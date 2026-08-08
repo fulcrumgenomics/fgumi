@@ -42,7 +42,7 @@ use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::create_raw_bam_reader;
 use fgumi_bam_io::{is_stdin_path, is_stdout_path};
 use fgumi_raw_bam::SamTag;
-use log::{debug, info};
+use log::{debug, info, warn};
 use noodles::sam::Header;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
 use noodles_bgzf::io::{
@@ -222,8 +222,11 @@ impl SortPhaseTimer {
     /// counts ([`RawExternalSorter::phase1_threads`] /
     /// [`RawExternalSorter::phase2_threads`]), not the configured `threads`
     /// they default from — the summary reports what the phases ran with.
+    ///
+    /// `max_temp_files` is reported so a run that consolidated says which limit
+    /// it consolidated against.
     #[allow(clippy::cast_precision_loss)]
-    fn log_summary(&self, sort_threads: usize, merge_threads: usize) {
+    fn log_summary(&self, sort_threads: usize, merge_threads: usize, max_temp_files: usize) {
         let overall = self.overall_start.map_or(0.0, |s| s.elapsed().as_secs_f64());
         // Guard against division by zero when sort completes in negligible time.
         let overall_nonzero = if overall > 0.0 { overall } else { f64::EPSILON };
@@ -246,7 +249,14 @@ impl SortPhaseTimer {
             let cons_secs = self.consolidate_secs;
             let cons_pct = 100.0 * cons_secs / overall_nonzero;
             let cons_count = self.consolidate_count;
-            info!("  Consolidation:     {cons_secs:.1}s ({cons_pct:.0}%) [{cons_count} merges]");
+            // Report the limit that triggered it: consolidation rewrites data
+            // that is already sorted, so a run that consolidated wants to know
+            // what it was up against. Reporting the number and not what to do
+            // about it keeps the recommendation with the caller that chose the
+            // limit -- the engine cannot know whether it was requested.
+            info!(
+                "  Consolidation:     {cons_secs:.1}s ({cons_pct:.0}%) [{cons_count} merges, limit {max_temp_files}]"
+            );
         }
         if self.merge_secs > 0.0 {
             let merge_secs = self.merge_secs;
@@ -584,9 +594,10 @@ impl LibraryLookup {
 /// Larger buffer reduces I/O latency impact during merge.
 const MERGE_PREFETCH_SIZE: usize = 1024;
 
-/// Maximum number of temp files before consolidation (like samtools).
-/// When this limit is reached, oldest files are merged to reduce file count.
-const DEFAULT_MAX_TEMP_FILES: usize = 64;
+// A bare `RawExternalSorter` keeps the fixed, portable `FALLBACK_MAX_TEMP_FILES`
+// as its consolidation limit. Sizing that limit to the process's soft
+// `RLIMIT_NOFILE` is a policy decision left to the caller, which opts in through
+// [`crate::fd_limit`] — `fgumi sort` does, `fgumi merge` and `fgumi simulate` do not.
 
 /// Working estimate of the raw BAM bytes per template-coordinate record (excluding the
 /// inline header and the `TemplateRecordRef<K>` index entry).  Used by the capacity
@@ -1768,7 +1779,7 @@ impl RawExternalSorter {
             spill_codec: crate::codec::SpillCodec::default(),
             write_index: false,
             pg_info: None,
-            max_temp_files: DEFAULT_MAX_TEMP_FILES,
+            max_temp_files: crate::fd_limit::FALLBACK_MAX_TEMP_FILES,
             cell_tag: None,
             initial_capacity: None,
             async_reader: false,
@@ -1932,7 +1943,10 @@ impl RawExternalSorter {
     ///
     /// When the number of temp files exceeds this limit, the oldest files
     /// are merged together to reduce the count. Set to 0 for unlimited.
-    /// Default is 64 (matching samtools).
+    ///
+    /// The default is a fixed, portable value. To size it to the host's
+    /// descriptor budget instead — which is what `fgumi sort` does — pass
+    /// [`resolve_temp_file_limit`](crate::resolve_temp_file_limit).
     #[must_use]
     pub fn max_temp_files(mut self, max: usize) -> Self {
         self.max_temp_files = max;
@@ -2280,6 +2294,56 @@ impl RawExternalSorter {
         }
     }
 
+    /// Warn when a merge is about to ask for more descriptors than the process
+    /// has.
+    ///
+    /// A merge opens every input at once, so its descriptor cost is the input
+    /// count — user-controlled, and not bounded by `max_temp_files`, which the
+    /// merge path never consults. Without this the failure surfaces as a bare
+    /// "Too many open files" naming one path, which reads like a problem with
+    /// that file rather than with the size of the merge.
+    ///
+    /// Warns rather than refuses: the reserve is deliberately conservative, so a
+    /// merge slightly over the estimate may still succeed, and refusing it would
+    /// turn a working command into a broken one. The subsequent open fails
+    /// immediately anyway — every reader is opened before any merging starts —
+    /// so nothing long-running is wasted either way.
+    ///
+    /// Returns the message rather than logging it so the threshold and the
+    /// wording are assertable without a log capture; `merge_bams` emits it.
+    fn fd_budget_warning(num_inputs: usize) -> Option<String> {
+        // One reading of the budget answers both questions in the helper.
+        // Reading it per question would let the warning name a budget other
+        // than the one that tripped it.
+        Self::fd_budget_warning_from_nofile(crate::fd_limit::soft_nofile(), num_inputs)
+    }
+
+    /// [`Self::fd_budget_warning`] against a supplied budget rather than the
+    /// process's own.
+    ///
+    /// Split out for the reason `fd_limit::temp_file_limit_from_soft_nofile`
+    /// is: the arithmetic is then testable without the host's real
+    /// `RLIMIT_NOFILE` deciding the answer. Reading it inside made both tests
+    /// host-dependent — the silent case needs a soft limit of at least
+    /// `8 + FD_RESERVE`, so it failed under a `ulimit -n` below 40, and the
+    /// warning case only reached the branch because `usize::MAX` saturates the
+    /// comparison on a 64-bit target. The CLI's own `fd_budget_warning` already
+    /// takes the budget as a parameter; this makes the engine's match.
+    fn fd_budget_warning_from_nofile(soft: Option<u64>, num_inputs: usize) -> Option<String> {
+        if crate::fd_limit::fits_nofile_budget(soft, num_inputs) {
+            return None;
+        }
+        let budget = soft.map_or_else(
+            || "unknown".to_string(),
+            |soft| soft.saturating_sub(crate::fd_limit::FD_RESERVE).to_string(),
+        );
+        Some(format!(
+            "Merging {num_inputs} inputs opens {num_inputs} files at once, which exceeds this \
+             process's open file budget of about {budget}. Raise it with `ulimit -n`, or merge in \
+             stages, if this fails with \"Too many open files\"."
+        ))
+    }
+
     /// Merge multiple pre-sorted BAM files into a single sorted BAM.
     ///
     /// Each input BAM must already be sorted in the order specified by
@@ -2296,6 +2360,9 @@ impl RawExternalSorter {
         };
 
         debug!("Starting k-way merge of {} BAM files", inputs.len());
+        if let Some(warning) = Self::fd_budget_warning(inputs.len()) {
+            warn!("{warning}");
+        }
 
         let mut readers = Self::open_bam_prefetch_readers(inputs)?;
         let output_header = self.create_output_header(header);
@@ -2677,7 +2744,7 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(self.phase1_threads(), self.phase2_threads());
+        timer.log_summary(self.phase1_threads(), self.phase2_threads(), self.max_temp_files);
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -2868,7 +2935,7 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(self.phase1_threads(), self.phase2_threads());
+        timer.log_summary(self.phase1_threads(), self.phase2_threads(), self.max_temp_files);
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -3138,7 +3205,7 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(self.phase1_threads(), self.phase2_threads());
+        timer.log_summary(self.phase1_threads(), self.phase2_threads(), self.max_temp_files);
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -3463,7 +3530,7 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(self.phase1_threads(), self.phase2_threads());
+        timer.log_summary(self.phase1_threads(), self.phase2_threads(), self.max_temp_files);
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -4756,7 +4823,10 @@ mod tests {
         assert_eq!(sorter.temp_compression, 1);
         assert!(!sorter.write_index);
         assert!(sorter.pg_info.is_none());
-        assert_eq!(sorter.max_temp_files, DEFAULT_MAX_TEMP_FILES);
+        // Fixed, not derived: a bare sorter must behave the same on every host.
+        // Deriving from `ulimit -n` is a decision the command line makes, not
+        // one the engine imposes on every embedder.
+        assert_eq!(sorter.max_temp_files, crate::fd_limit::FALLBACK_MAX_TEMP_FILES);
     }
 
     #[test]
@@ -4826,6 +4896,68 @@ mod tests {
     fn test_raw_sorter_max_temp_files() {
         let sorter = RawExternalSorter::new(SortOrder::Coordinate).max_temp_files(0);
         assert_eq!(sorter.max_temp_files, 0);
+    }
+
+    /// An ordinary merge width must not warn — every `fgumi merge` opens a
+    /// handful of inputs, so a warning there would be noise on every run —
+    /// while a merge past the budget must carry the two things that make the
+    /// warning actionable: how many inputs are being opened, and the
+    /// `ulimit -n` lever.
+    ///
+    /// The budget is supplied rather than read from the host, so every branch
+    /// is exercised on every target. Reading it made both assertions depend on
+    /// the machine: the silent case needs a soft limit of at least
+    /// `8 + FD_RESERVE` and failed under a `ulimit -n` below 40, and the
+    /// warning case reached its branch only because `usize::MAX` saturates the
+    /// comparison on a 64-bit target.
+    #[rstest]
+    #[case::ordinary_merge_fits(Some(1024), 8, None)]
+    // Exactly at the budget: 64 - FD_RESERVE is 32, and 32 inputs still fit.
+    #[case::exactly_at_the_budget(Some(64), 32, None)]
+    #[case::one_past_the_budget(Some(64), 33, Some(32))]
+    // A budget below the reserve saturates to zero, so any merge overruns it.
+    #[case::budget_below_the_reserve(Some(8), 1, Some(0))]
+    // Nothing to exceed where the limit cannot be read; silent by design.
+    #[case::unreadable_budget_never_warns(None, usize::MAX, None)]
+    fn test_fd_budget_warning_names_the_width_and_the_lever(
+        #[case] soft: Option<u64>,
+        #[case] num_inputs: usize,
+        #[case] expected_budget: Option<u64>,
+    ) {
+        let warning = RawExternalSorter::fd_budget_warning_from_nofile(soft, num_inputs);
+        match expected_budget {
+            None => assert_eq!(warning, None, "a merge within the budget must not warn"),
+            Some(budget) => {
+                let warning = warning.expect("a merge past the budget must warn");
+                assert!(
+                    warning.contains(&num_inputs.to_string()),
+                    "input count missing: {warning}"
+                );
+                assert!(
+                    warning.contains(&format!("budget of about {budget}")),
+                    "warning must name the budget it tripped: {warning}"
+                );
+                assert!(warning.contains("ulimit -n"), "remedy missing: {warning}");
+            }
+        }
+    }
+
+    /// The production wrapper must be exactly the helper applied to the host's
+    /// own budget — the seam exists to make the arithmetic testable, not to let
+    /// the two paths answer differently.
+    ///
+    /// Host-independent despite reading the real limit, because both sides read
+    /// the same one: whatever this machine reports, the answers must agree.
+    #[test]
+    fn test_fd_budget_warning_reads_the_process_budget() {
+        let soft = crate::fd_limit::soft_nofile();
+        for num_inputs in [1_usize, 8, 1024, usize::MAX] {
+            assert_eq!(
+                RawExternalSorter::fd_budget_warning(num_inputs),
+                RawExternalSorter::fd_budget_warning_from_nofile(soft, num_inputs),
+                "wrapper and helper disagree at {num_inputs} inputs"
+            );
+        }
     }
 
     // ========================================================================
@@ -6565,8 +6697,9 @@ mod tests {
         timer.time_write_output(|| Ok(())).expect("write ok");
         assert!(timer.write_output_secs >= 0.0);
 
-        // log_summary must not panic (output goes to log sink)
-        timer.log_summary(4, 4);
+        // log_summary must not panic (output goes to log sink). `consolidate_count`
+        // is 1 here, so the consolidation branch is exercised too.
+        timer.log_summary(4, 4, 64);
     }
 
     // ========================================================================

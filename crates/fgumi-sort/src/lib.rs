@@ -44,6 +44,7 @@ use tempfile::TempDir;
 pub(crate) mod bgzf_io;
 pub mod codec;
 pub(crate) mod external;
+pub(crate) mod fd_limit;
 pub(crate) mod inline;
 pub(crate) mod keys;
 pub(crate) mod loser_tree;
@@ -166,6 +167,10 @@ pub use codec::SpillCodec;
 pub use external::{
     KeyTypesSpec, LibraryLookup, RawExternalSorter, cb_hasher, extract_template_key_inline,
     format_thread_counts,
+};
+pub use fd_limit::{
+    FALLBACK_MAX_TEMP_FILES, fits_nofile_budget, resolve_temp_file_limit, soft_nofile,
+    temp_file_limit_from_nofile,
 };
 pub use inline::{
     PackedCoordinateKey, RecordRef, TemplateKey, extract_coordinate_key_inline,

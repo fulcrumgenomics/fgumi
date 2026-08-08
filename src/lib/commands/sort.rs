@@ -31,13 +31,13 @@ use fgumi_sort::{
     KeyTypesSpec, QuerynameComparator, RawExternalSorter, SortOrder, verify_sort_order,
 };
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::path::PathBuf;
 
 use crate::commands::command::Command;
 use crate::commands::common::{
-    CompressionOptions, MemoryLimit, MemoryReserve, parse_memory, parse_memory_reserve,
-    resolve_memory_budget,
+    CompressionOptions, MaxTempFiles, MemoryLimit, MemoryReserve, parse_max_temp_files,
+    parse_memory, parse_memory_reserve, resolve_memory_budget,
 };
 
 /// Sort order for BAM files.
@@ -155,8 +155,9 @@ PERFORMANCE:
   - Default 768M per-thread memory limit (samtools-compatible); pass
     `--max-memory auto` to detect system memory (opt-in)
   - Spilled runs are consolidated once they reach `--max-temp-files`
-    (default 64, matching samtools); raise it to avoid repeated
-    consolidation passes on very large inputs
+    (default "auto": sized to the process's open-file limit, `ulimit -n`);
+    consolidation rewrites already-sorted data, so raising that limit
+    avoids it on very large inputs
 
 EXAMPLES:
 
@@ -353,16 +354,24 @@ pub struct Sort {
     ///
     /// Large inputs spill many sorted runs to disk. When the number of runs
     /// reaches this limit, the oldest are merged together in a single pass so
-    /// the final k-way merge opens fewer files at once. Raising it avoids
-    /// repeated consolidation passes on very large inputs (at the cost of more
-    /// open file descriptors during the final merge); lowering it keeps fewer
-    /// files open. Must be at least 2; to effectively disable consolidation,
-    /// pass a value larger than the number of runs you expect to spill.
+    /// the final k-way merge opens fewer files at once. That merge is the only
+    /// reason the limit exists: it opens every remaining run at once, so the
+    /// limit bounds how many file descriptors the sort needs.
     ///
-    /// When unset, a built-in default is used (see this command's help
-    /// overview for the default value).
-    #[arg(long = "max-temp-files", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(2..))]
-    pub max_temp_files: Option<usize>,
+    /// Consolidation rewrites data that is already sorted, so it is pure
+    /// overhead whenever the descriptor budget could have carried the runs.
+    /// Raising this avoids it on very large inputs (at the cost of more open
+    /// file descriptors during the final merge); lowering it keeps fewer files
+    /// open. Must be at least 2; to effectively disable consolidation, pass a
+    /// value larger than the number of runs you expect to spill.
+    ///
+    /// "auto" (default) sizes the limit to the process's soft open-file limit
+    /// (`ulimit -n`), less a reserve for the input, output and index handles,
+    /// and capped at a tested maximum. Explicit values like "64", "256" pin it;
+    /// a pinned value larger than the open-file budget is reported at startup.
+    /// Must be at least 2.
+    #[arg(long = "max-temp-files", default_value = "auto", value_parser = parse_max_temp_files)]
+    pub max_temp_files: MaxTempFiles,
 
     /// Write BAM index (.bai) alongside output.
     ///
@@ -548,7 +557,12 @@ impl Sort {
     /// its own. That matters most for `--sort-threads` / `--merge-threads`:
     /// they only affect scheduling, so an end-to-end run cannot distinguish a
     /// correctly wired flag from one that was parsed and then dropped.
-    fn build_sorter(&self, effective_memory: usize, command_line: &str) -> RawExternalSorter {
+    fn build_sorter(
+        &self,
+        effective_memory: usize,
+        command_line: &str,
+        soft_nofile: Option<u64>,
+    ) -> RawExternalSorter {
         let mut sorter = RawExternalSorter::new(self.order.into())
             .memory_limit(effective_memory)
             .threads(self.threads)
@@ -566,11 +580,21 @@ impl Sort {
         if let Some(n) = self.merge_threads {
             sorter = sorter.merge_threads(n);
         }
-        // Optional; falls back to the engine default when unset.
-        if let Some(n) = self.max_temp_files {
-            sorter = sorter.max_temp_files(n);
-        }
+        sorter = sorter.max_temp_files(self.resolved_max_temp_files(soft_nofile));
         sorter
+    }
+
+    /// The spill-file consolidation limit this command will use.
+    ///
+    /// The engine's own default is a fixed, portable value; sizing it to the
+    /// host's descriptor budget is a decision the command line makes, so it is
+    /// resolved here and passed down. Resolving in one place keeps the number
+    /// that gets logged identical to the number the engine is handed.
+    fn resolved_max_temp_files(&self, soft_nofile: Option<u64>) -> usize {
+        match self.max_temp_files {
+            MaxTempFiles::Auto => fgumi_sort::temp_file_limit_from_nofile(soft_nofile),
+            MaxTempFiles::Fixed(limit) => limit,
+        }
     }
 
     /// Parse the cell tag for template-coordinate sort/verify, returning `None`
@@ -578,7 +602,56 @@ impl Sort {
     fn parse_cell_tag(&self) -> Result<Option<SamTag>> {
         parse_cell_tag(self.order)
     }
+}
 
+/// The line naming the spill-file limit in force, for the run configuration log.
+///
+/// Returns the string rather than logging it so the wording — in particular
+/// whether the number was asked for, derived from a budget this line then names,
+/// or fell back to the portable default — is assertable without a log capture.
+fn max_temp_files_log_line(
+    setting: MaxTempFiles,
+    resolved: usize,
+    soft_nofile: Option<u64>,
+) -> String {
+    match (setting, soft_nofile) {
+        (MaxTempFiles::Fixed(_), _) => format!("Max temp files: {resolved}"),
+        (MaxTempFiles::Auto, Some(soft)) => {
+            format!("Max temp files: {resolved} (derived from RLIMIT_NOFILE soft limit {soft})")
+        }
+        (MaxTempFiles::Auto, None) => format!("Max temp files: {resolved} (default)"),
+    }
+}
+
+/// The warning for a spill-file limit that overruns the process's descriptor
+/// budget, or `None` when `resolved` fits.
+///
+/// Checked for explicit limits too, not just derived ones. A derived limit is
+/// clamped to the budget and can only fall short of it when the budget is below
+/// the floor; an explicit limit can overrun it outright, which makes it the case
+/// more likely to fail — so the advice names `--max-temp-files` only when the
+/// user actually set it, and otherwise points at `ulimit -n`, the only lever
+/// left.
+fn fd_budget_warning(
+    setting: MaxTempFiles,
+    resolved: usize,
+    soft_nofile: Option<u64>,
+) -> Option<String> {
+    if fgumi_sort::fits_nofile_budget(soft_nofile, resolved) {
+        return None;
+    }
+    let advice = if matches!(setting, MaxTempFiles::Fixed(_)) {
+        "lower --max-temp-files or raise the open file limit with `ulimit -n`"
+    } else {
+        "raise the open file limit with `ulimit -n`"
+    };
+    Some(format!(
+        "A spill-file limit of {resolved} exceeds this process's open file budget; \
+         {advice} if the sort fails with \"Too many open files\"."
+    ))
+}
+
+impl Sort {
     /// Execute sort mode: read, sort, and write output.
     fn execute_sort(&self, command_line: &str) -> Result<()> {
         let output = self.output.as_ref().expect("output required for sort mode");
@@ -613,9 +686,15 @@ impl Sort {
 
         let cell_tag = self.parse_cell_tag()?;
 
+        // One reading of the descriptor budget serves the whole run: the limit
+        // handed to the sorter, the budget named in the log line, and the check
+        // the warning makes all derive from this value, so they cannot describe
+        // different limits if `RLIMIT_NOFILE` changes mid-run.
+        let soft_nofile = fgumi_sort::soft_nofile();
+
         // Built before the config log so the log can report the sorter's own
         // effective per-phase thread counts.
-        let mut sorter = self.build_sorter(effective_memory, command_line);
+        let mut sorter = self.build_sorter(effective_memory, command_line, soft_nofile);
 
         debug!("Starting Sort");
         info!("Input: {}", self.input.display());
@@ -651,6 +730,14 @@ impl Sort {
             fgumi_sort::format_thread_counts(sorter.phase1_threads(), sorter.phase2_threads())
         );
         info!("Temp compression level: {}", self.temp_compression);
+        // Read off the sorter, like the thread counts above: it is the number
+        // the engine will actually consolidate at, so it cannot drift from what
+        // this line reports.
+        let max_temp_files = sorter.temp_file_limit();
+        info!("{}", max_temp_files_log_line(self.max_temp_files, max_temp_files, soft_nofile));
+        if let Some(warning) = fd_budget_warning(self.max_temp_files, max_temp_files, soft_nofile) {
+            warn!("{warning}");
+        }
         if self.write_index {
             info!("Write index: enabled");
         }
@@ -996,7 +1083,8 @@ mod tests {
         sort.sort_threads = sort_threads;
         sort.merge_threads = merge_threads;
 
-        let sorter = sort.build_sorter(512 * 1024 * 1024, "fgumi sort (test)");
+        let sorter =
+            sort.build_sorter(512 * 1024 * 1024, "fgumi sort (test)", fgumi_sort::soft_nofile());
         assert_eq!(sorter.phase1_threads(), expected_phase1);
         assert_eq!(sorter.phase2_threads(), expected_phase2);
     }
@@ -1055,7 +1143,8 @@ mod tests {
         sort.threads = threads;
         sort.sort_threads = sort_threads;
 
-        let sorter = sort.build_sorter(512 * 1024 * 1024, "fgumi sort (test)");
+        let sorter =
+            sort.build_sorter(512 * 1024 * 1024, "fgumi sort (test)", fgumi_sort::soft_nofile());
         assert_eq!(sorter.phase1_threads(), expected_phase1, "engine sort-phase fallback drifted");
         assert_eq!(sort.memory_budget_threads(), threads.max(expected_phase1));
     }
@@ -1152,18 +1241,112 @@ mod tests {
         );
     }
 
-    /// `--max-temp-files` parses onto the struct and defaults to `None` (the
-    /// builder then applies the engine default).
+    /// `--max-temp-files` parses onto the struct and defaults to `auto`, which
+    /// is also spellable explicitly -- the point of the literal is that the
+    /// host-derived behaviour has a name rather than being the absence of a flag.
     #[rstest]
-    #[case::unset(&[], None)]
-    #[case::minimum(&["--max-temp-files", "2"], Some(2))]
-    #[case::explicit(&["--max-temp-files", "256"], Some(256))]
-    #[case::large(&["--max-temp-files", "100000"], Some(100_000))]
-    fn test_parse_max_temp_files(#[case] extra: &[&str], #[case] expected: Option<usize>) {
+    #[case::unset(&[], MaxTempFiles::Auto)]
+    #[case::auto(&["--max-temp-files", "auto"], MaxTempFiles::Auto)]
+    #[case::auto_mixed_case(&["--max-temp-files", "AUTO"], MaxTempFiles::Auto)]
+    #[case::minimum(&["--max-temp-files", "2"], MaxTempFiles::Fixed(2))]
+    #[case::explicit(&["--max-temp-files", "256"], MaxTempFiles::Fixed(256))]
+    #[case::large(&["--max-temp-files", "100000"], MaxTempFiles::Fixed(100_000))]
+    fn test_parse_max_temp_files(#[case] extra: &[&str], #[case] expected: MaxTempFiles) {
         let base = ["sort", "-i", "in.bam", "-o", "out.bam", "--order", "coordinate"];
         let args: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
         let sort = Sort::try_parse_from(args).expect("parse should succeed");
         assert_eq!(sort.max_temp_files, expected);
+    }
+
+    /// The config log must say where the number came from, because the same
+    /// value means different things depending on its provenance: an explicit
+    /// limit is what the user asked for, a derived one is a function of a budget
+    /// the line then names, and the fallback is neither.
+    #[rstest]
+    #[case::fixed_omits_provenance(
+        MaxTempFiles::Fixed(256),
+        256,
+        Some(1024),
+        "Max temp files: 256"
+    )]
+    #[case::fixed_ignores_the_soft_limit(
+        MaxTempFiles::Fixed(256),
+        256,
+        None,
+        "Max temp files: 256"
+    )]
+    #[case::auto_names_the_budget_it_came_from(
+        MaxTempFiles::Auto,
+        992,
+        Some(1024),
+        "Max temp files: 992 (derived from RLIMIT_NOFILE soft limit 1024)"
+    )]
+    #[case::auto_without_a_readable_budget_is_the_default(
+        MaxTempFiles::Auto,
+        64,
+        None,
+        "Max temp files: 64 (default)"
+    )]
+    fn test_max_temp_files_log_line(
+        #[case] setting: MaxTempFiles,
+        #[case] resolved: usize,
+        #[case] soft_nofile: Option<u64>,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(max_temp_files_log_line(setting, resolved, soft_nofile), expected);
+    }
+
+    /// A limit that fits the descriptor budget must not warn, and one that
+    /// cannot must name the lever the user actually has: `--max-temp-files` only
+    /// when they set it, and `ulimit -n` either way.
+    ///
+    /// The budget is supplied rather than read from the host, so every branch
+    /// is exercised on every target: a 1024-descriptor budget admits a
+    /// merge-width limit of 8 and rejects `usize::MAX`, and a `None` budget
+    /// (the non-Unix case) admits everything by design.
+    #[rstest]
+    #[case::fits_when_explicit(MaxTempFiles::Fixed(8), 8, Some(1024), None)]
+    #[case::fits_when_derived(MaxTempFiles::Auto, 8, Some(1024), None)]
+    #[case::explicit_overrun_points_at_the_flag(
+        MaxTempFiles::Fixed(usize::MAX),
+        usize::MAX,
+        Some(1024),
+        Some("lower --max-temp-files or raise the open file limit with `ulimit -n`")
+    )]
+    #[case::derived_overrun_points_only_at_ulimit(
+        MaxTempFiles::Auto,
+        usize::MAX,
+        Some(1024),
+        Some("raise the open file limit with `ulimit -n`")
+    )]
+    #[case::unreadable_budget_never_warns(MaxTempFiles::Fixed(usize::MAX), usize::MAX, None, None)]
+    fn test_fd_budget_warning(
+        #[case] setting: MaxTempFiles,
+        #[case] resolved: usize,
+        #[case] soft_nofile: Option<u64>,
+        #[case] expected_advice: Option<&str>,
+    ) {
+        let warning = fd_budget_warning(setting, resolved, soft_nofile);
+        match expected_advice {
+            None => assert_eq!(warning, None, "a limit within the budget must not warn"),
+            Some(advice) => {
+                let warning = warning.expect("an oversized limit must warn");
+                assert!(warning.contains(advice), "advice missing from: {warning}");
+                assert!(
+                    warning.contains(&format!("limit of {resolved}")),
+                    "warning must name the limit: {warning}"
+                );
+            }
+        }
+    }
+
+    /// The derived-overrun advice must not mention `--max-temp-files`: the user
+    /// never set it, so telling them to lower it is advice they cannot act on.
+    #[test]
+    fn test_derived_overrun_advice_omits_the_flag_the_user_did_not_set() {
+        let warning = fd_budget_warning(MaxTempFiles::Auto, usize::MAX, Some(1024))
+            .expect("an oversized limit must warn");
+        assert!(!warning.contains("lower --max-temp-files"), "unexpected advice: {warning}");
     }
 
     /// Invalid values are rejected at parse time rather than silently clamped or
@@ -1190,20 +1373,30 @@ mod tests {
         assert!(Sort::try_parse_from(args).is_err(), "--max-temp-files {value} must be rejected");
     }
 
-    /// The flag reaches the sorter: `Some(n)` sets the limit; `None` leaves the
-    /// engine default (read from a fresh sorter rather than hardcoded, so this
-    /// test does not pin fgumi's default number).
+    /// The flag reaches the sorter: an explicit limit passes through untouched;
+    /// `auto` derives one from the descriptor budget it is handed. The budget is
+    /// supplied rather than read from the host, so the expected derived value is
+    /// a fixed number instead of one that depends on the machine the test runs
+    /// on — and it is deliberately *not* the engine's own default, which stays a
+    /// fixed portable value now that the derivation lives in the command.
     #[rstest]
-    #[case::set(Some(256))]
-    #[case::unset(None)]
-    fn test_build_sorter_wires_max_temp_files(#[case] max_temp_files: Option<usize>) {
-        let engine_default =
-            RawExternalSorter::new(SortOrderArg::Coordinate.into()).temp_file_limit();
+    #[case::set(MaxTempFiles::Fixed(256), Some(1024), 256)]
+    #[case::auto_derives_from_the_budget(MaxTempFiles::Auto, Some(1024), 992)]
+    #[case::auto_without_a_budget_falls_back(
+        MaxTempFiles::Auto,
+        None,
+        fgumi_sort::FALLBACK_MAX_TEMP_FILES
+    )]
+    fn test_build_sorter_wires_max_temp_files(
+        #[case] max_temp_files: MaxTempFiles,
+        #[case] soft_nofile: Option<u64>,
+        #[case] expected: usize,
+    ) {
         let mut sort = make_sort(SortOrderArg::Coordinate);
         sort.max_temp_files = max_temp_files;
 
-        let sorter = sort.build_sorter(512 * 1024 * 1024, "fgumi sort (test)");
-        assert_eq!(sorter.temp_file_limit(), max_temp_files.unwrap_or(engine_default));
+        let sorter = sort.build_sorter(512 * 1024 * 1024, "fgumi sort (test)", soft_nofile);
+        assert_eq!(sorter.temp_file_limit(), expected);
     }
 
     /// The accessor test above only proves the flag reaches the builder. This
@@ -1211,11 +1404,17 @@ mod tests {
     /// never changes *what* is written: with a 1 KiB memory budget (no floor in
     /// `Fixed` mode) and enough records to spill many runs, `Some(2)` forces the
     /// consolidation merge to fire repeatedly (oldest runs are merged once their
-    /// count reaches the limit), while the default engine limit (64) never
+    /// count reaches the limit), while a limit far above the spill count never
     /// consolidates and merges every run in the final k-way pass. Both paths
     /// must emit the same records in the same order — this guards the
     /// consolidation path against a stable-order or record-loss regression the
     /// accessor test cannot catch.
+    ///
+    /// The control arm pins an explicit large limit rather than passing `None`.
+    /// The engine default is derived from the host's `ulimit -n`, so a `None`
+    /// control arm could itself consolidate on a low-limit machine, quietly
+    /// turning this into a consolidation-vs-consolidation comparison that still
+    /// passes while no longer testing what it claims.
     ///
     /// We compare decoded records rather than the raw BGZF bytes on purpose:
     /// the two write paths flush BGZF blocks at different points, so the
@@ -1244,14 +1443,14 @@ mod tests {
 
         // 1 KiB memory forces spilling; `build_sorter` is the exact option ->
         // builder path `execute` uses, so this exercises the real wiring.
-        let run = |max_temp_files: Option<usize>, out: PathBuf| {
+        let run = |max_temp_files: MaxTempFiles, out: PathBuf| {
             let mut sort = make_sort(SortOrderArg::Coordinate);
             sort.input = input.clone();
             sort.output = Some(out.clone());
             sort.threads = 1;
             sort.max_temp_files = max_temp_files;
 
-            let sorter = sort.build_sorter(1024, "fgumi sort (test)");
+            let sorter = sort.build_sorter(1024, "fgumi sort (test)", fgumi_sort::soft_nofile());
             let stats = sorter.sort(&input, &out).expect("sort should succeed");
 
             let mut reader =
@@ -1264,8 +1463,10 @@ mod tests {
             (stats, records)
         };
 
-        let (default_stats, default_records) = run(None, dir.path().join("default.bam"));
-        let (limited_stats, limited_records) = run(Some(2), dir.path().join("limited.bam"));
+        let (default_stats, default_records) =
+            run(MaxTempFiles::Fixed(usize::MAX), dir.path().join("default.bam"));
+        let (limited_stats, limited_records) =
+            run(MaxTempFiles::Fixed(2), dir.path().join("limited.bam"));
 
         // Precondition: the tiny budget really did spill multiple runs, so the
         // `Some(2)` run exercised consolidation rather than a trivial in-memory
@@ -1348,7 +1549,7 @@ mod tests {
             compression: CompressionOptions::default(),
             temp_compression: 1,
             temp_codec: fgumi_sort::SpillCodec::default(),
-            max_temp_files: None,
+            max_temp_files: MaxTempFiles::Auto,
             write_index: false,
             async_reader: false,
         }
