@@ -1477,6 +1477,11 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
                         let cause = crate::merge_trace::EmptyCause::classify(raw_len, in_flight);
                         self.shared.refill.record_empty(cause);
                         file.mark_emptied(now, cause);
+                        // This file needs a worker now. Waking one here is the
+                        // difference between the pool learning that within a
+                        // microsecond and learning it whenever some worker's
+                        // backoff happens to expire.
+                        self.shared.wake_one_worker();
                     }
                     let st = &mut self.parser_state[source_id];
                     st.current_buf = block.data;
@@ -1512,6 +1517,9 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
 
             // Source produced everything it ever will?
             if self.files[source_id].is_drained() {
+                // Move the drain frontier past it, so workers scanning for the
+                // next hungry file start at one that still has records.
+                self.shared.advance_phase2_frontier(&self.files);
                 return Ok(false);
             }
 
@@ -2418,6 +2426,17 @@ impl RawExternalSorter {
         output: &Path,
         pool: Arc<SortWorkerPool>,
     ) -> Result<RawSortStats> {
+        // Say so when the input claims to be in the order being requested. This
+        // is checked before @PG is added so it reflects the input as given.
+        if crate::header_declares_order(header, self.sort_order) {
+            log::warn!(
+                "Input header already declares this sort order ({}); sorting it again. \
+                 Headers are not verified, so the sort still runs -- use `--verify` to \
+                 check an input's order without rewriting it.",
+                self.sort_order_flag_value()
+            );
+        }
+
         // Add @PG record if pg_info was provided
         let header = if let Some((ref version, ref command_line)) = self.pg_info {
             fgumi_bam_io::header::add_pg_record(header.clone(), version, command_line)?
@@ -3902,6 +3921,17 @@ impl RawExternalSorter {
                 "  Workers ({workers_n} active threads; busy time, overlaps the above and itself)"
             );
             info!("    Spill disk read:   {read_s:.1}s ({:.0}%) [{read_n} batches]", pct(read_s));
+            // Blocks-per-batch, split by allowance. A deep share near zero means
+            // the frontier gate is not firing, which reads identically to "the
+            // deeper read-ahead did not help" unless it is reported separately.
+            let (deep_b, deep_blk, shal_b, shal_blk) = pool.read_batch_split();
+            let per = |blk: u64, b: u64| if b == 0 { 0.0 } else { blk as f64 / b as f64 };
+            info!(
+                "      frontier {deep_b} batches / {deep_blk} blocks ({:.1} per batch), \
+                 other {shal_b} batches / {shal_blk} blocks ({:.1} per batch)",
+                per(deep_blk, deep_b),
+                per(shal_blk, shal_b)
+            );
             info!("    Spill decompress:  {dec_s:.1}s ({:.0}%) [{dec_n} blocks]", pct(dec_s));
             info!("    Output compress:   {comp_s:.1}s ({:.0}%) [{comp_n} blocks]", pct(comp_s));
             info!("    Total worker busy: {busy:.1}s  (NOT comparable to loop wall clock)");
@@ -4005,8 +4035,9 @@ impl RawExternalSorter {
                 100.0 * wake.deep_sleep_wake_share()
             );
             info!(
-                "    (nothing unparks a worker, so this bounds how late work is noticed; it \
-                 delays the merge only when every worker is asleep at once)"
+                "    (the consumer unparks one worker when a reorder buffer drains, so this \
+                 bounds how late work arriving any other way is noticed; it delays the merge \
+                 only when every worker is asleep at once)"
             );
         }
 
