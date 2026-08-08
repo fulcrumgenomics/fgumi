@@ -48,6 +48,7 @@ pub(crate) mod inline;
 pub(crate) mod keys;
 pub(crate) mod loser_tree;
 pub(crate) mod memory_probe;
+pub(crate) mod merge_phases;
 pub(crate) mod pipeline;
 pub(crate) mod pooled_bam_writer;
 pub(crate) mod pooled_chunk_writer;
