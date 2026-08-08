@@ -618,6 +618,17 @@ impl Duplex {
         // been created, so relying on the constructor alone would turn an argument error
         // into a mid-run worker failure that leaves a partial output file behind.
         DuplexConsensusCaller::validate_min_reads(&self.min_reads)?;
+
+        // `--max-reads-per-strand 0` empties every strand, so no molecule can produce a
+        // consensus. fgbio failed deep in consensus calling with a bare
+        // `IllegalArgumentException` (fixed in fulcrumgenomics/fgbio#1166); fgumi was quieter
+        // still, exiting 0 having written an empty BAM. Only a lower bound is checked here,
+        // matching fgbio: unlike `simplex` and `codec`, duplex cannot compare the cap against
+        // `--min-reads` (a vector with its own ordering rule), and a cap below it is already
+        // handled gracefully -- `consensus_call` returns no consensus rather than panicking.
+        if self.max_reads_per_strand == Some(0) {
+            bail!("--max-reads-per-strand must be >= 1");
+        }
         Ok(())
     }
 
@@ -1260,6 +1271,63 @@ mod tests {
             duplex.validate().is_ok(),
             expect_ok,
             "validate() disagreed with the --min-reads contract for {min_reads:?}"
+        );
+    }
+
+    /// A cap of zero empties every strand, so no consensus can be built from any molecule.
+    /// fgbio failed deep in consensus calling with a bare `IllegalArgumentException`
+    /// (`CallDuplexConsensusReads`, fixed in fulcrumgenomics/fgbio#1166); fgumi was quieter
+    /// still — it exited 0 having written an empty BAM. simplex and codec already reject
+    /// their equivalents, so this closes the gap.
+    ///
+    /// Only a lower bound is applied, matching fgbio, rather than simplex/codec's stronger
+    /// `max >= min_reads`: duplex's `--min-reads` is a vector of up to three values with its
+    /// own ordering rule, and a cap below it is already handled gracefully — `consensus_call`
+    /// returns no consensus rather than panicking.
+    #[rstest]
+    #[case::zero_rejected(Some(0), false)]
+    #[case::one_accepted(Some(1), true)]
+    #[case::typical_accepted(Some(50), true)]
+    #[case::unset_accepted(None, true)]
+    fn test_validate_max_reads_per_strand(
+        #[case] max_reads_per_strand: Option<usize>,
+        #[case] expect_ok: bool,
+    ) {
+        let mut duplex =
+            create_duplex_with_paths(PathBuf::from("test.bam"), PathBuf::from("output.bam"));
+        duplex.max_reads_per_strand = max_reads_per_strand;
+        assert_eq!(
+            duplex.validate().is_ok(),
+            expect_ok,
+            "validate() disagreed with the --max-reads-per-strand contract for \
+             {max_reads_per_strand:?}"
+        );
+    }
+
+    /// fgbio validates `--max-reads-per-strand >= 1` because its option is an `Option[Int]`
+    /// and so accepts negatives. fgumi's is an `Option<usize>`, so clap rejects a negative at
+    /// parse time and `validate()` never sees it — the guard above only has to cover zero.
+    ///
+    /// Uses the attached `=-1` form and asserts the error *kind*, because both of those are
+    /// what make this test about the field's type. With the space-separated form clap rejects a
+    /// bare `-1` as a flag-shaped token (`UnknownArgument`) whatever the field type is, so that
+    /// spelling passes identically for an `Option<i64>` — the very shape this docstring claims
+    /// would need a runtime guard.
+    #[test]
+    fn test_negative_max_reads_per_strand_fails_to_parse() {
+        let parsed = Duplex::try_parse_from([
+            "duplex",
+            "--input",
+            "in.bam",
+            "--output",
+            "out.bam",
+            "--max-reads-per-strand=-1",
+        ]);
+        let error = parsed.expect_err("a negative --max-reads-per-strand must fail at parse time");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "the value must be rejected by the `usize` parser, not as an unknown argument"
         );
     }
 
