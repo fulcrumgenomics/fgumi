@@ -872,6 +872,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "fgumi-pipeline-io"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "criterion",
+ "fgumi-bam-io",
+ "fgumi-bgzf",
+ "fgumi-pipeline-core",
+ "fgumi-raw-bam",
+ "fgumi-sort",
+ "log",
+ "noodles",
+ "parking_lot",
+ "proptest",
+ "rayon",
+ "rstest",
+ "tempfile",
+]
+
+[[package]]
 name = "fgumi-raw-bam"
 version = "0.5.0"
 dependencies = [

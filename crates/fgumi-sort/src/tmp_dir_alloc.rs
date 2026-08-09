@@ -135,7 +135,6 @@ impl TmpDirAllocator {
 
     /// Override the periodic recheck interval (primarily for testing).
     #[must_use]
-    #[allow(dead_code)]
     pub fn with_recheck_interval(mut self, interval: usize) -> Self {
         self.recheck_interval = interval.max(1);
         self
@@ -175,7 +174,6 @@ impl TmpDirAllocator {
     /// Drop a directory from rotation (e.g. after `ENOSPC` during a spill write).
     ///
     /// Matches by path equality. A no-op if the path isn't currently active.
-    #[allow(dead_code)]
     pub fn mark_full(&mut self, dir: &Path) {
         if let Some(pos) = self.active.iter().position(|d| d == dir) {
             self.active.remove(pos);
