@@ -12,10 +12,10 @@ All notable changes to this project will be documented in this file.
 
   The retained subset is now a pure function of the tag family, so it is reproducible across
   runs, thread counts, and execution modes. Mates share a read name and therefore a rank, so
-  the two ends of a template rank together; `codec --max-reads` selects whole pairs and so
-  always keeps or drops both ends, while `simplex --max-reads` (which caps the whole family by
-  record count, fgumi#723) and `duplex --max-reads-per-strand` (which caps each end
-  independently) can retain one end of a template without the other. Previously the surviving
+  the two ends of a template rank together, but none of the three commands guarantees that both
+  ends survive: `simplex --max-reads` caps the whole family by record count (fgumi#723), and
+  `duplex --max-reads-per-strand` and `codec --max-reads` cap each end independently, so a
+  template can be retained on one end and dropped on the other. Previously the surviving
   reads depended on how many families the
   consensus caller had already processed, so `--threads N` and the no-`--threads` path could
   produce different consensus reads from the same input — measured at 566 of 77,804 records
@@ -25,6 +25,15 @@ All notable changes to this project will be documented in this file.
   There is no way to fix the reproducibility bug while preserving the old selection, since the
   old selection was the bug. Runs that do not set a cap are unaffected and remain
   byte-identical. Ports [fgbio#1166](https://github.com/fulcrumgenomics/fgbio/pull/1166).
+
+- **Breaking:** `codec --max-reads` now downsamples *after* filtering each strand to its most
+  common alignment, and independently per strand, matching fgbio's
+  `CodecConsensusCaller`. Previously the cap ran first, across a family that still mixed
+  alignment patterns, so the majority pattern among the sampled reads could differ from the
+  majority in the full family — the alignment filter then cut the family a second time and could
+  push it below `--min-reads`, rejecting a family fgbio consenses. On a CODEC library this
+  recovered 397 consensus records at `--max-reads 2` (103,144 → 103,541) and 61 at
+  `--max-reads 3` (105,478 → 105,539). Runs that do not set `--max-reads` are unaffected.
 
 ### Bug Fixes
 

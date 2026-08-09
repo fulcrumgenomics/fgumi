@@ -241,9 +241,12 @@ pub struct Codec {
     /// to exactly this many read pairs.
     ///
     /// Which pairs are retained is determined by a hash of the read names, so the selection is
-    /// reproducible across runs, thread counts, and execution modes. The cap selects whole pairs
-    /// — R1 and R2 are indexed by one shared selection — so both ends of a template are always
-    /// retained or discarded together.
+    /// reproducible across runs, thread counts, and execution modes.
+    ///
+    /// The cap is applied after filtering each strand to its most common alignment, and to each
+    /// strand independently — matching fgbio. Mates share a read name and therefore a rank, so
+    /// both ends of a template are normally retained or discarded together; they can diverge
+    /// when one end survives the alignment filter and the other does not.
     #[arg(long = "max-reads")]
     pub max_reads: Option<usize>,
 

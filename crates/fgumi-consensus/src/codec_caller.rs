@@ -156,6 +156,11 @@ pub struct CodecConsensusOptions {
     pub min_reads_per_strand: usize,
 
     /// Maximum number of read pairs to use per strand (downsample if exceeded)
+    ///
+    /// `Some(0)` is not a meaningful cap: it retains no reads on either strand. The `codec`
+    /// command rejects it at startup (`--max-reads` must be at least `--min-reads`, itself at
+    /// least 1); a caller that sets it directly gets every family rejected as
+    /// [`CallerRejectionReason::InsufficientReads`] rather than a panic.
     pub max_reads_per_strand: Option<usize>,
 
     /// Minimum duplex overlap length (in bases)
@@ -706,32 +711,9 @@ impl CodecConsensusCaller {
             return Ok(ConsensusOutput::default());
         }
 
-        // Downsample if needed, keeping the lowest-ranking read pairs. Rank is a
-        // Murmur3 hash of the read name (fgbio's rule, fulcrumgenomics/fgbio#1166), so
-        // selection is reproducible and independent of how work is divided across
-        // threads. R1 and R2 share a name and so are selected together; the shared
-        // index vector below keeps them aligned. The sort is stable so tied ranks keep
-        // input order.
-        if let Some(max_reads) = self.options.max_reads_per_strand
-            && r1_infos.len() > max_reads
-        {
-            let indices = Self::keep_indices_for_infos(records, &r1_infos, max_reads);
-
-            let new_r1: Vec<_> = indices
-                .iter()
-                .map(|&i| std::mem::replace(&mut r1_infos[i], Self::dummy_info()))
-                .collect();
-            let new_r2: Vec<_> = indices
-                .iter()
-                .map(|&i| std::mem::replace(&mut r2_infos[i], Self::dummy_info()))
-                .collect();
-            r1_infos = new_r1;
-            r2_infos = new_r2;
-        }
-
         // Phase 3: Filter to most common alignment on ClippedRecordInfo
-        let r1_infos = self.filter_to_most_common_alignment_raw(r1_infos);
-        let r2_infos = self.filter_to_most_common_alignment_raw(r2_infos);
+        let mut r1_infos = self.filter_to_most_common_alignment_raw(r1_infos);
+        let mut r2_infos = self.filter_to_most_common_alignment_raw(r2_infos);
 
         if r1_infos.is_empty() || r2_infos.is_empty() {
             return Ok(ConsensusOutput::default());
@@ -745,6 +727,37 @@ impl CodecConsensusCaller {
                 CallerRejectionReason::InsufficientReads,
             );
             return Ok(ConsensusOutput::default());
+        }
+
+        // Downsample AFTER the alignment filter and the read-count check, and independently per
+        // strand — the order fgbio uses (`CodecConsensusCaller.scala`: `filterToMostCommonAlignment`
+        // then the `minReadsPerStrand` check, with the cap applied inside `ssCaller.consensusCall`).
+        //
+        // Capping first would sample across a family that still mixes alignment patterns, so the
+        // majority pattern among the survivors could differ from the majority in the full family;
+        // `filter_to_most_common_alignment_raw` would then cut the family a second time and could
+        // drop it below `min_reads_per_strand`, rejecting a family fgbio consenses.
+        //
+        // Each strand is capped on its own ranks, so R1 and R2 need not retain the same templates.
+        // That matches fgbio, and nothing downstream pairs the two lists by index: phase 4 takes
+        // the longest of each independently, and phase 5 builds a separate single-strand consensus
+        // from each.
+        if let Some(max_reads) = self.options.max_reads_per_strand {
+            // A cap of zero empties both strands, and phase 4's `expect("non-empty")` would then
+            // panic on a family that reached here perfectly well-formed. The CLI cannot produce
+            // it -- `codec --max-reads` is validated to be at least `--min-reads`, itself at
+            // least 1 -- so this guards a programmatic caller that builds
+            // `CodecConsensusOptions` directly, and it rejects the family for the thing that is
+            // actually true of it: after the cap there are no reads left to consense.
+            if max_reads == 0 {
+                self.reject_records_count(
+                    r1_infos.len() + r2_infos.len(),
+                    CallerRejectionReason::InsufficientReads,
+                );
+                return Ok(ConsensusOutput::default());
+            }
+            Self::cap_infos_to_lowest_ranking(records, &mut r1_infos, max_reads);
+            Self::cap_infos_to_lowest_ranking(records, &mut r2_infos, max_reads);
         }
 
         // Phase 4: Overlap/phase calculation on ClippedRecordInfo
@@ -1002,6 +1015,25 @@ impl CodecConsensusCaller {
             infos.iter().map(|info| RawRecordView::new(records[info.raw_idx].as_ref()).read_name()),
             max_reads,
         )
+    }
+
+    /// Reduces `infos` in place to the `max_reads` lowest-ranking records, keeping input order.
+    ///
+    /// A no-op when the strand is already at or below the cap.
+    fn cap_infos_to_lowest_ranking(
+        records: &[RawRecord],
+        infos: &mut Vec<ClippedRecordInfo>,
+        max_reads: usize,
+    ) {
+        if infos.len() <= max_reads {
+            return;
+        }
+        let keep = Self::keep_indices_for_infos(records, infos, max_reads);
+        // Move the survivors out rather than cloning: a clipped CIGAR owns a heap buffer, and
+        // families reaching here are by definition larger than the cap.
+        let mut kept: Vec<ClippedRecordInfo> =
+            keep.iter().map(|&i| std::mem::replace(&mut infos[i], Self::dummy_info())).collect();
+        std::mem::swap(infos, &mut kept);
     }
 
     /// Filter `ClippedRecordInfo`s to the most common alignment pattern.
@@ -4628,6 +4660,178 @@ mod tests {
         assert_eq!(
             CodecConsensusCaller::keep_indices_for_infos(&records, &infos, 3),
             vec![6, 7, 9]
+        );
+    }
+
+    /// The cap runs after the alignment filter, so a minority-alignment sample cannot sink a
+    /// family the majority pattern would consense.
+    ///
+    /// Ten templates `q0..q9` in one family, with `--max-reads 3` and `--min-reads 3`. Six carry
+    /// the majority alignment (30M) and four a minority one (20M). The htsjdk-derived ranks put
+    /// `q3 < q2 < q0` lowest, and the fixture deliberately places `q0` and `q2` in the minority
+    /// group and `q3` in the majority group.
+    ///
+    /// Capping first — the order before fgumi#730 — samples `{q0, q2, q3}` across the whole
+    /// family, whose own majority is then the two minority-alignment reads; the filter cuts the
+    /// family to 2, which is below `--min-reads 3`, and the family is rejected. Filtering first,
+    /// as fgbio does, keeps the six majority reads, clears the read-count check, and caps within
+    /// that homogeneous set — so a consensus is produced.
+    #[test]
+    fn codec_cap_runs_after_the_alignment_filter() {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 3,
+            max_reads_per_strand: Some(3),
+            min_duplex_length: 1,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        // q0, q1, q2, q9 carry the minority alignment; q3..q8 the majority one.
+        let minority = ["q0", "q1", "q2", "q9"];
+        let mut reads: Vec<RawRecord> = Vec::new();
+        for i in 0..10 {
+            let name = format!("q{i}");
+            let cigar: Vec<(Kind, usize)> = if minority.contains(&name.as_str()) {
+                vec![(Kind::Match, 10), (Kind::Deletion, 2), (Kind::Match, 20)]
+            } else {
+                vec![(Kind::Match, 30)]
+            };
+            reads.extend(create_fr_pair(
+                &name,
+                1,
+                11,
+                30,
+                35,
+                &cigar,
+                &cigar,
+                "mi",
+                Some("ACC-TGA"),
+                false,
+                true,
+            ));
+        }
+
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
+
+        assert_eq!(
+            output.count, 1,
+            "filtering before capping must keep the majority-alignment reads and emit a consensus"
+        );
+    }
+
+    /// Each strand is capped from its *own* filtered set, not from the templates the two
+    /// strands happen to share.
+    ///
+    /// The sibling test above gives every template the same CIGAR on R1 and R2, so it passes
+    /// whether the cap retains reads per strand or retains whole pairs. This one makes the two
+    /// filters disagree: of twelve templates, `q0..q6` carry the majority alignment on R1 and
+    /// `q5..q11` carry it on R2, so the filtered sets are seven each and overlap in only `q5`
+    /// and `q6`.
+    ///
+    /// With `--max-reads 3` and `--min-reads 3`, per-strand capping draws three from each
+    /// seven-member set and both strands reach the cap. Retaining pairs instead — which is
+    /// what a single shared index vector across the two lists amounts to — can retain at most
+    /// the two shared templates, which is below `--min-reads` and emits nothing. So `aD` and
+    /// `bD` are the discriminating assertion here, not the record count alone.
+    #[test]
+    fn codec_caps_each_strand_from_its_own_filtered_set() {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 3,
+            max_reads_per_strand: Some(3),
+            min_duplex_length: 1,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        let majority: Vec<(Kind, usize)> = vec![(Kind::Match, 30)];
+        let minority: Vec<(Kind, usize)> =
+            vec![(Kind::Match, 10), (Kind::Deletion, 2), (Kind::Match, 20)];
+
+        let mut reads: Vec<RawRecord> = Vec::new();
+        for i in 0..12 {
+            // R1 majority is q0..q6; R2 majority is q5..q11. Both are 7 of 12, so each is the
+            // most common pattern on its own strand, and they share only q5 and q6.
+            let r1_cigar = if i <= 6 { &majority } else { &minority };
+            let r2_cigar = if i >= 5 { &majority } else { &minority };
+            reads.extend(create_fr_pair(
+                &format!("q{i}"),
+                1,
+                11,
+                30,
+                35,
+                r1_cigar,
+                r2_cigar,
+                "mi",
+                Some("ACC-TGA"),
+                false,
+                true,
+            ));
+        }
+
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
+
+        assert_eq!(
+            output.count, 1,
+            "each strand has seven reads after its own filter, so both clear --min-reads 3"
+        );
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
+        assert_eq!(
+            consensus.get_int_tag(SamTag::AD),
+            Some(3),
+            "R1 must be capped from its own seven filtered reads, not from the two shared with R2"
+        );
+        assert_eq!(
+            consensus.get_int_tag(SamTag::BD),
+            Some(3),
+            "R2 must be capped from its own seven filtered reads, not from the two shared with R1"
+        );
+    }
+
+    /// A zero cap rejects the family instead of panicking.
+    ///
+    /// `cap_infos_to_lowest_ranking(_, _, 0)` empties both strands, and phase 4 takes the
+    /// longest of each with `expect("non-empty")`. The `codec` command cannot reach this --
+    /// `--max-reads` must be at least `--min-reads >= 1` -- so the guard exists for a caller
+    /// that builds `CodecConsensusOptions` directly, which is the only way this crate can be
+    /// handed a zero.
+    #[test]
+    fn codec_zero_cap_rejects_rather_than_panics() {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            max_reads_per_strand: Some(0),
+            min_duplex_length: 1,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        let reads = create_fr_pair(
+            "q0",
+            1,
+            11,
+            30,
+            35,
+            &[(Kind::Match, 30)],
+            &[(Kind::Match, 30)],
+            "mi",
+            Some("ACC-TGA"),
+            false,
+            true,
+        );
+
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("a zero cap must reject the family, not fail the call");
+
+        assert_eq!(output.count, 0, "a cap of zero retains no reads, so no consensus is emitted");
+        assert_eq!(
+            caller.stats.rejection_reasons.get(&CallerRejectionReason::InsufficientReads),
+            Some(&2),
+            "both reads of the family must be accounted for as rejected"
         );
     }
 
