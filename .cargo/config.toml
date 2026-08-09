@@ -3,6 +3,13 @@ ci-test = "nextest run --workspace --features compare,simulate,profile-adjacency
 ci-fmt = "fmt --all -- --check"
 ci-lint = "clippy --workspace --all-targets --features compare,simulate,profile-adjacency -- -D warnings -W clippy::pedantic"
 ci-tag-literals = "run --package xtask -- check-tag-literals"
+# Validate the crates.io publish list against the workspace: it must name every
+# publishable workspace crate (those without `publish = false`), name nothing
+# else, and list them in dependency order. This is the local gate for that;
+# before it existed the only check was the `publish-order` CI job, so adding a
+# crate without listing it was invisible until after the push. Delegates to
+# scripts/publish-crates.sh so the local gate and CI share one definition.
+ci-publish-order = "run --package xtask -- check-publish-order"
 # Run documentation tests (nextest does not run doctests, so ci-test skips them)
 ci-doctest = "test --doc --workspace --features compare,simulate,profile-adjacency --locked"
 # Build the docs and fail on any rustdoc warning (e.g. broken intra-doc links).

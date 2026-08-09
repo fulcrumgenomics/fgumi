@@ -93,7 +93,8 @@ Commands implement the `Command` trait dispatched via enum:
 ## Development Practices
 
 ### Pre-commit Hooks
-Install with `./scripts/install-hooks.sh`. Runs `cargo ci-fmt` and `cargo ci-lint` before commits.
+Install with `./scripts/install-hooks.sh`. Runs `cargo ci-fmt`, `cargo ci-lint`,
+`cargo ci-tag-literals`, and `cargo ci-publish-order` before commits.
 
 To include tests: `FGUMI_PRECOMMIT_TEST=1 git commit`
 

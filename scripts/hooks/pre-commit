@@ -47,6 +47,19 @@ if ! cargo ci-tag-literals; then
     exit 1
 fi
 
+# Check the crates.io publish list names every publishable workspace crate, and
+# only those, in dependency order
+echo "==> cargo ci-publish-order"
+if ! cargo ci-publish-order; then
+    echo ""
+    echo "Publish-order check failed!"
+    echo "The CRATES list in scripts/publish-crates.sh is missing a publishable"
+    echo "workspace crate, contains an extra or stale entry, or is not in dependency"
+    echo "order. See the ERROR above: it names the offending crates and what to do"
+    echo "with them (add in dependency order, remove, or reorder)."
+    exit 1
+fi
+
 # Optionally run tests
 if [[ "${FGUMI_PRECOMMIT_TEST:-0}" == "1" ]]; then
     echo "==> cargo ci-test"
