@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-fmt", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/fgumi-cli-common", "crates/fgumi-cli-macros", "crates/fgumi-pipeline-core", "crates/xtask"]
+members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-fmt", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/fgumi-cli-common", "crates/fgumi-cli-macros", "crates/fgumi-pipeline-core", "crates/fgumi-pipeline-io", "crates/xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -29,6 +29,7 @@ fgumi-consensus = { version = "0.6.0", path = "crates/fgumi-consensus", default-
 fgumi-dna = { version = "0.6.0", path = "crates/fgumi-dna" }
 fgumi-metrics = { version = "0.6.0", path = "crates/fgumi-metrics" }
 fgumi-pipeline-core = { version = "0.6.0", path = "crates/fgumi-pipeline-core" }
+fgumi-pipeline-io = { version = "0.6.0", path = "crates/fgumi-pipeline-io" }
 fgumi-raw-bam = { version = "0.6.0", path = "crates/fgumi-raw-bam" }
 fgumi-sam = { version = "0.6.0", path = "crates/fgumi-sam" }
 fgumi-simd-fastq = { version = "0.6.0", path = "crates/fgumi-simd-fastq" }

@@ -116,7 +116,11 @@ jobs:
         with:
           tool: nextest
       - name: Generate coverage
-        run: cargo llvm-cov nextest --workspace --features compare,simulate,profile-adjacency --no-tests=pass --lcov --output-path lcov.info
+        # Includes `fgumi-pipeline-io/stress-tests`: the soak/matrix/proptest
+        # suites are gated off the fast `test` job, but they cover ~200 lines that
+        # nothing else reaches. Measuring without them under-reports patch
+        # coverage for code that IS tested, just not on the PR-latency path.
+        run: cargo llvm-cov nextest --workspace --features compare,simulate,profile-adjacency,fgumi-pipeline-io/stress-tests --no-tests=pass --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6.0.2
         with:
