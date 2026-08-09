@@ -896,6 +896,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "fgumi-pipeline-io"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "criterion",
+ "fgumi-bam-io",
+ "fgumi-bgzf",
+ "fgumi-pipeline-core",
+ "fgumi-raw-bam",
+ "fgumi-sort",
+ "log",
+ "noodles",
+ "parking_lot",
+ "proptest",
+ "rayon",
+ "rstest",
+ "tempfile",
+]
+
+[[package]]
 name = "fgumi-raw-bam"
 version = "0.7.0"
 dependencies = [
@@ -1499,7 +1519,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
- "regex-automata 0.4.16",
+ "regex-automata 0.4.18",
 ]
 
 [[package]]
@@ -2752,7 +2772,7 @@ dependencies = [
  "matchers",
  "nu-ansi-term",
  "once_cell",
- "regex-automata 0.4.16",
+ "regex-automata 0.4.18",
  "sharded-slab",
  "smallvec",
  "thread_local",
