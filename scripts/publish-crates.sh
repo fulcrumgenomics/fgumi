@@ -33,6 +33,7 @@ CRATES=(
   fgumi-sam
   fgumi-metrics
   fgumi-sort
+  fgumi-pipeline-io
   fgumi-consensus
   fgumi
 )
