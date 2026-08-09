@@ -9,13 +9,10 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use fgumi_bam_io::PipelineReaderOpts;
 use fgumi_bgzf::reader::read_raw_blocks;
 use noodles::sam::Header;
-use parking_lot::Mutex;
 
 use crate::types::BgzfBlock;
 use fgumi_pipeline_core::{
@@ -31,14 +28,19 @@ use fgumi_pipeline_core::{
 pub const DEFAULT_BLOCKS_PER_BATCH: usize = 16;
 
 /// `Exclusive + sticky` source step that reads raw BGZF blocks from a file.
+///
+/// The reader and the finished flag are plain owned fields, not `Arc`/atomics:
+/// this is a `Serial` step, so the runtime drives a single shared instance and
+/// never calls `new_worker_copy` on it (only `Parallel` steps are cloned per
+/// worker). There is no second owner to share them with.
 pub struct ReadBgzfBlocks {
-    reader: Arc<Mutex<Option<Box<dyn io::Read + Send>>>>,
+    reader: Option<Box<dyn io::Read + Send>>,
     blocks_per_batch: usize,
     next_serial: u64,
     pending: VecDeque<BgzfBlock>,
     held: HeldSlot<Unpushed<BgzfBlock>>,
     output_byte_limit: u64,
-    finished: Arc<AtomicBool>,
+    finished: bool,
 }
 
 impl ReadBgzfBlocks {
@@ -49,13 +51,13 @@ impl ReadBgzfBlocks {
         output_byte_limit: u64,
     ) -> Self {
         Self {
-            reader: Arc::new(Mutex::new(Some(reader))),
+            reader: Some(reader),
             blocks_per_batch: blocks_per_batch.max(1),
             next_serial: 0,
             pending: VecDeque::new(),
             held: HeldSlot::new(),
             output_byte_limit,
-            finished: Arc::new(AtomicBool::new(false)),
+            finished: false,
         }
     }
 }
@@ -101,20 +103,26 @@ impl Step for ReadBgzfBlocks {
             }
         }
 
-        if self.finished.load(Ordering::Acquire) {
+        if self.finished {
             return Ok(StepOutcome::Finished);
         }
 
-        // 3. Read up to `blocks_per_batch` raw BGZF blocks.
+        // 3. Read up to `blocks_per_batch` raw BGZF blocks. The reader is taken
+        // only at end of stream, so `None` here means `try_run` was called again
+        // after it already returned `Finished`.
         let raw_blocks = {
-            let mut guard = self.reader.lock();
-            let reader =
-                guard.as_mut().expect("ReadBgzfBlocks: reader missing — was clone() called?");
+            let reader = self
+                .reader
+                .as_mut()
+                .expect("ReadBgzfBlocks: try_run called after the source reported Finished");
             read_raw_blocks(reader.as_mut(), self.blocks_per_batch)?
         };
 
         if raw_blocks.is_empty() {
-            self.finished.store(true, Ordering::Release);
+            self.finished = true;
+            // Release the reader (and its 2 MiB BufReader) as soon as the stream
+            // is drained rather than holding it for the rest of the run.
+            self.reader = None;
             return Ok(StepOutcome::Finished);
         }
 
@@ -230,6 +238,7 @@ pub fn read_bam_auto<P: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     #[test]
     fn profile_advertises_serial_reader_byordinal() {
@@ -250,47 +259,188 @@ mod tests {
         assert!(matches!(profile.output_queues[0], QueueSpec::ByteBounded { .. }));
     }
 
-    #[test]
-    fn read_bam_from_reader_round_trips_bytes() {
-        const BGZF_EOF_LEN: usize = 28;
+    // ---------------------------------------------------------------------
+    // Driving the step through a real pipeline
+    // ---------------------------------------------------------------------
 
-        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-        let header = noodles::sam::Header::default();
-        let writer = fgumi_bam_io::create_raw_bam_writer(&path, &header, 1, 1).unwrap();
-        writer.finish().unwrap();
+    /// Sink that records every `BgzfBlock` the source emits, in arrival order.
+    struct BlockSink {
+        received: std::sync::Arc<parking_lot::Mutex<Vec<BgzfBlock>>>,
+    }
 
-        let on_disk = std::fs::read(&path).unwrap();
-        assert!(!on_disk.is_empty(), "BAM file should contain header + EOF block");
+    impl Step for BlockSink {
+        type Input = BgzfBlock;
+        type Outputs = ();
 
-        let cursor = std::io::Cursor::new(on_disk.clone());
-        let reader: Box<dyn io::Read + Send> = Box::new(cursor);
-        let (mut step, _hdr) =
-            read_bam_from_reader(reader, header, DEFAULT_BLOCKS_PER_BATCH, 1024 * 1024);
-
-        let mut collected = Vec::with_capacity(on_disk.len());
-        let mut last_serial: Option<u64> = None;
-        loop {
-            let raw_blocks = {
-                let mut guard = step.reader.lock();
-                let reader = guard.as_mut().expect("reader present");
-                fgumi_bgzf::reader::read_raw_blocks(reader.as_mut(), DEFAULT_BLOCKS_PER_BATCH)
-                    .unwrap()
-            };
-            if raw_blocks.is_empty() {
-                break;
-            }
-            for raw in raw_blocks {
-                let serial = step.next_serial;
-                step.next_serial += 1;
-                if let Some(prev) = last_serial {
-                    assert_eq!(serial, prev + 1, "serials must be monotonic");
-                }
-                last_serial = Some(serial);
-                collected.extend_from_slice(&raw.data);
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "BlockSink",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
             }
         }
-        let expected = &on_disk[..on_disk.len() - BGZF_EOF_LEN];
-        assert_eq!(collected, expected, "concatenated blocks must equal source bytes minus EOF");
-        assert!(last_serial.is_some(), "should have read at least one block");
+
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(block) => {
+                    self.received.lock().push(block);
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    /// Write `record_count` records to a temp BAM and return its `path` plus the
+    /// on-disk bytes.
+    fn temp_bam(record_count: usize) -> (tempfile::TempPath, Vec<u8>) {
+        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let header = noodles::sam::Header::default();
+        let mut writer = fgumi_bam_io::create_raw_bam_writer(&path, &header, 1, 1).unwrap();
+        for i in 0..record_count {
+            let name = format!("q{i}");
+            let bytes = fgumi_raw_bam::testutil::make_bam_bytes(
+                0,
+                i32::try_from(i).unwrap(),
+                0,
+                name.as_bytes(),
+                &[],
+                10,
+                -1,
+                -1,
+                &[],
+            );
+            writer.write_raw_record(&bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        let on_disk = std::fs::read(&path).unwrap();
+        (path, on_disk)
+    }
+
+    /// Run a `ReadBgzfBlocks -> BlockSink` pipeline and return the emitted blocks.
+    fn drive(path: &Path, blocks_per_batch: usize, threads: usize) -> Vec<BgzfBlock> {
+        let received = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (source, _hdr) =
+            read_bam(path, PipelineReaderOpts::default(), blocks_per_batch, 1024 * 1024).unwrap();
+        let sink = BlockSink { received: std::sync::Arc::clone(&received) };
+
+        let builder = fgumi_pipeline_core::builder::Pipeline::builder();
+        builder.chain(source).chain(sink).into_sink_marker();
+        let pipeline = builder.build().unwrap();
+        pipeline
+            .run(fgumi_pipeline_core::builder::PipelineConfig { threads, ..Default::default() })
+            .unwrap();
+
+        // Returned in ARRIVAL order, deliberately unsorted: the step declares
+        // `BranchOrdering::ByItemOrdinal`, so the sink must already see blocks in
+        // serial order. Sorting here would normalize out-of-order delivery and let
+        // an ordering regression pass.
+        std::mem::take(&mut *received.lock())
+    }
+
+    #[rstest]
+    #[case::single_block_batches(1)]
+    #[case::default_batching(DEFAULT_BLOCKS_PER_BATCH)]
+    #[case::larger_than_the_file(1024)]
+    fn try_run_emits_every_block_with_dense_serials(#[case] blocks_per_batch: usize) {
+        const BGZF_EOF_LEN: usize = 28;
+        let (path, on_disk) = temp_bam(64);
+        let blocks = drive(&path, blocks_per_batch, 1);
+
+        assert!(!blocks.is_empty(), "a non-empty BAM must yield at least one block");
+
+        // Serials are dense and start at zero.
+        for (i, block) in blocks.iter().enumerate() {
+            assert_eq!(block.batch_serial, i as u64, "serial {i} must be dense");
+            // `bytes` is the raw *compressed* block (this step does not inflate),
+            // so it is not the same length as `uncompressed_size`; only that the
+            // declared inflated size is populated is checkable here.
+            assert!(block.uncompressed_size > 0, "block {i} must declare an inflated size");
+            assert!(!block.bytes.is_empty(), "block {i} must carry its compressed bytes");
+        }
+
+        // Concatenating the payloads reproduces the file minus its BGZF EOF block,
+        // which is what `FindBamBoundaries` downstream expects to receive.
+        let concatenated: Vec<u8> = blocks.iter().flat_map(|b| b.bytes.clone()).collect();
+        assert_eq!(concatenated, on_disk[..on_disk.len() - BGZF_EOF_LEN]);
+    }
+
+    #[test]
+    fn try_run_emits_the_same_blocks_regardless_of_thread_count() {
+        let (path, _) = temp_bam(64);
+        let one = drive(&path, 4, 1);
+        let many = drive(&path, 4, 4);
+        assert_eq!(one.len(), many.len(), "block count must not depend on threads");
+        for (a, b) in one.iter().zip(many.iter()) {
+            assert_eq!(a.batch_serial, b.batch_serial);
+            assert_eq!(a.bytes, b.bytes);
+        }
+    }
+
+    #[test]
+    fn try_run_on_a_header_only_bam_still_emits_the_header_block() {
+        const BGZF_EOF_LEN: usize = 28;
+        let (path, on_disk) = temp_bam(0);
+        let blocks = drive(&path, DEFAULT_BLOCKS_PER_BATCH, 1);
+        let concatenated: Vec<u8> = blocks.iter().flat_map(|b| b.bytes.clone()).collect();
+        assert_eq!(concatenated, on_disk[..on_disk.len() - BGZF_EOF_LEN]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Constructor + dispatch
+    // ---------------------------------------------------------------------
+
+    #[rstest]
+    #[case::zero_clamps_to_one(0, 1)]
+    #[case::one_stays_one(1, 1)]
+    #[case::larger_is_preserved(32, 32)]
+    fn new_clamps_blocks_per_batch_to_at_least_one(
+        #[case] requested: usize,
+        #[case] expected: usize,
+    ) {
+        let reader: Box<dyn io::Read + Send> = Box::new(io::Cursor::new(Vec::new()));
+        let step = ReadBgzfBlocks::new(reader, requested, 1024);
+        assert_eq!(step.blocks_per_batch, expected);
+    }
+
+    #[test]
+    fn read_bam_auto_routes_a_regular_path_to_the_file_reader() {
+        let (path, _) = temp_bam(4);
+        // `read_bam_auto` on a non-stdin path must behave exactly like `read_bam`:
+        // same header, and a step that reads the same file.
+        let (_, auto_hdr) =
+            read_bam_auto(&path, PipelineReaderOpts::default(), 4, 1024 * 1024).unwrap();
+        let (_, direct_hdr) =
+            read_bam(&path, PipelineReaderOpts::default(), 4, 1024 * 1024).unwrap();
+        assert_eq!(auto_hdr, direct_hdr);
+        assert!(!fgumi_bam_io::is_stdin_path(AsRef::<Path>::as_ref(&path)));
+    }
+
+    #[rstest]
+    #[case::dash("-")]
+    #[case::dev_stdin("/dev/stdin")]
+    fn stdin_sentinels_are_recognised(#[case] sentinel: &str) {
+        // Guards the branch condition in `read_bam_auto` without consuming the
+        // process's real stdin, which a test must not do.
+        assert!(fgumi_bam_io::is_stdin_path(Path::new(sentinel)));
+    }
+
+    #[test]
+    fn read_bam_errors_on_a_missing_file() {
+        // `ReadBgzfBlocks` is not `Debug`, so inspect the variant directly rather
+        // than via `expect_err`.
+        let result = read_bam(
+            Path::new("/nonexistent/definitely/not/here.bam"),
+            PipelineReaderOpts::default(),
+            4,
+            1024,
+        );
+        match result {
+            Ok(_) => panic!("a missing file must not open"),
+            Err(e) => assert!(!e.to_string().is_empty()),
+        }
     }
 }

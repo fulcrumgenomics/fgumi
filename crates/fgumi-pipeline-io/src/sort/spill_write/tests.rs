@@ -167,3 +167,114 @@ fn residual_maps_to_memory_chunk_and_announced_passes_through() {
         })
     ));
 }
+
+// ── Step wiring: profile / affinity / detached group ─────────────────────────
+
+#[test]
+fn profile_defaults_to_a_pool_scheduled_serial_writer() {
+    let (w, _dir) = make_writer(SpillCodec::Zstd);
+    let profile = w.profile();
+    assert_eq!(profile.name, "SpillWrite");
+    assert_eq!(profile.kind, StepKind::Serial, "default is the pool-scheduled writer");
+    assert!(profile.sticky);
+    assert_eq!(profile.branch_ordering, vec![BranchOrdering::None]);
+    match profile.output_queues.as_slice() {
+        [QueueSpec::ByteBounded { limit_bytes }] => assert_eq!(*limit_bytes, 1 << 20),
+        other => panic!("expected one byte-bounded queue, got {other:?}"),
+    }
+    // Affinity pins the pool-scheduled writer; ignored once detached.
+    assert_eq!(w.affinity(), Affinity::Writer);
+}
+
+#[test]
+fn with_detached_flips_only_the_step_kind() {
+    let (w, _dir) = make_writer(SpillCodec::Zstd);
+    let before = w.profile();
+    let detached = w.with_detached();
+    let after = detached.profile();
+
+    assert_eq!(before.kind, StepKind::Serial);
+    assert_eq!(after.kind, StepKind::Detached, "detached runs on its own thread");
+    // Everything else about the step is unchanged — the doc promises the
+    // `try_run` body and the bytes written are identical either way.
+    assert_eq!(after.name, before.name);
+    assert_eq!(after.sticky, before.sticky);
+    assert_eq!(after.branch_ordering, before.branch_ordering);
+    assert_eq!(detached.affinity(), Affinity::Writer);
+}
+
+#[test]
+fn detached_writer_shares_the_sort_io_group() {
+    // Phase-1 spill and phase-2 output writes are temporally disjoint, so both
+    // ride the same driver thread rather than each taking one.
+    let (w, _dir) = make_writer(SpillCodec::Zstd);
+    assert_eq!(w.detached_group(), DetachedGroup::Shared(crate::sort::SORT_IO_GROUP));
+    let (w2, _dir2) = make_writer(SpillCodec::Bgzf);
+    assert_eq!(
+        w2.with_detached().detached_group(),
+        DetachedGroup::Shared(crate::sort::SORT_IO_GROUP)
+    );
+}
+
+// ── Open-file bookkeeping ────────────────────────────────────────────────────
+
+#[test]
+fn ensure_no_open_file_passes_when_idle_and_fails_while_a_file_is_open() {
+    let (mut w, _dir) = make_writer(SpillCodec::Zstd);
+    w.ensure_no_open_file("Residual").expect("idle writer has no open file");
+
+    // Opening a file without its is_last block leaves it dangling.
+    let out = w.process_event(block(SpillCodec::Zstd, 3, false, &[7u8; 16])).unwrap();
+    assert!(out.is_none());
+    assert!(w.current.is_some());
+
+    let err = w.ensure_no_open_file("AllAnnounced").expect_err("dangling file must fail closed");
+    let msg = err.to_string();
+    assert!(msg.contains("AllAnnounced"), "error names the offending event: {msg}");
+    assert!(msg.contains("file_id 3"), "error names the open file: {msg}");
+}
+
+#[test]
+fn open_file_refuses_to_reuse_an_existing_path() {
+    let (w, dir) = make_writer(SpillCodec::Zstd);
+    // First open succeeds and creates the file on disk.
+    let opened = w.open_file(9).expect("first open succeeds");
+    drop(opened);
+    assert!(dir.path().join("chunk_0009.keyed").exists(), "spill file is created eagerly");
+
+    // A reused file_id must fail closed rather than truncate the existing file:
+    // silently overwriting a spill would drop records from the merge.
+    // `OpenSpill` is not `Debug`, so match instead of using `expect_err`.
+    match w.open_file(9) {
+        Ok(_) => panic!("reusing a file_id must fail"),
+        Err(e) => assert_eq!(e.kind(), io::ErrorKind::AlreadyExists),
+    }
+}
+
+/// `AllAnnounced` arriving while a spill file is still open must fail closed.
+///
+/// Without the guard, `AllAnnounced` reaches `SortMerge` before the matching
+/// `SpillReady`, so the merge starts against an undercounted slot set and
+/// silently drops a spill file's records.
+#[test]
+fn all_announced_while_a_file_is_open_fails_closed() {
+    let codec = SpillCodec::Zstd;
+    let (mut w, _dir) = make_writer(codec);
+    // Open file 0 and never terminate it with an is_last_in_file block.
+    w.process_event(block(codec, 0, false, &[1u8; 16])).unwrap();
+
+    match w.process_event(SpillBlockEvent::AllAnnounced {
+        ordinal: 1,
+        slot_count: 1,
+        memory_chunk_count: 0,
+        total_records: 1,
+    }) {
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(msg.contains("AllAnnounced"), "error names the event: {msg}");
+            assert!(msg.contains("still open"), "error names the cause: {msg}");
+            assert!(msg.contains("file_id 0"), "error names the open file: {msg}");
+        }
+        Ok(_) => panic!("AllAnnounced while a spill file is open must error"),
+    }
+}

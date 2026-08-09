@@ -200,3 +200,124 @@ fn stage_residual_and_announced_pass_through_with_ordinals() {
         }
     ));
 }
+
+// ── Step wiring + ordinal minting ────────────────────────────────────────────
+
+#[test]
+fn profile_runs_off_pool_on_the_coordination_driver() {
+    let step = SpillGather::new(4096);
+    let profile = step.profile();
+    assert_eq!(profile.name, "SpillGather");
+    // Detached keeps the serial framing + ordinal minting off a pool worker, so
+    // it cannot starve the parallel spill compressors downstream.
+    assert_eq!(profile.kind, StepKind::Detached);
+    assert!(!profile.sticky);
+    assert_eq!(profile.branch_ordering, vec![BranchOrdering::ByItemOrdinal]);
+    match profile.output_queues.as_slice() {
+        [QueueSpec::ByteBounded { limit_bytes }] => assert_eq!(*limit_bytes, 4096),
+        other => panic!("expected one byte-bounded queue, got {other:?}"),
+    }
+    assert_eq!(step.detached_group(), DetachedGroup::Shared(crate::sort::SORT_COORD_GROUP));
+}
+
+#[test]
+fn ordinals_are_dense_and_monotonic_across_event_kinds() {
+    // Downstream `ByItemOrdinal` reordering depends on a gap-free sequence, and
+    // the counter is shared by every emitted event, not per-variant.
+    let mut step = SpillGather::new(1 << 20);
+
+    step.stage_event(SortChunkEvent::Residual {
+        chunk: coord_chunk(vec![vec![1u8; 8]]),
+        records_ingested_so_far: 1,
+    });
+    step.stage_event(SortChunkEvent::AllAnnounced {
+        slot_count: 1,
+        memory_chunk_count: 1,
+        total_records: 1,
+    });
+    step.stage_event(SortChunkEvent::Residual {
+        chunk: coord_chunk(vec![vec![2u8; 8]]),
+        records_ingested_so_far: 2,
+    });
+
+    let ordinals: Vec<u64> = step
+        .pending
+        .iter()
+        .map(|e| match e {
+            SpillBlockEvent::Block { ordinal, .. }
+            | SpillBlockEvent::Residual { ordinal, .. }
+            | SpillBlockEvent::AllAnnounced { ordinal, .. } => *ordinal,
+        })
+        .collect();
+    assert_eq!(ordinals, vec![0, 1, 2], "ordinals must be dense across variants");
+    assert_eq!(step.next_ordinal, 3);
+}
+
+#[test]
+fn an_empty_spill_chunk_is_skipped_rather_than_opening_a_file() {
+    // A zero-block file would never receive an `is_last_in_file` terminator, so
+    // `SpillWrite` would be left with a dangling open file forever.
+    let mut step = SpillGather::new(1 << 20);
+    step.stage_event(SortChunkEvent::Spill {
+        seq: 0,
+        chunk: coord_chunk(Vec::new()),
+        records_ingested_so_far: 0,
+    });
+    assert!(step.active.is_none(), "an empty chunk must not become the active spill");
+    assert!(step.pending.is_empty(), "and must emit nothing");
+    assert_eq!(step.next_ordinal, 0, "and must not consume an ordinal");
+}
+
+#[test]
+fn a_non_empty_spill_chunk_becomes_active_without_emitting_yet() {
+    let mut step = SpillGather::new(1 << 20);
+    step.stage_event(SortChunkEvent::Spill {
+        seq: 7,
+        chunk: coord_chunk(vec![vec![3u8; 32], vec![4u8; 32]]),
+        records_ingested_so_far: 2,
+    });
+    let active = step.active.as_ref().expect("chunk must be parked for incremental framing");
+    assert_eq!(active.file_id, 7, "file_id comes from the spill seq, not write order");
+    assert_eq!(active.next_idx, 0);
+    assert!(step.pending.is_empty(), "framing happens in produce_blocks, not stage_event");
+}
+
+/// The `TemplateCoordinate` variant is framed by a *different* function than the
+/// other three: `frame_record_at` routes it to `c.frame_record_into`, while
+/// `Coordinate` / `QuerynameLex` / `QuerynameNatural` share `frame_keyed_record_into`.
+/// Every other test here uses `coord_chunk`, so that branch never ran. A layout
+/// divergence produces spill files that `SortMerge` misreads — wrong output, not a
+/// crash — so the fourth variant needs its own framing coverage.
+#[test]
+fn template_coordinate_chunks_frame_through_their_own_path() {
+    use fgumi_sort::{TemplateKey24, TemplateMemChunk};
+
+    let payloads = [vec![0xA1u8; 24], vec![0xB2u8; 40], vec![0xC3u8; 8]];
+    let recs = payloads.iter().map(|b| (TemplateKey24::default(), b.clone())).collect::<Vec<_>>();
+    let chunk = MemoryChunkErased::TemplateCoordinate(TemplateMemChunk::K24(
+        InMemoryChunk::from_owned_records(recs),
+    ));
+
+    // Frame the whole chunk; every record must be emitted exactly once.
+    let mut blocks = Vec::new();
+    let mut next = 0usize;
+    while next < chunk.len() {
+        let mut out = Vec::new();
+        let consumed =
+            frame_one_block(&chunk, next, BGZF_MAX_BLOCK_SIZE, &mut out).expect("template framing");
+        assert!(consumed > 0, "framing must make progress on every call");
+        next += consumed;
+        blocks.push(out);
+    }
+    assert_eq!(next, payloads.len(), "every template record is framed");
+
+    // Each payload appears in the framed stream, so the template layout carries
+    // the record bodies through unchanged.
+    let framed = concat(&blocks);
+    for (i, p) in payloads.iter().enumerate() {
+        assert!(
+            framed.windows(p.len()).any(|w| w == p.as_slice()),
+            "record {i}'s body must survive template framing"
+        );
+    }
+}

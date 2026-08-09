@@ -364,42 +364,279 @@ impl Default for BoundaryState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    /// Build a BAM header: magic, `l_text` + text, `n_ref` + one entry per `(name, l_ref)`.
+    ///
+    /// Every test header is constructed here rather than committed as a fixture, so a
+    /// header's declared lengths and its actual bytes cannot drift apart.
+    fn header(text: &str, refs: &[(&str, u32)]) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(fgumi_raw_bam::BAM_MAGIC);
+        h.extend_from_slice(&u32::try_from(text.len()).unwrap().to_le_bytes());
+        h.extend_from_slice(text.as_bytes());
+        h.extend_from_slice(&u32::try_from(refs.len()).unwrap().to_le_bytes());
+        for (name, l_ref) in refs {
+            // l_name counts the trailing NUL, matching the BAM spec.
+            let name_bytes = format!("{name}\0");
+            h.extend_from_slice(&u32::try_from(name_bytes.len()).unwrap().to_le_bytes());
+            h.extend_from_slice(name_bytes.as_bytes());
+            h.extend_from_slice(&l_ref.to_le_bytes());
+        }
+        h
+    }
+
+    /// Build one BAM record: a 4-byte little-endian `block_size` followed by
+    /// `payload_len` bytes of `fill`. The scanner only reads the length prefix, so
+    /// the payload just has to be the declared size and be identifiable.
+    fn record(payload_len: usize, fill: u8) -> Vec<u8> {
+        let mut r = u32::try_from(payload_len).unwrap().to_le_bytes().to_vec();
+        r.extend(std::iter::repeat_n(fill, payload_len));
+        r
+    }
+
+    /// The expected total on-disk size of a record with `payload_len` bytes.
+    fn record_len(payload_len: usize) -> usize {
+        payload_len + 4
+    }
+
+    // ---------------------------------------------------------------------
+    // bam_header_len
+    // ---------------------------------------------------------------------
+
+    /// What a `bam_header_len` case expects: a parsed length (or `None` for
+    /// "need more bytes"), or a hard `InvalidData` rejection.
+    #[derive(Debug, Clone, Copy)]
+    enum Expect {
+        Header(Option<usize>),
+        InvalidMagic,
+    }
+
+    #[rstest]
+    #[case::empty(vec![], Expect::Header(None))]
+    #[case::shorter_than_magic(b"BAM".to_vec(), Expect::Header(None))]
+    #[case::magic_only_no_room_for_n_ref(
+        // 8 bytes: magic + l_text=0. Needs offset+4 == 12 to read n_ref.
+        [&fgumi_raw_bam::BAM_MAGIC[..], &0u32.to_le_bytes()[..]].concat(),
+        Expect::Header(None)
+    )]
+    #[case::no_refs(header("", &[]), Expect::Header(Some(12)))]
+    #[case::with_header_text(header("@HD\tVN:1.6\n", &[]), Expect::Header(Some(12 + 11)))]
+    // 12 + (4 l_name + 3 name + 4 l_ref) == 23
+    #[case::one_ref(header("", &[("r1", 100)]), Expect::Header(Some(23)))]
+    #[case::two_refs(header("", &[("r1", 100), ("chr2", 200)]), Expect::Header(Some(23 + 4 + 5 + 4)))]
+    #[case::truncated_mid_ref_name(header("", &[("r1", 100)])[..20].to_vec(), Expect::Header(None))]
+    #[case::truncated_before_l_name(header("", &[("r1", 100)])[..14].to_vec(), Expect::Header(None))]
+    #[case::bad_magic(b"NOT\x01\x00\x00\x00\x00\x00\x00\x00\x00".to_vec(), Expect::InvalidMagic)]
+    fn bam_header_len_cases(#[case] data: Vec<u8>, #[case] expected: Expect) {
+        match expected {
+            Expect::Header(len) => assert_eq!(bam_header_len(&data).unwrap(), len),
+            Expect::InvalidMagic => {
+                let err = bam_header_len(&data).expect_err("expected an error");
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Constructors
+    // ---------------------------------------------------------------------
 
     #[test]
-    fn bam_header_len_matches_constructed_header() {
-        // Minimal BAM header: magic + l_text=0 + n_ref=0 → 12 bytes.
-        let mut h = Vec::new();
-        h.extend_from_slice(b"BAM\x01");
-        h.extend_from_slice(&0u32.to_le_bytes()); // l_text
-        h.extend_from_slice(&0u32.to_le_bytes()); // n_ref
-        assert_eq!(bam_header_len(&h).unwrap(), Some(12));
+    fn new_skips_the_header_and_new_no_header_does_not() {
+        let hdr = header("", &[]);
+        let rec = record(8, 0xAB);
 
-        // One reference: magic + l_text=0 + n_ref=1 + l_name=3 + name "r1\0" + l_ref=100
-        // → 4 + 4 + 4 + 4 + 3 + 4 = 23 bytes, i.e. 12 + 4 + 3 + 4.
-        let mut h2 = Vec::new();
-        h2.extend_from_slice(b"BAM\x01");
-        h2.extend_from_slice(&0u32.to_le_bytes()); // l_text
-        h2.extend_from_slice(&1u32.to_le_bytes()); // n_ref
-        h2.extend_from_slice(&3u32.to_le_bytes()); // l_name
-        h2.extend_from_slice(b"r1\0"); // name
-        h2.extend_from_slice(&100u32.to_le_bytes()); // l_ref
-        assert_eq!(bam_header_len(&h2).unwrap(), Some(12 + 4 + 3 + 4));
+        // `new` consumes the header, so the first record starts after it.
+        let mut with_header = BoundaryState::new();
+        let (offsets, range) = with_header.scan(&[hdr.clone(), rec.clone()].concat()).unwrap();
+        assert_eq!(range, hdr.len()..hdr.len() + record_len(8));
+        assert_eq!(offsets, vec![0, record_len(8)]);
+        assert_eq!(with_header.records_bytes(range), rec.as_slice());
 
-        // Non-BAM magic → InvalidData error (fail closed; genuinely headerless
-        // streams must use `BoundaryState::new_no_header`).
-        let non_bam = b"NOT\x01\x00\x00\x00\x00\x00\x00\x00\x00";
-        let err = bam_header_len(non_bam).expect_err("non-BAM magic must error");
+        // `new_no_header` treats byte 0 as the first record.
+        let mut headerless = BoundaryState::new_no_header();
+        let (offsets, range) = headerless.scan(&rec).unwrap();
+        assert_eq!(range, 0..record_len(8));
+        assert_eq!(offsets, vec![0, record_len(8)]);
+    }
+
+    #[test]
+    fn default_matches_new_and_still_skips_the_header() {
+        let data = [header("", &[]), record(4, 0x11)].concat();
+        let mut from_default = BoundaryState::default();
+        let mut from_new = BoundaryState::new();
+        assert_eq!(from_default.scan(&data).unwrap(), from_new.scan(&data).unwrap());
+    }
+
+    // ---------------------------------------------------------------------
+    // scan
+    // ---------------------------------------------------------------------
+
+    #[rstest]
+    #[case::single(vec![8])]
+    #[case::several_same_size(vec![4, 4, 4])]
+    #[case::mixed_sizes(vec![1, 16, 3, 32])]
+    #[case::zero_length_payload(vec![0, 0])]
+    fn scan_finds_every_complete_record(#[case] payloads: Vec<usize>) {
+        let mut data = header("", &[]);
+        for (i, len) in payloads.iter().enumerate() {
+            data.extend(record(*len, u8::try_from(i).unwrap()));
+        }
+
+        let mut state = BoundaryState::new();
+        let (offsets, range) = state.scan(&data).unwrap();
+
+        // One offset per record plus the terminating end offset.
+        assert_eq!(offsets.len(), payloads.len() + 1);
+        let mut running = 0usize;
+        for (i, len) in payloads.iter().enumerate() {
+            assert_eq!(offsets[i], running, "record {i} start");
+            running += record_len(*len);
+        }
+        assert_eq!(*offsets.last().unwrap(), running);
+        assert_eq!(range.len(), running);
+        assert!(state.leftover.is_empty(), "no leftover when every record is complete");
+    }
+
+    #[test]
+    fn scan_holds_back_a_trailing_partial_record_as_leftover() {
+        let complete = record(8, 0x01);
+        let partial = &record(64, 0x02)[..10]; // declares 64 bytes, supplies 6
+        let data = [header("", &[]), complete.clone(), partial.to_vec()].concat();
+
+        let mut state = BoundaryState::new();
+        let (offsets, range) = state.scan(&data).unwrap();
+
+        // Only the complete record is emitted.
+        assert_eq!(offsets, vec![0, record_len(8)]);
+        assert_eq!(state.records_bytes(range), complete.as_slice());
+        assert_eq!(state.leftover, partial, "the partial record is carried forward verbatim");
+    }
+
+    #[test]
+    fn scan_reassembles_a_record_split_across_two_blocks() {
+        let rec = record(32, 0x7E);
+        let data = [header("", &[]), rec.clone()].concat();
+        let split = data.len() - 20; // cut mid-record
+
+        let mut state = BoundaryState::new();
+
+        // First block ends mid-record: nothing complete yet.
+        let (offsets, range) = state.scan(&data[..split]).unwrap();
+        assert_eq!(offsets, vec![0], "no complete record in the first block");
+        assert_eq!(range.len(), 0);
+        assert!(!state.leftover.is_empty());
+
+        // Second block completes it, and the bytes match the original record.
+        let (offsets, range) = state.scan(&data[split..]).unwrap();
+        assert_eq!(offsets, vec![0, record_len(32)]);
+        assert_eq!(state.records_bytes(range), rec.as_slice());
+        assert!(state.leftover.is_empty());
+    }
+
+    #[test]
+    fn scan_defers_when_the_header_itself_is_incomplete() {
+        let hdr = header("@HD\tVN:1.6\n", &[("r1", 100)]);
+        let mut state = BoundaryState::new();
+
+        // A prefix too short to hold the whole header yields an empty batch and
+        // stashes everything for the next call.
+        let (offsets, range) = state.scan(&hdr[..10]).unwrap();
+        assert_eq!(offsets, vec![0]);
+        assert_eq!(range, 0..0);
+        assert_eq!(state.leftover, hdr[..10]);
+        assert!(!state.header_skipped, "header must not be marked skipped yet");
+
+        // The rest of the header plus a record then parses normally.
+        let rec = record(8, 0x5A);
+        let (offsets, range) = state.scan(&[&hdr[10..], rec.as_slice()].concat()).unwrap();
+        assert!(state.header_skipped);
+        assert_eq!(offsets, vec![0, record_len(8)]);
+        assert_eq!(state.records_bytes(range), rec.as_slice());
+    }
+
+    #[test]
+    fn scan_propagates_a_bad_magic_as_invalid_data() {
+        let mut state = BoundaryState::new();
+        let err = state.scan(b"NOPE\x00\x00\x00\x00\x00\x00\x00\x00").expect_err("bad magic");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
 
-        // Too short to hold a complete header → Ok(None).
-        assert_eq!(bam_header_len(b"BAM").unwrap(), None);
-        assert_eq!(bam_header_len(&[]).unwrap(), None);
+    // ---------------------------------------------------------------------
+    // find_boundaries (owned-buffer wrapper over scan)
+    // ---------------------------------------------------------------------
 
-        // Exactly 8 bytes with BAM magic but no room for n_ref → None.
-        let mut short = Vec::new();
-        short.extend_from_slice(b"BAM\x01");
-        short.extend_from_slice(&0u32.to_le_bytes()); // l_text=0, offset would be 8
-        // data.len() == 8, need offset+4 == 12 → Ok(None)
-        assert_eq!(bam_header_len(&short).unwrap(), None);
+    #[test]
+    fn find_boundaries_returns_the_same_bytes_scan_would_borrow() {
+        let recs = [record(8, 0x01), record(16, 0x02), record(2, 0x03)].concat();
+        let data = [header("", &[("r1", 10)]), recs.clone()].concat();
+
+        let mut owned = BoundaryState::new();
+        let batch = owned.find_boundaries(&data).unwrap();
+
+        let mut borrowed = BoundaryState::new();
+        let (offsets, range) = borrowed.scan(&data).unwrap();
+
+        assert_eq!(batch.offsets, offsets);
+        assert_eq!(batch.buffer, borrowed.records_bytes(range));
+        assert_eq!(batch.buffer, recs, "the owned copy is the record bytes, header excluded");
+
+        // Offsets slice the buffer into the original records.
+        for i in 0..batch.offsets.len() - 1 {
+            let rec = &batch.buffer[batch.offsets[i]..batch.offsets[i + 1]];
+            let declared = u32::from_le_bytes(rec[..4].try_into().unwrap()) as usize;
+            assert_eq!(declared, rec.len() - 4, "record {i} length prefix matches its slice");
+        }
+    }
+
+    #[test]
+    fn find_boundaries_on_a_header_only_block_yields_an_empty_batch() {
+        let mut state = BoundaryState::new();
+        let batch = state.find_boundaries(&header("", &[])).unwrap();
+        assert!(batch.buffer.is_empty());
+        assert_eq!(batch.offsets, vec![0]);
+    }
+
+    // ---------------------------------------------------------------------
+    // finish
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn finish_returns_none_when_nothing_is_pending() {
+        let mut state = BoundaryState::new_no_header();
+        assert!(state.finish().unwrap().is_none());
+
+        // Also none after a scan that consumed every record.
+        let (_, _) = state.scan(&record(4, 0x09)).unwrap();
+        assert!(state.finish().unwrap().is_none());
+    }
+
+    #[test]
+    fn finish_emits_leftover_that_forms_complete_records() {
+        // `scan` never leaves a *complete* record behind, so the pending buffer is
+        // seeded directly to exercise the success branch.
+        let mut state = BoundaryState::new_no_header();
+        state.leftover = [record(4, 0xA1), record(8, 0xA2)].concat();
+
+        let batch = state.finish().unwrap().expect("complete records must be emitted");
+        assert_eq!(batch.offsets, vec![0, record_len(4), record_len(4) + record_len(8)]);
+        assert_eq!(batch.buffer.len(), record_len(4) + record_len(8));
+        assert!(state.leftover.is_empty(), "finish takes the pending bytes");
+    }
+
+    #[rstest]
+    // Declares a 64-byte payload but only supplies part of it.
+    #[case::truncated_payload(record(64, 0x02)[..10].to_vec())]
+    // Fewer than 4 bytes cannot even hold a block-size prefix.
+    #[case::one_trailing_byte(vec![0x00])]
+    #[case::three_trailing_bytes(vec![0x00, 0x01, 0x02])]
+    // A whole record followed by an unusable tail.
+    #[case::complete_then_stray_bytes([record(4, 0x03), vec![0xFF, 0xFF]].concat())]
+    fn finish_rejects_incomplete_trailing_bytes(#[case] pending: Vec<u8>) {
+        let mut state = BoundaryState::new_no_header();
+        state.leftover = pending;
+        let err = state.finish().expect_err("truncated input must fail closed");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

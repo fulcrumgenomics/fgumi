@@ -109,3 +109,78 @@ fn clone_starts_with_fresh_lazy_compressor() {
     let fresh = step.clone();
     assert!(fresh.compressor.is_none(), "clone must start with no compressor");
 }
+
+#[test]
+fn new_worker_copy_is_independent_of_the_template() {
+    let mut template = SpillBlockCompress::new(SpillCodec::Bgzf, 3, 4096);
+    let _ = template.compress_event(raw_block(0, 0, true, 0, vec![2u8; 32])).unwrap();
+
+    let worker = template.new_worker_copy();
+    // Config is inherited...
+    assert_eq!(worker.codec, SpillCodec::Bgzf);
+    assert_eq!(worker.compression, 3);
+    assert_eq!(worker.output_byte_limit, 4096);
+    // ...but the compressor is per-worker, so workers cannot share codec state.
+    assert!(worker.compressor.is_none(), "each worker builds its own compressor lazily");
+}
+
+#[test]
+fn profile_advertises_parallel_byordinal_with_a_byte_bounded_queue() {
+    let step = SpillBlockCompress::new(SpillCodec::Zstd, 1, 8192);
+    let profile = step.profile();
+    assert_eq!(profile.name, "SpillBlockCompress");
+    // Parallel + ByItemOrdinal is what lets any worker compress any block while
+    // `SpillWrite` still receives a dense, in-order stream.
+    assert_eq!(profile.kind, StepKind::Parallel);
+    assert!(!profile.sticky);
+    assert_eq!(profile.branch_ordering, vec![BranchOrdering::ByItemOrdinal]);
+    match profile.output_queues.as_slice() {
+        [QueueSpec::ByteBounded { limit_bytes }] => assert_eq!(*limit_bytes, 8192),
+        other => panic!("expected a single byte-bounded queue, got {other:?}"),
+    }
+}
+
+#[rstest]
+#[case::zstd(SpillCodec::Zstd)]
+#[case::bgzf(SpillCodec::Bgzf)]
+fn an_empty_block_round_trips_to_empty(#[case] codec: SpillCodec) {
+    let mut step = SpillBlockCompress::new(codec, 1, 1 << 20);
+    let out = step.compress_event(raw_block(0, 0, true, 0, Vec::new())).unwrap();
+    let SpillBlockEvent::Block { bytes, .. } = out else { panic!("expected Block") };
+
+    let mut dec = SpillBlockDecompressor::new();
+    let mut cursor = std::io::Cursor::new(&bytes[..]);
+    let frames = dec.read_raw(&mut cursor, codec, 64).unwrap();
+    let mut round = Vec::new();
+    for frame in &frames {
+        round.extend_from_slice(&dec.decompress_one(codec, frame).unwrap());
+    }
+    assert!(round.is_empty(), "an empty block must decompress back to empty ({codec:?})");
+}
+
+#[rstest]
+#[case::zstd(SpillCodec::Zstd)]
+#[case::bgzf(SpillCodec::Bgzf)]
+fn consecutive_blocks_reuse_one_compressor_and_stay_independent(#[case] codec: SpillCodec) {
+    // The compressor is built once and reused across blocks; each block must still
+    // decode standalone, since `SpillWrite` may interleave files.
+    let mut step = SpillBlockCompress::new(codec, 1, 1 << 20);
+    let payloads = [vec![0x11u8; 512], vec![0x22u8; 1024], vec![0x33u8; 64]];
+
+    for (i, payload) in payloads.iter().enumerate() {
+        let out = step
+            .compress_event(raw_block(i as u64, 0, i == payloads.len() - 1, 0, payload.clone()))
+            .unwrap();
+        let SpillBlockEvent::Block { bytes, .. } = out else { panic!("expected Block") };
+
+        let mut dec = SpillBlockDecompressor::new();
+        let mut cursor = std::io::Cursor::new(&bytes[..]);
+        let frames = dec.read_raw(&mut cursor, codec, 64).unwrap();
+        let mut round = Vec::new();
+        for frame in &frames {
+            round.extend_from_slice(&dec.decompress_one(codec, frame).unwrap());
+        }
+        assert_eq!(&round, payload, "block {i} must decode standalone ({codec:?})");
+    }
+    assert!(step.compressor.is_some(), "the compressor is built once and retained");
+}

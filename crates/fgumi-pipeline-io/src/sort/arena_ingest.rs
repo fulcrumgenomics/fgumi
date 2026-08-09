@@ -1633,6 +1633,121 @@ mod tests {
         blocks.remove(0).data
     }
 
+    /// Acquire a pooled arena for constructing block tokens in tests.
+    fn test_arena() -> Arc<PooledSegmentedBuf> {
+        let pool = ArenaPool::new(1, 1024);
+        Arc::new(pool.try_acquire().expect("a fresh pool always has one arena"))
+    }
+
+    // -----------------------------------------------------------------------
+    // Block token accounting (HeapSize / Ordered)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn arena_block_charges_only_its_compressed_bytes_to_the_heap() {
+        // The arena is shared via `Arc`, so it must NOT be counted per block —
+        // byte-bounded queues would otherwise over-charge by the arena size and
+        // stall the pipeline.
+        let block = ArenaBlock {
+            arena: test_arena(),
+            ordinal: 7,
+            offset: 64,
+            len: 128,
+            block: vec![0xAB; 40],
+            is_last_of_run: true,
+            run_seq: 2,
+            seals_to_spill: false,
+        };
+        assert_eq!(block.heap_size(), 40, "only the owned BGZF bytes are charged");
+        assert_eq!(block.ordinal(), 7, "ordinal drives ByItemOrdinal reordering");
+    }
+
+    #[test]
+    fn inflated_block_is_heap_free_because_its_bytes_live_in_the_arena() {
+        let token = InflatedBlock {
+            arena: test_arena(),
+            ordinal: 11,
+            offset: 0,
+            len: 256,
+            is_last_of_run: false,
+            run_seq: 1,
+            seals_to_spill: true,
+        };
+        assert_eq!(token.heap_size(), 0, "the token owns no bytes of its own");
+        assert_eq!(token.ordinal(), 11);
+    }
+
+    // -----------------------------------------------------------------------
+    // Step wiring
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_blocks_runs_off_pool_on_the_coordination_driver() {
+        let step = ReadBlocks::new(1 << 20, 4096);
+        let profile = step.profile();
+        assert_eq!(profile.name, "ReadBlocks");
+        // Detached keeps the serial arena-admit off a pool worker so it cannot
+        // steal a slot from the parallel inflaters.
+        assert_eq!(profile.kind, StepKind::Detached);
+        assert!(!profile.sticky);
+        assert_eq!(profile.branch_ordering, vec![BranchOrdering::ByItemOrdinal]);
+        match profile.output_queues.as_slice() {
+            [QueueSpec::ByteBounded { limit_bytes }] => assert_eq!(*limit_bytes, 4096),
+            other => panic!("expected one byte-bounded queue, got {other:?}"),
+        }
+        assert_eq!(step.detached_group(), DetachedGroup::Shared(crate::sort::SORT_COORD_GROUP));
+    }
+
+    #[test]
+    fn inflate_to_arena_is_parallel_and_worker_copies_share_only_config() {
+        let step = InflateToArena::new(8192);
+        let profile = step.profile();
+        assert_eq!(profile.name, "InflateToArena");
+        assert_eq!(profile.kind, StepKind::Parallel, "inflation fans out across workers");
+        assert!(!profile.sticky);
+        assert_eq!(profile.branch_ordering, vec![BranchOrdering::ByItemOrdinal]);
+
+        // Each worker gets an independent copy carrying the same queue bound.
+        let worker = step.new_worker_copy();
+        match worker.profile().output_queues.as_slice() {
+            [QueueSpec::ByteBounded { limit_bytes }] => assert_eq!(*limit_bytes, 8192),
+            other => panic!("expected one byte-bounded queue, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Sort strategies
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn coordinate_strategy_accumulates_refs_and_seal_drains_them() {
+        let mut strategy = CoordinateStrategy::new(4);
+        strategy.reserve_for_run(8);
+
+        // Two synthetic record bodies; only the leading tid/pos fields are read
+        // by the inline key extractor, so a minimal fixed-size body suffices.
+        let body = vec![0u8; 36];
+        strategy.push_record(&body, 0, 36).unwrap();
+        strategy.push_record(&body, 36, 36).unwrap();
+        assert_eq!(strategy.refs.len(), 2, "each pushed record yields one arena ref");
+
+        let chunk = strategy.seal(test_arena(), 1);
+        assert!(matches!(chunk, MemoryChunkErased::Coordinate(_)), "coordinate seal");
+        assert!(strategy.refs.is_empty(), "seal must drain the accumulator for the next run");
+    }
+
+    #[test]
+    fn coordinate_strategy_fresh_keeps_config_and_drops_accumulated_state() {
+        let mut strategy = CoordinateStrategy::new(9);
+        let body = vec![0u8; 36];
+        strategy.push_record(&body, 0, 36).unwrap();
+        assert!(!strategy.refs.is_empty());
+
+        let next = strategy.fresh();
+        assert_eq!(next.n_ref, 9, "reference count is configuration and is carried over");
+        assert!(next.refs.is_empty(), "a fresh strategy starts a new run with no refs");
+    }
+
     /// Read the BGZF footer ISIZE field (last 4 bytes of the block), which is
     /// the uncompressed size mod 2^32.  Returns the value as `usize`.
     fn uncompressed_size_of(block: &[u8]) -> usize {
