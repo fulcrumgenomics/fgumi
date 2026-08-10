@@ -896,3 +896,107 @@ fn test_codec_command_recovers_from_duplex_disagreement_threaded() {
         "both generated reads (R1 and R2) should be present in the rejects BAM"
     );
 }
+
+/// Builds a CODEC pair whose R2 is unmapped, matching the geometry of
+/// [`create_codec_read_pair`] so it lands in the same molecule.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn create_half_mapped_codec_pair(
+    name: &str,
+    r1_seq: &[u8],
+    r2_seq: &[u8],
+    ref_start: usize,
+    umi: &str,
+) -> (RawRecord, RawRecord) {
+    let r1_len = r1_seq.len();
+    let r2_len = r2_seq.len();
+    let r1_cigar_op = u32::try_from(r1_len).expect("r1_len fits u32") << 4;
+    let pos = i32::try_from(ref_start).expect("ref_start fits i32") - 1;
+
+    let mut b1 = SamBuilder::new();
+    b1.read_name(name.as_bytes())
+        .sequence(r1_seq)
+        .qualities(&vec![30u8; r1_len])
+        .cigar_ops(&[r1_cigar_op])
+        .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT | raw_flags::MATE_REVERSE)
+        .ref_id(0)
+        .pos(pos)
+        .mapq(60)
+        .mate_ref_id(0)
+        .mate_pos(pos)
+        .template_length(r1_len as i32)
+        .add_string_tag(SamTag::MI, umi.as_bytes());
+
+    let mut b2 = SamBuilder::new();
+    b2.read_name(name.as_bytes())
+        .sequence(r2_seq)
+        .qualities(&vec![30u8; r2_len])
+        .flags(
+            raw_flags::PAIRED | raw_flags::LAST_SEGMENT | raw_flags::REVERSE | raw_flags::UNMAPPED,
+        )
+        .ref_id(0)
+        .pos(pos)
+        .mapq(0)
+        .mate_ref_id(0)
+        .mate_pos(pos)
+        .template_length(-(r2_len as i32))
+        .add_string_tag(SamTag::MI, umi.as_bytes());
+
+    (b1.build(), b2.build())
+}
+
+/// Neither end of a half-mapped pair may contribute to a CODEC consensus when mapped reads are
+/// present in the same molecule. fgumi always prefers mapped reads.
+#[test]
+fn test_codec_ignores_half_mapped_pair_when_mapped_reads_present() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    let mut pairs = Vec::new();
+    for i in 0..2 {
+        pairs.push(create_codec_read_pair(
+            &format!("mapped{i}"),
+            b"ACGTACGT",
+            b"ACGTACGT",
+            &[30; 8],
+            &[30; 8],
+            100,
+            "UMI001",
+            None,
+        ));
+    }
+    pairs.push(create_half_mapped_codec_pair(
+        "halfmapped",
+        b"ACGTACGT",
+        b"TTTTTTTT",
+        100,
+        "UMI001",
+    ));
+    create_codec_test_bam(&input_bam, pairs);
+
+    let cmd = Codec::try_parse_from([
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--min-duplex-length",
+        "1",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse codec args");
+    cmd.execute("fgumi codec").expect("Failed to run codec command");
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let records: Vec<bam::Record> =
+        reader.records().map(|r| r.expect("failed to read record")).collect();
+    assert_eq!(records.len(), 1, "expected a single CODEC consensus read");
+
+    // Only the two fully mapped pairs contribute to each single-strand consensus.
+    assert_eq!(int_tag(&records[0], SamTag::AD), 2, "R1 strand must use only the mapped reads");
+    assert_eq!(int_tag(&records[0], SamTag::BD), 2, "R2 strand must use only the mapped reads");
+}
