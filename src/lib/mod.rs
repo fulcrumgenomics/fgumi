@@ -142,6 +142,7 @@ pub mod logging;
 pub mod metrics;
 pub mod mi_group;
 pub mod per_thread_accumulator;
+pub mod pipeline;
 pub use fgumi_consensus::phred;
 pub mod read_info;
 pub mod read_structure;
