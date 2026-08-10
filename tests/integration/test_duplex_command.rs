@@ -1349,6 +1349,9 @@ fn test_duplex_ignores_unmapped_end_when_mapped_reads_present() {
     // All three AB-R1s are mapped, so all three contribute to R1's AB single-strand consensus.
     assert_eq!(depth(r1, SamTag::AD), 3, "R1 should use all three mapped AB reads");
 
-    // Only the two mapped AB-R2s may contribute to R2's AB single-strand consensus.
+    // Only the two mapped AB-R2s may contribute to R2's AB single-strand consensus. AD is the
+    // oracle here rather than the emitted bases: the record's SEQ is the *duplex* consensus of
+    // the AB and BA strands, so it does not expose the AB single-strand bases this test is about.
+    // (The simplex counterpart can assert bases because it has only one strand.)
     assert_eq!(depth(r2, SamTag::AD), 2, "R2 must use only the two mapped AB reads");
 }

@@ -467,7 +467,7 @@ impl Command for Duplex {
 
         // Use the raw_reader opened above (single input open). Apply the fgbio
         // pre-group filter: always drop secondary/supplementary; --allow-unmapped
-        // relaxes only the unmapped-without-mapped-mate rule.
+        // relaxes only the mapped-record rule.
         let allow_unmapped = self.allow_unmapped.enabled;
         let raw_record_iter = std::iter::from_fn(move || {
             loop {
@@ -696,7 +696,7 @@ impl Duplex {
         let batch_size = 100; // MI groups per batch
 
         // Apply the fgbio pre-group filter: always drop secondary/supplementary;
-        // --allow-unmapped relaxes only the unmapped-without-mapped-mate rule.
+        // --allow-unmapped relaxes only the mapped-record rule.
         let allow_unmapped = self.allow_unmapped.enabled;
 
         // MI transform for raw bytes: strip /A and /B suffixes for duplex grouping
@@ -1483,9 +1483,9 @@ mod tests {
 
     /// The `--allow-unmapped` flag gates the fgbio pre-group filter for duplex.
     /// The same AB/BA molecule as `test_duplex_consensus_basic_ab_ba_pairing`,
-    /// but with every read unmapped (and no mapped mate): dropped by default
-    /// (fgbio parity), consensus-called with `--allow-unmapped`. Covers both
-    /// the single-threaded fast path and the multi-threaded pipeline path.
+    /// but with every read unmapped: dropped by default (fgbio parity),
+    /// consensus-called with `--allow-unmapped`. Covers both the single-threaded
+    /// fast path and the multi-threaded pipeline path.
     #[rstest]
     #[case::fast_path(ThreadingOptions::none())]
     #[case::threaded(ThreadingOptions::new(2))]
