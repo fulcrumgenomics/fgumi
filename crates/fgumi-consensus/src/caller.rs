@@ -633,11 +633,40 @@ pub fn make_prefix_from_header(header: &Header) -> String {
     }
 }
 
+/// Selects which of `ranks` survive a cap of `max_reads`, returning their indices in
+/// ascending (input) order.
+///
+/// The lowest-ranking entries are kept, where rank is the fgbio-compatible Murmur3 hash of
+/// the read name (see [`fgumi_raw_bam::hash::fgbio_read_name_rank`]). Ranks are compared as
+/// **signed** `i32`, matching fgbio's Scala `Int` — about half of all read names rank
+/// negative, so an unsigned comparison would silently reorder them. The selection sort is
+/// **stable**, matching Scala's `sortInPlaceBy`, so tied ranks resolve to input order.
+///
+/// The returned indices are re-sorted ascending after truncation so callers emit records in
+/// input order. That second sort orders *indices*, not ranks, and is independent of the
+/// selection above.
+///
+/// Callers pass ranks already stamped on their records rather than hashing here: Rust's
+/// `sort_by_key` may evaluate its key closure more than once per element, so hashing inside
+/// it would re-hash per comparison.
+pub(crate) fn select_lowest_ranking(ranks: &[i32], max_reads: usize) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..ranks.len()).collect();
+    if ranks.len() <= max_reads {
+        return indices;
+    }
+    indices.sort_by_key(|&i| ranks[i]);
+    indices.truncate(max_reads);
+    indices.sort_unstable();
+    indices
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fgumi_metrics::rejection::RejectionReason as CentralReason;
+    use proptest::prelude::*;
     use rstest::rstest;
+    use std::collections::HashSet;
 
     /// The scalar depth-tag clamp mirrors fgbio's `Short` per-base ceiling: values at or
     /// below 32767 pass through; anything above (up to `u16::MAX`) saturates at 32767,
@@ -1441,5 +1470,47 @@ mod tests {
         map.insert(RejectionReason::TooManyNs, 3);
         assert_eq!(map[&RejectionReason::QualityTooLow], 5);
         assert_eq!(map[&RejectionReason::TooManyNs], 3);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Both ends of a template share a read name and therefore a rank, so a cap that lands
+        /// inside a tied group must keep the ends that arrived *first*. This is the property the
+        /// stable sort in [`select_lowest_ranking`] exists to provide.
+        ///
+        /// A property test rather than a fixed vector, because a fixed vector only diverges under
+        /// `sort_unstable_by_key` at particular lengths and caps — pdqsort is effectively stable
+        /// on short slices — so a single case can silently lose its power when the standard
+        /// library's sort implementation changes. Random families keep the tripwire live: roughly
+        /// one in six mate-paired inputs distinguishes stable from unstable selection.
+        #[test]
+        fn select_lowest_ranking_resolves_ties_by_arrival_order(
+            template_ranks in prop::collection::vec(any::<i32>(), 2..40),
+            cap_seed in any::<usize>(),
+        ) {
+            // Each template contributes two records (R1 then R2) that share one rank.
+            let ranks: Vec<i32> = template_ranks.iter().flat_map(|&r| [r, r]).collect();
+            let cap = cap_seed % (ranks.len() - 1) + 1;
+
+            let kept = select_lowest_ranking(&ranks, cap);
+            let keep: HashSet<usize> = kept.iter().copied().collect();
+
+            prop_assert_eq!(kept.len(), cap.min(ranks.len()));
+            prop_assert!(kept.windows(2).all(|w| w[0] < w[1]), "survivors must come back in input order");
+
+            // Within one rank value the retained records must be a prefix of that value's
+            // records in arrival order: never a later record while an earlier tied one was
+            // dropped. An unstable sort violates this; nothing else about the rule does.
+            for (i, rank_i) in ranks.iter().enumerate().filter(|(i, _)| keep.contains(i)) {
+                for (j, rank_j) in ranks.iter().enumerate().take(i) {
+                    prop_assert!(
+                        rank_j != rank_i || keep.contains(&j),
+                        "kept index {} but dropped earlier index {} tied at rank {}",
+                        i, j, rank_i
+                    );
+                }
+            }
+        }
     }
 }

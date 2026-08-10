@@ -143,60 +143,20 @@ fn unclipped_five_prime_position_raw(record: &RawRecord) -> Option<i32> {
 /// and convert the read name to UTF-16 code units before hashing.
 #[must_use]
 pub fn compute_hash_fraction(read_name: &str) -> f64 {
-    let chars: Vec<u16> = read_name.encode_utf16().collect();
-    let hash = htsjdk_murmur3_hash_unencoded_chars(&chars, 42);
+    // SAM restricts read names to printable ASCII, and for those the UTF-16 code units htsjdk
+    // hashes are exactly the bytes widened — so the byte entry point is identical here and
+    // avoids a per-read `Vec<u16>`. A non-ASCII name violates the spec but must still hash the
+    // way htsjdk would, so it takes the widening path.
+    let hash = if read_name.is_ascii() {
+        fgumi_raw_bam::hash::fgbio_read_name_rank(read_name.as_bytes())
+    } else {
+        let chars: Vec<u16> = read_name.encode_utf16().collect();
+        fgumi_raw_bam::hash::htsjdk_murmur3_hash_unencoded_chars(&chars, 42)
+    };
     // `wrapping_abs` mirrors Java `Math.abs` (which returns `Int.MinValue`
     // unchanged when the input is `Int.MinValue`) so the rare edge case
     // produces the same downsample decision as fgbio.
     f64::from(hash.wrapping_abs()) / f64::from(i32::MAX)
-}
-
-/// Port of htsjdk `Murmur3.hashUnencodedChars` (Apache-2.0; derived from
-/// Guava's Apache-2.0 `Murmur3_32`; original `MurmurHash3` is public domain).
-/// `chars` is the Java `CharSequence` / UTF-16 code units.
-fn htsjdk_murmur3_hash_unencoded_chars(chars: &[u16], seed: i32) -> i32 {
-    let mut h1: u32 = seed as u32;
-    let length = chars.len();
-
-    let mut i = 1;
-    while i < length {
-        let k1 = u32::from(chars[i - 1]) | (u32::from(chars[i]) << 16);
-        h1 = murmur3_mix_h1(h1, murmur3_mix_k1(k1));
-        i += 2;
-    }
-
-    if length & 1 == 1 {
-        let k1 = murmur3_mix_k1(u32::from(chars[length - 1]));
-        h1 ^= k1;
-    }
-
-    murmur3_fmix(h1, (2 * length) as u32) as i32
-}
-
-#[inline]
-fn murmur3_mix_k1(mut k1: u32) -> u32 {
-    k1 = k1.wrapping_mul(0xcc9e_2d51);
-    k1 = k1.rotate_left(15);
-    k1 = k1.wrapping_mul(0x1b87_3593);
-    k1
-}
-
-#[inline]
-fn murmur3_mix_h1(mut h1: u32, k1: u32) -> u32 {
-    h1 ^= k1;
-    h1 = h1.rotate_left(13);
-    h1.wrapping_mul(5).wrapping_add(0xe654_6b64)
-}
-
-#[inline]
-fn murmur3_fmix(mut h1: u32, length: u32) -> u32 {
-    h1 ^= length;
-    h1 ^= h1 >> 16;
-    h1 = h1.wrapping_mul(0x85eb_ca6b);
-    h1 ^= h1 >> 13;
-    h1 = h1.wrapping_mul(0xc2b2_ae35);
-    h1 ^= h1 >> 16;
-    h1
 }
 
 /// Parses an intervals file in BED or Picard interval list format.
@@ -785,7 +745,7 @@ mod tests {
     #[case("NB500947:HT3JMBGX2:1:11101:19204:10048", -1_636_484_024)]
     fn test_murmur3_matches_htsjdk_reference_vectors(#[case] name: &str, #[case] expected: i32) {
         let chars: Vec<u16> = name.encode_utf16().collect();
-        let got = htsjdk_murmur3_hash_unencoded_chars(&chars, 42);
+        let got = fgumi_raw_bam::hash::htsjdk_murmur3_hash_unencoded_chars(&chars, 42);
         assert_eq!(got, expected, "Murmur3 mismatch on {name:?}");
     }
 

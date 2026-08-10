@@ -785,7 +785,6 @@ dependencies = [
  "log",
  "noodles",
  "proptest",
- "rand 0.10.2",
  "rstest",
  "tempfile",
  "thiserror 2.0.19",

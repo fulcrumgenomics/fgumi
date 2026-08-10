@@ -933,6 +933,9 @@ pub(crate) mod tests {
             ref_id: 0,
             alignment_start: 0,
             original_cigar: vec![(Kind::Match, bases.len())],
+            // No backing record to hash a name from. Nothing in production constructs a
+            // recordless `SourceRead`, so this value is never used for real selection.
+            name_hash: 0,
         }
     }
 }

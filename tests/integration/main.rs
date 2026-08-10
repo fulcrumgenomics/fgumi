@@ -20,6 +20,7 @@ mod test_compare_bams;
 mod test_compare_metrics_command;
 #[cfg(feature = "compare")]
 mod test_compare_mutation;
+mod test_consensus_downsampling;
 mod test_correct_command;
 mod test_dedup_command;
 mod test_downsample_command;
