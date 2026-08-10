@@ -117,7 +117,7 @@ pub fn format_thread_counts(sort_threads: usize, merge_threads: usize) -> String
 /// Used to identify bottlenecks and validate thread architecture changes.
 /// All times are cumulative (multiple spill cycles accumulate).
 #[derive(Debug, Default)]
-struct SortPhaseTimer {
+pub(crate) struct SortPhaseTimer {
     /// Time reading records from input BAM (includes BGZF decompression).
     read_secs: f64,
     /// Time sorting in-memory buffers (rayon parallel sort or single-threaded).
