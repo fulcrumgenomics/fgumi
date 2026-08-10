@@ -769,6 +769,7 @@ dependencies = [
 name = "fgumi-bam-io"
 version = "0.6.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "bgzf",
  "bstr 1.13.1",
