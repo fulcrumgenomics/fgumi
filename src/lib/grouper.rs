@@ -1547,8 +1547,11 @@ mod tests {
             .finish()
             .expect("finish must succeed with a group key set")
             .expect("the buffered position must be emitted");
-        let names: Vec<Vec<u8>> =
-            group.records.iter().map(|r| fgumi_raw_bam::read_name(&r.data).to_vec()).collect();
+        let names: Vec<Vec<u8>> = group
+            .records
+            .iter()
+            .map(|r| fgumi_raw_bam::read_name(r.raw_bytes()).to_vec())
+            .collect();
         assert_eq!(
             names,
             vec![b"readA".to_vec(), b"readB".to_vec(), b"readC".to_vec()],

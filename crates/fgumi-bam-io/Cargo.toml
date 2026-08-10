@@ -14,6 +14,7 @@ keywords = ["bioinformatics", "bam", "sequencing", "ngs"]
 pedantic = { level = "deny", priority = -1 }
 
 [dependencies]
+ahash = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-bgzf = { workspace = true }
 noodles = { workspace = true, features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
