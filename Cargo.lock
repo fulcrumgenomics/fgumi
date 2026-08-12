@@ -707,6 +707,8 @@ dependencies = [
  "fgumi-consensus",
  "fgumi-dna",
  "fgumi-metrics",
+ "fgumi-pipeline-core",
+ "fgumi-pipeline-io",
  "fgumi-raw-bam",
  "fgumi-sam",
  "fgumi-simd-fastq",
