@@ -92,6 +92,9 @@ pub struct DedupCounts {
     pub missing_tc_tag: u64,
     /// Per-reason counts from the template filter.
     pub filter_counts: TemplateFilterCounts,
+    /// Templates emitted untouched by `--include-unmapped`, which bypass the
+    /// filter entirely and so appear in no `filter_counts` bucket.
+    pub passthrough_templates: u64,
 }
 
 impl DedupCounts {
@@ -107,6 +110,7 @@ impl DedupCounts {
         self.supplementary_reads += other.supplementary_reads;
         self.missing_tc_tag += other.missing_tc_tag;
         self.filter_counts.merge(&other.filter_counts);
+        self.passthrough_templates += other.passthrough_templates;
     }
 
     /// Calculate duplicate rate.
@@ -916,6 +920,10 @@ fn process_position_group(
     // serialize step writes them verbatim (no MI tag, duplicate flag left as in the
     // input). Count them as unique output so the record totals match what is written.
     for template in &passthrough_templates {
+        // Counted separately from `filter_counts`: these templates were split off
+        // before the filter ran, so they appear in no rejection bucket and in no
+        // accepted count. Without this they would be invisible in the accounting.
+        dedup_counts.passthrough_templates += 1;
         dedup_counts.total_templates += 1;
         dedup_counts.unique_templates += 1;
         for raw in template.records() {

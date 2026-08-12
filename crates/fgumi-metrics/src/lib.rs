@@ -12,6 +12,7 @@
 pub mod clip;
 pub mod consensus;
 pub mod correct;
+pub mod dedup;
 pub mod duplex;
 pub mod float;
 pub mod group;
@@ -99,6 +100,7 @@ pub trait ProcessingMetrics {
 pub use clip::{ClipCounts, ClippingMetrics, ClippingMetricsCollection, ReadType};
 pub use consensus::{ConsensusCallerKind, ConsensusKvMetric, ConsensusMetrics};
 pub use correct::UmiCorrectionMetrics;
+pub use dedup::DeduplicationMetrics;
 pub use duplex::{
     DuplexFamilySizeMetric, DuplexMetricsCollector, DuplexUmiMetric, DuplexYieldMetric,
     FamilySizeMetric,
