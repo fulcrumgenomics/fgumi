@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use crate::grouper::{RawPositionGroup, RecordPositionGrouper, build_templates_from_records};
 use crate::logging::OperationTimer;
+use crate::metrics::DeduplicationMetrics;
 use crate::metrics::group::FamilySizeMetrics;
 use crate::metrics::{TemplateFilterCounts, TemplateFilterReason};
 use crate::read_info::LibraryIndex;
@@ -47,7 +48,6 @@ use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 
 use crate::commands::command::Command;
 use crate::commands::common::{
@@ -56,7 +56,7 @@ use crate::commands::common::{
 };
 use crate::sam::TC_TAG;
 use fgumi_raw_bam;
-use fgumi_raw_bam::RawRecordView;
+use fgumi_raw_bam::{RawRecord, RawRecordView};
 
 /// Duplicate flag bit in SAM flags (0x400)
 const DUPLICATE_FLAG: u16 = 0x400;
@@ -124,37 +124,33 @@ impl DedupCounts {
     }
 }
 
-/// Serializable version of `DedupCounts` for file output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DedupMetricsOutput {
-    total_templates: u64,
-    unique_templates: u64,
-    duplicate_templates: u64,
-    // DXM3-04: format the one fraction column like fgbio's DecimalFormat, matching
-    // the float serialization #504 wired onto the fgumi-metrics-crate structs.
-    #[serde(with = "fgumi_metrics::float")]
-    duplicate_rate: f64,
-    total_reads: u64,
-    unique_reads: u64,
-    duplicate_reads: u64,
-    secondary_reads: u64,
-    supplementary_reads: u64,
-    missing_tc_tag: u64,
-}
-
-impl From<&DedupCounts> for DedupMetricsOutput {
-    fn from(m: &DedupCounts) -> Self {
+impl From<&DedupCounts> for DeduplicationMetrics {
+    fn from(counts: &DedupCounts) -> Self {
+        use TemplateFilterReason as Reason;
+        let filter = &counts.filter_counts;
         Self {
-            total_templates: m.total_templates,
-            unique_templates: m.unique_templates,
-            duplicate_templates: m.duplicate_templates,
-            duplicate_rate: m.duplicate_rate(),
-            total_reads: m.total_reads,
-            unique_reads: m.unique_reads,
-            duplicate_reads: m.duplicate_reads,
-            secondary_reads: m.secondary_reads,
-            supplementary_reads: m.supplementary_reads,
-            missing_tc_tag: m.missing_tc_tag,
+            filtered_templates: filter.total_rejected_templates(),
+            filtered_malformed_record: filter.rejected_templates(Reason::MalformedRecord),
+            filtered_no_primary_reads: filter.rejected_templates(Reason::NoPrimaryReads),
+            filtered_unmapped: filter.rejected_templates(Reason::Unmapped),
+            filtered_not_passing_filter: filter.rejected_templates(Reason::NotPassingFilter),
+            filtered_low_mapping_quality: filter.rejected_templates(Reason::LowMappingQuality),
+            filtered_low_mate_mapping_quality: filter
+                .rejected_templates(Reason::LowMateMappingQuality),
+            filtered_missing_umi: filter.rejected_templates(Reason::MissingUmi),
+            filtered_ns_in_umi: filter.rejected_templates(Reason::NsInUmi),
+            filtered_umi_too_short: filter.rejected_templates(Reason::UmiTooShort),
+            passthrough_templates: counts.passthrough_templates,
+            total_templates: counts.total_templates,
+            unique_templates: counts.unique_templates,
+            duplicate_templates: counts.duplicate_templates,
+            duplicate_rate: counts.duplicate_rate(),
+            total_reads: counts.total_reads,
+            unique_reads: counts.unique_reads,
+            duplicate_reads: counts.duplicate_reads,
+            secondary_reads: counts.secondary_reads,
+            supplementary_reads: counts.supplementary_reads,
+            missing_tc_tag: counts.missing_tc_tag,
         }
     }
 }
@@ -492,6 +488,34 @@ fn template_is_unmapped_passthrough(template: &Template) -> bool {
 //////////////////////////////////////////////////////////////////////////////
 // UMI assignment (adapted from group command)
 //////////////////////////////////////////////////////////////////////////////
+
+/// Count one output record into `counts`: the read itself, whether it is secondary
+/// and/or supplementary, and whether a non-primary record is missing its `tc` tag.
+///
+/// Shared by both counting loops in `process_position_group` — the filtered templates
+/// and the `--include-unmapped` pass-throughs — so the two cannot drift on which
+/// records are checked. A missing `tc` on a non-primary record is a hard failure once
+/// the per-worker counts are merged, so a loop that counts non-primary reads without
+/// checking their `tc` tag is a hole in that check, not just an accounting gap.
+fn count_record(raw: &RawRecord, tc_tag_bytes: [u8; 2], counts: &mut DedupCounts) {
+    counts.total_reads += 1;
+    let flg = RawRecordView::new(raw.as_ref()).flags();
+    let is_secondary = (flg & fgumi_raw_bam::flags::SECONDARY) != 0;
+    let is_supplementary = (flg & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0;
+
+    if is_secondary {
+        counts.secondary_reads += 1;
+    }
+    if is_supplementary {
+        counts.supplementary_reads += 1;
+    }
+    if is_secondary || is_supplementary {
+        let aux = fgumi_raw_bam::aux_data_slice(raw);
+        if fgumi_raw_bam::find_tag_type(aux, tc_tag_bytes).is_none() {
+            counts.missing_tc_tag += 1;
+        }
+    }
+}
 
 /// Extract UMI for a read, handling paired UMI strategies.
 fn umi_for_read(umi: &str, is_r1_earlier: bool, assigner: &dyn UmiAssigner) -> Result<String> {
@@ -895,23 +919,7 @@ fn process_position_group(
     for template in &templates {
         dedup_counts.total_templates += 1;
         for raw in template.records() {
-            dedup_counts.total_reads += 1;
-            let flg = RawRecordView::new(raw.as_ref()).flags();
-            let is_secondary = (flg & fgumi_raw_bam::flags::SECONDARY) != 0;
-            let is_supplementary = (flg & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0;
-
-            if is_secondary {
-                dedup_counts.secondary_reads += 1;
-            }
-            if is_supplementary {
-                dedup_counts.supplementary_reads += 1;
-            }
-            if is_secondary || is_supplementary {
-                let aux = fgumi_raw_bam::aux_data_slice(raw);
-                if fgumi_raw_bam::find_tag_type(aux, tc_tag_bytes).is_none() {
-                    dedup_counts.missing_tc_tag += 1;
-                }
-            }
+            count_record(raw, tc_tag_bytes, &mut dedup_counts);
         }
     }
 
@@ -927,14 +935,12 @@ fn process_position_group(
         dedup_counts.total_templates += 1;
         dedup_counts.unique_templates += 1;
         for raw in template.records() {
-            dedup_counts.total_reads += 1;
-            let flg = RawRecordView::new(raw.as_ref()).flags();
-            if (flg & fgumi_raw_bam::flags::SECONDARY) != 0 {
-                dedup_counts.secondary_reads += 1;
-            }
-            if (flg & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0 {
-                dedup_counts.supplementary_reads += 1;
-            }
+            // Same accounting as the filtered templates above, `tc` check included.
+            // `template_is_unmapped_passthrough` only inspects the primary r1/r2, so a
+            // template routed here can still carry secondary/supplementary records; if
+            // they were counted but not checked, --include-unmapped would be a way to
+            // slip a `tc`-less non-primary read past the hard failure below.
+            count_record(raw, tc_tag_bytes, &mut dedup_counts);
         }
     }
     templates.extend(passthrough_templates);
@@ -1421,7 +1427,7 @@ impl Command for MarkDuplicates {
 
         // Write metrics file
         if let Some(metrics_path) = &self.metrics {
-            write_dedup_counts(&final_metrics, metrics_path)?;
+            write_dedup_metrics(&final_metrics, metrics_path)?;
         }
 
         // Write family size histogram
@@ -1452,6 +1458,22 @@ impl Command for MarkDuplicates {
             );
         }
 
+        // --metrics is optional, so it must not be the only channel reporting
+        // dropped templates: a run that filters everything otherwise logs a bare
+        // "0 templates" and is indistinguishable from empty input. Reasons are
+        // named by their column suffix so the log points at the metrics column.
+        let filtered = final_metrics.filter_counts.total_rejected_templates();
+        if filtered > 0 {
+            let reasons: Vec<String> = TemplateFilterReason::ALL
+                .into_iter()
+                .filter_map(|reason| {
+                    let count = final_metrics.filter_counts.rejected_templates(reason);
+                    (count > 0).then(|| format!("{count} {}", reason.column_suffix()))
+                })
+                .collect();
+            info!("Filtered out {filtered} templates before marking: {}", reasons.join(", "));
+        }
+
         timer.log_completion(final_metrics.total_reads);
 
         Ok(())
@@ -1462,8 +1484,8 @@ impl Command for MarkDuplicates {
 // Metrics writing
 //////////////////////////////////////////////////////////////////////////////
 
-fn write_dedup_counts(metrics: &DedupCounts, path: &PathBuf) -> Result<()> {
-    let output: DedupMetricsOutput = metrics.into();
+fn write_dedup_metrics(counts: &DedupCounts, path: &PathBuf) -> Result<()> {
+    let output: DeduplicationMetrics = counts.into();
     DelimFile::default()
         .write_tsv(path, [output])
         .with_context(|| format!("Failed to write dedup metrics: {}", path.display()))?;
@@ -2759,9 +2781,20 @@ mod tests {
         assert_eq!(metrics.missing_tc_tag, 0);
     }
 
+    /// The point of fgumi#739: every count the filter collects must survive the
+    /// trip to the output struct. Distinct per-reason counts so a mis-wired field
+    /// cannot pass by accident.
     #[test]
-    fn test_dedup_counts_output_from() {
-        let metrics = DedupCounts {
+    fn dedup_metrics_output_carries_every_filter_reason() {
+        let mut filter_counts = TemplateFilterCounts::new();
+        for (offset, reason) in TemplateFilterReason::ALL.into_iter().enumerate() {
+            for _ in 0..=offset {
+                filter_counts.record_rejected(reason, 2);
+            }
+        }
+        filter_counts.record_accepted(2);
+
+        let counts = DedupCounts {
             total_templates: 100,
             duplicate_templates: 25,
             unique_templates: 75,
@@ -2771,47 +2804,87 @@ mod tests {
             secondary_reads: 10,
             supplementary_reads: 5,
             missing_tc_tag: 2,
-            ..Default::default()
+            passthrough_templates: 3,
+            filter_counts,
         };
-        let output = DedupMetricsOutput::from(&metrics);
+        let output = DeduplicationMetrics::from(&counts);
 
+        assert_eq!(output.filtered_malformed_record, 1);
+        assert_eq!(output.filtered_no_primary_reads, 2);
+        assert_eq!(output.filtered_unmapped, 3);
+        assert_eq!(output.filtered_not_passing_filter, 4);
+        assert_eq!(output.filtered_low_mapping_quality, 5);
+        assert_eq!(output.filtered_low_mate_mapping_quality, 6);
+        assert_eq!(output.filtered_missing_umi, 7);
+        assert_eq!(output.filtered_ns_in_umi, 8);
+        assert_eq!(output.filtered_umi_too_short, 9);
+        assert_eq!(output.filtered_templates, 45);
+        assert_eq!(output.passthrough_templates, 3);
         assert_eq!(output.total_templates, 100);
-        assert_eq!(output.duplicate_templates, 25);
         assert_eq!(output.unique_templates, 75);
+        assert_eq!(output.duplicate_templates, 25);
         assert!((output.duplicate_rate - 0.25).abs() < 0.001);
         assert_eq!(output.total_reads, 200);
-        assert_eq!(output.duplicate_reads, 50);
         assert_eq!(output.unique_reads, 150);
+        assert_eq!(output.duplicate_reads, 50);
         assert_eq!(output.secondary_reads, 10);
         assert_eq!(output.supplementary_reads, 5);
         assert_eq!(output.missing_tc_tag, 2);
     }
 
-    /// DXM3-04: `duplicate_rate` serializes through the fgbio-style float
-    /// formatter (#504's now-public `fgumi_metrics::float`), so a whole-number
-    /// rate is written as `1`, not serde's raw `1.0` — consistent with the other
-    /// fgumi metric files.
+    /// Nothing may vanish silently: everything read is either filtered or written.
+    #[rstest]
+    #[case::nothing_filtered(0, 10, 0)]
+    #[case::everything_filtered(7, 0, 0)]
+    #[case::mixed(3, 5, 2)]
+    fn dedup_metrics_output_reconciles(
+        #[case] rejected: u64,
+        #[case] accepted: u64,
+        #[case] passthrough: u64,
+    ) {
+        let mut filter_counts = TemplateFilterCounts::new();
+        for _ in 0..rejected {
+            filter_counts.record_rejected(TemplateFilterReason::NsInUmi, 2);
+        }
+        for _ in 0..accepted {
+            filter_counts.record_accepted(2);
+        }
+
+        let counts = DedupCounts {
+            total_templates: accepted + passthrough,
+            passthrough_templates: passthrough,
+            filter_counts,
+            ..DedupCounts::default()
+        };
+        let output = DeduplicationMetrics::from(&counts);
+
+        assert_eq!(
+            output.filtered_templates + output.total_templates,
+            rejected + accepted + passthrough
+        );
+    }
+
+    /// `duplicate_rate` serializes through the fgbio-style float formatter, so a
+    /// whole-number rate is written as `1`, not serde's raw `1.0`. Located by
+    /// column name rather than position, so adding a column cannot silently
+    /// invalidate this.
     #[test]
     fn test_dedup_counts_duplicate_rate_uses_float_formatter() -> Result<()> {
-        let metrics = DedupCounts {
+        let counts = DedupCounts {
             total_templates: 2,
             duplicate_templates: 2,
             unique_templates: 0,
-            ..Default::default()
+            ..DedupCounts::default()
         };
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("dedup.metrics.txt");
-        write_dedup_counts(&metrics, &path)?;
+        write_dedup_metrics(&counts, &path)?;
 
         let text = std::fs::read_to_string(&path)?;
-        let data_row = text.lines().nth(1).expect("metrics data row");
-        let columns: Vec<&str> = data_row.split('\t').collect();
-        // Field order: total, unique, duplicate templates, then duplicate_rate.
-        assert_eq!(
-            columns.get(3).copied(),
-            Some("1"),
-            "duplicate_rate must format as `1`, not `1.0`; row: {data_row:?}"
-        );
+        let header: Vec<&str> = text.lines().next().expect("header").split('\t').collect();
+        let row: Vec<&str> = text.lines().nth(1).expect("data row").split('\t').collect();
+        let index = header.iter().position(|&c| c == "duplicate_rate").expect("column");
+        assert_eq!(row.get(index).copied(), Some("1"));
         Ok(())
     }
 

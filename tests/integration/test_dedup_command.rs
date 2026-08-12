@@ -8,8 +8,10 @@
 use clap::Parser;
 use rstest::rstest;
 
+use fgoxide::io::DelimFile;
 use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::dedup::MarkDuplicates;
+use fgumi_lib::metrics::DeduplicationMetrics;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
@@ -147,6 +149,75 @@ fn test_dedup_command_basic() {
     let _header = reader.read_header().unwrap();
     let count = reader.records().count();
     assert_eq!(count, 10, "All reads should be in output (marked, not removed)");
+}
+
+/// End-to-end guard for fgumi#739. With a mapping-quality threshold no read can
+/// meet, every template is dropped -- and the metrics file must say so, rather
+/// than reporting a row of zeros with no indication anything was discarded.
+///
+/// This is the regression test for the reported bug: before the fix, the counts
+/// were collected and merged correctly, then dropped at the serialization
+/// boundary because the output struct had no field to hold them.
+///
+/// The same input is run twice -- once unfiltered, once with the threshold -- and
+/// the templates that reach the output in the first run must equal the templates
+/// reported as filtered in the second. Asserting the two against each other,
+/// rather than against a hard-coded count, keeps the test about the accounting
+/// invariant instead of about how this fixture happens to group into templates.
+#[test]
+fn test_dedup_metrics_report_filtered_templates() {
+    fn run_dedup(temp_dir: &TempDir, label: &str, min_map_q: &str) -> DeduplicationMetrics {
+        let input_bam = temp_dir.path().join(format!("{label}.in.bam"));
+        let output_bam = temp_dir.path().join(format!("{label}.out.bam"));
+        let metrics_path = temp_dir.path().join(format!("{label}.metrics.txt"));
+
+        create_sorted_bam(&input_bam, create_duplicate_group("dup1", "ACGTACGT", 3, 100));
+
+        let cmd = MarkDuplicates::try_parse_from([
+            "dedup",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--strategy",
+            "identity",
+            "--min-map-q",
+            min_map_q,
+            "--metrics",
+            metrics_path.to_str().unwrap(),
+            "--compression-level",
+            "1",
+        ])
+        .expect("failed to parse dedup args");
+        cmd.execute("fgumi dedup").expect("Dedup command failed");
+
+        let rows: Vec<DeduplicationMetrics> =
+            DelimFile::default().read_tsv(&metrics_path).expect("failed to read dedup metrics");
+        rows.into_iter().next().expect("one metrics row")
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+
+    // Baseline: nothing is filtered, so every template reaches the output.
+    let kept = run_dedup(&temp_dir, "kept", "0");
+    assert_eq!(kept.filtered_templates, 0, "baseline should filter nothing");
+    assert!(kept.total_templates > 0, "baseline should emit templates");
+
+    // Same input, mapping-quality threshold no read can meet.
+    let dropped = run_dedup(&temp_dir, "dropped", "61");
+
+    assert_eq!(
+        dropped.filtered_templates, kept.total_templates,
+        "every template the baseline emitted should be reported as filtered"
+    );
+    assert_eq!(
+        dropped.filtered_low_mapping_quality, kept.total_templates,
+        "and all of them attributed to low mapping quality"
+    );
+    assert_eq!(dropped.total_templates, 0, "nothing should reach the output");
+    assert_eq!(dropped.filtered_ns_in_umi, 0, "no other reason should be credited");
+    assert_eq!(dropped.filtered_missing_umi, 0);
+    assert_eq!(dropped.filtered_unmapped, 0);
 }
 
 /// Test dedup command with metrics output.
@@ -294,6 +365,70 @@ fn test_dedup_include_unmapped(
 
     assert_eq!(total, expected_total, "unexpected output record count");
     assert_eq!(unmapped_seen, expected_unmapped, "unexpected unmapped-read count");
+}
+
+/// Create a secondary alignment for `name` with no `tc` tag.
+///
+/// `ref_id`/`pos` of `None` leave it unplaced, so it travels in the same
+/// template-coordinate group as an unmapped primary pair of the same name.
+fn create_secondary_without_tc(name: &str, umi: &str, placed: bool) -> RawRecord {
+    let mut b = SamBuilder::new();
+    b.read_name(name.as_bytes())
+        .sequence(b"ACGTACGT")
+        .qualities(&[30; 8])
+        .flags(flags::PAIRED | flags::SECONDARY | flags::FIRST_SEGMENT)
+        .add_string_tag(SamTag::RX, umi.as_bytes());
+    if placed {
+        // Same coordinate as `create_duplicate_group`'s R1, so it travels in that
+        // template's position group.
+        b.ref_id(0).pos(99).mapq(60).cigar_ops(&[fgumi_raw_bam::testutil::encode_op(0, 8)]);
+    } else {
+        b.flags(flags::PAIRED | flags::SECONDARY | flags::FIRST_SEGMENT | flags::UNMAPPED);
+    }
+    b.build()
+}
+
+/// A secondary/supplementary read with no `tc` tag is a hard failure, and
+/// `--include-unmapped` must not be a way around it.
+///
+/// `template_is_unmapped_passthrough` decides on the primary `r1`/`r2` alone, so a
+/// template whose primaries are both unmapped is routed to the pass-through partition
+/// carrying whatever non-primary records came with it. Those records are still counted
+/// as `secondary_reads`/`supplementary_reads`, so if the pass-through loop skipped the
+/// `tc` check, `--include-unmapped` would report the read and waive the failure that
+/// the same read triggers on any other template.
+#[rstest]
+#[case::passthrough_template("unmapped1", false)]
+#[case::filtered_template("dup1_0", true)]
+fn test_dedup_missing_tc_fails_on_every_template(#[case] name: &str, #[case] placed: bool) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    let mut records = create_duplicate_group("dup1", "ACGTACGT", 3, 100);
+    records.extend(create_unmapped_pair("unmapped1", "TGCATGCA"));
+    records.push(create_secondary_without_tc(name, "TGCATGCA", placed));
+    create_sorted_bam(&input_bam, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--include-unmapped",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+
+    let err = cmd.execute("fgumi dedup").expect_err("a tc-less secondary read must fail dedup");
+    assert!(
+        err.to_string().contains("missing the `tc` tag"),
+        "expected the tc-tag failure, got: {err}"
+    );
 }
 
 /// Regression test for OOM with large position groups in `--no-umi` mode.

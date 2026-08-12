@@ -20,6 +20,7 @@ pub use fgumi_metrics::{FLOAT_PRECISION, Metric, ProcessingMetrics, format_float
 pub use fgumi_metrics::clip;
 pub use fgumi_metrics::consensus;
 pub use fgumi_metrics::correct;
+pub use fgumi_metrics::dedup;
 pub use fgumi_metrics::duplex;
 pub use fgumi_metrics::group;
 pub use fgumi_metrics::shared;
@@ -31,6 +32,7 @@ pub use fgumi_metrics::writer;
 pub use clip::{ClippingMetrics, ClippingMetricsCollection, ReadType};
 pub use consensus::{ConsensusKvMetric, ConsensusMetrics};
 pub use correct::UmiCorrectionMetrics;
+pub use dedup::DeduplicationMetrics;
 pub use duplex::{
     DuplexFamilySizeMetric, DuplexMetricsCollector, DuplexUmiMetric, DuplexYieldMetric,
     FamilySizeMetric,
