@@ -24,6 +24,7 @@ pub use fgumi_metrics::duplex;
 pub use fgumi_metrics::group;
 pub use fgumi_metrics::shared;
 pub use fgumi_metrics::simplex;
+pub use fgumi_metrics::template_filter;
 pub use fgumi_metrics::writer;
 
 // Re-export commonly used types
@@ -36,4 +37,5 @@ pub use duplex::{
 };
 pub use group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
 pub use shared::UmiMetric;
+pub use template_filter::{TemplateFilterCounts, TemplateFilterReason};
 pub use writer::{read_metrics, write_metrics, write_metrics_auto};

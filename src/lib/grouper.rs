@@ -12,6 +12,7 @@ use noodles::sam::alignment::RecordBuf;
 
 use crate::template::{Template, TemplateBatch};
 use crate::unified_pipeline::{BatchWeight, DecodedRecord, Grouper, MemoryEstimate};
+use fgumi_metrics::TemplateFilterCounts;
 use fgumi_raw_bam;
 use fgumi_raw_bam::{RawRecord, raw_record_to_record_buf};
 
@@ -278,45 +279,10 @@ impl MemoryEstimate for ProcessedPositionGroup {
         // Each entry is ~24 bytes (key + value + overhead)
         let family_sizes_size = self.family_sizes.len() * 24;
 
-        // filter_metrics: FilterMetrics is mostly inline (u64 fields)
+        // filter_counts: TemplateFilterCounts is entirely inline (u64 fields + arrays)
         // Just a small struct overhead
 
         templates_size + templates_vec_overhead + family_sizes_size
-    }
-}
-
-/// Metrics tracking what was filtered during processing.
-#[derive(Default, Clone, Debug)]
-pub struct FilterMetrics {
-    /// Total templates seen before filtering.
-    pub total_templates: u64,
-    /// Templates accepted after filtering.
-    pub accepted_templates: u64,
-    /// Templates discarded because they weren't passing filter.
-    pub discarded_non_pf: u64,
-    /// Templates discarded due to poor alignment.
-    pub discarded_poor_alignment: u64,
-    /// Templates discarded due to Ns in UMI.
-    pub discarded_ns_in_umi: u64,
-    /// Templates discarded due to UMI being too short.
-    pub discarded_umi_too_short: u64,
-}
-
-impl FilterMetrics {
-    /// Create new empty metrics.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Merge another `FilterMetrics` into this one.
-    pub fn merge(&mut self, other: &FilterMetrics) {
-        self.total_templates += other.total_templates;
-        self.accepted_templates += other.accepted_templates;
-        self.discarded_non_pf += other.discarded_non_pf;
-        self.discarded_poor_alignment += other.discarded_poor_alignment;
-        self.discarded_ns_in_umi += other.discarded_ns_in_umi;
-        self.discarded_umi_too_short += other.discarded_umi_too_short;
     }
 }
 
@@ -328,8 +294,8 @@ pub struct ProcessedPositionGroup {
     pub templates: Vec<Template>,
     /// Family size counts for this position group.
     pub family_sizes: ahash::AHashMap<usize, u64>,
-    /// Filter metrics for this position group (thread-local, merged later).
-    pub filter_metrics: FilterMetrics,
+    /// Filter counts for this position group (thread-local, merged later).
+    pub filter_counts: TemplateFilterCounts,
     /// Total input records processed (for progress tracking).
     pub input_record_count: u64,
     /// Number of distinct numeric molecule IDs assigned in this group (i.e., the
