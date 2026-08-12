@@ -75,13 +75,16 @@ const DUPLICATE_FLAG: u16 = 0x400;
 /// schema: this is the accumulator, that is the file.
 #[derive(Debug, Default, Clone)]
 pub struct DedupCounts {
-    /// Total templates processed
+    /// Templates that passed the filter (excludes filtered)
+    ///
+    /// Not "written": under `--remove-duplicates` the duplicates are dropped at
+    /// serialization, after this counter has already taken them.
     pub total_templates: u64,
     /// Templates marked as duplicates
     pub duplicate_templates: u64,
     /// Templates kept (not duplicates)
     pub unique_templates: u64,
-    /// Total reads processed
+    /// Reads in templates that passed the filter (excludes filtered)
     pub total_reads: u64,
     /// Reads marked as duplicates
     pub duplicate_reads: u64,
@@ -93,10 +96,9 @@ pub struct DedupCounts {
     pub supplementary_reads: u64,
     /// Secondary/supplementary without `tc` tag
     pub missing_tc_tag: u64,
-    /// Per-reason counts from the template filter.
+    /// Per-reason counts from the template filter
     pub filter_counts: TemplateFilterCounts,
-    /// Templates emitted untouched by `--include-unmapped`, which bypass the
-    /// filter entirely and so appear in no `filter_counts` bucket.
+    /// Templates emitted untouched by `--include-unmapped` (bypass the filter)
     pub passthrough_templates: u64,
 }
 
@@ -824,6 +826,7 @@ discarded (not marked) when:
 
 - Both mates are unmapped (a template with no mapped read), unless --include-unmapped is
   given, in which case such templates are emitted untouched instead of discarded.
+- The template has neither a primary R1 nor a primary R2 record.
 - Any read is flagged QC-fail (unless -n/--include-non-pf-reads is given).
 - A mapped read has mapping quality below -q/--min-map-q (default 0, i.e. no reads are
   dropped for mapping quality unless a threshold is set).
@@ -841,10 +844,19 @@ lets you keep no-mapped-read templates; only truncated/corrupt records are alway
 Pass-through templates are written verbatim: never marked, never MI-tagged, and counted as
 unique in the metrics.
 
-The counts of templates dropped for each reason are reported in the metrics output
-(--metrics). For the templates that remain, representative selection (the duplicate score),
-the 0x400 flag, and --remove-duplicates follow Picard `MarkDuplicates` semantics; the
-grouping key does not — see below.
+The count of templates dropped for each reason is reported in the metrics output
+(--metrics), one `filtered_*` column per reason above, plus `filtered_templates` for the
+total and `passthrough_templates` for the --include-unmapped templates that bypass the
+filter. These count *templates*; the `discarded_*` columns of `fgumi group`'s metrics count
+primary records, so the two files are not directly comparable. Templates read from the input
+are `filtered_templates + total_templates` — note that `total_templates` counts the templates
+that *passed the filter*, not the templates read, and not the templates written either: under
+--remove-duplicates the duplicates are dropped at write time, after they have been counted.
+A per-reason summary is also logged, so the drops are visible even without --metrics.
+
+For the templates that remain, representative selection (the duplicate score), the 0x400
+flag, and --remove-duplicates follow Picard `MarkDuplicates` semantics; the grouping key does
+not — see below.
 
 # Grouping key (strand of origin)
 
@@ -1242,12 +1254,12 @@ impl Command for MarkDuplicates {
         let aggregated = Arc::try_unwrap(collected_metrics)
             .expect("bug: metrics Arc still shared after pipeline join")
             .into_inner();
-        let final_metrics = aggregated.dedup_counts;
+        let final_counts = aggregated.dedup_counts;
         let final_family_sizes = aggregated.family_sizes;
 
         // Write metrics file
         if let Some(metrics_path) = &self.metrics {
-            write_dedup_metrics(&final_metrics, metrics_path)?;
+            write_dedup_metrics(&final_counts, metrics_path)?;
         }
 
         // Write family size histogram
@@ -1258,13 +1270,13 @@ impl Command for MarkDuplicates {
         // Log summary
         info!(
             "Deduplication complete: {} templates ({} unique, {} duplicates, {:.2}% duplicate rate)",
-            final_metrics.total_templates,
-            final_metrics.unique_templates,
-            final_metrics.duplicate_templates,
-            final_metrics.duplicate_rate() * 100.0
+            final_counts.total_templates,
+            final_counts.unique_templates,
+            final_counts.duplicate_templates,
+            final_counts.duplicate_rate() * 100.0
         );
 
-        if final_metrics.missing_tc_tag > 0 {
+        if final_counts.missing_tc_tag > 0 {
             bail!(
                 "{} secondary/supplementary reads are missing the `tc` tag.\n\n\
                 The `tc` tag is required for correct UMI-aware deduplication of \
@@ -1274,7 +1286,7 @@ impl Command for MarkDuplicates {
                 fgumi zipper -i aligned.bam --unmapped unmapped.bam -r reference.fa -o merged.bam\n  \
                 fgumi sort -i merged.bam -o sorted.bam --order template-coordinate\n  \
                 fgumi dedup -i sorted.bam -o deduped.bam",
-                final_metrics.missing_tc_tag
+                final_counts.missing_tc_tag
             );
         }
 
@@ -1282,19 +1294,19 @@ impl Command for MarkDuplicates {
         // dropped templates: a run that filters everything otherwise logs a bare
         // "0 templates" and is indistinguishable from empty input. Reasons are
         // named by their column suffix so the log points at the metrics column.
-        let filtered = final_metrics.filter_counts.total_rejected_templates();
+        let filtered = final_counts.filter_counts.total_rejected_templates();
         if filtered > 0 {
             let reasons: Vec<String> = TemplateFilterReason::ALL
                 .into_iter()
                 .filter_map(|reason| {
-                    let count = final_metrics.filter_counts.rejected_templates(reason);
+                    let count = final_counts.filter_counts.rejected_templates(reason);
                     (count > 0).then(|| format!("{count} {}", reason.column_suffix()))
                 })
                 .collect();
             info!("Filtered out {filtered} templates before marking: {}", reasons.join(", "));
         }
 
-        timer.log_completion(final_metrics.total_reads);
+        timer.log_completion(final_counts.total_reads);
 
         Ok(())
     }

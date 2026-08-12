@@ -329,7 +329,7 @@ reviews:
         require it to be called out. Do NOT file wording-only nits on help text
         or doc comments unless the text states a behavior the code does not
         implement.
-    - path: "src/lib/{grouper,template,mi_group,read_info}.rs"
+    - path: "src/lib/{grouper,template,template_filter,mi_group,read_info}.rs"
       instructions: >-
         Core read-grouping and template-assembly logic that sits outside the
         crates but feeds the same fgbio-validated output as `fgumi-umi` and

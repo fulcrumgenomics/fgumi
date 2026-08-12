@@ -15,63 +15,63 @@ use crate::Metric;
 ///    that `group`'s fgbio-shaped `.grouping_metrics.txt` counts primary
 ///    *records*, so the two files' discard counts are not comparable.
 /// 2. **Deduplication** — `total_templates` through `duplicate_reads`, covering
-///    only what survived filtering.
+///    only what survived filtering. These count what *passed the filter*, not what
+///    reaches the output file: under `--remove-duplicates` the duplicates are
+///    dropped at write time, after they have been counted here.
 /// 3. **Diagnostics** — `secondary_reads`, `supplementary_reads`,
 ///    `missing_tc_tag`.
 ///
 /// Templates read from the input are `filtered_templates + total_templates`; that
 /// sum is not emitted as its own column because it is derivable, matching
-/// [`crate::group::UmiGroupingMetrics`]' treatment of its derivable fields.
+/// `UmiGroupingMetrics`' treatment of its derivable fields.
+// NB: plain code spans above, never intra-doc links — this doc is rendered verbatim
+// into docs/src/metrics/deduplication-metrics.md, where a rustdoc link would come
+// out as literal markdown. Keep field docs to a single short line: they become the
+// Description column of that page's table.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeduplicationMetrics {
-    /// Templates dropped by the filter, for any reason.
+    /// Templates dropped by the filter (any reason)
     pub filtered_templates: u64,
-    /// Dropped because a record was shorter than the minimum BAM record length
-    /// (corrupt input).
+    /// Templates dropped (record shorter than the minimum BAM record length)
     pub filtered_malformed_record: u64,
-    /// Dropped because the template had neither a primary R1 nor a primary R2.
+    /// Templates dropped (no primary R1 or R2)
     pub filtered_no_primary_reads: u64,
-    /// Dropped because no primary read was mapped. Always zero with
-    /// `--include-unmapped`, which routes these to `passthrough_templates`.
+    /// Templates dropped (no mapped primary read)
     pub filtered_unmapped: u64,
-    /// Dropped because a primary read carried the QC-fail flag.
+    /// Templates dropped (QC-fail flag)
     pub filtered_not_passing_filter: u64,
-    /// Dropped because a mapped primary read's mapping quality was below
-    /// `--min-map-q`.
+    /// Templates dropped (mapping quality below `--min-map-q`)
     pub filtered_low_mapping_quality: u64,
-    /// Dropped because a primary read's `MQ` tag was below `--min-map-q`.
+    /// Templates dropped (mate `MQ` below `--min-map-q`)
     pub filtered_low_mate_mapping_quality: u64,
-    /// Dropped because a primary read had no UMI tag.
+    /// Templates dropped (no UMI tag)
     pub filtered_missing_umi: u64,
-    /// Dropped because the UMI contained an `N` base.
+    /// Templates dropped (N base in the UMI)
     pub filtered_ns_in_umi: u64,
-    /// Dropped because the UMI was shorter than `--min-umi-length`.
+    /// Templates dropped (UMI shorter than `--min-umi-length`)
     pub filtered_umi_too_short: u64,
-    /// Templates emitted untouched by `--include-unmapped`: never filtered, never
-    /// marked, never MI-tagged. Counted as unique in the columns below.
+    /// Templates emitted untouched by `--include-unmapped`
     pub passthrough_templates: u64,
-    /// Templates written to the output (accepted by the filter, plus
-    /// pass-throughs) — not the number read from the input.
+    /// Templates that passed the filter
     pub total_templates: u64,
-    /// Templates kept as the representative of their UMI family.
+    /// Templates kept as their family's representative
     pub unique_templates: u64,
-    /// Templates marked as duplicates.
+    /// Templates marked as duplicates
     pub duplicate_templates: u64,
-    /// `duplicate_templates / total_templates`, or 0 when nothing was output.
+    /// `duplicate_templates` / `total_templates`
     #[serde(with = "crate::float")]
     pub duplicate_rate: f64,
-    /// Reads written to the output.
+    /// Reads in templates that passed the filter
     pub total_reads: u64,
-    /// Reads not marked as duplicates.
+    /// Reads not marked as duplicates
     pub unique_reads: u64,
-    /// Reads marked as duplicates.
+    /// Reads marked as duplicates
     pub duplicate_reads: u64,
-    /// Secondary alignments seen in the output.
+    /// Secondary alignments that passed the filter
     pub secondary_reads: u64,
-    /// Supplementary alignments seen in the output.
+    /// Supplementary alignments that passed the filter
     pub supplementary_reads: u64,
-    /// Secondary/supplementary reads lacking the `tc` tag that `fgumi zipper`
-    /// adds and template-coordinate ordering requires.
+    /// Secondary/supplementary reads lacking the `tc` tag
     pub missing_tc_tag: u64,
 }
 

@@ -302,13 +302,18 @@ fn create_unmapped_pair(name: &str, umi: &str) -> Vec<RawRecord> {
 /// `--include-unmapped` emits templates with no mapped read untouched, while the default
 /// drops them. Input is 3 mapped duplicate pairs (6 reads) + 1 fully-unmapped pair (2 reads);
 /// the default keeps only the 6 mapped reads, and `--include-unmapped` keeps all 8.
+/// `expected_passthrough` / `expected_filtered_unmapped` pin where the no-mapped-read
+/// template is *accounted*, not just whether its reads survive: the two modes must route
+/// it to exactly one of the two columns, never both and never neither.
 #[rstest]
-#[case::default_drops_unmapped(false, 6, 0)]
-#[case::include_unmapped_keeps(true, 8, 2)]
+#[case::default_drops_unmapped(false, 6, 0, 0, 1)]
+#[case::include_unmapped_keeps(true, 8, 2, 1, 0)]
 fn test_dedup_include_unmapped(
     #[case] include_unmapped: bool,
     #[case] expected_total: usize,
     #[case] expected_unmapped: usize,
+    #[case] expected_passthrough: u64,
+    #[case] expected_filtered_unmapped: u64,
 ) {
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::RecordBuf;
@@ -317,6 +322,7 @@ fn test_dedup_include_unmapped(
     let temp_dir = TempDir::new().unwrap();
     let input_bam = temp_dir.path().join("input.bam");
     let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
 
     let mut records = create_duplicate_group("dup1", "ACGTACGT", 3, 100);
     records.extend(create_unmapped_pair("unmapped1", "TGCATGCA"));
@@ -332,6 +338,8 @@ fn test_dedup_include_unmapped(
         "identity".into(),
         "--compression-level".into(),
         "1".into(),
+        "--metrics".into(),
+        metrics_path.to_str().unwrap().into(),
     ];
     if include_unmapped {
         args.push("--include-unmapped".into());
@@ -365,6 +373,20 @@ fn test_dedup_include_unmapped(
 
     assert_eq!(total, expected_total, "unexpected output record count");
     assert_eq!(unmapped_seen, expected_unmapped, "unexpected unmapped-read count");
+
+    // The no-mapped-read template must be accounted for in exactly one column: it is
+    // either passed through untouched or filtered as unmapped, never both, never neither.
+    let rows: Vec<DeduplicationMetrics> =
+        DelimFile::default().read_tsv(&metrics_path).expect("failed to read dedup metrics");
+    let metrics = rows.first().expect("one metrics row");
+    assert_eq!(
+        metrics.passthrough_templates, expected_passthrough,
+        "unexpected passthrough_templates"
+    );
+    assert_eq!(
+        metrics.filtered_unmapped, expected_filtered_unmapped,
+        "unexpected filtered_unmapped"
+    );
 }
 
 /// Create a secondary alignment for `name` with no `tc` tag.
