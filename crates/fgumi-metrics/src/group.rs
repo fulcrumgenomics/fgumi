@@ -109,7 +109,7 @@ impl UmiGroupingMetrics {
         Self::default()
     }
 
-    /// Fills the fgbio filter columns from [`TemplateFilterCounts`].
+    /// Builds the fgbio filter columns from [`TemplateFilterCounts`].
     ///
     /// fgbio's `UmiGroupingMetric` counts **primary records**, not templates, so
     /// this reads the primary-read side of `counts`. The exhaustive match makes
@@ -120,30 +120,32 @@ impl UmiGroupingMetrics {
     /// finer bucket for them. That collapse is lossy and is retained only for
     /// fgbio parity; `dedup` reports each reason separately.
     ///
-    /// Leaves the family-size and summary fields untouched; the caller fills those.
-    pub fn set_filter_counts(&mut self, counts: &TemplateFilterCounts) {
-        self.total_records = counts.total_primary_reads();
-        self.accepted_records = counts.accepted_primary_reads();
-        self.discarded_non_pf = 0;
-        self.discarded_poor_alignment = 0;
-        self.discarded_ns_in_umi = 0;
-        self.discarded_umi_too_short = 0;
+    /// Leaves the family-size and summary fields at their defaults; the caller
+    /// fills those.
+    #[must_use]
+    pub fn from_filter_counts(counts: &TemplateFilterCounts) -> Self {
+        let mut metrics = Self {
+            total_records: counts.total_primary_reads(),
+            accepted_records: counts.accepted_primary_reads(),
+            ..Self::default()
+        };
 
         for reason in TemplateFilterReason::ALL {
             let reads = counts.rejected_primary_reads(reason);
             let column = match reason {
-                TemplateFilterReason::NotPassingFilter => &mut self.discarded_non_pf,
-                TemplateFilterReason::NsInUmi => &mut self.discarded_ns_in_umi,
-                TemplateFilterReason::UmiTooShort => &mut self.discarded_umi_too_short,
+                TemplateFilterReason::NotPassingFilter => &mut metrics.discarded_non_pf,
+                TemplateFilterReason::NsInUmi => &mut metrics.discarded_ns_in_umi,
+                TemplateFilterReason::UmiTooShort => &mut metrics.discarded_umi_too_short,
                 TemplateFilterReason::MalformedRecord
                 | TemplateFilterReason::NoPrimaryReads
                 | TemplateFilterReason::Unmapped
                 | TemplateFilterReason::LowMappingQuality
                 | TemplateFilterReason::LowMateMappingQuality
-                | TemplateFilterReason::MissingUmi => &mut self.discarded_poor_alignment,
+                | TemplateFilterReason::MissingUmi => &mut metrics.discarded_poor_alignment,
             };
             *column += reads;
         }
+        metrics
     }
 }
 
@@ -321,8 +323,7 @@ mod tests {
         counts.record_accepted(2);
         counts.record_rejected(reason, 2);
 
-        let mut metrics = UmiGroupingMetrics::new();
-        metrics.set_filter_counts(&counts);
+        let metrics = UmiGroupingMetrics::from_filter_counts(&counts);
 
         assert_eq!(metrics.accepted_records, 2, "accepted is in primary-read units");
         assert_eq!(metrics.total_records, 4);
@@ -341,8 +342,7 @@ mod tests {
             counts.record_rejected(reason, 2);
         }
 
-        let mut metrics = UmiGroupingMetrics::new();
-        metrics.set_filter_counts(&counts);
+        let metrics = UmiGroupingMetrics::from_filter_counts(&counts);
 
         let discarded = metrics.discarded_non_pf
             + metrics.discarded_poor_alignment

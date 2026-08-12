@@ -10,17 +10,17 @@ use crate::grouper::{
     ProcessedPositionGroup, RawPositionGroup, RecordPositionGrouper, build_templates_from_records,
 };
 use crate::logging::{OperationTimer, log_umi_grouping_summary};
+use crate::metrics::TemplateFilterCounts;
 use crate::metrics::group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
-use crate::metrics::{TemplateFilterCounts, TemplateFilterReason};
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::read_info::LibraryIndex;
 use crate::sam::is_template_coordinate_sorted;
 use crate::template::Template;
+use crate::template_filter::{TemplateFilterConfig, filter_template};
 use crate::umi::parallel_assigner::{
     ParallelAdjacencyAssigner, ParallelEditAssigner, ParallelIdentityAssigner,
     ParallelPairedAssigner,
 };
-use crate::umi::{UmiValidation, validate_umi};
 use crate::unified_pipeline::DecodedRecord;
 use crate::unified_pipeline::compute_group_key_from_raw;
 use crate::unified_pipeline::{
@@ -90,194 +90,9 @@ impl GroupMetricsAccumulator {
     }
 }
 
-/// Configuration for template filtering during group processing.
-#[derive(Clone)]
-struct GroupFilterConfig {
-    /// UMI tag bytes (e.g., [b'R', b'X']).
-    umi_tag: [u8; 2],
-    /// Minimum mapping quality.
-    min_mapq: u8,
-    /// Whether to include non-PF reads.
-    include_non_pf: bool,
-    /// Minimum UMI length (None to disable).
-    min_umi_length: Option<usize>,
-    /// Skip UMI validation; group by template coordinate and strand of origin alone.
-    no_umi: bool,
-    /// Whether to allow fully unmapped templates (both reads unmapped).
-    allow_unmapped: bool,
-}
-
 // =============================================================================
 // Raw-byte filter and helper functions
 // =============================================================================
-
-/// Filter a template in raw-byte mode based on filtering criteria.
-/// Returns true if the template should be kept, false if it should be discarded.
-fn filter_template_raw(
-    template: &Template,
-    config: &GroupFilterConfig,
-    counts: &mut TemplateFilterCounts,
-) -> bool {
-    use fgumi_raw_bam;
-    use fgumi_raw_bam::RawRecordView;
-
-    // Recorded once at the accept/reject site rather than on entry, so the
-    // accepted + rejected == total invariant holds by construction.
-    let primary_reads = u64::from(template.r1().is_some()) + u64::from(template.r2().is_some());
-
-    // Fail closed when *any* record (primary, secondary, or supplementary) is
-    // shorter than the minimum BAM record length: a truncated record indicates
-    // corrupt input, so the whole template must be rejected (not silently
-    // treated as a single-read template, and never reaching RawRecordView::new
-    // on a malformed slice).
-    if template.records().iter().any(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN) {
-        counts.record_rejected(TemplateFilterReason::MalformedRecord, primary_reads);
-        return false;
-    }
-
-    let raw_r1 = template.r1();
-    let raw_r2 = template.r2();
-    let num_primary_reads = primary_reads;
-
-    if raw_r1.is_none() && raw_r2.is_none() {
-        counts.record_rejected(TemplateFilterReason::NoPrimaryReads, num_primary_reads);
-        return false;
-    }
-
-    // Check if both reads are unmapped
-    let both_unmapped = raw_r1
-        .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0)
-        && raw_r2
-            .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0);
-    if both_unmapped && !config.allow_unmapped {
-        counts.record_rejected(TemplateFilterReason::Unmapped, num_primary_reads);
-        return false;
-    }
-
-    // Phase 1: Cheap flag-based checks
-    for raw in [raw_r1, raw_r2].into_iter().flatten() {
-        let flg = RawRecordView::new(raw).flags();
-
-        if !config.include_non_pf && (flg & fgumi_raw_bam::flags::QC_FAIL) != 0 {
-            counts.record_rejected(TemplateFilterReason::NotPassingFilter, num_primary_reads);
-            return false;
-        }
-
-        if (flg & fgumi_raw_bam::flags::UNMAPPED) == 0 && fgumi_raw_bam::mapq(raw) < config.min_mapq
-        {
-            counts.record_rejected(TemplateFilterReason::LowMappingQuality, num_primary_reads);
-            return false;
-        }
-    }
-
-    // Phase 2: Single-pass tag lookups (MQ + UMI in one aux scan)
-    for raw in [raw_r1, raw_r2].into_iter().flatten() {
-        let flg = RawRecordView::new(raw).flags();
-        let aux = fgumi_raw_bam::aux_data_slice(raw);
-        let check_mq = (flg & fgumi_raw_bam::flags::MATE_UNMAPPED) == 0;
-        let check_umi = !config.no_umi;
-
-        // Single pass over aux data to find both MQ and UMI tags
-        let mut found_mq: Option<i64> = None;
-        let mut found_umi: Option<&[u8]> = None;
-        let mut p = 0;
-        while p + 3 <= aux.len() {
-            let t = [aux[p], aux[p + 1]];
-            let val_type = aux[p + 2];
-
-            if check_umi && t == config.umi_tag && val_type == b'Z' {
-                let start = p + 3;
-                if let Some(end) = aux[start..].iter().position(|&b| b == 0) {
-                    found_umi = Some(&aux[start..start + end]);
-                    p = start + end + 1;
-                } else {
-                    break;
-                }
-                if !check_mq || found_mq.is_some() {
-                    break;
-                }
-                continue;
-            }
-
-            if check_mq && t == *SamTag::MQ {
-                // Extract MQ value (common types: C/c/S/s/I/i)
-                found_mq = match val_type {
-                    b'C' if p + 3 < aux.len() => Some(i64::from(aux[p + 3])),
-                    b'c' if p + 3 < aux.len() => Some(i64::from(aux[p + 3] as i8)),
-                    b'S' if p + 5 <= aux.len() => {
-                        Some(i64::from(u16::from_le_bytes([aux[p + 3], aux[p + 4]])))
-                    }
-                    b's' if p + 5 <= aux.len() => {
-                        Some(i64::from(i16::from_le_bytes([aux[p + 3], aux[p + 4]])))
-                    }
-                    b'I' if p + 7 <= aux.len() => Some(i64::from(u32::from_le_bytes([
-                        aux[p + 3],
-                        aux[p + 4],
-                        aux[p + 5],
-                        aux[p + 6],
-                    ]))),
-                    b'i' if p + 7 <= aux.len() => Some(i64::from(i32::from_le_bytes([
-                        aux[p + 3],
-                        aux[p + 4],
-                        aux[p + 5],
-                        aux[p + 6],
-                    ]))),
-                    _ => None,
-                };
-            }
-
-            if let Some(size) = fgumi_raw_bam::tag_value_size(val_type, &aux[p + 3..]) {
-                p += 3 + size;
-            } else {
-                break;
-            }
-            if (!check_umi || found_umi.is_some()) && (!check_mq || found_mq.is_some()) {
-                break;
-            }
-        }
-
-        // Check mate MAPQ. Compare in i64 so a malformed `MQ:i:-1` (or any
-        // negative value from a signed integer aux type) reads as below the
-        // threshold instead of wrapping into a large positive u8.
-        if check_mq
-            && let Some(mq) = found_mq
-            && mq < i64::from(config.min_mapq)
-        {
-            counts.record_rejected(TemplateFilterReason::LowMateMappingQuality, num_primary_reads);
-            return false;
-        }
-
-        // Skip UMI validation in no-umi mode
-        if config.no_umi {
-            continue;
-        }
-
-        // Check UMI for Ns and minimum length
-        if let Some(umi_bytes) = found_umi {
-            match validate_umi(umi_bytes) {
-                UmiValidation::ContainsN => {
-                    counts.record_rejected(TemplateFilterReason::NsInUmi, num_primary_reads);
-                    return false;
-                }
-                UmiValidation::Valid(base_count) => {
-                    if let Some(min_len) = config.min_umi_length
-                        && base_count < min_len
-                    {
-                        counts
-                            .record_rejected(TemplateFilterReason::UmiTooShort, num_primary_reads);
-                        return false;
-                    }
-                }
-            }
-        } else {
-            counts.record_rejected(TemplateFilterReason::MissingUmi, num_primary_reads);
-            return false;
-        }
-    }
-
-    counts.record_accepted(num_primary_reads);
-    true
-}
 
 /// Get pair orientation from raw-byte template.
 fn get_pair_orientation_raw(template: &Template) -> (bool, bool) {
@@ -910,8 +725,7 @@ fn build_grouping_metrics(
     filter_counts: &TemplateFilterCounts,
     family_size_counter: &AHashMap<usize, u64>,
 ) -> UmiGroupingMetrics {
-    let mut metrics = UmiGroupingMetrics::new();
-    metrics.set_filter_counts(filter_counts);
+    let mut metrics = UmiGroupingMetrics::from_filter_counts(filter_counts);
 
     metrics.total_families = family_size_counter.values().sum::<u64>();
     metrics.unique_molecule_ids = metrics.total_families;
@@ -1081,7 +895,7 @@ impl Command for GroupReadsByUmi {
         let cell_tag = Tag::from(SamTag::CB);
 
         // Create filter configuration
-        let filter_config = GroupFilterConfig {
+        let filter_config = TemplateFilterConfig {
             umi_tag: raw_tag,
             min_mapq,
             include_non_pf: self.include_non_pf_reads,
@@ -1284,7 +1098,7 @@ impl Command for GroupReadsByUmi {
                 // Filter templates
                 let filtered_templates: Vec<Template> = all_templates
                     .into_iter()
-                    .filter(|t| filter_template_raw(t, &filter_config, &mut filter_counts))
+                    .filter(|t| filter_template(t, &filter_config, &mut filter_counts))
                     .collect();
 
                 // Track filtered template memory (optimized for hot path).
@@ -1594,7 +1408,7 @@ impl GroupReadsByUmi {
         raw_tag: [u8; 2],
         assign_tag_bytes: [u8; 2],
         cell_tag: Tag,
-        filter_config: &GroupFilterConfig,
+        filter_config: &TemplateFilterConfig,
         timer: &OperationTimer,
     ) -> Result<()> {
         info!("Using single-threaded mode");
@@ -1716,7 +1530,7 @@ impl GroupReadsByUmi {
     #[allow(clippy::too_many_arguments)]
     fn process_and_write_position_group(
         group: RawPositionGroup,
-        filter_config: &GroupFilterConfig,
+        filter_config: &TemplateFilterConfig,
         strategy: Strategy,
         effective_edits: u32,
         index_threshold: IndexThreshold,
@@ -1739,7 +1553,7 @@ impl GroupReadsByUmi {
         // Filter templates
         let filtered_templates: Vec<Template> = all_templates
             .into_iter()
-            .filter(|t| filter_template_raw(t, filter_config, &mut filter_counts))
+            .filter(|t| filter_template(t, filter_config, &mut filter_counts))
             .collect();
 
         total_filter_counts.merge(&filter_counts);
@@ -1960,6 +1774,7 @@ fn with_extension(prefix: &Path, suffix: &str) -> PathBuf {
 mod tests {
     use super::*;
     use crate::assigner::{IdentityUmiAssigner, PairedUmiAssigner, Strategy};
+    use crate::metrics::TemplateFilterReason;
     use bstr::BString;
     use fgumi_raw_bam::{
         SamBuilder as RawSamBuilder, flags, raw_record_to_record_buf, testutil::encode_op,
@@ -5901,7 +5716,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Raw-byte filter_template_raw tests
+    // Raw-byte filter_template tests
     // ========================================================================
 
     /// Build a raw BAM record with specified flags, mapq, and UMI for testing.
@@ -5958,7 +5773,7 @@ mod tests {
     }
 
     #[test]
-    fn test_group_filter_template_raw_accepts_valid() {
+    fn test_group_filter_template_accepts_valid() {
         let raw = make_raw_bam_for_group(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
@@ -5969,21 +5784,14 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 20,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
+        let config = TemplateFilterConfig { min_mapq: 20, ..Default::default() };
         let mut metrics = TemplateFilterCounts::new();
-        assert!(filter_template_raw(&template, &config, &mut metrics));
+        assert!(filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.accepted_primary_reads(), 1);
     }
 
     #[test]
-    fn test_group_filter_template_raw_rejects_low_mapq() {
+    fn test_group_filter_template_rejects_low_mapq() {
         let raw = make_raw_bam_for_group(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
@@ -5994,21 +5802,14 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 20,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
+        let config = TemplateFilterConfig { min_mapq: 20, ..Default::default() };
         let mut metrics = TemplateFilterCounts::new();
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.rejected_primary_reads(TemplateFilterReason::LowMappingQuality), 1);
     }
 
     #[test]
-    fn test_group_filter_template_raw_rejects_qc_fail() {
+    fn test_group_filter_template_rejects_qc_fail() {
         let raw = make_raw_bam_for_group(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
@@ -6020,21 +5821,14 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
+        let config = TemplateFilterConfig { ..Default::default() };
         let mut metrics = TemplateFilterCounts::new();
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.rejected_primary_reads(TemplateFilterReason::NotPassingFilter), 1);
     }
 
     #[test]
-    fn test_group_filter_template_raw_rejects_umi_with_n() {
+    fn test_group_filter_template_rejects_umi_with_n() {
         let raw = make_raw_bam_for_group(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
@@ -6045,21 +5839,14 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
+        let config = TemplateFilterConfig { ..Default::default() };
         let mut metrics = TemplateFilterCounts::new();
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.rejected_primary_reads(TemplateFilterReason::NsInUmi), 1);
     }
 
     #[test]
-    fn test_group_filter_template_raw_rejects_short_umi() {
+    fn test_group_filter_template_rejects_short_umi() {
         let raw = make_raw_bam_for_group(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
@@ -6070,21 +5857,14 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: Some(6),
-            no_umi: false,
-            allow_unmapped: false,
-        };
+        let config = TemplateFilterConfig { min_umi_length: Some(6), ..Default::default() };
         let mut metrics = TemplateFilterCounts::new();
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.rejected_primary_reads(TemplateFilterReason::UmiTooShort), 1);
     }
 
     #[test]
-    fn test_group_filter_template_raw_rejects_unmapped() {
+    fn test_group_filter_template_rejects_unmapped() {
         let raw = make_raw_bam_for_group(
             b"rea",
             fgumi_raw_bam::flags::UNMAPPED | fgumi_raw_bam::flags::MATE_UNMAPPED,
@@ -6093,16 +5873,9 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
+        let config = TemplateFilterConfig { ..Default::default() };
         let mut metrics = TemplateFilterCounts::new();
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.rejected_primary_reads(TemplateFilterReason::Unmapped), 1);
     }
 
@@ -6110,7 +5883,7 @@ mod tests {
     /// template too — the previous r1()/r2()-only guard let truncated
     /// non-primary records slip through.
     #[test]
-    fn test_group_filter_template_raw_truncated_secondary_rejected() {
+    fn test_group_filter_template_truncated_secondary_rejected() {
         let valid_r1 = make_raw_bam_for_group(
             b"rea",
             fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
@@ -6138,26 +5911,19 @@ mod tests {
             cached_umi_position: None,
         };
 
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
+        let config = TemplateFilterConfig { ..Default::default() };
         let mut metrics = TemplateFilterCounts::new();
         assert!(
-            !filter_template_raw(&template, &config, &mut metrics),
+            !filter_template(&template, &config, &mut metrics),
             "truncated secondary must cause the template to be rejected"
         );
         assert_eq!(metrics.rejected_primary_reads(TemplateFilterReason::MalformedRecord), 2);
     }
 
     #[test]
-    fn test_group_filter_template_raw_truncated_record_treated_as_missing() {
+    fn test_group_filter_template_truncated_record_treated_as_missing() {
         // Construct a Template by bypassing from_records validation so that
-        // raw_records[0] is shorter than MIN_BAM_RECORD_LEN. filter_template_raw
+        // raw_records[0] is shorter than MIN_BAM_RECORD_LEN. filter_template
         // must reject the template, accounting for the missing primary read.
         let short_rec = fgumi_raw_bam::RawRecord::from(vec![0u8; 16]);
         let valid_rec = make_raw_bam_for_group(
@@ -6188,17 +5954,10 @@ mod tests {
             cached_umi_position: None,
         };
 
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
+        let config = TemplateFilterConfig { ..Default::default() };
         let mut metrics = TemplateFilterCounts::new();
         assert!(
-            !filter_template_raw(&template, &config, &mut metrics),
+            !filter_template(&template, &config, &mut metrics),
             "truncated R1 must cause the template to be rejected"
         );
     }
@@ -6207,7 +5966,7 @@ mod tests {
     /// non-negative threshold, not wrapped to a large positive `u8` (which
     /// would let malformed records slip past `min_mapq`).
     #[test]
-    fn test_group_filter_template_raw_negative_mate_mq_rejected() {
+    fn test_group_filter_template_negative_mate_mq_rejected() {
         // Build R1 + R2 where R2 carries an aux MQ:i:-1 (signed int aux type).
         fn make_with_neg_mate_mq(name: &[u8], flag: u16, mapq: u8) -> fgumi_raw_bam::RawRecord {
             let seq_len = 4usize;
@@ -6261,23 +6020,16 @@ mod tests {
         let template =
             Template::from_records(vec![r1, r2]).expect("template construction should succeed");
 
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 20,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
+        let config = TemplateFilterConfig { min_mapq: 20, ..Default::default() };
         let mut metrics = TemplateFilterCounts::new();
         assert!(
-            !filter_template_raw(&template, &config, &mut metrics),
+            !filter_template(&template, &config, &mut metrics),
             "negative mate MQ must compare below min_mapq (signed semantics)"
         );
     }
 
     #[test]
-    fn test_group_filter_template_raw_no_primary_reads() {
+    fn test_group_filter_template_no_primary_reads() {
         // Template with only supplementary records → no raw_r1/raw_r2
         let supp = make_raw_bam_for_group(
             b"rea",
@@ -6290,17 +6042,10 @@ mod tests {
         );
         let template =
             Template::from_records(vec![supp]).expect("Template::from_raw_records should succeed");
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
+        let config = TemplateFilterConfig { ..Default::default() };
         let mut metrics = TemplateFilterCounts::new();
         // Supplementary-only template has no primary R1/R2 → raw_r1() returns None
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert!(!filter_template(&template, &config, &mut metrics));
     }
 
     // ========================================================================
@@ -6639,17 +6384,11 @@ mod tests {
         let (r1, r2) = build_unmapped_test_pair("unmapped", "AAAAAA");
         let template = Template::from_records(vec![r1, r2])?;
 
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 1,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: true,
-        };
+        let config =
+            TemplateFilterConfig { min_mapq: 1, allow_unmapped: true, ..Default::default() };
 
         let mut metrics = TemplateFilterCounts::new();
-        let should_keep = filter_template_raw(&template, &config, &mut metrics);
+        let should_keep = filter_template(&template, &config, &mut metrics);
 
         assert!(should_keep, "Unmapped template should be kept when allow_unmapped=true");
         assert_eq!(metrics.total_primary_reads(), 2, "Should count 2 records");
@@ -6663,17 +6402,10 @@ mod tests {
         let (r1, r2) = build_unmapped_test_pair("unmapped", "AAAAAA");
         let template = Template::from_records(vec![r1, r2])?;
 
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 1,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
+        let config = TemplateFilterConfig { min_mapq: 1, ..Default::default() };
 
         let mut metrics = TemplateFilterCounts::new();
-        let should_keep = filter_template_raw(&template, &config, &mut metrics);
+        let should_keep = filter_template(&template, &config, &mut metrics);
 
         assert!(!should_keep, "Unmapped template should be rejected when allow_unmapped=false");
         assert_eq!(metrics.total_primary_reads(), 2, "Should count 2 records");

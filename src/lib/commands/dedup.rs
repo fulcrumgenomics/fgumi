@@ -32,7 +32,10 @@ use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
 use crate::sam::is_template_coordinate_sorted;
 use crate::template::Template;
-use crate::umi::{UmiValidation, validate_umi};
+use crate::template_filter::{
+    TemplateFilterConfig, filter_template, template_has_malformed_record,
+    template_is_fully_unmapped,
+};
 use crate::unified_pipeline::{
     BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate,
     run_bam_pipeline_from_reader_with_mi_assign,
@@ -200,28 +203,12 @@ impl MemoryEstimate for ProcessedDedupGroup {
         self.templates.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
             + self.templates.capacity() * std::mem::size_of::<Template>()
             + self.family_sizes.capacity() * std::mem::size_of::<(usize, u64)>()
-            + std::mem::size_of::<DedupCounts>()
     }
 }
 
 //////////////////////////////////////////////////////////////////////////////
 // Configuration
 //////////////////////////////////////////////////////////////////////////////
-
-/// Configuration for template filtering during deduplication.
-#[derive(Clone)]
-struct DedupFilterConfig {
-    /// UMI tag bytes (e.g., [b'R', b'X']).
-    umi_tag: [u8; 2],
-    /// Minimum mapping quality.
-    min_mapq: u8,
-    /// Whether to include non-PF reads.
-    include_non_pf: bool,
-    /// Minimum UMI length.
-    min_umi_length: Option<usize>,
-    /// Skip UMI validation; group by template coordinate, orientation-agnostically.
-    no_umi: bool,
-}
 
 //////////////////////////////////////////////////////////////////////////////
 // Duplicate scoring
@@ -296,165 +283,6 @@ fn score_template(template: &Template) -> i64 {
 // Template filtering (adapted from group command)
 //////////////////////////////////////////////////////////////////////////////
 
-/// Filter a template based on filtering criteria.
-/// Returns true if the template should be kept.
-fn filter_template(
-    template: &Template,
-    config: &DedupFilterConfig,
-    counts: &mut TemplateFilterCounts,
-) -> bool {
-    // Primary-record count, recorded alongside the template count so `group` and
-    // `dedup` can render the same measurement in their respective units.
-    let primary_reads = u64::from(template.r1().is_some()) + u64::from(template.r2().is_some());
-
-    // Fail closed when *any* record (primary, secondary, or supplementary) is
-    // shorter than the minimum BAM record length: a truncated record indicates
-    // corrupt input, so the template must be rejected rather than have the
-    // malformed record silently dropped (and later panic in RawRecordView::new
-    // on the dedup/serialize path).
-    if template.records().iter().any(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN) {
-        counts.record_rejected(TemplateFilterReason::MalformedRecord, primary_reads);
-        return false;
-    }
-
-    let raw_r1 = template.r1();
-    let raw_r2 = template.r2();
-
-    if raw_r1.is_none() && raw_r2.is_none() {
-        counts.record_rejected(TemplateFilterReason::NoPrimaryReads, primary_reads);
-        return false;
-    }
-
-    let both_unmapped = raw_r1
-        .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0)
-        && raw_r2
-            .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0);
-    if both_unmapped {
-        counts.record_rejected(TemplateFilterReason::Unmapped, primary_reads);
-        return false;
-    }
-
-    // Phase 1: Flag-based checks
-    for raw in [raw_r1, raw_r2].into_iter().flatten() {
-        let flg = RawRecordView::new(raw).flags();
-
-        if !config.include_non_pf && (flg & fgumi_raw_bam::flags::QC_FAIL) != 0 {
-            counts.record_rejected(TemplateFilterReason::NotPassingFilter, primary_reads);
-            return false;
-        }
-
-        if (flg & fgumi_raw_bam::flags::UNMAPPED) == 0 {
-            let mapq = fgumi_raw_bam::mapq(raw);
-            if mapq < config.min_mapq {
-                counts.record_rejected(TemplateFilterReason::LowMappingQuality, primary_reads);
-                return false;
-            }
-        }
-    }
-
-    // Phase 2: Single-pass tag lookups (MQ + UMI in one aux scan)
-    for raw in [raw_r1, raw_r2].into_iter().flatten() {
-        let flg = RawRecordView::new(raw).flags();
-        let aux = fgumi_raw_bam::aux_data_slice(raw);
-        let check_mq = (flg & fgumi_raw_bam::flags::MATE_UNMAPPED) == 0;
-        let check_umi = !config.no_umi;
-
-        let mut found_mq: Option<i64> = None;
-        let mut found_umi: Option<&[u8]> = None;
-        let mut p = 0;
-        while p + 3 <= aux.len() {
-            let t = [aux[p], aux[p + 1]];
-            let val_type = aux[p + 2];
-
-            if check_umi && t == config.umi_tag && val_type == b'Z' {
-                let start = p + 3;
-                if let Some(end) = aux[start..].iter().position(|&b| b == 0) {
-                    found_umi = Some(&aux[start..start + end]);
-                    p = start + end + 1;
-                } else {
-                    break;
-                }
-                if !check_mq || found_mq.is_some() {
-                    break;
-                }
-                continue;
-            }
-
-            if check_mq && t == *SamTag::MQ {
-                found_mq = match val_type {
-                    b'C' if p + 3 < aux.len() => Some(i64::from(aux[p + 3])),
-                    b'c' if p + 3 < aux.len() => Some(i64::from(aux[p + 3] as i8)),
-                    b'S' if p + 5 <= aux.len() => {
-                        Some(i64::from(u16::from_le_bytes([aux[p + 3], aux[p + 4]])))
-                    }
-                    b's' if p + 5 <= aux.len() => {
-                        Some(i64::from(i16::from_le_bytes([aux[p + 3], aux[p + 4]])))
-                    }
-                    b'I' if p + 7 <= aux.len() => Some(i64::from(u32::from_le_bytes([
-                        aux[p + 3],
-                        aux[p + 4],
-                        aux[p + 5],
-                        aux[p + 6],
-                    ]))),
-                    b'i' if p + 7 <= aux.len() => Some(i64::from(i32::from_le_bytes([
-                        aux[p + 3],
-                        aux[p + 4],
-                        aux[p + 5],
-                        aux[p + 6],
-                    ]))),
-                    _ => None,
-                };
-            }
-
-            if let Some(size) = fgumi_raw_bam::tag_value_size(val_type, &aux[p + 3..]) {
-                p += 3 + size;
-            } else {
-                break;
-            }
-            if (!check_umi || found_umi.is_some()) && (!check_mq || found_mq.is_some()) {
-                break;
-            }
-        }
-
-        if check_mq && let Some(mq) = found_mq {
-            // Compare as signed so a negative MQ (e.g., MQ:c:-1) fails the filter
-            // rather than wrapping to 255 via `as u8`.
-            if mq < i64::from(config.min_mapq) {
-                counts.record_rejected(TemplateFilterReason::LowMateMappingQuality, primary_reads);
-                return false;
-            }
-        }
-
-        // Skip UMI validation in no-umi mode
-        if config.no_umi {
-            continue;
-        }
-
-        if let Some(umi_bytes) = found_umi {
-            match validate_umi(umi_bytes) {
-                UmiValidation::ContainsN => {
-                    counts.record_rejected(TemplateFilterReason::NsInUmi, primary_reads);
-                    return false;
-                }
-                UmiValidation::Valid(base_count) => {
-                    if let Some(min_len) = config.min_umi_length
-                        && base_count < min_len
-                    {
-                        counts.record_rejected(TemplateFilterReason::UmiTooShort, primary_reads);
-                        return false;
-                    }
-                }
-            }
-        } else {
-            counts.record_rejected(TemplateFilterReason::MissingUmi, primary_reads);
-            return false;
-        }
-    }
-
-    counts.record_accepted(primary_reads);
-    true
-}
-
 /// Returns `true` when a template has no mapped primary read (both mates unmapped,
 /// or a single unmapped read) and is not truncated/corrupt.
 ///
@@ -465,24 +293,12 @@ fn filter_template(
 /// so they still fall through to `filter_template` and are dropped — a corrupt record
 /// must never be passed through to the output.
 fn template_is_unmapped_passthrough(template: &Template) -> bool {
-    // A truncated record indicates corrupt input; leave it for `filter_template` to
-    // reject rather than emitting a malformed record.
-    if template.records().iter().any(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN) {
-        return false;
-    }
-
-    let raw_r1 = template.r1();
-    let raw_r2 = template.r2();
-
-    // A template with no primary read at all is a poor-alignment discard, not a
-    // pass-through; let `filter_template` account for it.
-    if raw_r1.is_none() && raw_r2.is_none() {
-        return false;
-    }
-
-    raw_r1.is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0)
-        && raw_r2
-            .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0)
+    // Both predicates are the shared filter's own, so the two cannot drift on what
+    // "malformed" or "unmapped" means. A truncated record is deliberately NOT a
+    // pass-through: it is left for `filter_template` to reject, so a corrupt record
+    // is never emitted verbatim. A template with no primary read at all is likewise
+    // left to the filter, which accounts for it as `NoPrimaryReads`.
+    !template_has_malformed_record(template) && template_is_fully_unmapped(template)
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -813,7 +629,7 @@ fn mark_template_as_duplicate(template: &mut Template, dedup_counts: &mut DedupC
 /// Process a position group for deduplication.
 fn process_position_group(
     group: RawPositionGroup,
-    filter_config: &DedupFilterConfig,
+    filter_config: &TemplateFilterConfig,
     assigner: &dyn UmiAssigner,
     raw_tag: SamTag,
     min_umi_length: Option<usize>,
@@ -1254,12 +1070,16 @@ impl Command for MarkDuplicates {
         let cell_tag = Tag::from(SamTag::CB);
         let assign_tag_bytes: [u8; 2] = *SamTag::MI;
 
-        let filter_config = DedupFilterConfig {
+        let filter_config = TemplateFilterConfig {
             umi_tag: *raw_tag,
             min_mapq,
             include_non_pf: self.include_non_pf_reads,
             min_umi_length: self.min_umi_length,
             no_umi: self.no_umi,
+            // Always false: --include-unmapped splits no-mapped-read templates off
+            // *before* the filter runs (see `template_is_unmapped_passthrough`), so
+            // an unmapped template reaching the filter is always a rejection.
+            allow_unmapped: false,
         };
 
         // Shared state for collecting metrics
@@ -1840,14 +1660,8 @@ mod tests {
     // filter_template tests
     // ========================================================================
 
-    fn default_filter_config() -> DedupFilterConfig {
-        DedupFilterConfig {
-            umi_tag: *SamTag::RX,
-            min_mapq: 20,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-        }
+    fn default_filter_config() -> TemplateFilterConfig {
+        TemplateFilterConfig { min_mapq: 20, ..Default::default() }
     }
 
     /// Helper to create a mapped template with UMI tag
@@ -2911,7 +2725,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_template_raw_truncated_record_no_panic() {
+    fn test_filter_template_raw_record_truncated_no_panic() {
         // After fix: truncated records no longer panic -- they gracefully return false.
         // The aux block is truncated rather than the record itself, so the record
         // clears the minimum-length check and is rejected for the missing UMI tag.
@@ -2920,13 +2734,7 @@ mod tests {
         let template =
             Template::from_records(vec![raw]).expect("test template construction should not fail");
 
-        let config = DedupFilterConfig {
-            umi_tag: *SamTag::RX,
-            min_mapq: 20,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-        };
+        let config = TemplateFilterConfig { min_mapq: 20, ..Default::default() };
         let mut metrics = TemplateFilterCounts::new();
 
         // Should not panic; should reject gracefully due to missing UMI
@@ -2935,9 +2743,9 @@ mod tests {
         assert_eq!(metrics.rejected_templates(TemplateFilterReason::MissingUmi), 1);
     }
 
-    // Test that the raw-byte mode MQ tag issue actually occurs in filter_template_raw
+    // Test that the raw-byte mode MQ tag issue actually occurs in filter_template
     #[test]
-    fn test_filter_template_raw_mq_tag_type_mismatch_bypasses_filter() {
+    fn test_filter_template_raw_record_mq_tag_type_mismatch() {
         // Build a BAM record with exact sizes so aux data is contiguous.
         // Header(32) + name(4) + cigar(4) + seq(2) + qual(4) = 46 bytes before aux
         let mut rec = vec![0u8; 46];
@@ -2964,16 +2772,10 @@ mod tests {
         let template = Template::from_records(vec![RawRecord::from(rec)])
             .expect("test template construction should not fail");
 
-        let config = DedupFilterConfig {
-            umi_tag: *SamTag::RX,
-            min_mapq: 20,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-        };
+        let config = TemplateFilterConfig { min_mapq: 20, ..Default::default() };
         let mut metrics = TemplateFilterCounts::new();
 
-        // After fix: filter_template_raw now uses find_int_tag which handles all integer types.
+        // After fix: filter_template now uses find_int_tag which handles all integer types.
         // The template should be REJECTED because mate MAPQ=10 < min_mapq=20.
         let result = filter_template(&template, &config, &mut metrics);
 
@@ -3164,7 +2966,7 @@ mod tests {
     }
 
     // ========================================================================
-    // filter_template_raw passing/rejecting tests
+    // filter_template passing/rejecting tests
     // ========================================================================
 
     /// What an `rstest` case expects the filter to record: `None` for an accepted
@@ -3211,7 +3013,7 @@ mod tests {
             | fgumi_raw_bam::flags::MATE_UNMAPPED,
         0, b"ACGT", 0, None, false, Some(TemplateFilterReason::Unmapped)
     )]
-    fn test_filter_template_raw(
+    fn test_filter_template(
         #[case] flags: u16,
         #[case] mapq: u8,
         #[case] umi: &'static [u8],
@@ -3223,12 +3025,13 @@ mod tests {
         let raw = make_raw_bam_for_dedup(b"rea", flags, mapq, 4, &[20, 20, 20, 20], umi);
         let template =
             Template::from_records(vec![raw]).expect("test template construction should not fail");
-        let config = DedupFilterConfig {
+        let config = TemplateFilterConfig {
             umi_tag: *SamTag::RX,
             min_mapq,
             include_non_pf: false,
             min_umi_length,
             no_umi: false,
+            allow_unmapped: false,
         };
         let mut metrics = TemplateFilterCounts::new();
         assert_eq!(filter_template(&template, &config, &mut metrics), expect_pass);
@@ -3398,7 +3201,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_template_raw_accepts_missing_umi_when_no_umi_mode() {
+    fn test_filter_template_raw_record_accepts_missing_umi_when_no_umi_mode() {
         let raw = make_raw_bam_for_dedup_no_tags(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
@@ -3410,13 +3213,7 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("test template construction should not fail");
-        let config = DedupFilterConfig {
-            umi_tag: *SamTag::RX,
-            min_mapq: 20,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: true,
-        };
+        let config = TemplateFilterConfig { min_mapq: 20, no_umi: true, ..Default::default() };
         let mut metrics = TemplateFilterCounts::new();
 
         // In no_umi mode, templates without UMI tags should be accepted
@@ -3425,7 +3222,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_template_raw_accepts_umi_with_n_when_no_umi_mode() {
+    fn test_filter_template_raw_record_accepts_umi_with_n_when_no_umi_mode() {
         let raw = make_raw_bam_for_dedup(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
@@ -3438,13 +3235,7 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("test template construction should not fail");
-        let config = DedupFilterConfig {
-            umi_tag: *SamTag::RX,
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: true,
-        };
+        let config = TemplateFilterConfig { no_umi: true, ..Default::default() };
         let mut metrics = TemplateFilterCounts::new();
 
         // In no_umi mode, UMIs with N should be accepted (UMI validation is skipped)
@@ -3453,7 +3244,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_template_raw_accepts_short_umi_when_no_umi_mode() {
+    fn test_filter_template_raw_record_accepts_short_umi_when_no_umi_mode() {
         let raw = make_raw_bam_for_dedup(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
@@ -3466,13 +3257,8 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("test template construction should not fail");
-        let config = DedupFilterConfig {
-            umi_tag: *SamTag::RX,
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: Some(6),
-            no_umi: true,
-        };
+        let config =
+            TemplateFilterConfig { min_umi_length: Some(6), no_umi: true, ..Default::default() };
         let mut metrics = TemplateFilterCounts::new();
 
         // In no_umi mode, short UMIs should be accepted (min_umi_length is not checked)
