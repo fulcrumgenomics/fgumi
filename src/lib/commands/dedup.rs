@@ -65,9 +65,13 @@ const DUPLICATE_FLAG: u16 = 0x400;
 // Metrics
 //////////////////////////////////////////////////////////////////////////////
 
-/// Metrics collected during deduplication.
+/// Per-worker deduplication counters, merged into a single total and then
+/// rendered into the serializable metrics schema for output.
+///
+/// Named `Counts` rather than `Metrics` to keep it distinct from the file
+/// schema: this is the accumulator, that is the file.
 #[derive(Debug, Default, Clone)]
-pub struct DedupMetrics {
+pub struct DedupCounts {
     /// Total templates processed
     pub total_templates: u64,
     /// Templates marked as duplicates
@@ -90,9 +94,9 @@ pub struct DedupMetrics {
     pub filter_counts: TemplateFilterCounts,
 }
 
-impl DedupMetrics {
-    /// Merge another `DedupMetrics` into this one.
-    pub fn merge(&mut self, other: &DedupMetrics) {
+impl DedupCounts {
+    /// Merge another `DedupCounts` into this one.
+    pub fn merge(&mut self, other: &DedupCounts) {
         self.total_templates += other.total_templates;
         self.duplicate_templates += other.duplicate_templates;
         self.unique_templates += other.unique_templates;
@@ -116,7 +120,7 @@ impl DedupMetrics {
     }
 }
 
-/// Serializable version of `DedupMetrics` for file output.
+/// Serializable version of `DedupCounts` for file output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DedupMetricsOutput {
     total_templates: u64,
@@ -134,8 +138,8 @@ struct DedupMetricsOutput {
     missing_tc_tag: u64,
 }
 
-impl From<&DedupMetrics> for DedupMetricsOutput {
-    fn from(m: &DedupMetrics) -> Self {
+impl From<&DedupCounts> for DedupMetricsOutput {
+    fn from(m: &DedupCounts) -> Self {
         Self {
             total_templates: m.total_templates,
             unique_templates: m.unique_templates,
@@ -157,9 +161,9 @@ impl From<&DedupMetrics> for DedupMetricsOutput {
 
 /// Metrics collected per position group, aggregated after pipeline completion.
 #[derive(Default, Debug)]
-struct CollectedDedupMetrics {
+struct CollectedDedupCounts {
     /// Dedup-specific metrics
-    dedup_metrics: DedupMetrics,
+    dedup_counts: DedupCounts,
     /// Family size counts
     family_sizes: AHashMap<usize, u64>,
 }
@@ -175,7 +179,7 @@ pub struct ProcessedDedupGroup {
     /// Family size counts for this group.
     pub family_sizes: AHashMap<usize, u64>,
     /// Dedup metrics for this group.
-    pub dedup_metrics: DedupMetrics,
+    pub dedup_counts: DedupCounts,
     /// Total input records processed (for progress tracking).
     pub input_record_count: u64,
     /// Number of distinct numeric `MoleculeId`s assigned in this group.
@@ -196,7 +200,7 @@ impl MemoryEstimate for ProcessedDedupGroup {
         self.templates.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
             + self.templates.capacity() * std::mem::size_of::<Template>()
             + self.family_sizes.capacity() * std::mem::size_of::<(usize, u64)>()
-            + std::mem::size_of::<DedupMetrics>()
+            + std::mem::size_of::<DedupCounts>()
     }
 }
 
@@ -704,24 +708,24 @@ fn assign_umi_groups(
 ///
 /// Optimized with fast paths for small families (size 1-3) to avoid
 /// allocation and sorting overhead for the common case.
-fn mark_duplicates_in_family(templates: &mut [&mut Template], dedup_metrics: &mut DedupMetrics) {
+fn mark_duplicates_in_family(templates: &mut [&mut Template], dedup_counts: &mut DedupCounts) {
     match templates.len() {
         0 => return,
         1 => {
             // Single template - not a duplicate
-            dedup_metrics.unique_templates += 1;
+            dedup_counts.unique_templates += 1;
             return;
         }
         2 => {
             // Fast path for size 2 (very common case) - no allocation needed
             let s0 = score_template(templates[0]);
             let s1 = score_template(templates[1]);
-            dedup_metrics.unique_templates += 1;
-            dedup_metrics.duplicate_templates += 1;
+            dedup_counts.unique_templates += 1;
+            dedup_counts.duplicate_templates += 1;
             if s0 >= s1 {
-                mark_template_as_duplicate(templates[1], dedup_metrics);
+                mark_template_as_duplicate(templates[1], dedup_counts);
             } else {
-                mark_template_as_duplicate(templates[0], dedup_metrics);
+                mark_template_as_duplicate(templates[0], dedup_counts);
             }
             return;
         }
@@ -730,17 +734,17 @@ fn mark_duplicates_in_family(templates: &mut [&mut Template], dedup_metrics: &mu
             let s0 = score_template(templates[0]);
             let s1 = score_template(templates[1]);
             let s2 = score_template(templates[2]);
-            dedup_metrics.unique_templates += 1;
-            dedup_metrics.duplicate_templates += 2;
+            dedup_counts.unique_templates += 1;
+            dedup_counts.duplicate_templates += 2;
             if s0 >= s1 && s0 >= s2 {
-                mark_template_as_duplicate(templates[1], dedup_metrics);
-                mark_template_as_duplicate(templates[2], dedup_metrics);
+                mark_template_as_duplicate(templates[1], dedup_counts);
+                mark_template_as_duplicate(templates[2], dedup_counts);
             } else if s1 >= s0 && s1 >= s2 {
-                mark_template_as_duplicate(templates[0], dedup_metrics);
-                mark_template_as_duplicate(templates[2], dedup_metrics);
+                mark_template_as_duplicate(templates[0], dedup_counts);
+                mark_template_as_duplicate(templates[2], dedup_counts);
             } else {
-                mark_template_as_duplicate(templates[0], dedup_metrics);
-                mark_template_as_duplicate(templates[1], dedup_metrics);
+                mark_template_as_duplicate(templates[0], dedup_counts);
+                mark_template_as_duplicate(templates[1], dedup_counts);
             }
             return;
         }
@@ -756,21 +760,21 @@ fn mark_duplicates_in_family(templates: &mut [&mut Template], dedup_metrics: &mu
     scores.sort_by(|a, b| b.1.cmp(&a.1));
 
     // First template (highest score) is representative
-    dedup_metrics.unique_templates += 1;
+    dedup_counts.unique_templates += 1;
 
     // Mark all others as duplicates
     for (idx, _score) in scores.iter().skip(1) {
-        mark_template_as_duplicate(templates[*idx], dedup_metrics);
-        dedup_metrics.duplicate_templates += 1;
+        mark_template_as_duplicate(templates[*idx], dedup_counts);
+        dedup_counts.duplicate_templates += 1;
     }
 }
 
 /// Marks all reads in a template as duplicates.
-fn mark_template_as_duplicate(template: &mut Template, dedup_metrics: &mut DedupMetrics) {
+fn mark_template_as_duplicate(template: &mut Template, dedup_counts: &mut DedupCounts) {
     for raw in template.records_mut().iter_mut() {
         let flg = RawRecordView::new(raw.as_ref()).flags();
         fgumi_raw_bam::set_flags(raw, flg | DUPLICATE_FLAG);
-        dedup_metrics.duplicate_reads += 1;
+        dedup_counts.duplicate_reads += 1;
     }
 }
 
@@ -788,7 +792,7 @@ fn process_position_group(
     no_umi: bool,
     include_unmapped: bool,
 ) -> io::Result<ProcessedDedupGroup> {
-    let mut dedup_metrics = DedupMetrics::default();
+    let mut dedup_counts = DedupCounts::default();
     let input_record_count = group.records.len() as u64;
 
     // Build templates from raw records (deferred from Group step)
@@ -812,13 +816,13 @@ fn process_position_group(
         .filter(|t| filter_template(t, filter_config, &mut filter_counts))
         .collect();
 
-    dedup_metrics.filter_counts = filter_counts;
+    dedup_counts.filter_counts = filter_counts;
 
     if filtered_templates.is_empty() && passthrough_templates.is_empty() {
         return Ok(ProcessedDedupGroup {
             templates: Vec::new(),
             family_sizes: AHashMap::new(),
-            dedup_metrics,
+            dedup_counts,
             input_record_count,
             distinct_mi_count: 0,
         });
@@ -878,30 +882,30 @@ fn process_position_group(
 
             // Get mutable references to family templates (single collection, not double)
             let mut family_refs: Vec<&mut Template> = templates[start..end].iter_mut().collect();
-            mark_duplicates_in_family(&mut family_refs, &mut dedup_metrics);
+            mark_duplicates_in_family(&mut family_refs, &mut dedup_counts);
         }
     }
 
     // Count reads and check for missing tc tags
     let tc_tag_bytes: [u8; 2] = *TC_TAG.as_ref();
     for template in &templates {
-        dedup_metrics.total_templates += 1;
+        dedup_counts.total_templates += 1;
         for raw in template.records() {
-            dedup_metrics.total_reads += 1;
+            dedup_counts.total_reads += 1;
             let flg = RawRecordView::new(raw.as_ref()).flags();
             let is_secondary = (flg & fgumi_raw_bam::flags::SECONDARY) != 0;
             let is_supplementary = (flg & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0;
 
             if is_secondary {
-                dedup_metrics.secondary_reads += 1;
+                dedup_counts.secondary_reads += 1;
             }
             if is_supplementary {
-                dedup_metrics.supplementary_reads += 1;
+                dedup_counts.supplementary_reads += 1;
             }
             if is_secondary || is_supplementary {
                 let aux = fgumi_raw_bam::aux_data_slice(raw);
                 if fgumi_raw_bam::find_tag_type(aux, tc_tag_bytes).is_none() {
-                    dedup_metrics.missing_tc_tag += 1;
+                    dedup_counts.missing_tc_tag += 1;
                 }
             }
         }
@@ -912,22 +916,22 @@ fn process_position_group(
     // serialize step writes them verbatim (no MI tag, duplicate flag left as in the
     // input). Count them as unique output so the record totals match what is written.
     for template in &passthrough_templates {
-        dedup_metrics.total_templates += 1;
-        dedup_metrics.unique_templates += 1;
+        dedup_counts.total_templates += 1;
+        dedup_counts.unique_templates += 1;
         for raw in template.records() {
-            dedup_metrics.total_reads += 1;
+            dedup_counts.total_reads += 1;
             let flg = RawRecordView::new(raw.as_ref()).flags();
             if (flg & fgumi_raw_bam::flags::SECONDARY) != 0 {
-                dedup_metrics.secondary_reads += 1;
+                dedup_counts.secondary_reads += 1;
             }
             if (flg & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0 {
-                dedup_metrics.supplementary_reads += 1;
+                dedup_counts.supplementary_reads += 1;
             }
         }
     }
     templates.extend(passthrough_templates);
 
-    dedup_metrics.unique_reads = dedup_metrics.total_reads - dedup_metrics.duplicate_reads;
+    dedup_counts.unique_reads = dedup_counts.total_reads - dedup_counts.duplicate_reads;
 
     // Compute the number of distinct numeric molecule IDs assigned in this group.
     // Mirrors `fgumi group`: assigners hand out numeric IDs 0, 1, 2, ... contiguously,
@@ -940,7 +944,7 @@ fn process_position_group(
     Ok(ProcessedDedupGroup {
         templates,
         family_sizes,
-        dedup_metrics,
+        dedup_counts,
         input_record_count,
         distinct_mi_count,
     })
@@ -1245,8 +1249,8 @@ impl Command for MarkDuplicates {
         };
 
         // Shared state for collecting metrics
-        let collected_metrics: Arc<Mutex<CollectedDedupMetrics>> =
-            Arc::new(Mutex::new(CollectedDedupMetrics::default()));
+        let collected_metrics: Arc<Mutex<CollectedDedupCounts>> =
+            Arc::new(Mutex::new(CollectedDedupCounts::default()));
 
         // Clone values needed by closures
         let strategy = effective_strategy;
@@ -1323,7 +1327,7 @@ impl Command for MarkDuplicates {
                 // Collect metrics
                 {
                     let mut agg = collected_metrics_clone.lock();
-                    agg.dedup_metrics.merge(&processed.dedup_metrics);
+                    agg.dedup_counts.merge(&processed.dedup_counts);
                     for (size, count) in &processed.family_sizes {
                         *agg.family_sizes.entry(*size).or_insert(0) += count;
                     }
@@ -1404,12 +1408,12 @@ impl Command for MarkDuplicates {
         let aggregated = Arc::try_unwrap(collected_metrics)
             .expect("bug: metrics Arc still shared after pipeline join")
             .into_inner();
-        let final_metrics = aggregated.dedup_metrics;
+        let final_metrics = aggregated.dedup_counts;
         let final_family_sizes = aggregated.family_sizes;
 
         // Write metrics file
         if let Some(metrics_path) = &self.metrics {
-            write_dedup_metrics(&final_metrics, metrics_path)?;
+            write_dedup_counts(&final_metrics, metrics_path)?;
         }
 
         // Write family size histogram
@@ -1450,7 +1454,7 @@ impl Command for MarkDuplicates {
 // Metrics writing
 //////////////////////////////////////////////////////////////////////////////
 
-fn write_dedup_metrics(metrics: &DedupMetrics, path: &PathBuf) -> Result<()> {
+fn write_dedup_counts(metrics: &DedupCounts, path: &PathBuf) -> Result<()> {
     let output: DedupMetricsOutput = metrics.into();
     DelimFile::default()
         .write_tsv(path, [output])
@@ -1542,22 +1546,22 @@ mod tests {
     #[test]
     fn test_duplicate_rate_calculation() {
         let metrics =
-            DedupMetrics { total_templates: 100, duplicate_templates: 25, ..Default::default() };
+            DedupCounts { total_templates: 100, duplicate_templates: 25, ..Default::default() };
         assert!((metrics.duplicate_rate() - 0.25).abs() < 0.001);
     }
 
     #[test]
     fn test_duplicate_rate_zero_templates() {
-        let metrics = DedupMetrics::default();
+        let metrics = DedupCounts::default();
         assert!((metrics.duplicate_rate() - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_metrics_merge() {
         let mut m1 =
-            DedupMetrics { total_templates: 10, duplicate_templates: 2, ..Default::default() };
+            DedupCounts { total_templates: 10, duplicate_templates: 2, ..Default::default() };
 
-        let m2 = DedupMetrics { total_templates: 20, duplicate_templates: 5, ..Default::default() };
+        let m2 = DedupCounts { total_templates: 20, duplicate_templates: 5, ..Default::default() };
 
         m1.merge(&m2);
         assert_eq!(m1.total_templates, 30);
@@ -1575,7 +1579,7 @@ mod tests {
 
     #[test]
     fn test_mark_duplicates_empty_family() {
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut templates: Vec<&mut Template> = vec![];
         mark_duplicates_in_family(&mut templates, &mut metrics);
         assert_eq!(metrics.unique_templates, 0);
@@ -1584,7 +1588,7 @@ mod tests {
 
     #[test]
     fn test_mark_duplicates_single_template() {
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[30, 30, 30, 30]);
         let mut templates: Vec<&mut Template> = vec![&mut t1];
         mark_duplicates_in_family(&mut templates, &mut metrics);
@@ -1597,7 +1601,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_size_2_first_higher() {
         // Fast path for size 2: first template has higher score
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[15, 15, 15, 15]); // Score: 60
         let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0 (all q < 15)
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2];
@@ -1612,7 +1616,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_size_2_second_higher() {
         // Fast path for size 2: second template has higher score
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 0 (all q < 15)
         let mut t2 = create_test_template("q2", &[15, 15, 15, 15]); // Score: 60
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2];
@@ -1627,7 +1631,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_size_3_first_highest() {
         // Fast path for size 3: first template has highest score
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[15, 15, 15, 15]); // Score: 60
         let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0 (all q < 15)
         let mut t3 = create_test_template("q3", &[5, 5, 5, 5]); // Score: 0 (all q < 15)
@@ -1644,7 +1648,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_size_3_second_highest() {
         // Fast path for size 3: second template has highest score
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 0 (all q < 15)
         let mut t2 = create_test_template("q2", &[15, 15, 15, 15]); // Score: 60
         let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 0 (all q < 15)
@@ -1661,7 +1665,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_size_3_third_highest() {
         // Fast path for size 3: third template has highest score
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 0 (all q < 15)
         let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0 (all q < 15)
         let mut t3 = create_test_template("q3", &[15, 15, 15, 15]); // Score: 60
@@ -1678,7 +1682,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_size_4_general_case() {
         // General case for size 4+: uses Vec and sort
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 0 (all q < 15)
         let mut t2 = create_test_template("q2", &[15, 15, 15, 15]); // Score: 60 (highest)
         let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 0 (all q < 15)
@@ -1697,7 +1701,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_counts_duplicate_reads() {
         // Verify duplicate_reads metric is incremented for each read in duplicate templates
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[15, 15, 15, 15]); // Score: 60 (1 read)
         let mut t2 = create_test_template("q2", &[5, 5, 5, 5]); // Score: 0 (all q < 15; 1 read)
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2];
@@ -1713,7 +1717,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_tie_breaking_size_2() {
         // When scores are equal, first template should be kept (deterministic)
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 0 (all < 15)
         let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0 (tie)
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2];
@@ -1729,7 +1733,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_tie_breaking_size_3_all_equal() {
         // All three have equal scores - first template should be kept
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 0 (all < 15)
         let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0
         let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 0
@@ -1747,7 +1751,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_tie_breaking_size_3_second_and_third_tie() {
         // First is lower, second and third tie - second should win
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 0 (all < 15)
         let mut t2 = create_test_template("q2", &[20, 20, 20, 20]); // Score: 80
         let mut t3 = create_test_template("q3", &[20, 20, 20, 20]); // Score: 80 (tie with t2)
@@ -1765,7 +1769,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_tie_breaking_size_4_all_equal() {
         // All four have equal scores - first template should be kept
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 0 (all < 15)
         let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0
         let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 0
@@ -1785,7 +1789,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_tie_breaking_size_4_partial_tie() {
         // Third and fourth tie for highest - third should win
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 0 (all < 15)
         let mut t2 = create_test_template("q2", &[16, 16, 16, 16]); // Score: 64
         let mut t3 = create_test_template("q3", &[20, 20, 20, 20]); // Score: 80
@@ -2416,7 +2420,7 @@ mod tests {
         for template in &mut templates {
             by_family.entry(template.mi.to_vec_index()).or_default().push(template);
         }
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         for (_mi, mut family) in by_family {
             mark_duplicates_in_family(&mut family, &mut metrics);
         }
@@ -2683,12 +2687,12 @@ mod tests {
     }
 
     // ========================================================================
-    // DedupMetrics tests
+    // DedupCounts tests
     // ========================================================================
 
     #[test]
     fn test_metrics_merge_all_fields() {
-        let mut m1 = DedupMetrics {
+        let mut m1 = DedupCounts {
             total_templates: 10,
             duplicate_templates: 2,
             unique_templates: 8,
@@ -2701,7 +2705,7 @@ mod tests {
             ..Default::default()
         };
 
-        let m2 = DedupMetrics {
+        let m2 = DedupCounts {
             total_templates: 5,
             duplicate_templates: 1,
             unique_templates: 4,
@@ -2729,13 +2733,13 @@ mod tests {
     #[test]
     fn test_duplicate_rate_all_duplicates() {
         let metrics =
-            DedupMetrics { total_templates: 50, duplicate_templates: 50, ..Default::default() };
+            DedupCounts { total_templates: 50, duplicate_templates: 50, ..Default::default() };
         assert!((metrics.duplicate_rate() - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_metrics_default() {
-        let metrics = DedupMetrics::default();
+        let metrics = DedupCounts::default();
         assert_eq!(metrics.total_templates, 0);
         assert_eq!(metrics.duplicate_templates, 0);
         assert_eq!(metrics.unique_templates, 0);
@@ -2748,8 +2752,8 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_metrics_output_from() {
-        let metrics = DedupMetrics {
+    fn test_dedup_counts_output_from() {
+        let metrics = DedupCounts {
             total_templates: 100,
             duplicate_templates: 25,
             unique_templates: 75,
@@ -2780,8 +2784,8 @@ mod tests {
     /// rate is written as `1`, not serde's raw `1.0` — consistent with the other
     /// fgumi metric files.
     #[test]
-    fn test_dedup_metrics_duplicate_rate_uses_float_formatter() -> Result<()> {
-        let metrics = DedupMetrics {
+    fn test_dedup_counts_duplicate_rate_uses_float_formatter() -> Result<()> {
+        let metrics = DedupCounts {
             total_templates: 2,
             duplicate_templates: 2,
             unique_templates: 0,
@@ -2789,7 +2793,7 @@ mod tests {
         };
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("dedup.metrics.txt");
-        write_dedup_metrics(&metrics, &path)?;
+        write_dedup_counts(&metrics, &path)?;
 
         let text = std::fs::read_to_string(&path)?;
         let data_row = text.lines().nth(1).expect("metrics data row");
@@ -3190,7 +3194,7 @@ mod tests {
         let batch = ProcessedDedupGroup {
             templates,
             family_sizes: AHashMap::new(),
-            dedup_metrics: DedupMetrics::default(),
+            dedup_counts: DedupCounts::default(),
             input_record_count: 1,
             distinct_mi_count: 0,
         };
