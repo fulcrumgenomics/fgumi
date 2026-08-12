@@ -1397,47 +1397,10 @@ impl QueueDepths {
 // Grouper Trait (for Step 5: Group)
 // ============================================================================
 
-/// Trait for command-specific record grouping logic.
-///
-/// The Grouper receives already-decoded BAM records and groups them according
-/// to command-specific rules. Since records are pre-decoded, grouping is very
-/// fast - just comparing record names, positions, or tags.
-///
-/// Different commands use different grouping strategies:
-/// - `group`: Groups by genomic position
-/// - `simplex/duplex/codec`: Groups by MI tag
-/// - `filter/clip/correct`: No grouping (each record is its own "group")
-pub trait Grouper: Send {
-    /// The type of group produced by this grouper.
-    type Group: Send;
-
-    /// Add decoded records to the grouper.
-    ///
-    /// Records are guaranteed to be in order (from template-coordinate sorted BAM).
-    /// The grouper maintains partial groups waiting for more records.
-    ///
-    /// Each `DecodedRecord` contains the record plus a pre-computed `GroupKey`
-    /// for fast comparison (position, name hash, library, etc.).
-    ///
-    /// Returns completed groups (may be empty if more records are needed).
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if grouping logic encounters invalid data.
-    fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>>;
-
-    /// Signal that no more input will arrive (EOF).
-    ///
-    /// Returns any remaining partial group.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if finalizing the grouper fails.
-    fn finish(&mut self) -> io::Result<Option<Self::Group>>;
-
-    /// Returns true if the grouper has a partial group.
-    fn has_pending(&self) -> bool;
-}
+// The `Grouper` trait is defined once, in `fgumi-bam-io`, alongside the
+// `DecodedRecord` it consumes. Re-exported so existing
+// `crate::unified_pipeline::Grouper` paths keep resolving.
+pub use fgumi_bam_io::Grouper;
 
 /// State for the exclusive `Group` step.
 ///

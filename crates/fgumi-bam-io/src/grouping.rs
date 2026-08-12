@@ -133,6 +133,16 @@ impl GroupKey {
             self.cell_hash,
         )
     }
+
+    /// Whether this key carries a mate position, i.e. it was built by
+    /// [`Self::paired`] rather than [`Self::single`].
+    ///
+    /// `strand2` is set to [`Self::UNKNOWN_STRAND`] by the single-end
+    /// constructor, so it is the discriminator between the two shapes.
+    #[must_use]
+    pub fn has_mate_position(&self) -> bool {
+        self.strand2 != Self::UNKNOWN_STRAND
+    }
 }
 
 impl PartialOrd for GroupKey {
