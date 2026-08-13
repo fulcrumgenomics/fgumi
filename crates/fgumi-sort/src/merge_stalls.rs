@@ -13,8 +13,10 @@
 //!
 //! - every file's reorder buffer was at [`PHASE2_DECOMP_CAP`] (the consumer is
 //!   behind, and the pool is correctly throttled),
-//! - every file's raw FIFO was at [`PHASE2_RAW_CAP`] (decompression is behind
-//!   the read side, so read-ahead depth is the binding constraint),
+//! - every file's raw FIFO was at its read-ahead allowance -- [`PHASE2_RAW_CAP`],
+//!   or [`PHASE2_STARVING_RAW_CAP`] for the file at the drain frontier
+//!   (decompression is behind the read side, so read-ahead depth is the binding
+//!   constraint),
 //! - every file with data left already had a peer worker inside a disk read
 //!   (waiting on I/O, which wants read concurrency rather than deeper buffers),
 //!   or
@@ -22,6 +24,7 @@
 //!
 //! [`PHASE2_DECOMP_CAP`]: crate::worker_pool::PHASE2_DECOMP_CAP
 //! [`PHASE2_RAW_CAP`]: crate::worker_pool::PHASE2_RAW_CAP
+//! [`PHASE2_STARVING_RAW_CAP`]: crate::worker_pool::PHASE2_STARVING_RAW_CAP
 //!
 //! The file-scan loop already distinguishes all four and then discards the
 //! distinction. This module keeps it, plus two things nothing currently measures
@@ -35,12 +38,15 @@
 //!   record" figure folds in with it. Censusing the other files at that moment
 //!   is what separates head-of-line blocking (this file starved, the rest at
 //!   cap) from a uniformly starved pool.
-//! - **How late workers discover work.** Nothing ever unparks a pool worker: the
-//!   wake path runs one way, workers to main thread. A worker that has backed
-//!   off to [`MAX_BACKOFF_US`](crate::worker_pool::MAX_BACKOFF_US) therefore
-//!   finds newly-available work up to a millisecond after it appears, and that
-//!   delay is indistinguishable from I/O latency in every counter that exists
-//!   today.
+//! - **How late workers discover work.** One wake path runs main thread to
+//!   workers: when a file's reorder buffer drains, the consumer unparks a single
+//!   worker through
+//!   [`SharedPipelineState::wake_one_worker`](crate::worker_pool::SharedPipelineState).
+//!   Everything else a worker could pick up arrives with no wake at all, and
+//!   that is what this measures: a worker that has backed off to
+//!   [`MAX_BACKOFF_US`](crate::worker_pool::MAX_BACKOFF_US) finds unannounced
+//!   work up to a millisecond after it appears, and that delay is
+//!   indistinguishable from I/O latency in every other counter.
 //!
 //! # Cost
 //!
@@ -91,16 +97,18 @@ pub(crate) enum Phase2Skip {
     /// not the gap-filler the consumer is stuck on. Backpressure working as
     /// intended: the consumer is behind, not the pool.
     DecompCapped,
-    /// The raw FIFO is at `PHASE2_RAW_CAP` while the reorder buffer still has
-    /// room, so decompression — not the consumer — is what this file is waiting
-    /// on.
+    /// The raw FIFO is at this file's read-ahead allowance while the reorder
+    /// buffer still has room, so decompression — not the consumer — is what this
+    /// file is waiting on. The allowance is `PHASE2_RAW_CAP` for every file
+    /// except the one at the drain frontier, which is allowed
+    /// `PHASE2_STARVING_RAW_CAP`.
     ///
     /// Reported only when the decompress half is *not* capped; when both are
     /// full the reason is [`FullyBuffered`](Self::FullyBuffered), because a full
     /// raw FIFO is the downstream consequence of workers having stopped
-    /// decompressing. A zero count here therefore does **not** mean
-    /// `PHASE2_RAW_CAP` was never reached — only that it was never the root
-    /// reason. Misreading that cost real time once already.
+    /// decompressing. A zero count here therefore does **not** mean the
+    /// allowance was never reached — only that it was never the root reason.
+    /// Misreading that cost real time once already.
     RawFull,
     /// Both caps are full: the consumer is behind, and the read-ahead behind it
     /// has backed up to its own limit. The file is as buffered as it can be.
@@ -181,7 +189,7 @@ pub(crate) enum ReadSkip {
     ReaderEof,
     /// The raw FIFO's `try_lock` lost a race, so its depth is unknown.
     RawLockContended,
-    /// The raw FIFO is at `PHASE2_RAW_CAP`.
+    /// The raw FIFO is at this file's read-ahead allowance.
     RawFull,
 }
 
@@ -426,6 +434,70 @@ pub(crate) fn wake_bucket(backoff_us: u64) -> usize {
     WAKE_BUCKET_US.iter().position(|&us| backoff_us <= us).unwrap_or(last)
 }
 
+/// Which set of wake counters a wait belongs to.
+///
+/// A wait is filed under the phase the worker believed it was in when it *took*
+/// the wait — a value decided once, at the top of the worker's iteration, and
+/// carried through to the record. That is what makes the merge's share of these
+/// counters race-free: a Phase 1 wait lands in `Other` however late the worker
+/// gets around to recording it.
+///
+/// Subtracting a baseline snapshot taken at the phase boundary cannot promise
+/// that, which is why it is no longer how the merge is scoped. The boundary can
+/// fall between a worker's phase load and its record, and the wait then lands
+/// *after* the baseline while still belonging to the phase before it — charging
+/// the merge for a wait taken before it started, and leaving a productive wait in
+/// the merge window whose matching sleep was subtracted away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WakePhase {
+    /// Every phase other than the merge, principally Phase 1's read/sort/spill.
+    Other = 0,
+    /// Phase 2: the k-way merge, the window [`WakeLatencyStats::snapshot`] is
+    /// asked for by the merge diagnostics.
+    Merge = 1,
+}
+
+impl WakePhase {
+    /// Number of variants, so the counter arrays indexed by `self as usize`
+    /// cannot fall behind the enum. Sizing them with a literal instead lets a
+    /// new variant compile and then index out of bounds inside
+    /// [`WakeLatencyStats::record_sleep`] -- on a worker thread, where it
+    /// surfaces only as a panicked sort worker.
+    pub(crate) const COUNT: usize = 2;
+}
+
+// Keeps `COUNT` honest: the match is exhaustive, so a third variant fails to
+// compile here instead of indexing past the end of the counter arrays at run
+// time.
+const _: () = {
+    const fn assert_count(phase: WakePhase) -> usize {
+        match phase {
+            WakePhase::Other => 0,
+            WakePhase::Merge => WakePhase::COUNT - 1,
+        }
+    }
+    assert!(assert_count(WakePhase::Merge) == 1);
+};
+
+/// One phase's worth of [`WakeLatencyStats`] counters.
+#[derive(Debug, Default)]
+struct WakeCounters {
+    /// Nanoseconds slept, by backoff level.
+    idle_nanos: [AtomicU64; WAKE_BUCKET_US.len()],
+    /// Sleeps, by backoff level.
+    sleeps: [AtomicU64; WAKE_BUCKET_US.len()],
+    /// Waits that were immediately followed by a successful step, bucketed by
+    /// how long they *actually* lasted.
+    productive_sleeps: [AtomicU64; WAKE_BUCKET_US.len()],
+    /// Observed nanoseconds of those waits.
+    ///
+    /// Kept alongside the count because the count alone can only be turned into
+    /// a duration via the bucket's nominal width, and since waits became
+    /// `park_timeout` an `unpark` can end one at any point. See
+    /// [`WakeLatencyStats::record_productive_sleep`].
+    productive_nanos: [AtomicU64; WAKE_BUCKET_US.len()],
+}
+
 /// How long workers sleep, and how much of that sleep precedes finding work.
 ///
 /// The second half is the point. Idle time alone cannot distinguish a worker
@@ -433,59 +505,54 @@ pub(crate) fn wake_bucket(backoff_us: u64) -> usize {
 /// becoming available, and only the latter is a cost the pipeline pays. A
 /// successful step recorded against a 1 ms bucket says the work was found no
 /// sooner than a millisecond after the worker last looked.
+///
+/// The pool exists for the whole sort, so a single running total would include
+/// Phase 1's sleeps: on a measured run, 1815s of "deep-sleep worker-seconds"
+/// against a merge that only had 8 x 305s = 2442 worker-seconds of capacity in
+/// the first place. Counters are therefore kept per [`WakePhase`], so the merge
+/// reads its own and nothing else's.
 #[derive(Debug, Default)]
 pub(crate) struct WakeLatencyStats {
-    /// Nanoseconds slept, by backoff level.
-    idle_nanos: [AtomicU64; WAKE_BUCKET_US.len()],
-    /// Sleeps, by backoff level.
-    sleeps: [AtomicU64; WAKE_BUCKET_US.len()],
-    /// Sleeps that were immediately followed by a successful step.
-    productive_sleeps: [AtomicU64; WAKE_BUCKET_US.len()],
+    /// One set of counters per [`WakePhase`], indexed by its discriminant.
+    by_phase: [WakeCounters; WakePhase::COUNT],
 }
 
 impl WakeLatencyStats {
-    /// Record a sleep of `idle_nanos` at backoff level `backoff_us`.
-    pub(crate) fn record_sleep(&self, backoff_us: u64, idle_nanos: u64) {
+    /// Record a sleep of `idle_nanos` at backoff level `backoff_us`, taken in `phase`.
+    pub(crate) fn record_sleep(&self, phase: WakePhase, backoff_us: u64, idle_nanos: u64) {
+        let counters = &self.by_phase[phase as usize];
         let b = wake_bucket(backoff_us);
-        self.idle_nanos[b].fetch_add(idle_nanos, Ordering::Relaxed);
-        self.sleeps[b].fetch_add(1, Ordering::Relaxed);
+        counters.idle_nanos[b].fetch_add(idle_nanos, Ordering::Relaxed);
+        counters.sleeps[b].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record that the sleep at `backoff_us` was followed by finding work.
-    pub(crate) fn record_productive_sleep(&self, backoff_us: u64) {
-        self.productive_sleeps[wake_bucket(backoff_us)].fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn snapshot(&self) -> WakeLatencyReport {
-        WakeLatencyReport {
-            idle_nanos: std::array::from_fn(|i| self.idle_nanos[i].load(Ordering::Relaxed)),
-            sleeps: std::array::from_fn(|i| self.sleeps[i].load(Ordering::Relaxed)),
-            productive_sleeps: std::array::from_fn(|i| {
-                self.productive_sleeps[i].load(Ordering::Relaxed)
-            }),
-        }
-    }
-}
-
-impl WakeLatencyReport {
-    /// This report minus `baseline`, i.e. what accumulated between them.
+    /// Record that a wait of `observed_nanos`, taken in `phase`, was followed by
+    /// finding work.
     ///
-    /// The pool exists for the whole sort, so these counters include Phase 1's
-    /// sleeps. Reporting the running total against merge wall clock overstates
-    /// the merge's share -- on a measured run, 1815s of "deep-sleep
-    /// worker-seconds" against a merge that only had 8 x 305s = 2442
-    /// worker-seconds of capacity in the first place. Subtracting a snapshot
-    /// taken at the phase boundary is what makes the figure comparable to the
-    /// numbers printed beside it.
-    #[must_use]
-    pub fn since(self, baseline: Self) -> Self {
-        Self {
-            idle_nanos: std::array::from_fn(|i| {
-                self.idle_nanos[i].saturating_sub(baseline.idle_nanos[i])
-            }),
-            sleeps: std::array::from_fn(|i| self.sleeps[i].saturating_sub(baseline.sleeps[i])),
+    /// Bucketed by the observed duration, not by the backoff level that was
+    /// requested. Since waits became `park_timeout`,
+    /// [`SharedPipelineState::wake_one_worker`](crate::worker_pool::SharedPipelineState)
+    /// can end a 1 ms wait after a few microseconds -- and charging that to the
+    /// 1 ms bucket would report discovery lag the wake had just eliminated,
+    /// making the pool look worst exactly where this path works best.
+    pub(crate) fn record_productive_sleep(&self, phase: WakePhase, observed_nanos: u64) {
+        let counters = &self.by_phase[phase as usize];
+        let b = wake_bucket(observed_nanos / 1_000);
+        counters.productive_sleeps[b].fetch_add(1, Ordering::Relaxed);
+        counters.productive_nanos[b].fetch_add(observed_nanos, Ordering::Relaxed);
+    }
+
+    /// The counters for `phase` alone.
+    pub(crate) fn snapshot(&self, phase: WakePhase) -> WakeLatencyReport {
+        let counters = &self.by_phase[phase as usize];
+        WakeLatencyReport {
+            idle_nanos: std::array::from_fn(|i| counters.idle_nanos[i].load(Ordering::Relaxed)),
+            sleeps: std::array::from_fn(|i| counters.sleeps[i].load(Ordering::Relaxed)),
             productive_sleeps: std::array::from_fn(|i| {
-                self.productive_sleeps[i].saturating_sub(baseline.productive_sleeps[i])
+                counters.productive_sleeps[i].load(Ordering::Relaxed)
+            }),
+            productive_nanos: std::array::from_fn(|i| {
+                counters.productive_nanos[i].load(Ordering::Relaxed)
             }),
         }
     }
@@ -498,8 +565,10 @@ pub struct WakeLatencyReport {
     pub idle_nanos: [u64; WAKE_BUCKET_US.len()],
     /// Sleeps, by backoff level.
     pub sleeps: [u64; WAKE_BUCKET_US.len()],
-    /// Sleeps immediately followed by a successful step, by backoff level.
+    /// Waits immediately followed by a successful step, by observed duration.
     pub productive_sleeps: [u64; WAKE_BUCKET_US.len()],
+    /// Observed nanoseconds of those waits, by the same bucketing.
+    pub productive_nanos: [u64; WAKE_BUCKET_US.len()],
 }
 
 impl WakeLatencyReport {
@@ -521,9 +590,16 @@ impl WakeLatencyReport {
 
     /// Estimated worker-seconds lost to discovering work late.
     ///
-    /// A sleep followed by a successful step means the work was there when the
-    /// worker woke and may have arrived at any point during the sleep, so half
-    /// the sleep is the expected lag under a uniform arrival assumption.
+    /// A wait followed by a successful step means the work was there when the
+    /// worker woke and may have arrived at any point during it, so half the
+    /// wait is the expected lag under a uniform arrival assumption.
+    ///
+    /// Computed from the *observed* wait, not the requested backoff level. Since
+    /// waits became `park_timeout`, an `unpark` from
+    /// [`SharedPipelineState::wake_one_worker`](crate::worker_pool::SharedPipelineState)
+    /// can cut a 1 ms wait to microseconds; charging the nominal level would
+    /// report that truncated wait as a full millisecond of lag, i.e. attribute
+    /// to discovery latency exactly the latency the wake removed.
     ///
     /// **This is per-worker discovery lag, not pipeline delay.** It only holds
     /// the merge up when every worker is asleep at once; with eight workers
@@ -534,22 +610,22 @@ impl WakeLatencyReport {
     #[must_use]
     #[allow(
         clippy::cast_precision_loss,
-        reason = "sleep counts stay far below 2^52 on any real sort"
+        reason = "nanosecond totals stay far below 2^52 on any real sort"
     )]
     pub fn estimated_discovery_lag_secs(self) -> f64 {
-        self.productive_sleeps
-            .iter()
-            .zip(WAKE_BUCKET_US)
-            .map(|(&n, us)| n as f64 * (us as f64 / 2.0) / 1e6)
-            .sum()
+        self.productive_nanos.iter().sum::<u64>() as f64 / 2.0 / 1e9
     }
 
-    /// Worker-seconds slept at the deepest backoff levels.
+    /// Worker-seconds spent waiting at the deepest *requested* backoff levels.
     ///
-    /// The pool of idle time that discovery lag is drawn from. If this is small,
-    /// [`Self::estimated_discovery_lag_secs`] cannot be large no matter how the
-    /// productive sleeps fall, which makes it a quick sanity check on the
-    /// estimate rather than a second measurement of it.
+    /// The pool of idle time most of the discovery lag is drawn from, printed
+    /// beside it for scale: a lag that is a rounding error against this is not
+    /// worth chasing. Not a strict bound on
+    /// [`Self::estimated_discovery_lag_secs`] — that sums productive waits at
+    /// every observed duration, including ones a shallow backoff produced — and
+    /// the two are bucketed differently on purpose: this by the level requested,
+    /// so it describes the backoff policy, and the lag by the duration observed,
+    /// so an unparked wait costs what it actually cost.
     #[must_use]
     #[allow(
         clippy::cast_precision_loss,
@@ -1310,14 +1386,14 @@ mod tests {
         let stats = WakeLatencyStats::default();
         // 1000 sleeps at 1 ms that each found work: 1000 x 0.5 ms = 0.5 s.
         for _ in 0..1000 {
-            stats.record_sleep(1000, 1_000_000);
-            stats.record_productive_sleep(1000);
+            stats.record_sleep(WakePhase::Merge, 1000, 1_000_000);
+            stats.record_productive_sleep(WakePhase::Merge, 1_000_000);
         }
         // Sleeps that found nothing cost the pipeline nothing and must not count.
         for _ in 0..1000 {
-            stats.record_sleep(1000, 1_000_000);
+            stats.record_sleep(WakePhase::Merge, 1000, 1_000_000);
         }
-        let report = stats.snapshot();
+        let report = stats.snapshot(WakePhase::Merge);
         assert!((report.estimated_discovery_lag_secs() - 0.5).abs() < 1e-9);
         assert_eq!(report.sleeps[7], 2000);
     }
@@ -1326,46 +1402,102 @@ mod tests {
     fn test_deep_sleep_wake_share() {
         let stats = WakeLatencyStats::default();
         for _ in 0..3 {
-            stats.record_productive_sleep(1000);
+            stats.record_productive_sleep(WakePhase::Merge, 1_000_000);
         }
-        stats.record_productive_sleep(10);
-        assert!((stats.snapshot().deep_sleep_wake_share() - 0.75).abs() < 1e-9);
+        stats.record_productive_sleep(WakePhase::Merge, 10_000);
+        assert!((stats.snapshot(WakePhase::Merge).deep_sleep_wake_share() - 0.75).abs() < 1e-9);
+    }
+
+    /// A wait cut short by `wake_one_worker` must be charged what it cost, not
+    /// what it asked for.
+    ///
+    /// Waits are `park_timeout`, so an unpark can end a 1 ms backoff after
+    /// microseconds. Bucketing by the requested level would book each of these
+    /// as a full millisecond and report ~0.5 s of discovery lag — attributing to
+    /// late discovery precisely the latency the wake removed, so the metric
+    /// would look worst exactly where this path works best.
+    #[test]
+    fn test_discovery_lag_uses_the_observed_wait_not_the_requested_backoff() {
+        let stats = WakeLatencyStats::default();
+        // 1000 waits that asked for 1 ms but were unparked after 5 us.
+        for _ in 0..1000 {
+            stats.record_sleep(WakePhase::Merge, 1000, 5_000);
+            stats.record_productive_sleep(WakePhase::Merge, 5_000);
+        }
+        let report = stats.snapshot(WakePhase::Merge);
+
+        // 1000 x 5us / 2 = 2.5 ms, not the 500 ms the nominal level implies.
+        assert!(
+            (report.estimated_discovery_lag_secs() - 0.0025).abs() < 1e-9,
+            "got {}",
+            report.estimated_discovery_lag_secs()
+        );
+        assert_eq!(report.productive_sleep_count(), 1000);
+        assert!(
+            (report.deep_sleep_wake_share() - 0.0).abs() < f64::EPSILON,
+            "a 5us wait is not a deep sleep, whatever backoff level requested it"
+        );
     }
 
     /// Phase 1's sleeps must not be charged to the merge.
     #[test]
-    fn test_wake_report_subtracts_a_phase_boundary_baseline() {
+    fn test_the_merge_report_holds_only_the_merges_own_waits() {
         let stats = WakeLatencyStats::default();
         for _ in 0..100 {
-            stats.record_sleep(1000, 1_000_000);
-            stats.record_productive_sleep(1000);
+            stats.record_sleep(WakePhase::Other, 1000, 1_000_000);
+            stats.record_productive_sleep(WakePhase::Other, 1_000_000);
         }
-        let at_merge_start = stats.snapshot();
         for _ in 0..10 {
-            stats.record_sleep(1000, 1_000_000);
-            stats.record_productive_sleep(1000);
+            stats.record_sleep(WakePhase::Merge, 1000, 1_000_000);
+            stats.record_productive_sleep(WakePhase::Merge, 1_000_000);
         }
-        let merge_only = stats.snapshot().since(at_merge_start);
+        let merge_only = stats.snapshot(WakePhase::Merge);
         assert_eq!(merge_only.sleeps[7], 10, "only the merge's sleeps may be counted");
         assert!((merge_only.estimated_discovery_lag_secs() - 0.005).abs() < 1e-9);
-        // The running total is still 110; `since` must not mutate the source.
-        assert_eq!(stats.snapshot().sleeps[7], 110);
+        // Phase 1's counters are untouched and still readable in their own right.
+        assert_eq!(stats.snapshot(WakePhase::Other).sleeps[7], 100);
     }
 
-    /// A counter that somehow went backwards must clamp rather than wrap into a
-    /// nonsensical multi-century total.
+    /// The race that a phase-boundary baseline could not close: a worker loads
+    /// `PHASE1`, the main thread flips the pool to `PHASE2` (which is where the
+    /// baseline used to be pinned), and only *then* does the worker record the
+    /// wait it took back in Phase 1.
+    ///
+    /// Order is the whole test — every record here happens after the transition,
+    /// which is exactly when a baseline subtraction would have swept the Phase 1
+    /// wait into the merge. Filing by the phase carried from the worker's load
+    /// makes the ordering irrelevant, so this holds for any interleaving rather
+    /// than merely for the one a threaded test happened to produce.
     #[test]
-    fn test_wake_report_since_saturates() {
+    fn test_a_phase1_wait_recorded_after_the_merge_began_stays_out_of_the_merge() {
         let stats = WakeLatencyStats::default();
-        stats.record_sleep(1000, 1_000_000);
-        let later = stats.snapshot();
-        let empty = WakeLatencyStats::default().snapshot();
-        assert_eq!(empty.since(later).sleeps[7], 0);
+
+        // The merge has begun and taken one short wait of its own.
+        stats.record_sleep(WakePhase::Merge, 10, 5_000);
+        stats.record_productive_sleep(WakePhase::Merge, 5_000);
+
+        // A worker that loaded PHASE1 before the flip now records its wait.
+        stats.record_sleep(WakePhase::Other, 1000, 1_000_000);
+        stats.record_productive_sleep(WakePhase::Other, 1_000_000);
+
+        let merge = stats.snapshot(WakePhase::Merge);
+        assert_eq!(
+            merge.idle_nanos.iter().sum::<u64>(),
+            5_000,
+            "the Phase 1 wait must not appear in the merge's idle time"
+        );
+        assert_eq!(
+            merge.productive_nanos.iter().sum::<u64>(),
+            5_000,
+            "nor in the merge's productive waits, which is what discovery lag is derived from"
+        );
+        // 5us / 2, not the 0.5 s the Phase 1 wait would have implied.
+        assert!((merge.estimated_discovery_lag_secs() - 0.000_002_5).abs() < 1e-12);
     }
 
     #[test]
     fn test_empty_wake_report_is_reported_as_empty() {
-        let report = WakeLatencyStats::default().snapshot();
+        let report = WakeLatencyStats::default().snapshot(WakePhase::Merge);
         assert!(report.is_empty());
         assert!((report.estimated_discovery_lag_secs() - 0.0).abs() < f64::EPSILON);
         assert!((report.deep_sleep_wake_share() - 0.0).abs() < f64::EPSILON);

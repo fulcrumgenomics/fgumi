@@ -186,10 +186,29 @@ impl SortPhaseTimer {
         result
     }
 
+    /// How many chunks have been spilled, counted where the spill is timed.
+    fn spill_count(&self) -> usize {
+        self.spill_count
+    }
+
     /// Record the size of a spill file.
     fn record_spill_size(&mut self, path: &Path) {
         if let Ok(meta) = std::fs::metadata(path) {
             self.total_spill_bytes += meta.len();
+        }
+    }
+
+    /// Add the bytes a spill run grew by, given its size before the chunk was
+    /// written.
+    ///
+    /// Run formation appends several chunks to one file, so re-adding the file's
+    /// whole length after each chunk would sum `C + 2C + ... + NC` and report a
+    /// spill volume quadratic in the chunk count. Spill volume is the figure used
+    /// to judge whether run formation reduced spill I/O at all, so it has to be
+    /// the delta.
+    fn record_spill_growth(&mut self, path: &Path, size_before: u64) {
+        if let Ok(meta) = std::fs::metadata(path) {
+            self.total_spill_bytes += meta.len().saturating_sub(size_before);
         }
     }
 
@@ -212,7 +231,7 @@ impl SortPhaseTimer {
     }
 
     /// Time writing in-memory-only output (no merge needed).
-    fn time_write_output(&mut self, f: impl FnOnce() -> Result<()>) -> Result<()> {
+    fn time_write_output<T>(&mut self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         Self::time(&mut self.write_output_secs, f)
     }
 
@@ -1297,6 +1316,82 @@ pub(crate) struct MainThreadChunkConsumer<K: RawSortKey + 'static> {
     _phantom: std::marker::PhantomData<K>,
 }
 
+/// Enforce the permutation invariant, removing the output when it fails.
+///
+/// A sort is a permutation: every record read must be written. By the time this
+/// runs the writer has finalized `output`, so a mismatch leaves a
+/// truncated-but-*valid* BAM (and, under `write_index`, a `.bai` describing it)
+/// on disk. Saying the output "must not be used" does not stop a wrapper that
+/// checks only an exit code, or a user who re-runs and reads the stale file, so
+/// a file output is removed rather than merely described.
+///
+/// That also matches the rest of the crate rather than making this the one
+/// exception: the merge writes through [`MergeOutputTarget`] and drops its temp
+/// on error, and `test_sort_records_producer_error_aborts` pins that an aborted
+/// sort leaves no output behind.
+///
+/// What is *not* removed is as deliberate as what is, and mirrors the guards
+/// [`MergeOutputTarget::create`] already applies: stdout cannot be un-written,
+/// and a FIFO, device or directory was written *through* rather than created, so
+/// unlinking it would destroy something this sort does not own. Those cases keep
+/// the "must not be used" wording, which is all that is true of them. A removal
+/// that fails is reported rather than swallowed -- the caller is being told the
+/// output is dangerous, so whether it is still there is exactly what they need.
+fn enforce_record_count(stats: &RawSortStats, output: &Path, write_index: bool) -> Result<()> {
+    if stats.total_records == stats.output_records {
+        return Ok(());
+    }
+
+    let disposition = if is_stdout_path(output) {
+        // The records are already past this process; there is nothing to unlink,
+        // and `/dev/stdout` itself must certainly not be.
+        "The records written to stdout are incomplete and must not be used.".to_string()
+    } else {
+        let mut targets = vec![output.to_path_buf()];
+        if write_index {
+            targets.push(fgumi_bam_io::bai_sidecar_path(output));
+        }
+        let left_behind: Vec<PathBuf> =
+            targets.into_iter().filter(|path| !remove_incomplete_output(path)).collect();
+        if left_behind.is_empty() {
+            format!("The incomplete output at {} has been removed.", output.display())
+        } else {
+            let paths =
+                left_behind.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
+            format!("The incomplete output at {paths} could not be removed and must not be used.")
+        }
+    };
+
+    anyhow::bail!(
+        "sort lost records: read {} but wrote {} (differ by {}). {}",
+        stats.total_records,
+        stats.output_records,
+        stats.total_records.abs_diff(stats.output_records),
+        disposition
+    )
+}
+
+/// Remove an incomplete sort output, reporting whether it is now gone.
+///
+/// Follows a symlink to the file the sort actually wrote through, so unlinking
+/// the link would not leave the real short BAM in place -- the same resolution
+/// [`MergeOutputTarget::create`] does for the opposite reason. Only regular
+/// files are removed; anything else was written through, not created, and a
+/// path that cannot be resolved or stat-ed is reported as still present rather
+/// than assumed gone.
+fn remove_incomplete_output(path: &Path) -> bool {
+    let Ok(resolved) = resolve_symlink_output(path) else {
+        return false;
+    };
+    match std::fs::metadata(&resolved) {
+        // Already absent is the outcome we wanted, not a failure.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+        Ok(metadata) if !metadata.is_file() => false,
+        Ok(_) => std::fs::remove_file(&resolved).is_ok(),
+    }
+}
+
 /// Whether the merge block-lifecycle block has nothing to print.
 ///
 /// Every report that block prints must appear here. A report missing from the
@@ -1544,6 +1639,15 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
                         None
                     };
                     drop(guard);
+                    if emptied_cause.is_some() {
+                        // This file needs a worker now. Waking one here is the
+                        // difference between the pool learning that within a
+                        // microsecond and learning it whenever some worker's
+                        // backoff happens to expire. After the drop, so the
+                        // woken worker does not immediately block on the mutex
+                        // this thread would still be holding.
+                        self.shared.wake_one_worker();
+                    }
                     if let Some(cause) = emptied_cause {
                         self.shared.refill.record_empty(cause);
                     }
@@ -1586,6 +1690,9 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
 
             // Source produced everything it ever will?
             if self.files[source_id].is_drained() {
+                // Move the drain frontier past it, so workers scanning for the
+                // next hungry file start at one that still has records.
+                self.shared.advance_phase2_frontier(&self.files);
                 return Ok(false);
             }
 
@@ -1835,6 +1942,120 @@ impl<'a> ChunkNamer<'a> {
 struct PendingSpill {
     handle: crate::pooled_chunk_writer::SpillWriteHandle,
     chunk_path: PathBuf,
+    /// Whether this chunk extended an existing run rather than starting one.
+    /// An extended run is already in `chunk_files`, so it must not be added twice.
+    appended: bool,
+    /// The run file's length before this chunk was written, so the drain can
+    /// account for the bytes this chunk added rather than the file's whole size.
+    size_before: u64,
+}
+
+/// Decides whether the next sorted chunk extends the open spill run or starts a
+/// new one — "natural run formation".
+///
+/// Phase 1 chunks its input sequentially, so an input already in the requested
+/// order produces chunks that are not merely disjoint but *totally ordered*:
+/// chunk 0 holds the earliest records, chunk 1 the next. Writing each to its own
+/// file manufactures a k-way merge for a sequence that was never interleaved.
+/// Appending instead collapses sorted input to a single run, and almost-sorted
+/// input to its natural runs.
+///
+/// # Why only the most recent run
+///
+/// Considering older runs too (best fit) yields fewer runs on adversarial input
+/// but breaks stability. Suppose run 0 ended at key 100 and stopped receiving,
+/// run 1 is at 200, and a chunk arrives with minimum 150: best fit appends it to
+/// run 0, so run 0 holds chunks {0,1,2,9} while run 1 holds {3,4}. Source index
+/// order no longer matches ingest order, and for a key present in both chunk 3
+/// and chunk 9 the merge would emit chunk 9's copy first.
+///
+/// Restricting appends to the most recent run keeps every run a *consecutive*
+/// group of chunks, so source order equals ingest order. Combined with the loser
+/// tree's tie-break on source index (`LoserTree::is_greater`), output is
+/// byte-identical to writing one file per chunk.
+#[derive(Default)]
+struct RunFormer<K> {
+    /// The open run: its path and the key of its last record. `None` before the
+    /// first spill, and after a consolidation that swallowed the run.
+    open: Option<(PathBuf, K)>,
+}
+
+/// Report how many spilled chunks became how many runs.
+///
+/// Sorted input collapses to one run, almost-sorted input to its natural runs,
+/// shuffled input to one run per chunk. Logging the ratio means every sort
+/// reports how ordered its own input was, which is the cheapest way to learn how
+/// common near-sorted inputs are in practice.
+///
+/// `runs` must be the number of runs *formed* (`RawSortStats::runs_written`),
+/// not the number of spill files left at merge time. Consolidation merges the
+/// oldest half of the files whenever their count reaches `--max-temp-files`, so
+/// the surviving file count can be far lower than the run count for reasons that
+/// have nothing to do with how ordered the input was -- which is the one thing
+/// this line exists to report.
+fn log_run_formation(chunks_spilled: usize, runs: usize) {
+    info!(
+        "Spill runs: {runs} from {chunks_spilled} chunks ({} extended an existing run)",
+        chunks_spilled.saturating_sub(runs)
+    );
+}
+
+/// The smallest and largest keys in an already-sorted slice.
+///
+/// Read off the ends rather than scanned, which is what makes run formation free:
+/// the caller has just sorted the buffer, so its extremes are its first and last
+/// elements. `None` only for an empty slice, which a spill never produces.
+fn chunk_bounds<T, K>(items: &[T], key: impl Fn(&T) -> K) -> Option<(K, K)> {
+    Some((key(items.first()?), key(items.last()?)))
+}
+
+impl<K: Clone + Ord> RunFormer<K> {
+    /// Choose where a sorted chunk should be written.
+    ///
+    /// Returns the path and whether it extends an existing run. The chunk extends
+    /// the open run when every key in it sorts at or after that run's last key;
+    /// otherwise a fresh path is allocated and a new run begins.
+    ///
+    /// Both pre-write steps in one method rather than two, because they have a
+    /// mandatory order — forget a consolidated run, *then* test appendability —
+    /// and nothing in the types enforced it when callers drove it themselves.
+    /// Recording the new boundary necessarily follows the write and stays in
+    /// [`Self::extended`], which [`RawExternalSorter::spill_chunk`] — the only
+    /// caller of either — invokes once the path is known.
+    fn place(
+        &mut self,
+        chunk_files: &[PathBuf],
+        bounds: Option<&(K, K)>,
+        namer: &mut ChunkNamer<'_>,
+    ) -> Result<(PathBuf, bool)> {
+        // Consolidation may have merged the open run away while the previous
+        // spill was draining, leaving a path that no longer holds what we think.
+        if let Some((path, _)) = &self.open
+            && !chunk_files.contains(path)
+        {
+            self.open = None;
+        }
+
+        let appendable = match (&self.open, bounds) {
+            (Some((path, last_key)), Some((chunk_min, _))) if last_key <= chunk_min => {
+                Some(path.clone())
+            }
+            _ => None,
+        };
+
+        match appendable {
+            Some(path) => Ok((path, true)),
+            // Always allocate through the namer on this branch: it is what
+            // advances the temp-directory round-robin and periodically re-checks
+            // free space (`TmpDirAllocator::next`).
+            None => Ok((namer.next_chunk_path()?, false)),
+        }
+    }
+
+    /// Record that a chunk ending at `chunk_max` was written to `path`.
+    fn extended(&mut self, path: PathBuf, chunk_max: K) {
+        self.open = Some((path, chunk_max));
+    }
 }
 
 /// Build `BufferProbeStats` from any buffer implementing `ProbeableBuffer`.
@@ -2246,6 +2467,46 @@ impl RawExternalSorter {
             .map_err(|e| anyhow::anyhow!("failed to build rayon sort pool: {e}"))
     }
 
+    /// Write one sorted chunk, extending the open spill run when it can.
+    ///
+    /// Shared by all four sort functions: identical aside from the key type and
+    /// the per-record write, which the caller supplies as a closure. Keeping the
+    /// run-formation bookkeeping here means the append/create choice, the
+    /// pre-write size needed for spill accounting, and the boundary key recorded
+    /// afterwards cannot drift between the four copies.
+    fn spill_chunk<K: RawSortKey + Clone + Ord + Default + 'static>(
+        run_former: &mut RunFormer<K>,
+        chunk_files: &[PathBuf],
+        bounds: Option<(K, K)>,
+        namer: &mut ChunkNamer<'_>,
+        pool: &Arc<SortWorkerPool>,
+        timer: &mut SortPhaseTimer,
+        write: impl FnOnce(&mut PooledChunkWriter<K>) -> Result<()>,
+    ) -> Result<PendingSpill> {
+        let (chunk_path, appended) = run_former.place(chunk_files, bounds.as_ref(), namer)?;
+
+        // Captured before the write so the drain can charge only the bytes this
+        // chunk adds; an appended run's file already holds its predecessors.
+        let size_before =
+            if appended { std::fs::metadata(&chunk_path).map_or(0, |m| m.len()) } else { 0 };
+
+        let handle = timer.time_spill_write(|| {
+            let mut writer = PooledChunkWriter::<K>::open(
+                Arc::clone(pool),
+                &chunk_path,
+                pool.spill_codec(),
+                appended,
+            )?;
+            write(&mut writer)?;
+            writer.start_finish()
+        })?;
+
+        if let Some((_, chunk_max)) = bounds {
+            run_former.extended(chunk_path.clone(), chunk_max);
+        }
+        Ok(PendingSpill { handle, chunk_path, appended, size_before })
+    }
+
     /// Consolidate temp files if we've exceeded the limit.
     /// Wait for a pending spill to complete and, if one was present, run consolidation.
     ///
@@ -2262,9 +2523,13 @@ impl RawExternalSorter {
     ) -> Result<()> {
         if let Some(prev) = pending.take() {
             prev.handle.wait()?;
-            timer.record_spill_size(&prev.chunk_path);
-            chunk_files.push(prev.chunk_path);
-            stats.chunks_written += 1;
+            timer.record_spill_growth(&prev.chunk_path, prev.size_before);
+            // A chunk that extended an existing run is already represented in
+            // `chunk_files`; only a chunk that started a run adds a merge source.
+            if !prev.appended {
+                chunk_files.push(prev.chunk_path);
+                stats.runs_written += 1;
+            }
 
             timer.time_consolidate(|| {
                 self.maybe_consolidate_temp_files::<K>(chunk_files, namer, pool)
@@ -2492,6 +2757,17 @@ impl RawExternalSorter {
         output: &Path,
         pool: Arc<SortWorkerPool>,
     ) -> Result<RawSortStats> {
+        // Say so when the input claims to be in the order being requested. This
+        // is checked before @PG is added so it reflects the input as given.
+        if crate::header_declares_order(header, self.sort_order) {
+            log::warn!(
+                "Input header already declares this sort order ({}); sorting it again. \
+                 Headers are not verified, so the sort still runs -- use `--verify` to \
+                 check an input's order without rewriting it.",
+                self.sort_order_flag_value()
+            );
+        }
+
         // Add @PG record if pg_info was provided
         let header = if let Some((ref version, ref command_line)) = self.pg_info {
             fgumi_bam_io::header::add_pg_record(header.clone(), version, command_line)?
@@ -2503,7 +2779,7 @@ impl RawExternalSorter {
         let (_temp_dirs, mut alloc) = self.create_temp_dirs()?;
 
         // Sort based on order
-        match self.sort_order {
+        let stats = match self.sort_order {
             SortOrder::Coordinate => {
                 self.sort_coordinate(record_source, pool, &header, output, &mut alloc)
             }
@@ -2513,7 +2789,17 @@ impl RawExternalSorter {
             SortOrder::TemplateCoordinate => {
                 self.sort_template_coordinate(record_source, pool, &header, output, &mut alloc)
             }
-        }
+        }?;
+
+        // A sort is a permutation: every record read must be written. Checked here
+        // rather than in the CLI so it covers every entry point -- `sort_records`
+        // has callers (`fgumi simulate`) that discard the stats entirely, and a
+        // library consumer should not have to opt in to the engine's own
+        // guarantee. Both counts are measured independently: `total_records` by
+        // the ingest loop, `output_records` by whichever writer produced the
+        // output.
+        enforce_record_count(&stats, output, self.write_index)?;
+        Ok(stats)
     }
 
     /// Warn when a merge is about to ask for more descriptors than the process
@@ -2815,6 +3101,9 @@ impl RawExternalSorter {
         let mut buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
         let mut namer = ChunkNamer::new(alloc);
         let mut pending_spill: Option<PendingSpill> = None;
+        // Natural run formation: consecutive chunks that are already in order
+        // extend one run instead of each becoming its own merge source.
+        let mut run_former: RunFormer<crate::keys::RawCoordinateKey> = RunFormer::default();
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
@@ -2854,30 +3143,31 @@ impl RawExternalSorter {
                 )?;
                 probe.post_drain(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
 
-                let chunk_path = namer.next_chunk_path()?;
-
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
                 });
 
-                // Write keyed temp file with parallel BGZF compression via worker pool.
-                // Use start_finish() for pipelining: I/O continues in background
-                // while we read the next batch.
-                let handle = timer.time_spill_write(|| {
-                    let mut writer = PooledChunkWriter::<RawCoordinateKey>::new(
-                        Arc::clone(&pool),
-                        &chunk_path,
-                        pool.spill_codec(),
-                    )?;
-                    for r in buffer.refs() {
-                        let key = RawCoordinateKey { sort_key: r.sort_key };
-                        let record_bytes = buffer.get_record(r);
-                        writer.write_record(&key, record_bytes)?;
-                    }
-                    writer.start_finish()
-                })?;
+                // The buffer is sorted, so the chunk's extreme keys are its ends.
+                let bounds =
+                    chunk_bounds(buffer.refs(), |r| RawCoordinateKey { sort_key: r.sort_key });
 
-                pending_spill = Some(PendingSpill { handle, chunk_path });
+                // Pipelined: `spill_chunk` returns once the write is submitted, so
+                // I/O continues in the background while we read the next batch.
+                pending_spill = Some(Self::spill_chunk::<RawCoordinateKey>(
+                    &mut run_former,
+                    &chunk_files,
+                    bounds,
+                    &mut namer,
+                    &pool,
+                    &mut timer,
+                    |writer| {
+                        for r in buffer.refs() {
+                            let key = RawCoordinateKey { sort_key: r.sort_key };
+                            writer.write_record(&key, buffer.get_record(r))?;
+                        }
+                        Ok(())
+                    },
+                )?);
 
                 buffer.clear();
                 force_mi_collect();
@@ -2914,16 +3204,18 @@ impl RawExternalSorter {
                 rayon_pool.install(|| buffer.par_sort());
             });
 
-            timer.time_write_output(|| {
+            stats.output_records = timer.time_write_output(|| {
                 use crate::pooled_bam_writer::PooledBamWriter;
                 let output_header = self.create_output_header(header);
                 let mut writer = PooledBamWriter::new(Arc::clone(&pool), output, &output_header)?;
 
+                let mut written: u64 = 0;
                 for record_bytes in buffer.iter_sorted() {
                     writer.write_raw_record(record_bytes)?;
+                    written += 1;
                 }
                 writer.finish()?;
-                Ok(())
+                Ok(written)
             })?;
         } else {
             // Sort remaining records into separate sub-array chunks (avoids
@@ -2944,13 +3236,14 @@ impl RawExternalSorter {
 
             let memory_chunks = MemorySources::Shared(memory_chunks);
             let n_memory = memory_chunks.num_non_empty();
+            log_run_formation(timer.spill_count(), stats.runs_written);
             debug!(
                 "Phase 2: Merging {} chunks (keyed O(1) comparisons)...",
                 chunk_files.len() + n_memory
             );
 
             // Merge disk chunks + in-memory chunks using O(1) key comparisons
-            timer.time_merge(|| {
+            stats.output_records = timer.time_merge(|| {
                 self.merge_chunks_generic::<RawCoordinateKey>(
                     &chunk_files,
                     memory_chunks,
@@ -2962,7 +3255,6 @@ impl RawExternalSorter {
             })?;
         }
 
-        stats.output_records = stats.total_records;
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
@@ -3006,6 +3298,9 @@ impl RawExternalSorter {
         let mut buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
         let mut namer = ChunkNamer::new(alloc);
         let mut pending_spill: Option<PendingSpill> = None;
+        // Natural run formation: consecutive chunks that are already in order
+        // extend one run instead of each becoming its own merge source.
+        let mut run_former: RunFormer<crate::keys::RawCoordinateKey> = RunFormer::default();
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         debug!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
@@ -3036,27 +3331,30 @@ impl RawExternalSorter {
                 )?;
                 probe.post_drain(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
 
-                let chunk_path = namer.next_chunk_path()?;
-
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
                 });
 
-                let handle = timer.time_spill_write(|| {
-                    let mut writer = PooledChunkWriter::<RawCoordinateKey>::new(
-                        Arc::clone(&pool),
-                        &chunk_path,
-                        pool.spill_codec(),
-                    )?;
-                    for r in buffer.refs() {
-                        let key = RawCoordinateKey { sort_key: r.sort_key };
-                        let record_bytes = buffer.get_record(r);
-                        writer.write_record(&key, record_bytes)?;
-                    }
-                    writer.start_finish()
-                })?;
+                let bounds =
+                    chunk_bounds(buffer.refs(), |r| RawCoordinateKey { sort_key: r.sort_key });
 
-                pending_spill = Some(PendingSpill { handle, chunk_path });
+                // Pipelined: `spill_chunk` returns once the write is submitted, so
+                // I/O continues in the background while we read the next batch.
+                pending_spill = Some(Self::spill_chunk::<RawCoordinateKey>(
+                    &mut run_former,
+                    &chunk_files,
+                    bounds,
+                    &mut namer,
+                    &pool,
+                    &mut timer,
+                    |writer| {
+                        for r in buffer.refs() {
+                            let key = RawCoordinateKey { sort_key: r.sort_key };
+                            writer.write_record(&key, buffer.get_record(r))?;
+                        }
+                        Ok(())
+                    },
+                )?);
 
                 buffer.clear();
                 force_mi_collect();
@@ -3095,7 +3393,7 @@ impl RawExternalSorter {
                 rayon_pool.install(|| buffer.par_sort());
             });
 
-            timer.time_write_output(|| {
+            stats.output_records = timer.time_write_output(|| {
                 let mut writer = create_indexing_bam_writer(
                     output,
                     &output_header,
@@ -3103,8 +3401,10 @@ impl RawExternalSorter {
                     self.phase2_threads(),
                 )?;
 
+                let mut written: u64 = 0;
                 for record_bytes in buffer.iter_sorted() {
                     writer.write_raw_record(record_bytes)?;
+                    written += 1;
                 }
 
                 let index = writer.finish()?;
@@ -3112,7 +3412,7 @@ impl RawExternalSorter {
                 let index_path = bai_sidecar_path(output);
                 write_bai_index(&index_path, &index)?;
                 info!("Wrote BAM index: {}", index_path.display());
-                Ok(())
+                Ok(written)
             })?;
         } else {
             // Sort remaining records into separate sub-array chunks
@@ -3131,13 +3431,14 @@ impl RawExternalSorter {
 
             let memory_chunks = MemorySources::Shared(memory_chunks);
             let n_memory = memory_chunks.num_non_empty();
+            log_run_formation(timer.spill_count(), stats.runs_written);
             debug!(
                 "Phase 2: Merging {} chunks with index generation...",
                 chunk_files.len() + n_memory
             );
 
-            timer.time_merge(|| {
-                let index = self.merge_chunks_with_index::<RawCoordinateKey>(
+            stats.output_records = timer.time_merge(|| {
+                let (index, records_merged) = self.merge_chunks_with_index::<RawCoordinateKey>(
                     &chunk_files,
                     memory_chunks,
                     header,
@@ -3149,11 +3450,10 @@ impl RawExternalSorter {
                 let index_path = bai_sidecar_path(output);
                 write_bai_index(&index_path, &index)?;
                 info!("Wrote BAM index: {}", index_path.display());
-                Ok(())
+                Ok(records_merged)
             })?;
         }
 
-        stats.output_records = stats.total_records;
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
@@ -3223,6 +3523,9 @@ impl RawExternalSorter {
         let mut memory_used = 0usize;
         let mut namer = ChunkNamer::new(alloc);
         let mut pending_spill: Option<PendingSpill> = None;
+        // Natural run formation: consecutive chunks already in queryname order
+        // extend one run instead of each becoming its own merge source.
+        let mut run_former: RunFormer<K> = RunFormer::default();
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
@@ -3271,8 +3574,6 @@ impl RawExternalSorter {
                 )?;
                 probe.post_drain(bstats, Some(pool.phase1_queue_depths()));
 
-                let chunk_path = namer.next_chunk_path()?;
-
                 timer.time_sort(|| {
                     use rayon::prelude::*;
                     // `entries` is in ingest order, and exact-queryname-key ties must keep
@@ -3285,20 +3586,22 @@ impl RawExternalSorter {
                     rayon_pool.install(|| entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0)));
                 });
 
-                // Write keyed temp file with parallel BGZF compression via worker pool.
-                let handle = timer.time_spill_write(|| {
-                    let mut writer = PooledChunkWriter::<K>::new(
-                        Arc::clone(&pool),
-                        &chunk_path,
-                        pool.spill_codec(),
-                    )?;
-                    for (key, record) in entries.drain(..) {
-                        writer.write_record(&key, record.as_ref())?;
-                    }
-                    writer.start_finish()
-                })?;
+                let bounds = chunk_bounds(&entries, |(k, _)| k.clone());
 
-                pending_spill = Some(PendingSpill { handle, chunk_path });
+                pending_spill = Some(Self::spill_chunk::<K>(
+                    &mut run_former,
+                    &chunk_files,
+                    bounds,
+                    &mut namer,
+                    &pool,
+                    &mut timer,
+                    |writer| {
+                        for (key, record) in entries.drain(..) {
+                            writer.write_record(&key, record.as_ref())?;
+                        }
+                        Ok(())
+                    },
+                )?);
 
                 memory_used = 0;
                 force_mi_collect();
@@ -3339,16 +3642,18 @@ impl RawExternalSorter {
                 rayon_pool.install(|| entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0)));
             });
 
-            timer.time_write_output(|| {
+            stats.output_records = timer.time_write_output(|| {
                 use crate::pooled_bam_writer::PooledBamWriter;
                 let output_header = self.create_output_header(header);
                 let mut writer = PooledBamWriter::new(Arc::clone(&pool), output, &output_header)?;
 
+                let mut written: u64 = 0;
                 for (_key, record) in entries {
                     writer.write_raw_record(&record)?;
+                    written += 1;
                 }
                 writer.finish()?;
-                Ok(())
+                Ok(written)
             })?;
         } else {
             // Sort remaining records into separate sub-array chunks (avoids
@@ -3405,13 +3710,14 @@ impl RawExternalSorter {
             let memory_chunks = MemorySources::Owned(keyed_chunks);
 
             let n_memory = memory_chunks.num_non_empty();
+            log_run_formation(timer.spill_count(), stats.runs_written);
             debug!(
                 "Phase 2: Merging {} chunks (keyed comparisons)...",
                 chunk_files.len() + n_memory
             );
 
             // Merge disk chunks + in-memory records using keyed comparisons
-            timer.time_merge(|| {
+            stats.output_records = timer.time_merge(|| {
                 self.merge_chunks_generic::<K>(
                     &chunk_files,
                     memory_chunks,
@@ -3423,7 +3729,6 @@ impl RawExternalSorter {
             })?;
         }
 
-        stats.output_records = stats.total_records;
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
@@ -3580,6 +3885,9 @@ impl RawExternalSorter {
             TemplateRecordBuffer::<K>::with_capacity(estimated_records, estimated_data_bytes);
         let mut namer = ChunkNamer::new(alloc);
         let mut pending_spill: Option<PendingSpill> = None;
+        // Natural run formation: consecutive chunks already in template order
+        // extend one run instead of each becoming its own merge source.
+        let mut run_former: RunFormer<K> = RunFormer::default();
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
@@ -3648,26 +3956,26 @@ impl RawExternalSorter {
                 )?;
                 probe.post_drain(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
 
-                let chunk_path = namer.next_chunk_path()?;
-
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
                 });
 
-                // Write keyed chunk with parallel BGZF compression via worker pool.
-                let handle = timer.time_spill_write(|| {
-                    let mut writer = PooledChunkWriter::<K>::new(
-                        Arc::clone(&pool),
-                        &chunk_path,
-                        pool.spill_codec(),
-                    )?;
-                    for (key, record) in buffer.iter_sorted_keyed() {
-                        writer.write_record(&key, record)?;
-                    }
-                    writer.start_finish()
-                })?;
+                let bounds = chunk_bounds(buffer.refs(), |r| r.key);
 
-                pending_spill = Some(PendingSpill { handle, chunk_path });
+                pending_spill = Some(Self::spill_chunk::<K>(
+                    &mut run_former,
+                    &chunk_files,
+                    bounds,
+                    &mut namer,
+                    &pool,
+                    &mut timer,
+                    |writer| {
+                        for (key, record) in buffer.iter_sorted_keyed() {
+                            writer.write_record(&key, record)?;
+                        }
+                        Ok(())
+                    },
+                )?);
 
                 buffer.clear();
                 force_mi_collect();
@@ -3704,16 +4012,18 @@ impl RawExternalSorter {
                 rayon_pool.install(|| buffer.par_sort());
             });
 
-            timer.time_write_output(|| {
+            stats.output_records = timer.time_write_output(|| {
                 use crate::pooled_bam_writer::PooledBamWriter;
                 let output_header = self.create_output_header(header);
                 let mut writer = PooledBamWriter::new(Arc::clone(&pool), output, &output_header)?;
 
+                let mut written: u64 = 0;
                 for record_bytes in buffer.iter_sorted() {
                     writer.write_raw_record(record_bytes)?;
+                    written += 1;
                 }
                 writer.finish()?;
-                Ok(())
+                Ok(written)
             })?;
         } else {
             // Sort remaining records into separate sub-array chunks (avoids
@@ -3733,10 +4043,11 @@ impl RawExternalSorter {
 
             let memory_chunks = MemorySources::Shared(memory_chunks);
             let n_memory = memory_chunks.num_non_empty();
+            log_run_formation(timer.spill_count(), stats.runs_written);
             debug!("Phase 2: Merging {} chunks...", chunk_files.len() + n_memory);
 
             // Merge using O(1) key comparisons
-            timer.time_merge(|| {
+            stats.output_records = timer.time_merge(|| {
                 self.merge_chunks_generic::<K>(
                     &chunk_files,
                     memory_chunks,
@@ -3748,7 +4059,6 @@ impl RawExternalSorter {
             })?;
         }
 
-        stats.output_records = stats.total_records;
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
@@ -3976,6 +4286,17 @@ impl RawExternalSorter {
                 "  Workers ({workers_n} active threads; busy time, overlaps the above and itself)"
             );
             info!("    Spill disk read:   {read_s:.1}s ({:.0}%) [{read_n} batches]", pct(read_s));
+            // Blocks-per-batch, split by allowance. A deep share near zero means
+            // the frontier gate is not firing, which reads identically to "the
+            // deeper read-ahead did not help" unless it is reported separately.
+            let (deep_b, deep_blk, shal_b, shal_blk) = pool.read_batch_split();
+            let per = |blk: u64, b: u64| if b == 0 { 0.0 } else { blk as f64 / b as f64 };
+            info!(
+                "      frontier {deep_b} batches / {deep_blk} blocks ({:.1} per batch), \
+                 other {shal_b} batches / {shal_blk} blocks ({:.1} per batch)",
+                per(deep_blk, deep_b),
+                per(shal_blk, shal_b)
+            );
             info!("    Spill decompress:  {dec_s:.1}s ({:.0}%) [{dec_n} blocks]", pct(dec_s));
             info!("    Output compress:   {comp_s:.1}s ({:.0}%) [{comp_n} blocks]", pct(comp_s));
             info!("    Total worker busy: {busy:.1}s  (NOT comparable to loop wall clock)");
@@ -4076,8 +4397,9 @@ impl RawExternalSorter {
                     100.0 * wake.deep_sleep_wake_share()
                 );
                 info!(
-                    "    (nothing unparks a worker, so this bounds how late work is noticed; it \
-                     delays the merge only when every worker is asleep at once)"
+                    "    (the consumer unparks one worker when a reorder buffer drains, so this \
+                     bounds how late work arriving any other way is noticed; it delays the merge \
+                     only when every worker is asleep at once)"
                 );
             }
 
@@ -4503,7 +4825,7 @@ impl RawExternalSorter {
         output: &Path,
         total_records: u64,
         pool: &Arc<SortWorkerPool>,
-    ) -> Result<noodles::bam::bai::Index> {
+    ) -> Result<(noodles::bam::bai::Index, u64)> {
         use crate::loser_tree::LoserTree;
         use crate::pooled_bam_writer::PooledBamWriter;
 
@@ -4529,7 +4851,7 @@ impl RawExternalSorter {
                     .finish_index()
             })?;
             debug!("Merge complete: 0 records merged");
-            return Ok(index);
+            return Ok((index, 0));
         }
 
         let mut tree = LoserTree::new(initial_keys);
@@ -4549,11 +4871,13 @@ impl RawExternalSorter {
             consumer.restart_stalls();
         }
         let loop_start = Instant::now();
+        let mut records_merged: u64 = 0;
         while tree.winner_is_active() {
             let winner = tree.winner();
             let src_idx = source_map[winner];
             let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref())?;
             writer.write_raw_record(record_bytes)?;
+            records_merged += 1;
             merge_progress.log_if_needed(1);
 
             if let Some(key) = sources[src_idx].advance(guard.consumer_mut())? {
@@ -4603,7 +4927,7 @@ impl RawExternalSorter {
         );
 
         merge_progress.log_final();
-        Ok(index)
+        Ok((index, records_merged))
     }
 
     /// Create output header with appropriate sort order tags.
@@ -5125,6 +5449,129 @@ mod tests {
     use rstest::rstest;
 
     // ========================================================================
+    // Record-count invariant
+    // ========================================================================
+
+    /// A failed permutation check must not leave a readable BAM behind.
+    ///
+    /// The output is finalized by the time the check runs, so it is a valid,
+    /// short BAM -- the most dangerous kind of failure output, because every
+    /// existence check and every reader accepts it. The rest of the crate
+    /// deletes on abort (`test_sort_records_producer_error_aborts`), and this
+    /// path has to as well or the error's own claim is false.
+    #[rstest]
+    #[case::index_written(true)]
+    #[case::no_index(false)]
+    fn record_count_mismatch_removes_the_output(#[case] write_index: bool) {
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let output = dir.path().join("out.bam");
+        let bai = fgumi_bam_io::bai_sidecar_path(&output);
+        std::fs::write(&output, b"a short but perfectly valid BAM").expect("write output");
+        std::fs::write(&bai, b"an index describing it").expect("write index");
+
+        let stats = RawSortStats { total_records: 100, output_records: 99, runs_written: 1 };
+        let err = enforce_record_count(&stats, &output, write_index)
+            .expect_err("a record-count mismatch must fail the sort");
+        let msg = format!("{err:#}");
+
+        assert!(!output.exists(), "the incomplete output must not survive the error");
+        assert!(msg.contains("read 100 but wrote 99"), "got: {msg}");
+        assert!(msg.contains("differ by 1"), "got: {msg}");
+        assert!(
+            msg.contains("has been removed"),
+            "the message must state what was done, not just what not to do: {msg}"
+        );
+        // The index describes a file that no longer exists, so it goes too --
+        // but only when this sort is the one that wrote it.
+        assert_eq!(
+            bai.exists(),
+            !write_index,
+            "index removal must follow write_index (write_index={write_index})"
+        );
+    }
+
+    /// stdout cannot be un-written, and `/dev/stdout` must certainly not be
+    /// unlinked. The error still fires; it just cannot claim a removal.
+    #[rstest]
+    #[case::dash("-")]
+    #[case::dev_stdout("/dev/stdout")]
+    fn record_count_mismatch_never_unlinks_stdout(#[case] output: &str) {
+        let stats = RawSortStats { total_records: 10, output_records: 4, runs_written: 1 };
+        let err = enforce_record_count(&stats, Path::new(output), false)
+            .expect_err("a record-count mismatch must fail the sort");
+        let msg = format!("{err:#}");
+
+        assert!(Path::new("/dev/stdout").exists(), "/dev/stdout must survive");
+        assert!(msg.contains("written to stdout"), "got: {msg}");
+        assert!(
+            !msg.contains("has been removed"),
+            "nothing was removed, so the message must not say so: {msg}"
+        );
+    }
+
+    /// A symlinked output is written *through* to the real file, so unlinking
+    /// the link would leave the short BAM exactly where a reader would find it.
+    #[test]
+    fn record_count_mismatch_removes_the_symlink_target() {
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let real = dir.path().join("real.bam");
+        let link = dir.path().join("link.bam");
+        std::fs::write(&real, b"a short but perfectly valid BAM").expect("write output");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let stats = RawSortStats { total_records: 10, output_records: 9, runs_written: 1 };
+        enforce_record_count(&stats, &link, false).expect_err("mismatch must fail the sort");
+
+        assert!(!real.exists(), "the file actually written must be the one removed");
+    }
+
+    /// A FIFO was written through, not created, so it is not this sort's to
+    /// unlink -- and the message must not claim otherwise.
+    #[test]
+    fn record_count_mismatch_leaves_a_non_regular_output_alone() {
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let fifo = dir.path().join("out.fifo");
+        let mkfifo =
+            std::process::Command::new("mkfifo").arg(&fifo).status().expect("failed to run mkfifo");
+        assert!(mkfifo.success(), "mkfifo failed");
+
+        let stats = RawSortStats { total_records: 10, output_records: 9, runs_written: 1 };
+        let err = enforce_record_count(&stats, &fifo, false).expect_err("mismatch must fail");
+        let msg = format!("{err:#}");
+
+        assert!(fifo.exists(), "a FIFO must not be unlinked by the sort that wrote through it");
+        assert!(msg.contains("could not be removed"), "got: {msg}");
+    }
+
+    /// The check must be silent and side-effect-free when the counts agree --
+    /// otherwise every successful sort would delete its own output.
+    #[test]
+    fn matching_record_counts_leave_the_output_alone() {
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let output = dir.path().join("out.bam");
+        std::fs::write(&output, b"the real output").expect("write output");
+
+        let stats = RawSortStats { total_records: 100, output_records: 100, runs_written: 1 };
+        enforce_record_count(&stats, &output, true).expect("matching counts must succeed");
+        assert!(output.exists(), "a successful sort must keep its output");
+    }
+
+    /// An output that is already gone is the state the removal wanted, so it
+    /// must not be reported as a removal failure on top of the count error.
+    #[test]
+    fn record_count_mismatch_tolerates_a_missing_output() {
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let output = dir.path().join("never-written.bam");
+
+        let stats = RawSortStats { total_records: 5, output_records: 0, runs_written: 0 };
+        let err = enforce_record_count(&stats, &output, true)
+            .expect_err("a record-count mismatch must fail the sort");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("has been removed"), "got: {msg}");
+        assert!(!msg.contains("could not be removed"), "absent is not a failure: {msg}");
+    }
+
+    // ========================================================================
     // Merge diagnostics reporting
     // ========================================================================
 
@@ -5204,6 +5651,7 @@ mod tests {
     fn merge_stall_gate_covers_every_report(#[case] populate: &str, #[case] silent: bool) {
         use crate::merge_stalls::{
             ConsumerStallTracker, Phase2ScanStats, Phase2ScanTally, Phase2Skip, WakeLatencyStats,
+            WakePhase,
         };
 
         let stalls = {
@@ -5225,9 +5673,9 @@ mod tests {
         let wake = {
             let stats = WakeLatencyStats::default();
             if populate == "wake" {
-                stats.record_sleep(320, 1_000);
+                stats.record_sleep(WakePhase::Merge, 320, 1_000);
             }
-            stats.snapshot()
+            stats.snapshot(WakePhase::Merge)
         };
 
         // Mirrors the caller, which drops an all-zero stall report before the
@@ -5250,7 +5698,9 @@ mod tests {
     /// on exactly those runs.
     #[test]
     fn silent_stall_gate_does_not_silence_the_lifecycle_gate() {
-        use crate::merge_stalls::{ConsumerStallTracker, Phase2ScanStats, WakeLatencyStats};
+        use crate::merge_stalls::{
+            ConsumerStallTracker, Phase2ScanStats, WakeLatencyStats, WakePhase,
+        };
         use crate::merge_trace::{
             BlockLifecycleStats, ConsumerTraceStats, DurationHistogram, RefillStats,
         };
@@ -5259,7 +5709,7 @@ mod tests {
         // empty, no worker slept.
         let stalls = ConsumerStallTracker::new(1).snapshot();
         let scans = Phase2ScanStats::default().snapshot();
-        let wake = WakeLatencyStats::default().snapshot();
+        let wake = WakeLatencyStats::default().snapshot(WakePhase::Merge);
         assert!(
             merge_stalls_are_silent(Some(&stalls), &scans, &wake),
             "a merge with no stalls should leave the stall block silent"
@@ -6061,7 +6511,7 @@ mod tests {
         use crate::worker_pool::phase;
 
         let fixture = empty_merge_fixture();
-        let index = fixture
+        let (index, records_merged) = fixture
             .sorter
             .merge_chunks_with_index::<RawCoordinateKey>(
                 std::slice::from_ref(&fixture.chunk),
@@ -6073,6 +6523,7 @@ mod tests {
             )
             .expect("empty indexed merge should succeed");
 
+        assert_eq!(records_merged, 0, "an empty merge must report zero records written");
         assert_eq!(
             count_bam_records(&fixture.output),
             0,
@@ -6444,6 +6895,66 @@ mod tests {
         RawReadAheadReader::new(reader).count() as u64
     }
 
+    /// Assert the output really is in `order`.
+    ///
+    /// Built on the crate's own [`crate::verify::verify_sort_order`] and the same
+    /// key extractors the merge uses, so it covers every sort order rather than
+    /// only coordinate. Record counts alone cannot distinguish "merged correctly"
+    /// from "emitted every record in the wrong order", which is what a bad append
+    /// would produce.
+    fn assert_sorted_in(order: SortOrder, path: &std::path::Path) {
+        use crate::keys::{RawQuerynameKey, RawQuerynameLexKey, SortContext};
+        use crate::reader::RawBamRecordReader;
+        use crate::verify::verify_sort_order;
+
+        let (_, header) = create_raw_bam_reader(path, 1).expect("open bam for header");
+        let new_reader = || {
+            let file = std::fs::File::open(path).expect("open bam");
+            let mut reader = RawBamRecordReader::new(file).expect("bam reader");
+            reader.skip_header().expect("skip header");
+            reader
+        };
+
+        let summary = match order {
+            SortOrder::Coordinate => {
+                let n_ref = u32::try_from(header.reference_sequences().len())
+                    .expect("reference sequence count fits in u32");
+                verify_sort_order(
+                    new_reader(),
+                    |bam| crate::inline::extract_coordinate_key_inline(bam, n_ref),
+                    |key, prev| key < prev,
+                )
+            }
+            SortOrder::Queryname(QuerynameComparator::Natural) => {
+                let ctx = SortContext::from_header(&header);
+                verify_sort_order(
+                    new_reader(),
+                    |bam| RawQuerynameKey::extract(bam, &ctx),
+                    |key, prev| key < prev,
+                )
+            }
+            SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
+                let ctx = SortContext::from_header(&header);
+                verify_sort_order(
+                    new_reader(),
+                    |bam| RawQuerynameLexKey::extract(bam, &ctx),
+                    |key, prev| key < prev,
+                )
+            }
+            SortOrder::TemplateCoordinate => {
+                let lib_lookup = LibraryLookup::from_header(&header);
+                let hasher = cb_hasher();
+                verify_sort_order(
+                    new_reader(),
+                    |bam| extract_template_key_inline(bam, &lib_lookup, None, &hasher),
+                    |key, prev| key < prev,
+                )
+            }
+        };
+        let (_, violations, _) = summary.expect("verify should read the output");
+        assert_eq!(violations, 0, "{order:?}: output is not sorted");
+    }
+
     /// Verifies that sort with consolidation preserves all records.
     ///
     /// Uses a tiny memory limit and low `max_temp_files` to force many chunks and
@@ -6516,12 +7027,16 @@ mod tests {
 
         let num_pairs = 30;
         let mut builder = SamBuilder::new();
+        // Descending coordinates: ascending input would fold into a single
+        // run under natural run formation, and this test needs several
+        // chunks to exercise consolidation.
         for i in 0..num_pairs {
+            let descending = num_pairs - 1 - i;
             let _ = builder
                 .add_pair()
-                .name(&format!("read{i}"))
-                .start1(i * 200 + 1)
-                .start2(i * 200 + 101)
+                .name(&format!("read{descending:05}"))
+                .start1(descending * 200 + 1)
+                .start2(descending * 200 + 101)
                 .build();
         }
 
@@ -6542,9 +7057,9 @@ mod tests {
             .expect("sort should succeed");
 
         assert!(
-            stats.chunks_written >= 5,
+            stats.runs_written >= 5,
             "expected at least 5 chunks to exercise post-consolidation naming, got {}",
-            stats.chunks_written
+            stats.runs_written
         );
 
         // Count records in the output BAM to verify no data was lost
@@ -6706,11 +7221,11 @@ mod tests {
         // order instead — so a spilling limit that quietly stopped spilling
         // would leave that half uncovered with the test still green.
         assert_eq!(
-            stats.chunks_written > 0,
+            stats.runs_written > 0,
             memory_limit == SPILLING_MEMORY_LIMIT,
-            "a {memory_limit}-byte limit wrote {} spill chunk(s), which is not the path this \
+            "a {memory_limit}-byte limit wrote {} spill run(s), which is not the path this \
              case is meant to exercise",
-            stats.chunks_written
+            stats.runs_written
         );
 
         // The stable baseline: ingest order, stably sorted by the comparator's
@@ -6732,8 +7247,305 @@ mod tests {
         );
     }
 
-    /// Verifies that sort with many chunks exercises the pool-integrated
-    /// merge readers during the final merge phase (not just consolidation).
+    /// Sort `input` to `output` in `order`, spilling or not according to
+    /// `memory_limit`.
+    fn run_sort(
+        order: SortOrder,
+        input: &std::path::Path,
+        output: &std::path::Path,
+        memory_limit: usize,
+    ) -> RawSortStats {
+        RawExternalSorter::new(order)
+            .memory_limit(memory_limit)
+            .max_temp_files(0)
+            .threads(1)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(input, output)
+            .expect("sort should succeed")
+    }
+
+    /// Memory limit large enough that nothing spills.
+    const NO_SPILL_MEMORY: usize = 256 * 1024 * 1024;
+    /// Memory limit small enough to force many chunks.
+    const SPILL_MEMORY: usize = 8 * 1024;
+
+    /// Produce a BAM genuinely in `order`, by sorting without spilling.
+    ///
+    /// Built by sorting rather than by construction: no order implies another.
+    /// A coordinate-sorted file is not in template-coordinate order (template
+    /// keys derive from the earlier mate), and neither is in queryname order.
+    fn presorted_in(dir: &std::path::Path, order: SortOrder, num_pairs: usize) -> PathBuf {
+        let raw = build_ordered_bam(dir, num_pairs);
+        let sorted = dir.join(format!("presorted-{}.bam", order.header_so_tag()));
+        let stats = run_sort(order, &raw, &sorted, NO_SPILL_MEMORY);
+        assert_eq!(stats.runs_written, 0, "setup must not spill");
+        assert_eq!(stats.total_records, stats.output_records);
+        sorted
+    }
+
+    /// Every sort order: input already in the requested order must collapse to a
+    /// single run, because run formation is what makes that case cheap.
+    #[rstest::rstest]
+    #[case::coordinate(SortOrder::Coordinate)]
+    #[case::queryname_lex(SortOrder::Queryname(QuerynameComparator::Lexicographic))]
+    #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
+    #[case::template_coordinate(SortOrder::TemplateCoordinate)]
+    fn test_presorted_input_collapses_to_one_run(#[case] order: SortOrder) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let presorted = presorted_in(dir.path(), order, 300);
+        let output = dir.path().join("output.bam");
+
+        let stats = run_sort(order, &presorted, &output, SPILL_MEMORY);
+
+        assert_eq!(
+            stats.runs_written, 1,
+            "{order:?}: input already in this order should spill exactly one run, got {}",
+            stats.runs_written
+        );
+        assert_eq!(stats.total_records, stats.output_records, "{order:?}: lost records");
+        assert_eq!(count_bam_records(&output), 600, "{order:?}: wrong record count");
+        assert_sorted_in(order, &output);
+    }
+
+    /// Every sort order: input NOT in the requested order must not collapse.
+    /// This is the guard against run formation appending where it has no right to.
+    #[rstest::rstest]
+    #[case::coordinate(SortOrder::Coordinate)]
+    #[case::queryname_lex(SortOrder::Queryname(QuerynameComparator::Lexicographic))]
+    #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
+    #[case::template_coordinate(SortOrder::TemplateCoordinate)]
+    fn test_unsorted_input_never_collapses_to_one_run(#[case] order: SortOrder) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Descending coordinates with names that ascend independently, so the
+        // input is out of order for coordinate and template-coordinate, and its
+        // name order does not track its coordinate order either.
+        let input = build_shuffled_bam(dir.path(), 300);
+        let output = dir.path().join("output.bam");
+
+        let stats = run_sort(order, &input, &output, SPILL_MEMORY);
+
+        assert!(
+            stats.runs_written >= 2,
+            "{order:?}: unsorted input must not collapse into one run, got {}",
+            stats.runs_written
+        );
+        assert_eq!(stats.total_records, stats.output_records, "{order:?}: lost records");
+        assert_eq!(count_bam_records(&output), 600, "{order:?}: wrong record count");
+        assert_sorted_in(order, &output);
+    }
+
+    /// Every sort order: run formation must not change the output bytes.
+    ///
+    /// The appending path and the no-spill path must agree byte for byte. This is
+    /// the strongest available check -- it subsumes ordering, and for template it
+    /// is what confirms the buffer's lane-wise radix sort and the merge's
+    /// `K::cmp` agree, which run formation depends on.
+    #[rstest::rstest]
+    #[case::coordinate(SortOrder::Coordinate)]
+    #[case::queryname_lex(SortOrder::Queryname(QuerynameComparator::Lexicographic))]
+    #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
+    #[case::template_coordinate(SortOrder::TemplateCoordinate)]
+    fn test_run_formation_output_is_byte_identical(#[case] order: SortOrder) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let presorted = presorted_in(dir.path(), order, 300);
+
+        let spilled = dir.path().join("spilled.bam");
+        let in_memory = dir.path().join("in_memory.bam");
+
+        let spilled_stats = run_sort(order, &presorted, &spilled, SPILL_MEMORY);
+        assert_eq!(spilled_stats.runs_written, 1, "{order:?}: expected the appending path");
+
+        let in_memory_stats = run_sort(order, &presorted, &in_memory, NO_SPILL_MEMORY);
+        assert_eq!(in_memory_stats.runs_written, 0, "{order:?}: expected the no-spill path");
+
+        assert_eq!(
+            std::fs::read(&spilled).expect("read spilled"),
+            std::fs::read(&in_memory).expect("read in-memory"),
+            "{order:?}: appending runs changed the output bytes"
+        );
+    }
+
+    /// A BAM whose coordinates descend while its names ascend, so it is out of
+    /// order under every sort order this engine supports.
+    fn build_shuffled_bam(dir: &std::path::Path, num_pairs: usize) -> PathBuf {
+        use fgumi_sam::SamBuilder;
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let descending = num_pairs - 1 - i;
+            let _ = builder
+                .add_pair()
+                // Names descend too, so queryname order is also violated.
+                .name(&format!("read{descending:05}"))
+                .start1(descending * 200 + 1)
+                .start2(descending * 200 + 101)
+                .build();
+        }
+        let input = dir.join("shuffled.bam");
+        builder.write_bam(&input).expect("write bam");
+        input
+    }
+
+    /// Build a coordinate-ascending BAM: names and positions both increase.
+    ///
+    /// The starting point for every run-formation test. Tests that need input out
+    /// of order sort this into the order under test first (`presorted_in`) or use
+    /// [`build_shuffled_bam`].
+    fn build_ordered_bam(dir: &std::path::Path, num_pairs: usize) -> PathBuf {
+        use fgumi_sam::SamBuilder;
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let n = i;
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:05}"))
+                .start1(n * 200 + 1)
+                .start2(n * 200 + 101)
+                .build();
+        }
+        let input = dir.join("input.bam");
+        builder.write_bam(&input).expect("write bam");
+        input
+    }
+
+    /// Build a coordinate BAM that ascends, drops once, then ascends again.
+    ///
+    /// The descent is placed past the first spill boundary so it closes an open
+    /// run rather than landing inside the first chunk, where sorting would
+    /// absorb it.
+    fn build_descent_bam(dir: &std::path::Path, num_pairs: usize) -> PathBuf {
+        use fgumi_sam::SamBuilder;
+        let mut builder = SamBuilder::new();
+        let half = num_pairs / 2;
+        for i in 0..num_pairs {
+            // Second half restarts low, so exactly one chunk boundary sees a key
+            // below the open run's last key.
+            let n = if i < half { i } else { i - half };
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:05}"))
+                .start1(n * 200 + 1)
+                .start2(n * 200 + 101)
+                .build();
+        }
+        let input = dir.join("descent.bam");
+        builder.write_bam(&input).expect("write bam");
+        input
+    }
+
+    /// The case that distinguishes run formation from both extremes: a descent
+    /// closes the open run and opens exactly one more. Neither the all-sorted nor
+    /// the reverse-sorted test reaches [`RunFormer::place`]'s fresh-path branch
+    /// while a run is open -- one never leaves it, the other never enters it.
+    #[test]
+    fn test_descent_opens_exactly_one_more_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = build_descent_bam(dir.path(), 300);
+        let output = dir.path().join("output.bam");
+
+        let stats = run_sort(SortOrder::Coordinate, &input, &output, SPILL_MEMORY);
+
+        assert!(
+            stats.runs_written >= 2,
+            "a mid-stream descent must close the open run, got {} run(s)",
+            stats.runs_written
+        );
+        assert_eq!(stats.total_records, stats.output_records, "sort must not lose records");
+        assert_eq!(count_bam_records(&output), 600);
+        assert_sorted_in(SortOrder::Coordinate, &output);
+    }
+
+    /// Consolidation can merge the open run away, leaving `RunFormer` holding a
+    /// path that no longer means what it did. Appending there would duplicate or
+    /// drop records, so exercise it with consolidation actually enabled --
+    /// every other run-formation test disables it.
+    ///
+    /// Parameterized over every order because each reaches
+    /// [`RunFormer::place`]'s consolidation check with a different key type
+    /// through the same generic [`chunk_bounds`].
+    #[rstest::rstest]
+    #[case::coordinate(SortOrder::Coordinate)]
+    #[case::queryname_lex(SortOrder::Queryname(QuerynameComparator::Lexicographic))]
+    #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
+    #[case::template_coordinate(SortOrder::TemplateCoordinate)]
+    fn test_consolidation_while_a_run_is_open(#[case] order: SortOrder) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = build_descent_bam(dir.path(), 400);
+        let output = dir.path().join("output.bam");
+
+        let stats = RawExternalSorter::new(order)
+            .memory_limit(8 * 1024)
+            .max_temp_files(2) // small enough that consolidation can swallow the open run
+            .threads(1)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output)
+            .expect("sort with consolidation should succeed");
+
+        assert_eq!(stats.total_records, stats.output_records, "{order:?}: lost records");
+        assert_eq!(count_bam_records(&output), 800, "{order:?}: wrong record count");
+        assert_sorted_in(order, &output);
+    }
+
+    /// Appending must work for both spill codecs. Zstd skips `ZSPILL_MAGIC` on
+    /// append -- a second magic mid-file would be read as frame data -- and that
+    /// branch is otherwise untested.
+    #[rstest::rstest]
+    #[case::bgzf(crate::codec::SpillCodec::Bgzf, 0)]
+    #[case::zstd(crate::codec::SpillCodec::Zstd, 1)]
+    fn test_append_across_spill_codecs(
+        #[case] codec: crate::codec::SpillCodec,
+        #[case] temp_compression: u32,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = build_ordered_bam(dir.path(), 300);
+        let output = dir.path().join("output.bam");
+
+        let stats = RawExternalSorter::new(SortOrder::Coordinate)
+            .memory_limit(8 * 1024)
+            .max_temp_files(0)
+            .threads(1)
+            .spill_codec(codec)
+            .temp_compression(temp_compression)
+            .output_compression(0)
+            .sort(&input, &output)
+            .expect("sort should succeed");
+
+        assert_eq!(stats.runs_written, 1, "sorted input should collapse to one run");
+        assert_eq!(stats.total_records, stats.output_records, "sort must not lose records");
+        assert_eq!(count_bam_records(&output), 600);
+        assert_sorted_in(SortOrder::Coordinate, &output);
+    }
+
+    /// The indexed path got run formation too, so cover appending there: the
+    /// merge sees one source instead of many while still emitting a BAI.
+    #[test]
+    fn test_appending_run_with_write_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = build_ordered_bam(dir.path(), 300);
+        let output = dir.path().join("output.bam");
+
+        let stats = RawExternalSorter::new(SortOrder::Coordinate)
+            .memory_limit(8 * 1024)
+            .max_temp_files(0)
+            .threads(1)
+            .write_index(true)
+            .spill_codec(crate::codec::SpillCodec::Bgzf)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output)
+            .expect("indexed sort should succeed");
+
+        assert_eq!(stats.runs_written, 1, "sorted input should collapse to one run");
+        assert_eq!(stats.total_records, stats.output_records, "sort must not lose records");
+        assert_eq!(count_bam_records(&output), 600);
+        assert!(output.with_extension("bam.bai").exists(), "index should be written");
+    }
+
+    /// Verifies that sort with many chunks exercises the pool-integrated merge
+    /// readers during the final merge phase (not just consolidation).
     #[rstest::rstest]
     #[case::coordinate(SortOrder::Coordinate)]
     #[case::queryname(SortOrder::Queryname(QuerynameComparator::default()))]
@@ -6744,12 +7556,18 @@ mod tests {
 
         let num_pairs = 200;
         let mut builder = SamBuilder::new();
+        // Emit descending coordinates so the input is NOT already in coordinate
+        // order. Natural run formation appends a chunk to the open run whenever
+        // its keys all sort after it, so ascending input collapses to a single
+        // run -- and a single source exercises neither the k-way merge nor the
+        // reader semaphore this test exists to cover.
         for i in 0..num_pairs {
+            let descending = num_pairs - 1 - i;
             let _ = builder
                 .add_pair()
-                .name(&format!("read{i}"))
-                .start1(i * 200 + 1)
-                .start2(i * 200 + 101)
+                .name(&format!("read{descending:05}"))
+                .start1(descending * 200 + 1)
+                .start2(descending * 200 + 101)
                 .build();
         }
 
@@ -6774,9 +7592,9 @@ mod tests {
             .expect("sort should succeed");
 
         assert!(
-            stats.chunks_written >= 2,
+            stats.runs_written >= 2,
             "expected multiple chunks to exercise merge, got {}",
-            stats.chunks_written
+            stats.runs_written
         );
 
         let expected = (num_pairs * 2) as u64;
@@ -6946,9 +7764,9 @@ mod tests {
             .sort(&input, &output)
             .expect("sort should succeed");
         assert!(
-            stats.chunks_written > 0,
+            stats.runs_written > 0,
             "test must spill to disk so the oversized record is read back through the \
-             PoolDisk merge (slow path); got chunks_written = 0"
+             PoolDisk merge (slow path); got runs_written = 0"
         );
 
         let mut reader =
@@ -7090,7 +7908,7 @@ mod tests {
         assert_eq!(file_stats.total_records, stream_stats.total_records);
         assert_eq!(file_stats.output_records, stream_stats.output_records);
         assert_eq!(
-            file_stats.chunks_written, stream_stats.chunks_written,
+            file_stats.runs_written, stream_stats.runs_written,
             "stream path should spill exactly like the file path"
         );
         assert_eq!(
@@ -7547,12 +8365,15 @@ mod tests {
 
         let num_pairs = 200;
         let mut builder = SamBuilder::new();
+        // Descending coordinates so run formation does not collapse the input
+        // to one run; this test compares multi-chunk spill across temp dirs.
         for i in 0..num_pairs {
+            let descending = num_pairs - 1 - i;
             let _ = builder
                 .add_pair()
-                .name(&format!("read{i:05}"))
-                .start1(i * 200 + 1)
-                .start2(i * 200 + 101)
+                .name(&format!("read{descending:05}"))
+                .start1(descending * 200 + 1)
+                .start2(descending * 200 + 101)
                 .build();
         }
 
@@ -7576,7 +8397,7 @@ mod tests {
             .sort(&input, &output_multi)
             .expect("multi-dir sort should succeed");
 
-        assert!(stats_multi.chunks_written >= 2, "expected multiple spill chunks");
+        assert!(stats_multi.runs_written >= 2, "expected multiple spill runs");
 
         RawExternalSorter::new(SortOrder::Coordinate)
             .memory_limit(8 * 1024)
@@ -7631,7 +8452,7 @@ mod tests {
             .sort(&input, &output)
             .expect("indexed coordinate sort should succeed");
 
-        assert_eq!(stats.chunks_written, 0, "expected no spill for the in-memory path");
+        assert_eq!(stats.runs_written, 0, "expected no spill for the in-memory path");
         assert_eq!(collect_read_names(&output).len(), 40, "record count mismatch");
 
         let bai = fgumi_bam_io::bai_sidecar_path(&output);
@@ -7658,14 +8479,18 @@ mod tests {
         // so the index-emitting merge runs over Disk sources + the in-memory
         // chunk simultaneously (the mixed-source path the refactor must keep
         // byte-identical).
+        // Descending coordinates: the point is a merge over several Disk sources
+        // plus the in-memory chunk, and natural run formation would fold
+        // already-ascending input into one run, leaving nothing to merge.
         let num_pairs = 300;
         let mut builder = SamBuilder::new();
         for i in 0..num_pairs {
+            let descending = num_pairs - 1 - i;
             let _ = builder
                 .add_pair()
-                .name(&format!("read{i:05}"))
-                .start1(i * 200 + 1)
-                .start2(i * 200 + 101)
+                .name(&format!("read{descending:05}"))
+                .start1(descending * 200 + 1)
+                .start2(descending * 200 + 101)
                 .build();
         }
 
@@ -7684,7 +8509,7 @@ mod tests {
             .sort(&input, &output)
             .expect("indexed coordinate sort should succeed");
 
-        assert!(stats.chunks_written >= 2, "expected multiple spill chunks");
+        assert!(stats.runs_written >= 2, "expected multiple spill runs");
 
         // All records preserved.
         let names = collect_read_names(&output);
@@ -7755,7 +8580,7 @@ mod tests {
             .output_compression(0)
             .sort(&input, &output)
             .expect("indexed coordinate sort should succeed");
-        assert!(stats.chunks_written > 0, "test must spill so the indexed pool merge runs");
+        assert!(stats.runs_written > 0, "test must spill so the indexed pool merge runs");
 
         // Every record (including the oversized one) survives the merge.
         assert_eq!(count_bam_records(&output), 161);
@@ -8482,7 +9307,7 @@ mod tests {
                 .key_types(spec)
                 .sort(&input, &out)
                 .expect("sort");
-            (collect_record_bytes(&out), stats.chunks_written)
+            (collect_record_bytes(&out), stats.runs_written)
         };
 
         let (baseline, base_chunks) = sort_spilling("spill_full", KeyTypesSpec::Full);
@@ -8537,7 +9362,7 @@ mod tests {
                 .key_types(spec)
                 .sort(&input, &out)
                 .expect("sort");
-            (collect_record_bytes(&out), stats.chunks_written)
+            (collect_record_bytes(&out), stats.runs_written)
         };
 
         let (baseline, base_chunks) = sort_spilling("spill_full_baseline", KeyTypesSpec::Full);

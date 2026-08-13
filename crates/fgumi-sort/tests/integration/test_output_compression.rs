@@ -192,7 +192,7 @@ struct SortRun {
 }
 
 /// Sorts `input` in `sort_order` under `run` and returns
-/// `(output_size_bytes, chunks_written, decoded_records)`.
+/// `(output_size_bytes, runs_written, decoded_records)`.
 ///
 /// `expected` is the independent baseline the output is checked against — the
 /// multiset of the *input* records, decoded straight from the input BAM without
@@ -246,13 +246,13 @@ fn sort_at_level(
         "level {output_compression} output is not in {sort_order:?} order"
     );
     let size = std::fs::metadata(output).expect("output metadata").len();
-    (size, stats.chunks_written, records)
+    (size, stats.runs_written, records)
 }
 
 /// `output_compression` must change the size of the written BAM.
 ///
 /// Both merge paths are covered: a memory limit large enough to hold everything
-/// (no spill, `chunks_written == 0`) and one small enough to force spill files.
+/// (no spill, `runs_written == 0`) and one small enough to force spill files.
 /// Only the in-memory case was broken — it never entered Phase 2, and back then
 /// the phase was what chose the compressor, so the pool used the Phase 1 spill
 /// one.
@@ -302,22 +302,22 @@ fn test_output_compression_level_reaches_the_output_bam(
     };
 
     let uncompressed = dir.path().join("level0.bam");
-    let (size_level_0, chunks_0, records_level_0) =
+    let (size_level_0, runs_0, records_level_0) =
         sort_at_level(sort_order, &input, &uncompressed, run_at(0), &expected);
 
     let compressed = dir.path().join("level9.bam");
-    let (size_level_9, chunks_9, records_level_9) =
+    let (size_level_9, runs_9, records_level_9) =
         sort_at_level(sort_order, &input, &compressed, run_at(9), &expected);
 
     assert_eq!(
-        chunks_0 > 0,
+        runs_0 > 0,
         expect_spill,
-        "expected spill={expect_spill}, got chunks_written={chunks_0} at level 0 ({sort_order:?})"
+        "expected spill={expect_spill}, got runs_written={runs_0} at level 0 ({sort_order:?})"
     );
     assert_eq!(
-        chunks_9 > 0,
+        runs_9 > 0,
         expect_spill,
-        "expected spill={expect_spill}, got chunks_written={chunks_9} at level 9 ({sort_order:?})"
+        "expected spill={expect_spill}, got runs_written={runs_9} at level 9 ({sort_order:?})"
     );
 
     // Both runs were already checked against the independent baseline above;
@@ -388,10 +388,10 @@ fn test_temp_compression_does_not_reach_the_output_bam(
             temp_compression,
             write_index,
         };
-        let (size, chunks, scanned) = sort_at_level(sort_order, &input, &output, run, &expected);
+        let (size, runs, scanned) = sort_at_level(sort_order, &input, &output, run, &expected);
         assert!(
-            chunks > 0,
-            "test must exercise the spilling path, but no chunks were written \
+            runs > 0,
+            "test must exercise the spilling path, but no spill runs were written \
              ({sort_order:?}, temp_compression={temp_compression})"
         );
 
