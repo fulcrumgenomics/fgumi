@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Breaking:** `dedup --metrics` gains eleven columns: one `filtered_*` column per template
+  filter reason, `filtered_templates` for the total, and `passthrough_templates` for the
+  `--include-unmapped` templates that bypass the filter. Consumers that parse the file
+  positionally must be updated; consumers keyed on column names are unaffected. Note that
+  `fgumi compare metrics` treats a column-set difference as `DIFFER`, so comparing a
+  pre-change dedup metrics file against a post-change one will fail by design.
+
+  These columns count *templates*, whereas the `discarded_*` columns of `group`'s
+  fgbio-shaped `.grouping_metrics.txt` count *primary records*. `group`'s output is unchanged.
+
 - **Breaking:** consensus downsampling now selects which reads to retain by a hash of the read
   name rather than by shuffling a seeded random number generator. This affects `simplex
   --max-reads`, `duplex --max-reads-per-strand`, and `codec --max-reads`.
@@ -36,6 +46,14 @@ All notable changes to this project will be documented in this file.
   `--max-reads 3` (105,478 → 105,539). Runs that do not set `--max-reads` are unaffected.
 
 ### Bug Fixes
+
+- `dedup --metrics` now reports the templates dropped by its template filter, broken out by
+  reason. `dedup` is a read filter as well as a duplicate marker, but the drop counts were
+  collected, merged across workers, and then discarded at the serialization boundary: a run
+  that filtered out every input template wrote a row of zeros and logged only "Deduplication
+  complete: 0 templates", with nothing to indicate records had been dropped or why. A
+  per-reason summary is now also logged, so the drops are visible without `--metrics`
+  ([#739](https://github.com/fulcrumgenomics/fgumi/issues/739)).
 
 - `duplex --max-reads-per-strand 0` is now rejected at startup. It previously exited 0 having
   written an empty BAM, because a cap of zero empties every strand. `simplex` and `codec`

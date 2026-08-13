@@ -27,9 +27,17 @@ A header row followed by a single data row. Used by `dedup`, `codec`, `duplex-me
 `simplex-metrics`, and `group`.
 
 ```text
-total_templates	unique_templates	duplicate_templates	duplicate_rate
-25000	18750	6250	0.25
+filtered_templates	filtered_low_mapping_quality	…	total_templates	unique_templates	duplicate_templates	duplicate_rate
+1200	1200	…	25000	18750	6250	0.25
 ```
+
+The example above is abridged; see
+[DeduplicationMetrics](../metrics/deduplication-metrics.md) for the full column list.
+
+Note that `dedup` and `group` count their discards in **different units**. `dedup`'s
+`filtered_*` columns count *templates*, while `group`'s `discarded_*` columns count *primary
+records* — the latter match fgbio's `UmiGroupingMetric` schema exactly, so they are readable
+by fgbio's `Metric.read`. Do not compare the two files' discard counts directly.
 
 ### Vertical Key-Value (Simplex/Duplex)
 

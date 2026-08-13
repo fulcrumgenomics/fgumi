@@ -146,31 +146,50 @@ pub fn find_int_tag(aux_data: &[u8], tag: impl AsTagBytes) -> Option<i64> {
     extract_int_value(aux_data, p, val_type)
 }
 
+/// Borrow the `width` value bytes of the tag entry that starts at `p`.
+///
+/// The value begins at `p + 3`, after the two tag bytes and the type byte. Returns
+/// `None` if that range overflows `usize` or runs past the end of `aux_data`.
+///
+/// Every offset is computed with checked arithmetic because `p` reaches
+/// `extract_int_value` from the caller rather than from a `find_tag_position` scan:
+/// a position near `usize::MAX` would otherwise wrap and decode unrelated bytes.
+#[inline]
+fn tag_value_bytes(aux_data: &[u8], p: usize, width: usize) -> Option<&[u8]> {
+    let start = p.checked_add(3)?;
+    let end = start.checked_add(width)?;
+    aux_data.get(start..end)
+}
+
 /// Extract an integer value at position `p` with the given type byte.
 ///
-/// Shared by [`find_int_tag`] and [`find_mi_tag`].
-fn extract_int_value(aux_data: &[u8], p: usize, val_type: u8) -> Option<i64> {
+/// Shared by [`find_int_tag`] and `find_mi_tag`, and by callers that walk the
+/// aux block themselves and already hold the tag's position and type byte — they
+/// get the decode ladder without paying for a second `find_tag_position` scan.
+///
+/// Returns `None` for a non-integer type byte, and for any `p` whose value bytes
+/// do not lie wholly within `aux_data`.
+#[must_use]
+pub fn extract_int_value(aux_data: &[u8], p: usize, val_type: u8) -> Option<i64> {
     match val_type {
-        b'c' if p + 4 <= aux_data.len() => Some(i64::from(aux_data[p + 3].cast_signed())),
-        b'C' if p + 4 <= aux_data.len() => Some(i64::from(aux_data[p + 3])),
-        b's' if p + 5 <= aux_data.len() => {
-            Some(i64::from(i16::from_le_bytes([aux_data[p + 3], aux_data[p + 4]])))
+        b'c' => Some(i64::from(tag_value_bytes(aux_data, p, 1)?[0].cast_signed())),
+        b'C' => Some(i64::from(tag_value_bytes(aux_data, p, 1)?[0])),
+        b's' => {
+            let bytes = tag_value_bytes(aux_data, p, 2)?;
+            Some(i64::from(i16::from_le_bytes([bytes[0], bytes[1]])))
         }
-        b'S' if p + 5 <= aux_data.len() => {
-            Some(i64::from(u16::from_le_bytes([aux_data[p + 3], aux_data[p + 4]])))
+        b'S' => {
+            let bytes = tag_value_bytes(aux_data, p, 2)?;
+            Some(i64::from(u16::from_le_bytes([bytes[0], bytes[1]])))
         }
-        b'i' if p + 7 <= aux_data.len() => Some(i64::from(i32::from_le_bytes([
-            aux_data[p + 3],
-            aux_data[p + 4],
-            aux_data[p + 5],
-            aux_data[p + 6],
-        ]))),
-        b'I' if p + 7 <= aux_data.len() => Some(i64::from(u32::from_le_bytes([
-            aux_data[p + 3],
-            aux_data[p + 4],
-            aux_data[p + 5],
-            aux_data[p + 6],
-        ]))),
+        b'i' => {
+            let bytes = tag_value_bytes(aux_data, p, 4)?;
+            Some(i64::from(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])))
+        }
+        b'I' => {
+            let bytes = tag_value_bytes(aux_data, p, 4)?;
+            Some(i64::from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])))
+        }
         _ => None,
     }
 }
@@ -2411,6 +2430,55 @@ mod tests {
     fn test_find_int_tag_not_found() {
         let aux = [b'X', b'Y', b'C', 10];
         assert_eq!(find_int_tag(&aux, b"ZZ"), None);
+    }
+
+    // ========================================================================
+    // extract_int_value bounds tests
+    // ========================================================================
+
+    /// `extract_int_value` is public and takes `p` from the caller rather than from a
+    /// `find_tag_position` scan, so a position near `usize::MAX` reaches the decode
+    /// ladder. With unchecked `p + 3` / `p + 4` / `p + 7` the guard wraps to a small
+    /// number, passes the length check, and the ladder then decodes bytes from a
+    /// wrapped offset — the wrong value, silently, in a release build.
+    #[rstest]
+    #[case::signed_byte(b'c')]
+    #[case::unsigned_byte(b'C')]
+    #[case::signed_short(b's')]
+    #[case::unsigned_short(b'S')]
+    #[case::signed_int(b'i')]
+    #[case::unsigned_int(b'I')]
+    fn test_extract_int_value_rejects_positions_that_overflow(#[case] type_byte: u8) {
+        let aux = [b'X', b'Y', type_byte, 1, 2, 3, 4, 5];
+        // Every `p` within a value width of the top of the address space: `p + 3`,
+        // `p + 4`, and `p + 7` all wrap for at least one of these.
+        for delta in 0..8usize {
+            let p = usize::MAX - delta;
+            assert_eq!(
+                extract_int_value(&aux, p, type_byte),
+                None,
+                "type {} at p = usize::MAX - {delta} must not decode",
+                type_byte as char
+            );
+        }
+    }
+
+    /// The in-bounds ladder is unchanged: a value that ends exactly at the end of the
+    /// aux block still decodes, and one byte short of that still does not.
+    #[rstest]
+    #[case::signed_byte(b'c', 1)]
+    #[case::unsigned_byte(b'C', 1)]
+    #[case::signed_short(b's', 2)]
+    #[case::unsigned_short(b'S', 2)]
+    #[case::signed_int(b'i', 4)]
+    #[case::unsigned_int(b'I', 4)]
+    fn test_extract_int_value_boundary(#[case] type_byte: u8, #[case] width: usize) {
+        let mut exact = vec![b'X', b'Y', type_byte];
+        exact.extend(std::iter::repeat_n(0u8, width));
+        assert_eq!(extract_int_value(&exact, 0, type_byte), Some(0));
+
+        let truncated = &exact[..exact.len() - 1];
+        assert_eq!(extract_int_value(truncated, 0, type_byte), None);
     }
 
     // --- Per-type find_int_tag tests ---

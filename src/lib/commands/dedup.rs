@@ -23,16 +23,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
-use crate::grouper::{
-    FilterMetrics, RawPositionGroup, RecordPositionGrouper, build_templates_from_records,
-};
+use crate::grouper::{RawPositionGroup, RecordPositionGrouper, build_templates_from_records};
 use crate::logging::OperationTimer;
+use crate::metrics::DeduplicationMetrics;
 use crate::metrics::group::FamilySizeMetrics;
+use crate::metrics::{TemplateFilterCounts, TemplateFilterReason};
 use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
 use crate::sam::is_template_coordinate_sorted;
 use crate::template::Template;
-use crate::umi::{UmiValidation, validate_umi};
+use crate::template_filter::{
+    TemplateFilterConfig, filter_template, template_has_malformed_record,
+    template_is_fully_unmapped,
+};
 use crate::unified_pipeline::{
     BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate,
     run_bam_pipeline_from_reader_with_mi_assign,
@@ -48,7 +51,6 @@ use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 
 use crate::commands::command::Command;
 use crate::commands::common::{
@@ -57,7 +59,7 @@ use crate::commands::common::{
 };
 use crate::sam::TC_TAG;
 use fgumi_raw_bam;
-use fgumi_raw_bam::RawRecordView;
+use fgumi_raw_bam::{RawRecord, RawRecordView};
 
 /// Duplicate flag bit in SAM flags (0x400)
 const DUPLICATE_FLAG: u16 = 0x400;
@@ -66,16 +68,23 @@ const DUPLICATE_FLAG: u16 = 0x400;
 // Metrics
 //////////////////////////////////////////////////////////////////////////////
 
-/// Metrics collected during deduplication.
+/// Per-worker deduplication counters, merged into a single total and then
+/// rendered into the serializable metrics schema for output.
+///
+/// Named `Counts` rather than `Metrics` to keep it distinct from the file
+/// schema: this is the accumulator, that is the file.
 #[derive(Debug, Default, Clone)]
-pub struct DedupMetrics {
-    /// Total templates processed
+pub struct DedupCounts {
+    /// Templates that passed the filter (excludes filtered)
+    ///
+    /// Not "written": under `--remove-duplicates` the duplicates are dropped at
+    /// serialization, after this counter has already taken them.
     pub total_templates: u64,
     /// Templates marked as duplicates
     pub duplicate_templates: u64,
     /// Templates kept (not duplicates)
     pub unique_templates: u64,
-    /// Total reads processed
+    /// Reads in templates that passed the filter (excludes filtered)
     pub total_reads: u64,
     /// Reads marked as duplicates
     pub duplicate_reads: u64,
@@ -87,13 +96,15 @@ pub struct DedupMetrics {
     pub supplementary_reads: u64,
     /// Secondary/supplementary without `tc` tag
     pub missing_tc_tag: u64,
-    /// Filter metrics from position grouping
-    pub filter_metrics: FilterMetrics,
+    /// Per-reason counts from the template filter
+    pub filter_counts: TemplateFilterCounts,
+    /// Templates emitted untouched by `--include-unmapped` (bypass the filter)
+    pub passthrough_templates: u64,
 }
 
-impl DedupMetrics {
-    /// Merge another `DedupMetrics` into this one.
-    pub fn merge(&mut self, other: &DedupMetrics) {
+impl DedupCounts {
+    /// Merge another `DedupCounts` into this one.
+    pub fn merge(&mut self, other: &DedupCounts) {
         self.total_templates += other.total_templates;
         self.duplicate_templates += other.duplicate_templates;
         self.unique_templates += other.unique_templates;
@@ -103,7 +114,8 @@ impl DedupMetrics {
         self.secondary_reads += other.secondary_reads;
         self.supplementary_reads += other.supplementary_reads;
         self.missing_tc_tag += other.missing_tc_tag;
-        self.filter_metrics.merge(&other.filter_metrics);
+        self.filter_counts.merge(&other.filter_counts);
+        self.passthrough_templates += other.passthrough_templates;
     }
 
     /// Calculate duplicate rate.
@@ -117,37 +129,33 @@ impl DedupMetrics {
     }
 }
 
-/// Serializable version of `DedupMetrics` for file output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DedupMetricsOutput {
-    total_templates: u64,
-    unique_templates: u64,
-    duplicate_templates: u64,
-    // DXM3-04: format the one fraction column like fgbio's DecimalFormat, matching
-    // the float serialization #504 wired onto the fgumi-metrics-crate structs.
-    #[serde(with = "fgumi_metrics::float")]
-    duplicate_rate: f64,
-    total_reads: u64,
-    unique_reads: u64,
-    duplicate_reads: u64,
-    secondary_reads: u64,
-    supplementary_reads: u64,
-    missing_tc_tag: u64,
-}
-
-impl From<&DedupMetrics> for DedupMetricsOutput {
-    fn from(m: &DedupMetrics) -> Self {
+impl From<&DedupCounts> for DeduplicationMetrics {
+    fn from(counts: &DedupCounts) -> Self {
+        use TemplateFilterReason as Reason;
+        let filter = &counts.filter_counts;
         Self {
-            total_templates: m.total_templates,
-            unique_templates: m.unique_templates,
-            duplicate_templates: m.duplicate_templates,
-            duplicate_rate: m.duplicate_rate(),
-            total_reads: m.total_reads,
-            unique_reads: m.unique_reads,
-            duplicate_reads: m.duplicate_reads,
-            secondary_reads: m.secondary_reads,
-            supplementary_reads: m.supplementary_reads,
-            missing_tc_tag: m.missing_tc_tag,
+            filtered_templates: filter.total_rejected_templates(),
+            filtered_malformed_record: filter.rejected_templates(Reason::MalformedRecord),
+            filtered_no_primary_reads: filter.rejected_templates(Reason::NoPrimaryReads),
+            filtered_unmapped: filter.rejected_templates(Reason::Unmapped),
+            filtered_not_passing_filter: filter.rejected_templates(Reason::NotPassingFilter),
+            filtered_low_mapping_quality: filter.rejected_templates(Reason::LowMappingQuality),
+            filtered_low_mate_mapping_quality: filter
+                .rejected_templates(Reason::LowMateMappingQuality),
+            filtered_missing_umi: filter.rejected_templates(Reason::MissingUmi),
+            filtered_ns_in_umi: filter.rejected_templates(Reason::NsInUmi),
+            filtered_umi_too_short: filter.rejected_templates(Reason::UmiTooShort),
+            passthrough_templates: counts.passthrough_templates,
+            total_templates: counts.total_templates,
+            unique_templates: counts.unique_templates,
+            duplicate_templates: counts.duplicate_templates,
+            duplicate_rate: counts.duplicate_rate(),
+            total_reads: counts.total_reads,
+            unique_reads: counts.unique_reads,
+            duplicate_reads: counts.duplicate_reads,
+            secondary_reads: counts.secondary_reads,
+            supplementary_reads: counts.supplementary_reads,
+            missing_tc_tag: counts.missing_tc_tag,
         }
     }
 }
@@ -158,9 +166,9 @@ impl From<&DedupMetrics> for DedupMetricsOutput {
 
 /// Metrics collected per position group, aggregated after pipeline completion.
 #[derive(Default, Debug)]
-struct CollectedDedupMetrics {
+struct CollectedDedupCounts {
     /// Dedup-specific metrics
-    dedup_metrics: DedupMetrics,
+    dedup_counts: DedupCounts,
     /// Family size counts
     family_sizes: AHashMap<usize, u64>,
 }
@@ -176,7 +184,7 @@ pub struct ProcessedDedupGroup {
     /// Family size counts for this group.
     pub family_sizes: AHashMap<usize, u64>,
     /// Dedup metrics for this group.
-    pub dedup_metrics: DedupMetrics,
+    pub dedup_counts: DedupCounts,
     /// Total input records processed (for progress tracking).
     pub input_record_count: u64,
     /// Number of distinct numeric `MoleculeId`s assigned in this group.
@@ -197,28 +205,12 @@ impl MemoryEstimate for ProcessedDedupGroup {
         self.templates.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
             + self.templates.capacity() * std::mem::size_of::<Template>()
             + self.family_sizes.capacity() * std::mem::size_of::<(usize, u64)>()
-            + std::mem::size_of::<DedupMetrics>()
     }
 }
 
 //////////////////////////////////////////////////////////////////////////////
 // Configuration
 //////////////////////////////////////////////////////////////////////////////
-
-/// Configuration for template filtering during deduplication.
-#[derive(Clone)]
-struct DedupFilterConfig {
-    /// UMI tag bytes (e.g., [b'R', b'X']).
-    umi_tag: [u8; 2],
-    /// Minimum mapping quality.
-    min_mapq: u8,
-    /// Whether to include non-PF reads.
-    include_non_pf: bool,
-    /// Minimum UMI length.
-    min_umi_length: Option<usize>,
-    /// Skip UMI validation; group by template coordinate, orientation-agnostically.
-    no_umi: bool,
-}
 
 //////////////////////////////////////////////////////////////////////////////
 // Duplicate scoring
@@ -293,163 +285,6 @@ fn score_template(template: &Template) -> i64 {
 // Template filtering (adapted from group command)
 //////////////////////////////////////////////////////////////////////////////
 
-/// Filter a template based on filtering criteria.
-/// Returns true if the template should be kept.
-fn filter_template(
-    template: &Template,
-    config: &DedupFilterConfig,
-    metrics: &mut FilterMetrics,
-) -> bool {
-    metrics.total_templates += 1;
-
-    // Fail closed when *any* record (primary, secondary, or supplementary) is
-    // shorter than the minimum BAM record length: a truncated record indicates
-    // corrupt input, so the template must be rejected rather than have the
-    // malformed record silently dropped (and later panic in RawRecordView::new
-    // on the dedup/serialize path).
-    if template.records().iter().any(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN) {
-        metrics.discarded_poor_alignment += 1;
-        return false;
-    }
-
-    let raw_r1 = template.r1();
-    let raw_r2 = template.r2();
-
-    if raw_r1.is_none() && raw_r2.is_none() {
-        metrics.discarded_poor_alignment += 1;
-        return false;
-    }
-
-    let both_unmapped = raw_r1
-        .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0)
-        && raw_r2
-            .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0);
-    if both_unmapped {
-        metrics.discarded_poor_alignment += 1;
-        return false;
-    }
-
-    // Phase 1: Flag-based checks
-    for raw in [raw_r1, raw_r2].into_iter().flatten() {
-        let flg = RawRecordView::new(raw).flags();
-
-        if !config.include_non_pf && (flg & fgumi_raw_bam::flags::QC_FAIL) != 0 {
-            metrics.discarded_non_pf += 1;
-            return false;
-        }
-
-        if (flg & fgumi_raw_bam::flags::UNMAPPED) == 0 {
-            let mapq = fgumi_raw_bam::mapq(raw);
-            if mapq < config.min_mapq {
-                metrics.discarded_poor_alignment += 1;
-                return false;
-            }
-        }
-    }
-
-    // Phase 2: Single-pass tag lookups (MQ + UMI in one aux scan)
-    for raw in [raw_r1, raw_r2].into_iter().flatten() {
-        let flg = RawRecordView::new(raw).flags();
-        let aux = fgumi_raw_bam::aux_data_slice(raw);
-        let check_mq = (flg & fgumi_raw_bam::flags::MATE_UNMAPPED) == 0;
-        let check_umi = !config.no_umi;
-
-        let mut found_mq: Option<i64> = None;
-        let mut found_umi: Option<&[u8]> = None;
-        let mut p = 0;
-        while p + 3 <= aux.len() {
-            let t = [aux[p], aux[p + 1]];
-            let val_type = aux[p + 2];
-
-            if check_umi && t == config.umi_tag && val_type == b'Z' {
-                let start = p + 3;
-                if let Some(end) = aux[start..].iter().position(|&b| b == 0) {
-                    found_umi = Some(&aux[start..start + end]);
-                    p = start + end + 1;
-                } else {
-                    break;
-                }
-                if !check_mq || found_mq.is_some() {
-                    break;
-                }
-                continue;
-            }
-
-            if check_mq && t == *SamTag::MQ {
-                found_mq = match val_type {
-                    b'C' if p + 3 < aux.len() => Some(i64::from(aux[p + 3])),
-                    b'c' if p + 3 < aux.len() => Some(i64::from(aux[p + 3] as i8)),
-                    b'S' if p + 5 <= aux.len() => {
-                        Some(i64::from(u16::from_le_bytes([aux[p + 3], aux[p + 4]])))
-                    }
-                    b's' if p + 5 <= aux.len() => {
-                        Some(i64::from(i16::from_le_bytes([aux[p + 3], aux[p + 4]])))
-                    }
-                    b'I' if p + 7 <= aux.len() => Some(i64::from(u32::from_le_bytes([
-                        aux[p + 3],
-                        aux[p + 4],
-                        aux[p + 5],
-                        aux[p + 6],
-                    ]))),
-                    b'i' if p + 7 <= aux.len() => Some(i64::from(i32::from_le_bytes([
-                        aux[p + 3],
-                        aux[p + 4],
-                        aux[p + 5],
-                        aux[p + 6],
-                    ]))),
-                    _ => None,
-                };
-            }
-
-            if let Some(size) = fgumi_raw_bam::tag_value_size(val_type, &aux[p + 3..]) {
-                p += 3 + size;
-            } else {
-                break;
-            }
-            if (!check_umi || found_umi.is_some()) && (!check_mq || found_mq.is_some()) {
-                break;
-            }
-        }
-
-        if check_mq && let Some(mq) = found_mq {
-            // Compare as signed so a negative MQ (e.g., MQ:c:-1) fails the filter
-            // rather than wrapping to 255 via `as u8`.
-            if mq < i64::from(config.min_mapq) {
-                metrics.discarded_poor_alignment += 1;
-                return false;
-            }
-        }
-
-        // Skip UMI validation in no-umi mode
-        if config.no_umi {
-            continue;
-        }
-
-        if let Some(umi_bytes) = found_umi {
-            match validate_umi(umi_bytes) {
-                UmiValidation::ContainsN => {
-                    metrics.discarded_ns_in_umi += 1;
-                    return false;
-                }
-                UmiValidation::Valid(base_count) => {
-                    if let Some(min_len) = config.min_umi_length
-                        && base_count < min_len
-                    {
-                        metrics.discarded_umi_too_short += 1;
-                        return false;
-                    }
-                }
-            }
-        } else {
-            metrics.discarded_poor_alignment += 1;
-            return false;
-        }
-    }
-
-    metrics.accepted_templates += 1;
-    true
-}
-
 /// Returns `true` when a template has no mapped primary read (both mates unmapped,
 /// or a single unmapped read) and is not truncated/corrupt.
 ///
@@ -460,29 +295,45 @@ fn filter_template(
 /// so they still fall through to `filter_template` and are dropped — a corrupt record
 /// must never be passed through to the output.
 fn template_is_unmapped_passthrough(template: &Template) -> bool {
-    // A truncated record indicates corrupt input; leave it for `filter_template` to
-    // reject rather than emitting a malformed record.
-    if template.records().iter().any(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN) {
-        return false;
-    }
-
-    let raw_r1 = template.r1();
-    let raw_r2 = template.r2();
-
-    // A template with no primary read at all is a poor-alignment discard, not a
-    // pass-through; let `filter_template` account for it.
-    if raw_r1.is_none() && raw_r2.is_none() {
-        return false;
-    }
-
-    raw_r1.is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0)
-        && raw_r2
-            .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0)
+    // Both predicates are the shared filter's own, so the two cannot drift on what
+    // "malformed" or "unmapped" means. A truncated record is deliberately NOT a
+    // pass-through: it is left for `filter_template` to reject, so a corrupt record
+    // is never emitted verbatim. A template with no primary read at all is likewise
+    // left to the filter, which accounts for it as `NoPrimaryReads`.
+    !template_has_malformed_record(template) && template_is_fully_unmapped(template)
 }
 
 //////////////////////////////////////////////////////////////////////////////
 // UMI assignment (adapted from group command)
 //////////////////////////////////////////////////////////////////////////////
+
+/// Count one output record into `counts`: the read itself, whether it is secondary
+/// and/or supplementary, and whether a non-primary record is missing its `tc` tag.
+///
+/// Shared by both counting loops in `process_position_group` — the filtered templates
+/// and the `--include-unmapped` pass-throughs — so the two cannot drift on which
+/// records are checked. A missing `tc` on a non-primary record is a hard failure once
+/// the per-worker counts are merged, so a loop that counts non-primary reads without
+/// checking their `tc` tag is a hole in that check, not just an accounting gap.
+fn count_record(raw: &RawRecord, tc_tag_bytes: [u8; 2], counts: &mut DedupCounts) {
+    counts.total_reads += 1;
+    let flg = RawRecordView::new(raw.as_ref()).flags();
+    let is_secondary = (flg & fgumi_raw_bam::flags::SECONDARY) != 0;
+    let is_supplementary = (flg & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0;
+
+    if is_secondary {
+        counts.secondary_reads += 1;
+    }
+    if is_supplementary {
+        counts.supplementary_reads += 1;
+    }
+    if is_secondary || is_supplementary {
+        let aux = fgumi_raw_bam::aux_data_slice(raw);
+        if fgumi_raw_bam::find_tag_type(aux, tc_tag_bytes).is_none() {
+            counts.missing_tc_tag += 1;
+        }
+    }
+}
 
 /// Extract UMI for a read, handling paired UMI strategies.
 fn umi_for_read(umi: &str, is_r1_earlier: bool, assigner: &dyn UmiAssigner) -> Result<String> {
@@ -703,24 +554,24 @@ fn assign_umi_groups(
 ///
 /// Optimized with fast paths for small families (size 1-3) to avoid
 /// allocation and sorting overhead for the common case.
-fn mark_duplicates_in_family(templates: &mut [&mut Template], dedup_metrics: &mut DedupMetrics) {
+fn mark_duplicates_in_family(templates: &mut [&mut Template], dedup_counts: &mut DedupCounts) {
     match templates.len() {
         0 => return,
         1 => {
             // Single template - not a duplicate
-            dedup_metrics.unique_templates += 1;
+            dedup_counts.unique_templates += 1;
             return;
         }
         2 => {
             // Fast path for size 2 (very common case) - no allocation needed
             let s0 = score_template(templates[0]);
             let s1 = score_template(templates[1]);
-            dedup_metrics.unique_templates += 1;
-            dedup_metrics.duplicate_templates += 1;
+            dedup_counts.unique_templates += 1;
+            dedup_counts.duplicate_templates += 1;
             if s0 >= s1 {
-                mark_template_as_duplicate(templates[1], dedup_metrics);
+                mark_template_as_duplicate(templates[1], dedup_counts);
             } else {
-                mark_template_as_duplicate(templates[0], dedup_metrics);
+                mark_template_as_duplicate(templates[0], dedup_counts);
             }
             return;
         }
@@ -729,17 +580,17 @@ fn mark_duplicates_in_family(templates: &mut [&mut Template], dedup_metrics: &mu
             let s0 = score_template(templates[0]);
             let s1 = score_template(templates[1]);
             let s2 = score_template(templates[2]);
-            dedup_metrics.unique_templates += 1;
-            dedup_metrics.duplicate_templates += 2;
+            dedup_counts.unique_templates += 1;
+            dedup_counts.duplicate_templates += 2;
             if s0 >= s1 && s0 >= s2 {
-                mark_template_as_duplicate(templates[1], dedup_metrics);
-                mark_template_as_duplicate(templates[2], dedup_metrics);
+                mark_template_as_duplicate(templates[1], dedup_counts);
+                mark_template_as_duplicate(templates[2], dedup_counts);
             } else if s1 >= s0 && s1 >= s2 {
-                mark_template_as_duplicate(templates[0], dedup_metrics);
-                mark_template_as_duplicate(templates[2], dedup_metrics);
+                mark_template_as_duplicate(templates[0], dedup_counts);
+                mark_template_as_duplicate(templates[2], dedup_counts);
             } else {
-                mark_template_as_duplicate(templates[0], dedup_metrics);
-                mark_template_as_duplicate(templates[1], dedup_metrics);
+                mark_template_as_duplicate(templates[0], dedup_counts);
+                mark_template_as_duplicate(templates[1], dedup_counts);
             }
             return;
         }
@@ -755,21 +606,21 @@ fn mark_duplicates_in_family(templates: &mut [&mut Template], dedup_metrics: &mu
     scores.sort_by(|a, b| b.1.cmp(&a.1));
 
     // First template (highest score) is representative
-    dedup_metrics.unique_templates += 1;
+    dedup_counts.unique_templates += 1;
 
     // Mark all others as duplicates
     for (idx, _score) in scores.iter().skip(1) {
-        mark_template_as_duplicate(templates[*idx], dedup_metrics);
-        dedup_metrics.duplicate_templates += 1;
+        mark_template_as_duplicate(templates[*idx], dedup_counts);
+        dedup_counts.duplicate_templates += 1;
     }
 }
 
 /// Marks all reads in a template as duplicates.
-fn mark_template_as_duplicate(template: &mut Template, dedup_metrics: &mut DedupMetrics) {
+fn mark_template_as_duplicate(template: &mut Template, dedup_counts: &mut DedupCounts) {
     for raw in template.records_mut().iter_mut() {
         let flg = RawRecordView::new(raw.as_ref()).flags();
         fgumi_raw_bam::set_flags(raw, flg | DUPLICATE_FLAG);
-        dedup_metrics.duplicate_reads += 1;
+        dedup_counts.duplicate_reads += 1;
     }
 }
 
@@ -780,14 +631,14 @@ fn mark_template_as_duplicate(template: &mut Template, dedup_metrics: &mut Dedup
 /// Process a position group for deduplication.
 fn process_position_group(
     group: RawPositionGroup,
-    filter_config: &DedupFilterConfig,
+    filter_config: &TemplateFilterConfig,
     assigner: &dyn UmiAssigner,
     raw_tag: SamTag,
     min_umi_length: Option<usize>,
     no_umi: bool,
     include_unmapped: bool,
 ) -> io::Result<ProcessedDedupGroup> {
-    let mut dedup_metrics = DedupMetrics::default();
+    let mut dedup_counts = DedupCounts::default();
     let input_record_count = group.records.len() as u64;
 
     // Build templates from raw records (deferred from Group step)
@@ -805,19 +656,19 @@ fn process_position_group(
         };
 
     // Filter templates
-    let mut filter_metrics = FilterMetrics::new();
+    let mut filter_counts = TemplateFilterCounts::new();
     let filtered_templates: Vec<Template> = candidate_templates
         .into_iter()
-        .filter(|t| filter_template(t, filter_config, &mut filter_metrics))
+        .filter(|t| filter_template(t, filter_config, &mut filter_counts))
         .collect();
 
-    dedup_metrics.filter_metrics = filter_metrics;
+    dedup_counts.filter_counts = filter_counts;
 
     if filtered_templates.is_empty() && passthrough_templates.is_empty() {
         return Ok(ProcessedDedupGroup {
             templates: Vec::new(),
             family_sizes: AHashMap::new(),
-            dedup_metrics,
+            dedup_counts,
             input_record_count,
             distinct_mi_count: 0,
         });
@@ -877,32 +728,16 @@ fn process_position_group(
 
             // Get mutable references to family templates (single collection, not double)
             let mut family_refs: Vec<&mut Template> = templates[start..end].iter_mut().collect();
-            mark_duplicates_in_family(&mut family_refs, &mut dedup_metrics);
+            mark_duplicates_in_family(&mut family_refs, &mut dedup_counts);
         }
     }
 
     // Count reads and check for missing tc tags
     let tc_tag_bytes: [u8; 2] = *TC_TAG.as_ref();
     for template in &templates {
-        dedup_metrics.total_templates += 1;
+        dedup_counts.total_templates += 1;
         for raw in template.records() {
-            dedup_metrics.total_reads += 1;
-            let flg = RawRecordView::new(raw.as_ref()).flags();
-            let is_secondary = (flg & fgumi_raw_bam::flags::SECONDARY) != 0;
-            let is_supplementary = (flg & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0;
-
-            if is_secondary {
-                dedup_metrics.secondary_reads += 1;
-            }
-            if is_supplementary {
-                dedup_metrics.supplementary_reads += 1;
-            }
-            if is_secondary || is_supplementary {
-                let aux = fgumi_raw_bam::aux_data_slice(raw);
-                if fgumi_raw_bam::find_tag_type(aux, tc_tag_bytes).is_none() {
-                    dedup_metrics.missing_tc_tag += 1;
-                }
-            }
+            count_record(raw, tc_tag_bytes, &mut dedup_counts);
         }
     }
 
@@ -911,22 +746,24 @@ fn process_position_group(
     // serialize step writes them verbatim (no MI tag, duplicate flag left as in the
     // input). Count them as unique output so the record totals match what is written.
     for template in &passthrough_templates {
-        dedup_metrics.total_templates += 1;
-        dedup_metrics.unique_templates += 1;
+        // Counted separately from `filter_counts`: these templates were split off
+        // before the filter ran, so they appear in no rejection bucket and in no
+        // accepted count. Without this they would be invisible in the accounting.
+        dedup_counts.passthrough_templates += 1;
+        dedup_counts.total_templates += 1;
+        dedup_counts.unique_templates += 1;
         for raw in template.records() {
-            dedup_metrics.total_reads += 1;
-            let flg = RawRecordView::new(raw.as_ref()).flags();
-            if (flg & fgumi_raw_bam::flags::SECONDARY) != 0 {
-                dedup_metrics.secondary_reads += 1;
-            }
-            if (flg & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0 {
-                dedup_metrics.supplementary_reads += 1;
-            }
+            // Same accounting as the filtered templates above, `tc` check included.
+            // `template_is_unmapped_passthrough` only inspects the primary r1/r2, so a
+            // template routed here can still carry secondary/supplementary records; if
+            // they were counted but not checked, --include-unmapped would be a way to
+            // slip a `tc`-less non-primary read past the hard failure below.
+            count_record(raw, tc_tag_bytes, &mut dedup_counts);
         }
     }
     templates.extend(passthrough_templates);
 
-    dedup_metrics.unique_reads = dedup_metrics.total_reads - dedup_metrics.duplicate_reads;
+    dedup_counts.unique_reads = dedup_counts.total_reads - dedup_counts.duplicate_reads;
 
     // Compute the number of distinct numeric molecule IDs assigned in this group.
     // Mirrors `fgumi group`: assigners hand out numeric IDs 0, 1, 2, ... contiguously,
@@ -939,7 +776,7 @@ fn process_position_group(
     Ok(ProcessedDedupGroup {
         templates,
         family_sizes,
-        dedup_metrics,
+        dedup_counts,
         input_record_count,
         distinct_mi_count,
     })
@@ -989,6 +826,7 @@ discarded (not marked) when:
 
 - Both mates are unmapped (a template with no mapped read), unless --include-unmapped is
   given, in which case such templates are emitted untouched instead of discarded.
+- The template has neither a primary R1 nor a primary R2 record.
 - Any read is flagged QC-fail (unless -n/--include-non-pf-reads is given).
 - A mapped read has mapping quality below -q/--min-map-q (default 0, i.e. no reads are
   dropped for mapping quality unless a threshold is set).
@@ -1006,10 +844,19 @@ lets you keep no-mapped-read templates; only truncated/corrupt records are alway
 Pass-through templates are written verbatim: never marked, never MI-tagged, and counted as
 unique in the metrics.
 
-The counts of templates dropped for each reason are reported in the metrics output
-(--metrics). For the templates that remain, representative selection (the duplicate score),
-the 0x400 flag, and --remove-duplicates follow Picard `MarkDuplicates` semantics; the
-grouping key does not — see below.
+The count of templates dropped for each reason is reported in the metrics output
+(--metrics), one `filtered_*` column per reason above, plus `filtered_templates` for the
+total and `passthrough_templates` for the --include-unmapped templates that bypass the
+filter. These count *templates*; the `discarded_*` columns of `fgumi group`'s metrics count
+primary records, so the two files are not directly comparable. Templates read from the input
+are `filtered_templates + total_templates` — note that `total_templates` counts the templates
+that *passed the filter*, not the templates read, and not the templates written either: under
+--remove-duplicates the duplicates are dropped at write time, after they have been counted.
+A per-reason summary is also logged, so the drops are visible even without --metrics.
+
+For the templates that remain, representative selection (the duplicate score), the 0x400
+flag, and --remove-duplicates follow Picard `MarkDuplicates` semantics; the grouping key does
+not — see below.
 
 # Grouping key (strand of origin)
 
@@ -1235,17 +1082,21 @@ impl Command for MarkDuplicates {
         let cell_tag = Tag::from(SamTag::CB);
         let assign_tag_bytes: [u8; 2] = *SamTag::MI;
 
-        let filter_config = DedupFilterConfig {
+        let filter_config = TemplateFilterConfig {
             umi_tag: *raw_tag,
             min_mapq,
             include_non_pf: self.include_non_pf_reads,
             min_umi_length: self.min_umi_length,
             no_umi: self.no_umi,
+            // Always false: --include-unmapped splits no-mapped-read templates off
+            // *before* the filter runs (see `template_is_unmapped_passthrough`), so
+            // an unmapped template reaching the filter is always a rejection.
+            allow_unmapped: false,
         };
 
         // Shared state for collecting metrics
-        let collected_metrics: Arc<Mutex<CollectedDedupMetrics>> =
-            Arc::new(Mutex::new(CollectedDedupMetrics::default()));
+        let collected_metrics: Arc<Mutex<CollectedDedupCounts>> =
+            Arc::new(Mutex::new(CollectedDedupCounts::default()));
 
         // Clone values needed by closures
         let strategy = effective_strategy;
@@ -1322,7 +1173,7 @@ impl Command for MarkDuplicates {
                 // Collect metrics
                 {
                     let mut agg = collected_metrics_clone.lock();
-                    agg.dedup_metrics.merge(&processed.dedup_metrics);
+                    agg.dedup_counts.merge(&processed.dedup_counts);
                     for (size, count) in &processed.family_sizes {
                         *agg.family_sizes.entry(*size).or_insert(0) += count;
                     }
@@ -1403,12 +1254,12 @@ impl Command for MarkDuplicates {
         let aggregated = Arc::try_unwrap(collected_metrics)
             .expect("bug: metrics Arc still shared after pipeline join")
             .into_inner();
-        let final_metrics = aggregated.dedup_metrics;
+        let final_counts = aggregated.dedup_counts;
         let final_family_sizes = aggregated.family_sizes;
 
         // Write metrics file
         if let Some(metrics_path) = &self.metrics {
-            write_dedup_metrics(&final_metrics, metrics_path)?;
+            write_dedup_metrics(&final_counts, metrics_path)?;
         }
 
         // Write family size histogram
@@ -1419,13 +1270,13 @@ impl Command for MarkDuplicates {
         // Log summary
         info!(
             "Deduplication complete: {} templates ({} unique, {} duplicates, {:.2}% duplicate rate)",
-            final_metrics.total_templates,
-            final_metrics.unique_templates,
-            final_metrics.duplicate_templates,
-            final_metrics.duplicate_rate() * 100.0
+            final_counts.total_templates,
+            final_counts.unique_templates,
+            final_counts.duplicate_templates,
+            final_counts.duplicate_rate() * 100.0
         );
 
-        if final_metrics.missing_tc_tag > 0 {
+        if final_counts.missing_tc_tag > 0 {
             bail!(
                 "{} secondary/supplementary reads are missing the `tc` tag.\n\n\
                 The `tc` tag is required for correct UMI-aware deduplication of \
@@ -1435,11 +1286,27 @@ impl Command for MarkDuplicates {
                 fgumi zipper -i aligned.bam --unmapped unmapped.bam -r reference.fa -o merged.bam\n  \
                 fgumi sort -i merged.bam -o sorted.bam --order template-coordinate\n  \
                 fgumi dedup -i sorted.bam -o deduped.bam",
-                final_metrics.missing_tc_tag
+                final_counts.missing_tc_tag
             );
         }
 
-        timer.log_completion(final_metrics.total_reads);
+        // --metrics is optional, so it must not be the only channel reporting
+        // dropped templates: a run that filters everything otherwise logs a bare
+        // "0 templates" and is indistinguishable from empty input. Reasons are
+        // named by their column suffix so the log points at the metrics column.
+        let filtered = final_counts.filter_counts.total_rejected_templates();
+        if filtered > 0 {
+            let reasons: Vec<String> = TemplateFilterReason::ALL
+                .into_iter()
+                .filter_map(|reason| {
+                    let count = final_counts.filter_counts.rejected_templates(reason);
+                    (count > 0).then(|| format!("{count} {}", reason.column_suffix()))
+                })
+                .collect();
+            info!("Filtered out {filtered} templates before marking: {}", reasons.join(", "));
+        }
+
+        timer.log_completion(final_counts.total_reads);
 
         Ok(())
     }
@@ -1449,8 +1316,8 @@ impl Command for MarkDuplicates {
 // Metrics writing
 //////////////////////////////////////////////////////////////////////////////
 
-fn write_dedup_metrics(metrics: &DedupMetrics, path: &PathBuf) -> Result<()> {
-    let output: DedupMetricsOutput = metrics.into();
+fn write_dedup_metrics(counts: &DedupCounts, path: &PathBuf) -> Result<()> {
+    let output: DeduplicationMetrics = counts.into();
     DelimFile::default()
         .write_tsv(path, [output])
         .with_context(|| format!("Failed to write dedup metrics: {}", path.display()))?;
@@ -1541,22 +1408,22 @@ mod tests {
     #[test]
     fn test_duplicate_rate_calculation() {
         let metrics =
-            DedupMetrics { total_templates: 100, duplicate_templates: 25, ..Default::default() };
+            DedupCounts { total_templates: 100, duplicate_templates: 25, ..Default::default() };
         assert!((metrics.duplicate_rate() - 0.25).abs() < 0.001);
     }
 
     #[test]
     fn test_duplicate_rate_zero_templates() {
-        let metrics = DedupMetrics::default();
+        let metrics = DedupCounts::default();
         assert!((metrics.duplicate_rate() - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_metrics_merge() {
         let mut m1 =
-            DedupMetrics { total_templates: 10, duplicate_templates: 2, ..Default::default() };
+            DedupCounts { total_templates: 10, duplicate_templates: 2, ..Default::default() };
 
-        let m2 = DedupMetrics { total_templates: 20, duplicate_templates: 5, ..Default::default() };
+        let m2 = DedupCounts { total_templates: 20, duplicate_templates: 5, ..Default::default() };
 
         m1.merge(&m2);
         assert_eq!(m1.total_templates, 30);
@@ -1574,7 +1441,7 @@ mod tests {
 
     #[test]
     fn test_mark_duplicates_empty_family() {
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut templates: Vec<&mut Template> = vec![];
         mark_duplicates_in_family(&mut templates, &mut metrics);
         assert_eq!(metrics.unique_templates, 0);
@@ -1583,7 +1450,7 @@ mod tests {
 
     #[test]
     fn test_mark_duplicates_single_template() {
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[30, 30, 30, 30]);
         let mut templates: Vec<&mut Template> = vec![&mut t1];
         mark_duplicates_in_family(&mut templates, &mut metrics);
@@ -1596,7 +1463,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_size_2_first_higher() {
         // Fast path for size 2: first template has higher score
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[15, 15, 15, 15]); // Score: 60
         let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0 (all q < 15)
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2];
@@ -1611,7 +1478,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_size_2_second_higher() {
         // Fast path for size 2: second template has higher score
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 0 (all q < 15)
         let mut t2 = create_test_template("q2", &[15, 15, 15, 15]); // Score: 60
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2];
@@ -1626,7 +1493,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_size_3_first_highest() {
         // Fast path for size 3: first template has highest score
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[15, 15, 15, 15]); // Score: 60
         let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0 (all q < 15)
         let mut t3 = create_test_template("q3", &[5, 5, 5, 5]); // Score: 0 (all q < 15)
@@ -1643,7 +1510,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_size_3_second_highest() {
         // Fast path for size 3: second template has highest score
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 0 (all q < 15)
         let mut t2 = create_test_template("q2", &[15, 15, 15, 15]); // Score: 60
         let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 0 (all q < 15)
@@ -1660,7 +1527,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_size_3_third_highest() {
         // Fast path for size 3: third template has highest score
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 0 (all q < 15)
         let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0 (all q < 15)
         let mut t3 = create_test_template("q3", &[15, 15, 15, 15]); // Score: 60
@@ -1677,7 +1544,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_size_4_general_case() {
         // General case for size 4+: uses Vec and sort
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[5, 5, 5, 5]); // Score: 0 (all q < 15)
         let mut t2 = create_test_template("q2", &[15, 15, 15, 15]); // Score: 60 (highest)
         let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 0 (all q < 15)
@@ -1696,7 +1563,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_counts_duplicate_reads() {
         // Verify duplicate_reads metric is incremented for each read in duplicate templates
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[15, 15, 15, 15]); // Score: 60 (1 read)
         let mut t2 = create_test_template("q2", &[5, 5, 5, 5]); // Score: 0 (all q < 15; 1 read)
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2];
@@ -1712,7 +1579,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_tie_breaking_size_2() {
         // When scores are equal, first template should be kept (deterministic)
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 0 (all < 15)
         let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0 (tie)
         let mut templates: Vec<&mut Template> = vec![&mut t1, &mut t2];
@@ -1728,7 +1595,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_tie_breaking_size_3_all_equal() {
         // All three have equal scores - first template should be kept
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 0 (all < 15)
         let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0
         let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 0
@@ -1746,7 +1613,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_tie_breaking_size_3_second_and_third_tie() {
         // First is lower, second and third tie - second should win
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 0 (all < 15)
         let mut t2 = create_test_template("q2", &[20, 20, 20, 20]); // Score: 80
         let mut t3 = create_test_template("q3", &[20, 20, 20, 20]); // Score: 80 (tie with t2)
@@ -1764,7 +1631,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_tie_breaking_size_4_all_equal() {
         // All four have equal scores - first template should be kept
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 0 (all < 15)
         let mut t2 = create_test_template("q2", &[10, 10, 10, 10]); // Score: 0
         let mut t3 = create_test_template("q3", &[10, 10, 10, 10]); // Score: 0
@@ -1784,7 +1651,7 @@ mod tests {
     #[test]
     fn test_mark_duplicates_tie_breaking_size_4_partial_tie() {
         // Third and fourth tie for highest - third should win
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         let mut t1 = create_test_template("q1", &[10, 10, 10, 10]); // Score: 0 (all < 15)
         let mut t2 = create_test_template("q2", &[16, 16, 16, 16]); // Score: 64
         let mut t3 = create_test_template("q3", &[20, 20, 20, 20]); // Score: 80
@@ -1805,14 +1672,8 @@ mod tests {
     // filter_template tests
     // ========================================================================
 
-    fn default_filter_config() -> DedupFilterConfig {
-        DedupFilterConfig {
-            umi_tag: *SamTag::RX,
-            min_mapq: 20,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-        }
+    fn default_filter_config() -> TemplateFilterConfig {
+        TemplateFilterConfig { min_mapq: 20, ..Default::default() }
     }
 
     /// Helper to create a mapped template with UMI tag
@@ -1834,11 +1695,11 @@ mod tests {
     #[test]
     fn test_filter_template_accepts_valid_template() {
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
         let template = create_mapped_template_with_umi("q1", "ACGTACGT", 30);
 
         assert!(filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.accepted_templates, 1);
+        assert_eq!(metrics.accepted_templates(), 1);
     }
 
     // ========================================================================
@@ -1931,11 +1792,11 @@ mod tests {
     #[test]
     fn test_filter_template_rejects_low_mapq() {
         let config = default_filter_config(); // min_mapq = 20
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
         let template = create_mapped_template_with_umi("q1", "ACGTACGT", 10); // MAPQ 10 < 20
 
         assert!(!filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.discarded_poor_alignment, 1);
+        assert_eq!(metrics.rejected_templates(TemplateFilterReason::LowMappingQuality), 1);
     }
 
     /// Truncated mate must reject the template (fail closed) rather than
@@ -1944,7 +1805,7 @@ mod tests {
     #[test]
     fn test_filter_template_rejects_truncated_mate() {
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
 
         // A valid R1 (full record) and a truncated R2 (16 bytes; below MIN_BAM_RECORD_LEN = 32).
         let mut b = RawSamBuilder::new();
@@ -1973,8 +1834,12 @@ mod tests {
         };
 
         assert!(!filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.discarded_poor_alignment, 1, "truncated mate must fail closed");
-        assert_eq!(metrics.accepted_templates, 0);
+        assert_eq!(
+            metrics.rejected_templates(TemplateFilterReason::MalformedRecord),
+            1,
+            "truncated mate must fail closed"
+        );
+        assert_eq!(metrics.accepted_templates(), 0);
     }
 
     /// A truncated secondary or supplementary alignment must also reject the
@@ -1983,7 +1848,7 @@ mod tests {
     #[test]
     fn test_filter_template_rejects_truncated_secondary() {
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
 
         let mut b1 = RawSamBuilder::new();
         b1.read_name(b"q1")
@@ -2026,35 +1891,39 @@ mod tests {
         };
 
         assert!(!filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.discarded_poor_alignment, 1, "truncated secondary must fail closed");
-        assert_eq!(metrics.accepted_templates, 0);
+        assert_eq!(
+            metrics.rejected_templates(TemplateFilterReason::MalformedRecord),
+            1,
+            "truncated secondary must fail closed"
+        );
+        assert_eq!(metrics.accepted_templates(), 0);
     }
 
     #[test]
     fn test_filter_template_rejects_umi_with_n() {
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
         let template = create_mapped_template_with_umi("q1", "ACNTACGT", 30); // N in UMI
 
         assert!(!filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.discarded_ns_in_umi, 1);
+        assert_eq!(metrics.rejected_templates(TemplateFilterReason::NsInUmi), 1);
     }
 
     #[test]
     fn test_filter_template_rejects_short_umi() {
         let mut config = default_filter_config();
         config.min_umi_length = Some(8); // Require 8 bases
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
         let template = create_mapped_template_with_umi("q1", "ACGT", 30); // Only 4 bases
 
         assert!(!filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.discarded_umi_too_short, 1);
+        assert_eq!(metrics.rejected_templates(TemplateFilterReason::UmiTooShort), 1);
     }
 
     #[test]
     fn test_filter_template_rejects_missing_umi_tag() {
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
 
         // Create template without RX tag
         let record = {
@@ -2073,13 +1942,13 @@ mod tests {
             .expect("test template construction should not fail");
 
         assert!(!filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.discarded_poor_alignment, 1);
+        assert_eq!(metrics.rejected_templates(TemplateFilterReason::MissingUmi), 1);
     }
 
     #[test]
     fn test_filter_template_rejects_qc_fail() {
         let config = default_filter_config(); // include_non_pf = false
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
 
         let record = {
             let mut b = RawSamBuilder::new();
@@ -2098,14 +1967,14 @@ mod tests {
             .expect("test template construction should not fail");
 
         assert!(!filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.discarded_non_pf, 1);
+        assert_eq!(metrics.rejected_templates(TemplateFilterReason::NotPassingFilter), 1);
     }
 
     #[test]
     fn test_filter_template_accepts_qc_fail_when_included() {
         let mut config = default_filter_config();
         config.include_non_pf = true; // Include QC-fail reads
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
 
         let record = {
             let mut b = RawSamBuilder::new();
@@ -2124,13 +1993,13 @@ mod tests {
             .expect("test template construction should not fail");
 
         assert!(filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.accepted_templates, 1);
+        assert_eq!(metrics.accepted_templates(), 1);
     }
 
     #[test]
     fn test_filter_template_rejects_unmapped() {
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
 
         let record = {
             let mut b = RawSamBuilder::new();
@@ -2145,18 +2014,18 @@ mod tests {
             .expect("test template construction should not fail");
 
         assert!(!filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.discarded_poor_alignment, 1);
+        assert_eq!(metrics.rejected_templates(TemplateFilterReason::Unmapped), 1);
     }
 
     #[test]
     fn test_filter_template_accepts_paired_umi_with_dash() {
         // Paired UMIs have format "ACGT-TGCA" with a dash separator
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
         let template = create_mapped_template_with_umi("q1", "ACGT-TGCA", 30);
 
         assert!(filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.accepted_templates, 1);
+        assert_eq!(metrics.accepted_templates(), 1);
     }
 
     // ========================================================================
@@ -2407,7 +2276,7 @@ mod tests {
         for template in &mut templates {
             by_family.entry(template.mi.to_vec_index()).or_default().push(template);
         }
-        let mut metrics = DedupMetrics::default();
+        let mut metrics = DedupCounts::default();
         for (_mi, mut family) in by_family {
             mark_duplicates_in_family(&mut family, &mut metrics);
         }
@@ -2607,27 +2476,27 @@ mod tests {
     #[test]
     fn test_filter_paired_template_accepts_valid() {
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
         let template = create_paired_mapped_template_with_umi("q1", "ACGTACGT", 30, 30);
 
         assert!(filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.accepted_templates, 1);
+        assert_eq!(metrics.accepted_templates(), 1);
     }
 
     #[test]
     fn test_filter_paired_template_rejects_r2_low_mapq() {
         let config = default_filter_config(); // min_mapq = 20
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
         let template = create_paired_mapped_template_with_umi("q1", "ACGTACGT", 30, 10);
 
         assert!(!filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.discarded_poor_alignment, 1);
+        assert_eq!(metrics.rejected_templates(TemplateFilterReason::LowMappingQuality), 1);
     }
 
     #[test]
     fn test_filter_paired_template_rejects_r2_umi_with_n() {
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
         // R1 has valid UMI, but R2 has N in UMI
         let r1 = {
             let mut b = RawSamBuilder::new();
@@ -2659,27 +2528,27 @@ mod tests {
             .expect("test template construction should not fail");
 
         assert!(!filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.discarded_ns_in_umi, 1);
+        assert_eq!(metrics.rejected_templates(TemplateFilterReason::NsInUmi), 1);
     }
 
     #[test]
     fn test_filter_paired_no_reads_rejected() {
         // Template with no primary reads (empty records list)
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
         let template = Template::new(b"empty".to_vec());
 
         assert!(!filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.discarded_poor_alignment, 1);
+        assert_eq!(metrics.rejected_templates(TemplateFilterReason::NoPrimaryReads), 1);
     }
 
     // ========================================================================
-    // DedupMetrics tests
+    // DedupCounts tests
     // ========================================================================
 
     #[test]
     fn test_metrics_merge_all_fields() {
-        let mut m1 = DedupMetrics {
+        let mut m1 = DedupCounts {
             total_templates: 10,
             duplicate_templates: 2,
             unique_templates: 8,
@@ -2692,7 +2561,7 @@ mod tests {
             ..Default::default()
         };
 
-        let m2 = DedupMetrics {
+        let m2 = DedupCounts {
             total_templates: 5,
             duplicate_templates: 1,
             unique_templates: 4,
@@ -2720,13 +2589,13 @@ mod tests {
     #[test]
     fn test_duplicate_rate_all_duplicates() {
         let metrics =
-            DedupMetrics { total_templates: 50, duplicate_templates: 50, ..Default::default() };
+            DedupCounts { total_templates: 50, duplicate_templates: 50, ..Default::default() };
         assert!((metrics.duplicate_rate() - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_metrics_default() {
-        let metrics = DedupMetrics::default();
+        let metrics = DedupCounts::default();
         assert_eq!(metrics.total_templates, 0);
         assert_eq!(metrics.duplicate_templates, 0);
         assert_eq!(metrics.unique_templates, 0);
@@ -2738,9 +2607,20 @@ mod tests {
         assert_eq!(metrics.missing_tc_tag, 0);
     }
 
+    /// The point of fgumi#739: every count the filter collects must survive the
+    /// trip to the output struct. Distinct per-reason counts so a mis-wired field
+    /// cannot pass by accident.
     #[test]
-    fn test_dedup_metrics_output_from() {
-        let metrics = DedupMetrics {
+    fn dedup_metrics_output_carries_every_filter_reason() {
+        let mut filter_counts = TemplateFilterCounts::new();
+        for (offset, reason) in TemplateFilterReason::ALL.into_iter().enumerate() {
+            for _ in 0..=offset {
+                filter_counts.record_rejected(reason, 2);
+            }
+        }
+        filter_counts.record_accepted(2);
+
+        let counts = DedupCounts {
             total_templates: 100,
             duplicate_templates: 25,
             unique_templates: 75,
@@ -2750,47 +2630,87 @@ mod tests {
             secondary_reads: 10,
             supplementary_reads: 5,
             missing_tc_tag: 2,
-            ..Default::default()
+            passthrough_templates: 3,
+            filter_counts,
         };
-        let output = DedupMetricsOutput::from(&metrics);
+        let output = DeduplicationMetrics::from(&counts);
 
+        assert_eq!(output.filtered_malformed_record, 1);
+        assert_eq!(output.filtered_no_primary_reads, 2);
+        assert_eq!(output.filtered_unmapped, 3);
+        assert_eq!(output.filtered_not_passing_filter, 4);
+        assert_eq!(output.filtered_low_mapping_quality, 5);
+        assert_eq!(output.filtered_low_mate_mapping_quality, 6);
+        assert_eq!(output.filtered_missing_umi, 7);
+        assert_eq!(output.filtered_ns_in_umi, 8);
+        assert_eq!(output.filtered_umi_too_short, 9);
+        assert_eq!(output.filtered_templates, 45);
+        assert_eq!(output.passthrough_templates, 3);
         assert_eq!(output.total_templates, 100);
-        assert_eq!(output.duplicate_templates, 25);
         assert_eq!(output.unique_templates, 75);
+        assert_eq!(output.duplicate_templates, 25);
         assert!((output.duplicate_rate - 0.25).abs() < 0.001);
         assert_eq!(output.total_reads, 200);
-        assert_eq!(output.duplicate_reads, 50);
         assert_eq!(output.unique_reads, 150);
+        assert_eq!(output.duplicate_reads, 50);
         assert_eq!(output.secondary_reads, 10);
         assert_eq!(output.supplementary_reads, 5);
         assert_eq!(output.missing_tc_tag, 2);
     }
 
-    /// DXM3-04: `duplicate_rate` serializes through the fgbio-style float
-    /// formatter (#504's now-public `fgumi_metrics::float`), so a whole-number
-    /// rate is written as `1`, not serde's raw `1.0` — consistent with the other
-    /// fgumi metric files.
+    /// Nothing may vanish silently: everything read is either filtered or written.
+    #[rstest]
+    #[case::nothing_filtered(0, 10, 0)]
+    #[case::everything_filtered(7, 0, 0)]
+    #[case::mixed(3, 5, 2)]
+    fn dedup_metrics_output_reconciles(
+        #[case] rejected: u64,
+        #[case] accepted: u64,
+        #[case] passthrough: u64,
+    ) {
+        let mut filter_counts = TemplateFilterCounts::new();
+        for _ in 0..rejected {
+            filter_counts.record_rejected(TemplateFilterReason::NsInUmi, 2);
+        }
+        for _ in 0..accepted {
+            filter_counts.record_accepted(2);
+        }
+
+        let counts = DedupCounts {
+            total_templates: accepted + passthrough,
+            passthrough_templates: passthrough,
+            filter_counts,
+            ..DedupCounts::default()
+        };
+        let output = DeduplicationMetrics::from(&counts);
+
+        assert_eq!(
+            output.filtered_templates + output.total_templates,
+            rejected + accepted + passthrough
+        );
+    }
+
+    /// `duplicate_rate` serializes through the fgbio-style float formatter, so a
+    /// whole-number rate is written as `1`, not serde's raw `1.0`. Located by
+    /// column name rather than position, so adding a column cannot silently
+    /// invalidate this.
     #[test]
-    fn test_dedup_metrics_duplicate_rate_uses_float_formatter() -> Result<()> {
-        let metrics = DedupMetrics {
+    fn test_dedup_counts_duplicate_rate_uses_float_formatter() -> Result<()> {
+        let counts = DedupCounts {
             total_templates: 2,
             duplicate_templates: 2,
             unique_templates: 0,
-            ..Default::default()
+            ..DedupCounts::default()
         };
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("dedup.metrics.txt");
-        write_dedup_metrics(&metrics, &path)?;
+        write_dedup_metrics(&counts, &path)?;
 
         let text = std::fs::read_to_string(&path)?;
-        let data_row = text.lines().nth(1).expect("metrics data row");
-        let columns: Vec<&str> = data_row.split('\t').collect();
-        // Field order: total, unique, duplicate templates, then duplicate_rate.
-        assert_eq!(
-            columns.get(3).copied(),
-            Some("1"),
-            "duplicate_rate must format as `1`, not `1.0`; row: {data_row:?}"
-        );
+        let header: Vec<&str> = text.lines().next().expect("header").split('\t').collect();
+        let row: Vec<&str> = text.lines().nth(1).expect("data row").split('\t').collect();
+        let index = header.iter().position(|&c| c == "duplicate_rate").expect("column");
+        assert_eq!(row.get(index).copied(), Some("1"));
         Ok(())
     }
 
@@ -2817,32 +2737,27 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_template_raw_truncated_record_no_panic() {
-        // After fix: truncated records no longer panic -- they gracefully return false
-        // (rejected as poor alignment due to missing UMI tag).
+    fn test_filter_template_raw_record_truncated_no_panic() {
+        // After fix: truncated records no longer panic -- they gracefully return false.
+        // The aux block is truncated rather than the record itself, so the record
+        // clears the minimum-length check and is rejected for the missing UMI tag.
 
         let raw = make_raw_bam_record_truncated_aux();
         let template =
             Template::from_records(vec![raw]).expect("test template construction should not fail");
 
-        let config = DedupFilterConfig {
-            umi_tag: *SamTag::RX,
-            min_mapq: 20,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-        };
-        let mut metrics = FilterMetrics::new();
+        let config = TemplateFilterConfig { min_mapq: 20, ..Default::default() };
+        let mut metrics = TemplateFilterCounts::new();
 
         // Should not panic; should reject gracefully due to missing UMI
         let result = filter_template(&template, &config, &mut metrics);
         assert!(!result, "Truncated record should be rejected");
-        assert_eq!(metrics.discarded_poor_alignment, 1);
+        assert_eq!(metrics.rejected_templates(TemplateFilterReason::MissingUmi), 1);
     }
 
-    // Test that the raw-byte mode MQ tag issue actually occurs in filter_template_raw
+    // Test that the raw-byte mode MQ tag issue actually occurs in filter_template
     #[test]
-    fn test_filter_template_raw_mq_tag_type_mismatch_bypasses_filter() {
+    fn test_filter_template_raw_record_mq_tag_type_mismatch() {
         // Build a BAM record with exact sizes so aux data is contiguous.
         // Header(32) + name(4) + cigar(4) + seq(2) + qual(4) = 46 bytes before aux
         let mut rec = vec![0u8; 46];
@@ -2869,22 +2784,16 @@ mod tests {
         let template = Template::from_records(vec![RawRecord::from(rec)])
             .expect("test template construction should not fail");
 
-        let config = DedupFilterConfig {
-            umi_tag: *SamTag::RX,
-            min_mapq: 20,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-        };
-        let mut metrics = FilterMetrics::new();
+        let config = TemplateFilterConfig { min_mapq: 20, ..Default::default() };
+        let mut metrics = TemplateFilterCounts::new();
 
-        // After fix: filter_template_raw now uses find_int_tag which handles all integer types.
+        // After fix: filter_template now uses find_int_tag which handles all integer types.
         // The template should be REJECTED because mate MAPQ=10 < min_mapq=20.
         let result = filter_template(&template, &config, &mut metrics);
 
         assert!(!result, "Template with low mate MAPQ should be rejected");
-        assert_eq!(metrics.accepted_templates, 0);
-        assert_eq!(metrics.discarded_poor_alignment, 1);
+        assert_eq!(metrics.accepted_templates(), 0);
+        assert_eq!(metrics.rejected_templates(TemplateFilterReason::LowMateMappingQuality), 1);
     }
 
     // ========================================================================
@@ -3069,57 +2978,54 @@ mod tests {
     }
 
     // ========================================================================
-    // filter_template_raw passing/rejecting tests
+    // filter_template passing/rejecting tests
     // ========================================================================
 
-    /// Which `FilterMetrics` field an `rstest` case expects to advance.
-    #[derive(Debug, Clone, Copy)]
-    enum FilterExpect {
-        Accepted,
-        PoorAlignment,
-        NonPf,
-        NsInUmi,
-        UmiTooShort,
-    }
+    /// What an `rstest` case expects the filter to record: `None` for an accepted
+    /// template, or the specific reason it was rejected for. This used to be a
+    /// bespoke enum mirroring fgbio's four discard columns, which forced
+    /// `rejects_low_mapq` and `rejects_unmapped` to share one `PoorAlignment`
+    /// expectation; keying on `TemplateFilterReason` tells them apart.
+    type FilterExpect = Option<TemplateFilterReason>;
 
     #[rstest]
     #[case::accepts_valid(
         fgumi_raw_bam::flags::PAIRED
             | fgumi_raw_bam::flags::FIRST_SEGMENT
             | fgumi_raw_bam::flags::MATE_UNMAPPED,
-        30, b"ACGTACGT", 20, None, true, FilterExpect::Accepted
+        30, b"ACGTACGT", 20, None, true, None
     )]
     #[case::rejects_low_mapq(
         fgumi_raw_bam::flags::PAIRED
             | fgumi_raw_bam::flags::FIRST_SEGMENT
             | fgumi_raw_bam::flags::MATE_UNMAPPED,
-        10, b"ACGT", 20, None, false, FilterExpect::PoorAlignment
+        10, b"ACGT", 20, None, false, Some(TemplateFilterReason::LowMappingQuality)
     )]
     #[case::rejects_qc_fail(
         fgumi_raw_bam::flags::PAIRED
             | fgumi_raw_bam::flags::FIRST_SEGMENT
             | fgumi_raw_bam::flags::MATE_UNMAPPED
             | fgumi_raw_bam::flags::QC_FAIL,
-        30, b"ACGT", 0, None, false, FilterExpect::NonPf
+        30, b"ACGT", 0, None, false, Some(TemplateFilterReason::NotPassingFilter)
     )]
     #[case::rejects_umi_with_n(
         fgumi_raw_bam::flags::PAIRED
             | fgumi_raw_bam::flags::FIRST_SEGMENT
             | fgumi_raw_bam::flags::MATE_UNMAPPED,
-        30, b"ANGT", 0, None, false, FilterExpect::NsInUmi
+        30, b"ANGT", 0, None, false, Some(TemplateFilterReason::NsInUmi)
     )]
     #[case::rejects_short_umi(
         fgumi_raw_bam::flags::PAIRED
             | fgumi_raw_bam::flags::FIRST_SEGMENT
             | fgumi_raw_bam::flags::MATE_UNMAPPED,
-        30, b"AC", 0, Some(6), false, FilterExpect::UmiTooShort
+        30, b"AC", 0, Some(6), false, Some(TemplateFilterReason::UmiTooShort)
     )]
     #[case::rejects_unmapped(
         fgumi_raw_bam::flags::UNMAPPED
             | fgumi_raw_bam::flags::MATE_UNMAPPED,
-        0, b"ACGT", 0, None, false, FilterExpect::PoorAlignment
+        0, b"ACGT", 0, None, false, Some(TemplateFilterReason::Unmapped)
     )]
-    fn test_filter_template_raw(
+    fn test_filter_template(
         #[case] flags: u16,
         #[case] mapq: u8,
         #[case] umi: &'static [u8],
@@ -3131,22 +3037,23 @@ mod tests {
         let raw = make_raw_bam_for_dedup(b"rea", flags, mapq, 4, &[20, 20, 20, 20], umi);
         let template =
             Template::from_records(vec![raw]).expect("test template construction should not fail");
-        let config = DedupFilterConfig {
+        let config = TemplateFilterConfig {
             umi_tag: *SamTag::RX,
             min_mapq,
             include_non_pf: false,
             min_umi_length,
             no_umi: false,
+            allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
         assert_eq!(filter_template(&template, &config, &mut metrics), expect_pass);
-        match expect {
-            FilterExpect::Accepted => assert_eq!(metrics.accepted_templates, 1),
-            FilterExpect::PoorAlignment => assert_eq!(metrics.discarded_poor_alignment, 1),
-            FilterExpect::NonPf => assert_eq!(metrics.discarded_non_pf, 1),
-            FilterExpect::NsInUmi => assert_eq!(metrics.discarded_ns_in_umi, 1),
-            FilterExpect::UmiTooShort => assert_eq!(metrics.discarded_umi_too_short, 1),
+        // Assert across every reason, not just the expected one, so a case cannot
+        // pass while also incrementing a bucket it should not have touched.
+        for reason in TemplateFilterReason::ALL {
+            let expected = u64::from(expect == Some(reason));
+            assert_eq!(metrics.rejected_templates(reason), expected, "{reason:?}");
         }
+        assert_eq!(metrics.accepted_templates(), u64::from(expect.is_none()));
     }
 
     // ========================================================================
@@ -3183,7 +3090,7 @@ mod tests {
         let batch = ProcessedDedupGroup {
             templates,
             family_sizes: AHashMap::new(),
-            dedup_metrics: DedupMetrics::default(),
+            dedup_counts: DedupCounts::default(),
             input_record_count: 1,
             distinct_mi_count: 0,
         };
@@ -3205,7 +3112,7 @@ mod tests {
     fn test_filter_template_accepts_missing_umi_when_no_umi_mode() {
         let mut config = default_filter_config();
         config.no_umi = true;
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
 
         // Create template without RX tag
         let record = {
@@ -3225,19 +3132,19 @@ mod tests {
 
         // In no_umi mode, templates without UMI tags should be accepted
         assert!(filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.accepted_templates, 1);
+        assert_eq!(metrics.accepted_templates(), 1);
     }
 
     #[test]
     fn test_filter_template_accepts_umi_with_n_when_no_umi_mode() {
         let mut config = default_filter_config();
         config.no_umi = true;
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
         let template = create_mapped_template_with_umi("q1", "ACNTACGT", 30);
 
         // In no_umi mode, UMIs with N should be accepted (UMI validation is skipped)
         assert!(filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.accepted_templates, 1);
+        assert_eq!(metrics.accepted_templates(), 1);
     }
 
     #[test]
@@ -3245,12 +3152,12 @@ mod tests {
         let mut config = default_filter_config();
         config.min_umi_length = Some(8);
         config.no_umi = true;
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = TemplateFilterCounts::new();
         let template = create_mapped_template_with_umi("q1", "ACGT", 30);
 
         // In no_umi mode, short UMIs should be accepted (min_umi_length is not checked)
         assert!(filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.accepted_templates, 1);
+        assert_eq!(metrics.accepted_templates(), 1);
     }
 
     // ========================================================================
@@ -3306,7 +3213,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_template_raw_accepts_missing_umi_when_no_umi_mode() {
+    fn test_filter_template_raw_record_accepts_missing_umi_when_no_umi_mode() {
         let raw = make_raw_bam_for_dedup_no_tags(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
@@ -3318,22 +3225,16 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("test template construction should not fail");
-        let config = DedupFilterConfig {
-            umi_tag: *SamTag::RX,
-            min_mapq: 20,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: true,
-        };
-        let mut metrics = FilterMetrics::new();
+        let config = TemplateFilterConfig { min_mapq: 20, no_umi: true, ..Default::default() };
+        let mut metrics = TemplateFilterCounts::new();
 
         // In no_umi mode, templates without UMI tags should be accepted
         assert!(filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.accepted_templates, 1);
+        assert_eq!(metrics.accepted_templates(), 1);
     }
 
     #[test]
-    fn test_filter_template_raw_accepts_umi_with_n_when_no_umi_mode() {
+    fn test_filter_template_raw_record_accepts_umi_with_n_when_no_umi_mode() {
         let raw = make_raw_bam_for_dedup(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
@@ -3346,22 +3247,16 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("test template construction should not fail");
-        let config = DedupFilterConfig {
-            umi_tag: *SamTag::RX,
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: true,
-        };
-        let mut metrics = FilterMetrics::new();
+        let config = TemplateFilterConfig { no_umi: true, ..Default::default() };
+        let mut metrics = TemplateFilterCounts::new();
 
         // In no_umi mode, UMIs with N should be accepted (UMI validation is skipped)
         assert!(filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.accepted_templates, 1);
+        assert_eq!(metrics.accepted_templates(), 1);
     }
 
     #[test]
-    fn test_filter_template_raw_accepts_short_umi_when_no_umi_mode() {
+    fn test_filter_template_raw_record_accepts_short_umi_when_no_umi_mode() {
         let raw = make_raw_bam_for_dedup(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
@@ -3374,17 +3269,12 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("test template construction should not fail");
-        let config = DedupFilterConfig {
-            umi_tag: *SamTag::RX,
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: Some(6),
-            no_umi: true,
-        };
-        let mut metrics = FilterMetrics::new();
+        let config =
+            TemplateFilterConfig { min_umi_length: Some(6), no_umi: true, ..Default::default() };
+        let mut metrics = TemplateFilterCounts::new();
 
         // In no_umi mode, short UMIs should be accepted (min_umi_length is not checked)
         assert!(filter_template(&template, &config, &mut metrics));
-        assert_eq!(metrics.accepted_templates, 1);
+        assert_eq!(metrics.accepted_templates(), 1);
     }
 }

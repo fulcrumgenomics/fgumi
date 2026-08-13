@@ -110,6 +110,48 @@ fn test_group_command_rejects_n_bases_in_umi() {
     assert!(metric.discarded_ns_in_umi > 0, "Should have discarded reads with N in UMI");
 }
 
+/// `group`'s metrics file is fgbio's `UmiGroupingMetric` and must stay exactly
+/// five columns with fgbio's spellings, whatever fgumi tracks internally. The
+/// struct-level test in `fgumi-metrics` pins the serialization; this pins what the
+/// command actually writes to disk, so an internal refactor of the filter
+/// accounting cannot change the file fgbio has to be able to read.
+#[test]
+fn test_grouping_metrics_header_is_fgbio_five_columns() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_file = temp_dir.path().join("metrics.txt");
+
+    create_test_input_bam(&input_bam);
+
+    let cmd = GroupReadsByUmi::try_parse_from([
+        "group",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--edits",
+        "0",
+        "--grouping-metrics",
+        metrics_file.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse group args");
+    cmd.execute("fgumi group").expect("Failed to run group command");
+
+    let content = fs::read_to_string(&metrics_file).expect("Failed to read metrics file");
+    assert_eq!(
+        content.lines().next(),
+        Some(
+            "accepted_sam_records\tdiscarded_non_pf\tdiscarded_poor_alignment\t\
+             discarded_ns_in_umi\tdiscarded_umis_to_short"
+        )
+    );
+}
+
 /// Helper function to create a test BAM file with multiple UMI families.
 fn create_test_input_bam(path: &PathBuf) {
     let header = create_minimal_header("chr1", 10000);

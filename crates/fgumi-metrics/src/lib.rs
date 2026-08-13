@@ -12,12 +12,14 @@
 pub mod clip;
 pub mod consensus;
 pub mod correct;
+pub mod dedup;
 pub mod duplex;
 pub mod float;
 pub mod group;
 pub mod rejection;
 pub mod shared;
 pub mod simplex;
+pub mod template_filter;
 pub mod writer;
 
 use serde::{Deserialize, Serialize};
@@ -98,6 +100,7 @@ pub trait ProcessingMetrics {
 pub use clip::{ClipCounts, ClippingMetrics, ClippingMetricsCollection, ReadType};
 pub use consensus::{ConsensusCallerKind, ConsensusKvMetric, ConsensusMetrics};
 pub use correct::UmiCorrectionMetrics;
+pub use dedup::DeduplicationMetrics;
 pub use duplex::{
     DuplexFamilySizeMetric, DuplexMetricsCollector, DuplexUmiMetric, DuplexYieldMetric,
     FamilySizeMetric,
@@ -106,6 +109,7 @@ pub use group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics}
 pub use rejection::{RejectionReason, format_count};
 pub use shared::UmiMetric;
 pub use simplex::{SimplexFamilySizeMetric, SimplexMetricsCollector, SimplexYieldMetric};
+pub use template_filter::{TemplateFilterCounts, TemplateFilterReason};
 pub use writer::{read_metrics, read_metrics_auto, write_metrics};
 
 #[cfg(test)]

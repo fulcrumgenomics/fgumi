@@ -7,20 +7,20 @@ use crate::commands::common::{
     build_pipeline_config, is_r1_genomically_earlier_raw,
 };
 use crate::grouper::{
-    FilterMetrics, ProcessedPositionGroup, RawPositionGroup, RecordPositionGrouper,
-    build_templates_from_records,
+    ProcessedPositionGroup, RawPositionGroup, RecordPositionGrouper, build_templates_from_records,
 };
 use crate::logging::{OperationTimer, log_umi_grouping_summary};
+use crate::metrics::TemplateFilterCounts;
 use crate::metrics::group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::read_info::LibraryIndex;
 use crate::sam::is_template_coordinate_sorted;
 use crate::template::Template;
+use crate::template_filter::{TemplateFilterConfig, filter_template};
 use crate::umi::parallel_assigner::{
     ParallelAdjacencyAssigner, ParallelEditAssigner, ParallelIdentityAssigner,
     ParallelPairedAssigner,
 };
-use crate::umi::{UmiValidation, validate_umi};
 use crate::unified_pipeline::DecodedRecord;
 use crate::unified_pipeline::compute_group_key_from_raw;
 use crate::unified_pipeline::{
@@ -70,11 +70,15 @@ fn estimate_templates_heap_size(templates: &[Template]) -> usize {
 struct GroupMetricsAccumulator {
     family_sizes: AHashMap<usize, u64>,
     position_group_sizes: AHashMap<usize, u64>,
-    filter_metrics: FilterMetrics,
+    filter_counts: TemplateFilterCounts,
 }
 
 impl GroupMetricsAccumulator {
-    fn record_group(&mut self, family_sizes: AHashMap<usize, u64>, filter_metrics: &FilterMetrics) {
+    fn record_group(
+        &mut self,
+        family_sizes: AHashMap<usize, u64>,
+        filter_counts: &TemplateFilterCounts,
+    ) {
         let position_group_size: u64 = family_sizes.values().sum();
         for (size, count) in family_sizes {
             *self.family_sizes.entry(size).or_insert(0) += count;
@@ -82,196 +86,13 @@ impl GroupMetricsAccumulator {
         if position_group_size > 0 {
             *self.position_group_sizes.entry(position_group_size as usize).or_insert(0) += 1;
         }
-        self.filter_metrics.merge(filter_metrics);
+        self.filter_counts.merge(filter_counts);
     }
-}
-
-/// Configuration for template filtering during group processing.
-#[derive(Clone)]
-struct GroupFilterConfig {
-    /// UMI tag bytes (e.g., [b'R', b'X']).
-    umi_tag: [u8; 2],
-    /// Minimum mapping quality.
-    min_mapq: u8,
-    /// Whether to include non-PF reads.
-    include_non_pf: bool,
-    /// Minimum UMI length (None to disable).
-    min_umi_length: Option<usize>,
-    /// Skip UMI validation; group by template coordinate and strand of origin alone.
-    no_umi: bool,
-    /// Whether to allow fully unmapped templates (both reads unmapped).
-    allow_unmapped: bool,
 }
 
 // =============================================================================
 // Raw-byte filter and helper functions
 // =============================================================================
-
-/// Filter a template in raw-byte mode based on filtering criteria.
-/// Returns true if the template should be kept, false if it should be discarded.
-fn filter_template_raw(
-    template: &Template,
-    config: &GroupFilterConfig,
-    metrics: &mut FilterMetrics,
-) -> bool {
-    use fgumi_raw_bam;
-    use fgumi_raw_bam::RawRecordView;
-
-    let primary_reads = u64::from(template.r1().is_some()) + u64::from(template.r2().is_some());
-    metrics.total_templates += primary_reads;
-
-    // Fail closed when *any* record (primary, secondary, or supplementary) is
-    // shorter than the minimum BAM record length: a truncated record indicates
-    // corrupt input, so the whole template must be rejected (not silently
-    // treated as a single-read template, and never reaching RawRecordView::new
-    // on a malformed slice).
-    if template.records().iter().any(|r| r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN) {
-        metrics.discarded_poor_alignment += primary_reads;
-        return false;
-    }
-
-    let raw_r1 = template.r1();
-    let raw_r2 = template.r2();
-    let num_primary_reads = primary_reads;
-
-    if raw_r1.is_none() && raw_r2.is_none() {
-        metrics.discarded_poor_alignment += num_primary_reads;
-        return false;
-    }
-
-    // Check if both reads are unmapped
-    let both_unmapped = raw_r1
-        .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0)
-        && raw_r2
-            .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::UNMAPPED) != 0);
-    if both_unmapped && !config.allow_unmapped {
-        metrics.discarded_poor_alignment += num_primary_reads;
-        return false;
-    }
-
-    // Phase 1: Cheap flag-based checks
-    for raw in [raw_r1, raw_r2].into_iter().flatten() {
-        let flg = RawRecordView::new(raw).flags();
-
-        if !config.include_non_pf && (flg & fgumi_raw_bam::flags::QC_FAIL) != 0 {
-            metrics.discarded_non_pf += num_primary_reads;
-            return false;
-        }
-
-        if (flg & fgumi_raw_bam::flags::UNMAPPED) == 0 && fgumi_raw_bam::mapq(raw) < config.min_mapq
-        {
-            metrics.discarded_poor_alignment += num_primary_reads;
-            return false;
-        }
-    }
-
-    // Phase 2: Single-pass tag lookups (MQ + UMI in one aux scan)
-    for raw in [raw_r1, raw_r2].into_iter().flatten() {
-        let flg = RawRecordView::new(raw).flags();
-        let aux = fgumi_raw_bam::aux_data_slice(raw);
-        let check_mq = (flg & fgumi_raw_bam::flags::MATE_UNMAPPED) == 0;
-        let check_umi = !config.no_umi;
-
-        // Single pass over aux data to find both MQ and UMI tags
-        let mut found_mq: Option<i64> = None;
-        let mut found_umi: Option<&[u8]> = None;
-        let mut p = 0;
-        while p + 3 <= aux.len() {
-            let t = [aux[p], aux[p + 1]];
-            let val_type = aux[p + 2];
-
-            if check_umi && t == config.umi_tag && val_type == b'Z' {
-                let start = p + 3;
-                if let Some(end) = aux[start..].iter().position(|&b| b == 0) {
-                    found_umi = Some(&aux[start..start + end]);
-                    p = start + end + 1;
-                } else {
-                    break;
-                }
-                if !check_mq || found_mq.is_some() {
-                    break;
-                }
-                continue;
-            }
-
-            if check_mq && t == *SamTag::MQ {
-                // Extract MQ value (common types: C/c/S/s/I/i)
-                found_mq = match val_type {
-                    b'C' if p + 3 < aux.len() => Some(i64::from(aux[p + 3])),
-                    b'c' if p + 3 < aux.len() => Some(i64::from(aux[p + 3] as i8)),
-                    b'S' if p + 5 <= aux.len() => {
-                        Some(i64::from(u16::from_le_bytes([aux[p + 3], aux[p + 4]])))
-                    }
-                    b's' if p + 5 <= aux.len() => {
-                        Some(i64::from(i16::from_le_bytes([aux[p + 3], aux[p + 4]])))
-                    }
-                    b'I' if p + 7 <= aux.len() => Some(i64::from(u32::from_le_bytes([
-                        aux[p + 3],
-                        aux[p + 4],
-                        aux[p + 5],
-                        aux[p + 6],
-                    ]))),
-                    b'i' if p + 7 <= aux.len() => Some(i64::from(i32::from_le_bytes([
-                        aux[p + 3],
-                        aux[p + 4],
-                        aux[p + 5],
-                        aux[p + 6],
-                    ]))),
-                    _ => None,
-                };
-            }
-
-            if let Some(size) = fgumi_raw_bam::tag_value_size(val_type, &aux[p + 3..]) {
-                p += 3 + size;
-            } else {
-                break;
-            }
-            if (!check_umi || found_umi.is_some()) && (!check_mq || found_mq.is_some()) {
-                break;
-            }
-        }
-
-        // Check mate MAPQ. Compare in i64 so a malformed `MQ:i:-1` (or any
-        // negative value from a signed integer aux type) reads as below the
-        // threshold instead of wrapping into a large positive u8.
-        if check_mq
-            && let Some(mq) = found_mq
-            && mq < i64::from(config.min_mapq)
-        {
-            metrics.discarded_poor_alignment += num_primary_reads;
-            return false;
-        }
-
-        // Skip UMI validation in no-umi mode
-        if config.no_umi {
-            continue;
-        }
-
-        // Check UMI for Ns and minimum length
-        if let Some(umi_bytes) = found_umi {
-            match validate_umi(umi_bytes) {
-                UmiValidation::ContainsN => {
-                    metrics.discarded_ns_in_umi += num_primary_reads;
-                    return false;
-                }
-                UmiValidation::Valid(base_count) => {
-                    if let Some(min_len) = config.min_umi_length
-                        && base_count < min_len
-                    {
-                        metrics.discarded_umi_too_short += num_primary_reads;
-                        return false;
-                    }
-                }
-            }
-        } else {
-            metrics.discarded_poor_alignment += num_primary_reads;
-            return false;
-        }
-    }
-
-    metrics.accepted_templates += num_primary_reads;
-    true
-}
 
 /// Get pair orientation from raw-byte template.
 fn get_pair_orientation_raw(template: &Template) -> (bool, bool) {
@@ -901,16 +722,10 @@ pub struct GroupReadsByUmi {
 ///
 /// Shared by both the pipeline and single-threaded execution paths.
 fn build_grouping_metrics(
-    filter_metrics: &FilterMetrics,
+    filter_counts: &TemplateFilterCounts,
     family_size_counter: &AHashMap<usize, u64>,
 ) -> UmiGroupingMetrics {
-    let mut metrics = UmiGroupingMetrics::new();
-    metrics.total_records = filter_metrics.total_templates;
-    metrics.accepted_records = filter_metrics.accepted_templates;
-    metrics.discarded_non_pf = filter_metrics.discarded_non_pf;
-    metrics.discarded_poor_alignment = filter_metrics.discarded_poor_alignment;
-    metrics.discarded_ns_in_umi = filter_metrics.discarded_ns_in_umi;
-    metrics.discarded_umi_too_short = filter_metrics.discarded_umi_too_short;
+    let mut metrics = UmiGroupingMetrics::from_filter_counts(filter_counts);
 
     metrics.total_families = family_size_counter.values().sum::<u64>();
     metrics.unique_molecule_ids = metrics.total_families;
@@ -1080,7 +895,7 @@ impl Command for GroupReadsByUmi {
         let cell_tag = Tag::from(SamTag::CB);
 
         // Create filter configuration
-        let filter_config = GroupFilterConfig {
+        let filter_config = TemplateFilterConfig {
             umi_tag: raw_tag,
             min_mapq,
             include_non_pf: self.include_non_pf_reads,
@@ -1244,12 +1059,12 @@ impl Command for GroupReadsByUmi {
                     return Ok(ProcessedPositionGroup {
                         templates: Vec::new(),
                         family_sizes: AHashMap::new(),
-                        filter_metrics: FilterMetrics::new(),
+                        filter_counts: TemplateFilterCounts::new(),
                         input_record_count,
                         distinct_mi_count: 0,
                     });
                 }
-                let mut filter_metrics = FilterMetrics::new();
+                let mut filter_counts = TemplateFilterCounts::new();
 
                 // Track memory usage if debug mode is enabled (optimized for hot path)
                 #[cfg(feature = "memory-debug")]
@@ -1283,7 +1098,7 @@ impl Command for GroupReadsByUmi {
                 // Filter templates
                 let filtered_templates: Vec<Template> = all_templates
                     .into_iter()
-                    .filter(|t| filter_template_raw(t, &filter_config, &mut filter_metrics))
+                    .filter(|t| filter_template(t, &filter_config, &mut filter_counts))
                     .collect();
 
                 // Track filtered template memory (optimized for hot path).
@@ -1321,7 +1136,7 @@ impl Command for GroupReadsByUmi {
                     return Ok(ProcessedPositionGroup {
                         templates: Vec::new(),
                         family_sizes: AHashMap::new(),
-                        filter_metrics,
+                        filter_counts,
                         input_record_count,
                         distinct_mi_count: 0,
                     });
@@ -1429,7 +1244,7 @@ impl Command for GroupReadsByUmi {
                 Ok(ProcessedPositionGroup {
                     templates,
                     family_sizes,
-                    filter_metrics,
+                    filter_counts,
                     input_record_count,
                     distinct_mi_count,
                 })
@@ -1454,7 +1269,7 @@ impl Command for GroupReadsByUmi {
                 // Memory stays O(threads × distinct sizes) instead of growing
                 // one hashmap per position group.
                 accumulators_clone.with_slot(|acc| {
-                    acc.record_group(processed.family_sizes, &processed.filter_metrics);
+                    acc.record_group(processed.family_sizes, &processed.filter_counts);
                 });
 
                 // Save input record count for progress tracking
@@ -1550,7 +1365,7 @@ impl Command for GroupReadsByUmi {
         // requiring unique ownership.
         let mut family_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
         let mut position_group_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
-        let mut total_filter_metrics = FilterMetrics::new();
+        let mut total_filter_counts = TemplateFilterCounts::new();
 
         for slot in accumulators.slots() {
             let acc = slot.lock();
@@ -1560,10 +1375,10 @@ impl Command for GroupReadsByUmi {
             for (&size, &count) in &acc.position_group_sizes {
                 *position_group_size_counter.entry(size).or_insert(0) += count;
             }
-            total_filter_metrics.merge(&acc.filter_metrics);
+            total_filter_counts.merge(&acc.filter_counts);
         }
 
-        let metrics = build_grouping_metrics(&total_filter_metrics, &family_size_counter);
+        let metrics = build_grouping_metrics(&total_filter_counts, &family_size_counter);
         log_umi_grouping_summary(&metrics);
 
         // Write all metrics (individual flags and --metrics prefix)
@@ -1593,7 +1408,7 @@ impl GroupReadsByUmi {
         raw_tag: [u8; 2],
         assign_tag_bytes: [u8; 2],
         cell_tag: Tag,
-        filter_config: &GroupFilterConfig,
+        filter_config: &TemplateFilterConfig,
         timer: &OperationTimer,
     ) -> Result<()> {
         info!("Using single-threaded mode");
@@ -1620,7 +1435,7 @@ impl GroupReadsByUmi {
         let mut grouper = RecordPositionGrouper::new();
 
         // Metrics accumulators (no lock-free queue needed in single-threaded mode)
-        let mut total_filter_metrics = FilterMetrics::new();
+        let mut total_filter_counts = TemplateFilterCounts::new();
         let mut family_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
         let mut position_group_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
         let mut next_mi_base: u64 = 0;
@@ -1655,7 +1470,7 @@ impl GroupReadsByUmi {
                     self.parallel_group_min_templates.as_ref(),
                     raw_tag,
                     assign_tag_bytes,
-                    &mut total_filter_metrics,
+                    &mut total_filter_counts,
                     &mut family_size_counter,
                     &mut position_group_size_counter,
                     &mut next_mi_base,
@@ -1679,7 +1494,7 @@ impl GroupReadsByUmi {
                 self.parallel_group_min_templates.as_ref(),
                 raw_tag,
                 assign_tag_bytes,
-                &mut total_filter_metrics,
+                &mut total_filter_counts,
                 &mut family_size_counter,
                 &mut position_group_size_counter,
                 &mut next_mi_base,
@@ -1694,7 +1509,7 @@ impl GroupReadsByUmi {
         writer.into_inner().finish().context("Failed to finish output BAM")?;
         info!("Wrote output to {}", self.io.output.display());
 
-        let metrics = build_grouping_metrics(&total_filter_metrics, &family_size_counter);
+        let metrics = build_grouping_metrics(&total_filter_counts, &family_size_counter);
         log_umi_grouping_summary(&metrics);
 
         // Write all metrics (individual flags and --metrics prefix)
@@ -1715,7 +1530,7 @@ impl GroupReadsByUmi {
     #[allow(clippy::too_many_arguments)]
     fn process_and_write_position_group(
         group: RawPositionGroup,
-        filter_config: &GroupFilterConfig,
+        filter_config: &TemplateFilterConfig,
         strategy: Strategy,
         effective_edits: u32,
         index_threshold: IndexThreshold,
@@ -1723,7 +1538,7 @@ impl GroupReadsByUmi {
         parallel_group_min_templates: Option<&ParallelMinTemplates>,
         raw_tag: [u8; 2],
         assign_tag_bytes: [u8; 2],
-        total_filter_metrics: &mut FilterMetrics,
+        total_filter_counts: &mut TemplateFilterCounts,
         family_size_counter: &mut AHashMap<usize, u64>,
         position_group_size_counter: &mut AHashMap<usize, u64>,
         next_mi_base: &mut u64,
@@ -1733,15 +1548,15 @@ impl GroupReadsByUmi {
         // Build templates from raw records
         let all_templates = build_templates_from_records(group.records)?;
 
-        let mut filter_metrics = FilterMetrics::new();
+        let mut filter_counts = TemplateFilterCounts::new();
 
         // Filter templates
         let filtered_templates: Vec<Template> = all_templates
             .into_iter()
-            .filter(|t| filter_template_raw(t, filter_config, &mut filter_metrics))
+            .filter(|t| filter_template(t, filter_config, &mut filter_counts))
             .collect();
 
-        total_filter_metrics.merge(&filter_metrics);
+        total_filter_counts.merge(&filter_counts);
 
         if filtered_templates.is_empty() {
             return Ok(());
@@ -1959,6 +1774,7 @@ fn with_extension(prefix: &Path, suffix: &str) -> PathBuf {
 mod tests {
     use super::*;
     use crate::assigner::{IdentityUmiAssigner, PairedUmiAssigner, Strategy};
+    use crate::metrics::TemplateFilterReason;
     use bstr::BString;
     use fgumi_raw_bam::{
         SamBuilder as RawSamBuilder, flags, raw_record_to_record_buf, testutil::encode_op,
@@ -3027,7 +2843,7 @@ mod tests {
     ) -> Result<()> {
         // Same dataset as test_metrics_prefix_writes_all_files, plus one
         // extra N-containing UMI pair (discarded) so the parity check also
-        // covers the `filter_metrics` merge in the per-thread accumulators:
+        // covers the `filter_counts` merge in the per-thread accumulators:
         //   Position group 1 (pos 100,300): UMI AAA x3 + CCC x1 = 2 families
         //   Position group 2 (pos 200,400): UMI AAA x2          = 1 family
         //   Position group 3 (pos 300,500): UMI AAA/CCC/GGG x1  = 3 families
@@ -5900,7 +5716,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Raw-byte filter_template_raw tests
+    // Raw-byte filter_template tests
     // ========================================================================
 
     /// Build a raw BAM record with specified flags, mapq, and UMI for testing.
@@ -5957,7 +5773,7 @@ mod tests {
     }
 
     #[test]
-    fn test_group_filter_template_raw_accepts_valid() {
+    fn test_group_filter_template_accepts_valid() {
         let raw = make_raw_bam_for_group(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
@@ -5968,21 +5784,14 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 20,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
-        let mut metrics = FilterMetrics::new();
-        assert!(filter_template_raw(&template, &config, &mut metrics));
-        assert_eq!(metrics.accepted_templates, 1);
+        let config = TemplateFilterConfig { min_mapq: 20, ..Default::default() };
+        let mut metrics = TemplateFilterCounts::new();
+        assert!(filter_template(&template, &config, &mut metrics));
+        assert_eq!(metrics.accepted_primary_reads(), 1);
     }
 
     #[test]
-    fn test_group_filter_template_raw_rejects_low_mapq() {
+    fn test_group_filter_template_rejects_low_mapq() {
         let raw = make_raw_bam_for_group(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
@@ -5993,21 +5802,14 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 20,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
-        let mut metrics = FilterMetrics::new();
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
-        assert_eq!(metrics.discarded_poor_alignment, 1);
+        let config = TemplateFilterConfig { min_mapq: 20, ..Default::default() };
+        let mut metrics = TemplateFilterCounts::new();
+        assert!(!filter_template(&template, &config, &mut metrics));
+        assert_eq!(metrics.rejected_primary_reads(TemplateFilterReason::LowMappingQuality), 1);
     }
 
     #[test]
-    fn test_group_filter_template_raw_rejects_qc_fail() {
+    fn test_group_filter_template_rejects_qc_fail() {
         let raw = make_raw_bam_for_group(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
@@ -6019,21 +5821,14 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
-        let mut metrics = FilterMetrics::new();
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
-        assert_eq!(metrics.discarded_non_pf, 1);
+        let config = TemplateFilterConfig { ..Default::default() };
+        let mut metrics = TemplateFilterCounts::new();
+        assert!(!filter_template(&template, &config, &mut metrics));
+        assert_eq!(metrics.rejected_primary_reads(TemplateFilterReason::NotPassingFilter), 1);
     }
 
     #[test]
-    fn test_group_filter_template_raw_rejects_umi_with_n() {
+    fn test_group_filter_template_rejects_umi_with_n() {
         let raw = make_raw_bam_for_group(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
@@ -6044,21 +5839,14 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
-        let mut metrics = FilterMetrics::new();
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
-        assert_eq!(metrics.discarded_ns_in_umi, 1);
+        let config = TemplateFilterConfig { ..Default::default() };
+        let mut metrics = TemplateFilterCounts::new();
+        assert!(!filter_template(&template, &config, &mut metrics));
+        assert_eq!(metrics.rejected_primary_reads(TemplateFilterReason::NsInUmi), 1);
     }
 
     #[test]
-    fn test_group_filter_template_raw_rejects_short_umi() {
+    fn test_group_filter_template_rejects_short_umi() {
         let raw = make_raw_bam_for_group(
             b"rea",
             fgumi_raw_bam::flags::PAIRED
@@ -6069,21 +5857,14 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: Some(6),
-            no_umi: false,
-            allow_unmapped: false,
-        };
-        let mut metrics = FilterMetrics::new();
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
-        assert_eq!(metrics.discarded_umi_too_short, 1);
+        let config = TemplateFilterConfig { min_umi_length: Some(6), ..Default::default() };
+        let mut metrics = TemplateFilterCounts::new();
+        assert!(!filter_template(&template, &config, &mut metrics));
+        assert_eq!(metrics.rejected_primary_reads(TemplateFilterReason::UmiTooShort), 1);
     }
 
     #[test]
-    fn test_group_filter_template_raw_rejects_unmapped() {
+    fn test_group_filter_template_rejects_unmapped() {
         let raw = make_raw_bam_for_group(
             b"rea",
             fgumi_raw_bam::flags::UNMAPPED | fgumi_raw_bam::flags::MATE_UNMAPPED,
@@ -6092,24 +5873,17 @@ mod tests {
         );
         let template =
             Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
-        let mut metrics = FilterMetrics::new();
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
-        assert_eq!(metrics.discarded_poor_alignment, 1);
+        let config = TemplateFilterConfig { ..Default::default() };
+        let mut metrics = TemplateFilterCounts::new();
+        assert!(!filter_template(&template, &config, &mut metrics));
+        assert_eq!(metrics.rejected_primary_reads(TemplateFilterReason::Unmapped), 1);
     }
 
     /// A truncated secondary or supplementary alignment must reject the whole
     /// template too — the previous r1()/r2()-only guard let truncated
     /// non-primary records slip through.
     #[test]
-    fn test_group_filter_template_raw_truncated_secondary_rejected() {
+    fn test_group_filter_template_truncated_secondary_rejected() {
         let valid_r1 = make_raw_bam_for_group(
             b"rea",
             fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
@@ -6137,26 +5911,19 @@ mod tests {
             cached_umi_position: None,
         };
 
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
-        let mut metrics = FilterMetrics::new();
+        let config = TemplateFilterConfig { ..Default::default() };
+        let mut metrics = TemplateFilterCounts::new();
         assert!(
-            !filter_template_raw(&template, &config, &mut metrics),
+            !filter_template(&template, &config, &mut metrics),
             "truncated secondary must cause the template to be rejected"
         );
-        assert_eq!(metrics.discarded_poor_alignment, 2);
+        assert_eq!(metrics.rejected_primary_reads(TemplateFilterReason::MalformedRecord), 2);
     }
 
     #[test]
-    fn test_group_filter_template_raw_truncated_record_treated_as_missing() {
+    fn test_group_filter_template_truncated_record_treated_as_missing() {
         // Construct a Template by bypassing from_records validation so that
-        // raw_records[0] is shorter than MIN_BAM_RECORD_LEN. filter_template_raw
+        // raw_records[0] is shorter than MIN_BAM_RECORD_LEN. filter_template
         // must reject the template, accounting for the missing primary read.
         let short_rec = fgumi_raw_bam::RawRecord::from(vec![0u8; 16]);
         let valid_rec = make_raw_bam_for_group(
@@ -6187,17 +5954,10 @@ mod tests {
             cached_umi_position: None,
         };
 
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
-        let mut metrics = FilterMetrics::new();
+        let config = TemplateFilterConfig { ..Default::default() };
+        let mut metrics = TemplateFilterCounts::new();
         assert!(
-            !filter_template_raw(&template, &config, &mut metrics),
+            !filter_template(&template, &config, &mut metrics),
             "truncated R1 must cause the template to be rejected"
         );
     }
@@ -6206,7 +5966,7 @@ mod tests {
     /// non-negative threshold, not wrapped to a large positive `u8` (which
     /// would let malformed records slip past `min_mapq`).
     #[test]
-    fn test_group_filter_template_raw_negative_mate_mq_rejected() {
+    fn test_group_filter_template_negative_mate_mq_rejected() {
         // Build R1 + R2 where R2 carries an aux MQ:i:-1 (signed int aux type).
         fn make_with_neg_mate_mq(name: &[u8], flag: u16, mapq: u8) -> fgumi_raw_bam::RawRecord {
             let seq_len = 4usize;
@@ -6260,23 +6020,16 @@ mod tests {
         let template =
             Template::from_records(vec![r1, r2]).expect("template construction should succeed");
 
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 20,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
-        let mut metrics = FilterMetrics::new();
+        let config = TemplateFilterConfig { min_mapq: 20, ..Default::default() };
+        let mut metrics = TemplateFilterCounts::new();
         assert!(
-            !filter_template_raw(&template, &config, &mut metrics),
+            !filter_template(&template, &config, &mut metrics),
             "negative mate MQ must compare below min_mapq (signed semantics)"
         );
     }
 
     #[test]
-    fn test_group_filter_template_raw_no_primary_reads() {
+    fn test_group_filter_template_no_primary_reads() {
         // Template with only supplementary records → no raw_r1/raw_r2
         let supp = make_raw_bam_for_group(
             b"rea",
@@ -6289,17 +6042,10 @@ mod tests {
         );
         let template =
             Template::from_records(vec![supp]).expect("Template::from_raw_records should succeed");
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 0,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
-        let mut metrics = FilterMetrics::new();
+        let config = TemplateFilterConfig { ..Default::default() };
+        let mut metrics = TemplateFilterCounts::new();
         // Supplementary-only template has no primary R1/R2 → raw_r1() returns None
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert!(!filter_template(&template, &config, &mut metrics));
     }
 
     // ========================================================================
@@ -6638,21 +6384,15 @@ mod tests {
         let (r1, r2) = build_unmapped_test_pair("unmapped", "AAAAAA");
         let template = Template::from_records(vec![r1, r2])?;
 
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 1,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: true,
-        };
+        let config =
+            TemplateFilterConfig { min_mapq: 1, allow_unmapped: true, ..Default::default() };
 
-        let mut metrics = FilterMetrics::new();
-        let should_keep = filter_template_raw(&template, &config, &mut metrics);
+        let mut metrics = TemplateFilterCounts::new();
+        let should_keep = filter_template(&template, &config, &mut metrics);
 
         assert!(should_keep, "Unmapped template should be kept when allow_unmapped=true");
-        assert_eq!(metrics.total_templates, 2, "Should count 2 records");
-        assert_eq!(metrics.discarded_poor_alignment, 0, "Should not discard for poor alignment");
+        assert_eq!(metrics.total_primary_reads(), 2, "Should count 2 records");
+        assert_eq!(metrics.total_rejected_primary_reads(), 0, "Should not discard anything");
 
         Ok(())
     }
@@ -6662,23 +6402,17 @@ mod tests {
         let (r1, r2) = build_unmapped_test_pair("unmapped", "AAAAAA");
         let template = Template::from_records(vec![r1, r2])?;
 
-        let config = GroupFilterConfig {
-            umi_tag: [b'R', b'X'],
-            min_mapq: 1,
-            include_non_pf: false,
-            min_umi_length: None,
-            no_umi: false,
-            allow_unmapped: false,
-        };
+        let config = TemplateFilterConfig { min_mapq: 1, ..Default::default() };
 
-        let mut metrics = FilterMetrics::new();
-        let should_keep = filter_template_raw(&template, &config, &mut metrics);
+        let mut metrics = TemplateFilterCounts::new();
+        let should_keep = filter_template(&template, &config, &mut metrics);
 
         assert!(!should_keep, "Unmapped template should be rejected when allow_unmapped=false");
-        assert_eq!(metrics.total_templates, 2, "Should count 2 records");
+        assert_eq!(metrics.total_primary_reads(), 2, "Should count 2 records");
         assert_eq!(
-            metrics.discarded_poor_alignment, 2,
-            "Should discard both reads for poor alignment"
+            metrics.rejected_primary_reads(TemplateFilterReason::Unmapped),
+            2,
+            "Should discard both reads as unmapped"
         );
 
         Ok(())
