@@ -449,7 +449,7 @@ impl Command for Codec {
 
         // Use the raw_reader opened above (single input open). Apply the fgbio
         // pre-group filter: always drop secondary/supplementary; --allow-unmapped
-        // relaxes only the unmapped-without-mapped-mate rule.
+        // relaxes only the mapped-record rule.
         let allow_unmapped = self.allow_unmapped.enabled;
         let raw_record_iter = std::iter::from_fn(move || {
             loop {
@@ -691,7 +691,7 @@ impl Codec {
 
         // ========== grouper_fn ==========
         // Apply the fgbio pre-group filter (always drop secondary/supplementary;
-        // --allow-unmapped relaxes only the unmapped-without-mapped-mate rule).
+        // --allow-unmapped relaxes only the mapped-record rule).
         let allow_unmapped = self.allow_unmapped.enabled;
         let grouper_fn = move |_header: &Header| {
             let grouper = MiGrouper::new("MI", batch_size)
@@ -951,7 +951,7 @@ mod tests {
 
     /// The codec pre-group filter drops secondary/supplementary alignments before
     /// grouping (fgbio parity), and `--allow-unmapped` must **not** relax that
-    /// exclusion — it only relaxes the unmapped-without-mapped-mate rule.
+    /// exclusion — it only relaxes the mapped-record rule.
     ///
     /// This is the codec counterpart to simplex's
     /// `test_allow_unmapped_gates_pregroup_filter` /
@@ -1156,6 +1156,102 @@ mod tests {
         let r2 = to_record_buf(b2.build());
 
         (r1, r2)
+    }
+
+    /// A fully-unmapped primary pair (both ends `UNMAPPED`, both mates
+    /// `MATE_UNMAPPED`) sharing `mi_value`. Used to verify that `--allow-unmapped`
+    /// admits such a pair past the pre-group filter but the codec caller still
+    /// declines to call it.
+    fn create_codec_unmapped_pair(
+        mi_value: &str,
+        read_len: usize,
+        quals: &[u8],
+    ) -> (RecordBuf, RecordBuf) {
+        let seq_forward = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let seq = &seq_forward[..read_len];
+
+        let build = |flags: u16| {
+            let mut b = RawSamBuilder::new();
+            // ref_id/pos/mate_ref_id/mate_pos of -1 are BAM's "no alignment", and
+            // an unmapped record carries no cigar.
+            b.read_name(format!("read_{mi_value}").as_bytes())
+                .flags(flags)
+                .ref_id(-1)
+                .pos(-1)
+                .mapq(0)
+                .sequence(seq)
+                .qualities(quals)
+                .mate_ref_id(-1)
+                .mate_pos(-1)
+                .template_length(0);
+            b.add_string_tag(SamTag::MI, mi_value.as_bytes());
+            b.add_string_tag(SamTag::RG, b"A");
+            to_record_buf(b.build())
+        };
+
+        let r1 =
+            build(flags::PAIRED | flags::FIRST_SEGMENT | flags::UNMAPPED | flags::MATE_UNMAPPED);
+        let r2 =
+            build(flags::PAIRED | flags::LAST_SEGMENT | flags::UNMAPPED | flags::MATE_UNMAPPED);
+        (r1, r2)
+    }
+
+    /// `--allow-unmapped` admits unmapped primary records into grouping, but the
+    /// codec caller requires a mapped primary FR pair (`is_primary_fr_pair_raw`
+    /// rejects an unmapped read or an unmapped mate), so `codec` emits no
+    /// consensus for a fully-unmapped pair however the flag is set.
+    ///
+    /// This pins the split documented on
+    /// [`consensus_pregroup_keep_flags`](crate::commands::common::consensus_pregroup_keep_flags):
+    /// the flag governs the *filter*, the caller governs whether a consensus is
+    /// produced. `raw_reads_considered` counts post-filter reads, so the two
+    /// assertions separate the two stages — with the flag on, both reads reach
+    /// the caller and are still not called; with it off, the filter drops them
+    /// before grouping.
+    #[rstest]
+    #[case::default_filters_before_grouping(false, 0)]
+    #[case::allow_unmapped_admits_then_caller_rejects(true, 2)]
+    fn test_codec_emits_no_consensus_for_unmapped_pair(
+        #[case] allow_unmapped: bool,
+        #[case] expected_reads_considered: u64,
+    ) -> Result<()> {
+        let dir = TempDir::new()?;
+        let input_path = dir.path().join("input.bam");
+        let output_path = dir.path().join("output.bam");
+        let stats_path = dir.path().join("stats.txt");
+
+        let (r1, r2) = create_codec_unmapped_pair("UMI001", 20, &[30; 20]);
+        write_codec_bam(&input_path, vec![r1, r2])?;
+
+        let mut cmd = create_codec_with_paths(input_path, output_path);
+        cmd.allow_unmapped.enabled = allow_unmapped;
+        cmd.stats_opts.stats = Some(stats_path.clone());
+        cmd.read_group.read_name_prefix = Some("codec".to_string());
+        cmd.outer_bases_length = 0;
+        cmd.execute("test")?;
+
+        let kv_metrics: Vec<ConsensusKvMetric> = DelimFile::default().read_tsv(&stats_path)?;
+        let value_for = |key: &str| -> u64 {
+            kv_metrics
+                .iter()
+                .find(|m| m.key == key)
+                .unwrap_or_else(|| panic!("stats file should contain a `{key}` row"))
+                .value
+                .parse()
+                .unwrap_or_else(|_| panic!("`{key}` value should be an integer"))
+        };
+        assert_eq!(
+            value_for("raw_reads_considered"),
+            expected_reads_considered,
+            "--allow-unmapped governs only the pre-group filter (allow_unmapped={allow_unmapped})"
+        );
+        assert_eq!(
+            value_for("consensus_reads_emitted"),
+            0,
+            "the codec caller never calls a fully-unmapped pair (allow_unmapped={allow_unmapped})"
+        );
+
+        Ok(())
     }
 
     /// A mapped supplementary alignment of R1 (`SUPPLEMENTARY` flag set) sharing

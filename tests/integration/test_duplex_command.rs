@@ -1203,3 +1203,155 @@ fn test_duplex_command_emits_unmapped_consensus_header(#[case] threads: Option<&
         }
     }
 }
+
+/// Builds an A-strand pair whose R2 is unmapped, matching the geometry of
+/// [`create_duplex_read_pair_with_sequences`] so it lands in the same molecule.
+///
+/// The R2 keeps its REVERSE flag so strand grouping is unaffected; only the mapping is removed.
+fn create_half_mapped_a_strand_pair(
+    name: &str,
+    mi_tag: &str,
+    r1_sequence: &str,
+    r2_sequence: &str,
+    quality: u8,
+    ref_start: i32,
+) -> (RawRecord, RawRecord) {
+    let read_len = r1_sequence.len();
+    let cigar_op = u32::try_from(read_len).expect("read_len fits u32") << 4;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "test data with known small values"
+    )]
+    let tlen: i32 = (read_len + 100) as i32;
+
+    let r1 = {
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(r1_sequence.as_bytes())
+            .qualities(&vec![quality; read_len])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .ref_id(0)
+            .pos(ref_start - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar_op])
+            .mate_ref_id(0)
+            .mate_pos(ref_start + 100 - 1)
+            .template_length(tlen)
+            .add_string_tag(SamTag::MI, mi_tag.as_bytes());
+        b.build()
+    };
+
+    let r2 = {
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(r2_sequence.as_bytes())
+            .qualities(&vec![quality; read_len])
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE | flags::UNMAPPED)
+            .ref_id(0)
+            .pos(ref_start + 100 - 1)
+            .mapq(0)
+            .mate_ref_id(0)
+            .mate_pos(ref_start - 1)
+            .template_length(-tlen)
+            .add_string_tag(SamTag::MI, mi_tag.as_bytes());
+        b.build()
+    };
+
+    (r1, r2)
+}
+
+/// The unmapped end of a half-mapped pair must not contribute to a single-strand consensus when
+/// mapped reads are present on that strand. fgumi always prefers mapped reads.
+#[test]
+fn test_duplex_ignores_unmapped_end_when_mapped_reads_present() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    let molecule = vec![
+        create_duplex_read_pair_with_sequences(
+            "ab1",
+            "1/A",
+            "ACGTACGTAC",
+            "GGGGGGGGGG",
+            30,
+            100,
+            false,
+        ),
+        create_duplex_read_pair_with_sequences(
+            "ab2",
+            "1/A",
+            "ACGTACGTAC",
+            "GGGGGGGGGG",
+            30,
+            100,
+            false,
+        ),
+        create_half_mapped_a_strand_pair("ab3", "1/A", "ACGTACGTAC", "TTTTTTTTTT", 30, 100),
+        create_duplex_read_pair_with_sequences(
+            "ba1",
+            "1/B",
+            "ACGTACGTAC",
+            "GGGGGGGGGG",
+            30,
+            100,
+            true,
+        ),
+        create_duplex_read_pair_with_sequences(
+            "ba2",
+            "1/B",
+            "ACGTACGTAC",
+            "GGGGGGGGGG",
+            30,
+            100,
+            true,
+        ),
+    ];
+    create_duplex_bam(&input_bam, vec![molecule]);
+
+    let cmd = Duplex::try_parse_from([
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse duplex args");
+    cmd.execute("fgumi duplex").expect("Duplex command failed");
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let records: Vec<bam::Record> =
+        reader.records().map(|r| r.expect("failed to read record")).collect();
+    assert_eq!(records.len(), 2, "expected one duplex consensus read pair");
+
+    let depth = |record: &bam::Record, tag: SamTag| -> i64 {
+        match record.data().get(&tag.to_noodles_tag()) {
+            Some(Ok(value)) => value.as_int().expect("depth tag must be an integer"),
+            other => panic!("record must carry an integer {tag:?} tag, got {other:?}"),
+        }
+    };
+
+    let r1 = records
+        .iter()
+        .find(|r| r.flags().bits() & flags::FIRST_SEGMENT != 0)
+        .expect("missing R1 consensus");
+    let r2 = records
+        .iter()
+        .find(|r| r.flags().bits() & flags::LAST_SEGMENT != 0)
+        .expect("missing R2 consensus");
+
+    // All three AB-R1s are mapped, so all three contribute to R1's AB single-strand consensus.
+    assert_eq!(depth(r1, SamTag::AD), 3, "R1 should use all three mapped AB reads");
+
+    // Only the two mapped AB-R2s may contribute to R2's AB single-strand consensus. AD is the
+    // oracle here rather than the emitted bases: the record's SEQ is the *duplex* consensus of
+    // the AB and BA strands, so it does not expose the AB single-strand bases this test is about.
+    // (The simplex counterpart can assert bases because it has only one strand.)
+    assert_eq!(depth(r2, SamTag::AD), 2, "R2 must use only the two mapped AB reads");
+}

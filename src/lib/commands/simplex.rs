@@ -403,7 +403,7 @@ impl Command for Simplex {
 
         // Use the raw_reader opened above (single input open). Apply the fgbio
         // pre-group filter: always drop secondary/supplementary; --allow-unmapped
-        // relaxes only the unmapped-without-mapped-mate rule.
+        // relaxes only the mapped-record rule.
         let allow_unmapped = self.allow_unmapped.enabled;
         let raw_record_iter = std::iter::from_fn(move || {
             loop {
@@ -610,7 +610,7 @@ impl Simplex {
 
         // ========== grouper_fn ==========
         // Apply the fgbio pre-group filter (always drop secondary/supplementary;
-        // --allow-unmapped relaxes only the unmapped-without-mapped-mate rule).
+        // --allow-unmapped relaxes only the mapped-record rule).
         let allow_unmapped = self.allow_unmapped.enabled;
         let grouper_fn = move |_header: &Header| {
             let grouper = MiGrouper::new("MI", batch_size)

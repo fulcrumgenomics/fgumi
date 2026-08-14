@@ -482,3 +482,213 @@ fn test_simplex_command_rejects_inherits_input_read_groups() {
         "expected the singleton family in rejects, got {reject_names:?}",
     );
 }
+
+/// Builds a tag family of `mapped_pairs` fully mapped pairs plus one pair whose R2 is unmapped.
+///
+/// The mapped R2s carry `r2_mapped_seq` and the unmapped R2 carries `r2_unmapped_seq`, so the
+/// emitted R2 consensus shows which reads contributed to it. All records share one position so
+/// they land in a single tag family.
+fn half_mapped_family(
+    mapped_pairs: usize,
+    r1_seq: &str,
+    r2_mapped_seq: &str,
+    r2_unmapped_seq: &str,
+) -> Vec<fgumi_raw_bam::RawRecord> {
+    use fgumi_raw_bam::{SamBuilder, flags};
+
+    let r1_cigar = u32::try_from(r1_seq.len()).expect("fits u32") << 4;
+    let r2_cigar = u32::try_from(r2_mapped_seq.len()).expect("fits u32") << 4;
+    let template_len = i32::try_from(100 + r2_mapped_seq.len()).expect("fits i32");
+    let mut records = Vec::new();
+
+    let mut push_pair = |name: &str, r2_seq: &str, r2_unmapped: bool| {
+        let mut b1 = SamBuilder::new();
+        b1.read_name(name.as_bytes())
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .mate_ref_id(0)
+            .mate_pos(199)
+            .template_length(template_len)
+            .cigar_ops(&[r1_cigar])
+            .sequence(r1_seq.as_bytes())
+            .qualities(&vec![30u8; r1_seq.len()])
+            .add_string_tag(SamTag::RX, b"ACGT");
+        records.push(b1.build());
+
+        let mut b2 = SamBuilder::new();
+        let r2_flags = if r2_unmapped {
+            flags::PAIRED | flags::LAST_SEGMENT | flags::UNMAPPED
+        } else {
+            flags::PAIRED | flags::LAST_SEGMENT
+        };
+        b2.read_name(name.as_bytes())
+            .ref_id(0)
+            .pos(199)
+            .mapq(if r2_unmapped { 0 } else { 60 })
+            .flags(r2_flags)
+            .mate_ref_id(0)
+            .mate_pos(99)
+            .template_length(-template_len)
+            .sequence(r2_seq.as_bytes())
+            .qualities(&vec![30u8; r2_seq.len()])
+            .add_string_tag(SamTag::RX, b"ACGT");
+        if !r2_unmapped {
+            b2.cigar_ops(&[r2_cigar]);
+        }
+        records.push(b2.build());
+    };
+
+    for i in 0..mapped_pairs {
+        push_pair(&format!("mapped_{i}"), r2_mapped_seq, false);
+    }
+    push_pair("halfmapped", r2_unmapped_seq, true);
+
+    records
+}
+
+/// The unmapped end of a half-mapped pair must not contribute to a consensus when mapped reads
+/// are present in the same family. fgumi always prefers mapped reads.
+#[test]
+fn test_simplex_ignores_unmapped_end_when_mapped_reads_present() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    let family = half_mapped_family(2, "ACGTACGTAC", "GGGGGGGGGG", "TTTTTTTTTT");
+    create_grouped_bam(&input_bam, vec![("1", family)]);
+
+    let cmd = Simplex::try_parse_from([
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse simplex args");
+    cmd.execute("fgumi simplex").expect("Simplex command failed");
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let records: Vec<bam::Record> =
+        reader.records().map(|r| r.expect("failed to read record")).collect();
+    assert_eq!(records.len(), 2, "expected one consensus read pair");
+
+    let r1 = records
+        .iter()
+        .find(|r| r.flags().bits() & raw_flags::FIRST_SEGMENT != 0)
+        .expect("missing R1 consensus");
+    let r2 = records
+        .iter()
+        .find(|r| r.flags().bits() & raw_flags::LAST_SEGMENT != 0)
+        .expect("missing R2 consensus");
+
+    // All three R1s are mapped, so all three contribute.
+    assert_eq!(int_tag(r1, SamTag::CD), 3, "R1 should use all three mapped reads");
+
+    // Only the two mapped R2s may contribute; the unmapped R2's bases must not reach the consensus.
+    assert_eq!(int_tag(r2, SamTag::CD), 2, "R2 must use only the two mapped reads");
+    let r2_bases: String = r2.sequence().iter().map(char::from).collect();
+    assert_eq!(r2_bases, "GGGGGGGGGG", "R2 consensus must come from the mapped reads");
+}
+
+/// Under `--allow-unmapped`, unmapped reads are admitted to grouping, but must still not displace
+/// mapped reads within a set being consensus called.
+#[test]
+fn test_simplex_prefers_mapped_reads_even_when_unmapped_are_allowed() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    let family = half_mapped_family(2, "ACGTACGTAC", "GGGGGGGGGG", "TTTTTTTTTT");
+    create_grouped_bam(&input_bam, vec![("1", family)]);
+
+    let cmd = Simplex::try_parse_from([
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--allow-unmapped",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse simplex args");
+    cmd.execute("fgumi simplex").expect("Simplex command failed");
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let records: Vec<bam::Record> =
+        reader.records().map(|r| r.expect("failed to read record")).collect();
+    let r2 = records
+        .iter()
+        .find(|r| r.flags().bits() & raw_flags::LAST_SEGMENT != 0)
+        .expect("missing R2 consensus");
+
+    assert_eq!(int_tag(r2, SamTag::CD), 2, "mapped reads must win even with --allow-unmapped");
+    let r2_bases: String = r2.sequence().iter().map(char::from).collect();
+    assert_eq!(r2_bases, "GGGGGGGGGG", "R2 consensus must come from the mapped reads");
+}
+
+/// `--allow-unmapped` must still produce a consensus for a wholly unmapped family; this is the
+/// capability (e.g. ribosome display) that keeps fgumi from simply requiring mapped reads.
+#[test]
+fn test_simplex_allow_unmapped_still_consenses_a_wholly_unmapped_family() {
+    use fgumi_raw_bam::{SamBuilder, flags};
+
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    let mut records = Vec::new();
+    for i in 0..3 {
+        for (segment, seq) in
+            [(flags::FIRST_SEGMENT, "ACGTACGTAC"), (flags::LAST_SEGMENT, "GGGGGGGGGG")]
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(format!("unmapped_{i}").as_bytes())
+                .ref_id(-1)
+                .pos(-1)
+                .mapq(0)
+                .flags(flags::PAIRED | segment | flags::UNMAPPED | flags::MATE_UNMAPPED)
+                .mate_ref_id(-1)
+                .mate_pos(-1)
+                .sequence(seq.as_bytes())
+                .qualities(&vec![30u8; seq.len()])
+                .add_string_tag(SamTag::RX, b"ACGT");
+            records.push(b.build());
+        }
+    }
+    create_grouped_bam(&input_bam, vec![("1", records)]);
+
+    let cmd = Simplex::try_parse_from([
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--allow-unmapped",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse simplex args");
+    cmd.execute("fgumi simplex").expect("Simplex command failed");
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let records: Vec<bam::Record> =
+        reader.records().map(|r| r.expect("failed to read record")).collect();
+    assert_eq!(records.len(), 2, "a wholly unmapped family must still yield a consensus pair");
+    for record in &records {
+        assert_eq!(int_tag(record, SamTag::CD), 3, "all three unmapped reads should contribute");
+    }
+}

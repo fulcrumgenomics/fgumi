@@ -1088,16 +1088,50 @@ impl VanillaUmiConsensusCaller {
         if self.options.max_reads.is_some() { fgbio_read_name_rank(name) } else { 0 }
     }
 
+    /// Drops unmapped reads when the set also contains at least one mapped read.
+    ///
+    /// An unmapped read has no cigar, and an empty cigar is a prefix of every cigar, so
+    /// `select_most_common_alignment_group` would match it against whichever alignment group it
+    /// was tested against first rather than letting it form a group of its own. It would then
+    /// contribute bases and depth to the consensus with no alignment supporting it.
+    ///
+    /// A wholly unmapped set is returned untouched, so molecules from
+    /// `fgumi group --allow-unmapped` (e.g. ribosome display) still produce consensus reads.
+    ///
+    /// Returns the retained reads and the original indices of any dropped unmapped reads.
+    fn drop_unmapped_if_any_mapped(
+        &mut self,
+        source_reads: Vec<SourceRead>,
+    ) -> (Vec<SourceRead>, HashSet<usize>) {
+        let is_unmapped = |sr: &SourceRead| sr.flags & flags::UNMAPPED != 0;
+
+        if !source_reads.iter().any(is_unmapped) || source_reads.iter().all(is_unmapped) {
+            return (source_reads, HashSet::new());
+        }
+
+        let (retained, dropped): (Vec<SourceRead>, Vec<SourceRead>) =
+            source_reads.into_iter().partition(|sr| !is_unmapped(sr));
+
+        self.stats.record_rejection(RejectionReason::Unmapped, dropped.len());
+        (retained, dropped.into_iter().map(|sr| sr.original_idx).collect())
+    }
+
     /// Filters `SourceReads` to only include those with the most common alignment pattern.
     /// This matches fgbio's filterToMostCommonAlignment behavior.
+    ///
+    /// Unmapped reads are dropped first whenever any mapped read is present: fgumi always
+    /// prefers to build a consensus from mapped reads. A wholly unmapped set is left intact so
+    /// that `fgumi group --allow-unmapped` workflows still produce consensus reads.
     ///
     /// Returns the filtered `SourceReads` and a set of rejected original indices.
     fn filter_source_reads_by_alignment(
         &mut self,
         source_reads: Vec<SourceRead>,
     ) -> (Vec<SourceRead>, HashSet<usize>) {
+        let (source_reads, unmapped_rejected) = self.drop_unmapped_if_any_mapped(source_reads);
+
         if source_reads.len() < 2 {
-            return (source_reads, HashSet::new());
+            return (source_reads, unmapped_rejected);
         }
 
         // Create indexed data: (source_read_index, length, simplified_cigar)
@@ -1122,7 +1156,8 @@ impl VanillaUmiConsensusCaller {
 
         // Collect rejected original indices with pre-allocated capacity
         let rejected_count = source_reads.len().saturating_sub(keep_indices.len());
-        let mut rejected_original_indices = HashSet::with_capacity(rejected_count);
+        let mut rejected_original_indices = unmapped_rejected;
+        rejected_original_indices.reserve(rejected_count);
         for (i, sr) in source_reads.iter().enumerate() {
             if !keep_mask[i] {
                 rejected_original_indices.insert(sr.original_idx);

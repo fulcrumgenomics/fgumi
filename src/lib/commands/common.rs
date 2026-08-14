@@ -345,18 +345,33 @@ fn header_sort_and_group_order(header: &Header) -> (String, String, Option<Strin
 
 /// The fgbio `ConsensusCallingIterator` pre-group filter
 /// (`ConsensusCallingIterator.scala:56-58`): drop secondary/supplementary
-/// alignments and any record that is unmapped **and** lacks a mapped mate.
+/// alignments and any record that is unmapped.
 ///
 /// fgbio applies this to *every* consensus caller (simplex, duplex, codec),
 /// for both the single- and multi-threaded execution paths, before grouping
 /// reads by molecular identifier. fgumi replicates it in the consensus
 /// commands.
 ///
-/// `--allow-unmapped` relaxes **only** the unmapped-without-mapped-mate rule so
-/// fully-unmapped input can be consensus-called (mirroring
-/// `fgumi group --allow-unmapped`). Secondary/supplementary alignments are
-/// **always** dropped, matching fgbio — `--allow-unmapped` never lets
-/// non-primary alignments into grouping.
+/// An unmapped record is dropped even when its mate is mapped. It has no cigar,
+/// and an empty cigar is a prefix of every cigar, so it would match every
+/// alignment group in `select_most_common_alignment_group` rather than forming
+/// one of its own, and would contribute bases and depth to the consensus with no
+/// alignment supporting it. The *mapped* end of a half-mapped pair is still kept.
+/// See fulcrumgenomics/fgbio#1168.
+///
+/// `--allow-unmapped` relaxes **only** the mapped-record rule, admitting
+/// unmapped primary records into grouping (mirroring `fgumi group
+/// --allow-unmapped`). Whether they then produce a consensus is the *caller's*
+/// decision, and the callers differ: `VanillaUmiConsensusCaller` (simplex and
+/// duplex) calls fully-unmapped input, while `CodecConsensusCaller` requires a
+/// mapped primary FR pair and rejects anything else as
+/// `CallerRejectionReason::NotPrimaryFrPair`, so `codec` emits no consensus for
+/// an unmapped pair however the flag is set. Where unmapped input *is* called,
+/// unmapped reads never displace mapped ones: within any set being consensus
+/// called, `VanillaUmiConsensusCaller::drop_unmapped_if_any_mapped` prefers the
+/// mapped reads. Secondary/supplementary alignments are **always** dropped,
+/// matching fgbio — `--allow-unmapped` never lets non-primary alignments into
+/// grouping.
 ///
 /// Returns `true` if the record should be kept.
 #[must_use]
@@ -367,13 +382,12 @@ pub fn consensus_pregroup_keep_flags(flags: u16, allow_unmapped: bool) -> bool {
     if flags & flags::SECONDARY != 0 || flags & flags::SUPPLEMENTARY != 0 {
         return false;
     }
-    // --allow-unmapped relaxes only the mapped-or-mate-mapped eligibility check.
+    // --allow-unmapped relaxes only the mapped-record rule. Without it a primary
+    // record is kept only when it is itself mapped; a mapped mate is not an exception.
     if allow_unmapped {
         return true;
     }
-    let is_mapped = flags & flags::UNMAPPED == 0;
-    let has_mapped_mate = flags & flags::PAIRED != 0 && flags & flags::MATE_UNMAPPED == 0;
-    is_mapped || has_mapped_mate
+    flags & flags::UNMAPPED == 0
 }
 
 /// Raw-BAM-bytes wrapper around [`consensus_pregroup_keep_flags`], suitable as
@@ -848,11 +862,13 @@ pub struct CompressionOptions {
 /// (name, default, and boolean parsing) stays identical across all three.
 #[derive(Debug, Clone, Args)]
 pub struct AllowUnmappedOptions {
-    /// Process reads that are unmapped and lack a mapped mate. By default
-    /// (fgbio parity, `ConsensusCallingIterator.scala:56-58`) such reads — and
-    /// all secondary/supplementary alignments — are dropped before consensus
-    /// calling. Enable for consensus on unmapped input (e.g. ribosome/protein
-    /// display), mirroring `fgumi group --allow-unmapped`.
+    /// Process unmapped reads. By default (fgbio parity,
+    /// `ConsensusCallingIterator.scala:56-58`) an unmapped read is dropped before
+    /// consensus calling whether or not its mate is mapped, as are all
+    /// secondary/supplementary alignments. Enable for consensus on unmapped input
+    /// (e.g. ribosome/protein display), mirroring `fgumi group --allow-unmapped`.
+    /// Note that `codec` requires a mapped FR pair, so it emits no consensus for
+    /// an unmapped pair even with this flag.
     #[arg(long = "allow-unmapped", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub enabled: bool,
 }
@@ -2193,12 +2209,14 @@ mod tests {
     use rstest::rstest;
 
     /// The `ConsensusCallingIterator` pre-group filter (fgbio parity,
-    /// `ConsensusCallingIterator.scala:56-58`): secondary and supplementary alignments are
-    /// always dropped, and an unmapped read is kept only when it has a mapped mate.
+    /// `ConsensusCallingIterator.scala:56-58`): the default keeps only mapped primary
+    /// records. Secondary and supplementary alignments are always dropped, and an
+    /// unmapped read is dropped whether or not its mate is mapped — a mapped mate is
+    /// not an exception, because the unmapped end has no cigar to group on.
     ///
     /// `--allow-unmapped` (the `allow_unmapped` column) relaxes **only** the
-    /// unmapped-without-mapped-mate rule: it makes otherwise-eligible primary alignments pass
-    /// regardless of mapping, but secondary/supplementary alignments are still dropped. The
+    /// mapped-record rule: it makes primary alignments pass regardless of mapping, but
+    /// secondary/supplementary alignments are still dropped. The
     /// `*_dropped_even_with_allow_unmapped` cases pin that the flag never lets a non-primary
     /// alignment into grouping (the regression this exists to prevent).
     #[rstest]
@@ -2212,8 +2230,15 @@ mod tests {
         false,
         false
     )]
-    #[case::unmapped_paired_mate_mapped_kept(
+    // The unmapped end of a half-mapped pair is dropped along with any other unmapped record: it
+    // has no cigar to group on. The mapped end is kept, since it is mapped in its own right.
+    #[case::unmapped_paired_mate_mapped_dropped(
         fgumi_raw_bam::flags::UNMAPPED | fgumi_raw_bam::flags::PAIRED,
+        false,
+        false
+    )]
+    #[case::mapped_paired_mate_unmapped_kept(
+        fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::MATE_UNMAPPED,
         false,
         true
     )]
