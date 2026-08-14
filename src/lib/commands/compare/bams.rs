@@ -623,6 +623,33 @@ pub(crate) fn start_raw_batch_reader(
     Ok((rx, header))
 }
 
+/// Renders the `Content diffs:` line of the content-mode report.
+///
+/// `content_diffs` counts only the pairs compared *before* the first `RecordKey`
+/// mismatch: pairing stops at the first desync and never resyncs, so every record from
+/// there on is left unexamined (see
+/// [`PositionalOutcome`](super::engines::positional::PositionalOutcome)). Unqualified,
+/// `Content diffs: 0` on such a run reads as "these files have no content differences",
+/// close to the opposite of what was established. So when `key_mismatch_at` is set the
+/// count carries the size of the prefix it actually covers; when pairing ran to
+/// completion it covers every index-paired record and the line is exactly what it has
+/// always been. (Pairing running to completion is not the same as both files being fully
+/// examined: an unequal record count leaves the longer file's tail unpaired. That case is
+/// already explicit one line above, in `Record counts: {bam1} vs {bam2}`, which a
+/// truncated pairing has no counterpart for.)
+fn content_diffs_line(content_diffs: u64, key_mismatch_at: Option<u64>) -> String {
+    let Some(records_compared) = key_mismatch_at else {
+        return format!("Content diffs: {content_diffs}");
+    };
+    // `key_mismatch_at` is the 0-based index of the first mismatching pair, hence also
+    // the number of pairs examined before the stop.
+    let plural = if records_compared == 1 { "" } else { "s" };
+    format!(
+        "Content diffs: {content_diffs} \
+         (of {records_compared} record{plural} compared before pairing stopped)"
+    )
+}
+
 impl Command for CompareBams {
     fn execute(&self, _command_line: &str) -> Result<()> {
         validate_file_exists(&self.bam1, "First BAM")?;
@@ -851,7 +878,7 @@ impl CompareBams {
             println!("BAM2: {}", self.bam2.display());
             println!();
             println!("Record counts: {} vs {}", outcome.bam1_count, outcome.bam2_count);
-            println!("Content diffs: {}", outcome.content_diffs);
+            println!("{}", content_diffs_line(outcome.content_diffs, outcome.key_mismatch_at));
             if let Some(index) = outcome.key_mismatch_at {
                 println!("First RecordKey mismatch: record {index} (pairing stopped)");
             }
@@ -1289,5 +1316,54 @@ mod tests {
         assert_eq!(MiKey::Int(42).to_string(), "42");
         assert_eq!(MiKey::Strand { base: 3, strand: b'A' }.to_string(), "3/A");
         assert_eq!(MiKey::Strand { base: 3, strand: b'B' }.to_string(), "3/B");
+    }
+
+    // ==================== content-mode summary line ====================
+
+    /// The happy path — pairing ran to completion — must keep the line byte-for-byte
+    /// what it has always been: with no key mismatch the count covers every index-paired
+    /// record, and downstream tooling greps this report.
+    #[rstest]
+    #[case(0, "Content diffs: 0")]
+    #[case(7, "Content diffs: 7")]
+    fn content_diffs_line_is_unqualified_when_pairing_completed(
+        #[case] content_diffs: u64,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(content_diffs_line(content_diffs, None), expected);
+    }
+
+    /// A truncated comparison must say so on the same line as the count: `Content diffs: 0`
+    /// alone reads as "these files have no content differences", which is close to the
+    /// opposite of what a stopped pairing establishes (fulcrumgenomics/fgumi#747).
+    #[test]
+    fn content_diffs_line_qualifies_count_when_pairing_stopped_early() {
+        assert_eq!(
+            content_diffs_line(0, Some(2_468_528)),
+            "Content diffs: 0 (of 2468528 records compared before pairing stopped)"
+        );
+    }
+
+    /// `key_mismatch_at` is the 0-based index of the first mismatching pair, so it is
+    /// also the number of pairs examined before the stop: a mismatch at record 0 means
+    /// nothing was compared at all, and a mismatch at record 1 means exactly one was.
+    #[rstest]
+    #[case(0, "Content diffs: 0 (of 0 records compared before pairing stopped)")]
+    #[case(1, "Content diffs: 0 (of 1 record compared before pairing stopped)")]
+    fn content_diffs_line_counts_records_compared_before_the_stop(
+        #[case] key_mismatch_at: u64,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(content_diffs_line(0, Some(key_mismatch_at)), expected);
+    }
+
+    /// Diffs found before the stop are still reported; the qualifier bounds what the
+    /// count covers, it does not replace it.
+    #[test]
+    fn content_diffs_line_keeps_a_nonzero_count_when_pairing_stopped_early() {
+        assert_eq!(
+            content_diffs_line(3, Some(12)),
+            "Content diffs: 3 (of 12 records compared before pairing stopped)"
+        );
     }
 }
