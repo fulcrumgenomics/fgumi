@@ -147,6 +147,7 @@ pub struct ConsensusMetrics {
     pub rejected_clip_overlap_failed: u64,
 
     /// Consensus reads rejected for high duplex disagreement (fgbio
+    /// `consensusReadsFilteredHighDisagreement`, emitted as
     /// `consensus_reads_rejected_hdd`; codec)
     ///
     /// Counts whole molecules, unlike `rejected_high_duplex_disagreement`, which

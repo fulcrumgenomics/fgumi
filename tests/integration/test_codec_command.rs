@@ -455,8 +455,16 @@ fn test_codec_stats_consensus_reads_matches_records_written(#[case] threads: Opt
 ///
 /// The counts are checked against the output BAM rather than hard-coded, so the
 /// rows are pinned to what the run actually emitted.
-#[test]
-fn test_codec_stats_emits_fgbio_codec_only_rows() {
+///
+/// The `with_rejected_molecule` case adds a molecule whose two strands disagree at
+/// every base, rejected by `--max-duplex-disagreements 0`. It pins the "emitted"
+/// half of the contract: a rejected molecule bumps `consensus_reads_rejected_hdd`
+/// and contributes to *none* of the three base counters. Counting it would inflate
+/// `duplex_disagreement_rate` by exactly the molecules discarded for disagreeing.
+#[rstest]
+#[case::all_molecules_emitted(false)]
+#[case::with_rejected_molecule(true)]
+fn test_codec_stats_emits_fgbio_codec_only_rows(#[case] add_disagreeing_molecule: bool) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let input_bam = temp_dir.path().join("input.bam");
     let output_bam = temp_dir.path().join("output.bam");
@@ -478,6 +486,23 @@ fn test_codec_stats_emits_fgbio_codec_only_rows() {
             pairs.push((r1, r2));
         }
     }
+    if add_disagreeing_molecule {
+        // Same shape as the molecules above, but the second strand carries a
+        // different base at every position, so the molecule is rejected.
+        for read in 0..3 {
+            let (r1, r2) = create_codec_read_pair(
+                &format!("hdd_read{read}"),
+                b"ACGTACGT",
+                b"TTTTTTTT",
+                &[30; 8],
+                &[30; 8],
+                400,
+                "UMI_HDD",
+                None,
+            );
+            pairs.push((r1, r2));
+        }
+    }
     create_codec_test_bam(&input_bam, pairs);
 
     Codec::try_parse_from(vec![
@@ -492,6 +517,8 @@ fn test_codec_stats_emits_fgbio_codec_only_rows() {
         "1",
         "--min-duplex-length",
         "1",
+        "--max-duplex-disagreements",
+        "0",
         "--compression-level",
         "1",
     ])
@@ -499,10 +526,13 @@ fn test_codec_stats_emits_fgbio_codec_only_rows() {
     .execute("fgumi codec")
     .expect("Failed to run codec command");
 
+    // The three agreeing molecules are always emitted; the disagreeing one never is,
+    // so the emitted-base totals are identical across both cases.
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
     let _header = reader.read_header().unwrap();
     let records =
         reader.records().collect::<Result<Vec<_>, _>>().expect("failed to read the consensus BAM");
+    assert_eq!(records.len(), 3, "only the three agreeing molecules are consensus-called");
     let bases_written: usize = records.iter().map(|record| record.sequence().len()).sum();
     assert!(bases_written > 0, "the run must emit at least one consensus base");
 
@@ -520,10 +550,14 @@ fn test_codec_stats_emits_fgbio_codec_only_rows() {
     };
 
     // fgbio's descriptions, verbatim (`CodecConsensusCaller.statistics`).
+    let expected_rejected = usize::from(add_disagreeing_molecule);
     assert_eq!(
         row("consensus_reads_rejected_hdd"),
-        ("0".to_string(), "Consensus Reads Rejected: High Duplex Disagreement".to_string()),
-        "no molecule in this fixture disagrees between strands"
+        (
+            expected_rejected.to_string(),
+            "Consensus Reads Rejected: High Duplex Disagreement".to_string()
+        ),
+        "one molecule per disagreeing template is counted, once"
     );
     assert_eq!(
         row("consensus_bases_emitted"),
@@ -536,7 +570,7 @@ fn test_codec_stats_emits_fgbio_codec_only_rows() {
             bases_written.to_string(),
             "Consensus bases emitted with support from both strands of the duplex".to_string()
         ),
-        "R1 and R2 fully overlap in this fixture, so every emitted base is duplex-supported"
+        "R1 and R2 fully overlap in the emitted molecules, and the rejected one emits nothing"
     );
     assert_eq!(
         row("duplex_disagreement_base_count"),
@@ -544,7 +578,7 @@ fn test_codec_stats_emits_fgbio_codec_only_rows() {
             "0".to_string(),
             "Number of consensus bases at which the top and bottom strands disagreed".to_string()
         ),
-        "the two strands carry identical bases in this fixture"
+        "the emitted molecules' strands agree; the rejected molecule's disagreements do not count"
     );
     assert_eq!(
         row("duplex_disagreement_rate"),
@@ -553,7 +587,7 @@ fn test_codec_stats_emits_fgbio_codec_only_rows() {
             "Rate of top/bottom strand disagreement within duplex regions of consensus reads"
                 .to_string()
         ),
-        "zero disagreements over a non-zero duplex base count is a rate of zero"
+        "the rate covers emitted output only, so a rejected molecule cannot inflate it"
     );
 }
 
