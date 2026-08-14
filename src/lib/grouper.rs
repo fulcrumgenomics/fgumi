@@ -664,6 +664,15 @@ impl MemoryEstimate for FastqTemplate {
     }
 }
 
+/// The typed-step pipeline byte-bounds its queues on this. Delegates to
+/// [`MemoryEstimate::estimate_heap_size`] so the queue budget and the memory
+/// estimate are a single source of truth.
+impl crate::pipeline::core::item::HeapSize for FastqTemplate {
+    fn heap_size(&self) -> usize {
+        MemoryEstimate::estimate_heap_size(self)
+    }
+}
+
 /// Groups FASTQ records from multiple synchronized input streams into templates.
 ///
 /// This grouper expects decompressed bytes from multiple FASTQ files,
