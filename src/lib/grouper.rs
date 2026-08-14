@@ -222,7 +222,7 @@ impl Grouper for TemplateGrouper {
         // records into the same template.
         for decoded in records {
             let name_hash = decoded.key.name_hash;
-            let raw = decoded.data;
+            let raw = decoded.into_raw_bytes();
             let read_name = fgumi_raw_bam::read_name(&raw);
             let same_template = match (self.current_name_hash, self.current_name.as_deref()) {
                 (Some(h), Some(name)) => h == name_hash && name == read_name,
@@ -464,7 +464,7 @@ impl RecordPositionGrouper {
     fn validate_mc_tag(decoded: &DecodedRecord) -> io::Result<()> {
         use fgumi_raw_bam::RawRecordView;
 
-        let raw = &decoded.data;
+        let raw = decoded.record();
         let flg = RawRecordView::new(raw).flags();
         let is_paired = (flg & fgumi_raw_bam::flags::PAIRED) != 0;
         let is_secondary = (flg & fgumi_raw_bam::flags::SECONDARY) != 0;
@@ -523,8 +523,8 @@ impl RecordPositionGrouper {
                     // Hash match is a fast pre-check; confirm QNAME bytes to guard
                     // against hash collisions merging unrelated templates.
                     last.key.name_hash == decoded.key.name_hash
-                        && fgumi_raw_bam::read_name(&last.data)
-                            == fgumi_raw_bam::read_name(&decoded.data)
+                        && fgumi_raw_bam::read_name(last.raw_bytes())
+                            == fgumi_raw_bam::read_name(decoded.raw_bytes())
                 }) =>
             {
                 // Different position but same template (name_hash + QNAME match with
@@ -621,7 +621,7 @@ fn group_by_name_and_build<T>(
 
     for decoded in records {
         let name_hash = decoded.key.name_hash;
-        let read_name = fgumi_raw_bam::read_name(&decoded.data).to_vec();
+        let read_name = fgumi_raw_bam::read_name(decoded.raw_bytes()).to_vec();
         let item = extract(decoded)?;
 
         // name_hash is a fast pre-check; confirm QNAME bytes to guard against

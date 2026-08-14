@@ -11,184 +11,29 @@
 
 use anyhow::Result;
 use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::header::Header;
-use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::sync::Arc;
-
-use bstr::ByteSlice;
 
 use crate::sam::SamTag;
 use crate::template::Template;
 
-/// A lookup table mapping read group IDs to library names.
-///
-/// This is built from the SAM header's @RG lines and used to resolve the library
-/// name (LB field) from a record's RG tag. This matches fgbio's behavior where
-/// grouping uses the library name, not the read group ID.
-///
-/// Uses `Arc<str>` for library names to avoid cloning strings for every read.
-///
-/// # Note: `LibraryLookup` vs `LibraryIndex`
-///
-/// Both `LibraryLookup` and [`LibraryIndex`] exist for different use cases:
-/// - `LibraryLookup`: String-based lookup returning library names. Used by
-///   [`ReadInfo::from`] where the actual library name string is needed.
-/// - [`LibraryIndex`]: Hash-based lookup returning numeric indices. Used by
-///   `compute_group_key_from_raw` in the hot path where only equality comparison
-///   matters, avoiding string allocations.
-pub type LibraryLookup = Arc<HashMap<String, Arc<str>>>;
-
-/// Shared "unknown" library string to avoid repeated allocations.
-static UNKNOWN_LIBRARY: std::sync::LazyLock<Arc<str>> =
-    std::sync::LazyLock::new(|| Arc::from("unknown"));
-
-/// Builds a library lookup table from a SAM header.
-///
-/// Iterates through all @RG lines in the header and creates a mapping from
-/// read group ID to library name. If a read group has no LB field, it maps
-/// to "unknown" (matching fgbio's behavior).
-///
-/// # Arguments
-///
-/// * `header` - The SAM header containing @RG lines
-///
-/// # Returns
-///
-/// An `Arc<HashMap>` mapping read group IDs to library names
-#[must_use]
-pub fn build_library_lookup(header: &Header) -> LibraryLookup {
-    let mut lookup = HashMap::new();
-
-    for (id, rg) in header.read_groups() {
-        // Get the LB field from the read group's other_fields
-        let library: Arc<str> = rg
-            .other_fields()
-            .get(&rg_tag::LIBRARY)
-            .map_or_else(|| Arc::clone(&UNKNOWN_LIBRARY), |s| Arc::from(s.to_string()));
-        lookup.insert(id.to_string(), library);
-    }
-
-    Arc::new(lookup)
-}
+// `LibraryIndex`, `LibraryLookup`, and `build_library_lookup` are defined once,
+// in `fgumi-bam-io`, next to the `GroupKey` that stores a library index. They
+// were duplicated here alongside `DecodedRecord` / `GroupKey`, and stop being
+// separable for the same reason: a `GroupKeyConfig` built here has to be the
+// same type the ported steps consume. Re-exported so existing
+// `crate::read_info::LibraryIndex` paths keep resolving.
+//
+// `unknown_library()` is re-exported for the same reason one level down: the
+// index built by `build_library_lookup` reserves slot 0 for the crate's shared
+// "unknown" `Arc<str>`, so a second local `LazyLock<Arc<str>>` here would mean
+// two allocations for one logical value — the duplication this change exists to
+// remove, just of a value rather than a type.
+pub use fgumi_bam_io::{LibraryIndex, LibraryLookup, build_library_lookup, unknown_library};
 
 // ============================================================================
 // LibraryIndex - Fast RG to library index mapping for GroupKey computation
 // ============================================================================
-
-/// Fast lookup from RG tag value to library index.
-///
-/// This provides O(1) library lookup during Decode using string hashing,
-/// replacing the O(n) string comparison in the original `LibraryLookup`.
-#[derive(Debug, Clone)]
-pub struct LibraryIndex {
-    /// Map from RG string hash to library index.
-    lookup: ahash::AHashMap<u64, u16>,
-    /// Library names for each index (for output/debugging).
-    names: Vec<Arc<str>>,
-    /// Unknown library index (always 0).
-    unknown_idx: u16,
-}
-
-impl LibraryIndex {
-    /// Build a library index from a SAM header.
-    ///
-    /// Each unique library name gets a sequential index starting from 0.
-    /// Index 0 is reserved for "unknown" library.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the header contains more than 65,535 distinct libraries.
-    #[must_use]
-    pub fn from_header(header: &Header) -> Self {
-        let mut lookup = ahash::AHashMap::new();
-        let mut names = vec![Arc::clone(&UNKNOWN_LIBRARY)]; // Index 0 = unknown
-        let mut library_to_idx: ahash::AHashMap<Arc<str>, u16> = ahash::AHashMap::new();
-        library_to_idx.insert(Arc::clone(&UNKNOWN_LIBRARY), 0);
-
-        for (id, rg) in header.read_groups() {
-            // Get library name from LB field
-            let library: Arc<str> = rg
-                .other_fields()
-                .get(&rg_tag::LIBRARY)
-                .map_or_else(|| Arc::clone(&UNKNOWN_LIBRARY), |s| Arc::from(s.to_string()));
-
-            // Get or create library index
-            let lib_idx = *library_to_idx.entry(library.clone()).or_insert_with(|| {
-                let idx: u16 =
-                    names.len().try_into().expect("too many distinct libraries for u16 index");
-                names.push(library);
-                idx
-            });
-
-            // Hash the RG string and map to library index
-            let rg_hash = Self::hash_rg(id.as_bytes());
-            lookup.insert(rg_hash, lib_idx);
-        }
-
-        Self { lookup, names, unknown_idx: 0 }
-    }
-
-    /// Get the library index for a read group hash.
-    ///
-    /// Returns 0 (unknown) if the RG hash is not found.
-    #[must_use]
-    pub fn get(&self, rg_hash: u64) -> u16 {
-        *self.lookup.get(&rg_hash).unwrap_or(&self.unknown_idx)
-    }
-
-    /// Get the library name for an index.
-    #[must_use]
-    pub fn library_name(&self, idx: u16) -> &Arc<str> {
-        self.names.get(idx as usize).unwrap_or(&self.names[0])
-    }
-
-    /// Hash a byte slice using `AHash`. Returns 0 for `None`.
-    ///
-    /// This is the single hashing implementation used by all `hash_*` methods.
-    #[must_use]
-    pub fn hash_bytes(bytes: Option<&[u8]>) -> u64 {
-        use ahash::AHasher;
-        use std::hash::{Hash, Hasher};
-        match bytes {
-            Some(b) => {
-                let mut hasher = AHasher::default();
-                b.hash(&mut hasher);
-                hasher.finish()
-            }
-            None => 0,
-        }
-    }
-
-    /// Hash an RG tag value for lookup.
-    #[must_use]
-    pub fn hash_rg(rg_bytes: &[u8]) -> u64 {
-        Self::hash_bytes(Some(rg_bytes))
-    }
-
-    /// Hash a cell barcode for `GroupKey`.
-    #[must_use]
-    pub fn hash_cell_barcode(cell_bytes: Option<&[u8]>) -> u64 {
-        Self::hash_bytes(cell_bytes)
-    }
-
-    /// Hash a read name for `GroupKey`.
-    #[must_use]
-    pub fn hash_name(name_bytes: Option<&[u8]>) -> u64 {
-        Self::hash_bytes(name_bytes)
-    }
-}
-
-impl Default for LibraryIndex {
-    fn default() -> Self {
-        Self {
-            lookup: ahash::AHashMap::new(),
-            names: vec![Arc::clone(&UNKNOWN_LIBRARY)],
-            unknown_idx: 0,
-        }
-    }
-}
 
 /// Information about read positions needed for grouping and ordering.
 ///
@@ -423,9 +268,9 @@ impl ReadInfo {
         let library: Arc<str> =
             if let Some(TagValue::String(rg_bytes)) = record.tags().get(SamTag::RG.as_ref()) {
                 let rg_id = std::str::from_utf8(rg_bytes).unwrap_or("unknown");
-                library_lookup.get(rg_id).cloned().unwrap_or_else(|| Arc::clone(&UNKNOWN_LIBRARY))
+                library_lookup.get(rg_id).cloned().unwrap_or_else(unknown_library)
             } else {
-                Arc::clone(&UNKNOWN_LIBRARY)
+                unknown_library()
             };
 
         // Extract cell barcode using the raw tag bytes
@@ -550,6 +395,8 @@ fn get_unclipped_position_raw(record: &fgumi_raw_bam::RawRecord) -> Result<i32> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use noodles::sam::header::Header;
+    use rstest::rstest;
 
     #[test]
     fn test_read_info_ordering() {
@@ -664,6 +511,61 @@ mod tests {
         assert_eq!(lookup.get("RG1").map(AsRef::as_ref), Some("libA"));
         assert_eq!(lookup.get("RG2").map(AsRef::as_ref), Some("libB"));
         assert_eq!(lookup.get("RG3").map(AsRef::as_ref), Some("unknown"));
+    }
+
+    /// `ReadInfo::from` resolves the library through the header lookup, and
+    /// this pins all three outcomes of that resolution.
+    ///
+    /// The two fallbacks are the interesting half: an `RG` naming a read group
+    /// the header never declared, and a record with no `RG` at all, must both
+    /// land on the shared `unknown_library()` value rather than differing or
+    /// panicking. `unknown_library()` is the crate-shared `Arc<str>` this
+    /// change deduplicated — a second local copy would have compared equal by
+    /// value while allocating twice, so the pointer identity is asserted too.
+    #[rstest]
+    #[case::rg_present_in_header(Some("RG1"), "libA")]
+    #[case::rg_absent_from_header(Some("RG-not-in-header"), "unknown")]
+    #[case::no_rg_tag(None, "unknown")]
+    fn read_info_from_resolves_the_library(
+        #[case] rg: Option<&str>,
+        #[case] expected_library: &str,
+    ) {
+        use bstr::BString;
+        use fgumi_raw_bam::SamBuilder;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReadGroup;
+        use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+
+        let rg1 = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("libA"))
+            .build()
+            .expect("read group builds");
+        let header = Header::builder().add_read_group(BString::from("RG1"), rg1).build();
+        let lookup = super::build_library_lookup(&header);
+
+        let mut b = SamBuilder::new();
+        b.read_name(b"q1")
+            .flags(0)
+            .ref_id(0)
+            .pos(100)
+            .cigar_ops(&[4u32 << 4])
+            .sequence(b"ACGT")
+            .qualities(&[30u8; 4]);
+        if let Some(rg) = rg {
+            b.add_string_tag(*SamTag::RG, rg.as_bytes());
+        }
+        let template = Template::from_records(vec![b.build()]).expect("template builds");
+
+        let info = ReadInfo::from(&template, Tag::CELL_BARCODE_ID, &lookup)
+            .expect("ReadInfo::from succeeds for a mapped single-end template");
+
+        assert_eq!(info.library.as_ref(), expected_library);
+        if expected_library == "unknown" {
+            assert!(
+                Arc::ptr_eq(&info.library, &unknown_library()),
+                "the fallback must reuse the crate-shared `unknown` Arc, not allocate a copy",
+            );
+        }
     }
 
     #[test]
