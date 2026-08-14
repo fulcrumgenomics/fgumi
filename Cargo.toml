@@ -216,6 +216,12 @@ harness = false
 required-features = ["simplex"]
 
 [[bench]]
+name = "pipeline_dispatch"
+harness = false
+# Dispatch-overhead A/B for the typed-step runtime; no command drives the
+# pipeline yet, so this is the only way to measure a hot-path change.
+
+[[bench]]
 name = "raw_bam_accessors"
 harness = false
 
