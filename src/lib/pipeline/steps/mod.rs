@@ -6,12 +6,13 @@
 //! - `boundaries/` — record-boundary discovery
 //! - `parse/`      — record parsing
 //! - `sink/`       — write-side step implementations
+//! - `source/`     — read-side step implementations (BAM/SAM/FASTQ)
 //! - `sort/`       — sort-chain step re-exports
 //! - `tuning.rs`   — per-chain byte/queue budgets
 //! - `types.rs`    — flowing data types (`HeapSize` + `Ordered`)
 //!
-//! `source/`, `group/`, `correct/`, and the closure-driven mid-steps arrive in
-//! follow-up ports.
+//! `group/`, `correct/`, and the closure-driven mid-steps arrive in follow-up
+//! ports.
 
 pub mod bgzf;
 pub mod boundaries;
@@ -20,6 +21,7 @@ mod chain_tests;
 pub mod parse;
 pub mod sink;
 pub mod sort;
+pub mod source;
 pub mod tuning;
 pub mod types;
 
