@@ -47,6 +47,16 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
+- `codec --stats` now writes the five codec-specific rows fgbio's `CallCodecConsensusReads
+  --stats` writes — `consensus_reads_rejected_hdd`, `consensus_bases_emitted`,
+  `consensus_duplex_bases_emitted`, `duplex_disagreement_base_count` and
+  `duplex_disagreement_rate` — using fgbio's key names, descriptions and row order, so a diff
+  of the two tools' stats files reports value differences rather than absent keys.
+  `duplex_disagreement_rate` is the headline strand-concordance signal for a duplex run and
+  previously had to be reconstructed by hand from per-read `ac`/`bc` tags. Relatedly,
+  `consensus_bases_emitted` was never incremented and so reported 0 everywhere it was
+  surfaced, including the run log ([#748](https://github.com/fulcrumgenomics/fgumi/issues/748)).
+
 - `dedup --metrics` now reports the templates dropped by its template filter, broken out by
   reason. `dedup` is a read filter as well as a duplicate marker, but the drop counts were
   collected, merged across workers, and then discarded at the serialization boundary: a run

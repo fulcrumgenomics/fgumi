@@ -23,7 +23,7 @@ Most metrics files are tab-separated values (TSV) with a header row. There are t
 
 ### Horizontal TSV (Most Commands)
 
-A header row followed by a single data row. Used by `dedup`, `codec`, `duplex-metrics`,
+A header row followed by a single data row. Used by `dedup`, `duplex-metrics`,
 `simplex-metrics`, and `group`.
 
 ```text
@@ -39,9 +39,9 @@ Note that `dedup` and `group` count their discards in **different units**. `dedu
 records* — the latter match fgbio's `UmiGroupingMetric` schema exactly, so they are readable
 by fgbio's `Metric.read`. Do not compare the two files' discard counts directly.
 
-### Vertical Key-Value (Simplex/Duplex)
+### Vertical Key-Value (Simplex/Duplex/Codec)
 
-The `simplex` and `duplex` commands use a three-column format with one metric per row:
+The `simplex`, `duplex`, and `codec` commands use a three-column format with one metric per row:
 
 ```text
 key	value	description
@@ -51,6 +51,20 @@ consensus_reads_emitted	12000	Total number of consensus reads (R1+R2=2) emitted
 ```
 
 This format is compatible with fgbio's `CallMolecularConsensusReads` output.
+
+`codec` appends five codec-specific rows after `consensus_reads_emitted`, matching fgbio's
+`CallCodecConsensusReads`:
+
+```text
+consensus_reads_rejected_hdd	14	Consensus Reads Rejected: High Duplex Disagreement
+consensus_bases_emitted	1560000	Total consensus bases emitted in consensus reads
+consensus_duplex_bases_emitted	1240000	Consensus bases emitted with support from both strands of the duplex
+duplex_disagreement_base_count	620	Number of consensus bases at which the top and bottom strands disagreed
+duplex_disagreement_rate	0.000500	Rate of top/bottom strand disagreement within duplex regions of consensus reads
+```
+
+`duplex_disagreement_rate` is `duplex_disagreement_base_count / consensus_duplex_bases_emitted`,
+and is 0 when no duplex bases were emitted.
 
 ### Filter Stats (Special Case)
 

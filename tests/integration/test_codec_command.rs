@@ -448,6 +448,115 @@ fn test_codec_stats_consensus_reads_matches_records_written(#[case] threads: Opt
     );
 }
 
+/// #748: `codec --stats` must emit the five codec-only rows fgbio's
+/// `CallCodecConsensusReads --stats` writes, with fgbio's exact key names and
+/// description strings, so the two tools' stats files stay diffable. All five were
+/// absent, which made a diff report missing keys rather than value differences.
+///
+/// The counts are checked against the output BAM rather than hard-coded, so the
+/// rows are pinned to what the run actually emitted.
+#[test]
+fn test_codec_stats_emits_fgbio_codec_only_rows() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let stats_file = temp_dir.path().join("stats.tsv");
+
+    let mut pairs = Vec::new();
+    for molecule in 0..3 {
+        for read in 0..3 {
+            let (r1, r2) = create_codec_read_pair(
+                &format!("mol{molecule}_read{read}"),
+                b"ACGTACGT",
+                b"ACGTACGT",
+                &[30; 8],
+                &[30; 8],
+                100 + molecule * 100,
+                &format!("UMI00{molecule}"),
+                None,
+            );
+            pairs.push((r1, r2));
+        }
+    }
+    create_codec_test_bam(&input_bam, pairs);
+
+    Codec::try_parse_from(vec![
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--stats",
+        stats_file.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--min-duplex-length",
+        "1",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse codec args")
+    .execute("fgumi codec")
+    .expect("Failed to run codec command");
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let records =
+        reader.records().collect::<Result<Vec<_>, _>>().expect("failed to read the consensus BAM");
+    let bases_written: usize = records.iter().map(|record| record.sequence().len()).sum();
+    assert!(bases_written > 0, "the run must emit at least one consensus base");
+
+    let stats = fs::read_to_string(&stats_file).expect("Failed to read stats");
+    let row = |key: &str| -> (String, String) {
+        let mut fields = stats
+            .lines()
+            .find(|line| line.starts_with(&format!("{key}\t")))
+            .unwrap_or_else(|| panic!("stats must contain a `{key}` row"))
+            .split('\t');
+        let _key = fields.next();
+        let value = fields.next().expect("row must have a value column").to_string();
+        let description = fields.next().expect("row must have a description column").to_string();
+        (value, description)
+    };
+
+    // fgbio's descriptions, verbatim (`CodecConsensusCaller.statistics`).
+    assert_eq!(
+        row("consensus_reads_rejected_hdd"),
+        ("0".to_string(), "Consensus Reads Rejected: High Duplex Disagreement".to_string()),
+        "no molecule in this fixture disagrees between strands"
+    );
+    assert_eq!(
+        row("consensus_bases_emitted"),
+        (bases_written.to_string(), "Total consensus bases emitted in consensus reads".to_string()),
+        "consensus_bases_emitted must total the bases written to the output BAM"
+    );
+    assert_eq!(
+        row("consensus_duplex_bases_emitted"),
+        (
+            bases_written.to_string(),
+            "Consensus bases emitted with support from both strands of the duplex".to_string()
+        ),
+        "R1 and R2 fully overlap in this fixture, so every emitted base is duplex-supported"
+    );
+    assert_eq!(
+        row("duplex_disagreement_base_count"),
+        (
+            "0".to_string(),
+            "Number of consensus bases at which the top and bottom strands disagreed".to_string()
+        ),
+        "the two strands carry identical bases in this fixture"
+    );
+    assert_eq!(
+        row("duplex_disagreement_rate"),
+        (
+            "0.000000".to_string(),
+            "Rate of top/bottom strand disagreement within duplex regions of consensus reads"
+                .to_string()
+        ),
+        "zero disagreements over a non-zero duplex base count is a rate of zero"
+    );
+}
+
 /// Test CODEC command with rejected reads output.
 #[test]
 fn test_codec_command_with_rejects() {
