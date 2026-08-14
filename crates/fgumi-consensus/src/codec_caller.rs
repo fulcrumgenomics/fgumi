@@ -294,6 +294,21 @@ struct SingleStrandConsensus {
     is_negative_strand: bool,
 }
 
+/// Per-molecule duplex base tallies produced while building a duplex consensus.
+///
+/// These are returned rather than folded straight into [`CodecStats`] so the caller can
+/// apply them only *after* the consensus record has been serialized. A molecule whose output
+/// fails to build — an over-long input-derived UMI makes `try_build_record` reject the read
+/// name — emits nothing, so its duplex bases must not be counted, exactly as
+/// `consensus_reads_generated`/`consensus_bases_emitted` are only bumped on the success path.
+#[derive(Debug, Clone, Copy, Default)]
+struct DuplexBaseTally {
+    /// Duplex bases the molecule would contribute to `consensus_duplex_bases_emitted`.
+    bases_emitted: u64,
+    /// Duplex disagreements the molecule would contribute to `duplex_disagreement_base_count`.
+    disagreement_bases: u64,
+}
+
 /// Convert a per-base depth/error array to the `i16` `Array[Short]` form fgbio
 /// emits, saturating any value above the `Short` ceiling at `i16::MAX` (32767)
 /// rather than letting a raw `as i16` cast wrap it to a negative value. Matches
@@ -358,6 +373,12 @@ pub struct CodecConsensusCaller {
 
     /// Rejected raw BAM records (only populated when `track_rejects` is true)
     rejected_reads: Vec<Vec<u8>>,
+
+    /// Per-group mark of which input records were rejected, indexed by position in the
+    /// group's record slice. Sized at the top of [`Self::consensus_reads_raw`] and
+    /// consumed by [`Self::drain_marked_rejects`]; left empty (so marking is a no-op)
+    /// when `track_rejects` is false.
+    reject_mask: Vec<bool>,
 }
 
 #[expect(
@@ -422,6 +443,7 @@ impl CodecConsensusCaller {
             read_name_buf: Vec::new(),
             track_rejects: false,
             rejected_reads: Vec::new(),
+            reject_mask: Vec::new(),
         }
     }
 
@@ -455,6 +477,7 @@ impl CodecConsensusCaller {
         self.stats = CodecConsensusStats::default();
         self.ss_caller.clear();
         self.rejected_reads.clear();
+        self.reject_mask.clear();
     }
 
     /// Returns a reference to the rejected reads (raw BAM bytes).
@@ -605,6 +628,13 @@ impl CodecConsensusCaller {
     ) -> std::result::Result<ConsensusOutput, CodecConsensusError> {
         self.stats.total_input_reads += records.len() as u64;
 
+        // Size the per-group reject mark before any rejection site can run. Left empty when
+        // tracking is off, which makes `reject_records_at`'s marking a no-op.
+        self.reject_mask.clear();
+        if self.track_rejects {
+            self.reject_mask.resize(records.len(), false);
+        }
+
         if records.is_empty() {
             return Ok(ConsensusOutput::default());
         }
@@ -620,11 +650,11 @@ impl CodecConsensusCaller {
         // is_fr_pair_raw check is asymmetric on dovetails whose aligned ends coincide and would
         // silently drop legitimate FR pairs (CODEC-01).
         let mut paired_indices: Vec<usize> = Vec::new();
-        let mut frag_count = 0usize;
+        let mut frag_indices: Vec<usize> = Vec::new();
         for (i, raw) in records.iter().enumerate() {
             let flg = RawRecordView::new(raw).flags();
             if flg & flags::PAIRED == 0 {
-                frag_count += 1;
+                frag_indices.push(i);
                 continue;
             }
             // Drop secondary/supplementary alignments (fgbio filters these out of the primary
@@ -635,8 +665,8 @@ impl CodecConsensusCaller {
             paired_indices.push(i);
         }
 
-        if frag_count > 0 {
-            self.reject_records_count(frag_count, CallerRejectionReason::FragmentRead);
+        if !frag_indices.is_empty() {
+            self.reject_records_at(frag_indices, CallerRejectionReason::FragmentRead);
         }
 
         if paired_indices.is_empty() {
@@ -667,7 +697,10 @@ impl CodecConsensusCaller {
             let is_primary_fr = indices.len() == 2
                 && bam_fields::is_primary_fr_pair_raw(&records[indices[0]], &records[indices[1]]);
             if !is_primary_fr {
-                self.reject_records_count(indices.len(), CallerRejectionReason::NotPrimaryFrPair);
+                self.reject_records_at(
+                    indices.iter().copied(),
+                    CallerRejectionReason::NotPrimaryFrPair,
+                );
                 continue;
             }
 
@@ -704,8 +737,8 @@ impl CodecConsensusCaller {
 
         // Check we have enough reads
         if r1_infos.len() < self.options.min_reads_per_strand {
-            self.reject_records_count(
-                r1_infos.len() + r2_infos.len(),
+            self.reject_records_at(
+                Self::strand_raw_indices(&r1_infos, &r2_infos),
                 CallerRejectionReason::InsufficientReads,
             );
             return Ok(ConsensusOutput::default());
@@ -722,8 +755,8 @@ impl CodecConsensusCaller {
         if r1_infos.len() < self.options.min_reads_per_strand
             || r2_infos.len() < self.options.min_reads_per_strand
         {
-            self.reject_records_count(
-                r1_infos.len() + r2_infos.len(),
+            self.reject_records_at(
+                Self::strand_raw_indices(&r1_infos, &r2_infos),
                 CallerRejectionReason::InsufficientReads,
             );
             return Ok(ConsensusOutput::default());
@@ -750,8 +783,8 @@ impl CodecConsensusCaller {
             // `CodecConsensusOptions` directly, and it rejects the family for the thing that is
             // actually true of it: after the cap there are no reads left to consense.
             if max_reads == 0 {
-                self.reject_records_count(
-                    r1_infos.len() + r2_infos.len(),
+                self.reject_records_at(
+                    Self::strand_raw_indices(&r1_infos, &r2_infos),
                     CallerRejectionReason::InsufficientReads,
                 );
                 return Ok(ConsensusOutput::default());
@@ -787,8 +820,8 @@ impl CodecConsensusCaller {
         let duplex_length = overlap_end as i64 - overlap_start as i64 + 1;
 
         if duplex_length < self.options.min_duplex_length as i64 {
-            self.reject_records_count(
-                r1_infos.len() + r2_infos.len(),
+            self.reject_records_at(
+                Self::strand_raw_indices(&r1_infos, &r2_infos),
                 CallerRejectionReason::InsufficientOverlap,
             );
             return Ok(ConsensusOutput::default());
@@ -796,8 +829,8 @@ impl CodecConsensusCaller {
 
         // Phase check using raw CIGAR ops
         if !Self::check_overlap_phase_raw(longest_r1, longest_r2, overlap_start, overlap_end) {
-            self.reject_records_count(
-                r1_infos.len() + r2_infos.len(),
+            self.reject_records_at(
+                Self::strand_raw_indices(&r1_infos, &r2_infos),
                 CallerRejectionReason::IndelErrorBetweenStrands,
             );
             return Ok(ConsensusOutput::default());
@@ -809,8 +842,8 @@ impl CodecConsensusCaller {
         let consensus_length =
             Self::compute_consensus_length_raw(longest_pos, longest_neg, overlap_end);
         let Some(consensus_length) = consensus_length else {
-            self.reject_records_count(
-                r1_infos.len() + r2_infos.len(),
+            self.reject_records_at(
+                Self::strand_raw_indices(&r1_infos, &r2_infos),
                 CallerRejectionReason::IndelErrorBetweenStrands,
             );
             return Ok(ConsensusOutput::default());
@@ -862,8 +895,8 @@ impl CodecConsensusCaller {
             // fgbio labels this the `ClipOverlapFailed` reason (the consensus is
             // shorter than a single strand, so the overlapping ends could not be
             // clipped) rather than an indel error (CodecConsensusCaller.scala:243).
-            self.reject_records_count(
-                r1_infos.len() + r2_infos.len(),
+            self.reject_records_at(
+                Self::strand_raw_indices(&r1_infos, &r2_infos),
                 CallerRejectionReason::ClipOverlapFailed,
             );
             return Ok(ConsensusOutput::default());
@@ -884,18 +917,19 @@ impl CodecConsensusCaller {
         // before propagating the (recoverable) error, matching fgbio, which does
         // `rejectRecords(..., HighDuplexDisagreement)` and
         // `consensusReadsFilteredHighDisagreement += 1` (CodecConsensusCaller.scala:255-256).
-        let consensus = match self.build_duplex_consensus_from_padded(&padded_r1, &padded_r2) {
-            Ok(consensus) => consensus,
-            Err(e) if e.is_duplex_disagreement() => {
-                self.reject_records_count(
-                    r1_infos.len() + r2_infos.len(),
-                    CallerRejectionReason::HighDuplexDisagreement,
-                );
-                self.stats.consensus_reads_rejected_hdd += 1;
-                return Err(e);
-            }
-            Err(e) => return Err(e),
-        };
+        let (consensus, duplex_tally) =
+            match self.build_duplex_consensus_from_padded(&padded_r1, &padded_r2) {
+                Ok(built) => built,
+                Err(e) if e.is_duplex_disagreement() => {
+                    self.reject_records_at(
+                        Self::strand_raw_indices(&r1_infos, &r2_infos),
+                        CallerRejectionReason::HighDuplexDisagreement,
+                    );
+                    self.stats.consensus_reads_rejected_hdd += 1;
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            };
         let consensus = self.mask_consensus_quals_query_based(consensus, &padded_r1, &padded_r2);
         let consensus =
             if r1_is_negative { Self::reverse_complement_ss(&consensus) } else { consensus };
@@ -926,6 +960,12 @@ impl CodecConsensusCaller {
             records,
         )?;
 
+        // Serialization succeeded: the record is emitted, so commit every emitted counter
+        // together. The duplex tallies are applied here rather than inside
+        // `build_duplex_consensus_from_padded` so an over-long-UMI failure above leaves them
+        // at zero, consistent with `consensus_reads_generated`/`consensus_bases_emitted`.
+        self.stats.consensus_duplex_bases_emitted += duplex_tally.bases_emitted;
+        self.stats.duplex_disagreement_base_count += duplex_tally.disagreement_bases;
         self.stats.consensus_reads_generated += 1;
         self.stats.consensus_bases_emitted += consensus.bases.len() as u64;
         Ok(output)
@@ -1037,6 +1077,19 @@ impl CodecConsensusCaller {
         std::mem::swap(infos, &mut kept);
     }
 
+    /// The raw-record indices behind both strands' reads, R1s first then R2s.
+    ///
+    /// Every whole-family reject reason counts `r1_infos.len() + r2_infos.len()` records;
+    /// this is the same set expressed as indices, so [`Self::reject_records_at`] can also
+    /// route them to the `--rejects` output. A `ClippedRecordInfo` is never shared between
+    /// the two strands, so the indices cannot repeat.
+    fn strand_raw_indices<'a>(
+        r1_infos: &'a [ClippedRecordInfo],
+        r2_infos: &'a [ClippedRecordInfo],
+    ) -> impl Iterator<Item = usize> + 'a {
+        r1_infos.iter().chain(r2_infos.iter()).map(|info| info.raw_idx)
+    }
+
     /// Filter `ClippedRecordInfo`s to the most common alignment pattern.
     fn filter_to_most_common_alignment_raw(
         &mut self,
@@ -1062,17 +1115,20 @@ impl CodecConsensusCaller {
 
         let best_indices = select_most_common_alignment_group(&indexed);
 
-        let rejected_count = infos.len() - best_indices.len();
-        if rejected_count > 0 {
-            *self
-                .stats
-                .rejection_reasons
-                .entry(CallerRejectionReason::MinorityAlignment)
-                .or_insert(0) += rejected_count;
-            self.stats.reads_filtered += rejected_count as u64;
+        let best_set: std::collections::HashSet<usize> = best_indices.into_iter().collect();
+
+        // The minority reads are dropped from a family that usually still consenses, so
+        // they must be routed to the --rejects output and not merely counted (#751).
+        let rejected: Vec<usize> = infos
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !best_set.contains(i))
+            .map(|(_, info)| info.raw_idx)
+            .collect();
+        if !rejected.is_empty() {
+            self.reject_records_at(rejected, CallerRejectionReason::MinorityAlignment);
         }
 
-        let best_set: std::collections::HashSet<usize> = best_indices.into_iter().collect();
         infos
             .into_iter()
             .enumerate()
@@ -1254,7 +1310,7 @@ impl CodecConsensusCaller {
         &mut self,
         ss_a: &SingleStrandConsensus,
         ss_b: &SingleStrandConsensus,
-    ) -> std::result::Result<SingleStrandConsensus, CodecConsensusError> {
+    ) -> std::result::Result<(SingleStrandConsensus, DuplexBaseTally), CodecConsensusError> {
         let len = ss_a.bases.len();
         assert_eq!(ss_b.bases.len(), len, "Padded consensuses must be the same length");
 
@@ -1392,6 +1448,7 @@ impl CodecConsensusCaller {
         }
 
         // Check duplex disagreement rate
+        let mut tally = DuplexBaseTally::default();
         if duplex_bases_count > 0 {
             let duplex_error_rate = duplex_disagreements as f64 / duplex_bases_count as f64;
 
@@ -1406,24 +1463,30 @@ impl CodecConsensusCaller {
                 });
             }
 
-            // Accumulate only once the molecule has survived both rejection checks:
-            // a rejected molecule emits nothing, so it contributes no duplex bases.
-            // fgbio does the same, incrementing `totalDuplexBases`/`duplexErrorBases`
-            // in the accepted branch only (`CodecConsensusCaller.scala:264-268`).
-            self.stats.consensus_duplex_bases_emitted += duplex_bases_count as u64;
-            self.stats.duplex_disagreement_base_count += duplex_disagreements as u64;
+            // Carry the per-molecule duplex tallies back to the caller, which applies them to
+            // `self.stats` only once the consensus record has been serialized. A molecule that
+            // survives both rejection checks here can still fail to emit (an over-long UMI makes
+            // `build_output_record_into` return an error), and a molecule that emits nothing must
+            // contribute no duplex bases. fgbio increments `totalDuplexBases`/`duplexErrorBases`
+            // in the accepted branch only (`CodecConsensusCaller.scala:264-268`); we defer that
+            // increment to the same success point as `consensus_reads_generated`.
+            tally.bases_emitted = duplex_bases_count as u64;
+            tally.disagreement_bases = duplex_disagreements as u64;
         }
 
-        Ok(SingleStrandConsensus {
-            bases,
-            quals,
-            depths,
-            errors,
-            raw_read_count: ss_a.raw_read_count + ss_b.raw_read_count,
-            ref_start: 0,
-            ref_end: len.saturating_sub(1),
-            is_negative_strand: ss_a.is_negative_strand,
-        })
+        Ok((
+            SingleStrandConsensus {
+                bases,
+                quals,
+                depths,
+                errors,
+                raw_read_count: ss_a.raw_read_count + ss_b.raw_read_count,
+                ref_start: 0,
+                ref_end: len.saturating_sub(1),
+                is_negative_strand: ss_a.is_negative_strand,
+            },
+            tally,
+        ))
     }
 
     /// Masks consensus qualities for query-based consensus, matching fgbio's
@@ -1675,6 +1738,52 @@ impl CodecConsensusCaller {
         self.stats.reads_filtered += count as u64;
     }
 
+    /// Rejects the records at `indices` (positions in the group's record slice) with the
+    /// given reason: counts them, and marks them for the `--rejects` output.
+    ///
+    /// Every counted rejection goes through here so the rejects BAM reconciles with
+    /// `--stats` — a reason counted without marking is a read that `raw_reads_rejected`
+    /// reports and the rejects BAM silently omits, which is what issue #751 describes.
+    /// Marking is a no-op when reject tracking is off, because `reject_mask` is then empty.
+    fn reject_records_at(
+        &mut self,
+        indices: impl IntoIterator<Item = usize>,
+        reason: CallerRejectionReason,
+    ) {
+        let mut count = 0usize;
+        for index in indices {
+            count += 1;
+            if let Some(marked) = self.reject_mask.get_mut(index) {
+                *marked = true;
+            } else {
+                // Out of range is expected only when tracking is off, where the mask is
+                // deliberately empty. With tracking on the mask spans the whole group, so an
+                // out-of-range index would be a record counted in `--stats` and silently
+                // omitted from the rejects BAM — the exact divergence this method prevents.
+                debug_assert!(
+                    !self.track_rejects,
+                    "reject index {index} is outside the group's reject mask"
+                );
+            }
+        }
+        self.reject_records_count(count, reason);
+    }
+
+    /// Moves every record marked by [`Self::reject_records_at`] into the pending
+    /// `--rejects` buffer, in input order, and resets the mark for the next group.
+    ///
+    /// Takes the group by value so the marked records' bytes are moved rather than copied.
+    /// The buffer is drained by the caller after each group (single-threaded) or each batch
+    /// (pipeline mode), so it never grows past what is already resident.
+    fn drain_marked_rejects(&mut self, records: Vec<RawRecord>) {
+        for (index, record) in records.into_iter().enumerate() {
+            if self.reject_mask.get(index).copied().unwrap_or(false) {
+                self.rejected_reads.push(record.into_inner());
+            }
+        }
+        self.reject_mask.clear();
+    }
+
     /// Calls consensus and returns a typed [`CodecConsensusError`] so callers can
     /// distinguish recoverable duplex disagreements (see
     /// [`CodecConsensusError::is_duplex_disagreement`]) from fatal failures
@@ -1690,25 +1799,26 @@ impl CodecConsensusCaller {
         &mut self,
         records: Vec<RawRecord>,
     ) -> std::result::Result<ConsensusOutput, CodecConsensusError> {
-        let result = match self.consensus_reads_raw(&records) {
-            Ok(result) => result,
-            Err(e) => {
-                // On a recoverable duplex-disagreement reject, still route the
-                // group's raw records to the --rejects output when tracking is
-                // enabled, mirroring the count==0 path below and fgbio's
-                // rejectsWriter. The reject reason/counters were already recorded
-                // by consensus_reads_raw before it returned the error.
-                if self.track_rejects && e.is_duplex_disagreement() && !records.is_empty() {
-                    self.rejected_reads.extend(records.into_iter().map(RawRecord::into_inner));
-                }
-                return Err(e);
-            }
-        };
-        // When a group fails to produce consensus, all its records are rejected
-        if self.track_rejects && result.count == 0 && !records.is_empty() {
-            self.rejected_reads.extend(records.into_iter().map(RawRecord::into_inner));
+        let result = self.consensus_reads_raw(&records);
+        // Route to the --rejects output exactly the records `consensus_reads_raw` counted
+        // as rejected, whether the whole group failed, the group hit a (recoverable)
+        // duplex disagreement, or individual reads were dropped from a group that still
+        // consensed. Mirrors fgbio's `rejectRecords`, which tags, counts and writes the
+        // same set in one step, so the rejects BAM and `--stats` cannot disagree (#751).
+        //
+        // This deliberately replaces a blanket "on `result.count == 0`, dump every record in
+        // the group" pass. That pass covered the counted rejects only by coincidence (their
+        // counts happen to sum to the group size), it double-wrote any read this method now
+        // routes at its own site, and it also emitted reads nothing counted -- which is what
+        // made the two outputs disagree in the first place. Records that reach the caller and
+        // are neither used nor counted (secondary/supplementary alignments, which the `codec`
+        // command already drops before grouping, and reads dropped by the `--max-reads` cap)
+        // are therefore not written, matching fgbio, which leaves both outside its rejects
+        // BAM as well.
+        if self.track_rejects {
+            self.drain_marked_rejects(records);
         }
-        Ok(result)
+        result
     }
 }
 
@@ -2567,6 +2677,64 @@ mod tests {
         assert_eq!(&rx[..], b"ACC-TGA", "RX tag should be preserved");
     }
 
+    /// A molecule whose consensus builds cleanly but cannot be serialized — an over-long
+    /// input-derived UMI drives the `<prefix>:<UMI>` read name past BAM's 254-byte limit — must
+    /// emit nothing AND leave every emitted counter at zero. The duplex tallies in particular
+    /// are computed while building the consensus (before serialization), so a regression that
+    /// folded them into `stats` eagerly would count duplex bases for a record that was never
+    /// written, desyncing `--stats` from the output BAM.
+    #[test]
+    fn duplex_counters_stay_zero_when_read_name_serialization_fails() {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        // An FR pair that overlaps for its full length produces duplex bases (so the tallies are
+        // non-zero), carried on an MI tag long enough that "codec:<umi>" exceeds 254 bytes.
+        let over_long_umi = "N".repeat(300);
+        let reads = create_fr_pair(
+            "read1",
+            1,
+            1,
+            30,
+            35,
+            &[(Kind::Match, 30)],
+            &[(Kind::Match, 30)],
+            &over_long_umi,
+            None,
+            false, // R1 forward
+            true,  // R2 reverse
+        );
+
+        let Err(err) = caller.consensus_reads_from_sam_records(reads) else {
+            panic!("an over-long UMI must fail to serialize the consensus record");
+        };
+        assert!(
+            format!("{err:#}").contains("could not write the consensus record"),
+            "error should name the un-writable consensus record, got: {err:#}",
+        );
+
+        assert_eq!(
+            caller.stats.consensus_duplex_bases_emitted, 0,
+            "no record was emitted, so no duplex bases may be counted",
+        );
+        assert_eq!(
+            caller.stats.duplex_disagreement_base_count, 0,
+            "no record was emitted, so no duplex disagreements may be counted",
+        );
+        assert_eq!(
+            caller.stats.consensus_reads_generated, 0,
+            "no record was emitted, so no consensus read may be counted",
+        );
+        assert_eq!(
+            caller.stats.consensus_bases_emitted, 0,
+            "no record was emitted, so no consensus bases may be counted",
+        );
+    }
+
     /// Port of fgbio test: "make a consensus where R1 has a deletion outside of the overlap region"
     #[test]
     fn test_make_consensus_r1_deletion() {
@@ -3233,18 +3401,163 @@ mod tests {
         );
     }
 
+    /// #751: a per-read rejection inside a molecule that *still* emits a consensus must
+    /// reach the `--rejects` output, not merely bump a counter.
+    ///
+    /// Before the fix `rejected_reads` was appended to only when the whole group failed
+    /// (`result.count == 0`) or hit a duplex disagreement, so `MinorityAlignment` — the
+    /// most common rejection on real data — reported a non-zero `raw_reads_rejected` in
+    /// `--stats` against a rejects BAM holding nothing at all. The two outputs must
+    /// reconcile, so this asserts the retained bytes are exactly the minority template's
+    /// records (identity, in input order), not merely that the count is right.
+    #[test]
+    fn test_minority_alignment_rejects_are_tracked_when_the_family_still_consenses() {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new_with_rejects_tracking(
+            "codec".to_string(),
+            "RG1".to_string(),
+            options,
+            true,
+        );
+
+        // Four templates; `tpl3` carries a minority indel pattern on both strands while the
+        // other three carry the majority ungapped one, so the family consenses from the
+        // three survivors and `tpl3`'s two records are rejected for MinorityAlignment.
+        let majority: Vec<(Kind, usize)> = vec![(Kind::Match, 30)];
+        let minority: Vec<(Kind, usize)> =
+            vec![(Kind::Match, 10), (Kind::Deletion, 2), (Kind::Match, 20)];
+        let mut reads: Vec<RawRecord> = Vec::new();
+        for i in 0..4 {
+            let cigar = if i == 3 { &minority } else { &majority };
+            reads.extend(create_fr_pair(
+                &format!("tpl{i}"),
+                1,
+                11,
+                30,
+                35,
+                cigar,
+                cigar,
+                "molecule1",
+                Some("ACC-TGA"),
+                false,
+                true,
+            ));
+        }
+
+        // Snapshot the minority template's raw bytes before `reads` is moved into the
+        // caller; `consensus_reads_typed` retains rejects in input order.
+        let expected_rejects: Vec<Vec<u8>> = reads
+            .iter()
+            .filter(|record| RawRecordView::new(record).read_name() == b"tpl3")
+            .map(|record| record.as_ref().to_vec())
+            .collect();
+        assert_eq!(expected_rejects.len(), 2, "the minority template contributes R1 and R2");
+
+        let output =
+            caller.consensus_reads_typed(reads).expect("the majority reads must still consense");
+        assert_eq!(output.count, 1, "the majority-alignment reads must still emit a consensus");
+
+        assert_eq!(
+            caller.statistics().rejection_reasons.get(&CallerRejectionReason::MinorityAlignment),
+            Some(&2),
+            "both minority records must be counted"
+        );
+        assert_eq!(
+            caller.statistics().reads_filtered,
+            2,
+            "raw_reads_rejected is derived from reads_filtered"
+        );
+        assert_eq!(
+            caller.rejected_reads(),
+            expected_rejects.as_slice(),
+            "the rejects output must hold exactly the counted records, byte-for-byte, so the \
+             rejects BAM reconciles with --stats"
+        );
+    }
+
+    /// #751: fragment reads are rejected per-read while the paired reads of the same
+    /// molecule go on to consense, so they too must reach the `--rejects` output.
+    #[test]
+    fn test_fragment_read_rejects_are_tracked_when_the_family_still_consenses() {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new_with_rejects_tracking(
+            "codec".to_string(),
+            "RG1".to_string(),
+            options,
+            true,
+        );
+
+        let mut reads = create_fr_pair(
+            "tpl0",
+            1,
+            11,
+            30,
+            35,
+            &[(Kind::Match, 30)],
+            &[(Kind::Match, 30)],
+            "molecule1",
+            Some("ACC-TGA"),
+            false,
+            true,
+        );
+        // An unpaired record in the same molecule: counted as FragmentRead, dropped before
+        // pairing, and the FR pair still consenses.
+        let mut fragment = SamBuilder::new();
+        fragment
+            .read_name(b"fragment")
+            .flags(0)
+            .ref_id(0)
+            .pos(0)
+            .mapq(60)
+            .cigar_ops(&[encode_op(0, 30)])
+            .sequence(&[b'A'; 30])
+            .qualities(&[35; 30]);
+        fragment.add_string_tag(SamTag::MI, b"molecule1");
+        let fragment = fragment.build();
+        let expected_reject = fragment.as_ref().to_vec();
+        reads.push(fragment);
+
+        let output = caller.consensus_reads_typed(reads).expect("the FR pair must still consense");
+        assert_eq!(output.count, 1, "the FR pair must still emit a consensus");
+
+        assert_eq!(
+            caller.statistics().rejection_reasons.get(&CallerRejectionReason::FragmentRead),
+            Some(&1),
+            "the fragment must be counted"
+        );
+        assert_eq!(
+            caller.rejected_reads(),
+            std::slice::from_ref(&expected_reject),
+            "the fragment must also reach the --rejects output"
+        );
+    }
+
     /// CODEC3-08: the `ClipOverlapFailed` reject (consensus shorter than a single
     /// strand — the overlapping ends could not be clipped, `CodecConsensusCaller.scala:243`)
     /// must be counted under its own reason and populate a metrics row under fgbio's
     /// verbatim label, *not* leak into `IndelErrorBetweenStrands` the way it did before
     /// the fix.
     ///
-    /// This exercises the counting/labeling contract at the reject-tallying seam:
-    /// `reject_records_count` is the single site every reject flows through, so pinning
-    /// the count, the filtered total, and the central-reason mapping here is what
-    /// guarantees the emitted metrics row is right when the branch fires.
-    /// `test_clip_overlap_failed_attribution_matches_fgbio` covers the complementary
-    /// half — reaching the branch through the whole pipeline.
+    /// The caller-level trigger (`consensus_length < ss.bases.len()` at the
+    /// `ClipOverlapFailed` site) is a degenerate overlap-clip boundary that fgbio itself
+    /// only reaches on specific real-data alignments; a synthetic pipeline fixture that
+    /// lands there without first tripping the earlier `IndelErrorBetweenStrands` phase
+    /// check would have to replicate fgbio's exact clip arithmetic and would be brittle.
+    /// This exercises the counting/labeling contract at the reject-tallying seam instead:
+    /// `reject_records_count` is the single site every reject is tallied at (the production
+    /// sites reach it through `reject_records_at`, which also routes the records to
+    /// `--rejects`), so pinning the count, the filtered total, and the central-reason
+    /// mapping here is what guarantees the emitted metrics row is right when the branch
+    /// does fire. `test_clip_overlap_failed_attribution_matches_fgbio` covers the
+    /// complementary half — reaching the branch through the whole pipeline.
     #[test]
     fn test_clip_overlap_failed_counted_and_labeled() {
         let options = CodecConsensusOptions {
@@ -3946,7 +4259,7 @@ mod tests {
             is_negative_strand: true,
         };
 
-        let duplex = caller
+        let (duplex, _tally) = caller
             .build_duplex_consensus_from_padded(&ss_a, &ss_b)
             .expect("Should build duplex consensus");
 
@@ -4003,7 +4316,7 @@ mod tests {
         let ss_a = deep.clone();
         let ss_b = SingleStrandConsensus { is_negative_strand: true, ..deep };
 
-        let duplex = caller
+        let (duplex, _tally) = caller
             .build_duplex_consensus_from_padded(&ss_a, &ss_b)
             .expect("Should build duplex consensus without overflowing");
 
@@ -4046,7 +4359,7 @@ mod tests {
         let ss_a = deep.clone();
         let ss_b = SingleStrandConsensus { is_negative_strand: true, ..deep };
 
-        let duplex = caller
+        let (duplex, _tally) = caller
             .build_duplex_consensus_from_padded(&ss_a, &ss_b)
             .expect("Should build duplex consensus without overflowing the error sum");
 
