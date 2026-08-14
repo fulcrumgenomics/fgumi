@@ -89,10 +89,6 @@ pub use fgumi_bam_io::{ProgressTracker, RawBamWriter, ReorderBuffer};
 use super::deadlock::{DeadlockAction, DeadlockState, QueueSnapshot, check_deadlock_and_restore};
 
 use crate::bgzf_reader::{RawBgzfBlock, decompress_block_into_opts, read_raw_blocks};
-use crate::read_info::LibraryIndex;
-use crate::sam::SamTag;
-use fgumi_raw_bam::RawRecord;
-use noodles::sam::alignment::record::data::field::Tag;
 
 use super::scheduler::{BackpressureState, Scheduler, SchedulerStrategy, create_scheduler};
 
@@ -1500,328 +1496,32 @@ impl ActiveSteps {
 // GroupKey - Pre-computed grouping key for fast comparison in Group step
 // ============================================================================
 
-/// Pre-computed grouping key for fast comparison in Group step.
-///
-/// All fields are integers/hashes for O(1) comparison. This is computed during
-/// the parallel Decode step so the serial Group step only does integer comparisons.
-///
-/// For paired-end reads, positions are normalized so the lower position comes first.
-/// For single-end reads, the mate fields use `UNKNOWN_*` sentinel values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GroupKey {
-    // Position info (normalized: lower position first)
-    /// Reference sequence index for position 1 (lower).
-    pub ref_id1: i32,
-    /// Unclipped 5' position for position 1.
-    pub pos1: i32,
-    /// Strand for position 1 (0=forward, 1=reverse).
-    pub strand1: u8,
-    /// Reference sequence index for position 2 (higher or mate).
-    pub ref_id2: i32,
-    /// Unclipped 5' position for position 2.
-    pub pos2: i32,
-    /// Strand for position 2.
-    pub strand2: u8,
-
-    // Grouping metadata
-    /// Library index (pre-computed from RG tag via header lookup).
-    pub library_idx: u16,
-    /// Hash of cell barcode (0 if none).
-    pub cell_hash: u64,
-
-    // For name-based grouping within position groups
-    /// Hash of QNAME for fast name comparison.
-    pub name_hash: u64,
-}
-
-impl GroupKey {
-    /// Sentinel value for unknown reference ID (unpaired reads).
-    pub const UNKNOWN_REF: i32 = i32::MAX;
-    /// Sentinel value for unknown position (unpaired reads).
-    pub const UNKNOWN_POS: i32 = i32::MAX;
-    /// Sentinel value for unknown strand (unpaired reads).
-    pub const UNKNOWN_STRAND: u8 = u8::MAX;
-
-    /// Create a `GroupKey` for a paired-end read with mate info.
-    ///
-    /// Positions are automatically normalized so the lower position comes first.
-    ///
-    /// Both strands must be `0` (forward) or `1` (reverse). Every caller derives
-    /// them from a boolean — either a flag bit or a `!= 0` test on a `tc` field —
-    /// so `UNKNOWN_STRAND` can never reach `strand2` through this constructor.
-    /// [`GroupKey::has_mate_position`] depends on that, so the invariant is
-    /// asserted here rather than left to convention.
-    #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn paired(
-        ref_id: i32,
-        pos: i32,
-        strand: u8,
-        mate_ref_id: i32,
-        mate_pos: i32,
-        mate_strand: u8,
-        library_idx: u16,
-        cell_hash: u64,
-        name_hash: u64,
-    ) -> Self {
-        debug_assert!(
-            strand <= 1 && mate_strand <= 1,
-            "GroupKey::paired requires boolean strands (got {strand}, {mate_strand}); \
-             UNKNOWN_STRAND in a paired key would break GroupKey::has_mate_position"
-        );
-
-        // Normalize: put lower position first (matching ReadInfo behavior)
-        let (ref_id1, pos1, strand1, ref_id2, pos2, strand2) =
-            if (ref_id, pos, strand) <= (mate_ref_id, mate_pos, mate_strand) {
-                (ref_id, pos, strand, mate_ref_id, mate_pos, mate_strand)
-            } else {
-                (mate_ref_id, mate_pos, mate_strand, ref_id, pos, strand)
-            };
-
-        Self { ref_id1, pos1, strand1, ref_id2, pos2, strand2, library_idx, cell_hash, name_hash }
-    }
-
-    /// Create a `GroupKey` for a single-end/unpaired read.
-    #[must_use]
-    pub fn single(
-        ref_id: i32,
-        pos: i32,
-        strand: u8,
-        library_idx: u16,
-        cell_hash: u64,
-        name_hash: u64,
-    ) -> Self {
-        Self {
-            ref_id1: ref_id,
-            pos1: pos,
-            strand1: strand,
-            ref_id2: Self::UNKNOWN_REF,
-            pos2: Self::UNKNOWN_POS,
-            strand2: Self::UNKNOWN_STRAND,
-            library_idx,
-            cell_hash,
-            name_hash,
-        }
-    }
-
-    /// Returns whether this key carries a resolved mate position.
-    ///
-    /// True for keys built by [`GroupKey::paired`], false for
-    /// [`GroupKey::single`] and [`GroupKey::default`].
-    ///
-    /// `strand2` is the discriminator because [`GroupKey::paired`] always
-    /// receives boolean strands (asserted there), so only the single-ended
-    /// constructors can produce [`GroupKey::UNKNOWN_STRAND`]. `ref_id2` and
-    /// `pos2` are weaker: `i32::MAX` is a legal-looking coordinate.
-    ///
-    /// Decode resolves the mate position from the `MC` tag, falling back to a
-    /// single-ended key when it is absent (see `compute_group_key_from_raw`).
-    /// `RecordPositionGrouper` therefore reads this instead of re-walking the
-    /// record's aux data.
-    #[must_use]
-    pub fn has_mate_position(&self) -> bool {
-        self.strand2 != Self::UNKNOWN_STRAND
-    }
-
-    /// Returns the position-only key for grouping by genomic position.
-    ///
-    /// This is used by `RecordPositionGrouper` to determine if records belong to
-    /// the same position group (ignoring name).
-    #[must_use]
-    pub fn position_key(&self) -> (i32, i32, u8, i32, i32, u8, u16, u64) {
-        (
-            self.ref_id1,
-            self.pos1,
-            self.strand1,
-            self.ref_id2,
-            self.pos2,
-            self.strand2,
-            self.library_idx,
-            self.cell_hash,
-        )
-    }
-}
-
-impl PartialOrd for GroupKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for GroupKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.position_key()
-            .cmp(&other.position_key())
-            .then_with(|| self.name_hash.cmp(&other.name_hash))
-    }
-}
-
-impl Default for GroupKey {
-    fn default() -> Self {
-        Self {
-            ref_id1: Self::UNKNOWN_REF,
-            pos1: Self::UNKNOWN_POS,
-            strand1: Self::UNKNOWN_STRAND,
-            ref_id2: Self::UNKNOWN_REF,
-            pos2: Self::UNKNOWN_POS,
-            strand2: Self::UNKNOWN_STRAND,
-            library_idx: 0,
-            cell_hash: 0,
-            name_hash: 0,
-        }
-    }
-}
-
 // ============================================================================
 // DecodedRecord - Record with pre-computed grouping key
 // ============================================================================
 
-/// A decoded BAM record with its pre-computed grouping key.
-///
-/// This is the output of the Decode step and input to the Group step.
-/// The key is computed during the parallel Decode step so that the
-/// serial Group step only needs to do fast integer comparisons.
-#[derive(Debug)]
-pub struct DecodedRecord {
-    /// Pre-computed grouping key.
-    pub key: GroupKey,
-    /// Raw BAM record bytes.
-    pub(crate) data: RawRecord,
-    /// Cached record-relative offset of the UMI tag's value bytes (i.e. the
-    /// first byte after the 2-byte tag header and the 1-byte type byte). The
-    /// slice `data[umi_value_offset..umi_value_offset + umi_value_len]` yields
-    /// the UMI bytes without the trailing NUL.
-    ///
-    /// Set to `Self::UMI_OFFSET_UNCACHED` when no UMI position was cached
-    /// during decode (UMI tag missing, not Z-typed, or caching disabled).
-    pub(crate) umi_value_offset: u32,
-    /// Cached UMI value length in bytes, paired with `umi_value_offset`.
-    pub(crate) umi_value_len: u16,
-}
+// `DecodedRecord` is defined once, in `fgumi-bam-io`, alongside the `GroupKey`
+// it carries and the `Grouper` trait that consumes it. It was duplicated here
+// while the ported step library only ever produced these records; the moment
+// ported steps started handing them to the umbrella groupers, the two copies
+// became two incompatible types with identical definitions. Re-exported so
+// every `crate::unified_pipeline::DecodedRecord` path keeps resolving.
+pub use fgumi_bam_io::DecodedRecord;
 
-impl DecodedRecord {
-    /// Sentinel value for `umi_value_offset` indicating no cached UMI position.
-    /// Chosen as `u32::MAX` so it can never collide with a real BAM record
-    /// offset (BAM records are bounded well under 4 GiB).
-    pub const UMI_OFFSET_UNCACHED: u32 = u32::MAX;
+// `GroupKey` and `GroupKeyConfig` are defined once, in `fgumi-bam-io`, next to
+// the `DecodedRecord` that carries them. They were duplicated here for the same
+// reason `DecodedRecord` was, and stopped being separable for the same reason:
+// a ported step handing a key to an umbrella grouper needs the two copies to be
+// one type. Re-exported so existing `crate::unified_pipeline::GroupKey` /
+// `GroupKeyConfig` paths keep resolving.
+pub use fgumi_bam_io::{GroupKey, GroupKeyConfig};
 
-    /// Create a decoded record from raw bytes, skipping noodles decode.
-    ///
-    /// Accepts anything that converts `Into<RawRecord>` (e.g. a bare `Vec<u8>` or
-    /// an already-constructed `RawRecord`).
-    #[must_use]
-    pub fn from_raw_bytes(raw: impl Into<RawRecord>, key: GroupKey) -> Self {
-        Self {
-            key,
-            data: raw.into(),
-            umi_value_offset: Self::UMI_OFFSET_UNCACHED,
-            umi_value_len: 0,
-        }
-    }
-
-    /// Attach a cached UMI value position to this decoded record.
-    ///
-    /// `umi_value_offset` is the record-relative offset of the first UMI value
-    /// byte (after the tag header), and `umi_value_len` is the value length
-    /// (excluding any trailing NUL).
-    pub fn set_cached_umi(&mut self, umi_value_offset: u32, umi_value_len: u16) {
-        self.umi_value_offset = umi_value_offset;
-        self.umi_value_len = umi_value_len;
-    }
-
-    /// Returns the cached UMI bytes (without trailing NUL) if a position was
-    /// recorded during decode and still falls within the raw record bytes.
-    /// Returns `None` if no cache is set or the cached position is out of range.
-    #[must_use]
-    pub fn cached_umi(&self) -> Option<&[u8]> {
-        if self.umi_value_offset == Self::UMI_OFFSET_UNCACHED {
-            return None;
-        }
-        let start = self.umi_value_offset as usize;
-        let end = start.checked_add(self.umi_value_len as usize)?;
-        self.data.as_ref().get(start..end)
-    }
-
-    /// Returns the cached UMI offset (`UMI_OFFSET_UNCACHED` when absent) and length.
-    #[must_use]
-    pub fn cached_umi_position(&self) -> (u32, u16) {
-        (self.umi_value_offset, self.umi_value_len)
-    }
-
-    /// Returns a reference to the raw bytes.
-    #[must_use]
-    pub fn raw_bytes(&self) -> &[u8] {
-        self.data.as_ref()
-    }
-
-    /// Takes the [`RawRecord`] out.
-    #[must_use]
-    pub fn into_raw_bytes(self) -> RawRecord {
-        self.data
-    }
-}
-
-impl MemoryEstimate for DecodedRecord {
-    fn estimate_heap_size(&self) -> usize {
-        // RawRecord::capacity() returns the inner Vec<u8> capacity.
-        self.data.capacity()
-    }
-}
 // Vec<DecodedRecord>, Vec<RecordBuf>, Vec<u8>, RecordBuf, () — all provided
 // by the blanket/foreign impls in fgumi_bam_io::mem_estimate.
 
 // ============================================================================
 // GroupKeyConfig - Configuration for computing `GroupKey` during Decode
 // ============================================================================
-
-/// Configuration for computing `GroupKey` during the Decode step.
-///
-/// When this is provided to the pipeline, the Decode step will compute
-/// full `GroupKey` values for each record. This moves expensive computations
-/// (CIGAR parsing, tag extraction) from the serial Group step to the parallel
-/// Decode step.
-#[derive(Debug, Clone)]
-pub struct GroupKeyConfig {
-    /// Library index for fast RG → library lookup.
-    pub library_index: Arc<LibraryIndex>,
-    /// Tag used for cell barcode extraction. None skips cell extraction.
-    pub cell_tag: Option<Tag>,
-    /// UMI tag (raw 2-byte form) whose value position should be cached on each
-    /// `DecodedRecord` during decode. None disables caching — downstream code
-    /// must fall back to scanning aux data.
-    pub umi_tag: Option<[u8; 2]>,
-}
-
-impl GroupKeyConfig {
-    /// Create a new `GroupKeyConfig`.
-    #[must_use]
-    pub fn new(library_index: LibraryIndex, cell_tag: Tag) -> Self {
-        Self { library_index: Arc::new(library_index), cell_tag: Some(cell_tag), umi_tag: None }
-    }
-
-    /// Create a `GroupKeyConfig` without cell barcode extraction.
-    #[must_use]
-    pub fn new_raw_no_cell(library_index: LibraryIndex) -> Self {
-        Self { library_index: Arc::new(library_index), cell_tag: None, umi_tag: None }
-    }
-
-    /// Enable UMI position caching for the given raw 2-byte UMI tag (e.g. `*b"RX"`).
-    #[must_use]
-    pub fn with_umi_tag(mut self, umi_tag: [u8; 2]) -> Self {
-        self.umi_tag = Some(umi_tag);
-        self
-    }
-}
-
-impl Default for GroupKeyConfig {
-    fn default() -> Self {
-        Self {
-            library_index: Arc::new(LibraryIndex::default()),
-            cell_tag: Some(Tag::from(SamTag::CB)), // Default cell barcode tag
-            umi_tag: None,
-        }
-    }
-}
 
 /// Decompressed data batch (output of Step 2, input to Step 3).
 #[derive(Default)]
