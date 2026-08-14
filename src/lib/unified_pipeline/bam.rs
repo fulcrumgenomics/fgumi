@@ -70,6 +70,25 @@ pub struct BoundaryBatch {
     pub offsets: Vec<usize>,
 }
 
+impl MemoryEstimate for BoundaryBatch {
+    fn estimate_heap_size(&self) -> usize {
+        self.buffer.capacity() + self.offsets.capacity() * std::mem::size_of::<usize>()
+    }
+}
+
+/// Release `bytes` from a queue byte counter, saturating at zero.
+///
+/// The counters summed by [`BamPipelineState::queue_bytes_in_flight`] gate the
+/// Read step, so an unpaired refund would not merely skew a statistic: a plain
+/// `fetch_sub` past zero wraps to `u64::MAX` and stops the pipeline reading for
+/// the rest of the run. Saturating turns that class of bug into a bounded
+/// accounting error rather than a hang.
+fn refund_queue_bytes(counter: &AtomicU64, bytes: u64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_sub(bytes))
+    });
+}
+
 /// State for the `FindBoundaries` step (sequential).
 ///
 /// This state maintains leftover bytes from incomplete records that span
@@ -588,10 +607,23 @@ pub struct BamPipelineState<G, P: MemoryEstimate> {
 
     // ========== Queue 1: Read → Decompress ==========
     /// Raw BGZF blocks waiting to be decompressed.
-    pub q1_raw_blocks: ArrayQueue<(u64, RawBlockBatch)>,
+    ///
+    /// Private: push and pop through the `q1_push` / `q1_pop` helpers so
+    /// `q1_heap_bytes` stays synchronized. External mutation would let a batch
+    /// enter or leave the queue without its paired byte accounting.
+    q1_raw_blocks: ArrayQueue<(u64, RawBlockBatch)>,
     /// Heap bytes currently held in Q1 (compressed BGZF blocks).
-    #[cfg(feature = "memory-debug")]
-    pub q1_heap_bytes: AtomicU64,
+    ///
+    /// Charged against the queue memory budget by
+    /// [`BamPipelineState::queue_bytes_in_flight`], so it is maintained
+    /// unconditionally rather than only under `memory-debug`. The charge is
+    /// `RawBlockBatch::estimate_heap_size` (allocation capacity), not
+    /// `total_compressed_size` (logical length) — the budget has to account for
+    /// the memory actually held, and `read_raw_blocks` over-allocates the block
+    /// `Vec` to `blocks_per_read_batch` whether or not it fills it.
+    ///
+    /// Private: maintained only by the `q1_push` / `q1_pop` helpers.
+    q1_heap_bytes: AtomicU64,
 
     // ========== Step 2: Decompress (parallel) ==========
     // No state needed - each thread has its own Decompressor
@@ -630,7 +662,18 @@ pub struct BamPipelineState<G, P: MemoryEstimate> {
 
     // ========== Queue 2b: FindBoundaries → Decode ==========
     /// Boundary batches waiting to be decoded.
-    pub q2b_boundaries: ArrayQueue<(u64, BoundaryBatch)>,
+    ///
+    /// Push and pop through the private `q2b_push` / `q2b_pop` helpers so
+    /// `q2b_heap_bytes` stays accurate. Private for the same reason.
+    q2b_boundaries: ArrayQueue<(u64, BoundaryBatch)>,
+    /// Heap bytes currently held in Q2b (decompressed record buffers).
+    ///
+    /// Q2b holds whole decompressed BGZF payloads, so it is one of the larger
+    /// consumers when the pipeline backs up; it is charged against the queue
+    /// memory budget by [`BamPipelineState::queue_bytes_in_flight`].
+    ///
+    /// Private: maintained only by the `q2b_push` / `q2b_pop` helpers.
+    q2b_heap_bytes: AtomicU64,
 
     // ========== Step 4: Decode (parallel) ==========
     //
@@ -709,7 +752,6 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
             next_read_serial: AtomicU64::new(0),
             // Q1: Read → Decompress
             q1_raw_blocks: ArrayQueue::new(cap),
-            #[cfg(feature = "memory-debug")]
             q1_heap_bytes: AtomicU64::new(0),
             // Step 2: Decompress
             batches_decompressed: AtomicU64::new(0),
@@ -727,6 +769,7 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
             batches_boundary_processed: AtomicU64::new(0),
             // Q2b: FindBoundaries → Decode
             q2b_boundaries: ArrayQueue::new(cap),
+            q2b_heap_bytes: AtomicU64::new(0),
             // Step 4: Decode
             batches_decoded: AtomicU64::new(0),
             group_key_config,
@@ -869,6 +912,114 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
     #[must_use]
     pub fn is_q5_memory_high(&self) -> bool {
         self.output.is_processed_memory_high()
+    }
+
+    /// Push a boundary batch onto Q2b, charging its heap bytes on success.
+    ///
+    /// Returns the batch unchanged when Q2b is out of slots, so callers keep
+    /// the existing held-item retry behaviour.
+    fn q2b_push(&self, serial: u64, batch: BoundaryBatch) -> Result<(), (u64, BoundaryBatch)> {
+        // Charge before the push so the batch is never visible to a consumer
+        // while its bytes are still uncharged: a pop in that window would refund
+        // bytes never added and, because `q2b_heap_bytes` gates Read via
+        // `queue_bytes_in_flight`, permanently over-state the counter and close
+        // the Read gate. Refund on the out-of-slots path so a rejected push
+        // leaves the counter unchanged.
+        let heap_size = batch.estimate_heap_size() as u64;
+        self.q2b_heap_bytes.fetch_add(heap_size, Ordering::AcqRel);
+        match self.q2b_boundaries.push((serial, batch)) {
+            Ok(()) => Ok(()),
+            Err(returned) => {
+                refund_queue_bytes(&self.q2b_heap_bytes, heap_size);
+                Err(returned)
+            }
+        }
+    }
+
+    /// Pop a boundary batch from Q2b, refunding its heap bytes.
+    fn q2b_pop(&self) -> Option<(u64, BoundaryBatch)> {
+        let (serial, batch) = self.q2b_boundaries.pop()?;
+        refund_queue_bytes(&self.q2b_heap_bytes, batch.estimate_heap_size() as u64);
+        Some((serial, batch))
+    }
+
+    /// Push a raw block batch onto Q1, charging its heap bytes on success.
+    ///
+    /// Mirrors [`Self::q2b_push`]: the charge precedes the push (see that method
+    /// for why a visible-but-uncharged batch permanently over-states the Read
+    /// gate), and the out-of-slots path refunds so a rejected push leaves the
+    /// counter unchanged. Callers record the deadlock-detector push on `Ok`.
+    fn q1_push(&self, serial: u64, batch: RawBlockBatch) -> Result<(), (u64, RawBlockBatch)> {
+        let heap_size = batch.estimate_heap_size() as u64;
+        self.q1_heap_bytes.fetch_add(heap_size, Ordering::AcqRel);
+        match self.q1_raw_blocks.push((serial, batch)) {
+            Ok(()) => Ok(()),
+            Err(returned) => {
+                refund_queue_bytes(&self.q1_heap_bytes, heap_size);
+                Err(returned)
+            }
+        }
+    }
+
+    /// Pop a raw block batch from Q1, refunding its heap bytes.
+    fn q1_pop(&self) -> Option<(u64, RawBlockBatch)> {
+        let (serial, batch) = self.q1_raw_blocks.pop()?;
+        refund_queue_bytes(&self.q1_heap_bytes, batch.estimate_heap_size() as u64);
+        Some((serial, batch))
+    }
+
+    /// Heap bytes the pipeline is currently holding in its accounted queues.
+    ///
+    /// Sums every byte counter the pipeline maintains: Q1 (compressed blocks),
+    /// Q2 and Q3 — whose `ReorderBufferState` counters span both the queue and
+    /// its reorder buffer — Q2b, Q4, Q5 (which also covers the MI-assign
+    /// reorder buffer), Q6, Q7, and the write reorder buffer.
+    ///
+    /// This is an estimate, not an exact figure: it counts queued batches, not
+    /// the per-thread working memory a stage allocates while operating on one,
+    /// and it uses `Vec::capacity` rather than the allocator's true block
+    /// sizes. It is nonetheless the whole of the data the pipeline parks
+    /// between stages, which is what grows without bound when the writer
+    /// stalls.
+    #[must_use]
+    pub fn queue_bytes_in_flight(&self) -> u64 {
+        self.q1_heap_bytes.load(Ordering::Acquire)
+            + self.q2_reorder_state.get_heap_bytes()
+            + self.q2b_heap_bytes.load(Ordering::Acquire)
+            + self.q3_reorder_state.get_heap_bytes()
+            + self.output.groups_heap_bytes.load(Ordering::Acquire)
+            + self.output.processed_heap_bytes.load(Ordering::Acquire)
+            + self.output.serialized_heap_bytes.load(Ordering::Acquire)
+            + self.output.compressed_heap_bytes.load(Ordering::Acquire)
+            + self.output.write_reorder_state.get_heap_bytes()
+    }
+
+    /// Whether the Read step may admit another batch under the queue memory
+    /// budget.
+    ///
+    /// Read is the pipeline's only source of new bytes, and every other stage
+    /// is bounded by a slot count rather than by bytes — so when the output
+    /// device stalls, each stage fills with however many bytes its slots
+    /// happen to hold and the configured budget bounds nothing. Gating Read on
+    /// [`Self::queue_bytes_in_flight`] is what turns that budget into a real
+    /// ceiling (issue #746).
+    ///
+    /// This cannot deadlock. Nothing downstream waits on Read to make
+    /// progress: `read_done` is set only at EOF, so declining to read leaves
+    /// every stage free to drain, which lowers the in-flight total and lets
+    /// reading resume. Admission is also always granted when nothing is
+    /// accounted for in flight, so a single batch larger than the whole budget
+    /// still gets through instead of stalling the pipeline forever.
+    ///
+    /// A `queue_memory_limit` of 0 means "no limit" and disables the gate.
+    #[must_use]
+    pub fn read_admission_allowed(&self) -> bool {
+        let limit = self.config.queue_memory_limit;
+        if limit == 0 {
+            return true;
+        }
+        let in_flight = self.queue_bytes_in_flight();
+        in_flight == 0 || in_flight < limit
     }
 
     /// Check if the pipeline is in drain mode (input exhausted, completing remaining work).
@@ -1239,8 +1390,8 @@ impl<G: Send + MemoryEstimate + 'static, P: Send + MemoryEstimate + 'static>
     fn process_input_pop(&self) -> Option<(u64, Vec<G>)> {
         let result = self.output.groups.pop();
         if result.is_some() {
-            // Q4 memory-debug tracking is handled by try_step_process (which does its own
-            // direct pop). Do NOT track here to avoid double-subtraction.
+            // Q4 byte accounting is handled by try_step_process (which does its own
+            // direct pop). Do NOT refund here to avoid double-subtraction.
             self.deadlock_state.record_q4_pop();
         }
         result
@@ -1819,17 +1970,16 @@ fn try_step_read<G: Send, P: Send + MemoryEstimate>(
     // Priority 1: Try to advance any held raw batch first
     // =========================================================================
     if let Some((serial, held)) = worker.held_raw.take() {
-        #[cfg(feature = "memory-debug")]
-        let q1_bytes = held.total_compressed_size() as u64;
-        match state.q1_raw_blocks.push((serial, held)) {
+        // `q1_push` charges the batch's heap bytes before the push and refunds
+        // on the out-of-slots path; see `q2b_push` for why an uncharged-but-
+        // visible batch permanently over-states the Read gate.
+        match state.q1_push(serial, held) {
             Ok(()) => {
                 // Successfully advanced held item, continue to read more
-                #[cfg(feature = "memory-debug")]
-                state.q1_heap_bytes.fetch_add(q1_bytes, Ordering::Relaxed);
                 state.deadlock_state.record_q1_push();
             }
             Err((serial, held)) => {
-                // Still can't push - put it back and signal output full
+                // Still can't push - put it back and signal output full.
                 worker.held_raw = Some((serial, held));
                 return false;
             }
@@ -1847,6 +1997,17 @@ fn try_step_read<G: Send, P: Send + MemoryEstimate>(
     // Priority 3: Check if output queue has space (soft check)
     // =========================================================================
     if state.q1_raw_blocks.len() >= state.config.queue_capacity {
+        return false;
+    }
+
+    // =========================================================================
+    // Priority 3b: Check the queue memory budget
+    // =========================================================================
+    // Every other stage is bounded by a slot count, not by bytes, so this is
+    // the only place the configured budget can actually cap the pipeline. See
+    // `BamPipelineState::read_admission_allowed` for why declining here cannot
+    // deadlock.
+    if !state.read_admission_allowed() {
         return false;
     }
 
@@ -1888,17 +2049,15 @@ fn try_step_read<G: Send, P: Send + MemoryEstimate>(
             // =========================================================================
             // Priority 6: Try to push result (non-blocking)
             // =========================================================================
-            #[cfg(feature = "memory-debug")]
-            let q1_bytes = batch.total_compressed_size() as u64;
-            match state.q1_raw_blocks.push((serial, batch)) {
+            // `q1_push` charges the batch's heap bytes before the push and
+            // refunds on the out-of-slots path. See `q2b_push`.
+            match state.q1_push(serial, batch) {
                 Ok(()) => {
-                    #[cfg(feature = "memory-debug")]
-                    state.q1_heap_bytes.fetch_add(q1_bytes, Ordering::Relaxed);
                     state.deadlock_state.record_q1_push();
                     true
                 }
                 Err((serial, batch)) => {
-                    // Output full - hold the result for next attempt
+                    // Output full - hold the result for the next attempt.
                     worker.held_raw = Some((serial, batch));
                     false
                 }
@@ -1967,18 +2126,13 @@ fn try_step_decompress<G: Send, P: Send + MemoryEstimate>(
     // =========================================================================
     // Priority 3: Pop input and process
     // =========================================================================
-    let Some((serial, raw_batch)) = state.q1_raw_blocks.pop() else {
+    // `q1_pop` refunds the batch's heap bytes as it leaves the queue.
+    let Some((serial, raw_batch)) = state.q1_pop() else {
         if let Some(stats) = state.stats() {
             stats.record_queue_empty(1);
         }
         return advanced_held;
     };
-    // Track Q1 memory on pop
-    #[cfg(feature = "memory-debug")]
-    {
-        let q1_pop_bytes = raw_batch.total_compressed_size() as u64;
-        state.q1_heap_bytes.fetch_sub(q1_pop_bytes, Ordering::Relaxed);
-    }
     state.deadlock_state.record_q1_pop();
 
     // Prepare worker's buffer: clear and reserve capacity
@@ -2102,7 +2256,7 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
     // =========================================================================
     let mut did_work = false;
     if let Some((serial, held)) = worker.held_boundaries.take() {
-        match state.q2b_boundaries.push((serial, held)) {
+        match state.q2b_push(serial, held) {
             Ok(()) => {
                 // Successfully advanced held item, increment completion counter
                 state.batches_boundary_found.fetch_add(1, Ordering::Release);
@@ -2188,7 +2342,7 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
 
                     let serial = state.next_boundary_serial.fetch_add(1, Ordering::SeqCst);
                     // Try non-blocking push
-                    match state.q2b_boundaries.push((serial, boundary_batch)) {
+                    match state.q2b_push(serial, boundary_batch) {
                         Ok(()) => {
                             // Successfully pushed, increment completion counter
                             state.batches_boundary_found.fetch_add(1, Ordering::Release);
@@ -2227,7 +2381,7 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
                 if final_batch.offsets.len() > 1 {
                     let serial = state.next_boundary_serial.fetch_add(1, Ordering::SeqCst);
                     // Try non-blocking push for final batch
-                    match state.q2b_boundaries.push((serial, final_batch)) {
+                    match state.q2b_push(serial, final_batch) {
                         Ok(()) => {
                             // Successfully pushed, increment completion counter
                             state.batches_boundary_found.fetch_add(1, Ordering::Release);
@@ -2308,7 +2462,7 @@ fn try_step_decode<G: Send, P: Send + MemoryEstimate>(
     // =========================================================================
     // Priority 3: Pop input
     // =========================================================================
-    let Some((serial, boundary_batch)) = state.q2b_boundaries.pop() else {
+    let Some((serial, boundary_batch)) = state.q2b_pop() else {
         if let Some(stats) = state.stats() {
             stats.record_queue_empty(25); // Q2b (boundaries queue)
 
@@ -2400,20 +2554,20 @@ fn try_step_group<G: Send + BatchWeight + MemoryEstimate + 'static, P: Send + Me
 
     // Helper to push a batch of groups to Q4
     // Returns Ok(()) on success, Err(batch) on failure so caller can restore
-    // Note: We don't track Q4 memory here - only Q3 (decoded records) is tracked.
-    // Mixing different estimation methods (O(1) for Q3, estimate_heap_size for Q4)
-    // on the same tracker causes imbalance and deadlock.
+    // Q4 bytes are charged here against the queue memory budget and refunded by
+    // `try_step_process` on pop. Q3 keeps its own separate tracker.
     let push_batch = |groups: Vec<G>, state: &BamPipelineState<G, P>| -> Result<(), Vec<G>> {
         if state.output.groups.is_full() {
             return Err(groups);
         }
 
-        // Track Q4 memory (debug only — estimate_heap_size is O(templates))
-        #[cfg(feature = "memory-debug")]
-        {
-            let heap_size: u64 = groups.iter().map(|g| g.estimate_heap_size() as u64).sum();
-            state.output.groups_heap_bytes.fetch_add(heap_size, Ordering::AcqRel);
-        }
+        // Charge Q4 against the queue memory budget. This is O(records) in the
+        // batch, on the exclusive Group step, but it is a `capacity()` read per
+        // record against grouping work that already walked every one of them —
+        // and leaving Q4 uncharged is what let a stalled writer park unbounded
+        // grouped input here (issue #746).
+        let heap_size: u64 = groups.iter().map(|g| g.estimate_heap_size() as u64).sum();
+        state.output.groups_heap_bytes.fetch_add(heap_size, Ordering::AcqRel);
 
         let serial = state.next_group_serial.fetch_add(1, Ordering::SeqCst);
         state
@@ -2744,12 +2898,10 @@ fn try_step_process<G: Send + MemoryEstimate + 'static, P: Send + MemoryEstimate
         };
         state.deadlock_state.record_q4_pop();
 
-        // Track Q4 memory decrement (debug only — estimate_heap_size is O(templates))
-        #[cfg(feature = "memory-debug")]
-        {
-            let q4_heap: u64 = batch.iter().map(|g| g.estimate_heap_size() as u64).sum();
-            state.output.groups_heap_bytes.fetch_sub(q4_heap, Ordering::AcqRel);
-        }
+        // Refund Q4's charge. The batch is unchanged since `push_batch`
+        // charged it, so the two estimates agree exactly.
+        let q4_heap: u64 = batch.iter().map(|g| g.estimate_heap_size() as u64).sum();
+        refund_queue_bytes(&state.output.groups_heap_bytes, q4_heap);
 
         // Process each group in the batch
         let mut results: Vec<P> = Vec::with_capacity(batch.len());
@@ -3210,6 +3362,7 @@ where
         !self.state.has_error()
             && !self.state.read_done.load(Ordering::Relaxed)
             && self.state.q1_raw_blocks.len() < self.state.config.queue_capacity
+            && self.state.read_admission_allowed()
     }
 
     fn execute_read_step(&self, worker: &mut Self::Worker) -> bool {
@@ -3703,22 +3856,21 @@ where
                 let reorder_memory_bytes = [q2_reorder_mem, q3_reorder_mem, q7_reorder_mem];
 
                 // Queue memory from AtomicU64 counters
-                // Q1: only tracked with memory-debug feature
-                #[cfg(feature = "memory-debug")]
+                // Q1: tracked unconditionally (charged against the queue budget)
                 let q1_mem = state_clone.q1_heap_bytes.load(Ordering::Relaxed);
-                #[cfg(not(feature = "memory-debug"))]
-                let q1_mem: u64 = 0;
                 // Q2-Q3: reorder buffer heap_bytes tracked unconditionally (used for backpressure)
                 let q2_mem = state_clone.q2_reorder_state.heap_bytes.load(Ordering::Relaxed);
+                // Q2b: tracked unconditionally (charged against the queue budget)
+                let boundaries_mem = state_clone.q2b_heap_bytes.load(Ordering::Relaxed);
                 let q3_mem = state_clone.q3_reorder_state.heap_bytes.load(Ordering::Relaxed);
-                // Q4: groups_heap_bytes is only mutated under memory-debug (reads 0 without feature)
+                // Q4: tracked unconditionally (charged against the queue budget)
                 let q4_mem = state_clone.output.groups_heap_bytes.load(Ordering::Relaxed);
                 // Q5-Q7: tracked unconditionally via OutputPipelineQueues atomic counters
                 let q5_mem = state_clone.output.processed_heap_bytes.load(Ordering::Relaxed);
                 let q6_mem = state_clone.output.serialized_heap_bytes.load(Ordering::Relaxed);
                 let q7_mem = state_clone.output.compressed_heap_bytes.load(Ordering::Relaxed);
                 let queue_memory_bytes =
-                    [q1_mem, q2_mem, 0, q3_mem, q4_mem, q5_mem, q6_mem, q7_mem];
+                    [q1_mem, q2_mem, boundaries_mem, q3_mem, q4_mem, q5_mem, q6_mem, q7_mem];
 
                 // Collect thread activity
                 let thread_steps: Vec<u8> = if let Some(stats) = state_clone.stats() {
@@ -3735,6 +3887,7 @@ where
                     // Track peak memory from all queues (reorder buffers + ArrayQueues)
                     let total_mem = q1_mem
                         + q2_mem
+                        + boundaries_mem
                         + q3_mem
                         + q7_reorder_mem
                         + q4_mem
@@ -3749,6 +3902,7 @@ where
                     stats.update_queue_memory_from_external(&[
                         ("q1", q1_mem),
                         ("q2", q2_mem),
+                        ("q2b", boundaries_mem),
                         ("q3", q3_mem),
                         ("q4", q4_mem),
                         ("q5", q5_mem),
@@ -4440,6 +4594,210 @@ mod tests {
         BamPipelineState::new(config, input, output, group_key_config)
     }
 
+    /// A `queue_memory_limit` of 0 means "no limit", so Read is never gated.
+    #[test]
+    fn read_admission_is_unconditional_without_a_limit() {
+        let state = create_test_state(0);
+        state.q1_heap_bytes.store(u64::MAX / 2, Ordering::Release);
+        assert!(state.read_admission_allowed());
+    }
+
+    /// Read is gated once the accounted queues reach the budget, and reopens
+    /// as soon as a stage drains below it.
+    #[test]
+    fn read_admission_tracks_the_queue_memory_budget() {
+        let state = create_test_state(1024);
+
+        state.q2b_heap_bytes.store(512, Ordering::Release);
+        assert!(state.read_admission_allowed(), "under budget: reading continues");
+
+        state.q2b_heap_bytes.store(1024, Ordering::Release);
+        assert!(!state.read_admission_allowed(), "at budget: reading stops");
+
+        state.q2b_heap_bytes.store(256, Ordering::Release);
+        assert!(state.read_admission_allowed(), "drained below budget: reading resumes");
+    }
+
+    /// With nothing accounted for in flight, Read is always admitted — so an
+    /// input whose first batch alone exceeds the whole budget still makes
+    /// progress instead of wedging the pipeline.
+    #[test]
+    fn read_admission_always_allows_the_first_batch() {
+        let state = create_test_state(1);
+        assert_eq!(state.queue_bytes_in_flight(), 0);
+        assert!(state.read_admission_allowed());
+    }
+
+    /// Q2b's charge is refunded exactly on pop, so the counter returns to zero.
+    #[test]
+    fn q2b_charge_is_refunded_on_pop() {
+        let state = create_test_state(1024);
+        assert_eq!(state.q2b_heap_bytes.load(Ordering::Acquire), 0);
+
+        let batch = BoundaryBatch { buffer: vec![0u8; 4096], offsets: vec![0, 4096] };
+        let charged = batch.estimate_heap_size() as u64;
+        assert!(state.q2b_push(7, batch).is_ok());
+        assert_eq!(state.q2b_heap_bytes.load(Ordering::Acquire), charged);
+        assert!(charged >= 4096, "a 4 KiB payload must be charged as at least 4 KiB");
+
+        let (serial, _batch) = state.q2b_pop().expect("pushed batch should pop");
+        assert_eq!(serial, 7);
+        assert_eq!(state.q2b_heap_bytes.load(Ordering::Acquire), 0);
+    }
+
+    /// `queue_bytes_in_flight` must include every accounted counter — not just
+    /// `q2b_heap_bytes` — and the Read gate must react to their aggregate. A
+    /// counter dropped from the sum, or a `q2b_push` that failed to charge,
+    /// would slip past a test that only drives `q2b_heap_bytes` with a direct
+    /// `store`.
+    #[test]
+    fn queue_bytes_in_flight_sums_charges_and_gates_on_the_aggregate() {
+        // Fixed charges for two accounted counters, plus Q2b charged through
+        // its real push path (not a direct store).
+        const Q1_CHARGE: u64 = 256;
+        const Q4_CHARGE: u64 = 512;
+        let batch = BoundaryBatch { buffer: vec![0u8; 4096], offsets: vec![0, 4096] };
+        let q2b_charge = batch.estimate_heap_size() as u64;
+
+        // Budget sits above Q1 + Q4 alone but at the full aggregate, so the Q2b
+        // push is what tips the gate shut.
+        let limit = Q1_CHARGE + Q4_CHARGE + q2b_charge;
+        let state = create_test_state(limit);
+
+        state.q1_heap_bytes.store(Q1_CHARGE, Ordering::Release);
+        state.output.groups_heap_bytes.store(Q4_CHARGE, Ordering::Release);
+        assert_eq!(state.queue_bytes_in_flight(), Q1_CHARGE + Q4_CHARGE);
+        assert!(state.read_admission_allowed(), "below budget with only Q1 and Q4 charged");
+
+        assert!(state.q2b_push(3, batch).is_ok());
+        assert_eq!(
+            state.queue_bytes_in_flight(),
+            Q1_CHARGE + Q4_CHARGE + q2b_charge,
+            "aggregate must sum Q1, Q4 and the Q2b push charge"
+        );
+        assert!(!state.read_admission_allowed(), "at the aggregate budget: reading stops");
+
+        // Draining Q2b through its pop path refunds only its own charge, and the
+        // gate reopens because the aggregate falls back below the budget.
+        state.q2b_pop().expect("pushed batch should pop");
+        assert_eq!(state.queue_bytes_in_flight(), Q1_CHARGE + Q4_CHARGE);
+        assert!(state.read_admission_allowed(), "Q2b drained: reading resumes");
+
+        // Every remaining summed counter must contribute to the aggregate. Q1,
+        // Q4 and Q2b are pinned above; charge the other six — Q2/Q3 reorder, Q5
+        // processed, Q6 serialized, Q7 compressed, and the write-reorder state —
+        // with distinct powers of two so dropping any single term from
+        // `queue_bytes_in_flight` changes the total and fails here. The
+        // write-reorder counter is the one the stalled-writer scenario this PR
+        // fixes depends on most, so its omission would otherwise go uncaught.
+        state.q2_reorder_state.add_heap_bytes(1);
+        state.q3_reorder_state.add_heap_bytes(2);
+        state.output.processed_heap_bytes.store(4, Ordering::Release);
+        state.output.serialized_heap_bytes.store(8, Ordering::Release);
+        state.output.compressed_heap_bytes.store(16, Ordering::Release);
+        state.output.write_reorder_state.add_heap_bytes(32);
+        assert_eq!(
+            state.queue_bytes_in_flight(),
+            Q1_CHARGE + Q4_CHARGE + 1 + 2 + 4 + 8 + 16 + 32,
+            "every accounted counter must contribute to the aggregate"
+        );
+    }
+
+    /// An unpaired refund saturates at zero rather than wrapping to
+    /// `u64::MAX`, which would gate Read shut for the rest of the run.
+    #[test]
+    fn refunding_more_than_was_charged_saturates_at_zero() {
+        let counter = AtomicU64::new(100);
+        refund_queue_bytes(&counter, 250);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    /// A `q2b_push` rejected because Q2b is out of slots must refund its charge
+    /// and hand the batch back, leaving `q2b_heap_bytes` exactly where it was —
+    /// otherwise a run of rejected pushes would permanently over-state the Read
+    /// gate.
+    #[test]
+    fn q2b_push_refunds_and_returns_the_batch_when_out_of_slots() {
+        let state = create_test_state(0);
+
+        // Fill Q2b to capacity through the raw queue so its byte counter starts
+        // at zero and only the rejected push under test can move it.
+        let cap = state.q2b_boundaries.capacity();
+        for serial in 0..cap as u64 {
+            let filler = BoundaryBatch { buffer: Vec::new(), offsets: vec![0] };
+            assert!(state.q2b_boundaries.push((serial, filler)).is_ok());
+        }
+        assert!(state.q2b_boundaries.is_full());
+        assert_eq!(state.q2b_heap_bytes.load(Ordering::Acquire), 0);
+
+        let rejected = BoundaryBatch { buffer: vec![0u8; 4096], offsets: vec![0, 4096] };
+        let Err((serial, returned)) = state.q2b_push(99, rejected) else {
+            panic!("push into a full Q2b must be rejected");
+        };
+        assert_eq!(serial, 99, "the rejected serial is handed back unchanged");
+        assert_eq!(returned.buffer.len(), 4096, "the rejected batch is handed back unchanged");
+        assert_eq!(
+            state.q2b_heap_bytes.load(Ordering::Acquire),
+            0,
+            "a rejected push must leave the Q2b counter unchanged"
+        );
+    }
+
+    /// A held raw batch that still cannot push at Priority 1 (Q1 full) must
+    /// refund its Q1 charge, be handed back to the worker, and signal
+    /// output-full — never leave bytes charged for a batch that is not in Q1.
+    #[test]
+    fn try_step_read_refunds_the_held_charge_when_q1_stays_full() {
+        let state = create_test_state(0);
+
+        // Fill Q1 so the held batch cannot be pushed.
+        let cap = state.q1_raw_blocks.capacity();
+        for serial in 0..cap as u64 {
+            assert!(state.q1_raw_blocks.push((serial, RawBlockBatch::new())).is_ok());
+        }
+        assert!(state.q1_raw_blocks.is_full());
+        assert_eq!(state.q1_heap_bytes.load(Ordering::Acquire), 0);
+
+        // A held batch with real capacity so the (charge, refund) pair is
+        // non-zero and a leak would be visible in the counter.
+        let held = RawBlockBatch::with_capacity(8);
+        assert!(held.estimate_heap_size() > 0, "the held batch must carry a non-zero charge");
+        let mut worker = create_test_worker();
+        worker.held_raw = Some((7, held));
+
+        assert!(!try_step_read(&state, &mut worker), "a full Q1 signals output-full");
+        assert!(worker.held_raw.is_some(), "the held batch is handed back to the worker");
+        assert_eq!(worker.held_raw.as_ref().unwrap().0, 7, "the held serial is preserved");
+        assert_eq!(
+            state.q1_heap_bytes.load(Ordering::Acquire),
+            0,
+            "the rejected held push must refund its Q1 charge"
+        );
+    }
+
+    /// With no held batch and Q1 physically open, Read must still decline to
+    /// admit new input once the accounted in-flight bytes reach the queue
+    /// memory budget — the Priority 3b gate.
+    #[test]
+    fn try_step_read_declines_when_over_the_queue_memory_budget() {
+        let state = create_test_state(100);
+        state.q1_heap_bytes.store(200, Ordering::Release);
+        assert!(!state.read_admission_allowed(), "precondition: over budget");
+        assert!(state.q1_raw_blocks.is_empty(), "precondition: Q1 has physical room");
+
+        let mut worker = create_test_worker();
+        assert!(worker.held_raw.is_none(), "no held batch, so Priority 1 is skipped");
+
+        assert!(!try_step_read(&state, &mut worker), "over-budget Read declines to admit input");
+        assert!(worker.held_raw.is_none(), "the gate reads nothing, so no batch is held");
+        assert!(state.q1_raw_blocks.is_empty(), "the gate reads nothing into Q1");
+        assert!(
+            !state.read_done.load(Ordering::Acquire),
+            "the gate must return before `read_raw_blocks`; a set `read_done` means Read hit EOF \
+             instead of being declined"
+        );
+    }
+
     #[test]
     fn test_can_decompress_proceed_no_limit() {
         let state = create_test_state(0); // No limit
@@ -4890,7 +5248,7 @@ mod tests {
         setup_memory_backpressure(&state.q3_reorder_state);
 
         let boundary = BoundaryBatch { buffer: Vec::new(), offsets: vec![0] };
-        assert!(state.q2b_boundaries.push((0, boundary)).is_ok());
+        assert!(state.q2b_push(0, boundary).is_ok());
 
         let mut worker = create_test_worker();
         worker.held_decoded = Some((50, vec![], 16));
@@ -4920,7 +5278,7 @@ mod tests {
         assert!(state.q3_decoded.is_full());
 
         let boundary = BoundaryBatch { buffer: Vec::new(), offsets: vec![0] };
-        assert!(state.q2b_boundaries.push((100, boundary)).is_ok());
+        assert!(state.q2b_push(100, boundary).is_ok());
 
         let mut worker = create_test_worker();
         worker.held_decoded = Some((50, vec![], 16));

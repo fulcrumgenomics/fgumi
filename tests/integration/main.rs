@@ -39,6 +39,7 @@ mod test_group_determinism;
 mod test_input_source_matrix;
 mod test_merge_command;
 mod test_pipeline_concurrency;
+mod test_pipeline_memory_backpressure;
 mod test_review_command;
 mod test_sam_input;
 #[cfg(feature = "simplex")]

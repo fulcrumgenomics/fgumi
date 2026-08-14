@@ -1225,6 +1225,17 @@ fn resolve_memory_budget_with_total(
 /// `--max-memory` is the dominant *controllable* consumer; it is a budget, not
 /// a hard RSS cap — a single pathological position group is still processed
 /// whole, and each worker has transient working-set memory on top of the queue.
+///
+/// In the **BAM** pipeline the budget is enforced at the Read step: the
+/// pipeline stops admitting input once the bytes queued between its stages
+/// reach it, so a slow or contended output device backs pressure up to the
+/// reader instead of filling every queue to its slot count. See
+/// `BamPipelineState::read_admission_allowed`.
+///
+/// The FASTQ pipeline (`fgumi extract`) shares these options and logs the same
+/// budget, but has no equivalent admission gate yet: there it still bounds only
+/// the reorder buffers, each capped at
+/// [`BACKPRESSURE_THRESHOLD_BYTES`](crate::unified_pipeline::BACKPRESSURE_THRESHOLD_BYTES).
 #[derive(Debug, Clone, Args)]
 pub struct QueueMemoryOptions {
     /// Maximum memory for the pipeline queues.
