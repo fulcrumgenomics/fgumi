@@ -214,6 +214,23 @@ use crate::vanilla_caller::{
 use crate::{ReadType, SourceRead};
 use fgumi_raw_bam::{self as bam_fields, RawRecord, RawRecordView, UnmappedSamBuilder, flags};
 use fgumi_sam::SamTag;
+use std::collections::HashSet;
+
+/// What the duplex layer did with one MI group's raw input records.
+///
+/// The two variants cannot be told apart by the payload: records are collected only when
+/// rejects tracking is on, so an empty payload means "nothing to emit", not "the group
+/// survived". The single-strand layer's rejections are folded in on exactly one of these
+/// two paths, so conflating them would double-count every run made without `--rejects`.
+enum DuplexGroupOutcome {
+    /// The duplex layer did not reject the group as a whole. Any rejections for this group
+    /// came from the single-strand layer, and are held by the single-strand caller.
+    Kept,
+    /// The duplex layer rejected the whole group and already counted every one of its raw
+    /// records, so the single-strand layer's subset is covered. The payload is every raw
+    /// input record when rejects tracking is on, and empty when it is off.
+    RejectedWholeGroup(Vec<Vec<u8>>),
+}
 
 /// Duplex consensus read - matches fgbio's `DuplexConsensusRead`
 ///
@@ -304,7 +321,9 @@ pub struct DuplexConsensusCaller {
     produce_per_base_tags: bool,
     /// Cell barcode tag (e.g., CB) for preserving cell barcodes
     cell_tag: Option<Tag>,
-    /// Statistics tracking
+    /// Statistics tracking, including the single-strand caller's rejections: `consensus_reads`
+    /// folds that caller's per-molecule delta in here, so `ss_caller` keeps no running totals
+    /// of its own and this is the one place duplex counters live.
     stats: ConsensusCallingStats,
     /// Single-strand consensus caller (used for both /A and /B families)
     /// Uses `min_reads=1` like fgbio; filtering happens at duplex level
@@ -1810,6 +1829,61 @@ impl DuplexConsensusCaller {
         Ok(Some(duplex))
     }
 
+    /// Ordinals into the group's canonical (`a` records then `b` records) input order for the
+    /// records matching `a_pred` among `a_records`, followed by those matching `b_pred` among
+    /// `b_records`. Built with the same filter+chain the partition's raws vector uses, so the
+    /// result is parallel to it: pass `(is_paired_r1, is_paired_r2)` for X (AB-R1 + BA-R2) and
+    /// `(is_paired_r2, is_paired_r1)` for Y (AB-R2 + BA-R1).
+    fn group_ordinals<A, B>(
+        a_records: &[RawRecord],
+        b_records: &[RawRecord],
+        a_pred: A,
+        b_pred: B,
+    ) -> Vec<usize>
+    where
+        A: Fn(&RawRecord) -> bool,
+        B: Fn(&RawRecord) -> bool,
+    {
+        a_records
+            .iter()
+            .enumerate()
+            .filter(|&(_, r)| a_pred(r))
+            .map(|(i, _)| i)
+            .chain(
+                b_records
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, r)| b_pred(r))
+                    .map(|(j, _)| a_records.len() + j),
+            )
+            .collect()
+    }
+
+    /// Collects the raw records behind a single-strand alignment rejection, tagged with each
+    /// record's ordinal in the group's canonical (`a` records then `b` records) input order.
+    ///
+    /// `rejected` holds indices into `raws`, and `ordinals[i]` is the group ordinal of
+    /// `raws[i]`. Returning `(ordinal, record)` pairs — rather than recording them straight
+    /// away — lets the caller merge the X and Y partitions' rejects into a single
+    /// input-ordered sequence before handing them to `ss_caller`. The two partitions split a
+    /// template's ends across strands (X = AB-R1 + BA-R2, Y = AB-R2 + BA-R1), so recording X
+    /// before Y would write a `/B` template's R2 ahead of its R1 even though the input wrote
+    /// R1 first; sorting by ordinal restores input order.
+    fn collect_ss_rejects<'a>(
+        raws: &[&'a RawRecord],
+        ordinals: &[usize],
+        rejected: &HashSet<usize>,
+        out: &mut Vec<(usize, &'a RawRecord)>,
+    ) {
+        out.extend(
+            raws.iter()
+                .zip(ordinals)
+                .enumerate()
+                .filter(|(idx, _)| rejected.contains(idx))
+                .map(|(_, (raw, &ordinal))| (ordinal, *raw)),
+        );
+    }
+
     /// Processes a single UMI group to generate duplex consensus
     #[expect(clippy::too_many_arguments, reason = "group processing requires many parameters")]
     #[expect(
@@ -1833,31 +1907,33 @@ impl DuplexConsensusCaller {
         read_group_id: &str,
         cell_tag: Option<Tag>,
         track_rejects: bool,
-    ) -> Result<(ConsensusOutput, ConsensusCallingStats, Vec<Vec<u8>>)> {
+    ) -> Result<(ConsensusOutput, ConsensusCallingStats, DuplexGroupOutcome)> {
         let mut stats = ConsensusCallingStats::new();
         let mut builder = UnmappedSamBuilder::new();
         let mut read_name_buf = Vec::new();
         let mut output = ConsensusOutput::default();
         let methylation_mode = ss_caller.options.methylation_mode;
 
-        // Helper: move raw input records into the reject payload if rejects are being
-        // tracked. Each rejection site moves `a_records`/`b_records` into the reject
-        // vec so we never hold both the input and reject copies simultaneously.
-        // Single-strand rejections are captured separately by `ss_caller`.
+        // Helper: mark the whole group as rejected by the duplex layer, moving its raw input
+        // records into the reject payload if rejects are being tracked. Each rejection site
+        // moves `a_records`/`b_records` into the reject vec so we never hold both the input
+        // and reject copies simultaneously. Single-strand rejections are captured separately
+        // by `ss_caller` and are subsumed by this whole-group set.
         let collect_rejected_raw =
-            |track: bool, a: Vec<RawRecord>, b: Vec<RawRecord>| -> Vec<Vec<u8>> {
-                if track {
+            |track: bool, a: Vec<RawRecord>, b: Vec<RawRecord>| -> DuplexGroupOutcome {
+                let records = if track {
                     let mut v: Vec<Vec<u8>> = a.into_iter().map(RawRecord::into_inner).collect();
                     v.extend(b.into_iter().map(RawRecord::into_inner));
                     v
                 } else {
                     Vec::new()
-                }
+                };
+                DuplexGroupOutcome::RejectedWholeGroup(records)
             };
 
         // Check if we have both strands
         if a_records.is_empty() && b_records.is_empty() {
-            return Ok((ConsensusOutput::default(), stats, Vec::new()));
+            return Ok((ConsensusOutput::default(), stats, DuplexGroupOutcome::Kept));
         }
 
         // Check if we have enough input reads (matching fgbio's hasMinimumNumberOfReads)
@@ -1945,7 +2021,7 @@ impl DuplexConsensusCaller {
             ab_r2s.len() + ba_r1s.len()
         );
 
-        // Keep references to original raw records for later tag extraction
+        // Keep references to original raw records for later tag extraction.
         let x_raws: Vec<&RawRecord> = ab_r1s.iter().chain(ba_r2s.iter()).copied().collect();
         let x_sources: Vec<SourceRead> = x_raws
             .iter()
@@ -1973,9 +2049,38 @@ impl DuplexConsensusCaller {
             y_sources.len()
         );
 
-        // Filter by common alignment (combined across strands)
-        let (filtered_xs, _) = ss_caller.filter_by_alignment(x_sources);
-        let (filtered_ys, _) = ss_caller.filter_by_alignment(y_sources);
+        // Filter by common alignment (combined across strands). The filter counts what it
+        // dropped on `ss_caller` but returns only the rejected indices, because the raw
+        // records belong to this caller — hand them back so they reach `--rejects` too.
+        // Merge both partitions' rejects by group ordinal before recording so a template
+        // whose ends are split across X and Y (e.g. a `/B` template) still lands in the
+        // rejects BAM in input order rather than X-before-Y order.
+        let (filtered_xs, x_rejected) = ss_caller.filter_by_alignment(x_sources);
+        let (filtered_ys, y_rejected) = ss_caller.filter_by_alignment(y_sources);
+        if track_rejects {
+            // Each raw record's ordinal is its position in the group's canonical `a`
+            // records-then-`b` records input order — the same order the whole-group reject
+            // path emits. The ordinal vectors are built with the same filter+chain as
+            // `x_raws`/`y_raws` so they stay parallel, and are computed here (only when
+            // tracking rejects) to keep the common `--rejects`-off path allocation-free.
+            let x_ordinals = Self::group_ordinals(
+                &a_records,
+                &b_records,
+                Self::is_paired_r1,
+                Self::is_paired_r2,
+            );
+            let y_ordinals = Self::group_ordinals(
+                &a_records,
+                &b_records,
+                Self::is_paired_r2,
+                Self::is_paired_r1,
+            );
+            let mut ss_rejects: Vec<(usize, &RawRecord)> = Vec::new();
+            Self::collect_ss_rejects(&x_raws, &x_ordinals, &x_rejected, &mut ss_rejects);
+            Self::collect_ss_rejects(&y_raws, &y_ordinals, &y_rejected, &mut ss_rejects);
+            ss_rejects.sort_by_key(|&(ordinal, _)| ordinal);
+            ss_caller.record_rejected_raw(ss_rejects.iter().map(|&(_, raw)| raw));
+        }
 
         debug!(
             "MI {}: After alignment filtering (X={}, Y={})",
@@ -2186,7 +2291,7 @@ impl DuplexConsensusCaller {
                             cell_barcode.as_deref(),
                         )?;
                         stats.record_consensus_pair();
-                        return Ok((output, stats, Vec::new()));
+                        return Ok((output, stats, DuplexGroupOutcome::Kept));
                     }
                     stats.record_rejection(
                         RejectionReason::InsufficientReads,
@@ -2264,7 +2369,7 @@ impl DuplexConsensusCaller {
                             cell_barcode.as_deref(),
                         )?;
                         stats.record_consensus_pair();
-                        return Ok((output, stats, Vec::new()));
+                        return Ok((output, stats, DuplexGroupOutcome::Kept));
                     }
                 }
             }
@@ -2338,7 +2443,7 @@ impl DuplexConsensusCaller {
                             cell_barcode.as_deref(),
                         )?;
                         stats.record_consensus_pair();
-                        return Ok((output, stats, Vec::new()));
+                        return Ok((output, stats, DuplexGroupOutcome::Kept));
                     }
                 }
             }
@@ -2388,7 +2493,7 @@ impl ConsensusCaller for DuplexConsensusCaller {
 
         let produce_per_base_tags = self.produce_per_base_tags;
 
-        let (output, group_stats, duplex_rejected_raw) = Self::process_group(
+        let (output, group_stats, duplex_outcome) = Self::process_group(
             base_mi,
             a_records,
             b_records,
@@ -2405,17 +2510,28 @@ impl ConsensusCaller for DuplexConsensusCaller {
 
         self.stats.merge(&group_stats);
 
-        if self.track_rejects {
-            // When the duplex layer rejects the group, `duplex_rejected_raw`
-            // already contains every raw input record (collected via
-            // `collect_rejected_raw`), so the ss-layer rejects — which are a
-            // subset of those same records — would be duplicates. Drain the
-            // ss-caller regardless to reset its state, but only emit one source.
-            let ss_rejected_raw = self.ss_caller.take_rejected_reads();
-            if duplex_rejected_raw.is_empty() {
-                self.rejected_reads.extend(ss_rejected_raw);
-            } else {
-                self.rejected_reads.extend(duplex_rejected_raw);
+        // The single-strand caller accumulates its own counters and rejects for this group;
+        // drain both unconditionally so nothing leaks into the next group, then fold in
+        // whichever source is the group's authoritative one.
+        //
+        // When the duplex layer rejects the group it counts and returns *every* raw input
+        // record, so the single-strand layer's rejections — a subset of those same records —
+        // are already covered. Adding them on top would report more rejected reads than the
+        // rejects BAM holds. Otherwise the group survived, and the single-strand drops are
+        // the only rejections it produced: they belong in both outputs.
+        let ss_stats = self.ss_caller.take_statistics();
+        let ss_rejected_raw = self.ss_caller.take_rejected_reads();
+        match duplex_outcome {
+            DuplexGroupOutcome::Kept => {
+                self.stats.merge(&ss_stats);
+                if self.track_rejects {
+                    self.rejected_reads.extend(ss_rejected_raw);
+                }
+            }
+            DuplexGroupOutcome::RejectedWholeGroup(duplex_rejected_raw) => {
+                if self.track_rejects {
+                    self.rejected_reads.extend(duplex_rejected_raw);
+                }
             }
         }
 
@@ -2444,14 +2560,12 @@ impl ConsensusCaller for DuplexConsensusCaller {
         info!("  Consensus reads constructed: {}", self.consensus_reads_constructed());
         info!("  Total filtered: {}", self.total_filtered());
 
-        // Log rejection breakdown
+        // Log rejection breakdown. The single-strand caller's rejections are folded into
+        // `self.stats` per molecule, so they are already in this breakdown; logging that
+        // caller separately would report zeroes and imply its drops went uncounted.
         for (reason, count) in &self.stats.rejection_reasons {
             info!("    {}: {}", reason.description(), count);
         }
-
-        // Log single-strand caller statistics
-        info!("Single-strand caller:");
-        self.ss_caller.log_statistics();
     }
 }
 
@@ -3779,6 +3893,236 @@ mod tests {
             result.count
         );
 
+        Ok(())
+    }
+
+    /// Builds one duplex molecule, optionally seeded with minority-alignment templates.
+    ///
+    /// Each strand gets `majority_templates` templates carrying `10M`. When `gapped_a` (or
+    /// `gapped_b`) is set, that strand also gets one `4M1D6M` template named `minority_a`
+    /// (`minority_b`): same query length, different alignment pattern. Both halves of such a
+    /// template land in the minority of their combined alignment group — R1 among
+    /// AB-R1 + BA-R2, R2 among AB-R2 + BA-R1 — so the single-strand layer drops both while
+    /// the majority reads go on to consense.
+    fn duplex_molecule(
+        majority_templates: usize,
+        gapped_a: bool,
+        gapped_b: bool,
+    ) -> Vec<RawRecord> {
+        let cigar_10m = &[encode_op(0, 10)];
+        let cigar_gapped = &[encode_op(0, 4), encode_op(2, 1), encode_op(0, 6)];
+        let quals = &[20u8; 10];
+        let mut b = SamBuilder::new();
+
+        let mut reads = Vec::new();
+        for i in 0..majority_templates {
+            let ab = format!("ab{i}");
+            let ba = format!("ba{i}");
+            reads.push(ab_r1(
+                &mut b,
+                ab.as_bytes(),
+                b"AAAAAAAAAA",
+                quals,
+                cigar_10m,
+                b"foo/A",
+                &[],
+            ));
+            reads.push(ab_r2(
+                &mut b,
+                ab.as_bytes(),
+                b"CCCCCCCCCC",
+                quals,
+                cigar_10m,
+                b"foo/A",
+                &[],
+            ));
+            reads.push(ba_r1(
+                &mut b,
+                ba.as_bytes(),
+                b"CCCCCCCCCC",
+                quals,
+                cigar_10m,
+                b"foo/B",
+                &[],
+            ));
+            reads.push(ba_r2(
+                &mut b,
+                ba.as_bytes(),
+                b"AAAAAAAAAA",
+                quals,
+                cigar_10m,
+                b"foo/B",
+                &[],
+            ));
+        }
+        if gapped_a {
+            let n = b"minority_a";
+            reads.push(ab_r1(&mut b, n, b"AAAAAAAAAA", quals, cigar_gapped, b"foo/A", &[]));
+            reads.push(ab_r2(&mut b, n, b"CCCCCCCCCC", quals, cigar_gapped, b"foo/A", &[]));
+        }
+        if gapped_b {
+            let n = b"minority_b";
+            reads.push(ba_r1(&mut b, n, b"CCCCCCCCCC", quals, cigar_gapped, b"foo/B", &[]));
+            reads.push(ba_r2(&mut b, n, b"AAAAAAAAAA", quals, cigar_gapped, b"foo/B", &[]));
+        }
+        reads
+    }
+
+    /// Builds a duplex caller for the #757 fixtures above.
+    fn rejection_accounting_caller(
+        min_reads: Vec<usize>,
+        track_rejects: bool,
+    ) -> Result<DuplexConsensusCaller> {
+        DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            min_reads,
+            10,
+            false,
+            false,
+            None,
+            None,
+            track_rejects,
+            45,
+            40,
+        )
+    }
+
+    /// #757: single-strand rejections inside a surviving molecule must reach `statistics()`.
+    ///
+    /// The single-strand caller keeps its own [`ConsensusCallingStats`], and the duplex caller
+    /// returned only its own. A read the single-strand layer dropped from a molecule that still
+    /// produced a duplex consensus was therefore counted nowhere, so `raw_reads_rejected`
+    /// under-reported and `--stats` could not reconcile with `--rejects`.
+    ///
+    /// Also pins that the merge adds only rejections: `total_reads` and `consensus_reads` must
+    /// stay at the duplex layer's own values, because the single-strand caller's input and
+    /// consensus counters are untouched on this path and folding them in would double-count.
+    #[test]
+    fn test_single_strand_rejections_reach_the_duplex_statistics() -> Result<()> {
+        let mut caller = rejection_accounting_caller(vec![1], true)?;
+
+        let reads = duplex_molecule(3, true, false);
+        let input_count = reads.len();
+        // The `--rejects` contract is byte-for-byte preservation, so keep the input bytes to
+        // compare against rather than checking read names: a reject path that re-serialized
+        // the record or dropped a tag would satisfy a name-and-count assertion.
+        let expected_rejects: Vec<Vec<u8>> = reads
+            .iter()
+            .filter(|record| fgumi_raw_bam::read_name(record) == b"minority_a")
+            .map(|record| record.to_vec())
+            .collect();
+        assert_eq!(expected_rejects.len(), 2, "the minority template contributes two records");
+        let result = caller.consensus_reads(reads)?;
+
+        assert_eq!(result.count, 2, "the majority-alignment reads must still emit a duplex pair");
+
+        let stats = caller.statistics();
+        assert_eq!(
+            stats.rejection_reasons.get(&RejectionReason::MinorityAlignment).copied().unwrap_or(0),
+            2,
+            "both halves of the minority template must be counted as minority-alignment"
+        );
+        assert_eq!(stats.filtered_reads, 2, "raw_reads_rejected must count the two dropped reads");
+        assert_eq!(
+            stats.total_reads, input_count,
+            "merging the single-strand counters must not inflate the input count"
+        );
+        assert_eq!(
+            stats.consensus_reads, 2,
+            "merging the single-strand counters must not inflate the consensus count"
+        );
+
+        assert_eq!(
+            caller.rejected_reads, expected_rejects,
+            "the rejects buffer must hold exactly the minority template's two records, \
+             byte-for-byte and in input order"
+        );
+        assert_eq!(
+            caller.rejected_reads.len(),
+            stats.filtered_reads,
+            "the rejects buffer must reconcile with raw_reads_rejected"
+        );
+        Ok(())
+    }
+
+    /// #757: the single-strand delta must be dropped when the duplex layer rejects the group.
+    ///
+    /// A whole-group duplex rejection counts *every* raw input record and moves every one of
+    /// them to the rejects buffer, so the single-strand layer's earlier rejections are already
+    /// covered — folding its counters in on top would report more rejected reads than the
+    /// rejects BAM holds.
+    ///
+    /// `min_reads = 4` is met before single-strand filtering (four templates per strand) and
+    /// missed after it (three survive per strand), which is the only way to reach a whole-group
+    /// rejection *downstream* of the single-strand layer. The control run pins that: the same
+    /// depth with no minority templates consenses under the same threshold, so the rejection
+    /// below is caused by the single-strand drops rather than by the raw depth.
+    #[test]
+    fn test_single_strand_rejections_are_not_double_counted_on_whole_group_rejection() -> Result<()>
+    {
+        let mut control = rejection_accounting_caller(vec![4], true)?;
+        let control_result = control.consensus_reads(duplex_molecule(4, false, false))?;
+        assert_eq!(
+            control_result.count, 2,
+            "four clean templates per strand must clear min_reads = 4, so the rejection below \
+             is downstream of the single-strand filter rather than at the pre-filter check"
+        );
+
+        let mut caller = rejection_accounting_caller(vec![4], true)?;
+        let reads = duplex_molecule(3, true, true);
+        let input_count = reads.len();
+
+        let result = caller.consensus_reads(reads)?;
+        assert_eq!(result.count, 0, "the molecule must fail the post-filter depth threshold");
+
+        let stats = caller.statistics();
+        assert_eq!(
+            stats.filtered_reads, input_count,
+            "a whole-group rejection counts every input record exactly once"
+        );
+        assert_eq!(
+            stats.rejection_reasons.get(&RejectionReason::InsufficientReads).copied().unwrap_or(0),
+            input_count,
+            "the whole group is attributed to the duplex layer's own reason"
+        );
+        assert_eq!(
+            stats.rejection_reasons.get(&RejectionReason::MinorityAlignment),
+            None,
+            "the single-strand reasons must not be added on top of the whole-group count"
+        );
+        assert_eq!(
+            caller.rejected_reads.len(),
+            stats.filtered_reads,
+            "the rejects buffer must reconcile with raw_reads_rejected"
+        );
+        Ok(())
+    }
+
+    /// #757: the counters must not depend on whether `--rejects` was requested.
+    ///
+    /// The reject payload is empty whenever tracking is off, so "the duplex layer rejected the
+    /// whole group" cannot be inferred from an empty payload — inferring it that way would fold
+    /// the single-strand delta in on top of the whole-group count on every untracked run, i.e.
+    /// exactly the double-count above but visible only without `--rejects`.
+    #[test]
+    fn test_whole_group_rejection_counts_are_independent_of_rejects_tracking() -> Result<()> {
+        let stats_for = |track_rejects: bool| -> Result<ConsensusCallingStats> {
+            let mut caller = rejection_accounting_caller(vec![4], track_rejects)?;
+            caller.consensus_reads(duplex_molecule(3, true, true))?;
+            Ok(caller.statistics())
+        };
+
+        let tracked = stats_for(true)?;
+        let untracked = stats_for(false)?;
+        assert_eq!(
+            tracked.filtered_reads, untracked.filtered_reads,
+            "rejects tracking must not change the rejected-read count"
+        );
+        assert_eq!(
+            tracked.rejection_reasons, untracked.rejection_reasons,
+            "rejects tracking must not change the per-reason breakdown"
+        );
         Ok(())
     }
 
