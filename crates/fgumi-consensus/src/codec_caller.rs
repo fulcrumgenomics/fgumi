@@ -2454,6 +2454,28 @@ mod tests {
     /// Reference sequence for tests (from fgbio)
     const REF_BASES: &[u8] = b"TGGGTGTTGTTTGGGTTCCTGCTTAAAGAGCTACTGTTCTTCACAGAAACTTCCAACTCACCCAGACTGAGATTTGTACTGAGACTACGATCCACATGTTCAATATCTGATATCTGATGGGAAATAGGCTTTACTGAATTATCCATTTGGGCTGTAATTAATTTCAGTGATGAGCGGGAGATGTTGTTAGTTGTGCTCAGTAACTTTTTGATAGTAGCGGGAGTAGGAGTAAATCTTGTACTAATTAGTGAATATTCTGTTGATGGTGGCTGAAAATTTATAGCTACACAACCAAAAAAATAAAAAACGTTAGTCAATAGCATTTATAAATAGTCTTCTCTACCTGAAATATTTTACATTAAGTAATTCATTCCTTCATTTAGTATCTACACATGTCTAACATTGTAGTAGGAGCTGTGTACTAACAAGAAATCATGACACTGTTTCTGCCTTCAAGGAGCTTATAATCTTTTGGGGTACACAAGATAACCCAGAATGTTAAATAGTATAAAAGTCAAAGTACAATAATTTATTTCATTAAGATTTTGAAATGGCTAACAAACACCTGTTGATCACCTCATACACATGAGCCTCAAAACAAAGGAAAGCACAGCCCCTATGCCTGAGCAATTTAGAATATTGTCAAGGATAGAGACATGTGAGCCATTCACTATGAAACAATCATTGAGAACTACTACAAGAGTGATAAATATAAAATGAAACCTACAGAAACACAGAAGAGTAAGTAATTTTCCCTATAAAGAAGACAGGAACTAAATGTATAAGCAAAAATTGGGAAATTATATAAATGCTATTTTATATGAGAGGCAAAGAACCACAGGTCTAATAATTTTACAAATGTGATAAAATCAGATTTTATGTCCCCATCTTTCTTGACTGCTCAGCTAGAAATTAAAACATTTTTACACATCTTTTTGGCGGGGGCGGGGGGGATCATTATTTATTTCACCTGCCAAAATACTTCATTTCCTTATTGCACTTTTTTACTTCTTTGGTATGGAAAAATCTAACGGGTTTTAGAGTATGAACACATTTTAAGCAGTGATTAGATACGTTTTTCTTGTTATGCTTTCTATTGCAAATTTAGGATTTGATTTTGCACTGTCTTCATGCAAAGCTCTTCTCAAAGGTCTTAAAATATAAAAAACACTTAATGCTTCTCAAAGCATTAAGATTTTATGTAAATCAAACCAAAACCAGAAAAAGACAGAAGAAAATGAACCAAAAACAACAAAAATAATCCTTAACATAGTTGGCAACAAGTGCAATGAAAGATTTTT";
 
+    /// The base [`create_fr_pair`] fills query-only CIGAR operations (insertions
+    /// and soft clips) with, and pads with when a CIGAR runs past the end of
+    /// [`REF_BASES`].
+    ///
+    /// It is deliberately a base [`REF_BASES`] does not open with, so a test
+    /// whose subject is a soft clip can tell the clipped bases apart from the
+    /// aligned ones in the emitted consensus.
+    const PLACEHOLDER_BASE: u8 = b'A';
+    const _: () = assert!(
+        PLACEHOLDER_BASE != REF_BASES[0],
+        "a leading soft clip would be indistinguishable from the reference span it precedes \
+         if the placeholder matched the first reference base"
+    );
+    /// Last aligned reference offset in `test_make_consensus_soft_clipping`,
+    /// which asserts a *trailing* soft clip as well as a leading one.
+    const LAST_ALIGNED_REF_OFFSET: usize = 34;
+    const _: () = assert!(
+        PLACEHOLDER_BASE != REF_BASES[LAST_ALIGNED_REF_OFFSET],
+        "a trailing soft clip would be indistinguishable from the reference span it follows if \
+         the placeholder matched the last aligned reference base"
+    );
+
     /// Helper to create an FR read pair similar to fgbio's SamBuilder.addPair
     ///
     /// Creates a properly oriented FR pair where:
@@ -2515,15 +2537,15 @@ mod tests {
                         let end = (ref_pos + len).min(REF_BASES.len());
                         if ref_pos < REF_BASES.len() {
                             seq.extend_from_slice(&REF_BASES[ref_pos..end]);
-                            // Pad with A's if we ran past ref
+                            // Pad with the placeholder base if we ran past ref
                             let pad_len = (ref_pos + len).saturating_sub(end);
-                            seq.resize(seq.len() + pad_len, b'A');
+                            seq.resize(seq.len() + pad_len, PLACEHOLDER_BASE);
                         }
                         ref_pos += len;
                     }
                     Kind::Insertion | Kind::SoftClip => {
                         // Consume read only - add placeholder bases
-                        seq.resize(seq.len() + len, b'A');
+                        seq.resize(seq.len() + len, PLACEHOLDER_BASE);
                     }
                     Kind::Deletion | Kind::Skip => {
                         // Consume ref only
@@ -2814,6 +2836,19 @@ mod tests {
     }
 
     /// Port of fgbio test: "make a consensus where R1 has a deletion outside of the overlap region"
+    ///
+    /// The subject is that the deletion *shifts* the bases: R1's `5M2D25M`
+    /// excises reference positions 6-7, so the consensus is the reference over
+    /// 1-42 with those two bases removed — not the contiguous 40bp span 1-40 an
+    /// implementation that ignored the deletion would emit. Asserting the
+    /// excised sequence is what separates those two outcomes; the length is 40
+    /// either way, so a length-only assertion cannot.
+    ///
+    /// The expected sequence spans the single-strand tails as well as the
+    /// duplex middle, because a single-strand position is *not* no-called:
+    /// `build_duplex_consensus_from_padded` keeps the covering strand's base
+    /// unless that strand's quality is `MIN_PHRED`, which a base quality of 35
+    /// never reaches.
     #[test]
     fn test_make_consensus_r1_deletion() {
         let options = CodecConsensusOptions {
@@ -2845,10 +2880,24 @@ mod tests {
         // Should produce consensus
         assert_eq!(output.count, 1, "Should produce one consensus read");
 
-        // Consensus should cover the region with deletion accounted for
+        // R1 spans reference 1-32 but skips 6-7; R2 extends the span to 42.
+        // The consensus is therefore reference 1-5 joined to reference 8-42.
+        let expected = [&REF_BASES[0..5], &REF_BASES[7..42]].concat();
+        let unshifted = &REF_BASES[0..40];
+        assert_ne!(
+            expected.as_slice(),
+            unshifted,
+            "fixture guard: the deleted bases must make the shifted and unshifted spans differ, \
+             or this test could not observe the deletion"
+        );
+
         let records = ParsedBamRecord::parse_all(&output.data);
         let consensus = &records[0];
-        assert!(!consensus.bases.is_empty(), "Should have sequence");
+        assert_eq!(
+            String::from_utf8_lossy(&consensus.bases),
+            String::from_utf8_lossy(&expected),
+            "the 2bp deletion must excise reference positions 6-7 from the consensus"
+        );
     }
 
     /// Port of fgbio test: "not emit a consensus when the reads are an RF pair"
@@ -3162,51 +3211,100 @@ mod tests {
 
     /// Port of fgbio test: "emit the consensus in the orientation of R1"
     ///
-    /// This test verifies that the consensus output orientation follows R1.
+    /// The claim is a *relationship* between two families, so it takes two to
+    /// state it. Both cover the same reference span 1-40 with the same pair of
+    /// 30bp `30M` reads at reference 1 and 11; they differ only in which mate
+    /// sits on the minus strand. The R1-forward family must consense to the
+    /// reference bases as read, and the R1-reverse family to the reverse
+    /// complement of exactly that — bases and qualities alike, since
+    /// `reverse_complement_ss` reverses both.
     ///
-    /// Tests that a forward R1 produces a consensus with the expected length.
-    /// Note: Positions covered by only one strand get N bases (correct duplex behavior).
+    /// That is a structural relationship, not a coincidence of this reference
+    /// span: `consensus_reads_raw` builds one single-strand consensus per mate
+    /// and folds them in a fixed order, so swapping which mate is R1 leaves the
+    /// folded consensus untouched and changes only the final
+    /// `if r1_is_negative { reverse_complement_ss(..) }`. The 40bp span is not
+    /// a palindrome, so the two outcomes are distinguishable.
+    ///
+    /// The emitted record's flags cannot carry this: `build_output_record_into`
+    /// writes a constant `UNMAPPED` flag for every CODEC consensus, so a
+    /// `flag & REVERSE == 0` check holds no matter which strand R1 was on. The
+    /// orientation lives in the bases, which is why they are what this asserts.
     #[test]
     fn test_emit_consensus_in_r1_orientation() {
-        // Test that forward R1 produces consensus with correct length
+        /// Reference start of the leftmost mate, which is the one on the plus
+        /// strand of an FR pair.
+        const PLUS_STRAND_START: usize = 1;
+        /// Reference start of the rightmost mate, the one on the minus strand.
+        const MINUS_STRAND_START: usize = 11;
+
         let options = CodecConsensusOptions {
             min_reads_per_strand: 1,
             min_duplex_length: 1,
             ..Default::default()
         };
-        let mut caller_fwd =
-            CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options.clone());
 
-        // Forward R1 (start=1), reverse R2 (start=11)
-        let reads_fwd = create_fr_pair(
-            "read1",
-            1,
-            11,
-            30,
-            35,
-            &[(Kind::Match, 30)],
-            &[(Kind::Match, 30)],
-            "hi",
-            Some("ACC-TGA"),
-            false, // R1 forward
-            true,  // R2 reverse
-        );
+        // Consenses one FR pair covering reference 1-40 and returns the emitted
+        // record. The single parameter is which strand R1 sits on, so the start
+        // and the strand flags cannot be set inconsistently: R1 takes the
+        // leftmost start when forward and the rightmost when reverse, and R2
+        // always takes the other.
+        let consense_pair = |r1_reverse: bool| -> ParsedBamRecord {
+            let mut caller =
+                CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options.clone());
+            let (r1_start, r2_start) = if r1_reverse {
+                (MINUS_STRAND_START, PLUS_STRAND_START)
+            } else {
+                (PLUS_STRAND_START, MINUS_STRAND_START)
+            };
+            let reads = create_fr_pair(
+                "read1",
+                r1_start,
+                r2_start,
+                30,
+                35,
+                &[(Kind::Match, 30)],
+                &[(Kind::Match, 30)],
+                "hi",
+                Some("ACC-TGA"),
+                r1_reverse,
+                !r1_reverse,
+            );
+            let output = caller
+                .consensus_reads_from_sam_records(reads)
+                .expect("consensus_reads_from_sam_records should succeed");
+            assert_eq!(output.count, 1, "Should produce one consensus read");
+            ParsedBamRecord::parse_all(&output.data)
+                .pop()
+                .expect("a count of one means one parsed record")
+        };
 
-        let output_fwd = caller_fwd
-            .consensus_reads_from_sam_records(reads_fwd)
-            .expect("consensus_reads_from_sam_records should succeed");
-        assert_eq!(output_fwd.count, 1, "Should produce one consensus read");
-
-        let records_fwd = ParsedBamRecord::parse_all(&output_fwd.data);
-        // Consensus should cover from pos 1 to pos 40 (R1: 1-30, R2: 11-40)
-        assert_eq!(records_fwd[0].bases.len(), 40, "Forward R1 should produce 40bp consensus");
-
-        // Verify orientation flag is set correctly (forward R1 = unmapped flag only, not reverse)
+        // R1 on the plus strand: the consensus reads out as the reference.
+        let forward = consense_pair(false);
         assert_eq!(
-            records_fwd[0].flag & flags::REVERSE,
-            0,
-            "Forward R1 should produce forward-oriented consensus"
+            String::from_utf8_lossy(&forward.bases),
+            String::from_utf8_lossy(&REF_BASES[0..40]),
+            "with R1 on the plus strand the consensus is the reference span the pair was cut from"
         );
+
+        // R1 on the minus strand: same span, mirrored to R1's orientation.
+        let reverse = consense_pair(true);
+        assert_eq!(
+            String::from_utf8_lossy(&reverse.bases),
+            String::from_utf8_lossy(&reverse_complement(&forward.bases)),
+            "with R1 on the minus strand the consensus must be the reverse complement of the \
+             R1-forward consensus of the same span"
+        );
+        let reversed_quals: Vec<u8> = forward.quals.iter().rev().copied().collect();
+        assert_eq!(
+            reverse.quals, reversed_quals,
+            "the qualities must be reversed alongside the bases"
+        );
+
+        // Both records are emitted unmapped, so the flag says nothing about
+        // orientation — asserted here to document why the bases carry it.
+        assert_eq!(forward.flag, flags::UNMAPPED, "CODEC emits unmapped consensus fragments");
+        assert_eq!(reverse.flag, flags::UNMAPPED, "CODEC emits unmapped consensus fragments");
     }
 
     /// Number of duplex positions in the [`duplex_disagreement_fixture`] pair:
@@ -3359,7 +3457,7 @@ mod tests {
         );
 
         let output = caller
-            .consensus_reads_from_sam_records(duplex_disagreement_fixture())
+            .consensus_reads_from_sam_records(duplex_disagreement_fixture(1))
             .expect("permissive thresholds should emit a consensus");
         assert_eq!(output.count, 1, "fixture should produce exactly one consensus read");
 
@@ -3401,7 +3499,7 @@ mod tests {
         };
         let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
-        let Err(err) = caller.consensus_reads_typed(duplex_disagreement_fixture()) else {
+        let Err(err) = caller.consensus_reads_typed(duplex_disagreement_fixture(1)) else {
             panic!("zero-tolerance disagreement threshold should produce an error");
         };
         assert!(err.is_duplex_disagreement());
@@ -3954,7 +4052,7 @@ mod tests {
         );
         assert_eq!(
             &records[0].bases[..],
-            b"ANGNNANTNNNTNANNNTNNNNNNNNTNNNNGTNNNNNNNNTANNAATTNNNNNNNANNNTNNNNANNNTNNNNNNNAATTNNTANNNNNNNNACNNNNANNNNNNNNANNNTNANNNANTNNCNTT",
+            b"AAGTAACTTTTTGATAGTAGCGGGAGTAGGAGTAAATCTTGTACTAATTAGTGAATATTCTGTTGATGGTGGCTGAAAATTTATAGCTACACAACCAAAAAAATAAAAAACGTTAGTCAATAGCATT",
             "the consensus bases are fixed by the fixture; a mis-placed clip shifts them",
         );
 
@@ -4308,7 +4406,13 @@ mod tests {
 
     /// Port of fgbio test: "make a consensus where R2 has a deletion outside of the overlap region"
     ///
-    /// fgumi now matches fgbio behavior: produces a 40bp consensus (skipping the deleted region).
+    /// fgumi matches fgbio behavior: a 40bp consensus that *skips* the deleted
+    /// region. Both halves of that matter, and only the second is interesting —
+    /// an implementation that ignored R2's `25M5D5M` would also emit 40 bases,
+    /// just the contiguous reference span 1-40. What distinguishes them is which
+    /// bases occupy the final five positions, so this asserts the sequence —
+    /// single-strand tails included, since a single-strand position keeps its
+    /// covering strand's base rather than being no-called.
     #[test]
     fn test_make_consensus_r2_deletion() {
         let options = CodecConsensusOptions {
@@ -4342,17 +4446,43 @@ mod tests {
         // Should produce consensus
         assert_eq!(output.count, 1, "Should produce one consensus read");
 
-        // fgbio produces 40bp consensus (skipping the deleted region in R2)
-        // fgumi now matches this behavior by filtering out positions with depth=0
+        // R1 covers reference 1-30 and R2 covers 11-35 then 41-45, so the
+        // consensus is reference 1-35 joined to reference 41-45: 40 bases, with
+        // the 5bp deletion (reference 36-40) excised.
+        let expected = [&REF_BASES[0..35], &REF_BASES[40..45]].concat();
+        let unshifted = &REF_BASES[0..40];
+        assert_ne!(
+            expected.as_slice(),
+            unshifted,
+            "fixture guard: the deleted bases must make the shifted and unshifted spans differ, \
+             or this test could not observe the deletion"
+        );
+
         let records = ParsedBamRecord::parse_all(&output.data);
         let consensus = &records[0];
-        let len = consensus.bases.len();
-        assert_eq!(len, 40, "Consensus should be 40bp (skipping the 5bp deletion), got {len}");
+        assert_eq!(
+            String::from_utf8_lossy(&consensus.bases),
+            String::from_utf8_lossy(&expected),
+            "the 5bp deletion must excise reference positions 36-40 from the consensus"
+        );
     }
 
     /// Port of fgbio test: "make a consensus where the reads have soft-clipping outside of the overlap region"
+    ///
+    /// The subject is that soft-clipped bases are *retained* and therefore shift
+    /// the aligned reference bases inward: R1's leading `5S` pushes reference
+    /// position 1 to consensus offset 5, and R2's trailing `5S` adds five more
+    /// bases past the aligned span. A length-only assertion cannot see that —
+    /// 45 bases arranged in any order satisfy it — so this pins the layout by
+    /// asserting the placeholder bases sit at the two ends with the reference
+    /// span between them, single-strand tails included (a single-strand
+    /// position keeps its covering strand's base rather than being no-called).
     #[test]
     fn test_make_consensus_soft_clipping() {
+        /// Length of the soft clip on each read, and so of the placeholder run
+        /// at each end of the consensus.
+        const SOFT_CLIP_LENGTH: usize = 5;
+
         let options = CodecConsensusOptions {
             min_reads_per_strand: 1,
             min_duplex_length: 1,
@@ -4388,21 +4518,49 @@ mod tests {
         // Should produce consensus
         assert_eq!(output.count, 1, "Should produce one consensus read");
 
-        // fgbio expects length 45: 5 (R1 soft-clip) + 35 (REF[0..35]) + 5 (R2 soft-clip)
+        // fgbio expects length 45: 5 (R1 soft-clip) + 35 (REF[0..35]) + 5 (R2 soft-clip).
+        // The soft-clipped bases are the fixture's placeholder, which REF_BASES
+        // does not open with, so their presence and position are observable.
+        let expected = [
+            &[PLACEHOLDER_BASE; SOFT_CLIP_LENGTH][..],
+            &REF_BASES[0..35],
+            &[PLACEHOLDER_BASE; SOFT_CLIP_LENGTH][..],
+        ]
+        .concat();
+
         let records = ParsedBamRecord::parse_all(&output.data);
         let consensus = &records[0];
-        let len = consensus.bases.len();
-        // Currently fgumi doesn't include soft-clips, so length is just the reference span
-        // TODO: Update to expect 45 when soft-clip handling is implemented
         assert_eq!(
-            len, 45,
-            "Consensus should be 45bp (5 soft-clip + 35 ref + 5 soft-clip), got {len}"
+            String::from_utf8_lossy(&consensus.bases),
+            String::from_utf8_lossy(&expected),
+            "the soft clips must be retained at both ends, shifting reference position 1 to \
+             consensus offset {SOFT_CLIP_LENGTH}"
         );
     }
 
     /// Port of fgbio test: "make a consensus where both reads are soft-clipped at the same end and fully overlapped"
+    ///
+    /// Both strands carry the same `5S25M` at the same position, so the two
+    /// claims in the name are separately assertable: the shared soft clip is
+    /// retained at the front (bases), and the pair is *fully* overlapped, so
+    /// there is no single-strand tail and every position is a duplex position
+    /// (a single, uniform quality across the whole consensus, because the
+    /// duplex-agreement rule sums both strands' qualities at every position —
+    /// contrast `test_make_consensus_soft_clipping`, whose single-strand tails
+    /// carry one strand's quality and so sit below its overlap).
     #[test]
     fn test_make_consensus_both_soft_clipped_same_end() {
+        /// Length of the soft clip both reads share, and so of the placeholder
+        /// run at the front of the consensus.
+        const SOFT_CLIP_LENGTH: usize = 5;
+        /// The quality every position carries. Pinned as well as asserted
+        /// uniform, since uniformity alone would be satisfied by a fold that
+        /// collapsed every position to one *wrong* value (`MIN_PHRED`, say).
+        /// Each strand's single-read consensus attenuates the input quality of
+        /// 35 by the default `error_rate_post_umi` of 40, giving 33, and duplex
+        /// agreement sums the two strands: 33 + 33 = 66.
+        const EXPECTED_DUPLEX_QUAL: PhredScore = 66;
+
         let options = CodecConsensusOptions {
             min_reads_per_strand: 1,
             min_duplex_length: 1,
@@ -4435,9 +4593,27 @@ mod tests {
         assert_eq!(output.count, 1, "Should produce one consensus read");
 
         // fgbio expects length 30: 5 (soft-clip) + 25 (aligned)
+        let expected = [&[PLACEHOLDER_BASE; SOFT_CLIP_LENGTH][..], &REF_BASES[0..25]].concat();
+
         let records = ParsedBamRecord::parse_all(&output.data);
         let consensus = &records[0];
-        assert!(!consensus.bases.is_empty(), "Should have sequence with both reads soft-clipped");
+        assert_eq!(
+            String::from_utf8_lossy(&consensus.bases),
+            String::from_utf8_lossy(&expected),
+            "the shared soft clip must be retained ahead of the 25bp aligned reference span"
+        );
+        let (&first_qual, rest) =
+            consensus.quals.split_first().expect("a 30bp consensus has qualities");
+        assert!(
+            rest.iter().all(|&q| q == first_qual),
+            "a fully overlapped pair has no single-strand tail, so every position is a duplex \
+             position and carries the same quality; got {:?}",
+            consensus.quals
+        );
+        assert_eq!(
+            first_qual, EXPECTED_DUPLEX_QUAL,
+            "every position is a duplex position, so each carries both strands' summed quality"
+        );
     }
 
     /// Port of fgbio test: "not emit a consensus when the reads are a cross-chromosomal chimeric pair"
@@ -4575,14 +4751,42 @@ mod tests {
     }
 
     /// Port of fgbio test: "mask single stranded regions _and_ bases"
+    ///
+    /// `--single-strand-qual` masks the *quality* of every position only one
+    /// strand covers, and leaves everything else alone. Both halves are pinned
+    /// per position here: the two single-strand tails must be at the masked
+    /// quality and the duplex middle must not, which is what says the mask
+    /// landed on the right positions rather than on all of them or none.
+    ///
+    /// The bases are asserted too, and they are *not* no-calls: the mask only
+    /// touches qualities, and `build_duplex_consensus_from_padded`'s
+    /// single-strand branch keeps the covering strand's base unless that
+    /// strand's quality is `MIN_PHRED`, which this fixture's base quality of 90
+    /// never reaches.
     #[test]
     fn test_mask_single_stranded_regions() {
-        // This tests the single_strand_qual option
-        // In fgbio, single-stranded bases (where abConsensus has N/qual=2) get masked
+        // Consensus offsets, 0-based: R1 covers 0..30 (reference 1-30) and R2
+        // covers 19..49 (reference 20-49), so 19..30 is duplex and the rest is
+        // single-stranded.
+        const SINGLE_STRAND_QUAL: PhredScore = 4;
+        const DUPLEX: std::ops::Range<usize> = 19..30;
+        const CONSENSUS_LENGTH: usize = 49;
+        /// The quality every duplex position carries. Pinned rather than merely
+        /// bounded below, so a capping or rounding regression that collapsed the
+        /// middle to some other single value is still caught. The fixture's base
+        /// quality of 90 saturates each strand's single-read consensus at the
+        /// default `error_rate_post_umi` of 40, and duplex agreement sums the two
+        /// strands: 40 + 40 = 80.
+        const DUPLEX_QUAL: PhredScore = 80;
+
+        // In fgbio, `maskCodecConsensusQuals` assigns `--single-strand-qual` to
+        // every position one of the two padded strands does not cover. It
+        // rewrites qualities only — the bases are left as the duplex fold
+        // produced them.
         let options = CodecConsensusOptions {
             min_reads_per_strand: 1,
             min_duplex_length: 1,
-            single_strand_qual: Some(4),
+            single_strand_qual: Some(SINGLE_STRAND_QUAL),
             ..Default::default()
         };
         let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
@@ -4611,21 +4815,36 @@ mod tests {
 
         assert_eq!(output.count, 1, "Should produce one consensus read");
 
-        // The consensus should have single-strand regions masked
-        // The exact quality values depend on the implementation details
-        // This test verifies the option is respected
         let records = ParsedBamRecord::parse_all(&output.data);
         let consensus = &records[0];
-        let quals = &consensus.quals;
 
-        // Single-strand regions should have lower quality
-        // In fgbio, these get masked to single_strand_qual (4)
-        // Check that we have some variation in qualities
-        let has_low_qual = quals.iter().any(|&q| q <= 4);
-        assert!(
-            has_low_qual || quals.is_empty(),
-            "Should have some low-quality single-strand regions (or be filtered)"
+        assert_eq!(
+            String::from_utf8_lossy(&consensus.bases),
+            String::from_utf8_lossy(&REF_BASES[0..CONSENSUS_LENGTH]),
+            "masking single-strand qualities must not disturb the bases, which stay the \
+             reference over the pair's whole span"
         );
+        assert_eq!(
+            consensus.quals.len(),
+            CONSENSUS_LENGTH,
+            "one quality per base over the pair's whole span"
+        );
+
+        for (offset, &qual) in consensus.quals.iter().enumerate() {
+            if DUPLEX.contains(&offset) {
+                assert_eq!(
+                    qual, DUPLEX_QUAL,
+                    "offset {offset} is covered by both strands, so it must escape the mask and \
+                     carry both strands' summed quality"
+                );
+            } else {
+                assert_eq!(
+                    qual, SINGLE_STRAND_QUAL,
+                    "offset {offset} is covered by one strand and must be masked to \
+                     --single-strand-qual"
+                );
+            }
+        }
     }
 
     /// Builds a `SingleStrandConsensus` for masking tests: `bases` + `quals`, everything else zeroed.
@@ -6168,11 +6387,33 @@ mod tests {
         assert!(
             caller.stats.rejection_reasons.contains_key(&CallerRejectionReason::InsufficientReads)
         );
+        // The tracking-disabled half of the pair with
+        // `test_rejected_reads_tracking_enabled`: the reason is counted either
+        // way, but without tracking the records themselves are not retained.
+        assert!(
+            caller.rejected_reads().is_empty(),
+            "rejects tracking is off, so no record bytes may be retained"
+        );
     }
 
+    /// With rejects tracking enabled, a family that produces no consensus has
+    /// **every** one of its raw records retained byte-for-byte, in input order,
+    /// for the `--rejects` output — the same contract
+    /// `test_high_duplex_disagreement_tracks_rejects` pins on the disagreement
+    /// path, here on the `InsufficientReads` path.
+    ///
+    /// The counters are asserted alongside, but they are not a substitute: they
+    /// are bumped by `reject_records_count`, which runs whether or not tracking
+    /// is on, so an `A || B` over the two would be satisfied by the counters
+    /// even if the rejects buffer were never written. `test_reject_records_tracking`
+    /// is the tracking-disabled half of the pair.
     #[test]
     fn test_rejected_reads_tracking_enabled() {
         use noodles::sam::alignment::record::cigar::op::Kind;
+
+        /// A single pair cannot meet `min_reads_per_strand: 2`, so both of its
+        /// records are rejected as `InsufficientReads`.
+        const EXPECTED_REJECTS: usize = 2;
 
         let options = CodecConsensusOptions {
             min_reads_per_strand: 2, // Require 2 reads per strand
@@ -6198,14 +6439,32 @@ mod tests {
             false,
             true,
         );
+        // Snapshot the input bytes before the fixture is moved into the caller.
+        let expected_bytes: Vec<Vec<u8>> =
+            reads.iter().map(|record| record.as_ref().to_vec()).collect();
+        assert_eq!(expected_bytes.len(), EXPECTED_REJECTS, "the fixture is one pair");
 
         let output = caller
             .consensus_reads_from_sam_records(reads)
             .expect("consensus_reads_from_sam_records should succeed");
 
         assert_eq!(output.count, 0);
-        // Rejected reads should be tracked
-        assert!(!caller.rejected_reads().is_empty() || caller.statistics().reads_filtered > 0);
+        assert_eq!(
+            caller.rejected_reads(),
+            expected_bytes.as_slice(),
+            "every rejected record must be retained byte-for-byte, in input order, for the \
+             --rejects output"
+        );
+        assert_eq!(
+            caller.statistics().reads_filtered,
+            EXPECTED_REJECTS as u64,
+            "both records of the pair are counted as filtered"
+        );
+        assert_eq!(
+            caller.stats.rejection_reasons.get(&CallerRejectionReason::InsufficientReads),
+            Some(&EXPECTED_REJECTS),
+            "both records are attributed to InsufficientReads"
+        );
     }
 
     #[test]
