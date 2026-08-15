@@ -2365,16 +2365,15 @@ mod tests {
             seq
         };
 
-        let seq1_fwd = get_sequence(start1, cigar1);
-        let seq2_fwd = get_sequence(start2, cigar2);
-
-        // For a true FR pair sequencing the same DNA molecule from opposite strands:
-        // - Positive strand reads are stored as-is in BAM (matches reference)
-        // - Negative strand reads are stored as revcomp in BAM
-        //   After revcomp during SS building, they become the same as reference
-        // This ensures that both R1 and R2 SS consensuses agree in the overlap.
-        let seq1: Vec<u8> = if strand1_reverse { reverse_complement(&seq1_fwd) } else { seq1_fwd };
-        let seq2: Vec<u8> = if strand2_reverse { reverse_complement(&seq2_fwd) } else { seq2_fwd };
+        // A BAM stores `SEQ` in *reference* orientation for every record, whatever
+        // the strand — the aligner has already reverse-complemented a read that
+        // mapped to the minus strand. `get_sequence` reads straight out of
+        // `REF_BASES`, so the bases it returns are already in that orientation and
+        // must be stored verbatim for both strands. Reverse-complementing the
+        // minus-strand read here would point the two strands of a pair in opposite
+        // directions and make their consensus almost entirely `N` (issue #763).
+        let seq1 = get_sequence(start1, cigar1);
+        let seq2 = get_sequence(start2, cigar2);
 
         let qual1 = vec![base_quality; seq1.len()];
         let qual2 = vec![base_quality; seq2.len()];
@@ -2466,11 +2465,75 @@ mod tests {
         vec![r1, r2]
     }
 
+    /// Both strands of a [`create_fr_pair`] family are cut from the same
+    /// stretch of [`REF_BASES`], so a family whose two reads align to the same
+    /// reference span must consense back to exactly those reference bases, with
+    /// no no-calls at all.
+    ///
+    /// This is the assertion the rest of the CODEC suite was missing (issue
+    /// #763): every other test on this fixture checks consensus *length*,
+    /// record counts or rejection reasons, so a consensus of the right size
+    /// assembled from the wrong bases went unnoticed. It caught the fixture
+    /// storing the reverse read's `SEQ` in read orientation — a BAM stores `SEQ`
+    /// in reference orientation for every record — which made the two strands
+    /// disagree at roughly three positions in four and turned most of the
+    /// consensus into `N`.
+    #[test]
+    fn test_fixture_consensus_reproduces_the_reference_bases() {
+        const START: usize = 200;
+        const LENGTH: usize = 30;
+
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        // Both reads align to exactly the same reference span, so every
+        // consensus position is a duplex position: there is no single-strand
+        // tail that could legitimately be masked to N.
+        let reads = create_fr_pair(
+            "read1",
+            START,
+            START,
+            LENGTH,
+            35,
+            &[(Kind::Match, LENGTH)],
+            &[(Kind::Match, LENGTH)],
+            "hi",
+            None,
+            false, // R1 forward
+            true,  // R2 reverse
+        );
+
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
+        assert_eq!(output.count, 1, "Should produce one consensus read");
+
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let bases = &records[0].bases;
+        let expected = &REF_BASES[START - 1..START - 1 + LENGTH];
+        assert_eq!(
+            String::from_utf8_lossy(bases),
+            String::from_utf8_lossy(expected),
+            "a wholly-overlapping family cut from REF_BASES must consense to those bases"
+        );
+        assert!(
+            !bases.contains(&NO_CALL_BASE),
+            "no position is single-stranded, so none may be a no-call"
+        );
+    }
+
     /// Port of fgbio test: "make a consensus from two simple reads"
     ///
-    /// Tests that a simple FR pair produces a consensus with correct structure.
-    /// Note: Positions covered by only one strand get N bases (correct duplex behavior),
-    /// so we don't check exact sequence content - only that consensus structure is correct.
+    /// Tests that a simple FR pair produces a consensus with correct structure
+    /// and content. Positions covered by only one strand are *not* no-called:
+    /// `build_duplex_consensus_from_padded` keeps the covering strand's base
+    /// unless that strand's quality is `MIN_PHRED`, which a base quality of 35
+    /// never reaches. The whole 40bp span is therefore assertable against the
+    /// reference, single-strand tails included.
     #[test]
     fn test_make_consensus_from_simple_reads() {
         let options = CodecConsensusOptions {
@@ -2507,8 +2570,13 @@ mod tests {
         let name = String::from_utf8_lossy(&consensus.name);
         assert!(name.contains("hi"), "Consensus name should contain MI tag: {name}");
 
-        // Consensus should cover from pos 1 to pos 40 (R1: 1-30, R2: 11-40)
-        assert_eq!(consensus.bases.len(), 40, "Consensus should be 40bp");
+        // Consensus should cover from pos 1 to pos 40 (R1: 1-30, R2: 11-40),
+        // reproducing the reference bases over that whole span.
+        assert_eq!(
+            String::from_utf8_lossy(&consensus.bases),
+            String::from_utf8_lossy(&REF_BASES[0..40]),
+            "Consensus should be the 40bp of reference the pair was cut from"
+        );
 
         // Check RX tag is preserved (UmiBases consensus)
         let rx = consensus.get_string_tag(SamTag::RX).expect("RX tag not found in consensus");
@@ -2853,14 +2921,87 @@ mod tests {
         );
     }
 
+    /// Number of duplex positions in the [`duplex_disagreement_fixture`] pair:
+    /// R1 covers reference positions 1-30 and R2 covers 11-40, so both strands
+    /// carry a base over positions 11-30.
+    ///
+    /// Only these positions are counted by
+    /// [`CodecConsensusCaller::build_duplex_consensus_from_padded`] — the ten
+    /// single-strand bases on either side are neither duplex bases nor
+    /// disagreements, so they cannot on their own trip a disagreement threshold.
+    const DUPLEX_OVERLAP_LENGTH: usize = 20;
+
+    /// Builds the FR pair the duplex-disagreement tests share, carrying exactly
+    /// `disagreements` deliberate strand disagreements.
+    ///
+    /// R1 is forward at reference position 1 and R2 reverse at 11, both `30M`,
+    /// so the two strands overlap over [`DUPLEX_OVERLAP_LENGTH`] positions.
+    /// Each requested disagreement substitutes one base of R2 inside that
+    /// overlap for a base the reference does not carry there, leaving R1 alone;
+    /// both reads keep the same base quality, so the caller sees an
+    /// equal-quality disagreement at each substituted position.
+    ///
+    /// Before issue #763 this fixture needed no substitutions to disagree: it
+    /// stored R2's `SEQ` in read rather than reference orientation, so the two
+    /// strands disagreed nearly everywhere by accident, and the tests below
+    /// asserted a rejection they had never actually constructed.
+    fn duplex_disagreement_fixture(disagreements: usize) -> Vec<RawRecord> {
+        assert!(
+            disagreements <= DUPLEX_OVERLAP_LENGTH,
+            "the pair only overlaps over {DUPLEX_OVERLAP_LENGTH} positions"
+        );
+
+        let mut reads = create_fr_pair(
+            "read1",
+            1,
+            11,
+            30,
+            35,
+            &[(Kind::Match, 30)],
+            &[(Kind::Match, 30)],
+            "hi",
+            Some("ACC-TGA"),
+            false,
+            true,
+        );
+
+        // R2 starts at reference position 11 and is entirely aligned, so its read
+        // offsets 0..DUPLEX_OVERLAP_LENGTH are exactly the overlap with R1, and
+        // offset `i` reads reference position `11 + i` (`REF_BASES[10 + i]`).
+        // The offsets are only the overlap for the reverse R2, so pin which
+        // record is being substituted rather than trusting the position in the
+        // returned vector.
+        let r2 = &mut reads[1];
+        assert!(
+            r2.is_last_segment() && r2.is_reverse(),
+            "the substituted record must be the reverse R2"
+        );
+        for offset in 0..disagreements {
+            let reference_base = REF_BASES[10 + offset];
+            let substitute = if reference_base == b'A' { b'C' } else { b'A' };
+            r2.view_mut().set_base(offset, substitute);
+        }
+
+        reads
+    }
+
     /// Port of fgbio test: "not emit a consensus when there are a lot of disagreements between strands"
     ///
-    /// Tests disagreement filtering: with permissive settings consensus is produced,
-    /// but with strict settings, consensus fails due to strand disagreements at
-    /// non-overlapping positions (where one strand has N).
+    /// The same family — six deliberate strand disagreements over the twenty
+    /// duplex positions — is emitted under permissive thresholds and rejected
+    /// once the thresholds drop below what it carries, so the rejection is
+    /// attributable to the thresholds and to nothing else.
+    ///
+    /// The rejecting half goes through `consensus_reads_typed` rather than
+    /// `consensus_reads_from_sam_records` (which is a `map_err` over it) so the
+    /// assertion can name *which* threshold fired instead of only that the call
+    /// failed.
     #[test]
     fn test_not_emit_consensus_high_disagreement() {
-        // First test that we get consensus with permissive disagreement settings
+        const DISAGREEMENTS: usize = 6;
+
+        // Both thresholds sit above what the family carries (6 disagreements, a
+        // rate of 6/20 = 0.3), so a consensus is emitted.
         let options_permissive = CodecConsensusOptions {
             min_reads_per_strand: 1,
             min_duplex_length: 1,
@@ -2871,78 +3012,35 @@ mod tests {
         let mut caller_permissive =
             CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options_permissive);
 
-        // Use positions within REF_BASES bounds (positions 1-40)
-        let reads = create_fr_pair(
-            "read1",
-            1,
-            11,
-            30,
-            35,
-            &[(Kind::Match, 30)],
-            &[(Kind::Match, 30)],
-            "hi",
-            Some("ACC-TGA"),
-            false,
-            true,
-        );
-
         let output = caller_permissive
-            .consensus_reads_from_sam_records(reads)
+            .consensus_reads_from_sam_records(duplex_disagreement_fixture(DISAGREEMENTS))
             .expect("consensus_reads_from_sam_records should succeed");
         assert_eq!(output.count, 1, "Should emit consensus with permissive settings");
 
-        // Now test with strict disagreement limits - should fail because
-        // positions covered by only one strand (10 on each side) count as disagreements
+        // Both thresholds now sit below what the family carries: 6 > 5 and
+        // 0.3 > 0.05.
         let options_strict = CodecConsensusOptions {
             min_reads_per_strand: 1,
             min_duplex_length: 1,
-            max_duplex_disagreements: 5, // Only allow 5 disagreements
-            max_duplex_disagreement_rate: 0.05, // 5% rate
+            max_duplex_disagreements: DISAGREEMENTS - 1,
+            max_duplex_disagreement_rate: 0.05,
             ..Default::default()
         };
         let mut caller_strict =
             CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options_strict);
 
-        // Use positions within REF_BASES bounds
-        let reads2 = create_fr_pair(
-            "read1",
-            1,
-            11,
-            30,
-            35,
-            &[(Kind::Match, 30)],
-            &[(Kind::Match, 30)],
-            "hi",
-            Some("ACC-TGA"),
-            false,
-            true,
+        let Err(err) =
+            caller_strict.consensus_reads_typed(duplex_disagreement_fixture(DISAGREEMENTS))
+        else {
+            panic!("a family carrying {DISAGREEMENTS} disagreements should be rejected");
+        };
+        assert!(
+            matches!(
+                err,
+                CodecConsensusError::DuplexDisagreementCount { disagreements: DISAGREEMENTS }
+            ),
+            "expected the count threshold to reject the family, got: {err:?}"
         );
-
-        // With strict settings, this should fail due to high disagreement
-        // (positions covered by only one strand count as disagreements)
-        let cons2 = caller_strict.consensus_reads_from_sam_records(reads2);
-        assert!(cons2.is_err(), "Should reject consensus with strict disagreement settings");
-    }
-
-    /// Builds the same FR pair used by `test_not_emit_consensus_high_disagreement`
-    /// — single-strand positions (10 on each side of the overlap) count as
-    /// disagreements, so the fixture produces >0 disagreement count and a
-    /// non-zero disagreement rate. The two `test_consensus_reads_typed_*`
-    /// tests rely on this to pin down which variant fires.
-    fn duplex_disagreement_fixture() -> Vec<RawRecord> {
-        create_fr_pair(
-            "read1",
-            1,
-            11,
-            30,
-            35,
-            &[(Kind::Match, 30)],
-            &[(Kind::Match, 30)],
-            "hi",
-            Some("ACC-TGA"),
-            false,
-            true,
-        )
     }
 
     /// Verifies that `consensus_reads_typed` returns the typed
@@ -2963,12 +3061,14 @@ mod tests {
         };
         let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
-        let Err(err) = caller.consensus_reads_typed(duplex_disagreement_fixture()) else {
+        // One deliberate disagreement is enough to exceed a zero-tolerance count.
+        let Err(err) = caller.consensus_reads_typed(duplex_disagreement_fixture(1)) else {
             panic!("zero-tolerance count threshold should produce an error");
         };
         assert!(
-            matches!(err, CodecConsensusError::DuplexDisagreementCount { .. }),
-            "expected DuplexDisagreementCount, got: {err:?}"
+            matches!(err, CodecConsensusError::DuplexDisagreementCount { disagreements: 1 }),
+            "expected DuplexDisagreementCount reporting the one disagreement built into \
+             the fixture, got: {err:?}"
         );
         assert!(err.is_duplex_disagreement());
     }
@@ -2979,6 +3079,13 @@ mod tests {
     /// not fire first).
     #[test]
     fn test_consensus_reads_typed_disagreement_rate() {
+        // One deliberate disagreement over the pair's duplex positions, which
+        // exceeds a zero-tolerance rate. Written as a literal because
+        // `DUPLEX_OVERLAP_LENGTH as f64` is a pedantic-clippy cast; the static
+        // assertion below keeps the two from drifting apart.
+        const EXPECTED_RATE: f64 = 1.0 / 20.0;
+        const _: () = assert!(DUPLEX_OVERLAP_LENGTH == 20);
+
         let options = CodecConsensusOptions {
             min_reads_per_strand: 1,
             min_duplex_length: 1,
@@ -2988,14 +3095,18 @@ mod tests {
         };
         let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
-        let Err(err) = caller.consensus_reads_typed(duplex_disagreement_fixture()) else {
+        let Err(err) = caller.consensus_reads_typed(duplex_disagreement_fixture(1)) else {
             panic!("zero-tolerance rate threshold should produce an error");
         };
-        assert!(
-            matches!(err, CodecConsensusError::DuplexDisagreementRate { .. }),
-            "expected DuplexDisagreementRate, got: {err:?}"
-        );
         assert!(err.is_duplex_disagreement());
+        let CodecConsensusError::DuplexDisagreementRate { rate } = err else {
+            panic!("expected DuplexDisagreementRate, got: {err:?}");
+        };
+        assert!(
+            (rate - EXPECTED_RATE).abs() < 1e-9,
+            "expected one disagreement over {DUPLEX_OVERLAP_LENGTH} duplex positions \
+             ({EXPECTED_RATE}), got {rate}"
+        );
     }
 
     /// CODEC3-08: a high-duplex-disagreement reject is counted under the
@@ -3020,7 +3131,8 @@ mod tests {
         };
         let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
-        let fixture = duplex_disagreement_fixture();
+        // One deliberate disagreement exceeds either zero-tolerance threshold.
+        let fixture = duplex_disagreement_fixture(1);
         let record_count = fixture.len();
 
         let Err(err) = caller.consensus_reads_typed(fixture) else {
@@ -3067,7 +3179,8 @@ mod tests {
             true,
         );
 
-        let fixture = duplex_disagreement_fixture();
+        // One deliberate disagreement exceeds the zero-tolerance count threshold.
+        let fixture = duplex_disagreement_fixture(1);
         // Snapshot each input record's full raw bytes before the fixture is moved
         // into the caller, so we can assert byte-exact identity of the retained
         // rejects. `consensus_reads_typed` stores `RawRecord::into_inner()` in
