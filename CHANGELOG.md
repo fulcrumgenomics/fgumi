@@ -21,6 +21,12 @@ All notable changes to this project will be documented in this file.
   if it was dropped without `finish()`. Each now reports what was left unflushed
   ([#782](https://github.com/fulcrumgenomics/fgumi/issues/782)).
 
+- The pipeline's reorder buffer now rejects a duplicate serial, and a serial below its base, in
+  every build rather than only in debug. Both were `debug_assert!`s, so a release build silently
+  overwrote the buffered batch in the first case — losing its records while double-counting them
+  in the memory accounting — and underflowed the `u64` index computation in the second
+  ([#782](https://github.com/fulcrumgenomics/fgumi/issues/782)).
+
 ## [0.6.0] - 2026-08-14
 
 ### Bug Fixes
