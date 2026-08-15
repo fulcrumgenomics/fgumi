@@ -78,6 +78,28 @@ total budget to avoid OOM.
 With `--max-memory auto`, the total budget is instead `host RAM − reserve`
 (divided across threads when per-thread), so it never scales past the host.
 
+### What the Budget Bounds
+
+`--max-memory` is a **total**: the BAM pipeline stops admitting input once the
+bytes queued between its stages reach it, so a slow or contended output device
+backs pressure up to the reader instead of filling every queue.
+
+It is not a per-stage allowance. The reorder-buffered stages back off at
+512 MiB and the processed queue at 256 MiB, and those marks do not rise with
+the budget. A budget below one of them pulls it down; a budget above it leaves
+it where it is. Raising `--max-memory` therefore raises how much the pipeline
+may hold in total, not how much any one stage may hold, and the startup line
+reports both numbers:
+
+```
+Queue memory budget: 6.0 GiB total (768.0 MiB/thread × 8 threads); per-stage high-water marks 512.0 MiB (reorder-buffered stages), 256.0 MiB (processed queue)
+```
+
+Note also that `fgumi extract`'s FASTQ pipeline shares this option and logs the
+same line, but does not yet enforce the total — there only the per-stage marks
+bind. That gap is tracked in
+[fgumi#766](https://github.com/fulcrumgenomics/fgumi/issues/766).
+
 ## Compression Options
 
 ### Compression Level

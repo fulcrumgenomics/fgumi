@@ -10,7 +10,10 @@ use std::sync::Arc;
 use crate::assigner::Strategy;
 #[cfg(feature = "simplex")]
 use crate::logging::OperationTimer;
-use crate::unified_pipeline::{BamPipelineConfig, SchedulerStrategy};
+use crate::unified_pipeline::{
+    BACKPRESSURE_THRESHOLD_BYTES, BamPipelineConfig, Q5_BACKPRESSURE_THRESHOLD_BYTES,
+    SchedulerStrategy, stage_high_water_mark,
+};
 use crate::validation::validate_input_exists;
 use bytesize::ByteSize;
 use clap::Args;
@@ -1241,9 +1244,20 @@ fn resolve_memory_budget_with_total(
 /// input and write reorder states), so this budget bounds them through the Read
 /// gate; they additionally apply their own threshold, capped at
 /// [`BACKPRESSURE_THRESHOLD_BYTES`](crate::unified_pipeline::BACKPRESSURE_THRESHOLD_BYTES).
+///
+/// The budget is a **total**, and it is not the same thing as what any one stage
+/// may hold. Stages back off at their own high-water marks —
+/// [`BACKPRESSURE_THRESHOLD_BYTES`](crate::unified_pipeline::BACKPRESSURE_THRESHOLD_BYTES)
+/// (512 MiB) for the queues and reorder buffers,
+/// [`Q5_BACKPRESSURE_THRESHOLD_BYTES`](crate::unified_pipeline::Q5_BACKPRESSURE_THRESHOLD_BYTES)
+/// (256 MiB) for the processed queue. A budget below one of those marks tightens
+/// it; a budget above it leaves it alone. So raising `--max-memory` raises how
+/// much the pipeline may hold in total, not how much any one stage may hold —
+/// see [`stage_high_water_mark`](crate::unified_pipeline::stage_high_water_mark)
+/// for why a per-stage trigger should not scale with the total (issue #765).
 #[derive(Debug, Clone, Args)]
 pub struct QueueMemoryOptions {
-    /// Maximum memory for the pipeline queues.
+    /// Maximum total memory for the pipeline queues.
     ///
     /// Default is "768" (768 MiB) per thread. Pass "auto" to detect host memory
     /// (cgroup-aware) and subtract --memory-reserve, so the budget shrinks to
@@ -1251,6 +1265,13 @@ pub struct QueueMemoryOptions {
     /// values like "512M", "1G", "4GiB" are per-thread when --memory-per-thread
     /// is enabled (default); plain numbers are MiB. Mirrors `fgumi sort`'s
     /// --max-memory.
+    ///
+    /// This bounds the bytes held in the queues *between* pipeline stages, in
+    /// total. It is not a hard RSS cap: per-thread working memory and a single
+    /// oversized group sit outside it. Individual stages also back off at their
+    /// own lower high-water marks (512 MiB, and 256 MiB for the processed
+    /// queue); a smaller budget tightens those marks, a larger one raises the
+    /// total but leaves them where they are.
     #[arg(long = "max-memory", default_value = "768", value_parser = parse_memory)]
     pub max_memory: MemoryLimit,
 
@@ -1301,23 +1322,43 @@ impl QueueMemoryOptions {
         Ok(bytes as u64)
     }
 
+    /// Renders the resolved memory configuration as a single log line.
+    ///
+    /// The budget is reported as what it is — a **total** — alongside the
+    /// per-stage high-water marks actually in force, so the line cannot be read
+    /// as a promise that raising `--max-memory` raises what any one stage holds.
+    /// It does not: a budget above a stage's default mark leaves that mark
+    /// alone, and only a budget below it pulls it down (issue #765).
+    ///
+    /// # Arguments
+    /// * `num_threads` - Number of threads used for the calculation.
+    /// * `total_memory` - The resolved total budget from `calculate_memory_limit`.
+    #[must_use]
+    pub fn memory_config_summary(&self, num_threads: usize, total_memory: u64) -> String {
+        let budget = if self.memory_per_thread && num_threads > 1 {
+            format!(
+                "{} total ({}/thread × {} threads)",
+                ByteSize(total_memory),
+                ByteSize(total_memory / num_threads as u64),
+                num_threads,
+            )
+        } else {
+            format!("{} total", ByteSize(total_memory))
+        };
+        format!(
+            "Queue memory budget: {budget}; per-stage high-water marks {} (reorder-buffered stages), {} (processed queue)",
+            ByteSize(stage_high_water_mark(total_memory, BACKPRESSURE_THRESHOLD_BYTES)),
+            ByteSize(stage_high_water_mark(total_memory, Q5_BACKPRESSURE_THRESHOLD_BYTES)),
+        )
+    }
+
     /// Logs the resolved memory configuration.
     ///
     /// # Arguments
     /// * `num_threads` - Number of threads used for the calculation.
     /// * `total_memory` - The resolved total budget from `calculate_memory_limit`.
     pub fn log_memory_config(&self, num_threads: usize, total_memory: u64) {
-        let per_thread = self.memory_per_thread;
-        if per_thread && num_threads > 1 {
-            log::info!(
-                "Queue memory budget: {} total ({}/thread × {} threads)",
-                ByteSize(total_memory),
-                ByteSize(total_memory / num_threads as u64),
-                num_threads
-            );
-        } else {
-            log::info!("Queue memory budget: {} total", ByteSize(total_memory));
-        }
+        log::info!("{}", self.memory_config_summary(num_threads, total_memory));
     }
 }
 
@@ -2191,6 +2232,42 @@ mod tests {
         let fixed_total =
             QueueMemoryOptions { memory_per_thread: false, ..QueueMemoryOptions::default() };
         fixed_total.log_memory_config(8, 1024 * 1024 * 1024); // fixed total branch
+    }
+
+    /// The startup line must name the budget as a total *and* report the
+    /// per-stage marks in force, so it cannot be read as promising that a
+    /// larger `--max-memory` gives any one stage more room (issue #765).
+    #[test]
+    fn test_memory_config_summary_reports_the_per_stage_marks() {
+        let per_thread = QueueMemoryOptions::default();
+        let line = per_thread.memory_config_summary(8, 8 * 768 * 1024 * 1024);
+        assert!(line.contains("6.0 GiB total"), "{line}");
+        assert!(line.contains("768.0 MiB/thread × 8 threads"), "{line}");
+        assert!(line.contains("512.0 MiB (reorder-buffered stages)"), "{line}");
+        assert!(line.contains("256.0 MiB (processed queue)"), "{line}");
+    }
+
+    /// A budget larger than every per-stage mark must still report the marks at
+    /// their defaults — that is precisely the fact the old line hid.
+    #[test]
+    fn test_memory_config_summary_does_not_inflate_the_marks_for_a_huge_budget() {
+        let fixed_total =
+            QueueMemoryOptions { memory_per_thread: false, ..QueueMemoryOptions::default() };
+        let line = fixed_total.memory_config_summary(8, 32 * 1024 * 1024 * 1024);
+        assert!(line.contains("32.0 GiB total"), "{line}");
+        assert!(line.contains("512.0 MiB (reorder-buffered stages)"), "{line}");
+        assert!(line.contains("256.0 MiB (processed queue)"), "{line}");
+    }
+
+    /// A budget below the marks pulls them down, and the line says so.
+    #[test]
+    fn test_memory_config_summary_reports_tightened_marks_for_a_small_budget() {
+        let fixed_total =
+            QueueMemoryOptions { memory_per_thread: false, ..QueueMemoryOptions::default() };
+        let line = fixed_total.memory_config_summary(8, 64 * 1024 * 1024);
+        assert!(line.contains("64.0 MiB total"), "{line}");
+        assert!(line.contains("64.0 MiB (reorder-buffered stages)"), "{line}");
+        assert!(line.contains("64.0 MiB (processed queue)"), "{line}");
     }
 
     #[test]

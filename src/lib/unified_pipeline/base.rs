@@ -459,6 +459,15 @@ pub use fgumi_bam_io::MemoryEstimate;
 /// It's designed to provide backpressure when queue memory exceeds a limit,
 /// preventing unbounded memory growth in threaded pipelines.
 ///
+/// # Not on the `--max-memory` path
+///
+/// No code path in this crate constructs a `MemoryTracker`; it is exercised
+/// only by this module's tests. The budget reaches the BAM and FASTQ pipelines
+/// through [`ReorderBufferState`] and [`OutputPipelineQueues`], and is enforced
+/// as a total by `BamPipelineState::read_admission_allowed`. Reading this
+/// struct as the live budget mechanism is a mistake that has been made before
+/// (issue #765), hence this note.
+///
 /// # Usage
 ///
 /// ```ignore
@@ -608,44 +617,23 @@ impl MemoryTracker {
         self.peak_bytes.load(Ordering::Relaxed)
     }
 
-    /// Check if we're at or above the backpressure threshold.
+    /// Check if we're at or above this tracker's high-water mark.
     ///
-    /// For optimal performance, we apply backpressure at a capped threshold
-    /// (512MB) regardless of the configured limit. This keeps the pipeline
-    /// lean with good cache behavior. The configured limit acts as a safety
-    /// cap but doesn't delay backpressure.
-    ///
-    /// Even with no limit (`limit_bytes` == 0), we still apply backpressure
-    /// at 512MB to maintain optimal throughput.
+    /// The mark is [`stage_high_water_mark`] of the configured limit: a limit
+    /// below [`BACKPRESSURE_THRESHOLD_BYTES`] tightens it, one above leaves it
+    /// alone, and no limit at all (`limit_bytes` == 0) still marks at 512 MiB.
     #[must_use]
     pub fn is_at_limit(&self) -> bool {
-        // Always apply backpressure at 512MB for optimal cache behavior.
-        // If a lower limit is configured, use that instead.
-        let backpressure_threshold = if self.limit_bytes == 0 {
-            BACKPRESSURE_THRESHOLD_BYTES
-        } else {
-            self.limit_bytes.min(BACKPRESSURE_THRESHOLD_BYTES)
-        };
-        self.current() >= backpressure_threshold
+        self.current() >= stage_high_water_mark(self.limit_bytes, BACKPRESSURE_THRESHOLD_BYTES)
     }
 
     /// Check if we've drained below the low-water mark.
     ///
     /// This is used for hysteresis to prevent thrashing: we enter drain mode
-    /// when at the backpressure threshold, but only exit when we've drained
-    /// to half that threshold.
-    ///
-    /// The threshold is 256MB (half of the 512MB backpressure cap), or half
-    /// of a lower configured limit if one is set.
+    /// at the high-water mark, but only exit when we've drained to half of it.
     #[must_use]
     pub fn is_below_drain_threshold(&self) -> bool {
-        // Drain threshold is half of the backpressure threshold
-        let backpressure_threshold = if self.limit_bytes == 0 {
-            BACKPRESSURE_THRESHOLD_BYTES
-        } else {
-            self.limit_bytes.min(BACKPRESSURE_THRESHOLD_BYTES)
-        };
-        self.current() < backpressure_threshold / 2
+        self.current() < stage_high_water_mark(self.limit_bytes, BACKPRESSURE_THRESHOLD_BYTES) / 2
     }
 }
 
@@ -692,39 +680,48 @@ impl StepResult {
 /// Progress logging interval for the 7-step pipeline.
 pub const PROGRESS_LOG_INTERVAL: u64 = 1_000_000;
 
-/// Memory threshold for scheduler backpressure signaling (512 MB).
+/// Default high-water mark for a reorder-buffered stage (512 MiB).
 ///
-/// This constant controls when the pipeline signals memory pressure to the scheduler,
-/// which responds by prioritizing downstream steps (Process, Serialize, Compress, Write)
-/// to drain buffered data before allowing more input.
+/// This is the point at which one stage stops taking on new work and the
+/// scheduler starts prioritizing downstream steps (Process, Serialize,
+/// Compress, Write) so the stage can drain.
 ///
-/// # Architecture
+/// It is reached only through `ReorderBufferState::effective_limit`, so it
+/// applies to exactly three stages: Q2 and Q3 (whose counters span the queue
+/// and its reorder buffer both) and the post-Group write reorder buffer. The
+/// remaining queues — Q1, Q2b, Q4, Q6, Q7 — carry byte counters but no byte
+/// mark of their own; they are bounded by their slot count and by the
+/// pipeline-wide total gated at the Read step.
 ///
-/// Memory is tracked at the reorder buffer BEFORE the Group step:
-/// - **BAM pipeline**: `q3_reorder_heap_bytes` (after Decode, before Group)
-/// - **FASTQ pipeline**: `q2_reorder_heap_bytes` (after Decompress, before Group)
+/// # Architecture — where the scheduler reads its drain signal
 ///
-/// This placement is critical: we track memory before the exclusive Group step rather
-/// than after it. Tracking after Group creates a coordination problem where memory is
-/// released from the pre-Group buffer before knowing if the post-Group queue can accept
-/// it, potentially leaving data in an untracked intermediate buffer.
+/// Only one of the three feeds the scheduler's `memory_high` / `memory_drained`
+/// pair, and the two pipelines pick different ones:
+/// - **BAM pipeline**: `q3_reorder_state`, the reorder buffer after Decode and
+///   before Group (`BamPipelineState::is_memory_high`)
+/// - **FASTQ pipeline**: `output.write_reorder_state`, the post-Compress write
+///   reorder buffer (`FastqStepContext::get_backpressure`)
 ///
-/// # Threshold Behavior
+/// For the BAM pipeline that placement is deliberate: memory is tracked before
+/// the exclusive Group step rather than after it, because tracking after Group
+/// releases the pre-Group buffer's bytes before knowing whether the post-Group
+/// queue can accept them, leaving data in an untracked intermediate buffer.
 ///
-/// - When tracked memory >= `BACKPRESSURE_THRESHOLD_BYTES`, `is_memory_high()` returns true
-/// - The scheduler enters "drain mode" and prioritizes output steps
-/// - When tracked memory < `BACKPRESSURE_THRESHOLD_BYTES / 2`, `is_memory_drained()` returns true
-/// - The scheduler exits drain mode (hysteresis prevents thrashing)
+/// # Threshold behaviour
 ///
-/// # Relationship to Queue Memory Limit
+/// - When tracked memory >= the mark, `is_memory_high()` returns true: the
+///   producing step declines new work and the scheduler enters "drain mode"
+/// - When tracked memory < half the mark, `is_memory_drained()` returns true
+///   and the scheduler exits drain mode (hysteresis prevents thrashing)
 ///
-/// This threshold is independent of `queue_memory_limit` (default 4GB), which controls
-/// the hard limit for `can_decompress_proceed()` / `can_decode_proceed()`. The backpressure
-/// threshold is deliberately lower to allow gradual slowdown before hitting hard limits.
+/// # Relationship to `--max-memory`
 ///
-/// The effective threshold is `min(queue_memory_limit, BACKPRESSURE_THRESHOLD_BYTES)`,
-/// so if a smaller memory limit is configured, backpressure activates at that limit.
-pub const BACKPRESSURE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024; // 512 MB
+/// This is a *per-stage trigger*, not the user's capacity budget; see
+/// [`stage_high_water_mark`] for why the two are separate and why a larger
+/// budget does not raise this. The budget's capacity role is enforced on the
+/// pipeline's total in-flight bytes at the Read step
+/// (`BamPipelineState::read_admission_allowed`).
+pub const BACKPRESSURE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 
 /// Release `bytes` from a queue byte counter, saturating at zero.
 ///
@@ -792,13 +789,58 @@ const fn saturating_refund(current: u64, bytes: u64) -> u64 {
     current.saturating_sub(bytes)
 }
 
-/// Q5 (processed queue) backpressure threshold.
+/// Default high-water mark for Q5, the processed queue (256 MiB).
 ///
-/// This is set lower than the Q3 threshold (256 MB vs 512 MB) because items in Q5
+/// This is set lower than the Q3 mark (256 MiB vs 512 MiB) because items in Q5
 /// are typically larger (e.g., `SimplexProcessedBatch` with `RecordBuf` vectors).
-/// When Q5 memory exceeds this threshold, the Process step pauses to let
+/// When Q5 memory reaches this mark, the Process step pauses to let
 /// downstream steps (Serialize, Compress, Write) catch up.
-pub const Q5_BACKPRESSURE_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024; // 256 MB
+///
+/// Like [`BACKPRESSURE_THRESHOLD_BYTES`] it is applied through
+/// [`stage_high_water_mark`], so a `--max-memory` below it tightens it and one
+/// above it leaves it alone.
+pub const Q5_BACKPRESSURE_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+
+/// The high-water mark one pipeline stage backs off at, given the declared
+/// queue memory budget and that stage's default mark.
+///
+/// Returns `default_mark` when `queue_memory_limit` is 0 (meaning "unset"),
+/// and `min(queue_memory_limit, default_mark)` otherwise.
+///
+/// # Why the budget cannot raise the mark (issue #765)
+///
+/// `--max-memory` is a *capacity* budget: how many bytes the pipeline may hold
+/// in total. A stage's high-water mark is a *trigger*: the depth at which that
+/// one stage stops pulling in work so the rest of the pipeline can catch up.
+/// Historically the mark was the only place the budget reached, which fused the
+/// two ideas into one number and made `--max-memory` above 512 MiB inert. The
+/// capacity half now lives where it belongs — on the pipeline's total in-flight
+/// bytes, gated at the Read step — and what is left here is only the trigger.
+///
+/// A trigger should not scale with the total budget, for three reasons:
+///
+/// - **It would buy no throughput.** The scheduler's response to `memory_high`
+///   is a priority reordering, not a stop. Raising the mark only postpones the
+///   moment output steps are favoured, so the stage parks more bytes and the
+///   pipeline runs no faster.
+/// - **Reorder capacity is bounded by serial skew, not by bytes.** The
+///   pre-Group reorder buffers exist to absorb out-of-order completion between
+///   workers. That skew is bounded by the number of batches in flight, which is
+///   bounded by the queue slot count, so bytes past the skew window are dead
+///   weight.
+/// - **It would let one stage monopolize the budget.** These marks are the only
+///   byte bound on Q2, Q3 and Q5 individually. Uncapped, a single stage could
+///   park the entire budget and the total gate would fire before any other
+///   stage buffered anything — converting a pipeline into a queue.
+///
+/// The downward direction is the useful one and is preserved: a budget smaller
+/// than the default mark pulls the mark down with it, so no single stage can
+/// hold more than the whole declared budget.
+#[inline]
+#[must_use]
+pub fn stage_high_water_mark(queue_memory_limit: u64, default_mark: u64) -> u64 {
+    if queue_memory_limit == 0 { default_mark } else { queue_memory_limit.min(default_mark) }
+}
 
 // ============================================================================
 // Input-Half Reorder Buffer State (shared between BAM and FASTQ pipelines)
@@ -889,15 +931,14 @@ impl ReorderBufferState {
         self.heap_bytes.load(Ordering::Acquire) < threshold / 2
     }
 
-    /// Get the effective memory limit (respecting default threshold).
+    /// The high-water mark this buffer backs off at.
+    ///
+    /// A `--max-memory` below [`BACKPRESSURE_THRESHOLD_BYTES`] tightens it; one
+    /// above leaves it alone. See [`stage_high_water_mark`] for why.
     #[inline]
     #[must_use]
     fn effective_limit(&self) -> u64 {
-        if self.memory_limit == 0 {
-            BACKPRESSURE_THRESHOLD_BYTES
-        } else {
-            self.memory_limit.min(BACKPRESSURE_THRESHOLD_BYTES)
-        }
+        stage_high_water_mark(self.memory_limit, BACKPRESSURE_THRESHOLD_BYTES)
     }
 
     /// Add heap bytes to the tracker (after pushing to reorder buffer).
@@ -1807,8 +1848,12 @@ pub struct OutputPipelineQueues<G, P: MemoryEstimate> {
     // ========== Queue: Group → Process ==========
     /// Batches of groups/templates waiting to be processed.
     pub groups: ArrayQueue<(u64, Vec<G>)>,
-    /// Current heap bytes in groups queue (stats/reporting only, not used for backpressure).
-    /// Mutations are gated behind the `memory-debug` feature; reads are zero without the feature.
+    /// Current heap bytes in the groups (Q4) queue.
+    ///
+    /// Charged by the Group step and refunded by the Process step (see
+    /// `bam.rs`'s `push_batch` / `try_step_process`), and summed into
+    /// `BamPipelineState::queue_bytes_in_flight` for Read admission, so it is
+    /// maintained unconditionally rather than only under `memory-debug`.
     pub groups_heap_bytes: AtomicU64,
 
     // ========== Queue: Process → Serialize ==========
@@ -1816,6 +1861,12 @@ pub struct OutputPipelineQueues<G, P: MemoryEstimate> {
     pub processed: ArrayQueue<(u64, Vec<P>)>,
     /// Current heap bytes in processed queue.
     pub processed_heap_bytes: AtomicU64,
+    /// High-water mark at which the Process step stops taking on new work.
+    ///
+    /// [`stage_high_water_mark`] of the configured queue memory budget and
+    /// [`Q5_BACKPRESSURE_THRESHOLD_BYTES`]. Resolved once at construction so
+    /// the hot `is_processed_memory_high` check stays a single load and compare.
+    processed_high_water_mark: u64,
 
     /// Serial-keyed reorder buffer used by the optional MI Assign hook
     /// (see [`crate::unified_pipeline::PipelineFunctions::mi_assign_fn`]).
@@ -1882,7 +1933,10 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
     /// - `output`: Output writer (will be wrapped in Mutex)
     /// - `stats`: Optional performance statistics collector
     /// - `progress_name`: Name for the progress tracker (e.g., "Processed records")
-    /// - `queue_memory_limit`: Memory limit for the write reorder buffer in bytes (0 = 512 MiB default)
+    /// - `queue_memory_limit`: The declared queue memory budget in bytes (0 =
+    ///   unset). It tightens the write reorder buffer's and the processed
+    ///   queue's high-water marks when it is below their defaults; see
+    ///   [`stage_high_water_mark`].
     #[must_use]
     pub fn new(
         queue_capacity: usize,
@@ -1896,6 +1950,10 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
             groups_heap_bytes: AtomicU64::new(0),
             processed: ArrayQueue::new(queue_capacity),
             processed_heap_bytes: AtomicU64::new(0),
+            processed_high_water_mark: stage_high_water_mark(
+                queue_memory_limit,
+                Q5_BACKPRESSURE_THRESHOLD_BYTES,
+            ),
             mi_assign_reorder: Mutex::new(ReorderBuffer::new()),
             serialized: ArrayQueue::new(queue_capacity),
             serialized_heap_bytes: AtomicU64::new(0),
@@ -1945,10 +2003,14 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
 
     // ========== Memory Backpressure ==========
 
-    /// Check if processed queue memory is at the backpressure threshold.
+    /// Check if processed queue memory is at its high-water mark.
+    ///
+    /// The mark is [`Q5_BACKPRESSURE_THRESHOLD_BYTES`], tightened by a smaller
+    /// `--max-memory` — so the processed queue alone can never park more than
+    /// the whole declared budget (issue #765).
     #[must_use]
     pub fn is_processed_memory_high(&self) -> bool {
-        self.processed_heap_bytes.load(Ordering::Acquire) >= Q5_BACKPRESSURE_THRESHOLD_BYTES
+        self.processed_heap_bytes.load(Ordering::Acquire) >= self.processed_high_water_mark
     }
 
     /// Check if pipeline is in drain mode.
@@ -5735,6 +5797,77 @@ mod tests {
         assert!(state_small.is_memory_high()); // 100 >= min(100, 512MB) = 100
     }
 
+    // ========================================================================
+    // Stage high-water mark tests (issue #765)
+    // ========================================================================
+
+    #[test]
+    fn test_stage_high_water_mark_treats_zero_as_unset() {
+        assert_eq!(
+            stage_high_water_mark(0, BACKPRESSURE_THRESHOLD_BYTES),
+            BACKPRESSURE_THRESHOLD_BYTES
+        );
+        assert_eq!(
+            stage_high_water_mark(0, Q5_BACKPRESSURE_THRESHOLD_BYTES),
+            Q5_BACKPRESSURE_THRESHOLD_BYTES
+        );
+    }
+
+    #[test]
+    fn test_stage_high_water_mark_tightens_under_a_small_budget() {
+        // A budget below the default mark pulls the mark down with it, so a
+        // single stage can never park more than the whole declared budget.
+        assert_eq!(
+            stage_high_water_mark(64 * 1024 * 1024, BACKPRESSURE_THRESHOLD_BYTES),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            stage_high_water_mark(64 * 1024 * 1024, Q5_BACKPRESSURE_THRESHOLD_BYTES),
+            64 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_stage_high_water_mark_does_not_scale_above_the_default() {
+        // Deliberate: the mark is a per-stage trigger, not the user's capacity
+        // budget. See the `stage_high_water_mark` docs for why raising it buys
+        // nothing. The budget's capacity role lives at the Read admission gate.
+        let huge = 32 * 1024 * 1024 * 1024;
+        assert_eq!(
+            stage_high_water_mark(huge, BACKPRESSURE_THRESHOLD_BYTES),
+            BACKPRESSURE_THRESHOLD_BYTES
+        );
+        assert_eq!(
+            stage_high_water_mark(huge, Q5_BACKPRESSURE_THRESHOLD_BYTES),
+            Q5_BACKPRESSURE_THRESHOLD_BYTES
+        );
+    }
+
+    #[test]
+    fn test_reorder_buffer_high_water_mark_does_not_scale_with_the_budget() {
+        // `--max-memory 32G` must not let one reorder buffer park 32 GiB before
+        // its producer backs off; it trips at the same 512 MiB a default run does.
+        let state = ReorderBufferState::new(32 * 1024 * 1024 * 1024);
+        state.add_heap_bytes(BACKPRESSURE_THRESHOLD_BYTES - 1);
+        assert!(!state.is_memory_high());
+        state.add_heap_bytes(1);
+        assert!(state.is_memory_high(), "trips at 512 MiB regardless of a larger budget");
+    }
+
+    #[test]
+    fn test_reorder_buffer_high_water_mark_is_identical_at_default_and_huge_budgets() {
+        // Guards the "default path unchanged" claim: the default 768 MiB/thread
+        // budget is already above the mark, so nothing about it is budget-derived.
+        let default_budget = ReorderBufferState::new(8 * 768 * 1024 * 1024);
+        let huge_budget = ReorderBufferState::new(32 * 1024 * 1024 * 1024);
+        for state in [&default_budget, &huge_budget] {
+            state.add_heap_bytes(BACKPRESSURE_THRESHOLD_BYTES);
+            assert!(state.is_memory_high());
+            state.sub_heap_bytes(BACKPRESSURE_THRESHOLD_BYTES / 2 + 1);
+            assert!(state.is_memory_drained());
+        }
+    }
+
     #[test]
     fn test_reorder_buffer_state_add_sub_heap_bytes() {
         let state = ReorderBufferState::new(0);
@@ -6433,6 +6566,72 @@ mod tests {
             "Should include secondary data, got {}",
             batch.estimate_heap_size()
         );
+    }
+
+    /// Q5's high-water mark must be derived from the declared queue memory
+    /// budget, not hardcoded (issue #765). Before this it was a flat 256 MiB,
+    /// so `--max-memory 64M` left the processed queue free to park four times
+    /// the entire declared budget on its own.
+    #[test]
+    fn test_processed_queue_high_water_mark_tightens_under_a_small_budget() {
+        let budget = 64 * 1024 * 1024;
+        let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
+        let queues: OutputPipelineQueues<(), TestProcessed> =
+            OutputPipelineQueues::new(16, output, None, "test", budget);
+
+        queues.processed_heap_bytes.store(budget - 1, Ordering::SeqCst);
+        assert!(!queues.is_processed_memory_high());
+
+        queues.processed_heap_bytes.store(budget, Ordering::SeqCst);
+        assert!(
+            queues.is_processed_memory_high(),
+            "Q5 must back off at the declared budget, not at the 256 MiB default"
+        );
+    }
+
+    /// The complement of the test above: at any budget at or above the default
+    /// mark the behaviour is byte-identical to before, which is what makes this
+    /// change one-directional (it can only lower memory, never raise it).
+    #[test]
+    fn test_processed_queue_high_water_mark_is_unchanged_at_the_default_budget() {
+        // 768 MiB/thread × 8 threads — the shipped default for an 8-thread run.
+        let budget = 8 * 768 * 1024 * 1024;
+        let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
+        let queues: OutputPipelineQueues<(), TestProcessed> =
+            OutputPipelineQueues::new(16, output, None, "test", budget);
+
+        queues.processed_heap_bytes.store(Q5_BACKPRESSURE_THRESHOLD_BYTES - 1, Ordering::SeqCst);
+        assert!(!queues.is_processed_memory_high());
+
+        queues.processed_heap_bytes.store(Q5_BACKPRESSURE_THRESHOLD_BYTES, Ordering::SeqCst);
+        assert!(queues.is_processed_memory_high());
+    }
+
+    /// A budget of 0 means "unset" everywhere else in the pipeline, and must
+    /// keep meaning that here rather than pinning the mark to 0 — which would
+    /// make `should_apply_process_backpressure` permanently true and stall the
+    /// Process step for the whole run.
+    #[test]
+    fn test_processed_queue_high_water_mark_treats_a_zero_budget_as_unset() {
+        let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
+        let queues: OutputPipelineQueues<(), TestProcessed> =
+            OutputPipelineQueues::new(16, output, None, "test", 0);
+        assert!(!queues.is_processed_memory_high());
+        assert!(!queues.should_apply_process_backpressure());
+    }
+
+    /// Forward progress: however small the budget, an empty Q5 must always
+    /// admit the next batch. `is_processed_memory_high` compares with `>=`, so
+    /// a mark of zero would deadlock the Process step; a mark of at least one
+    /// byte cannot.
+    #[test]
+    fn test_processed_queue_admits_work_when_empty_under_a_tiny_budget() {
+        let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
+        let queues: OutputPipelineQueues<(), TestProcessed> =
+            OutputPipelineQueues::new(16, output, None, "test", 1);
+        assert_eq!(queues.processed_heap_bytes.load(Ordering::SeqCst), 0);
+        assert!(!queues.is_processed_memory_high());
+        assert!(!queues.should_apply_process_backpressure());
     }
 
     // ========================================================================
