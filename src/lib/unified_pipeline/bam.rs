@@ -31,9 +31,9 @@ use super::base::{
     OutputPipelineQueues, OutputPipelineState, PROGRESS_LOG_INTERVAL, PipelineConfig,
     PipelineLifecycle, PipelineStats, PipelineStep, PipelineValidationError, ProcessPipelineState,
     QueueSample, RawBlockBatch, ReorderBufferState, SerializePipelineState, SerializedBatch,
-    StepContext, WorkerCoreState, WorkerStateCommon, WritePipelineState, finalize_pipeline,
-    generic_worker_loop, handle_worker_panic, join_monitor_thread, join_worker_threads,
-    shared_try_step_compress,
+    StepContext, WorkerCoreState, WorkerStateCommon, WritePipelineState,
+    finalize_pipeline_with_buffers, generic_worker_loop, handle_worker_panic, join_monitor_thread,
+    join_worker_threads, shared_try_step_compress,
 };
 use super::deadlock::{
     DeadlockAction, DeadlockConfig, DeadlockState, QueueSnapshot, check_deadlock_and_restore,
@@ -98,6 +98,15 @@ impl BoundaryState {
     #[must_use]
     pub fn new_no_header() -> Self {
         Self { leftover: Vec::new(), work_buffer: Vec::new(), header_skipped: true }
+    }
+
+    /// Number of bytes currently held from an incomplete record.
+    ///
+    /// Non-zero at pipeline completion means input was read but never became a
+    /// record, so completion validation reports it.
+    #[must_use]
+    pub fn leftover_len(&self) -> usize {
+        self.leftover.len()
     }
 
     /// Parse BAM header and return the number of bytes consumed.
@@ -294,9 +303,23 @@ impl BoundaryState {
             offsets.push(cursor);
         }
 
-        if cursor == 0 {
-            return Ok(None);
+        // Fewer than four bytes left: not even a `block_size`, so the record's
+        // own length is unknown. The scan loop above cannot see this — it stops
+        // at `cursor + 4 > len` — and the tail used to be discarded, silently
+        // with `Ok(None)` when no complete record preceded it and by sitting
+        // past the final offset when one did.
+        if cursor < self.leftover.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "Incomplete BAM record at EOF: {} trailing byte(s) are too few to hold a \
+                     record length",
+                    self.leftover.len() - cursor
+                ),
+            ));
         }
+
+        debug_assert!(cursor > 0, "cursor == 0 is caught by the trailing-byte check above");
 
         Ok(Some(BoundaryBatch { buffer: std::mem::take(&mut self.leftover), offsets }))
     }
@@ -919,6 +942,12 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
     /// Checks that:
     /// 1. All queues are empty
     /// 2. All batch counters match between stages
+    /// 3. The boundary finder holds no partial record
+    ///
+    /// The Group step's buffers are *not* visible here — the grouper and its
+    /// pending groups sit behind their own mutex — so
+    /// [`super::base::finalize_pipeline_with_buffers`] folds
+    /// [`GroupState::unflushed_buffers`] into this result.
     ///
     /// Note: Heap byte tracking is reported but advisory only (set to 0) because
     /// estimation can be imprecise. Only queue emptiness and counter checks
@@ -982,6 +1011,17 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
             let write_reorder = self.output.write_reorder.lock();
             if !write_reorder.is_empty() {
                 non_empty_queues.push(format!("write_reorder ({})", write_reorder.len()));
+            }
+        }
+
+        // Check the boundary finder holds no partial record. Leftover bytes at
+        // completion are input that never became a record, which is exactly the
+        // internal-buffer case `PipelineLifecycle::validate_completion`
+        // documents (and which the FASTQ side already reports per stream).
+        {
+            let leftover_len = self.boundary_state.lock().leftover_len();
+            if leftover_len > 0 {
+                non_empty_queues.push(format!("boundary_leftover ({leftover_len})"));
             }
         }
 
@@ -1500,6 +1540,29 @@ impl<G: Send> GroupState<G> {
     #[must_use]
     pub fn has_pending(&self) -> bool {
         self.grouper.has_pending()
+    }
+
+    /// Names of this step's buffers that still hold data, for completion
+    /// validation.
+    ///
+    /// Two of the three states [`super::base::PipelineLifecycle::validate_completion`]
+    /// documents live here rather than on the pipeline state: groups that were
+    /// never pushed to Q4, and records the grouper is still holding after
+    /// [`Self::finish`]. The state cannot reach them — they sit behind this
+    /// step's own mutex — so the run function folds this list into the
+    /// validation result.
+    ///
+    /// Empty means the Group step is genuinely drained.
+    #[must_use]
+    pub fn unflushed_buffers(&self) -> Vec<String> {
+        let mut buffers = Vec::new();
+        if !self.pending_groups.is_empty() {
+            buffers.push(format!("group_pending_groups ({})", self.pending_groups.len()));
+        }
+        if self.grouper.has_pending() {
+            buffers.push("grouper (partial group pending)".to_string());
+        }
+        buffers
     }
 }
 
@@ -3531,6 +3594,19 @@ where
         progress.log_if_needed(record_count);
     }
 
+    // The threaded path validates completion against the pipeline state; this
+    // path has no such state, so the same contract is checked directly here. A
+    // grouper that still reports pending records after `finish()` has swallowed
+    // them, and finishing the output now would leave a valid, complete-looking
+    // BAM missing exactly those records.
+    if grouper.has_pending() {
+        return Err(io::Error::other(PipelineValidationError {
+            non_empty_queues: vec!["grouper (partial group pending after finish)".to_string()],
+            counter_mismatches: Vec::new(),
+            leaked_heap_bytes: 0,
+        }));
+    }
+
     // Flush any remaining data in compression buffer
     compressor.flush()?;
     compressor.write_blocks_to(output.as_mut())?;
@@ -3794,8 +3870,11 @@ where
     join_worker_threads(handles)?;
     join_monitor_thread(monitor_handle);
 
-    // Finalize: check errors, flush output, log stats
-    let result = finalize_pipeline(&*state);
+    // Finalize: check errors, flush output, log stats. The Group step's own
+    // buffers are folded in: the state cannot reach them, and records stranded
+    // in the grouper (or groups never pushed to Q4) are data loss that would
+    // otherwise be reported as a clean run.
+    let result = finalize_pipeline_with_buffers(&*state, || group_state.lock().unflushed_buffers());
 
     // Finalize secondary output writer (if present)
     if let Some(ref secondary_mutex) = state.output.secondary_output {
@@ -4530,8 +4609,181 @@ mod tests {
     }
 
     // ========================================================================
+    // BoundaryState Tests
+    // ========================================================================
+
+    /// Frame `payload` as a BAM record: a little-endian `block_size` prefix
+    /// followed by the payload bytes. `find_boundaries` only reads that prefix,
+    /// so the payload's contents are irrelevant to boundary finding.
+    fn framed_record(payload: &[u8]) -> Vec<u8> {
+        let mut framed =
+            u32::try_from(payload.len()).expect("payload fits in u32").to_le_bytes()[..].to_vec();
+        framed.extend_from_slice(payload);
+        framed
+    }
+
+    /// A record fragment too short to hold even a `block_size` must fail at EOF.
+    ///
+    /// `finish` scanned with `cursor + 4 <= leftover.len()`, so a 1-3 byte tail
+    /// fell out of the loop and was dropped: with no complete record ahead of it
+    /// the whole leftover was discarded with `Ok(None)`, and with one it was
+    /// left past the final offset where nothing reads it. Either way the run
+    /// ended successfully on a truncated file, which its own documentation
+    /// already promised was an error.
+    #[rstest]
+    #[case::fragment_only(0)]
+    #[case::record_then_fragment(1)]
+    fn test_boundary_state_finish_rejects_a_sub_header_fragment(#[case] complete_records: usize) {
+        let mut state = BoundaryState::new_no_header();
+        let record = framed_record(&[b'A'; 32]);
+        let mut data: Vec<u8> =
+            std::iter::repeat_n(record.as_slice(), complete_records).flatten().copied().collect();
+        // Three bytes: a truncated `block_size`, so its record length is unknown.
+        data.extend_from_slice(&[0x01, 0x02, 0x03]);
+
+        let batch = state.find_boundaries(&data).expect("complete records must be found");
+        assert_eq!(
+            batch.offsets.len() - 1,
+            complete_records,
+            "only the complete records may be emitted before EOF"
+        );
+        assert_eq!(
+            batch.buffer,
+            data[..data.len() - 3],
+            "the complete records must come through byte-for-byte"
+        );
+
+        let err = state
+            .finish()
+            .expect_err("a record fragment at EOF must fail, as the doc comment promises");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("3 trailing byte"),
+            "the error must name the number of bytes left unread, got: {err}"
+        );
+    }
+
+    /// A record split across two calls must be reassembled, not rejected.
+    ///
+    /// The control for the case above: leftover bytes are the normal state
+    /// between blocks, so the EOF check must fire only at EOF and only on bytes
+    /// that never became a record.
+    #[test]
+    fn test_boundary_state_reassembles_a_record_split_across_calls() {
+        let mut state = BoundaryState::new_no_header();
+        let record = framed_record(&[b'C'; 32]);
+        let (head, tail) = record.split_at(20);
+
+        let first = state.find_boundaries(head).expect("a partial record is held, not rejected");
+        assert_eq!(first.offsets.len(), 1, "no complete record yet");
+
+        let second = state.find_boundaries(tail).expect("the completing chunk must parse");
+        assert_eq!(second.buffer, record, "the reassembled record must be byte-identical");
+
+        assert!(
+            state.finish().expect("nothing may remain after the record completed").is_none(),
+            "a fully consumed stream leaves no final batch"
+        );
+    }
+
+    // ========================================================================
     // Pipeline Validation Tests
     // ========================================================================
+
+    /// A grouper that holds records forever, to drive completion validation.
+    struct StuckGrouper;
+
+    impl Grouper for StuckGrouper {
+        type Group = ();
+
+        fn add_records(&mut self, _records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
+            Ok(Vec::new())
+        }
+
+        fn finish(&mut self) -> io::Result<Option<Self::Group>> {
+            Ok(None)
+        }
+
+        fn has_pending(&self) -> bool {
+            true
+        }
+    }
+
+    /// A grouper that is genuinely drained.
+    struct DrainedGrouper;
+
+    impl Grouper for DrainedGrouper {
+        type Group = ();
+
+        fn add_records(&mut self, _records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
+            Ok(Vec::new())
+        }
+
+        fn finish(&mut self) -> io::Result<Option<Self::Group>> {
+            Ok(None)
+        }
+
+        fn has_pending(&self) -> bool {
+            false
+        }
+    }
+
+    /// Leftover bytes in the boundary finder are data loss and must be reported.
+    ///
+    /// `base.rs` names boundary leftovers as one of the three internal buffers
+    /// completion validation exists to catch; the BAM implementation checked
+    /// none of them. The FASTQ side already reports its own per-stream
+    /// leftovers, so this brings the two into line.
+    #[test]
+    fn test_validation_detects_boundary_leftover() {
+        let state = create_test_state(0);
+        state.read_done.store(true, Ordering::SeqCst);
+        state.group_done.store(true, Ordering::SeqCst);
+
+        {
+            let mut boundary = state.boundary_state.lock();
+            *boundary = BoundaryState::new_no_header();
+            // A record announcing 32 bytes but delivering 8: held as leftover.
+            let mut partial = 32u32.to_le_bytes().to_vec();
+            partial.extend_from_slice(&[b'A'; 8]);
+            boundary.find_boundaries(&partial).expect("a partial record is held");
+        }
+
+        let err = state.validate_completion().expect_err("held bytes must fail validation");
+        assert!(
+            err.non_empty_queues.iter().any(|s| s.contains("boundary_leftover")),
+            "validation must name the boundary leftover, got: {err}"
+        );
+    }
+
+    /// The Group step's own buffers are the other two states `base.rs` names.
+    ///
+    /// The pipeline state cannot see them — the grouper and its pending groups
+    /// live behind a separate mutex — so they are folded into the same
+    /// validation result by the run function.
+    #[test]
+    fn test_group_state_reports_unflushed_records_and_groups() {
+        let mut group_state = GroupState::new(Box::new(StuckGrouper));
+        assert_eq!(
+            group_state.unflushed_buffers(),
+            vec!["grouper (partial group pending)".to_string()],
+            "a grouper reporting pending records must be named"
+        );
+
+        group_state.pending_groups.push_back(());
+        group_state.pending_groups.push_back(());
+        assert_eq!(
+            group_state.unflushed_buffers(),
+            vec![
+                "group_pending_groups (2)".to_string(),
+                "grouper (partial group pending)".to_string(),
+            ],
+            "groups never pushed to Q4 must be named alongside the grouper"
+        );
+
+        let drained: GroupState<()> = GroupState::new(Box::new(DrainedGrouper));
+        assert!(drained.unflushed_buffers().is_empty(), "a drained Group step must report nothing");
+    }
 
     #[test]
     fn test_validation_passes_when_complete() {

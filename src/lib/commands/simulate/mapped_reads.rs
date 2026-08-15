@@ -316,7 +316,9 @@ impl MappedReads {
         match result {
             // Flush the final partial batch, then close the stream.
             Ok(total_pairs) => {
-                sink.finish();
+                // `false` means the sort had already hung up on its own error,
+                // which `sort_records` surfaces; reporting ours would mask it.
+                let _delivered = sink.finish();
                 Ok(total_pairs)
             }
             // Surface the failure to the sort so it aborts instead of treating

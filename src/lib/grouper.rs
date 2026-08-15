@@ -549,19 +549,27 @@ impl Grouper for RecordPositionGrouper {
     }
 
     fn finish(&mut self) -> io::Result<Option<Self::Group>> {
-        if !self.current_records.is_empty() {
-            debug_assert!(
-                self.current_group_key.is_some(),
-                "RecordPositionGrouper has {} buffered records but no group key",
-                self.current_records.len()
-            );
-            if let Some(key) = self.current_group_key.take() {
-                let records = std::mem::take(&mut self.current_records);
-                self.current_position_key = None;
-                return Ok(Some(RawPositionGroup { group_key: key, records }));
-            }
+        if self.current_records.is_empty() {
+            return Ok(None);
         }
-        Ok(None)
+
+        // Unconditional, not a `debug_assert!`: the assertion compiled out in
+        // release builds, so the `if let` below simply failed and the buffered
+        // records were dropped on the floor while `has_pending()` went on
+        // reporting them. Buffered records with no key to emit them under are a
+        // bug in this grouper, and reporting it is the only way the caller can
+        // tell that data was left behind.
+        let Some(key) = self.current_group_key.take() else {
+            return Err(io::Error::other(format!(
+                "RecordPositionGrouper reached EOF with {} buffered record(s) but no group key; \
+                 the records cannot be emitted and must not be discarded",
+                self.current_records.len()
+            )));
+        };
+
+        let records = std::mem::take(&mut self.current_records);
+        self.current_position_key = None;
+        Ok(Some(RawPositionGroup { group_key: key, records }))
     }
 
     fn has_pending(&self) -> bool {
@@ -1517,6 +1525,68 @@ mod tests {
     fn test_record_position_grouper_default_impl() {
         let grouper = RecordPositionGrouper::default();
         assert!(!grouper.has_pending());
+    }
+
+    /// `finish` must hand back every record it is still holding, by identity.
+    ///
+    /// The contract the release-only flush bug broke: the records buffered for
+    /// the last position are the records the final group contains. A count-only
+    /// assertion would pass on a flush that emitted the wrong records, so this
+    /// compares read names.
+    #[test]
+    fn test_record_position_grouper_finish_emits_every_buffered_record() {
+        let mut grouper = RecordPositionGrouper::new();
+        for name in [b"readA", b"readB", b"readC"] {
+            let decoded = decoded_via_decode(PRIMARY_PAIRED, 99, Some("4M"), name);
+            let emitted =
+                grouper.add_records(vec![decoded]).expect("records at one position accumulate");
+            assert!(emitted.is_empty(), "a single position emits nothing before finish");
+        }
+
+        let group = grouper
+            .finish()
+            .expect("finish must succeed with a group key set")
+            .expect("the buffered position must be emitted");
+        let names: Vec<Vec<u8>> =
+            group.records.iter().map(|r| fgumi_raw_bam::read_name(&r.data).to_vec()).collect();
+        assert_eq!(
+            names,
+            vec![b"readA".to_vec(), b"readB".to_vec(), b"readC".to_vec()],
+            "finish must emit exactly the buffered records, in order"
+        );
+        assert!(!grouper.has_pending(), "a flushed grouper must report nothing pending");
+    }
+
+    /// Records that cannot be emitted must be reported, not dropped.
+    ///
+    /// The flush used to sit behind a `debug_assert!` that the group key was
+    /// set. In a release build the assertion compiles out, the `if let
+    /// Some(key)` fails, and `finish` returns `Ok(None)` with the records still
+    /// buffered — silent data loss that `has_pending()` then reports forever.
+    /// The check is unconditional now, so the loss is an error in every build
+    /// profile. Only the internals can reach this state, which is exactly why
+    /// the old assertion could not observe it in a release binary.
+    #[test]
+    fn test_record_position_grouper_finish_rejects_records_it_cannot_emit() {
+        let mut grouper = RecordPositionGrouper::new();
+        let decoded = decoded_via_decode(PRIMARY_PAIRED, 99, Some("4M"), b"readA");
+        grouper.add_records(vec![decoded]).expect("one record accumulates");
+
+        // Drive the inconsistency the `debug_assert!` claimed to rule out.
+        grouper.current_group_key = None;
+
+        let err = grouper
+            .finish()
+            .expect_err("buffered records with no group key must not be discarded silently");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("1 buffered record"),
+            "the error must name how many records were left unflushed, got: {msg}"
+        );
+        assert!(
+            grouper.has_pending(),
+            "the records must still be held, not discarded, when finish fails"
+        );
     }
 
     // ========================================================================

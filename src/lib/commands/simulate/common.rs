@@ -649,8 +649,10 @@ impl RecordSink {
     /// The generator must **own** the sink and drop it when it finishes:
     /// dropping the sender is what signals end-of-stream. A sink kept alive
     /// elsewhere (e.g. left in the caller's scope) leaves the sort blocked
-    /// waiting for records that will never arrive. Call [`Self::finish`] before
-    /// dropping so the last partial batch is not lost.
+    /// waiting for records that will never arrive. Call [`Self::finish`] to
+    /// deliver the last partial batch; a sink dropped with records still
+    /// buffered fails the sort rather than silently truncating it (see the
+    /// [`Drop`] impl).
     pub(super) fn new() -> (Self, Receiver<RecordBatch>) {
         let (sender, receiver) = bounded(RECORD_CHANNEL_CAPACITY);
         (Self { sender, batch: Vec::with_capacity(RECORD_BATCH_SIZE) }, receiver)
@@ -683,7 +685,10 @@ impl RecordSink {
     ///
     /// Buffered records are dropped: the stream is being abandoned, and sending
     /// them would only delay the abort.
-    pub(super) fn fail(self, error: anyhow::Error) {
+    pub(super) fn fail(mut self, error: anyhow::Error) {
+        // Deliberate: this abort is the error the caller should see, so clear
+        // the buffer before dropping rather than let `Drop` report a second one.
+        self.batch.clear();
         // If the sorter already hung up it is failing on its own error, which
         // is the one the user should see; dropping ours is correct.
         let _ = self.sender.send(Err(error));
@@ -696,6 +701,31 @@ impl RecordSink {
         }
         let batch = std::mem::replace(&mut self.batch, Vec::with_capacity(RECORD_BATCH_SIZE));
         self.sender.send(Ok(batch)).is_ok()
+    }
+}
+
+impl Drop for RecordSink {
+    /// Report records still buffered when the sink is abandoned.
+    ///
+    /// Dropping the sender is how end-of-stream is signalled, so a sink dropped
+    /// with a partial batch — a `?` on the generator's path, or a panic —
+    /// looked exactly like a clean end of input: the sort finished and wrote a
+    /// complete, short output. Sending the loss as the stream's terminal error
+    /// makes the sort abort instead, so no truncated output is written.
+    ///
+    /// [`Self::finish`] and [`Self::fail`] both leave the buffer empty, so this
+    /// is a no-op after either of them.
+    fn drop(&mut self) {
+        if self.batch.is_empty() {
+            return;
+        }
+        let unflushed = self.batch.len();
+        // A closed receiver means the sort already failed on its own error,
+        // which is the one to report; ours would only mask it.
+        let _ = self.sender.send(Err(anyhow!(
+            "The record generator was abandoned with {unflushed} generated record(s) still \
+             buffered; they were never handed to the sort"
+        )));
     }
 }
 
@@ -1925,5 +1955,101 @@ mod tests {
             "100 positions should span at least 2 chromosomes, got {}",
             unique_chroms.len()
         );
+    }
+
+    // ========================================================================
+    // RecordSink tests
+    // ========================================================================
+
+    /// Build a minimal named record for the sink tests.
+    fn sink_record(name: &str) -> RawRecord {
+        let mut builder = fgumi_raw_bam::SamBuilder::new();
+        builder
+            .read_name(name.as_bytes())
+            .flags(fgumi_raw_bam::flags::UNMAPPED)
+            .sequence(b"ACGT")
+            .qualities(&[30; 4]);
+        builder.build()
+    }
+
+    /// The names the sink actually delivered, in order, plus any error it sent.
+    fn drain(receiver: &Receiver<RecordBatch>) -> (Vec<String>, Vec<String>) {
+        let mut names = Vec::new();
+        let mut errors = Vec::new();
+        for batch in receiver {
+            match batch {
+                Ok(records) => names.extend(
+                    records
+                        .iter()
+                        .map(|r| String::from_utf8_lossy(fgumi_raw_bam::read_name(r)).into_owned()),
+                ),
+                Err(e) => errors.push(format!("{e:#}")),
+            }
+        }
+        (names, errors)
+    }
+
+    /// `finish` must deliver the last partial batch, by record identity.
+    #[test]
+    fn test_record_sink_finish_delivers_the_partial_batch() {
+        let (mut sink, receiver) = RecordSink::new();
+        assert!(sink.send(sink_record("readA")), "the receiver is still open");
+        assert!(sink.send(sink_record("readB")), "the receiver is still open");
+        assert!(sink.finish(), "finish must succeed while the receiver is open");
+
+        let (names, errors) = drain(&receiver);
+        assert_eq!(names, vec!["readA".to_string(), "readB".to_string()]);
+        assert!(errors.is_empty(), "a clean finish must not report an error: {errors:?}");
+    }
+
+    /// Dropping a sink with records still buffered must abort the sort.
+    ///
+    /// Dropping the sender is what signals end-of-stream, so a sink abandoned
+    /// with a partial batch — a `?` on the generator's path, or a panic —
+    /// used to look exactly like a clean end of input: the sort finished and
+    /// wrote a complete, short BAM. Reporting the loss as the stream's terminal
+    /// error is what makes the sort fail instead.
+    #[test]
+    fn test_record_sink_drop_reports_the_unflushed_batch() {
+        let (mut sink, receiver) = RecordSink::new();
+        assert!(sink.send(sink_record("readA")), "the receiver is still open");
+        drop(sink);
+
+        let (names, errors) = drain(&receiver);
+        assert!(
+            names.is_empty(),
+            "an abandoned partial batch must not be delivered as if it were complete: {names:?}"
+        );
+        assert_eq!(errors.len(), 1, "the stream must end in exactly one error: {errors:?}");
+        assert!(
+            errors[0].contains("1 generated record"),
+            "the error must name how many records were left unflushed, got: {}",
+            errors[0]
+        );
+    }
+
+    /// A finished sink has nothing left, so its drop must stay silent.
+    #[test]
+    fn test_record_sink_drop_after_finish_reports_nothing() {
+        let (mut sink, receiver) = RecordSink::new();
+        assert!(sink.send(sink_record("readA")), "the receiver is still open");
+        assert!(sink.finish(), "finish must succeed while the receiver is open");
+
+        let (names, errors) = drain(&receiver);
+        assert_eq!(names, vec!["readA".to_string()]);
+        assert!(errors.is_empty(), "a finished sink must not also report a loss: {errors:?}");
+    }
+
+    /// `fail` abandons its buffer deliberately, and must report only its own error.
+    #[test]
+    fn test_record_sink_fail_reports_only_the_generator_error() {
+        let (mut sink, receiver) = RecordSink::new();
+        assert!(sink.send(sink_record("readA")), "the receiver is still open");
+        sink.fail(anyhow!("generator exploded"));
+
+        let (names, errors) = drain(&receiver);
+        assert!(names.is_empty(), "an aborted stream delivers no records: {names:?}");
+        assert_eq!(errors.len(), 1, "the abort must not be followed by a drop error: {errors:?}");
+        assert!(errors[0].contains("generator exploded"), "got: {}", errors[0]);
     }
 }
