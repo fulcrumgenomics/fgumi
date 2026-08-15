@@ -4,7 +4,7 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use fgumi_lib::commands::command::Command;
@@ -68,10 +68,24 @@ fn create_bgzf_fastq(dir: &TempDir, name: &str, records: &[(&str, &str, &str)]) 
 }
 
 /// Read BAM records from a file.
-fn read_bam_records(path: &PathBuf) -> Vec<RecordBuf> {
+fn read_bam_records(path: &Path) -> Vec<RecordBuf> {
     let mut reader = File::open(path).map(bam::io::Reader::new).unwrap();
     let header = reader.read_header().unwrap();
     reader.record_bufs(&header).map(|r| r.expect("Failed to read BAM record")).collect()
+}
+
+/// The number of records in `path` if it can be read as a BAM, or `None` if the
+/// file is absent or does not parse as one. Used to inspect the partial output a
+/// rejected run may leave behind without panicking on a truncated file.
+fn try_bam_record_count(path: &Path) -> Option<usize> {
+    let mut reader = File::open(path).map(bam::io::Reader::new).ok()?;
+    let header = reader.read_header().ok()?;
+    let mut count = 0;
+    for record in reader.record_bufs(&header) {
+        record.ok()?;
+        count += 1;
+    }
+    Some(count)
 }
 
 /// Standard test records for paired-end FASTQs.
@@ -1306,4 +1320,401 @@ fn test_extract_compression_level_out_of_range_rejected() {
         "Expected clap range-validation error mentioning `0..=12` or `invalid value`, \
          got stderr: {stderr}"
     );
+}
+
+// ============================================================================
+// Mismatched-Length FASTQ Pair (issue #773)
+// ============================================================================
+
+/// Build `count` synthetic paired-end FASTQ records named `read00000..`.
+///
+/// Sequences are constant; only the name distinguishes records, which is what
+/// the identity assertions below key on.
+fn numbered_records(count: usize) -> Vec<(String, String, String)> {
+    (0..count)
+        .map(|i| {
+            (format!("read{i:06}"), "ACGTACGTACGTACGT".to_string(), "IIIIIIIIIIIIIIII".to_string())
+        })
+        .collect()
+}
+
+/// Borrow a `Vec<(String, String, String)>` as the `&str` triples the FASTQ
+/// writers take.
+fn as_str_records(records: &[(String, String, String)]) -> Vec<(&str, &str, &str)> {
+    records.iter().map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str())).collect()
+}
+
+/// The FASTQ compression formats `extract` dispatches on. Each selects a
+/// different pipeline: BGZF uses `BlockParseFast`/`BlockMerge`, gzip and plain
+/// use `FindBoundaries`/`Decode`.
+#[derive(Clone, Copy, Debug)]
+enum FastqFlavor {
+    Plain,
+    Gzip,
+    Bgzf,
+}
+
+impl FastqFlavor {
+    fn write(self, dir: &TempDir, name: &str, records: &[(&str, &str, &str)]) -> PathBuf {
+        match self {
+            Self::Plain => create_plain_fastq(dir, name, records),
+            Self::Gzip => create_gzip_fastq(dir, name, records),
+            Self::Bgzf => create_bgzf_fastq(dir, name, records),
+        }
+    }
+
+    /// Write raw FASTQ `bytes` through this flavor's compressor. Unlike
+    /// [`Self::write`], the caller controls the exact bytes, so a file that does
+    /// not end in a newline can be produced.
+    fn write_bytes(self, dir: &TempDir, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.path().join(name);
+        let file = File::create(&path).unwrap();
+        match self {
+            Self::Plain => {
+                let mut file = file;
+                file.write_all(bytes).unwrap();
+            }
+            Self::Gzip => {
+                let mut encoder = GzEncoder::new(file, Compression::default());
+                encoder.write_all(bytes).unwrap();
+                encoder.finish().unwrap();
+            }
+            Self::Bgzf => {
+                let mut writer = BgzfWriter::new(file);
+                writer.write_all(bytes).unwrap();
+                writer.finish().unwrap();
+            }
+        }
+        path
+    }
+}
+
+/// Serialize `records` as FASTQ text, optionally omitting the newline after the
+/// final record. A file that does not end in a newline leaves its last record in
+/// `suffix_bytes` on the BGZF path, which is the shape the no-trailing-newline
+/// regression test exercises.
+fn fastq_bytes(records: &[(&str, &str, &str)], trailing_newline: bool) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for (name, seq, qual) in records {
+        bytes.extend_from_slice(format!("@{name}\n{seq}\n+\n{qual}\n").as_bytes());
+    }
+    if !trailing_newline && bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    bytes
+}
+
+/// Run `fgumi extract` over a paired FASTQ input, returning the command result.
+fn run_extract_pair(r1: &Path, r2: &Path, output: &Path, threads: usize) -> anyhow::Result<()> {
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--read-structures",
+        "+T",
+        "+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--threads",
+        &threads.to_string(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("fgumi extract")
+}
+
+/// Run `fgumi extract` over a paired FASTQ input on the single-threaded fast
+/// path (no `--threads`), returning the command result. This path runs
+/// `process_singlethreaded` rather than the 7-step pipeline.
+fn run_extract_pair_single_threaded(r1: &Path, r2: &Path, output: &Path) -> anyhow::Result<()> {
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--read-structures",
+        "+T",
+        "+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("fgumi extract")
+}
+
+/// Every read name in `path`, in file order (one entry per BAM record, so a
+/// properly paired template contributes its name twice).
+fn bam_read_names(path: &Path) -> Vec<String> {
+    read_bam_records(path)
+        .iter()
+        .map(|record| {
+            let name: &[u8] = record.name().expect("BAM record must have a name").as_ref();
+            String::from_utf8(name.to_vec()).expect("read name must be UTF-8")
+        })
+        .collect()
+}
+
+/// Describe, by record identity, how a BAM written from a mismatched FASTQ pair
+/// differs from the long input stream.
+///
+/// Used only to build the failure message when `extract` wrongly accepts such a
+/// pair, so the failure names the records that were lost rather than reporting a
+/// bare count mismatch.
+fn describe_mismatched_output(output: &Path, long_stream: &[(String, String, String)]) -> String {
+    let emitted = bam_read_names(output);
+    let present: std::collections::HashSet<&str> = emitted.iter().map(String::as_str).collect();
+    let missing: Vec<&str> = long_stream
+        .iter()
+        .map(|(name, _, _)| name.as_str())
+        .filter(|name| !present.contains(name))
+        .collect();
+    format!(
+        "{} of {} input records reached the output, {} were dropped (first missing: {:?}), \
+         and {} records were emitted unpaired",
+        present.len(),
+        long_stream.len(),
+        missing.len(),
+        missing.first(),
+        unpaired_record_count(output),
+    )
+}
+
+/// Number of BAM records in `path` that are not flagged as paired (`0x1`).
+fn unpaired_record_count(path: &Path) -> usize {
+    read_bam_records(path).iter().filter(|record| !record.flags().is_segmented()).count()
+}
+
+/// A matched pair must survive extract with every template intact — asserted by
+/// exact read-name identity, not by a count.
+///
+/// This is the control for [`test_extract_rejects_mismatched_fastq_pair`]: the
+/// rejection added for issue #773 must not reject a well-formed input, and the
+/// record set it emits must be exactly the input record set. `RECORD_COUNT`
+/// straddles the per-batch record limit (200 at 1 thread, 800 at 4+) so the
+/// final batch is partial — the shape in which the old truncation silently
+/// dropped records.
+#[rstest]
+#[case::plain_t1(FastqFlavor::Plain, 1)]
+#[case::plain_t4(FastqFlavor::Plain, 4)]
+#[case::gzip_t1(FastqFlavor::Gzip, 1)]
+#[case::gzip_t4(FastqFlavor::Gzip, 4)]
+#[case::bgzf_t1(FastqFlavor::Bgzf, 1)]
+#[case::bgzf_t4(FastqFlavor::Bgzf, 4)]
+fn test_extract_matched_pair_emits_every_template(
+    #[case] flavor: FastqFlavor,
+    #[case] threads: usize,
+) {
+    const RECORD_COUNT: usize = 950;
+
+    let tmp = TempDir::new().unwrap();
+    let records = numbered_records(RECORD_COUNT);
+    let as_str = as_str_records(&records);
+    let r1 = flavor.write(&tmp, "r1.fq", &as_str);
+    let r2 = flavor.write(&tmp, "r2.fq", &as_str);
+    let output = tmp.path().join("matched.bam");
+
+    run_extract_pair(&r1, &r2, &output, threads).unwrap_or_else(|e| {
+        panic!("matched pair must extract cleanly ({flavor:?}, t{threads}): {e}")
+    });
+
+    // Identity: exactly two records per input template, one per mate, and the
+    // emitted name multiset equals the input name multiset.
+    let mut emitted = bam_read_names(&output);
+    emitted.sort();
+    let mut expected: Vec<String> =
+        records.iter().flat_map(|(name, _, _)| [name.clone(), name.clone()]).collect();
+    expected.sort();
+    assert_eq!(
+        emitted, expected,
+        "emitted read names must equal the input read names ({flavor:?}, t{threads})"
+    );
+    assert_eq!(
+        unpaired_record_count(&output),
+        0,
+        "every emitted record must be flagged paired ({flavor:?}, t{threads})"
+    );
+}
+
+/// A well-formed matched pair whose FASTQ files do not end in a trailing newline
+/// must still extract cleanly (#773).
+///
+/// `detect_suffix_start` treats the final record of a file without a trailing
+/// newline as an incomplete fragment and parks it in `suffix_bytes`. On the BGZF
+/// path the last block has no successor to stitch that fragment with, so before
+/// the EOF flush a valid matched pair simply hung — completion required the
+/// suffix buffers to be empty, and they never were. `RECORD_COUNT` spans several
+/// BGZF blocks so both cross-block stitching and the terminal flush are covered.
+/// gzip and plain (which never park a suffix) are included so the guarantee reads
+/// as uniform across flavors.
+#[rstest]
+#[case::plain_t1(FastqFlavor::Plain, 1)]
+#[case::plain_t4(FastqFlavor::Plain, 4)]
+#[case::gzip_t1(FastqFlavor::Gzip, 1)]
+#[case::gzip_t4(FastqFlavor::Gzip, 4)]
+#[case::bgzf_t1(FastqFlavor::Bgzf, 1)]
+#[case::bgzf_t4(FastqFlavor::Bgzf, 4)]
+fn test_extract_matched_pair_without_trailing_newline(
+    #[case] flavor: FastqFlavor,
+    #[case] threads: usize,
+) {
+    const RECORD_COUNT: usize = 3_000;
+
+    let tmp = TempDir::new().unwrap();
+    let records = numbered_records(RECORD_COUNT);
+    let bytes = fastq_bytes(&as_str_records(&records), false);
+    let r1 = flavor.write_bytes(&tmp, "r1.fq", &bytes);
+    let r2 = flavor.write_bytes(&tmp, "r2.fq", &bytes);
+    let output = tmp.path().join("matched.bam");
+
+    run_extract_pair(&r1, &r2, &output, threads).unwrap_or_else(|e| {
+        panic!("matched pair without a trailing newline must extract cleanly ({flavor:?}, t{threads}): {e}")
+    });
+
+    // Identity: the final record (the one parked in `suffix_bytes`) must be
+    // present, so the emitted name multiset equals the input name multiset.
+    let mut emitted = bam_read_names(&output);
+    emitted.sort();
+    let mut expected: Vec<String> =
+        records.iter().flat_map(|(name, _, _)| [name.clone(), name.clone()]).collect();
+    expected.sort();
+    assert_eq!(
+        emitted, expected,
+        "emitted read names must equal the input read names ({flavor:?}, t{threads})"
+    );
+    assert_eq!(
+        unpaired_record_count(&output),
+        0,
+        "every emitted record must be flagged paired ({flavor:?}, t{threads})"
+    );
+}
+
+/// A FASTQ pair whose two streams hold different numbers of records must be
+/// rejected, not silently truncated or silently emitted as fragments (#773).
+///
+/// The two shapes reach the rejection through different code, so both are run.
+/// In `within_batch` the streams first disagree inside a batch index they both
+/// reached, which the old `align_stream_records` truncated to the shorter stream,
+/// dropping the surplus outright. In `whole_batches` the short stream ends on an
+/// exact batch boundary, so the first divergent batch index carries *only* the
+/// long stream — which the old code emitted as single-end fragments (gzip and
+/// plain) or parked in the block merger forever (BGZF).
+///
+/// The short length is a multiple of the pipeline's per-batch record count at
+/// every thread count under test (200 at 1 thread, 800 at 4+), which is what puts
+/// `whole_batches` on the missing-stream path instead of the truncation path.
+///
+/// Assertions are by record identity: when the run wrongly succeeds, the panic
+/// names the specific records lost and the specific records emitted unpaired.
+#[rstest]
+#[case::plain_t1(FastqFlavor::Plain, 1)]
+#[case::plain_t4(FastqFlavor::Plain, 4)]
+#[case::gzip_t1(FastqFlavor::Gzip, 1)]
+#[case::gzip_t4(FastqFlavor::Gzip, 4)]
+#[case::bgzf_t1(FastqFlavor::Bgzf, 1)]
+#[case::bgzf_t4(FastqFlavor::Bgzf, 4)]
+fn test_extract_rejects_mismatched_fastq_pair(#[case] flavor: FastqFlavor, #[case] threads: usize) {
+    /// `(shape, short_count, long_count)`. 800 is a whole number of batches at
+    /// both 200 and 800 records per batch; 850 leaves a partial one.
+    const SHAPES: [(&str, usize, usize); 2] =
+        [("within_batch", 850, 950), ("whole_batches", 800, 2_600)];
+
+    for (shape, short_count, long_count) in SHAPES {
+        // Run both orientations: the surplus in R1 and the surplus in R2.
+        for surplus_in_r1 in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let long = numbered_records(long_count);
+            let short = numbered_records(short_count);
+            let (r1_recs, r2_recs) = if surplus_in_r1 { (&long, &short) } else { (&short, &long) };
+            let r1 = flavor.write(&tmp, "r1.fq", &as_str_records(r1_recs));
+            let r2 = flavor.write(&tmp, "r2.fq", &as_str_records(r2_recs));
+            let output = tmp.path().join("mismatched.bam");
+            let label = format!("{flavor:?}, t{threads}, {shape}, surplus_in_r1={surplus_in_r1}");
+
+            let Err(error) = run_extract_pair(&r1, &r2, &output, threads) else {
+                panic!(
+                    "extract accepted a mismatched FASTQ pair ({label}): {}",
+                    describe_mismatched_output(&output, &long)
+                );
+            };
+
+            // The message must identify which input ran out, so the operator
+            // knows which file to re-fetch — not merely that something is wrong.
+            let message = format!("{error:#}");
+            let expected_direction =
+                if surplus_in_r1 { "R2 ended before R1" } else { "R1 ended before R2" };
+            assert!(
+                message.contains("out of sync"),
+                "rejection must say the sources are out of sync ({label}): {message}"
+            );
+            assert!(
+                message.contains(expected_direction),
+                "rejection must name the stream that ended first ({label}): {message}"
+            );
+
+            // `extract` streams its output, so by the time it rejects the pair a
+            // BAM header and some record blocks may already be on disk — a
+            // rejected run does NOT guarantee the output is absent. What it must
+            // guarantee is that the leftover is never a *complete-looking* BAM: if
+            // it parses at all, it holds fewer records than the long stream alone
+            // would, so a downstream tool cannot mistake it for a full extraction
+            // (the truncated-but-valid-output failure class of #773).
+            if let Some(emitted) = try_bam_record_count(&output) {
+                assert!(
+                    emitted < 2 * long_count,
+                    "a rejected run must not leave a complete-looking BAM ({label}): \
+                     found {emitted} record(s), long stream has {long_count}"
+                );
+            }
+        }
+    }
+}
+
+/// The single-threaded fast path (no `--threads`) must reject a mismatched pair
+/// with a message that names which stream ended first, matching the threaded
+/// pipeline and the help text's promise (#773). `--threads N` (even `N == 1`)
+/// runs the pipeline, so `process_singlethreaded` is reachable only with no
+/// `--threads` flag at all — the other rejection test never exercises it.
+#[rstest]
+#[case::plain(FastqFlavor::Plain)]
+#[case::gzip(FastqFlavor::Gzip)]
+#[case::bgzf(FastqFlavor::Bgzf)]
+fn test_extract_single_threaded_rejects_mismatched_fastq_pair(#[case] flavor: FastqFlavor) {
+    for surplus_in_r1 in [true, false] {
+        let tmp = TempDir::new().unwrap();
+        let long = numbered_records(950);
+        let short = numbered_records(850);
+        let (r1_recs, r2_recs) = if surplus_in_r1 { (&long, &short) } else { (&short, &long) };
+        let r1 = flavor.write(&tmp, "r1.fq", &as_str_records(r1_recs));
+        let r2 = flavor.write(&tmp, "r2.fq", &as_str_records(r2_recs));
+        let output = tmp.path().join("mismatched.bam");
+        let label = format!("{flavor:?}, single-threaded, surplus_in_r1={surplus_in_r1}");
+
+        let Err(error) = run_extract_pair_single_threaded(&r1, &r2, &output) else {
+            panic!("single-threaded extract accepted a mismatched FASTQ pair ({label})");
+        };
+
+        let message = format!("{error:#}");
+        let expected_direction =
+            if surplus_in_r1 { "R2 ended before R1" } else { "R1 ended before R2" };
+        assert!(
+            message.contains("out of sync"),
+            "rejection must say the sources are out of sync ({label}): {message}"
+        );
+        assert!(
+            message.contains(expected_direction),
+            "rejection must name the stream that ended first ({label}): {message}"
+        );
+    }
 }

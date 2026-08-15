@@ -138,6 +138,18 @@ All notable changes to this project will be documented in this file.
   `simplex` went from 6 of 6 raw reads rejected and no consensus emitted, to 6 of 6 used and
   both strands emitted.
 
+- **Breaking:** `extract --threads N` now fails when the input FASTQs hold different numbers of
+  records, matching the no-`--threads` path, which has always failed with "FASTQ sources out of
+  sync". The threaded pipeline instead exited 0 on such a pair. On gzip and plain inputs the
+  surplus records that shared a batch index with the shorter stream were silently discarded, and
+  the rest were written as single-end fragments; measured on a synthetic pair of 100,150 and
+  100,050 records, 100 records vanished with no warning and no non-zero exit. On BGZF inputs the
+  surplus records were parked in the block merger and never released, so the run spun forever
+  without producing output. A mismatched pair is what a truncated download or an interrupted
+  upstream tool produces, so it is now rejected with a message naming which input ended first
+  and how many records were left unmated. Matched inputs are unaffected and byte-identical
+  ([#773](https://github.com/fulcrumgenomics/fgumi/issues/773)).
+
 - `dedup --metrics` now reports the templates dropped by its template filter, broken out by
   reason. `dedup` is a read filter as well as a duplicate marker, but the drop counts were
   collected, merged across workers, and then discarded at the serialization boundary: a run

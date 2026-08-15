@@ -28,7 +28,9 @@ use crate::fastq_parse::strip_read_suffix;
 use crate::grouper::FastqTemplate;
 use crate::logging::OperationTimer;
 use crate::sam::SamTag;
-use crate::unified_pipeline::{FastqPipelineConfig, MemoryEstimate, run_fastq_pipeline};
+use crate::unified_pipeline::{
+    FastqPipelineConfig, MemoryEstimate, fastq_out_of_sync_error, run_fastq_pipeline,
+};
 use crate::validation::validate_input_exists;
 use anyhow::{Context, Result, bail, ensure};
 use bstr::{BString, ByteSlice};
@@ -456,6 +458,13 @@ skipped over.
 
 Only template bases will be retained as read bases (stored in the `SEQ` field) as specified by
 the read structure.
+
+## Input Requirements
+
+All input FASTQs must contain the same number of records, in the same order. A pair whose
+streams disagree on record count is rejected with a non-zero exit status naming which input
+ended first — surplus records are neither discarded nor emitted as unpaired reads, since a
+short input almost always means a truncated transfer or an interrupted upstream tool.
 
 ## Read Structures
 
@@ -1189,24 +1198,33 @@ impl Extract {
         let mut read_pair_count: u64 = 0;
         let mut builder = UnmappedSamBuilder::new();
 
+        // One record per stream at this position; `1` = a record was read, `0` =
+        // the stream ended. Naming the streams (rather than a vague "some ended
+        // before others") matches the threaded pipeline and the help text's
+        // promise to name which input ended first. Hoisted out of the loop and
+        // reset each iteration to avoid a per-template allocation on this fast path.
+        let mut counts = vec![0usize; fq_iterators.len()];
         loop {
+            counts.fill(0);
             let mut next_read_sets = Vec::with_capacity(fq_iterators.len());
-            let mut saw_eof = false;
-            for iter in fq_iterators.iter_mut() {
+            for (idx, iter) in fq_iterators.iter_mut().enumerate() {
                 match iter.next() {
-                    Some(Ok(rec)) if !saw_eof => next_read_sets.push(rec),
-                    Some(Ok(_)) => bail!("FASTQ sources out of sync: some ended before others"),
+                    Some(Ok(rec)) => {
+                        counts[idx] = 1;
+                        next_read_sets.push(rec);
+                    }
                     Some(Err(e)) => return Err(e),
-                    None => saw_eof = true,
+                    None => {} // stream ended; leave its count at 0
                 }
             }
 
-            if saw_eof {
-                ensure!(
-                    next_read_sets.is_empty(),
-                    "FASTQ sources out of sync: some ended before others"
-                );
+            // Every stream ended together: clean EOF.
+            if counts.iter().all(|count| *count == 0) {
                 break;
+            }
+            // Some streams still had a record while others ended: out of sync.
+            if counts.iter().any(|count| *count != counts[0]) {
+                return Err(fastq_out_of_sync_error(&counts).into());
             }
 
             //  Validate read names match across all FASTQs
@@ -1288,14 +1306,10 @@ impl Extract {
             output,
             // process_fn: FastqTemplate → ExtractedBatch
             move |template: FastqTemplate| -> std::io::Result<ExtractedBatch> {
-                // Debug: Log template record count
-                if template.records.len() != read_structures.len() {
-                    log::warn!(
-                        "Template has {} records but expected {} (read_structures.len())",
-                        template.records.len(),
-                        read_structures.len()
-                    );
-                }
+                // A template must carry one record per read structure; a short
+                // template would silently drop that read's segments below (see
+                // `validate_template_record_count`, issue #773).
+                validate_template_record_count(&template, read_structures.len())?;
 
                 // Validate read names match (synchronized mode defers this from Group step)
                 if template.records.len() >= 2 {
@@ -1700,6 +1714,33 @@ impl Command for Extract {
 /// upper-case `N`); the read-name extraction path uses fgbio's strict alphabet.
 fn is_valid_umi_char(b: u8) -> bool {
     matches!(b, b'A' | b'C' | b'G' | b'T' | b'N' | b'-')
+}
+
+/// Reject an assembled template that does not carry exactly one record per read
+/// structure.
+///
+/// `--inputs` and `--read-structures` are validated to be the same length, and
+/// the pipeline now rejects inputs of unequal record count, so a short template
+/// cannot normally be assembled. This enforces the invariant rather than logging
+/// it: the segment `zip` downstream stops at the shorter side, so a short
+/// template would silently drop that read's segments (issue #773).
+fn validate_template_record_count(
+    template: &FastqTemplate,
+    read_structure_count: usize,
+) -> std::io::Result<()> {
+    if template.records.len() != read_structure_count {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "FASTQ sources out of sync: template '{}' has {} record(s) but {} \
+                 read structure(s) were given",
+                String::from_utf8_lossy(&template.name),
+                template.records.len(),
+                read_structure_count,
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4558,5 +4599,56 @@ mod tests {
         assert_eq!(rg.as_deref(), Some("RG1"), "RG tag should match read_group_id");
 
         Ok(())
+    }
+
+    /// Build a `FastqTemplate` carrying `record_count` records under a shared name.
+    fn template_with_record_count(name: &str, record_count: usize) -> FastqTemplate {
+        let records = (0..record_count)
+            .map(|_| {
+                crate::fastq_parse::FastqRecord::from_slice(
+                    format!("@{name}\nACGT\n+\nIIII\n").as_bytes(),
+                )
+                .expect("failed to parse synthetic FASTQ record")
+            })
+            .collect();
+        FastqTemplate { records, name: name.as_bytes().to_vec() }
+    }
+
+    /// A template with one record per read structure passes validation.
+    #[rstest]
+    #[case::single_end(1)]
+    #[case::paired_end(2)]
+    #[case::triple(3)]
+    fn test_validate_template_record_count_matched_is_accepted(#[case] count: usize) {
+        let template = template_with_record_count("read0", count);
+        validate_template_record_count(&template, count)
+            .expect("a template matching the read-structure count must be accepted");
+    }
+
+    /// A template whose record count differs from the read-structure count is
+    /// rejected, naming the template and both counts (issue #773).
+    #[rstest]
+    #[case::short(1, 2)]
+    #[case::surplus(3, 2)]
+    #[case::empty(0, 2)]
+    fn test_validate_template_record_count_mismatch_is_rejected(
+        #[case] record_count: usize,
+        #[case] read_structure_count: usize,
+    ) {
+        let template = template_with_record_count("read0", record_count);
+        let error = validate_template_record_count(&template, read_structure_count)
+            .expect_err("a template that disagrees with the read-structure count must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(message.contains("out of sync"), "unexpected message: {message}");
+        assert!(message.contains("read0"), "message must name the template: {message}");
+        assert!(
+            message.contains(&format!("{record_count} record(s)")),
+            "message must report the record count: {message}"
+        );
+        assert!(
+            message.contains(&format!("{read_structure_count} read structure(s)")),
+            "message must report the read-structure count: {message}"
+        );
     }
 }
