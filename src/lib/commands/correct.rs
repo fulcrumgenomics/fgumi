@@ -335,6 +335,63 @@ pub struct CorrectUmis {
     pub queue_memory: QueueMemoryOptions,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CorrectOptions — the stage's tuning knobs, projected out of the CLI struct
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// CorrectUmis-stage tuning, independent of how the values were supplied.
+///
+/// See [`crate::commands::zipper::ZipperOptions`] for why this is a plain
+/// struct rather than a flattened `clap::Args`. Note that the rejects path is
+/// held **flat** here even though [`CorrectUmis`] nests it behind a
+/// `#[command(flatten)]` sub-struct: the chain builder wants one bag per stage,
+/// not a re-run of the CLI's grouping.
+#[derive(Debug, Clone)]
+pub struct CorrectOptions {
+    /// Optional metrics output.
+    pub metrics: Option<PathBuf>,
+    /// Which SAM tag is corrected: `RX`/`OX` for UMIs, `BC`/`ob` for barcodes.
+    pub target: Target,
+    /// Maximum mismatches when matching a UMI.
+    pub max_mismatches: usize,
+    /// Minimum distance to the runner-up UMI.
+    pub min_distance_diff: usize,
+    /// Expected UMI sequences.
+    pub umis: Vec<String>,
+    /// Files holding expected UMI sequences.
+    pub umi_files: Vec<PathBuf>,
+    /// Skip storing the original UMI.
+    pub dont_store_original_umis: bool,
+    /// UMI match cache size.
+    pub cache_size: usize,
+    /// Minimum corrected fraction before failing.
+    pub min_corrected: Option<f64>,
+    /// Also match the reverse complement.
+    pub revcomp: bool,
+    /// Optional rejects output path.
+    pub rejects_path: Option<PathBuf>,
+}
+
+impl CorrectUmis {
+    /// Project the parsed CLI flags into [`CorrectOptions`].
+    #[must_use]
+    pub fn to_correct_options(&self) -> CorrectOptions {
+        CorrectOptions {
+            metrics: self.metrics.clone(),
+            target: self.target,
+            max_mismatches: self.max_mismatches,
+            min_distance_diff: self.min_distance_diff,
+            umis: self.umis.clone(),
+            umi_files: self.umi_files.clone(),
+            dont_store_original_umis: self.dont_store_original_umis,
+            cache_size: self.cache_size,
+            min_corrected: self.min_corrected,
+            revcomp: self.revcomp,
+            rejects_path: self.rejects_opts.rejects.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum RejectionReason {
     WrongLength,
@@ -1701,6 +1758,99 @@ pub fn find_umi_pairs_within_distance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every tuning flag must survive the projection into [`CorrectOptions`].
+    ///
+    /// Every value here is deliberately **non-default**, and every field of
+    /// `CorrectOptions` is asserted. Both halves matter: an assertion that
+    /// compares a default against a default passes even when the projection
+    /// ignores the parsed field entirely, and a field left unasserted can be
+    /// dropped from the projection without any test noticing.
+    ///
+    /// `rejects_path` is the one field that changes shape: it is read out of the
+    /// flattened `RejectsOptions`.
+    #[test]
+    fn to_correct_options_carries_every_tuning_flag() {
+        let cmd = CorrectUmis::try_parse_from([
+            "correct",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "-u",
+            "ACGT",
+            "-u",
+            "TTTT",
+            "-U",
+            "umis.txt",
+            "--target",
+            "barcode",
+            "--max-mismatches",
+            "5",
+            "--min-distance",
+            "3",
+            "--cache-size",
+            "4096",
+            "--min-corrected",
+            "0.75",
+            "--revcomp=true",
+            "--dont-store-original=true",
+            "--rejects",
+            "rej.bam",
+            "--metrics",
+            "m.txt",
+        ])
+        .expect("parses");
+
+        let opts = cmd.to_correct_options();
+
+        assert_eq!(opts.metrics, Some(std::path::PathBuf::from("m.txt")));
+        assert_eq!(opts.target, Target::Barcode, "--target must reach the projection");
+        assert_eq!(opts.max_mismatches, 5);
+        assert_eq!(opts.min_distance_diff, 3);
+        assert_eq!(opts.umis, vec!["ACGT".to_string(), "TTTT".to_string()]);
+        assert_eq!(opts.umi_files, vec![std::path::PathBuf::from("umis.txt")]);
+        assert!(opts.dont_store_original_umis);
+        assert_eq!(opts.cache_size, 4096);
+        assert_eq!(opts.min_corrected, Some(0.75));
+        assert!(opts.revcomp);
+        assert_eq!(
+            opts.rejects_path,
+            Some(std::path::PathBuf::from("rej.bam")),
+            "rejects_path must be read from the flattened RejectsOptions",
+        );
+    }
+
+    /// The projection must carry defaults faithfully too — a field hard-coded to
+    /// the value the non-default test happens to pass would slip through it.
+    #[test]
+    fn to_correct_options_carries_defaults() {
+        let cmd = CorrectUmis::try_parse_from([
+            "correct",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "-u",
+            "ACGT",
+            "--min-distance",
+            "1",
+        ])
+        .expect("parses");
+
+        let opts = cmd.to_correct_options();
+
+        assert_eq!(opts.metrics, None);
+        assert_eq!(opts.target, Target::Umi);
+        assert_eq!(opts.max_mismatches, 2);
+        assert!(opts.umi_files.is_empty());
+        assert!(!opts.dont_store_original_umis);
+        assert_eq!(opts.cache_size, 100_000);
+        assert_eq!(opts.min_corrected, None);
+        assert!(!opts.revcomp);
+        assert_eq!(opts.rejects_path, None);
+    }
+
     use noodles::sam;
     use noodles::sam::alignment::io::Write as SamWrite;
     use noodles::sam::alignment::record_buf::RecordBuf;
