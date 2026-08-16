@@ -72,11 +72,31 @@ pub type RawBamReaderAuto = RawBamReader<BgzfReaderEnum>;
 
 /// Options controlling how [`create_bam_reader_for_pipeline_with_opts`] opens
 /// and wraps its input file.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct PipelineReaderOpts {
     /// If true, wrap inputs in a `PrefetchReader` background thread
     /// so that disk reads happen on a dedicated I/O thread.
     pub async_reader: bool,
+    /// Whether the BGZF decode path should verify each block's CRC32
+    /// checksum against its footer.
+    ///
+    /// This struct only opens the byte stream (or, for
+    /// [`create_bam_reader_with_opts`]/[`create_raw_bam_reader_with_opts`],
+    /// wraps it in noodles' own BGZF reader) — it does not itself decode
+    /// BGZF blocks, so this field is not consumed here. It exists as the one
+    /// place callers bundle "how to read this file" settings; commands using
+    /// the fgumi-bgzf-backed unified pipeline (`decompress_block_into_opts`)
+    /// read this field back out of [`BamIoOptions::pipeline_reader_opts`]
+    /// (`fgumi_lib`) and thread it into their `PipelineConfig`/
+    /// `FastqPipelineConfig`. Defaults to `true` (verify) — the safe,
+    /// pre-existing behavior.
+    pub verify_crc: bool,
+}
+
+impl Default for PipelineReaderOpts {
+    fn default() -> Self {
+        Self { async_reader: false, verify_crc: true }
+    }
 }
 
 /// Wrap `reader` in a BGZF decoder, multi-threaded when `threads > 1`.
@@ -916,7 +936,7 @@ mod tests {
         }
 
         // Read using async reader opts — exercises the PrefetchReader branch
-        let opts = PipelineReaderOpts { async_reader: true };
+        let opts = PipelineReaderOpts { async_reader: true, ..PipelineReaderOpts::default() };
         let (mut reader, read_header) =
             create_bam_reader_for_pipeline_with_opts(temp_file.path(), opts)?;
         assert_eq!(read_header.reference_sequences().len(), 1);

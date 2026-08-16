@@ -280,6 +280,8 @@ impl Command for Duplex {
     ///         input: PathBuf::from("grouped.bam"),
     ///         output: PathBuf::from("duplex.bam"),
     ///         async_reader: false,
+    ///         check_crc: false,
+    ///         no_check_crc: false,
     ///     },
     ///     rejects_opts: RejectsOptions::default(),
     ///     stats_opts: StatsOptions::default(),
@@ -358,6 +360,7 @@ impl Command for Duplex {
 
         // Process reads grouped by MI tag (streaming approach)
         info!("Processing reads...");
+        self.io.log_effective_check_crc_for_fast_path(self.threading.threads.is_some());
 
         // ============================================================
         // --threads N mode: Use 7-step unified pipeline
@@ -674,6 +677,7 @@ impl Duplex {
             &self.queue_memory,
             num_threads,
         )?;
+        pipeline_config.pipeline.verify_crc = self.io.effective_check_crc();
 
         // Per-thread metrics accumulator: bounded metric memory, no unbounded
         // queue. Rejects buffering semantics are preserved (see follow-up).
@@ -1005,7 +1009,13 @@ mod tests {
     /// Uses sensible test defaults: disabled per-base tags, disabled overlapping consensus.
     fn create_duplex_with_paths(input: PathBuf, output: PathBuf) -> Duplex {
         Duplex {
-            io: BamIoOptions { input, output, async_reader: false },
+            io: BamIoOptions {
+                input,
+                output,
+                async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
+            },
             rejects_opts: RejectsOptions::default(),
             stats_opts: StatsOptions::default(),
             read_group: ReadGroupOptions {

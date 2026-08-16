@@ -353,6 +353,7 @@ impl Command for Codec {
 
         // Process reads using streaming by MI groups
         info!("Processing reads and calling consensus (streaming)...");
+        self.io.log_effective_check_crc_for_fast_path(self.threading.threads.is_some());
 
         // ============================================================
         // --threads N mode: Use 7-step unified pipeline
@@ -647,6 +648,7 @@ impl Codec {
             &self.queue_memory,
             num_threads,
         )?;
+        pipeline_config.pipeline.verify_crc = self.io.effective_check_crc();
 
         // Per-thread metrics accumulator: bounded metric memory, no unbounded
         // queue. Rejects buffering semantics are preserved (see follow-up).
@@ -866,7 +868,13 @@ mod tests {
     /// Helper to create a Codec with specified input/output paths
     fn create_codec_with_paths(input: PathBuf, output: PathBuf) -> Codec {
         Codec {
-            io: BamIoOptions { input, output, async_reader: false },
+            io: BamIoOptions {
+                input,
+                output,
+                async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
+            },
             rejects_opts: RejectsOptions::default(),
             stats_opts: StatsOptions::default(),
             read_group: ReadGroupOptions::default(),

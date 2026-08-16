@@ -31,7 +31,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{create_bam_reader_for_pipeline, create_bam_writer};
+use fgumi_bam_io::{create_bam_reader_for_pipeline_with_opts, create_bam_writer};
 use fgumi_umi::IndexThreshold;
 // MemoryEstimate is gated because it's only used in memory-debug blocks below
 use crate::sam::SamTag;
@@ -845,10 +845,14 @@ impl Command for GroupReadsByUmi {
 
         // Log threading configuration
         info!("{}", self.threading.log_message());
+        self.io.log_effective_check_crc_for_fast_path(self.threading.threads.is_some());
 
         // Open input BAM using streaming-capable reader for pipeline use
         info!("Reading input BAM");
-        let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
+        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
+            &self.io.input,
+            self.io.pipeline_reader_opts(),
+        )?;
 
         // Sort order: see `classify_input_ordering` for why template-coordinate
         // is required, and why `--allow-unmapped` relaxes it to query grouping.
@@ -978,6 +982,7 @@ impl Command for GroupReadsByUmi {
             &self.queue_memory,
             num_threads,
         )?;
+        pipeline_config.pipeline.verify_crc = self.io.effective_check_crc();
 
         // Override stats: use shared stats if available (memory-debug feature)
         if let Some(stats) = shared_stats.as_ref() {
@@ -1963,6 +1968,8 @@ mod tests {
                 input: std::path::PathBuf::from("/dev/null"),
                 output: std::path::PathBuf::from("/dev/null"),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             family_size_histogram: None,
             grouping_metrics: None,
@@ -2405,6 +2412,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             grouping_metrics: Some(paths.grouping_metrics.clone()),
             allow_unmapped: force_parallel_path,
@@ -2463,6 +2472,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             min_map_q: Some(30),
             ..test_group_cmd(Strategy::Edit, 1)
@@ -2509,6 +2520,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             grouping_metrics: Some(paths.grouping_metrics.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
@@ -2550,6 +2563,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             min_map_q: Some(30),
             ..test_group_cmd(Strategy::Identity, 0)
@@ -2588,6 +2603,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Edit, 1)
         };
@@ -2636,6 +2653,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             family_size_histogram: Some(paths.histogram.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
@@ -2734,6 +2753,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             metrics: Some(paths.metrics_prefix.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
@@ -2988,6 +3009,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             family_size_histogram: Some(paths.histogram.clone()),
             grouping_metrics: Some(paths.grouping_metrics.clone()),
@@ -3071,6 +3094,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             metrics: Some(paths.metrics_prefix.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
@@ -3129,6 +3154,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             grouping_metrics: Some(paths.grouping_metrics.clone()),
             min_map_q: Some(30),
@@ -3171,6 +3198,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             grouping_metrics: Some(paths.grouping_metrics.clone()),
             min_umi_length: Some(6),
@@ -3217,6 +3246,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             min_umi_length: Some(5),
             ..test_group_cmd(Strategy::Edit, 0)
@@ -3329,6 +3360,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Paired, 1)
         };
@@ -3431,6 +3464,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
@@ -3494,6 +3529,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Paired, 1)
         };
@@ -3559,6 +3596,8 @@ mod tests {
             input: input.path().to_path_buf(),
             output: paths.output.clone(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
         cmd.no_umi = true;
 
@@ -3600,6 +3639,8 @@ mod tests {
             input: input.path().to_path_buf(),
             output: paths.output.clone(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
         cmd.no_umi = true; // Will be overridden to identity
 
@@ -3635,6 +3676,8 @@ mod tests {
             input: input.path().to_path_buf(),
             output: paths.output.clone(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
         cmd.no_umi = true;
 
@@ -3779,6 +3822,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Edit, 1)
         };
@@ -3844,6 +3889,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Paired, 1)
         };
@@ -3909,6 +3956,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Paired, 1)
         };
@@ -4046,6 +4095,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Edit, 1)
         };
@@ -4134,6 +4185,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Adjacency, 2)
         };
@@ -4201,6 +4254,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             threading: ThreadingOptions::new(4), // Use 4 threads
             ..test_group_cmd(Strategy::Adjacency, 2)
@@ -4250,6 +4305,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
@@ -4294,6 +4351,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             threading: ThreadingOptions::new(4), // Use 4 threads
             ..test_group_cmd(Strategy::Adjacency, 1)
@@ -4425,6 +4484,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Paired, 1)
         };
@@ -4487,6 +4548,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Paired, 1)
         };
@@ -4536,6 +4599,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Edit, 1)
         };
@@ -4573,6 +4638,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Edit, 1)
         };
@@ -4613,6 +4680,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -4653,6 +4722,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
@@ -4694,6 +4765,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
@@ -4727,6 +4800,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -4766,6 +4841,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             min_umi_length: Some(8), // Require at least 8 bases
             ..test_group_cmd(Strategy::Identity, 0)
@@ -4806,6 +4883,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -4846,6 +4925,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Edit, 2)
         };
@@ -4876,6 +4957,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Paired, 0)
         };
@@ -4910,6 +4993,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Adjacency, 0) // No edits allowed
         };
@@ -4949,6 +5034,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Edit, 3) // Allow up to 3 edits
         };
@@ -4983,6 +5070,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Paired, 0)
         };
@@ -5022,6 +5111,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             family_size_histogram: Some(paths.histogram.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
@@ -5052,6 +5143,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             grouping_metrics: Some(paths.grouping_metrics.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
@@ -5088,6 +5181,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             min_map_q: Some(20), // Filter reads with mapq < 20
             ..test_group_cmd(Strategy::Identity, 0)
@@ -5120,6 +5215,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -5156,6 +5253,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -5190,6 +5289,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -5237,6 +5338,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             min_map_q: Some(30), // Threshold is 30, "bad" pair has MAPQ=10
             ..test_group_cmd(Strategy::Identity, 0)
@@ -5422,6 +5525,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -5483,6 +5588,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             ..test_group_cmd(Strategy::Paired, 0)
         };
@@ -5545,6 +5652,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             threading,
             ..test_group_cmd(Strategy::Adjacency, 1)
@@ -5604,6 +5713,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             threading: ThreadingOptions::new(4),
             ..test_group_cmd(strategy, edits)
@@ -5652,6 +5763,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             threading: ThreadingOptions::new(4),
             min_map_q: Some(30),
@@ -5699,6 +5812,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             threading: ThreadingOptions::new(4),
             ..test_group_cmd(Strategy::Identity, 0)
@@ -6272,6 +6387,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             allow_unmapped,
             min_map_q: Some(0),
@@ -6446,6 +6563,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             allow_unmapped: true,
             ..test_group_cmd(Strategy::Identity, 0)
@@ -6483,6 +6602,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             allow_unmapped: true,
             ..test_group_cmd(Strategy::Adjacency, 1)
@@ -6522,6 +6643,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             allow_unmapped: false,
             ..test_group_cmd(Strategy::Identity, 0)
@@ -6558,6 +6681,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             allow_unmapped: true,
             ..test_group_cmd(Strategy::Identity, 0)
@@ -6597,6 +6722,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             allow_unmapped: true,
             threading,
@@ -6652,6 +6779,8 @@ mod tests {
                 input: input.path().to_path_buf(),
                 output: paths.output.clone(),
                 async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
             },
             allow_unmapped,
             ..test_group_cmd(Strategy::Identity, 0)

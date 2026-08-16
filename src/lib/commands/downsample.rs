@@ -147,6 +147,13 @@ impl Command for Downsample {
         if self.validate_mi_order {
             info!("MI order validation: enabled");
         }
+        // downsample reads through noodles-bgzf directly (`create_raw_bam_reader`),
+        // not the fgumi-bgzf CRC-skip-capable decoder the unified pipeline uses, and
+        // has no `--threads` pipeline mode to fall back to, so --check-crc/
+        // --no-check-crc have no effect on this command; it always verifies.
+        log::info!(
+            "CRC verify: on (downsample always verifies; --check-crc/--no-check-crc have no effect)"
+        );
 
         // Initialize RNG
         let mut rng = match self.seed {
@@ -451,6 +458,8 @@ mod tests {
             input: PathBuf::from("input.bam"),
             output: PathBuf::from("output.bam"),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         }
     }
 

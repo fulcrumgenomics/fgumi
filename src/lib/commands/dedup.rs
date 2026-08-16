@@ -1056,12 +1056,12 @@ impl Command for MarkDuplicates {
             self.index_threshold,
         );
         info!("{}", self.threading.log_message());
+        self.io.log_effective_check_crc();
 
         // Open input BAM
-        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-            &self.io.input,
-            self.io.pipeline_reader_opts(),
-        )?;
+        let reader_opts = self.io.pipeline_reader_opts();
+        let (reader, header) =
+            create_bam_reader_for_pipeline_with_opts(&self.io.input, reader_opts)?;
 
         if !is_template_coordinate_sorted(&header) {
             bail!(
@@ -1115,6 +1115,7 @@ impl Command for MarkDuplicates {
             &self.queue_memory,
             num_threads,
         )?;
+        pipeline_config.pipeline.verify_crc = reader_opts.verify_crc;
         info!("Scheduler: {:?}", self.scheduler_opts.strategy());
         info!("Using pipeline with {num_threads} threads");
 
