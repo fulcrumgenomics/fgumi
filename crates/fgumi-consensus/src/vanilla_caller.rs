@@ -551,6 +551,27 @@ impl VanillaUmiConsensusCaller {
         }
     }
 
+    /// Records `records` as rejected for [`RejectionReason::ZeroLengthAfterTrimming`].
+    ///
+    /// [`Self::create_source_read`] returns `None` for reads with absent qualities or that trim to
+    /// zero length; [`Self::process_subgroup`] counts and writes those. A composing caller (the
+    /// duplex path) that calls `create_source_read` directly hands the dropped records here so they
+    /// receive the same accounting: counted on the reason breakdown and, when tracking is enabled,
+    /// drained through [`Self::take_rejected_reads`] alongside this caller's other rejections.
+    pub(crate) fn record_zero_length_after_trimming<'a, I>(&mut self, records: I)
+    where
+        I: IntoIterator<Item = &'a RawRecord>,
+    {
+        let records: Vec<&RawRecord> = records.into_iter().collect();
+        if records.is_empty() {
+            return;
+        }
+        self.stats.record_rejection(RejectionReason::ZeroLengthAfterTrimming, records.len());
+        if self.track_rejects {
+            self.rejected_reads.extend(records.into_iter().map(|record| record.to_vec()));
+        }
+    }
+
     /// Takes the accumulated statistics, leaving this caller's counters at zero.
     ///
     /// A composing caller drives this one per molecule and folds the resulting delta into its
@@ -1373,17 +1394,9 @@ impl VanillaUmiConsensusCaller {
             }
         }
 
-        if !zero_length_indices.is_empty() {
-            self.stats.record_rejection(
-                RejectionReason::ZeroLengthAfterTrimming,
-                zero_length_indices.len(),
-            );
-            if self.track_rejects {
-                for &idx in &zero_length_indices {
-                    self.rejected_reads.push(group_reads[idx].to_vec());
-                }
-            }
-        }
+        self.record_zero_length_after_trimming(
+            zero_length_indices.iter().map(|&idx| &group_reads[idx]),
+        );
 
         if source_reads.len() < self.options.min_reads {
             if !source_reads.is_empty() {

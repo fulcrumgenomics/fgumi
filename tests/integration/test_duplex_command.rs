@@ -509,6 +509,331 @@ fn test_duplex_rejects_bam_reconciles_with_stats(#[case] threads: Option<&str>) 
     );
 }
 
+/// #792: reads that trim to zero length must reach both the rejects BAM and `--stats`.
+///
+/// The duplex path built its source reads with a bare `filter_map`, silently discarding every
+/// read `create_source_read` rejected (a read that quality-trims to zero) — so it reached neither
+/// output. fgbio rejects such a read as `ZeroPostAfterTrimming` on the duplex caller's own writer
+/// and counter (`UmiConsensusCaller.toSourceRead`), one layer, both outputs; the vanilla path
+/// already matches that, and the duplex path now must too.
+///
+/// The `trimmed` template's two reads are entirely below `--min-input-base-quality`, so with
+/// `--trim` they trim to zero length while the three majority templates per strand still consense.
+/// Asserted single-threaded and threaded, since they drain rejects and statistics through
+/// different code.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_duplex_zero_length_rejects_reconcile_with_stats(#[case] threads: Option<&str>) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+    let stats_path = temp_dir.path().join("stats.txt");
+
+    let mut molecule = create_duplex_molecule("1", "ACGTACGT", 30, 100, 3);
+    // One extra /A template whose bases are all below --min-input-base-quality (10), so with
+    // --trim it trims to zero length and create_source_read rejects it.
+    molecule.push(create_duplex_read_pair_with_cigar(
+        "trimmed",
+        "1/A",
+        "ACGTACGT",
+        "ACGTACGT",
+        2,
+        100,
+        false,
+        &[8u32 << 4],
+    ));
+    create_duplex_bam(&input_bam, vec![molecule]);
+
+    let mut args = vec![
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--stats",
+        stats_path.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--trim",
+        "--compression-level",
+        "1",
+    ];
+    if let Some(threads) = threads {
+        args.extend_from_slice(&["--threads", threads]);
+    }
+    Duplex::try_parse_from(args)
+        .expect("failed to parse duplex args")
+        .execute("fgumi duplex")
+        .expect("Duplex command failed");
+
+    let mut output_reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    output_reader.read_header().expect("read output header");
+    assert_eq!(
+        output_reader.records().count(),
+        2,
+        "the majority-alignment reads must still emit a duplex R1/R2 pair"
+    );
+
+    // Key input records by (name, flags) so each reject is compared byte-for-byte against the
+    // exact bytes it came from.
+    let expected_rejects: HashMap<(Vec<u8>, u16), Vec<u8>> = read_raw_records(&input_bam)
+        .into_iter()
+        .filter(|record| fgumi_raw_bam::read_name(record) == b"trimmed")
+        .map(|record| {
+            let view = RawRecordView::new(&record);
+            ((view.read_name().to_vec(), view.flags()), record)
+        })
+        .collect();
+    assert_eq!(expected_rejects.len(), 2, "the trimmed template contributes two records");
+
+    let mut seen: Vec<(Vec<u8>, u16)> = Vec::new();
+    for record in read_raw_records(&rejects_bam) {
+        let view = RawRecordView::new(&record);
+        let key = (view.read_name().to_vec(), view.flags());
+        let expected = expected_rejects.get(&key).unwrap_or_else(|| {
+            panic!("unexpected reject record {}", String::from_utf8_lossy(&key.0))
+        });
+        assert_eq!(
+            &record, expected,
+            "each reject must be byte-for-byte identical to its input record"
+        );
+        assert!(!seen.contains(&key), "a reject record was written more than once");
+        seen.push(key);
+    }
+
+    let stats = fs::read_to_string(&stats_path).expect("read stats");
+    let stat = |key: &str| -> usize {
+        stats
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}\t")))
+            .and_then(|rest| rest.split('\t').next())
+            .unwrap_or_else(|| panic!("stats must contain a {key} row"))
+            .parse()
+            .unwrap_or_else(|_| panic!("{key} must be an integer"))
+    };
+    assert_eq!(
+        seen.len(),
+        expected_rejects.len(),
+        "the rejects BAM must hold both ends of the trimmed template"
+    );
+    assert_eq!(
+        stat("raw_reads_rejected_for_zero_bases_post_trimming"),
+        2,
+        "both ends of the trimmed template must be counted as zero-bases-post-trimming"
+    );
+    assert_eq!(
+        seen.len(),
+        stat("raw_reads_rejected"),
+        "the rejects BAM record count must equal raw_reads_rejected"
+    );
+}
+
+/// #792: reads with absent qualities must reach both the rejects BAM and `--stats`.
+///
+/// `create_source_read` returns `None` for two distinct reasons — a read that quality-trims to
+/// zero length, and a read whose qualities are absent (all `0xFF`, the BAM spec's sentinel).
+/// `test_duplex_zero_length_rejects_reconcile_with_stats` covers the first; this covers the
+/// second, which the duplex path also counts as `ZeroLengthAfterTrimming` and writes to
+/// `--rejects`. Absent qualities are rejected before any trimming, so `--trim` is deliberately
+/// not passed here — the sentinel check alone must route the pair.
+///
+/// The `absent_qual` template's two reads have all-`0xFF` qualities while the three majority
+/// templates per strand still consense. Asserted single-threaded and threaded, since they drain
+/// rejects and statistics through different code.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_duplex_absent_quality_rejects_reconcile_with_stats(#[case] threads: Option<&str>) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+    let stats_path = temp_dir.path().join("stats.txt");
+
+    let mut molecule = create_duplex_molecule("1", "ACGTACGT", 30, 100, 3);
+    // One extra /A template whose qualities are all 0xFF — the BAM spec's "quality absent"
+    // sentinel — so create_source_read rejects it regardless of trimming.
+    molecule.push(create_duplex_read_pair_with_cigar(
+        "absent_qual",
+        "1/A",
+        "ACGTACGT",
+        "ACGTACGT",
+        0xFF,
+        100,
+        false,
+        &[8u32 << 4],
+    ));
+    create_duplex_bam(&input_bam, vec![molecule]);
+
+    let mut args = vec![
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--stats",
+        stats_path.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--compression-level",
+        "1",
+    ];
+    if let Some(threads) = threads {
+        args.extend_from_slice(&["--threads", threads]);
+    }
+    Duplex::try_parse_from(args)
+        .expect("failed to parse duplex args")
+        .execute("fgumi duplex")
+        .expect("Duplex command failed");
+
+    let mut output_reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    output_reader.read_header().expect("read output header");
+    assert_eq!(
+        output_reader.records().count(),
+        2,
+        "the majority-alignment reads must still emit a duplex R1/R2 pair"
+    );
+
+    // Key input records by (name, flags) so each reject is compared byte-for-byte against the
+    // exact bytes it came from.
+    let expected_rejects: HashMap<(Vec<u8>, u16), Vec<u8>> = read_raw_records(&input_bam)
+        .into_iter()
+        .filter(|record| fgumi_raw_bam::read_name(record) == b"absent_qual")
+        .map(|record| {
+            let view = RawRecordView::new(&record);
+            ((view.read_name().to_vec(), view.flags()), record)
+        })
+        .collect();
+    assert_eq!(expected_rejects.len(), 2, "the absent-quality template contributes two records");
+
+    let mut seen: Vec<(Vec<u8>, u16)> = Vec::new();
+    for record in read_raw_records(&rejects_bam) {
+        let view = RawRecordView::new(&record);
+        let key = (view.read_name().to_vec(), view.flags());
+        let expected = expected_rejects.get(&key).unwrap_or_else(|| {
+            panic!("unexpected reject record {}", String::from_utf8_lossy(&key.0))
+        });
+        assert_eq!(
+            &record, expected,
+            "each reject must be byte-for-byte identical to its input record"
+        );
+        assert!(!seen.contains(&key), "a reject record was written more than once");
+        seen.push(key);
+    }
+
+    let stats = fs::read_to_string(&stats_path).expect("read stats");
+    let stat = |key: &str| -> usize {
+        stats
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}\t")))
+            .and_then(|rest| rest.split('\t').next())
+            .unwrap_or_else(|| panic!("stats must contain a {key} row"))
+            .parse()
+            .unwrap_or_else(|_| panic!("{key} must be an integer"))
+    };
+    assert_eq!(
+        seen.len(),
+        expected_rejects.len(),
+        "the rejects BAM must hold both ends of the absent-quality template"
+    );
+    assert_eq!(
+        stat("raw_reads_rejected_for_zero_bases_post_trimming"),
+        2,
+        "both ends of the absent-quality template must be counted as zero-bases-post-trimming"
+    );
+    assert_eq!(
+        seen.len(),
+        stat("raw_reads_rejected"),
+        "the rejects BAM record count must equal raw_reads_rejected"
+    );
+}
+
+/// #792 (follow-up): zero-length rejects must reach the rejects BAM in input order.
+///
+/// A read that trims to zero length is dropped by `create_source_read` while its X/Y source
+/// vectors are built, before alignment filtering. For a `/B` template that means R1 lands in the
+/// Y partition and R2 in the X partition, so collecting the dropped raws X-partition-first would
+/// write R2 ahead of R1 — the reverse of input order, which wrote R1 then R2. The zero-length
+/// path must merge both partitions back into the group's canonical order, exactly as the
+/// alignment-filter reject path does.
+///
+/// Mirrors `test_duplex_rejects_preserve_input_order_for_b_strand_minority`, but the minority
+/// template is rejected for trimming to zero length rather than for a divergent alignment, so it
+/// exercises the separate zero-length collection path. Asserted single-threaded and threaded,
+/// since they drain rejects through different code.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_duplex_zero_length_rejects_preserve_input_order_for_b_strand(
+    #[case] threads: Option<&str>,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+
+    let mut molecule = create_duplex_molecule("1", "ACGTACGT", 30, 100, 3);
+    // Minority template on the *B* strand whose bases are all below --min-input-base-quality (10):
+    // with --trim both ends trim to zero length and `create_source_read` rejects them. Its R1
+    // becomes BA-R1 (lands in Y) and its R2 becomes BA-R2 (lands in X), so the two ends are
+    // dropped by separate partitions — exactly the split that can invert their order.
+    molecule.push(create_duplex_read_pair_with_cigar(
+        "trimmed",
+        "1/B",
+        "ACGTACGT",
+        "ACGTACGT",
+        2,
+        100,
+        true,
+        &[8u32 << 4],
+    ));
+    create_duplex_bam(&input_bam, vec![molecule]);
+
+    let mut args = vec![
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--trim",
+        "--compression-level",
+        "1",
+    ];
+    if let Some(threads) = threads {
+        args.extend_from_slice(&["--threads", threads]);
+    }
+    Duplex::try_parse_from(args)
+        .expect("failed to parse duplex args")
+        .execute("fgumi duplex")
+        .expect("Duplex command failed");
+
+    // The trimmed template's two input records, in the exact order the input wrote them (R1 then
+    // R2). The majority templates all consense, so they contribute no rejects and the rejects BAM
+    // must reproduce this sequence and nothing else.
+    let expected_sequence: Vec<Vec<u8>> = read_raw_records(&input_bam)
+        .into_iter()
+        .filter(|record| fgumi_raw_bam::read_name(record) == b"trimmed")
+        .collect();
+    assert_eq!(expected_sequence.len(), 2, "the trimmed template contributes two records");
+
+    let reject_sequence = read_raw_records(&rejects_bam);
+    assert_eq!(
+        reject_sequence, expected_sequence,
+        "the /B trimmed template's zero-length rejects must be serialized in input order (R1 then \
+         R2), not X-before-Y order (R2 then R1)"
+    );
+}
+
 /// #757 (follow-up): single-strand rejects must reach the rejects BAM in input order.
 ///
 /// The two combined alignment groups split a template's ends across strands: X = AB-R1 +
