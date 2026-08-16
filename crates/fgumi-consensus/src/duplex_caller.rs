@@ -2022,25 +2022,35 @@ impl DuplexConsensusCaller {
         );
 
         // Keep references to original raw records for later tag extraction.
+        //
+        // `create_source_read` returns `None` for reads with absent qualities or that trim to zero
+        // length. The single-strand path counts those as `ZeroLengthAfterTrimming` and writes them;
+        // building the source vectors with a bare `filter_map` would drop them from both `--stats`
+        // and `--rejects` (#792). Collect the dropped raws — tagged with their index in the X/Y
+        // partition so their group ordinal can be recovered — and hand them to the sub-caller so
+        // they drain through the same statistics/rejects path as its alignment-filter rejections.
         let x_raws: Vec<&RawRecord> = ab_r1s.iter().chain(ba_r2s.iter()).copied().collect();
-        let x_sources: Vec<SourceRead> = x_raws
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| {
-                let mate_clip = bam_fields::num_bases_extending_past_mate_raw(r);
-                ss_caller.create_source_read(r, i, mate_clip)
-            })
-            .collect();
+        let mut x_zero_length: Vec<(usize, &RawRecord)> = Vec::new();
+
+        let mut x_sources: Vec<SourceRead> = Vec::with_capacity(x_raws.len());
+        for (i, r) in x_raws.iter().enumerate() {
+            let mate_clip = bam_fields::num_bases_extending_past_mate_raw(r);
+            match ss_caller.create_source_read(r, i, mate_clip) {
+                Some(source) => x_sources.push(source),
+                None => x_zero_length.push((i, *r)),
+            }
+        }
 
         let y_raws: Vec<&RawRecord> = ab_r2s.iter().chain(ba_r1s.iter()).copied().collect();
-        let y_sources: Vec<SourceRead> = y_raws
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| {
-                let mate_clip = bam_fields::num_bases_extending_past_mate_raw(r);
-                ss_caller.create_source_read(r, i, mate_clip)
-            })
-            .collect();
+        let mut y_zero_length: Vec<(usize, &RawRecord)> = Vec::new();
+        let mut y_sources: Vec<SourceRead> = Vec::with_capacity(y_raws.len());
+        for (i, r) in y_raws.iter().enumerate() {
+            let mate_clip = bam_fields::num_bases_extending_past_mate_raw(r);
+            match ss_caller.create_source_read(r, i, mate_clip) {
+                Some(source) => y_sources.push(source),
+                None => y_zero_length.push((i, *r)),
+            }
+        }
 
         debug!(
             "MI {}: After SourceRead conversion (X={}, Y={})",
@@ -2075,11 +2085,29 @@ impl DuplexConsensusCaller {
                 Self::is_paired_r2,
                 Self::is_paired_r1,
             );
+
+            // Zero-length rejects split across strands just like the alignment rejects below — a
+            // `/B` template's R1 lands in Y and its R2 in X — so merge both partitions by group
+            // ordinal before recording, or a `/B` template's ends would be written R2-before-R1.
+            let mut zero_length_rejects: Vec<(usize, &RawRecord)> =
+                Vec::with_capacity(x_zero_length.len() + y_zero_length.len());
+            zero_length_rejects.extend(x_zero_length.iter().map(|&(i, raw)| (x_ordinals[i], raw)));
+            zero_length_rejects.extend(y_zero_length.iter().map(|&(i, raw)| (y_ordinals[i], raw)));
+            zero_length_rejects.sort_by_key(|&(ordinal, _)| ordinal);
+            ss_caller
+                .record_zero_length_after_trimming(zero_length_rejects.iter().map(|&(_, raw)| raw));
+
             let mut ss_rejects: Vec<(usize, &RawRecord)> = Vec::new();
             Self::collect_ss_rejects(&x_raws, &x_ordinals, &x_rejected, &mut ss_rejects);
             Self::collect_ss_rejects(&y_raws, &y_ordinals, &y_rejected, &mut ss_rejects);
             ss_rejects.sort_by_key(|&(ordinal, _)| ordinal);
             ss_caller.record_rejected_raw(ss_rejects.iter().map(|&(_, raw)| raw));
+        } else {
+            // Not tracking rejects: the dropped raws are only counted, never stored, so their
+            // order is irrelevant and computing group ordinals would be wasted work.
+            ss_caller.record_zero_length_after_trimming(
+                x_zero_length.iter().chain(y_zero_length.iter()).map(|&(_, raw)| raw),
+            );
         }
 
         debug!(
@@ -4042,6 +4070,91 @@ mod tests {
             caller.rejected_reads.len(),
             stats.filtered_reads,
             "the rejects buffer must reconcile with raw_reads_rejected"
+        );
+        Ok(())
+    }
+
+    /// #792: reads that trim to zero length must reach both `--stats` and `--rejects`.
+    ///
+    /// The duplex path built its X/Y `SourceRead` vectors with `filter_map`, silently discarding
+    /// every `None` return from `create_source_read` with no accounting, so those reads reached
+    /// neither output. This mirrors fgbio, whose base `toSourceRead` rejects a read that trims to
+    /// zero as `ZeroPostAfterTrimming` on the duplex caller's own rejects writer and counter
+    /// (`UmiConsensusCaller.scala:310-313`, reached from `DuplexConsensusCaller.scala:321-322`) —
+    /// one layer, both outputs. fgumi's vanilla path already counts these as
+    /// `ZeroLengthAfterTrimming` and writes them; the duplex path must match.
+    ///
+    /// The fixture is a surviving molecule — three clean templates per strand emit a duplex pair —
+    /// plus one extra `/A` template whose two reads are entirely below the minimum input base
+    /// quality, so with quality trimming enabled they trim to zero length (fgbio's genuine
+    /// `ZeroPostAfterTrimming` condition). Pins the reason count, that the fold does not inflate
+    /// `total_reads`/`consensus_reads`, and that the two raw records reach the rejects buffer
+    /// byte-for-byte in input order.
+    #[test]
+    fn test_zero_length_after_trimming_reads_reach_stats_and_rejects() -> Result<()> {
+        // Quality trimming enabled (6th arg), so an all-low-quality read trims to zero length.
+        let mut caller = DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            vec![1],
+            10, // min_input_base_quality
+            false,
+            true, // trim
+            None,
+            None,
+            true, // track_rejects
+            45,
+            40,
+        )?;
+
+        let mut reads = duplex_molecule(3, false, false);
+        // One extra `/A` template whose bases are all below the minimum input base quality (10),
+        // so quality trimming drops the whole read and `create_source_read` returns `None`.
+        let mut b = SamBuilder::new();
+        let cigar_10m = &[encode_op(0, 10)];
+        let low_quals = &[2u8; 10];
+        let dropped = vec![
+            ab_r1(&mut b, b"trimmed", b"AAAAAAAAAA", low_quals, cigar_10m, b"foo/A", &[]),
+            ab_r2(&mut b, b"trimmed", b"CCCCCCCCCC", low_quals, cigar_10m, b"foo/A", &[]),
+        ];
+        // The `--rejects` contract is byte-for-byte preservation, so compare against the input
+        // bytes rather than read names.
+        let expected_rejects: Vec<Vec<u8>> = dropped.iter().map(|record| record.to_vec()).collect();
+        reads.extend(dropped);
+        let input_count = reads.len();
+
+        let result = caller.consensus_reads(reads)?;
+        assert_eq!(result.count, 2, "the three clean templates must still emit a duplex pair");
+
+        let stats = caller.statistics();
+        assert_eq!(
+            stats
+                .rejection_reasons
+                .get(&RejectionReason::ZeroLengthAfterTrimming)
+                .copied()
+                .unwrap_or(0),
+            2,
+            "both trimmed reads must be counted as zero-length-after-trimming",
+        );
+        assert_eq!(stats.filtered_reads, 2, "raw_reads_rejected must count the two dropped reads");
+        assert_eq!(
+            stats.total_reads, input_count,
+            "folding the zero-length rejections must not inflate the input count",
+        );
+        assert_eq!(
+            stats.consensus_reads, 2,
+            "folding the zero-length rejections must not inflate the consensus count",
+        );
+
+        assert_eq!(
+            caller.rejected_reads, expected_rejects,
+            "the rejects buffer must hold exactly the two trimmed records, \
+             byte-for-byte and in input order",
+        );
+        assert_eq!(
+            caller.rejected_reads.len(),
+            stats.filtered_reads,
+            "the rejects buffer must reconcile with raw_reads_rejected",
         );
         Ok(())
     }
