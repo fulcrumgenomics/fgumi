@@ -226,6 +226,62 @@ pub struct Zipper {
     pub restore_unconverted_bases: bool,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ZipperOptions — the stage's tuning knobs, projected out of the CLI struct
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Zipper-stage tuning, independent of how the values were supplied.
+///
+/// The chain builder needs these knobs without knowing where they came from:
+/// the standalone `fgumi zipper` command fills them from its own flags, and a
+/// fused pipeline fills them from its own. Holding them in a plain struct —
+/// rather than having the builder reach into [`Zipper`] — is what lets a chain
+/// be constructed with no CLI struct behind it at all.
+///
+/// This deliberately does **not** derive `clap::Args`. Flattening it into
+/// [`Zipper`] would move the fields off that struct and rewrite every
+/// `self.<field>` reference in this module and its tests, which buys the chain
+/// builder nothing — it only ever reads the values. That refactor belongs with
+/// the fused command that actually needs prefixed `--zipper::<flag>` flags, so
+/// the CLI surface here is untouched.
+#[derive(Debug, Clone)]
+pub struct ZipperOptions {
+    /// Tags to remove from mapped reads before copying unmapped tags.
+    pub tags_to_remove: Vec<String>,
+    /// Tags to reverse for reads mapped to the negative strand.
+    pub tags_to_reverse: Vec<String>,
+    /// Tags to reverse complement for reads mapped to the negative strand.
+    pub tags_to_revcomp: Vec<String>,
+    /// Buffer size for the template channel.
+    pub buffer: usize,
+    /// Accepted for backward compatibility; has no effect. Carried so the
+    /// projection stays total — see [`Zipper::bwa_chunk_size`].
+    pub bwa_chunk_size: u64,
+    /// Drop unmapped-BAM reads absent from the aligned BAM.
+    pub exclude_missing_reads: bool,
+    /// Skip adding `tc` tags to secondary/supplementary reads.
+    pub skip_tc_tags: bool,
+    /// Restore unconverted bases in EM-seq consensus reads.
+    pub restore_unconverted_bases: bool,
+}
+
+impl Zipper {
+    /// Project the parsed CLI flags into [`ZipperOptions`].
+    #[must_use]
+    pub fn to_zipper_options(&self) -> ZipperOptions {
+        ZipperOptions {
+            tags_to_remove: self.tags_to_remove.clone(),
+            tags_to_reverse: self.tags_to_reverse.clone(),
+            tags_to_revcomp: self.tags_to_revcomp.clone(),
+            buffer: self.buffer,
+            bwa_chunk_size: self.bwa_chunk_size,
+            exclude_missing_reads: self.exclude_missing_reads,
+            skip_tc_tags: self.skip_tc_tags,
+            restore_unconverted_bases: self.restore_unconverted_bases,
+        }
+    }
+}
+
 /// Builds the output BAM header from unmapped and mapped headers
 ///
 /// Merges information from both input headers:
@@ -3559,6 +3615,71 @@ mod tests {
     fn test_skip_tc_tags_parsing(#[case] args: &[&str], #[case] expected: bool) {
         let cmd = Zipper::try_parse_from(args).expect("failed to parse Zipper arguments");
         assert_eq!(cmd.skip_tc_tags, expected);
+    }
+
+    /// Every tuning flag must survive the projection into [`ZipperOptions`].
+    ///
+    /// Driven through `try_parse_from` rather than a struct literal on purpose:
+    /// a struct literal would still compile if a flag were renamed or unwired,
+    /// whereas parsing pins the whole path from command line to option struct.
+    /// Non-default values throughout, so a field copied from the wrong source —
+    /// or left at its default — fails rather than coincidentally matching.
+    #[test]
+    fn to_zipper_options_carries_every_tuning_flag() {
+        let cmd = Zipper::try_parse_from([
+            "zipper",
+            "-u",
+            "u.bam",
+            "-r",
+            "ref.fa",
+            "-o",
+            "out.bam",
+            "--tags-to-remove",
+            "RX,MI",
+            "--tags-to-reverse",
+            "QX",
+            "--tags-to-revcomp",
+            "OX,ZA",
+            "--buffer",
+            "1234",
+            "--bwa-chunk-size",
+            "4242",
+            "--exclude-missing-reads=true",
+            "--skip-tc-tags=true",
+            "--restore-unconverted-bases=true",
+        ])
+        .expect("failed to parse Zipper arguments");
+
+        let opts = cmd.to_zipper_options();
+
+        assert_eq!(opts.tags_to_remove, vec!["RX".to_string(), "MI".to_string()]);
+        assert_eq!(opts.tags_to_reverse, vec!["QX".to_string()]);
+        assert_eq!(opts.tags_to_revcomp, vec!["OX".to_string(), "ZA".to_string()]);
+        assert_eq!(opts.buffer, 1234);
+        assert_eq!(opts.bwa_chunk_size, 4242);
+        assert!(opts.exclude_missing_reads);
+        assert!(opts.skip_tc_tags);
+        assert!(opts.restore_unconverted_bases);
+    }
+
+    /// The projection must also carry defaults faithfully — a field hard-coded
+    /// to `true`/`0` would pass the all-non-default test above.
+    #[test]
+    fn to_zipper_options_carries_defaults() {
+        let cmd =
+            Zipper::try_parse_from(["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam"])
+                .expect("failed to parse Zipper arguments");
+
+        let opts = cmd.to_zipper_options();
+
+        assert!(opts.tags_to_remove.is_empty());
+        assert!(opts.tags_to_reverse.is_empty());
+        assert!(opts.tags_to_revcomp.is_empty());
+        assert_eq!(opts.buffer, 50_000);
+        assert_eq!(opts.bwa_chunk_size, 150_000_000);
+        assert!(!opts.exclude_missing_reads);
+        assert!(!opts.skip_tc_tags);
+        assert!(!opts.restore_unconverted_bases);
     }
 
     /// The rendered long help for `--skip-tc-tags`.
