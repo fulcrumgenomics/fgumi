@@ -323,6 +323,7 @@ pub fn run_detached_driver(
     drain_counters: &[Arc<StepDrainCounter>],
     signal: &Arc<PipelineSignal>,
     stats: Option<&Arc<PipelineStats>>,
+    liveness: &crate::liveness::LivenessCounter,
 ) {
     let primary = group.primary_step();
     let mut row = build_driver_storage(group.into_steps(), contexts.inputs.len());
@@ -334,6 +335,7 @@ pub fn run_detached_driver(
         drain_counters,
         signal,
         stats,
+        liveness,
         &DrainFirstScheduler,
     );
 }
@@ -469,7 +471,14 @@ mod tests {
         let drain_counters: Vec<Arc<StepDrainCounter>> =
             (0..contexts.inputs.len()).map(|_| StepDrainCounter::new(1)).collect();
         let group = DetachedDriverGroup::new(vec![(step_idx, step)]);
-        run_detached_driver(group, contexts, &drain_counters, signal, None);
+        run_detached_driver(
+            group,
+            contexts,
+            &drain_counters,
+            signal,
+            None,
+            &crate::liveness::LivenessCounter::new(1),
+        );
     }
 
     /// Items pushed onto a Detached step's input flow through to its output;

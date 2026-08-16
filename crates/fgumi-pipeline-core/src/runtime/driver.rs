@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::erased::ErasedStepCtx;
+use crate::liveness::LivenessCounter;
 use crate::runtime::contexts::ChainContexts;
 use crate::runtime::drain::StepDrainCounter;
 use crate::runtime::live::LiveSteps;
@@ -63,6 +64,7 @@ const STICKY_BURST_LIMIT: usize = 1024;
 /// output close on `Finished` (init N for Parallel so only the last clone
 /// closes the shared output; init 1 for Serial/Exclusive).
 /// `signal` — error/cancel broadcast.
+#[allow(clippy::too_many_arguments)] // per-step shared state plus the liveness shard; a struct would only rename it
 pub fn run_worker_loop(
     worker: &mut WorkerCore,
     entries: &mut [WorkerStepEntry],
@@ -70,6 +72,7 @@ pub fn run_worker_loop(
     drain_counters: &[Arc<StepDrainCounter>],
     signal: &Arc<PipelineSignal>,
     stats: Option<&Arc<PipelineStats>>,
+    liveness: &LivenessCounter,
     scheduler: &dyn Scheduler,
 ) {
     // Per-worker worklist of still-dispatchable steps, in chain order. A step
@@ -141,6 +144,8 @@ pub fn run_worker_loop(
                     &drain_counters[owned_idx.0],
                     signal,
                     stats,
+                    liveness,
+                    worker.thread_id,
                     is_driver,
                 ) else {
                     break; // Skip
@@ -183,6 +188,8 @@ pub fn run_worker_loop(
                 drain_counters,
                 signal,
                 stats,
+                liveness,
+                worker.thread_id,
                 scheduler.walk(),
                 is_driver,
             );
@@ -260,6 +267,8 @@ fn round_robin_dispatch(
     drain_counters: &[Arc<StepDrainCounter>],
     signal: &Arc<PipelineSignal>,
     stats: Option<&Arc<PipelineStats>>,
+    liveness: &LivenessCounter,
+    worker_slot: usize,
     walk: WalkDirection,
     is_driver: bool,
 ) -> RoundRobinOutcome {
@@ -294,6 +303,8 @@ fn round_robin_dispatch(
             &drain_counters[step_idx.0],
             signal,
             stats,
+            liveness,
+            worker_slot,
             is_driver,
         ) else {
             continue; // Skip (build-time placeholder; should not appear in `live`)
@@ -365,6 +376,7 @@ struct DispatchInfo {
 /// `Finished` here rather than re-`try_lock`-ing and re-running an already-done
 /// step. The winning worker sets the latch under the dispatch guard before
 /// `mark_outputs_drained`, so a non-idempotent flusher can never be re-entered.
+#[allow(clippy::too_many_arguments)] // per-step shared state plus the liveness shard; a struct would only rename it
 fn dispatch_one_step(
     entry: &mut WorkerStepEntry,
     step_idx: StepIdx,
@@ -372,6 +384,12 @@ fn dispatch_one_step(
     counter: &StepDrainCounter,
     signal: &Arc<PipelineSignal>,
     stats: Option<&Arc<PipelineStats>>,
+    // Always-on liveness signal for the deadlock monitor, sharded per worker so
+    // the bump is an uncontended increment. Separate from `stats` on purpose:
+    // liveness must be free enough to leave armed, while `stats` pays for
+    // per-dispatch timing and stays opt-in. See `crate::liveness`.
+    liveness: &LivenessCounter,
+    worker_slot: usize,
     // When true (a dedicated driver thread), attribute this dispatch's wall time
     // to the off-pool detached line keyed by `step_idx` — so each grouped step
     // reports its own busy. Pool workers pass `false` and record aggregate busy
@@ -457,6 +475,17 @@ fn dispatch_one_step(
         WorkerStepEntry::Skip => None,
     };
 
+    // Liveness first, and unconditionally: this is what the deadlock monitor
+    // samples, so it must not depend on `stats` being attached. Only productive
+    // outcomes count — a wedged pipeline still spins through `NoProgress` and
+    // `Contention` dispatches forever, so counting those would make a wedge look
+    // alive and defeat the whole detector.
+    if let Some(i) = info.as_ref()
+        && matches!(i.result, Ok(StepOutcome::Progress | StepOutcome::Finished))
+    {
+        liveness.bump(worker_slot);
+    }
+
     if let (Some(stats), Some(start)) = (stats, start) {
         let elapsed_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         // Wall ns at dispatch start, relative to pipeline start.
@@ -517,6 +546,7 @@ mod tests {
             &drain_counters,
             &signal,
             None,
+            &crate::liveness::LivenessCounter::new(1),
             &crate::runtime::scheduler::ChainOrderScheduler,
         );
         // If we reach this line, the loop exited cleanly.
@@ -713,8 +743,18 @@ mod tests {
                 !InputHandle::is_drained(sink_input),
                 "downstream input drained before the last clone finished (after {i} of {N})"
             );
-            let info =
-                dispatch_one_step(clone, mid, &contexts, &counter, &signal, None, false).unwrap();
+            let info = dispatch_one_step(
+                clone,
+                mid,
+                &contexts,
+                &counter,
+                &signal,
+                None,
+                &LivenessCounter::new(1),
+                0,
+                false,
+            )
+            .unwrap();
             assert!(matches!(info.result, Ok(StepOutcome::Finished)));
         }
         assert!(
@@ -744,8 +784,18 @@ mod tests {
         // Worker 1 finishes the step: runs once, sets the latch.
         let mut entry1 =
             WorkerStepEntry::Shared { step: Arc::clone(&shared), drain: Arc::clone(&drain) };
-        let info1 =
-            dispatch_one_step(&mut entry1, mid, &contexts, &counter, &signal, None, false).unwrap();
+        let info1 = dispatch_one_step(
+            &mut entry1,
+            mid,
+            &contexts,
+            &counter,
+            &signal,
+            None,
+            &LivenessCounter::new(1),
+            0,
+            false,
+        )
+        .unwrap();
         assert!(matches!(info1.result, Ok(StepOutcome::Finished)));
         assert_eq!(runs.load(Ordering::Relaxed), 1, "step ran exactly once on the first worker");
         assert!(drain.is_finished(), "first finisher must set the DrainGate latch");
@@ -753,8 +803,18 @@ mod tests {
         // Worker 2 dispatches the same step: short-circuit, no re-run.
         let mut entry2 =
             WorkerStepEntry::Shared { step: Arc::clone(&shared), drain: Arc::clone(&drain) };
-        let info2 =
-            dispatch_one_step(&mut entry2, mid, &contexts, &counter, &signal, None, false).unwrap();
+        let info2 = dispatch_one_step(
+            &mut entry2,
+            mid,
+            &contexts,
+            &counter,
+            &signal,
+            None,
+            &LivenessCounter::new(1),
+            0,
+            false,
+        )
+        .unwrap();
         assert!(matches!(info2.result, Ok(StepOutcome::Finished)));
         assert_eq!(
             info2.name, "<finished-serial-step>",
@@ -806,6 +866,7 @@ mod tests {
             &drain_counters,
             &signal,
             None,
+            &crate::liveness::LivenessCounter::new(1),
             &crate::runtime::scheduler::ChainOrderScheduler,
         );
     }
@@ -867,6 +928,7 @@ mod tests {
             &drain_counters,
             &signal,
             None,
+            &crate::liveness::LivenessCounter::new(1),
             &crate::runtime::scheduler::ChainOrderScheduler,
         );
 
@@ -1008,6 +1070,7 @@ mod tests {
             &drain_counters,
             &signal,
             None,
+            &crate::liveness::LivenessCounter::new(1),
             &crate::runtime::scheduler::ChainOrderScheduler,
         );
         done.store(true, Ordering::SeqCst);
@@ -1165,6 +1228,7 @@ mod tests {
             &drain_counters,
             &signal,
             None,
+            &crate::liveness::LivenessCounter::new(1),
             &crate::runtime::scheduler::ChainOrderScheduler,
         );
         done.store(true, Ordering::SeqCst);
@@ -1234,8 +1298,17 @@ mod tests {
         // to step 0 (not some group primary).
         let stats = Arc::new(PipelineStats::new(vec!["SlowFinish", "Sink"]));
         let mut entry = WorkerStepEntry::Owned { step: Box::new(TypedStep::new(SlowFinish)) };
-        let _ =
-            dispatch_one_step(&mut entry, mid, &contexts, &counter, &signal, Some(&stats), true);
+        let _ = dispatch_one_step(
+            &mut entry,
+            mid,
+            &contexts,
+            &counter,
+            &signal,
+            Some(&stats),
+            &LivenessCounter::new(1),
+            0,
+            true,
+        );
         let snap = stats.snapshot();
         assert!(
             snap.detached.iter().any(|&(step, name, busy, ..)| {
@@ -1259,6 +1332,8 @@ mod tests {
             &counter_pool,
             &signal,
             Some(&stats_pool),
+            &LivenessCounter::new(1),
+            0,
             false,
         );
         assert!(
