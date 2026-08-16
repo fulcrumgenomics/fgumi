@@ -146,6 +146,11 @@ pub struct ConsensusMetrics {
     /// codec)
     pub rejected_clip_overlap_failed: u64,
 
+    /// Reads discarded by consensus downsampling (a deliberate `--max-reads` cap).
+    /// fgumi-specific: fgbio has no equivalent metric yet (fulcrumgenomics/fgbio#1166,
+    /// #1167), so this row is emitted only when non-zero (fgumi#724).
+    pub rejected_downsampled: u64,
+
     /// Consensus reads rejected for high duplex disagreement (fgbio
     /// `consensusReadsFilteredHighDisagreement`, emitted as
     /// `consensus_reads_rejected_hdd`; codec)
@@ -229,7 +234,7 @@ impl ConsensusCallerKind {
 /// fgumi's taxonomy is finer-grained than fgbio's; the reasons not in any caller's
 /// seeded set (e.g. `LowBaseQuality`) are fgumi-specific and are emitted only when
 /// non-zero.
-const ALL_REJECTIONS: [RejectionReason; 24] = [
+const ALL_REJECTIONS: [RejectionReason; 25] = [
     RejectionReason::InsufficientSupport,
     RejectionReason::MinorityAlignment,
     RejectionReason::OrphanConsensus,
@@ -254,6 +259,7 @@ const ALL_REJECTIONS: [RejectionReason; 24] = [
     RejectionReason::InsufficientMinDepth,
     RejectionReason::ExcessiveErrorRate,
     RejectionReason::UmiTooShort,
+    RejectionReason::Downsampled,
 ];
 
 /// Returns an iterator over all rejection reasons fgumi tracks.
@@ -300,6 +306,7 @@ impl ConsensusMetrics {
             rejected_indel_error_between_strands: 0,
             rejected_high_duplex_disagreement: 0,
             rejected_clip_overlap_failed: 0,
+            rejected_downsampled: 0,
             consensus_reads_rejected_hdd: 0,
             consensus_bases_emitted: 0,
             consensus_duplex_bases_emitted: 0,
@@ -346,6 +353,7 @@ impl ConsensusMetrics {
             RejectionReason::IndelErrorBetweenStrands => self.rejected_indel_error_between_strands,
             RejectionReason::HighDuplexDisagreement => self.rejected_high_duplex_disagreement,
             RejectionReason::ClipOverlapFailed => self.rejected_clip_overlap_failed,
+            RejectionReason::Downsampled => self.rejected_downsampled,
         }
     }
 
@@ -386,6 +394,7 @@ impl ConsensusMetrics {
                 self.rejected_high_duplex_disagreement += count;
             }
             RejectionReason::ClipOverlapFailed => self.rejected_clip_overlap_failed += count,
+            RejectionReason::Downsampled => self.rejected_downsampled += count,
         }
     }
 

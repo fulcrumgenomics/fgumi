@@ -66,6 +66,11 @@ pub enum RejectionReason {
     HighDuplexDisagreement,
     /// Overlap clipping failed (fgbio `clip_overlap_failed`; used by codec)
     ClipOverlapFailed,
+    /// Reads discarded by consensus downsampling (a deliberate `--max-reads` cap, not a
+    /// quality or alignment failure). fgbio has no equivalent metric row yet
+    /// (fulcrumgenomics/fgbio#1166, #1167), so this is fgumi-specific and diverges from
+    /// fgbio's stats under a cap (fgumi#724).
+    Downsampled,
 }
 
 impl RejectionReason {
@@ -99,6 +104,7 @@ impl RejectionReason {
             // fgbio's exact string (note the "top/bottoms" typo), matched for parity.
             Self::HighDuplexDisagreement => "Too many errors between top/bottoms strands",
             Self::ClipOverlapFailed => "See https://github.com/fulcrumgenomics/fgbio/issues/1090",
+            Self::Downsampled => "Reads discarded by consensus downsampling",
         }
     }
 
@@ -130,6 +136,7 @@ impl RejectionReason {
             Self::IndelErrorBetweenStrands => "raw_reads_rejected_for_indel_error_between_strands",
             Self::HighDuplexDisagreement => "raw_reads_rejected_for_high_duplex_disagreement",
             Self::ClipOverlapFailed => "raw_reads_rejected_for_clip_overlap_failed",
+            Self::Downsampled => "raw_reads_rejected_for_downsampled",
         }
     }
 
@@ -162,6 +169,7 @@ impl RejectionReason {
             Self::IndelErrorBetweenStrands => "Indel error between top/bottom strands",
             Self::HighDuplexDisagreement => "Too many errors between top/bottoms strands",
             Self::ClipOverlapFailed => "See https://github.com/fulcrumgenomics/fgbio/issues/1090",
+            Self::Downsampled => "Reads discarded by downsampling to the max reads per consensus",
         }
     }
 }
