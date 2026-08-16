@@ -5,6 +5,7 @@
 //! Move semantics on `Chain` enforce single-consumer per branch at the
 //! type-system level; the `ChainGraph` performs the runtime all-wired check.
 
+use crate::liveness::LivenessCounter;
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -152,6 +153,31 @@ impl Default for PipelineConfig {
         Self {
             threads: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
             stats: None,
+            // Still disarmed by default — but for a different reason than
+            // before, and the remaining blocker is now the only one.
+            //
+            // It used to be unaffordable: liveness came from `PipelineStats`,
+            // so arming the monitor meant paying `Instant::now()` on every
+            // dispatch. That is fixed — liveness is now a sharded counter
+            // (`crate::liveness`), and the monitor's teardown no longer polls a
+            // flag in 25ms slices, which cost up to a full slice of dead time on
+            // every run (measured at +80% wall on a 27ms pipeline). Both costs
+            // are gone; benchmarking shows arming it is now free within noise.
+            //
+            // What still blocks flipping this to `DEFAULT_DEADLOCK_TIMEOUT_SECS`
+            // is `PipelineError::MonitorBlindTransport`: an armed monitor
+            // *rejects* any chain with a non-`ByteBounded` edge, because its
+            // stall verdict distinguishes "idle" from "wedged" by counting bytes
+            // in flight and cannot see an `Unbounded` or `CountBounded` queue.
+            // `Process2` uses `CountBounded`, so defaulting this on would fail
+            // those chains outright rather than merely watching them. Teaching
+            // the verdict to handle byte-blind edges is its own change.
+            //
+            // Both the arming and the transport requirement are properties of
+            // the *scheduled* path only: a run that fuses to a single thread
+            // returns before either, so it would neither gain the monitor nor
+            // be rejected for a byte-blind edge. It is bounded by the fused
+            // path's own stall budget instead.
             deadlock_timeout_secs: 0,
             queue_memory_total: None,
             instrumentation: InstrumentationLevel::Off,
@@ -170,8 +196,20 @@ impl PipelineConfig {
     }
 
     /// Builder-style helper to set the deadlock-detection timeout.
-    /// `0` disables; the monitor only spawns when this is non-zero
-    /// AND `stats` is set.
+    /// [`DEFAULT_DEADLOCK_TIMEOUT_SECS`] is the recommended value.
+    /// `0` disables it.
+    ///
+    /// **Scheduled path only.** A non-zero value arms the monitor, and arming
+    /// additionally requires every output transport to be `ByteBounded` — see
+    /// [`crate::signal::PipelineError::MonitorBlindTransport`]. A run that
+    /// fuses to a single thread returns before either the transport check or
+    /// the monitor spawn, so it accepts a non-zero timeout with `CountBounded`
+    /// or `Unbounded` edges and simply ignores it; the fused path is bounded by
+    /// its own stall budget instead.
+    ///
+    /// `stats` is **optional** and independent of arming: liveness comes from
+    /// [`crate::liveness::LivenessCounter`], and a stats handle only adds the
+    /// per-step snapshot to the stall report.
     #[must_use]
     pub fn with_deadlock_timeout(mut self, timeout_secs: u64) -> Self {
         self.deadlock_timeout_secs = timeout_secs;
@@ -909,13 +947,12 @@ impl Pipeline {
                 steps.len()
             );
         }
-        if deadlock_timeout_secs > 0 && stats_arc.is_none() {
-            log::warn!(
-                "PipelineConfig::deadlock_timeout_secs is {deadlock_timeout_secs} but \
-                 PipelineConfig::stats is None; deadlock monitor cannot run without \
-                 stats. Disable one or pair them via the helpers in commands/common.rs."
-            );
-        }
+        // Always-on liveness signal for the deadlock monitor. Sized for the
+        // worker pool plus a slot per possible driver thread, so every bumper
+        // gets its own cache line (see `crate::liveness`). Deliberately NOT
+        // gated on `stats`: the monitor must be armable without paying for
+        // per-dispatch timing, which is exactly what kept it disarmed before.
+        let liveness = Arc::new(LivenessCounter::new(n_threads + steps.len()));
 
         // 0. Fused single-thread fast path (issue #330). A single-source
         // source→sink chain at one worker is driven inline over direct buffers,
@@ -975,7 +1012,17 @@ impl Pipeline {
         // `steps` is still alive, before it is consumed by
         // `build_worker_storage` below. Test chains use CountBounded/Unbounded
         // but do not arm the monitor, so this only fires for a fail-fast run.
-        if deadlock_timeout_secs > 0 && stats_arc.is_some() {
+        //
+        // Keyed on the timeout ALONE, deliberately: liveness now comes from
+        // `LivenessCounter`, so the monitor arms on a non-zero timeout whether
+        // or not a stats handle is attached. Gating this on `stats.is_some()`
+        // too — as it was when liveness was read out of `PipelineStats` — would
+        // let an armed, stats-less run start on a blind edge, where
+        // `in_flight_bytes` reports 0, `classify_stall` reads that as
+        // `Starving`, and the stall clock resets on every poll, so the wedge
+        // never reaches the fatal timeout. The arming condition here must track
+        // the one at the monitor spawn below.
+        if deadlock_timeout_secs > 0 {
             ensure_monitor_visible_transports(&steps, &graph)?;
         }
 
@@ -1025,11 +1072,12 @@ impl Pipeline {
         // `deadlock_timeout_secs` seconds, it logs the snapshot at
         // `warn` level so the user has a starting point. Polls every
         // `max(1, deadlock_timeout_secs / 4)` seconds.
-        let (monitor_stop, monitor_handle) = match (deadlock_timeout_secs, stats_arc.as_ref()) {
-            (n, Some(stats)) if n > 0 => {
-                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (monitor_stop, monitor_handle) = match deadlock_timeout_secs {
+            n if n > 0 => {
+                let stop = Arc::new(StopSignal::default());
                 let stop_clone = Arc::clone(&stop);
-                let stats_clone = Arc::clone(stats);
+                let liveness_monitor = Arc::clone(&liveness);
+                let stats_for_monitor = stats_arc.as_ref().map(Arc::clone);
                 let contexts_clone = Arc::clone(&contexts);
                 let signal_clone = Arc::clone(&signal);
                 let warn_timeout = std::time::Duration::from_secs(deadlock_timeout_secs);
@@ -1043,7 +1091,8 @@ impl Pipeline {
                     .spawn(move || {
                         run_deadlock_monitor(
                             &stop_clone,
-                            &stats_clone,
+                            &liveness_monitor,
+                            stats_for_monitor.as_ref(),
                             &contexts_clone,
                             &signal_clone,
                             warn_timeout,
@@ -1064,7 +1113,7 @@ impl Pipeline {
         // consistently-empty ones. Total budget is preserved.
         let (rebalancer_stop, rebalancer_handle) =
             if config.queue_memory_total.is_some() && !contexts.bounded_queues.is_empty() {
-                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stop = Arc::new(StopSignal::default());
                 let stop_clone = Arc::clone(&stop);
                 // Capture handles into a contiguous Vec — the monitor
                 // doesn't need step indices/names beyond debug logging.
@@ -1139,6 +1188,7 @@ impl Pipeline {
                 let drain_counters_clone: Vec<Arc<StepDrainCounter>> =
                     drain_counters.iter().map(Arc::clone).collect();
                 let stats_clone = stats_arc.as_ref().map(Arc::clone);
+                let liveness_clone = Arc::clone(&liveness);
                 let thread_name = match group.label() {
                     DetachedGroup::Shared(label) => format!("fgumi-driver-{label}"),
                     DetachedGroup::PerStep => {
@@ -1161,6 +1211,7 @@ impl Pipeline {
                                     &drain_counters_clone,
                                     &signal_clone,
                                     stats_clone.as_ref(),
+                                    &liveness_clone,
                                 );
                             }))
                         {
@@ -1217,6 +1268,7 @@ impl Pipeline {
                     &drain_counters,
                     &signal_arc,
                     stats_arc.as_ref(),
+                    &liveness,
                     scheduler.as_ref(),
                 );
             })) {
@@ -1237,6 +1289,7 @@ impl Pipeline {
                 let drain_counters_clone: Vec<Arc<StepDrainCounter>> =
                     drain_counters.iter().map(Arc::clone).collect();
                 let stats_clone = stats_arc.as_ref().map(Arc::clone);
+                let liveness_clone = Arc::clone(&liveness);
                 let scheduler_clone = Arc::clone(&scheduler);
 
                 let handle = thread::Builder::new()
@@ -1263,6 +1316,7 @@ impl Pipeline {
                                     &drain_counters_clone,
                                     &signal_clone,
                                     stats_clone.as_ref(),
+                                    &liveness_clone,
                                     scheduler_clone.as_ref(),
                                 );
                             }))
@@ -1307,7 +1361,7 @@ impl Pipeline {
         // normal pipeline shutdown (where steps stop progressing
         // because they're done, not stuck).
         if let Some(stop) = monitor_stop {
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            stop.stop();
         }
         if let Some(handle) = monitor_handle {
             let _ = handle.join();
@@ -1315,7 +1369,7 @@ impl Pipeline {
 
         // 6b. Stop and join the queue rebalancer (if spawned).
         if let Some(stop) = rebalancer_stop {
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            stop.stop();
         }
         if let Some(handle) = rebalancer_handle {
             let _ = handle.join();
@@ -1369,6 +1423,16 @@ impl Pipeline {
 /// (busy-locus group, large sort merge) can legitimately flatten progress for
 /// many seconds, so we only fail after the stall persists well past the warn
 /// window. A real deadlock hangs forever, so waiting longer to be sure is free.
+/// Recommended stall patience for the deadlock monitor, in seconds, for callers
+/// arming it via [`PipelineConfig::with_deadlock_timeout`].
+///
+/// Matches the fused path's `DEFAULT_STALL_BUDGET` so both runtimes bound a
+/// wedge alike, and for the same reason: this catches a PERMANENT wedge, not a
+/// slow source, and the costs are asymmetric — err long.
+///
+/// Not yet the `PipelineConfig::default()` value; see the note there.
+pub const DEFAULT_DEADLOCK_TIMEOUT_SECS: u64 = 60;
+
 const DEADLOCK_FATAL_MULTIPLE: u64 = 6;
 
 /// Total bytes currently held across the **byte-bounded** transport queues and
@@ -1485,9 +1549,11 @@ fn ensure_monitor_visible_transports(
 ///     of hanging forever.
 ///
 /// Exits when `stop` is set (workers joined) or the pipeline is already done.
+#[allow(clippy::too_many_arguments)] // one monitor's worth of shared state; a struct would only rename it
 fn run_deadlock_monitor(
-    stop: &Arc<std::sync::atomic::AtomicBool>,
-    stats: &Arc<PipelineStats>,
+    stop: &Arc<StopSignal>,
+    liveness: &Arc<LivenessCounter>,
+    stats: Option<&Arc<PipelineStats>>,
     contexts: &Arc<crate::runtime::contexts::ChainContexts>,
     signal: &Arc<PipelineSignal>,
     warn_timeout: std::time::Duration,
@@ -1495,17 +1561,17 @@ fn run_deadlock_monitor(
     poll_interval: std::time::Duration,
 ) {
     let mut mon_state = StallMonitorState {
-        last_total: total_progress(stats),
+        last_total: liveness.total(),
         stall_start: std::time::Instant::now(),
         last_warn: None,
     };
-    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+    while !stop.is_stopped() {
         sleep_until_stop(stop, poll_interval);
-        if stop.load(std::sync::atomic::Ordering::Relaxed) || signal.is_done() {
+        if stop.is_stopped() || signal.is_done() {
             break;
         }
         let now = std::time::Instant::now();
-        let now_total = total_progress(stats);
+        let now_total = liveness.total();
         let progressed = now_total != mon_state.last_total;
         let stall_secs = now.duration_since(mon_state.stall_start).as_secs();
         let stuck = in_flight_bytes(contexts);
@@ -1523,7 +1589,7 @@ fn run_deadlock_monitor(
             stall_secs,
             stuck,
             warn_timeout,
-            stats,
+            stats.map(std::convert::AsRef::as_ref),
             signal,
             &mut mon_state,
         ) {
@@ -1554,7 +1620,11 @@ fn apply_stall_verdict(
     stall_secs: u64,
     stuck: u64,
     warn_timeout: std::time::Duration,
-    stats: &PipelineStats,
+    // Optional: the monitor no longer requires instrumentation to run, so an
+    // uninstrumented run still reports the stall — just without the per-step
+    // snapshot. Losing the snapshot is far better than losing the detection,
+    // which is what requiring `stats` used to cost.
+    stats: Option<&PipelineStats>,
     signal: &PipelineSignal,
     mon_state: &mut StallMonitorState,
 ) -> bool {
@@ -1580,9 +1650,16 @@ fn apply_stall_verdict(
                     "Pipeline stall: no progress for {stall_secs}s with {stuck} bytes \
                      still in flight. Snapshot follows."
                 );
-                let snapshot = stats.snapshot();
-                for line in format!("{snapshot}").lines() {
-                    log::warn!("{line}");
+                if let Some(stats) = stats {
+                    let snapshot = stats.snapshot();
+                    for line in format!("{snapshot}").lines() {
+                        log::warn!("{line}");
+                    }
+                } else {
+                    log::warn!(
+                        "(no per-step snapshot: PipelineConfig::stats is not set; \
+                         attach a stats handle to see which step is stuck)"
+                    );
                 }
                 mon_state.last_warn = Some(now);
             }
@@ -1592,9 +1669,16 @@ fn apply_stall_verdict(
                 "Pipeline deadlock: no progress for {stall_secs}s with {stuck} bytes \
                  stuck in flight; failing the pipeline. Snapshot follows."
             );
-            let snapshot = stats.snapshot();
-            for line in format!("{snapshot}").lines() {
-                log::error!("{line}");
+            if let Some(stats) = stats {
+                let snapshot = stats.snapshot();
+                for line in format!("{snapshot}").lines() {
+                    log::error!("{line}");
+                }
+            } else {
+                log::error!(
+                    "(no per-step snapshot: PipelineConfig::stats is not set; \
+                     attach a stats handle to see which step is stuck)"
+                );
             }
             signal.record_error(PipelineError::TimedOut { stalled_secs: stall_secs });
             signal.cancel();
@@ -1607,11 +1691,6 @@ fn apply_stall_verdict(
 /// Sum of `progress_count + finished_count` across all steps. The
 /// monitor uses this as a single scalar progress watermark; a change
 /// means *some* step is making forward progress.
-fn total_progress(stats: &PipelineStats) -> u64 {
-    let snap = stats.snapshot();
-    snap.steps.iter().map(|(_, s)| s.progress_count + s.finished_count).sum()
-}
-
 /// Sleep up to `dur`, returning early as soon as `stop` is set. Polls the
 /// flag in short slices so a background helper thread (deadlock monitor,
 /// queue rebalancer) exits within tens of milliseconds at teardown instead
@@ -1620,18 +1699,62 @@ fn total_progress(stats: &PipelineStats) -> u64 {
 /// here adds a fixed dead-time tail (up to `poll_interval`) to every run —
 /// negligible on long jobs but a large *relative* regression on short ones
 /// (e.g. FASTQ extract), since the worker pool is already idle and waiting.
-fn sleep_until_stop(stop: &std::sync::atomic::AtomicBool, dur: std::time::Duration) {
-    const SLICE: std::time::Duration = std::time::Duration::from_millis(25);
-    let deadline = std::time::Instant::now() + dur;
-    loop {
-        if stop.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
+fn sleep_until_stop(stop: &StopSignal, dur: std::time::Duration) {
+    // A condvar, not a polled sleep. The previous shape slept in 25ms slices and
+    // re-checked a flag, so teardown waited up to a full slice for the monitor to
+    // notice — dead time on the critical path of *every* run, since `Pipeline::run`
+    // joins this thread before returning.
+    //
+    // That is not a rounding error at the short end. With the monitor armed by
+    // default, a 27ms pipeline measured +80% wall on the dispatch benchmark, and
+    // the excess was almost exactly one slice. Waking the sleeper directly takes
+    // that to zero, which is what makes arming the monitor by default affordable.
+    let (lock, cvar) = (&stop.stopped, &stop.waker);
+    let mut stopped = lock.lock().expect("stop mutex not poisoned");
+    if *stopped {
+        return;
+    }
+    // `Instant::now() + dur` panics when the deadline is not representable (a
+    // caller could pass an enormous `deadlock_timeout_secs`). `Pipeline::run`
+    // discards this thread's join error, so a panic here would silently disarm
+    // the monitor while the run reports success. Guard with `checked_add`: an
+    // unrepresentable deadline means "effectively never", so wait untimed until
+    // `stop()` wakes us — the only teardown path that matters.
+    let Some(deadline) = std::time::Instant::now().checked_add(dur) else {
+        while !*stopped {
+            stopped = cvar.wait(stopped).expect("stop condvar not poisoned");
         }
-        let now = std::time::Instant::now();
-        if now >= deadline {
+        return;
+    };
+    // `wait_timeout` can wake spuriously; the loop re-checks both the flag and
+    // the deadline, so a spurious wake just resumes waiting for the remainder.
+    while !*stopped {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
             return;
-        }
-        std::thread::sleep(SLICE.min(deadline - now));
+        };
+        let (guard, _) = cvar.wait_timeout(stopped, remaining).expect("stop condvar not poisoned");
+        stopped = guard;
+    }
+}
+
+/// Stop flag for a background helper thread, with a condvar so a waiting thread
+/// wakes the instant it is set rather than on its next poll tick.
+#[derive(Debug, Default)]
+pub(crate) struct StopSignal {
+    stopped: std::sync::Mutex<bool>,
+    waker: std::sync::Condvar,
+}
+
+impl StopSignal {
+    /// Whether `stop` has been called.
+    pub(crate) fn is_stopped(&self) -> bool {
+        *self.stopped.lock().expect("stop mutex not poisoned")
+    }
+
+    /// Set the flag and wake the sleeper immediately.
+    pub(crate) fn stop(&self) {
+        *self.stopped.lock().expect("stop mutex not poisoned") = true;
+        self.waker.notify_all();
     }
 }
 
@@ -1756,7 +1879,7 @@ fn reorder_cap_for(per_queue: u64) -> u64 {
 /// Exits when `stop` is set (typically after workers join).
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn run_queue_rebalancer(
-    stop: &Arc<std::sync::atomic::AtomicBool>,
+    stop: &Arc<StopSignal>,
     handles: &[Arc<dyn super::queues::BoundedQueueHandle>],
     names: &[&'static str],
 ) {
@@ -1767,9 +1890,9 @@ fn run_queue_rebalancer(
     let poll_interval = std::time::Duration::from_secs(1);
     let shift_fraction: f64 = 0.10;
 
-    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+    while !stop.is_stopped() {
         sleep_until_stop(stop, poll_interval);
-        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+        if stop.is_stopped() {
             break;
         }
 
@@ -3313,7 +3436,8 @@ mod tests {
     /// must not block for a poll interval afterward.
     #[test]
     fn sleep_until_stop_returns_immediately_when_already_stopped() {
-        let stop = std::sync::atomic::AtomicBool::new(true);
+        let stop = StopSignal::default();
+        stop.stop();
         let start = std::time::Instant::now();
         sleep_until_stop(&stop, std::time::Duration::from_secs(10));
         assert!(
@@ -3328,11 +3452,11 @@ mod tests {
     /// slices), proving it interrupts a long sleep rather than waiting it out.
     #[test]
     fn sleep_until_stop_wakes_when_stopped_midway() {
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::new(StopSignal::default());
         let stop_clone = Arc::clone(&stop);
         let setter = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            stop_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+            stop_clone.stop();
         });
         let start = std::time::Instant::now();
         sleep_until_stop(&stop, std::time::Duration::from_secs(10));
@@ -3343,12 +3467,34 @@ mod tests {
         assert!(elapsed < std::time::Duration::from_millis(500), "woke too late: {elapsed:?}");
     }
 
+    /// A duration so large that `Instant::now() + dur` is unrepresentable must
+    /// not panic: the helper falls back to an untimed wait and still wakes the
+    /// instant `stop()` fires. Regression test for the `checked_add` guard —
+    /// before it, `Duration::MAX` panicked here and silently disarmed the
+    /// monitor (whose join error `Pipeline::run` discards).
+    #[test]
+    fn sleep_until_stop_survives_an_unrepresentable_deadline() {
+        let stop = Arc::new(StopSignal::default());
+        let stop_clone = Arc::clone(&stop);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            stop_clone.stop();
+        });
+        let start = std::time::Instant::now();
+        sleep_until_stop(&stop, std::time::Duration::MAX);
+        let elapsed = start.elapsed();
+        setter.join().unwrap();
+        // Woke shortly after the 50ms flag flip, not after an (impossible) MAX wait.
+        assert!(elapsed >= std::time::Duration::from_millis(40), "woke too early: {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_millis(500), "woke too late: {elapsed:?}");
+    }
+
     /// When `stop` is never set, the helper sleeps for approximately the full
     /// duration (it does not return early). Generous upper bound keeps it
     /// non-flaky on a loaded CI host.
     #[test]
     fn sleep_until_stop_sleeps_full_duration_when_never_stopped() {
-        let stop = std::sync::atomic::AtomicBool::new(false);
+        let stop = StopSignal::default();
         let start = std::time::Instant::now();
         sleep_until_stop(&stop, std::time::Duration::from_millis(100));
         let elapsed = start.elapsed();
@@ -3563,6 +3709,49 @@ mod tests {
         );
     }
 
+    /// Arming the monitor must enforce the monitor-visible-transport invariant
+    /// even with no stats handle attached.
+    ///
+    /// This goes through `Pipeline::run` rather than calling
+    /// `ensure_monitor_visible_transports` directly on purpose: the helper's own
+    /// unit tests above pass whatever condition guards the *call site*, so they
+    /// cannot catch a guard that skips the check. Only a run-level test can.
+    ///
+    /// The failure it pins is silent, which is what makes it worth a test: on a
+    /// blind edge `in_flight_bytes` reports 0, `classify_stall` reads that as
+    /// `Starving`, and `Starving` resets the stall clock on every poll — so an
+    /// armed monitor would watch a wedged pipeline forever and never fail it.
+    ///
+    /// The converse — that a blind transport is still legal on a *disarmed* run
+    /// — needs no test of its own: most chains in this suite pair a
+    /// `CountBounded` edge with the default `deadlock_timeout_secs: 0`, so an
+    /// over-broad guard would fail them by the hundred.
+    #[test]
+    fn pipeline_run_rejects_a_monitor_blind_transport_without_stats() {
+        // `StubSource` declares `CountBounded`, which the byte-accounting probe
+        // cannot see. The chain never terminates (`StubSinkU32` always reports
+        // `NoProgress`), which is fine here and load-bearing for the assertion:
+        // the transport check runs before any worker is spawned, so a passing
+        // run proves the rejection happened at startup rather than after any
+        // work.
+        let builder = PipelineBuilder::new();
+        builder.chain(StubSource).chain(StubSinkU32).into_sink_marker();
+        let pipeline = builder.build().unwrap();
+
+        let err = pipeline
+            .run(PipelineConfig {
+                threads: 2,
+                stats: None,
+                deadlock_timeout_secs: 5,
+                ..Default::default()
+            })
+            .expect_err("an armed monitor on a blind transport must fail the run");
+        assert!(
+            matches!(err, PipelineError::MonitorBlindTransport { step: "Source", .. }),
+            "expected MonitorBlindTransport for the blind source, got {err:?}",
+        );
+    }
+
     #[test]
     fn apply_stall_verdict_wedged_records_timeout_and_cancels() {
         use crate::signal::PipelineError;
@@ -3578,7 +3767,7 @@ mod tests {
             60,
             4096,
             std::time::Duration::from_secs(10),
-            &stats,
+            Some(&stats),
             &signal,
             &mut mon_state,
         );
@@ -3609,7 +3798,7 @@ mod tests {
             15,
             4096,
             warn,
-            &stats,
+            Some(&stats),
             &signal,
             &mut mon_state,
         );
@@ -3626,7 +3815,7 @@ mod tests {
             16,
             4096,
             warn,
-            &stats,
+            Some(&stats),
             &signal,
             &mut mon_state,
         );
@@ -3652,7 +3841,7 @@ mod tests {
             0,
             0,
             warn,
-            &stats,
+            Some(&stats),
             &signal,
             &mut mon_state,
         );
@@ -3672,7 +3861,7 @@ mod tests {
             0,
             0,
             warn,
-            &stats,
+            Some(&stats),
             &signal,
             &mut mon_state,
         );
