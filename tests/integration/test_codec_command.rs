@@ -12,9 +12,10 @@ use fgumi_dna::reverse_complement;
 use fgumi_lib::commands::codec::Codec;
 use fgumi_lib::commands::command::Command;
 use fgumi_lib::sam::SamTag;
-use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
+use fgumi_raw_bam::{RawRecord, RawRecordView, SamBuilder, flags as raw_flags};
 use noodles::bam;
 use rstest::rstest;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -668,6 +669,239 @@ fn test_codec_command_with_rejects() {
     let _rejects_header = rejects_reader.read_header().unwrap();
     let rejects_count = rejects_reader.records().count();
     assert_eq!(rejects_count, 2, "Rejects BAM should contain both reads of the failing molecule");
+}
+
+/// Builds a CODEC FR pair carrying an explicit CIGAR on both reads.
+///
+/// [`create_codec_read_pair`] derives an all-`M` CIGAR from the sequence length, so it
+/// cannot express the differing indel patterns the minority-alignment filter keys on.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn create_codec_read_pair_with_cigar(
+    name: &str,
+    seq: &[u8],
+    ref_start: usize,
+    umi: &str,
+    cigar_ops: &[u32],
+) -> (RawRecord, RawRecord) {
+    let pos = i32::try_from(ref_start).expect("ref_start fits i32") - 1;
+    let qual = vec![30u8; seq.len()];
+
+    let mut b1 = SamBuilder::new();
+    b1.read_name(name.as_bytes())
+        .sequence(seq)
+        .qualities(&qual)
+        .cigar_ops(cigar_ops)
+        .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT | raw_flags::MATE_REVERSE)
+        .ref_id(0)
+        .pos(pos)
+        .mapq(60)
+        .mate_ref_id(0)
+        .mate_pos(pos)
+        .template_length(seq.len() as i32)
+        .add_string_tag(SamTag::MI, umi.as_bytes());
+
+    let mut b2 = SamBuilder::new();
+    b2.read_name(name.as_bytes())
+        .sequence(seq)
+        .qualities(&qual)
+        .cigar_ops(cigar_ops)
+        .flags(raw_flags::PAIRED | raw_flags::LAST_SEGMENT | raw_flags::REVERSE)
+        .ref_id(0)
+        .pos(pos)
+        .mapq(60)
+        .mate_ref_id(0)
+        .mate_pos(pos)
+        .template_length(-(seq.len() as i32))
+        .add_string_tag(SamTag::MI, umi.as_bytes());
+
+    (b1.build(), b2.build())
+}
+
+/// #751: the rejects BAM must reconcile with `--stats`.
+///
+/// The molecule here emits a consensus *and* drops reads: `minority` carries a minority
+/// indel pattern (`raw_reads_rejected_for_minority_alignment`) and `fragment` is unpaired
+/// (`raw_reads_rejected_for_non_paired_reads`). Both rejections happen inside a group
+/// that goes on to produce a consensus, which is exactly the case that used to be counted
+/// in `--stats` and written nowhere — `raw_reads_rejected` was non-zero against a rejects
+/// BAM of zero records. Asserted in both the single-threaded and pipeline paths, since
+/// they drain the caller's rejects through different code.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_codec_rejects_bam_reconciles_with_stats(#[case] threads: Option<&str>) {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+    let stats_file = temp_dir.path().join("stats.tsv");
+
+    // Three majority (30M) templates and one minority (10M2D20M) template, all in one
+    // molecule, so the majority reads still consense while the minority pair is dropped.
+    let ungapped = [30u32 << 4];
+    let gapped = [10u32 << 4, (2u32 << 4) | 2, 20u32 << 4];
+    let seq = [b'A'; 30];
+    let mut pairs = Vec::new();
+    for i in 0..3 {
+        pairs.push(create_codec_read_pair_with_cigar(
+            &format!("majority{i}"),
+            &seq,
+            1,
+            "UMI_MIX",
+            &ungapped,
+        ));
+    }
+    pairs.push(create_codec_read_pair_with_cigar("minority", &seq, 1, "UMI_MIX", &gapped));
+
+    // An unpaired read in the same molecule: rejected on its own while the FR pairs consense.
+    let mut fragment = SamBuilder::new();
+    fragment
+        .read_name(b"fragment")
+        .sequence(&seq)
+        .qualities(&[30u8; 30])
+        .cigar_ops(&ungapped)
+        .flags(0)
+        .ref_id(0)
+        .pos(0)
+        .mapq(60)
+        .add_string_tag(SamTag::MI, b"UMI_MIX");
+
+    let mut input_records: Vec<RawRecord> = Vec::new();
+    for (r1, r2) in pairs {
+        input_records.push(r1);
+        input_records.push(r2);
+    }
+    input_records.push(fragment.build());
+
+    // The --rejects contract is byte-for-byte preservation of the input record, so key the
+    // three expected rejects by (name, flags) and compare whole serialized records below.
+    let expected_rejects: HashMap<(Vec<u8>, u16), Vec<u8>> = input_records
+        .iter()
+        .filter(|record| {
+            matches!(RawRecordView::new(record).read_name(), b"minority" | b"fragment")
+        })
+        .map(|record| {
+            let view = RawRecordView::new(record);
+            ((view.read_name().to_vec(), view.flags()), record.as_ref().to_vec())
+        })
+        .collect();
+    assert_eq!(expected_rejects.len(), 3, "the minority pair and the fragment must be rejected");
+
+    let header = create_minimal_header("chr1", 10000);
+    let mut writer =
+        create_raw_bam_writer(&input_bam, &header, 1, 6).expect("Failed to create raw BAM writer");
+    for record in &input_records {
+        writer.write_raw_record(record.as_ref()).expect("Failed to write record");
+    }
+    writer.finish().expect("Failed to finish BAM");
+
+    let mut args = vec![
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--stats",
+        stats_file.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--min-duplex-length",
+        "1",
+        "--compression-level",
+        "1",
+    ];
+    if let Some(threads) = threads {
+        args.extend_from_slice(&["--threads", threads]);
+    }
+    Codec::try_parse_from(args)
+        .expect("failed to parse codec args")
+        .execute("fgumi codec")
+        .expect("Failed to run codec command");
+
+    let mut output_reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _output_header = output_reader.read_header().unwrap();
+    assert_eq!(
+        output_reader.records().count(),
+        1,
+        "the majority-alignment reads must still emit a consensus"
+    );
+
+    let stats = fs::read_to_string(&stats_file).expect("Failed to read stats");
+    let stat = |key: &str| -> usize {
+        stats
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}\t")))
+            .and_then(|rest| rest.split('\t').next())
+            .unwrap_or_else(|| panic!("stats must contain a {key} row"))
+            .parse()
+            .unwrap_or_else(|_| panic!("{key} must be an integer"))
+    };
+    assert_eq!(
+        stat("raw_reads_rejected_for_minority_alignment"),
+        2,
+        "the minority template's R1 and R2 must be rejected"
+    );
+    assert_eq!(
+        stat("raw_reads_rejected_for_non_paired_reads"),
+        1,
+        "the fragment read must be rejected"
+    );
+
+    // Read the rejects back as raw records so the whole serialized record is compared, not
+    // just the fields noodles decodes ergonomically: a rejects BAM that dropped tags or
+    // rewrote a CIGAR would satisfy a name-and-count assertion.
+    let (mut rejects_reader, _rejects_header) =
+        fgumi_bam_io::create_raw_bam_reader(&rejects_bam, 1).expect("open rejects BAM");
+    let mut seen: Vec<(Vec<u8>, u16)> = Vec::new();
+    let mut record = RawRecord::new();
+    while rejects_reader.read_record(&mut record).expect("read reject record") != 0 {
+        let key = (RawRecordView::new(&record).read_name().to_vec(), record.flags());
+        let expected = expected_rejects.get(&key).unwrap_or_else(|| {
+            panic!("unexpected reject record {}", String::from_utf8_lossy(&key.0))
+        });
+        assert_eq!(
+            record.as_ref(),
+            expected.as_slice(),
+            "each reject must be byte-for-byte identical to its input record — every field \
+             and tag preserved on the --rejects path"
+        );
+        assert!(!seen.contains(&key), "a reject record was written more than once");
+        seen.push(key);
+    }
+
+    assert_eq!(
+        seen.len(),
+        expected_rejects.len(),
+        "the rejects BAM must hold exactly the reads counted as rejected"
+    );
+    assert_eq!(
+        seen.len(),
+        stat("raw_reads_rejected"),
+        "the rejects BAM record count must equal raw_reads_rejected"
+    );
+
+    // The --rejects path preserves input order: `drain_marked_rejects` walks each group's
+    // records in input order (see `CodecConsensusCaller::drain_marked_rejects`), and this
+    // molecule is a single group, so both the single-threaded and pipeline paths emit the
+    // rejects in the order they appeared in the input. Assert the exact ordered sequence —
+    // including both the minority-alignment pair and the fragment reject — so a reordering
+    // regression on the mixed-rejection path cannot pass on membership and count alone.
+    let expected_reject_order: Vec<(Vec<u8>, u16)> = input_records
+        .iter()
+        .filter(|record| {
+            matches!(RawRecordView::new(record).read_name(), b"minority" | b"fragment")
+        })
+        .map(|record| {
+            let view = RawRecordView::new(record);
+            (view.read_name().to_vec(), view.flags())
+        })
+        .collect();
+    assert_eq!(
+        seen, expected_reject_order,
+        "the rejects BAM must emit the rejected reads in their original input order"
+    );
 }
 
 /// Test CODEC command with minimum duplex length filter.
