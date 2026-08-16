@@ -54,15 +54,17 @@ impl From<MethylationModeArg> for fgumi_consensus::MethylationMode {
 pub enum TieRuleArg {
     /// No-call a maximum separated from the runner-up by only a few ULPs.
     ///
-    /// The default. A separation that small is summation-order noise rather than evidence,
-    /// and the rule is independent of both read order and family depth.
+    /// A separation that small is summation-order noise rather than evidence, and the rule is
+    /// independent of both read order and family depth — the better rule on the merits, but
+    /// not the fgbio-compatible one, which is why it is not the default.
     #[value(name = "ulp-relative")]
     UlpRelative,
     /// Reproduce fgbio's tie rule exactly, defects included.
     ///
-    /// For byte-parity with fgbio output — chiefly cross-tool equivalency testing. Inherits
-    /// fgbio's order dependence and scale dependence, so it will call a base off one ULP of
-    /// accumulation noise.
+    /// The default: fgumi is a drop-in replacement for fgbio, so matching its output is the
+    /// contract. For byte-parity with fgbio output — chiefly cross-tool equivalency testing.
+    /// Inherits fgbio's order dependence and scale dependence, so it will call a base off one
+    /// ULP of accumulation noise.
     #[default]
     #[value(name = "fgbio-compat")]
     FgbioCompat,
@@ -681,7 +683,7 @@ impl Default for ConsensusCallingOptions {
             output_per_base_tags: true,
             trim: false,
             min_consensus_base_quality: 2,
-            tie_rule: TieRuleArg::default(),
+            tie_rule: TieRuleArg::FgbioCompat,
         }
     }
 }
@@ -2310,6 +2312,53 @@ mod tests {
     fn test_overlapping_bases_parsing(#[case] args: &[&str], #[case] expected: bool) {
         let cmd = TestBoolFlags::try_parse_from(args).expect("valid CLI args should parse");
         assert_eq!(cmd.overlapping.consensus_call_overlapping_bases, expected);
+    }
+
+    /// The tie-rule default is `fgbio-compat`, and all three declarations of it agree.
+    ///
+    /// It is declared three times, independently: `#[default]` on the [`TieRuleArg`]
+    /// variant, `default_value = "fgbio-compat"` on the `--tie-rule` arg, and the
+    /// hand-written [`ConsensusCallingOptions::default`]. Nothing tied them together,
+    /// which is how the variant doc came to claim `ulp-relative` was the default long
+    /// after #666 switched it — a wrong doc on the flag that decides whether fgumi
+    /// reproduces fgbio's base calls.
+    ///
+    /// Pinning the *value* matters as much as pinning the agreement: `fgbio-compat` is
+    /// a compatibility contract, so a silent flip would change consensus output on
+    /// near-ties rather than fail anything.
+    #[test]
+    fn tie_rule_defaults_to_fgbio_compat_everywhere() {
+        assert_eq!(
+            TieRuleArg::default(),
+            TieRuleArg::FgbioCompat,
+            "the #[default] variant must stay fgbio-compat",
+        );
+        assert_eq!(
+            TestBoolFlags::try_parse_from(["test"]).expect("no args parses").consensus.tie_rule,
+            TieRuleArg::FgbioCompat,
+            "clap's default_value must agree with the #[default] variant",
+        );
+        assert_eq!(
+            ConsensusCallingOptions::default().tie_rule,
+            TieRuleArg::FgbioCompat,
+            "the hand-written Default impl must agree too",
+        );
+    }
+
+    /// The two `TieRuleArg` variants must map onto the matching
+    /// [`fgumi_consensus::TieRule`] variants.
+    ///
+    /// The CLI enum mirrors the domain enum, so the `From` impl is the seam where a
+    /// mirrored pair could be crossed — and crossing them would silently select the
+    /// opposite tie rule rather than fail to compile.
+    #[rstest]
+    #[case::ulp_relative(TieRuleArg::UlpRelative, fgumi_consensus::TieRule::UlpRelative)]
+    #[case::fgbio_compat(TieRuleArg::FgbioCompat, fgumi_consensus::TieRule::FgbioCompat)]
+    fn tie_rule_arg_maps_onto_the_matching_domain_variant(
+        #[case] arg: TieRuleArg,
+        #[case] expected: fgumi_consensus::TieRule,
+    ) {
+        assert_eq!(fgumi_consensus::TieRule::from(arg), expected);
     }
 
     #[rstest]
