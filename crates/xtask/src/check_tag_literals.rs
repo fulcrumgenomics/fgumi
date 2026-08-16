@@ -17,7 +17,7 @@
 //! * **Payload allowlist** — specific 2-byte sequences that are known-good across the
 //!   rest of the codebase because they are not SAM aux-tag identifiers:
 //!   - SAM header sub-fields (`SO`, `GO`, `SS`) accepted by the noodles header API.
-//!   - Read-name fixtures (`q1`, `q2`, `r0`–`r4`, `rd`).
+//!   - Read-name fixtures (`q1`–`q3`, `r0`–`r4`, `rd`).
 //!   - 2-bp DNA sequence fragments (`AA`, `AC`, `AT`, …) used in sequence tests.
 //!   - Opaque test-fixture tag names (`XA`–`XY`, `x0`–`x9`, `ZZ`, `Zz`, …) used to
 //!     exercise SAM/BAM parsers without carrying semantic meaning.
@@ -65,7 +65,7 @@ const DIR_ALLOWLIST: &[&str] = &[
 const PAYLOAD_ALLOWLIST: &[&[u8; 2]] = &[
     // ---- SAM header sub-fields (noodles `other_fields` map key convention) ----
     b"SO", b"GO", b"SS", // ---- Read-name fixtures ----
-    b"q1", b"q2", b"r0", b"r1", b"r2", b"r3", b"r4", b"rd",
+    b"q1", b"q2", b"q3", b"r0", b"r1", b"r2", b"r3", b"r4", b"rd",
     // ---- 2-bp DNA sequence fragments used in sequence/UMI tests ----
     b"AA", b"AC", b"AG", b"AT", b"CA", b"CC", b"CG", b"GA", b"GC", b"GT", b"NN", b"TA", b"TC",
     b"TT",
