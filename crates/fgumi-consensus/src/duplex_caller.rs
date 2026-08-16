@@ -2023,10 +2023,11 @@ impl DuplexConsensusCaller {
 
         // Keep references to original raw records for later tag extraction.
         //
-        // `create_source_read` returns `None` for reads with absent qualities or that trim to zero
-        // length. The single-strand path counts those as `ZeroLengthAfterTrimming` and writes them;
-        // building the source vectors with a bare `filter_map` would drop them from both `--stats`
-        // and `--rejects` (#792). Collect the dropped raws — tagged with their index in the X/Y
+        // `create_source_read` returns `None` for reads that trim to zero length (reads with absent
+        // qualities return `Err`, propagated below via `?`). The single-strand path counts the
+        // zero-length reads as `ZeroLengthAfterTrimming` and writes them; building the source
+        // vectors with a bare `filter_map` would drop them from both `--stats` and `--rejects`
+        // (#792). Collect the dropped raws — tagged with their index in the X/Y
         // partition so their group ordinal can be recovered — and hand them to the sub-caller so
         // they drain through the same statistics/rejects path as its alignment-filter rejections.
         let x_raws: Vec<&RawRecord> = ab_r1s.iter().chain(ba_r2s.iter()).copied().collect();
@@ -2035,7 +2036,7 @@ impl DuplexConsensusCaller {
         let mut x_sources: Vec<SourceRead> = Vec::with_capacity(x_raws.len());
         for (i, r) in x_raws.iter().enumerate() {
             let mate_clip = bam_fields::num_bases_extending_past_mate_raw(r);
-            match ss_caller.create_source_read(r, i, mate_clip) {
+            match ss_caller.create_source_read(r, i, mate_clip)? {
                 Some(source) => x_sources.push(source),
                 None => x_zero_length.push((i, *r)),
             }
@@ -2046,7 +2047,7 @@ impl DuplexConsensusCaller {
         let mut y_sources: Vec<SourceRead> = Vec::with_capacity(y_raws.len());
         for (i, r) in y_raws.iter().enumerate() {
             let mate_clip = bam_fields::num_bases_extending_past_mate_raw(r);
-            match ss_caller.create_source_read(r, i, mate_clip) {
+            match ss_caller.create_source_read(r, i, mate_clip)? {
                 Some(source) => y_sources.push(source),
                 None => y_zero_length.push((i, *r)),
             }
@@ -4235,6 +4236,31 @@ mod tests {
         assert_eq!(
             tracked.rejection_reasons, untracked.rejection_reasons,
             "rejects tracking must not change the per-reason breakdown"
+        );
+        Ok(())
+    }
+
+    /// #794: the duplex path must also abort on a read with absent base qualities.
+    ///
+    /// `create_source_read` is reached through the single-strand caller when building the X/Y
+    /// source vectors; the error must propagate out of `consensus_reads` rather than the read being
+    /// silently dropped, matching fgbio and the vanilla path.
+    #[test]
+    fn test_absent_base_qualities_abort_duplex_consensus() -> Result<()> {
+        let mut caller = rejection_accounting_caller(vec![1], true)?;
+
+        let mut reads = duplex_molecule(2, false, false);
+        // One extra /A read with absent qualities (0xFF per base), which create_source_read rejects.
+        let mut b = SamBuilder::new();
+        let cigar_10m = &[encode_op(0, 10)];
+        let absent = &[0xFFu8; 10];
+        reads.push(ab_r1(&mut b, b"absent", b"AAAAAAAAAA", absent, cigar_10m, b"foo/A", &[]));
+        reads.push(ab_r2(&mut b, b"absent", b"CCCCCCCCCC", absent, cigar_10m, b"foo/A", &[]));
+
+        let result = caller.consensus_reads(reads);
+        assert!(
+            result.is_err(),
+            "a read with absent base qualities must abort the duplex path, not be silently dropped"
         );
         Ok(())
     }
