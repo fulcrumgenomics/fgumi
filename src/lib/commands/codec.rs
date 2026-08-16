@@ -309,6 +309,93 @@ pub struct Codec {
     pub queue_memory: QueueMemoryOptions,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CodecOptions — the stage's tuning knobs, projected out of the CLI struct
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Codec-stage tuning, independent of how the values were supplied.
+///
+/// See [`crate::commands::zipper::ZipperOptions`] for why this is a plain
+/// struct rather than a flattened `clap::Args`. Note that the consensus-calling
+/// knobs are held **flat** here even though [`Codec`] nests them behind
+/// `#[command(flatten)]` sub-structs: the chain builder wants one bag per stage,
+/// not a re-run of the CLI's grouping.
+#[derive(Debug, Clone)]
+pub struct CodecOptions {
+    /// Pre-UMI error rate (phred).
+    pub error_rate_pre_umi: u8,
+    /// Post-UMI error rate (phred).
+    pub error_rate_post_umi: u8,
+    /// Minimum input base quality.
+    pub min_input_base_quality: u8,
+    /// Emit per-base consensus tags.
+    pub output_per_base_tags: bool,
+    /// Trim consensus reads.
+    pub trim: bool,
+    /// Minimum consensus base quality.
+    pub min_consensus_base_quality: u8,
+    /// How to resolve a near-tie between the two most likely consensus bases.
+    pub tie_rule: fgumi_consensus::TieRule,
+    /// Minimum reads per consensus.
+    pub min_reads: usize,
+    /// Cap on reads per consensus.
+    pub max_reads: Option<usize>,
+    /// Minimum duplex overlap length.
+    pub min_duplex_length: usize,
+    /// Quality cap for single-strand positions.
+    pub single_strand_qual: Option<u8>,
+    /// Quality cap for outer bases.
+    pub outer_bases_qual: Option<u8>,
+    /// How many bases count as outer.
+    pub outer_bases_length: usize,
+    /// Maximum duplex disagreement rate.
+    pub max_duplex_disagreement_rate: f64,
+    /// Maximum duplex disagreements.
+    pub max_duplex_disagreements: Option<usize>,
+    /// Let fully-unmapped primary templates through the pre-group filter.
+    ///
+    /// Carried as the whole flattened sub-struct, like `io` / `rejects_opts` /
+    /// `read_group`, rather than as a bare `bool`.
+    pub allow_unmapped: AllowUnmappedOptions,
+    /// Input/output paths and reader mode.
+    pub io: BamIoOptions,
+    /// Optional rejects output.
+    pub rejects_opts: RejectsOptions,
+    /// Optional stats output.
+    pub stats_opts: StatsOptions,
+    /// Read-group identity for emitted reads.
+    pub read_group: ReadGroupOptions,
+}
+
+impl Codec {
+    /// Project the parsed CLI flags into [`CodecOptions`].
+    #[must_use]
+    pub fn to_codec_options(&self) -> CodecOptions {
+        CodecOptions {
+            error_rate_pre_umi: self.consensus.error_rate_pre_umi,
+            error_rate_post_umi: self.consensus.error_rate_post_umi,
+            min_input_base_quality: self.consensus.min_input_base_quality,
+            output_per_base_tags: self.consensus.output_per_base_tags,
+            trim: self.consensus.trim,
+            min_consensus_base_quality: self.consensus.min_consensus_base_quality,
+            tie_rule: self.consensus.tie_rule.into(),
+            min_reads: self.min_reads,
+            max_reads: self.max_reads,
+            min_duplex_length: self.min_duplex_length,
+            single_strand_qual: self.single_strand_qual,
+            outer_bases_qual: self.outer_bases_qual,
+            outer_bases_length: self.outer_bases_length,
+            max_duplex_disagreement_rate: self.max_duplex_disagreement_rate,
+            max_duplex_disagreements: self.max_duplex_disagreements,
+            allow_unmapped: self.allow_unmapped.clone(),
+            io: self.io.clone(),
+            rejects_opts: self.rejects_opts.clone(),
+            stats_opts: self.stats_opts.clone(),
+            read_group: self.read_group.clone(),
+        }
+    }
+}
+
 /// Decide how the single-thread codec loop should handle a typed
 /// [`CodecConsensusError`]: silently swallow recoverable duplex-disagreement
 /// rejects (so the loop continues) and surface any other variant as a fatal
@@ -889,6 +976,125 @@ impl Codec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every tuning flag must survive the projection into [`CodecOptions`].
+    /// See the simplex counterpart for why this parses rather than constructs.
+    ///
+    /// Every value here is deliberately **non-default**, and every field of
+    /// `CodecOptions` is asserted. Both halves matter: an assertion that
+    /// compares a default against a default passes even when the projection
+    /// ignores the parsed field entirely, and a field left unasserted can be
+    /// dropped from the projection without any test noticing.
+    #[test]
+    fn to_codec_options_carries_every_tuning_flag() {
+        let cmd = Codec::try_parse_from([
+            "codec",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--error-rate-pre-umi",
+            "42",
+            "--error-rate-post-umi",
+            "37",
+            "--min-input-base-quality",
+            "16",
+            "--output-per-base-tags=false",
+            "--trim=true",
+            "--min-consensus-base-quality",
+            "23",
+            "--tie-rule",
+            "ulp-relative",
+            "--min-reads",
+            "4",
+            "--max-reads",
+            "88",
+            "--min-duplex-length",
+            "9",
+            "--single-strand-qual",
+            "12",
+            "--outer-bases-qual",
+            "15",
+            "--outer-bases-length",
+            "7",
+            "--max-duplex-disagreement-rate",
+            "0.25",
+            "--max-duplex-disagreements",
+            "6",
+            "--rejects",
+            "rej.bam",
+            "--stats",
+            "stats.txt",
+            "--read-group-id",
+            "Z",
+            "--read-name-prefix",
+            "pfx",
+            "--allow-unmapped=true",
+        ])
+        .expect("parses");
+
+        let opts = cmd.to_codec_options();
+
+        assert_eq!(opts.error_rate_pre_umi, 42);
+        assert_eq!(opts.error_rate_post_umi, 37);
+        assert_eq!(opts.min_input_base_quality, 16);
+        assert!(!opts.output_per_base_tags, "an explicit false must not be lost");
+        assert!(opts.trim);
+        assert_eq!(opts.min_consensus_base_quality, 23);
+        assert_eq!(
+            opts.tie_rule,
+            fgumi_consensus::TieRule::UlpRelative,
+            "--tie-rule must reach the projection"
+        );
+        assert_eq!(opts.min_reads, 4);
+        assert_eq!(opts.max_reads, Some(88));
+        assert_eq!(opts.min_duplex_length, 9);
+        assert_eq!(opts.single_strand_qual, Some(12));
+        assert_eq!(opts.outer_bases_qual, Some(15));
+        assert_eq!(opts.outer_bases_length, 7);
+        assert!((opts.max_duplex_disagreement_rate - 0.25).abs() < f64::EPSILON);
+        assert_eq!(opts.max_duplex_disagreements, Some(6));
+        assert!(opts.allow_unmapped.enabled, "--allow-unmapped must reach the projection");
+        // The flattened sub-structs must come across whole, not field by field.
+        assert_eq!(opts.io.input, std::path::PathBuf::from("in.bam"));
+        assert_eq!(opts.io.output, std::path::PathBuf::from("out.bam"));
+        assert_eq!(opts.rejects_opts.rejects, Some(std::path::PathBuf::from("rej.bam")));
+        assert_eq!(opts.stats_opts.stats, Some(std::path::PathBuf::from("stats.txt")));
+        assert_eq!(opts.read_group.read_group_id, "Z");
+        assert_eq!(opts.read_group.read_name_prefix, Some("pfx".to_string()));
+    }
+
+    /// The projection must carry defaults faithfully too — a field hard-coded to
+    /// the value the non-default test happens to pass would slip through it.
+    #[test]
+    fn to_codec_options_carries_defaults() {
+        let cmd =
+            Codec::try_parse_from(["codec", "-i", "in.bam", "-o", "out.bam"]).expect("parses");
+
+        let opts = cmd.to_codec_options();
+
+        assert_eq!(opts.error_rate_pre_umi, 45);
+        assert_eq!(opts.error_rate_post_umi, 40);
+        assert_eq!(opts.min_input_base_quality, 10);
+        assert!(opts.output_per_base_tags);
+        assert!(!opts.trim);
+        assert_eq!(opts.min_consensus_base_quality, 2);
+        assert_eq!(opts.tie_rule, fgumi_consensus::TieRule::FgbioCompat);
+        assert_eq!(opts.min_reads, 1);
+        assert_eq!(opts.max_reads, None);
+        assert_eq!(opts.min_duplex_length, 1);
+        assert_eq!(opts.single_strand_qual, None);
+        assert_eq!(opts.outer_bases_qual, None);
+        assert_eq!(opts.outer_bases_length, 5);
+        assert!((opts.max_duplex_disagreement_rate - 1.0).abs() < f64::EPSILON);
+        assert_eq!(opts.max_duplex_disagreements, None);
+        assert!(!opts.allow_unmapped.enabled);
+        assert_eq!(opts.rejects_opts.rejects, None);
+        assert_eq!(opts.stats_opts.stats, None);
+        assert_eq!(opts.read_group.read_group_id, "A");
+        assert_eq!(opts.read_group.read_name_prefix, None);
+    }
+
     use noodles::sam::alignment::io::Write as AlignmentWrite;
     use rstest::rstest;
     use std::path::PathBuf;
