@@ -219,6 +219,74 @@ fn test_content_mode_different_mi_tags() {
     );
 }
 
+/// The reported `Content diffs:` count must say how much of the file it covers whenever
+/// pairing stopped early (fulcrumgenomics/fgumi#747). Here the two files agree on records
+/// 0 and 1 and desync at record 2, so the content comparison examined two records and
+/// found no diff — `Content diffs: 0` on its own would read as "these files have no
+/// content differences", which is the line that gets copied into summaries.
+///
+/// Driven through the real CLI rather than the formatter's unit tests because the defect
+/// being pinned is the *wiring*: a report that formats the qualifier correctly but passes
+/// `None` for the stop index is exactly the reported bug, and it would leave those unit
+/// tests green.
+#[test]
+fn test_content_mode_report_qualifies_diff_count_when_pairing_stopped_early() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    let shared = vec![mapped_record(b"read1", 100), mapped_record(b"read2", 200)];
+    let mut records1 = shared.clone();
+    records1.push(mapped_record(b"read3", 300));
+    let mut records2 = shared;
+    records2.push(mapped_record(b"read4", 300));
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &records1);
+    write_bam(&bam2, &header, &records2);
+
+    let (code, stdout, _stderr) = run_compare(&bam1, &bam2, "content", &[]);
+    assert_eq!(code, Some(1), "a desync must still DIFFER, stdout:\n{stdout}");
+    let content_diffs_line = stdout
+        .lines()
+        .find(|line| line.starts_with("Content diffs: "))
+        .unwrap_or_else(|| panic!("expected a `Content diffs: ` line, got:\n{stdout}"));
+    assert_eq!(
+        content_diffs_line,
+        "Content diffs: 0 (of 2 records compared before pairing stopped)"
+    );
+}
+
+/// The counterpart to the test above: when pairing runs to completion the count needs no
+/// qualifier, so the line must stay exactly what downstream tooling has always grepped.
+/// Both files here differ at record 1 in position only — same `RecordKey`, so pairing
+/// never stops and the single content diff covers every paired record.
+#[test]
+fn test_content_mode_report_leaves_diff_count_unqualified_when_pairing_completed() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    let records1 = vec![mapped_record(b"read1", 100), mapped_record(b"read2", 200)];
+    let records2 = vec![mapped_record(b"read1", 100), mapped_record(b"read2", 250)];
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &records1);
+    write_bam(&bam2, &header, &records2);
+
+    let (code, stdout, _stderr) = run_compare(&bam1, &bam2, "content", &[]);
+    assert_eq!(code, Some(1), "a content diff must DIFFER, stdout:\n{stdout}");
+    let content_diffs_line = stdout
+        .lines()
+        .find(|line| line.starts_with("Content diffs: "))
+        .unwrap_or_else(|| panic!("expected a `Content diffs: ` line, got:\n{stdout}"));
+    assert_eq!(content_diffs_line, "Content diffs: 1");
+    assert!(
+        !stdout.contains("pairing stopped"),
+        "no key mismatch here, so nothing may claim pairing stopped:\n{stdout}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Grouping mode tests
 // ---------------------------------------------------------------------------
