@@ -318,6 +318,11 @@ pub fn log_comprehensive_memory_stats(stats: &PipelineStats) {
 
     // Main memory line with RSS vs tracked accuracy
     if breakdown.system_rss_gb > 0.0 {
+        // rationale: an integer percentage for a log line. The ratio is non-negative
+        // (this branch is guarded by `system_rss_gb > 0.0` and tracked totals are
+        // non-negative), so truncating toward zero and dropping the (never-present) sign
+        // is the intended display behavior.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pct = (breakdown.tracked_total_gb / breakdown.system_rss_gb * 100.0) as u32;
         log::info!(
             "MEMORY: RSS={:.1}GB Tracked={:.1}GB ({}%) | Queue: Q1:{:.0}MB Q2:{:.0}MB Q3:{:.0}MB Q4:{:.1}GB Q5:{:.1}GB Q6:{:.0}MB Q7:{:.0}MB | Proc: Pos={:.1}GB Tmpl={:.1}GB | Infra={:.0}MB",
@@ -354,6 +359,11 @@ pub fn log_comprehensive_memory_stats(stats: &PipelineStats) {
 
     // Untracked memory details (only if RSS is available)
     if breakdown.system_rss_gb > 0.0 {
+        // rationale: an integer percentage for a log line. The ratio is non-negative
+        // (this branch is guarded by `system_rss_gb > 0.0` and `untracked_gb` is a
+        // saturating subtraction, so never negative), so truncating toward zero and
+        // dropping the (never-present) sign is the intended display behavior.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let untracked_pct = ((breakdown.untracked_gb / breakdown.system_rss_gb) * 100.0) as u32;
         if breakdown.untracked_gb > 1.0 {
             log::info!(
@@ -4086,6 +4096,12 @@ impl PipelineStats {
     }
 
     /// Get current memory breakdown
+    // rationale: every cast below converts a `u64` byte count to an `f64` number of
+    // gigabytes/megabytes purely for the human-readable memory-debug log lines. Real RSS
+    // and queue sizes are far below `f64`'s 2^52-byte exact-integer limit (4 PiB), so the
+    // precision loss is unobservable and the truncated GB/MB figure is exactly what we want
+    // to display.
+    #[allow(clippy::cast_precision_loss)]
     pub fn get_memory_breakdown(&self) -> MemoryBreakdown {
         let m = &self.memory;
 
