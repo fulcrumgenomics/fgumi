@@ -16,6 +16,7 @@ pub mod dedup;
 pub mod duplex;
 pub mod float;
 pub mod group;
+pub mod library_size;
 pub mod rejection;
 pub mod shared;
 pub mod simplex;
