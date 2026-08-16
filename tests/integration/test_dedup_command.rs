@@ -488,6 +488,292 @@ fn test_dedup_command_single_library_metrics_has_unknown_and_total_rows() {
     assert_eq!(rows[0]["total_templates"], rows[1]["total_templates"]);
 }
 
+/// Dedup over a two-library input with `--duplication-ladder` and a small
+/// `--ladder-interval`, verifying per-library snapshot rows are correct.
+///
+/// libA gets three duplicate-group positions with `count` = 3, 2, 2 pairs
+/// (spaced far enough apart to fall in distinct position groups). Per
+/// [`test_dedup_command_per_library_metrics`]'s documented shape, each
+/// position's mate groups (R1 then R2, in coordinate order) each contribute
+/// `count` templates, so libA's cumulative per-group `templates_seen`
+/// sequence is 3, 6, 8, 10, 12, 14 (true total 14). With `--ladder-interval
+/// 4`, thresholds are crossed at cumulative values 6, 8, 12 — three interval
+/// rows — and the true total (14) does not land on a crossing, so a fourth,
+/// final row is appended at 14: four rows total.
+///
+/// libB gets two duplicate-group positions with `count` = 2 each, giving the
+/// cumulative sequence 2, 4, 6, 8 (true total 8). Thresholds are crossed at 4
+/// and 8 — two interval rows — and the second crossing lands exactly on the
+/// true total, so no extra final row is appended: two rows total.
+#[test]
+fn test_dedup_duplication_ladder_multi_library() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+    let ladder_path = temp_dir.path().join("ladder.txt");
+
+    let header = create_multi_library_header("chr1", 10000);
+    let mut records = create_duplicate_group_with_rg("libA_p1", "AAAAAAAA", 3, 100, "RG1");
+    records.extend(create_duplicate_group_with_rg("libA_p2", "CCCCCCCC", 2, 500, "RG1"));
+    records.extend(create_duplicate_group_with_rg("libA_p3", "GGGGGGGG", 2, 900, "RG1"));
+    records.extend(create_duplicate_group_with_rg("libB_p1", "TTTTTTTT", 2, 1300, "RG2"));
+    records.extend(create_duplicate_group_with_rg("libB_p2", "ACACACAC", 2, 1700, "RG2"));
+    create_sorted_bam_with_header(&input_bam, &header, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--duplication-ladder",
+        ladder_path.to_str().unwrap(),
+        "--ladder-interval",
+        "4",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command with duplication ladder failed");
+
+    assert!(ladder_path.exists(), "duplication ladder file must be created when requested");
+
+    let metrics_rows = read_dedup_metrics_rows(&metrics_path);
+    let metrics_by_library: std::collections::HashMap<
+        &str,
+        &std::collections::HashMap<String, String>,
+    > = metrics_rows.iter().map(|r| (r["library"].as_str(), r)).collect();
+
+    let ladder_rows = read_dedup_metrics_rows(&ladder_path);
+
+    // Expected snapshot sequence per library, pinned exactly (not merely by row
+    // count) so a regression that emitted the right number of rows at the wrong
+    // interval crossings is still caught: libA crosses the interval at 6, 8, 12,
+    // then gets a final row at its true total (14), which doesn't land on a
+    // crossing — 4 rows. libB crosses at 4 and 8, with 8 landing exactly on its
+    // true total, so no extra final row — 2 rows.
+    // Every snapshot row is pinned exactly — both `templates_seen` and the
+    // cumulative `duplicate_fraction` (as `(numerator, denominator)`) — so a
+    // regression that emits the right row count at the wrong interval crossings,
+    // reorders the library rows, or writes the wrong intermediate saturation
+    // values is caught, not just one with a wrong final row. libA crosses the
+    // interval at 6, 8, 12, then gets a final row at its true total (14), which
+    // doesn't land on a crossing — 4 rows. libB crosses at 4 and 8, with 8
+    // landing exactly on its true total, so no extra final row — 2 rows.
+    // Per snapshot row, keyed by library: (templates_seen, (duplicate
+    // numerator, denominator)), pinned so the table reads as a spec.
+    #[expect(clippy::type_complexity, reason = "an inline pinned table of expected rows")]
+    let expected_sequences: [(&str, &[(u64, (u64, u64))]); 2] = [
+        ("libA", &[(6, (4, 6)), (8, (5, 8)), (12, (7, 12)), (14, (8, 14))]),
+        ("libB", &[(4, (2, 4)), (8, (4, 8))]),
+    ];
+    let mut matched_row_count = 0usize;
+
+    // For each library: every row's templates_seen and duplicate_fraction match
+    // the pinned sequence in file order, the last row's templates_seen equals
+    // the true per-library total (from the metrics file), and the last row's
+    // duplicate_fraction matches the metrics file's template-level
+    // duplicate_rate exactly (both are the same cumulative
+    // duplicate_templates / total_templates ratio).
+    for (library, expected_rows) in expected_sequences {
+        let rows: Vec<_> = ladder_rows.iter().filter(|r| r["library"] == library).collect();
+        matched_row_count += rows.len();
+
+        assert_eq!(
+            rows.len(),
+            expected_rows.len(),
+            "{library}: expected {} ladder rows: {rows:?}",
+            expected_rows.len()
+        );
+
+        for (row, &(expected_seen, (num, den))) in rows.iter().zip(expected_rows) {
+            let seen: u64 = row["templates_seen"].parse().expect("templates_seen is u64");
+            assert_eq!(
+                seen, expected_seen,
+                "{library}: snapshot must land on the derived interval crossing: {row:?}"
+            );
+            let duplicate_fraction: f64 =
+                row["duplicate_fraction"].parse().expect("duplicate_fraction is f64");
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "numerator and denominator are small test constants (< 100)"
+            )]
+            let expected_fraction = num as f64 / den as f64;
+            assert!(
+                (duplicate_fraction - expected_fraction).abs() < 1e-9,
+                "{library}: row duplicate_fraction ({duplicate_fraction}) must equal \
+                 {num}/{den} ({expected_fraction}): {row:?}"
+            );
+        }
+
+        let last_row = rows.last().unwrap_or_else(|| panic!("{library}: no ladder rows emitted"));
+        let library_metrics = metrics_by_library[library];
+        assert_eq!(
+            last_row["templates_seen"], library_metrics["total_templates"],
+            "{library}: final ladder snapshot must land at the true per-library total: {last_row:?}"
+        );
+
+        let expected_fraction: f64 =
+            library_metrics["duplicate_rate"].parse().expect("duplicate_rate is f64");
+        let actual_fraction: f64 =
+            last_row["duplicate_fraction"].parse().expect("duplicate_fraction is f64");
+        assert!(
+            (actual_fraction - expected_fraction).abs() < 1e-9,
+            "{library}: final duplicate_fraction ({actual_fraction}) must match the metrics \
+             file's cumulative duplicate_rate ({expected_fraction})"
+        );
+    }
+
+    assert_eq!(
+        matched_row_count,
+        ladder_rows.len(),
+        "the ladder is inherently per-library: no unexpected library names: {ladder_rows:?}"
+    );
+}
+
+/// Without `--duplication-ladder`, no ladder file is written and dedup's
+/// ordinary behavior is unaffected (mirrors [`test_dedup_command_basic`]).
+#[test]
+fn test_dedup_duplication_ladder_off_by_default() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ladder_path = temp_dir.path().join("ladder_never_written.txt");
+
+    let mut records = create_duplicate_group("dup1", "ACGTACGT", 3, 100);
+    records.extend(create_duplicate_group("dup2", "TGCATGCA", 2, 500));
+    create_sorted_bam(&input_bam, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command without duplication ladder failed");
+
+    assert!(output_bam.exists(), "Output BAM not created");
+    assert!(
+        !ladder_path.exists(),
+        "duplication ladder file must not be created when --duplication-ladder is not passed"
+    );
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let count = reader.records().count();
+    assert_eq!(count, 10, "All reads should be in output (marked, not removed)");
+}
+
+/// Regression test: a single position group whose template increment is
+/// large enough to leap past more than one `--ladder-interval` multiple in a
+/// single `DuplicationLadderRecorder::record` call must still emit only one
+/// row per call, not one row per crossed multiple.
+///
+/// A single 10-pair duplicate group (no `@RG`, so library = "Unknown
+/// Library") with `--ladder-interval 3` produces two position groups (R1
+/// then R2, in coordinate order), each contributing 10 templates in one
+/// `record()` call — each call alone crosses three interval multiples (the
+/// first call crosses 3, 6, 9; the second crosses 12, 15, 18). Before the fix
+/// this produced duplicate rows `[10, 10, 10, 20, 20, 20]`; after the fix it
+/// must produce exactly `[10, 20]`.
+#[test]
+fn test_dedup_duplication_ladder_single_group_exceeds_interval() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+    let ladder_path = temp_dir.path().join("ladder.txt");
+
+    let records = create_duplicate_group("dup1", "ACGTACGT", 10, 100);
+    create_sorted_bam(&input_bam, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--duplication-ladder",
+        ladder_path.to_str().unwrap(),
+        "--ladder-interval",
+        "3",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command with duplication ladder failed");
+
+    let metrics_rows = read_dedup_metrics_rows(&metrics_path);
+    let unknown_library = metrics_rows
+        .iter()
+        .find(|r| r["library"] == "Unknown Library")
+        .expect("Unknown Library row present");
+
+    let ladder_rows = read_dedup_metrics_rows(&ladder_path);
+    let templates_seen: Vec<u64> = ladder_rows
+        .iter()
+        .map(|r| r["templates_seen"].parse().expect("templates_seen is u64"))
+        .collect();
+
+    assert_eq!(
+        templates_seen,
+        vec![10, 20],
+        "a single group whose increment leaps past more than one interval \
+         multiple must still emit exactly one row per record() call, not one \
+         row per crossed multiple (regression: previously produced \
+         [10, 10, 10, 20, 20, 20]): {ladder_rows:?}"
+    );
+
+    // Redundant with the exact-sequence check above, but states the general
+    // invariant explicitly: no duplicate/non-increasing templates_seen.
+    for window in templates_seen.windows(2) {
+        assert!(
+            window[1] > window[0],
+            "templates_seen must be strictly increasing: {templates_seen:?}"
+        );
+    }
+
+    // Pin the intermediate row's fraction too, not just the final one: the
+    // first snapshot lands at 10 templates_seen with 9 cumulative duplicates.
+    let first_row = ladder_rows.first().expect("at least one ladder row");
+    let first_fraction: f64 =
+        first_row["duplicate_fraction"].parse().expect("duplicate_fraction is f64");
+    assert!(
+        (first_fraction - 9.0 / 10.0).abs() < 1e-9,
+        "the first snapshot's duplicate_fraction must be 9/10: {first_row:?}"
+    );
+
+    let last_row = ladder_rows.last().expect("at least one ladder row");
+    assert_eq!(
+        last_row["templates_seen"], unknown_library["total_templates"],
+        "final ladder snapshot must land at the true total: {last_row:?}"
+    );
+    let expected_fraction: f64 =
+        unknown_library["duplicate_rate"].parse().expect("duplicate_rate is f64");
+    let actual_fraction: f64 =
+        last_row["duplicate_fraction"].parse().expect("duplicate_fraction is f64");
+    assert!(
+        (actual_fraction - expected_fraction).abs() < 1e-9,
+        "final duplicate_fraction ({actual_fraction}) must match the metrics \
+         file's cumulative duplicate_rate ({expected_fraction})"
+    );
+}
+
 /// Test dedup command with remove-duplicates flag.
 #[test]
 fn test_dedup_command_remove_duplicates() {

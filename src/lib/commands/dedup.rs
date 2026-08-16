@@ -26,7 +26,7 @@ use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use crate::grouper::{RawPositionGroup, RecordPositionGrouper, build_templates_from_records};
 use crate::logging::OperationTimer;
 use crate::metrics::group::FamilySizeMetrics;
-use crate::metrics::{DeduplicationCounts, DeduplicationMetrics};
+use crate::metrics::{DeduplicationCounts, DeduplicationMetrics, DuplicationLadderMetrics};
 use crate::metrics::{TemplateFilterCounts, TemplateFilterReason};
 use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
@@ -196,6 +196,113 @@ struct CollectedDedupCounts {
     /// Family size counts, global across all libraries (out of scope for
     /// per-library splitting).
     family_sizes: AHashMap<usize, u64>,
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Duplication saturation ladder (--duplication-ladder)
+//////////////////////////////////////////////////////////////////////////////
+
+/// Per-library cumulative counters and emitted snapshot rows backing
+/// `--duplication-ladder`.
+///
+/// # Ordering
+///
+/// A saturation curve plots "after N templates processed, in coordinate
+/// order, what cumulative fraction were duplicates" — so [`Self::record`]
+/// MUST be called in strict serial/coordinate order, one call per position
+/// group. It is wired into the `mi_assign_fn` hook installed on the pipeline
+/// (`run_bam_pipeline_from_reader_with_mi_assign`), which the pipeline
+/// harness runs in serial order by the MI Assign zone before each item's
+/// `serialize_fn`. `dedup` installs this hook unconditionally — not gated on
+/// `--no-umi`, strategy, or any other flag — so it runs for every position
+/// group in every mode, making it the correct accumulation point. Do NOT
+/// accumulate this in `serialize_fn`: that closure also runs once per group,
+/// but workers execute it in parallel completion order, not coordinate order.
+#[derive(Default)]
+struct DuplicationLadderRecorder {
+    /// Snapshot interval in cumulative templates (`--ladder-interval`).
+    interval: u64,
+    /// Per-library running totals and next snapshot threshold.
+    per_library: AHashMap<u16, LadderLibraryState>,
+    /// Emitted `(library_idx, templates_seen, duplicate_templates)` rows, in
+    /// emission order (interval crossings interleaved across libraries as
+    /// groups are processed, plus the final per-library rows appended by
+    /// [`Self::finish`]). Sorted into deterministic (library, `templates_seen`)
+    /// order only at write time.
+    rows: Vec<(u16, u64, u64)>,
+}
+
+/// Running cumulative state for one library's saturation ladder.
+#[derive(Default)]
+struct LadderLibraryState {
+    /// Cumulative templates seen so far for this library.
+    templates_seen: u64,
+    /// Cumulative duplicate templates seen so far for this library.
+    duplicate_templates: u64,
+    /// Next cumulative `templates_seen` value that triggers a snapshot row.
+    next_threshold: u64,
+    /// `templates_seen` at the last emitted row, used by [`Self::finish`] (via
+    /// [`DuplicationLadderRecorder::finish`]) to avoid a duplicate final row
+    /// when the true total already landed exactly on an interval crossing.
+    last_emitted_at: u64,
+}
+
+impl DuplicationLadderRecorder {
+    fn new(interval: u64) -> Self {
+        Self { interval, per_library: AHashMap::new(), rows: Vec::new() }
+    }
+
+    /// Adds one position group's per-library template/duplicate counts.
+    ///
+    /// A position group always belongs to a single library (library
+    /// partitions the grouping key), so `group_counts`'s counts belong
+    /// entirely to `library_idx`. Emits at most one snapshot row per call,
+    /// the moment cumulative `templates_seen` reaches or passes a multiple of
+    /// `interval` — even when a single group's increment is large enough to
+    /// leap past more than one multiple at once (a small `--ladder-interval`
+    /// against a large position group), only one row is emitted, at the
+    /// group's true cumulative total, and `next_threshold` is re-based to the
+    /// next multiple strictly above it.
+    ///
+    /// MUST be called in serial/coordinate order — see the ordering note on
+    /// [`DuplicationLadderRecorder`].
+    fn record(&mut self, library_idx: u16, group_counts: &DedupCounts) {
+        if group_counts.total_templates == 0 {
+            return;
+        }
+        let interval = self.interval;
+        let state = self.per_library.entry(library_idx).or_insert_with(|| LadderLibraryState {
+            templates_seen: 0,
+            duplicate_templates: 0,
+            next_threshold: interval,
+            last_emitted_at: 0,
+        });
+        state.templates_seen += group_counts.total_templates;
+        state.duplicate_templates += group_counts.duplicate_templates;
+        // At most one row per `record()` call, even if this group's increment
+        // is large enough to cross more than one `interval` multiple at once
+        // (e.g. a single big position group with a small `--ladder-interval`).
+        // Jump `next_threshold` to the first multiple of `interval` strictly
+        // above the new cumulative `templates_seen` rather than a single
+        // `+= interval` step, so the next crossing check is correct instead
+        // of re-firing on the very next call.
+        if state.templates_seen >= state.next_threshold {
+            self.rows.push((library_idx, state.templates_seen, state.duplicate_templates));
+            state.last_emitted_at = state.templates_seen;
+            state.next_threshold =
+                state.templates_seen - (state.templates_seen % interval) + interval;
+        }
+    }
+
+    /// Emits a final snapshot per library at its true total, unless the last
+    /// interval snapshot already landed exactly on that total.
+    fn finish(&mut self) {
+        for (&library_idx, state) in &self.per_library {
+            if state.templates_seen > state.last_emitted_at {
+                self.rows.push((library_idx, state.templates_seen, state.duplicate_templates));
+            }
+        }
+    }
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -962,6 +1069,19 @@ pub struct MarkDuplicates {
     #[arg(short = 'H', long = "family-size-histogram")]
     pub family_size_histogram: Option<PathBuf>,
 
+    /// Path to write the sampled duplication saturation ladder: per-library
+    /// cumulative duplicate fraction vs. templates seen (in coordinate
+    /// order), snapshotted every `--ladder-interval` templates. Off by
+    /// default (no recorder is built, so no added work).
+    #[arg(long = "duplication-ladder")]
+    pub duplication_ladder: Option<PathBuf>,
+
+    /// Snapshot interval (in per-library cumulative templates) for
+    /// `--duplication-ladder`. Only meaningful when `--duplication-ladder`
+    /// is set.
+    #[arg(long = "ladder-interval", default_value = "1000000", value_parser = clap::value_parser!(u64).range(1..))]
+    pub ladder_interval: u64,
+
     /// Remove duplicates instead of just marking them
     #[arg(short = 'r', long = "remove-duplicates", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub remove_duplicates: bool,
@@ -1178,6 +1298,17 @@ impl Command for MarkDuplicates {
         // its final value.
         let next_mi_base_for_hook = Arc::new(AtomicU64::new(0));
 
+        // Duplication saturation ladder recorder (--duplication-ladder). `None`
+        // when the flag is off, so the hook below does zero added work
+        // (a single `Option` check, no lock, no allocation) — see the ordering
+        // note on `DuplicationLadderRecorder` for why this must be populated
+        // from the serial MI Assign hook rather than `serialize_fn`.
+        let duplication_ladder_recorder: Option<Arc<Mutex<DuplicationLadderRecorder>>> = self
+            .duplication_ladder
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(DuplicationLadderRecorder::new(self.ladder_interval))));
+        let duplication_ladder_recorder_for_hook = duplication_ladder_recorder.clone();
+
         // Run the pipeline
         let _records_processed = run_bam_pipeline_from_reader_with_mi_assign(
             pipeline_config,
@@ -1287,6 +1418,17 @@ impl Command for MarkDuplicates {
                 for template in &mut processed.templates {
                     template.mi = template.mi.with_offset(base);
                 }
+
+                // Accumulate the duplication saturation ladder here, in this
+                // same serial/coordinate-order hook — not in `serialize_fn`,
+                // which runs in parallel completion order. See the ordering
+                // note on `DuplicationLadderRecorder`. `dedup_counts` belongs
+                // entirely to `processed.library_idx` (a position group is
+                // always single-library).
+                if let Some(recorder) = &duplication_ladder_recorder_for_hook {
+                    recorder.lock().record(processed.library_idx, &processed.dedup_counts);
+                }
+
                 Ok(())
             },
         )?;
@@ -1318,6 +1460,19 @@ impl Command for MarkDuplicates {
         // Write family size histogram
         if let Some(histogram_path) = &self.family_size_histogram {
             write_family_size_histogram(&final_family_sizes, histogram_path)?;
+        }
+
+        // Write duplication saturation ladder
+        if let Some(path) = &self.duplication_ladder {
+            let mut recorder = Arc::try_unwrap(duplication_ladder_recorder.expect(
+                "bug: duplication_ladder_recorder must be Some when --duplication-ladder is set",
+            ))
+            .unwrap_or_else(|_| {
+                panic!("bug: duplication ladder recorder Arc still shared after pipeline join")
+            })
+            .into_inner();
+            recorder.finish();
+            write_duplication_ladder(&recorder, &library_index_for_metrics, path)?;
         }
 
         // Log summary
@@ -1403,6 +1558,32 @@ fn write_family_size_histogram(family_sizes: &AHashMap<usize, u64>, path: &PathB
     DelimFile::default()
         .write_tsv(path, metrics)
         .with_context(|| format!("Failed to write family size histogram: {}", path.display()))?;
+    Ok(())
+}
+
+/// Writes the `--duplication-ladder` TSV: one row per (library, snapshot),
+/// sorted deterministically by library name then ascending `templates_seen`.
+fn write_duplication_ladder(
+    recorder: &DuplicationLadderRecorder,
+    library_index: &LibraryIndex,
+    path: &PathBuf,
+) -> Result<()> {
+    let mut rows: Vec<DuplicationLadderMetrics> = recorder
+        .rows
+        .iter()
+        .map(|&(idx, templates_seen, duplicate_templates)| {
+            DuplicationLadderMetrics::new(
+                library_display_name(idx, library_index),
+                templates_seen,
+                duplicate_templates,
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| a.library.cmp(&b.library).then(a.templates_seen.cmp(&b.templates_seen)));
+
+    DelimFile::default()
+        .write_tsv(path, rows)
+        .with_context(|| format!("Failed to write duplication ladder: {}", path.display()))?;
     Ok(())
 }
 
