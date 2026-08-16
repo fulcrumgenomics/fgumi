@@ -9,7 +9,7 @@ use clap::Parser;
 use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::duplex::Duplex;
 use fgumi_lib::sam::SamTag;
-use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
+use fgumi_raw_bam::{RawRecord, RawRecordView, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use rstest::rstest;
@@ -55,10 +55,36 @@ fn create_duplex_read_pair_with_sequences(
     ref_start: i32,
     is_b_strand: bool,
 ) -> (RawRecord, RawRecord) {
+    let cigar_ops = [u32::try_from(r1_sequence.len()).expect("read_len fits u32") << 4];
+    create_duplex_read_pair_with_cigar(
+        name,
+        mi_tag,
+        r1_sequence,
+        r2_sequence,
+        quality,
+        ref_start,
+        is_b_strand,
+        &cigar_ops,
+    )
+}
+
+/// As [`create_duplex_read_pair_with_sequences`], but with a caller-supplied CIGAR on both
+/// reads. The other constructors derive an all-`M` CIGAR from the sequence length, so they
+/// cannot express the differing alignment patterns the minority-alignment filter keys on.
+#[expect(clippy::too_many_arguments, reason = "test fixture builder mirrors the BAM fields")]
+fn create_duplex_read_pair_with_cigar(
+    name: &str,
+    mi_tag: &str,
+    r1_sequence: &str,
+    r2_sequence: &str,
+    quality: u8,
+    ref_start: i32,
+    is_b_strand: bool,
+    cigar_ops: &[u32],
+) -> (RawRecord, RawRecord) {
     assert_eq!(r1_sequence.len(), r2_sequence.len(), "R1 and R2 must be the same length");
     let seq = r1_sequence.as_bytes();
     let read_len = seq.len();
-    let cigar_op = u32::try_from(read_len).expect("read_len fits u32") << 4;
 
     let (r1_start, r2_start, r1_rev, r2_rev) = if is_b_strand {
         // B strand: RF orientation — R1 reverse at far position, R2 forward at near
@@ -94,7 +120,7 @@ fn create_duplex_read_pair_with_sequences(
             .ref_id(0)
             .pos(r1_start - 1)
             .mapq(60)
-            .cigar_ops(&[cigar_op])
+            .cigar_ops(cigar_ops)
             .mate_ref_id(0)
             .mate_pos(r2_start - 1)
             .template_length(tlen)
@@ -111,7 +137,7 @@ fn create_duplex_read_pair_with_sequences(
             .ref_id(0)
             .pos(r2_start - 1)
             .mapq(60)
-            .cigar_ops(&[cigar_op])
+            .cigar_ops(cigar_ops)
             .mate_ref_id(0)
             .mate_pos(r1_start - 1)
             .template_length(-tlen)
@@ -286,10 +312,13 @@ fn test_duplex_command_with_rejects() {
 /// already includes anything the ss layer would have rejected. Appending both
 /// sources naively would emit the overlapping records twice.
 ///
-/// This test drives several independent rejection paths in a single pipeline
-/// run and asserts that the rejects BAM contains each `(read_name, flags)`
+/// The molecules below all reject at the duplex layer, so this pins the
+/// deduplication of the *whole-group* source across several independent
+/// rejection paths: the rejects BAM must contain each `(read_name, flags)`
 /// tuple at most once, with the total record count matching the expected
-/// input-record count.
+/// input-record count. The single-strand source, and its reconciliation with
+/// `--stats`, is covered by
+/// `test_duplex_rejects_bam_reconciles_with_stats`.
 #[test]
 fn test_duplex_command_rejects_contain_no_duplicates() {
     let temp_dir = TempDir::new().unwrap();
@@ -361,6 +390,205 @@ fn test_duplex_command_rejects_contain_no_duplicates() {
             "record ({name}, flags={flags}) appears {count} times in the rejects BAM",
         );
     }
+}
+
+/// #757: the rejects BAM must reconcile with `--stats`.
+///
+/// The molecule here emits a duplex consensus *and* drops reads: `minority` carries a
+/// minority indel pattern on both ends, so the single-strand layer drops it from both
+/// combined alignment groups (AB-R1 + BA-R2 and AB-R2 + BA-R1) while the three majority
+/// templates per strand still consense. Those drops used to be recorded on the composed
+/// single-strand caller, whose statistics the duplex caller never merged and whose rejected
+/// records it never received, so they reached neither output — `raw_reads_rejected`
+/// under-reported and the rejects BAM was empty for a molecule that plainly rejected reads.
+///
+/// Asserted in both the single-threaded and pipeline paths, since they drain the caller's
+/// rejects and statistics through different code.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_duplex_rejects_bam_reconciles_with_stats(#[case] threads: Option<&str>) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+    let stats_path = temp_dir.path().join("stats.txt");
+
+    // 3M1D5M against the majority 8M: same query length, different alignment pattern.
+    let gapped = [3u32 << 4, (1u32 << 4) | 2, 5u32 << 4];
+    let mut molecule = create_duplex_molecule("1", "ACGTACGT", 30, 100, 3);
+    molecule.push(create_duplex_read_pair_with_cigar(
+        "minority", "1/A", "ACGTACGT", "ACGTACGT", 30, 100, false, &gapped,
+    ));
+    create_duplex_bam(&input_bam, vec![molecule]);
+
+    let mut args = vec![
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--stats",
+        stats_path.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--compression-level",
+        "1",
+    ];
+    if let Some(threads) = threads {
+        args.extend_from_slice(&["--threads", threads]);
+    }
+    Duplex::try_parse_from(args)
+        .expect("failed to parse duplex args")
+        .execute("fgumi duplex")
+        .expect("Duplex command failed");
+
+    let mut output_reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    output_reader.read_header().expect("read output header");
+    assert_eq!(
+        output_reader.records().count(),
+        2,
+        "the majority-alignment reads must still emit a duplex R1/R2 pair"
+    );
+
+    // Key the input records by (name, flags) so each reject can be compared against the
+    // exact bytes it came from: a rejects BAM that dropped a tag or rewrote a CIGAR would
+    // still satisfy a name-and-count assertion.
+    let expected_rejects: HashMap<(Vec<u8>, u16), Vec<u8>> = read_raw_records(&input_bam)
+        .into_iter()
+        .filter(|record| fgumi_raw_bam::read_name(record) == b"minority")
+        .map(|record| {
+            let view = RawRecordView::new(&record);
+            ((view.read_name().to_vec(), view.flags()), record)
+        })
+        .collect();
+    assert_eq!(expected_rejects.len(), 2, "the minority template contributes two records");
+
+    let mut seen: Vec<(Vec<u8>, u16)> = Vec::new();
+    for record in read_raw_records(&rejects_bam) {
+        let view = RawRecordView::new(&record);
+        let key = (view.read_name().to_vec(), view.flags());
+        let expected = expected_rejects.get(&key).unwrap_or_else(|| {
+            panic!("unexpected reject record {}", String::from_utf8_lossy(&key.0))
+        });
+        assert_eq!(
+            &record, expected,
+            "each reject must be byte-for-byte identical to its input record — every field \
+             and tag preserved on the --rejects path"
+        );
+        assert!(!seen.contains(&key), "a reject record was written more than once");
+        seen.push(key);
+    }
+
+    let stats = fs::read_to_string(&stats_path).expect("read stats");
+    let stat = |key: &str| -> usize {
+        stats
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}\t")))
+            .and_then(|rest| rest.split('\t').next())
+            .unwrap_or_else(|| panic!("stats must contain a {key} row"))
+            .parse()
+            .unwrap_or_else(|_| panic!("{key} must be an integer"))
+    };
+    assert_eq!(
+        seen.len(),
+        expected_rejects.len(),
+        "the rejects BAM must hold both ends of the minority template"
+    );
+    assert_eq!(
+        stat("raw_reads_rejected_for_minority_alignment"),
+        2,
+        "both ends of the minority template must be counted as minority-alignment"
+    );
+    assert_eq!(
+        seen.len(),
+        stat("raw_reads_rejected"),
+        "the rejects BAM record count must equal raw_reads_rejected"
+    );
+}
+
+/// #757 (follow-up): single-strand rejects must reach the rejects BAM in input order.
+///
+/// The two combined alignment groups split a template's ends across strands: X = AB-R1 +
+/// BA-R2 and Y = AB-R2 + BA-R1. For a `/B` template that means X carries its R2 while Y
+/// carries its R1, so recording X's rejects before Y's would write R2 ahead of R1 — the
+/// reverse of input order, which wrote R1 then R2. The reconciliation must merge both
+/// strands' rejects back into the group's canonical order before appending them.
+///
+/// Mirrors `test_duplex_rejects_bam_reconciles_with_stats`, but puts the minority template on
+/// the `/B` strand and asserts the serialized reject *sequence* equals the input sequence,
+/// which a name-and-count check (as the reconcile test uses) cannot catch.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_duplex_rejects_preserve_input_order_for_b_strand_minority(#[case] threads: Option<&str>) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+
+    // 3M1D5M against the majority 8M: same query length, minority alignment pattern.
+    let gapped = [3u32 << 4, (1u32 << 4) | 2, 5u32 << 4];
+    let mut molecule = create_duplex_molecule("1", "ACGTACGT", 30, 100, 3);
+    // Minority template on the *B* strand: its R1 becomes BA-R1 (lands in Y) and its R2
+    // becomes BA-R2 (lands in X), so the two ends are dropped by separate
+    // `filter_by_alignment` calls — exactly the split that can invert their order.
+    molecule.push(create_duplex_read_pair_with_cigar(
+        "minority", "1/B", "ACGTACGT", "ACGTACGT", 30, 100, true, &gapped,
+    ));
+    create_duplex_bam(&input_bam, vec![molecule]);
+
+    let mut args = vec![
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--compression-level",
+        "1",
+    ];
+    if let Some(threads) = threads {
+        args.extend_from_slice(&["--threads", threads]);
+    }
+    Duplex::try_parse_from(args)
+        .expect("failed to parse duplex args")
+        .execute("fgumi duplex")
+        .expect("Duplex command failed");
+
+    // The minority template's two input records, in the exact order the input wrote them
+    // (R1 then R2). The majority templates all consense, so they contribute no rejects and
+    // the rejects BAM must reproduce this sequence and nothing else.
+    let expected_sequence: Vec<Vec<u8>> = read_raw_records(&input_bam)
+        .into_iter()
+        .filter(|record| fgumi_raw_bam::read_name(record) == b"minority")
+        .collect();
+    assert_eq!(expected_sequence.len(), 2, "the minority template contributes two records");
+
+    let reject_sequence = read_raw_records(&rejects_bam);
+    assert_eq!(
+        reject_sequence, expected_sequence,
+        "the /B minority template's rejects must be serialized in input order (R1 then R2), \
+         not X-before-Y order (R2 then R1)"
+    );
+}
+
+/// Reads every record of a BAM back as raw bytes, so tests can compare whole serialized
+/// records rather than only the fields noodles decodes ergonomically.
+fn read_raw_records(path: &Path) -> Vec<Vec<u8>> {
+    let (mut reader, _header) =
+        fgumi_bam_io::create_raw_bam_reader(path, 1).expect("open BAM for raw reading");
+    let mut records = Vec::new();
+    let mut record = RawRecord::new();
+    while reader.read_record(&mut record).expect("read raw record") != 0 {
+        records.push(record.as_ref().to_vec());
+    }
+    records
 }
 
 /// Test duplex command with statistics output.

@@ -535,6 +535,31 @@ impl VanillaUmiConsensusCaller {
         self.rejected_reads.clear();
     }
 
+    /// Records `records` as rejected by this caller, when rejects tracking is enabled.
+    ///
+    /// [`Self::filter_by_alignment`] returns the *indices* it rejected rather than the raw
+    /// records, because a composing caller — not this one — owns those bytes. A caller that
+    /// reaches the filter directly instead of through [`Self::consensus_reads`] hands the
+    /// matching records back here so [`Self::take_rejected_reads`] drains them alongside this
+    /// caller's own rejections.
+    pub(crate) fn record_rejected_raw<'a, I>(&mut self, records: I)
+    where
+        I: IntoIterator<Item = &'a RawRecord>,
+    {
+        if self.track_rejects {
+            self.rejected_reads.extend(records.into_iter().map(|record| record.to_vec()));
+        }
+    }
+
+    /// Takes the accumulated statistics, leaving this caller's counters at zero.
+    ///
+    /// A composing caller drives this one per molecule and folds the resulting delta into its
+    /// own statistics; taking rather than cloning is what keeps that fold from re-counting
+    /// every molecule processed so far.
+    pub(crate) fn take_statistics(&mut self) -> ConsensusCallingStats {
+        std::mem::take(&mut self.stats)
+    }
+
     /// Clears all per-group state to prepare for reuse
     ///
     /// This resets statistics and rejected reads while preserving the caller's
