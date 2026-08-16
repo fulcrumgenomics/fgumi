@@ -211,6 +211,10 @@ regresses `samtools sort -n`–style throughput.
     SAFETY: the buffers are `to_vec()` + push, so the pointer is valid and
     null-terminated for the call's lifetime.
 
+### Approved spare-capacity record read (fgumi-raw-bam)
+
+- **`crates/fgumi-raw-bam/src/raw_bam_record.rs`** — `read_raw_record` reads a BAM record body into the spare capacity of the caller's reused `Vec<u8>` to skip the `resize(_, 0)` zero-fill (gigabytes of wasted zero-stores on large BAMs). SAFETY: `Read::read_exact` only writes to the destination; `spare_capacity_mut()[..block_size]` is valid uninitialized storage; `set_len(block_size)` runs only after `read_exact` returns `Ok`, so every byte covered by the new length is initialized. On error `set_len` is skipped and the Vec length stays 0.
+
 ### Approved SIMD intrinsics (fgumi-simd-fastq)
 
 `crates/fgumi-simd-fastq/src/lexer.rs` classifies 64-byte FASTQ blocks through
