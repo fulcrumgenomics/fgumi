@@ -1082,6 +1082,49 @@ impl CodecConsensusCaller {
     }
 
     /// Phase check using `ClippedRecordInfo`.
+    ///
+    /// Mirrors `CodecConsensusCaller.scala:221-231`: the overlap is in phase when the two
+    /// reads' query-space distances to the window's start and end agree.
+    ///
+    /// # Out-of-range boundaries
+    ///
+    /// The window is `[negative.start, positive.end]`, and in a family with more than one
+    /// template the longest R1 and the longest R2 come from *different* templates —
+    /// per-template overlap clipping says nothing about how two different templates line
+    /// up, so a boundary can fall outside one of the two reads.
+    ///
+    /// fgbio reads those boundaries with htsjdk's
+    /// `SAMRecord.getReadPositionAtReferencePosition`, which returns `0` — a value, not
+    /// "undefined" — for a reference position outside the alignment, and then does
+    /// arithmetic on that `0`. So the check is mirrored here by substituting `0` for an
+    /// out-of-range boundary rather than failing closed on it. Failing closed instead
+    /// banked those families under `IndelErrorBetweenStrands` where fgbio reports
+    /// `ClipOverlapFailed` — the near-mirrored reason rows of fulcrumgenomics/fgumi#749,
+    /// with the verdicts agreeing throughout.
+    ///
+    /// # Why this is attribution only
+    ///
+    /// Write `p_s`/`p_e` for the positive read's query positions at the window start and
+    /// end and `n_s`/`n_e` for the negative read's, so the check is
+    /// `p_s - n_s == p_e - n_e` in either operand order. The window start is the negative
+    /// read's own start and the window end is the positive read's own end, so only `p_s`
+    /// (window start before the positive read begins) and `n_e` (window end after the
+    /// negative read ends) can be out of range, and read position is non-decreasing in
+    /// reference position, so `n_s <= n_e` and `p_s <= p_e`, with `n_s >= 1`.
+    ///
+    /// - `n_e` out of range ⟹ `n_e = 0`, and the check needs `p_e - p_s = -n_s <= -1`,
+    ///   contradicting `p_s <= p_e`. It still fails, so those families keep landing in
+    ///   `IndelErrorBetweenStrands` exactly as they did before — including when `p_s` is
+    ///   out of range too.
+    /// - `p_s` out of range alone ⟹ `p_s = 0`, and the check passes only when
+    ///   `n_e = p_e + n_s`. [`Self::compute_consensus_length_raw`] then yields
+    ///   `p_e + neg_len - n_e = neg_len - n_s <= neg_len - 1`, which is below the negative
+    ///   strand's single-strand consensus length (that consensus is at least as long as
+    ///   the read it was built from), so the family is rejected at the `ClipOverlapFailed`
+    ///   site — the reason fgbio gives it (`CodecConsensusCaller.scala:245-247`).
+    ///
+    /// So no family that newly passes here goes on to emit a consensus; only the bucket it
+    /// is counted under moves.
     fn check_overlap_phase_raw(
         r1: &ClippedRecordInfo,
         r2: &ClippedRecordInfo,
@@ -1113,10 +1156,13 @@ impl CodecConsensusCaller {
             true,
         );
 
-        match (r1s, r2s, r1e, r2e) {
-            (Some(a), Some(b), Some(c), Some(d)) => (a as i64 - b as i64) == (c as i64 - d as i64),
-            _ => false,
-        }
+        // htsjdk's out-of-range sentinel; see the doc comment above. Both differences are
+        // between two non-negative `i64`s, so neither can overflow.
+        let read_pos_or_sentinel =
+            |pos: Option<usize>| -> i64 { pos.map_or(0, |p| i64::try_from(p).unwrap_or(i64::MAX)) };
+
+        (read_pos_or_sentinel(r1s) - read_pos_or_sentinel(r2s))
+            == (read_pos_or_sentinel(r1e) - read_pos_or_sentinel(r2e))
     }
 
     /// Compute consensus length from `ClippedRecordInfo`.
@@ -3193,15 +3239,12 @@ mod tests {
     /// verbatim label, *not* leak into `IndelErrorBetweenStrands` the way it did before
     /// the fix.
     ///
-    /// The caller-level trigger (`consensus_length < ss.bases.len()` at the
-    /// `ClipOverlapFailed` site) is a degenerate overlap-clip boundary that fgbio itself
-    /// only reaches on specific real-data alignments; a synthetic pipeline fixture that
-    /// lands there without first tripping the earlier `IndelErrorBetweenStrands` phase
-    /// check would have to replicate fgbio's exact clip arithmetic and would be brittle.
-    /// This exercises the counting/labeling contract at the reject-tallying seam instead:
+    /// This exercises the counting/labeling contract at the reject-tallying seam:
     /// `reject_records_count` is the single site every reject flows through, so pinning
     /// the count, the filtered total, and the central-reason mapping here is what
-    /// guarantees the emitted metrics row is right when the branch does fire.
+    /// guarantees the emitted metrics row is right when the branch fires.
+    /// `test_clip_overlap_failed_attribution_matches_fgbio` covers the complementary
+    /// half — reaching the branch through the whole pipeline.
     #[test]
     fn test_clip_overlap_failed_counted_and_labeled() {
         let options = CodecConsensusOptions {
@@ -3238,6 +3281,246 @@ mod tests {
             CallerRejectionReason::ClipOverlapFailed.to_centralized(),
             fgumi_metrics::rejection::RejectionReason::ClipOverlapFailed,
             "ClipOverlapFailed must map to the fgbio-verbatim central reason for the metrics row"
+        );
+    }
+
+    /// Builds a two-template CODEC family whose longest R1 and longest R2 come from
+    /// *different* templates, so the overlap window opens one base before the longest
+    /// R1's alignment start.
+    ///
+    /// - Template `tA`: R1 `200 50M` (200-249, positive), R2 `200 50M` (200-249, negative).
+    /// - Template `tB`: R1 `199 40M` (199-238, positive), R2 `199 102M` (199-300, negative).
+    ///
+    /// Neither template is overlap-clipped — in each one the positive read already ends
+    /// at or before its mate's un-soft-clipped end, and the negative read starts at its
+    /// mate's un-soft-clipped start — so the alignments above are exactly what the
+    /// caller sees. The longest R1 is `tA`'s (50 reference bases beats 40) and the
+    /// longest R2 is `tB`'s (102 beats 50), so the overlap window is
+    /// `[longest_r2.start, longest_r1.end]` = `[199, 249]` and its start falls one base
+    /// outside the longest R1.
+    ///
+    /// This is the everyday multi-template arrangement, not a contrivance: any family
+    /// with more than one template can pick its longest R1 and longest R2 from
+    /// different templates, and per-template overlap clipping says nothing about how
+    /// two *different* templates line up against each other.
+    fn cross_template_overlap_fixture() -> Vec<RawRecord> {
+        let mut records = create_fr_pair(
+            "tA",
+            200,
+            200,
+            50,
+            35,
+            &[(Kind::Match, 50)],
+            &[(Kind::Match, 50)],
+            "mi",
+            Some("ACC-TGA"),
+            false,
+            true,
+        );
+        records.extend(create_fr_pair(
+            "tB",
+            199,
+            199,
+            102,
+            35,
+            &[(Kind::Match, 40)],
+            &[(Kind::Match, 102)],
+            "mi",
+            Some("ACC-TGA"),
+            false,
+            true,
+        ));
+        records
+    }
+
+    /// A family whose overlap window opens outside the longest R1 must be attributed
+    /// the way fgbio attributes it — `ClipOverlapFailed`, not `IndelErrorBetweenStrands`.
+    ///
+    /// fgbio reads the overlap boundaries with htsjdk's
+    /// `SAMRecord.getReadPositionAtReferencePosition`, which yields `0` — a value, not
+    /// "undefined" — for a reference position outside the alignment, and then does
+    /// arithmetic on that `0` (`CodecConsensusCaller.scala:221-231`). For
+    /// [`cross_template_overlap_fixture`] the two boundary differences come out equal
+    /// (`0 - 1 == 50 - 51`), so fgbio's phase check *passes* and the family is carried
+    /// to the consensus-length branch, where the consensus (101) is shorter than the
+    /// R2 single-strand consensus (102) and fgbio rejects it as `ClipOverlapFailed`
+    /// (`CodecConsensusCaller.scala:245-247`). fgumi used to fail the phase check closed
+    /// on the out-of-range boundary and bank the family under `IndelErrorBetweenStrands`
+    /// instead — the mirrored reason rows in fulcrumgenomics/fgumi#749.
+    ///
+    /// The verdict is identical either way, and the rest of this test pins that: the
+    /// family is rejected exactly once, emits no consensus, and contributes all of its
+    /// records to the filtered total. Only the bucket moves.
+    #[test]
+    fn test_clip_overlap_failed_attribution_matches_fgbio() {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        let fixture = cross_template_overlap_fixture();
+        let record_count = fixture.len();
+
+        let output = caller
+            .consensus_reads_from_sam_records(fixture)
+            .expect("the family is rejected, which is not an error");
+
+        let stats = caller.statistics();
+        assert_eq!(
+            stats.rejection_reasons.get(&CallerRejectionReason::ClipOverlapFailed),
+            Some(&record_count),
+            "fgbio attributes this family to ClipOverlapFailed; every record must land there"
+        );
+        assert!(
+            !stats.rejection_reasons.contains_key(&CallerRejectionReason::IndelErrorBetweenStrands),
+            "an out-of-range overlap boundary must not be reported as an indel error"
+        );
+
+        // Attribution-only: the verdict and every total are what they were before the
+        // reason moved buckets.
+        assert_rejected_whole_family(&caller, &output, record_count);
+    }
+
+    /// Asserts the invariant this reordering must preserve: the family was rejected, no
+    /// consensus came out of it, and every one of its records is accounted for — once —
+    /// in the filtered total and across the rejection reasons.
+    ///
+    /// Only which reason holds the records is allowed to move, so the attribution tests
+    /// share this and differ solely in the reason they expect.
+    fn assert_rejected_whole_family(
+        caller: &CodecConsensusCaller,
+        output: &ConsensusOutput,
+        record_count: usize,
+    ) {
+        let stats = caller.statistics();
+        let expected = u64::try_from(record_count).expect("fixture size fits in u64");
+
+        assert_eq!(output.count, 0, "the family is rejected, so no consensus is emitted");
+        assert_eq!(stats.consensus_reads_generated, 0, "no consensus read may be constructed");
+        assert_eq!(stats.total_input_reads, expected, "every input record must be accounted for");
+        assert_eq!(
+            stats.reads_filtered, expected,
+            "the rejected total must still cover the whole family"
+        );
+        let total_rejected: usize = stats.rejection_reasons.values().sum();
+        assert_eq!(
+            total_rejected, record_count,
+            "the family must be rejected exactly once, under exactly one reason"
+        );
+    }
+
+    /// Builds a two-template CODEC family whose overlap window *ends* after the longest
+    /// R2 — the mirror of [`cross_template_overlap_fixture`], and the case the phase
+    /// check must keep failing.
+    ///
+    /// - Template `tA`: R1 `100 100M` (100-199, positive), R2 `160 40M` (160-199, negative).
+    /// - Template `tB`: R1 `120 30M` (120-149, positive), R2 `120 50M` (120-169, negative).
+    ///
+    /// As with the sibling fixture, no template is overlap-clipped. The longest R1 is
+    /// `tA`'s (100 reference bases) and the longest R2 is `tB`'s (50 beats 40), so the
+    /// window is `[120, 199]` and its end falls 30 bases past where the longest R2 stops.
+    fn window_end_past_r2_fixture() -> Vec<RawRecord> {
+        let mut records = create_fr_pair(
+            "tA",
+            100,
+            160,
+            100,
+            35,
+            &[(Kind::Match, 100)],
+            &[(Kind::Match, 40)],
+            "mi",
+            Some("ACC-TGA"),
+            false,
+            true,
+        );
+        records.extend(create_fr_pair(
+            "tB",
+            120,
+            120,
+            50,
+            35,
+            &[(Kind::Match, 30)],
+            &[(Kind::Match, 50)],
+            "mi",
+            Some("ACC-TGA"),
+            false,
+            true,
+        ));
+        records
+    }
+
+    /// The sentinel substitution must not turn *every* out-of-range boundary into a pass:
+    /// a window that ends past the longest R2 stays `IndelErrorBetweenStrands`, which is
+    /// where fgbio puts it too.
+    ///
+    /// This is the second half of the argument in `check_overlap_phase_raw`'s doc comment.
+    /// With the window end outside the negative read its query position reads as `0`, and
+    /// the check would need the positive read's query position to *decrease* from the
+    /// window start to the window end — unsatisfiable, since read position is
+    /// non-decreasing in reference position. Without this test the fix could be loosened
+    /// into passing that case as well, and those families would then reach
+    /// `compute_consensus_length_raw` and change verdict rather than bucket.
+    #[test]
+    fn test_window_end_past_r2_stays_indel_error() {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        let fixture = window_end_past_r2_fixture();
+        let record_count = fixture.len();
+
+        let output = caller
+            .consensus_reads_from_sam_records(fixture)
+            .expect("the family is rejected, which is not an error");
+
+        let stats = caller.statistics();
+        assert_eq!(
+            stats.rejection_reasons.get(&CallerRejectionReason::IndelErrorBetweenStrands),
+            Some(&record_count),
+            "a window ending past the longest R2 must still fail the phase check"
+        );
+        assert!(
+            !stats.rejection_reasons.contains_key(&CallerRejectionReason::ClipOverlapFailed),
+            "the sentinel must not turn this case into a phase pass"
+        );
+
+        assert_rejected_whole_family(&caller, &output, record_count);
+    }
+
+    /// The phase check itself must mirror fgbio's arithmetic on htsjdk's out-of-range
+    /// sentinel. `r1` covers 200-249 and `r2` covers 199-300, so the window start (199)
+    /// is outside `r1`: htsjdk returns `0` there, and `0 - 1 == 50 - 51` puts the two
+    /// reads in phase. Failing closed on the out-of-range boundary instead would send
+    /// the family to `IndelErrorBetweenStrands` (fulcrumgenomics/fgumi#749).
+    #[test]
+    fn test_check_overlap_phase_out_of_range_start_uses_fgbio_sentinel() {
+        let options = CodecConsensusOptions::default();
+        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        let mut b1 = SamBuilder::new();
+        b1.read_name(b"r1")
+            .sequence(&[b'A'; 50])
+            .qualities(&[30; 50])
+            .pos(199) // 0-based (1-based position 200)
+            .cigar_ops(&[encode_op(0, 50)]); // 50M
+        let r1 = b1.build();
+
+        let mut b2 = SamBuilder::new();
+        b2.read_name(b"r2")
+            .sequence(&[b'A'; 102])
+            .qualities(&[30; 102])
+            .pos(198) // 0-based (1-based position 199)
+            .cigar_ops(&[encode_op(0, 102)]); // 102M
+        let r2 = b2.build();
+
+        assert!(
+            caller.check_overlap_phase(&r1, &r2, 199, 249),
+            "an overlap start outside r1 must be read as fgbio reads it (htsjdk's 0), not as a phase failure"
         );
     }
 
