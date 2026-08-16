@@ -23,6 +23,7 @@ pub mod handles;
 pub mod header;
 pub mod held;
 pub mod item;
+pub mod liveness;
 pub mod outputs;
 pub mod queues;
 pub mod reorder;
@@ -35,8 +36,8 @@ pub mod topology;
 mod tests;
 
 pub use builder::{
-    BuildError, Chain, InstrumentationLevel, MultiChain2, MultiChain2Ordered, MultiChain3,
-    MultiChain4, Pipeline, PipelineBuilder, PipelineConfig,
+    BuildError, Chain, DEFAULT_DEADLOCK_TIMEOUT_SECS, InstrumentationLevel, MultiChain2,
+    MultiChain2Ordered, MultiChain3, MultiChain4, Pipeline, PipelineBuilder, PipelineConfig,
 };
 pub use erased::{ErasedStep, ErasedStepCtx, TypedStep, TypedStep2};
 pub use finalize::FinalizeHook;
@@ -47,6 +48,7 @@ pub use handles::{
 pub use header::{AlreadySetError, HeaderHandle};
 pub use held::HeldSlot;
 pub use item::{HeapSize, Ordered};
+pub use liveness::LivenessCounter;
 pub use outputs::{
     MAX_ARITY, OrderedBytesSingle, OrderedBytesTuple2, OrderedBytesTuple3, Single, StepOutputs,
 };
