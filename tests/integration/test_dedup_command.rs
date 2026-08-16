@@ -30,43 +30,31 @@ use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
 /// Template-coordinate sort groups reads by position, then by name within each position.
 /// The header must have SO:unsorted GO:query SS:template-coordinate tags.
 fn create_sorted_bam(path: &Path, records: Vec<RawRecord>) {
-    // Write the records to a temp BAM, then sort it into `path` with fgumi's own
-    // template-coordinate sorter so the dedup input is *genuinely* in
-    // template-coordinate order rather than merely labelled as such. (dedup trusts
-    // the header's SS tag; feeding it mislabelled-but-unsorted input produces
-    // mislabelled-but-unsorted output.)
-    let unsorted = path.with_file_name("dedup_input_unsorted.bam");
+    // Delegate to the header-aware variant with the default minimal header so the
+    // two helpers share a single implementation and can never drift apart.
     let header = create_minimal_header("chr1", 10000);
-    let mut writer =
-        bam::io::Writer::new(fs::File::create(&unsorted).expect("Failed to create BAM file"));
-    writer.write_header(&header).expect("Failed to write header");
-    for record in records {
-        writer
-            .write_alignment_record(&header, &to_record_buf(&record))
-            .expect("Failed to write record");
-    }
-    writer.try_finish().expect("Failed to finish BAM");
-
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "sort",
-            "-i",
-            unsorted.to_str().unwrap(),
-            "-o",
-            path.to_str().unwrap(),
-            "--order",
-            "template-coordinate",
-            "--key-types",
-            "mi",
-        ])
-        .status()
-        .expect("failed to spawn `fgumi sort` for dedup test input");
-    assert!(status.success(), "failed to template-coordinate sort dedup test input");
+    create_sorted_bam_with_header(path, &header, records);
 }
 
 /// Create a group of paired-end reads at the same position with the same UMI
 /// (simulating PCR duplicates).
 fn create_duplicate_group(base_name: &str, umi: &str, count: usize, start: i32) -> Vec<RawRecord> {
+    create_duplicate_group_inner(base_name, umi, count, start, None)
+}
+
+/// Shared implementation for [`create_duplicate_group`] and
+/// [`create_duplicate_group_with_rg`]: builds `count` paired-end duplicate
+/// templates, tagging each record with `RG:Z:{rg_id}` only when `rg_id` is
+/// `Some`. Keeping one implementation means the exact record shape the per-library
+/// and ladder tests derive their template counts from can never diverge between
+/// the RG and non-RG variants.
+fn create_duplicate_group_inner(
+    base_name: &str,
+    umi: &str,
+    count: usize,
+    start: i32,
+    rg_id: Option<&str>,
+) -> Vec<RawRecord> {
     let mut records = Vec::new();
     for i in 0..count {
         let name = format!("{base_name}_{i}");
@@ -86,6 +74,9 @@ fn create_duplicate_group(base_name: &str, umi: &str, count: usize, start: i32) 
                 .template_length(108)
                 .add_string_tag(SamTag::RX, umi.as_bytes())
                 .add_string_tag(SamTag::MC, b"8M");
+            if let Some(rg_id) = rg_id {
+                b.add_string_tag(SamTag::RG, rg_id.as_bytes());
+            }
             b.build()
         };
 
@@ -104,6 +95,9 @@ fn create_duplicate_group(base_name: &str, umi: &str, count: usize, start: i32) 
                 .template_length(-108)
                 .add_string_tag(SamTag::RX, umi.as_bytes())
                 .add_string_tag(SamTag::MC, b"8M");
+            if let Some(rg_id) = rg_id {
+                b.add_string_tag(SamTag::RG, rg_id.as_bytes());
+            }
             b.build()
         };
 
@@ -247,6 +241,251 @@ fn test_dedup_command_with_metrics() {
     .expect("failed to parse dedup args");
     cmd.execute("fgumi dedup").expect("Dedup command with metrics failed");
     assert!(metrics_path.exists(), "Metrics file not created");
+}
+
+/// Build a template-coordinate-sorted SAM header with two `@RG` lines that have
+/// distinct `LB` values ("libA"/"libB"), for the per-library metrics test below.
+fn create_multi_library_header(ref_name: &str, ref_len: usize) -> noodles::sam::Header {
+    use bstr::BString;
+    use noodles::sam::header::record::value::Map;
+    use noodles::sam::header::record::value::map::Map as HeaderRecordMap;
+    use noodles::sam::header::record::value::map::header::tag::Tag as HeaderTag;
+    use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+    use noodles::sam::header::record::value::map::{
+        Header as HeaderRecord, ReadGroup, ReferenceSequence,
+    };
+    use std::num::NonZeroUsize;
+
+    let mut header_builder = HeaderRecordMap::<HeaderRecord>::builder();
+    for &(tag_bytes, value) in
+        &[(*b"SO", "unsorted"), (*b"GO", "query"), (*b"SS", "template-coordinate")]
+    {
+        let HeaderTag::Other(tag) = HeaderTag::from(tag_bytes) else { unreachable!() };
+        header_builder = header_builder.insert(tag, value);
+    }
+    let header_map = header_builder.build().expect("valid header map");
+
+    let reference_sequence = Map::<ReferenceSequence>::new(
+        NonZeroUsize::new(ref_len).expect("reference length must be non-zero"),
+    );
+
+    let rg_a = Map::<ReadGroup>::builder()
+        .insert(rg_tag::LIBRARY, String::from("libA"))
+        .build()
+        .expect("building read group RG1 should succeed");
+    let rg_b = Map::<ReadGroup>::builder()
+        .insert(rg_tag::LIBRARY, String::from("libB"))
+        .build()
+        .expect("building read group RG2 should succeed");
+
+    noodles::sam::Header::builder()
+        .set_header(header_map)
+        .add_reference_sequence(BString::from(ref_name), reference_sequence)
+        .add_read_group(BString::from("RG1"), rg_a)
+        .add_read_group(BString::from("RG2"), rg_b)
+        .build()
+}
+
+/// Like [`create_duplicate_group`], but tags every record with `RG:Z:{rg_id}`
+/// so it is attributed to a specific library at dedup time.
+fn create_duplicate_group_with_rg(
+    base_name: &str,
+    umi: &str,
+    count: usize,
+    start: i32,
+    rg_id: &str,
+) -> Vec<RawRecord> {
+    create_duplicate_group_inner(base_name, umi, count, start, Some(rg_id))
+}
+
+/// Shared implementation for [`create_sorted_bam`]: writes `records` against the
+/// caller-supplied `header`, then template-coordinate sorts the result into
+/// `path` with fgumi's own sorter so the dedup input is *genuinely* in
+/// template-coordinate order rather than merely labelled as such. (dedup trusts
+/// the header's SS tag; feeding it mislabelled-but-unsorted input produces
+/// mislabelled-but-unsorted output.) [`create_sorted_bam`] passes the default
+/// [`create_minimal_header`]; the per-library tests pass a multi-`@RG` header so
+/// each read is attributed to a specific library at dedup time.
+fn create_sorted_bam_with_header(
+    path: &Path,
+    header: &noodles::sam::Header,
+    records: Vec<RawRecord>,
+) {
+    let unsorted = path.with_file_name("dedup_input_unsorted.bam");
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(&unsorted).expect("Failed to create BAM file"));
+    writer.write_header(header).expect("Failed to write header");
+    for record in records {
+        writer
+            .write_alignment_record(header, &to_record_buf(&record))
+            .expect("Failed to write record");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "sort",
+            "-i",
+            unsorted.to_str().unwrap(),
+            "-o",
+            path.to_str().unwrap(),
+            "--order",
+            "template-coordinate",
+            "--key-types",
+            "mi",
+        ])
+        .status()
+        .expect("failed to spawn `fgumi sort` for dedup test input");
+    assert!(status.success(), "failed to template-coordinate sort dedup test input");
+}
+
+/// Reads the dedup metrics TSV back as one `column name -> value` map per data
+/// row, in file order.
+fn read_dedup_metrics_rows(path: &Path) -> Vec<std::collections::HashMap<String, String>> {
+    let content = fs::read_to_string(path).expect("failed to read metrics file");
+    let mut lines = content.lines();
+    let header: Vec<String> =
+        lines.next().expect("metrics header row").split('\t').map(String::from).collect();
+    lines
+        .map(|line| {
+            let values: Vec<&str> = line.split('\t').collect();
+            header.iter().cloned().zip(values.iter().map(ToString::to_string)).collect()
+        })
+        .collect()
+}
+
+/// Dedup over a two-library input (library A: 3 duplicate pairs at one
+/// position; library B: 2 duplicate pairs at a different position) and verify
+/// the metrics file has one row per library, sorted by name, plus a final
+/// "All Reads" total row summing across libraries — with correct per-library
+/// `duplicate_templates`/`percent_duplication`, and `estimated_library_size`
+/// populated for both (both libraries have duplicates).
+///
+/// Each mate's position group is dedup'd independently (R1's group and R2's
+/// group are template-coordinate-adjacent but distinct `RawPositionGroup`s,
+/// each holding single-mate templates), so a library's `count` duplicate
+/// pairs contribute `2 * count` templates/reads to its row: `count` from R1's
+/// group (1 unique + `count - 1` duplicate) and `count` from R2's group
+/// (same split) — e.g. library A's 3 pairs give `total_templates = 6`,
+/// `unique_templates = 2`, `duplicate_templates = 4`.
+#[test]
+fn test_dedup_command_per_library_metrics() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+
+    let header = create_multi_library_header("chr1", 10000);
+    let mut records = create_duplicate_group_with_rg("libA_dup", "ACGTACGT", 3, 100, "RG1");
+    records.extend(create_duplicate_group_with_rg("libB_dup", "TGCATGCA", 2, 500, "RG2"));
+    create_sorted_bam_with_header(&input_bam, &header, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command with per-library metrics failed");
+
+    let rows = read_dedup_metrics_rows(&metrics_path);
+    assert_eq!(rows.len(), 3, "expected libA row + libB row + All Reads total row: {rows:?}");
+
+    let libraries: Vec<&str> = rows.iter().map(|r| r["library"].as_str()).collect();
+    assert_eq!(
+        libraries,
+        vec!["libA", "libB", "All Reads"],
+        "rows must be library-name-sorted, with the total row last: {libraries:?}"
+    );
+
+    // Each position group in `fgumi dedup` holds a single mate (R1's group and
+    // R2's group are template-coordinate-adjacent but distinct groups), so a
+    // library's `count` duplicate pairs contribute `2 * count` templates/reads
+    // (one per mate's own position group), each with exactly one record.
+    let lib_a = &rows[0];
+    assert_eq!(lib_a["total_templates"], "6");
+    assert_eq!(lib_a["unique_templates"], "2");
+    assert_eq!(lib_a["duplicate_templates"], "4");
+    assert_eq!(lib_a["total_reads"], "6");
+    assert_eq!(lib_a["duplicate_reads"], "4");
+    assert!(
+        (lib_a["percent_duplication"].parse::<f64>().unwrap() - 4.0 / 6.0).abs() < 1e-6,
+        "lib_a percent_duplication (read-level 4/6): {lib_a:?}"
+    );
+    assert!(
+        !lib_a["estimated_library_size"].is_empty(),
+        "lib_a has duplicates, so the library-size estimate must be populated: {lib_a:?}"
+    );
+
+    let lib_b = &rows[1];
+    assert_eq!(lib_b["total_templates"], "4");
+    assert_eq!(lib_b["unique_templates"], "2");
+    assert_eq!(lib_b["duplicate_templates"], "2");
+    assert_eq!(lib_b["total_reads"], "4");
+    assert_eq!(lib_b["duplicate_reads"], "2");
+    assert!(
+        (lib_b["percent_duplication"].parse::<f64>().unwrap() - 2.0 / 4.0).abs() < 1e-6,
+        "lib_b percent_duplication (read-level 2/4): {lib_b:?}"
+    );
+    assert!(
+        !lib_b["estimated_library_size"].is_empty(),
+        "lib_b has duplicates, so the library-size estimate must be populated: {lib_b:?}"
+    );
+
+    let total = &rows[2];
+    assert_eq!(total["total_templates"], "10");
+    assert_eq!(total["unique_templates"], "4");
+    assert_eq!(total["duplicate_templates"], "6");
+    assert_eq!(total["total_reads"], "10");
+    assert_eq!(total["duplicate_reads"], "6");
+}
+
+/// Single-library input (no `@RG`/`LB` at all) must still produce two rows:
+/// the "Unknown Library" bucket, then the "All Reads" total — the metrics
+/// writer never collapses to a single row, regardless of library count, so
+/// the output shape is uniform across single- and multi-library inputs.
+#[test]
+fn test_dedup_command_single_library_metrics_has_unknown_and_total_rows() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+
+    let records = create_duplicate_group("dup1", "ACGTACGT", 3, 100);
+    create_sorted_bam(&input_bam, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command with metrics failed");
+
+    let rows = read_dedup_metrics_rows(&metrics_path);
+    let libraries: Vec<&str> = rows.iter().map(|r| r["library"].as_str()).collect();
+    assert_eq!(
+        libraries,
+        vec!["Unknown Library", "All Reads"],
+        "no @RG/LB in the input: expect the Unknown Library bucket, then the total: {libraries:?}"
+    );
+    assert_eq!(rows[0]["total_templates"], rows[1]["total_templates"]);
 }
 
 /// Test dedup command with remove-duplicates flag.

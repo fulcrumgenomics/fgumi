@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use crate::grouper::{RawPositionGroup, RecordPositionGrouper, build_templates_from_records};
 use crate::logging::OperationTimer;
-use crate::metrics::DeduplicationMetrics;
 use crate::metrics::group::FamilySizeMetrics;
+use crate::metrics::{DeduplicationCounts, DeduplicationMetrics};
 use crate::metrics::{TemplateFilterCounts, TemplateFilterReason};
 use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
@@ -129,34 +129,55 @@ impl DedupCounts {
     }
 }
 
-impl From<&DedupCounts> for DeduplicationMetrics {
-    fn from(counts: &DedupCounts) -> Self {
-        use TemplateFilterReason as Reason;
-        let filter = &counts.filter_counts;
-        Self {
-            filtered_templates: filter.total_rejected_templates(),
-            filtered_malformed_record: filter.rejected_templates(Reason::MalformedRecord),
-            filtered_no_primary_reads: filter.rejected_templates(Reason::NoPrimaryReads),
-            filtered_unmapped: filter.rejected_templates(Reason::Unmapped),
-            filtered_not_passing_filter: filter.rejected_templates(Reason::NotPassingFilter),
-            filtered_low_mapping_quality: filter.rejected_templates(Reason::LowMappingQuality),
-            filtered_low_mate_mapping_quality: filter
-                .rejected_templates(Reason::LowMateMappingQuality),
-            filtered_missing_umi: filter.rejected_templates(Reason::MissingUmi),
-            filtered_ns_in_umi: filter.rejected_templates(Reason::NsInUmi),
-            filtered_umi_too_short: filter.rejected_templates(Reason::UmiTooShort),
-            passthrough_templates: counts.passthrough_templates,
-            total_templates: counts.total_templates,
-            unique_templates: counts.unique_templates,
-            duplicate_templates: counts.duplicate_templates,
-            duplicate_rate: counts.duplicate_rate(),
-            total_reads: counts.total_reads,
-            unique_reads: counts.unique_reads,
-            duplicate_reads: counts.duplicate_reads,
-            secondary_reads: counts.secondary_reads,
-            supplementary_reads: counts.supplementary_reads,
-            missing_tc_tag: counts.missing_tc_tag,
-        }
+/// Converts accumulated dedup counts for one library (or the aggregate total
+/// across all libraries) into the serializable [`DeduplicationMetrics`] row.
+///
+/// The raw counts are copied 1:1 into a [`DeduplicationCounts`], and
+/// [`DeduplicationMetrics::from_counts`] computes the three derived columns
+/// (`duplicate_rate`, `percent_duplication`, `estimated_library_size`). fgumi
+/// counts *templates*, and each template stands in for one read pair in
+/// paired-end data — the same approximation `duplicate_rate` already makes by
+/// reporting a template-level rather than read-pair-level rate. That is why
+/// `estimated_library_size` is fed `total_templates`/`unique_templates` as its
+/// `n_pairs`/`n_unique` inputs.
+fn to_deduplication_metrics(library: String, counts: &DedupCounts) -> DeduplicationMetrics {
+    use TemplateFilterReason as Reason;
+    let filter = &counts.filter_counts;
+    DeduplicationMetrics::from_counts(DeduplicationCounts {
+        library,
+        filtered_templates: filter.total_rejected_templates(),
+        filtered_malformed_record: filter.rejected_templates(Reason::MalformedRecord),
+        filtered_no_primary_reads: filter.rejected_templates(Reason::NoPrimaryReads),
+        filtered_unmapped: filter.rejected_templates(Reason::Unmapped),
+        filtered_not_passing_filter: filter.rejected_templates(Reason::NotPassingFilter),
+        filtered_low_mapping_quality: filter.rejected_templates(Reason::LowMappingQuality),
+        filtered_low_mate_mapping_quality: filter.rejected_templates(Reason::LowMateMappingQuality),
+        filtered_missing_umi: filter.rejected_templates(Reason::MissingUmi),
+        filtered_ns_in_umi: filter.rejected_templates(Reason::NsInUmi),
+        filtered_umi_too_short: filter.rejected_templates(Reason::UmiTooShort),
+        passthrough_templates: counts.passthrough_templates,
+        total_templates: counts.total_templates,
+        unique_templates: counts.unique_templates,
+        duplicate_templates: counts.duplicate_templates,
+        total_reads: counts.total_reads,
+        unique_reads: counts.unique_reads,
+        duplicate_reads: counts.duplicate_reads,
+        secondary_reads: counts.secondary_reads,
+        supplementary_reads: counts.supplementary_reads,
+        missing_tc_tag: counts.missing_tc_tag,
+    })
+}
+
+/// Resolves the display name for a metrics row's library index.
+///
+/// `LibraryIndex` reserves index 0 for reads whose `@RG` has no `LB` field
+/// (or no `RG` tag at all). For metrics *display*, match Picard
+/// `DuplicationMetrics`' convention of naming that bucket "Unknown Library".
+fn library_display_name(idx: u16, library_index: &LibraryIndex) -> String {
+    if idx == 0 {
+        "Unknown Library".to_string()
+    } else {
+        library_index.library_name(idx).to_string()
     }
 }
 
@@ -167,9 +188,13 @@ impl From<&DedupCounts> for DeduplicationMetrics {
 /// Metrics collected per position group, aggregated after pipeline completion.
 #[derive(Default, Debug)]
 struct CollectedDedupCounts {
-    /// Dedup-specific metrics
-    dedup_counts: DedupCounts,
-    /// Family size counts
+    /// Dedup-specific counts, aggregated per library (keyed by
+    /// `GroupKey::library_idx` / `ProcessedDedupGroup::library_idx`). One
+    /// position group always belongs to exactly one library (library is part
+    /// of the grouping key), so merging is unambiguous per group.
+    dedup_counts_by_library: AHashMap<u16, DedupCounts>,
+    /// Family size counts, global across all libraries (out of scope for
+    /// per-library splitting).
     family_sizes: AHashMap<usize, u64>,
 }
 
@@ -185,6 +210,10 @@ pub struct ProcessedDedupGroup {
     pub family_sizes: AHashMap<usize, u64>,
     /// Dedup metrics for this group.
     pub dedup_counts: DedupCounts,
+    /// Library index (`GroupKey::library_idx`) all templates in this group
+    /// belong to. A position group is always a single library — library
+    /// partitions the grouping key — so this is unambiguous per group.
+    pub library_idx: u16,
     /// Total input records processed (for progress tracking).
     pub input_record_count: u64,
     /// Number of distinct numeric `MoleculeId`s assigned in this group.
@@ -640,6 +669,9 @@ fn process_position_group(
 ) -> io::Result<ProcessedDedupGroup> {
     let mut dedup_counts = DedupCounts::default();
     let input_record_count = group.records.len() as u64;
+    // One position group is always a single library (library partitions the
+    // grouping key), so this is unambiguous.
+    let library_idx = group.group_key.library_idx;
 
     // Build templates from raw records (deferred from Group step)
     let all_templates = build_templates_from_records(group.records)?;
@@ -669,6 +701,7 @@ fn process_position_group(
             templates: Vec::new(),
             family_sizes: AHashMap::new(),
             dedup_counts,
+            library_idx,
             input_record_count,
             distinct_mi_count: 0,
         });
@@ -777,6 +810,7 @@ fn process_position_group(
         templates,
         family_sizes,
         dedup_counts,
+        library_idx,
         input_record_count,
         distinct_mi_count,
     })
@@ -1119,6 +1153,10 @@ impl Command for MarkDuplicates {
         info!("Using pipeline with {num_threads} threads");
 
         let library_index = LibraryIndex::from_header(&header);
+        // `GroupKeyConfig::new` takes `library_index` by value; keep a clone so
+        // the metrics writer can still map `library_idx -> name` after the
+        // pipeline consumes the original.
+        let library_index_for_metrics = library_index.clone();
         // Cache the UMI tag's value position on each DecodedRecord so the
         // Process step's UMI-assignment pass can slice the value without
         // re-scanning aux data (issue #334). In `--no-umi` mode the
@@ -1173,7 +1211,10 @@ impl Command for MarkDuplicates {
                 // Collect metrics
                 {
                     let mut agg = collected_metrics_clone.lock();
-                    agg.dedup_counts.merge(&processed.dedup_counts);
+                    agg.dedup_counts_by_library
+                        .entry(processed.library_idx)
+                        .or_default()
+                        .merge(&processed.dedup_counts);
                     for (size, count) in &processed.family_sizes {
                         *agg.family_sizes.entry(*size).or_insert(0) += count;
                     }
@@ -1254,12 +1295,24 @@ impl Command for MarkDuplicates {
         let aggregated = Arc::try_unwrap(collected_metrics)
             .expect("bug: metrics Arc still shared after pipeline join")
             .into_inner();
-        let final_counts = aggregated.dedup_counts;
+        let final_counts_by_library = aggregated.dedup_counts_by_library;
         let final_family_sizes = aggregated.family_sizes;
+
+        // Total across all libraries: used both for the summary log / `tc`-tag
+        // check below and as the metrics file's aggregate "All Reads" row.
+        let mut final_counts = DedupCounts::default();
+        for library_counts in final_counts_by_library.values() {
+            final_counts.merge(library_counts);
+        }
 
         // Write metrics file
         if let Some(metrics_path) = &self.metrics {
-            write_dedup_metrics(&final_counts, metrics_path)?;
+            write_dedup_metrics(
+                &final_counts_by_library,
+                &final_counts,
+                &library_index_for_metrics,
+                metrics_path,
+            )?;
         }
 
         // Write family size histogram
@@ -1316,10 +1369,31 @@ impl Command for MarkDuplicates {
 // Metrics writing
 //////////////////////////////////////////////////////////////////////////////
 
-fn write_dedup_metrics(counts: &DedupCounts, path: &PathBuf) -> Result<()> {
-    let output: DeduplicationMetrics = counts.into();
+/// Writes one metrics row per library observed in `per_library`, sorted by
+/// library name for deterministic output, followed by a final "All Reads"
+/// row summing across every library.
+///
+/// Single-library inputs still get two rows (the one library, then "All
+/// Reads") rather than collapsing to a single row: this keeps the output
+/// shape uniform regardless of how many libraries the input actually has, so
+/// downstream readers never need to special-case the single-library count.
+fn write_dedup_metrics(
+    per_library: &AHashMap<u16, DedupCounts>,
+    total: &DedupCounts,
+    library_index: &LibraryIndex,
+    path: &PathBuf,
+) -> Result<()> {
+    let mut rows: Vec<DeduplicationMetrics> = per_library
+        .iter()
+        .map(|(&idx, counts)| {
+            to_deduplication_metrics(library_display_name(idx, library_index), counts)
+        })
+        .collect();
+    rows.sort_by(|a, b| a.library.cmp(&b.library));
+    rows.push(to_deduplication_metrics("All Reads".to_string(), total));
+
     DelimFile::default()
-        .write_tsv(path, [output])
+        .write_tsv(path, rows)
         .with_context(|| format!("Failed to write dedup metrics: {}", path.display()))?;
     Ok(())
 }
@@ -2633,8 +2707,9 @@ mod tests {
             passthrough_templates: 3,
             filter_counts,
         };
-        let output = DeduplicationMetrics::from(&counts);
+        let output = to_deduplication_metrics("lib1".to_string(), &counts);
 
+        assert_eq!(output.library, "lib1");
         assert_eq!(output.filtered_malformed_record, 1);
         assert_eq!(output.filtered_no_primary_reads, 2);
         assert_eq!(output.filtered_unmapped, 3);
@@ -2656,6 +2731,12 @@ mod tests {
         assert_eq!(output.secondary_reads, 10);
         assert_eq!(output.supplementary_reads, 5);
         assert_eq!(output.missing_tc_tag, 2);
+    }
+
+    #[test]
+    fn test_library_display_name_unknown_bucket() {
+        let library_index = LibraryIndex::default();
+        assert_eq!(library_display_name(0, &library_index), "Unknown Library");
     }
 
     /// Nothing may vanish silently: everything read is either filtered or written.
@@ -2682,7 +2763,7 @@ mod tests {
             filter_counts,
             ..DedupCounts::default()
         };
-        let output = DeduplicationMetrics::from(&counts);
+        let output = to_deduplication_metrics("lib1".to_string(), &counts);
 
         assert_eq!(
             output.filtered_templates + output.total_templates,
@@ -2702,9 +2783,13 @@ mod tests {
             unique_templates: 0,
             ..DedupCounts::default()
         };
+        let mut per_library = AHashMap::new();
+        per_library.insert(0u16, counts.clone());
+        let library_index = LibraryIndex::default();
+
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("dedup.metrics.txt");
-        write_dedup_metrics(&counts, &path)?;
+        write_dedup_metrics(&per_library, &counts, &library_index, &path)?;
 
         let text = std::fs::read_to_string(&path)?;
         let header: Vec<&str> = text.lines().next().expect("header").split('\t').collect();
@@ -3091,6 +3176,7 @@ mod tests {
             templates,
             family_sizes: AHashMap::new(),
             dedup_counts: DedupCounts::default(),
+            library_idx: 0,
             input_record_count: 1,
             distinct_mi_count: 0,
         };
