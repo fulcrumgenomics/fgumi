@@ -10,6 +10,13 @@
 //!   and `stored_bypass` is the bypass win.
 //! * `deflate_level6` — deflate-compressed input. Regression guard: the
 //!   bypass logic must not perturb the compressed path.
+//! * `decode_verify_crc` / `decode_skip_crc` — same block sets (stored AND
+//!   compressed), decoded via `decompress_block_into_opts` with
+//!   `verify_crc = true` / `false`. The delta between these two rows is the
+//!   CRC32-skip win in isolation; it should be larger, proportionally, on
+//!   stored blocks (no libdeflater call to amortize the CRC cost against)
+//!   than on compressed blocks (CRC is a smaller fraction of already-heavier
+//!   libdeflater work).
 //!
 //! Producers like `samtools view -u`, htsjdk's level-0 writer, and our own
 //! `InlineBgzfCompressor::new(0)` emit stored blocks, so the `stored_bypass`
@@ -25,7 +32,9 @@ use std::hint::black_box;
 use std::io::Cursor;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use fgumi_bgzf::reader::{RawBgzfBlock, decompress_block_into, read_raw_blocks};
+use fgumi_bgzf::reader::{
+    RawBgzfBlock, decompress_block_into, decompress_block_into_opts, read_raw_blocks,
+};
 use fgumi_bgzf::writer::InlineBgzfCompressor;
 use libdeflater::Decompressor;
 
@@ -108,6 +117,26 @@ fn decode_stream_via_libdeflater(stream: &[u8], scratch: &mut Vec<u8>) {
     black_box(&*scratch);
 }
 
+/// Drive the full read + decompress path over a pre-encoded BGZF stream via
+/// `decompress_block_into_opts`, toggling CRC32 verification. Used to
+/// isolate the CRC32-skip win from the stored-block bypass measured above.
+fn decode_stream_opts(stream: &[u8], scratch: &mut Vec<u8>, verify_crc: bool) {
+    scratch.clear();
+    let mut reader = Cursor::new(stream);
+    let mut decompressor = Decompressor::new();
+    loop {
+        let blocks = read_raw_blocks(&mut reader, BLOCKS_PER_BATCH).expect("read_raw_blocks");
+        if blocks.is_empty() {
+            break;
+        }
+        for block in &blocks {
+            decompress_block_into_opts(block, &mut decompressor, scratch, verify_crc)
+                .expect("decompress");
+        }
+    }
+    black_box(&*scratch);
+}
+
 /// Decompress a single block via libdeflater, with no stored-block bypass —
 /// the path the reader took before this bench was added. Mirrors the
 /// pre-bypass production behavior: zero-length blocks are short-circuited
@@ -179,6 +208,32 @@ fn bench_decode(c: &mut Criterion) {
             b.iter(|| decode_stream(stream, &mut scratch));
         },
     );
+
+    // CRC32-skip win, isolated via `decompress_block_into_opts`. Covers both
+    // block kinds: stored blocks (no libdeflater call, so CRC is a larger
+    // fraction of total decode work) and compressed blocks (libdeflater
+    // dominates, so the CRC fraction — and thus the skip win — is smaller).
+    for (id, stream) in [("stored", &stored_stream), ("deflate_level6", &deflate_stream)] {
+        let bench_id = format!("{id}-{}KiB-stream", stream.len() / 1024);
+
+        group.bench_with_input(
+            BenchmarkId::new("decode_verify_crc", &bench_id),
+            stream,
+            |b, stream| {
+                let mut scratch = Vec::with_capacity(PAYLOAD_BYTES);
+                b.iter(|| decode_stream_opts(stream, &mut scratch, true));
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("decode_skip_crc", &bench_id),
+            stream,
+            |b, stream| {
+                let mut scratch = Vec::with_capacity(PAYLOAD_BYTES);
+                b.iter(|| decode_stream_opts(stream, &mut scratch, false));
+            },
+        );
+    }
 
     group.finish();
 }

@@ -268,7 +268,8 @@ pub fn read_raw_blocks<R: Read + ?Sized>(
 // Decompression Helpers
 // ============================================================================
 
-/// Verify that decompressed data matches the expected size and CRC32 checksum.
+/// Verify that decompressed data matches the expected size and, optionally,
+/// CRC32 checksum.
 ///
 /// # Arguments
 ///
@@ -276,15 +277,19 @@ pub fn read_raw_blocks<R: Read + ?Sized>(
 /// * `expected_size` - The expected uncompressed size from the BGZF footer.
 /// * `expected_crc` - The expected CRC32 checksum from the BGZF footer.
 /// * `block_len` - The total block length (for error messages).
+/// * `verify_crc` - Whether to compare the CRC32 checksum. The size check
+///   always runs regardless of this flag.
 ///
 /// # Errors
 ///
-/// Returns an error if the size or CRC32 does not match.
+/// Returns an error if the size does not match, or if `verify_crc` is true
+/// and the CRC32 does not match.
 fn verify_decompression(
     decompressed: &[u8],
     expected_size: usize,
     expected_crc: u32,
     block_len: usize,
+    verify_crc: bool,
 ) -> io::Result<()> {
     let actual_size = decompressed.len();
     if actual_size != expected_size {
@@ -296,15 +301,17 @@ fn verify_decompression(
         ));
     }
 
-    let actual_crc = crc32fast::hash(decompressed);
-    if expected_crc != actual_crc {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "BGZF CRC32 mismatch: expected 0x{expected_crc:08x}, got 0x{actual_crc:08x}, \
-                 block_size={block_len}, uncompressed_size={expected_size}",
-            ),
-        ));
+    if verify_crc {
+        let actual_crc = crc32fast::hash(decompressed);
+        if expected_crc != actual_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "BGZF CRC32 mismatch: expected 0x{expected_crc:08x}, got 0x{actual_crc:08x}, \
+                     block_size={block_len}, uncompressed_size={expected_size}",
+                ),
+            ));
+        }
     }
 
     Ok(())
@@ -377,18 +384,7 @@ pub fn decompress_block_into(
     decompressor: &mut Decompressor,
     output: &mut Vec<u8>,
 ) -> io::Result<()> {
-    if block.is_eof() || block.uncompressed_size() == 0 {
-        return Ok(());
-    }
-
-    decompress_and_verify(
-        block.compressed_data(),
-        block.uncompressed_size(),
-        block.crc32(),
-        block.len(),
-        decompressor,
-        output,
-    )
+    decompress_block_into_opts(block, decompressor, output, true)
 }
 
 /// Decompress a BGZF block from raw bytes into a provided buffer.
@@ -415,22 +411,43 @@ pub fn decompress_block_slice_into(
     decompressor: &mut Decompressor,
     output: &mut Vec<u8>,
 ) -> io::Result<()> {
-    if data.len() < BGZF_HEADER_SIZE + BGZF_FOOTER_SIZE {
-        return Ok(());
-    }
+    decompress_block_slice_into_opts(data, decompressor, output, true)
+}
 
-    let uncompressed_size = uncompressed_size_from_slice(data);
-    if uncompressed_size == 0 {
+/// Like [`decompress_block_into`], but lets the caller skip CRC32 verification
+/// (`verify_crc = false`) for trusted input. The decompressed-size check is
+/// always performed. `verify_crc = true` is identical to `decompress_block_into`.
+///
+/// # Arguments
+///
+/// * `block` - The raw BGZF block to decompress.
+/// * `decompressor` - A reusable libdeflater decompressor.
+/// * `output` - Buffer to append decompressed data to.
+/// * `verify_crc` - Whether to verify the CRC32 checksum against the BGZF
+///   footer. The decompressed-size check always runs regardless.
+///
+/// # Errors
+///
+/// Returns an error if decompression fails, the decompressed size doesn't
+/// match the footer, or (when `verify_crc` is true) CRC32 verification fails.
+pub fn decompress_block_into_opts(
+    block: &RawBgzfBlock,
+    decompressor: &mut Decompressor,
+    output: &mut Vec<u8>,
+    verify_crc: bool,
+) -> io::Result<()> {
+    if block.is_eof() || block.uncompressed_size() == 0 {
         return Ok(());
     }
 
     decompress_and_verify(
-        compressed_data_from_slice(data),
-        uncompressed_size,
-        crc32_from_slice(data),
-        data.len(),
+        block.compressed_data(),
+        block.uncompressed_size(),
+        block.crc32(),
+        block.len(),
         decompressor,
         output,
+        verify_crc,
     )
 }
 
@@ -463,6 +480,8 @@ pub fn decompress_block_slice_into(
 /// * `decompressor` - Reusable libdeflater decompressor (unused on the
 ///   stored-block path).
 /// * `output` - Buffer that the decompressed bytes are appended to.
+/// * `verify_crc` - Whether to verify the CRC32 checksum against the BGZF
+///   footer. The decompressed-size check always runs regardless of this flag.
 fn decompress_and_verify(
     compressed: &[u8],
     uncompressed_size: usize,
@@ -470,6 +489,7 @@ fn decompress_and_verify(
     block_len: usize,
     decompressor: &mut Decompressor,
     output: &mut Vec<u8>,
+    verify_crc: bool,
 ) -> io::Result<()> {
     // Stored-block fast path. The deflate frame for a stored block is:
     //   byte 0   : BFINAL | BTYPE | (5 padding bits to next byte boundary)
@@ -488,6 +508,7 @@ fn decompress_and_verify(
             expected_crc,
             block_len,
             output,
+            verify_crc,
         );
     }
 
@@ -508,6 +529,7 @@ fn decompress_and_verify(
             uncompressed_size,
             expected_crc,
             block_len,
+            verify_crc,
         )
     })();
 
@@ -552,6 +574,7 @@ fn copy_stored_and_verify(
     expected_crc: u32,
     block_len: usize,
     output: &mut Vec<u8>,
+    verify_crc: bool,
 ) -> io::Result<()> {
     // Deflate framing is 5 bytes (BFINAL/BTYPE byte + LEN + NLEN).
     if compressed.len() < 5 {
@@ -590,6 +613,7 @@ fn copy_stored_and_verify(
         uncompressed_size,
         expected_crc,
         block_len,
+        verify_crc,
     );
     if result.is_err() {
         output.truncate(start);
@@ -884,6 +908,7 @@ mod tests {
             block.len(),
             &mut decompressor,
             &mut output,
+            true,
         );
 
         assert!(result.is_err());
@@ -1079,6 +1104,67 @@ mod tests {
         assert!(
             err.to_string().contains("stored block too small"),
             "error should mention truncated stored framing: {err}"
+        );
+        assert!(out.is_empty(), "output should be rolled back on failure");
+    }
+
+    /// `decompress_block_into_opts(.., verify_crc = false)` must still catch a
+    /// decompressed-size mismatch (that check is unconditional per
+    /// `verify_decompression`), but must **not** reject a corrupted CRC32 —
+    /// that's the whole point of the toggle. `verify_crc = true` must behave
+    /// exactly like `decompress_block_into` (reject both).
+    #[test]
+    fn decompress_opts_skips_crc_but_still_checks_size() {
+        use crate::writer::InlineBgzfCompressor;
+
+        let original = b"decompress opts skip crc test payload bytes, long enough to compress";
+        let mut compressor = InlineBgzfCompressor::new(6);
+        compressor.write_all(original).expect("write");
+        compressor.flush().expect("flush");
+        let blocks = compressor.take_blocks();
+        assert_eq!(blocks.len(), 1);
+
+        // Corrupt only the footer's CRC32 (first 4 of the 8 footer bytes).
+        let mut crc_corrupted = blocks[0].data.clone();
+        let crc_off = crc_corrupted.len() - BGZF_FOOTER_SIZE;
+        crc_corrupted[crc_off] ^= 0x01;
+        let crc_block = RawBgzfBlock { data: crc_corrupted };
+
+        let mut decompressor = Decompressor::new();
+
+        // verify_crc = true: a CRC32 mismatch must still be rejected —
+        // identical behavior to `decompress_block_into`.
+        let mut out = Vec::new();
+        let err = decompress_block_into_opts(&crc_block, &mut decompressor, &mut out, true)
+            .expect_err("verify_crc=true must catch a CRC32 mismatch");
+        assert!(err.to_string().contains("CRC32"), "error should mention CRC32: {err}");
+        assert!(out.is_empty(), "output should be rolled back on failure");
+
+        // verify_crc = false: the same CRC32 mismatch must now be accepted,
+        // and the decompressed bytes must still be correct — only the CRC
+        // compare is skipped, decompression itself is unaffected.
+        let mut out = Vec::new();
+        decompress_block_into_opts(&crc_block, &mut decompressor, &mut out, false)
+            .expect("verify_crc=false must skip the CRC32 check");
+        assert_eq!(out.as_slice(), original.as_slice());
+
+        // Separately: a block whose decompressed size disagrees with the
+        // footer's ISIZE must still error even with verify_crc=false — the
+        // size check in `verify_decompression` is unconditional. Corrupt
+        // ISIZE (the low byte of the last 4 footer bytes) upward so the
+        // requested output size no longer matches what libdeflater actually
+        // produces.
+        let mut size_corrupted = blocks[0].data.clone();
+        let isize_off = size_corrupted.len() - 4;
+        size_corrupted[isize_off] = size_corrupted[isize_off].wrapping_add(1);
+        let size_block = RawBgzfBlock { data: size_corrupted };
+
+        let mut out = Vec::new();
+        let err = decompress_block_into_opts(&size_block, &mut decompressor, &mut out, false)
+            .expect_err("verify_crc=false must still catch a decompressed-size mismatch");
+        assert!(
+            err.to_string().contains("size mismatch"),
+            "error should mention the size mismatch: {err}"
         );
         assert!(out.is_empty(), "output should be rolled back on failure");
     }
