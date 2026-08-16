@@ -821,6 +821,7 @@ dependencies = [
  "anyhow",
  "bstr 1.13.1",
  "bytemuck",
+ "criterion",
  "fgumi-dna",
  "fgumi-tag",
  "noodles",
