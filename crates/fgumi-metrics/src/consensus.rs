@@ -145,6 +145,26 @@ pub struct ConsensusMetrics {
     /// Reads rejected because overlap clipping failed (fgbio `clip_overlap_failed`;
     /// codec)
     pub rejected_clip_overlap_failed: u64,
+
+    /// Consensus reads rejected for high duplex disagreement (fgbio
+    /// `consensusReadsFilteredHighDisagreement`, emitted as
+    /// `consensus_reads_rejected_hdd`; codec)
+    ///
+    /// Counts whole molecules, unlike `rejected_high_duplex_disagreement`, which
+    /// counts the raw reads those molecules were built from.
+    pub consensus_reads_rejected_hdd: u64,
+
+    /// Total consensus bases emitted in consensus reads (fgbio
+    /// `consensus_bases_emitted`; codec)
+    pub consensus_bases_emitted: u64,
+
+    /// Consensus bases emitted with support from both strands of the duplex (fgbio
+    /// `consensus_duplex_bases_emitted`; codec)
+    pub consensus_duplex_bases_emitted: u64,
+
+    /// Consensus bases at which the top and bottom strands disagreed (fgbio
+    /// `duplex_disagreement_base_count`; codec)
+    pub duplex_disagreement_base_count: u64,
 }
 
 /// The consensus caller whose statistics are being rendered.
@@ -280,7 +300,22 @@ impl ConsensusMetrics {
             rejected_indel_error_between_strands: 0,
             rejected_high_duplex_disagreement: 0,
             rejected_clip_overlap_failed: 0,
+            consensus_reads_rejected_hdd: 0,
+            consensus_bases_emitted: 0,
+            consensus_duplex_bases_emitted: 0,
+            duplex_disagreement_base_count: 0,
         }
+    }
+
+    /// The fraction of emitted duplex bases at which the two strands disagreed.
+    ///
+    /// Returns 0.0 when no duplex bases were emitted, matching fgbio's
+    /// `if (this.totalDuplexBases == 0) 0` guard in `CodecConsensusCaller`.
+    /// Only meaningful for the codec caller; the other callers leave both
+    /// counters at zero.
+    #[must_use]
+    pub fn duplex_disagreement_rate(&self) -> f64 {
+        frac_u64(self.duplex_disagreement_base_count, self.consensus_duplex_bases_emitted)
     }
 
     /// Returns the rejection count for a specific reason.
@@ -385,6 +420,10 @@ impl ConsensusMetrics {
     /// `indel_error_between_strands`, `high_duplex_disagreement`,
     /// `clip_overlap_failed`) plus `not_primary_fr_pair`.
     /// fgumi-specific finer-grained reasons are emitted only when non-zero.
+    ///
+    /// The codec kind additionally appends fgbio's five codec-only rows
+    /// (`consensus_reads_rejected_hdd` through `duplex_disagreement_rate`) after
+    /// `consensus_reads_emitted`, matching `CodecConsensusCaller.statistics`.
     #[must_use]
     pub fn to_kv_metrics(&self, kind: ConsensusCallerKind) -> Vec<ConsensusKvMetric> {
         let mut metrics = Vec::new();
@@ -444,6 +483,37 @@ impl ConsensusMetrics {
             self.consensus_reads.to_string(),
             "Total number of consensus reads (R1+R2=2) emitted.",
         ));
+
+        // Codec-only tail: fgbio's `CodecConsensusCaller.statistics` is
+        // `super.statistics ++` these five rows, so they trail the shared rows in
+        // exactly this order.
+        if matches!(kind, ConsensusCallerKind::Codec) {
+            metrics.push(ConsensusKvMetric::new(
+                "consensus_reads_rejected_hdd",
+                self.consensus_reads_rejected_hdd.to_string(),
+                "Consensus Reads Rejected: High Duplex Disagreement",
+            ));
+            metrics.push(ConsensusKvMetric::new(
+                "consensus_bases_emitted",
+                self.consensus_bases_emitted.to_string(),
+                "Total consensus bases emitted in consensus reads",
+            ));
+            metrics.push(ConsensusKvMetric::new(
+                "consensus_duplex_bases_emitted",
+                self.consensus_duplex_bases_emitted.to_string(),
+                "Consensus bases emitted with support from both strands of the duplex",
+            ));
+            metrics.push(ConsensusKvMetric::new(
+                "duplex_disagreement_base_count",
+                self.duplex_disagreement_base_count.to_string(),
+                "Number of consensus bases at which the top and bottom strands disagreed",
+            ));
+            metrics.push(ConsensusKvMetric::new(
+                "duplex_disagreement_rate",
+                format_float(self.duplex_disagreement_rate()),
+                "Rate of top/bottom strand disagreement within duplex regions of consensus reads",
+            ));
+        }
 
         metrics
     }
@@ -841,6 +911,112 @@ mod tests {
             find("raw_reads_rejected_for_potential_umi_collision").as_deref(),
             Some("Potential collision between independent duplex molecules")
         );
+    }
+
+    /// The five codec-only rows fgbio appends after `consensus_reads_emitted`
+    /// (`CodecConsensusCaller.statistics`), in fgbio's order, with fgbio's exact
+    /// key names and description strings.
+    const EXPECTED_CODEC_TAIL: &[(&str, &str)] = &[
+        ("consensus_reads_rejected_hdd", "Consensus Reads Rejected: High Duplex Disagreement"),
+        ("consensus_bases_emitted", "Total consensus bases emitted in consensus reads"),
+        (
+            "consensus_duplex_bases_emitted",
+            "Consensus bases emitted with support from both strands of the duplex",
+        ),
+        (
+            "duplex_disagreement_base_count",
+            "Number of consensus bases at which the top and bottom strands disagreed",
+        ),
+        (
+            "duplex_disagreement_rate",
+            "Rate of top/bottom strand disagreement within duplex regions of consensus reads",
+        ),
+    ];
+
+    /// #748: fgbio's `CodecConsensusCaller.statistics` is `super.statistics ++` five
+    /// codec-only rows, so they must trail `consensus_reads_emitted` in that exact
+    /// order with fgbio's exact descriptions — the two tools' stats files are meant
+    /// to be diffable, and fgumi previously dropped all five.
+    #[test]
+    fn test_to_kv_metrics_codec_emits_codec_only_tail() {
+        let mut metrics = ConsensusMetrics::new();
+        metrics.consensus_reads = 450;
+        metrics.consensus_reads_rejected_hdd = 7;
+        metrics.consensus_bases_emitted = 45_000;
+        metrics.consensus_duplex_bases_emitted = 400;
+        metrics.duplex_disagreement_base_count = 10;
+
+        let codec = metrics.to_kv_metrics(ConsensusCallerKind::Codec);
+
+        // The five rows must be the *tail* of the file, immediately after the final
+        // `consensus_reads_emitted` row, not merely present somewhere.
+        let tail = codec
+            .get(codec.len() - EXPECTED_CODEC_TAIL.len() - 1..)
+            .expect("codec KV metrics should be longer than the codec-only tail");
+        assert_eq!(tail[0].key, "consensus_reads_emitted", "codec-only rows must trail the file");
+        let emitted_tail: Vec<(&str, &str)> =
+            tail[1..].iter().map(|m| (m.key.as_str(), m.description.as_str())).collect();
+        assert_eq!(
+            emitted_tail.as_slice(),
+            EXPECTED_CODEC_TAIL,
+            "codec-only KV rows must match fgbio's order, keys and descriptions"
+        );
+
+        let value_for = |key: &str| {
+            codec.iter().find(|m| m.key == key).map_or_else(
+                || panic!("codec KV metrics should contain a `{key}` row"),
+                |m| m.value.as_str(),
+            )
+        };
+        assert_eq!(value_for("consensus_reads_rejected_hdd"), "7");
+        assert_eq!(value_for("consensus_bases_emitted"), "45000");
+        assert_eq!(value_for("consensus_duplex_bases_emitted"), "400");
+        assert_eq!(value_for("duplex_disagreement_base_count"), "10");
+        // 10 / 400, rendered through the same fixed-precision helper as
+        // `frac_raw_reads_used` so every float row in the file agrees.
+        assert_eq!(value_for("duplex_disagreement_rate"), format_float(0.025));
+    }
+
+    /// fgbio adds these rows in `CodecConsensusCaller` only; the vanilla and duplex
+    /// callers must not emit them, even at zero.
+    #[test]
+    fn test_to_kv_metrics_non_codec_omits_codec_only_tail() {
+        let mut metrics = ConsensusMetrics::new();
+        metrics.consensus_reads_rejected_hdd = 7;
+        metrics.consensus_bases_emitted = 45_000;
+        metrics.consensus_duplex_bases_emitted = 400;
+        metrics.duplex_disagreement_base_count = 10;
+
+        for kind in [ConsensusCallerKind::Vanilla, ConsensusCallerKind::Duplex] {
+            let kv = metrics.to_kv_metrics(kind);
+            assert_eq!(
+                kv.last().map(|m| m.key.as_str()),
+                Some("consensus_reads_emitted"),
+                "{kind:?} stats must still end at consensus_reads_emitted"
+            );
+            for (key, _) in EXPECTED_CODEC_TAIL {
+                assert!(
+                    !kv.iter().any(|m| m.key == *key),
+                    "{kind:?} KV metrics must not emit the codec-only row {key}"
+                );
+            }
+        }
+    }
+
+    /// `duplex_disagreement_rate` divides by `consensus_duplex_bases_emitted`, which
+    /// is zero whenever no duplex bases were emitted. fgbio guards this with
+    /// `if (this.totalDuplexBases == 0) 0`; the row must still be emitted, as 0.
+    #[test]
+    fn test_duplex_disagreement_rate_zero_denominator() {
+        let metrics = ConsensusMetrics::new();
+        assert!(metrics.duplex_disagreement_rate().abs() < f64::EPSILON);
+
+        let codec = metrics.to_kv_metrics(ConsensusCallerKind::Codec);
+        let rate = codec
+            .iter()
+            .find(|m| m.key == "duplex_disagreement_rate")
+            .expect("duplex_disagreement_rate row should be emitted even at zero");
+        assert_eq!(rate.value, format_float(0.0));
     }
 
     #[test]

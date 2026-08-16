@@ -927,6 +927,7 @@ impl CodecConsensusCaller {
         )?;
 
         self.stats.consensus_reads_generated += 1;
+        self.stats.consensus_bases_emitted += consensus.bases.len() as u64;
         Ok(output)
     }
 
@@ -1347,8 +1348,6 @@ impl CodecConsensusCaller {
         // Check duplex disagreement rate
         if duplex_bases_count > 0 {
             let duplex_error_rate = duplex_disagreements as f64 / duplex_bases_count as f64;
-            self.stats.consensus_duplex_bases_emitted += duplex_bases_count as u64;
-            self.stats.duplex_disagreement_base_count += duplex_disagreements as u64;
 
             if duplex_disagreements > self.options.max_duplex_disagreements {
                 return Err(CodecConsensusError::DuplexDisagreementCount {
@@ -1360,6 +1359,13 @@ impl CodecConsensusCaller {
                     rate: duplex_error_rate,
                 });
             }
+
+            // Accumulate only once the molecule has survived both rejection checks:
+            // a rejected molecule emits nothing, so it contributes no duplex bases.
+            // fgbio does the same, incrementing `totalDuplexBases`/`duplexErrorBases`
+            // in the accepted branch only (`CodecConsensusCaller.scala:264-268`).
+            self.stats.consensus_duplex_bases_emitted += duplex_bases_count as u64;
+            self.stats.duplex_disagreement_base_count += duplex_disagreements as u64;
         }
 
         Ok(SingleStrandConsensus {
@@ -2943,6 +2949,100 @@ mod tests {
             false,
             true,
         )
+    }
+
+    /// Permissive disagreement thresholds that accept
+    /// [`duplex_disagreement_fixture`], so it is consensus-called rather than
+    /// rejected.
+    fn permissive_disagreement_options() -> CodecConsensusOptions {
+        CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            max_duplex_disagreements: usize::MAX,
+            max_duplex_disagreement_rate: 1.0,
+            ..Default::default()
+        }
+    }
+
+    /// `consensus_bases_emitted` must total the bases of the consensus reads the
+    /// caller actually emits, mirroring fgbio's `totalConsensusBases +=
+    /// consensus.length` inside the accepted branch
+    /// (`CodecConsensusCaller.scala:266`). The field existed, was merged across
+    /// threads and was logged, but nothing ever incremented it, so it reported 0
+    /// for every run.
+    #[test]
+    fn test_consensus_bases_emitted_totals_emitted_consensus_bases() {
+        let mut caller = CodecConsensusCaller::new(
+            "codec".to_string(),
+            "RG1".to_string(),
+            permissive_disagreement_options(),
+        );
+
+        let output = caller
+            .consensus_reads_from_sam_records(duplex_disagreement_fixture())
+            .expect("permissive thresholds should emit a consensus");
+        assert_eq!(output.count, 1, "fixture should produce exactly one consensus read");
+
+        let emitted_bases: u64 = ParsedBamRecord::parse_all(&output.data)
+            .iter()
+            .map(|record| record.bases.len() as u64)
+            .sum();
+        assert!(emitted_bases > 0, "fixture must emit a non-empty consensus");
+        assert_eq!(
+            caller.statistics().consensus_bases_emitted,
+            emitted_bases,
+            "consensus_bases_emitted must total the bases of the emitted consensus reads"
+        );
+    }
+
+    /// A molecule rejected for high duplex disagreement emits no consensus, so it
+    /// must contribute nothing to any of the three "emitted" base counters — fgbio
+    /// increments `totalConsensusBases`, `totalDuplexBases` and `duplexErrorBases`
+    /// only in the accepted branch, after the rejection check
+    /// (`CodecConsensusCaller.scala:258-268`). Counting a reject would inflate
+    /// `duplex_disagreement_rate` by exactly the molecules thrown out for
+    /// disagreeing, which is the opposite of what that metric reports.
+    ///
+    /// Each case isolates one rejection trigger by making the other threshold
+    /// permissive, so both early returns are covered.
+    #[rstest]
+    #[case::by_count(0, 1.0)]
+    #[case::by_rate(usize::MAX, 0.0)]
+    fn test_rejected_molecules_contribute_no_emitted_bases(
+        #[case] max_duplex_disagreements: usize,
+        #[case] max_duplex_disagreement_rate: f64,
+    ) {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            max_duplex_disagreements,
+            max_duplex_disagreement_rate,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        let Err(err) = caller.consensus_reads_typed(duplex_disagreement_fixture()) else {
+            panic!("zero-tolerance disagreement threshold should produce an error");
+        };
+        assert!(err.is_duplex_disagreement());
+
+        let stats = caller.statistics();
+        assert_eq!(
+            stats.consensus_bases_emitted, 0,
+            "a rejected molecule emits no consensus bases"
+        );
+        assert_eq!(
+            stats.consensus_duplex_bases_emitted, 0,
+            "a rejected molecule emits no duplex-supported bases"
+        );
+        assert_eq!(
+            stats.duplex_disagreement_base_count, 0,
+            "a rejected molecule's disagreements are not disagreements within emitted output"
+        );
+        assert!(
+            stats.duplex_disagreement_rate().abs() < f64::EPSILON,
+            "the rate must not be inflated by the molecules rejected for disagreeing"
+        );
     }
 
     /// Verifies that `consensus_reads_typed` returns the typed

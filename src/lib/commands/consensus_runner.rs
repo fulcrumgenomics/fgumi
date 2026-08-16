@@ -72,6 +72,13 @@ impl ConsensusStatsOps for CodecConsensusStats {
         metrics.consensus_reads = self.consensus_reads_generated;
         metrics.filtered_reads = self.reads_filtered;
 
+        // Codec-only counters backing fgbio's five codec `statistics` rows. The
+        // rate is derived from the last two, so it is not carried separately.
+        metrics.consensus_reads_rejected_hdd = self.consensus_reads_rejected_hdd;
+        metrics.consensus_bases_emitted = self.consensus_bases_emitted;
+        metrics.consensus_duplex_bases_emitted = self.consensus_duplex_bases_emitted;
+        metrics.duplex_disagreement_base_count = self.duplex_disagreement_base_count;
+
         // Convert rejection reasons to centralized reasons
         for (reason, count) in &self.rejection_reasons {
             metrics.add_rejection(reason.to_centralized(), *count as u64);
@@ -400,6 +407,43 @@ mod tests {
         assert_eq!(metrics.total_input_reads, 100);
         assert_eq!(metrics.consensus_reads, 50);
         assert_eq!(metrics.filtered_reads, 10);
+    }
+
+    /// #748: the codec-only counters must survive the hop from the caller's stats
+    /// into `ConsensusMetrics`, which is the only thing `to_kv_metrics` can see.
+    /// They were dropped here, so all five fgbio codec rows were absent from
+    /// `codec --stats` regardless of what the caller had counted.
+    #[cfg(feature = "codec")]
+    #[test]
+    fn test_codec_stats_to_metrics_carries_codec_counters() {
+        let mut stats = CodecConsensusStats {
+            total_input_reads: 100,
+            consensus_reads_generated: 40,
+            reads_filtered: 10,
+            consensus_reads_rejected_hdd: 3,
+            consensus_bases_emitted: 4_000,
+            consensus_duplex_bases_emitted: 400,
+            duplex_disagreement_base_count: 10,
+            ..Default::default()
+        };
+        // Rate is derived from the two duplex counters, so merging must keep the
+        // metrics view consistent with the caller's own view of the same run.
+        let extra = stats.clone();
+        ConsensusStatsOps::merge(&mut stats, &extra);
+
+        let metrics = stats.to_metrics();
+        assert_eq!(metrics.total_input_reads, 200);
+        assert_eq!(metrics.consensus_reads, 80);
+        assert_eq!(metrics.filtered_reads, 20);
+        assert_eq!(metrics.consensus_reads_rejected_hdd, 6);
+        assert_eq!(metrics.consensus_bases_emitted, 8_000);
+        assert_eq!(metrics.consensus_duplex_bases_emitted, 800);
+        assert_eq!(metrics.duplex_disagreement_base_count, 20);
+        assert!(
+            (metrics.duplex_disagreement_rate() - stats.duplex_disagreement_rate()).abs()
+                < f64::EPSILON,
+            "the metrics view must derive the same rate as the caller's stats"
+        );
     }
 
     #[test]
