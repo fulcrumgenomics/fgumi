@@ -237,6 +237,86 @@ pub struct Duplex {
     pub reference: Option<std::path::PathBuf>,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DuplexOptions — the stage's tuning knobs, projected out of the CLI struct
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Duplex-stage tuning, independent of how the values were supplied.
+///
+/// See [`crate::commands::zipper::ZipperOptions`] for why this is a plain
+/// struct rather than a flattened `clap::Args`. Note that the consensus-calling
+/// knobs are held **flat** here even though [`Duplex`] nests them behind
+/// `#[command(flatten)]` sub-structs: the chain builder wants one bag per stage,
+/// not a re-run of the CLI's grouping.
+#[derive(Debug, Clone)]
+pub struct DuplexOptions {
+    /// Pre-UMI error rate (phred).
+    pub error_rate_pre_umi: u8,
+    /// Post-UMI error rate (phred).
+    pub error_rate_post_umi: u8,
+    /// Minimum input base quality.
+    pub min_input_base_quality: u8,
+    /// Emit per-base consensus tags.
+    pub output_per_base_tags: bool,
+    /// Trim consensus reads.
+    pub trim: bool,
+    /// Minimum consensus base quality.
+    pub min_consensus_base_quality: u8,
+    /// How to resolve a near-tie between the two most likely consensus bases.
+    pub tie_rule: fgumi_consensus::TieRule,
+    /// Call overlapping bases jointly.
+    pub consensus_call_overlapping_bases: bool,
+    /// Minimum reads per consensus, per tier.
+    pub min_reads: Vec<usize>,
+    /// Cap on reads per strand.
+    pub max_reads_per_strand: Option<usize>,
+    /// Let fully-unmapped primary templates through the pre-group filter.
+    ///
+    /// Carried as the whole flattened sub-struct, like `io` / `rejects_opts` /
+    /// `read_group`, rather than as a bare `bool`.
+    pub allow_unmapped: AllowUnmappedOptions,
+    /// Input/output paths and reader mode.
+    pub io: BamIoOptions,
+    /// Optional rejects output.
+    pub rejects_opts: RejectsOptions,
+    /// Optional stats output.
+    pub stats_opts: StatsOptions,
+    /// Read-group identity for emitted reads.
+    pub read_group: ReadGroupOptions,
+    /// Resolved methylation calling mode (`Disabled` when the flag is unset).
+    pub methylation_mode: fgumi_consensus::MethylationMode,
+    /// Reference FASTA for methylation-aware modes.
+    pub reference: Option<std::path::PathBuf>,
+}
+
+impl Duplex {
+    /// Project the parsed CLI flags into [`DuplexOptions`].
+    #[must_use]
+    pub fn to_duplex_options(&self) -> DuplexOptions {
+        DuplexOptions {
+            error_rate_pre_umi: self.consensus.error_rate_pre_umi,
+            error_rate_post_umi: self.consensus.error_rate_post_umi,
+            min_input_base_quality: self.consensus.min_input_base_quality,
+            output_per_base_tags: self.consensus.output_per_base_tags,
+            trim: self.consensus.trim,
+            min_consensus_base_quality: self.consensus.min_consensus_base_quality,
+            tie_rule: self.consensus.tie_rule.into(),
+            consensus_call_overlapping_bases: self.overlapping.consensus_call_overlapping_bases,
+            min_reads: self.min_reads.clone(),
+            max_reads_per_strand: self.max_reads_per_strand,
+            allow_unmapped: self.allow_unmapped.clone(),
+            io: self.io.clone(),
+            rejects_opts: self.rejects_opts.clone(),
+            stats_opts: self.stats_opts.clone(),
+            read_group: self.read_group.clone(),
+            methylation_mode: crate::commands::common::resolve_methylation_mode(
+                self.methylation_mode,
+            ),
+            reference: self.reference.clone(),
+        }
+    }
+}
+
 impl Command for Duplex {
     /// Executes the duplex consensus calling pipeline.
     ///
@@ -966,6 +1046,110 @@ fn has_both_strands_raw(records: &[RawRecord]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every tuning flag must survive the projection into [`DuplexOptions`].
+    /// See the simplex counterpart for why this parses rather than constructs.
+    #[test]
+    fn to_duplex_options_carries_every_tuning_flag() {
+        let cmd = Duplex::try_parse_from([
+            "duplex",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--error-rate-pre-umi",
+            "41",
+            "--error-rate-post-umi",
+            "36",
+            "--min-input-base-quality",
+            "18",
+            "--output-per-base-tags=false",
+            "--trim=true",
+            "--min-consensus-base-quality",
+            "21",
+            "--tie-rule",
+            "ulp-relative",
+            "--consensus-call-overlapping-bases=false",
+            "--min-reads",
+            "3,2,1",
+            "--max-reads-per-strand",
+            "55",
+            "--rejects",
+            "rej.bam",
+            "--stats",
+            "stats.txt",
+            "--read-group-id",
+            "Z",
+            "--read-name-prefix",
+            "pfx",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            "ref.fa",
+            "--allow-unmapped=true",
+        ])
+        .expect("parses");
+
+        let opts = cmd.to_duplex_options();
+
+        assert_eq!(opts.error_rate_pre_umi, 41);
+        assert_eq!(opts.error_rate_post_umi, 36);
+        assert_eq!(opts.min_input_base_quality, 18);
+        assert!(!opts.output_per_base_tags, "an explicit false must not be lost");
+        assert!(opts.trim);
+        assert_eq!(opts.min_consensus_base_quality, 21);
+        assert_eq!(
+            opts.tie_rule,
+            fgumi_consensus::TieRule::UlpRelative,
+            "--tie-rule must reach the projection"
+        );
+        assert!(!opts.consensus_call_overlapping_bases);
+        assert_eq!(opts.min_reads, vec![3, 2, 1]);
+        assert_eq!(opts.max_reads_per_strand, Some(55));
+        assert!(opts.allow_unmapped.enabled, "--allow-unmapped must reach the projection");
+        assert_eq!(
+            opts.methylation_mode,
+            fgumi_consensus::MethylationMode::EmSeq,
+            "--methylation-mode must reach the projection",
+        );
+        assert_eq!(opts.reference, Some(std::path::PathBuf::from("ref.fa")));
+        // The flattened sub-structs must come across whole, not field by field.
+        assert_eq!(opts.io.input, std::path::PathBuf::from("in.bam"));
+        assert_eq!(opts.io.output, std::path::PathBuf::from("out.bam"));
+        assert_eq!(opts.rejects_opts.rejects, Some(std::path::PathBuf::from("rej.bam")));
+        assert_eq!(opts.stats_opts.stats, Some(std::path::PathBuf::from("stats.txt")));
+        assert_eq!(opts.read_group.read_group_id, "Z");
+        assert_eq!(opts.read_group.read_name_prefix, Some("pfx".to_string()));
+    }
+
+    /// The projection must carry defaults faithfully too — a field hard-coded to
+    /// the value the non-default test happens to pass would slip through it.
+    #[test]
+    fn to_duplex_options_carries_defaults() {
+        let cmd =
+            Duplex::try_parse_from(["duplex", "-i", "in.bam", "-o", "out.bam"]).expect("parses");
+
+        let opts = cmd.to_duplex_options();
+
+        assert_eq!(opts.error_rate_pre_umi, 45);
+        assert_eq!(opts.error_rate_post_umi, 40);
+        assert_eq!(opts.min_input_base_quality, 10);
+        assert!(opts.output_per_base_tags);
+        assert!(!opts.trim);
+        assert_eq!(opts.min_consensus_base_quality, 2);
+        assert_eq!(opts.tie_rule, fgumi_consensus::TieRule::FgbioCompat);
+        assert!(opts.consensus_call_overlapping_bases);
+        assert_eq!(opts.min_reads, vec![1]);
+        assert_eq!(opts.max_reads_per_strand, None);
+        assert!(!opts.allow_unmapped.enabled);
+        assert_eq!(opts.methylation_mode, fgumi_consensus::MethylationMode::Disabled);
+        assert_eq!(opts.reference, None);
+        assert_eq!(opts.rejects_opts.rejects, None);
+        assert_eq!(opts.stats_opts.stats, None);
+        assert_eq!(opts.read_group.read_group_id, "A");
+        assert_eq!(opts.read_group.read_name_prefix, None);
+    }
+
     use anyhow::Result;
     use fgumi_bam_io::{create_bam_reader, create_bam_writer};
     use fgumi_raw_bam::{
