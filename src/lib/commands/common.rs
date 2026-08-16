@@ -446,15 +446,19 @@ pub struct BamIoOptions {
     /// transferred, or copied since it was written, where a flipped bit is
     /// exactly what CRC32 exists to catch. Pass `--check-crc` to force
     /// verification on (e.g. for stdin input you don't trust). Mutually
-    /// exclusive with `--no-check-crc`.
+    /// exclusive with `--no-check-crc`. Not every command honors this flag:
+    /// `downsample` never does; `clip`/`codec`/`duplex`/`simplex`/`correct`/`group`
+    /// only do when `--threads N` is given (their default, no-`--threads`
+    /// mode falls back to a reader that always verifies). Every run logs a
+    /// `CRC verify:` line at startup stating what actually happened.
     #[arg(long = "check-crc", default_value_t = false, conflicts_with = "no_check_crc")]
     pub check_crc: bool,
 
     /// Skip CRC32 verification while decoding the input.
     ///
     /// Trades the CRC32 integrity check for faster decode. See `--check-crc`
-    /// for the default policy this overrides. Mutually exclusive with
-    /// `--check-crc`.
+    /// for the default policy this overrides and which commands/modes this
+    /// has no effect on. Mutually exclusive with `--check-crc`.
     #[arg(long = "no-check-crc", default_value_t = false, conflicts_with = "check_crc")]
     pub no_check_crc: bool,
 }
@@ -1562,7 +1566,14 @@ pub use crate::validation::parse_memory_size;
 ///
 /// This consolidates the pipeline configuration boilerplate that is repeated
 /// across all multi-threaded commands: auto-tuning, scheduler strategy,
-/// stats collection, deadlock settings, and queue memory limits.
+/// stats collection, deadlock settings, queue memory limits, and the
+/// `--check-crc`/`--no-check-crc` CRC-verification policy (`io`).
+/// Centralizing `verify_crc` here (rather than each command setting
+/// `config.pipeline.verify_crc` individually after calling this) means every
+/// pipeline-backed command is guaranteed to populate it from
+/// [`BamIoOptions::effective_check_crc`] — a command that builds a
+/// `PipelineConfig` without going through here can't silently leave
+/// `verify_crc` at its default and log a setting it doesn't actually apply.
 ///
 /// After calling this, commands can further customize the returned config
 /// (e.g. setting `group_key_config` for raw-byte mode).
@@ -1570,6 +1581,7 @@ pub fn build_pipeline_config(
     scheduler_opts: &SchedulerOptions,
     compression: &CompressionOptions,
     queue_memory: &QueueMemoryOptions,
+    io: &BamIoOptions,
     num_threads: usize,
 ) -> anyhow::Result<BamPipelineConfig> {
     let mut config = BamPipelineConfig::auto_tuned(num_threads, compression.compression_level);
@@ -1579,6 +1591,7 @@ pub fn build_pipeline_config(
     }
     config.pipeline.deadlock_timeout_secs = scheduler_opts.deadlock_timeout_secs();
     config.pipeline.deadlock_recover_enabled = scheduler_opts.deadlock_recover_enabled();
+    config.pipeline.verify_crc = io.effective_check_crc();
 
     let queue_memory_limit_bytes = queue_memory.calculate_memory_limit(num_threads)?;
     config.pipeline.queue_memory_limit = queue_memory_limit_bytes;

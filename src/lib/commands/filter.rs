@@ -382,9 +382,9 @@ impl Filter {
             &self.scheduler_opts,
             &self.compression,
             &self.queue_memory,
+            &self.io,
             num_threads,
         )?;
-        pipeline_config.pipeline.verify_crc = self.io.effective_check_crc();
 
         let library_index = LibraryIndex::from_header(header);
         pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw_no_cell(library_index));

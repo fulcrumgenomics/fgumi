@@ -928,9 +928,9 @@ impl CorrectUmis {
             &self.scheduler_opts,
             &self.compression,
             &self.queue_memory,
+            &self.io,
             num_threads,
         )?;
-        pipeline_config.pipeline.verify_crc = self.io.effective_check_crc();
 
         // Enable raw-byte mode (correct uses TemplateGrouper, no cell tag needed)
         {

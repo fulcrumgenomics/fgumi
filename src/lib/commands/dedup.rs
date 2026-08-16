@@ -1113,9 +1113,9 @@ impl Command for MarkDuplicates {
             &self.scheduler_opts,
             &self.compression,
             &self.queue_memory,
+            &self.io,
             num_threads,
         )?;
-        pipeline_config.pipeline.verify_crc = reader_opts.verify_crc;
         info!("Scheduler: {:?}", self.scheduler_opts.strategy());
         info!("Using pipeline with {num_threads} threads");
 

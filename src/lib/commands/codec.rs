@@ -646,9 +646,9 @@ impl Codec {
             &self.scheduler_opts,
             &self.compression,
             &self.queue_memory,
+            &self.io,
             num_threads,
         )?;
-        pipeline_config.pipeline.verify_crc = self.io.effective_check_crc();
 
         // Per-thread metrics accumulator: bounded metric memory, no unbounded
         // queue. Rejects buffering semantics are preserved (see follow-up).

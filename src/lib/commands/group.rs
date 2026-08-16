@@ -980,9 +980,9 @@ impl Command for GroupReadsByUmi {
             &self.scheduler_opts,
             &self.compression,
             &self.queue_memory,
+            &self.io,
             num_threads,
         )?;
-        pipeline_config.pipeline.verify_crc = self.io.effective_check_crc();
 
         // Override stats: use shared stats if available (memory-debug feature)
         if let Some(stats) = shared_stats.as_ref() {
