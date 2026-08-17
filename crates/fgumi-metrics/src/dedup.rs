@@ -42,6 +42,10 @@ use crate::library_size::estimate_library_size;
 // Description column of that page's table.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeduplicationMetrics {
+    /// Sample name — the comma-joined unique `@RG SM:` values from the header,
+    /// or the `--sample` override. Constant across every row of a run; leads
+    /// the schema to match dupblaster/Picard `--stats` output.
+    pub sample: String,
     /// Library name, "Unknown Library", or "All Reads" (the aggregate row)
     pub library: String,
     /// Templates dropped by the filter (any reason)
@@ -114,6 +118,8 @@ pub struct DeduplicationMetrics {
 /// per library, plus the total) readable and self-labeling.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeduplicationCounts {
+    /// Sample name (comma-joined `@RG SM:` values or the `--sample` override).
+    pub sample: String,
     /// Library name, "Unknown Library", or "All Reads".
     pub library: String,
     /// Templates dropped by the filter (any reason).
@@ -171,6 +177,7 @@ impl DeduplicationMetrics {
     #[must_use]
     pub fn from_counts(counts: DeduplicationCounts) -> Self {
         let DeduplicationCounts {
+            sample,
             library,
             filtered_templates,
             filtered_malformed_record,
@@ -194,6 +201,7 @@ impl DeduplicationMetrics {
             missing_tc_tag,
         } = counts;
         Self {
+            sample,
             library,
             filtered_templates,
             filtered_malformed_record,
@@ -262,16 +270,41 @@ pub struct DuplicationLadderMetrics {
     /// at this snapshot.
     #[serde(with = "crate::float")]
     pub duplicate_fraction: f64,
+    /// Templates added since the previous snapshot (this window's depth). Equals
+    /// `templates_seen` on the first snapshot.
+    pub window_templates: u64,
+    /// Marginal duplicate fraction over just this window's templates
+    /// (`window_duplicate_templates / window_templates`). Often the more legible
+    /// view of the saturation curve than the cumulative `duplicate_fraction`,
+    /// since it isolates each depth band instead of averaging over all prior
+    /// ones. Mirrors dupblaster's per-window complexity columns.
+    #[serde(with = "crate::float")]
+    pub window_duplicate_fraction: f64,
 }
 
 impl DuplicationLadderMetrics {
-    /// Builds one snapshot row from cumulative per-library counts.
+    /// Builds one snapshot row from cumulative and per-window per-library counts.
+    ///
+    /// `templates_seen`/`duplicate_templates` are the cumulative totals at this
+    /// snapshot; `window_templates`/`window_duplicate_templates` cover only the
+    /// templates added since the previous snapshot.
     #[must_use]
-    pub fn new(library: String, templates_seen: u64, duplicate_templates: u64) -> Self {
+    pub fn new(
+        library: String,
+        templates_seen: u64,
+        duplicate_templates: u64,
+        window_templates: u64,
+        window_duplicate_templates: u64,
+    ) -> Self {
         Self {
             library,
             templates_seen,
             duplicate_fraction: crate::frac_u64(duplicate_templates, templates_seen),
+            window_templates,
+            window_duplicate_fraction: crate::frac_u64(
+                window_duplicate_templates,
+                window_templates,
+            ),
         }
     }
 }
@@ -322,7 +355,7 @@ mod tests {
     fn serializes_expected_columns_in_order() {
         assert_eq!(
             header_of(DeduplicationMetrics::default()),
-            "library\tfiltered_templates\tfiltered_malformed_record\tfiltered_no_primary_reads\t\
+            "sample\tlibrary\tfiltered_templates\tfiltered_malformed_record\tfiltered_no_primary_reads\t\
              filtered_unmapped\tfiltered_not_passing_filter\tfiltered_low_mapping_quality\t\
              filtered_low_mate_mapping_quality\tfiltered_missing_umi\tfiltered_ns_in_umi\t\
              filtered_umi_too_short\tpassthrough_templates\ttotal_templates\tunique_templates\t\
@@ -450,18 +483,19 @@ mod tests {
         let mut lines = content.lines();
 
         let header: Vec<&str> = lines.next().expect("header line").split('\t').collect();
-        assert_eq!(header.first(), Some(&"library"), "library column must be first: {header:?}");
+        assert_eq!(header.first(), Some(&"sample"), "sample column must be first: {header:?}");
+        assert_eq!(header.get(1), Some(&"library"), "library column must be second: {header:?}");
         let size_col = header
             .iter()
             .position(|&h| h == "estimated_library_size")
             .expect("estimated_library_size column present");
 
         let lib1_row: Vec<&str> = lines.next().expect("lib1 row").split('\t').collect();
-        assert_eq!(lib1_row.first(), Some(&"lib1"));
+        assert_eq!(lib1_row.get(1), Some(&"lib1"), "library is the second column: {lib1_row:?}");
         assert!(!lib1_row[size_col].is_empty(), "lib1 has duplicates: {lib1_row:?}");
 
         let lib2_row: Vec<&str> = lines.next().expect("lib2 row").split('\t').collect();
-        assert_eq!(lib2_row.first(), Some(&"lib2"));
+        assert_eq!(lib2_row.get(1), Some(&"lib2"), "library is the second column: {lib2_row:?}");
         assert!(
             lib2_row[size_col].is_empty(),
             "lib2's None estimate must render empty: {lib2_row:?}"
@@ -469,13 +503,17 @@ mod tests {
     }
 
     #[test]
-    fn ladder_metric_computes_cumulative_fraction() {
-        let row = DuplicationLadderMetrics::new("lib1".to_string(), 100, 25);
+    fn ladder_metric_computes_cumulative_and_window_fractions() {
+        // Cumulative 25/100 = 0.25; this window 20/40 = 0.5 (a denser band).
+        let row = DuplicationLadderMetrics::new("lib1".to_string(), 100, 25, 40, 20);
         assert_eq!(row.library, "lib1");
         assert_eq!(row.templates_seen, 100);
         assert!((row.duplicate_fraction - 0.25).abs() < 1e-9);
-        // Div-by-zero guard: zero templates yields a defined 0.0 fraction.
-        let empty = DuplicationLadderMetrics::new("lib2".to_string(), 0, 0);
+        assert_eq!(row.window_templates, 40);
+        assert!((row.window_duplicate_fraction - 0.5).abs() < 1e-9);
+        // Div-by-zero guard: zero templates yields defined 0.0 fractions.
+        let empty = DuplicationLadderMetrics::new("lib2".to_string(), 0, 0, 0, 0);
         assert!(empty.duplicate_fraction.abs() < 1e-9);
+        assert!(empty.window_duplicate_fraction.abs() < 1e-9);
     }
 }
