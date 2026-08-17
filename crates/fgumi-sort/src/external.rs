@@ -1833,13 +1833,31 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             }
             let len = u32::from_le_bytes(len_buf) as usize;
 
+            // Fast path, same as the embedded case: the key and length have been
+            // consumed, so if the record itself is contiguous in the current
+            // block it can be borrowed in place. Previously every keyed record
+            // was copied into scratch, which on a template-coordinate merge is a
+            // full-record memcpy per record on the one thread that touches every
+            // record -- measured at 776,167,078 of 776,167,078 records (100%),
+            // against a comment claiming the borrow path took "the vast
+            // majority". Nothing about a keyed record makes it uncopyable; the
+            // borrow simply had not been extended past the embedded path.
+            if self.parser_state[source_id].remaining() >= len {
+                let st = &mut self.parser_state[source_id];
+                let start = st.current_pos;
+                let end = start + len;
+                st.current_pos = end;
+                st.cur_record = CurRecord::Borrowed { start, end };
+                return Ok(Some(key));
+            }
+
+            // Slow path: the record spans a block boundary, so it has to be
+            // reassembled into the source's scratch buffer.
             buf.clear();
             buf.resize(len, 0);
             if !self.read_exact_from_source(source_id, buf)? {
                 return Err(anyhow::anyhow!("truncated record in chunk source {source_id}"));
             }
-            // Keyed records are always presented from scratch — only the
-            // EMBEDDED coordinate/template path is zero-copy for now.
             self.parser_state[source_id].cur_record = CurRecord::Scratch;
             Ok(Some(key))
         }
@@ -7940,6 +7958,18 @@ mod tests {
     /// path that the zero-copy fast path falls back to. This guards that
     /// fast/slow split: the fast path handles the ~200 normal reads, the slow
     /// path the one oversized read, and every byte must round-trip.
+    ///
+    /// The split is asserted, not just described. It was described here (and in
+    /// `parse_next_record`) while the keyed orders in fact reassembled *every*
+    /// record: the borrow was implemented only for the `EMBEDDED_IN_RECORD`
+    /// keys, so a template-coordinate merge paid a full-record copy 776,167,078
+    /// times out of 776,167,078 on the one thread that touches every record.
+    /// Prose cannot catch that regression; a counter can.
+    ///
+    /// The counters are process-global, so under `cargo ci-test` (nextest,
+    /// process-per-test) these deltas are exactly this test's, while under a
+    /// thread-parallel `cargo test` a concurrent test can only inflate them.
+    /// Asserting lower bounds is therefore sound in both.
     #[rstest::rstest]
     #[case::coordinate(SortOrder::Coordinate)]
     #[case::template_coordinate(SortOrder::TemplateCoordinate)]
@@ -7979,6 +8009,9 @@ mod tests {
         let output = dir.path().join("output.bam");
         builder.write_bam(&input).expect("write_bam");
 
+        let borrowed_before = RECORD_BORROWED.load(std::sync::atomic::Ordering::Relaxed);
+        let reassembled_before = RECORD_REASSEMBLED.load(std::sync::atomic::Ordering::Relaxed);
+
         // Memory limit below the oversized record forces it into its own spill
         // chunk (so it is read back through the PoolDisk merge, not from memory);
         // two threads give a genuine multi-source merge.
@@ -8010,6 +8043,27 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 201, "spill + pool merge lost records");
+
+        // The fast/slow split the doc comment above describes.
+        let borrowed = RECORD_BORROWED.load(std::sync::atomic::Ordering::Relaxed) - borrowed_before;
+        let reassembled =
+            RECORD_REASSEMBLED.load(std::sync::atomic::Ordering::Relaxed) - reassembled_before;
+        assert!(
+            reassembled >= 1,
+            "the oversized record spans blocks and must reassemble into scratch, exercising the \
+             slow path; got {reassembled} reassembled for {sort_order:?}"
+        );
+        // Measured: 100 of the 201 records come back through the PoolDisk merge
+        // (the rest are served from the in-memory chunk, which never parses).
+        // With the keyed borrow removed this is 0 for TemplateCoordinate and
+        // unchanged at 100 for Coordinate, which is what makes this an
+        // order-sensitive guard rather than a restatement of the record count.
+        assert!(
+            borrowed >= 90,
+            "normal records are borrowed in place, so this merge must borrow ~100 of them -- 0 \
+             means the zero-copy path never fires for {sort_order:?}, which is how the keyed \
+             orders silently copied every record; got {borrowed} borrowed"
+        );
         let oversized_bases = oversized_bases.expect("oversized read must survive the merge");
         assert_eq!(
             oversized_bases.len(),
