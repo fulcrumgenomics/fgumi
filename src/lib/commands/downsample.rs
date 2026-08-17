@@ -10,7 +10,7 @@ use crate::sam::{SamTag, is_template_coordinate_sorted};
 use anyhow::{Result, bail};
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{RawBamWriter, create_raw_bam_reader, create_raw_bam_writer};
+use fgumi_bam_io::{RawBamWriter, create_raw_bam_reader_with_opts, create_raw_bam_writer};
 use fgumi_raw_bam::{
     RawBamReader, RawRecord, aux_data_slice, find_int_tag, find_string_tag, read_name,
 };
@@ -147,13 +147,10 @@ impl Command for Downsample {
         if self.validate_mi_order {
             info!("MI order validation: enabled");
         }
-        // downsample reads through noodles-bgzf directly (`create_raw_bam_reader`),
-        // not the fgumi-bgzf CRC-skip-capable decoder the unified pipeline uses, and
-        // has no `--threads` pipeline mode to fall back to, so --check-crc/
-        // --no-check-crc have no effect on this command; it always verifies.
-        log::info!(
-            "CRC verify: on (downsample always verifies; --check-crc/--no-check-crc have no effect)"
-        );
+        // downsample is single-threaded and reads through fgumi-bgzf's decoder
+        // (`create_raw_bam_reader_with_opts` with threads=1), so it honors
+        // --check-crc/--no-check-crc (#800).
+        self.io.log_effective_check_crc();
 
         // Initialize RNG
         let mut rng = match self.seed {
@@ -161,7 +158,8 @@ impl Command for Downsample {
             None => rand::make_rng(),
         };
 
-        let (reader, header) = create_raw_bam_reader(&self.io.input, 1)?;
+        let (reader, header) =
+            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
 
         // Validate header - input must be template-coordinate sorted (output from group)
         if !is_template_coordinate_sorted(&header) {

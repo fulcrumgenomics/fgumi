@@ -289,7 +289,9 @@ impl Command for Simplex {
 
         // Process reads using streaming by MI groups
         info!("Processing reads and calling consensus (streaming)...");
-        self.io.log_effective_check_crc_for_fast_path(self.threading.threads.is_some());
+        // Both the single-threaded fast path (create_raw_bam_reader_with_opts)
+        // and the multi-threaded pipeline honor --check-crc/--no-check-crc (#800).
+        self.io.log_effective_check_crc();
 
         // ============================================================
         // --threads N mode: Use 7-step unified pipeline
