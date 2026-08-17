@@ -31,13 +31,16 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{create_bam_reader_for_pipeline_with_opts, create_bam_writer};
+use fgumi_bam_io::{
+    PipelineReaderOpts, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
+    create_raw_bam_reader_from_stream_with_opts,
+};
 use fgumi_umi::IndexThreshold;
 // MemoryEstimate is gated because it's only used in memory-debug blocks below
 use crate::sam::SamTag;
 #[cfg(feature = "memory-debug")]
 use crate::unified_pipeline::MemoryEstimate;
-use fgumi_raw_bam::{RawBamReader, RawRecord};
+use fgumi_raw_bam::RawRecord;
 use log::{info, warn};
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
@@ -866,14 +869,13 @@ impl Command for GroupReadsByUmi {
 
         // Log threading configuration
         info!("{}", self.threading.log_message());
-        self.io.log_effective_check_crc_for_fast_path(self.threading.threads.is_some());
+        self.io.log_effective_check_crc();
 
         // Open input BAM using streaming-capable reader for pipeline use
         info!("Reading input BAM");
-        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-            &self.io.input,
-            self.io.pipeline_reader_opts(),
-        )?;
+        let reader_opts = self.io.pipeline_reader_opts();
+        let (reader, header) =
+            create_bam_reader_for_pipeline_with_opts(&self.io.input, reader_opts)?;
 
         // Sort order: see `classify_input_ordering` for why template-coordinate
         // is required, and why `--allow-unmapped` relaxes it to query grouping.
@@ -936,6 +938,7 @@ impl Command for GroupReadsByUmi {
             // Single-threaded fast path - pass reader (required for stdin support)
             return self.execute_single_threaded(
                 reader,
+                reader_opts.verify_crc,
                 &header,
                 effective_strategy,
                 effective_edits,
@@ -1428,6 +1431,7 @@ impl GroupReadsByUmi {
     fn execute_single_threaded(
         &self,
         reader: Box<dyn std::io::Read + Send>,
+        verify_crc: bool,
         header: &Header,
         effective_strategy: Strategy,
         effective_edits: u32,
@@ -1439,16 +1443,14 @@ impl GroupReadsByUmi {
     ) -> Result<()> {
         info!("Using single-threaded mode");
 
-        // Wrap the reader in a BufReader and use noodles to skip past the BAM header bytes.
-        // The reader is positioned at file start; we must discard the header to reach records.
-        // This reuses the already-opened reader (required for stdin support).
-        let buf_reader = std::io::BufReader::new(reader);
-        let mut noodles_reader = noodles::bam::io::Reader::new(buf_reader);
-        let _ = noodles_reader.read_header().context("Failed to skip BAM header")?;
-
-        // After the header skip, extract the inner BufReader and wrap in RawBamReader.
-        // Raw-byte mode avoids the noodles decode/encode round-trip (~15% CPU savings).
-        let mut raw_reader = RawBamReader::new(noodles_reader.into_inner());
+        // Reuse the already-opened reader (required for stdin support) and skip
+        // past the BAM header to reach records. Decode through fgumi-bgzf so
+        // `--no-check-crc` takes effect on this fast path too (#800); raw-byte
+        // mode avoids the noodles decode/encode round-trip (~15% CPU savings).
+        // The re-parsed header is discarded — the caller already holds `header`.
+        let reader_opts = PipelineReaderOpts { verify_crc, ..PipelineReaderOpts::default() };
+        let (mut raw_reader, _skipped_header) =
+            create_raw_bam_reader_from_stream_with_opts(reader, reader_opts)?;
 
         // Create output writer (single-threaded for strict thread control)
         let mut writer =

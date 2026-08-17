@@ -70,15 +70,15 @@ use crate::unified_pipeline::{
     run_bam_pipeline_from_reader_with_secondary,
 };
 use ahash::AHashMap;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::{
-    BamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
-    create_optional_bam_writer,
+    BamWriter, PipelineReaderOpts, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
+    create_optional_bam_writer, create_raw_bam_reader_from_stream_with_opts,
 };
 use fgumi_raw_bam;
-use fgumi_raw_bam::{RawBamReader, RawRecord};
+use fgumi_raw_bam::RawRecord;
 use log::{error, info, warn};
 use lru::LruCache;
 use noodles::sam::Header;
@@ -491,7 +491,7 @@ impl Command for CorrectUmis {
         // Warn about UMIs that are too close together
         self.check_umi_distances(&umi_sequences);
 
-        self.io.log_effective_check_crc_for_fast_path(self.threading.threads.is_some());
+        self.io.log_effective_check_crc();
 
         // Open input using streaming-capable reader for pipeline use
         let reader_opts = self.io.pipeline_reader_opts();
@@ -523,6 +523,7 @@ impl Command for CorrectUmis {
             // re-opening would double-consume a pipe). Mirrors group::execute_single_threaded.
             self.execute_single_thread_mode(
                 reader,
+                reader_opts.verify_crc,
                 header,
                 encoded_umi_set,
                 umi_length,
@@ -1256,6 +1257,7 @@ impl CorrectUmis {
     fn execute_single_thread_mode(
         &self,
         reader: Box<dyn std::io::Read + Send>,
+        verify_crc: bool,
         header: Header,
         encoded_umi_set: EncodedUmiSet,
         umi_length: usize,
@@ -1264,12 +1266,12 @@ impl CorrectUmis {
         info!("Using single-threaded mode with template-level UMI correction");
 
         // Reuse the already-opened reader (required for stdin: re-opening a pipe
-        // double-consumes it). Skip past the BAM header to reach records, then
-        // wrap in RawBamReader for zero-copy processing.
-        let buf_reader = std::io::BufReader::new(reader);
-        let mut noodles_reader = noodles::bam::io::Reader::new(buf_reader);
-        let _ = noodles_reader.read_header().context("Failed to skip BAM header")?;
-        let mut bam_reader = RawBamReader::new(noodles_reader.into_inner());
+        // double-consumes it). Decode through fgumi-bgzf so `--no-check-crc`
+        // takes effect on this fast path too (#800); the re-parsed header is
+        // discarded because `header` already carries the synthesized @HD/@PG.
+        let reader_opts = PipelineReaderOpts { verify_crc, ..PipelineReaderOpts::default() };
+        let (mut bam_reader, _skipped_header) =
+            create_raw_bam_reader_from_stream_with_opts(reader, reader_opts)?;
 
         // Open output writer (single-threaded)
         let mut writer =

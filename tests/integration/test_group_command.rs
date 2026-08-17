@@ -196,3 +196,134 @@ fn create_test_bam_with_n_umis(path: &PathBuf) {
 
     writer.try_finish().expect("Failed to finish BAM");
 }
+
+// ============================================================================
+// --check-crc / --no-check-crc on the single-threaded fast path (#800)
+// ============================================================================
+
+/// Flip a byte in the last BGZF block's CRC32 footer, so decoding that block
+/// fails only when CRC verification is on. Requires the file to span at least
+/// two blocks so the corrupted block is not the header's block (the header
+/// parse always verifies).
+fn corrupt_last_block_crc(path: &std::path::Path) {
+    let mut bytes = fs::read(path).expect("read bam for corruption");
+    let mut cursor: &[u8] = &bytes;
+    let blocks = fgumi_lib::bgzf_reader::read_raw_blocks(&mut cursor, 100_000)
+        .expect("read bgzf blocks from test bam");
+    assert!(
+        blocks.len() >= 2,
+        "test input must span >= 2 BGZF blocks so the corrupted block isn't the header's; \
+         got {} -- generate more records",
+        blocks.len()
+    );
+    let offset: usize =
+        blocks[..blocks.len() - 1].iter().map(fgumi_lib::bgzf_reader::RawBgzfBlock::len).sum();
+    let last = blocks.last().expect("checked len >= 2 above");
+    let crc_off = offset + last.len() - fgumi_lib::bgzf_reader::BGZF_FOOTER_SIZE;
+    bytes[crc_off] ^= 0x01;
+    fs::write(path, bytes).expect("write corrupted bam");
+}
+
+/// Write a single UMI family large enough to span more than one BGZF block (all
+/// reads sit at one position on reference 0, so the input is template-coordinate
+/// sorted), so the corrupted last block is a record block, not the header's.
+fn create_multiblock_group_bam(path: &PathBuf) {
+    let header = create_minimal_header("chr1", 10000);
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
+    writer.write_header(&header).expect("Failed to write header");
+    for record in &create_umi_family("AAAAAAAA", 3000, "read", "ACGTACGT", 30) {
+        writer
+            .write_alignment_record(&header, &to_record_buf(record))
+            .expect("Failed to write record");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+}
+
+/// Build group's argv for the single-threaded fast path (no `--threads`),
+/// appending any extra flags (e.g. `--no-check-crc`).
+fn group_args<'a>(input: &'a str, output: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec![
+        "group",
+        "--input",
+        input,
+        "--output",
+        output,
+        "--strategy",
+        "identity",
+        "--edits",
+        "0",
+        "--compression-level",
+        "1",
+    ];
+    args.extend_from_slice(extra);
+    args
+}
+
+/// `--no-check-crc` must let group's single-threaded reader accept a corrupted
+/// BGZF CRC32: it decodes through fgumi-bgzf, honoring the flag (#800). Against
+/// the noodles reader this path used before, this could not pass.
+#[test]
+fn test_group_no_check_crc_accepts_corrupted_crc() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    create_multiblock_group_bam(&input_bam);
+    corrupt_last_block_crc(&input_bam);
+
+    let cmd = GroupReadsByUmi::try_parse_from(group_args(
+        input_bam.to_str().unwrap(),
+        output_bam.to_str().unwrap(),
+        &["--no-check-crc"],
+    ))
+    .expect("failed to parse group args");
+    cmd.execute("fgumi group")
+        .expect("--no-check-crc must accept a corrupted BGZF CRC32 and complete");
+    assert!(output_bam.exists(), "Output BAM not created");
+}
+
+/// Default (verify-on for file input) must reject the same corrupted CRC32.
+#[test]
+fn test_group_rejects_corrupted_crc_by_default() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    create_multiblock_group_bam(&input_bam);
+    corrupt_last_block_crc(&input_bam);
+
+    let cmd = GroupReadsByUmi::try_parse_from(group_args(
+        input_bam.to_str().unwrap(),
+        output_bam.to_str().unwrap(),
+        &[],
+    ))
+    .expect("failed to parse group args");
+    let err = cmd
+        .execute("fgumi group")
+        .expect_err("default (verify-on for file input) must reject a corrupted BGZF CRC32");
+    let message = format!("{err:#}");
+    assert!(message.to_uppercase().contains("CRC32"), "error should mention CRC32: {message}");
+}
+
+/// `--check-crc` must also reject the corrupted CRC32 (forces verification on).
+#[test]
+fn test_group_check_crc_rejects_corrupted_crc() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    create_multiblock_group_bam(&input_bam);
+    corrupt_last_block_crc(&input_bam);
+
+    let cmd = GroupReadsByUmi::try_parse_from(group_args(
+        input_bam.to_str().unwrap(),
+        output_bam.to_str().unwrap(),
+        &["--check-crc"],
+    ))
+    .expect("failed to parse group args");
+    let err =
+        cmd.execute("fgumi group").expect_err("--check-crc must reject a corrupted BGZF CRC32");
+    let message = format!("{err:#}");
+    assert!(message.to_uppercase().contains("CRC32"), "error should mention CRC32: {message}");
+}
