@@ -181,13 +181,15 @@ The consensus reads produced are unaligned fragments, so they should be aligned 
 Quality masking
 ---------------
 
-Several options reduce base qualities in regions where the duplex evidence is weaker, rather than
-discarding the bases outright:
+Several options overwrite base qualities in regions where the duplex evidence is weaker, rather
+than discarding the bases outright. Each assigns its value unconditionally, so a position whose
+quality is already lower is raised to it:
 
-  --single-strand-qual         caps quality in regions covered by only one strand, where there is
-                               no duplex confirmation
-  --outer-bases-qual /         caps quality for the first and last --outer-bases-length bases (5 by
-  --outer-bases-length         default) of the fragment, which are the most error-prone
+  --single-strand-qual         sets quality to this value in regions covered by only one strand,
+                               where there is no duplex confirmation
+  --outer-bases-qual /         sets quality to this value for the first and last
+  --outer-bases-length         --outer-bases-length bases (5 by default) of the fragment, which
+                               are the most error-prone
 
 Duplex agreement filters
 ------------------------
@@ -254,16 +256,18 @@ pub struct Codec {
     #[arg(short = 'd', long = "min-duplex-length", default_value = "1")]
     pub min_duplex_length: usize,
 
-    /// Reduce single-strand region quality to this value (0-93).
+    /// Set single-strand region quality to this value (0-93). Assigned
+    /// unconditionally, so a lower quality is raised to it.
     /// Note: This uses a different short flag than duplex's -q for min-base-quality.
     #[arg(long = "single-strand-qual")]
     pub single_strand_qual: Option<u8>,
 
-    /// Reduce outer bases quality to this value (0-93)
+    /// Set outer bases quality to this value (0-93). Assigned unconditionally,
+    /// so a lower quality is raised to it.
     #[arg(short = 'Q', long = "outer-bases-qual")]
     pub outer_bases_qual: Option<u8>,
 
-    /// Number of outer bases to reduce quality for
+    /// Number of outer bases to set the quality of
     #[arg(short = 'O', long = "outer-bases-length", default_value = "5")]
     pub outer_bases_length: usize,
 
