@@ -284,6 +284,16 @@ pub(crate) struct SortPipelineStats {
     pub per_thread_step_counts: Box<[[AtomicU64; SortStep::COUNT]; SORT_MAX_THREADS]>,
     /// Per-thread idle time in nanoseconds (time in backoff/yield).
     pub per_thread_idle_ns: Box<[AtomicU64; SORT_MAX_THREADS]>,
+    /// Nanoseconds each worker spent inside a successful step.
+    ///
+    /// The existing per-thread array counts steps but not their duration, so a
+    /// worker doing few expensive steps was indistinguishable from one doing
+    /// many cheap ones.
+    pub per_thread_busy_ns: Box<[AtomicU64; SORT_MAX_THREADS]>,
+    /// Times each worker was the *first* to claim the block the consumer was
+    /// parked on. Says whether critical-path service is spread across the pool
+    /// or concentrated on a few workers.
+    pub per_thread_awaited_claims: Box<[AtomicU64; SORT_MAX_THREADS]>,
 
     /// Number of worker threads (for display bounds).
     pub num_threads: usize,
@@ -298,6 +308,8 @@ impl SortPipelineStats {
             step_count: std::array::from_fn(|_| AtomicU64::new(0)),
             per_thread_step_counts: new_sort_2d_array(),
             per_thread_idle_ns: new_sort_1d_array(),
+            per_thread_busy_ns: new_sort_1d_array(),
+            per_thread_awaited_claims: new_sort_1d_array(),
             num_threads,
         }
     }
@@ -309,6 +321,14 @@ impl SortPipelineStats {
         self.step_count[step_idx].fetch_add(1, Ordering::Relaxed);
         if thread_id < SORT_MAX_THREADS {
             self.per_thread_step_counts[thread_id][step_idx].fetch_add(1, Ordering::Relaxed);
+            self.per_thread_busy_ns[thread_id].fetch_add(elapsed_ns, Ordering::Relaxed);
+        }
+    }
+
+    /// Credit a worker with first-claiming the consumer's awaited block.
+    pub fn record_awaited_claim(&self, thread_id: usize) {
+        if thread_id < SORT_MAX_THREADS {
+            self.per_thread_awaited_claims[thread_id].fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1335,6 +1355,13 @@ pub(crate) struct SharedPipelineState {
     /// slot that is still empty simply cannot be woken yet, which is harmless
     /// because a worker that has not reached its loop is not sleeping either.
     worker_threads: Vec<std::sync::OnceLock<std::thread::Thread>>,
+    /// When the first worker claimed a block for the awaited source during the
+    /// consumer's current park, or 0 if none has. Reset by the consumer at park.
+    pub(crate) awaited_claim_nanos: AtomicU64,
+    /// When the consumer was last woken, or 0 if not yet during this park.
+    pub(crate) awaited_publish_nanos: AtomicU64,
+    /// Where consumer park time goes, split into additive stages.
+    pub(crate) park_attribution: crate::merge_stalls::ParkAttribution,
     /// Rotates the target of [`Self::wake_one_worker`] so repeated wakes spread
     /// across the pool rather than always hitting worker 0.
     wake_cursor: AtomicUsize,
@@ -1425,6 +1452,9 @@ impl SharedPipelineState {
             shallow_read_blocks: AtomicU64::new(0),
             phase2_lowest_active: AtomicUsize::new(0),
             phase2_awaited_source: AtomicUsize::new(NO_AWAITED_SOURCE),
+            awaited_claim_nanos: AtomicU64::new(0),
+            awaited_publish_nanos: AtomicU64::new(0),
+            park_attribution: crate::merge_stalls::ParkAttribution::default(),
             awaited_skips: std::array::from_fn(|_| AtomicU64::new(0)),
             phase2_read_bytes: AtomicU64::new(0),
             phase2_read_blocks: AtomicU64::new(0),
@@ -1451,6 +1481,26 @@ impl SharedPipelineState {
     /// resets its own backoff to [`MIN_BACKOFF_US`] on success and so stays hot
     /// for the blocks that follow. Waking the whole pool would spend N fruitless
     /// scans to get the one read that matters.
+    /// Wake the merge consumer, stamping when it became runnable.
+    ///
+    /// Every consumer wake goes through here so the park decomposition cannot
+    /// silently miss one of the six unpark sites. The stamp is the moment the
+    /// consumer *could* run, so the gap to it actually resuming is its own wake
+    /// latency rather than fetch time.
+    ///
+    /// Only the first wake in a park is stamped (compare-exchange from 0): a
+    /// park ends on the first wake, and later ones belong to the next park.
+    pub(crate) fn wake_consumer(&self) {
+        let now = self.now_nanos();
+        let _ = self.awaited_publish_nanos.compare_exchange(
+            0,
+            now,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        self.main_thread_handle.unpark();
+    }
+
     pub(crate) fn wake_one_worker(&self) {
         if self.worker_threads.is_empty() {
             return;
@@ -1564,6 +1614,23 @@ struct SortWorkerState {
     /// cleared) by the next iteration that finds work, which is what makes that
     /// wait "productive" — see [`crate::merge_stalls::WakeLatencyStats`].
     last_wait: Option<PendingWait>,
+    /// Whether the step this iteration completed produced for the file the merge
+    /// consumer was parked on.
+    ///
+    /// Set and read at the two Phase-2 claim sites, where the file index is in
+    /// hand: it gates the `stamp_awaited_claim` call, so only a worker that
+    /// served the awaited file can credit the first claim. The
+    /// productive-wait path reads `won_awaited_claim` instead, not this field.
+    /// Discovery lag is only paid in wall clock on the awaited file — a
+    /// late wake for any other file is absorbed by idle capacity — so without
+    /// this the aggregate lag cannot be told apart from free lag. Cleared at the
+    /// top of every iteration so a stale `true` cannot survive into a step that
+    /// served a different file.
+    served_awaited: bool,
+    /// Whether this worker won the race to first-claim the consumer's awaited
+    /// block this iteration. Credited per thread by the main loop, which is
+    /// where the stats handle is in scope.
+    won_awaited_claim: bool,
 }
 
 impl SortWorkerState {
@@ -1839,7 +1906,7 @@ impl Drop for WorkerPanicGuard {
         }
         // Reached only when the worker loop unwound.
         self.shared.worker_panicked.store(true, Ordering::Release);
-        self.shared.main_thread_handle.unpark();
+        self.shared.wake_consumer();
     }
 }
 
@@ -1891,6 +1958,8 @@ impl SortWorkerPool {
                         held_raw_input_blocks: Vec::new(),
                         held_decompressed_input: None,
                         backoff_us: MIN_BACKOFF_US,
+                        served_awaited: false,
+                        won_awaited_claim: false,
                         idle_iter: 0,
                         last_wait: None,
                     };
@@ -1981,6 +2050,8 @@ impl SortWorkerPool {
             }
 
             let mut did_work = false;
+            worker.served_awaited = false;
+            worker.won_awaited_claim = false;
 
             // 3. Try to advance ALL held items first (deadlock prevention)
             did_work |= Self::try_advance_all_held(shared, worker);
@@ -2061,6 +2132,9 @@ impl SortWorkerPool {
                     shared
                         .wake_latency
                         .record_productive_sleep(wake_phase(current_phase), waited_ns);
+                }
+                if worker.won_awaited_claim {
+                    pstats.record_awaited_claim(worker.worker_id);
                 }
                 worker.backoff_us = MIN_BACKOFF_US;
             } else {
@@ -2222,7 +2296,7 @@ impl SortWorkerPool {
             let pushed =
                 try_advance_held(&shared.decompressed_input, &mut worker.held_decompressed_input);
             if pushed {
-                shared.main_thread_handle.unpark();
+                shared.wake_consumer();
                 advanced = true;
                 // This may have been the last block. Increment `input_blocks_queued` now
                 // that the block is actually in the queue (not held), then re-check the
@@ -2237,7 +2311,7 @@ impl SortWorkerPool {
                     && !shared.decompressed_input_done.load(Ordering::Acquire)
                 {
                     shared.decompressed_input_done.store(true, Ordering::Release);
-                    shared.main_thread_handle.unpark();
+                    shared.wake_consumer();
                 }
             }
         }
@@ -2277,7 +2351,7 @@ impl SortWorkerPool {
                 log::error!("I/O error reading input BAM: {e}");
                 shared.input_read_error.store(true, Ordering::Release);
                 shared.input_eof.store(true, Ordering::Release);
-                shared.main_thread_handle.unpark();
+                shared.wake_consumer();
                 return StepResult::InputEmpty;
             }
         };
@@ -2342,7 +2416,7 @@ impl SortWorkerPool {
                 let total = shared.input_read_serial.load(Ordering::Acquire);
                 if queued >= total {
                     shared.decompressed_input_done.store(true, Ordering::Release);
-                    shared.main_thread_handle.unpark();
+                    shared.wake_consumer();
                 }
             }
             return StepResult::InputEmpty;
@@ -2353,7 +2427,7 @@ impl SortWorkerPool {
             Err(e) => {
                 log::error!("BGZF decompression error (input block serial {serial}): {e}");
                 shared.decompression_error.store(true, Ordering::Release);
-                shared.main_thread_handle.unpark();
+                shared.wake_consumer();
                 return StepResult::InputEmpty;
             }
         };
@@ -2364,13 +2438,13 @@ impl SortWorkerPool {
         // Try to push to decompressed_input ArrayQueue
         let pushed = match shared.decompressed_input.push((serial, data)) {
             Ok(()) => {
-                shared.main_thread_handle.unpark();
+                shared.wake_consumer();
                 true
             }
             Err(item) => {
                 worker.held_decompressed_input = Some(item);
                 // Queue full — wake main thread to drain so we can push next time
-                shared.main_thread_handle.unpark();
+                shared.wake_consumer();
                 false
             }
         };
@@ -2385,7 +2459,7 @@ impl SortWorkerPool {
             let total = shared.input_read_serial.load(Ordering::Acquire);
             if input_eof && raw_empty && queued >= total {
                 shared.decompressed_input_done.store(true, Ordering::Release);
-                shared.main_thread_handle.unpark();
+                shared.wake_consumer();
             }
         }
 
@@ -2485,6 +2559,11 @@ impl SortWorkerPool {
                 Err(skip) => skip,
                 Ok(entry) => {
                     worker.phase2_file_cursor = (i + 1) % n;
+                    worker.served_awaited =
+                        shared.phase2_awaited_source.load(Ordering::Relaxed) == i;
+                    if worker.served_awaited {
+                        worker.won_awaited_claim = Self::stamp_awaited_claim(shared);
+                    }
                     Self::note_claim(shared, file, &entry);
                     return Self::decompress_and_publish(shared, worker, file, i, entry);
                 }
@@ -2705,6 +2784,14 @@ impl SortWorkerPool {
             }
 
             worker.phase2_file_cursor = (i + 1) % n;
+            // Reading for the awaited file is on the critical path as much as
+            // decompressing for it: `raw-empty` is 47-70% of the reasons the pool
+            // passes that file over, so a late wake that ends in a read is a late
+            // wake the consumer paid for.
+            worker.served_awaited = shared.phase2_awaited_source.load(Ordering::Relaxed) == i;
+            if worker.served_awaited {
+                worker.won_awaited_claim = Self::stamp_awaited_claim(shared);
+            }
             return StepResult::Success;
         }
 
@@ -2779,7 +2866,7 @@ impl SortWorkerPool {
                         );
                         shared.decompression_error.store(true, Ordering::Release);
                         file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
-                        shared.main_thread_handle.unpark();
+                        shared.wake_consumer();
                         return StepResult::Success;
                     }
                 }
@@ -2807,7 +2894,7 @@ impl SortWorkerPool {
                         );
                         shared.decompression_error.store(true, Ordering::Release);
                         file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
-                        shared.main_thread_handle.unpark();
+                        shared.wake_consumer();
                         return StepResult::Success;
                     }
                 }
@@ -2851,9 +2938,23 @@ impl SortWorkerPool {
             // Wake the consumer either because new data is available or because
             // the last in-flight decompression for this file just completed and
             // the file is now fully drained.
-            shared.main_thread_handle.unpark();
+            shared.wake_consumer();
         }
         StepResult::Success
+    }
+
+    /// Stamp the first claim of the consumer's awaited block, and credit the
+    /// worker that made it.
+    ///
+    /// Compare-exchange from 0 so only the first claim in a park is recorded --
+    /// the consumer waits for whichever worker arrives first, so a sum over all
+    /// of them would overcount exactly the way the worker-side lag total does.
+    fn stamp_awaited_claim(shared: &SharedPipelineState) -> bool {
+        let now = shared.now_nanos();
+        shared
+            .awaited_claim_nanos
+            .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     }
 
     /// Try to pop a raw block from `file` for decompression, applying
@@ -2978,7 +3079,7 @@ impl SortWorkerPool {
     ) -> StepResult {
         file.mark_reader_eof(&mut reader_guard);
         drop(reader_guard);
-        shared.main_thread_handle.unpark();
+        shared.wake_consumer();
         Self::maybe_mark_all_eof(shared);
         worker.phase2_file_cursor = (source + 1) % num_sources;
         StepResult::Success
@@ -2990,7 +3091,7 @@ impl SortWorkerPool {
         let total = shared.total_sources.load(Ordering::Acquire);
         if total > 0 && eof_count >= total {
             shared.all_chunks_eof.store(true, Ordering::Release);
-            shared.main_thread_handle.unpark();
+            shared.wake_consumer();
         }
     }
 
@@ -3057,6 +3158,28 @@ impl SortWorkerPool {
 
     /// Why worker scans passed over the file the consumer was parked on,
     /// as `[raw-lock, raw-empty, decomp-lock, decomp-capped]`.
+    /// Where the merge consumer's park time went, split into additive stages.
+    pub(crate) fn park_attribution_report(&self) -> crate::merge_stalls::ParkAttributionReport {
+        self.shared.park_attribution.snapshot()
+    }
+
+    /// Per-worker busy time, idle time and critical-path claims, worker 0 first.
+    ///
+    /// Truncated to the workers this pool actually started, so a 16-thread merge
+    /// does not print 32 rows of zeros.
+    pub(crate) fn per_thread_report(&self) -> Vec<(u64, u64, u64)> {
+        let stats = &self.pipeline_stats;
+        (0..self.num_workers.min(SORT_MAX_THREADS))
+            .map(|w| {
+                (
+                    stats.per_thread_busy_ns[w].load(Ordering::Relaxed),
+                    stats.per_thread_idle_ns[w].load(Ordering::Relaxed),
+                    stats.per_thread_awaited_claims[w].load(Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
     pub(crate) fn awaited_skip_counts(&self) -> [u64; 4] {
         std::array::from_fn(|i| self.shared.awaited_skips[i].load(Ordering::Relaxed))
     }
@@ -3386,7 +3509,7 @@ impl SortWorkerPool {
                     // Worker panicked — set flag and wake main thread so it doesn't
                     // park forever waiting for work that will never arrive.
                     self.shared.worker_panicked.store(true, Ordering::Release);
-                    self.shared.main_thread_handle.unpark();
+                    self.shared.wake_consumer();
                 }
             }
         }

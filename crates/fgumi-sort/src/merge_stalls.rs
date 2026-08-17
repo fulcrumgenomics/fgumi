@@ -660,6 +660,172 @@ impl WakeLatencyReport {
 const DEEP_SLEEP_FIRST_BUCKET: usize = 5;
 
 // ============================================================================
+// Consumer park decomposition
+// ============================================================================
+
+/// One consumer park, split into the stages of fetching the block it wanted.
+///
+/// The four fields partition the park by construction — see [`split_park`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ParkSegments {
+    /// Park spent before any worker claimed the needed block: the cost of
+    /// getting *a* worker onto it, whichever one arrives first.
+    pub to_claim: u64,
+    /// Park spent between the claim and the block being published: the read and
+    /// decompress work itself.
+    pub work: u64,
+    /// Park spent after the block was published, before the consumer resumed:
+    /// the consumer's own wake latency.
+    pub to_resume: u64,
+    /// Park not attributable to fetching this block — the honesty term.
+    pub unattributed: u64,
+}
+
+/// Split a park into [`ParkSegments`].
+///
+/// `claim` and `publish` are `None` when that stamp did not land inside this
+/// park: the block may have been claimed before the consumer parked, or not yet
+/// claimed when it resumed. Both are ordinary, and neither may be allowed to
+/// inflate a segment — an unstamped stage contributes to `unattributed`
+/// instead, so the reader can see how much of park the model fails to explain.
+///
+/// Stamps come from other threads and are only `Relaxed`, so they can be
+/// observed out of order relative to `park_start`. Every subtraction therefore
+/// saturates and every segment is clamped to what remains, which is what keeps
+/// the sum exactly equal to `resume - park_start` rather than merely close.
+pub(crate) fn split_park(
+    park_start: u64,
+    claim: Option<u64>,
+    publish: Option<u64>,
+    resume: u64,
+) -> ParkSegments {
+    let total = resume.saturating_sub(park_start);
+    let mut seg = ParkSegments::default();
+    let mut spent = 0u64;
+
+    // Each stage is measured from the later of its own start and the previous
+    // stage's end, so a stamp that predates the park contributes zero rather
+    // than borrowing time from a neighbour.
+    let mut cursor = park_start;
+    if let Some(claim) = claim {
+        seg.to_claim = claim.saturating_sub(cursor).min(total - spent);
+        spent += seg.to_claim;
+        cursor = cursor.max(claim);
+    }
+    if let Some(publish) = publish {
+        seg.work = publish.saturating_sub(cursor).min(total - spent);
+        spent += seg.work;
+        cursor = cursor.max(publish);
+        seg.to_resume = resume.saturating_sub(cursor).min(total - spent);
+        spent += seg.to_resume;
+    }
+    seg.unattributed = total - spent;
+    seg
+}
+
+/// Where the merge consumer's park time actually goes.
+///
+/// Every earlier attempt to explain park was either a share of park *events* —
+/// which hides a rare-but-long cause — or a sum over workers, which overcounts
+/// because the consumer waits for the *first* worker to deliver while the sum
+/// counts all of them. Measured on one 16-thread merge, the worker-side sum read
+/// 96.7s of critical-path lag against 97.0s of park, then a change that removed
+/// 62.9s of that lag moved park by 7.8s. These counters are consumer-side and
+/// additive instead, so the segments cannot exceed the park they came from.
+#[derive(Debug, Default)]
+pub(crate) struct ParkAttribution {
+    to_claim_nanos: AtomicU64,
+    work_nanos: AtomicU64,
+    to_resume_nanos: AtomicU64,
+    unattributed_nanos: AtomicU64,
+    parks: AtomicU64,
+    /// Parks where no worker claimed the block during the park, so the whole
+    /// wait was for a stage that had already started or already finished.
+    unclaimed_parks: AtomicU64,
+    /// Blocks the awaited file had ready when the consumer resumed, summed.
+    ///
+    /// Divided by [`Self::parks`] this is pipeline depth on the critical path. A
+    /// mean near 1 means every block the consumer needs is fetched on demand and
+    /// costs a full round trip, which is a different problem from a slow round
+    /// trip and has different fixes.
+    ready_on_resume: AtomicU64,
+}
+
+impl ParkAttribution {
+    /// Record one park, split by [`split_park`].
+    pub(crate) fn record(&self, seg: ParkSegments, claimed: bool, ready_on_resume: u64) {
+        self.to_claim_nanos.fetch_add(seg.to_claim, Ordering::Relaxed);
+        self.work_nanos.fetch_add(seg.work, Ordering::Relaxed);
+        self.to_resume_nanos.fetch_add(seg.to_resume, Ordering::Relaxed);
+        self.unattributed_nanos.fetch_add(seg.unattributed, Ordering::Relaxed);
+        self.parks.fetch_add(1, Ordering::Relaxed);
+        if !claimed {
+            self.unclaimed_parks.fetch_add(1, Ordering::Relaxed);
+        }
+        self.ready_on_resume.fetch_add(ready_on_resume, Ordering::Relaxed);
+    }
+
+    /// Snapshot for logging.
+    pub(crate) fn snapshot(&self) -> ParkAttributionReport {
+        ParkAttributionReport {
+            to_claim_nanos: self.to_claim_nanos.load(Ordering::Relaxed),
+            work_nanos: self.work_nanos.load(Ordering::Relaxed),
+            to_resume_nanos: self.to_resume_nanos.load(Ordering::Relaxed),
+            unattributed_nanos: self.unattributed_nanos.load(Ordering::Relaxed),
+            parks: self.parks.load(Ordering::Relaxed),
+            unclaimed_parks: self.unclaimed_parks.load(Ordering::Relaxed),
+            ready_on_resume: self.ready_on_resume.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Read-only view of [`ParkAttribution`].
+#[derive(Debug, Clone, Copy)]
+pub struct ParkAttributionReport {
+    /// Park spent waiting for any worker to claim the needed block.
+    pub to_claim_nanos: u64,
+    /// Park spent on the read and decompress themselves.
+    pub work_nanos: u64,
+    /// Park spent after publication, waiting for the consumer's own wake.
+    pub to_resume_nanos: u64,
+    /// Park the model does not explain.
+    pub unattributed_nanos: u64,
+    /// Parks recorded.
+    pub parks: u64,
+    /// Parks in which no claim landed.
+    pub unclaimed_parks: u64,
+    /// Summed blocks ready on the awaited file at resume.
+    pub ready_on_resume: u64,
+}
+
+impl ParkAttributionReport {
+    /// Whether anything was recorded.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.parks == 0
+    }
+
+    /// Total park accounted for, which must match the exact park clock.
+    #[must_use]
+    pub fn total_nanos(self) -> u64 {
+        self.to_claim_nanos + self.work_nanos + self.to_resume_nanos + self.unattributed_nanos
+    }
+
+    /// Mean blocks ready on the awaited file when the consumer resumed.
+    ///
+    /// Near 1.0 means the critical path has no pipeline depth: each block is
+    /// fetched on demand, so the merge pays one full round trip per block.
+    #[must_use]
+    #[expect(clippy::cast_precision_loss, reason = "counts are well within f64's exact range")]
+    pub fn mean_ready_on_resume(self) -> f64 {
+        if self.parks == 0 {
+            return 0.0;
+        }
+        self.ready_on_resume as f64 / self.parks as f64
+    }
+}
+
+// ============================================================================
 // Consumer side: where the merge loop blocks
 // ============================================================================
 
@@ -1396,6 +1562,78 @@ mod tests {
         let report = stats.snapshot(WakePhase::Merge);
         assert!((report.estimated_discovery_lag_secs() - 0.5).abs() < 1e-9);
         assert_eq!(report.sleeps[7], 2000);
+    }
+
+    /// The four segments must partition the park exactly, whatever order the
+    /// stamps arrive in.
+    ///
+    /// This is the property that makes the decomposition trustworthy where the
+    /// worker-side lag sum was not: a segment cannot be inflated without another
+    /// shrinking, so no single number can be read as larger than the park it
+    /// came from.
+    #[rstest::rstest]
+    // Ordinary case: claimed then published inside the park.
+    #[case(1_000, Some(1_100), Some(1_150), 1_200, (100, 50, 50, 0))]
+    // Claimed but not yet published when the consumer resumed: no work segment,
+    // and the remainder is unattributed rather than silently folded into work.
+    #[case(1_000, Some(1_100), None, 1_200, (100, 0, 0, 100))]
+    // Already claimed before the park: nothing to wait for a worker on.
+    #[case(1_000, None, Some(1_050), 1_200, (0, 50, 150, 0))]
+    // Neither stamp: the block was already available, so the park is not
+    // attributable to fetching it at all.
+    #[case(1_000, None, None, 1_200, (0, 0, 0, 200))]
+    // Both stamps predate the park: the block was already published when the
+    // consumer parked, so the whole wait is the consumer failing to notice --
+    // charged to `to_resume`, not to a fetch that had already finished. Stamps
+    // arrive from other threads under `Relaxed`, so this ordering is reachable
+    // and must not yield a negative segment or a sum over the park.
+    #[case(1_000, Some(900), Some(950), 1_200, (0, 0, 200, 0))]
+    fn test_park_segments_always_partition_the_park(
+        #[case] park_start: u64,
+        #[case] claim: Option<u64>,
+        #[case] publish: Option<u64>,
+        #[case] resume: u64,
+        #[case] want: (u64, u64, u64, u64),
+    ) {
+        let (want_to_claim, want_work, want_to_resume, want_unattributed) = want;
+        let seg = split_park(park_start, claim, publish, resume);
+        assert_eq!(seg.to_claim, want_to_claim, "to_claim");
+        assert_eq!(seg.work, want_work, "work");
+        assert_eq!(seg.to_resume, want_to_resume, "to_resume");
+        assert_eq!(seg.unattributed, want_unattributed, "unattributed");
+        assert_eq!(
+            seg.to_claim + seg.work + seg.to_resume + seg.unattributed,
+            resume - park_start,
+            "segments must sum to the measured park"
+        );
+    }
+
+    proptest::proptest! {
+        /// Property: the segments partition the park for *any* arrangement of
+        /// stamps, including ones that predate the park or arrive reversed.
+        ///
+        /// This is the whole basis for trusting the decomposition over the
+        /// worker-side lag sum it replaces, and the case list cannot cover the
+        /// orderings that `Relaxed` loads across threads make reachable.
+        #[test]
+        fn prop_park_segments_partition_the_park(
+            park_start in 0u64..1_000_000,
+            span in 1u64..1_000_000,
+            claim_off in proptest::option::of(-500_000i64..1_500_000),
+            publish_off in proptest::option::of(-500_000i64..1_500_000),
+        ) {
+            let resume = park_start + span;
+            let stamp = |off: Option<i64>| {
+                off.map(|o| u64::try_from(i64::try_from(park_start).unwrap_or(i64::MAX) + o)
+                    .unwrap_or(0))
+            };
+            let seg = split_park(park_start, stamp(claim_off), stamp(publish_off), resume);
+            proptest::prop_assert_eq!(
+                seg.to_claim + seg.work + seg.to_resume + seg.unattributed,
+                span,
+                "segments must sum to the park exactly"
+            );
+        }
     }
 
     #[test]

@@ -1774,11 +1774,40 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             self.shared
                 .phase2_awaited_source
                 .store(source_id, std::sync::atomic::Ordering::Relaxed);
+            // Arm the park handshake. Workers stamp when the awaited block is
+            // first claimed and when the consumer is woken; the difference from
+            // `park_start` splits this park into additive stages. Cleared here
+            // rather than after so a stamp can only ever be attributed to a park
+            // that had already begun.
+            let ord = std::sync::atomic::Ordering::Relaxed;
+            self.shared.awaited_claim_nanos.store(0, ord);
+            self.shared.awaited_publish_nanos.store(0, ord);
+            let park_started_at = self.shared.now_nanos();
+
             let park_start = Instant::now();
             std::thread::park();
             let parked_ns = crate::merge_trace::elapsed_nanos(park_start);
             self.stalls.record_park(source_id, parked_ns, !parked_yet);
             self.shared.consumer_trace.record_park(state, parked_ns, in_flight);
+
+            // Split the park. `now_nanos` is the same clock the workers stamp
+            // with, so the segments are comparable; `parked_ns` comes from
+            // `Instant` and is only used for the existing counters.
+            let resumed_at = self.shared.now_nanos();
+            let claim = self.shared.awaited_claim_nanos.load(ord);
+            let publish = self.shared.awaited_publish_nanos.load(ord);
+            let segments = crate::merge_stalls::split_park(
+                park_started_at,
+                (claim != 0).then_some(claim),
+                (publish != 0).then_some(publish),
+                resumed_at,
+            );
+            // Depth on the critical path: how many blocks the awaited file had
+            // ready the moment the consumer could run again. A mean near 1 means
+            // every block is fetched on demand, which is a different problem
+            // from a slow fetch.
+            let (_, ready, _) = self.files[source_id].depths();
+            self.shared.park_attribution.record(segments, claim != 0, ready as u64);
             parked_yet = true;
         }
     }
@@ -4546,6 +4575,8 @@ impl RawExternalSorter {
                 );
             }
 
+            Self::log_park_attribution(pool, loop_total);
+
             // Close this block before delegating: `log_block_lifecycle` opens and
             // closes its own, so without a terminator here the lifecycle block
             // reads as nested inside the stall block rather than following it.
@@ -4557,6 +4588,87 @@ impl RawExternalSorter {
         // never stalled is precisely the run with a complete lifecycle trace and
         // nothing to say above. `log_block_lifecycle` carries its own gate.
         Self::log_block_lifecycle(pool);
+    }
+
+    /// Log where consumer park time went, and what each worker did.
+    ///
+    /// The park table is the one figure in this report that partitions an exact
+    /// total by construction, which is why it is the one to read first. Earlier
+    /// attempts to explain park were shares of park *events* (blind to a
+    /// rare-but-long cause) or sums over workers (which overcount, because the
+    /// consumer waits for whichever worker arrives first). `unattributed` is the
+    /// honesty term: a large value means the model is incomplete, not that the
+    /// merge is idle for no reason.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "nanosecond and count totals are within f64's exact-integer range here"
+    )]
+    fn log_park_attribution(pool: &SortWorkerPool, loop_total: f64) {
+        let park = pool.park_attribution_report();
+        if park.is_empty() {
+            return;
+        }
+        let total = park.total_nanos();
+        if total == 0 {
+            return;
+        }
+        let secs = |ns: u64| ns as f64 / 1e9;
+        let share = |ns: u64| 100.0 * ns as f64 / total as f64;
+        let per_park = |ns: u64| ns as f64 / park.parks as f64 / 1e3;
+
+        info!("  Consumer park, by stage (exact, partitions the park):");
+        info!("    {:<28} {:>8} {:>7} {:>10}", "stage", "time", "share", "per park");
+        for (label, ns) in [
+            ("waiting for a worker", park.to_claim_nanos),
+            ("read + decompress work", park.work_nanos),
+            ("waiting for its own wake", park.to_resume_nanos),
+            ("unattributed", park.unattributed_nanos),
+        ] {
+            info!("    {label:<28} {:>7.1}s {:>6.0}% {:>9.0}us", secs(ns), share(ns), per_park(ns));
+        }
+        info!(
+            "    {:<28} {:>7.1}s {:>6.0}% {:>9.0}us  over {} parks ({:.0}% of loop wall)",
+            "TOTAL",
+            secs(total),
+            100.0,
+            per_park(total),
+            park.parks,
+            if loop_total > 0.0 { 100.0 * secs(total) / loop_total } else { 0.0 }
+        );
+        info!(
+            "    Blocks ready on the awaited file at resume: mean {:.2} (1.0 = every block \
+             fetched on demand, one round trip per block)",
+            park.mean_ready_on_resume()
+        );
+        info!(
+            "    Parks with no claim during them: {} of {} ({:.0}%) -- the block was already \
+             in flight or already done",
+            park.unclaimed_parks,
+            park.parks,
+            100.0 * park.unclaimed_parks as f64 / park.parks as f64
+        );
+
+        let threads = pool.per_thread_report();
+        let claims_total: u64 = threads.iter().map(|&(_, _, c)| c).sum();
+        if claims_total == 0 {
+            return;
+        }
+        info!("  Per worker (merge + phase 1 combined):");
+        info!(
+            "    {:>3} {:>9} {:>9} {:>7} {:>10} {:>5}",
+            "wid", "busy", "idle", "busy%", "claims", "share"
+        );
+        for (w, &(busy, idle, claims)) in threads.iter().enumerate() {
+            let denom = busy + idle;
+            info!(
+                "    {w:>3} {:>8.1}s {:>8.1}s {:>6.0}% {:>10} {:>4.0}%",
+                secs(busy),
+                secs(idle),
+                if denom > 0 { 100.0 * busy as f64 / denom as f64 } else { 0.0 },
+                claims,
+                100.0 * claims as f64 / claims_total as f64
+            );
+        }
     }
 
     /// Log every stage of a spill block's journey, and the refill cycle.
