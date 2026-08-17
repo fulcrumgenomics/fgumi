@@ -4050,12 +4050,11 @@ mod tests {
     /// Both reads are cut from the same shared reference bases, so the alignment geometry is
     /// the only variable between them.
     ///
-    /// The tests below assert consensus *lengths* rather than consensus *bases*, because
-    /// [`create_fr_pair`] stores the reverse read's `SEQ` in read orientation where a BAM
-    /// stores it in reference orientation — so its two strands point opposite ways and the
-    /// consensus comes out mostly `N` for every family the fixture builds, not just these.
-    /// Tracked as fulcrumgenomics/fgumi#763; the length is what this fix is about, and it is
-    /// unaffected.
+    /// With the reverse read stored in reference orientation (fulcrumgenomics/fgumi#763, fixed
+    /// by #768), a family with no strand disagreement consenses to the reference sequence over
+    /// the region the two strands share — so the tests below assert the consensus *bases*, not
+    /// merely its length. Positions only one strand covers — the soft-clip read-through edges —
+    /// resolve to `N`.
     fn codec_template(
         pos_start: usize,
         pos_cigar: &[(Kind, usize)],
@@ -4140,6 +4139,14 @@ mod tests {
             128,
             "the reverse read gives up two bases to the overlap clip, leaving both strands 128"
         );
+        // The consensus is the reference sequence the two strands share: `REF_BASES[200..326]`
+        // for the 126 positions both align, bracketed by the soft-clip read-through edge. A
+        // mis-placed clip would shift these bases while leaving the length intact.
+        assert_eq!(
+            &consensus[0].bases[..],
+            b"ANTAACTTTTTGATAGTAGCGGGAGTAGGAGTAAATCTTGTACTAATTAGTGAATATTCTGTTGATGGTGGCTGAAAATTTATAGCTACACAACCAAAAAAATAAAAAACGTTAGTCAATAGCATTTA",
+            "the consensus must be the reference sequence the two strands share",
+        );
     }
 
     /// The duplex overlap is measured over the region both strands align, so a threshold
@@ -4207,6 +4214,14 @@ mod tests {
             consensus[0].bases.len(),
             127,
             "both strands keep 127 bases after the overlap clip, so the consensus is 127 long"
+        );
+        // The consensus is the reference sequence the two strands share, with the terminal
+        // deletion skipped; the lone `N` is the single-strand edge past the reverse read's
+        // close. A mis-placed clip would shift these bases while leaving the length intact.
+        assert_eq!(
+            &consensus[0].bases[..],
+            b"ANTAACTTTTTGATAGTAGCGGGAGTAGGAGTAAATCTTGTACTAATTAGTGAATATTCTGTTGATGGTGGCTGAAAATTTATAGCTACACAACCAAAAAAATAAAAAACGTTAGTCAATAGCATNA",
+            "the consensus must be the reference sequence the two strands share",
         );
     }
 
