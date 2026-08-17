@@ -7,6 +7,7 @@
 
 use bstr::BString;
 use clap::Parser;
+use fgumi_dna::reverse_complement;
 use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::simplex::Simplex;
 use fgumi_lib::sam::SamTag;
@@ -690,5 +691,186 @@ fn test_simplex_allow_unmapped_still_consenses_a_wholly_unmapped_family() {
     assert_eq!(records.len(), 2, "a wholly unmapped family must still yield a consensus pair");
     for record in &records {
         assert_eq!(int_tag(record, SamTag::CD), 3, "all three unmapped reads should contribute");
+    }
+}
+
+/// Read length of an [`indel_readthrough_family`] read: `2S124M1D3M` and `3S124M2S` both consume
+/// 129 query bases.
+const INDEL_READTHROUGH_READ_LEN: usize = 129;
+
+/// R1's 1-based alignment start in [`indel_readthrough_family`]; R2 starts one base to its left.
+const INDEL_READTHROUGH_R1_START: usize = 200;
+
+/// A deterministic synthetic reference base at a 1-based position.
+///
+/// Deliberately aperiodic over the span the fixture uses, so a clip of the right size taken from
+/// the wrong end, or one base off, changes the consensus rather than landing on an identical
+/// repeat.
+fn synthetic_ref_base(pos_1based: usize) -> u8 {
+    b"ACGT"[(pos_1based * 7 + pos_1based / 5 + pos_1based / 11) % 4]
+}
+
+/// The reference-orientation bases of an [`indel_readthrough_family`] read pair, `(r1, r2)`.
+///
+/// Both reads take their aligned bases from [`synthetic_ref_base`], so they agree everywhere
+/// their alignments overlap. R1's `1D` skips reference position 324, which R2 never reaches.
+///
+/// The soft-clipped adapter tails are a fixed called base rather than `N`: consensus calling
+/// drops trailing no-call positions, which would shorten a correctly clipped read and hide the
+/// very thing this fixture measures.
+fn indel_readthrough_read_bases() -> (Vec<u8>, Vec<u8>) {
+    const ADAPTER: u8 = b'A';
+    let r1_start = INDEL_READTHROUGH_R1_START;
+
+    // R1 = 2S124M1D3M: 2 adapter bases, 124 aligned from 200, a skipped 324, 3 aligned from 325.
+    let mut r1 = vec![ADAPTER; 2];
+    r1.extend((r1_start..r1_start + 124).map(synthetic_ref_base));
+    r1.extend((r1_start + 125..r1_start + 128).map(synthetic_ref_base));
+
+    // R2 = 3S124M2S at 199: 3 adapter bases, 124 aligned from 199, 2 adapter bases.
+    let mut r2 = vec![ADAPTER; 3];
+    r2.extend((r1_start - 1..r1_start + 123).map(synthetic_ref_base));
+    r2.extend([ADAPTER; 2]);
+
+    assert_eq!(r1.len(), INDEL_READTHROUGH_READ_LEN);
+    assert_eq!(r2.len(), INDEL_READTHROUGH_READ_LEN);
+    (r1, r2)
+}
+
+/// Builds `depth` read pairs that sequence through the insert and into the adapter, with a
+/// 1-base deletion three bases from the positive read's 3' end — the fulcrumgenomics/fgumi#752
+/// shape, in the end-to-end setting where its cost is visible.
+///
+/// - R1 (positive): `2S124M1D3M` at 1-based 200 (reference span 200-327)
+/// - R2 (negative): `3S124M2S`   at 1-based 199 (reference span 199-322)
+///
+/// R2's soft-only unclipped *reference* end is its alignment end plus its 2-base trailing soft
+/// clip — a query distance added to a reference coordinate — which lands inside R1's `1D`.
+/// Measuring the clip in query space from the last reference position the two reads share (322)
+/// gives R1 4 query bases past it against R2's 2, so R1 gives up 2 and keeps 127.
+fn indel_readthrough_family(depth: usize) -> Vec<fgumi_raw_bam::RawRecord> {
+    use fgumi_raw_bam::SamBuilder;
+
+    // BAM stores SEQ on the forward reference strand for both mates, so the negative strand's
+    // record carries its reference-orientation bases as-is. Getting this backwards matters here:
+    // `simplex` consensus-calls overlapping bases by default, so two strands that disagree at a
+    // reference position are both masked to `N` and the sequence assertions go blind.
+    let (r1_seq, r2_seq) = indel_readthrough_read_bases();
+    // 2S124M1D3M and 3S124M2S, packed as (len << 4) | op_code.
+    let r1_cigar = [(2u32 << 4) | 4, (124u32 << 4), (1u32 << 4) | 2, 3u32 << 4];
+    let r2_cigar = [(3u32 << 4) | 4, (124u32 << 4), (2u32 << 4) | 4];
+    let quals = [35u8; INDEL_READTHROUGH_READ_LEN];
+    // 0-based positions: R1 at 1-based 200, R2 one base to its left.
+    let r1_pos = i32::try_from(INDEL_READTHROUGH_R1_START).expect("start fits i32") - 1;
+    let r2_pos = r1_pos - 1;
+
+    let mut records = Vec::new();
+    for i in 0..depth {
+        let read_name = format!("rt_{i}");
+
+        let mut b1 = SamBuilder::new();
+        b1.read_name(read_name.as_bytes())
+            .ref_id(0)
+            .pos(r1_pos)
+            .mapq(60)
+            .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT | raw_flags::MATE_REVERSE)
+            .mate_ref_id(0)
+            .mate_pos(r2_pos)
+            .template_length(124)
+            .cigar_ops(&r1_cigar)
+            .sequence(&r1_seq)
+            .qualities(&quals)
+            .add_string_tag(SamTag::RX, b"ACGT")
+            .add_string_tag(SamTag::MC, b"3S124M2S");
+        records.push(b1.build());
+
+        let mut b2 = SamBuilder::new();
+        b2.read_name(read_name.as_bytes())
+            .ref_id(0)
+            .pos(r2_pos)
+            .mapq(60)
+            .flags(raw_flags::PAIRED | raw_flags::LAST_SEGMENT | raw_flags::REVERSE)
+            .mate_ref_id(0)
+            .mate_pos(r1_pos)
+            .template_length(-124)
+            .cigar_ops(&r2_cigar)
+            .sequence(&r2_seq)
+            .qualities(&quals)
+            .add_string_tag(SamTag::RX, b"ACGT")
+            .add_string_tag(SamTag::MC, b"2S124M1D3M");
+        records.push(b2.build());
+    }
+    records
+}
+
+/// A read-through family with an indel at the overlap boundary must survive to a consensus,
+/// with the positive strand clipped by the 2 bases it genuinely overhangs.
+///
+/// The overlap clip is computed before anything else the caller does, and the superseded
+/// reference-space arithmetic answered with the positive read's *entire* 129 bases here: the
+/// mate boundary landed inside its `1D`, where the read has no position at all, and the whole
+/// read length was clipped. Every R1 in the family was trimmed to nothing, banked under
+/// `zero_length_after_trimming`, and no R1 consensus came out — silently, since the R2 half
+/// still emitted normally. Measuring the clip in query space keeps 127 of the 129 bases.
+#[test]
+fn test_simplex_indel_at_overlap_boundary_still_calls_a_consensus() {
+    const DEPTH: usize = 3;
+
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    create_grouped_bam(&input_bam, vec![("1", indel_readthrough_family(DEPTH))]);
+
+    Simplex::try_parse_from([
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "3",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse simplex args")
+    .execute("fgumi simplex")
+    .expect("Simplex command failed");
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let records: Vec<bam::Record> =
+        reader.records().map(|r| r.expect("failed to read record")).collect();
+
+    assert_eq!(records.len(), 2, "both strands must emit a consensus, R1 included");
+    for record in &records {
+        assert_eq!(
+            int_tag(record, SamTag::CD),
+            i64::try_from(DEPTH).expect("depth fits in i64"),
+            "every raw read must contribute"
+        );
+    }
+
+    // Each strand overhangs its mate by exactly 2 query bases, and those 2 come off the
+    // sequencing 3' end. Pinning the full consensus sequence — not just its length — is what
+    // says *which* bases were dropped: a clip of the right size taken from the wrong end, or
+    // taken in the mate's coordinate frame, produces a 127-base read with different content.
+    // Simplex emits consensus reads in read orientation, so the negative strand's expectation
+    // is built from the reverse complement of its stored sequence.
+    let (r1_bases, r2_bases) = indel_readthrough_read_bases();
+    let expected_r1: Vec<u8> = r1_bases[..127].to_vec();
+    // The negative strand is emitted in sequencing order, which is the reverse complement of the
+    // reference-orientation bases the BAM stores; its clip comes off that sequence's 3' end.
+    let expected_r2: Vec<u8> = reverse_complement(&r2_bases)[..127].to_vec();
+    for record in &records {
+        let bases: Vec<u8> = record.sequence().iter().collect();
+        let is_r1 = record.flags().is_first_segment();
+        let expected = if is_r1 { &expected_r1 } else { &expected_r2 };
+        assert_eq!(
+            &bases,
+            expected,
+            "the {} consensus must be its read minus the 2 bases it overhangs, 3'-end first",
+            if is_r1 { "R1" } else { "R2" }
+        );
     }
 }

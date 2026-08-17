@@ -1,6 +1,6 @@
 use crate::SamTag;
 use crate::cigar::{
-    consumes_query, get_cigar_ops, reference_length_from_cigar, reference_length_from_raw_bam,
+    consumes_ref, get_cigar_ops, query_length_from_cigar, reference_length_from_raw_bam,
 };
 use crate::fields::{RawRecordView, aux_data_slice, flags, mate_pos, mate_ref_id, template_length};
 use crate::tags::RawTagsView;
@@ -100,18 +100,22 @@ pub fn is_primary_fr_pair_raw(a: &[u8], b: &[u8]) -> bool {
     is_fr_pair_raw(reverse_record)
 }
 
-/// Number of bases a read extends past its mate for FR pairs, deriving the mate's boundary
-/// from the read's own **MC tag** (the mate CIGAR). Returns `0` for non-FR pairs or when the
-/// MC tag is absent/invalid.
+/// Number of bases a read extends past its mate for FR pairs, taking the mate's alignment from
+/// the read's own **MC tag** (the mate CIGAR). Returns `0` for non-FR pairs or when the MC tag
+/// is absent/invalid.
 ///
-/// The mate boundary uses **soft-only** unclipped coordinates (fgbio `mateUnSoftClippedStart`/
-/// `mateUnSoftClippedEnd`) — hard clips do NOT extend it. This deliberately differs from the
-/// samtools-style soft+hard unclipped 5' position used for template-coordinate sorting/grouping
-/// (see [`crate::cigar::mate_unclipped_5prime`]): overlap clipping counts only bases physically
-/// present in the mate's sequence, whereas the sort/group key follows samtools' soft+hard
-/// convention. Used by the simplex (vanilla) and duplex consensus callers, mirroring fgbio's
-/// base `UmiConsensusCaller.numBasesExtendingPastMate`. The codec caller instead uses
-/// [`num_bases_extending_past_mate_vs_mate_raw`], which reads the mate boundary from the mate
+/// The distance is measured in **query** bases: the read's query bases past the last reference
+/// position it shares with its mate, less the mate's own query bases past that position (the
+/// first shared position, for a negative-strand read, whose 3' end is its leftmost). Hard clips
+/// never contribute — the mate's overhang counts only bases physically present in its sequence,
+/// matching fgbio's soft-only `mateUnSoftClippedStart`/
+/// `mateUnSoftClippedEnd`. This deliberately differs from the samtools-style soft+hard unclipped
+/// 5' position used for template-coordinate sorting/grouping (see
+/// [`crate::cigar::mate_unclipped_5prime`]), which follows samtools' soft+hard convention.
+///
+/// Used by the simplex (vanilla) and duplex consensus callers, in the place of fgbio's base
+/// `UmiConsensusCaller.numBasesExtendingPastMate`. The codec caller instead uses
+/// [`num_bases_extending_past_mate_vs_mate_raw`], which reads the mate's alignment from the mate
 /// record in hand rather than its MC tag (see CODEC3-04).
 #[must_use]
 pub fn num_bases_extending_past_mate_raw(bam: &[u8]) -> usize {
@@ -131,21 +135,19 @@ pub fn num_bases_extending_past_mate_raw(bam: &[u8]) -> usize {
 
     // A malformed MC CIGAR fails closed to 0 (no clip), honoring the doc contract above
     // ("Returns 0 ... when the MC tag is absent/invalid").
-    let Some((mate_unclipped_start, mate_unclipped_end)) =
-        mate_soft_unclipped_from_mc(mate_pos(bam) + 1, mc_cigar)
-    else {
+    let Some(mate_ops) = parse_mc_cigar_ops(mc_cigar) else {
         return 0;
     };
-    bases_extending_past_mate(bam, mate_unclipped_start, mate_unclipped_end)
+    bases_extending_past_mate(bam, mate_pos(bam) + 1, &mate_ops)
 }
 
-/// Number of bases a read extends past its mate for FR pairs, deriving the mate's boundary
-/// from the **mate record in hand** rather than the read's MC tag.
+/// Number of bases a read extends past its mate for FR pairs, taking the mate's alignment from
+/// the **mate record in hand** rather than the read's MC tag.
 ///
 /// Codec (and any caller holding both primary reads) uses this so overlap clipping does not
 /// silently no-op when the MC tag is missing — mirroring fgbio's `updateMateCigars`, which
-/// backfills the mate CIGAR from the in-group mate before clipping. Uses the same soft-only
-/// mate boundary as [`num_bases_extending_past_mate_raw`].
+/// backfills the mate CIGAR from the in-group mate before clipping. Measures the same query
+/// distance as [`num_bases_extending_past_mate_raw`].
 ///
 /// Because both records are in hand, FR classification uses the symmetric per-pair
 /// [`is_primary_fr_pair_raw`] rather than the per-record [`is_fr_pair_raw`]. The per-record test is
@@ -159,94 +161,165 @@ pub fn num_bases_extending_past_mate_vs_mate_raw(rec: &[u8], mate: &[u8]) -> usi
     }
     let mate_pos_1based = RawRecordView::new(mate).pos() + 1;
     let mate_ops = get_cigar_ops(mate);
-    let (mate_unclipped_start, mate_unclipped_end) =
-        mate_soft_unclipped_from_ops(mate_pos_1based, &mate_ops);
-    bases_extending_past_mate(rec, mate_unclipped_start, mate_unclipped_end)
+    bases_extending_past_mate(rec, mate_pos_1based, &mate_ops)
 }
 
 /// Core of the overlap-clip computation shared by the MC-based and mate-record-based entry
-/// points: given the mate's soft-only unclipped start/end (1-based), returns how many bases at
-/// the read's 3' (sequencing) end extend past the mate. Mirrors fgbio
-/// `SamRecordClipper.numBasesExtendingPastMate`.
+/// points: given the mate's 1-based leftmost position and its CIGAR ops, returns how many bases
+/// at the read's 3' (sequencing) end extend past the mate.
+///
+/// # Distances are measured in query space
+///
+/// Both distances are counted in **query** bases from a reference position the two reads
+/// actually share, per fgbio's `SamRecordClipper` rework (fulcrumgenomics/fgbio#1090, mirrored
+/// as fulcrumgenomics/fgumi#752):
+///
+/// 1. take the last reference position both alignments cover (the first, for a negative-strand
+///    read, whose 3' end is its leftmost);
+/// 2. count the query bases each read has past it;
+/// 3. clip the read down to the mate's count.
+///
+/// The superseded formula built a *reference* coordinate — the mate's soft-only unclipped end —
+/// by adding the mate's trailing soft clip, a *query* distance, to its alignment end, and then
+/// looked up the read position there. Those two spaces only agree across an ungapped alignment.
+/// With an indel near the read's 3' end the boundary lands somewhere the read never sequenced:
+/// inside a deletion it has no read position at all, and the lookup's "no such position" was
+/// then subtracted from the read length, clipping the **entire read**. An insertion moved the
+/// boundary the other way and under-clipped by the insertion's length. Reading the deleted base
+/// as the last one before it (htsjdk's `returnLastBaseIfDeleted`) does not fix this — it only
+/// replaces one reference-space answer with another, and still carries the mate's soft clip in
+/// the wrong space.
+///
+/// # When the read stops short of the mate's alignment
+///
+/// A read whose alignment does not reach its mate's has no shared reference position to anchor
+/// on, and nothing but its soft-clipped tail can reach past the mate. The estimate is then the
+/// historical one: extrapolate the tail one query base per reference base against the mate's
+/// soft-only unclipped boundary — what fgbio's `SamRecordClipper.numBasesExtendingPastMate` has
+/// done since fulcrumgenomics/fgbio#842, which added it precisely because answering 0 here made
+/// `FilterConsensusReads` pass reads it should have failed.
+///
+/// Read-through is entirely possible in this geometry, so answering 0 here would leave adapter
+/// on the read. Both alignments lie within the insert, so a short insert read from both ends
+/// leaves them disjoint whenever each alignment stops short of the other's — which soft clipping
+/// at a variant or a mis-called base is enough to produce. The extrapolation is exact whenever
+/// the region between the two alignments is ungapped, and it is continuous with the query-space
+/// count above, which reduces to exactly this expression as the shared span shrinks to a single
+/// reference position.
+///
+/// The conflation this function otherwise avoids cannot bite here: neither alignment places a
+/// base between the two, so neither can place an indel between them either. An indel in the
+/// sample that falls in that gap is invisible to both reads and shifts the estimate by its own
+/// length, in either direction; the result is capped by the read's soft clipping regardless, so
+/// no aligned base is ever removed on the strength of it.
+///
+/// # When the read lies entirely on the far side of the mate
+///
+/// A read whose 3' end points *away* from a mate it does not overlap describes an outward-facing
+/// template rather than read-through, and nothing is clipped. Measuring it against the anchor
+/// like any other read would count every one of its query bases as past the mate and take its
+/// aligned bases — the destructive answer fulcrumgenomics/fgumi#752 exists to remove — on a
+/// geometry this function cannot verify.
+///
+/// It is reachable two ways, one per strand. [`is_fr_pair_raw`] mirrors htsjdk's *per-record*
+/// orientation test, whose forward-strand arm reads `TLEN`, so a forward record can be accepted
+/// as one end of an FR pair while the mate CIGAR it carries places the mate to its left.
+/// (htsjdk 5 prefers the mate CIGAR when the MC tag is present, which is why fgbio does not admit
+/// that one.) The reverse-strand arm is CIGAR-derived, but it reads the mate position recorded
+/// *on this record*, while [`num_bases_extending_past_mate_vs_mate_raw`] measures against the
+/// mate record in hand — so a stale mate-position field admits the mirror image.
 #[must_use]
-fn bases_extending_past_mate(
-    bam: &[u8],
-    mate_unclipped_start: i32,
-    mate_unclipped_end: i32,
-) -> usize {
+fn bases_extending_past_mate(bam: &[u8], mate_pos_1based: i32, mate_ops: &[u32]) -> usize {
     let v = RawRecordView::new(bam);
     let is_reverse = v.flags() & flags::REVERSE != 0;
     let this_pos = v.pos() + 1; // 1-based
 
     let cigar_ops = get_cigar_ops(bam);
-    let read_length: usize = cigar_ops
-        .iter()
-        .map(|&op| {
-            let op_type = op & 0xF;
-            let op_len = (op >> 4) as usize;
-            if consumes_query(op_type) { op_len } else { 0 }
-        })
-        .sum();
+    let read_end = alignment_end_1based(this_pos, &cigar_ops);
+    let mate_end = alignment_end_1based(mate_pos_1based, mate_ops);
 
     if is_reverse {
-        // Negative strand: check if read extends before mate's unclipped start
-        if this_pos <= mate_unclipped_start {
-            compute_bases_before_ref_pos(&cigar_ops, this_pos, mate_unclipped_start)
-        } else {
-            // Only clip excess soft-clipped bases at the start.
-            // saturating: an adversarial MC-tag/mate CIGAR can push mate_unclipped_start far
-            // negative (leading_soft saturates to i32::MAX upstream), so a plain subtraction
-            // would overflow i32 here — panic in debug, wrap to garbage in release.
-            let leading_sc = leading_soft_clip_from_ops(&cigar_ops);
+        // Negative strand: the read's 3' end is its leftmost, so it is measured against the
+        // mate's alignment *start*.
+        if this_pos > mate_end {
+            // The read begins after the mate's alignment ends; see "stops short" above. The gap
+            // is non-negative by construction (mate_unclipped_start <= mate_pos <= mate_end <
+            // this_pos), and saturating only because an adversarial mate CIGAR can push
+            // mate_unclipped_start to i32::MIN, where a plain subtraction would overflow i32 —
+            // a panic in debug, garbage in release.
+            let (mate_unclipped_start, _) = mate_soft_unclipped_from_ops(mate_pos_1based, mate_ops);
             let gap = this_pos.saturating_sub(mate_unclipped_start).cast_unsigned() as usize;
-            leading_sc.saturating_sub(gap)
+            return leading_soft_clip_from_ops(&cigar_ops).saturating_sub(gap);
         }
+        if read_end < mate_pos_1based {
+            // The mate lies entirely to the right of a read whose 3' end faces left; see "far
+            // side" above.
+            return 0;
+        }
+        // Equalize the query bases the two reads have *before* the first reference position they
+        // share.
+        let first_shared = this_pos.max(mate_pos_1based);
+        let read_before = query_bases_before_ref_pos(&cigar_ops, this_pos, first_shared);
+        let mate_before = query_bases_before_ref_pos(mate_ops, mate_pos_1based, first_shared);
+        read_before.saturating_sub(mate_before)
     } else {
-        // Positive strand: check if read extends past mate's unclipped end.
-        // saturating: an oversized decoded CIGAR can drive `ref_len` up to `i32::MAX`, so a plain
-        // `this_pos + ref_len - 1` would overflow i32 before clipping can fail closed — panic in
-        // debug, wrap to garbage in release.
-        let ref_len = reference_length_from_cigar(&cigar_ops);
-        // `-1` first, matching the mate-boundary helpers: subtracting it after the
-        // saturating add clamps a genuinely-at-the-ceiling end inward to `i32::MAX - 1`.
-        let alignment_end = this_pos.saturating_sub(1).saturating_add(ref_len);
-
-        if alignment_end >= mate_unclipped_end {
-            // Compute read position at mate's unclipped end
-            let bases_past = compute_bases_past_ref_pos(&cigar_ops, this_pos, mate_unclipped_end);
-            read_length.saturating_sub(bases_past)
-        } else {
-            // Only clip excess soft-clipped bases.
-            // saturating for symmetry with the reverse-strand branch: mate_unclipped_end only
-            // saturates upward (bounded by i32::MAX) so this is not currently reachable-overflow,
-            // but saturating the subtraction closes the analogous gap defensively and cheaply.
-            let trailing_sc = trailing_soft_clip_from_ops(&cigar_ops);
-            let gap = mate_unclipped_end.saturating_sub(alignment_end).cast_unsigned() as usize;
-            trailing_sc.saturating_sub(gap)
+        // Positive strand: the read's 3' end is its rightmost, so it is measured against the
+        // mate's alignment *end*.
+        if read_end < mate_pos_1based {
+            // The read ends before the mate's alignment begins; see "stops short" above. The gap
+            // is non-negative by construction (read_end < mate_pos <= mate_end <=
+            // mate_unclipped_end); saturating for symmetry with the reverse branch.
+            let (_, mate_unclipped_end) = mate_soft_unclipped_from_ops(mate_pos_1based, mate_ops);
+            let gap = mate_unclipped_end.saturating_sub(read_end).cast_unsigned() as usize;
+            return trailing_soft_clip_from_ops(&cigar_ops).saturating_sub(gap);
         }
+        if mate_end < this_pos {
+            // The mate lies entirely to the left of a read whose 3' end faces right; see "far
+            // side" above.
+            return 0;
+        }
+        // Equalize the query bases past the last reference position they share.
+        let last_shared = read_end.min(mate_end);
+        let read_past = query_bases_past_ref_pos(&cigar_ops, this_pos, last_shared);
+        let mate_past = query_bases_past_ref_pos(mate_ops, mate_pos_1based, last_shared);
+        read_past.saturating_sub(mate_past)
     }
 }
 
-/// Mate's soft-only unclipped start/end (1-based) from an MC-tag CIGAR **string** and the
-/// mate's 1-based leftmost position. Only soft clips count — hard clips are excluded — matching
-/// fgbio `mateUnSoftClippedStart`/`mateUnSoftClippedEnd`.
-fn mate_soft_unclipped_from_mc(mate_pos_1based: i32, mc_cigar: &str) -> Option<(i32, i32)> {
-    let (leading_soft, ref_len, trailing_soft) = parse_soft_clips_and_ref_len(mc_cigar)?;
-    // saturating: a saturated ref_len/soft-clip (from an adversarial MC CIGAR) must
-    // clamp the boundary, not overflow-panic (debug) / wrap to a negative (release).
-    // The inclusive-end `-1` is applied *first*, for the reason given on
-    // `cigar::unclipped_other_end`: applied last it would saturate the sum to
-    // `i32::MAX` and then walk it back to `i32::MAX - 1`, clamping inward rather
-    // than outward -- the opposite of what the fail-closed contract wants. As a
-    // plain `- 1` it also underflow-panicked in debug when `mate_pos_1based` was
-    // `i32::MIN` and the spans were zero.
-    Some((
-        mate_pos_1based.saturating_sub(leading_soft),
-        mate_pos_1based.saturating_sub(1).saturating_add(ref_len).saturating_add(trailing_soft),
-    ))
+/// 1-based inclusive alignment end for an alignment starting at `pos_1based`.
+///
+/// saturating: an oversized decoded CIGAR can drive the reference span up to `i32::MAX`, so a
+/// plain `pos + ref_len - 1` would overflow i32 before clipping can fail closed — panic in
+/// debug, wrap to garbage in release. The `-1` is applied *first*, matching the mate-boundary
+/// helper: subtracting it after the saturating add would clamp a genuinely-at-the-ceiling end
+/// inward to `i32::MAX - 1`.
+fn alignment_end_1based(pos_1based: i32, cigar_ops: &[u32]) -> i32 {
+    pos_1based.saturating_sub(1).saturating_add(saturating_reference_length(cigar_ops))
 }
 
-/// Mate's soft-only unclipped start/end (1-based) from the mate record's own CIGAR **ops**.
+/// Reference-consuming span of `cigar_ops`, clamped to `i32::MAX` instead of overflowing.
+///
+/// [`crate::cigar::reference_length_from_cigar`] sums with a plain `+=`, which is fine for a
+/// CIGAR decoded from a BAM record but not for one decoded from an MC tag: the tag is a
+/// free-form `Z` string whose operations are never length-checked against a real reference, so
+/// enough of them can overflow the sum. Every boundary this module derives is fail-closed, so
+/// clamping outward is the right answer here.
+fn saturating_reference_length(cigar_ops: &[u32]) -> i32 {
+    let mut ref_len = 0i32;
+    for &op in cigar_ops {
+        if consumes_ref(op & 0xF) {
+            ref_len = ref_len.saturating_add(i32::try_from(op >> 4).unwrap_or(i32::MAX));
+        }
+    }
+    ref_len
+}
+
+/// Mate's soft-only unclipped start/end (1-based) from the mate's CIGAR **ops**. Only soft clips
+/// count — hard clips are excluded — matching fgbio `mateUnSoftClippedStart`/`mateUnSoftClippedEnd`.
+///
+/// Used only by [`bases_extending_past_mate`]'s stops-short branch: these boundaries mix a query
+/// distance (the soft clip) into a reference coordinate, which is sound only when no aligned base
+/// lies between the two reads.
 fn mate_soft_unclipped_from_ops(mate_pos_1based: i32, mate_ops: &[u32]) -> (i32, i32) {
     // Both soft-clip totals clamp to i32::MAX (not 0) when they overflow i32: an oversized
     // trailing clip that collapsed to 0 would shrink mate_unclipped_end, making the read look
@@ -254,46 +327,51 @@ fn mate_soft_unclipped_from_ops(mate_pos_1based: i32, mate_ops: &[u32]) -> (i32,
     // clamping the boundary outward, matching leading_soft.
     let leading_soft = i32::try_from(leading_soft_clip_from_ops(mate_ops)).unwrap_or(i32::MAX);
     let trailing_soft = i32::try_from(trailing_soft_clip_from_ops(mate_ops)).unwrap_or(i32::MAX);
-    let ref_len = reference_length_from_cigar(mate_ops);
-    // The inclusive-end `-1` is applied first; see `mate_soft_unclipped_from_mc`.
+    let ref_len = saturating_reference_length(mate_ops);
+    // The inclusive-end `-1` is applied first; see `alignment_end_1based`.
     (
         mate_pos_1based.saturating_sub(leading_soft),
         mate_pos_1based.saturating_sub(1).saturating_add(ref_len).saturating_add(trailing_soft),
     )
 }
 
-/// Parses `(leading_soft_clips, reference_length, trailing_soft_clips)` from a CIGAR string,
-/// counting only soft (`S`) clips — hard clips (`H`) are ignored, giving the soft-only unclipped
-/// extent fgbio uses for overlap clipping.
+/// The largest run length a BAM CIGAR operation can carry: the length occupies the upper 28 bits
+/// of the packed `u32`. An MC-tag run length beyond it cannot describe a real alignment.
+const MAX_CIGAR_OP_LEN: u32 = (1 << 28) - 1;
+
+/// Parses an MC-tag CIGAR **string** into BAM-packed CIGAR ops (`(len << 4) | op_code`), the same
+/// encoding [`crate::cigar::get_cigar_ops`] yields for a record's own CIGAR, so the MC-tag and
+/// mate-record paths share one set of CIGAR walkers.
 ///
 /// Returns `None` for any CIGAR that is not a structurally valid SAM CIGAR for a mapped record,
-/// so malformed MC-tag input fails closed rather than yielding a partial boundary. Rejected:
+/// so malformed MC-tag input fails closed rather than yielding a partial answer. Rejected:
 /// - an unknown operator byte (e.g. the `f`/`o` in `10Mfoo5S`, or a non-ASCII byte);
 /// - an operator with no preceding run-length (a bare `MS`) or a zero run-length (`0M`, `10M0S`);
+/// - a run-length past [`MAX_CIGAR_OP_LEN`], which no BAM CIGAR operation can hold;
 /// - a trailing run-length with no operator (`10M5`), or an empty CIGAR;
 /// - a soft (`S`) or hard (`H`) clip that is not at the end of the CIGAR — `S` may only sit at the
 ///   ends (inside any `H`), and `H` only as the first/last operation (e.g. `10M5S10M` is invalid);
 /// - a CIGAR with no reference-consuming operation (`10S`), which a mapped mate cannot have.
-fn parse_soft_clips_and_ref_len(cigar: &str) -> Option<(i32, i32, i32)> {
+fn parse_mc_cigar_ops(cigar: &str) -> Option<Vec<u32>> {
     // Phase 1: tokenize into (run_length, operator) pairs. Accumulate the run-length from digit
     // bytes directly rather than slicing the string by byte offset — slicing on a non-ASCII byte
     // (a malformed CIGAR) would panic on a char boundary. Reject lexical errors here.
-    let mut tokens: Vec<(i32, u8)> = Vec::new();
-    let mut num = 0i32;
+    let mut tokens: Vec<(u32, u8)> = Vec::new();
+    let mut num = 0u32;
     let mut have_digits = false;
     for &c in cigar.as_bytes() {
         if c.is_ascii_digit() {
-            // saturating: an adversarial MC CIGAR can sum a run-length past i32::MAX; clamp
-            // rather than overflow-panic (debug) / wrap (release).
-            num = num.saturating_mul(10).saturating_add(i32::from(c - b'0'));
+            // saturating, then range-checked: an adversarial MC CIGAR can run the digits past
+            // any bound, and clamping rather than wrapping keeps the check below decisive.
+            num = num.saturating_mul(10).saturating_add(u32::from(c - b'0'));
+            if num > MAX_CIGAR_OP_LEN {
+                return None;
+            }
             have_digits = true;
             continue;
         }
         // Every operator needs a positive run-length, and must be a known CIGAR operator.
-        if !have_digits || num == 0 {
-            return None;
-        }
-        if !matches!(c, b'M' | b'I' | b'D' | b'N' | b'S' | b'H' | b'P' | b'=' | b'X') {
+        if !have_digits || num == 0 || cigar_op_code(c).is_none() {
             return None;
         }
         tokens.push((num, c));
@@ -305,30 +383,22 @@ fn parse_soft_clips_and_ref_len(cigar: &str) -> Option<(i32, i32, i32)> {
         return None;
     }
 
-    // Phase 2: validate structure and accumulate the soft-only boundary in one pass. Soft clips
-    // must sit at the ends (inside any hard clip); hard clips only as the first/last operation.
+    // Phase 2: validate structure and pack the ops in one pass. Soft clips must sit at the ends
+    // (inside any hard clip); hard clips only as the first/last operation.
     let last = tokens.len() - 1;
-    let mut leading_soft = 0i32;
-    let mut trailing_soft = 0i32;
-    let mut ref_len = 0i32;
+    let mut ops = Vec::with_capacity(tokens.len());
     let mut saw_ref_op = false;
     for (i, &(len, op)) in tokens.iter().enumerate() {
+        // Phase 1 accepted every operator, so this lookup cannot fail.
+        let op_code = cigar_op_code(op)?;
         match op {
-            b'M' | b'D' | b'N' | b'=' | b'X' => {
-                ref_len = ref_len.saturating_add(len);
-                saw_ref_op = true;
-            }
-            b'I' | b'P' => {} // interior op: no boundary contribution, no placement constraint
+            b'M' | b'D' | b'N' | b'=' | b'X' => saw_ref_op = true,
+            b'I' | b'P' => {} // interior op: no placement constraint
             b'S' => {
                 let leading = tokens[..i].iter().all(|&(_, o)| o == b'H');
                 let trailing = tokens[i + 1..].iter().all(|&(_, o)| o == b'H');
                 if !leading && !trailing {
                     return None; // internal soft clip: invalid placement
-                }
-                if saw_ref_op {
-                    trailing_soft = trailing_soft.saturating_add(len);
-                } else {
-                    leading_soft = leading_soft.saturating_add(len);
                 }
             }
             b'H' if i == 0 || i == last => {} // hard clip only permitted at the ends
@@ -336,99 +406,135 @@ fn parse_soft_clips_and_ref_len(cigar: &str) -> Option<(i32, i32, i32)> {
             // operators, so every other operator byte here also fails closed.
             _ => return None,
         }
+        // `len <= MAX_CIGAR_OP_LEN` (28 bits), so the shift cannot drop bits.
+        ops.push((len << 4) | op_code);
     }
     // A mapped mate's CIGAR must consume reference; a fully-clipped CIGAR (`10S`) cannot.
     if !saw_ref_op {
         return None;
     }
 
-    Some((leading_soft, ref_len, trailing_soft))
+    Some(ops)
 }
 
-/// Whether to return the read position at or past the target reference position,
-/// or the read position before it.
+/// BAM operation code for a CIGAR operator character, in `BAM_CIGAR_STR` (`MIDNSHP=X`) order, or
+/// `None` for a byte that is not a CIGAR operator. Doubles as the tokenizer's operator check, so
+/// the set of accepted operators is defined in exactly one place.
+fn cigar_op_code(op: u8) -> Option<u32> {
+    Some(match op {
+        b'M' => 0,
+        b'I' => 1,
+        b'D' => 2,
+        b'N' => 3,
+        b'S' => 4,
+        b'H' => 5,
+        b'P' => 6,
+        b'=' => 7,
+        b'X' => 8,
+        _ => return None,
+    })
+}
+
+/// Which side of `target_ref_pos` the base sitting *on* it belongs to.
 #[derive(Clone, Copy)]
-enum RefPosMode {
-    /// Return the 1-based read position at the target (for positive strand clipping).
-    AtOrPast,
-    /// Return the 1-based read position before the target (for negative strand clipping).
-    Before,
+enum RefPosBoundary {
+    /// Count the query base aligned to `target_ref_pos` itself.
+    Inclusive,
+    /// Stop one reference base short of `target_ref_pos`.
+    Exclusive,
 }
 
-/// Compute the read position relative to a reference position by walking the CIGAR.
+/// Number of query bases the alignment places at or before `target_ref_pos` (`Inclusive`), or
+/// strictly before it (`Exclusive`).
 ///
-/// Returns the 1-based read position at (or just before) the given reference position,
-/// or 0 if the position falls in a deletion/skip or outside the alignment.
-fn compute_read_pos_at_ref(
+/// A query-only operation (`I`/`S`) occupies the gap between the reference position last consumed
+/// and the next one, so it belongs to whichever side of `target_ref_pos` that gap falls on — a
+/// leading soft clip precedes the alignment start and always counts, a trailing soft clip follows
+/// the alignment end and never does, and an interior insertion counts only when the alignment has
+/// not yet reached past the target. Both modes agree on those; they differ only in whether the
+/// base aligned to `target_ref_pos` itself is counted.
+///
+/// A `target_ref_pos` inside a deletion is *not* a special case: the deletion consumes reference
+/// without query, so the walk simply carries past the target and every query base after the
+/// deletion falls on its far side. That is the whole point — this is what the superseded
+/// read-position lookup could not express, and where it returned "no such position" instead.
+fn query_bases_up_to_ref_pos(
     cigar_ops: &[u32],
     alignment_start_1based: i32,
     target_ref_pos: i32,
-    mode: RefPosMode,
+    boundary: RefPosBoundary,
 ) -> usize {
-    let mut ref_pos = alignment_start_1based;
-    let mut read_pos: usize = 0;
+    // Widened to i64 so an alignment start far below the target (an adversarial mate position)
+    // cannot overflow the span subtraction below.
+    let target = i64::from(target_ref_pos);
+    // Whether the reference base at `target` is on this side of the boundary.
+    let inclusive = match boundary {
+        RefPosBoundary::Inclusive => 1i64,
+        RefPosBoundary::Exclusive => 0i64,
+    };
 
+    let mut ref_pos = alignment_start_1based;
+    let mut query_bases = 0usize;
     for &op in cigar_ops {
+        // Everything from here on sits past the target, on the reference and in the query.
+        if i64::from(ref_pos) > target {
+            break;
+        }
         let op_type = op & 0xF;
         let op_len = (op >> 4) as usize;
-
         match op_type {
             0 | 7 | 8 => {
-                // M, =, X: consume both query and reference
-                for _ in 0..op_len {
-                    read_pos += 1;
-                    if ref_pos == target_ref_pos {
-                        return match mode {
-                            RefPosMode::AtOrPast => read_pos,
-                            RefPosMode::Before => read_pos.saturating_sub(1),
-                        };
-                    }
-                    ref_pos += 1;
+                // M, =, X: consume both query and reference. Take only the bases on this side of
+                // the boundary; if any are left over, the rest of the CIGAR is past it.
+                let span = target - i64::from(ref_pos) + inclusive;
+                let take = op_len.min(usize::try_from(span.max(0)).unwrap_or(usize::MAX));
+                query_bases += take;
+                ref_pos = ref_pos.saturating_add(i32::try_from(op >> 4).unwrap_or(i32::MAX));
+                if take < op_len {
+                    break;
                 }
             }
-            1 => {
-                // I: consume query only
-                read_pos += op_len;
-            }
-            4 => {
-                // S: consume query only
-                read_pos += op_len;
-            }
-            2 | 3 => {
-                // D, N: consume reference only
-                for _ in 0..op_len {
-                    if ref_pos == target_ref_pos {
-                        return 0; // Position in deletion
-                    }
-                    ref_pos += 1;
-                }
-            }
-            _ => {}
+            // I, S: consume query only, in the gap the walk has reached — which is on this side
+            // of the boundary, or the loop would have broken above.
+            1 | 4 => query_bases += op_len,
+            // D, N: consume reference only.
+            2 | 3 => ref_pos = ref_pos.saturating_add(i32::try_from(op >> 4).unwrap_or(i32::MAX)),
+            _ => {} // H, P: neither
         }
     }
 
-    0
+    query_bases
 }
 
-/// Compute number of read bases at or past a reference position (for positive strand).
-///
-/// Returns the 1-based read position at the given reference position,
-/// or 0 if the position falls in a deletion or outside the alignment.
-fn compute_bases_past_ref_pos(
+/// Number of query bases the alignment places strictly past `target_ref_pos` — the 3' overhang of
+/// a positive-strand read measured from a shared reference position.
+fn query_bases_past_ref_pos(
     cigar_ops: &[u32],
     alignment_start_1based: i32,
     target_ref_pos: i32,
 ) -> usize {
-    compute_read_pos_at_ref(cigar_ops, alignment_start_1based, target_ref_pos, RefPosMode::AtOrPast)
+    let at_or_before = query_bases_up_to_ref_pos(
+        cigar_ops,
+        alignment_start_1based,
+        target_ref_pos,
+        RefPosBoundary::Inclusive,
+    );
+    query_length_from_cigar(cigar_ops).saturating_sub(at_or_before)
 }
 
-/// Compute number of read bases before a reference position (for negative strand).
-fn compute_bases_before_ref_pos(
+/// Number of query bases the alignment places strictly before `target_ref_pos` — the 3' overhang
+/// of a negative-strand read, whose 3' end is its leftmost.
+fn query_bases_before_ref_pos(
     cigar_ops: &[u32],
     alignment_start_1based: i32,
     target_ref_pos: i32,
 ) -> usize {
-    compute_read_pos_at_ref(cigar_ops, alignment_start_1based, target_ref_pos, RefPosMode::Before)
+    query_bases_up_to_ref_pos(
+        cigar_ops,
+        alignment_start_1based,
+        target_ref_pos,
+        RefPosBoundary::Exclusive,
+    )
 }
 
 /// Count trailing soft clips from CIGAR ops.
@@ -469,8 +575,20 @@ mod tests {
     use rstest::rstest;
 
     // ========================================================================
-    // parse_soft_clips_and_ref_len tests
+    // parse_mc_cigar_ops tests
     // ========================================================================
+
+    /// Summarizes parsed MC ops as `(leading_soft, ref_len, trailing_soft)` — counting only soft
+    /// clips (H excluded) — so the case table below reads in the terms the boundary math uses.
+    fn mc_summary(cigar: &str) -> Option<(i32, i32, i32)> {
+        parse_mc_cigar_ops(cigar).map(|ops| {
+            (
+                i32::try_from(leading_soft_clip_from_ops(&ops)).unwrap_or(i32::MAX),
+                saturating_reference_length(&ops),
+                i32::try_from(trailing_soft_clip_from_ops(&ops)).unwrap_or(i32::MAX),
+            )
+        })
+    }
 
     /// `(leading_soft, ref_len, trailing_soft)`, counting only soft clips (H excluded).
     /// Any CIGAR that is not a structurally valid SAM CIGAR for a mapped record fails closed
@@ -485,10 +603,14 @@ mod tests {
     #[case::soft_and_hard("2H5S10M3S2H", Some((5, 10, 3)))]
     #[case::ref_ops_summed("5M2D3N4M", Some((0, 14, 0)))]
     #[case::insertion_ignored("5M2I3M", Some((0, 8, 0)))]
-    // A malformed/adversarial MC CIGAR whose ref ops sum past i32::MAX must
-    // saturate rather than overflow the `ref_len += num` accumulation.
-    #[case::oversized_ref_ops_saturate("2000000000M2000000000M", Some((0, i32::MAX, 0)))]
-    // --- lexically malformed: unknown byte, missing/zero run-length, dangling length, empty ---
+    // A CIGAR whose ref ops sum past i32::MAX must saturate rather than overflow the
+    // accumulation. Each op is at the 28-bit CIGAR maximum, so this is the widest span any
+    // structurally valid CIGAR can describe; nine of them exceed i32::MAX.
+    #[case::many_max_length_ops_saturate(&"268435455M".repeat(9), Some((0, i32::MAX, 0)))]
+    // --- lexically malformed: unknown byte, missing/zero/oversized run-length, dangling, empty ---
+    // A run length past the 28-bit CIGAR field cannot describe a real alignment.
+    #[case::out_of_range_run_length_rejected("2000000000M", None)]
+    #[case::out_of_range_run_length_absurd_rejected("9999999999M", None)]
     #[case::non_ascii_rejected("10M\u{20ac}5S", None)]
     #[case::embedded_garbage_rejected("10Mfoo5S", None)]
     #[case::bare_operator_rejected("MS", None)]
@@ -502,53 +624,32 @@ mod tests {
     #[case::leading_hard_after_soft_rejected("5S2H10M", None)]
     #[case::no_ref_op_soft_only_rejected("36S", None)]
     #[case::no_ref_op_insertion_only_rejected("5S5I", None)]
-    fn test_parse_soft_clips_and_ref_len(
-        #[case] cigar: &str,
-        #[case] expected: Option<(i32, i32, i32)>,
-    ) {
-        assert_eq!(parse_soft_clips_and_ref_len(cigar), expected);
+    fn test_parse_mc_cigar_ops(#[case] cigar: &str, #[case] expected: Option<(i32, i32, i32)>) {
+        assert_eq!(mc_summary(cigar), expected);
     }
 
-    /// A crafted (valid-UTF-8) MC-tag CIGAR with an op length that saturates
-    /// `ref_len` must not overflow the boundary arithmetic
-    /// (`mate_pos_1based - 1 + ref_len + trailing_soft`). Pre-fix this panicked in
-    /// debug/test and wrapped to a bogus negative boundary in release, corrupting
-    /// the overlap-clip amount. A well-formed BAM cannot reach this (real ref
-    /// lengths are chromosome-bounded), but the MC Z-string is never length-checked.
-    #[rstest]
-    #[case::from_mc(mate_soft_unclipped_from_mc(100, "9999999999M"))]
-    fn mate_soft_unclipped_saturates_on_oversized_cigar(#[case] bounds: Option<(i32, i32)>) {
-        let (start, end) = bounds.expect("well-formed (if oversized) CIGAR parses");
+    /// A crafted (valid-UTF-8) MC-tag CIGAR whose reference span saturates `ref_len` must not
+    /// overflow the boundary arithmetic (`mate_pos_1based - 1 + ref_len + trailing_soft`).
+    /// Pre-fix this panicked in debug/test and wrapped to a bogus negative boundary in release,
+    /// corrupting the overlap-clip amount. A well-formed BAM cannot reach this (real ref lengths
+    /// are chromosome-bounded), but the MC Z-string is never length-checked.
+    #[test]
+    fn mate_soft_unclipped_saturates_on_oversized_cigar() {
+        let ops = parse_mc_cigar_ops(&"268435455M".repeat(9))
+            .expect("well-formed (if oversized) CIGAR parses");
+        let (start, end) = mate_soft_unclipped_from_ops(100, &ops);
         assert_eq!(start, 100, "no leading soft clip -> start stays at mate_pos");
         assert!(end >= start, "end boundary must stay >= start, not wrap negative");
         assert_eq!(end, i32::MAX, "saturated ref_len clamps the end boundary");
     }
 
-    /// The inclusive-end `-1` must be applied before the saturating additions, in
-    /// both mate-boundary helpers.
+    /// The inclusive-end `-1` must be applied before the saturating additions in the
+    /// mate-boundary helper.
     ///
     /// Applied last it saturates the sum to `i32::MAX` and then walks it back, so a
     /// boundary whose exact value *is* `i32::MAX` was reported as `i32::MAX - 1` --
     /// clamping the fail-closed boundary inward by one base rather than outward.
     /// This is the `overlap.rs` sibling of `cigar::unclipped_other_end`.
-    #[rstest]
-    // Exact ceiling, no saturation warranted: MAX + 1M - 1 == MAX.
-    #[case::from_mc_exactly_max(mate_soft_unclipped_from_mc(i32::MAX, "1M"), i32::MAX)]
-    // Genuinely past the ceiling: clamping outward to MAX is correct.
-    #[case::from_mc_past_max(mate_soft_unclipped_from_mc(i32::MAX, "10M"), i32::MAX)]
-    // The ordinary case must be untouched by the reordering: 100 + 10 - 1 == 109.
-    #[case::from_mc_ordinary(mate_soft_unclipped_from_mc(100, "10M"), 109)]
-    // A trailing soft clip still extends the boundary: 100 + 10 + 5 - 1 == 114.
-    #[case::from_mc_trailing_soft(mate_soft_unclipped_from_mc(100, "10M5S"), 114)]
-    fn mate_soft_unclipped_end_applies_the_inclusive_minus_one_first(
-        #[case] bounds: Option<(i32, i32)>,
-        #[case] expected_end: i32,
-    ) {
-        let (_, end) = bounds.expect("well-formed CIGAR parses");
-        assert_eq!(end, expected_end);
-    }
-
-    /// Same contract for the mate-record-based helper, which shares the formula.
     #[rstest]
     #[case::exactly_max(i32::MAX, &[encode_op(0, 1)], i32::MAX)]
     #[case::past_max(i32::MAX, &[encode_op(0, 10)], i32::MAX)]
@@ -563,8 +664,8 @@ mod tests {
         assert_eq!(end, expected_end);
     }
 
-    /// A malformed MC CIGAR fails closed through the whole MC-tag boundary path:
-    /// `mate_soft_unclipped_from_mc` returns `None` rather than a partial boundary.
+    /// A malformed MC CIGAR fails closed through the whole MC-tag path: `parse_mc_cigar_ops`
+    /// returns `None` rather than a partial CIGAR, and the entry point then clips nothing.
     #[rstest]
     #[case::embedded_garbage("10Mfoo5S")]
     #[case::bare_operator("MS")]
@@ -572,8 +673,28 @@ mod tests {
     #[case::internal_soft("10M5S10M")]
     #[case::no_ref_op("36S")]
     #[case::empty("")]
-    fn mate_soft_unclipped_from_mc_rejects_malformed(#[case] cigar: &str) {
-        assert_eq!(mate_soft_unclipped_from_mc(100, cigar), None);
+    #[case::out_of_range_run_length("9999999999M")]
+    fn mc_cigar_path_rejects_malformed(#[case] cigar: &str) {
+        assert_eq!(parse_mc_cigar_ops(cigar), None);
+
+        // A read whose mate CIGAR cannot be trusted is not clipped at all.
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ");
+        aux.extend_from_slice(cigar.as_bytes());
+        aux.push(0);
+        let rec = make_bam_bytes_with_tlen(
+            0,
+            100,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 40)],
+            40,
+            0,
+            100,
+            40,
+            &aux,
+        );
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
     }
 
     /// A mate record whose trailing soft clips sum past `i32::MAX` must clamp the mate
@@ -881,132 +1002,99 @@ mod tests {
     }
 
     // ========================================================================
-    // compute_bases_past_ref_pos tests
+    // query_bases_past_ref_pos tests
     // ========================================================================
 
-    #[test]
-    fn test_compute_bases_past_ref_pos_simple_match() {
-        // 10M starting at ref pos 100 (1-based)
-        // target_ref_pos = 105: should find read_pos at offset 5
-        let cigar = &[encode_op(0, 10)]; // 10M
-        let result = compute_bases_past_ref_pos(cigar, 100, 105);
-        assert_eq!(result, 6); // 1-based: read pos 6 at ref pos 105
-    }
-
-    #[test]
-    fn test_compute_bases_past_ref_pos_at_start() {
-        // 10M starting at ref pos 100
-        // target_ref_pos = 100: first position
-        let cigar = &[encode_op(0, 10)];
-        let result = compute_bases_past_ref_pos(cigar, 100, 100);
-        assert_eq!(result, 1);
-    }
-
-    #[test]
-    fn test_compute_bases_past_ref_pos_at_end() {
-        // 10M starting at ref pos 100
-        // target_ref_pos = 109: last position
-        let cigar = &[encode_op(0, 10)];
-        let result = compute_bases_past_ref_pos(cigar, 100, 109);
-        assert_eq!(result, 10);
-    }
-
-    #[test]
-    fn test_compute_bases_past_ref_pos_past_alignment() {
-        // 10M starting at ref pos 100
-        // target_ref_pos = 110: beyond alignment
-        let cigar = &[encode_op(0, 10)];
-        let result = compute_bases_past_ref_pos(cigar, 100, 110);
-        assert_eq!(result, 0); // outside alignment
-    }
-
-    #[test]
-    fn test_compute_bases_past_ref_pos_with_insertion() {
-        // 5M3I5M: insertion adds 3 query bases without consuming reference
-        // At ref 100: 5M covers ref 100-104, 3I adds 3 query bases,
-        // then 5M covers ref 105-109
-        // target=107: in second 5M, offset 2 from ref 105
-        // query pos = 5 (from first M) + 3 (from I) + 3 (offset in second M) = 11
-        let cigar = &[encode_op(0, 5), encode_op(1, 3), encode_op(0, 5)]; // 5M3I5M
-        let result = compute_bases_past_ref_pos(cigar, 100, 107);
-        assert_eq!(result, 11);
-    }
-
-    #[test]
-    fn test_compute_bases_past_ref_pos_in_deletion() {
-        // 5M3D5M: deletion spans ref 105-107 without consuming query
-        // target=106: falls in the deletion
-        let cigar = &[encode_op(0, 5), encode_op(2, 3), encode_op(0, 5)]; // 5M3D5M
-        let result = compute_bases_past_ref_pos(cigar, 100, 106);
-        assert_eq!(result, 0); // position is in a deletion
-    }
-
-    #[test]
-    fn test_compute_bases_past_ref_pos_with_soft_clip() {
-        // 3S10M: soft clip consumes 3 query bases but no reference
-        // Alignment starts at ref 100, so 10M covers ref 100-109
-        // target=102: offset 2 in the M, query pos = 3 (from S) + 3 = 6
-        let cigar = &[encode_op(4, 3), encode_op(0, 10)]; // 3S10M
-        let result = compute_bases_past_ref_pos(cigar, 100, 102);
-        assert_eq!(result, 6);
+    /// Query bases lying strictly past a reference position. Query-only operations belong to the
+    /// side of the boundary their gap falls on: a leading soft clip never counts, a trailing soft
+    /// clip always does, and an interior insertion counts once the walk is past the target.
+    #[rstest]
+    // 10M at 100-109; ref 105 is the 6th base, leaving 4 past it.
+    #[case::simple_match(&[encode_op(0, 10)], 100, 105, 4)]
+    // The first aligned base leaves the other 9 past it.
+    #[case::at_start(&[encode_op(0, 10)], 100, 100, 9)]
+    // The last aligned base leaves nothing past it.
+    #[case::at_end(&[encode_op(0, 10)], 100, 109, 0)]
+    // A target past the whole alignment leaves nothing past it.
+    #[case::past_alignment(&[encode_op(0, 10)], 100, 110, 0)]
+    // 5M3I5M at 100-109 (13 query bases): ref 107 is the 3rd base of the second 5M, so 11 query
+    // bases are at or before it (5M + 3I + 3M) and 2 are past.
+    #[case::with_insertion(&[encode_op(0, 5), encode_op(1, 3), encode_op(0, 5)], 100, 107, 2)]
+    // 5M3D5M at 100-112 with the deletion spanning 105-107: a target *inside* the deletion has no
+    // aligned query base, and every base after the deletion is past it. This is the fgumi#752
+    // case -- the superseded read-position lookup answered "no such position" (0) here, which the
+    // caller then read as "the whole read is past the mate".
+    #[case::in_deletion(&[encode_op(0, 5), encode_op(2, 3), encode_op(0, 5)], 100, 106, 5)]
+    // 3S10M at 100-109 (13 query bases): the leading soft clip is never past the target, and ref
+    // 102 is the 6th query base, leaving 7 past it.
+    #[case::with_soft_clip(&[encode_op(4, 3), encode_op(0, 10)], 100, 102, 7)]
+    fn test_query_bases_past_ref_pos(
+        #[case] cigar: &[u32],
+        #[case] alignment_start: i32,
+        #[case] target: i32,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(query_bases_past_ref_pos(cigar, alignment_start, target), expected);
     }
 
     // ========================================================================
-    // compute_bases_before_ref_pos tests
+    // query_bases_before_ref_pos tests
     // ========================================================================
 
-    #[test]
-    fn test_compute_bases_before_ref_pos_simple_match() {
-        // 10M starting at ref pos 100
-        // target_ref_pos = 105: read_pos increments to 6, but returns 6-1=5
-        let cigar = &[encode_op(0, 10)];
-        let result = compute_bases_before_ref_pos(cigar, 100, 105);
-        assert_eq!(result, 5);
+    /// Query bases lying strictly before a reference position — the mirror image, used for the
+    /// negative strand, whose 3' end is its leftmost.
+    #[rstest]
+    // 10M at 100-109; 5 bases precede ref 105.
+    #[case::simple_match(&[encode_op(0, 10)], 100, 105, 5)]
+    // Nothing precedes the first aligned base.
+    #[case::at_start(&[encode_op(0, 10)], 100, 100, 0)]
+    // A target past the whole alignment has all 10 bases before it.
+    #[case::past_alignment(&[encode_op(0, 10)], 100, 110, 10)]
+    // 5M3I5M: 5M + 3I + 2 more aligned bases precede ref 107.
+    #[case::with_insertion(&[encode_op(0, 5), encode_op(1, 3), encode_op(0, 5)], 100, 107, 10)]
+    // 5M3D5M with the deletion spanning 105-107: only the 5 bases before the deletion precede a
+    // target inside it.
+    #[case::in_deletion(&[encode_op(0, 5), encode_op(2, 3), encode_op(0, 5)], 100, 106, 5)]
+    // 3S10M: the leading soft clip precedes the alignment, so it always counts.
+    #[case::with_soft_clip(&[encode_op(4, 3), encode_op(0, 10)], 100, 102, 5)]
+    // A leading soft clip at the alignment start still precedes it -- the case that makes this
+    // the mirror of `past`, not simply `past` with the target shifted by one.
+    #[case::leading_soft_clip_at_start(&[encode_op(4, 3), encode_op(0, 10)], 100, 100, 3)]
+    fn test_query_bases_before_ref_pos(
+        #[case] cigar: &[u32],
+        #[case] alignment_start: i32,
+        #[case] target: i32,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(query_bases_before_ref_pos(cigar, alignment_start, target), expected);
     }
 
-    #[test]
-    fn test_compute_bases_before_ref_pos_at_start() {
-        // 10M starting at ref pos 100
-        // target_ref_pos = 100: first position, read_pos=1, returns 1-1=0
-        let cigar = &[encode_op(0, 10)];
-        let result = compute_bases_before_ref_pos(cigar, 100, 100);
-        assert_eq!(result, 0);
-    }
-
-    #[test]
-    fn test_compute_bases_before_ref_pos_past_alignment() {
-        // 10M starting at ref pos 100
-        // target_ref_pos = 110: beyond alignment
-        let cigar = &[encode_op(0, 10)];
-        let result = compute_bases_before_ref_pos(cigar, 100, 110);
-        assert_eq!(result, 0);
-    }
-
-    #[test]
-    fn test_compute_bases_before_ref_pos_with_insertion() {
-        // 5M3I5M: at ref 107 (in second M block)
-        // query consumed: 5(M) + 3(I) + 3(into second M) = 11, returns 11-1=10
-        let cigar = &[encode_op(0, 5), encode_op(1, 3), encode_op(0, 5)]; // 5M3I5M
-        let result = compute_bases_before_ref_pos(cigar, 100, 107);
-        assert_eq!(result, 10);
-    }
-
-    #[test]
-    fn test_compute_bases_before_ref_pos_in_deletion() {
-        // 5M3D5M: deletion at ref 105-107
-        // target=106: falls in deletion
-        let cigar = &[encode_op(0, 5), encode_op(2, 3), encode_op(0, 5)]; // 5M3D5M
-        let result = compute_bases_before_ref_pos(cigar, 100, 106);
-        assert_eq!(result, 0);
-    }
-
-    #[test]
-    fn test_compute_bases_before_ref_pos_with_soft_clip() {
-        // 3S10M: soft clip consumes 3 query bases
-        // At ref 102: query = 3(S) + 3(into M) = 6, returns 6-1=5
-        let cigar = &[encode_op(4, 3), encode_op(0, 10)]; // 3S10M
-        let result = compute_bases_before_ref_pos(cigar, 100, 102);
-        assert_eq!(result, 5);
+    /// Every query base falls on exactly one side of a boundary, whichever mode is asked for.
+    #[rstest]
+    #[case::simple_match(&[encode_op(0, 10)], 100, 105)]
+    #[case::with_insertion(&[encode_op(0, 5), encode_op(1, 3), encode_op(0, 5)], 100, 107)]
+    #[case::in_deletion(&[encode_op(0, 5), encode_op(2, 3), encode_op(0, 5)], 100, 106)]
+    #[case::both_soft_clips(&[encode_op(4, 3), encode_op(0, 10), encode_op(4, 4)], 100, 104)]
+    #[case::hard_clips_excluded(&[encode_op(5, 6), encode_op(0, 10), encode_op(5, 2)], 100, 104)]
+    fn query_bases_partition_the_read(
+        #[case] cigar: &[u32],
+        #[case] alignment_start: i32,
+        #[case] target: i32,
+    ) {
+        let query_length = query_length_from_cigar(cigar);
+        let at_or_before =
+            query_bases_up_to_ref_pos(cigar, alignment_start, target, RefPosBoundary::Inclusive);
+        assert_eq!(
+            at_or_before + query_bases_past_ref_pos(cigar, alignment_start, target),
+            query_length
+        );
+        // The base aligned to the target itself is the only difference between the two modes.
+        let before = query_bases_before_ref_pos(cigar, alignment_start, target);
+        assert!(before <= at_or_before, "`before` counts a subset of `at or before`");
+        assert!(
+            at_or_before - before <= 1,
+            "at most the single base aligned to the target separates the two modes"
+        );
     }
 
     // ========================================================================
@@ -1263,19 +1351,15 @@ mod tests {
 
     #[test]
     fn test_num_bases_extending_past_mate_raw_reverse_oversized_mc_leading_soft_no_overflow() {
-        // Regression (CodeRabbit): an adversarial MC-tag CIGAR with an oversized leading
-        // soft clip saturates `leading_soft` to i32::MAX, pushing the mate's soft-only
-        // unclipped start far negative. In the reverse-strand `this_pos > mate_unclipped_start`
-        // branch, the gap subtraction `this_pos - mate_unclipped_start` then exceeds i32::MAX.
-        // Pre-fix this panicked in debug/test (overflow) and wrapped to garbage in release;
-        // it must saturate instead and clip nothing.
+        // Regression (CodeRabbit): an adversarial MC-tag CIGAR with an enormous leading soft
+        // clip pushed the mate's soft-only unclipped start far negative, and the reverse-strand
+        // gap subtraction `this_pos - mate_unclipped_start` then exceeded i32::MAX -- a debug
+        // overflow panic, garbage in release. A run length that large is no longer accepted at
+        // all (it cannot fit a BAM CIGAR's 28-bit length field), so the MC-tag path now fails
+        // closed one step earlier; either way the read must be left unclipped.
         //
         // Read: reverse at pos 100 (0-based) => this_pos = 101, 20M (no leading soft clip)
-        // Mate: forward at pos 0 (0-based) => mate_pos_1based = 1
-        //   MC = "9999999999S10M" => leading_soft saturates to i32::MAX
-        //   => mate_unclipped_start = 1 - i32::MAX (well below this_pos)
-        // gap = 101 - (1 - i32::MAX) overflows i32; saturating_sub clamps it, and with no
-        // leading soft clip the result is leading_sc(0).saturating_sub(gap) = 0.
+        // Mate: forward at pos 0 (0-based) => mate_pos_1based = 1, MC = "9999999999S10M"
         let mut aux = Vec::new();
         aux.extend_from_slice(b"MCZ9999999999S10M\x00");
         let rec = make_bam_bytes(
@@ -1290,6 +1374,43 @@ mod tests {
             &aux,
         );
         assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
+    }
+
+    /// The saturation the MC-tag path can no longer reach is still reachable from a mate
+    /// *record*, whose CIGAR can hold arbitrarily many maximum-length soft clips: nine of them
+    /// sum past `i32::MAX`, pushing the mate's soft-only unclipped start far negative, and the
+    /// reverse-strand gap subtraction `this_pos - mate_unclipped_start` must saturate rather
+    /// than overflow (a debug panic, garbage in release).
+    #[test]
+    fn test_num_bases_extending_past_mate_vs_mate_raw_reverse_oversized_leading_soft_no_overflow() {
+        let max_op_len = (1usize << 28) - 1; // a CIGAR op length is 28 bits
+        let mut mate_ops = vec![encode_op(4, max_op_len); 9]; // 9 maximal leading soft clips
+        mate_ops.push(encode_op(0, 10)); // 10M
+        let mate = make_bam_bytes_with_tlen(
+            0,
+            0,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &mate_ops,
+            10, // l_seq is unused by the overlap math; keep the record small
+            0,
+            100,
+            110,
+            &[],
+        );
+        let rec = make_bam_bytes_with_tlen(
+            0,
+            100, // this_pos = 101, past the mate's alignment (1-10): no shared reference position
+            flags::PAIRED | flags::REVERSE,
+            b"rea",
+            &[encode_op(0, 20)], // no leading soft clip -> nothing to clip
+            20,
+            0,
+            0,
+            -110,
+            &[],
+        );
+        assert_eq!(num_bases_extending_past_mate_vs_mate_raw(&rec, &mate), 0);
     }
 
     #[test]
@@ -1517,6 +1638,330 @@ mod tests {
         let via_mate = num_bases_extending_past_mate_vs_mate_raw(&rec, &mate);
         assert_eq!(via_mc, via_mate);
         assert_eq!(via_mc, 10); // 40M end ref 140, mate soft end ref 130 -> clip 40 - readPos(130)=30 = 10
+    }
+
+    // ========================================================================
+    // Reference-vs-query distance conflation (fgumi#752 / fgbio#1090)
+    // ========================================================================
+
+    /// An FR pair that reads through into the adapter with a 1-base deletion three bases
+    /// from the positive read's 3' end — the shape from fulcrumgenomics/fgumi#752.
+    ///
+    /// - positive: `2S124M1D3M` at 1-based 83,585,781 (reference span 83,585,781-83,585,908)
+    /// - negative: `3S124M2S`   at 1-based 83,585,780 (reference span 83,585,780-83,585,903)
+    ///
+    /// Both reads are 129 bases. The negative read's soft-only unclipped *reference* end is
+    /// 83,585,903 + 2 = 83,585,905 — a reference coordinate built by adding a **query**
+    /// distance (its 2-base trailing soft clip). That coordinate lands squarely inside the
+    /// positive read's `1D`, which is exactly the collision fgbio#1090 describes.
+    fn deletion_at_boundary_pair() -> (Vec<u8>, Vec<u8>) {
+        let mut fwd_aux = Vec::new();
+        fwd_aux.extend_from_slice(b"MCZ3S124M2S\x00");
+        let fwd = make_bam_bytes_with_tlen(
+            0,
+            83_585_780, // 0-based -> 1-based 83,585,781
+            flags::PAIRED | flags::MATE_REVERSE | flags::FIRST_SEGMENT,
+            b"del",
+            &[encode_op(4, 2), encode_op(0, 124), encode_op(2, 1), encode_op(0, 3)],
+            129,
+            0,
+            83_585_779,
+            124,
+            &fwd_aux,
+        );
+
+        let mut rev_aux = Vec::new();
+        rev_aux.extend_from_slice(b"MCZ2S124M1D3M\x00");
+        let rev = make_bam_bytes_with_tlen(
+            0,
+            83_585_779, // 0-based -> 1-based 83,585,780
+            flags::PAIRED | flags::REVERSE | flags::LAST_SEGMENT,
+            b"del",
+            &[encode_op(4, 3), encode_op(0, 124), encode_op(4, 2)],
+            129,
+            0,
+            83_585_780,
+            -124,
+            &rev_aux,
+        );
+
+        (fwd, rev)
+    }
+
+    /// The clip point must be a **query** distance measured from a reference position the
+    /// two reads share, not a query distance added to a reference coordinate.
+    ///
+    /// The two reads share reference positions up to 83,585,903 (the negative read's
+    /// alignment end). Past it the positive read has 4 query bases (`129 - 125`, since its
+    /// `2S` plus 123 aligned bases carry it to query position 125) and the negative read
+    /// has 2 (its trailing soft clip), so the positive read must give up `4 - 2 = 2` bases.
+    ///
+    /// Before the fix the boundary was the negative read's soft-only unclipped reference end
+    /// (83,585,905), which falls inside the positive read's `1D`; the read-position lookup
+    /// reported "no such position" and the clip became the read's entire 129 bases.
+    #[test]
+    fn test_deletion_at_mate_boundary_clips_the_query_distance() {
+        let (fwd, rev) = deletion_at_boundary_pair();
+        assert_eq!(num_bases_extending_past_mate_raw(&fwd), 2, "MC-tag path (simplex/duplex)");
+        assert_eq!(
+            num_bases_extending_past_mate_vs_mate_raw(&fwd, &rev),
+            2,
+            "mate-record path (codec)"
+        );
+    }
+
+    /// The negative read of the same pair is clipped by the mirror-image rule: the two reads
+    /// first share reference position 83,585,781 (the positive read's alignment start), before
+    /// which the negative read has 4 query bases and the positive read has 2, so the negative
+    /// read gives up 2. It was already correct — no deletion sits at *its* boundary — and must
+    /// stay that way.
+    #[test]
+    fn test_deletion_at_mate_boundary_leaves_the_unaffected_mate_alone() {
+        let (fwd, rev) = deletion_at_boundary_pair();
+        assert_eq!(num_bases_extending_past_mate_raw(&rev), 2);
+        assert_eq!(num_bases_extending_past_mate_vs_mate_raw(&rev, &fwd), 2);
+    }
+
+    /// The whole-read over-clip must be gone at the source, not merely clamped downstream.
+    ///
+    /// Consumers clamp the clip amount to the read length, so the pre-fix answer (129 of 129
+    /// bases) did not panic or truncate a buffer — it silently deleted the read from its
+    /// family. Pinning "strictly less than the read length" fails loudly if the boundary math
+    /// ever regresses to answering with the whole read again.
+    #[test]
+    fn test_deletion_at_mate_boundary_does_not_consume_the_whole_read() {
+        let (fwd, rev) = deletion_at_boundary_pair();
+        let read_length = 129;
+        assert!(
+            num_bases_extending_past_mate_vs_mate_raw(&fwd, &rev) < read_length,
+            "an over-clip that reaches the read length is the fgumi#752 failure"
+        );
+    }
+
+    /// fgbio#1090's own worked example, which is the insertion half of the same defect:
+    ///
+    /// - positive: `70M10I23M47S` at 1-based 1,234,500 (reference span 1,234,500-1,234,592)
+    /// - negative: `50S70M30S`    at 1-based 1,234,500 (reference span 1,234,500-1,234,569)
+    ///
+    /// The reads last share reference position 1,234,569; past it the positive read has 80
+    /// query bases (`10I` + `23M` + `47S`) and the negative read has 30 (its trailing soft
+    /// clip), so the positive read must give up 50 — fgbio#1090's stated answer, leaving
+    /// `70M10I20M50S`.
+    ///
+    /// Before the fix the negative read's soft-only unclipped reference end (1,234,599) sat
+    /// *past* the positive read's alignment end, so the clip was estimated from the trailing
+    /// soft clip alone (`47 - 7 = 40`) and under-clipped by exactly the insertion's 10 bases.
+    #[test]
+    fn test_insertion_before_mate_boundary_is_not_under_clipped() {
+        let mut fwd_aux = Vec::new();
+        fwd_aux.extend_from_slice(b"MCZ50S70M30S\x00");
+        let fwd = make_bam_bytes_with_tlen(
+            0,
+            1_234_499,
+            flags::PAIRED | flags::MATE_REVERSE | flags::FIRST_SEGMENT,
+            b"ins",
+            &[encode_op(0, 70), encode_op(1, 10), encode_op(0, 23), encode_op(4, 47)],
+            150,
+            0,
+            1_234_499,
+            93,
+            &fwd_aux,
+        );
+        let rev = make_bam_bytes_with_tlen(
+            0,
+            1_234_499,
+            flags::PAIRED | flags::REVERSE | flags::LAST_SEGMENT,
+            b"ins",
+            &[encode_op(4, 50), encode_op(0, 70), encode_op(4, 30)],
+            150,
+            0,
+            1_234_499,
+            -93,
+            &[],
+        );
+        assert_eq!(num_bases_extending_past_mate_raw(&fwd), 50);
+        assert_eq!(num_bases_extending_past_mate_vs_mate_raw(&fwd, &rev), 50);
+    }
+
+    /// Control: with no indel anywhere in either read, the clip is unchanged. The equalization
+    /// is exact for an ungapped overlap — every query base past the shared reference position
+    /// is one reference base past it — so an indel-free pair must produce the same answer it
+    /// always did, from both entry points and on both strands.
+    ///
+    /// `40M` at 101-140 against `10S30M10S` at 101-130: the reads last share 130, past which
+    /// the positive read has 10 query bases and the negative read has its 10-base trailing
+    /// soft clip, so nothing is clipped. They first share 101, before which the positive read
+    /// has 0 and the negative read has 10, so the negative read gives up 10.
+    #[test]
+    fn test_ungapped_overlap_is_unchanged() {
+        let mut fwd_aux = Vec::new();
+        fwd_aux.extend_from_slice(b"MCZ10S30M10S\x00");
+        let fwd = make_bam_bytes_with_tlen(
+            0,
+            100,
+            flags::PAIRED | flags::MATE_REVERSE | flags::FIRST_SEGMENT,
+            b"pln",
+            &[encode_op(0, 40)],
+            40,
+            0,
+            100,
+            40,
+            &fwd_aux,
+        );
+        let mut rev_aux = Vec::new();
+        rev_aux.extend_from_slice(b"MCZ40M\x00");
+        let rev = make_bam_bytes_with_tlen(
+            0,
+            100,
+            flags::PAIRED | flags::REVERSE | flags::LAST_SEGMENT,
+            b"pln",
+            &[encode_op(4, 10), encode_op(0, 30), encode_op(4, 10)],
+            50,
+            0,
+            100,
+            -40,
+            &rev_aux,
+        );
+        assert_eq!(num_bases_extending_past_mate_raw(&fwd), 0, "positive strand, MC path");
+        assert_eq!(
+            num_bases_extending_past_mate_vs_mate_raw(&fwd, &rev),
+            0,
+            "positive strand, mate-record path"
+        );
+        assert_eq!(num_bases_extending_past_mate_raw(&rev), 10, "negative strand, MC path");
+        assert_eq!(
+            num_bases_extending_past_mate_vs_mate_raw(&rev, &fwd),
+            10,
+            "negative strand, mate-record path"
+        );
+    }
+
+    /// A read lying entirely on the far side of its mate is left alone: its 3' end points away
+    /// from the mate, which is an outward-facing template rather than read-through.
+    ///
+    /// The per-record FR test reads forward-strand orientation off `TLEN`, which is never
+    /// cross-checked against the MC tag, so a record can claim a forward-oriented pair while its
+    /// mate is actually mapped to its left. Forward `20M` at 301-320 against a reverse mate
+    /// `10M5S` at 101-110 is such a record. Measuring it against the last shared position like
+    /// any other read would put the anchor at 110, count all 20 of its bases as past it against
+    /// the mate's 5 trailing soft-clipped bases, and take 15 of its 20 *aligned* bases — the same
+    /// destructive answer the superseded formula gave (all 20, from the "no such position"
+    /// sentinel at a coordinate before the alignment began), on a geometry that cannot be
+    /// verified. Nothing may be clipped here.
+    #[test]
+    fn test_num_bases_extending_past_mate_raw_read_entirely_past_mate() {
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ10M5S\x00");
+        let rec = make_bam_bytes_with_tlen(
+            0,
+            300, // 0-based -> 1-based 301
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 20)],
+            20,
+            0,
+            100, // 0-based -> 1-based 101, to the *left* of this read
+            100, // TLEN > 0, so the per-record FR test accepts the pair
+            &aux,
+        );
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
+    }
+
+    /// The negative-strand mirror of the case above, which only the mate-record entry point can
+    /// reach: [`is_fr_pair_raw`]'s reverse arm compares the mate position recorded *on the read*
+    /// against the read's own end, while [`num_bases_extending_past_mate_vs_mate_raw`] measures
+    /// against the mate record in hand, and the two disagree when that field is stale.
+    ///
+    /// Reverse `20M` at 101-120 whose mate-position field says 101, against a forward mate `10M`
+    /// actually at 301-310. The pair passes the FR test on the recorded field, and the read's 3'
+    /// end (its leftmost) then points away from the mate. Anchoring at 301 would count all 20 of
+    /// the read's bases as before it and clip the read away entirely.
+    #[test]
+    fn test_num_bases_extending_past_mate_vs_mate_raw_read_entirely_before_mate() {
+        let rec = make_bam_bytes_with_tlen(
+            0,
+            100, // 0-based -> 1-based 101
+            flags::PAIRED | flags::REVERSE,
+            b"rea",
+            &[encode_op(0, 20)],
+            20,
+            0,
+            100, // stale mate position: 1-based 101, left of this read's end
+            -100,
+            &[],
+        );
+        let mate = make_bam_bytes_with_tlen(
+            0,
+            300, // 0-based -> 1-based 301, entirely to the right of the read
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            0,
+            100,
+            100,
+            &[],
+        );
+        assert_eq!(num_bases_extending_past_mate_vs_mate_raw(&rec, &mate), 0);
+    }
+
+    /// Builds one FR pair at 1-based `s1`/`s2` with the given CIGARs and returns the clip each
+    /// read is given by the MC-tag entry point, as `(forward, reverse)`.
+    fn clips_for_fr_pair(s1: i32, c1: &str, s2: i32, c2: &str) -> (usize, usize) {
+        let fwd_ops = parse_mc_cigar_ops(c1).expect("valid forward CIGAR");
+        let rev_ops = parse_mc_cigar_ops(c2).expect("valid reverse CIGAR");
+        // TLEN spans the forward read's leftmost base to the reverse read's rightmost.
+        let tlen = alignment_end_1based(s2, &rev_ops) - s1 + 1;
+
+        let mut fwd_aux = Vec::new();
+        fwd_aux.extend_from_slice(format!("MCZ{c2}\0").as_bytes());
+        let fwd = make_bam_bytes_with_tlen(
+            0,
+            s1 - 1,
+            flags::PAIRED | flags::MATE_REVERSE | flags::FIRST_SEGMENT,
+            b"pair",
+            &fwd_ops,
+            query_length_from_cigar(&fwd_ops),
+            0,
+            s2 - 1,
+            tlen,
+            &fwd_aux,
+        );
+
+        let mut rev_aux = Vec::new();
+        rev_aux.extend_from_slice(format!("MCZ{c1}\0").as_bytes());
+        let rev = make_bam_bytes_with_tlen(
+            0,
+            s2 - 1,
+            flags::PAIRED | flags::REVERSE | flags::LAST_SEGMENT,
+            b"pair",
+            &rev_ops,
+            query_length_from_cigar(&rev_ops),
+            0,
+            s1 - 1,
+            -tlen,
+            &rev_aux,
+        );
+
+        (num_bases_extending_past_mate_raw(&fwd), num_bases_extending_past_mate_raw(&rev))
+    }
+
+    /// Both alignments lie within the insert, so a pair that read through into the adapter can
+    /// still leave them disjoint. Each 100-base read here aligns only its first 20 bases and
+    /// soft-clips the rest, over an insert of 39 reference bases.
+    ///
+    /// With the reverse read at 1019 the two alignments share exactly one reference position,
+    /// 1019, past which the forward read has all 80 of its soft-clipped bases and the reverse
+    /// read has 19 — so 61 bases of read-through come off each. Moving the reverse read one base
+    /// to the right removes that shared position, and the answer must not jump: the insert is one
+    /// base longer, so one fewer base of each read is read-through. Extrapolating the read's
+    /// soft-clipped tail against the mate's soft-only unclipped boundary is what carries the
+    /// count across that boundary; answering 0 there would leave 60 bases of adapter on a read
+    /// whose neighbour in this table gives up 61.
+    #[test]
+    fn test_disjoint_alignments_still_clip_their_read_through() {
+        assert_eq!(clips_for_fr_pair(1000, "20M80S", 1019, "80S20M"), (61, 61), "one shared base");
+        assert_eq!(clips_for_fr_pair(1000, "20M80S", 1020, "80S20M"), (60, 60), "no shared base");
     }
 
     #[test]

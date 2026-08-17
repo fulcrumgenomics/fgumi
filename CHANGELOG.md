@@ -118,6 +118,26 @@ All notable changes to this project will be documented in this file.
   exactly the templates it is meant to exclude. All three now count only emitted consensus
   reads, matching fgbio.
 
+- Overlap clipping — how far a read is trimmed back for extending past its mate, in `simplex`,
+  `duplex` and `codec` — now measures that distance in query bases rather than mixing query and
+  reference distances. The mate boundary it clipped against was a *reference* coordinate built
+  by adding the mate's trailing soft clip, a *query* distance, to the mate's alignment end.
+  Those two spaces only agree across an ungapped alignment, so a pair that sequenced through
+  into the adapter with an indel near the read's 3' end was mis-clipped: with a deletion at the
+  boundary the read had no position there at all and the computed clip became the read's
+  **entire length**, and with an insertion it under-clipped by the insertion's length. The clip
+  is now the number of query bases the read has past the last reference position it shares with
+  its mate, less the number the mate has, which is exact in the presence of indels and
+  unchanged for every ungapped overlap
+  ([#752](https://github.com/fulcrumgenomics/fgumi/issues/752), the fgumi side of
+  [fgbio#1090](https://github.com/fulcrumgenomics/fgbio/issues/1090)).
+
+  This changes consensus output on affected templates. A read that was clipped to nothing was
+  banked under `raw_reads_rejected_for_zero_bases_post_trimming` and could orphan its mate; on
+  a read-through family with a 1-base deletion three bases from the positive read's 3' end,
+  `simplex` went from 6 of 6 raw reads rejected and no consensus emitted, to 6 of 6 used and
+  both strands emitted.
+
 - `dedup --metrics` now reports the templates dropped by its template filter, broken out by
   reason. `dedup` is a read filter as well as a duplicate marker, but the drop counts were
   collected, merged across workers, and then discarded at the serialization boundary: a run

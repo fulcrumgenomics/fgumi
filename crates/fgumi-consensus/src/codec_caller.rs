@@ -3696,6 +3696,103 @@ mod tests {
         assert_rejected_whole_family(&caller, &output, record_count);
     }
 
+    /// Builds a CODEC family of `templates` read pairs that sequence through the insert and
+    /// into the adapter, with a 1-base deletion three bases from the positive read's 3' end —
+    /// the fulcrumgenomics/fgumi#752 shape.
+    ///
+    /// - positive: `2S124M1D3M` at 200 (reference span 200-327, the deletion at 324)
+    /// - negative: `3S125M`     at 200 (reference span 200-324)
+    ///
+    /// The negative read's soft-only unclipped *reference* end is 324 — squarely inside the
+    /// positive read's `1D`, where the positive read has no read position at all. Measuring the
+    /// clip in query space from the last reference position the two reads share (324) instead
+    /// gives the positive read 3 query bases past it against the negative read's 0, so it gives
+    /// up 3 and keeps 126.
+    fn indel_readthrough_family(templates: usize) -> Vec<RawRecord> {
+        (0..templates)
+            .flat_map(|i| {
+                create_fr_pair(
+                    &format!("t{i}"),
+                    200,
+                    200,
+                    129,
+                    35,
+                    &[
+                        (Kind::SoftClip, 2),
+                        (Kind::Match, 124),
+                        (Kind::Deletion, 1),
+                        (Kind::Match, 3),
+                    ],
+                    &[(Kind::SoftClip, 3), (Kind::Match, 125)],
+                    "mi",
+                    Some("ACC-TGA"),
+                    false,
+                    true,
+                )
+            })
+            .collect()
+    }
+
+    /// A read-through pair with an indel at the overlap boundary must survive to a consensus.
+    ///
+    /// The overlap clip is the first thing the caller computes, and the superseded
+    /// reference-space arithmetic answered with the positive read's *entire* 129 bases here
+    /// (the boundary landed inside its deletion, where the read has no position at all). The
+    /// read was clipped away to nothing and the whole family was banked as a rejection. With
+    /// the clip measured in query space it gives up 3 bases and the family calls normally.
+    ///
+    /// This is the end-to-end half of the fgumi#752 fix: the unit tests in
+    /// `fgumi_raw_bam::overlap` pin the arithmetic, this pins what it costs a family to get it
+    /// wrong.
+    #[test]
+    fn test_indel_at_overlap_boundary_still_calls_a_consensus() {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        let fixture = indel_readthrough_family(2);
+        let record_count = fixture.len();
+
+        let output =
+            caller.consensus_reads_from_sam_records(fixture).expect("the family calls a consensus");
+
+        let stats = caller.statistics();
+
+        // Pin the emitted consensus, not merely its existence. This PR changes the
+        // overlap-clip arithmetic; a regression that clips the wrong (still nonzero) number of
+        // query bases would keep `count > 0` and zero rejections intact while silently shifting
+        // the output. The family shares one MI, so it collapses to exactly one molecule; the
+        // query-space clip fixes both the 127-base length and the reference-derived bases below,
+        // and the superseded reference-space arithmetic would have produced a different record.
+        let records = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(output.count, 1, "the single molecule must emit exactly one consensus record");
+        assert_eq!(records.len(), 1, "exactly one consensus record must be serialized");
+        assert_eq!(
+            records[0].bases.len(),
+            127,
+            "the query-space overlap clip fixes the consensus length",
+        );
+        assert_eq!(
+            &records[0].bases[..],
+            b"ANGNNANTNNNTNANNNTNNNNNNNNTNNNNGTNNNNNNNNTANNAATTNNNNNNNANNNTNNNNANNNTNNNNNNNAATTNNTANNNNNNNNACNNNNANNNNNNNNANNNTNANNNANTNNCNTT",
+            "the consensus bases are fixed by the fixture; a mis-placed clip shifts them",
+        );
+
+        assert_eq!(
+            stats.rejection_reasons.values().sum::<usize>(),
+            0,
+            "no record may be rejected: nothing about this family is malformed"
+        );
+        assert_eq!(stats.reads_filtered, 0);
+        assert_eq!(
+            stats.total_input_reads,
+            u64::try_from(record_count).expect("fixture size fits in u64")
+        );
+    }
+
     /// Asserts the invariant this reordering must preserve: the family was rejected, no
     /// consensus came out of it, and every one of its records is accounted for — once —
     /// in the filtered total and across the rejection reasons.

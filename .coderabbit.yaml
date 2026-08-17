@@ -240,7 +240,7 @@ reviews:
         it, and integer accumulation over attacker-controlled CIGAR or tag values
         that can overflow `i32`/`u32`. DO NOT propose clamping unclipped
         coordinates. `unclipped_start_from_raw_cigar`, `unclipped_other_start` /
-        `unclipped_other_end`, and `mate_soft_unclipped_from_mc` produce
+        `unclipped_other_end`, and `mate_soft_unclipped_from_ops` produce
         template-coordinate SORT-KEY LANES, not genomic positions: they may
         legitimately go negative or exceed contig bounds, and a `.max(0)` or
         contig-floor clamp on one side desynchronizes the two mates of a template
