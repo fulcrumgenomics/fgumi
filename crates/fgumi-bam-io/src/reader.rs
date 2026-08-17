@@ -82,14 +82,15 @@ pub struct PipelineReaderOpts {
     ///
     /// This struct only opens the byte stream (or, for
     /// [`create_bam_reader_with_opts`]/[`create_raw_bam_reader_with_opts`],
-    /// wraps it in noodles' own BGZF reader) — it does not itself decode
-    /// BGZF blocks, so this field is not consumed here. It exists as the one
-    /// place callers bundle "how to read this file" settings; commands using
-    /// the fgumi-bgzf-backed unified pipeline (`decompress_block_into_opts`)
-    /// read this field back out of [`BamIoOptions::pipeline_reader_opts`]
-    /// (`fgumi_lib`) and thread it into their `PipelineConfig`/
-    /// `FastqPipelineConfig`. Defaults to `true` (verify) — the safe,
-    /// pre-existing behavior.
+    /// wraps it in noodles' own BGZF reader, which always verifies and has no
+    /// skip knob) — it does not itself decode BGZF blocks, so **this field is
+    /// not consumed today**. The multi-threaded unified pipeline gets its CRC
+    /// policy from `PipelineConfig::verify_crc` (set in `build_pipeline_config`
+    /// in `fgumi_lib`), not from here. This field becomes live once the
+    /// raw-reader path is unified onto fgumi-bgzf (see #800), at which point
+    /// [`create_raw_bam_reader_with_opts`] will honor it directly. It is kept
+    /// now so callers already bundle the setting in one place. Defaults to
+    /// `true` (verify) — the safe, pre-existing behavior.
     pub verify_crc: bool,
 }
 
