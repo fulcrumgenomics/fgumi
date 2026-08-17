@@ -1524,28 +1524,51 @@ impl Command for MarkDuplicates {
 // Metrics writing
 //////////////////////////////////////////////////////////////////////////////
 
-/// Writes one metrics row per library observed in `per_library`, sorted by
-/// library name for deterministic output, followed by a final "All Reads"
-/// row summing across every library.
+/// Writes one metrics row per library observed in `per_library`, followed by a
+/// final "All Reads" row summing across every library.
+///
+/// Row order is deterministic: named libraries first (alphabetical), then the
+/// idx-0 "Unknown Library" catch-all (a sentinel, grouped after the real
+/// libraries), then the "All Reads" total last.
 ///
 /// Single-library inputs still get two rows (the one library, then "All
 /// Reads") rather than collapsing to a single row: this keeps the output
 /// shape uniform regardless of how many libraries the input actually has, so
 /// downstream readers never need to special-case the single-library count.
+///
+/// The aggregate "All Reads" row leaves `estimated_library_size` empty whenever
+/// it spans more than one library: a Lander-Waterman estimate is only meaningful
+/// within a single library, so a value pooled across distinct libraries would be
+/// misleading. This matches dupblaster, which never estimates library size across
+/// libraries; the per-library rows carry the meaningful estimates.
 fn write_dedup_metrics(
     per_library: &AHashMap<u16, DedupCounts>,
     total: &DedupCounts,
     library_index: &LibraryIndex,
     path: &PathBuf,
 ) -> Result<()> {
-    let mut rows: Vec<DeduplicationMetrics> = per_library
-        .iter()
-        .map(|(&idx, counts)| {
+    let mut ordered: Vec<(u16, &DedupCounts)> =
+        per_library.iter().map(|(&idx, counts)| (idx, counts)).collect();
+    // Named libraries sort alphabetically; the idx-0 "Unknown Library" catch-all
+    // sorts after them (`false` before `true`), so it lands just before the
+    // "All Reads" total appended below.
+    ordered.sort_by(|a, b| {
+        (a.0 == 0).cmp(&(b.0 == 0)).then_with(|| {
+            library_display_name(a.0, library_index).cmp(&library_display_name(b.0, library_index))
+        })
+    });
+    let mut rows: Vec<DeduplicationMetrics> = ordered
+        .into_iter()
+        .map(|(idx, counts)| {
             to_deduplication_metrics(library_display_name(idx, library_index), counts)
         })
         .collect();
-    rows.sort_by(|a, b| a.library.cmp(&b.library));
-    rows.push(to_deduplication_metrics("All Reads".to_string(), total));
+
+    let mut total_row = to_deduplication_metrics("All Reads".to_string(), total);
+    if per_library.len() > 1 {
+        total_row.estimated_library_size = None;
+    }
+    rows.push(total_row);
 
     DelimFile::default()
         .write_tsv(path, rows)

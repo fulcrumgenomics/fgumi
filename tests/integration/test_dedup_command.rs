@@ -446,6 +446,59 @@ fn test_dedup_command_per_library_metrics() {
     assert_eq!(total["duplicate_templates"], "6");
     assert_eq!(total["total_reads"], "10");
     assert_eq!(total["duplicate_reads"], "6");
+    // The aggregate row spans two distinct libraries, so a pooled Lander-Waterman
+    // estimate would be meaningless: it must be left empty (the per-library rows
+    // above carry the meaningful estimates). Matches dupblaster.
+    assert!(
+        total["estimated_library_size"].is_empty(),
+        "the aggregate row spans >1 library, so its estimate must be empty: {total:?}"
+    );
+}
+
+/// Row order with named libraries AND reads lacking `@RG`/`LB`: named
+/// libraries first (alphabetical), then the "Unknown Library" catch-all, then
+/// the "All Reads" total last. The catch-all is a sentinel, not a real
+/// library, so it is grouped after the named libraries rather than sorted in
+/// among them by name.
+#[test]
+fn test_dedup_command_metrics_orders_unknown_after_named_before_total() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+
+    let header = create_multi_library_header("chr1", 10000);
+    // Named libraries (RG1 -> libA, RG2 -> libB) plus reads with no @RG, which
+    // fall into the idx-0 "Unknown Library" bucket. Distinct positions keep them
+    // in separate position groups.
+    let mut records = create_duplicate_group_with_rg("libA_dup", "ACGTACGT", 3, 100, "RG1");
+    records.extend(create_duplicate_group_with_rg("libB_dup", "TGCATGCA", 2, 500, "RG2"));
+    records.extend(create_duplicate_group("noRG_dup", "GGCCGGCC", 2, 900));
+    create_sorted_bam_with_header(&input_bam, &header, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command with mixed-library metrics failed");
+
+    let rows = read_dedup_metrics_rows(&metrics_path);
+    let libraries: Vec<&str> = rows.iter().map(|r| r["library"].as_str()).collect();
+    assert_eq!(
+        libraries,
+        vec!["libA", "libB", "Unknown Library", "All Reads"],
+        "named libraries first (alphabetical), then Unknown Library, then the total: {libraries:?}"
+    );
 }
 
 /// Single-library input (no `@RG`/`LB` at all) must still produce two rows:
