@@ -37,6 +37,12 @@ pub enum BgzfReaderEnum {
     SingleThreaded(BgzfReader<Box<dyn Read + Send>>),
     /// Multi-threaded BGZF reader (noodles built-in threading)
     MultiThreaded(MultithreadedReader<Box<dyn Read + Send>>),
+    /// Single-threaded BGZF reader backed by fgumi-bgzf, which honors the
+    /// `verify_crc` policy (see [`FgumiBgzfReader`]). This is the arm used by
+    /// the raw-reader path (`create_raw_bam_reader[_with_opts]`) for
+    /// single-threaded input, so `--check-crc`/`--no-check-crc` take effect
+    /// there.
+    Fgumi(FgumiBgzfReader),
 }
 
 impl Read for BgzfReaderEnum {
@@ -44,6 +50,7 @@ impl Read for BgzfReaderEnum {
         match self {
             BgzfReaderEnum::SingleThreaded(r) => r.read(buf),
             BgzfReaderEnum::MultiThreaded(r) => r.read(buf),
+            BgzfReaderEnum::Fgumi(r) => r.read(buf),
         }
     }
 }
@@ -53,6 +60,7 @@ impl BufRead for BgzfReaderEnum {
         match self {
             BgzfReaderEnum::SingleThreaded(r) => r.fill_buf(),
             BgzfReaderEnum::MultiThreaded(r) => r.fill_buf(),
+            BgzfReaderEnum::Fgumi(r) => r.fill_buf(),
         }
     }
 
@@ -60,7 +68,165 @@ impl BufRead for BgzfReaderEnum {
         match self {
             BgzfReaderEnum::SingleThreaded(r) => r.consume(amt),
             BgzfReaderEnum::MultiThreaded(r) => r.consume(amt),
+            BgzfReaderEnum::Fgumi(r) => r.consume(amt),
         }
+    }
+}
+
+/// Number of raw BGZF blocks the [`FgumiBgzfReader`] *frames* (reads and length
+/// -validates) per refill of its frame queue.
+///
+/// Framing is decoupled from decoding: a batch this size is pulled from the
+/// source at once, then decoded one block at a time on demand (see
+/// [`FgumiBgzfReader::ensure_buffered`]). Two properties motivate the batch:
+///
+/// - **Correct EOF handling across concatenated streams.**
+///   [`read_raw_blocks`](fgumi_bgzf::read_raw_blocks) skips BGZF EOF-marker
+///   blocks and returns an empty vector only when it finds no real block within
+///   the batch. A multithreaded writer (and `cat a.bam b.bam`) emits an EOF
+///   marker between segments, so framing one block at a time would read that
+///   lone marker, get an empty vector, and wrongly conclude end-of-stream before
+///   the following data. A batch absorbs intermediate markers and returns real
+///   blocks, so an empty vector reliably means true end of input.
+/// - **Bounded memory.** Framed blocks are compressed (typically ~16 KiB), so a
+///   batch of this size costs a few hundred KiB per reader — `merge` holds one
+///   reader per input file, so this is kept modest rather than file-sized.
+const FGUMI_FRAME_BATCH: usize = 16;
+
+/// A single-threaded, safe streaming BGZF decoder built over fgumi-bgzf.
+///
+/// Unlike noodles' BGZF reader (which always verifies CRC32 and exposes no skip
+/// knob), this decoder honors a `verify_crc` flag: with it `false`, block CRC32
+/// verification is skipped (the decompressed-size check always runs), which is
+/// the fast path for trusted input. It yields the **decompressed** BAM byte
+/// stream, so it slots in wherever a noodles BGZF reader did — the header parse
+/// and [`RawBamReader`] both see plain decompressed bytes.
+///
+/// Framing and decoding are decoupled. Blocks are framed in batches via
+/// [`read_raw_blocks`](fgumi_bgzf::read_raw_blocks) (so intermediate BGZF EOF
+/// markers are handled — see `FGUMI_FRAME_BATCH`) into a queue, and decoded
+/// one at a time with
+/// [`decompress_block_into_opts`](fgumi_bgzf::decompress_block_into_opts) into an
+/// internal buffer served out across `read`/`fill_buf` calls with a cursor.
+/// Decoding lazily (one queued block per refill) keeps decode work — and any
+/// CRC/size error — tied to the bytes the caller actually reads, rather than
+/// pulling a later block's error forward into, say, the header parse. Partial
+/// reads and mid-block boundaries are handled by the cursor. No `unsafe` is used.
+pub struct FgumiBgzfReader {
+    /// The underlying compressed byte source (a normalized BGZF stream).
+    inner: Box<dyn Read + Send>,
+    /// Reusable libdeflater decompressor.
+    decompressor: fgumi_bgzf::Decompressor,
+    /// Whether to verify each block's CRC32 against its footer.
+    verify_crc: bool,
+    /// Framed-but-not-yet-decoded blocks, filled a [`FGUMI_FRAME_BATCH`] at a
+    /// time and drained front to back.
+    frames: std::collections::VecDeque<fgumi_bgzf::RawBgzfBlock>,
+    /// Set once the source yields no further blocks, so framing stops.
+    frames_done: bool,
+    /// Decoded bytes of the current block not yet served to the caller.
+    buffer: Vec<u8>,
+    /// Cursor into `buffer`: `buffer[pos..]` is unread.
+    pos: usize,
+    /// Set once a block fails to decode, poisoning the reader. A decode error
+    /// pops its frame and resets the cursor, so without this flag a later
+    /// `read`/`fill_buf` would resume at the *next* frame and silently skip the
+    /// corrupted block's records. Once set, every subsequent refill errors.
+    failed: bool,
+}
+
+impl FgumiBgzfReader {
+    /// Wrap `inner` in a streaming fgumi-bgzf decoder.
+    ///
+    /// `verify_crc` selects whether each block's CRC32 is checked; the
+    /// decompressed-size check always runs regardless.
+    #[must_use]
+    pub fn new(inner: Box<dyn Read + Send>, verify_crc: bool) -> Self {
+        Self {
+            inner,
+            decompressor: fgumi_bgzf::Decompressor::new(),
+            verify_crc,
+            frames: std::collections::VecDeque::new(),
+            frames_done: false,
+            buffer: Vec::new(),
+            pos: 0,
+            failed: false,
+        }
+    }
+
+    /// Ensure `self.buffer[self.pos..]` holds at least one byte, framing and
+    /// decoding more blocks if needed. Returns `Ok(false)` at end of input.
+    ///
+    /// Decodes at most one queued block per iteration and loops because a block
+    /// can decode to zero bytes (e.g. `ISIZE == 0`) without being end of input;
+    /// it stops only when the source yields no further blocks.
+    fn ensure_buffered(&mut self) -> io::Result<bool> {
+        if self.failed {
+            return Err(io::Error::other(
+                "fgumi-bgzf reader poisoned by an earlier BGZF block decode failure",
+            ));
+        }
+        while self.pos >= self.buffer.len() {
+            if self.frames.is_empty() {
+                if self.frames_done {
+                    return Ok(false);
+                }
+                let batch = fgumi_bgzf::read_raw_blocks(&mut self.inner, FGUMI_FRAME_BATCH)?;
+                if batch.is_empty() {
+                    // No real block in the batch => true end of input (EOF
+                    // markers are skipped inside `read_raw_blocks`).
+                    self.frames_done = true;
+                    return Ok(false);
+                }
+                self.frames.extend(batch);
+            }
+
+            let block = self.frames.pop_front().expect("frames non-empty checked above");
+            self.buffer.clear();
+            self.pos = 0;
+            // Poison the reader before propagating: this frame is already popped
+            // and the cursor reset, so a retried refill would otherwise skip
+            // straight to the next frame and hide the corrupted block.
+            if let Err(e) = fgumi_bgzf::decompress_block_into_opts(
+                &block,
+                &mut self.decompressor,
+                &mut self.buffer,
+                self.verify_crc,
+            ) {
+                self.failed = true;
+                return Err(e);
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl Read for FgumiBgzfReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if !self.ensure_buffered()? {
+            return Ok(0);
+        }
+        let available = &self.buffer[self.pos..];
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+impl BufRead for FgumiBgzfReader {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if !self.ensure_buffered()? {
+            return Ok(&[]);
+        }
+        Ok(&self.buffer[self.pos..])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.pos = (self.pos + amt).min(self.buffer.len());
     }
 }
 
@@ -80,17 +246,16 @@ pub struct PipelineReaderOpts {
     /// Whether the BGZF decode path should verify each block's CRC32
     /// checksum against its footer.
     ///
-    /// This struct only opens the byte stream (or, for
-    /// [`create_bam_reader_with_opts`]/[`create_raw_bam_reader_with_opts`],
-    /// wraps it in noodles' own BGZF reader, which always verifies and has no
-    /// skip knob) — it does not itself decode BGZF blocks, so **this field is
-    /// not consumed today**. The multi-threaded unified pipeline gets its CRC
-    /// policy from `PipelineConfig::verify_crc` (set in `build_pipeline_config`
-    /// in `fgumi_lib`), not from here. This field becomes live once the
-    /// raw-reader path is unified onto fgumi-bgzf (see #800), at which point
-    /// [`create_raw_bam_reader_with_opts`] will honor it directly. It is kept
-    /// now so callers already bundle the setting in one place. Defaults to
-    /// `true` (verify) — the safe, pre-existing behavior.
+    /// This field is **honored** for the single-threaded readers built by
+    /// [`create_bam_reader_with_opts`] and [`create_raw_bam_reader_with_opts`]:
+    /// both route single-threaded input through fgumi-bgzf's decoder (see
+    /// [`FgumiBgzfReader`]), which skips CRC32 verification when this is `false`
+    /// (the decompressed-size check always runs). Multi-threaded input
+    /// (`threads > 1`) still uses noodles' multithreaded reader, which always
+    /// verifies; the multi-threaded unified pipeline instead gets its CRC policy
+    /// from `PipelineConfig::verify_crc` (set in `build_pipeline_config` in
+    /// `fgumi_lib`). Defaults to `true` (verify) — the safe, pre-existing
+    /// behavior.
     pub verify_crc: bool,
 }
 
@@ -307,8 +472,11 @@ const BGZF_INPUT_BUFFER_SIZE: usize = 256 * 1024;
 /// is not paid twice: [`open_normalized_input`]'s consumers wrap the stream in
 /// their own [`BufReader`] (`fgumi_sort::RawBamRecordReader`), and buffering
 /// inside the shared opener would copy every byte through two buffers on that
-/// path. A `PrefetchReader` already hands out large chunks, so `opts.async_reader`
-/// gains nothing here and pays the same extra copy — it is left unwrapped.
+/// path. The async branch is buffered too: a `PrefetchReader` hands out large
+/// chunks only when the caller asks for them, but the frame reader asks for 18
+/// bytes then a block body, so an unbuffered async source pays the same per-read
+/// overhead (plus a cross-thread handoff each time). The `PrefetchReader` stays
+/// inside the buffer so its readahead still runs.
 fn open_bgzf_reader(
     path: &Path,
     opts: PipelineReaderOpts,
@@ -316,12 +484,18 @@ fn open_bgzf_reader(
     label: &str,
 ) -> Result<BgzfReaderEnum> {
     let normalized = open_normalized_with_opts(path, opts, label)?;
-    let buffered: Box<dyn Read + Send> = if opts.async_reader {
-        normalized
+    let buffered: Box<dyn Read + Send> =
+        Box::new(BufReader::with_capacity(BGZF_INPUT_BUFFER_SIZE, normalized));
+
+    // Single-threaded input decodes through fgumi-bgzf, which honors
+    // `opts.verify_crc` (noodles always verifies and has no skip knob). A
+    // threaded fgumi-bgzf raw reader is out of scope, so `threads > 1` keeps
+    // noodles' multithreaded decoder — its CRC policy is fixed on.
+    if threads > 1 {
+        Ok(make_bgzf_reader(buffered, threads))
     } else {
-        Box::new(BufReader::with_capacity(BGZF_INPUT_BUFFER_SIZE, normalized))
-    };
-    Ok(make_bgzf_reader(buffered, threads))
+        Ok(BgzfReaderEnum::Fgumi(FgumiBgzfReader::new(buffered, opts.verify_crc)))
+    }
 }
 
 /// Create a raw BAM reader that yields raw bytes instead of noodles Record.
@@ -525,6 +699,15 @@ pub fn create_bam_reader_for_pipeline_with_opts<P: AsRef<Path>>(
 
 /// Parse the BAM header from `reader`, then return a reader that replays the
 /// whole stream from byte zero.
+///
+/// The header block's CRC32 is **always** verified: the parse runs through
+/// noodles' [`BgzfReader`], which has no CRC-skip knob. A pipeline's
+/// `verify_crc = false` (`--no-check-crc`) therefore applies to the record body
+/// only — a corrupted *header* block is rejected regardless. Threading the
+/// policy here would mean swapping in the block-batching fgumi-bgzf reader,
+/// whose readahead over-consumes the [`TeeReader`] and breaks the exact-byte
+/// replay this function relies on, so the header parse deliberately stays on
+/// noodles.
 ///
 /// The bytes the header parse consumed are captured by a [`TeeReader`] and
 /// chained back in front of the remainder, so callers get the header without
@@ -923,6 +1106,303 @@ mod tests {
         let mut replayed = Vec::new();
         rest.read_to_end(&mut replayed)?;
         assert_eq!(replayed, bgzf, "replayed stream is not byte-identical to the input");
+        Ok(())
+    }
+
+    // ========================================================================
+    // fgumi-bgzf raw-reader unify (#800)
+    // ========================================================================
+
+    /// Build SAM text with `n` aligned records over a single reference. Enough
+    /// records to span more than one BGZF block once transcoded, so the raw
+    /// reader's block-boundary refill logic is exercised.
+    fn many_record_sam_text(n: usize) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::from("@HD\tVN:1.6\tSO:unsorted\n@SQ\tSN:chr1\tLN:100000\n");
+        for i in 0..n {
+            let pos = (i % 90_000) + 1;
+            writeln!(s, "r{i}\t0\tchr1\t{pos}\t60\t4M\t*\t0\t0\tACGT\tIIII").expect("format");
+        }
+        s
+    }
+
+    /// Transcode SAM text to a BGZF BAM file on disk. For a large `sam` this
+    /// spans several BGZF blocks, which the corrupted-CRC and roundtrip tests
+    /// rely on.
+    fn write_bgzf_bam(path: &Path, sam: &str) {
+        let source: Box<dyn Read + Send> = Box::new(io::Cursor::new(sam.as_bytes().to_vec()));
+        let mut normalized = crate::sam_input::normalize_to_bgzf(source, Path::new("test.sam"))
+            .expect("transcode SAM to BGZF");
+        let mut bytes = Vec::new();
+        normalized.read_to_end(&mut bytes).expect("read transcoded BGZF");
+        std::fs::write(path, bytes).expect("write BGZF BAM");
+    }
+
+    /// Flip a byte in the last BGZF block's CRC32 footer, adapted from PR2's
+    /// `corrupt_last_block_crc` dedup integration helper. Requires the file to
+    /// span at least two blocks so the corrupted block comes *after* reader
+    /// construction succeeds: `FgumiBgzfReader` applies `verify_crc` uniformly to
+    /// every block, so corrupting block 0 (the header's block) with
+    /// `verify_crc: true` would fail inside reader construction (via `?`), before
+    /// the intended `read_record`/count assertion can run.
+    fn corrupt_last_block_crc(path: &Path) {
+        let mut bytes = std::fs::read(path).expect("read bam for corruption");
+        let mut cursor: &[u8] = &bytes;
+        let blocks =
+            fgumi_bgzf::read_raw_blocks(&mut cursor, 100_000).expect("read bgzf blocks from bam");
+        assert!(
+            blocks.len() >= 2,
+            "test input must span >= 2 BGZF blocks so the corrupted block isn't the header's; \
+             got {} -- generate more records",
+            blocks.len()
+        );
+        let offset: usize =
+            blocks[..blocks.len() - 1].iter().map(fgumi_bgzf::RawBgzfBlock::len).sum();
+        let last = blocks.last().expect("checked len >= 2 above");
+        // `read_raw_blocks` drops every BGZF EOF marker, so summing the returned
+        // (real) block lengths yields the last block's on-disk offset only when no
+        // marker sits *between* real blocks. Guard that: everything past the last
+        // framed block must be whole trailing EOF markers (a writer may emit more
+        // than one). An intermediate marker would leave real data here instead and
+        // shift `crc_off` onto an unrelated byte, which the `>= 2` guard cannot
+        // detect.
+        let eof = &fgumi_bgzf::BGZF_EOF;
+        let tail = &bytes[offset + last.len()..];
+        assert!(
+            tail.len().is_multiple_of(eof.len())
+                && tail.chunks_exact(eof.len()).all(|chunk| chunk == &eof[..]),
+            "bytes after the last framed block must be only trailing BGZF EOF markers; \
+             an intermediate marker would invalidate the CRC offset"
+        );
+        let crc_off = offset + last.len() - fgumi_bgzf::BGZF_FOOTER_SIZE;
+        bytes[crc_off] ^= 0x01;
+        std::fs::write(path, bytes).expect("write corrupted bam");
+    }
+
+    /// Flip a byte in the *first* BGZF block's CRC32 footer — the block that
+    /// carries the BAM header. The pipeline reader parses the header through
+    /// noodles (which always verifies), so this corruption is rejected even with
+    /// `verify_crc: false`.
+    fn corrupt_first_block_crc(path: &Path) {
+        let mut bytes = std::fs::read(path).expect("read bam for corruption");
+        let mut cursor: &[u8] = &bytes;
+        let blocks =
+            fgumi_bgzf::read_raw_blocks(&mut cursor, 100_000).expect("read bgzf blocks from bam");
+        let first_len = blocks.first().expect("at least one BGZF block").len();
+        let crc_off = first_len - fgumi_bgzf::BGZF_FOOTER_SIZE;
+        bytes[crc_off] ^= 0x01;
+        std::fs::write(path, bytes).expect("write corrupted bam");
+    }
+
+    /// The pipeline reader parses the BAM header through noodles' BGZF reader,
+    /// which always verifies CRC32 and has no skip knob. So `verify_crc: false`
+    /// does **not** suppress a corrupted *header* block — it applies to the
+    /// record body only. This pins that documented limitation (see
+    /// [`read_header_and_replay`]).
+    #[test]
+    fn test_pipeline_reader_always_verifies_the_header_block() -> Result<()> {
+        let file = tempfile::Builder::new().suffix(".bam").tempfile()?;
+        write_bgzf_bam(file.path(), &many_record_sam_text(8000));
+        corrupt_first_block_crc(file.path());
+
+        let opts = PipelineReaderOpts { verify_crc: false, ..PipelineReaderOpts::default() };
+        assert!(
+            create_bam_reader_for_pipeline_with_opts(file.path(), opts).is_err(),
+            "the header block is always CRC-verified, even with verify_crc: false"
+        );
+        Ok(())
+    }
+
+    /// Drain every record from a raw reader, returning the count.
+    fn count_raw_records(reader: &mut RawBamReaderAuto) -> io::Result<usize> {
+        let mut record = fgumi_raw_bam::RawRecord::new();
+        let mut count = 0usize;
+        while reader.read_record(&mut record)? > 0 {
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// The raw reader must honor `verify_crc`: with verification on, a corrupted
+    /// block errors; with it off, the same file reads clean. Against the noodles
+    /// path this could not be expressed — noodles always verifies — so the
+    /// `verify_crc: false` case is the red test for the fgumi-bgzf unify (#800).
+    #[test]
+    fn test_raw_reader_honors_verify_crc_on_corrupted_block() -> Result<()> {
+        let file = tempfile::Builder::new().suffix(".bam").tempfile()?;
+        write_bgzf_bam(file.path(), &many_record_sam_text(8000));
+        corrupt_last_block_crc(file.path());
+
+        // verify_crc: true -> reading the corrupted block must error.
+        let opts_verify = PipelineReaderOpts { verify_crc: true, ..PipelineReaderOpts::default() };
+        let (mut reader, _header) = create_raw_bam_reader_with_opts(file.path(), 1, opts_verify)?;
+        assert!(
+            count_raw_records(&mut reader).is_err(),
+            "verify_crc: true must reject a corrupted BGZF CRC32"
+        );
+
+        // verify_crc: false -> the same file reads clean (RED on the noodles path).
+        let opts_skip = PipelineReaderOpts { verify_crc: false, ..PipelineReaderOpts::default() };
+        let (mut reader, _header) = create_raw_bam_reader_with_opts(file.path(), 1, opts_skip)?;
+        let count = count_raw_records(&mut reader)
+            .expect("verify_crc: false must accept a corrupted BGZF CRC32");
+        assert_eq!(count, 8000, "all records read with verify_crc: false");
+        Ok(())
+    }
+
+    /// A clean multi-block file round-trips through the raw reader with
+    /// verification on: every written record is read back.
+    #[test]
+    fn test_raw_reader_roundtrip_multiblock() -> Result<()> {
+        let file = tempfile::Builder::new().suffix(".bam").tempfile()?;
+        write_bgzf_bam(file.path(), &many_record_sam_text(8000));
+
+        let opts = PipelineReaderOpts { verify_crc: true, ..PipelineReaderOpts::default() };
+        let (mut reader, header) = create_raw_bam_reader_with_opts(file.path(), 1, opts)?;
+        assert_eq!(header.reference_sequences().len(), 1, "header @SQ lost");
+        assert_eq!(count_raw_records(&mut reader)?, 8000, "record count mismatch");
+        Ok(())
+    }
+
+    /// A BGZF EOF marker appearing between data blocks (as a multithreaded
+    /// writer emits between per-thread segments, or `cat a.bam b.bam` does) must
+    /// not truncate the stream: the reader has to skip the marker and keep
+    /// reading the blocks after it. This is the exact shape that a naive
+    /// one-block-at-a-time refill mishandled.
+    #[test]
+    fn test_raw_reader_skips_intermediate_eof_marker() -> Result<()> {
+        // Transcode to BGZF bytes, then splice a BGZF EOF marker after the first
+        // block (not the header's block; it stays intact and parseable).
+        let bytes = {
+            let file = tempfile::Builder::new().suffix(".bam").tempfile()?;
+            write_bgzf_bam(file.path(), &many_record_sam_text(8000));
+            std::fs::read(file.path())?
+        };
+        let blocks = {
+            let mut cursor: &[u8] = &bytes;
+            fgumi_bgzf::read_raw_blocks(&mut cursor, 100_000)?
+        };
+        assert!(blocks.len() >= 2, "need >= 2 blocks, got {}", blocks.len());
+        let first_block_len = blocks[0].len();
+
+        let mut spliced = Vec::with_capacity(bytes.len() + fgumi_bgzf::BGZF_EOF.len());
+        spliced.extend_from_slice(&bytes[..first_block_len]);
+        spliced.extend_from_slice(&fgumi_bgzf::BGZF_EOF); // stray EOF marker mid-stream
+        spliced.extend_from_slice(&bytes[first_block_len..]);
+
+        let file = tempfile::Builder::new().suffix(".bam").tempfile()?;
+        std::fs::write(file.path(), &spliced)?;
+
+        let opts = PipelineReaderOpts { verify_crc: true, ..PipelineReaderOpts::default() };
+        let (mut reader, _header) = create_raw_bam_reader_with_opts(file.path(), 1, opts)?;
+        assert_eq!(
+            count_raw_records(&mut reader)?,
+            8000,
+            "intermediate EOF marker truncated the record stream"
+        );
+        Ok(())
+    }
+
+    /// Byte-at-a-time reads must reconstruct exactly the same decompressed
+    /// stream as one big read, across block boundaries. This pins the partial
+    /// -read / cursor logic of the fgumi-bgzf streaming decoder.
+    #[test]
+    fn test_fgumi_bgzf_reader_partial_reads_match_full_decode() -> Result<()> {
+        let bgzf = {
+            let src: Box<dyn Read + Send> =
+                Box::new(io::Cursor::new(many_record_sam_text(8000).into_bytes()));
+            let mut normalized = crate::sam_input::normalize_to_bgzf(src, Path::new("test.sam"))?;
+            let mut bytes = Vec::new();
+            normalized.read_to_end(&mut bytes)?;
+            bytes
+        };
+
+        // Full decode in one shot.
+        let mut full = Vec::new();
+        FgumiBgzfReader::new(Box::new(io::Cursor::new(bgzf.clone())), true)
+            .read_to_end(&mut full)?;
+        assert!(!full.is_empty(), "decoded stream should be non-empty");
+
+        // Byte-at-a-time decode must match exactly.
+        let mut reader = FgumiBgzfReader::new(Box::new(io::Cursor::new(bgzf.clone())), true);
+        let mut one_byte_at_a_time = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let n = reader.read(&mut byte)?;
+            if n == 0 {
+                break;
+            }
+            one_byte_at_a_time.extend_from_slice(&byte[..n]);
+        }
+        assert_eq!(one_byte_at_a_time, full, "byte-at-a-time decode diverged from full decode");
+
+        // A small odd-sized buffer (spanning block boundaries) must also match.
+        let mut reader = FgumiBgzfReader::new(Box::new(io::Cursor::new(bgzf)), true);
+        let mut small_chunks = Vec::new();
+        let mut buf = [0u8; 7];
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            small_chunks.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(small_chunks, full, "7-byte-chunk decode diverged from full decode");
+        Ok(())
+    }
+
+    /// A block decode failure must be **sticky**: once a block fails to decode,
+    /// the reader must keep erroring rather than resume at the next frame and
+    /// silently skip the corrupted block's records. Corrupt a *middle* block so
+    /// valid blocks remain queued behind it — the exact shape where a
+    /// non-sticky reader would hand back the following block's bytes.
+    #[test]
+    fn test_fgumi_bgzf_reader_poisons_after_decode_failure() -> Result<()> {
+        let mut bgzf = {
+            let src: Box<dyn Read + Send> =
+                Box::new(io::Cursor::new(many_record_sam_text(8000).into_bytes()));
+            let mut normalized = crate::sam_input::normalize_to_bgzf(src, Path::new("test.sam"))?;
+            let mut bytes = Vec::new();
+            normalized.read_to_end(&mut bytes)?;
+            bytes
+        };
+
+        // Locate block boundaries and corrupt the CRC of block index 1 (a middle
+        // block): blocks 0 and 2.. stay valid, so a non-sticky reader would skip
+        // block 1 and continue serving block 2's bytes.
+        let block_lens: Vec<usize> = {
+            let mut cursor: &[u8] = &bgzf;
+            fgumi_bgzf::read_raw_blocks(&mut cursor, 100_000)?
+                .iter()
+                .map(fgumi_bgzf::RawBgzfBlock::len)
+                .collect()
+        };
+        assert!(block_lens.len() >= 3, "need >= 3 blocks, got {}", block_lens.len());
+        let block1_offset = block_lens[0];
+        let crc_off = block1_offset + block_lens[1] - fgumi_bgzf::BGZF_FOOTER_SIZE;
+        bgzf[crc_off] ^= 0x01;
+
+        let mut reader = FgumiBgzfReader::new(Box::new(io::Cursor::new(bgzf)), true);
+        let mut buf = [0u8; 64];
+
+        // Drain until the first error (must occur at the block 0 -> 1 boundary).
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => panic!("reader reached clean EOF without erroring on the corrupted block"),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        // Sticky: every subsequent read must also error, never resume at block 2.
+        for _ in 0..3 {
+            assert!(
+                reader.read(&mut buf).is_err(),
+                "reader must stay poisoned after a decode failure, not skip the corrupted block"
+            );
+        }
+        // `fill_buf` shares the poison too.
+        assert!(reader.fill_buf().is_err(), "fill_buf must also honor the poison");
         Ok(())
     }
 

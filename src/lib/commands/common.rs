@@ -446,11 +446,18 @@ pub struct BamIoOptions {
     /// transferred, or copied since it was written, where a flipped bit is
     /// exactly what CRC32 exists to catch. Pass `--check-crc` to force
     /// verification on (e.g. for stdin input you don't trust). Mutually
-    /// exclusive with `--no-check-crc`. Not every command honors this flag:
-    /// `downsample` never does; `clip`/`codec`/`duplex`/`simplex`/`correct`/`group`
-    /// only do when `--threads N` is given (their default, no-`--threads`
-    /// mode falls back to a reader that always verifies). Every run logs a
-    /// `CRC verify:` line at startup stating what actually happened.
+    /// exclusive with `--no-check-crc`. Coverage varies by command:
+    /// `clip`/`codec`/`duplex`/`simplex`/`downsample` honor it whether run
+    /// single- or multi-threaded; `correct`/`group` honor it only with
+    /// `--threads N` (their single-threaded mode falls back to a reader that
+    /// always verifies). Every run logs a `CRC verify:` line at startup stating
+    /// what actually happened. For `correct`/`group` the BAM **header** block is
+    /// always CRC-verified regardless of this flag, because their header parse
+    /// goes through a decoder with no CRC-skip knob; there `--no-check-crc`
+    /// applies to the record body only. The raw-reader commands
+    /// (`clip`/`codec`/`duplex`/`simplex`/`downsample`) parse the header through
+    /// the same fgumi-bgzf decoder as the body when single-threaded, so
+    /// `--no-check-crc` skips the header block's CRC there too.
     #[arg(long = "check-crc", default_value_t = false, conflicts_with = "no_check_crc")]
     pub check_crc: bool,
 
@@ -533,10 +540,13 @@ impl BamIoOptions {
     /// Log the CRC-verification setting for a command whose single-threaded
     /// fast path bypasses the CRC-skip-capable fgumi-bgzf decoder in favor of
     /// noodles-bgzf's own BGZF reader (which always verifies and has no
-    /// public knob to disable it — see the fgumi-sort-style follow-up note in
-    /// the task-2b report). `pipeline_mode` is `true` when the wireable
-    /// 7-step pipeline will run instead of the fast path, in which case this
-    /// defers to [`log_effective_check_crc`](Self::log_effective_check_crc).
+    /// public knob to disable it). Since the raw-reader unify (#800), only
+    /// `correct` and `group` still take this path: their single-threaded mode
+    /// reads through `create_bam_reader_for_pipeline_with_opts` + a manual
+    /// noodles BGZF decode, not through `create_raw_bam_reader[_with_opts]`.
+    /// `pipeline_mode` is `true` when the wireable 7-step pipeline will run
+    /// instead of the fast path, in which case this defers to
+    /// [`log_effective_check_crc`](Self::log_effective_check_crc).
     pub fn log_effective_check_crc_for_fast_path(&self, pipeline_mode: bool) {
         if pipeline_mode {
             self.log_effective_check_crc();
