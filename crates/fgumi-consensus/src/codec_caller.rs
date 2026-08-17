@@ -1049,9 +1049,9 @@ impl CodecConsensusCaller {
     ///
     /// The one implementation of codec's cap rule: rank each read name with
     /// [`fgumi_raw_bam::hash::fgbio_read_name_rank`], then hand the ranks to
-    /// [`select_lowest_ranking`]. Production (`consensus_reads_raw`) and the `downsample_pairs`
-    /// test wrapper both go through here, so a test cannot pass against a ranking that
-    /// production does not use.
+    /// [`select_lowest_ranking`]. Every caller — `consensus_reads_raw` via
+    /// [`Self::keep_indices_for_infos`], and the cap tests via the same function — goes through
+    /// here, so a test cannot pass against a ranking that production does not use.
     ///
     /// Ranking here rather than stamping every `ClippedRecordInfo` at construction keeps the
     /// hash inside the caller's own `max_reads_per_strand` guard: an uncapped run — the default
@@ -1978,29 +1978,6 @@ impl CodecConsensusCaller {
         let info_pos = Self::build_clipped_info(pos_rec, 0, 0);
         let info_neg = Self::build_clipped_info(neg_rec, 1, 0);
         Self::compute_consensus_length_raw(&info_pos, &info_neg, overlap_end)
-    }
-
-    /// Test-only wrapper: downsample pairs using the `max_reads_per_strand` option.
-    ///
-    /// Delegates to [`Self::keep_indices_by_name_rank`], the same function `consensus_reads_raw`
-    /// uses, so a change to the ranking or selection rule cannot pass here while breaking
-    /// production. It differs from the production path only in operating on `RawRecord`s
-    /// directly rather than on already-clipped `ClippedRecordInfo`s.
-    pub fn downsample_pairs(
-        &self,
-        r1s: Vec<RawRecord>,
-        r2s: Vec<RawRecord>,
-    ) -> (Vec<RawRecord>, Vec<RawRecord>) {
-        let Some(max_reads) = self.options.max_reads_per_strand else {
-            return (r1s, r2s);
-        };
-        let indices = Self::keep_indices_by_name_rank(
-            r1s.iter().map(|r| RawRecordView::new(r.as_ref()).read_name()),
-            max_reads,
-        );
-        let new_r1: Vec<_> = indices.iter().map(|&i| r1s[i].clone()).collect();
-        let new_r2: Vec<_> = indices.iter().map(|&i| r2s[i].clone()).collect();
-        (new_r1, new_r2)
     }
 }
 
@@ -3825,46 +3802,46 @@ mod tests {
     /// verbatim label, *not* leak into `IndelErrorBetweenStrands` the way it did before
     /// the fix.
     ///
-    /// The caller-level trigger (`consensus_length < ss.bases.len()` at the
-    /// `ClipOverlapFailed` site) is a degenerate overlap-clip boundary that fgbio itself
-    /// only reaches on specific real-data alignments; a synthetic pipeline fixture that
-    /// lands there without first tripping the earlier `IndelErrorBetweenStrands` phase
-    /// check would have to replicate fgbio's exact clip arithmetic and would be brittle.
-    /// This exercises the counting/labeling contract at the reject-tallying seam instead:
-    /// `reject_records_count` is the single site every reject is tallied at (the production
-    /// sites reach it through `reject_records_at`, which also routes the records to
-    /// `--rejects`), so pinning the count, the filtered total, and the central-reason
-    /// mapping here is what guarantees the emitted metrics row is right when the branch
-    /// does fire. `test_clip_overlap_failed_attribution_matches_fgbio` covers the
-    /// complementary half — reaching the branch through the whole pipeline.
+    /// The trigger is driven end to end through the production `consensus_length <
+    /// ss.bases.len()` site, reusing [`window_end_past_r2_fixture`]: a family whose longest R1
+    /// runs 30 bases past where its longest R2 stops aligning, so the consensus can only span
+    /// the two strands' meeting region — shorter than the 100-base R1 single-strand consensus
+    /// it would have to contain — and lands on `ClipOverlapFailed` with no indel anywhere in
+    /// it. [`test_r1_running_past_r2_is_not_an_indel_error`] pins *which* reason that same
+    /// fixture falls under; this test pins the *labeling* contract layered on top of it: the
+    /// whole family is filtered, and the reason maps to fgbio's verbatim `ClipOverlapFailed`
+    /// metrics label rather than a fallback.
+    ///
+    /// An earlier version of this test called `reject_records_count` directly and asserted that
+    /// the tally had not leaked into `IndelErrorBetweenStrands`. Nothing in that test could have
+    /// inserted the other reason, so the guard against the very mislabeling the test is named
+    /// for could not fail (issue #771). Driving the real branch is what makes it a guard: before
+    /// the fix this site passed `IndelErrorBetweenStrands`, and this fixture now reports it.
     #[test]
     fn test_clip_overlap_failed_counted_and_labeled() {
-        let options = CodecConsensusOptions {
-            min_reads_per_strand: 1,
-            min_duplex_length: 1,
-            ..Default::default()
-        };
-        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+        let fixture = window_end_past_r2_fixture();
+        let record_count = fixture.len();
+        let (caller, output) = call_codec_family(fixture);
 
-        // A rejected molecule contributes both of its records (R1 + R2), matching how the
+        let stats = caller.statistics();
+        assert_eq!(output.count, 0, "a consensus shorter than a single strand must be rejected");
+        // Every record of the rejected family is tallied under the reason, matching how the
         // caller passes `r1_infos.len() + r2_infos.len()` at the ClipOverlapFailed site.
-        caller.reject_records_count(2, CallerRejectionReason::ClipOverlapFailed);
-
         assert_eq!(
-            caller.stats.rejection_reasons.get(&CallerRejectionReason::ClipOverlapFailed),
-            Some(&2),
-            "both rejected records must be tallied under ClipOverlapFailed"
+            stats.rejection_reasons.get(&CallerRejectionReason::ClipOverlapFailed),
+            Some(&record_count),
+            "the whole family must be tallied under ClipOverlapFailed"
         );
-        // Regression guard: before the fix this reject was mislabeled as an indel error.
+        // Regression guard: before the fix this reject was mislabeled as an indel error. The
+        // fixture reaches the branch with no indel in it, so relabeling it makes this fail.
         assert!(
-            !caller
-                .stats
-                .rejection_reasons
-                .contains_key(&CallerRejectionReason::IndelErrorBetweenStrands),
-            "a clip-overlap reject must not leak into IndelErrorBetweenStrands"
+            !stats.rejection_reasons.contains_key(&CallerRejectionReason::IndelErrorBetweenStrands),
+            "a clip-overlap reject must not leak into IndelErrorBetweenStrands; got {:?}",
+            stats.rejection_reasons
         );
         assert_eq!(
-            caller.stats.reads_filtered, 2,
+            stats.reads_filtered,
+            u64::try_from(record_count).expect("fixture size fits in u64"),
             "the filtered-reads total the metrics row is derived from must include the reject"
         );
         // The metrics row is emitted under the centralized reason; confirm it maps to
@@ -4617,6 +4594,20 @@ mod tests {
     }
 
     /// Port of fgbio test: "not emit a consensus when the reads are a cross-chromosomal chimeric pair"
+    ///
+    /// The subject is `is_primary_fr_pair_raw`'s same-reference check, so the fixture has to
+    /// reach it. The pair therefore *overlaps* (R1 at 1, R2 at 11, both `30M`): the geometry the
+    /// suite's other fixtures use to produce a consensus, so the only thing standing between this
+    /// family and an emitted record is the chromosome it was moved to. The old fixture used
+    /// starts `100`/`135`, spanning 100-129 and 135-164 with no overlap at all, and was rejected
+    /// as `InsufficientOverlap` in phase 4 — long after phase 2 had already dropped it. Deleting
+    /// the two `set_ref_id` calls left that version green (issue #771).
+    ///
+    /// The rejection *reason* is asserted, not merely the absence of output: a family can fail to
+    /// emit for a dozen reasons, and only one of them is the one this test is named for. It is
+    /// `NotPrimaryFrPair` because the cross-chromosome check lives inside
+    /// `is_primary_fr_pair_raw`, the same phase-2 gate `test_not_emit_consensus_for_rf_pair`
+    /// pins for a non-FR orientation.
     #[test]
     fn test_not_emit_consensus_chimeric_pair() {
         let options = CodecConsensusOptions {
@@ -4624,22 +4615,40 @@ mod tests {
             min_duplex_length: 1,
             ..Default::default()
         };
-        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
-        // Create FR pair then make it chimeric by putting R1 on a different chromosome
-        let mut reads = create_fr_pair(
-            "read1",
-            100,
-            135,
-            30,
-            35,
-            &[(Kind::Match, 30)],
-            &[(Kind::Match, 30)],
-            "hi",
-            Some("ACC-TGA"),
-            false,
-            true,
+        // R1 at 1 and R2 at 11, both 30M: 20 reference positions of overlap, so the pair clears
+        // the `min_duplex_length` gate that rejected the old non-overlapping fixture.
+        let build_pair = || {
+            create_fr_pair(
+                "read1",
+                1,
+                11,
+                30,
+                35,
+                &[(Kind::Match, 30)],
+                &[(Kind::Match, 30)],
+                "hi",
+                Some("ACC-TGA"),
+                false,
+                true,
+            )
+        };
+
+        // Control: the same family, left on one chromosome, does emit a consensus. Without this
+        // the test cannot distinguish "rejected for being chimeric" from "this fixture never
+        // consenses" — which is exactly how the old fixture passed for the wrong reason.
+        let mut control_caller =
+            CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options.clone());
+        let control = control_caller
+            .consensus_reads_from_sam_records(build_pair())
+            .expect("consensus_reads_from_sam_records should succeed");
+        assert_eq!(
+            control.count, 1,
+            "fixture guard: the pair must consense while both reads are on one chromosome"
         );
+
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+        let mut reads = build_pair();
 
         // Modify R1 to be on a different reference (chromosome)
         reads[0].view_mut().set_ref_id(2); // Different chromosome
@@ -4654,6 +4663,17 @@ mod tests {
         assert_eq!(
             output.count, 0,
             "Should not emit consensus for cross-chromosomal chimeric pair"
+        );
+        assert_eq!(
+            caller.stats.rejection_reasons.get(&CallerRejectionReason::NotPrimaryFrPair),
+            Some(&2),
+            "both records of the chimeric template must be rejected by the same-reference check"
+        );
+        assert_eq!(
+            caller.stats.rejection_reasons.len(),
+            1,
+            "the chimeric check must be the only thing that rejected this family; got {:?}",
+            caller.stats.rejection_reasons
         );
     }
 
@@ -4699,15 +4719,26 @@ mod tests {
     }
 
     /// Port of fgbio test: "mask end qualities"
+    ///
+    /// `--outer-bases-qual` **assigns** its value to the outermost `--outer-bases-length`
+    /// positions at each end, and leaves the interior alone. Both halves are asserted, per
+    /// position: the ends must be exactly the masked quality, and every interior position must
+    /// be above it.
+    ///
+    /// The earlier version asserted only `q <= 5` over the two ends and never looked at the
+    /// interior, so masking *every* base to 0 — the one outcome a test named for masking *ends*
+    /// exists to exclude — passed both of its loops (issue #771).
     #[test]
     fn test_mask_end_qualities() {
         // This tests the outer_bases_qual and outer_bases_length options
         // Create a consensus with outerBasesLength=7 and outerBasesQual=5
+        const OUTER_LENGTH: usize = 7;
+        const OUTER_QUAL: PhredScore = 5;
         let options = CodecConsensusOptions {
             min_reads_per_strand: 1,
             min_duplex_length: 1,
-            outer_bases_length: 7,
-            outer_bases_qual: Some(5),
+            outer_bases_length: OUTER_LENGTH,
+            outer_bases_qual: Some(OUTER_QUAL),
             ..Default::default()
         };
         let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
@@ -4736,17 +4767,29 @@ mod tests {
         let records = ParsedBamRecord::parse_all(&output.data);
         let consensus = &records[0];
         let quals = &consensus.quals;
+        assert_eq!(
+            quals.len(),
+            50,
+            "fixture guard: both reads span reference 1-50, so the consensus is 50 positions and \
+             has an interior between the two masked ends"
+        );
 
-        // Check that outer bases have reduced quality
-        // First 7 bases should have qual <= 5
-        for (i, &q) in quals.iter().take(7).enumerate() {
-            assert!(q <= 5, "First 7 bases should have qual <= 5, but base {i} has qual {q}");
-        }
-
-        // Last 7 bases should also have qual <= 5
-        let len = quals.len();
-        for (i, &q) in quals.iter().skip(len.saturating_sub(7)).enumerate() {
-            assert!(q <= 5, "Last 7 bases should have qual <= 5, but base {i} has qual {q}");
+        let is_outer = |i: usize| i < OUTER_LENGTH || i >= quals.len() - OUTER_LENGTH;
+        for (i, &q) in quals.iter().enumerate() {
+            if is_outer(i) {
+                assert_eq!(
+                    q, OUTER_QUAL,
+                    "outer base {i} must be assigned the outer-bases quality"
+                );
+            } else {
+                // The half the old assertion missed: masking every position also satisfies "the
+                // ends are at most 5".
+                assert!(
+                    q > OUTER_QUAL,
+                    "interior base {i} is not an outer base and must keep its consensus \
+                     quality, but has qual {q}"
+                );
+            }
         }
     }
 
@@ -5362,8 +5405,10 @@ mod tests {
         assert_eq!(info.clip_amount, 3);
         assert!(info.clip_from_start, "Reverse strand should clip from start");
         assert_eq!(info.clipped_seq_len, 5); // 8 - 3
-        // Position adjusts forward by clipped reference bases
-        assert!(info.adjusted_pos > 100);
+        // Clipping three bases off the start of an all-`M` alignment moves the start by exactly
+        // three reference positions. The old `> 100` accepted any forward move, including the
+        // wrong one -- every other assertion in this test is exact, and this one now is too.
+        assert_eq!(info.adjusted_pos, 103);
     }
 
     #[test]
@@ -5384,7 +5429,9 @@ mod tests {
 
         assert_eq!(info.clipped_seq_len, 4);
         assert_eq!(info.adjusted_pos, 50);
-        assert_eq!(info.clipped_cigar.len(), 1); // Single 4M op
+        // A zero clip preserves the CIGAR, so the single op must still be the input's `4M` --
+        // asserting only `len() == 1` would hold for any one-op CIGAR the clipper substituted.
+        assert_eq!(info.clipped_cigar, vec![encode_op(0, 4)]);
     }
 
     #[test]
@@ -5429,22 +5476,85 @@ mod tests {
         assert_eq!(ss.raw_read_count, 5);
     }
 
+    /// `statistics()` reports what the caller actually did, on each of its three counters.
+    ///
+    /// The earlier version constructed a caller, fed it nothing, and asserted three zeroes — a
+    /// restatement of `CodecConsensusStats::default()`, which holds for a caller that tracks
+    /// nothing at all (issue #771). The zeroes are kept as a starting point, but the counters are
+    /// then moved: one family that consenses and one that does not, so
+    /// `consensus_reads_generated` and `reads_filtered` are each driven off zero *separately* and
+    /// cannot be satisfied by one accumulator standing in for the other.
     #[test]
     fn test_codec_statistics_tracking() {
-        // Test that CodecConsensusCaller properly tracks statistics
         let options = CodecConsensusOptions {
             min_reads_per_strand: 1,
             min_duplex_length: 1,
             ..Default::default()
         };
-        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
-
-        let stats = caller.statistics();
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
         // Initial statistics should be zero
+        let stats = caller.statistics();
         assert_eq!(stats.total_input_reads, 0);
         assert_eq!(stats.consensus_reads_generated, 0);
         assert_eq!(stats.reads_filtered, 0);
+
+        // A well-formed overlapping FR pair: consenses.
+        let consensing = create_fr_pair(
+            "kept",
+            1,
+            11,
+            30,
+            35,
+            &[(Kind::Match, 30)],
+            &[(Kind::Match, 30)],
+            "hi",
+            None,
+            false,
+            true,
+        );
+        assert_eq!(
+            caller
+                .consensus_reads_from_sam_records(consensing)
+                .expect("consensus_reads_from_sam_records should succeed")
+                .count,
+            1
+        );
+
+        // An RF pair: rejected as NotPrimaryFrPair, so it moves `reads_filtered` and not
+        // `consensus_reads_generated`. The starts match `test_not_emit_consensus_for_rf_pair`'s,
+        // which put the reverse read's 5' end left of the forward read's — the geometry that
+        // makes the orientation genuinely RF rather than a dovetailed FR.
+        let rejected = create_fr_pair(
+            "dropped",
+            100,
+            135,
+            30,
+            35,
+            &[(Kind::Match, 30)],
+            &[(Kind::Match, 30)],
+            "hi",
+            None,
+            true,  // R1 reverse
+            false, // R2 forward
+        );
+        assert_eq!(
+            caller
+                .consensus_reads_from_sam_records(rejected)
+                .expect("consensus_reads_from_sam_records should succeed")
+                .count,
+            0
+        );
+
+        let stats = caller.statistics();
+        assert_eq!(stats.total_input_reads, 4, "both pairs are counted as input");
+        assert_eq!(stats.consensus_reads_generated, 1, "only the FR pair consensed");
+        assert_eq!(stats.reads_filtered, 2, "both records of the RF pair were filtered");
+        assert_eq!(
+            stats.rejection_reasons.get(&CallerRejectionReason::NotPrimaryFrPair),
+            Some(&2),
+            "the reasons map must be carried through to the reported statistics"
+        );
     }
 
     // ==========================================================================
@@ -5597,6 +5707,21 @@ mod tests {
         assert!(caller.check_overlap_phase(&r1, &r2, 110, 129));
     }
 
+    /// A deletion carried by only one strand puts the two reads out of phase across the overlap,
+    /// and `check_overlap_phase` must report that.
+    ///
+    /// The outcome is fully determined, not indeterminate as an earlier comment here claimed
+    /// while the test discarded its result (issue #771). Over the overlap 100-129: R1's `30M`
+    /// puts reference 100 at query 1 and reference 129 at query 30, while R2's `15M5D15M` puts
+    /// reference 100 at query 1 and reference 129 at query 25, because the 5bp deletion
+    /// (reference 115-119) consumes no query bases. The two offsets are `1 - 1 = 0` at the start
+    /// and `30 - 25 = 5` at the end, so the phases differ and the answer is `false`.
+    ///
+    /// The `30M` control is what makes that attributable to the deletion: it is the same
+    /// geometry with the indel removed, and it must be `true`. Without it the assertion could
+    /// not tell a phase mismatch from a fixture that never reaches the comparison — a
+    /// `read_pos_at_ref_pos_raw` returning `None` for any of the four lookups also yields
+    /// `false`.
     #[test]
     fn test_check_overlap_phase_indel_mismatch() {
         use noodles::sam::alignment::record::cigar::op::Kind;
@@ -5605,7 +5730,6 @@ mod tests {
         let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
         // R1 with 30M, R2 with 15M5D15M
-        // The overlap boundaries may land in the deletion
         let r1 = create_test_paired_read(
             "read1",
             &[b'A'; 30],
@@ -5627,9 +5751,28 @@ mod tests {
             &[(Kind::Match, 15), (Kind::Deletion, 5), (Kind::Match, 15)],
         );
 
-        // Overlap region spanning the deletion should detect the phase mismatch
-        // Result depends on whether the boundaries land in indels - just verify it runs
-        let _result = caller.check_overlap_phase(&r1, &r2, 100, 129);
+        assert!(
+            !caller.check_overlap_phase(&r1, &r2, 100, 129),
+            "R2's 5bp deletion shifts its query offset by 5 across the overlap, so the two \
+             strands are out of phase"
+        );
+
+        // Control: the same pair with R2's deletion removed is in phase over the same overlap.
+        let r2_no_indel = create_test_paired_read(
+            "read2",
+            &[b'A'; 30],
+            &[30; 30],
+            false,
+            true,
+            false,
+            100,
+            &[(Kind::Match, 30)],
+        );
+        assert!(
+            caller.check_overlap_phase(&r1, &r2_no_indel, 100, 129),
+            "fixture guard: without the deletion the same geometry is in phase, so the \
+             rejection above is attributable to the indel and not to the overlap window"
+        );
     }
 
     #[test]
@@ -5715,8 +5858,12 @@ mod tests {
 
         let padded = CodecConsensusCaller::pad_consensus(&ss, 2, false);
 
-        // Should return unchanged since new_length <= current_len
-        assert_eq!(padded.bases.len(), 4);
+        // Should return unchanged since new_length <= current_len. The claim is "unchanged", so
+        // every field is compared: a length alone would hold for a truncate-then-repad.
+        assert_eq!(padded.bases, ss.bases);
+        assert_eq!(padded.quals, ss.quals);
+        assert_eq!(padded.depths, ss.depths);
+        assert_eq!(padded.errors, ss.errors);
     }
 
     #[test]
@@ -5825,11 +5972,20 @@ mod tests {
         assert!(!cigar_utils::is_cigar_prefix(&c, &b));
     }
 
+    /// `reverse_complement_ss` reverse-complements the bases and reverses everything else, so
+    /// depths and errors stay attached to the base they were measured on.
+    ///
+    /// The fixture bases are `AACG`, deliberately not a palindrome. The earlier version used
+    /// `ACGT`, whose reverse complement is itself, so the base assertion held for a function that
+    /// did nothing at all to them — and `reverse_complement_ss` has no other non-palindromic
+    /// test in the crate (issue #771). `AACG` also separates the two halves of the operation:
+    /// reversing without complementing gives `GCAA` and complementing without reversing gives
+    /// `TTGC`, both distinct from the correct `CGTT`.
     #[test]
     fn test_reverse_complement_ss_depths_errors_reversed() {
         // Verify that depths and errors are reversed along with bases/quals for CODEC
         let ss = SingleStrandConsensus {
-            bases: b"ACGT".to_vec(),
+            bases: b"AACG".to_vec(),
             quals: vec![10, 20, 30, 40],
             depths: vec![1, 2, 3, 4],
             errors: vec![5, 6, 7, 8],
@@ -5841,8 +5997,9 @@ mod tests {
 
         let rc = CodecConsensusCaller::reverse_complement_ss(&ss);
 
-        // Bases should be reverse complemented
-        assert_eq!(rc.bases, b"ACGT"); // ACGT revcomp is ACGT (palindrome)
+        // Bases must be reversed *and* complemented: reversing alone would give `GCAA` and
+        // complementing alone `TTGC`, so this one equality excludes both.
+        assert_eq!(rc.bases, b"CGTT");
 
         // Quals should be reversed
         assert_eq!(rc.quals, vec![40, 30, 20, 10]);
@@ -5855,160 +6012,147 @@ mod tests {
         assert!(rc.is_negative_strand);
     }
 
+    /// With no cap configured, every read of the family reaches the consensus.
+    ///
+    /// This drives `consensus_reads_raw`'s own `if let Some(max_reads) = ...` guard, which is
+    /// where production decides whether to cap. The earlier version of this test called a
+    /// `#[cfg(test)]` `downsample_pairs` wrapper whose first statement was the mirror-image
+    /// `let Some(max_reads) = ... else { return (r1s, r2s) }`, so it returned its own input
+    /// before reaching any production code and could not have failed (issue #771).
+    ///
+    /// `aD`/`bD` are the per-strand maximum depths, so they count the reads that actually
+    /// contributed. The capped half is the A/B that makes the uncapped half mean something:
+    /// the same family under `--max-reads 3` must report 3, so "10" is the absence of a cap
+    /// rather than a depth the fixture would report either way.
     #[test]
-    fn test_downsample_pairs() {
-        use noodles::sam::alignment::record::cigar::op::Kind;
+    fn codec_uncapped_family_contributes_every_read() {
+        // `i32` because these are compared against `aD`/`bD`, which are BAM integer tags.
+        const FAMILY_SIZE: i32 = 10;
+        const CAP: i32 = 3;
 
-        let options = CodecConsensusOptions { max_reads_per_strand: Some(2), ..Default::default() };
-        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+        let depths_for = |max_reads_per_strand: Option<usize>| -> (Option<i32>, Option<i32>) {
+            let options = CodecConsensusOptions {
+                min_reads_per_strand: 1,
+                min_duplex_length: 1,
+                max_reads_per_strand,
+                ..Default::default()
+            };
+            let mut caller =
+                CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
-        // Create 5 R1s and 5 R2s
-        let r1s: Vec<RawRecord> = (0..5)
-            .map(|i| {
-                create_test_paired_read(
-                    &format!("r{i}"),
-                    &[b'A'; 20],
-                    &[30; 20],
-                    true,
+            let mut reads: Vec<RawRecord> = Vec::new();
+            for i in 0..FAMILY_SIZE {
+                reads.extend(create_fr_pair(
+                    &format!("q{i}"),
+                    1,
+                    11,
+                    30,
+                    35,
+                    &[(Kind::Match, 30)],
+                    &[(Kind::Match, 30)],
+                    "mi",
+                    Some("ACC-TGA"),
                     false,
                     true,
-                    100,
-                    &[(Kind::Match, 20)],
-                )
-            })
-            .collect();
-        let r2s: Vec<RawRecord> = (0..5)
-            .map(|i| {
-                create_test_paired_read(
-                    &format!("r{i}"),
-                    &[b'A'; 20],
-                    &[30; 20],
-                    false,
-                    true,
-                    false,
-                    110,
-                    &[(Kind::Match, 20)],
-                )
-            })
-            .collect();
+                ));
+            }
 
-        let (ds_r1s, ds_r2s) = caller.downsample_pairs(r1s, r2s);
+            let output = caller
+                .consensus_reads_from_sam_records(reads)
+                .expect("consensus_reads_from_sam_records should succeed");
+            assert_eq!(output.count, 1, "the family must consense at every cap tested here");
+            let records = ParsedBamRecord::parse_all(&output.data);
+            (records[0].get_int_tag(SamTag::AD), records[0].get_int_tag(SamTag::BD))
+        };
 
-        assert_eq!(ds_r1s.len(), 2);
-        assert_eq!(ds_r2s.len(), 2);
-    }
-
-    #[test]
-    fn test_downsample_pairs_no_limit() {
-        use noodles::sam::alignment::record::cigar::op::Kind;
-
-        let options = CodecConsensusOptions { max_reads_per_strand: None, ..Default::default() };
-        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
-
-        let r1s: Vec<RawRecord> = (0..5)
-            .map(|i| {
-                create_test_paired_read(
-                    &format!("r{i}"),
-                    &[b'A'; 20],
-                    &[30; 20],
-                    true,
-                    false,
-                    true,
-                    100,
-                    &[(Kind::Match, 20)],
-                )
-            })
-            .collect();
-        let r2s: Vec<RawRecord> = (0..5)
-            .map(|i| {
-                create_test_paired_read(
-                    &format!("r{i}"),
-                    &[b'A'; 20],
-                    &[30; 20],
-                    false,
-                    true,
-                    false,
-                    110,
-                    &[(Kind::Match, 20)],
-                )
-            })
-            .collect();
-
-        let (ds_r1s, ds_r2s) = caller.downsample_pairs(r1s, r2s);
-
-        // No limit, so all reads should be kept
-        assert_eq!(ds_r1s.len(), 5);
-        assert_eq!(ds_r2s.len(), 5);
+        assert_eq!(
+            depths_for(None),
+            (Some(FAMILY_SIZE), Some(FAMILY_SIZE)),
+            "with no cap every read of the family must contribute to its strand's consensus"
+        );
+        assert_eq!(
+            depths_for(Some(CAP as usize)),
+            (Some(CAP), Some(CAP)),
+            "control: the same family under a cap reports the cap, so the uncapped depth above \
+             is the absence of a cap and not a property of the fixture"
+        );
     }
 
     /// Codec downsampling keeps the lowest-hashing read pairs, not a shuffled sample, so the
-    /// retained subset is reproducible and matches fgbio's rule. Drives the real
-    /// `downsample_pairs` selection (same rank/sort/truncate/restore-order logic used inline in
-    /// `consensus_reads_raw`) with real read names, rather than re-deriving the ranking in the
-    /// test — see the task report for why that's preferred over a test-only reimplementation.
+    /// retained subset is reproducible and matches fgbio's rule.
+    ///
+    /// Both strands go through [`CodecConsensusCaller::keep_indices_for_infos`] — the function
+    /// `cap_infos_to_lowest_ranking`, and therefore `consensus_reads_raw`, calls — and each is
+    /// capped from its **own** list, which is what production does. The earlier version called a
+    /// `#[cfg(test)]` `downsample_pairs` wrapper that derived one index vector from R1 and
+    /// applied it to R2, so its "R2 must keep the same templates as R1" assertion was a property
+    /// of the wrapper and could not fail; worse, it stated as a contract something production
+    /// does not promise (see `codec_caps_each_strand_from_its_own_filtered_set`, where the two
+    /// strands deliberately retain different templates). Issue #771.
+    ///
+    /// The R2 arm is what carries the "lowest-hashing, not first-N" half of the claim: its list
+    /// is built in the *reverse* of R1's, so the retained set must be the same three names while
+    /// the retained positions are not. Selecting by input order would keep `{q0, q1, q2}` from
+    /// R1 and `{q9, q8, q7}` from R2 — the two arms disagree, which is exactly what an
+    /// order-dependent rule cannot survive.
     #[test]
     fn codec_downsampling_retains_lowest_hashing_pairs() {
         use noodles::sam::alignment::record::cigar::op::Kind;
 
-        let options = CodecConsensusOptions { max_reads_per_strand: Some(3), ..Default::default() };
-        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
-
         // Ten templates named q0..q9; signed Murmur3(42) ranks (htsjdk-derived) put
         // q3 (-1135430185) < q2 (-974105965) < q0 (-593808727) lowest, so a cap of 3 keeps
-        // exactly {q0, q2, q3}.
+        // exactly {q0, q2, q3} whatever order the list arrives in.
+        const MAX_READS: usize = 3;
         let names: Vec<String> = (0..10).map(|i| format!("q{i}")).collect();
-        let expected: Vec<String> = vec!["q3".to_string(), "q2".to_string(), "q0".to_string()];
 
-        let r1s: Vec<RawRecord> = names
-            .iter()
-            .map(|n| {
-                create_test_paired_read(
-                    n,
-                    &[b'A'; 20],
-                    &[30; 20],
-                    true,
-                    false,
-                    true,
-                    100,
-                    &[(Kind::Match, 20)],
-                )
-            })
-            .collect();
-        let r2s: Vec<RawRecord> = names
-            .iter()
-            .map(|n| {
-                create_test_paired_read(
-                    n,
-                    &[b'A'; 20],
-                    &[30; 20],
-                    false,
-                    true,
-                    false,
-                    110,
-                    &[(Kind::Match, 20)],
-                )
-            })
-            .collect();
-
-        let (ds_r1s, ds_r2s) = caller.downsample_pairs(r1s, r2s);
-        let names_of = |recs: &[RawRecord]| -> Vec<String> {
-            let mut names: Vec<String> = recs
+        let build = |ordered: &[String], is_first: bool, pos: usize| -> Vec<RawRecord> {
+            ordered
                 .iter()
-                .map(|r| {
-                    String::from_utf8(RawRecordView::new(r.as_ref()).read_name().to_vec())
+                .map(|n| {
+                    create_test_paired_read(
+                        n,
+                        &[b'A'; 20],
+                        &[30; 20],
+                        is_first,
+                        !is_first,
+                        is_first,
+                        pos,
+                        &[(Kind::Match, 20)],
+                    )
+                })
+                .collect()
+        };
+        let reversed: Vec<String> = names.iter().rev().cloned().collect();
+        let r1s = build(&names, true, 100);
+        let r2s = build(&reversed, false, 110);
+
+        // Cap each strand independently, exactly as `consensus_reads_raw` does.
+        let kept_names = |recs: &[RawRecord]| -> Vec<String> {
+            let infos: Vec<ClippedRecordInfo> = recs
+                .iter()
+                .enumerate()
+                .map(|(i, rec)| CodecConsensusCaller::build_clipped_info(rec.as_ref(), i, 0))
+                .collect();
+            CodecConsensusCaller::keep_indices_for_infos(recs, &infos, MAX_READS)
+                .into_iter()
+                .map(|i| {
+                    String::from_utf8(RawRecordView::new(recs[i].as_ref()).read_name().to_vec())
                         .expect("read names are ASCII")
                 })
-                .collect();
-            names.sort();
-            names
+                .collect()
         };
-        let mut expected_sorted = expected;
-        expected_sorted.sort();
 
-        assert_eq!(names_of(&ds_r1s), expected_sorted);
-        // Both ends must survive together: R1 and R2 share a read name and therefore a rank,
-        // so a cap retains or discards a template as a unit.
-        assert_eq!(names_of(&ds_r2s), expected_sorted, "R2 must keep the same templates as R1");
+        assert_eq!(
+            kept_names(&r1s),
+            vec!["q0", "q2", "q3"],
+            "a cap of 3 must keep the three lowest-ranking templates, in input order"
+        );
+        assert_eq!(
+            kept_names(&r2s),
+            vec!["q3", "q2", "q0"],
+            "the same three templates are kept from the reversed list — the cap ranks by read \
+             name, not by position, and preserves the order it was given"
+        );
     }
 
     /// The cap must rank each info by *its own* record, resolved through `raw_idx`.
@@ -6239,9 +6383,8 @@ mod tests {
         );
     }
 
-    /// [`select_lowest_ranking`] is the single selection primitive behind both the production
-    /// `consensus_reads_raw` cap and the `downsample_pairs` test wrapper, so these cases pin
-    /// the production rule directly.
+    /// [`select_lowest_ranking`] is the single selection primitive behind the production
+    /// `consensus_reads_raw` cap, so these cases pin the production rule directly.
     #[rstest]
     // Signed comparison: negative ranks sort below positive ones. Comparing as `u32` would
     // instead keep [2, 7], and `wrapping_abs` would keep [7] over [-9].
@@ -6467,9 +6610,23 @@ mod tests {
         );
     }
 
+    /// `clear_rejected_reads` empties a **populated** rejects buffer, and touches nothing else.
+    ///
+    /// The earlier version called it on a caller that had processed no records, so the buffer was
+    /// already empty and a body of `{}` passed (issue #771). The buffer is filled first here, by
+    /// rejecting a family the way `test_rejected_reads_tracking_enabled` does, so the call has
+    /// something to do.
+    ///
+    /// The statistics are asserted to survive because that is what separates this method from
+    /// [`CodecConsensusCaller::clear`], which empties the buffer *and* returns the stats to
+    /// `Default`. A `clear_rejected_reads` implemented as `self.clear()` would empty the buffer
+    /// and pass a test that only looked at the buffer.
     #[test]
     fn test_clear_rejected_reads() {
-        let options = CodecConsensusOptions::default();
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 2, // one pair cannot meet this, so the family is rejected
+            ..Default::default()
+        };
         let mut caller = CodecConsensusCaller::new_with_rejects_tracking(
             "codec".to_string(),
             "RG1".to_string(),
@@ -6480,9 +6637,41 @@ mod tests {
         // Initially empty
         assert!(caller.rejected_reads().is_empty());
 
-        // Clear (should be no-op on empty)
+        let reads = create_fr_pair(
+            "read1",
+            1,
+            11,
+            30,
+            35,
+            &[(Kind::Match, 30)],
+            &[(Kind::Match, 30)],
+            "UMI1",
+            None,
+            false,
+            true,
+        );
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
+        assert_eq!(output.count, 0, "the family must be rejected so the buffer is populated");
+        assert_eq!(
+            caller.rejected_reads().len(),
+            2,
+            "fixture guard: both records of the rejected pair must be retained, or the clear \
+             below would have nothing to clear"
+        );
+
         caller.clear_rejected_reads();
-        assert!(caller.rejected_reads().is_empty());
+        assert!(caller.rejected_reads().is_empty(), "the rejects buffer must be emptied");
+        assert_eq!(
+            caller.stats.total_input_reads, 2,
+            "clearing the rejects buffer must not reset the statistics -- that is `clear`"
+        );
+        assert_eq!(
+            caller.stats.rejection_reasons.get(&CallerRejectionReason::InsufficientReads),
+            Some(&2),
+            "the rejection tally must survive a rejects-buffer clear"
+        );
     }
 
     // ============================================================================
