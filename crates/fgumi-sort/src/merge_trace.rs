@@ -604,6 +604,46 @@ impl ConsumerTraceReport {
         self.in_flight_at_park[0]
     }
 
+    /// Parks where two or more workers were decompressing the awaited file.
+    ///
+    /// The complement of [`Self::idle_file_parks`] and
+    /// [`Self::single_worker_parks`], and the one that distinguishes the two
+    /// explanations for a starved consumer. If the pool is mostly *not* on the
+    /// awaited file, it is scheduling badly and can be steered. If it is on that
+    /// file several workers deep and the consumer still waits, the workers are
+    /// decompressing *different* serials while the merge needs the lowest one,
+    /// so the park is the head block's decompress latency and no amount of
+    /// additional concurrency on that file will shorten it.
+    #[must_use]
+    pub fn multi_worker_parks(self) -> u64 {
+        self.in_flight_at_park[2..].iter().sum()
+    }
+
+    /// Mean concurrent decompressions on the awaited file at a park.
+    ///
+    /// A *lower bound* once the pool saturates: the histogram clamps at
+    /// [`MAX_TRACKED_IN_FLIGHT`], so every deeper park is counted as exactly
+    /// that. Read it against the cap rather than as an absolute -- a mean at the
+    /// clamp means "at least this deep", not "exactly this deep".
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "park counts stay far below 2^52; depths are bounded by MAX_TRACKED_IN_FLIGHT"
+    )]
+    pub fn mean_in_flight(self) -> f64 {
+        let parks = self.parks();
+        if parks == 0 {
+            return 0.0;
+        }
+        let weighted: u64 = self
+            .in_flight_at_park
+            .iter()
+            .enumerate()
+            .map(|(depth, count)| depth as u64 * count)
+            .sum();
+        weighted as f64 / parks as f64
+    }
+
     /// Total parks counted in the in-flight histogram.
     #[must_use]
     pub fn parks(self) -> u64 {
@@ -805,6 +845,33 @@ mod tests {
         assert_eq!(report.idle_file_parks(), 1);
         assert_eq!(report.in_flight_at_park[MAX_TRACKED_IN_FLIGHT], 1);
         assert_eq!(report.park_by_state[AwaitedState::Decompressing as usize].count, 3);
+    }
+
+    #[test]
+    fn test_consumer_trace_reports_depth_beyond_one_worker() {
+        // `none` and `exactly one` cannot distinguish a pool running two deep
+        // from one running at the cap, yet that is the difference between
+        // "scheduling headroom remains" and "decompress latency is irreducible".
+        let stats = ConsumerTraceStats::default();
+        stats.record_park(AwaitedState::Decompressing, 10_000, 0);
+        stats.record_park(AwaitedState::Decompressing, 10_000, 1);
+        stats.record_park(AwaitedState::Decompressing, 10_000, 4);
+        stats.record_park(AwaitedState::Decompressing, 10_000, 4);
+        let report = stats.snapshot();
+
+        assert_eq!(report.multi_worker_parks(), 2, "two parks had 2+ workers");
+        assert!(
+            (report.mean_in_flight() - 2.25).abs() < 1e-9,
+            "mean of 0,1,4,4 is 2.25, got {}",
+            report.mean_in_flight()
+        );
+    }
+
+    #[test]
+    fn test_mean_in_flight_is_zero_without_parks() {
+        let report = ConsumerTraceStats::default().snapshot();
+        assert_eq!(report.parks(), 0);
+        assert!(report.mean_in_flight().abs() < f64::EPSILON, "no parks must not divide by zero");
     }
 
     #[test]

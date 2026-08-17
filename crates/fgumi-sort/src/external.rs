@@ -1718,6 +1718,14 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             // exactly the thing a sampled version would get wrong.
             let (raw_len, decomp_len, in_flight) = self.files[source_id].depths();
             let state = crate::merge_stalls::AwaitedState::classify(decomp_len, in_flight, raw_len);
+            // Tell the pool which file the merge is blocked on, so it reads
+            // ahead deeply there. The drain frontier is the same file only when
+            // sources drain in order; on a partially-correlated input the merge
+            // parks on a source that is not the lowest undrained one, and that
+            // source was reading at the shallow allowance.
+            self.shared
+                .phase2_awaited_source
+                .store(source_id, std::sync::atomic::Ordering::Relaxed);
             let park_start = Instant::now();
             std::thread::park();
             let parked_ns = crate::merge_trace::elapsed_nanos(park_start);
@@ -4287,12 +4295,13 @@ impl RawExternalSorter {
             );
             info!("    Spill disk read:   {read_s:.1}s ({:.0}%) [{read_n} batches]", pct(read_s));
             // Blocks-per-batch, split by allowance. A deep share near zero means
-            // the frontier gate is not firing, which reads identically to "the
-            // deeper read-ahead did not help" unless it is reported separately.
+            // the deep-read gate (drain frontier or awaited source) is not
+            // firing, which reads identically to "the deeper read-ahead did not
+            // help" unless it is reported separately.
             let (deep_b, deep_blk, shal_b, shal_blk) = pool.read_batch_split();
             let per = |blk: u64, b: u64| if b == 0 { 0.0 } else { blk as f64 / b as f64 };
             info!(
-                "      frontier {deep_b} batches / {deep_blk} blocks ({:.1} per batch), \
+                "      deep {deep_b} batches / {deep_blk} blocks ({:.1} per batch), \
                  other {shal_b} batches / {shal_blk} blocks ({:.1} per batch)",
                 per(deep_blk, deep_b),
                 per(shal_blk, shal_b)
@@ -4425,8 +4434,100 @@ impl RawExternalSorter {
     /// silent, these figures are the whole report, which is why they are not
     /// gated on it. See [`crate::merge_trace`].
     #[allow(clippy::cast_precision_loss)]
-    fn log_block_lifecycle(pool: &Arc<SortWorkerPool>) {
+    /// Log how deep the pool was on the file the consumer was blocked on.
+    ///
+    /// Separates the two explanations for a starved consumer, which the park
+    /// totals alone cannot: a pool that is barely on the awaited file is
+    /// scheduling badly and can be steered, while one running near its tracked
+    /// depth is paying the head block's decompress latency and cannot be helped
+    /// by putting more workers on that same file.
+    fn log_awaited_file_depth(
+        consumer: &crate::merge_trace::ConsumerTraceReport,
+        pool: &Arc<SortWorkerPool>,
+    ) {
         use crate::merge_stalls::AwaitedState;
+        use crate::merge_trace::MAX_TRACKED_IN_FLIGHT;
+
+        // A merge that never stalled still has source runs to report, so this
+        // block stands on its own park count rather than on the report being
+        // non-empty -- otherwise it prints a header with nothing under it and
+        // divides by zero to fill the line below.
+        let parks = consumer.parks();
+        if parks == 0 {
+            return;
+        }
+        debug!("  Park duration by what the awaited file was doing");
+        for state in AwaitedState::ALL {
+            let hist = consumer.park_by_state[state as usize];
+            if !hist.is_empty() {
+                debug!("    {:<14} {}", state.label(), hist.summary());
+            }
+        }
+
+        let parks_pct = |count: u64| {
+            #[allow(clippy::cast_precision_loss, reason = "park counts stay far below 2^52")]
+            let pct = 100.0 * count as f64 / parks as f64;
+            pct
+        };
+        let mean_depth = consumer.mean_in_flight();
+        info!(
+            "    Workers on the awaited file at a park: none {:.0}%, exactly one {:.0}%, \
+             two or more {:.0}% (mean {mean_depth:.1}, tracked to {MAX_TRACKED_IN_FLIGHT})",
+            parks_pct(consumer.idle_file_parks()),
+            parks_pct(consumer.single_worker_parks()),
+            parks_pct(consumer.multi_worker_parks()),
+        );
+
+        // Keyed on depth against the cap rather than on which bucket is
+        // largest. "Two or more" becomes the majority long before the pool is
+        // actually deep, so a bucket comparison would call a pool running two
+        // deep saturated and retire a question the data has not answered.
+        #[allow(clippy::cast_precision_loss, reason = "the cap is a small constant")]
+        let cap = MAX_TRACKED_IN_FLIGHT as f64;
+        // Which admission gate holds the depth where it is. Rendered next to
+        // the depth itself: "only 1.9 deep of 8" is the symptom, and without
+        // the gate that produced it the next step is a guess.
+        // What the byte target actually derived. Without this a sizing
+        // regression is invisible: the wall clock moves and nothing says which
+        // batch produced it.
+        let (mean_block_bytes, derived_cap, derived_batch) = pool.awaited_sizing();
+        if mean_block_bytes > 0 {
+            info!(
+                "    Hot-file refill sized from measured blocks: {mean_block_bytes} B/block \
+                 -> batch {derived_batch}, cap {derived_cap}"
+            );
+        }
+        let skips = pool.awaited_skip_counts();
+        let skip_total: u64 = skips.iter().sum();
+        if skip_total > 0 {
+            #[allow(clippy::cast_precision_loss, reason = "skip counts stay far below 2^52")]
+            let pct = |n: u64| 100.0 * n as f64 / skip_total as f64;
+            info!(
+                "    Why the pool passed over the awaited file: raw-lock {:.0}%, raw-empty \
+                 {:.0}%, decomp-lock {:.0}%, decomp-capped {:.0}% (of {skip_total})",
+                pct(skips[0]),
+                pct(skips[1]),
+                pct(skips[2]),
+                pct(skips[3]),
+            );
+        }
+        if mean_depth >= cap / 2.0 {
+            info!(
+                "      -> the pool is running near its tracked depth on the file the merge is \
+                 blocked on, so these parks are the head block's decompress latency; more \
+                 concurrency on that file cannot shorten them"
+            );
+        } else if consumer.multi_worker_parks() > 0 {
+            info!(
+                "      -> the pool is on the awaited file but only {mean_depth:.1} deep of \
+                 {MAX_TRACKED_IN_FLIGHT} tracked, so capacity is going unused on the file the \
+                 merge is blocked on -- supply to that file, not decompress latency, is the \
+                 first thing to check"
+            );
+        }
+    }
+
+    fn log_block_lifecycle(pool: &Arc<SortWorkerPool>) {
         use crate::merge_trace::EmptyCause;
 
         let life = pool.block_lifecycle_report();
@@ -4493,21 +4594,7 @@ impl RawExternalSorter {
             // park block has to stand on its own count rather than on the report
             // being non-empty -- otherwise it prints a header with nothing under
             // it and divides by zero to fill the line below.
-            let parks = consumer.parks();
-            if parks > 0 {
-                debug!("  Park duration by what the awaited file was doing");
-                for state in AwaitedState::ALL {
-                    let hist = consumer.park_by_state[state as usize];
-                    if !hist.is_empty() {
-                        debug!("    {:<14} {}", state.label(), hist.summary());
-                    }
-                }
-                info!(
-                    "    Workers on the awaited file at a park: none {:.0}%, exactly one {:.0}%",
-                    100.0 * consumer.idle_file_parks() as f64 / parks as f64,
-                    100.0 * consumer.single_worker_parks() as f64 / parks as f64
-                );
-            }
+            Self::log_awaited_file_depth(&consumer, pool);
             if !consumer.source_run_length.is_empty() {
                 info!(
                     "  Consecutive blocks per source: {}",
