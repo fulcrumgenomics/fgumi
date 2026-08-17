@@ -63,6 +63,16 @@ struct IndexState {
 }
 
 impl PooledBamWriter {
+    /// Seconds the producer spent blocked waiting for an output permit, and the
+    /// number of waits.
+    ///
+    /// On the k-way merge the producer is the merge consumer -- the one thread
+    /// that touches every record -- so this is output backpressure landing
+    /// directly on the critical path. Zero when the compressor keeps up.
+    pub fn write_backpressure(&self) -> (f64, u64) {
+        self.staging.as_ref().map_or((0.0, 0), StagingBuffer::write_backpressure)
+    }
+
     /// Create a new pooled BAM writer.
     ///
     /// Opens the output sink through `open_output_writer`, so `-` and

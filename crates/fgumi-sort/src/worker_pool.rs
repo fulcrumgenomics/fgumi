@@ -495,6 +495,16 @@ pub(crate) struct PermitPool {
     /// finally surfaced. This never produced wrong output or a hang; it just
     /// wasted work on the failure path.
     closed: AtomicBool,
+    /// Nanoseconds producers spent blocked waiting for a permit, and how many
+    /// waits that was.
+    ///
+    /// This is the *output* backpressure stall. On the merge it lands on the
+    /// consumer thread -- the one thread that touches every record -- so it is
+    /// directly on the critical path, and it was previously invisible: the
+    /// sampled sub-phase breakdown folded it into "enqueue write", which is
+    /// documented as a handoff that excludes compression.
+    blocked_nanos: AtomicU64,
+    blocked_waits: AtomicU64,
 }
 
 impl PermitPool {
@@ -504,7 +514,13 @@ impl PermitPool {
         for _ in 0..capacity {
             tx.try_send(()).expect("fresh channel has capacity for initial permits");
         }
-        Self { tx: std::sync::Mutex::new(Some(tx)), rx, closed: AtomicBool::new(false) }
+        Self {
+            tx: std::sync::Mutex::new(Some(tx)),
+            rx,
+            closed: AtomicBool::new(false),
+            blocked_nanos: AtomicU64::new(0),
+            blocked_waits: AtomicU64::new(0),
+        }
     }
 
     /// Acquire a permit, blocking until one is available.
@@ -522,13 +538,30 @@ impl PermitPool {
         if self.closed.load(Ordering::Acquire) {
             anyhow::bail!("permit pool closed: I/O writer thread exited");
         }
-        self.rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("permit pool closed: I/O writer thread exited"))?;
+        // Fast path first: a permit that is already available must not pay for
+        // two clock reads. Only a real wait is timed, which is the same shape as
+        // the merge consumer's park accounting -- and why this can run
+        // unconditionally on a billion-record merge.
+        if self.rx.try_recv().is_err() {
+            let waited = std::time::Instant::now();
+            let outcome = self.rx.recv();
+            let elapsed = u64::try_from(waited.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.blocked_nanos.fetch_add(elapsed, Ordering::Relaxed);
+            self.blocked_waits.fetch_add(1, Ordering::Relaxed);
+            outcome.map_err(|_| anyhow::anyhow!("permit pool closed: I/O writer thread exited"))?;
+        }
         if self.closed.load(Ordering::Acquire) {
             anyhow::bail!("permit pool closed: I/O writer thread exited");
         }
         Ok(())
+    }
+
+    /// Seconds spent blocked on a permit, and the number of waits.
+    pub(crate) fn blocked(&self) -> (f64, u64) {
+        let nanos = self.blocked_nanos.load(Ordering::Relaxed);
+        #[allow(clippy::cast_precision_loss, reason = "nanosecond totals stay far below 2^52")]
+        let secs = nanos as f64 / 1e9;
+        (secs, self.blocked_waits.load(Ordering::Relaxed))
     }
 
     /// Release a permit back to the pool after a block has been written to disk.
