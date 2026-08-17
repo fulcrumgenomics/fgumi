@@ -423,7 +423,8 @@ pub enum RejectionReason {
     InsufficientOverlap,
     /// Only one of R1/R2 consensus was generated (orphan)
     OrphanConsensus,
-    /// Overlap boundary lands in an indel between strands
+    /// The two strands disagree about an indel inside the region they both align, so their
+    /// query bases cannot be laid out on one axis (codec)
     IndelErrorBetweenStrands,
     /// Overlap clipping failed: the computed consensus length is shorter than a
     /// single-strand consensus, so the overlapping ends could not be clipped

@@ -815,8 +815,32 @@ impl CodecConsensusCaller {
         let pos_ref_len =
             bam_fields::reference_length_from_cigar(&longest_pos.clipped_cigar) as usize;
         let pos_end = pos_start + pos_ref_len.saturating_sub(1);
+        let neg_ref_len =
+            bam_fields::reference_length_from_cigar(&longest_neg.clipped_cigar) as usize;
+        let neg_end = neg_start + neg_ref_len.saturating_sub(1);
 
-        let (overlap_start, overlap_end) = (neg_start, pos_end);
+        // The duplex window is the *intersection* of the two alignments: the reference
+        // positions at which both strands actually have an aligned base, and so the only
+        // positions at which they can be said to agree or disagree.
+        //
+        // fgbio takes it to be `[negative.start, positive.end]`
+        // (`CodecConsensusCaller.scala:211-213`), which is the intersection only while the
+        // positive alignment opens first and closes first. CODEC breaks that: both strands
+        // cover the same insert end to end, so the aligner routinely takes as matching a
+        // terminal base that it soft-clipped on the other strand, leaving the two alignments
+        // *dovetailed* by a base or two. The window then reaches past one read or the other,
+        // and every consumer of it is answered about a position that read never aligned:
+        // `check_overlap_phase_raw` reads the out-of-range boundary as htsjdk's `0` and the
+        // family fails a check about indels with no indel anywhere in it, and
+        // `compute_consensus_length_raw` has no position to anchor on at all
+        // (fulcrumgenomics/fgumi#761). Clamping to the intersection is inert whenever the
+        // alignments do not dovetail, since `max`/`min` then select the same two boundaries.
+        //
+        // An empty intersection is not a special case: it can only arise when the two
+        // alignments do not overlap, where these are still the same two boundaries fgbio
+        // computes, and `min_duplex_length` (at least 1, enforced by the command) rejects it
+        // just below.
+        let (overlap_start, overlap_end) = (neg_start.max(pos_start), pos_end.min(neg_end));
         let duplex_length = overlap_end as i64 - overlap_start as i64 + 1;
 
         if duplex_length < self.options.min_duplex_length as i64 {
@@ -1144,43 +1168,23 @@ impl CodecConsensusCaller {
     ///
     /// # Out-of-range boundaries
     ///
-    /// The window is `[negative.start, positive.end]`, and in a family with more than one
-    /// template the longest R1 and the longest R2 come from *different* templates —
-    /// per-template overlap clipping says nothing about how two different templates line
-    /// up, so a boundary can fall outside one of the two reads.
-    ///
-    /// fgbio reads those boundaries with htsjdk's
+    /// fgbio reads the two boundaries with htsjdk's
     /// `SAMRecord.getReadPositionAtReferencePosition`, which returns `0` — a value, not
     /// "undefined" — for a reference position outside the alignment, and then does
-    /// arithmetic on that `0`. So the check is mirrored here by substituting `0` for an
-    /// out-of-range boundary rather than failing closed on it. Failing closed instead
-    /// banked those families under `IndelErrorBetweenStrands` where fgbio reports
-    /// `ClipOverlapFailed` — the near-mirrored reason rows of fulcrumgenomics/fgumi#749,
-    /// with the verdicts agreeing throughout.
+    /// arithmetic on that `0`. The predicate mirrors that by substituting `0` for an
+    /// out-of-range boundary rather than failing closed on it; failing closed instead
+    /// banked families under `IndelErrorBetweenStrands` where fgbio reports
+    /// `ClipOverlapFailed` (fulcrumgenomics/fgumi#749), with the verdicts agreeing
+    /// throughout.
     ///
-    /// # Why this is attribution only
-    ///
-    /// Write `p_s`/`p_e` for the positive read's query positions at the window start and
-    /// end and `n_s`/`n_e` for the negative read's, so the check is
-    /// `p_s - n_s == p_e - n_e` in either operand order. The window start is the negative
-    /// read's own start and the window end is the positive read's own end, so only `p_s`
-    /// (window start before the positive read begins) and `n_e` (window end after the
-    /// negative read ends) can be out of range, and read position is non-decreasing in
-    /// reference position, so `n_s <= n_e` and `p_s <= p_e`, with `n_s >= 1`.
-    ///
-    /// - `n_e` out of range ⟹ `n_e = 0`, and the check needs `p_e - p_s = -n_s <= -1`,
-    ///   contradicting `p_s <= p_e`. It still fails, so those families keep landing in
-    ///   `IndelErrorBetweenStrands` exactly as they did before — including when `p_s` is
-    ///   out of range too.
-    /// - `p_s` out of range alone ⟹ `p_s = 0`, and the check passes only when
-    ///   `n_e = p_e + n_s`. [`Self::compute_consensus_length_raw`] then yields
-    ///   `p_e + neg_len - n_e = neg_len - n_s <= neg_len - 1`, which is below the negative
-    ///   strand's single-strand consensus length (that consensus is at least as long as
-    ///   the read it was built from), so the family is rejected at the `ClipOverlapFailed`
-    ///   site — the reason fgbio gives it (`CodecConsensusCaller.scala:245-247`).
-    ///
-    /// So no family that newly passes here goes on to emit a consensus; only the bucket it
-    /// is counted under moves.
+    /// The caller no longer hands it a boundary that needs the substitution: the window is
+    /// clamped to the intersection of the two alignments, and an empty intersection is
+    /// rejected by `min_duplex_length` (at least 1) before this runs, so both boundaries lie
+    /// inside both reads — where every reference position resolves, deletions included,
+    /// since the lookups pass `return_last_base_if_deleted`. The substitution is kept
+    /// because this is a predicate over two arbitrary boundaries and has no business
+    /// panicking on one, and because it is what makes it fgbio's predicate rather than a
+    /// stricter one.
     fn check_overlap_phase_raw(
         r1: &ClippedRecordInfo,
         r2: &ClippedRecordInfo,
@@ -1302,12 +1306,18 @@ impl CodecConsensusCaller {
     ///
     /// Single-strand positions (where only one strand has data) preserve their
     /// original qualities from the single-strand consensus, matching fgbio's behavior.
+    ///
+    /// Returns the consensus together with the [`DuplexBaseTally`] it would
+    /// contribute to `CodecConsensusStats`. The deltas are returned rather than applied
+    /// here so the caller can fold them in only after the output record is emitted (see
+    /// `consensus_reads_raw`) — a molecule that computes a consensus but fails to write
+    /// it must not advance the emitted-base counters.
     #[expect(
         clippy::too_many_lines,
         reason = "per-position duplex consensus folds together base-call resolution, quality math, and disagreement bookkeeping; splitting would obscure the per-position state machine"
     )]
     fn build_duplex_consensus_from_padded(
-        &mut self,
+        &self,
         ss_a: &SingleStrandConsensus,
         ss_b: &SingleStrandConsensus,
     ) -> std::result::Result<(SingleStrandConsensus, DuplexBaseTally), CodecConsensusError> {
@@ -2987,6 +2997,64 @@ mod tests {
         );
     }
 
+    /// A molecule whose output record is rejected must not advance the duplex-base
+    /// statistics: those counters describe *emitted* bases, so a family that computes a
+    /// duplex consensus but then fails to write it (here because its input-derived read
+    /// name overflows BAM's length limit) must leave `consensus_duplex_bases_emitted` and
+    /// `duplex_disagreement_base_count` at zero. Regression for the pre-output increment,
+    /// where the counters advanced before `build_output_record_into` ran.
+    #[test]
+    fn test_rejected_over_long_read_name_leaves_duplex_stats_unchanged() {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        // The consensus read name is `<prefix>:<MI>`; an MI tag far longer than BAM's
+        // 254-byte read-name limit makes `try_build_record` reject the record, so
+        // `build_output_record_into` errors out *after* the duplex consensus (and its
+        // would-be statistics) have already been computed.
+        let over_long_mi = "A".repeat(300);
+        let reads = create_fr_pair(
+            "read1",
+            1,
+            11,
+            30,
+            35,
+            &[(Kind::Match, 30)],
+            &[(Kind::Match, 30)],
+            &over_long_mi,
+            Some("ACC-TGA"),
+            false,
+            true,
+        );
+
+        let result = caller.consensus_reads_from_sam_records(reads);
+        // Pin the *reason* for the error, not merely that one occurred: the regression is
+        // meaningful only if the duplex consensus was built and then failed at the record
+        // write. Asserting the read-name context guards against a future reorder that
+        // rejected the pair earlier (leaving the counters at zero for an unrelated reason).
+        // `ConsensusOutput` is not `Debug`, so destructure rather than `expect_err`.
+        let Err(err) = result else {
+            panic!("an over-long input-derived read name must abort the output write with an error")
+        };
+        assert!(
+            err.to_string().contains("could not write the consensus record for read"),
+            "error must come from the over-long consensus read name, got: {err}"
+        );
+
+        assert_eq!(
+            caller.stats.consensus_duplex_bases_emitted, 0,
+            "no record was emitted, so no duplex bases should be counted as emitted"
+        );
+        assert_eq!(
+            caller.stats.duplex_disagreement_base_count, 0,
+            "no record was emitted, so no duplex disagreement bases should be counted"
+        );
+    }
+
     /// Port of fgbio test: "not emit a consensus when the read pair has one mate unmapped"
     #[test]
     fn test_not_emit_consensus_unmapped_mate() {
@@ -3598,8 +3666,7 @@ mod tests {
     }
 
     /// Builds a two-template CODEC family whose longest R1 and longest R2 come from
-    /// *different* templates, so the overlap window opens one base before the longest
-    /// R1's alignment start.
+    /// *different* templates, so the longest R2 opens one base before the longest R1.
     ///
     /// - Template `tA`: R1 `200 50M` (200-249, positive), R2 `200 50M` (200-249, negative).
     /// - Template `tB`: R1 `199 40M` (199-238, positive), R2 `199 102M` (199-300, negative).
@@ -3608,9 +3675,8 @@ mod tests {
     /// at or before its mate's un-soft-clipped end, and the negative read starts at its
     /// mate's un-soft-clipped start — so the alignments above are exactly what the
     /// caller sees. The longest R1 is `tA`'s (50 reference bases beats 40) and the
-    /// longest R2 is `tB`'s (102 beats 50), so the overlap window is
-    /// `[longest_r2.start, longest_r1.end]` = `[199, 249]` and its start falls one base
-    /// outside the longest R1.
+    /// longest R2 is `tB`'s (102 beats 50), so the two meet over `[200, 249]`, the whole
+    /// of the longest R1.
     ///
     /// This is the everyday multi-template arrangement, not a contrivance: any family
     /// with more than one template can pick its longest R1 and longest R2 from
@@ -3646,20 +3712,18 @@ mod tests {
         records
     }
 
-    /// A family whose overlap window opens outside the longest R1 must be attributed
-    /// the way fgbio attributes it — `ClipOverlapFailed`, not `IndelErrorBetweenStrands`.
+    /// A family whose two strands are in register but cannot be laid out on one axis must
+    /// be attributed the way fgbio attributes it — `ClipOverlapFailed`, not
+    /// `IndelErrorBetweenStrands`.
     ///
-    /// fgbio reads the overlap boundaries with htsjdk's
-    /// `SAMRecord.getReadPositionAtReferencePosition`, which yields `0` — a value, not
-    /// "undefined" — for a reference position outside the alignment, and then does
-    /// arithmetic on that `0` (`CodecConsensusCaller.scala:221-231`). For
-    /// [`cross_template_overlap_fixture`] the two boundary differences come out equal
-    /// (`0 - 1 == 50 - 51`), so fgbio's phase check *passes* and the family is carried
-    /// to the consensus-length branch, where the consensus (101) is shorter than the
-    /// R2 single-strand consensus (102) and fgbio rejects it as `ClipOverlapFailed`
-    /// (`CodecConsensusCaller.scala:245-247`). fgumi used to fail the phase check closed
-    /// on the out-of-range boundary and bank the family under `IndelErrorBetweenStrands`
-    /// instead — the mirrored reason rows in fulcrumgenomics/fgumi#749.
+    /// Over `[200, 249]` the two boundary differences of
+    /// [`cross_template_overlap_fixture`] come out equal (`1 - 2 == 50 - 51`), so the
+    /// phase check passes and the family is carried to the consensus-length branch, where
+    /// the consensus (101) is shorter than the R2 single-strand consensus (102) and fgbio
+    /// rejects it as `ClipOverlapFailed` (`CodecConsensusCaller.scala:245-247`). fgumi
+    /// used to fail the phase check closed on a boundary outside the longest R1 and bank
+    /// the family under `IndelErrorBetweenStrands` instead — the mirrored reason rows in
+    /// fulcrumgenomics/fgumi#749.
     ///
     /// The verdict is identical either way, and the rest of this test pins that: the
     /// family is rejected exactly once, emits no consensus, and contributes all of its
@@ -3793,6 +3857,201 @@ mod tests {
         );
     }
 
+    /// Builds a one-template CODEC family with the given forward/reverse geometry.
+    ///
+    /// Both reads are cut from the same shared reference bases, so the alignment geometry is
+    /// the only variable between them.
+    ///
+    /// The tests below assert consensus *lengths* rather than consensus *bases*, because
+    /// [`create_fr_pair`] stores the reverse read's `SEQ` in read orientation where a BAM
+    /// stores it in reference orientation — so its two strands point opposite ways and the
+    /// consensus comes out mostly `N` for every family the fixture builds, not just these.
+    /// Tracked as fulcrumgenomics/fgumi#763; the length is what this fix is about, and it is
+    /// unaffected.
+    fn codec_template(
+        pos_start: usize,
+        pos_cigar: &[(Kind, usize)],
+        neg_start: usize,
+        neg_cigar: &[(Kind, usize)],
+    ) -> Vec<RawRecord> {
+        create_fr_pair(
+            "t0",
+            pos_start,
+            neg_start,
+            0, // read length: unused by the builder, which sizes each read from its CIGAR
+            35,
+            pos_cigar,
+            neg_cigar,
+            "mi",
+            Some("ACC-TGA"),
+            false, // forward read is R1
+            true,  // reverse read is R2
+        )
+    }
+
+    /// Runs a family through a caller whose thresholds accept a single template, returning the
+    /// caller (for its statistics) alongside the output.
+    fn call_codec_family(records: Vec<RawRecord>) -> (CodecConsensusCaller, ConsensusOutput) {
+        call_codec_family_with_min_duplex_length(records, 1)
+    }
+
+    /// As [`call_codec_family`], with the duplex-overlap threshold under test.
+    fn call_codec_family_with_min_duplex_length(
+        records: Vec<RawRecord>,
+        min_duplex_length: usize,
+    ) -> (CodecConsensusCaller, ConsensusOutput) {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+        let output = caller
+            .consensus_reads_from_sam_records(records)
+            .expect("a rejected family is not an error");
+        (caller, output)
+    }
+
+    /// The dovetailed geometry of
+    /// [`test_dovetailed_starts_without_an_indel_call_a_consensus`]: forward `2S126M` at 201
+    /// (reference span 201-326) against reverse `3S127M` at 200 (200-326).
+    fn dovetailed_start_template() -> Vec<RawRecord> {
+        codec_template(
+            201,
+            &[(Kind::SoftClip, 2), (Kind::Match, 126)],
+            200,
+            &[(Kind::SoftClip, 3), (Kind::Match, 127)],
+        )
+    }
+
+    /// Two strands that dovetail, with no indel anywhere, must consense.
+    ///
+    /// - forward: `2S126M` at 201 (reference span 201-326)
+    /// - reverse: `3S127M` at 200 (reference span 200-326)
+    ///
+    /// The reverse read aligns one base further left than the forward read — the aligner took
+    /// as matching a base the forward read soft-clipped — and that is the whole of the
+    /// difference between them. Both CIGARs are pure matches, so no reading of the input makes
+    /// the two strands disagree about an indel, and the family must not be counted as though
+    /// they did (fulcrumgenomics/fgumi#761).
+    #[test]
+    fn test_dovetailed_starts_without_an_indel_call_a_consensus() {
+        let (caller, output) = call_codec_family(dovetailed_start_template());
+
+        let stats = caller.statistics();
+        assert_eq!(output.count, 1, "an indel-free family must produce a consensus");
+        assert_eq!(
+            stats.rejection_reasons.values().sum::<usize>(),
+            0,
+            "neither CIGAR contains an indel, so nothing may be rejected"
+        );
+        let consensus = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(consensus.len(), 1, "exactly one consensus fragment");
+        assert_eq!(
+            consensus[0].bases.len(),
+            128,
+            "the reverse read gives up two bases to the overlap clip, leaving both strands 128"
+        );
+    }
+
+    /// The duplex overlap is measured over the region both strands align, so a threshold
+    /// above that region's length rejects the family for insufficient overlap.
+    ///
+    /// [`dovetailed_start_template`]'s strands align together over `[201, 326]`, 126
+    /// reference positions, while their alignments *span* `[200, 326]`, 127. A threshold of
+    /// 126 must pass and 127 must fail; before fulcrumgenomics/fgumi#761 the span was what
+    /// `--min-duplex-length` was compared against, so 127 passed the check on 126 shared
+    /// positions.
+    #[test]
+    fn test_min_duplex_length_is_measured_over_the_shared_region() {
+        let (_, passing) =
+            call_codec_family_with_min_duplex_length(dovetailed_start_template(), 126);
+        assert_eq!(passing.count, 1, "126 shared positions must satisfy a threshold of 126");
+
+        let records = dovetailed_start_template();
+        let record_count = records.len();
+        let (caller, output) = call_codec_family_with_min_duplex_length(records, 127);
+
+        let stats = caller.statistics();
+        assert_eq!(
+            stats.rejection_reasons.get(&CallerRejectionReason::InsufficientOverlap),
+            Some(&record_count),
+            "126 shared positions must not satisfy a threshold of 127"
+        );
+        assert_rejected_whole_family(&caller, &output, record_count);
+    }
+
+    /// A deletion outside the region the two strands share must not reject the family.
+    ///
+    /// - forward: `2S124M1D3M` at 201 (reference span 201-328, the deletion at 325)
+    /// - reverse: `3S124M2S`   at 200 (reference span 200-323)
+    ///
+    /// This is the fulcrumgenomics/fgumi#761 shape, and it dovetails at *both* ends: the
+    /// reverse read's alignment opens one base to the left of the forward read's, and the
+    /// forward read's runs past the reverse read's close. The deletion sits at 325, two bases
+    /// beyond where the reverse read stops aligning, so the two strands are in register over
+    /// every reference position they both cover — the deletion is not evidence that they
+    /// disagree.
+    ///
+    /// The consensus is 127 bases: overlap clipping gives each read up two bases (#752), and
+    /// the clip leaves both strands the same number of query bases past the last reference
+    /// position they share, so the two single-strand consensuses line up index for index with
+    /// no padding.
+    #[test]
+    fn test_terminal_indel_outside_the_shared_region_calls_a_consensus() {
+        let (caller, output) = call_codec_family(codec_template(
+            201,
+            &[(Kind::SoftClip, 2), (Kind::Match, 124), (Kind::Deletion, 1), (Kind::Match, 3)],
+            200,
+            &[(Kind::SoftClip, 3), (Kind::Match, 124), (Kind::SoftClip, 2)],
+        ));
+
+        let stats = caller.statistics();
+        assert_eq!(output.count, 1, "the family must produce a consensus");
+        assert_eq!(
+            stats.rejection_reasons.values().sum::<usize>(),
+            0,
+            "the deletion lies outside the shared region, so nothing may be rejected"
+        );
+        let consensus = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(consensus.len(), 1, "exactly one consensus fragment");
+        assert_eq!(
+            consensus[0].bases.len(),
+            127,
+            "both strands keep 127 bases after the overlap clip, so the consensus is 127 long"
+        );
+    }
+
+    /// The control the fix must not weaken: a deletion *inside* the shared region still
+    /// rejects the family, because there the two strands really are out of register.
+    ///
+    /// - forward: `2S60M1D67M` at 201 (reference span 201-328, the deletion at 261)
+    /// - reverse: `3S124M2S`   at 200 (reference span 200-323)
+    ///
+    /// The geometry is otherwise the sibling of
+    /// [`test_terminal_indel_outside_the_shared_region_calls_a_consensus`]; only the
+    /// deletion's position moves, from past the reverse read's aligned end to the middle of
+    /// the region both strands cover.
+    #[test]
+    fn test_indel_inside_the_shared_region_is_still_rejected() {
+        let records = codec_template(
+            201,
+            &[(Kind::SoftClip, 2), (Kind::Match, 60), (Kind::Deletion, 1), (Kind::Match, 67)],
+            200,
+            &[(Kind::SoftClip, 3), (Kind::Match, 124), (Kind::SoftClip, 2)],
+        );
+        let record_count = records.len();
+        let (caller, output) = call_codec_family(records);
+
+        let stats = caller.statistics();
+        assert_eq!(
+            stats.rejection_reasons.get(&CallerRejectionReason::IndelErrorBetweenStrands),
+            Some(&record_count),
+            "a deletion inside the shared region is a genuine disagreement between the strands"
+        );
+        assert_rejected_whole_family(&caller, &output, record_count);
+    }
+
     /// Asserts the invariant this reordering must preserve: the family was rejected, no
     /// consensus came out of it, and every one of its records is accounted for — once —
     /// in the filtered total and across the rejection reasons.
@@ -3821,16 +4080,16 @@ mod tests {
         );
     }
 
-    /// Builds a two-template CODEC family whose overlap window *ends* after the longest
-    /// R2 — the mirror of [`cross_template_overlap_fixture`], and the case the phase
-    /// check must keep failing.
+    /// Builds a two-template CODEC family whose longest R1 closes long after its longest
+    /// R2 — the mirror of [`cross_template_overlap_fixture`].
     ///
     /// - Template `tA`: R1 `100 100M` (100-199, positive), R2 `160 40M` (160-199, negative).
     /// - Template `tB`: R1 `120 30M` (120-149, positive), R2 `120 50M` (120-169, negative).
     ///
     /// As with the sibling fixture, no template is overlap-clipped. The longest R1 is
-    /// `tA`'s (100 reference bases) and the longest R2 is `tB`'s (50 beats 40), so the
-    /// window is `[120, 199]` and its end falls 30 bases past where the longest R2 stops.
+    /// `tA`'s (100 reference bases) and the longest R2 is `tB`'s (50 beats 40), so the two
+    /// alignments meet only over `[120, 169]` and the longest R1 runs 30 bases past the
+    /// longest R2's close. Not one of the four CIGARs carries an indel.
     fn window_end_past_r2_fixture() -> Vec<RawRecord> {
         let mut records = create_fr_pair(
             "tA",
@@ -3861,42 +4120,37 @@ mod tests {
         records
     }
 
-    /// The sentinel substitution must not turn *every* out-of-range boundary into a pass:
-    /// a window that ends past the longest R2 stays `IndelErrorBetweenStrands`, which is
-    /// where fgbio puts it too.
+    /// A family the geometry cannot lay out on one axis is rejected — but not as an indel
+    /// error, because it has no indel.
     ///
-    /// This is the second half of the argument in `check_overlap_phase_raw`'s doc comment.
-    /// With the window end outside the negative read its query position reads as `0`, and
-    /// the check would need the positive read's query position to *decrease* from the
-    /// window start to the window end — unsatisfiable, since read position is
-    /// non-decreasing in reference position. Without this test the fix could be loosened
-    /// into passing that case as well, and those families would then reach
-    /// `compute_consensus_length_raw` and change verdict rather than bucket.
+    /// The two alignments meet over `[120, 169]` and are in register throughout it, so the
+    /// phase check passes. What defeats this family is the layout: the consensus can only
+    /// run from the longest R1's start to the longest R2's end, 70 bases, which is shorter
+    /// than the 100-base R1 single-strand consensus it would have to contain. That is
+    /// `ClipOverlapFailed`, the reason fgbio gives when the consensus comes out shorter
+    /// than a single strand (`CodecConsensusCaller.scala:245-247`).
+    ///
+    /// Before fulcrumgenomics/fgumi#761 the window ran to the longest R1's end, 30 bases
+    /// past where the longest R2 stops aligning; the longest R2's query position there read
+    /// as htsjdk's out-of-range `0`, the phase check failed, and this indel-free family was
+    /// counted under `IndelErrorBetweenStrands`. The verdict is the same either way — the
+    /// family is rejected and emits nothing, which [`assert_rejected_whole_family`] pins —
+    /// so only the bucket moves, onto the reason that is true of it.
     #[test]
-    fn test_window_end_past_r2_stays_indel_error() {
-        let options = CodecConsensusOptions {
-            min_reads_per_strand: 1,
-            min_duplex_length: 1,
-            ..Default::default()
-        };
-        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
-
+    fn test_r1_running_past_r2_is_not_an_indel_error() {
         let fixture = window_end_past_r2_fixture();
         let record_count = fixture.len();
-
-        let output = caller
-            .consensus_reads_from_sam_records(fixture)
-            .expect("the family is rejected, which is not an error");
+        let (caller, output) = call_codec_family(fixture);
 
         let stats = caller.statistics();
         assert_eq!(
-            stats.rejection_reasons.get(&CallerRejectionReason::IndelErrorBetweenStrands),
+            stats.rejection_reasons.get(&CallerRejectionReason::ClipOverlapFailed),
             Some(&record_count),
-            "a window ending past the longest R2 must still fail the phase check"
+            "the consensus is shorter than a single strand, which is ClipOverlapFailed"
         );
         assert!(
-            !stats.rejection_reasons.contains_key(&CallerRejectionReason::ClipOverlapFailed),
-            "the sentinel must not turn this case into a phase pass"
+            !stats.rejection_reasons.contains_key(&CallerRejectionReason::IndelErrorBetweenStrands),
+            "no CIGAR in this family has an indel, so none of it may be counted as one"
         );
 
         assert_rejected_whole_family(&caller, &output, record_count);
@@ -3907,6 +4161,11 @@ mod tests {
     /// is outside `r1`: htsjdk returns `0` there, and `0 - 1 == 50 - 51` puts the two
     /// reads in phase. Failing closed on the out-of-range boundary instead would send
     /// the family to `IndelErrorBetweenStrands` (fulcrumgenomics/fgumi#749).
+    ///
+    /// The boundaries are passed to the predicate directly, since the caller clamps its
+    /// window to the two alignments and so no longer produces one
+    /// (fulcrumgenomics/fgumi#761). This pins the predicate as fgbio's rather than a
+    /// stricter one, for any boundary it is handed.
     #[test]
     fn test_check_overlap_phase_out_of_range_start_uses_fgbio_sentinel() {
         let options = CodecConsensusOptions::default();
@@ -4326,7 +4585,7 @@ mod tests {
     #[test]
     fn test_nocall_masking_uppercase_n() {
         let options = CodecConsensusOptions::default();
-        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
         // Create two single-strand consensuses:
         // Position 0: Both have valid bases (A, A) - should agree
@@ -4396,7 +4655,7 @@ mod tests {
     #[test]
     fn test_duplex_per_base_depth_caps_each_strand_before_summing() {
         let options = CodecConsensusOptions::default();
-        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
         // Both strands agree on both bases (drives the `da + db` agreement branch),
         // with per-base depths at/above the `Short` ceiling.
@@ -4438,7 +4697,7 @@ mod tests {
     #[test]
     fn test_duplex_per_base_error_caps_before_summing() {
         let options = CodecConsensusOptions::default();
-        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
         // Both strands agree on both bases (drives the `ea + eb` agreement branch), each
         // carrying a per-base error above the `Short` ceiling (a contract-level input; the
