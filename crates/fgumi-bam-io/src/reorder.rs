@@ -78,8 +78,8 @@ impl<T> ReorderBuffer<T> {
     ///
     /// # Panics
     ///
-    /// Panics in debug mode if an item with the same sequence number is already buffered,
-    /// or if the sequence number is before the current base.
+    /// Panics if an item with the same sequence number is already buffered, or
+    /// if the sequence number is before the current base.
     pub fn insert(&mut self, seq: u64, item: T) {
         self.insert_with_size(seq, item, 0);
     }
@@ -97,15 +97,20 @@ impl<T> ReorderBuffer<T> {
     ///
     /// # Panics
     ///
-    /// Panics in debug mode if an item with the same sequence number is already buffered,
-    /// or if the sequence number is before the current base.
+    /// Panics if an item with the same sequence number is already buffered, or
+    /// if the sequence number is before the current base.
+    ///
+    /// Both checks are unconditional, not `debug_assert!`s. Serial accounting
+    /// here is data-integrity-critical, and in a release build the compiled-out
+    /// assertions left two silent failures: a duplicate serial overwrote the
+    /// buffered item — dropping a whole batch of records while `count` and
+    /// `heap_bytes` counted it twice — and a serial below the base underflowed
+    /// `seq - next_seq`, so the extend loop below tried to grow the buffer to
+    /// an unreachable index. Neither is recoverable in place, so this fails
+    /// loudly; the pipeline's `catch_unwind` turns it into a reported error.
     #[allow(clippy::cast_possible_truncation)]
     pub fn insert_with_size(&mut self, seq: u64, item: T, heap_size: usize) {
-        debug_assert!(
-            seq >= self.next_seq,
-            "Sequence number {seq} is before base {}",
-            self.next_seq
-        );
+        assert!(seq >= self.next_seq, "Sequence number {seq} is before base {}", self.next_seq);
 
         let index = (seq - self.next_seq) as usize;
 
@@ -114,7 +119,7 @@ impl<T> ReorderBuffer<T> {
             self.buffer.push_back(None);
         }
 
-        debug_assert!(self.buffer[index].is_none(), "Duplicate sequence number: {seq}");
+        assert!(self.buffer[index].is_none(), "Duplicate sequence number: {seq}");
         self.buffer[index] = Some((item, heap_size));
         self.count += 1;
         self.heap_bytes += heap_size as u64;
@@ -534,5 +539,33 @@ mod tests {
 
         // With limit 2000, we're under limit, should accept
         assert!(buffer.would_accept(1, 2000));
+    }
+
+    /// A duplicate serial must abort, not overwrite the buffered item.
+    ///
+    /// Under the old `debug_assert!` a release build silently replaced the
+    /// item — losing a whole batch of records — while `count` and `heap_bytes`
+    /// counted it twice, so the accounting the pipeline's backpressure reads
+    /// drifted at the same time.
+    #[test]
+    #[should_panic(expected = "Duplicate sequence number: 1")]
+    fn test_duplicate_serial_panics_instead_of_overwriting() {
+        let mut buffer: ReorderBuffer<i32> = ReorderBuffer::new();
+        buffer.insert(1, 100);
+        buffer.insert(1, 200);
+    }
+
+    /// A serial below the base must abort, not underflow the index.
+    ///
+    /// `(seq - self.next_seq)` is `u64` arithmetic, so in a release build a
+    /// stale serial wrapped to an astronomically large index and the extend
+    /// loop tried to grow the buffer to reach it.
+    #[test]
+    #[should_panic(expected = "is before base")]
+    fn test_serial_before_base_panics_instead_of_underflowing() {
+        let mut buffer: ReorderBuffer<i32> = ReorderBuffer::new();
+        buffer.insert(0, 100);
+        assert_eq!(buffer.try_pop_next(), Some(100), "base advances to 1");
+        buffer.insert(0, 200);
     }
 }

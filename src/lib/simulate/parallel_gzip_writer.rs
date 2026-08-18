@@ -168,6 +168,16 @@ impl ParallelGzipWriter {
     }
 
     /// The I/O writer thread main loop.
+    ///
+    /// Writes compressed blocks in strict serial order, buffering any that
+    /// arrive early.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a write fails, if a worker reported a compression
+    /// failure, or if a block is missing from the serial sequence once the
+    /// channel closes — writing around a gap would produce a valid gzip stream
+    /// with a hole in it.
     #[allow(clippy::needless_pass_by_value)]
     fn io_writer_loop<W: Write>(
         mut writer: W,
@@ -196,8 +206,18 @@ impl ParallelGzipWriter {
             }
         }
 
-        // Write any remaining pending blocks
-        for (_, block) in pending {
+        // Drain the remaining buffered blocks — any gap means a block was never
+        // produced, and writing around it yields a *valid* gzip file missing that
+        // block's payload: readable, complete-looking, and short. Mirrors the
+        // check in `fgumi-sort`'s `io_writer_loop`.
+        while let Some((&serial, _)) = pending.first_key_value() {
+            if serial != next_expected {
+                return Err(io::Error::other(format!(
+                    "missing compressed block {next_expected}: next available is {serial}; \
+                     the output would be silently truncated"
+                )));
+            }
+            let block = pending.remove(&serial).expect("key just checked");
             match block {
                 CompressedBlock::Ok { data, .. } => writer.write_all(&data)?,
                 CompressedBlock::Err { serial, error } => {
@@ -206,6 +226,7 @@ impl ParallelGzipWriter {
                     )));
                 }
             }
+            next_expected += 1;
         }
 
         writer.flush()?;
@@ -336,6 +357,104 @@ mod tests {
     use std::fs::File;
     use std::io::Read;
     use tempfile::NamedTempFile;
+
+    /// A sink that keeps every byte written to it, so a test can decode the
+    /// stream the I/O loop actually produced.
+    #[derive(Clone)]
+    struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedSink {
+        fn new() -> Self {
+            Self(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+
+        /// The bytes written so far, decompressed as a (possibly concatenated)
+        /// gzip stream. An empty sink decodes to nothing — `MultiGzDecoder`
+        /// rejects zero bytes as a truncated header, which is not what a sink
+        /// that was never written to means.
+        fn decoded(&self) -> Vec<u8> {
+            let raw = self.0.lock().expect("sink mutex").clone();
+            if raw.is_empty() {
+                return Vec::new();
+            }
+            let mut decoded = Vec::new();
+            MultiGzDecoder::new(raw.as_slice())
+                .read_to_end(&mut decoded)
+                .expect("the sink must hold a decodable gzip stream");
+            decoded
+        }
+    }
+
+    impl Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("sink mutex").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Compress `payload` as block `serial`, ready to hand to the I/O loop.
+    fn compressed_block(serial: u64, payload: &[u8]) -> CompressedBlock {
+        let mut compressor = Compressor::new(CompressionLvl::default());
+        compress_block(UncompressedBlock { serial, data: payload.to_vec() }, &mut compressor)
+            .expect("compression of a small payload")
+    }
+
+    /// A gap in the serial sequence must fail, not be written around.
+    ///
+    /// The leftover drain used to emit whatever was still buffered in serial
+    /// order without checking for a gap, so a block that never arrived produced
+    /// a *valid* gzip file missing that block's payload — readable,
+    /// complete-looking, and short. `fgumi-sort`'s `io_writer_loop` already
+    /// rejects exactly this. The assertion is on the emitted bytes, not just on
+    /// the error: a file with a hole in it is the failure being pinned.
+    #[test]
+    fn test_io_writer_loop_rejects_a_gap_in_the_serial_sequence() {
+        let (tx, rx) = bounded::<CompressedBlock>(4);
+        // Serial 0 is never produced — it is the hole.
+        tx.send(compressed_block(1, b"BBBB")).expect("send block 1");
+        tx.send(compressed_block(2, b"CCCC")).expect("send block 2");
+        drop(tx);
+
+        let sink = SharedSink::new();
+        let err = ParallelGzipWriter::io_writer_loop(sink.clone(), rx)
+            .expect_err("a missing block must fail the write, not be skipped over");
+
+        assert!(
+            err.to_string().contains("missing compressed block 0"),
+            "the error must name the block that never arrived, got: {err}"
+        );
+        assert!(
+            sink.decoded().is_empty(),
+            "blocks past the gap were written anyway, leaving a valid gzip stream with a hole: {:?}",
+            String::from_utf8_lossy(&sink.decoded())
+        );
+    }
+
+    /// Blocks that merely arrive out of order still have to be drained in full.
+    ///
+    /// The gap check must not reject a run whose leftover blocks are contiguous
+    /// from `next_expected` — that is the ordinary case the drain exists for.
+    #[test]
+    fn test_io_writer_loop_drains_out_of_order_blocks() {
+        let (tx, rx) = bounded::<CompressedBlock>(4);
+        tx.send(compressed_block(2, b"CCCC")).expect("send block 2");
+        tx.send(compressed_block(0, b"AAAA")).expect("send block 0");
+        tx.send(compressed_block(1, b"BBBB")).expect("send block 1");
+        drop(tx);
+
+        let sink = SharedSink::new();
+        ParallelGzipWriter::io_writer_loop(sink.clone(), rx).expect("a complete run must succeed");
+
+        assert_eq!(
+            sink.decoded(),
+            b"AAAABBBBCCCC",
+            "every block must be written exactly once, in serial order"
+        );
+    }
 
     /// A sink that fails every write, to drive the I/O thread's error path.
     struct FailingSink;

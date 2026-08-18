@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **Breaking:** end-of-stream flush paths now fail instead of discarding what they were holding,
+  so an input that used to produce a short output and exit 0 now exits non-zero. A BAM whose last
+  record is truncated is the case a user can hit: the boundary finder dropped a 1-3 byte record
+  fragment at EOF (though its own documentation promised an error), and in `--threads` mode
+  nothing checked its leftover bytes at all. The other four paths report an internal invariant
+  that a correct run never reaches: `simulate`'s parallel gzip writer emitted whatever blocks
+  were left without checking the serial sequence, so a block that never arrived produced a valid
+  gzip file with a hole in it; `RecordPositionGrouper::finish` guarded its flush with a
+  `debug_assert!`, so release builds dropped the buffered records while `has_pending()` went on
+  reporting them; the BAM pipeline's completion validation checked none of the three internal
+  buffers it is documented to cover (the grouper's partial group, groups never pushed to Q4, and
+  the boundary finder's leftover bytes); and `simulate`'s record sink lost its last partial batch
+  if it was dropped without `finish()`. Each now reports what was left unflushed
+  ([#782](https://github.com/fulcrumgenomics/fgumi/issues/782)).
+
+- The pipeline's reorder buffer now rejects a duplicate serial, and a serial below its base, in
+  every build rather than only in debug. Both were `debug_assert!`s, so a release build silently
+  overwrote the buffered batch in the first case — losing its records while double-counting them
+  in the memory accounting — and underflowed the `u64` index computation in the second
+  ([#782](https://github.com/fulcrumgenomics/fgumi/issues/782)).
+
 ## [0.6.0] - 2026-08-14
 
 ### Bug Fixes

@@ -2186,6 +2186,12 @@ pub trait PipelineLifecycle {
     /// 2. All batch counters match (no batches lost between stages)
     /// 3. Internal buffers are empty (grouper state, boundary leftovers)
     ///
+    /// An implementation can only check the buffers its state owns. Buffers held
+    /// by a stage behind its own lock — the BAM pipeline's grouper and its
+    /// pending groups — are folded into the same result by
+    /// [`finalize_pipeline_with_buffers`], which the run function calls in place
+    /// of [`finalize_pipeline`].
+    ///
     /// Note: Heap byte tracking is reported in `PipelineValidationError::leaked_heap_bytes`
     /// but is currently advisory only (implementations set it to 0) because estimation
     /// can be imprecise. Only queue emptiness and counter checks cause validation failure.
@@ -2365,13 +2371,36 @@ pub fn join_monitor_thread(handle: Option<thread::JoinHandle<()>>) {
 ///
 /// Returns an I/O error if an error occurred during processing or output flush fails.
 pub fn finalize_pipeline<S: PipelineLifecycle>(state: &S) -> io::Result<u64> {
+    finalize_pipeline_with_buffers(state, Vec::new)
+}
+
+/// Finalize a pipeline, folding in buffers the state itself cannot see.
+///
+/// Same as [`finalize_pipeline`], except that `unflushed_buffers` names any
+/// stage-local buffer that still holds data — the BAM pipeline's Group step
+/// keeps its grouper and its pending groups behind their own mutex, so
+/// `validate_completion` has no way to reach them on its own. The closure runs
+/// only after the error check, so a real failure is still reported ahead of the
+/// buffers it stranded.
+///
+/// # Errors
+///
+/// Returns an I/O error if an error occurred during processing, if completion
+/// validation fails (including on any named buffer), or if the output flush
+/// fails.
+pub fn finalize_pipeline_with_buffers<S, F>(state: &S, unflushed_buffers: F) -> io::Result<u64>
+where
+    S: PipelineLifecycle,
+    F: FnOnce() -> Vec<String>,
+{
     // Check for errors
     if let Some(error) = state.take_error() {
         return Err(error);
     }
 
     // Validate pipeline completion to detect data loss
-    state.validate_completion().map_err(io::Error::other)?;
+    merge_unflushed_buffers(state.validate_completion(), unflushed_buffers())
+        .map_err(io::Error::other)?;
 
     // Flush output
     state.flush_output()?;
@@ -2382,6 +2411,33 @@ pub fn finalize_pipeline<S: PipelineLifecycle>(state: &S) -> io::Result<u64> {
     }
 
     Ok(state.items_written())
+}
+
+/// Fold externally-reported buffers into a completion validation result.
+///
+/// Buffers named here are reported exactly like a non-empty queue, so a caller
+/// sees one error listing everything that still held data rather than learning
+/// about the queues and the stage buffers separately.
+///
+/// # Errors
+///
+/// Returns `result`'s own error when `unflushed_buffers` is empty, and
+/// otherwise a `PipelineValidationError` naming those buffers — extending
+/// `result`'s error if it already had one.
+pub fn merge_unflushed_buffers(
+    result: Result<(), PipelineValidationError>,
+    unflushed_buffers: Vec<String>,
+) -> Result<(), PipelineValidationError> {
+    if unflushed_buffers.is_empty() {
+        return result;
+    }
+    let mut error = result.err().unwrap_or_else(|| PipelineValidationError {
+        non_empty_queues: Vec::new(),
+        counter_mismatches: Vec::new(),
+        leaked_heap_bytes: 0,
+    });
+    error.non_empty_queues.extend(unflushed_buffers);
+    Err(error)
 }
 
 // ============================================================================
@@ -5276,6 +5332,74 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    /// Buffers a state cannot see must fail an otherwise-clean validation.
+    ///
+    /// The BAM pipeline's Group step keeps its grouper and its pending groups
+    /// behind their own mutex, so `validate_completion` returns `Ok` while
+    /// records sit in them. Folding those names in here is what turns a
+    /// silently truncated run into a failure.
+    #[test]
+    fn test_merge_unflushed_buffers_fails_an_otherwise_clean_validation() {
+        let merged =
+            merge_unflushed_buffers(Ok(()), vec!["grouper (partial group pending)".into()])
+                .expect_err("named buffers must fail validation");
+        assert_eq!(merged.non_empty_queues, vec!["grouper (partial group pending)".to_string()]);
+        assert!(merged.counter_mismatches.is_empty());
+    }
+
+    /// One error listing everything, not two reported separately.
+    #[test]
+    fn test_merge_unflushed_buffers_extends_an_existing_error() {
+        let existing = Err(PipelineValidationError {
+            non_empty_queues: vec!["q4_groups (2)".to_string()],
+            counter_mismatches: vec![
+                "batches_grouped (1) != batches_boundary_found (2)".to_string(),
+            ],
+            leaked_heap_bytes: 0,
+        });
+
+        let merged = merge_unflushed_buffers(existing, vec!["group_pending_groups (3)".into()])
+            .expect_err("the existing failure must be preserved");
+        assert_eq!(
+            merged.non_empty_queues,
+            vec!["q4_groups (2)".to_string(), "group_pending_groups (3)".to_string()],
+            "both the queue and the stage buffer must be reported together"
+        );
+        assert_eq!(
+            merged.counter_mismatches,
+            vec!["batches_grouped (1) != batches_boundary_found (2)".to_string()],
+            "the original counter mismatch must survive the merge"
+        );
+    }
+
+    /// Nothing buffered must leave the result exactly as it was, either way.
+    #[rstest]
+    #[case::clean(true)]
+    #[case::already_failing(false)]
+    fn test_merge_unflushed_buffers_passes_through_when_nothing_is_buffered(
+        #[case] validation_passed: bool,
+    ) {
+        let result = if validation_passed {
+            Ok(())
+        } else {
+            Err(PipelineValidationError {
+                non_empty_queues: vec!["q1_raw_blocks (1)".to_string()],
+                counter_mismatches: Vec::new(),
+                leaked_heap_bytes: 0,
+            })
+        };
+
+        let merged = merge_unflushed_buffers(result, Vec::new());
+        assert_eq!(
+            merged.is_ok(),
+            validation_passed,
+            "an empty buffer list must not change the outcome"
+        );
+        if let Err(err) = merged {
+            assert_eq!(err.non_empty_queues, vec!["q1_raw_blocks (1)".to_string()]);
+        }
+    }
 
     #[test]
     fn test_stats_record_step_timing() {

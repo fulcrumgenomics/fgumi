@@ -6,6 +6,7 @@ use noodles::bam;
 use noodles::sam::Header;
 use noodles::sam::alignment::RecordBuf;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
+use rstest::rstest;
 use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::Path;
@@ -397,4 +398,80 @@ fn test_error_corrupted_bgzf() {
 
     // Error could be from header reading or BGZF decompression
     assert!(result.is_err(), "Expected error for corrupted BAM file");
+}
+
+/// A grouper that swallows every record: it buffers them, emits nothing, and
+/// reports the buffer through `has_pending()`.
+///
+/// This is the shape of an end-of-stream flush that discards rather than fails
+/// — the pipeline consumed the records, wrote none of them, and reported
+/// success. Completion validation exists to catch exactly that.
+struct SwallowingGrouper {
+    buffered: usize,
+}
+
+impl Grouper for SwallowingGrouper {
+    type Group = RecordBuf;
+
+    fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
+        self.buffered += records.len();
+        Ok(Vec::new())
+    }
+
+    fn finish(&mut self) -> io::Result<Option<Self::Group>> {
+        // Deliberately reports "nothing left" while still holding records.
+        Ok(None)
+    }
+
+    fn has_pending(&self) -> bool {
+        self.buffered > 0
+    }
+}
+
+/// A grouper still holding records at EOF must fail the run, not truncate it.
+///
+/// Both pipeline paths are pinned because they finalize differently: the
+/// single-threaded path calls the grouper's `finish()` inline, and the threaded
+/// path validates completion against the shared state. Before this check,
+/// either one accepted a grouper that reported `has_pending()` after `finish()`
+/// and wrote a valid, complete-looking BAM with none of the input in it.
+#[rstest]
+#[case::single_threaded(1)]
+#[case::threaded(4)]
+fn test_pipeline_rejects_a_grouper_still_holding_records(#[case] threads: usize) {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    let header = create_minimal_header("chr1", 10000);
+    let input_records = create_test_bam(&input_bam, &header);
+    assert!(!input_records.is_empty(), "precondition: the input must hold records to lose");
+
+    let config = BamPipelineConfig::new(threads, 6);
+    let result = run_bam_pipeline_with_grouper(
+        config,
+        &input_bam,
+        &output_bam,
+        |_| Box::new(SwallowingGrouper { buffered: 0 }),
+        |r: RecordBuf| Ok(r),
+        |r: RecordBuf, h: &Header, output: &mut Vec<u8>| serialize_bam_record_into(&r, h, output),
+    );
+
+    let err = match result {
+        Err(err) => err,
+        Ok(count) => {
+            let written = read_bam_records(&output_bam);
+            panic!(
+                "the pipeline reported success ({count} records) with the grouper still \
+                 holding {} record(s); the output holds {} of {} input records",
+                input_records.len(),
+                written.len(),
+                input_records.len()
+            );
+        }
+    };
+    assert!(
+        err.to_string().contains("grouper (partial group pending"),
+        "the failure must name the grouper's unflushed records, got: {err}"
+    );
 }
