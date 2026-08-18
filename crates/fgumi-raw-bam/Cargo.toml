@@ -22,6 +22,11 @@ test-utils = []
 
 [dev-dependencies]
 bstr = { workspace = true }
+criterion = { workspace = true }
 proptest = { workspace = true }
 rstest = { workspace = true }
 tempfile = { workspace = true }
+
+[[bench]]
+name = "record_read"
+harness = false

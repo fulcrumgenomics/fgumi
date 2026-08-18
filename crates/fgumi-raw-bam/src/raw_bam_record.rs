@@ -165,8 +165,29 @@ where
         n => n,
     };
 
-    record.0.resize(block_size, 0);
-    reader.read_exact(&mut record.0)?;
+    record.0.clear();
+    record.0.reserve(block_size);
+    // SAFETY: spare_capacity_mut()[..block_size] is valid uninit storage
+    // owned by this Vec, and set_len is called only after read_exact returns
+    // Ok, at which point all block_size bytes are initialized -- *provided*
+    // read_exact only writes to the destination and never reads from it.
+    // That provision is a trust boundary on R's concrete behavior, not
+    // something the `Read` trait guarantees at the type level (a misbehaving
+    // impl could over-report bytes written or read stale/uninitialized bytes
+    // back out of the buffer -- the bug class std::io::BorrowedBuf exists to
+    // close). It holds here because every call site in this crate passes a
+    // trusted first-party reader (the BGZF decode stream, `File`, or
+    // `Cursor`), all of which honor the read_exact contract, and Miri's
+    // interpreter validates this block under those readers. If/when
+    // `BorrowedBuf`/`read_buf_exact` are convenient on this MSRV, they would
+    // let the compiler enforce this instead of us asserting it.
+    #[allow(unsafe_code)]
+    unsafe {
+        let spare = &mut record.0.spare_capacity_mut()[..block_size];
+        let target = std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), block_size);
+        reader.read_exact(target)?;
+        record.0.set_len(block_size);
+    }
 
     Ok(block_size)
 }
@@ -1175,6 +1196,35 @@ mod tests {
         let n =
             read_raw_record(&mut reader, &mut record).expect("reading at EOF should return Ok(0)");
         assert_eq!(n, 0); // EOF
+    }
+
+    /// A `RawRecord` reused across two reads, where the second body is shorter
+    /// than the first, must contain exactly the second record's bytes -- no
+    /// leftover tail from the first (the bug a naive spare-capacity read could
+    /// introduce if `set_len` were mishandled).
+    #[test]
+    fn reused_record_has_no_stale_tail_when_shorter_record_follows() {
+        use crate::testutil::*;
+
+        let long_bytes = make_bam_bytes(0, 0, 0, b"rd", &[], 0, -1, -1, &[0xABu8; 165]);
+        let long = RawRecord::from(long_bytes);
+        assert_eq!(long.len(), 200);
+
+        let short_bytes = make_bam_bytes(0, 0, 0, b"rd", &[], 0, -1, -1, &[0xCDu8; 5]);
+        let short = RawRecord::from(short_bytes);
+        assert_eq!(short.len(), 40);
+
+        let mut buf = Vec::new();
+        write_raw_record(&mut buf, &long).unwrap();
+        write_raw_record(&mut buf, &short).unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let mut rec = RawRecord::new();
+        assert_eq!(read_raw_record(&mut cursor, &mut rec).unwrap(), long.len());
+        assert_eq!(rec.as_ref(), long.as_ref());
+        assert_eq!(read_raw_record(&mut cursor, &mut rec).unwrap(), short.len());
+        assert_eq!(rec.as_ref(), short.as_ref());
+        assert_eq!(rec.len(), short.len());
     }
 
     // ── Edge-case tests for length-changing edits ──────────────────────────
