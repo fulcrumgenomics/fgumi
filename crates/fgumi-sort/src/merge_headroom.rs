@@ -114,6 +114,26 @@ impl MergeFloors {
     }
 }
 
+/// Nanoseconds one `Instant::now()` / `elapsed()` pair costs on this machine.
+///
+/// Measured rather than assumed because it varies by platform and by clock source
+/// -- 15-35ns across the hosts this engine has been profiled on -- and because it
+/// is the same order as the segments it is used to correct. A hard-coded constant
+/// would silently stop being right.
+///
+/// Timed with an empty body, so the result is exactly what a segment's interval
+/// picks up on top of the work it is measuring.
+#[must_use]
+pub(crate) fn measure_clock_overhead_nanos() -> u64 {
+    const ITERATIONS: u64 = 4096;
+    let mut total: u64 = 0;
+    for _ in 0..ITERATIONS {
+        let started = std::time::Instant::now();
+        total += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+    total / ITERATIONS
+}
+
 /// Sampled seconds for each step the merge consumer takes per record, in loop
 /// order.
 ///
@@ -148,6 +168,39 @@ impl ConsumerSample {
             write: self.write * scale,
             advance: self.advance * scale,
             tree: self.tree * scale,
+        }
+    }
+
+    /// Every segment with its own measurement overhead removed.
+    ///
+    /// Each sampled segment is bracketed by an `Instant::now()` / `elapsed()` pair,
+    /// and that pair's cost lands *inside* the interval it is timing. On aarch64 it
+    /// runs 15-35ns against segments of 2-100ns, so the raw numbers can be more
+    /// clock than work: the first run of this instrument reported five segments
+    /// summing to 321.5s of a 189.3s loop, and a `next-source predict` row of
+    /// 21 ns/record whose true cost is 0.37 ns/record.
+    ///
+    /// The correction is one pair per segment per sample, because every segment is
+    /// timed on every sampled record. Clamped at zero: a segment cheaper than the
+    /// clock that measures it cannot be resolved by this method, and zero says that
+    /// where a negative would just look like a bug.
+    #[must_use]
+    pub(crate) fn corrected(self, samples: u64, overhead_nanos: u64) -> Self {
+        if samples == 0 || overhead_nanos == 0 {
+            return self;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "sample and nanosecond counts stay below 2^52"
+        )]
+        let per_segment = (samples * overhead_nanos) as f64 / 1e9;
+        let fix = |v: f64| (v - per_segment).max(0.0);
+        Self {
+            publish: fix(self.publish),
+            present: fix(self.present),
+            write: fix(self.write),
+            advance: fix(self.advance),
+            tree: fix(self.tree),
         }
     }
 
@@ -301,6 +354,68 @@ mod tests {
         assert!(f.floor_secs().is_finite());
         assert!(f.recoverable_secs().is_finite());
         assert!((0.0..=1.0).contains(&f.recoverable_share()));
+    }
+
+    /// The calibration must produce a plausible figure on whatever host the tests
+    /// run on. Not asserting a specific value -- that is hardware -- and zero is
+    /// valid: a coarse-resolution clock can round an empty body's interval to 0,
+    /// which `ConsumerSample::corrected` already handles as a no-op rather than a
+    /// bug. Only the upper bound is a real signal: a huge number would mean the loop
+    /// is measuring something other than the clock.
+    #[test]
+    fn test_clock_calibration_is_plausible() {
+        let ns = super::measure_clock_overhead_nanos();
+        assert!(ns < 10_000, "{ns}ns per clock pair is not a clock read");
+    }
+
+    /// Every timed segment carries one clock-read pair inside its interval, so the
+    /// correction is per segment per sample -- not per sample.
+    ///
+    /// This is the difference between a usable partition and an unusable one. The
+    /// first run of this instrument reported segments summing to 321.5s of a 189.3s
+    /// loop (-70%), with `next-source predict` at 21 ns/record against a true cost
+    /// the loser-tree benchmark puts at 0.37 ns/record. Almost the entire row was
+    /// the clock.
+    #[test]
+    fn test_correction_removes_one_clock_pair_per_segment_per_sample() {
+        // 1000 samples, 20ns of clock per pair: each segment loses 20us.
+        let raw = ConsumerSample {
+            publish: 0.000_030,
+            present: 0.000_040,
+            write: 0.000_050,
+            advance: 0.000_060,
+            tree: 0.000_070,
+        };
+        let c = raw.corrected(1000, 20);
+        assert!((c.publish - 0.000_010).abs() < 1e-12, "got {}", c.publish);
+        assert!((c.present - 0.000_020).abs() < 1e-12);
+        assert!((c.write - 0.000_030).abs() < 1e-12);
+        assert!((c.advance - 0.000_040).abs() < 1e-12);
+        assert!((c.tree - 0.000_050).abs() < 1e-12);
+    }
+
+    /// A segment smaller than its own measurement overhead must clamp to zero
+    /// rather than go negative: that is the signature of a row that is entirely
+    /// clock, and reporting it as negative time would be worse than reporting none.
+    #[test]
+    fn test_a_segment_smaller_than_its_overhead_clamps_to_zero() {
+        let raw = ConsumerSample { publish: 0.000_005, ..ConsumerSample::default() };
+        let c = raw.corrected(1000, 20);
+        assert!((c.publish - 0.0).abs() < 1e-12, "got {}", c.publish);
+    }
+
+    /// No samples, or an unmeasurable clock, must leave the sample untouched rather
+    /// than divide by zero or subtract a guess.
+    #[rstest]
+    #[case::no_samples(0, 20)]
+    #[case::no_measurable_overhead(1000, 0)]
+    fn test_correction_is_a_no_op_without_a_calibration(
+        #[case] samples: u64,
+        #[case] overhead_nanos: u64,
+    ) {
+        let raw = ConsumerSample { advance: 1.5, ..ConsumerSample::default() };
+        let c = raw.corrected(samples, overhead_nanos);
+        assert!((c.advance - 1.5).abs() < 1e-12);
     }
 
     /// The residual is the whole reason this type exists, so it must be reported

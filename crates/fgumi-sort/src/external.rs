@@ -5424,6 +5424,11 @@ impl RawExternalSorter {
         // than the loop wall clock they are supposed to partition. A prime
         // interval decorrelates the sample from any block-size-derived period.
         let merge_sample_interval: u64 = 1021;
+        // Calibrated once per merge, not assumed: the clock pair that brackets each
+        // sampled segment costs 15-35ns depending on host, which is the same order
+        // as the segments themselves. Without subtracting it the rows are more clock
+        // than work -- measured at -70% residual before this existed.
+        let clock_overhead_nanos = crate::merge_headroom::measure_clock_overhead_nanos();
         let mut merge_publish_secs = 0.0f64;
         let mut merge_present_secs = 0.0f64;
         let mut merge_write_secs = 0.0f64;
@@ -5581,15 +5586,24 @@ impl RawExternalSorter {
             .as_deref()
             .map_or_else(Default::default, crate::worker_pool::PermitPool::writer_stats);
 
+        let raw_sample = crate::merge_headroom::ConsumerSample {
+            publish: merge_publish_secs,
+            present: merge_present_secs,
+            write: merge_write_secs,
+            advance: merge_read_secs,
+            tree: merge_tree_secs,
+        };
+        let corrected_sample = raw_sample.corrected(samples_taken, clock_overhead_nanos);
+        info!(
+            "  Consumer sampling: {samples_taken} samples, clock {clock_overhead_nanos}ns per \
+             segment; sampled total {:.1}ms -> {:.1}ms after removing measurement overhead \
+             (sampled basis, before scaling to the full merge)",
+            raw_sample.total() * 1e3,
+            corrected_sample.total() * 1e3
+        );
         Self::log_merge_sub_phases(
             (loop_total, loop_start.elapsed().as_secs_f64()),
-            crate::merge_headroom::ConsumerSample {
-                publish: merge_publish_secs,
-                present: merge_present_secs,
-                write: merge_write_secs,
-                advance: merge_read_secs,
-                tree: merge_tree_secs,
-            },
+            corrected_sample,
             (samples_taken, records_merged),
             active_workers,
             pool,
