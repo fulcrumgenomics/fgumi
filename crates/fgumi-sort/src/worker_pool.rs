@@ -39,7 +39,7 @@
 
 use crate::codec::{SpillCodec, ZSPILL_MAGIC};
 use crate::merge_stalls::{
-    Phase2ScanReport, Phase2ScanTally, PopSkip, ReadSkip, WakeLatencyReport, WakePhase,
+    Phase2ScanReport, Phase2ScanTally, Phase2Skip, PopSkip, ReadSkip, WakeLatencyReport, WakePhase,
     combine_skip,
 };
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -60,12 +60,22 @@ use zstd::bulk::{Compressor as ZstdCompressor, Decompressor as ZstdDecompressor}
 
 use fgumi_bam_io::ReorderBuffer;
 
-/// Read up to `n` length-prefixed zstd frames from `reader`.
+/// Read up to `n` length-prefixed zstd frames from `reader`, stopping early once
+/// the frames read reach `max_bytes`.
 ///
 /// On-disk format for a zstd spill file is the four-byte file magic followed
 /// by a sequence of `[u32 LE compressed-len][zstd frame bytes]` records. The
 /// magic is consumed by `set_phase2_files`, so `reader` is positioned at the
 /// first length prefix on entry.
+///
+/// `max_bytes` bounds one refill by *bytes*, not just the entry count `n`. The
+/// deep read-ahead path derives `n` from a running mean block size, so a source
+/// first measured from small frames earns a large `n`; without a byte cap a
+/// burst of larger frames would then be pulled in a single unbounded read. The
+/// budget is checked after each frame, so at least one frame is always returned
+/// and the read stops on the frame that first crosses the budget. Callers that
+/// want the entry count `n` alone (the frontier and shallow paths) pass
+/// `usize::MAX`.
 ///
 /// Returns the frames read. Stops cleanly at a frame boundary on EOF and
 /// returns an error if the file is truncated inside a length prefix or frame
@@ -73,15 +83,21 @@ use fgumi_bam_io::ReorderBuffer;
 pub(crate) fn read_raw_zstd_frames<R: std::io::Read + ?Sized>(
     reader: &mut R,
     n: usize,
+    max_bytes: usize,
 ) -> std::io::Result<Vec<Vec<u8>>> {
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(n);
+    let mut total_bytes: usize = 0;
     for _ in 0..n {
         match read_length_prefix(reader)? {
             None => break,
             Some(frame_len) => {
                 let mut frame = vec![0u8; frame_len];
                 reader.read_exact(&mut frame)?;
+                total_bytes = total_bytes.saturating_add(frame.len());
                 out.push(frame);
+                if total_bytes >= max_bytes {
+                    break;
+                }
             }
         }
     }
@@ -479,6 +495,16 @@ pub(crate) struct PermitPool {
     /// finally surfaced. This never produced wrong output or a hang; it just
     /// wasted work on the failure path.
     closed: AtomicBool,
+    /// Nanoseconds producers spent blocked waiting for a permit, and how many
+    /// waits that was.
+    ///
+    /// This is the *output* backpressure stall. On the merge it lands on the
+    /// consumer thread -- the one thread that touches every record -- so it is
+    /// directly on the critical path, and it was previously invisible: the
+    /// sampled sub-phase breakdown folded it into "enqueue write", which is
+    /// documented as a handoff that excludes compression.
+    blocked_nanos: AtomicU64,
+    blocked_waits: AtomicU64,
 }
 
 impl PermitPool {
@@ -488,7 +514,13 @@ impl PermitPool {
         for _ in 0..capacity {
             tx.try_send(()).expect("fresh channel has capacity for initial permits");
         }
-        Self { tx: std::sync::Mutex::new(Some(tx)), rx, closed: AtomicBool::new(false) }
+        Self {
+            tx: std::sync::Mutex::new(Some(tx)),
+            rx,
+            closed: AtomicBool::new(false),
+            blocked_nanos: AtomicU64::new(0),
+            blocked_waits: AtomicU64::new(0),
+        }
     }
 
     /// Acquire a permit, blocking until one is available.
@@ -506,13 +538,30 @@ impl PermitPool {
         if self.closed.load(Ordering::Acquire) {
             anyhow::bail!("permit pool closed: I/O writer thread exited");
         }
-        self.rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("permit pool closed: I/O writer thread exited"))?;
+        // Fast path first: a permit that is already available must not pay for
+        // two clock reads. Only a real wait is timed, which is the same shape as
+        // the merge consumer's park accounting -- and why this can run
+        // unconditionally on a billion-record merge.
+        if self.rx.try_recv().is_err() {
+            let waited = std::time::Instant::now();
+            let outcome = self.rx.recv();
+            let elapsed = u64::try_from(waited.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.blocked_nanos.fetch_add(elapsed, Ordering::Relaxed);
+            self.blocked_waits.fetch_add(1, Ordering::Relaxed);
+            outcome.map_err(|_| anyhow::anyhow!("permit pool closed: I/O writer thread exited"))?;
+        }
         if self.closed.load(Ordering::Acquire) {
             anyhow::bail!("permit pool closed: I/O writer thread exited");
         }
         Ok(())
+    }
+
+    /// Seconds spent blocked on a permit, and the number of waits.
+    pub(crate) fn blocked(&self) -> (f64, u64) {
+        let nanos = self.blocked_nanos.load(Ordering::Relaxed);
+        #[allow(clippy::cast_precision_loss, reason = "nanosecond totals stay far below 2^52")]
+        let secs = nanos as f64 / 1e9;
+        (secs, self.blocked_waits.load(Ordering::Relaxed))
     }
 
     /// Release a permit back to the pool after a block has been written to disk.
@@ -592,6 +641,114 @@ pub(crate) const PHASE2_STARVING_RAW_CAP: usize = 512;
 /// a given file's reader mutex and that read is therefore the whole refill rate.
 pub(crate) const PHASE2_STARVING_READ_BATCH: usize = 32;
 
+/// `phase2_awaited_source` value meaning the consumer has not parked yet.
+///
+/// A real source index would hand the deep allowance to file 0 before the
+/// merge has told anyone what it is waiting for.
+pub(crate) const NO_AWAITED_SOURCE: usize = usize::MAX;
+
+/// Bytes one refill of the merge's hot file should fetch.
+///
+/// The allowance that matters is a *byte* target, not a block count. Only one
+/// worker may hold a file's reader mutex, so a refill is a single sequential
+/// read whose cost is dominated by per-request overhead until it is large
+/// enough to stream. Sizing it in bytes is also what makes it portable: a
+/// "block" is ~64 KB for BGZF and up to 256 KB for a zstd frame, and its
+/// compressed size moves with `--temp-compression`, so any fixed block count is
+/// right for exactly one codec at one compression level. Measured on the same
+/// input, template-coordinate spills averaged 10,448 B/block and queryname ones
+/// 14,407 B -- a 38% difference from the sort order alone.
+///
+/// Measured on `1kg-wgs-HG00096`, coordinate -> template-coordinate, 89 spill
+/// runs, 8 threads, `--max-memory 512M` (merge loop / pool utilization):
+///
+/// | target | batch | merge | util |
+/// | --- | --- | --- | --- |
+/// | (none: 4 blocks) | 4 | 326.5s | 54% |
+/// | 1 MiB | 101 | 212.4s | 83% |
+/// | **2 MiB** | 201 | **197.5s** | 89% |
+/// | 4 MiB | 402 | 194.5s | 90% |
+///
+/// 2 MiB is the knee; 4 MiB buys 3s for twice the read-ahead. Peak RSS was flat
+/// across the whole sweep (4793-4828 MB against a 4794 MB baseline), because
+/// the deep allowance is scoped to one file and fewer stalls mean less
+/// transient buffering elsewhere.
+///
+/// The floor read-ahead is working against is total worker busy / threads:
+/// ~1400 worker-seconds over 8 threads is ~175s, and an uncorrelated merge of
+/// the same data reaches 184s at 97% utilization. Further read-ahead cannot
+/// beat that. Getting under it means doing less work per record -- output
+/// compression is 68% of the worker total -- or shortening the serial limits
+/// read-ahead does not touch: the merge consumer's per-record cost, and the
+/// per-block decompress chain on the file the merge is blocked on.
+pub(crate) const PHASE2_STARVING_READ_TARGET_BYTES: u64 = 2 << 20;
+
+/// [`PHASE2_STARVING_READ_TARGET_BYTES`] as a `usize`, for the byte budgets that
+/// bound the deep FIFO and a single deep read (both of which count `usize`
+/// bytes). The const assert keeps the two spellings in step, so the target has a
+/// single source of truth without an `as` cast the pedantic lints reject.
+pub(crate) const PHASE2_STARVING_READ_TARGET_BYTES_USIZE: usize = 2 << 20;
+const _: () =
+    assert!(PHASE2_STARVING_READ_TARGET_BYTES_USIZE as u64 == PHASE2_STARVING_READ_TARGET_BYTES);
+
+/// Blocks the hot file may buffer, as a multiple of one refill.
+///
+/// The FIFO must have room for a whole batch or the read is never admitted:
+/// measured, batch 32 into a cap-8 FIFO performs exactly like no change at all
+/// (325.5s against a 326.5s baseline), because the batch silently degrades to
+/// the cap. Headroom beyond one batch is what lets the next refill start
+/// before the current one is drained.
+pub(crate) const PHASE2_STARVING_CAP_MULTIPLE: usize = 16;
+
+/// Byte budget for the awaited source's deep raw FIFO, and the primary bound on
+/// its memory.
+///
+/// [`awaited_allowance_for`]'s `raw_cap` is sized to hold ~32 MiB *at the running
+/// mean compressed block size*, but it is an entry count, not a byte bound. A
+/// FIFO first measured from small frames earns a large entry cap, and a zstd
+/// frame is capped only at [`MAX_ZSTD_FRAME_BYTES`] (2 MiB), so once larger
+/// frames arrive the entry count alone would let the FIFO retain far more than
+/// the intended budget. `admitted_read_batch` therefore refuses a read once the
+/// FIFO already holds this many bytes, keeping the entry cap as a secondary
+/// guard. It equals the read target times the cap multiple -- the same 32 MiB
+/// the entry cap targets -- so the byte budget only bites when the frames
+/// actually held run larger than the mean the entry count was derived from.
+pub(crate) const PHASE2_STARVING_FIFO_BYTE_BUDGET: usize =
+    PHASE2_STARVING_READ_TARGET_BYTES_USIZE.saturating_mul(PHASE2_STARVING_CAP_MULTIPLE);
+
+/// The `(raw_cap, read_batch)` for the merge's hot file, sized from the block
+/// size actually observed on this run.
+///
+/// `mean_block_bytes` of zero means nothing has been read yet, so the shipped
+/// block-count defaults stand in until the first refill has measured one.
+///
+/// The batch is clamped to `[PHASE2_READ_BATCH, PHASE2_STARVING_RAW_CAP]` so a
+/// pathologically small block size cannot turn the byte target into an
+/// unbounded read. The ceiling bounds only the FIFO's *entry count*; its memory
+/// is bounded by [`PHASE2_STARVING_FIFO_BYTE_BUDGET`] (enforced in
+/// [`admitted_read_batch`]) plus the byte budget one read may add, which holds
+/// even when the frames actually queued run larger than the measured mean the
+/// entry cap was derived from.
+fn awaited_allowance_for(mean_block_bytes: u64) -> (usize, usize) {
+    if mean_block_bytes == 0 {
+        return (PHASE2_STARVING_RAW_CAP, PHASE2_STARVING_READ_BATCH);
+    }
+    let batch = PHASE2_STARVING_READ_TARGET_BYTES.div_ceil(mean_block_bytes);
+    // Clamp the derived batch so a small measured block size cannot ask for an
+    // unbounded refill: at a 200 B mean the target alone wants ~10k blocks in
+    // one `read_raw_blocks`, and `raw_cap` would be 16x that. The ceiling caps
+    // the deep FIFO's entry count; the measured regime (~10 KB/block -> ~201
+    // blocks) is well under it, so the clamp only bites pathological inputs. The
+    // floor keeps the hot file from ever reading shallower than an ordinary one.
+    // The byte side of the bound is `PHASE2_STARVING_FIFO_BYTE_BUDGET`, applied
+    // in `admitted_read_batch`, because the entry count alone does not bound the
+    // bytes held once frames run larger than this mean.
+    let batch = usize::try_from(batch)
+        .unwrap_or(PHASE2_STARVING_READ_BATCH)
+        .clamp(PHASE2_READ_BATCH, PHASE2_STARVING_RAW_CAP);
+    (batch.saturating_mul(PHASE2_STARVING_CAP_MULTIPLE), batch)
+}
+
 /// The file index a Phase 2 scan starts at.
 ///
 /// The frontier -- the lowest source that has not delivered everything -- when
@@ -621,6 +778,26 @@ fn phase2_scan_start(
 /// the frontier rather than to any starving file because at merge start *every*
 /// file is empty, and letting all K deepen at once would multiply read-ahead
 /// memory by K.
+/// Whether file `index` should read at the deep allowance.
+///
+/// Two files qualify. The **drain frontier** is the historical one: it is the
+/// file the merge reaches next when sources drain in order, which is what an
+/// input already in the requested order produces.
+///
+/// The **awaited source** covers the case the frontier misses. When the input
+/// is only partially correlated with the requested order, the merge interleaves
+/// at the median yet still draws long solo runs from a source that is not the
+/// lowest undrained one, and that source -- the file the consumer is parked on
+/// -- was taking the shallow allowance while the merge waited on it. Both are
+/// single files, so the read-ahead memory this admits is bounded by two deep
+/// FIFOs rather than by K.
+///
+/// [`NO_AWAITED_SOURCE`] means the consumer has not parked yet, and matches no
+/// index.
+fn phase2_deserves_deep_read(index: usize, frontier: usize, awaited: usize) -> bool {
+    index == frontier || (awaited != NO_AWAITED_SOURCE && index == awaited)
+}
+
 fn phase2_read_allowance(is_frontier: bool) -> (usize, usize) {
     // The deep allowance must actually be deeper, or scoping it to the frontier
     // buys nothing and the two branches are the same read.
@@ -633,18 +810,34 @@ fn phase2_read_allowance(is_frontier: bool) -> (usize, usize) {
     }
 }
 
-/// Blocks a read may fetch for a file whose raw FIFO holds `raw_len`, or `None`
-/// when the FIFO is already at its cap.
+/// Blocks a read may fetch for a file whose raw FIFO holds `raw_len` entries and
+/// `raw_bytes` bytes, or `None` when the FIFO is already at either cap.
 ///
-/// Admitting on "not yet full" and then reading a whole batch overshoots the
-/// cap by up to a batch: at the frontier allowance that is a FIFO admitted at
-/// 511 and left holding 543. `raw_cap` is a read-ahead *memory* bound, so it has
-/// to bound -- and the deep path, which raised the cap 64x and the batch 8x, is
-/// exactly where an unclamped overshoot is largest.
+/// Two caps bound the FIFO. `byte_budget` is the primary one: a deep FIFO's
+/// entry cap is derived from a running *mean* block size, so once frames larger
+/// than that mean arrive, the entry count no longer bounds the bytes held (a
+/// zstd frame is capped only at [`MAX_ZSTD_FRAME_BYTES`]). Refusing a read once
+/// the FIFO already holds `byte_budget` bytes bounds its memory regardless of
+/// how the entry cap was sized. The frontier and shallow paths pass
+/// `usize::MAX` here and rely on the entry cap alone, unchanged.
+///
+/// `raw_cap` is the secondary, entry-count bound. Admitting on "not yet full"
+/// and then reading a whole batch overshoots it by up to a batch: at the
+/// frontier allowance that is a FIFO admitted at 511 and left holding 543, so
+/// the returned batch is clamped to the entry headroom.
 ///
 /// Pure so the bound is testable without a pool, following
 /// [`classify_scan`](crate::merge_stalls::classify_scan).
-fn admitted_read_batch(raw_len: usize, raw_cap: usize, read_batch: usize) -> Option<usize> {
+fn admitted_read_batch(
+    raw_len: usize,
+    raw_bytes: usize,
+    raw_cap: usize,
+    byte_budget: usize,
+    read_batch: usize,
+) -> Option<usize> {
+    if raw_bytes >= byte_budget {
+        return None;
+    }
     match raw_cap.saturating_sub(raw_len) {
         0 => None,
         headroom => Some(read_batch.min(headroom)),
@@ -699,6 +892,11 @@ pub(crate) struct Phase2FileState {
     /// without touching the reader mutex (called per decompressed block on
     /// the hot Phase 2 path).
     pub(crate) reader_eof: AtomicBool,
+    /// Set once this source is observed fully drained: reader at EOF, raw
+    /// FIFO empty, nothing in flight, reorder buffer empty. Monotonic -- no
+    /// new data can appear after that -- so a worker scan may skip the file
+    /// without paying its two `try_lock`s.
+    pub(crate) retired: AtomicBool,
     /// Codec used to compress this file. Detected at open time from magic.
     pub(crate) codec: SpillCodec,
     /// Raw compressed blocks read from disk, in serial order. For BGZF, each
@@ -758,6 +956,7 @@ impl Phase2FileState {
         Self {
             reader: Mutex::new(Phase2Reader { inner: reader, next_serial: 0, eof: false }),
             reader_eof: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
             codec,
             raw_blocks: Mutex::new(VecDeque::with_capacity(PHASE2_RAW_CAP)),
             decompressed: Mutex::new(ReorderBuffer::new()),
@@ -925,6 +1124,13 @@ impl Phase2FileState {
     /// the Phase 2 hot path — every successful decompression calls this to
     /// decide whether to wake the consumer.
     pub(crate) fn is_drained(&self) -> bool {
+        // Retirement is terminal, so once published the answer cannot change
+        // and re-deriving it would pay two mutex acquisitions for it. Retired
+        // files stay in the scan: `is_phase_complete` checks every file and
+        // `advance_phase2_frontier` walks over drained ones.
+        if self.retired.load(Ordering::Acquire) {
+            return true;
+        }
         if !self.reader_eof.load(Ordering::Acquire) {
             return false;
         }
@@ -936,7 +1142,15 @@ impl Phase2FileState {
         if self.decomp_in_flight.load(Ordering::Acquire) > 0 {
             return false;
         }
-        self.decompressed.lock().expect("phase2 decompressed mutex poisoned").is_empty()
+        let drained =
+            self.decompressed.lock().expect("phase2 decompressed mutex poisoned").is_empty();
+        if drained {
+            // Publish for the worker scan. Safe because every condition above
+            // is terminal: the reader is at EOF, so nothing can refill the
+            // FIFO, and nothing is mid-decompress.
+            self.retired.store(true, Ordering::Release);
+        }
+        drained
     }
 }
 
@@ -1148,6 +1362,21 @@ pub(crate) struct SharedPipelineState {
     /// scan still wraps over every file, so a stale value costs nothing but a
     /// few microseconds of walking.
     pub(crate) phase2_lowest_active: AtomicUsize,
+    /// Source the merge consumer is currently parked on, or
+    /// [`NO_AWAITED_SOURCE`]. Published by the consumer so the pool can read
+    /// ahead deeply on the file the merge is actually blocked on, which is
+    /// not the frontier unless sources drain in order.
+    pub(crate) phase2_awaited_source: AtomicUsize,
+    /// Why a worker scan declined the awaited file, by [`PopSkip`] reason:
+    /// `[RawLockContended, RawEmpty, DecompLockContended, DecompCapped]`.
+    /// The pool-wide tally cannot answer this -- it is dominated by the 88
+    /// files nobody is waiting on.
+    pub(crate) awaited_skips: [AtomicU64; 4],
+    /// Compressed spill bytes and blocks read in Phase 2, for sizing one
+    /// refill by bytes rather than by a block count that only suits one
+    /// codec at one compression level.
+    pub(crate) phase2_read_bytes: AtomicU64,
+    pub(crate) phase2_read_blocks: AtomicU64,
 }
 
 impl SharedPipelineState {
@@ -1195,6 +1424,10 @@ impl SharedPipelineState {
             shallow_read_batches: AtomicU64::new(0),
             shallow_read_blocks: AtomicU64::new(0),
             phase2_lowest_active: AtomicUsize::new(0),
+            phase2_awaited_source: AtomicUsize::new(NO_AWAITED_SOURCE),
+            awaited_skips: std::array::from_fn(|_| AtomicU64::new(0)),
+            phase2_read_bytes: AtomicU64::new(0),
+            phase2_read_blocks: AtomicU64::new(0),
         }
     }
 
@@ -2231,6 +2464,15 @@ impl SortWorkerPool {
             let i = (start + offset) % n;
             let file = &files[i];
 
+            // A retired source can never produce again, so skipping it here
+            // avoids the `raw_blocks` and `reader` try_locks the scan would
+            // otherwise pay on every pass. Measured at baseline: 14.2M scans
+            // over drained files on an 89-way merge.
+            if file.retired.load(Ordering::Relaxed) {
+                tally.note(Phase2Skip::Drained);
+                continue;
+            }
+
             // -- Try decompression first (highest-value work) ----------------
             // `try_pop_raw_for_decompress` increments `decomp_in_flight` before
             // returning, so the consumer's `is_drained` check sees this work as
@@ -2247,6 +2489,19 @@ impl SortWorkerPool {
                     return Self::decompress_and_publish(shared, worker, file, i, entry);
                 }
             };
+
+            // Why the pool passed over the file the merge is parked on. The
+            // depth histogram says the pool is only ~2 deep there; this says
+            // which of the four admission gates is what holds it at two.
+            if shared.phase2_awaited_source.load(Ordering::Relaxed) == i {
+                let reason = match pop_skip {
+                    PopSkip::RawLockContended => 0,
+                    PopSkip::RawEmpty => 1,
+                    PopSkip::DecompLockContended => 2,
+                    PopSkip::DecompCapped => 3,
+                };
+                shared.awaited_skips[reason].fetch_add(1, Ordering::Relaxed);
+            }
 
             // -- Try reading raw blocks from disk ----------------------------
             // Skip if disk reader is contended OR already at EOF.
@@ -2284,7 +2539,48 @@ impl SortWorkerPool {
             //
             // Still scoped to one file: at merge start every file is empty, and
             // letting all K deepen at once would multiply read-ahead memory by K.
-            let (raw_cap, read_batch) = phase2_read_allowance(i == frontier);
+            // The frontier keeps the fixed block-count allowance on purpose;
+            // only the awaited non-frontier source gets the measured byte
+            // sizing. The frontier path is the pre-existing #709 mechanism, and
+            // this change deliberately leaves it byte-for-byte as it was so the
+            // orders that already drain in frontier order stay comparable to the
+            // previous release (queryname -> coordinate and coordinate ->
+            // queryname were both reported unchanged). The byte sizing is scoped
+            // to the new awaited-source path it was measured on; unifying the
+            // two here would re-time the frontier orders and is out of scope for
+            // this change. When `frontier == awaited` the frontier branch wins,
+            // which is the intended precedence -- the frontier allowance is the
+            // established one.
+            // The awaited source is the only path bounded by bytes: its entry
+            // cap is derived from a running mean block size, so a source first
+            // measured from small frames could otherwise retain a large multiple
+            // of the intended 32 MiB once larger frames arrive. `fifo_byte_budget`
+            // bounds what the FIFO may hold and `read_byte_budget` bounds what one
+            // read may add. The frontier and shallow paths keep their fixed
+            // entry-count allowances and an unbounded (`usize::MAX`) byte budget,
+            // so they behave exactly as before.
+            let awaited = shared.phase2_awaited_source.load(Ordering::Relaxed);
+            let (raw_cap, read_batch, fifo_byte_budget, read_byte_budget) = if i == frontier {
+                let (cap, batch) = phase2_read_allowance(true);
+                (cap, batch, usize::MAX, usize::MAX)
+            } else if phase2_deserves_deep_read(i, frontier, awaited) {
+                let read_blocks = shared.phase2_read_blocks.load(Ordering::Relaxed);
+                let mean_block_bytes = if read_blocks == 0 {
+                    0
+                } else {
+                    shared.phase2_read_bytes.load(Ordering::Relaxed) / read_blocks
+                };
+                let (cap, batch) = awaited_allowance_for(mean_block_bytes);
+                (
+                    cap,
+                    batch,
+                    PHASE2_STARVING_FIFO_BYTE_BUDGET,
+                    PHASE2_STARVING_READ_TARGET_BYTES_USIZE,
+                )
+            } else {
+                let (cap, batch) = phase2_read_allowance(false);
+                (cap, batch, usize::MAX, usize::MAX)
+            };
 
             // Bound disk read-ahead per file: don't keep pulling if the raw
             // FIFO is already full. Use try_lock so a momentarily contended
@@ -2296,8 +2592,18 @@ impl SortWorkerPool {
                 tally.note(combine_skip(pop_skip, ReadSkip::RawLockContended));
                 continue;
             };
-            let admitted = admitted_read_batch(raw_guard.len(), raw_cap, read_batch);
+            let raw_len = raw_guard.len();
+            // Only the byte-bounded (awaited) path pays for the byte tally; the
+            // others carry an unbounded budget, so their gate can never fire and
+            // scanning the FIFO would be wasted work in the hot read path.
+            let raw_bytes = if fifo_byte_budget == usize::MAX {
+                0
+            } else {
+                raw_guard.iter().map(|entry| entry.bytes.len()).sum()
+            };
             drop(raw_guard);
+            let admitted =
+                admitted_read_batch(raw_len, raw_bytes, raw_cap, fifo_byte_budget, read_batch);
             let Some(read_batch) = admitted else {
                 tally.note(combine_skip(pop_skip, ReadSkip::RawFull));
                 continue;
@@ -2313,10 +2619,9 @@ impl SortWorkerPool {
                     .read
                     .time(|| read_raw_blocks(&mut reader_guard.inner, read_batch))
                     .map(|blocks| blocks.into_iter().map(|b| b.data).collect()),
-                SpillCodec::Zstd => shared
-                    .merge_phases
-                    .read
-                    .time(|| read_raw_zstd_frames(&mut reader_guard.inner, read_batch)),
+                SpillCodec::Zstd => shared.merge_phases.read.time(|| {
+                    read_raw_zstd_frames(&mut reader_guard.inner, read_batch, read_byte_budget)
+                }),
             };
             let raw_bytes: Vec<Vec<u8>> = match read {
                 Ok(bytes) => bytes,
@@ -2329,14 +2634,22 @@ impl SortWorkerPool {
 
             // Record which allowance this batch was taken at, and what it
             // returned, so "the deep path did not help" can be told apart from
-            // "the deep path did not run".
-            let (batches, blocks) = if i == frontier {
+            // "the deep path did not run". Classify by the same predicate the
+            // allowance selection uses, so an awaited non-frontier source --
+            // which reads at the deep allowance via `awaited_allowance_for` --
+            // is counted as deep, not shallow.
+            let (batches, blocks) = if phase2_deserves_deep_read(i, frontier, awaited) {
                 (&shared.deep_read_batches, &shared.deep_read_blocks)
             } else {
                 (&shared.shallow_read_batches, &shared.shallow_read_blocks)
             };
             batches.fetch_add(1, Ordering::Relaxed);
             blocks.fetch_add(raw_bytes.len() as u64, Ordering::Relaxed);
+            // Measure the block size this run actually has, so the hot
+            // file's refill can be sized in bytes.
+            let batch_bytes: usize = raw_bytes.iter().map(Vec::len).sum();
+            shared.phase2_read_bytes.fetch_add(batch_bytes as u64, Ordering::Relaxed);
+            shared.phase2_read_blocks.fetch_add(raw_bytes.len() as u64, Ordering::Relaxed);
 
             if raw_bytes.is_empty() {
                 return Self::retire_phase2_source(shared, worker, file, reader_guard, i, n);
@@ -2729,6 +3042,25 @@ impl SortWorkerPool {
     /// already record into, and the two dwell stages from `block_lifecycle`.
     /// This is the one place that holds both, which is why it is the only place
     /// a complete report can be assembled.
+    /// The measured mean spill-block size and the refill allowance derived
+    /// from it, as `(bytes_per_block, raw_cap, read_batch)`.
+    pub(crate) fn awaited_sizing(&self) -> (u64, usize, usize) {
+        let blocks = self.shared.phase2_read_blocks.load(Ordering::Relaxed);
+        let mean = if blocks == 0 {
+            0
+        } else {
+            self.shared.phase2_read_bytes.load(Ordering::Relaxed) / blocks
+        };
+        let (cap, batch) = awaited_allowance_for(mean);
+        (mean, cap, batch)
+    }
+
+    /// Why worker scans passed over the file the consumer was parked on,
+    /// as `[raw-lock, raw-empty, decomp-lock, decomp-capped]`.
+    pub(crate) fn awaited_skip_counts(&self) -> [u64; 4] {
+        std::array::from_fn(|i| self.shared.awaited_skips[i].load(Ordering::Relaxed))
+    }
+
     pub(crate) fn block_lifecycle_report(&self) -> crate::merge_trace::BlockLifecycleReport {
         let phases = &self.shared.merge_phases;
         crate::merge_trace::BlockLifecycleReport {
@@ -2928,6 +3260,25 @@ impl SortWorkerPool {
         // happens to sit at that index. `advance_phase2_frontier` only walks
         // forward, so neither is self-correcting.
         self.shared.phase2_lowest_active.store(0, Ordering::Release);
+        self.shared.phase2_awaited_source.store(NO_AWAITED_SOURCE, Ordering::Release);
+        // The refill allowance is derived from `phase2_read_bytes /
+        // phase2_read_blocks`, so these must describe only the set being
+        // installed: mean spill-block size moves with the codec, the
+        // compression level and the sort order, and a blended mean picks a
+        // batch that is right for neither merge. The skip tallies are
+        // per-merge diagnostics and read as totals for one merge.
+        self.shared.phase2_read_bytes.store(0, Ordering::Release);
+        self.shared.phase2_read_blocks.store(0, Ordering::Release);
+        for skips in &self.shared.awaited_skips {
+            skips.store(0, Ordering::Release);
+        }
+        // The deep/shallow read-batch split is a per-merge diagnostic too
+        // (`read_batch_split` reports it as totals for one merge), so it must
+        // not carry the prior file set's batches into the new one.
+        self.shared.deep_read_batches.store(0, Ordering::Release);
+        self.shared.deep_read_blocks.store(0, Ordering::Release);
+        self.shared.shallow_read_batches.store(0, Ordering::Release);
+        self.shared.shallow_read_blocks.store(0, Ordering::Release);
 
         let mut states: Vec<Phase2FileState> = Vec::with_capacity(total_sources);
         for path in files {
@@ -3643,6 +3994,127 @@ mod tests {
         assert_eq!(phase2_read_allowance(is_frontier), (expected_cap, expected_batch));
     }
 
+    /// One refill is sized to a byte target, not to a block count.
+    ///
+    /// Asserted as properties rather than pinned block counts: the target is a
+    /// tuning constant, and a test that hardcodes its quotient has to be edited
+    /// every time it moves, which teaches nothing. What must hold for any target
+    /// is that a refill reaches it, that larger blocks therefore need fewer of
+    /// them, and that the FIFO can hold a whole batch.
+    #[rstest]
+    #[case::ten_kb_blocks(10_240)]
+    #[case::sixty_four_kb_bgzf_blocks(65_536)]
+    #[case::quarter_mb_zstd_frames(262_144)]
+    fn one_refill_is_sized_in_bytes_not_blocks(#[case] mean_block_bytes: u64) {
+        let (cap, batch) = awaited_allowance_for(mean_block_bytes);
+
+        assert!(
+            u64::try_from(batch).unwrap() * mean_block_bytes >= PHASE2_STARVING_READ_TARGET_BYTES,
+            "a refill of {batch} x {mean_block_bytes} B must reach the byte target"
+        );
+        assert!(
+            batch >= PHASE2_READ_BATCH,
+            "the hot file must never read shallower than an ordinary one"
+        );
+        assert_eq!(
+            cap,
+            batch * PHASE2_STARVING_CAP_MULTIPLE,
+            "the FIFO must hold whole batches, or the read is never admitted"
+        );
+    }
+
+    /// Larger blocks need proportionally fewer of them to hit the same target.
+    ///
+    /// This is the property that makes the allowance portable across codecs: a
+    /// zstd frame is up to 4x a BGZF block, and compressed size also moves with
+    /// `--temp-compression`. Measured on one input, template-coordinate spills
+    /// averaged 10,448 B/block against queryname's 14,407 B.
+    #[test]
+    fn a_bigger_block_needs_fewer_blocks_per_refill() {
+        let (_, small) = awaited_allowance_for(10_240);
+        let (_, large) = awaited_allowance_for(102_400);
+        assert!(
+            small > large,
+            "10 KB blocks should need more per refill than 100 KB ones, got {small} vs {large}"
+        );
+        assert!(
+            small <= large * 12 && small >= large * 8,
+            "a 10x block-size difference should be roughly a 10x batch difference, \
+             got {small} vs {large}"
+        );
+    }
+
+    /// A block bigger than the whole target still reads at the shallow floor
+    /// rather than rounding down to nothing.
+    #[test]
+    fn an_oversized_block_floors_at_the_shallow_batch() {
+        let (_, batch) = awaited_allowance_for(8 << 20);
+        assert_eq!(batch, PHASE2_READ_BATCH);
+    }
+
+    /// A tiny measured block size cannot drive the refill unbounded.
+    ///
+    /// The byte target divided by a 200 B block wants ~10k blocks in one read,
+    /// and `raw_cap` would be 16x that. The batch is clamped to
+    /// `PHASE2_STARVING_RAW_CAP` so the deep FIFO stays bounded regardless of
+    /// how small the compressed blocks get.
+    #[rstest]
+    #[case::two_hundred_byte_blocks(200)]
+    #[case::one_byte_blocks(1)]
+    fn a_tiny_block_size_clamps_the_refill(#[case] mean_block_bytes: u64) {
+        let (cap, batch) = awaited_allowance_for(mean_block_bytes);
+        assert_eq!(
+            batch, PHASE2_STARVING_RAW_CAP,
+            "a batch derived from a {mean_block_bytes} B block must clamp to the ceiling"
+        );
+        assert_eq!(
+            cap,
+            PHASE2_STARVING_RAW_CAP * PHASE2_STARVING_CAP_MULTIPLE,
+            "the FIFO must still hold a whole clamped batch"
+        );
+    }
+
+    /// Before anything has been read there is no measured block size, so the
+    /// shipped block-count defaults stand in rather than a batch derived from
+    /// a division by zero.
+    #[test]
+    fn unmeasured_block_size_falls_back_to_the_shipped_defaults() {
+        assert_eq!(awaited_allowance_for(0), (PHASE2_STARVING_RAW_CAP, PHASE2_STARVING_READ_BATCH));
+    }
+
+    /// The file the consumer is parked on reads deep even when it is not the
+    /// frontier.
+    ///
+    /// The frontier is the lowest source that has not fully drained, which is
+    /// the blocked file only when sources drain in order -- true for an input
+    /// already in the requested order, false for a partially-correlated one,
+    /// where the merge interleaves at the median (p50 = 1 block per source) but
+    /// still draws long solo runs from a source that is not the lowest. On
+    /// `1kg-wgs-HG00096` sorted coordinate -> template-coordinate that tail
+    /// reaches 512 consecutive blocks, and the blocked file was taking the
+    /// shallow allowance: the pool sat 1.9 decompressions deep of a tracked 8
+    /// while the consumer waited 73% of the merge loop.
+    #[rstest]
+    #[case::frontier_only(0, usize::MAX, 0, true)]
+    #[case::awaited_only(0, 5, 5, true)]
+    #[case::neither(0, 5, 3, false)]
+    #[case::no_awaited_source_yet(0, usize::MAX, 7, false)]
+    fn the_blocked_file_reads_deep_even_when_it_is_not_the_frontier(
+        #[case] frontier: usize,
+        #[case] awaited: usize,
+        #[case] candidate: usize,
+        #[case] expect_deep: bool,
+    ) {
+        let deep = phase2_deserves_deep_read(candidate, frontier, awaited);
+        assert_eq!(deep, expect_deep);
+        let expected = if expect_deep {
+            (PHASE2_STARVING_RAW_CAP, PHASE2_STARVING_READ_BATCH)
+        } else {
+            (PHASE2_RAW_CAP, PHASE2_READ_BATCH)
+        };
+        assert_eq!(phase2_read_allowance(deep), expected);
+    }
+
     /// `is_starving` is what arms the scan-start gate, and it means "this file
     /// can give the consumer nothing right now" -- neither buffered nor being
     /// produced. A file with a decompression in flight is about to deliver, so
@@ -3663,37 +4135,55 @@ mod tests {
         assert_eq!(file.is_starving(), expected);
     }
 
-    /// A read may never carry the raw FIFO past its cap.
+    /// A read may never carry the raw FIFO past its entry cap or its byte budget.
     ///
-    /// The cap is a read-ahead memory bound, and admitting on "not yet full"
-    /// and then reading a full batch breaks it by up to a batch. Every case
-    /// asserts the post-read depth against the cap rather than the returned
-    /// figure alone, because that bound is the property, not the arithmetic.
+    /// The entry cap is a read-ahead bound, and admitting on "not yet full" and
+    /// then reading a full batch breaks it by up to a batch, so every admitted
+    /// case asserts the post-read depth against the cap rather than the returned
+    /// figure alone. The byte budget is the primary bound the entry count cannot
+    /// provide: a FIFO whose entries run larger than the mean its entry cap was
+    /// sized from must be refused on bytes even when entry headroom remains.
     #[rstest]
+    // Byte budget disabled (`usize::MAX`): the entry cap alone governs, exactly
+    // as the frontier and shallow paths use it.
     // Well under the cap: the batch is what limits the read, not the headroom.
-    #[case::far_below_the_cap_reads_a_full_batch(0, 512, 32, Some(32))]
-    #[case::shallow_path_far_below_the_cap(0, 8, 4, Some(4))]
+    #[case::far_below_the_cap_reads_a_full_batch(0, 0, 512, usize::MAX, 32, Some(32))]
+    #[case::shallow_path_far_below_the_cap(0, 0, 8, usize::MAX, 4, Some(4))]
     // One entry below the allowance -- the case that used to overshoot by 31.
-    #[case::one_below_the_frontier_cap_reads_one(511, 512, 32, Some(1))]
-    #[case::one_below_the_shallow_cap_reads_one(7, 8, 4, Some(1))]
+    #[case::one_below_the_frontier_cap_reads_one(511, 0, 512, usize::MAX, 32, Some(1))]
+    #[case::one_below_the_shallow_cap_reads_one(7, 0, 8, usize::MAX, 4, Some(1))]
     // Partly full: headroom is what limits the read.
-    #[case::headroom_shorter_than_the_batch(500, 512, 32, Some(12))]
+    #[case::headroom_shorter_than_the_batch(500, 0, 512, usize::MAX, 32, Some(12))]
     // At or past the cap: no read at all.
-    #[case::at_the_cap_declines(512, 512, 32, None)]
-    #[case::past_the_cap_declines(600, 512, 32, None)]
-    fn read_batch_never_overshoots_the_raw_fifo_cap(
+    #[case::at_the_cap_declines(512, 0, 512, usize::MAX, 32, None)]
+    #[case::past_the_cap_declines(600, 0, 512, usize::MAX, 32, None)]
+    // Byte budget engaged: the deep FIFO holds few entries but has reached its
+    // byte budget because its frames run larger than the mean the entry cap was
+    // derived from, so no read is admitted despite ample entry headroom -- the
+    // bound the entry count cannot provide on its own.
+    #[case::byte_budget_reached_declines_despite_entry_headroom(10, 32 << 20, 8192, 32 << 20, 512, None)]
+    #[case::byte_budget_exceeded_declines(10, 40 << 20, 8192, 32 << 20, 512, None)]
+    // Under the byte budget: the entry cap governs the read as usual.
+    #[case::under_the_byte_budget_reads_a_full_batch(10, 1 << 20, 8192, 32 << 20, 512, Some(512))]
+    fn read_batch_respects_the_raw_fifo_entry_and_byte_bounds(
         #[case] raw_len: usize,
+        #[case] raw_bytes: usize,
         #[case] raw_cap: usize,
+        #[case] byte_budget: usize,
         #[case] read_batch: usize,
         #[case] expected: Option<usize>,
     ) {
-        let admitted = admitted_read_batch(raw_len, raw_cap, read_batch);
+        let admitted = admitted_read_batch(raw_len, raw_bytes, raw_cap, byte_budget, read_batch);
         assert_eq!(admitted, expected);
         if let Some(n) = admitted {
             assert!(n > 0, "an admitted read must fetch something");
             assert!(
                 raw_len + n <= raw_cap,
                 "read of {n} on a FIFO of {raw_len} exceeds the cap of {raw_cap}"
+            );
+            assert!(
+                raw_bytes < byte_budget,
+                "a read was admitted with {raw_bytes} B held against a {byte_budget} B budget"
             );
         }
     }
@@ -4101,6 +4591,33 @@ mod tests {
         TimedBlock { data: vec![0u8; len], inserted_nanos: 0 }
     }
 
+    /// Once a file has retired, `is_drained` must answer from the flag alone.
+    ///
+    /// Retirement is terminal -- the reader is at EOF, nothing can refill the
+    /// FIFO and nothing is mid-decompress -- so re-deriving it costs two mutex
+    /// acquisitions for an answer that cannot change. Retired files are
+    /// re-checked repeatedly: `is_phase_complete` scans every file and
+    /// `advance_phase2_frontier` walks over drained ones, so at k=89 that lock
+    /// traffic lands on the same `raw_blocks` mutex the worker scan contends
+    /// for (measured: 32% of the passes over the awaited file).
+    ///
+    /// The post-retirement push below cannot happen in production; it is how
+    /// the short-circuit is made observable, standing in for "the slow path
+    /// would now compute a different answer".
+    #[test]
+    fn test_is_drained_short_circuits_once_retired() {
+        let file = empty_phase2_file();
+        file.reader_eof.store(true, Ordering::Release);
+        assert!(file.is_drained(), "an empty file at EOF is drained");
+        assert!(file.retired.load(Ordering::Acquire), "being drained must publish retirement");
+
+        file.raw_blocks.lock().expect("raw lock").push_back(raw_entry(0, 0));
+        assert!(
+            file.is_drained(),
+            "retirement is terminal, so it must be reported without re-deriving it"
+        );
+    }
+
     #[test]
     fn test_admission_under_cap_admits() {
         let file = empty_phase2_file();
@@ -4359,19 +4876,40 @@ mod tests {
         assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 0);
     }
 
+    /// A block in a worker's hands must hide drain, or the last block of a file
+    /// is dropped.
+    ///
+    /// The in-flight count is raised through `try_pop_raw_for_decompress` here
+    /// rather than by storing to the counter, because that is the only thing
+    /// that raises it in production -- and it does so while holding the
+    /// `raw_blocks` lock, which is what makes the drained state terminal.
+    /// Setting the counter directly reaches a state the pool cannot: a file
+    /// whose FIFO is empty and whose reader is at EOF has nothing left to pop.
     #[test]
     fn test_is_drained_respects_in_flight_counter() {
         let file = empty_phase2_file();
-        // Mark reader as EOF and ensure both queues are empty.
+        file.raw_blocks.lock().expect("raw lock").push_back(raw_entry(0, 0));
         file.mark_reader_eof(&mut file.reader.lock().expect("reader lock"));
-        assert!(file.is_drained(), "reader_eof + empty queues + no in-flight should be drained");
+        assert!(!file.is_drained(), "a pending raw block must keep is_drained=false");
 
-        // Simulate a worker mid-decompression: in_flight > 0 must hide drain.
-        file.decomp_in_flight.fetch_add(1, Ordering::AcqRel);
+        // A worker claims the last block: the FIFO is now empty, but the block
+        // has not been decompressed yet.
+        let popped = SortWorkerPool::try_pop_raw_for_decompress(&file)
+            .expect("the only block must be admitted");
+        assert!(file.raw_blocks.lock().expect("raw lock").is_empty(), "guard: FIFO drained");
+        assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 1, "guard: slot reserved");
         assert!(!file.is_drained(), "in-flight decompression must keep is_drained=false");
 
-        // Decrementing brings us back to drained.
+        // The worker publishes its block, so the data is still pending.
+        file.decompressed.lock().expect("dec lock").insert(popped.serial, timed_block(3));
         file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
+        assert!(!file.is_drained(), "a decompressed block still waiting must hide drain");
+
+        // Only once the consumer has taken it is the file finished.
+        assert!(
+            file.decompressed.lock().expect("dec lock").try_pop_next().is_some(),
+            "guard: the consumer must be able to take the published block"
+        );
         assert!(file.is_drained());
     }
 
@@ -4446,7 +4984,8 @@ mod tests {
     #[test]
     fn test_read_raw_zstd_frames_clean_eof_returns_empty() {
         let mut reader = Cursor::new(Vec::<u8>::new());
-        let frames = read_raw_zstd_frames(&mut reader, 4).expect("clean EOF should be Ok");
+        let frames =
+            read_raw_zstd_frames(&mut reader, 4, usize::MAX).expect("clean EOF should be Ok");
         assert!(frames.is_empty(), "no frames in an empty stream");
     }
 
@@ -4459,8 +4998,8 @@ mod tests {
         buf.extend_from_slice(&frame_len.to_le_bytes());
         buf.extend_from_slice(&body[..body.len() / 2]);
 
-        let err =
-            read_raw_zstd_frames(&mut Cursor::new(buf), 1).expect_err("truncated body must error");
+        let err = read_raw_zstd_frames(&mut Cursor::new(buf), 1, usize::MAX)
+            .expect_err("truncated body must error");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
@@ -4476,8 +5015,60 @@ mod tests {
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(f);
         }
-        let frames = read_raw_zstd_frames(&mut Cursor::new(buf), 8).expect("two frames");
+        let frames =
+            read_raw_zstd_frames(&mut Cursor::new(buf), 8, usize::MAX).expect("two frames");
         assert_eq!(frames, vec![first_frame, second_frame]);
+    }
+
+    /// A refill sized in entries from a small mean still stops at its byte
+    /// budget once large frames arrive.
+    ///
+    /// The deep read-ahead path derives the entry count `n` from a running mean
+    /// block size, so a source first measured from small frames earns a large
+    /// `n`. If a burst of larger frames then follows, reading all `n` would pull
+    /// far more than one refill; the byte budget stops the read on the frame
+    /// that first crosses it. This is the read-side half of the deep-FIFO byte
+    /// bound -- the FIFO-occupancy half is `admitted_read_batch`. It is the
+    /// small-frames-then-max-size-frames regression the byte bound exists for.
+    #[test]
+    fn read_raw_zstd_frames_stops_at_the_byte_budget() {
+        // Ten 1 KiB "frames", then one MAX_ZSTD_FRAME_BYTES frame, then five
+        // more small frames. The parser does not decompress, so opaque bytes
+        // stand in for real zstd frames.
+        let small = vec![0xAAu8; 1024];
+        let large = vec![0xBBu8; MAX_ZSTD_FRAME_BYTES];
+        let mut buf: Vec<u8> = Vec::new();
+        let mut frame_into = |bytes: &[u8]| {
+            let len = u32::try_from(bytes.len()).expect("fits");
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(bytes);
+        };
+        for _ in 0..10 {
+            frame_into(&small);
+        }
+        frame_into(&large);
+        for _ in 0..5 {
+            frame_into(&small);
+        }
+
+        // A 64 KiB budget with n = 100 would read all sixteen frames on entry
+        // count alone. The ten small frames total ~10 KiB (under budget), so the
+        // eleventh (large) frame is what crosses it and ends the read.
+        let budget = 64 * 1024;
+        let frames = read_raw_zstd_frames(&mut Cursor::new(buf), 100, budget).expect("frames read");
+
+        assert_eq!(
+            frames.len(),
+            11,
+            "the read must stop on the frame that crosses the budget, not exhaust n"
+        );
+        let total: usize = frames.iter().map(Vec::len).sum();
+        let crossing_frame = frames.iter().map(Vec::len).max().expect("non-empty");
+        assert!(
+            total <= budget + crossing_frame,
+            "read of {total} B overshot the {budget} B budget by more than the crossing frame \
+             ({crossing_frame} B)"
+        );
     }
 
     // ========================================================================
@@ -4604,6 +5195,57 @@ mod tests {
             pool.shared.phase2_lowest_active.load(Ordering::Relaxed),
             0,
             "the new source set must be prioritized from its own first file"
+        );
+
+        pool.shutdown();
+    }
+
+    /// A pool that merges twice must size the second merge's refill allowance
+    /// from the second merge's own blocks.
+    ///
+    /// `awaited_sizing` divides accumulated bytes by accumulated blocks, so
+    /// carrying the previous merge's totals across would blend two block-size
+    /// populations into one mean. Spill block size moves with the codec, the
+    /// compression level and the sort order (measured: 10,448 B/block for
+    /// template-coordinate against 14,407 B for queryname on one input), so the
+    /// blend is not a rounding difference -- it picks the wrong batch. The skip
+    /// tallies are diagnostics for one merge and read as that merge's totals.
+    #[test]
+    fn test_set_phase2_files_restarts_the_refill_sizing_counters() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spill = |name: &str| {
+            let path = dir.path().join(name);
+            let mut file = std::fs::File::create(&path).expect("create");
+            file.write_all(&[0x1f, 0x8b, 0x00, 0x00]).expect("write magic");
+            path
+        };
+
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf);
+        pool.set_phase2_files(std::slice::from_ref(&spill("first.spill")))
+            .expect("set_phase2_files");
+
+        // Stand in for a first merge that read wide blocks and skipped often.
+        pool.shared.phase2_read_bytes.store(64 * 1024 * 10, Ordering::Relaxed);
+        pool.shared.phase2_read_blocks.store(10, Ordering::Relaxed);
+        for reason in 0..4 {
+            pool.shared.awaited_skips[reason].store(7, Ordering::Relaxed);
+        }
+        let (first_mean, ..) = pool.awaited_sizing();
+        assert_eq!(first_mean, 64 * 1024, "guard: the first merge's mean must be observable");
+
+        pool.set_phase2_files(&[spill("second-a.spill"), spill("second-b.spill")])
+            .expect("set_phase2_files");
+
+        let (mean, ..) = pool.awaited_sizing();
+        assert_eq!(
+            mean, 0,
+            "a new source set must size its allowance from its own blocks, not the prior merge's"
+        );
+        assert_eq!(
+            pool.awaited_skip_counts(),
+            [0; 4],
+            "skip tallies describe one merge and must not accumulate across merges"
         );
 
         pool.shutdown();

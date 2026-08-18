@@ -1206,6 +1206,42 @@ impl<K: RawSortKey + Default + 'static> ChunkSource<K> {
 /// loops set the consumer); a missing consumer is a pipeline bug and returns an
 /// error here — matching [`ChunkSource::advance`]'s handling of the same
 /// invariant — rather than silently writing empty/stale scratch bytes.
+/// How the merge presented each record to the writer: borrowed straight from
+/// the decompressed block, or reassembled into scratch because it straddled a
+/// block boundary.
+///
+/// Process-wide rather than per-merge because the merge loop hands out `&[u8]`
+/// and threading a counter through it would change the signature of the hot
+/// path. These are never reset — concurrent sorts sharing the process would
+/// race a reset — so the merge loop snapshots them before and after its run and
+/// reports only the delta (see `log_merge_sub_phases`) rather than the running
+/// total. The delta is exact for sequential sorts; if another sort runs
+/// concurrently in the same process its records fall inside the window and
+/// inflate the delta, but that is a diagnostic-only skew and is preferable to a
+/// race-prone reset.
+static RECORD_BORROWED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RECORD_REASSEMBLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Consumer-side per-merge diagnostics for the sub-phase log.
+///
+/// Grouped into one value so they travel together and keep
+/// [`RawExternalSorter::log_merge_sub_phases`] within its argument budget. All
+/// four are scoped to a single merge: the backpressure fields are measured over
+/// this merge's loop, and the presentation counts are a delta of the
+/// process-wide [`RECORD_BORROWED`]/[`RECORD_REASSEMBLED`] atomics taken across
+/// the loop.
+#[derive(Clone, Copy)]
+struct MergeConsumerDiag {
+    /// Seconds the consumer blocked waiting for an output permit (exact).
+    backpressure_secs: f64,
+    /// Number of output-permit waits.
+    backpressure_waits: u64,
+    /// Records handed to the writer borrowed zero-copy from a decompressed block.
+    borrowed: u64,
+    /// Records reassembled into scratch because they straddled a block boundary.
+    reassembled: u64,
+}
+
 #[inline]
 fn winner_record_bytes<'a, K: RawSortKey + Default + 'static>(
     source: &'a ChunkSource<K>,
@@ -1221,7 +1257,19 @@ fn winner_record_bytes<'a, K: RawSortKey + Default + 'static>(
             })?;
             // `Some` on the zero-copy fast path; `None` means the record
             // straddled a block boundary and was reassembled into `scratch`.
-            Ok(consumer.current_record_bytes(*source_id).unwrap_or(scratch.as_slice()))
+            //
+            // Counted, not timed: this runs once per record on the one thread
+            // that touches every record, so a clock read here would cost more
+            // than the step. What was unknown is how often the copy path fires
+            // at all -- a frequency answers that, and the per-record cost is a
+            // memcpy of a ~100-byte record either way.
+            if let Some(borrowed) = consumer.current_record_bytes(*source_id) {
+                RECORD_BORROWED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(borrowed)
+            } else {
+                RECORD_REASSEMBLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(scratch.as_slice())
+            }
         }
         other => Ok(other.current_bytes()),
     }
@@ -1718,6 +1766,14 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             // exactly the thing a sampled version would get wrong.
             let (raw_len, decomp_len, in_flight) = self.files[source_id].depths();
             let state = crate::merge_stalls::AwaitedState::classify(decomp_len, in_flight, raw_len);
+            // Tell the pool which file the merge is blocked on, so it reads
+            // ahead deeply there. The drain frontier is the same file only when
+            // sources drain in order; on a partially-correlated input the merge
+            // parks on a source that is not the lowest undrained one, and that
+            // source was reading at the shallow allowance.
+            self.shared
+                .phase2_awaited_source
+                .store(source_id, std::sync::atomic::Ordering::Relaxed);
             let park_start = Instant::now();
             std::thread::park();
             let parked_ns = crate::merge_trace::elapsed_nanos(park_start);
@@ -1777,13 +1833,31 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             }
             let len = u32::from_le_bytes(len_buf) as usize;
 
+            // Fast path, same as the embedded case: the key and length have been
+            // consumed, so if the record itself is contiguous in the current
+            // block it can be borrowed in place. Previously every keyed record
+            // was copied into scratch, which on a template-coordinate merge is a
+            // full-record memcpy per record on the one thread that touches every
+            // record -- measured at 776,167,078 of 776,167,078 records (100%),
+            // against a comment claiming the borrow path took "the vast
+            // majority". Nothing about a keyed record makes it uncopyable; the
+            // borrow simply had not been extended past the embedded path.
+            if self.parser_state[source_id].remaining() >= len {
+                let st = &mut self.parser_state[source_id];
+                let start = st.current_pos;
+                let end = start + len;
+                st.current_pos = end;
+                st.cur_record = CurRecord::Borrowed { start, end };
+                return Ok(Some(key));
+            }
+
+            // Slow path: the record spans a block boundary, so it has to be
+            // reassembled into the source's scratch buffer.
             buf.clear();
             buf.resize(len, 0);
             if !self.read_exact_from_source(source_id, buf)? {
                 return Err(anyhow::anyhow!("truncated record in chunk source {source_id}"));
             }
-            // Keyed records are always presented from scratch — only the
-            // EMBEDDED coordinate/template path is zero-copy for now.
             self.parser_state[source_id].cur_record = CurRecord::Scratch;
             Ok(Some(key))
         }
@@ -4216,20 +4290,72 @@ impl RawExternalSorter {
     /// divides by; using `loop_total` there would charge worker busy time to a
     /// window that ended before some of it happened.
     #[allow(clippy::cast_precision_loss)]
+    /// Log the consumer's CPU cost, partitioned from exact totals.
+    ///
+    /// The sampled sub-phase rows are magnitude-biased -- they routinely sum past
+    /// loop wall, and `log_merge_sub_phases` says so -- but their *ratios* hold up
+    /// far better than their absolute values, because the bias comes from scaling
+    /// whichever samples happened to land on a stall and inflates the buckets
+    /// roughly together. So this takes the split from sampling and the total from
+    /// quantities that are exact: loop wall minus the two stalls that are timed
+    /// exactly. The breakdown then partitions the loop by construction rather
+    /// than overshooting it by 30-50%.
+    fn log_consumer_cpu(
+        sampled: (f64, f64, f64, f64),
+        records: (u64, f64),
+        stalls: Option<&crate::merge_stalls::ConsumerStallReport>,
+    ) {
+        let (loop_total, est_read, est_tree, est_write) = sampled;
+        let (records_merged, blocked_secs) = records;
+        if records_merged == 0 {
+            return;
+        }
+        let park_secs = stalls.map_or(0.0, |s| s.park_secs);
+        let consumer_cpu = (loop_total - park_secs - blocked_secs).max(0.0);
+        #[allow(clippy::cast_precision_loss, reason = "record counts stay far below 2^52")]
+        let records = records_merged as f64;
+        // Park is inside the sampled "fetch" bucket, and output backpressure is
+        // inside the sampled "write" bucket. `consumer_cpu` already excludes
+        // both, so remove them from their buckets before taking ratios or the
+        // waits would be counted on both sides and inflate their shares.
+        let fetch_cpu = (est_read - park_secs).max(0.0);
+        let write_cpu = (est_write - blocked_secs).max(0.0);
+        let ratio_total = fetch_cpu + est_tree + write_cpu;
+        info!(
+            "  Consumer CPU: {consumer_cpu:.1}s exact (loop {loop_total:.1}s - park \
+             {park_secs:.1}s - backpressure {blocked_secs:.1}s) = {:.0} ns/record",
+            consumer_cpu * 1e9 / records
+        );
+        if ratio_total <= 0.0 {
+            return;
+        }
+        let share = |part: f64| consumer_cpu * part / ratio_total;
+        let ns = |part: f64| share(part) * 1e9 / records;
+        info!("    parse + key extract: {:.1}s ({:.0} ns/rec)", share(fetch_cpu), ns(fetch_cpu));
+        info!("    loser tree:          {:.1}s ({:.0} ns/rec)", share(est_tree), ns(est_tree));
+        info!("    enqueue write:       {:.1}s ({:.0} ns/rec)", share(write_cpu), ns(write_cpu));
+        info!(
+            "    (totals exact; the split between them is sampled, so read the shares as \
+             proportions rather than to the tenth of a second)"
+        );
+    }
+
     fn log_merge_sub_phases(
-        loop_total: f64,
-        merge_total: f64,
+        walls: (f64, f64),
         consumer: (f64, f64, f64),
         sampling: (u64, u64),
         active_workers: usize,
         pool: &Arc<SortWorkerPool>,
         stalls: Option<crate::merge_stalls::ConsumerStallReport>,
+        consumer_diag: MergeConsumerDiag,
     ) {
+        let (loop_total, merge_total) = walls;
         let (write_secs, read_secs, tree_secs) = consumer;
         let (samples_taken, records_merged) = sampling;
         if records_merged == 0 {
             return;
         }
+        #[allow(clippy::cast_precision_loss, reason = "sample counts stay far below 2^52")]
         let scale =
             if samples_taken > 0 { records_merged as f64 / samples_taken as f64 } else { 1.0 };
         let (est_write, est_read, est_tree) =
@@ -4240,23 +4366,38 @@ impl RawExternalSorter {
             "  Consumer (main thread; {samples_taken} samples of {records_merged} records, scaled {scale:.0}x)"
         );
         info!("    Fetch next record: {est_read:.1}s  (includes waiting on decompressed blocks)");
-        info!("    Loser tree:        {est_tree:.1}s");
-        info!(
-            "    Enqueue write:     {est_write:.1}s  (hands off to workers; excludes compression)"
-        );
-        info!("    Loop wall clock:   {loop_total:.1}s");
-        info!("    Merge wall clock:  {merge_total:.1}s (loop plus output finalization)");
-        // These three estimates partition one thread's time, so they cannot
-        // legitimately exceed it. Saying so in the log beats leaving a reader to
-        // notice the arithmetic -- a biased sample is the failure mode here, and
-        // it is silent otherwise.
-        let consumer_est = est_read + est_tree + est_write;
-        if consumer_est > loop_total * 1.05 {
+        let MergeConsumerDiag {
+            backpressure_secs: blocked_secs,
+            backpressure_waits: blocked_waits,
+            borrowed,
+            reassembled,
+        } = consumer_diag;
+        if blocked_waits > 0 {
+            #[allow(clippy::cast_precision_loss, reason = "wait counts stay far below 2^52")]
+            let mean_us = blocked_secs * 1e6 / blocked_waits as f64;
             info!(
-                "    NOTE: rows sum to {consumer_est:.1}s > loop wall {loop_total:.1}s, so the \
-                 sample is biased; treat consumer rows as indicative only"
+                "    Output backpressure: {blocked_secs:.1}s over {blocked_waits} waits \
+                 (mean {mean_us:.0} us, exact) -- the consumer blocked for an output permit"
+            );
+        } else {
+            info!("    Output backpressure: none -- the compressors always had a permit ready");
+        }
+        if borrowed + reassembled > 0 {
+            #[allow(clippy::cast_precision_loss, reason = "record counts stay far below 2^52")]
+            let pct = 100.0 * reassembled as f64 / (borrowed + reassembled) as f64;
+            info!(
+                "    Record presentation: {borrowed} borrowed zero-copy, {reassembled} \
+                 reassembled across a block boundary ({pct:.2}%, exact)"
             );
         }
+        info!("    Loser tree:        {est_tree:.1}s");
+
+        Self::log_consumer_cpu(
+            (loop_total, est_read, est_tree, est_write),
+            (records_merged, blocked_secs),
+            stalls.as_ref(),
+        );
+
         // Parking is a subset of "fetch next record", so exact park time cannot
         // legitimately exceed the sampled estimate of it. When it does, the
         // sample missed stalls: parks are rare per record and expensive when
@@ -4287,12 +4428,14 @@ impl RawExternalSorter {
             );
             info!("    Spill disk read:   {read_s:.1}s ({:.0}%) [{read_n} batches]", pct(read_s));
             // Blocks-per-batch, split by allowance. A deep share near zero means
-            // the frontier gate is not firing, which reads identically to "the
-            // deeper read-ahead did not help" unless it is reported separately.
+            // the deep-read gate (drain frontier or awaited source) is not
+            // firing, which reads identically to "the deeper read-ahead did not
+            // help" unless it is reported separately.
             let (deep_b, deep_blk, shal_b, shal_blk) = pool.read_batch_split();
+            #[allow(clippy::cast_precision_loss, reason = "block counts stay far below 2^52")]
             let per = |blk: u64, b: u64| if b == 0 { 0.0 } else { blk as f64 / b as f64 };
             info!(
-                "      frontier {deep_b} batches / {deep_blk} blocks ({:.1} per batch), \
+                "      deep {deep_b} batches / {deep_blk} blocks ({:.1} per batch), \
                  other {shal_b} batches / {shal_blk} blocks ({:.1} per batch)",
                 per(deep_blk, deep_b),
                 per(shal_blk, shal_b)
@@ -4425,8 +4568,100 @@ impl RawExternalSorter {
     /// silent, these figures are the whole report, which is why they are not
     /// gated on it. See [`crate::merge_trace`].
     #[allow(clippy::cast_precision_loss)]
-    fn log_block_lifecycle(pool: &Arc<SortWorkerPool>) {
+    /// Log how deep the pool was on the file the consumer was blocked on.
+    ///
+    /// Separates the two explanations for a starved consumer, which the park
+    /// totals alone cannot: a pool that is barely on the awaited file is
+    /// scheduling badly and can be steered, while one running near its tracked
+    /// depth is paying the head block's decompress latency and cannot be helped
+    /// by putting more workers on that same file.
+    fn log_awaited_file_depth(
+        consumer: &crate::merge_trace::ConsumerTraceReport,
+        pool: &Arc<SortWorkerPool>,
+    ) {
         use crate::merge_stalls::AwaitedState;
+        use crate::merge_trace::MAX_TRACKED_IN_FLIGHT;
+
+        // A merge that never stalled still has source runs to report, so this
+        // block stands on its own park count rather than on the report being
+        // non-empty -- otherwise it prints a header with nothing under it and
+        // divides by zero to fill the line below.
+        let parks = consumer.parks();
+        if parks == 0 {
+            return;
+        }
+        debug!("  Park duration by what the awaited file was doing");
+        for state in AwaitedState::ALL {
+            let hist = consumer.park_by_state[state as usize];
+            if !hist.is_empty() {
+                debug!("    {:<14} {}", state.label(), hist.summary());
+            }
+        }
+
+        let parks_pct = |count: u64| {
+            #[allow(clippy::cast_precision_loss, reason = "park counts stay far below 2^52")]
+            let pct = 100.0 * count as f64 / parks as f64;
+            pct
+        };
+        let mean_depth = consumer.mean_in_flight();
+        info!(
+            "    Workers on the awaited file at a park: none {:.0}%, exactly one {:.0}%, \
+             two or more {:.0}% (mean {mean_depth:.1}, tracked to {MAX_TRACKED_IN_FLIGHT})",
+            parks_pct(consumer.idle_file_parks()),
+            parks_pct(consumer.single_worker_parks()),
+            parks_pct(consumer.multi_worker_parks()),
+        );
+
+        // Keyed on depth against the cap rather than on which bucket is
+        // largest. "Two or more" becomes the majority long before the pool is
+        // actually deep, so a bucket comparison would call a pool running two
+        // deep saturated and retire a question the data has not answered.
+        #[allow(clippy::cast_precision_loss, reason = "the cap is a small constant")]
+        let cap = MAX_TRACKED_IN_FLIGHT as f64;
+        // Which admission gate holds the depth where it is. Rendered next to
+        // the depth itself: "only 1.9 deep of 8" is the symptom, and without
+        // the gate that produced it the next step is a guess.
+        // What the byte target actually derived. Without this a sizing
+        // regression is invisible: the wall clock moves and nothing says which
+        // batch produced it.
+        let (mean_block_bytes, derived_cap, derived_batch) = pool.awaited_sizing();
+        if mean_block_bytes > 0 {
+            info!(
+                "    Hot-file refill sized from measured blocks: {mean_block_bytes} B/block \
+                 -> batch {derived_batch}, cap {derived_cap}"
+            );
+        }
+        let skips = pool.awaited_skip_counts();
+        let skip_total: u64 = skips.iter().sum();
+        if skip_total > 0 {
+            #[allow(clippy::cast_precision_loss, reason = "skip counts stay far below 2^52")]
+            let pct = |n: u64| 100.0 * n as f64 / skip_total as f64;
+            info!(
+                "    Why the pool passed over the awaited file: raw-lock {:.0}%, raw-empty \
+                 {:.0}%, decomp-lock {:.0}%, decomp-capped {:.0}% (of {skip_total})",
+                pct(skips[0]),
+                pct(skips[1]),
+                pct(skips[2]),
+                pct(skips[3]),
+            );
+        }
+        if mean_depth >= cap / 2.0 {
+            info!(
+                "      -> the pool is running near its tracked depth on the file the merge is \
+                 blocked on, so these parks are the head block's decompress latency; more \
+                 concurrency on that file cannot shorten them"
+            );
+        } else if consumer.multi_worker_parks() > 0 {
+            info!(
+                "      -> the pool is on the awaited file but only {mean_depth:.1} deep of \
+                 {MAX_TRACKED_IN_FLIGHT} tracked, so capacity is going unused on the file the \
+                 merge is blocked on -- supply to that file, not decompress latency, is the \
+                 first thing to check"
+            );
+        }
+    }
+
+    fn log_block_lifecycle(pool: &Arc<SortWorkerPool>) {
         use crate::merge_trace::EmptyCause;
 
         let life = pool.block_lifecycle_report();
@@ -4493,21 +4728,7 @@ impl RawExternalSorter {
             // park block has to stand on its own count rather than on the report
             // being non-empty -- otherwise it prints a header with nothing under
             // it and divides by zero to fill the line below.
-            let parks = consumer.parks();
-            if parks > 0 {
-                debug!("  Park duration by what the awaited file was doing");
-                for state in AwaitedState::ALL {
-                    let hist = consumer.park_by_state[state as usize];
-                    if !hist.is_empty() {
-                        debug!("    {:<14} {}", state.label(), hist.summary());
-                    }
-                }
-                info!(
-                    "    Workers on the awaited file at a park: none {:.0}%, exactly one {:.0}%",
-                    100.0 * consumer.idle_file_parks() as f64 / parks as f64,
-                    100.0 * consumer.single_worker_parks() as f64 / parks as f64
-                );
-            }
+            Self::log_awaited_file_depth(&consumer, pool);
             if !consumer.source_run_length.is_empty() {
                 info!(
                     "  Consecutive blocks per source: {}",
@@ -4710,6 +4931,11 @@ impl RawExternalSorter {
         if let Some(consumer) = guard.consumer_mut() {
             consumer.restart_stalls();
         }
+        // Snapshot the process-wide presentation counters so the sub-phase log
+        // reports only this merge's delta, not totals accumulated by any prior
+        // (sequential or concurrent) sort sharing the process.
+        let borrowed_before = RECORD_BORROWED.load(std::sync::atomic::Ordering::Relaxed);
+        let reassembled_before = RECORD_REASSEMBLED.load(std::sync::atomic::Ordering::Relaxed);
         let loop_start = Instant::now();
 
         while tree.winner_is_active() {
@@ -4764,6 +4990,10 @@ impl RawExternalSorter {
         }
 
         let loop_total = loop_start.elapsed().as_secs_f64();
+        let borrowed_this_merge =
+            RECORD_BORROWED.load(std::sync::atomic::Ordering::Relaxed) - borrowed_before;
+        let reassembled_this_merge =
+            RECORD_REASSEMBLED.load(std::sync::atomic::Ordering::Relaxed) - reassembled_before;
         // The active limit, not the pool width: Phase 2 caps the pool to
         // `phase2_threads`, so on a run with a wider Phase 1 the extra threads
         // cannot take merge work and must not sit in the utilization
@@ -4771,6 +5001,16 @@ impl RawExternalSorter {
         // would call a CPU-bound merge I/O-bound. Read while Phase 2 is still
         // active, so the number cannot depend on what teardown does to the cap.
         let active_workers = pool.active_workers();
+
+        // Output backpressure, harvested before finalize for the same reason as
+        // the stall report below: `finish` drains the output queue, and permits
+        // taken during that drain belong to the drain, not to the merge loop.
+        //
+        // This is the merge's *second* consumer stall, and until now the only
+        // unmeasured one. The consumer blocks here once per output block when the
+        // compressors are behind, which the sampled breakdown charged to "enqueue
+        // write" -- a bucket documented as a handoff that excludes compression.
+        let (write_blocked_secs, write_blocked_waits) = writer.write_backpressure();
 
         // Harvest the consumer's stall report before finalizing: `finish_output`
         // releases the merge sources and with them the consumer, and the report
@@ -4793,13 +5033,18 @@ impl RawExternalSorter {
         guard.finish_output(|| writer.finish())?;
 
         Self::log_merge_sub_phases(
-            loop_total,
-            loop_start.elapsed().as_secs_f64(),
+            (loop_total, loop_start.elapsed().as_secs_f64()),
             (merge_write_secs, merge_read_secs, merge_tree_secs),
             (samples_taken, records_merged),
             active_workers,
             pool,
             stalls,
+            MergeConsumerDiag {
+                backpressure_secs: write_blocked_secs,
+                backpressure_waits: write_blocked_waits,
+                borrowed: borrowed_this_merge,
+                reassembled: reassembled_this_merge,
+            },
         );
 
         merge_progress.log_final();
@@ -7713,6 +7958,18 @@ mod tests {
     /// path that the zero-copy fast path falls back to. This guards that
     /// fast/slow split: the fast path handles the ~200 normal reads, the slow
     /// path the one oversized read, and every byte must round-trip.
+    ///
+    /// The split is asserted, not just described. It was described here (and in
+    /// `parse_next_record`) while the keyed orders in fact reassembled *every*
+    /// record: the borrow was implemented only for the `EMBEDDED_IN_RECORD`
+    /// keys, so a template-coordinate merge paid a full-record copy 776,167,078
+    /// times out of 776,167,078 on the one thread that touches every record.
+    /// Prose cannot catch that regression; a counter can.
+    ///
+    /// The counters are process-global, so under `cargo ci-test` (nextest,
+    /// process-per-test) these deltas are exactly this test's, while under a
+    /// thread-parallel `cargo test` a concurrent test can only inflate them.
+    /// Asserting lower bounds is therefore sound in both.
     #[rstest::rstest]
     #[case::coordinate(SortOrder::Coordinate)]
     #[case::template_coordinate(SortOrder::TemplateCoordinate)]
@@ -7752,6 +8009,9 @@ mod tests {
         let output = dir.path().join("output.bam");
         builder.write_bam(&input).expect("write_bam");
 
+        let borrowed_before = RECORD_BORROWED.load(std::sync::atomic::Ordering::Relaxed);
+        let reassembled_before = RECORD_REASSEMBLED.load(std::sync::atomic::Ordering::Relaxed);
+
         // Memory limit below the oversized record forces it into its own spill
         // chunk (so it is read back through the PoolDisk merge, not from memory);
         // two threads give a genuine multi-source merge.
@@ -7783,6 +8043,27 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 201, "spill + pool merge lost records");
+
+        // The fast/slow split the doc comment above describes.
+        let borrowed = RECORD_BORROWED.load(std::sync::atomic::Ordering::Relaxed) - borrowed_before;
+        let reassembled =
+            RECORD_REASSEMBLED.load(std::sync::atomic::Ordering::Relaxed) - reassembled_before;
+        assert!(
+            reassembled >= 1,
+            "the oversized record spans blocks and must reassemble into scratch, exercising the \
+             slow path; got {reassembled} reassembled for {sort_order:?}"
+        );
+        // Measured: 100 of the 201 records come back through the PoolDisk merge
+        // (the rest are served from the in-memory chunk, which never parses).
+        // With the keyed borrow removed this is 0 for TemplateCoordinate and
+        // unchanged at 100 for Coordinate, which is what makes this an
+        // order-sensitive guard rather than a restatement of the record count.
+        assert!(
+            borrowed >= 90,
+            "normal records are borrowed in place, so this merge must borrow ~100 of them -- 0 \
+             means the zero-copy path never fires for {sort_order:?}, which is how the keyed \
+             orders silently copied every record; got {borrowed} borrowed"
+        );
         let oversized_bases = oversized_bases.expect("oversized read must survive the merge");
         assert_eq!(
             oversized_bases.len(),
