@@ -63,15 +63,16 @@ struct IndexState {
 }
 
 impl PooledBamWriter {
-    /// Writer-side distributions: per-block write, reorder wait, reorder depth.
-    pub(crate) fn writer_stats(
-        &self,
-    ) -> (
-        crate::merge_trace::HistogramReport,
-        crate::merge_trace::HistogramReport,
-        crate::merge_trace::HistogramReport,
-    ) {
-        self.staging.as_ref().map_or_else(Default::default, StagingBuffer::writer_stats)
+    /// The permit pool carrying this writer's histograms, if the writer has not
+    /// yet been finalized.
+    ///
+    /// Retain this [`Arc`] before [`finish`](Self::finish) and read
+    /// [`PermitPool::writer_stats`] afterwards: the pool outlives the writer, so
+    /// the snapshot then includes the block writes and reorder waits performed
+    /// during the output drain that `finish` runs — a snapshot taken through the
+    /// live writer would omit that tail.
+    pub(crate) fn permit_pool(&self) -> Option<Arc<PermitPool>> {
+        self.staging.as_ref().map(|staging| Arc::clone(staging.permit_pool()))
     }
 
     /// Seconds the producer spent blocked waiting for an output permit, and the
@@ -621,6 +622,51 @@ mod tests {
             .expect("records should read cleanly")
             .len();
         assert_eq!(record_count, num_records);
+
+        if let Ok(pool) = Arc::try_unwrap(pool) {
+            pool.shutdown();
+        }
+    }
+
+    /// The writer histograms must be harvested *after* `finish` drains the output
+    /// queue, not before: the drain flushes the final partial block (and any
+    /// still-queued blocks) through the I/O thread, so a snapshot taken while the
+    /// writer is still alive omits those drain-time writes. Retaining the permit
+    /// pool and reading [`PermitPool::writer_stats`] after `finish` captures the
+    /// full write count.
+    #[test]
+    fn test_writer_stats_include_finish_drain() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let bam_path = dir.path().join("drain.bam");
+        let header = test_header();
+        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf));
+
+        // Retain the permit pool before finalizing, exactly as the merge path does,
+        // and snapshot the block-write count both before and after the drain.
+        let (before, after) = {
+            let mut writer =
+                PooledBamWriter::new(Arc::clone(&pool), &bam_path, &header).expect("create writer");
+            for i in 0..5000 {
+                let rec = make_test_record(format!("read_{i:06}").as_bytes(), 100);
+                writer.write_raw_record(&rec).expect("write record");
+            }
+            let permit_pool = writer.permit_pool().expect("permit pool present before finish");
+
+            let before = permit_pool.writer_stats().0.count;
+            writer.finish().expect("finish writer");
+            let after = permit_pool.writer_stats().0.count;
+            (before, after)
+        };
+
+        // The final flush and drain happen inside `finish`, so the post-drain
+        // count must exceed the pre-drain count -- the exact regression the
+        // pre-finalize snapshot silently dropped.
+        assert!(after > 0, "drain-inclusive snapshot must record block writes, got {after}");
+        assert!(
+            after > before,
+            "finish drain must add block writes the pre-finish snapshot missed: \
+             before={before}, after={after}"
+        );
 
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();

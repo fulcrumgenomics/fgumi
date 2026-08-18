@@ -48,29 +48,25 @@ pub(crate) struct StagingBuffer {
 }
 
 impl StagingBuffer {
-    /// Create a new staging buffer.
-    #[must_use]
-    /// Seconds this buffer's producer spent blocked waiting for an output
-    /// permit, and the number of waits. See [`PermitPool::blocked`].
-    /// Writer-side distributions: per-block write, reorder wait, reorder depth.
-    pub(crate) fn writer_stats(
-        &self,
-    ) -> (
-        crate::merge_trace::HistogramReport,
-        crate::merge_trace::HistogramReport,
-        crate::merge_trace::HistogramReport,
-    ) {
-        (
-            self.permit_pool.write_dur.snapshot(),
-            self.permit_pool.write_reorder_wait.snapshot(),
-            self.permit_pool.write_reorder_depth.snapshot(),
-        )
+    /// The permit pool that carries this writer's histograms.
+    ///
+    /// Exposed so a caller can retain the [`Arc`] and harvest
+    /// [`PermitPool::writer_stats`] *after* the output drain. The writer's own
+    /// `finish` consumes the staging to run that drain, so the pool is the only
+    /// handle that outlives it. See that method for why the drain must be
+    /// included.
+    pub(crate) fn permit_pool(&self) -> &Arc<PermitPool> {
+        &self.permit_pool
     }
 
+    /// Seconds this buffer's producer spent blocked waiting for an output
+    /// permit, and the number of waits. See [`PermitPool::blocked`].
     pub(crate) fn write_backpressure(&self) -> (f64, u64) {
         self.permit_pool.blocked()
     }
 
+    /// Create a new staging buffer.
+    #[must_use]
     pub(crate) fn new(
         pool: Arc<SortWorkerPool>,
         result_tx: Sender<CompressResult>,
@@ -306,7 +302,10 @@ fn io_writer_loop_inner<W: Write>(
         }
         // Sampled on every arrival, in-order or not, so the depth reflects the
         // queue the writer is actually carrying rather than only its bad moments.
-        permit_pool.write_reorder_depth.record(reorder_buf.len() as u64);
+        // A block count rides a duration histogram, so `record_count` scales it
+        // into the microsecond lane; recording the raw count would bucket every
+        // depth below `BLOCKS_TO_NANOS` to zero and the report would read zero.
+        permit_pool.write_reorder_depth.record_count(reorder_buf.len() as u64);
     }
 
     // Drain remaining buffered blocks — any gap means a worker dropped a result.

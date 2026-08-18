@@ -515,14 +515,6 @@ pub(crate) struct PermitPool {
     /// finally surfaced. This never produced wrong output or a hang; it just
     /// wasted work on the failure path.
     closed: AtomicBool,
-    /// Nanoseconds producers spent blocked waiting for a permit, and how many
-    /// waits that was.
-    ///
-    /// This is the *output* backpressure stall. On the merge it lands on the
-    /// consumer thread -- the one thread that touches every record -- so it is
-    /// directly on the critical path, and it was previously invisible: the
-    /// sampled sub-phase breakdown folded it into "enqueue write", which is
-    /// documented as a handoff that excludes compression.
     /// Writing one compressed block to the file.
     ///
     /// Lives here rather than on the pool because the I/O writer thread already
@@ -534,6 +526,14 @@ pub(crate) struct PermitPool {
     pub(crate) write_reorder_wait: crate::merge_trace::DurationHistogram,
     /// Blocks held in that map, sampled on each arrival. Read "us" as "blocks".
     pub(crate) write_reorder_depth: crate::merge_trace::DurationHistogram,
+    /// Nanoseconds producers spent blocked waiting for a permit, and how many
+    /// waits that was.
+    ///
+    /// This is the *output* backpressure stall. On the merge it lands on the
+    /// consumer thread -- the one thread that touches every record -- so it is
+    /// directly on the critical path, and it was previously invisible: the
+    /// sampled sub-phase breakdown folded it into "enqueue write", which is
+    /// documented as a handoff that excludes compression.
     blocked_nanos: AtomicU64,
     blocked_waits: AtomicU64,
 }
@@ -596,6 +596,27 @@ impl PermitPool {
         #[allow(clippy::cast_precision_loss, reason = "nanosecond totals stay far below 2^52")]
         let secs = nanos as f64 / 1e9;
         (secs, self.blocked_waits.load(Ordering::Relaxed))
+    }
+
+    /// Writer-side distributions: per-block write, reorder wait, reorder depth.
+    ///
+    /// Read from the pool rather than the writer's staging buffer because the
+    /// pool outlives `PooledBamWriter::finish`, which consumes the staging: the
+    /// output drain happens inside `finish`, so a snapshot taken through the
+    /// still-live writer would omit every block written and every reorder wait
+    /// incurred during the drain.
+    pub(crate) fn writer_stats(
+        &self,
+    ) -> (
+        crate::merge_trace::HistogramReport,
+        crate::merge_trace::HistogramReport,
+        crate::merge_trace::HistogramReport,
+    ) {
+        (
+            self.write_dur.snapshot(),
+            self.write_reorder_wait.snapshot(),
+            self.write_reorder_depth.snapshot(),
+        )
     }
 
     /// Release a permit back to the pool after a block has been written to disk.
@@ -1437,13 +1458,10 @@ pub(crate) struct SharedPipelineState {
     /// The recoverable half: targeting a parked worker would have delivered these.
     /// A wake with nobody parked at all is not the targeting rule's fault.
     pub(crate) wakes_recoverable: AtomicU64,
-    /// Critical-path awaited claims, split by how the serving worker's park ended.
-    ///
-    /// `from_timeout` winning means the wake never reached anyone and recruitment
-    /// latency is set by the backoff, not by unpark cost. Inferred -- see
-    /// [`crate::merge_stalls::classify_park_exit`].
-    pub(crate) awaited_from_unpark: AtomicU64,
-    pub(crate) awaited_from_timeout: AtomicU64,
+    /// Consumer parks split by what the pool looked like at the instant of the
+    /// park: a sleeper was available, everyone was busy compressing, or everyone
+    /// was busy merging. See [`crate::merge_stalls::ParkSupply`].
+    pub(crate) park_supply: crate::merge_stalls::ParkSupplyCensus,
 
     /// Read batches taken at the deep frontier allowance, and the blocks they
     /// returned; and the same for batches taken at the uniform allowance.
@@ -1528,8 +1546,7 @@ impl SharedPipelineState {
             worker_parked: (0..num_workers).map(|_| AtomicBool::new(false)).collect(),
             wakes_on_running_worker: AtomicU64::new(0),
             wakes_recoverable: AtomicU64::new(0),
-            awaited_from_unpark: AtomicU64::new(0),
-            awaited_from_timeout: AtomicU64::new(0),
+            park_supply: crate::merge_stalls::ParkSupplyCensus::default(),
             deep_read_batches: AtomicU64::new(0),
             deep_read_blocks: AtomicU64::new(0),
             shallow_read_batches: AtomicU64::new(0),
@@ -1554,19 +1571,6 @@ impl SharedPipelineState {
         }
     }
 
-    /// Wake one idle worker, rotating which one.
-    ///
-    /// The consumer calls this the instant a reorder buffer drains. Without it
-    /// the wake path runs one way — workers to main thread — so a file that
-    /// runs dry waits out an idle worker's backoff (up to [`MAX_BACKOFF_US`])
-    /// before anyone even looks at it. That wait is pure latency: the work is
-    /// available and unclaimed.
-    ///
-    /// One worker, not all: the refill it needs to start is a disk read, which
-    /// is serialized by the file's reader mutex anyway, and a woken worker
-    /// resets its own backoff to [`MIN_BACKOFF_US`] on success and so stays hot
-    /// for the blocks that follow. Waking the whole pool would spend N fruitless
-    /// scans to get the one read that matters.
     /// Wake the merge consumer, stamping when it became runnable.
     ///
     /// Every consumer wake goes through here so the park decomposition cannot
@@ -1587,6 +1591,19 @@ impl SharedPipelineState {
         self.main_thread_handle.unpark();
     }
 
+    /// Wake one idle worker, rotating which one.
+    ///
+    /// The consumer calls this the instant a reorder buffer drains. Without it
+    /// the wake path runs one way — workers to main thread — so a file that
+    /// runs dry waits out an idle worker's backoff (up to [`MAX_BACKOFF_US`])
+    /// before anyone even looks at it. That wait is pure latency: the work is
+    /// available and unclaimed.
+    ///
+    /// One worker, not all: the refill it needs to start is a disk read, which
+    /// is serialized by the file's reader mutex anyway, and a woken worker
+    /// resets its own backoff to [`MIN_BACKOFF_US`] on success and so stays hot
+    /// for the blocks that follow. Waking the whole pool would spend N fruitless
+    /// scans to get the one read that matters.
     pub(crate) fn wake_one_worker(&self) {
         if self.worker_threads.is_empty() {
             return;
@@ -1616,13 +1633,19 @@ impl SharedPipelineState {
         }
     }
 
-    /// Record which kind of park exit produced a critical-path awaited claim.
-    pub(crate) fn record_awaited_recruitment(&self, exit: crate::merge_stalls::ParkExit) {
-        let counter = match exit {
-            crate::merge_stalls::ParkExit::Unparked => &self.awaited_from_unpark,
-            crate::merge_stalls::ParkExit::TimedOut => &self.awaited_from_timeout,
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
+    /// How many workers are parked right now, and whether output compression is
+    /// queued -- the two facts that say why nobody had already started on the
+    /// block the consumer is about to wait for.
+    ///
+    /// Scans the parked flags rather than keeping a running count: it runs once
+    /// per consumer park against at most `SORT_MAX_THREADS` relaxed loads, and a
+    /// counter would need an atomic add on both sides of every worker's wait --
+    /// the far hotter path.
+    pub(crate) fn park_supply_now(&self) -> crate::merge_stalls::ParkSupply {
+        let limit = self.active_worker_limit.load(Ordering::Acquire);
+        let width = limit.min(self.worker_parked.len());
+        let parked = (0..width).filter(|&i| self.worker_parked[i].load(Ordering::Relaxed)).count();
+        crate::merge_stalls::classify_park_supply(parked, self.compress_queue.len())
     }
 
     /// Which worker slot the next wake should target.
@@ -1720,10 +1743,6 @@ struct SortWorkerState {
     /// Monotonic counter incremented on each idle sleep; mixed with `worker_id` to
     /// produce per-worker jitter so all workers don't wake simultaneously.
     idle_iter: u64,
-    /// How this worker's last Phase 2 park ended, inferred from elapsed vs
-    /// requested. Read when the worker wins a critical-path awaited claim, to
-    /// say whether the wake path or the backoff timer recruited it.
-    last_park_exit: crate::merge_stalls::ParkExit,
     /// The wait the previous loop iteration took, if it waited. Taken (and
     /// cleared) by the next iteration that finds work, which is what makes that
     /// wait "productive" — see [`crate::merge_stalls::WakeLatencyStats`].
@@ -1869,11 +1888,24 @@ fn get_sort_priorities(bp: &SortBackpressureState) -> &'static [SortStep] {
 /// Where the consumer's wakes went, and what recruited the worker that served
 /// the critical path.
 ///
-/// A wake aimed at an already-running worker does nothing; the consumer then
-/// waits for some other worker's backoff to expire, which is bounded by
-/// [`MAX_BACKOFF_US`] rather than by unpark cost. `from_timeout` exceeding
-/// `from_unpark` therefore means recruitment latency is set by the backoff timer
-/// and tuning the wake cannot help.
+/// **These numbers do not explain the merge's idle time. Measured, both regimes.**
+/// A wake aimed at an already-running worker does nothing, which looks like a
+/// defect worth fixing until both thread counts are measured:
+///
+/// | | t8 (fast) | t16 (slow) |
+/// | --- | --- | --- |
+/// | hit an already-running worker | **100%** | 88% |
+/// | a parked worker was available | **0%** | 27% |
+/// | consumer's wait for a worker | **10us** | 72us |
+///
+/// t8 scores worse on every count and waits 7x less, because at 91% utilization
+/// there is nobody parked to hit and a running worker reaches the awaited file
+/// almost at once. So "wakes land on busy workers" is what a *healthy* pool looks
+/// like, and targeting parked workers is not the fix for t16.
+///
+/// Kept because they are cheap and because rediscovering this costs a machine
+/// day. What does separate the regimes is
+/// [`crate::merge_stalls::ParkSupply`].
 #[derive(Debug, Clone, Copy)]
 pub struct WakeAccounting {
     /// Wakes issued.
@@ -1882,10 +1914,6 @@ pub struct WakeAccounting {
     pub on_running: u64,
     /// The subset of `on_running` where a parked worker existed and was skipped.
     pub recoverable: u64,
-    /// Critical-path awaited claims by a worker our wake cut short.
-    pub from_unpark: u64,
-    /// Critical-path awaited claims by a worker whose own backoff expired.
-    pub from_timeout: u64,
 }
 
 pub(crate) const MIN_BACKOFF_US: u64 = 10;
@@ -1910,17 +1938,12 @@ pub(crate) const MAX_BACKOFF_US: u64 = 1000;
 /// a spurious early wake, which costs one scan and is harmless — the caller
 /// loops.
 ///
-/// Returns the wait it actually asked for, in microseconds, or 0 on the
-/// `yield_now` path. The caller needs it to tell an unpark from a timeout: the
-/// jitter is applied here, so only this function knows the real deadline.
-fn idle_wait_with_jitter(backoff_us: u64, worker_id: usize, iter: u64) -> u64 {
+fn idle_wait_with_jitter(backoff_us: u64, worker_id: usize, iter: u64) {
     if backoff_us <= MIN_BACKOFF_US {
         std::thread::yield_now();
-        0
     } else {
         let actual_us = jittered_wait_micros(backoff_us, worker_id, iter);
         std::thread::park_timeout(std::time::Duration::from_micros(actual_us));
-        actual_us
     }
 }
 
@@ -2100,7 +2123,6 @@ impl SortWorkerPool {
                         held_raw_input_blocks: Vec::new(),
                         held_decompressed_input: None,
                         backoff_us: MIN_BACKOFF_US,
-                        last_park_exit: crate::merge_stalls::ParkExit::TimedOut,
                         served_awaited: false,
                         won_awaited_claim: false,
                         idle_iter: 0,
@@ -2131,29 +2153,22 @@ impl SortWorkerPool {
         }
     }
 
-    /// Park for the current backoff, publish the parked state, and record how
-    /// the park ended. Returns the elapsed park in nanoseconds.
+    /// Park for the current backoff, publish the parked state, and return the
+    /// elapsed park in nanoseconds.
     ///
     /// `worker_parked` is set before the wait and cleared after, so the window
     /// the wake path reads as "parked" is a superset of the real one: a wake is
     /// never withheld from a worker that is about to park. The reverse error --
     /// reading "running" for a worker that has just parked -- would lose a wake,
     /// so the asymmetry is deliberate.
-    ///
-    /// The exit classification needs the *jittered* deadline, which only
-    /// `idle_wait_with_jitter` knows, so it is returned rather than recomputed.
-    fn park_and_classify(shared: &SharedPipelineState, worker: &mut SortWorkerState) -> u64 {
+    fn park_and_measure(shared: &SharedPipelineState, worker: &mut SortWorkerState) -> u64 {
         let idle_start = Instant::now();
         shared.worker_parked[worker.worker_id].store(true, Ordering::Relaxed);
-        let requested_us =
-            idle_wait_with_jitter(worker.backoff_us, worker.worker_id, worker.idle_iter);
+        idle_wait_with_jitter(worker.backoff_us, worker.worker_id, worker.idle_iter);
         shared.worker_parked[worker.worker_id].store(false, Ordering::Relaxed);
         worker.idle_iter = worker.idle_iter.wrapping_add(1);
         worker.backoff_us = (worker.backoff_us * 2).min(MAX_BACKOFF_US);
-        let idle_ns = Self::nanos_u64(idle_start.elapsed());
-        worker.last_park_exit =
-            crate::merge_stalls::classify_park_exit(idle_ns / 1_000, requested_us);
-        idle_ns
+        Self::nanos_u64(idle_start.elapsed())
     }
 
     // ========================================================================
@@ -2196,11 +2211,7 @@ impl SortWorkerPool {
                 if Self::try_advance_all_held(shared, worker) {
                     worker.backoff_us = MIN_BACKOFF_US;
                 } else {
-                    let _ = idle_wait_with_jitter(
-                        worker.backoff_us,
-                        worker.worker_id,
-                        worker.idle_iter,
-                    );
+                    idle_wait_with_jitter(worker.backoff_us, worker.worker_id, worker.idle_iter);
                     worker.idle_iter = worker.idle_iter.wrapping_add(1);
                     worker.backoff_us = (worker.backoff_us * 2).min(MAX_BACKOFF_US);
                 }
@@ -2213,8 +2224,7 @@ impl SortWorkerPool {
             // 2. Check phase completion — wait for next phase, only exit on SHUTDOWN.
             //    Workers must survive across Phase 1 → Phase 2 transitions.
             if Self::is_phase_complete(shared, current_phase) && !worker.has_any_held_items() {
-                let _ =
-                    idle_wait_with_jitter(worker.backoff_us, worker.worker_id, worker.idle_iter);
+                idle_wait_with_jitter(worker.backoff_us, worker.worker_id, worker.idle_iter);
                 worker.idle_iter = worker.idle_iter.wrapping_add(1);
                 worker.backoff_us = (worker.backoff_us * 2).min(MAX_BACKOFF_US);
                 // Waiting for the next phase, not for work — see above.
@@ -2308,15 +2318,11 @@ impl SortWorkerPool {
                 }
                 if worker.won_awaited_claim {
                     pstats.record_awaited_claim(worker.worker_id);
-                    // Whether the wake path or the backoff timer recruited this
-                    // worker is the difference between a fixable wake and an
-                    // irreducible one.
-                    shared.record_awaited_recruitment(worker.last_park_exit);
                 }
                 worker.backoff_us = MIN_BACKOFF_US;
             } else {
                 let slept_us = worker.backoff_us;
-                let idle_ns = Self::park_and_classify(shared, worker);
+                let idle_ns = Self::park_and_measure(shared, worker);
                 pstats.record_idle(worker.worker_id, idle_ns);
                 shared.wake_latency.record_sleep(wake_phase(current_phase), slept_us, idle_ns);
                 worker.last_wait = Some(PendingWait { phase: current_phase, nanos: idle_ns });
@@ -3341,8 +3347,6 @@ impl SortWorkerPool {
         (mean, cap, batch)
     }
 
-    /// Why worker scans passed over the file the consumer was parked on,
-    /// as `[raw-lock, raw-empty, decomp-lock, decomp-capped]`.
     /// Where the merge consumer's park time went, split into additive stages.
     pub(crate) fn park_attribution_report(&self) -> crate::merge_stalls::ParkAttributionReport {
         self.shared.park_attribution.snapshot()
@@ -3370,14 +3374,17 @@ impl SortWorkerPool {
         &self.shared.stage_latency
     }
 
-    /// Where the consumer's wakes landed, and what actually recruited a worker.
+    /// Consumer parks split by what the pool looked like when the park began.
+    pub(crate) fn park_supply_report(&self) -> crate::merge_stalls::ParkSupplyReport {
+        self.shared.park_supply.snapshot()
+    }
+
+    /// Where the consumer's wakes landed.
     pub(crate) fn wake_accounting(&self) -> WakeAccounting {
         WakeAccounting {
             issued: self.shared.wakes_issued.load(Ordering::Relaxed),
             on_running: self.shared.wakes_on_running_worker.load(Ordering::Relaxed),
             recoverable: self.shared.wakes_recoverable.load(Ordering::Relaxed),
-            from_unpark: self.shared.awaited_from_unpark.load(Ordering::Relaxed),
-            from_timeout: self.shared.awaited_from_timeout.load(Ordering::Relaxed),
         }
     }
 
@@ -3386,6 +3393,8 @@ impl SortWorkerPool {
         self.shared.wakes_issued.load(Ordering::Relaxed)
     }
 
+    /// Why worker scans passed over the file the consumer was parked on,
+    /// as `[raw-lock, raw-empty, decomp-lock, decomp-capped]`.
     pub(crate) fn awaited_skip_counts(&self) -> [u64; 4] {
         std::array::from_fn(|i| self.shared.awaited_skips[i].load(Ordering::Relaxed))
     }

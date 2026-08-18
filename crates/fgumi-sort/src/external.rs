@@ -1783,10 +1783,15 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             self.shared.awaited_claim_nanos.store(0, ord);
             self.shared.awaited_publish_nanos.store(0, ord);
             let park_started_at = self.shared.now_nanos();
+            // Sampled BEFORE the park, not after: the question is why nobody had
+            // already started on this block, and the pool's state on *resume* is
+            // the answer to a different question -- by then somebody has.
+            let supply = self.shared.park_supply_now();
 
             let park_start = Instant::now();
             std::thread::park();
             let parked_ns = crate::merge_trace::elapsed_nanos(park_start);
+            self.shared.park_supply.record(supply, parked_ns);
             self.stalls.record_park(source_id, parked_ns, !parked_yet);
             self.shared.consumer_trace.record_park(state, parked_ns, in_flight);
 
@@ -4591,26 +4596,35 @@ impl RawExternalSorter {
                         Self::percent(wakes.recoverable, wakes.issued)
                     );
                 }
-                // The decisive split: if the backoff timer recruited more critical-path
-                // claims than the wake did, the wake path is not what sets recruitment
-                // latency and tuning unpark cost cannot help. Inferred from elapsed vs
-                // requested park time -- park_timeout does not report its reason.
-                let recruited = wakes.from_unpark + wakes.from_timeout;
-                if recruited > 0 {
-                    info!(
-                        "  Critical-path recruitment (inferred): {} by our wake, {} by the worker's own \
-                 backoff expiring ({:.0}% timer)",
-                        wakes.from_unpark,
-                        wakes.from_timeout,
-                        Self::percent(wakes.from_timeout, recruited)
-                    );
-                }
                 info!(
                     "    Wakes issued: {} (backoff 10us doubling to {}us ceiling; one worker woken \
                      per wake)",
                     pool.wakes_issued(),
                     crate::worker_pool::MAX_BACKOFF_US
                 );
+            }
+
+            // What the pool looked like when the consumer parked, which is the
+            // question "why did nobody start on this block yet" reduced to three
+            // mutually exclusive answers with three different fixes. Splitting park
+            // *time* as well as park counts matters: a rare-but-long class is
+            // invisible in counts alone. Outside the wake gate above so it stands
+            // on its own park count: a heavy-parking consumer whose wake report is
+            // empty would otherwise collect this census and never print it.
+            let supply = pool.park_supply_report();
+            if supply.total_parks() > 0 {
+                const LABELS: [&str; crate::merge_stalls::ParkSupply::COUNT] =
+                    ["a worker was asleep", "all busy, compress queued", "all busy merging"];
+                info!("  Why nobody had started on the awaited block, at the moment of the park:");
+                for (i, label) in LABELS.iter().enumerate() {
+                    info!(
+                        "    {label:<26} {:>10} parks ({:>4.1}%)  {:>7.1}s ({:>4.1}% of park time)",
+                        supply.counts[i],
+                        Self::percent(supply.counts[i], supply.total_parks()),
+                        Self::secs(supply.nanos[i]),
+                        Self::percent(supply.nanos[i], supply.total_nanos())
+                    );
+                }
             }
 
             Self::log_park_attribution(pool, loop_total);
@@ -4626,6 +4640,21 @@ impl RawExternalSorter {
         // never stalled is precisely the run with a complete lifecycle trace and
         // nothing to say above. `log_block_lifecycle` carries its own gate.
         Self::log_block_lifecycle(pool);
+    }
+
+    /// Nanoseconds as seconds.
+    #[expect(clippy::cast_precision_loss, reason = "nanosecond totals stay below 2^52")]
+    fn secs(nanos: u64) -> f64 {
+        nanos as f64 / 1e9
+    }
+
+    /// `part` as a percentage of `whole`, or 0.0 when `whole` is zero.
+    #[expect(clippy::cast_precision_loss, reason = "counts stay far below 2^52")]
+    fn percent(part: u64, whole: u64) -> f64 {
+        if whole == 0 {
+            return 0.0;
+        }
+        100.0 * part as f64 / whole as f64
     }
 
     /// Log a latency distribution for every stage a block passes through.
@@ -4649,15 +4678,6 @@ impl RawExternalSorter {
     /// the same split [`Self::log_block_lifecycle`] uses: a percentile table is
     /// for an investigation, not for someone who just sorted a BAM. Collection
     /// is unconditional either way.
-    /// `part` as a percentage of `whole`, or 0.0 when `whole` is zero.
-    #[expect(clippy::cast_precision_loss, reason = "counts stay far below 2^52")]
-    fn percent(part: u64, whole: u64) -> f64 {
-        if whole == 0 {
-            return 0.0;
-        }
-        100.0 * part as f64 / whole as f64
-    }
-
     fn log_stage_latency(
         pool: &SortWorkerPool,
         writer: &(
@@ -4851,6 +4871,30 @@ impl RawExternalSorter {
             if !hist.is_empty() {
                 debug!("    {:<14} {}", state.label(), hist.summary());
             }
+        }
+        // The same five states weighted by TIME, not by park count, and at info
+        // because the two disagree and only one of them is a cost.
+        //
+        // The park-supply census made this concrete: by count its largest class
+        // was "all busy, compress queued" at 41%, by time that class was 13%
+        // while "a worker was asleep" was 81%. Counts named the wrong fix,
+        // confidently. These histograms have always carried the nanoseconds --
+        // they were simply reported one level down, so every arm collected the
+        // answer and none printed it.
+        let state_secs: [f64; AwaitedState::COUNT] =
+            std::array::from_fn(|i| consumer.park_by_state[i].total_secs());
+        let state_total: f64 = state_secs.iter().sum();
+        if state_total > 0.0 {
+            let share = |i: usize| 100.0 * state_secs[i] / state_total;
+            info!(
+                "    The awaited file by park TIME ({state_total:.1}s): {:.0}% gap-filling, \
+                 {:.0}% gap-stalled, {:.0}% decompressing, {:.0}% raw-queued, {:.0}% starved",
+                share(AwaitedState::ReorderGapFilling as usize),
+                share(AwaitedState::ReorderGapStalled as usize),
+                share(AwaitedState::Decompressing as usize),
+                share(AwaitedState::RawQueued as usize),
+                share(AwaitedState::Starved as usize)
+            );
         }
 
         let parks_pct = |count: u64| {
@@ -5266,7 +5310,13 @@ impl RawExternalSorter {
         // compressors are behind, which the sampled breakdown charged to "enqueue
         // write" -- a bucket documented as a handoff that excludes compression.
         let (write_blocked_secs, write_blocked_waits) = writer.write_backpressure();
-        let writer_stats = writer.writer_stats();
+        // Retain the permit pool so the writer histograms can be harvested *after*
+        // `finish` drains the output queue: the pool outlives the writer, and the
+        // block writes and reorder waits incurred during that drain belong in the
+        // "write block" and "write reorder wait" rows. A snapshot taken here,
+        // before the drain, would omit the tail -- the same reason the stall
+        // report below is harvested pre-finalize but the histograms are not.
+        let writer_permit_pool = writer.permit_pool();
 
         // Harvest the consumer's stall report before finalizing: `finish_output`
         // releases the merge sources and with them the consumer, and the report
@@ -5287,6 +5337,13 @@ impl RawExternalSorter {
         // `output_compress` and divides the rest by a wall clock that stops
         // before the drain.
         guard.finish_output(|| writer.finish())?;
+
+        // Harvest now, after the drain, from the retained pool. Empty only if the
+        // writer was already finalized when the pool was retained, which cannot
+        // happen on this path.
+        let writer_stats = writer_permit_pool
+            .as_deref()
+            .map_or_else(Default::default, crate::worker_pool::PermitPool::writer_stats);
 
         Self::log_merge_sub_phases(
             (loop_total, loop_start.elapsed().as_secs_f64()),

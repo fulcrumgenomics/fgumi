@@ -1381,50 +1381,123 @@ pub fn classify_stall(
 // Worker recruitment: why the consumer waits for a worker it already woke
 // ============================================================================
 
-/// How a worker's `park_timeout` ended.
+/// Why nobody had already started on the block the consumer is about to wait for.
 ///
-/// `park_timeout` does not report its reason, so this is **inferred** from the
-/// elapsed time against the duration the worker asked for. A worker that
-/// returned meaningfully early was unparked; one that ran to its deadline timed
-/// out. Label any conclusion drawn from it as inferred.
+/// The three cases are not degrees of one problem -- they imply different fixes,
+/// which is why they are counted apart:
+///
+/// - `SleeperAvailable`: capacity was idle and unused. Pure coordination loss;
+///   the pool should have been on it.
+/// - `AllBusyCompressing`: every worker was busy and output compression was
+///   queued. Priority inversion -- `get_sort_priorities` puts `Compress` ahead
+///   of `Phase2FileWork` whenever the compress queue is non-empty, so the block
+///   the consumer is blocked on waits behind output work.
+/// - `AllBusyMerging`: every worker was busy on merge work. Genuine capacity;
+///   nothing to schedule better.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ParkExit {
-    /// Returned early -- something unparked it.
-    Unparked,
-    /// Ran to its deadline -- nobody did.
-    TimedOut,
+pub(crate) enum ParkSupply {
+    /// At least one worker was parked.
+    SleeperAvailable,
+    /// Nobody parked, and output compression was queued.
+    AllBusyCompressing,
+    /// Nobody parked, and the compress queue was empty.
+    AllBusyMerging,
 }
 
-/// Classify a park exit from elapsed vs requested microseconds.
-///
-/// The margin exists because a timed-out park overshoots its deadline by
-/// scheduler latency, so "elapsed < requested" alone would classify almost every
-/// timeout as an unpark. Requiring the wake to be clearly early instead means a
-/// *late* unpark is misread as a timeout -- the safe direction, because it
-/// under-counts the wake path's effectiveness rather than crediting it for
-/// recruitment it did not do.
-pub(crate) fn classify_park_exit(elapsed_us: u64, requested_us: u64) -> ParkExit {
-    // A park that never asked for a wait (the `yield_now` path) cannot have been
-    // cut short by anything.
-    if requested_us == 0 {
-        return ParkExit::TimedOut;
+impl ParkSupply {
+    /// Number of variants, so the census arrays indexed by [`Self::index`]
+    /// cannot fall behind the enum. Sizing them with a literal instead lets a
+    /// new variant compile and then index out of bounds inside
+    /// [`ParkSupplyCensus::record`] -- on a worker-adjacent path, where it
+    /// surfaces only as a panicked sort worker.
+    pub(crate) const COUNT: usize = 3;
+
+    /// Stable index for the census arrays.
+    fn index(self) -> usize {
+        match self {
+            Self::SleeperAvailable => 0,
+            Self::AllBusyCompressing => 1,
+            Self::AllBusyMerging => Self::COUNT - 1,
+        }
     }
-    // Three quarters of the deadline: comfortably past scheduler overshoot, and
-    // far enough from the deadline that a genuine unpark is unambiguous.
-    if elapsed_us.saturating_mul(4) < requested_us.saturating_mul(3) {
-        ParkExit::Unparked
+}
+
+// Keeps `COUNT` honest: the match is exhaustive, so a fourth variant fails to
+// compile here instead of indexing past the end of the census arrays at run
+// time.
+const _: () = {
+    const fn assert_count(supply: ParkSupply) -> usize {
+        match supply {
+            ParkSupply::SleeperAvailable => 0,
+            ParkSupply::AllBusyCompressing => 1,
+            ParkSupply::AllBusyMerging => ParkSupply::COUNT - 1,
+        }
+    }
+    assert!(assert_count(ParkSupply::AllBusyMerging) == 2);
+};
+
+/// Classify the pool's state at the instant the consumer parks.
+pub(crate) fn classify_park_supply(parked_workers: usize, compress_depth: usize) -> ParkSupply {
+    // A sleeper outranks a queued compress deliberately: the two fixes are not
+    // interchangeable. Waking an idle worker costs nothing, while reordering
+    // priorities trades output throughput for merge latency, so a park with both
+    // conditions true belongs in the cheaper bucket.
+    if parked_workers > 0 {
+        ParkSupply::SleeperAvailable
+    } else if compress_depth > 0 {
+        ParkSupply::AllBusyCompressing
     } else {
-        ParkExit::TimedOut
+        ParkSupply::AllBusyMerging
     }
 }
 
-/// The first parked worker at or after `cursor`, or `None` if none are parked.
-///
-/// Rotating blindly is what makes a wake cheap, and also what makes it
-/// unreliable: at low utilization most workers are parked, but the cursor can
-/// still land on the one that is running, and that wake is simply lost. The
-/// consumer then waits for some other worker's backoff to expire instead --
-/// bounded by `MAX_BACKOFF_US`, not by wake cost.
+/// Park time and park counts split by [`ParkSupply`].
+#[derive(Debug, Default)]
+pub(crate) struct ParkSupplyCensus {
+    counts: [AtomicU64; ParkSupply::COUNT],
+    nanos: [AtomicU64; ParkSupply::COUNT],
+}
+
+impl ParkSupplyCensus {
+    /// Attribute one park of `nanos` to `supply`.
+    pub(crate) fn record(&self, supply: ParkSupply, nanos: u64) {
+        let i = supply.index();
+        self.counts[i].fetch_add(1, Ordering::Relaxed);
+        self.nanos[i].fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    /// Counts and nanoseconds per class, indexed as [`ParkSupply::index`].
+    pub(crate) fn snapshot(&self) -> ParkSupplyReport {
+        ParkSupplyReport {
+            counts: std::array::from_fn(|i| self.counts[i].load(Ordering::Relaxed)),
+            nanos: std::array::from_fn(|i| self.nanos[i].load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/// Read-only view of [`ParkSupplyCensus`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ParkSupplyReport {
+    /// Parks per class: sleeper-available, all-busy-compressing, all-busy-merging.
+    pub counts: [u64; ParkSupply::COUNT],
+    /// Park nanoseconds per class, same order.
+    pub nanos: [u64; ParkSupply::COUNT],
+}
+
+impl ParkSupplyReport {
+    /// Total parks censused.
+    #[must_use]
+    pub fn total_parks(self) -> u64 {
+        self.counts.iter().sum()
+    }
+
+    /// Total park nanoseconds censused.
+    #[must_use]
+    pub fn total_nanos(self) -> u64 {
+        self.nanos.iter().sum()
+    }
+}
+
 /// Takes a predicate rather than a slice so the wake path can read the atomics
 /// directly: this runs on every wake -- millions of them -- and materializing a
 /// `Vec<bool>` there would allocate on the hottest coordination path in the
@@ -2067,22 +2140,50 @@ mod tests {
     // Worker recruitment
     // ========================================================================
 
-    /// A timed-out park overshoots its deadline by scheduler latency, so
-    /// `elapsed < requested` alone would call almost every timeout an unpark and
-    /// credit the wake path with recruitment it never did.
+    /// The three classes imply three different fixes, so the boundaries matter
+    /// more than the counts: a parked worker means coordination lost the block,
+    /// a queued compress means priority did, and neither means capacity did.
     #[rstest]
-    #[case::clearly_early_is_an_unpark(10, 1000, ParkExit::Unparked)]
-    #[case::ran_to_the_deadline_timed_out(1000, 1000, ParkExit::TimedOut)]
-    #[case::overshot_the_deadline_timed_out(1180, 1000, ParkExit::TimedOut)]
-    #[case::a_hair_early_is_not_credited_as_a_wake(995, 1000, ParkExit::TimedOut)]
-    #[case::half_the_deadline_is_a_wake(500, 1000, ParkExit::Unparked)]
-    #[case::yield_path_never_requested_a_wait(0, 0, ParkExit::TimedOut)]
-    fn test_park_exit_is_inferred_conservatively(
-        #[case] elapsed_us: u64,
-        #[case] requested_us: u64,
-        #[case] expected: ParkExit,
+    #[case::one_sleeper_is_coordination_loss(1, 0, ParkSupply::SleeperAvailable)]
+    #[case::a_sleeper_outranks_a_full_compress_queue(3, 9, ParkSupply::SleeperAvailable)]
+    #[case::nobody_free_with_compress_queued_is_priority(0, 5, ParkSupply::AllBusyCompressing)]
+    #[case::nobody_free_and_nothing_queued_is_capacity(0, 0, ParkSupply::AllBusyMerging)]
+    fn test_park_supply_separates_coordination_from_priority_from_capacity(
+        #[case] parked_workers: usize,
+        #[case] compress_depth: usize,
+        #[case] expected: ParkSupply,
     ) {
-        assert_eq!(classify_park_exit(elapsed_us, requested_us), expected);
+        assert_eq!(classify_park_supply(parked_workers, compress_depth), expected);
+    }
+
+    /// A sleeper is reported even when compression is also backed up, because the
+    /// fixes are not interchangeable: waking the sleeper costs nothing, whereas
+    /// reordering priorities trades output throughput for merge latency.
+    #[test]
+    fn test_a_sleeper_is_not_masked_by_a_busy_compress_queue() {
+        assert_eq!(classify_park_supply(1, 100), ParkSupply::SleeperAvailable);
+    }
+
+    #[test]
+    fn test_census_attributes_parks_and_time_by_class() {
+        let census = ParkSupplyCensus::default();
+        census.record(ParkSupply::SleeperAvailable, 100);
+        census.record(ParkSupply::SleeperAvailable, 50);
+        census.record(ParkSupply::AllBusyCompressing, 700);
+        census.record(ParkSupply::AllBusyMerging, 5);
+
+        let report = census.snapshot();
+        assert_eq!(report.counts, [2, 1, 1]);
+        assert_eq!(report.nanos, [150, 700, 5]);
+        assert_eq!(report.total_parks(), 4);
+        assert_eq!(report.total_nanos(), 855);
+    }
+
+    #[test]
+    fn test_census_starts_empty() {
+        let report = ParkSupplyCensus::default().snapshot();
+        assert_eq!(report.total_parks(), 0);
+        assert_eq!(report.total_nanos(), 0);
     }
 
     #[test]

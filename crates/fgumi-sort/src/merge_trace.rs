@@ -105,6 +105,18 @@ impl DurationHistogram {
         self.total_nanos.fetch_add(nanos, Ordering::Relaxed);
     }
 
+    /// Record one *count* observation (a queue depth, a run length) into a
+    /// histogram built for durations, scaling one unit to [`BLOCKS_TO_NANOS`]
+    /// so counts land in the microsecond lane the log2 bucketing is built
+    /// around. Without the scale every count below `BLOCKS_TO_NANOS` buckets to
+    /// zero and both the mean and the tail read as zero.
+    ///
+    /// Read the result back with [`HistogramReport::summary_blocks`], never
+    /// [`HistogramReport::summary`] -- the latter labels these as durations.
+    pub(crate) fn record_count(&self, count: u64) {
+        self.record(count.saturating_mul(BLOCKS_TO_NANOS));
+    }
+
     /// Time `f`, recording how long it took, and return its value.
     pub(crate) fn time<R>(&self, f: impl FnOnce() -> R) -> R {
         let start = Instant::now();
@@ -549,7 +561,7 @@ impl ConsumerTraceStats {
     /// Read the result back with [`HistogramReport::summary_blocks`], never
     /// [`HistogramReport::summary`] -- the latter labels these as durations.
     pub(crate) fn record_source_run(&self, blocks: u64) {
-        self.source_run_length.record(blocks.saturating_mul(BLOCKS_TO_NANOS));
+        self.source_run_length.record_count(blocks);
     }
 
     pub(crate) fn snapshot(&self) -> ConsumerTraceReport {
@@ -704,6 +716,44 @@ mod tests {
         assert_eq!(report.percentile_micros(1.00), 8192);
     }
 
+    /// A queue depth is a single-digit count. Recording it raw drops every
+    /// observation into bucket 0 and the report reads zero -- the merge-trace
+    /// bug this guards. [`DurationHistogram::record_count`] scales one unit to
+    /// [`BLOCKS_TO_NANOS`] first, so the mean and the tail read as the depths
+    /// themselves.
+    #[test]
+    fn test_record_count_scales_small_counts_out_of_the_zero_bucket() {
+        let depths = [2_u64, 3, 4, 9];
+
+        // Raw counts collapse: every depth below `BLOCKS_TO_NANOS` buckets to
+        // zero, so the mean rounds to 0.0 and the tail is a flat zero.
+        let raw = DurationHistogram::default();
+        for &depth in &depths {
+            raw.record(depth);
+        }
+        let raw = raw.snapshot();
+        assert_eq!(raw.count, 4);
+        assert_eq!(format!("{:.1}", raw.mean_micros()), "0.0", "raw counts read as zero");
+        assert_eq!(raw.percentile_micros(1.0), 0, "raw counts collapse to a zero tail");
+
+        // Scaled through `record_count`, the same depths read back as blocks.
+        let scaled = DurationHistogram::default();
+        for &depth in &depths {
+            scaled.record_count(depth);
+        }
+        let scaled = scaled.snapshot();
+        assert_eq!(scaled.count, 4);
+        // (2 + 3 + 4 + 9) / 4 = 4.5 blocks, reported exactly.
+        assert!((scaled.mean_micros() - 4.5).abs() < 0.01, "{}", scaled.mean_micros());
+        // Bucketed as if microseconds, so the tail reads as blocks (log2 floor).
+        assert_eq!(scaled.percentile_micros(1.0), 8);
+        assert_eq!(
+            scaled.summary_blocks(),
+            "n=4 total=18 blocks mean=4.5 p50=2 p90=8 p99=8",
+            "the depth line must read as blocks"
+        );
+    }
+
     /// A mean alone cannot tell these two apart, and they have different
     /// causes: one is uniformly slow, the other is fast with a bad tail.
     #[test]
@@ -845,6 +895,46 @@ mod tests {
         assert_eq!(report.idle_file_parks(), 1);
         assert_eq!(report.in_flight_at_park[MAX_TRACKED_IN_FLIGHT], 1);
         assert_eq!(report.park_by_state[AwaitedState::Decompressing as usize].count, 3);
+    }
+
+    /// Park time per state, not just park count.
+    ///
+    /// The two disagree and only one is a cost: the park-supply census had a class
+    /// that was 41% of parks and 13% of park time, and reading the counts picked a
+    /// fix that then measured at 0.06%. These nanoseconds were collected from the
+    /// start and reported one log level down, so every experiment in that
+    /// investigation had the answer and none printed it.
+    #[test]
+    fn test_consumer_trace_carries_park_time_per_state_not_only_counts() {
+        let stats = ConsumerTraceStats::default();
+        // Many cheap parks in one state, one expensive park in another: the count
+        // majority and the time majority are deliberately opposite.
+        for _ in 0..10 {
+            stats.record_park(AwaitedState::Decompressing, 1_000, 1);
+        }
+        stats.record_park(AwaitedState::RawQueued, 500_000, 0);
+
+        let report = stats.snapshot();
+        let decomp = report.park_by_state[AwaitedState::Decompressing as usize];
+        let raw = report.park_by_state[AwaitedState::RawQueued as usize];
+
+        assert_eq!(decomp.count, 10, "counts say Decompressing dominates 10:1");
+        assert_eq!(raw.count, 1);
+        assert!(
+            (decomp.total_secs() - 10e-6).abs() < 1e-12,
+            "10 parks of 1us is 10us, got {}",
+            decomp.total_secs()
+        );
+        assert!(
+            (raw.total_secs() - 500e-6).abs() < 1e-12,
+            "one park of 500us is 500us, got {}",
+            raw.total_secs()
+        );
+        assert!(
+            raw.total_secs() > decomp.total_secs() * 40.0,
+            "time says RawQueued dominates 50:1 -- the opposite of the counts, which is \
+             precisely the reading that must be available at info level"
+        );
     }
 
     #[test]
