@@ -187,9 +187,12 @@ reviews:
         producer gating as liveness- and memory-critical. Require that no path
         lets a queue or reorder buffer grow without a byte bound, so steady-state
         memory stays a function of config rather than input size: the per-queue
-        bound is `OrderedQueue::limit_bytes` (`queue.rs`), and the shared
-        pipeline budget is consulted through `MemoryTracker::is_at_limit` /
-        `MemoryTracker::is_below_drain_threshold` (`base.rs`). Flag a cap
+        bound is `OrderedQueue::limit_bytes` (`queue.rs`); the pipeline total is
+        gated at Read by `BamPipelineState::read_admission_allowed` (`bam.rs`);
+        and each stage's own high-water mark comes from `stage_high_water_mark`
+        (`base.rs`), which caps the mark rather than scaling it with the budget.
+        `MemoryTracker` (`base.rs`) is NOT on that path — nothing in this crate
+        constructs one, so do not cite it as the live budget check. Flag a cap
         checked on only one sub-condition so another code path bypasses it; flag
         capping a consumer drain loop (consumers must stay unbounded — bound the
         producers instead); and flag byte accounting that measures logical length

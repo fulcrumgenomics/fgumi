@@ -30,7 +30,8 @@ use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to
 use fgumi_lib::grouper::SingleRecordGrouper;
 use fgumi_lib::read_info::LibraryIndex;
 use fgumi_lib::unified_pipeline::{
-    GroupKeyConfig, PipelineConfig, PipelineFunctions, run_bam_pipeline, serialize_bam_record_into,
+    BatchOrdinal, GroupKeyConfig, PipelineConfig, PipelineFunctions, run_bam_pipeline,
+    serialize_bam_record_into,
 };
 
 /// Queue memory budget used by the tests, in bytes.
@@ -158,18 +159,16 @@ fn bam_header_bytes(header: &Header) -> Vec<u8> {
     bgzf.into_inner()
 }
 
-/// Read the record names out of a BAM byte stream, in order.
-fn record_names(bam_bytes: &[u8]) -> Vec<String> {
+/// Decode every record out of a BAM byte stream, in order.
+///
+/// Returns fully decoded [`RecordBuf`]s rather than just names so the identity
+/// assertions can compare flags, coordinates, CIGAR, sequence, qualities, and
+/// tags — not only that the right names arrived in the right order. Name-only
+/// comparison would pass even if the pipeline corrupted any of those fields.
+fn record_bufs(bam_bytes: &[u8]) -> Vec<RecordBuf> {
     let mut reader = bam::io::Reader::new(io::Cursor::new(bam_bytes));
     let header = reader.read_header().expect("read header");
-    reader
-        .record_bufs(&header)
-        .map(|r| {
-            let record = r.expect("read record");
-            String::from_utf8_lossy(record.name().expect("record should have a name").as_ref())
-                .into_owned()
-        })
-        .collect()
+    reader.record_bufs(&header).map(|r| r.expect("read record")).collect()
 }
 
 /// Build a BAM whose compressed size comfortably exceeds the test budget, so a
@@ -504,7 +503,7 @@ fn read_ahead_under_a_stalled_writer_shrinks_with_the_queue_memory_budget() {
 #[test]
 fn a_budget_smaller_than_one_batch_still_completes_with_every_record() {
     let (header, bam_bytes) = shared_bam_bytes();
-    let expected_names = record_names(bam_bytes);
+    let expected_records = record_bufs(bam_bytes);
 
     // Release the writer immediately so it never blocks — a healthy sink — and
     // set a budget far below one decompressed batch.
@@ -513,17 +512,122 @@ fn a_budget_smaller_than_one_batch_still_completes_with_every_record() {
 
     let written =
         join_pipeline_within(run.handle, &run.consumed, bam_bytes.len() as u64, JOIN_DEADLINE);
-    assert_eq!(written, expected_names.len() as u64, "every input record must reach the writer");
+    assert_eq!(written, expected_records.len() as u64, "every input record must reach the writer");
 
     // `run_bam_pipeline` writes record blocks only, so re-attach a header before
     // reading the captured stream back as a BAM.
     let mut output = bam_header_bytes(header);
     output.extend_from_slice(&run.sink.lock().expect("sink mutex should not be poisoned"));
     assert_eq!(
-        record_names(&output),
-        expected_names,
+        record_bufs(&output),
+        expected_records,
         "output records must match the input exactly, in order"
     );
+}
+
+/// A budget small enough to bind the processed queue must not wedge the
+/// MI-assign stage.
+///
+/// The processed queue's high-water mark is `min(budget, 256 MiB)` (issue
+/// #765), so a small `--max-memory` can pull it below the size of a single
+/// processed batch. That matters most with `mi_assign_fn` installed: batches
+/// drained out of Q5 stay charged to `processed_heap_bytes` while they sit in
+/// `mi_assign_reorder`, so a reorder buffer waiting on a missing serial holds
+/// the Process step off at its backpressure check. Forward progress then rests
+/// entirely on the Process step pushing an already-held batch unconditionally,
+/// ahead of that check.
+///
+/// Two budgets, because they bind differently. At 4 KiB the Read gate admits
+/// one batch at a time, so the mark fires constantly but skew is minimal; at
+/// 8 MiB several batches are in flight at once, which is what actually gives
+/// the reorder buffer out-of-order serials to park. Both must complete.
+///
+/// The writer is not stalled here: the hazard is internal to the pipeline, and
+/// a stalled writer would mask it behind the Read gate.
+#[test]
+fn mi_assign_makes_progress_under_a_budget_that_binds_the_processed_queue() {
+    let header = create_minimal_header("chr1", 100_000);
+    // Enough families to span many batches, few enough to stay quick.
+    let bam_bytes = build_bam_bytes(&header, 20_000, DEPTH);
+    let expected_records = record_bufs(&bam_bytes);
+
+    for budget in [4096u64, 8 * 1024 * 1024] {
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let writer =
+            StalledWriter { released: Arc::new(AtomicBool::new(true)), sink: Arc::clone(&sink) };
+
+        let mut config = PipelineConfig::auto_tuned(4, 1);
+        config.queue_memory_limit = budget;
+        // Unlike the stalled-writer tests above, the deadlock detector stays
+        // ON here (default: 10s, detection only). This test asserts liveness,
+        // so a wedge should surface as a failed run rather than as a hang that
+        // only the harness timeout catches.
+        assert!(!config.deadlock_recover_enabled, "detection only, so a wedge is not papered over");
+
+        let grouper = Box::new(SingleRecordGrouper::with_header(header.clone()));
+        let output_header = header.clone();
+        // Record each hook invocation's ordinal in call order. The contract is
+        // that `mi_assign_fn` runs in strict `(batch_serial, idx_in_batch)`
+        // order (see `BatchOrdinal`); the write reorder buffer can restore
+        // output order even if the hook fired out of order, so a name-order
+        // check on the output alone cannot see a violation of that contract.
+        let hook_ordinals = Arc::new(Mutex::new(Vec::<(u64, usize)>::new()));
+        let hook_ordinals_inner = Arc::clone(&hook_ordinals);
+        let fns = PipelineFunctions::new(
+            |record: RecordBuf| Ok(record),
+            move |record: RecordBuf, buf: &mut Vec<u8>| {
+                serialize_bam_record_into(&record, &output_header, buf)
+            },
+        )
+        .with_mi_assign(move |ordinal: BatchOrdinal, _item: &mut RecordBuf| {
+            hook_ordinals_inner
+                .lock()
+                .expect("hook ordinals mutex should not be poisoned")
+                .push((ordinal.batch_serial, ordinal.idx_in_batch));
+            Ok(())
+        });
+        let group_key_config = GroupKeyConfig::new_raw_no_cell(LibraryIndex::from_header(&header));
+
+        let written = run_bam_pipeline(
+            config,
+            Box::new(io::Cursor::new(bam_bytes.clone())),
+            Box::new(writer),
+            grouper,
+            fns,
+            group_key_config,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("budget {budget}: pipeline must complete, got {e}"));
+
+        assert_eq!(
+            written,
+            expected_records.len() as u64,
+            "budget {budget}: every input record must reach the writer"
+        );
+
+        let ordinals = hook_ordinals.lock().expect("hook ordinals mutex should not be poisoned");
+        assert_eq!(
+            ordinals.len(),
+            expected_records.len(),
+            "budget {budget}: the MI-assign hook must run once per item"
+        );
+        // The hook must be invoked in strictly increasing `(batch_serial,
+        // idx_in_batch)` order — the serial-order contract it exists to
+        // provide. `Vec::is_sorted` alone would accept duplicates, so pair it
+        // with a strict-monotonicity check via `windows`.
+        assert!(
+            ordinals.windows(2).all(|w| w[0] < w[1]),
+            "budget {budget}: MI-assign hook fired out of serial order: {ordinals:?}"
+        );
+
+        let mut output = bam_header_bytes(&header);
+        output.extend_from_slice(&sink.lock().expect("sink mutex should not be poisoned"));
+        assert_eq!(
+            record_bufs(&output),
+            expected_records,
+            "budget {budget}: output must match the input exactly, in order"
+        );
+    }
 }
 
 /// The pipeline must still emit every record, in order, once the writer
@@ -537,8 +641,8 @@ fn a_budget_smaller_than_one_batch_still_completes_with_every_record() {
 #[test]
 fn reader_resumes_and_completes_after_the_writer_recovers() {
     let (header, bam_bytes) = shared_bam_bytes();
-    let expected_names = record_names(bam_bytes);
-    assert_eq!(expected_names.len(), FAMILIES * DEPTH, "input should hold every generated read");
+    let expected_records = record_bufs(bam_bytes);
+    assert_eq!(expected_records.len(), FAMILIES * DEPTH, "input should hold every generated read");
 
     let StalledRun { consumed, released, sink, handle } =
         spawn_stalled_pipeline(header, bam_bytes.clone(), 4, TEST_BUDGET_BYTES, None);
@@ -549,7 +653,7 @@ fn reader_resumes_and_completes_after_the_writer_recovers() {
     released.store(true, Ordering::Release);
 
     let written = join_pipeline_within(handle, &consumed, bam_bytes.len() as u64, JOIN_DEADLINE);
-    assert_eq!(written, expected_names.len() as u64, "every input record must reach the writer");
+    assert_eq!(written, expected_records.len() as u64, "every input record must reach the writer");
     assert_eq!(
         consumed.load(Ordering::Relaxed),
         bam_bytes.len() as u64,
@@ -561,8 +665,8 @@ fn reader_resumes_and_completes_after_the_writer_recovers() {
     let mut output = bam_header_bytes(header);
     output.extend_from_slice(&sink.lock().expect("sink mutex should not be poisoned"));
     assert_eq!(
-        record_names(&output),
-        expected_names,
+        record_bufs(&output),
+        expected_records,
         "output records must match the input exactly, in order"
     );
 }

@@ -4715,6 +4715,32 @@ mod tests {
         assert!(state.read_admission_allowed(), "drained below budget: reading resumes");
     }
 
+    /// The budget keeps discriminating above 512 MiB (issue #765).
+    ///
+    /// The per-stage high-water marks are capped at
+    /// [`BACKPRESSURE_THRESHOLD_BYTES`](crate::unified_pipeline::BACKPRESSURE_THRESHOLD_BYTES),
+    /// and for a long time those marks were the only thing `--max-memory`
+    /// reached — which made every budget above 512 MiB behave identically. The
+    /// budget's capacity role lives here instead, where nothing caps it: at
+    /// 4 GiB in flight a 512 MiB budget must refuse and a 32 GiB budget must
+    /// admit. If both answers ever agree again, the knob has gone inert.
+    #[test]
+    fn read_admission_still_discriminates_above_the_per_stage_marks() {
+        let in_flight = 4 * 1024 * 1024 * 1024;
+
+        let at_the_mark =
+            create_test_state(crate::unified_pipeline::base::BACKPRESSURE_THRESHOLD_BYTES);
+        at_the_mark.q2b_heap_bytes.store(in_flight, Ordering::Release);
+        assert!(!at_the_mark.read_admission_allowed(), "512 MiB budget must gate 4 GiB in flight");
+
+        let above_the_mark = create_test_state(32 * 1024 * 1024 * 1024);
+        above_the_mark.q2b_heap_bytes.store(in_flight, Ordering::Release);
+        assert!(
+            above_the_mark.read_admission_allowed(),
+            "32 GiB budget must admit 4 GiB in flight; a budget above 512 MiB is not inert"
+        );
+    }
+
     /// With nothing accounted for in flight, Read is always admitted — so an
     /// input whose first batch alone exceeds the whole budget still makes
     /// progress instead of wedging the pipeline.
