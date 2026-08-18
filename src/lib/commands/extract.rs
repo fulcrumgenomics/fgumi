@@ -151,8 +151,35 @@ fn open_fastq_reader(
     path: &Path,
     threads: usize,
     async_reader: bool,
+    check_crc: bool,
+    no_check_crc: bool,
 ) -> Result<Box<dyn BufRead + Send>> {
     use flate2::read::MultiGzDecoder;
+
+    // CRC-verification policy, resolved per input path: an explicit flag wins,
+    // otherwise verify a file and trust (skip) stdin. Only consulted for the
+    // single-threaded BGZF path below.
+    let verify_crc = if check_crc {
+        true
+    } else if no_check_crc {
+        false
+    } else {
+        !is_stdin_path(path)
+    };
+    // Mirror the BAM path's `CRC verify:` line (see `RunOptions::log_effective_check_crc`)
+    // so the effective policy — including the default-off-for-stdin skip, a change from
+    // fgumi's previous always-verify default — is visible in every run's log rather than a
+    // silent decision. Emitted below only for BGZF input, the only format that carries a
+    // per-block CRC32 to verify or skip.
+    let crc_reason = if check_crc {
+        " (--check-crc)"
+    } else if no_check_crc {
+        " (--no-check-crc)"
+    } else if is_stdin_path(path) {
+        " (trusted stdin)"
+    } else {
+        ""
+    };
 
     // stdin cannot be sniffed by path and then re-opened — the bytes read to
     // classify it are gone. Peek them off the stream and chain them back in
@@ -188,14 +215,38 @@ fn open_fastq_reader(
     };
 
     match format {
-        CompressionFormat::Bgzf if threads > 1 => {
+        CompressionFormat::Bgzf if threads > 1 && verify_crc => {
+            // Verifying + multi-threaded: use noodles' parallel decoder. It always
+            // verifies CRC32 and has no skip knob, which is exactly what this arm
+            // wants. When `--no-check-crc` is set we fall through to the fgumi arm
+            // below instead, so the skip is always honored (trading MT decode for
+            // it); simultaneous MT decode + skip would need a threaded fgumi
+            // decoder (deferred, same as the raw-BAM multi-threaded path).
+            info!("CRC verify: on{crc_reason}");
             info!("Detected BGZF-compressed FASTQ, using {threads} decompression threads");
             let worker_count = std::num::NonZero::new(threads).expect("threads > 1 checked above");
             let reader = MultithreadedReader::with_worker_count(worker_count, reader);
             Ok(Box::new(BufReader::with_capacity(BUFFER_SIZE, reader)))
         }
-        CompressionFormat::Bgzf | CompressionFormat::Gzip => {
-            debug!("Detected {format:?}-compressed FASTQ, using single-threaded decompression");
+        CompressionFormat::Bgzf => {
+            // BGZF decode through fgumi-bgzf, which honors `verify_crc` (noodles /
+            // flate2 always verify). Reached for single-threaded input, and for
+            // `--no-check-crc` at any thread count (the guard above only takes the
+            // parallel path when verifying), so the skip is never silently ignored.
+            // The inner buffer feeds the block-header reads; the decoder is `BufRead`.
+            info!("CRC verify: {}{crc_reason}", if verify_crc { "on" } else { "off" });
+            debug!(
+                "Detected BGZF-compressed FASTQ, single-threaded fgumi-bgzf decode (CRC verify: {verify_crc})"
+            );
+            let buffered: Box<dyn std::io::Read + Send> =
+                Box::new(BufReader::with_capacity(BUFFER_SIZE, reader));
+            let decoder = fgumi_bam_io::FgumiBgzfReader::new(buffered, verify_crc);
+            Ok(Box::new(BufReader::with_capacity(BUFFER_SIZE, decoder)))
+        }
+        CompressionFormat::Gzip => {
+            // Plain gzip is not block-structured; there is no per-block CRC to
+            // skip, so it stays on flate2 and ignores the flag.
+            debug!("Detected gzip-compressed FASTQ, using single-threaded decompression");
             Ok(Box::new(BufReader::with_capacity(
                 BUFFER_SIZE,
                 MultiGzDecoder::new(BufReader::with_capacity(BUFFER_SIZE, reader)),
@@ -625,9 +676,42 @@ pub struct Extract {
     /// Hidden experimental flag.
     #[arg(long = "async-reader", default_value_t = false, hide = true)]
     pub async_reader: bool,
+
+    /// Verify each BGZF block's CRC32 checksum while decoding the input.
+    ///
+    /// Applies to BGZF-compressed FASTQ input (bgzip'd); plain gzip is not
+    /// block-structured and has no per-block CRC to skip. The policy is honored
+    /// at any thread count, though BGZF decode runs single-threaded when skipping
+    /// (verifying BGZF input can decode in parallel). Without either flag,
+    /// verification defaults on for file input and off for trusted stdin (a
+    /// freshly-piped stream is trusted; a file may have been archived or
+    /// transferred since it was written, where a flipped bit is what CRC32 exists
+    /// to catch). Pass `--check-crc` to force it on. Mutually exclusive with
+    /// `--no-check-crc`.
+    #[arg(long = "check-crc", default_value_t = false, conflicts_with = "no_check_crc")]
+    pub check_crc: bool,
+
+    /// Skip CRC32 verification while decoding BGZF FASTQ input.
+    ///
+    /// Trades the CRC32 integrity check for faster BGZF decode (which then runs
+    /// single-threaded). See `--check-crc` for the default policy this overrides.
+    /// Mutually exclusive with `--check-crc`.
+    #[arg(long = "no-check-crc", default_value_t = false, conflicts_with = "check_crc")]
+    pub no_check_crc: bool,
 }
 
 impl Extract {
+    /// CRC-verification policy for the `all_bgzf` pipeline path, which decodes
+    /// BGZF-file inputs itself (Step 2). That path never includes stdin — a
+    /// piped input takes the pre-opened-reader path — so every input there is a
+    /// file and the default is verify-on. `--no-check-crc` turns it off;
+    /// `--check-crc` and the default both verify. (The non-`all_bgzf` path
+    /// resolves per input path in [`open_fastq_reader`], honoring trusted-stdin.)
+    #[must_use]
+    fn bgzf_input_verify_crc(&self) -> bool {
+        !self.no_check_crc
+    }
+
     /// Get actual read structures (default to +T if none provided for 1-2 FASTQs)
     fn get_read_structures(&self) -> Result<Vec<ReadStructure>> {
         if self.read_structures.is_empty() && (1..=2).contains(&self.inputs.len()) {
@@ -658,7 +742,15 @@ impl Extract {
         }
         self.inputs
             .iter()
-            .map(|path| open_fastq_reader(path, decomp_threads, self.async_reader))
+            .map(|path| {
+                open_fastq_reader(
+                    path,
+                    decomp_threads,
+                    self.async_reader,
+                    self.check_crc,
+                    self.no_check_crc,
+                )
+            })
             .collect()
     }
 
@@ -1268,7 +1360,8 @@ impl Extract {
                 .with_scheduler_strategy(self.scheduler_opts.strategy())
                 .with_deadlock_timeout(self.scheduler_opts.deadlock_timeout_secs())
                 .with_deadlock_recovery(self.scheduler_opts.deadlock_recover_enabled())
-                .with_async_reader(self.async_reader);
+                .with_async_reader(self.async_reader)
+                .with_verify_crc(self.bgzf_input_verify_crc());
 
         // Calculate and apply queue memory limit
         let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
@@ -1546,11 +1639,20 @@ fn make_raw_records_static(
 /// readers are not consumed. Sampling is always synchronous — a bounded head-scan
 /// of at most [`QUALITY_DETECTION_SAMPLE_SIZE`] records gains nothing from the
 /// async reader (which the main extraction still uses per `--async-reader`).
-fn sample_detection_quals(inputs: &[PathBuf]) -> Result<QualDetectionStats> {
+fn sample_detection_quals(
+    inputs: &[PathBuf],
+    check_crc: bool,
+    no_check_crc: bool,
+) -> Result<QualDetectionStats> {
     let mut stats = QualDetectionStats::new();
     for input in inputs {
-        let mut reader =
-            SimdFastqReader::with_capacity(open_fastq_reader(input, 1, false)?, BUFFER_SIZE);
+        // Honor the same CRC policy as the main decode: the sampler's buffered
+        // read can pull the whole (small) input, so a corrupted trailing block
+        // would otherwise fail here under the default even with `--no-check-crc`.
+        let mut reader = SimdFastqReader::with_capacity(
+            open_fastq_reader(input, 1, false, check_crc, no_check_crc)?,
+            BUFFER_SIZE,
+        );
         sample_into(&mut reader, &mut stats)?;
     }
     Ok(stats)
@@ -1631,12 +1733,18 @@ impl Command for Extract {
         let detection_stats =
             if let Some(stdin_input) = self.inputs.iter().find(|p| is_stdin_path(p)) {
                 let decomp_threads = self.threading.num_threads().max(1);
-                let opened = open_fastq_reader(stdin_input, decomp_threads, self.async_reader)?;
+                let opened = open_fastq_reader(
+                    stdin_input,
+                    decomp_threads,
+                    self.async_reader,
+                    self.check_crc,
+                    self.no_check_crc,
+                )?;
                 let (stats, replayed) = sample_detection_quals_from_stream(opened)?;
                 stdin_reader = Some(replayed);
                 stats
             } else {
-                sample_detection_quals(&self.inputs)?
+                sample_detection_quals(&self.inputs, self.check_crc, self.no_check_crc)?
             };
         let encoding = QualityEncoding::from_stats(&detection_stats)?;
 
@@ -1776,6 +1884,190 @@ mod tests {
         path
     }
 
+    /// The uncompressed FASTQ bytes that [`create_bgzf_fastq`] compresses. Kept as
+    /// the single source of truth so tests can assert exact decoded output and
+    /// exact per-record identity/order (record `i` is `@q{i}` / `ACGTACGTAC` /
+    /// `IIIIIIIIII`).
+    fn fastq_bytes(num_records: usize) -> Vec<u8> {
+        let mut fastq = Vec::new();
+        for i in 0..num_records {
+            writeln!(fastq, "@q{i}").expect("write");
+            writeln!(fastq, "ACGTACGTAC").expect("write");
+            writeln!(fastq, "+").expect("write");
+            writeln!(fastq, "IIIIIIIIII").expect("write");
+        }
+        fastq
+    }
+
+    /// Write `num_records` single-end FASTQ records, BGZF-compressed, to a file.
+    /// `num_records` is chosen large enough by callers to span >= 2 BGZF blocks
+    /// (blocks flush per ~64 KiB uncompressed).
+    fn create_bgzf_fastq(dir: &TempDir, name: &str, num_records: usize) -> PathBuf {
+        let path = dir.path().join(name);
+        let fastq = fastq_bytes(num_records);
+        let mut compressed = Vec::new();
+        {
+            let mut writer = noodles_bgzf::io::Writer::new(&mut compressed);
+            writer.write_all(&fastq).expect("write bgzf");
+            writer.finish().expect("finish bgzf");
+        }
+        std::fs::write(&path, compressed).expect("write bgzf fastq");
+        path
+    }
+
+    /// Assert an error message names a CRC / checksum failure specifically, so a
+    /// CRC regression test cannot pass on some unrelated decode error. The
+    /// single-threaded fgumi-bgzf path reports `BGZF CRC32 mismatch`; the
+    /// multi-threaded noodles path reports `block data checksum mismatch`.
+    fn assert_crc_error_msg(message: &str) {
+        let lower = message.to_lowercase();
+        assert!(
+            lower.contains("crc") || lower.contains("checksum"),
+            "error should name a CRC/checksum failure, got: {message}"
+        );
+    }
+
+    /// Flip a byte in the last real BGZF block's CRC32 footer. Requires >= 2
+    /// blocks so the corrupted block is a data block.
+    fn corrupt_last_block_crc(path: &PathBuf) {
+        let mut bytes = std::fs::read(path).expect("read bgzf fastq");
+        let blocks = {
+            let mut cursor: &[u8] = &bytes;
+            fgumi_bgzf::read_raw_blocks(&mut cursor, 1_000_000).expect("read bgzf blocks")
+        };
+        assert!(blocks.len() >= 2, "input must span >= 2 BGZF blocks; got {}", blocks.len());
+        let offset: usize =
+            blocks[..blocks.len() - 1].iter().map(fgumi_bgzf::RawBgzfBlock::len).sum();
+        let last = blocks.last().expect("checked len >= 2");
+        let crc_off = offset + last.len() - fgumi_bgzf::BGZF_FOOTER_SIZE;
+        bytes[crc_off] ^= 0x01;
+        std::fs::write(path, bytes).expect("write corrupted bgzf fastq");
+    }
+
+    /// Build an `Extract` for a single BGZF FASTQ `input` with the given threading
+    /// and CRC flags.
+    fn bgzf_crc_extract(
+        input: PathBuf,
+        output: PathBuf,
+        threading: ThreadingOptions,
+        check_crc: bool,
+        no_check_crc: bool,
+    ) -> Extract {
+        Extract {
+            inputs: vec![input],
+            output,
+            read_structures: vec![],
+            store_umi_quals: false,
+            store_cell_quals: false,
+            store_sample_barcode_qualities: false,
+            extract_umis_from_read_names: false,
+            annotate_read_names: false,
+            single_tag: None,
+            clipping_attribute: None,
+            read_group_id: "A".to_string(),
+            sample: "foo".to_string(),
+            library: "bar".to_string(),
+            barcode: None,
+            platform: "illumina".to_string(),
+            platform_unit: None,
+            platform_model: None,
+            sequencing_center: None,
+            predicted_insert_size: None,
+            description: None,
+            comment: vec![],
+            run_date: None,
+            threading,
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
+            check_crc,
+            no_check_crc,
+        }
+    }
+
+    /// A corrupted-CRC BGZF FASTQ must be rejected by default and with
+    /// `--check-crc`, and read clean with `--no-check-crc` (#819). Parameterized
+    /// over threading so both BGZF decode paths are covered: single-threaded goes
+    /// through `open_fastq_reader`'s fgumi-bgzf arm, while `--threads N` decodes
+    /// the pure-BGZF input in the pipeline honoring `FastqPipelineConfig::verify_crc`.
+    #[rstest]
+    #[case::single_threaded(ThreadingOptions::none())]
+    #[case::multi_threaded(ThreadingOptions::new(2))]
+    fn test_bgzf_fastq_honors_check_crc(#[case] threading: ThreadingOptions) {
+        let tmp = TempDir::new().expect("temp dir");
+        // ~5000 records * ~30 bytes = ~150 KiB uncompressed => several BGZF blocks.
+        let input = create_bgzf_fastq(&tmp, "reads.fq.gz", 5000);
+        corrupt_last_block_crc(&input);
+
+        // --no-check-crc: the corrupted block is accepted and every record is
+        // decoded exactly, in input order (identity, not just count).
+        let out_ok = tmp.path().join("ok.bam");
+        bgzf_crc_extract(input.clone(), out_ok.clone(), threading.clone(), false, true)
+            .execute("test")
+            .expect("--no-check-crc must accept a corrupted BGZF FASTQ CRC32");
+        let records = read_bam_records(&out_ok);
+        assert_eq!(records.len(), 5000, "all records extracted");
+        for (i, record) in records.iter().enumerate() {
+            let expected_name = format!("q{i}");
+            assert_eq!(
+                record.name().map(|name| name.as_bytes()),
+                Some(expected_name.as_bytes()),
+                "record {i} name mismatch (identity/order)"
+            );
+            assert_eq!(record.sequence().as_ref(), b"ACGTACGTAC", "record {i} sequence");
+            assert_eq!(record.quality_scores().as_ref(), &[40; 10], "record {i} quality");
+        }
+
+        // Default (file => verify on): rejected with a CRC-specific error.
+        let out_default = tmp.path().join("default.bam");
+        let default_err =
+            bgzf_crc_extract(input.clone(), out_default, threading.clone(), false, false)
+                .execute("test")
+                .expect_err("default must reject a corrupted BGZF FASTQ CRC32");
+        assert_crc_error_msg(&format!("{default_err:#}"));
+
+        // --check-crc: rejected with a CRC-specific error.
+        let out_check = tmp.path().join("check.bam");
+        let check_err = bgzf_crc_extract(input, out_check, threading, true, false)
+            .execute("test")
+            .expect_err("--check-crc must reject a corrupted BGZF FASTQ CRC32");
+        assert_crc_error_msg(&format!("{check_err:#}"));
+    }
+
+    /// `open_fastq_reader` must honor `--no-check-crc` on BGZF input at **any**
+    /// thread count. At `threads > 1` the parallel noodles decoder always
+    /// verifies, so the skip has to route through fgumi-bgzf instead — a
+    /// regression test for the multi-threaded BGZF path (stdin / mixed inputs)
+    /// silently ignoring the flag.
+    #[rstest]
+    #[case::single_threaded(1)]
+    #[case::multi_threaded(4)]
+    fn test_open_fastq_reader_bgzf_honors_no_check_crc(#[case] threads: usize) {
+        use std::io::Read;
+        let tmp = TempDir::new().expect("temp dir");
+        let input = create_bgzf_fastq(&tmp, "reads.fq.gz", 5000);
+        corrupt_last_block_crc(&input);
+
+        // --no-check-crc (check=false, no_check=true): reads clean at any thread
+        // count and decodes to exactly the original uncompressed FASTQ bytes.
+        let mut skipping = open_fastq_reader(&input, threads, false, false, true)
+            .expect("open (no-check-crc) should succeed");
+        let mut buf = Vec::new();
+        skipping.read_to_end(&mut buf).expect("--no-check-crc must skip the corrupted CRC32");
+        assert_eq!(buf, fastq_bytes(5000), "--no-check-crc must decode the FASTQ exactly");
+
+        // Default (check=false, no_check=false => verify for a file): errors on the
+        // corrupted block with a CRC-specific message, whether via noodles MT
+        // (threads > 1) or fgumi (threads 1).
+        let mut verifying = open_fastq_reader(&input, threads, false, false, false)
+            .expect("open (verify) should succeed");
+        let mut buf = Vec::new();
+        let err =
+            verifying.read_to_end(&mut buf).expect_err("verify must reject the corrupted CRC32");
+        assert_crc_error_msg(&err.to_string());
+    }
+
     /// Read all records from a BAM file into a vector
     ///
     /// # Arguments
@@ -1848,6 +2140,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -1903,6 +2197,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -1962,6 +2258,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2011,6 +2309,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2069,6 +2369,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2120,6 +2422,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2178,6 +2482,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2233,6 +2539,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2295,6 +2603,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2342,6 +2652,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2412,6 +2724,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2478,6 +2792,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         let err = extract
@@ -2531,6 +2847,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2577,6 +2895,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract2.execute("test").expect("execute should succeed");
@@ -2630,6 +2950,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2684,6 +3006,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2883,6 +3207,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2934,6 +3260,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2996,6 +3324,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         // Before the fix this panicked in the builder instead of returning Err.
@@ -3153,6 +3483,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3207,6 +3539,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3255,6 +3589,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3300,6 +3636,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3343,6 +3681,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3386,6 +3726,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3437,6 +3779,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3487,6 +3831,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3539,6 +3885,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3582,6 +3930,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3639,6 +3989,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         let err =
@@ -3691,6 +4043,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3738,7 +4092,7 @@ mod tests {
         );
 
         // Sampling only the first input mis-detects Illumina (the EXT3-01 trap).
-        let first_only = sample_detection_quals(std::slice::from_ref(&r1))
+        let first_only = sample_detection_quals(std::slice::from_ref(&r1), false, false)
             .expect("sampling first input should succeed");
         assert_eq!(
             QualityEncoding::from_stats(&first_only).expect("detect should succeed"),
@@ -3747,7 +4101,8 @@ mod tests {
         );
 
         // Pooling both inputs detects Phred+33 (Standard), matching fgbio.
-        let pooled = sample_detection_quals(&[r1, r2]).expect("sampling all inputs should succeed");
+        let pooled = sample_detection_quals(&[r1, r2], false, false)
+            .expect("sampling all inputs should succeed");
         assert_eq!(
             QualityEncoding::from_stats(&pooled).expect("detect should succeed"),
             QualityEncoding::Standard,
@@ -3772,8 +4127,8 @@ mod tests {
             &[("read0", "ACGTACGT", "(((((((("), ("read1", "ACGTACGT", "((((((((")],
         );
 
-        let pooled =
-            sample_detection_quals(&[empty, low]).expect("sampling should skip the empty input");
+        let pooled = sample_detection_quals(&[empty, low], false, false)
+            .expect("sampling should skip the empty input");
         assert_eq!(
             QualityEncoding::from_stats(&pooled).expect("detect should succeed"),
             QualityEncoding::Standard,
@@ -3826,6 +4181,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -4038,6 +4395,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         // Should succeed without panicking
@@ -4102,6 +4461,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -4157,6 +4518,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -4227,6 +4590,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -4289,6 +4654,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -4345,6 +4712,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         // Should succeed with all quality tag parameters specified
@@ -4394,6 +4763,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test")?;
@@ -4524,6 +4895,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test")?;
@@ -4578,6 +4951,8 @@ mod tests {
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         };
 
         extract.execute("test")?;

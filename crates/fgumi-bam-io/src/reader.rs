@@ -810,6 +810,7 @@ mod tests {
     use crate::writer::create_bam_writer;
     use noodles::sam::alignment::record::cigar::op::Kind as CigarKind;
     use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+    use rstest::rstest;
     use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1323,6 +1324,61 @@ mod tests {
         let count = count_raw_records(&mut reader)
             .expect("verify_crc: false must accept a corrupted BGZF CRC32");
         assert_eq!(count, 8000, "all records read with verify_crc: false");
+        Ok(())
+    }
+
+    /// A file truncated mid-block — cut inside the final data block, including
+    /// inside its 18-byte BGZF header — must surface as an error, never a clean
+    /// `Ok(0)` end-of-stream. With `verify_crc` off the decompressed-size check
+    /// is the only guard left, so both CRC modes must reject the truncation
+    /// (see the path instruction: "a truncated or malformed block must surface
+    /// as an error, never as a silent end-of-stream").
+    #[rstest]
+    #[case::inside_block_header(5)]
+    #[case::mid_block_header(12)]
+    #[case::header_only_body_cut(18)]
+    #[case::inside_compressed_body(40)]
+    fn test_raw_reader_rejects_truncated_final_block(
+        #[case] kept_last_block_bytes: usize,
+        #[values(true, false)] verify_crc: bool,
+    ) -> Result<()> {
+        // Build a multi-block BGZF BAM, then cut the file inside its final data
+        // block at the requested offset (dropping any trailing EOF markers too).
+        let bytes = {
+            let file = tempfile::Builder::new().suffix(".bam").tempfile()?;
+            write_bgzf_bam(file.path(), &many_record_sam_text(8000));
+            std::fs::read(file.path())?
+        };
+        let blocks = {
+            let mut cursor: &[u8] = &bytes;
+            fgumi_bgzf::read_raw_blocks(&mut cursor, 100_000)?
+        };
+        assert!(blocks.len() >= 2, "need >= 2 blocks, got {}", blocks.len());
+        let last_block_start: usize =
+            blocks[..blocks.len() - 1].iter().map(fgumi_bgzf::RawBgzfBlock::len).sum();
+        let last_block_len = blocks.last().expect("checked len >= 2 above").len();
+        assert!(
+            last_block_len > kept_last_block_bytes,
+            "truncation offset {kept_last_block_bytes} must fall inside the last block \
+             (len {last_block_len})"
+        );
+
+        let file = tempfile::Builder::new().suffix(".bam").tempfile()?;
+        std::fs::write(file.path(), &bytes[..last_block_start + kept_last_block_bytes])?;
+
+        // The header lives in the intact first block, so reader construction may
+        // succeed; the truncation must then surface while draining records.
+        // Either failure point counts — neither may yield a clean EOF.
+        let opts = PipelineReaderOpts { verify_crc, ..PipelineReaderOpts::default() };
+        let rejected = match create_raw_bam_reader_with_opts(file.path(), 1, opts) {
+            Err(_) => true,
+            Ok((mut reader, _header)) => count_raw_records(&mut reader).is_err(),
+        };
+        assert!(
+            rejected,
+            "truncated final block (kept {kept_last_block_bytes} bytes, verify_crc={verify_crc}) \
+             must error, not return a clean EOF"
+        );
         Ok(())
     }
 
