@@ -17,7 +17,7 @@ simulate = ["fgumi/simulate"]
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-syn = { version = "2", features = ["full", "extra-traits"] }
+syn = { version = "3", features = ["full", "extra-traits"] }
 quote = "1"
 fgumi = { path = "../.." }
 
