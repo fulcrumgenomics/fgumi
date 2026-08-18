@@ -922,8 +922,10 @@ fn phase2_scan_start(
 ///
 /// [`NO_AWAITED_SOURCE`] means the consumer has not parked yet, and matches no
 /// index.
-fn phase2_deserves_deep_read(index: usize, frontier: usize, awaited: usize) -> bool {
-    index == frontier || (awaited != NO_AWAITED_SOURCE && index == awaited)
+fn phase2_deserves_deep_read(index: usize, frontier: usize, awaited: usize, next: usize) -> bool {
+    index == frontier
+        || (awaited != NO_AWAITED_SOURCE && index == awaited)
+        || (next != NO_AWAITED_SOURCE && index == next)
 }
 
 fn phase2_read_allowance(is_frontier: bool) -> (usize, usize) {
@@ -1509,6 +1511,25 @@ pub(crate) struct SharedPipelineState {
     /// The validity gate for that path: if this stays near zero the consumer never
     /// found an unclaimed block and the change is inert, whatever the clock says.
     pub(crate) consumer_self_served: AtomicU64,
+    /// The source the merge expects to consume *after* the current one, or
+    /// [`NO_AWAITED_SOURCE`].
+    ///
+    /// `phase2_awaited_source` is reactive -- it can only be set once the consumer
+    /// has already stalled. This is predictive, and the distinction is the whole
+    /// point: the merge starves at run transitions, where only 2,475 of 167,624
+    /// source switches starve but each costs ~20ms against an 8.4ms read latency,
+    /// because the read had not been *started* when the consumer arrived. Depth
+    /// cannot fix that -- doubling the read-ahead cap left the starved share of
+    /// park time at 99% -- but ~300 blocks of advance notice can.
+    pub(crate) phase2_next_source: AtomicUsize,
+    /// Predictions actually published to the pool.
+    ///
+    /// The validity gate for the predictive read-ahead path. `runner_up()` returns
+    /// `None` whenever fewer than two sources are active, and a version that
+    /// returned `None` always would look exactly like a null wall-clock result --
+    /// the deep-read path just never fires and nothing says so. A timing gain is
+    /// only attributable to prediction if this is non-zero.
+    pub(crate) phase2_predictions: AtomicU64,
 
     /// Read batches taken at the deep frontier allowance, and the blocks they
     /// returned; and the same for batches taken at the uniform allowance.
@@ -1594,6 +1615,8 @@ impl SharedPipelineState {
             wakes_on_running_worker: AtomicU64::new(0),
             wakes_recoverable: AtomicU64::new(0),
             park_supply: crate::merge_stalls::ParkSupplyCensus::default(),
+            phase2_next_source: AtomicUsize::new(NO_AWAITED_SOURCE),
+            phase2_predictions: AtomicU64::new(0),
             consumer_self_served: AtomicU64::new(0),
             deep_read_batches: AtomicU64::new(0),
             deep_read_blocks: AtomicU64::new(0),
@@ -1679,6 +1702,20 @@ impl SharedPipelineState {
         if let Some(handle) = self.worker_threads[idx].get() {
             handle.unpark();
         }
+    }
+
+    /// Publish the source the merge expects to consume next, so the pool can start
+    /// its read before the consumer gets there.
+    pub(crate) fn set_phase2_next_source(&self, next: Option<usize>) {
+        if next.is_some() {
+            self.phase2_predictions.fetch_add(1, Ordering::Relaxed);
+        }
+        self.phase2_next_source.store(next.unwrap_or(NO_AWAITED_SOURCE), Ordering::Relaxed);
+    }
+
+    /// Predictions published to the pool. See [`Self::phase2_predictions`].
+    pub(crate) fn phase2_predictions(&self) -> u64 {
+        self.phase2_predictions.load(Ordering::Relaxed)
     }
 
     /// How many workers are parked right now, and whether output compression is
@@ -2898,10 +2935,11 @@ impl SortWorkerPool {
             // entry-count allowances and an unbounded (`usize::MAX`) byte budget,
             // so they behave exactly as before.
             let awaited = shared.phase2_awaited_source.load(Ordering::Relaxed);
+            let next_source = shared.phase2_next_source.load(Ordering::Relaxed);
             let (raw_cap, read_batch, fifo_byte_budget, read_byte_budget) = if i == frontier {
                 let (cap, batch) = phase2_read_allowance(true);
                 (cap, batch, usize::MAX, usize::MAX)
-            } else if phase2_deserves_deep_read(i, frontier, awaited) {
+            } else if phase2_deserves_deep_read(i, frontier, awaited, next_source) {
                 let read_blocks = shared.phase2_read_blocks.load(Ordering::Relaxed);
                 let mean_block_bytes = if read_blocks == 0 {
                     0
@@ -2976,7 +3014,8 @@ impl SortWorkerPool {
             // allowance selection uses, so an awaited non-frontier source --
             // which reads at the deep allowance via `awaited_allowance_for` --
             // is counted as deep, not shallow.
-            let (batches, blocks) = if phase2_deserves_deep_read(i, frontier, awaited) {
+            let (batches, blocks) = if phase2_deserves_deep_read(i, frontier, awaited, next_source)
+            {
                 (&shared.deep_read_batches, &shared.deep_read_blocks)
             } else {
                 (&shared.shallow_read_batches, &shared.shallow_read_blocks)
@@ -3449,6 +3488,12 @@ impl SortWorkerPool {
         &self.shared.stage_latency
     }
 
+    /// Publish the source the merge expects to consume next, so the pool can start
+    /// that file's read before the consumer arrives.
+    pub(crate) fn set_phase2_next_source(&self, next: Option<usize>) {
+        self.shared.set_phase2_next_source(next);
+    }
+
     /// Consumer parks split by what the pool looked like when the park began.
     pub(crate) fn park_supply_report(&self) -> crate::merge_stalls::ParkSupplyReport {
         self.shared.park_supply.snapshot()
@@ -3494,6 +3539,11 @@ impl SortWorkerPool {
     /// Parks the consumer avoided by decompressing a block itself.
     pub(crate) fn consumer_self_served(&self) -> u64 {
         self.shared.consumer_self_served.load(Ordering::Relaxed)
+    }
+
+    /// Predictions published to the pool by the merge's loser tree.
+    pub(crate) fn phase2_predictions(&self) -> u64 {
+        self.shared.phase2_predictions()
     }
 
     /// Where the consumer's wakes landed.
@@ -3716,6 +3766,12 @@ impl SortWorkerPool {
         // forward, so neither is self-correcting.
         self.shared.phase2_lowest_active.store(0, Ordering::Release);
         self.shared.phase2_awaited_source.store(NO_AWAITED_SOURCE, Ordering::Release);
+        // The read-ahead prediction indexes the file vector being replaced, so a
+        // pool that merges twice would expose the prior merge's `runner_up`
+        // through `phase2_next_source` while the new merge seeds its sources --
+        // handing deep-read priority to an unrelated file until the new merge
+        // publishes its own prediction. Reset it to the sentinel here.
+        self.shared.phase2_next_source.store(NO_AWAITED_SOURCE, Ordering::Release);
         // The refill allowance is derived from `phase2_read_bytes /
         // phase2_read_blocks`, so these must describe only the set being
         // installed: mean spill-block size moves with the codec, the
@@ -4550,17 +4606,24 @@ mod tests {
     /// shallow allowance: the pool sat 1.9 decompressions deep of a tracked 8
     /// while the consumer waited 73% of the merge loop.
     #[rstest]
-    #[case::frontier_only(0, usize::MAX, 0, true)]
-    #[case::awaited_only(0, 5, 5, true)]
-    #[case::neither(0, 5, 3, false)]
-    #[case::no_awaited_source_yet(0, usize::MAX, 7, false)]
+    #[case::frontier_only(0, usize::MAX, usize::MAX, 0, true)]
+    #[case::awaited_only(0, 5, usize::MAX, 5, true)]
+    #[case::neither(0, 5, usize::MAX, 3, false)]
+    #[case::no_awaited_source_yet(0, usize::MAX, usize::MAX, 7, false)]
+    // The predicted next source reads deep too: reactive signals fire only after
+    // the consumer has already stalled, and a run transition costs ~20ms because
+    // the read had not been started when it arrived.
+    #[case::predicted_next_source(0, usize::MAX, 9, 9, true)]
+    #[case::predicted_next_is_not_the_candidate(0, usize::MAX, 9, 4, false)]
+    #[case::no_prediction_yet(0, usize::MAX, usize::MAX, 4, false)]
     fn the_blocked_file_reads_deep_even_when_it_is_not_the_frontier(
         #[case] frontier: usize,
         #[case] awaited: usize,
+        #[case] next: usize,
         #[case] candidate: usize,
         #[case] expect_deep: bool,
     ) {
-        let deep = phase2_deserves_deep_read(candidate, frontier, awaited);
+        let deep = phase2_deserves_deep_read(candidate, frontier, awaited, next);
         assert_eq!(deep, expect_deep);
         let expected = if expect_deep {
             (PHASE2_STARVING_RAW_CAP, PHASE2_STARVING_READ_BATCH)
@@ -4710,6 +4773,26 @@ mod tests {
     /// over the pool width instead sends most wakes to workers idled by the
     /// Phase 2 cap, which re-park without looking at the starving file — and
     /// the workers that could have refilled it wait out their full backoff.
+    /// A published prediction must be counted, and "no prediction" must not be.
+    ///
+    /// Without this counter a `runner_up()` that returned `None` on every call
+    /// would be indistinguishable from a null result: the deep-read path simply
+    /// never fires, wall clock lands wherever it lands, and nothing in the log
+    /// says the mechanism was inert. The measured -2.7% is only attributable to
+    /// prediction if predictions were actually published.
+    #[test]
+    fn test_published_predictions_are_counted_and_absent_ones_are_not() {
+        let shared = SharedPipelineState::new(2, std::thread::current());
+        assert_eq!(shared.phase2_predictions(), 0, "nothing published yet");
+
+        shared.set_phase2_next_source(Some(3));
+        shared.set_phase2_next_source(Some(1));
+        assert_eq!(shared.phase2_predictions(), 2, "each published source counts once");
+
+        shared.set_phase2_next_source(None);
+        assert_eq!(shared.phase2_predictions(), 2, "clearing the prediction is not a prediction");
+    }
+
     #[rstest]
     // A pool 8 wide capped to 3 must never select a worker above the cap, at
     // any point in the rotation.
@@ -5650,6 +5733,52 @@ mod tests {
             pool.shared.phase2_lowest_active.load(Ordering::Relaxed),
             0,
             "the new source set must be prioritized from its own first file"
+        );
+
+        pool.shutdown();
+    }
+
+    /// A pool that merges twice must not carry the first merge's read-ahead
+    /// prediction into the second.
+    ///
+    /// `phase2_next_source` indexes the file vector `set_phase2_files` replaces
+    /// and hands the named source deep-read priority. A value left from a
+    /// completed merge would give that priority to an unrelated file while the
+    /// new merge is still seeding its sources, before it has published a
+    /// prediction of its own -- so a fresh source set must reset it to the
+    /// sentinel.
+    #[test]
+    fn test_set_phase2_files_clears_the_read_ahead_prediction() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spill = |name: &str| {
+            let path = dir.path().join(name);
+            let mut file = std::fs::File::create(&path).expect("create");
+            file.write_all(&[0x1f, 0x8b, 0x00, 0x00]).expect("write magic");
+            path
+        };
+
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf);
+
+        // First merge: install a source and publish a prediction, as the merge
+        // loop does when the winning run changes.
+        pool.set_phase2_files(std::slice::from_ref(&spill("first.spill")))
+            .expect("set_phase2_files");
+        pool.set_phase2_next_source(Some(0));
+        assert_eq!(
+            pool.shared.phase2_next_source.load(Ordering::Relaxed),
+            0,
+            "guard: the first merge's prediction is published"
+        );
+
+        // Second merge: a fresh set must start with no prediction so no
+        // unrelated file inherits the previous merge's deep-read priority.
+        pool.set_phase2_files(&[spill("second-a.spill"), spill("second-b.spill")])
+            .expect("set_phase2_files");
+        assert_eq!(
+            pool.shared.phase2_next_source.load(Ordering::Relaxed),
+            NO_AWAITED_SOURCE,
+            "a fresh source set must clear the read-ahead prediction"
         );
 
         pool.shutdown();

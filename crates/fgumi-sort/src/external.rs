@@ -4736,12 +4736,13 @@ impl RawExternalSorter {
         100.0 * part as f64 / whole as f64
     }
 
-    /// Validity gates for the merge's targeted-depth paths.
+    /// Validity gates for the two targeted-depth paths in the merge.
     ///
-    /// This one is inert in a way wall clock cannot reveal: if the consumer never
-    /// finds an unclaimed block to decompress, the change does nothing and the run
-    /// still reports a plausible time. So it gets a counter, and the counter is
-    /// printed. Later targeted-depth paths join it here.
+    /// Both changes are inert in a way that a wall-clock number cannot reveal: the
+    /// consumer may never find an unclaimed block to decompress, and the loser tree
+    /// may never name a next source. Either would land as "no measurable change"
+    /// rather than as "the mechanism did not run", so each gets a counter and each
+    /// counter is printed.
     fn log_merge_validity_gates(pool: &SortWorkerPool) {
         let self_served = pool.consumer_self_served();
         if self_served > 0 {
@@ -4749,6 +4750,10 @@ impl RawExternalSorter {
                 "  Consumer served itself: {self_served} parks avoided by decompressing an \
                  already-read block inline"
             );
+        }
+        let predictions = pool.phase2_predictions();
+        if predictions > 0 {
+            info!("  Next-source predictions published: {predictions}");
         }
     }
 
@@ -5342,9 +5347,20 @@ impl RawExternalSorter {
         let reassembled_before = RECORD_REASSEMBLED.load(std::sync::atomic::Ordering::Relaxed);
         let loop_start = Instant::now();
 
+        let mut published_src: Option<usize> = None;
         while tree.winner_is_active() {
             let winner = tree.winner();
             let src_idx = source_map[winner];
+            // Publish the next likely source, but only when the run changes --
+            // ~167K times rather than once per record. The pool gives it the deep
+            // read allowance, so its first read starts while the consumer is still
+            // draining ~300 blocks from the current file, instead of after it has
+            // already stalled. A wrong prediction costs one deep read on a file the
+            // merge will reach eventually; there is no correctness component.
+            if published_src != Some(src_idx) {
+                published_src = Some(src_idx);
+                pool.set_phase2_next_source(tree.runner_up().map(|w| source_map[w]));
+            }
             let sample_this = sample_countdown == 0;
             if sample_this {
                 sample_countdown = merge_sample_interval - 1;
@@ -5540,9 +5556,22 @@ impl RawExternalSorter {
         }
         let loop_start = Instant::now();
         let mut records_merged: u64 = 0;
+        let mut published_src: Option<usize> = None;
         while tree.winner_is_active() {
             let winner = tree.winner();
             let src_idx = source_map[winner];
+            // Publish the next likely source, but only when the run changes. The
+            // pool gives it the deep read allowance, so its first read starts
+            // while the consumer is still draining the current file instead of
+            // after it has already stalled. A wrong prediction costs one deep
+            // read on a file the merge will reach anyway; there is no correctness
+            // component. Mirrors `merge_chunks_generic`; without it the indexed
+            // path -- the default coordinate sort -- gets no predictive
+            // read-ahead.
+            if published_src != Some(src_idx) {
+                published_src = Some(src_idx);
+                pool.set_phase2_next_source(tree.runner_up().map(|w| source_map[w]));
+            }
             let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref())?;
             writer.write_raw_record(record_bytes)?;
             records_merged += 1;
