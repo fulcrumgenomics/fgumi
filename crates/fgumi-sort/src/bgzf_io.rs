@@ -52,6 +52,21 @@ impl StagingBuffer {
     #[must_use]
     /// Seconds this buffer's producer spent blocked waiting for an output
     /// permit, and the number of waits. See [`PermitPool::blocked`].
+    /// Writer-side distributions: per-block write, reorder wait, reorder depth.
+    pub(crate) fn writer_stats(
+        &self,
+    ) -> (
+        crate::merge_trace::HistogramReport,
+        crate::merge_trace::HistogramReport,
+        crate::merge_trace::HistogramReport,
+    ) {
+        (
+            self.permit_pool.write_dur.snapshot(),
+            self.permit_pool.write_reorder_wait.snapshot(),
+            self.permit_pool.write_reorder_depth.snapshot(),
+        )
+    }
+
     pub(crate) fn write_backpressure(&self) -> (f64, u64) {
         self.permit_pool.blocked()
     }
@@ -192,7 +207,7 @@ fn write_block_in_order<W: Write>(
         // Best-effort: the indexing consumer keeps the receiver alive until finish.
         let _ = tx.send(BlockOffset { serial, compressed_start: *compressed_offset });
     }
-    writer.write_all(data)?;
+    permit_pool.write_dur.time(|| writer.write_all(data))?;
     *compressed_offset += data.len() as u64;
     permit_pool.release();
     Ok(())
@@ -252,7 +267,10 @@ fn io_writer_loop_inner<W: Write>(
     block_offset_tx: Option<&Sender<BlockOffset>>,
 ) -> Result<()> {
     let mut next_expected: u64 = 0;
-    let mut reorder_buf: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    // Value carries the arrival instant so the wait for an earlier serial is
+    // measurable; a block written straight through never enters the map and so
+    // records no wait, which is the correct reading.
+    let mut reorder_buf: BTreeMap<u64, (Vec<u8>, std::time::Instant)> = BTreeMap::new();
     let mut compressed_offset: u64 = 0;
     let tx = block_offset_tx;
 
@@ -270,7 +288,8 @@ fn io_writer_loop_inner<W: Write>(
             )?;
             next_expected += 1;
 
-            while let Some(data) = reorder_buf.remove(&next_expected) {
+            while let Some((data, arrived)) = reorder_buf.remove(&next_expected) {
+                permit_pool.write_reorder_wait.record(crate::merge_trace::elapsed_nanos(arrived));
                 write_block_in_order(
                     writer,
                     next_expected,
@@ -282,15 +301,19 @@ fn io_writer_loop_inner<W: Write>(
                 next_expected += 1;
             }
         } else {
-            reorder_buf.insert(result.serial, result.compressed);
+            reorder_buf.insert(result.serial, (result.compressed, std::time::Instant::now()));
             // Permit held: released when this block is written in the cascade above.
         }
+        // Sampled on every arrival, in-order or not, so the depth reflects the
+        // queue the writer is actually carrying rather than only its bad moments.
+        permit_pool.write_reorder_depth.record(reorder_buf.len() as u64);
     }
 
     // Drain remaining buffered blocks — any gap means a worker dropped a result.
     while let Some((&serial, _)) = reorder_buf.first_key_value() {
         if serial == next_expected {
-            let data = reorder_buf.remove(&serial).expect("key just checked");
+            let (data, arrived) = reorder_buf.remove(&serial).expect("key just checked");
+            permit_pool.write_reorder_wait.record(crate::merge_trace::elapsed_nanos(arrived));
             write_block_in_order(
                 writer,
                 next_expected,

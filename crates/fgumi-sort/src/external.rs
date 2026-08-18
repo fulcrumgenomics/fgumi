@@ -4590,6 +4590,102 @@ impl RawExternalSorter {
         Self::log_block_lifecycle(pool);
     }
 
+    /// Log a latency distribution for every stage a block passes through.
+    ///
+    /// [`crate::merge_phases::MergePhaseBreakdown`] already gives each stage a
+    /// busy total and a block count, which yields a mean. A mean cannot settle
+    /// an argument: output compression averages ~187 us over five million blocks
+    /// and a uniform 187 us behaves nothing like a bimodal mix with a long tail,
+    /// yet only the tail explains a worker being unavailable when the consumer
+    /// needs one. So report count, total, mean and three percentiles for each,
+    /// including the writer -- previously visible only as the consumer's
+    /// backpressure wait, which jumped 0.0s to 29.9s across one sweep with no
+    /// way to attribute it.
+    ///
+    /// `wasted visits` is the other half: files a worker passed over before one
+    /// gave it work. The scan tally is published only when a scan finds nothing,
+    /// so the walk to a *successful* claim was never counted -- and on an 89-way
+    /// merge that walk is most of what an "idle" worker is doing.
+    ///
+    /// The distributions log at **debug** and the wasted-visit line at **info**,
+    /// the same split [`Self::log_block_lifecycle`] uses: a percentile table is
+    /// for an investigation, not for someone who just sorted a BAM. Collection
+    /// is unconditional either way.
+    fn log_stage_latency(
+        pool: &SortWorkerPool,
+        writer: &(
+            crate::merge_trace::HistogramReport,
+            crate::merge_trace::HistogramReport,
+            crate::merge_trace::HistogramReport,
+        ),
+    ) {
+        let stage = pool.stage_latency();
+        let &(write_dur, reorder_wait, reorder_depth) = writer;
+        let rows: [(&str, crate::merge_trace::HistogramReport); 6] = [
+            ("read (batched)", stage.read.snapshot()),
+            ("decompress spill", stage.decompress.snapshot()),
+            ("compress output", stage.output_compress.snapshot()),
+            ("compress spill (ph1)", stage.spill_compress.snapshot()),
+            ("write block", write_dur),
+            ("write reorder wait", reorder_wait),
+        ];
+        if rows.iter().all(|(_, r)| r.is_empty()) {
+            return;
+        }
+        // Distributions go to debug and decision-changing numbers stay at info,
+        // matching `log_block_lifecycle` above: a six-row percentile table is
+        // what an investigation needs and far more than someone who just sorted
+        // a BAM should have to scroll past. Collection stays unconditional --
+        // gating collection is what made these questions unanswerable from logs
+        // already in hand.
+        debug!("=== Stage Latency ===");
+        debug!(
+            "  {:<22} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9}",
+            "stage", "count", "total", "mean", "p50", "p90", "p99"
+        );
+        for (label, r) in rows {
+            if r.is_empty() {
+                continue;
+            }
+            debug!(
+                "  {label:<22} {:>10} {:>8.1}s {:>8.0}us {:>8}us {:>8}us {:>8}us",
+                r.count,
+                r.total_secs(),
+                r.mean_micros(),
+                r.percentile_micros(0.50),
+                r.percentile_micros(0.90),
+                r.percentile_micros(0.99)
+            );
+        }
+        if !reorder_depth.is_empty() {
+            debug!(
+                "  Writer reorder depth: mean {:.1} blocks, p90 {}, p99 {} (blocks held waiting \
+                 for an earlier serial)",
+                reorder_depth.mean_micros(),
+                reorder_depth.percentile_micros(0.90),
+                reorder_depth.percentile_micros(0.99)
+            );
+        }
+        // Closes the debug block above, so the separator does not outlive its
+        // header when only info is enabled.
+        debug!("=====================");
+        // Stays at info: this one is a decision-changer, not a distribution. It
+        // is how much of an "idle" worker is scanning rather than waiting, and
+        // reading it wrong sends an investigation at the scan loop -- filling
+        // the walk with more work per claim was measured at +36% (see
+        // `PHASE2_DECOMP_CAP`).
+        let claims = stage.useful_claims.load(std::sync::atomic::Ordering::Relaxed);
+        if claims > 0 {
+            info!(
+                "  Wasted file visits: {:.1} per claim over {} claims ({} visits produced \
+                 nothing) -- what an idle worker is actually doing",
+                stage.wasted_visits_per_claim(),
+                claims,
+                stage.wasted_visits.load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
+    }
+
     /// Log where consumer park time went, and what each worker did.
     ///
     /// The park table is the one figure in this report that partitions an exact
@@ -5123,6 +5219,7 @@ impl RawExternalSorter {
         // compressors are behind, which the sampled breakdown charged to "enqueue
         // write" -- a bucket documented as a handoff that excludes compression.
         let (write_blocked_secs, write_blocked_waits) = writer.write_backpressure();
+        let writer_stats = writer.writer_stats();
 
         // Harvest the consumer's stall report before finalizing: `finish_output`
         // releases the merge sources and with them the consumer, and the report
@@ -5158,6 +5255,7 @@ impl RawExternalSorter {
                 reassembled: reassembled_this_merge,
             },
         );
+        Self::log_stage_latency(pool, &writer_stats);
 
         merge_progress.log_final();
         log_snapshot("phase2.end", 0);
@@ -5265,6 +5363,14 @@ impl RawExternalSorter {
             guard.consumer_ref().map(MainThreadChunkConsumer::stall_report)
         };
 
+        // Retain the permit pool so the writer histograms can be harvested *after*
+        // `finish_index` drains the output queue, exactly as the generic path
+        // does: the pool outlives the writer, and the block writes and reorder
+        // waits incurred during that drain belong in the "write block" and
+        // "write reorder wait" rows. A snapshot taken here, before the drain,
+        // would omit the tail.
+        let writer_permit_pool = writer.permit_pool();
+
         // Finalize before logging, for the reason the generic path does: `finish`
         // drains the output queue, and every block still in it is compressed by
         // the same workers `log_merge_stalls` divides into `merge_total`. Logging
@@ -5275,6 +5381,14 @@ impl RawExternalSorter {
         // number. `loop_total` stays the consumer's park-fraction denominator,
         // which is a fraction of the merge loop alone.
         let index = guard.finish_output(|| writer.finish_index())?;
+
+        // Harvest now, after the drain, from the retained pool. Empty only if the
+        // writer was already finalized when the pool was retained, which cannot
+        // happen on this path.
+        let writer_stats = writer_permit_pool
+            .as_deref()
+            .map_or_else(Default::default, crate::worker_pool::PermitPool::writer_stats);
+
         Self::log_merge_stalls(
             loop_total,
             loop_start.elapsed().as_secs_f64(),
@@ -5282,6 +5396,11 @@ impl RawExternalSorter {
             stalls,
             pool,
         );
+        // `--write-index` is the default for a coordinate sort, so wiring the
+        // stage-latency table here -- matching `merge_chunks_generic` -- is what
+        // gives most production merges any stage-latency and writer-histogram
+        // rows at all.
+        Self::log_stage_latency(pool, &writer_stats);
 
         merge_progress.log_final();
         Ok((index, records_merged))

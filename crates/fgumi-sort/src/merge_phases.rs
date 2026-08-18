@@ -85,6 +85,61 @@ pub(crate) struct MergePhaseCounters {
     pub(crate) spill_compress: ComponentCounter,
 }
 
+/// Latency distributions for the four stages a block passes through, plus the
+/// writer, plus how much scanning was wasted getting there.
+///
+/// [`MergePhaseCounters`] already gives each stage a busy total and a block
+/// count, which yields a *mean*. That is not enough to settle an argument: a
+/// stage averaging 187 us could be uniform or bimodal with a long tail, and only
+/// the tail explains why a worker is unavailable when the consumer needs one.
+/// Output compression is 69% of all worker busy on the measured cell and had no
+/// distribution at all; the writer had none either, so a jump in consumer
+/// backpressure from 0.0s to 29.9s could not be attributed.
+#[derive(Debug, Default)]
+pub(crate) struct StageLatency {
+    /// One batched read of compressed blocks from a spill file.
+    pub(crate) read: crate::merge_trace::DurationHistogram,
+    /// Decompressing one spill block.
+    pub(crate) decompress: crate::merge_trace::DurationHistogram,
+    /// Compressing one output block.
+    pub(crate) output_compress: crate::merge_trace::DurationHistogram,
+    /// Compressing one Phase 1 spill block.
+    pub(crate) spill_compress: crate::merge_trace::DurationHistogram,
+    // The writer's own histograms live on `PermitPool`: the I/O writer thread
+    // already holds that `Arc`, and one pool per writer keeps the output
+    // writer's stats separate from a spill writer's.
+    /// Files a worker passed over before one gave it work, summed over all
+    /// productive scans.
+    ///
+    /// The scan tally is published only when a scan finds *nothing*, so the
+    /// files skipped on the way to a successful claim were invisible. On an
+    /// 89-way merge a worker can walk most of the file set before finding work,
+    /// and that walk is the cost this counts.
+    pub(crate) wasted_visits: std::sync::atomic::AtomicU64,
+    /// Scans that ended in a claim. The denominator for `wasted_visits`.
+    pub(crate) useful_claims: std::sync::atomic::AtomicU64,
+}
+
+impl StageLatency {
+    /// Record a productive scan that skipped `skipped` files before claiming.
+    pub(crate) fn record_claim(&self, skipped: u64) {
+        use std::sync::atomic::Ordering;
+        self.wasted_visits.fetch_add(skipped, Ordering::Relaxed);
+        self.useful_claims.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mean files visited fruitlessly per unit of work claimed.
+    #[expect(clippy::cast_precision_loss, reason = "counts stay far below 2^52")]
+    pub(crate) fn wasted_visits_per_claim(&self) -> f64 {
+        use std::sync::atomic::Ordering;
+        let claims = self.useful_claims.load(Ordering::Relaxed);
+        if claims == 0 {
+            return 0.0;
+        }
+        self.wasted_visits.load(Ordering::Relaxed) as f64 / claims as f64
+    }
+}
+
 /// A read-only view of the counters, for logging.
 #[derive(Debug, Clone, Copy)]
 pub struct MergePhaseBreakdown {

@@ -63,6 +63,17 @@ struct IndexState {
 }
 
 impl PooledBamWriter {
+    /// Writer-side distributions: per-block write, reorder wait, reorder depth.
+    pub(crate) fn writer_stats(
+        &self,
+    ) -> (
+        crate::merge_trace::HistogramReport,
+        crate::merge_trace::HistogramReport,
+        crate::merge_trace::HistogramReport,
+    ) {
+        self.staging.as_ref().map_or_else(Default::default, StagingBuffer::writer_stats)
+    }
+
     /// Seconds the producer spent blocked waiting for an output permit, and the
     /// number of waits.
     ///
