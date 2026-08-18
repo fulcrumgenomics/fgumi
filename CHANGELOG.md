@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **fgumi simplex:** `--max-reads` now caps each end (Fragment, R1, R2) independently rather
+  than the whole MI group ([#723](https://github.com/fulcrumgenomics/fgumi/issues/723)). A family
+  with 6 R1 + 6 R2 reads and `--max-reads 3` previously produced a single consensus with depth 3;
+  it now produces two consensus records (one per strand), each with depth 3. This matches fgbio's
+  `CallMolecularConsensusReads`, which applies the cap independently to each end of the family.
+
 ### Bug Fixes
 
 - **Breaking:** end-of-stream flush paths now fail instead of discarding what they were holding,

@@ -409,10 +409,12 @@ fn run_duplex(
 /// The capped case is the regression: before hash-based selection, `--threads N` and the
 /// no-`--threads` path retained different reads. The uncapped case guards the default
 /// configuration, which was always mode-independent and must stay so.
-/// The odd cap is not redundant with the even one: reads within a family arrive interleaved
-/// R1/R2 and mates share a rank, so a cap of 2 lands exactly on a tie boundary and never
-/// consults the stable sort, while a cap of 3 lands *inside* one — making arrival order, the
-/// last selection input that is not a pure function of the family, observable across modes.
+/// The odd cap complements the even one by truncating each end at a different depth, so a
+/// selection bug surfacing at only one boundary is still caught. (Before fgumi#723 the cap
+/// counted whole-family records with mates sharing a rank, so a cap of 2 landed on a tie
+/// boundary while a cap of 3 landed *inside* one, exercising the stable sort. Per-end capping
+/// now selects from each end's distinctly-named reads, so neither cap hits a tie — but keeping
+/// both still guards cross-mode determinism at two truncation depths.)
 #[rstest]
 #[case::capped(Some("2"))]
 #[case::capped_odd(Some("3"))]

@@ -209,16 +209,18 @@ pub struct Simplex {
     #[arg(short = 'M', long = "min-reads")]
     pub min_reads: usize,
 
-    /// Maximum reads to use per tag family (downsample if exceeded).
+    /// Maximum reads to use per end (Fragment, R1, or R2) when building the consensus
+    /// (downsample if exceeded).
+    ///
+    /// The cap is applied independently to each end rather than to the whole tag family, matching
+    /// fgbio's per-end semantics (fgumi#723).
     ///
     /// Which reads are retained is determined by a hash of the read names, so the selection is
-    /// reproducible across runs, thread counts, and execution modes.
-    ///
-    /// Note the cap applies to the whole tag family rather than to each end independently, unlike
-    /// fgbio (fgumi#723). Mates share a read name and therefore a rank, so the two ends of a
-    /// template sort together, but the cap counts records: a template straddling the cap boundary
-    /// keeps one end and drops the other, which can push that end below `--min-reads` and reject
-    /// the family.
+    /// reproducible across runs, thread counts, and execution modes. Mates share a read name and
+    /// therefore a rank, so both ends of a template are normally retained or discarded together;
+    /// because each end is capped independently, a template whose R1 survives upstream alignment
+    /// filtering while its R2 does not can shift the cap boundary on one end alone, and then the
+    /// two ends' retained subsets diverge.
     #[arg(long = "max-reads")]
     pub max_reads: Option<usize>,
 

@@ -721,8 +721,9 @@ impl VanillaUmiConsensusCaller {
         // fulcrumgenomics/fgbio#1166 — previously `shuffle.take(maxReads)`).
         // The duplex and codec callers reach the single-strand consensus through
         // `consensus_call`, so without this cap `--max-reads-per-strand` is silently ignored
-        // on those paths (DUPLEX3-01). The vanilla path caps raw records earlier in
-        // `process_group` and does not route through here, so it is unaffected.
+        // on those paths (DUPLEX3-01). The vanilla path caps alignment-filtered `SourceRead`s
+        // in `process_subgroup` (per read-type, via `downsample_filtered_source_reads`) and
+        // does not route through here, so it is unaffected.
         //
         // The cap shapes ONLY the consensus bases/quals/depths: the FULL (uncapped)
         // `source_reads` are retained on the output below. fgbio caps inside `consensusCall`
@@ -847,53 +848,77 @@ impl VanillaUmiConsensusCaller {
     }
 
     /// Filters reads to remove secondary/supplementary alignments.
-    fn filter_reads(&mut self, reads: Vec<RawRecord>) -> Vec<RawRecord> {
-        let (accepted, rejected): (Vec<_>, Vec<_>) = reads.into_iter().partition(|raw| {
+    ///
+    /// Each read carries its original group-input position; rejected reads are
+    /// pushed to `group_rejects` with that position so [`Self::process_group`]
+    /// can restore input order across all the ways a group drops records.
+    fn filter_reads(
+        &mut self,
+        reads: Vec<(usize, RawRecord)>,
+        group_rejects: &mut Vec<(usize, Vec<u8>)>,
+    ) -> Vec<(usize, RawRecord)> {
+        let (accepted, rejected): (Vec<_>, Vec<_>) = reads.into_iter().partition(|(_, raw)| {
             let flg = RawRecordView::new(raw.as_ref()).flags();
             flg & flags::SECONDARY == 0 && flg & flags::SUPPLEMENTARY == 0
         });
 
         if self.track_rejects {
-            self.rejected_reads.extend(rejected.into_iter().map(RawRecord::into_inner));
+            group_rejects.extend(rejected.into_iter().map(|(pos, raw)| (pos, raw.into_inner())));
         }
 
         accepted
     }
 
-    /// Downsamples reads if there are more than `max_reads`, returning `(kept, dropped)`.
+    /// Downsamples one end's alignment-filtered `SourceRead`s to at most `max_reads`, returning
+    /// `(kept, dropped)` with each half in input order.
     ///
-    /// Both halves preserve input order. The `dropped` reads are the ones the cap discards;
-    /// the caller counts them as rejected (so `raw_reads_used` excludes them) and routes them
-    /// to the `--rejects` output rather than silently discarding them (fgumi#724).
-    fn downsample_reads(&self, reads: Vec<RawRecord>) -> (Vec<RawRecord>, Vec<RawRecord>) {
+    /// This is the vanilla/simplex `--max-reads` cap (fgumi#723). It runs once per subgroup
+    /// (Fragment, R1, R2) inside [`Self::process_subgroup`], after filtering to the most common
+    /// alignment, so the cap admits `max_reads` reads *per end* rather than across the whole MI
+    /// group — matching fgbio's `consensusCall`, which downsamples each end of the family
+    /// independently and only after the alignment filter. Because both ends of a template share a
+    /// read name and therefore a rank, capping each end to the same size retains matched mates
+    /// together, so a capped paired family still emits an R1/R2 consensus pair instead of
+    /// collapsing to a single end.
+    ///
+    /// The `dropped` reads are the ones the cap discards; the caller counts them as `Downsampled`
+    /// rejections (so `raw_reads_used` excludes them) and routes them to the `--rejects` output
+    /// rather than silently discarding them (fgumi#724).
+    ///
+    /// Unlike [`Self::downsample_source_reads`] (the duplex/codec path, which returns reads in
+    /// *rank* order because they feed only per-position aggregation), this preserves input order:
+    /// the retained reads are consumed both for consensus aggregation *and* for tag extraction —
+    /// where the cell-barcode and methylation-strand tags read the *first* retained read — so the
+    /// survivors must keep the order they had before capping. Rank comes from
+    /// [`SourceRead::name_hash`] and is a no-op returning the input unchanged when `max_reads` is
+    /// unset or the end is already at or below the cap.
+    fn downsample_filtered_source_reads(
+        &self,
+        source_reads: Vec<SourceRead>,
+    ) -> (Vec<SourceRead>, Vec<SourceRead>) {
         let Some(max_reads) = self.options.max_reads else {
-            return (reads, Vec::new());
+            return (source_reads, Vec::new());
         };
-        if reads.len() <= max_reads {
-            return (reads, Vec::new());
+        if source_reads.len() <= max_reads {
+            return (source_reads, Vec::new());
         }
 
-        // Rank once per record, not inside the sort key: `sort_by_key` may evaluate its
-        // closure more than once per element, which would re-hash on every comparison.
-        let ranks: Vec<i32> = reads
-            .iter()
-            .map(|raw| fgbio_read_name_rank(RawRecordView::new(raw.as_ref()).read_name()))
-            .collect();
+        let ranks: Vec<i32> = source_reads.iter().map(|sr| sr.name_hash).collect();
         let keep_indices = select_lowest_ranking(&ranks, max_reads);
 
-        // Partition into survivors and discards, each in input order. Records are moved, not
+        // Partition into survivors and discards, each in input order. Reads are moved, not
         // cloned — families reaching here are by definition larger than the cap.
-        let mut keep = vec![false; reads.len()];
+        let mut keep = vec![false; source_reads.len()];
         for i in keep_indices {
             keep[i] = true;
         }
         let mut kept = Vec::with_capacity(max_reads);
-        let mut dropped = Vec::with_capacity(reads.len() - max_reads);
-        for (i, read) in reads.into_iter().enumerate() {
+        let mut dropped = Vec::with_capacity(source_reads.len() - max_reads);
+        for (i, sr) in source_reads.into_iter().enumerate() {
             if keep[i] {
-                kept.push(read);
+                kept.push(sr);
             } else {
-                dropped.push(read);
+                dropped.push(sr);
             }
         }
         (kept, dropped)
@@ -902,9 +927,10 @@ impl VanillaUmiConsensusCaller {
     /// Downsamples already-filtered `SourceReads` to at most `max_reads`, keeping the
     /// lowest-ranking reads.
     ///
-    /// This is the `SourceRead` analogue of [`Self::downsample_reads`], applied inside
-    /// [`Self::consensus_call`] so the per-strand cap reaches the duplex and codec callers
-    /// (which build consensus from pre-filtered `SourceReads` rather than raw records).
+    /// This is applied inside [`Self::consensus_call`] so the per-strand cap reaches the duplex
+    /// and codec callers (which build consensus from pre-filtered `SourceReads`). It is the
+    /// rank-ordered counterpart to [`Self::downsample_filtered_source_reads`], the simplex per-end
+    /// cap, which preserves input order because its survivors also feed order-sensitive tags.
     ///
     /// Rank comes from [`SourceRead::name_hash`], a Murmur3 hash of the read name, so the
     /// retained subset is a pure function of the family: independent of how many families this
@@ -1158,17 +1184,14 @@ impl VanillaUmiConsensusCaller {
 
     /// The downsampling rank for a `SourceRead`, or `0` when no cap is configured.
     ///
-    /// [`Self::downsample_source_reads`] is the only consumer and runs only when `max_reads` is
-    /// `Some`, so the hash is dead work otherwise — and uncapped is the default configuration,
-    /// i.e. every read of an ordinary run. Gating on the consumer's own guard rather than on a
-    /// caller-supplied flag is deliberate: a placeholder returned while downsampling was live
-    /// would tie every rank, and selection would silently fall back to input order — the exact
-    /// order dependence this ranking exists to remove.
-    ///
-    /// Standalone `simplex` still pays for ranks it never reads, because it caps raw records in
-    /// `process_group` and does not route through `consensus_call`. That residue is bounded by
-    /// `--max-reads` per family rather than by the size of the input, and removing it would need
-    /// exactly the caller-supplied flag this avoids.
+    /// The rank feeds the `--max-reads` cap: [`Self::downsample_source_reads`] (the duplex/codec
+    /// path) and [`Self::downsample_filtered_source_reads`] (the simplex per-end path, fgumi#723)
+    /// are its consumers, and both run only when `max_reads` is `Some`. The hash is therefore dead
+    /// work otherwise — and uncapped is the default configuration, i.e. every read of an ordinary
+    /// run. Gating on the consumers' own guard rather than on a caller-supplied flag is
+    /// deliberate: a placeholder returned while downsampling was live would tie every rank, and
+    /// selection would silently fall back to input order — the exact order dependence this ranking
+    /// exists to remove.
     fn source_read_name_rank(&self, name: &[u8]) -> i32 {
         if self.options.max_reads.is_some() { fgbio_read_name_rank(name) } else { 0 }
     }
@@ -1270,22 +1293,25 @@ impl VanillaUmiConsensusCaller {
         clippy::unused_self,
         reason = "method signature kept for consistency with other caller trait methods"
     )]
+    #[allow(clippy::type_complexity)]
     fn subgroup_reads(
         &self,
-        reads: Vec<RawRecord>,
-    ) -> (Vec<RawRecord>, Vec<RawRecord>, Vec<RawRecord>) {
+        reads: Vec<(usize, RawRecord)>,
+    ) -> (Vec<(usize, RawRecord)>, Vec<(usize, RawRecord)>, Vec<(usize, RawRecord)>) {
         let mut fragment_reads = Vec::new();
         let mut r1_reads = Vec::new();
         let mut r2_reads = Vec::new();
 
-        for raw in reads {
-            let flg = RawRecordView::new(raw.as_ref()).flags();
+        // Each entry keeps its group-input position, so a later sort restores
+        // input order even though R1 and R2 are processed in separate passes.
+        for entry in reads {
+            let flg = RawRecordView::new(entry.1.as_ref()).flags();
             if flg & flags::PAIRED == 0 {
-                fragment_reads.push(raw);
+                fragment_reads.push(entry);
             } else if flg & flags::FIRST_SEGMENT != 0 {
-                r1_reads.push(raw);
+                r1_reads.push(entry);
             } else if flg & flags::LAST_SEGMENT != 0 {
-                r2_reads.push(raw);
+                r2_reads.push(entry);
             }
         }
 
@@ -1297,15 +1323,26 @@ impl VanillaUmiConsensusCaller {
         let input_count = records.len();
         self.stats.record_input(input_count);
 
+        // Tag every record with its group-input position up front. A group drops
+        // records through several independent paths — the secondary/supplementary
+        // filter, each subgroup's alignment/min-reads/downsample filters, and the
+        // orphan-consensus case — and `process_subgroup` runs R1 and R2 in
+        // separate passes. Collecting rejects with their positions and sorting
+        // once at the end keeps the `--rejects` output in input order rather than
+        // "all R1 rejects, then all R2 rejects" (see `SimplexProcessedBatch`).
+        let positioned: Vec<(usize, RawRecord)> = records.into_iter().enumerate().collect();
+        let mut group_rejects: Vec<(usize, Vec<u8>)> = Vec::new();
+
         // Filter reads
-        let pre_filter_count = records.len();
-        let reads = self.filter_reads(records);
+        let pre_filter_count = positioned.len();
+        let reads = self.filter_reads(positioned, &mut group_rejects);
         let filtered_count = pre_filter_count - reads.len();
         if filtered_count > 0 {
             self.stats.record_rejection(RejectionReason::SecondaryOrSupplementary, filtered_count);
         }
 
         if reads.is_empty() {
+            self.flush_group_rejects(group_rejects);
             return Ok(ConsensusOutput::default());
         }
 
@@ -1313,20 +1350,10 @@ impl VanillaUmiConsensusCaller {
         if reads.len() < self.options.min_reads {
             self.stats.record_rejection(RejectionReason::InsufficientReads, reads.len());
             if self.track_rejects {
-                self.rejected_reads.extend(reads.into_iter().map(RawRecord::into_inner));
+                group_rejects.extend(reads.into_iter().map(|(pos, raw)| (pos, raw.into_inner())));
             }
+            self.flush_group_rejects(group_rejects);
             return Ok(ConsensusOutput::default());
-        }
-
-        // Downsample if necessary, routing the reads the cap discards to the --rejects output
-        // and counting them so `raw_reads_used` excludes them rather than over-counting the
-        // downsampled reads as used (fgumi#724).
-        let (reads, downsampled) = self.downsample_reads(reads);
-        if !downsampled.is_empty() {
-            self.stats.record_rejection(RejectionReason::Downsampled, downsampled.len());
-            if self.track_rejects {
-                self.rejected_reads.extend(downsampled.into_iter().map(RawRecord::into_inner));
-            }
         }
 
         // Sub-group by read type
@@ -1335,18 +1362,33 @@ impl VanillaUmiConsensusCaller {
         let mut output = ConsensusOutput::default();
 
         // Process fragment subgroup
-        let (fragment_ok, _, _) =
-            self.process_subgroup(&mut output, umi, ReadType::Fragment, fragment_reads)?;
+        let (fragment_ok, _, _) = self.process_subgroup(
+            &mut output,
+            umi,
+            ReadType::Fragment,
+            fragment_reads,
+            &mut group_rejects,
+        )?;
         if fragment_ok {
             self.stats.record_consensus();
         }
 
         // Process R1/R2 subgroups
         let mut r1r2_output = ConsensusOutput::default();
-        let (r1_ok, r1_surviving_count, r1_surviving_reads) =
-            self.process_subgroup(&mut r1r2_output, umi, ReadType::R1, r1_reads)?;
-        let (r2_ok, r2_surviving_count, r2_surviving_reads) =
-            self.process_subgroup(&mut r1r2_output, umi, ReadType::R2, r2_reads)?;
+        let (r1_ok, r1_surviving_count, r1_surviving_reads) = self.process_subgroup(
+            &mut r1r2_output,
+            umi,
+            ReadType::R1,
+            r1_reads,
+            &mut group_rejects,
+        )?;
+        let (r2_ok, r2_surviving_count, r2_surviving_reads) = self.process_subgroup(
+            &mut r1r2_output,
+            umi,
+            ReadType::R2,
+            r2_reads,
+            &mut group_rejects,
+        )?;
 
         match (r1_ok, r2_ok) {
             (true, true) => {
@@ -1356,19 +1398,34 @@ impl VanillaUmiConsensusCaller {
             (true, false) => {
                 self.stats.record_rejection(RejectionReason::OrphanConsensus, r1_surviving_count);
                 if self.track_rejects {
-                    self.rejected_reads.extend(r1_surviving_reads);
+                    group_rejects.extend(r1_surviving_reads);
                 }
             }
             (false, true) => {
                 self.stats.record_rejection(RejectionReason::OrphanConsensus, r2_surviving_count);
                 if self.track_rejects {
-                    self.rejected_reads.extend(r2_surviving_reads);
+                    group_rejects.extend(r2_surviving_reads);
                 }
             }
             (false, false) => {}
         }
 
+        self.flush_group_rejects(group_rejects);
         Ok(output)
+    }
+
+    /// Append one group's rejected records to `rejected_reads` in group-input
+    /// order. Each entry carries its original position in the group input
+    /// (assigned in [`Self::process_group`]); sorting by it before draining keeps
+    /// interleaved paired input from emitting all R1 rejects before all R2
+    /// rejects, honoring `SimplexProcessedBatch`'s input-order contract. A no-op
+    /// when reject tracking is off (the buffer is empty then).
+    fn flush_group_rejects(&mut self, mut group_rejects: Vec<(usize, Vec<u8>)>) {
+        if !self.track_rejects {
+            return;
+        }
+        group_rejects.sort_by_key(|(pos, _)| *pos);
+        self.rejected_reads.extend(group_rejects.into_iter().map(|(_, bytes)| bytes));
     }
 
     /// Processes a single subgroup (Fragment, R1, or R2) and writes the consensus record
@@ -1379,16 +1436,22 @@ impl VanillaUmiConsensusCaller {
     /// - `usize` — count of reads that survived all internal filtering (not rejected)
     /// - `Vec<Vec<u8>>` — the surviving raw reads as bytes (only populated when `self.track_rejects`)
     ///
-    /// The return type's third element is `Vec<Vec<u8>>` (not `Vec<RawRecord>`) because
-    /// orphan-consensus rejections are forwarded to `rejected_reads: Vec<Vec<u8>>`; that
-    /// rejects path is a separate migration from the input migration done here.
+    /// The return type's third element is `Vec<(usize, Vec<u8>)>` (not
+    /// `Vec<RawRecord>`) because orphan-consensus rejections are forwarded to the
+    /// group's positioned reject buffer; that rejects path is a separate
+    /// migration from the input migration done here. Each rejected record keeps
+    /// its group-input position (the first tuple element) so the caller can
+    /// restore input order — `group_rejects` collects every non-orphan rejection
+    /// with that same position.
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
     fn process_subgroup(
         &mut self,
         output: &mut ConsensusOutput,
         umi: &str,
         read_type: ReadType,
-        group_reads: Vec<RawRecord>,
-    ) -> Result<(bool, usize, Vec<Vec<u8>>)> {
+        group_reads: Vec<(usize, RawRecord)>,
+        group_rejects: &mut Vec<(usize, Vec<u8>)>,
+    ) -> Result<(bool, usize, Vec<(usize, Vec<u8>)>)> {
         use fgumi_raw_bam as bam_fields;
 
         if group_reads.is_empty() {
@@ -1398,7 +1461,8 @@ impl VanillaUmiConsensusCaller {
         if group_reads.len() < self.options.min_reads {
             self.stats.record_rejection(RejectionReason::InsufficientReads, group_reads.len());
             if self.track_rejects {
-                self.rejected_reads.extend(group_reads.into_iter().map(RawRecord::into_inner));
+                group_rejects
+                    .extend(group_reads.into_iter().map(|(pos, raw)| (pos, raw.into_inner())));
             }
             return Ok((false, 0, Vec::new()));
         }
@@ -1406,14 +1470,15 @@ impl VanillaUmiConsensusCaller {
         // Calculate mate overlap clips from raw bytes
         let mate_overlap_clips: Vec<usize> = group_reads
             .iter()
-            .map(|raw| bam_fields::num_bases_extending_past_mate_raw(raw.as_ref()))
+            .map(|(_, raw)| bam_fields::num_bases_extending_past_mate_raw(raw.as_ref()))
             .collect();
 
-        // Create SourceReads from raw bytes
+        // Create SourceReads from raw bytes. `idx` indexes `group_reads` (this
+        // subgroup); `group_reads[idx].0` recovers the group-input position.
         let mut source_reads: Vec<SourceRead> = Vec::new();
         let mut zero_length_indices: Vec<usize> = Vec::new();
 
-        for (idx, (raw, &mate_clip)) in
+        for (idx, ((_, raw), &mate_clip)) in
             group_reads.iter().zip(mate_overlap_clips.iter()).enumerate()
         {
             if let Some(sr) = self.create_source_read(raw.as_ref(), idx, mate_clip)? {
@@ -1423,16 +1488,26 @@ impl VanillaUmiConsensusCaller {
             }
         }
 
-        self.record_zero_length_after_trimming(
-            zero_length_indices.iter().map(|&idx| &group_reads[idx]),
-        );
+        if !zero_length_indices.is_empty() {
+            self.stats.record_rejection(
+                RejectionReason::ZeroLengthAfterTrimming,
+                zero_length_indices.len(),
+            );
+            if self.track_rejects {
+                for &idx in &zero_length_indices {
+                    let (pos, raw) = &group_reads[idx];
+                    group_rejects.push((*pos, raw.to_vec()));
+                }
+            }
+        }
 
         if source_reads.len() < self.options.min_reads {
             if !source_reads.is_empty() {
                 self.stats.record_rejection(RejectionReason::InsufficientReads, source_reads.len());
                 if self.track_rejects {
                     for sr in &source_reads {
-                        self.rejected_reads.push(group_reads[sr.original_idx].to_vec());
+                        let (pos, raw) = &group_reads[sr.original_idx];
+                        group_rejects.push((*pos, raw.to_vec()));
                     }
                 }
             }
@@ -1445,7 +1520,8 @@ impl VanillaUmiConsensusCaller {
 
         if self.track_rejects {
             for idx in rejected_indices {
-                self.rejected_reads.push(group_reads[idx].to_vec());
+                let (pos, raw) = &group_reads[idx];
+                group_rejects.push((*pos, raw.to_vec()));
             }
         }
 
@@ -1457,17 +1533,71 @@ impl VanillaUmiConsensusCaller {
                 );
                 if self.track_rejects {
                     for sr in &filtered_source_reads {
-                        self.rejected_reads.push(group_reads[sr.original_idx].to_vec());
+                        let (pos, raw) = &group_reads[sr.original_idx];
+                        group_rejects.push((*pos, raw.to_vec()));
                     }
                 }
             }
             return Ok((false, 0, Vec::new()));
         }
 
-        // Capture surviving count and reads before building consensus
+        // Apply the per-end `--max-reads` cap (fgumi#723). fgbio applies `--max-reads`
+        // independently to each end of the family inside `consensusCall`, *after* filtering to the
+        // most common alignment, so cap the alignment-filtered reads here — this matches both the
+        // per-end semantics and fgbio's ordering (capping the raw group would rank reads fgbio
+        // never considers and could under-fill the consensus when a kept read later fails the
+        // alignment filter). Reads the cap discards are routed to the `--rejects` output and
+        // counted as `Downsampled` so `raw_reads_used` excludes them (fgumi#724). The
+        // `--max-reads >= --min-reads` CLI check keeps the survivors at or above `min_reads`, so no
+        // consensus is lost to the cap. This is a no-op for the default (uncapped) configuration.
+        let (filtered_source_reads, downsampled) =
+            self.downsample_filtered_source_reads(filtered_source_reads);
+        if !downsampled.is_empty() {
+            self.stats.record_rejection(RejectionReason::Downsampled, downsampled.len());
+            if self.track_rejects {
+                for sr in &downsampled {
+                    let (pos, raw) = &group_reads[sr.original_idx];
+                    group_rejects.push((*pos, raw.to_vec()));
+                }
+            }
+        }
+
+        // Re-check the minimum after the cap. A degenerate `--max-reads` (0, or a value
+        // below `--min-reads`) can leave fewer reads than are required; return no consensus
+        // rather than reaching the empty-source `bail!` or `lengths[min_reads - 1]` in
+        // `create_consensus_from_source_reads`. The `--max-reads >= --min-reads` CLI check
+        // makes this a no-op for the simplex command, but a library caller constructing
+        // `VanillaUmiConsensusOptions` directly bypasses that, so guard here too — mirroring
+        // the same post-cap guard on the per-strand `consensus_call` path. The survivors are
+        // counted as insufficient (the cap's discards were already recorded as `Downsampled`).
+        if filtered_source_reads.len() < self.options.min_reads {
+            if !filtered_source_reads.is_empty() {
+                self.stats.record_rejection(
+                    RejectionReason::InsufficientReads,
+                    filtered_source_reads.len(),
+                );
+                if self.track_rejects {
+                    for sr in &filtered_source_reads {
+                        let (pos, raw) = &group_reads[sr.original_idx];
+                        group_rejects.push((*pos, raw.to_vec()));
+                    }
+                }
+            }
+            return Ok((false, 0, Vec::new()));
+        }
+
+        // Capture surviving count and reads before building consensus. The
+        // orphan-consensus path rejects survivors, so they too carry their
+        // group-input position.
         let surviving_count = filtered_source_reads.len();
         let surviving_reads = if self.track_rejects {
-            filtered_source_reads.iter().map(|sr| group_reads[sr.original_idx].to_vec()).collect()
+            filtered_source_reads
+                .iter()
+                .map(|sr| {
+                    let (pos, raw) = &group_reads[sr.original_idx];
+                    (*pos, raw.to_vec())
+                })
+                .collect()
         } else {
             Vec::new()
         };
@@ -1488,8 +1618,10 @@ impl VanillaUmiConsensusCaller {
         let methylation = methylation.map(|m| m.truncate(bases.len()));
 
         // Get raw records for tag extraction
-        let original_raws: Vec<&[u8]> =
-            filtered_source_reads.iter().map(|sr| group_reads[sr.original_idx].as_ref()).collect();
+        let original_raws: Vec<&[u8]> = filtered_source_reads
+            .iter()
+            .map(|sr| group_reads[sr.original_idx].1.as_ref())
+            .collect();
 
         self.build_consensus_record_into(
             output,
@@ -2022,8 +2154,62 @@ mod tests {
             b.build()
         };
 
-        let filtered = caller.filter_reads(vec![read1, read2]);
+        let positioned: Vec<(usize, RawRecord)> =
+            vec![read1, read2].into_iter().enumerate().collect();
+        let mut group_rejects = Vec::new();
+        let filtered = caller.filter_reads(positioned, &mut group_rejects);
         assert_eq!(filtered.len(), 1);
+    }
+
+    /// Interleaved paired input keeps rejected records in group-input order, not
+    /// "all R1 rejects, then all R2 rejects". R1 and R2 are rejected in separate
+    /// subgroup passes, so without carrying each record's input position the
+    /// `--rejects` output would reorder them, violating `SimplexProcessedBatch`'s
+    /// input-order contract.
+    #[test]
+    fn test_rejected_reads_preserve_interleaved_group_input_order() {
+        // min_reads = 3: the 4-read group clears the group-level gate, but each
+        // 2-read end is rejected (InsufficientReads) in its own subgroup pass.
+        let options = VanillaUmiConsensusOptions { min_reads: 3, ..Default::default() };
+        let mut caller = VanillaUmiConsensusCaller::new_with_rejects_tracking(
+            "consensus".to_string(),
+            "A".to_string(),
+            options,
+            true,
+        );
+
+        // Two pairs, interleaved in input order: a/R1, a/R2, b/R1, b/R2.
+        let reads = vec![
+            create_test_read("a", b"ACGT", b"####", true, true),
+            create_test_read("a", b"ACGT", b"####", true, false),
+            create_test_read("b", b"ACGT", b"####", true, true),
+            create_test_read("b", b"ACGT", b"####", true, false),
+        ];
+
+        consensus_reads_from_raw(&mut caller, reads)
+            .expect("consensus_reads_from_raw should succeed");
+
+        let observed: Vec<(String, bool)> = caller
+            .rejected_reads()
+            .iter()
+            .map(|bytes| {
+                let view = RawRecordView::new(bytes);
+                let name = String::from_utf8_lossy(view.read_name()).into_owned();
+                let is_r1 = view.flags() & flags::FIRST_SEGMENT != 0;
+                (name, is_r1)
+            })
+            .collect();
+
+        assert_eq!(
+            observed,
+            vec![
+                ("a".to_string(), true),
+                ("a".to_string(), false),
+                ("b".to_string(), true),
+                ("b".to_string(), false),
+            ],
+            "rejects must stay in interleaved group-input order, not all-R1-then-all-R2"
+        );
     }
 
     #[test]
@@ -2036,7 +2222,9 @@ mod tests {
         let r1 = create_test_read("r1", b"ACGT", b"####", true, true);
         let r2 = create_test_read("r2", b"ACGT", b"####", true, false);
 
-        let (frag_reads, r1_reads, r2_reads) = caller.subgroup_reads(vec![fragment, r1, r2]);
+        let positioned: Vec<(usize, RawRecord)> =
+            vec![fragment, r1, r2].into_iter().enumerate().collect();
+        let (frag_reads, r1_reads, r2_reads) = caller.subgroup_reads(positioned);
 
         // Should have one read in each subgroup
         assert_eq!(frag_reads.len(), 1, "Should have 1 fragment read");
@@ -2084,14 +2272,48 @@ mod tests {
         assert_eq!(output.count, 0);
     }
 
+    /// fgumi#723 guard parity: on the vanilla/simplex path (`process_subgroup`), a
+    /// degenerate `--max-reads` — zero, or any value below `--min-reads` — must return
+    /// no consensus, not panic. The reads clear every pre-cap `min_reads` gate (group,
+    /// source, alignment-filter) and are only dropped below the minimum by the cap, so
+    /// without a post-cap re-check `create_consensus_from_source_reads` reaches its
+    /// empty-source `bail!` (`max_reads` = 0) or `lengths[min_reads - 1]` (0 < cap <
+    /// `min_reads`). `Simplex::execute` rejects `--max-reads < --min-reads`, but a library
+    /// caller constructing `VanillaUmiConsensusOptions` directly bypasses that check, so
+    /// the guard must live here too — mirroring the same guard on `consensus_call`.
+    #[rstest]
+    #[case::zero_cap(Some(0))]
+    #[case::cap_below_min(Some(2))]
+    fn vanilla_path_degenerate_cap_yields_no_consensus_without_panic(
+        #[case] max_reads: Option<usize>,
+    ) {
+        let options = VanillaUmiConsensusOptions { min_reads: 3, max_reads, ..Default::default() };
+        let mut caller =
+            VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
+
+        // Four identical fragment reads clear the group, source, and alignment-filter
+        // min_reads(3) gates; the cap then drops the survivors below the minimum.
+        let reads: Vec<RawRecord> = (0..4)
+            .map(|i| create_test_read(&format!("r{i}"), b"ACGT", b"####", false, false))
+            .collect();
+
+        let output = consensus_reads_from_raw(&mut caller, reads)
+            .expect("consensus_reads_from_raw must not error on a degenerate cap");
+        assert_eq!(
+            output.count, 0,
+            "a cap below min_reads must yield no consensus, not a panic or empty-source error"
+        );
+    }
+
     #[test]
     fn test_consensus_call_caps_reads_per_strand() {
-        // DUPLEX3-01: `consensus_call` is the single-strand consensus entry point used by the
-        // duplex and codec callers (the vanilla path downsamples raw records earlier and never
-        // reaches this method). fgbio caps the contributing reads inside `consensusCall`
-        // (`downsample(maxReads)`), so `--max-reads-per-strand` must limit how many reads
-        // contribute here. Without the cap, every read contributes and the per-strand depth
-        // exceeds the requested maximum.
+        // DUPLEX3-01 / fgumi#723: `consensus_call` is the single-strand consensus entry point
+        // used by the duplex and codec callers (the vanilla path downsamples alignment-filtered
+        // reads earlier in `process_subgroup` and never reaches this method). fgbio caps the
+        // contributing reads inside `consensusCall` (`downsample(maxReads)`), so `--max-reads`
+        // must limit how many reads contribute here — the same per-end cap the simplex tests
+        // exercise through `process_subgroup`, locked in here for the duplex/codec path directly.
+        // Without the cap, every read contributes and the per-strand depth exceeds the maximum.
         let options =
             VanillaUmiConsensusOptions { min_reads: 1, max_reads: Some(3), ..Default::default() };
         let mut caller =
@@ -2310,35 +2532,6 @@ mod tests {
         );
     }
 
-    /// The raw-record path ranks by read-name hash like the `SourceRead` path, so simplex's
-    /// group-level cap is reproducible across execution modes. Expected values are the same
-    /// htsjdk-derived oracle: signed ranks put q3 < q2 < q0 lowest, so a cap of 3 keeps
-    /// exactly those.
-    ///
-    /// (The cap here is still applied to the whole MI group rather than per end — see
-    /// fgumi#723 — but which reads it keeps is now deterministic.)
-    #[test]
-    fn downsample_reads_retains_lowest_hashing_names() {
-        let options =
-            VanillaUmiConsensusOptions { min_reads: 1, max_reads: Some(3), ..Default::default() };
-        let caller = VanillaUmiConsensusCaller::new("c".to_string(), "A".to_string(), options);
-        let reads: Vec<RawRecord> = (0..10)
-            .map(|i| create_test_read(&format!("q{i}"), b"ACGT", b"####", false, false))
-            .collect();
-
-        let mut names: Vec<String> = caller
-            .downsample_reads(reads)
-            .0
-            .iter()
-            .map(|r| {
-                String::from_utf8(RawRecordView::new(r.as_ref()).read_name().to_vec())
-                    .expect("read names are ASCII")
-            })
-            .collect();
-        names.sort();
-        assert_eq!(names, vec!["q0", "q2", "q3"]);
-    }
-
     /// fgumi#724: reads the `--max-reads` cap discards must be counted as rejected — so
     /// `raw_reads_used` (derived from `filtered_reads`) excludes them — and, with rejects
     /// tracking on, routed to the `--rejects` output byte-for-byte in input order rather than
@@ -2387,54 +2580,40 @@ mod tests {
         );
     }
 
-    /// Both ends of a template share a read name and therefore a rank, so they sort adjacently
-    /// and the cap keeps or drops them together — *unless* the truncation boundary falls inside
-    /// a pair. The simplex cap counts records, not templates (fgumi#723), so whether a template
-    /// splits depends on where the boundary lands in the rank-sorted list, not on the parity of
-    /// `max_reads`: a family mixing fragment and paired reads can split at an even cap and stay
-    /// whole at an odd one. The `--max-reads` help text documents this.
-    ///
-    /// Ranks for "q0".."q4" sort `q3 < q2 < q0 < q1 < q4`, so the rank-sorted record list is
-    /// `q3 q3 | q2 q2 | q0 q0 | q1 q1 | q4 q4`. A cap of 4 lands between blocks; a cap of 3
-    /// lands inside q2's block and keeps only the end that arrived first (the sort is stable).
-    ///
-    /// The expected column is the retained `(name, is_r1)` sequence in output order, which pins
-    /// membership, input-order preservation, and *which* end survives a split in one assertion.
-    #[rstest]
-    #[case::boundary_between_pairs(4, &[("q2", true), ("q2", false), ("q3", true), ("q3", false)])]
-    #[case::boundary_inside_a_pair(3, &[("q2", true), ("q3", true), ("q3", false)])]
-    fn downsample_reads_splits_a_template_only_at_the_cap_boundary(
-        #[case] max_reads: usize,
-        #[case] expected: &[(&str, bool)],
-    ) {
-        let options = VanillaUmiConsensusOptions {
-            min_reads: 1,
-            max_reads: Some(max_reads),
-            ..Default::default()
-        };
-        let caller = VanillaUmiConsensusCaller::new("c".to_string(), "A".to_string(), options);
-        let mut reads: Vec<RawRecord> = Vec::new();
-        for i in 0..5 {
-            let name = format!("q{i}");
-            reads.push(create_test_read(&name, b"ACGT", b"####", true, true));
-            reads.push(create_test_read(&name, b"ACGT", b"####", true, false));
-        }
-
-        let kept: Vec<(String, bool)> = caller
-            .downsample_reads(reads)
-            .0
-            .iter()
-            .map(|r| {
-                let view = RawRecordView::new(r.as_ref());
-                let name =
-                    String::from_utf8(view.read_name().to_vec()).expect("read names are ASCII");
-                (name, view.flags() & flags::FIRST_SEGMENT != 0)
+    /// The simplex per-end cap ([`VanillaUmiConsensusCaller::downsample_filtered_source_reads`],
+    /// fgumi#723) selects the same lowest-ranking reads as `downsample_source_reads` (htsjdk
+    /// `Murmur3(42)` oracle: q0, q2, q3) but returns them **in input order**. That distinguishes
+    /// it from `downsample_source_reads`, which returns rank order (`q3, q2, q0`): the simplex
+    /// survivors feed tag extraction where `.first()` is observable, so the assertion pins the
+    /// order directly rather than sorting first.
+    #[test]
+    fn per_end_cap_keeps_lowest_ranking_reads_in_input_order() {
+        let caller = VanillaUmiConsensusCaller::new(
+            "c".to_string(),
+            "A".to_string(),
+            VanillaUmiConsensusOptions { min_reads: 1, max_reads: Some(3), ..Default::default() },
+        );
+        let srcs: Vec<SourceRead> = (0..10)
+            .map(|i| {
+                let read = create_test_read(&format!("q{i}"), b"ACGT", b"####", false, false);
+                caller
+                    .create_source_read(read.as_ref(), i, 0)
+                    .expect("source read result")
+                    .expect("read is non-empty after trimming")
             })
             .collect();
-        let expected: Vec<(String, bool)> =
-            expected.iter().map(|&(n, r1)| (n.to_string(), r1)).collect();
 
-        assert_eq!(kept, expected);
+        let kept: Vec<usize> = caller
+            .downsample_filtered_source_reads(srcs)
+            .0
+            .iter()
+            .map(|sr| sr.original_idx)
+            .collect();
+        assert_eq!(
+            kept,
+            vec![0, 2, 3],
+            "a cap of 3 must retain q0, q2, q3 in input order (not rank order q3, q2, q0)"
+        );
     }
 
     /// Pins *which* reads a cap retains, with expected values derived from htsjdk's
@@ -2497,6 +2676,78 @@ mod tests {
 
         assert_eq!(build(Some(3)), 3, "a cap of 3 must cap consensus depth at 3");
         assert_eq!(build(None), 10, "uncapped, the full 10-read family must contribute");
+    }
+
+    /// fgumi#723: `--max-reads` caps each end of a paired family independently, matching fgbio's
+    /// per-end `consensusCall` cap rather than the whole MI group. A family of four templates
+    /// (four R1s + four R2s) must always emit an R1/R2 consensus pair, each end capped at
+    /// `max_reads` — never collapsed to half depth, never orphaned. Under the previous
+    /// group-level cap the family was truncated to `max_reads` records *total*, halving per-end
+    /// depth and dropping any end whose mate fell across the truncation boundary (a cap of 1
+    /// left a single record, so one end was orphaned and no consensus was emitted at all).
+    #[rstest]
+    #[case::cap_one(1, vec![1, 1])]
+    #[case::cap_two(2, vec![2, 2])]
+    #[case::cap_equals_count(4, vec![4, 4])]
+    #[case::cap_above_count(8, vec![4, 4])]
+    fn max_reads_caps_each_end_independently(
+        #[case] max_reads: usize,
+        #[case] expected_depths: Vec<i32>,
+    ) {
+        let mut caller = VanillaUmiConsensusCaller::new(
+            "c".to_string(),
+            "A".to_string(),
+            VanillaUmiConsensusOptions {
+                min_reads: 1,
+                max_reads: Some(max_reads),
+                ..Default::default()
+            },
+        );
+        let mut reads: Vec<RawRecord> = Vec::new();
+        for i in 0..4 {
+            let name = format!("q{i}");
+            reads.push(create_test_read(&name, b"ACGT", b"####", true, true));
+            reads.push(create_test_read(&name, b"ACGT", b"####", true, false));
+        }
+        let output =
+            consensus_reads_from_raw(&mut caller, reads).expect("consensus_reads_from_raw");
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let depths: Vec<i32> =
+            records.iter().map(|r| r.get_int_tag(SamTag::CD).expect("cD present")).collect();
+        assert_eq!(
+            depths, expected_depths,
+            "each end of a paired family must be capped independently at max_reads ({max_reads})"
+        );
+    }
+
+    /// fgumi#723: the per-end cap also applies independently to Fragment reads (unpaired
+    /// reads).  This test creates 6 fragment reads (no paired flag), sets `max_reads = 3`,
+    /// and verifies the Fragment subgroup is capped at 3 independently.
+    #[test]
+    fn max_reads_is_applied_to_fragment_subgroup() {
+        let options =
+            VanillaUmiConsensusOptions { min_reads: 1, max_reads: Some(3), ..Default::default() };
+        let mut caller =
+            VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
+
+        // Create 6 fragment (unpaired) reads sharing the same UMI.
+        let reads: Vec<RawRecord> = (0..6)
+            .map(|i| create_test_read(&format!("frag{i}"), b"ACGTACGT", b"########", false, false))
+            .collect();
+
+        let output =
+            consensus_reads_from_raw(&mut caller, reads).expect("consensus_reads_from_raw");
+        assert_eq!(output.count, 1, "should produce exactly one consensus");
+
+        let records = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(records.len(), 1, "one parsed record for one consensus record");
+
+        // Fragment subgroup capped at 3: depth should be 3.
+        let max_depth = records[0].get_int_tag(SamTag::CD).expect("cD present");
+        assert_eq!(
+            max_depth, 3,
+            "fragment subgroup capped at 3: depth should be 3, not group-level 3 shared across strands"
+        );
     }
 
     #[rstest]
