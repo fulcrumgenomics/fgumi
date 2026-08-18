@@ -2192,6 +2192,11 @@ pub struct RawExternalSorter {
     initial_capacity: Option<usize>,
     /// When true, wrap input in a `PrefetchReader` for async I/O.
     async_reader: bool,
+    /// Verify each input BGZF block's CRC32 while decompressing it. Defaults to
+    /// `true` (the safe, pre-existing behavior); the sort command lowers it per
+    /// the `--check-crc` / `--no-check-crc` policy. Applies to input decode only,
+    /// never to spill chunks.
+    verify_crc: bool,
     /// Which optional template-key lanes to retain (template-coordinate only).
     ///
     /// Defaults to [`KeyTypesSpec::Auto`], which provisions the narrowest key
@@ -2300,6 +2305,7 @@ impl RawExternalSorter {
             cell_tag: None,
             initial_capacity: None,
             async_reader: false,
+            verify_crc: true,
             key_types: KeyTypesSpec::default(),
         }
     }
@@ -2510,6 +2516,17 @@ impl RawExternalSorter {
     #[must_use]
     pub fn async_reader(mut self, enabled: bool) -> Self {
         self.async_reader = enabled;
+        self
+    }
+
+    /// Set whether to verify each input BGZF block's CRC32 while decompressing.
+    ///
+    /// Defaults to `true`. Pass `false` to skip verification on trusted input
+    /// (the decompressed-size check always runs). Applies to the Phase 1 input
+    /// decode only; spill chunks are always verified.
+    #[must_use]
+    pub fn verify_crc(mut self, enabled: bool) -> Self {
+        self.verify_crc = enabled;
         self
     }
 
@@ -2814,6 +2831,8 @@ impl RawExternalSorter {
             self.output_compression,
             self.spill_codec,
         );
+        // Set before any input decode begins (workers read it at decode time).
+        pool.set_verify_crc(self.verify_crc);
         // Phase 1 runs first; the merge raises this to `phase2_threads()`.
         pool.set_active_workers(self.phase1_threads());
         Ok(Arc::new(pool))
@@ -7311,6 +7330,66 @@ mod tests {
         let expected = (num_pairs * 2) as u64;
         let observed = count_bam_records(&output);
         assert_eq!(observed, expected, "chunk filename collision likely lost data");
+    }
+
+    /// Flip a byte in the last real BGZF block's CRC32 footer of the BAM at
+    /// `path`. `read_raw_blocks` skips the EOF marker, so this targets a data
+    /// block; the file must span >= 2 blocks so it is not the header's.
+    fn corrupt_last_block_crc(path: &Path) {
+        let mut bytes = std::fs::read(path).expect("read bam for corruption");
+        let blocks = {
+            let mut cursor: &[u8] = &bytes;
+            fgumi_bgzf::read_raw_blocks(&mut cursor, 1_000_000).expect("read bgzf blocks")
+        };
+        assert!(blocks.len() >= 2, "test input must span >= 2 BGZF blocks; got {}", blocks.len());
+        let offset: usize =
+            blocks[..blocks.len() - 1].iter().map(fgumi_bgzf::RawBgzfBlock::len).sum();
+        let last = blocks.last().expect("checked len >= 2 above");
+        let crc_off = offset + last.len() - fgumi_bgzf::BGZF_FOOTER_SIZE;
+        bytes[crc_off] ^= 0x01;
+        std::fs::write(path, bytes).expect("write corrupted bam");
+    }
+
+    /// The worker-pool sort path must honor `verify_crc` on its input decode: a
+    /// corrupted block is rejected by default (verify on) and read clean with it
+    /// off (#817). Against the old always-verify decode the `verify_crc: false`
+    /// case could not pass.
+    #[test]
+    fn test_sort_honors_verify_crc_on_corrupted_input() {
+        use fgumi_sam::SamBuilder;
+
+        // Enough pairs to span several 64 KiB BGZF blocks so the corrupted block
+        // is a data block the sort must decode.
+        let mut builder = SamBuilder::new();
+        for i in 0..3000usize {
+            let descending = 2999 - i;
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{descending:05}"))
+                .start1(descending * 50 + 1)
+                .start2(descending * 50 + 101)
+                .build();
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("input.bam");
+        builder.write_bam(&input).expect("write bam");
+        corrupt_last_block_crc(&input);
+
+        // Default (verify on): the corrupted input CRC32 is rejected.
+        let out_verify = dir.path().join("verify.bam");
+        assert!(
+            RawExternalSorter::new(SortOrder::Coordinate).sort(&input, &out_verify).is_err(),
+            "verify_crc: true (default) must reject a corrupted input CRC32"
+        );
+
+        // verify_crc(false): the same file sorts clean, all records preserved.
+        let out_skip = dir.path().join("skip.bam");
+        RawExternalSorter::new(SortOrder::Coordinate)
+            .verify_crc(false)
+            .sort(&input, &out_skip)
+            .expect("verify_crc: false must accept a corrupted input CRC32");
+        assert_eq!(count_bam_records(&out_skip), 6000, "all records read with verify_crc: false");
     }
 
     /// Collect (name, pos) for every record in a BAM, in file order.

@@ -30,7 +30,7 @@
 //! This module is currently not integrated into the sort pipeline.
 //! It provides infrastructure for future optimization.
 
-use fgumi_bgzf::reader::{decompress_block_into, read_raw_blocks};
+use fgumi_bgzf::reader::{decompress_block_into_opts, read_raw_blocks};
 use libdeflater::Decompressor;
 use std::io::{self, BufReader, Read};
 
@@ -61,7 +61,7 @@ pub fn open_raw_bam_record_reader<P: AsRef<std::path::Path>>(
 ) -> anyhow::Result<OwnedRawBamRecordReader> {
     let path = path.as_ref();
     let normalized = fgumi_bam_io::open_normalized_input(path)?;
-    skip_header_for(normalized, path)
+    skip_header_for(normalized, path, true)
 }
 
 /// Open `path` for raw BAM record reading and return its parsed header too.
@@ -78,18 +78,35 @@ pub fn open_raw_bam_record_reader<P: AsRef<std::path::Path>>(
 pub fn open_raw_bam_record_reader_with_header<P: AsRef<std::path::Path>>(
     path: P,
 ) -> anyhow::Result<(OwnedRawBamRecordReader, noodles::sam::Header)> {
+    open_raw_bam_record_reader_with_header_opts(path, true)
+}
+
+/// Variant of [`open_raw_bam_record_reader_with_header`] that chooses whether to
+/// verify each input BGZF block's CRC32 (`verify_crc`). The header parse always
+/// verifies (it runs through noodles-bgzf); only the record decode honors the
+/// flag.
+///
+/// # Errors
+///
+/// Returns an error if the input cannot be opened, is neither BAM nor SAM, or
+/// its header cannot be parsed or skipped.
+pub fn open_raw_bam_record_reader_with_header_opts<P: AsRef<std::path::Path>>(
+    path: P,
+    verify_crc: bool,
+) -> anyhow::Result<(OwnedRawBamRecordReader, noodles::sam::Header)> {
     let path = path.as_ref();
     let normalized = fgumi_bam_io::open_normalized_input(path)?;
     let (header, replayed) = fgumi_bam_io::read_header_and_replay(normalized, path)?;
-    Ok((skip_header_for(replayed, path)?, header))
+    Ok((skip_header_for(replayed, path, verify_crc)?, header))
 }
 
 /// Wrap `reader` in a [`RawBamRecordReader`] positioned at the first record.
 fn skip_header_for(
     reader: Box<dyn Read + Send>,
     path: &std::path::Path,
+    verify_crc: bool,
 ) -> anyhow::Result<OwnedRawBamRecordReader> {
-    let mut reader = RawBamRecordReader::new(reader)
+    let mut reader = RawBamRecordReader::new_with_opts(reader, verify_crc)
         .map_err(|e| anyhow::anyhow!("Failed to read BAM header from {}: {e}", path.display()))?;
     reader
         .skip_header()
@@ -114,6 +131,9 @@ pub struct RawBamRecordReader<R: Read> {
     eof: bool,
     /// Whether the BAM header has been skipped.
     header_skipped: bool,
+    /// Whether to verify each BGZF block's CRC32 while decompressing. Defaults to
+    /// `true`; lowered via [`new_with_opts`](Self::new_with_opts) for trusted input.
+    verify_crc: bool,
 }
 
 impl<R: Read> RawBamRecordReader<R> {
@@ -126,6 +146,19 @@ impl<R: Read> RawBamRecordReader<R> {
     ///
     /// Returns an error if the input is not a valid BAM file.
     pub fn new(reader: R) -> io::Result<Self> {
+        Self::new_with_opts(reader, true)
+    }
+
+    /// Create a new raw BAM record reader, choosing whether to verify each BGZF
+    /// block's CRC32 while decompressing.
+    ///
+    /// `verify_crc = true` matches [`new`](Self::new); `false` skips CRC32
+    /// verification for trusted input (the decompressed-size check always runs).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is not a valid BAM file.
+    pub fn new_with_opts(reader: R, verify_crc: bool) -> io::Result<Self> {
         let reader = BufReader::with_capacity(256 * 1024, reader);
 
         let mut this = Self {
@@ -135,6 +168,7 @@ impl<R: Read> RawBamRecordReader<R> {
             position: 0,
             eof: false,
             header_skipped: false,
+            verify_crc,
         };
 
         // Decompress initial blocks to access BAM header
@@ -177,6 +211,7 @@ impl<R: Read> RawBamRecordReader<R> {
             position: 0,
             eof: false,
             header_skipped: false,
+            verify_crc: true,
         };
 
         // Decompress initial blocks
@@ -361,9 +396,14 @@ impl<R: Read> RawBamRecordReader<R> {
             return Ok(());
         }
 
-        // Decompress blocks
+        // Decompress blocks, honoring the CRC-verification policy.
         for block in &blocks {
-            decompress_block_into(block, &mut self.decompressor, &mut self.decompressed)?;
+            decompress_block_into_opts(
+                block,
+                &mut self.decompressor,
+                &mut self.decompressed,
+                self.verify_crc,
+            )?;
         }
 
         Ok(())
@@ -503,6 +543,58 @@ mod tests {
         let data = build_test_bam("@HD\tVN:1.6\n", &[], &[]);
         let reader = RawBamRecordReader::new(io::Cursor::new(data));
         assert!(reader.is_ok(), "Expected valid BAM to succeed: {:?}", reader.err());
+    }
+
+    /// Flip a byte in the last BGZF block's CRC32 footer. Requires the input to
+    /// span at least two blocks so the corrupted block is a data block, not the
+    /// header's (the header parse always verifies through noodles-bgzf).
+    fn corrupt_last_block_crc(bam: &mut [u8]) {
+        let blocks = {
+            let mut cursor: &[u8] = bam;
+            fgumi_bgzf::read_raw_blocks(&mut cursor, 100_000).expect("read bgzf blocks")
+        };
+        assert!(blocks.len() >= 2, "test input must span >= 2 BGZF blocks; got {}", blocks.len());
+        let offset: usize =
+            blocks[..blocks.len() - 1].iter().map(fgumi_bgzf::RawBgzfBlock::len).sum();
+        let last = blocks.last().expect("checked len >= 2 above");
+        let crc_off = offset + last.len() - fgumi_bgzf::BGZF_FOOTER_SIZE;
+        bam[crc_off] ^= 0x01;
+    }
+
+    /// Construct, skip the header, and drain all records, returning the count or
+    /// the first error from any step. The corrupted block is decompressed during
+    /// the reader's first refill, so the error can surface at construction.
+    fn read_all_records(bam: Vec<u8>, verify_crc: bool) -> io::Result<usize> {
+        let mut reader = RawBamRecordReader::new_with_opts(io::Cursor::new(bam), verify_crc)?;
+        reader.skip_header()?;
+        let mut count = 0;
+        while reader.next_record()?.is_some() {
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// The single-threaded raw reader must honor `verify_crc`: a corrupted block
+    /// errors with verification on and reads clean with it off (#817). Against the
+    /// old always-verify decode the `verify_crc: false` case could not pass.
+    #[test]
+    fn test_raw_bam_record_reader_honors_verify_crc() {
+        // Enough records to span >= 2 BGZF blocks (minimal records are ~38 bytes;
+        // 5000 gives ~190 KiB uncompressed, several 64 KiB blocks).
+        let records: Vec<Vec<u8>> =
+            (0..5000).map(|i| make_minimal_record(format!("r{i}").as_bytes())).collect();
+        let mut bam = build_test_bam("@HD\tVN:1.6\n", &[("chr1", 1000)], &records);
+        corrupt_last_block_crc(&mut bam);
+
+        assert!(
+            read_all_records(bam.clone(), true).is_err(),
+            "verify_crc: true must reject a corrupted BGZF CRC32"
+        );
+        assert_eq!(
+            read_all_records(bam, false).expect("verify_crc: false must accept a corrupted CRC32"),
+            5000,
+            "all records read with verify_crc: false"
+        );
     }
 
     #[test]

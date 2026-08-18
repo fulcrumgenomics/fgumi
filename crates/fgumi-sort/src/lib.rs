@@ -216,7 +216,7 @@ pub use keys::{
 };
 pub use reader::{
     OwnedRawBamRecordReader, RawBamRecordReader, open_raw_bam_record_reader,
-    open_raw_bam_record_reader_with_header,
+    open_raw_bam_record_reader_with_header, open_raw_bam_record_reader_with_header_opts,
 };
 pub use verify::{VerifySummary, verify_sort_order};
 

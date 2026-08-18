@@ -393,6 +393,27 @@ pub struct Sort {
     /// on disk. Prototype flag; defaults to off.
     #[arg(long = "async-reader", default_value_t = false, hide = true)]
     pub async_reader: bool,
+
+    /// Verify each input BGZF block's CRC32 checksum while decoding.
+    ///
+    /// Without either `--check-crc` or `--no-check-crc`, verification defaults on
+    /// for file input and off for stdin input: a freshly-piped aligner stream is
+    /// trusted, since any corruption there is a bug in the upstream process rather
+    /// than data at rest, while a file may have been archived, transferred, or
+    /// copied since it was written, where a flipped bit is exactly what CRC32
+    /// exists to catch. Pass `--check-crc` to force verification on. Mutually
+    /// exclusive with `--no-check-crc`. Honored on both the sort and `--verify`
+    /// input decode; spill files are always verified. Every run logs a
+    /// `CRC verify:` line at startup.
+    #[arg(long = "check-crc", default_value_t = false, conflicts_with = "no_check_crc")]
+    pub check_crc: bool,
+
+    /// Skip CRC32 verification while decoding the input.
+    ///
+    /// Trades the input CRC32 integrity check for faster decode. See `--check-crc`
+    /// for the default policy this overrides. Mutually exclusive with `--check-crc`.
+    #[arg(long = "no-check-crc", default_value_t = false, conflicts_with = "check_crc")]
+    pub no_check_crc: bool,
 }
 
 /// Environment variable name for the fallback temp-dir list, parsed as a
@@ -571,6 +592,7 @@ impl Sort {
             .spill_codec(self.temp_codec)
             .write_index(self.write_index)
             .async_reader(self.async_reader)
+            .verify_crc(self.effective_check_crc())
             .pg_info(crate::version::VERSION.to_string(), command_line.to_string());
 
         // Each per-phase override is optional and falls back to `--threads`.
@@ -601,6 +623,39 @@ impl Sort {
     /// for other sort orders.
     fn parse_cell_tag(&self) -> Result<Option<SamTag>> {
         parse_cell_tag(self.order)
+    }
+
+    /// Resolve the effective input-CRC-verification policy from `--check-crc` /
+    /// `--no-check-crc` and the input's stdin-vs-file status, matching the policy
+    /// the BAM-input commands use: `--check-crc` forces it on, `--no-check-crc`
+    /// forces it off, and with neither given it defaults on for a file and off
+    /// for trusted stdin. The two flags are mutually exclusive at the CLI layer.
+    #[must_use]
+    fn effective_check_crc(&self) -> bool {
+        if self.check_crc {
+            true
+        } else if self.no_check_crc {
+            false
+        } else {
+            !fgumi_bam_io::is_stdin_path(&self.input)
+        }
+    }
+
+    /// Log the effective CRC-verification setting once at run start, so the
+    /// policy — a default that varies with file-vs-stdin — is visible rather
+    /// than silent.
+    fn log_effective_check_crc(&self) {
+        let effective = self.effective_check_crc();
+        let reason = if self.check_crc {
+            " (--check-crc)"
+        } else if self.no_check_crc {
+            " (--no-check-crc)"
+        } else if fgumi_bam_io::is_stdin_path(&self.input) {
+            " (trusted stdin)"
+        } else {
+            ""
+        };
+        info!("CRC verify: {}{reason}", if effective { "on" } else { "off" });
     }
 }
 
@@ -700,6 +755,7 @@ impl Sort {
         info!("Input: {}", self.input.display());
         info!("Output: {}", output.display());
         info!("Sort order: {:?}", self.order);
+        self.log_effective_check_crc();
         if let Some(ct) = cell_tag {
             let ct_bytes = *ct;
             info!("Cell tag: {}{}", ct_bytes[0] as char, ct_bytes[1] as char);
@@ -792,7 +848,7 @@ impl Sort {
 
     /// Execute verify mode: read records and check sort order.
     fn execute_verify(&self) -> Result<()> {
-        use fgumi_sort::open_raw_bam_record_reader_with_header;
+        use fgumi_sort::open_raw_bam_record_reader_with_header_opts;
         use fgumi_sort::{
             LibraryLookup, RawQuerynameKey, RawQuerynameLexKey, RawSortKey, SortContext, cb_hasher,
             extract_coordinate_key_inline, extract_template_key_inline,
@@ -806,6 +862,7 @@ impl Sort {
         debug!("Starting Sort Verification");
         info!("Input: {}", self.input.display());
         info!("Expected order: {:?}", self.order);
+        self.log_effective_check_crc();
         if let Some(ct) = cell_tag {
             let ct_bytes = *ct;
             info!("Cell tag: {}{}", ct_bytes[0] as char, ct_bytes[1] as char);
@@ -814,7 +871,8 @@ impl Sort {
         // One open yields both the header and the records: the header is parsed
         // through a tee and the consumed bytes replayed. Reading the path twice
         // is what used to make `--verify` reject a pipe.
-        let (raw_reader, header) = open_raw_bam_record_reader_with_header(&self.input)?;
+        let (raw_reader, header) =
+            open_raw_bam_record_reader_with_header_opts(&self.input, self.effective_check_crc())?;
 
         let (total_records, violations, first_violation) = match self.order {
             SortOrderArg::Coordinate => {
@@ -1552,7 +1610,33 @@ mod tests {
             max_temp_files: MaxTempFiles::Auto,
             write_index: false,
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         }
+    }
+
+    /// The `--check-crc` / `--no-check-crc` policy: explicit flags win; with
+    /// neither, verify defaults on for a file and off for trusted stdin.
+    #[rstest]
+    #[case::default_file(false, false, "in.bam", true)]
+    #[case::default_stdin(false, false, "-", false)]
+    #[case::force_on_file(true, false, "in.bam", true)]
+    #[case::force_on_stdin(true, false, "-", true)]
+    #[case::force_off_file(false, true, "in.bam", false)]
+    #[case::force_off_stdin(false, true, "-", false)]
+    fn test_sort_effective_check_crc(
+        #[case] check_crc: bool,
+        #[case] no_check_crc: bool,
+        #[case] input: &str,
+        #[case] expected: bool,
+    ) {
+        let sort = Sort {
+            input: PathBuf::from(input),
+            check_crc,
+            no_check_crc,
+            ..make_sort(SortOrderArg::Coordinate)
+        };
+        assert_eq!(sort.effective_check_crc(), expected);
     }
 
     #[rstest]

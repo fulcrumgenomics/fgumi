@@ -46,7 +46,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use crossbeam_queue::ArrayQueue;
 use fgumi_bgzf::reader::read_raw_blocks;
 use fgumi_bgzf::writer::InlineBgzfCompressor;
-use fgumi_bgzf::{RawBgzfBlock, decompress_block};
+use fgumi_bgzf::{RawBgzfBlock, decompress_block, decompress_block_into_opts};
 use log::debug;
 use std::collections::VecDeque;
 use std::fmt::Write as FmtWrite;
@@ -1239,6 +1239,14 @@ pub(crate) struct SharedPipelineState {
     /// Current phase: 0=shutdown, 1=Phase1, 2=Phase2, 255=Legacy.
     pub(crate) phase: AtomicU8,
 
+    /// Whether to verify each input BGZF block's CRC32 while decompressing it.
+    /// Defaults to `true`; the sort driver lowers it via
+    /// [`SortWorkerPool::set_verify_crc`] before Phase 1 decode begins, per the
+    /// `--check-crc` policy. Applies only to the input decode (Phase 1), not to
+    /// fgumi's own spill chunks, whose integrity is a separate concern. Atomic so
+    /// the already-spawned workers observe the driver's setting.
+    pub(crate) verify_crc: AtomicBool,
+
     /// Number of workers permitted to be active in the current phase. Workers
     /// with `worker_id >= active_worker_limit` idle (backoff) instead of taking
     /// work. Lets the sort driver run Phase 1 (accumulate/sort/spill) on fewer
@@ -1394,6 +1402,7 @@ impl SharedPipelineState {
             consumer_trace: crate::merge_trace::ConsumerTraceStats::default(),
             fruitless_scan: crate::merge_trace::DurationHistogram::default(),
             phase: AtomicU8::new(phase::LEGACY),
+            verify_crc: AtomicBool::new(true),
             active_worker_limit: AtomicUsize::new(num_workers),
 
             input_file: std::sync::Mutex::new(None),
@@ -1852,6 +1861,9 @@ impl SortWorkerPool {
     /// - `temp_compression`: BGZF level for Phase 1 spill writes (typically 1 for speed).
     /// - `output_compression`: BGZF level for Phase 2 merge output (typically 6 for size).
     /// - `spill_codec`: codec used for spill chunks (BGZF or Zstd). Output is always BGZF.
+    ///
+    /// Input CRC verification defaults to on; lower it with
+    /// [`set_verify_crc`](Self::set_verify_crc) before Phase 1 decode begins.
     #[must_use]
     pub fn new(
         num_workers: usize,
@@ -2348,8 +2360,18 @@ impl SortWorkerPool {
             return StepResult::InputEmpty;
         };
 
-        let data = match decompress_block(&block, &mut worker.decompressor) {
-            Ok(d) => d,
+        // Input decode honors the `--check-crc` policy (unlike spill decode,
+        // which always verifies fgumi's own temp files). `decompress_block_into_opts`
+        // appends into a fresh buffer pre-sized to the block's ISIZE, matching what
+        // `decompress_block` did.
+        let mut decompressed = Vec::with_capacity(block.uncompressed_size());
+        let data = match decompress_block_into_opts(
+            &block,
+            &mut worker.decompressor,
+            &mut decompressed,
+            shared.verify_crc.load(Ordering::Relaxed),
+        ) {
+            Ok(()) => decompressed,
             Err(e) => {
                 log::error!("BGZF decompression error (input block serial {serial}): {e}");
                 shared.decompression_error.store(true, Ordering::Release);
@@ -3199,6 +3221,14 @@ impl SortWorkerPool {
     pub fn set_active_workers(&self, n: usize) {
         let n = n.clamp(1, self.num_workers);
         self.shared.active_worker_limit.store(n, Ordering::Release);
+    }
+
+    /// Set whether Phase 1 input decode verifies each BGZF block's CRC32.
+    ///
+    /// Must be called before input decode begins (the sort driver does so right
+    /// after constructing the pool). Spill-chunk decode is unaffected.
+    pub fn set_verify_crc(&self, enabled: bool) {
+        self.shared.verify_crc.store(enabled, Ordering::Relaxed);
     }
 
     /// Hand the pool over to Phase 2 once ingest is done, widening it to
