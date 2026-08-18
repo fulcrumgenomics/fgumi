@@ -4573,6 +4573,44 @@ impl RawExternalSorter {
                      bounds how late work arriving any other way is noticed; it delays the merge \
                      only when every worker is asleep at once)"
                 );
+                // Why the discovery lag above is as large as it is. A wake aimed at a
+                // worker that is already running does nothing, and the consumer then
+                // waits for some other worker's backoff to expire -- bounded by
+                // MAX_BACKOFF_US, not by unpark cost. `recoverable` is the subset where a
+                // parked worker existed and the rotating target passed it over; the rest
+                // is a genuinely saturated pool and is nobody's fault.
+                let wakes = pool.wake_accounting();
+                if wakes.issued > 0 {
+                    info!(
+                        "  Wake targeting: {} of {} wakes hit an already-running worker ({:.0}%), {} of \
+                 those had a parked worker available ({:.0}% recoverable)",
+                        wakes.on_running,
+                        wakes.issued,
+                        Self::percent(wakes.on_running, wakes.issued),
+                        wakes.recoverable,
+                        Self::percent(wakes.recoverable, wakes.issued)
+                    );
+                }
+                // The decisive split: if the backoff timer recruited more critical-path
+                // claims than the wake did, the wake path is not what sets recruitment
+                // latency and tuning unpark cost cannot help. Inferred from elapsed vs
+                // requested park time -- park_timeout does not report its reason.
+                let recruited = wakes.from_unpark + wakes.from_timeout;
+                if recruited > 0 {
+                    info!(
+                        "  Critical-path recruitment (inferred): {} by our wake, {} by the worker's own \
+                 backoff expiring ({:.0}% timer)",
+                        wakes.from_unpark,
+                        wakes.from_timeout,
+                        Self::percent(wakes.from_timeout, recruited)
+                    );
+                }
+                info!(
+                    "    Wakes issued: {} (backoff 10us doubling to {}us ceiling; one worker woken \
+                     per wake)",
+                    pool.wakes_issued(),
+                    crate::worker_pool::MAX_BACKOFF_US
+                );
             }
 
             Self::log_park_attribution(pool, loop_total);
@@ -4611,6 +4649,15 @@ impl RawExternalSorter {
     /// the same split [`Self::log_block_lifecycle`] uses: a percentile table is
     /// for an investigation, not for someone who just sorted a BAM. Collection
     /// is unconditional either way.
+    /// `part` as a percentage of `whole`, or 0.0 when `whole` is zero.
+    #[expect(clippy::cast_precision_loss, reason = "counts stay far below 2^52")]
+    fn percent(part: u64, whole: u64) -> f64 {
+        if whole == 0 {
+            return 0.0;
+        }
+        100.0 * part as f64 / whole as f64
+    }
+
     fn log_stage_latency(
         pool: &SortWorkerPool,
         writer: &(

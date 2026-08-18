@@ -1377,6 +1377,68 @@ pub fn classify_stall(
     }
 }
 
+// ============================================================================
+// Worker recruitment: why the consumer waits for a worker it already woke
+// ============================================================================
+
+/// How a worker's `park_timeout` ended.
+///
+/// `park_timeout` does not report its reason, so this is **inferred** from the
+/// elapsed time against the duration the worker asked for. A worker that
+/// returned meaningfully early was unparked; one that ran to its deadline timed
+/// out. Label any conclusion drawn from it as inferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParkExit {
+    /// Returned early -- something unparked it.
+    Unparked,
+    /// Ran to its deadline -- nobody did.
+    TimedOut,
+}
+
+/// Classify a park exit from elapsed vs requested microseconds.
+///
+/// The margin exists because a timed-out park overshoots its deadline by
+/// scheduler latency, so "elapsed < requested" alone would classify almost every
+/// timeout as an unpark. Requiring the wake to be clearly early instead means a
+/// *late* unpark is misread as a timeout -- the safe direction, because it
+/// under-counts the wake path's effectiveness rather than crediting it for
+/// recruitment it did not do.
+pub(crate) fn classify_park_exit(elapsed_us: u64, requested_us: u64) -> ParkExit {
+    // A park that never asked for a wait (the `yield_now` path) cannot have been
+    // cut short by anything.
+    if requested_us == 0 {
+        return ParkExit::TimedOut;
+    }
+    // Three quarters of the deadline: comfortably past scheduler overshoot, and
+    // far enough from the deadline that a genuine unpark is unambiguous.
+    if elapsed_us.saturating_mul(4) < requested_us.saturating_mul(3) {
+        ParkExit::Unparked
+    } else {
+        ParkExit::TimedOut
+    }
+}
+
+/// The first parked worker at or after `cursor`, or `None` if none are parked.
+///
+/// Rotating blindly is what makes a wake cheap, and also what makes it
+/// unreliable: at low utilization most workers are parked, but the cursor can
+/// still land on the one that is running, and that wake is simply lost. The
+/// consumer then waits for some other worker's backoff to expire instead --
+/// bounded by `MAX_BACKOFF_US`, not by wake cost.
+/// Takes a predicate rather than a slice so the wake path can read the atomics
+/// directly: this runs on every wake -- millions of them -- and materializing a
+/// `Vec<bool>` there would allocate on the hottest coordination path in the
+/// merge. Production and tests call the same function.
+pub(crate) fn first_parked_from<F>(cursor: usize, width: usize, is_parked: F) -> Option<usize>
+where
+    F: Fn(usize) -> bool,
+{
+    if width == 0 {
+        return None;
+    }
+    (0..width).map(|offset| (cursor + offset) % width).find(|&i| is_parked(i))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2000,5 +2062,64 @@ mod tests {
         let shares = awaited_shares([0.2, 0.3, 0.15, 0.25, 0.1]);
         let total = shares.starved + shares.unclaimed() + shares.in_progress();
         assert!((total - 1.0).abs() < 1e-9);
+    }
+    // ========================================================================
+    // Worker recruitment
+    // ========================================================================
+
+    /// A timed-out park overshoots its deadline by scheduler latency, so
+    /// `elapsed < requested` alone would call almost every timeout an unpark and
+    /// credit the wake path with recruitment it never did.
+    #[rstest]
+    #[case::clearly_early_is_an_unpark(10, 1000, ParkExit::Unparked)]
+    #[case::ran_to_the_deadline_timed_out(1000, 1000, ParkExit::TimedOut)]
+    #[case::overshot_the_deadline_timed_out(1180, 1000, ParkExit::TimedOut)]
+    #[case::a_hair_early_is_not_credited_as_a_wake(995, 1000, ParkExit::TimedOut)]
+    #[case::half_the_deadline_is_a_wake(500, 1000, ParkExit::Unparked)]
+    #[case::yield_path_never_requested_a_wait(0, 0, ParkExit::TimedOut)]
+    fn test_park_exit_is_inferred_conservatively(
+        #[case] elapsed_us: u64,
+        #[case] requested_us: u64,
+        #[case] expected: ParkExit,
+    ) {
+        assert_eq!(classify_park_exit(elapsed_us, requested_us), expected);
+    }
+
+    #[test]
+    fn test_first_parked_starts_at_the_cursor_and_wraps() {
+        let parked = [false, false, true, false];
+        let at = |i: usize| parked[i];
+        assert_eq!(first_parked_from(0, 4, at), Some(2), "scans forward from the cursor");
+        assert_eq!(first_parked_from(3, 4, at), Some(2), "and wraps around to find it");
+        assert_eq!(first_parked_from(2, 4, at), Some(2), "the cursor itself counts");
+    }
+
+    /// The point of the counter this feeds: when nobody is parked a wake has
+    /// nowhere useful to go, and must be recorded as wasted rather than silently
+    /// spent on a running worker.
+    #[test]
+    fn test_first_parked_reports_none_when_every_worker_is_running() {
+        assert_eq!(first_parked_from(0, 3, |_| false), None);
+    }
+
+    /// Wakes stay inside the active window, exactly as `wake_target` does -- a
+    /// capped worker will not take Phase 2 work, so waking it is the same lost
+    /// wake by another route.
+    #[test]
+    fn test_first_parked_ignores_workers_outside_the_active_limit() {
+        let parked = [false, false, true, true];
+        let at = |i: usize| parked[i];
+        assert_eq!(
+            first_parked_from(0, 2, at),
+            None,
+            "workers 2 and 3 are parked but capped out of Phase 2"
+        );
+        assert_eq!(first_parked_from(0, 3, at), Some(2));
+    }
+
+    #[test]
+    fn test_first_parked_tolerates_an_empty_pool() {
+        assert_eq!(first_parked_from(0, 0, |_| true), None);
+        assert_eq!(first_parked_from(5, 0, |_| true), None, "a zero limit admits nobody");
     }
 }
