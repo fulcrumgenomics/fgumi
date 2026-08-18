@@ -33,7 +33,7 @@ use super::base::{
     QueueSample, RawBlockBatch, ReorderBufferState, SerializePipelineState, SerializedBatch,
     StepContext, WorkerCoreState, WorkerStateCommon, WritePipelineState,
     finalize_pipeline_with_buffers, generic_worker_loop, handle_worker_panic, join_monitor_thread,
-    join_worker_threads, shared_try_step_compress,
+    join_worker_threads, push_charged, refund_queue_bytes, shared_try_step_compress,
 };
 use super::deadlock::{
     DeadlockAction, DeadlockConfig, DeadlockState, QueueSnapshot, check_deadlock_and_restore,
@@ -74,19 +74,6 @@ impl MemoryEstimate for BoundaryBatch {
     fn estimate_heap_size(&self) -> usize {
         self.buffer.capacity() + self.offsets.capacity() * std::mem::size_of::<usize>()
     }
-}
-
-/// Release `bytes` from a queue byte counter, saturating at zero.
-///
-/// The counters summed by [`BamPipelineState::queue_bytes_in_flight`] gate the
-/// Read step, so an unpaired refund would not merely skew a statistic: a plain
-/// `fetch_sub` past zero wraps to `u64::MAX` and stops the pipeline reading for
-/// the rest of the run. Saturating turns that class of bug into a bounded
-/// accounting error rather than a hang.
-fn refund_queue_bytes(counter: &AtomicU64, bytes: u64) {
-    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-        Some(current.saturating_sub(bytes))
-    });
 }
 
 /// State for the `FindBoundaries` step (sequential).
@@ -942,21 +929,14 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
     /// Returns the batch unchanged when Q2b is out of slots, so callers keep
     /// the existing held-item retry behaviour.
     fn q2b_push(&self, serial: u64, batch: BoundaryBatch) -> Result<(), (u64, BoundaryBatch)> {
-        // Charge before the push so the batch is never visible to a consumer
-        // while its bytes are still uncharged: a pop in that window would refund
-        // bytes never added and, because `q2b_heap_bytes` gates Read via
-        // `queue_bytes_in_flight`, permanently over-state the counter and close
-        // the Read gate. Refund on the out-of-slots path so a rejected push
-        // leaves the counter unchanged.
+        // `push_charged` charges before the push so the batch is never visible to
+        // a consumer while its bytes are still uncharged: a pop in that window
+        // would refund bytes never added and, because `q2b_heap_bytes` gates Read
+        // via `queue_bytes_in_flight`, permanently over-state the counter and
+        // close the Read gate. It refunds on the out-of-slots path so a rejected
+        // push leaves the counter unchanged.
         let heap_size = batch.estimate_heap_size() as u64;
-        self.q2b_heap_bytes.fetch_add(heap_size, Ordering::AcqRel);
-        match self.q2b_boundaries.push((serial, batch)) {
-            Ok(()) => Ok(()),
-            Err(returned) => {
-                refund_queue_bytes(&self.q2b_heap_bytes, heap_size);
-                Err(returned)
-            }
-        }
+        push_charged(&self.q2b_boundaries, &self.q2b_heap_bytes, heap_size, (serial, batch))
     }
 
     /// Pop a boundary batch from Q2b, refunding its heap bytes.
@@ -974,14 +954,7 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
     /// counter unchanged. Callers record the deadlock-detector push on `Ok`.
     fn q1_push(&self, serial: u64, batch: RawBlockBatch) -> Result<(), (u64, RawBlockBatch)> {
         let heap_size = batch.estimate_heap_size() as u64;
-        self.q1_heap_bytes.fetch_add(heap_size, Ordering::AcqRel);
-        match self.q1_raw_blocks.push((serial, batch)) {
-            Ok(()) => Ok(()),
-            Err(returned) => {
-                refund_queue_bytes(&self.q1_heap_bytes, heap_size);
-                Err(returned)
-            }
-        }
+        push_charged(&self.q1_raw_blocks, &self.q1_heap_bytes, heap_size, (serial, batch))
     }
 
     /// Pop a raw block batch from Q1, refunding its heap bytes.
@@ -4780,15 +4753,6 @@ mod tests {
             Q1_CHARGE + Q4_CHARGE + 1 + 2 + 4 + 8 + 16 + 32,
             "every accounted counter must contribute to the aggregate"
         );
-    }
-
-    /// An unpaired refund saturates at zero rather than wrapping to
-    /// `u64::MAX`, which would gate Read shut for the rest of the run.
-    #[test]
-    fn refunding_more_than_was_charged_saturates_at_zero() {
-        let counter = AtomicU64::new(100);
-        refund_queue_bytes(&counter, 250);
-        assert_eq!(counter.load(Ordering::Acquire), 0);
     }
 
     /// A `q2b_push` rejected because Q2b is out of slots must refund its charge

@@ -47,7 +47,8 @@ use super::base::{
     PipelineStep, PipelineValidationError, ProcessPipelineState, SerializePipelineState,
     SerializedBatch, StepContext, WorkerCoreState, WorkerStateCommon, WritePipelineState,
     finalize_pipeline, generic_worker_loop, handle_worker_panic, join_monitor_thread,
-    join_worker_threads, run_monitor_loop, shared_try_step_compress,
+    join_worker_threads, push_charged, refund_queue_bytes, run_monitor_loop,
+    shared_try_step_compress,
 };
 use super::deadlock::{DeadlockConfig, DeadlockState, QueueSnapshot};
 use super::scheduler::{BackpressureState, SchedulerStrategy};
@@ -124,20 +125,46 @@ impl PairState {
         Self { pending: BTreeMap::new(), next_emit: 0, num_streams }
     }
 
-    /// Insert a data chunk into the pending map.
-    fn insert(&mut self, chunk: PerStreamChunk) {
+    /// Insert a data chunk into the pending map, charging `heap_bytes`.
+    ///
+    /// The counter is passed in rather than mirrored in a field so there is
+    /// exactly one place the pending bytes are tracked: it is summed by
+    /// [`FastqPipelineState::queue_bytes_in_flight`], which gates the Read step,
+    /// and a second copy that could drift from this one would either leak the
+    /// budget or hold it shut.
+    ///
+    /// Read assigns each `(stream_idx, batch_num)` exactly once, under the
+    /// per-stream reader lock, so a slot should never already be occupied. The
+    /// displaced chunk is refunded rather than assumed away because the counter
+    /// now gates Read: a leaked charge would not skew a statistic, it would
+    /// inflate the gate until the pipeline stopped reading for the rest of the
+    /// run.
+    fn insert(&mut self, chunk: PerStreamChunk, heap_bytes: &AtomicU64) {
         let stream_idx = chunk.stream_idx;
         let batch_num = chunk.batch_num;
+        heap_bytes.fetch_add(chunk.estimate_heap_size() as u64, Ordering::AcqRel);
         let slots = self.pending.entry(batch_num).or_insert_with(|| vec![None; self.num_streams]);
-        slots[stream_idx] = Some(chunk);
+        if let Some(displaced) = slots[stream_idx].replace(chunk) {
+            debug_assert!(
+                false,
+                "stream {stream_idx} delivered batch {batch_num} twice; Read assigns each \
+                 (stream, batch) pair once"
+            );
+            refund_queue_bytes(heap_bytes, displaced.estimate_heap_size() as u64);
+        }
     }
 
-    /// Try to pop a complete set of chunks for the next `batch_num`.
+    /// Try to pop a complete set of chunks for the next `batch_num`, refunding
+    /// their charge against `heap_bytes`.
     ///
     /// When `all_arrived` is false (normal operation), ALL streams must have
     /// delivered their chunk. When `all_arrived` is true (all Read chunks have
     /// been consumed), incomplete batches are emitted with whatever data is present.
-    fn try_pop_complete(&mut self, all_arrived: bool) -> Option<Vec<PerStreamChunk>> {
+    fn try_pop_complete(
+        &mut self,
+        all_arrived: bool,
+        heap_bytes: &AtomicU64,
+    ) -> Option<Vec<PerStreamChunk>> {
         let slots = self.pending.get(&self.next_emit)?;
         let complete = if all_arrived {
             slots.iter().any(Option::is_some)
@@ -153,7 +180,10 @@ impl PairState {
             .remove(&self.next_emit)
             .expect("next_emit key must exist in pending map after get() succeeded");
         self.next_emit += 1;
-        Some(slots.into_iter().flatten().collect())
+        let chunks: Vec<PerStreamChunk> = slots.into_iter().flatten().collect();
+        let released: u64 = chunks.iter().map(|c| c.estimate_heap_size() as u64).sum();
+        refund_queue_bytes(heap_bytes, released);
+        Some(chunks)
     }
 
     fn is_empty(&self) -> bool {
@@ -613,6 +643,28 @@ impl BlockMergeState {
         );
         empty
     }
+}
+
+/// Charge `bytes` to `BlockMergeState::pending_heap_bytes`, mirroring into
+/// `mirror`.
+///
+/// `mirror` is [`FastqPipelineState::block_merge_pending_heap_bytes`], which the
+/// Read gate reads without taking the merge lock. Routing every mutation
+/// through this pair is what keeps the two in step: the local figure decides
+/// [`PENDING_BACKPRESSURE_BYTES`], the mirror contributes to the queue memory
+/// budget, and neither can drift from the other. They take the counter by
+/// `&mut` rather than the whole `BlockMergeState` so they can be called from
+/// code that has already split-borrowed the per-stream fields.
+fn charge_block_merge_pending(pending_heap_bytes: &mut u64, mirror: &AtomicU64, bytes: u64) {
+    *pending_heap_bytes += bytes;
+    mirror.fetch_add(bytes, Ordering::AcqRel);
+}
+
+/// Release `bytes` from `BlockMergeState::pending_heap_bytes`, mirroring into
+/// `mirror`. See `charge_block_merge_pending`.
+fn refund_block_merge_pending(pending_heap_bytes: &mut u64, mirror: &AtomicU64, bytes: u64) {
+    *pending_heap_bytes = pending_heap_bytes.saturating_sub(bytes);
+    refund_queue_bytes(mirror, bytes);
 }
 
 /// Detect where the first complete FASTQ record begins in `data`.
@@ -1388,11 +1440,30 @@ pub struct FastqPipelineState<R: BufRead + Send, P: Send + MemoryEstimate> {
 
     // ========== Q0: Read → Decompress ==========
     /// Per-stream chunks waiting to be decompressed.
+    ///
+    /// Push and pop through `FastqPipelineState::q0_push` /
+    /// `FastqPipelineState::q0_pop` so `q0_heap_bytes` stays accurate.
     pub q0_chunks: ArrayQueue<(u64, PerStreamChunk)>,
+    /// Heap bytes currently held in Q0 (raw BGZF or record-aligned chunks).
+    ///
+    /// Charged against the queue memory budget by
+    /// [`FastqPipelineState::queue_bytes_in_flight`].
+    pub q0_heap_bytes: AtomicU64,
 
     // ========== Q1: Decompress → BlockParseFast (parallel) ==========
     /// Decompressed per-stream chunks waiting for parallel block parsing.
+    ///
+    /// Push and pop through `FastqPipelineState::q1_push` /
+    /// `FastqPipelineState::q1_pop` so `q1_heap_bytes` stays accurate.
     pub q1_decompressed: ArrayQueue<(u64, PerStreamChunk)>,
+    /// Heap bytes currently held in Q1 (decompressed chunks).
+    ///
+    /// Q1 holds whole decompressed BGZF payloads on the BGZF path, and the
+    /// record-aligned chunks Read produced on the gzip/plain path, so it is one
+    /// of the larger consumers when the pipeline backs up; it is charged
+    /// against the queue memory budget by
+    /// [`FastqPipelineState::queue_bytes_in_flight`].
+    pub q1_heap_bytes: AtomicU64,
 
     // ========== BlockParseFast → BlockMerge ==========
     /// Count of per-stream chunks consumed by `BlockParseFast` from q1.
@@ -1404,6 +1475,13 @@ pub struct FastqPipelineState<R: BufRead + Send, P: Send + MemoryEstimate> {
     pub q2_block_parsed_heap_bytes: AtomicU64,
     /// Serial `BlockMerge` step state (locked via `try_lock` for serial execution).
     pub(crate) block_merge_state: Mutex<BlockMergeState>,
+    /// Heap bytes held in `BlockMergeState`'s pending maps (BGZF path).
+    ///
+    /// A lock-free mirror of `BlockMergeState::pending_heap_bytes`, maintained
+    /// by `charge_block_merge_pending` / `refund_block_merge_pending`, so
+    /// the Read gate can include blocks parked in the merge step without taking
+    /// the merge lock.
+    pub block_merge_pending_heap_bytes: AtomicU64,
     /// Flag indicating all blocks have been merged and templates emitted.
     pub block_merge_done: AtomicBool,
     /// Count of `BlockParsed` items consumed by `BlockMerge`.
@@ -1414,6 +1492,12 @@ pub struct FastqPipelineState<R: BufRead + Send, P: Send + MemoryEstimate> {
     pub chunks_paired: AtomicU64,
     /// Pair state: accumulates per-stream chunks by `batch_num` (gzip path).
     pub(crate) pair_state: Mutex<PairState>,
+    /// Heap bytes held in `PairState`'s pending map (gzip path).
+    ///
+    /// Chunks move out of Q1 and into the pair buffer while they wait for the
+    /// matching `batch_num` from the other stream, so without this counter the
+    /// Read gate would stop seeing them the moment they were paired-in-waiting.
+    pub pair_heap_bytes: AtomicU64,
     /// State for finding FASTQ record boundaries (gzip path).
     pub boundary_state: FastqBoundaryState,
     /// Flag indicating pair assembly / boundary finding is complete (gzip path).
@@ -1486,15 +1570,19 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
             read_done: AtomicBool::new(false),
             batches_read: AtomicU64::new(0),
             q0_chunks: ArrayQueue::new(cap),
+            q0_heap_bytes: AtomicU64::new(0),
             q1_decompressed: ArrayQueue::new(cap),
+            q1_heap_bytes: AtomicU64::new(0),
             chunks_block_parsed: AtomicU64::new(0),
             q2_block_parsed: ArrayQueue::new(cap),
             q2_block_parsed_heap_bytes: AtomicU64::new(0),
             block_merge_state: Mutex::new(BlockMergeState::new()),
+            block_merge_pending_heap_bytes: AtomicU64::new(0),
             block_merge_done: AtomicBool::new(false),
             blocks_merged: AtomicU64::new(0),
             chunks_paired: AtomicU64::new(0),
             pair_state: Mutex::new(PairState::new(num_streams)),
+            pair_heap_bytes: AtomicU64::new(0),
             boundary_state: FastqBoundaryState::new(num_streams),
             boundaries_done: AtomicBool::new(false),
             batches_boundaries_found: AtomicU64::new(0),
@@ -1545,6 +1633,176 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
     #[must_use]
     pub fn is_q4_memory_high(&self) -> bool {
         self.output.is_processed_memory_high()
+    }
+
+    /// Push a chunk onto Q0 through [`push_charged`], which charges its heap
+    /// bytes *before* the push and refunds them if it fails.
+    ///
+    /// Returns the chunk unchanged when Q0 is out of slots, so callers keep the
+    /// existing held-item retry behaviour.
+    fn q0_push(&self, serial: u64, chunk: PerStreamChunk) -> Result<(), (u64, PerStreamChunk)> {
+        let heap_size = chunk.estimate_heap_size() as u64;
+        push_charged(&self.q0_chunks, &self.q0_heap_bytes, heap_size, (serial, chunk))
+    }
+
+    /// Pop a chunk from Q0, refunding its heap bytes.
+    fn q0_pop(&self) -> Option<(u64, PerStreamChunk)> {
+        let (serial, chunk) = self.q0_chunks.pop()?;
+        refund_queue_bytes(&self.q0_heap_bytes, chunk.estimate_heap_size() as u64);
+        Some((serial, chunk))
+    }
+
+    /// Push a decompressed chunk onto Q1 through [`push_charged`], which charges
+    /// its heap bytes *before* the push and refunds them if it fails.
+    fn q1_push(&self, serial: u64, chunk: PerStreamChunk) -> Result<(), (u64, PerStreamChunk)> {
+        let heap_size = chunk.estimate_heap_size() as u64;
+        push_charged(&self.q1_decompressed, &self.q1_heap_bytes, heap_size, (serial, chunk))
+    }
+
+    /// Pop a decompressed chunk from Q1, refunding its heap bytes.
+    fn q1_pop(&self) -> Option<(u64, PerStreamChunk)> {
+        let (serial, chunk) = self.q1_decompressed.pop()?;
+        refund_queue_bytes(&self.q1_heap_bytes, chunk.estimate_heap_size() as u64);
+        Some((serial, chunk))
+    }
+
+    /// Push a batch of templates onto Q3 through [`push_charged`], which charges
+    /// its heap bytes *before* the push and refunds them if it fails.
+    ///
+    /// Q3 holds fully parsed `FastqTemplate`s — names, sequences and qualities
+    /// as owned buffers — so it is the largest single consumer when the writer
+    /// stalls. It used to be charged only under `memory-debug`, and then only
+    /// with a hardcoded `0` on the way in, which left the counter permanently
+    /// zero (issue #766).
+    fn q3_push(
+        &self,
+        serial: u64,
+        templates: Vec<FastqTemplate>,
+    ) -> Result<(), (u64, Vec<FastqTemplate>)> {
+        let heap_size: u64 = templates.iter().map(|t| t.estimate_heap_size() as u64).sum();
+        push_charged(
+            &self.output.groups,
+            &self.output.groups_heap_bytes,
+            heap_size,
+            (serial, templates),
+        )
+    }
+
+    /// Pop a batch of templates from Q3, refunding its heap bytes.
+    ///
+    /// The batch is unchanged since `q3_push` charged it, so the two estimates
+    /// agree exactly.
+    fn q3_pop(&self) -> Option<(u64, Vec<FastqTemplate>)> {
+        let (serial, templates) = self.output.groups.pop()?;
+        let heap_size: u64 = templates.iter().map(|t| t.estimate_heap_size() as u64).sum();
+        refund_queue_bytes(&self.output.groups_heap_bytes, heap_size);
+        Some((serial, templates))
+    }
+
+    /// Heap bytes the pipeline is currently holding in its accounted queues.
+    ///
+    /// Sums every byte counter the pipeline maintains: Q0 (raw chunks), Q1
+    /// (decompressed chunks), Q2 and the merge step's pending maps (BGZF path),
+    /// the pair buffer and Q2.5 (gzip path), Q3 (templates), Q4 (processed),
+    /// Q5 (serialized), Q6 (compressed) and the write reorder buffer.
+    ///
+    /// This is an estimate, not an exact figure: it counts queued batches, not
+    /// the per-thread working memory a stage allocates while operating on one
+    /// (a worker's held item is counted only for Q2, where the charge is taken
+    /// at creation; elsewhere it is uncharged until it reaches its queue, and
+    /// is bounded by the thread count either way), and it uses `Vec::capacity`
+    /// rather than the allocator's true block sizes. It is nonetheless the whole of the data the pipeline parks
+    /// between stages, which is what grows without bound when the writer
+    /// stalls.
+    #[must_use]
+    pub fn queue_bytes_in_flight(&self) -> u64 {
+        self.q0_heap_bytes.load(Ordering::Acquire)
+            + self.q1_heap_bytes.load(Ordering::Acquire)
+            + self.q2_block_parsed_heap_bytes.load(Ordering::Acquire)
+            + self.block_merge_pending_heap_bytes.load(Ordering::Acquire)
+            + self.pair_heap_bytes.load(Ordering::Acquire)
+            + self.q2_5_boundaries_heap_bytes.load(Ordering::Acquire)
+            + self.output.groups_heap_bytes.load(Ordering::Acquire)
+            + self.output.processed_heap_bytes.load(Ordering::Acquire)
+            + self.output.serialized_heap_bytes.load(Ordering::Acquire)
+            + self.output.compressed_heap_bytes.load(Ordering::Acquire)
+            + self.output.write_reorder_state.get_heap_bytes()
+    }
+
+    /// Whether `stream_idx` has been read less far than some other stream.
+    ///
+    /// Half of `Self::read_is_required_for_liveness`; see it for why a laggard
+    /// must stay readable.
+    #[must_use]
+    fn stream_is_behind(&self, stream_idx: usize) -> bool {
+        let mine = self.batch_counters[stream_idx].load(Ordering::Relaxed);
+        self.batch_counters.iter().any(|c| c.load(Ordering::Relaxed) > mine)
+    }
+
+    /// Whether some stream other than `stream_idx` has reached EOF.
+    ///
+    /// The other half of `Self::read_is_required_for_liveness`.
+    #[must_use]
+    fn another_stream_is_at_eof(&self, stream_idx: usize) -> bool {
+        self.stream_eof
+            .iter()
+            .enumerate()
+            .any(|(i, eof)| i != stream_idx && eof.load(Ordering::Acquire))
+    }
+
+    /// Whether Read must be allowed to pull from `stream_idx` regardless of the
+    /// queue memory budget, to keep the pipeline live.
+    ///
+    /// Both multi-stream assembly steps — the gzip Pair step and the BGZF
+    /// `BlockMerge` step — release a batch only once every stream has delivered
+    /// the matching index, or once every stream has reached EOF
+    /// (`read_done` / `stream_eof`). Only Read can satisfy either condition, so
+    /// there are two states in which refusing to read wedges the pipeline
+    /// holding data it can never release:
+    ///
+    /// * **This stream has fallen behind another.** What Pair/`BlockMerge` are
+    ///   holding is waiting on exactly this stream's next batch. Exempting only
+    ///   the laggard bounds the extra read-ahead at the skew that already
+    ///   existed: once the streams are level the gate closes completely, and by
+    ///   then every index below the common one is inside the pipeline.
+    /// * **Another stream has reached EOF.** Everything past the shorter
+    ///   stream's end is unreleasable until `read_done`, which needs *this*
+    ///   stream at EOF too. For equal-length inputs that covers the last batch
+    ///   or two. For mismatched-length inputs it deliberately trades the bound
+    ///   for liveness on the surplus tail: a run that cannot finish is worse
+    ///   than one that exceeds its budget on malformed input.
+    #[must_use]
+    fn read_is_required_for_liveness(&self, stream_idx: usize) -> bool {
+        self.stream_is_behind(stream_idx) || self.another_stream_is_at_eof(stream_idx)
+    }
+
+    /// Whether the Read step may admit another batch from `stream_idx` under
+    /// the queue memory budget.
+    ///
+    /// Every other stage is bounded by a slot count rather than by bytes — so
+    /// when the output device stalls, each stage fills with however many bytes
+    /// its slots happen to hold and the configured budget bounds nothing.
+    /// Gating Read on [`Self::queue_bytes_in_flight`] is what turns that budget
+    /// into a real ceiling (issue #766).
+    ///
+    /// This cannot deadlock. Nothing downstream waits on Read to make progress:
+    /// `read_done` is set only once every stream is at EOF, so declining to
+    /// read leaves every stage free to drain, which lowers the in-flight total
+    /// and lets reading resume. Admission is also always granted when nothing
+    /// is accounted for in flight, so a single batch larger than the whole
+    /// budget still gets through instead of stalling the pipeline forever, and
+    /// a stream whose data the assembly steps are waiting on is always
+    /// admitted — see `Self::read_is_required_for_liveness`.
+    ///
+    /// A `queue_memory_limit` of 0 means "no limit" and disables the gate.
+    #[must_use]
+    pub fn read_admission_allowed(&self, stream_idx: usize) -> bool {
+        let limit = self.config.queue_memory_limit;
+        if limit == 0 {
+            return true;
+        }
+        let in_flight = self.queue_bytes_in_flight();
+        in_flight == 0 || in_flight < limit || self.read_is_required_for_liveness(stream_idx)
     }
 
     /// Check if the pipeline is in drain mode (input exhausted, completing remaining work).
@@ -1859,6 +2117,10 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> Monitorabl
                 )),
             )
         };
+        // Include the Read gate's own view: when the gate is what stopped the
+        // pipeline, the queue lengths alone look like an idle run.
+        let in_flight_mb = self.queue_bytes_in_flight() / (1024 * 1024);
+        let extra_state = extra_state.map(|s| format!("{s}, queue_in_flight={in_flight_mb}MB"));
         QueueSnapshot {
             q1_len: self.q0_chunks.len(),
             q2_len: self.q1_decompressed.len(),
@@ -1898,7 +2160,8 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipe
     }
 
     fn q5_push(&self, item: (u64, SerializedBatch)) -> Result<(), (u64, SerializedBatch)> {
-        self.output.serialized.push(item)
+        let heap_size = item.1.estimate_heap_size() as u64;
+        push_charged(&self.output.serialized, &self.output.serialized_heap_bytes, heap_size, item)
     }
 
     fn q5_is_full(&self) -> bool {
@@ -1906,7 +2169,7 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipe
     }
 
     fn q5_track_pop(&self, heap_size: u64) {
-        self.output.serialized_heap_bytes.fetch_sub(heap_size, Ordering::AcqRel);
+        refund_queue_bytes(&self.output.serialized_heap_bytes, heap_size);
     }
 
     fn q6_pop(&self) -> Option<(u64, CompressedBlockBatch)> {
@@ -1917,12 +2180,8 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipe
         &self,
         item: (u64, CompressedBlockBatch),
     ) -> Result<(), (u64, CompressedBlockBatch)> {
-        let heap_size = item.1.estimate_heap_size();
-        let result = self.output.compressed.push(item);
-        if result.is_ok() {
-            self.output.compressed_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
-        }
-        result
+        let heap_size = item.1.estimate_heap_size() as u64;
+        push_charged(&self.output.compressed, &self.output.compressed_heap_bytes, heap_size, item)
     }
 
     fn q6_is_full(&self) -> bool {
@@ -1930,7 +2189,7 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipe
     }
 
     fn q6_track_pop(&self, heap_size: u64) {
-        self.output.compressed_heap_bytes.fetch_sub(heap_size, Ordering::AcqRel);
+        refund_queue_bytes(&self.output.compressed_heap_bytes, heap_size);
     }
 
     fn q6_reorder_insert(&self, serial: u64, batch: CompressedBlockBatch) {
@@ -1986,7 +2245,7 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static>
     ProcessPipelineState<FastqTemplate, P> for FastqPipelineState<R, P>
 {
     fn process_input_pop(&self) -> Option<(u64, Vec<FastqTemplate>)> {
-        self.output.groups.pop()
+        self.q3_pop()
     }
 
     fn process_output_is_full(&self) -> bool {
@@ -1994,7 +2253,9 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static>
     }
 
     fn process_output_push(&self, item: (u64, Vec<P>)) -> Result<(), (u64, Vec<P>)> {
-        self.output.processed.push(item)
+        let heap_size: u64 =
+            item.1.iter().map(|p| MemoryEstimate::estimate_heap_size(p) as u64).sum();
+        push_charged(&self.output.processed, &self.output.processed_heap_bytes, heap_size, item)
     }
 
     fn has_error(&self) -> bool {
@@ -2029,7 +2290,11 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> SerializeP
         &self,
         item: (u64, SerializedBatch),
     ) -> Result<(), (u64, SerializedBatch)> {
-        self.output.serialized.push(item)
+        // Q5 and the serialize step push to the same queue with the same charge;
+        // delegate so the heap estimate and charge live in one place and cannot
+        // diverge (a divergent charge on one path would silently bias the Read
+        // gate).
+        OutputPipelineState::q5_push(self, item)
     }
 
     fn has_error(&self) -> bool {
@@ -2097,7 +2362,7 @@ fn fastq_try_step_read<R: BufRead + Send, P: Send + MemoryEstimate>(
 ) -> bool {
     // Priority 1: Try to advance held chunk
     if let Some((serial, held)) = worker.held_chunk.take() {
-        match state.q0_chunks.push((serial, held)) {
+        match state.q0_push(serial, held) {
             Ok(()) => {
                 state.deadlock_state.record_q1_push();
             }
@@ -2123,6 +2388,15 @@ fn fastq_try_step_read<R: BufRead + Send, P: Send + MemoryEstimate>(
     for i in 0..state.num_streams {
         let stream_idx = (start + i) % state.num_streams;
         if state.stream_eof[stream_idx].load(Ordering::Relaxed) {
+            continue;
+        }
+        // Priority 4a: Check the queue memory budget.
+        //
+        // Every other stage is bounded by a slot count, not by bytes, so this
+        // is the only place the configured budget can actually cap the
+        // pipeline. See `FastqPipelineState::read_admission_allowed` for why
+        // declining here cannot deadlock, and why a lagging stream is exempt.
+        if !state.read_admission_allowed(stream_idx) {
             continue;
         }
         let Some(mut guard) = state.readers[stream_idx].try_lock() else {
@@ -2158,7 +2432,7 @@ fn fastq_try_step_read<R: BufRead + Send, P: Send + MemoryEstimate>(
                         let serial = state.batches_read.fetch_add(1, Ordering::Release);
                         let chunk =
                             PerStreamChunk { stream_idx, batch_num, data: raw_data, offsets: None };
-                        match state.q0_chunks.push((serial, chunk)) {
+                        match state.q0_push(serial, chunk) {
                             Ok(()) => {
                                 state.deadlock_state.record_q1_push();
                                 return true;
@@ -2215,7 +2489,7 @@ fn fastq_try_step_read<R: BufRead + Send, P: Send + MemoryEstimate>(
                         }
                         let chunk =
                             PerStreamChunk { stream_idx, batch_num, data, offsets: Some(offsets) };
-                        match state.q0_chunks.push((serial, chunk)) {
+                        match state.q0_push(serial, chunk) {
                             Ok(()) => {
                                 state.deadlock_state.record_q1_push();
                                 return true;
@@ -2248,7 +2522,7 @@ fn fastq_try_step_decompress<R: BufRead + Send, P: Send + MemoryEstimate>(
 ) -> bool {
     // Priority 1: Try to advance held decompressed chunk
     if let Some((serial, held)) = worker.held_decompressed_chunk.take() {
-        match state.q1_decompressed.push((serial, held)) {
+        match state.q1_push(serial, held) {
             Ok(()) => {
                 state.deadlock_state.record_q2_push();
             }
@@ -2270,7 +2544,7 @@ fn fastq_try_step_decompress<R: BufRead + Send, P: Send + MemoryEstimate>(
     }
 
     // Priority 4: Pop from input queue
-    let Some((serial, chunk)) = state.q0_chunks.pop() else {
+    let Some((serial, chunk)) = state.q0_pop() else {
         if let Some(stats) = state.stats() {
             stats.record_queue_empty(1);
         }
@@ -2299,7 +2573,7 @@ fn fastq_try_step_decompress<R: BufRead + Send, P: Send + MemoryEstimate>(
     };
 
     // Priority 6: Push result
-    match state.q1_decompressed.push((serial, decompressed)) {
+    match state.q1_push(serial, decompressed) {
         Ok(()) => {
             state.deadlock_state.record_q2_push();
             true
@@ -2361,7 +2635,7 @@ fn fastq_try_step_block_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
     }
 
     // Priority 3: Pop a decompressed chunk from q1.
-    let Some((serial, chunk)) = state.q1_decompressed.pop() else {
+    let Some((serial, chunk)) = state.q1_pop() else {
         return false;
     };
     state.deadlock_state.record_q2_pop();
@@ -2416,9 +2690,13 @@ fn fastq_try_step_block_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
 
     let block_parsed = BlockParsed { block_idx, stream_idx, records, prefix_bytes, suffix_bytes };
 
-    // Track heap bytes at creation time. BlockMerge subtracts when it pops.
+    // Charge at creation time, before the item can become visible to BlockMerge
+    // (which refunds when it pops) — see `push_charged` for why the order
+    // matters. Unlike the `push_charged` sites this charge survives a failed
+    // push: the item is then held by the worker and is still resident, so
+    // keeping it charged is the accurate answer.
     let heap_bytes = block_parsed.estimate_heap_size() as u64;
-    state.q2_block_parsed_heap_bytes.fetch_add(heap_bytes, Ordering::Release);
+    state.q2_block_parsed_heap_bytes.fetch_add(heap_bytes, Ordering::AcqRel);
 
     match state.q2_block_parsed.push(block_parsed) {
         Ok(()) => {
@@ -2467,6 +2745,7 @@ fn drain_exhausted_stream<R: BufRead + Send, P: Send + MemoryEstimate>(
     mut did_work: bool,
     mut batches_this_call: usize,
 ) -> DrainResult {
+    let pending_heap_bytes = &mut merge.pending_heap_bytes;
     let (pending, suffix, surplus, other_surplus, next) = if drain_r1 {
         (
             &mut merge.r1_pending,
@@ -2490,8 +2769,11 @@ fn drain_exhausted_stream<R: BufRead + Send, P: Send + MemoryEstimate>(
         let Some(block) = pending.remove(&block_next) else {
             break;
         };
-        merge.pending_heap_bytes =
-            merge.pending_heap_bytes.saturating_sub(block.estimate_heap_size() as u64);
+        refund_block_merge_pending(
+            pending_heap_bytes,
+            &state.block_merge_pending_heap_bytes,
+            block.estimate_heap_size() as u64,
+        );
         *next += 1;
 
         let cross = match stitch_cross_block_record(suffix, &block.prefix_bytes) {
@@ -2544,7 +2826,7 @@ fn drain_exhausted_stream<R: BufRead + Send, P: Send + MemoryEstimate>(
             merge.serial_out += 1;
             let count = templates.len();
 
-            match state.output.groups.push((serial, templates)) {
+            match state.q3_push(serial, templates) {
                 Ok(()) => {
                     state.total_templates_pushed.fetch_add(count as u64, Ordering::Release);
                     if let Some(stats) = state.stats() {
@@ -2749,7 +3031,10 @@ fn flush_residual_suffixes_at_eof<R: BufRead + Send, P: Send + MemoryEstimate>(
     let serial = merge.serial_out;
     merge.serial_out += 1;
     let count = templates.len();
-    match state.output.groups.push((serial, templates)) {
+    // Charge Q3 through `q3_push` like every other producer: `groups_heap_bytes`
+    // gates Read and `q3_pop` refunds it unconditionally, so a batch pushed here
+    // uncharged would leave that later refund unpaired (issue `#766`).
+    match state.q3_push(serial, templates) {
         Ok(()) => {
             state.total_templates_pushed.fetch_add(count as u64, Ordering::Release);
             if let Some(stats) = state.stats() {
@@ -2785,7 +3070,7 @@ fn fastq_try_step_block_merge<R: BufRead + Send, P: Send + MemoryEstimate>(
     // Priority 1: Advance held templates first (same pattern as FindBoundaries).
     let mut did_work = false;
     if let Some((serial, held_templates, count)) = worker.held_parsed.take() {
-        match state.output.groups.push((serial, held_templates)) {
+        match state.q3_push(serial, held_templates) {
             Ok(()) => {
                 state.total_templates_pushed.fetch_add(count as u64, Ordering::Release);
                 if let Some(stats) = state.stats() {
@@ -2840,14 +3125,31 @@ fn fastq_try_step_block_merge<R: BufRead + Send, P: Send + MemoryEstimate>(
     if within_limit || !can_process {
         while let Some(block) = state.q2_block_parsed.pop() {
             let heap_bytes = block.estimate_heap_size() as u64;
-            state.q2_block_parsed_heap_bytes.fetch_sub(heap_bytes, Ordering::Release);
-            merge.pending_heap_bytes += heap_bytes;
+            refund_queue_bytes(&state.q2_block_parsed_heap_bytes, heap_bytes);
+            charge_block_merge_pending(
+                &mut merge.pending_heap_bytes,
+                &state.block_merge_pending_heap_bytes,
+                heap_bytes,
+            );
             state.deadlock_state.record_q2_5_pop();
             state.blocks_merged.fetch_add(1, Ordering::Release);
-            if block.stream_idx == 0 {
-                merge.r1_pending.insert(block.block_idx, block);
+            let block_idx = block.block_idx;
+            let displaced = if block.stream_idx == 0 {
+                merge.r1_pending.insert(block_idx, block)
             } else {
-                merge.r2_pending.insert(block.block_idx, block);
+                merge.r2_pending.insert(block_idx, block)
+            };
+            // `block_idx` is unique per stream, so a displaced block means the
+            // BGZF reader handed the same index over twice. Refund it rather
+            // than leak its charge: `block_merge_pending_heap_bytes` gates Read,
+            // so a leak stops the run rather than skewing a statistic.
+            if let Some(displaced) = displaced {
+                debug_assert!(false, "block {block_idx} was merged twice");
+                refund_block_merge_pending(
+                    &mut merge.pending_heap_bytes,
+                    &state.block_merge_pending_heap_bytes,
+                    displaced.estimate_heap_size() as u64,
+                );
             }
             drained += 1;
         }
@@ -2869,8 +3171,11 @@ fn fastq_try_step_block_merge<R: BufRead + Send, P: Send + MemoryEstimate>(
             let Some(r1_block) = merge.r1_pending.remove(&r1_next) else {
                 break;
             };
-            merge.pending_heap_bytes =
-                merge.pending_heap_bytes.saturating_sub(r1_block.estimate_heap_size() as u64);
+            refund_block_merge_pending(
+                &mut merge.pending_heap_bytes,
+                &state.block_merge_pending_heap_bytes,
+                r1_block.estimate_heap_size() as u64,
+            );
             merge.r1_next += 1;
 
             // Stitch cross-block record.
@@ -2904,7 +3209,7 @@ fn fastq_try_step_block_merge<R: BufRead + Send, P: Send + MemoryEstimate>(
             merge.serial_out += 1;
             let count = templates.len();
 
-            match state.output.groups.push((serial, templates)) {
+            match state.q3_push(serial, templates) {
                 Ok(()) => {
                     state.total_templates_pushed.fetch_add(count as u64, Ordering::Release);
                     if let Some(stats) = state.stats() {
@@ -2933,7 +3238,9 @@ fn fastq_try_step_block_merge<R: BufRead + Send, P: Send + MemoryEstimate>(
 
             let r1_block = merge.r1_pending.remove(&r1_next).expect("just checked");
             let r2_block = merge.r2_pending.remove(&r2_next).expect("just checked");
-            merge.pending_heap_bytes = merge.pending_heap_bytes.saturating_sub(
+            refund_block_merge_pending(
+                &mut merge.pending_heap_bytes,
+                &state.block_merge_pending_heap_bytes,
                 (r1_block.estimate_heap_size() + r2_block.estimate_heap_size()) as u64,
             );
             merge.r1_next += 1;
@@ -2992,7 +3299,7 @@ fn fastq_try_step_block_merge<R: BufRead + Send, P: Send + MemoryEstimate>(
             merge.serial_out += 1;
             let count = templates.len();
 
-            match state.output.groups.push((serial, templates)) {
+            match state.q3_push(serial, templates) {
                 Ok(()) => {
                     state.total_templates_pushed.fetch_add(count as u64, Ordering::Release);
                     if let Some(stats) = state.stats() {
@@ -3099,12 +3406,14 @@ fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
     // first, the held batch would never be pushed to q2_5, deadlocking the pipeline.
     let mut did_work = false;
     if let Some((serial, held)) = worker.held_boundaries.take() {
-        let boundary_heap_size = held.estimate_heap_size();
-        match state.q2_5_boundaries.push((serial, held)) {
+        let boundary_heap_size = held.estimate_heap_size() as u64;
+        match push_charged(
+            &state.q2_5_boundaries,
+            &state.q2_5_boundaries_heap_bytes,
+            boundary_heap_size,
+            (serial, held),
+        ) {
             Ok(()) => {
-                state
-                    .q2_5_boundaries_heap_bytes
-                    .fetch_add(boundary_heap_size as u64, Ordering::Relaxed);
                 // Note: batches_boundaries_found was already incremented at serial
                 // assignment time (fetch_add in Priority 5), not here.
                 state.deadlock_state.record_q2_5_push();
@@ -3133,10 +3442,10 @@ fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
     };
 
     // Priority 4: Drain q1_decompressed into pair buffer
-    while let Some((_, chunk)) = state.q1_decompressed.pop() {
+    while let Some((_, chunk)) = state.q1_pop() {
         state.deadlock_state.record_q2_pop();
         state.chunks_paired.fetch_add(1, Ordering::Release);
-        pair.insert(chunk);
+        pair.insert(chunk, &state.pair_heap_bytes);
     }
 
     // Check if ALL chunks from Read have arrived at the Pair.
@@ -3149,7 +3458,9 @@ fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
     // Cap batches processed per lock hold to avoid starving other workers (mirrors BAM pipeline).
     let mut batches_this_call = 0;
     while batches_this_call < MAX_BATCHES_PER_LOCK {
-        let Some(chunks) = pair.try_pop_complete(all_arrived) else { break };
+        let Some(chunks) = pair.try_pop_complete(all_arrived, &state.pair_heap_bytes) else {
+            break;
+        };
         // Atomically assign a unique serial. This must be fetch_add (not load)
         // because the held_boundaries path can race: Worker A creates a batch
         // but push fails (goes to held_boundaries without incrementing), then
@@ -3191,12 +3502,14 @@ fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
             }
         };
 
-        let boundary_heap_size = boundary_batch.estimate_heap_size();
-        match state.q2_5_boundaries.push((serial, boundary_batch)) {
+        let boundary_heap_size = boundary_batch.estimate_heap_size() as u64;
+        match push_charged(
+            &state.q2_5_boundaries,
+            &state.q2_5_boundaries_heap_bytes,
+            boundary_heap_size,
+            (serial, boundary_batch),
+        ) {
             Ok(()) => {
-                state
-                    .q2_5_boundaries_heap_bytes
-                    .fetch_add(boundary_heap_size as u64, Ordering::Relaxed);
                 // Note: batches_boundaries_found was already incremented by
                 // fetch_add above when the serial was assigned.
                 state.deadlock_state.record_q2_5_push();
@@ -3252,13 +3565,8 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
 
     // Priority 1: Try to advance held parsed templates
     if let Some((serial, held_templates, count)) = worker.held_parsed.take() {
-        match state.output.groups.push((serial, held_templates)) {
+        match state.q3_push(serial, held_templates) {
             Ok(()) => {
-                #[cfg(feature = "memory-debug")]
-                {
-                    let q4_heap: u64 = 0; // already tracked when first parsed
-                    state.output.groups_heap_bytes.fetch_add(q4_heap, Ordering::AcqRel);
-                }
                 state.total_templates_pushed.fetch_add(count as u64, Ordering::Release);
                 if let Some(stats) = state.stats() {
                     stats.groups_produced.fetch_add(count as u64, Ordering::Relaxed);
@@ -3309,7 +3617,7 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
     match FastqFormat::parse_records(boundary_batch) {
         Ok(parsed_batch) => {
             // Only decrement input memory AFTER successful parse
-            state.q2_5_boundaries_heap_bytes.fetch_sub(input_heap_size as u64, Ordering::Relaxed);
+            refund_queue_bytes(&state.q2_5_boundaries_heap_bytes, input_heap_size as u64);
 
             // Create templates by zipping records at matching positions
             let templates = match create_templates_from_streams(parsed_batch.streams) {
@@ -3323,15 +3631,8 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
             let count = templates.len();
 
             // Priority 5: Push templates to Q3 using held-item pattern
-            match state.output.groups.push((serial, templates)) {
+            match state.q3_push(serial, templates) {
                 Ok(()) => {
-                    #[cfg(feature = "memory-debug")]
-                    {
-                        // Heap size tracking for pushed templates is not yet implemented;
-                        // queue memory is tracked through estimates only for now.
-                        let q4_heap: u64 = 0;
-                        state.output.groups_heap_bytes.fetch_add(q4_heap, Ordering::AcqRel);
-                    }
                     state.total_templates_pushed.fetch_add(count as u64, Ordering::Release);
                     if let Some(stats) = state.stats() {
                         stats.groups_produced.fetch_add(count as u64, Ordering::Relaxed);
@@ -3352,7 +3653,7 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
         }
         Err(e) => {
             // Batch already removed from Q2.5; keep heap tracking consistent
-            state.q2_5_boundaries_heap_bytes.fetch_sub(input_heap_size as u64, Ordering::Relaxed);
+            refund_queue_bytes(&state.q2_5_boundaries_heap_bytes, input_heap_size as u64);
             state.set_error(e);
             false
         }
@@ -3435,10 +3736,14 @@ where
     // Priority 1: Try to advance any held item first
     // =========================================================================
     if let Some((serial, held, heap_size)) = worker.held_processed.take() {
-        match state.output.processed.push((serial, held)) {
+        match push_charged(
+            &state.output.processed,
+            &state.output.processed_heap_bytes,
+            heap_size as u64,
+            (serial, held),
+        ) {
             Ok(()) => {
                 // Successfully advanced held item
-                state.output.processed_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
                 state.deadlock_state.record_q5_push();
             }
             Err((serial, held)) => {
@@ -3480,19 +3785,13 @@ where
             break;
         }
 
-        let Some((serial, batch)) = state.output.groups.pop() else {
+        let Some((serial, batch)) = state.q3_pop() else {
             if let Some(stats) = state.stats() {
                 stats.record_queue_empty(4);
             }
             break;
         };
         state.deadlock_state.record_q4_pop();
-
-        #[cfg(feature = "memory-debug")]
-        {
-            let q4_heap: u64 = batch.iter().map(|t| t.estimate_heap_size() as u64).sum();
-            state.output.groups_heap_bytes.fetch_sub(q4_heap, Ordering::AcqRel);
-        }
 
         log::trace!(
             "fastq_try_step_process: processing batch of {} templates, serial={}",
@@ -3519,9 +3818,13 @@ where
         let heap_size: usize = results.iter().map(MemoryEstimate::estimate_heap_size).sum();
 
         // Try to push result (non-blocking)
-        match state.output.processed.push((serial, results)) {
+        match push_charged(
+            &state.output.processed,
+            &state.output.processed_heap_bytes,
+            heap_size as u64,
+            (serial, results),
+        ) {
             Ok(()) => {
-                state.output.processed_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
                 state.deadlock_state.record_q5_push();
                 did_work = true;
             }
@@ -3550,10 +3853,14 @@ where
     // Priority 1: Try to advance any held item first
     // =========================================================================
     if let Some((serial, held, heap_size)) = worker.held_serialized.take() {
-        match state.output.serialized.push((serial, held)) {
+        match push_charged(
+            &state.output.serialized,
+            &state.output.serialized_heap_bytes,
+            heap_size as u64,
+            (serial, held),
+        ) {
             Ok(()) => {
                 // Successfully advanced held item
-                state.output.serialized_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
                 state.deadlock_state.record_q6_push();
             }
             Err((serial, held)) => {
@@ -3591,7 +3898,7 @@ where
 
     // Track memory being removed from Q4
     let q4_heap_size: usize = batch.iter().map(MemoryEstimate::estimate_heap_size).sum();
-    state.output.processed_heap_bytes.fetch_sub(q4_heap_size as u64, Ordering::AcqRel);
+    refund_queue_bytes(&state.output.processed_heap_bytes, q4_heap_size as u64);
 
     // =========================================================================
     // Priority 5: Serialize all items
@@ -3649,9 +3956,13 @@ where
         secondary_data: None,
     };
     let heap_size = batch.estimate_heap_size();
-    match state.output.serialized.push((serial, batch)) {
+    match push_charged(
+        &state.output.serialized,
+        &state.output.serialized_heap_bytes,
+        heap_size as u64,
+        (serial, batch),
+    ) {
         Ok(()) => {
-            state.output.serialized_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
             state.deadlock_state.record_q6_push();
             true
         }
@@ -4981,24 +5292,32 @@ mod tests {
 
     #[test]
     fn test_pair_state_insert_and_pop() {
+        let heap_bytes = AtomicU64::new(0);
         let mut pair = PairState::new(2);
 
         // Insert both streams for batch 0
-        pair.insert(PerStreamChunk {
-            stream_idx: 0,
-            batch_num: 0,
-            data: b"data0".to_vec(),
-            offsets: Some(vec![0, 5]),
-        });
-        assert!(pair.try_pop_complete(false).is_none()); // Not complete yet
+        pair.insert(
+            PerStreamChunk {
+                stream_idx: 0,
+                batch_num: 0,
+                data: b"data0".to_vec(),
+                offsets: Some(vec![0, 5]),
+            },
+            &heap_bytes,
+        );
+        assert!(pair.try_pop_complete(false, &heap_bytes).is_none()); // Not complete yet
 
-        pair.insert(PerStreamChunk {
-            stream_idx: 1,
-            batch_num: 0,
-            data: b"data1".to_vec(),
-            offsets: Some(vec![0, 5]),
-        });
-        let chunks = pair.try_pop_complete(false).expect("try_pop_complete should succeed");
+        pair.insert(
+            PerStreamChunk {
+                stream_idx: 1,
+                batch_num: 0,
+                data: b"data1".to_vec(),
+                offsets: Some(vec![0, 5]),
+            },
+            &heap_bytes,
+        );
+        let chunks =
+            pair.try_pop_complete(false, &heap_bytes).expect("try_pop_complete should succeed");
         assert_eq!(chunks.len(), 2);
         assert!(pair.is_empty());
     }
@@ -5008,36 +5327,48 @@ mod tests {
         // Stream 0 produces 2 batches, stream 1 produces 1 batch.
         // With all_arrived=false, batch 1 won't emit (stream 1 missing).
         // With all_arrived=true, batch 1 emits with just stream 0's data.
+        let heap_bytes = AtomicU64::new(0);
         let mut pair = PairState::new(2);
 
-        pair.insert(PerStreamChunk {
-            stream_idx: 0,
-            batch_num: 0,
-            data: b"d00".to_vec(),
-            offsets: Some(vec![0, 3]),
-        });
-        pair.insert(PerStreamChunk {
-            stream_idx: 1,
-            batch_num: 0,
-            data: b"d10".to_vec(),
-            offsets: Some(vec![0, 3]),
-        });
-        pair.insert(PerStreamChunk {
-            stream_idx: 0,
-            batch_num: 1,
-            data: b"d01".to_vec(),
-            offsets: Some(vec![0, 3]),
-        });
+        pair.insert(
+            PerStreamChunk {
+                stream_idx: 0,
+                batch_num: 0,
+                data: b"d00".to_vec(),
+                offsets: Some(vec![0, 3]),
+            },
+            &heap_bytes,
+        );
+        pair.insert(
+            PerStreamChunk {
+                stream_idx: 1,
+                batch_num: 0,
+                data: b"d10".to_vec(),
+                offsets: Some(vec![0, 3]),
+            },
+            &heap_bytes,
+        );
+        pair.insert(
+            PerStreamChunk {
+                stream_idx: 0,
+                batch_num: 1,
+                data: b"d01".to_vec(),
+                offsets: Some(vec![0, 3]),
+            },
+            &heap_bytes,
+        );
 
         // Batch 0: complete
-        let chunks = pair.try_pop_complete(false).expect("try_pop_complete should succeed");
+        let chunks =
+            pair.try_pop_complete(false, &heap_bytes).expect("try_pop_complete should succeed");
         assert_eq!(chunks.len(), 2);
 
         // Batch 1: only stream 0 — not complete without all_arrived
-        assert!(pair.try_pop_complete(false).is_none());
+        assert!(pair.try_pop_complete(false, &heap_bytes).is_none());
 
         // With all_arrived, batch 1 emits with just stream 0
-        let chunks = pair.try_pop_complete(true).expect("try_pop_complete should succeed");
+        let chunks =
+            pair.try_pop_complete(true, &heap_bytes).expect("try_pop_complete should succeed");
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].stream_idx, 0);
         assert!(pair.is_empty());
@@ -5051,48 +5382,62 @@ mod tests {
     /// a counter at the destination (Pair).
     #[test]
     fn test_pair_state_count_based_completion() {
+        let heap_bytes = AtomicU64::new(0);
         let mut pair = PairState::new(2);
 
         // Simulate: 2 streams, stream 0 produces batches 0..2, stream 1 produces batch 0 only.
         // Total batches_read = 3, chunks arriving at pair counted by chunks_paired.
 
         // Insert batch 0 from both streams.
-        pair.insert(PerStreamChunk {
-            stream_idx: 0,
-            batch_num: 0,
-            data: b"s0b0".to_vec(),
-            offsets: Some(vec![0, 4]),
-        });
-        pair.insert(PerStreamChunk {
-            stream_idx: 1,
-            batch_num: 0,
-            data: b"s1b0".to_vec(),
-            offsets: Some(vec![0, 4]),
-        });
+        pair.insert(
+            PerStreamChunk {
+                stream_idx: 0,
+                batch_num: 0,
+                data: b"s0b0".to_vec(),
+                offsets: Some(vec![0, 4]),
+            },
+            &heap_bytes,
+        );
+        pair.insert(
+            PerStreamChunk {
+                stream_idx: 1,
+                batch_num: 0,
+                data: b"s1b0".to_vec(),
+                offsets: Some(vec![0, 4]),
+            },
+            &heap_bytes,
+        );
 
         // Simulate: batches_read=2 (still reading), chunks_paired=2.
         // all_arrived = read_done(false) && ... → false.
         let all_arrived = false;
-        let chunks = pair.try_pop_complete(all_arrived).expect("try_pop_complete should succeed");
+        let chunks = pair
+            .try_pop_complete(all_arrived, &heap_bytes)
+            .expect("try_pop_complete should succeed");
         assert_eq!(chunks.len(), 2);
 
         // Insert batch 1 from stream 0 only (stream 1 hit EOF earlier).
-        pair.insert(PerStreamChunk {
-            stream_idx: 0,
-            batch_num: 1,
-            data: b"s0b1".to_vec(),
-            offsets: Some(vec![0, 4]),
-        });
+        pair.insert(
+            PerStreamChunk {
+                stream_idx: 0,
+                batch_num: 1,
+                data: b"s0b1".to_vec(),
+                offsets: Some(vec![0, 4]),
+            },
+            &heap_bytes,
+        );
 
         // Simulate: batches_read=3, chunks_paired=2 (third chunk just inserted, not yet counted).
         // all_arrived = read_done(true) && 2 == 3 → false.
         let all_arrived = false;
-        assert!(pair.try_pop_complete(all_arrived).is_none());
+        assert!(pair.try_pop_complete(all_arrived, &heap_bytes).is_none());
 
         // Simulate: chunks_paired catches up to 3.
         // all_arrived = read_done(true) && 3 == 3 → true.
         let all_arrived = true;
-        let chunks = pair.try_pop_complete(all_arrived).expect("try_pop_complete should succeed");
+        let chunks = pair
+            .try_pop_complete(all_arrived, &heap_bytes)
+            .expect("try_pop_complete should succeed");
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].stream_idx, 0);
         assert!(pair.is_empty());
@@ -5811,6 +6156,17 @@ mod tests {
             vec![],
             vec![],
         );
+        // Production charges a pending block's bytes when it is buffered (see the
+        // `charge_block_merge_pending` call beside the real `*_pending.insert`),
+        // and `drain_exhausted_stream` refunds them as it consumes the block.
+        // Charge them here too so that refund is paired — otherwise it trips
+        // `refund_queue_bytes`'s unpaired-refund assertion.
+        let block_bytes = block.estimate_heap_size() as u64;
+        charge_block_merge_pending(
+            &mut merge.pending_heap_bytes,
+            &state.block_merge_pending_heap_bytes,
+            block_bytes,
+        );
         if drain_r1 {
             merge.r1_pending.insert(0, block);
         } else {
@@ -5830,6 +6186,95 @@ mod tests {
         );
     }
 
+    /// Drive `block_merge_input_drained` true: read done, every read batch
+    /// parsed, and nothing left queued or pending.
+    fn mark_block_merge_input_drained(state: &FastqPipelineState<Cursor<Vec<u8>>, Vec<u8>>) {
+        state.read_done.store(true, Ordering::Release);
+        state.batches_read.store(1, Ordering::Release);
+        state.chunks_block_parsed.store(1, Ordering::Release);
+    }
+
+    /// A worker with no held batch, so `flush_residual_suffixes_at_eof` acts.
+    fn idle_worker() -> FastqWorkerState<Vec<u8>> {
+        FastqWorkerState::new(6, 0, 1, SchedulerStrategy::default(), ActiveSteps::all())
+    }
+
+    /// At EOF, a single-stream residual with no trailing newline must be flushed
+    /// as a template and charged onto Q3 — the shape the `--rejects`-off/`-on`
+    /// integration paths exercise end to end, pinned here directly.
+    #[test]
+    fn flush_residual_suffix_emits_a_single_stream_record_without_a_trailing_newline() {
+        let state = make_fastq_state_with_budget(0, 1);
+        let mut merge = BlockMergeState::new();
+        let mut worker = idle_worker();
+        mark_block_merge_input_drained(&state);
+
+        // A complete record whose final newline never arrived: the whole record
+        // is left in the suffix at EOF.
+        merge.r1_suffix_bytes = b"@r1\nACGT\n+\nIIII".to_vec();
+
+        let flushed = flush_residual_suffixes_at_eof(&state, &mut merge, &mut worker);
+        assert!(flushed, "a residual record must be flushed at EOF");
+        assert!(merge.r1_suffix_bytes.is_empty(), "the suffix must be consumed");
+        assert!(worker.held_parsed.is_none(), "an accepted push holds nothing");
+        let (_serial, templates) = state.q3_pop().expect("the flushed record must reach Q3");
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].name, b"r1");
+    }
+
+    /// A paired input with a residual on only one stream forms no pair, so
+    /// nothing is flushed — but both suffixes are still drained so completion is
+    /// no longer blocked on them, and the unpairable record stays in the surplus
+    /// for `finish_block_merge_if_complete` to reject as out of sync (issue #773).
+    #[test]
+    fn flush_residual_suffix_leaves_a_one_sided_paired_residual_for_rejection() {
+        let state = make_fastq_state_with_budget(0, 2);
+        let mut merge = BlockMergeState::new();
+        let mut worker = idle_worker();
+        mark_block_merge_input_drained(&state);
+
+        // Only R1 has a residual; R2 ended cleanly, so no mate can arrive.
+        merge.r1_suffix_bytes = b"@r1\nACGT\n+\nIIII".to_vec();
+
+        let flushed = flush_residual_suffixes_at_eof(&state, &mut merge, &mut worker);
+        assert!(!flushed, "a one-sided residual forms no template, so nothing is flushed");
+        assert!(
+            merge.r1_suffix_bytes.is_empty(),
+            "the suffix must still be drained to unblock completion"
+        );
+        assert_eq!(
+            merge.r1_surplus.len(),
+            1,
+            "the unpairable record stays in the surplus for rejection"
+        );
+        assert!(state.q3_pop().is_none(), "no template reaches Q3");
+    }
+
+    /// When Q3 is full the flush cannot publish, so it must hand the batch back
+    /// to `worker.held_parsed` for Priority 1 to retry — never drop it.
+    #[test]
+    fn flush_residual_suffix_holds_the_batch_when_q3_is_full() {
+        let state = make_fastq_state_with_budget(0, 1);
+        let mut merge = BlockMergeState::new();
+        let mut worker = idle_worker();
+        mark_block_merge_input_drained(&state);
+        merge.r1_suffix_bytes = b"@r1\nACGT\n+\nIIII".to_vec();
+
+        // Saturate Q3 so the flush's push is refused.
+        let mut filler_serial = 1_000u64;
+        while state.output.groups.push((filler_serial, Vec::new())).is_ok() {
+            filler_serial += 1;
+        }
+
+        let flushed = flush_residual_suffixes_at_eof(&state, &mut merge, &mut worker);
+        assert!(flushed, "the flush did work even though the push was refused");
+        let (_serial, held, count) =
+            worker.held_parsed.as_ref().expect("the un-pushable batch must be held for retry");
+        assert_eq!(*count, 1);
+        assert_eq!(held.len(), 1, "the held batch carries the flushed template");
+        assert_eq!(held[0].name, b"r1");
+    }
+
     #[test]
     fn test_block_merge_state_empty() {
         let state = BlockMergeState::new();
@@ -5845,10 +6290,261 @@ mod tests {
 
     /// Helper to create a minimal FASTQ pipeline state for backpressure tests.
     fn make_fastq_state() -> FastqPipelineState<Cursor<Vec<u8>>, Vec<u8>> {
-        let config = FastqPipelineConfig::new(2, false, 6);
-        let readers = vec![StreamReader::Decompressed(Cursor::new(Vec::new()))];
+        make_fastq_state_with_budget(4 * 1024 * 1024 * 1024, 1)
+    }
+
+    /// A minimal two-stream-capable FASTQ pipeline state with an explicit queue
+    /// memory budget, for the Read-admission tests.
+    fn make_fastq_state_with_budget(
+        queue_memory_limit: u64,
+        num_streams: usize,
+    ) -> FastqPipelineState<Cursor<Vec<u8>>, Vec<u8>> {
+        let config =
+            FastqPipelineConfig::new(2, false, 6).with_queue_memory_limit(queue_memory_limit);
+        let readers =
+            (0..num_streams).map(|_| StreamReader::Decompressed(Cursor::new(Vec::new()))).collect();
         let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
         FastqPipelineState::new(config, readers, output)
+    }
+
+    /// A chunk holding `len` bytes of data, for exercising the queue charges.
+    fn chunk_of(stream_idx: usize, batch_num: u64, len: usize) -> PerStreamChunk {
+        PerStreamChunk { stream_idx, batch_num, data: vec![0u8; len], offsets: None }
+    }
+
+    /// A `queue_memory_limit` of 0 means "no limit", so Read is never gated.
+    #[test]
+    fn read_admission_is_unconditional_without_a_limit() {
+        let state = make_fastq_state_with_budget(0, 1);
+        state.q0_heap_bytes.store(u64::MAX / 2, Ordering::Release);
+        assert!(state.read_admission_allowed(0));
+    }
+
+    /// Read is gated once the accounted queues reach the budget, and reopens as
+    /// soon as a stage drains below it.
+    #[test]
+    fn read_admission_tracks_the_queue_memory_budget() {
+        let state = make_fastq_state_with_budget(1024, 1);
+
+        state.q1_heap_bytes.store(512, Ordering::Release);
+        assert!(state.read_admission_allowed(0), "under budget: reading continues");
+
+        state.q1_heap_bytes.store(1024, Ordering::Release);
+        assert!(!state.read_admission_allowed(0), "at budget: reading stops");
+
+        state.q1_heap_bytes.store(256, Ordering::Release);
+        assert!(state.read_admission_allowed(0), "drained below budget: reading resumes");
+    }
+
+    /// With nothing accounted for in flight, Read is always admitted — so an
+    /// input whose first batch alone exceeds the whole budget still makes
+    /// progress instead of wedging the pipeline.
+    #[test]
+    fn read_admission_always_allows_the_first_batch() {
+        let state = make_fastq_state_with_budget(1, 1);
+        assert_eq!(state.queue_bytes_in_flight(), 0);
+        assert!(state.read_admission_allowed(0));
+    }
+
+    /// A stream that has fallen behind stays readable even over budget.
+    ///
+    /// Both the BGZF merge step and the gzip pair step hold a batch until every
+    /// stream has delivered the matching index, and only Read can supply the
+    /// missing one — so gating the laggard would wedge the pipeline holding
+    /// data it can never release.
+    #[test]
+    fn read_admission_still_allows_a_lagging_stream() {
+        let state = make_fastq_state_with_budget(1024, 2);
+        state.q0_heap_bytes.store(4096, Ordering::Release);
+        state.batch_counters[0].store(10, Ordering::Release);
+        state.batch_counters[1].store(3, Ordering::Release);
+
+        assert!(!state.read_admission_allowed(0), "the stream that ran ahead is gated");
+        assert!(state.read_admission_allowed(1), "the stream that fell behind is not");
+
+        // Once the streams are level the gate closes for both, and every index
+        // below the common one is already inside the pipeline.
+        state.batch_counters[1].store(10, Ordering::Release);
+        assert!(!state.read_admission_allowed(0));
+        assert!(!state.read_admission_allowed(1));
+    }
+
+    /// A stream whose sibling has already hit EOF stays readable over budget.
+    ///
+    /// Nothing past the shorter stream's end can be released by the Pair or
+    /// `BlockMerge` steps until every stream is at EOF, and only Read can get
+    /// there — so gating the surviving stream would wedge the run holding data
+    /// it can never emit.
+    #[test]
+    fn read_admission_still_allows_a_stream_whose_sibling_hit_eof() {
+        let state = make_fastq_state_with_budget(1024, 2);
+        state.q0_heap_bytes.store(4096, Ordering::Release);
+        state.batch_counters[0].store(10, Ordering::Release);
+        state.batch_counters[1].store(10, Ordering::Release);
+        assert!(!state.read_admission_allowed(1), "level streams under budget pressure are gated");
+
+        state.stream_eof[0].store(true, Ordering::Release);
+        assert!(
+            state.read_admission_allowed(1),
+            "the surviving stream must still reach its own EOF"
+        );
+    }
+
+    /// Every accounted counter must reach the Read gate; a queue left out of
+    /// the sum is a queue the budget does not bound.
+    #[test]
+    fn queue_bytes_in_flight_sums_every_accounted_queue() {
+        let state = make_fastq_state_with_budget(1024, 1);
+        let counters: [&AtomicU64; 10] = [
+            &state.q0_heap_bytes,
+            &state.q1_heap_bytes,
+            &state.q2_block_parsed_heap_bytes,
+            &state.block_merge_pending_heap_bytes,
+            &state.pair_heap_bytes,
+            &state.q2_5_boundaries_heap_bytes,
+            &state.output.groups_heap_bytes,
+            &state.output.processed_heap_bytes,
+            &state.output.serialized_heap_bytes,
+            &state.output.compressed_heap_bytes,
+        ];
+        for (i, counter) in counters.iter().enumerate() {
+            counter.store(1 << i, Ordering::Release);
+        }
+        state.output.write_reorder_state.add_heap_bytes(1 << counters.len());
+
+        let expected = (1u64 << (counters.len() + 1)) - 1;
+        assert_eq!(state.queue_bytes_in_flight(), expected);
+    }
+
+    /// A push that fails for want of a slot must leave no charge behind.
+    ///
+    /// `push_charged` charges before the item can become visible, so a failed
+    /// push has to refund; otherwise every rejected push would inflate a
+    /// counter that gates the Read step, and the pipeline would eventually stop
+    /// reading with its queues empty.
+    #[test]
+    fn a_failed_push_leaves_no_charge_behind() {
+        let counter = AtomicU64::new(0);
+        let queue: ArrayQueue<(u64, Vec<u8>)> = ArrayQueue::new(1);
+
+        assert!(push_charged(&queue, &counter, 4096, (0, vec![0u8; 4096])).is_ok());
+        assert_eq!(counter.load(Ordering::Acquire), 4096);
+
+        let rejected = push_charged(&queue, &counter, 4096, (1, vec![0u8; 4096]));
+        assert!(rejected.is_err(), "a full queue must reject the second push");
+        assert_eq!(
+            counter.load(Ordering::Acquire),
+            4096,
+            "the rejected push must not leave its charge on the counter"
+        );
+    }
+
+    /// Q0's and Q1's charges are refunded exactly on pop, so the counters
+    /// return to zero.
+    #[test]
+    fn q0_and_q1_charges_are_refunded_on_pop() {
+        let state = make_fastq_state_with_budget(1024 * 1024, 1);
+
+        let charged = chunk_of(0, 0, 4096).estimate_heap_size() as u64;
+        assert!(charged >= 4096, "a 4 KiB payload must be charged as at least 4 KiB");
+
+        assert!(state.q0_push(7, chunk_of(0, 0, 4096)).is_ok());
+        assert_eq!(state.q0_heap_bytes.load(Ordering::Acquire), charged);
+        let (serial, _chunk) = state.q0_pop().expect("pushed chunk should pop");
+        assert_eq!(serial, 7);
+        assert_eq!(state.q0_heap_bytes.load(Ordering::Acquire), 0);
+
+        assert!(state.q1_push(9, chunk_of(0, 1, 4096)).is_ok());
+        assert_eq!(state.q1_heap_bytes.load(Ordering::Acquire), charged);
+        let (serial, _chunk) = state.q1_pop().expect("pushed chunk should pop");
+        assert_eq!(serial, 9);
+        assert_eq!(state.q1_heap_bytes.load(Ordering::Acquire), 0);
+    }
+
+    /// Q3 (templates) is charged on push and refunded on pop.
+    ///
+    /// It used to be tracked only under `memory-debug`, and even then charged a
+    /// hardcoded `0` on the way in, so the counter read zero however much the
+    /// queue held (issue #766).
+    #[test]
+    fn q3_charge_is_refunded_on_pop() {
+        let state = make_fastq_state_with_budget(1024 * 1024, 1);
+        let record = FastqRecord::from_slice(b"@read1\nACGTACGT\n+\nIIIIIIII\n")
+            .expect("valid FASTQ record");
+        let templates = vec![FastqTemplate { name: b"read1".to_vec(), records: vec![record] }];
+        let charged: u64 = templates.iter().map(|t| t.estimate_heap_size() as u64).sum();
+        assert!(charged > 0, "a non-empty template must carry a non-zero charge");
+
+        assert!(state.q3_push(3, templates).is_ok());
+        assert_eq!(state.output.groups_heap_bytes.load(Ordering::Acquire), charged);
+
+        let (serial, _batch) = state.q3_pop().expect("pushed batch should pop");
+        assert_eq!(serial, 3);
+        assert_eq!(state.output.groups_heap_bytes.load(Ordering::Acquire), 0);
+    }
+
+    /// The pair buffer's charge survives the move out of Q1 and is refunded
+    /// when the batch is emitted.
+    ///
+    /// Chunks leave Q1 the moment the Pair step runs, so if the pair buffer did
+    /// not carry the charge the Read gate would stop seeing data that is still
+    /// resident.
+    #[test]
+    fn pair_buffer_charge_is_refunded_when_the_batch_is_emitted() {
+        let state = make_fastq_state_with_budget(1024 * 1024, 2);
+        let charged = 2 * chunk_of(0, 0, 4096).estimate_heap_size() as u64;
+
+        let mut pair = state.pair_state.lock();
+        pair.insert(chunk_of(0, 0, 4096), &state.pair_heap_bytes);
+        pair.insert(chunk_of(1, 0, 4096), &state.pair_heap_bytes);
+        assert_eq!(state.pair_heap_bytes.load(Ordering::Acquire), charged);
+
+        let chunks = pair
+            .try_pop_complete(false, &state.pair_heap_bytes)
+            .expect("both streams delivered batch 0");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(state.pair_heap_bytes.load(Ordering::Acquire), 0);
+    }
+
+    /// The merge step's pending maps are mirrored into a lock-free counter, so
+    /// blocks parked there still count against the budget.
+    #[test]
+    fn block_merge_pending_charge_is_mirrored_and_refunded() {
+        let state = make_fastq_state_with_budget(1024 * 1024, 2);
+        let mut merge = state.block_merge_state.lock();
+
+        charge_block_merge_pending(
+            &mut merge.pending_heap_bytes,
+            &state.block_merge_pending_heap_bytes,
+            4096,
+        );
+        assert_eq!(merge.pending_heap_bytes, 4096);
+        assert_eq!(state.block_merge_pending_heap_bytes.load(Ordering::Acquire), 4096);
+
+        refund_block_merge_pending(
+            &mut merge.pending_heap_bytes,
+            &state.block_merge_pending_heap_bytes,
+            4096,
+        );
+        assert_eq!(merge.pending_heap_bytes, 0);
+        assert_eq!(state.block_merge_pending_heap_bytes.load(Ordering::Acquire), 0);
+    }
+
+    /// The local `pending_heap_bytes` saturates at zero on an over-refund rather
+    /// than wrapping to `u64::MAX`, which would hold the merge step's
+    /// `PENDING_BACKPRESSURE_BYTES` gate shut for the rest of the run.
+    ///
+    /// The mirror is charged the full amount first so only the *local* side is
+    /// over-refunded: `refund_queue_bytes` carries a `debug_assert!` that its own
+    /// refunds are paired, and this test is about the local counter's arithmetic.
+    #[test]
+    fn refunding_more_block_merge_pending_than_was_charged_saturates_at_zero() {
+        let state = make_fastq_state_with_budget(1024, 1);
+        let mut local = 100u64;
+        state.block_merge_pending_heap_bytes.store(250, Ordering::Release);
+        refund_block_merge_pending(&mut local, &state.block_merge_pending_heap_bytes, 250);
+        assert_eq!(local, 0);
+        assert_eq!(state.block_merge_pending_heap_bytes.load(Ordering::Acquire), 0);
     }
 
     /// Verify that the FASTQ pipeline's scheduler backpressure reports memory
