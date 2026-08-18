@@ -12,8 +12,13 @@
 //! fgbio (or between two independent tool invocations) even on functionally equivalent
 //! output:
 //!
-//! - **`@HD`** — the `SO` (sort order) and `GO` (group order) tags are compared
-//!   byte-for-byte. The `SS` (sub-sort) tag is deliberately **not** byte-compared here:
+//! - **`@HD`** — the `SO` (sort order) and `GO` (group order) tags are compared after
+//!   canonicalizing each to the SAM-spec *state* it denotes, so two headers that spell the
+//!   same state differently do not read as a content difference (`SO:unknown` vs
+//!   `SO:unsorted` — both "no defined order" — and an absent tag vs. its spec default; see
+//!   [`canonical_sort_order`]/[`canonical_group_order`], issue #778). Any genuine ordering
+//!   disagreement (`coordinate` vs `queryname`, `GO:query` vs `GO:reference`) is still a
+//!   divergence. The `SS` (sub-sort) tag is deliberately **not** byte-compared here:
 //!   fgumi writes the bare form (e.g. `SS:template-coordinate`) while fgbio/samtools write
 //!   the `<sort-order>:`-prefixed form (`SS:unsorted:template-coordinate`) for the same
 //!   sort order (`R2-HDR-01`), so a byte comparison would spuriously flag every
@@ -75,8 +80,9 @@ pub fn compare_headers(h1: &Header, h2: &Header) -> Option<Vec<String>> {
 /// [`SortOrder`] (see [`sort_order_from_header`] — this is the case for `sort`/`group`
 /// output and any coordinate/queryname-sorted BAM). Returns `Ok(None)` when **neither**
 /// header's raw `@HD SO` claims a recognized orderable order (`coordinate`/`queryname`) —
-/// i.e. both are genuinely orderless (absent `SO`, or `SO:unsorted`) — and the two headers'
-/// raw `@HD SO`/`GO` tags still agree byte-for-byte: this is the legitimate case for
+/// i.e. both are genuinely orderless (absent `SO`, `SO:unknown`, or `SO:unsorted`) — and the
+/// two headers' `@HD SO`/`GO` tags still agree once canonicalized to the state each denotes
+/// (see [`compare_hd`]; `unknown`/`unsorted`/absent are one state): this is the case for
 /// pre-sort pipeline stages (`extract`/`fastq`/`zipper`/unmapped `consensus` output all
 /// declare bare `SO:unsorted GO:query` with no `SS` — genuinely unordered data, not a
 /// recognized sort order, but still a valid same-format pair to content-compare). A
@@ -92,8 +98,8 @@ pub fn compare_headers(h1: &Header, h2: &Header) -> Option<Vec<String>> {
 /// claims a recognized orderable order (`coordinate`/`queryname`) that failed to resolve
 /// (e.g. an unrecognized `SS` sub-sort) — a header that *claims* verifiable order must not
 /// be silently treated as unverifiable-but-fine; or if neither header's sort order is
-/// determinable, neither claims an orderable `SO`, and the raw `@HD SO`/`GO` tags also
-/// disagree.
+/// determinable, neither claims an orderable `SO`, and the canonicalized `@HD SO`/`GO` tags
+/// also disagree.
 ///
 /// Called from `CompareBams::execute` before any mode/preset dispatch, so an incompatible
 /// pair of inputs always hard-exits here rather than cascading into per-record diffs.
@@ -117,9 +123,10 @@ pub(crate) fn require_compatible_headers(h1: &Header, h2: &Header) -> Result<Opt
             // of them is benign:
             //
             //   1. Genuinely orderless input (e.g. `extract`/`fastq`/`zipper` output: bare
-            //      `SO:unsorted GO:query` with no `SS`, or no `@HD SO` at all). Nothing was
-            //      *claimed* that this engine failed to verify, so falling back to a raw
-            //      `SO`/`GO` byte comparison is a legitimate pass.
+            //      `SO:unsorted GO:query` with no `SS`, `SO:unknown`, or no `@HD SO` at
+            //      all). Nothing was *claimed* that this engine failed to verify, so
+            //      falling back to a canonicalized `SO`/`GO` comparison is a legitimate
+            //      pass.
             //   2. A header whose raw `SO` claims a recognized orderable order
             //      (`coordinate` or `queryname`) but whose `SS` sub-sort this engine
             //      doesn't recognize/support (e.g. `SO:coordinate SS:coordinate:foo`).
@@ -141,8 +148,9 @@ pub(crate) fn require_compatible_headers(h1: &Header, h2: &Header) -> Result<Opt
             // Neither header declares a sort order this engine recognizes (e.g. `extract`/
             // `fastq`/`zipper` output: bare `SO:unsorted GO:query` with no `SS`). That's a
             // legitimate pre-sort format, not an error, as long as the two headers still
-            // agree on what `@HD` they DO declare — a genuine `SO`/`GO` divergence here
-            // (via `compare_hd`) is still a hard incompatibility.
+            // agree on the `@HD` state they DO declare — a genuine `SO`/`GO` divergence
+            // here (via `compare_hd`, which first canonicalizes the equivalent orderless
+            // spellings `unknown`/`unsorted`/absent) is still a hard incompatibility.
             ensure!(
                 compare_hd(h1, h2).is_empty(),
                 "@HD SO/GO tags differ and neither input's sort order could be determined"
@@ -200,8 +208,39 @@ fn format_opt_bytes(v: Option<&[u8]>) -> String {
     }
 }
 
+/// Canonicalizes an `@HD SO` value to the SAM-spec *state* it denotes, so that two headers
+/// spelling the same state differently compare equal (issue #778).
+///
+/// `unknown` (the spec's default, and what fgumi wrote for unmapped consensus output before
+/// v0.5.0) and `unsorted` (what it writes now, matching fgbio) both mean "these records are
+/// in no defined order"; `unsorted` differs from `unknown` only in asserting that the lack
+/// of order is deliberate. Neither implies an ordering the other contradicts, so a pair
+/// spanning that spelling change is a well-defined, order-insensitive comparison rather
+/// than an incompatibility. An absent `SO` is the spec default, `unknown`, and canonicalizes
+/// to the same state. Every other value (`coordinate`, `queryname`, or anything
+/// unrecognized) is returned verbatim, so a genuine ordering disagreement is still a
+/// divergence.
+fn canonical_sort_order(value: Option<&[u8]>) -> &[u8] {
+    match value {
+        None | Some(b"unknown" | b"unsorted") => b"unknown",
+        Some(other) => other,
+    }
+}
+
+/// Canonicalizes an `@HD GO` value the same way: the spec's default for an absent `GO` is
+/// `none`, so the two spellings denote one state. `query`/`reference` are returned verbatim.
+fn canonical_group_order(value: Option<&[u8]>) -> &[u8] {
+    match value {
+        None | Some(b"none") => b"none",
+        Some(other) => other,
+    }
+}
+
 /// Compares the `@HD` `SO`/`GO` tags (see the module docs for why exactly these two, and
-/// not `VN`).
+/// not `VN`), each canonicalized to the SAM-spec state it denotes — see
+/// [`canonical_sort_order`]/[`canonical_group_order`] for which spellings are equivalent.
+/// The diff message still renders the raw values, so a reported divergence names what each
+/// header actually declares.
 ///
 /// `SS` is intentionally NOT byte-compared here: sort-order identity (including the
 /// bare-vs-`<sort-order>:`-prefixed `SS` spelling) is decided semantically by
@@ -209,18 +248,26 @@ fn format_opt_bytes(v: Option<&[u8]>) -> String {
 /// `unsorted:template-coordinate` and fgumi's bare `template-coordinate` to the same
 /// order — byte-comparing `SS` here would re-introduce that spelling false-positive.
 fn compare_hd(h1: &Header, h2: &Header) -> Vec<String> {
-    let fields: [(&str, [u8; 2]); 2] =
-        [("SO", *header_tag::SORT_ORDER.as_ref()), ("GO", *header_tag::GROUP_ORDER.as_ref())];
-    fields
-        .iter()
-        .filter_map(|(name, tag)| {
-            let v1 = hd_tag_value(h1, *tag);
-            let v2 = hd_tag_value(h2, *tag);
-            (v1 != v2).then(|| {
-                format!("@HD {name}: {} vs {}", format_opt_bytes(v1), format_opt_bytes(v2))
-            })
-        })
-        .collect()
+    /// Renders one tag's diff line if the two headers' canonicalized values disagree.
+    fn diff(
+        name: &str,
+        v1: Option<&[u8]>,
+        v2: Option<&[u8]>,
+        canonical: impl Fn(Option<&[u8]>) -> &[u8],
+    ) -> Option<String> {
+        (canonical(v1) != canonical(v2))
+            .then(|| format!("@HD {name}: {} vs {}", format_opt_bytes(v1), format_opt_bytes(v2)))
+    }
+
+    let so = *header_tag::SORT_ORDER.as_ref();
+    let go = *header_tag::GROUP_ORDER.as_ref();
+    [
+        diff("SO", hd_tag_value(h1, so), hd_tag_value(h2, so), canonical_sort_order),
+        diff("GO", hd_tag_value(h1, go), hd_tag_value(h2, go), canonical_group_order),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// One reference sequence's compared identity: its name (`SN`), `LN` length, and every
@@ -584,6 +631,76 @@ mod tests {
     ) {
         let h1 = header_with_hd(so1, go1, ss1);
         let h2 = header_with_hd(so2, go2, ss2);
+        let diffs = compare_headers(&h1, &h2).expect("@HD divergence must be reported");
+        assert!(diffs.iter().any(|d| d.starts_with("@HD")), "diffs: {diffs:?}");
+    }
+
+    /// Two `@HD` lines that spell the *same* SAM-spec state differently are not a content
+    /// difference (issue #778). `SO:unknown` (the spec default) and `SO:unsorted` both
+    /// denote "no defined order", and an absent `SO`/`GO` tag means exactly what the spec
+    /// default for that tag says — so every pair below describes the same header state and
+    /// must produce no `@HD` diff.
+    #[rstest]
+    #[case::unknown_vs_unsorted(Some("unknown"), Some("query"), Some("unsorted"), Some("query"))]
+    #[case::absent_so_vs_unknown(None, Some("query"), Some("unknown"), Some("query"))]
+    #[case::absent_so_vs_unsorted(None, Some("query"), Some("unsorted"), Some("query"))]
+    #[case::absent_go_vs_none(Some("unsorted"), None, Some("unsorted"), Some("none"))]
+    fn spec_equivalent_orderless_hd_spellings_are_not_a_diff(
+        #[case] so1: Option<&str>,
+        #[case] go1: Option<&str>,
+        #[case] so2: Option<&str>,
+        #[case] go2: Option<&str>,
+    ) {
+        let h1 = header_with_hd(so1, go1, None);
+        let h2 = header_with_hd(so2, go2, None);
+        assert!(
+            compare_headers(&h1, &h2).is_none(),
+            "SO:{so1:?} GO:{go1:?} and SO:{so2:?} GO:{go2:?} describe the same header state"
+        );
+    }
+
+    /// The gate must accept the same spec-equivalent spellings as compatible-but-orderless
+    /// (`Ok(None)`) rather than hard-erroring the whole comparison — the reported failure in
+    /// issue #778, where pre-v0.5.0 fgumi output (`SO:unknown GO:query`) could not be
+    /// compared against v0.5.0+ output (`SO:unsorted GO:query`) at all.
+    #[rstest]
+    #[case::unknown_vs_unsorted(Some("unknown"), Some("query"), Some("unsorted"), Some("query"))]
+    #[case::absent_so_vs_unknown(None, Some("query"), Some("unknown"), Some("query"))]
+    #[case::absent_so_vs_unsorted(None, Some("query"), Some("unsorted"), Some("query"))]
+    #[case::absent_go_vs_none(Some("unsorted"), None, Some("unsorted"), Some("none"))]
+    fn require_compatible_headers_accepts_spec_equivalent_orderless_spellings(
+        #[case] so1: Option<&str>,
+        #[case] go1: Option<&str>,
+        #[case] so2: Option<&str>,
+        #[case] go2: Option<&str>,
+    ) {
+        let h1 = header_with_hd(so1, go1, None);
+        let h2 = header_with_hd(so2, go2, None);
+        let order = require_compatible_headers(&h1, &h2)
+            .expect("spec-equivalent orderless spellings must be compatible");
+        assert_eq!(order, None, "neither header declares a verifiable sort order");
+    }
+
+    /// The boundary the equivalence above must NOT cross: an orderless `SO` is only
+    /// equivalent to another *orderless* `SO`, and `GO` values that genuinely differ stay a
+    /// divergence. Guards against normalizing away a real disagreement.
+    #[rstest]
+    #[case::unknown_vs_coordinate(Some("unknown"), None, Some("coordinate"), None)]
+    #[case::unsorted_vs_queryname(Some("unsorted"), None, Some("queryname"), None)]
+    #[case::go_query_vs_reference(
+        Some("unsorted"),
+        Some("query"),
+        Some("unsorted"),
+        Some("reference")
+    )]
+    fn genuinely_differing_hd_tags_remain_a_diff(
+        #[case] so1: Option<&str>,
+        #[case] go1: Option<&str>,
+        #[case] so2: Option<&str>,
+        #[case] go2: Option<&str>,
+    ) {
+        let h1 = header_with_hd(so1, go1, None);
+        let h2 = header_with_hd(so2, go2, None);
         let diffs = compare_headers(&h1, &h2).expect("@HD divergence must be reported");
         assert!(diffs.iter().any(|d| d.starts_with("@HD")), "diffs: {diffs:?}");
     }
