@@ -1228,15 +1228,18 @@ fn resolve_memory_budget_with_total(
 /// a hard RSS cap — a single pathological position group is still processed
 /// whole, and each worker has transient working-set memory on top of the queue.
 ///
-/// In the **BAM** pipeline the budget is enforced at the Read step: the
-/// pipeline stops admitting input once the bytes queued between its stages
-/// reach it, so a slow or contended output device backs pressure up to the
-/// reader instead of filling every queue to its slot count. See
-/// `BamPipelineState::read_admission_allowed`.
+/// Both pipelines enforce the budget at the Read step: they stop admitting
+/// input once the bytes queued between their stages reach it, so a slow or
+/// contended output device backs pressure up to the reader instead of filling
+/// every queue to its slot count. See `BamPipelineState::read_admission_allowed`
+/// and `FastqPipelineState::read_admission_allowed`.
 ///
-/// The FASTQ pipeline (`fgumi extract`) shares these options and logs the same
-/// budget, but has no equivalent admission gate yet: there it still bounds only
-/// the reorder buffers, each capped at
+/// Memory held *outside* those aggregates is not covered: a worker's
+/// in-progress batch is bounded by the thread count rather than by this budget.
+/// The write reorder buffers, by contrast, *are* summed into the aggregates
+/// (the FASTQ aggregate counts its write reorder state and the BAM aggregate its
+/// input and write reorder states), so this budget bounds them through the Read
+/// gate; they additionally apply their own threshold, capped at
 /// [`BACKPRESSURE_THRESHOLD_BYTES`](crate::unified_pipeline::BACKPRESSURE_THRESHOLD_BYTES).
 #[derive(Debug, Clone, Args)]
 pub struct QueueMemoryOptions {

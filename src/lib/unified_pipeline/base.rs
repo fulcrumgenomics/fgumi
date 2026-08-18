@@ -726,6 +726,72 @@ pub const PROGRESS_LOG_INTERVAL: u64 = 1_000_000;
 /// so if a smaller memory limit is configured, backpressure activates at that limit.
 pub const BACKPRESSURE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024; // 512 MB
 
+/// Release `bytes` from a queue byte counter, saturating at zero.
+///
+/// The counters summed by a pipeline's `queue_bytes_in_flight` gate its Read
+/// step, so an unpaired refund would not merely skew a statistic: a plain
+/// `fetch_sub` past zero wraps to `u64::MAX` and stops the pipeline reading for
+/// the rest of the run. Saturating turns that class of bug into a bounded
+/// accounting error rather than a hang.
+///
+/// Saturating is the right release behaviour but it also makes an unpaired
+/// refund invisible, so a `debug_assert!` fails the test suite on one rather
+/// than letting the budget quietly under-bound for the rest of the run. The
+/// saturating arithmetic itself lives in [`saturating_refund`] so it stays
+/// testable independently of that assertion.
+pub(crate) fn refund_queue_bytes(counter: &AtomicU64, bytes: u64) {
+    let previous = counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(saturating_refund(current, bytes))
+        })
+        .unwrap_or_else(|current| current);
+    debug_assert!(
+        previous >= bytes,
+        "refunded {bytes} queue bytes against a counter holding {previous}; every refund must be \
+         paired with the charge that preceded it"
+    );
+}
+
+/// Push `item` onto `queue`, charging `heap_size` to `counter` **before** the
+/// item becomes visible to a consumer, and refunding it if the push fails.
+///
+/// The order is the point. `counter` is summed by a pipeline's
+/// `queue_bytes_in_flight`, which gates the Read step, and [`refund_queue_bytes`]
+/// saturates at zero. Charging *after* a successful push leaves a window in which
+/// a consumer pops the item and refunds bytes that were never charged; when the
+/// counter is near zero — the normal state of a queue that is draining as fast as
+/// it fills — that refund saturates, and the charge landing afterwards is then
+/// never released. Each occurrence permanently inflates the counter, and once the
+/// accumulated phantom bytes reach the budget the pipeline stops reading for the
+/// rest of the run.
+///
+/// Charging first inverts the failure: the counter can only ever be *over* the
+/// true figure for the span of a failed push, which makes the gate briefly
+/// conservative rather than permanently shut.
+pub(crate) fn push_charged<T>(
+    queue: &ArrayQueue<(u64, T)>,
+    counter: &AtomicU64,
+    heap_size: u64,
+    item: (u64, T),
+) -> Result<(), (u64, T)> {
+    counter.fetch_add(heap_size, Ordering::AcqRel);
+    match queue.push(item) {
+        Ok(()) => Ok(()),
+        Err(returned) => {
+            refund_queue_bytes(counter, heap_size);
+            Err(returned)
+        }
+    }
+}
+
+/// The arithmetic [`refund_queue_bytes`] applies: subtract, saturating at zero.
+///
+/// Extracted so the wrap-to-`u64::MAX` guarantee can be tested without tripping
+/// that function's `debug_assert!` on an unpaired refund.
+const fn saturating_refund(current: u64, bytes: u64) -> u64 {
+    current.saturating_sub(bytes)
+}
+
 /// Q5 (processed queue) backpressure threshold.
 ///
 /// This is set lower than the Q3 threshold (256 MB vs 512 MB) because items in Q5
@@ -4798,7 +4864,9 @@ where
     // write reorder buffer's bytes are charged to the queue memory budget and the
     // Read step declines to admit more input once that budget is reached — see
     // `BamPipelineState::read_admission_allowed` (issue #746). The FASTQ pipeline
-    // has no equivalent admission gate yet.
+    // bounds its write side the same way through
+    // `FastqPipelineState::read_admission_allowed`, which additionally exempts a
+    // stream whose data the multi-stream assembly steps are waiting on (issue #766).
     if state.q6_is_full() {
         return if advanced_held { StepResult::Success } else { StepResult::OutputFull };
     }
@@ -5414,6 +5482,36 @@ mod tests {
         if let Err(err) = merged {
             assert_eq!(err.non_empty_queues, vec!["q1_raw_blocks (1)".to_string()]);
         }
+    }
+
+    /// An unpaired refund saturates at zero rather than wrapping to `u64::MAX`,
+    /// which would gate both pipelines' Read step shut for the rest of the run.
+    ///
+    /// Asserted against [`saturating_refund`] rather than [`refund_queue_bytes`]
+    /// because the latter carries a `debug_assert!` that an unpaired refund must
+    /// not happen; this pins what the arithmetic does if one ever does.
+    #[rstest]
+    #[case::paired(100, 100, 0)]
+    #[case::partial(100, 40, 60)]
+    #[case::unpaired_saturates(100, 250, 0)]
+    #[case::unpaired_from_zero(0, 1, 0)]
+    fn refunding_more_than_was_charged_saturates_at_zero(
+        #[case] current: u64,
+        #[case] bytes: u64,
+        #[case] expected: u64,
+    ) {
+        assert_eq!(saturating_refund(current, bytes), expected);
+    }
+
+    /// A paired refund leaves the counter at the difference, and does not trip
+    /// [`refund_queue_bytes`]'s unpaired-refund assertion.
+    #[test]
+    fn a_paired_refund_debits_the_counter() {
+        let counter = AtomicU64::new(100);
+        refund_queue_bytes(&counter, 40);
+        assert_eq!(counter.load(Ordering::Acquire), 60);
+        refund_queue_bytes(&counter, 60);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
     }
 
     #[test]
