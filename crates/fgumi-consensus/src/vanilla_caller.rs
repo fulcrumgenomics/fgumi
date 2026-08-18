@@ -832,33 +832,43 @@ impl VanillaUmiConsensusCaller {
         accepted
     }
 
-    /// Downsamples reads if there are more than `max_reads`
-    fn downsample_reads(&self, mut reads: Vec<RawRecord>) -> Vec<RawRecord> {
-        if let Some(max_reads) = self.options.max_reads
-            && reads.len() > max_reads
-        {
-            // Rank once per record, not inside the sort key: `sort_by_key` may evaluate its
-            // closure more than once per element, which would re-hash on every comparison.
-            let ranks: Vec<i32> = reads
-                .iter()
-                .map(|raw| fgbio_read_name_rank(RawRecordView::new(raw.as_ref()).read_name()))
-                .collect();
-            let keep_indices = select_lowest_ranking(&ranks, max_reads);
-
-            // Drop the non-survivors in place. `retain` preserves input order and moves the
-            // retained records rather than cloning them — families reaching here can be large.
-            let mut keep = vec![false; reads.len()];
-            for i in keep_indices {
-                keep[i] = true;
-            }
-            let mut idx = 0;
-            reads.retain(|_| {
-                let keeping = keep[idx];
-                idx += 1;
-                keeping
-            });
+    /// Downsamples reads if there are more than `max_reads`, returning `(kept, dropped)`.
+    ///
+    /// Both halves preserve input order. The `dropped` reads are the ones the cap discards;
+    /// the caller counts them as rejected (so `raw_reads_used` excludes them) and routes them
+    /// to the `--rejects` output rather than silently discarding them (fgumi#724).
+    fn downsample_reads(&self, reads: Vec<RawRecord>) -> (Vec<RawRecord>, Vec<RawRecord>) {
+        let Some(max_reads) = self.options.max_reads else {
+            return (reads, Vec::new());
+        };
+        if reads.len() <= max_reads {
+            return (reads, Vec::new());
         }
-        reads
+
+        // Rank once per record, not inside the sort key: `sort_by_key` may evaluate its
+        // closure more than once per element, which would re-hash on every comparison.
+        let ranks: Vec<i32> = reads
+            .iter()
+            .map(|raw| fgbio_read_name_rank(RawRecordView::new(raw.as_ref()).read_name()))
+            .collect();
+        let keep_indices = select_lowest_ranking(&ranks, max_reads);
+
+        // Partition into survivors and discards, each in input order. Records are moved, not
+        // cloned — families reaching here are by definition larger than the cap.
+        let mut keep = vec![false; reads.len()];
+        for i in keep_indices {
+            keep[i] = true;
+        }
+        let mut kept = Vec::with_capacity(max_reads);
+        let mut dropped = Vec::with_capacity(reads.len() - max_reads);
+        for (i, read) in reads.into_iter().enumerate() {
+            if keep[i] {
+                kept.push(read);
+            } else {
+                dropped.push(read);
+            }
+        }
+        (kept, dropped)
     }
 
     /// Downsamples already-filtered `SourceReads` to at most `max_reads`, keeping the
@@ -1239,7 +1249,7 @@ impl VanillaUmiConsensusCaller {
 
         // Filter reads
         let pre_filter_count = records.len();
-        let mut reads = self.filter_reads(records);
+        let reads = self.filter_reads(records);
         let filtered_count = pre_filter_count - reads.len();
         if filtered_count > 0 {
             self.stats.record_rejection(RejectionReason::SecondaryOrSupplementary, filtered_count);
@@ -1258,8 +1268,16 @@ impl VanillaUmiConsensusCaller {
             return Ok(ConsensusOutput::default());
         }
 
-        // Downsample if necessary
-        reads = self.downsample_reads(reads);
+        // Downsample if necessary, routing the reads the cap discards to the --rejects output
+        // and counting them so `raw_reads_used` excludes them rather than over-counting the
+        // downsampled reads as used (fgumi#724).
+        let (reads, downsampled) = self.downsample_reads(reads);
+        if !downsampled.is_empty() {
+            self.stats.record_rejection(RejectionReason::Downsampled, downsampled.len());
+            if self.track_rejects {
+                self.rejected_reads.extend(downsampled.into_iter().map(RawRecord::into_inner));
+            }
+        }
 
         // Sub-group by read type
         let (fragment_reads, r1_reads, r2_reads) = self.subgroup_reads(reads);
@@ -2266,6 +2284,7 @@ mod tests {
 
         let mut names: Vec<String> = caller
             .downsample_reads(reads)
+            .0
             .iter()
             .map(|r| {
                 String::from_utf8(RawRecordView::new(r.as_ref()).read_name().to_vec())
@@ -2274,6 +2293,54 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["q0", "q2", "q3"]);
+    }
+
+    /// fgumi#724: reads the `--max-reads` cap discards must be counted as rejected — so
+    /// `raw_reads_used` (derived from `filtered_reads`) excludes them — and, with rejects
+    /// tracking on, routed to the `--rejects` output byte-for-byte in input order rather than
+    /// silently dropped. Ranks put `q3 < q2 < q0` lowest, so a cap of 3 keeps exactly those
+    /// three and discards the other seven.
+    #[test]
+    fn downsampled_reads_are_rejected_and_routed_to_the_rejects_output() {
+        let options =
+            VanillaUmiConsensusOptions { min_reads: 1, max_reads: Some(3), ..Default::default() };
+        let mut caller = VanillaUmiConsensusCaller::new_with_rejects_tracking(
+            "c".to_string(),
+            "A".to_string(),
+            options,
+            true,
+        );
+
+        let reads: Vec<RawRecord> = (0..10)
+            .map(|i| create_test_read(&format!("q{i}"), b"ACGT", b"####", false, false))
+            .collect();
+
+        // Snapshot the discarded records — everything except the kept q0/q2/q3 — in input
+        // order, before the group is moved into the caller.
+        let kept: [&[u8]; 3] = ["q0", "q2", "q3"].map(str::as_bytes);
+        let expected_dropped: Vec<Vec<u8>> = reads
+            .iter()
+            .filter(|r| !kept.contains(&RawRecordView::new(r.as_ref()).read_name()))
+            .map(|r| r.as_ref().to_vec())
+            .collect();
+        assert_eq!(expected_dropped.len(), 7, "a cap of 3 over 10 reads discards seven");
+
+        caller.process_group("UMI123", reads).expect("the three kept reads must still consense");
+
+        assert_eq!(
+            caller.stats.rejection_reasons.get(&RejectionReason::Downsampled),
+            Some(&7),
+            "the seven downsampled reads must be counted under Downsampled"
+        );
+        assert_eq!(
+            caller.stats.filtered_reads, 7,
+            "filtered_reads must include the downsampled reads so raw_reads_used excludes them"
+        );
+        assert_eq!(
+            caller.rejected_reads(),
+            expected_dropped.as_slice(),
+            "the downsampled reads must reach --rejects byte-for-byte, in input order"
+        );
     }
 
     /// Both ends of a template share a read name and therefore a rank, so they sort adjacently
@@ -2311,6 +2378,7 @@ mod tests {
 
         let kept: Vec<(String, bool)> = caller
             .downsample_reads(reads)
+            .0
             .iter()
             .map(|r| {
                 let view = RawRecordView::new(r.as_ref());

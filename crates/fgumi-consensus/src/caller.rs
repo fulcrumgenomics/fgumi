@@ -437,6 +437,10 @@ pub enum RejectionReason {
     PotentialCollision,
     /// Template did not have a single primary FR pair of reads (codec)
     NotPrimaryFrPair,
+    /// Read was discarded by consensus downsampling (a deliberate `--max-reads` cap, not a
+    /// quality or alignment failure). Counted so `raw_reads_used` excludes it and routed to
+    /// the `--rejects` output (fgumi#724).
+    Downsampled,
     /// Other unspecified reason
     Other,
 }
@@ -465,6 +469,7 @@ impl RejectionReason {
             Self::HighDuplexDisagreement => 'H',
             Self::PotentialCollision => 'C',
             Self::NotPrimaryFrPair => 'R',
+            Self::Downsampled => 'd',
             Self::Other => 'O',
         }
     }
@@ -494,6 +499,7 @@ impl RejectionReason {
                 "Potential collisions (reads with the same MI but different strands)"
             }
             Self::NotPrimaryFrPair => "Template did not have a single primary FR pair of reads",
+            Self::Downsampled => "Downsampled to the maximum reads per consensus",
             Self::Other => "Other reason",
         }
     }
@@ -531,6 +537,9 @@ impl RejectionReason {
             Self::OrphanConsensus => CentralReason::OrphanConsensus,
             Self::PotentialCollision => CentralReason::DuplicateUmi,
             Self::NotPrimaryFrPair => CentralReason::NotPrimaryFrPair,
+            // fgumi-specific: fgbio has no downsampled rejection metric yet
+            // (fulcrumgenomics/fgbio#1166, #1167), so this diverges from fgbio under a cap.
+            Self::Downsampled => CentralReason::Downsampled,
         }
     }
 }

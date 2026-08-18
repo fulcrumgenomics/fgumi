@@ -789,8 +789,16 @@ impl CodecConsensusCaller {
                 );
                 return Ok(ConsensusOutput::default());
             }
-            Self::cap_infos_to_lowest_ranking(records, &mut r1_infos, max_reads);
-            Self::cap_infos_to_lowest_ranking(records, &mut r2_infos, max_reads);
+            // Count the reads the cap discards as Downsampled so `raw_reads_used` excludes
+            // them rather than over-counting the downsampled reads as used (fgumi#724). This
+            // mirrors how the codec caller already counts its other per-read rejections (e.g.
+            // MinorityAlignment above); routing them individually to the `--rejects` output
+            // waits on the codec's per-read reject-mask machinery (fgumi#751).
+            let downsampled = Self::cap_infos_to_lowest_ranking(records, &mut r1_infos, max_reads)
+                + Self::cap_infos_to_lowest_ranking(records, &mut r2_infos, max_reads);
+            if downsampled > 0 {
+                self.reject_records_count(downsampled, CallerRejectionReason::Downsampled);
+            }
         }
 
         // Phase 4: Overlap/phase calculation on ClippedRecordInfo
@@ -1085,20 +1093,24 @@ impl CodecConsensusCaller {
     /// Reduces `infos` in place to the `max_reads` lowest-ranking records, keeping input order.
     ///
     /// A no-op when the strand is already at or below the cap.
+    /// Caps `infos` to the `max_reads` lowest-ranking reads, returning the number discarded so
+    /// the caller can count them as `Downsampled` rejections (fgumi#724).
     fn cap_infos_to_lowest_ranking(
         records: &[RawRecord],
         infos: &mut Vec<ClippedRecordInfo>,
         max_reads: usize,
-    ) {
+    ) -> usize {
         if infos.len() <= max_reads {
-            return;
+            return 0;
         }
+        let dropped = infos.len() - max_reads;
         let keep = Self::keep_indices_for_infos(records, infos, max_reads);
         // Move the survivors out rather than cloning: a clipped CIGAR owns a heap buffer, and
         // families reaching here are by definition larger than the cap.
         let mut kept: Vec<ClippedRecordInfo> =
             keep.iter().map(|&i| std::mem::replace(&mut infos[i], Self::dummy_info())).collect();
         std::mem::swap(infos, &mut kept);
+        dropped
     }
 
     /// The raw-record indices behind both strands' reads, R1s first then R2s.
@@ -6246,6 +6258,55 @@ mod tests {
         assert_eq!(
             output.count, 1,
             "filtering before capping must keep the majority-alignment reads and emit a consensus"
+        );
+    }
+
+    /// fgumi#724: the reads the per-strand `--max-reads` cap discards must be counted as
+    /// `Downsampled`, so `raw_reads_used` (derived from `reads_filtered`) excludes them rather
+    /// than counting the downsampled reads as used. Six identical-alignment templates with a
+    /// cap of three discard three R1s and three R2s — six reads in all.
+    #[test]
+    fn codec_downsampled_reads_are_counted_as_rejected() {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            max_reads_per_strand: Some(3),
+            min_duplex_length: 1,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        // One family of six templates, all sharing the majority alignment, so the alignment
+        // filter keeps all six and the cap draws three from each strand's six.
+        let cigar: Vec<(Kind, usize)> = vec![(Kind::Match, 30)];
+        let mut reads: Vec<RawRecord> = Vec::new();
+        for i in 0..6 {
+            reads.extend(create_fr_pair(
+                &format!("q{i}"),
+                1,
+                11,
+                30,
+                35,
+                &cigar,
+                &cigar,
+                "mi",
+                Some("ACC-TGA"),
+                false,
+                true,
+            ));
+        }
+
+        let output =
+            caller.consensus_reads_from_sam_records(reads).expect("the survivors must consense");
+        assert_eq!(output.count, 1, "the capped survivors must still emit a consensus");
+
+        assert_eq!(
+            caller.statistics().rejection_reasons.get(&CallerRejectionReason::Downsampled),
+            Some(&6),
+            "three R1 and three R2 reads are discarded by the cap and must be counted"
+        );
+        assert!(
+            caller.statistics().reads_filtered >= 6,
+            "reads_filtered must include the downsampled reads so raw_reads_used excludes them"
         );
     }
 
