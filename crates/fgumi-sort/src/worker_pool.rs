@@ -773,13 +773,34 @@ pub(crate) const NO_AWAITED_SOURCE: usize = usize::MAX;
 /// | --- | --- | --- | --- |
 /// | (none: 4 blocks) | 4 | 326.5s | 54% |
 /// | 1 MiB | 101 | 212.4s | 83% |
-/// | **2 MiB** | 201 | **197.5s** | 89% |
-/// | 4 MiB | 402 | 194.5s | 90% |
+/// | 2 MiB | 201 | 197.5s | 89% |
+/// | **4 MiB** | 402 | **194.5s** | 90% |
 ///
-/// 2 MiB is the knee; 4 MiB buys 3s for twice the read-ahead. Peak RSS was flat
-/// across the whole sweep (4793-4828 MB against a 4794 MB baseline), because
-/// the deep allowance is scoped to one file and fewer stalls mean less
-/// transient buffering elsewhere.
+/// Peak RSS was flat across that sweep (4793-4828 MB against a 4794 MB
+/// baseline), because the deep allowance is scoped to one file and fewer stalls
+/// mean less transient buffering elsewhere.
+///
+/// Re-measured later with paired controls in one session, which moved the
+/// default here from 2 MiB to 4 MiB and bounded it from above:
+///
+/// | threads | 2 MiB | 4 MiB | 32 MiB |
+/// | --- | --- | --- | --- |
+/// | t8 (89 spill runs) | 199.1s (mean of 5) | **193.5 / 193.8s** | 199.3s, **RSS +58%** |
+/// | t16 (44 spill runs) | 178.9s | **169.6s** | not run |
+///
+/// So -2.8% at t8 and -5.2% at t16. **Do not raise it further.** At 32 MiB the
+/// merge is *slower* than at 4 MiB and peak RSS goes 4793 -> 7562 MB, because
+/// `raw-lock` contention climbs with batch depth (29% -> 52% -> 38% of
+/// awaited-file skips): more workers collide on one file's `raw_blocks` mutex.
+/// A wall-clock-only reading would have called that arm harmless.
+///
+/// It helps t16 *more* than t8, and the mechanism is worth knowing because it is
+/// not a scheduling improvement. Critical-path worker discovery lag halves
+/// (98.5s -> 59.8s) and the share of finds arriving after 320us drops 23% ->
+/// 16%: deeper read-ahead does not make recruiting a worker faster, it just
+/// needs fewer recruitments. So it pays most where each recruitment is most
+/// expensive, which is the regime with the *most* idle capacity. See
+/// [`SharedPipelineState::wake_one_worker`] for why recruitment is slow there.
 ///
 /// The floor read-ahead is working against is total worker busy / threads:
 /// ~1400 worker-seconds over 8 threads is ~175s, and an uncorrelated merge of
@@ -788,13 +809,13 @@ pub(crate) const NO_AWAITED_SOURCE: usize = usize::MAX;
 /// compression is 68% of the worker total -- or shortening the serial limits
 /// read-ahead does not touch: the merge consumer's per-record cost, and the
 /// per-block decompress chain on the file the merge is blocked on.
-pub(crate) const PHASE2_STARVING_READ_TARGET_BYTES: u64 = 2 << 20;
+pub(crate) const PHASE2_STARVING_READ_TARGET_BYTES: u64 = 4 << 20;
 
 /// [`PHASE2_STARVING_READ_TARGET_BYTES`] as a `usize`, for the byte budgets that
 /// bound the deep FIFO and a single deep read (both of which count `usize`
 /// bytes). The const assert keeps the two spellings in step, so the target has a
 /// single source of truth without an `as` cast the pedantic lints reject.
-pub(crate) const PHASE2_STARVING_READ_TARGET_BYTES_USIZE: usize = 2 << 20;
+pub(crate) const PHASE2_STARVING_READ_TARGET_BYTES_USIZE: usize = 4 << 20;
 const _: () =
     assert!(PHASE2_STARVING_READ_TARGET_BYTES_USIZE as u64 == PHASE2_STARVING_READ_TARGET_BYTES);
 
