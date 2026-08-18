@@ -1357,6 +1357,9 @@ pub(crate) struct MainThreadChunkConsumer<K: RawSortKey + 'static> {
     /// Shared pool state, for the epoch clock and the trace counters that
     /// record both halves of a producer/consumer handoff.
     shared: Arc<crate::worker_pool::SharedPipelineState>,
+    /// Decompression state, so this thread can serve itself a block that has been
+    /// read but not yet claimed instead of parking for a worker to do it.
+    decomp: crate::worker_pool::DecompressorSet,
     /// Source the previous block came from, and how many consecutive blocks
     /// have now come from it. Says whether the merge dwells on one run at a
     /// time -- in which case lookahead on that run would pay -- or hops.
@@ -1495,9 +1498,11 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
     ) -> Self {
         let parser_state = (0..files.len()).map(|_| SourceParserState::new()).collect();
         let stalls = crate::merge_stalls::ConsumerStallTracker::new(files.len());
+        let codec = files.first().map_or(crate::codec::SpillCodec::Bgzf, |f| f.codec);
         Self {
             files,
             parser_state,
+            decomp: crate::worker_pool::DecompressorSet::for_codec(codec),
             decompression_error,
             chunk_read_error,
             worker_panicked,
@@ -1786,6 +1791,32 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             // Sampled BEFORE the park, not after: the question is why nobody had
             // already started on this block, and the pool's state on *resume* is
             // the answer to a different question -- by then somebody has.
+            // Before sleeping: if the block this thread is waiting for has already
+            // been read and nobody has claimed it, decompress it here rather than
+            // parking. That trades ~53us of work for a ~190us wait on a worker
+            // that has to be woken first, and it removes the producer-to-consumer
+            // handoff instead of trying to schedule around it -- which is what
+            // eight scheduling interventions failed to do.
+            //
+            // Loops while it keeps succeeding: the same argument applies to the
+            // blocks after the one immediately needed, and serving them here is
+            // depth on exactly the file being drained, which is where >=94% of
+            // consumed blocks come from. Bounded by the FIFO running dry or the
+            // reorder cap, both of which `try_pop_raw_for_decompress` enforces, so
+            // this cannot spin.
+            //
+            // Only on the way into a park, never in place of merging: this thread
+            // is the serial bottleneck at 76s of a 166s merge, and taking work it
+            // could have delegated while it still has records to emit would be
+            // strictly worse.
+            if self.serve_self_instead_of_parking(source_id) {
+                // Self-service is not a park: leave `parked_yet` untouched so the
+                // first real park of this pull still records a `stalled_pull`.
+                // Serving before the first park would otherwise suppress that
+                // increment and understate the stall rate.
+                continue;
+            }
+
             let supply = self.shared.park_supply_now();
 
             let park_start = Instant::now();
@@ -1815,6 +1846,46 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             self.shared.park_attribution.record(segments, claim != 0, ready as u64);
             parked_yet = true;
         }
+    }
+
+    /// Decompress this source's already-read blocks on this thread, returning
+    /// whether anything was published.
+    ///
+    /// Called only on the way into a park. If the block the merge is waiting for
+    /// has been read and nobody has claimed it -- 12% of parks -- decompressing it
+    /// here trades ~53us of work for a ~190us wait on a worker that has to be
+    /// woken first. It removes the producer-to-consumer handoff instead of trying
+    /// to schedule around it, which is what eight scheduling interventions failed
+    /// to do. The decisive evidence: raising `PHASE2_DECOMP_CAP` 8 -> 128 cut parks
+    /// from 978,325 to 400,487 and left total park time at 89.6s against 89.7s, so
+    /// the cost is per block, not per park, and no amount of buffering reaches it.
+    ///
+    /// Loops while it keeps succeeding, because the same argument applies to the
+    /// blocks after the one immediately needed, and serving them here is depth on
+    /// exactly the file being drained -- where >=94% of consumed blocks come from
+    /// (median run is 1 block, but the mean is 31.7 and p99 is 512). It cannot
+    /// spin: each iteration either pops a block or stops, bounded by the FIFO
+    /// emptying or the reorder cap, both enforced inside
+    /// `try_pop_raw_for_decompress`.
+    ///
+    /// **Never in place of merging.** This thread is the serial bottleneck, 76s of
+    /// a 166s merge, so taking work it could have delegated while it still has
+    /// records to emit would be strictly worse. The only safe moment is the one
+    /// where it was about to sleep anyway.
+    fn serve_self_instead_of_parking(&mut self, source_id: usize) -> bool {
+        let mut served = false;
+        while crate::worker_pool::SortWorkerPool::consumer_decompress_one(
+            &self.shared,
+            &mut self.decomp,
+            &self.files[source_id],
+            source_id,
+        ) {
+            served = true;
+        }
+        if served {
+            self.shared.consumer_self_served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        served
     }
 
     /// Parse the next record from a source's byte stream.
@@ -4640,6 +4711,10 @@ impl RawExternalSorter {
         // never stalled is precisely the run with a complete lifecycle trace and
         // nothing to say above. `log_block_lifecycle` carries its own gate.
         Self::log_block_lifecycle(pool);
+
+        // Also outside the gate: these two counters say whether the targeted-depth
+        // paths ran at all, which matters most on the runs that did not stall.
+        Self::log_merge_validity_gates(pool);
     }
 
     /// Nanoseconds as seconds.
@@ -4655,6 +4730,31 @@ impl RawExternalSorter {
             return 0.0;
         }
         100.0 * part as f64 / whole as f64
+    }
+
+    /// Validity gates for the merge's targeted-depth paths.
+    ///
+    /// This one is inert in a way wall clock cannot reveal: if the consumer never
+    /// finds an unclaimed block to decompress, the change does nothing and the run
+    /// still reports a plausible time. So it gets a counter, and the counter is
+    /// printed. Later targeted-depth paths join it here.
+    fn log_merge_validity_gates(pool: &SortWorkerPool) {
+        let self_served = pool.consumer_self_served();
+        if self_served > 0 {
+            info!(
+                "  Consumer served itself: {self_served} parks avoided by decompressing an \
+                 already-read block inline"
+            );
+        }
+    }
+
+    /// `total` divided over `claims`, or 0.0 when there are none.
+    #[expect(clippy::cast_precision_loss, reason = "counts stay far below 2^52")]
+    fn per_claim(total: u64, claims: u64) -> f64 {
+        if claims == 0 {
+            return 0.0;
+        }
+        total as f64 / claims as f64
     }
 
     /// Log a latency distribution for every stage a block passes through.

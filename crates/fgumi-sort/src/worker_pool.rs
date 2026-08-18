@@ -1504,6 +1504,11 @@ pub(crate) struct SharedPipelineState {
     /// park: a sleeper was available, everyone was busy compressing, or everyone
     /// was busy merging. See [`crate::merge_stalls::ParkSupply`].
     pub(crate) park_supply: crate::merge_stalls::ParkSupplyCensus,
+    /// Parks avoided because the consumer decompressed the block itself.
+    ///
+    /// The validity gate for that path: if this stays near zero the consumer never
+    /// found an unclaimed block and the change is inert, whatever the clock says.
+    pub(crate) consumer_self_served: AtomicU64,
 
     /// Read batches taken at the deep frontier allowance, and the blocks they
     /// returned; and the same for batches taken at the uniform allowance.
@@ -1589,6 +1594,7 @@ impl SharedPipelineState {
             wakes_on_running_worker: AtomicU64::new(0),
             wakes_recoverable: AtomicU64::new(0),
             park_supply: crate::merge_stalls::ParkSupplyCensus::default(),
+            consumer_self_served: AtomicU64::new(0),
             deep_read_batches: AtomicU64::new(0),
             deep_read_blocks: AtomicU64::new(0),
             shallow_read_batches: AtomicU64::new(0),
@@ -1748,6 +1754,39 @@ impl SharedPipelineState {
     }
 }
 
+/// The decompression state one thread needs to turn a spill block into records.
+///
+/// Extracted from [`SortWorkerState`] so the merge consumer can run
+/// [`SortWorkerPool::decompress_and_publish`] itself instead of parking. A second
+/// copy of the codec branch would be the alternative, and a spill format that
+/// disagreed between the two paths is exactly the class of bug that passes the
+/// standard matrix and fails where spill volume is largest.
+pub(crate) struct DecompressorSet {
+    zstd: ZstdDecompressor<'static>,
+    /// Scratch for one zstd frame, sized by [`zstd_decomp_cap`]. Allocated lazily:
+    /// a BGZF-only sort must not pay for it.
+    zstd_buf: Vec<u8>,
+    bgzf: libdeflater::Decompressor,
+}
+
+impl DecompressorSet {
+    /// Sized for `codec`: the zstd scratch is pre-allocated only for zstd spills,
+    /// so a BGZF-only sort does not carry `zstd_decomp_cap()` per thread. The
+    /// decompress path still resizes on demand, so this is an optimization rather
+    /// than a precondition.
+    pub(crate) fn for_codec(codec: SpillCodec) -> Self {
+        let zstd_buf = match codec {
+            SpillCodec::Zstd => vec![0u8; zstd_decomp_cap()],
+            SpillCodec::Bgzf => Vec::new(),
+        };
+        Self {
+            zstd: ZstdDecompressor::new().expect("zstd decompressor init"),
+            zstd_buf,
+            bgzf: libdeflater::Decompressor::new(),
+        }
+    }
+}
+
 /// Per-worker mutable state — no sharing, no locks.
 ///
 /// Every step output has a held-item slot. If an `ArrayQueue::push()` fails
@@ -1763,12 +1802,8 @@ struct SortWorkerState {
     output_compressor: InlineBgzfCompressor,
     /// Zstd compressor reused across spill frames when `SpillCodec::Zstd`.
     zstd_compressor: ZstdCompressor<'static>,
-    /// Zstd decompressor reused across Phase 2 frames when `SpillCodec::Zstd`.
-    zstd_decompressor: ZstdDecompressor<'static>,
-    /// Scratch buffer reused across zstd frame decompressions to avoid
-    /// allocating a fresh Vec for every frame on the merge hot path.
-    zstd_decompress_buf: Vec<u8>,
-    decompressor: libdeflater::Decompressor,
+    /// Decompression state, shared in shape with the merge consumer.
+    decomp: DecompressorSet,
     /// Phase 2 file scan cursor — starts at `worker_id` and advances on success
     /// for cache locality and reduced lock contention. Workers no longer own a
     /// fixed subset of files; any worker can do work on any file.
@@ -2147,20 +2182,13 @@ impl SortWorkerPool {
                 thread::spawn(move || {
                     let zstd_level =
                         i32::try_from(temp_compression.clamp(1, ZSTD_MAX_CLEVEL)).expect("clamped");
-                    let zstd_decompress_buf = if matches!(spill_codec, SpillCodec::Zstd) {
-                        vec![0u8; zstd_decomp_cap()]
-                    } else {
-                        Vec::new()
-                    };
                     let mut worker = SortWorkerState {
                         worker_id,
                         compressor: InlineBgzfCompressor::new(temp_compression),
                         output_compressor: InlineBgzfCompressor::new(output_compression),
                         zstd_compressor: ZstdCompressor::new(zstd_level)
                             .expect("zstd compressor init"),
-                        zstd_decompressor: ZstdDecompressor::new().expect("zstd decompressor init"),
-                        zstd_decompress_buf,
-                        decompressor: libdeflater::Decompressor::new(),
+                        decomp: DecompressorSet::for_codec(spill_codec),
                         phase2_file_cursor: worker_id,
                         held_raw_input_blocks: Vec::new(),
                         held_decompressed_input: None,
@@ -2643,7 +2671,7 @@ impl SortWorkerPool {
             return StepResult::InputEmpty;
         };
 
-        let data = match decompress_block(&block, &mut worker.decompressor) {
+        let data = match decompress_block(&block, &mut worker.decomp.bgzf) {
             Ok(d) => d,
             Err(e) => {
                 log::error!("BGZF decompression error (input block serial {serial}): {e}");
@@ -2790,7 +2818,13 @@ impl SortWorkerPool {
                         worker.won_awaited_claim = Self::stamp_awaited_claim(shared);
                     }
                     Self::note_claim(shared, file, &entry);
-                    return Self::decompress_and_publish(shared, worker, file, i, entry);
+                    return Self::decompress_and_publish(
+                        shared,
+                        &mut worker.decomp,
+                        file,
+                        i,
+                        entry,
+                    );
                 }
             };
 
@@ -3071,7 +3105,7 @@ impl SortWorkerPool {
     /// responsible for releasing.
     fn decompress_and_publish(
         shared: &SharedPipelineState,
-        worker: &mut SortWorkerState,
+        decomp: &mut DecompressorSet,
         file: &Phase2FileState,
         source_idx: usize,
         entry: RawEntry,
@@ -3084,7 +3118,7 @@ impl SortWorkerPool {
                     shared
                         .merge_phases
                         .decompress
-                        .time(|| decompress_block(&raw_block, &mut worker.decompressor))
+                        .time(|| decompress_block(&raw_block, &mut decomp.bgzf))
                 }) {
                     Ok(d) => d,
                     Err(e) => {
@@ -3101,22 +3135,21 @@ impl SortWorkerPool {
             SpillCodec::Zstd => {
                 // Allocate the scratch buffer lazily so BGZF-only sorts don't
                 // pay 256 KiB × num_workers of dead memory.
-                if worker.zstd_decompress_buf.len() < zstd_decomp_cap() {
-                    worker.zstd_decompress_buf.resize(zstd_decomp_cap(), 0);
+                if decomp.zstd_buf.len() < zstd_decomp_cap() {
+                    decomp.zstd_buf.resize(zstd_decomp_cap(), 0);
                 }
                 match shared.stage_latency.decompress.time(|| {
-                    shared.merge_phases.decompress.time(|| {
-                        worker
-                            .zstd_decompressor
-                            .decompress_to_buffer(&raw_bytes, &mut worker.zstd_decompress_buf)
-                    })
+                    shared
+                        .merge_phases
+                        .decompress
+                        .time(|| decomp.zstd.decompress_to_buffer(&raw_bytes, &mut decomp.zstd_buf))
                 }) {
                     // Copy the `n` decompressed bytes (≤ one staging-buffer's
                     // worth, typically ~65 KB) into a fresh Vec for the
                     // consumer. The scratch buffer keeps its 256 KiB capacity so
                     // the next frame on this worker reuses it without
                     // reallocating.
-                    Ok(n) => worker.zstd_decompress_buf[..n].to_vec(),
+                    Ok(n) => decomp.zstd_buf[..n].to_vec(),
                     Err(e) => {
                         log::error!(
                             "zstd decompression error (chunk source {source_idx} serial {serial}): {e}"
@@ -3419,6 +3452,48 @@ impl SortWorkerPool {
     /// Consumer parks split by what the pool looked like when the park began.
     pub(crate) fn park_supply_report(&self) -> crate::merge_stalls::ParkSupplyReport {
         self.shared.park_supply.snapshot()
+    }
+
+    /// Decompress one already-read block for `source_idx` on the calling thread,
+    /// returning whether it published anything.
+    ///
+    /// For the merge consumer to call instead of parking. The block it needs is
+    /// sitting in the raw FIFO, read but unclaimed, in 12% of parks -- and parking
+    /// there trades ~53us of work for a ~190us wait on a worker that has to be
+    /// woken first.
+    ///
+    /// The deeper reason is that the consumer's exposed latency is **per block,
+    /// not per park**: raising `PHASE2_DECOMP_CAP` from 8 to 128 cut parks from
+    /// 978,325 to 400,487 and left total park time at 89.6s against 89.7s, while
+    /// wall clock got monotonically worse. A cost that survives a 16x change in
+    /// buffer depth is not a buffering problem and not a signalling one -- eight
+    /// scheduling interventions moved their own metrics and left the clock alone.
+    /// What is left is the producer-to-consumer handoff itself, and the only way
+    /// to remove a handoff is for one thread to do both halves.
+    ///
+    /// Goes through the same [`Self::try_pop_raw_for_decompress`] and
+    /// [`Self::decompress_and_publish`] as a worker, so the in-flight counter and
+    /// the reorder-buffer protocol cannot drift between the two paths. Publishing
+    /// rather than consuming the block directly is deliberate: the consumer then
+    /// picks it up through its ordinary path, and nothing about serial ordering
+    /// gets a second implementation.
+    ///
+    /// Safe to call while parked-pending: the consumer holds no locks, so it
+    /// cannot participate in a cycle with a worker.
+    pub(crate) fn consumer_decompress_one(
+        shared: &SharedPipelineState,
+        decomp: &mut DecompressorSet,
+        file: &Phase2FileState,
+        source_idx: usize,
+    ) -> bool {
+        let Ok(entry) = Self::try_pop_raw_for_decompress(file) else { return false };
+        let _ = Self::decompress_and_publish(shared, decomp, file, source_idx, entry);
+        true
+    }
+
+    /// Parks the consumer avoided by decompressing a block itself.
+    pub(crate) fn consumer_self_served(&self) -> u64 {
+        self.shared.consumer_self_served.load(Ordering::Relaxed)
     }
 
     /// Where the consumer's wakes landed.
