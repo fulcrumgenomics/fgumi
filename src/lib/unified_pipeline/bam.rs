@@ -1036,15 +1036,25 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
     /// stalls.
     #[must_use]
     pub fn queue_bytes_in_flight(&self) -> u64 {
-        self.q1_heap_bytes.load(Ordering::Acquire)
-            + self.q2_reorder_state.get_heap_bytes()
-            + self.q2b_heap_bytes.load(Ordering::Acquire)
-            + self.q3_reorder_state.get_heap_bytes()
-            + self.output.groups_heap_bytes.load(Ordering::Acquire)
-            + self.output.processed_heap_bytes.load(Ordering::Acquire)
-            + self.output.serialized_heap_bytes.load(Ordering::Acquire)
-            + self.output.compressed_heap_bytes.load(Ordering::Acquire)
-            + self.output.write_reorder_state.get_heap_bytes()
+        // Saturating sum: every debit that feeds these counters now floors at
+        // zero, but the nine loads are not one atomic snapshot, so an in-flight
+        // debit/credit interleaving could still transiently read a counter high.
+        // Fold with `saturating_add` so the aggregate can never overflow the
+        // checked `+` in a debug/coverage build even under that interleaving —
+        // the gate is conservative for an instant rather than panicking.
+        [
+            self.q1_heap_bytes.load(Ordering::Acquire),
+            self.q2_reorder_state.get_heap_bytes(),
+            self.q2b_heap_bytes.load(Ordering::Acquire),
+            self.q3_reorder_state.get_heap_bytes(),
+            self.output.groups_heap_bytes.load(Ordering::Acquire),
+            self.output.processed_heap_bytes.load(Ordering::Acquire),
+            self.output.serialized_heap_bytes.load(Ordering::Acquire),
+            self.output.compressed_heap_bytes.load(Ordering::Acquire),
+            self.output.write_reorder_state.get_heap_bytes(),
+        ]
+        .into_iter()
+        .fold(0u64, u64::saturating_add)
     }
 
     /// Whether the Read step may admit another batch under the queue memory
@@ -1378,7 +1388,10 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipelineState
     }
 
     fn q5_track_pop(&self, heap_size: u64) {
-        self.output.serialized_heap_bytes.fetch_sub(heap_size, Ordering::AcqRel);
+        // Saturating (via `refund_queue_bytes`): this counter is summed into the
+        // overflow-checked `queue_bytes_in_flight`, so an under-subtraction must
+        // floor at zero rather than wrap to `u64::MAX`.
+        refund_queue_bytes(&self.output.serialized_heap_bytes, heap_size);
     }
 
     fn q6_pop(&self) -> Option<(u64, CompressedBlockBatch)> {
@@ -1390,9 +1403,14 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipelineState
         item: (u64, CompressedBlockBatch),
     ) -> Result<(), (u64, CompressedBlockBatch)> {
         let heap_size = item.1.estimate_heap_size();
+        // Charge *before* publishing: once the batch is visible a consumer can
+        // pop and refund it, so a charge recorded after the push can land after
+        // that refund and strand a phantom nonzero counter (see `q6_track_pop`).
+        // Refund if the push fails, since nothing was published.
+        self.output.compressed_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
         let result = self.output.compressed.push(item);
-        if result.is_ok() {
-            self.output.compressed_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
+        if result.is_err() {
+            refund_queue_bytes(&self.output.compressed_heap_bytes, heap_size as u64);
         }
         result
     }
@@ -1402,7 +1420,12 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipelineState
     }
 
     fn q6_track_pop(&self, heap_size: u64) {
-        self.output.compressed_heap_bytes.fetch_sub(heap_size, Ordering::AcqRel);
+        // Saturating (via `refund_queue_bytes`): this counter is summed into the
+        // overflow-checked `queue_bytes_in_flight`, so an under-subtraction must
+        // floor at zero rather than wrap to `u64::MAX`. `q6_push` now charges
+        // before publishing, closing the pop-before-charge race; the floor
+        // stays as defense in depth against any residual accounting skew.
+        refund_queue_bytes(&self.output.compressed_heap_bytes, heap_size);
     }
 
     fn q6_reorder_insert(&self, serial: u64, batch: CompressedBlockBatch) {
@@ -1505,9 +1528,13 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> SerializePipelineSta
     fn serialize_input_pop(&self) -> Option<(u64, Vec<P>)> {
         let result = self.output.processed.pop();
         if let Some((_, ref batch)) = result {
-            // Track memory being removed from processed queue
-            let heap_size: usize = batch.iter().map(MemoryEstimate::estimate_heap_size).sum();
-            self.output.processed_heap_bytes.fetch_sub(heap_size as u64, Ordering::AcqRel);
+            // Track memory being removed from processed queue. Saturating, like
+            // every other debit summed into `queue_bytes_in_flight`: a raw
+            // `fetch_sub` past zero wraps to `u64::MAX` and slams the `Read` gate
+            // shut (or panics the overflow-checked sum in debug/coverage).
+            let heap_size: u64 =
+                batch.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>() as u64;
+            refund_queue_bytes(&self.output.processed_heap_bytes, heap_size);
             self.deadlock_state.record_q5_pop();
         }
         result
@@ -1522,10 +1549,14 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> SerializePipelineSta
         item: (u64, SerializedBatch),
     ) -> Result<(), (u64, SerializedBatch)> {
         let heap_size = item.1.estimate_heap_size();
+        // Charge before publishing so a consumer cannot pop and refund the batch
+        // before the charge lands; refund on a failed push (see `q6_push`).
+        self.output.serialized_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
         let result = self.output.serialized.push(item);
         if result.is_ok() {
-            self.output.serialized_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
             self.deadlock_state.record_q6_push();
+        } else {
+            refund_queue_bytes(&self.output.serialized_heap_bytes, heap_size as u64);
         }
         result
     }
@@ -3107,7 +3138,8 @@ fn try_pop_mi_assigned<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
             MiAssignPopOutcome::Stalled
         };
     };
-    state.output.processed_heap_bytes.fetch_sub(heap_size as u64, Ordering::AcqRel);
+    // Saturating, like every other debit summed into `queue_bytes_in_flight`.
+    refund_queue_bytes(&state.output.processed_heap_bytes, heap_size as u64);
 
     // Run the hook on every item in the popped batch, in order. We hold the
     // reorder mutex for the whole loop so that two workers cannot interleave
@@ -3144,14 +3176,17 @@ fn try_step_serialize<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
     // Priority 1: Try to advance any held serialized batch first
     // =========================================================================
     if let Some((serial, held, heap_size)) = worker.held_serialized.take() {
+        // Charge before publishing so a consumer cannot pop and refund the batch
+        // before the charge lands; refund on a failed push (see `q6_push`).
+        state.output.serialized_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
         match state.output.serialized.push((serial, held)) {
             Ok(()) => {
                 // Successfully advanced held item
-                state.output.serialized_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
                 state.deadlock_state.record_q6_push();
             }
             Err((serial, held)) => {
-                // Still can't push - put it back and signal output full
+                // Still can't push - refund the charge, put it back, signal output full
+                refund_queue_bytes(&state.output.serialized_heap_bytes, heap_size as u64);
                 worker.held_serialized = Some((serial, held, heap_size));
                 return false;
             }
@@ -3210,8 +3245,10 @@ fn try_step_serialize<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
         // Track memory being removed from Q5 (only when we go straight from
         // Q5 to Serialize; the MI Assign path subtracts after the reorder
         // buffer hands the batch off to serialize).
-        let q5_heap_size: usize = item.1.iter().map(MemoryEstimate::estimate_heap_size).sum();
-        state.output.processed_heap_bytes.fetch_sub(q5_heap_size as u64, Ordering::AcqRel);
+        // Saturating, like every other debit summed into `queue_bytes_in_flight`.
+        let q5_heap_size: u64 =
+            item.1.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>() as u64;
+        refund_queue_bytes(&state.output.processed_heap_bytes, q5_heap_size);
         item
     };
 
@@ -3271,14 +3308,17 @@ fn try_step_serialize<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
     let batch =
         SerializedBatch { data: combined_data, record_count: total_record_count, secondary_data };
     let heap_size = batch.estimate_heap_size();
+    // Charge before publishing so a consumer cannot pop and refund the batch
+    // before the charge lands; refund on a failed push (see `q6_push`).
+    state.output.serialized_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
     match state.output.serialized.push((serial, batch)) {
         Ok(()) => {
-            state.output.serialized_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
             state.deadlock_state.record_q6_push();
             true
         }
         Err((serial, batch)) => {
-            // Output full - hold the result for next attempt
+            // Output full - refund the charge and hold the result for next attempt
+            refund_queue_bytes(&state.output.serialized_heap_bytes, heap_size as u64);
             worker.held_serialized = Some((serial, batch, heap_size));
             false
         }
@@ -4767,6 +4807,119 @@ mod tests {
         let (serial, _batch) = state.q2b_pop().expect("pushed batch should pop");
         assert_eq!(serial, 7);
         assert_eq!(state.q2b_heap_bytes.load(Ordering::Acquire), 0);
+    }
+
+    /// Q5 (serialized) charges its byte counter *before* publishing and refunds
+    /// it on pop. Regression for #810: charging after publication let a
+    /// consumer's refund race ahead of the producer's charge and strand a
+    /// phantom nonzero counter that keeps the `Read` gate shut.
+    #[test]
+    fn serialize_output_push_charges_before_publish_and_refunds_on_pop() {
+        let state = create_test_state(0);
+        let batch =
+            SerializedBatch { data: vec![0u8; 4096], record_count: 0, secondary_data: None };
+        let charge = batch.estimate_heap_size() as u64;
+        assert!(charge >= 4096, "a 4 KiB payload must be charged as at least 4 KiB");
+
+        assert!(state.serialize_output_push((3, batch)).is_ok());
+        assert_eq!(state.output.serialized_heap_bytes.load(Ordering::Acquire), charge);
+
+        let (serial, _batch) = state.q5_pop().expect("pushed batch should pop");
+        assert_eq!(serial, 3);
+        state.q5_track_pop(charge);
+        assert_eq!(state.output.serialized_heap_bytes.load(Ordering::Acquire), 0);
+    }
+
+    /// Q6 (compressed) charges before publishing and refunds a push the queue
+    /// rejects, so a full-queue rejection leaves no phantom charge behind — the
+    /// same #810 ordering fix as the serialized queue.
+    #[test]
+    fn q6_push_charges_on_publish_and_refunds_a_rejected_push() {
+        let state = create_test_state(0);
+        let make = || CompressedBlockBatch {
+            blocks: vec![],
+            record_count: 0,
+            secondary_data: Some(vec![0u8; 4096]),
+        };
+        let charge = make().estimate_heap_size() as u64;
+        assert!(charge >= 4096, "a 4 KiB secondary payload must be charged as at least 4 KiB");
+
+        // Fill the bounded output queue until a push is rejected.
+        let mut accepted = 0u64;
+        while state.q6_push((accepted, make())).is_ok() {
+            accepted += 1;
+            assert!(accepted < 100_000, "the bounded queue should fill well before this");
+        }
+        assert!(accepted > 0, "at least one push must be accepted");
+
+        // The rejected push refunded its charge, so the counter reflects exactly
+        // the accepted batches — not the one that bounced off a full queue.
+        assert_eq!(
+            state.output.compressed_heap_bytes.load(Ordering::Acquire),
+            accepted * charge,
+            "a rejected push must refund its own charge"
+        );
+
+        // Draining through the track-pop refund path returns the counter to zero.
+        while state.q6_pop().is_some() {
+            state.q6_track_pop(charge);
+        }
+        assert_eq!(state.output.compressed_heap_bytes.load(Ordering::Acquire), 0);
+    }
+
+    /// `serialize_input_pop` pops the processed (Q5-input) queue and returns its
+    /// charge through the saturating `refund_queue_bytes` path (#810). The test
+    /// state's processed payload is `Vec<()>`, whose heap charge is zero, so this
+    /// pins the pop + refund *path* (the debit runs, saturating, and the popped
+    /// batch is returned intact) rather than a nonzero byte amount.
+    #[test]
+    fn serialize_input_pop_refunds_the_processed_queue_charge() {
+        let state = create_test_state(0);
+        assert!(
+            state.process_output_push((7, vec![(), (), ()])).is_ok(),
+            "the empty processed queue must accept a push"
+        );
+
+        let (serial, batch) = state.serialize_input_pop().expect("pushed batch must pop");
+        assert_eq!(serial, 7);
+        assert_eq!(batch.len(), 3, "the popped batch must be returned intact");
+        assert_eq!(
+            state.output.processed_heap_bytes.load(Ordering::Acquire),
+            0,
+            "serialize_input_pop must leave the processed-queue counter floored at zero"
+        );
+
+        // Popping the now-empty queue is a no-op that touches no counter.
+        assert!(state.serialize_input_pop().is_none());
+    }
+
+    /// `serialize_output_push` charges before publishing and refunds a push the
+    /// bounded serialized queue rejects, so a full-queue rejection strands no
+    /// phantom charge — the Q6 ordering fix (#810) applied to the serialized
+    /// queue's rejected-push branch.
+    #[test]
+    fn serialize_output_push_refunds_a_rejected_push() {
+        let state = create_test_state(0);
+        let make =
+            || SerializedBatch { data: vec![0u8; 4096], record_count: 0, secondary_data: None };
+        let charge = make().estimate_heap_size() as u64;
+        assert!(charge >= 4096, "a 4 KiB payload must be charged as at least 4 KiB");
+
+        // Fill the bounded serialized queue until a push is rejected.
+        let mut accepted = 0u64;
+        while state.serialize_output_push((accepted, make())).is_ok() {
+            accepted += 1;
+            assert!(accepted < 100_000, "the bounded queue should fill well before this");
+        }
+        assert!(accepted > 0, "at least one push must be accepted");
+
+        // The rejected push refunded its own charge, so the counter reflects
+        // exactly the accepted batches — not the one that bounced off a full queue.
+        assert_eq!(
+            state.output.serialized_heap_bytes.load(Ordering::Acquire),
+            accepted * charge,
+            "a rejected serialized push must refund its own charge"
+        );
     }
 
     /// `queue_bytes_in_flight` must include every accounted counter — not just
