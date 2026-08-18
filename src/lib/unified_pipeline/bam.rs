@@ -966,6 +966,36 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
         Some((serial, batch))
     }
 
+    /// Decide whether a boundary batch just popped from Q2b should be decoded
+    /// now or handed back to Q2b under per-serial memory backpressure (fgumi#746).
+    ///
+    /// The Q3 reorder buffer's own [`ReorderBufferState::can_proceed`] always
+    /// admits the serial Group needs next (the gap-filler), even when memory is
+    /// high, and backpressures only *future* serials once the buffer is half
+    /// full. Returns:
+    ///
+    /// - `Some((serial, batch))` — decode it now: either it is the gap-filler,
+    ///   or it is a future batch whose requeue lost the race to a full Q2b (a
+    ///   rare, bounded overshoot — never a lost or reordered-into-loss batch,
+    ///   since Q3 reassembles by serial).
+    /// - `None` — the batch was requeued to Q2b so another worker can still
+    ///   reach the gap-filler, avoiding the "all workers hold a non-`next_seq`
+    ///   batch and nobody can produce `next_seq`" deadlock.
+    fn admit_or_requeue_decode(
+        &self,
+        serial: u64,
+        batch: BoundaryBatch,
+    ) -> Option<(u64, BoundaryBatch)> {
+        if self.q3_reorder_state.can_proceed(serial) {
+            return Some((serial, batch));
+        }
+        // On requeue-success (`Ok`) return `None` so the caller advances no work;
+        // on requeue-failure the batch is handed back to be decoded directly
+        // (bounded overshoot). `Result::err` maps exactly that: `Ok` -> `None`,
+        // `Err(returned)` -> `Some(returned)`.
+        self.q2b_push(serial, batch).err()
+    }
+
     /// Push a raw block batch onto Q1, charging its heap bytes on success.
     ///
     /// Mirrors [`Self::q2b_push`]: the charge precedes the push (see that method
@@ -2514,11 +2544,14 @@ fn try_step_decode<G: Send, P: Send + MemoryEstimate>(
     }
 
     // =========================================================================
-    // Priority 2: Check backpressure (physical capacity AND memory)
+    // Priority 2: Check physical-capacity backpressure
     // =========================================================================
-    // Memory check gates new work when the Q3 reorder buffer is large.
-    // Same deadlock-safe pattern as Decompress P2 — see comment there.
-    if state.q3_decoded.is_full() || state.q3_reorder_state.is_memory_high() {
+    // Only the output queue being physically full blocks new work here. Memory
+    // backpressure is applied *per serial* after the pop (below), because a
+    // blanket `is_memory_high()` guard at this point is not deadlock-safe for
+    // Decode the way it is for Decompress: it can stall the very serial the Q3
+    // reorder buffer needs next, starving Group (fgumi#746).
+    if state.q3_decoded.is_full() {
         return advanced_held;
     }
 
@@ -2536,6 +2569,18 @@ fn try_step_decode<G: Send, P: Send + MemoryEstimate>(
                 stats.record_queue_empty(2);
             }
         }
+        return advanced_held;
+    };
+
+    // Per-serial memory backpressure (fgumi#746). A blanket `is_memory_high()`
+    // guard before the pop instead stalled the gap-filler: when a slow writer
+    // backed the pipeline up, Decode declined to decode the very serial the Q3
+    // reorder buffer was waiting on, so it never released to Group and the
+    // pipeline wedged. `admit_or_requeue_decode` applies the buffer's own
+    // per-serial `can_proceed` after the pop instead — see it for the requeue
+    // and bounded-overshoot semantics.
+    let Some((serial, boundary_batch)) = state.admit_or_requeue_decode(serial, boundary_batch)
+    else {
         return advanced_held;
     };
     state.deadlock_state.record_q2b_pop();
@@ -4819,6 +4864,78 @@ mod tests {
             state.q2b_heap_bytes.load(Ordering::Acquire),
             0,
             "a rejected push must leave the Q2b counter unchanged"
+        );
+    }
+
+    /// The gap-filler serial (`serial == next_seq`) is admitted for decoding
+    /// even when the Q3 reorder buffer is over its memory limit — otherwise the
+    /// very serial Group is waiting on would be requeued and the pipeline would
+    /// wedge (fgumi#746).
+    #[test]
+    fn admit_or_requeue_decode_admits_the_gap_filler_even_over_the_limit() {
+        let state = create_test_state(1024);
+        // next_seq = 0 and heap well over the 50% (512-byte) backpressure mark,
+        // so `can_proceed` would reject any *future* serial here.
+        state.q3_reorder_state.next_seq.store(0, Ordering::SeqCst);
+        state.q3_reorder_state.heap_bytes.store(800, Ordering::SeqCst);
+
+        let batch = BoundaryBatch { buffer: vec![0u8; 4096], offsets: vec![0, 4096] };
+        let admitted = state.admit_or_requeue_decode(0, batch);
+        let Some((serial, returned)) = admitted else {
+            panic!("the gap-filler serial must be admitted for decoding");
+        };
+        assert_eq!(serial, 0, "the gap-filler serial is returned for decoding");
+        assert_eq!(returned.buffer.len(), 4096, "the gap-filler batch is returned unchanged");
+        assert!(state.q2b_boundaries.is_empty(), "the gap-filler is not requeued to Q2b");
+    }
+
+    /// A future serial over the backpressure mark is requeued to Q2b (not
+    /// decoded) so another worker can still reach the gap-filler.
+    #[test]
+    fn admit_or_requeue_decode_requeues_a_future_serial_under_pressure() {
+        let state = create_test_state(1024);
+        state.q3_reorder_state.next_seq.store(0, Ordering::SeqCst);
+        state.q3_reorder_state.heap_bytes.store(800, Ordering::SeqCst);
+
+        let batch = BoundaryBatch { buffer: vec![0u8; 4096], offsets: vec![0, 4096] };
+        assert!(
+            state.admit_or_requeue_decode(50, batch).is_none(),
+            "a future serial under memory pressure is requeued, not decoded"
+        );
+        assert_eq!(state.q2b_boundaries.len(), 1, "the future serial is handed back to Q2b");
+        let (serial, _) = state.q2b_pop().expect("the requeued batch should pop");
+        assert_eq!(serial, 50, "the requeued serial is preserved");
+    }
+
+    /// When a future serial cannot be requeued because Q2b is full, it is
+    /// decoded directly — the bounded-overshoot path. This is safe because Q3
+    /// reassembles by serial, so the batch is never lost or reordered.
+    #[test]
+    fn admit_or_requeue_decode_decodes_directly_when_q2b_is_full() {
+        let state = create_test_state(1024);
+        state.q3_reorder_state.next_seq.store(0, Ordering::SeqCst);
+        state.q3_reorder_state.heap_bytes.store(800, Ordering::SeqCst);
+
+        // Fill Q2b to capacity so the requeue push must fail.
+        let cap = state.q2b_boundaries.capacity();
+        for filler in 0..cap as u64 {
+            let batch = BoundaryBatch { buffer: Vec::new(), offsets: vec![0] };
+            assert!(state.q2b_boundaries.push((filler, batch)).is_ok());
+        }
+        assert!(state.q2b_boundaries.is_full());
+        let charged_before = state.q2b_heap_bytes.load(Ordering::Acquire);
+
+        let batch = BoundaryBatch { buffer: vec![0u8; 4096], offsets: vec![0, 4096] };
+        let admitted = state.admit_or_requeue_decode(50, batch);
+        let Some((serial, returned)) = admitted else {
+            panic!("a future serial that cannot be requeued must be decoded directly");
+        };
+        assert_eq!(serial, 50, "the overshoot serial is returned for decoding");
+        assert_eq!(returned.buffer.len(), 4096, "the overshoot batch is returned unchanged");
+        assert_eq!(
+            state.q2b_heap_bytes.load(Ordering::Acquire),
+            charged_before,
+            "the failed requeue refunds its charge, leaving the Q2b counter unchanged"
         );
     }
 

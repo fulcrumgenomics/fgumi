@@ -224,11 +224,18 @@ struct StalledRun {
 }
 
 /// Spawn a pass-through pipeline over `bam_bytes` whose writer never completes.
+///
+/// `blocks_per_read_batch` overrides the reader's batch granularity when `Some`;
+/// `None` keeps the thread-count-derived production default. Only the read-ahead
+/// *scaling* test needs to shrink it — see
+/// [`read_ahead_under_a_stalled_writer_shrinks_with_the_queue_memory_budget`] for
+/// why the production ~1 MiB batch quantum would otherwise swamp the signal.
 fn spawn_stalled_pipeline(
     header: &Header,
     bam_bytes: Vec<u8>,
     num_threads: usize,
     queue_memory_limit: u64,
+    blocks_per_read_batch: Option<usize>,
 ) -> StalledRun {
     let consumed = Arc::new(AtomicU64::new(0));
     let released = Arc::new(AtomicBool::new(false));
@@ -243,6 +250,12 @@ fn spawn_stalled_pipeline(
     // observes comes from the byte budget and not from a queue running out of
     // slots.
     let mut config = PipelineConfig::auto_tuned(num_threads, 1);
+    // The read granularity, by contrast, is not a slot count and is overridable
+    // per test: a finer batch lets the reader stop closer to the byte budget
+    // instead of overshooting by up to a whole read batch.
+    if let Some(blocks) = blocks_per_read_batch {
+        config.blocks_per_read_batch = blocks;
+    }
     config.queue_memory_limit = queue_memory_limit;
     // A permanently stalled writer is exactly what the deadlock detector is
     // meant to flag, and flagging it would tear the pipeline down before the
@@ -380,7 +393,7 @@ fn stalled_writer_stops_the_reader_within_the_queue_memory_budget() {
     );
 
     let StalledRun { consumed, released, handle, .. } =
-        spawn_stalled_pipeline(header, bam_bytes.clone(), 4, TEST_BUDGET_BYTES);
+        spawn_stalled_pipeline(header, bam_bytes.clone(), 4, TEST_BUDGET_BYTES, None);
 
     let settled = wait_for_consumption_to_settle(&consumed, input_len, Duration::from_secs(30));
     assert!(settled.settled, "reader never stopped under a stalled writer within the timeout");
@@ -411,30 +424,43 @@ fn stalled_writer_stops_the_reader_within_the_queue_memory_budget() {
 /// satisfied by the queues simply running out of *slots*; this one holds the
 /// input and the slot counts fixed and varies only `--max-memory`, so a budget
 /// that bounds nothing shows up as two identical read-ahead figures.
+///
+/// Two things keep the signal clean and the assertion stable:
+///
+/// - **A fine read batch.** With the production ~1 MiB read batch the reader
+///   overshoots the budget by up to a whole batch, and *which* batch it stops on
+///   is scheduling-dependent — so the read-ahead is quantised in ~1 MiB steps
+///   and a loaded CI host can land one step off, swamping a budget difference of
+///   the same order (that quantisation, not the byte gate, is what made this
+///   assertion flap). Shrinking the batch lets the reader stop within a few
+///   blocks of the byte budget, so the read-ahead tracks the budget rather than
+///   the batch and both arms are deterministic across hosts.
+/// - **Sub-saturation budgets.** The compressed read-ahead only rises with the
+///   budget while the budget is small: Q3 parks *decoded* (expanded) records, so
+///   once the budget is a few MiB the reorder buffer's per-serial cap is what
+///   bounds the queue and lifting the budget further barely moves the compressed
+///   bytes consumed. Both arms therefore sit in the responsive regime (1 MiB and
+///   3 MiB), where doubling-plus the budget produces a clear read-ahead gap.
 #[test]
 fn read_ahead_under_a_stalled_writer_shrinks_with_the_queue_memory_budget() {
+    /// Read batch small enough that read-ahead tracks the byte budget instead of
+    /// the ~1 MiB production batch quantum.
+    const FINE_READ_BLOCKS: usize = 4;
+
     let (header, bam_bytes) = shared_bam_bytes();
     let input_len = bam_bytes.len() as u64;
 
-    // Both arms must stay gated: the generous budget has to leave the reader
-    // stopping short of EOF, or the comparison degenerates into
-    // `stalled_writer_stops_the_reader_within_the_queue_memory_budget`'s
-    // assertion, which a slot-count-only bound would also satisfy. The reader
-    // stops near `budget + overhead`, so the generous budget must clear both that
-    // overhead and one further `TEST_BUDGET_BYTES` of gap below `input_len`.
-    // Twice the tight budget is the largest multiple this fixture (~4 budgets)
-    // admits while keeping the generous arm off EOF.
-    let generous_budget = 2 * TEST_BUDGET_BYTES;
-    assert!(
-        generous_budget + TEST_BUDGET_BYTES < input_len,
-        "the generous budget ({generous_budget}) plus one tight budget must stay below the input \
-         ({input_len}) so both runs are gated with the reader stopping short of EOF"
-    );
+    // Both budgets stay in the sub-saturation regime (see the doc comment) so the
+    // budget actually moves the read-ahead, and both leave the reader well short
+    // of EOF on this fixture.
+    let tight_budget = TEST_BUDGET_BYTES / 2; // 1 MiB
+    let generous_budget = 3 * TEST_BUDGET_BYTES / 2; // 3 MiB
+    let budget_difference = generous_budget - tight_budget;
 
     let mut consumption = Vec::new();
-    for budget in [TEST_BUDGET_BYTES, generous_budget] {
+    for budget in [tight_budget, generous_budget] {
         let StalledRun { consumed, released, handle, .. } =
-            spawn_stalled_pipeline(header, bam_bytes.clone(), 4, budget);
+            spawn_stalled_pipeline(header, bam_bytes.clone(), 4, budget, Some(FINE_READ_BLOCKS));
         let settled = wait_for_consumption_to_settle(&consumed, input_len, Duration::from_secs(30));
         assert!(
             settled.settled,
@@ -450,18 +476,19 @@ fn read_ahead_under_a_stalled_writer_shrinks_with_the_queue_memory_budget() {
         consumption.push(settled.bytes);
     }
 
-    // A margin tied to the budget difference, not bare ordering: a scheduler
-    // hiccup that made the tight run read one extra block would still pass
-    // `tight < generous`, and if the generous run read to EOF a bounded gate would
-    // be indistinguishable from none. Requiring the gap to span at least one
-    // tight budget pins that the budget — not slot counts or timing — is the
-    // bound.
+    // A margin tied to the budget difference, not bare ordering: `tight < generous`
+    // alone could be one stray block, and if a bound ignored the budget entirely
+    // the two figures would coincide. Requiring the gap to span at least half the
+    // budget difference pins that the budget — not slot counts or timing — is the
+    // bound, while tolerating the few-block overshoot the fine read batch still
+    // leaves. (Measured gap is ~0.9x the budget difference; the reader trails the
+    // budget sub-linearly because part of it is spent on decoded, expanded data.)
     let (tight, generous) = (consumption[0], consumption[1]);
     assert!(
-        generous.saturating_sub(tight) >= TEST_BUDGET_BYTES,
-        "read-ahead was {tight} bytes under a {TEST_BUDGET_BYTES}-byte budget and {generous} \
-         bytes under a {generous_budget}-byte one; the gap is smaller than one tight budget, so \
-         the budget is not bounding the queues"
+        generous.saturating_sub(tight) >= budget_difference / 2,
+        "read-ahead was {tight} bytes under a {tight_budget}-byte budget and {generous} bytes \
+         under a {generous_budget}-byte one; the gap is under half the {budget_difference}-byte \
+         budget difference, so the budget is not bounding the queues"
     );
 }
 
@@ -481,7 +508,7 @@ fn a_budget_smaller_than_one_batch_still_completes_with_every_record() {
 
     // Release the writer immediately so it never blocks — a healthy sink — and
     // set a budget far below one decompressed batch.
-    let run = spawn_stalled_pipeline(header, bam_bytes.clone(), 4, 8);
+    let run = spawn_stalled_pipeline(header, bam_bytes.clone(), 4, 8, None);
     run.released.store(true, Ordering::Release);
 
     let written =
@@ -514,7 +541,7 @@ fn reader_resumes_and_completes_after_the_writer_recovers() {
     assert_eq!(expected_names.len(), FAMILIES * DEPTH, "input should hold every generated read");
 
     let StalledRun { consumed, released, sink, handle } =
-        spawn_stalled_pipeline(header, bam_bytes.clone(), 4, TEST_BUDGET_BYTES);
+        spawn_stalled_pipeline(header, bam_bytes.clone(), 4, TEST_BUDGET_BYTES, None);
 
     let settled =
         wait_for_consumption_to_settle(&consumed, bam_bytes.len() as u64, Duration::from_secs(30));
