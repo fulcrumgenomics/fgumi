@@ -1818,9 +1818,15 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             }
 
             let supply = self.shared.park_supply_now();
+            // Published for `get_sort_priorities`: while this is set, a worker
+            // serves the awaited file before it drains output compression.
+            // Ordering is Release/Acquire-free on purpose -- a worker reading it
+            // one iteration late costs one deferred block, not correctness.
+            self.shared.consumer_parked.store(true, ord);
 
             let park_start = Instant::now();
             std::thread::park();
+            self.shared.consumer_parked.store(false, ord);
             let parked_ns = crate::merge_trace::elapsed_nanos(park_start);
             self.shared.park_supply.record(supply, parked_ns);
             self.stalls.record_park(source_id, parked_ns, !parked_yet);
