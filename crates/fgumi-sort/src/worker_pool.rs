@@ -138,17 +138,38 @@ pub(crate) fn read_length_prefix<R: std::io::Read + ?Sized>(
     Ok(Some(frame_len))
 }
 
-/// Cap on uncompressed size of a zstd spill frame. Production frames are
-/// bounded by the staging buffer (`BGZF_MAX_BLOCK_SIZE` + padding ~= 68 KB);
-/// this leaves slack but stays small enough that per-frame allocations don't
-/// dominate the merge phase when there are many tens of thousands of frames.
-const ZSTD_FRAME_DECOMP_CAP: usize = 256 * 1024;
+/// Cap on the uncompressed size of a zstd spill frame.
+///
+/// Derived from the writer's frame size rather than fixed, because a buffer
+/// smaller than the largest frame the writer can emit fails to decompress
+/// *every* frame at that size -- a total-failure mode, not a slow one.
+///
+/// The slack is **proportional** (4x), not a fixed addend, and that is
+/// load-bearing rather than tidiness. This buffer is per-worker scratch touched
+/// once per decompressed frame -- millions of times in a spill-heavy merge -- so
+/// its size is a cache-locality parameter, not just an allocation. A fixed
+/// `+ 4 MiB` of slack measured **249.5s against a 199.2s baseline (+25%)** at the
+/// default frame size, because it took 8 workers from 2 MiB of hot scratch to
+/// 32.5 MiB while peak RSS barely moved. At 4x it evaluates to exactly the 256
+/// KiB this constant held before it was derived, so the default path is
+/// unchanged and larger frames scale with it.
+///
+/// The 256 KiB floor matters because `BGZF_MAX_BLOCK_SIZE` is 65,280 -- not
+/// 65,536 -- so a bare 4x lands 1 KiB *under* the tuned value rather than on it.
+#[must_use]
+pub(crate) const fn zstd_decomp_cap() -> usize {
+    let scaled = 4 * crate::bgzf_io::SPILL_FRAME_BYTES;
+    if scaled > 256 * 1024 { scaled } else { 256 * 1024 }
+}
 
-/// Hard cap on the `u32 LE` length prefix of any zstd spill frame. Frames are
-/// produced one per ~64 KiB of input by `compress_job`; even
-/// pathological expansion can't reach this. Beyond it, we treat the value as
-/// corruption rather than allocate gigabytes.
-pub(crate) const MAX_ZSTD_FRAME_BYTES: usize = 2 * 1024 * 1024;
+/// Hard cap on the `u32 LE` length prefix of any zstd spill frame.
+///
+/// Scaled from the writer's frame size so the guard can never reject a frame
+/// this build is capable of emitting, while still refusing to allocate gigabytes
+/// on a corrupt prefix. Compressed frames are smaller than their input in
+/// practice, so the doubling is pure slack.
+pub(crate) const MAX_ZSTD_FRAME_BYTES: usize =
+    2 * 1024 * 1024 + 2 * crate::bgzf_io::SPILL_FRAME_BYTES;
 
 /// Maximum zstd compression level recognized by the `zstd` crate.
 const ZSTD_MAX_CLEVEL: u32 = 22;
@@ -2106,7 +2127,7 @@ impl SortWorkerPool {
                     let zstd_level =
                         i32::try_from(temp_compression.clamp(1, ZSTD_MAX_CLEVEL)).expect("clamped");
                     let zstd_decompress_buf = if matches!(spill_codec, SpillCodec::Zstd) {
-                        vec![0u8; ZSTD_FRAME_DECOMP_CAP]
+                        vec![0u8; zstd_decomp_cap()]
                     } else {
                         Vec::new()
                     };
@@ -3059,8 +3080,8 @@ impl SortWorkerPool {
             SpillCodec::Zstd => {
                 // Allocate the scratch buffer lazily so BGZF-only sorts don't
                 // pay 256 KiB × num_workers of dead memory.
-                if worker.zstd_decompress_buf.len() < ZSTD_FRAME_DECOMP_CAP {
-                    worker.zstd_decompress_buf.resize(ZSTD_FRAME_DECOMP_CAP, 0);
+                if worker.zstd_decompress_buf.len() < zstd_decomp_cap() {
+                    worker.zstd_decompress_buf.resize(zstd_decomp_cap(), 0);
                 }
                 match shared.stage_latency.decompress.time(|| {
                     shared.merge_phases.decompress.time(|| {
