@@ -523,6 +523,46 @@ where
     }
 }
 
+impl<'b, A, B, C> Chain<'b, super::outputs::OrderedBytesTuple3<A, B, C>>
+where
+    A: Send + super::item::HeapSize + super::item::Ordered + 'static,
+    B: Send + super::item::HeapSize + super::item::Ordered + 'static,
+    C: Send + super::item::HeapSize + super::item::Ordered + 'static,
+{
+    /// Convert a 3-output ordered + byte-bounded chain into per-branch
+    /// sub-chains, the 3-way counterpart of the
+    /// [`OrderedBytesTuple2`](super::outputs::OrderedBytesTuple2) impl above.
+    ///
+    /// Without this, a step whose `Outputs` is `OrderedBytesTuple3` cannot be
+    /// wired through the typed builder at all: `append_step` exposes only
+    /// branch 0, and branch wiring is not otherwise public — so the step type
+    /// checks, builds, and is simply unreachable.
+    #[must_use = "all chain branches must be wired to a sink"]
+    pub fn into_multi(self) -> MultiChain3Ordered<'b, A, B, C> {
+        MultiChain3Ordered {
+            b0: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(0),
+                _phantom: PhantomData,
+            },
+            b1: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(1),
+                _phantom: PhantomData,
+            },
+            b2: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(2),
+                _phantom: PhantomData,
+            },
+            _phantom: PhantomData,
+        }
+    }
+}
+
 impl<'b, A, B, C> Chain<'b, (A, B, C)>
 where
     A: Send + HeapSize + 'static,
@@ -775,6 +815,23 @@ where
     pub b0: Chain<'b, Single<A>>,
     pub b1: Chain<'b, Single<B>>,
     pub b2: Chain<'b, Single<C>>,
+    pub(crate) _phantom: PhantomData<&'b PipelineBuilder>,
+}
+
+/// Per-branch sub-chains of an ordered + byte-bounded 3-way fan-out. The
+/// 3-way counterpart of [`MultiChain2Ordered`]; each branch is exposed as
+/// `Chain<OrderedBytesSingle<X>>` so downstream chained steps see the
+/// byte-aware ordered shape.
+#[must_use = "all chain branches must be wired to a sink"]
+pub struct MultiChain3Ordered<'b, A, B, C>
+where
+    A: Send + super::item::HeapSize + super::item::Ordered + 'static,
+    B: Send + super::item::HeapSize + super::item::Ordered + 'static,
+    C: Send + super::item::HeapSize + super::item::Ordered + 'static,
+{
+    pub b0: Chain<'b, super::outputs::OrderedBytesSingle<A>>,
+    pub b1: Chain<'b, super::outputs::OrderedBytesSingle<B>>,
+    pub b2: Chain<'b, super::outputs::OrderedBytesSingle<C>>,
     pub(crate) _phantom: PhantomData<&'b PipelineBuilder>,
 }
 
@@ -2555,6 +2612,61 @@ mod tests {
         assert!(matches!(
             builder.build(),
             Err(BuildError::UnwiredOutput { step: "OrderedSource", branch: "1" })
+        ));
+    }
+
+    #[derive(Clone)]
+    struct OrderedSource3;
+    impl Step for OrderedSource3 {
+        type Input = ();
+        type Outputs = crate::outputs::OrderedBytesTuple3<Ord32, Ord32, Ord32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "OrderedSource3",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1024 }; 3],
+                branch_ordering: vec![BranchOrdering::ByItemOrdinal; 3],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// The 3-way counterpart of `into_multi_ordered_bytes_2_exposes_one_chain_per_branch`:
+    /// all three ordered + byte-bounded branches are exposed as
+    /// `Chain<OrderedBytesSingle<_>>` and separately wireable.
+    #[test]
+    fn into_multi_ordered_bytes_3_exposes_one_chain_per_branch() {
+        let builder = PipelineBuilder::new();
+        let multi = builder.chain(OrderedSource3).into_multi();
+        let _: &Chain<'_, crate::outputs::OrderedBytesSingle<Ord32>> = &multi.b0;
+        multi.b0.chain(OrderedSink).into_sink_marker();
+        multi.b1.chain(OrderedSink).into_sink_marker();
+        multi.b2.chain(OrderedSink).into_sink_marker();
+
+        let pipeline = builder.build().expect("all three ordered branches wired");
+        assert_eq!(pipeline.graph.n_steps(), 4, "source + 3 sinks");
+    }
+
+    /// The 3-way counterpart of `into_multi_ordered_bytes_2_reports_the_branch_left_unwired`:
+    /// the dropped branch is reported BY INDEX, proving `b2` is a distinct edge
+    /// rather than an alias of `b0`/`b1`.
+    #[test]
+    fn into_multi_ordered_bytes_3_reports_the_branch_left_unwired() {
+        let builder = PipelineBuilder::new();
+        let multi = builder.chain(OrderedSource3).into_multi();
+        multi.b0.chain(OrderedSink).into_sink_marker();
+        multi.b1.chain(OrderedSink).into_sink_marker();
+        drop(multi.b2);
+
+        assert!(matches!(
+            builder.build(),
+            Err(BuildError::UnwiredOutput { step: "OrderedSource3", branch: "2" })
         ));
     }
 
