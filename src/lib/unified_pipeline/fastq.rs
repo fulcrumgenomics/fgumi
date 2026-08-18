@@ -1134,27 +1134,61 @@ fn decompress_bgzf_chunk(raw_data: &[u8], decompressor: &mut Decompressor) -> io
 // Phase 6 & 7: FASTQ Pipeline State and Entry Point
 // ============================================================================
 
-/// Align record counts across multiple streams, truncating excess to the minimum.
+/// The error reported when the input FASTQ streams do not hold the same number
+/// of records.
 ///
-/// When streams have different record counts (e.g., at EOF), excess records
-/// are discarded since they have no mate and cannot form valid templates.
-fn align_stream_records(
-    mut streams: Vec<FastqStreamBoundaries>,
+/// `counts` is indexed by stream (`0` = R1, `1` = R2, ...) and holds the number
+/// of records each stream contributed at the position where they diverged — `0`
+/// for a stream that had already ended. Streams are named `R1`/`R2`/... to match
+/// the `--inputs` order and the wording of the single-threaded path in
+/// `commands::extract`.
+pub(crate) fn fastq_out_of_sync_error(counts: &[usize]) -> io::Error {
+    debug_assert!(
+        counts.len() >= 2 && counts.iter().any(|count| *count != counts[0]),
+        "fastq_out_of_sync_error called with counts that are not out of sync: {counts:?}"
+    );
+    let longest = counts.iter().enumerate().max_by_key(|(_, count)| **count).map_or(0, |(i, _)| i);
+    let shortest = counts.iter().enumerate().min_by_key(|(_, count)| **count).map_or(0, |(i, _)| i);
+    let surplus =
+        counts.iter().max().copied().unwrap_or(0) - counts.iter().min().copied().unwrap_or(0);
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "FASTQ sources out of sync: R{} ended before R{}, leaving at least {surplus} \
+             record(s) in R{} with no mate. Paired FASTQ inputs must contain the same number \
+             of records — a shorter input usually means a truncated or interrupted transfer.",
+            shortest + 1,
+            longest + 1,
+            longest + 1,
+        ),
+    )
+}
+
+/// Assemble one boundary batch, rejecting streams that disagree on record count.
+///
+/// The Read step fills every chunk to `records_per_batch` unless it hits EOF, so
+/// a short chunk means that stream ended; a stream missing from `streams`
+/// entirely means it ended at an earlier batch index. Either way the inputs hold
+/// different numbers of records and the surplus records have no mate. Those
+/// records are neither discarded nor emitted as fragments — the run fails, so a
+/// truncated input cannot masquerade as a complete one (issue #773).
+fn assemble_boundary_batch(
+    streams: Vec<FastqStreamBoundaries>,
     serial: u64,
-) -> FastqBoundaryBatch {
-    if streams.len() > 1 {
-        let min_records =
-            streams.iter().map(|s| s.offsets.len().saturating_sub(1)).min().unwrap_or(0);
-        for stream in &mut streams {
-            let record_count = stream.offsets.len().saturating_sub(1);
-            if record_count > min_records && min_records > 0 {
-                let excess_start = stream.offsets[min_records];
-                stream.data.truncate(excess_start);
-                stream.offsets.truncate(min_records + 1);
+    num_streams: usize,
+) -> io::Result<FastqBoundaryBatch> {
+    if num_streams > 1 {
+        let mut counts = vec![0usize; num_streams];
+        for stream in &streams {
+            if let Some(count) = counts.get_mut(stream.stream_idx) {
+                *count = stream.offsets.len().saturating_sub(1);
             }
         }
+        if counts.iter().any(|count| *count != counts[0]) {
+            return Err(fastq_out_of_sync_error(&counts));
+        }
     }
-    FastqBoundaryBatch { streams, serial }
+    Ok(FastqBoundaryBatch { streams, serial })
 }
 
 /// Default serialization buffer capacity.
@@ -2475,6 +2509,13 @@ fn drain_exhausted_stream<R: BufRead + Send, P: Send + MemoryEstimate>(
         // Pair with any available surplus from the other stream.
         let all_other: Vec<FastqRecord> = std::mem::take(other_surplus);
         let pair_count = all_this.len().min(all_other.len());
+        // This drain only runs once the *other* stream is exhausted, so an empty
+        // `all_other` means no further mate can arrive. Reject here rather than
+        // letting the records pile up in the surplus vector (issue #773).
+        if all_other.is_empty() && !all_this.is_empty() {
+            let counts = if drain_r1 { [all_this.len(), 0] } else { [0, all_this.len()] };
+            return DrainResult::Error(fastq_out_of_sync_error(&counts));
+        }
         if pair_count > 0 {
             // Ensure R1 is always first in the template regardless of which stream
             // we're draining.
@@ -2559,34 +2600,168 @@ fn drain_exhausted_stream<R: BufRead + Send, P: Send + MemoryEstimate>(
 /// [`FastqPipelineState::is_complete`] separately requires the output queues to be
 /// empty, and the BGZF path skips `Group` entirely, so there is no one-way
 /// `finished` latch to trip.
-fn block_merge_is_complete<R: BufRead + Send, P: Send + MemoryEstimate>(
+fn block_merge_input_drained<R: BufRead + Send, P: Send + MemoryEstimate>(
     state: &FastqPipelineState<R, P>,
     merge: &BlockMergeState,
-    held_parsed_is_none: bool,
 ) -> bool {
     state.read_done.load(Ordering::Acquire)
         && state.chunks_block_parsed.load(Ordering::Acquire)
             == state.batches_read.load(Ordering::Acquire)
         // Must be observed *after* the counter load above — see the doc comment.
         && state.q2_block_parsed.is_empty()
-        && merge.is_empty()
-        && held_parsed_is_none
+        && merge.r1_pending.is_empty()
+        && merge.r2_pending.is_empty()
 }
 
-/// Publishes `BlockMerge`'s completion flags if [`block_merge_is_complete`] holds.
+/// Publishes `BlockMerge`'s completion flags, or the out-of-sync error, once
+/// [`block_merge_input_drained`] holds.
 ///
-/// Both of `BlockMerge`'s exits end in the same three stores, and the drift between
-/// its two completion *conditions* is what stranded blocks in the first place, so
+/// Both of `BlockMerge`'s exits end in the same stores, and the drift between its
+/// two completion *conditions* is what stranded blocks in the first place, so
 /// condition and action are kept together in one place rather than repeated.
+///
+/// Once the input is drained, leftover surplus records can never be paired: they
+/// are the tail of the longer FASTQ, and the shorter one has ended. Before issue
+/// #773 that state simply failed `merge.is_empty()` forever, so `BlockMerge`
+/// spun without ever publishing completion and the run produced no output and no
+/// error. Reject it instead, naming the stream that ended first.
 fn finish_block_merge_if_complete<R: BufRead + Send, P: Send + MemoryEstimate>(
     state: &FastqPipelineState<R, P>,
     merge: &BlockMergeState,
     worker: &FastqWorkerState<P>,
 ) {
-    if block_merge_is_complete(state, merge, worker.held_parsed.is_none()) {
+    if !block_merge_input_drained(state, merge) {
+        return;
+    }
+    if !merge.r1_surplus.is_empty() || !merge.r2_surplus.is_empty() {
+        // `fastq_out_of_sync_error` requires the counts to actually differ; the
+        // pairing loop and `drain_exhausted_stream` both drain `min(len, len)`, so
+        // at most one surplus vector is ever non-empty here. Enforce that invariant
+        // at the call site so a future change that leaves both non-empty and equal
+        // trips this assert rather than degrading the error message.
+        debug_assert!(
+            merge.r1_surplus.is_empty()
+                || merge.r2_surplus.is_empty()
+                || merge.r1_surplus.len() != merge.r2_surplus.len(),
+            "both surplus vectors non-empty and equal length ({}); \
+             fastq_out_of_sync_error cannot name a stream",
+            merge.r1_surplus.len()
+        );
+        state.set_error(fastq_out_of_sync_error(&[merge.r1_surplus.len(), merge.r2_surplus.len()]));
+        return;
+    }
+    if merge.is_empty() && worker.held_parsed.is_none() {
         state.block_merge_done.store(true, Ordering::Release);
         state.parse_done.store(true, Ordering::Release);
         state.group_done.store(true, Ordering::Release);
+    }
+}
+
+/// Parse and emit the final record of each stream when it does not end in a
+/// trailing newline.
+///
+/// `detect_suffix_start` treats a record without a trailing newline as an
+/// incomplete trailing fragment and leaves it in `suffix_bytes`. During normal
+/// processing that fragment is stitched with the next block's `prefix_bytes`, but
+/// the *last* block of a stream has no successor, so a residual complete record
+/// stays parked in `suffix_bytes` forever. Because [`BlockMergeState::is_empty`]
+/// requires the suffix buffers to be empty, completion would never fire: a valid
+/// matched pair whose FASTQ files simply do not end in a newline would hang the
+/// BGZF path (both single-stream and paired) with no output and no error.
+///
+/// Once all input is drained, parse any such residual as the stream's final
+/// record (with an empty successor prefix), move it into the surplus, and run it
+/// through the same pairing and emission as any other record. Leftover surplus is
+/// left for [`finish_block_merge_if_complete`] to reject as out of sync, and a
+/// genuinely truncated fragment surfaces as a parse error rather than being
+/// silently dropped (issue #773).
+///
+/// Returns `true` if it emitted a template or is now holding one for the caller.
+fn flush_residual_suffixes_at_eof<R: BufRead + Send, P: Send + MemoryEstimate>(
+    state: &FastqPipelineState<R, P>,
+    merge: &mut BlockMergeState,
+    worker: &mut FastqWorkerState<P>,
+) -> bool {
+    // A held template must be pushed by Priority 1 first (ordering/backpressure);
+    // only act once every block has been read, parsed, and merged.
+    if worker.held_parsed.is_some() || !block_merge_input_drained(state, merge) {
+        return false;
+    }
+    if merge.r1_suffix_bytes.is_empty() && merge.r2_suffix_bytes.is_empty() {
+        return false;
+    }
+
+    for from_r1 in [true, false] {
+        let (suffix, surplus) = if from_r1 {
+            (&mut merge.r1_suffix_bytes, &mut merge.r1_surplus)
+        } else {
+            (&mut merge.r2_suffix_bytes, &mut merge.r2_surplus)
+        };
+        if suffix.is_empty() {
+            continue;
+        }
+        match stitch_cross_block_record(suffix, &[]) {
+            Ok(Some(rec)) => {
+                surplus.push(rec);
+                suffix.clear();
+            }
+            // Unreachable for a non-empty suffix (`stitch_cross_block_record`
+            // only returns `None` when both slices are empty), but clear it so a
+            // future change cannot strand it and re-introduce the hang.
+            Ok(None) => suffix.clear(),
+            Err(e) => {
+                state.set_error(e);
+                return true;
+            }
+        }
+    }
+
+    // Emit the newly flushed records through the normal pairing path.
+    let templates: Vec<FastqTemplate> = if state.num_streams == 1 {
+        std::mem::take(&mut merge.r1_surplus)
+            .into_iter()
+            .map(|record| {
+                let name = record.name().to_vec();
+                FastqTemplate { name, records: vec![record] }
+            })
+            .collect()
+    } else {
+        let pair_count = merge.r1_surplus.len().min(merge.r2_surplus.len());
+        merge
+            .r1_surplus
+            .drain(..pair_count)
+            .zip(merge.r2_surplus.drain(..pair_count))
+            .map(|(r1, r2)| {
+                let name = r1.name().to_vec();
+                FastqTemplate { name, records: vec![r1, r2] }
+            })
+            .collect()
+    };
+
+    if templates.is_empty() {
+        // Paired input where only one stream had a residual record: it stays in
+        // the surplus for `finish_block_merge_if_complete` to reject as out of
+        // sync. The suffix buffers are now empty, so completion is no longer
+        // blocked on them.
+        return false;
+    }
+
+    let serial = merge.serial_out;
+    merge.serial_out += 1;
+    let count = templates.len();
+    match state.output.groups.push((serial, templates)) {
+        Ok(()) => {
+            state.total_templates_pushed.fetch_add(count as u64, Ordering::Release);
+            if let Some(stats) = state.stats() {
+                stats.groups_produced.fetch_add(count as u64, Ordering::Relaxed);
+            }
+            state.deadlock_state.record_q4_push();
+            true
+        }
+        Err((serial, returned)) => {
+            worker.held_parsed = Some((serial, returned, count));
+            true
+        }
     }
 }
 
@@ -2678,9 +2853,11 @@ fn fastq_try_step_block_merge<R: BufRead + Send, P: Send + MemoryEstimate>(
         }
     }
     if drained == 0 && merge.r1_pending.is_empty() && merge.r2_pending.is_empty() {
-        // Nothing to do. Check for completion.
+        // Nothing left in the pending maps: flush any trailing-newline-less final
+        // record, then check for completion.
+        let flushed = flush_residual_suffixes_at_eof(state, &mut merge, worker);
         finish_block_merge_if_complete(state, &merge, worker);
-        return (did_work, false);
+        return (did_work || flushed, false);
     }
 
     let mut batches_this_call = 0;
@@ -2889,10 +3066,12 @@ fn fastq_try_step_block_merge<R: BufRead + Send, P: Send + MemoryEstimate>(
         }
     }
 
-    // Check for completion: all chunks processed, queue drained, and merge state empty.
+    // Flush any trailing-newline-less final record, then check for completion:
+    // all chunks processed, queue drained, and merge state empty.
+    let flushed = flush_residual_suffixes_at_eof(state, &mut merge, worker);
     finish_block_merge_if_complete(state, &merge, worker);
 
-    (did_work, false)
+    (did_work || flushed, false)
 }
 
 // ============================================================================
@@ -2987,7 +3166,13 @@ fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
                     offsets: c.offsets.expect("gzip chunks must have pre-computed offsets"),
                 })
                 .collect();
-            align_stream_records(streams, serial)
+            match assemble_boundary_batch(streams, serial, state.num_streams) {
+                Ok(batch) => batch,
+                Err(e) => {
+                    state.set_error(e);
+                    return (true, false);
+                }
+            }
         } else {
             // BGZF path: need to find record boundaries in decompressed data.
             let decompressed = FastqDecompressedBatch {
@@ -4913,43 +5098,87 @@ mod tests {
         assert!(pair.is_empty());
     }
 
+    /// An equal-length batch passes through byte-for-byte: no record is
+    /// rewritten, reordered or dropped.
     #[test]
-    fn test_align_stream_records_equal() {
+    fn test_assemble_boundary_batch_equal_counts_passes_records_through() {
+        let r1_data = b"@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n".to_vec();
+        let r2_data = b"@r1\nTTTT\n+\nJJJJ\n@r2\nTTTT\n+\nJJJJ\n".to_vec();
         let streams = vec![
             FastqStreamBoundaries {
                 stream_idx: 0,
-                data: b"@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n".to_vec(),
-                offsets: vec![0, 18, 36],
+                data: r1_data.clone(),
+                offsets: vec![0, 16, 32],
             },
             FastqStreamBoundaries {
                 stream_idx: 1,
-                data: b"@r1\nTTTT\n+\nJJJJ\n@r2\nTTTT\n+\nJJJJ\n".to_vec(),
-                offsets: vec![0, 18, 36],
+                data: r2_data.clone(),
+                offsets: vec![0, 16, 32],
             },
         ];
-        let batch = align_stream_records(streams, 0);
-        assert_eq!(batch.streams[0].offsets.len() - 1, 2);
-        assert_eq!(batch.streams[1].offsets.len() - 1, 2);
+        let batch = assemble_boundary_batch(streams, 7, 2)
+            .expect("equal record counts must assemble cleanly");
+        assert_eq!(batch.serial, 7);
+        assert_eq!(batch.streams[0].data, r1_data, "R1 bytes must be untouched");
+        assert_eq!(batch.streams[0].offsets, vec![0, 16, 32], "R1 offsets must be untouched");
+        assert_eq!(batch.streams[1].data, r2_data, "R2 bytes must be untouched");
+        assert_eq!(batch.streams[1].offsets, vec![0, 16, 32], "R2 offsets must be untouched");
     }
 
+    /// Unequal counts within one batch index are rejected, naming both streams
+    /// and the surplus — the old behavior silently truncated to the shorter
+    /// stream, dropping the surplus records (issue #773).
     #[test]
-    fn test_align_stream_records_unequal() {
+    fn test_assemble_boundary_batch_unequal_counts_is_rejected() {
         let streams = vec![
             FastqStreamBoundaries {
                 stream_idx: 0,
                 data: b"@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n@r3\nACGT\n+\nIIII\n".to_vec(),
-                offsets: vec![0, 18, 36, 54],
+                offsets: vec![0, 16, 32, 48],
             },
             FastqStreamBoundaries {
                 stream_idx: 1,
                 data: b"@r1\nTTTT\n+\nJJJJ\n@r2\nTTTT\n+\nJJJJ\n".to_vec(),
-                offsets: vec![0, 18, 36],
+                offsets: vec![0, 16, 32],
             },
         ];
-        let batch = align_stream_records(streams, 0);
-        // Both should be truncated to min(3, 2) = 2 records
-        assert_eq!(batch.streams[0].offsets.len() - 1, 2);
-        assert_eq!(batch.streams[1].offsets.len() - 1, 2);
+        let error = assemble_boundary_batch(streams, 0, 2)
+            .expect_err("unequal record counts must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(message.contains("out of sync"), "unexpected message: {message}");
+        assert!(message.contains("R2 ended before R1"), "unexpected message: {message}");
+        assert!(message.contains("at least 1 record"), "unexpected message: {message}");
+    }
+
+    /// A stream that ended at an earlier batch index is absent from `streams`
+    /// entirely; that is still an out-of-sync input, not a single-end batch.
+    #[test]
+    fn test_assemble_boundary_batch_missing_stream_is_rejected() {
+        let streams = vec![FastqStreamBoundaries {
+            stream_idx: 0,
+            data: b"@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n".to_vec(),
+            offsets: vec![0, 16, 32],
+        }];
+        let error = assemble_boundary_batch(streams, 0, 2)
+            .expect_err("a batch missing a stream must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("R2 ended before R1"), "unexpected message: {message}");
+        assert!(message.contains("at least 2 record"), "unexpected message: {message}");
+    }
+
+    /// Single-stream (single-end) input has no mate to be out of sync with.
+    #[test]
+    fn test_assemble_boundary_batch_single_stream_is_accepted() {
+        let streams = vec![FastqStreamBoundaries {
+            stream_idx: 0,
+            data: b"@r1\nACGT\n+\nIIII\n".to_vec(),
+            offsets: vec![0, 16],
+        }];
+        let batch = assemble_boundary_batch(streams, 3, 1)
+            .expect("single-end batches must assemble cleanly");
+        assert_eq!(batch.streams.len(), 1);
+        assert_eq!(batch.streams[0].offsets, vec![0, 16]);
     }
 
     // ========================================================================
@@ -5457,30 +5686,49 @@ mod tests {
         assert_eq!(first_key, 0, "BTreeMap must yield block 0 first");
     }
 
+    /// What `BlockMerge` is expected to publish for a given state.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MergeOutcome {
+        /// Neither complete nor failed — the step must run again.
+        KeepGoing,
+        /// Completion flags published.
+        Complete,
+        /// Rejected: the inputs hold different numbers of records.
+        OutOfSync,
+    }
+
     /// `BlockMerge` may only declare completion when every parsed block has been
-    /// *consumed*, so each of the three places a block can sit must independently
-    /// veto completion.
+    /// *consumed*, so each of the places a block can sit must independently veto
+    /// completion — and leftover surplus records, which no later block can pair,
+    /// must be reported rather than waited on forever.
     ///
-    /// `blocks_still_queued` is the regression — it stalled the run until the deadlock
-    /// detector fired (`Q2b=2, merged=0, block_merge_done=true`). See
-    /// [`block_merge_is_complete`] for why a counters-only predicate strands blocks.
+    /// `blocks_still_queued` is the earlier regression — it stalled the run until the
+    /// deadlock detector fired (`Q2b=2, merged=0, block_merge_done=true`). See
+    /// [`block_merge_input_drained`] for why a counters-only predicate strands blocks.
+    /// `surplus_unpairable` is issue #773, which had no such backstop at all: the run
+    /// spun forever with no output and no error.
     #[rstest]
-    #[case::all_drained(true, true, false, false, false, true)]
-    #[case::blocks_still_queued(true, true, true, false, false, false)]
-    #[case::counters_behind(true, false, false, false, false, false)]
-    #[case::reader_still_going(false, true, false, false, false, false)]
-    #[case::merge_state_pending(true, true, false, true, false, false)]
-    #[case::batch_held_downstream(true, true, false, false, true, false)]
+    #[case::all_drained(true, true, false, false, false, false, MergeOutcome::Complete)]
+    #[case::blocks_still_queued(true, true, true, false, false, false, MergeOutcome::KeepGoing)]
+    #[case::counters_behind(true, false, false, false, false, false, MergeOutcome::KeepGoing)]
+    #[case::reader_still_going(false, true, false, false, false, false, MergeOutcome::KeepGoing)]
+    #[case::merge_state_pending(true, true, false, true, false, false, MergeOutcome::KeepGoing)]
+    #[case::batch_held_downstream(true, true, false, false, true, false, MergeOutcome::KeepGoing)]
+    #[case::surplus_unpairable(true, true, false, false, false, true, MergeOutcome::OutOfSync)]
+    #[case::surplus_wins_over_held(true, true, false, false, true, true, MergeOutcome::OutOfSync)]
     fn test_block_merge_completion_requires_every_block_consumed(
         #[case] read_done: bool,
         #[case] counters_caught_up: bool,
         #[case] blocks_queued: bool,
         #[case] merge_pending: bool,
         #[case] batch_held: bool,
-        #[case] expected_complete: bool,
+        #[case] surplus_left: bool,
+        #[case] expected: MergeOutcome,
     ) {
         let state = make_fastq_state();
         let mut merge = BlockMergeState::new();
+        let mut worker: FastqWorkerState<Vec<u8>> =
+            FastqWorkerState::new(6, 0, 2, SchedulerStrategy::default(), ActiveSteps::all());
 
         // `read_done` plus a counter level with `batches_read` is what tells
         // BlockMerge that no further blocks will ever be produced.
@@ -5499,11 +5747,86 @@ mod tests {
                 make_block_parsed(0, 0, vec![make_record("r1", "ACGT", "IIII")], vec![], vec![]),
             );
         }
+        if batch_held {
+            worker.held_parsed = Some((0, Vec::new(), 0));
+        }
+        if surplus_left {
+            merge.r1_surplus.push(make_record("r1", "ACGT", "IIII"));
+        }
 
-        assert_eq!(
-            block_merge_is_complete(&state, &merge, !batch_held),
-            expected_complete,
-            "completion must require an empty queue, empty merge state and no held batch"
+        finish_block_merge_if_complete(&state, &merge, &worker);
+
+        let error = state.take_error();
+        let actual = match (state.block_merge_done.load(Ordering::Acquire), &error) {
+            (_, Some(_)) => MergeOutcome::OutOfSync,
+            (true, None) => MergeOutcome::Complete,
+            (false, None) => MergeOutcome::KeepGoing,
+        };
+        assert_eq!(actual, expected, "unexpected BlockMerge outcome");
+
+        if expected == MergeOutcome::OutOfSync {
+            let message = error.expect("out-of-sync outcome must carry an error").to_string();
+            assert!(message.contains("out of sync"), "unexpected message: {message}");
+            assert!(message.contains("R2 ended before R1"), "unexpected message: {message}");
+            assert!(
+                !state.block_merge_done.load(Ordering::Acquire),
+                "a rejected run must not also publish completion"
+            );
+        } else {
+            assert_eq!(
+                state.parse_done.load(Ordering::Acquire),
+                expected == MergeOutcome::Complete,
+                "parse_done must track block_merge_done"
+            );
+            assert_eq!(
+                state.group_done.load(Ordering::Acquire),
+                expected == MergeOutcome::Complete,
+                "group_done must track block_merge_done"
+            );
+        }
+    }
+
+    /// When one BGZF stream is exhausted but the other still has blocks with no
+    /// mate to pair against, the drain must reject the input rather than let the
+    /// records pile up in the surplus vector (issue #773). Both drain directions
+    /// name the stream that ended first.
+    #[rstest]
+    #[case::drain_r1_r2_ended(true, "R2 ended before R1")]
+    #[case::drain_r2_r1_ended(false, "R1 ended before R2")]
+    fn test_drain_exhausted_stream_rejects_unpairable_surplus(
+        #[case] drain_r1: bool,
+        #[case] expected_direction: &str,
+    ) {
+        let state = make_fastq_state();
+        let mut merge = BlockMergeState::new();
+
+        // The stream being drained still has a block of records; the other
+        // stream is exhausted, so its surplus is empty and no mate can arrive.
+        // R1 is stream 0, R2 is stream 1.
+        let stream_idx = usize::from(!drain_r1);
+        let block = make_block_parsed(
+            0,
+            stream_idx,
+            vec![make_record("r1", "ACGT", "IIII"), make_record("r2", "GGGG", "JJJJ")],
+            vec![],
+            vec![],
+        );
+        if drain_r1 {
+            merge.r1_pending.insert(0, block);
+        } else {
+            merge.r2_pending.insert(0, block);
+        }
+
+        let result = drain_exhausted_stream(&state, &mut merge, drain_r1, false, 0);
+        let DrainResult::Error(error) = result else {
+            panic!("draining a stream with no mate must return an error");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(message.contains("out of sync"), "unexpected message: {message}");
+        assert!(
+            message.contains(expected_direction),
+            "rejection must name the stream that ended first: {message}"
         );
     }
 
