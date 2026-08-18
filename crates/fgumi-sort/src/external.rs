@@ -3166,6 +3166,7 @@ impl RawExternalSorter {
         )?;
 
         let mut records_merged = 0u64;
+        let mut merge_progress_batch = crate::progress_batch::BatchedProgress::new();
         let merge_progress = ProgressTracker::new("Merged records").with_interval(1_000_000);
         // Set when an input is found not to be monotonic in the merge order:
         // (source index into `inputs`, 1-based record number within that input).
@@ -3180,7 +3181,7 @@ impl RawExternalSorter {
 
             writer.write_raw_record(&records[winner])?;
             records_merged += 1;
-            merge_progress.log_if_needed(1);
+            merge_progress_batch.tick(&merge_progress);
 
             let reader_idx = source_map[winner];
             if let Some(raw_record) = readers[reader_idx].next() {
@@ -3226,6 +3227,9 @@ impl RawExternalSorter {
 
         writer.finish()?;
         out_target.persist()?;
+        // Must precede log_final: the tracker has not seen the last partial batch,
+        // and without this the reported total comes up short by up to one batch.
+        merge_progress_batch.flush(&merge_progress);
         merge_progress.log_final();
 
         Ok(records_merged)
@@ -5290,6 +5294,7 @@ impl RawExternalSorter {
         let mut writer = PooledBamWriter::new(Arc::clone(pool), output, &output_header)?;
 
         let mut records_merged = 0u64;
+        let mut merge_progress_batch = crate::progress_batch::BatchedProgress::new();
         let merge_progress = ProgressTracker::new("Merged records")
             .with_interval(1_000_000)
             .with_total(total_records);
@@ -5357,7 +5362,7 @@ impl RawExternalSorter {
             }
 
             records_merged += 1;
-            merge_progress.log_if_needed(1);
+            merge_progress_batch.tick(&merge_progress);
 
             if merge_probe.should_sample(records_merged) {
                 let depths = pool.phase1_queue_depths();
@@ -5461,6 +5466,9 @@ impl RawExternalSorter {
         );
         Self::log_stage_latency(pool, &writer_stats);
 
+        // Must precede log_final: the tracker has not seen the last partial batch,
+        // and without this the reported total comes up short by up to one batch.
+        merge_progress_batch.flush(&merge_progress);
         merge_progress.log_final();
         log_snapshot("phase2.end", 0);
 
@@ -5516,6 +5524,7 @@ impl RawExternalSorter {
         let mut tree = LoserTree::new(initial_keys);
 
         let mut writer = PooledBamWriter::new_indexing(Arc::clone(pool), output, &output_header)?;
+        let mut merge_progress_batch = crate::progress_batch::BatchedProgress::new();
         let merge_progress = ProgressTracker::new("Merged records")
             .with_interval(1_000_000)
             .with_total(total_records);
@@ -5537,7 +5546,7 @@ impl RawExternalSorter {
             let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref())?;
             writer.write_raw_record(record_bytes)?;
             records_merged += 1;
-            merge_progress.log_if_needed(1);
+            merge_progress_batch.tick(&merge_progress);
 
             if let Some(key) = sources[src_idx].advance(guard.consumer_mut())? {
                 tree.replace_winner(key);
@@ -5606,6 +5615,9 @@ impl RawExternalSorter {
         // rows at all.
         Self::log_stage_latency(pool, &writer_stats);
 
+        // Must precede log_final: the tracker has not seen the last partial batch,
+        // and without this the reported total comes up short by up to one batch.
+        merge_progress_batch.flush(&merge_progress);
         merge_progress.log_final();
         Ok((index, records_merged))
     }

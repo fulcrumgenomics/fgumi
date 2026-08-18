@@ -55,6 +55,7 @@ pub(crate) mod merge_trace;
 pub(crate) mod pipeline;
 pub(crate) mod pooled_bam_writer;
 pub(crate) mod pooled_chunk_writer;
+pub(crate) mod progress_batch;
 pub(crate) mod radix;
 pub(crate) mod read_ahead;
 pub(crate) mod reader;
