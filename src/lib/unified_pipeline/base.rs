@@ -114,6 +114,7 @@ pub struct MemoryBreakdown {
     // Queue memory in MB/GB
     pub q1_mb: f64,
     pub q2_mb: f64,
+    pub q2b_mb: f64,
     pub q3_mb: f64,
     pub q4_gb: f64,
     pub q5_gb: f64,
@@ -148,6 +149,8 @@ pub struct MemoryDebugStats {
     pub q1_memory_bytes: AtomicU64,
     /// Memory held in Q2 (decompressed blocks)
     pub q2_memory_bytes: AtomicU64,
+    /// Memory held in Q2b (decompressed record buffers waiting to be decoded)
+    pub q2b_memory_bytes: AtomicU64,
     /// Memory held in Q3 (decoded records)
     pub q3_memory_bytes: AtomicU64,
     /// Memory held in Q4 (position groups) - likely the big one
@@ -198,6 +201,7 @@ impl MemoryDebugStats {
         Self {
             q1_memory_bytes: AtomicU64::new(0),
             q2_memory_bytes: AtomicU64::new(0),
+            q2b_memory_bytes: AtomicU64::new(0),
             q3_memory_bytes: AtomicU64::new(0),
             q4_memory_bytes: AtomicU64::new(0),
             q5_memory_bytes: AtomicU64::new(0),
@@ -325,12 +329,13 @@ pub fn log_comprehensive_memory_stats(stats: &PipelineStats) {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pct = (breakdown.tracked_total_gb / breakdown.system_rss_gb * 100.0) as u32;
         log::info!(
-            "MEMORY: RSS={:.1}GB Tracked={:.1}GB ({}%) | Queue: Q1:{:.0}MB Q2:{:.0}MB Q3:{:.0}MB Q4:{:.1}GB Q5:{:.1}GB Q6:{:.0}MB Q7:{:.0}MB | Proc: Pos={:.1}GB Tmpl={:.1}GB | Infra={:.0}MB",
+            "MEMORY: RSS={:.1}GB Tracked={:.1}GB ({}%) | Queue: Q1:{:.0}MB Q2:{:.0}MB Q2b:{:.0}MB Q3:{:.0}MB Q4:{:.1}GB Q5:{:.1}GB Q6:{:.0}MB Q7:{:.0}MB | Proc: Pos={:.1}GB Tmpl={:.1}GB | Infra={:.0}MB",
             breakdown.system_rss_gb,
             breakdown.tracked_total_gb,
             pct,
             breakdown.q1_mb,
             breakdown.q2_mb,
+            breakdown.q2b_mb,
             breakdown.q3_mb,
             breakdown.q4_gb,
             breakdown.q5_gb,
@@ -342,10 +347,11 @@ pub fn log_comprehensive_memory_stats(stats: &PipelineStats) {
         );
     } else {
         log::info!(
-            "MEMORY: Tracked={:.1}GB | Queue: Q1:{:.0}MB Q2:{:.0}MB Q3:{:.0}MB Q4:{:.1}GB Q5:{:.1}GB Q6:{:.0}MB Q7:{:.0}MB | Proc: Pos={:.1}GB Tmpl={:.1}GB | Infra={:.0}MB",
+            "MEMORY: Tracked={:.1}GB | Queue: Q1:{:.0}MB Q2:{:.0}MB Q2b:{:.0}MB Q3:{:.0}MB Q4:{:.1}GB Q5:{:.1}GB Q6:{:.0}MB Q7:{:.0}MB | Proc: Pos={:.1}GB Tmpl={:.1}GB | Infra={:.0}MB",
             breakdown.tracked_total_gb,
             breakdown.q1_mb,
             breakdown.q2_mb,
+            breakdown.q2b_mb,
             breakdown.q3_mb,
             breakdown.q4_gb,
             breakdown.q5_gb,
@@ -4141,6 +4147,7 @@ impl PipelineStats {
             match *queue_name {
                 "q1" => m.q1_memory_bytes.store(*current_bytes, Ordering::Relaxed),
                 "q2" => m.q2_memory_bytes.store(*current_bytes, Ordering::Relaxed),
+                "q2b" => m.q2b_memory_bytes.store(*current_bytes, Ordering::Relaxed),
                 "q3" => m.q3_memory_bytes.store(*current_bytes, Ordering::Relaxed),
                 "q4" => m.q4_memory_bytes.store(*current_bytes, Ordering::Relaxed),
                 "q5" => m.q5_memory_bytes.store(*current_bytes, Ordering::Relaxed),
@@ -4164,12 +4171,13 @@ impl PipelineStats {
         // Load each counter once to avoid divergence under contention
         let q1 = m.q1_memory_bytes.load(Ordering::Relaxed);
         let q2 = m.q2_memory_bytes.load(Ordering::Relaxed);
+        let q2b = m.q2b_memory_bytes.load(Ordering::Relaxed);
         let q3 = m.q3_memory_bytes.load(Ordering::Relaxed);
         let q4 = m.q4_memory_bytes.load(Ordering::Relaxed);
         let q5 = m.q5_memory_bytes.load(Ordering::Relaxed);
         let q6 = m.q6_memory_bytes.load(Ordering::Relaxed);
         let q7 = m.q7_memory_bytes.load(Ordering::Relaxed);
-        let queue_total = q1 + q2 + q3 + q4 + q5 + q6 + q7;
+        let queue_total = q1 + q2 + q2b + q3 + q4 + q5 + q6 + q7;
 
         let pos_groups = m.position_group_processing_bytes.load(Ordering::Relaxed);
         let templates = m.template_processing_bytes.load(Ordering::Relaxed);
@@ -4202,6 +4210,7 @@ impl PipelineStats {
 
             q1_mb: q1 as f64 / 1e6,
             q2_mb: q2 as f64 / 1e6,
+            q2b_mb: q2b as f64 / 1e6,
             q3_mb: q3 as f64 / 1e6,
             q4_gb: q4 as f64 / 1e9,
             q5_gb: q5 as f64 / 1e9,
@@ -4780,10 +4789,16 @@ where
     // NOT serial-ordered. If the write reorder buffer is memory-high because
     // later serials are buffered waiting for a missing `next_seq`, that
     // missing serial may still be sitting in Q5 awaiting compression — and
-    // blocking Q5 pops would trap it there, deadlocking Write. Memory
-    // backpressure on the write side is applied at the scheduler level
-    // (`BackpressureState::memory_high`), which redirects threads to drain
-    // Compress/Write rather than stopping them.
+    // blocking Q5 pops would trap it there, deadlocking Write.
+    //
+    // Note this is not the same as saying the write side is backpressured
+    // elsewhere: `BackpressureState::memory_high` is fed by the *input*-side Q3
+    // reorder buffer, and `write_reorder_is_memory_high` has no production
+    // consumer at all. In the BAM pipeline the write side is bounded because the
+    // write reorder buffer's bytes are charged to the queue memory budget and the
+    // Read step declines to admit more input once that budget is reached — see
+    // `BamPipelineState::read_admission_allowed` (issue #746). The FASTQ pipeline
+    // has no equivalent admission gate yet.
     if state.q6_is_full() {
         return if advanced_held { StepResult::Success } else { StepResult::OutputFull };
     }
