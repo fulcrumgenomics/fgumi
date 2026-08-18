@@ -4416,11 +4416,18 @@ impl RawExternalSorter {
     /// exactly. The breakdown then partitions the loop by construction rather
     /// than overshooting it by 30-50%.
     fn log_consumer_cpu(
-        sampled: (f64, f64, f64, f64),
+        loop_total: f64,
+        scaled: crate::merge_headroom::ConsumerSample,
         records: (u64, f64),
         stalls: Option<&crate::merge_stalls::ConsumerStallReport>,
     ) {
-        let (loop_total, est_read, est_tree, est_write) = sampled;
+        let crate::merge_headroom::ConsumerSample {
+            publish: est_publish,
+            present: est_present,
+            write: est_write,
+            advance: est_read,
+            tree: est_tree,
+        } = scaled;
         let (records_merged, blocked_secs) = records;
         if records_merged == 0 {
             return;
@@ -4435,7 +4442,7 @@ impl RawExternalSorter {
         // waits would be counted on both sides and inflate their shares.
         let fetch_cpu = (est_read - park_secs).max(0.0);
         let write_cpu = (est_write - blocked_secs).max(0.0);
-        let ratio_total = fetch_cpu + est_tree + write_cpu;
+        let ratio_total = est_publish + est_present + fetch_cpu + est_tree + write_cpu;
         info!(
             "  Consumer CPU: {consumer_cpu:.1}s exact (loop {loop_total:.1}s - park \
              {park_secs:.1}s - backpressure {blocked_secs:.1}s) = {:.0} ns/record",
@@ -4446,9 +4453,19 @@ impl RawExternalSorter {
         }
         let share = |part: f64| consumer_cpu * part / ratio_total;
         let ns = |part: f64| share(part) * 1e9 / records;
-        info!("    parse + key extract: {:.1}s ({:.0} ns/rec)", share(fetch_cpu), ns(fetch_cpu));
+        info!("    fetch + decompress:  {:.1}s ({:.0} ns/rec)", share(fetch_cpu), ns(fetch_cpu));
+        info!(
+            "    present record:      {:.1}s ({:.0} ns/rec)",
+            share(est_present),
+            ns(est_present)
+        );
         info!("    loser tree:          {:.1}s ({:.0} ns/rec)", share(est_tree), ns(est_tree));
         info!("    enqueue write:       {:.1}s ({:.0} ns/rec)", share(write_cpu), ns(write_cpu));
+        info!(
+            "    next-source predict: {:.1}s ({:.0} ns/rec)",
+            share(est_publish),
+            ns(est_publish)
+        );
         info!(
             "    (totals exact; the split between them is sampled, so read the shares as \
              proportions rather than to the tenth of a second)"
@@ -4457,7 +4474,7 @@ impl RawExternalSorter {
 
     fn log_merge_sub_phases(
         walls: (f64, f64),
-        consumer: (f64, f64, f64),
+        consumer: crate::merge_headroom::ConsumerSample,
         sampling: (u64, u64),
         active_workers: usize,
         pool: &Arc<SortWorkerPool>,
@@ -4465,7 +4482,6 @@ impl RawExternalSorter {
         consumer_diag: MergeConsumerDiag,
     ) {
         let (loop_total, merge_total) = walls;
-        let (write_secs, read_secs, tree_secs) = consumer;
         let (samples_taken, records_merged) = sampling;
         if records_merged == 0 {
             return;
@@ -4473,45 +4489,22 @@ impl RawExternalSorter {
         #[allow(clippy::cast_precision_loss, reason = "sample counts stay far below 2^52")]
         let scale =
             if samples_taken > 0 { records_merged as f64 / samples_taken as f64 } else { 1.0 };
-        let (est_write, est_read, est_tree) =
-            (write_secs * scale, read_secs * scale, tree_secs * scale);
+        let scaled = consumer.scaled(scale);
+        let est_read = scaled.advance;
+        let park_secs = stalls.as_ref().map_or(0.0, |x| x.park_secs);
 
         info!("=== Merge Sub-Phase Timing ===");
-        info!(
-            "  Consumer (main thread; {samples_taken} samples of {records_merged} records, scaled {scale:.0}x)"
+        let MergeConsumerDiag { backpressure_secs: blocked_secs, .. } = consumer_diag;
+        Self::log_consumer_rows(
+            scaled,
+            (samples_taken, records_merged),
+            scale,
+            loop_total,
+            park_secs,
+            consumer_diag,
         );
-        info!("    Fetch next record: {est_read:.1}s  (includes waiting on decompressed blocks)");
-        let MergeConsumerDiag {
-            backpressure_secs: blocked_secs,
-            backpressure_waits: blocked_waits,
-            borrowed,
-            reassembled,
-        } = consumer_diag;
-        if blocked_waits > 0 {
-            #[allow(clippy::cast_precision_loss, reason = "wait counts stay far below 2^52")]
-            let mean_us = blocked_secs * 1e6 / blocked_waits as f64;
-            info!(
-                "    Output backpressure: {blocked_secs:.1}s over {blocked_waits} waits \
-                 (mean {mean_us:.0} us, exact) -- the consumer blocked for an output permit"
-            );
-        } else {
-            info!("    Output backpressure: none -- the compressors always had a permit ready");
-        }
-        if borrowed + reassembled > 0 {
-            #[allow(clippy::cast_precision_loss, reason = "record counts stay far below 2^52")]
-            let pct = 100.0 * reassembled as f64 / (borrowed + reassembled) as f64;
-            info!(
-                "    Record presentation: {borrowed} borrowed zero-copy, {reassembled} \
-                 reassembled across a block boundary ({pct:.2}%, exact)"
-            );
-        }
-        info!("    Loser tree:        {est_tree:.1}s");
 
-        Self::log_consumer_cpu(
-            (loop_total, est_read, est_tree, est_write),
-            (records_merged, blocked_secs),
-            stalls.as_ref(),
-        );
+        Self::log_consumer_cpu(loop_total, scaled, (records_merged, blocked_secs), stalls.as_ref());
 
         // Parking is a subset of "fetch next record", so exact park time cannot
         // legitimately exceed the sampled estimate of it. When it does, the
@@ -4580,9 +4573,114 @@ impl RawExternalSorter {
                 workers.worker_utilization(merge_total, workers_n),
                 if loop_total > 0.0 { est_read / loop_total } else { 0.0 },
             );
+            Self::log_merge_headroom(loop_total, busy, workers_n, park_secs, blocked_secs);
         }
         Self::log_merge_stalls(loop_total, merge_total, active_workers, stalls, pool);
         info!("==============================");
+    }
+
+    /// The consumer's sampled sub-phase rows, and their reconciliation against the
+    /// loop they partition.
+    ///
+    /// Extracted from [`Self::log_merge_sub_phases`] to keep that function inside
+    /// the line limit; it is one cohesive block of reporting rather than a
+    /// mechanical split.
+    fn log_consumer_rows(
+        scaled: crate::merge_headroom::ConsumerSample,
+        sampling: (u64, u64),
+        scale: f64,
+        loop_total: f64,
+        park_secs: f64,
+        consumer_diag: MergeConsumerDiag,
+    ) {
+        let (samples_taken, records_merged) = sampling;
+        let est_tree = scaled.tree;
+        let est_read = scaled.advance;
+        info!(
+            "  Consumer (main thread; {samples_taken} samples of {records_merged} records, scaled {scale:.0}x)"
+        );
+        info!("    Fetch next record: {est_read:.1}s  (includes waiting on decompressed blocks)");
+        let MergeConsumerDiag {
+            backpressure_secs: blocked_secs,
+            backpressure_waits: blocked_waits,
+            borrowed,
+            reassembled,
+        } = consumer_diag;
+        if blocked_waits > 0 {
+            #[allow(clippy::cast_precision_loss, reason = "wait counts stay far below 2^52")]
+            let mean_us = blocked_secs * 1e6 / blocked_waits as f64;
+            info!(
+                "    Output backpressure: {blocked_secs:.1}s over {blocked_waits} waits \
+                 (mean {mean_us:.0} us, exact) -- the consumer blocked for an output permit"
+            );
+        } else {
+            info!("    Output backpressure: none -- the compressors always had a permit ready");
+        }
+        if borrowed + reassembled > 0 {
+            #[allow(clippy::cast_precision_loss, reason = "record counts stay far below 2^52")]
+            let pct = 100.0 * reassembled as f64 / (borrowed + reassembled) as f64;
+            info!(
+                "    Record presentation: {borrowed} borrowed zero-copy, {reassembled} \
+                 reassembled across a block boundary ({pct:.2}%, exact)"
+            );
+        }
+        info!("    Loser tree:        {est_tree:.1}s");
+        // Reconcile the sampled segments against the loop they are meant to
+        // partition. Three of these rows were reported for a long time without
+        // ever being summed against the loop, so there was no way to tell whether
+        // they accounted for most of it or a third. A signed residual is the check:
+        // positive means real time is unaccounted for, negative means the sampled
+        // regions over-attribute (their own clock overhead, or a sample biased
+        // toward expensive records).
+        let partition = crate::merge_headroom::LoopPartition {
+            segments: scaled,
+            loop_secs: loop_total,
+            park_secs,
+        };
+        info!(
+            "    Sampled segments sum to {:.1}s of a {loop_total:.1}s loop \
+             ({:+.0}% unattributed); {:.1}s of the fetch bucket was the consumer \
+             working rather than waiting",
+            scaled.total(),
+            100.0 * partition.unattributed_share(),
+            partition.advance_work_secs()
+        );
+    }
+
+    /// Name the wall this merge is against, and what is recoverable without
+    /// doing less work.
+    ///
+    /// Three limits, three different fixes, and they are routinely confused: the
+    /// serial consumer's own CPU, worker capacity, and coordination. Measured on
+    /// one cell, the same build at 8 and 16 threads gave opposite advice -- 1.8%
+    /// recoverable against 28% -- and nothing in the wall clock distinguished them.
+    /// Printing the floor turns "is my sort slow?" into "which limit am I on?",
+    /// which is the only version of the question that has an action attached.
+    fn log_merge_headroom(
+        loop_total: f64,
+        worker_busy_secs: f64,
+        threads: usize,
+        park_secs: f64,
+        blocked_secs: f64,
+    ) {
+        let floors = crate::merge_headroom::MergeFloors {
+            loop_secs: loop_total,
+            consumer_secs: (loop_total - park_secs - blocked_secs).max(0.0),
+            worker_busy_secs,
+            threads,
+        };
+        info!("  Merge floor: {} is the limit", floors.binding().label());
+        info!(
+            "    consumer serial {:.1}s | worker capacity {:.1}s ({threads} threads) | \
+             loop {loop_total:.1}s",
+            floors.consumer_secs,
+            floors.worker_floor_secs()
+        );
+        info!(
+            "    recoverable without doing less work: {:.1}s ({:.0}% of the merge)",
+            floors.recoverable_secs(),
+            100.0 * floors.recoverable_share()
+        );
     }
 
     /// Log why the merge stalled, as opposed to where its time went.
@@ -5326,6 +5424,8 @@ impl RawExternalSorter {
         // than the loop wall clock they are supposed to partition. A prime
         // interval decorrelates the sample from any block-size-derived period.
         let merge_sample_interval: u64 = 1021;
+        let mut merge_publish_secs = 0.0f64;
+        let mut merge_present_secs = 0.0f64;
         let mut merge_write_secs = 0.0f64;
         let mut merge_read_secs = 0.0f64;
         let mut merge_tree_secs = 0.0f64;
@@ -5355,32 +5455,47 @@ impl RawExternalSorter {
 
         let mut published_src: Option<usize> = None;
         while tree.winner_is_active() {
-            let winner = tree.winner();
-            let src_idx = source_map[winner];
-            // Publish the next likely source, but only when the run changes --
-            // ~167K times rather than once per record. The pool gives it the deep
-            // read allowance, so its first read starts while the consumer is still
-            // draining ~300 blocks from the current file, instead of after it has
-            // already stalled. A wrong prediction costs one deep read on a file the
-            // merge will reach eventually; there is no correctness component.
-            if published_src != Some(src_idx) {
-                published_src = Some(src_idx);
-                pool.set_phase2_next_source(tree.runner_up().map(|w| source_map[w]));
-            }
+            // Decide sampling first, so every segment below is timed on the same
+            // records or on none. Timing a subset would bias the partition toward
+            // whichever step happened to be measured, and the partition's whole
+            // value is that its segments sum to the loop.
             let sample_this = sample_countdown == 0;
             if sample_this {
                 sample_countdown = merge_sample_interval - 1;
+                samples_taken += 1;
             } else {
                 sample_countdown -= 1;
             }
 
+            let t = sample_this.then(Instant::now);
+            let winner = tree.winner();
+            let src_idx = source_map[winner];
+            // Publish the next likely source on run change. That is not once per
+            // record but it is far from rare: 25,003,410 publications against
+            // 779,820,469 records on the measured cell, one per ~31 records, each
+            // calling `runner_up()` at ~11.6ns. The pool gives the named file the
+            // deep read allowance, so its first read starts while the consumer is
+            // still draining the current file instead of after it has stalled. A
+            // wrong prediction costs one deep read on a file the merge reaches
+            // eventually; there is no correctness component.
+            if published_src != Some(src_idx) {
+                published_src = Some(src_idx);
+                pool.set_phase2_next_source(tree.runner_up().map(|w| source_map[w]));
+            }
+            if let Some(t0) = t {
+                merge_publish_secs += t0.elapsed().as_secs_f64();
+            }
+
+            let t = sample_this.then(Instant::now);
             let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref())?;
-            if sample_this {
-                let t0 = Instant::now();
-                writer.write_raw_record(record_bytes)?;
+            if let Some(t0) = t {
+                merge_present_secs += t0.elapsed().as_secs_f64();
+            }
+
+            let t = sample_this.then(Instant::now);
+            writer.write_raw_record(record_bytes)?;
+            if let Some(t0) = t {
                 merge_write_secs += t0.elapsed().as_secs_f64();
-            } else {
-                writer.write_raw_record(record_bytes)?;
             }
 
             records_merged += 1;
@@ -5392,26 +5507,20 @@ impl RawExternalSorter {
                 merge_probe.log_mid_with_depths(depths, consumer_stats);
             }
 
-            if sample_this {
-                let t0 = Instant::now();
-                let next = sources[src_idx].advance(guard.consumer_mut())?;
+            let t = sample_this.then(Instant::now);
+            let next = sources[src_idx].advance(guard.consumer_mut())?;
+            if let Some(t0) = t {
                 merge_read_secs += t0.elapsed().as_secs_f64();
+            }
 
-                let t0 = Instant::now();
-                if let Some(key) = next {
-                    tree.replace_winner(key);
-                } else {
-                    tree.remove_winner();
-                }
-                merge_tree_secs += t0.elapsed().as_secs_f64();
-                samples_taken += 1;
+            let t = sample_this.then(Instant::now);
+            if let Some(key) = next {
+                tree.replace_winner(key);
             } else {
-                let next = sources[src_idx].advance(guard.consumer_mut())?;
-                if let Some(key) = next {
-                    tree.replace_winner(key);
-                } else {
-                    tree.remove_winner();
-                }
+                tree.remove_winner();
+            }
+            if let Some(t0) = t {
+                merge_tree_secs += t0.elapsed().as_secs_f64();
             }
         }
 
@@ -5474,7 +5583,13 @@ impl RawExternalSorter {
 
         Self::log_merge_sub_phases(
             (loop_total, loop_start.elapsed().as_secs_f64()),
-            (merge_write_secs, merge_read_secs, merge_tree_secs),
+            crate::merge_headroom::ConsumerSample {
+                publish: merge_publish_secs,
+                present: merge_present_secs,
+                write: merge_write_secs,
+                advance: merge_read_secs,
+                tree: merge_tree_secs,
+            },
             (samples_taken, records_merged),
             active_workers,
             pool,
