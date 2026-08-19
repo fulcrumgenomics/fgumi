@@ -445,6 +445,19 @@ fn read_ahead_under_a_stalled_writer_shrinks_with_the_queue_memory_budget() {
     /// Read batch small enough that read-ahead tracks the byte budget instead of
     /// the ~1 MiB production batch quantum.
     const FINE_READ_BLOCKS: usize = 4;
+    /// Reps per arm whose maximum read-ahead is taken as that arm's measurement.
+    ///
+    /// The budget-bounded stopping point is an *upper* bound the reader
+    /// approaches from below, and the only scheduler noise on it is one-sided and
+    /// downward: if the reader is starved of CPU for a full second mid-read,
+    /// [`wait_for_consumption_to_settle`] can call the arm settled at a partial
+    /// read-ahead — well short of where the budget would actually stop it. That
+    /// rare downward tail (observed on the generous arm) is what made a single
+    /// sample flap (issue #809). It never lifts an arm *above* its true ceiling,
+    /// so the maximum across a few reps recovers that ceiling and is immune to
+    /// the tail; three reps drive the odds of every rep tailing at once low
+    /// enough to be irrelevant while keeping the test cheap.
+    const READ_AHEAD_REPS: usize = 3;
 
     let (header, bam_bytes) = shared_bam_bytes();
     let input_len = bam_bytes.len() as u64;
@@ -456,8 +469,10 @@ fn read_ahead_under_a_stalled_writer_shrinks_with_the_queue_memory_budget() {
     let generous_budget = 3 * TEST_BUDGET_BYTES / 2; // 3 MiB
     let budget_difference = generous_budget - tight_budget;
 
-    let mut consumption = Vec::new();
-    for budget in [tight_budget, generous_budget] {
+    // Measure one arm's read-ahead: how far the reader runs before a stalled
+    // writer backs it up under `budget`. Returned as the settled input-bytes
+    // consumed, after asserting the arm actually settled short of EOF.
+    let measure_read_ahead = |budget: u64| -> u64 {
         let StalledRun { consumed, released, handle, .. } =
             spawn_stalled_pipeline(header, bam_bytes.clone(), 4, budget, Some(FINE_READ_BLOCKS));
         let settled = wait_for_consumption_to_settle(&consumed, input_len, Duration::from_secs(30));
@@ -472,8 +487,17 @@ fn read_ahead_under_a_stalled_writer_shrinks_with_the_queue_memory_budget() {
         );
         released.store(true, Ordering::Release);
         join_pipeline_within(handle, &consumed, input_len, JOIN_DEADLINE);
-        consumption.push(settled.bytes);
-    }
+        settled.bytes
+    };
+
+    // Take each arm's *maximum* read-ahead over a few reps, not a single sample:
+    // the measurement noise is a one-sided downward tail (see `READ_AHEAD_REPS`),
+    // so the max is the robust estimator of the arm's true budget-bounded ceiling.
+    let arm_read_ahead = |budget: u64| -> u64 {
+        (0..READ_AHEAD_REPS).map(|_| measure_read_ahead(budget)).max().expect("at least one rep")
+    };
+    let tight = arm_read_ahead(tight_budget);
+    let generous = arm_read_ahead(generous_budget);
 
     // A margin tied to the budget difference, not bare ordering: `tight < generous`
     // alone could be one stray block, and if a bound ignored the budget entirely
@@ -482,7 +506,6 @@ fn read_ahead_under_a_stalled_writer_shrinks_with_the_queue_memory_budget() {
     // bound, while tolerating the few-block overshoot the fine read batch still
     // leaves. (Measured gap is ~0.9x the budget difference; the reader trails the
     // budget sub-linearly because part of it is spent on decoded, expanded data.)
-    let (tight, generous) = (consumption[0], consumption[1]);
     assert!(
         generous.saturating_sub(tight) >= budget_difference / 2,
         "read-ahead was {tight} bytes under a {tight_budget}-byte budget and {generous} bytes \
