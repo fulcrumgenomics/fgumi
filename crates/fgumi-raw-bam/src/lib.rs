@@ -43,6 +43,7 @@ pub use fields::{
     mapq,
     mate_pos,
     mate_ref_id,
+    nul_offset,
     pos,
     qual_offset,
     read_name,

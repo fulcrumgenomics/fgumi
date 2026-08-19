@@ -13,6 +13,7 @@ anyhow = { workspace = true, optional = true }
 bytemuck = { workspace = true }
 fgumi-dna = { workspace = true }
 fgumi-tag = { workspace = true }
+memchr = { workspace = true }
 wide = { workspace = true }
 
 [features]

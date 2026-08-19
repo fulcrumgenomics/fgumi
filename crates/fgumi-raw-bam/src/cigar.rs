@@ -295,7 +295,7 @@ pub fn unclipped_5prime_raw(bam: &[u8], pos: i32, is_reverse: bool) -> i32 {
 /// For reverse strand mate: `unclipped_end`
 #[inline]
 #[must_use]
-pub fn mate_unclipped_5prime(mate_pos: i32, mate_reverse: bool, mc_cigar: &str) -> i32 {
+pub fn mate_unclipped_5prime(mate_pos: i32, mate_reverse: bool, mc_cigar: &[u8]) -> i32 {
     if mate_reverse {
         unclipped_other_end(mate_pos, mc_cigar)
     } else {
@@ -311,7 +311,7 @@ pub fn mate_unclipped_5prime(mate_pos: i32, mate_reverse: bool, mc_cigar: &str) 
 pub fn mate_unclipped_5prime_1based(
     mate_pos_0based: i32,
     mate_reverse: bool,
-    mc_cigar: &str,
+    mc_cigar: &[u8],
 ) -> i32 {
     let mate_pos_1based = mate_pos_0based.saturating_add(1);
     if mate_reverse {
@@ -335,8 +335,8 @@ pub fn mate_unclipped_5prime_1based(
 /// `samtools sort --template-coordinate`.
 #[inline]
 #[must_use]
-pub(crate) fn unclipped_other_start(mate_pos: i32, mc_cigar: &str) -> i32 {
-    mate_pos.saturating_sub(parse_leading_clips(mc_cigar.as_bytes()))
+pub(crate) fn unclipped_other_start(mate_pos: i32, mc_cigar: &[u8]) -> i32 {
+    mate_pos.saturating_sub(parse_leading_clips(mc_cigar))
 }
 
 /// Calculate mate's unclipped end from MC tag CIGAR string.
@@ -349,8 +349,8 @@ pub(crate) fn unclipped_other_start(mate_pos: i32, mc_cigar: &str) -> i32 {
 /// the subtraction then walks the saturated value back.
 #[inline]
 #[must_use]
-pub(crate) fn unclipped_other_end(mate_pos: i32, mc_cigar: &str) -> i32 {
-    let (ref_len, trailing_clips) = parse_ref_len_and_trailing_clips(mc_cigar.as_bytes());
+pub(crate) fn unclipped_other_end(mate_pos: i32, mc_cigar: &[u8]) -> i32 {
+    let (ref_len, trailing_clips) = parse_ref_len_and_trailing_clips(mc_cigar);
     mate_pos.saturating_sub(1).saturating_add(ref_len).saturating_add(trailing_clips)
 }
 
@@ -1439,13 +1439,13 @@ mod tests {
     #[test]
     fn test_mate_unclipped_5prime_1based_forward() {
         // MC=5S10M: forward 5' = pos+1 - 5 = 96
-        assert_eq!(mate_unclipped_5prime_1based(100, false, "5S10M"), 96);
+        assert_eq!(mate_unclipped_5prime_1based(100, false, b"5S10M"), 96);
     }
 
     #[test]
     fn test_mate_unclipped_5prime_1based_reverse() {
         // MC=10M5S: reverse 5' = pos+1 + 10 + 5 - 1 = 115
-        assert_eq!(mate_unclipped_5prime_1based(100, true, "10M5S"), 115);
+        assert_eq!(mate_unclipped_5prime_1based(100, true, b"10M5S"), 115);
     }
 
     // ========================================================================
@@ -1506,52 +1506,52 @@ mod tests {
     /// -- for these inputs the old code panicked or wrapped, so it cannot serve
     /// as an oracle.
     #[rstest]
-    // Non-ASCII but valid UTF-8: `str::from_utf8` admits it, so it reaches the
-    // parser. Byte 4 falls inside 'e-acute', which panicked when the old code
+    // Non-ASCII bytes reach the parser directly now that `MC` is extracted as
+    // bytes. Byte 4 falls inside 'e-acute', which panicked when the old code
     // sliced the &str there.
-    #[case::non_ascii_utf8("10M\u{e9}", (10, 0))]
-    #[case::non_ascii_leading("\u{e9}10M", (10, 0))]
+    #[case::non_ascii_utf8("10M\u{e9}".as_bytes(), (10, 0))]
+    #[case::non_ascii_leading("\u{e9}10M".as_bytes(), (10, 0))]
     // Unknown ASCII operators are ignored, as before.
-    #[case::unknown_operator("10Mfoo5S", (10, 5))]
-    #[case::placeholder_star("*", (0, 0))]
+    #[case::unknown_operator(b"10Mfoo5S", (10, 5))]
+    #[case::placeholder_star(b"*", (0, 0))]
     // A single run wider than i32: `str::parse::<i32>` returns Err, and
     // `unwrap_or(0)` makes it 0. Saturation would wrongly give i32::MAX.
-    #[case::run_overflows_i32("99999999999M", (0, 0))]
+    #[case::run_overflows_i32(b"99999999999M", (0, 0))]
     // Totals that overflow across operators must clamp, not wrap to negative.
-    #[case::sum_overflows_i32("2000000000M2000000000M", (i32::MAX, 0))]
-    #[case::trailing_sum_overflows("1M2000000000S2000000000S", (1, i32::MAX))]
+    #[case::sum_overflows_i32(b"2000000000M2000000000M", (i32::MAX, 0))]
+    #[case::trailing_sum_overflows(b"1M2000000000S2000000000S", (1, i32::MAX))]
     // A non-ref, non-clip operator between the last ref op and the trailing
     // clips must not reset the run (matches htsjdk's getUnclippedEnd).
-    #[case::insertion_before_trailing_clip("10M5I3S", (10, 3))]
-    #[case::padding_before_trailing_clip("10M5P3S", (10, 3))]
+    #[case::insertion_before_trailing_clip(b"10M5I3S", (10, 3))]
+    #[case::padding_before_trailing_clip(b"10M5P3S", (10, 3))]
     // An unknown operator AFTER a trailing clip must not clear the run --
     // only a reference-consuming operator resets it.
-    #[case::garbage_after_trailing_clip("10M3Sfoo", (10, 3))]
+    #[case::garbage_after_trailing_clip(b"10M3Sfoo", (10, 3))]
     // A run too wide for u64 itself: the accumulator must saturate, not wrap
     // back into i32 range. 18446744073709551617 == u64::MAX + 2.
-    #[case::run_overflows_u64("18446744073709551617M", (0, 0))]
-    #[case::leading_zeros("0007M", (7, 0))]
-    #[case::empty("", (0, 0))]
-    #[case::digits_only("10", (0, 0))]
+    #[case::run_overflows_u64(b"18446744073709551617M", (0, 0))]
+    #[case::leading_zeros(b"0007M", (7, 0))]
+    #[case::empty(b"", (0, 0))]
+    #[case::digits_only(b"10", (0, 0))]
     fn test_parse_ref_len_and_trailing_clips_malformed(
-        #[case] cigar: &str,
+        #[case] cigar: &[u8],
         #[case] expected: (i32, i32),
     ) {
-        assert_eq!(parse_ref_len_and_trailing_clips(cigar.as_bytes()), expected);
+        assert_eq!(parse_ref_len_and_trailing_clips(cigar), expected);
     }
 
     /// Same contract for the leading-clip parser.
     #[rstest]
-    #[case::non_ascii_utf8("\u{e9}10M", 0)]
-    #[case::run_overflows_i32("99999999999S", 0)]
-    #[case::run_overflows_u64("18446744073709551617S", 0)]
-    #[case::sum_overflows_i32("2000000000S2000000000S", i32::MAX)]
-    #[case::leading_zeros("0007S", 7)]
-    #[case::empty("", 0)]
-    #[case::digits_only("10", 0)]
-    #[case::stops_at_first_non_clip("5S10M5S", 5)]
-    fn test_parse_leading_clips_malformed(#[case] cigar: &str, #[case] expected: i32) {
-        assert_eq!(parse_leading_clips(cigar.as_bytes()), expected);
+    #[case::non_ascii_utf8("\u{e9}10M".as_bytes(), 0)]
+    #[case::run_overflows_i32(b"99999999999S", 0)]
+    #[case::run_overflows_u64(b"18446744073709551617S", 0)]
+    #[case::sum_overflows_i32(b"2000000000S2000000000S", i32::MAX)]
+    #[case::leading_zeros(b"0007S", 7)]
+    #[case::empty(b"", 0)]
+    #[case::digits_only(b"10", 0)]
+    #[case::stops_at_first_non_clip(b"5S10M5S", 5)]
+    fn test_parse_leading_clips_malformed(#[case] cigar: &[u8], #[case] expected: i32) {
+        assert_eq!(parse_leading_clips(cigar), expected);
     }
 
     /// One token of a generated MC value: a run of digits, a CIGAR operator, a
@@ -1617,24 +1617,30 @@ mod tests {
             proptest::prop_assert!(trailing_clips >= 0);
         }
 
-        /// The public entry point must not panic either, on any MC that
-        /// survives `str::from_utf8` -- the filter these values pass through.
+        /// The public entry point must not panic either, on *any* byte string.
+        ///
+        /// This property used to be gated on `str::from_utf8` succeeding,
+        /// because the extractor discarded a non-UTF-8 `MC` before it could
+        /// reach here. These functions take CIGAR bytes now, so every generated
+        /// value is a real input and the gate would only hide the cases most
+        /// likely to break the parser.
         #[test]
         fn test_mate_unclipped_5prime_never_panics(
             cigar in cigar_ish_bytes(),
             mate_pos in proptest::prelude::any::<i32>(),
             mate_reverse in proptest::prelude::any::<bool>(),
         ) {
-            if let Ok(mc) = std::str::from_utf8(&cigar) {
-                // Only asserting it returns: the panic and the debug-build
-                // overflow are what this is guarding against.
-                let _ = mate_unclipped_5prime(mate_pos, mate_reverse, mc);
-                let _ = mate_unclipped_5prime_1based(mate_pos, mate_reverse, mc);
-            }
+            // Only asserting it returns: the panic and the debug-build
+            // overflow are what this is guarding against.
+            let _ = mate_unclipped_5prime(mate_pos, mate_reverse, &cigar);
+            let _ = mate_unclipped_5prime_1based(mate_pos, mate_reverse, &cigar);
         }
     }
 
-    /// The public entry points must not panic on a non-ASCII MC either.
+    /// The public entry points must not panic on a non-ASCII MC either. Since
+    /// these take CIGAR bytes, such a value now reaches the parser directly
+    /// rather than being discarded by a `str::from_utf8` gate first; the parser
+    /// reads the valid prefix and stops at the byte it cannot interpret.
     #[rstest]
     #[case::forward(false, 96)]
     #[case::reverse(true, 110)]
@@ -1643,7 +1649,10 @@ mod tests {
         #[case] expected: i32,
     ) {
         // "5S10M\u{e9}": leading clips 5, ref_len 10, no trailing clips.
-        assert_eq!(mate_unclipped_5prime_1based(100, mate_reverse, "5S10M\u{e9}"), expected);
+        assert_eq!(
+            mate_unclipped_5prime_1based(100, mate_reverse, "5S10M\u{e9}".as_bytes()),
+            expected
+        );
     }
 
     #[test]
@@ -2430,25 +2439,25 @@ mod tests {
 
     #[test]
     fn test_unclipped_other_start_no_clips() {
-        assert_eq!(unclipped_other_start(100, "10M"), 100);
+        assert_eq!(unclipped_other_start(100, b"10M"), 100);
     }
 
     #[test]
     fn test_unclipped_other_end_no_trailing_clips() {
         // 10M: end = 100 + 10 + 0 - 1 = 109
-        assert_eq!(unclipped_other_end(100, "10M"), 109);
+        assert_eq!(unclipped_other_end(100, b"10M"), 109);
     }
 
     #[test]
     fn test_unclipped_other_start_complex() {
         // 3H5S10M: leading = 3+5=8, start = 100 - 8 = 92
-        assert_eq!(unclipped_other_start(100, "3H5S10M"), 92);
+        assert_eq!(unclipped_other_start(100, b"3H5S10M"), 92);
     }
 
     #[test]
     fn test_unclipped_other_end_complex() {
         // 10M5S3H: ref=10, trailing=5+3=8, end = 100 + 10 + 8 - 1 = 117
-        assert_eq!(unclipped_other_end(100, "10M5S3H"), 117);
+        assert_eq!(unclipped_other_end(100, b"10M5S3H"), 117);
     }
 
     /// The inclusive-end `-1` must be applied before the saturating additions.
@@ -2456,14 +2465,14 @@ mod tests {
     /// reporting `i32::MAX - 1` for a coordinate whose exact value is `i32::MAX`.
     #[rstest::rstest]
     // 1M at MAX: MAX + 1 - 1 == MAX exactly, so no saturation is warranted.
-    #[case::exactly_max(i32::MAX, "1M", i32::MAX)]
+    #[case::exactly_max(i32::MAX, b"1M", i32::MAX)]
     // Genuinely past the top: saturation is correct here.
-    #[case::past_max(i32::MAX, "10M", i32::MAX)]
+    #[case::past_max(i32::MAX, b"10M", i32::MAX)]
     // A malformed MC whose spans saturate must still clamp at the top, not wrap.
-    #[case::saturated_spans(100, "2000000000M2000000000M", i32::MAX)]
+    #[case::saturated_spans(100, b"2000000000M2000000000M", i32::MAX)]
     fn test_unclipped_other_end_saturates_at_the_coordinate_ceiling(
         #[case] mate_pos: i32,
-        #[case] mc_cigar: &str,
+        #[case] mc_cigar: &[u8],
         #[case] expected: i32,
     ) {
         assert_eq!(unclipped_other_end(mate_pos, mc_cigar), expected);
@@ -2480,14 +2489,14 @@ mod tests {
     /// well-meaning `.max(0)`.
     #[rstest::rstest]
     // 1-based pos 3 with 10 leading clips: 3 - 10 = -7, before the contig start.
-    #[case::clips_past_contig_start(3, "10S5M", -7)]
-    #[case::clips_exactly_to_zero(10, "10S5M", 0)]
+    #[case::clips_past_contig_start(3, b"10S5M", -7)]
+    #[case::clips_exactly_to_zero(10, b"10S5M", 0)]
     // Even a malformed, saturated clip stays a (very negative) number rather
     // than wrapping: `saturating_sub` bottoms out at `i32::MIN`.
-    #[case::saturated_clip_does_not_wrap(100, "2000000000S2000000000S", 100 - i32::MAX)]
+    #[case::saturated_clip_does_not_wrap(100, b"2000000000S2000000000S", 100 - i32::MAX)]
     fn test_unclipped_other_start_is_not_clamped_to_the_contig_start(
         #[case] mate_pos: i32,
-        #[case] mc_cigar: &str,
+        #[case] mc_cigar: &[u8],
         #[case] expected: i32,
     ) {
         assert_eq!(unclipped_other_start(mate_pos, mc_cigar), expected);
