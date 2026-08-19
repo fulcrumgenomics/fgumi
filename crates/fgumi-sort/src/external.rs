@@ -504,13 +504,32 @@ fn process_umask() -> u32 {
     u32::from(previous)
 }
 
+/// RG-id to library-ordinal map, hashed with `ahash` rather than std's `SipHash`.
+///
+/// `ordinal_from_rg` runs once per record on the sort's serial Phase 1 thread --
+/// the thread that sets 60% of a spill-heavy sort's wall clock -- and hashing a
+/// ~40-byte RG id with `SipHash` measured **6.1% of that thread** on
+/// `1kg-wgs-HG00096` (`core::hash::sip::Hasher::write`, third-largest entry in
+/// its profile). The keys come from the header of a BAM the caller chose to
+/// sort, so there is no adversarial-input exposure that would argue for
+/// `SipHash`'s collision resistance here.
+///
+/// Unlike [`cb_hasher`] and [`LibraryLookup::hasher`], this one is left at
+/// `ahash`'s default randomly-seeded state rather than `with_seeds`. Those two
+/// feed hash values *into the sort key*, so they must be identical across
+/// processes or the same input would sort differently run to run. This map's
+/// hasher is never observed: it is probed only by `get`, and
+/// `distinct_header_ordinals` collects its values into a set, so neither the
+/// hash values nor the iteration order reaches an output.
+type RgOrdinalMap = HashMap<Vec<u8>, u32, ahash::RandomState>;
+
 /// Maps read group ID -> library ordinal for O(1) comparison.
 ///
 /// Pre-computes ordinals by sorting library names alphabetically.
 /// Empty/unknown library sorts first (ordinal 0).
 pub struct LibraryLookup {
     /// RG ID -> library ordinal
-    rg_to_ordinal: HashMap<Vec<u8>, u32>,
+    rg_to_ordinal: RgOrdinalMap,
     /// Deterministic hasher for read name hashing, constructed once for reuse.
     hasher: ahash::RandomState,
 }
@@ -542,7 +561,7 @@ impl LibraryLookup {
         }
 
         // Build RG ID -> ordinal mapping
-        let rg_to_ordinal: HashMap<Vec<u8>, u32> = header
+        let rg_to_ordinal: RgOrdinalMap = header
             .read_groups()
             .iter()
             .map(|(id, rg)| {
@@ -3296,6 +3315,13 @@ impl RawExternalSorter {
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
+        // Count records locally and forward in batches: `log_if_needed` does a
+        // relaxed `fetch_add` per call, which on aarch64 is an outline-atomics
+        // call into `__aarch64_ldadd8_relax`. On the ingest thread -- the serial
+        // thread that sets 60% of a spill-heavy sort's wall clock -- that helper
+        // measured 3.4% of the profile. The merge loops already batch for the
+        // same reason.
+        let mut progress_batch = crate::progress_batch::BatchedProgress::new();
         debug!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
         let mut probe = SpillProbe::new("phase1");
 
@@ -3305,7 +3331,7 @@ impl RawExternalSorter {
         // call, which is fine — `push_coordinate` copies the bytes into the buffer).
         while let Some(record) = record_source.next_record_borrowed()? {
             stats.total_records += 1;
-            progress.log_if_needed(1);
+            progress_batch.tick(&progress);
 
             // Push directly to buffer - key extracted inline from raw bytes
             buffer.push_coordinate(record)?;
@@ -3366,6 +3392,7 @@ impl RawExternalSorter {
         }
 
         timer.end_read_span();
+        progress_batch.flush(&progress);
         progress.log_final();
         if let Some(err) = record_source.take_error() {
             return Err(anyhow::Error::from(err));
@@ -3718,12 +3745,19 @@ impl RawExternalSorter {
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
+        // Count records locally and forward in batches: `log_if_needed` does a
+        // relaxed `fetch_add` per call, which on aarch64 is an outline-atomics
+        // call into `__aarch64_ldadd8_relax`. On the ingest thread -- the serial
+        // thread that sets 60% of a spill-heavy sort's wall clock -- that helper
+        // measured 3.4% of the profile. The merge loops already batch for the
+        // same reason.
+        let mut progress_batch = crate::progress_batch::BatchedProgress::new();
         debug!("Phase 1: Reading and sorting chunks (keyed output)...");
         let mut probe = SpillProbe::new("phase1");
 
         for record in record_source.by_ref() {
             stats.total_records += 1;
-            progress.log_if_needed(1);
+            progress_batch.tick(&progress);
 
             // Extract key from raw bytes. Stamp the ingest position within this
             // chunk so the key is totally ordered: read name + flags alone is not
@@ -3800,6 +3834,7 @@ impl RawExternalSorter {
         }
 
         timer.end_read_span();
+        progress_batch.flush(&progress);
         progress.log_final();
         if let Some(err) = record_source.take_error() {
             return Err(anyhow::Error::from(err));
@@ -4080,6 +4115,13 @@ impl RawExternalSorter {
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
+        // Count records locally and forward in batches: `log_if_needed` does a
+        // relaxed `fetch_add` per call, which on aarch64 is an outline-atomics
+        // call into `__aarch64_ldadd8_relax`. On the ingest thread -- the serial
+        // thread that sets 60% of a spill-heavy sort's wall clock -- that helper
+        // measured 3.4% of the profile. The merge loops already batch for the
+        // same reason.
+        let mut progress_batch = crate::progress_batch::BatchedProgress::new();
         debug!("Phase 1: Reading and sorting chunks (inline buffer)...");
         let mut probe = SpillProbe::new("phase1");
 
@@ -4089,7 +4131,7 @@ impl RawExternalSorter {
         // exceed the memory limit, so no spill check is needed here.
         if let Some(record) = first_record {
             stats.total_records += 1;
-            progress.log_if_needed(1);
+            progress_batch.tick(&progress);
 
             let bam_bytes = record.as_ref();
             let full = extract_template_key_inline(bam_bytes, lib_lookup, self.cell_tag, cb_hasher);
@@ -4108,7 +4150,7 @@ impl RawExternalSorter {
         // borrow ends, so no owned `RawRecord` is needed here.
         while let Some(bam_bytes) = record_source.next_record_borrowed()? {
             stats.total_records += 1;
-            progress.log_if_needed(1);
+            progress_batch.tick(&progress);
 
             // Extract the full template key, verify the lanes the chosen variant
             // dropped are constant relative to the first record, then push the
@@ -4174,6 +4216,7 @@ impl RawExternalSorter {
         }
 
         timer.end_read_span();
+        progress_batch.flush(&progress);
         progress.log_final();
         if let Some(err) = record_source.take_error() {
             return Err(anyhow::Error::from(err));
@@ -7445,6 +7488,76 @@ mod tests {
         aux.extend_from_slice(value);
         aux.push(0); // null terminator
         aux
+    }
+
+    /// Build `MC:Z:<value>` aux tag bytes.
+    fn mc_aux(value: &[u8]) -> Vec<u8> {
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ");
+        aux.extend_from_slice(value);
+        aux.push(0); // null terminator
+        aux
+    }
+
+    /// Overwrite the mate position of a record built by `build_mapped_bam`,
+    /// which otherwise sets it equal to the record's own position.
+    fn with_mate_pos(mut bam: Vec<u8>, mate_pos: i32) -> Vec<u8> {
+        bam[24..28].copy_from_slice(&mate_pos.to_le_bytes());
+        bam
+    }
+
+    /// The mate lane resolves through `MC`, and it lands where a record whose
+    /// mate is already at the unclipped position lands.
+    ///
+    /// The template-coordinate key is output-identity-critical against
+    /// `samtools sort`, and the mate lane is the one part of it that comes from
+    /// parsing a tag rather than from a fixed field offset. Asserting the two
+    /// keys are equal pins the whole lane -- packing included -- rather than
+    /// just the parser, which `cigar.rs` already covers.
+    #[test]
+    fn test_extract_template_key_mate_lane_comes_from_mc() {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+
+        // Mate at 100 with 10 leading soft clips: unclipped 5' is 90.
+        let with_mc = with_mate_pos(build_mapped_bam(0, 50, b"read1", &mc_aux(b"10S40M")), 100);
+        // The same record whose mate is already reported at 90, and no MC to parse.
+        let without_mc = with_mate_pos(build_mapped_bam(0, 50, b"read1", &[]), 90);
+
+        let keyed = extract_template_key_inline(&with_mc, &lib_lookup, None, &test_cb_hasher());
+        let expected =
+            extract_template_key_inline(&without_mc, &lib_lookup, None, &test_cb_hasher());
+        assert_eq!(keyed, expected, "MC-derived mate lane must equal the unclipped position");
+    }
+
+    /// A non-UTF-8 `MC` reaches the parser and its valid prefix still sets the
+    /// mate lane.
+    ///
+    /// Extraction hands `MC` over as raw bytes rather than validating it as
+    /// UTF-8 first, so this value is parsed where it was previously discarded
+    /// (leaving the mate lane at the raw mate position). This pins the change at
+    /// the key level, which is the level the sort order is defined at.
+    #[test]
+    fn test_extract_template_key_mate_lane_parses_a_non_utf8_mc_prefix() {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+
+        let with_bad_mc =
+            with_mate_pos(build_mapped_bam(0, 50, b"read1", &mc_aux(b"10S40M\xff")), 100);
+        let unclipped = with_mate_pos(build_mapped_bam(0, 50, b"read1", &[]), 90);
+        let raw_mate = with_mate_pos(build_mapped_bam(0, 50, b"read1", &[]), 100);
+
+        let keyed = extract_template_key_inline(&with_bad_mc, &lib_lookup, None, &test_cb_hasher());
+        assert_eq!(
+            keyed,
+            extract_template_key_inline(&unclipped, &lib_lookup, None, &test_cb_hasher()),
+            "the valid CIGAR prefix must still be applied"
+        );
+        assert_ne!(
+            keyed,
+            extract_template_key_inline(&raw_mate, &lib_lookup, None, &test_cb_hasher()),
+            "discarding the tag would leave the mate lane at the raw mate position"
+        );
     }
 
     #[test]
