@@ -296,7 +296,7 @@ struct SingleStrandConsensus {
 
 /// Per-molecule duplex base tallies produced while building a duplex consensus.
 ///
-/// These are returned rather than folded straight into [`CodecStats`] so the caller can
+/// These are returned rather than folded straight into [`CodecConsensusStats`] so the caller can
 /// apply them only *after* the consensus record has been serialized. A molecule whose output
 /// fails to build — an over-long input-derived UMI makes `try_build_record` reject the read
 /// name — emits nothing, so its duplex bases must not be counted, exactly as
