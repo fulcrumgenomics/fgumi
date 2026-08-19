@@ -388,7 +388,7 @@ impl CorrectUmis {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum RejectionReason {
+pub(crate) enum RejectionReason {
     WrongLength,
     Mismatched,
     #[default]
@@ -400,9 +400,9 @@ enum RejectionReason {
 /// This struct holds the result of correcting a UMI once for an entire template,
 /// which can then be applied to all records in that template.
 #[derive(Debug)]
-struct TemplateCorrection {
+pub(crate) struct TemplateCorrection {
     /// Whether the UMI matched successfully.
-    matched: bool,
+    pub(crate) matched: bool,
     /// The corrected UMI string (if matched).
     corrected_umi: Option<String>,
     /// The original UMI string.
@@ -412,9 +412,9 @@ struct TemplateCorrection {
     /// Whether there were actual mismatches (not just revcomp).
     has_mismatches: bool,
     /// Match details for metrics.
-    matches: Vec<UmiMatch>,
+    pub(crate) matches: Vec<UmiMatch>,
     /// Rejection reason if not matched.
-    rejection_reason: RejectionReason,
+    pub(crate) rejection_reason: RejectionReason,
 }
 
 // ============================================================================
@@ -452,17 +452,37 @@ impl MemoryEstimate for CorrectProcessedBatch {
 
 /// Metrics collected from UMI correction processing, aggregated post-pipeline.
 #[derive(Default)]
-struct CollectedCorrectMetrics {
+pub(crate) struct CollectedCorrectMetrics {
     /// Total templates processed.
-    templates_processed: u64,
+    pub(crate) templates_processed: u64,
     /// Records with missing UMI tag.
-    missing_umis: u64,
+    pub(crate) missing_umis: u64,
     /// Records with wrong UMI length.
-    wrong_length: u64,
+    pub(crate) wrong_length: u64,
     /// Records that didn't match any fixed UMI.
-    mismatched: u64,
+    pub(crate) mismatched: u64,
     /// Per-UMI match counts (for metrics file).
-    umi_matches: AHashMap<String, UmiCorrectionMetrics>,
+    pub(crate) umi_matches: AHashMap<String, UmiCorrectionMetrics>,
+}
+
+// Slot aggregation for the typed-step correction path
+// (`pipeline::steps::correct`). Per-UMI crediting is NOT re-derived here --
+// the step calls `CorrectUmis::credit_umi_metrics` directly, so both paths
+// share one definition of fgbio's per-segment accounting.
+impl CollectedCorrectMetrics {
+    /// Drain `other` into `self`, summing counts.
+    ///
+    /// Used to aggregate the per-thread accumulator slots once the pipeline has
+    /// drained. `other` is left empty.
+    pub(crate) fn merge_into(&mut self, other: &mut CollectedCorrectMetrics) {
+        self.templates_processed += std::mem::take(&mut other.templates_processed);
+        self.missing_umis += std::mem::take(&mut other.missing_umis);
+        self.wrong_length += std::mem::take(&mut other.wrong_length);
+        self.mismatched += std::mem::take(&mut other.mismatched);
+        for (umi, counts) in other.umi_matches.drain() {
+            merge_umi_counts(&mut self.umi_matches, umi, &counts);
+        }
+    }
 }
 
 impl Command for CorrectUmis {
@@ -683,7 +703,7 @@ impl CorrectUmis {
 
     /// Compute UMI correction for a template (called once per template).
     #[allow(clippy::too_many_arguments)]
-    fn compute_template_correction(
+    pub(crate) fn compute_template_correction(
         umi: &str,
         umi_length: usize,
         revcomp: bool,
@@ -788,7 +808,7 @@ impl CorrectUmis {
     ///
     /// `num_records` scales fgbio's per-record accounting to fgumi's
     /// per-template batching (both R1 and R2 of a template share one UMI).
-    fn credit_umi_metrics(
+    pub(crate) fn credit_umi_metrics(
         matches: &[UmiMatch],
         num_records: u64,
         unmatched_umi: &str,
@@ -826,7 +846,7 @@ impl CorrectUmis {
     /// - Records have different UMIs
     /// - Some records have UMIs and others don't
     /// - UMI tag has non-string type
-    fn extract_and_validate_template_umi_raw(
+    pub(crate) fn extract_and_validate_template_umi_raw(
         raw_records: &[RawRecord],
         umi_tag: [u8; 2],
     ) -> anyhow::Result<Option<String>> {
@@ -892,7 +912,7 @@ impl CorrectUmis {
     }
 
     /// Apply UMI correction to a raw BAM record.
-    fn apply_correction_to_raw(
+    pub(crate) fn apply_correction_to_raw(
         record: &mut RawRecord,
         correction: &TemplateCorrection,
         umi_tag: [u8; 2],
