@@ -37,10 +37,10 @@ use std::sync::Arc;
 /// Fast path: If sequence fits in a single line, skip newline stripping entirely.
 #[allow(clippy::cast_possible_truncation)]
 fn read_sequence_raw(file: &mut File, record: &fai::Record) -> Result<Vec<u8>> {
-    let line_bases = record.line_bases() as usize;
-    let line_width = record.line_width() as usize;
+    let line_bases = record.line_base_count().get() as usize;
+    let line_width = record.line_width().get() as usize;
     let seq_len = record.length() as usize;
-    let offset = record.offset();
+    let offset = record.position();
 
     // Fast path: if sequence fits in a single line, no newlines to strip
     if seq_len <= line_bases {
