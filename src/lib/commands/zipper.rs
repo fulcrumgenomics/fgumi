@@ -685,13 +685,11 @@ fn merge_raw_with(
 /// Appends a raw tag entry (tag + type byte + value bytes) to the destination record.
 ///
 /// This is the raw-byte equivalent of `append_buf_value_raw` — it copies the already-encoded
-/// bytes directly without going through `BufValue` decoding/re-encoding.
+/// bytes directly without going through `BufValue` decoding/re-encoding. Thin wrapper over the
+/// shared [`fgumi_raw_bam::append_raw_tag`] primitive, preserving the entry's own tag identifier.
 #[inline]
 fn append_raw_tag_entry(dest: &mut Vec<u8>, entry: &fgumi_raw_bam::TagEntry<'_>) {
-    dest.push(entry.tag[0]);
-    dest.push(entry.tag[1]);
-    dest.push(entry.type_byte);
-    dest.extend_from_slice(entry.value_bytes);
+    fgumi_raw_bam::append_raw_tag(dest, entry.tag, entry.type_byte, entry.value_bytes);
 }
 
 /// Applies the appropriate reverse operation for a tag in-place, dispatching on BAM type byte.

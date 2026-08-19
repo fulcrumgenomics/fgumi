@@ -607,6 +607,33 @@ pub fn array_tag_to_vec_u16(tag_ref: &ArrayTagRef) -> Vec<u16> {
     (0..tag_ref.count).map(|i| array_tag_element_u16(tag_ref, i)).collect()
 }
 
+/// Append a pre-encoded aux tag entry to a BAM record, verbatim.
+///
+/// Writes `[tag_byte_1, tag_byte_2, type_byte, value_bytes...]` to the end of the
+/// record's aux section. `type_byte` and `value_bytes` are the exact on-disk BAM
+/// encoding of the value (e.g. a `Z` value's trailing NUL, or a `B` array's
+/// subtype + count + elements), as yielded by [`TagEntry`]. The value is copied
+/// with no decode/re-encode, so the destination entry is byte-identical to the
+/// source apart from the two-byte tag identifier.
+///
+/// This is the shared primitive behind copying/renaming a tag: pair it with
+/// [`remove_tag`] on the destination first if an existing value must be
+/// overwritten. The caller is responsible for supplying a well-formed
+/// `(type_byte, value_bytes)`; no validation is performed.
+#[inline]
+pub fn append_raw_tag(
+    record: &mut Vec<u8>,
+    tag: impl AsTagBytes,
+    type_byte: u8,
+    value_bytes: &[u8],
+) {
+    let tag = tag.as_tag_bytes();
+    record.push(tag[0]);
+    record.push(tag[1]);
+    record.push(type_byte);
+    record.extend_from_slice(value_bytes);
+}
+
 /// Append a string (Z-type) tag to a BAM record.
 ///
 /// The tag is appended at the end of the record: `[tag_byte_1, tag_byte_2, 'Z', value..., NUL]`.
@@ -4431,5 +4458,20 @@ mod tests {
         // And still accept &[u8; 2] for backward compat.
         let v2 = find_string_tag(&aux, b"RX");
         assert_eq!(v2, Some(b"ACGT".as_ref()));
+    }
+
+    #[test]
+    fn append_raw_tag_writes_tag_type_and_value_verbatim() {
+        // Start from an aux block holding RX:Z:ACGT and copy it verbatim under CB.
+        let mut record = b"RXZACGT\0".to_vec();
+        let entry = RawTagsView::new(&record).iter().next().expect("one source tag");
+        let (type_byte, value_bytes) = (entry.type_byte, entry.value_bytes.to_vec());
+
+        append_raw_tag(&mut record, SamTag::CB, type_byte, &value_bytes);
+
+        // The appended entry is byte-identical to the source apart from the tag id,
+        // so the destination value (NUL terminator included) round-trips.
+        assert_eq!(find_string_tag(&record, SamTag::CB), Some(b"ACGT".as_ref()));
+        assert_eq!(&record[8..], b"CBZACGT\0", "verbatim tag+type+value bytes");
     }
 }
