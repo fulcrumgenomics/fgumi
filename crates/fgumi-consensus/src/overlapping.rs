@@ -422,9 +422,11 @@ impl ReadAndRefPosIterator {
         let min_ref_pos = rec_start_i32.max(mate_start as i32);
         let max_ref_pos = rec_end_i32.min(mate_end as i32);
 
-        let raw_ops = fgumi_raw_bam::get_cigar_ops(bam);
-        let cigar_ops: Vec<(u8, usize)> =
-            raw_ops.iter().map(|&op| ((op & 0xF) as u8, (op >> 4) as usize)).collect();
+        // Decode CIGAR ops straight from the raw bytes (no intermediate `Vec<u32>`).
+        let cigar_ops: Vec<(u8, usize)> = RawRecordView::new(bam)
+            .cigar_ops_iter()
+            .map(|op| ((op & 0xF) as u8, (op >> 4) as usize))
+            .collect();
 
         let start_read_pos = 1i32;
         let end_read_pos = rec_len;

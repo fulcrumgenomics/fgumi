@@ -305,11 +305,8 @@ pub fn regenerate_alignment_tags_raw(
     let ref_start = Position::new((alignment_start_0based + 1) as usize)
         .context("Invalid alignment start position")?;
 
-    // Get CIGAR ops (one small Vec allocation - typically 1-5 ops)
-    let cigar_ops = fgumi_raw_bam::get_cigar_ops(record);
-
-    // Calculate reference span from CIGAR ops
-    let ref_span = usize::try_from(fgumi_raw_bam::reference_length_from_cigar(&cigar_ops))
+    // Calculate reference span directly from the raw CIGAR bytes (zero allocation).
+    let ref_span = usize::try_from(fgumi_raw_bam::reference_length_from_raw_bam(record))
         .context("CIGAR-derived reference span is negative")?;
 
     // Handle edge case: CIGAR with no reference-consuming operations
@@ -345,7 +342,7 @@ pub fn regenerate_alignment_tags_raw(
     let mut seq_pos = 0;
     let mut match_count: usize = 0;
 
-    for &op in &cigar_ops {
+    for op in RawRecordView::new(record).cigar_ops_iter() {
         let op_type = op & 0xF;
         let op_len = (op >> 4) as usize;
 
