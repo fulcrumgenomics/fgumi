@@ -553,8 +553,8 @@ impl VanillaUmiConsensusCaller {
 
     /// Records `records` as rejected for [`RejectionReason::ZeroLengthAfterTrimming`].
     ///
-    /// [`Self::create_source_read`] returns `None` for reads with absent qualities or that trim to
-    /// zero length; [`Self::process_subgroup`] counts and writes those. A composing caller (the
+    /// [`Self::create_source_read`] returns `None` for reads that trim to zero length;
+    /// [`Self::process_subgroup`] counts and writes those. A composing caller (the
     /// duplex path) that calls `create_source_read` directly hands the dropped records here so they
     /// receive the same accounting: counted on the reason breakdown and, when tracking is enabled,
     /// drained through [`Self::take_rejected_reads`] alongside this caller's other rejections.
@@ -610,6 +610,13 @@ impl VanillaUmiConsensusCaller {
         let read_len = bases.len();
 
         if quals.is_empty() || quals.len() != read_len {
+            return None;
+        }
+
+        // Mirror `create_source_read`'s guard: absent qualities (0xFF per base) are not valid
+        // evidence, so drop such a read rather than treating it as high-quality. (`quals` is
+        // non-empty here, so `all` is not vacuously true.)
+        if quals.iter().all(|&q| q == 0xFF) {
             return None;
         }
 
@@ -1031,13 +1038,18 @@ impl VanillaUmiConsensusCaller {
     /// 5. Trailing N removal
     /// 6. CIGAR transformation (reverse if negative strand, truncate to final length)
     ///
-    /// Returns None if the final length is 0 (`ZeroPostAfterTrimming`).
+    /// Returns `Ok(None)` if the final length is 0 (`ZeroPostAfterTrimming`), which is a legitimate
+    /// filtering outcome. Returns `Err` if the read has absent base qualities (BAM `QUAL` of `*`,
+    /// encoded as `0xFF` per base) or a quality string whose length does not match the sequence:
+    /// those are structurally invalid input, not a biological filter, and — matching fgbio's
+    /// `toSourceRead` (`UmiConsensusCaller.scala:267-270`) — abort the run rather than silently
+    /// dropping the read (which would mask an upstream pipeline error).
     pub(crate) fn create_source_read(
         &self,
         raw: &[u8],
         original_idx: usize,
         mate_overlap_clip: usize,
-    ) -> Option<SourceRead> {
+    ) -> Result<Option<SourceRead>> {
         use fgumi_raw_bam as bam_fields;
 
         let view = RawRecordView::new(raw);
@@ -1050,15 +1062,32 @@ impl VanillaUmiConsensusCaller {
         let mut quals = view.quality_scores().to_vec();
         let read_len = bases.len();
 
-        if quals.is_empty() || quals.len() != read_len {
-            return None;
+        // A legal zero-length record (`SEQ=*`) has no bases and no qualities: it is not missing
+        // qualities, it simply has nothing to weight. Route it as `ZeroLengthAfterTrimming`
+        // (`Ok(None)`) before the quality checks below, which would otherwise treat the empty
+        // quality string as a length mismatch (and an empty `all(|&q| q == 0xFF)` is vacuously true).
+        if read_len == 0 {
+            return Ok(None);
         }
 
-        // Per the BAM spec, absent quality scores are encoded as 0xFF per base. Reject
-        // such reads rather than treating 0xFF as genuine very-high-quality evidence
-        // (which would let unqualified reads dominate consensus).
+        if quals.is_empty() || quals.len() != read_len {
+            bail!(
+                "input read has invalid base qualities (length {} does not match sequence length \
+                 {read_len}): {}",
+                quals.len(),
+                String::from_utf8_lossy(view.read_name()),
+            );
+        }
+
+        // Per the BAM spec, absent quality scores are encoded as 0xFF per base. This is
+        // structurally invalid input for a quality-weighted consensus — treating 0xFF as genuine
+        // very-high-quality evidence would let unqualified reads dominate — so abort the run
+        // (matching fgbio) rather than silently dropping the read and quietly degrading depth.
         if quals.iter().all(|&q| q == 0xFF) {
-            return None;
+            bail!(
+                "input read is missing base qualities (BAM QUAL is '*'): {}",
+                String::from_utf8_lossy(view.read_name()),
+            );
         }
 
         // If negative strand, reverse complement bases and reverse quals
@@ -1094,7 +1123,7 @@ impl VanillaUmiConsensusCaller {
         }
 
         if final_len == 0 {
-            return None;
+            return Ok(None);
         }
 
         bases.truncate(final_len);
@@ -1114,7 +1143,7 @@ impl VanillaUmiConsensusCaller {
         let rid = view.ref_id();
         let astart = i64::from(view.pos());
 
-        Some(SourceRead {
+        Ok(Some(SourceRead {
             original_idx,
             bases,
             quals,
@@ -1124,7 +1153,7 @@ impl VanillaUmiConsensusCaller {
             alignment_start: astart,
             original_cigar,
             name_hash: self.source_read_name_rank(view.read_name()),
-        })
+        }))
     }
 
     /// The downsampling rank for a `SourceRead`, or `0` when no cap is configured.
@@ -1387,7 +1416,7 @@ impl VanillaUmiConsensusCaller {
         for (idx, (raw, &mate_clip)) in
             group_reads.iter().zip(mate_overlap_clips.iter()).enumerate()
         {
-            if let Some(sr) = self.create_source_read(raw.as_ref(), idx, mate_clip) {
+            if let Some(sr) = self.create_source_read(raw.as_ref(), idx, mate_clip)? {
                 source_reads.push(sr);
             } else {
                 zero_length_indices.push(idx);
@@ -2257,9 +2286,11 @@ mod tests {
                 let r2_raw = create_test_read_at(&name, false, 1, pos_r2, b"TTTTGGGGCCCC");
                 let sr1 = caller
                     .create_source_read(r1_raw.as_ref(), i, 0)
+                    .expect("valid qualities")
                     .expect("R1 source read should be created");
                 let sr2 = caller
                     .create_source_read(r2_raw.as_ref(), i, 0)
+                    .expect("valid qualities")
                     .expect("R2 source read should be created");
                 (sr1, sr2)
             })
@@ -2429,7 +2460,10 @@ mod tests {
         let srcs: Vec<SourceRead> = (0..10)
             .map(|i| {
                 let read = create_test_read(&format!("q{i}"), b"ACGT", b"####", false, false);
-                caller.create_source_read(read.as_ref(), i, 0).expect("source read")
+                caller
+                    .create_source_read(read.as_ref(), i, 0)
+                    .expect("valid qualities")
+                    .expect("source read")
             })
             .collect();
 
@@ -3638,7 +3672,7 @@ mod tests {
             b.build()
         };
 
-        let source = caller.create_source_read(record.as_ref(), 0, 0);
+        let source = caller.create_source_read(record.as_ref(), 0, 0).expect("valid qualities");
         assert!(source.is_some(), "Should produce a SourceRead");
 
         let sr = source.expect("source read should be Some");
@@ -3676,8 +3710,10 @@ mod tests {
             VanillaUmiConsensusOptions { min_reads: 1, max_reads, ..Default::default() },
         );
         let read = create_test_read(name, b"ACGT", b"####", false, false);
-        let sr =
-            caller.create_source_read(read.as_ref(), 0, 0).expect("source read should be created");
+        let sr = caller
+            .create_source_read(read.as_ref(), 0, 0)
+            .expect("valid qualities")
+            .expect("source read should be created");
         assert_eq!(sr.name_hash, expected);
     }
 
@@ -3702,7 +3738,7 @@ mod tests {
             b.build()
         };
 
-        let source = caller.create_source_read(record.as_ref(), 0, 0);
+        let source = caller.create_source_read(record.as_ref(), 0, 0).expect("valid qualities");
         assert!(source.is_some(), "Should produce a SourceRead");
 
         let sr = source.expect("source read should be Some");
@@ -3732,7 +3768,7 @@ mod tests {
             b.build()
         };
 
-        let source = caller.create_source_read(record.as_ref(), 0, 0);
+        let source = caller.create_source_read(record.as_ref(), 0, 0).expect("valid qualities");
         assert!(source.is_some(), "Should produce a SourceRead");
 
         let sr = source.expect("source read should be Some");
@@ -3764,7 +3800,7 @@ mod tests {
             b.build()
         };
 
-        let source = caller.create_source_read(record.as_ref(), 0, 0);
+        let source = caller.create_source_read(record.as_ref(), 0, 0).expect("valid qualities");
         assert!(source.is_some(), "Should produce a SourceRead");
 
         let sr = source.expect("source read should be Some");
@@ -3799,7 +3835,7 @@ mod tests {
             b.build()
         };
 
-        let source = caller.create_source_read(record.as_ref(), 0, 0);
+        let source = caller.create_source_read(record.as_ref(), 0, 0).expect("valid qualities");
         // fgbio expected: None
         assert!(source.is_none(), "Should return None when all bases are masked or N");
     }
@@ -3836,7 +3872,7 @@ mod tests {
         let clip = num_bases_extending_past_mate_raw(r1.as_ref());
         assert_eq!(clip, 0, "FF pair should not trigger mate overlap clipping");
 
-        let source = caller.create_source_read(r1.as_ref(), 0, clip);
+        let source = caller.create_source_read(r1.as_ref(), 0, clip).expect("valid qualities");
         assert!(source.is_some(), "Should produce a SourceRead");
 
         let sr = source.expect("source read should be Some");
@@ -3873,7 +3909,7 @@ mod tests {
         };
 
         let clip = num_bases_extending_past_mate_raw(r1.as_ref());
-        let source = caller.create_source_read(r1.as_ref(), 0, clip);
+        let source = caller.create_source_read(r1.as_ref(), 0, clip).expect("valid qualities");
         assert!(source.is_some(), "Should produce a SourceRead");
 
         let sr = source.expect("source read should be Some");
@@ -3913,7 +3949,7 @@ mod tests {
         // R1 ends at 148, mate ends at 168, so R1 doesn't extend past mate
         assert_eq!(clip, 0, "R1 should not extend past mate");
 
-        let source = caller.create_source_read(r1.as_ref(), 0, clip);
+        let source = caller.create_source_read(r1.as_ref(), 0, clip).expect("valid qualities");
         assert!(source.is_some());
         assert_eq!(source.expect("source should be Some").bases.len(), 50);
     }
@@ -3949,7 +3985,7 @@ mod tests {
         // R1 ends at 148, mate ends at 128, so R1 extends 20 bases past mate
         assert_eq!(clip, 20, "R1 should extend 20 bases past mate");
 
-        let source = caller.create_source_read(r1.as_ref(), 0, clip);
+        let source = caller.create_source_read(r1.as_ref(), 0, clip).expect("valid qualities");
         assert!(source.is_some());
         let sr = source.expect("source read should be Some");
         assert_eq!(sr.bases.len(), 30, "Should be trimmed to 30 bases");
@@ -4065,7 +4101,8 @@ mod tests {
         // R1 extends 10 bases past mate's end
         assert_eq!(clip_r1, 10, "R1 should extend 10 bases past mate");
 
-        let source_r1 = caller.create_source_read(r1.as_ref(), 0, clip_r1);
+        let source_r1 =
+            caller.create_source_read(r1.as_ref(), 0, clip_r1).expect("valid qualities");
         assert!(source_r1.is_some(), "R1 should produce SourceRead");
         let sr1 = source_r1.expect("failed to get sr1");
 
@@ -4101,7 +4138,8 @@ mod tests {
         // R2's first 10 bases (positions 1-10) extend before mate's start (11)
         assert_eq!(clip_r2, 10, "R2 should extend 10 bases before mate start");
 
-        let source_r2 = caller.create_source_read(r2.as_ref(), 0, clip_r2);
+        let source_r2 =
+            caller.create_source_read(r2.as_ref(), 0, clip_r2).expect("valid qualities");
         assert!(source_r2.is_some(), "R2 should produce SourceRead");
         let sr2 = source_r2.expect("failed to get sr2");
 
@@ -4143,7 +4181,8 @@ mod tests {
 
         let clip_r1 = num_bases_extending_past_mate_raw(r1.as_ref());
 
-        let source_r1 = caller.create_source_read(r1.as_ref(), 0, clip_r1);
+        let source_r1 =
+            caller.create_source_read(r1.as_ref(), 0, clip_r1).expect("valid qualities");
         assert!(source_r1.is_some(), "R1 should produce SourceRead");
         let sr1 = source_r1.expect("failed to get sr1");
 
@@ -4184,7 +4223,8 @@ mod tests {
 
         let clip_r1 = num_bases_extending_past_mate_raw(r1.as_ref());
 
-        let source_r1 = caller.create_source_read(r1.as_ref(), 0, clip_r1);
+        let source_r1 =
+            caller.create_source_read(r1.as_ref(), 0, clip_r1).expect("valid qualities");
         assert!(source_r1.is_some(), "R1 should produce SourceRead");
         let sr1 = source_r1.expect("failed to get sr1");
 
@@ -4232,7 +4272,8 @@ mod tests {
         // R2 unclipped end is 57 (20+30-1+8=57)
         // R1 extends 2 bases past R2's end
 
-        let source_r1 = caller.create_source_read(r1.as_ref(), 0, clip_r1);
+        let source_r1 =
+            caller.create_source_read(r1.as_ref(), 0, clip_r1).expect("valid qualities");
         assert!(source_r1.is_some(), "R1 should produce SourceRead");
         let sr1 = source_r1.expect("failed to get sr1");
 
@@ -4734,7 +4775,7 @@ mod tests {
         let caller =
             VanillaUmiConsensusCaller::new("test".to_string(), "UMI1".to_string(), options);
 
-        let source = caller.create_source_read(record.as_ref(), 0, 0);
+        let source = caller.create_source_read(record.as_ref(), 0, 0).expect("valid qualities");
 
         assert!(source.is_some(), "Should produce a source read");
         let sr = source.expect("source read should be Some");
@@ -4748,12 +4789,13 @@ mod tests {
     // Test 40: Exception when reads lack base qualities
     // =========================================================================
 
-    /// Port of fgbio test: "except when the reads do not have base qualities"
-    /// Tests that reads without quality scores are handled appropriately
+    /// Port of fgbio test: "except when the reads do not have base qualities" (#794).
+    /// fgbio's `toSourceRead` throws when a read has no base qualities; `create_source_read` must
+    /// likewise return an error rather than silently dropping the read.
     #[test]
     fn test_reads_without_base_qualities() {
         // The BAM spec represents absent quality scores as 0xFF per base. SamBuilder
-        // emits 0xFF when qualities are not set. create_source_read must reject such
+        // emits 0xFF when qualities are not set. create_source_read must error on such
         // records rather than treating 0xFF as usable very-high-quality evidence.
         let record = {
             let mut b = SamBuilder::new();
@@ -4773,8 +4815,72 @@ mod tests {
 
         let result = caller.create_source_read(record.as_ref(), 0, 0);
         assert!(
-            result.is_none(),
-            "reads without base qualities should be rejected, not treated as usable qualities"
+            result.is_err(),
+            "reads without base qualities must error, not be silently rejected"
+        );
+    }
+
+    /// #794: a read with absent base qualities must abort consensus calling, matching fgbio.
+    ///
+    /// fgbio's `toSourceRead` throws `IllegalArgumentException` when a read has no base qualities
+    /// (`UmiConsensusCaller.scala:267-270`). fgumi previously dropped such reads silently, which can
+    /// mask an upstream pipeline error (a tool that stripped `QUAL`) by quietly degrading a
+    /// molecule's depth. This drives the whole consensus path — not just `create_source_read` — so
+    /// it fails loudly regardless of which caller sees the read.
+    #[test]
+    fn test_absent_base_qualities_abort_consensus() {
+        // The BAM spec encodes absent qualities as 0xFF per base; SamBuilder emits that when
+        // qualities are not set.
+        let record = {
+            let mut b = SamBuilder::new();
+            b.read_name(b"test")
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                .ref_id(0)
+                .pos(0)
+                .sequence(b"AAAAAAAAAA")
+                .cigar_ops(&[encode_op(0, 10)])
+                .add_string_tag(SamTag::MI, b"UMI1");
+            b.build()
+        };
+
+        let options = VanillaUmiConsensusOptions { min_reads: 1, ..Default::default() };
+        let mut caller =
+            VanillaUmiConsensusCaller::new("test".to_string(), "UMI1".to_string(), options);
+
+        let result = caller.consensus_reads(vec![record]);
+        assert!(
+            result.is_err(),
+            "a read with absent base qualities must abort the run, not be silently dropped"
+        );
+    }
+
+    /// A legal zero-length record (`SEQ=*`) has no bases and no qualities. It must be routed as
+    /// `ZeroLengthAfterTrimming` (`Ok(None)`) rather than tripping the absent-qualities guard: an
+    /// empty quality string is not "missing qualities on a read with bases", and an empty
+    /// `all(|&q| q == 0xFF)` is vacuously true. `process_subgroup` calls `create_source_read` before
+    /// unmapped filtering, so erroring here would abort otherwise-valid `--allow-unmapped` runs.
+    #[test]
+    fn test_zero_length_record_is_not_treated_as_absent_qualities() {
+        let record = {
+            let mut b = SamBuilder::new();
+            // SEQ=* / QUAL=*: no bases, no qualities.
+            b.read_name(b"empty")
+                .flags(flags::UNMAPPED)
+                .sequence(b"")
+                .add_string_tag(SamTag::MI, b"UMI1");
+            b.build()
+        };
+
+        let options = VanillaUmiConsensusOptions::default();
+        let caller =
+            VanillaUmiConsensusCaller::new("test".to_string(), "UMI1".to_string(), options);
+
+        let source = caller
+            .create_source_read(record.as_ref(), 0, 0)
+            .expect("a zero-length record must not error, unlike an absent-quality read");
+        assert!(
+            source.is_none(),
+            "a zero-length record must route as ZeroLengthAfterTrimming (None)"
         );
     }
 
