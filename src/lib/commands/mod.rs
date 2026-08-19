@@ -70,6 +70,7 @@ pub mod fastq;
 pub mod filter;
 pub mod group;
 pub mod merge;
+pub mod retag;
 pub mod review;
 pub mod shared_metrics;
 #[cfg(feature = "simplex")]
