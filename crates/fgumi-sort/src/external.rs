@@ -3556,9 +3556,17 @@ impl RawExternalSorter {
         debug!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
         let mut probe = SpillProbe::new("phase1");
 
-        for record in record_source.by_ref() {
+        // Borrow each record's bytes straight out of the decompressed block, as the
+        // non-indexed sibling does. `RecordSource`'s `Iterator` impl yields an owned
+        // `RawRecord`, which is a heap allocation plus a full-record memcpy per
+        // record -- freed again as soon as `push_coordinate` has copied the bytes
+        // into the arena -- on the serial thread that sets 60% of a spill-heavy
+        // sort's wall clock. Nothing here needs the record to outlive the push: the
+        // BAI is built by the writer from BGZF offsets during the merge, not from
+        // this loop.
+        while let Some(record) = record_source.next_record_borrowed()? {
             stats.total_records += 1;
-            buffer.push_coordinate(record.as_ref())?;
+            buffer.push_coordinate(record)?;
 
             if probe.should_sample_read(stats.total_records) {
                 probe.log_mid_read(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
