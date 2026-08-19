@@ -60,3 +60,7 @@ rstest = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
+
+[[bench]]
+name = "template_key"
+harness = false
