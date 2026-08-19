@@ -121,9 +121,179 @@ impl Phase1IngestReport {
     }
 }
 
+/// One record in this many is timed for the sub-phase partition.
+///
+/// Prime, so the sampled set cannot align with any periodic structure in the
+/// input (read groups, tile boundaries, alternating mate records) and bias the
+/// partition toward whichever records happen to be cheap.
+pub(crate) const INGEST_SAMPLE_INTERVAL: u64 = 1021;
+
+/// Where the ingest thread's serial CPU goes, per record.
+///
+/// The floor line says this thread *is* the limit -- on a 16-thread whole-genome
+/// sort it is 137.2s of a 145.7s read span, against a worker-capacity floor of
+/// 22.4s -- so the only question left is what the 137.2s is made of. Nothing else
+/// in the phase can answer it: worker counters describe the pool, and wall-clock
+/// spans describe the phase, and neither looks inside the loop.
+///
+/// Sampled rather than timed on every record, for the same reason
+/// [`crate::merge_headroom::ConsumerSample`] is: the loop runs at ~175 ns/record
+/// and an `Instant::now()` pair costs 15-35 ns on aarch64, so timing five
+/// segments on every record would cost more than several of the segments it
+/// measures. One record in [`INGEST_SAMPLE_INTERVAL`] is timed and scaled, and
+/// the scale is reported next to the result.
+///
+/// Each field is **exactly one** timed region in the loop, which is what makes
+/// [`Self::corrected`] valid: it subtracts one clock pair per field per sample,
+/// so a field spanning two bracketed regions would be under-corrected by a
+/// whole pair. That is why progress counting and spill probing are separate
+/// fields rather than one "bookkeeping" bucket -- they sit at opposite ends of
+/// the loop body and cannot share a bracket.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct IngestSample {
+    /// Pulling the next record's bytes from the pool's decompressed stream.
+    /// **Includes park time**, so it is not pure CPU -- `park_secs` measures that
+    /// part exactly and separately.
+    pub(crate) fetch: f64,
+    /// Extracting the sort key from the record bytes.
+    pub(crate) key: f64,
+    /// Verifying that the lanes the chosen key variant drops are constant.
+    pub(crate) verify: f64,
+    /// Copying the record into the arena and appending its ref.
+    pub(crate) push: f64,
+    /// Counting the record toward the progress log.
+    pub(crate) tick: f64,
+    /// The spill probe's sample check and the memory-limit test that follows it.
+    pub(crate) probe: f64,
+}
+
+impl IngestSample {
+    /// Every segment multiplied by the sampling scale.
+    #[must_use]
+    pub(crate) fn scaled(self, scale: f64) -> Self {
+        Self {
+            fetch: self.fetch * scale,
+            key: self.key * scale,
+            verify: self.verify * scale,
+            push: self.push * scale,
+            tick: self.tick * scale,
+            probe: self.probe * scale,
+        }
+    }
+
+    /// Every segment with its own measurement overhead removed.
+    ///
+    /// One `Instant::now()`/`elapsed()` pair per segment per sampled record, and
+    /// that pair's cost lands inside the interval it times. Clamped at zero: a
+    /// segment cheaper than the clock measuring it cannot be resolved this way,
+    /// and zero says so where a negative would read as a bug.
+    #[must_use]
+    pub(crate) fn corrected(self, samples: u64, overhead_nanos: u64) -> Self {
+        if samples == 0 || overhead_nanos == 0 {
+            return self;
+        }
+        #[expect(clippy::cast_precision_loss, reason = "sample counts stay below 2^52")]
+        let per_segment = (samples * overhead_nanos) as f64 / 1e9;
+        let fix = |v: f64| (v - per_segment).max(0.0);
+        Self {
+            fetch: fix(self.fetch),
+            key: fix(self.key),
+            verify: fix(self.verify),
+            push: fix(self.push),
+            tick: fix(self.tick),
+            probe: fix(self.probe),
+        }
+    }
+
+    /// The six segments summed.
+    #[must_use]
+    pub(crate) fn total(self) -> f64 {
+        self.fetch + self.key + self.verify + self.push + self.tick + self.probe
+    }
+}
+
+/// A scaled ingest sample checked against the read span it should partition.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IngestPartition {
+    /// Scaled, corrected per-segment seconds.
+    pub(crate) segments: IngestSample,
+    /// Measured read span, exact.
+    pub(crate) read_secs: f64,
+    /// Park time inside `segments.fetch`, measured exactly and separately.
+    pub(crate) park_secs: f64,
+}
+
+impl IngestPartition {
+    /// Read-span time the segments do not account for.
+    ///
+    /// **Signed on purpose.** A negative residual means the sample
+    /// over-attributes -- clock overhead left inside the timed regions, or a
+    /// sampling bias -- and the merge's first partition did exactly that,
+    /// summing to 321.5s of a 189.3s loop. Only the sign made it visible; a
+    /// clamped residual would have reported a tidy zero and the partition would
+    /// have been believed.
+    #[must_use]
+    pub(crate) fn residual_secs(self) -> f64 {
+        self.read_secs - self.segments.total()
+    }
+
+    /// Residual as a share of the read span, for judging whether the partition
+    /// is trustworthy at all.
+    #[must_use]
+    pub(crate) fn residual_share(self) -> f64 {
+        if self.read_secs > 0.0 { self.residual_secs() / self.read_secs } else { 0.0 }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_the_residual_is_signed_so_over_attribution_is_visible() {
+        // The merge's first partition summed to 321.5s of a 189.3s loop. A
+        // clamped residual would have shown 0.0 and the numbers would have been
+        // believed; the sign is what exposed the clock overhead inside them.
+        let over = IngestPartition {
+            segments: IngestSample { fetch: 200.0, ..IngestSample::default() },
+            read_secs: 100.0,
+            park_secs: 0.0,
+        };
+        assert!(over.residual_secs() < 0.0, "got {}", over.residual_secs());
+        assert!((over.residual_share() + 1.0).abs() < 1e-9, "got {}", over.residual_share());
+    }
+
+    #[test]
+    fn test_clock_correction_subtracts_one_pair_per_segment_per_sample() {
+        // Ten samples, 20 ns per pair, five segments: each segment carries
+        // 10 x 20 ns = 200 ns of clock, and each is corrected independently.
+        let raw = IngestSample {
+            fetch: 1e-6,
+            key: 1e-6,
+            verify: 1e-7,
+            push: 1e-6,
+            tick: 1e-6,
+            probe: 1e-6,
+        };
+        let fixed = raw.corrected(10, 20);
+        assert!((fixed.fetch - 0.8e-6).abs() < 1e-12, "got {}", fixed.fetch);
+        // A segment cheaper than the clock that measured it clamps to zero rather
+        // than going negative, which would read as a bug rather than as
+        // "unresolvable by this method".
+        assert!((fixed.verify - 0.0).abs() < 1e-12, "got {}", fixed.verify);
+    }
+
+    #[test]
+    fn test_scaling_happens_before_correction_is_meaningful() {
+        // Scale multiplies the sampled segments up to the whole loop; correction
+        // works on the sampled scale. Applying them in the wrong order would
+        // subtract one pair's cost from the *scaled* total rather than from each
+        // sample, understating the correction by the scale factor.
+        let raw = IngestSample { key: 2e-6, ..IngestSample::default() };
+        let corrected_then_scaled = raw.corrected(10, 20).scaled(1000.0);
+        let scaled_then_corrected = raw.scaled(1000.0).corrected(10, 20);
+        assert!(corrected_then_scaled.key < scaled_then_corrected.key);
+    }
 
     #[test]
     fn test_park_causes_are_counted_separately() {

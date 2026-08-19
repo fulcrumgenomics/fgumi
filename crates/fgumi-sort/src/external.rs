@@ -360,6 +360,73 @@ impl SortPhaseTimer {
                 ingest.spill_waits
             );
         }
+        self.log_ingest_partition(phase1);
+    }
+
+    /// What the ingest thread's serial CPU is made of, per segment.
+    ///
+    /// Correction happens at the sampled scale and scaling second: subtracting
+    /// one clock pair from the *scaled* total instead would understate the
+    /// correction by the scale factor, which on a 1-in-1021 sample is three
+    /// orders of magnitude.
+    #[allow(clippy::cast_precision_loss, reason = "record counts stay below 2^52")]
+    fn log_ingest_partition(&self, phase1: Phase1FloorInputs) {
+        if phase1.samples == 0 || phase1.records == 0 {
+            return;
+        }
+        let scale = phase1.records as f64 / phase1.samples as f64;
+        let segments =
+            phase1.sample.corrected(phase1.samples, phase1.clock_overhead_nanos).scaled(scale);
+        let partition = crate::phase1_stats::IngestPartition {
+            segments,
+            read_secs: self.read_secs,
+            park_secs: phase1.ingest.park_secs,
+        };
+        let per_record = |secs: f64| 1e9 * secs / phase1.records as f64;
+        stat!(
+            "    Ingest segments ({} samples of {} records, scaled {scale:.0}x, clock {}ns/pair)",
+            phase1.samples,
+            phase1.records,
+            phase1.clock_overhead_nanos
+        );
+        stat!(
+            "      fetch next record: {:.1}s ({:.0} ns/rec)  [includes {:.1}s parked]",
+            segments.fetch,
+            per_record(segments.fetch),
+            partition.park_secs
+        );
+        stat!(
+            "      extract key:       {:.1}s ({:.0} ns/rec)",
+            segments.key,
+            per_record(segments.key)
+        );
+        stat!(
+            "      verify lanes:      {:.1}s ({:.0} ns/rec)",
+            segments.verify,
+            per_record(segments.verify)
+        );
+        stat!(
+            "      push to arena:     {:.1}s ({:.0} ns/rec)",
+            segments.push,
+            per_record(segments.push)
+        );
+        stat!(
+            "      progress tick:     {:.1}s ({:.0} ns/rec)",
+            segments.tick,
+            per_record(segments.tick)
+        );
+        stat!(
+            "      probe + mem check: {:.1}s ({:.0} ns/rec)",
+            segments.probe,
+            per_record(segments.probe)
+        );
+        // Signed: a negative residual means the segments over-attribute, which is
+        // the failure mode this partition exists to make visible.
+        stat!(
+            "      unattributed:      {:+.1}s ({:+.0}% of the read span)",
+            partition.residual_secs(),
+            100.0 * partition.residual_share()
+        );
     }
 }
 
@@ -377,6 +444,16 @@ pub(crate) struct Phase1FloorInputs {
     pub(crate) threads: usize,
     /// What the ingest thread waited for.
     pub(crate) ingest: crate::phase1_stats::Phase1IngestReport,
+    /// Raw (unscaled, uncorrected) sub-phase sample from the ingest loop, when
+    /// that loop is instrumented. Left at zero by the orders that are not.
+    pub(crate) sample: crate::phase1_stats::IngestSample,
+    /// Records timed for `sample`.
+    pub(crate) samples: u64,
+    /// Records the loop processed, the numerator of the sampling scale.
+    pub(crate) records: u64,
+    /// Measured cost of one `Instant::now()`/`elapsed()` pair, subtracted once
+    /// per segment per sample.
+    pub(crate) clock_overhead_nanos: u64,
 }
 
 /// Deterministic hasher for cell barcode hashing in template-coordinate sort.
@@ -3542,6 +3619,7 @@ impl RawExternalSorter {
             input_busy_secs: pool.phase1_input_busy_secs(),
             threads: self.phase1_threads(),
             ingest: pool.phase1_ingest_stats().snapshot(),
+            ..Phase1FloorInputs::default()
         };
         self.enter_output_phase(&pool);
 
@@ -3752,6 +3830,7 @@ impl RawExternalSorter {
             input_busy_secs: pool.phase1_input_busy_secs(),
             threads: self.phase1_threads(),
             ingest: pool.phase1_ingest_stats().snapshot(),
+            ..Phase1FloorInputs::default()
         };
         self.enter_output_phase(&pool);
 
@@ -4018,6 +4097,7 @@ impl RawExternalSorter {
             input_busy_secs: pool.phase1_input_busy_secs(),
             threads: self.phase1_threads(),
             ingest: pool.phase1_ingest_stats().snapshot(),
+            ..Phase1FloorInputs::default()
         };
         self.enter_output_phase(&pool);
 
@@ -4317,32 +4397,84 @@ impl RawExternalSorter {
             buffer.push(bam_bytes, K::from_full(&full))?;
         }
 
+        // Sub-phase timing for the ingest thread's serial CPU, which the floor
+        // line identifies as this phase's binding limit. Sampled 1-in-N and
+        // clock-corrected, per `crate::phase1_stats::IngestSample`; the segments
+        // are checked against the measured read span with a signed residual, so a
+        // partition that over-attributes says so instead of looking tidy.
+        let ingest_sample_interval = crate::phase1_stats::INGEST_SAMPLE_INTERVAL;
+        let clock_overhead_nanos = crate::merge_headroom::measure_clock_overhead_nanos();
+        let mut ingest_raw = crate::phase1_stats::IngestSample::default();
+        let mut ingest_samples: u64 = 0;
+        let mut sample_countdown: u64 = 0;
+
         // Borrow each record's bytes in place (see the coordinate ingest loop);
         // the key is extracted and the bytes copied into the buffer before the
         // borrow ends, so no owned `RawRecord` is needed here.
-        while let Some(bam_bytes) = record_source.next_record_borrowed()? {
+        loop {
+            // Decide sampling before the fetch, so every segment below is timed
+            // on the same records or on none. Timing a subset would bias the
+            // partition toward whichever step happened to be measured, and the
+            // partition's whole value is that its segments sum to the span.
+            let sample_this = sample_countdown == 0;
+            if sample_this {
+                sample_countdown = ingest_sample_interval - 1;
+                ingest_samples += 1;
+            } else {
+                sample_countdown -= 1;
+            }
+
+            let t = sample_this.then(Instant::now);
+            let Some(bam_bytes) = record_source.next_record_borrowed()? else { break };
+            if let Some(t0) = t {
+                ingest_raw.fetch += t0.elapsed().as_secs_f64();
+            }
+
             stats.total_records += 1;
+            let t = sample_this.then(Instant::now);
             progress_batch.tick(&progress);
+            if let Some(t0) = t {
+                ingest_raw.tick += t0.elapsed().as_secs_f64();
+            }
 
             // Extract the full template key, verify the lanes the chosen variant
             // dropped are constant relative to the first record, then push the
             // narrowed key.
+            let t = sample_this.then(Instant::now);
             let full = extract_template_key_inline(bam_bytes, lib_lookup, self.cell_tag, cb_hasher);
-            if let Some(violation) = verify_dropped_lanes(&first, &full, variant) {
+            if let Some(t0) = t {
+                ingest_raw.key += t0.elapsed().as_secs_f64();
+            }
+            let t = sample_this.then(Instant::now);
+            let violation = verify_dropped_lanes(&first, &full, variant);
+            if let Some(t0) = t {
+                ingest_raw.verify += t0.elapsed().as_secs_f64();
+            }
+            if let Some(violation) = violation {
                 let name = String::from_utf8_lossy(
                     fgumi_raw_bam::RawRecordView::new(bam_bytes).read_name(),
                 )
                 .into_owned();
                 return Err(dropped_lane_error(&name, violation));
             }
+            let t = sample_this.then(Instant::now);
             buffer.push(bam_bytes, K::from_full(&full))?;
+            if let Some(t0) = t {
+                ingest_raw.push += t0.elapsed().as_secs_f64();
+            }
 
-            if probe.should_sample_read(stats.total_records) {
+            let t = sample_this.then(Instant::now);
+            let should_probe = probe.should_sample_read(stats.total_records);
+            let over_limit = buffer.memory_usage() >= self.memory_limit;
+            if let Some(t0) = t {
+                ingest_raw.probe += t0.elapsed().as_secs_f64();
+            }
+            if should_probe {
                 probe.log_mid_read(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
             }
 
             // Check memory usage
-            if buffer.memory_usage() >= self.memory_limit {
+            if over_limit {
                 timer.end_read_span();
                 let bstats = probe_stats(&buffer);
                 let depths = Some(pool.phase1_queue_depths());
@@ -4413,6 +4545,10 @@ impl RawExternalSorter {
             input_busy_secs: pool.phase1_input_busy_secs(),
             threads: self.phase1_threads(),
             ingest: pool.phase1_ingest_stats().snapshot(),
+            sample: ingest_raw,
+            samples: ingest_samples,
+            records: stats.total_records,
+            clock_overhead_nanos,
         };
         self.enter_output_phase(&pool);
 
