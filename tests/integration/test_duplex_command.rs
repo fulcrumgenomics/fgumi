@@ -834,6 +834,97 @@ fn test_duplex_zero_length_rejects_preserve_input_order_for_b_strand(
     );
 }
 
+/// #791: a whole-group rejection downstream of the single-strand filter must split its `--stats`
+/// reasons the way fgbio does (first-writer-wins).
+///
+/// `--min-reads 4` is met before single-strand filtering (four templates per strand) and missed
+/// after the two minority-alignment templates are dropped (three survive per strand), so the group
+/// is rejected as `InsufficientSupport` downstream of the filter. The four minority reads must be
+/// counted under `raw_reads_rejected_for_minority_alignment`, and only the twelve survivors under
+/// `raw_reads_rejected_for_insufficient_support` — not the whole group under one reason. The reject
+/// total is unchanged, so `--rejects` still reconciles.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_duplex_whole_group_rejection_splits_stats_reasons(#[case] threads: Option<&str>) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+    let stats_path = temp_dir.path().join("stats.txt");
+
+    // 3M1D5M against the majority 8M: same query length, different alignment pattern.
+    let gapped = [3u32 << 4, (1u32 << 4) | 2, 5u32 << 4];
+    let mut molecule = create_duplex_molecule("1", "ACGTACGT", 30, 100, 3);
+    molecule.push(create_duplex_read_pair_with_cigar(
+        "min_a", "1/A", "ACGTACGT", "ACGTACGT", 30, 100, false, &gapped,
+    ));
+    molecule.push(create_duplex_read_pair_with_cigar(
+        "min_b", "1/B", "ACGTACGT", "ACGTACGT", 30, 100, true, &gapped,
+    ));
+    create_duplex_bam(&input_bam, vec![molecule]);
+
+    let mut args = vec![
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--rejects",
+        rejects_bam.to_str().unwrap(),
+        "--stats",
+        stats_path.to_str().unwrap(),
+        "--min-reads",
+        "4",
+        "--compression-level",
+        "1",
+    ];
+    if let Some(threads) = threads {
+        args.extend_from_slice(&["--threads", threads]);
+    }
+    Duplex::try_parse_from(args)
+        .expect("failed to parse duplex args")
+        .execute("fgumi duplex")
+        .expect("Duplex command failed");
+
+    let mut output_reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    output_reader.read_header().expect("read output header");
+    assert_eq!(
+        output_reader.records().count(),
+        0,
+        "the group must be rejected once the minority templates drop it below --min-reads"
+    );
+
+    let reject_count = read_raw_records(&rejects_bam).len();
+
+    let stats = fs::read_to_string(&stats_path).expect("read stats");
+    let stat = |key: &str| -> usize {
+        stats
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}\t")))
+            .and_then(|rest| rest.split('\t').next())
+            .unwrap_or_else(|| panic!("stats must contain a {key} row"))
+            .parse()
+            .unwrap_or_else(|_| panic!("{key} must be an integer"))
+    };
+    assert_eq!(
+        stat("raw_reads_rejected_for_minority_alignment"),
+        4,
+        "the four minority reads must keep their single-strand reason"
+    );
+    assert_eq!(
+        stat("raw_reads_rejected_for_insufficient_support"),
+        12,
+        "only the twelve survivors are attributed to the whole-group reason"
+    );
+    assert_eq!(stat("raw_reads_rejected"), 16, "every input read is rejected exactly once");
+    assert_eq!(
+        reject_count,
+        stat("raw_reads_rejected"),
+        "the rejects BAM record count must equal raw_reads_rejected"
+    );
+}
+
 /// #757 (follow-up): single-strand rejects must reach the rejects BAM in input order.
 ///
 /// The two combined alignment groups split a template's ends across strands: X = AB-R1 +
