@@ -245,7 +245,13 @@ impl SortPhaseTimer {
     /// `max_temp_files` is reported so a run that consolidated says which limit
     /// it consolidated against.
     #[allow(clippy::cast_precision_loss)]
-    fn log_summary(&self, sort_threads: usize, merge_threads: usize, max_temp_files: usize) {
+    fn log_summary(
+        &self,
+        sort_threads: usize,
+        merge_threads: usize,
+        max_temp_files: usize,
+        phase1: Phase1FloorInputs,
+    ) {
         let overall = self.overall_start.map_or(0.0, |s| s.elapsed().as_secs_f64());
         // Guard against division by zero when sort completes in negligible time.
         let overall_nonzero = if overall > 0.0 { overall } else { f64::EPSILON };
@@ -289,13 +295,89 @@ impl SortPhaseTimer {
         }
         stat!("  Total wall clock:  {overall:.1}s");
         stat!("  Threads: {}", format_thread_counts(sort_threads, merge_threads));
+        self.log_phase1_floor(phase1);
         stat!("=========================");
+    }
+
+    /// Which of three limits Phase 1's *ingest* is against, and what is
+    /// recoverable without doing less work.
+    ///
+    /// Scoped to the read span rather than the whole phase, deliberately. The
+    /// in-memory sort is parallel (rayon) and the spill write-out overlaps the
+    /// next read, so folding them in would put parallel work on the same side of
+    /// the comparison as one thread's serial CPU and report the difference as
+    /// "coordination" -- naming a limit that is not there. The read span is the
+    /// part where one thread reads every record while the pool feeds it, which is
+    /// exactly the shape [`crate::merge_headroom`] models.
+    ///
+    /// Externally sampled, this phase is 60% of a whole-genome sort's wall clock
+    /// with its main thread 91% busy while 16 cores average 5.3. If that holds
+    /// in-process, the binding limit is the ingest thread and no amount of
+    /// additional worker capacity moves it.
+    fn log_phase1_floor(&self, phase1: Phase1FloorInputs) {
+        if self.read_secs <= 0.0 {
+            return;
+        }
+        let ingest = phase1.ingest;
+        let floors = crate::merge_headroom::MergeFloors {
+            loop_secs: self.read_secs,
+            consumer_secs: (self.read_secs - ingest.park_secs).max(0.0),
+            worker_busy_secs: phase1.input_busy_secs,
+            threads: phase1.threads.max(1),
+        };
+        stat!("  Phase 1 ingest floor: {} is the limit", floors.binding().label());
+        stat!(
+            "    ingest serial {:.1}s | worker capacity {:.1}s ({} threads) | read span {:.1}s",
+            floors.consumer_secs,
+            floors.worker_floor_secs(),
+            floors.threads,
+            self.read_secs
+        );
+        stat!(
+            "    recoverable without doing less work: {:.1}s ({:.0}% of the read span)",
+            floors.recoverable_secs(),
+            100.0 * floors.recoverable_share()
+        );
+        if ingest.parks > 0 {
+            // Mean park separates a supply problem from a handoff problem: many
+            // short parks and few long ones need opposite fixes, and the totals
+            // alone cannot tell them apart.
+            stat!(
+                "    ingest parked {:.1}s over {} parks ({:.0} us each): {} starved, {} head-of-line",
+                ingest.park_secs,
+                ingest.parks,
+                ingest.mean_park_micros().unwrap_or(0.0),
+                ingest.parks_starved,
+                ingest.parks_head_of_line
+            );
+        } else {
+            stat!("    ingest never parked: the pool always had the next block ready");
+        }
+        if ingest.spill_waits > 0 {
+            stat!(
+                "    waited {:.1}s over {} spill handoffs (outside every phase bucket)",
+                ingest.spill_wait_secs,
+                ingest.spill_waits
+            );
+        }
     }
 }
 
 // ============================================================================
 // Library Lookup for Template-Coordinate Sort
 // ============================================================================
+
+/// What the Phase 1 floor line needs that [`SortPhaseTimer`] cannot see: the
+/// pool's worker time and the ingest thread's waits.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Phase1FloorInputs {
+    /// Worker seconds reading and decompressing input blocks.
+    pub(crate) input_busy_secs: f64,
+    /// Active Phase 1 worker threads the busy total is spread over.
+    pub(crate) threads: usize,
+    /// What the ingest thread waited for.
+    pub(crate) ingest: crate::phase1_stats::Phase1IngestReport,
+}
 
 /// Deterministic hasher for cell barcode hashing in template-coordinate sort.
 ///
@@ -2760,7 +2842,16 @@ impl RawExternalSorter {
         pool: &std::sync::Arc<crate::worker_pool::SortWorkerPool>,
     ) -> Result<()> {
         if let Some(prev) = pending.take() {
+            // Timed because it lands in no phase bucket: this sits between
+            // `end_read_span` and `time_sort`, so without its own counter the
+            // ingest thread's wall clock and its own CPU cannot be reconciled and
+            // the difference shows up only as an unexplained residual against
+            // total wall clock.
+            let waited_at = Instant::now();
             prev.handle.wait()?;
+            pool.phase1_ingest_stats().record_spill_wait(
+                u64::try_from(waited_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
             timer.record_spill_growth(&prev.chunk_path, prev.size_before);
             // A chunk that extended an existing run is already represented in
             // `chunk_files`; only a chunk that started a run adds a merge source.
@@ -3444,6 +3535,14 @@ impl RawExternalSorter {
         probe.phase1_end(buffer.memory_usage() as u64);
 
         // Ingest is done: everything from here is Phase 2 (merge/write).
+        // Snapshot Phase 1's floor inputs before the pool is handed to the merge:
+        // the counters describe the phase that has just ended, and reading them
+        // later would both borrow a moved value and risk folding in Phase 2 work.
+        let phase1_floor = Phase1FloorInputs {
+            input_busy_secs: pool.phase1_input_busy_secs(),
+            threads: self.phase1_threads(),
+            ingest: pool.phase1_ingest_stats().snapshot(),
+        };
         self.enter_output_phase(&pool);
 
         if chunk_files.is_empty() {
@@ -3508,7 +3607,12 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(self.phase1_threads(), self.phase2_threads(), self.max_temp_files);
+        timer.log_summary(
+            self.phase1_threads(),
+            self.phase2_threads(),
+            self.max_temp_files,
+            phase1_floor,
+        );
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -3641,6 +3745,14 @@ impl RawExternalSorter {
         let output_header = self.create_output_header(header);
 
         // Ingest is done: everything from here is Phase 2 (merge/write).
+        // Snapshot Phase 1's floor inputs before the pool is handed to the merge:
+        // the counters describe the phase that has just ended, and reading them
+        // later would both borrow a moved value and risk folding in Phase 2 work.
+        let phase1_floor = Phase1FloorInputs {
+            input_busy_secs: pool.phase1_input_busy_secs(),
+            threads: self.phase1_threads(),
+            ingest: pool.phase1_ingest_stats().snapshot(),
+        };
         self.enter_output_phase(&pool);
 
         if chunk_files.is_empty() {
@@ -3715,7 +3827,12 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(self.phase1_threads(), self.phase2_threads(), self.max_temp_files);
+        timer.log_summary(
+            self.phase1_threads(),
+            self.phase2_threads(),
+            self.max_temp_files,
+            phase1_floor,
+        );
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -3894,6 +4011,14 @@ impl RawExternalSorter {
         probe.phase1_end(memory_used as u64);
 
         // Ingest is done: everything from here is Phase 2 (merge/write).
+        // Snapshot Phase 1's floor inputs before the pool is handed to the merge:
+        // the counters describe the phase that has just ended, and reading them
+        // later would both borrow a moved value and risk folding in Phase 2 work.
+        let phase1_floor = Phase1FloorInputs {
+            input_busy_secs: pool.phase1_input_busy_secs(),
+            threads: self.phase1_threads(),
+            ingest: pool.phase1_ingest_stats().snapshot(),
+        };
         self.enter_output_phase(&pool);
 
         if chunk_files.is_empty() {
@@ -3998,7 +4123,12 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(self.phase1_threads(), self.phase2_threads(), self.max_temp_files);
+        timer.log_summary(
+            self.phase1_threads(),
+            self.phase2_threads(),
+            self.max_temp_files,
+            phase1_floor,
+        );
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -4276,6 +4406,14 @@ impl RawExternalSorter {
         probe.phase1_end(buffer.memory_usage() as u64);
 
         // Ingest is done: everything from here is Phase 2 (merge/write).
+        // Snapshot Phase 1's floor inputs before the pool is handed to the merge:
+        // the counters describe the phase that has just ended, and reading them
+        // later would both borrow a moved value and risk folding in Phase 2 work.
+        let phase1_floor = Phase1FloorInputs {
+            input_busy_secs: pool.phase1_input_busy_secs(),
+            threads: self.phase1_threads(),
+            ingest: pool.phase1_ingest_stats().snapshot(),
+        };
         self.enter_output_phase(&pool);
 
         if chunk_files.is_empty() {
@@ -4336,7 +4474,12 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(self.phase1_threads(), self.phase2_threads(), self.max_temp_files);
+        timer.log_summary(
+            self.phase1_threads(),
+            self.phase2_threads(),
+            self.max_temp_files,
+            phase1_floor,
+        );
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -6183,6 +6326,7 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
         pool.decompressed_input_done_flag(),
         pool.input_read_error_flag(),
         pool.decompress_error_flag(),
+        pool.phase1_ingest_stats(),
     );
 
     // Deliberately not phrased as a header failure. The header was parsed
@@ -9346,7 +9490,7 @@ mod tests {
 
         // log_summary must not panic (output goes to log sink). `consolidate_count`
         // is 1 here, so the consolidation branch is exercised too.
-        timer.log_summary(4, 4, 64);
+        timer.log_summary(4, 4, 64, Phase1FloorInputs::default());
     }
 
     // ========================================================================

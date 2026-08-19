@@ -1432,6 +1432,10 @@ pub(crate) struct SharedPipelineState {
     /// `do_shutdown` checks join results and sets this flag so the main thread
     /// does not park forever waiting for work that will never arrive.
     pub(crate) worker_panicked: Arc<AtomicBool>,
+    /// What Phase 1's serial ingest thread waited for. Owned here because the
+    /// input stream records into it and the sorter reports from it, and neither
+    /// owns the other.
+    pub(crate) phase1_ingest: Arc<crate::phase1_stats::Phase1IngestStats>,
     /// Next serial for input block reading (atomic increment for ordering).
     input_read_serial: AtomicU64,
     /// Raw input blocks: `ReadInputBlocks` → `DecompressInput`.
@@ -1627,6 +1631,7 @@ impl SharedPipelineState {
             decompression_error: Arc::new(AtomicBool::new(false)),
             chunk_read_error: Arc::new(AtomicBool::new(false)),
             worker_panicked: Arc::new(AtomicBool::new(false)),
+            phase1_ingest: Arc::new(crate::phase1_stats::Phase1IngestStats::default()),
             input_read_serial: AtomicU64::new(0),
             raw_input_blocks: Arc::new(ArrayQueue::new(data_queue_cap)),
             decompressed_input: Arc::new(ArrayQueue::new(data_queue_cap)),
@@ -3519,6 +3524,28 @@ impl SortWorkerPool {
     /// [`crate::merge_phases`].
     pub(crate) fn merge_phase_breakdown(&self) -> crate::merge_phases::MergePhaseBreakdown {
         self.shared.merge_phases.snapshot()
+    }
+
+    /// Worker seconds spent feeding Phase 1's ingest thread: reading raw input
+    /// blocks off disk and decompressing them.
+    ///
+    /// Deliberately excludes `Compress`, which serves spill *and* output and so
+    /// cannot be attributed to the ingest span; the spill half is reported on its
+    /// own through [`crate::merge_phases`].
+    pub(crate) fn phase1_input_busy_secs(&self) -> f64 {
+        let ns = self.pipeline_stats.step_ns[SortStep::ReadInputBlocks as usize]
+            .load(Ordering::Relaxed)
+            + self.pipeline_stats.step_ns[SortStep::DecompressInput as usize]
+                .load(Ordering::Relaxed);
+        #[allow(clippy::cast_precision_loss, reason = "nanosecond totals stay far below 2^52")]
+        {
+            ns as f64 / 1_000_000_000.0
+        }
+    }
+
+    /// Counters for what Phase 1's ingest thread waited on.
+    pub(crate) fn phase1_ingest_stats(&self) -> Arc<crate::phase1_stats::Phase1IngestStats> {
+        Arc::clone(&self.shared.phase1_ingest)
     }
 
     /// The pool's shared state, for the merge consumer's own instrumentation.

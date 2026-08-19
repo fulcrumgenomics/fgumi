@@ -94,6 +94,7 @@ pub(crate) mod merge_headroom;
 pub(crate) mod merge_phases;
 pub(crate) mod merge_stalls;
 pub(crate) mod merge_trace;
+pub(crate) mod phase1_stats;
 pub(crate) mod pipeline;
 pub(crate) mod pooled_bam_writer;
 pub(crate) mod pooled_chunk_writer;
