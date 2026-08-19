@@ -1261,10 +1261,42 @@ struct MergeConsumerDiag {
     reassembled: u64,
 }
 
+/// Per-merge tallies of the record-fetch fast/slow split.
+///
+/// [`RECORD_BORROWED`] and [`RECORD_REASSEMBLED`] used to be incremented per
+/// record, directly from the merge consumer. That is the one serial thread that
+/// touches every record of the merge, and it is the merge's binding floor on the
+/// measured cell (`consumer serial 112.9s` against `worker capacity 89.4s` and a
+/// 157.1s loop). A relaxed `fetch_add` there is not free: on aarch64 it is an
+/// outline-atomics call into `__aarch64_ldadd8_relax`, the same helper that
+/// measured 28% of this thread's cycles while the progress counter used it
+/// per-record (see [`crate::progress_batch`]).
+///
+/// Counting into locals and publishing once per merge keeps every number the
+/// reports read -- they consume the statics as a before/after delta around the
+/// loop -- and removes two atomics per record from the critical path. Publish
+/// *before* that delta is read, or the merge reports zero.
+#[derive(Default)]
+struct RecordFetchCounts {
+    /// Records handed over borrowed from the current decompressed block.
+    borrowed: u64,
+    /// Records reassembled into scratch because they straddled a block boundary.
+    reassembled: u64,
+}
+
+impl RecordFetchCounts {
+    /// Fold this merge's tallies into the process-wide totals.
+    fn publish(&self) {
+        RECORD_BORROWED.fetch_add(self.borrowed, std::sync::atomic::Ordering::Relaxed);
+        RECORD_REASSEMBLED.fetch_add(self.reassembled, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[inline]
 fn winner_record_bytes<'a, K: RawSortKey + Default + 'static>(
     source: &'a ChunkSource<K>,
     consumer: Option<&'a MainThreadChunkConsumer<K>>,
+    counts: &mut RecordFetchCounts,
 ) -> Result<&'a [u8]> {
     match source {
         ChunkSource::PoolDisk { source_id, scratch } => {
@@ -1281,12 +1313,14 @@ fn winner_record_bytes<'a, K: RawSortKey + Default + 'static>(
             // that touches every record, so a clock read here would cost more
             // than the step. What was unknown is how often the copy path fires
             // at all -- a frequency answers that, and the per-record cost is a
-            // memcpy of a ~100-byte record either way.
+            // memcpy of a ~100-byte record either way. The tally is a local
+            // (see [`RecordFetchCounts`]); an atomic per record on this thread
+            // is itself measurable.
             if let Some(borrowed) = consumer.current_record_bytes(*source_id) {
-                RECORD_BORROWED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                counts.borrowed += 1;
                 Ok(borrowed)
             } else {
-                RECORD_REASSEMBLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                counts.reassembled += 1;
                 Ok(scratch.as_slice())
             }
         }
@@ -5502,6 +5536,7 @@ impl RawExternalSorter {
         // Snapshot the process-wide presentation counters so the sub-phase log
         // reports only this merge's delta, not totals accumulated by any prior
         // (sequential or concurrent) sort sharing the process.
+        let mut fetch_counts = RecordFetchCounts::default();
         let borrowed_before = RECORD_BORROWED.load(std::sync::atomic::Ordering::Relaxed);
         let reassembled_before = RECORD_REASSEMBLED.load(std::sync::atomic::Ordering::Relaxed);
         let loop_start = Instant::now();
@@ -5540,7 +5575,8 @@ impl RawExternalSorter {
             }
 
             let t = sample_this.then(Instant::now);
-            let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref())?;
+            let record_bytes =
+                winner_record_bytes(&sources[src_idx], guard.consumer_ref(), &mut fetch_counts)?;
             if let Some(t0) = t {
                 merge_present_secs += t0.elapsed().as_secs_f64();
             }
@@ -5576,6 +5612,9 @@ impl RawExternalSorter {
                 merge_tree_secs += t0.elapsed().as_secs_f64();
             }
         }
+
+        // Before the delta below is read, or this merge reports zero.
+        fetch_counts.publish();
 
         let loop_total = loop_start.elapsed().as_secs_f64();
         let borrowed_this_merge =
@@ -5740,6 +5779,7 @@ impl RawExternalSorter {
         let loop_start = Instant::now();
         let mut records_merged: u64 = 0;
         let mut published_src: Option<usize> = None;
+        let mut fetch_counts = RecordFetchCounts::default();
         while tree.winner_is_active() {
             let winner = tree.winner();
             let src_idx = source_map[winner];
@@ -5755,7 +5795,8 @@ impl RawExternalSorter {
                 published_src = Some(src_idx);
                 pool.set_phase2_next_source(tree.runner_up().map(|w| source_map[w]));
             }
-            let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref())?;
+            let record_bytes =
+                winner_record_bytes(&sources[src_idx], guard.consumer_ref(), &mut fetch_counts)?;
             writer.write_raw_record(record_bytes)?;
             records_merged += 1;
             merge_progress_batch.tick(&merge_progress);
@@ -5777,6 +5818,7 @@ impl RawExternalSorter {
         // cannot change it, and the consumer's report is harvested before
         // `finish_output` releases the merge sources and with them the
         // consumer. Both describe the loop that has just ended.
+        fetch_counts.publish();
         let loop_total = loop_start.elapsed().as_secs_f64();
         let active_workers = pool.active_workers();
         let stalls = {
