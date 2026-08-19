@@ -403,6 +403,103 @@ fn collect_mapped_indices(mapped: &Template, is_first_segment: bool) -> Vec<usiz
     indices
 }
 
+/// A membership set over two-byte SAM tag names, backed by a 256×256 bit table.
+///
+/// Replaces a `HashSet<String>` on the zipper hot path. `merge_raw` probes tag
+/// membership once per aux tag per mapped read; a `HashSet<String>` lookup there
+/// costs a `SipHash` of the tag name plus a UTF-8 conversion of the two raw tag
+/// bytes. A direct bit test on those two bytes removes both. Measured at ~23% of
+/// the per-record tag-copy loop on a consensus-config zipper (M3 Ultra), where
+/// the bitset also decisively beats a `HashSet<[u8; 2]>` (which still hashes).
+///
+/// All SAM tags are exactly two bytes, so only two-byte names are representable;
+/// any longer or shorter filter string can never equal a real tag and is dropped
+/// at construction — matching the pre-existing `tag_str.len() == 2` guard.
+///
+/// Membership is tested against the tag's **raw two bytes**. The prior code
+/// converted the bytes with `str::from_utf8(..).unwrap_or("")` before a
+/// `HashSet<String>` lookup; for spec-conforming tags (ASCII `[A-Za-z][A-Za-z0-9]`)
+/// the two are identical. They differ only for a non-UTF-8 tag byte pair (reachable
+/// only from a malformed BAM): the old path aliased it to the empty string and so
+/// could match an empty (`""`) filter, whereas here the raw bytes are matched
+/// directly and an empty filter — being length ≠ 2 — is never inserted. This is the
+/// intended behavior; do not reintroduce the UTF-8 conversion.
+#[derive(Debug, Clone)]
+struct TagBitset {
+    /// 256 × 256 = 65536 bits, one per possible `(byte0, byte1)` tag, packed into
+    /// 1024 `u64` words and indexed by `(byte0 << 8) | byte1`.
+    words: Box<[u64; 1024]>,
+}
+
+impl TagBitset {
+    fn new() -> Self {
+        Self { words: Box::new([0u64; 1024]) }
+    }
+
+    #[inline]
+    fn bit_index(tag: [u8; 2]) -> usize {
+        (usize::from(tag[0]) << 8) | usize::from(tag[1])
+    }
+
+    fn insert(&mut self, tag: [u8; 2]) {
+        let i = Self::bit_index(tag);
+        self.words[i >> 6] |= 1u64 << (i & 63);
+    }
+
+    #[inline]
+    fn contains(&self, tag: [u8; 2]) -> bool {
+        let i = Self::bit_index(tag);
+        (self.words[i >> 6] >> (i & 63)) & 1 != 0
+    }
+
+    /// Builds a bitset from tag-name strings, keeping only the two-byte names
+    /// (see the type doc).
+    fn from_names<'a>(names: impl IntoIterator<Item = &'a String>) -> Self {
+        let mut set = Self::new();
+        for name in names {
+            if let [b0, b1] = *name.as_bytes() {
+                set.insert([b0, b1]);
+            }
+        }
+        set
+    }
+}
+
+/// Precomputed tag lookups for `merge_raw`, built once per zipper run from the
+/// user's `TagInfo` and reused for every template. Building the bitsets once
+/// rather than per template is the entire reason this type exists.
+struct ZipperTags {
+    /// Two-byte tag names to remove from mapped reads (Step 2), pre-filtered to
+    /// exactly the two-byte names (mirrors the old `len() == 2` guard).
+    remove_list: Vec<[u8; 2]>,
+    /// Membership sets consulted while copying tags (Steps 3–4).
+    remove: TagBitset,
+    reverse: TagBitset,
+    revcomp: TagBitset,
+    /// Whether any reverse/revcomp transform is configured.
+    has_transforms: bool,
+}
+
+impl ZipperTags {
+    fn from_tag_info(tag_info: &TagInfo) -> Self {
+        let remove_list = tag_info
+            .remove
+            .iter()
+            .filter_map(|name| match *name.as_bytes() {
+                [b0, b1] => Some([b0, b1]),
+                _ => None,
+            })
+            .collect();
+        Self {
+            remove_list,
+            remove: TagBitset::from_names(&tag_info.remove),
+            reverse: TagBitset::from_names(&tag_info.reverse),
+            revcomp: TagBitset::from_names(&tag_info.revcomp),
+            has_transforms: tag_info.has_revs_or_revcomps(),
+        }
+    }
+}
+
 /// Merges tags from unmapped template into mapped template using raw bytes.
 ///
 /// Performs 6 operations:
@@ -413,10 +510,30 @@ fn collect_mapped_indices(mapped: &Template, is_first_segment: bool) -> Vec<usiz
 /// 4. Transfer QC flags
 /// 5. Normalize AS/XS tags
 /// 6. Add PA tags
+///
+/// This is a thin wrapper that builds the per-run `ZipperTags` lookups and
+/// delegates to `merge_raw_with`. On the hot per-template path in `process_raw`
+/// the lookups are built once and `merge_raw_with` is called directly.
+///
+/// Note that this wrapper rebuilds the `ZipperTags` lookups (three `TagBitset`
+/// allocations) on **every** call, so a caller merging many templates should
+/// build the lookups once and reuse them rather than calling this in a loop —
+/// which is exactly what `process_raw` does.
 pub fn merge_raw(
     unmapped: &Template,
     mapped: &mut Template,
     tag_info: &TagInfo,
+    skip_tc_tags: bool,
+) -> Result<()> {
+    merge_raw_with(unmapped, mapped, &ZipperTags::from_tag_info(tag_info), skip_tc_tags)
+}
+
+/// Core of [`merge_raw`], operating on precomputed [`ZipperTags`] so the bitsets
+/// are built once per run rather than once per template.
+fn merge_raw_with(
+    unmapped: &Template,
+    mapped: &mut Template,
+    tags: &ZipperTags,
     skip_tc_tags: bool,
 ) -> Result<()> {
     // Step 1: Fix mate info
@@ -424,16 +541,13 @@ pub fn merge_raw(
 
     // Step 2: Remove tags from mapped reads
     for record in mapped.records_mut().iter_mut() {
-        for tag_str in &tag_info.remove {
-            if tag_str.len() == 2 {
-                let tag_bytes: [u8; 2] = [tag_str.as_bytes()[0], tag_str.as_bytes()[1]];
-                fgumi_raw_bam::remove_tag(record.as_mut_vec(), tag_bytes);
-            }
+        for &tag_bytes in &tags.remove_list {
+            fgumi_raw_bam::remove_tag(record.as_mut_vec(), tag_bytes);
         }
     }
 
     // Steps 3–4: Copy tags from unmapped to mapped, transfer QC flags
-    let has_transforms = tag_info.has_revs_or_revcomps();
+    let has_transforms = tags.has_transforms;
     for u in unmapped.primary_reads() {
         let u_flags = RawRecordView::new(u).flags();
         let is_unpaired = (u_flags & fgumi_raw_bam::flags::PAIRED) == 0;
@@ -478,9 +592,7 @@ pub fn merge_raw(
                     if entry.tag == *SamTag::PG && has_pg {
                         continue;
                     }
-                    // Tag bytes are always valid ASCII
-                    let tag_str = std::str::from_utf8(&entry.tag).unwrap_or("");
-                    if tag_info.remove.contains(tag_str) {
+                    if tags.remove.contains(entry.tag) {
                         continue;
                     }
                     fgumi_raw_bam::remove_tag(rr[i].as_mut_vec(), entry.tag);
@@ -508,22 +620,21 @@ pub fn merge_raw(
                     if entry.tag == *SamTag::PG && has_pg {
                         continue;
                     }
-                    let tag_str = std::str::from_utf8(&entry.tag).unwrap_or("");
-                    if tag_info.remove.contains(tag_str) {
+                    if tags.remove.contains(entry.tag) {
                         continue;
                     }
 
                     fgumi_raw_bam::remove_tag(rr[i].as_mut_vec(), entry.tag);
                     append_raw_tag_entry(rr[i].as_mut_vec(), entry);
 
-                    if has_transforms && tag_info.reverse.contains(tag_str) {
+                    if has_transforms && tags.reverse.contains(entry.tag) {
                         reverse_tag_in_place_raw_by_type(
                             &mut rr[i],
                             aux_offset,
                             entry.tag,
                             entry.type_byte,
                         );
-                    } else if has_transforms && tag_info.revcomp.contains(tag_str) {
+                    } else if has_transforms && tags.revcomp.contains(entry.tag) {
                         revcomp_tag_in_place_raw_by_type(
                             &mut rr[i],
                             aux_offset,
@@ -846,7 +957,7 @@ impl Zipper {
         unmapped_iter: U,
         mut mapped_iter: M,
         output_header: &Header,
-        tag_info: &TagInfo,
+        tags: &ZipperTags,
         reference: Option<&ReferenceReader>,
     ) -> Result<u64>
     where
@@ -873,7 +984,7 @@ impl Zipper {
 
             if let Some(ref mut mapped_template) = mapped_peek {
                 if mapped_template.name == unmapped_template.name {
-                    merge_raw(&unmapped_template, mapped_template, tag_info, self.skip_tc_tags)?;
+                    merge_raw_with(&unmapped_template, mapped_template, tags, self.skip_tc_tags)?;
                     if let Some(ref_reader) = reference {
                         // EM-seq: restore converted bases in-place on packed 4-bit nibbles.
                         restore_unconverted_bases_in_raw_template(
@@ -1121,11 +1232,14 @@ impl Command for Zipper {
         });
         let mapped_iter = std::iter::from_fn(move || mapped_rx.recv().ok());
 
+        // Build the tag lookups once for the whole run; `process_raw` reuses them
+        // for every template.
+        let tags = ZipperTags::from_tag_info(&tag_info);
         let total_records = self.process_raw(
             unmapped_iter,
             mapped_iter,
             &output_header,
-            &tag_info,
+            &tags,
             reference.as_ref(),
         )?;
 
@@ -1622,6 +1736,97 @@ mod tests {
         for t in ["aD", "bD", "cD"] {
             assert!(!tag_info.revcomp.contains(t), "per-read scalar {t} must not be revcomped");
         }
+    }
+
+    /// `TagBitset` membership matches the tag names it was built from, is
+    /// case-sensitive, and covers the full 0..=255 byte range (raw tag bytes are
+    /// not assumed to be ASCII).
+    #[rstest]
+    #[case::present_lower("cd", true)]
+    #[case::present_upper_distinct("cD", false)] // case-sensitive: only "cd" was inserted
+    #[case::absent("XY", false)]
+    #[case::rx_present("RX", true)]
+    fn test_tag_bitset_membership(#[case] probe: &str, #[case] expected: bool) {
+        let names = ["cd".to_string(), "RX".to_string()];
+        let bitset = TagBitset::from_names(&names);
+        let b = probe.as_bytes();
+        assert_eq!(bitset.contains([b[0], b[1]]), expected);
+    }
+
+    /// Non-ASCII / boundary byte pairs are representable and independent.
+    #[test]
+    fn test_tag_bitset_full_byte_range() {
+        let mut bitset = TagBitset::new();
+        bitset.insert([0x00, 0x00]);
+        bitset.insert([0xFF, 0xFF]);
+        bitset.insert([0x80, 0x01]);
+        assert!(bitset.contains([0x00, 0x00]));
+        assert!(bitset.contains([0xFF, 0xFF]));
+        assert!(bitset.contains([0x80, 0x01]));
+        assert!(!bitset.contains([0x00, 0xFF]));
+        assert!(!bitset.contains([0x01, 0x80]));
+    }
+
+    /// `from_names` keeps only two-byte names — mirroring the pre-existing
+    /// `tag_str.len() == 2` guard — so one-, three-byte, and empty filters are
+    /// dropped rather than matching anything.
+    #[test]
+    fn test_tag_bitset_from_names_drops_non_two_byte() {
+        let names = ["AB".to_string(), "X".to_string(), "ABC".to_string(), String::new()];
+        let bitset = TagBitset::from_names(&names);
+        assert!(bitset.contains([b'A', b'B']));
+        assert!(!bitset.contains([b'X', 0])); // "X" was dropped
+    }
+
+    /// Pins the intended raw-byte matching semantics (see the `TagBitset` doc):
+    /// an empty-string filter matches no real tag, and a two-byte filter matches
+    /// exactly its bytes — no UTF-8 aliasing of a filter to a tag. The prior
+    /// `from_utf8(..).unwrap_or("")` path would have aliased a non-UTF-8 tag to
+    /// the empty string; that conversion is intentionally gone.
+    #[test]
+    fn test_tag_bitset_empty_filter_matches_nothing() {
+        // An empty tag filter is dropped, so it never matches a two-byte tag.
+        let empty = TagBitset::from_names(&[String::new()]);
+        assert!(!empty.contains([b'N', b'M']));
+        assert!(!empty.contains([0xC3, 0x28])); // a non-UTF-8 byte pair
+
+        // A two-byte filter matches its exact bytes and nothing else.
+        let one = TagBitset::from_names(&["NM".to_string()]);
+        assert!(one.contains([b'N', b'M']));
+        assert!(!one.contains([b'M', b'N'])); // order matters
+        assert!(!one.contains([b'N', b'X']));
+    }
+
+    /// `ZipperTags::from_tag_info` filters `remove_list` to two-byte names,
+    /// mirrors the three membership sets, and carries `has_transforms`.
+    #[test]
+    fn test_zipper_tags_from_tag_info() {
+        let tag_info = TagInfo::new(
+            vec!["NM".to_string(), "TOOLONG".to_string()],
+            vec!["Consensus".to_string()],
+            vec!["Consensus".to_string()],
+        );
+        let tags = ZipperTags::from_tag_info(&tag_info);
+
+        // remove_list keeps only the two-byte name.
+        assert_eq!(tags.remove_list, vec![[b'N', b'M']]);
+        assert!(tags.remove.contains([b'N', b'M']));
+
+        // reverse/revcomp mirror the expanded Consensus sets.
+        for t in ["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq"] {
+            let b = t.as_bytes();
+            assert!(tags.reverse.contains([b[0], b[1]]), "missing reverse {t}");
+        }
+        for t in ["ac", "bc"] {
+            let b = t.as_bytes();
+            assert!(tags.revcomp.contains([b[0], b[1]]), "missing revcomp {t}");
+        }
+        assert!(tags.has_transforms);
+
+        // Empty TagInfo → no transforms.
+        let empty = ZipperTags::from_tag_info(&TagInfo::new(vec![], vec![], vec![]));
+        assert!(!empty.has_transforms);
+        assert!(empty.remove_list.is_empty());
     }
 
     #[test]
