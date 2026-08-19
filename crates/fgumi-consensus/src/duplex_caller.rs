@@ -1884,6 +1884,53 @@ impl DuplexConsensusCaller {
         );
     }
 
+    /// Reattributes single-strand rejections out of a whole-group reason, matching fgbio's
+    /// first-writer-wins reason assignment (#791).
+    ///
+    /// On a whole-group rejection downstream of the single-strand filter, `process_group` counted
+    /// the entire raw group (`N` reads) under one duplex reason, and `stats` has already had that
+    /// `group_stats` merged in. But the `M` reads the single-strand layer already rejected
+    /// (`MinorityAlignment`, `Unmapped`, …) should keep *their* reason; only the `N - M` survivors
+    /// belong to the whole-group reason. This moves those `M` reads from the whole-group reason
+    /// bucket into the single-strand reasons, leaving the reject-count *total* unchanged — so
+    /// `--rejects` still reconciles with `raw_reads_rejected` — while the per-reason split now
+    /// matches fgbio.
+    ///
+    /// `group_stats` holds exactly the one whole-group reason on this path (pre-filter rejections
+    /// leave `ss_stats` empty, so this is a no-op for them). The single-strand rejections are a
+    /// subset of the group, so `M <= N`.
+    fn reattribute_single_strand_rejections(
+        stats: &mut ConsensusCallingStats,
+        group_stats: &ConsensusCallingStats,
+        ss_stats: &ConsensusCallingStats,
+    ) {
+        let ss_rejected = ss_stats.filtered_reads;
+        if ss_rejected == 0 {
+            return;
+        }
+        debug_assert_eq!(
+            group_stats.rejection_reasons.len(),
+            1,
+            "a whole-group rejection records exactly one duplex reason"
+        );
+        if let Some((&whole_group_reason, &whole_group_count)) =
+            group_stats.rejection_reasons.iter().next()
+        {
+            debug_assert!(
+                ss_rejected <= whole_group_count,
+                "single-strand rejections are a subset of the whole group"
+            );
+            if let Some(count) = stats.rejection_reasons.get_mut(&whole_group_reason) {
+                *count = count.saturating_sub(ss_rejected);
+            }
+            stats.filtered_reads = stats.filtered_reads.saturating_sub(ss_rejected);
+        }
+        // Fold the single-strand reasons back in: this re-adds the `M` reads under
+        // `MinorityAlignment`/`Unmapped` and restores `filtered_reads`, so the net effect is a
+        // reason move, not a change to the total.
+        stats.merge(ss_stats);
+    }
+
     /// Processes a single UMI group to generate duplex consensus
     #[expect(clippy::too_many_arguments, reason = "group processing requires many parameters")]
     #[expect(
@@ -2022,25 +2069,36 @@ impl DuplexConsensusCaller {
         );
 
         // Keep references to original raw records for later tag extraction.
+        //
+        // `create_source_read` returns `None` for reads that trim to zero length (reads with absent
+        // qualities return `Err`, propagated below via `?`). The single-strand path counts the
+        // zero-length reads as `ZeroLengthAfterTrimming` and writes them; building the source
+        // vectors with a bare `filter_map` would drop them from both `--stats` and `--rejects`
+        // (#792). Collect the dropped raws — tagged with their index in the X/Y
+        // partition so their group ordinal can be recovered — and hand them to the sub-caller so
+        // they drain through the same statistics/rejects path as its alignment-filter rejections.
         let x_raws: Vec<&RawRecord> = ab_r1s.iter().chain(ba_r2s.iter()).copied().collect();
-        let x_sources: Vec<SourceRead> = x_raws
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| {
-                let mate_clip = bam_fields::num_bases_extending_past_mate_raw(r);
-                ss_caller.create_source_read(r, i, mate_clip)
-            })
-            .collect();
+        let mut x_zero_length: Vec<(usize, &RawRecord)> = Vec::new();
+
+        let mut x_sources: Vec<SourceRead> = Vec::with_capacity(x_raws.len());
+        for (i, r) in x_raws.iter().enumerate() {
+            let mate_clip = bam_fields::num_bases_extending_past_mate_raw(r);
+            match ss_caller.create_source_read(r, i, mate_clip)? {
+                Some(source) => x_sources.push(source),
+                None => x_zero_length.push((i, *r)),
+            }
+        }
 
         let y_raws: Vec<&RawRecord> = ab_r2s.iter().chain(ba_r1s.iter()).copied().collect();
-        let y_sources: Vec<SourceRead> = y_raws
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| {
-                let mate_clip = bam_fields::num_bases_extending_past_mate_raw(r);
-                ss_caller.create_source_read(r, i, mate_clip)
-            })
-            .collect();
+        let mut y_zero_length: Vec<(usize, &RawRecord)> = Vec::new();
+        let mut y_sources: Vec<SourceRead> = Vec::with_capacity(y_raws.len());
+        for (i, r) in y_raws.iter().enumerate() {
+            let mate_clip = bam_fields::num_bases_extending_past_mate_raw(r);
+            match ss_caller.create_source_read(r, i, mate_clip)? {
+                Some(source) => y_sources.push(source),
+                None => y_zero_length.push((i, *r)),
+            }
+        }
 
         debug!(
             "MI {}: After SourceRead conversion (X={}, Y={})",
@@ -2075,11 +2133,29 @@ impl DuplexConsensusCaller {
                 Self::is_paired_r2,
                 Self::is_paired_r1,
             );
+
+            // Zero-length rejects split across strands just like the alignment rejects below — a
+            // `/B` template's R1 lands in Y and its R2 in X — so merge both partitions by group
+            // ordinal before recording, or a `/B` template's ends would be written R2-before-R1.
+            let mut zero_length_rejects: Vec<(usize, &RawRecord)> =
+                Vec::with_capacity(x_zero_length.len() + y_zero_length.len());
+            zero_length_rejects.extend(x_zero_length.iter().map(|&(i, raw)| (x_ordinals[i], raw)));
+            zero_length_rejects.extend(y_zero_length.iter().map(|&(i, raw)| (y_ordinals[i], raw)));
+            zero_length_rejects.sort_by_key(|&(ordinal, _)| ordinal);
+            ss_caller
+                .record_zero_length_after_trimming(zero_length_rejects.iter().map(|&(_, raw)| raw));
+
             let mut ss_rejects: Vec<(usize, &RawRecord)> = Vec::new();
             Self::collect_ss_rejects(&x_raws, &x_ordinals, &x_rejected, &mut ss_rejects);
             Self::collect_ss_rejects(&y_raws, &y_ordinals, &y_rejected, &mut ss_rejects);
             ss_rejects.sort_by_key(|&(ordinal, _)| ordinal);
             ss_caller.record_rejected_raw(ss_rejects.iter().map(|&(_, raw)| raw));
+        } else {
+            // Not tracking rejects: the dropped raws are only counted, never stored, so their
+            // order is irrelevant and computing group ordinals would be wasted work.
+            ss_caller.record_zero_length_after_trimming(
+                x_zero_length.iter().chain(y_zero_length.iter()).map(|&(_, raw)| raw),
+            );
         }
 
         debug!(
@@ -2516,9 +2592,13 @@ impl ConsensusCaller for DuplexConsensusCaller {
         //
         // When the duplex layer rejects the group it counts and returns *every* raw input
         // record, so the single-strand layer's rejections — a subset of those same records —
-        // are already covered. Adding them on top would report more rejected reads than the
-        // rejects BAM holds. Otherwise the group survived, and the single-strand drops are
-        // the only rejections it produced: they belong in both outputs.
+        // are already covered in the reject *count*. But fgbio attributes reasons
+        // first-writer-wins: a read the single-strand filter already rejected keeps its own
+        // reason, and only the survivors carry the whole-group reason. The whole-group site
+        // counted the entire raw group under one duplex reason, so reattribute the
+        // single-strand-rejected reads from that reason to their own. Otherwise the group
+        // survived, and the single-strand drops are the only rejections it produced: they belong
+        // in both outputs.
         let ss_stats = self.ss_caller.take_statistics();
         let ss_rejected_raw = self.ss_caller.take_rejected_reads();
         match duplex_outcome {
@@ -2529,6 +2609,11 @@ impl ConsensusCaller for DuplexConsensusCaller {
                 }
             }
             DuplexGroupOutcome::RejectedWholeGroup(duplex_rejected_raw) => {
+                Self::reattribute_single_strand_rejections(
+                    &mut self.stats,
+                    &group_stats,
+                    &ss_stats,
+                );
                 if self.track_rejects {
                     self.rejected_reads.extend(duplex_rejected_raw);
                 }
@@ -4046,12 +4131,101 @@ mod tests {
         Ok(())
     }
 
-    /// #757: the single-strand delta must be dropped when the duplex layer rejects the group.
+    /// #792: reads that trim to zero length must reach both `--stats` and `--rejects`.
     ///
-    /// A whole-group duplex rejection counts *every* raw input record and moves every one of
-    /// them to the rejects buffer, so the single-strand layer's earlier rejections are already
-    /// covered — folding its counters in on top would report more rejected reads than the
-    /// rejects BAM holds.
+    /// The duplex path built its X/Y `SourceRead` vectors with `filter_map`, silently discarding
+    /// every `None` return from `create_source_read` with no accounting, so those reads reached
+    /// neither output. This mirrors fgbio, whose base `toSourceRead` rejects a read that trims to
+    /// zero as `ZeroPostAfterTrimming` on the duplex caller's own rejects writer and counter
+    /// (`UmiConsensusCaller.scala:310-313`, reached from `DuplexConsensusCaller.scala:321-322`) —
+    /// one layer, both outputs. fgumi's vanilla path already counts these as
+    /// `ZeroLengthAfterTrimming` and writes them; the duplex path must match.
+    ///
+    /// The fixture is a surviving molecule — three clean templates per strand emit a duplex pair —
+    /// plus one extra `/A` template whose two reads are entirely below the minimum input base
+    /// quality, so with quality trimming enabled they trim to zero length (fgbio's genuine
+    /// `ZeroPostAfterTrimming` condition). Pins the reason count, that the fold does not inflate
+    /// `total_reads`/`consensus_reads`, and that the two raw records reach the rejects buffer
+    /// byte-for-byte in input order.
+    #[test]
+    fn test_zero_length_after_trimming_reads_reach_stats_and_rejects() -> Result<()> {
+        // Quality trimming enabled (6th arg), so an all-low-quality read trims to zero length.
+        let mut caller = DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            vec![1],
+            10, // min_input_base_quality
+            false,
+            true, // trim
+            None,
+            None,
+            true, // track_rejects
+            45,
+            40,
+        )?;
+
+        let mut reads = duplex_molecule(3, false, false);
+        // One extra `/A` template whose bases are all below the minimum input base quality (10),
+        // so quality trimming drops the whole read and `create_source_read` returns `None`.
+        let mut b = SamBuilder::new();
+        let cigar_10m = &[encode_op(0, 10)];
+        let low_quals = &[2u8; 10];
+        let dropped = vec![
+            ab_r1(&mut b, b"trimmed", b"AAAAAAAAAA", low_quals, cigar_10m, b"foo/A", &[]),
+            ab_r2(&mut b, b"trimmed", b"CCCCCCCCCC", low_quals, cigar_10m, b"foo/A", &[]),
+        ];
+        // The `--rejects` contract is byte-for-byte preservation, so compare against the input
+        // bytes rather than read names.
+        let expected_rejects: Vec<Vec<u8>> = dropped.iter().map(|record| record.to_vec()).collect();
+        reads.extend(dropped);
+        let input_count = reads.len();
+
+        let result = caller.consensus_reads(reads)?;
+        assert_eq!(result.count, 2, "the three clean templates must still emit a duplex pair");
+
+        let stats = caller.statistics();
+        assert_eq!(
+            stats
+                .rejection_reasons
+                .get(&RejectionReason::ZeroLengthAfterTrimming)
+                .copied()
+                .unwrap_or(0),
+            2,
+            "both trimmed reads must be counted as zero-length-after-trimming",
+        );
+        assert_eq!(stats.filtered_reads, 2, "raw_reads_rejected must count the two dropped reads");
+        assert_eq!(
+            stats.total_reads, input_count,
+            "folding the zero-length rejections must not inflate the input count",
+        );
+        assert_eq!(
+            stats.consensus_reads, 2,
+            "folding the zero-length rejections must not inflate the consensus count",
+        );
+
+        assert_eq!(
+            caller.rejected_reads, expected_rejects,
+            "the rejects buffer must hold exactly the two trimmed records, \
+             byte-for-byte and in input order",
+        );
+        assert_eq!(
+            caller.rejected_reads.len(),
+            stats.filtered_reads,
+            "the rejects buffer must reconcile with raw_reads_rejected",
+        );
+        Ok(())
+    }
+
+    /// #757/#791: a whole-group rejection downstream of the single-strand filter must split its
+    /// reasons the way fgbio does — first-writer-wins.
+    ///
+    /// Every raw input record is still rejected exactly once, and the rejects buffer still holds
+    /// all of them (the #757 no-double-count invariant). But the reads the single-strand layer
+    /// already rejected keep *their* reason (`MinorityAlignment`); only the survivors are
+    /// attributed to the duplex layer's whole-group reason. fgbio's `rejectRecords` is
+    /// first-writer-wins (`recs.filterNot(_.contains(RejectReasonTag))`), so a record already
+    /// tagged `MinorityAlignment` in `filterToMostCommonAlignment` keeps it and the whole-group
+    /// reason lands only on the rest (`DuplexConsensusCaller.scala:359-362`).
     ///
     /// `min_reads = 4` is met before single-strand filtering (four templates per strand) and
     /// missed after it (three survive per strand), which is the only way to reach a whole-group
@@ -4059,8 +4233,7 @@ mod tests {
     /// depth with no minority templates consenses under the same threshold, so the rejection
     /// below is caused by the single-strand drops rather than by the raw depth.
     #[test]
-    fn test_single_strand_rejections_are_not_double_counted_on_whole_group_rejection() -> Result<()>
-    {
+    fn test_whole_group_rejection_preserves_single_strand_reasons() -> Result<()> {
         let mut control = rejection_accounting_caller(vec![4], true)?;
         let control_result = control.consensus_reads(duplex_molecule(4, false, false))?;
         assert_eq!(
@@ -4070,8 +4243,11 @@ mod tests {
         );
 
         let mut caller = rejection_accounting_caller(vec![4], true)?;
+        // Two minority-alignment templates (one per strand) contribute four reads the
+        // single-strand filter rejects as MinorityAlignment before the whole-group check.
         let reads = duplex_molecule(3, true, true);
         let input_count = reads.len();
+        let minority_reads = 4;
 
         let result = caller.consensus_reads(reads)?;
         assert_eq!(result.count, 0, "the molecule must fail the post-filter depth threshold");
@@ -4082,15 +4258,85 @@ mod tests {
             "a whole-group rejection counts every input record exactly once"
         );
         assert_eq!(
-            stats.rejection_reasons.get(&RejectionReason::InsufficientReads).copied().unwrap_or(0),
-            input_count,
-            "the whole group is attributed to the duplex layer's own reason"
+            stats.rejection_reasons.get(&RejectionReason::MinorityAlignment).copied().unwrap_or(0),
+            minority_reads,
+            "the single-strand-rejected reads must keep their MinorityAlignment reason",
         );
         assert_eq!(
-            stats.rejection_reasons.get(&RejectionReason::MinorityAlignment),
-            None,
-            "the single-strand reasons must not be added on top of the whole-group count"
+            stats.rejection_reasons.get(&RejectionReason::InsufficientReads).copied().unwrap_or(0),
+            input_count - minority_reads,
+            "only the survivors of the single-strand filter are attributed to the whole-group reason",
         );
+        assert_eq!(
+            caller.rejected_reads.len(),
+            stats.filtered_reads,
+            "the rejects buffer must reconcile with raw_reads_rejected"
+        );
+        Ok(())
+    }
+
+    /// #791 × #792: a whole-group rejection carrying *both* single-strand reasons must split them
+    /// all first-writer-wins.
+    ///
+    /// This pins the composition of the two fixes: the minority-alignment reads (dropped by the
+    /// alignment filter) and the zero-length reads (dropped by `create_source_read` under `--trim`)
+    /// must each keep their own reason, and only the survivors carry the whole-group reason. Without
+    /// #792 the zero-length reads would never reach the sub-caller's stats, so the reattribution
+    /// would leave them folded into the whole-group reason — this asserts they do not.
+    ///
+    /// Fixture: three clean templates per strand, one minority-alignment template per strand
+    /// (`MinorityAlignment`), and one `/A` template whose bases are all below the minimum input base
+    /// quality so it trims to zero (`ZeroLengthAfterTrimming`). `min_reads = 4` is met before the
+    /// single-strand filter and missed after it, so the group is rejected as `InsufficientReads`.
+    #[test]
+    fn test_whole_group_rejection_splits_all_single_strand_reasons() -> Result<()> {
+        // Quality trimming enabled (6th arg) so the all-low-quality template trims to zero length.
+        let mut caller = DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            vec![4],
+            10, // min_input_base_quality
+            false,
+            true, // trim
+            None,
+            None,
+            true, // track_rejects
+            45,
+            40,
+        )?;
+
+        let mut reads = duplex_molecule(3, true, true);
+        let minority_reads = 4; // one minority template per strand, two reads each
+        // One /A template whose bases are all below the minimum input base quality: trims to zero.
+        let mut b = SamBuilder::new();
+        let cigar_10m = &[encode_op(0, 10)];
+        let low_quals = &[2u8; 10];
+        reads.push(ab_r1(&mut b, b"trimmed", b"AAAAAAAAAA", low_quals, cigar_10m, b"foo/A", &[]));
+        reads.push(ab_r2(&mut b, b"trimmed", b"CCCCCCCCCC", low_quals, cigar_10m, b"foo/A", &[]));
+        let zero_length_reads = 2;
+        let input_count = reads.len();
+
+        let result = caller.consensus_reads(reads)?;
+        assert_eq!(result.count, 0, "the molecule must fail the post-filter depth threshold");
+
+        let stats = caller.statistics();
+        let reason = |r: RejectionReason| stats.rejection_reasons.get(&r).copied().unwrap_or(0);
+        assert_eq!(
+            reason(RejectionReason::MinorityAlignment),
+            minority_reads,
+            "the minority-alignment reads must keep their reason",
+        );
+        assert_eq!(
+            reason(RejectionReason::ZeroLengthAfterTrimming),
+            zero_length_reads,
+            "the zero-length reads must keep their reason, not fold into the whole-group reason",
+        );
+        assert_eq!(
+            reason(RejectionReason::InsufficientReads),
+            input_count - minority_reads - zero_length_reads,
+            "only the survivors of the single-strand filter carry the whole-group reason",
+        );
+        assert_eq!(stats.filtered_reads, input_count, "every input read is rejected exactly once");
         assert_eq!(
             caller.rejected_reads.len(),
             stats.filtered_reads,
@@ -4122,6 +4368,31 @@ mod tests {
         assert_eq!(
             tracked.rejection_reasons, untracked.rejection_reasons,
             "rejects tracking must not change the per-reason breakdown"
+        );
+        Ok(())
+    }
+
+    /// #794: the duplex path must also abort on a read with absent base qualities.
+    ///
+    /// `create_source_read` is reached through the single-strand caller when building the X/Y
+    /// source vectors; the error must propagate out of `consensus_reads` rather than the read being
+    /// silently dropped, matching fgbio and the vanilla path.
+    #[test]
+    fn test_absent_base_qualities_abort_duplex_consensus() -> Result<()> {
+        let mut caller = rejection_accounting_caller(vec![1], true)?;
+
+        let mut reads = duplex_molecule(2, false, false);
+        // One extra /A read with absent qualities (0xFF per base), which create_source_read rejects.
+        let mut b = SamBuilder::new();
+        let cigar_10m = &[encode_op(0, 10)];
+        let absent = &[0xFFu8; 10];
+        reads.push(ab_r1(&mut b, b"absent", b"AAAAAAAAAA", absent, cigar_10m, b"foo/A", &[]));
+        reads.push(ab_r2(&mut b, b"absent", b"CCCCCCCCCC", absent, cigar_10m, b"foo/A", &[]));
+
+        let result = caller.consensus_reads(reads);
+        assert!(
+            result.is_err(),
+            "a read with absent base qualities must abort the duplex path, not be silently dropped"
         );
         Ok(())
     }
