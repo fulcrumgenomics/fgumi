@@ -1243,17 +1243,17 @@ fn resolve_memory_budget_with_total(
 /// (the FASTQ aggregate counts its write reorder state and the BAM aggregate its
 /// input and write reorder states), so this budget bounds them through the Read
 /// gate; they additionally apply their own threshold, capped at
-/// [`BACKPRESSURE_THRESHOLD_BYTES`](crate::unified_pipeline::BACKPRESSURE_THRESHOLD_BYTES).
+/// [`BACKPRESSURE_THRESHOLD_BYTES`].
 ///
 /// The budget is a **total**, and it is not the same thing as what any one stage
 /// may hold. Stages back off at their own high-water marks —
-/// [`BACKPRESSURE_THRESHOLD_BYTES`](crate::unified_pipeline::BACKPRESSURE_THRESHOLD_BYTES)
+/// [`BACKPRESSURE_THRESHOLD_BYTES`]
 /// (512 MiB) for the queues and reorder buffers,
-/// [`Q5_BACKPRESSURE_THRESHOLD_BYTES`](crate::unified_pipeline::Q5_BACKPRESSURE_THRESHOLD_BYTES)
+/// [`Q5_BACKPRESSURE_THRESHOLD_BYTES`]
 /// (256 MiB) for the processed queue. A budget below one of those marks tightens
 /// it; a budget above it leaves it alone. So raising `--max-memory` raises how
 /// much the pipeline may hold in total, not how much any one stage may hold —
-/// see [`stage_high_water_mark`](crate::unified_pipeline::stage_high_water_mark)
+/// see [`stage_high_water_mark`]
 /// for why a per-stage trigger should not scale with the total (issue #765).
 #[derive(Debug, Clone, Args)]
 pub struct QueueMemoryOptions {
