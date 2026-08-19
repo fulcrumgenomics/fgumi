@@ -12,6 +12,16 @@ All notable changes to this project will be documented in this file.
   it now produces two consensus records (one per strand), each with depth 3. This matches fgbio's
   `CallMolecularConsensusReads`, which applies the cap independently to each end of the family.
 
+### Features
+
+- **Breaking:** `fgumi sort`'s performance diagnostics are now opt-in behind `--sort-stats` (off by
+  default) instead of printed on every run. A plain `fgumi sort` previously emitted roughly a
+  hundred lines of spill geometry, per-phase timing, merge-floor attribution, and park statistics
+  at `info` level; those lines are now suppressed unless `--sort-stats` is passed, so any script or
+  harness that parsed them out of the default log must add the flag to keep collecting them. The
+  flag is hidden from the generated help and documented under Advanced Pipeline Options in the
+  performance-tuning guide ([#826](https://github.com/fulcrumgenomics/fgumi/pull/826)).
+
 ### Bug Fixes
 
 - **Breaking:** end-of-stream flush paths now fail instead of discarding what they were holding,
