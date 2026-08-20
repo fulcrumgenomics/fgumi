@@ -132,6 +132,25 @@ pub(crate) struct ScatterReader {
     /// reader report describes. A fill is exactly what `TimedReader` measures
     /// on the sequential arm -- the fetch, as opposed to the framing above it.
     stats: Option<Arc<crate::phase1_stats::ReaderStats>>,
+    /// Fills whose slices have been offered but whose bytes are not collected,
+    /// oldest first and contiguous in the file.
+    pending: VecDeque<PendingFill>,
+    /// How many fills to keep in flight ahead of the consumer, so the device
+    /// works while the framer frames. Zero for the merge's spill readers: the
+    /// merge already sits at its consumer-serial floor, so all lookahead would
+    /// buy there is `K * depth * FILL_BYTES` of extra buffers.
+    lookahead: usize,
+}
+
+/// A fill in flight: its slices, where they report, and where it began.
+///
+/// Its length is not stored because it is always `offset - start`: only the
+/// most recently issued fill is ever pending, and `issue` advances `offset` by
+/// exactly that fill's size.
+struct PendingFill {
+    slices: Vec<Arc<FetchSlice>>,
+    state: Arc<FillState>,
+    start: u64,
 }
 
 /// How one file's bytes are read.
@@ -252,7 +271,24 @@ impl ScatterReader {
             fetch,
             streams: streams.max(1),
             stats: None,
+            pending: VecDeque::new(),
+            lookahead: 0,
         })
+    }
+
+    /// Keep `fills` in flight ahead of the consumer.
+    ///
+    /// Without this a fill is issued only once the previous one is exhausted,
+    /// so the device idles for as long as framing and decompression take.
+    /// Measured on the phase-1 read span: 69.4s at depth 0, 66.9s at depth 1,
+    /// and 62.3s for a reader that prefetched continuously with its own
+    /// threads -- so depth is worth something well past one.
+    ///
+    /// Costs `(fills + 1) * FILL_BYTES` of buffers for this reader.
+    #[must_use]
+    pub(crate) fn looking_ahead(mut self, fills: usize) -> Self {
+        self.lookahead = fills;
+        self
     }
 
     /// Book this reader's fills into `stats`, so framing and fetching stay
@@ -276,29 +312,22 @@ impl ScatterReader {
         buf
     }
 
-    /// Fetch the next [`FILL_BYTES`] as concurrent slices, appending them to
-    /// `ready` in file order. Leaves `ready` empty at EOF.
-    fn fill(&mut self) -> io::Result<()> {
+    /// Offer the next [`FILL_BYTES`] as slices and advance the fetch offset.
+    ///
+    /// Returns `None` at EOF. Nothing is read here beyond what a worker happens
+    /// to pick up: the bytes are claimed in [`Self::collect`], which is what
+    /// lets a fill be in flight while the caller does something else.
+    fn issue(&mut self) -> Option<PendingFill> {
         let remaining = self.len.saturating_sub(self.offset);
         if remaining == 0 {
-            return Ok(());
+            return None;
         }
         let want = usize::try_from(remaining.min(FILL_BYTES as u64)).expect("a fill fits usize");
         // Never split below `MIN_SLICE_BYTES`: a fill near EOF is small, and
         // cutting it into pinpricks costs more than the concurrency returns.
         let slices = self.streams.min(want.div_ceil(MIN_SLICE_BYTES)).max(1);
         let slice_len = want.div_ceil(slices);
-        let base = self.offset;
-
-        if slices == 1 {
-            // The single-stream arm: no state, no offer, no barrier -- just the
-            // read this thread was going to do anyway.
-            let mut buf = self.take_buf(want);
-            self.file.read_exact_at(&mut buf, base)?;
-            self.ready.push_back(buf);
-            self.offset += want as u64;
-            return Ok(());
-        }
+        let start = self.offset;
 
         let bufs: Vec<Vec<u8>> = (0..slices)
             .map(|index| self.take_buf(slice_len.min(want - index * slice_len)))
@@ -311,43 +340,55 @@ impl ScatterReader {
             }),
             completed: Condvar::new(),
         });
-        let mine: Vec<Arc<FetchSlice>> = (0..slices)
+        let slices: Vec<Arc<FetchSlice>> = (0..slices)
             .map(|index| {
                 Arc::new(FetchSlice {
                     file: Arc::clone(&self.file),
-                    offset: base + (index * slice_len) as u64,
+                    offset: start + (index * slice_len) as u64,
                     index,
                     state: Arc::clone(&state),
                 })
             })
             .collect();
 
-        // Offer the later slices first so they can already be in flight, then
-        // walk every slice in order: the first is this thread's own, and the
-        // rest are reclaimed if no worker has started them. `run` no-ops on a
-        // slice someone else took, so this is both "do my share" and "take back
-        // what nobody wanted" in one pass -- and it is why a full queue, an
-        // empty pool, or a pool of workers all busy filling cannot wedge here.
+        // Slice 0 stays for the collecting thread, which has nothing better to
+        // do than read it; the rest go where a worker can reach them.
         if let Some(queue) = &self.fetch {
-            for slice in &mine[1..] {
+            for slice in &slices[1..] {
                 queue.offer(slice);
             }
         }
-        for slice in &mine {
+        self.offset += want as u64;
+        Some(PendingFill { slices, state, start })
+    }
+
+    /// Claim whatever the pool has not taken, wait for the rest, and publish the
+    /// fill's bytes in file order.
+    fn collect(&mut self, pending: &PendingFill) -> io::Result<()> {
+        // Walk every slice: the first is this thread's own share, and the rest
+        // are reclaimed if no worker has started them. `run` no-ops on a slice
+        // someone else took, so this is both "do my share" and "take back what
+        // nobody wanted" in one pass -- and it is why a full queue, an empty
+        // pool, or a pool of workers all busy filling cannot wedge here.
+        for slice in &pending.slices {
             slice.run();
         }
 
-        let mut progress = state.progress.lock().expect("fill state poisoned");
+        let mut progress = pending.state.progress.lock().expect("fill state poisoned");
         // Only slices a worker claimed before we got to them remain, and that
         // worker is inside `read_exact_at` rather than waiting on anything, so
         // this wait is bounded by one disk read.
         while progress.remaining > 0 {
-            progress = state.completed.wait(progress).expect("fill state poisoned");
+            progress = pending.state.completed.wait(progress).expect("fill state poisoned");
         }
         if let Some(e) = progress.error.take() {
-            // Nothing is published and `offset` has not moved, so the reader is
-            // exactly where it was and a caller that reads again re-reads the
-            // same range. That is why this needs no error latch.
+            drop(progress);
+            // `issue` moved the fetch offset before the bytes were claimed, so
+            // put it back: a caller that reads again must retry this range, not
+            // skip it. Anything issued after it covers bytes past the failure
+            // and is dropped for the same reason.
+            self.offset = pending.start;
+            self.pending.clear();
             return Err(e);
         }
         for slot in &mut progress.slots {
@@ -356,8 +397,28 @@ impl ScatterReader {
                 _ => unreachable!("a fill with no error has every slice done"),
             }
         }
-        drop(progress);
-        self.offset += want as u64;
+        Ok(())
+    }
+
+    /// Make bytes available in `ready`, leaving it empty only at EOF.
+    fn fill(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            let Some(first) = self.issue() else {
+                return Ok(());
+            };
+            self.pending.push_back(first);
+        }
+        let pending = self.pending.pop_front().expect("just ensured non-empty");
+        self.collect(&pending)?;
+        // Topped up after collecting rather than before, so the fills issued
+        // here overlap the framing of what just landed rather than the wait for
+        // it. At depth 0 this loop does nothing and the reader is demand-driven.
+        while self.pending.len() < self.lookahead {
+            let Some(next) = self.issue() else {
+                break;
+            };
+            self.pending.push_back(next);
+        }
         Ok(())
     }
 }
@@ -412,7 +473,10 @@ impl ScatterReader {
     fn position(&self) -> u64 {
         let unconsumed: usize =
             self.ready.iter().map(Vec::len).sum::<usize>().saturating_sub(self.front_pos);
-        self.offset.saturating_sub(unconsumed as u64)
+        // Pending fills are contiguous and end at the fetch offset, so the
+        // oldest one's start is where the in-flight region begins.
+        let in_flight = self.pending.front().map_or(0, |p| self.offset - p.start);
+        self.offset.saturating_sub(unconsumed as u64).saturating_sub(in_flight)
     }
 }
 
@@ -585,6 +649,89 @@ mod tests {
         worker.join().expect("worker");
 
         assert!(got == expected, "bytes must match however the slices were shared");
+    }
+
+    /// A reader that keeps one fill in flight, like the phase-1 input reader.
+    fn ahead(path: &std::path::Path, streams: usize) -> ScatterReader {
+        let file = File::open(path).expect("open");
+        ScatterReader::new(file, 0, streams, Some(FetchQueue::new(4)))
+            .expect("reader")
+            .looking_ahead(1)
+    }
+
+    #[test]
+    fn test_lookahead_delivers_the_file_verbatim_at_every_stream_count() {
+        // Prefetching the next fill must not change a byte, and it is the case
+        // most likely to: two fills are alive at once, so a buffer recycled or
+        // an offset advanced at the wrong moment corrupts the seam between them.
+        let (file, expected) = fixture(FILL_BYTES * 3 + 12_345);
+        for streams in [2usize, 4, 8] {
+            let got = read_all(&mut ahead(file.path(), streams), 64 * 1024);
+            assert_eq!(got.len(), expected.len(), "length at {streams} streams");
+            assert!(got == expected, "bytes differ at {streams} streams");
+        }
+    }
+
+    #[test]
+    fn test_lookahead_keeps_the_next_fill_in_flight_while_the_consumer_reads() {
+        // The whole point: the device should be working on the next fill while
+        // the framer is still consuming this one. Without it the disk idles for
+        // exactly as long as framing takes, which is what the demand-driven
+        // reader measured as 18s of unrecovered read span.
+        let (file, _) = fixture(FILL_BYTES * 3);
+        let mut reader = ahead(file.path(), 4);
+        assert!(reader.pending.is_empty(), "nothing is in flight before the first read");
+        assert!(reader.read(&mut [0u8; 64]).expect("first read") > 0, "the fixture is not empty");
+        assert_eq!(reader.pending.len(), 1, "the next fill should already be issued");
+    }
+
+    #[test]
+    fn test_lookahead_keeps_the_depth_it_was_given_in_flight() {
+        // Depth is the knob that decides how much of the framing time the fetch
+        // can hide behind, so it has to actually take effect.
+        let (file, _) = fixture(FILL_BYTES * 6);
+        let handle = File::open(file.path()).expect("open");
+        let mut reader = ScatterReader::new(handle, 0, 4, Some(FetchQueue::new(4)))
+            .expect("reader")
+            .looking_ahead(3);
+        assert!(reader.read(&mut [0u8; 64]).expect("read") > 0, "the fixture is not empty");
+        assert_eq!(reader.pending.len(), 3, "three fills should be in flight");
+    }
+
+    #[test]
+    fn test_lookahead_does_not_run_ahead_of_the_end_of_the_file() {
+        // The last fill has no successor. Issuing one anyway would read past EOF
+        // and turn a clean finish into an error.
+        let (file, expected) = fixture(FILL_BYTES + 16);
+        let mut reader = ahead(file.path(), 4);
+        assert!(read_all(&mut reader, 1024) == expected);
+        assert!(reader.pending.is_empty(), "nothing may be in flight at EOF");
+    }
+
+    #[test]
+    fn test_a_failed_fill_rewinds_so_the_next_read_retries_the_same_bytes() {
+        // A fill is issued before it is collected, so the fetch offset moves
+        // first. If a failure left it moved, the retry would silently skip the
+        // range that failed -- losing records rather than reporting an error.
+        let (file, _) = fixture(FILL_BYTES * 3);
+        let mut reader = ahead(file.path(), 4);
+        let before = reader.position();
+        file.as_file().set_len(0).expect("truncate");
+        assert!(reader.read(&mut [0u8; 4096]).is_err(), "the read reports the failure");
+        assert_eq!(reader.position(), before, "a failed fill must not advance the reader");
+        assert!(reader.read(&mut [0u8; 4096]).is_err(), "and it keeps reporting it");
+    }
+
+    #[test]
+    fn test_position_ignores_bytes_that_are_only_in_flight() {
+        // `position` is where the consumer is, not how far ahead the fetch has
+        // run. Counting an in-flight fill would make it jump forward by a whole
+        // `FILL_BYTES` the moment lookahead was enabled.
+        let (file, _) = fixture(FILL_BYTES * 3);
+        let mut reader = ahead(file.path(), 4);
+        let consumed = reader.read(&mut [0u8; 100]).expect("read");
+        assert_eq!(consumed, 100, "a 100-byte read from a full fill returns 100");
+        assert_eq!(reader.position(), 100, "only consumed bytes count");
     }
 
     #[test]

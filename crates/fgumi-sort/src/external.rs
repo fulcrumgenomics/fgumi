@@ -6522,6 +6522,31 @@ pub(crate) use crate::SortStats as RawSortStats;
 // rather than in `fgumi-bam-io`.
 // ============================================================================
 
+/// Fills the phase-1 input reader keeps in flight ahead of the framer.
+///
+/// One, and deeper does not help. Swept in a single boot on
+/// `1kg-wgs-HG00096` (t16, 4 streams), read span against total wall:
+///
+/// | depth | read span | wall |
+/// | --- | --- | --- |
+/// | 0 | 69.4s | 271.8s |
+/// | 1 | 66.9s | 267.7s |
+/// | 2 | 66.7s | 269.4s |
+/// | 4 | 66.4s | 268.5s |
+///
+/// Depths 2 and 4 move the span by less than a second and the wall clock not
+/// at all -- all three sit inside the +/-0.7% in-boot noise floor -- and depth
+/// 2 cost 277 MB of peak RSS for it. One is enough because the span is not
+/// fetch-bound: the fetch runs at 1327 MB/s and takes 32.5s of a 66.4s span
+/// against an ingest-serial floor of 53.0s, so what is left is coordination
+/// between the reader, the decompress workers and the ingest thread, which no
+/// amount of read-ahead touches.
+///
+/// Costs `(n + 1) * FILL_BYTES` of buffers on one reader, which is also why
+/// the merge's spill readers -- there are K of them, and the merge is already
+/// at its consumer-serial floor -- get none.
+const PHASE1_LOOKAHEAD_FILLS: usize = 1;
+
 /// Create a raw BAM reader using the pool's Phase 1 integrated reading.
 ///
 /// Workers in the pool do `ReadInputBlocks` + `DecompressInput`. The main
@@ -6595,8 +6620,9 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
                 read_streams,
                 Some(pool.fetch_queue()),
             )
-            .map(|reader| reader.timed(Arc::clone(&reader_stats)))
-            {
+            .map(|reader| {
+                reader.timed(Arc::clone(&reader_stats)).looking_ahead(PHASE1_LOOKAHEAD_FILLS)
+            }) {
                 Ok(reader) => {
                     log::debug!(
                         "scattered sort reader: {read_streams} streams over {}",
