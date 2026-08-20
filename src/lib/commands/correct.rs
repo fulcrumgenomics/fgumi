@@ -21,7 +21,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use std::path::PathBuf;
+//! use std::path::{Path, PathBuf};
 //! use fgumi_lib::commands::correct::{CorrectUmis, Target};
 //! use fgumi_lib::commands::command::Command;
 //! use fgumi_lib::commands::common::{
@@ -85,6 +85,7 @@ use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
 use std::io;
 use std::num::NonZero;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -92,7 +93,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions, SchedulerOptions,
-    ThreadingOptions, build_pipeline_config, reject_colliding_outputs, serialize_raw_bam_records,
+    ThreadingOptions, build_pipeline_config, reject_output_collisions, serialize_raw_bam_records,
 };
 
 /// Which SAM tag `correct` operates on.
@@ -471,7 +472,14 @@ impl Command for CorrectUmis {
     /// ```
     fn execute(&self, command_line: &str) -> Result<()> {
         self.validate()?;
-        reject_colliding_outputs(&self.io.output, self.rejects_opts.rejects.as_ref(), "--rejects")?;
+        let mut outputs: Vec<(&Path, &str)> = vec![(self.io.output.as_path(), "--output")];
+        if let Some(path) = &self.rejects_opts.rejects {
+            outputs.push((path.as_path(), "--rejects"));
+        }
+        if let Some(path) = &self.metrics {
+            outputs.push((path.as_path(), "--metrics"));
+        }
+        reject_output_collisions(&outputs)?;
 
         let timer = OperationTimer::new("Correcting UMIs");
 

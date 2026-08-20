@@ -20,10 +20,10 @@ use rand::rngs::StdRng;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::commands::command::Command;
-use crate::commands::common::{BamIoOptions, CompressionOptions, reject_colliding_outputs};
+use crate::commands::common::{BamIoOptions, CompressionOptions, reject_output_collisions};
 
 /// Downsample a BAM file by UMI family using streaming.
 ///
@@ -130,7 +130,17 @@ impl Command for Downsample {
         // is exempt from the file-existence check, matching every other streaming
         // command; the BAM reader already handles stdin.
         self.io.validate()?;
-        reject_colliding_outputs(&self.io.output, self.rejects.as_ref(), "--rejects")?;
+        let mut outputs: Vec<(&Path, &str)> = vec![(self.io.output.as_path(), "--output")];
+        if let Some(path) = &self.rejects {
+            outputs.push((path.as_path(), "--rejects"));
+        }
+        if let Some(path) = &self.histogram_kept {
+            outputs.push((path.as_path(), "--histogram-kept"));
+        }
+        if let Some(path) = &self.histogram_rejected {
+            outputs.push((path.as_path(), "--histogram-rejected"));
+        }
+        reject_output_collisions(&outputs)?;
 
         // Validate fraction
         Self::validate_fraction(self.fraction)?;

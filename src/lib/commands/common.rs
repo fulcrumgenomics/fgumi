@@ -3,6 +3,8 @@
 //! This module provides shared argument structures that can be composed into
 //! command structs using `#[command(flatten)]`.
 
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "simplex")]
 use std::sync::Arc;
@@ -17,7 +19,6 @@ use crate::unified_pipeline::{
 use crate::validation::validate_input_exists;
 use bytesize::ByteSize;
 use clap::Args;
-#[cfg(feature = "simplex")]
 use fgumi_bam_io::is_stdout_path;
 use fgumi_consensus::methylation::RefBaseProvider;
 use fgumi_umi::IndexThreshold;
@@ -584,12 +585,17 @@ impl RejectsOptions {
     }
 }
 
-/// Refuse a secondary output that resolves to the same destination as `--output`.
+/// Refuse a command whose output paths do not all resolve to distinct
+/// destinations.
 ///
-/// A command's primary and secondary writers are both opened up front and
-/// written from the same loop, so pointing them at one destination does not make
-/// them take turns — it interleaves two BAMs. How that fails depends on the
-/// destination, and both ways are silent:
+/// Given every output a command will open — `--output`, `--rejects`, `--stats`,
+/// `--metrics` (including a prefix's expanded files), histograms — as
+/// `(path, flag-label)` pairs, this rejects any two that resolve to the same
+/// destination. A command's writers are opened up front and written
+/// independently, so pointing two at one destination does not make them take
+/// turns — it interleaves or overwrites, corrupting the output (a metrics/stats
+/// path equal to `--output` truncates a finished BAM to a TSV). How that fails
+/// depends on the destination, and both ways are silent:
 ///
 /// - **stdout.** `-` and `/dev/stdout` both resolve to fd 1, where the two
 ///   writers share one file description. Every byte lands, but the stream
@@ -613,8 +619,7 @@ impl RejectsOptions {
 /// hard links, or one name in two cases on a case-insensitive filesystem. A true
 /// `dev`+`ino` comparison needs both files to exist, and by the time they do both
 /// `File::create` calls have already truncated; closing that gap means moving the
-/// check into the writer layer. See #715, which also covers `--stats`/`--metrics`
-/// sharing a path with `--output`.
+/// check into the writer layer — a follow-up to #715 (item 1) tracked separately.
 ///
 /// The null device is the one exempt destination: it discards every byte, so two
 /// writers on it cannot corrupt each other and `-o /dev/null --rejects /dev/null`
@@ -624,43 +629,67 @@ impl RejectsOptions {
 /// two block sequences, and two EOF markers into a stream no reader can parse.
 /// That is the same failure as `-o - --rejects -`, so it is rejected the same way.
 ///
-/// `secondary_flag` names the offending option in the error, since a command may
-/// have more than one secondary output.
+/// Each target carries the flag label that named it, so the error can point at
+/// the offending options. Absent (`None`) outputs are simply left out of the
+/// slice by the caller.
 ///
 /// # Errors
 ///
-/// Returns an error if `output` and `secondary` both name stdout, or both resolve
-/// to the same destination and that destination is not the null device.
-pub fn reject_colliding_outputs(
-    output: &Path,
-    secondary: Option<&PathBuf>,
-    secondary_flag: &str,
-) -> anyhow::Result<()> {
-    let Some(secondary) = secondary else { return Ok(()) };
-
-    if is_stdout_path(output) || is_stdout_path(secondary) {
-        anyhow::ensure!(
-            !(is_stdout_path(output) && is_stdout_path(secondary)),
-            "--output and {secondary_flag} cannot both write to stdout: the two BAM streams \
-             would interleave into one unreadable stream; give {secondary_flag} a path"
-        );
-        return Ok(());
-    }
-
-    if is_null_device(output) && is_null_device(secondary) {
-        return Ok(());
-    }
-
-    if resolve_output_identity(output) == resolve_output_identity(secondary) {
+/// Returns an error if more than one target names stdout, or if two targets
+/// resolve to the same non-null destination.
+pub fn reject_output_collisions(targets: &[(&Path, &str)]) -> anyhow::Result<()> {
+    // stdout is a single shared stream, so at most one target may name it —
+    // regardless of spelling (`-`, `/dev/stdout`). Two writers on it would
+    // interleave two headers and two block sequences into one unreadable stream.
+    let stdout_flags: Vec<&str> =
+        targets.iter().filter(|(path, _)| is_stdout_path(path)).map(|&(_, flag)| flag).collect();
+    if stdout_flags.len() > 1 {
         anyhow::bail!(
-            "--output and {secondary_flag} both write to {}: the two BAM streams would \
-             interleave on a shared stream, or overwrite each other byte for byte on a \
-             regular file, and either way nothing can read the result; give \
-             {secondary_flag} a different path",
-            secondary.display()
+            "{} cannot all write to stdout: the streams would interleave into one unreadable \
+             output; give all but one an explicit path",
+            join_flags(&stdout_flags)
         );
+    }
+
+    // Group the remaining file targets by the identity that can be established
+    // before the file exists. The null device is the one destination multiple
+    // writers may share (it discards every byte), so it is skipped rather than
+    // grouped. The first flag to claim an identity wins the error's "prior" slot.
+    let mut seen: HashMap<(PathBuf, Option<OsString>), &str> = HashMap::new();
+    for &(path, flag) in targets {
+        if is_stdout_path(path) || is_null_device(path) {
+            continue;
+        }
+        let identity = resolve_output_identity_owned(path);
+        if let Some(&prior_flag) = seen.get(&identity) {
+            anyhow::bail!(
+                "{prior_flag} and {flag} both write to {}: two outputs on one destination would \
+                 overwrite each other byte for byte, or interleave on a shared stream, and either \
+                 way nothing can read the result; give one a different path",
+                path.display()
+            );
+        }
+        seen.insert(identity, flag);
     }
     Ok(())
+}
+
+/// Join flag labels into an English list for an error message: `"--output and
+/// --stats"`, or `"--output, --stats, and --metrics"`.
+fn join_flags(flags: &[&str]) -> String {
+    match flags {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [a, b] => format!("{a} and {b}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
+}
+
+/// [`resolve_output_identity`] with the file name owned, so the identity can key
+/// a map across targets rather than borrowing each path.
+fn resolve_output_identity_owned(path: &Path) -> (PathBuf, Option<OsString>) {
+    let (parent, name) = resolve_output_identity(path);
+    (parent, name.map(std::ffi::OsStr::to_os_string))
 }
 
 /// Whether `path` is the null device, the one destination two writers can share.
@@ -1669,7 +1698,7 @@ mod tests {
         assert_eq!(io.effective_check_crc(), expected);
     }
 
-    /// `reject_colliding_outputs` compares destinations, not the strings naming
+    /// `reject_output_collisions` compares destinations, not the strings naming
     /// them: `out.bam` and `./out.bam` are one file under two names, and two
     /// writers on one file overwrite each other byte for byte.
     ///
@@ -1686,7 +1715,7 @@ mod tests {
     #[case::distinct_names("out.bam", "rejects.bam", false)]
     #[case::identical_under_a_missing_parent("missing/out.bam", "missing/out.bam", true)]
     #[case::distinct_under_a_missing_parent("missing/out.bam", "missing/rejects.bam", false)]
-    fn reject_colliding_outputs_compares_resolved_files(
+    fn reject_output_collisions_compares_resolved_files(
         #[case] output: &str,
         #[case] secondary: &str,
         #[case] collides: bool,
@@ -1696,7 +1725,10 @@ mod tests {
         let output = dir.path().join(output);
         let secondary = dir.path().join(secondary);
 
-        let result = reject_colliding_outputs(&output, Some(&secondary), "--rejects");
+        let result = reject_output_collisions(&[
+            (output.as_path(), "--output"),
+            (secondary.as_path(), "--rejects"),
+        ]);
 
         assert_eq!(
             result.is_err(),
@@ -1731,14 +1763,17 @@ mod tests {
     #[case::a_file_then_stdout("out.bam", "-", false)]
     #[case::both_dev_null("/dev/null", "/dev/null", false)]
     #[case::dev_null_then_a_file("/dev/null", "rejects.bam", false)]
-    fn reject_colliding_outputs_handles_stdout_and_the_null_device(
+    fn reject_output_collisions_handles_stdout_and_the_null_device(
         #[case] output: &str,
         #[case] secondary: &str,
         #[case] collides: bool,
     ) {
         let secondary = PathBuf::from(secondary);
 
-        let result = reject_colliding_outputs(Path::new(output), Some(&secondary), "--rejects");
+        let result = reject_output_collisions(&[
+            (Path::new(output), "--output"),
+            (secondary.as_path(), "--rejects"),
+        ]);
 
         assert_eq!(
             result.is_err(),
@@ -1764,8 +1799,8 @@ mod tests {
     #[case::stdout("-")]
     #[case::dev_stdout("/dev/stdout")]
     #[case::a_file("out.bam")]
-    fn reject_colliding_outputs_allows_an_absent_secondary(#[case] output: &str) {
-        let result = reject_colliding_outputs(Path::new(output), None, "--rejects");
+    fn reject_output_collisions_allows_an_absent_secondary(#[case] output: &str) {
+        let result = reject_output_collisions(&[(Path::new(output), "--output")]);
         assert!(result.is_ok(), "`-o {output}` with no --rejects must be allowed: {result:?}");
     }
 
@@ -1781,7 +1816,7 @@ mod tests {
     #[rstest]
     #[case::one_fifo_named_twice("primary", "primary", true)]
     #[case::two_distinct_fifos("primary", "secondary", false)]
-    fn reject_colliding_outputs_rejects_a_shared_fifo(
+    fn reject_output_collisions_rejects_a_shared_fifo(
         #[case] output: &str,
         #[case] secondary: &str,
         #[case] collides: bool,
@@ -1794,7 +1829,10 @@ mod tests {
             make_fifo(&secondary);
         }
 
-        let result = reject_colliding_outputs(&output, Some(&secondary), "--rejects");
+        let result = reject_output_collisions(&[
+            (output.as_path(), "--output"),
+            (secondary.as_path(), "--rejects"),
+        ]);
 
         assert_eq!(
             result.is_err(),
@@ -1810,6 +1848,46 @@ mod tests {
                 "two writers on one stream interleave rather than overwrite, got: {message}"
             );
         }
+    }
+
+    /// The guard checks every pair among a command's outputs, not just
+    /// output-vs-rejects, and a distinct set of paths is always allowed.
+    #[rstest]
+    #[case::stats_hits_output(&[("out.bam", "--output"), ("r.bam", "--rejects"), ("out.bam", "--stats")], true)]
+    #[case::metrics_hits_rejects(&[("out.bam", "--output"), ("m.tsv", "--rejects"), ("m.tsv", "--metrics")], true)]
+    #[case::all_distinct(&[("out.bam", "--output"), ("r.bam", "--rejects"), ("s.tsv", "--stats")], false)]
+    #[case::single_output(&[("out.bam", "--output")], false)]
+    #[case::no_outputs(&[], false)]
+    fn reject_output_collisions_checks_every_pair(
+        #[case] specs: &[(&str, &str)],
+        #[case] collides: bool,
+    ) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let owned: Vec<(PathBuf, &str)> =
+            specs.iter().map(|(p, flag)| (dir.path().join(p), *flag)).collect();
+        let targets: Vec<(&Path, &str)> =
+            owned.iter().map(|(p, flag)| (p.as_path(), *flag)).collect();
+
+        let result = reject_output_collisions(&targets);
+        assert_eq!(result.is_err(), collides, "{specs:?}: got {result:?}");
+    }
+
+    /// stdout is one shared stream, so at most one output may name it — and the
+    /// error names every flag that tried to.
+    #[test]
+    fn reject_output_collisions_rejects_more_than_one_stdout() {
+        let result = reject_output_collisions(&[
+            (Path::new("-"), "--output"),
+            (Path::new("out.bam"), "--rejects"),
+            (Path::new("/dev/stdout"), "--stats"),
+        ]);
+        let message = result.expect_err("two stdout writers must be rejected").to_string();
+        assert!(
+            message.contains("stdout")
+                && message.contains("--output")
+                && message.contains("--stats"),
+            "the error must name stdout and both offending flags, got: {message}"
+        );
     }
 
     /// Create a FIFO at `path`.

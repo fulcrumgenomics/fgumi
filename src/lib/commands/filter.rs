@@ -40,7 +40,7 @@ use fgumi_raw_bam::{RawRecord, RawRecordView};
 use log::info;
 use noodles::sam::Header;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -48,7 +48,7 @@ use std::time::Instant;
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config, reject_colliding_outputs, serialize_raw_bam_records,
+    build_pipeline_config, reject_output_collisions, serialize_raw_bam_records,
 };
 
 /// Filters and masks consensus reads based on various quality metrics.
@@ -292,7 +292,14 @@ impl Command for Filter {
         // Validate the input exists (stdin paths are exempt — the reader
         // streams them in a single pass).
         self.io.validate()?;
-        reject_colliding_outputs(&self.io.output, self.rejects.as_ref(), "--rejects")?;
+        let mut outputs: Vec<(&Path, &str)> = vec![(self.io.output.as_path(), "--output")];
+        if let Some(path) = &self.rejects {
+            outputs.push((path.as_path(), "--rejects"));
+        }
+        if let Some(path) = &self.stats {
+            outputs.push((path.as_path(), "--stats"));
+        }
+        reject_output_collisions(&outputs)?;
 
         if let Some(ref reference) = self.reference {
             validate_file_exists(reference, "Reference FASTA")?;

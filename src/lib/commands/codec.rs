@@ -25,11 +25,12 @@ use fgumi_bam_io::{
     create_bam_reader_for_pipeline_with_opts, create_bam_writer, create_optional_bam_writer,
     create_raw_bam_reader_with_opts,
 };
+use std::path::Path;
 
 use super::common::{
     AllowUnmappedOptions, BamIoOptions, CompressionOptions, ConsensusCallingOptions,
     QueueMemoryOptions, ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions,
-    ThreadingOptions, build_pipeline_config, reject_colliding_outputs, serialize_raw_bam_records,
+    ThreadingOptions, build_pipeline_config, reject_output_collisions, serialize_raw_bam_records,
 };
 use crate::consensus::codec_caller::{
     CodecConsensusCaller, CodecConsensusError, CodecConsensusOptions, CodecConsensusStats,
@@ -318,7 +319,14 @@ impl Command for Codec {
         // Validate the input exists (stdin paths are exempt — the reader
         // streams them in a single pass).
         self.io.validate()?;
-        reject_colliding_outputs(&self.io.output, self.rejects_opts.rejects.as_ref(), "--rejects")?;
+        let mut outputs: Vec<(&Path, &str)> = vec![(self.io.output.as_path(), "--output")];
+        if let Some(path) = &self.rejects_opts.rejects {
+            outputs.push((path.as_path(), "--rejects"));
+        }
+        if let Some(path) = &self.stats_opts.stats {
+            outputs.push((path.as_path(), "--stats"));
+        }
+        reject_output_collisions(&outputs)?;
 
         let timer = OperationTimer::new("Calling CODEC consensus");
 

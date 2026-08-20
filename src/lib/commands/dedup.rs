@@ -1151,6 +1151,20 @@ pub struct MarkDuplicates {
 
 impl Command for MarkDuplicates {
     fn execute(&self, command_line: &str) -> Result<()> {
+        // Reject two outputs resolving to one destination before any writer opens.
+        let mut outputs: Vec<(&std::path::Path, &str)> =
+            vec![(self.io.output.as_path(), "--output")];
+        if let Some(path) = &self.metrics {
+            outputs.push((path.as_path(), "--metrics"));
+        }
+        if let Some(path) = &self.family_size_histogram {
+            outputs.push((path.as_path(), "--family-size-histogram"));
+        }
+        if let Some(path) = &self.duplication_ladder {
+            outputs.push((path.as_path(), "--duplication-ladder"));
+        }
+        crate::commands::common::reject_output_collisions(&outputs)?;
+
         // Validate strategy/min-umi-length combination
         if self.min_umi_length.is_some() && matches!(self.strategy, Strategy::Paired) {
             bail!("Paired strategy cannot be used with --min-umi-length");

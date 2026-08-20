@@ -767,6 +767,27 @@ impl Command for GroupReadsByUmi {
     /// Execute the tool using the 7-step unified pipeline.
     #[allow(clippy::too_many_lines)]
     fn execute(&self, command_line: &str) -> Result<()> {
+        // Reject two outputs resolving to one destination before any writer opens
+        // (e.g. a `--metrics PREFIX` file, or `-f`/`-g`, landing on `--output`).
+        let metrics_files: Vec<PathBuf> = self.metrics.as_ref().map_or_else(Vec::new, |prefix| {
+            vec![
+                with_extension(prefix, "family_sizes.txt"),
+                with_extension(prefix, "grouping_metrics.txt"),
+                with_extension(prefix, "position_group_sizes.txt"),
+            ]
+        });
+        let mut outputs: Vec<(&Path, &str)> = vec![(self.io.output.as_path(), "--output")];
+        if let Some(path) = &self.family_size_histogram {
+            outputs.push((path.as_path(), "--family-size-histogram"));
+        }
+        if let Some(path) = &self.grouping_metrics {
+            outputs.push((path.as_path(), "--grouping-metrics"));
+        }
+        for path in &metrics_files {
+            outputs.push((path.as_path(), "--metrics"));
+        }
+        crate::commands::common::reject_output_collisions(&outputs)?;
+
         // Validate inputs
         if self.min_umi_length.is_some() && matches!(self.strategy, Strategy::Paired) {
             bail!("Paired strategy cannot be used with --min-umi-length");
