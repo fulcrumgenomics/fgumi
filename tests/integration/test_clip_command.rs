@@ -8,6 +8,7 @@
 use clap::Parser;
 use fgumi_lib::commands::clip::Clip;
 use fgumi_lib::commands::command::Command;
+use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::RecordBuf;
@@ -468,6 +469,37 @@ fn read_with_cigar(
         .cigar_ops(cigar_ops)
         .mate_ref_id(0)
         .mate_pos(mate_pos);
+    b.build()
+}
+
+/// Like [`read_with_cigar`] but also sets the `MC` (mate CIGAR) tag and derives the read length
+/// from `cigar_ops` (rather than taking it as a separate, easily-mismatched argument). The
+/// past-mate-clip geometries below don't strictly require `MC` (`clip_extending_past_mate_ends`
+/// reads the mate's own CIGAR from the mate record in hand -- see
+/// `fgumi_raw_bam::num_bases_extending_past_mate_vs_mate_raw`), but real query-grouped input
+/// from an aligner carries it, so wiring it here keeps these fixtures representative.
+fn read_with_cigar_mc(
+    name: &[u8],
+    flags: u16,
+    pos: i32,
+    mate_pos: i32,
+    cigar_ops: &[u32],
+    mapq: u8,
+    mate_cigar: &[u8],
+) -> RawRecord {
+    let read_len = fgumi_raw_bam::query_length_from_cigar(cigar_ops);
+    let mut b = SamBuilder::new();
+    b.read_name(name)
+        .sequence(&vec![b'A'; read_len])
+        .qualities(&vec![30; read_len])
+        .flags(flags)
+        .ref_id(0)
+        .pos(pos)
+        .mapq(mapq)
+        .cigar_ops(cigar_ops)
+        .mate_ref_id(0)
+        .mate_pos(mate_pos)
+        .add_string_tag(SamTag::MC, mate_cigar);
     b.build()
 }
 
@@ -1107,5 +1139,278 @@ fn test_clip_command_lone_r2_primary_passed_through_unclipped() {
     assert_eq!(
         single_records, multi_records,
         "both threading modes agree on the lone-R2 passthrough"
+    );
+}
+
+// ===================================================================
+// #760: query-space past-mate clipping, end-to-end through the LIVE `fgumi clip` command.
+//
+// The unit-level fix lives in `RawRecordClipper::clip_extending_past_mate_ends`
+// (`crates/fgumi-sam/src/clipper.rs`), exercised in isolation by
+// `raw_clip_extending_past_mate_ends_query_space`. These tests drive the real command
+// (`Clip::execute`) instead, so they prove the fix actually takes effect on the path a user
+// runs (`--clip-bases-past-mate`), and pin the final CIGARs the whole pipeline produces --
+// something the isolated function's unit tests, which only assert the returned clip-count
+// tuple, cannot reach.
+// ===================================================================
+
+/// fgbio#1172 knock-on geometry through the LIVE `fgumi clip` command: r1 carries a deletion
+/// right at the mate's un-soft-clipped end (`2S124M1D3M`@101/+), r2 is `115M14S`@97/-. The OLD
+/// reference-space `clip_extending_past_mate_ends` mapped the deletion boundary to "no read
+/// position" and clipped r1's *entire* read, unmapping it -- and because it unmapped r1 before
+/// reaching r2, r2's mate was left unclipped too. The query-space fix (`RawRecordClipper`, Task
+/// 4R) clips both reads by a small, finite amount instead. `fgumi clip`'s own default clipping
+/// mode is Hard, so Soft is forced explicitly here to match the unit test
+/// (`deletion_knock_on`) this test's expected CIGARs are hand-derived from.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_clip_command_past_mate_knock_on_regression(#[case] threads: Option<&str>) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    // r1 (forward): 2S124M1D3M @ 1-based 101 (0-based 100).
+    let r1 = read_with_cigar_mc(
+        b"knockon",
+        flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE,
+        100,
+        96,
+        &[(2u32 << 4) | 4, 124u32 << 4, (1u32 << 4) | 2, 3u32 << 4],
+        60,
+        b"115M14S",
+    );
+    // r2 (reverse): 115M14S @ 1-based 97 (0-based 96).
+    let r2 = read_with_cigar_mc(
+        b"knockon",
+        flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE,
+        96,
+        100,
+        &[115u32 << 4, (14u32 << 4) | 4],
+        60,
+        b"2S124M1D3M",
+    );
+    create_bam_from_records(&input_bam, &[r1, r2]);
+
+    let mut args = vec![
+        "clip".to_string(),
+        "--input".to_string(),
+        input_bam.to_str().unwrap().to_string(),
+        "--output".to_string(),
+        output_bam.to_str().unwrap().to_string(),
+        "--reference".to_string(),
+        ref_path.to_str().unwrap().to_string(),
+        "--clipping-mode".to_string(),
+        "soft".to_string(),
+        "--clip-bases-past-mate".to_string(),
+        "true".to_string(),
+        "--compression-level".to_string(),
+        "1".to_string(),
+    ];
+    if let Some(t) = threads {
+        args.push("--threads".to_string());
+        args.push(t.to_string());
+    }
+    let cmd = Clip::try_parse_from(&args).expect("failed to parse clip args");
+    cmd.execute("fgumi clip").expect("Clip command failed");
+
+    let recs = read_output_record_bufs(&output_bam);
+    assert_eq!(recs.len(), 2, "both reads retained");
+
+    let r1_out = recs.iter().find(|r| r.flags().is_first_segment()).expect("r1 present");
+    let r2_out = recs.iter().find(|r| r.flags().is_last_segment()).expect("r2 present");
+
+    // Core regression: neither read was unmapped by the past-mate clip (OLD code unmapped r1).
+    assert!(!r1_out.flags().is_unmapped(), "r1 must remain mapped");
+    assert!(!r2_out.flags().is_unmapped(), "r2 must remain mapped");
+    assert!(r1_out.alignment_start().is_some(), "r1 must have an alignment start");
+    assert!(r2_out.alignment_start().is_some(), "r2 must have an alignment start");
+
+    // r1 clipped a small, finite amount (2 query bases at the 3' end): 2S124M1D3M -> 2S124M1D1M2S.
+    let r1_cigar = cigar_ops(r1_out);
+    assert_eq!(
+        r1_cigar,
+        vec![
+            (CigarKind::SoftClip, 2),
+            (CigarKind::Match, 124),
+            (CigarKind::Deletion, 1),
+            (CigarKind::Match, 1),
+            (CigarKind::SoftClip, 2),
+        ],
+        "r1 CIGAR mismatch; got {r1_cigar:?}"
+    );
+    assert_eq!(
+        usize::from(r1_out.alignment_start().unwrap()),
+        101,
+        "r1 alignment start unchanged (only its trailing end was clipped)"
+    );
+
+    // r2 also clipped (OLD code skipped the mate entirely after unmapping r1): 2 bases at its 3'
+    // end, which for a reverse-strand read is the leading (low-coordinate) side, so
+    // 115M14S -> 2S113M14S and the alignment start advances by 2 (97 -> 99, 1-based).
+    let r2_cigar = cigar_ops(r2_out);
+    assert_eq!(
+        r2_cigar,
+        vec![(CigarKind::SoftClip, 2), (CigarKind::Match, 113), (CigarKind::SoftClip, 14)],
+        "r2 CIGAR mismatch; got {r2_cigar:?}"
+    );
+    assert_eq!(
+        usize::from(r2_out.alignment_start().unwrap()),
+        99,
+        "r2 alignment start advances by the newly added leading clip (97 -> 99)"
+    );
+}
+
+/// Machine-verifies the two Hard-mode past-mate-clip full-pipeline CIGARs that the
+/// `RawRecordClipper` unit test `raw_clip_extending_past_mate_ends_query_space`
+/// (`crates/fgumi-sam/src/clipper.rs`) only pins as a `(bases_r1, bases_r2)` return tuple -- the
+/// final CIGAR is produced by the whole `fgumi clip` pipeline (which maps that tuple through
+/// `clip_3_prime_end_of_read_raw` and, where the request lands inside an already-soft-clipped
+/// run, `upgrade_clipping_raw`'s partial soft-to-hard upgrade), not by the isolated function, so
+/// this is the only place those CIGARs are checked end-to-end. Both templates share one BAM /
+/// one Hard-mode invocation (neither case needs any other clipping option):
+///
+/// - `ins`: r1 `70M10I23M47S`@100/+, r2 `50S70M30S`@100/-. Unit case `insertion_before_mate_end`
+///   pins the return tuple `(3, 0)`. r1's past-mate request (50 query bases) exceeds its
+///   existing 47-base trailing soft clip by exactly 3, so `clip_end_of_read_raw` shrinks the
+///   alignment by those 3 bases (`23M` -> `20M`) and, in Hard mode, merges them with the
+///   existing 47 soft-clipped bases into one 50-base hard-clip run: `70M10I20M50H`. r2's
+///   past-mate request is also 50 query bases (Table B's `count_insertion` pins both sides at
+///   50), which lands exactly on its existing 50-base leading soft clip -- not past it -- so
+///   `clip_start_of_read_raw` takes the upgrade-only branch (contributing `0` newly-*aligned*
+///   bases, hence the tuple's `0`) and upgrades the entire existing run to hard:
+///   `50S70M30S` -> `50H70M30S`.
+/// - `disjoint`: r1 `20M80S`@1000/+, r2 `80S20M`@1020/-. Unit case `disjoint_no_shared_pos` pins
+///   `(0, 0)`: the 60-base past-mate request lands entirely inside each read's existing 80-base
+///   soft clip, so `clip_end_of_read_raw` takes the upgrade-only branch (no alignment
+///   shrinkage, hence the `0` in the tuple) and converts exactly 60 of the 80 existing
+///   soft-clipped bases to hard, leaving the other 20 still soft: r1 -> `20M20S60H`, r2
+///   (symmetric, on its leading/low-coordinate side) -> `60H20S20M`.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_clip_command_past_mate_hard_mode_cigars(#[case] threads: Option<&str>) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    // "ins": r1 70M10I23M47S @ 1-based 100 (0-based 99), r2 50S70M30S @ same start.
+    let ins_r1 = read_with_cigar_mc(
+        b"ins",
+        flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE,
+        99,
+        99,
+        &[70u32 << 4, (10u32 << 4) | 1, 23u32 << 4, (47u32 << 4) | 4],
+        60,
+        b"50S70M30S",
+    );
+    let ins_r2 = read_with_cigar_mc(
+        b"ins",
+        flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE,
+        99,
+        99,
+        &[(50u32 << 4) | 4, 70u32 << 4, (30u32 << 4) | 4],
+        60,
+        b"70M10I23M47S",
+    );
+
+    // "disjoint": r1 20M80S @ 1-based 1000 (0-based 999), r2 80S20M @ 1-based 1020 (0-based 1019).
+    let disjoint_r1 = read_with_cigar_mc(
+        b"disjoint",
+        flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE,
+        999,
+        1019,
+        &[20u32 << 4, (80u32 << 4) | 4],
+        60,
+        b"80S20M",
+    );
+    let disjoint_r2 = read_with_cigar_mc(
+        b"disjoint",
+        flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE,
+        1019,
+        999,
+        &[(80u32 << 4) | 4, 20u32 << 4],
+        60,
+        b"20M80S",
+    );
+
+    create_bam_from_records(&input_bam, &[ins_r1, ins_r2, disjoint_r1, disjoint_r2]);
+
+    let mut args = vec![
+        "clip".to_string(),
+        "--input".to_string(),
+        input_bam.to_str().unwrap().to_string(),
+        "--output".to_string(),
+        output_bam.to_str().unwrap().to_string(),
+        "--reference".to_string(),
+        ref_path.to_str().unwrap().to_string(),
+        "--clipping-mode".to_string(),
+        "hard".to_string(),
+        "--clip-bases-past-mate".to_string(),
+        "true".to_string(),
+        "--compression-level".to_string(),
+        "1".to_string(),
+    ];
+    if let Some(t) = threads {
+        args.push("--threads".to_string());
+        args.push(t.to_string());
+    }
+    let cmd = Clip::try_parse_from(&args).expect("failed to parse clip args");
+    cmd.execute("fgumi clip").expect("Clip command failed");
+
+    let recs = read_output_record_bufs(&output_bam);
+    assert_eq!(recs.len(), 4, "all four reads retained");
+
+    let named_segment = |name: &[u8], first: bool| -> &RecordBuf {
+        recs.iter()
+            .find(|r| {
+                r.name().is_some_and(|n| AsRef::<[u8]>::as_ref(n) == name)
+                    && r.flags().is_first_segment() == first
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing {}/{}",
+                    String::from_utf8_lossy(name),
+                    if first { "R1" } else { "R2" }
+                )
+            })
+    };
+
+    let ins_r1_out = named_segment(b"ins", true);
+    let ins_r2_out = named_segment(b"ins", false);
+    let disjoint_r1_out = named_segment(b"disjoint", true);
+    let disjoint_r2_out = named_segment(b"disjoint", false);
+
+    let ins_r1_cigar = cigar_ops(ins_r1_out);
+    assert_eq!(
+        ins_r1_cigar,
+        vec![
+            (CigarKind::Match, 70),
+            (CigarKind::Insertion, 10),
+            (CigarKind::Match, 20),
+            (CigarKind::HardClip, 50),
+        ],
+        "ins r1 CIGAR mismatch; got {ins_r1_cigar:?}"
+    );
+    let ins_r2_cigar = cigar_ops(ins_r2_out);
+    assert_eq!(
+        ins_r2_cigar,
+        vec![(CigarKind::HardClip, 50), (CigarKind::Match, 70), (CigarKind::SoftClip, 30)],
+        "ins r2 CIGAR mismatch; got {ins_r2_cigar:?}"
+    );
+
+    let disjoint_r1_cigar = cigar_ops(disjoint_r1_out);
+    assert_eq!(
+        disjoint_r1_cigar,
+        vec![(CigarKind::Match, 20), (CigarKind::SoftClip, 20), (CigarKind::HardClip, 60)],
+        "disjoint r1 CIGAR mismatch; got {disjoint_r1_cigar:?}"
+    );
+    let disjoint_r2_cigar = cigar_ops(disjoint_r2_out);
+    assert_eq!(
+        disjoint_r2_cigar,
+        vec![(CigarKind::HardClip, 60), (CigarKind::SoftClip, 20), (CigarKind::Match, 20)],
+        "disjoint r2 CIGAR mismatch; got {disjoint_r2_cigar:?}"
     );
 }
