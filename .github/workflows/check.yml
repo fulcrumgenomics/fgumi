@@ -281,6 +281,9 @@ jobs:
 
   sort-correctness:
     runs-on: ubuntu-latest
+    # A stalled apt mirror on the "Install samtools" step has hung this job for
+    # 30+ minutes (up to GitHub's 6-hour default). Cap it so an infrastructure
+    # stall fails fast and is obvious, instead of masquerading as a slow job.
     timeout-minutes: 20
     # This job only reads the repository -- it builds and runs tests, and never
     # writes back to GitHub. Drop the default GITHUB_TOKEN scopes to read-only so
@@ -311,7 +314,30 @@ jobs:
         # sort-correctness was ungated. samtools is taken from the runner's apt repo —
         # the tests never parse samtools' record order, so they do not depend on a
         # specific samtools patch version.
-        run: sudo apt-get update && sudo apt-get install -y samtools
+        #
+        # Bound each apt call and retry: a stalled Azure apt mirror otherwise
+        # hangs `apt-get` indefinitely (observed 40+ min), and with the job
+        # timeout above that would waste the whole budget on one bad mirror.
+        # Acquire::Retries + a per-request timeout make a stuck mirror error out
+        # quickly, and the outer loop retries the transient failure. DEBIAN_
+        # FRONTEND=noninteractive guards against any post-install config prompt.
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get update "${apt_opts[@]}" \
+              && sudo apt-get install -y "${apt_opts[@]}" samtools; then
+              exit 0
+            fi
+            if [ "${attempt}" -lt 3 ]; then
+              echo "apt attempt ${attempt} failed; retrying in 15s" >&2
+              sleep 15
+            fi
+          done
+          echo "apt failed after 3 attempts" >&2
+          exit 1
       - name: Verify samtools is on PATH
         # The samtools-gated suites early-return when `samtools_available()`
         # (which shells out to `samtools --version`) is false, so a missing binary
