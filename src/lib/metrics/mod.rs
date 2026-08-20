@@ -32,7 +32,7 @@ pub use fgumi_metrics::writer;
 pub use clip::{ClippingMetrics, ClippingMetricsCollection, ReadType};
 pub use consensus::{ConsensusKvMetric, ConsensusMetrics};
 pub use correct::UmiCorrectionMetrics;
-pub use dedup::DeduplicationMetrics;
+pub use dedup::{DeduplicationCounts, DeduplicationMetrics, DuplicationLadderMetrics};
 pub use duplex::{
     DuplexFamilySizeMetric, DuplexMetricsCollector, DuplexUmiMetric, DuplexYieldMetric,
     FamilySizeMetric,

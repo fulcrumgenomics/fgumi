@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use crate::grouper::{RawPositionGroup, RecordPositionGrouper, build_templates_from_records};
 use crate::logging::OperationTimer;
-use crate::metrics::DeduplicationMetrics;
 use crate::metrics::group::FamilySizeMetrics;
+use crate::metrics::{DeduplicationCounts, DeduplicationMetrics, DuplicationLadderMetrics};
 use crate::metrics::{TemplateFilterCounts, TemplateFilterReason};
 use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
@@ -129,34 +129,55 @@ impl DedupCounts {
     }
 }
 
-impl From<&DedupCounts> for DeduplicationMetrics {
-    fn from(counts: &DedupCounts) -> Self {
-        use TemplateFilterReason as Reason;
-        let filter = &counts.filter_counts;
-        Self {
-            filtered_templates: filter.total_rejected_templates(),
-            filtered_malformed_record: filter.rejected_templates(Reason::MalformedRecord),
-            filtered_no_primary_reads: filter.rejected_templates(Reason::NoPrimaryReads),
-            filtered_unmapped: filter.rejected_templates(Reason::Unmapped),
-            filtered_not_passing_filter: filter.rejected_templates(Reason::NotPassingFilter),
-            filtered_low_mapping_quality: filter.rejected_templates(Reason::LowMappingQuality),
-            filtered_low_mate_mapping_quality: filter
-                .rejected_templates(Reason::LowMateMappingQuality),
-            filtered_missing_umi: filter.rejected_templates(Reason::MissingUmi),
-            filtered_ns_in_umi: filter.rejected_templates(Reason::NsInUmi),
-            filtered_umi_too_short: filter.rejected_templates(Reason::UmiTooShort),
-            passthrough_templates: counts.passthrough_templates,
-            total_templates: counts.total_templates,
-            unique_templates: counts.unique_templates,
-            duplicate_templates: counts.duplicate_templates,
-            duplicate_rate: counts.duplicate_rate(),
-            total_reads: counts.total_reads,
-            unique_reads: counts.unique_reads,
-            duplicate_reads: counts.duplicate_reads,
-            secondary_reads: counts.secondary_reads,
-            supplementary_reads: counts.supplementary_reads,
-            missing_tc_tag: counts.missing_tc_tag,
-        }
+/// Converts accumulated dedup counts for one library (or the aggregate total
+/// across all libraries) into the serializable [`DeduplicationMetrics`] row.
+///
+/// The raw counts are copied 1:1 into a [`DeduplicationCounts`], and
+/// [`DeduplicationMetrics::from_counts`] computes the three derived columns
+/// (`duplicate_rate`, `percent_duplication`, `estimated_library_size`). fgumi
+/// counts *templates*, and each template stands in for one read pair in
+/// paired-end data — the same approximation `duplicate_rate` already makes by
+/// reporting a template-level rather than read-pair-level rate. That is why
+/// `estimated_library_size` is fed `total_templates`/`unique_templates` as its
+/// `n_pairs`/`n_unique` inputs.
+fn to_deduplication_metrics(library: String, counts: &DedupCounts) -> DeduplicationMetrics {
+    use TemplateFilterReason as Reason;
+    let filter = &counts.filter_counts;
+    DeduplicationMetrics::from_counts(DeduplicationCounts {
+        library,
+        filtered_templates: filter.total_rejected_templates(),
+        filtered_malformed_record: filter.rejected_templates(Reason::MalformedRecord),
+        filtered_no_primary_reads: filter.rejected_templates(Reason::NoPrimaryReads),
+        filtered_unmapped: filter.rejected_templates(Reason::Unmapped),
+        filtered_not_passing_filter: filter.rejected_templates(Reason::NotPassingFilter),
+        filtered_low_mapping_quality: filter.rejected_templates(Reason::LowMappingQuality),
+        filtered_low_mate_mapping_quality: filter.rejected_templates(Reason::LowMateMappingQuality),
+        filtered_missing_umi: filter.rejected_templates(Reason::MissingUmi),
+        filtered_ns_in_umi: filter.rejected_templates(Reason::NsInUmi),
+        filtered_umi_too_short: filter.rejected_templates(Reason::UmiTooShort),
+        passthrough_templates: counts.passthrough_templates,
+        total_templates: counts.total_templates,
+        unique_templates: counts.unique_templates,
+        duplicate_templates: counts.duplicate_templates,
+        total_reads: counts.total_reads,
+        unique_reads: counts.unique_reads,
+        duplicate_reads: counts.duplicate_reads,
+        secondary_reads: counts.secondary_reads,
+        supplementary_reads: counts.supplementary_reads,
+        missing_tc_tag: counts.missing_tc_tag,
+    })
+}
+
+/// Resolves the display name for a metrics row's library index.
+///
+/// `LibraryIndex` reserves index 0 for reads whose `@RG` has no `LB` field
+/// (or no `RG` tag at all). For metrics *display*, match Picard
+/// `DuplicationMetrics`' convention of naming that bucket "Unknown Library".
+fn library_display_name(idx: u16, library_index: &LibraryIndex) -> String {
+    if idx == 0 {
+        "Unknown Library".to_string()
+    } else {
+        library_index.library_name(idx).to_string()
     }
 }
 
@@ -167,10 +188,121 @@ impl From<&DedupCounts> for DeduplicationMetrics {
 /// Metrics collected per position group, aggregated after pipeline completion.
 #[derive(Default, Debug)]
 struct CollectedDedupCounts {
-    /// Dedup-specific metrics
-    dedup_counts: DedupCounts,
-    /// Family size counts
+    /// Dedup-specific counts, aggregated per library (keyed by
+    /// `GroupKey::library_idx` / `ProcessedDedupGroup::library_idx`). One
+    /// position group always belongs to exactly one library (library is part
+    /// of the grouping key), so merging is unambiguous per group.
+    dedup_counts_by_library: AHashMap<u16, DedupCounts>,
+    /// Family size counts, global across all libraries (out of scope for
+    /// per-library splitting).
     family_sizes: AHashMap<usize, u64>,
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Duplication saturation ladder (--duplication-ladder)
+//////////////////////////////////////////////////////////////////////////////
+
+/// Per-library cumulative counters and emitted snapshot rows backing
+/// `--duplication-ladder`.
+///
+/// # Ordering
+///
+/// A saturation curve plots "after N templates processed, in coordinate
+/// order, what cumulative fraction were duplicates" — so [`Self::record`]
+/// MUST be called in strict serial/coordinate order, one call per position
+/// group. It is wired into the `mi_assign_fn` hook installed on the pipeline
+/// (`run_bam_pipeline_from_reader_with_mi_assign`), which the pipeline
+/// harness runs in serial order by the MI Assign zone before each item's
+/// `serialize_fn`. `dedup` installs this hook unconditionally — not gated on
+/// `--no-umi`, strategy, or any other flag — so it runs for every position
+/// group in every mode, making it the correct accumulation point. Do NOT
+/// accumulate this in `serialize_fn`: that closure also runs once per group,
+/// but workers execute it in parallel completion order, not coordinate order.
+#[derive(Default)]
+struct DuplicationLadderRecorder {
+    /// Snapshot interval in cumulative templates (`--ladder-interval`).
+    interval: u64,
+    /// Per-library running totals and next snapshot threshold.
+    per_library: AHashMap<u16, LadderLibraryState>,
+    /// Emitted `(library_idx, templates_seen, duplicate_templates)` rows, in
+    /// emission order (interval crossings interleaved across libraries as
+    /// groups are processed, plus the final per-library rows appended by
+    /// [`Self::finish`]). Sorted into deterministic (library, `templates_seen`)
+    /// order only at write time.
+    rows: Vec<(u16, u64, u64)>,
+}
+
+/// Running cumulative state for one library's saturation ladder.
+#[derive(Default)]
+struct LadderLibraryState {
+    /// Cumulative templates seen so far for this library.
+    templates_seen: u64,
+    /// Cumulative duplicate templates seen so far for this library.
+    duplicate_templates: u64,
+    /// Next cumulative `templates_seen` value that triggers a snapshot row.
+    next_threshold: u64,
+    /// `templates_seen` at the last emitted row, used by [`Self::finish`] (via
+    /// [`DuplicationLadderRecorder::finish`]) to avoid a duplicate final row
+    /// when the true total already landed exactly on an interval crossing.
+    last_emitted_at: u64,
+}
+
+impl DuplicationLadderRecorder {
+    fn new(interval: u64) -> Self {
+        Self { interval, per_library: AHashMap::new(), rows: Vec::new() }
+    }
+
+    /// Adds one position group's per-library template/duplicate counts.
+    ///
+    /// A position group always belongs to a single library (library
+    /// partitions the grouping key), so `group_counts`'s counts belong
+    /// entirely to `library_idx`. Emits at most one snapshot row per call,
+    /// the moment cumulative `templates_seen` reaches or passes a multiple of
+    /// `interval` — even when a single group's increment is large enough to
+    /// leap past more than one multiple at once (a small `--ladder-interval`
+    /// against a large position group), only one row is emitted, at the
+    /// group's true cumulative total, and `next_threshold` is re-based to the
+    /// next multiple strictly above it.
+    ///
+    /// MUST be called in serial/coordinate order — see the ordering note on
+    /// [`DuplicationLadderRecorder`].
+    fn record(&mut self, library_idx: u16, group_counts: &DedupCounts) {
+        if group_counts.total_templates == 0 {
+            return;
+        }
+        let interval = self.interval;
+        let state = self.per_library.entry(library_idx).or_insert_with(|| LadderLibraryState {
+            templates_seen: 0,
+            duplicate_templates: 0,
+            next_threshold: interval,
+            last_emitted_at: 0,
+        });
+        state.templates_seen += group_counts.total_templates;
+        state.duplicate_templates += group_counts.duplicate_templates;
+        // At most one row per `record()` call, even if this group's increment
+        // is large enough to cross more than one `interval` multiple at once
+        // (e.g. a single big position group with a small `--ladder-interval`).
+        // Jump `next_threshold` to the first multiple of `interval` strictly
+        // above the new cumulative `templates_seen` rather than a single
+        // `+= interval` step, so the next crossing check is correct instead
+        // of re-firing on the very next call.
+        if state.templates_seen >= state.next_threshold {
+            self.rows.push((library_idx, state.templates_seen, state.duplicate_templates));
+            state.last_emitted_at = state.templates_seen;
+            state.next_threshold =
+                state.templates_seen - (state.templates_seen % interval) + interval;
+        }
+    }
+
+    /// Emits a final snapshot per library at its true total, unless the last
+    /// interval snapshot already landed exactly on that total.
+    fn finish(&mut self) {
+        for (&library_idx, state) in &self.per_library {
+            if state.templates_seen > state.last_emitted_at {
+                self.rows.push((library_idx, state.templates_seen, state.duplicate_templates));
+            }
+        }
+    }
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -185,6 +317,10 @@ pub struct ProcessedDedupGroup {
     pub family_sizes: AHashMap<usize, u64>,
     /// Dedup metrics for this group.
     pub dedup_counts: DedupCounts,
+    /// Library index (`GroupKey::library_idx`) all templates in this group
+    /// belong to. A position group is always a single library — library
+    /// partitions the grouping key — so this is unambiguous per group.
+    pub library_idx: u16,
     /// Total input records processed (for progress tracking).
     pub input_record_count: u64,
     /// Number of distinct numeric `MoleculeId`s assigned in this group.
@@ -640,6 +776,9 @@ fn process_position_group(
 ) -> io::Result<ProcessedDedupGroup> {
     let mut dedup_counts = DedupCounts::default();
     let input_record_count = group.records.len() as u64;
+    // One position group is always a single library (library partitions the
+    // grouping key), so this is unambiguous.
+    let library_idx = group.group_key.library_idx;
 
     // Build templates from raw records (deferred from Group step)
     let all_templates = build_templates_from_records(group.records)?;
@@ -669,6 +808,7 @@ fn process_position_group(
             templates: Vec::new(),
             family_sizes: AHashMap::new(),
             dedup_counts,
+            library_idx,
             input_record_count,
             distinct_mi_count: 0,
         });
@@ -777,6 +917,7 @@ fn process_position_group(
         templates,
         family_sizes,
         dedup_counts,
+        library_idx,
         input_record_count,
         distinct_mi_count,
     })
@@ -927,6 +1068,19 @@ pub struct MarkDuplicates {
     /// Path to write family size histogram
     #[arg(short = 'H', long = "family-size-histogram")]
     pub family_size_histogram: Option<PathBuf>,
+
+    /// Path to write the sampled duplication saturation ladder: per-library
+    /// cumulative duplicate fraction vs. templates seen (in coordinate
+    /// order), snapshotted every `--ladder-interval` templates. Off by
+    /// default (no recorder is built, so no added work).
+    #[arg(long = "duplication-ladder")]
+    pub duplication_ladder: Option<PathBuf>,
+
+    /// Snapshot interval (in per-library cumulative templates) for
+    /// `--duplication-ladder`. Only meaningful when `--duplication-ladder`
+    /// is set.
+    #[arg(long = "ladder-interval", default_value = "1000000", value_parser = clap::value_parser!(u64).range(1..))]
+    pub ladder_interval: u64,
 
     /// Remove duplicates instead of just marking them
     #[arg(short = 'r', long = "remove-duplicates", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
@@ -1120,6 +1274,10 @@ impl Command for MarkDuplicates {
         info!("Using pipeline with {num_threads} threads");
 
         let library_index = LibraryIndex::from_header(&header);
+        // `GroupKeyConfig::new` takes `library_index` by value; keep a clone so
+        // the metrics writer can still map `library_idx -> name` after the
+        // pipeline consumes the original.
+        let library_index_for_metrics = library_index.clone();
         // Cache the UMI tag's value position on each DecodedRecord so the
         // Process step's UMI-assignment pass can slice the value without
         // re-scanning aux data (issue #334). In `--no-umi` mode the
@@ -1140,6 +1298,17 @@ impl Command for MarkDuplicates {
         // by the hook closure; nothing outside the closure needs to read
         // its final value.
         let next_mi_base_for_hook = Arc::new(AtomicU64::new(0));
+
+        // Duplication saturation ladder recorder (--duplication-ladder). `None`
+        // when the flag is off, so the hook below does zero added work
+        // (a single `Option` check, no lock, no allocation) — see the ordering
+        // note on `DuplicationLadderRecorder` for why this must be populated
+        // from the serial MI Assign hook rather than `serialize_fn`.
+        let duplication_ladder_recorder: Option<Arc<Mutex<DuplicationLadderRecorder>>> = self
+            .duplication_ladder
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(DuplicationLadderRecorder::new(self.ladder_interval))));
+        let duplication_ladder_recorder_for_hook = duplication_ladder_recorder.clone();
 
         // Run the pipeline
         let _records_processed = run_bam_pipeline_from_reader_with_mi_assign(
@@ -1174,7 +1343,10 @@ impl Command for MarkDuplicates {
                 // Collect metrics
                 {
                     let mut agg = collected_metrics_clone.lock();
-                    agg.dedup_counts.merge(&processed.dedup_counts);
+                    agg.dedup_counts_by_library
+                        .entry(processed.library_idx)
+                        .or_default()
+                        .merge(&processed.dedup_counts);
                     for (size, count) in &processed.family_sizes {
                         *agg.family_sizes.entry(*size).or_insert(0) += count;
                     }
@@ -1247,6 +1419,17 @@ impl Command for MarkDuplicates {
                 for template in &mut processed.templates {
                     template.mi = template.mi.with_offset(base);
                 }
+
+                // Accumulate the duplication saturation ladder here, in this
+                // same serial/coordinate-order hook — not in `serialize_fn`,
+                // which runs in parallel completion order. See the ordering
+                // note on `DuplicationLadderRecorder`. `dedup_counts` belongs
+                // entirely to `processed.library_idx` (a position group is
+                // always single-library).
+                if let Some(recorder) = &duplication_ladder_recorder_for_hook {
+                    recorder.lock().record(processed.library_idx, &processed.dedup_counts);
+                }
+
                 Ok(())
             },
         )?;
@@ -1255,17 +1438,42 @@ impl Command for MarkDuplicates {
         let aggregated = Arc::try_unwrap(collected_metrics)
             .expect("bug: metrics Arc still shared after pipeline join")
             .into_inner();
-        let final_counts = aggregated.dedup_counts;
+        let final_counts_by_library = aggregated.dedup_counts_by_library;
         let final_family_sizes = aggregated.family_sizes;
+
+        // Total across all libraries: used both for the summary log / `tc`-tag
+        // check below and as the metrics file's aggregate "All Reads" row.
+        let mut final_counts = DedupCounts::default();
+        for library_counts in final_counts_by_library.values() {
+            final_counts.merge(library_counts);
+        }
 
         // Write metrics file
         if let Some(metrics_path) = &self.metrics {
-            write_dedup_metrics(&final_counts, metrics_path)?;
+            write_dedup_metrics(
+                &final_counts_by_library,
+                &final_counts,
+                &library_index_for_metrics,
+                metrics_path,
+            )?;
         }
 
         // Write family size histogram
         if let Some(histogram_path) = &self.family_size_histogram {
             write_family_size_histogram(&final_family_sizes, histogram_path)?;
+        }
+
+        // Write duplication saturation ladder
+        if let Some(path) = &self.duplication_ladder {
+            let mut recorder = Arc::try_unwrap(duplication_ladder_recorder.expect(
+                "bug: duplication_ladder_recorder must be Some when --duplication-ladder is set",
+            ))
+            .unwrap_or_else(|_| {
+                panic!("bug: duplication ladder recorder Arc still shared after pipeline join")
+            })
+            .into_inner();
+            recorder.finish();
+            write_duplication_ladder(&recorder, &library_index_for_metrics, path)?;
         }
 
         // Log summary
@@ -1317,10 +1525,54 @@ impl Command for MarkDuplicates {
 // Metrics writing
 //////////////////////////////////////////////////////////////////////////////
 
-fn write_dedup_metrics(counts: &DedupCounts, path: &PathBuf) -> Result<()> {
-    let output: DeduplicationMetrics = counts.into();
+/// Writes one metrics row per library observed in `per_library`, followed by a
+/// final "All Reads" row summing across every library.
+///
+/// Row order is deterministic: named libraries first (alphabetical), then the
+/// idx-0 "Unknown Library" catch-all (a sentinel, grouped after the real
+/// libraries), then the "All Reads" total last.
+///
+/// Single-library inputs still get two rows (the one library, then "All
+/// Reads") rather than collapsing to a single row: this keeps the output
+/// shape uniform regardless of how many libraries the input actually has, so
+/// downstream readers never need to special-case the single-library count.
+///
+/// The aggregate "All Reads" row leaves `estimated_library_size` empty whenever
+/// it spans more than one library: a Lander-Waterman estimate is only meaningful
+/// within a single library, so a value pooled across distinct libraries would be
+/// misleading. This matches dupblaster, which never estimates library size across
+/// libraries; the per-library rows carry the meaningful estimates.
+fn write_dedup_metrics(
+    per_library: &AHashMap<u16, DedupCounts>,
+    total: &DedupCounts,
+    library_index: &LibraryIndex,
+    path: &PathBuf,
+) -> Result<()> {
+    let mut ordered: Vec<(u16, &DedupCounts)> =
+        per_library.iter().map(|(&idx, counts)| (idx, counts)).collect();
+    // Named libraries sort alphabetically; the idx-0 "Unknown Library" catch-all
+    // sorts after them (`false` before `true`), so it lands just before the
+    // "All Reads" total appended below.
+    ordered.sort_by(|a, b| {
+        (a.0 == 0).cmp(&(b.0 == 0)).then_with(|| {
+            library_display_name(a.0, library_index).cmp(&library_display_name(b.0, library_index))
+        })
+    });
+    let mut rows: Vec<DeduplicationMetrics> = ordered
+        .into_iter()
+        .map(|(idx, counts)| {
+            to_deduplication_metrics(library_display_name(idx, library_index), counts)
+        })
+        .collect();
+
+    let mut total_row = to_deduplication_metrics("All Reads".to_string(), total);
+    if per_library.len() > 1 {
+        total_row.estimated_library_size = None;
+    }
+    rows.push(total_row);
+
     DelimFile::default()
-        .write_tsv(path, [output])
+        .write_tsv(path, rows)
         .with_context(|| format!("Failed to write dedup metrics: {}", path.display()))?;
     Ok(())
 }
@@ -1330,6 +1582,32 @@ fn write_family_size_histogram(family_sizes: &AHashMap<usize, u64>, path: &PathB
     DelimFile::default()
         .write_tsv(path, metrics)
         .with_context(|| format!("Failed to write family size histogram: {}", path.display()))?;
+    Ok(())
+}
+
+/// Writes the `--duplication-ladder` TSV: one row per (library, snapshot),
+/// sorted deterministically by library name then ascending `templates_seen`.
+fn write_duplication_ladder(
+    recorder: &DuplicationLadderRecorder,
+    library_index: &LibraryIndex,
+    path: &PathBuf,
+) -> Result<()> {
+    let mut rows: Vec<DuplicationLadderMetrics> = recorder
+        .rows
+        .iter()
+        .map(|&(idx, templates_seen, duplicate_templates)| {
+            DuplicationLadderMetrics::new(
+                library_display_name(idx, library_index),
+                templates_seen,
+                duplicate_templates,
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| a.library.cmp(&b.library).then(a.templates_seen.cmp(&b.templates_seen)));
+
+    DelimFile::default()
+        .write_tsv(path, rows)
+        .with_context(|| format!("Failed to write duplication ladder: {}", path.display()))?;
     Ok(())
 }
 
@@ -2634,8 +2912,9 @@ mod tests {
             passthrough_templates: 3,
             filter_counts,
         };
-        let output = DeduplicationMetrics::from(&counts);
+        let output = to_deduplication_metrics("lib1".to_string(), &counts);
 
+        assert_eq!(output.library, "lib1");
         assert_eq!(output.filtered_malformed_record, 1);
         assert_eq!(output.filtered_no_primary_reads, 2);
         assert_eq!(output.filtered_unmapped, 3);
@@ -2657,6 +2936,12 @@ mod tests {
         assert_eq!(output.secondary_reads, 10);
         assert_eq!(output.supplementary_reads, 5);
         assert_eq!(output.missing_tc_tag, 2);
+    }
+
+    #[test]
+    fn test_library_display_name_unknown_bucket() {
+        let library_index = LibraryIndex::default();
+        assert_eq!(library_display_name(0, &library_index), "Unknown Library");
     }
 
     /// Nothing may vanish silently: everything read is either filtered or written.
@@ -2683,7 +2968,7 @@ mod tests {
             filter_counts,
             ..DedupCounts::default()
         };
-        let output = DeduplicationMetrics::from(&counts);
+        let output = to_deduplication_metrics("lib1".to_string(), &counts);
 
         assert_eq!(
             output.filtered_templates + output.total_templates,
@@ -2703,9 +2988,13 @@ mod tests {
             unique_templates: 0,
             ..DedupCounts::default()
         };
+        let mut per_library = AHashMap::new();
+        per_library.insert(0u16, counts.clone());
+        let library_index = LibraryIndex::default();
+
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("dedup.metrics.txt");
-        write_dedup_metrics(&counts, &path)?;
+        write_dedup_metrics(&per_library, &counts, &library_index, &path)?;
 
         let text = std::fs::read_to_string(&path)?;
         let header: Vec<&str> = text.lines().next().expect("header").split('\t').collect();
@@ -3092,6 +3381,7 @@ mod tests {
             templates,
             family_sizes: AHashMap::new(),
             dedup_counts: DedupCounts::default(),
+            library_idx: 0,
             input_record_count: 1,
             distinct_mi_count: 0,
         };

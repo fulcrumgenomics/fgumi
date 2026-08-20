@@ -30,43 +30,31 @@ use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
 /// Template-coordinate sort groups reads by position, then by name within each position.
 /// The header must have SO:unsorted GO:query SS:template-coordinate tags.
 fn create_sorted_bam(path: &Path, records: Vec<RawRecord>) {
-    // Write the records to a temp BAM, then sort it into `path` with fgumi's own
-    // template-coordinate sorter so the dedup input is *genuinely* in
-    // template-coordinate order rather than merely labelled as such. (dedup trusts
-    // the header's SS tag; feeding it mislabelled-but-unsorted input produces
-    // mislabelled-but-unsorted output.)
-    let unsorted = path.with_file_name("dedup_input_unsorted.bam");
+    // Delegate to the header-aware variant with the default minimal header so the
+    // two helpers share a single implementation and can never drift apart.
     let header = create_minimal_header("chr1", 10000);
-    let mut writer =
-        bam::io::Writer::new(fs::File::create(&unsorted).expect("Failed to create BAM file"));
-    writer.write_header(&header).expect("Failed to write header");
-    for record in records {
-        writer
-            .write_alignment_record(&header, &to_record_buf(&record))
-            .expect("Failed to write record");
-    }
-    writer.try_finish().expect("Failed to finish BAM");
-
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args([
-            "sort",
-            "-i",
-            unsorted.to_str().unwrap(),
-            "-o",
-            path.to_str().unwrap(),
-            "--order",
-            "template-coordinate",
-            "--key-types",
-            "mi",
-        ])
-        .status()
-        .expect("failed to spawn `fgumi sort` for dedup test input");
-    assert!(status.success(), "failed to template-coordinate sort dedup test input");
+    create_sorted_bam_with_header(path, &header, records);
 }
 
 /// Create a group of paired-end reads at the same position with the same UMI
 /// (simulating PCR duplicates).
 fn create_duplicate_group(base_name: &str, umi: &str, count: usize, start: i32) -> Vec<RawRecord> {
+    create_duplicate_group_inner(base_name, umi, count, start, None)
+}
+
+/// Shared implementation for [`create_duplicate_group`] and
+/// [`create_duplicate_group_with_rg`]: builds `count` paired-end duplicate
+/// templates, tagging each record with `RG:Z:{rg_id}` only when `rg_id` is
+/// `Some`. Keeping one implementation means the exact record shape the per-library
+/// and ladder tests derive their template counts from can never diverge between
+/// the RG and non-RG variants.
+fn create_duplicate_group_inner(
+    base_name: &str,
+    umi: &str,
+    count: usize,
+    start: i32,
+    rg_id: Option<&str>,
+) -> Vec<RawRecord> {
     let mut records = Vec::new();
     for i in 0..count {
         let name = format!("{base_name}_{i}");
@@ -86,6 +74,9 @@ fn create_duplicate_group(base_name: &str, umi: &str, count: usize, start: i32) 
                 .template_length(108)
                 .add_string_tag(SamTag::RX, umi.as_bytes())
                 .add_string_tag(SamTag::MC, b"8M");
+            if let Some(rg_id) = rg_id {
+                b.add_string_tag(SamTag::RG, rg_id.as_bytes());
+            }
             b.build()
         };
 
@@ -104,6 +95,9 @@ fn create_duplicate_group(base_name: &str, umi: &str, count: usize, start: i32) 
                 .template_length(-108)
                 .add_string_tag(SamTag::RX, umi.as_bytes())
                 .add_string_tag(SamTag::MC, b"8M");
+            if let Some(rg_id) = rg_id {
+                b.add_string_tag(SamTag::RG, rg_id.as_bytes());
+            }
             b.build()
         };
 
@@ -247,6 +241,590 @@ fn test_dedup_command_with_metrics() {
     .expect("failed to parse dedup args");
     cmd.execute("fgumi dedup").expect("Dedup command with metrics failed");
     assert!(metrics_path.exists(), "Metrics file not created");
+}
+
+/// Build a template-coordinate-sorted SAM header with two `@RG` lines that have
+/// distinct `LB` values ("libA"/"libB"), for the per-library metrics test below.
+fn create_multi_library_header(ref_name: &str, ref_len: usize) -> noodles::sam::Header {
+    use bstr::BString;
+    use noodles::sam::header::record::value::Map;
+    use noodles::sam::header::record::value::map::Map as HeaderRecordMap;
+    use noodles::sam::header::record::value::map::header::tag::Tag as HeaderTag;
+    use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+    use noodles::sam::header::record::value::map::{
+        Header as HeaderRecord, ReadGroup, ReferenceSequence,
+    };
+    use std::num::NonZeroUsize;
+
+    let mut header_builder = HeaderRecordMap::<HeaderRecord>::builder();
+    for &(tag_bytes, value) in
+        &[(*b"SO", "unsorted"), (*b"GO", "query"), (*b"SS", "template-coordinate")]
+    {
+        let HeaderTag::Other(tag) = HeaderTag::from(tag_bytes) else { unreachable!() };
+        header_builder = header_builder.insert(tag, value);
+    }
+    let header_map = header_builder.build().expect("valid header map");
+
+    let reference_sequence = Map::<ReferenceSequence>::new(
+        NonZeroUsize::new(ref_len).expect("reference length must be non-zero"),
+    );
+
+    let rg_a = Map::<ReadGroup>::builder()
+        .insert(rg_tag::LIBRARY, String::from("libA"))
+        .build()
+        .expect("building read group RG1 should succeed");
+    let rg_b = Map::<ReadGroup>::builder()
+        .insert(rg_tag::LIBRARY, String::from("libB"))
+        .build()
+        .expect("building read group RG2 should succeed");
+
+    noodles::sam::Header::builder()
+        .set_header(header_map)
+        .add_reference_sequence(BString::from(ref_name), reference_sequence)
+        .add_read_group(BString::from("RG1"), rg_a)
+        .add_read_group(BString::from("RG2"), rg_b)
+        .build()
+}
+
+/// Like [`create_duplicate_group`], but tags every record with `RG:Z:{rg_id}`
+/// so it is attributed to a specific library at dedup time.
+fn create_duplicate_group_with_rg(
+    base_name: &str,
+    umi: &str,
+    count: usize,
+    start: i32,
+    rg_id: &str,
+) -> Vec<RawRecord> {
+    create_duplicate_group_inner(base_name, umi, count, start, Some(rg_id))
+}
+
+/// Shared implementation for [`create_sorted_bam`]: writes `records` against the
+/// caller-supplied `header`, then template-coordinate sorts the result into
+/// `path` with fgumi's own sorter so the dedup input is *genuinely* in
+/// template-coordinate order rather than merely labelled as such. (dedup trusts
+/// the header's SS tag; feeding it mislabelled-but-unsorted input produces
+/// mislabelled-but-unsorted output.) [`create_sorted_bam`] passes the default
+/// [`create_minimal_header`]; the per-library tests pass a multi-`@RG` header so
+/// each read is attributed to a specific library at dedup time.
+fn create_sorted_bam_with_header(
+    path: &Path,
+    header: &noodles::sam::Header,
+    records: Vec<RawRecord>,
+) {
+    let unsorted = path.with_file_name("dedup_input_unsorted.bam");
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(&unsorted).expect("Failed to create BAM file"));
+    writer.write_header(header).expect("Failed to write header");
+    for record in records {
+        writer
+            .write_alignment_record(header, &to_record_buf(&record))
+            .expect("Failed to write record");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "sort",
+            "-i",
+            unsorted.to_str().unwrap(),
+            "-o",
+            path.to_str().unwrap(),
+            "--order",
+            "template-coordinate",
+            "--key-types",
+            "mi",
+        ])
+        .status()
+        .expect("failed to spawn `fgumi sort` for dedup test input");
+    assert!(status.success(), "failed to template-coordinate sort dedup test input");
+}
+
+/// Reads the dedup metrics TSV back as one `column name -> value` map per data
+/// row, in file order.
+fn read_dedup_metrics_rows(path: &Path) -> Vec<std::collections::HashMap<String, String>> {
+    let content = fs::read_to_string(path).expect("failed to read metrics file");
+    let mut lines = content.lines();
+    let header: Vec<String> =
+        lines.next().expect("metrics header row").split('\t').map(String::from).collect();
+    lines
+        .map(|line| {
+            let values: Vec<&str> = line.split('\t').collect();
+            header.iter().cloned().zip(values.iter().map(ToString::to_string)).collect()
+        })
+        .collect()
+}
+
+/// Dedup over a two-library input (library A: 3 duplicate pairs at one
+/// position; library B: 2 duplicate pairs at a different position) and verify
+/// the metrics file has one row per library, sorted by name, plus a final
+/// "All Reads" total row summing across libraries — with correct per-library
+/// `duplicate_templates`/`percent_duplication`, and `estimated_library_size`
+/// populated for both (both libraries have duplicates).
+///
+/// Each mate's position group is dedup'd independently (R1's group and R2's
+/// group are template-coordinate-adjacent but distinct `RawPositionGroup`s,
+/// each holding single-mate templates), so a library's `count` duplicate
+/// pairs contribute `2 * count` templates/reads to its row: `count` from R1's
+/// group (1 unique + `count - 1` duplicate) and `count` from R2's group
+/// (same split) — e.g. library A's 3 pairs give `total_templates = 6`,
+/// `unique_templates = 2`, `duplicate_templates = 4`.
+#[test]
+fn test_dedup_command_per_library_metrics() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+
+    let header = create_multi_library_header("chr1", 10000);
+    let mut records = create_duplicate_group_with_rg("libA_dup", "ACGTACGT", 3, 100, "RG1");
+    records.extend(create_duplicate_group_with_rg("libB_dup", "TGCATGCA", 2, 500, "RG2"));
+    create_sorted_bam_with_header(&input_bam, &header, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command with per-library metrics failed");
+
+    let rows = read_dedup_metrics_rows(&metrics_path);
+    assert_eq!(rows.len(), 3, "expected libA row + libB row + All Reads total row: {rows:?}");
+
+    let libraries: Vec<&str> = rows.iter().map(|r| r["library"].as_str()).collect();
+    assert_eq!(
+        libraries,
+        vec!["libA", "libB", "All Reads"],
+        "rows must be library-name-sorted, with the total row last: {libraries:?}"
+    );
+
+    // Each position group in `fgumi dedup` holds a single mate (R1's group and
+    // R2's group are template-coordinate-adjacent but distinct groups), so a
+    // library's `count` duplicate pairs contribute `2 * count` templates/reads
+    // (one per mate's own position group), each with exactly one record.
+    let lib_a = &rows[0];
+    assert_eq!(lib_a["total_templates"], "6");
+    assert_eq!(lib_a["unique_templates"], "2");
+    assert_eq!(lib_a["duplicate_templates"], "4");
+    assert_eq!(lib_a["total_reads"], "6");
+    assert_eq!(lib_a["duplicate_reads"], "4");
+    assert!(
+        (lib_a["percent_duplication"].parse::<f64>().unwrap() - 4.0 / 6.0).abs() < 1e-6,
+        "lib_a percent_duplication (read-level 4/6): {lib_a:?}"
+    );
+    assert!(
+        !lib_a["estimated_library_size"].is_empty(),
+        "lib_a has duplicates, so the library-size estimate must be populated: {lib_a:?}"
+    );
+
+    let lib_b = &rows[1];
+    assert_eq!(lib_b["total_templates"], "4");
+    assert_eq!(lib_b["unique_templates"], "2");
+    assert_eq!(lib_b["duplicate_templates"], "2");
+    assert_eq!(lib_b["total_reads"], "4");
+    assert_eq!(lib_b["duplicate_reads"], "2");
+    assert!(
+        (lib_b["percent_duplication"].parse::<f64>().unwrap() - 2.0 / 4.0).abs() < 1e-6,
+        "lib_b percent_duplication (read-level 2/4): {lib_b:?}"
+    );
+    assert!(
+        !lib_b["estimated_library_size"].is_empty(),
+        "lib_b has duplicates, so the library-size estimate must be populated: {lib_b:?}"
+    );
+
+    let total = &rows[2];
+    assert_eq!(total["total_templates"], "10");
+    assert_eq!(total["unique_templates"], "4");
+    assert_eq!(total["duplicate_templates"], "6");
+    assert_eq!(total["total_reads"], "10");
+    assert_eq!(total["duplicate_reads"], "6");
+    // The aggregate row spans two distinct libraries, so a pooled Lander-Waterman
+    // estimate would be meaningless: it must be left empty (the per-library rows
+    // above carry the meaningful estimates). Matches dupblaster.
+    assert!(
+        total["estimated_library_size"].is_empty(),
+        "the aggregate row spans >1 library, so its estimate must be empty: {total:?}"
+    );
+}
+
+/// Row order with named libraries AND reads lacking `@RG`/`LB`: named
+/// libraries first (alphabetical), then the "Unknown Library" catch-all, then
+/// the "All Reads" total last. The catch-all is a sentinel, not a real
+/// library, so it is grouped after the named libraries rather than sorted in
+/// among them by name.
+#[test]
+fn test_dedup_command_metrics_orders_unknown_after_named_before_total() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+
+    let header = create_multi_library_header("chr1", 10000);
+    // Named libraries (RG1 -> libA, RG2 -> libB) plus reads with no @RG, which
+    // fall into the idx-0 "Unknown Library" bucket. Distinct positions keep them
+    // in separate position groups.
+    let mut records = create_duplicate_group_with_rg("libA_dup", "ACGTACGT", 3, 100, "RG1");
+    records.extend(create_duplicate_group_with_rg("libB_dup", "TGCATGCA", 2, 500, "RG2"));
+    records.extend(create_duplicate_group("noRG_dup", "GGCCGGCC", 2, 900));
+    create_sorted_bam_with_header(&input_bam, &header, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command with mixed-library metrics failed");
+
+    let rows = read_dedup_metrics_rows(&metrics_path);
+    let libraries: Vec<&str> = rows.iter().map(|r| r["library"].as_str()).collect();
+    assert_eq!(
+        libraries,
+        vec!["libA", "libB", "Unknown Library", "All Reads"],
+        "named libraries first (alphabetical), then Unknown Library, then the total: {libraries:?}"
+    );
+}
+
+/// Single-library input (no `@RG`/`LB` at all) must still produce two rows:
+/// the "Unknown Library" bucket, then the "All Reads" total — the metrics
+/// writer never collapses to a single row, regardless of library count, so
+/// the output shape is uniform across single- and multi-library inputs.
+#[test]
+fn test_dedup_command_single_library_metrics_has_unknown_and_total_rows() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+
+    let records = create_duplicate_group("dup1", "ACGTACGT", 3, 100);
+    create_sorted_bam(&input_bam, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command with metrics failed");
+
+    let rows = read_dedup_metrics_rows(&metrics_path);
+    let libraries: Vec<&str> = rows.iter().map(|r| r["library"].as_str()).collect();
+    assert_eq!(
+        libraries,
+        vec!["Unknown Library", "All Reads"],
+        "no @RG/LB in the input: expect the Unknown Library bucket, then the total: {libraries:?}"
+    );
+    assert_eq!(rows[0]["total_templates"], rows[1]["total_templates"]);
+}
+
+/// Dedup over a two-library input with `--duplication-ladder` and a small
+/// `--ladder-interval`, verifying per-library snapshot rows are correct.
+///
+/// libA gets three duplicate-group positions with `count` = 3, 2, 2 pairs
+/// (spaced far enough apart to fall in distinct position groups). Per
+/// [`test_dedup_command_per_library_metrics`]'s documented shape, each
+/// position's mate groups (R1 then R2, in coordinate order) each contribute
+/// `count` templates, so libA's cumulative per-group `templates_seen`
+/// sequence is 3, 6, 8, 10, 12, 14 (true total 14). With `--ladder-interval
+/// 4`, thresholds are crossed at cumulative values 6, 8, 12 — three interval
+/// rows — and the true total (14) does not land on a crossing, so a fourth,
+/// final row is appended at 14: four rows total.
+///
+/// libB gets two duplicate-group positions with `count` = 2 each, giving the
+/// cumulative sequence 2, 4, 6, 8 (true total 8). Thresholds are crossed at 4
+/// and 8 — two interval rows — and the second crossing lands exactly on the
+/// true total, so no extra final row is appended: two rows total.
+#[test]
+fn test_dedup_duplication_ladder_multi_library() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+    let ladder_path = temp_dir.path().join("ladder.txt");
+
+    let header = create_multi_library_header("chr1", 10000);
+    let mut records = create_duplicate_group_with_rg("libA_p1", "AAAAAAAA", 3, 100, "RG1");
+    records.extend(create_duplicate_group_with_rg("libA_p2", "CCCCCCCC", 2, 500, "RG1"));
+    records.extend(create_duplicate_group_with_rg("libA_p3", "GGGGGGGG", 2, 900, "RG1"));
+    records.extend(create_duplicate_group_with_rg("libB_p1", "TTTTTTTT", 2, 1300, "RG2"));
+    records.extend(create_duplicate_group_with_rg("libB_p2", "ACACACAC", 2, 1700, "RG2"));
+    create_sorted_bam_with_header(&input_bam, &header, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--duplication-ladder",
+        ladder_path.to_str().unwrap(),
+        "--ladder-interval",
+        "4",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command with duplication ladder failed");
+
+    assert!(ladder_path.exists(), "duplication ladder file must be created when requested");
+
+    let metrics_rows = read_dedup_metrics_rows(&metrics_path);
+    let metrics_by_library: std::collections::HashMap<
+        &str,
+        &std::collections::HashMap<String, String>,
+    > = metrics_rows.iter().map(|r| (r["library"].as_str(), r)).collect();
+
+    let ladder_rows = read_dedup_metrics_rows(&ladder_path);
+
+    // Expected snapshot sequence per library, pinned exactly (not merely by row
+    // count) so a regression that emitted the right number of rows at the wrong
+    // interval crossings is still caught: libA crosses the interval at 6, 8, 12,
+    // then gets a final row at its true total (14), which doesn't land on a
+    // crossing — 4 rows. libB crosses at 4 and 8, with 8 landing exactly on its
+    // true total, so no extra final row — 2 rows.
+    // Every snapshot row is pinned exactly — both `templates_seen` and the
+    // cumulative `duplicate_fraction` (as `(numerator, denominator)`) — so a
+    // regression that emits the right row count at the wrong interval crossings,
+    // reorders the library rows, or writes the wrong intermediate saturation
+    // values is caught, not just one with a wrong final row. libA crosses the
+    // interval at 6, 8, 12, then gets a final row at its true total (14), which
+    // doesn't land on a crossing — 4 rows. libB crosses at 4 and 8, with 8
+    // landing exactly on its true total, so no extra final row — 2 rows.
+    // Per snapshot row, keyed by library: (templates_seen, (duplicate
+    // numerator, denominator)), pinned so the table reads as a spec.
+    #[expect(clippy::type_complexity, reason = "an inline pinned table of expected rows")]
+    let expected_sequences: [(&str, &[(u64, (u64, u64))]); 2] = [
+        ("libA", &[(6, (4, 6)), (8, (5, 8)), (12, (7, 12)), (14, (8, 14))]),
+        ("libB", &[(4, (2, 4)), (8, (4, 8))]),
+    ];
+    let mut matched_row_count = 0usize;
+
+    // For each library: every row's templates_seen and duplicate_fraction match
+    // the pinned sequence in file order, the last row's templates_seen equals
+    // the true per-library total (from the metrics file), and the last row's
+    // duplicate_fraction matches the metrics file's template-level
+    // duplicate_rate exactly (both are the same cumulative
+    // duplicate_templates / total_templates ratio).
+    for (library, expected_rows) in expected_sequences {
+        let rows: Vec<_> = ladder_rows.iter().filter(|r| r["library"] == library).collect();
+        matched_row_count += rows.len();
+
+        assert_eq!(
+            rows.len(),
+            expected_rows.len(),
+            "{library}: expected {} ladder rows: {rows:?}",
+            expected_rows.len()
+        );
+
+        for (row, &(expected_seen, (num, den))) in rows.iter().zip(expected_rows) {
+            let seen: u64 = row["templates_seen"].parse().expect("templates_seen is u64");
+            assert_eq!(
+                seen, expected_seen,
+                "{library}: snapshot must land on the derived interval crossing: {row:?}"
+            );
+            let duplicate_fraction: f64 =
+                row["duplicate_fraction"].parse().expect("duplicate_fraction is f64");
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "numerator and denominator are small test constants (< 100)"
+            )]
+            let expected_fraction = num as f64 / den as f64;
+            assert!(
+                (duplicate_fraction - expected_fraction).abs() < 1e-9,
+                "{library}: row duplicate_fraction ({duplicate_fraction}) must equal \
+                 {num}/{den} ({expected_fraction}): {row:?}"
+            );
+        }
+
+        let last_row = rows.last().unwrap_or_else(|| panic!("{library}: no ladder rows emitted"));
+        let library_metrics = metrics_by_library[library];
+        assert_eq!(
+            last_row["templates_seen"], library_metrics["total_templates"],
+            "{library}: final ladder snapshot must land at the true per-library total: {last_row:?}"
+        );
+
+        let expected_fraction: f64 =
+            library_metrics["duplicate_rate"].parse().expect("duplicate_rate is f64");
+        let actual_fraction: f64 =
+            last_row["duplicate_fraction"].parse().expect("duplicate_fraction is f64");
+        assert!(
+            (actual_fraction - expected_fraction).abs() < 1e-9,
+            "{library}: final duplicate_fraction ({actual_fraction}) must match the metrics \
+             file's cumulative duplicate_rate ({expected_fraction})"
+        );
+    }
+
+    assert_eq!(
+        matched_row_count,
+        ladder_rows.len(),
+        "the ladder is inherently per-library: no unexpected library names: {ladder_rows:?}"
+    );
+}
+
+/// Without `--duplication-ladder`, no ladder file is written and dedup's
+/// ordinary behavior is unaffected (mirrors [`test_dedup_command_basic`]).
+#[test]
+fn test_dedup_duplication_ladder_off_by_default() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ladder_path = temp_dir.path().join("ladder_never_written.txt");
+
+    let mut records = create_duplicate_group("dup1", "ACGTACGT", 3, 100);
+    records.extend(create_duplicate_group("dup2", "TGCATGCA", 2, 500));
+    create_sorted_bam(&input_bam, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command without duplication ladder failed");
+
+    assert!(output_bam.exists(), "Output BAM not created");
+    assert!(
+        !ladder_path.exists(),
+        "duplication ladder file must not be created when --duplication-ladder is not passed"
+    );
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let count = reader.records().count();
+    assert_eq!(count, 10, "All reads should be in output (marked, not removed)");
+}
+
+/// Regression test: a single position group whose template increment is
+/// large enough to leap past more than one `--ladder-interval` multiple in a
+/// single `DuplicationLadderRecorder::record` call must still emit only one
+/// row per call, not one row per crossed multiple.
+///
+/// A single 10-pair duplicate group (no `@RG`, so library = "Unknown
+/// Library") with `--ladder-interval 3` produces two position groups (R1
+/// then R2, in coordinate order), each contributing 10 templates in one
+/// `record()` call — each call alone crosses three interval multiples (the
+/// first call crosses 3, 6, 9; the second crosses 12, 15, 18). Before the fix
+/// this produced duplicate rows `[10, 10, 10, 20, 20, 20]`; after the fix it
+/// must produce exactly `[10, 20]`.
+#[test]
+fn test_dedup_duplication_ladder_single_group_exceeds_interval() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+    let ladder_path = temp_dir.path().join("ladder.txt");
+
+    let records = create_duplicate_group("dup1", "ACGTACGT", 10, 100);
+    create_sorted_bam(&input_bam, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--duplication-ladder",
+        ladder_path.to_str().unwrap(),
+        "--ladder-interval",
+        "3",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command with duplication ladder failed");
+
+    let metrics_rows = read_dedup_metrics_rows(&metrics_path);
+    let unknown_library = metrics_rows
+        .iter()
+        .find(|r| r["library"] == "Unknown Library")
+        .expect("Unknown Library row present");
+
+    let ladder_rows = read_dedup_metrics_rows(&ladder_path);
+    let templates_seen: Vec<u64> = ladder_rows
+        .iter()
+        .map(|r| r["templates_seen"].parse().expect("templates_seen is u64"))
+        .collect();
+
+    assert_eq!(
+        templates_seen,
+        vec![10, 20],
+        "a single group whose increment leaps past more than one interval \
+         multiple must still emit exactly one row per record() call, not one \
+         row per crossed multiple (regression: previously produced \
+         [10, 10, 10, 20, 20, 20]): {ladder_rows:?}"
+    );
+
+    // Redundant with the exact-sequence check above, but states the general
+    // invariant explicitly: no duplicate/non-increasing templates_seen.
+    for window in templates_seen.windows(2) {
+        assert!(
+            window[1] > window[0],
+            "templates_seen must be strictly increasing: {templates_seen:?}"
+        );
+    }
+
+    // Pin the intermediate row's fraction too, not just the final one: the
+    // first snapshot lands at 10 templates_seen with 9 cumulative duplicates.
+    let first_row = ladder_rows.first().expect("at least one ladder row");
+    let first_fraction: f64 =
+        first_row["duplicate_fraction"].parse().expect("duplicate_fraction is f64");
+    assert!(
+        (first_fraction - 9.0 / 10.0).abs() < 1e-9,
+        "the first snapshot's duplicate_fraction must be 9/10: {first_row:?}"
+    );
+
+    let last_row = ladder_rows.last().expect("at least one ladder row");
+    assert_eq!(
+        last_row["templates_seen"], unknown_library["total_templates"],
+        "final ladder snapshot must land at the true total: {last_row:?}"
+    );
+    let expected_fraction: f64 =
+        unknown_library["duplicate_rate"].parse().expect("duplicate_rate is f64");
+    let actual_fraction: f64 =
+        last_row["duplicate_fraction"].parse().expect("duplicate_fraction is f64");
+    assert!(
+        (actual_fraction - expected_fraction).abs() < 1e-9,
+        "final duplicate_fraction ({actual_fraction}) must match the metrics \
+         file's cumulative duplicate_rate ({expected_fraction})"
+    );
 }
 
 /// Test dedup command with remove-duplicates flag.
