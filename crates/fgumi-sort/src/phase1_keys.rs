@@ -95,6 +95,51 @@ pub(crate) trait KeyExtractionJob: Send {
     fn run(self: Box<Self>);
 }
 
+/// Bytes ahead of the current record to software-prefetch while extracting keys.
+///
+/// A batch reads record bodies out of a **sealed** arena segment — bytes the
+/// ingest thread wrote up to a segment ago and which are long gone from cache by
+/// the time a worker gets to them. The scan is therefore latency-bound on cache
+/// misses rather than compute-bound, and prefetching ahead hides them.
+///
+/// 2 KiB is `main-runall`'s measured value for the same shape of scan (a cold
+/// ~2.6 GiB arena at ~220 B/record): 2 KiB gave the best speedup (~15%), ≤1 KiB
+/// was negligible (too little lead time) and 4 KiB matched 2 KiB. At our ~250
+/// B/record that is ~8 records of lead.
+const KEY_PREFETCH_DISTANCE: usize = 2048;
+
+/// Software-prefetch (read, into L1, temporal) the cache line containing `byte`.
+///
+/// SAFETY: both `prfm pldl1keep` (`aarch64`) and `_mm_prefetch` (`x86_64`) are
+/// *non-faulting hints* — they never read or write observable memory and never
+/// trap, even on an unmapped address. `byte` is a live `&u8`, so the pointer is
+/// valid to name. Cribbed from `main-runall`'s `prefetch_read_l1`; a no-op on
+/// other architectures.
+#[inline]
+fn prefetch_read_l1(byte: &u8) {
+    let ptr: *const u8 = byte;
+    #[cfg(target_arch = "aarch64")]
+    #[allow(unsafe_code)]
+    // SAFETY: a non-faulting prefetch hint over a valid pointer.
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{p}]",
+            p = in(reg) ptr,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    #[allow(unsafe_code)]
+    // SAFETY: a non-faulting prefetch hint over a valid pointer.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ptr.cast());
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = ptr; // no portable stable prefetch; the hint is a no-op elsewhere
+    }
+}
+
 /// Extract one record's full key and check the lanes the chosen variant drops.
 ///
 /// The single extraction implementation, shared by the batched path and the
@@ -135,6 +180,11 @@ where
         for (i, &(offset, len)) in me.extents.iter().enumerate() {
             let local = usize::try_from(offset - me.segment_base)
                 .expect("record offset precedes its own segment");
+            // Pull the bytes this scan will reach shortly into L1 while the
+            // current record is being parsed.
+            if let Some(ahead) = me.segment.get(local + KEY_PREFETCH_DISTANCE) {
+                prefetch_read_l1(ahead);
+            }
             let bam = &me.segment[local..local + len as usize];
 
             let (full, lane) = extract_one(ctx, bam);

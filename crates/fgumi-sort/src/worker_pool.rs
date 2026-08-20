@@ -2621,6 +2621,19 @@ impl SortWorkerPool {
         }
     }
 
+    /// Whether a worker owning `owned_step` may also take key-extraction batches.
+    ///
+    /// The worker that exclusively owns [`SortStep::ReadInputBlocks`] may not.
+    /// A batch is ~0.5 ms of pure CPU, and for that long its worker is not
+    /// reading — and nobody else can read, because the step is exclusive. On the
+    /// production cell, letting the reader's owner take batches cost the reader
+    /// 358 → 345 MB/s and 125.2s → 129.8s, against a phase whose whole remaining
+    /// cost *is* the reader. Every other worker is free to extract, so this
+    /// gives up 1/16th of the extraction capacity to protect the critical path.
+    fn worker_may_extract_keys(owned_step: Option<SortStep>) -> bool {
+        owned_step != Some(SortStep::ReadInputBlocks)
+    }
+
     /// Whether a step is exclusive (requires ownership).
     ///
     /// Only `ReadInputBlocks` is exclusive — it reads from a shared input file
@@ -2676,7 +2689,14 @@ impl SortWorkerPool {
             // Deliberately not gated on the phase: a batch queued late in
             // Phase 1 must still be reachable while the ingest thread drains at
             // the chunk barrier, which can coincide with the phase flip.
-            SortStep::ExtractKeys => !shared.key_jobs.is_empty(),
+            SortStep::ExtractKeys => {
+                !shared.key_jobs.is_empty()
+                    && Self::worker_may_extract_keys(Self::exclusive_step_for(
+                        worker.worker_id,
+                        shared,
+                        current_phase,
+                    ))
+            }
         }
     }
 
@@ -4682,6 +4702,27 @@ mod tests {
         let mut seen: Vec<usize> = rx.iter().collect();
         seen.sort_unstable();
         assert_eq!(seen, (0..num_jobs).collect::<Vec<_>>(), "every batch must run exactly once");
+    }
+
+    #[test]
+    fn test_the_worker_that_owns_the_reader_does_not_take_key_batches() {
+        // Measured on the production cell: adding key extraction to the pool
+        // slowed the input reader from 358 to 345 MB/s and its step from 125.2s
+        // to 129.8s. The reader is one exclusively-owned worker, and a key batch
+        // is ~0.5 ms during which that worker is not reading. Everyone else may
+        // take batches; the reader's owner may not.
+        assert!(
+            !SortWorkerPool::worker_may_extract_keys(Some(SortStep::ReadInputBlocks)),
+            "the reader's owner must stay on the reader"
+        );
+        assert!(
+            SortWorkerPool::worker_may_extract_keys(None),
+            "a worker owning no exclusive step is free to extract"
+        );
+        assert!(
+            SortWorkerPool::worker_may_extract_keys(Some(SortStep::Compress)),
+            "owning some other step does not bar extraction"
+        );
     }
 
     #[test]

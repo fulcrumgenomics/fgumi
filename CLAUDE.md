@@ -187,6 +187,16 @@ of records) and a safe rewrite measurably regresses sort throughput.
   `RawQuerynameKey::new`).
 - **`crates/fgumi-sort/src/radix.rs`** — internal radix-sort helpers; see file
   comments for the `SAFETY:` invariants.
+- **`crates/fgumi-sort/src/phase1_keys.rs`** — one `#[allow(unsafe_code)]` site in
+  `prefetch_read_l1`, a software-prefetch hint issued while a deferred key batch
+  scans record bodies out of a sealed arena segment. Those bytes were written up
+  to a segment ago and are cold by the time a worker reads them, so the scan is
+  latency-bound on cache misses. SAFETY: both `prfm pldl1keep` (aarch64) and
+  `_mm_prefetch` (x86_64) are *non-faulting hints* — they never read or write
+  observable memory and never trap, even on an unmapped address — and the
+  argument is a live `&u8`, so the pointer is valid to name. A no-op on other
+  architectures. Approved for the same reason as the other sort hot paths: it
+  runs once per record over hundreds of millions of records.
 
 ### Approved natural-order comparator (fgumi-raw-bam)
 

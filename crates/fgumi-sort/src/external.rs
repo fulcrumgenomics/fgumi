@@ -250,7 +250,7 @@ impl SortPhaseTimer {
         sort_threads: usize,
         merge_threads: usize,
         max_temp_files: usize,
-        phase1: Phase1FloorInputs,
+        phase1: &Phase1FloorInputs,
     ) {
         let overall = self.overall_start.map_or(0.0, |s| s.elapsed().as_secs_f64());
         // Guard against division by zero when sort completes in negligible time.
@@ -314,7 +314,7 @@ impl SortPhaseTimer {
     /// with its main thread 91% busy while 16 cores average 5.3. If that holds
     /// in-process, the binding limit is the ingest thread and no amount of
     /// additional worker capacity moves it.
-    fn log_phase1_floor(&self, phase1: Phase1FloorInputs) {
+    fn log_phase1_floor(&self, phase1: &Phase1FloorInputs) {
         if self.read_secs <= 0.0 {
             return;
         }
@@ -360,7 +360,7 @@ impl SortPhaseTimer {
                 ingest.spill_waits
             );
         }
-        Self::log_reader_partition(phase1.reader);
+        Self::log_reader_partition(&phase1.reader);
         self.log_ingest_partition(phase1);
     }
 
@@ -379,7 +379,7 @@ impl SortPhaseTimer {
     /// only the step total gives a number -- 24.3 us/block on the production
     /// cell -- that is consistent with either being the whole cost.
     #[allow(clippy::cast_precision_loss, reason = "call and byte counts stay below 2^52")]
-    fn log_reader_partition(reader: crate::phase1_stats::ReaderReport) {
+    fn log_reader_partition(reader: &crate::phase1_stats::ReaderReport) {
         if reader.batches == 0 {
             return;
         }
@@ -414,6 +414,26 @@ impl SortPhaseTimer {
             reader.dispatch_secs,
             reader.per_block_micros(reader.dispatch_secs)
         );
+        stat!("    refill latency: {}", reader.refill_latency.summary());
+        // The discriminator. A `read()` that got slower because the thread kept
+        // losing the CPU shows runqueue wait and extra timeslices; one that got
+        // slower because the device or the memory system delivered fewer bytes
+        // per second shows neither, because the thread was blocked on I/O
+        // throughout. Wall-clock timing cannot separate those, and the whole
+        // question of what a busier worker pool does to the reader turns on it.
+        if reader.refill_sched_samples > 0 {
+            stat!(
+                "    refill scheduling: runqueue wait {:.2}s ({:.1}% of refill), on-CPU {:.2}s, \
+                 {} timeslices over {} sampled calls",
+                reader.refill_runqueue_secs,
+                100.0 * reader.refill_runqueue_share(),
+                reader.refill_oncpu_secs,
+                reader.refill_timeslices,
+                reader.refill_sched_samples,
+            );
+        } else {
+            stat!("    refill scheduling: unavailable (needs /proc/thread-self/schedstat)");
+        }
         stat!(
             "    unattributed: {:.1}s ({:.0}% of the step)",
             reader.residual_secs(),
@@ -428,7 +448,7 @@ impl SortPhaseTimer {
     /// correction by the scale factor, which on a 1-in-1021 sample is three
     /// orders of magnitude.
     #[allow(clippy::cast_precision_loss, reason = "record counts stay below 2^52")]
-    fn log_ingest_partition(&self, phase1: Phase1FloorInputs) {
+    fn log_ingest_partition(&self, phase1: &Phase1FloorInputs) {
         if phase1.samples == 0 || phase1.records == 0 {
             return;
         }
@@ -3669,7 +3689,9 @@ impl RawExternalSorter {
                     },
                 )?);
 
-                buffer.clear();
+                // Keep the arena's pages mapped for the next chunk; `clear` would
+                // hand them back and cost a minor fault per page on the refill.
+                buffer.reset_for_reuse();
                 force_mi_collect();
                 probe.post_spill(Some(pool.phase1_queue_depths()));
                 timer.begin_read_span();
@@ -3773,7 +3795,7 @@ impl RawExternalSorter {
             self.phase1_threads(),
             self.phase2_threads(),
             self.max_temp_files,
-            phase1_floor,
+            &phase1_floor,
         );
         debug!("Sort complete: {} records processed", stats.total_records);
 
@@ -3880,7 +3902,9 @@ impl RawExternalSorter {
                     },
                 )?);
 
-                buffer.clear();
+                // Keep the arena's pages mapped for the next chunk; `clear` would
+                // hand them back and cost a minor fault per page on the refill.
+                buffer.reset_for_reuse();
                 force_mi_collect();
                 probe.post_spill(Some(pool.phase1_queue_depths()));
                 timer.begin_read_span();
@@ -3995,7 +4019,7 @@ impl RawExternalSorter {
             self.phase1_threads(),
             self.phase2_threads(),
             self.max_temp_files,
-            phase1_floor,
+            &phase1_floor,
         );
         debug!("Sort complete: {} records processed", stats.total_records);
 
@@ -4293,7 +4317,7 @@ impl RawExternalSorter {
             self.phase1_threads(),
             self.phase2_threads(),
             self.max_temp_files,
-            phase1_floor,
+            &phase1_floor,
         );
         debug!("Sort complete: {} records processed", stats.total_records);
 
@@ -4604,7 +4628,9 @@ impl RawExternalSorter {
                     },
                 )?);
 
-                buffer.clear();
+                // Keep the arena's pages mapped for the next chunk; `clear` would
+                // hand them back and cost a minor fault per page on the refill.
+                buffer.reset_for_reuse();
                 deferred.reset();
                 force_mi_collect();
                 probe.post_spill(Some(pool.phase1_queue_depths()));
@@ -4622,6 +4648,11 @@ impl RawExternalSorter {
         // report a shorter span, which is the one way this optimization could
         // look successful while doing nothing.
         let violation = deferred.finish(&mut buffer, &pool)?;
+
+        // Ingest is over, so the arena segments held for the next chunk have no
+        // next chunk. Holding them through the merge costs peak RSS and buys
+        // nothing.
+        buffer.release_retained();
 
         timer.end_read_span();
 
@@ -4725,7 +4756,7 @@ impl RawExternalSorter {
             self.phase1_threads(),
             self.phase2_threads(),
             self.max_temp_files,
-            phase1_floor,
+            &phase1_floor,
         );
         debug!("Sort complete: {} records processed", stats.total_records);
 
@@ -9750,7 +9781,7 @@ mod tests {
 
         // log_summary must not panic (output goes to log sink). `consolidate_count`
         // is 1 here, so the consolidation branch is exercised too.
-        timer.log_summary(4, 4, 64, Phase1FloorInputs::default());
+        timer.log_summary(4, 4, 64, &Phase1FloorInputs::default());
     }
 
     // ========================================================================

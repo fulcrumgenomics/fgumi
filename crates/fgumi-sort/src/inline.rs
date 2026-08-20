@@ -547,6 +547,25 @@ impl RecordBuffer {
     }
 
     /// Clear the buffer for reuse.
+    /// Give back the arena segments held for reuse; see
+    /// [`SegmentedBuf::release_retained`](crate::segmented_buf::SegmentedBuf::release_retained).
+    /// Call once ingest is finished — holding them through the merge costs peak
+    /// RSS and buys nothing, because nothing more is pushed.
+    pub fn release_retained(&mut self) {
+        self.data.release_retained();
+    }
+
+    /// Empty the buffer between chunks, **keeping the arena's segment
+    /// allocations** so the next chunk does not fault every page back in.
+    ///
+    /// See [`SegmentedBuf::reset_for_reuse`](crate::segmented_buf::SegmentedBuf::reset_for_reuse)
+    /// for the measurement. Use this rather than [`clear`](Self::clear)
+    /// anywhere the buffer is about to be refilled; `clear` is for teardown.
+    pub fn reset_for_reuse(&mut self) {
+        self.data.reset_for_reuse();
+        self.refs.clear();
+    }
+
     pub fn clear(&mut self) {
         self.data.clear();
         self.refs.clear();
@@ -1620,6 +1639,25 @@ impl<K: TemplateLaneKey> TemplateRecordBuffer<K> {
     }
 
     /// Clear the buffer for reuse.
+    /// Give back the arena segments held for reuse; see
+    /// [`SegmentedBuf::release_retained`](crate::segmented_buf::SegmentedBuf::release_retained).
+    /// Call once ingest is finished — holding them through the merge costs peak
+    /// RSS and buys nothing, because nothing more is pushed.
+    pub fn release_retained(&mut self) {
+        self.data.release_retained();
+    }
+
+    /// Empty the buffer between chunks, **keeping the arena's segment
+    /// allocations** so the next chunk does not fault every page back in.
+    ///
+    /// See [`SegmentedBuf::reset_for_reuse`](crate::segmented_buf::SegmentedBuf::reset_for_reuse)
+    /// for the measurement. Use this rather than [`clear`](Self::clear)
+    /// anywhere the buffer is about to be refilled; `clear` is for teardown.
+    pub fn reset_for_reuse(&mut self) {
+        self.data.reset_for_reuse();
+        self.refs.clear();
+    }
+
     pub fn clear(&mut self) {
         self.data.clear();
         self.refs.clear();
