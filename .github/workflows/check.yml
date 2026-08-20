@@ -5,6 +5,10 @@ on:
     branches:
       - main
   pull_request:
+  # Run in the merge queue too. GitHub evaluates `merge_group` workflows from the
+  # target branch (main), so these checks gate every group the queue assembles;
+  # the branch ruleset lists these job names as the queue's required checks.
+  merge_group:
 
 # Every job here only checks out the repo and runs read-only build/test/lint
 # steps (the coverage upload authenticates with CODECOV_TOKEN, not the workflow
@@ -21,6 +25,7 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,6 +46,7 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -57,6 +63,7 @@ jobs:
 
   coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.actor != 'dependabot[bot]'
     environment: github-actions
     steps:
@@ -87,6 +94,7 @@ jobs:
 
   format:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -103,6 +111,7 @@ jobs:
 
   security:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -129,6 +138,7 @@ jobs:
   # says nothing about whether the publish list is complete or correctly ordered.
   publish-order:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -141,6 +151,7 @@ jobs:
 
   publish-dry-run:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -175,6 +186,7 @@ jobs:
 
   no-default-features-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -201,6 +213,7 @@ jobs:
 
   msrv-lockstep:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -226,6 +239,7 @@ jobs:
 
   coderabbit-config:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -246,6 +260,7 @@ jobs:
 
   docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Turn every rustdoc warning (broken intra-doc links, private-item links,
     # etc.) into a hard error. This gates doc *build* and link health; doctest
     # *execution* (running the `///` examples) is a separate concern not covered
@@ -266,6 +281,7 @@ jobs:
 
   sort-correctness:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # This job only reads the repository -- it builds and runs tests, and never
     # writes back to GitHub. Drop the default GITHUB_TOKEN scopes to read-only so
     # the token exposed to test code cannot mutate the repo.
@@ -307,6 +323,7 @@ jobs:
 
   all-features-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
