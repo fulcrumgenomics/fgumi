@@ -1412,9 +1412,25 @@ impl<K: TemplateLaneKey> TemplateRecordBuffer<K> {
     /// Create a new buffer with estimated capacity.
     #[must_use]
     pub fn with_capacity(estimated_records: usize, estimated_bytes: usize) -> Self {
+        Self::with_segment_size(estimated_records, estimated_bytes, SORT_SEGMENT_SIZE)
+    }
+
+    /// Create a new buffer with an explicit arena segment size.
+    ///
+    /// Production always uses [`SORT_SEGMENT_SIZE`]. This exists so tests can
+    /// drive the behaviour that only appears once the arena has *sealed* a
+    /// segment — deferred key batches are cut per sealed segment, and at 256 MiB
+    /// a segment no realistic test input ever fills, leaving that path
+    /// unexercised by everything short of a quarter-gigabyte fixture.
+    #[must_use]
+    pub fn with_segment_size(
+        estimated_records: usize,
+        estimated_bytes: usize,
+        segment_size: usize,
+    ) -> Self {
         let header_bytes = estimated_records * TEMPLATE_HEADER_SIZE;
         Self {
-            data: SegmentedBuf::with_capacity(estimated_bytes + header_bytes, SORT_SEGMENT_SIZE),
+            data: SegmentedBuf::with_capacity(estimated_bytes + header_bytes, segment_size),
             refs: Vec::with_capacity(estimated_records),
         }
     }
@@ -1454,6 +1470,72 @@ impl<K: TemplateLaneKey> TemplateRecordBuffer<K> {
         // Add ref with cached key for O(1) sort comparisons
         self.refs.push(TemplateRecordRef { key, offset, len: record_len, padding: 0 });
         Ok(())
+    }
+
+    /// Push a record whose sort key will be supplied later by
+    /// [`fill_keys`](Self::fill_keys).
+    ///
+    /// The ref lands with `K::default()` in its key field, which is **not** a
+    /// valid sort position — sorting before every deferred key has been filled
+    /// would silently collate records under a constant key rather than fail.
+    /// The ingest thread's barrier is what guarantees that cannot happen; it
+    /// counts filled keys against `refs.len()` before it sorts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the record (plus header) exceeds the segment size
+    /// (256 MiB) or if the record length exceeds `u32::MAX`.
+    #[inline]
+    pub fn push_deferred(&mut self, record: &[u8]) -> anyhow::Result<()> {
+        self.push(record, K::default())
+    }
+
+    /// Write keys for the refs at `first_ref .. first_ref + keys.len()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range runs past the end of the ref array — that means a
+    /// batch outlived the chunk it belonged to, which would otherwise corrupt a
+    /// later chunk's keys silently.
+    pub fn fill_keys(&mut self, first_ref: usize, keys: &[K]) {
+        let end = first_ref + keys.len();
+        assert!(
+            end <= self.refs.len(),
+            "key batch covers refs {first_ref}..{end} but the buffer holds only {}",
+            self.refs.len(),
+        );
+        for (r, k) in self.refs[first_ref..end].iter_mut().zip(keys) {
+            r.key = *k;
+        }
+    }
+
+    /// Number of arena segments that are sealed — finished and safe to share
+    /// with a worker. See [`SegmentedBuf::sealed_len`](crate::segmented_buf::SegmentedBuf::sealed_len).
+    #[must_use]
+    pub fn sealed_segments(&self) -> usize {
+        self.data.sealed_len()
+    }
+
+    /// A shared handle to sealed arena segment `idx`, or `None` if it is the
+    /// live segment.
+    #[must_use]
+    pub fn sealed_segment(&self, idx: usize) -> Option<std::sync::Arc<Vec<u8>>> {
+        self.data.sealed_segment(idx)
+    }
+
+    /// Seal the live arena segment, so every record pushed so far lives in a
+    /// segment that can be shared with a worker.
+    ///
+    /// Called at the chunk barrier, where the buffer is about to be sorted and
+    /// cleared, so the tail of the sealed segment is never wasted in practice.
+    pub fn seal_arena_segment(&mut self) {
+        self.data.seal_current();
+    }
+
+    /// The arena's segment size, for mapping a global offset to its segment.
+    #[must_use]
+    pub fn segment_size(&self) -> usize {
+        self.data.segment_size()
     }
 
     /// Sort the index by cached key using stable LSD radix sort.
@@ -2607,6 +2689,56 @@ mod tests {
                     refs[i].offset
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_deferring_a_key_and_filling_it_matches_pushing_it_outright() {
+        // Deferred extraction is only safe if the buffer it produces is
+        // indistinguishable from the one the serial push produced — same bytes
+        // at the same offsets, same keys on the same refs.
+        let keys: Vec<TemplateKey> = (0..16i32)
+            .map(|i| {
+                let name_hash = u64::from(i.unsigned_abs());
+                TemplateKey::new(
+                    0,
+                    100 + i,
+                    false,
+                    0,
+                    200,
+                    false,
+                    0,
+                    0,
+                    (1, true),
+                    name_hash,
+                    false,
+                )
+            })
+            .collect();
+        let records: Vec<Vec<u8>> = (0..16u8).map(|i| vec![i; 40 + usize::from(i)]).collect();
+
+        let mut direct = TemplateRecordBuffer::<TemplateKey40>::with_capacity(16, 4096);
+        for (record, key) in records.iter().zip(&keys) {
+            direct.push(record, TemplateLaneKey::from_full(key)).expect("push");
+        }
+
+        let mut deferred = TemplateRecordBuffer::<TemplateKey40>::with_capacity(16, 4096);
+        for record in &records {
+            deferred.push_deferred(record).expect("push_deferred");
+        }
+        // Fill in two uneven batches, as the pool would.
+        let narrowed: Vec<TemplateKey40> = keys.iter().map(TemplateLaneKey::from_full).collect();
+        deferred.fill_keys(0, &narrowed[..5]);
+        deferred.fill_keys(5, &narrowed[5..]);
+
+        assert_eq!(direct.refs().len(), deferred.refs().len());
+        for (a, b) in direct.refs().iter().zip(deferred.refs()) {
+            assert_eq!(a.key, b.key, "keys must match");
+            assert_eq!(a.offset, b.offset, "record bytes must land at the same offset");
+            assert_eq!(a.len, b.len);
+        }
+        for (i, r) in deferred.refs().iter().enumerate() {
+            assert_eq!(deferred.get_record(r), &records[i][..], "record bytes must survive");
         }
     }
 

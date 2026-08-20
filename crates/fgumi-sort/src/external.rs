@@ -454,16 +454,6 @@ impl SortPhaseTimer {
             partition.park_secs
         );
         stat!(
-            "      extract key:       {:.1}s ({:.0} ns/rec)",
-            segments.key,
-            per_record(segments.key)
-        );
-        stat!(
-            "      verify lanes:      {:.1}s ({:.0} ns/rec)",
-            segments.verify,
-            per_record(segments.verify)
-        );
-        stat!(
             "      push to arena:     {:.1}s ({:.0} ns/rec)",
             segments.push,
             per_record(segments.push)
@@ -478,6 +468,25 @@ impl SortPhaseTimer {
             segments.probe,
             per_record(segments.probe)
         );
+        // Exact, not sampled, and reported outside the partition above: both
+        // costs are per-batch or per-chunk, so the per-record sampler cannot see
+        // them honestly. `dispatch` is what deferral costs the serial thread;
+        // `barrier` is the extraction the pool failed to hide.
+        let census = phase1.key_overlap;
+        if let Some(pct) = census.overlap_percent() {
+            stat!(
+                "    Deferred key extraction: {pct:.1}% overlapped ({} of {} records; \
+                 {} keyed at a barrier)",
+                census.overlapped_records,
+                census.total_records(),
+                census.barrier_records,
+            );
+            stat!(
+                "      dispatch (exact):  {:.1}s      barrier wait (exact): {:.1}s",
+                census.dispatch_secs,
+                census.barrier_secs,
+            );
+        }
         // Signed: a negative residual means the segments over-attribute, which is
         // the failure mode this partition exists to make visible.
         stat!(
@@ -516,6 +525,9 @@ pub(crate) struct Phase1FloorInputs {
     /// this is order-independent -- every sort order reads the same way -- so it
     /// is filled in on all four paths.
     pub(crate) reader: crate::phase1_stats::ReaderReport,
+    /// What deferred key extraction achieved, on the orders that defer it
+    /// (template-coordinate). Default (all zero) elsewhere.
+    pub(crate) key_overlap: crate::phase1_keys::KeyOverlapCensus,
 }
 
 /// Deterministic hasher for cell barcode hashing in template-coordinate sort.
@@ -748,6 +760,15 @@ type RgOrdinalMap = HashMap<Vec<u8>, u32, ahash::RandomState>;
 ///
 /// Pre-computes ordinals by sorting library names alphabetically.
 /// Empty/unknown library sorts first (ordinal 0).
+///
+/// `Clone` is derived so the deferred key-extraction context can own a copy
+/// rather than borrow one, and it is **seed-preserving on purpose**: cloning
+/// `ahash::RandomState` copies its keys rather than drawing new ones, so a clone
+/// hashes read names identically to its original. Anything that reseeded here
+/// would change the template-coordinate sort key and break byte-identity
+/// silently — the output would still be correctly sorted, just not the same
+/// order twice.
+#[derive(Clone)]
 pub struct LibraryLookup {
     /// RG ID -> library ordinal
     rg_to_ordinal: RgOrdinalMap,
@@ -4442,24 +4463,31 @@ impl RawExternalSorter {
         debug!("Phase 1: Reading and sorting chunks (inline buffer)...");
         let mut probe = SpillProbe::new("phase1");
 
-        // Process the captured first record before draining the rest: extract its
-        // full key, verify the dropped lanes match `first` (trivially true for the
-        // first record itself), and push the narrowed key. A single record cannot
-        // exceed the memory limit, so no spill check is needed here.
+        // Key extraction runs on the pool, not here: at 120 ns/record it was the
+        // single largest cost on this thread (93.6s of a 137.5s ingest against a
+        // 145.4s read span), and it has no ordering requirement. The ingest
+        // thread now pushes bytes and hands out batches; `deferred` cuts them,
+        // the pool runs them, and the keys are spliced back before any sort.
+        let mut deferred = crate::phase1_keys::DeferredKeys::<K>::new(
+            Arc::new(crate::phase1_keys::KeyContext {
+                lib_lookup: lib_lookup.clone(),
+                cell_tag: self.cell_tag,
+                cb_hasher: cb_hasher.clone(),
+                first_key: first,
+                variant,
+            }),
+            self.phase1_threads(),
+        );
+
+        // Process the captured first record before draining the rest. Its key is
+        // deferred like every other record's, including the dropped-lane verify
+        // (trivially satisfied for the first record, since it *is* the baseline).
+        // A single record cannot exceed the memory limit, so no spill check is
+        // needed here.
         if let Some(record) = first_record {
             stats.total_records += 1;
             progress_batch.tick(&progress);
-
-            let bam_bytes = record.as_ref();
-            let full = extract_template_key_inline(bam_bytes, lib_lookup, self.cell_tag, cb_hasher);
-            if let Some(violation) = verify_dropped_lanes(&first, &full, variant) {
-                let name = String::from_utf8_lossy(
-                    fgumi_raw_bam::RawRecordView::new(bam_bytes).read_name(),
-                )
-                .into_owned();
-                return Err(dropped_lane_error(&name, violation));
-            }
-            buffer.push(bam_bytes, K::from_full(&full))?;
+            deferred.push(&mut buffer, &pool, record.as_ref())?;
         }
 
         // Sub-phase timing for the ingest thread's serial CPU, which the floor
@@ -4502,35 +4530,24 @@ impl RawExternalSorter {
                 ingest_raw.tick += t0.elapsed().as_secs_f64();
             }
 
-            // Extract the full template key, verify the lanes the chosen variant
-            // dropped are constant relative to the first record, then push the
-            // narrowed key.
+            // Push the bytes and get a key onto them. With workers to spare the
+            // key is extracted on the pool and spliced in before anything sorts
+            // this buffer; with a single worker it is extracted right here, as
+            // it always was. `push` therefore covers extraction on the
+            // single-worker path and not on the deferred one -- read it against
+            // the deferred-extraction census below, not on its own.
             let t = sample_this.then(Instant::now);
-            let full = extract_template_key_inline(bam_bytes, lib_lookup, self.cell_tag, cb_hasher);
-            if let Some(t0) = t {
-                ingest_raw.key += t0.elapsed().as_secs_f64();
-            }
-            let t = sample_this.then(Instant::now);
-            let violation = verify_dropped_lanes(&first, &full, variant);
-            if let Some(t0) = t {
-                ingest_raw.verify += t0.elapsed().as_secs_f64();
-            }
-            if let Some(violation) = violation {
-                let name = String::from_utf8_lossy(
-                    fgumi_raw_bam::RawRecordView::new(bam_bytes).read_name(),
-                )
-                .into_owned();
-                return Err(dropped_lane_error(&name, violation));
-            }
-            let t = sample_this.then(Instant::now);
-            buffer.push(bam_bytes, K::from_full(&full))?;
+            deferred.push(&mut buffer, &pool, bam_bytes)?;
             if let Some(t0) = t {
                 ingest_raw.push += t0.elapsed().as_secs_f64();
             }
 
             let t = sample_this.then(Instant::now);
             let should_probe = probe.should_sample_read(stats.total_records);
-            let over_limit = buffer.memory_usage() >= self.memory_limit;
+            // Records whose keys are still in flight are charged here, so a
+            // lagging pool cannot let the buffer overrun the memory limit.
+            let over_limit =
+                buffer.memory_usage() + deferred.in_flight_bytes() >= self.memory_limit;
             if let Some(t0) = t {
                 ingest_raw.probe += t0.elapsed().as_secs_f64();
             }
@@ -4540,6 +4557,16 @@ impl RawExternalSorter {
 
             // Check memory usage
             if over_limit {
+                // Finish the chunk's keys *inside* the read span. This is ingest
+                // work for records already read, and accounting it to the spill
+                // region instead would let a pool that never keeps up still
+                // report a shorter read span -- the one way this change could
+                // look successful while doing nothing.
+                let violation = deferred.finish(&mut buffer, &pool)?;
+                if let Some(v) = violation {
+                    return Err(dropped_lane_error(&v.name, v.violation));
+                }
+
                 timer.end_read_span();
                 let bstats = probe_stats(&buffer);
                 let depths = Some(pool.phase1_queue_depths());
@@ -4578,13 +4605,30 @@ impl RawExternalSorter {
                 )?);
 
                 buffer.clear();
+                deferred.reset();
                 force_mi_collect();
                 probe.post_spill(Some(pool.phase1_queue_depths()));
                 timer.begin_read_span();
             }
         }
 
+        // Drain the tail before closing the read span: the records still held in
+        // the live arena segment have no keys yet, and everything below this
+        // point either sorts or spills the buffer.
+        //
+        // Inside the span on purpose. This is ingest work for records already
+        // read, and the read span is the number this whole change is trying to
+        // move -- excluding the drain would let a pool that never kept up still
+        // report a shorter span, which is the one way this optimization could
+        // look successful while doing nothing.
+        let violation = deferred.finish(&mut buffer, &pool)?;
+
         timer.end_read_span();
+
+        if let Some(v) = violation {
+            return Err(dropped_lane_error(&v.name, v.violation));
+        }
+
         progress_batch.flush(&progress);
         progress.log_final();
         if let Some(err) = record_source.take_error() {
@@ -4611,6 +4655,7 @@ impl RawExternalSorter {
             threads: self.phase1_threads(),
             ingest: pool.phase1_ingest_stats().snapshot(),
             reader: pool.phase1_reader_report(),
+            key_overlap: deferred.overlap_census(),
             sample: ingest_raw,
             samples: ingest_samples,
             records: stats.total_records,
@@ -6738,7 +6783,7 @@ pub fn verify_dropped_lanes(
 }
 
 /// Build the actionable error message for a dropped-lane violation.
-fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow::Error {
+pub(crate) fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow::Error {
     let field = match v {
         DroppedLaneViolation::Cb => "CB",
         DroppedLaneViolation::Mi => "MI",

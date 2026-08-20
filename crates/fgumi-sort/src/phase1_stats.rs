@@ -130,6 +130,12 @@ pub(crate) const INGEST_SAMPLE_INTERVAL: u64 = 1021;
 
 /// Where the ingest thread's serial CPU goes, per record.
 ///
+/// **Per-record segments only.** Deferred key extraction is deliberately absent:
+/// its costs are per-*batch* and per-*chunk*, not per-record, so sampling one
+/// record in [`INGEST_SAMPLE_INTERVAL`] and scaling would be measuring a rare
+/// event with a method built for a uniform one. Those two are timed exactly
+/// instead and reported beside this partition, the same way `park_secs` is.
+///
 /// The floor line says this thread *is* the limit -- on a 16-thread whole-genome
 /// sort it is 137.2s of a 145.7s read span, against a worker-capacity floor of
 /// 22.4s -- so the only question left is what the 137.2s is made of. Nothing else
@@ -155,10 +161,6 @@ pub(crate) struct IngestSample {
     /// **Includes park time**, so it is not pure CPU -- `park_secs` measures that
     /// part exactly and separately.
     pub(crate) fetch: f64,
-    /// Extracting the sort key from the record bytes.
-    pub(crate) key: f64,
-    /// Verifying that the lanes the chosen key variant drops are constant.
-    pub(crate) verify: f64,
     /// Copying the record into the arena and appending its ref.
     pub(crate) push: f64,
     /// Counting the record toward the progress log.
@@ -173,8 +175,6 @@ impl IngestSample {
     pub(crate) fn scaled(self, scale: f64) -> Self {
         Self {
             fetch: self.fetch * scale,
-            key: self.key * scale,
-            verify: self.verify * scale,
             push: self.push * scale,
             tick: self.tick * scale,
             probe: self.probe * scale,
@@ -197,8 +197,6 @@ impl IngestSample {
         let fix = |v: f64| (v - per_segment).max(0.0);
         Self {
             fetch: fix(self.fetch),
-            key: fix(self.key),
-            verify: fix(self.verify),
             push: fix(self.push),
             tick: fix(self.tick),
             probe: fix(self.probe),
@@ -208,7 +206,7 @@ impl IngestSample {
     /// The six segments summed.
     #[must_use]
     pub(crate) fn total(self) -> f64 {
-        self.fetch + self.key + self.verify + self.push + self.tick + self.probe
+        self.fetch + self.push + self.tick + self.probe
     }
 }
 
@@ -519,22 +517,16 @@ mod tests {
 
     #[test]
     fn test_clock_correction_subtracts_one_pair_per_segment_per_sample() {
-        // Ten samples, 20 ns per pair, five segments: each segment carries
+        // Ten samples, 20 ns per pair, four segments: each segment carries
         // 10 x 20 ns = 200 ns of clock, and each is corrected independently.
-        let raw = IngestSample {
-            fetch: 1e-6,
-            key: 1e-6,
-            verify: 1e-7,
-            push: 1e-6,
-            tick: 1e-6,
-            probe: 1e-6,
-        };
+        // `tick` is deliberately *below* that, to exercise the clamp.
+        let raw = IngestSample { fetch: 1e-6, push: 1e-6, tick: 1e-7, probe: 1e-6 };
         let fixed = raw.corrected(10, 20);
         assert!((fixed.fetch - 0.8e-6).abs() < 1e-12, "got {}", fixed.fetch);
         // A segment cheaper than the clock that measured it clamps to zero rather
         // than going negative, which would read as a bug rather than as
         // "unresolvable by this method".
-        assert!((fixed.verify - 0.0).abs() < 1e-12, "got {}", fixed.verify);
+        assert!((fixed.tick - 0.0).abs() < 1e-12, "got {}", fixed.tick);
     }
 
     #[test]
@@ -543,10 +535,10 @@ mod tests {
         // works on the sampled scale. Applying them in the wrong order would
         // subtract one pair's cost from the *scaled* total rather than from each
         // sample, understating the correction by the scale factor.
-        let raw = IngestSample { key: 2e-6, ..IngestSample::default() };
+        let raw = IngestSample { push: 2e-6, ..IngestSample::default() };
         let corrected_then_scaled = raw.corrected(10, 20).scaled(1000.0);
         let scaled_then_corrected = raw.scaled(1000.0).corrected(10, 20);
-        assert!(corrected_then_scaled.key < scaled_then_corrected.key);
+        assert!(corrected_then_scaled.push < scaled_then_corrected.push);
     }
 
     #[test]
