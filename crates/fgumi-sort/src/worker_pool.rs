@@ -1377,9 +1377,9 @@ pub struct SortWorkerPool {
     pub buffer_pool: BufferPool,
     num_workers: usize,
     pub(crate) spill_codec: SpillCodec,
-    /// Concurrent positional reads the merge may use per spill file. One keeps
-    /// the sequential `BufReader` a merge has always used.
-    pub(crate) read_streams: usize,
+    /// How the merge reads each spill file. `Fixed(1)` keeps the sequential
+    /// `BufReader` a merge has always used.
+    pub(crate) read_streams: crate::external::ReadStreams,
 }
 
 /// Shared state visible to all workers and the main thread.
@@ -2423,7 +2423,7 @@ impl SortWorkerPool {
             buffer_pool,
             num_workers,
             spill_codec,
-            read_streams: 1,
+            read_streams: crate::external::ReadStreams::Fixed(1),
         }
     }
 
@@ -4113,11 +4113,16 @@ impl SortWorkerPool {
             file.seek(SeekFrom::Start(body_start)).map_err(|e| {
                 anyhow::anyhow!("Failed to seek chunk file {}: {e}", path.display())
             })?;
-            let reader = if self.read_streams > 1 {
+            let reader = if self.read_streams.is_sequential() {
+                crate::spill_reader::SpillSource::Sequential(BufReader::with_capacity(
+                    2 * 1024 * 1024,
+                    file,
+                ))
+            } else {
                 // Positional reads need no file position, so the seek above is
                 // irrelevant here -- `body_start` is passed explicitly instead.
                 crate::spill_reader::SpillSource::Scattered(
-                    crate::spill_reader::ScatterReader::new(
+                    crate::spill_reader::ScatterReader::for_streams(
                         file,
                         body_start,
                         self.read_streams,
@@ -4127,11 +4132,6 @@ impl SortWorkerPool {
                         anyhow::anyhow!("Failed to size chunk file {}: {e}", path.display())
                     })?,
                 )
-            } else {
-                crate::spill_reader::SpillSource::Sequential(BufReader::with_capacity(
-                    2 * 1024 * 1024,
-                    file,
-                ))
             };
             states.push(Phase2FileState::new(reader, codec));
         }
@@ -6336,7 +6336,13 @@ mod tests {
         file.write_all(&[0xAA, 0xBB, 0xCC]).expect("write body");
         drop(file);
 
-        for read_streams in [1usize, 4] {
+        // All three shapes: the sequential reader, a pinned scattered one, and
+        // the auto-tuning one that is now the default.
+        for read_streams in [
+            crate::external::ReadStreams::Fixed(1),
+            crate::external::ReadStreams::Fixed(4),
+            crate::external::ReadStreams::Auto,
+        ] {
             let mut pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf);
             pool.read_streams = read_streams;
             pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
@@ -6346,7 +6352,7 @@ mod tests {
             assert_eq!(
                 phase2_file_position(&files[0]),
                 ZSPILL_MAGIC.len() as u64,
-                "zstd reader must start past the 4-byte magic at {read_streams} streams"
+                "zstd reader must start past the 4-byte magic at {read_streams:?}"
             );
             pool.shutdown();
         }
@@ -6363,7 +6369,13 @@ mod tests {
         file.write_all(&[0x1f, 0x8b, 0x00, 0x00, 0x55, 0x66]).expect("write magic");
         drop(file);
 
-        for read_streams in [1usize, 4] {
+        // All three shapes: the sequential reader, a pinned scattered one, and
+        // the auto-tuning one that is now the default.
+        for read_streams in [
+            crate::external::ReadStreams::Fixed(1),
+            crate::external::ReadStreams::Fixed(4),
+            crate::external::ReadStreams::Auto,
+        ] {
             let mut pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Zstd);
             pool.read_streams = read_streams;
             pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
@@ -6373,7 +6385,7 @@ mod tests {
             assert_eq!(
                 phase2_file_position(&files[0]),
                 0,
-                "bgzf reader must start at byte 0 at {read_streams} streams, for the header"
+                "bgzf reader must start at byte 0 at {read_streams:?}, for the header"
             );
             pool.shutdown();
         }

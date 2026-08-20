@@ -2616,9 +2616,9 @@ pub struct RawExternalSorter {
     /// a modest allocation and let `Vec` grow on demand, while explicit limits
     /// pre-allocate the full budget upfront (preserving prior behavior).
     initial_capacity: Option<usize>,
-    /// Prefetch streams for a seekable input; 1 keeps the single sequential
-    /// reader. See [`crate::parallel_reader`] for why more than one is needed.
-    read_streams: usize,
+    /// How the input and the merge's spill files are read. See
+    /// `spill_reader` for why more than one stream is needed.
+    read_streams: ReadStreams,
     /// Which optional template-key lanes to retain (template-coordinate only).
     ///
     /// Defaults to [`KeyTypesSpec::Auto`], which provisions the narrowest key
@@ -2726,7 +2726,7 @@ impl RawExternalSorter {
             max_temp_files: crate::fd_limit::FALLBACK_MAX_TEMP_FILES,
             cell_tag: None,
             initial_capacity: None,
-            read_streams: 1,
+            read_streams: ReadStreams::default(),
             key_types: KeyTypesSpec::default(),
         }
     }
@@ -2930,15 +2930,10 @@ impl RawExternalSorter {
         self
     }
 
-    /// Number of prefetch streams to read a seekable input with.
-    ///
-    /// One keeps today's single sequential reader. More than one spawns that
-    /// many positional-read workers, which is the only way a process can create
-    /// device queue depth without root (`read_ahead_kb`) — see
-    /// [`crate::parallel_reader`].
+    /// How to read the input and the merge's spill files.
     #[must_use]
-    pub fn read_streams(mut self, streams: usize) -> Self {
-        self.read_streams = streams.max(1);
+    pub fn read_streams(mut self, streams: ReadStreams) -> Self {
+        self.read_streams = streams;
         self
     }
 
@@ -6522,6 +6517,71 @@ pub(crate) use crate::SortStats as RawSortStats;
 // rather than in `fgumi-bam-io`.
 // ============================================================================
 
+/// How many concurrent streams to read a file with.
+///
+/// `Auto` starts at one and grows only when fills are demonstrably occupying
+/// the span (see `spill_reader`); a fixed value pins it. One measured
+/// device wants four and another wants one, and the difference is 28% on the
+/// first and -1.8% on the second, which is why the default measures rather
+/// than guesses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadStreams {
+    /// Measure and grow. The default.
+    #[default]
+    Auto,
+    /// Exactly this many; `1` is the plain sequential reader.
+    Fixed(usize),
+}
+
+impl std::fmt::Display for ReadStreams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Fixed(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+impl ReadStreams {
+    /// Whether this asks for the plain sequential reader, which is what every
+    /// phase did before scattered reads existed.
+    #[must_use]
+    pub fn is_sequential(self) -> bool {
+        matches!(self, Self::Fixed(1))
+    }
+
+    /// Streams to start with. `Auto` starts at one and grows from what it
+    /// measures, so it costs nothing until it has evidence.
+    #[must_use]
+    pub fn initial(self) -> usize {
+        match self {
+            Self::Auto => 1,
+            Self::Fixed(n) => n.max(1),
+        }
+    }
+
+    /// Whether the reader should tune itself as it goes.
+    #[must_use]
+    pub fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+impl std::str::FromStr for ReadStreams {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        match text.parse::<usize>() {
+            Ok(0) => Err("--read-streams must be `auto` or at least 1".to_string()),
+            Ok(n) => Ok(Self::Fixed(n)),
+            Err(_) => Err(format!("expected `auto` or a positive number, got `{text}`")),
+        }
+    }
+}
+
 /// Fills the phase-1 input reader keeps in flight ahead of the framer.
 ///
 /// One, and deeper does not help. Swept in a single boot on
@@ -6554,7 +6614,7 @@ const PHASE1_LOOKAHEAD_FILLS: usize = 1;
 ///
 /// No extra threads are spawned either way: with one stream the pool's block
 /// reader reads directly from the input file, and with several it offers byte
-/// slices to the pool (see [`crate::spill_reader`]).
+/// slices to the pool (see `spill_reader`).
 ///
 /// # Flow
 ///
@@ -6572,7 +6632,7 @@ const PHASE1_LOOKAHEAD_FILLS: usize = 1;
 fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
     path: P,
     pool: &Arc<SortWorkerPool>,
-    read_streams: usize,
+    read_streams: ReadStreams,
 ) -> Result<(fgumi_raw_bam::RawBamReader<PooledInputStream>, Header)> {
     use crate::worker_pool::phase;
     use std::io;
@@ -6605,7 +6665,14 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
         // applies however the bytes are subsequently read.
         fgumi_bam_io::os_hints::advise_sequential(&file);
 
-        if read_streams > 1 {
+        if read_streams.is_sequential() {
+            // `--read-streams 1`: the plain buffered reader every phase used
+            // before scattered reads existed.
+            Box::new(io::BufReader::with_capacity(
+                SORT_INPUT_BUFFER_SIZE,
+                crate::phase1_stats::TimedReader::new(file, reader_stats),
+            ))
+        } else {
             // Scattered positional reads, the same mechanism the merge uses on
             // spill files: slices are offered to the pool so the device sees
             // real queue depth, which one blocking `read()` cannot produce
@@ -6614,7 +6681,7 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
             //
             // Only reachable on a real file: stdin and other non-seekable inputs
             // take the branch above, where positional reads do not exist.
-            match crate::spill_reader::ScatterReader::new(
+            match crate::spill_reader::ScatterReader::for_streams(
                 file,
                 0,
                 read_streams,
@@ -6625,7 +6692,7 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
             }) {
                 Ok(reader) => {
                     log::debug!(
-                        "scattered sort reader: {read_streams} streams over {}",
+                        "scattered sort reader: {read_streams} over {}",
                         path_ref.display()
                     );
                     Box::new(reader)
@@ -6643,11 +6710,6 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
                     ))
                 }
             }
-        } else {
-            Box::new(io::BufReader::with_capacity(
-                SORT_INPUT_BUFFER_SIZE,
-                crate::phase1_stats::TimedReader::new(file, reader_stats),
-            ))
         }
     };
 

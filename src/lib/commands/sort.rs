@@ -386,24 +386,28 @@ pub struct Sort {
     #[arg(long = "write-index", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub write_index: bool,
 
-    /// Read the input BAM and the merge's spill files with this many
-    /// concurrent streams.
+    /// Concurrent streams to read the input BAM and the merge's spill files
+    /// with: `auto`, or a fixed count.
     ///
     /// One blocking read keeps only about one read-ahead window outstanding at
     /// the device, which on network-attached storage is far below what it can
     /// serve -- and no buffer size fixes it, because a bigger single request is
-    /// not more concurrency. On EBS gp3, four streams measured 1177 MB/s
-    /// against 358 MB/s for one, and a whole-genome sort ran 28% faster.
+    /// not more concurrency. How much that matters depends entirely on the
+    /// storage: on EBS gp3 four streams took a whole-genome sort 28% faster,
+    /// while on a direct-attached instance-store SSD one stream is already faster than four
+    /// are on gp3 and adding more costs 1.8%.
     ///
-    /// **4 is the measured value for network-attached storage.** The default is
-    /// 1 (today's behaviour) because direct-attached storage has far lower latency
-    /// and may need fewer; that has not been measured yet. The streams are pool
-    /// workers, not new threads, so this never exceeds `--threads`.
+    /// `auto` therefore measures instead of guessing. It starts at one stream
+    /// -- exactly the pre-existing behaviour -- and doubles only while fills
+    /// are occupying most of the read span, which is the condition under which
+    /// concurrency has something to buy. It lands on four for gp3 and stays at
+    /// one for `NVMe` without being told which is which.
     ///
-    /// Clamped to 16 and to the input's chunk count. Ignored for stdin and
-    /// other non-seekable inputs, where positional reads do not exist.
-    #[arg(long = "read-streams", default_value_t = 1)]
-    pub read_streams: usize,
+    /// The streams are existing pool workers, not new threads, so this never
+    /// exceeds `--threads`. Ignored for stdin and other non-seekable inputs,
+    /// where positional reads do not exist.
+    #[arg(long = "read-streams", default_value_t = fgumi_sort::ReadStreams::Auto)]
+    pub read_streams: fgumi_sort::ReadStreams,
 
     /// Emit the sort's performance diagnostics.
     ///
@@ -978,7 +982,6 @@ mod tests {
     /// rendering is suppressed.
     #[rstest]
     #[case::sort_stats("sort-stats")]
-    #[case::async_reader("async-reader")]
     fn test_advanced_flags_are_hidden_from_help(#[case] long: &str) {
         let command = Sort::command();
         let arg = command
@@ -1593,7 +1596,7 @@ mod tests {
             temp_codec: fgumi_sort::SpillCodec::default(),
             max_temp_files: MaxTempFiles::Auto,
             write_index: false,
-            read_streams: 1,
+            read_streams: fgumi_sort::ReadStreams::Auto,
             sort_stats: false,
         }
     }

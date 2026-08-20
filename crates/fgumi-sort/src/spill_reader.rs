@@ -47,7 +47,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crossbeam_queue::ArrayQueue;
@@ -59,6 +59,55 @@ use crossbeam_queue::ArrayQueue;
 /// 975 MB/s against 1081 MB/s at 4 MiB, so slices much below a megabyte start
 /// giving the gain back.
 pub(crate) const FILL_BYTES: usize = 4 * 1024 * 1024;
+
+/// Most streams the ramp will ever reach.
+///
+/// Eight already matched four on the storage that needs concurrency at all
+/// (1080 MB/s against 1081 on EBS gp3), and past this each extra stream is
+/// pool work that buys nothing.
+const MAX_STREAMS: usize = 8;
+
+/// Fills measured at one stream before choosing a stream count.
+///
+/// Long enough that one slow fill cannot move the decision, short enough that
+/// the probe costs 32 MiB of reading at whatever the device does unaided.
+const AUTO_PROBE_FILLS: usize = 8;
+
+/// Single-stream throughput at or above which concurrency has nothing to buy.
+///
+/// Derived from the consumer, not from the device: the ingest thread reads
+/// 43.1 GB in ~53s, so it can absorb about 810 MB/s, and a reader that already
+/// beats that is not what the sort is waiting on. This leaves ~1.5x headroom
+/// over that floor.
+///
+/// The two devices measured sit either side of it by a wide margin -- EBS gp3
+/// sustains 358 MB/s on one stream and wants four; a local instance-store SSD
+/// sustains 2214 MB/s and wants one, where forcing eight measured 1.8%
+/// *slower*. Anything from roughly 900 MB/s to 2 GB/s separates them.
+const AUTO_TARGET_BYTES_PER_SEC: f64 = 1_200_000_000.0;
+
+/// Streams to use, from what one stream measured.
+///
+/// `ceil(target / measured)`: enough streams to reach a rate the consumer
+/// cannot outrun, and no more. Measuring the *device* rather than the pipeline
+/// is what makes this work -- an earlier version compared fetch time against
+/// the reader's own elapsed time, which is a high fraction on every device
+/// because a reader mostly reads, and it duly ramped both gp3 and a local SSD
+/// to the cap.
+fn streams_for_measured_rate(bytes: u64, nanos: u64) -> usize {
+    if bytes == 0 || nanos == 0 {
+        return 1;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let rate = bytes as f64 * 1e9 / nanos as f64;
+    let wanted = (AUTO_TARGET_BYTES_PER_SEC / rate).ceil();
+    if !wanted.is_finite() || wanted <= 1.0 {
+        return 1;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let wanted = wanted as usize;
+    wanted.min(MAX_STREAMS)
+}
 
 /// Smallest slice worth offering to another worker.
 ///
@@ -110,6 +159,15 @@ pub(crate) struct FetchQueue {
     jobs: ArrayQueue<Arc<FetchSlice>>,
     offered: AtomicU64,
     taken: AtomicU64,
+    /// The stream count one uncontended probe measured, or 0 while none has.
+    ///
+    /// Shared because the thing being measured is the *device*, and a merge
+    /// reads K spill files at once: each reader would otherwise measure its own
+    /// share of a contended device, conclude it needs more streams, and add
+    /// contention. Measured on EBS gp3 -- phase 1 alone saw 335 MB/s and chose
+    /// four, while the 44 spill readers each saw 224-229 MB/s and chose six or
+    /// seven, which took the merge from 119.3s to 129.1s.
+    chosen_streams: AtomicUsize,
 }
 
 /// A [`Read`] over a file whose buffer is filled by concurrent positional reads.
@@ -140,6 +198,13 @@ pub(crate) struct ScatterReader {
     /// merge already sits at its consumer-serial floor, so all lookahead would
     /// buy there is `K * depth * FILL_BYTES` of extra buffers.
     lookahead: usize,
+    /// Whether to grow `streams` from what the fills measure. See
+    /// [`ramped_streams`].
+    auto: bool,
+    /// Bytes and nanoseconds the probe has measured at one stream so far.
+    probe_bytes: u64,
+    probe_nanos: u64,
+    probe_fills: usize,
 }
 
 /// A fill in flight: its slices, where they report, and where it began.
@@ -173,6 +238,7 @@ impl FetchQueue {
             jobs: ArrayQueue::new(workers.max(1) * 8),
             offered: AtomicU64::new(0),
             taken: AtomicU64::new(0),
+            chosen_streams: AtomicUsize::new(0),
         })
     }
 
@@ -202,6 +268,20 @@ impl FetchQueue {
     /// which no output check would ever notice.
     pub(crate) fn census(&self) -> (u64, u64) {
         (self.offered.load(Ordering::Relaxed), self.taken.load(Ordering::Relaxed))
+    }
+
+    /// The stream count a probe has already settled on, if any.
+    fn settled_streams(&self) -> Option<usize> {
+        match self.chosen_streams.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// Publish what one uncontended probe measured, if nobody has yet.
+    fn settle_streams(&self, streams: usize) {
+        let _ =
+            self.chosen_streams.compare_exchange(0, streams, Ordering::Relaxed, Ordering::Relaxed);
     }
 
     /// Offer a slice, ignoring a full queue -- the filler reclaims either way.
@@ -273,7 +353,23 @@ impl ScatterReader {
             stats: None,
             pending: VecDeque::new(),
             lookahead: 0,
+            auto: false,
+            probe_bytes: 0,
+            probe_nanos: 0,
+            probe_fills: 0,
         })
+    }
+
+    /// Grow the stream count from what the fills measure, starting at one.
+    ///
+    /// Costs nothing before it has measured anything -- one stream is exactly
+    /// the pre-change path -- and only grows when the consumer is demonstrably
+    /// waiting on fills. See [`ramped_streams`].
+    #[must_use]
+    pub(crate) fn auto_tuned(mut self) -> Self {
+        self.auto = true;
+        self.streams = 1;
+        self
     }
 
     /// Keep `fills` in flight ahead of the consumer.
@@ -297,6 +393,22 @@ impl ScatterReader {
     pub(crate) fn timed(mut self, stats: Arc<crate::phase1_stats::ReaderStats>) -> Self {
         self.stats = Some(stats);
         self
+    }
+
+    /// Build a reader for a [`crate::external::ReadStreams`] setting, tuning
+    /// itself when asked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file's length cannot be determined.
+    pub(crate) fn for_streams(
+        file: File,
+        offset: u64,
+        streams: crate::external::ReadStreams,
+        fetch: Option<Arc<FetchQueue>>,
+    ) -> io::Result<Self> {
+        let reader = Self::new(file, offset, streams.initial(), fetch)?;
+        Ok(if streams.is_auto() { reader.auto_tuned() } else { reader })
     }
 
     /// A buffer of exactly `len` bytes, recycled where possible.
@@ -400,6 +512,41 @@ impl ScatterReader {
         Ok(())
     }
 
+    /// Fold one single-stream fill into the probe, and decide once it has seen
+    /// enough. Decides exactly once; after that the reader stops measuring.
+    fn probe_fill(&mut self, bytes: u64, nanos: u64) {
+        // Self-guarding rather than relying on the caller to stop: deciding
+        // twice is exactly how the previous design went wrong, and a probe that
+        // cannot be re-armed cannot repeat it. Later fills also run at the
+        // chosen stream count, so they no longer measure one stream and would
+        // answer a different question.
+        if !self.auto {
+            return;
+        }
+        // Adopt an answer someone else already measured rather than measuring a
+        // contended device. In a merge this is every spill reader but the first.
+        if let Some(settled) = self.fetch.as_ref().and_then(|q| q.settled_streams()) {
+            self.streams = settled;
+            self.auto = false;
+            return;
+        }
+        self.probe_bytes = self.probe_bytes.saturating_add(bytes);
+        self.probe_nanos = self.probe_nanos.saturating_add(nanos);
+        self.probe_fills += 1;
+        if self.probe_fills < AUTO_PROBE_FILLS {
+            return;
+        }
+        let chosen = streams_for_measured_rate(self.probe_bytes, self.probe_nanos);
+        #[allow(clippy::cast_precision_loss)]
+        let mbps = self.probe_bytes as f64 * 1e3 / self.probe_nanos.max(1) as f64;
+        log::debug!("read streams: one stream measured {mbps:.0} MB/s, using {chosen}");
+        if let Some(queue) = &self.fetch {
+            queue.settle_streams(chosen);
+        }
+        self.streams = chosen;
+        self.auto = false;
+    }
+
     /// Make bytes available in `ready`, leaving it empty only at EOF.
     fn fill(&mut self) -> io::Result<()> {
         if self.pending.is_empty() {
@@ -409,7 +556,15 @@ impl ScatterReader {
             self.pending.push_back(first);
         }
         let pending = self.pending.pop_front().expect("just ensured non-empty");
+        let started = self.auto.then(std::time::Instant::now);
+        let fill_start = pending.start;
         self.collect(&pending)?;
+        if let Some(t0) = started {
+            self.probe_fill(
+                self.offset.saturating_sub(fill_start),
+                u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
+        }
         // Topped up after collecting rather than before, so the fills issued
         // here overlap the framing of what just landed rather than the wait for
         // it. At depth 0 this loop does nothing and the reader is demand-driven.
@@ -544,6 +699,155 @@ mod tests {
     fn scattered(path: &std::path::Path, offset: u64, streams: usize) -> ScatterReader {
         let file = File::open(path).expect("open");
         ScatterReader::new(file, offset, streams, Some(FetchQueue::new(4))).expect("reader")
+    }
+
+    #[test]
+    fn test_read_streams_parses_what_a_user_would_type() {
+        use crate::external::ReadStreams;
+        use std::str::FromStr;
+        assert_eq!(ReadStreams::from_str("auto"), Ok(ReadStreams::Auto));
+        assert_eq!(ReadStreams::from_str("AUTO"), Ok(ReadStreams::Auto), "case-insensitive");
+        assert_eq!(ReadStreams::from_str("1"), Ok(ReadStreams::Fixed(1)));
+        assert_eq!(ReadStreams::from_str("4"), Ok(ReadStreams::Fixed(4)));
+        // Zero streams cannot read anything, and silently promoting it to one
+        // would hide a typo behind a plausible-looking run.
+        assert!(ReadStreams::from_str("0").is_err(), "zero is rejected, not rounded up");
+        assert!(ReadStreams::from_str("four").is_err());
+        assert!(ReadStreams::from_str("-1").is_err());
+        assert!(ReadStreams::from_str("").is_err());
+    }
+
+    #[test]
+    fn test_read_streams_round_trips_through_its_display() {
+        // clap prints the default in `--help` via `Display`, so a value it
+        // shows has to be one it accepts.
+        use crate::external::ReadStreams;
+        use std::str::FromStr;
+        for value in [ReadStreams::Auto, ReadStreams::Fixed(1), ReadStreams::Fixed(8)] {
+            assert_eq!(ReadStreams::from_str(&value.to_string()), Ok(value));
+        }
+    }
+
+    /// Bytes and nanos for a device sustaining `mbps` on one stream.
+    fn probe_of(mbps: u64) -> (u64, u64) {
+        (mbps * 1_000_000, 1_000_000_000)
+    }
+
+    #[test]
+    fn test_the_probe_picks_the_stream_count_each_measured_device_wanted() {
+        // The two devices actually measured, at the rate one stream sustained
+        // on each. gp3 gained 28% from four streams; the instance-store SSD
+        // lost 1.8% from being pushed past one.
+        let (bytes, nanos) = probe_of(358);
+        assert_eq!(streams_for_measured_rate(bytes, nanos), 4, "EBS gp3 at 358 MB/s wants four");
+        let (bytes, nanos) = probe_of(2214);
+        assert_eq!(
+            streams_for_measured_rate(bytes, nanos),
+            1,
+            "a local SSD at 2214 MB/s wants one"
+        );
+    }
+
+    #[test]
+    fn test_the_probe_scales_between_those_two_points() {
+        // "Smarter than 1 or 4" is the point: the count is computed from the
+        // measurement, so storage between the two measured devices gets a
+        // count between the two answers.
+        assert_eq!(streams_for_measured_rate(probe_of(700).0, probe_of(700).1), 2);
+        assert_eq!(streams_for_measured_rate(probe_of(1199).0, probe_of(1199).1), 2);
+        assert_eq!(streams_for_measured_rate(probe_of(1200).0, probe_of(1200).1), 1);
+        assert_eq!(streams_for_measured_rate(probe_of(5000).0, probe_of(5000).1), 1);
+    }
+
+    #[test]
+    fn test_the_probe_is_capped_however_slow_the_device() {
+        // A very slow mount would ask for dozens of streams; past the cap they
+        // are pool work that buys nothing.
+        assert_eq!(streams_for_measured_rate(probe_of(10).0, probe_of(10).1), MAX_STREAMS);
+        assert_eq!(streams_for_measured_rate(1, u64::MAX), MAX_STREAMS);
+    }
+
+    #[test]
+    fn test_the_probe_refuses_to_divide_by_a_degenerate_measurement() {
+        // A zero-length or zero-byte probe would produce an infinity or a NaN,
+        // and a NaN comparison is false, which would silently pin the reader at
+        // whatever it happened to be.
+        assert_eq!(streams_for_measured_rate(0, 1_000), 1);
+        assert_eq!(streams_for_measured_rate(1_000, 0), 1);
+        assert_eq!(streams_for_measured_rate(0, 0), 1);
+    }
+
+    #[test]
+    fn test_the_probe_decides_once_and_then_stops_measuring() {
+        // Deciding repeatedly is what the previous design did, and it ramped
+        // every device to the cap. One decision on a device-rate measurement
+        // has no such failure mode -- but only if it really does stop.
+        let (file, _) = fixture(1024);
+        let handle = File::open(file.path()).expect("open");
+        let mut reader = ScatterReader::new(handle, 0, 1, Some(FetchQueue::new(4)))
+            .expect("reader")
+            .auto_tuned();
+        for _ in 0..AUTO_PROBE_FILLS {
+            reader.probe_fill(FILL_BYTES as u64, 12_000_000);
+        }
+        assert!(!reader.auto, "the probe must disarm itself");
+        assert_eq!(reader.streams, 4, "4 MiB in 12ms is ~350 MB/s, which wants four");
+        let settled = reader.streams;
+        for _ in 0..AUTO_PROBE_FILLS * 4 {
+            reader.probe_fill(FILL_BYTES as u64, 1);
+        }
+        assert_eq!(reader.streams, settled, "a disarmed probe must not revisit its answer");
+    }
+
+    #[test]
+    fn test_readers_sharing_a_queue_share_one_measurement() {
+        // What is being measured is the device, and a merge reads K spill files
+        // at once. Measured on EBS gp3: phase 1 alone saw 335 MB/s and chose
+        // four, while 44 concurrent spill readers each saw 224-229 MB/s of a
+        // device they were contending for and chose six or seven -- which took
+        // the merge from 119.3s to 129.1s. A second reader must adopt, not
+        // re-measure.
+        let (file, _) = fixture(1024);
+        let queue = FetchQueue::new(4);
+        let reader_with = || {
+            ScatterReader::new(
+                File::open(file.path()).expect("open"),
+                0,
+                1,
+                Some(Arc::clone(&queue)),
+            )
+            .expect("reader")
+            .auto_tuned()
+        };
+
+        let mut first = reader_with();
+        for _ in 0..AUTO_PROBE_FILLS {
+            first.probe_fill(FILL_BYTES as u64, 12_000_000);
+        }
+        assert_eq!(first.streams, 4, "the uncontended probe chooses four");
+
+        // The second reader is handed a *slow* measurement, as a contended one
+        // would be. It must ignore it and take the settled answer.
+        let mut second = reader_with();
+        second.probe_fill(FILL_BYTES as u64, 900_000_000);
+        assert_eq!(second.streams, 4, "adopted, not re-measured");
+        assert!(!second.auto, "and disarmed on the spot");
+        assert_eq!(second.probe_fills, 0, "without accumulating a probe of its own");
+    }
+
+    #[test]
+    fn test_an_incomplete_probe_decides_nothing() {
+        // Deciding early would let one slow fill choose the count for the run.
+        let (file, _) = fixture(1024);
+        let handle = File::open(file.path()).expect("open");
+        let mut reader = ScatterReader::new(handle, 0, 1, Some(FetchQueue::new(4)))
+            .expect("reader")
+            .auto_tuned();
+        for _ in 0..AUTO_PROBE_FILLS - 1 {
+            reader.probe_fill(FILL_BYTES as u64, 900_000_000);
+        }
+        assert_eq!(reader.streams, 1, "a probe one fill short must not decide");
+        assert!(reader.auto, "and must still be armed");
     }
 
     #[test]
