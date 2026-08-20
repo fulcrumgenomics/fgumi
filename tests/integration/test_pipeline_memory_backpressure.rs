@@ -73,25 +73,44 @@ const DEPTH: usize = 1;
 /// The compressed fixture must be at least this many `TEST_BUDGET_BYTES` in
 /// size for the read-ahead margin assertions to carry drift headroom.
 ///
-/// The reader's stopping point sits near `budget + overhead` (~1.5 budgets),
-/// and the margin assertions demand one further budget left unread, so anything
-/// below three budgets has no slack for BGZF block-size drift (issue #789). The
-/// precondition in [`stalled_writer_stops_the_reader_within_the_queue_memory_budget`]
-/// enforces this so a future shrink of `FAMILIES` fails loudly here rather than
-/// silently reintroducing a thin margin.
+/// The reader's stopping point sits near `budget + overhead`. The largest
+/// budget any test uses is the read-ahead test's generous arm at
+/// `3 * TEST_BUDGET_BYTES / 2`, and the margin assertions demand one further
+/// budget left unread on top of wherever the reader stops, so anything below
+/// three budgets has no slack for BGZF block-size drift (issue #789). The floor
+/// holds with room to spare at the current `FAMILIES`: the input measures
+/// ~4 budgets and the reader stops by ~1.5, leaving ~2.5 budgets unread on
+/// every arm. [`shared_bam_bytes`] asserts this floor once at fixture
+/// construction so a future shrink of `FAMILIES` fails loudly for *every* test
+/// — not only the one that happens to re-check it — rather than silently
+/// reintroducing a thin margin.
 const MIN_INPUT_HEADROOM_BUDGETS: u64 = 3;
 
 /// The generated BAM input and the header it was built with, materialized once
 /// and shared by every test.
 ///
-/// Building the fixture dominates each test's runtime, and all three want the
+/// Building the fixture dominates each test's runtime, and every test wants the
 /// same bytes, so this amortizes it across the suite. Tests clone the byte
 /// vector when the pipeline needs to own it.
+///
+/// Enforces the [`MIN_INPUT_HEADROOM_BUDGETS`] floor here, at the single point
+/// where the fixture is built, so the guarantee covers every test that reads it
+/// — including the read-ahead test, which uses the largest budget and would
+/// otherwise have no fixture-size guard at all. A future `FAMILIES` shrink that
+/// erodes the read-ahead margin therefore fails loudly and unambiguously.
 fn shared_bam_bytes() -> &'static (Header, Vec<u8>) {
     static FIXTURE: OnceLock<(Header, Vec<u8>)> = OnceLock::new();
     FIXTURE.get_or_init(|| {
         let header = create_minimal_header("chr1", 100_000);
         let bytes = build_bam_bytes(&header, FAMILIES, DEPTH);
+        let input_len = bytes.len() as u64;
+        assert!(
+            input_len >= MIN_INPUT_HEADROOM_BUDGETS * TEST_BUDGET_BYTES,
+            "test fixture ({input_len} bytes) must be at least {MIN_INPUT_HEADROOM_BUDGETS} \
+             budgets ({} bytes) so every read-ahead margin assertion has BGZF block-size drift \
+             headroom (issue #789); raise FAMILIES",
+            MIN_INPUT_HEADROOM_BUDGETS * TEST_BUDGET_BYTES
+        );
         (header, bytes)
     })
 }
@@ -379,17 +398,11 @@ const JOIN_DEADLINE: Duration = Duration::from_secs(60);
 fn stalled_writer_stops_the_reader_within_the_queue_memory_budget() {
     let (header, bam_bytes) = shared_bam_bytes();
     let input_len = bam_bytes.len() as u64;
-    // Not merely "exceeds the budget": the reader stops near `budget + overhead`
-    // and the assertion below requires a further whole budget left unread, so
-    // the fixture needs clear headroom above `read_ahead + TEST_BUDGET_BYTES`.
-    // Enforcing a multi-budget floor here keeps that headroom robust to BGZF
-    // block-size drift and makes a future `FAMILIES` shrink fail loudly (#789).
-    assert!(
-        input_len >= MIN_INPUT_HEADROOM_BUDGETS * TEST_BUDGET_BYTES,
-        "test input ({input_len} bytes) must be at least {MIN_INPUT_HEADROOM_BUDGETS} budgets \
-         ({} bytes) so the read-ahead margin has drift headroom",
-        MIN_INPUT_HEADROOM_BUDGETS * TEST_BUDGET_BYTES
-    );
+    // The fixture's drift headroom — the reader stops near `budget + overhead`
+    // and the assertion below requires a further whole budget left unread — is
+    // enforced once for every test by the `MIN_INPUT_HEADROOM_BUDGETS` floor in
+    // `shared_bam_bytes`, so a `FAMILIES` shrink fails there before reaching here
+    // (#789).
 
     let StalledRun { consumed, released, handle, .. } =
         spawn_stalled_pipeline(header, bam_bytes.clone(), 4, TEST_BUDGET_BYTES, None);
