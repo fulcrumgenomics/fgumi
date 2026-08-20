@@ -104,6 +104,7 @@ pub(crate) mod radix;
 pub(crate) mod read_ahead;
 pub(crate) mod reader;
 pub(crate) mod segmented_buf;
+pub(crate) mod spill_reader;
 pub(crate) mod tmp_dir_alloc;
 pub(crate) mod verify;
 pub(crate) mod worker_pool;

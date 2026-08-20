@@ -2616,8 +2616,9 @@ pub struct RawExternalSorter {
     /// a modest allocation and let `Vec` grow on demand, while explicit limits
     /// pre-allocate the full budget upfront (preserving prior behavior).
     initial_capacity: Option<usize>,
-    /// When true, wrap input in a `PrefetchReader` for async I/O.
-    async_reader: bool,
+    /// Prefetch streams for a seekable input; 1 keeps the single sequential
+    /// reader. See [`crate::parallel_reader`] for why more than one is needed.
+    read_streams: usize,
     /// Which optional template-key lanes to retain (template-coordinate only).
     ///
     /// Defaults to [`KeyTypesSpec::Auto`], which provisions the narrowest key
@@ -2725,7 +2726,7 @@ impl RawExternalSorter {
             max_temp_files: crate::fd_limit::FALLBACK_MAX_TEMP_FILES,
             cell_tag: None,
             initial_capacity: None,
-            async_reader: false,
+            read_streams: 1,
             key_types: KeyTypesSpec::default(),
         }
     }
@@ -2929,13 +2930,15 @@ impl RawExternalSorter {
         self
     }
 
-    /// Enable/disable the async prefetch reader on input.
+    /// Number of prefetch streams to read a seekable input with.
     ///
-    /// When enabled, the input BAM is wrapped in a `PrefetchReader` before the
-    /// BGZF layer, which overlaps block I/O with decompression.
+    /// One keeps today's single sequential reader. More than one spawns that
+    /// many positional-read workers, which is the only way a process can create
+    /// device queue depth without root (`read_ahead_kb`) — see
+    /// [`crate::parallel_reader`].
     #[must_use]
-    pub fn async_reader(mut self, enabled: bool) -> Self {
-        self.async_reader = enabled;
+    pub fn read_streams(mut self, streams: usize) -> Self {
+        self.read_streams = streams.max(1);
         self
     }
 
@@ -3165,7 +3168,7 @@ impl RawExternalSorter {
         );
         let (record_source, header) = {
             let (reader, header) =
-                create_raw_bam_reader_pool_integrated(input, &pool, self.async_reader)?;
+                create_raw_bam_reader_pool_integrated(input, &pool, self.read_streams)?;
             (RecordSource::direct(reader), header)
         };
 
@@ -3243,12 +3246,13 @@ impl RawExternalSorter {
 
         // One worker pool spans both phases, so size it to the wider of the two
         // and cap the active count per phase via `set_active_workers`.
-        let pool = SortWorkerPool::new(
+        let mut pool = SortWorkerPool::new(
             self.phase1_threads().max(self.phase2_threads()),
             self.temp_compression,
             self.output_compression,
             self.spill_codec,
         );
+        pool.read_streams = self.read_streams;
         // Phase 1 runs first; the merge raises this to `phase2_threads()`.
         pool.set_active_workers(self.phase1_threads());
         Ok(Arc::new(pool))
@@ -6523,11 +6527,9 @@ pub(crate) use crate::SortStats as RawSortStats;
 /// Workers in the pool do `ReadInputBlocks` + `DecompressInput`. The main
 /// thread consumes decompressed bytes via `PooledInputStream`.
 ///
-/// When `async_reader` is false, no extra threads are spawned: the pool's
-/// block reader reads directly from the input file. When `async_reader` is
-/// true, the input file is wrapped in a `PrefetchReader`, which spawns one
-/// dedicated OS thread (`fgumi-prefetch`) that reads raw bytes ahead into a
-/// bounded queue so the pool's block reader never blocks on disk I/O.
+/// No extra threads are spawned either way: with one stream the pool's block
+/// reader reads directly from the input file, and with several it offers byte
+/// slices to the pool (see [`crate::spill_reader`]).
 ///
 /// # Flow
 ///
@@ -6545,53 +6547,76 @@ pub(crate) use crate::SortStats as RawSortStats;
 fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
     path: P,
     pool: &Arc<SortWorkerPool>,
-    async_reader: bool,
+    read_streams: usize,
 ) -> Result<(fgumi_raw_bam::RawBamReader<PooledInputStream>, Header)> {
     use crate::worker_pool::phase;
     use std::io;
 
     let path_ref = path.as_ref();
 
-    // Times the reads that refill the buffer below. Only the synchronous paths
-    // are wrapped: `--async-reader` moves the read onto a prefetch thread, so
-    // the reader step no longer pays for it and there is nothing on this thread
-    // to separate from framing. A zero refill row on an async run is that, not a
-    // measurement failure.
+    // Times the reads that refill the buffer below, so that `framing_secs` --
+    // time inside `read_raw_blocks` that was *not* spent fetching -- means what
+    // it says. Both arms report into it: the sequential one through
+    // `TimedReader`, the scattered one by timing its own fills. Leaving the
+    // scattered arm out booked its fill waits as framing and showed 10.9
+    // us/block against a true 0.9.
     let reader_stats = pool.reader_stats();
 
     let opened: Box<dyn io::Read + Send> = if is_stdin_path(path_ref) {
-        if async_reader {
-            // `--async-reader` is about decoupling the read from the block
-            // reader, which stdin needs at least as much as a file does: the
-            // prefetch thread also subsumes the buffering below, reading ahead
-            // in chunks into a bounded queue.
-            log::debug!("async sort reader enabled: spawning fgumi-prefetch thread for stdin");
-            Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::new(io::stdin()))
-        } else {
-            // `io::Stdin` re-acquires a mutex and reads through an 8 KiB buffer
-            // on every call; the pool's block reader wants far bigger gulps than
-            // that, so give the stdin path the same 2 MiB buffer the file path
-            // gets.
-            Box::new(io::BufReader::with_capacity(
-                SORT_INPUT_BUFFER_SIZE,
-                crate::phase1_stats::TimedReader::new(io::stdin(), reader_stats),
-            ))
-        }
+        // `io::Stdin` re-acquires a mutex and reads through an 8 KiB buffer on
+        // every call; the pool's block reader wants far bigger gulps than that,
+        // so give the stdin path the same 2 MiB buffer the file path gets.
+        // Scattered reads are not available here -- a pipe has no offsets.
+        Box::new(io::BufReader::with_capacity(
+            SORT_INPUT_BUFFER_SIZE,
+            crate::phase1_stats::TimedReader::new(io::stdin(), reader_stats),
+        ))
     } else {
         let file = std::fs::File::open(path_ref)
             .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
 
-        // Grow the per-fd readahead window. This is the plain sequential hint
-        // and applies however the bytes are subsequently read; the WILLNEED
-        // hints that `PrefetchReader` issues are a separate, async-only extra.
+        // Grow the per-fd readahead window. Measured worth almost nothing on
+        // its own (359 MB/s against 360 with no hint), but it is free and
+        // applies however the bytes are subsequently read.
         fgumi_bam_io::os_hints::advise_sequential(&file);
 
-        if async_reader {
-            log::debug!(
-                "async sort reader enabled: spawning fgumi-prefetch thread for {}",
-                path_ref.display()
-            );
-            Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file))
+        if read_streams > 1 {
+            // Scattered positional reads, the same mechanism the merge uses on
+            // spill files: slices are offered to the pool so the device sees
+            // real queue depth, which one blocking `read()` cannot produce
+            // however large its buffer. The framer downstream is unchanged --
+            // this still presents a sequential `Read`.
+            //
+            // Only reachable on a real file: stdin and other non-seekable inputs
+            // take the branch above, where positional reads do not exist.
+            match crate::spill_reader::ScatterReader::new(
+                file,
+                0,
+                read_streams,
+                Some(pool.fetch_queue()),
+            )
+            .map(|reader| reader.timed(Arc::clone(&reader_stats)))
+            {
+                Ok(reader) => {
+                    log::debug!(
+                        "scattered sort reader: {read_streams} streams over {}",
+                        path_ref.display()
+                    );
+                    Box::new(reader)
+                }
+                Err(e) => {
+                    // A file whose length we cannot read is one we cannot slice.
+                    // Fall back rather than fail a sort over a prefetch tweak.
+                    log::warn!("scattered sort reader unavailable ({e}); using one stream");
+                    let file = std::fs::File::open(path_ref).with_context(|| {
+                        format!("Failed to reopen input BAM: {}", path_ref.display())
+                    })?;
+                    Box::new(io::BufReader::with_capacity(
+                        SORT_INPUT_BUFFER_SIZE,
+                        crate::phase1_stats::TimedReader::new(file, reader_stats),
+                    ))
+                }
+            }
         } else {
             Box::new(io::BufReader::with_capacity(
                 SORT_INPUT_BUFFER_SIZE,

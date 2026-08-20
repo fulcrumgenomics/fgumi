@@ -386,13 +386,24 @@ pub struct Sort {
     #[arg(long = "write-index", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub write_index: bool,
 
-    /// Enable async userspace prefetch on the input BAM.
+    /// Read the input BAM and the merge's spill files with this many
+    /// concurrent streams.
     ///
-    /// Spawns a dedicated I/O thread that reads raw bytes into a bounded
-    /// queue ahead of the decompression step, so pool workers do not block
-    /// on disk. Prototype flag; defaults to off.
-    #[arg(long = "async-reader", default_value_t = false, hide = true)]
-    pub async_reader: bool,
+    /// One blocking read keeps only about one read-ahead window outstanding at
+    /// the device, which on network-attached storage is far below what it can
+    /// serve -- and no buffer size fixes it, because a bigger single request is
+    /// not more concurrency. On EBS gp3, four streams measured 1177 MB/s
+    /// against 358 MB/s for one, and a whole-genome sort ran 28% faster.
+    ///
+    /// **4 is the measured value for network-attached storage.** The default is
+    /// 1 (today's behaviour) because direct-attached storage has far lower latency
+    /// and may need fewer; that has not been measured yet. The streams are pool
+    /// workers, not new threads, so this never exceeds `--threads`.
+    ///
+    /// Clamped to 16 and to the input's chunk count. Ignored for stdin and
+    /// other non-seekable inputs, where positional reads do not exist.
+    #[arg(long = "read-streams", default_value_t = 1)]
+    pub read_streams: usize,
 
     /// Emit the sort's performance diagnostics.
     ///
@@ -584,7 +595,7 @@ impl Sort {
             .temp_compression(self.temp_compression)
             .spill_codec(self.temp_codec)
             .write_index(self.write_index)
-            .async_reader(self.async_reader)
+            .read_streams(self.read_streams)
             .pg_info(crate::version::VERSION.to_string(), command_line.to_string());
 
         // Each per-phase override is optional and falls back to `--threads`.
@@ -1582,7 +1593,7 @@ mod tests {
             temp_codec: fgumi_sort::SpillCodec::default(),
             max_temp_files: MaxTempFiles::Auto,
             write_index: false,
-            async_reader: false,
+            read_streams: 1,
             sort_stats: false,
         }
     }
