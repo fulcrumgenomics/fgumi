@@ -948,9 +948,21 @@ impl ReorderBufferState {
     }
 
     /// Subtract heap bytes from the tracker (after popping from reorder buffer).
+    ///
+    /// Saturates at zero rather than wrapping. A raw `fetch_sub` past zero wraps
+    /// to `u64::MAX`, and this counter is summed into
+    /// `queue_bytes_in_flight`, which both gates the `Read` step and is evaluated
+    /// with overflow-checked addition in debug/coverage builds — so a single
+    /// transiently-underflowed sub would spuriously slam the admission gate shut
+    /// (release) or panic the pipeline worker (debug). The debit/credit are only
+    /// eventually consistent across the producer and consumer threads, so an
+    /// over-subtraction is possible under interleaving; flooring at zero keeps
+    /// the counter a faithful "bytes still in flight" estimate either way.
     #[inline]
     pub fn sub_heap_bytes(&self, bytes: u64) {
-        self.heap_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        let _ = self.heap_bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.saturating_sub(bytes))
+        });
     }
 
     /// Update the next sequence number (after consumer advances).
@@ -5912,6 +5924,29 @@ mod tests {
         assert_eq!(state.get_heap_bytes(), 150);
         state.sub_heap_bytes(30);
         assert_eq!(state.get_heap_bytes(), 120);
+    }
+
+    /// An over-subtraction must floor at zero, never wrap to `u64::MAX`.
+    ///
+    /// Regression for #810: a raw `fetch_sub` past zero wrapped the counter,
+    /// and because it is summed into the overflow-checked `queue_bytes_in_flight`
+    /// a single transient under-subtraction slammed the `Read` gate shut (release)
+    /// or panicked the pipeline worker with "attempt to add with overflow"
+    /// (debug/coverage).
+    #[test]
+    fn test_reorder_buffer_sub_heap_bytes_saturates_at_zero() {
+        let state = ReorderBufferState::new(0);
+        state.add_heap_bytes(100);
+
+        // Subtract more than is held: the pre-fix raw `fetch_sub` would wrap to
+        // `u64::MAX - 149`.
+        state.sub_heap_bytes(250);
+        assert_eq!(state.get_heap_bytes(), 0, "an over-subtraction must floor at zero");
+
+        // A subsequent credit resumes from zero, and the counter stays a value
+        // that cannot overflow a checked sum.
+        state.add_heap_bytes(50);
+        assert_eq!(state.get_heap_bytes(), 50);
     }
 
     // ========================================================================
