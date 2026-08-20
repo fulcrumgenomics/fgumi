@@ -289,6 +289,7 @@ impl Command for Simplex {
 
         // Process reads using streaming by MI groups
         info!("Processing reads and calling consensus (streaming)...");
+        self.io.log_effective_check_crc_for_fast_path(self.threading.threads.is_some());
 
         // ============================================================
         // --threads N mode: Use 7-step unified pipeline
@@ -557,6 +558,7 @@ impl Simplex {
             &self.scheduler_opts,
             &self.compression,
             &self.queue_memory,
+            &self.io,
             num_threads,
         )?;
 
@@ -857,7 +859,13 @@ mod tests {
     /// Creates a Simplex command with the given input/output paths and default parameters.
     fn create_simplex_with_paths(input: PathBuf, output: PathBuf) -> Simplex {
         Simplex {
-            io: BamIoOptions { input, output, async_reader: false },
+            io: BamIoOptions {
+                input,
+                output,
+                async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
+            },
             rejects_opts: RejectsOptions::default(),
             stats_opts: StatsOptions::default(),
             read_group: ReadGroupOptions::default(),

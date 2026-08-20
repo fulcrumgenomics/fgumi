@@ -72,11 +72,32 @@ pub type RawBamReaderAuto = RawBamReader<BgzfReaderEnum>;
 
 /// Options controlling how [`create_bam_reader_for_pipeline_with_opts`] opens
 /// and wraps its input file.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct PipelineReaderOpts {
     /// If true, wrap inputs in a `PrefetchReader` background thread
     /// so that disk reads happen on a dedicated I/O thread.
     pub async_reader: bool,
+    /// Whether the BGZF decode path should verify each block's CRC32
+    /// checksum against its footer.
+    ///
+    /// This struct only opens the byte stream (or, for
+    /// [`create_bam_reader_with_opts`]/[`create_raw_bam_reader_with_opts`],
+    /// wraps it in noodles' own BGZF reader, which always verifies and has no
+    /// skip knob) — it does not itself decode BGZF blocks, so **this field is
+    /// not consumed today**. The multi-threaded unified pipeline gets its CRC
+    /// policy from `PipelineConfig::verify_crc` (set in `build_pipeline_config`
+    /// in `fgumi_lib`), not from here. This field becomes live once the
+    /// raw-reader path is unified onto fgumi-bgzf (see #800), at which point
+    /// [`create_raw_bam_reader_with_opts`] will honor it directly. It is kept
+    /// now so callers already bundle the setting in one place. Defaults to
+    /// `true` (verify) — the safe, pre-existing behavior.
+    pub verify_crc: bool,
+}
+
+impl Default for PipelineReaderOpts {
+    fn default() -> Self {
+        Self { async_reader: false, verify_crc: true }
+    }
 }
 
 /// Wrap `reader` in a BGZF decoder, multi-threaded when `threads > 1`.
@@ -916,7 +937,7 @@ mod tests {
         }
 
         // Read using async reader opts — exercises the PrefetchReader branch
-        let opts = PipelineReaderOpts { async_reader: true };
+        let opts = PipelineReaderOpts { async_reader: true, ..PipelineReaderOpts::default() };
         let (mut reader, read_header) =
             create_bam_reader_for_pipeline_with_opts(temp_file.path(), opts)?;
         assert_eq!(read_header.reference_sequences().len(), 1);

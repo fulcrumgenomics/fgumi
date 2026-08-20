@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 use crate::bgzf_reader::{
-    BGZF_EOF, BGZF_FOOTER_SIZE, BGZF_HEADER_SIZE, decompress_block_slice_into, read_raw_blocks,
+    BGZF_EOF, BGZF_FOOTER_SIZE, BGZF_HEADER_SIZE, decompress_block_slice_into_opts, read_raw_blocks,
 };
 use crate::bgzf_writer::InlineBgzfCompressor;
 use crate::fastq_parse::FastqRecord;
@@ -864,6 +864,11 @@ pub struct FastqPipelineConfig {
     /// Wrap BGZF FASTQ inputs in a userspace async prefetch reader (opt-in).
     /// Only applies when `inputs_are_bgzf` is true; ignored otherwise.
     pub async_reader: bool,
+    /// Whether the BGZF decode step (Step 2, for `inputs_are_bgzf` inputs)
+    /// verifies each block's CRC32 checksum. Defaults to `true` (verify).
+    /// Ignored when `inputs_are_bgzf` is false (gzip/plain inputs pass
+    /// through without a CRC32 to check).
+    pub verify_crc: bool,
 }
 
 impl FastqPipelineConfig {
@@ -896,6 +901,7 @@ impl FastqPipelineConfig {
             shared_stats: None, // No shared stats by default
             records_per_batch,
             async_reader: false,
+            verify_crc: true,
         }
     }
 
@@ -954,6 +960,13 @@ impl FastqPipelineConfig {
     #[must_use]
     pub fn with_async_reader(mut self, enabled: bool) -> Self {
         self.async_reader = enabled;
+        self
+    }
+
+    /// Set whether the BGZF decode step verifies each block's CRC32 checksum.
+    #[must_use]
+    pub fn with_verify_crc(mut self, verify_crc: bool) -> Self {
+        self.verify_crc = verify_crc;
         self
     }
 
@@ -1123,7 +1136,11 @@ fn estimate_uncompressed_size(raw_data: &[u8]) -> usize {
 ///
 /// The chunk contains multiple BGZF blocks concatenated together.
 /// This function parses each block and decompresses it.
-fn decompress_bgzf_chunk(raw_data: &[u8], decompressor: &mut Decompressor) -> io::Result<Vec<u8>> {
+fn decompress_bgzf_chunk(
+    raw_data: &[u8],
+    decompressor: &mut Decompressor,
+    verify_crc: bool,
+) -> io::Result<Vec<u8>> {
     // Pre-allocate based on BGZF ISIZE fields to avoid reallocations
     let estimated_size = estimate_uncompressed_size(raw_data);
     let mut result = Vec::with_capacity(estimated_size);
@@ -1170,10 +1187,11 @@ fn decompress_bgzf_chunk(raw_data: &[u8], decompressor: &mut Decompressor) -> io
         }
 
         // Decompress directly from slice - no allocation for RawBgzfBlock
-        decompress_block_slice_into(
+        decompress_block_slice_into_opts(
             &raw_data[offset..offset + block_size],
             decompressor,
             &mut result,
+            verify_crc,
         )?;
 
         offset += block_size;
@@ -2558,7 +2576,8 @@ fn fastq_try_step_decompress<R: BufRead + Send, P: Send + MemoryEstimate>(
         chunk
     } else {
         // BGZF: decompress raw blocks
-        match decompress_bgzf_chunk(&chunk.data, &mut worker.decompressor) {
+        match decompress_bgzf_chunk(&chunk.data, &mut worker.decompressor, state.config.verify_crc)
+        {
             Ok(decompressed_data) => PerStreamChunk {
                 stream_idx: chunk.stream_idx,
                 batch_num: chunk.batch_num,
@@ -6642,7 +6661,7 @@ mod tests {
         );
 
         let mut decompressor = Decompressor::new();
-        let err = decompress_bgzf_chunk(&raw, &mut decompressor)
+        let err = decompress_bgzf_chunk(&raw, &mut decompressor, true)
             .expect_err("an undersized BSIZE must be rejected, not skipped");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(

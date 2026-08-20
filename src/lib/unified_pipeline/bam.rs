@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::bgzf_reader::{BGZF_EOF, decompress_block_into, read_raw_blocks};
+use crate::bgzf_reader::{BGZF_EOF, decompress_block_into_opts, read_raw_blocks};
 use crate::bgzf_writer::InlineBgzfCompressor;
 use crate::sam::SamTag;
 use fgumi_bam_io::ProgressTracker;
@@ -2208,9 +2208,12 @@ fn try_step_decompress<G: Send, P: Send + MemoryEstimate>(
 
     // Decompress directly into worker's buffer (no intermediate allocations)
     for block in &raw_batch.blocks {
-        if let Err(e) =
-            decompress_block_into(block, &mut worker.decompressor, &mut worker.decompression_buffer)
-        {
+        if let Err(e) = decompress_block_into_opts(
+            block,
+            &mut worker.decompressor,
+            &mut worker.decompression_buffer,
+            state.config.verify_crc,
+        ) {
             state.set_error(e);
             return false;
         }
@@ -3629,7 +3632,12 @@ where
         buffers.decompressed.reserve(expected_size);
 
         for block in &blocks {
-            decompress_block_into(block, &mut decompressor, &mut buffers.decompressed)?;
+            decompress_block_into_opts(
+                block,
+                &mut decompressor,
+                &mut buffers.decompressed,
+                config.verify_crc,
+            )?;
         }
 
         // Step 3: Find record boundaries

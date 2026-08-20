@@ -435,24 +435,126 @@ pub struct BamIoOptions {
     /// not block on disk. Prototype flag; defaults to off.
     #[arg(long = "async-reader", default_value_t = false, hide = true)]
     pub async_reader: bool,
+
+    /// Verify each BGZF block's CRC32 checksum while decoding the input.
+    ///
+    /// Without either `--check-crc` or `--no-check-crc`, fgumi verifies for
+    /// file input and skips verification for stdin input: a freshly-piped
+    /// aligner stream (e.g. `bwa-mem3 ... | fgumi ... -i /dev/stdin`) is
+    /// trusted, since any corruption there is a bug in the upstream process
+    /// rather than data at rest, while a file may have been archived,
+    /// transferred, or copied since it was written, where a flipped bit is
+    /// exactly what CRC32 exists to catch. Pass `--check-crc` to force
+    /// verification on (e.g. for stdin input you don't trust). Mutually
+    /// exclusive with `--no-check-crc`. Not every command honors this flag:
+    /// `downsample` never does; `clip`/`codec`/`duplex`/`simplex`/`correct`/`group`
+    /// only do when `--threads N` is given (their default, no-`--threads`
+    /// mode falls back to a reader that always verifies). Every run logs a
+    /// `CRC verify:` line at startup stating what actually happened.
+    #[arg(long = "check-crc", default_value_t = false, conflicts_with = "no_check_crc")]
+    pub check_crc: bool,
+
+    /// Skip CRC32 verification while decoding the input.
+    ///
+    /// Trades the CRC32 integrity check for faster decode. See `--check-crc`
+    /// for the default policy this overrides and which commands/modes this
+    /// has no effect on. Mutually exclusive with `--check-crc`.
+    #[arg(long = "no-check-crc", default_value_t = false, conflicts_with = "check_crc")]
+    pub no_check_crc: bool,
 }
 
 impl Default for BamIoOptions {
     fn default() -> Self {
-        Self { input: PathBuf::new(), output: PathBuf::new(), async_reader: false }
+        Self {
+            input: PathBuf::new(),
+            output: PathBuf::new(),
+            async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
+        }
     }
 }
 
 impl BamIoOptions {
     /// Construct a `BamIoOptions` from input and output paths. Leaves
-    /// opt-in tuning flags (e.g. `async_reader`) at their default values.
+    /// opt-in tuning flags (e.g. `async_reader`) and the CRC-verification
+    /// override flags at their default (unset) values, so
+    /// [`effective_check_crc`](Self::effective_check_crc) falls back to the
+    /// file-vs-stdin policy.
     pub fn new(input: impl Into<PathBuf>, output: impl Into<PathBuf>) -> Self {
-        Self { input: input.into(), output: output.into(), async_reader: false }
+        Self {
+            input: input.into(),
+            output: output.into(),
+            async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
+        }
     }
 
-    /// Build [`fgumi_bam_io::PipelineReaderOpts`] from the async-reader flag.
+    /// Resolve the effective CRC-verification policy from `--check-crc` /
+    /// `--no-check-crc` and the input's stdin-vs-file status.
+    ///
+    /// Policy (matches dupblaster): `--check-crc` forces verification on;
+    /// `--no-check-crc` forces it off; with neither given, verification
+    /// defaults on for file input and off for stdin, since a fresh
+    /// aligner-piped stream is trusted while a file may have been archived
+    /// or transferred since it was written. `check_crc` and `no_check_crc`
+    /// are mutually exclusive at the CLI layer (`conflicts_with`), so at most
+    /// one is ever true.
+    #[must_use]
+    pub fn effective_check_crc(&self) -> bool {
+        if self.check_crc {
+            true
+        } else if self.no_check_crc {
+            false
+        } else {
+            !fgumi_bam_io::is_stdin_path(&self.input)
+        }
+    }
+
+    /// Log the effective CRC-verification setting at info level, once, at
+    /// run start. Makes the `effective_check_crc` policy — a default-behavior
+    /// change from fgumi's previous always-verify default — visible in every
+    /// run's log rather than a silent decision.
+    pub fn log_effective_check_crc(&self) {
+        let effective = self.effective_check_crc();
+        let reason = if self.check_crc {
+            " (--check-crc)"
+        } else if self.no_check_crc {
+            " (--no-check-crc)"
+        } else if fgumi_bam_io::is_stdin_path(&self.input) {
+            " (trusted stdin)"
+        } else {
+            ""
+        };
+        log::info!("CRC verify: {}{reason}", if effective { "on" } else { "off" });
+    }
+
+    /// Log the CRC-verification setting for a command whose single-threaded
+    /// fast path bypasses the CRC-skip-capable fgumi-bgzf decoder in favor of
+    /// noodles-bgzf's own BGZF reader (which always verifies and has no
+    /// public knob to disable it — see the fgumi-sort-style follow-up note in
+    /// the task-2b report). `pipeline_mode` is `true` when the wireable
+    /// 7-step pipeline will run instead of the fast path, in which case this
+    /// defers to [`log_effective_check_crc`](Self::log_effective_check_crc).
+    pub fn log_effective_check_crc_for_fast_path(&self, pipeline_mode: bool) {
+        if pipeline_mode {
+            self.log_effective_check_crc();
+        } else {
+            log::info!(
+                "CRC verify: on (single-threaded fast path always verifies; \
+                 --check-crc/--no-check-crc apply only with --threads)"
+            );
+        }
+    }
+
+    /// Build [`fgumi_bam_io::PipelineReaderOpts`] from the async-reader flag
+    /// and the [`effective_check_crc`](Self::effective_check_crc) policy.
     pub fn pipeline_reader_opts(&self) -> fgumi_bam_io::PipelineReaderOpts {
-        fgumi_bam_io::PipelineReaderOpts { async_reader: self.async_reader }
+        fgumi_bam_io::PipelineReaderOpts {
+            async_reader: self.async_reader,
+            verify_crc: self.effective_check_crc(),
+        }
     }
 
     /// Validates that the input file exists (skipped for stdin paths).
@@ -1464,7 +1566,14 @@ pub use crate::validation::parse_memory_size;
 ///
 /// This consolidates the pipeline configuration boilerplate that is repeated
 /// across all multi-threaded commands: auto-tuning, scheduler strategy,
-/// stats collection, deadlock settings, and queue memory limits.
+/// stats collection, deadlock settings, queue memory limits, and the
+/// `--check-crc`/`--no-check-crc` CRC-verification policy (`io`).
+/// Centralizing `verify_crc` here (rather than each command setting
+/// `config.pipeline.verify_crc` individually after calling this) means every
+/// pipeline-backed command is guaranteed to populate it from
+/// [`BamIoOptions::effective_check_crc`] — a command that builds a
+/// `PipelineConfig` without going through here can't silently leave
+/// `verify_crc` at its default and log a setting it doesn't actually apply.
 ///
 /// After calling this, commands can further customize the returned config
 /// (e.g. setting `group_key_config` for raw-byte mode).
@@ -1472,6 +1581,7 @@ pub fn build_pipeline_config(
     scheduler_opts: &SchedulerOptions,
     compression: &CompressionOptions,
     queue_memory: &QueueMemoryOptions,
+    io: &BamIoOptions,
     num_threads: usize,
 ) -> anyhow::Result<BamPipelineConfig> {
     let mut config = BamPipelineConfig::auto_tuned(num_threads, compression.compression_level);
@@ -1481,6 +1591,7 @@ pub fn build_pipeline_config(
     }
     config.pipeline.deadlock_timeout_secs = scheduler_opts.deadlock_timeout_secs();
     config.pipeline.deadlock_recover_enabled = scheduler_opts.deadlock_recover_enabled();
+    config.pipeline.verify_crc = io.effective_check_crc();
 
     let queue_memory_limit_bytes = queue_memory.calculate_memory_limit(num_threads)?;
     config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
@@ -1532,6 +1643,31 @@ pub fn validate_index_threshold(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `effective_check_crc` truth table (dupblaster policy): an explicit flag
+    /// always wins; with neither flag given, the policy falls back to
+    /// file-vs-stdin (verify for files, skip for stdin).
+    #[rstest::rstest]
+    #[case::check_crc_flag_forces_on_even_for_stdin(true, false, "-", true)]
+    #[case::no_check_crc_flag_forces_off_even_for_a_file(false, true, "input.bam", false)]
+    #[case::neither_flag_file_input_defaults_on(false, false, "input.bam", true)]
+    #[case::neither_flag_stdin_defaults_off(false, false, "-", false)]
+    #[case::neither_flag_dev_stdin_defaults_off(false, false, "/dev/stdin", false)]
+    fn effective_check_crc_truth_table(
+        #[case] check_crc: bool,
+        #[case] no_check_crc: bool,
+        #[case] input: &str,
+        #[case] expected: bool,
+    ) {
+        let io = BamIoOptions {
+            input: PathBuf::from(input),
+            output: PathBuf::from("output.bam"),
+            async_reader: false,
+            check_crc,
+            no_check_crc,
+        };
+        assert_eq!(io.effective_check_crc(), expected);
+    }
 
     /// `reject_colliding_outputs` compares destinations, not the strings naming
     /// them: `out.bam` and `./out.bam` are one file under two names, and two

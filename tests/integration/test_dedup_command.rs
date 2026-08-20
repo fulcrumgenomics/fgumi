@@ -778,3 +778,142 @@ fn test_dedup_accepts_index_threshold_never() {
     let duplicates = never.iter().filter(|(_, flags, _)| flags & flags::DUPLICATE != 0).count();
     assert_eq!(duplicates, 4, "two of the three pairs must be marked duplicate: {never:?}");
 }
+
+/// Corrupt the CRC32 footer of the LAST non-EOF BGZF block in `path`, in place.
+///
+/// BAM writers flush the compressor after the header, so with enough alignment
+/// records the file spans multiple BGZF blocks and the last one holds only
+/// record data. Corrupting the *first* block instead would risk landing inside
+/// the header's block: the single-threaded raw reader (`FgumiBgzfReader`) applies
+/// `verify_crc` uniformly to every block, so a corrupted block 0 fails while the
+/// reader is being constructed -- before the intended read/count assertion can
+/// run, which would defeat the point of this test.
+fn corrupt_last_block_crc(path: &Path) {
+    let mut bytes = fs::read(path).expect("read bam for corruption");
+    let mut cursor: &[u8] = &bytes;
+    let blocks = fgumi_lib::bgzf_reader::read_raw_blocks(&mut cursor, 10_000)
+        .expect("read bgzf blocks from test bam");
+    assert!(
+        blocks.len() >= 2,
+        "test input must span at least 2 BGZF blocks so the corrupted block isn't also the \
+         header's block; got {} -- generate more records",
+        blocks.len()
+    );
+    let offset: usize =
+        blocks[..blocks.len() - 1].iter().map(fgumi_lib::bgzf_reader::RawBgzfBlock::len).sum();
+    let last = blocks.last().expect("checked len >= 2 above");
+    // `read_raw_blocks` drops every BGZF EOF marker, so summing the returned
+    // (real) block lengths yields the last block's on-disk offset only when no
+    // marker sits *between* real blocks. Guard that: everything past the last
+    // framed block must be whole trailing EOF markers (a writer may emit more
+    // than one). An intermediate marker would leave real data here instead and
+    // shift `crc_off` onto an unrelated byte, which the `>= 2` guard above cannot
+    // detect.
+    let eof = &fgumi_lib::bgzf_reader::BGZF_EOF;
+    let tail = &bytes[offset + last.len()..];
+    assert!(
+        tail.len().is_multiple_of(eof.len())
+            && tail.chunks_exact(eof.len()).all(|chunk| chunk == &eof[..]),
+        "bytes after the last framed block must be only trailing BGZF EOF markers; \
+         an intermediate marker would invalidate the CRC offset"
+    );
+    let crc_off = offset + last.len() - fgumi_lib::bgzf_reader::BGZF_FOOTER_SIZE;
+    bytes[crc_off] ^= 0x01;
+    fs::write(path, bytes).expect("write corrupted bam");
+}
+
+/// A file input with a corrupted BGZF CRC32 must fail dedup by default:
+/// `--check-crc`/`--no-check-crc` are unset, and the dupblaster policy
+/// verifies for file input. Also confirms the failure is the CRC32 check
+/// (not, say, a coincidental header-parse failure from the corruption).
+#[test]
+fn test_dedup_rejects_corrupted_crc_on_file_input_by_default() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    // Enough duplicate pairs to span multiple BGZF blocks (see
+    // `corrupt_last_block_crc`).
+    create_sorted_bam(&input_bam, create_duplicate_group("dup", "ACGTACGT", 400, 100));
+    corrupt_last_block_crc(&input_bam);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+    ])
+    .expect("failed to parse dedup args");
+
+    let err = cmd
+        .execute("fgumi dedup")
+        .expect_err("default (verify-on for file input) must reject a corrupted BGZF CRC32");
+    let message = format!("{err:#}");
+    assert!(message.to_uppercase().contains("CRC32"), "error should mention CRC32: {message}");
+}
+
+/// `--no-check-crc` on a file input must accept the same corrupted BGZF CRC32
+/// that the default (verify-on) run above rejects.
+#[test]
+fn test_dedup_no_check_crc_accepts_corrupted_crc_on_file_input() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let clean_bam = temp_dir.path().join("clean.bam");
+    let clean_output = temp_dir.path().join("clean_output.bam");
+
+    create_sorted_bam(&input_bam, create_duplicate_group("dup", "ACGTACGT", 400, 100));
+    // Keep a pristine copy before corrupting the CRC32, so we can dedup both and
+    // compare the decoded output record-for-record.
+    fs::copy(&input_bam, &clean_bam).expect("copy pristine input");
+    corrupt_last_block_crc(&input_bam);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--no-check-crc",
+    ])
+    .expect("failed to parse dedup args");
+
+    cmd.execute("fgumi dedup")
+        .expect("--no-check-crc must accept a corrupted BGZF CRC32 and still complete");
+    assert!(output_bam.exists(), "output BAM not created");
+
+    // The CRC32 footer is metadata: skipping its check must not alter a single
+    // decoded byte, so the corrupted run must reproduce the clean run exactly.
+    // A record-identity oracle catches dropped, duplicated, or reordered records
+    // that a bare count of 800 would miss.
+    MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        clean_bam.to_str().unwrap(),
+        "--output",
+        clean_output.to_str().unwrap(),
+        "--strategy",
+        "identity",
+    ])
+    .expect("failed to parse dedup args")
+    .execute("fgumi dedup")
+    .expect("clean input must dedup");
+
+    let read_records = |path: &Path| {
+        let mut reader = bam::io::Reader::new(fs::File::open(path).unwrap());
+        let header = reader.read_header().unwrap();
+        reader
+            .record_bufs(&header)
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("read deduped records")
+    };
+    let actual = read_records(&output_bam);
+    let expected = read_records(&clean_output);
+    assert_eq!(actual.len(), 800, "all records should be in output (marked, not removed)");
+    assert_eq!(actual, expected, "--no-check-crc changed the decoded records");
+}

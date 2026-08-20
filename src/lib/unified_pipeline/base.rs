@@ -88,7 +88,7 @@ pub use fgumi_bam_io::{ProgressTracker, RawBamWriter, ReorderBuffer};
 
 use super::deadlock::{DeadlockAction, DeadlockState, QueueSnapshot, check_deadlock_and_restore};
 
-use crate::bgzf_reader::{RawBgzfBlock, decompress_block_into, read_raw_blocks};
+use crate::bgzf_reader::{RawBgzfBlock, decompress_block_into_opts, read_raw_blocks};
 use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
 use fgumi_raw_bam::RawRecord;
@@ -1190,15 +1190,28 @@ pub struct BgzfWorkerState {
     pub decompressor: libdeflater::Decompressor,
     /// Compressor for output blocks.
     pub compressor: InlineBgzfCompressor,
+    /// Whether [`decompress_batch`](Self::decompress_batch) verifies each
+    /// block's CRC32 checksum.
+    pub verify_crc: bool,
 }
 
 impl BgzfWorkerState {
-    /// Create new worker state with the given compression level.
+    /// Create new worker state with the given compression level. CRC32
+    /// verification defaults to on; see [`Self::new_with_verify_crc`] to
+    /// override.
     #[must_use]
     pub fn new(compression_level: u32) -> Self {
+        Self::new_with_verify_crc(compression_level, true)
+    }
+
+    /// Create new worker state with the given compression level and CRC32
+    /// verification setting.
+    #[must_use]
+    pub fn new_with_verify_crc(compression_level: u32, verify_crc: bool) -> Self {
         Self {
             decompressor: libdeflater::Decompressor::new(),
             compressor: InlineBgzfCompressor::new(compression_level),
+            verify_crc,
         }
     }
 
@@ -1214,7 +1227,12 @@ impl BgzfWorkerState {
         let mut result = Vec::with_capacity(total_size);
 
         for block in &batch.blocks {
-            decompress_block_into(block, &mut self.decompressor, &mut result)?;
+            decompress_block_into_opts(
+                block,
+                &mut self.decompressor,
+                &mut result,
+                self.verify_crc,
+            )?;
         }
 
         Ok(result)
@@ -2783,6 +2801,7 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipelineState
 
 /// Configuration for the BAM pipeline.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PipelineConfig {
     /// Number of threads in the pool.
     pub num_threads: usize,
@@ -2858,6 +2877,13 @@ pub struct PipelineConfig {
     /// Shared statistics instance for external memory monitoring.
     /// When provided, the pipeline will use this instead of creating its own.
     pub shared_stats: Option<Arc<PipelineStats>>,
+    /// Whether the BGZF decode step verifies each block's CRC32 checksum.
+    ///
+    /// Defaults to `true` (verify). Commands set this from
+    /// `BamIoOptions::effective_check_crc` (via
+    /// `BamIoOptions::pipeline_reader_opts().verify_crc`), which defaults to
+    /// verifying for file input and skipping for stdin input.
+    pub verify_crc: bool,
 }
 
 impl PipelineConfig {
@@ -2880,6 +2906,7 @@ impl PipelineConfig {
             deadlock_timeout_secs: 10,       // Default 10 second timeout
             deadlock_recover_enabled: false, // Detection only by default
             shared_stats: None,              // No shared stats by default
+            verify_crc: true,                // Verify by default (safe baseline)
         }
     }
 
@@ -2887,6 +2914,13 @@ impl PipelineConfig {
     #[must_use]
     pub fn with_compression_level(mut self, level: u32) -> Self {
         self.compression_level = level;
+        self
+    }
+
+    /// Set whether the BGZF decode step verifies each block's CRC32 checksum.
+    #[must_use]
+    pub fn with_verify_crc(mut self, verify_crc: bool) -> Self {
+        self.verify_crc = verify_crc;
         self
     }
 
@@ -2973,6 +3007,7 @@ impl PipelineConfig {
             deadlock_timeout_secs: 10,       // Default 10 second timeout
             deadlock_recover_enabled: false, // Detection only by default
             shared_stats: None,              // No shared stats by default
+            verify_crc: true,                // Verify by default (safe baseline)
         }
     }
 

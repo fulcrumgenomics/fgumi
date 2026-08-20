@@ -18,6 +18,7 @@ pub use header::{
 };
 pub use reader::{
     BGZF_EOF, BGZF_FOOTER_SIZE, RawBgzfBlock, decompress_block, decompress_block_into,
-    decompress_block_slice_into, read_raw_blocks,
+    decompress_block_into_opts, decompress_block_slice_into, decompress_block_slice_into_opts,
+    read_raw_blocks,
 };
 pub use writer::{BGZF_MAX_BLOCK_SIZE, CompressedBlock, InlineBgzfCompressor};
