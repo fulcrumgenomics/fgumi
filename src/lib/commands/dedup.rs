@@ -140,10 +140,15 @@ impl DedupCounts {
 /// reporting a template-level rather than read-pair-level rate. That is why
 /// `estimated_library_size` is fed `total_templates`/`unique_templates` as its
 /// `n_pairs`/`n_unique` inputs.
-fn to_deduplication_metrics(library: String, counts: &DedupCounts) -> DeduplicationMetrics {
+fn to_deduplication_metrics(
+    sample: String,
+    library: String,
+    counts: &DedupCounts,
+) -> DeduplicationMetrics {
     use TemplateFilterReason as Reason;
     let filter = &counts.filter_counts;
     DeduplicationMetrics::from_counts(DeduplicationCounts {
+        sample,
         library,
         filtered_templates: filter.total_rejected_templates(),
         filtered_malformed_record: filter.rejected_templates(Reason::MalformedRecord),
@@ -179,6 +184,26 @@ fn library_display_name(idx: u16, library_index: &LibraryIndex) -> String {
     } else {
         library_index.library_name(idx).to_string()
     }
+}
+
+/// Resolves the `sample` column value for the `--metrics` output: the
+/// `--sample` override when given, otherwise the comma-joined unique `@RG SM:`
+/// values from the header (empty string when the header declares none).
+fn resolve_sample(header: &Header, override_sample: Option<&str>) -> String {
+    use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+    if let Some(s) = override_sample {
+        return s.to_string();
+    }
+    let mut samples: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (_id, rg) in header.read_groups() {
+        if let Some(sm) = rg.other_fields().get(&rg_tag::SAMPLE) {
+            let s = sm.to_string();
+            if !s.is_empty() {
+                samples.insert(s);
+            }
+        }
+    }
+    samples.into_iter().collect::<Vec<_>>().join(",")
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -229,7 +254,10 @@ struct DuplicationLadderRecorder {
     /// groups are processed, plus the final per-library rows appended by
     /// [`Self::finish`]). Sorted into deterministic (library, `templates_seen`)
     /// order only at write time.
-    rows: Vec<(u16, u64, u64)>,
+    /// `(library_idx, templates_seen, duplicate_templates, window_templates,
+    /// window_duplicate_templates)`. The two `window_*` values cover only the
+    /// templates added since the previous snapshot for that library.
+    rows: Vec<(u16, u64, u64, u64, u64)>,
 }
 
 /// Running cumulative state for one library's saturation ladder.
@@ -243,8 +271,12 @@ struct LadderLibraryState {
     next_threshold: u64,
     /// `templates_seen` at the last emitted row, used by [`Self::finish`] (via
     /// [`DuplicationLadderRecorder::finish`]) to avoid a duplicate final row
-    /// when the true total already landed exactly on an interval crossing.
+    /// when the true total already landed exactly on an interval crossing, and
+    /// to size each snapshot's window (`templates_seen - last_emitted_at`).
     last_emitted_at: u64,
+    /// `duplicate_templates` at the last emitted row, so a snapshot's window
+    /// duplicate count is `duplicate_templates - last_emitted_duplicates`.
+    last_emitted_duplicates: u64,
 }
 
 impl DuplicationLadderRecorder {
@@ -276,6 +308,7 @@ impl DuplicationLadderRecorder {
             duplicate_templates: 0,
             next_threshold: interval,
             last_emitted_at: 0,
+            last_emitted_duplicates: 0,
         });
         state.templates_seen += group_counts.total_templates;
         state.duplicate_templates += group_counts.duplicate_templates;
@@ -287,8 +320,17 @@ impl DuplicationLadderRecorder {
         // `+= interval` step, so the next crossing check is correct instead
         // of re-firing on the very next call.
         if state.templates_seen >= state.next_threshold {
-            self.rows.push((library_idx, state.templates_seen, state.duplicate_templates));
+            let window_templates = state.templates_seen - state.last_emitted_at;
+            let window_duplicates = state.duplicate_templates - state.last_emitted_duplicates;
+            self.rows.push((
+                library_idx,
+                state.templates_seen,
+                state.duplicate_templates,
+                window_templates,
+                window_duplicates,
+            ));
             state.last_emitted_at = state.templates_seen;
+            state.last_emitted_duplicates = state.duplicate_templates;
             state.next_threshold =
                 state.templates_seen - (state.templates_seen % interval) + interval;
         }
@@ -299,7 +341,13 @@ impl DuplicationLadderRecorder {
     fn finish(&mut self) {
         for (&library_idx, state) in &self.per_library {
             if state.templates_seen > state.last_emitted_at {
-                self.rows.push((library_idx, state.templates_seen, state.duplicate_templates));
+                self.rows.push((
+                    library_idx,
+                    state.templates_seen,
+                    state.duplicate_templates,
+                    state.templates_seen - state.last_emitted_at,
+                    state.duplicate_templates - state.last_emitted_duplicates,
+                ));
             }
         }
     }
@@ -1065,6 +1113,12 @@ pub struct MarkDuplicates {
     #[arg(short = 'm', long = "metrics")]
     pub metrics: Option<PathBuf>,
 
+    /// Sample name written to the `sample` column of the `--metrics` output.
+    /// Defaults to the comma-joined unique `@RG SM:` values from the input
+    /// header (empty when none are present).
+    #[arg(long = "sample")]
+    pub sample: Option<String>,
+
     /// Path to write family size histogram
     #[arg(short = 'H', long = "family-size-histogram")]
     pub family_size_histogram: Option<PathBuf>,
@@ -1278,6 +1332,9 @@ impl Command for MarkDuplicates {
         // the metrics writer can still map `library_idx -> name` after the
         // pipeline consumes the original.
         let library_index_for_metrics = library_index.clone();
+        // Resolve the metrics `sample` value now, while `header` is still
+        // available — the pipeline consumes `header` by value below.
+        let sample_for_metrics = resolve_sample(&header, self.sample.as_deref());
         // Cache the UMI tag's value position on each DecodedRecord so the
         // Process step's UMI-assignment pass can slice the value without
         // re-scanning aux data (issue #334). In `--no-umi` mode the
@@ -1454,6 +1511,7 @@ impl Command for MarkDuplicates {
                 &final_counts_by_library,
                 &final_counts,
                 &library_index_for_metrics,
+                &sample_for_metrics,
                 metrics_path,
             )?;
         }
@@ -1546,6 +1604,7 @@ fn write_dedup_metrics(
     per_library: &AHashMap<u16, DedupCounts>,
     total: &DedupCounts,
     library_index: &LibraryIndex,
+    sample: &str,
     path: &PathBuf,
 ) -> Result<()> {
     let mut ordered: Vec<(u16, &DedupCounts)> =
@@ -1561,11 +1620,16 @@ fn write_dedup_metrics(
     let mut rows: Vec<DeduplicationMetrics> = ordered
         .into_iter()
         .map(|(idx, counts)| {
-            to_deduplication_metrics(library_display_name(idx, library_index), counts)
+            to_deduplication_metrics(
+                sample.to_string(),
+                library_display_name(idx, library_index),
+                counts,
+            )
         })
         .collect();
 
-    let mut total_row = to_deduplication_metrics("All Reads".to_string(), total);
+    let mut total_row =
+        to_deduplication_metrics(sample.to_string(), "All Reads".to_string(), total);
     if per_library.len() > 1 {
         total_row.estimated_library_size = None;
     }
@@ -1595,11 +1659,13 @@ fn write_duplication_ladder(
     let mut rows: Vec<DuplicationLadderMetrics> = recorder
         .rows
         .iter()
-        .map(|&(idx, templates_seen, duplicate_templates)| {
+        .map(|&(idx, templates_seen, duplicate_templates, window_templates, window_duplicates)| {
             DuplicationLadderMetrics::new(
                 library_display_name(idx, library_index),
                 templates_seen,
                 duplicate_templates,
+                window_templates,
+                window_duplicates,
             )
         })
         .collect();
@@ -2912,7 +2978,7 @@ mod tests {
             passthrough_templates: 3,
             filter_counts,
         };
-        let output = to_deduplication_metrics("lib1".to_string(), &counts);
+        let output = to_deduplication_metrics("smpl".to_string(), "lib1".to_string(), &counts);
 
         assert_eq!(output.library, "lib1");
         assert_eq!(output.filtered_malformed_record, 1);
@@ -2968,7 +3034,7 @@ mod tests {
             filter_counts,
             ..DedupCounts::default()
         };
-        let output = to_deduplication_metrics("lib1".to_string(), &counts);
+        let output = to_deduplication_metrics("smpl".to_string(), "lib1".to_string(), &counts);
 
         assert_eq!(
             output.filtered_templates + output.total_templates,
@@ -2994,7 +3060,7 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("dedup.metrics.txt");
-        write_dedup_metrics(&per_library, &counts, &library_index, &path)?;
+        write_dedup_metrics(&per_library, &counts, &library_index, "test-sample", &path)?;
 
         let text = std::fs::read_to_string(&path)?;
         let header: Vec<&str> = text.lines().next().expect("header").split('\t').collect();

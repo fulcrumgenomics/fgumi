@@ -246,6 +246,19 @@ fn test_dedup_command_with_metrics() {
 /// Build a template-coordinate-sorted SAM header with two `@RG` lines that have
 /// distinct `LB` values ("libA"/"libB"), for the per-library metrics test below.
 fn create_multi_library_header(ref_name: &str, ref_len: usize) -> noodles::sam::Header {
+    // Both read groups share one sample, so the resolved `sample` column is a
+    // single value; the distinct-sample ordering is exercised separately.
+    create_multi_library_header_with_samples(ref_name, ref_len, "sampleX", "sampleX")
+}
+
+/// Like [`create_multi_library_header`], but lets each read group declare its
+/// own `@RG SM:` value so a test can pin how distinct samples resolve.
+fn create_multi_library_header_with_samples(
+    ref_name: &str,
+    ref_len: usize,
+    sample_rg1: &str,
+    sample_rg2: &str,
+) -> noodles::sam::Header {
     use bstr::BString;
     use noodles::sam::header::record::value::Map;
     use noodles::sam::header::record::value::map::Map as HeaderRecordMap;
@@ -271,10 +284,12 @@ fn create_multi_library_header(ref_name: &str, ref_len: usize) -> noodles::sam::
 
     let rg_a = Map::<ReadGroup>::builder()
         .insert(rg_tag::LIBRARY, String::from("libA"))
+        .insert(rg_tag::SAMPLE, String::from(sample_rg1))
         .build()
         .expect("building read group RG1 should succeed");
     let rg_b = Map::<ReadGroup>::builder()
         .insert(rg_tag::LIBRARY, String::from("libB"))
+        .insert(rg_tag::SAMPLE, String::from(sample_rg2))
         .build()
         .expect("building read group RG2 should succeed");
 
@@ -354,6 +369,114 @@ fn read_dedup_metrics_rows(path: &Path) -> Vec<std::collections::HashMap<String,
         .collect()
 }
 
+/// Validate one library's `--duplication-ladder` rows and return their count.
+///
+/// Checks: `templates_seen` matches the derived interval-crossing sequence
+/// exactly (which also pins the snapshot-row count) and is strictly increasing;
+/// cumulative and per-window `duplicate_fraction` both in `[0, 1]`; each
+/// `window_templates` equals the increment over the previous snapshot and the
+/// windows sum to the true per-library total; the final snapshot lands at that
+/// total with a cumulative fraction matching the metrics file's
+/// `duplicate_rate`.
+/// Assert `row[field]` parses to the exact fraction `num/den` (within a small
+/// float tolerance), so a pinned expected table catches wrong saturation values,
+/// not merely out-of-range ones.
+fn assert_fraction_eq(
+    row: &std::collections::HashMap<String, String>,
+    field: &str,
+    (num, den): (u64, u64),
+    label: &str,
+) {
+    let actual: f64 = row[field].parse().unwrap_or_else(|_| panic!("{field} is f64"));
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "numerator and denominator are small test constants (< 100)"
+    )]
+    let expected = num as f64 / den as f64;
+    assert!(
+        (actual - expected).abs() < 1e-9,
+        "{label} {field} ({actual}) must equal {num}/{den} ({expected}): {row:?}"
+    );
+}
+
+#[expect(clippy::type_complexity, reason = "an inline pinned table of expected rows")]
+fn assert_ladder_library_ok(
+    ladder_rows: &[std::collections::HashMap<String, String>],
+    library: &str,
+    expected_rows: &[(u64, (u64, u64), (u64, u64))],
+    library_metrics: &std::collections::HashMap<String, String>,
+) -> usize {
+    let rows: Vec<_> = ladder_rows.iter().filter(|r| r["library"] == library).collect();
+
+    // Pin every row's snapshot exactly, in file order (not merely by count), so a
+    // regression that emits the right number of rows at the wrong interval
+    // crossings — or with the wrong cumulative/marginal saturation values — is
+    // caught.
+    assert_eq!(
+        rows.len(),
+        expected_rows.len(),
+        "{library}: expected {} ladder rows: {rows:?}",
+        expected_rows.len()
+    );
+
+    let mut previous_seen = 0u64;
+    let mut window_sum = 0u64;
+    for (row, &(expected_seen, cumulative, window)) in rows.iter().zip(expected_rows) {
+        let templates_seen: u64 = row["templates_seen"].parse().expect("templates_seen is u64");
+        assert_eq!(
+            templates_seen, expected_seen,
+            "{library}: snapshot must land on the derived interval crossing: {row:?}"
+        );
+        assert!(
+            templates_seen > previous_seen,
+            "{library}: templates_seen must be strictly increasing: {rows:?}"
+        );
+
+        // Cumulative duplicate_fraction, pinned exactly (not merely in [0, 1]).
+        assert_fraction_eq(
+            row,
+            "duplicate_fraction",
+            cumulative,
+            &format!("{library}: cumulative"),
+        );
+
+        // Marginal (window) columns: this window's depth is the increment over
+        // the previous snapshot, and its fraction is pinned exactly.
+        let window_templates: u64 =
+            row["window_templates"].parse().expect("window_templates is u64");
+        assert_eq!(
+            window_templates,
+            templates_seen - previous_seen,
+            "{library}: window_templates must equal the increment since the last snapshot: {row:?}"
+        );
+        assert_fraction_eq(row, "window_duplicate_fraction", window, &format!("{library}: window"));
+        window_sum += window_templates;
+        previous_seen = templates_seen;
+    }
+
+    let last_row = rows.last().unwrap_or_else(|| panic!("{library}: no ladder rows emitted"));
+    assert_eq!(
+        last_row["templates_seen"], library_metrics["total_templates"],
+        "{library}: final ladder snapshot must land at the true per-library total: {last_row:?}"
+    );
+    // The per-window depths partition the cumulative total exactly.
+    assert_eq!(
+        window_sum.to_string(),
+        library_metrics["total_templates"],
+        "{library}: window_templates must sum to the per-library total"
+    );
+    let expected_fraction: f64 =
+        library_metrics["duplicate_rate"].parse().expect("duplicate_rate is f64");
+    let actual_fraction: f64 =
+        last_row["duplicate_fraction"].parse().expect("duplicate_fraction is f64");
+    assert!(
+        (actual_fraction - expected_fraction).abs() < 1e-9,
+        "{library}: final duplicate_fraction ({actual_fraction}) must match the metrics \
+         file's cumulative duplicate_rate ({expected_fraction})"
+    );
+    rows.len()
+}
+
 /// Dedup over a two-library input (library A: 3 duplicate pairs at one
 /// position; library B: 2 duplicate pairs at a different position) and verify
 /// the metrics file has one row per library, sorted by name, plus a final
@@ -406,6 +529,12 @@ fn test_dedup_command_per_library_metrics() {
         "rows must be library-name-sorted, with the total row last: {libraries:?}"
     );
 
+    // The `sample` column is resolved from the header's @RG SM tags (both read
+    // groups declare SM:sampleX) and is the same on every row.
+    for row in &rows {
+        assert_eq!(row["sample"], "sampleX", "sample resolved from @RG SM: {row:?}");
+    }
+
     // Each position group in `fgumi dedup` holds a single mate (R1's group and
     // R2's group are template-coordinate-adjacent but distinct groups), so a
     // library's `count` duplicate pairs contribute `2 * count` templates/reads
@@ -453,6 +582,202 @@ fn test_dedup_command_per_library_metrics() {
         total["estimated_library_size"].is_empty(),
         "the aggregate row spans >1 library, so its estimate must be empty: {total:?}"
     );
+}
+
+/// Distinct `@RG SM:` values resolve deterministically: the `sample` column is
+/// the sorted, comma-joined set of unique samples, identical on every row,
+/// regardless of the order the read groups declare them in the header. The
+/// header here lists `sampleB` before `sampleA` so a non-sorting resolver would
+/// emit `sampleB,sampleA`.
+#[test]
+fn test_dedup_command_metrics_sample_column_sorts_distinct_samples() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+
+    // RG1 declares the lexically-later sample, RG2 the earlier one, so the
+    // header order is the reverse of the expected sorted output.
+    let header = create_multi_library_header_with_samples("chr1", 10000, "sampleB", "sampleA");
+    let mut records = create_duplicate_group_with_rg("libA_dup", "ACGTACGT", 3, 100, "RG1");
+    records.extend(create_duplicate_group_with_rg("libB_dup", "TGCATGCA", 2, 500, "RG2"));
+    create_sorted_bam_with_header(&input_bam, &header, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command with distinct samples failed");
+
+    let rows = read_dedup_metrics_rows(&metrics_path);
+    assert_eq!(rows.len(), 3, "expected libA row + libB row + All Reads total row: {rows:?}");
+
+    let libraries: Vec<&str> = rows.iter().map(|r| r["library"].as_str()).collect();
+    assert_eq!(
+        libraries,
+        vec!["libA", "libB", "All Reads"],
+        "rows must be library-name-sorted, with the total row last: {libraries:?}"
+    );
+
+    for row in &rows {
+        assert_eq!(
+            row["sample"], "sampleA,sampleB",
+            "the sample column must be the sorted, comma-joined unique @RG SM values, \
+             independent of header order: {row:?}"
+        );
+    }
+}
+
+/// `--sample` overrides the header-derived `@RG SM:` value on every metrics row.
+#[test]
+fn test_dedup_command_sample_override_wins_over_header() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+
+    // The header declares @RG SM:sampleX; --sample must win.
+    let header = create_multi_library_header("chr1", 10000);
+    let records = create_duplicate_group_with_rg("libA_dup", "ACGTACGT", 3, 100, "RG1");
+    create_sorted_bam_with_header(&input_bam, &header, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--sample",
+        "OVERRIDE",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command with --sample override failed");
+
+    let rows = read_dedup_metrics_rows(&metrics_path);
+    assert_eq!(rows.len(), 2, "expected libA row + All Reads total row: {rows:?}");
+
+    let libraries: Vec<&str> = rows.iter().map(|r| r["library"].as_str()).collect();
+    assert_eq!(
+        libraries,
+        vec!["libA", "All Reads"],
+        "rows must be library-name-sorted, with the total row last: {libraries:?}"
+    );
+
+    for row in &rows {
+        assert_eq!(row["sample"], "OVERRIDE", "--sample must override @RG SM: {row:?}");
+    }
+}
+
+/// Builds a two-`@RG` header whose read groups declare `LB` but no `SM:`, for
+/// the empty-`sample` resolution test below.
+fn create_multi_library_header_without_samples(
+    ref_name: &str,
+    ref_len: usize,
+) -> noodles::sam::Header {
+    use bstr::BString;
+    use noodles::sam::header::record::value::Map;
+    use noodles::sam::header::record::value::map::Map as HeaderRecordMap;
+    use noodles::sam::header::record::value::map::header::tag::Tag as HeaderTag;
+    use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+    use noodles::sam::header::record::value::map::{
+        Header as HeaderRecord, ReadGroup, ReferenceSequence,
+    };
+    use std::num::NonZeroUsize;
+
+    let mut header_builder = HeaderRecordMap::<HeaderRecord>::builder();
+    for &(tag_bytes, value) in
+        &[(*b"SO", "unsorted"), (*b"GO", "query"), (*b"SS", "template-coordinate")]
+    {
+        let HeaderTag::Other(tag) = HeaderTag::from(tag_bytes) else { unreachable!() };
+        header_builder = header_builder.insert(tag, value);
+    }
+    let header_map = header_builder.build().expect("valid header map");
+
+    let reference_sequence = Map::<ReferenceSequence>::new(
+        NonZeroUsize::new(ref_len).expect("reference length must be non-zero"),
+    );
+
+    // Read groups carry LB but deliberately omit SM.
+    let rg_a = Map::<ReadGroup>::builder()
+        .insert(rg_tag::LIBRARY, String::from("libA"))
+        .build()
+        .expect("building read group RG1 should succeed");
+    let rg_b = Map::<ReadGroup>::builder()
+        .insert(rg_tag::LIBRARY, String::from("libB"))
+        .build()
+        .expect("building read group RG2 should succeed");
+
+    noodles::sam::Header::builder()
+        .set_header(header_map)
+        .add_reference_sequence(BString::from(ref_name), reference_sequence)
+        .add_read_group(BString::from("RG1"), rg_a)
+        .add_read_group(BString::from("RG2"), rg_b)
+        .build()
+}
+
+/// When neither `--sample` nor any `@RG SM:` value is present, the `sample`
+/// column resolves to the empty string on every row.
+#[test]
+fn test_dedup_command_sample_empty_when_no_rg_sm() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+
+    // Read groups declare LB but no @RG SM:, and --sample is not passed.
+    let header = create_multi_library_header_without_samples("chr1", 10000);
+    let mut records = create_duplicate_group_with_rg("libA_dup", "ACGTACGT", 3, 100, "RG1");
+    records.extend(create_duplicate_group_with_rg("libB_dup", "TGCATGCA", 2, 500, "RG2"));
+    create_sorted_bam_with_header(&input_bam, &header, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command with no @RG SM: failed");
+
+    let rows = read_dedup_metrics_rows(&metrics_path);
+    assert_eq!(rows.len(), 3, "expected libA row + libB row + All Reads total row: {rows:?}");
+
+    let libraries: Vec<&str> = rows.iter().map(|r| r["library"].as_str()).collect();
+    assert_eq!(
+        libraries,
+        vec!["libA", "libB", "All Reads"],
+        "rows must be library-name-sorted, with the total row last: {libraries:?}"
+    );
+
+    for row in &rows {
+        assert_eq!(
+            row["sample"], "",
+            "sample must be empty when neither --sample nor any @RG SM: is present: {row:?}"
+        );
+    }
 }
 
 /// Row order with named libraries AND reads lacking `@RG`/`LB`: named
@@ -618,67 +943,38 @@ fn test_dedup_duplication_ladder_multi_library() {
     // interval at 6, 8, 12, then gets a final row at its true total (14), which
     // doesn't land on a crossing — 4 rows. libB crosses at 4 and 8, with 8
     // landing exactly on its true total, so no extra final row — 2 rows.
-    // Per snapshot row, keyed by library: (templates_seen, (duplicate
-    // numerator, denominator)), pinned so the table reads as a spec.
+    // Per snapshot row, keyed by library: (templates_seen, cumulative (num,
+    // den), window (num, den)), pinned so the table reads as a spec. The window
+    // duplicate count is the cumulative duplicates minus the previous snapshot's,
+    // over the window's templates: libA cumulative dups run 4, 5, 7, 8 over seen
+    // 6, 8, 12, 14, so the windows are 4/6, 1/2, 2/4, 1/2; libB runs 2, 4 over 4,
+    // 8, so 2/4, 2/4.
     #[expect(clippy::type_complexity, reason = "an inline pinned table of expected rows")]
-    let expected_sequences: [(&str, &[(u64, (u64, u64))]); 2] = [
-        ("libA", &[(6, (4, 6)), (8, (5, 8)), (12, (7, 12)), (14, (8, 14))]),
-        ("libB", &[(4, (2, 4)), (8, (4, 8))]),
+    let expected_sequences: [(&str, &[(u64, (u64, u64), (u64, u64))]); 2] = [
+        (
+            "libA",
+            &[
+                (6, (4, 6), (4, 6)),
+                (8, (5, 8), (1, 2)),
+                (12, (7, 12), (2, 4)),
+                (14, (8, 14), (1, 2)),
+            ],
+        ),
+        ("libB", &[(4, (2, 4), (2, 4)), (8, (4, 8), (2, 4))]),
     ];
     let mut matched_row_count = 0usize;
 
-    // For each library: every row's templates_seen and duplicate_fraction match
-    // the pinned sequence in file order, the last row's templates_seen equals
-    // the true per-library total (from the metrics file), and the last row's
-    // duplicate_fraction matches the metrics file's template-level
-    // duplicate_rate exactly (both are the same cumulative
-    // duplicate_templates / total_templates ratio).
+    // For each library: every row's templates_seen, cumulative duplicate_fraction,
+    // window_templates and window_duplicate_fraction match the pinned sequence in
+    // file order; the windows sum to the true per-library total; and the last
+    // row's cumulative fraction matches the metrics file's template-level
+    // duplicate_rate exactly.
     for (library, expected_rows) in expected_sequences {
-        let rows: Vec<_> = ladder_rows.iter().filter(|r| r["library"] == library).collect();
-        matched_row_count += rows.len();
-
-        assert_eq!(
-            rows.len(),
-            expected_rows.len(),
-            "{library}: expected {} ladder rows: {rows:?}",
-            expected_rows.len()
-        );
-
-        for (row, &(expected_seen, (num, den))) in rows.iter().zip(expected_rows) {
-            let seen: u64 = row["templates_seen"].parse().expect("templates_seen is u64");
-            assert_eq!(
-                seen, expected_seen,
-                "{library}: snapshot must land on the derived interval crossing: {row:?}"
-            );
-            let duplicate_fraction: f64 =
-                row["duplicate_fraction"].parse().expect("duplicate_fraction is f64");
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "numerator and denominator are small test constants (< 100)"
-            )]
-            let expected_fraction = num as f64 / den as f64;
-            assert!(
-                (duplicate_fraction - expected_fraction).abs() < 1e-9,
-                "{library}: row duplicate_fraction ({duplicate_fraction}) must equal \
-                 {num}/{den} ({expected_fraction}): {row:?}"
-            );
-        }
-
-        let last_row = rows.last().unwrap_or_else(|| panic!("{library}: no ladder rows emitted"));
-        let library_metrics = metrics_by_library[library];
-        assert_eq!(
-            last_row["templates_seen"], library_metrics["total_templates"],
-            "{library}: final ladder snapshot must land at the true per-library total: {last_row:?}"
-        );
-
-        let expected_fraction: f64 =
-            library_metrics["duplicate_rate"].parse().expect("duplicate_rate is f64");
-        let actual_fraction: f64 =
-            last_row["duplicate_fraction"].parse().expect("duplicate_fraction is f64");
-        assert!(
-            (actual_fraction - expected_fraction).abs() < 1e-9,
-            "{library}: final duplicate_fraction ({actual_fraction}) must match the metrics \
-             file's cumulative duplicate_rate ({expected_fraction})"
+        matched_row_count += assert_ladder_library_ok(
+            &ladder_rows,
+            library,
+            expected_rows,
+            metrics_by_library[library],
         );
     }
 
@@ -722,10 +1018,66 @@ fn test_dedup_duplication_ladder_off_by_default() {
         "duplication ladder file must not be created when --duplication-ladder is not passed"
     );
 
+    // Record-identity oracle: dedup marks duplicates in place, so the output must
+    // hold exactly the input's 10 records (both segments of all five templates),
+    // none dropped, added, or renamed — and carrying the duplicate marks the
+    // identity strategy assigns. A bare count of 10 would still pass if a record
+    // were dropped and another duplicated, or the wrong templates were marked.
     let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
-    let _header = reader.read_header().unwrap();
-    let count = reader.records().count();
-    assert_eq!(count, 10, "All reads should be in output (marked, not removed)");
+    let header = reader.read_header().unwrap();
+    let mut names: Vec<String> = Vec::new();
+    // Per template name, the duplicate flag of each of its segments.
+    let mut duplicate_flags_by_template: std::collections::BTreeMap<String, Vec<bool>> =
+        std::collections::BTreeMap::new();
+    for record in reader.record_bufs(&header) {
+        let record = record.expect("read output record");
+        let name =
+            String::from_utf8(record.name().expect("output record must have a name").to_vec())
+                .expect("read name is UTF-8");
+        duplicate_flags_by_template
+            .entry(name.clone())
+            .or_default()
+            .push(record.flags().is_duplicate());
+        names.push(name);
+    }
+
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec![
+            "dup1_0", "dup1_0", "dup1_1", "dup1_1", "dup1_2", "dup1_2", "dup2_0", "dup2_0",
+            "dup2_1", "dup2_1",
+        ],
+        "output must hold exactly the input records (both segments of every template): {names:?}"
+    );
+
+    // Both segments of a template must carry the same duplicate mark, and the
+    // identity strategy keeps exactly one primary per position group: dup1's three
+    // templates yield two duplicates, dup2's two yield one.
+    for (name, flags) in &duplicate_flags_by_template {
+        assert_eq!(flags.len(), 2, "template {name} must have both segments in output");
+        assert_eq!(
+            flags[0], flags[1],
+            "template {name}: both segments must share the duplicate mark"
+        );
+    }
+    let marked_duplicate_templates = |prefix: &str| {
+        duplicate_flags_by_template
+            .iter()
+            .filter(|(name, _)| name.starts_with(prefix))
+            .filter(|(_, flags)| flags[0])
+            .count()
+    };
+    assert_eq!(
+        marked_duplicate_templates("dup1"),
+        2,
+        "dup1: 3 templates at one position -> 1 primary kept, 2 marked duplicate"
+    );
+    assert_eq!(
+        marked_duplicate_templates("dup2"),
+        1,
+        "dup2: 2 templates at one position -> 1 primary kept, 1 marked duplicate"
+    );
 }
 
 /// Regression test: a single position group whose template increment is
@@ -799,6 +1151,20 @@ fn test_dedup_duplication_ladder_single_group_exceeds_interval() {
             window[1] > window[0],
             "templates_seen must be strictly increasing: {templates_seen:?}"
         );
+    }
+
+    // Pin the marginal (window) columns on the multi-threshold path too, not just
+    // the cumulative fraction: a defect in `window_templates` or
+    // `window_duplicate_fraction` — e.g. one that mis-attributes depth when a
+    // single `record()` call crosses several interval multiples — can pass a
+    // cumulative-only check. Each position group contributes exactly 10 templates
+    // with 9 duplicates, so every window is 10 templates at 9/10.
+    for row in &ladder_rows {
+        assert_eq!(
+            row["window_templates"], "10",
+            "each window covers exactly one 10-template position group: {row:?}"
+        );
+        assert_fraction_eq(row, "window_duplicate_fraction", (9, 10), "multi-threshold window");
     }
 
     // Pin the intermediate row's fraction too, not just the final one: the
