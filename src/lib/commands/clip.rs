@@ -500,6 +500,14 @@ impl ClipParams {
 impl Command for Clip {
     #[allow(clippy::too_many_lines)]
     fn execute(&self, command_line: &str) -> Result<()> {
+        // Reject two outputs resolving to one destination before any writer opens.
+        let mut outputs: Vec<(&std::path::Path, &str)> =
+            vec![(self.io.output.as_path(), "--output")];
+        if let Some(path) = &self.metrics {
+            outputs.push((path.as_path(), "--metrics"));
+        }
+        crate::commands::common::reject_output_collisions(&outputs)?;
+
         // Validate the input exists (stdin paths are exempt).
         self.io.validate()?;
         validate_file_exists(&self.reference, "Reference FASTA")?;

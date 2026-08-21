@@ -8,7 +8,6 @@ use noodles::bam::{self};
 use noodles::sam::{Header, alignment::RecordBuf};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -21,7 +20,6 @@ use crate::bgzf_writer::InlineBgzfCompressor;
 use crate::sam::SamTag;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::ReorderBuffer;
-use fgumi_bam_io::is_stdout_path;
 use noodles::sam::alignment::record::data::field::Tag;
 
 use super::base::{
@@ -4202,14 +4200,17 @@ impl BamPipelineConfig {
 }
 
 /// Open an output writer for pipeline use, supporting stdout via "-" or "/dev/stdout".
+///
+/// Delegates to [`fgumi_bam_io::open_output_writer`], the single place the `-`
+/// convention is honoured for BAM output. This previously re-implemented the
+/// dispatch and returned a `LineWriter`-backed [`std::io::stdout`], which tears
+/// every BGZF flush at each `0x0a`; `open_output_writer` returns a block-buffered
+/// stdout handle instead.
 fn open_pipeline_output(output_path: &Path) -> io::Result<Box<dyn Write + Send>> {
-    if is_stdout_path(output_path) {
-        Ok(Box::new(std::io::stdout()))
-    } else {
-        let file = File::create(output_path)
-            .map_err(|e| io::Error::new(e.kind(), format!("Failed to create output: {e}")))?;
-        Ok(Box::new(file))
-    }
+    fgumi_bam_io::open_output_writer(output_path).map_err(|e| {
+        let kind = e.downcast_ref::<io::Error>().map_or(io::ErrorKind::Other, io::Error::kind);
+        io::Error::new(kind, format!("{e:#}"))
+    })
 }
 
 /// Convert an input-open failure into an `io::Error`, preserving its kind.

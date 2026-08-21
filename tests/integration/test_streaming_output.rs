@@ -259,13 +259,19 @@ fn sort_rejects_write_index_with_stdout(#[case] spelling: &str) {
 /// regardless of the tags each would otherwise require. The reference and UMI
 /// list are supplied because the two commands that take them reject a missing
 /// file before the guard under test would ever run.
-fn colliding_output_args(dir: &Path, command: &[&str], output: &str, rejects: &str) -> Vec<String> {
+fn colliding_output_args(
+    dir: &Path,
+    command: &[&str],
+    secondary_flag: &str,
+    output: &str,
+    secondary: &str,
+) -> Vec<String> {
     let input = dir.join("input.bam");
     write_test_bam(&input, 4);
 
     let mut args: Vec<String> = command.iter().map(|a| (*a).to_string()).collect();
     args.extend(
-        ["-i", input.to_str().unwrap(), "-o", output, "--rejects", rejects]
+        ["-i", input.to_str().unwrap(), "-o", output, secondary_flag, secondary]
             .map(ToString::to_string),
     );
     if command[0] == "correct" {
@@ -273,7 +279,7 @@ fn colliding_output_args(dir: &Path, command: &[&str], output: &str, rejects: &s
         std::fs::write(&umis, "ACGTACGT\n").expect("write UMI list");
         args.extend(["-U".to_string(), umis.display().to_string()]);
     }
-    if command[0] == "filter" {
+    if command[0] == "filter" || command[0] == "clip" {
         let reference = create_test_reference(dir);
         args.extend(["-r".to_string(), reference.display().to_string()]);
     }
@@ -305,7 +311,7 @@ fn rejects_output_and_rejects_both_on_stdout(
     #[values("-", "/dev/stdout")] rejects: &str,
 ) {
     let dir = TempDir::new().expect("create temp dir");
-    let args = colliding_output_args(dir.path(), command, output, rejects);
+    let args = colliding_output_args(dir.path(), command, "--rejects", output, rejects);
 
     let run = run_in(dir.path(), &args);
     let label = format!("{} -o {output} --rejects {rejects}", command[0]);
@@ -360,7 +366,7 @@ fn rejects_output_and_rejects_on_the_same_file(
 ) {
     let dir = TempDir::new().expect("create temp dir");
     std::fs::create_dir_all(dir.path().join("sub")).expect("create subdirectory");
-    let args = colliding_output_args(dir.path(), command, "out.bam", rejects);
+    let args = colliding_output_args(dir.path(), command, "--rejects", "out.bam", rejects);
 
     let run = run_in(dir.path(), &args);
     let label = format!("{} -o out.bam --rejects {rejects}", command[0]);
@@ -377,6 +383,39 @@ fn rejects_output_and_rejects_on_the_same_file(
     assert!(
         !dir.path().join("out.bam").exists(),
         "{label}: the rejected run still created the output file"
+    );
+}
+
+/// The collision guard covers a command's *other* secondary outputs, not just
+/// `--rejects` (#715): a `--stats`/`--metrics`/histogram path equal to `--output`
+/// used to write a correct BAM and then truncate it to a TSV. Each command here
+/// carries a different secondary output; pointing it at `--output` must be
+/// rejected before either writer opens, so the BAM is never created.
+#[rstest]
+#[case::simplex_stats(&["simplex", "--min-reads", "1"], "--stats")]
+#[case::duplex_stats(&["duplex", "--min-reads", "1"], "--stats")]
+#[case::codec_stats(&["codec", "--min-reads", "1", "--min-duplex-length", "1"], "--stats")]
+#[case::filter_stats(&["filter", "--min-reads", "1"], "--stats")]
+#[case::correct_metrics(&["correct", "-d", "1"], "--metrics")]
+#[case::dedup_metrics(&["dedup"], "--metrics")]
+#[case::clip_metrics(&["clip"], "--metrics")]
+#[case::group_histogram(&["group", "--strategy", "adjacency"], "--family-size-histogram")]
+fn rejects_secondary_output_on_the_output_file(#[case] command: &[&str], #[case] flag: &str) {
+    let dir = TempDir::new().expect("create temp dir");
+    let args = colliding_output_args(dir.path(), command, flag, "out.bam", "out.bam");
+
+    let run = run_in(dir.path(), &args);
+    let label = format!("{} -o out.bam {flag} out.bam", command[0]);
+
+    assert!(!run.status.success(), "{label}: a secondary output on `--output` must be rejected");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains(flag) && stderr.contains("out.bam"),
+        "{label}: the error must name the colliding option and the path, got: {stderr}"
+    );
+    assert!(
+        !dir.path().join("out.bam").exists(),
+        "{label}: the rejected run still created (and would have truncated) the output BAM"
     );
 }
 

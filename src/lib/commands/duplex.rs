@@ -20,12 +20,13 @@ use fgumi_bam_io::{
     create_bam_reader_for_pipeline_with_opts, create_bam_writer, create_optional_bam_writer,
     create_raw_bam_reader_with_opts,
 };
+use std::path::Path;
 
 use super::common::{
     AllowUnmappedOptions, BamIoOptions, CompressionOptions, ConsensusCallingOptions,
     OverlappingConsensusOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions,
     SchedulerOptions, StatsOptions, ThreadingOptions, build_pipeline_config,
-    consensus_pregroup_keep_flags, consensus_pregroup_keep_raw, reject_colliding_outputs,
+    consensus_pregroup_keep_flags, consensus_pregroup_keep_raw, reject_output_collisions,
     serialize_raw_bam_records,
 };
 use crate::commands::consensus_runner::{
@@ -274,7 +275,7 @@ impl Command for Duplex {
     /// #     OverlappingConsensusOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions,
     /// #     SchedulerOptions, StatsOptions, ThreadingOptions,
     /// # };
-    /// # use std::path::PathBuf;
+    /// # use std::path::{Path, PathBuf};
     /// let duplex = Duplex {
     ///     io: BamIoOptions {
     ///         input: PathBuf::from("grouped.bam"),
@@ -315,7 +316,14 @@ impl Command for Duplex {
         // Validate the input exists (stdin paths are exempt — the reader
         // streams them in a single pass).
         self.io.validate()?;
-        reject_colliding_outputs(&self.io.output, self.rejects_opts.rejects.as_ref(), "--rejects")?;
+        let mut outputs: Vec<(&Path, &str)> = vec![(self.io.output.as_path(), "--output")];
+        if let Some(path) = &self.rejects_opts.rejects {
+            outputs.push((path.as_path(), "--rejects"));
+        }
+        if let Some(path) = &self.stats_opts.stats {
+            outputs.push((path.as_path(), "--stats"));
+        }
+        reject_output_collisions(&outputs)?;
 
         // Validate consensus arguments (e.g. error rates must be > 0).
         self.validate()?;

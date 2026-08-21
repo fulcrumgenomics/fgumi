@@ -35,6 +35,7 @@ use fgumi_bam_io::{
     create_raw_bam_reader_with_opts,
 };
 use fgumi_raw_bam::{RawRecord, RawRecordView};
+use std::path::Path;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::sam::SamTag;
@@ -52,7 +53,7 @@ use crate::commands::common::{
     AllowUnmappedOptions, BamIoOptions, CompressionOptions, ConsensusCallingOptions,
     OverlappingConsensusOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions,
     SchedulerOptions, StatsOptions, ThreadingOptions, build_pipeline_config,
-    consensus_pregroup_keep_flags, consensus_pregroup_keep_raw, reject_colliding_outputs,
+    consensus_pregroup_keep_flags, consensus_pregroup_keep_raw, reject_output_collisions,
     serialize_raw_bam_records,
 };
 use crate::commands::consensus_runner::{
@@ -255,7 +256,14 @@ impl Command for Simplex {
 
         // Validate inputs
         self.io.validate()?;
-        reject_colliding_outputs(&self.io.output, self.rejects_opts.rejects.as_ref(), "--rejects")?;
+        let mut outputs: Vec<(&Path, &str)> = vec![(self.io.output.as_path(), "--output")];
+        if let Some(path) = &self.rejects_opts.rejects {
+            outputs.push((path.as_path(), "--rejects"));
+        }
+        if let Some(path) = &self.stats_opts.stats {
+            outputs.push((path.as_path(), "--stats"));
+        }
+        reject_output_collisions(&outputs)?;
 
         self.validate_read_bounds()?;
 
