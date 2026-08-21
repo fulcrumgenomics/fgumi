@@ -58,6 +58,163 @@ fn create_grouped_bam(path: &PathBuf, families: Vec<(&str, usize)>) {
     writer.try_finish().expect("Failed to finish BAM");
 }
 
+/// Flip a byte in the last BGZF block's CRC32 footer, so decoding that block
+/// fails only when CRC verification is on. Adapted from PR2's dedup integration
+/// helper. Requires the file to span at least two blocks so the corrupted block
+/// comes *after* reader construction succeeds: the single-threaded raw reader
+/// (`FgumiBgzfReader`) applies `verify_crc` uniformly to every block, so
+/// corrupting block 0 (the header's block) with verification on would fail while
+/// building the reader, before the intended read/count assertion can run.
+fn corrupt_last_block_crc(path: &std::path::Path) {
+    let mut bytes = fs::read(path).expect("read bam for corruption");
+    let mut cursor: &[u8] = &bytes;
+    let blocks = fgumi_lib::bgzf_reader::read_raw_blocks(&mut cursor, 100_000)
+        .expect("read bgzf blocks from test bam");
+    assert!(
+        blocks.len() >= 2,
+        "test input must span >= 2 BGZF blocks so the corrupted block isn't the header's; \
+         got {} -- generate more records",
+        blocks.len()
+    );
+    let offset: usize =
+        blocks[..blocks.len() - 1].iter().map(fgumi_lib::bgzf_reader::RawBgzfBlock::len).sum();
+    let last = blocks.last().expect("checked len >= 2 above");
+    // `read_raw_blocks` drops every BGZF EOF marker, so summing the returned
+    // (real) block lengths yields the last block's on-disk offset only when no
+    // marker sits *between* real blocks. Guard that: everything past the last
+    // framed block must be whole trailing EOF markers (a writer may emit more
+    // than one). An intermediate marker would leave real data here instead and
+    // shift `crc_off` onto an unrelated byte, which the `>= 2` guard cannot
+    // detect.
+    let eof = &fgumi_lib::bgzf_reader::BGZF_EOF;
+    let tail = &bytes[offset + last.len()..];
+    assert!(
+        tail.len().is_multiple_of(eof.len())
+            && tail.chunks_exact(eof.len()).all(|chunk| chunk == &eof[..]),
+        "bytes after the last framed block must be only trailing BGZF EOF markers; \
+         an intermediate marker would invalidate the CRC offset"
+    );
+    let crc_off = offset + last.len() - fgumi_lib::bgzf_reader::BGZF_FOOTER_SIZE;
+    bytes[crc_off] ^= 0x01;
+    fs::write(path, bytes).expect("write corrupted bam");
+}
+
+/// `--no-check-crc` must let downsample's single-threaded raw reader accept a
+/// corrupted BGZF CRC32 (it decodes through fgumi-bgzf, honoring the flag, #800).
+#[test]
+fn test_downsample_no_check_crc_accepts_corrupted_crc() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    // Enough records to span multiple BGZF blocks (see corrupt_last_block_crc).
+    create_grouped_bam(&input_bam, vec![("MI1", 3000)]);
+    corrupt_last_block_crc(&input_bam);
+
+    let cmd = Downsample::try_parse_from([
+        "downsample",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_bam.to_str().unwrap(),
+        "-f",
+        "1.0",
+        "--seed",
+        "42",
+        "--no-check-crc",
+    ])
+    .expect("failed to parse downsample args");
+    cmd.execute("fgumi downsample")
+        .expect("--no-check-crc must accept a corrupted BGZF CRC32 and complete");
+
+    // Assert the corrupted block was decoded, not silently dropped: the input is
+    // one MI family of 3000 records at -f 1.0 (every record kept), so all 3000
+    // must survive the --no-check-crc decode. Pin the complete read-name set,
+    // not just the count — a bare `records().count()` can tally error items and
+    // passes even if records were dropped and replaced or duplicated.
+    let mut reader =
+        bam::io::reader::Builder.build_from_path(&output_bam).expect("open output BAM");
+    reader.read_header().expect("read output BAM header");
+    let records: Vec<_> = reader
+        .records()
+        .collect::<std::io::Result<Vec<_>>>()
+        .expect("every output record must decode under --no-check-crc");
+    let mut names: Vec<String> = records
+        .iter()
+        .map(|r| {
+            let name = r.name().expect("record has a name");
+            String::from_utf8_lossy(AsRef::<[u8]>::as_ref(&name)).into_owned()
+        })
+        .collect();
+    names.sort();
+    let mut expected: Vec<String> = (0..3000).map(|i| format!("read_{i}")).collect();
+    expected.sort();
+    assert_eq!(
+        names, expected,
+        "read_0..read_2999 must all survive the --no-check-crc decode of the corrupted block, \
+         by identity"
+    );
+}
+
+/// Default (verify-on for file input) must reject the same corrupted CRC32.
+#[test]
+fn test_downsample_rejects_corrupted_crc_by_default() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    create_grouped_bam(&input_bam, vec![("MI1", 3000)]);
+    corrupt_last_block_crc(&input_bam);
+
+    let cmd = Downsample::try_parse_from([
+        "downsample",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_bam.to_str().unwrap(),
+        "-f",
+        "1.0",
+        "--seed",
+        "42",
+    ])
+    .expect("failed to parse downsample args");
+    let err = cmd
+        .execute("fgumi downsample")
+        .expect_err("default (verify-on for file input) must reject a corrupted BGZF CRC32");
+    let message = format!("{err:#}");
+    assert!(message.to_uppercase().contains("CRC32"), "error should mention CRC32: {message}");
+}
+
+/// `--check-crc` must also reject the corrupted CRC32 (forces verification on).
+#[test]
+fn test_downsample_check_crc_rejects_corrupted_crc() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    create_grouped_bam(&input_bam, vec![("MI1", 3000)]);
+    corrupt_last_block_crc(&input_bam);
+
+    let cmd = Downsample::try_parse_from([
+        "downsample",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_bam.to_str().unwrap(),
+        "-f",
+        "1.0",
+        "--seed",
+        "42",
+        "--check-crc",
+    ])
+    .expect("failed to parse downsample args");
+    let err = cmd
+        .execute("fgumi downsample")
+        .expect_err("--check-crc must reject a corrupted BGZF CRC32");
+    let message = format!("{err:#}");
+    assert!(message.to_uppercase().contains("CRC32"), "error should mention CRC32: {message}");
+}
+
 /// Read records from a BAM file.
 fn read_bam_records(path: &PathBuf) -> Vec<noodles::sam::alignment::RecordBuf> {
     let mut reader = bam::io::reader::Builder.build_from_path(path).expect("Failed to open BAM");

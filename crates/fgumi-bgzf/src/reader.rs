@@ -239,8 +239,13 @@ fn read_raw_block<R: Read + ?Sized>(reader: &mut R) -> io::Result<Option<RawBgzf
 ///
 /// # Returns
 ///
-/// A vector of blocks read. The vector may be shorter than `max_blocks`
-/// if EOF is reached. Returns an empty vector at EOF.
+/// Up to `max_blocks` real (non-EOF-marker) blocks. BGZF EOF-marker blocks are
+/// skipped and do **not** count against `max_blocks`: the reader keeps consuming
+/// markers until it finds a real block or reaches true end of input. So the
+/// vector is shorter than `max_blocks` only when true EOF was reached first, and
+/// an empty vector reliably means true end of input — even when the stream holds
+/// a run of `max_blocks` or more consecutive markers (as concatenated BGZF
+/// segments or `cat a.bam b.bam` can produce) before the next real block.
 ///
 /// # Errors
 ///
@@ -250,14 +255,13 @@ pub fn read_raw_blocks<R: Read + ?Sized>(
     max_blocks: usize,
 ) -> io::Result<Vec<RawBgzfBlock>> {
     let mut blocks = Vec::with_capacity(max_blocks);
-    for _ in 0..max_blocks {
+    while blocks.len() < max_blocks {
         match read_raw_block(reader)? {
-            Some(block) => {
-                // Skip EOF marker blocks
-                if !block.is_eof() {
-                    blocks.push(block);
-                }
-            }
+            // Skip EOF marker blocks without counting them against `max_blocks`,
+            // so a batch that reads only markers before a later real block still
+            // returns that block instead of spuriously reporting EOF.
+            Some(block) if block.is_eof() => {}
+            Some(block) => blocks.push(block),
             None => break,
         }
     }
@@ -436,7 +440,11 @@ pub fn decompress_block_into_opts(
     output: &mut Vec<u8>,
     verify_crc: bool,
 ) -> io::Result<()> {
-    if block.is_eof() || block.uncompressed_size() == 0 {
+    // Skip only the exact EOF marker. A zero-size block that is *not* the EOF
+    // marker — e.g. a CRC-corrupted EOF whose bytes no longer match it — must
+    // still be CRC-verified: short-circuiting on `uncompressed_size() == 0`
+    // would let malformed input pass silently under `verify_crc = true`.
+    if block.is_eof() {
         return Ok(());
     }
 
@@ -478,10 +486,13 @@ pub fn decompress_block_slice_into_opts(
         return Ok(());
     }
 
-    let uncompressed_size = uncompressed_size_from_slice(data);
-    if uncompressed_size == 0 {
+    // Skip only the exact EOF marker; every other zero-size block is still
+    // CRC-verified (see `decompress_block_into_opts` for why).
+    if data == BGZF_EOF {
         return Ok(());
     }
+
+    let uncompressed_size = uncompressed_size_from_slice(data);
 
     decompress_and_verify(
         compressed_data_from_slice(data),
@@ -854,6 +865,44 @@ mod tests {
         let mut reader = Cursor::new(Vec::<u8>::new());
         let result = read_raw_block(&mut reader).expect("reading raw BGZF block should succeed");
         assert!(result.is_none());
+    }
+
+    /// A run of EOF markers longer than `max_blocks` must not make
+    /// `read_raw_blocks` report EOF while a real block still follows: markers are
+    /// skipped without counting against the budget, so the trailing real block is
+    /// returned rather than dropped. Regression for the case where concatenated
+    /// BGZF segments emit more consecutive markers than a single batch spans.
+    #[test]
+    fn test_read_raw_blocks_skips_marker_run_longer_than_max_blocks() {
+        use crate::writer::InlineBgzfCompressor;
+
+        let original_data = b"payload after a long run of EOF markers";
+        let mut compressor = InlineBgzfCompressor::new(6);
+        compressor.write_all(original_data).expect("write payload");
+        compressor.flush().expect("flush compressor");
+        let real_block = compressor.take_blocks().remove(0).data;
+
+        // More consecutive markers than `max_blocks` below, then one real block.
+        let max_blocks = 4;
+        let marker_run = max_blocks + 3;
+        let mut stream = Vec::new();
+        for _ in 0..marker_run {
+            stream.extend_from_slice(&BGZF_EOF);
+        }
+        stream.extend_from_slice(&real_block);
+
+        let mut reader = Cursor::new(stream);
+        let blocks = read_raw_blocks(&mut reader, max_blocks).expect("read raw blocks");
+        assert_eq!(blocks.len(), 1, "the trailing real block must survive the marker run");
+        assert!(!blocks[0].is_eof(), "the returned block must be the real block, not a marker");
+
+        let mut decompressor = Decompressor::new();
+        let decoded = decompress_block(&blocks[0], &mut decompressor).expect("decompress block");
+        assert_eq!(decoded, original_data, "decoded payload must match the written data");
+
+        // The stream is now fully drained: the next batch reports true EOF.
+        let tail = read_raw_blocks(&mut reader, max_blocks).expect("read raw blocks at eof");
+        assert!(tail.is_empty(), "an empty vector must reliably mean true end of input");
     }
 
     #[test]
@@ -1340,5 +1389,51 @@ mod tests {
             "error should mention the size mismatch: {err}"
         );
         assert!(out.is_empty(), "output should be rolled back on failure");
+    }
+
+    /// A CRC-corrupted EOF marker no longer matches [`BGZF_EOF`] byte-for-byte,
+    /// so it is not `is_eof()` and must run through CRC verification like any
+    /// other zero-size block rather than being waved through on
+    /// `uncompressed_size == 0`. Regression: the previous short-circuit let a
+    /// corrupted EOF marker pass silently under `verify_crc = true`, on both the
+    /// `RawBgzfBlock` and slice APIs.
+    #[test]
+    fn decompress_opts_verifies_a_corrupted_eof_marker() {
+        let mut decompressor = Decompressor::new();
+
+        // The exact EOF marker is skipped by both APIs, verify_crc either way.
+        let eof = RawBgzfBlock { data: BGZF_EOF.to_vec() };
+        let mut out = Vec::new();
+        decompress_block_into_opts(&eof, &mut decompressor, &mut out, true)
+            .expect("the exact EOF marker is skipped");
+        assert!(out.is_empty());
+
+        // Flip the first CRC32 footer byte. The block is no longer the exact
+        // marker (so `is_eof()` is false) but still has ISIZE == 0.
+        let crc_off = BGZF_EOF.len() - BGZF_FOOTER_SIZE;
+        let mut corrupted = BGZF_EOF.to_vec();
+        corrupted[crc_off] ^= 0x01;
+        assert_ne!(corrupted.as_slice(), &BGZF_EOF[..], "must not be the exact EOF marker");
+
+        // RawBgzfBlock API: verify_crc = true rejects, verify_crc = false skips.
+        let block = RawBgzfBlock { data: corrupted.clone() };
+        let mut out = Vec::new();
+        let err = decompress_block_into_opts(&block, &mut decompressor, &mut out, true)
+            .expect_err("verify_crc=true must reject a corrupted EOF marker");
+        assert!(err.to_string().contains("CRC32"), "error should mention CRC32: {err}");
+        let mut out = Vec::new();
+        decompress_block_into_opts(&block, &mut decompressor, &mut out, false)
+            .expect("verify_crc=false must skip the CRC32 check");
+        assert!(out.is_empty());
+
+        // Slice API twin.
+        let mut out = Vec::new();
+        let err = decompress_block_slice_into_opts(&corrupted, &mut decompressor, &mut out, true)
+            .expect_err("slice API: verify_crc=true must reject a corrupted EOF marker");
+        assert!(err.to_string().contains("CRC32"), "error should mention CRC32: {err}");
+        let mut out = Vec::new();
+        decompress_block_slice_into_opts(&corrupted, &mut decompressor, &mut out, false)
+            .expect("slice API: verify_crc=false must skip the CRC32 check");
+        assert!(out.is_empty());
     }
 }

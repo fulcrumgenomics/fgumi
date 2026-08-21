@@ -35,3 +35,7 @@ tempfile = { workspace = true }
 rstest = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
+
+[[bench]]
+name = "bgzf_decode"
+harness = false

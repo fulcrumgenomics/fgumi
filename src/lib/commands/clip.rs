@@ -24,7 +24,8 @@ use anyhow::Result;
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::{
-    create_bam_reader_for_pipeline_with_opts, create_raw_bam_reader, create_raw_bam_writer,
+    create_bam_reader_for_pipeline_with_opts, create_raw_bam_reader_with_opts,
+    create_raw_bam_writer,
 };
 use fgumi_raw_bam::RawRecord;
 use log::info;
@@ -510,7 +511,9 @@ impl Command for Clip {
         info!("  Clip overlapping reads: {}", self.clip_overlapping_reads);
         info!("  Clip extending past mate: {}", self.clip_extending_past_mate);
         info!("  {}", self.threading.log_message());
-        self.io.log_effective_check_crc_for_fast_path(self.threading.threads.is_some());
+        // Both the single-threaded fast path (via create_raw_bam_reader_with_opts)
+        // and the multi-threaded pipeline honor --check-crc/--no-check-crc (#800).
+        self.io.log_effective_check_crc();
 
         let timer = OperationTimer::new("Clipping reads");
 
@@ -602,9 +605,15 @@ impl Clip {
         // Load reference (always required and tags are always regenerated to match Scala fgbio)
         let reference_reader = ReferenceReader::new(&self.reference)?;
 
-        // Open input BAM with MT BGZF decompression
+        // Open input BAM. This fast path is only reached with no --threads, so
+        // reader_threads is 1 and the reader decodes through fgumi-bgzf, honoring
+        // --check-crc/--no-check-crc via pipeline_reader_opts (#800).
         let reader_threads = self.threading.num_threads();
-        let (reader, header) = create_raw_bam_reader(&self.io.input, reader_threads)?;
+        let (reader, header) = create_raw_bam_reader_with_opts(
+            &self.io.input,
+            reader_threads,
+            self.io.pipeline_reader_opts(),
+        )?;
 
         // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio).
         let header = crate::commands::common::ensure_hd_record(header)?;

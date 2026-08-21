@@ -21,4 +21,8 @@ pub use reader::{
     decompress_block_into_opts, decompress_block_slice_into, decompress_block_slice_into_opts,
     read_raw_blocks,
 };
+// Re-export the libdeflater decompressor so downstream crates can name the type
+// required by `decompress_block_into_opts` without depending on libdeflater
+// directly.
+pub use libdeflater::Decompressor;
 pub use writer::{BGZF_MAX_BLOCK_SIZE, CompressedBlock, InlineBgzfCompressor};
