@@ -100,6 +100,25 @@ pub struct DedupCounts {
     pub filter_counts: TemplateFilterCounts,
     /// Templates emitted untouched by `--include-unmapped` (bypass the filter)
     pub passthrough_templates: u64,
+    /// Mapped primary reads whose mate is also mapped, i.e. one half of a mapped
+    /// pair. Accumulated in read (pair-half) units because a pair's two mates are
+    /// dedup'd in separate position groups; halved to `mapped_pairs`
+    /// (Picard `READ_PAIRS_EXAMINED`) only when the final row is built.
+    pub mapped_pair_reads: u64,
+    /// Duplicate-marked half of a mapped pair; halved to `duplicate_pairs`
+    /// (Picard `READ_PAIR_DUPLICATES`) at row-build time.
+    pub duplicate_pair_reads: u64,
+    /// Mapped primary reads with no mapped mate — single-end, or mate unmapped
+    /// (Picard `UNPAIRED_READS_EXAMINED`); read units, not halved.
+    pub mapped_orphans: u64,
+    /// Single-mapped-end reads marked duplicate (Picard `UNPAIRED_READ_DUPLICATES`)
+    pub duplicate_orphans: u64,
+    /// Unmapped primary reads carrying the paired flag (diagnostic, read units)
+    pub unmapped_pairs: u64,
+    /// Unmapped primary reads not carrying the paired flag (diagnostic, read units)
+    pub unmapped_orphans: u64,
+    /// Primary reads not carrying the paired flag, i.e. single-end (diagnostic)
+    pub unmated_templates: u64,
 }
 
 impl DedupCounts {
@@ -116,6 +135,13 @@ impl DedupCounts {
         self.missing_tc_tag += other.missing_tc_tag;
         self.filter_counts.merge(&other.filter_counts);
         self.passthrough_templates += other.passthrough_templates;
+        self.mapped_pair_reads += other.mapped_pair_reads;
+        self.duplicate_pair_reads += other.duplicate_pair_reads;
+        self.mapped_orphans += other.mapped_orphans;
+        self.duplicate_orphans += other.duplicate_orphans;
+        self.unmapped_pairs += other.unmapped_pairs;
+        self.unmapped_orphans += other.unmapped_orphans;
+        self.unmated_templates += other.unmated_templates;
     }
 
     /// Calculate duplicate rate.
@@ -132,14 +158,13 @@ impl DedupCounts {
 /// Converts accumulated dedup counts for one library (or the aggregate total
 /// across all libraries) into the serializable [`DeduplicationMetrics`] row.
 ///
-/// The raw counts are copied 1:1 into a [`DeduplicationCounts`], and
-/// [`DeduplicationMetrics::from_counts`] computes the three derived columns
-/// (`duplicate_rate`, `percent_duplication`, `estimated_library_size`). fgumi
-/// counts *templates*, and each template stands in for one read pair in
-/// paired-end data — the same approximation `duplicate_rate` already makes by
-/// reporting a template-level rather than read-pair-level rate. That is why
-/// `estimated_library_size` is fed `total_templates`/`unique_templates` as its
-/// `n_pairs`/`n_unique` inputs.
+/// The raw counts are copied into a [`DeduplicationCounts`], and
+/// [`DeduplicationMetrics::from_counts`] computes the derived columns.
+/// `duplicate_rate` stays template-level, while the Picard-parity
+/// `percent_duplication` and `estimated_library_size` are computed from the
+/// pair/orphan units below: the accumulated pair-half read counts are halved to
+/// whole pairs (Picard `READ_PAIRS_EXAMINED`/`READ_PAIR_DUPLICATES`) here, once,
+/// after all per-library and cross-worker merging.
 fn to_deduplication_metrics(
     sample: String,
     library: String,
@@ -170,6 +195,19 @@ fn to_deduplication_metrics(
         secondary_reads: counts.secondary_reads,
         supplementary_reads: counts.supplementary_reads,
         missing_tc_tag: counts.missing_tc_tag,
+        // Pair-half read counts -> pair units (Picard `READ_PAIRS_EXAMINED` /
+        // `READ_PAIR_DUPLICATES`). Halved here, once, after all per-library and
+        // cross-worker merging, so the two mates of every pair — dedup'd in
+        // separate position groups — are both counted before the division.
+        // Integer floor: a mate missing from the input leaves an odd half that
+        // rounds down, matching the "count complete pairs" intent.
+        mapped_pairs: counts.mapped_pair_reads / 2,
+        duplicate_pairs: counts.duplicate_pair_reads / 2,
+        mapped_orphans: counts.mapped_orphans,
+        duplicate_orphans: counts.duplicate_orphans,
+        unmapped_pairs: counts.unmapped_pairs,
+        unmapped_orphans: counts.unmapped_orphans,
+        unmated_templates: counts.unmated_templates,
     })
 }
 
@@ -249,14 +287,13 @@ struct DuplicationLadderRecorder {
     interval: u64,
     /// Per-library running totals and next snapshot threshold.
     per_library: AHashMap<u16, LadderLibraryState>,
-    /// Emitted `(library_idx, templates_seen, duplicate_templates)` rows, in
-    /// emission order (interval crossings interleaved across libraries as
-    /// groups are processed, plus the final per-library rows appended by
-    /// [`Self::finish`]). Sorted into deterministic (library, `templates_seen`)
-    /// order only at write time.
-    /// `(library_idx, templates_seen, duplicate_templates, window_templates,
-    /// window_duplicate_templates)`. The two `window_*` values cover only the
-    /// templates added since the previous snapshot for that library.
+    /// Emitted `(library_idx, templates_seen, duplicate_templates,
+    /// window_templates, window_duplicate_templates)` rows, in emission order
+    /// (interval crossings interleaved across libraries as groups are
+    /// processed, plus the final per-library rows appended by [`Self::finish`]).
+    /// The two `window_*` values cover only the templates added since the
+    /// previous snapshot for that library. Sorted into deterministic (library,
+    /// `templates_seen`) order only at write time.
     rows: Vec<(u16, u64, u64, u64, u64)>,
 }
 
@@ -808,6 +845,57 @@ fn mark_template_as_duplicate(template: &mut Template, dedup_counts: &mut DedupC
     }
 }
 
+/// Classify each primary read of a counted template into the Picard-style
+/// pair/orphan breakdown (#804).
+///
+/// fgumi `dedup` dedups each mate in its own position group, so a template here
+/// almost always holds a single primary read; classifying **per primary read**
+/// (rather than per template) is what lets a normal read-pair — split across two
+/// templates in two groups — be recognised as a pair at all. Each read is bucketed
+/// by its own SAM flags, mirroring Picard `DuplicationMetrics`:
+///
+/// - mapped with a mapped mate  -> `mapped_pair_reads` (a pair half; Picard
+///   `READ_PAIRS_EXAMINED` after halving), and `duplicate_pair_reads` if marked.
+/// - mapped with no mapped mate -> `mapped_orphans` (Picard
+///   `UNPAIRED_READS_EXAMINED`), and `duplicate_orphans` if marked.
+/// - unmapped                   -> `unmapped_pairs` / `unmapped_orphans` by the
+///   paired flag (diagnostic; never marked duplicate).
+///
+/// `unmated_templates` counts primary reads with no paired flag (single-end),
+/// independently of the buckets above. Duplicate status is read from the record's
+/// own `DUPLICATE_FLAG` (marking set it on every record of a duplicate template).
+fn count_template_pair_orphan(template: &Template, dedup_counts: &mut DedupCounts) {
+    for read in template.primary_reads() {
+        let flags = RawRecordView::new(read).flags();
+        let is_mapped = (flags & fgumi_raw_bam::flags::UNMAPPED) == 0;
+        let is_paired = (flags & fgumi_raw_bam::flags::PAIRED) != 0;
+        let mate_mapped = is_paired && (flags & fgumi_raw_bam::flags::MATE_UNMAPPED) == 0;
+        let is_duplicate = (flags & DUPLICATE_FLAG) != 0;
+
+        if !is_paired {
+            dedup_counts.unmated_templates += 1;
+        }
+
+        if !is_mapped {
+            if is_paired {
+                dedup_counts.unmapped_pairs += 1;
+            } else {
+                dedup_counts.unmapped_orphans += 1;
+            }
+        } else if mate_mapped {
+            dedup_counts.mapped_pair_reads += 1;
+            if is_duplicate {
+                dedup_counts.duplicate_pair_reads += 1;
+            }
+        } else {
+            dedup_counts.mapped_orphans += 1;
+            if is_duplicate {
+                dedup_counts.duplicate_orphans += 1;
+            }
+        }
+    }
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // Position group processing
 //////////////////////////////////////////////////////////////////////////////
@@ -924,6 +1012,7 @@ fn process_position_group(
     let tc_tag_bytes: [u8; 2] = *TC_TAG.as_ref();
     for template in &templates {
         dedup_counts.total_templates += 1;
+        count_template_pair_orphan(template, &mut dedup_counts);
         for raw in template.records() {
             count_record(raw, tc_tag_bytes, &mut dedup_counts);
         }
@@ -940,6 +1029,7 @@ fn process_position_group(
         dedup_counts.passthrough_templates += 1;
         dedup_counts.total_templates += 1;
         dedup_counts.unique_templates += 1;
+        count_template_pair_orphan(template, &mut dedup_counts);
         for raw in template.records() {
             // Same accounting as the filtered templates above, `tc` check included.
             // `template_is_unmapped_passthrough` only inspects the primary r1/r2, so a
@@ -2121,6 +2211,91 @@ mod tests {
         assert_eq!(template_is_unmapped_passthrough(&template), expected);
     }
 
+    // ========================================================================
+    // count_template_pair_orphan tests (#804 pair/orphan breakdown)
+    // ========================================================================
+
+    /// Build a single-primary-read template whose read carries exactly `flags`.
+    /// `dedup` sees single-mate templates, so classifying one read is the real
+    /// unit of the pair/orphan pass.
+    fn template_with_primary_flags(flags: u16) -> Template {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"q1").sequence(b"ACGT").qualities(&[30, 30, 30, 30]).flags(flags);
+        Template::from_records(vec![b.build()]).expect("test template construction should not fail")
+    }
+
+    /// `(mapped_pair_reads, mapped_orphans, unmapped_pairs, unmapped_orphans, unmated)`
+    /// tallied by [`count_template_pair_orphan`].
+    fn breakdown(counts: &DedupCounts) -> (u64, u64, u64, u64, u64) {
+        (
+            counts.mapped_pair_reads,
+            counts.mapped_orphans,
+            counts.unmapped_pairs,
+            counts.unmapped_orphans,
+            counts.unmated_templates,
+        )
+    }
+
+    /// Each primary read is bucketed by its own flags. A mapped read with a mapped
+    /// mate is a pair half; mapped with mate unmapped, or unpaired, is an orphan;
+    /// unmapped splits by the paired flag. Only unpaired reads are `unmated`.
+    #[rstest]
+    #[case::mapped_pair(flags::PAIRED | flags::FIRST_SEGMENT, (1, 0, 0, 0, 0))]
+    #[case::mapped_mate_unmapped(
+        flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_UNMAPPED, (0, 1, 0, 0, 0))]
+    #[case::mapped_unpaired(0, (0, 1, 0, 0, 1))]
+    #[case::unmapped_paired(flags::PAIRED | flags::FIRST_SEGMENT | flags::UNMAPPED, (0, 0, 1, 0, 0))]
+    #[case::unmapped_unpaired(flags::UNMAPPED, (0, 0, 0, 1, 1))]
+    fn test_count_pair_orphan_by_flags(
+        #[case] flags: u16,
+        #[case] expected: (u64, u64, u64, u64, u64),
+    ) {
+        let template = template_with_primary_flags(flags);
+        let mut counts = DedupCounts::default();
+        count_template_pair_orphan(&template, &mut counts);
+        assert_eq!(breakdown(&counts), expected);
+    }
+
+    /// A duplicate-marked read increments the duplicate sub-counter of its bucket:
+    /// pair-half reads feed `duplicate_pair_reads`, orphans feed `duplicate_orphans`.
+    #[rstest]
+    #[case::dup_pair(flags::PAIRED | flags::FIRST_SEGMENT | DUPLICATE_FLAG, 1, 0)]
+    #[case::dup_orphan(
+        flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_UNMAPPED | DUPLICATE_FLAG, 0, 1)]
+    #[case::pair_not_duplicate(flags::PAIRED | flags::FIRST_SEGMENT, 0, 0)]
+    fn test_count_pair_orphan_duplicate_split(
+        #[case] flags: u16,
+        #[case] expected_dup_pair_reads: u64,
+        #[case] expected_dup_orphans: u64,
+    ) {
+        let template = template_with_primary_flags(flags);
+        let mut counts = DedupCounts::default();
+        count_template_pair_orphan(&template, &mut counts);
+        assert_eq!(counts.duplicate_pair_reads, expected_dup_pair_reads);
+        assert_eq!(counts.duplicate_orphans, expected_dup_orphans);
+    }
+
+    /// `to_deduplication_metrics` halves the accumulated pair-half read counts into
+    /// whole-pair units (Picard `READ_PAIRS_EXAMINED` / `READ_PAIR_DUPLICATES`),
+    /// while orphan counts pass through in read units.
+    #[test]
+    fn test_to_metrics_halves_pair_reads() {
+        let counts = DedupCounts {
+            total_templates: 8,
+            duplicate_templates: 5,
+            mapped_pair_reads: 6,    // 3 pairs
+            duplicate_pair_reads: 4, // 2 duplicate pairs
+            mapped_orphans: 2,
+            duplicate_orphans: 1,
+            ..DedupCounts::default()
+        };
+        let metrics = to_deduplication_metrics("smpl".to_string(), "lib1".to_string(), &counts);
+        assert_eq!(metrics.mapped_pairs, 3, "6 pair-half reads -> 3 pairs");
+        assert_eq!(metrics.duplicate_pairs, 2, "4 duplicate pair-half reads -> 2 pairs");
+        assert_eq!(metrics.mapped_orphans, 2, "orphans stay in read units");
+        assert_eq!(metrics.duplicate_orphans, 1);
+    }
+
     /// A truncated/corrupt record must never be treated as pass-through even when the
     /// other mate is unmapped: it has to fall through to `filter_template`, which drops
     /// it, rather than being emitted verbatim.
@@ -2991,6 +3166,7 @@ mod tests {
             missing_tc_tag: 2,
             passthrough_templates: 3,
             filter_counts,
+            ..DedupCounts::default()
         };
         let output = to_deduplication_metrics("smpl".to_string(), "lib1".to_string(), &counts);
 

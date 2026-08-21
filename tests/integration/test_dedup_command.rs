@@ -243,6 +243,86 @@ fn test_dedup_command_with_metrics() {
     assert!(metrics_path.exists(), "Metrics file not created");
 }
 
+/// End-to-end guard for the #804 pair/orphan breakdown. The fixture is entirely
+/// mapped paired-end duplicates. `dedup` dedups each mate in its own position
+/// group, so the 3 read-pairs become 6 single-mate templates (4 marked duplicate:
+/// 2 per group); classified by flags they are 6 pair halves -> `mapped_pairs = 3`,
+/// `duplicate_pairs = 2`, with nothing in the orphan or unmapped categories. Also
+/// asserts the documented read-unit reconciliation invariants.
+#[test]
+fn test_dedup_metrics_pair_orphan_breakdown_all_mapped_pairs() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+
+    // 3 mapped paired-end duplicates: 1 kept + 2 marked duplicate.
+    create_sorted_bam(&input_bam, create_duplicate_group("dup1", "ACGTACGT", 3, 100));
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command failed");
+
+    let rows: Vec<DeduplicationMetrics> =
+        DelimFile::default().read_tsv(&metrics_path).expect("failed to read dedup metrics");
+    // One per-library row plus the aggregate "All Reads" row, so a regression in
+    // `DedupCounts::merge` (which builds the aggregate) cannot hide behind the first row.
+    assert_eq!(rows.len(), 2, "one library row plus the All Reads aggregate");
+
+    // The pair/orphan breakdown and both read-unit reconciliation invariants must hold on
+    // every row, including the aggregate. This fixture has a single library, so the aggregate
+    // repeats the per-library counts — but asserting it exercises the merge path all the same.
+    let assert_breakdown = |row: &DeduplicationMetrics, label: &str| {
+        // 3 read-pairs -> 6 single-mate templates, 4 marked duplicate (2 per group).
+        assert_eq!(row.total_templates, 6, "{label}: 3 pairs -> 6 single-mate templates");
+        assert_eq!(row.duplicate_templates, 4, "{label}: duplicate templates");
+        // Every read is a pair half, halved to whole pairs.
+        assert_eq!(row.mapped_pairs, 3, "{label}: 6 pair halves -> 3 mapped pairs");
+        assert_eq!(row.duplicate_pairs, 2, "{label}: 4 duplicate pair halves -> 2 duplicate pairs");
+        assert_eq!(row.mapped_orphans, 0, "{label}: mapped orphans");
+        assert_eq!(row.duplicate_orphans, 0, "{label}: duplicate orphans");
+        assert_eq!(row.unmapped_pairs, 0, "{label}: unmapped pairs");
+        assert_eq!(row.unmapped_orphans, 0, "{label}: unmapped orphans");
+        assert_eq!(row.unmated_templates, 0, "{label}: no single-end reads in this fixture");
+
+        // Documented read-unit reconciliation invariants (each pair == two templates).
+        assert_eq!(
+            2 * row.mapped_pairs + row.mapped_orphans + row.unmapped_pairs + row.unmapped_orphans,
+            row.total_templates,
+            "{label}: mapping buckets must reconcile with total_templates in read units"
+        );
+        assert_eq!(
+            2 * row.duplicate_pairs + row.duplicate_orphans,
+            row.duplicate_templates,
+            "{label}: duplicate buckets must reconcile with duplicate_templates in read units"
+        );
+    };
+
+    let all_reads = rows
+        .iter()
+        .find(|r| r.library == "All Reads")
+        .expect("metrics file must contain an All Reads aggregate row");
+    let per_library = rows
+        .iter()
+        .find(|r| r.library != "All Reads")
+        .expect("metrics file must contain a per-library row");
+
+    assert_breakdown(per_library, "per-library row");
+    assert_breakdown(all_reads, "All Reads row");
+}
+
 /// Build a template-coordinate-sorted SAM header with two `@RG` lines that have
 /// distinct `LB` values ("libA"/"libB"), for the per-library metrics test below.
 fn create_multi_library_header(ref_name: &str, ref_len: usize) -> noodles::sam::Header {
@@ -1250,14 +1330,15 @@ fn create_unmapped_pair(name: &str, umi: &str) -> Vec<RawRecord> {
 /// template is *accounted*, not just whether its reads survive: the two modes must route
 /// it to exactly one of the two columns, never both and never neither.
 #[rstest]
-#[case::default_drops_unmapped(false, 6, 0, 0, 1)]
-#[case::include_unmapped_keeps(true, 8, 2, 1, 0)]
+#[case::default_drops_unmapped(false, 6, 0, 0, 1, 0)]
+#[case::include_unmapped_keeps(true, 8, 2, 1, 0, 2)]
 fn test_dedup_include_unmapped(
     #[case] include_unmapped: bool,
     #[case] expected_total: usize,
     #[case] expected_unmapped: usize,
     #[case] expected_passthrough: u64,
     #[case] expected_filtered_unmapped: u64,
+    #[case] expected_unmapped_pairs: u64,
 ) {
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::RecordBuf;
@@ -1330,6 +1411,30 @@ fn test_dedup_include_unmapped(
     assert_eq!(
         metrics.filtered_unmapped, expected_filtered_unmapped,
         "unexpected filtered_unmapped"
+    );
+
+    // The fully-unmapped pass-through pair is the multi-primary case the
+    // pair/orphan reconciliation invariant explicitly excludes: it is emitted as
+    // ONE template holding both mates, so it adds 1 to `total_templates` but 2 to
+    // `unmapped_pairs` (one per primary read). Under `--include-unmapped` that is
+    // two unmapped pairs from a single template; by default the pair is filtered
+    // out before pair/orphan counting, so the counter stays zero.
+    assert_eq!(metrics.unmapped_pairs, expected_unmapped_pairs, "unexpected unmapped_pairs");
+
+    // The single-primary-read reconciliation `2*mapped_pairs + mapped_orphans +
+    // unmapped_pairs + unmapped_orphans == total_templates` holds only for
+    // deduplicated (single-primary) templates. This fixture's sole pass-through is
+    // a fully-unmapped *pair* (two primary reads in one template), so the left
+    // side runs ahead of `total_templates` by exactly `passthrough_templates`.
+    let reconciliation_lhs = 2 * metrics.mapped_pairs
+        + metrics.mapped_orphans
+        + metrics.unmapped_pairs
+        + metrics.unmapped_orphans;
+    assert_eq!(
+        reconciliation_lhs,
+        metrics.total_templates + metrics.passthrough_templates,
+        "pair/orphan reconciliation must exceed total_templates by the fully-unmapped \
+         pass-through pairs: {metrics:?}"
     );
 }
 
