@@ -176,8 +176,13 @@ impl SamRecordClipper {
                 let (start, end) = if from_start { (remove, old_length) } else { (0, new_length) };
                 let new_value = match value {
                     Value::String(s) => {
+                        // Preserve the clipped bytes verbatim. The previous
+                        // `from_utf8(..).unwrap_or("")` silently replaced a
+                        // non-UTF-8 tag value with an empty string; noodles'
+                        // `Value::String` holds a byte string, so slice it
+                        // directly instead of round-tripping through `&str`.
                         let bytes: &[u8] = s.as_ref();
-                        Value::from(std::str::from_utf8(&bytes[start..end]).unwrap_or(""))
+                        Value::String(bytes[start..end].to_vec().into())
                     }
                     Value::Array(arr) => slice_array!(arr, start, end),
                     _ => continue, // Should not reach here due to should_clip check
@@ -1418,8 +1423,11 @@ impl SamRecordClipper {
                     let end = old_seq_len - trailing_soft;
                     let new_value = match value {
                         Value::String(s) => {
+                            // Preserve the clipped bytes verbatim; `from_utf8_lossy`
+                            // would replace any non-UTF-8 byte with U+FFFD. noodles'
+                            // `Value::String` is a byte string, so slice it directly.
                             let bytes: &[u8] = s.as_ref();
-                            Value::from(String::from_utf8_lossy(&bytes[start..end]).to_string())
+                            Value::String(bytes[start..end].to_vec().into())
                         }
                         Value::Array(arr) => slice_array!(arr, start, end),
                         _ => value.clone(),
@@ -3551,6 +3559,35 @@ mod tests {
         }
     }
 
+    /// A non-UTF-8 string tag must be clipped byte-for-byte, not silently
+    /// replaced with an empty string (or corrupted with U+FFFD). Regression test
+    /// for the `from_utf8(..).unwrap_or("")` / `from_utf8_lossy` handling.
+    #[test]
+    fn test_auto_clip_attributes_string_non_utf8_preserves_bytes() {
+        use noodles::sam::alignment::record::data::field::Tag;
+
+        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Hard, true);
+        let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
+
+        // A 10-byte tag value that is NOT valid UTF-8 (0xFF/0xFE never appear in
+        // well-formed UTF-8), matching the 10-base read length so it is clipped.
+        let tag = Tag::from([b'X', b'S']);
+        let raw: Vec<u8> = vec![b'0', b'1', 0xFF, 0xFE, b'4', b'5', b'6', b'7', b'8', b'9'];
+        record.data_mut().insert(tag, Value::String(raw.clone().into()));
+
+        // Clip 3 bases from the 5' end.
+        assert_eq!(clipper.clip_start_of_alignment(&mut record, 3), 3);
+
+        // The tag must hold exactly bytes 3..10 of the original — not "" and not
+        // a U+FFFD-mangled string.
+        if let Some(Value::String(s)) = record.data().get(&tag) {
+            let bytes: &[u8] = s.as_ref();
+            assert_eq!(bytes, &raw[3..], "non-UTF-8 tag bytes must be preserved");
+        } else {
+            panic!("Tag XS not found or wrong type");
+        }
+    }
+
     #[test]
     fn test_auto_clip_attributes_array_5_prime() {
         use noodles::sam::alignment::record::data::field::Tag;
@@ -4302,6 +4339,35 @@ mod tests {
         if let Some(Value::String(s)) = with_auto.data().get(&az_tag) {
             let bytes: &[u8] = s.as_ref();
             assert_eq!(bytes, "67890123456789012345678901234567890".as_bytes());
+        }
+    }
+
+    /// The soft→hard upgrade path (`upgrade_all_clipping`) must also clip a
+    /// non-UTF-8 string tag byte-for-byte, not mangle it with `from_utf8_lossy`.
+    #[test]
+    fn test_upgrade_all_clipping_string_non_utf8_preserves_bytes() {
+        use noodles::sam::alignment::record::data::field::Tag;
+
+        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Hard, true);
+        let seq = "12345678901234567890123456789012345678901234567890"; // 50 bases
+        let mut record = create_test_record("5S35M10S", seq, 10);
+
+        // A 50-byte tag value that is not valid UTF-8, matching the read length.
+        let az_tag = Tag::from([b'a', b'z']);
+        let mut raw: Vec<u8> = (0..50u8).map(|i| b'0' + (i % 10)).collect();
+        raw[7] = 0xFF;
+        raw[42] = 0xFE;
+        record.data_mut().insert(az_tag, Value::String(raw.clone().into()));
+
+        let result = clipper.upgrade_all_clipping(&mut record).expect("upgrade should succeed");
+        assert_eq!(result, (5, 10));
+
+        // Auto-clip removes the first 5 and last 10 bytes → raw[5..40], verbatim.
+        if let Some(Value::String(s)) = record.data().get(&az_tag) {
+            let bytes: &[u8] = s.as_ref();
+            assert_eq!(bytes, &raw[5..40], "non-UTF-8 tag bytes must be preserved on upgrade");
+        } else {
+            panic!("Tag az not found or wrong type");
         }
     }
 
