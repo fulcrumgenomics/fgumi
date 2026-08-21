@@ -283,7 +283,6 @@ struct FilterProcessCaptures {
     min_conversion_fraction: Option<f64>,
     methylation_mode: fgumi_consensus::MethylationMode,
     ref_names: Arc<Vec<String>>,
-    progress: Arc<AtomicU64>,
     header: Header,
 }
 
@@ -448,7 +447,6 @@ impl Filter {
                 self.methylation_mode,
             ),
             ref_names: Arc::new(ref_names),
-            progress: Arc::clone(&setup.progress_counter),
             header: header.clone(),
         }
     }
@@ -472,6 +470,7 @@ impl Filter {
         ProcessFn: Fn(G) -> io::Result<FilterProcessedBatchRaw> + Send + Sync + 'static,
     {
         let collected_for_serialize = Arc::clone(&setup.collected_metrics);
+        let progress = Arc::clone(&setup.progress_counter);
 
         // Primary serialize: write kept records
         let serialize_fn = move |processed: FilterProcessedBatchRaw,
@@ -484,6 +483,13 @@ impl Filter {
                 m.failed_records += processed.records_count - processed.passed_count;
                 m.total_bases_masked += processed.bases_masked;
             });
+
+            // Interim "Processed N records" heartbeat, advanced once per batch
+            // here rather than once per record inside the parallel `process_fn` —
+            // the per-record `fetch_add` was a contended shared atomic (cacheline
+            // ping-pong across pipeline workers). Log-only; the authoritative total
+            // is aggregated from `records_count` below.
+            advance_progress(&progress, processed.records_count);
 
             serialize_raw_bam_records(&processed.kept_records, output)
         };
@@ -602,11 +608,6 @@ impl Filter {
                 rejected_records.push(record);
             }
 
-            let count = ctx.progress.fetch_add(1, Ordering::Relaxed);
-            if (count + 1).is_multiple_of(1_000_000) {
-                info!("Processed {} records", count + 1);
-            }
-
             Ok(FilterProcessedBatchRaw {
                 kept_records,
                 rejected_records,
@@ -711,11 +712,6 @@ impl Filter {
                         }
                     }
                 }
-            }
-
-            let count = ctx.progress.fetch_add(total_records, Ordering::Relaxed);
-            if (count + total_records) / 1_000_000 > count / 1_000_000 {
-                info!("Processed {} records", count + total_records);
             }
 
             Ok(FilterProcessedBatchRaw {
@@ -1154,6 +1150,33 @@ impl Filter {
     }
 }
 
+/// Advances the shared interim-progress `counter` by `records` and logs a
+/// "Processed N records" heartbeat when the running total crosses a
+/// 1,000,000-record boundary.
+///
+/// This is log-only — the authoritative record total is aggregated from each
+/// batch's `records_count` and logged at completion — so callers may batch the
+/// update coarsely to keep the shared atomic off the per-record hot path.
+fn advance_progress(counter: &AtomicU64, records: u64) {
+    let before = counter.fetch_add(records, Ordering::Relaxed);
+    if let Some(total) = progress_heartbeat_total(before, records) {
+        info!("Processed {total} records");
+    }
+}
+
+/// Returns the running total to announce in a "Processed N records" heartbeat
+/// when advancing the interim-progress counter from `before` by `records`, or
+/// `None` when the advance does not cross a 1,000,000-record boundary.
+///
+/// This is the pure boundary-crossing decision behind [`advance_progress`]'s
+/// heartbeat: a non-`None` result means a heartbeat should be emitted for that
+/// exact running total. Extracting it keeps the emit-or-not behavior directly
+/// testable without capturing log output.
+fn progress_heartbeat_total(before: u64, records: u64) -> Option<u64> {
+    let after = before + records;
+    if after / 1_000_000 > before / 1_000_000 { Some(after) } else { None }
+}
+
 #[cfg(test)]
 #[allow(clippy::float_cmp)]
 mod tests {
@@ -1162,6 +1185,44 @@ mod tests {
     use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, aux_data_slice, flags};
     use noodles::sam::alignment::record_buf::RecordBuf;
     use rstest::rstest;
+
+    /// `advance_progress` accumulates exactly across successive batched advances,
+    /// regardless of whether any given advance crosses a heartbeat boundary. The
+    /// counter is the authoritative side of the function; the heartbeat cadence
+    /// is verified separately by [`test_progress_heartbeat_total`].
+    #[test]
+    fn test_advance_progress_accumulates_and_crosses_boundary() {
+        let counter = AtomicU64::new(0);
+        advance_progress(&counter, 1_000_000); // 0 -> 1_000_000: crosses, logs
+        assert_eq!(counter.load(Ordering::Relaxed), 1_000_000);
+        advance_progress(&counter, 5); // 1_000_000 -> 1_000_005: no crossing
+        assert_eq!(counter.load(Ordering::Relaxed), 1_000_005);
+        advance_progress(&counter, 1_000_000); // crosses again
+        assert_eq!(counter.load(Ordering::Relaxed), 2_000_005);
+    }
+
+    /// The heartbeat fires exactly when an advance crosses a 1,000,000-record
+    /// boundary, and reports the *running total* (not the batch size). Each case
+    /// mirrors a step of the accumulation walk plus the boundary edge cases:
+    /// a first crossing, a within-window increment that must stay silent, a
+    /// repeated crossing at the next boundary, a no-op advance, an advance that
+    /// lands exactly on a boundary, and a single advance that spans several
+    /// boundaries (still one heartbeat, at the final total).
+    #[rstest]
+    #[case::first_crossing(0, 1_000_000, Some(1_000_000))]
+    #[case::within_window_is_silent(1_000_000, 5, None)]
+    #[case::repeated_crossing(1_000_005, 999_995, Some(2_000_000))]
+    #[case::zero_advance_is_silent(1_000_005, 0, None)]
+    #[case::partial_within_window_is_silent(0, 999_999, None)]
+    #[case::lands_exactly_on_boundary(999_999, 1, Some(1_000_000))]
+    #[case::spans_multiple_boundaries(500_000, 2_500_000, Some(3_000_000))]
+    fn test_progress_heartbeat_total(
+        #[case] before: u64,
+        #[case] records: u64,
+        #[case] expected: Option<u64>,
+    ) {
+        assert_eq!(progress_heartbeat_total(before, records), expected);
+    }
 
     /// Helper function to create a Filter command with commonly used test defaults.
     fn create_filter_with_paths(input: PathBuf, output: PathBuf, reference: PathBuf) -> Filter {
