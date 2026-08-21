@@ -82,7 +82,7 @@ fn parse_metric_structs(source: &str) -> Result<Vec<ParsedMetric>> {
         .iter()
         .filter_map(|item| {
             if let syn::Item::Impl(impl_item) = item
-                && let Some((_, trait_path, _)) = &impl_item.trait_
+                && let Some((trait_path, _)) = &impl_item.trait_
             {
                 let trait_name = trait_path.segments.last().map(|s| s.ident.to_string())?;
                 if trait_name == "Metric"
