@@ -871,3 +871,180 @@ fn simulate_bam_commands_report_the_writer_error_not_the_send_failure(#[case] co
         "the send failure is the symptom, not the cause: {rendered}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression (#687): `simulate grouped-reads` output must be accepted by the
+// grouped-input engine it exists to feed.
+// ---------------------------------------------------------------------------
+
+/// Generate a `simulate grouped-reads` BAM, optionally in duplex mode.
+///
+/// Mirrors [`simulate_grouped_reads`] but adds `--duplex` when requested, so the
+/// regression test can cover both the simplex (`<id>`) and duplex (`<id>/A`,
+/// `<id>/B`) MI-tag shapes.
+fn simulate_grouped_reads_mode(
+    output: &Path,
+    truth: &Path,
+    reference: &Path,
+    seed: u32,
+    num_molecules: u32,
+    duplex: bool,
+) {
+    let num_molecules_str = num_molecules.to_string();
+    let seed_str = seed.to_string();
+    let mut argv: Vec<&OsStr> = vec![
+        OsStr::new("grouped-reads"),
+        OsStr::new("-o"),
+        output.as_os_str(),
+        OsStr::new("--truth"),
+        truth.as_os_str(),
+        OsStr::new("--reference"),
+        reference.as_os_str(),
+        OsStr::new("--num-molecules"),
+        OsStr::new(&num_molecules_str),
+        OsStr::new("--seed"),
+        OsStr::new(&seed_str),
+        OsStr::new("--read-length"),
+        OsStr::new("100"),
+        OsStr::new("--umi-length"),
+        OsStr::new("6"),
+        OsStr::new("--min-family-size"),
+        OsStr::new("2"),
+    ];
+    if duplex {
+        argv.push(OsStr::new("--duplex"));
+    }
+    let cmd = GroupedReads::try_parse_from(argv).expect("failed to parse grouped-reads args");
+    cmd.execute("fgumi simulate grouped-reads").expect("simulate grouped-reads failed");
+}
+
+/// Run `fgumi compare bams <a> <b> --command group` in-process, returning the raw
+/// `execute` result so the caller can distinguish a clean match (`Ok`) from the
+/// grouped-input precondition rejection (`Err`) that #687 is about.
+fn compare_bams_group_command(bam1: &Path, bam2: &Path) -> anyhow::Result<()> {
+    let cmd = CompareBams::try_parse_from([
+        OsStr::new("bams"),
+        bam1.as_os_str(),
+        bam2.as_os_str(),
+        OsStr::new("--command"),
+        OsStr::new("group"),
+    ])
+    .expect("failed to parse compare bams args");
+    cmd.execute("fgumi compare bams")
+}
+
+/// `simulate grouped-reads` exists to produce grouping test input, so its output
+/// must round-trip through the engine that consumes grouped BAMs: comparing the
+/// file against a byte-identical copy of itself must report a match, not fail the
+/// grouped-input precondition.
+///
+/// Regression test for #687: MI ids were minted as a pre-sort counter and emerged
+/// non-monotonic in the template-coordinate-sorted file, so
+/// `compare bams --command group` rejected `simulate`'s own output with
+/// "input is not grouped: MI base N is not greater than a previously seen base M".
+#[rstest]
+#[case::simplex(false)]
+#[case::duplex(true)]
+fn simulate_grouped_reads_roundtrips_through_compare_group(#[case] duplex: bool) {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let reference = create_test_reference(tmp.path());
+    let bam = tmp.path().join("grouped.bam");
+    let truth = tmp.path().join("truth.tsv");
+    simulate_grouped_reads_mode(&bam, &truth, &reference, 42, 500, duplex);
+
+    // A byte-identical copy: comparing a file against itself cannot legitimately
+    // DIFFER, so any failure here is the grouped-input precondition rejecting the
+    // simulated input, not a comparison result.
+    let copy = tmp.path().join("grouped.copy.bam");
+    std::fs::copy(&bam, &copy).expect("copy grouped bam");
+
+    compare_bams_group_command(&bam, &copy).unwrap_or_else(|e| {
+        panic!(
+            "`compare bams --command group` rejected simulate grouped-reads output \
+             (duplex={duplex}): {e:#}"
+        )
+    });
+}
+
+/// The truth TSV must stay consistent with the renumbered BAM. After #687's
+/// post-sort MI renumber, a consumer that joins truth rows to BAM records by read
+/// name must still see the same MI: this asserts every BAM record's MI equals its
+/// truth row's `mi_tag`, the truth `molecule_id` equals the MI base, and the
+/// renumbered bases are exactly `1..=N` in file order (monotonic and contiguous).
+#[rstest]
+#[case::simplex(false)]
+#[case::duplex(true)]
+fn simulate_grouped_reads_truth_matches_renumbered_bam(#[case] duplex: bool) {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let reference = create_test_reference(tmp.path());
+    let bam = tmp.path().join("grouped.bam");
+    let truth = tmp.path().join("truth.tsv");
+    simulate_grouped_reads_mode(&bam, &truth, &reference, 7, 300, duplex);
+
+    // truth: read_name -> (molecule_id, mi_tag)
+    let truth_txt = std::fs::read_to_string(&truth).expect("read truth");
+    let mut truth_by_name: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    let mut lines = truth_txt.lines();
+    lines.next().expect("truth header"); // skip header
+    for line in lines {
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert!(cols.len() > 3, "malformed truth row: {line:?}");
+        // Reject duplicate read names: each pair has a unique name, and a
+        // silently-overwritten row would let a stale/duplicate entry pass the
+        // relation check below.
+        let prior =
+            truth_by_name.insert(cols[0].to_string(), (cols[2].to_string(), cols[3].to_string()));
+        assert!(prior.is_none(), "duplicate truth read name: {}", cols[0]);
+    }
+
+    let mut prev_base: Option<u64> = None;
+    let mut distinct_bases: Vec<u64> = Vec::new();
+    let mut bam_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for bytes in read_all_record_bytes(&bam) {
+        let view = fgumi_raw_bam::RawRecordView::new(&bytes);
+        let qname: String =
+            String::from_utf8(view.read_name().iter().copied().take_while(|&b| b != 0).collect())
+                .expect("read name is UTF-8");
+        let mi_bytes = fgumi_raw_bam::find_string_tag_in_record(&bytes, SamTag::MI)
+            .expect("record has MI tag");
+        let mi = std::str::from_utf8(mi_bytes).expect("MI is UTF-8").to_string();
+
+        let (truth_mol_id, truth_mi) = truth_by_name
+            .get(&qname)
+            .unwrap_or_else(|| panic!("BAM read {qname} absent from truth"));
+        assert_eq!(&mi, truth_mi, "BAM MI != truth mi_tag for {qname} (duplex={duplex})");
+
+        let base: u64 = mi.split('/').next().unwrap().parse().expect("MI base is an integer");
+        assert_eq!(
+            &base.to_string(),
+            truth_mol_id,
+            "truth molecule_id != MI base for {qname} (duplex={duplex})"
+        );
+
+        if prev_base != Some(base) {
+            if let Some(p) = prev_base {
+                assert!(base > p, "MI base not strictly increasing in file order: {p} then {base}");
+            }
+            distinct_bases.push(base);
+            prev_base = Some(base);
+        }
+        bam_names.insert(qname);
+    }
+
+    let n = distinct_bases.len() as u64;
+    assert_eq!(
+        distinct_bases,
+        (1..=n).collect::<Vec<_>>(),
+        "renumbered bases must be exactly 1..=N in file order (duplex={duplex})"
+    );
+
+    // Check the relation in both directions: every truth row is realized in the
+    // BAM and vice versa, so a stale/extra truth row (or a dropped BAM read) fails
+    // rather than slipping through the per-record lookup above.
+    let truth_names: std::collections::HashSet<String> = truth_by_name.into_keys().collect();
+    assert_eq!(
+        bam_names, truth_names,
+        "BAM read-name set != truth read-name set (duplex={duplex})"
+    );
+}

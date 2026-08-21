@@ -22,15 +22,18 @@ use crate::simulate::{
 };
 use anyhow::{Context, Result};
 use clap::Parser;
-use fgumi_bam_io::ProgressTracker;
-use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
+use fgumi_bam_io::{ProgressTracker, create_raw_bam_reader, create_raw_bam_writer};
+use fgumi_raw_bam::{
+    RawRecord, SamBuilder, aux_data_slice, find_string_tag, flags as raw_flags, update_string_tag,
+};
 use fgumi_sort::{KeyTypesSpec, RawExternalSorter, SortOrder};
 use log::info;
 use noodles::sam::header::Header;
 use rand::{Rng, RngExt};
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
 
 /// Generate template-coordinate sorted BAM with MI tags for consensus callers.
 #[derive(Parser, Debug)]
@@ -228,12 +231,35 @@ impl Command for GroupedReads {
         // sorted chunks exactly like `fgumi sort` would.
         info!("Generating records and sorting into template-coordinate order...");
 
+        // The sort produces same-MI-consecutive output, but `simulate` mints MI
+        // ids as a pre-sort counter, so the ids come out of the template-coordinate
+        // sort in position order rather than monotonically increasing in file
+        // order. The grouped-input engine (`fgumi compare bams --command group`,
+        // `compare::molecule`) treats a strictly-increasing MI base as the
+        // definition of grouped input and rejects anything else, so the sorted BAM
+        // is written to a temporary file first and then renumbered in a second
+        // streaming pass (`renumber_sorted_mi`) that mints a fresh base each time
+        // the MI base changes. The temp BAM is compressed at a fast level since it
+        // is immediately re-read and re-compressed at the requested output level by
+        // the renumber pass; the final output compression is applied there.
+        //
+        // Both final artifacts are staged to sibling temp paths and renamed into
+        // place only once *both* are fully written, so a failure never leaves a
+        // truncated BAM or a BAM whose ids no longer match its truth TSV. `temp_bam`
+        // holds the sort's fast-compressed output and `temp_truth` holds
+        // generation's pre-renumber truth; `staged_bam` and `staged_truth` hold the
+        // renumbered BAM and remapped truth before they are published.
+        let temp_bam = temp_sibling(&self.output, "sort");
+        let temp_truth = temp_sibling(&self.truth_output, "gen");
+        let staged_bam = temp_sibling(&self.output, "staged");
+        let staged_truth = temp_sibling(&self.truth_output, "staged");
+
         let sorter = self
             .sort_resources
             .apply(
                 RawExternalSorter::new(SortOrder::TemplateCoordinate)
                     .threads(self.threads)
-                    .output_compression(self.compression.compression_level)
+                    .output_compression(TEMP_BAM_COMPRESSION_LEVEL)
                     // grouped-reads always writes MI tags, so include the tertiary
                     // (library|mi) lane in the template-coordinate key rather than
                     // relying on first-record auto-detection (equivalent to
@@ -254,10 +280,10 @@ impl Command for GroupedReads {
             let generator = scope.spawn(|| {
                 self.generate_records(
                     sink,
+                    &temp_truth,
                     &params,
                     &ref_genome,
                     &position_table,
-                    num_positions,
                     &mut seed_rng,
                 )
             });
@@ -265,17 +291,223 @@ impl Command for GroupedReads {
             // Consumes `records`, so a sort failure drops the receiver and the
             // generator's next `send` returns false, unblocking it.
             sorter
-                .sort_records(into_record_stream(records), &header, &self.output)
+                .sort_records(into_record_stream(records), &header, &temp_bam)
                 .context("Failed to template-coordinate sort simulated reads")?;
 
             generator.join().unwrap_or_else(|payload| std::panic::resume_unwind(payload))
         })?;
+
+        // Renumber the sorted temp BAM and remap the truth TSV (written during
+        // generation with the pre-sort ids) into their staging paths, then publish
+        // both with renames only after both writes succeed.
+        info!("Renumbering molecule ids into monotonic file order...");
+        let publish = (|| -> Result<()> {
+            let old_to_new = renumber_sorted_mi(
+                &temp_bam,
+                &staged_bam,
+                self.threads,
+                self.compression.compression_level,
+            )
+            .context("Failed to renumber molecule ids in the sorted output")?;
+
+            remap_truth_mi(&temp_truth, &staged_truth, &old_to_new)
+                .context("Failed to remap molecule ids in the truth file")?;
+
+            // Publish both finals only after both staged files are complete, so a
+            // failure above never exposes a truncated BAM or a mismatched pair.
+            std::fs::rename(&staged_bam, &self.output)
+                .with_context(|| format!("Failed to publish {}", self.output.display()))?;
+            std::fs::rename(&staged_truth, &self.truth_output)
+                .with_context(|| format!("Failed to publish {}", self.truth_output.display()))?;
+            Ok(())
+        })();
+
+        // Always remove the sort/generation intermediates. Remove the staged finals
+        // only on failure (a successful publish renamed them away), leaving any
+        // pre-existing destinations untouched.
+        let _ = std::fs::remove_file(&temp_bam);
+        let _ = std::fs::remove_file(&temp_truth);
+        if publish.is_err() {
+            let _ = std::fs::remove_file(&staged_bam);
+            let _ = std::fs::remove_file(&staged_truth);
+        }
+        publish?;
 
         info!("Generated {total_pairs} read pairs");
         info!("Done");
 
         Ok(())
     }
+}
+
+/// Fast BGZF level for the intermediate sorted BAM.
+///
+/// The temp BAM is transient: it is re-read and re-compressed at the requested
+/// output level by [`renumber_sorted_mi`], so it is written at a fast level to
+/// avoid compressing the same records twice. The final output compression is
+/// applied by the renumber pass, not here.
+const TEMP_BAM_COMPRESSION_LEVEL: u32 = 1;
+
+/// Build a temporary sibling path next to `path`.
+///
+/// The intermediate lands on the same filesystem as the final output (so the
+/// renumber pass reads and writes the same disk, not a possibly-tmpfs `TMPDIR`),
+/// and the process id keeps concurrent runs writing distinct outputs from
+/// colliding on the temp name.
+fn temp_sibling(path: &Path, tag: &str) -> PathBuf {
+    let mut name = path.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
+    name.push(format!(".{tag}.{}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Split an MI tag value into its integer base and trailing strand suffix.
+///
+/// `b"381"` → `(381, b"")`; `b"381/A"` → `(381, b"/A")`. The suffix (including the
+/// `/`) is returned verbatim so duplex `/A`,`/B` strand labels round-trip
+/// unchanged when only the base is renumbered.
+fn split_mi_base(mi: &[u8]) -> Result<(u64, &[u8])> {
+    let split = mi.iter().position(|&c| c == b'/').unwrap_or(mi.len());
+    let (base_bytes, suffix) = mi.split_at(split);
+    let base = std::str::from_utf8(base_bytes)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "MI tag {:?} does not start with an integer molecule id",
+                String::from_utf8_lossy(mi)
+            )
+        })?;
+    Ok((base, suffix))
+}
+
+/// Renumber the MI tags of a template-coordinate-sorted grouped BAM so molecule
+/// ids increase monotonically in file order.
+///
+/// Reads the sorted `input` — whose records are same-MI-consecutive but carry the
+/// pre-sort MI ids — mints a fresh base `1, 2, 3, …` each time the MI base
+/// changes, and writes the result to `output` at `compression_level`. Because
+/// each simulated molecule maps to a single position, its records form one
+/// contiguous run in template-coordinate order, so a monotonic counter over
+/// base changes yields strictly-increasing, same-MI-consecutive bases regardless
+/// of the pre-sort id order. Duplex `/A`,`/B` strands share a molecule (and a
+/// base), so the suffix is preserved and only the base is rewritten. Returns the
+/// `old base → new base` map so the truth TSV can be remapped to match.
+fn renumber_sorted_mi(
+    input: &Path,
+    output: &Path,
+    threads: usize,
+    compression_level: u32,
+) -> Result<HashMap<u64, u64>> {
+    let (mut reader, header) = create_raw_bam_reader(input, threads)?;
+    let mut writer = create_raw_bam_writer(output, &header, threads, compression_level)?;
+
+    let mut old_to_new: HashMap<u64, u64> = HashMap::new();
+    let mut current_old_base: Option<u64> = None;
+    let mut next_new_base: u64 = 0;
+    let mut mi_buf: Vec<u8> = Vec::new();
+
+    let mut record = RawRecord::default();
+    while reader.read_record(&mut record)? != 0 {
+        let mi = find_string_tag(aux_data_slice(record.as_ref()), SamTag::MI).ok_or_else(|| {
+            anyhow::anyhow!(
+                "simulated record is missing an MI tag; every grouped-reads record must be \
+                 MI-tagged"
+            )
+        })?;
+        let (old_base, suffix) = split_mi_base(mi)?;
+
+        // Records are same-MI-consecutive, so the base only changes at a molecule
+        // boundary. Mint a fresh, strictly-increasing base there; a duplex
+        // molecule's /A and /B strands share the base minted for its run.
+        let new_base = if current_old_base == Some(old_base) {
+            next_new_base
+        } else {
+            next_new_base += 1;
+            current_old_base = Some(old_base);
+            old_to_new.insert(old_base, next_new_base);
+            next_new_base
+        };
+
+        // `suffix` borrows `record`; capture the new value before the mutable
+        // borrow taken by `update_string_tag`.
+        mi_buf.clear();
+        write!(mi_buf, "{new_base}").expect("writing to a Vec cannot fail");
+        mi_buf.extend_from_slice(suffix);
+        update_string_tag(record.as_mut_vec(), SamTag::MI, &mi_buf);
+
+        writer.write_raw_record(record.as_ref())?;
+    }
+    writer.finish()?;
+    Ok(old_to_new)
+}
+
+/// Stream the truth TSV from `input` to `output`, rewriting the `molecule_id` and
+/// `mi_tag` columns so they match the renumbered BAM.
+///
+/// The truth file is written during generation with the pre-sort molecule ids
+/// (see [`GroupedReads::generate_records_inner`]); this maps both id columns
+/// through `old_to_new` so a consumer that joins the truth to the renumbered BAM
+/// by MI still lines up. Rows are read and written line by line (never buffering
+/// the whole file) to preserve the command's streaming design on large
+/// simulations. Every id that appears in the truth was emitted to the BAM (truth
+/// rows are written per generated pair), so an unmapped id is a bug rather than an
+/// expected case, and is surfaced as an error.
+fn remap_truth_mi(input: &Path, output: &Path, old_to_new: &HashMap<u64, u64>) -> Result<()> {
+    /// Column indices in the truth TSV header
+    /// (`read_name  true_umi  molecule_id  mi_tag  chrom  position  strand`).
+    const MOLECULE_ID_COL: usize = 2;
+    const MI_TAG_COL: usize = 3;
+
+    let reader = BufReader::new(
+        File::open(input)
+            .with_context(|| format!("Failed to read truth file {}", input.display()))?,
+    );
+    let mut writer = BufWriter::new(
+        File::create(output).with_context(|| format!("Failed to create {}", output.display()))?,
+    );
+
+    for (row, line) in reader.lines().enumerate() {
+        let line = line?;
+        // Row 0 is the column header; pass it through unchanged.
+        if row == 0 {
+            writeln!(writer, "{line}")?;
+            continue;
+        }
+
+        let mut cols: Vec<String> = line.split('\t').map(str::to_owned).collect();
+        anyhow::ensure!(
+            cols.len() > MI_TAG_COL,
+            "truth row has too few columns to remap: {line:?}"
+        );
+
+        let old_mol: u64 = cols[MOLECULE_ID_COL]
+            .parse()
+            .with_context(|| format!("truth molecule_id is not an integer: {line:?}"))?;
+        cols[MOLECULE_ID_COL] = lookup_new(old_to_new, old_mol)?.to_string();
+
+        // `split_mi_base` borrows `cols[MI_TAG_COL]`; own the suffix before the
+        // column is reassigned.
+        let (old_base, suffix) = {
+            let (base, suffix) = split_mi_base(cols[MI_TAG_COL].as_bytes())?;
+            (base, suffix.to_vec())
+        };
+        let new_base = lookup_new(old_to_new, old_base)?;
+        cols[MI_TAG_COL] = format!("{new_base}{}", String::from_utf8_lossy(&suffix));
+
+        writeln!(writer, "{}", cols.join("\t"))?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Look up a renumbered molecule id, erroring if the pre-sort id was never seen
+/// in the sorted BAM (which would mean the truth and BAM disagree on membership).
+fn lookup_new(old_to_new: &HashMap<u64, u64>, old_base: u64) -> Result<u64> {
+    old_to_new.get(&old_base).copied().ok_or_else(|| {
+        anyhow::anyhow!(
+            "truth references molecule id {old_base}, which is absent from the sorted BAM"
+        )
+    })
 }
 
 impl GroupedReads {
@@ -292,18 +524,18 @@ impl GroupedReads {
     fn generate_records(
         &self,
         mut sink: RecordSink,
+        truth_path: &Path,
         params: &GenerationParams,
         ref_genome: &ReferenceGenome,
         position_table: &[(usize, usize)],
-        num_positions: usize,
         seed_rng: &mut impl Rng,
     ) -> Result<usize> {
         let result = self.generate_records_inner(
             &mut sink,
+            truth_path,
             params,
             ref_genome,
             position_table,
-            num_positions,
             seed_rng,
         );
         match result {
@@ -327,15 +559,21 @@ impl GroupedReads {
     fn generate_records_inner(
         &self,
         sink: &mut RecordSink,
+        truth_path: &Path,
         params: &GenerationParams,
         ref_genome: &ReferenceGenome,
         position_table: &[(usize, usize)],
-        num_positions: usize,
         seed_rng: &mut impl Rng,
     ) -> Result<usize> {
-        // Create truth file
-        let truth_file = File::create(&self.truth_output)
-            .with_context(|| format!("Failed to create {}", self.truth_output.display()))?;
+        // `sample_positions` returns exactly one entry per requested position, so
+        // the table length is the position count the molecule stride wraps over.
+        let num_positions = position_table.len();
+
+        // Create truth file. This is a staging path (see `execute`): it holds the
+        // pre-renumber ids and is remapped and published only once the renumbered
+        // BAM is also written.
+        let truth_file = File::create(truth_path)
+            .with_context(|| format!("Failed to create {}", truth_path.display()))?;
         let mut truth_writer = BufWriter::new(truth_file);
         writeln!(
             truth_writer,
@@ -1638,5 +1876,28 @@ mod tests {
                  A-strand and a B-strand pair; saw_a={saw_a}, saw_b={saw_b}"
             );
         }
+    }
+
+    #[rstest]
+    #[case::simplex_zero(b"0", 0, b"")]
+    #[case::simplex(b"381", 381, b"")]
+    #[case::duplex_a(b"381/A", 381, b"/A")]
+    #[case::duplex_b(b"42/B", 42, b"/B")]
+    fn split_mi_base_parses_base_and_suffix(
+        #[case] mi: &[u8],
+        #[case] expected_base: u64,
+        #[case] expected_suffix: &[u8],
+    ) {
+        let (base, suffix) = split_mi_base(mi).expect("valid MI");
+        assert_eq!(base, expected_base);
+        assert_eq!(suffix, expected_suffix);
+    }
+
+    #[rstest]
+    #[case::empty(b"")]
+    #[case::non_numeric(b"abc")]
+    #[case::suffix_only(b"/A")]
+    fn split_mi_base_rejects_non_integer_base(#[case] mi: &[u8]) {
+        assert!(split_mi_base(mi).is_err(), "expected {mi:?} to be rejected");
     }
 }
