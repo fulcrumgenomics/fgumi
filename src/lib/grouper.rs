@@ -595,13 +595,18 @@ fn group_by_name_and_build<T>(
 
     for decoded in records {
         let name_hash = decoded.key.name_hash;
-        let read_name = fgumi_raw_bam::read_name(&decoded.data).to_vec();
-        let item = extract(decoded)?;
 
         // name_hash is a fast pre-check; confirm QNAME bytes to guard against
-        // hash collisions merging unrelated templates.
-        let same = current_name_hash == Some(name_hash)
-            && current_name.as_deref() == Some(read_name.as_slice());
+        // hash collisions merging unrelated templates. Compare the name via a
+        // borrow (and only copy it out when a new group starts) so records within
+        // a group don't each allocate a QNAME `Vec` — the borrow must end before
+        // `extract` consumes `decoded`.
+        let read_name = fgumi_raw_bam::read_name(&decoded.data);
+        let same =
+            current_name_hash == Some(name_hash) && current_name.as_deref() == Some(read_name);
+        let new_name = if same { None } else { Some(read_name.to_vec()) };
+
+        let item = extract(decoded)?;
         if same {
             current_items.push(item);
         } else if current_name_hash.is_some() {
@@ -609,11 +614,11 @@ fn group_by_name_and_build<T>(
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             templates.push(template);
             current_name_hash = Some(name_hash);
-            current_name = Some(read_name);
+            current_name = new_name;
             current_items.push(item);
         } else {
             current_name_hash = Some(name_hash);
-            current_name = Some(read_name);
+            current_name = new_name;
             current_items.push(item);
         }
     }

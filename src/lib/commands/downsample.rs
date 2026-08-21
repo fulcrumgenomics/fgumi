@@ -363,8 +363,10 @@ where
         while let Some(peek_result) = self.records.peek() {
             match peek_result {
                 Ok(record) => {
-                    let record_mi = get_mi_tag(record)?;
-                    if record_mi != mi {
+                    // Compare the MI against the family key without allocating a
+                    // `String` per record — the family key was already materialized
+                    // once above.
+                    if !mi_tag_equals(record, mi.as_bytes())? {
                         break;
                     }
                     // Consume the record — next() is Some because peek() was Some
@@ -397,6 +399,32 @@ fn get_mi_tag(record: &RawRecord) -> Result<String> {
 
     if let Some(v) = find_int_tag(aux, SamTag::MI) {
         return Ok(v.to_string());
+    }
+
+    let name = String::from_utf8_lossy(read_name(record.as_ref())).into_owned();
+    let display_name = if name.is_empty() { "<unknown>".to_string() } else { name };
+    bail!("Read '{display_name}' is missing required MI tag")
+}
+
+/// Whether a record's MI tag equals `target`, without allocating.
+///
+/// Mirrors [`get_mi_tag`]'s type handling (Z-typed first, then an integer
+/// encoding), but compares against `target` in place rather than building a
+/// `String` for every record — the family-key `String` is materialized only
+/// once per family. The Z path still validates UTF-8 so an invalid MI is an
+/// error exactly as in [`get_mi_tag`]; the legacy integer path is rare and falls
+/// back to rendering.
+fn mi_tag_equals(record: &RawRecord, target: &[u8]) -> Result<bool> {
+    let aux = aux_data_slice(record.as_ref());
+
+    if let Some(bytes) = find_string_tag(aux, SamTag::MI) {
+        std::str::from_utf8(bytes)
+            .map_err(|e| anyhow::anyhow!("MI tag is not valid UTF-8: {e}"))?;
+        return Ok(bytes == target);
+    }
+
+    if let Some(v) = find_int_tag(aux, SamTag::MI) {
+        return Ok(v.to_string().as_bytes() == target);
     }
 
     let name = String::from_utf8_lossy(read_name(record.as_ref())).into_owned();
@@ -443,11 +471,55 @@ mod tests {
         b.build()
     }
 
+    /// Create a test record with a raw-bytes (Z-typed) MI tag, allowing invalid
+    /// UTF-8 that `&str` cannot express.
+    fn create_test_record_bytes_mi(name: &str, mi: &[u8]) -> RawRecord {
+        let mut b = RawSamBuilder::new();
+        b.read_name(name.as_bytes());
+        b.add_string_tag(SamTag::MI, mi);
+        b.build()
+    }
+
     /// Create a test record without an MI tag.
     fn create_test_record_no_mi(name: &str) -> RawRecord {
         let mut b = RawSamBuilder::new();
         b.read_name(name.as_bytes());
         b.build()
+    }
+
+    /// `mi_tag_equals` must agree with a `get_mi_tag` + compare for both Z and
+    /// integer MI encodings, and error on a missing MI exactly as `get_mi_tag`
+    /// does — it is the allocation-free replacement for that comparison.
+    #[test]
+    fn test_mi_tag_equals_matches_get_mi_tag() {
+        // Z-typed MI: match and mismatch.
+        let z = create_test_record("read1", "12345");
+        assert!(mi_tag_equals(&z, b"12345").unwrap());
+        assert!(!mi_tag_equals(&z, b"12346").unwrap());
+        assert!(!mi_tag_equals(&z, b"1234").unwrap()); // prefix is not a match
+        assert!(mi_tag_equals(&z, get_mi_tag(&z).unwrap().as_bytes()).unwrap());
+
+        // Integer-typed MI renders the same way get_mi_tag does.
+        let i = create_test_record_int_mi("read2", 421);
+        assert!(mi_tag_equals(&i, b"421").unwrap());
+        assert!(!mi_tag_equals(&i, b"420").unwrap());
+        assert!(mi_tag_equals(&i, get_mi_tag(&i).unwrap().as_bytes()).unwrap());
+
+        // A Z-typed MI with invalid UTF-8 is an error, and mi_tag_equals must
+        // surface the same UTF-8 error as get_mi_tag rather than reporting a
+        // (mis)match against the raw bytes.
+        let bad_utf8 = create_test_record_bytes_mi("read3", &[0xff, 0xfe]);
+        let equals_err =
+            mi_tag_equals(&bad_utf8, &[0xff, 0xfe]).expect_err("invalid UTF-8 MI must be an error");
+        let get_err = get_mi_tag(&bad_utf8).expect_err("invalid UTF-8 MI must be an error");
+        assert!(equals_err.to_string().contains("not valid UTF-8"));
+        assert!(get_err.to_string().contains("not valid UTF-8"));
+        assert_eq!(equals_err.to_string(), get_err.to_string());
+
+        // Missing MI is an error, matching get_mi_tag.
+        let none = create_test_record_no_mi("read4");
+        assert!(mi_tag_equals(&none, b"anything").is_err());
+        assert!(get_mi_tag(&none).is_err());
     }
 
     /// Canonical `BamIoOptions` used by `Downsample` test constructors.

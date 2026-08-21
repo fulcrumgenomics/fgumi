@@ -641,11 +641,25 @@ pub fn apply_overlapping_consensus(
             continue;
         }
 
-        let name = view.read_name().to_vec();
+        // Look the name up by borrow and only copy it into an owned key when a
+        // new pair is inserted. `entry(name.to_vec())` would allocate a QNAME
+        // `Vec` for every record and then discard it whenever the key already
+        // exists (i.e. on the second read of each pair).
+        let name = view.read_name();
         if flg & fgumi_raw_bam::flags::FIRST_SEGMENT != 0 {
-            read_pairs.entry(name).or_insert((None, None)).0 = Some(idx);
+            match read_pairs.get_mut(name) {
+                Some(pair) => pair.0 = Some(idx),
+                None => {
+                    read_pairs.insert(name.to_vec(), (Some(idx), None));
+                }
+            }
         } else if flg & fgumi_raw_bam::flags::LAST_SEGMENT != 0 {
-            read_pairs.entry(name).or_insert((None, None)).1 = Some(idx);
+            match read_pairs.get_mut(name) {
+                Some(pair) => pair.1 = Some(idx),
+                None => {
+                    read_pairs.insert(name.to_vec(), (None, Some(idx)));
+                }
+            }
         }
     }
 
