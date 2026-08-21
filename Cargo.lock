@@ -868,6 +868,7 @@ dependencies = [
  "fgumi-tag",
  "log",
  "noodles",
+ "proptest",
  "rstest",
  "tempfile",
 ]

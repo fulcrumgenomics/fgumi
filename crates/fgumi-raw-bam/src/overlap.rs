@@ -168,6 +168,10 @@ pub fn num_bases_extending_past_mate_vs_mate_raw(rec: &[u8], mate: &[u8]) -> usi
 /// points: given the mate's 1-based leftmost position and its CIGAR ops, returns how many bases
 /// at the read's 3' (sequencing) end extend past the mate.
 ///
+/// Pure geometry: takes strand, positions, and BAM-encoded CIGAR ops (`(len << 4) | op_code`,
+/// same encoding as [`crate::cigar::get_cigar_ops`]) rather than a raw record, so the count can
+/// be reached from decoded CIGAR ops without a raw record in hand.
+///
 /// # Distances are measured in query space
 ///
 /// Both distances are counted in **query** bases from a reference position the two reads
@@ -229,27 +233,28 @@ pub fn num_bases_extending_past_mate_vs_mate_raw(rec: &[u8], mate: &[u8]) -> usi
 /// *on this record*, while [`num_bases_extending_past_mate_vs_mate_raw`] measures against the
 /// mate record in hand — so a stale mate-position field admits the mirror image.
 #[must_use]
-fn bases_extending_past_mate(bam: &[u8], mate_pos_1based: i32, mate_ops: &[u32]) -> usize {
-    let v = RawRecordView::new(bam);
-    let is_reverse = v.flags() & flags::REVERSE != 0;
-    let this_pos = v.pos() + 1; // 1-based
-
-    let cigar_ops = get_cigar_ops(bam);
-    let read_end = alignment_end_1based(this_pos, &cigar_ops);
+pub fn bases_extending_past_mate_ops(
+    is_reverse: bool,
+    this_pos_1based: i32,
+    this_ops: &[u32],
+    mate_pos_1based: i32,
+    mate_ops: &[u32],
+) -> usize {
+    let read_end = alignment_end_1based(this_pos_1based, this_ops);
     let mate_end = alignment_end_1based(mate_pos_1based, mate_ops);
 
     if is_reverse {
         // Negative strand: the read's 3' end is its leftmost, so it is measured against the
         // mate's alignment *start*.
-        if this_pos > mate_end {
+        if this_pos_1based > mate_end {
             // The read begins after the mate's alignment ends; see "stops short" above. The gap
             // is non-negative by construction (mate_unclipped_start <= mate_pos <= mate_end <
             // this_pos), and saturating only because an adversarial mate CIGAR can push
             // mate_unclipped_start to i32::MIN, where a plain subtraction would overflow i32 —
             // a panic in debug, garbage in release.
             let (mate_unclipped_start, _) = mate_soft_unclipped_from_ops(mate_pos_1based, mate_ops);
-            let gap = this_pos.saturating_sub(mate_unclipped_start).cast_unsigned() as usize;
-            return leading_soft_clip_from_ops(&cigar_ops).saturating_sub(gap);
+            let gap = this_pos_1based.saturating_sub(mate_unclipped_start).cast_unsigned() as usize;
+            return leading_soft_clip_from_ops(this_ops).saturating_sub(gap);
         }
         if read_end < mate_pos_1based {
             // The mate lies entirely to the right of a read whose 3' end faces left; see "far
@@ -258,8 +263,8 @@ fn bases_extending_past_mate(bam: &[u8], mate_pos_1based: i32, mate_ops: &[u32])
         }
         // Equalize the query bases the two reads have *before* the first reference position they
         // share.
-        let first_shared = this_pos.max(mate_pos_1based);
-        let read_before = query_bases_before_ref_pos(&cigar_ops, this_pos, first_shared);
+        let first_shared = this_pos_1based.max(mate_pos_1based);
+        let read_before = query_bases_before_ref_pos(this_ops, this_pos_1based, first_shared);
         let mate_before = query_bases_before_ref_pos(mate_ops, mate_pos_1based, first_shared);
         read_before.saturating_sub(mate_before)
     } else {
@@ -271,19 +276,29 @@ fn bases_extending_past_mate(bam: &[u8], mate_pos_1based: i32, mate_ops: &[u32])
             // mate_unclipped_end); saturating for symmetry with the reverse branch.
             let (_, mate_unclipped_end) = mate_soft_unclipped_from_ops(mate_pos_1based, mate_ops);
             let gap = mate_unclipped_end.saturating_sub(read_end).cast_unsigned() as usize;
-            return trailing_soft_clip_from_ops(&cigar_ops).saturating_sub(gap);
+            return trailing_soft_clip_from_ops(this_ops).saturating_sub(gap);
         }
-        if mate_end < this_pos {
+        if mate_end < this_pos_1based {
             // The mate lies entirely to the left of a read whose 3' end faces right; see "far
             // side" above.
             return 0;
         }
         // Equalize the query bases past the last reference position they share.
         let last_shared = read_end.min(mate_end);
-        let read_past = query_bases_past_ref_pos(&cigar_ops, this_pos, last_shared);
+        let read_past = query_bases_past_ref_pos(this_ops, this_pos_1based, last_shared);
         let mate_past = query_bases_past_ref_pos(mate_ops, mate_pos_1based, last_shared);
         read_past.saturating_sub(mate_past)
     }
+}
+
+/// Thin adapter over [`bases_extending_past_mate_ops`]: reads strand, position, and CIGAR from
+/// the raw record and delegates the geometry to the pure core.
+fn bases_extending_past_mate(bam: &[u8], mate_pos_1based: i32, mate_ops: &[u32]) -> usize {
+    let v = RawRecordView::new(bam);
+    let is_reverse = v.flags() & flags::REVERSE != 0;
+    let this_pos = v.pos() + 1; // 1-based
+    let cigar_ops = get_cigar_ops(bam);
+    bases_extending_past_mate_ops(is_reverse, this_pos, &cigar_ops, mate_pos_1based, mate_ops)
 }
 
 /// 1-based inclusive alignment end for an alignment starting at `pos_1based`.
@@ -317,7 +332,7 @@ fn saturating_reference_length(cigar_ops: &[u32]) -> i32 {
 /// Mate's soft-only unclipped start/end (1-based) from the mate's CIGAR **ops**. Only soft clips
 /// count — hard clips are excluded — matching fgbio `mateUnSoftClippedStart`/`mateUnSoftClippedEnd`.
 ///
-/// Used only by [`bases_extending_past_mate`]'s stops-short branch: these boundaries mix a query
+/// Used only by [`bases_extending_past_mate_ops`]'s stops-short branch: these boundaries mix a query
 /// distance (the soft clip) into a reference coordinate, which is sound only when no aligned base
 /// lies between the two reads.
 fn mate_soft_unclipped_from_ops(mate_pos_1based: i32, mate_ops: &[u32]) -> (i32, i32) {
@@ -573,6 +588,45 @@ mod tests {
     use super::*;
     use crate::testutil::*;
     use rstest::rstest;
+
+    // ========================================================================
+    // bases_extending_past_mate_ops tests
+    // ========================================================================
+
+    #[test]
+    fn ops_core_matches_record_entry_for_indel_pair() {
+        // 100bp read, positive strand, 70M10I20M then read-through; mate 80S20M at 1019.
+        // Encode via testutil::encode_op (M=0,I=1,S=4).
+        use crate::testutil::encode_op;
+        let this_ops = vec![encode_op(0, 70), encode_op(1, 10), encode_op(0, 20)];
+        let mate_ops = vec![encode_op(4, 80), encode_op(0, 20)];
+        // Positive strand read at 1000, mate at 1019.
+        let via_ops = bases_extending_past_mate_ops(false, 1000, &this_ops, 1019, &mate_ops);
+        // The last shared reference position is the mate's alignment end: mate 80S20M@1019 ends
+        // at 1019 + 20 - 1 = 1038, and the read 70M10I20M@1000 spans ref 1000-1089. Through ref
+        // 1038 the read has aligned 39 query bases (ref 1000-1038); the remaining 61 (31 aligned
+        // bases over ref 1039-1069, the 10I insertion, and the final 20M) extend past the mate,
+        // which has none, so the clip is 100 - 39 = 61.
+        assert_eq!(via_ops, 61, "exact query-space clip past the mate");
+
+        // The private adapter must agree with the pure ops-core when given a raw record
+        // carrying the same strand/pos/cigar: this proves it extracts is_reverse/pos/cigar
+        // correctly and delegates to the core unchanged.
+        let rec = make_bam_bytes_with_tlen(
+            0,
+            999, // 0-based pos (1-based 1000)
+            flags::PAIRED,
+            b"rea",
+            &this_ops,
+            100,
+            0,
+            1018, // 0-based mate pos (1-based 1019)
+            0,
+            &[],
+        );
+        let via_adapter = bases_extending_past_mate(&rec, 1019, &mate_ops);
+        assert_eq!(via_ops, via_adapter, "adapter must agree with the pure ops-core");
+    }
 
     // ========================================================================
     // parse_mc_cigar_ops tests

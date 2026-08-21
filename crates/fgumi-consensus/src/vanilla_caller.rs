@@ -599,9 +599,16 @@ impl VanillaUmiConsensusCaller {
         original_idx: usize,
     ) -> Option<SourceRead> {
         use fgumi_sam::clipper::cigar_utils;
-        use fgumi_sam::record_utils;
 
-        let mate_clip = record_utils::num_bases_extending_past_mate(read);
+        // The query-space past-mate count now lives solely in fgumi-raw-bam's raw-byte core
+        // (record_utils::num_bases_extending_past_mate, the RecordBuf/reference-space copy,
+        // was removed as stale — issue #760). This bridge only has a RecordBuf in hand, so
+        // round-trip it through the BAM wire format to reach the raw-byte entry point; a
+        // header-less default is fine here since num_bases_extending_past_mate_raw reads only
+        // the record's own bytes (position, CIGAR, flags, MC tag), never the header.
+        let raw = fgumi_raw_bam::encode_record_buf_to_raw(read, &noodles::sam::Header::default())
+            .expect("encode_record_buf_to_raw should succeed for a well-formed RecordBuf");
+        let mate_clip = fgumi_raw_bam::num_bases_extending_past_mate_raw(raw.as_ref());
         let is_negative_strand = read.flags().is_reverse_complemented();
         let min_bq = self.options.min_input_base_quality;
 

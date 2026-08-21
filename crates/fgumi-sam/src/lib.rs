@@ -29,7 +29,6 @@
 //! - [`record_utils::read_pos_at_ref_pos`] - Map reference position to read position
 //! - [`record_utils::is_fr_pair_from_tags`] - Check if read is part of FR pair using tags
 //! - [`record_utils::mate_unclipped_start`] / [`record_utils::mate_unclipped_end`] - Get mate boundaries from MC tag
-//! - [`record_utils::num_bases_extending_past_mate`] - Calculate overlap with mate
 //! - [`record_utils::parse_cigar_string`] - Parse CIGAR string to operations
 
 pub mod alignment_tags;
@@ -117,9 +116,9 @@ pub use fgumi_tag::SamTag;
 pub use record_utils::{
     PairOrientation, alignment_end, cigar_reference_length, get_pair_orientation, is_fr_pair,
     is_fr_pair_from_tags, leading_clipping, leading_soft_clipping, mate_unclipped_end,
-    mate_unclipped_start, num_bases_extending_past_mate, parse_cigar_string, read_pos_at_ref_pos,
-    reference_length, trailing_clipping, trailing_soft_clipping, unclipped_end,
-    unclipped_five_prime_position, unclipped_start,
+    mate_unclipped_start, parse_cigar_string, read_pos_at_ref_pos, reference_length,
+    trailing_clipping, trailing_soft_clipping, unclipped_end, unclipped_five_prime_position,
+    unclipped_start,
 };
 pub use template_coordinate::{TC_TAG, TemplateCoordinateInfo};
 

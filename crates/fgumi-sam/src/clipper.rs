@@ -768,192 +768,6 @@ impl SamRecordClipper {
         if swapped { (clipped_r2, clipped_r1) } else { (clipped_r1, clipped_r2) }
     }
 
-    /// Calculates the number of bases in a read that extend past the mate's unclipped boundary
-    ///
-    /// This matches fgbio's `numBasesExtendingPastMate` function exactly.
-    ///
-    /// # Arguments
-    /// * `record` - The SAM record to check
-    /// * `mate_unclipped_start` - The mate's unclipped start position
-    /// * `mate_unclipped_end` - The mate's unclipped end position
-    ///
-    /// # Returns
-    /// The number of bases that extend past the mate's boundary, or 0 if not applicable
-    // RecordBuf kept: reads flags via record.flags().is_reverse_complemented() (noodles typed
-    // Flags), CIGAR via typed iterator to sum read length and reference length
-    // (cigar_utils::reference_length), alignment_start via noodles Position, and delegates to
-    // record_utils::read_pos_at_ref_pos.  A raw equivalent
-    // (num_bases_extending_past_mate_raw) exists in fgumi-raw-bam for the hot-path consensus
-    // overlap caller; this typed version serves the fgumi-sam clipper callers.
-    #[must_use]
-    pub fn num_bases_extending_past_mate(
-        record: &RecordBuf,
-        mate_unclipped_start: usize,
-        mate_unclipped_end: usize,
-    ) -> usize {
-        // Note: FR pair check is done in the caller (clip_extending_past_mate_ends)
-        // so we don't need to check it here
-
-        let is_positive_strand = !record.flags().is_reverse_complemented();
-
-        // Get read length (total bases in the read, excluding hard clips)
-        let read_length: usize = record
-            .cigar()
-            .iter()
-            .filter_map(Result::ok)
-            .filter(|op| {
-                matches!(
-                    op.kind(),
-                    Kind::Match
-                        | Kind::SequenceMatch
-                        | Kind::SequenceMismatch
-                        | Kind::Insertion
-                        | Kind::SoftClip
-                )
-            })
-            .map(CigarOp::len)
-            .sum();
-
-        if is_positive_strand {
-            // Positive strand: check if read extends past mate's unclipped end
-            let Some(alignment_start) = record.alignment_start().map(usize::from) else {
-                return 0;
-            };
-            let alignment_end =
-                alignment_start + cigar_utils::reference_length(&record.cigar()).saturating_sub(1);
-
-            if alignment_end >= mate_unclipped_end {
-                // Aligned portion reaches or extends past mate's unclipped end
-                // Use readPosAtRefPos to find where in the read the mate ends
-                // fgbio: Math.max(0, rec.length - rec.readPosAtRefPos(pos=mateUnclippedEnd, returnLastBaseIfDeleted=false))
-                let pos_at_mate_end =
-                    record_utils::read_pos_at_ref_pos(record, mate_unclipped_end, false);
-                // When pos_at_mate_end is 0 (position in deletion or outside alignment),
-                // fgbio's formula gives: max(0, read_length - 0) = read_length (clip all)
-                read_length.saturating_sub(pos_at_mate_end)
-            } else {
-                // Aligned portion ends before mate's unclipped end
-                // Only clip excess soft-clipped bases that extend past the mate
-                let trailing_soft_clip = Self::trailing_soft_clips(record.cigar());
-                let gap = mate_unclipped_end - alignment_end;
-                trailing_soft_clip.saturating_sub(gap)
-            }
-        } else {
-            // Negative strand: check if read extends before mate's unclipped start
-            let Some(alignment_start) = record.alignment_start().map(usize::from) else {
-                return 0;
-            };
-
-            if alignment_start > mate_unclipped_start {
-                // Aligned portion starts after mate's unclipped start
-                // Only clip excess soft-clipped bases that extend before the mate
-                let leading_soft_clip = Self::leading_soft_clips(record.cigar());
-                let gap = alignment_start - mate_unclipped_start;
-                leading_soft_clip.saturating_sub(gap)
-            } else {
-                // Aligned portion starts at or before mate's unclipped start
-                // Use readPosAtRefPos to find where in the read the mate starts
-                // fgbio: Math.max(0, rec.readPosAtRefPos(pos=mateUnclippedStart, returnLastBaseIfDeleted=false) - 1)
-                let pos_at_mate_start =
-                    record_utils::read_pos_at_ref_pos(record, mate_unclipped_start, false);
-                // When pos_at_mate_start is 0 (position in deletion or outside alignment),
-                // fgbio's formula gives: max(0, 0 - 1) = 0 (clip nothing)
-                // pos_at_mate_start is 1-based, so subtract 1 to get bases before it
-                pos_at_mate_start.saturating_sub(1)
-            }
-        }
-    }
-
-    /// Clips reads that extend beyond their mate's alignment ends
-    ///
-    /// This matches fgbio's `clipExtendingPastMateEnds` function exactly.
-    ///
-    /// **Important:** Only clips reads that are in FR (forward-reverse) orientation.
-    /// Non-FR pairs (FF, RR, RF) are not clipped.
-    ///
-    /// Returns (`bases_clipped_r1`, `bases_clipped_r2`)
-    // RecordBuf kept: delegates orientation check to record_utils::is_fr_pair and unclipped
-    // position helpers (all RecordBuf-kept); clip operations delegate to
-    // clip_single_read_extending_past_mate.
-    pub fn clip_extending_past_mate_ends(
-        &self,
-        r1: &mut RecordBuf,
-        r2: &mut RecordBuf,
-    ) -> (usize, usize) {
-        // Check if this is a valid FR pair before clipping
-        if !record_utils::is_fr_pair(r1, r2) {
-            return (0, 0);
-        }
-
-        // Bound each read's window by the mate's *un-soft-clipped* span (soft clips only;
-        // hard-clipped bases are physically absent), matching fgbio's use of
-        // `mate.unSoftClippedStart` / `unSoftClippedEnd` in `clipExtendingPastMateEnds`.
-        let r1_unclipped_start = record_utils::unsoftclipped_start(r1);
-        let r1_unclipped_end = record_utils::unsoftclipped_end(r1);
-        let r2_unclipped_start = record_utils::unsoftclipped_start(r2);
-        let r2_unclipped_end = record_utils::unsoftclipped_end(r2);
-
-        let (Some(r1_start), Some(r1_end), Some(r2_start), Some(r2_end)) =
-            (r1_unclipped_start, r1_unclipped_end, r2_unclipped_start, r2_unclipped_end)
-        else {
-            return (0, 0);
-        };
-
-        // Clip each read individually using fgbio's algorithm
-        let clipped_r1 = self.clip_single_read_extending_past_mate(r1, r2_start, r2_end);
-        let clipped_r2 = self.clip_single_read_extending_past_mate(r2, r1_start, r1_end);
-
-        (clipped_r1, clipped_r2)
-    }
-
-    /// Clips a single read if it extends past its mate's alignment boundaries.
-    ///
-    /// This matches fgbio's `clipExtendingPastMateEnd` private method exactly.
-    ///
-    /// - Positive strand reads: clips from the 3' end (end of read)
-    /// - Negative strand reads: clips from the 5' end (start of read)
-    // RecordBuf kept: reads rec.flags().is_reverse_complemented() via noodles typed Flags;
-    // delegates to clip_end/start_of_read and num_bases_extending_past_mate (all RecordBuf-kept).
-    fn clip_single_read_extending_past_mate(
-        &self,
-        rec: &mut RecordBuf,
-        mate_unclipped_start: usize,
-        mate_unclipped_end: usize,
-    ) -> usize {
-        // Calculate how many bases extend past the mate
-        let total_clipped_bases =
-            Self::num_bases_extending_past_mate(rec, mate_unclipped_start, mate_unclipped_end);
-
-        if total_clipped_bases == 0 {
-            return 0;
-        }
-
-        // Clip based on strand
-        let is_positive = !rec.flags().is_reverse_complemented();
-        if is_positive {
-            // Positive strand: clip from end of read (3' in sequencing order)
-            self.clip_end_of_read(rec, total_clipped_bases)
-        } else {
-            // Negative strand: clip from start of read (5' in sequencing order, which is 3' in read orientation)
-            self.clip_start_of_read(rec, total_clipped_bases)
-        }
-    }
-
-    /// Count leading soft clips
-    // RecordBuf kept: accepts noodles CigarBuf (typed CIGAR) — converts ops to (Kind, usize)
-    // pairs and delegates to record_utils::leading_soft_clipping.
-    fn leading_soft_clips(cigar: &noodles::sam::alignment::record_buf::Cigar) -> usize {
-        let ops: Vec<_> = cigar.as_ref().iter().map(|op| (op.kind(), op.len())).collect();
-        record_utils::leading_soft_clipping(&ops)
-    }
-
-    /// Count trailing soft clips
-    // RecordBuf kept: same as leading_soft_clips; accepts noodles CigarBuf.
-    fn trailing_soft_clips(cigar: &noodles::sam::alignment::record_buf::Cigar) -> usize {
-        let ops: Vec<_> = cigar.as_ref().iter().map(|op| (op.kind(), op.len())).collect();
-        record_utils::trailing_soft_clipping(&ops)
-    }
-
     /// Helper function to calculate query bases corresponding to a reference region
     ///
     /// Given a reference length, calculates how many query bases correspond to that region
@@ -2092,120 +1906,44 @@ impl RawRecordClipper {
         if swapped { (clipped_r2, clipped_r1) } else { (clipped_r1, clipped_r2) }
     }
 
-    /// Returns the number of bases extending past the mate's boundaries.
-    ///
-    /// Raw-byte equivalent of [`SamRecordClipper::num_bases_extending_past_mate`].
-    #[must_use]
-    pub fn num_bases_extending_past_mate_raw(
-        record: &fgumi_raw_bam::RawRecord,
-        mate_unclipped_start: usize,
-        mate_unclipped_end: usize,
-    ) -> usize {
-        let flg = record.flags();
-        let is_positive_strand = flg & fgumi_raw_bam::flags::REVERSE == 0;
-
-        let cigar_ops = record.cigar_ops_vec();
-        let read_length: usize = cigar_ops
-            .iter()
-            .map(|&op| {
-                let t = op & 0xF;
-                let l = (op >> 4) as usize;
-                // M, I, S, =, X consume query
-                if matches!(t, 0 | 1 | 4 | 7 | 8) { l } else { 0 }
-            })
-            .sum();
-
-        let Some(alignment_start) = record.alignment_start_1based() else {
-            return 0;
-        };
-
-        if is_positive_strand {
-            let ref_len = crate::record_utils::cigar_reference_length_raw(&cigar_ops);
-            let alignment_end = alignment_start + ref_len.saturating_sub(1);
-
-            if alignment_end >= mate_unclipped_end {
-                let pos_at_mate_end = fgumi_raw_bam::read_pos_at_ref_pos_raw(
-                    &cigar_ops,
-                    alignment_start,
-                    mate_unclipped_end,
-                    false,
-                )
-                .unwrap_or(0);
-                read_length.saturating_sub(pos_at_mate_end)
-            } else {
-                let trailing_soft_clip =
-                    crate::record_utils::trailing_soft_clipping_raw(&cigar_ops);
-                let gap = mate_unclipped_end - alignment_end;
-                trailing_soft_clip.saturating_sub(gap)
-            }
-        } else if alignment_start > mate_unclipped_start {
-            let leading_soft_clip = crate::record_utils::leading_soft_clipping_raw(&cigar_ops);
-            let gap = alignment_start - mate_unclipped_start;
-            leading_soft_clip.saturating_sub(gap)
-        } else {
-            let pos_at_mate_start = fgumi_raw_bam::read_pos_at_ref_pos_raw(
-                &cigar_ops,
-                alignment_start,
-                mate_unclipped_start,
-                false,
-            )
-            .unwrap_or(0);
-            pos_at_mate_start.saturating_sub(1)
-        }
-    }
-
     /// Clips reads that extend beyond their mate's alignment ends.
     ///
     /// Returns `(bases_clipped_r1, bases_clipped_r2)`.
+    ///
+    /// Delegates the past-mate distance to
+    /// [`fgumi_raw_bam::num_bases_extending_past_mate_vs_mate_raw`], the query-space, mate-in-hand
+    /// count fgbio#1172 lands (fixing issue #760). This raw-byte path backs the LIVE `fgumi clip`
+    /// command; the reference-space `RecordBuf` past-mate methods on [`SamRecordClipper`], which
+    /// `fgumi clip` never constructed, were removed as redundant in the same change. That function
+    /// gates on the symmetric [`fgumi_raw_bam::is_primary_fr_pair_raw`] internally, so no separate
+    /// FR-pair check is needed here.
     pub fn clip_extending_past_mate_ends(
         &self,
         r1: &mut fgumi_raw_bam::RawRecord,
         r2: &mut fgumi_raw_bam::RawRecord,
     ) -> (usize, usize) {
-        if !fgumi_raw_bam::is_fr_pair_raw(r1.as_ref())
-            || !fgumi_raw_bam::is_fr_pair_raw(r2.as_ref())
-        {
-            return (0, 0);
-        }
-
-        // Soft-only mate window (see the RecordBuf sibling above and fgbio
-        // `SamRecordClipper.clipExtendingPastMateEnds`); hard-clipped bases are absent.
-        let r1_unclipped_start = crate::record_utils::unsoftclipped_start_raw(r1.as_ref());
-        let r1_unclipped_end = crate::record_utils::unsoftclipped_end_raw(r1.as_ref());
-        let r2_unclipped_start = crate::record_utils::unsoftclipped_start_raw(r2.as_ref());
-        let r2_unclipped_end = crate::record_utils::unsoftclipped_end_raw(r2.as_ref());
-
-        let (Some(r1_start), Some(r1_end), Some(r2_start), Some(r2_end)) =
-            (r1_unclipped_start, r1_unclipped_end, r2_unclipped_start, r2_unclipped_end)
-        else {
-            return (0, 0);
-        };
-
-        let clipped_r1 = self.clip_single_read_extending_past_mate_raw(r1, r2_start, r2_end);
-        let clipped_r2 = self.clip_single_read_extending_past_mate_raw(r2, r1_start, r1_end);
-
-        (clipped_r1, clipped_r2)
+        // NB: compute BOTH counts before clipping either read (fgbio#1172): otherwise the second
+        // read is measured against an alignment the first clip already shortened. The FR-pair
+        // gate is inside num_bases_extending_past_mate_vs_mate_raw (returns 0 for non-FR).
+        let n1 = fgumi_raw_bam::num_bases_extending_past_mate_vs_mate_raw(r1.as_ref(), r2.as_ref());
+        let n2 = fgumi_raw_bam::num_bases_extending_past_mate_vs_mate_raw(r2.as_ref(), r1.as_ref());
+        let hard1 = Self::existing_hard_clip_3_prime_raw(r1);
+        let hard2 = Self::existing_hard_clip_3_prime_raw(r2);
+        let c1 = if n1 > 0 { self.clip_3_prime_end_of_read_raw(r1, n1 + hard1) } else { 0 };
+        let c2 = if n2 > 0 { self.clip_3_prime_end_of_read_raw(r2, n2 + hard2) } else { 0 };
+        (c1, c2)
     }
 
-    /// Clips a single raw record if it extends past its mate's boundaries.
-    fn clip_single_read_extending_past_mate_raw(
-        &self,
-        rec: &mut fgumi_raw_bam::RawRecord,
-        mate_unclipped_start: usize,
-        mate_unclipped_end: usize,
-    ) -> usize {
-        let total_clipped_bases =
-            Self::num_bases_extending_past_mate_raw(rec, mate_unclipped_start, mate_unclipped_end);
-
-        if total_clipped_bases == 0 {
-            return 0;
-        }
-
-        let is_positive = rec.flags() & fgumi_raw_bam::flags::REVERSE == 0;
-        if is_positive {
-            self.clip_end_of_read_raw(rec, total_clipped_bases)
+    /// Existing hard-clipping at the record's 3' end (trailing for +strand, leading for
+    /// -strand). `clip_3_prime_end_of_read_raw` takes TOTAL desired clipping incl. existing; the
+    /// query-space count excludes hard clips, so they must be added back (fgbio#1172). Zero when
+    /// none present, so applying it unconditionally is a no-op in that case.
+    fn existing_hard_clip_3_prime_raw(rec: &fgumi_raw_bam::RawRecord) -> usize {
+        let ops = rec.cigar_ops_vec();
+        if rec.flags() & fgumi_raw_bam::flags::REVERSE != 0 {
+            ops.iter().take_while(|&&op| (op & 0xF) == 5).map(|&op| (op >> 4) as usize).sum()
         } else {
-            self.clip_start_of_read_raw(rec, total_clipped_bases)
+            ops.iter().rev().take_while(|&&op| (op & 0xF) == 5).map(|&op| (op >> 4) as usize).sum()
         }
     }
 
@@ -2741,6 +2479,7 @@ pub mod cigar_utils {
 mod tests {
     use super::*;
     use crate::builder::RecordBuilder;
+    use proptest::prelude::*;
     use rstest::rstest;
 
     #[test]
@@ -3193,24 +2932,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clip_extending_past_mate_ends() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
-
-        // R1: 1000-1149, R2: 1100-1199
-        // R1 does NOT extend past R2's end (1149 < 1199)
-        // R2 does NOT start before R1's start (1100 > 1000)
-        // So neither should be clipped
-        let mut r1 = create_paired_record("150M", "ACGTACGTACGT", 1000, false, true, 1100, "100M");
-        let mut r2 = create_paired_record("100M", "TGCATGCATGCA", 1100, true, false, 1000, "150M");
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        // Neither should be clipped
-        assert_eq!(clipped_r1, 0);
-        assert_eq!(clipped_r2, 0);
-    }
-
-    #[test]
     fn test_cigar_utils_reference_length() {
         let record = create_test_record("50M10I40M", "ACGTACGTACGT", 1000);
         let ref_len = cigar_utils::reference_length(&record.cigar());
@@ -3454,22 +3175,6 @@ mod tests {
         let mut r2 = create_paired_record("100M", "TGCATGCATGCA", 1050, false, false, 1000, "100M");
 
         let (clipped_r1, clipped_r2) = clipper.clip_overlapping_reads(&mut r1, &mut r2);
-
-        // Should NOT clip because this is not an FR pair
-        assert_eq!(clipped_r1, 0);
-        assert_eq!(clipped_r2, 0);
-    }
-
-    #[test]
-    fn test_clip_extending_past_mate_ends_non_fr_pair() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
-
-        // Create RR pair (both reverse) with extension
-        // R1: 1000-1150, R2: 1100-1200
-        let mut r1 = create_paired_record("150M", "ACGTACGTACGT", 1000, true, true, 1100, "100M");
-        let mut r2 = create_paired_record("100M", "TGCATGCATGCA", 1100, true, true, 1000, "150M");
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
 
         // Should NOT clip because this is not an FR pair
         assert_eq!(clipped_r1, 0);
@@ -4830,156 +4535,6 @@ mod tests {
 
     // Tests for clip_extending_past_mate
 
-    #[test]
-    fn test_clip_extending_past_mate_ends_basic() {
-        // Based on the Scala test: r1 at 100-149, r2 at 90-139
-        // After clipping, both should have same start and end
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
-        let seq = "A".repeat(50);
-        let (mut r1, mut r2) = create_pair(100, "50M", &seq, 90, "50M", &seq);
-
-        // Before: R1: 100-149, R2: 90-139
-        // R1 extends 10 bases past R2's end (149 vs 139), so clip 10 from R1's 3' end
-        // R2 starts 10 bases before R1's start (90 vs 100), so clip 10 from R2's 5' end (reference)
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        // Both reads should be clipped
-        assert_eq!(clipped_r1, 10); // R1 clipped from 3' end
-        assert_eq!(clipped_r2, 10); // R2 clipped from 5' reference end (3' read end for reverse strand)
-
-        // After clipping: R1: 100-139, R2: 100-139 (same start and end)
-        assert_eq!(r1.alignment_start(), Position::new(100));
-        let cigar_r1 = format_cigar(&r1.cigar());
-        assert_eq!(cigar_r1, "40M10S");
-
-        assert_eq!(r2.alignment_start(), Position::new(100));
-        let cigar_r2 = format_cigar(&r2.cigar());
-        assert_eq!(cigar_r2, "10S40M");
-    }
-
-    #[test]
-    fn test_clip_extending_past_mate_ends_both_extend() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
-        let seq = "A".repeat(60);
-        // R1: 100-159, R2: 110-169
-        let (mut r1, mut r2) = create_pair(100, "60M", &seq, 110, "60M", &seq);
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        // R1 extends 10 bases past R2's end (159 vs 169)
-        assert_eq!(clipped_r1, 0); // R1 doesn't extend past R2
-        // R2 starts 10 bases before R1's start (110 vs 100) - wait, that's backwards
-        assert_eq!(clipped_r2, 0); // R2 starts after R1
-
-        let cigar_r1 = format_cigar(&r1.cigar());
-        assert_eq!(cigar_r1, "60M");
-
-        let cigar_r2 = format_cigar(&r2.cigar());
-        assert_eq!(cigar_r2, "60M");
-    }
-
-    #[test]
-    fn test_clip_extending_past_mate_ends_with_soft_clips() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
-        let seq = "A".repeat(60);
-        // R1: `10S50M` at 100 → unclipped 90-149, alignment 100-149
-        // R2: `50M` at 90 → unclipped 90-139, alignment 90-139
-        // R1's alignment end (149) extends 10 bases past R2's unclipped end (139)
-        // R2's alignment start (90) is 10 bases before R1's unclipped start (90) - no extension
-        let (mut r1, mut r2) = create_pair(100, "10S50M", &seq, 90, "50M", &seq);
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        // R1 should be clipped by 10 from the end
-        assert_eq!(clipped_r1, 10);
-        // R2 should not be clipped (its start doesn't extend past R1's unclipped start)
-        assert_eq!(clipped_r2, 0);
-
-        let cigar_r1 = format_cigar(&r1.cigar());
-        assert_eq!(cigar_r1, "10S40M10S");
-
-        // R2 unchanged
-        assert_eq!(r2.alignment_start(), Position::new(90));
-        let cigar_r2 = format_cigar(&r2.cigar());
-        assert_eq!(cigar_r2, "50M");
-    }
-
-    #[test]
-    fn test_clip_extending_past_mate_ends_no_extension() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
-        let seq = "A".repeat(50);
-        // R1: 100-149, R2: 200-249 (no extension)
-        let (mut r1, mut r2) = create_pair(100, "50M", &seq, 200, "50M", &seq);
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        assert_eq!(clipped_r1, 0);
-        assert_eq!(clipped_r2, 0);
-
-        let cigar_r1 = format_cigar(&r1.cigar());
-        assert_eq!(cigar_r1, "50M");
-
-        let cigar_r2 = format_cigar(&r2.cigar());
-        assert_eq!(cigar_r2, "50M");
-    }
-
-    #[test]
-    fn test_clip_extending_past_mate_ends_ff_pair() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
-        let seq = "A".repeat(50);
-        let mut r1 = create_test_record("50M", &seq, 100);
-        let mut r2 = create_test_record("50M", &seq, 90);
-
-        // Make them both forward strand (not FR pair)
-        *r1.flags_mut() = Flags::SEGMENTED;
-        *r2.flags_mut() = Flags::SEGMENTED; // Both forward, not FR
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        // Should not clip non-FR pairs
-        assert_eq!(clipped_r1, 0);
-        assert_eq!(clipped_r2, 0);
-    }
-
-    #[test]
-    fn test_clip_extending_past_mate_ends_with_deletion() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
-        let seq = "A".repeat(50);
-        // R1: 100-159 (50M + 10D)
-        // R2: 110-159
-        let (mut r1, mut r2) = create_pair(100, "50M10D10M", &seq, 110, "50M", &seq);
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        // R1 ends at 169, extends past R2's end at 159
-        // Should clip ~10 bases worth
-        assert!(clipped_r1 > 0);
-        assert_eq!(clipped_r2, 0);
-    }
-
-    #[test]
-    fn test_clip_extending_past_mate_ends_hard_mode() {
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
-        let seq = "A".repeat(50);
-        let (mut r1, mut r2) = create_pair(100, "50M", &seq, 90, "50M", &seq);
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        assert_eq!(clipped_r1, 10);
-        assert_eq!(clipped_r2, 10);
-
-        let cigar_r1 = format_cigar(&r1.cigar());
-        assert_eq!(cigar_r1, "40M10H");
-
-        let cigar_r2 = format_cigar(&r2.cigar());
-        assert_eq!(cigar_r2, "10H40M");
-
-        // Sequence should be trimmed in hard mode
-        assert_eq!(r1.sequence().len(), 40);
-        assert_eq!(r2.sequence().len(), 40);
-    }
-
     // Tests for overlapping reads with insertions
 
     #[test]
@@ -5442,236 +4997,6 @@ mod tests {
     // ===== Additional tests ported from fgbio to match clipExtendingPastMateEnds coverage =====
 
     #[test]
-    fn test_clip_extending_past_mate_ends_one_base_extension() {
-        // fgbio test: "clip reads that extend one base past their mate's start"
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
-        let seq = "A".repeat(100);
-        let (mut r1, mut r2) = create_pair(2, "100M", &seq, 1, "100M", &seq);
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        assert_eq!(clipped_r1, 1);
-        assert_eq!(clipped_r2, 1);
-        assert_eq!(
-            r1.alignment_start(),
-            Some(Position::new(2).expect("position 2 should be valid"))
-        );
-        assert_eq!(format_cigar(&r1.cigar()), "99M1S");
-        assert_eq!(
-            r2.alignment_start(),
-            Some(Position::new(2).expect("position 2 should be valid"))
-        );
-        assert_eq!(format_cigar(&r2.cigar()), "1S99M");
-    }
-
-    #[test]
-    fn test_clip_extending_past_mate_ends_two_base_extension() {
-        // fgbio test: "clip reads that extend two bases past their mate's start"
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
-        let seq = "A".repeat(100);
-        let (mut r1, mut r2) = create_pair(3, "100M", &seq, 1, "100M", &seq);
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        assert_eq!(clipped_r1, 2);
-        assert_eq!(clipped_r2, 2);
-        assert_eq!(
-            r1.alignment_start(),
-            Some(Position::new(3).expect("position 3 should be valid"))
-        );
-        assert_eq!(format_cigar(&r1.cigar()), "98M2S");
-        assert_eq!(
-            r2.alignment_start(),
-            Some(Position::new(3).expect("position 3 should be valid"))
-        );
-        assert_eq!(format_cigar(&r2.cigar()), "2S98M");
-    }
-
-    #[test]
-    fn test_clip_extending_past_mate_ends_only_one_end_extends() {
-        // fgbio test: "only one end extends their mate's start"
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
-        let seq = "A".repeat(100);
-        let (mut r1, mut r2) = create_pair(1, "100M", &seq, 1, "50S50M", &seq);
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        assert_eq!(clipped_r1, 50); // R1 gets clipped
-        assert_eq!(clipped_r2, 0); // R2 already has clipping
-        assert_eq!(
-            r1.alignment_start(),
-            Some(Position::new(1).expect("position 1 should be valid"))
-        );
-        assert_eq!(format_cigar(&r1.cigar()), "50M50S");
-        assert_eq!(
-            r2.alignment_start(),
-            Some(Position::new(1).expect("position 1 should be valid"))
-        );
-        assert_eq!(format_cigar(&r2.cigar()), "50S50M"); // unchanged
-    }
-
-    #[test]
-    fn test_clip_extending_past_mate_ends_with_insertions() {
-        // fgbio test: "only one end extends with insertions"
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
-        let seq = "A".repeat(100);
-        let (mut r1, mut r2) = create_pair(1, "40M10I50M", &seq, 1, "50S50M", &seq);
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        assert_eq!(clipped_r1, 40); // 40 bases clipped (insertion doesn't count toward ref)
-        assert_eq!(clipped_r2, 0);
-        assert_eq!(
-            r1.alignment_start(),
-            Some(Position::new(1).expect("position 1 should be valid"))
-        );
-        assert_eq!(format_cigar(&r1.cigar()), "40M10I10M40S");
-        assert_eq!(
-            r2.alignment_start(),
-            Some(Position::new(1).expect("position 1 should be valid"))
-        );
-        assert_eq!(format_cigar(&r2.cigar()), "50S50M"); // unchanged
-    }
-
-    #[test]
-    fn test_clip_extending_past_mate_ends_soft_clips_extend_hard_mode() {
-        // fgbio test: "forward read soft-clips extend past (hard mode)"
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
-        let seq = "A".repeat(50);
-        let (mut r1, mut r2) = create_pair(20, "30M20S", &seq, 20, "10S40M", &seq);
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        assert_eq!(clipped_r1, 0); // No aligned bases clipped
-        assert_eq!(clipped_r2, 0); // No aligned bases clipped
-        assert_eq!(
-            r1.alignment_start(),
-            Some(Position::new(20).expect("position 20 should be valid"))
-        );
-        assert_eq!(format_cigar(&r1.cigar()), "30M10S10H"); // 10 of 20S hard-clipped
-        assert_eq!(
-            r2.alignment_start(),
-            Some(Position::new(20).expect("position 20 should be valid"))
-        );
-        assert_eq!(format_cigar(&r2.cigar()), "10H40M"); // 10S hard-clipped
-    }
-
-    #[test]
-    fn test_clip_extending_past_mate_ends_soft_clips_extend_with_deletion_hard_mode() {
-        // fgbio test: "forward read soft-clips extend past with deletion (hard mode)"
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
-        let seq = "A".repeat(50);
-        let (mut r1, mut r2) = create_pair(20, "15M1D15M20S", &seq, 20, "10S15M1D25M", &seq);
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        assert_eq!(clipped_r1, 0); // No aligned bases clipped
-        assert_eq!(clipped_r2, 0); // No aligned bases clipped
-        assert_eq!(
-            r1.alignment_start(),
-            Some(Position::new(20).expect("position 20 should be valid"))
-        );
-        assert_eq!(format_cigar(&r1.cigar()), "15M1D15M10S10H");
-        assert_eq!(
-            r2.alignment_start(),
-            Some(Position::new(20).expect("position 20 should be valid"))
-        );
-        assert_eq!(format_cigar(&r2.cigar()), "10H15M1D25M");
-    }
-
-    #[test]
-    fn test_clip_extending_past_mate_ends_soft_clips_extend_with_insertion_hard_mode() {
-        // fgbio test: "forward read soft-clips extend past with insertion (hard mode)"
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
-        let seq = "A".repeat(51);
-        let (mut r1, mut r2) = create_pair(20, "15M1I15M20S", &seq, 20, "10S15M1I25M", &seq);
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        assert_eq!(clipped_r1, 0); // No aligned bases clipped
-        assert_eq!(clipped_r2, 0); // No aligned bases clipped
-        assert_eq!(
-            r1.alignment_start(),
-            Some(Position::new(20).expect("position 20 should be valid"))
-        );
-        assert_eq!(format_cigar(&r1.cigar()), "15M1I15M10S10H");
-        assert_eq!(
-            r2.alignment_start(),
-            Some(Position::new(20).expect("position 20 should be valid"))
-        );
-        assert_eq!(format_cigar(&r2.cigar()), "10H15M1I25M");
-    }
-
-    #[test]
-    fn test_clip_extending_past_mate_ends_reverse_soft_clips_extend_hard_mode() {
-        // fgbio test: "reverse read soft-clips extend past (hard mode)"
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
-        let seq = "A".repeat(50);
-        let (mut r1, mut r2) = create_pair(20, "40M10S", &seq, 30, "20S30M", &seq);
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        assert_eq!(clipped_r1, 0); // No aligned bases clipped
-        assert_eq!(clipped_r2, 0); // No aligned bases clipped
-        assert_eq!(
-            r1.alignment_start(),
-            Some(Position::new(20).expect("position 20 should be valid"))
-        );
-        assert_eq!(format_cigar(&r1.cigar()), "40M10H");
-        assert_eq!(
-            r2.alignment_start(),
-            Some(Position::new(30).expect("position 30 should be valid"))
-        );
-        assert_eq!(format_cigar(&r2.cigar()), "10H10S30M");
-    }
-
-    #[test]
-    fn test_clip_extending_past_mate_ends_no_overlap_far_apart() {
-        // fgbio test: "not clip when mapped +/- with start(R1) > end(R2) but no overlap"
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
-        let seq = "A".repeat(100);
-        let (mut r1, mut r2) = create_pair(1000, "100M", &seq, 1, "100M", &seq);
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        assert_eq!(clipped_r1, 0);
-        assert_eq!(clipped_r2, 0);
-        assert_eq!(
-            r1.alignment_start(),
-            Some(Position::new(1000).expect("position 1000 should be valid"))
-        );
-        assert_eq!(format_cigar(&r1.cigar()), "100M");
-        assert_eq!(
-            r2.alignment_start(),
-            Some(Position::new(1).expect("position 1 should be valid"))
-        );
-        assert_eq!(format_cigar(&r2.cigar()), "100M");
-    }
-
-    #[test]
-    fn test_clip_extending_past_mate_ends_no_extension_with_insertions() {
-        // fgbio test: "not clip when no extension with insertions"
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
-        let seq = "A".repeat(100);
-        let (mut r1, mut r2) = create_pair(1, "40M20I40M", &seq, 1, "40M20I40M", &seq);
-
-        let (clipped_r1, clipped_r2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
-
-        assert_eq!(clipped_r1, 0);
-        assert_eq!(clipped_r2, 0);
-        assert_eq!(
-            r1.alignment_start(),
-            Some(Position::new(1).expect("position 1 should be valid"))
-        );
-        assert_eq!(format_cigar(&r1.cigar()), "40M20I40M");
-        assert_eq!(
-            r2.alignment_start(),
-            Some(Position::new(1).expect("position 1 should be valid"))
-        );
-        assert_eq!(format_cigar(&r2.cigar()), "40M20I40M");
-    }
-
-    #[test]
     fn test_clip_5_prime_end_of_alignment_positive_strand() {
         // fgbio test: "add more clipping to the 5' end" - positive strand
         let clipper = SamRecordClipper::new(ClippingMode::Soft);
@@ -5749,6 +5074,508 @@ mod tests {
         let clipped = clipper.clip_3_prime_end_of_alignment(&mut rec4, 10);
         assert_eq!(clipped, 10);
         assert_eq!(format_cigar(&rec4.cigar()), "30M20S");
+    }
+
+    // ===================================================================
+    // fgbio#1172 query-space regression for the RawRecordClipper past-mate path
+    // (clip_extending_past_mate_ends / num_bases_extending_past_mate_vs_mate_raw),
+    // ported from fgbio's SamRecordClipperTest.scala. See fgumi-raw-bam's
+    // bases_extending_past_mate_ops (Task 1) for the shared query-space core.
+    // ===================================================================
+
+    /// Local strand marker for the fgbio#1172 ported cases, mapped to the
+    /// `REVERSE_COMPLEMENTED` / `MATE_REVERSE_COMPLEMENTED` flags.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Strand {
+        Plus,
+        Minus,
+    }
+
+    impl Strand {
+        fn is_reverse(self) -> bool {
+            self == Strand::Minus
+        }
+    }
+
+    /// Signed template length (insert size) for a record given its own strand/position/
+    /// reference length and its mate's position/reference length; matches the sign
+    /// convention `record_utils::is_fr_pair` (via `get_pair_orientation`) relies on.
+    fn template_length_for(
+        is_reverse: bool,
+        own_pos: usize,
+        own_ref_len: usize,
+        mate_pos: usize,
+        mate_ref_len: usize,
+    ) -> i32 {
+        if is_reverse {
+            let own_end = i32::try_from(own_pos + own_ref_len.saturating_sub(1))
+                .expect("own_end fits in i32");
+            let mate_pos = i32::try_from(mate_pos).expect("mate_pos fits in i32");
+            -(own_end - mate_pos + 1)
+        } else {
+            let mate_end = i32::try_from(mate_pos + mate_ref_len.saturating_sub(1))
+                .expect("mate_end fits in i32");
+            let own_pos = i32::try_from(own_pos).expect("own_pos fits in i32");
+            mate_end - own_pos + 1
+        }
+    }
+
+    /// Builds an FR-oriented `RecordBuf` pair for the fgbio#1172 ported cases: sets
+    /// paired/first-second/reverse flags, mate ref+pos+strand, `MC` tags, and a
+    /// `template_length` consistent with the given positions/CIGARs (needed for
+    /// `record_utils::is_fr_pair`). Sequence/qualities are auto-generated by
+    /// `RecordBuilder` to match each CIGAR's query length.
+    fn fr_pair(rec1: (&str, usize, Strand), rec2: (&str, usize, Strand)) -> (RecordBuf, RecordBuf) {
+        let (cigar1, pos1, strand1) = rec1;
+        let (cigar2, pos2, strand2) = rec2;
+
+        let mut r1 = RecordBuilder::mapped_read()
+            .cigar(cigar1)
+            .alignment_start(pos1)
+            .paired(true)
+            .first_segment(true)
+            .reverse_complement(strand1.is_reverse())
+            .mate_reverse_complement(strand2.is_reverse())
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(pos2)
+            .tag("MC", cigar2)
+            .build();
+        let mut r2 = RecordBuilder::mapped_read()
+            .cigar(cigar2)
+            .alignment_start(pos2)
+            .paired(true)
+            .first_segment(false)
+            .reverse_complement(strand2.is_reverse())
+            .mate_reverse_complement(strand1.is_reverse())
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(pos1)
+            .tag("MC", cigar1)
+            .build();
+
+        let ref_len1 = cigar_utils::reference_length(&r1.cigar());
+        let ref_len2 = cigar_utils::reference_length(&r2.cigar());
+        *r1.template_length_mut() =
+            template_length_for(strand1.is_reverse(), pos1, ref_len1, pos2, ref_len2);
+        *r2.template_length_mut() =
+            template_length_for(strand2.is_reverse(), pos2, ref_len2, pos1, ref_len1);
+
+        (r1, r2)
+    }
+
+    // ===================================================================
+    // fgbio#1172 query-space regression, RawRecordClipper: this is the LIVE `fgumi clip`
+    // path (RawRecordClipper::clip_extending_past_mate_ends). SamRecordClipper never had
+    // this fixed and its RecordBuf-only past-mate methods have been removed as redundant
+    // (issue #760) — this is the single remaining home for the query-space count.
+    // ===================================================================
+
+    /// Build a SAM header with a single reference sequence long enough for the fgbio#1172
+    /// ported cases (`disjoint_no_shared_pos` uses position 1020).
+    fn raw_test_header() -> noodles::sam::Header {
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use std::num::NonZeroUsize;
+        let ref_seq = Map::<ReferenceSequence>::new(
+            NonZeroUsize::new(100_000).expect("ref length must be nonzero"),
+        );
+        noodles::sam::Header::builder().add_reference_sequence(b"chr1", ref_seq).build()
+    }
+
+    /// Builds an FR-oriented raw pair for the fgbio#1172 ported cases: reuses [`fr_pair`]'s
+    /// `RecordBuf` construction (paired/first-second/reverse flags, mate ref+pos+strand, `MC`
+    /// tags, consistent `template_length`) and encodes both records to `RawRecord` bytes, since
+    /// `RawRecordClipper::clip_extending_past_mate_ends` is the LIVE `fgumi clip` path this
+    /// issue fixes.
+    fn raw_fr_pair(
+        rec1: (&str, usize, Strand),
+        rec2: (&str, usize, Strand),
+    ) -> (fgumi_raw_bam::RawRecord, fgumi_raw_bam::RawRecord) {
+        let (r1_buf, r2_buf) = fr_pair(rec1, rec2);
+        let header = raw_test_header();
+        let r1 = fgumi_raw_bam::encode_record_buf_to_raw(&r1_buf, &header).expect("encode r1");
+        let r2 = fgumi_raw_bam::encode_record_buf_to_raw(&r2_buf, &header).expect("encode r2");
+        (r1, r2)
+    }
+
+    /// Format a raw CIGAR (BAM `(len<<4)|op` u32s) as a SAM CIGAR string, for asserting the
+    /// exact post-clip shapes in the fgbio#1172 ported cases.
+    fn raw_format_cigar(ops: &[u32]) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for &op in ops {
+            let len = op >> 4;
+            let kind_char = match op & 0xF {
+                0 => 'M',
+                1 => 'I',
+                2 => 'D',
+                3 => 'N',
+                4 => 'S',
+                5 => 'H',
+                6 => 'P',
+                7 => '=',
+                8 => 'X',
+                _ => '?',
+            };
+            let _ = write!(out, "{len}{kind_char}");
+        }
+        out
+    }
+
+    /// Table A (fgbio#1172, ported verbatim, `RawRecordClipper`): `clip_extending_past_mate_ends`
+    /// returns additional `(clip_r1, clip_r2)`. Confirms the LIVE `fgumi clip` path (#760).
+    #[rstest]
+    // Control, Soft: no indel. rec 100M@100/+, mate 90M10S@60/-. Expect (40,40); rec->60M40S, mate->40S50M10S.
+    #[case::no_indel_control(ClippingMode::Soft, ("100M", 100, Strand::Plus), ("90M10S", 60, Strand::Minus), (40, 40))]
+    // Over-clip regression, Soft: deletion at mate's un-soft-clipped end. OLD unmapped rec. NEW (2,0).
+    #[case::deletion_at_mate_end(ClippingMode::Soft, ("2S124M1D3M", 101, Strand::Plus), ("3S124M2S", 100, Strand::Minus), (2, 0))]
+    // Knock-on, Soft: rec's deletion at mate end; mate must still be clipped (order-independent). (2,2).
+    #[case::deletion_knock_on(ClippingMode::Soft, ("2S124M1D3M", 101, Strand::Plus), ("115M14S", 97, Strand::Minus), (2, 2))]
+    // Under-clip regression, Hard: insertion before mate end (the #1090 example). (3,0); rec->70M10I20M50H.
+    #[case::insertion_before_mate_end(ClippingMode::Hard, ("70M10I23M47S", 100, Strand::Plus), ("50S70M30S", 100, Strand::Minus), (3, 0))]
+    // Disjoint continuity, Hard: share NO ref position (mate at 1020). Bounded by soft clip -> 0 aligned clipped.
+    #[case::disjoint_no_shared_pos(ClippingMode::Hard, ("20M80S", 1000, Strand::Plus), ("80S20M", 1020, Strand::Minus), (0, 0))]
+    fn raw_clip_extending_past_mate_ends_query_space(
+        #[case] mode: ClippingMode,
+        #[case] rec1: (&str, usize, Strand),
+        #[case] rec2: (&str, usize, Strand),
+        #[case] expected: (usize, usize),
+    ) {
+        let (mut r1, mut r2) = raw_fr_pair(rec1, rec2);
+        let clipper = RawRecordClipper::new(mode);
+        assert_eq!(clipper.clip_extending_past_mate_ends(&mut r1, &mut r2), expected);
+        // Regression: neither read may be unmapped by a past-mate clip.
+        assert!(r1.alignment_start_1based().is_some());
+        assert!(r2.alignment_start_1based().is_some());
+    }
+
+    /// Hard-clip add-back case (fgbio#1172), `RawRecordClipper`: pre-clip each 3' end by 10
+    /// (upgrading to hard clip via `clip_3_prime_end_of_read_raw`), THEN measure/clip past-mate.
+    /// `clip_3_prime_end_of_read_raw`/`clip_end_of_read_raw` take TOTAL desired clipping and
+    /// subtract existing hard+soft, so the second call must add the already-hard-clipped bases
+    /// back before re-requesting, or it under-clips by that amount (see
+    /// `existing_hard_clip_3_prime_raw`, applied unconditionally in `clip_extending_past_mate_ends`).
+    #[test]
+    fn raw_clip_extending_past_mate_ends_query_space_already_hard_clipped_3prime() {
+        let clipper = RawRecordClipper::new(ClippingMode::Hard);
+        let (mut r1, mut r2) =
+            raw_fr_pair(("100M", 100, Strand::Plus), ("90M10S", 60, Strand::Minus));
+
+        clipper.clip_3_prime_end_of_read_raw(&mut r1, 10);
+        clipper.clip_3_prime_end_of_read_raw(&mut r2, 10);
+        assert_eq!(raw_format_cigar(&r1.cigar_ops_vec()), "90M10H");
+        assert_eq!(raw_format_cigar(&r2.cigar_ops_vec()), "10H80M10S");
+
+        let result = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
+        assert_eq!(result, (30, 30));
+        assert_eq!(raw_format_cigar(&r1.cigar_ops_vec()), "60M40H");
+        assert_eq!(raw_format_cigar(&r2.cigar_ops_vec()), "40H50M10S");
+    }
+
+    /// Table B (fgbio#1172, ported verbatim, `RawRecordClipper`):
+    /// `num_bases_extending_past_mate_vs_mate_raw(rec, mate)` count, checked in both directions.
+    #[rstest]
+    // Indel near end: deletion (r1) and its mate. Shared through ref 223 / first-shared 101. Expect 2 & 2.
+    #[case::count_deletion(("2S124M1D3M", 101, Strand::Plus), ("3S124M2S", 100, Strand::Minus), 2, 2)]
+    // Indel near end: insertion. Shared through 169 / first-shared 100. Expect 50 & 50.
+    #[case::count_insertion(("70M10I23M47S", 100, Strand::Plus), ("50S70M30S", 100, Strand::Minus), 50, 50)]
+    // Disjoint sharing exactly one ref position (mate at 1019): 61 & 61.
+    #[case::count_disjoint_one_shared(("20M80S", 1000, Strand::Plus), ("80S20M", 1019, Strand::Minus), 61, 61)]
+    // Disjoint sharing none (mate at 1020): must be 60 & 60, not 0 (continuity).
+    #[case::count_disjoint_none(("20M80S", 1000, Strand::Plus), ("80S20M", 1020, Strand::Minus), 60, 60)]
+    fn raw_num_bases_extending_past_mate_counts(
+        #[case] rec1: (&str, usize, Strand),
+        #[case] rec2: (&str, usize, Strand),
+        #[case] expect_r1: usize,
+        #[case] expect_r2: usize,
+    ) {
+        let (r1, r2) = raw_fr_pair(rec1, rec2);
+        assert_eq!(
+            fgumi_raw_bam::num_bases_extending_past_mate_vs_mate_raw(r1.as_ref(), r2.as_ref()),
+            expect_r1
+        );
+        assert_eq!(
+            fgumi_raw_bam::num_bases_extending_past_mate_vs_mate_raw(r2.as_ref(), r1.as_ref()),
+            expect_r2
+        );
+    }
+
+    // ===================================================================
+    // fgbio#1172 query-space regression: property tests over a generated FR-pair
+    // strategy, modeled on the fgbio#1172 sweep geometry (overlapping / touching /
+    // disjoint mate blocks, ~half carrying a single indel near an alignment end).
+    // Built on the `fr_pair`/`RecordBuilder` machinery above so every generated
+    // pair clears the same FR-pair gate and carries the same MC-tag/mate-field
+    // wiring as the ported fgbio#1172 cases.
+    // ===================================================================
+
+    /// One 100bp read's CIGAR shape: leading/trailing soft-clip lengths (each 0-80, summing to
+    /// at most 90 so at least 10 aligned bases always remain) plus an optional single indel
+    /// (insertion or deletion, 1-6bp) placed adjacent to either the leading or trailing aligned
+    /// edge. Mirrors the shapes exercised by the fgbio#1172 ported cases above
+    /// (`no_indel_control` = no indel; `deletion_at_mate_end`/`insertion_before_mate_end` = an
+    /// indel adjacent to the mate-facing end).
+    #[derive(Clone, Copy, Debug)]
+    struct CigarShape {
+        leading_clip: usize,
+        trailing_clip: usize,
+        /// `(near_start, is_insertion, len)`, or `None` for a plain `{aligned}M` interior.
+        indel: Option<(bool, bool, usize)>,
+    }
+
+    impl CigarShape {
+        const READ_LEN: usize = 100;
+
+        /// Renders this shape as a CIGAR string whose query length is exactly `READ_LEN`
+        /// (`RecordBuilder::cigar` auto-generates SEQ/QUAL to match, so no explicit sequence is
+        /// needed).
+        fn to_cigar(self) -> String {
+            use std::fmt::Write as _;
+
+            let avail = Self::READ_LEN - self.leading_clip - self.trailing_clip;
+            let mut cigar = String::new();
+            if self.leading_clip > 0 {
+                write!(cigar, "{}S", self.leading_clip).expect("write! to String never fails");
+            }
+            match self.indel {
+                None => write!(cigar, "{avail}M").expect("write! to String never fails"),
+                Some((near_start, true, len)) => {
+                    // Insertion consumes query: the aligned (M) total shrinks by `len`.
+                    // `avail >= 10` and `len <= 6` by construction, so `m_total >= 4`.
+                    let m_total = avail - len;
+                    let (m1, m2) = if near_start { (1, m_total - 1) } else { (m_total - 1, 1) };
+                    write!(cigar, "{m1}M{len}I{m2}M").expect("write! to String never fails");
+                }
+                Some((near_start, false, len)) => {
+                    // Deletion doesn't consume query: the aligned (M) total is `avail`.
+                    let (m1, m2) = if near_start { (1, avail - 1) } else { (avail - 1, 1) };
+                    write!(cigar, "{m1}M{len}D{m2}M").expect("write! to String never fails");
+                }
+            }
+            if self.trailing_clip > 0 {
+                write!(cigar, "{}S", self.trailing_clip).expect("write! to String never fails");
+            }
+            cigar
+        }
+    }
+
+    /// Strategy for [`CigarShape`]: soft clips independently in `0..=80`, constrained so their
+    /// sum never exceeds 90 (guaranteeing `avail >= 10`), plus a single indel roughly half the
+    /// time.
+    fn arb_cigar_shape() -> impl Strategy<Value = CigarShape> {
+        (0..=80usize)
+            .prop_flat_map(|leading_clip| {
+                let max_trailing = (90usize.saturating_sub(leading_clip)).min(80);
+                (Just(leading_clip), 0..=max_trailing)
+            })
+            .prop_flat_map(|(leading_clip, trailing_clip)| {
+                let indel_strategy = prop_oneof![
+                    1 => Just(None),
+                    1 => (any::<bool>(), any::<bool>(), 1..=6usize)
+                        .prop_map(|(near_start, is_insertion, len)| Some((
+                            near_start,
+                            is_insertion,
+                            len
+                        ))),
+                ];
+                (Just(leading_clip), Just(trailing_clip), indel_strategy)
+            })
+            .prop_map(|(leading_clip, trailing_clip, indel)| CigarShape {
+                leading_clip,
+                trailing_clip,
+                indel,
+            })
+    }
+
+    /// How r1's and r2's aligned reference blocks relate: their reference blocks share bases
+    /// (`Overlapping`), are immediately adjacent and share none (`Touching`), or are separated
+    /// by a gap (`Disjoint`). Mirrors the geometries exercised by the fgbio#1172 ported cases
+    /// above (`deletion_knock_on` overlaps, `disjoint_no_shared_pos` touches,
+    /// `count_disjoint_none` is disjoint).
+    #[derive(Clone, Copy, Debug)]
+    enum PairGeometry {
+        /// Overlap magnitude in bases, clamped below `min(ref_len1, ref_len2)` so some
+        /// reference span always separates r1's start from r2's end (required for
+        /// `record_utils::is_fr_pair`'s forward-5'-before-reverse-5' check). Drawn up to the
+        /// 100bp read length so the clamp binds and the extreme "one alignment almost entirely
+        /// swallows the other" geometry — which historically produced the full-read-unmap bug
+        /// the `never_unmaps` property guards against — is exercised, not just shallow overlaps.
+        Overlapping(usize),
+        Touching,
+        /// Gap in bases strictly separating the two reference blocks.
+        Disjoint(usize),
+    }
+
+    fn arb_pair_geometry() -> impl Strategy<Value = PairGeometry> {
+        prop_oneof![
+            (0..100usize).prop_map(PairGeometry::Overlapping),
+            Just(PairGeometry::Touching),
+            (0..60usize).prop_map(PairGeometry::Disjoint),
+        ]
+    }
+
+    /// Strategy for a valid FR-oriented `(RecordBuf, RecordBuf)` pair: two independently
+    /// generated 100bp `CigarShape`s (r1 forward, r2 reverse) positioned per a generated
+    /// [`PairGeometry`], then built via [`fr_pair`] so mate ref/pos/strand fields, `MC` tags,
+    /// and `template_length` all come from the same helper the fgbio#1172 ported cases above
+    /// use (keeping this generator's pairs indistinguishable, from the clipper's point of view,
+    /// from a real FR pair).
+    fn arb_fr_pair() -> impl Strategy<Value = (RecordBuf, RecordBuf)> {
+        // Large enough that `pos1 + ref_len1 + offset` never underflows for any generated
+        // overlap/gap magnitude.
+        const BASE_POS: usize = 10_000;
+
+        (arb_cigar_shape(), arb_cigar_shape(), arb_pair_geometry()).prop_map(
+            |(shape1, shape2, geometry)| {
+                let cigar1 = shape1.to_cigar();
+                let cigar2 = shape2.to_cigar();
+                let ref_len1 = crate::builder::cigar_ref_len(&cigar1);
+                let ref_len2 = crate::builder::cigar_ref_len(&cigar2);
+
+                let pos1 = BASE_POS;
+                let offset: isize = match geometry {
+                    PairGeometry::Overlapping(magnitude) => {
+                        let cap = ref_len1.min(ref_len2).saturating_sub(1);
+                        -isize::try_from(magnitude.min(cap)).expect("small overlap fits isize")
+                    }
+                    PairGeometry::Touching => 0,
+                    PairGeometry::Disjoint(gap) => {
+                        isize::try_from(gap + 1).expect("small gap fits isize")
+                    }
+                };
+                let pos1_end = isize::try_from(pos1 + ref_len1).expect("fits isize");
+                let pos2 =
+                    usize::try_from(pos1_end + offset).expect("pos2 stays positive for BASE_POS");
+
+                fr_pair((&cigar1, pos1, Strand::Plus), (&cigar2, pos2, Strand::Minus))
+            },
+        )
+    }
+
+    /// Strategy for a dovetail read-through `(RecordBuf, RecordBuf)` pair: each 100bp read aligns
+    /// a short block and soft-clips the rest, with the two aligned blocks meeting near one shared
+    /// reference position (`shift` jitters that meeting point). Both reads therefore read through
+    /// past the far end of the mate — the short-insert / adapter-read-through geometry that
+    /// `clip_extending_past_mate_ends` actually clips, and that [`arb_fr_pair`]'s
+    /// forward-left/reverse-right layout never produces. Mirrors the fgbio#1172
+    /// `disjoint_no_shared_pos` / `count_disjoint_*` cases parametrically.
+    fn arb_readthrough_fr_pair() -> impl Strategy<Value = (RecordBuf, RecordBuf)> {
+        const BASE_POS: usize = 10_000;
+        (10..=40usize, 10..=40usize, -3isize..=3isize).prop_map(|(a, b, shift)| {
+            let cigar1 = format!("{a}M{}S", CigarShape::READ_LEN - a); // fwd: short block + read-through
+            let cigar2 = format!("{}S{b}M", CigarShape::READ_LEN - b); // rev: read-through + short block
+            let pos1 = BASE_POS;
+            // Reverse aligned block starts at (roughly) the forward aligned block's end, so the
+            // two share ~one reference position and their soft-clipped tails cross.
+            let pos2 = usize::try_from(isize::try_from(pos1 + a).expect("fits isize") - 1 + shift)
+                .expect("pos2 stays positive for BASE_POS");
+            fr_pair((&cigar1, pos1, Strand::Plus), (&cigar2, pos2, Strand::Minus))
+        })
+    }
+
+    /// Strategy for an "overhang" read-through pair that clips *aligned* bases: the forward read
+    /// is fully aligned (`100M`) and extends past the far end of a reverse mate that starts to its
+    /// left and soft-clips its trailing (5') bases. The forward read's aligned 3' therefore runs
+    /// past the mate's un-soft-clipped end, so `clip_extending_past_mate_ends` removes real aligned
+    /// bases (a nonzero clip) rather than merely re-clipping soft-clipped tails. Mirrors the
+    /// fgbio#1172 `no_indel_control` case (`100M` + `90M10S` -> `(40, 40)`), which
+    /// [`arb_fr_pair`]'s cap — which keeps the forward block from ever reaching past the reverse
+    /// block — cannot reach.
+    fn arb_overhang_fr_pair() -> impl Strategy<Value = (RecordBuf, RecordBuf)> {
+        const BASE_POS: usize = 10_000;
+        // rev_aligned: length of the reverse read's aligned (M) block; back_shift: how far left of
+        // the forward read the reverse block starts. Bounds keep the forward 5' strictly left of
+        // the reverse 5' (FR-valid) while the forward 3' overhangs the reverse's un-soft-clipped end.
+        (20..=90usize, 1..=39usize).prop_map(|(rev_aligned, back_shift)| {
+            let cigar1 = format!("{}M", CigarShape::READ_LEN); // fully-aligned forward, overhangs right
+            let cigar2 = format!("{rev_aligned}M{}S", CigarShape::READ_LEN - rev_aligned);
+            let pos1 = BASE_POS;
+            let pos2 = pos1 - back_shift; // reverse block starts to the left of the forward block
+            fr_pair((&cigar1, pos1, Strand::Plus), (&cigar2, pos2, Strand::Minus))
+        })
+    }
+
+    /// Strategy for a valid FR-oriented `(RawRecord, RawRecord)` pair. Mixes three geometries and
+    /// encodes both records to `RawRecord` bytes, exercising the LIVE `fgumi clip` path
+    /// (`RawRecordClipper`): [`arb_fr_pair`]'s aligned-block sweep (mostly no-clip),
+    /// [`arb_readthrough_fr_pair`]'s dovetail (nonzero read-through *count*, clip absorbed by soft
+    /// clipping), and [`arb_overhang_fr_pair`]'s overhang (nonzero *aligned-base* clip). See
+    /// `arb_raw_fr_pair_exercises_nonzero_clips`.
+    fn arb_raw_fr_pair()
+    -> impl Strategy<Value = (fgumi_raw_bam::RawRecord, fgumi_raw_bam::RawRecord)> {
+        prop_oneof![arb_fr_pair(), arb_readthrough_fr_pair(), arb_overhang_fr_pair()].prop_map(
+            |(r1_buf, r2_buf)| {
+                let header = raw_test_header();
+                let r1 = fgumi_raw_bam::encode_record_buf_to_raw(&r1_buf, &header)
+                    .expect("encode r1 to raw");
+                let r2 = fgumi_raw_bam::encode_record_buf_to_raw(&r2_buf, &header)
+                    .expect("encode r2 to raw");
+                (r1, r2)
+            },
+        )
+    }
+
+    proptest! {
+        /// A past-mate clip must never unmap an already-mapped FR read (RawRecordClipper).
+        #[test]
+        fn raw_past_mate_clip_never_unmaps(pair in arb_raw_fr_pair()) {
+            let (mut r1, mut r2) = pair;
+            let clipper = RawRecordClipper::new(ClippingMode::Soft);
+            let _ = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
+            prop_assert!(r1.alignment_start_1based().is_some());
+            prop_assert!(r2.alignment_start_1based().is_some());
+        }
+
+        /// A second pass over an already-clipped pair must clip nothing further
+        /// (RawRecordClipper).
+        #[test]
+        fn raw_past_mate_clip_is_idempotent(pair in arb_raw_fr_pair()) {
+            let (mut r1, mut r2) = pair;
+            let clipper = RawRecordClipper::new(ClippingMode::Soft);
+            let _ = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
+            prop_assert_eq!(clipper.clip_extending_past_mate_ends(&mut r1, &mut r2), (0, 0));
+        }
+
+        /// Swapping the two records passed in swaps the returned clip amounts
+        /// (RawRecordClipper).
+        #[test]
+        fn raw_past_mate_clip_is_symmetric(pair in arb_raw_fr_pair()) {
+            let (mut a1, mut a2) = pair.clone();
+            let (mut b1, mut b2) = pair;
+            let clipper = RawRecordClipper::new(ClippingMode::Soft);
+            let (c1, c2) = clipper.clip_extending_past_mate_ends(&mut a1, &mut a2);
+            let (d2, d1) = clipper.clip_extending_past_mate_ends(&mut b2, &mut b1);
+            prop_assert_eq!((c1, c2), (d1, d2));
+        }
+    }
+
+    /// The `never_unmaps` / `idempotent` / `symmetric` properties above would pass vacuously if
+    /// the generator rarely produced read-through past the mate. Pin that it does not: over a
+    /// deterministic sample, a meaningful fraction of generated pairs must clip a nonzero number
+    /// of bases from at least one read, so the properties are exercised against real clipping
+    /// rather than a stream of no-op pairs.
+    #[test]
+    fn arb_raw_fr_pair_exercises_nonzero_clips() {
+        use proptest::strategy::{Strategy, ValueTree};
+        use proptest::test_runner::TestRunner;
+
+        let mut runner = TestRunner::deterministic();
+        let clipper = RawRecordClipper::new(ClippingMode::Soft);
+        let strategy = arb_raw_fr_pair();
+        let total = 512;
+        let mut nonzero = 0;
+        for _ in 0..total {
+            let (mut r1, mut r2) =
+                strategy.new_tree(&mut runner).expect("generate a pair").current();
+            let (c1, c2) = clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
+            if c1 > 0 || c2 > 0 {
+                nonzero += 1;
+            }
+        }
+        assert!(
+            nonzero >= total / 10,
+            "generator exercises read-through too rarely: only {nonzero}/{total} pairs clipped \
+             nonzero — the past-mate properties risk passing vacuously"
+        );
     }
 }
 
