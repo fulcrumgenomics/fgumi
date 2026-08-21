@@ -2620,12 +2620,12 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> ProcessPipelineState
     }
 
     fn process_output_push(&self, item: (u64, Vec<P>)) -> Result<(), (u64, Vec<P>)> {
-        let heap_size: usize = item.1.iter().map(MemoryEstimate::estimate_heap_size).sum();
-        let result = self.processed.push(item);
-        if result.is_ok() {
-            self.processed_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
-        }
-        result
+        // Charge before publishing (via `push_charged`) so a consumer cannot pop
+        // and refund the batch before the charge lands; it refunds on a failed
+        // push. Charging after the push strands a phantom counter (see `q6_push`).
+        let heap_size: u64 =
+            item.1.iter().map(|p| MemoryEstimate::estimate_heap_size(p) as u64).sum();
+        push_charged(&self.processed, &self.processed_heap_bytes, heap_size, item)
     }
 
     fn has_error(&self) -> bool {

@@ -1466,11 +1466,18 @@ impl<G: Send + MemoryEstimate + 'static, P: Send + MemoryEstimate + 'static>
     }
 
     fn process_output_push(&self, item: (u64, Vec<P>)) -> Result<(), (u64, Vec<P>)> {
-        // Calculate heap size before push for memory tracking
-        let heap_size: usize = item.1.iter().map(MemoryEstimate::estimate_heap_size).sum();
-        let result = self.output.processed.push(item);
+        // Charge before publishing (via `push_charged`) so a consumer cannot pop
+        // and refund the batch before the charge lands; it refunds on a failed
+        // push. Charging after the push strands a phantom counter (see `q6_push`).
+        let heap_size: u64 =
+            item.1.iter().map(|p| MemoryEstimate::estimate_heap_size(p) as u64).sum();
+        let result = push_charged(
+            &self.output.processed,
+            &self.output.processed_heap_bytes,
+            heap_size,
+            item,
+        );
         if result.is_ok() {
-            self.output.processed_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
             self.deadlock_state.record_q5_push();
         }
         result
@@ -2966,14 +2973,16 @@ fn try_step_process<G: Send + MemoryEstimate + 'static, P: Send + MemoryEstimate
     // Priority 1: Try to advance any held processed batch first
     // =========================================================================
     if let Some((serial, held, heap_size)) = worker.held_processed.take() {
+        // Charge before publishing so a consumer cannot pop and refund the batch
+        // before the charge lands; refund on a failed push (see `q6_push`).
+        state.output.processed_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
         match state.output.processed.push((serial, held)) {
             Ok(()) => {
-                // Successfully advanced held item - memory tracking handled by trait impl
-                state.output.processed_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
                 state.deadlock_state.record_q5_push();
             }
             Err((serial, held)) => {
-                // Still can't push - put it back and signal output full
+                // Still can't push - refund the charge, put it back, signal output full
+                refund_queue_bytes(&state.output.processed_heap_bytes, heap_size as u64);
                 worker.held_processed = Some((serial, held, heap_size));
                 return false;
             }
@@ -3031,15 +3040,17 @@ fn try_step_process<G: Send + MemoryEstimate + 'static, P: Send + MemoryEstimate
         // Calculate heap size for memory tracking
         let heap_size: usize = results.iter().map(MemoryEstimate::estimate_heap_size).sum();
 
-        // Try to push result
+        // Charge before publishing so a consumer cannot pop and refund the batch
+        // before the charge lands; refund on a failed push (see `q6_push`).
+        state.output.processed_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
         match state.output.processed.push((serial, results)) {
             Ok(()) => {
-                state.output.processed_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
                 state.deadlock_state.record_q5_push();
                 did_work = true;
             }
             Err((serial, results)) => {
-                // Output full - hold the result for next attempt
+                // Output full - refund the charge and hold the result for next attempt
+                refund_queue_bytes(&state.output.processed_heap_bytes, heap_size as u64);
                 worker.held_processed = Some((serial, results, heap_size));
                 break;
             }
