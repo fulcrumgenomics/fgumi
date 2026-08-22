@@ -442,7 +442,7 @@ mod tests {
         // Oversized (unmapped) record that spans multiple BGZF blocks.
         records.push(make_test_record(b"oversized", BGZF_MAX_BLOCK_SIZE + 500));
 
-        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf, false));
 
         let plain_path = dir.path().join("plain.bam");
         {
@@ -493,7 +493,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("test.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
 
         let num_records = 200;
         let records: Vec<Vec<u8>> = (0..num_records)
@@ -540,7 +540,7 @@ mod tests {
     #[case::dev_stdout("/dev/stdout")]
     fn test_pooled_bam_writer_indexing_rejects_stdout(#[case] spelling: &str) {
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
 
         // Matched rather than `expect_err`: the writer is deliberately not
         // `Debug`, so unwrapping the error out of the `Result` does not compile.
@@ -569,7 +569,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("empty.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
 
         {
             let writer =
@@ -599,7 +599,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("many.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf, false));
 
         let num_records = 5000;
         {
@@ -639,7 +639,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("drain.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf, false));
 
         // Retain the permit pool before finalizing, exactly as the merge path does,
         // and snapshot the block-write count both before and after the drain.
@@ -678,7 +678,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("raw_match.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
 
         let records: Vec<Vec<u8>> =
             (0..50).map(|i| make_test_record(format!("r{i}").as_bytes(), 30)).collect();
@@ -715,7 +715,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("oversized.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
 
         // A sequence of BGZF_MAX_BLOCK_SIZE bytes exceeds the threshold.
         let oversized_rec = make_test_record(b"oversized_read", BGZF_MAX_BLOCK_SIZE);
@@ -750,7 +750,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("dropped_writer.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
 
         {
             let mut writer =

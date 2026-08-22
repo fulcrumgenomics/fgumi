@@ -485,9 +485,6 @@ pub(crate) fn parse_key_types(s: &str) -> Result<KeyTypesSpec, String> {
 
 impl Command for Sort {
     fn execute(&self, command_line: &str) -> Result<()> {
-        // Set before any sort work begins and never mutated after, which is what
-        // makes the flag's relaxed ordering sufficient.
-        fgumi_sort::set_sort_stats(self.sort_stats);
         if self.verify && self.output.is_some() {
             bail!("--verify cannot be used with --output");
         }
@@ -600,6 +597,7 @@ impl Sort {
             .spill_codec(self.temp_codec)
             .write_index(self.write_index)
             .read_streams(self.read_streams)
+            .sort_stats(self.sort_stats)
             .pg_info(crate::version::VERSION.to_string(), command_line.to_string());
 
         // Each per-phase override is optional and falls back to `--threads`.

@@ -772,7 +772,7 @@ mod tests {
             .collect();
         let ctx = context(&records, None);
 
-        let pool = SortWorkerPool::new(4, 1, 6, SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(4, 1, 6, SpillCodec::Bgzf, false);
         pool.set_phase(crate::worker_pool::phase::PHASE1);
 
         let mut buffer =
@@ -847,7 +847,7 @@ mod tests {
             .collect();
         let ctx = context(&records, None);
 
-        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf, false);
         pool.set_phase(crate::worker_pool::phase::PHASE1);
 
         let mut buffer =
@@ -900,7 +900,7 @@ mod tests {
             variant: TemplateKeyVariant { cb: false, tertiary: false },
         });
 
-        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf, false);
         pool.set_phase(crate::worker_pool::phase::PHASE1);
         let mut buffer = TemplateRecordBuffer::<TemplateKey24>::with_capacity(2, 4096);
         let mut deferred = DeferredKeys::<TemplateKey24>::new(ctx, 1);
@@ -941,7 +941,7 @@ mod tests {
             variant: TemplateKeyVariant { cb: false, tertiary: false },
         });
 
-        let pool = SortWorkerPool::new(4, 1, 6, SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(4, 1, 6, SpillCodec::Bgzf, false);
         pool.set_phase(crate::worker_pool::phase::PHASE1);
 
         let mut buffer =

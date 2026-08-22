@@ -52,33 +52,24 @@ pub mod codec;
 /// They are read from a log file with a grep, never from a terminal, and they
 /// buried the handful of lines an end user can act on.
 ///
-/// A process-wide flag rather than a parameter threaded through the engine: the
-/// emitters sit a dozen call levels below the CLI, several are free functions,
-/// and the alternative is a `bool` in twenty signatures that exists only for
-/// logging. Set once from the CLI before the sort starts and never mutated after,
-/// so the relaxed ordering is sufficient.
-static SORT_STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Enable or disable the sort's performance diagnostics. Call once, from the CLI.
-pub fn set_sort_stats(enabled: bool) {
-    SORT_STATS.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Whether the sort's performance diagnostics are enabled.
-#[must_use]
-pub fn sort_stats_enabled() -> bool {
-    SORT_STATS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Emit a performance diagnostic, at INFO, only when `--sort-stats` is on.
+/// The flag is run-scoped, not a process-global: it lives on [`RawExternalSorter`] (the sort's
+/// options struct) and is copied into the `SortPhaseTimer` and `SortWorkerPool` that sorter
+/// builds, so two sorts in one process (fgumi-sort is a library) keep independent settings. The
+/// emitters therefore read it from the `self`/`pool` they already hold, or take it as a
+/// `sort_stats: bool` parameter where they are free functions.
 ///
-/// Deliberately not `debug!`: these lines are the harness's data, and a benchmark
-/// that has to raise the global log level to collect them also collects every
-/// other crate's debug output, which is how a 1,700-line log became a 60,000-line
-/// one. `--sort-stats` selects *these* lines and nothing else.
+/// Emit a performance diagnostic, at INFO, only when `--sort-stats` is on for the run.
+///
+/// The first argument is the run-scoped `sort_stats` flag (a `bool`); the rest is a `log::info!`
+/// format string and arguments.
+///
+/// Deliberately not `debug!`: these lines are the harness's data, and a benchmark that has to
+/// raise the global log level to collect them also collects every other crate's debug output,
+/// which is how a 1,700-line log became a 60,000-line one. `--sort-stats` selects *these* lines
+/// and nothing else.
 macro_rules! stat {
-    ($($arg:tt)*) => {
-        if $crate::sort_stats_enabled() {
+    ($enabled:expr, $($arg:tt)*) => {
+        if $enabled {
             log::info!($($arg)*);
         }
     };
@@ -467,42 +458,5 @@ mod tests {
         );
         assert_eq!(<_ as AsRef<[u8]>>::as_ref(hd.other_fields().get(b"GO").expect("GO")), b"query");
         assert_eq!(ss_of(hd), b"unsorted:template-coordinate");
-    }
-}
-
-#[cfg(test)]
-mod stats_flag_tests {
-    /// Serializes the tests that read or write the process-global `SORT_STATS`
-    /// flag. `nextest` runs each test in its own process, so they never race
-    /// there, but plain `cargo test` runs them as threads in one process where
-    /// one test's store would be visible to the other. Holding this lock for
-    /// each test body keeps `cargo test` race-free too. Poisoning is benign
-    /// here (the guarded state is a single `AtomicBool` each test resets), so
-    /// recover the guard rather than propagate the panic.
-    static SORT_STATS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Off unless asked for. This is the whole point of the flag: a plain
-    /// `fgumi sort` printed ~99 diagnostic lines, 66 of them on the merge path
-    /// alone, and none of it was opt-in.
-    #[test]
-    fn test_sort_stats_are_off_by_default() {
-        let _guard = SORT_STATS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Not `set_sort_stats(false)` first: that would pass even if the static
-        // were initialised to `true`, which is the mistake worth catching.
-        assert!(!super::sort_stats_enabled(), "sort stats must default to off");
-    }
-
-    /// The flag is a process-wide static, so this test and
-    /// `test_sort_stats_are_off_by_default` must not run concurrently in a way
-    /// that lets one observe the other's write. `SORT_STATS_LOCK` serializes
-    /// them under plain `cargo test`; nextest additionally runs each test in
-    /// its own process, so the default test cannot see this one's store.
-    #[test]
-    fn test_sort_stats_round_trip() {
-        let _guard = SORT_STATS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        super::set_sort_stats(true);
-        assert!(super::sort_stats_enabled());
-        super::set_sort_stats(false);
-        assert!(!super::sort_stats_enabled());
     }
 }

@@ -347,7 +347,7 @@ mod tests {
     fn test_appending_leaves_one_bgzf_terminator() {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("run.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, SpillCodec::Bgzf));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, SpillCodec::Bgzf, false));
 
         // Two chunks, the second appended to the first.
         for (chunk, appending) in [(0u64, false), (1u64, true)] {
@@ -402,7 +402,7 @@ mod tests {
         // auto-detects the magic and routes to `ZspillStreamReader`.
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("test_chunk_zstd.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Zstd));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Zstd, false));
 
         let records: Vec<(TemplateKey, Vec<u8>)> = (0..100)
             .map(|i| {
@@ -463,7 +463,7 @@ mod tests {
     fn test_pooled_writer_roundtrip() {
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("test_chunk.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
 
         let records: Vec<(TemplateKey, Vec<u8>)> = (0..100)
             .map(|i| {
@@ -513,7 +513,7 @@ mod tests {
     fn test_pooled_writer_empty() {
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("empty_chunk.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
 
         {
             let writer = PooledChunkWriter::<TemplateKey>::new(
@@ -539,7 +539,7 @@ mod tests {
     fn test_pooled_writer_large_records() {
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("large_chunk.keyed");
-        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf, false));
 
         let records: Vec<(TemplateKey, Vec<u8>)> = (0..500)
             .map(|i| {
@@ -587,7 +587,7 @@ mod tests {
         // `handle.wait()` must join it and surface any errors.
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("pipelined_chunk.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
 
         let records: Vec<(TemplateKey, Vec<u8>)> =
             (0..50).map(|i| (make_key(i), vec![(i % 256) as u8; 100])).collect();
@@ -630,7 +630,7 @@ mod tests {
         // the `Drop` impl joins the thread and logs any error.
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("dropped_chunk.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
 
         let handle = {
             let mut writer = PooledChunkWriter::<TemplateKey>::new(
@@ -661,7 +661,7 @@ mod tests {
         // deadlock — the Drop impl signals the I/O thread and joins it.
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("dropped_writer.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
 
         {
             let mut writer = PooledChunkWriter::<TemplateKey>::new(
