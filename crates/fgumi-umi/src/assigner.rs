@@ -2165,14 +2165,22 @@ impl PairedUmiAssigner {
     ///
     /// As for [`AdjacencyUmiAssigner::uses_index`], an [`IndexThreshold::MinUmis`] is a
     /// MINIMUM: `0` indexes every group, and [`IndexThreshold::Never`] is what turns the
-    /// index off. Unlike the adjacency and edit strategies, the paired strategy indexes at
-    /// every `--edits` value — N-gram for k=1, BK-tree for k>1 — so only the threshold
-    /// applies. This reads the very gate `build_adjacency_graph` runs, not a copy of it.
+    /// index off. Unlike the adjacency and edit strategies, the paired strategy is index-
+    /// *eligible* at every `--edits` value — N-gram for k=1, BK-tree for k>1 — so only the
+    /// threshold applies. This reads the very gate `build_adjacency_graph` runs, not a copy
+    /// of it.
     ///
-    /// As there, eligibility is necessary but not sufficient: [`NgramIndex::new`] and
+    /// Eligibility is necessary but not sufficient: [`NgramIndex::new`] and
     /// [`BkTree::from_umis`] both decline UMIs they cannot encode (non-ACGT bases, and
-    /// for the N-gram index an empty group or inconsistent lengths), and the caller
-    /// then falls back to the linear scan.
+    /// for the N-gram index an empty group or inconsistent lengths), and the caller then
+    /// falls back to the linear scan. For the paired strategy that fallback is not an edge
+    /// case but the rule: a paired canonical form always carries the `-` separator between its
+    /// halves, and `-` is non-`ACGT`, so the index invariably declines it. So although this
+    /// returns `true` above the size threshold, the paired strategy in practice **always**
+    /// runs its reverse-aware linear scan — see the
+    /// `test_paired_forms_are_never_indexed_because_of_the_dash` regression test. (That linear
+    /// scan is what keeps it reverse-aware: the indexed candidate search is forward-Hamming
+    /// only.)
     #[must_use]
     pub fn uses_index(&self, num_umis: usize) -> bool {
         self.adjacency.index_admits(num_umis)
@@ -2903,6 +2911,31 @@ mod tests {
         let other = format!("T{}", &umi[1..]);
         let umis = vec![(0usize, umi.as_str()), (1usize, other.as_str())];
         assert_eq!(NgramIndex::new(&umis, max_mismatches).map(|_| ()), expected);
+    }
+
+    /// Paired canonical forms always carry the `-` separator between the two halves, and `-`
+    /// is a non-`ACGT` byte. Both indexes encode only `ACGT`, so they invariably decline
+    /// dash-delimited forms — which is why `PairedUmiAssigner`'s size-based index *eligibility*
+    /// (`uses_index`) is never actually realized: the paired strategy always falls back to its
+    /// reverse-aware linear scan regardless of pool size.
+    ///
+    /// This pins that invariant deliberately: the indexed candidate search
+    /// (`find_within`) is forward-Hamming only, so were the index ever taught to accept
+    /// dash-delimited forms (e.g. by stripping the dash for a perf win on large paired pools),
+    /// it would silently drop the reverse-orientation (`A-B` == `B-A`, GRP3-01) edges the
+    /// paired matcher draws. A change that makes this test fail must also make the indexed path
+    /// reverse-aware.
+    #[test]
+    fn test_paired_forms_are_never_indexed_because_of_the_dash() {
+        let umis = vec![(0usize, "ACGT-TGCA"), (1usize, "AAAA-CCCC"), (2usize, "TTTT-GGGG")];
+        assert!(
+            NgramIndex::new(&umis, 1).is_none(),
+            "NgramIndex must decline dash-delimited paired forms (`-` is non-ACGT)"
+        );
+        assert!(
+            BkTree::from_umis(&umis).is_none(),
+            "BkTree must decline dash-delimited paired forms (`-` is non-ACGT)"
+        );
     }
 
     /// Group `umis` into components by brute force, independent of the
@@ -5102,8 +5135,10 @@ mod tests {
         assert_eq!(assigner.uses_index(1_000), expected);
     }
 
-    /// The paired strategy indexes at every `--edits` value: N-gram for k=1, BK-tree
-    /// for k>1. Only the `--index-threshold` minimum applies.
+    /// The paired strategy is index-*eligible* at every `--edits` value (N-gram for k=1,
+    /// BK-tree for k>1; only the `--index-threshold` minimum applies) — this pins that
+    /// `uses_index` size gate. Eligibility is never actually realized for paired UMIs, whose
+    /// dash declines the index (see `test_paired_forms_are_never_indexed_because_of_the_dash`).
     #[rstest]
     #[case::edits_one_below_threshold(1, 99, false)]
     #[case::edits_one_at_threshold(1, 100, true)]
