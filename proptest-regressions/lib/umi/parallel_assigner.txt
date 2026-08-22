@@ -6,3 +6,5 @@
 # everyone who runs the test benefits from these saved cases.
 cc 686bd6d531b3c099c74ab9af51c41a3626daec9d4e3272eb845900cbe0e79e41 # shrinks to molecules = [([0, 2, 3, 3], [0, 2, 2, 3])], reads = [(0, true, Some(2)), (0, false, None)]
 cc b2c16b44a86ca92ec1916db9550c1e20c0998c1d5e6a5376aa8081b9ce41b6fd # shrinks to molecules = [([0, 0, 0, 0], [0, 0, 0, 0]), ([1, 3, 3, 0], [1, 3, 3, 0])], reads = [(1, false, None), (1, false, Some(0))]
+cc 63117059953722b539bc2ce40e3785e3bdd01d7d67aac46704b991359b503a13 # shrinks to total_bases = 5, molecules = [([3, 1], 91), ([2, 1, 3, 3, 1], 146)], reads = [(1, true, Some(2)), (2, false, None), (0, false, None)], max_mismatches = 2
+cc f23e69d4fb2f3f2fca96fa31ac5dcf2984178ce0078a8011b0cac42e30757b1f # shrinks to total_bases = 4, molecules = [([0], 178), ([2, 3, 0, 0], 108), ([2, 0, 3, 0], 32)], reads = [(1, true, Some(5)), (4, false, None), (2, false, None), (4, false, None)], max_mismatches = 2
