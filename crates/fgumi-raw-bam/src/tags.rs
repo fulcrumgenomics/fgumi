@@ -314,16 +314,25 @@ pub fn extract_aux_string_tags(
             let start = p + 3;
             if let Some(end) = nul_offset(&aux_data[start..]) {
                 let value = &aux_data[start..start + end];
+                // Independent `if` checks (not a chained `else if`) so a caller
+                // that configures overlapping selected tags -- e.g. `cell_tag ==
+                // MC`, or `umi_tag` equal to RG/cell/MC -- still captures every
+                // selected field from the one matching aux entry. A chained
+                // `else if` would populate only the first-matching field. This
+                // mirrors the sibling `extract_template_aux_tags`.
                 if t == SamTag::RG {
                     result.rg = Some(value);
                     found |= 1;
-                } else if t == *cell_tag {
+                }
+                if t == *cell_tag {
                     result.cell = Some(value);
                     found |= 2;
-                } else if t == SamTag::MC {
+                }
+                if t == SamTag::MC {
                     result.mc = Some(value);
                     found |= 4;
-                } else if matches!(umi_tag, Some(ut) if t == ut) {
+                }
+                if matches!(umi_tag, Some(ut) if t == ut) {
                     // Width checks are defensive only (BAM records < 4 GiB,
                     // aux values < 64 KiB); silently skip if they fail.
                     if let (Ok(off_u32), Ok(len_u16)) = (u32::try_from(start), u16::try_from(end)) {
@@ -2881,6 +2890,49 @@ mod tests {
         let aux = b"RXZACGT\x00";
         let result = extract_aux_string_tags(aux, SamTag::CB, None);
         assert!(result.umi_position.is_none());
+    }
+
+    /// Overlapping selection: when `cell_tag == MC`, the single `MC` aux entry
+    /// must populate BOTH the cell field and the mc field. The chained
+    /// `else if` this replaced captured only the first-matching field (cell) and
+    /// left `mc` = None, which on the grouping/dedup key path silently dropped
+    /// the mate-CIGAR contribution to the group key. Parity with the sibling
+    /// `extract_template_aux_tags`, which already uses independent `if` checks.
+    #[test]
+    fn test_extract_aux_string_tags_captures_overlapping_cell_and_mc() {
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"RGZlib1\x00");
+        aux.extend_from_slice(b"MCZ5M\x00");
+        // cell_tag == MC: the one MC entry is selected as both cell and mc.
+        let result = extract_aux_string_tags(&aux, SamTag::MC, None);
+        assert_eq!(result.rg, Some(b"lib1".as_ref()));
+        assert_eq!(result.cell, Some(b"5M".as_ref()), "cell must capture the MC entry");
+        assert_eq!(result.mc, Some(b"5M".as_slice()), "mc must still capture the same entry");
+    }
+
+    /// Overlapping selection on the UMI axis: when `umi_tag == RG`, the single
+    /// `RG` entry must populate BOTH the rg field and the UMI position.
+    #[test]
+    fn test_extract_aux_string_tags_captures_overlapping_rg_and_umi() {
+        let aux = b"RGZlib1\x00";
+        let result = extract_aux_string_tags(aux, SamTag::CB, Some(*SamTag::RG));
+        assert_eq!(result.rg, Some(b"lib1".as_ref()), "rg must still capture");
+        let (off, len) = result.umi_position.expect("UMI position must also capture the RG entry");
+        assert_eq!(&aux[off as usize..off as usize + len as usize], b"lib1");
+    }
+
+    /// Non-overlap pin: with disjoint selected tags (the default `cell_tag ==
+    /// CB`), each field is sourced from its own entry and nothing cross-fills.
+    #[test]
+    fn test_extract_aux_string_tags_non_overlapping_tags_stay_separate() {
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"RGZlib1\x00");
+        aux.extend_from_slice(b"CBZbc1\x00");
+        aux.extend_from_slice(b"MCZ5M\x00");
+        let result = extract_aux_string_tags(&aux, SamTag::CB, None);
+        assert_eq!(result.rg, Some(b"lib1".as_ref()));
+        assert_eq!(result.cell, Some(b"bc1".as_ref()));
+        assert_eq!(result.mc, Some(b"5M".as_slice()));
     }
 
     // ========================================================================
