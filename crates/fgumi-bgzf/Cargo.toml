@@ -20,5 +20,9 @@ rstest = { workspace = true }
 name = "stored_block_decode"
 harness = false
 
+[[bench]]
+name = "raw_block_read"
+harness = false
+
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
