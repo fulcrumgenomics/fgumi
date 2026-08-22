@@ -1933,11 +1933,6 @@ impl CodecConsensusCaller {
     reason = "test-only methods use owned values and numeric casts"
 )]
 impl CodecConsensusCaller {
-    /// Test-only wrapper: check if a `RawRecord` is part of an FR pair.
-    pub fn is_fr_pair(&self, rec: &RawRecord) -> bool {
-        bam_fields::is_fr_pair_raw(rec)
-    }
-
     /// Test-only wrapper: filter `RawRecord`s to most common alignment,
     /// returning the surviving records (index-stable relative to the input).
     pub fn filter_to_most_common_alignment(&mut self, recs: Vec<RawRecord>) -> Vec<RawRecord> {
@@ -2147,53 +2142,6 @@ mod tests {
             .template_length(tlen);
         b.add_string_tag(SamTag::MI, b"UMI123");
         b.build()
-    }
-
-    #[test]
-    fn test_is_fr_pair() {
-        use noodles::sam::alignment::record::cigar::op::Kind;
-
-        let options = CodecConsensusOptions::default();
-        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
-
-        // FR pair: R1 forward, R2 reverse
-        let r1_fr = create_test_paired_read(
-            "read1",
-            b"ACGT",
-            b"####",
-            true,
-            false,
-            true,
-            100,
-            &[(Kind::Match, 4)],
-        );
-        assert!(caller.is_fr_pair(&r1_fr));
-
-        // RF pair: R1 reverse, R2 forward - still considered FR orientation
-        let r1_rf = create_test_paired_read(
-            "read1",
-            b"ACGT",
-            b"####",
-            true,
-            true,
-            false,
-            100,
-            &[(Kind::Match, 4)],
-        );
-        assert!(caller.is_fr_pair(&r1_rf));
-
-        // FF pair: both forward - not FR
-        let r1_ff = create_test_paired_read(
-            "read1",
-            b"ACGT",
-            b"####",
-            true,
-            false,
-            false,
-            100,
-            &[(Kind::Match, 4)],
-        );
-        assert!(!caller.is_fr_pair(&r1_ff));
     }
 
     #[test]

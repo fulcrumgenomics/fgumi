@@ -97,8 +97,8 @@ pub use cigar::{
 
 // -- overlap --
 pub use overlap::{
-    bases_extending_past_mate_ops, is_fr_pair_raw, is_primary_fr_pair_raw,
-    num_bases_extending_past_mate_raw, num_bases_extending_past_mate_vs_mate_raw,
+    bases_extending_past_mate_ops, is_primary_fr_pair_raw, num_bases_extending_past_mate_raw,
+    num_bases_extending_past_mate_vs_mate_raw,
 };
 
 // -- raw_bam_record --

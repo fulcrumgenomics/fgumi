@@ -5,13 +5,20 @@ use crate::cigar::{
 use crate::fields::{RawRecordView, aux_data_slice, flags, mate_pos, mate_ref_id, template_length};
 use crate::tags::RawTagsView;
 
-/// Check if a single read is part of an FR (forward-reverse) pair using raw BAM bytes.
+/// Crate-internal per-record FR (forward-reverse) classification from raw BAM bytes.
 ///
-/// This is the raw-byte equivalent of `record_utils::is_fr_pair_from_tags`.
+/// **Per-record, and not a gate for pair decisions.** The forward-strand arm derives the mate's
+/// 5' end from `TLEN`, which misclassifies dovetail FR pairs whose aligned ends coincide
+/// (htsjdk/samtools#1771). It is therefore crate-internal: it exists only as the reverse-arm
+/// building block for the correct, TLEN-independent gates. Callers that need to classify a pair
+/// must use `is_primary_fr_pair_raw` (both records in hand) or `is_fr_pair_with_mate_cigar_raw`
+/// (a read plus its MC tag) instead. Raw-byte counterpart of
+/// `record_utils::is_fr_pair_from_tags`.
+///
 /// Returns `true` if the read is paired, both read and mate are mapped,
 /// on the same reference, and in FR orientation (positive strand 5' < negative strand 5').
 #[must_use]
-pub fn is_fr_pair_raw(bam: &[u8]) -> bool {
+pub(crate) fn is_fr_pair_raw(bam: &[u8]) -> bool {
     let v = RawRecordView::new(bam);
     let flg = v.flags();
 
@@ -63,7 +70,7 @@ pub fn is_fr_pair_raw(bam: &[u8]) -> bool {
 /// Symmetric per-pair FR classification for a template's two primary reads.
 ///
 /// This is the raw-byte port of fgbio `CodecConsensusCaller.isPrimaryFrPair(a, b)`
-/// (`CodecConsensusCaller.scala:424-433`). Unlike [`is_fr_pair_raw`], which is a *per-record*
+/// (`CodecConsensusCaller.scala:424-433`). Unlike `is_fr_pair_raw`, which is a *per-record*
 /// test, this evaluates a *pair* and is order-independent: after confirming both reads are
 /// mapped with mapped mates, on the same reference, and on opposite strands, it derives the FR
 /// orientation from the **reverse-strand record only**. That branch of the orientation test is
@@ -101,19 +108,19 @@ pub fn is_primary_fr_pair_raw(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// FR classification for the MC-tag consensus path, evaluated per-*pair* rather than via the
-/// per-record TLEN arm of [`is_fr_pair_raw`].
+/// per-record TLEN arm of `is_fr_pair_raw`.
 ///
-/// [`is_fr_pair_raw`]'s forward-strand arm derives the negative-strand 5' end from `TLEN`, which
+/// `is_fr_pair_raw`'s forward-strand arm derives the negative-strand 5' end from `TLEN`, which
 /// misclassifies dovetail FR pairs whose aligned ends coincide (htsjdk/samtools#1771) and zeroes
 /// the read-through clip for the forward read. The simplex/duplex callers hold the read plus its
 /// `MC` tag (mate CIGAR), so the reverse-strand record's CIGAR-derived orientation — the branch
 /// [`is_primary_fr_pair_raw`] evaluates — can be reconstructed for either strand:
 /// - a reverse-strand read *is* the reverse record, so its own CIGAR-based arm (exactly
-///   [`is_fr_pair_raw`]) is already correct and TLEN-independent;
+///   `is_fr_pair_raw`) is already correct and TLEN-independent;
 /// - a forward-strand read's mate is the reverse record: its leftmost (5') is `mate_pos` and its
 ///   inclusive alignment end is `mate_pos + mate_ref_len - 1` (from the `MC` CIGAR), and the pair
 ///   is FR iff the forward read's own 5' (its leftmost) is `<` that end — the same
-///   `positive_five_prime < negative_five_prime` test [`is_fr_pair_raw`]'s reverse arm applies.
+///   `positive_five_prime < negative_five_prime` test `is_fr_pair_raw`'s reverse arm applies.
 ///
 /// `mate_ref_len` is the reference span of the mate's CIGAR (from the `MC` tag), clamped by
 /// [`saturating_reference_length`]. This matches `is_primary_fr_pair_raw(read, mate)` on dovetail
@@ -208,7 +215,7 @@ pub fn num_bases_extending_past_mate_raw(bam: &[u8]) -> usize {
 /// distance as [`num_bases_extending_past_mate_raw`].
 ///
 /// Because both records are in hand, FR classification uses the symmetric per-pair
-/// [`is_primary_fr_pair_raw`] rather than the per-record [`is_fr_pair_raw`]. The per-record test is
+/// [`is_primary_fr_pair_raw`] rather than the per-record `is_fr_pair_raw`. The per-record test is
 /// asymmetric for dovetail pairs (htsjdk/samtools#1771): a valid dovetail-forward pair can be
 /// mis-classified as non-FR from the forward read's perspective, which would zero its clip even
 /// though the caller (e.g. the codec caller's `is_primary_fr_pair_raw` gate) accepted the pair.
@@ -283,7 +290,7 @@ pub fn num_bases_extending_past_mate_vs_mate_raw(rec: &[u8], mate: &[u8]) -> usi
 /// aligned bases — the destructive answer fulcrumgenomics/fgumi#752 exists to remove — on a
 /// geometry this function cannot verify.
 ///
-/// It is reachable two ways, one per strand. [`is_fr_pair_raw`] mirrors htsjdk's *per-record*
+/// It is reachable two ways, one per strand. `is_fr_pair_raw` mirrors htsjdk's *per-record*
 /// orientation test, whose forward-strand arm reads `TLEN`, so a forward record can be accepted
 /// as one end of an FR pair while the mate CIGAR it carries places the mate to its left.
 /// (htsjdk 5 prefers the mate CIGAR when the MC tag is present, which is why fgbio does not admit
@@ -2031,7 +2038,7 @@ mod tests {
     }
 
     /// The negative-strand mirror of the case above, which only the mate-record entry point can
-    /// reach: [`is_fr_pair_raw`]'s reverse arm compares the mate position recorded *on the read*
+    /// reach: `is_fr_pair_raw`'s reverse arm compares the mate position recorded *on the read*
     /// against the read's own end, while [`num_bases_extending_past_mate_vs_mate_raw`] measures
     /// against the mate record in hand, and the two disagree when that field is stale.
     ///
