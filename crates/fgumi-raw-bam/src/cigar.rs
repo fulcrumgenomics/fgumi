@@ -387,7 +387,7 @@ pub fn alignment_start_from_raw(bam: &[u8]) -> Option<usize> {
 ///
 /// Computes clipped CIGAR ops and the number of reference bases consumed by clipping,
 /// without modifying any record. This is the raw-byte equivalent of
-/// `SamRecordClipper::clip_start_of_read` / `clip_end_of_read` with Hard clipping mode.
+/// `RawRecordClipper::clip_start_of_read_raw` / `clip_end_of_read_raw` with Hard clipping mode.
 ///
 /// Like the Clipper, this first accounts for existing H+S clips at the relevant end.
 /// If `clip_amount` <= existing clips, only soft clips are upgraded to hard clips
@@ -664,7 +664,7 @@ fn parse_ref_len_and_trailing_clips(cigar: &[u8]) -> (i32, i32) {
 
 /// Upgrade existing soft clips to hard clips without changing alignment.
 ///
-/// Matches `SamRecordClipper::upgrade_clipping` in Hard mode.
+/// Matches `RawRecordClipper::upgrade_clipping_raw` in Hard mode.
 /// Used when `clip_amount` <= existing H+S clips.
 fn upgrade_clipping_raw(
     cigar_ops: &[u32],

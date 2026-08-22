@@ -3,47 +3,7 @@
 //! This module provides functionality for clipping reads in various ways (soft, hard, etc.)
 //! and is used by tools like `clip` and consensus calling tools.
 
-use anyhow::Result;
-use noodles::core::Position;
-use noodles::sam::alignment::RecordBuf;
-use noodles::sam::alignment::record::cigar::Cigar;
-use noodles::sam::alignment::record::cigar::Op as CigarOp;
 use noodles::sam::alignment::record::cigar::op::Kind;
-use noodles::sam::alignment::record_buf::data::field::Value;
-use noodles::sam::alignment::record_buf::{Cigar as CigarBuf, QualityScores, Sequence};
-
-use crate::record_utils;
-use fgumi_dna::{MIN_PHRED, NO_CALL_BASE};
-
-/// Helper macro to get array length for any Array variant
-macro_rules! array_len {
-    ($arr:expr) => {
-        match $arr {
-            Array::Int8(a) => a.len(),
-            Array::UInt8(a) => a.len(),
-            Array::Int16(a) => a.len(),
-            Array::UInt16(a) => a.len(),
-            Array::Int32(a) => a.len(),
-            Array::UInt32(a) => a.len(),
-            Array::Float(a) => a.len(),
-        }
-    };
-}
-
-/// Helper macro to slice an array and create a new Value
-macro_rules! slice_array {
-    ($arr:expr, $start:expr, $end:expr) => {
-        match $arr {
-            Array::Int8(a) => Value::from(a[$start..$end].to_vec()),
-            Array::UInt8(a) => Value::from(a[$start..$end].to_vec()),
-            Array::Int16(a) => Value::from(a[$start..$end].to_vec()),
-            Array::UInt16(a) => Value::from(a[$start..$end].to_vec()),
-            Array::Int32(a) => Value::from(a[$start..$end].to_vec()),
-            Array::UInt32(a) => Value::from(a[$start..$end].to_vec()),
-            Array::Float(a) => Value::from(a[$start..$end].to_vec()),
-        }
-    };
-}
 
 /// Base-oriented aux tags that are reverse-complemented (with `SEQ`) when a read is
 /// reverse-complemented, mirroring htsjdk `SAMRecord.TAGS_TO_REVERSE_COMPLEMENT`.
@@ -54,35 +14,6 @@ const TAGS_TO_REVERSE_COMPLEMENT: [fgumi_raw_bam::SamTag; 2] =
 /// reverse-complemented, mirroring htsjdk `SAMRecord.TAGS_TO_REVERSE`.
 const TAGS_TO_REVERSE: [fgumi_raw_bam::SamTag; 2] =
     [fgumi_raw_bam::SamTag::OQ, fgumi_raw_bam::SamTag::U2];
-
-/// Reorients the strand-sensitive aux tags of a `RecordBuf` the way htsjdk
-/// `SAMRecord.reverseComplement` does when unmapping a reverse-strand read:
-/// reverse-complement the base-oriented tags ([`TAGS_TO_REVERSE_COMPLEMENT`]) and
-/// reverse the quality-oriented tags ([`TAGS_TO_REVERSE`]).
-///
-/// Only the `Z`-string encoding is handled — the sole form these tags take in practice.
-/// htsjdk additionally reverses array-encoded (`B:...`) values, but none of these tags
-/// is emitted as an array by real tooling, and skipping them keeps this in lockstep with
-/// the raw path (`RawTagsMut::reverse_string` / `reverse_complement_string`).
-fn reorient_strand_tags(record: &mut RecordBuf) {
-    for tag in TAGS_TO_REVERSE_COMPLEMENT {
-        if let Some(Value::String(s)) = record.data_mut().get_mut(&tag.to_noodles_tag()) {
-            let mut bytes = s.to_vec();
-            bytes.reverse();
-            for b in &mut bytes {
-                *b = fgumi_dna::complement_base(*b);
-            }
-            *s = bytes.into();
-        }
-    }
-    for tag in TAGS_TO_REVERSE {
-        if let Some(Value::String(s)) = record.data_mut().get_mut(&tag.to_noodles_tag()) {
-            let mut bytes = s.to_vec();
-            bytes.reverse();
-            *s = bytes.into();
-        }
-    }
-}
 
 /// Modes of clipping that can be applied to reads
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -106,1181 +37,11 @@ impl std::fmt::Display for ClippingMode {
     }
 }
 
-/// Utility for clipping BAM/SAM records in various ways
-pub struct SamRecordClipper {
-    /// The clipping mode to use
-    mode: ClippingMode,
-    /// Whether to automatically clip extended attributes that match read length
-    auto_clip_attributes: bool,
-}
-
-impl SamRecordClipper {
-    /// Creates a new clipper with the specified mode
-    #[must_use]
-    pub fn new(mode: ClippingMode) -> Self {
-        Self { mode, auto_clip_attributes: false }
-    }
-
-    /// Creates a new clipper with auto-clip attributes enabled
-    ///
-    /// When enabled with hard clipping mode, any tags that are the same length as the
-    /// read's sequence will be automatically clipped to match. This ensures per-base
-    /// tags (like quality arrays, per-base depths, etc.) stay synchronized with the sequence.
-    #[must_use]
-    pub fn with_auto_clip(mode: ClippingMode, auto_clip_attributes: bool) -> Self {
-        Self { mode, auto_clip_attributes }
-    }
-
-    /// Clips extended attributes (per-base tags) when hard clipping
-    ///
-    /// When auto-clipping is enabled and using hard clipping mode, this method
-    /// automatically trims any tag values (strings or arrays) that are the same length
-    /// as the original read sequence to match the new clipped length.
-    ///
-    /// # Arguments
-    /// * `record` - The record to modify
-    /// * `remove` - Number of bases being removed
-    /// * `from_start` - If true, clip from start (5' end); if false, clip from end (3' end)
-    // RecordBuf kept: iterates typed tag data via record.data().iter() returning Value variants
-    // (String/Array), then writes updated values back via record.data_mut().insert() — there is
-    // no raw-byte equivalent that can splice arbitrary per-base tag arrays without fully
-    // re-encoding the aux section.
-    fn clip_extended_attributes(&self, record: &mut RecordBuf, remove: usize, from_start: bool) {
-        use noodles::sam::alignment::record_buf::data::field::value::Array;
-
-        // Only clip attributes when using hard clipping mode with auto-clip enabled
-        if !matches!(self.mode, ClippingMode::Hard) || remove == 0 || !self.auto_clip_attributes {
-            return;
-        }
-
-        let new_length = record.sequence().len();
-        let old_length = new_length + remove;
-
-        // Collect tags to update (we can't modify while iterating)
-        let mut tags_to_update: Vec<(Vec<u8>, Value)> = Vec::new();
-
-        // Iterate through all data fields
-        for (tag, value) in record.data().iter() {
-            // Check if this is a String or Array that matches the old length
-            let should_clip = match value {
-                Value::String(s) => {
-                    let bytes: &[u8] = s.as_ref();
-                    bytes.len() == old_length
-                }
-                Value::Array(arr) => array_len!(arr) == old_length,
-                _ => false,
-            };
-
-            if should_clip {
-                // Create clipped version of the value
-                let (start, end) = if from_start { (remove, old_length) } else { (0, new_length) };
-                let new_value = match value {
-                    Value::String(s) => {
-                        // Preserve the clipped bytes verbatim. The previous
-                        // `from_utf8(..).unwrap_or("")` silently replaced a
-                        // non-UTF-8 tag value with an empty string; noodles'
-                        // `Value::String` holds a byte string, so slice it
-                        // directly instead of round-tripping through `&str`.
-                        let bytes: &[u8] = s.as_ref();
-                        Value::String(bytes[start..end].to_vec().into())
-                    }
-                    Value::Array(arr) => slice_array!(arr, start, end),
-                    _ => continue, // Should not reach here due to should_clip check
-                };
-
-                tags_to_update.push((tag.as_ref().to_vec(), new_value));
-            }
-        }
-
-        // Now update the tags
-        for (tag, value) in tags_to_update {
-            let tag_array: [u8; 2] = [tag[0], tag[1]];
-            record.data_mut().insert(tag_array.into(), value);
-        }
-    }
-
-    /// Number of bases available to be clipped from the alignment.
-    ///
-    /// The sum of the alignment (`M`/`=`/`X`) and insertion (`I`) CIGAR op lengths,
-    /// i.e. the read bases that are aligned. Mirrors fgbio `numberOfClippableBases`.
-    fn number_of_clippable_bases(record: &RecordBuf) -> usize {
-        record
-            .cigar()
-            .iter()
-            .filter_map(Result::ok)
-            .filter(|op| {
-                matches!(
-                    op.kind(),
-                    Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Insertion
-                )
-            })
-            .map(CigarOp::len)
-            .sum()
-    }
-
-    /// Unmaps a read the way htsjdk `SAMUtils.makeReadUnmapped` does.
-    ///
-    /// Clears the reference, position, mapping quality, CIGAR, and template length, and
-    /// clears the duplicate, secondary, supplementary, and proper-pair flags while setting
-    /// the unmapped flag. For reverse-strand reads the (reference-forward) bases are
-    /// reverse-complemented, the qualities reversed, and the strand-sensitive aux tags
-    /// reoriented (see [`reorient_strand_tags`]) — returning them to original read
-    /// orientation — before the reverse-strand flag is cleared. Bases and qualities are
-    /// otherwise preserved (they are *not* dropped).
-    fn make_read_unmapped(record: &mut RecordBuf) {
-        use noodles::sam::alignment::record::Flags;
-
-        if record.flags().is_reverse_complemented() {
-            let rc = fgumi_dna::reverse_complement(record.sequence().as_ref());
-            let mut quals: Vec<u8> = record.quality_scores().as_ref().to_vec();
-            quals.reverse();
-            *record.sequence_mut() = Sequence::from(rc);
-            *record.quality_scores_mut() = QualityScores::from(quals);
-            reorient_strand_tags(record);
-        }
-
-        let flags = record.flags_mut();
-        flags.remove(
-            Flags::REVERSE_COMPLEMENTED
-                | Flags::DUPLICATE
-                | Flags::SECONDARY
-                | Flags::SUPPLEMENTARY
-                | Flags::PROPERLY_SEGMENTED,
-        );
-        flags.insert(Flags::UNMAPPED);
-
-        *record.reference_sequence_id_mut() = None;
-        *record.alignment_start_mut() = None;
-        // htsjdk makeReadUnmapped sets NO_MAPPING_QUALITY (0), not the "unavailable"
-        // sentinel: a typed `None` here would serialize to BAM MAPQ 255, diverging from
-        // both htsjdk and the raw path (`make_read_unmapped_raw` sets 0).
-        *record.mapping_quality_mut() = Some(
-            noodles::sam::alignment::record::MappingQuality::try_from(0u8)
-                .expect("0 is a valid mapping quality"),
-        );
-        *record.template_length_mut() = 0;
-        *record.cigar_mut() = CigarBuf::default();
-    }
-
-    /// Clips a specified number of bases from the start (left side) of the alignment
-    ///
-    /// Returns the number of bases actually clipped
-    // RecordBuf kept: core algorithm decodes CIGAR ops via noodles record.cigar().iter() ->
-    // Result<Op>, rebuilds them as Vec<CigarOp>, assigns back via *record.cigar_mut() =
-    // CigarBuf::from(...), updates alignment_start via noodles Position, and splices
-    // sequence/qualities via Sequence/QualityScores wrappers.  A raw-byte rewrite would
-    // require in-place byte surgery on the CIGAR and seq/qual sections; the noodles-typed
-    // algorithm is already well-tested and a raw rewrite is a large, independent effort.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "clipping logic with multiple modes requires handling many CIGAR edge cases"
-    )]
-    pub fn clip_start_of_alignment(&self, record: &mut RecordBuf, bases_to_clip: usize) -> usize {
-        if bases_to_clip == 0 {
-            return 0;
-        }
-
-        // Don't clip unmapped reads
-        if record.flags().is_unmapped() {
-            return 0;
-        }
-
-        let sequence_len = record.sequence();
-        if sequence_len.is_empty() {
-            return 0;
-        }
-
-        // If the read has no more clippable (aligned/inserted) bases than requested, it
-        // cannot retain an alignment; unmap it (fgbio SamRecordClipper.scala:111-114).
-        let num_clippable = Self::number_of_clippable_bases(record);
-        if num_clippable <= bases_to_clip {
-            Self::make_read_unmapped(record);
-            return num_clippable;
-        }
-
-        // Collect existing CIGAR ops
-        let old_ops: Vec<CigarOp> = record.cigar().iter().filter_map(Result::ok).collect();
-
-        // Extract existing hard and soft clips from the start
-        let existing_hard_clip = old_ops
-            .iter()
-            .take_while(|op| op.kind() == Kind::HardClip)
-            .map(|op| op.len())
-            .sum::<usize>();
-
-        let existing_soft_clip = old_ops
-            .iter()
-            .skip_while(|op| op.kind() == Kind::HardClip)
-            .take_while(|op| op.kind() == Kind::SoftClip)
-            .map(|op| op.len())
-            .sum::<usize>();
-
-        // Skip to operations after existing clips
-        let post_clip_ops: Vec<CigarOp> = old_ops
-            .into_iter()
-            .skip_while(|op| matches!(op.kind(), Kind::HardClip | Kind::SoftClip))
-            .collect();
-
-        let mut read_bases_clipped = 0;
-        let mut ref_bases_clipped = 0;
-        let mut new_ops = Vec::new();
-        let mut iter = post_clip_ops.iter().peekable();
-
-        // Clip operations from the start
-        // Continue until we've clipped enough read bases, OR if we've clipped the right amount
-        // but the next operation is a deletion (which should be removed)
-        while read_bases_clipped < bases_to_clip
-            || (read_bases_clipped == bases_to_clip
-                && new_ops.is_empty()
-                && iter.peek().map(|op| op.kind()) == Some(Kind::Deletion))
-        {
-            let Some(op) = iter.next() else { break };
-
-            let kind = op.kind();
-            let len = op.len();
-
-            let consumes_read = matches!(
-                kind,
-                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Insertion
-            );
-            let consumes_ref = matches!(
-                kind,
-                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion
-            );
-
-            if consumes_read && len > (bases_to_clip - read_bases_clipped) {
-                // This operation extends past our clip point
-                if kind == Kind::Insertion {
-                    // Consume entire insertion at clip boundary
-                    read_bases_clipped += len;
-                } else {
-                    // Split the operation
-                    let remaining_clip = bases_to_clip - read_bases_clipped;
-                    let remaining_length = len - remaining_clip;
-                    read_bases_clipped += remaining_clip;
-                    ref_bases_clipped += remaining_clip;
-                    new_ops.push(CigarOp::new(kind, remaining_length));
-                }
-            } else {
-                // Consume entire operation
-                if consumes_read {
-                    read_bases_clipped += len;
-                }
-                if consumes_ref {
-                    ref_bases_clipped += len;
-                }
-            }
-        }
-
-        // Add remaining operations
-        new_ops.extend(iter.copied());
-
-        // Prepend appropriate clipping operators
-        let (final_ops, bases_to_remove) = match self.mode {
-            ClippingMode::Hard => {
-                // Match fgbio's behavior: convert ALL existing soft clips to hard clips
-                let added_hard_clip = existing_soft_clip + read_bases_clipped;
-                let total_hard_clip = existing_hard_clip + added_hard_clip;
-                let mut result = Vec::new();
-                result.push(CigarOp::new(Kind::HardClip, total_hard_clip));
-                result.extend(new_ops);
-                (result, added_hard_clip)
-            }
-            ClippingMode::Soft | ClippingMode::SoftWithMask => {
-                let total_soft_clip = existing_soft_clip + read_bases_clipped;
-                let mut result = Vec::new();
-                if existing_hard_clip > 0 {
-                    result.push(CigarOp::new(Kind::HardClip, existing_hard_clip));
-                }
-                result.push(CigarOp::new(Kind::SoftClip, total_soft_clip));
-                result.extend(new_ops);
-                (result, 0)
-            }
-        };
-
-        // Update CIGAR
-        *record.cigar_mut() = CigarBuf::from(final_ops);
-
-        // Update alignment start position
-        if ref_bases_clipped > 0
-            && let Some(start_pos) = record.alignment_start()
-            && let Some(new_start) = Position::new(usize::from(start_pos) + ref_bases_clipped)
-        {
-            *record.alignment_start_mut() = Some(new_start);
-        }
-
-        // Handle sequence and quality updates based on mode
-        match self.mode {
-            ClippingMode::Soft => {
-                // Keep sequence and qualities as-is
-            }
-            ClippingMode::SoftWithMask => {
-                // Mask clipped bases to N and quality to min
-                let seq = record.sequence();
-                let qual = record.quality_scores();
-                let mut new_seq: Vec<u8> = seq.as_ref().to_vec();
-                let mut new_qual: Vec<u8> = qual.as_ref().to_vec();
-
-                let total_soft_clip = existing_soft_clip + read_bases_clipped;
-                for i in 0..total_soft_clip.min(new_seq.len()) {
-                    new_seq[i] = NO_CALL_BASE;
-                    new_qual[i] = MIN_PHRED;
-                }
-
-                *record.sequence_mut() = Sequence::from(new_seq);
-                *record.quality_scores_mut() = QualityScores::from(new_qual);
-            }
-            ClippingMode::Hard => {
-                // Remove clipped bases and qualities using direct slice indexing
-                let seq = record.sequence();
-                let qual = record.quality_scores();
-                let new_seq = seq.as_ref()[bases_to_remove..].to_vec();
-                let new_qual = qual.as_ref()[bases_to_remove..].to_vec();
-
-                *record.sequence_mut() = Sequence::from(new_seq);
-                *record.quality_scores_mut() = QualityScores::from(new_qual);
-
-                // Clip extended attributes if auto-clipping is enabled
-                self.clip_extended_attributes(record, bases_to_remove, true);
-            }
-        }
-
-        read_bases_clipped
-    }
-
-    /// Clips a specified number of bases from the end (right side) of the alignment
-    ///
-    /// Returns the number of bases actually clipped
-    // RecordBuf kept: symmetric counterpart to clip_start_of_alignment; same reasoning —
-    // CIGAR surgery uses noodles CigarOp/CigarBuf, sequence and quality edits use noodles
-    // wrappers.  No raw-byte equivalent exists; see clip_start_of_alignment for full rationale.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "mirrors clip_start_of_alignment with symmetric end-clipping logic"
-    )]
-    pub fn clip_end_of_alignment(&self, record: &mut RecordBuf, bases_to_clip: usize) -> usize {
-        if bases_to_clip == 0 {
-            return 0;
-        }
-
-        // Don't clip unmapped reads
-        if record.flags().is_unmapped() {
-            return 0;
-        }
-
-        let sequence_len = record.sequence();
-        if sequence_len.is_empty() {
-            return 0;
-        }
-
-        // If the read has no more clippable (aligned/inserted) bases than requested, it
-        // cannot retain an alignment; unmap it (fgbio SamRecordClipper.scala:157-160).
-        let num_clippable = Self::number_of_clippable_bases(record);
-        if num_clippable <= bases_to_clip {
-            Self::make_read_unmapped(record);
-            return num_clippable;
-        }
-
-        // Collect existing CIGAR ops
-        let old_ops: Vec<CigarOp> = record.cigar().iter().filter_map(Result::ok).collect();
-
-        // Extract existing hard and soft clips from the end (process in reverse)
-        let existing_hard_clip = old_ops
-            .iter()
-            .rev()
-            .take_while(|op| op.kind() == Kind::HardClip)
-            .map(|op| op.len())
-            .sum::<usize>();
-
-        let existing_soft_clip = old_ops
-            .iter()
-            .rev()
-            .skip_while(|op| op.kind() == Kind::HardClip)
-            .take_while(|op| op.kind() == Kind::SoftClip)
-            .map(|op| op.len())
-            .sum::<usize>();
-
-        // Skip to operations before existing clips (reverse order, so use rev/skip_while/rev pattern)
-        let mut post_clip_ops: Vec<CigarOp> = old_ops
-            .into_iter()
-            .rev()
-            .skip_while(|op| matches!(op.kind(), Kind::HardClip | Kind::SoftClip))
-            .collect();
-        post_clip_ops.reverse(); // Un-reverse to get normal order
-
-        let mut read_bases_clipped = 0;
-        let mut new_ops = Vec::new();
-        let mut iter = post_clip_ops.iter().rev().peekable();
-
-        // Clip operations from the end (working backwards)
-        // Continue until we've clipped enough read bases, OR if we've clipped the right amount
-        // but the next operation (when working backwards) is a deletion (which should be removed)
-        while read_bases_clipped < bases_to_clip
-            || (read_bases_clipped == bases_to_clip
-                && new_ops.is_empty()
-                && iter.peek().map(|op| op.kind()) == Some(Kind::Deletion))
-        {
-            let Some(op) = iter.next() else { break };
-
-            let kind = op.kind();
-            let len = op.len();
-
-            let consumes_read = matches!(
-                kind,
-                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Insertion
-            );
-
-            if consumes_read && len > (bases_to_clip - read_bases_clipped) {
-                // This operation extends past our clip point
-                if kind == Kind::Insertion {
-                    // Consume entire insertion at clip boundary
-                    read_bases_clipped += len;
-                } else {
-                    // Split the operation
-                    let remaining_clip = bases_to_clip - read_bases_clipped;
-                    let remaining_length = len - remaining_clip;
-                    read_bases_clipped += remaining_clip;
-                    new_ops.push(CigarOp::new(kind, remaining_length));
-                }
-            } else {
-                // Consume entire operation
-                if consumes_read {
-                    read_bases_clipped += len;
-                }
-            }
-        }
-
-        // Add remaining operations (iter is already reversed, so collect as-is)
-        let remaining: Vec<CigarOp> = iter.copied().collect();
-        new_ops.extend(remaining.iter());
-
-        // new_ops is in reverse order, so reverse it
-        new_ops.reverse();
-
-        // Append appropriate clipping operators
-        let (final_ops, bases_to_remove) = match self.mode {
-            ClippingMode::Hard => {
-                // Match fgbio's behavior: convert ALL existing soft clips to hard clips
-                let added_hard_clip = existing_soft_clip + read_bases_clipped;
-                let total_hard_clip = existing_hard_clip + added_hard_clip;
-                let mut result = new_ops;
-                result.push(CigarOp::new(Kind::HardClip, total_hard_clip));
-                (result, added_hard_clip)
-            }
-            ClippingMode::Soft | ClippingMode::SoftWithMask => {
-                let total_soft_clip = existing_soft_clip + read_bases_clipped;
-                let mut result = new_ops;
-                result.push(CigarOp::new(Kind::SoftClip, total_soft_clip));
-                if existing_hard_clip > 0 {
-                    result.push(CigarOp::new(Kind::HardClip, existing_hard_clip));
-                }
-                (result, 0)
-            }
-        };
-
-        // Update CIGAR
-        *record.cigar_mut() = CigarBuf::from(final_ops);
-
-        // Handle sequence and quality updates based on mode
-        let seq_len = record.sequence().len();
-        match self.mode {
-            ClippingMode::Soft => {
-                // Keep sequence and qualities as-is
-            }
-            ClippingMode::SoftWithMask => {
-                // Mask clipped bases to N and quality to min
-                let seq = record.sequence();
-                let qual = record.quality_scores();
-                let mut new_seq: Vec<u8> = seq.as_ref().to_vec();
-                let mut new_qual: Vec<u8> = qual.as_ref().to_vec();
-
-                let total_soft_clip = existing_soft_clip + read_bases_clipped;
-                let start_mask = seq_len.saturating_sub(total_soft_clip);
-                for i in start_mask..seq_len {
-                    new_seq[i] = NO_CALL_BASE;
-                    new_qual[i] = MIN_PHRED;
-                }
-
-                *record.sequence_mut() = Sequence::from(new_seq);
-                *record.quality_scores_mut() = QualityScores::from(new_qual);
-            }
-            ClippingMode::Hard => {
-                // Remove clipped bases and qualities using direct slice indexing
-                let seq = record.sequence();
-                let qual = record.quality_scores();
-                let keep_len = seq_len.saturating_sub(bases_to_remove);
-                let new_seq = seq.as_ref()[..keep_len].to_vec();
-                let new_qual = qual.as_ref()[..keep_len].to_vec();
-
-                *record.sequence_mut() = Sequence::from(new_seq);
-                *record.quality_scores_mut() = QualityScores::from(new_qual);
-
-                // Clip extended attributes if auto-clipping is enabled
-                self.clip_extended_attributes(record, bases_to_remove, false);
-            }
-        }
-
-        read_bases_clipped
-    }
-
-    /// Clips bases from the 5' end of the read (strand-aware)
-    ///
-    /// For positive strand reads, clips from the start of alignment.
-    /// For negative strand reads, clips from the end of alignment.
-    ///
-    /// Returns the number of bases actually clipped
-    // RecordBuf kept: reads record.flags().is_reverse_complemented() via noodles typed Flags;
-    // delegates to clip_end/start_of_alignment which are themselves RecordBuf-kept.
-    pub fn clip_5_prime_end_of_alignment(
-        &self,
-        record: &mut RecordBuf,
-        bases_to_clip: usize,
-    ) -> usize {
-        if record.flags().is_reverse_complemented() {
-            self.clip_end_of_alignment(record, bases_to_clip)
-        } else {
-            self.clip_start_of_alignment(record, bases_to_clip)
-        }
-    }
-
-    /// Clips bases from the 3' end of the read (strand-aware)
-    ///
-    /// For positive strand reads, clips from the end of alignment.
-    /// For negative strand reads, clips from the start of alignment.
-    ///
-    /// Returns the number of bases actually clipped
-    // RecordBuf kept: symmetric counterpart to clip_5_prime_end_of_alignment; same reasoning.
-    pub fn clip_3_prime_end_of_alignment(
-        &self,
-        record: &mut RecordBuf,
-        bases_to_clip: usize,
-    ) -> usize {
-        if record.flags().is_reverse_complemented() {
-            self.clip_start_of_alignment(record, bases_to_clip)
-        } else {
-            self.clip_end_of_alignment(record, bases_to_clip)
-        }
-    }
-
-    /// Clips overlapping portions of an FR read pair
-    ///
-    /// **Important:** Only clips reads that are in FR (forward-reverse) orientation.
-    /// Non-FR pairs (FF, RR, RF) are not clipped.
-    ///
-    /// This implementation matches fgbio's midpoint approach: calculates the midpoint
-    /// between the 5' ends of the two reads and clips both reads at that position.
-    ///
-    /// Returns (`bases_clipped_r1`, `bases_clipped_r2`)
-    // RecordBuf kept: reads alignment_start via noodles Position, reference length via typed
-    // CIGAR (cigar_utils::reference_length), and delegates pair-orientation check to
-    // record_utils::is_fr_pair (also RecordBuf-kept).  All clip operations delegate to
-    // clip_end/start_of_alignment.
-    pub fn clip_overlapping_reads(&self, r1: &mut RecordBuf, r2: &mut RecordBuf) -> (usize, usize) {
-        // Check if this is a valid FR pair before clipping
-        if !record_utils::is_fr_pair(r1, r2) {
-            return (0, 0);
-        }
-
-        // Normalize by strand so the positive-strand read is treated as r1 and the
-        // negative-strand read as r2. The body below assumes r1 is the forward read
-        // (5' at its start) and r2 the reverse read (5' at its end); an FR pair whose
-        // first-of-pair read is the reverse strand would otherwise be clipped at the
-        // wrong (outer) ends. Mirrors fgbio `SamRecordClipper.clipOverlappingReads`
-        // (`if (rec.negativeStrand) clipOverlappingReads(rec=mate, mate=rec).swap`).
-        let swapped = r1.flags().is_reverse_complemented();
-        let (r1, r2) = if swapped { (r2, r1) } else { (r1, r2) };
-
-        // Get alignment positions
-        let r1_start = match r1.alignment_start() {
-            Some(pos) => usize::from(pos),
-            None => return (0, 0),
-        };
-        let r2_start = match r2.alignment_start() {
-            Some(pos) => usize::from(pos),
-            None => return (0, 0),
-        };
-
-        // Calculate reference end positions using CIGAR
-        let r1_end = r1_start + cigar_utils::reference_length(&r1.cigar()) - 1; // -1 for inclusive end
-        let r2_end = r2_start + cigar_utils::reference_length(&r2.cigar()) - 1; // -1 for inclusive end
-
-        // Check if they overlap on the reference
-        let overlap_start = r1_start.max(r2_start);
-        let overlap_end = r1_end.min(r2_end);
-
-        if overlap_start > overlap_end {
-            // No overlap
-            return (0, 0);
-        }
-
-        // Calculate midpoint between the 5' ends (r1.start and r2.end)
-        // In FR orientation: r1 is forward (5' at start), r2 is reverse (5' at end)
-        let mut midpoint = usize::midpoint(r1_start, r2_end);
-
-        // Adjust midpoint if it falls outside the overlap region
-        if midpoint > r1_end {
-            // midpoint is past r1's end, trim only the reverse strand read (r2)
-            midpoint = r1_end;
-        } else if midpoint < r2_start {
-            // midpoint is before r2's start, trim only the positive strand read (r1)
-            // Use r2_start - 1 to ensure we clip at least one base
-            midpoint = r2_start.saturating_sub(1);
-        }
-
-        // Calculate how many bases to clip from each read
-        // R1 (forward): clip from 3' end everything after midpoint
-        let r1_bases_to_clip = if r1_end > midpoint {
-            let ref_bases_to_clip = r1_end - midpoint;
-            // Convert reference bases to query bases
-            self.calculate_query_bases_for_ref_region(r1, ref_bases_to_clip, false)
-        } else {
-            0
-        };
-
-        // R2 (reverse): clip from 3' end (which is the 5' end in reference coordinates)
-        // everything before midpoint + 1
-        let r2_bases_to_clip = if midpoint + 1 > r2_start {
-            let ref_bases_to_clip = midpoint + 1 - r2_start;
-            // Convert reference bases to query bases, clipping from start (5' in ref = 3' in read)
-            self.calculate_query_bases_for_ref_region(r2, ref_bases_to_clip, true)
-        } else {
-            0
-        };
-
-        let clipped_r1 =
-            if r1_bases_to_clip > 0 { self.clip_end_of_alignment(r1, r1_bases_to_clip) } else { 0 };
-
-        // For R2 (reverse read), we clip from the beginning of the alignment (5' in reference),
-        // which corresponds to the beginning of the stored sequence, so use clip_5_prime
-        let clipped_r2 = if r2_bases_to_clip > 0 {
-            self.clip_start_of_alignment(r2, r2_bases_to_clip)
-        } else {
-            0
-        };
-
-        // If in Hard mode, upgrade any remaining soft clips to hard clips
-        if matches!(self.mode, ClippingMode::Hard) {
-            let _ = self.upgrade_all_clipping(r1);
-            let _ = self.upgrade_all_clipping(r2);
-        }
-
-        // Map clip counts back to the caller's original (r1, r2) argument order.
-        if swapped { (clipped_r2, clipped_r1) } else { (clipped_r1, clipped_r2) }
-    }
-
-    /// Helper function to calculate query bases corresponding to a reference region
-    ///
-    /// Given a reference length, calculates how many query bases correspond to that region
-    /// starting from either the 5' end (`from_start=true`) or 3' end (`from_start=false`)
-    // RecordBuf kept: reads record.cigar() and iterates ops via noodles typed CigarBuf
-    // (record.cigar().iter().filter_map(Result::ok) -> CigarOp); no raw-byte equivalent
-    // needed — this is only called from clip_overlapping_reads on RecordBuf inputs.
-    #[expect(
-        clippy::unused_self,
-        reason = "kept as a method for consistency with other clipper operations"
-    )]
-    fn calculate_query_bases_for_ref_region(
-        &self,
-        record: &RecordBuf,
-        ref_bases: usize,
-        from_start: bool,
-    ) -> usize {
-        let cigar = record.cigar();
-        let ops: Vec<_> = cigar.iter().filter_map(Result::ok).collect();
-
-        let mut remaining_ref = ref_bases;
-        let mut query_bases = 0;
-
-        // Process CIGAR operations in the appropriate direction
-        let iter: Box<dyn Iterator<Item = &CigarOp>> =
-            if from_start { Box::new(ops.iter()) } else { Box::new(ops.iter().rev()) };
-
-        for op in iter {
-            if remaining_ref == 0 {
-                break;
-            }
-
-            let kind = op.kind();
-            let len = op.len();
-
-            let consumes_ref = matches!(
-                kind,
-                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion
-            );
-            let consumes_query = matches!(
-                kind,
-                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Insertion
-            );
-
-            if consumes_ref {
-                let ref_consumed = len.min(remaining_ref);
-                remaining_ref -= ref_consumed;
-
-                // Add corresponding query bases
-                if consumes_query {
-                    query_bases += ref_consumed;
-                }
-            } else if consumes_query && remaining_ref > 0 {
-                // Insertion - consumes query but not reference
-                // If we haven't finished consuming reference, include these bases
-                query_bases += len;
-            }
-        }
-
-        query_bases
-    }
-
-    /// Upgrades soft clipping to hard clipping for a specified number of bases
-    ///
-    /// This matches fgbio's private `upgradeClipping` method.
-    ///
-    /// # Arguments
-    /// * `record` - The record to modify
-    /// * `length` - The total number of clipped bases requested
-    /// * `from_start` - If true, upgrade from the start; if false, from the end
-    // RecordBuf kept: iterates noodles typed CIGAR ops (record.cigar().iter()), rebuilds ops
-    // as Vec<CigarOp>, assigns back via *record.cigar_mut() = CigarBuf::from(...), and splices
-    // sequence/qualities via record.sequence()/quality_scores() as_ref() slices then assigns
-    // back via noodles Sequence/QualityScores wrappers.  No raw-byte equivalent exists.
-    fn upgrade_clipping(&self, record: &mut RecordBuf, length: usize, from_start: bool) {
-        // Only upgrade if not in Soft mode and length > 0
-        if self.mode == ClippingMode::Soft || length == 0 {
-            return;
-        }
-
-        let old_ops: Vec<CigarOp> = record.cigar().iter().filter_map(Result::ok).collect();
-
-        // Count existing hard and soft clips in the appropriate direction
-        let (hard_clipped, soft_clipped) = if from_start {
-            let hard: usize = old_ops
-                .iter()
-                .take_while(|op| op.kind() == Kind::HardClip)
-                .map(|op| op.len())
-                .sum();
-            let soft: usize = old_ops
-                .iter()
-                .skip_while(|op| op.kind() == Kind::HardClip)
-                .take_while(|op| op.kind() == Kind::SoftClip)
-                .map(|op| op.len())
-                .sum();
-            (hard, soft)
-        } else {
-            let hard: usize = old_ops
-                .iter()
-                .rev()
-                .take_while(|op| op.kind() == Kind::HardClip)
-                .map(|op| op.len())
-                .sum();
-            let soft: usize = old_ops
-                .iter()
-                .rev()
-                .skip_while(|op| op.kind() == Kind::HardClip)
-                .take_while(|op| op.kind() == Kind::SoftClip)
-                .map(|op| op.len())
-                .sum();
-            (hard, soft)
-        };
-
-        // If requested length is already hard-clipped, or there are no soft clips, nothing to do
-        if hard_clipped >= length || soft_clipped == 0 {
-            return;
-        }
-
-        // Calculate how many soft clips to upgrade
-        let length_to_upgrade = soft_clipped.min(length - hard_clipped);
-
-        // Build new CIGAR and update sequence/quals
-        let mut new_ops = Vec::new();
-        let ops_to_process =
-            if from_start { old_ops.clone() } else { old_ops.iter().rev().copied().collect() };
-
-        // Handle Hard mode
-        if self.mode == ClippingMode::Hard {
-            let remaining_to_upgrade = length_to_upgrade;
-
-            // Process leading clips
-            let mut i = 0;
-            let mut existing_hard = 0;
-            let mut existing_soft = 0;
-
-            // Count leading hard clips
-            while i < ops_to_process.len() && ops_to_process[i].kind() == Kind::HardClip {
-                existing_hard += ops_to_process[i].len();
-                i += 1;
-            }
-
-            // Count leading soft clips
-            while i < ops_to_process.len() && ops_to_process[i].kind() == Kind::SoftClip {
-                existing_soft += ops_to_process[i].len();
-                i += 1;
-            }
-
-            // Build new clipping ops
-            let new_hard_count = existing_hard + remaining_to_upgrade;
-            new_ops.push(CigarOp::new(Kind::HardClip, new_hard_count));
-
-            if existing_soft > remaining_to_upgrade {
-                // Some soft clips remain
-                new_ops.push(CigarOp::new(Kind::SoftClip, existing_soft - remaining_to_upgrade));
-            }
-
-            // Add remaining ops
-            new_ops.extend_from_slice(&ops_to_process[i..]);
-
-            // Update CIGAR
-            let final_ops = if from_start { new_ops } else { new_ops.into_iter().rev().collect() };
-            *record.cigar_mut() = CigarBuf::from(final_ops);
-
-            // Update sequence and quals by dropping the upgraded bases
-            let seq = record.sequence().as_ref().to_vec();
-            let quals = record.quality_scores().as_ref().to_vec();
-
-            if from_start {
-                *record.sequence_mut() = Sequence::from(seq[length_to_upgrade..].to_vec());
-                *record.quality_scores_mut() =
-                    QualityScores::from(quals[length_to_upgrade..].to_vec());
-            } else {
-                let new_len = seq.len() - length_to_upgrade;
-                *record.sequence_mut() = Sequence::from(seq[..new_len].to_vec());
-                *record.quality_scores_mut() = QualityScores::from(quals[..new_len].to_vec());
-            }
-        } else if self.mode == ClippingMode::SoftWithMask {
-            // SoftWithMask: leave the soft clipping in the CIGAR but mask the upgraded
-            // soft-clipped bases to N with minimum quality. Mirrors fgbio's
-            // hardMaskStartOfRead call in upgradeClipping (SamRecordClipper.scala:528-529).
-            // Bases are not removed, so the CIGAR and extended attributes are untouched
-            // (fgbio's clipExtendedAttributes is a no-op outside Hard mode).
-            let mut new_seq = record.sequence().as_ref().to_vec();
-            let mut new_qual = record.quality_scores().as_ref().to_vec();
-            let seq_len = new_seq.len();
-            let (mask_start, mask_end) = if from_start {
-                (0, length_to_upgrade)
-            } else {
-                (seq_len - length_to_upgrade, seq_len)
-            };
-            for i in mask_start..mask_end {
-                new_seq[i] = NO_CALL_BASE;
-                new_qual[i] = MIN_PHRED;
-            }
-            *record.sequence_mut() = Sequence::from(new_seq);
-            *record.quality_scores_mut() = QualityScores::from(new_qual);
-        }
-    }
-
-    /// Ensures at least `clip_length` bases are clipped at the start of the read
-    ///
-    /// This includes any existing hard and soft clipping. If more clipping is needed,
-    /// delegates to `clip_start_of_alignment`.
-    ///
-    /// Returns the number of additional bases clipped (not including existing clips)
-    // RecordBuf kept: counts existing clips by iterating record.cigar() via noodles typed
-    // CigarBuf; delegates to clip_start_of_alignment / upgrade_clipping (both RecordBuf-kept).
-    pub fn clip_start_of_read(&self, record: &mut RecordBuf, clip_length: usize) -> usize {
-        // Count existing clipping at the start
-        let existing_clipping: usize = record
-            .cigar()
-            .iter()
-            .filter_map(Result::ok)
-            .take_while(|op| matches!(op.kind(), Kind::HardClip | Kind::SoftClip))
-            .map(CigarOp::len)
-            .sum();
-
-        if clip_length > existing_clipping {
-            self.clip_start_of_alignment(record, clip_length - existing_clipping)
-        } else {
-            self.upgrade_clipping(record, clip_length, true);
-            0
-        }
-    }
-
-    /// Ensures at least `clip_length` bases are clipped at the end of the read
-    ///
-    /// This includes any existing hard and soft clipping. If more clipping is needed,
-    /// delegates to `clip_end_of_alignment`.
-    ///
-    /// Returns the number of additional bases clipped (not including existing clips)
-    // RecordBuf kept: symmetric counterpart to clip_start_of_read; same reasoning.
-    pub fn clip_end_of_read(&self, record: &mut RecordBuf, clip_length: usize) -> usize {
-        // Count existing clipping at the end
-        let ops: Vec<_> = record.cigar().iter().filter_map(Result::ok).collect();
-        let existing_clipping: usize = ops
-            .iter()
-            .rev()
-            .take_while(|op| matches!(op.kind(), Kind::HardClip | Kind::SoftClip))
-            .map(|op| op.len())
-            .sum();
-
-        if clip_length > existing_clipping {
-            self.clip_end_of_alignment(record, clip_length - existing_clipping)
-        } else {
-            self.upgrade_clipping(record, clip_length, false);
-            0
-        }
-    }
-
-    /// Ensures at least `clip_length` bases are clipped at the 5' end (strand-aware)
-    ///
-    /// For positive strand: clips from start. For negative strand: clips from end.
-    ///
-    /// Returns the number of additional bases clipped
-    // RecordBuf kept: reads record.flags().is_reverse_complemented() via noodles typed Flags;
-    // delegates to clip_end/start_of_read (both RecordBuf-kept).
-    pub fn clip_5_prime_end_of_read(&self, record: &mut RecordBuf, clip_length: usize) -> usize {
-        if record.flags().is_reverse_complemented() {
-            self.clip_end_of_read(record, clip_length)
-        } else {
-            self.clip_start_of_read(record, clip_length)
-        }
-    }
-
-    /// Ensures at least `clip_length` bases are clipped at the 3' end (strand-aware)
-    ///
-    /// For positive strand: clips from end. For negative strand: clips from start.
-    ///
-    /// Returns the number of additional bases clipped
-    // RecordBuf kept: symmetric counterpart to clip_5_prime_end_of_read; same reasoning.
-    pub fn clip_3_prime_end_of_read(&self, record: &mut RecordBuf, clip_length: usize) -> usize {
-        if record.flags().is_reverse_complemented() {
-            self.clip_start_of_read(record, clip_length)
-        } else {
-            self.clip_end_of_read(record, clip_length)
-        }
-    }
-
-    /// Upgrades all existing clipping in a read to the current clipping mode
-    ///
-    /// In `Hard` mode existing soft clips are converted to hard clips (and the
-    /// corresponding bases removed from the sequence); in `SoftWithMask` mode the
-    /// CIGAR is left intact and the soft-clipped bases are masked to N with minimum
-    /// quality. `Soft` mode is a no-op.
-    ///
-    /// Returns `(leading, trailing)` - the number of soft-clipped bases upgraded at
-    /// the CIGAR-leading and CIGAR-trailing ends respectively (converted in `Hard`
-    /// mode, masked in `SoftWithMask` mode). The ordering is by CIGAR position, not
-    /// biological 5'/3' end, so it is independent of strand (on a reverse-strand read
-    /// the CIGAR-leading end is the biological 3' end). Returns `(0, 0)` if nothing
-    /// was upgraded.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an adjacent hard-clip CIGAR op disappears between the `last()` check
-    /// and the subsequent access (should not happen in practice), or if a BAM tag
-    /// is not exactly 2 bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Result` for API compatibility, but the current implementation is
-    /// infallible and always returns `Ok`.
-    // RecordBuf kept: walks CIGAR via record.cigar().iter() -> Result<CigarOp>, rebuilds ops
-    // as CigarBuf, splices sequence/qualities via Sequence/QualityScores, and applies
-    // per-base attribute clipping via record.data().iter() / record.data_mut().insert()
-    // (noodles typed tag API).  The combination of CIGAR rewriting + seq/qual slicing +
-    // tag surgery makes this inherently noodles-typed; no raw-byte equivalent exists.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "CIGAR rewriting with attribute clipping requires many branches"
-    )]
-    pub fn upgrade_all_clipping(&self, record: &mut RecordBuf) -> Result<(usize, usize)> {
-        // Only upgrade in Hard or SoftWithMask mode (Soft leaves clipping untouched).
-        if matches!(self.mode, ClippingMode::Soft) {
-            return Ok((0, 0));
-        }
-
-        // Don't upgrade unmapped reads
-        if record.flags().is_unmapped() {
-            return Ok((0, 0));
-        }
-        let cigar = record.cigar();
-        let ops: Vec<CigarOp> = cigar.iter().filter_map(Result::ok).collect();
-
-        // Check if there are any soft clips to convert
-        let has_soft_clips = ops.iter().any(|op| op.kind() == Kind::SoftClip);
-        if !has_soft_clips {
-            return Ok((0, 0));
-        }
-
-        // Count leading and trailing soft clips (and existing hard clips)
-        let mut leading_hard = 0;
-        let mut leading_soft = 0;
-        let mut trailing_soft = 0;
-
-        // Count leading clips
-        for op in &ops {
-            match op.kind() {
-                Kind::HardClip => leading_hard += op.len(),
-                Kind::SoftClip => {
-                    leading_soft += op.len();
-                    break;
-                }
-                _ => break,
-            }
-        }
-
-        // Count trailing soft clips (from the end)
-        let mut trailing_hard = 0;
-        for op in ops.iter().rev() {
-            match op.kind() {
-                Kind::HardClip => trailing_hard += op.len(),
-                Kind::SoftClip => {
-                    trailing_soft += op.len();
-                    break;
-                }
-                _ => break,
-            }
-        }
-
-        // SoftWithMask: mask the existing soft-clipped bases at both ends to N/min-quality,
-        // leaving the CIGAR intact. Delegates to upgrade_clipping per end, mirroring fgbio
-        // upgradeAllClipping's clipStartOfRead/clipEndOfRead -> upgradeClipping path
-        // (SamRecordClipper.scala:274-290). Returns the soft counts that were masked.
-        if self.mode == ClippingMode::SoftWithMask {
-            if leading_soft > 0 {
-                self.upgrade_clipping(record, leading_hard + leading_soft, true);
-            }
-            if trailing_soft > 0 {
-                self.upgrade_clipping(record, trailing_hard + trailing_soft, false);
-            }
-            return Ok((leading_soft, trailing_soft));
-        }
-
-        // Build new CIGAR, converting soft clips to hard clips
-        let mut new_cigar_ops = Vec::new();
-        let sequence = record.sequence();
-        let qualities = record.quality_scores();
-        let old_seq_len = sequence.len(); // Capture this before any mutations
-        let mut seq_pos = 0;
-        let mut new_sequence = Vec::new();
-        let mut new_qualities = Vec::new();
-        let mut is_leading = true;
-
-        for op in &ops {
-            let kind = op.kind();
-            let len = op.len();
-
-            match kind {
-                Kind::SoftClip => {
-                    // Convert to hard clip
-                    // Merge with existing hard clips at this position
-                    if is_leading && new_cigar_ops.is_empty() && leading_hard > 0 {
-                        // Merge with preceding hard clip
-                        new_cigar_ops.push(CigarOp::new(Kind::HardClip, leading_hard + len));
-                    } else if new_cigar_ops.last().map(|o| o.kind()) == Some(Kind::HardClip) {
-                        // Merge with adjacent hard clip
-                        // SAFETY: We just checked that last() is Some(HardClip)
-                        let last_len = new_cigar_ops.last().expect("last() checked above").len();
-                        new_cigar_ops.pop();
-                        new_cigar_ops.push(CigarOp::new(Kind::HardClip, last_len + len));
-                    } else {
-                        new_cigar_ops.push(CigarOp::new(Kind::HardClip, len));
-                    }
-                    seq_pos += len;
-                }
-                Kind::HardClip => {
-                    // Merge with preceding hard clip if present
-                    if new_cigar_ops.last().map(|o| o.kind()) == Some(Kind::HardClip) {
-                        // SAFETY: We just checked that last() is Some(HardClip)
-                        let last_len = new_cigar_ops.last().expect("last() checked above").len();
-                        new_cigar_ops.pop();
-                        new_cigar_ops.push(CigarOp::new(Kind::HardClip, last_len + len));
-                    } else if !is_leading || new_cigar_ops.is_empty() {
-                        // Keep hard clips but don't add duplicates if we already merged leading
-                        new_cigar_ops.push(*op);
-                    }
-                }
-                _ => {
-                    is_leading = false;
-                    new_cigar_ops.push(*op);
-                    // Copy bases/quals for query-consuming operations
-                    let consumes_query = matches!(
-                        kind,
-                        Kind::Match
-                            | Kind::SequenceMatch
-                            | Kind::SequenceMismatch
-                            | Kind::Insertion
-                    );
-                    if consumes_query {
-                        for _ in 0..len {
-                            if seq_pos < sequence.len() {
-                                new_sequence.push(sequence.as_ref()[seq_pos]);
-                                new_qualities.push(qualities.as_ref()[seq_pos]);
-                            }
-                            seq_pos += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Update the record
-        *record.cigar_mut() = CigarBuf::from(new_cigar_ops);
-
-        // Clip extended attributes if auto-clipping is enabled (do this BEFORE updating sequence)
-        if self.auto_clip_attributes && (leading_soft > 0 || trailing_soft > 0) {
-            // Manually clip attributes that match the original sequence length
-            use noodles::sam::alignment::record::data::field::Tag;
-            use noodles::sam::alignment::record_buf::data::field::value::Array;
-            let mut tags_to_update: Vec<(Vec<u8>, Value)> = Vec::new();
-
-            for (tag, value) in record.data().iter() {
-                let should_clip = match value {
-                    Value::String(s) => {
-                        let bytes: &[u8] = s.as_ref();
-                        bytes.len() == old_seq_len
-                    }
-                    Value::Array(arr) => array_len!(arr) == old_seq_len,
-                    _ => false,
-                };
-
-                if should_clip {
-                    // Clip from both ends: remove leading_soft from start, trailing_soft from end
-                    let start = leading_soft;
-                    let end = old_seq_len - trailing_soft;
-                    let new_value = match value {
-                        Value::String(s) => {
-                            // Preserve the clipped bytes verbatim; `from_utf8_lossy`
-                            // would replace any non-UTF-8 byte with U+FFFD. noodles'
-                            // `Value::String` is a byte string, so slice it directly.
-                            let bytes: &[u8] = s.as_ref();
-                            Value::String(bytes[start..end].to_vec().into())
-                        }
-                        Value::Array(arr) => slice_array!(arr, start, end),
-                        _ => value.clone(),
-                    };
-                    tags_to_update.push((tag.as_ref().to_vec(), new_value));
-                }
-            }
-
-            // Apply updates
-            for (tag_bytes, value) in tags_to_update {
-                // SAFETY: Tags are always 2 bytes, as tag_bytes came from tag.as_ref().to_vec() where tag is a 2-byte tag
-                let tag = Tag::from(
-                    <[u8; 2]>::try_from(tag_bytes.as_slice())
-                        .expect("tag bytes are always 2 bytes"),
-                );
-                record.data_mut().insert(tag, value);
-            }
-        }
-
-        *record.sequence_mut() = Sequence::from(new_sequence);
-        *record.quality_scores_mut() = QualityScores::from(new_qualities);
-
-        Ok((leading_soft, trailing_soft))
-    }
-
-    /// Returns the number of bases that are currently clipped in the read
-    // RecordBuf kept: accesses record.cigar() (noodles CigarBuf) and delegates to
-    // cigar_utils::clipped_bases which accepts &impl CigarTrait.
-    #[must_use]
-    pub fn clipped_bases(record: &RecordBuf) -> usize {
-        cigar_utils::clipped_bases(&record.cigar())
-    }
-}
-
 /// A raw-byte clipper that operates directly on [`fgumi_raw_bam::RawRecord`].
 ///
-/// This is the raw-byte sibling of [`SamRecordClipper`]. It mirrors the same public
-/// API — same methods, same semantics, same `ClippingMode` — but operates on `RawRecord`
-/// bytes instead of noodles `RecordBuf` objects.
+/// This is the clipper every production caller uses. It operates on `RawRecord` bytes
+/// instead of noodles `RecordBuf` objects, following the same fgbio-derived semantics (same
+/// methods, same `ClippingMode`) as the former `RecordBuf`-based `SamRecordClipper` it replaced.
 ///
 /// All positions in the raw-byte world are 0-based (BAM spec). The algorithms convert
 /// to/from 1-based where required for CIGAR reference-position arithmetic.
@@ -1371,7 +132,7 @@ impl RawRecordClipper {
     /// Number of bases available to be clipped from the alignment.
     ///
     /// The sum of the alignment (`M`/`=`/`X`) and insertion (`I`) CIGAR op lengths.
-    /// Raw-byte equivalent of [`SamRecordClipper::number_of_clippable_bases`].
+    /// Raw-byte equivalent of the former `SamRecordClipper::number_of_clippable_bases`.
     fn number_of_clippable_bases_raw(ops: &[u32]) -> usize {
         ops.iter()
             .filter(|&&op| matches!(op & 0xF, 0 | 1 | 7 | 8)) // M, I, =, X
@@ -1381,11 +142,12 @@ impl RawRecordClipper {
 
     /// Unmaps a read the way htsjdk `SAMUtils.makeReadUnmapped` does.
     ///
-    /// Raw-byte equivalent of [`SamRecordClipper::make_read_unmapped`]: clears the
+    /// Raw-byte equivalent of the former `SamRecordClipper::make_read_unmapped`: clears the
     /// reference, position, mapping quality, CIGAR, and template length, clears the
     /// duplicate/secondary/supplementary/proper-pair flags, and sets the unmapped flag.
     /// Reverse-strand reads have their bases reverse-complemented, qualities reversed, and
-    /// strand-sensitive aux tags reoriented (see [`reorient_strand_tags`]) before the
+    /// strand-sensitive aux tags reoriented (the base-oriented [`TAGS_TO_REVERSE_COMPLEMENT`]
+    /// reverse-complemented, the quality-oriented [`TAGS_TO_REVERSE`] reversed) before the
     /// reverse flag is cleared. Bases and qualities are otherwise preserved.
     fn make_read_unmapped_raw(record: &mut fgumi_raw_bam::RawRecord) {
         use fgumi_raw_bam::flags as rflags;
@@ -1397,7 +159,9 @@ impl RawRecordClipper {
             quals.reverse();
             record.set_sequence_and_qualities(&rc, &quals);
             // Reorient the strand-sensitive aux tags alongside SEQ/QUAL, matching htsjdk
-            // `SAMRecord.reverseComplement` (see `reorient_strand_tags` for the Z-only note).
+            // `SAMRecord.reverseComplement`. Only the `Z`-string encoding is handled -- the sole
+            // form these tags take in practice; htsjdk also reverses array-encoded (`B:...`)
+            // values, but none of these tags is emitted as an array by real tooling.
             let mut tags = record.tags_mut();
             for tag in TAGS_TO_REVERSE_COMPLEMENT {
                 tags.reverse_complement_string(tag);
@@ -1913,8 +677,8 @@ impl RawRecordClipper {
     /// Delegates the past-mate distance to
     /// [`fgumi_raw_bam::num_bases_extending_past_mate_vs_mate_raw`], the query-space, mate-in-hand
     /// count fgbio#1172 lands (fixing issue #760). This raw-byte path backs the LIVE `fgumi clip`
-    /// command; the reference-space `RecordBuf` past-mate methods on [`SamRecordClipper`], which
-    /// `fgumi clip` never constructed, were removed as redundant in the same change. That function
+    /// command; the reference-space `RecordBuf` past-mate methods on the former
+    /// `SamRecordClipper`, which `fgumi clip` never constructed, were removed as redundant. That function
     /// gates on the symmetric [`fgumi_raw_bam::is_primary_fr_pair_raw`] internally, so no separate
     /// FR-pair check is needed here.
     pub fn clip_extending_past_mate_ends(
@@ -2474,29 +1238,164 @@ pub mod cigar_utils {
     }
 }
 
+/// Test-only adapter that drives [`RawRecordClipper`] through the `RecordBuf` API by
+/// round-tripping each record to raw BAM bytes and back.
+///
+/// The behavioral clipper tests were originally written against the `RecordBuf`-based
+/// `SamRecordClipper`, which has been removed (superseded by the raw-byte [`RawRecordClipper`]
+/// that every production caller uses). Rather than rewrite each test's assertions into the raw
+/// API, this adapter re-encodes the input `RecordBuf` to a `RawRecord`, runs the real
+/// [`RawRecordClipper`] method on it, and decodes the result back to a `RecordBuf`, so the
+/// tests' setup and assertions run verbatim while exercising the raw clipper's actual logic.
+/// The buf→raw→buf round-trip is lossless for the fields the adapter-driven tests assert on
+/// (CIGAR, POS, sequence, quality, flags, and *UTF-8* tag values), so a mismatch reflects a real
+/// `RawRecordClipper` discrepancy, not a round-trip artifact. Tag values round-trip only when
+/// UTF-8: a non-UTF-8 `Z` tag cannot be represented in a noodles `RecordBuf`, so a test needing
+/// non-UTF-8 tag bytes must build the `RawRecord` directly and assert on the raw bytes (as
+/// `test_auto_clip_attributes_string_non_utf8_preserves_bytes` and
+/// `test_upgrade_all_clipping_string_non_utf8_preserves_bytes` do) rather than drive this adapter.
+#[cfg(test)]
+mod clip_test_adapter {
+    use super::{ClippingMode, RawRecordClipper};
+    use fgumi_raw_bam::{RawRecord, encode_record_buf_to_raw, raw_record_to_record_buf};
+    use noodles::sam::alignment::RecordBuf;
+
+    /// Build a SAM header with a single 100 000-base reference, matching the clipper tests'
+    /// coordinate space.
+    pub(super) fn test_header() -> noodles::sam::Header {
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use std::num::NonZeroUsize;
+        let ref_seq = Map::<ReferenceSequence>::new(
+            NonZeroUsize::new(100_000).expect("ref length must be nonzero"),
+        );
+        noodles::sam::Header::builder().add_reference_sequence(b"chr1", ref_seq).build()
+    }
+
+    /// Encode a `RecordBuf` to a `RawRecord` through the shared test header.
+    pub(super) fn to_raw(record: &RecordBuf) -> RawRecord {
+        encode_record_buf_to_raw(record, &test_header())
+            .expect("encode_record_buf_to_raw should succeed")
+    }
+
+    /// Decode a `RawRecord` back to a `RecordBuf` through the shared test header.
+    pub(super) fn to_buf(raw: &RawRecord) -> RecordBuf {
+        raw_record_to_record_buf(raw, &test_header())
+            .expect("raw_record_to_record_buf should succeed")
+    }
+
+    /// `RecordBuf`-API façade over [`RawRecordClipper`]. `mode` / `auto_clip_attributes` are
+    /// mirrored as fields so the construction-sanity tests can read them like the old struct.
+    pub(super) struct RawClipperOnBuf {
+        inner: RawRecordClipper,
+        pub(super) mode: ClippingMode,
+        pub(super) auto_clip_attributes: bool,
+    }
+
+    impl RawClipperOnBuf {
+        pub(super) fn new(mode: ClippingMode) -> Self {
+            Self { inner: RawRecordClipper::new(mode), mode, auto_clip_attributes: false }
+        }
+
+        pub(super) fn with_auto_clip(mode: ClippingMode, auto_clip_attributes: bool) -> Self {
+            Self {
+                inner: RawRecordClipper::with_auto_clip(mode, auto_clip_attributes),
+                mode,
+                auto_clip_attributes,
+            }
+        }
+
+        /// Round-trip a single record through the raw clipper: `RecordBuf` → raw → clip → back.
+        fn on_one(
+            &self,
+            record: &mut RecordBuf,
+            run: impl FnOnce(&RawRecordClipper, &mut RawRecord) -> usize,
+        ) -> usize {
+            let mut raw = to_raw(record);
+            let ret = run(&self.inner, &mut raw);
+            *record = to_buf(&raw);
+            ret
+        }
+
+        pub(super) fn clip_start_of_alignment(&self, r: &mut RecordBuf, n: usize) -> usize {
+            self.on_one(r, |c, raw| c.clip_start_of_alignment(raw, n))
+        }
+
+        pub(super) fn clip_end_of_alignment(&self, r: &mut RecordBuf, n: usize) -> usize {
+            self.on_one(r, |c, raw| c.clip_end_of_alignment(raw, n))
+        }
+
+        pub(super) fn clip_5_prime_end_of_alignment(&self, r: &mut RecordBuf, n: usize) -> usize {
+            self.on_one(r, |c, raw| c.clip_5_prime_end_of_alignment(raw, n))
+        }
+
+        pub(super) fn clip_3_prime_end_of_alignment(&self, r: &mut RecordBuf, n: usize) -> usize {
+            self.on_one(r, |c, raw| c.clip_3_prime_end_of_alignment(raw, n))
+        }
+
+        pub(super) fn clip_start_of_read(&self, r: &mut RecordBuf, n: usize) -> usize {
+            self.on_one(r, |c, raw| c.clip_start_of_read_raw(raw, n))
+        }
+
+        pub(super) fn clip_end_of_read(&self, r: &mut RecordBuf, n: usize) -> usize {
+            self.on_one(r, |c, raw| c.clip_end_of_read_raw(raw, n))
+        }
+
+        pub(super) fn clip_overlapping_reads(
+            &self,
+            r1: &mut RecordBuf,
+            r2: &mut RecordBuf,
+        ) -> (usize, usize) {
+            let mut raw1 = to_raw(r1);
+            let mut raw2 = to_raw(r2);
+            let ret = self.inner.clip_overlapping_reads(&mut raw1, &mut raw2);
+            *r1 = to_buf(&raw1);
+            *r2 = to_buf(&raw2);
+            ret
+        }
+
+        pub(super) fn upgrade_all_clipping(
+            &self,
+            r: &mut RecordBuf,
+        ) -> anyhow::Result<(usize, usize)> {
+            let mut raw = to_raw(r);
+            let ret = self.inner.upgrade_all_clipping_raw(&mut raw)?;
+            *r = to_buf(&raw);
+            Ok(ret)
+        }
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::similar_names, reason = "test code uses clipper/clipped naming pattern")]
 mod tests {
+    use super::clip_test_adapter::{RawClipperOnBuf, to_raw};
     use super::*;
     use crate::builder::RecordBuilder;
+    use crate::record_utils;
+    use fgumi_dna::{MIN_PHRED, NO_CALL_BASE};
+    use noodles::sam::alignment::record::cigar::Cigar;
+    use noodles::sam::alignment::record::cigar::Op as CigarOp;
+    use noodles::sam::alignment::record_buf::Cigar as CigarBuf;
+    use noodles::sam::alignment::record_buf::data::field::Value;
     use proptest::prelude::*;
     use rstest::rstest;
 
     #[test]
     fn test_clipping_mode() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         assert_eq!(clipper.mode, ClippingMode::Soft);
 
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
         assert_eq!(clipper.mode, ClippingMode::Hard);
     }
 
     #[test]
     fn test_auto_clip() {
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Soft, true);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Soft, true);
         assert!(clipper.auto_clip_attributes);
 
-        let clipper_disabled = SamRecordClipper::with_auto_clip(ClippingMode::Hard, false);
+        let clipper_disabled = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, false);
         assert!(!clipper_disabled.auto_clip_attributes);
     }
 
@@ -2577,9 +1476,38 @@ mod tests {
     }
 
     /// Helper to create a simple test record with given CIGAR, sequence, and position
+    /// Query-consuming (SEQ) length of a CIGAR string: the sum of `M`/`I`/`S`/`=`/`X` run
+    /// lengths. Used to pad placeholder sequences to a length the raw BAM encoder accepts.
+    fn cigar_query_len(cigar_str: &str) -> usize {
+        let mut total = 0usize;
+        let mut num = 0usize;
+        for ch in cigar_str.chars() {
+            if let Some(d) = ch.to_digit(10) {
+                num = num * 10 + d as usize;
+            } else {
+                if matches!(ch, 'M' | 'I' | 'S' | '=' | 'X') {
+                    total += num;
+                }
+                num = 0;
+            }
+        }
+        total
+    }
+
     fn create_test_record(cigar_str: &str, seq: &str, start_pos: usize) -> RecordBuf {
+        // The raw BAM path (and the spec) require SEQ length to equal the CIGAR's query length.
+        // Many clipper tests pass a placeholder sequence (too short or too long) and only assert
+        // on the resulting CIGAR/POS, so normalize the sequence to exactly the query length --
+        // keeping any provided prefix and padding the rest with `A` -- to make the record a valid
+        // BAM record without changing the behavior under test. A content-asserting test already
+        // supplies a query-length sequence, so it is left untouched.
+        let query_len = cigar_query_len(cigar_str);
+        let mut seq: String = seq.chars().take(query_len).collect();
+        if seq.len() < query_len {
+            seq.push_str(&"A".repeat(query_len - seq.len()));
+        }
         RecordBuilder::mapped_read()
-            .sequence(seq)
+            .sequence(&seq)
             .cigar(cigar_str)
             .alignment_start(start_pos)
             .build()
@@ -2591,7 +1519,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_soft_matched_bases() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("50M", "ACGTACGTACGT", 10);
 
         let clipped = clipper.clip_start_of_alignment(&mut record, 10);
@@ -2604,7 +1532,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_soft_with_insertion() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("4M2I44M", "ACGTACGTACGT", 10);
 
         let clipped = clipper.clip_start_of_alignment(&mut record, 10);
@@ -2617,7 +1545,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_soft_with_deletion() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("6M2D44M", "ACGTACGTACGT", 10);
 
         let clipped = clipper.clip_start_of_alignment(&mut record, 10);
@@ -2630,7 +1558,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_soft_additional_bases() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("10S40M", "ACGTACGTACGT", 10);
 
         let clipped = clipper.clip_start_of_alignment(&mut record, 10);
@@ -2643,7 +1571,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_preserve_hard_clip() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("10H40M", "ACGTACGTACGT", 10);
 
         let clipped = clipper.clip_start_of_alignment(&mut record, 10);
@@ -2656,7 +1584,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_complex_cigar() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         // 2H4S16M10I5M5I10M
         let mut record = create_test_record("2H4S16M10I5M5I10M", "ACGTACGTACGT", 10);
 
@@ -2670,7 +1598,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_consumes_trailing_insertion() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("8M4I38M", "ACGTACGTACGT", 10);
 
         // Ask to clip 10 bases, but should consume 12 bases (8M + 4I) because
@@ -2685,7 +1613,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_preserve_insertion_after_clip() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("10M4I36M", "ACGTACGTACGT", 10);
 
         let clipped = clipper.clip_start_of_alignment(&mut record, 10);
@@ -2698,7 +1626,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_remove_deletion_after_clip() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("10M4D40M", "ACGTACGTACGT", 10);
 
         let clipped = clipper.clip_start_of_alignment(&mut record, 10);
@@ -2711,7 +1639,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_preserve_distant_deletion() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("25M4D25M", "ACGTACGTACGT", 10);
 
         let clipped = clipper.clip_start_of_alignment(&mut record, 10);
@@ -2724,7 +1652,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_soft_with_mask() {
-        let clipper = SamRecordClipper::new(ClippingMode::SoftWithMask);
+        let clipper = RawClipperOnBuf::new(ClippingMode::SoftWithMask);
         let seq = "ACGTACGTAC"; // 10 bases
         let mut record = create_test_record("10M", seq, 10);
 
@@ -2749,7 +1677,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_soft_with_mask_existing_soft_clip() {
-        let clipper = SamRecordClipper::new(ClippingMode::SoftWithMask);
+        let clipper = RawClipperOnBuf::new(ClippingMode::SoftWithMask);
         let seq = "ACGTACGTACGTACGTACGT"; // 20 bases
         let mut record = create_test_record("10S10M", seq, 10);
 
@@ -2771,7 +1699,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_unmapped_read_does_nothing() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("50M", "ACGTACGTACGTACGTACGT", 1000);
 
         // Set unmapped flag
@@ -2790,7 +1718,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_soft() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("100M", "ACGTACGTACGT", 1000);
 
         let clipped = clipper.clip_start_of_alignment(&mut record, 5);
@@ -2809,7 +1737,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_soft() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("100M", "ACGTACGTACGT", 1000);
 
         let clipped = clipper.clip_end_of_alignment(&mut record, 5);
@@ -2829,7 +1757,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_soft_matched_bases() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         // 50 bases to match 50M CIGAR
         let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC";
         assert_eq!(seq.len(), 50, "Sequence length should be 50");
@@ -2845,7 +1773,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_hard_existing_soft_clip() {
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
         let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC"; // 50 bases
         assert_eq!(seq.len(), 50, "Sequence length should be 50");
         let mut record = create_test_record("40M10S", seq, 10);
@@ -2867,7 +1795,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_hard() {
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
         let mut record = create_test_record("12M", "ACGTACGTACGT", 1000);
 
         let original_len = record.sequence().len();
@@ -2890,7 +1818,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_no_overlap() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
 
         // R1: 1000-1100, R2: 1200-1300 (no overlap)
         let mut r1 = create_test_record("100M", "ACGTACGTACGT", 1000);
@@ -2905,7 +1833,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_with_overlap() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
 
         // R1: 1000-1099 (forward), R2: 1050-1149 (reverse) - 50bp overlap
         // Create proper FR pair
@@ -2960,7 +1888,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_with_existing_soft_clip() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("5S95M", "ACGTACGTACGT", 1000);
 
         // Clip additional 3 bases from 5' end
@@ -2979,7 +1907,7 @@ mod tests {
 
     #[test]
     fn test_clip_entire_read() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "ACGTACGTACGT";
         let mut record = create_test_record("12M", seq, 1000);
 
@@ -2992,7 +1920,7 @@ mod tests {
 
     #[test]
     fn test_clip_zero_bases() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("100M", "ACGTACGTACGT", 1000);
 
         let clipped = clipper.clip_start_of_alignment(&mut record, 0);
@@ -3167,7 +2095,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_non_fr_pair() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
 
         // Create FF pair (both forward) with overlap
         // R1: 1000-1100, R2: 1050-1150 (50bp overlap)
@@ -3218,7 +2146,7 @@ mod tests {
     fn test_auto_clip_attributes_string_5_prime() {
         use noodles::sam::alignment::record::data::field::Tag;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Hard, true);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
         let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
 
         // Add a string attribute that matches the read length
@@ -3243,7 +2171,7 @@ mod tests {
     fn test_auto_clip_attributes_string_3_prime() {
         use noodles::sam::alignment::record::data::field::Tag;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Hard, true);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
         let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
 
         // Add a string attribute that matches the read length
@@ -3269,28 +2197,32 @@ mod tests {
     /// for the `from_utf8(..).unwrap_or("")` / `from_utf8_lossy` handling.
     #[test]
     fn test_auto_clip_attributes_string_non_utf8_preserves_bytes() {
-        use noodles::sam::alignment::record::data::field::Tag;
-
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Hard, true);
-        let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
-
-        // A 10-byte tag value that is NOT valid UTF-8 (0xFF/0xFE never appear in
-        // well-formed UTF-8), matching the 10-base read length so it is clipped.
-        let tag = Tag::from([b'X', b'S']);
+        // A non-UTF-8 `Z` tag cannot be represented in a noodles `RecordBuf`, so this exercises
+        // the raw clipper directly: encode a clean 10M read, append the non-UTF-8 XX:Z tag to the
+        // raw bytes, then hard-clip.
+        let buf = create_test_record("10M", "ACGTACGTAC", 1000);
+        let mut rec = to_raw(&buf).as_ref().to_vec();
+        // A 10-byte tag value that is NOT valid UTF-8 (0xFF/0xFE never appear in well-formed
+        // UTF-8), matching the 10-base read length so it is clipped.
         let raw: Vec<u8> = vec![b'0', b'1', 0xFF, 0xFE, b'4', b'5', b'6', b'7', b'8', b'9'];
-        record.data_mut().insert(tag, Value::String(raw.clone().into()));
-
-        // Clip 3 bases from the 5' end.
-        assert_eq!(clipper.clip_start_of_alignment(&mut record, 3), 3);
-
-        // The tag must hold exactly bytes 3..10 of the original — not "" and not
-        // a U+FFFD-mangled string.
-        if let Some(Value::String(s)) = record.data().get(&tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, &raw[3..], "non-UTF-8 tag bytes must be preserved");
-        } else {
-            panic!("Tag XS not found or wrong type");
+        {
+            let mut ed = fgumi_raw_bam::RawTagsEditor::from_vec(&mut rec);
+            ed.append_string(b"XX", &raw);
         }
+        let mut record = fgumi_raw_bam::RawRecord::from(rec);
+
+        // Clip 3 bases from the 5' end (== start of the alignment for a forward read).
+        assert_eq!(
+            RawRecordClipper::with_auto_clip(ClippingMode::Hard, true)
+                .clip_start_of_alignment(&mut record, 3),
+            3
+        );
+
+        // The tag must hold exactly bytes 3..10 of the original — not "" and not a
+        // U+FFFD-mangled string.
+        let bytes = fgumi_raw_bam::find_string_tag_in_record(record.as_ref(), b"XX")
+            .expect("XX tag present");
+        assert_eq!(bytes, &raw[3..], "non-UTF-8 tag bytes must be preserved");
     }
 
     #[test]
@@ -3298,7 +2230,7 @@ mod tests {
         use noodles::sam::alignment::record::data::field::Tag;
         use noodles::sam::alignment::record_buf::data::field::value::Array;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Hard, true);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
         let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
 
         // Add a UInt8Array attribute that matches the read length
@@ -3325,7 +2257,7 @@ mod tests {
         use noodles::sam::alignment::record::data::field::Tag;
         use noodles::sam::alignment::record_buf::data::field::value::Array;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Hard, true);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
         let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
 
         // Add a UInt8Array attribute that matches the read length
@@ -3352,7 +2284,7 @@ mod tests {
         use noodles::sam::alignment::record::data::field::Tag;
 
         // Test with Soft mode - attributes should NOT be clipped
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Soft, true);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Soft, true);
         let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
 
         let tag = Tag::from([b'X', b'S']);
@@ -3373,7 +2305,7 @@ mod tests {
         use noodles::sam::alignment::record::data::field::Tag;
 
         // Test with auto_clip_attributes disabled - attributes should NOT be clipped
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Hard, false);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, false);
         let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
 
         let tag = Tag::from([b'X', b'S']);
@@ -3393,7 +2325,7 @@ mod tests {
     fn test_auto_clip_attributes_only_matching_length() {
         use noodles::sam::alignment::record::data::field::Tag;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Hard, true);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
         let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
 
         // Add two attributes: one matching length, one not
@@ -3426,7 +2358,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_soft_with_insertion() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         // 44M + 2I + 4M = 50 bases
         let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC"; // 50 bases
         assert_eq!(seq.len(), 50);
@@ -3442,7 +2374,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_soft_with_deletion() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         // 44M + 2D + 6M = 50 bases in query
         let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC"; // 50 bases
         assert_eq!(seq.len(), 50);
@@ -3458,7 +2390,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_soft_additional_bases() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC"; // 50 bases
         let mut record = create_test_record("40M10S", seq, 10);
 
@@ -3472,7 +2404,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_preserve_hard_clip() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC"; // 40 bases (no hard clip in sequence)
         let mut record = create_test_record("40M10H", &seq[..40], 10);
 
@@ -3486,7 +2418,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_complex_cigar() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         // 10M + 5I + 5M + 10I + 16M + 4S + 2H = 50 query bases
         let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC"; // 50 bases
         let mut record = create_test_record("10M5I5M10I16M4S2H", seq, 10);
@@ -3501,7 +2433,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_consumes_leading_insertion() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         // 38M + 4I + 8M = 50 bases
         let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC"; // 50 bases
         let mut record = create_test_record("38M4I8M", seq, 10);
@@ -3518,7 +2450,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_preserve_insertion_after_clip() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         // 36M + 4I + 10M = 50 bases
         let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC"; // 50 bases
         let mut record = create_test_record("36M4I10M", seq, 10);
@@ -3533,7 +2465,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_remove_deletion_before_clip() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         // 40M + 4D + 10M = 50 query bases
         let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC"; // 50 bases
         let mut record = create_test_record("40M4D10M", seq, 10);
@@ -3548,7 +2480,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_preserve_distant_deletion() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         // 25M + 4D + 25M = 50 query bases
         let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC"; // 50 bases
         let mut record = create_test_record("25M4D25M", seq, 10);
@@ -3563,7 +2495,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_unmapped_read_does_nothing() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC"; // 50 bases
         let mut record = create_test_record("50M", seq, 10);
 
@@ -3583,7 +2515,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_soft_with_mask() {
-        let clipper = SamRecordClipper::new(ClippingMode::SoftWithMask);
+        let clipper = RawClipperOnBuf::new(ClippingMode::SoftWithMask);
         let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC"; // 50 bases
         let mut record = create_test_record("50M", seq, 10);
 
@@ -3609,7 +2541,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_soft_with_mask_existing_soft_clip() {
-        let clipper = SamRecordClipper::new(ClippingMode::SoftWithMask);
+        let clipper = RawClipperOnBuf::new(ClippingMode::SoftWithMask);
         let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC"; // 50 bases
         let mut record = create_test_record("40M10S", seq, 10);
 
@@ -3635,7 +2567,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_hard() {
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
         let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC"; // 50 bases
         let mut record = create_test_record("50M", seq, 10);
 
@@ -3656,7 +2588,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_hard_existing_soft_clip() {
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
         let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC"; // 50 bases
         assert_eq!(seq.len(), 50);
         let mut record = create_test_record("10S40M", seq, 10);
@@ -3684,7 +2616,7 @@ mod tests {
     fn test_clip_start_of_alignment_auto_trim_soft_mode_false() {
         use noodles::sam::alignment::record::data::field::Tag;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Soft, false);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Soft, false);
         let seq = "ACGTACGTACGTACGTACGT"; // 20 bases
         let mut record = create_test_record("20M", seq, 10);
 
@@ -3705,7 +2637,7 @@ mod tests {
     fn test_clip_start_of_alignment_auto_trim_soft_mode_true() {
         use noodles::sam::alignment::record::data::field::Tag;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Soft, true);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Soft, true);
         let seq = "ACGTACGTACGTACGTACGT"; // 20 bases
         let mut record = create_test_record("20M", seq, 10);
 
@@ -3726,7 +2658,7 @@ mod tests {
     fn test_clip_start_of_alignment_auto_trim_soft_with_mask_mode_false() {
         use noodles::sam::alignment::record::data::field::Tag;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::SoftWithMask, false);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::SoftWithMask, false);
         let seq = "ACGTACGTACGTACGTACGT"; // 20 bases
         let mut record = create_test_record("20M", seq, 10);
 
@@ -3747,7 +2679,7 @@ mod tests {
     fn test_clip_start_of_alignment_auto_trim_soft_with_mask_mode_true() {
         use noodles::sam::alignment::record::data::field::Tag;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::SoftWithMask, true);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::SoftWithMask, true);
         let seq = "ACGTACGTACGTACGTACGT"; // 20 bases
         let mut record = create_test_record("20M", seq, 10);
 
@@ -3769,7 +2701,7 @@ mod tests {
         use noodles::sam::alignment::record::data::field::Tag;
         use noodles::sam::alignment::record_buf::data::field::value::Array;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Hard, false);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, false);
         let seq = "ACGTACGTACGTACGTACGT"; // 20 bases
         let mut record = create_test_record("20M", seq, 10);
 
@@ -3798,7 +2730,7 @@ mod tests {
         use noodles::sam::alignment::record::data::field::Tag;
         use noodles::sam::alignment::record_buf::data::field::value::Array;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Hard, true);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
         let seq = "ACGTACGTACGTACGTACGT"; // 20 bases
         let mut record = create_test_record("20M", seq, 10);
 
@@ -3840,7 +2772,7 @@ mod tests {
     fn test_clip_end_of_alignment_auto_trim_soft_mode_false() {
         use noodles::sam::alignment::record::data::field::Tag;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Soft, false);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Soft, false);
         let seq = "ACGTACGTACGTACGTACGT"; // 20 bases
         let mut record = create_test_record("20M", seq, 10);
 
@@ -3861,7 +2793,7 @@ mod tests {
     fn test_clip_end_of_alignment_auto_trim_soft_mode_true() {
         use noodles::sam::alignment::record::data::field::Tag;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Soft, true);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Soft, true);
         let seq = "ACGTACGTACGTACGTACGTACGT"; // 20 bases
         let mut record = create_test_record("20M", seq, 10);
 
@@ -3882,7 +2814,7 @@ mod tests {
     fn test_clip_end_of_alignment_auto_trim_soft_with_mask_mode_false() {
         use noodles::sam::alignment::record::data::field::Tag;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::SoftWithMask, false);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::SoftWithMask, false);
         let seq = "ACGTACGTACGTACGTACGT"; // 20 bases
         let mut record = create_test_record("20M", seq, 10);
 
@@ -3903,7 +2835,7 @@ mod tests {
     fn test_clip_end_of_alignment_auto_trim_soft_with_mask_mode_true() {
         use noodles::sam::alignment::record::data::field::Tag;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::SoftWithMask, true);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::SoftWithMask, true);
         let seq = "ACGTACGTACGTACGTACGT"; // 20 bases
         let mut record = create_test_record("20M", seq, 10);
 
@@ -3925,7 +2857,7 @@ mod tests {
         use noodles::sam::alignment::record::data::field::Tag;
         use noodles::sam::alignment::record_buf::data::field::value::Array;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Hard, false);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, false);
         let seq = "ACGTACGTACGTACGTACGT"; // 20 bases
         let mut record = create_test_record("20M", seq, 10);
 
@@ -3954,7 +2886,7 @@ mod tests {
         use noodles::sam::alignment::record::data::field::Tag;
         use noodles::sam::alignment::record_buf::data::field::value::Array;
 
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Hard, true);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
         let seq = "ACGTACGTACGTACGTACGT"; // 20 bases
         let mut record = create_test_record("20M", seq, 10);
 
@@ -4001,7 +2933,7 @@ mod tests {
         use noodles::sam::alignment::record::data::field::Tag;
 
         // Test without auto-clip
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
         let seq = "12345678901234567890123456789012345678901234567890"; // 50 bases
         let mut no_auto = create_test_record("5S35M10S", seq, 10);
         let az_tag = Tag::from([b'a', b'z']);
@@ -4025,7 +2957,7 @@ mod tests {
         }
 
         // Test with auto-clip
-        let clipper_auto = SamRecordClipper::with_auto_clip(ClippingMode::Hard, true);
+        let clipper_auto = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
         let mut with_auto = create_test_record("5S35M10S", seq, 10);
         with_auto
             .data_mut()
@@ -4051,29 +2983,31 @@ mod tests {
     /// non-UTF-8 string tag byte-for-byte, not mangle it with `from_utf8_lossy`.
     #[test]
     fn test_upgrade_all_clipping_string_non_utf8_preserves_bytes() {
-        use noodles::sam::alignment::record::data::field::Tag;
-
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Hard, true);
+        // A non-UTF-8 `Z` tag cannot round-trip through a noodles `RecordBuf`, so exercise the
+        // raw clipper directly: encode a clean 5S35M10S read, append the non-UTF-8 aa:Z tag to
+        // the raw bytes, then upgrade all clipping to hard with auto-clip on.
         let seq = "12345678901234567890123456789012345678901234567890"; // 50 bases
-        let mut record = create_test_record("5S35M10S", seq, 10);
-
+        let buf = create_test_record("5S35M10S", seq, 10);
+        let mut rec = to_raw(&buf).as_ref().to_vec();
         // A 50-byte tag value that is not valid UTF-8, matching the read length.
-        let az_tag = Tag::from([b'a', b'z']);
         let mut raw: Vec<u8> = (0..50u8).map(|i| b'0' + (i % 10)).collect();
         raw[7] = 0xFF;
         raw[42] = 0xFE;
-        record.data_mut().insert(az_tag, Value::String(raw.clone().into()));
+        {
+            let mut ed = fgumi_raw_bam::RawTagsEditor::from_vec(&mut rec);
+            ed.append_string(b"aa", &raw);
+        }
+        let mut record = fgumi_raw_bam::RawRecord::from(rec);
 
-        let result = clipper.upgrade_all_clipping(&mut record).expect("upgrade should succeed");
+        let result = RawRecordClipper::with_auto_clip(ClippingMode::Hard, true)
+            .upgrade_all_clipping_raw(&mut record)
+            .expect("upgrade should succeed");
         assert_eq!(result, (5, 10));
 
         // Auto-clip removes the first 5 and last 10 bytes → raw[5..40], verbatim.
-        if let Some(Value::String(s)) = record.data().get(&az_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, &raw[5..40], "non-UTF-8 tag bytes must be preserved on upgrade");
-        } else {
-            panic!("Tag az not found or wrong type");
-        }
+        let bytes = fgumi_raw_bam::find_string_tag_in_record(record.as_ref(), b"aa")
+            .expect("aa tag present");
+        assert_eq!(bytes, &raw[5..40], "non-UTF-8 tag bytes must be preserved on upgrade");
     }
 
     #[test]
@@ -4081,7 +3015,7 @@ mod tests {
         use noodles::sam::alignment::record::data::field::Tag;
 
         // Test without auto-clip
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
         let seq = "12345678901234567890123456789012345678901234567890"; // 50 bases
         let mut no_auto = create_test_record("5H5S35M10S5H", seq, 10);
         let az_tag = Tag::from([b'a', b'z']);
@@ -4105,7 +3039,7 @@ mod tests {
         }
 
         // Test with auto-clip
-        let clipper_auto = SamRecordClipper::with_auto_clip(ClippingMode::Hard, true);
+        let clipper_auto = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
         let mut with_auto = create_test_record("5H5S35M10S5H", seq, 10);
         with_auto
             .data_mut()
@@ -4131,7 +3065,7 @@ mod tests {
     fn test_upgrade_all_clipping_no_soft_clipping() {
         use noodles::sam::alignment::record::data::field::Tag;
 
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
         let az_tag = Tag::from([b'a', b'z']);
 
         // Test with no soft clips
@@ -4174,7 +3108,7 @@ mod tests {
         let seq = "1234567890123456789012345678901234567890123456789012345"; // 55 bases
 
         // Test Soft mode (should not convert)
-        let clipper_soft = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper_soft = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut mapped = create_test_record("55M", seq, 10);
         mapped
             .data_mut()
@@ -4186,7 +3120,7 @@ mod tests {
         assert_eq!(result, (0, 0));
 
         // Test SoftWithMask mode (should not convert)
-        let clipper_mask = SamRecordClipper::new(ClippingMode::SoftWithMask);
+        let clipper_mask = RawClipperOnBuf::new(ClippingMode::SoftWithMask);
         let mut mapped2 = create_test_record("55M", seq, 10);
         mapped2
             .data_mut()
@@ -4198,7 +3132,7 @@ mod tests {
         assert_eq!(result, (0, 0));
 
         // Test unmapped read (should not convert)
-        let clipper_hard = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper_hard = RawClipperOnBuf::new(ClippingMode::Hard);
         let mut unmapped = create_test_record("55M", seq, 10);
         *unmapped.flags_mut() = Flags::UNMAPPED;
         unmapped
@@ -4264,7 +3198,7 @@ mod tests {
         #[case] rev_start: usize,
         #[values(ClippingMode::Soft, ClippingMode::Hard)] mode: ClippingMode,
     ) {
-        let clipper = SamRecordClipper::new(mode);
+        let clipper = RawClipperOnBuf::new(mode);
         let seq = "A".repeat(100);
 
         // Forward-first: positive-strand read passed first (canonical, already handled).
@@ -4340,7 +3274,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_one_base_overlap() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "A".repeat(100);
         let (mut r1, mut r2) = create_pair(1, "100M", &seq, 100, "100M", &seq);
 
@@ -4359,7 +3293,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_two_base_overlap() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "A".repeat(100);
         let (mut r1, mut r2) = create_pair(2, "100M", &seq, 100, "100M", &seq);
 
@@ -4378,7 +3312,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_with_deletion() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "A".repeat(90);
         let (mut r1, mut r2) = create_pair(2, "80M10D10M", &seq, 70, "10M10D80M", &seq);
 
@@ -4397,7 +3331,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_full_overlap() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "A".repeat(100);
         let (mut r1, mut r2) = create_pair(1, "100M", &seq, 1, "100M", &seq);
 
@@ -4416,7 +3350,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_extend_past_each_other() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "A".repeat(100);
         let (mut r1, mut r2) = create_pair(50, "100M", &seq, 1, "100M", &seq);
 
@@ -4436,7 +3370,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_forward_much_longer() {
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Hard, false);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, false);
         let r1_seq = "A".repeat(100);
         let r2_seq = "A".repeat(100);
         let (mut r1, mut r2) = create_pair(1, "100M", &r1_seq, 30, "80S20M", &r2_seq);
@@ -4456,7 +3390,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_reverse_much_longer() {
-        let clipper = SamRecordClipper::with_auto_clip(ClippingMode::Hard, false);
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, false);
         let r1_seq = "A".repeat(100);
         let r2_seq = "A".repeat(100);
         let (mut r1, mut r2) = create_pair(50, "20M80S", &r1_seq, 1, "100M", &r2_seq);
@@ -4476,7 +3410,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_with_one_end_deletion() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let r1_seq = "A".repeat(100);
         let r2_seq = "A".repeat(110);
         let (mut r1, mut r2) = create_pair(1, "60M10D40M", &r1_seq, 50, "10M10D80M10D10M", &r2_seq);
@@ -4496,7 +3430,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_both_ends_deletion() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "A".repeat(100);
         let (mut r1, mut r2) = create_pair(1, "50M10D50M", &seq, 3, "47M10D53M", &seq);
 
@@ -4516,7 +3450,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_no_overlap_far_apart() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "A".repeat(100);
         let (mut r1, mut r2) = create_pair(1000, "100M", &seq, 1, "100M", &seq);
 
@@ -4540,7 +3474,7 @@ mod tests {
     #[test]
     fn test_clip_overlapping_reads_with_insertions() {
         // Based on Scala test: "handle reads that contain insertions"
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let r1_seq = "A".repeat(50);
         let r2_seq = "A".repeat(50);
         // R1: 100-147 with 2bp insertion (40M2I8M)
@@ -4572,7 +3506,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_with_multiple_insertions() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "A".repeat(60);
         // R1: Multiple insertions
         // R2: Multiple insertions
@@ -4586,7 +3520,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_insertion_at_overlap_boundary() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "A".repeat(55);
         // R1: 100-149, with insertion near the end
         // R2: 145-194
@@ -4602,7 +3536,7 @@ mod tests {
 
     #[test]
     fn test_clip_end_of_alignment_soft_with_mask_masking() {
-        let clipper = SamRecordClipper::new(ClippingMode::SoftWithMask);
+        let clipper = RawClipperOnBuf::new(ClippingMode::SoftWithMask);
         let mut record = create_test_record("50M", &"A".repeat(50), 1000);
 
         let clipped = clipper.clip_end_of_alignment(&mut record, 10);
@@ -4628,7 +3562,7 @@ mod tests {
 
     #[test]
     fn test_clip_start_of_alignment_soft_with_mask_masking() {
-        let clipper = SamRecordClipper::new(ClippingMode::SoftWithMask);
+        let clipper = RawClipperOnBuf::new(ClippingMode::SoftWithMask);
         let mut record = create_test_record("50M", &"A".repeat(50), 1000);
 
         let clipped = clipper.clip_start_of_alignment(&mut record, 10);
@@ -4654,7 +3588,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_soft_with_mask() {
-        let clipper = SamRecordClipper::new(ClippingMode::SoftWithMask);
+        let clipper = RawClipperOnBuf::new(ClippingMode::SoftWithMask);
         let seq = "A".repeat(100);
         let (mut r1, mut r2) = create_pair(1, "100M", &seq, 50, "100M", &seq);
 
@@ -4677,7 +3611,7 @@ mod tests {
 
     #[test]
     fn test_clip_very_short_read() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("5M", "ACGTA", 1000);
 
         // Try to clip more than the read length
@@ -4690,7 +3624,7 @@ mod tests {
 
     #[test]
     fn test_clip_entire_read_3_prime() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("10M", &"A".repeat(10), 1000);
 
         // Clipping all 10 aligned bases leaves no alignment, so fgbio unmaps the read
@@ -4704,7 +3638,7 @@ mod tests {
 
     #[test]
     fn test_clip_overlapping_reads_complex_cigar() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let r1_seq = "A".repeat(70);
         let r2_seq = "A".repeat(70);
         // Complex CIGAR with multiple operation types
@@ -4718,7 +3652,7 @@ mod tests {
 
     #[test]
     fn test_clip_with_leading_and_trailing_soft_clips() {
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let mut record = create_test_record("10S30M10S", &"A".repeat(50), 1000);
 
         // Clip additional 5 bases from 3' end
@@ -4732,7 +3666,7 @@ mod tests {
     #[test]
     fn test_clip_overlapping_reads_one_base_different_positions() {
         // Test overlapping by exactly one base at different reference positions
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "A".repeat(50);
 
         // Test at low position
@@ -4751,7 +3685,7 @@ mod tests {
     #[test]
     fn test_not_upgrade_soft_to_soft() {
         // Same mode - should not upgrade
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "12345678901234567890123456789012345678901234567890";
         let mut record = create_test_record("5S35M10S", seq, 10);
 
@@ -4767,7 +3701,7 @@ mod tests {
     #[test]
     fn test_not_upgrade_soft_with_mask_to_soft() {
         // Going backwards - should not upgrade
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "12345678901234567890123456789012345678901234567890";
         let mut record = create_test_record("5S35M10S", seq, 10);
 
@@ -4783,7 +3717,7 @@ mod tests {
     fn test_upgrade_all_clipping_soft_with_mask_masks_existing_soft_clips() {
         // CLIP3-03: SoftWithMask must mask existing soft-clipped bases to N/min-quality
         // (CIGAR unchanged), matching fgbio upgradeAllClipping. Previously a no-op.
-        let clipper = SamRecordClipper::new(ClippingMode::SoftWithMask);
+        let clipper = RawClipperOnBuf::new(ClippingMode::SoftWithMask);
         let seq = "ACGTGACGTGACGTGACGTGACGTGACGTGACGTGACGTGACGTGACGTG"; // 50 bases, no N
         let mut record = create_test_record("5S35M10S", seq, 10);
 
@@ -4841,7 +3775,7 @@ mod tests {
     #[test]
     fn test_not_upgrade_hard_to_hard() {
         // Same mode - should not upgrade
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
         let seq = "12345678901234567890123456789012345"; // 35 bases
         let mut record = create_test_record("5H35M10H", seq, 10);
 
@@ -4857,7 +3791,7 @@ mod tests {
     #[test]
     fn test_not_upgrade_hard_to_soft_with_mask() {
         // Going backwards - should not upgrade (Hard is already most restrictive)
-        let clipper = SamRecordClipper::new(ClippingMode::SoftWithMask);
+        let clipper = RawClipperOnBuf::new(ClippingMode::SoftWithMask);
         let seq = "12345678901234567890123456789012345";
         let mut record = create_test_record("5H35M10H", seq, 10);
 
@@ -4872,7 +3806,7 @@ mod tests {
     #[test]
     fn test_not_upgrade_hard_to_soft() {
         // Going backwards - should not upgrade
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
         let seq = "12345678901234567890123456789012345";
         let mut record = create_test_record("5H35M10H", seq, 10);
 
@@ -4887,7 +3821,7 @@ mod tests {
     #[test]
     fn test_not_upgrade_unmapped_read() {
         // Unmapped reads should not be upgraded
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
         let seq = "12345678901234567890123456789012345678901234567890";
         let mut record = create_test_record("5S35M10S", seq, 10);
 
@@ -4905,7 +3839,7 @@ mod tests {
     #[test]
     fn test_upgrade_soft_to_hard_with_existing_hard_clips() {
         // Soft with existing hard clips -> Hard mode
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
         let seq = "1234567890123456789012345678901234567890"; // 40 bases (2H + 5S + 30M + 3S)
         let mut record = create_test_record("2H5S30M3S", seq, 10);
 
@@ -4921,7 +3855,7 @@ mod tests {
     #[test]
     fn test_upgrade_soft_with_mask_to_hard() {
         // SoftWithMask -> Hard should upgrade
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
         let seq = "12345678901234567890123456789012345678901234567890";
         let mut record = create_test_record("5S35M10S", seq, 10);
 
@@ -4936,7 +3870,7 @@ mod tests {
 
     #[test]
     fn test_upgrade_clipping_with_only_leading_soft_clip() {
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
         let seq = "12345678901234567890123456789012345678901234567890";
         let mut record = create_test_record("10S40M", seq, 10);
 
@@ -4951,7 +3885,7 @@ mod tests {
 
     #[test]
     fn test_upgrade_clipping_with_only_trailing_soft_clip() {
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
         let seq = "12345678901234567890123456789012345678901234567890";
         let mut record = create_test_record("40M10S", seq, 10);
 
@@ -4966,7 +3900,7 @@ mod tests {
 
     #[test]
     fn test_upgrade_clipping_complex_cigar_with_indels() {
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
         let seq = "123456789012345678901234567890123456789012345"; // 45 bases (5S + 20M + 5I + 10M + 5S)
         let mut record = create_test_record("5S20M5I10M5S", seq, 10);
 
@@ -4981,7 +3915,7 @@ mod tests {
 
     #[test]
     fn test_upgrade_clipping_no_soft_clips_present() {
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
         let seq = "12345678901234567890123456789012345678901234567890";
         let mut record = create_test_record("50M", seq, 10);
 
@@ -4999,7 +3933,7 @@ mod tests {
     #[test]
     fn test_clip_5_prime_end_of_alignment_positive_strand() {
         // fgbio test: "add more clipping to the 5' end" - positive strand
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
 
         // Positive strand, no existing clipping
         let mut rec1 = create_test_record("50M", &"A".repeat(50), 10);
@@ -5019,7 +3953,7 @@ mod tests {
     #[test]
     fn test_clip_5_prime_end_of_alignment_negative_strand() {
         // fgbio test: "add more clipping to the 5' end" - negative strand
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
 
         // Negative strand, no existing clipping
         let mut rec3 = create_test_record("50M", &"A".repeat(50), 10);
@@ -5039,7 +3973,7 @@ mod tests {
     #[test]
     fn test_clip_3_prime_end_of_alignment_negative_strand() {
         // fgbio test: "add more clipping to the 3' end" - negative strand
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
 
         // Negative strand, no existing clipping
         let mut rec1 = create_test_record("50M", &"A".repeat(50), 10);
@@ -5059,7 +3993,7 @@ mod tests {
     #[test]
     fn test_clip_3_prime_end_of_alignment_positive_strand() {
         // fgbio test: "add more clipping to the 3' end" - positive strand
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
 
         // Positive strand, no existing clipping
         let mut rec3 = create_test_record("50M", &"A".repeat(50), 10);
@@ -5580,21 +4514,32 @@ mod tests {
 }
 
 // ============================================================================
-// Cross-check tests: RawRecordClipper == SamRecordClipper
+// Round-trip fidelity tests: RawRecordClipper direct == via RecordBuf adapter
 // ============================================================================
 //
-// These tests verify that `RawRecordClipper` and `SamRecordClipper` agree on
-// CIGAR string, alignment start, sequence, and quality scores for a variety of
-// representative inputs across all three `ClippingMode` values.
+// These tests once cross-checked `RawRecordClipper` against the removed
+// `SamRecordClipper`. They now compare the raw clipper run directly on a
+// `RawRecord` against the same clip run through the `RawClipperOnBuf` adapter
+// (`RecordBuf` -> raw -> clip -> `RecordBuf`), confirming the buf<->raw round-trip
+// preserves CIGAR, alignment start, sequence, and quality across all three
+// `ClippingMode` values for a variety of representative inputs.
+//
+// Because both compared paths now run the SAME `RawRecordClipper`, this module guards only
+// buf<->raw round-trip fidelity -- it cannot catch a clip-logic regression (a bug would produce
+// identical wrong output on both sides and still pass here). Clip-arithmetic correctness rests
+// on the concrete-expectation assertions in `mod tests` (hard-coded fgbio-derived CIGAR/SEQ
+// values), not on this module.
 // ============================================================================
 
 #[cfg(test)]
 mod crosscheck_tests {
+    use super::clip_test_adapter::RawClipperOnBuf;
     use super::*;
     use crate::builder::RecordBuilder;
     use fgumi_raw_bam::{RawRecord, encode_record_buf_to_raw};
     use noodles::sam::alignment::RecordBuf;
     use noodles::sam::alignment::record::Sequence as SequenceTrait;
+    use noodles::sam::alignment::record::cigar::Cigar;
     use noodles::sam::alignment::record::cigar::op::Kind;
     use rstest::rstest;
 
@@ -5746,7 +4691,7 @@ mod crosscheck_tests {
                 let mut raw = to_raw(&buf);
 
                 let buf_clipped =
-                    SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, bases);
+                    RawClipperOnBuf::new(mode).clip_start_of_alignment(&mut buf, bases);
                 let raw_clipped =
                     RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, bases);
 
@@ -5773,7 +4718,7 @@ mod crosscheck_tests {
                 .build();
             let mut raw = to_raw(&buf);
 
-            let buf_clipped = SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 10);
+            let buf_clipped = RawClipperOnBuf::new(mode).clip_start_of_alignment(&mut buf, 10);
             let raw_clipped = RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 10);
 
             assert_eq!(buf_clipped, raw_clipped, "mode={mode:?}: clip count");
@@ -5793,7 +4738,7 @@ mod crosscheck_tests {
                 .build();
             let mut raw = to_raw(&buf);
 
-            let buf_clipped = SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 5);
+            let buf_clipped = RawClipperOnBuf::new(mode).clip_start_of_alignment(&mut buf, 5);
             let raw_clipped = RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 5);
 
             assert_eq!(buf_clipped, raw_clipped, "mode={mode:?}: clip count");
@@ -5811,7 +4756,7 @@ mod crosscheck_tests {
                 .build();
             let mut raw = to_raw(&buf);
 
-            let buf_clipped = SamRecordClipper::new(mode).clip_end_of_alignment(&mut buf, 5);
+            let buf_clipped = RawClipperOnBuf::new(mode).clip_end_of_alignment(&mut buf, 5);
             let raw_clipped = RawRecordClipper::new(mode).clip_end_of_alignment(&mut raw, 5);
 
             assert_eq!(buf_clipped, raw_clipped, "mode={mode:?}: clip count");
@@ -5829,7 +4774,7 @@ mod crosscheck_tests {
                 .build();
             let mut raw = to_raw(&buf);
 
-            let buf_clipped = SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 10);
+            let buf_clipped = RawClipperOnBuf::new(mode).clip_start_of_alignment(&mut buf, 10);
             let raw_clipped = RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 10);
 
             assert_eq!(buf_clipped, raw_clipped, "mode={mode:?}: clip count");
@@ -5848,7 +4793,7 @@ mod crosscheck_tests {
                 .build();
             let mut raw = to_raw(&buf);
 
-            let buf_clipped = SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 10);
+            let buf_clipped = RawClipperOnBuf::new(mode).clip_start_of_alignment(&mut buf, 10);
             let raw_clipped = RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 10);
 
             assert_eq!(buf_clipped, raw_clipped, "10S40M mode={mode:?}");
@@ -5866,7 +4811,7 @@ mod crosscheck_tests {
                 .build();
             let mut raw = to_raw(&buf);
 
-            let buf_clipped = SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 10);
+            let buf_clipped = RawClipperOnBuf::new(mode).clip_start_of_alignment(&mut buf, 10);
             let raw_clipped = RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 10);
 
             assert_eq!(buf_clipped, raw_clipped, "10H40M mode={mode:?}");
@@ -5889,8 +4834,7 @@ mod crosscheck_tests {
                     .build();
                 let mut raw = to_raw(&buf);
 
-                let buf_clipped =
-                    SamRecordClipper::new(mode).clip_end_of_alignment(&mut buf, bases);
+                let buf_clipped = RawClipperOnBuf::new(mode).clip_end_of_alignment(&mut buf, bases);
                 let raw_clipped =
                     RawRecordClipper::new(mode).clip_end_of_alignment(&mut raw, bases);
 
@@ -5915,7 +4859,7 @@ mod crosscheck_tests {
                 .build();
             let mut raw = to_raw(&buf);
 
-            let buf_clipped = SamRecordClipper::new(mode).clip_end_of_alignment(&mut buf, 10);
+            let buf_clipped = RawClipperOnBuf::new(mode).clip_end_of_alignment(&mut buf, 10);
             let raw_clipped = RawRecordClipper::new(mode).clip_end_of_alignment(&mut raw, 10);
 
             assert_eq!(buf_clipped, raw_clipped, "mode={mode:?}");
@@ -5933,7 +4877,7 @@ mod crosscheck_tests {
                 .build();
             let mut raw = to_raw(&buf);
 
-            let buf_clipped = SamRecordClipper::new(mode).clip_end_of_alignment(&mut buf, 10);
+            let buf_clipped = RawClipperOnBuf::new(mode).clip_end_of_alignment(&mut buf, 10);
             let raw_clipped = RawRecordClipper::new(mode).clip_end_of_alignment(&mut raw, 10);
 
             assert_eq!(buf_clipped, raw_clipped, "mode={mode:?}");
@@ -5957,7 +4901,7 @@ mod crosscheck_tests {
             .build();
         let mut raw = to_raw(&buf);
 
-        let buf_clipped = SamRecordClipper::new(mode).clip_start_of_read(&mut buf, 5);
+        let buf_clipped = RawClipperOnBuf::new(mode).clip_start_of_read(&mut buf, 5);
         let raw_clipped = RawRecordClipper::new(mode).clip_start_of_read_raw(&mut raw, 5);
 
         assert_eq!(buf_clipped, raw_clipped, "10S40M Hard upgrade start");
@@ -5975,7 +4919,7 @@ mod crosscheck_tests {
             .build();
         let mut raw = to_raw(&buf);
 
-        let buf_clipped = SamRecordClipper::new(mode).clip_end_of_read(&mut buf, 5);
+        let buf_clipped = RawClipperOnBuf::new(mode).clip_end_of_read(&mut buf, 5);
         let raw_clipped = RawRecordClipper::new(mode).clip_end_of_read_raw(&mut raw, 5);
 
         assert_eq!(buf_clipped, raw_clipped, "40M10S Hard upgrade end");
@@ -6033,7 +4977,7 @@ mod crosscheck_tests {
             .build();
         let mut raw = to_raw(&buf);
 
-        let buf_result = SamRecordClipper::new(mode).upgrade_all_clipping(&mut buf);
+        let buf_result = RawClipperOnBuf::new(mode).upgrade_all_clipping(&mut buf);
         let raw_result = RawRecordClipper::new(mode).upgrade_all_clipping_raw(&mut raw);
 
         assert_eq!(
@@ -6061,7 +5005,7 @@ mod crosscheck_tests {
             .build();
         let mut raw = to_raw(&buf);
 
-        let buf_result = SamRecordClipper::new(mode).upgrade_all_clipping(&mut buf);
+        let buf_result = RawClipperOnBuf::new(mode).upgrade_all_clipping(&mut buf);
         let raw_result = RawRecordClipper::new(mode).upgrade_all_clipping_raw(&mut raw);
 
         assert_eq!(
@@ -6096,7 +5040,7 @@ mod crosscheck_tests {
             .build();
         let mut raw = to_raw(&buf);
 
-        let buf_result = SamRecordClipper::new(mode).upgrade_all_clipping(&mut buf);
+        let buf_result = RawClipperOnBuf::new(mode).upgrade_all_clipping(&mut buf);
         let raw_result = RawRecordClipper::new(mode).upgrade_all_clipping_raw(&mut raw);
 
         assert_eq!(
@@ -6125,7 +5069,7 @@ mod crosscheck_tests {
                 .build();
             let mut raw = to_raw(&buf);
 
-            let buf_c = SamRecordClipper::new(mode).clip_5_prime_end_of_alignment(&mut buf, 10);
+            let buf_c = RawClipperOnBuf::new(mode).clip_5_prime_end_of_alignment(&mut buf, 10);
             let raw_c = RawRecordClipper::new(mode).clip_5_prime_end_of_alignment(&mut raw, 10);
 
             assert_eq!(buf_c, raw_c, "5' positive mode={mode:?}");
@@ -6143,7 +5087,7 @@ mod crosscheck_tests {
                 .build();
             let mut raw = to_raw(&buf);
 
-            let buf_c = SamRecordClipper::new(mode).clip_3_prime_end_of_alignment(&mut buf, 10);
+            let buf_c = RawClipperOnBuf::new(mode).clip_3_prime_end_of_alignment(&mut buf, 10);
             let raw_c = RawRecordClipper::new(mode).clip_3_prime_end_of_alignment(&mut raw, 10);
 
             assert_eq!(buf_c, raw_c, "3' positive mode={mode:?}");
@@ -6226,7 +5170,7 @@ mod crosscheck_tests {
             .build();
         let mut raw = to_raw(&buf);
 
-        let buf_c = SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 50);
+        let buf_c = RawClipperOnBuf::new(mode).clip_start_of_alignment(&mut buf, 50);
         let raw_c = RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 50);
 
         assert_eq!(buf_c, 40, "buf return count mode={mode:?}");
@@ -6250,7 +5194,7 @@ mod crosscheck_tests {
             .build();
         let mut raw = to_raw(&buf);
 
-        let buf_c = SamRecordClipper::new(mode).clip_end_of_alignment(&mut buf, 50);
+        let buf_c = RawClipperOnBuf::new(mode).clip_end_of_alignment(&mut buf, 50);
         let raw_c = RawRecordClipper::new(mode).clip_end_of_alignment(&mut raw, 50);
 
         assert_eq!(buf_c, 40, "buf return count mode={mode:?}");
@@ -6272,7 +5216,7 @@ mod crosscheck_tests {
             .build();
         let mut raw = to_raw(&buf);
 
-        let buf_c = SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 50);
+        let buf_c = RawClipperOnBuf::new(mode).clip_start_of_alignment(&mut buf, 50);
         let raw_c = RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 50);
 
         assert_eq!(buf_c, 50, "buf return count mode={mode:?}");
@@ -6293,7 +5237,7 @@ mod crosscheck_tests {
             .build();
         let mut raw = to_raw(&buf);
 
-        let buf_c = SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 49);
+        let buf_c = RawClipperOnBuf::new(mode).clip_start_of_alignment(&mut buf, 49);
         let raw_c = RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 49);
 
         assert_eq!(buf_c, 49, "buf return count mode={mode:?}");
@@ -6321,7 +5265,7 @@ mod crosscheck_tests {
             .build();
         let mut raw = to_raw(&buf);
 
-        SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 60);
+        RawClipperOnBuf::new(mode).clip_start_of_alignment(&mut buf, 60);
         RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 60);
 
         assert_both_unmapped(&raw, &buf, &format!("neg-strand unmap mode={mode:?}"));
@@ -6375,7 +5319,7 @@ mod crosscheck_tests {
             .build();
         let mut raw = to_raw(&buf);
 
-        SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 60);
+        RawClipperOnBuf::new(mode).clip_start_of_alignment(&mut buf, 60);
         RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 60);
 
         assert_both_unmapped(&raw, &buf, &format!("neg-strand tag reorient mode={mode:?}"));
@@ -6408,7 +5352,7 @@ mod crosscheck_tests {
             .build();
         let mut raw = to_raw(&buf);
 
-        SamRecordClipper::new(mode).clip_start_of_alignment(&mut buf, 60);
+        RawClipperOnBuf::new(mode).clip_start_of_alignment(&mut buf, 60);
         RawRecordClipper::new(mode).clip_start_of_alignment(&mut raw, 60);
 
         assert_both_unmapped(&raw, &buf, &format!("fwd-strand unmap mode={mode:?}"));

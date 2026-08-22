@@ -112,7 +112,7 @@ pub use builder::{
     SamBuilder, Strand, create_default_test_fasta, create_ref_dict, create_test_fasta,
     degrading_qualities, parse_cigar, repeat_n, uniform_qualities,
 };
-pub use clipper::{ClippingMode, RawRecordClipper, SamRecordClipper};
+pub use clipper::{ClippingMode, RawRecordClipper};
 pub use fgumi_tag::SamTag;
 pub use record_utils::{
     PairOrientation, alignment_end, cigar_reference_length, get_pair_orientation, is_fr_pair,
