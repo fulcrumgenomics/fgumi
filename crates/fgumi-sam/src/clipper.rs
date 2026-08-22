@@ -598,9 +598,12 @@ impl RawRecordClipper {
         r1: &mut fgumi_raw_bam::RawRecord,
         r2: &mut fgumi_raw_bam::RawRecord,
     ) -> (usize, usize) {
-        if !fgumi_raw_bam::is_fr_pair_raw(r1.as_ref())
-            || !fgumi_raw_bam::is_fr_pair_raw(r2.as_ref())
-        {
+        // Gate on the symmetric, order-independent per-*pair* FR classifier. The per-record
+        // `is_fr_pair_raw` derives the mate 5' from TLEN on its forward-strand arm, which
+        // misclassifies dovetail FR pairs (htsjdk/samtools#1771) and would skip overlap clipping
+        // on a valid pair. Both records are in hand here, so `is_primary_fr_pair_raw` (the same
+        // gate the sibling `clip_extending_past_mate_ends` uses) is the correct check.
+        if !fgumi_raw_bam::is_primary_fr_pair_raw(r1.as_ref(), r2.as_ref()) {
             return (0, 0);
         }
 
@@ -2118,8 +2121,9 @@ mod tests {
         use noodles::sam::header::record::value::map::ReferenceSequence;
         use std::num::NonZeroUsize;
 
-        // Build a valid FR pair, then mark r2 as self-unmapped. r1's flags still
-        // claim the mate is mapped, so is_fr_pair_raw(r1) passes but r2 doesn't.
+        // Build a valid FR pair, then mark r2 as self-unmapped. r1's flags still claim the mate
+        // is mapped, but the pair is not a valid primary FR pair because r2 itself is unmapped,
+        // so the symmetric gate must reject it (validating both records, not just r1).
         let r1_buf =
             create_paired_record("100M", &"A".repeat(100), 1000, false, true, 1100, "100M");
         let mut r2_buf =
@@ -2134,12 +2138,55 @@ mod tests {
         let mut r1 = encode_record_buf_to_raw(&r1_buf, &header).expect("encode r1");
         let mut r2 = encode_record_buf_to_raw(&r2_buf, &header).expect("encode r2");
 
-        assert!(fgumi_raw_bam::is_fr_pair_raw(r1.as_ref()));
-        assert!(!fgumi_raw_bam::is_fr_pair_raw(r2.as_ref()));
+        // Not a valid primary FR pair: r2 is self-unmapped.
+        assert!(!fgumi_raw_bam::is_primary_fr_pair_raw(r1.as_ref(), r2.as_ref()));
 
         let clipper = RawRecordClipper::new(ClippingMode::Soft);
         assert_eq!(clipper.clip_overlapping_reads(&mut r1, &mut r2), (0, 0));
         assert_eq!(clipper.clip_extending_past_mate_ends(&mut r1, &mut r2), (0, 0));
+    }
+
+    /// Retro sibling of #839: `clip_overlapping_reads` must clip a valid dovetail FR pair whose
+    /// FORWARD read carries a leftmost-to-rightmost `TLEN`. `is_fr_pair_raw`'s per-record
+    /// forward arm derives the mate 5' from `TLEN`, so it mis-reports the forward read as non-FR
+    /// on such dovetails (htsjdk/samtools#1771); the old `is_fr_pair_raw(r1) || is_fr_pair_raw(r2)`
+    /// gate then short-circuited to `(0, 0)` and left the read-through/adapter overlap unclipped.
+    /// The symmetric `is_primary_fr_pair_raw(r1, r2)` gate — both records in hand, the same fix
+    /// the sibling `clip_extending_past_mate_ends` already uses — classifies the pair correctly.
+    #[test]
+    fn test_raw_clip_overlapping_reads_dovetail_fr_forward_tlen() {
+        use fgumi_raw_bam::encode_record_buf_to_raw;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use std::num::NonZeroUsize;
+
+        // Dovetail FR pair: forward 100M @ 101 (ref 101..200), reverse 100M @ 61 (ref 61..160).
+        // Overlap is ref 101..160; the reference midpoint between the forward 5' (101) and the
+        // reverse 3' (160) is 130, so each read clips 70 query bases back to the midpoint.
+        let seq = "A".repeat(100);
+        let mut fwd_buf = create_paired_record("100M", &seq, 101, false, true, 61, "100M");
+        // An aligner writing TLEN under SAM v1 §1.4's leftmost-to-rightmost convention emits a
+        // negative TLEN on the rightmost (here forward) read, which is what mis-drives
+        // is_fr_pair_raw's per-record forward arm. create_paired_record's own 5'-to-5' TLEN would
+        // sidestep the bug, so override it to the leftmost-to-rightmost value (span 61..200).
+        *fwd_buf.template_length_mut() = -140;
+        let rev_buf = create_paired_record("100M", &seq, 61, true, false, 101, "100M");
+
+        let ref_seq =
+            Map::<ReferenceSequence>::new(NonZeroUsize::new(100_000).expect("ref length nonzero"));
+        let header =
+            noodles::sam::Header::builder().add_reference_sequence(b"chr1", ref_seq).build();
+        let mut fwd = encode_record_buf_to_raw(&fwd_buf, &header).expect("encode fwd");
+        let mut rev = encode_record_buf_to_raw(&rev_buf, &header).expect("encode rev");
+
+        // The pair is a valid primary FR pair (classified on the reverse record's CIGAR arm),
+        // even though the forward read's per-record TLEN arm misclassifies it.
+        assert!(fgumi_raw_bam::is_primary_fr_pair_raw(fwd.as_ref(), rev.as_ref()));
+
+        // Before the fix this returned (0, 0); the dovetail overlap must be clipped to the
+        // reference midpoint on both reads.
+        let clipper = RawRecordClipper::new(ClippingMode::Soft);
+        assert_eq!(clipper.clip_overlapping_reads(&mut fwd, &mut rev), (70, 70));
     }
 
     #[test]

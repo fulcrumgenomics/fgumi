@@ -802,9 +802,9 @@ fn test_clip_command_threads_mode_primary_pair_all_options() {
         mapped_read(b"p", flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE, 99, 150, 60);
     let mut r2 =
         mapped_read(b"p", flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE, 99, 100, 60);
-    // A non-zero TLEN is required for `is_fr_pair_raw` to recognize the pair (htsjdk keys FR
-    // detection off the insert size); without it overlap and mate-extension clipping would
-    // silently no-op and only the fixed 5'/3' clips would apply.
+    // Set a realistic FR insert size on the pair. Overlap and mate-extension clipping gate on the
+    // symmetric `is_primary_fr_pair_raw` (the reverse read's CIGAR-derived arm), so FR detection is
+    // TLEN-independent; the values are set only because a real FR pair carries them.
     fgumi_raw_bam::set_template_length(r1.as_mut_vec(), 150);
     fgumi_raw_bam::set_template_length(r2.as_mut_vec(), -150);
     create_bam_from_records(&input_bam, &[r1, r2]);
