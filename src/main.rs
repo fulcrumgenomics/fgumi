@@ -31,6 +31,7 @@ use fgumi_lib::commands::fastq::Fastq;
 use fgumi_lib::commands::filter::Filter;
 use fgumi_lib::commands::group::GroupReadsByUmi;
 use fgumi_lib::commands::merge::Merge;
+use fgumi_lib::commands::retag::Retag;
 use fgumi_lib::commands::review::Review;
 #[cfg(feature = "simplex")]
 use fgumi_lib::commands::simplex::Simplex;
@@ -144,11 +145,13 @@ enum Subcommand {
     // Utilities
     #[command(display_order = 17)]
     Downsample(Downsample),
-    #[cfg(feature = "compare")]
     #[command(display_order = 18)]
+    Retag(Retag),
+    #[cfg(feature = "compare")]
+    #[command(display_order = 19)]
     Compare(Compare),
     #[cfg(feature = "simulate")]
-    #[command(display_order = 19)]
+    #[command(display_order = 20)]
     Simulate(Simulate),
 }
 
@@ -177,6 +180,7 @@ impl Subcommand {
             Self::SimplexMetrics(cmd) => cmd.execute(command_line),
             Self::Review(cmd) => cmd.execute(command_line),
             Self::Downsample(cmd) => cmd.execute(command_line),
+            Self::Retag(cmd) => cmd.execute(command_line),
             #[cfg(feature = "compare")]
             Self::Compare(cmd) => cmd.execute(command_line),
             #[cfg(feature = "simulate")]

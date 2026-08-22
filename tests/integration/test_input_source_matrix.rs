@@ -181,6 +181,13 @@ const CONTRACTS: &[IoContract] = &[
         stdout: Required,
         output_depends_on_input: Required,
     },
+    IoContract {
+        command: "retag",
+        sam: Required,
+        stdin: Required,
+        stdout: Required,
+        output_depends_on_input: Required,
+    },
     #[cfg(feature = "duplex")]
     IoContract {
         command: "duplex-metrics",
@@ -517,6 +524,7 @@ fn invocation(command: &str) -> Option<Vec<&'static str>> {
                 "--clip-overlapping-reads",
             ]
         }
+        "retag" => vec!["retag", "-i", "{input}", "-o", "{output}", "RX::copy::BX"],
         "duplex-metrics" => vec!["duplex-metrics", "-i", "{input}", "-o", "{output}"],
         "simplex-metrics" => vec!["simplex-metrics", "-i", "{input}", "-o", "{output}"],
         "downsample" => {

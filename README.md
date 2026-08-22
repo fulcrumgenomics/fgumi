@@ -138,6 +138,7 @@ Enable with: `cargo build --release --features <feature>`
 | `duplex-metrics` | Collect duplex metrics | `fgbio CollectDuplexSeqMetrics` |
 | `review` | Review consensus variants | `fgbio ReviewConsensusVariants` |
 | `downsample` | Downsample BAM by UMI family | N/A |
+| `retag` | Rewrite SAM tags (copy/move/delete) | N/A |
 | `compare <cmd>` | Compare files (feature-gated) | N/A |
 | `simulate <cmd>` | Generate test data (feature-gated) | N/A |
 

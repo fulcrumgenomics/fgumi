@@ -69,6 +69,7 @@ cargo build --release
 | `duplex-metrics` | Collect duplex metrics |
 | `review` | Review consensus variants |
 | `downsample` | Downsample BAM by UMI family |
+| `retag` | Rewrite SAM tags (copy/move/delete) |
 | `simplex-metrics` | Collect simplex metrics |
 | `merge` | Merge sorted BAM files |
 
