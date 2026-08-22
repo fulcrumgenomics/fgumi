@@ -4,6 +4,7 @@
 //!
 //! - `bgzf/`                    — BGZF compress/decompress
 //! - `boundaries/`              — record-boundary discovery
+//! - `correct/`                 — UMI correction against a known-UMI set
 //! - `group/`                   — template grouping (BAM, position, queryname, MI)
 //! - `parse/`                   — record parsing
 //! - `process.rs`               — closure-driven mid-steps (`Process`,
@@ -17,9 +18,11 @@
 //! - `tuning.rs`                — per-chain byte/queue budgets
 //! - `types.rs`                 — flowing data types (`HeapSize` + `Ordered`)
 //!
-//! `correct/`, `extract.rs`, and `align_and_merge` arrive in follow-up ports:
-//! the first two additionally require the command-layer options refactor
-//! (`CorrectOptions` / `ExtractOptions`), which lands with the command rewiring.
+//! `extract.rs` and `align_and_merge` arrive in follow-up ports: `extract.rs`
+//! still needs `ExtractOptions` from the command-layer options refactor, and
+//! `align_and_merge` needs `crate::aligner`, neither of which has landed yet.
+//! (`correct/` had the same dependency on `CorrectOptions`; that arrived with
+//! the options projection, so it is ported here.)
 //!
 //! This module deliberately holds only what the chain builder actually
 //! constructs. Two steps that exist upstream are *not* ported here:
@@ -32,6 +35,7 @@ pub mod bgzf;
 pub mod boundaries;
 #[cfg(test)]
 mod chain_tests;
+pub mod correct;
 pub mod group;
 pub mod parse;
 pub mod process;
