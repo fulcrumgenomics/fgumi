@@ -1380,6 +1380,9 @@ pub struct SortWorkerPool {
     /// How the merge reads each spill file. `Fixed(1)` keeps the sequential
     /// `BufReader` a merge has always used.
     pub(crate) read_streams: crate::external::ReadStreams,
+    /// Whether the `--sort-stats` diagnostics are enabled for this run (run-scoped copy of
+    /// [`crate::RawExternalSorter::sort_stats`]); consulted by this pool's `stat!` emitters.
+    sort_stats: bool,
 }
 
 /// Shared state visible to all workers and the main thread.
@@ -2364,12 +2367,15 @@ impl SortWorkerPool {
     /// - `temp_compression`: BGZF level for Phase 1 spill writes (typically 1 for speed).
     /// - `output_compression`: BGZF level for Phase 2 merge output (typically 6 for size).
     /// - `spill_codec`: codec used for spill chunks (BGZF or Zstd). Output is always BGZF.
+    /// - `sort_stats`: whether `--sort-stats` diagnostics are on for this run (the trailing
+    ///   `bool` at call sites; tests pass `false`).
     #[must_use]
     pub fn new(
         num_workers: usize,
         temp_compression: u32,
         output_compression: u32,
         spill_codec: SpillCodec,
+        sort_stats: bool,
     ) -> Self {
         let buffer_pool = BufferPool::new(num_workers * 4);
         let stats = PoolStats::default();
@@ -2424,7 +2430,13 @@ impl SortWorkerPool {
             num_workers,
             spill_codec,
             read_streams: crate::external::ReadStreams::Fixed(1),
+            sort_stats,
         }
+    }
+
+    /// Whether the `--sort-stats` diagnostics are enabled for the run that built this pool.
+    pub(crate) fn sort_stats(&self) -> bool {
+        self.sort_stats
     }
 
     /// Park for the current backoff, publish the parked state, and return the
@@ -4664,7 +4676,7 @@ mod tests {
     fn test_compress_target_decides_level_regardless_of_phase(#[case] phase_under_test: u8) {
         // Compressible: 8 KiB of one byte shrinks to almost nothing at level 9.
         let data = vec![b'A'; 8192];
-        let pool = SortWorkerPool::new(2, 0, 9, crate::codec::SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(2, 0, 9, crate::codec::SpillCodec::Bgzf, false);
         pool.set_phase(phase_under_test);
 
         let compressed_len = |target: CompressTarget| {
@@ -4736,7 +4748,7 @@ mod tests {
 
     #[test]
     fn test_pool_compress_roundtrip() {
-        let pool = SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false);
         let (result_tx, result_rx) = pool.compress_result_channel();
 
         // Submit a compress job
@@ -4778,7 +4790,7 @@ mod tests {
             }
         }
 
-        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf, false);
         pool.set_phase(phase::PHASE1);
         let (tx, rx) = std::sync::mpsc::channel();
 
@@ -4835,7 +4847,7 @@ mod tests {
             }
         }
 
-        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf, false);
         pool.set_phase(phase::PHASE1);
         // Everything the phase-completion check looks at is now satisfied.
         pool.shared.decompressed_input_done.store(true, Ordering::Release);
@@ -4857,7 +4869,7 @@ mod tests {
 
     #[test]
     fn test_pool_many_jobs() {
-        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf, false);
         let (result_tx, result_rx) = pool.compress_result_channel();
 
         let num_jobs = 100usize;
@@ -4894,7 +4906,7 @@ mod tests {
 
     #[test]
     fn set_active_workers_clamps() {
-        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf, false);
         // A fresh pool is fully active, so anything dividing by the active count
         // before a cap is applied still gets the pool width.
         assert_eq!(pool.active_workers(), 4, "a pool starts with every worker active");
@@ -4914,7 +4926,7 @@ mod tests {
     /// utilization and flip the merge verdict from CPU-bound to I/O-bound.
     #[test]
     fn active_workers_reports_the_phase2_cap_not_the_pool_width() {
-        let pool = SortWorkerPool::new(8, 1, 6, crate::codec::SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(8, 1, 6, crate::codec::SpillCodec::Bgzf, false);
         pool.set_active_workers(8);
         pool.begin_phase2(3);
         assert_eq!(pool.num_workers(), 8, "the pool is still eight threads wide");
@@ -5473,7 +5485,7 @@ mod tests {
             (pool, counts)
         };
 
-        let pool = SortWorkerPool::new(6, 1, 6, crate::codec::SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(6, 1, 6, crate::codec::SpillCodec::Bgzf, false);
 
         // Batch 1: capped at 2 — only workers 0..2 may run.
         pool.set_active_workers(2);
@@ -5509,7 +5521,7 @@ mod tests {
 
     #[test]
     fn test_pool_stats() {
-        let pool = SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false);
         let (c_tx, c_rx) = pool.compress_result_channel();
 
         // Submit one compress job
@@ -5800,7 +5812,7 @@ mod tests {
 
     #[test]
     fn test_worker_pool_num_workers() {
-        let pool = SortWorkerPool::new(3, 1, 6, crate::codec::SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(3, 1, 6, crate::codec::SpillCodec::Bgzf, false);
         assert_eq!(pool.num_workers(), 3);
         pool.shutdown();
     }
@@ -6343,7 +6355,7 @@ mod tests {
             crate::external::ReadStreams::Fixed(4),
             crate::external::ReadStreams::Auto,
         ] {
-            let mut pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf);
+            let mut pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf, false);
             pool.read_streams = read_streams;
             pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
             let files = pool.phase2_files();
@@ -6376,7 +6388,7 @@ mod tests {
             crate::external::ReadStreams::Fixed(4),
             crate::external::ReadStreams::Auto,
         ] {
-            let mut pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Zstd);
+            let mut pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Zstd, false);
             pool.read_streams = read_streams;
             pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
             let files = pool.phase2_files();
@@ -6397,7 +6409,7 @@ mod tests {
         let path = dir.path().join("empty.spill");
         std::fs::File::create(&path).expect("create empty");
 
-        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Zstd);
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Zstd, false);
         pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
         let files = pool.phase2_files();
         assert_eq!(files.len(), 1);
@@ -6428,7 +6440,7 @@ mod tests {
             path
         };
 
-        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf, false);
 
         // First merge: one source, drained to completion.
         pool.set_phase2_files(std::slice::from_ref(&spill("first.spill")))
@@ -6475,7 +6487,7 @@ mod tests {
             path
         };
 
-        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf, false);
 
         // First merge: install a source and publish a prediction, as the merge
         // loop does when the winning run changes.
@@ -6522,7 +6534,7 @@ mod tests {
             path
         };
 
-        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf);
+        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf, false);
         pool.set_phase2_files(std::slice::from_ref(&spill("first.spill")))
             .expect("set_phase2_files");
 

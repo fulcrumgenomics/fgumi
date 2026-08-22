@@ -387,7 +387,7 @@ mod tests {
     /// without the `ZSPILL_MAGIC` prefix (which a real chunk writer would write
     /// before invoking the loop).
     fn roundtrip_data(data: &[u8], codec: SpillCodec) -> Vec<u8> {
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, codec));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, codec, false));
         let (result_tx, result_rx) = pool.compress_result_channel();
         let buffer_pool = pool.buffer_pool.clone();
         let permit_pool = make_permit_pool(&pool);
@@ -425,7 +425,7 @@ mod tests {
     #[case(SpillCodec::Bgzf)]
     #[case(SpillCodec::Zstd)]
     fn test_staging_buffer_flush_empty_is_noop(#[case] codec: SpillCodec) {
-        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec));
+        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec, false));
         let (result_tx, _result_rx) = pool.compress_result_channel();
         let permit_pool = make_permit_pool(&pool);
 
@@ -453,7 +453,7 @@ mod tests {
     #[case(SpillCodec::Bgzf)]
     #[case(SpillCodec::Zstd)]
     fn test_staging_buffer_is_full(#[case] codec: SpillCodec) {
-        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec));
+        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec, false));
         let (result_tx, _result_rx) = pool.compress_result_channel();
         let permit_pool = make_permit_pool(&pool);
         let mut staging = StagingBuffer::new(
@@ -541,7 +541,7 @@ mod tests {
     #[case(SpillCodec::Bgzf)]
     #[case(SpillCodec::Zstd)]
     fn test_spill_writer_pre_flushes_at_the_staging_frame_size(#[case] codec: SpillCodec) {
-        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec));
+        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec, false));
         let dir = tempfile::tempdir().expect("tempdir");
         let writer =
             crate::pooled_chunk_writer::PooledChunkWriter::<crate::keys::RawCoordinateKey>::new(
@@ -585,7 +585,7 @@ mod tests {
     fn test_staging_buffer_write_chunked_large_data(#[case] codec: SpillCodec) {
         // Data larger than BGZF_MAX_BLOCK_SIZE must be split into multiple compress jobs.
         let large = vec![b'A'; BGZF_MAX_BLOCK_SIZE * 2 + 1000];
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, codec));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, codec, false));
         let (result_tx, result_rx) = pool.compress_result_channel();
         let buffer_pool = pool.buffer_pool.clone();
         let permit_pool = make_permit_pool(&pool);
@@ -631,7 +631,7 @@ mod tests {
         let data1 = b"first block data".to_vec();
         let data2 = b"second block data".to_vec();
 
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, codec));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, codec, false));
         let (result_tx, result_rx) = pool.compress_result_channel();
         let buffer_pool = pool.buffer_pool.clone();
         let permit_pool = Arc::new(PermitPool::new(4));
