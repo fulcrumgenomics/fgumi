@@ -100,6 +100,59 @@ pub fn is_primary_fr_pair_raw(a: &[u8], b: &[u8]) -> bool {
     is_fr_pair_raw(reverse_record)
 }
 
+/// FR classification for the MC-tag consensus path, evaluated per-*pair* rather than via the
+/// per-record TLEN arm of [`is_fr_pair_raw`].
+///
+/// [`is_fr_pair_raw`]'s forward-strand arm derives the negative-strand 5' end from `TLEN`, which
+/// misclassifies dovetail FR pairs whose aligned ends coincide (htsjdk/samtools#1771) and zeroes
+/// the read-through clip for the forward read. The simplex/duplex callers hold the read plus its
+/// `MC` tag (mate CIGAR), so the reverse-strand record's CIGAR-derived orientation — the branch
+/// [`is_primary_fr_pair_raw`] evaluates — can be reconstructed for either strand:
+/// - a reverse-strand read *is* the reverse record, so its own CIGAR-based arm (exactly
+///   [`is_fr_pair_raw`]) is already correct and TLEN-independent;
+/// - a forward-strand read's mate is the reverse record: its leftmost (5') is `mate_pos` and its
+///   inclusive alignment end is `mate_pos + mate_ref_len - 1` (from the `MC` CIGAR), and the pair
+///   is FR iff the forward read's own 5' (its leftmost) is `<` that end — the same
+///   `positive_five_prime < negative_five_prime` test [`is_fr_pair_raw`]'s reverse arm applies.
+///
+/// `mate_ref_len` is the reference span of the mate's CIGAR (from the `MC` tag), clamped by
+/// [`saturating_reference_length`]. This matches `is_primary_fr_pair_raw(read, mate)` on dovetail
+/// pairs without needing the mate record in hand.
+#[must_use]
+fn is_fr_pair_with_mate_cigar_raw(bam: &[u8], mate_ref_len: i32) -> bool {
+    let v = RawRecordView::new(bam);
+    let flg = v.flags();
+
+    // Paired, both read and mate mapped, same reference, opposite strands — identical to the
+    // non-orientation guards in `is_fr_pair_raw`.
+    if flg & flags::PAIRED == 0 {
+        return false;
+    }
+    if flg & flags::UNMAPPED != 0 || flg & flags::MATE_UNMAPPED != 0 {
+        return false;
+    }
+    if v.ref_id() != mate_ref_id(bam) {
+        return false;
+    }
+    let is_reverse = flg & flags::REVERSE != 0;
+    let mate_is_reverse = flg & flags::MATE_REVERSE != 0;
+    if is_reverse == mate_is_reverse {
+        return false;
+    }
+
+    if is_reverse {
+        // This read is the reverse record; its own arm is CIGAR-derived and TLEN-independent.
+        return is_fr_pair_raw(bam);
+    }
+
+    // Forward read: evaluate the reverse mate's CIGAR-derived arm. positive strand 5' (this
+    // read's leftmost) < negative strand 5' (the mate's inclusive alignment end).
+    let this_start = v.pos() + 1; // 1-based
+    let mate_start = mate_pos(bam) + 1; // 1-based
+    let mate_end = mate_start.saturating_add((mate_ref_len - 1).max(0));
+    this_start < mate_end
+}
+
 /// Number of bases a read extends past its mate for FR pairs, taking the mate's alignment from
 /// the read's own **MC tag** (the mate CIGAR). Returns `0` for non-FR pairs or when the MC tag
 /// is absent/invalid.
@@ -119,12 +172,9 @@ pub fn is_primary_fr_pair_raw(a: &[u8], b: &[u8]) -> bool {
 /// record in hand rather than its MC tag (see CODEC3-04).
 #[must_use]
 pub fn num_bases_extending_past_mate_raw(bam: &[u8]) -> usize {
-    // Only applies to FR pairs (matching the RecordBuf-based `num_bases_extending_past_mate`)
-    if !is_fr_pair_raw(bam) {
-        return 0;
-    }
-
-    // Need MC tag for mate CIGAR information
+    // Need the MC tag for mate CIGAR information. Parsed before the FR gate because the gate
+    // now classifies orientation from the mate CIGAR (see below); with no usable MC there is
+    // nothing to compute the overhang from anyway, so absent/invalid MC fails closed to 0.
     let aux = aux_data_slice(bam);
     let Some(mc_bytes) = RawTagsView::new(aux).find_string(SamTag::MC) else {
         return 0;
@@ -138,6 +188,14 @@ pub fn num_bases_extending_past_mate_raw(bam: &[u8]) -> usize {
     let Some(mate_ops) = parse_mc_cigar_ops(mc_cigar) else {
         return 0;
     };
+
+    // Only applies to FR pairs. Classify per-pair from the read plus its mate CIGAR rather than
+    // the per-record `is_fr_pair_raw`, whose forward-strand TLEN arm misclassifies dovetail FR
+    // pairs (#839 / htsjdk/samtools#1771) and would zero the read-through clip for the forward
+    // read, leaking adapter into the simplex/duplex consensus.
+    if !is_fr_pair_with_mate_cigar_raw(bam, saturating_reference_length(&mate_ops)) {
+        return 0;
+    }
     bases_extending_past_mate(bam, mate_pos(bam) + 1, &mate_ops)
 }
 
@@ -1692,6 +1750,57 @@ mod tests {
         let via_mate = num_bases_extending_past_mate_vs_mate_raw(&rec, &mate);
         assert_eq!(via_mc, via_mate);
         assert_eq!(via_mc, 10); // 40M end ref 140, mate soft end ref 130 -> clip 40 - readPos(130)=30 = 10
+    }
+
+    /// #839 regression: the MC-tag path (`num_bases_extending_past_mate_raw`, used by the
+    /// simplex/duplex consensus callers) must trim read-through on a dovetail FR pair whose
+    /// FORWARD read has a negative TLEN. The per-record `is_fr_pair_raw(fwd)` mis-reports the
+    /// forward read as non-FR (htsjdk/samtools#1771), which used to zero the clip and leak the
+    /// read-through into the consensus. The pair is a valid primary FR pair, so the 40 bases of
+    /// read-through past the mate must still be trimmed — matching the symmetric mate-record
+    /// path `num_bases_extending_past_mate_vs_mate_raw`.
+    #[test]
+    fn test_num_bases_extending_past_mate_raw_symmetric_on_dovetail_forward() {
+        // forward 50M50S @ 1-based 101, TLEN = -90, MC = 100M; reverse 100M @ 1-based 61.
+        // 50M covers ref 101..150; the 50S read-through covers ref 151..200 in read space.
+        // The mate (100M) ends at ref 160, so 40 soft bases (ref 161..200) extend past it.
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ100M\x00");
+        let fwd = make_bam_bytes_with_tlen(
+            0,
+            100, // 1-based 101
+            flags::PAIRED | flags::MATE_REVERSE | 0x40,
+            b"dtl",
+            &[encode_op(0, 50), encode_op(4, 50)], // 50M50S
+            100,
+            0,
+            60,  // mate 1-based 61
+            -90, // negative TLEN -> is_fr_pair_raw(fwd) == false
+            &aux,
+        );
+        // The reverse mate (100M @ 1-based 61), so the MC-tag path can be pinned against the
+        // symmetric mate-record path on the exact same geometry.
+        let mate = make_bam_bytes_with_tlen(
+            0,
+            60, // 1-based 61
+            flags::PAIRED | flags::REVERSE | 0x80,
+            b"dtl",
+            &[encode_op(0, 100)], // 100M -> ref 61..160
+            100,
+            0,
+            100, // mate (forward) 1-based 101
+            90,  // positive TLEN
+            &[],
+        );
+
+        // The per-record check mis-reports the forward read as non-FR ...
+        assert!(!is_fr_pair_raw(&fwd));
+        // ... but the pair is a valid primary FR pair, so both the MC-tag path (simplex/duplex)
+        // and the symmetric mate-record path (CODEC / clip) must trim the same 40 bases of
+        // read-through. Pinning them together makes the parity claim load-bearing.
+        assert!(is_primary_fr_pair_raw(&fwd, &mate));
+        assert_eq!(num_bases_extending_past_mate_raw(&fwd), 40);
+        assert_eq!(num_bases_extending_past_mate_vs_mate_raw(&fwd, &mate), 40);
     }
 
     // ========================================================================
