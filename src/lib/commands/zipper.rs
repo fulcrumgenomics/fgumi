@@ -47,7 +47,6 @@
 //! - `TagInfo`: Holds sets of tags to remove/reverse/revcomp
 //! - `merge_raw()`: Core function that transfers metadata between templates using raw bytes
 use crate::commands::command::Command;
-use crate::commands::common::CompressionOptions;
 use crate::logging::OperationTimer;
 use crate::reference::{ReferenceReader, find_dict_path};
 use crate::sam::{SamTag, TemplateCoordinateInfo, check_sort};
@@ -59,7 +58,8 @@ use bstr::ByteSlice;
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::{
-    RawBamReaderAuto, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path, make_bgzf_reader,
+    RawBamReaderAuto, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path, is_stdout_path,
+    make_bgzf_reader,
 };
 use fgumi_raw_bam;
 use fgumi_raw_bam::{BAM_BASE_TO_ASCII, RawRecord, RawRecordView};
@@ -168,9 +168,17 @@ pub struct Zipper {
     #[arg(long, short = 't', default_value = "1")]
     pub threads: usize,
 
-    /// Compression options for output BAM.
-    #[command(flatten)]
-    pub compression: CompressionOptions,
+    /// Compression level for output BAM (0-12).
+    ///
+    /// Defaults are chosen for zipper's place in a pipeline: when the output is
+    /// a stream/pipe (stdout, a FIFO, or process substitution) — the usual
+    /// `aligner | fgumi zipper | fgumi sort` case — it defaults to **0**
+    /// (uncompressed BGZF), because compressing an intermediate that `sort`
+    /// immediately re-reads and recompresses is wasted CPU (~28% of zipper's
+    /// work at level 1). When the output is a regular file it defaults to **1**,
+    /// a sane on-disk size. An explicit value always wins.
+    #[arg(long = "compression-level", value_parser = clap::value_parser!(u32).range(0..=12))]
+    pub compression_level: Option<u32>,
 
     /// Accepted for backward compatibility; has no effect.
     ///
@@ -949,6 +957,37 @@ impl Zipper {
         Ok((fgumi_raw_bam::RawBamReader::new(bam_reader.into_inner()), header))
     }
 
+    /// Whether the output is a stream rather than a regular file.
+    ///
+    /// True for stdout and for an existing non-regular file — a FIFO, character
+    /// device, or `/dev/fd/N` from process substitution. A path that does not
+    /// exist yet is *not* a stream: zipper is about to create it as a regular
+    /// file. (This is why the output cannot reuse [`is_regular_file`], which
+    /// stats the path and so reports `false` for a to-be-created file.)
+    fn output_is_stream(&self) -> bool {
+        is_stdout_path(&self.output)
+            || std::fs::metadata(&self.output).is_ok_and(|meta| !meta.file_type().is_file())
+    }
+
+    /// The BGZF compression level to write output at.
+    ///
+    /// An explicit `--compression-level` always wins. Otherwise the default is
+    /// output-aware: **0** (uncompressed, no DEFLATE) for a stream, since
+    /// zipper's output there flows straight into `sort` which recompresses it,
+    /// and **1** for a regular file, a reasonable on-disk size. See
+    /// [`Zipper::compression_level`] and [`Zipper::output_is_stream`].
+    fn resolved_compression_level(&self) -> u32 {
+        /// Uncompressed BGZF for a streamed output — `sort` recompresses it.
+        const STREAM_DEFAULT: u32 = 0;
+        /// Light DEFLATE for a regular file — a reasonable on-disk size.
+        const FILE_DEFAULT: u32 = 1;
+        self.compression_level.unwrap_or(if self.output_is_stream() {
+            STREAM_DEFAULT
+        } else {
+            FILE_DEFAULT
+        })
+    }
+
     /// Process templates using raw-byte merge path with BGZF compression.
     ///
     /// Thread count is controlled by `self.threads` (1 = single-threaded).
@@ -968,7 +1007,7 @@ impl Zipper {
             &self.output,
             output_header,
             self.threads,
-            self.compression.compression_level,
+            self.resolved_compression_level(),
         )?;
 
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
@@ -1204,44 +1243,47 @@ impl Command for Zipper {
             None
         };
 
-        // Create async unmapped reader - spawn thread to read ahead
-        let (unmapped_tx, unmapped_rx) =
-            std::sync::mpsc::sync_channel::<Result<Template>>(self.buffer);
-        std::thread::spawn(move || {
-            let unmapped_iter = TemplateIterator::new(unmapped_raw_reader);
-            for template in unmapped_iter {
-                if unmapped_tx.send(template).is_err() {
-                    break; // Receiver dropped, main thread done
-                }
-            }
-        });
-        let unmapped_iter = std::iter::from_fn(move || unmapped_rx.recv().ok());
-
-        // Spawn a reader thread so a slow consumer never backpressures the input
-        // (e.g. when reading piped output from bwa). The thread owns the reader so
-        // its record iterator outlives each iteration.
-        let (mapped_tx, mapped_rx) = std::sync::mpsc::sync_channel::<Result<Template>>(self.buffer);
-        std::thread::spawn(move || {
-            // The reader is owned by this thread so its record iterator
-            // outlives each iteration.
-            for template in TemplateIterator::new(mapped_reader) {
-                if mapped_tx.send(template).is_err() {
-                    break;
-                }
-            }
-        });
-        let mapped_iter = std::iter::from_fn(move || mapped_rx.recv().ok());
-
         // Build the tag lookups once for the whole run; `process_raw` reuses them
-        // for every template.
+        // for every template on either scheduling path.
         let tags = ZipperTags::from_tag_info(&tag_info);
-        let total_records = self.process_raw(
-            unmapped_iter,
-            mapped_iter,
-            &output_header,
-            &tags,
-            reference.as_ref(),
-        )?;
+
+        // zipper is a lightweight streaming step (`aligner | fgumi zipper |
+        // fgumi sort`), so it must honour `--threads` and not oversubscribe
+        // (issue #762). The single-core fast path (`--threads <= 1`) reads both
+        // inputs inline on this thread — no producer threads at all — so the
+        // whole command is one core with a minimal footprint. The OS pipe buffer
+        // decouples us from the aligner and reading inline naturally
+        // backpressures it. Only the parallel path (`--threads >= 2`) spawns
+        // reader threads, so a slow consumer never backpressures the input pipe.
+        let total_records = if self.threads <= 1 {
+            let unmapped_iter = TemplateIterator::new(unmapped_raw_reader);
+            let mapped_iter = TemplateIterator::new(mapped_reader);
+            self.process_raw(unmapped_iter, mapped_iter, &output_header, &tags, reference.as_ref())?
+        } else {
+            let (unmapped_tx, unmapped_rx) =
+                std::sync::mpsc::sync_channel::<Result<Template>>(self.buffer);
+            std::thread::spawn(move || {
+                for template in TemplateIterator::new(unmapped_raw_reader) {
+                    if unmapped_tx.send(template).is_err() {
+                        break; // Receiver dropped, main thread done
+                    }
+                }
+            });
+            let unmapped_iter = std::iter::from_fn(move || unmapped_rx.recv().ok());
+
+            let (mapped_tx, mapped_rx) =
+                std::sync::mpsc::sync_channel::<Result<Template>>(self.buffer);
+            std::thread::spawn(move || {
+                for template in TemplateIterator::new(mapped_reader) {
+                    if mapped_tx.send(template).is_err() {
+                        break;
+                    }
+                }
+            });
+            let mapped_iter = std::iter::from_fn(move || mapped_rx.recv().ok());
+
+            self.process_raw(unmapped_iter, mapped_iter, &output_header, &tags, reference.as_ref())?
+        };
 
         info!("zipper completed successfully");
         timer.log_completion(total_records);
@@ -1354,7 +1396,7 @@ mod tests {
             tags_to_revcomp,
             buffer: 5000,
             threads: 1,
-            compression: CompressionOptions { compression_level: 1 },
+            compression_level: Some(1),
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
             skip_tc_tags: false,
@@ -1370,6 +1412,54 @@ mod tests {
         let mut reader = noodles::bam::io::reader::Builder.build_from_path(path)?;
         let header = reader.read_header()?;
         Ok(reader.record_bufs(&header).collect::<std::io::Result<Vec<_>>>()?)
+    }
+
+    /// The output-aware compression default: streams get 0 (uncompressed, since
+    /// `sort` recompresses downstream), regular files get 1, and an explicit
+    /// `--compression-level` always wins — including for a path that does not
+    /// exist yet, which zipper is about to create as a regular file (#762).
+    #[test]
+    fn resolved_compression_level_is_output_aware() -> Result<()> {
+        let dir = TempDir::new()?;
+        let existing = dir.path().join("exists.bam");
+        std::fs::write(&existing, b"")?;
+        let missing = dir.path().join("will-create.bam");
+
+        let zipper = |output: &std::path::Path, level: Option<u32>| Zipper {
+            input: std::path::PathBuf::from("-"),
+            unmapped: std::path::PathBuf::from("u.bam"),
+            reference: std::path::PathBuf::from("r.dict"),
+            output: output.to_path_buf(),
+            tags_to_remove: vec![],
+            tags_to_reverse: vec![],
+            tags_to_revcomp: vec![],
+            buffer: 5000,
+            threads: 1,
+            compression_level: level,
+            bwa_chunk_size: 150_000_000,
+            exclude_missing_reads: false,
+            skip_tc_tags: false,
+            restore_unconverted_bases: false,
+        };
+
+        // Streams (stdout) default to uncompressed.
+        assert_eq!(zipper(std::path::Path::new("-"), None).resolved_compression_level(), 0);
+        assert_eq!(
+            zipper(std::path::Path::new("/dev/stdout"), None).resolved_compression_level(),
+            0
+        );
+        // An existing non-regular file (here a character device) is also a stream:
+        // this drives the `output_is_stream` metadata branch that the stdout paths
+        // above short-circuit past, and must likewise default to uncompressed.
+        #[cfg(unix)]
+        assert_eq!(zipper(std::path::Path::new("/dev/null"), None).resolved_compression_level(), 0);
+        // Regular files default to 1 — including a not-yet-created path.
+        assert_eq!(zipper(&missing, None).resolved_compression_level(), 1);
+        assert_eq!(zipper(&existing, None).resolved_compression_level(), 1);
+        // An explicit level always wins, whatever the output is.
+        assert_eq!(zipper(std::path::Path::new("-"), Some(6)).resolved_compression_level(), 6);
+        assert_eq!(zipper(&existing, Some(0)).resolved_compression_level(), 0);
+        Ok(())
     }
 
     /// Tests basic tag merging from unmapped to mapped reads
@@ -2203,7 +2293,7 @@ mod tests {
             tags_to_revcomp: vec![],
             buffer: 5000,
             threads: 4,
-            compression: CompressionOptions { compression_level: 1 },
+            compression_level: Some(1),
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
             skip_tc_tags: false,
@@ -2220,6 +2310,80 @@ mod tests {
             assert!(rec.data().get(&Tag::from(SamTag::RX)).is_some());
             assert!(rec.data().get(&Tag::new(b'x', b'y')).is_some());
             assert!(rec.data().get(&Tag::from(SamTag::AS)).is_some());
+        }
+
+        Ok(())
+    }
+
+    /// The inline single-thread fast path (`--threads <= 1`) and the
+    /// channel-backed parallel path (`--threads >= 2`) run different iterator
+    /// implementations but must produce byte-for-byte identical output (#762).
+    /// Merge the same inputs at threads 0, 1, and 2 and assert the decoded
+    /// records match across all three, so ordering or error-propagation drift
+    /// between the paths is caught.
+    #[test]
+    fn scheduling_paths_produce_identical_output() -> Result<()> {
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
+        for i in 0..10 {
+            let name = format!("q{i}");
+            let mut attrs = HashMap::new();
+            attrs.insert("RX", BufValue::from(format!("ACG{i}")));
+            attrs.insert("xy", BufValue::from(1000 + i as i32));
+            unmapped.add_pair_with_attrs(&name, None, None, true, true, &attrs);
+
+            let mut mapped_attrs = HashMap::new();
+            mapped_attrs.insert("PG", BufValue::from(MAPPED_PG_ID.to_string()));
+            mapped_attrs.insert("AS", BufValue::from(77i32));
+            mapped.add_pair_with_attrs(
+                &name,
+                Some(100 + i * 100),
+                Some(200 + i * 100),
+                true,
+                true,
+                &mapped_attrs,
+            );
+        }
+
+        let dir = TempDir::new()?;
+        let unmapped_path = dir.path().join("unmapped.bam");
+        let mapped_path = dir.path().join("mapped.sam");
+        let dict_path = create_ref_dict(&dir, "chr1", REFERENCE_LENGTH)?;
+        unmapped.write(&unmapped_path)?;
+        mapped.write_sam(&mapped_path)?;
+
+        // threads 0 and 1 exercise the inline fast path; 2 exercises the
+        // channel-backed path with real producer threads.
+        let mut per_thread_records = Vec::new();
+        for threads in [0usize, 1, 2] {
+            let output_path = dir.path().join(format!("output.t{threads}.bam"));
+            let zipper = Zipper {
+                input: mapped_path.clone(),
+                unmapped: unmapped_path.clone(),
+                reference: dict_path.clone(),
+                output: output_path.clone(),
+                tags_to_remove: vec![],
+                tags_to_reverse: vec![],
+                tags_to_revcomp: vec![],
+                buffer: 5000,
+                threads,
+                compression_level: Some(1),
+                bwa_chunk_size: 150_000_000,
+                exclude_missing_reads: false,
+                skip_tc_tags: false,
+                restore_unconverted_bases: false,
+            };
+            zipper.execute("test")?;
+            per_thread_records.push((threads, read_bam_records(&output_path)?));
+        }
+
+        let (baseline_threads, baseline) = &per_thread_records[0];
+        assert_eq!(baseline.len(), 20);
+        for (threads, records) in &per_thread_records[1..] {
+            assert_eq!(
+                records, baseline,
+                "output for --threads {threads} diverged from --threads {baseline_threads}"
+            );
         }
 
         Ok(())
@@ -2411,7 +2575,7 @@ mod tests {
             tags_to_revcomp: vec![],
             buffer: 5000,
             threads: 1,
-            compression: CompressionOptions { compression_level: 1 },
+            compression_level: Some(1),
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads,
             skip_tc_tags: false,
@@ -2498,7 +2662,7 @@ mod tests {
             tags_to_revcomp: vec![],
             buffer: 5000,
             threads: 1,
-            compression: CompressionOptions { compression_level: 1 },
+            compression_level: Some(1),
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
             skip_tc_tags: false,
