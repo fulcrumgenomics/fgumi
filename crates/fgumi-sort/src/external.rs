@@ -257,11 +257,11 @@ impl SortPhaseTimer {
         let sort_secs = self.sort_secs;
         let spill_secs = self.spill_write_secs;
 
-        info!("=== Sort Phase Timing ===");
-        info!("  Read + decompress: {read_secs:.1}s ({read_pct:.0}%)");
-        info!("  In-memory sort:    {sort_secs:.1}s ({sort_pct:.0}%) [{spill_count} spills]");
+        stat!("=== Sort Phase Timing ===");
+        stat!("  Read + decompress: {read_secs:.1}s ({read_pct:.0}%)");
+        stat!("  In-memory sort:    {sort_secs:.1}s ({sort_pct:.0}%) [{spill_count} spills]");
         let spill_mb = self.total_spill_bytes as f64 / (1024.0 * 1024.0);
-        info!(
+        stat!(
             "  Spill write:       {spill_secs:.1}s ({spill_pct:.0}%) [{spill_count} writes, {spill_mb:.1} MB total]"
         );
         if self.consolidate_count > 0 {
@@ -273,23 +273,23 @@ impl SortPhaseTimer {
             // what it was up against. Reporting the number and not what to do
             // about it keeps the recommendation with the caller that chose the
             // limit -- the engine cannot know whether it was requested.
-            info!(
+            stat!(
                 "  Consolidation:     {cons_secs:.1}s ({cons_pct:.0}%) [{cons_count} merges, limit {max_temp_files}]"
             );
         }
         if self.merge_secs > 0.0 {
             let merge_secs = self.merge_secs;
             let merge_pct = 100.0 * merge_secs / overall_nonzero;
-            info!("  K-way merge:       {merge_secs:.1}s ({merge_pct:.0}%)");
+            stat!("  K-way merge:       {merge_secs:.1}s ({merge_pct:.0}%)");
         }
         if self.write_output_secs > 0.0 {
             let write_secs = self.write_output_secs;
             let write_pct = 100.0 * write_secs / overall_nonzero;
-            info!("  Write output:      {write_secs:.1}s ({write_pct:.0}%)");
+            stat!("  Write output:      {write_secs:.1}s ({write_pct:.0}%)");
         }
-        info!("  Total wall clock:  {overall:.1}s");
-        info!("  Threads: {}", format_thread_counts(sort_threads, merge_threads));
-        info!("=========================");
+        stat!("  Total wall clock:  {overall:.1}s");
+        stat!("  Threads: {}", format_thread_counts(sort_threads, merge_threads));
+        stat!("=========================");
     }
 }
 
@@ -2179,7 +2179,7 @@ struct RunFormer<K> {
 /// have nothing to do with how ordered the input was -- which is the one thing
 /// this line exists to report.
 fn log_run_formation(chunks_spilled: usize, runs: usize) {
-    info!(
+    stat!(
         "Spill runs: {runs} from {chunks_spilled} chunks ({} extended an existing run)",
         chunks_spilled.saturating_sub(runs)
     );
@@ -4368,11 +4368,11 @@ impl RawExternalSorter {
         let (util_pct, fetch_pct) = (100.0 * utilization, 100.0 * fetch_fraction);
 
         match classify_merge(utilization, fetch_fraction) {
-            MergeVerdict::CpuBound => info!(
+            MergeVerdict::CpuBound => stat!(
                 "  Verdict: worker pool saturated ({util_pct:.0}%); the merge is CPU-bound, so \
                  more threads may help"
             ),
-            MergeVerdict::IoBound => info!(
+            MergeVerdict::IoBound => stat!(
                 "  Verdict: workers idle ({util_pct:.0}% of capacity) while the consumer spent \
                  {fetch_pct:.0}% of its loop waiting for data -- neither side is the constraint. \
                  More threads are unlikely to help. Storage is one candidate; the pipeline's own \
@@ -4380,7 +4380,7 @@ impl RawExternalSorter {
                  workers notice new work -- is another, and the Merge Stalls block below is what \
                  separates them."
             ),
-            MergeVerdict::Mixed => info!(
+            MergeVerdict::Mixed => stat!(
                 "  Verdict: worker pool {util_pct:.0}% utilized, consumer {fetch_pct:.0}% \
                  waiting on data -- neither clearly saturated"
             ),
@@ -4443,7 +4443,7 @@ impl RawExternalSorter {
         let fetch_cpu = (est_read - park_secs).max(0.0);
         let write_cpu = (est_write - blocked_secs).max(0.0);
         let ratio_total = est_publish + est_present + fetch_cpu + est_tree + write_cpu;
-        info!(
+        stat!(
             "  Consumer CPU: {consumer_cpu:.1}s exact (loop {loop_total:.1}s - park \
              {park_secs:.1}s - backpressure {blocked_secs:.1}s) = {:.0} ns/record",
             consumer_cpu * 1e9 / records
@@ -4453,20 +4453,20 @@ impl RawExternalSorter {
         }
         let share = |part: f64| consumer_cpu * part / ratio_total;
         let ns = |part: f64| share(part) * 1e9 / records;
-        info!("    fetch + decompress:  {:.1}s ({:.0} ns/rec)", share(fetch_cpu), ns(fetch_cpu));
-        info!(
+        stat!("    fetch + decompress:  {:.1}s ({:.0} ns/rec)", share(fetch_cpu), ns(fetch_cpu));
+        stat!(
             "    present record:      {:.1}s ({:.0} ns/rec)",
             share(est_present),
             ns(est_present)
         );
-        info!("    loser tree:          {:.1}s ({:.0} ns/rec)", share(est_tree), ns(est_tree));
-        info!("    enqueue write:       {:.1}s ({:.0} ns/rec)", share(write_cpu), ns(write_cpu));
-        info!(
+        stat!("    loser tree:          {:.1}s ({:.0} ns/rec)", share(est_tree), ns(est_tree));
+        stat!("    enqueue write:       {:.1}s ({:.0} ns/rec)", share(write_cpu), ns(write_cpu));
+        stat!(
             "    next-source predict: {:.1}s ({:.0} ns/rec)",
             share(est_publish),
             ns(est_publish)
         );
-        info!(
+        stat!(
             "    (totals exact; the split between them is sampled, so read the shares as \
              proportions rather than to the tenth of a second)"
         );
@@ -4493,7 +4493,7 @@ impl RawExternalSorter {
         let est_read = scaled.advance;
         let park_secs = stalls.as_ref().map_or(0.0, |x| x.park_secs);
 
-        info!("=== Merge Sub-Phase Timing ===");
+        stat!("=== Merge Sub-Phase Timing ===");
         let MergeConsumerDiag { backpressure_secs: blocked_secs, .. } = consumer_diag;
         Self::log_consumer_rows(
             scaled,
@@ -4515,7 +4515,7 @@ impl RawExternalSorter {
         if let Some(s) = stalls
             && s.park_secs > est_read * 1.05
         {
-            info!(
+            stat!(
                 "    NOTE: exact park time is {:.1}s, above the sampled fetch estimate of \
                  {est_read:.1}s -- the sample under-caught stalls; prefer the Merge Stalls block",
                 s.park_secs
@@ -4531,10 +4531,10 @@ impl RawExternalSorter {
             let (comp_s, comp_n) = workers.output_compress;
             let (spill_s, spill_n) = workers.spill_compress;
             let workers_n = active_workers;
-            info!(
+            stat!(
                 "  Workers ({workers_n} active threads; busy time, overlaps the above and itself)"
             );
-            info!("    Spill disk read:   {read_s:.1}s ({:.0}%) [{read_n} batches]", pct(read_s));
+            stat!("    Spill disk read:   {read_s:.1}s ({:.0}%) [{read_n} batches]", pct(read_s));
             // Blocks-per-batch, split by allowance. A deep share near zero means
             // the deep-read gate (drain frontier or awaited source) is not
             // firing, which reads identically to "the deeper read-ahead did not
@@ -4542,20 +4542,20 @@ impl RawExternalSorter {
             let (deep_b, deep_blk, shal_b, shal_blk) = pool.read_batch_split();
             #[allow(clippy::cast_precision_loss, reason = "block counts stay far below 2^52")]
             let per = |blk: u64, b: u64| if b == 0 { 0.0 } else { blk as f64 / b as f64 };
-            info!(
+            stat!(
                 "      deep {deep_b} batches / {deep_blk} blocks ({:.1} per batch), \
                  other {shal_b} batches / {shal_blk} blocks ({:.1} per batch)",
                 per(deep_blk, deep_b),
                 per(shal_blk, shal_b)
             );
-            info!("    Spill decompress:  {dec_s:.1}s ({:.0}%) [{dec_n} blocks]", pct(dec_s));
-            info!("    Output compress:   {comp_s:.1}s ({:.0}%) [{comp_n} blocks]", pct(comp_s));
-            info!("    Total worker busy: {busy:.1}s  (NOT comparable to loop wall clock)");
+            stat!("    Spill decompress:  {dec_s:.1}s ({:.0}%) [{dec_n} blocks]", pct(dec_s));
+            stat!("    Output compress:   {comp_s:.1}s ({:.0}%) [{comp_n} blocks]", pct(comp_s));
+            stat!("    Total worker busy: {busy:.1}s  (NOT comparable to loop wall clock)");
             // Utilization is the thread-efficiency question: well below 100%
             // means the pool idled, the merge was bound by something other than
             // worker CPU, and adding compression threads cannot help.
             if let Some(util) = workers.worker_utilization(merge_total, workers_n) {
-                info!(
+                stat!(
                     "    Worker utilization: {:.0}% of {workers_n} active threads x \
                      {merge_total:.1}s",
                     100.0 * util
@@ -4563,8 +4563,8 @@ impl RawExternalSorter {
             }
             // Phase 1 spill compression rides the same worker step, so it is
             // reported for context but excluded from the merge totals above.
-            info!("  Phase 1 (not part of the merge)");
-            info!("    Spill compress:    {spill_s:.1}s [{spill_n} blocks]");
+            stat!("  Phase 1 (not part of the merge)");
+            stat!("    Spill compress:    {spill_s:.1}s [{spill_n} blocks]");
 
             // Utilization over the full merge window; the fetch fraction stays
             // relative to the consumer loop, which is the only thing it is a
@@ -4576,7 +4576,7 @@ impl RawExternalSorter {
             Self::log_merge_headroom(loop_total, busy, workers_n, park_secs, blocked_secs);
         }
         Self::log_merge_stalls(loop_total, merge_total, active_workers, stalls, pool);
-        info!("==============================");
+        stat!("==============================");
     }
 
     /// The consumer's sampled sub-phase rows, and their reconciliation against the
@@ -4669,14 +4669,14 @@ impl RawExternalSorter {
             worker_busy_secs,
             threads,
         };
-        info!("  Merge floor: {} is the limit", floors.binding().label());
-        info!(
+        stat!("  Merge floor: {} is the limit", floors.binding().label());
+        stat!(
             "    consumer serial {:.1}s | worker capacity {:.1}s ({threads} threads) | \
              loop {loop_total:.1}s",
             floors.consumer_secs,
             floors.worker_floor_secs()
         );
-        info!(
+        stat!(
             "    recoverable without doing less work: {:.1}s ({:.0}% of the merge)",
             floors.recoverable_secs(),
             100.0 * floors.recoverable_share()
@@ -4794,9 +4794,9 @@ impl RawExternalSorter {
             if supply.total_parks() > 0 {
                 const LABELS: [&str; crate::merge_stalls::ParkSupply::COUNT] =
                     ["a worker was asleep", "all busy, compress queued", "all busy merging"];
-                debug!("  Why nobody had started on the awaited block, at the moment of the park:");
+                stat!("  Why nobody had started on the awaited block, at the moment of the park:");
                 for (i, label) in LABELS.iter().enumerate() {
-                    debug!(
+                    stat!(
                         "    {label:<26} {:>10} parks ({:>4.1}%)  {:>7.1}s ({:>4.1}% of park time)",
                         supply.counts[i],
                         Self::percent(supply.counts[i], supply.total_parks()),
@@ -4850,14 +4850,14 @@ impl RawExternalSorter {
     fn log_merge_validity_gates(pool: &SortWorkerPool) {
         let self_served = pool.consumer_self_served();
         if self_served > 0 {
-            info!(
+            stat!(
                 "  Consumer served itself: {self_served} parks avoided by decompressing an \
                  already-read block inline"
             );
         }
         let predictions = pool.phase2_predictions();
         if predictions > 0 {
-            info!("  Next-source predictions published: {predictions}");
+            stat!("  Next-source predictions published: {predictions}");
         }
     }
 
@@ -4956,7 +4956,7 @@ impl RawExternalSorter {
         // `PHASE2_DECOMP_CAP`).
         let claims = stage.useful_claims.load(std::sync::atomic::Ordering::Relaxed);
         if claims > 0 {
-            info!(
+            stat!(
                 "  Wasted file visits: {:.1} per claim over {} claims ({} visits produced \
                  nothing) -- what an idle worker is actually doing",
                 stage.wasted_visits_per_claim(),
@@ -4992,22 +4992,17 @@ impl RawExternalSorter {
         let share = |ns: u64| 100.0 * ns as f64 / total as f64;
         let per_park = |ns: u64| ns as f64 / park.parks as f64 / 1e3;
 
-        debug!("  Consumer park, by stage (exact, partitions the park):");
-        debug!("    {:<28} {:>8} {:>7} {:>10}", "stage", "time", "share", "per park");
+        stat!("  Consumer park, by stage (exact, partitions the park):");
+        stat!("    {:<28} {:>8} {:>7} {:>10}", "stage", "time", "share", "per park");
         for (label, ns) in [
             ("waiting for a worker", park.to_claim_nanos),
             ("read + decompress work", park.work_nanos),
             ("waiting for its own wake", park.to_resume_nanos),
             ("unattributed", park.unattributed_nanos),
         ] {
-            debug!(
-                "    {label:<28} {:>7.1}s {:>6.0}% {:>9.0}us",
-                secs(ns),
-                share(ns),
-                per_park(ns)
-            );
+            stat!("    {label:<28} {:>7.1}s {:>6.0}% {:>9.0}us", secs(ns), share(ns), per_park(ns));
         }
-        debug!(
+        stat!(
             "    {:<28} {:>7.1}s {:>6.0}% {:>9.0}us  over {} parks ({:.0}% of loop wall)",
             "TOTAL",
             secs(total),
@@ -5016,12 +5011,12 @@ impl RawExternalSorter {
             park.parks,
             if loop_total > 0.0 { 100.0 * secs(total) / loop_total } else { 0.0 }
         );
-        debug!(
+        stat!(
             "    Blocks ready on the awaited file at resume: mean {:.2} (1.0 = every block \
              fetched on demand, one round trip per block)",
             park.mean_ready_on_resume()
         );
-        debug!(
+        stat!(
             "    Parks with no claim during them: {} of {} ({:.0}%) -- the block was already \
              in flight or already done",
             park.unclaimed_parks,
@@ -5034,14 +5029,19 @@ impl RawExternalSorter {
         if claims_total == 0 {
             return;
         }
-        debug!("  Per worker (merge + phase 1 combined):");
-        debug!(
+        stat!("  Per worker (merge + phase 1 combined):");
+        stat!(
             "    {:>3} {:>9} {:>9} {:>7} {:>10} {:>5}",
-            "wid", "busy", "idle", "busy%", "claims", "share"
+            "wid",
+            "busy",
+            "idle",
+            "busy%",
+            "claims",
+            "share"
         );
         for (w, &(busy, idle, claims)) in threads.iter().enumerate() {
             let denom = busy + idle;
-            debug!(
+            stat!(
                 "    {w:>3} {:>8.1}s {:>8.1}s {:>6.0}% {:>10} {:>4.0}%",
                 secs(busy),
                 secs(idle),
@@ -5104,7 +5104,7 @@ impl RawExternalSorter {
         let state_total: f64 = state_secs.iter().sum();
         if state_total > 0.0 {
             let share = |i: usize| 100.0 * state_secs[i] / state_total;
-            info!(
+            stat!(
                 "    The awaited file by park TIME ({state_total:.1}s): {:.0}% gap-filling, \
                  {:.0}% gap-stalled, {:.0}% decompressing, {:.0}% raw-queued, {:.0}% starved",
                 share(AwaitedState::ReorderGapFilling as usize),
@@ -5121,7 +5121,7 @@ impl RawExternalSorter {
             pct
         };
         let mean_depth = consumer.mean_in_flight();
-        info!(
+        stat!(
             "    Workers on the awaited file at a park: none {:.0}%, exactly one {:.0}%, \
              two or more {:.0}% (mean {mean_depth:.1}, tracked to {MAX_TRACKED_IN_FLIGHT})",
             parks_pct(consumer.idle_file_parks()),
@@ -5143,7 +5143,7 @@ impl RawExternalSorter {
         // batch produced it.
         let (mean_block_bytes, derived_cap, derived_batch) = pool.awaited_sizing();
         if mean_block_bytes > 0 {
-            info!(
+            stat!(
                 "    Hot-file refill sized from measured blocks: {mean_block_bytes} B/block \
                  -> batch {derived_batch}, cap {derived_cap}"
             );
@@ -5153,7 +5153,7 @@ impl RawExternalSorter {
         if skip_total > 0 {
             #[allow(clippy::cast_precision_loss, reason = "skip counts stay far below 2^52")]
             let pct = |n: u64| 100.0 * n as f64 / skip_total as f64;
-            info!(
+            stat!(
                 "    Why the pool passed over the awaited file: raw-lock {:.0}%, raw-empty \
                  {:.0}%, decomp-lock {:.0}%, decomp-capped {:.0}% (of {skip_total})",
                 pct(skips[0]),
@@ -5163,13 +5163,13 @@ impl RawExternalSorter {
             );
         }
         if mean_depth >= cap / 2.0 {
-            info!(
+            stat!(
                 "      -> the pool is running near its tracked depth on the file the merge is \
                  blocked on, so these parks are the head block's decompress latency; more \
                  concurrency on that file cannot shorten them"
             );
         } else if consumer.multi_worker_parks() > 0 {
-            info!(
+            stat!(
                 "      -> the pool is on the awaited file but only {mean_depth:.1} deep of \
                  {MAX_TRACKED_IN_FLIGHT} tracked, so capacity is going unused on the file the \
                  merge is blocked on -- supply to that file, not decompress latency, is the \
@@ -5195,7 +5195,7 @@ impl RawExternalSorter {
         // change a decision stay at info. Collection is unconditional either
         // way -- gating collection is what made the original question
         // unanswerable from logs we had already collected.
-        info!("=== Merge Block Lifecycle ===");
+        stat!("=== Merge Block Lifecycle ===");
         debug!("  disk read   -> {}", life.read_batch.summary());
         debug!("  raw dwell   -> {}   (queued, waiting for a worker)", life.raw_dwell.summary());
         debug!("  decompress  -> {}", life.decompress.summary());
@@ -5203,7 +5203,7 @@ impl RawExternalSorter {
             "  reorder     -> {}   (decompressed, waiting for the consumer)",
             life.reorder_dwell.summary()
         );
-        info!(
+        stat!(
             "  Per block: {:.0}us in the raw FIFO unclaimed, {:.0}us decompressing, {:.0}us \
              buffered before use (p50)",
             life.raw_dwell.percentile_micros(0.50),
@@ -5211,7 +5211,7 @@ impl RawExternalSorter {
             life.reorder_dwell.percentile_micros(0.50)
         );
         if life.reorder_is_pass_through() {
-            info!(
+            stat!(
                 "    NOTE: blocks are consumed almost as fast as they are inserted, so the \
                  reorder buffer is a pass-through and PHASE2_DECOMP_CAP is not the binding \
                  constraint -- however full the other files look"
@@ -5219,8 +5219,8 @@ impl RawExternalSorter {
         }
 
         if !refill.is_empty() {
-            info!("  Refill cycle ({} times a file's buffer ran dry)", refill.empties());
-            info!(
+            stat!("  Refill cycle ({} times a file's buffer ran dry)", refill.empties());
+            stat!(
                 "    At the moment it emptied: {:.0}% had raw blocks unclaimed, {:.0}% already \
                  decompressing, {:.0}% nothing at all",
                 100.0 * refill.cause_share(EmptyCause::RawReady),
@@ -5232,7 +5232,7 @@ impl RawExternalSorter {
             if !refill.read_lag.is_empty() {
                 debug!("    empty -> read     {}", refill.read_lag.summary());
             }
-            info!(
+            stat!(
                 "    -> {:.0}% of refill latency is spent waiting for a worker to START, {:.0}% \
                  doing the work",
                 100.0 * refill.claim_share(),
@@ -5247,12 +5247,12 @@ impl RawExternalSorter {
             // it and divides by zero to fill the line below.
             Self::log_awaited_file_depth(&consumer, pool);
             if !consumer.source_run_length.is_empty() {
-                info!(
+                stat!(
                     "  Consecutive blocks per source: {}",
                     consumer.source_run_length.summary_blocks()
                 );
                 if consumer.source_run_length.percentile_micros(0.90) <= 1 {
-                    info!(
+                    stat!(
                         "    -> the merge switches source almost every block, so there is no hot \
                          file to prioritise; demand is spread across all runs at once"
                     );
@@ -5263,7 +5263,7 @@ impl RawExternalSorter {
         if !scans.is_empty() {
             debug!("  Fruitless worker scan cost: {}", scans.summary());
         }
-        info!("=============================");
+        stat!("=============================");
     }
 
     /// Log where the merge loop blocked and what the other files were doing.
@@ -5280,13 +5280,13 @@ impl RawExternalSorter {
         use crate::merge_stalls::{StallShape, classify_stall};
 
         let park_fraction = if loop_total > 0.0 { s.park_secs / loop_total } else { 0.0 };
-        debug!(
+        stat!(
             "  Consumer parked: {:.1}s ({:.0}% of loop wall, exact) over {} parks",
             s.park_secs,
             100.0 * park_fraction,
             s.parks
         );
-        debug!(
+        stat!(
             "    Block pulls that had to wait: {}/{} ({:.0}%), {:.1} parks each (1.0 = no wasted \
              wake-ups)",
             s.stalled_pulls,
@@ -5294,7 +5294,7 @@ impl RawExternalSorter {
             100.0 * s.stall_rate(),
             s.parks_per_stall()
         );
-        debug!(
+        stat!(
             "    Worst source: #{} at {:.1}s ({:.0}% of park time; {} sources parked on)",
             s.top_source,
             s.top_source_park_secs,
@@ -5302,7 +5302,7 @@ impl RawExternalSorter {
             s.sources_parked_on
         );
         if s.censuses > 0 {
-            debug!(
+            stat!(
                 "    Other files at a park ({} parks sampled): {:.0}% at cap, {:.0}% starved, \
                  {:.0}% unreadable",
                 s.censuses,
@@ -5310,7 +5310,7 @@ impl RawExternalSorter {
                 100.0 * s.starved_share,
                 100.0 * s.contended_share
             );
-            debug!(
+            stat!(
                 "    The awaited file: {:.0}% gap-filling, {:.0}% gap-stalled, {:.0}% \
                  decompressing, {:.0}% raw-queued, {:.0}% starved",
                 100.0 * s.awaited.reorder_gap_filling,
@@ -5319,7 +5319,7 @@ impl RawExternalSorter {
                 100.0 * s.awaited.raw_queued,
                 100.0 * s.awaited.starved
             );
-            debug!(
+            stat!(
                 "      -> block not read yet {:.0}%, exists but unclaimed {:.0}%, being produced \
                  {:.0}%",
                 100.0 * s.awaited.starved,
@@ -5328,33 +5328,33 @@ impl RawExternalSorter {
             );
         }
         match classify_stall(park_fraction, utilization, s.contended_share, s.awaited) {
-            StallShape::NotStalled => debug!("    Shape: the consumer is not waiting on blocks"),
-            StallShape::PoolSaturated => debug!(
+            StallShape::NotStalled => stat!("    Shape: the consumer is not waiting on blocks"),
+            StallShape::PoolSaturated => stat!(
                 "    Shape: pool saturated -- the consumer waits because every worker is busy, \
                  which is what a healthy CPU-bound merge looks like. Fewer bytes to compress or \
                  more threads would help; nothing here is misscheduled"
             ),
-            StallShape::HeadOfLine => debug!(
+            StallShape::HeadOfLine => stat!(
                 "    Shape: head-of-line -- the awaited file has nothing anywhere in its \
                  pipeline, so the block has not been read from disk yet. The constraint is \
                  upstream of the pool: storage, or read concurrency"
             ),
-            StallShape::WorkUnclaimed => debug!(
+            StallShape::WorkUnclaimed => stat!(
                 "    Shape: work unclaimed -- the block the consumer needs already exists and no \
                  worker is on it. Capacity is not the problem; scheduling and wake latency are. \
                  Compare the discovery-lag line below"
             ),
-            StallShape::DecompressLatency => debug!(
+            StallShape::DecompressLatency => stat!(
                 "    Shape: decompression latency -- a worker is already producing the needed \
                  block, so the consumer is paying the per-block cost serially. Check the reorder \
                  dwell below before reaching for a deeper cap: if blocks are consumed as fast as \
                  they are inserted, the buffer is not what the pipeline is running into"
             ),
-            StallShape::Contended => debug!(
+            StallShape::Contended => stat!(
                 "    Shape: lock contention -- a large share of file state could not be read \
                  without blocking, so the shares above understate what was available"
             ),
-            StallShape::Mixed => debug!("    Shape: no single candidate dominates"),
+            StallShape::Mixed => stat!("    Shape: no single candidate dominates"),
         }
     }
 
@@ -5599,7 +5599,7 @@ impl RawExternalSorter {
             tree: merge_tree_secs,
         };
         let corrected_sample = raw_sample.corrected(samples_taken, clock_overhead_nanos);
-        info!(
+        stat!(
             "  Consumer sampling: {samples_taken} samples, clock {clock_overhead_nanos}ns per \
              segment; sampled total {:.1}ms -> {:.1}ms after removing measurement overhead \
              (sampled basis, before scaling to the full merge)",

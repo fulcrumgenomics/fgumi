@@ -287,6 +287,14 @@ fgumi group --pipeline-stats --input reads.bam --output grouped.bam
 
 Prints detailed per-step timing, throughput, contention metrics, and per-thread work distribution at completion.
 
+### Sort Statistics
+
+```bash
+fgumi sort --sort-stats --input reads.bam --output sorted.bam
+```
+
+`fgumi sort` has its own engine rather than the shared pipeline, so it carries a dedicated `--sort-stats` flag instead of `--pipeline-stats`. It prints the spill geometry, per-phase timing, the merge's floor (which of consumer serial CPU, worker capacity, or coordination limits the merge, and how much is recoverable), worker utilization, and park attribution — roughly a hundred lines. Off by default; it is instrumentation for performance work, read from a log with a `grep`.
+
 ### Scheduler Strategy
 
 ```bash

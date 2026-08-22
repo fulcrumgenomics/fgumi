@@ -393,6 +393,17 @@ pub struct Sort {
     /// on disk. Prototype flag; defaults to off.
     #[arg(long = "async-reader", default_value_t = false, hide = true)]
     pub async_reader: bool,
+
+    /// Emit the sort's performance diagnostics.
+    ///
+    /// Prints spill geometry, per-phase timing, the merge's floor (which of
+    /// consumer serial CPU, worker capacity, or coordination limits it, and how
+    /// much is recoverable), worker utilization, and park attribution -- roughly
+    /// a hundred lines. Off by default: it is instrumentation for performance
+    /// work, read from a log with a grep, and it buried the handful of lines a
+    /// normal run should show.
+    #[arg(long = "sort-stats", default_value_t = false, hide = true)]
+    pub sort_stats: bool,
 }
 
 /// Environment variable name for the fallback temp-dir list, parsed as a
@@ -459,6 +470,9 @@ pub(crate) fn parse_key_types(s: &str) -> Result<KeyTypesSpec, String> {
 
 impl Command for Sort {
     fn execute(&self, command_line: &str) -> Result<()> {
+        // Set before any sort work begins and never mutated after, which is what
+        // makes the flag's relaxed ordering sufficient.
+        fgumi_sort::set_sort_stats(self.sort_stats);
         if self.verify && self.output.is_some() {
             bail!("--verify cannot be used with --output");
         }
@@ -944,6 +958,23 @@ mod tests {
                 arg.get_id()
             );
         }
+    }
+
+    /// The advanced performance-instrumentation flags are hidden from generated
+    /// help. The performance-tuning guide documents them as available but hidden,
+    /// and surfacing them in `fgumi sort --help` would bury the handful of
+    /// options a normal run cares about. They stay parseable; only their help
+    /// rendering is suppressed.
+    #[rstest]
+    #[case::sort_stats("sort-stats")]
+    #[case::async_reader("async-reader")]
+    fn test_advanced_flags_are_hidden_from_help(#[case] long: &str) {
+        let command = Sort::command();
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some(long))
+            .unwrap_or_else(|| panic!("`--{long}` not found on `fgumi sort`"));
+        assert!(arg.is_hide_set(), "`--{long}` must be hidden from generated help");
     }
 
     // Boolean-flag help is guarded repo-wide in `src/main.rs`'s `mod tests`,
@@ -1552,6 +1583,7 @@ mod tests {
             max_temp_files: MaxTempFiles::Auto,
             write_index: false,
             async_reader: false,
+            sort_stats: false,
         }
     }
 
