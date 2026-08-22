@@ -250,7 +250,7 @@ impl SortPhaseTimer {
         sort_threads: usize,
         merge_threads: usize,
         max_temp_files: usize,
-        phase1: Phase1FloorInputs,
+        phase1: &Phase1FloorInputs,
     ) {
         let overall = self.overall_start.map_or(0.0, |s| s.elapsed().as_secs_f64());
         // Guard against division by zero when sort completes in negligible time.
@@ -314,7 +314,7 @@ impl SortPhaseTimer {
     /// with its main thread 91% busy while 16 cores average 5.3. If that holds
     /// in-process, the binding limit is the ingest thread and no amount of
     /// additional worker capacity moves it.
-    fn log_phase1_floor(&self, phase1: Phase1FloorInputs) {
+    fn log_phase1_floor(&self, phase1: &Phase1FloorInputs) {
         if self.read_secs <= 0.0 {
             return;
         }
@@ -360,7 +360,7 @@ impl SortPhaseTimer {
                 ingest.spill_waits
             );
         }
-        Self::log_reader_partition(phase1.reader);
+        Self::log_reader_partition(&phase1.reader);
         self.log_ingest_partition(phase1);
     }
 
@@ -379,7 +379,7 @@ impl SortPhaseTimer {
     /// only the step total gives a number -- 24.3 us/block on the production
     /// cell -- that is consistent with either being the whole cost.
     #[allow(clippy::cast_precision_loss, reason = "call and byte counts stay below 2^52")]
-    fn log_reader_partition(reader: crate::phase1_stats::ReaderReport) {
+    fn log_reader_partition(reader: &crate::phase1_stats::ReaderReport) {
         if reader.batches == 0 {
             return;
         }
@@ -414,6 +414,26 @@ impl SortPhaseTimer {
             reader.dispatch_secs,
             reader.per_block_micros(reader.dispatch_secs)
         );
+        stat!("    refill latency: {}", reader.refill_latency.summary());
+        // The discriminator. A `read()` that got slower because the thread kept
+        // losing the CPU shows runqueue wait and extra timeslices; one that got
+        // slower because the device or the memory system delivered fewer bytes
+        // per second shows neither, because the thread was blocked on I/O
+        // throughout. Wall-clock timing cannot separate those, and the whole
+        // question of what a busier worker pool does to the reader turns on it.
+        if reader.refill_sched_samples > 0 {
+            stat!(
+                "    refill scheduling: runqueue wait {:.2}s ({:.1}% of refill), on-CPU {:.2}s, \
+                 {} timeslices over {} sampled calls",
+                reader.refill_runqueue_secs,
+                100.0 * reader.refill_runqueue_share(),
+                reader.refill_oncpu_secs,
+                reader.refill_timeslices,
+                reader.refill_sched_samples,
+            );
+        } else {
+            stat!("    refill scheduling: unavailable (needs /proc/thread-self/schedstat)");
+        }
         stat!(
             "    unattributed: {:.1}s ({:.0}% of the step)",
             reader.residual_secs(),
@@ -428,7 +448,7 @@ impl SortPhaseTimer {
     /// correction by the scale factor, which on a 1-in-1021 sample is three
     /// orders of magnitude.
     #[allow(clippy::cast_precision_loss, reason = "record counts stay below 2^52")]
-    fn log_ingest_partition(&self, phase1: Phase1FloorInputs) {
+    fn log_ingest_partition(&self, phase1: &Phase1FloorInputs) {
         if phase1.samples == 0 || phase1.records == 0 {
             return;
         }
@@ -454,16 +474,6 @@ impl SortPhaseTimer {
             partition.park_secs
         );
         stat!(
-            "      extract key:       {:.1}s ({:.0} ns/rec)",
-            segments.key,
-            per_record(segments.key)
-        );
-        stat!(
-            "      verify lanes:      {:.1}s ({:.0} ns/rec)",
-            segments.verify,
-            per_record(segments.verify)
-        );
-        stat!(
             "      push to arena:     {:.1}s ({:.0} ns/rec)",
             segments.push,
             per_record(segments.push)
@@ -478,6 +488,25 @@ impl SortPhaseTimer {
             segments.probe,
             per_record(segments.probe)
         );
+        // Exact, not sampled, and reported outside the partition above: both
+        // costs are per-batch or per-chunk, so the per-record sampler cannot see
+        // them honestly. `dispatch` is what deferral costs the serial thread;
+        // `barrier` is the extraction the pool failed to hide.
+        let census = phase1.key_overlap;
+        if let Some(pct) = census.overlap_percent() {
+            stat!(
+                "    Deferred key extraction: {pct:.1}% overlapped ({} of {} records; \
+                 {} keyed at a barrier)",
+                census.overlapped_records,
+                census.total_records(),
+                census.barrier_records,
+            );
+            stat!(
+                "      dispatch (exact):  {:.1}s      barrier wait (exact): {:.1}s",
+                census.dispatch_secs,
+                census.barrier_secs,
+            );
+        }
         // Signed: a negative residual means the segments over-attribute, which is
         // the failure mode this partition exists to make visible.
         stat!(
@@ -516,6 +545,9 @@ pub(crate) struct Phase1FloorInputs {
     /// this is order-independent -- every sort order reads the same way -- so it
     /// is filled in on all four paths.
     pub(crate) reader: crate::phase1_stats::ReaderReport,
+    /// What deferred key extraction achieved, on the orders that defer it
+    /// (template-coordinate). Default (all zero) elsewhere.
+    pub(crate) key_overlap: crate::phase1_keys::KeyOverlapCensus,
 }
 
 /// Deterministic hasher for cell barcode hashing in template-coordinate sort.
@@ -748,6 +780,15 @@ type RgOrdinalMap = HashMap<Vec<u8>, u32, ahash::RandomState>;
 ///
 /// Pre-computes ordinals by sorting library names alphabetically.
 /// Empty/unknown library sorts first (ordinal 0).
+///
+/// `Clone` is derived so the deferred key-extraction context can own a copy
+/// rather than borrow one, and it is **seed-preserving on purpose**: cloning
+/// `ahash::RandomState` copies its keys rather than drawing new ones, so a clone
+/// hashes read names identically to its original. Anything that reseeded here
+/// would change the template-coordinate sort key and break byte-identity
+/// silently — the output would still be correctly sorted, just not the same
+/// order twice.
+#[derive(Clone)]
 pub struct LibraryLookup {
     /// RG ID -> library ordinal
     rg_to_ordinal: RgOrdinalMap,
@@ -2575,8 +2616,9 @@ pub struct RawExternalSorter {
     /// a modest allocation and let `Vec` grow on demand, while explicit limits
     /// pre-allocate the full budget upfront (preserving prior behavior).
     initial_capacity: Option<usize>,
-    /// When true, wrap input in a `PrefetchReader` for async I/O.
-    async_reader: bool,
+    /// How the input and the merge's spill files are read. See
+    /// `spill_reader` for why more than one stream is needed.
+    read_streams: ReadStreams,
     /// Which optional template-key lanes to retain (template-coordinate only).
     ///
     /// Defaults to [`KeyTypesSpec::Auto`], which provisions the narrowest key
@@ -2684,7 +2726,7 @@ impl RawExternalSorter {
             max_temp_files: crate::fd_limit::FALLBACK_MAX_TEMP_FILES,
             cell_tag: None,
             initial_capacity: None,
-            async_reader: false,
+            read_streams: ReadStreams::default(),
             key_types: KeyTypesSpec::default(),
         }
     }
@@ -2888,13 +2930,10 @@ impl RawExternalSorter {
         self
     }
 
-    /// Enable/disable the async prefetch reader on input.
-    ///
-    /// When enabled, the input BAM is wrapped in a `PrefetchReader` before the
-    /// BGZF layer, which overlaps block I/O with decompression.
+    /// How to read the input and the merge's spill files.
     #[must_use]
-    pub fn async_reader(mut self, enabled: bool) -> Self {
-        self.async_reader = enabled;
+    pub fn read_streams(mut self, streams: ReadStreams) -> Self {
+        self.read_streams = streams;
         self
     }
 
@@ -3124,7 +3163,7 @@ impl RawExternalSorter {
         );
         let (record_source, header) = {
             let (reader, header) =
-                create_raw_bam_reader_pool_integrated(input, &pool, self.async_reader)?;
+                create_raw_bam_reader_pool_integrated(input, &pool, self.read_streams)?;
             (RecordSource::direct(reader), header)
         };
 
@@ -3202,12 +3241,13 @@ impl RawExternalSorter {
 
         // One worker pool spans both phases, so size it to the wider of the two
         // and cap the active count per phase via `set_active_workers`.
-        let pool = SortWorkerPool::new(
+        let mut pool = SortWorkerPool::new(
             self.phase1_threads().max(self.phase2_threads()),
             self.temp_compression,
             self.output_compression,
             self.spill_codec,
         );
+        pool.read_streams = self.read_streams;
         // Phase 1 runs first; the merge raises this to `phase2_threads()`.
         pool.set_active_workers(self.phase1_threads());
         Ok(Arc::new(pool))
@@ -3648,7 +3688,9 @@ impl RawExternalSorter {
                     },
                 )?);
 
-                buffer.clear();
+                // Keep the arena's pages mapped for the next chunk; `clear` would
+                // hand them back and cost a minor fault per page on the refill.
+                buffer.reset_for_reuse();
                 force_mi_collect();
                 probe.post_spill(Some(pool.phase1_queue_depths()));
                 timer.begin_read_span();
@@ -3752,7 +3794,7 @@ impl RawExternalSorter {
             self.phase1_threads(),
             self.phase2_threads(),
             self.max_temp_files,
-            phase1_floor,
+            &phase1_floor,
         );
         debug!("Sort complete: {} records processed", stats.total_records);
 
@@ -3859,7 +3901,9 @@ impl RawExternalSorter {
                     },
                 )?);
 
-                buffer.clear();
+                // Keep the arena's pages mapped for the next chunk; `clear` would
+                // hand them back and cost a minor fault per page on the refill.
+                buffer.reset_for_reuse();
                 force_mi_collect();
                 probe.post_spill(Some(pool.phase1_queue_depths()));
                 timer.begin_read_span();
@@ -3974,7 +4018,7 @@ impl RawExternalSorter {
             self.phase1_threads(),
             self.phase2_threads(),
             self.max_temp_files,
-            phase1_floor,
+            &phase1_floor,
         );
         debug!("Sort complete: {} records processed", stats.total_records);
 
@@ -4272,7 +4316,7 @@ impl RawExternalSorter {
             self.phase1_threads(),
             self.phase2_threads(),
             self.max_temp_files,
-            phase1_floor,
+            &phase1_floor,
         );
         debug!("Sort complete: {} records processed", stats.total_records);
 
@@ -4442,24 +4486,31 @@ impl RawExternalSorter {
         debug!("Phase 1: Reading and sorting chunks (inline buffer)...");
         let mut probe = SpillProbe::new("phase1");
 
-        // Process the captured first record before draining the rest: extract its
-        // full key, verify the dropped lanes match `first` (trivially true for the
-        // first record itself), and push the narrowed key. A single record cannot
-        // exceed the memory limit, so no spill check is needed here.
+        // Key extraction runs on the pool, not here: at 120 ns/record it was the
+        // single largest cost on this thread (93.6s of a 137.5s ingest against a
+        // 145.4s read span), and it has no ordering requirement. The ingest
+        // thread now pushes bytes and hands out batches; `deferred` cuts them,
+        // the pool runs them, and the keys are spliced back before any sort.
+        let mut deferred = crate::phase1_keys::DeferredKeys::<K>::new(
+            Arc::new(crate::phase1_keys::KeyContext {
+                lib_lookup: lib_lookup.clone(),
+                cell_tag: self.cell_tag,
+                cb_hasher: cb_hasher.clone(),
+                first_key: first,
+                variant,
+            }),
+            self.phase1_threads(),
+        );
+
+        // Process the captured first record before draining the rest. Its key is
+        // deferred like every other record's, including the dropped-lane verify
+        // (trivially satisfied for the first record, since it *is* the baseline).
+        // A single record cannot exceed the memory limit, so no spill check is
+        // needed here.
         if let Some(record) = first_record {
             stats.total_records += 1;
             progress_batch.tick(&progress);
-
-            let bam_bytes = record.as_ref();
-            let full = extract_template_key_inline(bam_bytes, lib_lookup, self.cell_tag, cb_hasher);
-            if let Some(violation) = verify_dropped_lanes(&first, &full, variant) {
-                let name = String::from_utf8_lossy(
-                    fgumi_raw_bam::RawRecordView::new(bam_bytes).read_name(),
-                )
-                .into_owned();
-                return Err(dropped_lane_error(&name, violation));
-            }
-            buffer.push(bam_bytes, K::from_full(&full))?;
+            deferred.push(&mut buffer, &pool, record.as_ref())?;
         }
 
         // Sub-phase timing for the ingest thread's serial CPU, which the floor
@@ -4502,35 +4553,24 @@ impl RawExternalSorter {
                 ingest_raw.tick += t0.elapsed().as_secs_f64();
             }
 
-            // Extract the full template key, verify the lanes the chosen variant
-            // dropped are constant relative to the first record, then push the
-            // narrowed key.
+            // Push the bytes and get a key onto them. With workers to spare the
+            // key is extracted on the pool and spliced in before anything sorts
+            // this buffer; with a single worker it is extracted right here, as
+            // it always was. `push` therefore covers extraction on the
+            // single-worker path and not on the deferred one -- read it against
+            // the deferred-extraction census below, not on its own.
             let t = sample_this.then(Instant::now);
-            let full = extract_template_key_inline(bam_bytes, lib_lookup, self.cell_tag, cb_hasher);
-            if let Some(t0) = t {
-                ingest_raw.key += t0.elapsed().as_secs_f64();
-            }
-            let t = sample_this.then(Instant::now);
-            let violation = verify_dropped_lanes(&first, &full, variant);
-            if let Some(t0) = t {
-                ingest_raw.verify += t0.elapsed().as_secs_f64();
-            }
-            if let Some(violation) = violation {
-                let name = String::from_utf8_lossy(
-                    fgumi_raw_bam::RawRecordView::new(bam_bytes).read_name(),
-                )
-                .into_owned();
-                return Err(dropped_lane_error(&name, violation));
-            }
-            let t = sample_this.then(Instant::now);
-            buffer.push(bam_bytes, K::from_full(&full))?;
+            deferred.push(&mut buffer, &pool, bam_bytes)?;
             if let Some(t0) = t {
                 ingest_raw.push += t0.elapsed().as_secs_f64();
             }
 
             let t = sample_this.then(Instant::now);
             let should_probe = probe.should_sample_read(stats.total_records);
-            let over_limit = buffer.memory_usage() >= self.memory_limit;
+            // Records whose keys are still in flight are charged here, so a
+            // lagging pool cannot let the buffer overrun the memory limit.
+            let over_limit =
+                buffer.memory_usage() + deferred.in_flight_bytes() >= self.memory_limit;
             if let Some(t0) = t {
                 ingest_raw.probe += t0.elapsed().as_secs_f64();
             }
@@ -4540,6 +4580,16 @@ impl RawExternalSorter {
 
             // Check memory usage
             if over_limit {
+                // Finish the chunk's keys *inside* the read span. This is ingest
+                // work for records already read, and accounting it to the spill
+                // region instead would let a pool that never keeps up still
+                // report a shorter read span -- the one way this change could
+                // look successful while doing nothing.
+                let violation = deferred.finish(&mut buffer, &pool)?;
+                if let Some(v) = violation {
+                    return Err(dropped_lane_error(&v.name, v.violation));
+                }
+
                 timer.end_read_span();
                 let bstats = probe_stats(&buffer);
                 let depths = Some(pool.phase1_queue_depths());
@@ -4577,14 +4627,38 @@ impl RawExternalSorter {
                     },
                 )?);
 
-                buffer.clear();
+                // Keep the arena's pages mapped for the next chunk; `clear` would
+                // hand them back and cost a minor fault per page on the refill.
+                buffer.reset_for_reuse();
+                deferred.reset();
                 force_mi_collect();
                 probe.post_spill(Some(pool.phase1_queue_depths()));
                 timer.begin_read_span();
             }
         }
 
+        // Drain the tail before closing the read span: the records still held in
+        // the live arena segment have no keys yet, and everything below this
+        // point either sorts or spills the buffer.
+        //
+        // Inside the span on purpose. This is ingest work for records already
+        // read, and the read span is the number this whole change is trying to
+        // move -- excluding the drain would let a pool that never kept up still
+        // report a shorter span, which is the one way this optimization could
+        // look successful while doing nothing.
+        let violation = deferred.finish(&mut buffer, &pool)?;
+
+        // Ingest is over, so the arena segments held for the next chunk have no
+        // next chunk. Holding them through the merge costs peak RSS and buys
+        // nothing.
+        buffer.release_retained();
+
         timer.end_read_span();
+
+        if let Some(v) = violation {
+            return Err(dropped_lane_error(&v.name, v.violation));
+        }
+
         progress_batch.flush(&progress);
         progress.log_final();
         if let Some(err) = record_source.take_error() {
@@ -4611,6 +4685,7 @@ impl RawExternalSorter {
             threads: self.phase1_threads(),
             ingest: pool.phase1_ingest_stats().snapshot(),
             reader: pool.phase1_reader_report(),
+            key_overlap: deferred.overlap_census(),
             sample: ingest_raw,
             samples: ingest_samples,
             records: stats.total_records,
@@ -4680,7 +4755,7 @@ impl RawExternalSorter {
             self.phase1_threads(),
             self.phase2_threads(),
             self.max_temp_files,
-            phase1_floor,
+            &phase1_floor,
         );
         debug!("Sort complete: {} records processed", stats.total_records);
 
@@ -6442,16 +6517,104 @@ pub(crate) use crate::SortStats as RawSortStats;
 // rather than in `fgumi-bam-io`.
 // ============================================================================
 
+/// How many concurrent streams to read a file with.
+///
+/// `Auto` starts at one and grows only when fills are demonstrably occupying
+/// the span (see `spill_reader`); a fixed value pins it. One measured
+/// device wants four and another wants one, and the difference is 28% on the
+/// first and -1.8% on the second, which is why the default measures rather
+/// than guesses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadStreams {
+    /// Measure and grow. The default.
+    #[default]
+    Auto,
+    /// Exactly this many; `1` is the plain sequential reader.
+    Fixed(usize),
+}
+
+impl std::fmt::Display for ReadStreams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Fixed(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+impl ReadStreams {
+    /// Whether this asks for the plain sequential reader, which is what every
+    /// phase did before scattered reads existed.
+    #[must_use]
+    pub fn is_sequential(self) -> bool {
+        matches!(self, Self::Fixed(1))
+    }
+
+    /// Streams to start with. `Auto` starts at one and grows from what it
+    /// measures, so it costs nothing until it has evidence.
+    #[must_use]
+    pub fn initial(self) -> usize {
+        match self {
+            Self::Auto => 1,
+            Self::Fixed(n) => n.max(1),
+        }
+    }
+
+    /// Whether the reader should tune itself as it goes.
+    #[must_use]
+    pub fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+impl std::str::FromStr for ReadStreams {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        match text.parse::<usize>() {
+            Ok(0) => Err("--read-streams must be `auto` or at least 1".to_string()),
+            Ok(n) => Ok(Self::Fixed(n)),
+            Err(_) => Err(format!("expected `auto` or a positive number, got `{text}`")),
+        }
+    }
+}
+
+/// Fills the phase-1 input reader keeps in flight ahead of the framer.
+///
+/// One, and deeper does not help. Swept in a single boot on
+/// `1kg-wgs-HG00096` (t16, 4 streams), read span against total wall:
+///
+/// | depth | read span | wall |
+/// | --- | --- | --- |
+/// | 0 | 69.4s | 271.8s |
+/// | 1 | 66.9s | 267.7s |
+/// | 2 | 66.7s | 269.4s |
+/// | 4 | 66.4s | 268.5s |
+///
+/// Depths 2 and 4 move the span by less than a second and the wall clock not
+/// at all -- all three sit inside the +/-0.7% in-boot noise floor -- and depth
+/// 2 cost 277 MB of peak RSS for it. One is enough because the span is not
+/// fetch-bound: the fetch runs at 1327 MB/s and takes 32.5s of a 66.4s span
+/// against an ingest-serial floor of 53.0s, so what is left is coordination
+/// between the reader, the decompress workers and the ingest thread, which no
+/// amount of read-ahead touches.
+///
+/// Costs `(n + 1) * FILL_BYTES` of buffers on one reader, which is also why
+/// the merge's spill readers -- there are K of them, and the merge is already
+/// at its consumer-serial floor -- get none.
+const PHASE1_LOOKAHEAD_FILLS: usize = 1;
+
 /// Create a raw BAM reader using the pool's Phase 1 integrated reading.
 ///
 /// Workers in the pool do `ReadInputBlocks` + `DecompressInput`. The main
 /// thread consumes decompressed bytes via `PooledInputStream`.
 ///
-/// When `async_reader` is false, no extra threads are spawned: the pool's
-/// block reader reads directly from the input file. When `async_reader` is
-/// true, the input file is wrapped in a `PrefetchReader`, which spawns one
-/// dedicated OS thread (`fgumi-prefetch`) that reads raw bytes ahead into a
-/// bounded queue so the pool's block reader never blocks on disk I/O.
+/// No extra threads are spawned either way: with one stream the pool's block
+/// reader reads directly from the input file, and with several it offers byte
+/// slices to the pool (see `spill_reader`).
 ///
 /// # Flow
 ///
@@ -6469,58 +6632,84 @@ pub(crate) use crate::SortStats as RawSortStats;
 fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
     path: P,
     pool: &Arc<SortWorkerPool>,
-    async_reader: bool,
+    read_streams: ReadStreams,
 ) -> Result<(fgumi_raw_bam::RawBamReader<PooledInputStream>, Header)> {
     use crate::worker_pool::phase;
     use std::io;
 
     let path_ref = path.as_ref();
 
-    // Times the reads that refill the buffer below. Only the synchronous paths
-    // are wrapped: `--async-reader` moves the read onto a prefetch thread, so
-    // the reader step no longer pays for it and there is nothing on this thread
-    // to separate from framing. A zero refill row on an async run is that, not a
-    // measurement failure.
+    // Times the reads that refill the buffer below, so that `framing_secs` --
+    // time inside `read_raw_blocks` that was *not* spent fetching -- means what
+    // it says. Both arms report into it: the sequential one through
+    // `TimedReader`, the scattered one by timing its own fills. Leaving the
+    // scattered arm out booked its fill waits as framing and showed 10.9
+    // us/block against a true 0.9.
     let reader_stats = pool.reader_stats();
 
     let opened: Box<dyn io::Read + Send> = if is_stdin_path(path_ref) {
-        if async_reader {
-            // `--async-reader` is about decoupling the read from the block
-            // reader, which stdin needs at least as much as a file does: the
-            // prefetch thread also subsumes the buffering below, reading ahead
-            // in chunks into a bounded queue.
-            log::debug!("async sort reader enabled: spawning fgumi-prefetch thread for stdin");
-            Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::new(io::stdin()))
-        } else {
-            // `io::Stdin` re-acquires a mutex and reads through an 8 KiB buffer
-            // on every call; the pool's block reader wants far bigger gulps than
-            // that, so give the stdin path the same 2 MiB buffer the file path
-            // gets.
-            Box::new(io::BufReader::with_capacity(
-                SORT_INPUT_BUFFER_SIZE,
-                crate::phase1_stats::TimedReader::new(io::stdin(), reader_stats),
-            ))
-        }
+        // `io::Stdin` re-acquires a mutex and reads through an 8 KiB buffer on
+        // every call; the pool's block reader wants far bigger gulps than that,
+        // so give the stdin path the same 2 MiB buffer the file path gets.
+        // Scattered reads are not available here -- a pipe has no offsets.
+        Box::new(io::BufReader::with_capacity(
+            SORT_INPUT_BUFFER_SIZE,
+            crate::phase1_stats::TimedReader::new(io::stdin(), reader_stats),
+        ))
     } else {
         let file = std::fs::File::open(path_ref)
             .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
 
-        // Grow the per-fd readahead window. This is the plain sequential hint
-        // and applies however the bytes are subsequently read; the WILLNEED
-        // hints that `PrefetchReader` issues are a separate, async-only extra.
+        // Grow the per-fd readahead window. Measured worth almost nothing on
+        // its own (359 MB/s against 360 with no hint), but it is free and
+        // applies however the bytes are subsequently read.
         fgumi_bam_io::os_hints::advise_sequential(&file);
 
-        if async_reader {
-            log::debug!(
-                "async sort reader enabled: spawning fgumi-prefetch thread for {}",
-                path_ref.display()
-            );
-            Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file))
-        } else {
+        if read_streams.is_sequential() {
+            // `--read-streams 1`: the plain buffered reader every phase used
+            // before scattered reads existed.
             Box::new(io::BufReader::with_capacity(
                 SORT_INPUT_BUFFER_SIZE,
                 crate::phase1_stats::TimedReader::new(file, reader_stats),
             ))
+        } else {
+            // Scattered positional reads, the same mechanism the merge uses on
+            // spill files: slices are offered to the pool so the device sees
+            // real queue depth, which one blocking `read()` cannot produce
+            // however large its buffer. The framer downstream is unchanged --
+            // this still presents a sequential `Read`.
+            //
+            // Only reachable on a real file: stdin and other non-seekable inputs
+            // take the branch above, where positional reads do not exist.
+            match crate::spill_reader::ScatterReader::for_streams(
+                file,
+                0,
+                read_streams,
+                Some(pool.fetch_queue()),
+            )
+            .map(|reader| {
+                reader.timed(Arc::clone(&reader_stats)).looking_ahead(PHASE1_LOOKAHEAD_FILLS)
+            }) {
+                Ok(reader) => {
+                    log::debug!(
+                        "scattered sort reader: {read_streams} over {}",
+                        path_ref.display()
+                    );
+                    Box::new(reader)
+                }
+                Err(e) => {
+                    // A file whose length we cannot read is one we cannot slice.
+                    // Fall back rather than fail a sort over a prefetch tweak.
+                    log::warn!("scattered sort reader unavailable ({e}); using one stream");
+                    let file = std::fs::File::open(path_ref).with_context(|| {
+                        format!("Failed to reopen input BAM: {}", path_ref.display())
+                    })?;
+                    Box::new(io::BufReader::with_capacity(
+                        SORT_INPUT_BUFFER_SIZE,
+                        crate::phase1_stats::TimedReader::new(file, reader_stats),
+                    ))
+                }
+            }
         }
     };
 
@@ -6738,7 +6927,7 @@ pub fn verify_dropped_lanes(
 }
 
 /// Build the actionable error message for a dropped-lane violation.
-fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow::Error {
+pub(crate) fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow::Error {
     let field = match v {
         DroppedLaneViolation::Cb => "CB",
         DroppedLaneViolation::Mi => "MI",
@@ -9705,7 +9894,7 @@ mod tests {
 
         // log_summary must not panic (output goes to log sink). `consolidate_count`
         // is 1 here, so the consolidation branch is exercised too.
-        timer.log_summary(4, 4, 64, Phase1FloorInputs::default());
+        timer.log_summary(4, 4, 64, &Phase1FloorInputs::default());
     }
 
     // ========================================================================

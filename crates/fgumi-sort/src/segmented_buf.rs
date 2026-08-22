@@ -9,6 +9,8 @@
 //! Designed as a drop-in replacement for `Vec<u8>` in the sort buffer, where
 //! records are appended sequentially and later accessed by `(offset, len)`.
 
+use std::sync::Arc;
+
 /// Default segment size: 256 MiB.
 const DEFAULT_SEGMENT_SIZE: usize = 256 * 1024 * 1024;
 
@@ -23,8 +25,26 @@ const DEFAULT_SEGMENT_SIZE: usize = 256 * 1024 * 1024;
 pub struct SegmentedBuf {
     /// The fixed capacity of each segment.
     segment_size: usize,
-    /// Backing storage: one `Vec<u8>` per segment, each with capacity `segment_size`.
-    segments: Vec<Vec<u8>>,
+    /// Segments that are complete and will never be appended to again.
+    ///
+    /// Held behind `Arc` so a reader can be handed one segment while the writer
+    /// keeps appending to [`current`](Self::current). Splitting the finished
+    /// segments from the live one is what makes that safe *by construction*
+    /// rather than by asserting that a `Vec<Vec<u8>>` will not reallocate: the
+    /// writer never names a sealed segment again, so no `&mut` can alias the
+    /// `&` a reader holds.
+    sealed: Vec<Arc<Vec<u8>>>,
+    /// The segment currently being appended to, with capacity `segment_size`
+    /// (the first may be smaller — see [`with_capacity`](Self::with_capacity)).
+    current: Vec<u8>,
+    /// Segment allocations reclaimed by [`reset_for_reuse`](Self::reset_for_reuse),
+    /// waiting to be used again.
+    ///
+    /// This is the whole point of `reset_for_reuse`: keeping the pages mapped
+    /// across a fill→spill→reset cycle instead of returning them to the
+    /// allocator, which returns them to the OS, which makes the next chunk fault
+    /// every page back in one at a time.
+    free: Vec<Vec<u8>>,
     /// Total bytes stored across all segments.
     total_len: usize,
 }
@@ -43,9 +63,13 @@ impl SegmentedBuf {
         // re-allocations as the buffer grows.
         let first_cap = capacity.min(segment_size);
         let estimated_segments = (capacity / segment_size).max(1);
-        let mut segments = Vec::with_capacity(estimated_segments);
-        segments.push(Vec::with_capacity(first_cap));
-        Self { segment_size, segments, total_len: 0 }
+        Self {
+            segment_size,
+            sealed: Vec::with_capacity(estimated_segments),
+            current: Vec::with_capacity(first_cap),
+            free: Vec::new(),
+            total_len: 0,
+        }
     }
 
     /// Create a new buffer with a default segment size of 256 MiB.
@@ -76,18 +100,12 @@ impl SegmentedBuf {
             self.segment_size,
         );
 
-        let seg = self.segments.last().expect("segments is never empty");
-        if seg.len() + data.len() > self.segment_size {
-            // Pad total_len to the next segment boundary so locate() works.
-            let remainder = self.total_len % self.segment_size;
-            if remainder > 0 {
-                self.total_len += self.segment_size - remainder;
-            }
-            self.segments.push(Vec::with_capacity(self.segment_size));
+        if self.current.len() + data.len() > self.segment_size {
+            self.advance_segment();
         }
 
         let offset = self.total_len;
-        self.segments.last_mut().expect("segments is never empty").extend_from_slice(data);
+        self.current.extend_from_slice(data);
         self.total_len += data.len();
         offset
     }
@@ -112,13 +130,8 @@ impl SegmentedBuf {
             self.segment_size,
         );
 
-        let seg = self.segments.last().expect("segments is never empty");
-        if seg.len() + additional > self.segment_size {
-            let remainder = self.total_len % self.segment_size;
-            if remainder > 0 {
-                self.total_len += self.segment_size - remainder;
-            }
-            self.segments.push(Vec::with_capacity(self.segment_size));
+        if self.current.len() + additional > self.segment_size {
+            self.advance_segment();
         }
         self.total_len
     }
@@ -134,10 +147,10 @@ impl SegmentedBuf {
     #[inline]
     pub fn extend_in_place(&mut self, data: &[u8]) {
         debug_assert!(
-            self.segments.last().is_some_and(|s| s.len() + data.len() <= self.segment_size),
+            self.current.len() + data.len() <= self.segment_size,
             "extend_in_place exceeds segment capacity; use reserve_contiguous first"
         );
-        self.segments.last_mut().expect("segments is never empty").extend_from_slice(data);
+        self.current.extend_from_slice(data);
         self.total_len += data.len();
     }
 
@@ -168,7 +181,8 @@ impl SegmentedBuf {
     #[must_use]
     pub fn slice(&self, offset: usize, len: usize) -> &[u8] {
         let (seg_idx, seg_offset) = self.locate(offset);
-        let seg = &self.segments[seg_idx];
+        let seg: &[u8] =
+            if seg_idx == self.sealed.len() { &self.current } else { &self.sealed[seg_idx] };
         assert!(
             seg_offset + len <= seg.len(),
             "slice ({offset}..{}) spans segment boundary (seg {seg_idx}, seg_offset {seg_offset}, seg_len {})",
@@ -181,20 +195,120 @@ impl SegmentedBuf {
     /// Total allocated capacity in bytes across all segments.
     #[must_use]
     pub fn allocated_capacity(&self) -> usize {
-        self.segments.iter().map(Vec::capacity).sum()
+        self.sealed.iter().map(|s| s.capacity()).sum::<usize>()
+            + self.free.iter().map(Vec::capacity).sum::<usize>()
+            + self.current.capacity()
     }
 
-    /// Number of allocated segments.
+    /// Give back every retained segment allocation.
+    ///
+    /// Call once ingest is done. [`reset_for_reuse`](Self::reset_for_reuse)
+    /// keeps segments mapped so the *next* chunk does not re-fault them, but
+    /// after the last chunk there is no next fill and holding them just carries
+    /// the arena's peak footprint through the merge — measured at +1.68 GB of
+    /// peak RSS on the production cell, for no benefit.
+    pub fn release_retained(&mut self) {
+        self.free = Vec::new();
+    }
+
+    /// Segment allocations held for reuse but not currently part of the buffer.
+    #[must_use]
+    pub fn retained_segments(&self) -> usize {
+        self.free.len()
+    }
+
+    /// Empty the buffer **keeping every segment allocation** for the next fill.
+    ///
+    /// The counterpart to [`clear`](Self::clear), and the one a sort should use
+    /// between chunks. `clear` drops the sealed segments, which hands their
+    /// pages to the allocator and ultimately back to the OS; the next chunk then
+    /// takes a minor fault on every page it touches again. Measured on the
+    /// production cell (780M records, 44 chunks, ~8 GB of arena per chunk):
+    /// **25.9M minor faults** and ~25s of wall clock with `clear`, against
+    /// **18k faults** when the pages are simply kept.
+    ///
+    /// A segment a reader still holds cannot be reclaimed — its `Arc` is
+    /// dropped instead and the next fill allocates a replacement. That is a
+    /// correctness requirement, not an optimization: reusing storage a
+    /// key-extraction batch was still reading would overwrite its records
+    /// mid-flight.
+    pub fn reset_for_reuse(&mut self) {
+        for segment in std::mem::take(&mut self.sealed) {
+            if let Ok(mut owned) = Arc::try_unwrap(segment) {
+                owned.clear();
+                self.free.push(owned);
+            }
+        }
+        self.current.clear();
+        self.total_len = 0;
+    }
+
+    /// Number of allocated segments, sealed plus the one being appended to.
     #[must_use]
     pub fn num_segments(&self) -> usize {
-        self.segments.len()
+        self.sealed.len() + 1
     }
 
-    /// Clear all data, retaining the first segment's allocation.
+    /// Number of sealed segments — those that will never be appended to again.
+    ///
+    /// Segment indices `0..sealed_len()` are stable and shareable; index
+    /// `sealed_len()` is the live segment and is not.
+    #[must_use]
+    pub fn sealed_len(&self) -> usize {
+        self.sealed.len()
+    }
+
+    /// A shared handle to sealed segment `idx`, or `None` if `idx` is the live
+    /// segment (or past the end).
+    ///
+    /// The returned handle stays valid and byte-stable for as long as it is
+    /// held, including across [`clear`](Self::clear) — which is what lets a
+    /// worker read record bytes out of it while the writer fills later segments.
+    #[must_use]
+    pub fn sealed_segment(&self, idx: usize) -> Option<Arc<Vec<u8>>> {
+        self.sealed.get(idx).map(Arc::clone)
+    }
+
+    /// Clear all data, retaining the live segment's allocation.
+    ///
+    /// Sealed segments are released here. A handle handed out by
+    /// [`sealed_segment`](Self::sealed_segment) keeps its own segment alive
+    /// past this call, so the storage is freed when the last reader drops it
+    /// rather than while it is still being read.
     pub fn clear(&mut self) {
-        self.segments.truncate(1);
-        self.segments[0].clear();
+        self.sealed.clear();
+        self.free.clear();
+        self.current.clear();
         self.total_len = 0;
+    }
+
+    /// Seal the live segment so its bytes can be shared, if it holds anything.
+    ///
+    /// A no-op on an empty live segment, so calling it twice does not push an
+    /// empty segment or open a spurious gap. The writer's next append starts a
+    /// fresh segment, which wastes the tail of the sealed one — acceptable only
+    /// because the caller (the ingest thread's chunk barrier) is about to
+    /// [`clear`](Self::clear) the whole buffer anyway.
+    pub fn seal_current(&mut self) {
+        if !self.current.is_empty() {
+            self.advance_segment();
+        }
+    }
+
+    /// Seal the live segment and start a fresh one.
+    ///
+    /// Pads `total_len` to the next segment boundary first, so
+    /// [`locate`](Self::locate)'s division arithmetic stays exact.
+    fn advance_segment(&mut self) {
+        let remainder = self.total_len % self.segment_size;
+        if remainder > 0 {
+            self.total_len += self.segment_size - remainder;
+        }
+        // Reuse a retained allocation when there is one; only ask the OS for
+        // fresh pages when there is not.
+        let next = self.free.pop().unwrap_or_else(|| Vec::with_capacity(self.segment_size));
+        let filled = std::mem::replace(&mut self.current, next);
+        self.sealed.push(Arc::new(filled));
     }
 
     /// Translate a global byte offset to `(segment_index, offset_within_segment)`.
@@ -210,9 +324,9 @@ impl SegmentedBuf {
         let seg_idx = offset / self.segment_size;
         let seg_offset = offset % self.segment_size;
         debug_assert!(
-            seg_idx < self.segments.len(),
+            seg_idx <= self.sealed.len(),
             "locate({offset}): seg_idx {seg_idx} out of bounds (len {})",
-            self.segments.len()
+            self.sealed.len() + 1
         );
         (seg_idx, seg_offset)
     }
@@ -304,6 +418,98 @@ mod tests {
 
         assert_eq!(buf.slice(o1, 7), b"1234567");
         assert_eq!(buf.slice(o2, 5), b"abcde");
+    }
+
+    #[test]
+    fn test_reset_for_reuse_keeps_the_segment_allocations() {
+        // The whole point: a sort cycles fill -> spill -> reset once per chunk,
+        // and dropping the segments each time hands their pages back to the
+        // allocator, which returns them to the OS. The next chunk then faults
+        // every page back in. Measured on the production cell: 25.9M minor
+        // faults and ~25s of wall clock, against 18k faults when the pages are
+        // simply kept.
+        let mut buf = SegmentedBuf::with_capacity(0, 10);
+        for _ in 0..4 {
+            buf.extend_from_slice(b"0123456789");
+        }
+        let segments_before = buf.num_segments();
+        let capacity_before = buf.allocated_capacity();
+        assert!(segments_before >= 4, "fixture must span several segments");
+
+        buf.reset_for_reuse();
+
+        assert_eq!(buf.len(), 0, "the buffer is logically empty");
+        assert_eq!(
+            buf.allocated_capacity(),
+            capacity_before,
+            "reset must not give the allocations back",
+        );
+        assert_eq!(
+            buf.retained_segments(),
+            segments_before - 1,
+            "every sealed segment is retained for the next fill",
+        );
+
+        // Refilling consumes the retained segments rather than allocating.
+        for _ in 0..4 {
+            buf.extend_from_slice(b"0123456789");
+        }
+        assert_eq!(buf.retained_segments(), 0, "the refill reused them");
+        assert_eq!(buf.allocated_capacity(), capacity_before, "and allocated nothing new");
+        assert_eq!(buf.slice(0, 10), b"0123456789", "and the data is correct");
+    }
+
+    #[test]
+    fn test_reset_for_reuse_lets_go_of_a_segment_a_reader_still_holds() {
+        // A reclaimed segment must be exclusively owned. A key-extraction batch
+        // that outlived its chunk would otherwise have its bytes overwritten by
+        // the next chunk's records while it read them.
+        let mut buf = SegmentedBuf::with_capacity(0, 10);
+        buf.extend_from_slice(b"0123456789");
+        buf.extend_from_slice(b"abcde");
+        let held = buf.sealed_segment(0).expect("segment 0 is sealed");
+
+        buf.reset_for_reuse();
+
+        assert_eq!(buf.retained_segments(), 0, "the held segment cannot be reused");
+        assert_eq!(&held[..], b"0123456789", "and the reader still sees its bytes");
+    }
+
+    #[test]
+    fn test_a_segment_seals_only_once_a_later_one_starts() {
+        let mut buf = SegmentedBuf::with_capacity(0, 10);
+        buf.extend_from_slice(b"0123456789");
+
+        // The segment being appended to is never sealed: a worker handed it
+        // could observe a partial write, and the ingest thread still owns it.
+        assert_eq!(buf.sealed_len(), 0);
+        assert!(buf.sealed_segment(0).is_none());
+
+        // Starting segment 1 seals segment 0.
+        buf.extend_from_slice(b"abcde");
+        assert_eq!(buf.sealed_len(), 1);
+        assert_eq!(&buf.sealed_segment(0).expect("segment 0 is sealed")[..], b"0123456789");
+        assert!(buf.sealed_segment(1).is_none(), "the live segment is not sealed");
+    }
+
+    #[test]
+    fn test_a_sealed_segment_is_readable_while_later_segments_are_written() {
+        // The invariant the parallel key-extraction path rests on: a handle to a
+        // sealed segment stays valid and byte-stable no matter how much is
+        // appended afterwards. Without it, a worker reading record bytes races
+        // the ingest thread's growth.
+        let mut buf = SegmentedBuf::with_capacity(0, 10);
+        buf.extend_from_slice(b"0123456789");
+        buf.extend_from_slice(b"abcde");
+
+        let held = buf.sealed_segment(0).expect("segment 0 is sealed");
+
+        // Fill several more segments; segment 0's bytes must not move or change.
+        for _ in 0..4 {
+            buf.extend_from_slice(b"0123456789");
+        }
+        assert_eq!(&held[..], b"0123456789");
+        assert!(buf.num_segments() >= 5);
     }
 
     #[test]

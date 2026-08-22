@@ -130,6 +130,12 @@ pub(crate) const INGEST_SAMPLE_INTERVAL: u64 = 1021;
 
 /// Where the ingest thread's serial CPU goes, per record.
 ///
+/// **Per-record segments only.** Deferred key extraction is deliberately absent:
+/// its costs are per-*batch* and per-*chunk*, not per-record, so sampling one
+/// record in [`INGEST_SAMPLE_INTERVAL`] and scaling would be measuring a rare
+/// event with a method built for a uniform one. Those two are timed exactly
+/// instead and reported beside this partition, the same way `park_secs` is.
+///
 /// The floor line says this thread *is* the limit -- on a 16-thread whole-genome
 /// sort it is 137.2s of a 145.7s read span, against a worker-capacity floor of
 /// 22.4s -- so the only question left is what the 137.2s is made of. Nothing else
@@ -155,10 +161,6 @@ pub(crate) struct IngestSample {
     /// **Includes park time**, so it is not pure CPU -- `park_secs` measures that
     /// part exactly and separately.
     pub(crate) fetch: f64,
-    /// Extracting the sort key from the record bytes.
-    pub(crate) key: f64,
-    /// Verifying that the lanes the chosen key variant drops are constant.
-    pub(crate) verify: f64,
     /// Copying the record into the arena and appending its ref.
     pub(crate) push: f64,
     /// Counting the record toward the progress log.
@@ -173,8 +175,6 @@ impl IngestSample {
     pub(crate) fn scaled(self, scale: f64) -> Self {
         Self {
             fetch: self.fetch * scale,
-            key: self.key * scale,
-            verify: self.verify * scale,
             push: self.push * scale,
             tick: self.tick * scale,
             probe: self.probe * scale,
@@ -197,8 +197,6 @@ impl IngestSample {
         let fix = |v: f64| (v - per_segment).max(0.0);
         Self {
             fetch: fix(self.fetch),
-            key: fix(self.key),
-            verify: fix(self.verify),
             push: fix(self.push),
             tick: fix(self.tick),
             probe: fix(self.probe),
@@ -208,7 +206,7 @@ impl IngestSample {
     /// The six segments summed.
     #[must_use]
     pub(crate) fn total(self) -> f64 {
-        self.fetch + self.key + self.verify + self.push + self.tick + self.probe
+        self.fetch + self.push + self.tick + self.probe
     }
 }
 
@@ -273,6 +271,46 @@ impl IngestPartition {
 /// ~30 ns clock is well under 30 ms of measurement on a 124.5s step, five orders
 /// of magnitude below the quantity. [`IngestSample`] has to sample only because
 /// its loop runs 780 million times; this one does not.
+/// One thread's scheduler accounting: `(on_cpu_nanos, runqueue_wait_nanos,
+/// timeslices)`, read from `/proc/thread-self/schedstat`.
+///
+/// This is the measurement that separates the two stories a slower `read()`
+/// could be telling. If the call got slower because the thread lost the CPU —
+/// to the fifteen workers now extracting keys, or to anything else — the
+/// runqueue-wait delta across the call grows and the timeslice count rises. If
+/// it got slower because the *device* or the memory system delivered bytes more
+/// slowly, the thread was blocked on I/O the whole time and both stay flat.
+/// Wall-clock timing alone cannot tell those apart.
+///
+/// `/proc/thread-self` is Linux-only and needs no thread-id lookup; elsewhere
+/// this returns `None` and the report simply omits the section, which is why
+/// nothing downstream treats a missing sample as a zero.
+#[cfg(target_os = "linux")]
+pub(crate) fn thread_schedstat() -> Option<(u64, u64, u64)> {
+    let text = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+    parse_schedstat(&text)
+}
+
+/// Non-Linux stub: no scheduler accounting is available.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn thread_schedstat() -> Option<(u64, u64, u64)> {
+    None
+}
+
+/// Parse a `schedstat` line: on-CPU nanos, runqueue-wait nanos, timeslices.
+///
+/// Split out from the read so it can be tested off Linux, where the proc file
+/// does not exist and the whole path would otherwise be unexercised — which is
+/// also why it is `dead_code`-exempt there: only the tests call it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_schedstat(text: &str) -> Option<(u64, u64, u64)> {
+    let mut fields = text.split_whitespace();
+    let on_cpu = fields.next()?.parse().ok()?;
+    let runqueue = fields.next()?.parse().ok()?;
+    let timeslices = fields.next()?.parse().ok()?;
+    Some((on_cpu, runqueue, timeslices))
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ReaderStats {
     /// `read()` calls made against the file, below the 2 MiB buffer.
@@ -289,6 +327,26 @@ pub(crate) struct ReaderStats {
     read_raw_nanos: AtomicU64,
     /// Nanoseconds pushing framed blocks onto the decompress queue.
     dispatch_nanos: AtomicU64,
+    /// Per-`read()` latency distribution.
+    ///
+    /// A uniform shift and a heavy tail are different diagnoses: the first says
+    /// every call got slower (the device or the memory system is delivering less
+    /// bandwidth), the second says most calls were fine and some stalled
+    /// (reclaim, contention spikes). The mean alone cannot tell them apart.
+    refill_latency: crate::merge_trace::DurationHistogram,
+    /// Runqueue wait accumulated by the reading thread *inside* `read()` calls.
+    refill_runqueue_nanos: AtomicU64,
+    /// On-CPU time accumulated by the reading thread inside `read()` calls.
+    refill_oncpu_nanos: AtomicU64,
+    /// Timeslices the reading thread was granted inside `read()` calls.
+    refill_timeslices: AtomicU64,
+    /// Refills for which a scheduler sample was actually available.
+    ///
+    /// Separate from `refills` on purpose: on a platform without
+    /// `/proc/thread-self/schedstat` this stays zero and the report omits the
+    /// section, rather than printing a zero runqueue wait that would read as
+    /// evidence the reader never lost the CPU.
+    refill_sched_samples: AtomicU64,
 }
 
 impl ReaderStats {
@@ -297,6 +355,18 @@ impl ReaderStats {
         self.refills.fetch_add(1, Ordering::Relaxed);
         self.refill_nanos.fetch_add(elapsed_nanos, Ordering::Relaxed);
         self.refill_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.refill_latency.record(elapsed_nanos);
+    }
+
+    /// Record what the scheduler did to the reading thread during one `read()`.
+    ///
+    /// `on_cpu` and `runqueue` are deltas in nanoseconds and `timeslices` a
+    /// delta in count, taken across the call.
+    pub(crate) fn record_refill_sched(&self, on_cpu: u64, runqueue: u64, timeslices: u64) {
+        self.refill_oncpu_nanos.fetch_add(on_cpu, Ordering::Relaxed);
+        self.refill_runqueue_nanos.fetch_add(runqueue, Ordering::Relaxed);
+        self.refill_timeslices.fetch_add(timeslices, Ordering::Relaxed);
+        self.refill_sched_samples.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record one framed batch: how long `read_raw_blocks` took and what it returned.
@@ -323,6 +393,11 @@ impl ReaderStats {
             read_raw_secs: secs(self.read_raw_nanos.load(Ordering::Relaxed)),
             dispatch_secs: secs(self.dispatch_nanos.load(Ordering::Relaxed)),
             step_secs,
+            refill_latency: self.refill_latency.snapshot(),
+            refill_runqueue_secs: secs(self.refill_runqueue_nanos.load(Ordering::Relaxed)),
+            refill_oncpu_secs: secs(self.refill_oncpu_nanos.load(Ordering::Relaxed)),
+            refill_timeslices: self.refill_timeslices.load(Ordering::Relaxed),
+            refill_sched_samples: self.refill_sched_samples.load(Ordering::Relaxed),
         }
     }
 }
@@ -340,9 +415,32 @@ pub(crate) struct ReaderReport {
     pub(crate) dispatch_secs: f64,
     /// Exact `ReadInputBlocks` busy total the parts should add up to.
     pub(crate) step_secs: f64,
+    /// Per-`read()` latency distribution.
+    pub(crate) refill_latency: crate::merge_trace::HistogramReport,
+    /// Seconds the reading thread spent waiting for a CPU inside `read()`.
+    pub(crate) refill_runqueue_secs: f64,
+    /// Seconds it spent on-CPU inside `read()`.
+    pub(crate) refill_oncpu_secs: f64,
+    /// Timeslices granted to it inside `read()`.
+    pub(crate) refill_timeslices: u64,
+    /// Refills that produced a scheduler sample; zero means unavailable here.
+    pub(crate) refill_sched_samples: u64,
 }
 
 impl ReaderReport {
+    /// Share of refill wall time the reading thread spent waiting for a CPU.
+    ///
+    /// The number that decides whether a slower `read()` is a scheduling
+    /// problem. Near zero means the thread was blocked on I/O the whole time and
+    /// the bytes simply arrived more slowly; a material share means it was
+    /// runnable and waiting, and the fix is scheduling rather than bandwidth.
+    pub(crate) fn refill_runqueue_share(&self) -> f64 {
+        if self.refill_secs <= 0.0 {
+            return 0.0;
+        }
+        self.refill_runqueue_secs / self.refill_secs
+    }
+
     /// Time inside `read_raw_blocks` that was **not** spent in a `read()`:
     /// header parse, validation, per-block allocation, and the body copy.
     ///
@@ -408,9 +506,20 @@ impl<R> TimedReader<R> {
 
 impl<R: std::io::Read> std::io::Read for TimedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Two ~2 us proc reads per refill, against ~21k refills on a ~125s step:
+        // under 0.1% of the quantity measured, and the only way to tell a slower
+        // device from a thread that keeps losing the CPU.
+        let sched_before = thread_schedstat();
         let started = std::time::Instant::now();
         let result = self.inner.read(buf);
         let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if let (Some(before), Some(after)) = (sched_before, thread_schedstat()) {
+            self.stats.record_refill_sched(
+                after.0.saturating_sub(before.0),
+                after.1.saturating_sub(before.1),
+                after.2.saturating_sub(before.2),
+            );
+        }
         // A failed read still cost time; counting zero bytes for it keeps the
         // throughput figure honest rather than crediting the failure with bytes.
         self.stats.record_refill(elapsed, result.as_ref().copied().unwrap_or(0));
@@ -420,6 +529,24 @@ impl<R: std::io::Read> std::io::Read for TimedReader<R> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_schedstat_parses_the_kernel_format() {
+        // Format is "<on_cpu_ns> <runqueue_wait_ns> <timeslices>"; the kernel
+        // appends a trailing newline.
+        assert_eq!(parse_schedstat("12345 678 9\n"), Some((12345, 678, 9)));
+        assert_eq!(parse_schedstat("0 0 0"), Some((0, 0, 0)));
+    }
+
+    #[test]
+    fn test_schedstat_refuses_a_line_it_does_not_understand() {
+        // A silently-wrong parse would report zero runqueue wait, which reads as
+        // "the reader never lost the CPU" -- the exact conclusion this
+        // measurement exists to test. Better to have no sample than a false one.
+        assert_eq!(parse_schedstat(""), None, "empty");
+        assert_eq!(parse_schedstat("12345 678"), None, "truncated: only two fields");
+        assert_eq!(parse_schedstat("version 15"), None, "not numeric");
+    }
+
     use super::*;
 
     /// A reader report built from the production cell's shape: 124.5s of step
@@ -434,6 +561,7 @@ mod tests {
             read_raw_secs: 121.4,
             dispatch_secs: 3.1,
             step_secs: 124.5,
+            ..ReaderReport::default()
         }
     }
 
@@ -519,22 +647,16 @@ mod tests {
 
     #[test]
     fn test_clock_correction_subtracts_one_pair_per_segment_per_sample() {
-        // Ten samples, 20 ns per pair, five segments: each segment carries
+        // Ten samples, 20 ns per pair, four segments: each segment carries
         // 10 x 20 ns = 200 ns of clock, and each is corrected independently.
-        let raw = IngestSample {
-            fetch: 1e-6,
-            key: 1e-6,
-            verify: 1e-7,
-            push: 1e-6,
-            tick: 1e-6,
-            probe: 1e-6,
-        };
+        // `tick` is deliberately *below* that, to exercise the clamp.
+        let raw = IngestSample { fetch: 1e-6, push: 1e-6, tick: 1e-7, probe: 1e-6 };
         let fixed = raw.corrected(10, 20);
         assert!((fixed.fetch - 0.8e-6).abs() < 1e-12, "got {}", fixed.fetch);
         // A segment cheaper than the clock that measured it clamps to zero rather
         // than going negative, which would read as a bug rather than as
         // "unresolvable by this method".
-        assert!((fixed.verify - 0.0).abs() < 1e-12, "got {}", fixed.verify);
+        assert!((fixed.tick - 0.0).abs() < 1e-12, "got {}", fixed.tick);
     }
 
     #[test]
@@ -543,10 +665,10 @@ mod tests {
         // works on the sampled scale. Applying them in the wrong order would
         // subtract one pair's cost from the *scaled* total rather than from each
         // sample, understating the correction by the scale factor.
-        let raw = IngestSample { key: 2e-6, ..IngestSample::default() };
+        let raw = IngestSample { push: 2e-6, ..IngestSample::default() };
         let corrected_then_scaled = raw.corrected(10, 20).scaled(1000.0);
         let scaled_then_corrected = raw.scaled(1000.0).corrected(10, 20);
-        assert!(corrected_then_scaled.key < scaled_then_corrected.key);
+        assert!(corrected_then_scaled.push < scaled_then_corrected.push);
     }
 
     #[test]

@@ -1,11 +1,14 @@
-//! Integration tests for the `--async-reader` flag across all supported input paths.
+//! Integration tests that a command's choice of *reader* never changes its output.
 //!
-//! Each test runs a command twice — once without `--async-reader` and once with it —
-//! then asserts that the outputs are identical record-by-record. This ensures the
-//! prefetch reader is transparent across:
+//! Each test runs a command twice — once with the default reader and once with an
+//! alternative — then asserts the outputs are identical record-by-record:
 //!
-//! - **Extract:** BGZF, gzip, and plain FASTQ inputs (single- and multi-threaded)
-//! - **BAM commands:** file input with/without `--threads`, and piped stdin
+//! - **Extract and group, `--async-reader`:** BGZF, gzip and plain FASTQ inputs,
+//!   and BAM input, single- and multi-threaded
+//! - **Sort, `--read-streams`:** every sort order, single- and multi-threaded,
+//!   with spilling forced so the merge reads its spill files back through the
+//!   scattered reader too. That is where a mis-ordered slice would corrupt a
+//!   BGZF block or zstd frame, and it is only reachable end to end.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -565,7 +568,7 @@ fn test_simplex_async_reader_stdin() {
 }
 
 // ============================================================================
-// Sort: async-reader regression tests
+// Sort: --read-streams regression tests
 // ============================================================================
 
 /// Check if samtools is available for sort tests.
@@ -639,7 +642,7 @@ fn run_sort(
     order: &str,
     threads: usize,
     max_memory: &str,
-    async_reader: bool,
+    read_streams: usize,
 ) -> PathBuf {
     let output = tmp.path().join(output_name);
     let mut args: Vec<std::ffi::OsString> = vec![
@@ -659,15 +662,16 @@ fn run_sort(
         "--compression-level".into(),
         "1".into(),
     ];
-    if async_reader {
-        args.push("--async-reader".into());
+    if read_streams > 1 {
+        args.push("--read-streams".into());
+        args.push(read_streams.to_string().into());
     }
 
     let result =
         Command::new(env!("CARGO_BIN_EXE_fgumi")).args(&args).output().expect("fgumi sort");
     assert!(
         result.status.success(),
-        "fgumi sort failed (order={order}, threads={threads}, async={async_reader}):\n{}",
+        "fgumi sort failed (order={order}, threads={threads}, streams={read_streams}):\n{}",
         String::from_utf8_lossy(&result.stderr),
     );
     output
@@ -675,126 +679,56 @@ fn run_sort(
 
 #[test]
 #[ignore = "requires samtools"]
-fn test_sort_coordinate_async_reader_single_threaded() {
+fn test_sort_coordinate_read_streams_single_threaded() {
     if !samtools_available() {
         return;
     }
     let tmp = TempDir::new().unwrap();
     let input = create_unsorted_bam(tmp.path(), 500);
 
-    let baseline = run_sort(&tmp, &input, "baseline.bam", "coordinate", 1, "100M", false);
-    let async_out = run_sort(&tmp, &input, "async.bam", "coordinate", 1, "100M", true);
-    assert_bam_records_equal(&baseline, &async_out);
+    let baseline = run_sort(&tmp, &input, "baseline.bam", "coordinate", 1, "100M", 1);
+    let scattered = run_sort(&tmp, &input, "scattered.bam", "coordinate", 1, "100M", 4);
+    assert_bam_records_equal(&baseline, &scattered);
 }
 
 #[test]
 #[ignore = "requires samtools"]
-fn test_sort_coordinate_async_reader_multithreaded() {
+fn test_sort_coordinate_read_streams_multithreaded() {
     if !samtools_available() {
         return;
     }
     let tmp = TempDir::new().unwrap();
     let input = create_unsorted_bam(tmp.path(), 2000);
 
-    let baseline = run_sort(&tmp, &input, "baseline.bam", "coordinate", 4, "50K", false);
-    let async_out = run_sort(&tmp, &input, "async.bam", "coordinate", 4, "50K", true);
-    assert_bam_records_equal(&baseline, &async_out);
+    let baseline = run_sort(&tmp, &input, "baseline.bam", "coordinate", 4, "50K", 1);
+    let scattered = run_sort(&tmp, &input, "scattered.bam", "coordinate", 4, "50K", 4);
+    assert_bam_records_equal(&baseline, &scattered);
 }
 
 #[test]
 #[ignore = "requires samtools"]
-fn test_sort_queryname_async_reader_multithreaded() {
+fn test_sort_queryname_read_streams_multithreaded() {
     if !samtools_available() {
         return;
     }
     let tmp = TempDir::new().unwrap();
     let input = create_unsorted_bam(tmp.path(), 2000);
 
-    let baseline = run_sort(&tmp, &input, "baseline.bam", "queryname", 4, "50K", false);
-    let async_out = run_sort(&tmp, &input, "async.bam", "queryname", 4, "50K", true);
-    assert_bam_records_equal(&baseline, &async_out);
+    let baseline = run_sort(&tmp, &input, "baseline.bam", "queryname", 4, "50K", 1);
+    let scattered = run_sort(&tmp, &input, "scattered.bam", "queryname", 4, "50K", 4);
+    assert_bam_records_equal(&baseline, &scattered);
 }
 
 #[test]
 #[ignore = "requires samtools"]
-fn test_sort_template_coordinate_async_reader_multithreaded() {
+fn test_sort_template_coordinate_read_streams_multithreaded() {
     if !samtools_available() {
         return;
     }
     let tmp = TempDir::new().unwrap();
     let input = create_unsorted_bam(tmp.path(), 2000);
 
-    let baseline = run_sort(&tmp, &input, "baseline.bam", "template-coordinate", 4, "50K", false);
-    let async_out = run_sort(&tmp, &input, "async.bam", "template-coordinate", 4, "50K", true);
-    assert_bam_records_equal(&baseline, &async_out);
-}
-
-// ============================================================================
-// BAM commands: sort with stdin input
-// ============================================================================
-
-/// Runs `fgumi sort` over stdin at debug verbosity, returning `(output, stderr)`.
-fn run_sort_from_stdin(
-    tmp: &TempDir,
-    input: &Path,
-    output_name: &str,
-    async_reader: bool,
-) -> (PathBuf, String) {
-    let output = tmp.path().join(output_name);
-    let mut args: Vec<std::ffi::OsString> = vec![
-        "-v".into(), // the prefetch decision is logged at debug level
-        "sort".into(),
-        "-i".into(),
-        "-".into(),
-        "-o".into(),
-        output.as_os_str().to_owned(),
-        "--order".into(),
-        "queryname".into(),
-    ];
-    if async_reader {
-        args.push("--async-reader".into());
-    }
-
-    let result = Command::new(env!("CARGO_BIN_EXE_fgumi"))
-        .args(&args)
-        .stdin(Stdio::from(File::open(input).expect("open sort input")))
-        .output()
-        .expect("fgumi sort");
-    assert!(
-        result.status.success(),
-        "fgumi sort from stdin failed (async={async_reader}):\n{}",
-        String::from_utf8_lossy(&result.stderr),
-    );
-    (output, String::from_utf8_lossy(&result.stderr).into_owned())
-}
-
-/// `--async-reader` must reach the stdin path, not only file inputs.
-///
-/// sort's pool-integrated reader spawns a `fgumi-prefetch` thread when the flag is
-/// given, but its stdin branch used to hand back a plain buffered reader whatever
-/// the flag said — so `fgumi sort --async-reader -i -` silently ran without the
-/// prefetch thread while the same command over a file got one.
-///
-/// The assertion is on the log rather than on the records: both readers deliver the
-/// same bytes, so comparing output alone cannot tell whether the flag was honored.
-/// Output equality is checked too, because honoring it must not change the result.
-#[test]
-fn test_sort_async_reader_reaches_stdin() {
-    let tmp = TempDir::new().unwrap();
-    let input = tmp.path().join("input.bam");
-    create_test_bam(&input);
-
-    let (baseline, baseline_log) = run_sort_from_stdin(&tmp, &input, "baseline.bam", false);
-    assert!(
-        !baseline_log.contains("fgumi-prefetch thread for stdin"),
-        "no prefetch thread should be spawned without --async-reader:\n{baseline_log}"
-    );
-
-    let (async_out, async_log) = run_sort_from_stdin(&tmp, &input, "async.bam", true);
-    assert!(
-        async_log.contains("fgumi-prefetch thread for stdin"),
-        "--async-reader must spawn the prefetch thread for stdin too:\n{async_log}"
-    );
-
-    assert_bam_records_equal(&baseline, &async_out);
+    let baseline = run_sort(&tmp, &input, "baseline.bam", "template-coordinate", 4, "50K", 1);
+    let scattered = run_sort(&tmp, &input, "scattered.bam", "template-coordinate", 4, "50K", 4);
+    assert_bam_records_equal(&baseline, &scattered);
 }

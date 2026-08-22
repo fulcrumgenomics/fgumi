@@ -94,6 +94,7 @@ pub(crate) mod merge_headroom;
 pub(crate) mod merge_phases;
 pub(crate) mod merge_stalls;
 pub(crate) mod merge_trace;
+pub(crate) mod phase1_keys;
 pub(crate) mod phase1_stats;
 pub(crate) mod pipeline;
 pub(crate) mod pooled_bam_writer;
@@ -103,6 +104,7 @@ pub(crate) mod radix;
 pub(crate) mod read_ahead;
 pub(crate) mod reader;
 pub(crate) mod segmented_buf;
+pub(crate) mod spill_reader;
 pub(crate) mod tmp_dir_alloc;
 pub(crate) mod verify;
 pub(crate) mod worker_pool;
@@ -243,8 +245,8 @@ fn create_temp_dir(base: Option<&Path>) -> Result<TempDir> {
 
 pub use codec::SpillCodec;
 pub use external::{
-    KeyTypesSpec, LibraryLookup, RawExternalSorter, cb_hasher, extract_template_key_inline,
-    format_thread_counts,
+    KeyTypesSpec, LibraryLookup, RawExternalSorter, ReadStreams, cb_hasher,
+    extract_template_key_inline, format_thread_counts,
 };
 pub use fd_limit::{
     FALLBACK_MAX_TEMP_FILES, fits_nofile_budget, resolve_temp_file_limit, soft_nofile,

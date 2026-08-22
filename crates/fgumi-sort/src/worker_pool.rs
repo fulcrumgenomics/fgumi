@@ -265,11 +265,27 @@ pub enum SortStep {
     Compress = 2,
     /// Read+decompress one unit of work for some Phase 2 spill file (work-stealing).
     Phase2FileWork = 3,
+    /// Extract the sort keys for one batch of already-ingested records.
+    ///
+    /// Phase 1 slack work: the ingest thread defers key extraction rather than
+    /// paying 120 ns/record for it serially, and any worker can pick a batch up.
+    /// It is scheduled *last* everywhere on purpose — a batch that waits costs
+    /// nothing until the chunk barrier, whereas displacing `DecompressInput`
+    /// would starve the very thread this step exists to unblock.
+    ExtractKeys = 4,
+    /// Read one byte slice of some reader's in-flight fill.
+    ///
+    /// Scheduled *first* everywhere, the mirror image of `ExtractKeys`: a
+    /// pending slice is what a thread holding an exclusive reader is blocked
+    /// on, so every moment it waits is a moment nothing downstream is fed. A
+    /// deferred key batch costs nothing until the chunk barrier; a deferred
+    /// slice costs the pipeline immediately.
+    FetchBytes = 5,
 }
 
 impl SortStep {
     /// Number of distinct sort steps.
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 6;
 
     /// Short label for display.
     #[must_use]
@@ -279,6 +295,8 @@ impl SortStep {
             Self::DecompressInput => "DecInp",
             Self::Compress => "Cmprs",
             Self::Phase2FileWork => "P2File",
+            Self::ExtractKeys => "ExtKey",
+            Self::FetchBytes => "Fetch",
         }
     }
 }
@@ -372,6 +390,8 @@ impl SortPipelineStats {
             SortStep::DecompressInput,
             SortStep::Compress,
             SortStep::Phase2FileWork,
+            SortStep::ExtractKeys,
+            SortStep::FetchBytes,
         ];
 
         for &step in &all_steps {
@@ -1030,7 +1050,7 @@ pub(crate) struct TimedBlock {
 
 /// Reader state for a single spill file. Locked when reading from disk.
 pub(crate) struct Phase2Reader {
-    pub(crate) inner: BufReader<std::fs::File>,
+    pub(crate) inner: crate::spill_reader::SpillSource,
     pub(crate) next_serial: u64,
     pub(crate) eof: bool,
 }
@@ -1109,7 +1129,7 @@ pub(crate) struct Phase2FileState {
 }
 
 impl Phase2FileState {
-    pub(crate) fn new(reader: BufReader<std::fs::File>, codec: SpillCodec) -> Self {
+    pub(crate) fn new(reader: crate::spill_reader::SpillSource, codec: SpillCodec) -> Self {
         Self {
             reader: Mutex::new(Phase2Reader { inner: reader, next_serial: 0, eof: false }),
             reader_eof: AtomicBool::new(false),
@@ -1357,6 +1377,9 @@ pub struct SortWorkerPool {
     pub buffer_pool: BufferPool,
     num_workers: usize,
     pub(crate) spill_codec: SpillCodec,
+    /// How the merge reads each spill file. `Fixed(1)` keeps the sequential
+    /// `BufReader` a merge has always used.
+    pub(crate) read_streams: crate::external::ReadStreams,
 }
 
 /// Shared state visible to all workers and the main thread.
@@ -1482,6 +1505,23 @@ pub(crate) struct SharedPipelineState {
     // --- Compress queue (shared Phase 1 + Phase 2) ---
     /// Compress jobs: main thread → workers (`ArrayQueue`, non-blocking push).
     pub(crate) compress_queue: Arc<ArrayQueue<CompressJob>>,
+
+    /// Deferred key-extraction batches: ingest thread → workers.
+    ///
+    /// Bounded like every other queue here, and a full queue is *not* an error:
+    /// [`SortWorkerPool::submit_key_job`] hands the batch back and the ingest
+    /// thread runs it inline. That fallback is what makes the ingest thread's
+    /// barrier deadlock-free — it never waits on a batch no worker can reach.
+    pub(crate) key_jobs: Arc<ArrayQueue<Box<dyn crate::phase1_keys::KeyExtractionJob>>>,
+
+    /// Byte slices offered by whichever reader is filling: reader → workers.
+    ///
+    /// Shared by both phases because the job is identical -- read a range at an
+    /// offset into a waiting buffer. A full queue is not an error and neither is
+    /// an idle pool: the offering thread reclaims anything nobody started, which
+    /// is what keeps a fill from waiting on workers that are all themselves
+    /// filling. See [`crate::spill_reader`].
+    pub(crate) fetch_jobs: Arc<crate::spill_reader::FetchQueue>,
 
     /// Number of workers (for `low_water` threshold in backpressure).
     num_workers: usize,
@@ -1616,6 +1656,11 @@ impl SharedPipelineState {
     fn new(num_workers: usize, main_thread_handle: std::thread::Thread) -> Self {
         let data_queue_cap = num_workers * 8;
         let compress_queue_cap = num_workers * 4;
+        // Deeper than the compress queue: batches are pure CPU with no
+        // downstream, so a backlog costs only memory, and a shallow queue would
+        // push the ingest thread onto the inline fallback exactly when the pool
+        // is busiest — reintroducing the serial cost this step removes.
+        let key_job_queue_cap = num_workers * 16;
 
         Self {
             merge_phases: crate::merge_phases::MergePhaseCounters::default(),
@@ -1649,6 +1694,8 @@ impl SharedPipelineState {
             total_sources: AtomicU64::new(0),
 
             compress_queue: Arc::new(ArrayQueue::new(compress_queue_cap)),
+            key_jobs: Arc::new(ArrayQueue::new(key_job_queue_cap)),
+            fetch_jobs: crate::spill_reader::FetchQueue::new(num_workers),
 
             num_workers,
             main_thread_handle,
@@ -2049,15 +2096,29 @@ fn get_sort_priorities(bp: &SortBackpressureState) -> &'static [SortStep] {
     match bp.phase {
         phase::PHASE1 => {
             if bp.input_eof && !bp.compress_has_items && bp.decompressed_input_done {
-                // Input fully decompressed and no compress work — nothing productive to do
-                &[]
+                // Input fully decompressed and no compress work — only leftover
+                // key batches remain, and eligibility drops the step when there
+                // are none.
+                &[SortStep::FetchBytes, SortStep::ExtractKeys]
             } else if bp.compress_has_items && !bp.decompressed_input_low {
                 // Spill compression is the bottleneck (13.7s at t4). Drain compress
                 // while decompressed blocks are plentiful for the main thread.
-                &[SortStep::Compress, SortStep::DecompressInput, SortStep::ReadInputBlocks]
+                &[
+                    SortStep::FetchBytes,
+                    SortStep::Compress,
+                    SortStep::DecompressInput,
+                    SortStep::ReadInputBlocks,
+                    SortStep::ExtractKeys,
+                ]
             } else {
                 // Default/starving: feed the main thread first, compress if available
-                &[SortStep::DecompressInput, SortStep::ReadInputBlocks, SortStep::Compress]
+                &[
+                    SortStep::FetchBytes,
+                    SortStep::DecompressInput,
+                    SortStep::ReadInputBlocks,
+                    SortStep::Compress,
+                    SortStep::ExtractKeys,
+                ]
             }
         }
         phase::PHASE2 => {
@@ -2070,17 +2131,32 @@ fn get_sort_priorities(bp: &SortBackpressureState) -> &'static [SortStep] {
                 // is throughput work any worker can do at any time; this block is
                 // the only thing that can unblock the consumer, so it goes first
                 // even though the compress queue is the writer-side bottleneck.
-                &[SortStep::Phase2FileWork, SortStep::Compress]
+                &[
+                    SortStep::FetchBytes,
+                    SortStep::Phase2FileWork,
+                    SortStep::Compress,
+                    SortStep::ExtractKeys,
+                ]
             } else if bp.compress_has_items {
                 // Drain output compression while we can; it's the writer-side bottleneck.
-                &[SortStep::Compress, SortStep::Phase2FileWork]
+                &[
+                    SortStep::FetchBytes,
+                    SortStep::Compress,
+                    SortStep::Phase2FileWork,
+                    SortStep::ExtractKeys,
+                ]
             } else {
-                &[SortStep::Phase2FileWork, SortStep::Compress]
+                &[
+                    SortStep::FetchBytes,
+                    SortStep::Phase2FileWork,
+                    SortStep::Compress,
+                    SortStep::ExtractKeys,
+                ]
             }
         }
         // Legacy/transition: compress only (drain any remaining jobs, of either
         // kind — each carries its own `CompressTarget`).
-        _ => &[SortStep::Compress],
+        _ => &[SortStep::FetchBytes, SortStep::Compress, SortStep::ExtractKeys],
     }
 }
 
@@ -2347,6 +2423,7 @@ impl SortWorkerPool {
             buffer_pool,
             num_workers,
             spill_codec,
+            read_streams: crate::external::ReadStreams::Fixed(1),
         }
     }
 
@@ -2535,6 +2612,12 @@ impl SortWorkerPool {
             phase::PHASE1 => {
                 shared.decompressed_input_done.load(Ordering::Acquire)
                     && shared.compress_queue.is_empty()
+                    // Deferred key batches outlive the input: the last chunk's
+                    // barrier runs after the input is fully decompressed, so
+                    // without this the pool parks precisely when the ingest
+                    // thread is waiting on it and the final chunk's extraction
+                    // collapses back to serial.
+                    && shared.key_jobs.is_empty()
             }
             phase::PHASE2 => {
                 if !shared.all_chunks_eof.load(Ordering::Acquire) {
@@ -2577,6 +2660,19 @@ impl SortWorkerPool {
             phase::PHASE1 => Some(SortStep::ReadInputBlocks),
             _ => None,
         }
+    }
+
+    /// Whether a worker owning `owned_step` may also take key-extraction batches.
+    ///
+    /// The worker that exclusively owns [`SortStep::ReadInputBlocks`] may not.
+    /// A batch is ~0.5 ms of pure CPU, and for that long its worker is not
+    /// reading — and nobody else can read, because the step is exclusive. On the
+    /// production cell, letting the reader's owner take batches cost the reader
+    /// 358 → 345 MB/s and 125.2s → 129.8s, against a phase whose whole remaining
+    /// cost *is* the reader. Every other worker is free to extract, so this
+    /// gives up 1/16th of the extraction capacity to protect the critical path.
+    fn worker_may_extract_keys(owned_step: Option<SortStep>) -> bool {
+        owned_step != Some(SortStep::ReadInputBlocks)
     }
 
     /// Whether a step is exclusive (requires ownership).
@@ -2631,6 +2727,21 @@ impl SortWorkerPool {
             }
             SortStep::Compress => !shared.compress_queue.is_empty(),
             SortStep::Phase2FileWork => current_phase == phase::PHASE2,
+            // Deliberately not gated on the phase: a batch queued late in
+            // Phase 1 must still be reachable while the ingest thread drains at
+            // the chunk barrier, which can coincide with the phase flip.
+            // Not gated on the phase either: both phases fill through the
+            // same queue, and a slice offered as Phase 1 drains must stay
+            // reachable across the flip.
+            SortStep::FetchBytes => !shared.fetch_jobs.is_empty(),
+            SortStep::ExtractKeys => {
+                !shared.key_jobs.is_empty()
+                    && Self::worker_may_extract_keys(Self::exclusive_step_for(
+                        worker.worker_id,
+                        shared,
+                        current_phase,
+                    ))
+            }
         }
     }
 
@@ -2645,7 +2756,30 @@ impl SortWorkerPool {
             SortStep::DecompressInput => Self::try_decompress_input(shared, worker),
             SortStep::Compress => Self::try_compress(shared, worker),
             SortStep::Phase2FileWork => Self::try_phase2_file_work(shared, worker),
+            SortStep::ExtractKeys => Self::try_extract_keys(shared),
+            SortStep::FetchBytes => Self::try_fetch_bytes(shared),
         }
+    }
+
+    /// Read one offered byte slice, if any is still unclaimed.
+    ///
+    /// `InputEmpty` covers both "nothing queued" and "the offering thread
+    /// reclaimed this one first" -- neither did work, and reporting progress
+    /// for a no-op would keep a worker spinning on a queue of stale slices.
+    fn try_fetch_bytes(shared: &SharedPipelineState) -> StepResult {
+        if shared.fetch_jobs.run_one() { StepResult::Success } else { StepResult::InputEmpty }
+    }
+
+    /// Run one deferred key-extraction batch, if any is queued.
+    ///
+    /// Takes no worker state: a batch owns everything it needs and publishes its
+    /// own result, so there is nothing to hold and nothing to advance.
+    fn try_extract_keys(shared: &SharedPipelineState) -> StepResult {
+        let Some(job) = shared.key_jobs.pop() else {
+            return StepResult::InputEmpty;
+        };
+        job.run();
+        StepResult::Success
     }
 
     // ========================================================================
@@ -3907,6 +4041,7 @@ impl SortWorkerPool {
     ///
     /// Panics if the `phase2_files` rwlock is poisoned.
     pub fn set_phase2_files(&self, files: &[std::path::PathBuf]) -> anyhow::Result<()> {
+        let scatter = Arc::clone(&self.shared.fetch_jobs);
         let total_sources = files.len();
         self.shared.total_sources.store(total_sources as u64, Ordering::Release);
 
@@ -3978,13 +4113,37 @@ impl SortWorkerPool {
             file.seek(SeekFrom::Start(body_start)).map_err(|e| {
                 anyhow::anyhow!("Failed to seek chunk file {}: {e}", path.display())
             })?;
-            let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
+            let reader = if self.read_streams.is_sequential() {
+                crate::spill_reader::SpillSource::Sequential(BufReader::with_capacity(
+                    2 * 1024 * 1024,
+                    file,
+                ))
+            } else {
+                // Positional reads need no file position, so the seek above is
+                // irrelevant here -- `body_start` is passed explicitly instead.
+                crate::spill_reader::SpillSource::Scattered(
+                    crate::spill_reader::ScatterReader::for_streams(
+                        file,
+                        body_start,
+                        self.read_streams,
+                        Some(Arc::clone(&scatter)),
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to size chunk file {}: {e}", path.display())
+                    })?,
+                )
+            };
             states.push(Phase2FileState::new(reader, codec));
         }
 
         let mut guard = self.shared.phase2_files.write().expect("phase2_files rwlock poisoned");
         *guard = Arc::new(states);
         Ok(())
+    }
+
+    /// The queue readers offer byte slices to. See [`crate::spill_reader`].
+    pub(crate) fn fetch_queue(&self) -> Arc<crate::spill_reader::FetchQueue> {
+        Arc::clone(&self.shared.fetch_jobs)
     }
 
     /// Clear the Phase 2 file vector. Call this after Phase 2 finishes (and
@@ -4020,6 +4179,51 @@ impl SortWorkerPool {
         }
     }
 
+    /// Offer a deferred key-extraction batch to the pool.
+    ///
+    /// Returns the batch unrun in `Err` when the queue is full or the pool has
+    /// shut down; the caller must run it inline rather than drop it. Unlike
+    /// [`submit_compress`](Self::submit_compress) this does **not** spin waiting
+    /// for room: the submitter is the ingest thread, and blocking it to hand off
+    /// work whose whole purpose is to unblock it would be self-defeating.
+    ///
+    /// # Errors
+    ///
+    /// Returns the batch when it could not be queued.
+    pub(crate) fn submit_key_job(
+        &self,
+        job: Box<dyn crate::phase1_keys::KeyExtractionJob>,
+    ) -> Result<(), Box<dyn crate::phase1_keys::KeyExtractionJob>> {
+        if self.shared.phase.load(Ordering::Acquire) == phase::SHUTDOWN {
+            return Err(job); // Workers have exited; no one will pop the queue
+        }
+        self.shared.key_jobs.push(job)?;
+        self.shared.wake_one_worker();
+        Ok(())
+    }
+
+    /// Whether any worker has published a panic.
+    pub(crate) fn worker_panicked(&self) -> bool {
+        self.shared.worker_panicked.load(Ordering::Acquire)
+    }
+
+    /// Run one queued key-extraction batch on the calling thread, if any is
+    /// queued. Returns whether a batch ran.
+    ///
+    /// The ingest thread's self-help path: at the chunk barrier it drains the
+    /// queue itself rather than waiting on workers that may already have parked
+    /// for the phase. Without it the barrier could wait on a batch nobody is
+    /// scheduled to run.
+    pub(crate) fn run_one_key_job(&self) -> bool {
+        match self.shared.key_jobs.pop() {
+            Some(job) => {
+                job.run();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Create a new result channel pair for compress results.
     ///
     /// The result channel stays as `crossbeam_channel::bounded()` because the
@@ -4045,6 +4249,19 @@ impl SortWorkerPool {
     /// Internal shutdown: signal workers and join them. Safe to call multiple times
     /// (idempotent via `Option::take`). Called by both `shutdown` and `Drop`.
     fn do_shutdown(&mut self) {
+        // The census for "did scattered reading engage at all". Zero taken means
+        // every fill was read by the thread that wanted it -- the pre-change
+        // behaviour, and something no output check would ever notice. Reported
+        // here because the queue spans both phases and this is the one point
+        // every sort passes through. Gated on the workers still being present so
+        // it prints once: `do_shutdown` runs from both `shutdown` and `Drop`,
+        // and only the join below is idempotent on its own.
+        if self.workers.is_some() {
+            let (offered, taken) = self.shared.fetch_jobs.census();
+            if offered > 0 {
+                log::info!("Byte fetch: {offered} slices offered, {taken} run by workers");
+            }
+        }
         self.shared.phase.store(phase::SHUTDOWN, Ordering::Release);
         if let Some(workers) = self.workers.take() {
             for w in workers {
@@ -4542,6 +4759,100 @@ mod tests {
         assert!(result.recycled_buf.is_empty());
 
         pool.shutdown();
+    }
+
+    #[test]
+    fn test_the_pool_runs_every_submitted_key_job() {
+        // Deferred key extraction is only a win if the pool actually drains the
+        // batches; a batch the pool never picks up would stall the ingest
+        // thread's barrier instead. Submits more batches than the queue holds,
+        // so the full-queue path is exercised too.
+        use crate::phase1_keys::KeyExtractionJob;
+
+        struct CountingBatch(std::sync::mpsc::Sender<usize>, usize);
+        impl KeyExtractionJob for CountingBatch {
+            fn run(self: Box<Self>) {
+                // The receiver outlives every batch here; a closed channel would
+                // just mean the test already finished.
+                let _ = self.0.send(self.1);
+            }
+        }
+
+        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf);
+        pool.set_phase(phase::PHASE1);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let num_jobs = 64usize;
+        for i in 0..num_jobs {
+            // A full queue hands the batch back rather than dropping it; the
+            // ingest thread runs those inline, so the test does the same.
+            if let Err(job) = pool.submit_key_job(Box::new(CountingBatch(tx.clone(), i))) {
+                job.run();
+            }
+        }
+        drop(tx);
+
+        let mut seen: Vec<usize> = rx.iter().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..num_jobs).collect::<Vec<_>>(), "every batch must run exactly once");
+    }
+
+    #[test]
+    fn test_the_worker_that_owns_the_reader_does_not_take_key_batches() {
+        // Measured on the production cell: adding key extraction to the pool
+        // slowed the input reader from 358 to 345 MB/s and its step from 125.2s
+        // to 129.8s. The reader is one exclusively-owned worker, and a key batch
+        // is ~0.5 ms during which that worker is not reading. Everyone else may
+        // take batches; the reader's owner may not.
+        assert!(
+            !SortWorkerPool::worker_may_extract_keys(Some(SortStep::ReadInputBlocks)),
+            "the reader's owner must stay on the reader"
+        );
+        assert!(
+            SortWorkerPool::worker_may_extract_keys(None),
+            "a worker owning no exclusive step is free to extract"
+        );
+        assert!(
+            SortWorkerPool::worker_may_extract_keys(Some(SortStep::Compress)),
+            "owning some other step does not bar extraction"
+        );
+    }
+
+    #[test]
+    fn test_workers_stay_awake_for_key_batches_after_the_input_is_drained() {
+        // The final chunk's barrier lands exactly here: the input is read and
+        // decompressed, so Phase 1 looks finished, but a chunk's worth of key
+        // batches is still queued. If the phase counts as complete the workers
+        // all park and the ingest thread drains them one at a time on its own —
+        // correct output, but the last chunk's extraction becomes fully serial,
+        // which is the cost this step exists to remove.
+        use crate::phase1_keys::KeyExtractionJob;
+
+        struct Ping(std::sync::mpsc::Sender<()>);
+        impl KeyExtractionJob for Ping {
+            fn run(self: Box<Self>) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let pool = SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf);
+        pool.set_phase(phase::PHASE1);
+        // Everything the phase-completion check looks at is now satisfied.
+        pool.shared.decompressed_input_done.store(true, Ordering::Release);
+        pool.shared.input_eof.store(true, Ordering::Release);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let submitted = 8usize;
+        for _ in 0..submitted {
+            pool.submit_key_job(Box::new(Ping(tx.clone()))).ok().expect("queue has room");
+        }
+        drop(tx);
+
+        for i in 0..submitted {
+            rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| {
+                panic!("workers parked with key batches still queued; only {i} of {submitted} ran")
+            });
+        }
     }
 
     #[test]
@@ -5285,7 +5596,7 @@ mod tests {
             phase: phase::PHASE1,
         };
         let priorities = get_sort_priorities(&bp);
-        assert_eq!(priorities[0], SortStep::DecompressInput);
+        assert!(rank(priorities, SortStep::DecompressInput) < rank(priorities, SortStep::Compress));
     }
 
     #[test]
@@ -5299,11 +5610,17 @@ mod tests {
             phase: phase::PHASE1,
         };
         let priorities = get_sort_priorities(&bp);
-        assert_eq!(priorities[0], SortStep::Compress);
+        assert!(rank(priorities, SortStep::Compress) < rank(priorities, SortStep::DecompressInput));
     }
 
     #[test]
-    fn test_sort_priorities_phase1_all_done_returns_empty() {
+    fn test_sort_priorities_phase1_all_done_offers_no_input_or_compress_work() {
+        // Once the input is read and decompressed and nothing is queued to
+        // compress, no worker should be offered work that produces more of it —
+        // that is what makes them back off instead of spinning. `ExtractKeys` is
+        // exempt and may appear: it self-gates on a non-empty batch queue, and a
+        // batch queued just before EOF must still be reachable while the ingest
+        // thread drains at the barrier.
         let bp = SortBackpressureState {
             decompressed_input_low: false,
             input_eof: true,
@@ -5312,7 +5629,10 @@ mod tests {
             consumer_parked: false,
             phase: phase::PHASE1,
         };
-        assert!(get_sort_priorities(&bp).is_empty());
+        let priorities = get_sort_priorities(&bp);
+        for step in [SortStep::ReadInputBlocks, SortStep::DecompressInput, SortStep::Compress] {
+            assert!(!priorities.contains(&step), "{step:?} must not be offered once input is done");
+        }
     }
 
     #[test]
@@ -5326,7 +5646,7 @@ mod tests {
             phase: phase::PHASE2,
         };
         let priorities = get_sort_priorities(&bp);
-        assert_eq!(priorities[0], SortStep::Phase2FileWork);
+        assert!(rank(priorities, SortStep::Phase2FileWork) < rank(priorities, SortStep::Compress));
     }
 
     #[test]
@@ -5340,7 +5660,7 @@ mod tests {
             phase: phase::PHASE2,
         };
         let priorities = get_sort_priorities(&bp);
-        assert_eq!(priorities[0], SortStep::Compress);
+        assert!(rank(priorities, SortStep::Compress) < rank(priorities, SortStep::DecompressInput));
     }
 
     #[test]
@@ -5356,7 +5676,49 @@ mod tests {
             phase: phase::PHASE2,
         };
         let priorities = get_sort_priorities(&bp);
-        assert_eq!(priorities[0], SortStep::Phase2FileWork);
+        assert!(rank(priorities, SortStep::Phase2FileWork) < rank(priorities, SortStep::Compress));
+    }
+
+    /// A pending byte slice is what some thread holding an exclusive reader is
+    /// blocked on, and that thread reclaims the slice if nobody takes it -- so
+    /// the whole benefit lives in the short window between offer and reclaim.
+    /// Anything scheduled above `FetchBytes` spends that window, which is why
+    /// it leads every list. This is the mirror image of `ExtractKeys`, which
+    /// goes last everywhere because a deferred key batch costs nothing until
+    /// the chunk barrier.
+    #[test]
+    fn test_fetch_bytes_outranks_every_other_step_in_every_state() {
+        for phase in [phase::PHASE1, phase::PHASE2, phase::SHUTDOWN] {
+            for &(low, eof, done, compress, parked) in &[
+                (false, false, false, false, false),
+                (true, false, false, true, false),
+                (false, true, true, false, false),
+                (false, false, false, true, true),
+                (true, true, true, true, true),
+            ] {
+                let bp = SortBackpressureState {
+                    decompressed_input_low: low,
+                    input_eof: eof,
+                    decompressed_input_done: done,
+                    compress_has_items: compress,
+                    consumer_parked: parked,
+                    phase,
+                };
+                assert_eq!(
+                    get_sort_priorities(&bp)[0],
+                    SortStep::FetchBytes,
+                    "phase {phase} state {low}{eof}{done}{compress}{parked}"
+                );
+            }
+        }
+    }
+
+    /// Where `step` sits in a priority list, for tests that mean "A outranks B"
+    /// rather than "A is literally first". Index-based assertions broke the
+    /// moment `FetchBytes` was inserted above them, though nothing they were
+    /// asserting had changed.
+    fn rank(priorities: &[SortStep], step: SortStep) -> usize {
+        priorities.iter().position(|&s| s == step).unwrap_or(usize::MAX)
     }
 
     /// Output compression is throughput work any worker can do at any time. The
@@ -5372,7 +5734,8 @@ mod tests {
             consumer_parked: true,
             phase: phase::PHASE2,
         };
-        assert_eq!(get_sort_priorities(&bp)[0], SortStep::Phase2FileWork);
+        let p = get_sort_priorities(&bp);
+        assert!(rank(p, SortStep::Phase2FileWork) < rank(p, SortStep::Compress));
     }
 
     /// With the consumer running, compress-first is preserved exactly: it is the
@@ -5387,7 +5750,8 @@ mod tests {
             consumer_parked: false,
             phase: phase::PHASE2,
         };
-        assert_eq!(get_sort_priorities(&bp)[0], SortStep::Compress);
+        let p = get_sort_priorities(&bp);
+        assert!(rank(p, SortStep::Compress) < rank(p, SortStep::Phase2FileWork));
     }
 
     /// Both steps stay reachable either way -- dropping one would starve it
@@ -5411,7 +5775,10 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_priorities_legacy_returns_compress_only() {
+    fn test_sort_priorities_legacy_drains_compress_and_no_phased_work() {
+        // The legacy/transition phase exists to drain queued jobs, so compression
+        // must be reachable and the phase-specific steps must not be. As above,
+        // `ExtractKeys` self-gates and is exempt.
         let bp = SortBackpressureState {
             decompressed_input_low: false,
             input_eof: false,
@@ -5421,8 +5788,14 @@ mod tests {
             phase: phase::LEGACY,
         };
         let priorities = get_sort_priorities(&bp);
-        assert_eq!(priorities.len(), 1);
-        assert_eq!(priorities[0], SortStep::Compress);
+        assert!(
+            rank(priorities, SortStep::Compress) < rank(priorities, SortStep::Phase2FileWork),
+            "compression drains first"
+        );
+        for step in [SortStep::ReadInputBlocks, SortStep::DecompressInput, SortStep::Phase2FileWork]
+        {
+            assert!(!priorities.contains(&step), "{step:?} belongs to a real phase");
+        }
     }
 
     #[test]
@@ -5442,7 +5815,7 @@ mod tests {
     fn empty_phase2_file() -> Phase2FileState {
         let tmp = tempfile::tempfile().expect("failed to create tempfile");
         let reader = BufReader::with_capacity(1024, tmp);
-        Phase2FileState::new(reader, SpillCodec::Bgzf)
+        Phase2FileState::new(crate::spill_reader::SpillSource::Sequential(reader), SpillCodec::Bgzf)
     }
 
     /// Build a tiny placeholder raw entry whose contents we never decode.
@@ -5945,13 +6318,12 @@ mod tests {
     // for BGZF (whose decoder reads the gzip header itself).
     // ========================================================================
 
-    /// Snapshot the file position by locking the per-file reader. `BufReader`'s
-    /// `stream_position` accounts for any buffered bytes — for a fresh
-    /// `BufReader` whose buffer hasn't been filled this equals the underlying
-    /// `File`'s seek position.
+    /// Snapshot the position of the next byte the per-file reader will serve.
+    /// Both `SpillSource` arms account for whatever they have already buffered,
+    /// so on a reader nothing has read from this is where it will start.
     fn phase2_file_position(state: &Phase2FileState) -> u64 {
         let mut guard = state.reader.lock().expect("reader lock");
-        guard.inner.stream_position().expect("stream_position")
+        guard.inner.position().expect("position")
     }
 
     #[test]
@@ -5964,17 +6336,26 @@ mod tests {
         file.write_all(&[0xAA, 0xBB, 0xCC]).expect("write body");
         drop(file);
 
-        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf);
-        pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
-        let files = pool.phase2_files();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].codec, SpillCodec::Zstd, "ZSPILL_MAGIC must select zstd codec");
-        assert_eq!(
-            phase2_file_position(&files[0]),
-            ZSPILL_MAGIC.len() as u64,
-            "zstd reader must be positioned past the 4-byte magic"
-        );
-        pool.shutdown();
+        // All three shapes: the sequential reader, a pinned scattered one, and
+        // the auto-tuning one that is now the default.
+        for read_streams in [
+            crate::external::ReadStreams::Fixed(1),
+            crate::external::ReadStreams::Fixed(4),
+            crate::external::ReadStreams::Auto,
+        ] {
+            let mut pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Bgzf);
+            pool.read_streams = read_streams;
+            pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
+            let files = pool.phase2_files();
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].codec, SpillCodec::Zstd, "ZSPILL_MAGIC must select zstd codec");
+            assert_eq!(
+                phase2_file_position(&files[0]),
+                ZSPILL_MAGIC.len() as u64,
+                "zstd reader must start past the 4-byte magic at {read_streams:?}"
+            );
+            pool.shutdown();
+        }
     }
 
     #[test]
@@ -5988,17 +6369,26 @@ mod tests {
         file.write_all(&[0x1f, 0x8b, 0x00, 0x00, 0x55, 0x66]).expect("write magic");
         drop(file);
 
-        let pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Zstd);
-        pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
-        let files = pool.phase2_files();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].codec, SpillCodec::Bgzf, "BGZF magic must select bgzf codec");
-        assert_eq!(
-            phase2_file_position(&files[0]),
-            0,
-            "bgzf reader must be rewound to byte 0 so the decoder sees the header"
-        );
-        pool.shutdown();
+        // All three shapes: the sequential reader, a pinned scattered one, and
+        // the auto-tuning one that is now the default.
+        for read_streams in [
+            crate::external::ReadStreams::Fixed(1),
+            crate::external::ReadStreams::Fixed(4),
+            crate::external::ReadStreams::Auto,
+        ] {
+            let mut pool = SortWorkerPool::new(1, 1, 6, SpillCodec::Zstd);
+            pool.read_streams = read_streams;
+            pool.set_phase2_files(std::slice::from_ref(&path)).expect("set_phase2_files");
+            let files = pool.phase2_files();
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].codec, SpillCodec::Bgzf, "BGZF magic must select bgzf codec");
+            assert_eq!(
+                phase2_file_position(&files[0]),
+                0,
+                "bgzf reader must start at byte 0 at {read_streams:?}, for the header"
+            );
+            pool.shutdown();
+        }
     }
 
     #[test]

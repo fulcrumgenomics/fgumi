@@ -96,6 +96,57 @@ enum Pattern {
     Interleaved,
 }
 
+/// What the reader tells the kernel about the access pattern it is about to make.
+///
+/// The question these exist to answer: a blocking `read()` keeps roughly one
+/// read-ahead window outstanding at the device, and on this volume that is ~3x
+/// too little to saturate it (358 MB/s single-stream against a ~1050 MB/s cap).
+/// Four threads fix that by carrying four windows. These advise calls try to fix
+/// it *without* extra threads, by asking the kernel to keep the queue primed on
+/// a single ordered stream -- which, unlike parallel streams, cannot deliver
+/// blocks out of order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Advice {
+    /// No hint: the default read-ahead window and nothing else.
+    None,
+    /// `POSIX_FADV_SEQUENTIAL` once per stream. Linux doubles the read-ahead
+    /// window for the file; a 2x lever at most.
+    Sequential,
+    /// `POSIX_FADV_WILLNEED` for a window ahead of the cursor, reissued as the
+    /// cursor advances. Not bounded by the read-ahead window, so this is the one
+    /// that can actually fill the device queue.
+    WillNeed,
+}
+
+/// Issue one `posix_fadvise` call, or do nothing where it does not exist.
+///
+/// Errors are deliberately ignored: `fadvise` is a *hint*, and a kernel that
+/// declines it (memory pressure, an unsupported filesystem) must not fail the
+/// read. A hint that was dropped shows up as a throughput number that did not
+/// move, which is exactly the result the experiment is testing for.
+#[cfg(target_os = "linux")]
+fn advise(file: &File, offset: u64, len: u64, advice: nix::fcntl::PosixFadviseAdvice) {
+    let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+    let len = i64::try_from(len).unwrap_or(i64::MAX);
+    let _ = nix::fcntl::posix_fadvise(file, offset, len, advice);
+}
+
+#[cfg(target_os = "linux")]
+fn advise_sequential(file: &File, offset: u64, len: u64) {
+    advise(file, offset, len, nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL);
+}
+
+#[cfg(target_os = "linux")]
+fn advise_willneed(file: &File, offset: u64, len: u64) {
+    advise(file, offset, len, nix::fcntl::PosixFadviseAdvice::POSIX_FADV_WILLNEED);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn advise_sequential(_file: &File, _offset: u64, _len: u64) {}
+
+#[cfg(not(target_os = "linux"))]
+fn advise_willneed(_file: &File, _offset: u64, _len: u64) {}
+
 struct Args {
     rung: String,
     path: PathBuf,
@@ -106,6 +157,9 @@ struct Args {
     chunk_bytes: u64,
     writer_mbps: u64,
     writer_dir: Option<PathBuf>,
+    advice: Advice,
+    /// Bytes ahead of the cursor to keep advised, for `Advice::WillNeed`.
+    advise_ahead: u64,
 }
 
 fn parse_args() -> Result<Args> {
@@ -121,6 +175,11 @@ fn parse_args() -> Result<Args> {
     let mut chunk_bytes = 4 * 1024 * 1024u64;
     let mut writer_mbps = 0u64;
     let mut writer_dir = None;
+    let mut advice = Advice::None;
+    // 8 MiB: four 2 MiB reads of lead, comfortably more than the ~400 KB the
+    // device's bandwidth-delay product asks for, so a null result cannot be
+    // blamed on advising too little.
+    let mut advise_ahead = 8 * 1024 * 1024u64;
     while let Some(flag) = it.next() {
         let value = it.next().with_context(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
@@ -142,6 +201,15 @@ fn parse_args() -> Result<Args> {
             }
             "--chunk" => chunk_bytes = value.parse().context("--chunk")?,
             "--writer-mbps" => writer_mbps = value.parse().context("--writer-mbps")?,
+            "--fadvise" => {
+                advice = match value.as_str() {
+                    "none" => Advice::None,
+                    "sequential" => Advice::Sequential,
+                    "willneed" => Advice::WillNeed,
+                    other => bail!("--fadvise must be none|sequential|willneed, got {other}"),
+                };
+            }
+            "--advise-ahead" => advise_ahead = value.parse().context("--advise-ahead")?,
             "--writer-dir" => writer_dir = Some(PathBuf::from(value)),
             other => bail!("unknown flag {other}"),
         }
@@ -175,6 +243,8 @@ fn parse_args() -> Result<Args> {
         chunk_bytes,
         writer_mbps,
         writer_dir,
+        advice,
+        advise_ahead,
     })
 }
 
@@ -255,15 +325,38 @@ fn rung_raw(args: &Args) -> Result<Tally> {
         let chunk = args.chunk_bytes;
         let start = stream * span;
         let end = ((stream + 1) * span).min(total);
+        let advice = args.advice;
+        let advise_ahead = args.advise_ahead;
         handles.push(std::thread::spawn(move || -> Result<u64> {
             let mut buf = vec![0u8; buf_bytes];
             let mut read_total = 0u64;
+            if advice == Advice::Sequential {
+                advise_sequential(&file, start, end.saturating_sub(start));
+            }
             match pattern {
                 Pattern::Contiguous => {
                     let mut offset = start;
+                    // Prime the queue before the first read, so the very first
+                    // call is not the one uncovered case.
+                    if advice == Advice::WillNeed {
+                        advise_willneed(&file, offset, advise_ahead.min(end - offset));
+                    }
                     while offset < end {
                         let want = usize::try_from((end - offset).min(buf_bytes as u64))
                             .expect("clamped to buffer size");
+                        // Advise the window *beyond* what this read will consume,
+                        // so the device is working on the next span while this
+                        // one is being copied out.
+                        if advice == Advice::WillNeed {
+                            let ahead_start = offset + want as u64;
+                            if ahead_start < end {
+                                advise_willneed(
+                                    &file,
+                                    ahead_start,
+                                    advise_ahead.min(end - ahead_start),
+                                );
+                            }
+                        }
                         let n = file.read_at(&mut buf[..want], offset)?;
                         if n == 0 {
                             break;
