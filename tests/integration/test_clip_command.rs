@@ -47,6 +47,174 @@ fn write_paired_bam_with_header(
     writer.try_finish().expect("Failed to finish BAM");
 }
 
+// ============================================================================
+// --check-crc / --no-check-crc on the multi-threaded (`--threads N`) path (#800)
+//
+// clip is the one command whose `--threads N` mode decodes its input through the
+// unified pipeline (not the single-threaded raw reader). These prove that path
+// honors the flag: `--no-check-crc` accepts a corrupted block, while the default
+// and `--check-crc` reject it.
+// ============================================================================
+
+/// Flip a byte in the last BGZF block's CRC32 footer, so decoding that block
+/// fails only when CRC verification is on. The input must span at least two
+/// blocks so the corrupted block is not the header's block (which always
+/// verifies during the header parse).
+fn corrupt_last_block_crc(path: &Path) {
+    use fgumi_lib::bgzf_reader::{BGZF_FOOTER_SIZE, RawBgzfBlock, read_raw_blocks};
+    let mut bytes = fs::read(path).expect("read bam for corruption");
+    let mut cursor: &[u8] = &bytes;
+    let blocks = read_raw_blocks(&mut cursor, 100_000).expect("read bgzf blocks from test bam");
+    assert!(
+        blocks.len() >= 2,
+        "test input must span >= 2 BGZF blocks so the corrupted block isn't the header's; got {}",
+        blocks.len()
+    );
+    let offset: usize = blocks[..blocks.len() - 1].iter().map(RawBgzfBlock::len).sum();
+    let last = blocks.last().expect("checked len >= 2 above");
+    let crc_off = offset + last.len() - BGZF_FOOTER_SIZE;
+    bytes[crc_off] ^= 0x01;
+    fs::write(path, bytes).expect("write corrupted bam");
+}
+
+/// Write enough query-grouped read pairs to span more than one BGZF block, so
+/// the corrupted last block is a record block rather than the header's.
+fn create_multiblock_clip_bam(path: &Path) {
+    let header = create_minimal_header("chr1", 10000);
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
+    writer.write_header(&header).expect("Failed to write header");
+    for i in 0..3000u32 {
+        let name = format!("read{i}");
+        let mut r1 = SamBuilder::new();
+        r1.read_name(name.as_bytes())
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4])
+            .mate_ref_id(0)
+            .mate_pos(103)
+            .template_length(12);
+        let mut r2 = SamBuilder::new();
+        r2.read_name(name.as_bytes())
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .ref_id(0)
+            .pos(103)
+            .mapq(60)
+            .cigar_ops(&[8 << 4])
+            .mate_ref_id(0)
+            .mate_pos(99)
+            .template_length(-12);
+        writer.write_alignment_record(&header, &to_record_buf(&r1.build())).expect("R1");
+        writer.write_alignment_record(&header, &to_record_buf(&r2.build())).expect("R2");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+}
+
+/// Build clip's `--threads N` argv with a clipping option set (clip requires at
+/// least one), appending any extra flags (e.g. `--no-check-crc`).
+fn clip_threads_args<'a>(
+    input: &'a str,
+    output: &'a str,
+    reference: &'a str,
+    extra: &[&'a str],
+) -> Vec<&'a str> {
+    let mut args = vec![
+        "clip",
+        "--input",
+        input,
+        "--output",
+        output,
+        "--ref",
+        reference,
+        "--clip-overlapping-reads",
+        "--threads",
+        "2",
+    ];
+    args.extend_from_slice(extra);
+    args
+}
+
+/// `--no-check-crc` must let clip's `--threads N` pipeline decode accept a
+/// corrupted BGZF CRC32 and complete (#800).
+#[test]
+fn test_clip_threads_no_check_crc_accepts_corrupted_crc() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+    create_multiblock_clip_bam(&input_bam);
+    corrupt_last_block_crc(&input_bam);
+
+    let cmd = Clip::try_parse_from(clip_threads_args(
+        input_bam.to_str().unwrap(),
+        output_bam.to_str().unwrap(),
+        ref_path.to_str().unwrap(),
+        &["--no-check-crc"],
+    ))
+    .expect("failed to parse clip args");
+    cmd.execute("fgumi clip")
+        .expect("--no-check-crc must accept a corrupted BGZF CRC32 under --threads");
+    assert!(output_bam.exists(), "Output BAM not created");
+}
+
+/// Default (verify-on for file input) must reject the same corrupted CRC32 under
+/// `--threads N`.
+#[test]
+fn test_clip_threads_rejects_corrupted_crc_by_default() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+    create_multiblock_clip_bam(&input_bam);
+    corrupt_last_block_crc(&input_bam);
+
+    let cmd = Clip::try_parse_from(clip_threads_args(
+        input_bam.to_str().unwrap(),
+        output_bam.to_str().unwrap(),
+        ref_path.to_str().unwrap(),
+        &[],
+    ))
+    .expect("failed to parse clip args");
+    let err = cmd
+        .execute("fgumi clip")
+        .expect_err("default (verify-on for file input) must reject a corrupted BGZF CRC32");
+    assert!(
+        format!("{err:#}").to_uppercase().contains("CRC32"),
+        "error should mention CRC32: {err:#}"
+    );
+}
+
+/// `--check-crc` must also reject the corrupted CRC32 under `--threads N`.
+#[test]
+fn test_clip_threads_check_crc_rejects_corrupted_crc() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+    create_multiblock_clip_bam(&input_bam);
+    corrupt_last_block_crc(&input_bam);
+
+    let cmd = Clip::try_parse_from(clip_threads_args(
+        input_bam.to_str().unwrap(),
+        output_bam.to_str().unwrap(),
+        ref_path.to_str().unwrap(),
+        &["--check-crc"],
+    ))
+    .expect("failed to parse clip args");
+    let err =
+        cmd.execute("fgumi clip").expect_err("--check-crc must reject a corrupted BGZF CRC32");
+    assert!(
+        format!("{err:#}").to_uppercase().contains("CRC32"),
+        "error should mention CRC32: {err:#}"
+    );
+}
+
 /// CLIP3-05: clip must reject coordinate-sorted (non-query-grouped) input,
 /// matching fgbio's `Bams.requireQueryGrouped`. On coordinate-sorted input mates
 /// scatter, so pair clip / overlap / mate-fix silently no-op — hard-fail instead.

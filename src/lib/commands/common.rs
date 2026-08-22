@@ -447,18 +447,12 @@ pub struct BamIoOptions {
     /// transferred, or copied since it was written, where a flipped bit is
     /// exactly what CRC32 exists to catch. Pass `--check-crc` to force
     /// verification on (e.g. for stdin input you don't trust). Mutually
-    /// exclusive with `--no-check-crc`. Coverage varies by command:
-    /// `clip`/`codec`/`duplex`/`simplex`/`downsample` honor it whether run
-    /// single- or multi-threaded; `correct`/`group` honor it only with
-    /// `--threads N` (their single-threaded mode falls back to a reader that
-    /// always verifies). Every run logs a `CRC verify:` line at startup stating
-    /// what actually happened. For `correct`/`group` the BAM **header** block is
-    /// always CRC-verified regardless of this flag, because their header parse
-    /// goes through a decoder with no CRC-skip knob; there `--no-check-crc`
-    /// applies to the record body only. The raw-reader commands
-    /// (`clip`/`codec`/`duplex`/`simplex`/`downsample`) parse the header through
-    /// the same fgumi-bgzf decoder as the body when single-threaded, so
-    /// `--no-check-crc` skips the header block's CRC there too.
+    /// exclusive with `--no-check-crc`. Honored on every command's input decode,
+    /// in both single- and multi-threaded modes: single-threaded decodes route
+    /// through fgumi-bgzf, and `--threads N` runs (e.g. `clip --threads N`) decode
+    /// through the unified pipeline, which takes its CRC policy from the same
+    /// flag. Every run logs a `CRC verify:` line at startup stating what actually
+    /// happened.
     #[arg(long = "check-crc", default_value_t = false, conflicts_with = "no_check_crc")]
     pub check_crc: bool,
 
@@ -536,27 +530,6 @@ impl BamIoOptions {
             ""
         };
         log::info!("CRC verify: {}{reason}", if effective { "on" } else { "off" });
-    }
-
-    /// Log the CRC-verification setting for a command whose single-threaded
-    /// fast path bypasses the CRC-skip-capable fgumi-bgzf decoder in favor of
-    /// noodles-bgzf's own BGZF reader (which always verifies and has no
-    /// public knob to disable it). Since the raw-reader unify (#800), only
-    /// `correct` and `group` still take this path: their single-threaded mode
-    /// reads through `create_bam_reader_for_pipeline_with_opts` + a manual
-    /// noodles BGZF decode, not through `create_raw_bam_reader[_with_opts]`.
-    /// `pipeline_mode` is `true` when the wireable 7-step pipeline will run
-    /// instead of the fast path, in which case this defers to
-    /// [`log_effective_check_crc`](Self::log_effective_check_crc).
-    pub fn log_effective_check_crc_for_fast_path(&self, pipeline_mode: bool) {
-        if pipeline_mode {
-            self.log_effective_check_crc();
-        } else {
-            log::info!(
-                "CRC verify: on (single-threaded fast path always verifies; \
-                 --check-crc/--no-check-crc apply only with --threads)"
-            );
-        }
     }
 
     /// Build [`fgumi_bam_io::PipelineReaderOpts`] from the async-reader flag

@@ -537,18 +537,60 @@ pub fn create_raw_bam_reader_with_opts<P: AsRef<Path>>(
 ) -> Result<(RawBamReaderAuto, Header)> {
     let path_ref = path.as_ref();
     let bgzf_reader = open_bgzf_reader(path_ref, opts, threads, "raw BAM reader")?;
+    finish_raw_bam_reader(bgzf_reader, &path_ref.display().to_string())
+}
 
-    // Use noodles to read the header, then extract the BGZF reader
+/// Build a raw BAM reader over an already-opened, still-compressed BGZF byte
+/// stream, decoding through fgumi-bgzf so `opts.verify_crc` is honored.
+///
+/// The single-threaded `correct` and `group` fast paths open their input exactly
+/// once (required for stdin, which cannot be re-opened), parse the header for the
+/// output, then must skip the header again to reach records. That second decode
+/// is what this factory provides: routing it through [`FgumiBgzfReader`] — rather
+/// than noodles' always-verify BGZF reader — makes `--no-check-crc` take effect
+/// on those fast paths too (#800), matching the `--threads N` unified pipeline
+/// (which already honors `PipelineConfig::verify_crc`).
+///
+/// The input is decoded single-threaded: this is the fast path taken precisely
+/// when the caller passed no `--threads`, so no worker pool is warranted.
+///
+/// The returned header is the stream's own header, re-parsed here; callers that
+/// have already augmented a header (e.g. synthesized @HD or added @PG) keep their
+/// own copy and use this only to position the reader past the header bytes.
+///
+/// # Errors
+///
+/// Returns an error if the BAM header cannot be read from the stream.
+pub fn create_raw_bam_reader_from_stream_with_opts(
+    reader: Box<dyn Read + Send>,
+    opts: PipelineReaderOpts,
+) -> Result<(RawBamReaderAuto, Header)> {
+    // Buffer before the frame reader for the same reason as `open_bgzf_reader`:
+    // the BGZF frame reader asks for an 18-byte header and then a block body, so
+    // an unbuffered source pays a syscall per block (and worse on stdin).
+    let buffered: Box<dyn Read + Send> =
+        Box::new(BufReader::with_capacity(BGZF_INPUT_BUFFER_SIZE, reader));
+    let bgzf_reader = BgzfReaderEnum::Fgumi(FgumiBgzfReader::new(buffered, opts.verify_crc));
+    finish_raw_bam_reader(bgzf_reader, "BAM stream")
+}
+
+/// Parse the BAM header from `bgzf_reader` and wrap the positioned decoder in a
+/// [`RawBamReader`]. Shared tail of [`create_raw_bam_reader_with_opts`] and
+/// [`create_raw_bam_reader_from_stream_with_opts`]: noodles is used only to
+/// consume the header, after which the underlying BGZF decoder — already the
+/// fgumi-bgzf or multithreaded arm chosen by the caller — is handed to the raw
+/// reader for record access. `source` names the input in the header-read error.
+fn finish_raw_bam_reader(
+    bgzf_reader: BgzfReaderEnum,
+    source: &str,
+) -> Result<(RawBamReaderAuto, Header)> {
     let mut noodles_reader = noodles::bam::io::Reader::from(bgzf_reader);
     let header = noodles_reader
         .read_header()
-        .with_context(|| format!("Failed to read header from: {}", path_ref.display()))?;
+        .with_context(|| format!("Failed to read header from: {source}"))?;
 
-    // Get back the BGZF reader (header has been consumed)
-    let bgzf_reader = noodles_reader.into_inner();
-
-    // Wrap in our raw reader
-    let raw_reader = RawBamReader::new(bgzf_reader);
+    // Get back the BGZF reader (header has been consumed) and wrap it.
+    let raw_reader = RawBamReader::new(noodles_reader.into_inner());
 
     Ok((raw_reader, header))
 }
@@ -1244,6 +1286,40 @@ mod tests {
         // verify_crc: false -> the same file reads clean (RED on the noodles path).
         let opts_skip = PipelineReaderOpts { verify_crc: false, ..PipelineReaderOpts::default() };
         let (mut reader, _header) = create_raw_bam_reader_with_opts(file.path(), 1, opts_skip)?;
+        let count = count_raw_records(&mut reader)
+            .expect("verify_crc: false must accept a corrupted BGZF CRC32");
+        assert_eq!(count, 8000, "all records read with verify_crc: false");
+        Ok(())
+    }
+
+    /// The from-stream raw reader must honor `verify_crc` exactly as the
+    /// from-path reader does. This is the factory the single-threaded `correct`
+    /// and `group` fast paths use on their already-opened stream (opened once so
+    /// stdin — which cannot be re-opened — works), so `--no-check-crc` must take
+    /// effect there too (#800). Against the noodles path these commands used
+    /// before, the `verify_crc: false` case could not pass — noodles always
+    /// verifies — so it is the red test for routing them through fgumi-bgzf.
+    #[test]
+    fn test_raw_reader_from_stream_honors_verify_crc() -> Result<()> {
+        let file = tempfile::Builder::new().suffix(".bam").tempfile()?;
+        write_bgzf_bam(file.path(), &many_record_sam_text(8000));
+        corrupt_last_block_crc(file.path());
+        let bytes = std::fs::read(file.path())?;
+
+        // verify_crc: true -> reading the corrupted block must error.
+        let opts_verify = PipelineReaderOpts { verify_crc: true, ..PipelineReaderOpts::default() };
+        let stream: Box<dyn Read + Send> = Box::new(io::Cursor::new(bytes.clone()));
+        let (mut reader, _header) =
+            create_raw_bam_reader_from_stream_with_opts(stream, opts_verify)?;
+        assert!(
+            count_raw_records(&mut reader).is_err(),
+            "verify_crc: true must reject a corrupted BGZF CRC32"
+        );
+
+        // verify_crc: false -> the same bytes read clean (RED on the noodles path).
+        let opts_skip = PipelineReaderOpts { verify_crc: false, ..PipelineReaderOpts::default() };
+        let stream: Box<dyn Read + Send> = Box::new(io::Cursor::new(bytes));
+        let (mut reader, _header) = create_raw_bam_reader_from_stream_with_opts(stream, opts_skip)?;
         let count = count_raw_records(&mut reader)
             .expect("verify_crc: false must accept a corrupted BGZF CRC32");
         assert_eq!(count, 8000, "all records read with verify_crc: false");
