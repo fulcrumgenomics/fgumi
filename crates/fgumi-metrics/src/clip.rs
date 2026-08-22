@@ -120,18 +120,15 @@ impl ClippingMetrics {
     /// * `counts` - The clip counts for this operation
     #[cfg(feature = "clip")]
     pub fn update_raw(&mut self, record: &fgumi_raw_bam::RawRecord, counts: ClipCounts) {
-        use fgumi_raw_bam::get_cigar_ops;
+        use fgumi_raw_bam::RawRecordView;
 
         self.reads += 1;
 
-        // Count aligned bases (M/=/X ops) from raw CIGAR
-        let cigar_ops = get_cigar_ops(record.as_ref());
-        let aligned_bases: usize = cigar_ops
-            .iter()
-            .filter(|&&op| {
-                matches!(op & 0xF, 0 | 7 | 8) // Match, SequenceMatch, SequenceMismatch
-            })
-            .map(|&op| (op >> 4) as usize)
+        // Count aligned bases (M/=/X ops) directly from raw CIGAR bytes (zero allocation).
+        let aligned_bases: usize = RawRecordView::new(record.as_ref())
+            .cigar_ops_iter()
+            .filter(|&op| matches!(op & 0xF, 0 | 7 | 8)) // Match, SequenceMatch, SequenceMismatch
+            .map(|op| (op >> 4) as usize)
             .sum();
         self.bases += aligned_bases;
 

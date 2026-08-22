@@ -1092,12 +1092,11 @@ pub fn resolve_ref_bases_for_record(
     // avoiding a HashMap lookup per position.
     let ref_seq = reference.sequence_for(ref_name);
 
-    let cigar_ops = bam_fields::get_cigar_ops(record);
     let len = RawRecordView::new(record).l_seq() as usize;
     let mut result = Vec::with_capacity(len);
     let mut ref_pos = alignment_start;
 
-    for &op in &cigar_ops {
+    for op in RawRecordView::new(record).cigar_ops_iter() {
         let op_len = (op >> 4) as usize;
         let kind = bam_fields::cigar_op_kind(op);
         match kind {
