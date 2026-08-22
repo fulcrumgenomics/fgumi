@@ -1357,6 +1357,9 @@ pub(crate) struct MainThreadChunkConsumer<K: RawSortKey + 'static> {
     /// Shared pool state, for the epoch clock and the trace counters that
     /// record both halves of a producer/consumer handoff.
     shared: Arc<crate::worker_pool::SharedPipelineState>,
+    /// Decompression state, so this thread can serve itself a block that has been
+    /// read but not yet claimed instead of parking for a worker to do it.
+    decomp: crate::worker_pool::DecompressorSet,
     /// Source the previous block came from, and how many consecutive blocks
     /// have now come from it. Says whether the merge dwells on one run at a
     /// time -- in which case lookahead on that run would pay -- or hops.
@@ -1495,9 +1498,11 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
     ) -> Self {
         let parser_state = (0..files.len()).map(|_| SourceParserState::new()).collect();
         let stalls = crate::merge_stalls::ConsumerStallTracker::new(files.len());
+        let codec = files.first().map_or(crate::codec::SpillCodec::Bgzf, |f| f.codec);
         Self {
             files,
             parser_state,
+            decomp: crate::worker_pool::DecompressorSet::for_codec(codec),
             decompression_error,
             chunk_read_error,
             worker_panicked,
@@ -1786,10 +1791,42 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             // Sampled BEFORE the park, not after: the question is why nobody had
             // already started on this block, and the pool's state on *resume* is
             // the answer to a different question -- by then somebody has.
+            // Before sleeping: if the block this thread is waiting for has already
+            // been read and nobody has claimed it, decompress it here rather than
+            // parking. That trades ~53us of work for a ~190us wait on a worker
+            // that has to be woken first, and it removes the producer-to-consumer
+            // handoff instead of trying to schedule around it -- which is what
+            // eight scheduling interventions failed to do.
+            //
+            // Loops while it keeps succeeding: the same argument applies to the
+            // blocks after the one immediately needed, and serving them here is
+            // depth on exactly the file being drained, which is where >=94% of
+            // consumed blocks come from. Bounded by the FIFO running dry or the
+            // reorder cap, both of which `try_pop_raw_for_decompress` enforces, so
+            // this cannot spin.
+            //
+            // Only on the way into a park, never in place of merging: this thread
+            // is the serial bottleneck at 76s of a 166s merge, and taking work it
+            // could have delegated while it still has records to emit would be
+            // strictly worse.
+            if self.serve_self_instead_of_parking(source_id) {
+                // Self-service is not a park: leave `parked_yet` untouched so the
+                // first real park of this pull still records a `stalled_pull`.
+                // Serving before the first park would otherwise suppress that
+                // increment and understate the stall rate.
+                continue;
+            }
+
             let supply = self.shared.park_supply_now();
+            // Published for `get_sort_priorities`: while this is set, a worker
+            // serves the awaited file before it drains output compression.
+            // Ordering is Release/Acquire-free on purpose -- a worker reading it
+            // one iteration late costs one deferred block, not correctness.
+            self.shared.consumer_parked.store(true, ord);
 
             let park_start = Instant::now();
             std::thread::park();
+            self.shared.consumer_parked.store(false, ord);
             let parked_ns = crate::merge_trace::elapsed_nanos(park_start);
             self.shared.park_supply.record(supply, parked_ns);
             self.stalls.record_park(source_id, parked_ns, !parked_yet);
@@ -1815,6 +1852,46 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             self.shared.park_attribution.record(segments, claim != 0, ready as u64);
             parked_yet = true;
         }
+    }
+
+    /// Decompress this source's already-read blocks on this thread, returning
+    /// whether anything was published.
+    ///
+    /// Called only on the way into a park. If the block the merge is waiting for
+    /// has been read and nobody has claimed it -- 12% of parks -- decompressing it
+    /// here trades ~53us of work for a ~190us wait on a worker that has to be
+    /// woken first. It removes the producer-to-consumer handoff instead of trying
+    /// to schedule around it, which is what eight scheduling interventions failed
+    /// to do. The decisive evidence: raising `PHASE2_DECOMP_CAP` 8 -> 128 cut parks
+    /// from 978,325 to 400,487 and left total park time at 89.6s against 89.7s, so
+    /// the cost is per block, not per park, and no amount of buffering reaches it.
+    ///
+    /// Loops while it keeps succeeding, because the same argument applies to the
+    /// blocks after the one immediately needed, and serving them here is depth on
+    /// exactly the file being drained -- where >=94% of consumed blocks come from
+    /// (median run is 1 block, but the mean is 31.7 and p99 is 512). It cannot
+    /// spin: each iteration either pops a block or stops, bounded by the FIFO
+    /// emptying or the reorder cap, both enforced inside
+    /// `try_pop_raw_for_decompress`.
+    ///
+    /// **Never in place of merging.** This thread is the serial bottleneck, 76s of
+    /// a 166s merge, so taking work it could have delegated while it still has
+    /// records to emit would be strictly worse. The only safe moment is the one
+    /// where it was about to sleep anyway.
+    fn serve_self_instead_of_parking(&mut self, source_id: usize) -> bool {
+        let mut served = false;
+        while crate::worker_pool::SortWorkerPool::consumer_decompress_one(
+            &self.shared,
+            &mut self.decomp,
+            &self.files[source_id],
+            source_id,
+        ) {
+            served = true;
+        }
+        if served {
+            self.shared.consumer_self_served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        served
     }
 
     /// Parse the next record from a source's byte stream.
@@ -3095,6 +3172,7 @@ impl RawExternalSorter {
         )?;
 
         let mut records_merged = 0u64;
+        let mut merge_progress_batch = crate::progress_batch::BatchedProgress::new();
         let merge_progress = ProgressTracker::new("Merged records").with_interval(1_000_000);
         // Set when an input is found not to be monotonic in the merge order:
         // (source index into `inputs`, 1-based record number within that input).
@@ -3109,7 +3187,7 @@ impl RawExternalSorter {
 
             writer.write_raw_record(&records[winner])?;
             records_merged += 1;
-            merge_progress.log_if_needed(1);
+            merge_progress_batch.tick(&merge_progress);
 
             let reader_idx = source_map[winner];
             if let Some(raw_record) = readers[reader_idx].next() {
@@ -3155,6 +3233,9 @@ impl RawExternalSorter {
 
         writer.finish()?;
         out_target.persist()?;
+        // Must precede log_final: the tracker has not seen the last partial batch,
+        // and without this the reported total comes up short by up to one batch.
+        merge_progress_batch.flush(&merge_progress);
         merge_progress.log_final();
 
         Ok(records_merged)
@@ -4640,6 +4721,10 @@ impl RawExternalSorter {
         // never stalled is precisely the run with a complete lifecycle trace and
         // nothing to say above. `log_block_lifecycle` carries its own gate.
         Self::log_block_lifecycle(pool);
+
+        // Also outside the gate: these two counters say whether the targeted-depth
+        // paths ran at all, which matters most on the runs that did not stall.
+        Self::log_merge_validity_gates(pool);
     }
 
     /// Nanoseconds as seconds.
@@ -4655,6 +4740,36 @@ impl RawExternalSorter {
             return 0.0;
         }
         100.0 * part as f64 / whole as f64
+    }
+
+    /// Validity gates for the two targeted-depth paths in the merge.
+    ///
+    /// Both changes are inert in a way that a wall-clock number cannot reveal: the
+    /// consumer may never find an unclaimed block to decompress, and the loser tree
+    /// may never name a next source. Either would land as "no measurable change"
+    /// rather than as "the mechanism did not run", so each gets a counter and each
+    /// counter is printed.
+    fn log_merge_validity_gates(pool: &SortWorkerPool) {
+        let self_served = pool.consumer_self_served();
+        if self_served > 0 {
+            info!(
+                "  Consumer served itself: {self_served} parks avoided by decompressing an \
+                 already-read block inline"
+            );
+        }
+        let predictions = pool.phase2_predictions();
+        if predictions > 0 {
+            info!("  Next-source predictions published: {predictions}");
+        }
+    }
+
+    /// `total` divided over `claims`, or 0.0 when there are none.
+    #[expect(clippy::cast_precision_loss, reason = "counts stay far below 2^52")]
+    fn per_claim(total: u64, claims: u64) -> f64 {
+        if claims == 0 {
+            return 0.0;
+        }
+        total as f64 / claims as f64
     }
 
     /// Log a latency distribution for every stage a block passes through.
@@ -5190,6 +5305,7 @@ impl RawExternalSorter {
         let mut writer = PooledBamWriter::new(Arc::clone(pool), output, &output_header)?;
 
         let mut records_merged = 0u64;
+        let mut merge_progress_batch = crate::progress_batch::BatchedProgress::new();
         let merge_progress = ProgressTracker::new("Merged records")
             .with_interval(1_000_000)
             .with_total(total_records);
@@ -5237,9 +5353,20 @@ impl RawExternalSorter {
         let reassembled_before = RECORD_REASSEMBLED.load(std::sync::atomic::Ordering::Relaxed);
         let loop_start = Instant::now();
 
+        let mut published_src: Option<usize> = None;
         while tree.winner_is_active() {
             let winner = tree.winner();
             let src_idx = source_map[winner];
+            // Publish the next likely source, but only when the run changes --
+            // ~167K times rather than once per record. The pool gives it the deep
+            // read allowance, so its first read starts while the consumer is still
+            // draining ~300 blocks from the current file, instead of after it has
+            // already stalled. A wrong prediction costs one deep read on a file the
+            // merge will reach eventually; there is no correctness component.
+            if published_src != Some(src_idx) {
+                published_src = Some(src_idx);
+                pool.set_phase2_next_source(tree.runner_up().map(|w| source_map[w]));
+            }
             let sample_this = sample_countdown == 0;
             if sample_this {
                 sample_countdown = merge_sample_interval - 1;
@@ -5257,7 +5384,7 @@ impl RawExternalSorter {
             }
 
             records_merged += 1;
-            merge_progress.log_if_needed(1);
+            merge_progress_batch.tick(&merge_progress);
 
             if merge_probe.should_sample(records_merged) {
                 let depths = pool.phase1_queue_depths();
@@ -5361,6 +5488,9 @@ impl RawExternalSorter {
         );
         Self::log_stage_latency(pool, &writer_stats);
 
+        // Must precede log_final: the tracker has not seen the last partial batch,
+        // and without this the reported total comes up short by up to one batch.
+        merge_progress_batch.flush(&merge_progress);
         merge_progress.log_final();
         log_snapshot("phase2.end", 0);
 
@@ -5416,6 +5546,7 @@ impl RawExternalSorter {
         let mut tree = LoserTree::new(initial_keys);
 
         let mut writer = PooledBamWriter::new_indexing(Arc::clone(pool), output, &output_header)?;
+        let mut merge_progress_batch = crate::progress_batch::BatchedProgress::new();
         let merge_progress = ProgressTracker::new("Merged records")
             .with_interval(1_000_000)
             .with_total(total_records);
@@ -5431,13 +5562,26 @@ impl RawExternalSorter {
         }
         let loop_start = Instant::now();
         let mut records_merged: u64 = 0;
+        let mut published_src: Option<usize> = None;
         while tree.winner_is_active() {
             let winner = tree.winner();
             let src_idx = source_map[winner];
+            // Publish the next likely source, but only when the run changes. The
+            // pool gives it the deep read allowance, so its first read starts
+            // while the consumer is still draining the current file instead of
+            // after it has already stalled. A wrong prediction costs one deep
+            // read on a file the merge will reach anyway; there is no correctness
+            // component. Mirrors `merge_chunks_generic`; without it the indexed
+            // path -- the default coordinate sort -- gets no predictive
+            // read-ahead.
+            if published_src != Some(src_idx) {
+                published_src = Some(src_idx);
+                pool.set_phase2_next_source(tree.runner_up().map(|w| source_map[w]));
+            }
             let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref())?;
             writer.write_raw_record(record_bytes)?;
             records_merged += 1;
-            merge_progress.log_if_needed(1);
+            merge_progress_batch.tick(&merge_progress);
 
             if let Some(key) = sources[src_idx].advance(guard.consumer_mut())? {
                 tree.replace_winner(key);
@@ -5506,6 +5650,9 @@ impl RawExternalSorter {
         // rows at all.
         Self::log_stage_latency(pool, &writer_stats);
 
+        // Must precede log_final: the tracker has not seen the last partial batch,
+        // and without this the reported total comes up short by up to one batch.
+        merge_progress_batch.flush(&merge_progress);
         merge_progress.log_final();
         Ok((index, records_merged))
     }

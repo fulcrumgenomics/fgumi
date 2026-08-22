@@ -134,6 +134,47 @@ impl<K: Ord> LoserTree<K> {
         self.losers[0]
     }
 
+    /// The source most likely to be consumed after the winner, or `None` when
+    /// fewer than two sources remain.
+    ///
+    /// The runner-up is always among the losers stored along the winner's
+    /// root-to-leaf path -- anything eliminated elsewhere in the tree lost to a
+    /// source that itself lost to the winner. So this is O(log k) comparisons over
+    /// existing state, ~6 for a 44-way merge, and needs no new bookkeeping.
+    ///
+    /// `losers[1]` alone is NOT the answer, which is the tempting O(1) shortcut:
+    /// after a replay that node holds whoever lost the final comparison of *that*
+    /// replay, not the global second-smallest. With keys `[50, 100, 30, 20]` the
+    /// winner is source 3 and `losers[1]` is source 0 (key 50), while the true
+    /// runner-up is source 2 (key 30).
+    ///
+    /// It exists to be read *predictively*. The merge starves at run transitions:
+    /// only 2,475 of 167,624 source switches starve, but each costs ~20ms against
+    /// an 8.4ms read latency -- the read had not been started when the consumer
+    /// arrived. Depth cannot fix that (doubling the read-ahead cap moved the
+    /// starved share of park time not at all, 99% to 99%), but knowing which file
+    /// is next, ~300 blocks before it is needed, can.
+    #[must_use]
+    pub fn runner_up(&self) -> Option<usize> {
+        if self.num_active < 2 {
+            return None;
+        }
+        let winner = self.losers[0];
+        let mut node = self.leaf_to_node(winner);
+        let mut best: Option<usize> = None;
+        while node > 0 {
+            let candidate = self.losers[node];
+            if candidate != EMPTY && self.active[candidate] {
+                best = Some(match best {
+                    Some(b) if self.is_greater(candidate, b) => b,
+                    _ => candidate,
+                });
+            }
+            node >>= 1;
+        }
+        best
+    }
+
     /// Check if the winner is still an active source.
     #[inline]
     #[must_use]
@@ -384,5 +425,42 @@ mod tests {
         }
 
         assert_eq!(result, (1..=10).collect::<Vec<i32>>());
+    }
+    /// The runner-up predicts the source the merge will consume after the current
+    /// winner run. It starts that source's disk read ~300 blocks early. Getting it
+    /// wrong prefetches the wrong file, which is how grab-N cost 36%.
+    #[test]
+    fn test_runner_up_is_the_second_smallest_key() {
+        let tree = LoserTree::new(vec![50u32, 10, 30, 20]);
+        assert_eq!(tree.winner(), 1, "guard: 10 is the winner");
+        assert_eq!(tree.runner_up(), Some(3), "20 is next, at source 3");
+    }
+
+    /// Must track the tree, not a stale snapshot: after the winner advances the
+    /// prediction has to move with it.
+    #[test]
+    fn test_runner_up_follows_the_tree_as_the_winner_advances() {
+        let mut tree = LoserTree::new(vec![50u32, 10, 30, 20]);
+        tree.replace_winner(100);
+        assert_eq!(tree.winner(), 3, "20 now wins");
+        assert_eq!(tree.runner_up(), Some(2), "30 is next, at source 2");
+    }
+
+    /// One source has no next source; predicting one would send a read at the file
+    /// already being drained, which already has the deep allowance.
+    #[test]
+    fn test_runner_up_is_none_with_a_single_source() {
+        assert_eq!(LoserTree::new(vec![7u32]).runner_up(), None);
+    }
+
+    /// Exhausted sources must never be predicted: a read issued for a drained file
+    /// is pure waste, and `active` is what distinguishes them.
+    #[test]
+    fn test_runner_up_skips_an_exhausted_source() {
+        let mut tree = LoserTree::new(vec![10u32, 20]);
+        assert_eq!(tree.winner(), 0);
+        tree.remove_winner();
+        assert_eq!(tree.winner(), 1, "guard: source 0 is gone");
+        assert_eq!(tree.runner_up(), None, "no live source remains behind the winner");
     }
 }

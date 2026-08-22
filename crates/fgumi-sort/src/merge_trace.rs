@@ -546,12 +546,28 @@ impl ConsumerTraceStats {
     /// Record that the merge drew `blocks` consecutive blocks from one source.
     ///
     /// This is the test for whether the merge has a *hot file* worth steering
-    /// workers toward. A run length of 1 means it does not: the loser tree
-    /// interleaves records from every run at once, so by the time one source's
-    /// block is exhausted the merge has already pulled from many others.
-    /// Demand is spread evenly and continuously across all K files, and any fix
-    /// framed as "prefetch the file the consumer needs next" is answering a
-    /// question the workload does not pose.
+    /// workers toward, and it must be read weighted by **blocks, not by runs** --
+    /// the two give opposite answers.
+    ///
+    /// By run count the merge looks perfectly interleaved: the measured median run
+    /// is 1 block, so most of the time the loser tree does pull the next record
+    /// from some other source. An earlier version of this comment stopped there and
+    /// concluded that any fix framed as "prefetch the file the consumer needs next"
+    /// was answering a question the workload does not pose.
+    ///
+    /// Weighted by blocks the same histogram says the opposite. On a measured
+    /// 44-way merge (`n=167624 total=5306698 mean=31.7 p50=1 p90=2 p99=512`), if
+    /// the bottom 90% of runs average two blocks or fewer they account for at most
+    /// 302k of 5.31M blocks -- so **at least 94% of all blocks come from the top
+    /// decile of runs**, which are hundreds of consecutive blocks from one source.
+    /// Steering read-ahead at the source the merge is draining, and at the one it
+    /// will drain next, is worth 2.8-5.2% and 2.7% of merge wall respectively.
+    ///
+    /// Both readings are true; only the block-weighted one predicted a result. It
+    /// is the same count-versus-time trap that made the park census point at a
+    /// scheduling change that then measured 0.06%. A short floor for the frequent
+    /// one-block runs still has to exist -- what does not work is spreading depth
+    /// uniformly, which has been measured negative four separate times.
     ///
     /// Reuses the duration histogram's bucketing for a count: run lengths are as
     /// heavy-tailed as the timings and want the same log2 treatment. One block

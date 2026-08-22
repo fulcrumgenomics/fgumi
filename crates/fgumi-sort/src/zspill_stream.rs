@@ -17,14 +17,27 @@
 use crate::codec::ZSPILL_MAGIC;
 use std::io::{self, Read};
 
-/// Cap on the uncompressed size of a single zstd spill frame. Production
-/// frames are bounded by the producer's staging buffer
-/// (`BGZF_MAX_BLOCK_SIZE` + padding ~= 68 KB), so 256 KiB leaves comfortable
-/// slack. If a frame ever decompresses to more bytes than this,
+/// Cap on the uncompressed size of a single zstd spill frame.
+///
+/// If a frame decompresses to more than this,
 /// `zstd::bulk::Decompressor::decompress_to_buffer` surfaces a clear error
-/// rather than silently truncating. Kept in sync with `ZSTD_FRAME_DECOMP_CAP`
-/// in `worker_pool.rs`.
-const FRAME_DECOMP_CAP: usize = 256 * 1024;
+/// rather than silently truncating.
+///
+/// **Derived** from the pool's cap rather than kept in step with it by comment.
+/// This reader serves the consolidation path while `worker_pool` serves the
+/// merge, so a cap that is smaller than the writer's frame size fails only the
+/// consolidating configurations -- the ones the standard matrix does not
+/// exercise. `test_frame_caps_admit_the_largest_frame_the_writer_emits` pins
+/// them together.
+const FRAME_DECOMP_CAP: usize = crate::worker_pool::zstd_decomp_cap();
+
+/// The frame cap this reader enforces, exposed so it can be pinned against the
+/// writer's frame size rather than trusted to stay in step.
+#[cfg(test)]
+#[must_use]
+pub(crate) const fn frame_decomp_cap() -> usize {
+    FRAME_DECOMP_CAP
+}
 
 /// Streaming decompressor for "ZSP1" spill files.
 pub struct ZspillStreamReader<R: Read> {
