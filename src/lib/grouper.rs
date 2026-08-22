@@ -419,7 +419,7 @@ impl RecordPositionGrouper {
     /// record's aux data: the Decode step already resolved the mate position from
     /// the `MC` tag, and falls back to a single-ended key when it could not (see
     /// `compute_group_key_from_raw`). Re-deriving that here cost a second full
-    /// aux-TLV walk plus a UTF-8 validation, per record, on this serial step.
+    /// aux-TLV walk per record, on this serial step.
     ///
     /// This makes validation agree with the value grouping actually uses. It also
     /// makes fgumi marginally more permissive for one malformed shape: a record

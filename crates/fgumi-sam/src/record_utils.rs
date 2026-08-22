@@ -167,13 +167,17 @@ fn parse_mate_cigar(read: &RecordBuf) -> Option<(Vec<(Kind, usize)>, usize)> {
     let mc_tag = Tag::from([b'M', b'C']);
     let mc_value = read.data().get(&mc_tag)?;
 
-    let cigar_str = match mc_value {
-        Value::String(s) => std::str::from_utf8(s.as_ref()).ok()?,
+    let cigar_bytes = match mc_value {
+        // Parse the raw bytes directly rather than gating on UTF-8. A valid
+        // CIGAR prefix followed by non-UTF-8 trailing bytes is still usable, and
+        // this keeps the typed path in parity with the raw-byte sibling
+        // (`mate_unclipped_*_raw`), which parses the same bytes.
+        Value::String(s) => s.as_ref(),
         _ => return None,
     };
 
     let mate_start = usize::from(read.mate_alignment_start()?);
-    let ops = parse_cigar_string(cigar_str);
+    let ops = parse_cigar_bytes(cigar_bytes);
     if ops.is_empty() {
         return None;
     }
@@ -242,26 +246,38 @@ pub fn alignment_end(read: &RecordBuf) -> Option<usize> {
 /// This is useful for parsing the MC (mate CIGAR) tag value.
 #[must_use]
 pub fn parse_cigar_string(cigar_str: &str) -> Vec<(Kind, usize)> {
+    parse_cigar_bytes(cigar_str.as_bytes())
+}
+
+/// Parses a CIGAR from raw bytes, as [`parse_cigar_string`] does from `&str`.
+///
+/// `MC` is extracted as bytes (`find_mc_tag_in_record`) so that the sort's
+/// per-record ingest path does not pay a UTF-8 validation it cannot use, and
+/// this is the entry point that consumes it. Operators are ASCII by
+/// construction, so a non-ASCII byte falls into the same "unknown operator"
+/// arm a non-ASCII `char` did: the two functions agree on every input.
+#[must_use]
+pub fn parse_cigar_bytes(cigar: &[u8]) -> Vec<(Kind, usize)> {
     let mut ops = Vec::new();
     let mut num_str = String::new();
 
-    for ch in cigar_str.chars() {
-        if ch.is_ascii_digit() {
-            num_str.push(ch);
+    for &b in cigar {
+        if b.is_ascii_digit() {
+            num_str.push(char::from(b));
         } else {
             let len: usize = num_str.parse().unwrap_or(0);
             num_str.clear();
 
-            let kind = match ch {
-                'M' => Kind::Match,
-                'I' => Kind::Insertion,
-                'D' => Kind::Deletion,
-                'N' => Kind::Skip,
-                'S' => Kind::SoftClip,
-                'H' => Kind::HardClip,
-                'P' => Kind::Pad,
-                '=' => Kind::SequenceMatch,
-                'X' => Kind::SequenceMismatch,
+            let kind = match b {
+                b'M' => Kind::Match,
+                b'I' => Kind::Insertion,
+                b'D' => Kind::Deletion,
+                b'N' => Kind::Skip,
+                b'S' => Kind::SoftClip,
+                b'H' => Kind::HardClip,
+                b'P' => Kind::Pad,
+                b'=' => Kind::SequenceMatch,
+                b'X' => Kind::SequenceMismatch,
                 _ => continue,
             };
 
@@ -622,7 +638,7 @@ pub fn mate_unclipped_start_raw(bam: &[u8]) -> Option<isize> {
     if mate_start_0based < 0 {
         return None;
     }
-    let ops = parse_cigar_string(mc_cigar);
+    let ops = parse_cigar_bytes(mc_cigar);
     if ops.is_empty() {
         return None;
     }
@@ -655,7 +671,7 @@ pub fn mate_unclipped_end_raw(bam: &[u8]) -> Option<usize> {
         reason = "mate_start_0based is verified non-negative by the guard above"
     )]
     let mate_start_1based = (mate_start_0based + 1) as usize;
-    let ops = parse_cigar_string(mc_cigar);
+    let ops = parse_cigar_bytes(mc_cigar);
     if ops.is_empty() {
         return None;
     }
@@ -769,6 +785,7 @@ mod tests {
     use super::*;
     use crate::builder::{RecordBuilder, RecordPairBuilder};
     use noodles::sam::alignment::record::Flags;
+    use rstest::rstest;
 
     // Flag constants for test readability
     const FLAG_PAIRED: u16 = 0x1;
@@ -1188,6 +1205,51 @@ mod tests {
 
         assert_eq!(mate_unclipped_start(&record), None);
         assert_eq!(mate_unclipped_end(&record), None);
+    }
+
+    /// A valid CIGAR prefix followed by non-UTF-8 trailing bytes must yield the
+    /// same mate coordinates on the typed `RecordBuf` path as on the raw-byte
+    /// sibling (which parses the bytes directly). The byte parser stops at the
+    /// prefix; the typed path used to reject the whole value on a UTF-8 gate,
+    /// disagreeing with the raw path on identical input.
+    #[rstest]
+    #[case::leading_soft_clip(b"10S50M", 190, 249)]
+    #[case::trailing_soft_clip(b"50M10S", 200, 259)]
+    fn test_mate_unclipped_valid_prefix_non_utf8_mc_matches_raw(
+        #[case] mc_prefix: &[u8],
+        #[case] expected_start: isize,
+        #[case] expected_end: usize,
+    ) {
+        let mc_tag = Tag::from([b'M', b'C']);
+        // The BAM encoder rejects non-UTF-8 strings, so encode with a valid
+        // placeholder trailing byte ('x'), then overwrite it with 0xFF in both
+        // the raw buffer and the typed record. 'x' and 0xFF are both non-CIGAR
+        // bytes the byte parser skips, so the coordinate is identical either
+        // way — the point is a genuinely non-UTF-8 MC value on both paths.
+        let mut placeholder = mc_prefix.to_vec();
+        placeholder.push(b'x');
+
+        let mut record = create_mc_test_read("valid_prefix_non_utf8", 200, "50M");
+        record.data_mut().insert(mc_tag, Value::String(placeholder.clone().into()));
+        let mut raw = to_raw(&record);
+
+        // Inject the non-UTF-8 byte into the raw record's MC value.
+        let pos = raw
+            .windows(placeholder.len())
+            .position(|w| w == placeholder.as_slice())
+            .expect("placeholder MC value present in raw record");
+        raw[pos + placeholder.len() - 1] = 0xFF;
+
+        // And into the typed record.
+        let mut non_utf8 = mc_prefix.to_vec();
+        non_utf8.push(0xFF);
+        record.data_mut().insert(mc_tag, Value::String(non_utf8.into()));
+
+        assert_eq!(mate_unclipped_start(&record), Some(expected_start));
+        assert_eq!(mate_unclipped_end(&record), Some(expected_end));
+        // Parity with the raw-byte sibling on the identical non-UTF-8 input.
+        assert_eq!(mate_unclipped_start_raw(&raw), mate_unclipped_start(&record));
+        assert_eq!(mate_unclipped_end_raw(&raw), mate_unclipped_end(&record));
     }
 
     #[test]

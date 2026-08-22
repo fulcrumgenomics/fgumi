@@ -2,7 +2,7 @@ use fgumi_tag::{AsTagBytes, SamTag};
 
 use crate::fields::{
     RawRecordMut, RawRecordView, TAG_FIXED_SIZES, aux_data_offset_from_record, aux_data_slice,
-    tag_value_size,
+    nul_offset, tag_value_size,
 };
 
 /// Find a tag's position and type byte in auxiliary data.
@@ -43,7 +43,7 @@ pub fn find_string_tag(aux_data: &[u8], tag: impl AsTagBytes) -> Option<&[u8]> {
         return None;
     }
     let start = p + 3;
-    let end = aux_data[start..].iter().position(|&b| b == 0)?;
+    let end = nul_offset(&aux_data[start..])?;
     Some(&aux_data[start..start + end])
 }
 
@@ -68,7 +68,7 @@ pub fn find_string_tag_position(aux_data: &[u8], tag: impl AsTagBytes) -> Option
         return None;
     }
     let start = p + 3;
-    let len = aux_data[start..].iter().position(|&b| b == 0)?;
+    let len = nul_offset(&aux_data[start..])?;
     Some((u32::try_from(start).ok()?, u16::try_from(len).ok()?))
 }
 
@@ -206,7 +206,7 @@ pub(crate) fn find_mi_tag(aux_data: &[u8]) -> Option<(u64, bool)> {
     if val_type == b'Z' {
         // String type - parse "12345" or "12345/A" or "12345/B"
         let start = pos + 3;
-        let end = aux_data[start..].iter().position(|&b| b == 0)?;
+        let end = nul_offset(&aux_data[start..])?;
         parse_mi_bytes(&aux_data[start..start + end])
     } else {
         // Integer types: delegate to shared extractor, reject negative values
@@ -257,15 +257,23 @@ fn parse_mi_bytes(s: &[u8]) -> Option<(u64, bool)> {
 
 /// Find the MC (mate CIGAR) tag in auxiliary data.
 ///
-/// Returns the CIGAR string, or None if not found.
+/// Returns the CIGAR bytes, or `None` if not found.
+///
+/// No UTF-8 validation: `MC` is a CIGAR that every consumer parses as bytes,
+/// and this accessor is the byte-level sibling of the batch extractors
+/// ([`extract_aux_string_tags`], [`extract_template_aux_tags`]). Those two
+/// hand the raw value over, so gating here would make the two paths disagree
+/// on a non-UTF-8 value -- and `src/lib/grouper.rs` cross-checks them against
+/// each other, with duplicate `MC` entries documented as the *only* case where
+/// they may differ.
 #[must_use]
-pub(crate) fn find_mc_tag(aux_data: &[u8]) -> Option<&str> {
-    find_string_tag(aux_data, SamTag::MC).and_then(|v| std::str::from_utf8(v).ok())
+pub(crate) fn find_mc_tag(aux_data: &[u8]) -> Option<&[u8]> {
+    find_string_tag(aux_data, SamTag::MC)
 }
 
 /// Find MC tag in a complete BAM record.
 #[must_use]
-pub fn find_mc_tag_in_record(bam: &[u8]) -> Option<&str> {
+pub fn find_mc_tag_in_record(bam: &[u8]) -> Option<&[u8]> {
     find_mc_tag(aux_data_slice(bam))
 }
 
@@ -274,7 +282,7 @@ pub fn find_mc_tag_in_record(bam: &[u8]) -> Option<&str> {
 pub struct AuxStringTags<'a> {
     pub rg: Option<&'a [u8]>,
     pub cell: Option<&'a [u8]>,
-    pub mc: Option<&'a str>,
+    pub mc: Option<&'a [u8]>,
     /// Aux-relative `(value_offset, value_len)` of the UMI tag's value bytes
     /// (excluding NUL terminator), when the caller supplied a `umi_tag` to look
     /// for. `None` when no `umi_tag` was supplied, or when the tag is absent
@@ -304,7 +312,7 @@ pub fn extract_aux_string_tags(
 
         if val_type == b'Z' {
             let start = p + 3;
-            if let Some(end) = aux_data[start..].iter().position(|&b| b == 0) {
+            if let Some(end) = nul_offset(&aux_data[start..]) {
                 let value = &aux_data[start..start + end];
                 if t == SamTag::RG {
                     result.rg = Some(value);
@@ -313,7 +321,7 @@ pub fn extract_aux_string_tags(
                     result.cell = Some(value);
                     found |= 2;
                 } else if t == SamTag::MC {
-                    result.mc = std::str::from_utf8(value).ok();
+                    result.mc = Some(value);
                     found |= 4;
                 } else if matches!(umi_tag, Some(ut) if t == ut) {
                     // Width checks are defensive only (BAM records < 4 GiB,
@@ -352,7 +360,7 @@ pub struct TemplateAuxTags<'a> {
     /// Cell barcode tag value.
     pub cell: Option<&'a [u8]>,
     /// MC (mate CIGAR) tag value.
-    pub mc: Option<&'a str>,
+    pub mc: Option<&'a [u8]>,
 }
 
 /// Extract MI, RG, cell barcode, and MC tags in a single pass over aux data.
@@ -375,7 +383,7 @@ pub fn extract_template_aux_tags(bam: &[u8], cell_tag: Option<SamTag>) -> Templa
         if t == SamTag::MI {
             if val_type == b'Z' {
                 let start = p + 3;
-                if let Some(end) = aux_data[start..].iter().position(|&b| b == 0) {
+                if let Some(end) = nul_offset(&aux_data[start..]) {
                     result.mi = parse_mi_bytes(&aux_data[start..start + end]).unwrap_or((0, true));
                     p = start + end + 1;
                 } else {
@@ -407,7 +415,7 @@ pub fn extract_template_aux_tags(bam: &[u8], cell_tag: Option<SamTag>) -> Templa
 
         if val_type == b'Z' {
             let start = p + 3;
-            if let Some(end) = aux_data[start..].iter().position(|&b| b == 0) {
+            if let Some(end) = nul_offset(&aux_data[start..]) {
                 let value = &aux_data[start..start + end];
                 if t == SamTag::RG {
                     result.rg = Some(value);
@@ -418,7 +426,7 @@ pub fn extract_template_aux_tags(bam: &[u8], cell_tag: Option<SamTag>) -> Templa
                     found |= 4;
                 }
                 if t == SamTag::MC {
-                    result.mc = std::str::from_utf8(value).ok();
+                    result.mc = Some(value);
                     found |= 8;
                 }
                 if found & target_bits == target_bits {
@@ -893,7 +901,7 @@ fn find_string_tag_range(record: &[u8], aux_offset: usize, tag: [u8; 2]) -> Opti
         return None;
     }
     let start = aux_offset + p + 3;
-    let nul_off = record[start..].iter().position(|&b| b == 0)?;
+    let nul_off = nul_offset(&record[start..])?;
     let end = start + nul_off;
     if end > start { Some((start, end)) } else { None }
 }
@@ -1172,12 +1180,12 @@ impl<'a> RawTagsView<'a> {
         find_mi_tag(self.0)
     }
 
-    /// Returns the MC (mate CIGAR) tag as a `&str`.
+    /// Returns the MC (mate CIGAR) tag as raw CIGAR bytes.
     ///
-    /// Returns `None` if the tag is absent or is not valid UTF-8.
+    /// Returns `None` if the tag is absent or is not `Z`-typed.
     #[inline]
     #[must_use]
-    pub fn find_mc(&self) -> Option<&'a str> {
+    pub fn find_mc(&self) -> Option<&'a [u8]> {
         find_mc_tag(self.0)
     }
 
@@ -1209,11 +1217,11 @@ impl<'a> RawTagsView<'a> {
                 ])))
             }
             b'Z' => {
-                let end = aux[start..].iter().position(|&b| b == 0)?;
+                let end = nul_offset(&aux[start..])?;
                 Some(TagValue::String(&aux[start..start + end]))
             }
             b'H' => {
-                let end = aux[start..].iter().position(|&b| b == 0)?;
+                let end = nul_offset(&aux[start..])?;
                 Some(TagValue::Hex(&aux[start..start + end]))
             }
             b'B' => parse_array_tag_at(aux, start).map(TagValue::Array),
@@ -1499,7 +1507,7 @@ impl<'a> RawTagsMut<'a> {
             return false;
         }
         let start = p + 3;
-        let Some(nul_off) = self.0[start..].iter().position(|&b| b == 0) else {
+        let Some(nul_off) = nul_offset(&self.0[start..]) else {
             return false;
         };
         if nul_off != value.len() {
@@ -2673,7 +2681,7 @@ mod tests {
     fn test_find_mc_tag_present() {
         // MC:Z:10M5S\0
         let aux = b"MCZ10M5S\x00";
-        assert_eq!(find_mc_tag(aux), Some("10M5S"));
+        assert_eq!(find_mc_tag(aux), Some(b"10M5S".as_slice()));
     }
 
     #[test]
@@ -2692,7 +2700,7 @@ mod tests {
         aux.extend_from_slice(b"NMC"); // tag NM, type C (unsigned byte)
         aux.push(5); // value
         aux.extend_from_slice(b"MCZ15M\x00"); // MC:Z:15M
-        assert_eq!(find_mc_tag(&aux), Some("15M"));
+        assert_eq!(find_mc_tag(&aux), Some(b"15M".as_slice()));
     }
 
     #[test]
@@ -2731,7 +2739,7 @@ mod tests {
         let result = extract_aux_string_tags(&aux, SamTag::CB, None);
         assert_eq!(result.rg, Some(b"sample1".as_ref()));
         assert_eq!(result.cell, Some(b"cell42".as_ref()));
-        assert_eq!(result.mc, Some("10M5S"));
+        assert_eq!(result.mc, Some(b"10M5S".as_slice()));
     }
 
     #[test]
@@ -2746,7 +2754,7 @@ mod tests {
         let result = extract_aux_string_tags(&aux, SamTag::CB, None);
         assert_eq!(result.rg, Some(b"rg1".as_ref()));
         assert_eq!(result.cell, Some(b"bc1".as_ref()));
-        assert_eq!(result.mc, Some("5M"));
+        assert_eq!(result.mc, Some(b"5M".as_slice()));
     }
 
     #[test]
@@ -2770,7 +2778,7 @@ mod tests {
         let result = extract_aux_string_tags(&aux, SamTag::CB, None);
         assert_eq!(result.rg, Some(b"lib1".as_ref()));
         assert!(result.cell.is_none());
-        assert_eq!(result.mc, Some("20M"));
+        assert_eq!(result.mc, Some(b"20M".as_slice()));
     }
 
     #[test]
@@ -2781,15 +2789,32 @@ mod tests {
         assert!(result.mc.is_none());
     }
 
+    /// A non-UTF-8 `MC` is handed over as bytes rather than discarded.
+    ///
+    /// This is a deliberate behavior change. Extraction used to run
+    /// `str::from_utf8(..).ok()` on the value, so a tag with any non-UTF-8 byte
+    /// became `None` and the mate position was used unadjusted. `MC` is a CIGAR
+    /// that every consumer immediately re-borrows as bytes, and validating it
+    /// per record cost 2.1% of `fgumi sort`'s serial Phase 1 thread, so the gate
+    /// is gone.
+    ///
+    /// The observable difference is narrow: the clip parsers read a leading run
+    /// of ASCII digits and stop at the first byte they cannot interpret, so a
+    /// value that is garbage from the start still yields zero clips -- the same
+    /// answer discarding it gave. Only a value with a *valid CIGAR prefix*
+    /// followed by invalid bytes now changes, and it changes toward parsing the
+    /// prefix, which is what samtools does.
     #[test]
-    fn test_extract_aux_string_tags_mc_invalid_utf8() {
-        // MC tag with invalid UTF-8 bytes → mc should be None
+    fn test_extract_aux_string_tags_keeps_a_non_utf8_mc_as_bytes() {
         let mut aux = Vec::new();
         aux.extend_from_slice(b"MCZ");
-        aux.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // invalid UTF-8
-        aux.push(0); // null terminator
+        aux.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // not valid UTF-8
+        aux.push(0); // NUL terminator
         let result = extract_aux_string_tags(&aux, SamTag::CB, None);
-        assert!(result.mc.is_none()); // from_utf8 fails
+        assert_eq!(result.mc, Some([0xFF, 0xFE, 0xFD].as_slice()));
+        // Garbage from the first byte still parses to no clips, so this value
+        // places the mate exactly where discarding the tag used to.
+        assert_eq!(crate::cigar::mate_unclipped_5prime(100, false, result.mc.expect("mc")), 100);
     }
 
     #[test]
@@ -3525,7 +3550,7 @@ mod tests {
         assert_eq!(result.mi, (42, true));
         assert_eq!(result.rg, Some(b"sample1".as_ref()));
         assert_eq!(result.cell, Some(b"cell99".as_ref()));
-        assert_eq!(result.mc, Some("10M5S"));
+        assert_eq!(result.mc, Some(b"10M5S".as_slice()));
     }
 
     #[test]
@@ -3540,7 +3565,7 @@ mod tests {
         assert_eq!(result.mi, (7, false));
         assert_eq!(result.rg, Some(b"lib1".as_ref()));
         assert!(result.cell.is_none());
-        assert_eq!(result.mc, Some("20M"));
+        assert_eq!(result.mc, Some(b"20M".as_slice()));
     }
 
     #[test]
@@ -3594,7 +3619,7 @@ mod tests {
         let result = extract_template_aux_tags(&rec, None);
         assert_eq!(result.mi, (100, true));
         assert_eq!(result.rg, Some(b"lib2".as_ref()));
-        assert_eq!(result.mc, Some("5M"));
+        assert_eq!(result.mc, Some(b"5M".as_slice()));
     }
 
     // ========================================================================
@@ -3833,7 +3858,32 @@ mod tests {
         let s = RawRecordView::new(&rec).tags().extract_string_batch(SamTag::BC, None);
         assert_eq!(s.rg, Some(b"mygrp".as_slice()));
         assert_eq!(s.cell, Some(b"ACGT".as_slice()));
-        assert_eq!(s.mc, Some("50M"));
+        assert_eq!(s.mc, Some(b"50M".as_slice()));
+    }
+
+    #[test]
+    fn test_mc_is_returned_as_bytes_without_a_utf8_gate() {
+        // `MC` is only ever consumed as CIGAR bytes, so extraction hands the raw
+        // value over rather than validating it as UTF-8 first. A value with a
+        // valid CIGAR prefix and a non-UTF-8 byte after it therefore reaches the
+        // parser, which reads the prefix and stops -- where the earlier
+        // `str::from_utf8(..).ok()` gate discarded the whole tag and silently
+        // left the mate position unadjusted.
+        let aux = b"MCZ10S40M\xff\0RGZrg1\0";
+        let rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
+        let tags = extract_template_aux_tags(&rec, None);
+        assert_eq!(tags.mc, Some(b"10S40M\xff".as_slice()));
+        assert_eq!(tags.rg, Some(b"rg1".as_slice()), "the scan continues past MC");
+    }
+
+    #[test]
+    fn test_mc_bytes_round_trip_through_the_clip_parser() {
+        // The point of dropping the gate is that the bytes still parse, so pin
+        // the value the sort key actually uses rather than only the field.
+        let aux = b"MCZ10S40M\0";
+        let rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
+        let mc = extract_template_aux_tags(&rec, None).mc.expect("MC present");
+        assert_eq!(crate::cigar::mate_unclipped_5prime(100, false, mc), 90);
     }
 
     #[test]

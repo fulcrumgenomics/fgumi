@@ -1308,7 +1308,7 @@ mod tests {
         assert_eq!(supp.template_length(), -351);
         assert_ne!(supp.flags() & rflags::MATE_REVERSE, 0, "mate is reverse");
         assert_eq!(supp.flags() & rflags::MATE_UNMAPPED, 0, "mate is mapped");
-        assert_eq!(supp.tags().find_mc(), Some("50M"));
+        assert_eq!(supp.tags().find_mc(), Some(b"50M".as_slice()));
         assert_eq!(supp.tags().find_int(SamTag::MQ), Some(40));
     }
 
