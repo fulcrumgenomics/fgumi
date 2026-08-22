@@ -360,7 +360,65 @@ impl SortPhaseTimer {
                 ingest.spill_waits
             );
         }
+        Self::log_reader_partition(phase1.reader);
         self.log_ingest_partition(phase1);
+    }
+
+    /// What the input reader's exclusively-owned thread spent its time on.
+    ///
+    /// The reader is Phase 1's *second* serial resource and the one the floor
+    /// line cannot see: `phase1_input_busy_secs` folds it in with decompression
+    /// and divides by the thread count, which is right for a step any worker may
+    /// run and wrong for one only worker 0 ever runs. So a reader at its limit
+    /// disappears into a worker-capacity figure that looks comfortable.
+    ///
+    /// The split that matters is refill against framing, because they have
+    /// nothing in common: refill time is the disk (compare it to the volume's
+    /// measured ceiling) and framing time is header parse, per-block allocation
+    /// and the body copy (compare it to the `raw_block_read` bench). Reporting
+    /// only the step total gives a number -- 24.3 us/block on the production
+    /// cell -- that is consistent with either being the whole cost.
+    #[allow(clippy::cast_precision_loss, reason = "call and byte counts stay below 2^52")]
+    fn log_reader_partition(reader: crate::phase1_stats::ReaderReport) {
+        if reader.batches == 0 {
+            return;
+        }
+        stat!(
+            "  Phase 1 input reader: {:.1}s over {} batches ({:.1} us/block, {} blocks)",
+            reader.step_secs,
+            reader.batches,
+            reader.per_block_micros(reader.step_secs),
+            reader.blocks
+        );
+        if reader.refills > 0 {
+            stat!(
+                "    refill reads: {:.1}s over {} calls ({:.2} ms each, {:.0} MB/s, {:.1} GB)",
+                reader.refill_secs,
+                reader.refills,
+                reader.refill_secs * 1000.0 / reader.refills as f64,
+                reader.refill_mb_per_sec(),
+                reader.refill_bytes as f64 / 1e9
+            );
+        } else {
+            stat!(
+                "    refill reads: none on this thread (async reader, or input already buffered)"
+            );
+        }
+        stat!(
+            "    framing:      {:.1}s ({:.1} us/block)",
+            reader.framing_secs(),
+            reader.per_block_micros(reader.framing_secs())
+        );
+        stat!(
+            "    dispatch:     {:.1}s ({:.1} us/block)",
+            reader.dispatch_secs,
+            reader.per_block_micros(reader.dispatch_secs)
+        );
+        stat!(
+            "    unattributed: {:.1}s ({:.0}% of the step)",
+            reader.residual_secs(),
+            100.0 * reader.residual_share()
+        );
     }
 
     /// What the ingest thread's serial CPU is made of, per segment.
@@ -454,6 +512,10 @@ pub(crate) struct Phase1FloorInputs {
     /// Measured cost of one `Instant::now()`/`elapsed()` pair, subtracted once
     /// per segment per sample.
     pub(crate) clock_overhead_nanos: u64,
+    /// How the exclusively-owned input reader spent its time. Unlike `sample`,
+    /// this is order-independent -- every sort order reads the same way -- so it
+    /// is filled in on all four paths.
+    pub(crate) reader: crate::phase1_stats::ReaderReport,
 }
 
 /// Deterministic hasher for cell barcode hashing in template-coordinate sort.
@@ -3619,6 +3681,7 @@ impl RawExternalSorter {
             input_busy_secs: pool.phase1_input_busy_secs(),
             threads: self.phase1_threads(),
             ingest: pool.phase1_ingest_stats().snapshot(),
+            reader: pool.phase1_reader_report(),
             ..Phase1FloorInputs::default()
         };
         self.enter_output_phase(&pool);
@@ -3830,6 +3893,7 @@ impl RawExternalSorter {
             input_busy_secs: pool.phase1_input_busy_secs(),
             threads: self.phase1_threads(),
             ingest: pool.phase1_ingest_stats().snapshot(),
+            reader: pool.phase1_reader_report(),
             ..Phase1FloorInputs::default()
         };
         self.enter_output_phase(&pool);
@@ -4097,6 +4161,7 @@ impl RawExternalSorter {
             input_busy_secs: pool.phase1_input_busy_secs(),
             threads: self.phase1_threads(),
             ingest: pool.phase1_ingest_stats().snapshot(),
+            reader: pool.phase1_reader_report(),
             ..Phase1FloorInputs::default()
         };
         self.enter_output_phase(&pool);
@@ -4545,6 +4610,7 @@ impl RawExternalSorter {
             input_busy_secs: pool.phase1_input_busy_secs(),
             threads: self.phase1_threads(),
             ingest: pool.phase1_ingest_stats().snapshot(),
+            reader: pool.phase1_reader_report(),
             sample: ingest_raw,
             samples: ingest_samples,
             records: stats.total_records,
@@ -6410,6 +6476,13 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
 
     let path_ref = path.as_ref();
 
+    // Times the reads that refill the buffer below. Only the synchronous paths
+    // are wrapped: `--async-reader` moves the read onto a prefetch thread, so
+    // the reader step no longer pays for it and there is nothing on this thread
+    // to separate from framing. A zero refill row on an async run is that, not a
+    // measurement failure.
+    let reader_stats = pool.reader_stats();
+
     let opened: Box<dyn io::Read + Send> = if is_stdin_path(path_ref) {
         if async_reader {
             // `--async-reader` is about decoupling the read from the block
@@ -6423,7 +6496,10 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
             // on every call; the pool's block reader wants far bigger gulps than
             // that, so give the stdin path the same 2 MiB buffer the file path
             // gets.
-            Box::new(io::BufReader::with_capacity(SORT_INPUT_BUFFER_SIZE, io::stdin()))
+            Box::new(io::BufReader::with_capacity(
+                SORT_INPUT_BUFFER_SIZE,
+                crate::phase1_stats::TimedReader::new(io::stdin(), reader_stats),
+            ))
         }
     } else {
         let file = std::fs::File::open(path_ref)
@@ -6441,7 +6517,10 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
             );
             Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file))
         } else {
-            Box::new(io::BufReader::with_capacity(SORT_INPUT_BUFFER_SIZE, file))
+            Box::new(io::BufReader::with_capacity(
+                SORT_INPUT_BUFFER_SIZE,
+                crate::phase1_stats::TimedReader::new(file, reader_stats),
+            ))
         }
     };
 

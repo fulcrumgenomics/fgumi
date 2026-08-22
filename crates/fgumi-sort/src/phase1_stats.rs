@@ -245,9 +245,263 @@ impl IngestPartition {
     }
 }
 
+// ============================================================================
+// The input reader
+// ============================================================================
+
+/// What the input reader's exclusive thread spends its time on.
+///
+/// `ReadInputBlocks` is a *second* serial resource in Phase 1, and its cost is
+/// not explained by the disk. Worker 0 owns the step exclusively
+/// (`exclusive_step_for` returns `None` for every other worker), so one thread
+/// frames the whole file: on the production cell that is 124.5s across 5,114,408
+/// blocks -- **24.3 us per 8.4 KB block** -- while the same 43.1 GB at that
+/// volume's measured single-stream ceiling (605 MB/s, direct I/O, caches
+/// dropped) is only ~71s. The step is not disk-bound, and nothing accounts for
+/// the remaining ~55s.
+///
+/// It cannot be split from outside the reader, because the disk wait is *inside*
+/// it: `read_raw_blocks` frames blocks out of a 2 MiB `BufReader`, so whichever
+/// block happens to exhaust the buffer pays for the refill and every other block
+/// pays nothing. Timing the step measures framing and I/O fused together, and no
+/// per-block average can separate them. [`TimedReader`] sits one layer *below*
+/// the buffer and times the underlying `read()` itself, which is what makes
+/// [`ReaderReport::framing_secs`] -- time inside `read_raw_blocks` that was not
+/// spent in a `read()` -- mean anything.
+///
+/// Timed exactly rather than sampled: ~320k batches and ~21k refills against a
+/// ~30 ns clock is well under 30 ms of measurement on a 124.5s step, five orders
+/// of magnitude below the quantity. [`IngestSample`] has to sample only because
+/// its loop runs 780 million times; this one does not.
+#[derive(Debug, Default)]
+pub(crate) struct ReaderStats {
+    /// `read()` calls made against the file, below the 2 MiB buffer.
+    refills: AtomicU64,
+    /// Nanoseconds inside those calls.
+    refill_nanos: AtomicU64,
+    /// Bytes they returned.
+    refill_bytes: AtomicU64,
+    /// Successful `ReadInputBlocks` batches.
+    batches: AtomicU64,
+    /// Blocks those batches framed.
+    blocks: AtomicU64,
+    /// Nanoseconds inside `read_raw_blocks`, refill time included.
+    read_raw_nanos: AtomicU64,
+    /// Nanoseconds pushing framed blocks onto the decompress queue.
+    dispatch_nanos: AtomicU64,
+}
+
+impl ReaderStats {
+    /// Record one `read()` against the underlying file.
+    pub(crate) fn record_refill(&self, elapsed_nanos: u64, bytes: usize) {
+        self.refills.fetch_add(1, Ordering::Relaxed);
+        self.refill_nanos.fetch_add(elapsed_nanos, Ordering::Relaxed);
+        self.refill_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Record one framed batch: how long `read_raw_blocks` took and what it returned.
+    pub(crate) fn record_batch(&self, elapsed_nanos: u64, blocks: usize) {
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.blocks.fetch_add(blocks as u64, Ordering::Relaxed);
+        self.read_raw_nanos.fetch_add(elapsed_nanos, Ordering::Relaxed);
+    }
+
+    /// Record one dispatch of a framed batch onto the queue.
+    pub(crate) fn record_dispatch(&self, elapsed_nanos: u64) {
+        self.dispatch_nanos.fetch_add(elapsed_nanos, Ordering::Relaxed);
+    }
+
+    /// A consistent view of the counters, against the step total that should
+    /// contain them.
+    pub(crate) fn snapshot(&self, step_secs: f64) -> ReaderReport {
+        ReaderReport {
+            refills: self.refills.load(Ordering::Relaxed),
+            refill_secs: secs(self.refill_nanos.load(Ordering::Relaxed)),
+            refill_bytes: self.refill_bytes.load(Ordering::Relaxed),
+            batches: self.batches.load(Ordering::Relaxed),
+            blocks: self.blocks.load(Ordering::Relaxed),
+            read_raw_secs: secs(self.read_raw_nanos.load(Ordering::Relaxed)),
+            dispatch_secs: secs(self.dispatch_nanos.load(Ordering::Relaxed)),
+            step_secs,
+        }
+    }
+}
+
+/// Where the input reader's serial time went, as reported.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ReaderReport {
+    pub(crate) refills: u64,
+    pub(crate) refill_secs: f64,
+    pub(crate) refill_bytes: u64,
+    pub(crate) batches: u64,
+    pub(crate) blocks: u64,
+    /// Time inside `read_raw_blocks`, **including** the refills it triggered.
+    pub(crate) read_raw_secs: f64,
+    pub(crate) dispatch_secs: f64,
+    /// Exact `ReadInputBlocks` busy total the parts should add up to.
+    pub(crate) step_secs: f64,
+}
+
+impl ReaderReport {
+    /// Time inside `read_raw_blocks` that was **not** spent in a `read()`:
+    /// header parse, validation, per-block allocation, and the body copy.
+    ///
+    /// This is the number the whole struct exists to produce. It is signed, and
+    /// a small negative is a known, benign case rather than a bug: the header
+    /// parse refills the buffer once before Phase 1 starts, so a few
+    /// milliseconds of refill can sit outside every timed batch. A *large*
+    /// negative means the reader was rebuilt or the counters were shared across
+    /// runs, and should not be explained away.
+    pub(crate) fn framing_secs(&self) -> f64 {
+        self.read_raw_secs - self.refill_secs
+    }
+
+    /// Step time the parts do not account for -- the `try_lock`, the serial
+    /// reservation, and dropping the guard.
+    ///
+    /// **Signed on purpose**, for the reason [`IngestPartition::residual_secs`]
+    /// gives: the merge's first partition summed to 321.5s of a 189.3s loop, and
+    /// only the sign made that visible.
+    pub(crate) fn residual_secs(&self) -> f64 {
+        self.step_secs - self.read_raw_secs - self.dispatch_secs
+    }
+
+    /// Residual as a share of the step, for judging the partition at a glance.
+    pub(crate) fn residual_share(&self) -> f64 {
+        if self.step_secs > 0.0 { self.residual_secs() / self.step_secs } else { 0.0 }
+    }
+
+    /// Spread `secs` over the blocks framed, in microseconds -- the unit the
+    /// 24.3 us/block question is asked in.
+    #[allow(clippy::cast_precision_loss, reason = "block counts stay far below 2^52")]
+    pub(crate) fn per_block_micros(&self, secs: f64) -> f64 {
+        if self.blocks == 0 { 0.0 } else { secs * 1_000_000.0 / self.blocks as f64 }
+    }
+
+    /// Throughput the refills actually achieved, in MB/s.
+    ///
+    /// The discriminant against the volume's measured ceiling: at the ceiling the
+    /// refills are disk-bound and the remaining time is framing; well under it,
+    /// the reader is leaving bandwidth on the floor and the fix is upstream of
+    /// framing entirely.
+    #[allow(clippy::cast_precision_loss, reason = "byte totals stay far below 2^52")]
+    pub(crate) fn refill_mb_per_sec(&self) -> f64 {
+        if self.refill_secs > 0.0 { self.refill_bytes as f64 / self.refill_secs / 1e6 } else { 0.0 }
+    }
+}
+
+/// Times every `read()` made against whatever it wraps.
+///
+/// Belongs *below* the input `BufReader`, so it sees buffer refills rather than
+/// per-block reads -- see [`ReaderStats`] for why that placement is the whole
+/// point.
+pub(crate) struct TimedReader<R> {
+    inner: R,
+    stats: std::sync::Arc<ReaderStats>,
+}
+
+impl<R> TimedReader<R> {
+    pub(crate) fn new(inner: R, stats: std::sync::Arc<ReaderStats>) -> Self {
+        Self { inner, stats }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for TimedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let started = std::time::Instant::now();
+        let result = self.inner.read(buf);
+        let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        // A failed read still cost time; counting zero bytes for it keeps the
+        // throughput figure honest rather than crediting the failure with bytes.
+        self.stats.record_refill(elapsed, result.as_ref().copied().unwrap_or(0));
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader report built from the production cell's shape: 124.5s of step
+    /// time over 5,114,408 blocks, of which ~71s is disk.
+    fn production_shape() -> ReaderReport {
+        ReaderReport {
+            refills: 20_560,
+            refill_secs: 71.0,
+            refill_bytes: 43_131_188_552,
+            batches: 319_651,
+            blocks: 5_114_408,
+            read_raw_secs: 121.4,
+            dispatch_secs: 3.1,
+            step_secs: 124.5,
+        }
+    }
+
+    #[test]
+    fn test_framing_is_read_raw_time_with_the_refills_taken_out() {
+        // The whole point of putting a timer below the BufReader: the refill
+        // happens inside `read_raw_blocks`, so the raw span is framing and I/O
+        // fused. Reporting the raw span as framing would credit userspace with
+        // every second the disk spent.
+        let report = production_shape();
+        assert!((report.framing_secs() - 50.4).abs() < 1e-9, "got {}", report.framing_secs());
+    }
+
+    #[test]
+    fn test_a_reader_report_partitions_the_step_with_a_signed_residual() {
+        let report = production_shape();
+        assert!((report.residual_secs() - 0.0).abs() < 1e-9, "got {}", report.residual_secs());
+
+        // Over-attribution must be visible. If the parts claim more than the
+        // step, a clamped residual reports a tidy zero and the partition gets
+        // believed -- exactly how the merge's first partition summed to 321.5s
+        // of a 189.3s loop and survived a reading.
+        let over = ReaderReport { read_raw_secs: 200.0, ..production_shape() };
+        assert!(over.residual_secs() < 0.0, "got {}", over.residual_secs());
+        assert!(over.residual_share() < 0.0, "got {}", over.residual_share());
+    }
+
+    #[test]
+    fn test_per_block_micros_reproduces_the_number_under_investigation() {
+        // 124.5s over 5,114,408 blocks is the 24.3 us/block the campaign is
+        // trying to explain; the report has to say so in that unit.
+        let report = production_shape();
+        let per_block = report.per_block_micros(report.step_secs);
+        assert!((per_block - 24.34).abs() < 0.01, "got {per_block}");
+        assert!((report.per_block_micros(0.0) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_refill_throughput_is_measured_against_the_bytes_actually_returned() {
+        // 43.1 GB in 71.0s is ~607 MB/s, which is what makes "the disk is at its
+        // ceiling" a claim rather than an assumption.
+        let report = production_shape();
+        assert!(
+            (report.refill_mb_per_sec() - 607.5).abs() < 1.0,
+            "got {}",
+            report.refill_mb_per_sec()
+        );
+        assert!((ReaderReport::default().refill_mb_per_sec() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_a_failed_read_is_timed_but_credited_no_bytes() {
+        use std::io::Read;
+        struct Failing;
+        impl Read for Failing {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("device fell off"))
+            }
+        }
+        let stats = std::sync::Arc::new(ReaderStats::default());
+        let mut reader = TimedReader::new(Failing, std::sync::Arc::clone(&stats));
+        let mut buf = [0u8; 8];
+        assert!(reader.read(&mut buf).is_err());
+
+        let report = stats.snapshot(0.0);
+        assert_eq!(report.refills, 1, "the attempt still cost time and must be counted");
+        assert_eq!(report.refill_bytes, 0, "a failed read must not inflate throughput");
+    }
 
     #[test]
     fn test_the_residual_is_signed_so_over_attribution_is_visible() {

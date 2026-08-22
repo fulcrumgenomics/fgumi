@@ -1436,6 +1436,10 @@ pub(crate) struct SharedPipelineState {
     /// input stream records into it and the sorter reports from it, and neither
     /// owns the other.
     pub(crate) phase1_ingest: Arc<crate::phase1_stats::Phase1IngestStats>,
+    /// What the exclusively-owned input reader spends its time on. Shared with
+    /// the `TimedReader` wrapped around the input file, which is the only place
+    /// the refill syscalls are visible.
+    pub(crate) reader_stats: Arc<crate::phase1_stats::ReaderStats>,
     /// Next serial for input block reading (atomic increment for ordering).
     input_read_serial: AtomicU64,
     /// Raw input blocks: `ReadInputBlocks` → `DecompressInput`.
@@ -1632,6 +1636,7 @@ impl SharedPipelineState {
             chunk_read_error: Arc::new(AtomicBool::new(false)),
             worker_panicked: Arc::new(AtomicBool::new(false)),
             phase1_ingest: Arc::new(crate::phase1_stats::Phase1IngestStats::default()),
+            reader_stats: Arc::new(crate::phase1_stats::ReaderStats::default()),
             input_read_serial: AtomicU64::new(0),
             raw_input_blocks: Arc::new(ArrayQueue::new(data_queue_cap)),
             decompressed_input: Arc::new(ArrayQueue::new(data_queue_cap)),
@@ -2715,7 +2720,14 @@ impl SortWorkerPool {
             return StepResult::InputEmpty; // No input file set
         };
 
-        // Read a batch of raw BGZF blocks
+        // Read a batch of raw BGZF blocks.
+        //
+        // Timed as one region because that is the only honest boundary: the
+        // 2 MiB refill happens *inside* this call, on whichever block exhausts
+        // the buffer. Splitting disk from framing needs a timer below the
+        // buffer, which is what the `TimedReader` on the input file is for --
+        // `ReaderReport::framing_secs` is this span minus that one.
+        let framing_started = Instant::now();
         let blocks = match read_raw_blocks(reader.as_mut(), INPUT_READ_BATCH_SIZE) {
             Ok(b) => b,
             Err(e) => {
@@ -2731,6 +2743,13 @@ impl SortWorkerPool {
             shared.input_eof.store(true, Ordering::Release);
             return StepResult::InputEmpty;
         }
+
+        // Recorded only past the empty check, so the partition covers exactly the
+        // calls `record_step` charges to `ReadInputBlocks` -- that step is timed
+        // on `StepResult::Success` alone, and the EOF-detecting call returns
+        // `InputEmpty`. Counting it here would put time in the parts that is not
+        // in the total and drive the residual negative for no reason.
+        shared.reader_stats.record_batch(Self::nanos_u64(framing_started.elapsed()), blocks.len());
 
         // Reserve this batch's serial range while STILL HOLDING the input lock.
         //
@@ -2754,12 +2773,14 @@ impl SortWorkerPool {
         // Drop the lock before pushing to queue
         drop(guard);
 
+        let dispatch_started = Instant::now();
         dispatch_reserved_blocks(
             base_serial,
             blocks,
             &shared.raw_input_blocks,
             &mut worker.held_raw_input_blocks,
         );
+        shared.reader_stats.record_dispatch(Self::nanos_u64(dispatch_started.elapsed()));
 
         StepResult::Success
     }
@@ -3546,6 +3567,22 @@ impl SortWorkerPool {
     /// Counters for what Phase 1's ingest thread waited on.
     pub(crate) fn phase1_ingest_stats(&self) -> Arc<crate::phase1_stats::Phase1IngestStats> {
         Arc::clone(&self.shared.phase1_ingest)
+    }
+
+    /// Counters for the input reader, shared with the `TimedReader` that has to
+    /// be built before the pool is handed the file.
+    pub(crate) fn reader_stats(&self) -> Arc<crate::phase1_stats::ReaderStats> {
+        Arc::clone(&self.shared.reader_stats)
+    }
+
+    /// The input reader's partition, checked against the exact `ReadInputBlocks`
+    /// busy total it should add up to.
+    pub(crate) fn phase1_reader_report(&self) -> crate::phase1_stats::ReaderReport {
+        let ns =
+            self.pipeline_stats.step_ns[SortStep::ReadInputBlocks as usize].load(Ordering::Relaxed);
+        #[allow(clippy::cast_precision_loss, reason = "nanosecond totals stay far below 2^52")]
+        let step_secs = ns as f64 / 1_000_000_000.0;
+        self.shared.reader_stats.snapshot(step_secs)
     }
 
     /// The pool's shared state, for the merge consumer's own instrumentation.
