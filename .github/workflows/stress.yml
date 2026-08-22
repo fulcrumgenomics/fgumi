@@ -49,7 +49,7 @@ jobs:
       - name: Set up compilation cache (sccache)
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Install nextest
-        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.85.12
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
         with:
           tool: nextest
       - name: Concurrency stress tests
