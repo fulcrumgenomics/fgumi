@@ -877,6 +877,10 @@ pub struct ReorderBufferState {
     pub heap_bytes: AtomicU64,
     /// Memory limit for backpressure. 0 means use default threshold.
     memory_limit: u64,
+    /// Serial-skew admission window (Q3 decode). `0` = legacy byte-threshold
+    /// backpressure; `> 0` bounds how many serials ahead of `next_seq` the
+    /// reorder buffer may run, decoupling decode parallelism from bytes.
+    window: u64,
 }
 
 impl ReorderBufferState {
@@ -886,29 +890,63 @@ impl ReorderBufferState {
     /// * `memory_limit` - Memory limit in bytes. Use 0 for default threshold.
     #[must_use]
     pub fn new(memory_limit: u64) -> Self {
-        Self { next_seq: AtomicU64::new(0), heap_bytes: AtomicU64::new(0), memory_limit }
+        Self { next_seq: AtomicU64::new(0), heap_bytes: AtomicU64::new(0), memory_limit, window: 0 }
+    }
+
+    /// Enable windowed admission with the given serial-skew window.
+    ///
+    /// Used by the Q3 decode reorder buffer: future serials are admitted while
+    /// within `[next_seq, next_seq + window)`, rather than while under a byte
+    /// threshold. Total in-flight memory is bounded upstream by the Read
+    /// admission gate, so decode parallelism no longer collapses under a
+    /// capped per-stage byte limit (fgumi#787 follow-up).
+    #[must_use]
+    pub fn with_window(mut self, window: u64) -> Self {
+        self.window = window;
+        self
     }
 
     /// Check if a producer can proceed with the given serial number.
     ///
     /// Always allows the serial that the consumer needs (`next_seq`) to proceed,
     /// even if over memory limit. This ensures the consumer can always make progress.
-    /// For other serials, applies backpressure if over 50% of the limit.
+    ///
+    /// For other serials, admission depends on the mode: with a window set (Q3
+    /// decode), the serial must be within `[next_seq, next_seq + window)` and
+    /// under a raw-memory backstop (total memory is bounded upstream by the Read
+    /// admission gate); otherwise (legacy Q2 / write) it is admitted while heap
+    /// is under 50% of the effective limit.
     #[must_use]
     pub fn can_proceed(&self, serial: u64) -> bool {
-        let limit = self.effective_limit();
         let next_seq = self.next_seq.load(Ordering::Acquire);
-        let heap_bytes = self.heap_bytes.load(Ordering::Acquire);
 
-        // Always accept the serial the reorder buffer needs to make progress.
-        // This fills gaps and allows the consumer to pop items, reducing memory.
+        // Always admit the gap-filler (the serial the consumer needs), even
+        // over memory. Preserves deadlock-freedom (fgumi#746).
         if serial == next_seq {
             return true;
         }
 
-        // Apply backpressure if over 50% of limit.
-        let effective_limit = limit / 2;
-        heap_bytes < effective_limit
+        if self.window > 0 {
+            // Windowed admission (Q3 decode): bound reorder *skew* to
+            // concurrency, not bytes. A future serial is admitted while it is
+            // within `[next_seq, next_seq + window)`. Total in-flight memory is
+            // already bounded upstream by the Read admission gate, so the heap
+            // check here is only a backstop against a single pathologically
+            // large batch (compared against the raw limit, uncapped). This
+            // replaces the per-serial byte threshold that collapsed decode
+            // parallelism (fgumi#787 gated future serials at `heap < limit/2`
+            // with `limit` capped at 512 MiB, serializing decode once the Q3
+            // buffer held ~256 MiB regardless of `--max-memory` or threads).
+            let heap_bytes = self.heap_bytes.load(Ordering::Acquire);
+            return serial < next_seq.wrapping_add(self.window)
+                && (self.memory_limit == 0 || heap_bytes < self.memory_limit);
+        }
+
+        // Legacy byte-threshold backpressure (Q2 / write / others): apply
+        // backpressure once heap is over 50% of the effective limit.
+        let limit = self.effective_limit();
+        let heap_bytes = self.heap_bytes.load(Ordering::Acquire);
+        heap_bytes < limit / 2
     }
 
     /// Check if memory is at the backpressure threshold.
@@ -5811,6 +5849,35 @@ mod tests {
         assert!(!state.can_proceed(1));
         // Serial 0 is next_seq, should still proceed
         assert!(state.can_proceed(0));
+    }
+
+    #[test]
+    fn test_reorder_buffer_state_windowed_admission() {
+        // Regression guard for the Q3 decode serialization fix (fgumi#787
+        // follow-up). With a window set, admission bounds reorder *skew*
+        // (serials ahead of next_seq), not bytes. Heap is driven above the
+        // legacy 50% byte gate to prove the window path — not the byte
+        // threshold — governs future-serial admission.
+        let window = 8u64;
+        let state = ReorderBufferState::new(1000).with_window(window);
+        state.add_heap_bytes(600); // over legacy gate (500), under memory_limit (1000)
+
+        // next_seq (0) is always admitted, even over memory.
+        assert!(state.can_proceed(0));
+        // Future serials within [next_seq, next_seq + window) are admitted
+        // despite heap being over the legacy byte gate that serialized decode.
+        assert!(state.can_proceed(1));
+        assert!(state.can_proceed(window - 1));
+        // Serials at/beyond the window boundary are rejected: skew stays bounded.
+        assert!(!state.can_proceed(window));
+        assert!(!state.can_proceed(window + 4));
+
+        // Giant-batch backstop: at/over memory_limit even an in-window future
+        // serial is rejected, while next_seq still proceeds.
+        let tight = ReorderBufferState::new(1000).with_window(window);
+        tight.add_heap_bytes(1000); // == memory_limit
+        assert!(tight.can_proceed(0));
+        assert!(!tight.can_proceed(1));
     }
 
     #[test]
