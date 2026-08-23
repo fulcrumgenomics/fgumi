@@ -736,6 +736,12 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
         group_key_config: GroupKeyConfig,
     ) -> Self {
         let cap = config.queue_capacity;
+        // Q3 decode admission window: bound reorder *skew* to concurrency (a few
+        // batches per worker), capped by queue capacity. This is not a byte
+        // limit — total memory is bounded upstream by the Read admission gate —
+        // see `ReorderBufferState::can_proceed`. Restores decode parallelism
+        // lost to fgumi#787's per-serial byte backpressure.
+        let q3_decode_window = config.num_threads.saturating_mul(4).min(cap).max(1);
         let memory_limit = config.queue_memory_limit;
         let stats = if config.collect_stats {
             config.shared_stats.clone().or_else(|| Some(Arc::new(PipelineStats::new())))
@@ -785,7 +791,8 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
             q3_decoded: ArrayQueue::new(cap),
             q3_reorder: Mutex::new(ReorderBuffer::new()),
             // Q3 reorder buffer atomic state (for lock-free admission control)
-            q3_reorder_state: ReorderBufferState::new(memory_limit),
+            q3_reorder_state: ReorderBufferState::new(memory_limit)
+                .with_window(q3_decode_window as u64),
             q3_reorder_can_pop: AtomicBool::new(false),
             // Step 5: Group
             group_done: AtomicBool::new(false),
@@ -881,8 +888,10 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
 
     /// Check if Decode step can proceed with pushing decoded records to Q3.
     ///
-    /// This implements memory-based backpressure on the Q3 reorder buffer to prevent
-    /// unbounded memory growth when Group (exclusive step) falls behind.
+    /// Bounds the Q3 reorder buffer by *serial skew* -- how far ahead of the
+    /// serial Group needs (`next_seq`) decode may run -- rather than by a byte
+    /// threshold. Total in-flight memory is bounded upstream by the Read
+    /// admission gate; see [`super::base::ReorderBufferState::can_proceed`].
     ///
     /// # Deadlock Prevention
     ///
@@ -949,13 +958,17 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
     ///
     /// The Q3 reorder buffer's own [`ReorderBufferState::can_proceed`] always
     /// admits the serial Group needs next (the gap-filler), even when memory is
-    /// high, and backpressures only *future* serials once the buffer is half
-    /// full. Returns:
+    /// high, and backpressures only *future* serials that fall outside the
+    /// serial-skew window. Returns:
     ///
     /// - `Some((serial, batch))` — decode it now: either it is the gap-filler,
     ///   or it is a future batch whose requeue lost the race to a full Q2b (a
     ///   rare, bounded overshoot — never a lost or reordered-into-loss batch,
-    ///   since Q3 reassembles by serial).
+    ///   since Q3 reassembles by serial). Decoding it here skips the per-serial
+    ///   Q3 memory backstop, but only as defense-in-depth: the Read admission
+    ///   gate enforces the same `queue_memory_limit` on `queue_bytes_in_flight`,
+    ///   a sum that already includes the Q3 and Q2b heap, so the overshoot
+    ///   cannot push total in-flight memory past the global bound.
     /// - `None` — the batch was requeued to Q2b so another worker can still
     ///   reach the gap-filler, avoiding the "all workers hold a non-`next_seq`
     ///   batch and nobody can produce `next_seq`" deadlock.
@@ -5198,10 +5211,19 @@ mod tests {
 
     #[test]
     fn test_can_decode_proceed_no_limit() {
-        let state = create_test_state(0); // No limit (uses default 512MB threshold)
-        // Under default threshold, should proceed
+        // With no memory limit, Q3 admission is governed purely by the
+        // serial-skew window (W = min(4 * num_threads, queue_capacity) = 8 for
+        // this 2-thread test config); memory is bounded upstream by the Read
+        // admission gate.
+        let state = create_test_state(0);
+        // next_seq (0) always proceeds.
         assert!(state.can_decode_proceed(0));
-        assert!(state.can_decode_proceed(100));
+        // Serials within [next_seq, next_seq + W) proceed.
+        assert!(state.can_decode_proceed(7));
+        // Serials at/beyond the window are held back (bounded skew), even with
+        // no memory limit.
+        assert!(!state.can_decode_proceed(8));
+        assert!(!state.can_decode_proceed(100));
     }
 
     #[test]
@@ -5215,12 +5237,14 @@ mod tests {
     #[test]
     fn test_can_decode_proceed_over_limit_but_needed_serial() {
         let state = create_test_state(1024 * 1024); // 1MB limit
-        // Over 50% of limit
-        state.q3_reorder_state.heap_bytes.store(600_000, Ordering::SeqCst);
+        // Heap at the raw memory backstop, next_seq = 5.
+        state.q3_reorder_state.heap_bytes.store(1024 * 1024, Ordering::SeqCst);
         state.q3_reorder_state.next_seq.store(5, Ordering::SeqCst);
-        // Should still proceed for the needed serial (deadlock prevention)
+        // The needed serial (next_seq) always proceeds, even over memory
+        // (deadlock prevention).
         assert!(state.can_decode_proceed(5));
-        // But not for other serials
+        // A future serial within the window is still held back by the
+        // giant-batch memory backstop once heap reaches the limit.
         assert!(!state.can_decode_proceed(6));
     }
 
