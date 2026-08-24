@@ -200,6 +200,10 @@ Duplex agreement filters
   --max-duplex-disagreement-rate  maximum fraction of overlapping positions where the strands may
                                disagree (default 1.0, i.e. no limit)
   --max-duplex-disagreements   maximum absolute count of such disagreements
+  --legacy-overlap-window      use fgbio's legacy `[neg.start, pos.end]` overlap window, which
+                               rejects dovetailed short-insert pairs as dovetails and matches
+                               fgbio's current-release consensus output (off by default; the
+                               corrected intersection window admits those pairs)
 
 Note that `--methylation-mode` is not supported for CODEC data.
 "#
@@ -256,6 +260,18 @@ pub struct Codec {
     /// Minimum duplex overlap length in bases
     #[arg(short = 'd', long = "min-duplex-length", default_value = "1")]
     pub min_duplex_length: usize,
+
+    /// Use fgbio's legacy `[negative.start, positive.end]` duplex overlap window instead of the
+    /// corrected intersection window (fgumi#761).
+    ///
+    /// Reproduces fgbio's CODEC consensus *output* for the current fgbio release: dovetailed FR
+    /// pairs — common on short inserts, where each strand's alignment runs past the far end of
+    /// the other — are rejected rather than consensed, so far fewer consensus reads are emitted.
+    /// Those rejections are reported under `raw_reads_rejected_for_dovetail`, whereas fgbio
+    /// buckets them under `indel_error_between_strands`, so the `--stats` breakdown is not
+    /// byte-identical to fgbio's. Off by default (fulcrumgenomics/fgbio#1173).
+    #[arg(long = "legacy-overlap-window")]
+    pub legacy_overlap_window: bool,
 
     /// Set single-strand region quality to this value (0-93). Assigned
     /// unconditionally, so a lower quality is raised to it.
@@ -444,6 +460,7 @@ impl Command for Codec {
             min_reads_per_strand: self.min_reads,
             max_reads_per_strand: self.max_reads,
             min_duplex_length: self.min_duplex_length,
+            legacy_overlap_window: self.legacy_overlap_window,
             single_strand_qual: self.single_strand_qual,
             outer_bases_qual: self.outer_bases_qual,
             outer_bases_length: self.outer_bases_length,
@@ -677,6 +694,7 @@ impl Codec {
             min_reads_per_strand: self.min_reads,
             max_reads_per_strand: self.max_reads,
             min_duplex_length: self.min_duplex_length,
+            legacy_overlap_window: self.legacy_overlap_window,
             single_strand_qual: self.single_strand_qual,
             outer_bases_qual: self.outer_bases_qual,
             outer_bases_length: self.outer_bases_length,
@@ -898,6 +916,7 @@ mod tests {
             min_reads: 1,
             max_reads: None,
             min_duplex_length: 1,
+            legacy_overlap_window: false,
             single_strand_qual: None,
             outer_bases_qual: None,
             outer_bases_length: 5,
