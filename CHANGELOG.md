@@ -4,6 +4,79 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-24
+
+### Bug Fixes
+
+- Emit the five codec stats rows fgbio reports ([#754](https://github.com/fulcrumgenomics/fgumi/pull/754))
+- Qualify the content-mode diff count when pairing stopped early ([#750](https://github.com/fulcrumgenomics/fgumi/pull/750))
+- Reconcile single-strand rejections with --stats and --rejects ([#758](https://github.com/fulcrumgenomics/fgumi/pull/758))
+- Route per-read rejections to the --rejects output ([#756](https://github.com/fulcrumgenomics/fgumi/pull/756))
+- Clip overlapping reads by query distance, not reference distance ([#759](https://github.com/fulcrumgenomics/fgumi/pull/759))
+- Treat spec-equivalent @HD SO/GO spellings as compatible ([#784](https://github.com/fulcrumgenomics/fgumi/pull/784))
+- [**breaking**] Reject FASTQ inputs with different record counts ([#776](https://github.com/fulcrumgenomics/fgumi/pull/776))
+- [**breaking**] Fail on data left unflushed at end of stream ([#783](https://github.com/fulcrumgenomics/fgumi/pull/783))
+- Enforce the queue memory budget at the Read step ([#764](https://github.com/fulcrumgenomics/fgumi/pull/764))
+- Admit the gap-filler serial to Decode under memory-high ([#746](https://github.com/fulcrumgenomics/fgumi/pull/746)) ([#787](https://github.com/fulcrumgenomics/fgumi/pull/787))
+- Enforce the queue memory budget at the FASTQ Read step ([#772](https://github.com/fulcrumgenomics/fgumi/pull/772))
+- Separate the per-stage high-water mark from --max-memory ([#775](https://github.com/fulcrumgenomics/fgumi/pull/775))
+- [**breaking**] Count and route reads that trim to zero length ([#793](https://github.com/fulcrumgenomics/fgumi/pull/793))
+- Saturate queue-byte debits so queue_bytes_in_flight cannot overflow ([#811](https://github.com/fulcrumgenomics/fgumi/pull/811))
+- [**breaking**] Cap simplex --max-reads per end, not per group ([#723](https://github.com/fulcrumgenomics/fgumi/pull/723)) ([#812](https://github.com/fulcrumgenomics/fgumi/pull/812))
+- Renumber grouped-reads MI ids into monotonic file order ([#844](https://github.com/fulcrumgenomics/fgumi/pull/844))
+- Clip past-mate reads by query distance, not reference distance ([#760](https://github.com/fulcrumgenomics/fgumi/pull/760)) ([#840](https://github.com/fulcrumgenomics/fgumi/pull/840))
+- Reject colliding output paths across every command output ([#845](https://github.com/fulcrumgenomics/fgumi/pull/845))
+- Charge queue bytes before publishing on the processed queue ([#850](https://github.com/fulcrumgenomics/fgumi/pull/850))
+- Clip dovetail FR overlaps and make the TLEN FR check crate-internal ([#857](https://github.com/fulcrumgenomics/fgumi/pull/857))
+- Bound Q3 decode admission by serial skew, not bytes ([#860](https://github.com/fulcrumgenomics/fgumi/pull/860))
+
+### Documentation
+
+- Correct the TieRuleArg default and pin it with a test ([#753](https://github.com/fulcrumgenomics/fgumi/pull/753))
+- Use shortcut intra-doc links for backpressure constants ([#822](https://github.com/fulcrumgenomics/fgumi/pull/822))
+
+### Features
+
+- Per-library complexity metrics and duplication saturation ladder ([#786](https://github.com/fulcrumgenomics/fgumi/pull/786)) ([#799](https://github.com/fulcrumgenomics/fgumi/pull/799))
+- Decode the single-threaded raw-BAM reader via fgumi-bgzf, honoring verify_crc ([#800](https://github.com/fulcrumgenomics/fgumi/pull/800)) ([#842](https://github.com/fulcrumgenomics/fgumi/pull/842))
+- Add sample column and marginal duplication-ladder columns ([#802](https://github.com/fulcrumgenomics/fgumi/pull/802)) ([#841](https://github.com/fulcrumgenomics/fgumi/pull/841))
+- Add Picard pair/orphan duplicate breakdown to --metrics ([#804](https://github.com/fulcrumgenomics/fgumi/pull/804)) ([#815](https://github.com/fulcrumgenomics/fgumi/pull/815))
+- Honor --check-crc on correct/group single-threaded paths ([#800](https://github.com/fulcrumgenomics/fgumi/pull/800)) ([#805](https://github.com/fulcrumgenomics/fgumi/pull/805))
+- [**breaking**] Put the performance diagnostics behind --sort-stats ([#826](https://github.com/fulcrumgenomics/fgumi/pull/826))
+- Add retag command to rewrite SAM tags (copy/move/delete) ([#824](https://github.com/fulcrumgenomics/fgumi/pull/824))
+- Add --legacy-overlap-window for fgbio-parity output ([#861](https://github.com/fulcrumgenomics/fgumi/pull/861))
+
+### Miscellaneous Tasks
+
+- Run checks in the merge queue and cap job runtimes ([#848](https://github.com/fulcrumgenomics/fgumi/pull/848))
+- Harden samtools install against apt mirror stalls ([#825](https://github.com/fulcrumgenomics/fgumi/pull/825))
+
+### Performance
+
+- Skip the record-read zero-fill via a spare-capacity read ([#786](https://github.com/fulcrumgenomics/fgumi/pull/786)) ([#797](https://github.com/fulcrumgenomics/fgumi/pull/797))
+- Skip BGZF CRC verification on trusted stdin input by default ([#786](https://github.com/fulcrumgenomics/fgumi/pull/786)) ([#798](https://github.com/fulcrumgenomics/fgumi/pull/798))
+- Probe tag membership with a 256x256 bitset ([#830](https://github.com/fulcrumgenomics/fgumi/pull/830))
+- Batch the interim progress counter out of the per-record path ([#831](https://github.com/fulcrumgenomics/fgumi/pull/831))
+- Avoid three per-record heap allocations (group / downsample / overlapping consensus) ([#832](https://github.com/fulcrumgenomics/fgumi/pull/832))
+- Make the single-thread path lightweight and CPU-efficient ([#762](https://github.com/fulcrumgenomics/fgumi/pull/762)) ([#836](https://github.com/fulcrumgenomics/fgumi/pull/836))
+- Honor --check-crc for BGZF-compressed FASTQ input ([#819](https://github.com/fulcrumgenomics/fgumi/pull/819)) ([#820](https://github.com/fulcrumgenomics/fgumi/pull/820))
+- [**breaking**] Cut the Phase 1 ingest thread's per-record cost ([#829](https://github.com/fulcrumgenomics/fgumi/pull/829))
+- Overlap key extraction, reuse arena pages, and read with real queue depth ([#846](https://github.com/fulcrumgenomics/fgumi/pull/846))
+- Make parallel paired assigner dash-aware for asymmetric halves ([#852](https://github.com/fulcrumgenomics/fgumi/pull/852))
+
+### Refactor
+
+- Resolve clippy::pedantic cast-precision lints in base.rs ([#790](https://github.com/fulcrumgenomics/fgumi/pull/790))
+- Make --sort-stats run-scoped instead of a process-global static ([#855](https://github.com/fulcrumgenomics/fgumi/pull/855))
+
+### Testing
+
+- Assert the bases the CODEC consensus tests are named for ([#770](https://github.com/fulcrumgenomics/fgumi/pull/770))
+- Stabilize read-ahead backpressure assertion ([#809](https://github.com/fulcrumgenomics/fgumi/pull/809)) ([#827](https://github.com/fulcrumgenomics/fgumi/pull/827))
+- Enforce backpressure fixture headroom centrally ([#789](https://github.com/fulcrumgenomics/fgumi/pull/789)) ([#828](https://github.com/fulcrumgenomics/fgumi/pull/828))
+
+<!-- generated by git-cliff -->
+
 ### Breaking Changes
 
 - **fgumi simplex:** `--max-reads` now caps each end (Fragment, R1, R2) independently rather
