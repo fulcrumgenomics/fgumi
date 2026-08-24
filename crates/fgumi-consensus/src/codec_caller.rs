@@ -166,6 +166,17 @@ pub struct CodecConsensusOptions {
     /// Minimum duplex overlap length (in bases)
     pub min_duplex_length: usize,
 
+    /// Use fgbio's legacy `[negative.start, positive.end]` duplex overlap window instead of the
+    /// corrected intersection `[max(starts), min(ends)]` (fgumi#761).
+    ///
+    /// The legacy window equals the intersection only when one alignment nests within the span
+    /// of the other. On CODEC's short inserts the two strands routinely *dovetail* (each aligns
+    /// past the far end of the other), and the legacy window then overshoots past one read and
+    /// rejects the pair as [`CallerRejectionReason::Dovetail`] even with no indel. `false` (the
+    /// default) admits those pairs; `true` reproduces fgbio's consensus output for the current
+    /// fgbio release (fulcrumgenomics/fgbio#1173).
+    pub legacy_overlap_window: bool,
+
     /// Reduce quality of single-strand regions to this value (if set)
     pub single_strand_qual: Option<PhredScore>,
 
@@ -208,6 +219,7 @@ impl Default for CodecConsensusOptions {
             min_reads_per_strand: 1,
             max_reads_per_strand: None,
             min_duplex_length: 1,
+            legacy_overlap_window: false,
             single_strand_qual: None,
             outer_bases_qual: None,
             outer_bases_length: 5,
@@ -844,11 +856,20 @@ impl CodecConsensusCaller {
         // (fulcrumgenomics/fgumi#761). Clamping to the intersection is inert whenever the
         // alignments do not dovetail, since `max`/`min` then select the same two boundaries.
         //
+        // `--legacy-overlap-window` opts back into fgbio's `[negative.start, positive.end]`
+        // window to reproduce fgbio's consensus output for its current release; it differs from
+        // the intersection only on dovetailed pairs, which it rejects rather than consenses.
+        //
         // An empty intersection is not a special case: it can only arise when the two
         // alignments do not overlap, where these are still the same two boundaries fgbio
         // computes, and `min_duplex_length` (at least 1, enforced by the command) rejects it
         // just below.
-        let (overlap_start, overlap_end) = (neg_start.max(pos_start), pos_end.min(neg_end));
+        let (inter_start, inter_end) = (neg_start.max(pos_start), pos_end.min(neg_end));
+        let (overlap_start, overlap_end) = if self.options.legacy_overlap_window {
+            (neg_start, pos_end)
+        } else {
+            (inter_start, inter_end)
+        };
         let duplex_length = overlap_end as i64 - overlap_start as i64 + 1;
 
         if duplex_length < self.options.min_duplex_length as i64 {
@@ -859,27 +880,36 @@ impl CodecConsensusCaller {
             return Ok(ConsensusOutput::default());
         }
 
-        // Phase check using raw CIGAR ops
-        if !Self::check_overlap_phase_raw(longest_r1, longest_r2, overlap_start, overlap_end) {
-            self.reject_records_at(
-                Self::strand_raw_indices(&r1_infos, &r2_infos),
-                CallerRejectionReason::IndelErrorBetweenStrands,
-            );
-            return Ok(ConsensusOutput::default());
-        }
-
-        let r2_is_negative = longest_r2.flags & flags::REVERSE != 0;
-
-        // Compute consensus length using clipped info
-        let consensus_length =
-            Self::compute_consensus_length_raw(longest_pos, longest_neg, overlap_end);
+        // Phase and consensus-length checks on the active window (raw CIGAR ops). A pair that
+        // fails either is rejected; classify why. Under `--legacy-overlap-window`, a pair the
+        // corrected (intersection) window would have accepted is rejected solely because it
+        // dovetails, so label it `Dovetail` rather than the misleading `IndelErrorBetweenStrands`
+        // (which fgbio uses for these). In the default mode the active window *is* the
+        // intersection, so the `legacy_overlap_window &&` guard short-circuits and the reason is
+        // unchanged.
+        let phase_ok =
+            Self::check_overlap_phase_raw(longest_r1, longest_r2, overlap_start, overlap_end);
+        let consensus_length = if phase_ok {
+            Self::compute_consensus_length_raw(longest_pos, longest_neg, overlap_end)
+        } else {
+            None
+        };
         let Some(consensus_length) = consensus_length else {
-            self.reject_records_at(
-                Self::strand_raw_indices(&r1_infos, &r2_infos),
-                CallerRejectionReason::IndelErrorBetweenStrands,
-            );
+            let reason = if self.options.legacy_overlap_window
+                && (inter_end as i64 - inter_start as i64 + 1)
+                    >= self.options.min_duplex_length as i64
+                && Self::check_overlap_phase_raw(longest_r1, longest_r2, inter_start, inter_end)
+                && Self::compute_consensus_length_raw(longest_pos, longest_neg, inter_end).is_some()
+            {
+                CallerRejectionReason::Dovetail
+            } else {
+                CallerRejectionReason::IndelErrorBetweenStrands
+            };
+            self.reject_records_at(Self::strand_raw_indices(&r1_infos, &r2_infos), reason);
             return Ok(ConsensusOutput::default());
         };
+
+        let r2_is_negative = longest_r2.flags & flags::REVERSE != 0;
 
         // Phase 5: Build SourceReads and call single-strand consensus
         let r1_is_neg_strand = r1_infos.first().is_some_and(|i| i.flags & flags::REVERSE != 0);
@@ -4059,6 +4089,22 @@ mod tests {
         (caller, output)
     }
 
+    /// As [`call_codec_family`], but with `--legacy-overlap-window` (fgbio-parity window) on.
+    fn call_codec_family_legacy_window(
+        records: Vec<RawRecord>,
+    ) -> (CodecConsensusCaller, ConsensusOutput) {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            legacy_overlap_window: true,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+        let output = caller
+            .consensus_reads_from_sam_records(records)
+            .expect("a rejected family is not an error");
+        (caller, output)
+    }
+
     /// The dovetailed geometry of
     /// [`test_dovetailed_starts_without_an_indel_call_a_consensus`]: forward `2S126M` at 201
     /// (reference span 201-326) against reverse `3S127M` at 200 (200-326).
@@ -4107,6 +4153,70 @@ mod tests {
             b"ANTAACTTTTTGATAGTAGCGGGAGTAGGAGTAAATCTTGTACTAATTAGTGAATATTCTGTTGATGGTGGCTGAAAATTTATAGCTACACAACCAAAAAAATAAAAAACGTTAGTCAATAGCATTTA",
             "the consensus must be the reference sequence the two strands share",
         );
+    }
+
+    /// `--legacy-overlap-window` reproduces fgbio's rejection of a dovetailed pair, but labels
+    /// it honestly as [`CallerRejectionReason::Dovetail`] rather than `IndelErrorBetweenStrands`.
+    ///
+    /// [`dovetailed_start_template`] contains no indel, so the corrected default window
+    /// consenses it ([`test_dovetailed_starts_without_an_indel_call_a_consensus`]). Under the
+    /// legacy window the same family is rejected — but because it dovetails, not because of an
+    /// indel — so its reason must be `Dovetail`, and nothing may land under
+    /// `IndelErrorBetweenStrands`.
+    #[test]
+    fn test_legacy_overlap_window_labels_dovetail_rejection() {
+        let records = dovetailed_start_template();
+        let record_count = records.len();
+        let (caller, output) = call_codec_family_legacy_window(records);
+
+        let stats = caller.statistics();
+        assert_eq!(output.count, 0, "the legacy window rejects a dovetailed pair");
+        assert_eq!(
+            stats.rejection_reasons.get(&CallerRejectionReason::Dovetail),
+            Some(&record_count),
+            "a dovetail with no indel must be counted as Dovetail: {:?}",
+            stats.rejection_reasons
+        );
+        assert!(
+            !stats.rejection_reasons.contains_key(&CallerRejectionReason::IndelErrorBetweenStrands),
+            "no indel is present, so nothing may be counted under IndelErrorBetweenStrands: {:?}",
+            stats.rejection_reasons
+        );
+        assert_rejected_whole_family(&caller, &output, record_count);
+    }
+
+    /// `Dovetail` is reserved for pairs the corrected window would have accepted. A pair that
+    /// *both* dovetails and carries a real indel in the region both strands cover fails the
+    /// intersection check too, so under `--legacy-overlap-window` it stays
+    /// `IndelErrorBetweenStrands` — the same reason the default window gives it — not `Dovetail`.
+    ///
+    /// Reuses [`test_indel_inside_the_shared_region_is_still_rejected`]'s geometry: the reverse
+    /// read starts one base left of the forward read (a dovetail), and the forward read carries a
+    /// deletion in the middle of the shared region.
+    #[test]
+    fn test_legacy_overlap_window_keeps_indel_rejection_over_dovetail() {
+        let records = codec_template(
+            201,
+            &[(Kind::SoftClip, 2), (Kind::Match, 60), (Kind::Deletion, 1), (Kind::Match, 67)],
+            200,
+            &[(Kind::SoftClip, 3), (Kind::Match, 124), (Kind::SoftClip, 2)],
+        );
+        let record_count = records.len();
+        let (caller, output) = call_codec_family_legacy_window(records);
+
+        let stats = caller.statistics();
+        assert_eq!(
+            stats.rejection_reasons.get(&CallerRejectionReason::IndelErrorBetweenStrands),
+            Some(&record_count),
+            "a real indel in the shared region is an indel error, not a dovetail: {:?}",
+            stats.rejection_reasons
+        );
+        assert!(
+            !stats.rejection_reasons.contains_key(&CallerRejectionReason::Dovetail),
+            "a genuine indel must not be relabeled Dovetail under the legacy window: {:?}",
+            stats.rejection_reasons
+        );
+        assert_rejected_whole_family(&caller, &output, record_count);
     }
 
     /// The duplex overlap is measured over the region both strands align, so a threshold

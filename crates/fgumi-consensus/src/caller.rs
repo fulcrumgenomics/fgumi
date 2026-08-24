@@ -441,6 +441,12 @@ pub enum RejectionReason {
     /// quality or alignment failure). Counted so `raw_reads_used` excludes it and routed to
     /// the `--rejects` output (fgumi#724).
     Downsampled,
+    /// The two strands' alignments dovetail (each runs past the far end of the other), so the
+    /// legacy `[neg.start, pos.end]` overlap window rejects them with no indel present. Only
+    /// produced by the codec caller under `--legacy-overlap-window`; the corrected default
+    /// window admits these pairs. Replaces the misleading `IndelErrorBetweenStrands` label
+    /// fgbio uses for the same pairs (fgumi#761, fulcrumgenomics/fgbio#1173).
+    Dovetail,
     /// Other unspecified reason
     Other,
 }
@@ -470,6 +476,7 @@ impl RejectionReason {
             Self::PotentialCollision => 'C',
             Self::NotPrimaryFrPair => 'R',
             Self::Downsampled => 'd',
+            Self::Dovetail => 'w',
             Self::Other => 'O',
         }
     }
@@ -500,6 +507,7 @@ impl RejectionReason {
             }
             Self::NotPrimaryFrPair => "Template did not have a single primary FR pair of reads",
             Self::Downsampled => "Downsampled to the maximum reads per consensus",
+            Self::Dovetail => "Alignments dovetail (rejected only under the legacy overlap window)",
             Self::Other => "Other reason",
         }
     }
@@ -540,6 +548,10 @@ impl RejectionReason {
             // fgumi-specific: fgbio has no downsampled rejection metric yet
             // (fulcrumgenomics/fgbio#1166, #1167), so this diverges from fgbio under a cap.
             Self::Downsampled => CentralReason::Downsampled,
+            // fgumi-specific: only produced under `--legacy-overlap-window`. fgbio buckets
+            // these dovetail rejections under `indel_error_between_strands`; fgumi labels them
+            // honestly instead, so the legacy-window stats diverge from fgbio here (fgumi#761).
+            Self::Dovetail => CentralReason::Dovetail,
         }
     }
 }

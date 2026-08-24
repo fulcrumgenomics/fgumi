@@ -71,6 +71,14 @@ pub enum RejectionReason {
     /// (fulcrumgenomics/fgbio#1166, #1167), so this is fgumi-specific and diverges from
     /// fgbio's stats under a cap (fgumi#724).
     Downsampled,
+    /// The two strands' alignments dovetail — each runs past the far end of the other rather
+    /// than one nesting within the span of the other — and the legacy `[neg.start, pos.end]`
+    /// overlap window (fgbio parity, `--legacy-overlap-window`) therefore rejects them even
+    /// though neither CIGAR contains an indel. fgumi-specific: the corrected default window
+    /// admits these pairs, so this reason is only produced under `--legacy-overlap-window`,
+    /// where it is reported in place of the `indel_error_between_strands` bucket fgbio
+    /// mislabels them under (fulcrumgenomics/fgbio#1173, fgumi#761).
+    Dovetail,
 }
 
 impl RejectionReason {
@@ -105,6 +113,7 @@ impl RejectionReason {
             Self::HighDuplexDisagreement => "Too many errors between top/bottoms strands",
             Self::ClipOverlapFailed => "See https://github.com/fulcrumgenomics/fgbio/issues/1090",
             Self::Downsampled => "Reads discarded by consensus downsampling",
+            Self::Dovetail => "Alignments dovetail (rejected only under the legacy overlap window)",
         }
     }
 
@@ -137,6 +146,7 @@ impl RejectionReason {
             Self::HighDuplexDisagreement => "raw_reads_rejected_for_high_duplex_disagreement",
             Self::ClipOverlapFailed => "raw_reads_rejected_for_clip_overlap_failed",
             Self::Downsampled => "raw_reads_rejected_for_downsampled",
+            Self::Dovetail => "raw_reads_rejected_for_dovetail",
         }
     }
 
@@ -170,6 +180,7 @@ impl RejectionReason {
             Self::HighDuplexDisagreement => "Too many errors between top/bottoms strands",
             Self::ClipOverlapFailed => "See https://github.com/fulcrumgenomics/fgbio/issues/1090",
             Self::Downsampled => "Reads discarded by downsampling to the max reads per consensus",
+            Self::Dovetail => "Alignments dovetail; rejected under the legacy overlap window",
         }
     }
 }
