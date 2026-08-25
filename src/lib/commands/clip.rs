@@ -1140,6 +1140,40 @@ fn clipped_bases_raw(record: &RawRecord) -> usize {
         .sum()
 }
 
+// ==== ported from feat-runall for the chain builder (R2) ====
+/// Updates mate information tags (MC and MQ) for a read based on its mate.
+///
+/// After clipping operations, mate information tags need to be updated to reflect
+/// the new state of the mate read. This function updates:
+/// - MC tag: Mate CIGAR string
+/// - MQ tag: Mate mapping quality
+///
+/// These tags are standard SAM optional tags that store information about the mate
+/// to enable single-ended processing.
+///
+/// KNOWN DIVERGENCE — resolve in the clip WIRING PR: this is a NARROWER update
+/// than the canonical [`set_mate_info_raw`]. It updates only the MC/MQ tags and
+/// still does not update mate ref/pos/strand or TLEN; the clip wiring PR must
+/// delegate to `ClipParams::clip_template` / `set_mate_info_raw` and add
+/// byte-parity tests (same deferral as the Cluster-4 chain-clip divergence). The
+/// MC/MQ unmapped-mate divergence is closed here (see below) rather than
+/// deferred, so it cannot survive to the wiring PR.
+///
+/// # Arguments
+///
+/// * `record` - The record to update (mutable)
+/// * `mate` - The mate record to read information from
+pub(crate) fn update_mate_info_raw(record: &mut RawRecord, mate: &RawRecord) {
+    use fgumi_raw_bam::flags as rflags;
+    // An unmapped mate has no CIGAR and no meaningful MAPQ: remove MC/MQ rather
+    // than writing an empty `MC:Z:` and a stale MQ. Matches `set_mate_info_raw`.
+    if mate.flags() & rflags::UNMAPPED != 0 {
+        clear_mate_mq_mc_raw(record);
+        return;
+    }
+    set_mate_mq_mc_raw(record, mate.mapq(), &mate.cigar_to_string());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

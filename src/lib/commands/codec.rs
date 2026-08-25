@@ -355,6 +355,9 @@ pub struct CodecOptions {
     pub max_duplex_disagreement_rate: f64,
     /// Maximum duplex disagreements.
     pub max_duplex_disagreements: Option<usize>,
+    /// Use fgbio's legacy `[neg.start, pos.end]` overlap window for the duplex
+    /// consensus region instead of the strict intersection (`--legacy-overlap-window`).
+    pub legacy_overlap_window: bool,
     /// Let fully-unmapped primary templates through the pre-group filter.
     ///
     /// Carried as the whole flattened sub-struct, like `io` / `rejects_opts` /
@@ -391,6 +394,7 @@ impl Codec {
             outer_bases_length: self.outer_bases_length,
             max_duplex_disagreement_rate: self.max_duplex_disagreement_rate,
             max_duplex_disagreements: self.max_duplex_disagreements,
+            legacy_overlap_window: self.legacy_overlap_window,
             allow_unmapped: self.allow_unmapped.clone(),
             io: self.io.clone(),
             rejects_opts: self.rejects_opts.clone(),
@@ -416,6 +420,25 @@ fn recover_or_propagate_codec_error(e: CodecConsensusError, umi: &str) -> Result
     } else {
         Err(anyhow::Error::from(e))
             .with_context(|| format!("Failed to call consensus for UMI: {umi}"))
+    }
+}
+
+impl CodecOptions {
+    /// Reconstruct the shared [`ConsensusCallingOptions`] from the inlined flat
+    /// fields, so the chain builder can read `.consensus().error_rate_pre_umi`
+    /// etc. `tie_rule` is stored resolved on `CodecOptions`; convert it back to
+    /// the CLI-facing [`crate::commands::common::TieRuleArg`] via the 1:1 mapping.
+    #[must_use]
+    pub fn consensus(&self) -> ConsensusCallingOptions {
+        ConsensusCallingOptions {
+            error_rate_pre_umi: self.error_rate_pre_umi,
+            error_rate_post_umi: self.error_rate_post_umi,
+            min_input_base_quality: self.min_input_base_quality,
+            output_per_base_tags: self.output_per_base_tags,
+            trim: self.trim,
+            min_consensus_base_quality: self.min_consensus_base_quality,
+            tie_rule: self.tie_rule.into(),
+        }
     }
 }
 

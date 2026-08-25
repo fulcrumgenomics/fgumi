@@ -141,7 +141,13 @@ pub(crate) fn header_declares_order(header: &Header, sort_order: keys::SortOrder
 /// Preserves all existing header content (reference sequences, read groups, programs,
 /// comments, and `@HD` fields like `VN`), then overwrites only the sort-related tags
 /// (`SO`, `GO`, `SS`) based on the requested sort order.
-pub(crate) fn create_output_header(sort_order: keys::SortOrder, header: &Header) -> Header {
+///
+/// # Panics
+///
+/// Panics only if constructing the default `@HD` map fails, which cannot happen for
+/// the hard-coded default built here.
+#[must_use]
+pub fn create_output_header(sort_order: keys::SortOrder, header: &Header) -> Header {
     let mut builder = Header::builder();
 
     // Copy reference sequences

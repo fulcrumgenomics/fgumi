@@ -67,7 +67,7 @@ pub use bin::{UNMAPPED_BIN, bin_from_raw_bam, reg2bin, set_bin_from_raw_bam};
 pub use hash::{fgbio_read_name_rank, htsjdk_murmur3_hash_unencoded_chars};
 
 // -- builder --
-pub use builder::{ReadNameTooLong, SamBuilder, UnmappedSamBuilder};
+pub use builder::{ReadNameTooLong, SamBuilder, UnmappedSamBuilder, write_framed_record};
 
 // -- cigar --
 #[cfg(feature = "noodles")]

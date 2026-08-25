@@ -906,6 +906,14 @@ pub trait UmiAssigner: Send + Sync {
     /// `Vec<MoleculeId>` where `result[i]` is the assignment for `raw_umis[i]`.
     fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId>;
 
+    /// Reset any internal per-run state (e.g. a monotonic molecule-id counter)
+    /// so the assigner can be reused across batches within one chain run.
+    ///
+    /// Default is a no-op; assigners that carry a counter override this to zero
+    /// it. See `chains/commands/{group,dedup}.rs`, which reset the assigner
+    /// between position groups.
+    fn reset(&self) {}
+
     /// Check if two UMIs are the same
     ///
     /// Default implementation uses simple string equality. Override for custom
@@ -1007,6 +1015,10 @@ impl Default for IdentityUmiAssigner {
 }
 
 impl UmiAssigner for IdentityUmiAssigner {
+    fn reset(&self) {
+        self.counter.store(0, Ordering::SeqCst);
+    }
+
     fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
         if raw_umis.is_empty() {
             return Vec::new();
@@ -1265,6 +1277,10 @@ impl SimpleErrorUmiAssigner {
 }
 
 impl UmiAssigner for SimpleErrorUmiAssigner {
+    fn reset(&self) {
+        self.counter.store(0, Ordering::SeqCst);
+    }
+
     fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
         if raw_umis.is_empty() {
             return Vec::new();
@@ -1934,6 +1950,10 @@ impl AdjacencyUmiAssigner {
 }
 
 impl UmiAssigner for AdjacencyUmiAssigner {
+    fn reset(&self) {
+        self.counter.store(0, Ordering::SeqCst);
+    }
+
     fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
         if raw_umis.is_empty() {
             return Vec::new();
@@ -2484,6 +2504,16 @@ impl PairedUmiAssigner {
 }
 
 impl UmiAssigner for PairedUmiAssigner {
+    fn reset(&self) {
+        // Molecule ids are produced via `self.adjacency.next_id()`, so the
+        // counter that must be zeroed for per-position-group reuse lives in the
+        // wrapped adjacency assigner. Delegate to its `reset` (a no-op default
+        // here would leave the counter accumulating across groups, breaking the
+        // chain's local-`0..k` per-group numbering that `distinct_mi_count` and
+        // `assign_mi_offsets` rely on — see `chains/commands/{group,dedup}.rs`).
+        self.adjacency.reset();
+    }
+
     fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
         if raw_umis.is_empty() {
             return Vec::new();
@@ -2850,6 +2880,61 @@ mod tests {
             ids[2],
             MoleculeId::None,
             "invalid-base UMI gets its own molecule (fgbio assigns every UMI a molecule)"
+        );
+    }
+
+    /// `reset()` must return a reused assigner to its initial molecule-id
+    /// numbering. The chain group/dedup loops reuse ONE assigner across
+    /// position groups and call `reset()` per group so each group emits local
+    /// ids `0..k` (which `distinct_mi_count` and the downstream
+    /// `assign_mi_offsets` global rebase depend on). The trait's default
+    /// `reset()` is a no-op, so an assigner that carries a counter but forgets
+    /// to override it silently leaves the counter accumulating — corrupting the
+    /// per-group MI numbering. This pins that every sequential strategy actually
+    /// resets, including `Paired` (which delegates to its wrapped adjacency
+    /// counter and would otherwise inherit the no-op default).
+    #[rstest]
+    #[case::identity(
+        crate::assigner::Strategy::Identity,
+        0,
+        vec!["AAAA".to_string(), "AAAA".to_string(), "CCCC".to_string()]
+    )]
+    #[case::edit(
+        crate::assigner::Strategy::Edit,
+        1,
+        vec!["AAAA".to_string(), "AAAT".to_string(), "CCCC".to_string()]
+    )]
+    #[case::adjacency(
+        crate::assigner::Strategy::Adjacency,
+        1,
+        vec!["AAAA".to_string(), "AAAT".to_string(), "CCCC".to_string()]
+    )]
+    #[case::paired(
+        crate::assigner::Strategy::Paired,
+        1,
+        vec!["ACT-ACT".to_string(), "ACT-ACT".to_string(), "TGA-TGA".to_string()]
+    )]
+    fn reset_restores_initial_molecule_numbering(
+        #[case] strategy: crate::assigner::Strategy,
+        #[case] edits: u32,
+        #[case] umis: Vec<Umi>,
+    ) {
+        let assigner = strategy.new_assigner_full(edits, 1, 100);
+        let first = assigner.assign(&umis);
+        // Advance the internal counter with an extra batch (no reset here).
+        let _ = assigner.assign(&umis);
+        // Without reset, the reused assigner's ids drift past the first block —
+        // this guards against a no-op `reset()` making the assertion below pass
+        // trivially.
+        let reused = assigner.assign(&umis);
+        assert_ne!(reused, first, "reused assign without reset must advance ids for {strategy:?}");
+        // reset() must restore the initial local numbering, so a reused
+        // (reset) assigner is byte-identical to a fresh one per group.
+        assigner.reset();
+        let after_reset = assigner.assign(&umis);
+        assert_eq!(
+            after_reset, first,
+            "reset() must restore local `0..k` molecule numbering for {strategy:?}"
         );
     }
 

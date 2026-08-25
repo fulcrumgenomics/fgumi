@@ -148,7 +148,7 @@ fn classify_compression_header(header: &[u8]) -> CompressionFormat {
 ///
 /// # Returns
 /// A boxed reader that implements `BufRead` + `Send`
-fn open_fastq_reader(
+pub(crate) fn open_fastq_reader(
     path: &Path,
     threads: usize,
     async_reader: bool,
@@ -288,7 +288,7 @@ fn detect_compression_format_from_stream(
 
 /// Quality encoding type
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum QualityEncoding {
+pub enum QualityEncoding {
     Standard, // Phred+33 (Sanger)
     Illumina, // Phred+64 (Illumina 1.3-1.7)
 }
@@ -859,7 +859,7 @@ impl Extract {
         if let Some(tag) = self.single_tag {
             ensure!(
                 !RESERVED_OUTPUT_TAGS.contains(&tag),
-                "Single tag cannot collide with tags emitted by extract \
+                "Single tag (--single-tag) cannot collide with tags emitted by extract \
                  (RX, QX, CB, CY, BC, QT, RG): {tag}"
             );
         }
@@ -1906,6 +1906,281 @@ fn validate_template_record_count(
         ));
     }
     Ok(())
+}
+
+// ==== ported from feat-runall for the chain builder (R2) ====
+/// Per-stage options for [`crate::pipeline::chains::Stage::Extract`].
+///
+/// Carries all the knobs that [`crate::pipeline::chains::commands::extract`]
+/// (T5.6) will need when building the extract step sequence and synthesizing the
+/// unmapped-BAM header:
+///
+/// - **Header-synthesis fields** (`sample`, `library`, `platform`,
+///   `platform_unit`, `read_group_id`, `comments`) map directly to the
+///   corresponding `@RG` and `@CO` entries written by [`Extract::create_header`].
+/// - **Behavior options** control tag output and name annotation in the same
+///   way as the identically-named [`Extract`] CLI flags.
+///
+/// Constructed by `Extract::execute` (T5.7) from the parsed CLI struct and
+/// placed into [`crate::pipeline::chains::StageOptionsBag::extract`].
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ExtractOptions {
+    // ── Header-synthesis fields (map to @RG / @CO in the unmapped BAM header) ──
+    /// Sample name (`@RG SM:`).
+    pub sample: String,
+    /// Library name (`@RG LB:`).
+    pub library: String,
+    /// Sequencing platform (`@RG PL:`, e.g. `"illumina"`).
+    pub platform: Option<String>,
+    /// Platform unit (`@RG PU:`).
+    pub platform_unit: Option<String>,
+    /// Read-group identifier (`@RG ID:`). Defaults to `"A"`.
+    pub read_group_id: String,
+    /// Comments to add as `@CO` lines in the header.
+    pub comments: Vec<String>,
+    /// Library or sample barcode sequence (`@RG BC:`).
+    pub barcode: Option<String>,
+    /// Platform model (`@RG PM:`, e.g. `"hiseq2500"`).
+    pub platform_model: Option<String>,
+    /// Sequencing center (`@RG CN:`).
+    pub sequencing_center: Option<String>,
+    /// Predicted median insert size (`@RG PI:`).
+    pub predicted_insert_size: Option<u32>,
+    /// Description of the read group (`@RG DS:`).
+    pub description: Option<String>,
+    /// Date the run was produced (`@RG DT:`).
+    pub run_date: Option<String>,
+
+    // ── Extract behavior options ──
+    /// Quality encoding of the input FASTQ files.
+    pub quality_encoding: QualityEncoding,
+    /// Store UMI base qualities in the `QX` tag.
+    pub store_umi_quals: bool,
+    /// Store cell-barcode base qualities in the `CY` tag.
+    pub store_cell_quals: bool,
+    /// Single SAM tag to store all concatenated UMIs (must not collide with
+    /// reserved tags `RX`, `QX`, `CB`, `CY`, `BC`, `QT`, `RG`).
+    pub single_tag: Option<SamTag>,
+    /// Append `+<UMIs>` to each read name.
+    pub annotate_read_names: bool,
+    /// Extract UMIs from read names (last `:`-separated field, ≥8 fields).
+    pub extract_umis_from_read_names: bool,
+    /// Store sample-barcode qualities in the `QT` tag.
+    pub store_sample_barcode_qualities: bool,
+    /// Wrap FASTQ readers in a userspace async prefetch thread.
+    pub async_reader: bool,
+}
+
+/// Build raw BAM [`RawRecord`]s from a [`FastqSet`].
+///
+/// This is the core extract logic: applies read structures (via the segments
+/// already present in `read_set`), extracts UMI / cell-barcode / sample-barcode
+/// tags, and produces one [`RawRecord`] per template segment. The caller wraps
+/// the result in a [`crate::template::Template`] for the typed-step pipeline.
+///
+/// KNOWN DUPLICATION — resolve in the extract WIRING PR: this is a third
+/// near-identical copy of the FASTQ→`RawRecord` per-read loop, alongside
+/// `Extract::make_raw_records` (writes to a `RawBamWriter`) and
+/// `make_raw_records_static` (builds an `ExtractedBatch`). The three differ only
+/// in output target, so tag-extraction/flag logic can drift between them. The
+/// extract wiring PR should unify them (sharing `Extract::create_header` and the
+/// per-read tag loop) once the chain extract path is live; dormant today.
+///
+/// # Errors
+///
+/// Returns an error if the read set contains no template segments, or if a read
+/// name is 255 bytes or longer (via `try_build_record`).
+pub fn make_raw_records_from_fastq_set(
+    read_set: &FastqSet,
+    opts: &ExtractOptions,
+) -> Result<Vec<fgumi_raw_bam::RawRecord>> {
+    let templates: Vec<&FastqSegment> = read_set.template_segments().collect();
+
+    let read_name = String::from_utf8_lossy(&read_set.header);
+    ensure!(!templates.is_empty(), "No template segments found for read: {read_name}");
+
+    // Extract various barcode types as BString
+    let cell_barcode_bs = Extract::join_bytes_with_separator(
+        read_set.cell_barcode_segments().map(|s| s.seq.as_slice()),
+        b'-',
+    );
+    let cell_quals_bs = Extract::join_bytes_with_separator(
+        read_set.cell_barcode_segments().map(|s| s.quals.as_slice()),
+        b' ',
+    );
+    let sample_barcode_bs = Extract::join_bytes_with_separator(
+        read_set.sample_barcode_segments().map(|s| s.seq.as_slice()),
+        b'-',
+    );
+    let sample_quals_bs = Extract::join_bytes_with_separator(
+        read_set.sample_barcode_segments().map(|s| s.quals.as_slice()),
+        b' ',
+    );
+    let umi_bs = Extract::join_bytes_with_separator(
+        read_set.molecular_barcode_segments().map(|s| s.seq.as_slice()),
+        b'-',
+    );
+    let umi_qual_bs = Extract::join_bytes_with_separator(
+        read_set.molecular_barcode_segments().map(|s| s.quals.as_slice()),
+        b' ',
+    );
+
+    // Extract UMI from read name if requested
+    let (read_name_bytes, umi_from_name) =
+        Extract::extract_read_name_and_umi(&read_set.header, opts.extract_umis_from_read_names)?;
+
+    // Prepare final UMI
+    let final_umi_bs: BString = match (umi_bs.is_empty(), &umi_from_name) {
+        (true, Some(from_name)) => BString::from(from_name.as_slice()),
+        (true, None) => BString::default(),
+        (false, Some(from_name)) => {
+            let mut combined = Vec::with_capacity(from_name.len() + 1 + umi_bs.len());
+            combined.extend_from_slice(from_name);
+            combined.push(b'-');
+            combined.extend_from_slice(umi_bs.as_bytes());
+            BString::from(combined)
+        }
+        (false, None) => umi_bs,
+    };
+
+    let num_templates = templates.len();
+    let mut builder = UnmappedSamBuilder::new();
+    let mut records = Vec::with_capacity(num_templates);
+
+    for (index, template) in templates.iter().enumerate() {
+        // Compute flags for unmapped reads
+        let mut flag = flags::UNMAPPED;
+        if num_templates == 2 {
+            flag |= flags::PAIRED | flags::MATE_UNMAPPED;
+            if index == 0 {
+                flag |= flags::FIRST_SEGMENT;
+            } else {
+                flag |= flags::LAST_SEGMENT;
+            }
+        }
+
+        // Set read name (optionally with UMI annotation)
+        let annotated_name: Option<Vec<u8>> =
+            if opts.annotate_read_names && !final_umi_bs.is_empty() {
+                let mut name = Vec::with_capacity(read_name_bytes.len() + 1 + final_umi_bs.len());
+                name.extend_from_slice(&read_name_bytes);
+                name.push(b'+');
+                name.extend_from_slice(final_umi_bs.as_bytes());
+                Some(name)
+            } else {
+                None
+            };
+        let final_read_name: &[u8] = annotated_name.as_deref().unwrap_or(&read_name_bytes);
+
+        // Build the record - if empty seq, substitute with single N @ Q2.
+        // Use try_build_record (not the panicking build_record): the name is
+        // derived from the input FASTQ header (plus an optional `+<UMI>`), so an
+        // over-long (>=255-byte) name is bad input, not a bug — fail cleanly with
+        // context instead of panicking partway through the batch and truncating
+        // the output BAM. Mirrors the standalone path's `build_template_record`.
+        if template.seq.is_empty() {
+            builder.try_build_record(final_read_name, flag, b"N", &[2u8])
+        } else {
+            let numeric_quals = opts.quality_encoding.to_standard_numeric(&template.quals);
+            builder.try_build_record(final_read_name, flag, &template.seq, &numeric_quals)
+        }
+        .with_context(|| Extract::read_name_too_long_context(final_read_name))?;
+
+        // Append tags
+        // Read group
+        builder.append_string_tag(SamTag::RG, opts.read_group_id.as_bytes());
+
+        // Cell barcode
+        if !cell_barcode_bs.is_empty() {
+            builder.append_string_tag(SamTag::CB, cell_barcode_bs.as_bytes());
+        }
+
+        if !cell_quals_bs.is_empty() && opts.store_cell_quals {
+            builder.append_string_tag(SamTag::CY, cell_quals_bs.as_bytes());
+        }
+
+        // Sample barcode
+        if !sample_barcode_bs.is_empty() {
+            builder.append_string_tag(SamTag::BC, sample_barcode_bs.as_bytes());
+        }
+
+        if opts.store_sample_barcode_qualities && !sample_quals_bs.is_empty() {
+            builder.append_string_tag(SamTag::QT, sample_quals_bs.as_bytes());
+        }
+
+        // UMI
+        if !final_umi_bs.is_empty() {
+            builder.append_string_tag(SamTag::RX, final_umi_bs.as_bytes());
+
+            // Single tag for all concatenated UMIs (if specified)
+            if let Some(st) = opts.single_tag {
+                builder.append_string_tag(st, final_umi_bs.as_bytes());
+            }
+
+            // Only add UMI qualities if not extracted from read names
+            if umi_from_name.is_none() && !umi_qual_bs.is_empty() && opts.store_umi_quals {
+                builder.append_string_tag(SamTag::QX, umi_qual_bs.as_bytes());
+            }
+        }
+
+        records.push(builder.build());
+    }
+
+    Ok(records)
+}
+
+/// Validate that the read structures produce a valid SAM template: 1 or 2
+/// template (`T`) reads total. 0 template reads yields records with no sequence;
+/// 3+ produce more segments than a SAM template (R1/R2) can hold — either way
+/// the output BAM would be malformed. Shared by the standalone `Extract` command
+/// and the chain/runall `ChainBuilder::add_extract` so both paths reject it
+/// (the chain path previously skipped this check — silent malformed output).
+///
+/// # Errors
+///
+/// Returns an error unless the total template-read count is 1 or 2.
+pub(crate) fn validate_template_count(read_structures: &[ReadStructure]) -> anyhow::Result<()> {
+    let template_count: usize =
+        read_structures.iter().map(|rs| rs.segments_by_type(SegmentType::Template).count()).sum();
+    anyhow::ensure!(
+        (1..=2).contains(&template_count),
+        "read structures must contain 1-2 template reads total."
+    );
+    Ok(())
+}
+
+// ==== impls ported from feat-runall for the chain builder (R2) ====
+impl ExtractOptions {
+    /// Validate that [`Self::single_tag`] does not collide with any of the
+    /// SAM tags that the extractor emits internally.
+    ///
+    /// This mirrors the check in [`Extract::validate`]; keeping both guards in
+    /// sync ensures that the error fires whether the caller constructs an
+    /// `ExtractOptions` directly (chain path) or via the CLI struct (command path).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `single_tag` matches `RX`, `QX`, `CB`, `CY`,
+    /// `BC`, `QT`, or `RG`, or when `extract_umis_from_read_names` is combined
+    /// with `store_umi_quals` (read-name UMIs carry no qualities, so
+    /// `make_raw_records_from_fastq_set` would silently omit `QX`).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        const RESERVED_OUTPUT_TAGS: &[SamTag] =
+            &[SamTag::RX, SamTag::QX, SamTag::CB, SamTag::CY, SamTag::BC, SamTag::QT, SamTag::RG];
+        if let Some(ref tag) = self.single_tag {
+            anyhow::ensure!(
+                !RESERVED_OUTPUT_TAGS.contains(tag),
+                "Single tag (--single-tag) cannot collide with tags emitted by extract \
+                 (RX, QX, CB, CY, BC, QT, RG): {tag}"
+            );
+        }
+        anyhow::ensure!(
+            !self.extract_umis_from_read_names || !self.store_umi_quals,
+            "Cannot store UMI qualities (--store-umi-quals) when also extracting UMIs from read names (--extract-umis-from-read-names)."
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -3936,7 +4211,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Single tag cannot collide with tags emitted by extract")]
+    #[should_panic(
+        expected = "Single tag (--single-tag) cannot collide with tags emitted by extract"
+    )]
     fn test_single_tag_same_as_umi_tag() {
         let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "ACGTAAAAAA", "IIII======")]);
@@ -5500,5 +5777,89 @@ mod tests {
             key_set(&plain_out),
             "BGZF interleaved output must match plaintext interleaved output"
         );
+    }
+
+    /// `validate_template_count` accepts exactly 1-2 template reads (a SAM
+    /// template is R1, or R1/R2); 0 yields sequence-less records and 3+ produce
+    /// more segments than a template can hold. Pins the guard the chain path
+    /// previously skipped (silent malformed output) — see the fn's doc.
+    #[rstest]
+    #[case::zero_no_structures(&[], false)]
+    #[case::zero_no_template_segment(&["8M"], false)]
+    #[case::one_template(&["+T"], true)]
+    #[case::two_templates(&["+T", "+T"], true)]
+    #[case::two_templates_with_barcodes(&["4M+T", "4M+T"], true)]
+    #[case::three_templates(&["+T", "+T", "+T"], false)]
+    fn validate_template_count_accepts_one_or_two_templates(
+        #[case] structures: &[&str],
+        #[case] expected_ok: bool,
+    ) {
+        let read_structures: Vec<ReadStructure> = structures
+            .iter()
+            .map(|s| ReadStructure::from_str(s).expect("valid read structure"))
+            .collect();
+        assert_eq!(validate_template_count(&read_structures).is_ok(), expected_ok);
+    }
+
+    /// Minimal `ExtractOptions` with every field at a benign default, so a test
+    /// can set exactly the field under scrutiny. `ExtractOptions` has no `Default`
+    /// (it is normally projected from the parsed CLI struct).
+    fn minimal_extract_options() -> ExtractOptions {
+        ExtractOptions {
+            sample: "sample".to_string(),
+            library: "lib".to_string(),
+            platform: None,
+            platform_unit: None,
+            read_group_id: "A".to_string(),
+            comments: Vec::new(),
+            barcode: None,
+            platform_model: None,
+            sequencing_center: None,
+            predicted_insert_size: None,
+            description: None,
+            run_date: None,
+            quality_encoding: QualityEncoding::Standard,
+            store_umi_quals: false,
+            store_cell_quals: false,
+            single_tag: None,
+            annotate_read_names: false,
+            extract_umis_from_read_names: false,
+            store_sample_barcode_qualities: false,
+            async_reader: false,
+        }
+    }
+
+    /// `ExtractOptions::validate` must reject a `--single-tag` that collides with
+    /// any tag extract emits (RX/QX/CB/CY/BC/QT/RG) and accept any other tag,
+    /// mirroring `Extract::validate`.
+    #[rstest]
+    #[case::reserved_rx(Some(SamTag::RX), false)]
+    #[case::reserved_rg(Some(SamTag::RG), false)]
+    #[case::non_reserved_mi(Some(SamTag::MI), true)]
+    #[case::none(None, true)]
+    fn extract_options_validate_single_tag_collision(
+        #[case] single_tag: Option<SamTag>,
+        #[case] expected_ok: bool,
+    ) {
+        let mut opts = minimal_extract_options();
+        opts.single_tag = single_tag;
+        assert_eq!(opts.validate().is_ok(), expected_ok);
+    }
+
+    /// Extracting UMIs from read names carries no qualities, so pairing it with
+    /// `--store-umi-quals` (which would silently omit `QX`) must be rejected.
+    #[test]
+    fn extract_options_validate_rejects_umi_from_name_with_store_umi_quals() {
+        let mut opts = minimal_extract_options();
+        opts.extract_umis_from_read_names = true;
+        opts.store_umi_quals = true;
+        assert!(
+            opts.validate().is_err(),
+            "extract-umis-from-read-names + store-umi-quals must be rejected"
+        );
+        // Either flag alone is fine.
+        let mut only_from_name = minimal_extract_options();
+        only_from_name.extract_umis_from_read_names = true;
+        only_from_name.validate().expect("extract-umis-from-read-names alone must validate");
     }
 }

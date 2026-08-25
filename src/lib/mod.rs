@@ -126,6 +126,7 @@
 //! - [fgbio](https://github.com/fulcrumgenomics/fgbio) - Scala implementation
 //! - [noodles](https://github.com/zaeleus/noodles) - Rust bioinformatics I/O
 
+pub mod aligner;
 pub mod commands;
 pub mod version;
 pub use fgumi_bgzf::reader as bgzf_reader;

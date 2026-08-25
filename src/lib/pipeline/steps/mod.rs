@@ -18,24 +18,20 @@
 //! - `tuning.rs`                — per-chain byte/queue budgets
 //! - `types.rs`                 — flowing data types (`HeapSize` + `Ordered`)
 //!
-//! `extract.rs` and `align_and_merge` arrive in follow-up ports: `extract.rs`
-//! still needs `ExtractOptions` from the command-layer options refactor, and
-//! `align_and_merge` needs `crate::aligner`, neither of which has landed yet.
-//! (`correct/` had the same dependency on `CorrectOptions`; that arrived with
-//! the options projection, so it is ported here.)
+//! `extract.rs` and `align_and_merge.rs` land here with the chain builder
+//! (R2), which is their consumer: `extract.rs` needs `ExtractOptions` (ported
+//! alongside) and `align_and_merge.rs` needs `crate::aligner` (ported alongside).
 //!
-//! This module deliberately holds only what the chain builder actually
-//! constructs. Two steps that exist upstream are *not* ported here:
 //! `coalesce.rs` (a `CoalesceBytes` byte-batching step with no caller anywhere,
-//! upstream included) and `roundtrip.rs` (a whole-chain convenience whose only
-//! consumer is the `compare bam-roundtrip` command, so it travels with the
-//! command rewiring rather than with the steps).
+//! upstream included) is *not* ported — it would be dead code.
 
+pub mod align_and_merge;
 pub mod bgzf;
 pub mod boundaries;
 #[cfg(test)]
 mod chain_tests;
 pub mod correct;
+pub mod extract;
 pub mod group;
 pub mod parse;
 pub mod process;

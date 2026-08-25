@@ -329,6 +329,52 @@ impl Simplex {
     }
 }
 
+impl SimplexOptions {
+    /// Reconstruct the shared [`ConsensusCallingOptions`] from the inlined flat
+    /// fields, so the chain builder can read `.consensus().error_rate_pre_umi`
+    /// etc. `tie_rule` is stored resolved on `SimplexOptions`; convert it back to
+    /// the CLI-facing [`TieRuleArg`] via the 1:1 mapping.
+    #[must_use]
+    pub fn consensus(&self) -> ConsensusCallingOptions {
+        ConsensusCallingOptions {
+            error_rate_pre_umi: self.error_rate_pre_umi,
+            error_rate_post_umi: self.error_rate_post_umi,
+            min_input_base_quality: self.min_input_base_quality,
+            output_per_base_tags: self.output_per_base_tags,
+            trim: self.trim,
+            min_consensus_base_quality: self.min_consensus_base_quality,
+            tie_rule: self.tie_rule.into(),
+        }
+    }
+
+    /// Reconstruct the shared [`OverlappingConsensusOptions`] from the inlined
+    /// flat field.
+    #[must_use]
+    pub fn overlapping(&self) -> OverlappingConsensusOptions {
+        OverlappingConsensusOptions {
+            consensus_call_overlapping_bases: self.consensus_call_overlapping_bases,
+        }
+    }
+
+    /// Validate the `--min-reads` / `--max-reads` range.
+    ///
+    /// `min_reads` must be `>= 1` (a value of 0 admits empty groups) and, when
+    /// `max_reads` is set, it must be `>= min_reads`. Shared by the standalone
+    /// `Simplex::execute` and the chain builder's `add_simplex` so `runall`
+    /// rejects the same degenerate configurations the standalone command does.
+    pub(crate) fn validate_read_bounds(&self) -> Result<()> {
+        if self.min_reads == 0 {
+            bail!("--min-reads must be >= 1 (a value of 0 admits empty groups)");
+        }
+        if let Some(max) = self.max_reads
+            && max < self.min_reads
+        {
+            bail!("--max-reads ({}) must be >= --min-reads ({})", max, self.min_reads);
+        }
+        Ok(())
+    }
+}
+
 impl Command for Simplex {
     fn execute(&self, command_line: &str) -> Result<()> {
         // Start timing
@@ -618,15 +664,7 @@ impl Simplex {
     ///
     /// Returns an error if `min_reads` is 0, or if `max_reads` is below `min_reads`.
     fn validate_read_bounds(&self) -> Result<()> {
-        if self.min_reads == 0 {
-            bail!("--min-reads must be >= 1 (a value of 0 admits empty groups)");
-        }
-        if let Some(max) = self.max_reads
-            && max < self.min_reads
-        {
-            bail!("--max-reads ({}) must be >= --min-reads ({})", max, self.min_reads);
-        }
-        Ok(())
+        self.to_simplex_options().validate_read_bounds()
     }
 
     /// Execute using 7-step unified pipeline with --threads.

@@ -70,14 +70,14 @@ fn estimate_templates_heap_size(templates: &[Template]) -> usize {
 /// per-position-group results into its own slot, so memory is O(threads ×
 /// distinct family/position-group sizes) rather than O(position groups).
 #[derive(Default, Debug)]
-struct GroupMetricsAccumulator {
-    family_sizes: AHashMap<usize, u64>,
-    position_group_sizes: AHashMap<usize, u64>,
-    filter_counts: TemplateFilterCounts,
+pub(crate) struct GroupMetricsAccumulator {
+    pub(crate) family_sizes: AHashMap<usize, u64>,
+    pub(crate) position_group_sizes: AHashMap<usize, u64>,
+    pub(crate) filter_counts: TemplateFilterCounts,
 }
 
 impl GroupMetricsAccumulator {
-    fn record_group(
+    pub(crate) fn record_group(
         &mut self,
         family_sizes: AHashMap<usize, u64>,
         filter_counts: &TemplateFilterCounts,
@@ -283,7 +283,7 @@ fn classify_input_ordering(header: &Header, allow_unmapped: bool) -> InputOrderi
 ///    huge group", so *every* group in the run takes the parallel path.
 /// 2. `parallel_group_min_templates` is set and this group has at least the
 ///    per-strategy threshold number of templates (see `parallel_threshold`).
-fn should_use_parallel(
+pub(crate) fn should_use_parallel(
     allow_unmapped: bool,
     template_count: usize,
     strategy: Strategy,
@@ -303,7 +303,7 @@ fn should_use_parallel(
 /// pool delivers no parallelism while still paying pool-construction overhead,
 /// so `--threads 1` and `execute_single_threaded` (which passes `threads = 1`)
 /// always fall back to the sequential assigner regardless of `use_parallel`.
-fn create_umi_assigner(
+pub(crate) fn create_umi_assigner(
     strategy: Strategy,
     effective_edits: u32,
     index_threshold: IndexThreshold,
@@ -325,7 +325,7 @@ fn create_umi_assigner(
 }
 
 /// Assign UMI groups to templates (static implementation).
-fn assign_umi_groups_impl(
+pub(crate) fn assign_umi_groups_impl(
     templates: &mut [Template],
     assigner: &dyn UmiAssigner,
     raw_tag: [u8; 2],
@@ -773,6 +773,30 @@ pub struct GroupOptions {
     pub metrics_prefix: Option<PathBuf>,
 }
 
+impl Default for GroupOptions {
+    /// Test/`runall`-construction default. `strategy` has no meaningful default
+    /// (it is a required CLI flag), so the most conservative `Identity` is used
+    /// for the placeholder; callers that care set it explicitly.
+    fn default() -> Self {
+        Self {
+            min_map_q: 1,
+            include_non_pf_reads: false,
+            allow_unmapped: false,
+            strategy: Strategy::Identity,
+            edits: 1,
+            min_umi_length: None,
+            index_threshold: IndexThreshold::default(),
+            no_umi: false,
+            parallel_group_min_templates: None,
+            effective_strategy: Strategy::Identity,
+            effective_edits: 0,
+            family_size_histogram: None,
+            grouping_metrics: None,
+            metrics_prefix: None,
+        }
+    }
+}
+
 impl GroupReadsByUmi {
     /// The minimum mapping quality to apply, defaulting when the flag is absent.
     #[must_use]
@@ -822,7 +846,7 @@ impl GroupReadsByUmi {
 /// Build [`UmiGroupingMetrics`] from filter metrics and family size counts.
 ///
 /// Shared by both the pipeline and single-threaded execution paths.
-fn build_grouping_metrics(
+pub(crate) fn build_grouping_metrics(
     filter_counts: &TemplateFilterCounts,
     family_size_counter: &AHashMap<usize, u64>,
 ) -> UmiGroupingMetrics {
@@ -1881,6 +1905,56 @@ fn with_extension(prefix: &Path, suffix: &str) -> PathBuf {
     s.push(".");
     s.push(suffix);
     PathBuf::from(s)
+}
+
+
+/// Write all group metrics files for the chain-builder finalize hook.
+///
+/// Called from `GroupFinalizeHook::finalize` with the fully reduced
+/// per-thread accumulators. Mirrors the logic in
+/// `GroupReadsByUmi::write_all_metrics` but takes explicit paths rather than
+/// reading from `&self`.
+pub(crate) fn write_metrics_for_chain(
+    grouping_metrics: &crate::metrics::group::UmiGroupingMetrics,
+    family_sizes: &AHashMap<usize, u64>,
+    position_group_sizes: &AHashMap<usize, u64>,
+    family_size_histogram: Option<&Path>,
+    grouping_metrics_path: Option<&Path>,
+    metrics_prefix: Option<&Path>,
+) -> Result<()> {
+    use crate::metrics::group::{FamilySizeMetrics, PositionGroupSizeMetrics};
+
+    let family_size_metrics =
+        FamilySizeMetrics::from_size_counts(family_sizes.iter().map(|(&s, &c)| (s, c)));
+    let position_group_size_metrics = PositionGroupSizeMetrics::from_size_counts(
+        position_group_sizes.iter().map(|(&s, &c)| (s, c)),
+    );
+
+    // Individual flag outputs (fgbio-compatible)
+    if let Some(path) = family_size_histogram {
+        write_metrics(path, &family_size_metrics, "family size histogram")?;
+    }
+    if let Some(path) = grouping_metrics_path {
+        write_metrics(path, std::slice::from_ref(grouping_metrics), "grouping metrics")?;
+    }
+
+    // --metrics prefix outputs (all three files)
+    if let Some(prefix) = metrics_prefix {
+        let family_path = with_extension(prefix, "family_sizes.txt");
+        write_metrics(&family_path, &family_size_metrics, "family size histogram")?;
+
+        let gm_path = with_extension(prefix, "grouping_metrics.txt");
+        write_metrics(&gm_path, std::slice::from_ref(grouping_metrics), "grouping metrics")?;
+
+        let position_path = with_extension(prefix, "position_group_sizes.txt");
+        write_metrics(
+            &position_path,
+            &position_group_size_metrics,
+            "position group size histogram",
+        )?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

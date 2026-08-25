@@ -421,6 +421,71 @@ pub struct Sort {
     pub sort_stats: bool,
 }
 
+/// Sort-stage tuning, projected out of the [`Sort`] CLI struct for the chain
+/// builder's `add_sort` (which reads these values from the
+/// [`crate::pipeline::chains::StageOptionsBag`] rather than from `Sort`
+/// directly).
+///
+/// `block_batch` and `file_granularity` are chain-engine knobs that `Sort`
+/// does not yet expose as CLI flags; until the sort command is rewired onto the
+/// chain they take the engine defaults (`block_batch = 4`, the original
+/// `MAX_BATCH_PER_CALL`; `file_granularity = false`, block-parallel).
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct SortOptions {
+    /// Requested output sort order.
+    pub order: SortOrderArg,
+    /// Expert override for the provisioned template-coordinate key lanes.
+    pub key_types: Option<KeyTypesSpec>,
+    /// In-memory sort budget before spilling.
+    pub max_memory: MemoryLimit,
+    /// Memory reserved for other processes under `--max-memory=auto`.
+    pub memory_reserve: MemoryReserve,
+    /// Whether `max_memory` is per-thread (samtools behavior).
+    pub memory_per_thread: bool,
+    /// Temp directories for spill chunks (free-space-aware round-robin).
+    pub tmp_dirs: Vec<PathBuf>,
+    /// Worker threads for the accumulate/sort/spill phase (Phase 1).
+    pub sort_threads: Option<usize>,
+    /// Worker threads for the k-way merge phase (Phase 2).
+    pub merge_threads: Option<usize>,
+    /// Compression level for temporary spill files (0-9).
+    pub temp_compression: u32,
+    /// Codec for temporary spill files.
+    pub temp_codec: fgumi_sort::SpillCodec,
+    /// Spill-file consolidation limit (`--max-temp-files`). Resolved against the
+    /// host `RLIMIT_NOFILE` when `Auto`; without this the chain sorter fell back
+    /// to the engine's portable default and ignored the CLI value.
+    pub max_temp_files: MaxTempFiles,
+    /// Records batched per parallel sort call (chain engine; not a CLI flag).
+    pub block_batch: usize,
+    /// Spill at file rather than block granularity (chain engine; not a CLI flag).
+    pub file_granularity: bool,
+}
+
+impl Sort {
+    /// Projects the parsed CLI flags into [`SortOptions`] for the chain builder.
+    #[must_use]
+    pub fn to_sort_options(&self) -> SortOptions {
+        SortOptions {
+            order: self.order,
+            key_types: self.key_types,
+            max_memory: self.max_memory,
+            memory_reserve: self.memory_reserve,
+            memory_per_thread: self.memory_per_thread,
+            tmp_dirs: self.tmp_dirs.clone(),
+            sort_threads: self.sort_threads,
+            merge_threads: self.merge_threads,
+            temp_compression: self.temp_compression,
+            temp_codec: self.temp_codec,
+            max_temp_files: self.max_temp_files,
+            // Chain-engine defaults (see `SortOptions` docs) — not yet CLI flags.
+            block_batch: 4,
+            file_granularity: false,
+        }
+    }
+}
+
 /// Environment variable name for the fallback temp-dir list, parsed as a
 /// `PATH`-style list when no `-T/--tmp-dir` flags are passed.
 pub(crate) const TMP_DIRS_ENV: &str = "FGUMI_TMP_DIRS";

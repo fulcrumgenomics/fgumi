@@ -83,6 +83,19 @@ impl From<TieRuleArg> for fgumi_consensus::TieRule {
     }
 }
 
+impl From<fgumi_consensus::TieRule> for TieRuleArg {
+    /// Reverse of the `TieRuleArg → TieRule` resolution. The two enums are a
+    /// 1:1 pairing, so the `Options` projections that store the resolved
+    /// [`fgumi_consensus::TieRule`] can reconstruct the CLI-facing
+    /// [`ConsensusCallingOptions`] without losing information.
+    fn from(rule: fgumi_consensus::TieRule) -> Self {
+        match rule {
+            fgumi_consensus::TieRule::UlpRelative => Self::UlpRelative,
+            fgumi_consensus::TieRule::FgbioCompat => Self::FgbioCompat,
+        }
+    }
+}
+
 /// Resolves an optional `--methylation-mode` CLI arg to a [`MethylationMode`].
 ///
 /// Returns `Disabled` when `None` (flag not provided).
@@ -1672,6 +1685,107 @@ pub fn validate_index_threshold(
          {reason}. Drop --index-threshold to leave indexing to the default threshold, \
          or pass --index-threshold never to state that a linear scan is intended."
     )
+}
+
+
+
+// ==== ported from feat-runall for the chain builder (R2) ====
+/// Log warnings for `SchedulerOptions` / `QueueMemoryOptions` flags that the
+/// typed-step pipeline doesn't honor. Called from each command's multi-
+/// threaded dispatch so users see why their flags might appear to be
+/// ignored. `--pipeline-stats` is honored separately via
+/// `attach_new_pipeline_stats`; this only warns about the others.
+pub fn warn_unwired_pipeline_flags(
+    scheduler_opts: &SchedulerOptions,
+    queue_memory: &QueueMemoryOptions,
+) {
+    // --scheduler was fully removed on `main-runall` (no pluggable strategy
+    // field to inspect), so there is nothing to warn about here; the field is a
+    // plain non-optional `SchedulerStrategy` set programmatically.
+    // --deadlock-recover: the legacy progressive-doubling recovery
+    // addressed a failure mode (a worker pinned on a stuck step under
+    // legacy's static scheduler) that doesn't exist in the typed-step
+    // dispatch model — every worker round-robins through every step
+    // each iteration, so there's nothing to "recover" from.
+    if scheduler_opts.deadlock_recover_enabled() {
+        log::info!(
+            "--deadlock-recover has no effect in the typed-step pipeline: \
+             the dispatch model round-robins all workers across all steps, \
+             so the failure mode legacy's progressive recovery addressed \
+             does not occur"
+        );
+    }
+    // `--queue-memory` is now honored: the total bytes flow into
+    // `PipelineConfig::queue_memory_total`, which both seeds the
+    // initial per-queue budget AND enables the rebalancer that
+    // shifts budget between consistently-full / consistently-empty
+    // queues at runtime. No warning needed.
+    let _ = queue_memory; // signal intentional use; dead-code lint dampener
+}
+
+
+
+// ==== ported from feat-runall for the chain builder (R2) ====
+/// Print the new-pipeline `PipelineStats` snapshot to the log if any
+/// were collected. Pairs with `attach_new_pipeline_stats`.
+pub fn log_new_pipeline_stats(
+    stats: Option<std::sync::Arc<crate::pipeline::core::runtime::stats::PipelineStats>>,
+) {
+    if let Some(stats) = stats {
+        let snapshot = stats.snapshot();
+        log::info!("=== Pipeline statistics ===");
+        for line in format!("{snapshot}").lines() {
+            log::info!("{line}");
+        }
+    }
+}
+
+/// Validate that `header` advertises a sort order the group stage accepts, and
+/// emit the accompanying info logging.
+///
+/// Accepts template-coordinate order always, and queryname order when
+/// `allow_unmapped` is set. On rejection, bails with the order-specific
+/// remediation hint. Shared by `Group::execute`'s single-threaded path and the
+/// chain builder's `add_group` so the two orchestrations of the same stage
+/// cannot drift on the accepted orders, the error text, or the info logging —
+/// the standalone-vs-runall divergence class. The predicates themselves are the
+/// shared `crate::sam::{is_template_coordinate_sorted, is_sorted}`.
+pub(crate) fn require_group_input_sort(
+    header: &Header,
+    allow_unmapped: bool,
+) -> anyhow::Result<()> {
+    use crate::sam::{is_sorted, is_template_coordinate_sorted};
+    use anyhow::bail;
+    use log::info;
+    use noodles::sam::header::record::value::map::header::sort_order::QUERY_NAME;
+
+    let is_tc_sorted = is_template_coordinate_sorted(header);
+    let is_qname_sorted = is_sorted(header, QUERY_NAME);
+
+    if !(is_tc_sorted || allow_unmapped && is_qname_sorted) {
+        if allow_unmapped {
+            bail!(
+                "Input BAM must be template-coordinate sorted or queryname sorted \
+                when --allow-unmapped is enabled.\n\n\
+                To queryname sort your BAM file, run:\n  \
+                samtools sort -n input.bam -o sorted.bam"
+            );
+        }
+        bail!(
+            "Input BAM must be template-coordinate sorted (header must advertise \
+            SO:unsorted, GO:query, and SS:template-coordinate).\n\n\
+            To sort your BAM file, run:\n  \
+            fgumi sort -i input.bam -o sorted.bam --order template-coordinate"
+        );
+    }
+
+    if is_tc_sorted {
+        info!("Input is template-coordinate sorted");
+    } else {
+        info!("Input is queryname sorted (accepted with --allow-unmapped)");
+        info!("All unmapped reads will form a single position group per library/cell");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -392,6 +392,112 @@ impl CorrectUmis {
     }
 }
 
+impl CorrectOptions {
+    /// Loads the known-UMI set from `--umis` and `--umi-files`, upper-cased and
+    /// de-duplicated, and returns the sorted sequences plus their common length.
+    ///
+    /// Shared by the non-chain [`CorrectUmis`] path and the chain builder, which
+    /// holds these tuning knobs directly.
+    pub(crate) fn load_umi_sequences(&self) -> Result<(Vec<String>, usize)> {
+        let mut umi_set: std::collections::HashSet<String> =
+            self.umis.iter().map(|s| s.to_uppercase()).collect();
+
+        for file in &self.umi_files {
+            let content = std::fs::read_to_string(file)?;
+            for line in content.lines() {
+                let umi = line.trim().to_uppercase();
+                if !umi.is_empty() {
+                    umi_set.insert(umi);
+                }
+            }
+        }
+
+        if umi_set.is_empty() {
+            bail!("No UMIs provided.");
+        }
+
+        let mut umi_sequences: Vec<String> = umi_set.into_iter().collect();
+        umi_sequences.sort_unstable();
+
+        // Check all UMIs have the same length
+        let first_len = umi_sequences[0].len();
+        if !umi_sequences.iter().all(|u| u.len() == first_len) {
+            bail!("All UMIs must have the same length.");
+        }
+
+        info!("Loaded {} UMI sequences of length {}", umi_sequences.len(), first_len);
+        Ok((umi_sequences, first_len))
+    }
+
+    /// Checks distances between UMI pairs and warns about ambiguities.
+    ///
+    /// Identifies pairs of UMIs that are within `min_distance_diff` of each other,
+    /// which could lead to ambiguous matching situations.
+    pub(crate) fn check_umi_distances(&self, umi_sequences: &[String]) {
+        // fgbio computes `findUmiPairsWithinDistance(umis, minDistanceDiff - 1)`
+        // with signed arithmetic, so `--min-distance 0` yields a threshold of -1
+        // and reports no pairs (CorrectUmis.scala:180, exercised by
+        // CorrectUmisTest.scala:187). Reproduce that — and avoid the `usize`
+        // underflow that would otherwise wrap to `usize::MAX` and flag every pair.
+        if self.min_distance_diff == 0 {
+            return;
+        }
+        let pairs = find_umi_pairs_within_distance(umi_sequences, self.min_distance_diff - 1);
+
+        if !pairs.is_empty() {
+            warn!("###################################################################");
+            warn!("# WARNING: Found pairs of UMIs within min-distance-diff threshold!");
+            warn!("# These pairs may be ambiguous and fail to match:");
+            for (umi1, umi2, dist) in &pairs {
+                warn!("#   {umi1} <-> {umi2} (distance {dist})");
+            }
+            warn!("###################################################################");
+        }
+    }
+
+    /// Finalizes per-UMI correction metrics (fractions + representation) and
+    /// writes the TSV when `--metrics` was given. Reads only the `metrics` path,
+    /// so it lives on [`CorrectOptions`] and is shared with the chain builder's
+    /// finalize hook.
+    pub(crate) fn finalize_metrics(
+        &self,
+        umi_metrics: &mut AHashMap<String, UmiCorrectionMetrics>,
+        unmatched_umi: &str,
+    ) -> Result<()> {
+        // Calculate totals
+        let total: u64 = umi_metrics.values().map(|m| m.total_matches).sum();
+        let matched_total: u64 = umi_metrics
+            .iter()
+            .filter(|(umi, _)| *umi != unmatched_umi)
+            .map(|(_, m)| m.total_matches)
+            .sum();
+
+        // Calculate fractions (allow NaN when total is 0, matching fgbio behavior)
+        #[allow(clippy::cast_precision_loss)]
+        for metric in umi_metrics.values_mut() {
+            metric.fraction_of_matches = metric.total_matches as f64 / total as f64;
+        }
+
+        // Calculate representations (allow NaN/Infinity, matching fgbio behavior)
+        let umi_count = umi_metrics.keys().filter(|umi| *umi != unmatched_umi).count();
+
+        #[allow(clippy::cast_precision_loss)]
+        let mean = matched_total as f64 / umi_count as f64;
+        for metric in umi_metrics.values_mut() {
+            metric.representation = metric.total_matches as f64 / mean;
+        }
+
+        // Write metrics if requested
+        if let Some(path) = &self.metrics {
+            let mut metrics: Vec<UmiCorrectionMetrics> = umi_metrics.values().cloned().collect();
+            metrics.sort_by(|a, b| a.umi.cmp(&b.umi));
+            UmiCorrectionMetrics::write_metrics(&metrics, path)?;
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RejectionReason {
     WrongLength,
@@ -654,65 +760,15 @@ impl CorrectUmis {
     /// - No UMIs are provided
     /// - UMI files cannot be read
     /// - UMIs have different lengths
-    fn load_umi_sequences(&self) -> Result<(Vec<String>, usize)> {
-        let mut umi_set: std::collections::HashSet<String> =
-            self.umis.iter().map(|s| s.to_uppercase()).collect();
-
-        for file in &self.umi_files {
-            let content = std::fs::read_to_string(file)?;
-            for line in content.lines() {
-                let umi = line.trim().to_uppercase();
-                if !umi.is_empty() {
-                    umi_set.insert(umi);
-                }
-            }
-        }
-
-        if umi_set.is_empty() {
-            bail!("No UMIs provided.");
-        }
-
-        let mut umi_sequences: Vec<String> = umi_set.into_iter().collect();
-        umi_sequences.sort_unstable();
-
-        // Check all UMIs have the same length
-        let first_len = umi_sequences[0].len();
-        if !umi_sequences.iter().all(|u| u.len() == first_len) {
-            bail!("All UMIs must have the same length.");
-        }
-
-        info!("Loaded {} UMI sequences of length {}", umi_sequences.len(), first_len);
-        Ok((umi_sequences, first_len))
+    pub(crate) fn load_umi_sequences(&self) -> Result<(Vec<String>, usize)> {
+        self.to_correct_options().load_umi_sequences()
     }
 
     /// Checks distances between UMI pairs and warns about ambiguities.
     ///
-    /// Identifies pairs of UMIs that are within `min_distance_diff` of each other,
-    /// which could lead to ambiguous matching situations.
-    ///
-    /// # Arguments
-    ///
-    /// * `umi_sequences` - Slice of UMI sequences to check
-    fn check_umi_distances(&self, umi_sequences: &[String]) {
-        // fgbio computes `findUmiPairsWithinDistance(umis, minDistanceDiff - 1)`
-        // with signed arithmetic, so `--min-distance 0` yields a threshold of -1
-        // and reports no pairs (CorrectUmis.scala:180, exercised by
-        // CorrectUmisTest.scala:187). Reproduce that — and avoid the `usize`
-        // underflow that would otherwise wrap to `usize::MAX` and flag every pair.
-        if self.min_distance_diff == 0 {
-            return;
-        }
-        let pairs = find_umi_pairs_within_distance(umi_sequences, self.min_distance_diff - 1);
-
-        if !pairs.is_empty() {
-            warn!("###################################################################");
-            warn!("# WARNING: Found pairs of UMIs within min-distance-diff threshold!");
-            warn!("# These pairs may be ambiguous and fail to match:");
-            for (umi1, umi2, dist) in &pairs {
-                warn!("#   {umi1} <-> {umi2} (distance {dist})");
-            }
-            warn!("###################################################################");
-        }
+    /// Delegates to [`CorrectOptions::check_umi_distances`].
+    pub(crate) fn check_umi_distances(&self, umi_sequences: &[String]) {
+        self.to_correct_options().check_umi_distances(umi_sequences);
     }
 
     /// Compute UMI correction for a template (called once per template).
@@ -957,42 +1013,12 @@ impl CorrectUmis {
         }
     }
 
-    fn finalize_metrics(
+    pub(crate) fn finalize_metrics(
         &self,
         umi_metrics: &mut AHashMap<String, UmiCorrectionMetrics>,
         unmatched_umi: &str,
     ) -> Result<()> {
-        // Calculate totals
-        let total: u64 = umi_metrics.values().map(|m| m.total_matches).sum();
-        let matched_total: u64 = umi_metrics
-            .iter()
-            .filter(|(umi, _)| *umi != unmatched_umi)
-            .map(|(_, m)| m.total_matches)
-            .sum();
-
-        // Calculate fractions (allow NaN when total is 0, matching fgbio behavior)
-        #[allow(clippy::cast_precision_loss)]
-        for metric in umi_metrics.values_mut() {
-            metric.fraction_of_matches = metric.total_matches as f64 / total as f64;
-        }
-
-        // Calculate representations (allow NaN/Infinity, matching fgbio behavior)
-        let umi_count = umi_metrics.keys().filter(|umi| *umi != unmatched_umi).count();
-
-        #[allow(clippy::cast_precision_loss)]
-        let mean = matched_total as f64 / umi_count as f64;
-        for metric in umi_metrics.values_mut() {
-            metric.representation = metric.total_matches as f64 / mean;
-        }
-
-        // Write metrics if requested
-        if let Some(path) = &self.metrics {
-            let mut metrics: Vec<UmiCorrectionMetrics> = umi_metrics.values().cloned().collect();
-            metrics.sort_by(|a, b| a.umi.cmp(&b.umi));
-            UmiCorrectionMetrics::write_metrics(&metrics, path)?;
-        }
-
-        Ok(())
+        self.to_correct_options().finalize_metrics(umi_metrics, unmatched_umi)
     }
 
     /// Execute using the 7-step unified pipeline.
@@ -1564,7 +1590,7 @@ impl CorrectUmis {
 /// Merges `counts` into `dst[umi]`, creating a zero-initialized entry if the
 /// key is absent. Uses `or_insert_with_key` so `umi` is only cloned on insert,
 /// not on hit.
-fn merge_umi_counts(
+pub(crate) fn merge_umi_counts(
     dst: &mut AHashMap<String, UmiCorrectionMetrics>,
     umi: String,
     counts: &UmiCorrectionMetrics,
@@ -1631,7 +1657,7 @@ pub struct EncodedUmiSet {
     /// Bit-encoded sequences for fast comparison (None if encoding failed)
     encoded: Vec<Option<BitEnc>>,
     /// Original strings for output
-    strings: Vec<String>,
+    pub(crate) strings: Vec<String>,
 }
 
 impl EncodedUmiSet {
@@ -1775,6 +1801,56 @@ pub fn find_umi_pairs_within_distance(
     }
     pairs
 }
+
+// ==== methods/symbols ported from feat-runall for the chain builder (R2) ====
+impl CorrectOptions {
+    /// Validate semantic constraints the `multi_options` macro can't
+    /// express:
+    ///
+    /// - At least one of `umis` / `umi_files` is provided (the macro
+    ///   only sees each as a separately optional `Vec<>`, so it
+    ///   cannot enforce "at least one of two Vecs must be non-empty").
+    /// - `min_distance_diff >= 1` (a value of 0 would disable the ambiguity
+    ///   check and underflow the `min_distance_diff - 1` window).
+    /// - `min_corrected`, when set, lies in `[0.0, 1.0]`.
+    ///
+    /// This is the runall/chain-builder validator. It is **not yet wired to the
+    /// standalone `fgumi correct` CLI**, which validates via its own
+    /// [`CorrectUmis::validate`] and — unlike this — still accepts
+    /// `--min-distance 0` (fgbio parity; `check_umi_distances` early-returns on
+    /// it, matching `CorrectUmis.scala:180`). The follow-up EC-C2/EC-C3 commits
+    /// will plumb this into runall via the `MultiCorrectOptions::validate()`
+    /// round-trip when `--start-from <= correct`; the standalone/runall
+    /// divergence on `--min-distance 0` must be reconciled then.
+    pub fn validate(&self) -> Result<()> {
+        if self.umis.is_empty() && self.umi_files.is_empty() {
+            bail!(
+                "At least one UMI or UMI file must be provided \
+                 (via --umis / --umi-files for `fgumi correct`, or \
+                 --correct::umis / --correct::umi-files for `fgumi runall`)."
+            );
+        }
+        if self.min_distance_diff == 0 {
+            bail!(
+                "--min-distance must be >= 1 \
+                 (a value of 0 would disable the ambiguity check and underflow \
+                 the `min_distance_diff - 1` distance window)."
+            );
+        }
+        if let Some(min) = self.min_corrected
+            && !(0.0..=1.0).contains(&min)
+        {
+            bail!("--min-corrected must be between 0 and 1.");
+        }
+        Ok(())
+    }
+}
+
+/// Log line emitted by `build_correct_chain` on entry.
+/// Pinned as a `pub const` so integration tests that assert the
+/// typed-step path was taken share a single source of truth with the
+/// log site and cannot drift. Mirrors `commands::zipper::NEW_PIPELINE_START_LOG`.
+pub const NEW_PIPELINE_START_LOG: &str = "Starting correct (new pipeline)";
 
 #[cfg(test)]
 mod tests {
