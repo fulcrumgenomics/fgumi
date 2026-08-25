@@ -1176,8 +1176,13 @@ impl<'a> ChainBuilder<'a> {
             self.tuning.per_step_byte_limit,
         );
         let tail = self.pipeline.append_source(read_step);
-        let tail =
-            self.pipeline.append_step(BgzfDecompress::new(self.tuning.per_step_byte_limit), tail);
+        // Honor the command's CRC-verification policy (`--check-crc` /
+        // `--no-check-crc`, via `effective_check_crc`) so the chain's BAM
+        // decode matches the non-chain path rather than always verifying.
+        let tail = self.pipeline.append_step(
+            BgzfDecompress::new_with_crc(self.tuning.per_step_byte_limit, self.spec.verify_crc),
+            tail,
+        );
         let tail = self
             .pipeline
             .append_step(FindBamBoundaries::new(self.tuning.per_step_byte_limit), tail);

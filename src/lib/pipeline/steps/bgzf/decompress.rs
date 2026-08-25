@@ -4,7 +4,7 @@
 
 use std::io;
 
-use fgumi_bgzf::reader::decompress_block_slice_into;
+use fgumi_bgzf::reader::decompress_block_slice_into_opts;
 use libdeflater::Decompressor;
 
 use crate::pipeline::core::Unpushed;
@@ -40,16 +40,32 @@ pub struct BgzfDecompress {
     output_scratch: Vec<u8>,
     held: HeldSlot<Unpushed<DecompressedBlock>>,
     output_byte_limit: u64,
+    /// Whether to verify each block's CRC32 against its footer. The BAM source
+    /// preamble threads the command's `--check-crc`/`--no-check-crc` policy (via
+    /// `BamIoOptions::effective_check_crc`) here so the chain reproduces the
+    /// non-chain path's CRC behavior; the decompressed-size check always runs.
+    verify_crc: bool,
 }
 
 impl BgzfDecompress {
+    /// Construct a decompressor that verifies CRC32 (the pre-existing default).
     #[must_use]
     pub fn new(output_byte_limit: u64) -> Self {
+        Self::new_with_crc(output_byte_limit, true)
+    }
+
+    /// Construct a decompressor with an explicit CRC-verification policy.
+    ///
+    /// The chain's BAM source preamble uses this to honor the command's
+    /// `--check-crc` / `--no-check-crc` policy, matching the non-chain path.
+    #[must_use]
+    pub fn new_with_crc(output_byte_limit: u64, verify_crc: bool) -> Self {
         Self {
             decompressor: Decompressor::new(),
             output_scratch: Vec::with_capacity(DECOMPRESS_SCRATCH_CAPACITY),
             held: HeldSlot::new(),
             output_byte_limit,
+            verify_crc,
         }
     }
 }
@@ -61,6 +77,7 @@ impl Clone for BgzfDecompress {
             output_scratch: Vec::with_capacity(DECOMPRESS_SCRATCH_CAPACITY),
             held: HeldSlot::new(),
             output_byte_limit: self.output_byte_limit,
+            verify_crc: self.verify_crc,
         }
     }
 }
@@ -111,10 +128,11 @@ impl Step for BgzfDecompress {
         // buffer goes into the emitted block; a fresh fixed-capacity
         // buffer takes its place). Single mimalloc size class keeps the
         // thread-local cache hot.
-        decompress_block_slice_into(
+        decompress_block_slice_into_opts(
             &block.bytes,
             &mut self.decompressor,
             &mut self.output_scratch,
+            self.verify_crc,
         )?;
         let bytes = std::mem::replace(
             &mut self.output_scratch,

@@ -29,6 +29,12 @@ pub struct ChainSpec {
     /// When true, the BAM/SAM source is opened with a userspace async
     /// prefetch reader (`--async-reader`), overlapping disk I/O with compute.
     pub async_reader: bool,
+    /// Whether the BAM source's BGZF decode verifies each block's CRC32. Set
+    /// from the command's `--check-crc`/`--no-check-crc` policy (via
+    /// [`crate::commands::common::BamIoOptions::effective_check_crc`]) so the
+    /// chain reproduces the non-chain path's CRC behavior. Inert for the SAM
+    /// source (no BGZF) and for the FASTQ source (which carries its own policy).
+    pub verify_crc: bool,
     /// For `@PG` line injection into the output header.
     pub command_line: String,
 }
@@ -72,6 +78,7 @@ impl ChainSpec {
             scheduler: ctx.scheduler.clone(),
             queue_memory: ctx.queue_memory.clone(),
             async_reader: ctx.io.async_reader,
+            verify_crc: ctx.io.effective_check_crc(),
             command_line: ctx.command_line.to_string(),
         }
     }

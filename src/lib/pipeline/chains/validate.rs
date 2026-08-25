@@ -225,7 +225,7 @@ pub fn validate_stage_opts_present(spec: &ChainSpec) -> Result<()> {
 /// and the strategy is not re-checkable from the spec alone.
 ///
 /// **Deferred rule.** Dedup's "input must be template-coordinate sorted"
-/// rule is checked at chain-build time (`build_dedup_chain` reads the
+/// rule is checked at chain-build time (the chain builder reads the
 /// input BAM header) — it cannot be determined from `spec.stages` alone,
 /// so it intentionally stays out of this validator.
 ///
@@ -259,7 +259,7 @@ pub fn validate_cross_stage_constraints(spec: &ChainSpec) -> Result<()> {
     // stages are present in the same chain.
     //
     // Dedup's "input must be template-coordinate sorted" rule is checked at
-    // chain-build time (build_dedup_chain reads the input BAM header) — it
+    // chain-build time (the chain builder reads the input BAM header) — it
     // can't be checked from spec.stages alone, so it stays out of this
     // validator by design.
     if spec.stages.contains(&Stage::Duplex)
@@ -354,6 +354,7 @@ mod tests {
             scheduler: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            verify_crc: true,
             command_line: String::new(),
         }
     }
