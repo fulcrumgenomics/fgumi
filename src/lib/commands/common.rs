@@ -1689,24 +1689,37 @@ pub fn validate_index_threshold(
 
 // ==== ported from feat-runall for the chain builder (R2) ====
 /// Log warnings for `SchedulerOptions` / `QueueMemoryOptions` flags that the
-/// typed-step pipeline doesn't honor. Called from each command's multi-
-/// threaded dispatch so users see why their flags might appear to be
-/// ignored. `--pipeline-stats` is honored separately via
-/// `attach_new_pipeline_stats`; this only warns about the others.
-pub fn warn_unwired_pipeline_flags(
+/// typed-step pipeline doesn't honor. Called from the chain builder's
+/// `add_*` stage methods (which back every command's multi-threaded chain
+/// dispatch) so users see why their flags might appear to be ignored.
+/// `--pipeline-stats` is honored separately via `attach_new_pipeline_stats`;
+/// this only warns about the others.
+pub(crate) fn warn_unwired_pipeline_flags(
     scheduler_opts: &SchedulerOptions,
     queue_memory: &QueueMemoryOptions,
 ) {
-    // --scheduler was fully removed on `main-runall` (no pluggable strategy
-    // field to inspect), so there is nothing to warn about here; the field is a
-    // plain non-optional `SchedulerStrategy` set programmatically.
+    // --scheduler selects a legacy unified-pipeline scheduler strategy that the
+    // typed-step chain engine does not consume, so setting it (a hidden dev flag)
+    // has no effect on any chain-backed command. Mirror the --deadlock-recover
+    // diagnostic below: surface it when set to a non-default value so a developer
+    // sees the flag was inert rather than silently ignored. Use `warn!` (not
+    // `info!`) to match the sibling "flag has no effect on the chain path"
+    // diagnostics in `group::execute_chain` (--debug-memory, FGUMI_SHORT_CIRCUIT).
+    let requested_scheduler = scheduler_opts.strategy();
+    if requested_scheduler != crate::unified_pipeline::scheduler::SchedulerStrategy::default() {
+        log::warn!(
+            "--scheduler has no effect in the typed-step pipeline: the chain engine \
+             does not use a pluggable scheduler strategy, so the requested strategy \
+             ({requested_scheduler:?}) is ignored"
+        );
+    }
     // --deadlock-recover: the legacy progressive-doubling recovery
     // addressed a failure mode (a worker pinned on a stuck step under
     // legacy's static scheduler) that doesn't exist in the typed-step
     // dispatch model — every worker round-robins through every step
     // each iteration, so there's nothing to "recover" from.
     if scheduler_opts.deadlock_recover_enabled() {
-        log::info!(
+        log::warn!(
             "--deadlock-recover has no effect in the typed-step pipeline: \
              the dispatch model round-robins all workers across all steps, \
              so the failure mode legacy's progressive recovery addressed \
@@ -1724,7 +1737,7 @@ pub fn warn_unwired_pipeline_flags(
 // ==== ported from feat-runall for the chain builder (R2) ====
 /// Print the new-pipeline `PipelineStats` snapshot to the log if any
 /// were collected. Pairs with `attach_new_pipeline_stats`.
-pub fn log_new_pipeline_stats(
+pub(crate) fn log_new_pipeline_stats(
     stats: Option<std::sync::Arc<crate::pipeline::core::runtime::stats::PipelineStats>>,
 ) {
     if let Some(stats) = stats {

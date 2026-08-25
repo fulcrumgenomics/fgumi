@@ -265,6 +265,39 @@ pub fn create_umi_family(
     create_family_with_tags(&[(SamTag::RX, umi.as_bytes())], depth, base_name, sequence, quality)
 }
 
+/// Like [`create_umi_family`] but places every read at `pos` (1-based reference
+/// position) instead of the fixed default, so callers can build inputs that span
+/// many distinct positions — hence many position groups and, past the pipeline's
+/// template-batch size, multiple batches.
+pub fn create_umi_family_at_pos(
+    umi: &str,
+    depth: usize,
+    base_name: &str,
+    sequence: &str,
+    quality: u8,
+    pos: usize,
+) -> Vec<RawRecord> {
+    let seq = sequence.as_bytes();
+    let cigar_op = u32::try_from(seq.len()).expect("seq.len() fits u32") << 4; // M
+    let pos = i32::try_from(pos).expect("pos fits i32");
+    (0..depth)
+        .map(|i| {
+            let name = format!("{base_name}_{i}");
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .ref_id(0)
+                .pos(pos)
+                .mapq(60)
+                .flags(0)
+                .cigar_ops(&[cigar_op])
+                .sequence(seq)
+                .qualities(&vec![quality; seq.len()]);
+            b.add_string_tag(SamTag::RX, umi.as_bytes());
+            b.build()
+        })
+        .collect()
+}
+
 /// Like [`create_umi_family`] but tags each read with an arbitrary `SamTag`
 /// (e.g. `SamTag::RX` for UMI mode or `SamTag::BC` for barcode mode).
 pub fn create_family_with_tag(
@@ -484,6 +517,16 @@ pub fn create_minimal_header(ref_name: &str, ref_len: usize) -> Header {
 /// Configured SAM Header with SO:coordinate sort order
 pub fn create_coordinate_sorted_header(ref_name: &str, ref_len: usize) -> Header {
     build_header_with_tags(ref_name, ref_len, &[(*b"SO", "coordinate")])
+}
+
+/// Creates a query-grouped (but not template-coordinate) SAM header:
+/// `SO:unsorted, GO:query`, without `SS:template-coordinate`.
+///
+/// `is_query_grouped` holds (GO:query) but `is_template_coordinate_sorted` does
+/// not (no `SS`), so `group` classifies this as `QueryGroupedUnmapped` and
+/// accepts it only under `--allow-unmapped`.
+pub fn create_query_grouped_header(ref_name: &str, ref_len: usize) -> Header {
+    build_header_with_tags(ref_name, ref_len, &[(*b"SO", "unsorted"), (*b"GO", "query")])
 }
 
 /// Creates a UMI family with intentional sequencing errors.

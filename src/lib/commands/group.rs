@@ -4,16 +4,14 @@ use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config, is_r1_genomically_earlier_raw,
+    is_r1_genomically_earlier_raw,
 };
-use crate::grouper::{
-    ProcessedPositionGroup, RawPositionGroup, RecordPositionGrouper, build_templates_from_records,
-};
+use crate::grouper::{RawPositionGroup, RecordPositionGrouper, build_templates_from_records};
 use crate::logging::{OperationTimer, log_umi_grouping_summary};
 use crate::metrics::TemplateFilterCounts;
-use crate::metrics::group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
-use crate::per_thread_accumulator::PerThreadAccumulator;
+use crate::metrics::group::UmiGroupingMetrics;
 use crate::read_info::LibraryIndex;
+use crate::sam::SamTag;
 use crate::template::Template;
 use crate::template_filter::{TemplateFilterConfig, filter_template};
 use crate::umi::parallel_assigner::{
@@ -21,10 +19,8 @@ use crate::umi::parallel_assigner::{
     ParallelPairedAssigner,
 };
 use crate::unified_pipeline::DecodedRecord;
+use crate::unified_pipeline::Grouper;
 use crate::unified_pipeline::compute_group_key_from_raw;
-use crate::unified_pipeline::{
-    GroupKeyConfig, Grouper, run_bam_pipeline_from_reader_with_mi_assign,
-};
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -34,34 +30,12 @@ use fgumi_bam_io::{
     PipelineReaderOpts, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
     create_raw_bam_reader_from_stream_with_opts,
 };
-use fgumi_umi::IndexThreshold;
-// MemoryEstimate is gated because it's only used in memory-debug blocks below
-use crate::sam::SamTag;
-#[cfg(feature = "memory-debug")]
-use crate::unified_pipeline::MemoryEstimate;
 use fgumi_raw_bam::RawRecord;
+use fgumi_umi::IndexThreshold;
 use log::{info, warn};
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-/// Estimate total heap size of a template slice using sampling for large batches.
-/// For small batches (<=10), computes exact total. For larger batches, samples the
-/// first 5 templates and extrapolates. This avoids O(n) overhead on every call but
-/// may underestimate for groups with heterogeneous read lengths.
-#[cfg(feature = "memory-debug")]
-fn estimate_templates_heap_size(templates: &[Template]) -> usize {
-    if templates.len() <= 10 {
-        templates.iter().map(|t| t.estimate_heap_size()).sum()
-    } else {
-        let sample_size = 5;
-        let sample_total: usize =
-            templates.iter().take(sample_size).map(|t| t.estimate_heap_size()).sum();
-        // Use multiply-before-divide to avoid truncation bias
-        (sample_total * templates.len()) / sample_size
-    }
-}
 
 // UmiGroupingMetrics and FamilySizeMetrics are imported from crate::metrics
 
@@ -658,7 +632,13 @@ pub struct GroupReadsByUmi {
     #[arg(long, value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub debug_memory: bool,
 
-    /// Memory report interval in seconds (default: 1, minimum: 1)
+    /// Memory report interval in seconds (default: 1, minimum: 1).
+    ///
+    /// Only meaningful together with `--debug-memory`, which drives the legacy
+    /// memory monitor. That monitor is not carried by the `--threads` chain
+    /// engine, so this flag is inert there — kept (rather than removed) so a
+    /// `memory-debug` build accepts it instead of hard-erroring; the
+    /// `--debug-memory` warning in `execute_chain` covers the whole feature.
     #[cfg(feature = "memory-debug")]
     #[arg(long, default_value = "1", value_parser = clap::value_parser!(u64).range(1..))]
     pub memory_report_interval: u64,
@@ -885,6 +865,15 @@ impl Command for GroupReadsByUmi {
         // Set minimum mapping quality
         let min_mapq: u8 = self.resolved_min_map_q();
 
+        // --threads N: run the group stage on the declarative chain builder.
+        // Dispatch BEFORE the timer/banner/reader below: the chain re-emits the
+        // timer and banner via `add_group` and opens its own source, so running
+        // them here too would double-log and pre-consume stdin. CRC-verify status
+        // (which `add_group` does not log) is emitted by `execute_chain` instead.
+        if self.threading.threads.is_some() {
+            return self.execute_chain(command_line);
+        }
+
         // Initialize tracking infrastructure
         let timer = OperationTimer::new("Grouping reads by UMI");
 
@@ -922,7 +911,11 @@ impl Command for GroupReadsByUmi {
         info!("{}", self.threading.log_message());
         self.io.log_effective_check_crc();
 
-        // Open input BAM using streaming-capable reader for pipeline use
+        // ============================================================
+        // Single-threaded fast path (no --threads flag; --threads N returned
+        // to execute_chain above, before this banner/timer block).
+        // ============================================================
+        // Open input BAM using a streaming-capable reader (required for stdin).
         info!("Reading input BAM");
         let reader_opts = self.io.pipeline_reader_opts();
         let (reader, header) =
@@ -934,15 +927,15 @@ impl Command for GroupReadsByUmi {
         // two paths cannot drift — see `require_group_input_ordering`.
         crate::commands::common::require_group_input_ordering(&header, self.allow_unmapped)?;
 
-        // Add @PG record with PP chaining to input's last program
+        // Add @PG record with PP chaining to input's last program.
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
-        // Tag constants per SAM specification — all derived from SamTag to ensure type safety.
+        // Tag constants per SAM specification — all derived from SamTag.
         let raw_tag: [u8; 2] = *SamTag::RX;
         let assign_tag_bytes: [u8; 2] = *SamTag::MI;
         let cell_tag = Tag::from(SamTag::CB);
 
-        // Create filter configuration
+        // Create filter configuration.
         let filter_config = TemplateFilterConfig {
             umi_tag: raw_tag,
             min_mapq,
@@ -952,498 +945,76 @@ impl Command for GroupReadsByUmi {
             allow_unmapped: self.allow_unmapped,
         };
 
-        // ============================================================
-        // Check for single-threaded fast path (no --threads flag)
-        // ============================================================
-        if self.threading.threads.is_none() {
-            // Single-threaded fast path - pass reader (required for stdin support)
-            return self.execute_single_threaded(
-                reader,
-                reader_opts.verify_crc,
-                &header,
-                effective_strategy,
-                effective_edits,
-                raw_tag,
-                assign_tag_bytes,
-                cell_tag,
-                &filter_config,
-                &timer,
-            );
-        }
-
-        // ============================================================
-        // Use 7-step unified pipeline (--threads N was specified)
-        // ============================================================
-        // Per-thread metric accumulators: each worker merges into its own slot,
-        // so retained memory is O(threads × distinct sizes) rather than growing
-        // one hashmap per position group (see issue #285).
-        let num_threads = self.threading.num_threads();
-        let accumulators = PerThreadAccumulator::<GroupMetricsAccumulator>::new(num_threads);
-
-        // Clone values needed by closures
-        let strategy = effective_strategy;
-        let index_threshold = self.index_threshold;
-        let no_umi = self.no_umi;
-        let allow_unmapped = self.allow_unmapped;
-        let parallel_group_min_templates = self.parallel_group_min_templates.clone();
-        let accumulators_clone = Arc::clone(&accumulators);
-
-        // Setup comprehensive memory monitoring first if debug mode is enabled
-        #[cfg(feature = "memory-debug")]
-        let debug_memory_flag = self.debug_memory;
-        #[cfg(feature = "memory-debug")]
-        let (memory_monitor_handle, shared_stats) = if self.debug_memory {
-            use crate::unified_pipeline::{PipelineStats, start_memory_monitor};
-            use std::sync::atomic::AtomicBool;
-
-            info!("Memory debugging enabled - reporting every {}s", self.memory_report_interval);
-
-            let stats = Arc::new(PipelineStats::new());
-            let shutdown_signal = Arc::new(AtomicBool::new(false));
-            let shutdown_signal_clone = shutdown_signal.clone();
-
-            let handle = start_memory_monitor(
-                stats.clone(),
-                shutdown_signal_clone,
-                self.memory_report_interval,
-            );
-            (Some((handle, shutdown_signal)), Some(stats))
-        } else {
-            (None, None)
-        };
-        #[cfg(not(feature = "memory-debug"))]
-        let shared_stats: Option<Arc<crate::unified_pipeline::PipelineStats>> = None;
-
-        // Clone stats for hot path tracking (process_fn and serialize_fn closures)
-        #[cfg(feature = "memory-debug")]
-        let stats_for_tracking = shared_stats.clone();
-        #[cfg(feature = "memory-debug")]
-        let stats_for_serialize = shared_stats.clone();
-
-        // Configure 7-step pipeline
-        let mut pipeline_config = build_pipeline_config(
-            &self.scheduler_opts,
-            &self.compression,
-            &self.queue_memory,
-            &self.io,
-            num_threads,
-        )?;
-
-        // Override stats: use shared stats if available (memory-debug feature)
-        if let Some(stats) = shared_stats.as_ref() {
-            pipeline_config.pipeline = pipeline_config.pipeline.with_shared_stats(stats.clone());
-        }
-        info!("Scheduler: {:?}", self.scheduler_opts.strategy());
-        // Template-based batching is enabled by default in auto_tuned() with target=500 templates.
-        // This provides consistent batch sizes across datasets with varying templates-per-group ratios.
-
-        let library_index = LibraryIndex::from_header(&header);
-        // Cache the UMI tag's value position on each DecodedRecord so the Process
-        // step's UMI-assignment pass can slice the value without re-scanning aux
-        // data (issue #334). Skip the cache in --no-umi mode where the assignment
-        // site emits String::new() and never reads the cache.
-        let group_key_config = GroupKeyConfig::new(library_index, cell_tag);
-        pipeline_config.group_key_config = Some(if self.no_umi {
-            group_key_config
-        } else {
-            group_key_config.with_umi_tag(raw_tag)
-        });
-
-        // Short-circuit support for memory bisection debugging.
-        // Set FGUMI_SHORT_CIRCUIT=process|serialize|compress to skip downstream steps.
-        #[cfg(feature = "memory-debug")]
-        let short_circuit = std::env::var("FGUMI_SHORT_CIRCUIT").unwrap_or_default();
-        #[cfg(feature = "memory-debug")]
-        if !short_circuit.is_empty() {
-            match short_circuit.as_str() {
-                "process" | "serialize" | "compress" => {
-                    log::warn!(
-                        "SHORT-CIRCUIT mode: pipeline truncated at '{}' — OUTPUT WILL BE INVALID",
-                        short_circuit
-                    );
-                }
-                other => {
-                    bail!(
-                        "Invalid FGUMI_SHORT_CIRCUIT value '{}'. Valid: process, serialize, compress",
-                        other
-                    );
-                }
-            }
-        }
-        #[cfg(feature = "memory-debug")]
-        let short_circuit_process = short_circuit == "process";
-        #[cfg(feature = "memory-debug")]
-        let short_circuit_serialize = short_circuit == "serialize";
-        #[cfg(feature = "memory-debug")]
-        let short_circuit_compress = short_circuit == "compress";
-
-        // Cumulative MoleculeId counter, advanced **only** by the
-        // serial-ordered MI Assign hook installed below. The hook is
-        // invoked in pipeline-input order (`(batch_serial, idx_in_batch)`)
-        // by the unified pipeline's MI Assign zone, so two runs of
-        // `fgumi group` on the same input observe the same `fetch_add`
-        // sequence and produce byte-identical `MI:Z` integers — see
-        // `docs/design/deterministic-mi-numbering.md`. The `Arc` is owned
-        // by the hook closure; nothing outside the closure needs to read
-        // its final value.
-        let next_mi_base_for_hook = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-        // Run the 7-step unified pipeline with the already-opened reader (supports streaming)
-        let records_processed = run_bam_pipeline_from_reader_with_mi_assign(
-            pipeline_config,
+        self.execute_single_threaded(
             reader,
-            header,
-            &self.io.output,
-            None, // Use input header for output
-            // grouper_fn: Create RecordPositionGrouper (lightweight, no Template building)
-            move |_header: &Header| {
-                Box::new(RecordPositionGrouper::new())
-                    as Box<dyn Grouper<Group = RawPositionGroup> + Send>
-            },
-            // process_fn: Build Templates + Filter + assign UMIs (parallel)
-            move |group: RawPositionGroup| -> std::io::Result<ProcessedPositionGroup> {
-                #[cfg(feature = "memory-debug")]
-                if short_circuit_process {
-                    let input_record_count = group.records.len() as u64;
-                    drop(group);
-                    return Ok(ProcessedPositionGroup {
-                        templates: Vec::new(),
-                        family_sizes: AHashMap::new(),
-                        filter_counts: TemplateFilterCounts::new(),
-                        input_record_count,
-                        distinct_mi_count: 0,
-                    });
-                }
-                let mut filter_counts = TemplateFilterCounts::new();
-
-                // Track memory usage if debug mode is enabled (optimized for hot path)
-                #[cfg(feature = "memory-debug")]
-                let initial_group_size = if debug_memory_flag {
-                    let size = group.estimate_heap_size();
-                    if let Some(stats) = stats_for_tracking.as_ref() {
-                        use crate::unified_pipeline::get_or_assign_thread_id;
-                        let thread_id = get_or_assign_thread_id();
-                        let record_count = group.records.len();
-
-                        stats.track_position_group_memory(size, true);
-
-                        if record_count > 200 {
-                            let group_size_gb = size as f64 / 1e9;
-                            log::debug!("Processing large position group: {:.2}GB ({} records) on thread {}",
-                                       group_size_gb, record_count, thread_id);
-                        }
-                    }
-                    size
-                } else {
-                    0
-                };
-
-                // Build Templates from raw records (was serial, now parallel!)
-                let all_templates = build_templates_from_records(group.records)?;
-
-                // Count ALL input records for progress tracking
-                let input_record_count: u64 =
-                    all_templates.iter().map(|t| t.read_count() as u64).sum();
-
-                // Filter templates
-                let filtered_templates: Vec<Template> = all_templates
-                    .into_iter()
-                    .filter(|t| filter_template(t, &filter_config, &mut filter_counts))
-                    .collect();
-
-                // Track filtered template memory (optimized for hot path).
-                // Note: alloc/dealloc estimates may diverge since templates are mutated between
-                // estimation points (e.g. MI fields populated, records reordered). This is
-                // acceptable for debug instrumentation — counters may drift slightly.
-                #[cfg(feature = "memory-debug")]
-                let _template_memory_size = if debug_memory_flag && !filtered_templates.is_empty() {
-                    let estimated_size = estimate_templates_heap_size(&filtered_templates);
-
-                    if let Some(stats) = stats_for_tracking.as_ref() {
-                        let thread_id = crate::unified_pipeline::get_or_assign_thread_id();
-
-                        stats.track_template_memory(estimated_size, true);
-
-                        if filtered_templates.len() > 50 {
-                            let estimated_total_mb = estimated_size as f64 / 1e6;
-                            if estimated_total_mb > 10.0 {
-                                log::debug!("Filtered templates: ~{:.1}MB ({} templates) on thread {}",
-                                           estimated_total_mb, filtered_templates.len(), thread_id);
-                            }
-                        }
-                    }
-                    estimated_size
-                } else {
-                    0
-                };
-
-                if filtered_templates.is_empty() {
-                    #[cfg(feature = "memory-debug")]
-                    if debug_memory_flag
-                        && let Some(stats) = stats_for_tracking.as_ref() {
-                            stats.track_position_group_memory(initial_group_size, false);
-                        }
-                    return Ok(ProcessedPositionGroup {
-                        templates: Vec::new(),
-                        family_sizes: AHashMap::new(),
-                        filter_counts,
-                        input_record_count,
-                        distinct_mi_count: 0,
-                    });
-                }
-
-                // Create UMI assigner for this group. See `should_use_parallel`
-                // for the two triggers: (a) `--allow-unmapped` parallelizes
-                // every group (these runs are dominated by one huge unmapped
-                // group); (b) the user-set `--parallel-group-min-templates`
-                // threshold is met for this group's strategy.
-                let use_parallel = should_use_parallel(
-                    allow_unmapped,
-                    filtered_templates.len(),
-                    strategy,
-                    parallel_group_min_templates.as_ref(),
-                );
-                let assigner = create_umi_assigner(
-                    strategy,
-                    effective_edits,
-                    index_threshold,
-                    num_threads,
-                    use_parallel,
-                );
-
-                // Assign UMI groups using the unified _impl function
-                let mut templates = filtered_templates;
-                if let Err(e) = assign_umi_groups_impl(
-                    &mut templates,
-                    assigner.as_ref(),
-                    raw_tag,
-                    filter_config.min_umi_length,
-                    no_umi,
-                ) {
-                    // A failed assignment means this position group's reads cannot be
-                    // grouped at all — an unparseable UMI for the chosen strategy, a
-                    // missing `RX` tag, mixed UMI lengths. Substituting an empty group
-                    // would silently drop every read in it and still exit 0, so fail
-                    // the run and let the user fix the input or the strategy.
-                    #[cfg(feature = "memory-debug")]
-                    if debug_memory_flag
-                        && let Some(stats) = stats_for_tracking.as_ref() {
-                            stats.track_position_group_memory(initial_group_size, false);
-                            stats.track_template_memory(_template_memory_size, false);
-                        }
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("Failed to assign UMI groups: {e:#}"),
-                    ));
-                }
-
-                // Compute the number of distinct numeric molecule IDs assigned in this group.
-                // Assigners hand out numeric IDs 0, 1, 2, ... contiguously, so `max(id) + 1`
-                // equals the count of distinct IDs used. This can be less than
-                // `templates.len()` when multiple templates share a UMI family (and hence a
-                // MoleculeId) or when paired A/B variants share the same numeric id.
-                let distinct_mi_count: u64 = templates
-                    .iter()
-                    .filter_map(|t| t.mi.id())
-                    .max()
-                    .map(|max_id| max_id + 1)
-                    .unwrap_or(0);
-
-                // Sort templates directly by (MI index, name) - avoids Vec<Vec<Template>> allocation
-                templates.sort_by(|a, b| {
-                    let a_idx = a.mi.to_vec_index();
-                    let b_idx = b.mi.to_vec_index();
-                    a_idx.cmp(&b_idx).then_with(|| a.name.cmp(&b.name))
-                });
-
-                // Count family sizes in one pass through sorted templates
-                // Family sizes rarely exceed 50 distinct sizes
-                let mut family_sizes: AHashMap<usize, u64> = AHashMap::with_capacity(50);
-                if !templates.is_empty() {
-                    let mut current_mi = templates[0].mi.to_vec_index();
-                    let mut current_count = 1usize;
-
-                    for template in templates.iter().skip(1) {
-                        let mi = template.mi.to_vec_index();
-                        if mi == current_mi {
-                            current_count += 1;
-                        } else {
-                            // Finish previous MI group
-                            if current_mi.is_some() {
-                                *family_sizes.entry(current_count).or_insert(0) += 1;
-                            }
-                            current_mi = mi;
-                            current_count = 1;
-                        }
-                    }
-                    // Don't forget the last group
-                    if current_mi.is_some() {
-                        *family_sizes.entry(current_count).or_insert(0) += 1;
-                    }
-                }
-
-                // Templates are now sorted by MI, no need for additional collection
-
-                // Track memory deallocation when processing completes (if debug mode)
-                #[cfg(feature = "memory-debug")]
-                if debug_memory_flag
-                    && let Some(stats) = stats_for_tracking.as_ref() {
-                        stats.track_position_group_memory(initial_group_size, false);
-                    }
-
-                Ok(ProcessedPositionGroup {
-                    templates,
-                    family_sizes,
-                    filter_counts,
-                    input_record_count,
-                    distinct_mi_count,
-                })
-            },
-            // serialize_fn: Serialize records + collect metrics (serial, ordered)
-            move |processed: ProcessedPositionGroup,
-                  _header: &Header,
-                  output: &mut Vec<u8>|
-                  -> std::io::Result<u64> {
-                #[cfg(feature = "memory-debug")]
-                if short_circuit_serialize {
-                    let count = processed.input_record_count;
-                    if debug_memory_flag
-                        && let Some(stats) = stats_for_serialize.as_ref() {
-                            let tmpl_size = estimate_templates_heap_size(&processed.templates);
-                            stats.track_template_memory(tmpl_size, false);
-                        }
-                    drop(processed);
-                    return Ok(count);
-                }
-                // Merge per-group metrics into this worker's accumulator slot.
-                // Memory stays O(threads × distinct sizes) instead of growing
-                // one hashmap per position group.
-                accumulators_clone.with_slot(|acc| {
-                    acc.record_group(processed.family_sizes, &processed.filter_counts);
-                });
-
-                // Save input record count for progress tracking
-                let input_record_count = processed.input_record_count;
-
-                // Track template memory deallocation (templates are consumed here)
-                #[cfg(feature = "memory-debug")]
-                if debug_memory_flag
-                    && let Some(stats) = stats_for_serialize.as_ref() {
-                        let tmpl_size = estimate_templates_heap_size(&processed.templates);
-                        stats.track_template_memory(tmpl_size, false);
-                    }
-
-                // Serialize primary reads directly from templates — no
-                // intermediate `Vec<RecordBuf>`. Templates already carry
-                // their final global `MoleculeId`s because the MI Assign
-                // hook (installed below) ran in serial order before this
-                // closure was called, so we pass `base_mi = 0` to the
-                // emitter. Each record is serialized and dropped
-                // immediately, keeping per-thread peak memory low.
-                // Pre-allocate output buffer: ~2 records/template × ~400 bytes/record.
-                output.reserve(processed.templates.len() * 2 * 400);
-                let mut scratch = Vec::with_capacity(512);
-                let mut mi_buf = String::with_capacity(16);
-                emit_templates_raw_with_mi(
-                    &processed.templates,
-                    0,
-                    assign_tag_bytes,
-                    &mut scratch,
-                    &mut mi_buf,
-                    |bytes| {
-                        output.extend_from_slice(bytes);
-                        Ok(())
-                    },
-                )?;
-                // Short-circuit: let serialize run fully but starve compress/write
-                #[cfg(feature = "memory-debug")]
-                if short_circuit_compress {
-                    output.clear();
-                }
-                // Return INPUT record count for progress tracking (not output count)
-                Ok(input_record_count)
-            },
-            // mi_assign_fn: called in serial order by the MI Assign zone
-            // before each item's `serialize_fn`. Folds a cumulative offset
-            // into every template's local `MoleculeId`, turning per-position-
-            // group local IDs (0..N-1) into globally contiguous IDs that
-            // `serialize_fn` can emit verbatim.
-            move |_ord, processed: &mut ProcessedPositionGroup| {
-                // `fetch_update` + `checked_add` so wraparound is detected and surfaced
-                // rather than silently reusing MI integers (which would defeat
-                // `MoleculeId::with_offset`'s own overflow check on the per-template add).
-                let base = next_mi_base_for_hook
-                    .fetch_update(
-                        std::sync::atomic::Ordering::Relaxed,
-                        std::sync::atomic::Ordering::Relaxed,
-                        |current| current.checked_add(processed.distinct_mi_count),
-                    )
-                    .map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "MoleculeId offset overflow: cumulative MI counter exceeded u64::MAX",
-                        )
-                    })?;
-                for template in &mut processed.templates {
-                    template.mi = template.mi.with_offset(base);
-                }
-                Ok(())
-            },
+            reader_opts.verify_crc,
+            &header,
+            effective_strategy,
+            effective_edits,
+            raw_tag,
+            assign_tag_bytes,
+            cell_tag,
+            &filter_config,
+            &timer,
         )
-        .context("Pipeline execution failed")?;
-
-        // Cleanup memory monitoring if it was enabled
-        #[cfg(feature = "memory-debug")]
-        if let Some((handle, shutdown_signal)) = memory_monitor_handle {
-            use crate::unified_pipeline::log_comprehensive_memory_stats;
-
-            shutdown_signal.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _: Result<(), _> = handle.join();
-
-            if let Some(stats) = shared_stats.as_ref() {
-                log_comprehensive_memory_stats(stats);
-                info!("Memory monitoring stopped - final stats logged above");
-            }
-        }
-
-        info!("Wrote output to {}", self.io.output.display());
-
-        // Reduce per-thread accumulators into final counters. The pipeline has
-        // returned, so `accumulators_clone` inside serialize_fn has been dropped
-        // along with the closure; remaining Arc holders are this call site and
-        // any debug monitor, so we iterate slots by reference rather than
-        // requiring unique ownership.
-        let mut family_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
-        let mut position_group_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
-        let mut total_filter_counts = TemplateFilterCounts::new();
-
-        for slot in accumulators.slots() {
-            let acc = slot.lock();
-            for (&size, &count) in &acc.family_sizes {
-                *family_size_counter.entry(size).or_insert(0) += count;
-            }
-            for (&size, &count) in &acc.position_group_sizes {
-                *position_group_size_counter.entry(size).or_insert(0) += count;
-            }
-            total_filter_counts.merge(&acc.filter_counts);
-        }
-
-        let metrics = build_grouping_metrics(&total_filter_counts, &family_size_counter);
-        log_umi_grouping_summary(&metrics);
-
-        // Write all metrics (individual flags and --metrics prefix)
-        self.write_all_metrics(&metrics, &family_size_counter, &position_group_size_counter)?;
-
-        // Log completion with timing
-        timer.log_completion(metrics.accepted_records);
-
-        info!("group completed successfully");
-        info!("Records processed by pipeline: {records_processed}");
-        Ok(())
     }
 }
 
 impl GroupReadsByUmi {
+    /// Run the group stage on the declarative chain builder (the `--threads N`
+    /// path).
+    ///
+    /// Replaces the former hand-rolled unified-pipeline construction. The chain
+    /// opens its own source, injects `@PG`, validates record ordering, assigns
+    /// `MoleculeId`s deterministically, writes the output BAM, and writes the
+    /// grouping metrics via its finalize hook — all through the same shared
+    /// helpers (`require_group_input_ordering`, `add_pg_record`,
+    /// `write_metrics_for_chain`) as the single-threaded path, so the two
+    /// orchestrations of the group stage stay in parity.
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        use crate::pipeline::chains::{
+            ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
+        };
+
+        // The chain's `add_group` re-emits the timer/banner/threading log lines
+        // but not the CRC-verify status; emit it here so the --threads path
+        // reports it once, matching the single-threaded path.
+        self.io.log_effective_check_crc();
+
+        // The chain engine does not carry the legacy unified-pipeline memory
+        // monitor, so the memory-debug knobs the old --threads path honored have
+        // no effect here. Warn rather than silently no-op; FGUMI_PIPELINE_STATS
+        // is the chain's equivalent stats hook.
+        #[cfg(feature = "memory-debug")]
+        if self.debug_memory {
+            warn!(
+                "--debug-memory is not supported on the --threads chain path and is ignored; \
+                 set FGUMI_PIPELINE_STATS=1 for chain pipeline stats"
+            );
+        }
+        // `FGUMI_SHORT_CIRCUIT` is an env var, not part of the `memory-debug`
+        // feature, so warn about it in every build rather than only when
+        // `memory-debug` is compiled in.
+        if std::env::var("FGUMI_SHORT_CIRCUIT").is_ok_and(|v| !v.is_empty()) {
+            warn!(
+                "FGUMI_SHORT_CIRCUIT is not supported on the --threads chain path and is ignored"
+            );
+        }
+
+        let stage_opts =
+            StageOptionsBag { group: Some(self.to_group_options()), ..Default::default() };
+        let ctx = SingleStageContext {
+            io: &self.io,
+            threading: &self.threading,
+            compression: &self.compression,
+            scheduler: &self.scheduler_opts,
+            queue_memory: &self.queue_memory,
+            command_line,
+        };
+        let spec = ChainSpec::single_stage(Stage::Group, stage_opts, &ctx);
+        build_for(spec)?.run()
+    }
+
     /// Execute in single-threaded mode for `--threads 1`.
     ///
     /// This provides a simpler, streaming implementation that avoids pipeline overhead
@@ -1709,47 +1280,25 @@ impl GroupReadsByUmi {
     }
 
     /// Write all metrics files: individual flags and --metrics prefix outputs.
+    ///
+    /// Delegates to [`write_metrics_for_chain`] so the single-threaded path and
+    /// the chain builder's `GroupFinalizeHook` share one implementation and
+    /// cannot emit divergent metrics files (same filenames, order, and labels)
+    /// for the same input.
     fn write_all_metrics(
         &self,
         grouping_metrics: &UmiGroupingMetrics,
         family_sizes: &AHashMap<usize, u64>,
         position_group_sizes: &AHashMap<usize, u64>,
     ) -> Result<()> {
-        let family_size_metrics =
-            FamilySizeMetrics::from_size_counts(family_sizes.iter().map(|(&s, &c)| (s, c)));
-        let position_group_size_metrics = PositionGroupSizeMetrics::from_size_counts(
-            position_group_sizes.iter().map(|(&s, &c)| (s, c)),
-        );
-
-        // Write individual flag outputs (fgbio-compatible)
-        if let Some(path) = &self.family_size_histogram {
-            write_metrics(path, &family_size_metrics, "family size histogram")?;
-        }
-        if let Some(path) = &self.grouping_metrics {
-            write_metrics(path, std::slice::from_ref(grouping_metrics), "grouping metrics")?;
-        }
-
-        // Write --metrics prefix outputs (all three files)
-        if let Some(prefix) = &self.metrics {
-            let family_path = with_extension(prefix, "family_sizes.txt");
-            write_metrics(&family_path, &family_size_metrics, "family size histogram")?;
-
-            let grouping_path = with_extension(prefix, "grouping_metrics.txt");
-            write_metrics(
-                &grouping_path,
-                std::slice::from_ref(grouping_metrics),
-                "grouping metrics",
-            )?;
-
-            let position_path = with_extension(prefix, "position_group_sizes.txt");
-            write_metrics(
-                &position_path,
-                &position_group_size_metrics,
-                "position group size histogram",
-            )?;
-        }
-
-        Ok(())
+        write_metrics_for_chain(
+            grouping_metrics,
+            family_sizes,
+            position_group_sizes,
+            self.family_size_histogram.as_deref(),
+            self.grouping_metrics.as_deref(),
+            self.metrics.as_deref(),
+        )
     }
 }
 
@@ -1871,6 +1420,9 @@ pub(crate) fn write_metrics_for_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Production code now writes metrics via `write_metrics_for_chain` (which
+    // imports these itself); the tests still construct them directly.
+    use crate::metrics::group::{FamilySizeMetrics, PositionGroupSizeMetrics};
 
     /// The `--no-umi` and identity-implies-zero-edits rules, pinned as a table.
     ///
