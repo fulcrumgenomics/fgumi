@@ -1554,9 +1554,7 @@ impl<'a> ChainBuilder<'a> {
         // report, since neither `collect_stats()` nor the env var is set.
         let user_wants_stats = self.spec.scheduler.collect_stats()
             || super::build_helpers::env_flag_enabled("FGUMI_PIPELINE_STATS");
-        if user_wants_stats
-            && let Some(s) = pipeline_stats
-        {
+        if user_wants_stats && let Some(s) = pipeline_stats {
             self.finalize.push(Box::new(PipelineStatsFinalizeHook { stats: s }));
         }
 
@@ -2850,10 +2848,11 @@ impl<'a> ChainBuilder<'a> {
         info!("{}", self.spec.threading.log_message());
         info!("Using pipeline with {num_threads} threads");
 
-        // Check sort order — identical validation to GroupReadsByUmi::execute.
-        // Sort-order precondition + info logging, shared verbatim with
-        // `Group::execute`'s single-threaded path (see `require_group_input_sort`).
-        crate::commands::common::require_group_input_sort(&self.header, group.allow_unmapped)?;
+        // Record-ordering precondition + info/warn logging, shared verbatim
+        // with `Group::execute` (see `require_group_input_ordering`) so the two
+        // orchestrations of the group stage cannot drift on accepted orders,
+        // error text, or logging.
+        crate::commands::common::require_group_input_ordering(&self.header, group.allow_unmapped)?;
 
         // Tag constants per SAM specification.
         let raw_tag: [u8; 2] = *SamTag::RX;

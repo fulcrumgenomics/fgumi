@@ -14,7 +14,6 @@ use crate::metrics::TemplateFilterCounts;
 use crate::metrics::group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::read_info::LibraryIndex;
-use crate::sam::is_template_coordinate_sorted;
 use crate::template::Template;
 use crate::template_filter::{TemplateFilterConfig, filter_template};
 use crate::umi::parallel_assigner::{
@@ -210,63 +209,6 @@ fn parallel_threshold(strategy: Strategy, opt: &ParallelMinTemplates) -> usize {
             // 20x at 1k, 95x at 4k, 390x at 16k.
             Strategy::Paired => 128,
         },
-    }
-}
-
-/// How an input header satisfies `group`'s record-ordering requirement.
-///
-/// The three cases are mutually exclusive and are what the diagnostics and the
-/// rejection message key off. They must be decided in priority order: a
-/// template-coordinate header also advertises `GO:query`, so it satisfies
-/// [`crate::sam::is_query_grouped`] too and would otherwise be misreported as
-/// merely query-grouped whenever `--allow-unmapped` is set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InputOrdering {
-    /// Template-coordinate sorted: records sharing a position key are adjacent,
-    /// so mapped templates group by position as intended.
-    TemplateCoordinate,
-    /// Query-grouped but not template-coordinate sorted. Accepted only under
-    /// `--allow-unmapped`, which groups unmapped reads by UMI alone.
-    QueryGroupedUnmapped,
-    /// Neither ordering holds, so a template's records may not be adjacent.
-    Unusable,
-}
-
-/// Classify how an input header orders its records.
-///
-/// Template-coordinate is the ordering `group` is built around. The streaming
-/// `RecordPositionGrouper` emits a group whenever the position key changes
-/// between consecutive records, so any input where records sharing a position
-/// key aren't already adjacent (queryname-sorted, coordinate-sorted,
-/// FASTQ-order, etc.) would be split into many small groups and assigned
-/// distinct `MoleculeIds` -- silently wrong. Template-coordinate sort is what
-/// makes adjacency match the grouping key.
-///
-/// `--allow-unmapped` places every unmapped read in a single position group, so
-/// the position adjacency that template-coordinate sort exists to provide is not
-/// needed: every unmapped record lands in that one group regardless of order.
-/// Requiring a template-coordinate sort there would tell a user with unaligned
-/// data to sort by coordinates that do not exist, which is not actionable -- it
-/// blocked the unaligned-only workflow (ribosome display, for example)
-/// outright.
-///
-/// Query grouping is still required, and that is a correctness requirement
-/// rather than a policy choice: templates are assembled by comparing each
-/// record's name to the previous one, so if a template's records are not
-/// adjacent an R1/R2 pair splits into two partial templates.
-///
-/// Mapped reads in a query-grouped (rather than template-coordinate) input are
-/// not position-adjacent, so each mapped template forms its own position group
-/// and therefore its own family. That under-groups rather than merging unrelated
-/// molecules, and `--allow-unmapped` already warns that it groups by UMI alone;
-/// the caller's warning names the case explicitly so it is not a surprise.
-fn classify_input_ordering(header: &Header, allow_unmapped: bool) -> InputOrdering {
-    if is_template_coordinate_sorted(header) {
-        InputOrdering::TemplateCoordinate
-    } else if allow_unmapped && crate::sam::is_query_grouped(header) {
-        InputOrdering::QueryGroupedUnmapped
-    } else {
-        InputOrdering::Unusable
     }
 }
 
@@ -986,41 +928,11 @@ impl Command for GroupReadsByUmi {
         let (reader, header) =
             create_bam_reader_for_pipeline_with_opts(&self.io.input, reader_opts)?;
 
-        // Sort order: see `classify_input_ordering` for why template-coordinate
-        // is required, and why `--allow-unmapped` relaxes it to query grouping.
-        match classify_input_ordering(&header, self.allow_unmapped) {
-            InputOrdering::TemplateCoordinate => {
-                info!("Input is template-coordinate sorted");
-            }
-            InputOrdering::QueryGroupedUnmapped => {
-                info!("Input is query-grouped; grouping unmapped reads by UMI only");
-                if !header.reference_sequences().is_empty() {
-                    warn!(
-                        "Input declares reference sequences but is not template-coordinate \
-                         sorted. Any mapped templates will not be position-grouped, so each \
-                         will form its own family. Sort with --order template-coordinate if \
-                         the input contains mapped reads you want grouped by position."
-                    );
-                }
-            }
-            InputOrdering::Unusable => {
-                if self.allow_unmapped {
-                    bail!(
-                        "With --allow-unmapped the input must be either template-coordinate \
-                         sorted or query-grouped, so that a template's records are adjacent \
-                         (header must advertise SO:queryname or GO:query).\n\n\
-                         To sort your BAM file, run:\n  \
-                         fgumi sort -i input.bam -o sorted.bam --order queryname"
-                    );
-                }
-                bail!(
-                    "Input BAM must be template-coordinate sorted (header must advertise \
-                     SO:unsorted, GO:query, and SS:template-coordinate).\n\n\
-                     To sort your BAM file, run:\n  \
-                     fgumi sort -i input.bam -o sorted.bam --order template-coordinate"
-                );
-            }
-        }
+        // Validate the input's record ordering (template-coordinate, or
+        // query-grouped under --allow-unmapped) and emit the accompanying
+        // info/warn logging. Shared with the chain builder's `add_group` so the
+        // two paths cannot drift — see `require_group_input_ordering`.
+        crate::commands::common::require_group_input_ordering(&header, self.allow_unmapped)?;
 
         // Add @PG record with PP chaining to input's last program
         let header = crate::commands::common::add_pg_record(header, command_line)?;
@@ -1906,7 +1818,6 @@ fn with_extension(prefix: &Path, suffix: &str) -> PathBuf {
     s.push(suffix);
     PathBuf::from(s)
 }
-
 
 /// Write all group metrics files for the chain-builder finalize hook.
 ///
@@ -6765,6 +6676,8 @@ mod tests {
         Ok(())
     }
 
+    use crate::commands::common::{InputOrdering, classify_input_ordering};
+
     /// The acceptance table above pins accept-vs-reject; this pins *which*
     /// ordering the input was accepted as, which is what the diagnostics and the
     /// rejection message key off.
@@ -6774,6 +6687,10 @@ mod tests {
     /// correctly-sorted BAM as merely query-grouped whenever `--allow-unmapped`
     /// is set -- warning that its mapped templates "will not be position-grouped"
     /// when in fact they are.
+    ///
+    /// `classify_input_ordering`/`InputOrdering` now live in `commands::common`
+    /// (shared by `Group::execute` and the chain builder's `add_group`); this
+    /// test moved its references there accordingly.
     #[rstest]
     // Template-coordinate wins over the weaker query-grouped match, flag or not.
     #[case::tc_sorted(
