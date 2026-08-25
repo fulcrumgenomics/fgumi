@@ -24,12 +24,11 @@
 //! (`correct/` had the same dependency on `CorrectOptions`; that arrived with
 //! the options projection, so it is ported here.)
 //!
-//! This module deliberately holds only what the chain builder actually
-//! constructs. Two steps that exist upstream are *not* ported here:
-//! `coalesce.rs` (a `CoalesceBytes` byte-batching step with no caller anywhere,
-//! upstream included) and `roundtrip.rs` (a whole-chain convenience whose only
-//! consumer is the `compare bam-roundtrip` command, so it travels with the
-//! command rewiring rather than with the steps).
+//! `roundtrip.rs` is a whole-chain convenience whose only consumer is the
+//! `compare bam-roundtrip` command; it is ported here alongside that command so
+//! it lands caller-complete rather than dormant. `coalesce.rs` (a
+//! `CoalesceBytes` byte-batching step) is deliberately *not* ported: it has no
+//! caller anywhere, upstream included, so it would be pure dead code.
 
 pub mod bgzf;
 pub mod boundaries;
@@ -39,6 +38,7 @@ pub mod correct;
 pub mod group;
 pub mod parse;
 pub mod process;
+pub mod roundtrip;
 pub mod serialize;
 pub mod serialize_processed;
 pub mod sink;
@@ -48,6 +48,7 @@ pub mod templates_to_records;
 pub mod tuning;
 pub mod types;
 
+pub use roundtrip::{RoundtripConfig, run_bam_roundtrip};
 pub use tuning::BamPipelineTuning;
 pub use types::{
     BamTemplateBatch, BgzfBlock, DecodedRecordBatch, DecompressedBlock, RecordBatch,
