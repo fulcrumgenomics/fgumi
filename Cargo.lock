@@ -804,7 +804,7 @@ dependencies = [
 
 [[package]]
 name = "fgumi-cli-common"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "bytesize",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "fgumi-cli-macros"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "fgumi-fmt"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "num-format",
  "rstest",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "fgumi-pipeline-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "fgumi-pipeline-io"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "criterion",
