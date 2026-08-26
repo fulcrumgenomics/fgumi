@@ -16,6 +16,7 @@
 pub mod base_builder;
 pub mod caller;
 pub mod filter;
+pub(crate) mod hashing;
 pub mod overlapping;
 pub mod phred;
 pub mod sequence;

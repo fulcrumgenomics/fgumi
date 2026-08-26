@@ -659,7 +659,8 @@ impl Filter {
 
             for template in batch {
                 let mut template_records: Vec<RawRecord> = template.into_records();
-                let mut pass_map: AHashMap<usize, bool> = AHashMap::new();
+                let mut pass_map: AHashMap<usize, bool> =
+                    AHashMap::with_hasher(crate::hashing::deterministic_state());
                 let mut masked_by_record: Vec<u64> = Vec::with_capacity(template_records.len());
 
                 for (idx, record) in template_records.iter_mut().enumerate() {

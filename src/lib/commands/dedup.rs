@@ -728,7 +728,8 @@ fn assign_umi_groups(
     no_umi: bool,
 ) -> Result<()> {
     if splits_by_strand_of_origin(assigner, no_umi) {
-        let mut subgroups: AHashMap<(bool, bool), Vec<usize>> = AHashMap::new();
+        let mut subgroups: AHashMap<(bool, bool), Vec<usize>> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
         for (idx, template) in templates.iter().enumerate() {
             let orientation = get_pair_orientation(template);
             subgroups.entry(orientation).or_default().push(idx);
@@ -942,7 +943,7 @@ fn process_position_group(
     if filtered_templates.is_empty() && passthrough_templates.is_empty() {
         return Ok(ProcessedDedupGroup {
             templates: Vec::new(),
-            family_sizes: AHashMap::new(),
+            family_sizes: AHashMap::with_hasher(crate::hashing::deterministic_state()),
             dedup_counts,
             library_idx,
             input_record_count,
@@ -973,7 +974,8 @@ fn process_position_group(
     });
 
     // Group by MI and mark duplicates
-    let mut family_sizes: AHashMap<usize, u64> = AHashMap::with_capacity(50);
+    let mut family_sizes: AHashMap<usize, u64> =
+        AHashMap::with_capacity_and_hasher(50, crate::hashing::deterministic_state());
 
     if !templates.is_empty() {
         // Collect family boundaries

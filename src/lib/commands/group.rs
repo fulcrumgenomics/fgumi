@@ -341,7 +341,8 @@ fn assign_umi_groups_impl(
     // deliberately does not, so do not "harmonize" the two by adding `&& !no_umi` here.
     if assigner.split_templates_by_pair_orientation() {
         // Group by pair orientation
-        let mut subgroups: AHashMap<(bool, bool), Vec<usize>> = AHashMap::new();
+        let mut subgroups: AHashMap<(bool, bool), Vec<usize>> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
         for (idx, template) in templates.iter().enumerate() {
             let orientation = get_pair_orientation_raw(template);
             subgroups.entry(orientation).or_default().push(idx);

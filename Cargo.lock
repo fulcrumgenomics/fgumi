@@ -820,6 +820,7 @@ dependencies = [
 name = "fgumi-dna"
 version = "0.7.0"
 dependencies = [
+ "ahash",
  "rstest",
 ]
 
@@ -901,6 +902,7 @@ dependencies = [
  "crossbeam-utils",
  "fgumi-bam-io",
  "fgumi-bgzf",
+ "fgumi-dna",
  "fgumi-raw-bam",
  "fgumi-sam",
  "fs4",

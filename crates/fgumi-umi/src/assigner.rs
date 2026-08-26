@@ -481,8 +481,9 @@ impl NgramIndex {
             return None;
         }
 
-        let mut partitions: Vec<AHashMap<u32, Vec<(usize, BitEnc)>>> =
-            (0..num_partitions).map(|_| AHashMap::new()).collect();
+        let mut partitions: Vec<AHashMap<u32, Vec<(usize, BitEnc)>>> = (0..num_partitions)
+            .map(|_| AHashMap::with_hasher(crate::hashing::deterministic_state()))
+            .collect();
 
         for &(idx, umi) in umis {
             // Verify consistent length
@@ -787,7 +788,8 @@ fn assign_with_invalid_fallback(
     mut resolve: impl FnMut(usize, &str) -> Option<MoleculeId>,
     mut mint: impl FnMut() -> MoleculeId,
 ) -> Vec<MoleculeId> {
-    let mut invalid_to_id: AHashMap<String, MoleculeId> = AHashMap::new();
+    let mut invalid_to_id: AHashMap<String, MoleculeId> =
+        AHashMap::with_hasher(crate::hashing::deterministic_state());
     raw_umis
         .iter()
         .enumerate()
@@ -1242,7 +1244,8 @@ impl SimpleErrorUmiAssigner {
             }
         }
 
-        let mut by_root: AHashMap<usize, BTreeSet<Umi>> = AHashMap::new();
+        let mut by_root: AHashMap<usize, BTreeSet<Umi>> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
         for (i, umi) in distinct.iter().enumerate() {
             by_root.entry(components.find(i)).or_default().insert((*umi).clone());
         }
@@ -1407,7 +1410,8 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
         });
 
         // Build map from UMI string to MoleculeId
-        let mut umi_to_id: AHashMap<String, MoleculeId> = AHashMap::new();
+        let mut umi_to_id: AHashMap<String, MoleculeId> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
         for set in umi_sets {
             let id = MoleculeId::Single(self.next_id());
             for umi in set {
@@ -1952,8 +1956,10 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         // Also build a map from BitEnc -> unique_index for result lookup
         let mut umi_counts: Vec<(BitEnc, usize, usize)> = {
             // Map from BitEnc -> (count, first_raw_index)
-            let mut counts: AHashMap<BitEnc, (usize, usize)> =
-                AHashMap::with_capacity(raw_umis.len() / 4); // Estimate ~4 reads per UMI
+            let mut counts: AHashMap<BitEnc, (usize, usize)> = AHashMap::with_capacity_and_hasher(
+                raw_umis.len() / 4,
+                crate::hashing::deterministic_state(),
+            ); // Estimate ~4 reads per UMI
 
             for (i, encoded) in encodings.iter().enumerate() {
                 // Skip UMIs that contain invalid characters
@@ -2001,8 +2007,10 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         });
 
         // Build lookup from BitEnc to sorted index (after sorting)
-        let bitenc_to_unique_idx: AHashMap<BitEnc, usize> =
-            umi_counts.iter().enumerate().map(|(idx, (enc, _, _))| (*enc, idx)).collect();
+        let mut bitenc_to_unique_idx: AHashMap<BitEnc, usize> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
+        bitenc_to_unique_idx
+            .extend(umi_counts.iter().enumerate().map(|(idx, (enc, _, _))| (*enc, idx)));
 
         #[cfg(feature = "profile-adjacency")]
         let t_after_sort = std::time::Instant::now();
@@ -2396,7 +2404,8 @@ impl PairedUmiAssigner {
         umis: &[Umi],
         underlying: &[Option<usize>],
     ) -> Vec<(Umi, usize, Option<usize>)> {
-        let mut counts: AHashMap<Umi, (usize, Option<usize>)> = AHashMap::new();
+        let mut counts: AHashMap<Umi, (usize, Option<usize>)> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
         for (umi, len) in umis.iter().zip(underlying) {
             let canonical = Self::canonicalize_paired(umi)
                 .expect("UMI should be valid paired format (validated in assign())");
@@ -2581,7 +2590,8 @@ impl UmiAssigner for PairedUmiAssigner {
 
         // Assign IDs with A/B variants - build a map from UMI string to MoleculeId
         // Use owned strings since we need to store reversed UMIs
-        let mut umi_to_id: AHashMap<String, MoleculeId> = AHashMap::new();
+        let mut umi_to_id: AHashMap<String, MoleculeId> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
 
         for &root_idx in &roots {
             let id = self.adjacency.next_id();

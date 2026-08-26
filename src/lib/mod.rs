@@ -138,6 +138,7 @@ pub mod errors;
 pub mod fastq;
 pub mod fastq_parse;
 pub mod grouper;
+pub(crate) mod hashing;
 pub mod logging;
 pub mod metrics;
 pub mod mi_group;

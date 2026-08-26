@@ -17,6 +17,7 @@ pedantic = { level = "deny", priority = -1 }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-bgzf = { workspace = true }
 fgumi-bam-io = { workspace = true }
+fgumi-dna = { workspace = true }
 noodles = { workspace = true, features = ["bam", "sam", "core", "csi"] }
 noodles-bgzf = { workspace = true }
 libdeflater = { workspace = true }

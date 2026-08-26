@@ -1011,7 +1011,8 @@ impl CorrectUmis {
                 let mut missing_umis = 0u64;
                 let mut wrong_length = 0u64;
                 let mut mismatched = 0u64;
-                let mut umi_matches_map: AHashMap<String, UmiCorrectionMetrics> = AHashMap::new();
+                let mut umi_matches_map: AHashMap<String, UmiCorrectionMetrics> =
+                    AHashMap::with_hasher(crate::hashing::deterministic_state());
                 let templates_count = batch.len() as u64;
                 // Count ALL input records for progress tracking (not just kept/rejected)
                 let mut total_input_records = 0u64;

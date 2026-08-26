@@ -588,16 +588,11 @@ pub(crate) struct Phase1FloorInputs {
 
 /// Deterministic hasher for cell barcode hashing in template-coordinate sort.
 ///
-/// Uses arbitrary fixed seeds so that hash values are reproducible across runs.
+/// Delegates to the shared [`fgumi_dna::deterministic_state`] so the fixed seed table lives in
+/// exactly one place; hash values remain reproducible across runs.
 #[must_use]
 pub fn cb_hasher() -> ahash::RandomState {
-    // Arbitrary fixed seeds — chosen for uniqueness, not cryptographic strength.
-    ahash::RandomState::with_seeds(
-        0xa1b2_c3d4_e5f6_0718,
-        0x9182_7364_5546_3728,
-        0xfede_dcba_0987_6543,
-        0x0011_2233_4455_6677,
-    )
+    fgumi_dna::deterministic_state()
 }
 
 /// Where a merge writes its output.
