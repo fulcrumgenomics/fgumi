@@ -27,9 +27,10 @@
 //!
 //! `ChainBuilder`'s callers are constrained: each `add_<stage>` method
 //! pushes a known-typed step sequence onto the chain, and the sequencing
-//! is verified by the unit tests that drive `build_<command>_chain`
-//! end-to-end. Misuse from outside `chains::builder` is prevented by
-//! the `pub(crate)` scope.
+//! is verified by the unit tests that drive the builder end-to-end.
+//! `ChainBuilder` is `pub` deliberately as the chains layer's declarative
+//! entry surface; [`super::build::build_for`] is the live dispatch that
+//! drives it stage-by-stage.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -257,19 +258,17 @@ impl HeapSize for FuseState {}
 /// even when their mate is mapped (fgbio#1168). Keeping the two orchestrations
 /// on the one shared predicate is what stops them drifting.
 #[cfg(feature = "consensus")]
-fn templates_to_mi_step<F>(
+fn templates_to_mi_step(
     limit_bytes: u64,
     duplex_strip_strand: bool,
-    record_filter: Option<F>,
+    allow_unmapped: bool,
 ) -> impl crate::pipeline::core::step::Step<
     Input = crate::pipeline::steps::group::position::BatchedProcessedPositionGroups,
     Outputs = crate::pipeline::core::outputs::OrderedBytesSingle<
         crate::pipeline::steps::group::mi::BatchedMiGroups,
     >,
->
-where
-    F: Fn(&[u8]) -> bool + Send + Sync + 'static,
-{
+> {
+    use crate::commands::common::consensus_pregroup_keep_raw;
     use crate::mi_group::MiGroup;
     use crate::pipeline::steps::group::mi::BatchedMiGroups;
     use crate::pipeline::steps::group::position::BatchedProcessedPositionGroups;
@@ -324,12 +323,10 @@ where
                         Some(_) => {}
                     }
                     for raw in [template.r1(), template.r2()].into_iter().flatten() {
-                        // Apply the optional per-record filter (duplex) so the
-                        // fused bridge drops the same records the non-fused
-                        // `GroupByMi::with_record_filter` would (NEW-002).
-                        if let Some(filter) = &record_filter
-                            && !filter(raw)
-                        {
+                        // Apply the same per-record filter the non-fused
+                        // `GroupByMi::with_record_filter` would, so the fused
+                        // bridge drops the same records (NEW-002).
+                        if !consensus_pregroup_keep_raw(raw, allow_unmapped) {
                             continue;
                         }
                         state.scratch.clear();
@@ -1515,7 +1512,7 @@ impl<'a> ChainBuilder<'a> {
     /// `"dedup"` (single stage) or `"group→simplex"` (multi-stage), making
     /// the log line unambiguous for fused chains.
     ///
-    /// Also calls [`build_pipeline_config_for_chain`] for shared threading /
+    /// Also calls `build_pipeline_config_for_chain` for shared threading /
     /// deadlock-timeout / queue-memory wiring. Registers
     /// [`PipelineStatsFinalizeHook`] if the user requested stats.
     ///
@@ -1811,7 +1808,7 @@ impl<'a> ChainBuilder<'a> {
 
         let track_rejects = correct_opts.rejects_path.is_some();
 
-        warn_unwired_pipeline_flags(&self.spec.scheduler, &self.spec.queue_memory);
+        warn_unwired_pipeline_flags(&self.spec.scheduler);
         info!("{}", self.spec.threading.log_message());
         info!("Using pipeline with {num_threads} threads");
 
@@ -2109,7 +2106,9 @@ impl<'a> ChainBuilder<'a> {
         }
 
         let timer = OperationTimer::new("AlignAndMerge");
-        self.finalize.push(Box::new(AlignFinalizeHook { records_emitted, timer }));
+        // Success-only: the hook logs "pipeline completed successfully" and
+        // records completion timing, which must not fire on a failed run.
+        self.finalize_on_success.push(Box::new(AlignFinalizeHook { records_emitted, timer }));
 
         Ok(())
     }
@@ -2195,7 +2194,7 @@ impl<'a> ChainBuilder<'a> {
 
         // Emit the start log and pipeline-info lines (mirrors build_zipper_chain).
         info!("{NEW_PIPELINE_START_LOG}");
-        warn_unwired_pipeline_flags(&self.spec.scheduler, &self.spec.queue_memory);
+        warn_unwired_pipeline_flags(&self.spec.scheduler);
         info!("{}", self.spec.threading.log_message());
         info!("Using pipeline with {num_threads} threads");
 
@@ -2432,6 +2431,18 @@ impl<'a> ChainBuilder<'a> {
             if !sort.tmp_dirs.is_empty() {
                 sorter = sorter.temp_dirs(sort.tmp_dirs.clone());
             }
+
+            // Thread `--max-temp-files` through: `Auto` resolves against the host
+            // `RLIMIT_NOFILE` (one snapshot), matching the standalone
+            // `Sort::build_sorter`. Without this the chain used the engine's
+            // portable fallback and silently ignored the CLI value.
+            let resolved_max_temp_files = match sort.max_temp_files {
+                crate::commands::common::MaxTempFiles::Auto => {
+                    fgumi_sort::temp_file_limit_from_nofile(fgumi_sort::soft_nofile())
+                }
+                crate::commands::common::MaxTempFiles::Fixed(n) => n,
+            };
+            sorter = sorter.max_temp_files(resolved_max_temp_files);
 
             // NOTE: the legacy `build_sort_step` clamped the sorter's *initial*
             // in-memory capacity (768 MiB/thread) for standalone `--max-memory
@@ -2848,7 +2859,7 @@ impl<'a> ChainBuilder<'a> {
             }
         }
 
-        warn_unwired_pipeline_flags(&self.spec.scheduler, &self.spec.queue_memory);
+        warn_unwired_pipeline_flags(&self.spec.scheduler);
         let num_threads = self.spec.threading.num_threads();
         info!("{}", self.spec.threading.log_message());
         info!("Using pipeline with {num_threads} threads");
@@ -3079,7 +3090,7 @@ impl<'a> ChainBuilder<'a> {
             info!("Overlapping consensus calling enabled");
         }
 
-        warn_unwired_pipeline_flags(&self.spec.scheduler, &self.spec.queue_memory);
+        warn_unwired_pipeline_flags(&self.spec.scheduler);
         let num_threads = self.spec.threading.num_threads();
         info!("{}", self.spec.threading.log_message());
         info!("Using pipeline with {num_threads} threads");
@@ -3178,11 +3189,7 @@ impl<'a> ChainBuilder<'a> {
         let tail = if self.chain_tail_kind == ChainTailKind::BatchedProcessedPositionGroups {
             // simplex: no `/A` `/B` strand stripping; apply the canonical filter.
             self.pipeline.append_step(
-                templates_to_mi_step(
-                    self.tuning.per_step_byte_limit,
-                    false,
-                    Some(move |raw: &[u8]| consensus_pregroup_keep_raw(raw, allow_unmapped)),
-                ),
+                templates_to_mi_step(self.tuning.per_step_byte_limit, false, allow_unmapped),
                 tail,
             )
         } else {
@@ -3348,7 +3355,7 @@ impl<'a> ChainBuilder<'a> {
             info!("Overlapping consensus calling enabled");
         }
 
-        warn_unwired_pipeline_flags(&self.spec.scheduler, &self.spec.queue_memory);
+        warn_unwired_pipeline_flags(&self.spec.scheduler);
         let num_threads = self.spec.threading.num_threads();
         info!("{}", self.spec.threading.log_message());
         info!("Using pipeline with {num_threads} threads");
@@ -3447,11 +3454,7 @@ impl<'a> ChainBuilder<'a> {
             // duplex: strip `/A` `/B` so both strands group together, and apply
             // the same canonical per-record filter the non-fused path applies.
             self.pipeline.append_step(
-                templates_to_mi_step(
-                    self.tuning.per_step_byte_limit,
-                    true,
-                    Some(move |raw: &[u8]| consensus_pregroup_keep_raw(raw, allow_unmapped)),
-                ),
+                templates_to_mi_step(self.tuning.per_step_byte_limit, true, allow_unmapped),
                 tail,
             )
         } else {
@@ -3594,7 +3597,7 @@ impl<'a> ChainBuilder<'a> {
         info!("Error rate post-UMI: Q{}", consensus.error_rate_post_umi);
         info!("Min duplex length: {}", codec.min_duplex_length);
 
-        warn_unwired_pipeline_flags(&self.spec.scheduler, &self.spec.queue_memory);
+        warn_unwired_pipeline_flags(&self.spec.scheduler);
         let num_threads = self.spec.threading.num_threads();
         info!("Worker threads: {num_threads}");
         info!("Reader threads: {num_threads}");
@@ -3695,11 +3698,7 @@ impl<'a> ChainBuilder<'a> {
         let tail = if self.chain_tail_kind == ChainTailKind::BatchedProcessedPositionGroups {
             // codec: no `/A` `/B` strand stripping; apply the canonical filter.
             self.pipeline.append_step(
-                templates_to_mi_step(
-                    self.tuning.per_step_byte_limit,
-                    false,
-                    Some(move |raw: &[u8]| consensus_pregroup_keep_raw(raw, allow_unmapped)),
-                ),
+                templates_to_mi_step(self.tuning.per_step_byte_limit, false, allow_unmapped),
                 tail,
             )
         } else {
@@ -3862,7 +3861,7 @@ impl<'a> ChainBuilder<'a> {
         info!("  Clip extending past mate: {}", clip.clip_extending_past_mate);
         info!("  {}", self.spec.threading.log_message());
 
-        warn_unwired_pipeline_flags(&self.spec.scheduler, &self.spec.queue_memory);
+        warn_unwired_pipeline_flags(&self.spec.scheduler);
         info!("{}", self.spec.threading.log_message());
         info!("Using pipeline with {num_threads} threads");
 
@@ -3941,7 +3940,7 @@ impl<'a> ChainBuilder<'a> {
         use crate::commands::common::warn_unwired_pipeline_flags;
         use crate::logging::OperationTimer;
         use crate::pipeline::chains::commands::filter::{
-            FilterFinalizeHook, build_filter_step_single_no_rejects,
+            FilterFinalizeHook, FilterStatsFinalizeHook, build_filter_step_single_no_rejects,
             build_filter_step_single_with_rejects, build_filter_step_template_no_rejects,
             build_filter_step_template_with_rejects,
         };
@@ -4032,13 +4031,13 @@ impl<'a> ChainBuilder<'a> {
             info!("Methylation mode: {:?}", filter.methylation_mode);
         }
 
-        warn_unwired_pipeline_flags(&self.spec.scheduler, &self.spec.queue_memory);
+        warn_unwired_pipeline_flags(&self.spec.scheduler);
         let num_threads = self.spec.threading.num_threads();
         info!("{}", self.spec.threading.log_message());
         info!("Using pipeline with {num_threads} threads");
 
         // Build shared FilterPipelineSetup (config, reference, accumulators, progress).
-        let setup = filter.setup_pipeline(num_threads, &self.header)?;
+        let setup = filter.setup_pipeline(num_threads)?;
         let accumulators = Arc::clone(&setup.collected_metrics);
 
         let filter_by_template = filter.filter_by_template;
@@ -4119,13 +4118,21 @@ impl<'a> ChainBuilder<'a> {
         // Branch 0 of process_tail (kept) becomes current_tail for add_sink.
         self.current_tail = Some(process_tail);
 
-        // Register the filter finalize hook.
+        // Register the filter finalize hooks. The stats file is written by a
+        // success-only hook so a failed/partial run never publishes counts; the
+        // summary banner stays on the always-run hook so it reports even after a
+        // failure.
         // The chain-level StageTimingFinalizeHook is inserted at index 0 by
         // build() after all stages have been added — that way a single timer
         // covers the full pipeline run regardless of how many stages there are.
+        if let Some(stats_path) = filter.stats.clone() {
+            self.finalize_on_success.push(Box::new(FilterStatsFinalizeHook {
+                accumulators: Arc::clone(&accumulators),
+                stats_path,
+            }));
+        }
         self.finalize.push(Box::new(FilterFinalizeHook {
             accumulators,
-            stats_path: filter.stats.clone(),
             has_rejects: track_rejects,
             timer,
         }));
@@ -4252,7 +4259,7 @@ impl<'a> ChainBuilder<'a> {
             info!("Index threshold: {}", dedup.index_threshold);
         }
 
-        warn_unwired_pipeline_flags(&self.spec.scheduler, &self.spec.queue_memory);
+        warn_unwired_pipeline_flags(&self.spec.scheduler);
         let num_threads = self.spec.threading.num_threads();
         info!("{}", self.spec.threading.log_message());
         info!("Using pipeline with {num_threads} threads");

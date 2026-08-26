@@ -6,9 +6,8 @@
 //! destructures it and bails with a clear message on any other variant.
 //!
 //! In Phase 3a T3a.12 the bulk of the chain-construction logic moved into
-//! [`ChainBuilder::add_zipper`] and the step-construction details were
-//! extracted into [`build_zipper_merge_step`]. `build_zipper_chain` is now
-//! the canonical 10-line entry point.
+//! `ChainBuilder::add_zipper` and the step-construction details were
+//! extracted into `build_zipper_merge_step`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,8 +17,7 @@ use log::info;
 
 use crate::commands::zipper::{ZipperOptions, merge_step};
 use crate::logging::OperationTimer;
-use crate::pipeline::chains::builder::StagePosition;
-use crate::pipeline::chains::{BuiltPipeline, ChainSpec, FinalizeHook, Stage};
+use crate::pipeline::chains::FinalizeHook;
 use crate::pipeline::steps::tuning::BamPipelineTuning;
 use crate::reference::ReferenceReader;
 
@@ -123,33 +121,4 @@ pub(crate) fn build_zipper_merge_step(
         output_byte_limit: tuning.per_step_byte_limit,
     };
     Ok(merge_step::ZipperMergeStep::new(cfg))
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// build_zipper_chain — 10-line entry point
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Build a [`BuiltPipeline`] for a zipper-only chain.
-///
-/// `spec.stages == [Stage::Zipper]`. Other layouts are caller errors
-/// caught by the dispatch match in [`crate::pipeline::chains::build`].
-///
-/// `spec.source` must be `SourceSpec::PairedBams { unmapped, mapped, reference }`.
-/// The mapped source supports both BAM and SAM input; the unmapped source
-/// is BAM-only (as `fgumi extract` always produces BAM). The function
-/// bails with a clear message if the unmapped source turns out to be SAM.
-///
-/// # Errors
-///
-/// Returns input-validation errors or any underlying pipeline
-/// construction error.
-#[allow(clippy::needless_pass_by_value)]
-pub fn build_zipper_chain(spec: ChainSpec) -> Result<BuiltPipeline> {
-    use crate::pipeline::chains::builder::ChainBuilder;
-
-    let mut chain = ChainBuilder::new(&spec)?;
-    chain.add_source()?;
-    chain.add_stage(Stage::Zipper, StagePosition::Terminal)?;
-    chain.add_sink()?;
-    chain.build()
 }

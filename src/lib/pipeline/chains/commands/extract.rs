@@ -1,8 +1,8 @@
 //! Chain builder support for [`crate::pipeline::chains::Stage::Extract`].
 //!
-//! Provides the extract-specific finalize hook, the `build_fastq_header`
+//! Provides the extract-specific finalize hook and the `build_fastq_header`
 //! helper that synthesizes an unmapped-BAM `@HD`/`@RG`/`@CO` header from
-//! [`ExtractOptions`], and the `build_extract_chain` delegate.
+//! [`ExtractOptions`], both consumed by `ChainBuilder::add_extract`.
 //!
 //! The header builder reproduces the same `@HD`, `@RG`, and `@CO` records
 //! that [`Extract::create_header`] emits, minus the `@PG` record —
@@ -65,7 +65,7 @@ impl FinalizeHook for ExtractFinalizeHook {
 /// Conditionally add a read-group tag value to a [`Builder<ReadGroup>`].
 ///
 /// If `value` is `Some`, inserts the tag with the value. Otherwise returns
-/// the builder unchanged. Mirrors [`Extract::add_to_read_group`].
+/// the builder unchanged. Mirrors `Extract::add_to_read_group`.
 fn add_to_read_group(
     rg: Builder<ReadGroup>,
     tag: noodles::sam::header::record::value::map::tag::Other<rg_tag::Standard>,
@@ -132,33 +132,6 @@ pub(crate) fn build_fastq_header(extract_opts: &ExtractOptions) -> Result<Header
     header = header.add_read_group(extract_opts.read_group_id.clone(), rg.build()?);
 
     Ok(header.build())
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// build_extract_chain — 10-line delegate
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Build a [`BuiltPipeline`] for an extract-only chain.
-///
-/// `spec.stages == [Stage::Extract]`. Delegates to [`ChainBuilder`].
-///
-/// # Errors
-///
-/// Returns validation errors (missing extract options, invalid source type)
-/// or any underlying pipeline construction error.
-///
-/// [`BuiltPipeline`]: crate::pipeline::chains::BuiltPipeline
-/// [`ChainBuilder`]: crate::pipeline::chains::builder::ChainBuilder
-#[allow(clippy::needless_pass_by_value)]
-pub fn build_extract_chain(
-    spec: crate::pipeline::chains::ChainSpec,
-) -> Result<crate::pipeline::chains::BuiltPipeline> {
-    use crate::pipeline::chains::{Stage, builder::StagePosition};
-    let mut chain = crate::pipeline::chains::builder::ChainBuilder::new(&spec)?;
-    chain.add_source()?;
-    chain.add_stage(Stage::Extract, StagePosition::Terminal)?;
-    chain.add_sink()?;
-    chain.build()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

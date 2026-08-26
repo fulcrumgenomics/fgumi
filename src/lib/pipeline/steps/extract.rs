@@ -4,10 +4,10 @@
 //! [`BamTemplateBatch`] (N `Template`s) by:
 //!
 //! 1. Applying read structures to each `FastqRecord` in the template,
-//!    yielding a combined [`FastqSet`](crate::fastq::FastqSet).
-//! 2. Calling [`make_raw_records_from_fastq_set`] to produce
+//!    yielding a combined [`FastqSet`].
+//! 2. Calling `make_raw_records_from_fastq_set` to produce
 //!    `Vec<RawRecord>`.
-//! 3. Building a [`Template`](crate::template::Template) via
+//! 3. Building a [`Template`] via
 //!    [`Template::from_records`].
 //!
 //! The step is `Parallel` (closure-driven via [`ProcessOrdered`]) and
@@ -31,7 +31,7 @@ use crate::template::Template;
 ///
 /// Each input batch's `FastqTemplate`s are independently converted: read
 /// structures are applied, UMI/barcode tags are extracted via
-/// [`make_raw_records_from_fastq_set`], and the resulting `RawRecord`s are
+/// `make_raw_records_from_fastq_set`, and the resulting `RawRecord`s are
 /// assembled into `Template`s.
 ///
 /// The returned step preserves batch ordering (output ordinal ==
@@ -355,6 +355,35 @@ mod tests {
         let err = extract_batch(&read_structures, &opts, &emitted, &batch)
             .expect_err("record-count mismatch must return Err, not truncate");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "mismatch must surface as InvalidData");
+        assert!(
+            err.to_string().contains("internal invariant violated"),
+            "error must be framed as an internal invariant: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_batch_errors_on_record_surplus() {
+        // Mirror of the shortfall case: a template carrying MORE records than
+        // there are read structures. The guard rejects both directions, so a
+        // future rewrite to a one-sided check (`records.len() < structures.len()`)
+        // must fail here — the surplus direction is tested independently.
+        let read_structures = vec!["5T".parse::<ReadStructure>().unwrap(); 2];
+        let opts = default_extract_opts();
+        let emitted = AtomicU64::new(0);
+
+        let long_template = FastqTemplate {
+            name: b"read0".to_vec(),
+            records: vec![
+                fq_record("read0", "ACGTG"),
+                fq_record("read0", "ACGTG"),
+                fq_record("read0", "ACGTG"),
+            ],
+        };
+        let batch = FastqTemplateBatch::new(0, vec![long_template]);
+
+        let err = extract_batch(&read_structures, &opts, &emitted, &batch)
+            .expect_err("record-count surplus must return Err, not ignore the extra records");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "surplus must surface as InvalidData");
         assert!(
             err.to_string().contains("internal invariant violated"),
             "error must be framed as an internal invariant: {err}"

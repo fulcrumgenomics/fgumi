@@ -4,10 +4,8 @@
 //! Phase 3 (T3a.5) lifts that logic into
 //! [`crate::pipeline::chains::builder::ChainBuilder`]; this module
 //! now holds the clip-specific types and step factories that the builder
-//! imports: [`ClipAtomicMetrics`], [`ClipFinalizeHook`], and the two
+//! imports: `ClipAtomicMetrics`, `ClipFinalizeHook`, and the two
 //! step-factory functions used by `ChainBuilder::add_clip`.
-//!
-//! [`build_clip_chain`] shrinks to a ~10-line delegate.
 
 use std::io;
 use std::sync::Arc;
@@ -18,8 +16,7 @@ use log::info;
 
 use crate::clipper::RawRecordClipper;
 use crate::logging::OperationTimer;
-use crate::pipeline::chains::builder::ChainBuilder;
-use crate::pipeline::chains::{BuiltPipeline, ChainSpec, FinalizeHook};
+use crate::pipeline::chains::FinalizeHook;
 use crate::pipeline::steps::process::{ProcessOrdered, process_ordered};
 use crate::pipeline::steps::serialize::SerializeBamRecords;
 use crate::pipeline::steps::types::BamTemplateBatch;
@@ -34,7 +31,7 @@ use fgumi_raw_bam::RawRecord;
 /// the `ClipTemplates` step; each closure call adds its per-batch counts
 /// via `fetch_add(_, Relaxed)`.
 ///
-/// `pub(crate)` so [`ChainBuilder`] can construct and pass it to the step
+/// `pub(crate)` so `ChainBuilder` can construct and pass it to the step
 /// factories and the finalize hook in `add_clip`.
 pub(crate) struct ClipAtomicMetrics {
     pub(crate) total_templates: AtomicU64,
@@ -59,7 +56,7 @@ impl Default for ClipAtomicMetrics {
 /// Post-pipeline finalize hook for clip. Reads atomic counters, logs
 /// the summary banner, and calls `timer.log_completion`.
 ///
-/// `pub(crate)` so [`ChainBuilder`] can construct and register it in
+/// `pub(crate)` so `ChainBuilder` can construct and register it in
 /// `add_clip`.
 pub(crate) struct ClipFinalizeHook {
     pub(crate) metrics: Arc<ClipAtomicMetrics>,
@@ -102,7 +99,7 @@ impl FinalizeHook for ClipFinalizeHook {
 /// Bundles all the cloned scalars and Arcs the closure needs so `add_clip`
 /// can prepare them once and hand them off cleanly.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_clip`] and
+/// `pub(crate)` — consumed only by `ChainBuilder::add_clip` and
 /// [`build_clip_process_step`].
 ///
 /// The five boolean fields reflect the five independent clipping control
@@ -131,7 +128,7 @@ pub(crate) struct ClipProcessCaptures {
 /// emitting a fresh [`BamTemplateBatch`] carrying the same `batch_serial`
 /// so downstream order is preserved.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_clip`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_clip`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_clip_process_step(
     limit_bytes: u64,
@@ -287,32 +284,7 @@ pub(crate) fn build_clip_process_step(
 /// for `Intermediate` the chain tail stays as [`BamTemplateBatch`] for the
 /// next stage's input.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_clip`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_clip`.
 pub(crate) fn build_clip_serialize_step(limit_bytes: u64) -> SerializeBamRecords {
     SerializeBamRecords::new(limit_bytes)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// build_clip_chain — thin delegate (Phase 3 T3a.5)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Build a [`BuiltPipeline`] for a clip-only chain.
-///
-/// Delegates to [`ChainBuilder`]. The full step sequence lives in
-/// [`ChainBuilder`]'s `add_clip` method in
-/// [`crate::pipeline::chains::builder`].
-///
-/// # Errors
-///
-/// Returns input-validation errors (reference FASTA missing, no clipping
-/// operation requested, `--metrics` + `--threads` conflict, etc.), or any
-/// underlying pipeline construction error.
-#[allow(clippy::needless_pass_by_value)]
-pub fn build_clip_chain(spec: ChainSpec) -> Result<BuiltPipeline> {
-    use crate::pipeline::chains::{Stage, builder::StagePosition};
-    let mut chain = ChainBuilder::new(&spec)?;
-    chain.add_source()?;
-    chain.add_stage(Stage::Clip, StagePosition::Terminal)?;
-    chain.add_sink()?;
-    chain.build()
 }

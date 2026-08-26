@@ -412,7 +412,7 @@ impl std::fmt::Display for AlignerPreset {
 impl AlignerPreset {
     /// Default binary name (without path) for this preset. Also the
     /// kebab-case CLI value (`bwa`, `bwa-mem3`). Internal helper —
-    /// callers outside this module should use [`Display`] instead.
+    /// callers outside this module should use [`Display`](std::fmt::Display) instead.
     #[must_use]
     pub(crate) fn binary_name(self) -> &'static str {
         match self {
@@ -454,8 +454,13 @@ impl AlignerPreset {
     ///   When `Some`, replaces the preset's default binary name; when
     ///   `None`, the bare binary name is used and the shell resolves it
     ///   via `PATH`.
+    // `pub(crate)`, not `pub`: this interpolates `reference` / `binary_override`
+    // into a string later run via `/bin/bash -c`, and it does not itself validate
+    // those paths — it trusts that `validate` (which runs `check_shell_safe_path`)
+    // was called first. Restricting the method to in-crate callers keeps a direct
+    // external caller from bypassing that validation and injecting shell syntax.
     #[must_use]
-    pub fn build_command(
+    pub(crate) fn build_command(
         self,
         reference: &Path,
         threads: usize,
@@ -641,7 +646,7 @@ pub const DEFAULT_ALIGNER_CHUNK_SIZE: u64 = 150_000_000;
 /// Annotated with `#[multi_options("aligner", "Aligner Options")]` so
 /// `runall` exposes each field as `--aligner::<flag>` via the generated
 /// `MultiAlignerOptions` companion struct. Mutual-exclusion between
-/// `preset` and `command` is enforced inside [`Self::resolve`] rather
+/// `preset` and `command` is enforced inside `Self::resolve` rather
 /// than at clap-parse time — the macro doesn't rewrite clap's
 /// `conflicts_with` field-name references when the prefixed identifiers
 /// shift, so we validate logically after `MultiAlignerOptions::validate`.
@@ -649,9 +654,9 @@ pub const DEFAULT_ALIGNER_CHUNK_SIZE: u64 = 150_000_000;
 /// Field shapes:
 /// - `preset` — `Option<AlignerPreset>` so clap parses it as
 ///   `--aligner::preset {bwa-mem3|bwa}` (no default; if unset and
-///   `command` is also unset, [`Self::resolve`] errors).
+///   `command` is also unset, `Self::resolve` errors).
 /// - `command` — `Option<String>` for the free-form mode.
-/// - `threads` — `Option<usize>` so [`Self::resolve`] can default it
+/// - `threads` — `Option<usize>` so `Self::resolve` can default it
 ///   from `std::thread::available_parallelism()` at runtime (the macro
 ///   can't represent "all cores" as a const default).
 /// - `chunk_size` — `u64` with a const default; drives the `-K` flag
@@ -951,10 +956,12 @@ mod tests {
         proc.wait().expect("process should exit successfully");
     }
 
-    /// Spawn a command that writes to both stdout and stderr; verify
-    /// both are captured.
+    /// Spawn a command that writes to both stdout and stderr; verify the stderr
+    /// relay does not corrupt or interleave into stdout. The stderr ring itself
+    /// is pinned by `test_nonzero_exit_surfaces_stderr`, since `wait()` discards
+    /// the ring on a successful exit.
     #[test]
-    fn test_stderr_capture() {
+    fn test_stderr_does_not_leak_into_stdout() {
         let mut proc = AlignerProcess::spawn("bash -c 'echo err >&2; echo out'", 10)
             .expect("spawn should succeed");
 

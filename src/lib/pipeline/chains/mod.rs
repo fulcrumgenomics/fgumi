@@ -1,11 +1,3 @@
-// TEMPORARY (go-green tracking): this dormant chain-builder layer still has
-// unresolved intra-doc links to not-yet-in-scope items across the subtree
-// (e.g. `DecompressedBlock`, `DecodeRecords`, `ChainBuilder::build`). They are
-// repaired per-cluster as each command/step is reviewed; this blanket allow is
-// removed in the final go-green doc pass once `cargo ci-doc` is clean. Do NOT
-// add new broken links under its cover.
-#![allow(rustdoc::broken_intra_doc_links)]
-
 //! Unified chain-builder API for the typed-step pipeline framework.
 //!
 //! Single declarative entry point — [`build_for`] — that constructs a
@@ -42,9 +34,8 @@ pub mod build;
 pub use build::build_for;
 
 pub mod builder;
-pub use builder::ChainBuilder;
 
 pub mod build_helpers;
-pub use build_helpers::build_pipeline_config_for_chain;
+pub(crate) use build_helpers::build_pipeline_config_for_chain;
 
 pub mod commands;

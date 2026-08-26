@@ -4,16 +4,14 @@
 //! Phase 3 (T3a.8) lifts that logic into
 //! [`crate::pipeline::chains::builder::ChainBuilder`]; this module
 //! now holds the simplex-specific types and step factory that the builder
-//! imports: [`SimplexFinalizeHook`] and the `build_simplex_consensus_step_with_rejects` / `build_simplex_consensus_step_kept_only` factories, used
+//! imports: `SimplexFinalizeHook` and the `build_simplex_consensus_step_with_rejects` / `build_simplex_consensus_step_kept_only` factories, used
 //! by `ChainBuilder::add_simplex`.
-//!
-//! [`build_simplex_chain`] shrinks to a ~10-line delegate.
 //!
 //! Mirrors the dedup (6423252), filter (8eead93), clip (8e95428), group
 //! (d371d84) reference migrations.
 //!
 //! This module supplies the chain-builder pieces for the simplex stage; the
-//! chain is constructed via [`ChainBuilder`] /
+//! chain is constructed via `ChainBuilder` /
 //! [`crate::pipeline::chains::build::build_for`]. It is not yet wired as
 //! `Simplex::execute`'s live path.
 
@@ -36,8 +34,7 @@ use crate::overlapping_consensus::{
     apply_overlapping_consensus,
 };
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::pipeline::chains::builder::ChainBuilder;
-use crate::pipeline::chains::{BuiltPipeline, ChainSpec, FinalizeHook};
+use crate::pipeline::chains::FinalizeHook;
 use crate::pipeline::core::outputs::OrderedBytesTuple2;
 use crate::pipeline::core::step::Step;
 use crate::pipeline::steps::group::mi::BatchedMiGroups;
@@ -57,7 +54,7 @@ use crate::vanilla_consensus_caller::{VanillaUmiConsensusCaller, VanillaUmiConse
 /// Merged into final aggregates after the pipeline completes; one instance
 /// per worker slot (see [`PerThreadAccumulator`]).
 ///
-/// `pub(crate)` so [`ChainBuilder`] can construct it in `add_simplex`.
+/// `pub(crate)` so `ChainBuilder` can construct it in `add_simplex`.
 #[derive(Default)]
 pub(crate) struct CollectedSimplexMetrics {
     /// Consensus calling statistics.
@@ -93,7 +90,7 @@ impl crate::pipeline::core::item::HeapSize for ConsensusState {}
 /// (if enabled), logs the summary banner, finalizes the rejects writer,
 /// and calls `timer.log_completion`.
 ///
-/// `pub(crate)` so [`ChainBuilder`] can construct and register it in
+/// `pub(crate)` so `ChainBuilder` can construct and register it in
 /// `add_simplex`.
 pub(crate) struct SimplexFinalizeHook {
     pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedSimplexMetrics>>,
@@ -166,7 +163,7 @@ impl FinalizeHook for SimplexFinalizeHook {
 /// Bundles all the cloned scalars and Arcs the closure needs so `add_simplex`
 /// can prepare them once and hand them off cleanly.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_simplex`] and
+/// `pub(crate)` — consumed only by `ChainBuilder::add_simplex` and
 /// [`build_simplex_consensus_step_with_rejects`] / [`build_simplex_consensus_step_kept_only`].
 pub(crate) struct SimplexConsensusCaptures {
     pub(crate) track_rejects: bool,
@@ -310,7 +307,7 @@ fn run_simplex_consensus_batch(
 /// branch 0 carries the consensus `DecompressedBlock`, branch 1 carries the
 /// rejects `DecompressedBlock`. Parallel, `ByItemOrdinal`.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_simplex`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_simplex`.
 pub(crate) fn build_simplex_consensus_step_with_rejects(
     limit_bytes: u64,
     cap: SimplexConsensusCaptures,
@@ -381,7 +378,7 @@ pub(crate) fn build_simplex_consensus_step_with_rejects(
 /// produced; the framework has no public discard sink, so omitting the rejects
 /// branch requires this single-output variant (mirrors `correct_step_kept_only`).
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_simplex`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_simplex`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_simplex_consensus_step_kept_only(
     limit_bytes: u64,
@@ -436,28 +433,4 @@ pub(crate) fn build_simplex_consensus_step_kept_only(
         init,
         body,
     )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// build_simplex_chain — thin delegate (Phase 3 T3a.8)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Build a [`BuiltPipeline`] for a simplex-only chain.
-///
-/// Delegates to [`ChainBuilder`]. The full step sequence lives in
-/// [`ChainBuilder`]'s `add_simplex` method in
-/// [`crate::pipeline::chains::builder`].
-///
-/// # Errors
-///
-/// Returns input-validation errors (missing reference for methylation mode,
-/// etc.) or any underlying pipeline construction error.
-#[allow(clippy::needless_pass_by_value)]
-pub fn build_simplex_chain(spec: ChainSpec) -> Result<BuiltPipeline> {
-    use crate::pipeline::chains::{Stage, builder::StagePosition};
-    let mut chain = ChainBuilder::new(&spec)?;
-    chain.add_source()?;
-    chain.add_stage(Stage::Simplex, StagePosition::Terminal)?;
-    chain.add_sink()?;
-    chain.build()
 }

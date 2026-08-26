@@ -1816,7 +1816,7 @@ impl CorrectOptions {
     ///
     /// This is the runall/chain-builder validator. It is **not yet wired to the
     /// standalone `fgumi correct` CLI**, which validates via its own
-    /// [`CorrectUmis::validate`] and — unlike this — still accepts
+    /// `CorrectUmis::validate` and — unlike this — still accepts
     /// `--min-distance 0` (fgbio parity; `check_umi_distances` early-returns on
     /// it, matching `CorrectUmis.scala:180`). The follow-up EC-C2/EC-C3 commits
     /// will plumb this into runall via the `MultiCorrectOptions::validate()`
@@ -1846,7 +1846,8 @@ impl CorrectOptions {
     }
 }
 
-/// Log line emitted by `build_correct_chain` on entry.
+/// Log line emitted when the chain builder wires the typed-step correct path
+/// (the log site lives in `pipeline::chains::builder`).
 /// Pinned as a `pub const` so integration tests that assert the
 /// typed-step path was taken share a single source of truth with the
 /// log site and cannot drift. Mirrors `commands::zipper::NEW_PIPELINE_START_LOG`.

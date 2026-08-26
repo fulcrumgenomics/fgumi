@@ -4,10 +4,8 @@
 //! Phase 3 (T3a.7) lifts that logic into
 //! [`crate::pipeline::chains::builder::ChainBuilder`]; this module
 //! now holds the group-specific types and step factories that the builder
-//! imports: [`GroupFinalizeHook`] and the three step-factory functions used
+//! imports: `GroupFinalizeHook` and the three step-factory functions used
 //! by `ChainBuilder::add_group`.
-//!
-//! [`build_group_chain`] shrinks to a ~10-line delegate.
 //!
 //! Mirrors the dedup (6423252), filter (8eead93), clip (8e95428) reference
 //! migrations.
@@ -26,8 +24,7 @@ use crate::commands::group::{
 use crate::grouper::{ProcessedPositionGroup, build_templates_from_records};
 use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::pipeline::chains::builder::ChainBuilder;
-use crate::pipeline::chains::{BuiltPipeline, ChainSpec, FinalizeHook};
+use crate::pipeline::chains::FinalizeHook;
 use crate::pipeline::steps::group::position::{
     BatchedProcessedPositionGroups, BatchedRawPositionGroups,
 };
@@ -53,7 +50,7 @@ use fgumi_umi::IndexThreshold;
 /// outputs), logs the UMI grouping summary banner, and calls
 /// `timer.log_completion`.
 ///
-/// `pub(crate)` so [`ChainBuilder`] can construct and register it in
+/// `pub(crate)` so `ChainBuilder` can construct and register it in
 /// `add_group`.
 pub(crate) struct GroupFinalizeHook {
     pub(crate) accumulators: Arc<PerThreadAccumulator<GroupMetricsAccumulator>>,
@@ -136,7 +133,7 @@ impl FinalizeHook for GroupFinalizeHook {
 /// templates, assigns UMI groups, tracks per-thread family-size and filter
 /// metrics, and emits [`BatchedProcessedPositionGroups`].
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_group`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_group`.
 #[allow(clippy::type_complexity, clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn build_group_process_step(
     limit_bytes: u64,
@@ -312,7 +309,7 @@ pub(crate) fn build_group_process_step(
 /// `BatchedProcessedDedupGroups`), so this factory is distinct from
 /// `chains::commands::dedup::build_mi_assign_step`.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_group`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_group`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_group_mi_assign_step(
     limit_bytes: u64,
@@ -378,7 +375,7 @@ fn assign_mi_offsets(
 /// for `Intermediate` the chain tail stays as [`BatchedProcessedPositionGroups`]
 /// for the next stage's input.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_group`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_group`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_group_serialize_step(
     limit_bytes: u64,
@@ -395,36 +392,6 @@ pub(crate) fn build_group_serialize_step(
     impl Fn() -> SerializeState + Send + Sync + 'static,
 > {
     build_serialize_processed_groups_step(limit_bytes, assign_tag_bytes, progress_counter)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// build_group_chain — thin delegate (Phase 3 T3a.7)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Build a [`BuiltPipeline`] for a group-only chain.
-///
-/// Delegates to [`ChainBuilder`]. The full step sequence lives in
-/// [`ChainBuilder`]'s `add_group` method in
-/// [`crate::pipeline::chains::builder`].
-///
-/// The live `group --threads` path is served by the chain builder via
-/// [`crate::pipeline::chains::build::build_for`] (which `GroupReadsByUmi::execute`
-/// calls when `--threads` is set); with `--threads` unset the command still uses
-/// its single-threaded executor. This `build_group_chain` is the group-only
-/// chain delegate.
-///
-/// # Errors
-///
-/// Returns input-validation errors (sort-order mismatch, strategy/UMI
-/// incompatibility) or any underlying pipeline construction error.
-#[allow(clippy::needless_pass_by_value)]
-pub fn build_group_chain(spec: ChainSpec) -> Result<BuiltPipeline> {
-    use crate::pipeline::chains::{Stage, builder::StagePosition};
-    let mut chain = ChainBuilder::new(&spec)?;
-    chain.add_source()?;
-    chain.add_stage(Stage::Group, StagePosition::Terminal)?;
-    chain.add_sink()?;
-    chain.build()
 }
 
 #[cfg(test)]

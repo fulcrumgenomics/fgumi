@@ -30,7 +30,7 @@ impl FinalizeHook for PipelineStatsFinalizeHook {
 }
 
 /// Logs wall-time elapsed since the hook was constructed. One instance is
-/// registered per chain — by [`ChainBuilder::build`], not by individual
+/// registered per chain — by `ChainBuilder::build`, not by individual
 /// `add_<stage>` methods — so for a fused multi-stage chain like
 /// `[Group, Simplex]` a single line is logged rather than two lines each
 /// reporting the full pipeline duration.
@@ -54,7 +54,7 @@ impl StageTimingFinalizeHook {
     }
 
     /// Construct the hook with an owned `chain_label` string and `start`
-    /// captured at call time. [`ChainBuilder::build`] uses this form,
+    /// captured at call time. `ChainBuilder::build` uses this form,
     /// generating the label from `spec.stages` (e.g. `"dedup"` or
     /// `"group→simplex"`).
     #[must_use]
@@ -268,6 +268,29 @@ mod tests {
             on_success.load(Ordering::SeqCst),
             0,
             "success hook must not run after a failure"
+        );
+    }
+
+    #[test]
+    fn drain_finalize_short_circuits_success_hooks_on_first_failure() {
+        // Unlike the always-run list (which drains fully), the success-gated
+        // hooks short-circuit: the first to error stops the rest. Pin that, so a
+        // change to `?` semantics (e.g. draining all success hooks) is caught —
+        // the second hook must NOT run, and the first hook's error propagates.
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let result = drain_finalize(
+            Ok(()),
+            vec![],
+            vec![counting_hook(&first, true), counting_hook(&second, false)],
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("hook failed"));
+        assert_eq!(first.load(Ordering::SeqCst), 1, "the first success hook ran");
+        assert_eq!(
+            second.load(Ordering::SeqCst),
+            0,
+            "the second success hook must be short-circuited by the first's failure"
         );
     }
 

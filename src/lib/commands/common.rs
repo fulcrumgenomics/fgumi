@@ -1694,10 +1694,7 @@ pub fn validate_index_threshold(
 /// dispatch) so users see why their flags might appear to be ignored.
 /// `--pipeline-stats` is honored separately via `attach_new_pipeline_stats`;
 /// this only warns about the others.
-pub(crate) fn warn_unwired_pipeline_flags(
-    scheduler_opts: &SchedulerOptions,
-    queue_memory: &QueueMemoryOptions,
-) {
+pub(crate) fn warn_unwired_pipeline_flags(scheduler_opts: &SchedulerOptions) {
     // --scheduler selects a legacy unified-pipeline scheduler strategy that the
     // typed-step chain engine does not consume, so setting it (a hidden dev flag)
     // has no effect on any chain-backed command. Mirror the --deadlock-recover
@@ -1726,12 +1723,10 @@ pub(crate) fn warn_unwired_pipeline_flags(
              does not occur"
         );
     }
-    // `--queue-memory` is now honored: the total bytes flow into
-    // `PipelineConfig::queue_memory_total`, which both seeds the
-    // initial per-queue budget AND enables the rebalancer that
-    // shifts budget between consistently-full / consistently-empty
-    // queues at runtime. No warning needed.
-    let _ = queue_memory; // signal intentional use; dead-code lint dampener
+    // `--queue-memory` needs no warning here: it is honored by the chain
+    // engine — the total bytes flow into `PipelineConfig::queue_memory_total`,
+    // which seeds the initial per-queue budget AND enables the runtime
+    // rebalancer that shifts budget between consistently-full / empty queues.
 }
 
 // ==== ported from feat-runall for the chain builder (R2) ====

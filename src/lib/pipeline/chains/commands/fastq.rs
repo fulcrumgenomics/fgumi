@@ -3,7 +3,7 @@
 //!
 //! The encode step consumes the [`DecodedRecordBatch`] tail produced by the
 //! BAM source preamble and emits a [`DecompressedBlock`] of FASTQ text per
-//! batch, reusing [`write_fastq_record`] (the same encoder the standalone
+//! batch, reusing `write_fastq_record` (the same encoder the standalone
 //! command used). It is a `Parallel` step, so the work-stealing pool spreads
 //! the encode across N workers; `add_sink` then routes the byte tail to a
 //! (optionally BGZF-compressing) raw-file/stdout writer.

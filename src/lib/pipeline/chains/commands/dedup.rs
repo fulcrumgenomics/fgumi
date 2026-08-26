@@ -4,10 +4,8 @@
 //! Phase 3 (T3a.3) lifts that logic into
 //! [`crate::pipeline::chains::builder::ChainBuilder`]; this module
 //! now holds the dedup-specific types and step factories that the builder
-//! imports: [`DedupSerializeState`], [`DedupFinalizeHook`], and the three
+//! imports: `DedupSerializeState`, `DedupFinalizeHook`, and the three
 //! step-factory functions used by `ChainBuilder::add_dedup`.
-//!
-//! [`build_dedup_chain`] shrinks to a ~10-line delegate.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,8 +19,7 @@ use crate::commands::dedup::{
 };
 use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::pipeline::chains::builder::ChainBuilder;
-use crate::pipeline::chains::{BuiltPipeline, ChainSpec, FinalizeHook};
+use crate::pipeline::chains::FinalizeHook;
 use crate::pipeline::steps::group::position::BatchedRawPositionGroups;
 use crate::pipeline::steps::process::{
     MiAssign, ProcessOrdered, ProcessWithWorkerState, mi_assign, process_ordered,
@@ -40,7 +37,7 @@ use fgumi_raw_bam::RawRecordView;
 /// `clippy::items_after_statements` lint that fires when a struct is defined
 /// after executable statements in a function body.
 ///
-/// `pub(crate)` so [`ChainBuilder`] can reference it when constructing the
+/// `pub(crate)` so `ChainBuilder` can reference it when constructing the
 /// dedup step sequence in `add_dedup`.
 pub(crate) struct DedupSerializeState {
     scratch: Vec<u8>,
@@ -78,7 +75,7 @@ impl crate::pipeline::core::item::HeapSize for DedupSerializeState {}
 /// summary banner, checks for missing `tc` tags, and calls
 /// `timer.log_completion`.
 ///
-/// `pub(crate)` so [`ChainBuilder`] can construct and register it in
+/// `pub(crate)` so `ChainBuilder` can construct and register it in
 /// `add_dedup`.
 pub(crate) struct DedupFinalizeHook {
     pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedDedupMetrics>>,
@@ -184,7 +181,7 @@ impl FinalizeHook for DedupFinalizeHook {
 /// position group through [`process_position_group`] and accumulates per-thread
 /// metrics.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_dedup`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_dedup`.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn build_process_step(
     limit_bytes: u64,
@@ -245,7 +242,7 @@ pub(crate) fn build_process_step(
 /// Build the `MiAssignDedup` step: serial, `ByItemOrdinal`, assigns
 /// monotonically increasing MI offsets to each batch.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_dedup`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_dedup`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_mi_assign_step(
     limit_bytes: u64,
@@ -277,7 +274,7 @@ pub(crate) fn build_mi_assign_step(
 ///
 /// # Errors
 ///
-/// Returns an [`io::Error`] if the cumulative MI counter would exceed
+/// Returns an `io::Error` if the cumulative MI counter would exceed
 /// [`u64::MAX`].
 fn assign_mi_offsets(
     next_mi: &mut u64,
@@ -301,11 +298,11 @@ fn assign_mi_offsets(
 
 /// Build the `DedupSerialize` step: parallel, `ByItemOrdinal`, serializes
 /// each processed batch to raw BAM bytes with MI tags applied. Only included
-/// in the chain when the stage is [`StagePosition::Terminal`]; for
-/// [`StagePosition::Intermediate`] the chain tail stays as
+/// in the chain when the stage is `StagePosition::Terminal`; for
+/// `StagePosition::Intermediate` the chain tail stays as
 /// [`BatchedProcessedDedupGroups`] for the next stage's input.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_dedup`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_dedup`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_serialize_step(
     limit_bytes: u64,
@@ -379,26 +376,6 @@ pub(crate) fn build_serialize_step(
             Ok(DecompressedBlock { batch_serial, bytes: output })
         },
     )
-}
-
-/// Build a [`BuiltPipeline`] for a dedup-only chain.
-///
-/// Delegates to [`ChainBuilder`]. The full step sequence lives in
-/// [`ChainBuilder`]'s `add_dedup` method in
-/// [`crate::pipeline::chains::builder`].
-///
-/// # Errors
-///
-/// Returns input-validation errors (BAM not template-coordinate sorted,
-/// etc.), or any underlying pipeline construction error.
-#[allow(clippy::needless_pass_by_value)]
-pub fn build_dedup_chain(spec: ChainSpec) -> Result<BuiltPipeline> {
-    use crate::pipeline::chains::{Stage, builder::StagePosition};
-    let mut chain = ChainBuilder::new(&spec)?;
-    chain.add_source()?;
-    chain.add_stage(Stage::Dedup, StagePosition::Terminal)?;
-    chain.add_sink()?;
-    chain.build()
 }
 
 #[cfg(test)]

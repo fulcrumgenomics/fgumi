@@ -3,7 +3,7 @@
 //! The stage-by-stage construction lives in
 //! [`crate::pipeline::chains::builder::ChainBuilder`]'s `add_sort` method.
 //! This module provides the standalone-sort summary finalize hook
-//! ([`SortSummaryFinalizeHook`]) and the [`IndexBamFinalizeHook`] BAI indexer
+//! (`SortSummaryFinalizeHook`) and the `IndexBamFinalizeHook` BAI indexer
 //! (defined locally — see its doc), which `add_sort` registers for a
 //! `SinkSpec::BamWithIndex` request.
 //!
@@ -32,7 +32,7 @@ use crate::pipeline::chains::FinalizeHook;
 /// Reads the `SortMerge` stats slot (records processed/written + spill-chunk
 /// count) and logs the `=== Summary ===` block, then the timer's
 /// records-per-second completion line. Registered by
-/// [`ChainBuilder::add_sort`] only for a sole-`[Stage::Sort]` chain; the fused
+/// `ChainBuilder::add_sort` only for a sole-`[Stage::Sort]` chain; the fused
 /// `runall` path leaves the slot unset and gets no summary block.
 pub(crate) struct SortSummaryFinalizeHook {
     pub(crate) stats_slot: Arc<Mutex<Option<fgumi_sort::SortStats>>>,

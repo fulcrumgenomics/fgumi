@@ -4,17 +4,15 @@
 //! Phase 3 (T3a.10) lifts that logic into
 //! [`crate::pipeline::chains::builder::ChainBuilder`]; this module
 //! now holds the codec-specific types and step factory that the builder
-//! imports: [`CodecFinalizeHook`] and the `build_codec_consensus_step_with_rejects` / `build_codec_consensus_step_kept_only` factories, used
+//! imports: `CodecFinalizeHook` and the `build_codec_consensus_step_with_rejects` / `build_codec_consensus_step_kept_only` factories, used
 //! by `ChainBuilder::add_codec`.
-//!
-//! [`build_codec_chain`] shrinks to a ~10-line delegate.
 //!
 //! Mirrors duplex (2dc8bd8). Codec's chain is structurally the same with a
 //! different consensus caller and no MI-tag transform, overlapping consensus,
 //! or methylation mode — matching fgbio's `CallCodecConsensusReads` behaviour.
 //!
 //! This is the chain-builder construction path for the codec stage, consumed via
-//! [`ChainBuilder`] / [`crate::pipeline::chains::build::build_for`]. It is not
+//! `ChainBuilder` / [`crate::pipeline::chains::build::build_for`]. It is not
 //! yet wired as `Codec::execute`'s live path.
 
 use std::io;
@@ -32,8 +30,7 @@ use crate::consensus_caller::ConsensusOutput;
 use crate::logging::OperationTimer;
 use crate::mi_group::MiGroup;
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::pipeline::chains::builder::ChainBuilder;
-use crate::pipeline::chains::{BuiltPipeline, ChainSpec, FinalizeHook};
+use crate::pipeline::chains::FinalizeHook;
 use crate::pipeline::core::outputs::OrderedBytesTuple2;
 use crate::pipeline::core::step::Step;
 use crate::pipeline::steps::group::mi::BatchedMiGroups;
@@ -52,7 +49,7 @@ use crate::pipeline::steps::types::DecompressedBlock;
 /// Merged into final aggregates after the pipeline completes; one instance
 /// per worker slot (see [`PerThreadAccumulator`]).
 ///
-/// `pub(crate)` so [`ChainBuilder`] can construct it in `add_codec`.
+/// `pub(crate)` so `ChainBuilder` can construct it in `add_codec`.
 #[derive(Default)]
 pub(crate) struct CollectedCodecMetrics {
     /// CODEC consensus calling statistics.
@@ -84,7 +81,7 @@ impl crate::pipeline::core::item::HeapSize for CodecState {}
 /// writes the optional stats file, logs the summary banner, finalizes
 /// the rejects writer, and calls `timer.log_completion`.
 ///
-/// `pub(crate)` so [`ChainBuilder`] can construct and register it in
+/// `pub(crate)` so `ChainBuilder` can construct and register it in
 /// `add_codec`.
 pub(crate) struct CodecFinalizeHook {
     pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedCodecMetrics>>,
@@ -150,7 +147,7 @@ impl FinalizeHook for CodecFinalizeHook {
 /// Bundles all the cloned scalars and Arcs the closure needs so `add_codec`
 /// can prepare them once and hand them off cleanly.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_codec`] and
+/// `pub(crate)` — consumed only by `ChainBuilder::add_codec` and
 /// [`build_codec_consensus_step_with_rejects`] / [`build_codec_consensus_step_kept_only`].
 pub(crate) struct CodecConsensusCaptures {
     pub(crate) track_rejects: bool,
@@ -270,7 +267,7 @@ fn run_codec_consensus_batch(
 /// Build the 2-output `CodecConsensus` step (used when `--rejects` is set):
 /// branch 0 = consensus, branch 1 = rejects.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_codec`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_codec`.
 pub(crate) fn build_codec_consensus_step_with_rejects(
     limit_bytes: u64,
     cap: CodecConsensusCaptures,
@@ -326,7 +323,7 @@ pub(crate) fn build_codec_consensus_step_with_rejects(
 /// is unset). The framework has no public discard sink, so omitting the rejects
 /// branch requires this single-output variant.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_codec`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_codec`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_codec_consensus_step_kept_only(
     limit_bytes: u64,
@@ -366,28 +363,4 @@ pub(crate) fn build_codec_consensus_step_kept_only(
         init,
         body,
     )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// build_codec_chain — thin delegate (Phase 3 T3a.10)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Build a [`BuiltPipeline`] for a codec-only chain.
-///
-/// Delegates to [`ChainBuilder`]. The full step sequence lives in
-/// [`ChainBuilder`]'s `add_codec` method in
-/// [`crate::pipeline::chains::builder`].
-///
-/// # Errors
-///
-/// Returns input-validation errors (missing file, etc.) or any underlying
-/// pipeline construction error.
-#[allow(clippy::needless_pass_by_value)]
-pub fn build_codec_chain(spec: ChainSpec) -> Result<BuiltPipeline> {
-    use crate::pipeline::chains::{Stage, builder::StagePosition};
-    let mut chain = ChainBuilder::new(&spec)?;
-    chain.add_source()?;
-    chain.add_stage(Stage::Codec, StagePosition::Terminal)?;
-    chain.add_sink()?;
-    chain.build()
 }

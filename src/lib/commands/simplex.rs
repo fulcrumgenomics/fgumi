@@ -333,7 +333,7 @@ impl SimplexOptions {
     /// Reconstruct the shared [`ConsensusCallingOptions`] from the inlined flat
     /// fields, so the chain builder can read `.consensus().error_rate_pre_umi`
     /// etc. `tie_rule` is stored resolved on `SimplexOptions`; convert it back to
-    /// the CLI-facing [`TieRuleArg`] via the 1:1 mapping.
+    /// the CLI-facing `TieRuleArg` via the 1:1 mapping.
     #[must_use]
     pub fn consensus(&self) -> ConsensusCallingOptions {
         ConsensusCallingOptions {

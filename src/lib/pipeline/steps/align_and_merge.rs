@@ -51,7 +51,7 @@
 //! whichever worker dispatches AAM amortize merge across the same
 //! `OUT_CHAN_DEPTH` of in-flight batches.
 //!
-//! ## [`BatchToken`] / [`ZipperBatch`] protocol (index-based pairing)
+//! ## `BatchToken` / `ZipperBatch` protocol (index-based pairing)
 //!
 //! Pairing of unmapped templates with their alignments is **structural
 //! by index, not queryname**. The writer thread keeps a per-batch
@@ -244,8 +244,8 @@ pub fn in_flight_budget_for_chunk_size(chunk_size_bases: u64) -> u64 {
 /// than hanging.
 struct InFlightGate {
     budget: u64,
-    inner: std::sync::Mutex<GateInner>,
-    cond: std::sync::Condvar,
+    inner: Mutex<GateInner>,
+    cond: parking_lot::Condvar,
 }
 
 struct GateInner {
@@ -257,8 +257,8 @@ impl InFlightGate {
     fn new(budget: u64) -> Self {
         Self {
             budget,
-            inner: std::sync::Mutex::new(GateInner { in_flight: 0, consumer_gone: false }),
-            cond: std::sync::Condvar::new(),
+            inner: Mutex::new(GateInner { in_flight: 0, consumer_gone: false }),
+            cond: parking_lot::Condvar::new(),
         }
     }
 
@@ -266,14 +266,14 @@ impl InFlightGate {
     /// non-empty. Returns `false` if the consumer (reader) has gone — the
     /// caller (writer) should then stop.
     fn acquire(&self, n: u64) -> bool {
-        let mut g = self.inner.lock().expect("InFlightGate mutex poisoned");
+        let mut g = self.inner.lock();
         // Block while non-empty AND this reservation would exceed budget.
         // The `in_flight != 0` guard lets a single oversized batch through
         // when the gate is empty (it can't be split, so holding it is
         // unavoidable) — without it the writer would deadlock on a batch
         // larger than the whole budget.
         while !g.consumer_gone && g.in_flight != 0 && g.in_flight.saturating_add(n) > self.budget {
-            g = self.cond.wait(g).expect("InFlightGate mutex poisoned");
+            self.cond.wait(&mut g);
         }
         if g.consumer_gone {
             return false;
@@ -285,7 +285,7 @@ impl InFlightGate {
     /// Release `n` in-flight bytes (reader consumed a token) and wake the
     /// writer if it is blocked.
     fn release(&self, n: u64) {
-        let mut g = self.inner.lock().expect("InFlightGate mutex poisoned");
+        let mut g = self.inner.lock();
         g.in_flight = g.in_flight.saturating_sub(n);
         drop(g);
         self.cond.notify_all();
@@ -294,7 +294,7 @@ impl InFlightGate {
     /// Latch that the consumer (reader) has exited, so a blocked writer
     /// wakes and bails instead of hanging forever.
     fn mark_consumer_gone(&self) {
-        let mut g = self.inner.lock().expect("InFlightGate mutex poisoned");
+        let mut g = self.inner.lock();
         g.consumer_gone = true;
         drop(g);
         self.cond.notify_all();
@@ -624,7 +624,7 @@ impl AlignAndMergeStep {
 // ──────────────────────────────────────────────────────────────────────────
 
 /// Drain `in_rx` to the aligner's stdin as interleaved FASTQ, pushing
-/// one [`BatchToken`] per batch to `token_tx` so the reader can pair
+/// one `BatchToken` per batch to `token_tx` so the reader can pair
 /// alignments back by count.
 ///
 /// Lifecycle:
@@ -1272,10 +1272,10 @@ struct SamTemplateStream {
     /// the noodles SAM reader's `read_record_buf(&header, ...)` call
     /// can borrow it freely on each iteration.
     header: Arc<Header>,
-    /// Scratch [`RecordBuf`] reused across `read_record_buf` calls.
+    /// Scratch `RecordBuf` reused across `read_record_buf` calls.
     scratch: noodles::sam::alignment::RecordBuf,
     /// First record of the next template, encoded to `RawRecord`.
-    /// Stashed when [`next_template`] reads past the current
+    /// Stashed when `next_template` reads past the current
     /// template's last record.
     peeked: Option<fgumi_raw_bam::RawRecord>,
     name_buf: Vec<u8>,

@@ -458,11 +458,7 @@ impl FilterOptions {
     /// The [`BamPipelineConfig`] is *not* built here: the chain builder derives
     /// it from its [`crate::pipeline::chains::ChainSpec`], and the non-chain run
     /// builds it via [`Filter::build_filter_pipeline_config`].
-    pub(crate) fn setup_pipeline(
-        &self,
-        num_threads: usize,
-        _header: &Header,
-    ) -> Result<FilterPipelineSetup> {
+    pub(crate) fn setup_pipeline(&self, num_threads: usize) -> Result<FilterPipelineSetup> {
         let config = Arc::new(FilterConfig::new(
             &self.min_reads,
             &self.max_read_error_rate,
@@ -705,12 +701,8 @@ impl Filter {
     /// Build the shared filter config, reference, metrics queue, and progress
     /// counter. Delegates to [`FilterOptions::setup_pipeline`] so the chain
     /// builder and the non-chain run share one implementation.
-    pub(crate) fn setup_pipeline(
-        &self,
-        num_threads: usize,
-        header: &Header,
-    ) -> Result<FilterPipelineSetup> {
-        self.to_filter_options().setup_pipeline(num_threads, header)
+    pub(crate) fn setup_pipeline(&self, num_threads: usize) -> Result<FilterPipelineSetup> {
+        self.to_filter_options().setup_pipeline(num_threads)
     }
 
     /// Build the process closure captures. Delegates to
@@ -837,7 +829,7 @@ impl Filter {
         header: Header,
         track_rejects: bool,
     ) -> Result<u64> {
-        let setup = self.setup_pipeline(num_threads, &header)?;
+        let setup = self.setup_pipeline(num_threads)?;
         let pipeline_config = self.build_filter_pipeline_config(num_threads, &header)?;
         let ctx = self.process_captures(&setup, &header);
 
@@ -904,7 +896,7 @@ impl Filter {
         header: Header,
         track_rejects: bool,
     ) -> Result<u64> {
-        let setup = self.setup_pipeline(num_threads, &header)?;
+        let setup = self.setup_pipeline(num_threads)?;
         let pipeline_config = self.build_filter_pipeline_config(num_threads, &header)?;
         let ctx = self.process_captures(&setup, &header);
 

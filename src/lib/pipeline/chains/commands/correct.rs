@@ -4,9 +4,7 @@
 //! Phase 3 (T3a.11) lifts that logic into
 //! [`crate::pipeline::chains::builder::ChainBuilder`]; this module
 //! now holds the correct-specific types and step factories that the builder
-//! imports: [`CorrectFinalizeHook`] used by `ChainBuilder::add_correct`.
-//!
-//! [`build_correct_chain`] shrinks to a ~10-line delegate.
+//! imports: `CorrectFinalizeHook` used by `ChainBuilder::add_correct`.
 //!
 //! ## Four chain shapes
 //!
@@ -18,7 +16,7 @@
 //! - `(Sam,  true)`:  `[sam preamble]  → GroupByQueryname → correct_step_with_rejects` (same as Bam/true)
 //!
 //! The source preamble differences (BAM vs SAM) are handled by `add_source`
-//! in [`ChainBuilder`]; `add_correct` always receives a
+//! in `ChainBuilder`; `add_correct` always receives a
 //! `BamTemplateBatch`-typed tail (after `GroupByQueryname`).
 
 use std::sync::Arc;
@@ -34,8 +32,7 @@ use crate::commands::correct::{
 use crate::logging::OperationTimer;
 use crate::metrics::correct::UmiCorrectionMetrics;
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::pipeline::chains::builder::ChainBuilder;
-use crate::pipeline::chains::{BuiltPipeline, ChainSpec, FinalizeHook};
+use crate::pipeline::chains::FinalizeHook;
 
 /// Post-pipeline finalize hook for correct. Reduces per-thread metrics,
 /// writes the optional metrics TSV, logs summary + warn banners, enforces
@@ -44,7 +41,7 @@ use crate::pipeline::chains::{BuiltPipeline, ChainSpec, FinalizeHook};
 /// Mirrors the body of `CorrectUmis::finalize_correct_run`, extracted here so
 /// `BuiltPipeline::run` can call it after `Pipeline::run` returns.
 ///
-/// `pub(crate)` so [`ChainBuilder`] can construct and register it in
+/// `pub(crate)` so `ChainBuilder` can construct and register it in
 /// `add_correct`.
 pub(crate) struct CorrectFinalizeHook {
     pub(crate) metrics: Arc<PerThreadAccumulator<CollectedCorrectMetrics>>,
@@ -128,10 +125,6 @@ impl FinalizeHook for CorrectFinalizeHook {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// build_correct_chain — thin delegate
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Enforce the `--min-corrected` floor on the ratio of kept records.
 ///
 /// Errors when `records_written / total_records` falls below `min`. When no
@@ -161,25 +154,6 @@ fn check_min_corrected(records_written: u64, total_records: u64, min: f64) -> Re
         );
     }
     Ok(())
-}
-
-/// Build a [`BuiltPipeline`] for a correct-only chain.
-///
-/// Delegates to [`ChainBuilder`]. The full step sequence lives in
-/// [`ChainBuilder`]'s `add_correct` method in
-/// [`crate::pipeline::chains::builder`].
-///
-/// # Errors
-///
-/// Returns input-validation errors or any underlying pipeline construction error.
-#[allow(clippy::needless_pass_by_value)]
-pub fn build_correct_chain(spec: ChainSpec) -> Result<BuiltPipeline> {
-    use crate::pipeline::chains::{Stage, builder::StagePosition};
-    let mut chain = ChainBuilder::new(&spec)?;
-    chain.add_source()?;
-    chain.add_stage(Stage::Correct, StagePosition::Terminal)?;
-    chain.add_sink()?;
-    chain.build()
 }
 
 #[cfg(test)]

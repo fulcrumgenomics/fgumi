@@ -1917,7 +1917,7 @@ fn validate_template_record_count(
 ///
 /// - **Header-synthesis fields** (`sample`, `library`, `platform`,
 ///   `platform_unit`, `read_group_id`, `comments`) map directly to the
-///   corresponding `@RG` and `@CO` entries written by [`Extract::create_header`].
+///   corresponding `@RG` and `@CO` entries written by `Extract::create_header`.
 /// - **Behavior options** control tag output and name annotation in the same
 ///   way as the identically-named [`Extract`] CLI flags.
 ///
@@ -1972,11 +1972,11 @@ pub struct ExtractOptions {
     pub async_reader: bool,
 }
 
-/// Build raw BAM [`RawRecord`]s from a [`FastqSet`].
+/// Build raw BAM `RawRecord`s from a [`FastqSet`].
 ///
 /// This is the core extract logic: applies read structures (via the segments
 /// already present in `read_set`), extracts UMI / cell-barcode / sample-barcode
-/// tags, and produces one [`RawRecord`] per template segment. The caller wraps
+/// tags, and produces one `RawRecord` per template segment. The caller wraps
 /// the result in a [`crate::template::Template`] for the typed-step pipeline.
 ///
 /// KNOWN DUPLICATION — resolve in the extract WIRING PR: this is a third
@@ -1991,7 +1991,7 @@ pub struct ExtractOptions {
 ///
 /// Returns an error if the read set contains no template segments, or if a read
 /// name is 255 bytes or longer (via `try_build_record`).
-pub fn make_raw_records_from_fastq_set(
+pub(crate) fn make_raw_records_from_fastq_set(
     read_set: &FastqSet,
     opts: &ExtractOptions,
 ) -> Result<Vec<fgumi_raw_bam::RawRecord>> {
@@ -2155,7 +2155,7 @@ impl ExtractOptions {
     /// Validate that [`Self::single_tag`] does not collide with any of the
     /// SAM tags that the extractor emits internally.
     ///
-    /// This mirrors the check in [`Extract::validate`]; keeping both guards in
+    /// This mirrors the check in `Extract::validate`; keeping both guards in
     /// sync ensures that the error fires whether the caller constructs an
     /// `ExtractOptions` directly (chain path) or via the CLI struct (command path).
     ///

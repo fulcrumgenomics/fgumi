@@ -4,10 +4,8 @@
 //! Phase 3 (T3a.4) lifts that logic into
 //! [`crate::pipeline::chains::builder::ChainBuilder`]; this module
 //! now holds the filter-specific types and step factories that the builder
-//! imports: [`FilterFinalizeHook`] and the step-factory functions used by
+//! imports: `FilterFinalizeHook` and the step-factory functions used by
 //! `ChainBuilder::add_filter`.
-//!
-//! [`build_filter_chain`] shrinks to a ~10-line delegate.
 //!
 //! ## Four chain shapes
 //!
@@ -34,8 +32,7 @@ use log::info;
 use crate::commands::filter::{CollectedFilterMetrics, Filter, FilterProcessCaptures};
 use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::pipeline::chains::builder::ChainBuilder;
-use crate::pipeline::chains::{BuiltPipeline, ChainSpec, FinalizeHook};
+use crate::pipeline::chains::FinalizeHook;
 use crate::pipeline::steps::process::{
     Process2Ordered, ProcessOrdered, process_ordered, process2_ordered,
 };
@@ -45,21 +42,23 @@ use crate::pipeline::steps::types::{BamTemplateBatch, DecodedRecordBatch, Decomp
 // FilterFinalizeHook
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Post-pipeline finalize hook for filter. Reduces per-thread metrics,
-/// writes the optional stats file, and logs the summary banner.
+/// Post-pipeline finalize hook for filter. Reduces per-thread metrics and logs
+/// the summary banner. Registered on the **always-run** `finalize` list so the
+/// summary is reported even after a failure; the stats *file* is written by the
+/// success-only [`FilterStatsFinalizeHook`] instead, so a partial run never
+/// publishes counts.
 ///
-/// `pub(crate)` so [`ChainBuilder`] can construct and register it in
+/// `pub(crate)` so `ChainBuilder` can construct and register it in
 /// `add_filter`.
 pub(crate) struct FilterFinalizeHook {
     pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedFilterMetrics>>,
-    pub(crate) stats_path: Option<std::path::PathBuf>,
     pub(crate) has_rejects: bool,
     pub(crate) timer: OperationTimer,
 }
 
 impl FinalizeHook for FilterFinalizeHook {
     fn finalize(self: Box<Self>) -> Result<()> {
-        let FilterFinalizeHook { accumulators, stats_path, has_rejects, timer } = *self;
+        let FilterFinalizeHook { accumulators, has_rejects, timer } = *self;
 
         let mut total_reads = 0u64;
         let mut passed_reads = 0u64;
@@ -73,10 +72,6 @@ impl FinalizeHook for FilterFinalizeHook {
             total_bases_masked += m.total_bases_masked;
         }
 
-        if let Some(ref path) = stats_path {
-            write_filter_stats(path, total_reads, passed_reads, failed_reads)?;
-        }
-
         info!("Processed {total_reads} reads; kept {passed_reads} and rejected {failed_reads}");
         if has_rejects && failed_reads > 0 {
             info!("Wrote {failed_reads} rejected records to rejects file");
@@ -86,6 +81,33 @@ impl FinalizeHook for FilterFinalizeHook {
         timer.log_completion(total_reads);
 
         Ok(())
+    }
+}
+
+/// Success-only finalize hook that writes the `--filter::stats` file. Registered
+/// on `finalize_on_success` (not the always-run `finalize`) so a failed or
+/// partial run never publishes filter counts. Shares the accumulators with
+/// [`FilterFinalizeHook`] via `Arc`.
+pub(crate) struct FilterStatsFinalizeHook {
+    pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedFilterMetrics>>,
+    pub(crate) stats_path: std::path::PathBuf,
+}
+
+impl FinalizeHook for FilterStatsFinalizeHook {
+    fn finalize(self: Box<Self>) -> Result<()> {
+        let FilterStatsFinalizeHook { accumulators, stats_path } = *self;
+
+        let mut total_reads = 0u64;
+        let mut passed_reads = 0u64;
+        let mut failed_reads = 0u64;
+        for slot in accumulators.slots() {
+            let m = slot.lock();
+            total_reads += m.total_records;
+            passed_reads += m.passed_records;
+            failed_reads += m.failed_records;
+        }
+
+        write_filter_stats(&stats_path, total_reads, passed_reads, failed_reads)
     }
 }
 
@@ -148,12 +170,35 @@ pub(crate) fn process_record_raw_call(
 // in `chains::commands::dedup`).
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Emit the per-batch progress milestone and fold this batch's counts into the
+/// per-thread accumulator. Shared by all four `build_filter_step_*` factories so
+/// the metrics contract lives in exactly one place (four copies of it is the
+/// sibling-divergence pattern that has shipped bugs in this module).
+fn record_batch_metrics(
+    captures: &FilterProcessCaptures,
+    accumulators: &PerThreadAccumulator<CollectedFilterMetrics>,
+    total_records: u64,
+    passed_count: u64,
+    bases_masked_total: u64,
+) {
+    let prev = captures.progress.fetch_add(total_records, Ordering::Relaxed);
+    if (prev + total_records) / 1_000_000 > prev / 1_000_000 {
+        info!("Processed {} records", prev + total_records);
+    }
+    accumulators.with_slot(|m| {
+        m.total_records += total_records;
+        m.passed_records += passed_count;
+        m.failed_records += total_records - passed_count;
+        m.total_bases_masked += bases_masked_total;
+    });
+}
+
 /// Build the single-read, no-rejects filter step.
 ///
 /// `DecodedRecordBatch → DecompressedBlock`. Parallel, `ByItemOrdinal`.
 /// Rejected records are dropped; kept records are serialised to raw BAM bytes.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_filter`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_filter`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_filter_step_single_no_rejects(
     limit_bytes: u64,
@@ -188,16 +233,13 @@ pub(crate) fn build_filter_step_single_no_rejects(
                 // No rejects: rejected records are simply dropped.
             }
 
-            let prev = captures.progress.fetch_add(records_count, Ordering::Relaxed);
-            if (prev + records_count) / 1_000_000 > prev / 1_000_000 {
-                info!("Processed {} records", prev + records_count);
-            }
-            accumulators.with_slot(|m| {
-                m.total_records += records_count;
-                m.passed_records += passed_count;
-                m.failed_records += records_count - passed_count;
-                m.total_bases_masked += bases_masked_total;
-            });
+            record_batch_metrics(
+                &captures,
+                &accumulators,
+                records_count,
+                passed_count,
+                bases_masked_total,
+            );
 
             Ok(DecompressedBlock { batch_serial, bytes: kept_bytes })
         },
@@ -209,7 +251,7 @@ pub(crate) fn build_filter_step_single_no_rejects(
 /// `DecodedRecordBatch → (DecompressedBlock kept, DecompressedBlock rejects)`.
 /// Parallel, `ByItemOrdinal`. Branch 0 = kept records; branch 1 = rejected.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_filter`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_filter`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_filter_step_single_with_rejects(
     limit_bytes: u64,
@@ -263,16 +305,13 @@ pub(crate) fn build_filter_step_single_with_rejects(
                 fgumi_raw_bam::write_framed_record(target, record.as_ref())?;
             }
 
-            let prev = captures.progress.fetch_add(records_count, Ordering::Relaxed);
-            if (prev + records_count) / 1_000_000 > prev / 1_000_000 {
-                info!("Processed {} records", prev + records_count);
-            }
-            accumulators.with_slot(|m| {
-                m.total_records += records_count;
-                m.passed_records += passed_count;
-                m.failed_records += records_count - passed_count;
-                m.total_bases_masked += bases_masked_total;
-            });
+            record_batch_metrics(
+                &captures,
+                &accumulators,
+                records_count,
+                passed_count,
+                bases_masked_total,
+            );
 
             Ok(Process2Output::both(
                 DecompressedBlock { batch_serial, bytes: kept_bytes },
@@ -287,7 +326,7 @@ pub(crate) fn build_filter_step_single_with_rejects(
 /// `BamTemplateBatch → DecompressedBlock`. Parallel, `ByItemOrdinal`.
 /// Templates failing the filter are dropped; kept records are serialised.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_filter`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_filter`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_filter_step_template_no_rejects(
     limit_bytes: u64,
@@ -340,16 +379,13 @@ pub(crate) fn build_filter_step_template_no_rejects(
                 }
             }
 
-            let prev = captures.progress.fetch_add(total_records, Ordering::Relaxed);
-            if (prev + total_records) / 1_000_000 > prev / 1_000_000 {
-                info!("Processed {} records", prev + total_records);
-            }
-            accumulators.with_slot(|m| {
-                m.total_records += total_records;
-                m.passed_records += passed_count;
-                m.failed_records += total_records - passed_count;
-                m.total_bases_masked += bases_masked_total;
-            });
+            record_batch_metrics(
+                &captures,
+                &accumulators,
+                total_records,
+                passed_count,
+                bases_masked_total,
+            );
 
             Ok(DecompressedBlock { batch_serial, bytes: kept_bytes })
         },
@@ -361,7 +397,7 @@ pub(crate) fn build_filter_step_template_no_rejects(
 /// `BamTemplateBatch → (DecompressedBlock kept, DecompressedBlock rejects)`.
 /// Parallel, `ByItemOrdinal`. Branch 0 = kept records; branch 1 = rejected.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_filter`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_filter`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_filter_step_template_with_rejects(
     limit_bytes: u64,
@@ -429,16 +465,13 @@ pub(crate) fn build_filter_step_template_with_rejects(
                 }
             }
 
-            let prev = captures.progress.fetch_add(total_records, Ordering::Relaxed);
-            if (prev + total_records) / 1_000_000 > prev / 1_000_000 {
-                info!("Processed {} records", prev + total_records);
-            }
-            accumulators.with_slot(|m| {
-                m.total_records += total_records;
-                m.passed_records += passed_count;
-                m.failed_records += total_records - passed_count;
-                m.total_bases_masked += bases_masked_total;
-            });
+            record_batch_metrics(
+                &captures,
+                &accumulators,
+                total_records,
+                passed_count,
+                bases_masked_total,
+            );
 
             Ok(Process2Output::both(
                 DecompressedBlock { batch_serial, bytes: kept_bytes },
@@ -446,27 +479,4 @@ pub(crate) fn build_filter_step_template_with_rejects(
             ))
         },
     )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// build_filter_chain — thin delegate
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Build a [`BuiltPipeline`] for a filter-only chain.
-///
-/// Delegates to [`ChainBuilder`]. The full step sequence lives in
-/// [`ChainBuilder`]'s `add_filter` method in
-/// [`crate::pipeline::chains::builder`].
-///
-/// # Errors
-///
-/// Returns input-validation errors or any underlying pipeline construction error.
-#[allow(clippy::needless_pass_by_value)]
-pub fn build_filter_chain(spec: ChainSpec) -> Result<BuiltPipeline> {
-    use crate::pipeline::chains::{Stage, builder::StagePosition};
-    let mut chain = ChainBuilder::new(&spec)?;
-    chain.add_source()?;
-    chain.add_stage(Stage::Filter, StagePosition::Terminal)?;
-    chain.add_sink()?;
-    chain.build()
 }

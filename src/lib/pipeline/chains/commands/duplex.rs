@@ -4,17 +4,15 @@
 //! Phase 3 (T3a.9) lifts that logic into
 //! [`crate::pipeline::chains::builder::ChainBuilder`]; this module
 //! now holds the duplex-specific types and step factory that the builder
-//! imports: [`DuplexFinalizeHook`] and the `build_duplex_consensus_step_with_rejects` / `build_duplex_consensus_step_kept_only` factories, used
+//! imports: `DuplexFinalizeHook` and the `build_duplex_consensus_step_with_rejects` / `build_duplex_consensus_step_kept_only` factories, used
 //! by `ChainBuilder::add_duplex`.
-//!
-//! [`build_duplex_chain`] shrinks to a ~10-line delegate.
 //!
 //! Mirrors simplex (5cce86c). Duplex's chain is structurally the same with a
 //! different consensus caller, a record filter, and an MI-tag transform that
 //! strips `/A`/`/B` suffixes.
 //!
 //! This module supplies the chain-builder pieces for the duplex stage; the
-//! chain is constructed via [`ChainBuilder`] /
+//! chain is constructed via `ChainBuilder` /
 //! [`crate::pipeline::chains::build::build_for`]. It is not yet wired as
 //! `Duplex::execute`'s live path.
 
@@ -36,8 +34,7 @@ use crate::overlapping_consensus::{
     apply_overlapping_consensus,
 };
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::pipeline::chains::builder::ChainBuilder;
-use crate::pipeline::chains::{BuiltPipeline, ChainSpec, FinalizeHook};
+use crate::pipeline::chains::FinalizeHook;
 use crate::pipeline::core::outputs::OrderedBytesTuple2;
 use crate::pipeline::core::step::Step;
 use crate::pipeline::steps::group::mi::BatchedMiGroups;
@@ -56,7 +53,7 @@ use crate::pipeline::steps::types::DecompressedBlock;
 /// Merged into final aggregates after the pipeline completes; one instance
 /// per worker slot (see [`PerThreadAccumulator`]).
 ///
-/// `pub(crate)` so [`ChainBuilder`] can construct it in `add_duplex`.
+/// `pub(crate)` so `ChainBuilder` can construct it in `add_duplex`.
 #[derive(Default)]
 pub(crate) struct CollectedDuplexMetrics {
     /// Consensus calling statistics.
@@ -92,7 +89,7 @@ impl crate::pipeline::core::item::HeapSize for DuplexState {}
 /// (if enabled), logs the summary banner, finalizes the rejects writer,
 /// and calls `timer.log_completion`.
 ///
-/// `pub(crate)` so [`ChainBuilder`] can construct and register it in
+/// `pub(crate)` so `ChainBuilder` can construct and register it in
 /// `add_duplex`.
 pub(crate) struct DuplexFinalizeHook {
     pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedDuplexMetrics>>,
@@ -164,7 +161,7 @@ impl FinalizeHook for DuplexFinalizeHook {
 /// Bundles all the cloned scalars and Arcs the closure needs so `add_duplex`
 /// can prepare them once and hand them off cleanly.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_duplex`] and
+/// `pub(crate)` — consumed only by `ChainBuilder::add_duplex` and
 /// [`build_duplex_consensus_step_with_rejects`] / [`build_duplex_consensus_step_kept_only`].
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct DuplexConsensusCaptures {
@@ -320,7 +317,7 @@ fn run_duplex_consensus_batch(
 /// Build the 2-output `DuplexConsensus` step (used when `--rejects` is set):
 /// branch 0 = consensus, branch 1 = rejects.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_duplex`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_duplex`.
 pub(crate) fn build_duplex_consensus_step_with_rejects(
     limit_bytes: u64,
     cap: DuplexConsensusCaptures,
@@ -402,7 +399,7 @@ pub(crate) fn build_duplex_consensus_step_with_rejects(
 /// is unset). The framework has no public discard sink, so omitting the rejects
 /// branch requires this single-output variant.
 ///
-/// `pub(crate)` — consumed only by [`ChainBuilder::add_duplex`].
+/// `pub(crate)` — consumed only by `ChainBuilder::add_duplex`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_duplex_consensus_step_kept_only(
     limit_bytes: u64,
@@ -468,28 +465,4 @@ pub(crate) fn build_duplex_consensus_step_kept_only(
         init,
         body,
     )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// build_duplex_chain — thin delegate (Phase 3 T3a.9)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Build a [`BuiltPipeline`] for a duplex-only chain.
-///
-/// Delegates to [`ChainBuilder`]. The full step sequence lives in
-/// [`ChainBuilder`]'s `add_duplex` method in
-/// [`crate::pipeline::chains::builder`].
-///
-/// # Errors
-///
-/// Returns input-validation errors (missing reference for methylation mode,
-/// etc.) or any underlying pipeline construction error.
-#[allow(clippy::needless_pass_by_value)]
-pub fn build_duplex_chain(spec: ChainSpec) -> Result<BuiltPipeline> {
-    use crate::pipeline::chains::{Stage, builder::StagePosition};
-    let mut chain = ChainBuilder::new(&spec)?;
-    chain.add_source()?;
-    chain.add_stage(Stage::Duplex, StagePosition::Terminal)?;
-    chain.add_sink()?;
-    chain.build()
 }
