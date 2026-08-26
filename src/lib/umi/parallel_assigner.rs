@@ -68,7 +68,8 @@ impl MoleculeIdCounter {
 /// molecule) and the sequential assigners. Used for the "all UMIs invalid" edge case shared by
 /// every parallel assigner.
 fn all_invalid_molecule_ids(raw_umis: &[Umi]) -> Vec<MoleculeId> {
-    let mut invalid_to_id: AHashMap<String, MoleculeId> = AHashMap::new();
+    let mut invalid_to_id: AHashMap<String, MoleculeId> =
+        AHashMap::with_hasher(crate::hashing::deterministic_state());
     let mut next_mol_id: u64 = 0;
     raw_umis
         .iter()
@@ -241,8 +242,9 @@ pub fn discover_edges_parallel_k1(
     umis: &[(BitEnc, usize)], // (encoded UMI, count)
 ) -> Vec<(usize, usize)> {
     // Build lookup map: BitEnc -> index
-    let umi_to_idx: AHashMap<BitEnc, usize> =
-        umis.iter().enumerate().map(|(i, (enc, _))| (*enc, i)).collect();
+    let mut umi_to_idx: AHashMap<BitEnc, usize> =
+        AHashMap::with_hasher(crate::hashing::deterministic_state());
+    umi_to_idx.extend(umis.iter().enumerate().map(|(i, (enc, _))| (*enc, i)));
 
     umis.par_iter()
         .enumerate()
@@ -276,8 +278,9 @@ pub fn discover_edges_parallel_k(
     }
 
     // Build lookup map: BitEnc -> index
-    let umi_to_idx: AHashMap<BitEnc, usize> =
-        umis.iter().enumerate().map(|(i, (enc, _))| (*enc, i)).collect();
+    let mut umi_to_idx: AHashMap<BitEnc, usize> =
+        AHashMap::with_hasher(crate::hashing::deterministic_state());
+    umi_to_idx.extend(umis.iter().enumerate().map(|(i, (enc, _))| (*enc, i)));
 
     // For k > 1, generate all neighbors within distance k and check hash map
     // This is still faster than O(n²) for reasonable k (1-3) and large n
@@ -316,8 +319,9 @@ fn discover_paired_reverse_edges(
     reverse_encs: &[BitEnc],
     max_mismatches: u32,
 ) -> Vec<(usize, usize)> {
-    let umi_to_idx: AHashMap<BitEnc, usize> =
-        forward.iter().enumerate().map(|(i, (enc, _))| (*enc, i)).collect();
+    let mut umi_to_idx: AHashMap<BitEnc, usize> =
+        AHashMap::with_hasher(crate::hashing::deterministic_state());
+    umi_to_idx.extend(forward.iter().enumerate().map(|(i, (enc, _))| (*enc, i)));
 
     reverse_encs
         .par_iter()
@@ -562,11 +566,14 @@ impl ParallelIdentityAssigner {
         unique_canonicals.sort_unstable();
 
         // Assign IDs in sorted order
-        let canonical_to_id: AHashMap<&str, MoleculeId> = unique_canonicals
-            .into_iter()
-            .enumerate()
-            .map(|(i, umi)| (umi, MoleculeId::Single(i as u64)))
-            .collect();
+        let mut canonical_to_id: AHashMap<&str, MoleculeId> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
+        canonical_to_id.extend(
+            unique_canonicals
+                .into_iter()
+                .enumerate()
+                .map(|(i, umi)| (umi, MoleculeId::Single(i as u64))),
+        );
 
         // Phase 3: Parallel final mapping
         self.pool.install(|| {
@@ -625,7 +632,8 @@ impl ParallelEditAssigner {
 
         // Encode UMIs and count occurrences
         // Use a single pass to build both the count map and the encoding vector
-        let mut umi_counts: AHashMap<BitEnc, usize> = AHashMap::new();
+        let mut umi_counts: AHashMap<BitEnc, usize> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
         let mut umi_to_original: Vec<Option<BitEnc>> = Vec::with_capacity(raw_umis.len());
 
         for umi in raw_umis {
@@ -652,8 +660,9 @@ impl ParallelEditAssigner {
         // Reject differing-length UMIs the way fgbio (and the sequential assigner) does.
         assert_uniform_umi_length(unique_umis.iter().map(|(enc, _)| enc.len()));
 
-        let enc_to_idx: AHashMap<BitEnc, usize> =
-            unique_umis.iter().enumerate().map(|(i, (enc, _))| (*enc, i)).collect();
+        let mut enc_to_idx: AHashMap<BitEnc, usize> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
+        enc_to_idx.extend(unique_umis.iter().enumerate().map(|(i, (enc, _))| (*enc, i)));
 
         // Discover edges and build components using the configured thread pool
         let max_mismatches = self.max_mismatches;
@@ -666,8 +675,10 @@ impl ParallelEditAssigner {
         drop(edges);
 
         // Assign molecule IDs based on connected components
-        let mut root_to_mol: AHashMap<usize, MoleculeId> = AHashMap::new();
-        let mut invalid_to_id: AHashMap<String, MoleculeId> = AHashMap::new();
+        let mut root_to_mol: AHashMap<usize, MoleculeId> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
+        let mut invalid_to_id: AHashMap<String, MoleculeId> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
         let mut next_mol_id: u64 = 0;
 
         let mut result = Vec::with_capacity(raw_umis.len());
@@ -747,7 +758,8 @@ impl ParallelAdjacencyAssigner {
         }
 
         // Count unique UMIs
-        let mut umi_counts: AHashMap<String, usize> = AHashMap::new();
+        let mut umi_counts: AHashMap<String, usize> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
         for umi in raw_umis {
             *umi_counts.entry(umi.to_uppercase()).or_insert(0) += 1;
         }
@@ -837,17 +849,18 @@ impl ParallelAdjacencyAssigner {
 
         // Build map from uppercase UMI string to molecule ID
         // Use references to avoid cloning
-        let str_to_mol: AHashMap<&str, MoleculeId> = sorted_umis
-            .iter()
-            .enumerate()
-            .map(|(i, (umi, _, _))| (umi.as_str(), mol_ids[i]))
-            .collect();
+        let mut str_to_mol: AHashMap<&str, MoleculeId> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
+        str_to_mol.extend(
+            sorted_umis.iter().enumerate().map(|(i, (umi, _, _))| (umi.as_str(), mol_ids[i])),
+        );
 
         // Map back to original UMI order. Each distinct invalid (non-encodable) UMI gets its own
         // molecule (identical strings share, continuing the `next_mol_id` sequence), mirroring
         // fgbio's per-string assignment and the sequential adjacency assigner. Invalid UMIs never
         // join a valid molecule. See the cross-assigner parity note in the tests module.
-        let mut invalid_to_id: AHashMap<String, MoleculeId> = AHashMap::new();
+        let mut invalid_to_id: AHashMap<String, MoleculeId> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
         raw_umis
             .iter()
             .map(|umi| {
@@ -961,7 +974,8 @@ impl ParallelPairedAssigner {
         }
 
         // Count unique UMIs using canonical form
-        let mut canonical_counts: AHashMap<String, usize> = AHashMap::new();
+        let mut canonical_counts: AHashMap<String, usize> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
         for umi in raw_umis {
             let canonical = Self::canonicalize(umi);
             *canonical_counts.entry(canonical).or_insert(0) += 1;
@@ -1172,9 +1186,12 @@ impl ParallelPairedAssigner {
         // and all-invalid paths keep them distinct -- a `--threads`-dependent divergence. fgumi's
         // chosen model is one molecule per distinct raw UMI string (an intentional fgbio
         // divergence, since `BitEnc` cannot represent the invalid base).
-        let canonical_to_idx: AHashMap<&str, usize> =
-            sorted_umis.iter().enumerate().map(|(i, (umi, _, _))| (umi.as_str(), i)).collect();
-        let mut invalid_to_id: AHashMap<String, MoleculeId> = AHashMap::new();
+        let mut canonical_to_idx: AHashMap<&str, usize> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
+        canonical_to_idx
+            .extend(sorted_umis.iter().enumerate().map(|(i, (umi, _, _))| (umi.as_str(), i)));
+        let mut invalid_to_id: AHashMap<String, MoleculeId> =
+            AHashMap::with_hasher(crate::hashing::deterministic_state());
         raw_umis
             .iter()
             .map(|umi| {

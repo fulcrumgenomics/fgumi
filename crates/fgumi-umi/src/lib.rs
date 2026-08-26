@@ -8,6 +8,7 @@
 //! - UMI grouping and family analysis
 
 pub mod assigner;
+pub(crate) mod hashing;
 pub mod index_threshold;
 
 // Re-export commonly used items

@@ -9,10 +9,12 @@
 
 pub mod bitenc;
 pub mod dna;
+pub mod hashing;
 
 // Re-export submodule contents at crate root for convenience
 pub use bitenc::BitEnc;
 pub use dna::{COMPLEMENT, complement_base, reverse_complement, reverse_complement_str};
+pub use hashing::deterministic_state;
 
 /// No-call base character (matches fgbio's `NoCallBase`).
 pub const NO_CALL_BASE: u8 = b'N';

@@ -631,7 +631,8 @@ pub fn apply_overlapping_consensus(
     use ahash::AHashMap;
 
     // Group reads by name for pairing
-    let mut read_pairs: AHashMap<Vec<u8>, (Option<usize>, Option<usize>)> = AHashMap::new();
+    let mut read_pairs: AHashMap<Vec<u8>, (Option<usize>, Option<usize>)> =
+        AHashMap::with_hasher(crate::hashing::deterministic_state());
 
     for (idx, record) in records.iter().enumerate() {
         let view = RawRecordView::new(record);
