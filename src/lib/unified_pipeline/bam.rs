@@ -17,10 +17,10 @@ use std::time::{Duration, Instant};
 
 use crate::bgzf_reader::{BGZF_EOF, decompress_block_into_opts, read_raw_blocks};
 use crate::bgzf_writer::InlineBgzfCompressor;
+#[cfg(test)]
 use crate::sam::SamTag;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::ReorderBuffer;
-use noodles::sam::alignment::record::data::field::Tag;
 
 use super::base::{
     ActiveSteps, BatchWeight, CompressedBlockBatch, DecodedRecord, DecompressedBatch,
@@ -344,18 +344,26 @@ impl Default for BoundaryState {
 /// # Arguments
 ///
 /// * `batch` - A `BoundaryBatch` with record offsets
-/// * `group_key_config` - Config for computing `GroupKey` (library index and cell tag)
+/// * `group_key_config` - `Some` config for computing each record's `GroupKey`
+///   (library index, cell tag, UMI tag), or `None` to skip key computation
+///   entirely and attach a default placeholder key. `None` is only for groupers
+///   that never read the key (e.g. `SingleRawRecordGrouper`, which discards the
+///   decoded record). Pairing `None` with a key-consuming grouper mis-groups:
+///   key-only groupers (position/MI) collapse every record into one group, and
+///   `TemplateGrouper` loses its `name_hash` fast-path (its QNAME byte-compare
+///   still keeps it correct, only slower). Every key-consuming command sets
+///   `Some` explicitly, so `None` is never reached by accident.
 ///
 /// # Returns
 ///
-/// A vector of decoded `DecodedRecord` instances (record + pre-computed `GroupKey`).
+/// A vector of decoded `DecodedRecord` instances (record + `GroupKey`).
 ///
 /// # Errors
 ///
 /// Returns an I/O error if any BAM record is malformed.
 pub fn decode_records(
     batch: &BoundaryBatch,
-    group_key_config: &GroupKeyConfig,
+    group_key_config: Option<&GroupKeyConfig>,
 ) -> io::Result<Vec<DecodedRecord>> {
     let num_records = batch.offsets.len().saturating_sub(1);
     let mut records = Vec::with_capacity(num_records);
@@ -418,12 +426,14 @@ pub fn decode_records(
                 ),
             ));
         }
-        let (key, umi_position) = compute_group_key_from_raw(
-            &raw,
-            &group_key_config.library_index,
-            group_key_config.cell_tag,
-            group_key_config.umi_tag,
-        );
+        // Skip the per-record key computation when no grouper needs it; the
+        // placeholder key is never read in that case (see the `None` contract).
+        let (key, umi_position) = match group_key_config {
+            Some(cfg) => {
+                compute_group_key_from_raw(&raw, &cfg.library_index, cfg.cell_tag, cfg.umi_tag)
+            }
+            None => (super::base::GroupKey::default(), None),
+        };
         let mut decoded = DecodedRecord::from_raw_bytes(raw, key);
         // The UMI position returned above is record-relative (already converted
         // from aux-relative inside `compute_group_key_from_raw`).
@@ -691,8 +701,9 @@ pub struct BamPipelineState<G, P: MemoryEstimate> {
     // retried push.
     /// Count of batches that have completed decoding (for completion tracking).
     pub batches_decoded: AtomicU64,
-    /// Configuration for computing `GroupKey` during decode.
-    pub group_key_config: GroupKeyConfig,
+    /// Configuration for computing `GroupKey` during decode, or `None` to skip
+    /// key computation for groupers that never read it (see [`decode_records`]).
+    pub group_key_config: Option<GroupKeyConfig>,
 
     // ========== Queue 3: Decode → Group (with reorder) ==========
     /// Decoded records waiting to be grouped.
@@ -733,7 +744,7 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
         config: PipelineConfig,
         input: Box<dyn Read + Send>,
         output: Box<dyn Write + Send>,
-        group_key_config: GroupKeyConfig,
+        group_key_config: Option<GroupKeyConfig>,
     ) -> Self {
         let cap = config.queue_capacity;
         // Q3 decode admission window: bound reorder *skew* to concurrency (a few
@@ -2613,7 +2624,7 @@ fn try_step_decode<G: Send, P: Send + MemoryEstimate>(
     // =========================================================================
     // Priority 4: Decode records and compute GroupKey
     // =========================================================================
-    match decode_records(&boundary_batch, &state.group_key_config) {
+    match decode_records(&boundary_batch, state.group_key_config.as_ref()) {
         Ok(records) => {
             // Record decoded count for throughput metrics
             if let Some(stats) = state.stats() {
@@ -3643,7 +3654,7 @@ fn run_bam_pipeline_single_threaded<G, P>(
     mut output: Box<dyn Write + Send>,
     mut grouper: Box<dyn Grouper<Group = G> + Send>,
     fns: PipelineFunctions<G, P>,
-    group_key_config: GroupKeyConfig,
+    group_key_config: Option<GroupKeyConfig>,
     mut secondary_writer: Option<fgumi_bam_io::RawBamWriter>,
 ) -> io::Result<u64>
 where
@@ -3707,7 +3718,7 @@ where
 
         // Step 4: Decode records (only if there are any)
         if boundary_batch.offsets.len() > 1 {
-            let decoded = decode_records(&boundary_batch, &group_key_config)?;
+            let decoded = decode_records(&boundary_batch, group_key_config.as_ref())?;
 
             // Step 5: Feed decoded records to grouper
             let groups = grouper.add_records(decoded)?;
@@ -3760,7 +3771,7 @@ where
     if let Some(final_batch) = boundary_state.finish()?
         && final_batch.offsets.len() > 1
     {
-        let decoded = decode_records(&final_batch, &group_key_config)?;
+        let decoded = decode_records(&final_batch, group_key_config.as_ref())?;
         let groups = grouper.add_records(decoded)?;
 
         for group in groups {
@@ -3900,7 +3911,7 @@ pub fn run_bam_pipeline<G, P>(
     output: Box<dyn Write + Send>,
     grouper: Box<dyn Grouper<Group = G> + Send>,
     fns: PipelineFunctions<G, P>,
-    group_key_config: GroupKeyConfig,
+    group_key_config: Option<GroupKeyConfig>,
     secondary_writer: Option<fgumi_bam_io::RawBamWriter>,
 ) -> io::Result<u64>
 where
@@ -4178,8 +4189,14 @@ pub struct BamPipelineConfig {
     pub pipeline: PipelineConfig,
     /// Compression level for output (0-12).
     pub compression_level: u32,
-    /// Configuration for computing `GroupKey` during decode.
-    /// If None, a default config will be built from the header.
+    /// Configuration for computing each record's `GroupKey` during decode.
+    ///
+    /// `Some(cfg)` computes the key from `cfg`; `None` skips the per-record
+    /// computation entirely and attaches a default placeholder key. `None` is
+    /// only valid for groupers that never read the key (e.g.
+    /// `SingleRawRecordGrouper`) — a key-consuming grouper paired with `None`
+    /// would mis-group (see [`decode_records`]). Every key-consuming command
+    /// sets `Some` explicitly, so it is never left unset by accident.
     pub group_key_config: Option<GroupKeyConfig>,
 }
 
@@ -4332,12 +4349,10 @@ where
 
     let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
 
-    // Build GroupKeyConfig from header if not provided
-    let group_key_config = config.group_key_config.unwrap_or_else(|| {
-        let library_index = LibraryIndex::from_header(&header);
-        let cell_tag = Tag::from(SamTag::CB);
-        GroupKeyConfig::new(library_index, cell_tag)
-    });
+    // Pass the caller's `Option` straight through: `Some` computes keys during
+    // decode, `None` skips it for groupers that never read the key. Every
+    // key-consuming command sets `Some` explicitly, so no default is needed here.
+    let group_key_config = config.group_key_config;
 
     // Create the grouper
     // Note: Header skipping is now handled by BoundaryState in the pipeline
@@ -4414,12 +4429,10 @@ where
 
     let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
 
-    // Build GroupKeyConfig from input header if not provided
-    let group_key_config = config.group_key_config.unwrap_or_else(|| {
-        let library_index = LibraryIndex::from_header(&input_header);
-        let cell_tag = Tag::from(SamTag::CB);
-        GroupKeyConfig::new(library_index, cell_tag)
-    });
+    // Pass the caller's `Option` straight through: `Some` computes keys during
+    // decode, `None` skips it for groupers that never read the key. Every
+    // key-consuming command sets `Some` explicitly, so no default is needed here.
+    let group_key_config = config.group_key_config;
 
     // Create the grouper using INPUT header
     let grouper = grouper_fn(&input_header);
@@ -4675,12 +4688,10 @@ where
     )
     .map_err(|e| io::Error::other(format!("Failed to create secondary output: {e}")))?;
 
-    // Build GroupKeyConfig
-    let group_key_config = config.group_key_config.unwrap_or_else(|| {
-        let library_index = LibraryIndex::from_header(&input_header);
-        let cell_tag = Tag::from(SamTag::CB);
-        GroupKeyConfig::new(library_index, cell_tag)
-    });
+    // Pass the caller's `Option` straight through: `Some` computes keys during
+    // decode, `None` skips it for groupers that never read the key. Every
+    // key-consuming command sets `Some` explicitly, so no default is needed here.
+    let group_key_config = config.group_key_config;
 
     let grouper = grouper_fn(&input_header);
 
@@ -4761,7 +4772,7 @@ mod tests {
         let header = Header::default();
         let library_index = LibraryIndex::from_header(&header);
         let group_key_config = GroupKeyConfig::new(library_index, SamTag::CB.into());
-        BamPipelineState::new(config, input, output, group_key_config)
+        BamPipelineState::new(config, input, output, Some(group_key_config))
     }
 
     /// A `queue_memory_limit` of 0 means "no limit", so Read is never gated.
@@ -5704,7 +5715,7 @@ mod tests {
         let library_index = LibraryIndex::from_header(&header);
         let group_key_config = GroupKeyConfig::new(library_index, SamTag::CB.into());
         let state: BamPipelineState<(), ()> =
-            BamPipelineState::new(config, input, output, group_key_config);
+            BamPipelineState::new(config, input, output, Some(group_key_config));
         let mut worker = create_test_worker();
 
         state.boundary_done.store(boundary_done, Ordering::SeqCst);
@@ -5898,7 +5909,7 @@ mod tests {
         let library_index = LibraryIndex::from_header(&header);
         let cfg = GroupKeyConfig::new(library_index, SamTag::CB.into()).with_umi_tag(*SamTag::RX);
 
-        let decoded = decode_records(&batch, &cfg).expect("decode succeeds");
+        let decoded = decode_records(&batch, Some(&cfg)).expect("decode succeeds");
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].cached_umi(), Some(b"CACHEDUMI".as_ref()));
     }
@@ -5918,9 +5929,42 @@ mod tests {
         // No `with_umi_tag` → caching is disabled.
         let cfg = GroupKeyConfig::new(library_index, SamTag::CB.into());
 
-        let decoded = decode_records(&batch, &cfg).expect("decode succeeds");
+        let decoded = decode_records(&batch, Some(&cfg)).expect("decode succeeds");
         assert_eq!(decoded.len(), 1);
         assert!(decoded[0].cached_umi().is_none());
+    }
+
+    #[test]
+    fn test_decode_records_skips_group_key_when_none() {
+        // With `None`, per-record GroupKey computation is skipped and a default
+        // placeholder key is attached — for groupers (e.g. SingleRawRecordGrouper)
+        // that never read it. The raw record bytes must be byte-identical to the
+        // key-computing path so downstream passthrough is unaffected.
+        let raw = raw_record_with_rx(b"CACHEDUMI");
+        let make_batch = || {
+            let mut buffer = Vec::with_capacity(raw.as_ref().len() + 4);
+            let block_size = u32::try_from(raw.as_ref().len()).unwrap();
+            buffer.extend_from_slice(&block_size.to_le_bytes());
+            buffer.extend_from_slice(raw.as_ref());
+            let offsets = vec![0usize, buffer.len()];
+            BoundaryBatch { buffer, offsets }
+        };
+
+        let header = Header::default();
+        let library_index = LibraryIndex::from_header(&header);
+        let cfg = GroupKeyConfig::new(library_index, SamTag::CB.into());
+
+        let with_key = decode_records(&make_batch(), Some(&cfg)).expect("decode Some");
+        let without_key = decode_records(&make_batch(), None).expect("decode None");
+
+        assert_eq!(with_key.len(), 1);
+        assert_eq!(without_key.len(), 1);
+        // Identical record bytes either way — the transform is pure passthrough.
+        assert_eq!(with_key[0].raw_bytes(), without_key[0].raw_bytes());
+        // `None` attaches the default placeholder; `Some` computes a real key that
+        // differs from it, proving the computation was actually skipped.
+        assert_eq!(without_key[0].key, crate::unified_pipeline::base::GroupKey::default());
+        assert_ne!(with_key[0].key, without_key[0].key, "Some path computes a real key");
     }
 
     /// A secondary/supplementary read carries the exact template coordinate of its
