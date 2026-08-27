@@ -288,7 +288,7 @@ pub(crate) struct CollectedDedupCounts {
 /// accumulate this in `serialize_fn`: that closure also runs once per group,
 /// but workers execute it in parallel completion order, not coordinate order.
 #[derive(Default)]
-struct DuplicationLadderRecorder {
+pub(crate) struct DuplicationLadderRecorder {
     /// Snapshot interval in cumulative templates (`--ladder-interval`).
     interval: u64,
     /// Per-library running totals and next snapshot threshold.
@@ -323,7 +323,7 @@ struct LadderLibraryState {
 }
 
 impl DuplicationLadderRecorder {
-    fn new(interval: u64) -> Self {
+    pub(crate) fn new(interval: u64) -> Self {
         Self { interval, per_library: AHashMap::new(), rows: Vec::new() }
     }
 
@@ -341,7 +341,7 @@ impl DuplicationLadderRecorder {
     ///
     /// MUST be called in serial/coordinate order — see the ordering note on
     /// [`DuplicationLadderRecorder`].
-    fn record(&mut self, library_idx: u16, group_counts: &DedupCounts) {
+    pub(crate) fn record(&mut self, library_idx: u16, group_counts: &DedupCounts) {
         if group_counts.total_templates == 0 {
             return;
         }
@@ -381,7 +381,7 @@ impl DuplicationLadderRecorder {
 
     /// Emits a final snapshot per library at its true total, unless the last
     /// interval snapshot already landed exactly on that total.
-    fn finish(&mut self) {
+    pub(crate) fn finish(&mut self) {
         for (&library_idx, state) in &self.per_library {
             if state.templates_seen > state.last_emitted_at {
                 self.rows.push((
@@ -1074,7 +1074,7 @@ pub(crate) fn process_position_group(
 //////////////////////////////////////////////////////////////////////////////
 
 /// UMI-aware duplicate marking command.
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(
     name = "dedup",
     about = "\x1b[38;5;151m[DEDUP]\x1b[0m         \x1b[36mMark or remove PCR duplicates using UMI information\x1b[0m",
@@ -1669,21 +1669,7 @@ impl Command for MarkDuplicates {
             );
         }
 
-        // --metrics is optional, so it must not be the only channel reporting
-        // dropped templates: a run that filters everything otherwise logs a bare
-        // "0 templates" and is indistinguishable from empty input. Reasons are
-        // named by their column suffix so the log points at the metrics column.
-        let filtered = final_counts.filter_counts.total_rejected_templates();
-        if filtered > 0 {
-            let reasons: Vec<String> = TemplateFilterReason::ALL
-                .into_iter()
-                .filter_map(|reason| {
-                    let count = final_counts.filter_counts.rejected_templates(reason);
-                    (count > 0).then(|| format!("{count} {}", reason.column_suffix()))
-                })
-                .collect();
-            info!("Filtered out {filtered} templates before marking: {}", reasons.join(", "));
-        }
+        log_filtered_templates(&final_counts.filter_counts);
 
         timer.log_completion(final_counts.total_reads);
 
@@ -1766,7 +1752,30 @@ pub(crate) fn write_family_size_histogram(
 
 /// Writes the `--duplication-ladder` TSV: one row per (library, snapshot),
 /// sorted deterministically by library name then ascending `templates_seen`.
-fn write_duplication_ladder(
+/// Log the "Filtered out N templates before marking" diagnostic, if any were
+/// rejected. Called by both the non-chain `execute` tail and the chain's
+/// `DedupFinalizeHook` so `--threads` and no-`--threads` report filtered
+/// templates identically.
+///
+/// `--metrics` is optional, so this must not be the only channel reporting
+/// dropped templates: a run that filters everything otherwise logs a bare
+/// "0 templates" and is indistinguishable from empty input. Reasons are named
+/// by their column suffix so the log points at the metrics column.
+pub(crate) fn log_filtered_templates(filter_counts: &TemplateFilterCounts) {
+    let filtered = filter_counts.total_rejected_templates();
+    if filtered > 0 {
+        let reasons: Vec<String> = TemplateFilterReason::ALL
+            .into_iter()
+            .filter_map(|reason| {
+                let count = filter_counts.rejected_templates(reason);
+                (count > 0).then(|| format!("{count} {}", reason.column_suffix()))
+            })
+            .collect();
+        info!("Filtered out {filtered} templates before marking: {}", reasons.join(", "));
+    }
+}
+
+pub(crate) fn write_duplication_ladder(
     recorder: &DuplicationLadderRecorder,
     library_index: &LibraryIndex,
     path: &PathBuf,

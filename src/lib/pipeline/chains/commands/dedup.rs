@@ -14,8 +14,9 @@ use ahash::AHashMap;
 use anyhow::{Result, bail};
 
 use crate::commands::dedup::{
-    BatchedProcessedDedupGroups, CollectedDedupMetrics, DedupCounts, ProcessedDedupGroup,
-    process_position_group, write_dedup_metrics, write_family_size_histogram,
+    BatchedProcessedDedupGroups, CollectedDedupMetrics, DedupCounts, DuplicationLadderRecorder,
+    ProcessedDedupGroup, process_position_group, write_dedup_metrics, write_duplication_ladder,
+    write_family_size_histogram,
 };
 use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
@@ -81,6 +82,16 @@ pub(crate) struct DedupFinalizeHook {
     pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedDedupMetrics>>,
     pub(crate) metrics_path: Option<std::path::PathBuf>,
     pub(crate) family_size_histogram_path: Option<std::path::PathBuf>,
+    /// `--duplication-ladder` output path paired with the recorder accumulated
+    /// by the serial MI-assign step; `Some` exactly when the flag is set. A
+    /// single `Option<(path, recorder)>` (rather than two coupled `Option`s)
+    /// makes the "both or neither" invariant unrepresentable-when-broken, so
+    /// finalize needs no runtime assert. The recorder is held behind an `Arc`
+    /// shared with the MI-assign step, so the ladder is read here **through the
+    /// lock** rather than by `Arc::try_unwrap` — the step's clone may still be
+    /// alive when finalize hooks run.
+    pub(crate) duplication_ladder:
+        Option<(std::path::PathBuf, Arc<parking_lot::Mutex<DuplicationLadderRecorder>>)>,
     /// Library index resolved from the input header, needed for the per-library
     /// metrics rows.
     pub(crate) library_index: LibraryIndex,
@@ -95,6 +106,7 @@ impl FinalizeHook for DedupFinalizeHook {
             accumulators,
             metrics_path,
             family_size_histogram_path,
+            duplication_ladder,
             library_index,
             sample,
             timer,
@@ -136,6 +148,15 @@ impl FinalizeHook for DedupFinalizeHook {
             write_family_size_histogram(&final_family_sizes, path)?;
         }
 
+        // Write the duplication-saturation ladder if requested. Accessed through
+        // the lock (not `Arc::try_unwrap`): the serial MI-assign step holds a
+        // clone of this `Arc` that may still be alive here.
+        if let Some((path, recorder)) = duplication_ladder {
+            let mut guard = recorder.lock();
+            guard.finish();
+            write_duplication_ladder(&guard, &library_index, &path)?;
+        }
+
         // Log summary banner (verbatim from the original execute).
         log::info!(
             "Deduplication complete: {} templates ({} unique, {} duplicates, {:.2}% duplicate rate)",
@@ -159,6 +180,10 @@ impl FinalizeHook for DedupFinalizeHook {
                 final_counts.missing_tc_tag
             );
         }
+
+        // Report filtered templates identically to the non-chain path (shared
+        // helper, so the two paths cannot drift).
+        crate::commands::dedup::log_filtered_templates(&final_counts.filter_counts);
 
         timer.log_completion(final_counts.total_reads);
 
@@ -242,10 +267,20 @@ pub(crate) fn build_process_step(
 /// Build the `MiAssignDedup` step: serial, `ByItemOrdinal`, assigns
 /// monotonically increasing MI offsets to each batch.
 ///
+/// When `ladder_recorder` is `Some`, this step also records the
+/// `--duplication-ladder` saturation curve — per position group, in the same
+/// serial/coordinate-order seam the non-chain path records it (`mi_assign_fn`),
+/// **not** in the parallel serialize step. `MiAssign` is `Serial` +
+/// `ByItemOrdinal`, so batches reach this closure in input-record order and the
+/// groups within a batch are in coordinate order, exactly reproducing the
+/// non-chain per-group stream — see the ordering note on
+/// [`crate::commands::dedup::DuplicationLadderRecorder`].
+///
 /// `pub(crate)` — consumed only by `ChainBuilder::add_dedup`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_mi_assign_step(
     limit_bytes: u64,
+    ladder_recorder: Option<Arc<parking_lot::Mutex<DuplicationLadderRecorder>>>,
 ) -> MiAssign<
     BatchedProcessedDedupGroups,
     BatchedProcessedDedupGroups,
@@ -259,6 +294,12 @@ pub(crate) fn build_mi_assign_step(
         limit_bytes,
         move |next_mi: &mut u64, mut item: BatchedProcessedDedupGroups| {
             assign_mi_offsets(next_mi, &mut item)?;
+            if let Some(recorder) = &ladder_recorder {
+                let mut guard = recorder.lock();
+                for processed in &item.groups {
+                    guard.record(processed.library_idx, &processed.dedup_counts);
+                }
+            }
             Ok(item)
         },
     )
