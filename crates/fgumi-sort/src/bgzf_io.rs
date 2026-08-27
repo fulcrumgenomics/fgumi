@@ -48,14 +48,14 @@ pub(crate) struct StagingBuffer {
 }
 
 impl StagingBuffer {
-    /// Create a new staging buffer.
-    #[must_use]
     /// Seconds this buffer's producer spent blocked waiting for an output
     /// permit, and the number of waits. See [`PermitPool::blocked`].
     pub(crate) fn write_backpressure(&self) -> (f64, u64) {
         self.permit_pool.blocked()
     }
 
+    /// Create a new staging buffer.
+    #[must_use]
     pub(crate) fn new(
         pool: Arc<SortWorkerPool>,
         result_tx: Sender<CompressResult>,

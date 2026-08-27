@@ -14,7 +14,7 @@ fgumi-pipeline-core = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-sort = { workspace = true }
 anyhow = "1.0.102"
-log = "0"
+log = { workspace = true }
 noodles = { workspace = true, features = ["bam", "sam", "bgzf"] }
 parking_lot = "0.12"
 rayon = "1.10"
@@ -28,12 +28,12 @@ test-utils = []
 stress-tests = []
 
 [dev-dependencies]
-fgumi-bam-io = { workspace = true }
+# fgumi-bam-io, fgumi-bgzf, and tempfile are omitted here: each is already a
+# normal dependency with identical configuration, which tests and benches
+# inherit, so a dev-dependency entry would be redundant.
 fgumi-raw-bam = { workspace = true, features = ["noodles", "test-utils"] }
 fgumi-sort = { workspace = true, features = ["test-utils"] }
-tempfile = "3.4"
 noodles = { workspace = true, features = ["bam", "sam"] }
-fgumi-bgzf = { workspace = true }
 rstest = "0.26"
 proptest = "1.10"
 criterion = { version = "0.8", features = ["html_reports"] }

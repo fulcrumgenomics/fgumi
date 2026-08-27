@@ -1,6 +1,6 @@
 error: multi_options does not support generic structs: the generated Multi struct and its conversions are emitted without generic parameters, so the expansion would not compile. Use a concrete options struct.
- --> tests/ui/where_only.rs:6:1
-  |
-6 | / where
-7 | |     u32: Clone,
-  | |_______________^
+  --> tests/ui/where_only.rs:9:1
+   |
+ 9 | / where
+10 | |     u32: Clone,
+   | |_______________^

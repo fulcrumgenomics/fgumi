@@ -342,6 +342,9 @@ pub struct CodecOptions {
     pub max_reads: Option<usize>,
     /// Minimum duplex overlap length.
     pub min_duplex_length: usize,
+    /// Reproduce fgbio's legacy (pre-fgumi#761) overlap window for dovetailed
+    /// FR pairs. Off by default; see [`Codec::legacy_overlap_window`].
+    pub legacy_overlap_window: bool,
     /// Quality cap for single-strand positions.
     pub single_strand_qual: Option<u8>,
     /// Quality cap for outer bases.
@@ -382,6 +385,7 @@ impl Codec {
             min_reads: self.min_reads,
             max_reads: self.max_reads,
             min_duplex_length: self.min_duplex_length,
+            legacy_overlap_window: self.legacy_overlap_window,
             single_strand_qual: self.single_strand_qual,
             outer_bases_qual: self.outer_bases_qual,
             outer_bases_length: self.outer_bases_length,
@@ -1011,6 +1015,7 @@ mod tests {
             "88",
             "--min-duplex-length",
             "9",
+            "--legacy-overlap-window",
             "--single-strand-qual",
             "12",
             "--outer-bases-qual",
@@ -1049,6 +1054,7 @@ mod tests {
         assert_eq!(opts.min_reads, 4);
         assert_eq!(opts.max_reads, Some(88));
         assert_eq!(opts.min_duplex_length, 9);
+        assert!(opts.legacy_overlap_window, "--legacy-overlap-window must reach the projection");
         assert_eq!(opts.single_strand_qual, Some(12));
         assert_eq!(opts.outer_bases_qual, Some(15));
         assert_eq!(opts.outer_bases_length, 7);
@@ -1083,6 +1089,7 @@ mod tests {
         assert_eq!(opts.min_reads, 1);
         assert_eq!(opts.max_reads, None);
         assert_eq!(opts.min_duplex_length, 1);
+        assert!(!opts.legacy_overlap_window, "the default must be preserved, not hard-coded true");
         assert_eq!(opts.single_strand_qual, None);
         assert_eq!(opts.outer_bases_qual, None);
         assert_eq!(opts.outer_bases_length, 5);

@@ -517,6 +517,16 @@ pub fn compute_group_key_from_raw(
     let reverse = (flg & fgumi_raw_bam::flags::REVERSE) != 0;
     let own_pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(raw);
 
+    // A mapped record with an empty or truncated CIGAR has no computable
+    // unclipped 5' position, so `unclipped_5prime_from_raw_bam` returns the
+    // `i32::MAX` sentinel. Fall back to the name-only key rather than letting the
+    // sentinel reach a position slot — otherwise distinct templates sharing
+    // ref/strand/library/cell would collide on `i32::MAX` (`position_key`
+    // excludes `name_hash`). Matches the secondary/supplementary fallback above.
+    if own_pos == i32::MAX {
+        return GroupKey { name_hash, ..GroupKey::default() };
+    }
+
     let own_ref_id = fgumi_raw_bam::ref_id(raw);
     let strand = u8::from(reverse);
 
@@ -786,6 +796,32 @@ mod tests {
 
         assert_eq!(key, GroupKey { name_hash: key.name_hash, ..GroupKey::default() });
         assert_eq!(key.name_hash, LibraryIndex::hash_name(Some(b"sup_no_tc")));
+        assert_eq!(key.pos1, GroupKey::default().pos1, "no i32::MAX sentinel may leak in");
+    }
+
+    /// The PRIMARY path has the same sentinel hazard: a mapped, unpaired primary
+    /// with an empty CIGAR has no computable unclipped 5' position, so it must
+    /// fall back to the name-only key too. Without the guard the `i32::MAX`
+    /// sentinel would reach `pos1` and merge distinct templates sharing
+    /// ref/strand/library/cell (`position_key` excludes `name_hash`).
+    #[test]
+    fn primary_with_empty_cigar_falls_back_to_name_only() {
+        let lib = library_index_with_two_groups();
+
+        // Default flags (0) => mapped, unpaired, primary.
+        let mut b = SamBuilder::new();
+        b.ref_id(0)
+            .pos(5000)
+            .read_name(b"primary_no_cigar")
+            .cigar_ops(&[])
+            .sequence(b"ACGT")
+            .qualities(&[30, 30, 30, 30]);
+        let rec = b.build();
+
+        let key = compute_group_key_from_raw(rec.as_ref(), &lib, None);
+
+        assert_eq!(key, GroupKey { name_hash: key.name_hash, ..GroupKey::default() });
+        assert_eq!(key.name_hash, LibraryIndex::hash_name(Some(b"primary_no_cigar")));
         assert_eq!(key.pos1, GroupKey::default().pos1, "no i32::MAX sentinel may leak in");
     }
 

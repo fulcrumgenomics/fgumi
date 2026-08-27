@@ -919,6 +919,27 @@ mod tests {
         assert_eq!(def.cmp(&RawQuerynameKey::default()), Ordering::Equal);
     }
 
+    /// `read_from` must restore the NUL terminator that `cmp`'s `unsafe`
+    /// `natural_compare_nul` relies on, even for a truncated or hand-crafted
+    /// frame whose serialized name lacks it — the branch a `write_to`-produced
+    /// frame never exercises (its name already carries the terminator).
+    #[test]
+    fn read_from_terminates_a_frame_whose_name_lacks_the_nul() {
+        // Hand-built frame: [u16 len][name bytes, no NUL][u16 flags].
+        let name = b"readX";
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(name);
+        buf.extend_from_slice(&7u16.to_le_bytes());
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let key = RawQuerynameKey::read_from(&mut cursor).expect("read_from should succeed");
+        assert_eq!(key.name(), b"readX\0", "read_from must restore the terminator");
+        // cmp must not read past the buffer and must compare equal to the key
+        // the terminated constructor produces from the same bytes.
+        assert_eq!(key.cmp(&RawQuerynameKey::new(b"readX".to_vec(), 7)), Ordering::Equal);
+    }
+
     // ========================================================================
     // queryname_flag_order tests
     // ========================================================================

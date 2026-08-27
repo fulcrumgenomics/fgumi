@@ -513,6 +513,16 @@ pub fn compute_group_key_from_raw(
     let reverse = (flg & fgumi_raw_bam::flags::REVERSE) != 0;
     let own_pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(raw);
 
+    // A mapped record with an empty or truncated CIGAR has no computable
+    // unclipped 5' position, so `unclipped_5prime_from_raw_bam` returns the
+    // `i32::MAX` sentinel. Fall back to the name-only key rather than letting the
+    // sentinel reach a position slot — otherwise distinct templates sharing
+    // ref/strand/library/cell would collide on `i32::MAX` (`position_key`
+    // excludes `name_hash`). Matches the secondary/supplementary fallback above.
+    if own_pos == i32::MAX {
+        return (GroupKey { name_hash, ..GroupKey::default() }, None);
+    }
+
     let own_ref_id = fgumi_raw_bam::ref_id(raw);
     let strand = u8::from(reverse);
 

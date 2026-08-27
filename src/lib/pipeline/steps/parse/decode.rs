@@ -118,7 +118,14 @@ pub(crate) fn cache_umi_position(decoded: &mut DecodedRecord, umi_tag: [u8; 2]) 
     let Some(aux_offset) = fgumi_raw_bam::aux_data_offset_from_record(raw) else {
         return;
     };
-    let aux = &raw[aux_offset..];
+    // `aux_data_offset_from_record` derives the offset from the record header
+    // (`n_cigar_op`, `l_seq`) without bounding it against `raw.len()`, so a
+    // framing-consistent but malformed record can produce `aux_offset > raw.len()`.
+    // Slice through `get` — matching the guard in `aux_data_slice` — rather than
+    // panicking on an out-of-range index.
+    let Some(aux) = raw.get(aux_offset..) else {
+        return;
+    };
     let Some((value_off_in_aux, value_len)) = fgumi_raw_bam::find_string_tag_position(aux, umi_tag)
     else {
         return;

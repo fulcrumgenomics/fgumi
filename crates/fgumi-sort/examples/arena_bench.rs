@@ -113,6 +113,9 @@ fn main() {
     let chunk_mib: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(512);
     let n_chunks: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(6);
     let workers: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(4);
+    // With `workers == 0` the per-worker `ranges` below are empty, so the
+    // benchmark skips gather and compression but still records a result row.
+    assert!(workers > 0, "workers must be at least 1");
     let codec = SpillCodec::Zstd;
     let level = 1u32;
     let mem_limit = chunk_mib * 1024 * 1024;
@@ -170,8 +173,8 @@ fn main() {
     let split = mode == "split";
     while let Ok(mut buf) = work_rx.recv() {
         let n = buf.len();
-        // contiguous index ranges, one per worker
-        let per = n.div_ceil(workers.max(1));
+        // contiguous index ranges, one per worker (`workers > 0` asserted above)
+        let per = n.div_ceil(workers);
         let ranges: Vec<(usize, usize)> = (0..workers)
             .map(|w| (w * per, ((w + 1) * per).min(n)))
             .filter(|(s, e)| s < e)

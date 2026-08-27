@@ -303,10 +303,10 @@ fn template_coordinate_chunks_frame_through_their_own_path() {
     let mut next = 0usize;
     while next < chunk.len() {
         let mut out = Vec::new();
-        let consumed =
+        let advanced =
             frame_one_block(&chunk, next, BGZF_MAX_BLOCK_SIZE, &mut out).expect("template framing");
-        assert!(consumed > 0, "framing must make progress on every call");
-        next += consumed;
+        assert!(advanced > next, "framing must make progress on every call");
+        next = advanced;
         blocks.push(out);
     }
     assert_eq!(next, payloads.len(), "every template record is framed");

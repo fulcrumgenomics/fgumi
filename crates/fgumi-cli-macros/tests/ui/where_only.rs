@@ -1,3 +1,6 @@
+//! A `where` clause with no type parameters must still be rejected, and the
+//! diagnostic must point at the clause: spanning on an empty `Generics` would
+//! collapse to the call site.
 use fgumi_cli_macros::multi_options;
 
 #[multi_options("probe", "Probe Options")]

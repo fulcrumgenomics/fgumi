@@ -28,7 +28,7 @@
 //!
 //! [`PooledChunkWriter`]: crate::pooled_chunk_writer::PooledChunkWriter
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::marker::PhantomData;
 use std::path::Path;
@@ -165,7 +165,10 @@ pub(crate) struct BgzfSpillWriter<K: RawSortKey> {
 
 impl<K: RawSortKey> BgzfSpillWriter<K> {
     fn create(path: &Path, level: u32) -> Result<Self> {
-        let file = File::create(path)?;
+        // `create_new` fails closed on a duplicate/stale path rather than
+        // truncating an existing spill and silently corrupting merge input —
+        // matching `SpillWrite::open_file`.
+        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         let writer = BufWriter::with_capacity(256 * 1024, file);
         Ok(Self {
             writer,
@@ -235,7 +238,8 @@ pub(crate) struct ZstdSpillWriter<K: RawSortKey> {
 
 impl<K: RawSortKey> ZstdSpillWriter<K> {
     fn create(path: &Path, level: u32) -> Result<Self> {
-        let file = File::create(path)?;
+        // See `BgzfSpillWriter::create`: exclusive creation, never truncation.
+        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         let mut writer = BufWriter::with_capacity(256 * 1024, file);
         writer.write_all(&ZSPILL_MAGIC)?;
         #[allow(clippy::cast_possible_wrap)]

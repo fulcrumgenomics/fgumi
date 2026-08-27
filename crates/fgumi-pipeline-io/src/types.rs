@@ -83,8 +83,21 @@ pub struct RecordBatch {
 
 impl RecordBatch {
     /// Construct a batch from a pre-parsed backing buffer and `(start, end)` ranges.
+    ///
+    /// Each range must satisfy `start <= end <= backing.len()`; callers own that
+    /// invariant (the boundary scans that produce these ranges already validate
+    /// it). Violating it panics later in
+    /// [`iter_record_bytes`](Self::iter_record_bytes) when the range is sliced,
+    /// far from the site that produced it — the `debug_assert!` pins the failure
+    /// at the constructor boundary instead. Note that `total_bytes` reports
+    /// `backing.len()`, which differs from the sum of the record bodies if the
+    /// ranges do not cover the whole buffer.
     #[must_use]
     pub fn from_parsed(batch_serial: u64, backing: Vec<u8>, ranges: Vec<(u32, u32)>) -> Self {
+        debug_assert!(
+            ranges.iter().all(|&(s, e)| s <= e && e as usize <= backing.len()),
+            "RecordBatch::from_parsed: range outside backing buffer"
+        );
         Self { batch_serial, backing, ranges }
     }
 

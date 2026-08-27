@@ -160,6 +160,10 @@ impl SpillBlockCompressor {
                 let mut out = Vec::new();
                 for block in compressor.take_blocks() {
                     out.extend_from_slice(&block.data);
+                    // The bytes are copied into `out`, so the block buffer is
+                    // free; hand it back so the next block reuses the allocation
+                    // instead of allocating a fresh output `Vec` per 64 KiB block.
+                    compressor.recycle_buffer(block.data);
                 }
                 Ok(out)
             }
@@ -400,8 +404,11 @@ mod tests {
         let keyed: Vec<(TemplateKey, fgumi_raw_bam::RawRecord)> =
             records.iter().map(|(k, r)| (*k, fgumi_raw_bam::RawRecord::from(r.clone()))).collect();
         for (codec, level) in [(SpillCodec::Zstd, 3), (SpillCodec::Bgzf, 1)] {
-            let kernel_path = dir.path().join("kernel.keyed");
-            let oracle_path = dir.path().join("oracle.keyed");
+            // Unique paths per codec: the spill writers now create files
+            // exclusively (`create_new`), so a path may not be reused across
+            // iterations.
+            let kernel_path = dir.path().join(format!("kernel_{codec:?}.keyed"));
+            let oracle_path = dir.path().join(format!("oracle_{codec:?}.keyed"));
             write_via_kernel(&kernel_path, codec, level, &records, 11);
             crate::write_sorted_chunk(&oracle_path, codec, level, &keyed).unwrap();
             assert_eq!(

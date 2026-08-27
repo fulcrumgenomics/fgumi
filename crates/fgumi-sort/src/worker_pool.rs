@@ -142,7 +142,7 @@ pub(crate) fn read_length_prefix<R: std::io::Read + ?Sized>(
 /// bounded by the staging buffer (`BGZF_MAX_BLOCK_SIZE` + padding ~= 68 KB);
 /// this leaves slack but stays small enough that per-frame allocations don't
 /// dominate the merge phase when there are many tens of thousands of frames.
-const ZSTD_FRAME_DECOMP_CAP: usize = 256 * 1024;
+pub(crate) const ZSTD_FRAME_DECOMP_CAP: usize = 256 * 1024;
 
 /// Hard cap on the `u32 LE` length prefix of any zstd spill frame. Frames are
 /// produced one per ~64 KiB of input by `compress_job`; even

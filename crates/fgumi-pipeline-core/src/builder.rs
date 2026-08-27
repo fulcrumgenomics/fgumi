@@ -106,18 +106,21 @@ pub struct PipelineConfig {
     /// during the run, and the caller reads them after `run` returns.
     /// `None` (the default) keeps the worker loop on its zero-cost path.
     pub stats: Option<Arc<PipelineStats>>,
-    /// Deadlock-detection timeout in seconds. When > 0 and `stats` is set,
-    /// `Pipeline::run` spawns a background monitor that polls the stats
-    /// snapshot every `timeout / 4` seconds (clamped to ≥1s). If no step
-    /// has progressed (or finished) for `timeout` seconds, the monitor
-    /// logs the snapshot at warn level so the user has a starting point
-    /// for debugging the stall. `0` (default) disables the monitor.
+    /// Deadlock-detection timeout in seconds. When > 0, `Pipeline::run`
+    /// spawns a background monitor that polls liveness every `timeout / 4`
+    /// seconds (clamped to ≥1s). If no step has progressed (or finished) for
+    /// `timeout` seconds, the monitor logs at warn level so the user has a
+    /// starting point for debugging the stall. `0` (default) disables the
+    /// monitor.
+    ///
+    /// `stats` is **optional** and independent of arming: liveness comes from
+    /// [`crate::liveness::LivenessCounter`], and a stats handle only adds the
+    /// per-step snapshot to the stall report. The helpers in
+    /// `commands/common.rs` auto-attach a stats handle when this is non-zero so
+    /// those reports are populated without callers pairing the two flags.
     ///
     /// Mirrors the legacy framework's `--deadlock-timeout` semantics
-    /// (default 10s, 0 = disabled). Stats must be enabled for the
-    /// monitor to have anything to read; the helpers in
-    /// `commands/common.rs` auto-attach a stats handle when this is
-    /// non-zero so callers don't have to pair the two flags manually.
+    /// (default 10s, 0 = disabled).
     pub deadlock_timeout_secs: u64,
     /// Total byte budget for byte-bounded queues across the chain.
     /// `None` keeps each queue at the per-step limit set by its
@@ -1521,9 +1524,17 @@ const DEADLOCK_FATAL_MULTIPLE: u64 = 6;
 /// holding items whose `heap_size()` is 0 also reports zero here, however many
 /// are queued. A wedge stranding only such items therefore classifies as
 /// [`StallVerdict::Starving`], which resets the stall clock on every poll, so
-/// `deadlock_timeout_secs` can never fail it. Production item types
-/// (record batches, BGZF blocks) all carry real heap payloads, so this affects
-/// zero-heap item types only.
+/// `deadlock_timeout_secs` can never fail it. Most production item types
+/// (record batches, BGZF blocks) carry real heap payloads, but at least one does
+/// not: `InflatedBlock` (the arena-ingest completion token, whose payload lives
+/// in the shared arena rather than on its own heap) reports `heap_size() == 0` by
+/// design, so a `ByteBounded` edge carrying only inflated-block tokens is
+/// invisible to this probe. That edge is **not** wired into a monitored
+/// production chain today (the arena front is exercised only by its own
+/// tests/benches). Before it is, close the gap at the source — give
+/// `InflatedBlock` a `size_of::<Self>()` base (as the sort control events already
+/// do) — or have the monitor consult queue *occupancy*, not just bytes, on the
+/// starvation branch. Until then this remains a latent, unreachable gap.
 fn in_flight_bytes(contexts: &crate::runtime::contexts::ChainContexts) -> u64 {
     contexts
         .bounded_queues

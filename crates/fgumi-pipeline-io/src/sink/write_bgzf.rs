@@ -295,6 +295,95 @@ mod tests {
         assert_eq!(tail, &BGZF_EOF, "file ends with BGZF EOF marker");
     }
 
+    /// Positive coverage for the drained-finish branch of `try_run`, driven
+    /// through a real 2-step pipeline (block source → sink): the sink must write
+    /// exactly one trailing `BGZF_EOF` and retire its state. The negative branch
+    /// (`drop_before_finish_does_not_append_eof_marker`) and the by-hand EOF
+    /// (`header_only_round_trip`) left this positive path — the one that decides
+    /// whether an output BAM is a valid, EOF-terminated stream — otherwise unpinned.
+    #[test]
+    fn try_run_drained_finish_writes_exactly_one_eof() {
+        use fgumi_pipeline_core::{
+            Unpushed,
+            builder::{Pipeline, PipelineConfig},
+            held::HeldSlot,
+            outputs::OrderedBytesSingle,
+            queues::QueueSpec,
+            reorder::BranchOrdering,
+        };
+
+        /// Exclusive source draining a `Vec<BgzfBlock>`, one block per `try_run`.
+        struct BlockSource {
+            blocks: Vec<BgzfBlock>,
+            held: HeldSlot<Unpushed<BgzfBlock>>,
+        }
+        impl Step for BlockSource {
+            type Input = ();
+            type Outputs = OrderedBytesSingle<BgzfBlock>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "BlockSource",
+                    kind: StepKind::Exclusive,
+                    sticky: true,
+                    output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 20 }],
+                    branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+                }
+            }
+            fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                if let Some(unpushed) = self.held.take()
+                    && let Err(again) = ctx.outputs.retry(unpushed)
+                {
+                    self.held.put(again);
+                    return Ok(StepOutcome::Progress);
+                }
+                let Some(block) = self.blocks.pop() else {
+                    return Ok(StepOutcome::Finished);
+                };
+                if let Err(unpushed) = ctx.outputs.push(block) {
+                    self.held.put(unpushed);
+                }
+                Ok(StepOutcome::Progress)
+            }
+        }
+
+        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let sink = WriteBgzfFile::new(&path, &empty_header(), 1).unwrap();
+
+        // Two payload blocks with dense ordinals (0, 1). `pop()` drains the tail
+        // first, so ordinal 0 is emitted before ordinal 1 for the `ByItemOrdinal`
+        // reorder stage. The bytes are arbitrary non-EOF markers.
+        let blocks = vec![
+            BgzfBlock { batch_serial: 1, bytes: vec![0xAB; 16], uncompressed_size: 0 },
+            BgzfBlock { batch_serial: 0, bytes: vec![0xCD; 16], uncompressed_size: 0 },
+        ];
+        let source = BlockSource { blocks, held: HeldSlot::new() };
+
+        let builder = Pipeline::builder();
+        builder.chain(source).chain(sink).into_sink_marker();
+        let pipeline = builder.build().expect("pipeline builds");
+        pipeline
+            .run(PipelineConfig { threads: 2, ..Default::default() })
+            .expect("pipeline runs to completion");
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() >= 28, "header + payload + EOF present");
+        assert_eq!(
+            &bytes[bytes.len() - 28..],
+            &BGZF_EOF,
+            "the drained-finish path terminates the stream with a BGZF EOF marker"
+        );
+        // Exactly one trailing EOF: stripping it must not reveal a second, which
+        // is what a stray `Drop`-side append would produce.
+        let without_eof = &bytes[..bytes.len() - 28];
+        assert!(
+            without_eof.len() < 28 || without_eof[without_eof.len() - 28..] != BGZF_EOF,
+            "only the drained-finish path may append EOF; Drop must not add a second"
+        );
+        // Both payload blocks reached disk.
+        assert!(bytes.windows(16).any(|w| w == [0xAB; 16]), "first block written");
+        assert!(bytes.windows(16).any(|w| w == [0xCD; 16]), "second block written");
+    }
+
     #[test]
     fn new_with_handle_defers_header_until_resolved() {
         let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();

@@ -6,11 +6,12 @@
 //! global ordering across multi-step Parallel transforms).
 //!
 //! Serial propagation: every transform copies the input's `batch_serial`
-//! onto its output items. For Serial steps that span batch boundaries
-//! (`FindBamBoundaries`, `GroupBam`), the output's serial is the
-//! serial of the *last* contributing input — this preserves monotonicity
-//! since the output ordinal of batch N is always ≥ the output ordinal of
-//! batch N-1.
+//! onto its output items when the mapping is 1:1. Steps that aggregate or
+//! split across input batches (`GroupBam`, `GroupByPosition`,
+//! `GroupByQueryname`) instead mint their own monotonic counter from 0, one
+//! value per emitted batch: `ByItemOrdinal` requires a *contiguous* sequence,
+//! and inheriting an input serial would skip ordinals and stall the
+//! downstream `ReorderStage`.
 //!
 //! `BamTemplateBatch` is named to disambiguate from
 //! `crate::template::TemplateBatch` (a legacy type alias for

@@ -27,7 +27,7 @@ use fgumi_pipeline_core::{
 /// Legacy default blocks-per-batch.
 pub const DEFAULT_BLOCKS_PER_BATCH: usize = 16;
 
-/// `Exclusive + sticky` source step that reads raw BGZF blocks from a file.
+/// `Serial + sticky` source step that reads raw BGZF blocks from a file.
 ///
 /// The reader and the finished flag are plain owned fields, not `Arc`/atomics:
 /// this is a `Serial` step, so the runtime drives a single shared instance and
@@ -194,8 +194,16 @@ pub fn read_bam<P: AsRef<Path>>(
         .map_err(|e| io::Error::other(format!("create_raw_bam_reader_with_opts: {e}")))?;
 
     let file = File::open(path)?;
-    let reader: Box<dyn io::Read + Send> =
-        Box::new(io::BufReader::with_capacity(2 * 1024 * 1024, file));
+    // Honor `async_reader` for the reopened raw block stream too — not just the
+    // temporary header reader above — so a regular file prefetches like the
+    // stdin path (`read_bam_stdin`) does. `verify_crc` does not apply here:
+    // `ReadBgzfBlocks` forwards compressed bytes without decoding them.
+    let reader: Box<dyn io::Read + Send> = if opts.async_reader {
+        log::info!("async read enabled: spawning fgumi-prefetch thread for {}", path.display());
+        Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file))
+    } else {
+        Box::new(io::BufReader::with_capacity(2 * 1024 * 1024, file))
+    };
     Ok(read_bam_from_reader(reader, header, blocks_per_batch, output_byte_limit))
 }
 

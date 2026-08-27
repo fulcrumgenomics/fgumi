@@ -22,9 +22,9 @@ use std::io::{self, Read};
 /// (`BGZF_MAX_BLOCK_SIZE` + padding ~= 68 KB), so 256 KiB leaves comfortable
 /// slack. If a frame ever decompresses to more bytes than this,
 /// `zstd::bulk::Decompressor::decompress_to_buffer` surfaces a clear error
-/// rather than silently truncating. Kept in sync with `ZSTD_FRAME_DECOMP_CAP`
-/// in `worker_pool.rs`.
-const FRAME_DECOMP_CAP: usize = 256 * 1024;
+/// rather than silently truncating. Reuses `worker_pool::ZSTD_FRAME_DECOMP_CAP`
+/// so producer and consumer share one source and cannot drift.
+const FRAME_DECOMP_CAP: usize = crate::worker_pool::ZSTD_FRAME_DECOMP_CAP;
 
 /// Streaming decompressor for "ZSP1" spill files.
 pub struct ZspillStreamReader<R: Read> {

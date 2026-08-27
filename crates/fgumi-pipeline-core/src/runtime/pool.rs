@@ -258,7 +258,8 @@ mod tests {
         let exclusive_owners = vec![Some(0_usize), Some(0_usize)];
         let sticky = assign_sticky_owners(&steps, &exclusive_owners, 4);
         // First step wins; second is skipped because slot[0] is already occupied.
-        assert_eq!(sticky[0], Some(StepIdx(0)));
+        // The loser must not land in any other slot either.
+        assert_only_slot(&sticky, 4, Some(0));
     }
 
     #[rstest]
@@ -288,7 +289,8 @@ mod tests {
         let steps: Vec<Box<dyn ErasedStep>> = vec![exc, ser];
         let exclusive_owners = vec![Some(0_usize), None];
         let sticky = assign_sticky_owners(&steps, &exclusive_owners, 4);
-        // Exclusive (step 0) wins slot 0; Serial (step 1) is blocked.
-        assert_eq!(sticky[0], Some(StepIdx(0)));
+        // Exclusive (step 0) wins slot 0; Serial (step 1) is blocked — and the
+        // blocked serial step must not land in any other slot either.
+        assert_only_slot(&sticky, 4, Some(0));
     }
 }

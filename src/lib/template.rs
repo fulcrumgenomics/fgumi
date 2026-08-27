@@ -1094,9 +1094,19 @@ mod tests {
         // (`records.capacity() * size_of::<RawRecord>()`). The empty-records case
         // left both at zero, so a dropped record term would have gone unnoticed.
         let mut records: Vec<RawRecord> = Vec::with_capacity(8);
-        records.push(create_test_raw(b"read1", raw_flags::PAIRED | raw_flags::FIRST_SEGMENT));
+        let mut first = create_test_raw(b"read1", raw_flags::PAIRED | raw_flags::FIRST_SEGMENT);
+        // Force spare capacity on one record so the per-record term is genuinely
+        // capacity-based, not length-based: with `capacity() == len()` a
+        // regression from `RawRecord::capacity()` to `len()` would leave the
+        // total unchanged and slip through.
+        first.as_mut_vec().reserve(64);
+        records.push(first);
         records.push(create_test_raw(b"read1", raw_flags::PAIRED | raw_flags::LAST_SEGMENT));
         template.records = records;
+        assert!(
+            template.records.iter().any(|r| r.capacity() > r.len()),
+            "a record must carry spare capacity so the per-record term is capacity-based",
+        );
 
         // heap_size (pipeline byte-budget) and estimate_heap_size (MemoryEstimate)
         // are a single source of truth — they must never diverge.
@@ -1106,17 +1116,19 @@ mod tests {
             "heap_size and estimate_heap_size must agree",
         );
 
-        // Independent lower bound re-derived from the components in the test (NOT
-        // via estimate_heap_size, which delegates to heap_size and is tautological).
-        // If heap_size ever drops the record-buffer or Vec-backing term, this trips.
+        // Exact component total re-derived in the test (NOT via
+        // estimate_heap_size, which delegates to heap_size and is tautological).
+        // `heap_size` is exactly these three terms, so an exact equality catches a
+        // dropped record-buffer/Vec-backing term AND a capacity()→len() regression
+        // on the record buffers (which the spare capacity above makes observable).
         let record_bytes = template.records.iter().map(RawRecord::capacity).sum::<usize>();
         let vec_backing = template.records.capacity() * std::mem::size_of::<RawRecord>();
-        let expected_min = template.name.capacity() + record_bytes + vec_backing;
-        assert!(
-            template.heap_size() >= expected_min,
-            "heap_size {} must cover queryname ({}) + record buffers ({record_bytes}) + \
-             Vec<RawRecord> backing ({vec_backing})",
+        let expected_exact = template.name.capacity() + record_bytes + vec_backing;
+        assert_eq!(
             template.heap_size(),
+            expected_exact,
+            "heap_size must equal queryname ({}) + record buffers ({record_bytes}) + \
+             Vec<RawRecord> backing ({vec_backing})",
             template.name.capacity(),
         );
         // The record terms must be non-trivial: real byte buffers and the reserved

@@ -853,15 +853,19 @@ impl<S: Step2> ErasedStep for TypedStep2<S> {
 
     fn build_fused_output_set(
         &self,
-        level: crate::builder::InstrumentationLevel,
+        _level: crate::builder::InstrumentationLevel,
     ) -> (OutputQueueSet, OutputsViewAny) {
-        // `Step2` never appears in a linear (single-input) fused chain, so this
-        // is unreachable in practice; provided for trait completeness with the
-        // same direct-transport / profile-bounds semantics as the single-input
-        // adapter.
-        let profile = self.inner.profile();
-        let orderings = vec![BranchOrdering::None; profile.output_queues.len()];
-        <S::Outputs as StepOutputs>::build_queues(&profile.output_queues, &orderings, level)
+        // `is_fusible_chain` rejects any step with `input_arity() > 1`, so a
+        // `Step2` never reaches the fused driver. Collapsing its ordering to
+        // `None` here would drop the reorder stage that `build_output_set`
+        // documents as load-bearing for a merge, so refuse instead of
+        // returning an unordered transport.
+        panic!(
+            "build_fused_output_set called on Step2 adapter '{}': fusing a \
+             two-input merge would drop its load-bearing reorder stage. \
+             Extend the fused driver's ordering handling before allowing this.",
+            self.name
+        );
     }
 
     fn wrap_outputs_view(&self, view: OutputsViewAny) -> Box<dyn Any + Send + Sync> {

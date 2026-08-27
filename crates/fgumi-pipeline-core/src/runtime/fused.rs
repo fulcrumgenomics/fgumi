@@ -757,11 +757,14 @@ mod tests {
     /// used here to keep the test fast; the assertion is that the run fails inside
     /// its own budget and names the wedged step.
     ///
-    /// `#[should_panic]` rather than an error assertion: the `debug_assert!` on the
-    /// stall path fires first in a test build, which is itself the contract (a
-    /// genuine wedge must be loud in tests).
+    /// Gated `#[should_panic]` rather than an unconditional one: the
+    /// `debug_assert!` on the stall path fires first in a debug test build, which
+    /// is itself the contract (a genuine wedge must be loud in tests). In a
+    /// release test build that `debug_assert!` is compiled out, so the driver
+    /// records the stall and returns `Err` instead — the in-body assertions cover
+    /// that path, and the `should_panic` expectation must not apply there.
     #[test]
-    #[should_panic(expected = "fused single-thread driver stalled")]
+    #[cfg_attr(debug_assertions, should_panic(expected = "fused single-thread driver stalled"))]
     fn drive_reports_a_real_stall_within_the_configured_budget() {
         let mut graph = ChainGraph::new();
         let src = graph.register_step("WedgedSource", 1);

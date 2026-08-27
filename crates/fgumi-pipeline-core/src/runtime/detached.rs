@@ -288,6 +288,11 @@ pub fn build_driver_storage(
 ) -> Vec<WorkerStepEntry> {
     let mut row: Vec<WorkerStepEntry> = (0..n_total_steps).map(|_| WorkerStepEntry::Skip).collect();
     for (idx, step) in group_steps {
+        assert!(
+            idx.0 < n_total_steps,
+            "driver group step index {} out of range (chain has {n_total_steps} steps)",
+            idx.0
+        );
         assert_ne!(
             step.kind(),
             StepKind::Parallel,
@@ -780,5 +785,15 @@ mod tests {
         let a: Box<dyn ErasedStep> = Box::new(TypedStep::new(PassThroughDetached { held: None }));
         let b: Box<dyn ErasedStep> = Box::new(TypedStep::new(PassThroughDetached { held: None }));
         let _ = build_driver_storage(vec![(StepIdx(1), a), (StepIdx(1), b)], 3);
+    }
+
+    /// G3: a group step index past `n_total_steps` is the documented out-of-range
+    /// panic, matching the guard the sibling `build_worker_storage` applies —
+    /// without it the bare `row[idx.0]` index would panic with an opaque message.
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn build_driver_storage_rejects_out_of_range_index() {
+        let det: Box<dyn ErasedStep> = Box::new(TypedStep::new(PassThroughDetached { held: None }));
+        let _ = build_driver_storage(vec![(StepIdx(5), det)], 3);
     }
 }

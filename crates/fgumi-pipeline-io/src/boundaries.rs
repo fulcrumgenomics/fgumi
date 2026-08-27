@@ -13,6 +13,14 @@
 
 use std::io;
 
+/// Upper bound on a single BAM record's `block_size`. The `block_size` prefix is
+/// read straight from the input bytes, so a corrupt or hostile value (e.g.
+/// `0xFFFF_FFFF`) would otherwise make the scanner buffer the whole unconsumed
+/// tail into `leftover` — up to ~4 GiB from a 4-byte corruption — and only fail
+/// at [`BoundaryState::finish`]. A record larger than this is corruption, not
+/// data; reject it at the point the prefix is read.
+const MAX_RECORD_BLOCK_SIZE: usize = 64 * 1024 * 1024;
+
 /// Output of `FindBoundaries` step: buffer + record offsets for parallel decoding.
 ///
 /// This struct enables parallel BAM record decoding by pre-computing where
@@ -270,6 +278,15 @@ impl BoundaryState {
                 self.work_buffer[cursor + 2],
                 self.work_buffer[cursor + 3],
             ]) as usize;
+            if block_size > MAX_RECORD_BLOCK_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "BAM record block_size {block_size} exceeds the maximum \
+                         {MAX_RECORD_BLOCK_SIZE} (corrupt or truncated input)"
+                    ),
+                ));
+            }
             let record_end = cursor + 4 + block_size;
             if record_end > self.work_buffer.len() {
                 break; // Incomplete record - becomes leftover.
@@ -320,6 +337,15 @@ impl BoundaryState {
                 self.leftover[cursor + 3],
             ]) as usize;
 
+            if block_size > MAX_RECORD_BLOCK_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "BAM record block_size {block_size} exceeds the maximum \
+                         {MAX_RECORD_BLOCK_SIZE} (corrupt or truncated input)"
+                    ),
+                ));
+            }
             let record_end = cursor + 4 + block_size;
             if record_end > self.leftover.len() {
                 return Err(io::Error::new(

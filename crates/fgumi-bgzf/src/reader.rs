@@ -555,7 +555,7 @@ fn decompress_and_verify(
     // "stored". `payload_len == LEN + 5` is the structural guarantee that
     // there's exactly one stored sub-block spanning the BGZF payload — the
     // form every real level-0 producer emits.
-    if !compressed.is_empty() && compressed[0] & 0b110 == 0 {
+    if is_stored_block(compressed) {
         return copy_stored_and_verify(
             compressed,
             uncompressed_size,
