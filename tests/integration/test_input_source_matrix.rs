@@ -39,8 +39,8 @@ use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{
     create_consensus_family, create_duplex_grouped_family, create_grouped_family,
-    create_minimal_header, create_single_strand_family, create_test_reference, create_umi_family,
-    transcode_bam_to_sam, write_bam,
+    create_minimal_header, create_read_name_umi_records, create_single_strand_family,
+    create_test_reference, create_umi_family, transcode_bam_to_sam, write_bam,
 };
 
 /// Whether a command is held to one of the properties [`CONTRACTS`] declares.
@@ -183,6 +183,13 @@ const CONTRACTS: &[IoContract] = &[
     },
     IoContract {
         command: "retag",
+        sam: Required,
+        stdin: Required,
+        stdout: Required,
+        output_depends_on_input: Required,
+    },
+    IoContract {
+        command: "copy-umi",
         sam: Required,
         stdin: Required,
         stdout: Required,
@@ -359,6 +366,8 @@ enum Shape {
     SimplexGrouped,
     /// Overlapping read pairs tagged `MI` + `MC`, the CODEC shape.
     Codec,
+    /// Reads with the UMI in the last `:`-field of the name and no `RX` tag.
+    ReadNameUmi,
 }
 
 /// The record shape `command` requires.
@@ -384,6 +393,9 @@ fn shape_for(command: &str) -> Shape {
         // CODEC gets duplex from a single overlapping pair rather than from two
         // strand-tagged templates, so it needs its own shape.
         "codec" => Shape::Codec,
+        // `copy-umi` reads the UMI from the read name and rejects names without
+        // one, so it needs names carrying a UMI field rather than tagged families.
+        "copy-umi" => Shape::ReadNameUmi,
         _ => Shape::Ungrouped,
     }
 }
@@ -429,6 +441,7 @@ fn write_fixture(dir: &Path, command: &str) -> Fixture {
                 [r1, r2]
             })
             .collect(),
+        Shape::ReadNameUmi => create_read_name_umi_records(),
     };
     write_bam(&bam, &header, &records);
 
@@ -525,6 +538,7 @@ fn invocation(command: &str) -> Option<Vec<&'static str>> {
             ]
         }
         "retag" => vec!["retag", "-i", "{input}", "-o", "{output}", "RX::copy::BX"],
+        "copy-umi" => vec!["copy-umi", "-i", "{input}", "-o", "{output}"],
         "duplex-metrics" => vec!["duplex-metrics", "-i", "{input}", "-o", "{output}"],
         "simplex-metrics" => vec!["simplex-metrics", "-i", "{input}", "-o", "{output}"],
         "downsample" => {

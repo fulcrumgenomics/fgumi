@@ -238,6 +238,29 @@ pub fn to_record_buf(raw: &RawRecord) -> RecordBuf {
         .expect("raw_record_to_record_buf should succeed in test")
 }
 
+/// Records whose UMI lives in the last `:`-delimited field of the read name and
+/// which carry *no* `RX` tag — the input shape `copy-umi` consumes.
+///
+/// Two mapped reads at one position with Illumina-shaped names ending in a UMI
+/// field, so `copy-umi` writes a distinct `RX` per read (and an empty input
+/// yields a header-only file, keeping the output-depends-on-input axis honest).
+pub fn create_read_name_umi_records() -> Vec<RawRecord> {
+    ["inst:1:FC:1:1101:5:1:ACGT", "inst:1:FC:1:1101:5:2:TTGG"]
+        .iter()
+        .map(|name| {
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .ref_id(0)
+                .pos(100)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]);
+            b.build()
+        })
+        .collect()
+}
+
 /// Creates a UMI family with specified parameters.
 ///
 /// All reads in the family are mapped to reference sequence 0 at position 100

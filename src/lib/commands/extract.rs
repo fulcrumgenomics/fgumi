@@ -957,9 +957,13 @@ impl Extract {
             && let Some(last) = parts.last()
             && !last.is_empty()
         {
-            let umi = crate::umi::read_name::normalize_read_name_umi(last).with_context(|| {
-                format!("extracting UMI from read name '{}'", String::from_utf8_lossy(name_part))
-            })?;
+            let umi =
+                crate::umi::read_name::normalize_read_name_umi(last, true).with_context(|| {
+                    format!(
+                        "extracting UMI from read name '{}'",
+                        String::from_utf8_lossy(name_part)
+                    )
+                })?;
             return Ok((name_part.to_vec(), Some(umi)));
         }
 
@@ -2982,6 +2986,15 @@ mod tests {
         let header = b"@q1:2:3:4:5:6:7:ACGT+CGTA".to_vec();
         let (_name, umi) = Extract::extract_read_name_and_umi(&header, true).unwrap();
         assert_eq!(umi, Some(b"ACGT-CGTA".to_vec()));
+    }
+
+    #[test]
+    fn test_extract_read_name_and_umi_rejects_field_that_normalizes_to_empty() {
+        // An 8-field name whose UMI field is a bare `r` normalizes to empty; the
+        // shared normalizer rejects it rather than emitting an empty RX.
+        let header = b"@q1:2:3:4:5:6:7:r".to_vec();
+        let err = Extract::extract_read_name_and_umi(&header, true).unwrap_err();
+        assert!(format!("{err:#}").contains("empty"), "got: {err:#}");
     }
 
     #[test]

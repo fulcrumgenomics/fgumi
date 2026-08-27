@@ -139,6 +139,7 @@ Enable with: `cargo build --release --features <feature>`
 | `review` | Review consensus variants | `fgbio ReviewConsensusVariants` |
 | `downsample` | Downsample BAM by UMI family | N/A |
 | `retag` | Rewrite SAM tags (copy/move/delete) | N/A |
+| `copy-umi` | Copy the UMI from the read name into the RX tag | `fgbio CopyUmiFromReadName` |
 | `compare <cmd>` | Compare files (feature-gated) | N/A |
 | `simulate <cmd>` | Generate test data (feature-gated) | N/A |
 
