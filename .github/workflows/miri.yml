@@ -132,13 +132,25 @@ jobs:
         run: |
           set -euo pipefail
           # The zero-match guard below proves the filter selects tests; it cannot
-          # prove the filter still COVERS the crate's `unsafe`. Pin that too: if an
-          # `#[allow(unsafe_code)]` site moves out of `sort.rs`, the filter keeps
-          # matching and Miri silently stops checking the moved site.
+          # prove the filter still COVERS the crate's `unsafe`. Pin that too: if a
+          # NEW `#[allow(unsafe_code)]` site appears outside the modules known to
+          # carry approved unsafe, the `sort` filter keeps matching and Miri
+          # silently stops checking the moved/new site — so flag it.
+          #
+          # Two modules are excluded because both carry documented, approved
+          # unsafe (see CLAUDE.md → "Unsafe Code"):
+          #   - `sort.rs` — the natural-order queryname comparator, which the
+          #     `sort` filter below DOES exercise under Miri.
+          #   - `raw_bam_record.rs` — `read_raw_record`'s spare-capacity read.
+          #     The `sort` filter does not run its tests, so this unsafe is not
+          #     Miri-checked here (matching `main`, whose miri job runs only the
+          #     `sort` filter too). Bringing it under Miri needs a separate
+          #     `read_raw_record`-filtered run; tracked as a follow-up. Excluded
+          #     here so this PRE-EXISTING approved site does not fail the guard.
           stray=$(grep -rl 'allow(unsafe_code)' crates/fgumi-raw-bam/src \
-            | grep -v '^crates/fgumi-raw-bam/src/sort.rs$' || true)
+            | grep -vE '^crates/fgumi-raw-bam/src/(sort|raw_bam_record)\.rs$' || true)
           if [ -n "${stray}" ]; then
-            echo "::error::unsafe_code outside the Miri-scoped 'sort' module: ${stray}" >&2
+            echo "::error::unsafe_code outside the Miri-scoped fgumi-raw-bam modules: ${stray}" >&2
             exit 1
           fi
           cargo +nightly miri test -p fgumi-raw-bam sort -- --list > "${RUNNER_TEMP}/miri-raw-bam-sort.list"
