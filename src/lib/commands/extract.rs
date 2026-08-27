@@ -24,6 +24,7 @@ use crate::commands::common::{
 use crate::fastq::FastqSegment;
 use crate::fastq::FastqSet;
 use crate::fastq::ReadSetIterator;
+use crate::fastq_deinterleave::deinterleave;
 use crate::fastq_parse::strip_read_suffix;
 use crate::grouper::FastqTemplate;
 use crate::logging::OperationTimer;
@@ -578,6 +579,14 @@ pub struct Extract {
     #[arg(long, short = 'r', num_args = 0..)]
     read_structures: Vec<ReadStructure>,
 
+    /// Treat a single input as interleaved paired-end FASTQ (`R1, R2, R1, R2, …`),
+    /// de-interleaving it into the two reads. Requires exactly one `--input` (a
+    /// file or `-` for stdin) and describes both reads with two `--read-structures`
+    /// (defaults to `+T +T`). This lets a streaming trimmer or converter pipe
+    /// interleaved pairs straight into extract without staging two FASTQ files.
+    #[arg(long = "interleaved", short = 'p', default_value_t = false)]
+    interleaved: bool,
+
     /// Store UMI base quality scores in the QX SAM tag
     #[arg(long, short = 'q', conflicts_with = "extract_umis_from_read_names")]
     store_umi_quals: bool,
@@ -712,13 +721,21 @@ impl Extract {
         !self.no_check_crc
     }
 
-    /// Get actual read structures (default to +T if none provided for 1-2 FASTQs)
+    /// Get actual read structures (default to +T if none provided).
+    ///
+    /// For interleaved input the two reads share one physical stream, so the
+    /// default is two `+T` structures regardless of the single `--input`; the
+    /// normal path defaults to one `+T` per FASTQ for 1-2 FASTQs.
     fn get_read_structures(&self) -> Result<Vec<ReadStructure>> {
-        if self.read_structures.is_empty() && (1..=2).contains(&self.inputs.len()) {
-            Ok(vec![ReadStructure::from_str("+T")?; self.inputs.len()])
-        } else {
-            Ok(self.read_structures.clone())
+        if self.read_structures.is_empty() {
+            if self.interleaved {
+                return Ok(vec![ReadStructure::from_str("+T")?; 2]);
+            }
+            if (1..=2).contains(&self.inputs.len()) {
+                return Ok(vec![ReadStructure::from_str("+T")?; self.inputs.len()]);
+            }
         }
+        Ok(self.read_structures.clone())
     }
 
     /// Open every input FASTQ as a decompressed reader.
@@ -737,6 +754,25 @@ impl Extract {
         decomp_threads: usize,
         stdin_reader: Option<Box<dyn BufRead + Send>>,
     ) -> Result<Vec<Box<dyn BufRead + Send>>> {
+        // Interleaved: one physical source (stdin or the sole file), split into
+        // an R1 and an R2 reader. Validation guarantees exactly one input, so the
+        // stdin reader — when present — is that whole source. Decompression has
+        // already happened (stdin via the pre-opened reader, a file via
+        // `open_fastq_reader`), so the de-interleaver splits decompressed bytes.
+        if self.interleaved {
+            let source = match stdin_reader {
+                Some(reader) => reader,
+                None => open_fastq_reader(
+                    &self.inputs[0],
+                    decomp_threads,
+                    self.async_reader,
+                    self.check_crc,
+                    self.no_check_crc,
+                )?,
+            };
+            let (r1, r2) = deinterleave(source);
+            return Ok(vec![r1, r2]);
+        }
         if let Some(reader) = stdin_reader {
             return Ok(vec![reader]);
         }
@@ -758,10 +794,26 @@ impl Extract {
     fn validate(&self) -> Result<()> {
         let read_structures = self.get_read_structures()?;
 
-        ensure!(
-            self.inputs.len() == read_structures.len(),
-            "input and read-structure must be supplied the same number of times."
-        );
+        if self.interleaved {
+            // One physical stream carries both reads, so the usual
+            // one-structure-per-input equality does not apply: the single input
+            // is split into exactly two reads.
+            ensure!(
+                self.inputs.len() == 1,
+                "--interleaved requires exactly one --input (the interleaved stream); got {}.",
+                self.inputs.len()
+            );
+            ensure!(
+                read_structures.len() == 2,
+                "--interleaved requires exactly two --read-structures (one per read); got {}.",
+                read_structures.len()
+            );
+        } else {
+            ensure!(
+                self.inputs.len() == read_structures.len(),
+                "input and read-structure must be supplied the same number of times."
+            );
+        }
 
         let template_count: usize = read_structures
             .iter()
@@ -1347,7 +1399,12 @@ impl Extract {
         // Detect if all inputs are BGZF. stdin is never "all BGZF" for this
         // purpose: that path has the pipeline open the files itself, which stdin
         // cannot support, so it must take the pre-opened-reader path below.
-        let all_bgzf = stdin_reader.is_none()
+        // Interleaved is likewise never "all BGZF": the single source must be
+        // read once and de-interleaved into two readers (in `open_input_readers`),
+        // which the pipeline consumes as decompressed streams — it cannot re-open
+        // and re-split the file itself.
+        let all_bgzf = !self.interleaved
+            && stdin_reader.is_none()
             && self.inputs.iter().all(|p| {
                 detect_compression_format(p).map(|f| f == CompressionFormat::Bgzf).unwrap_or(false)
             });
@@ -1983,6 +2040,7 @@ mod tests {
             async_reader: false,
             check_crc,
             no_check_crc,
+            interleaved: false,
         }
     }
 
@@ -2142,6 +2200,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2199,6 +2258,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2260,6 +2320,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2311,6 +2372,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2371,6 +2433,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2424,6 +2487,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2484,6 +2548,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2541,6 +2606,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2605,6 +2671,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2654,6 +2721,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2726,6 +2794,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2794,6 +2863,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         let err = extract
@@ -2849,6 +2919,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2897,6 +2968,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract2.execute("test").expect("execute should succeed");
@@ -2952,6 +3024,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3008,6 +3081,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3209,6 +3283,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3262,6 +3337,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3326,6 +3402,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         // Before the fix this panicked in the builder instead of returning Err.
@@ -3485,6 +3562,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3541,6 +3619,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3591,6 +3670,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3638,6 +3718,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3683,6 +3764,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3728,6 +3810,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3781,6 +3864,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3833,6 +3917,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3887,6 +3972,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3932,6 +4018,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3991,6 +4078,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         let err =
@@ -4045,6 +4133,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -4183,6 +4272,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -4397,6 +4487,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         // Should succeed without panicking
@@ -4463,6 +4554,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -4520,6 +4612,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -4592,6 +4685,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -4656,6 +4750,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -4714,6 +4809,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         // Should succeed with all quality tag parameters specified
@@ -4765,6 +4861,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test")?;
@@ -4897,6 +4994,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test")?;
@@ -4953,6 +5051,7 @@ mod tests {
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
+            interleaved: false,
         };
 
         extract.execute("test")?;
@@ -5024,6 +5123,382 @@ mod tests {
         assert!(
             message.contains(&format!("{read_structure_count} read structure(s)")),
             "message must report the read-structure count: {message}"
+        );
+    }
+
+    /// Build an `Extract` for the interleaved-equivalence test, varying only the
+    /// inputs, output, read structures, `interleaved`, read-name UMI extraction,
+    /// and threading.
+    fn interleave_test_extract(
+        inputs: Vec<PathBuf>,
+        output: PathBuf,
+        read_structures: Vec<ReadStructure>,
+        interleaved: bool,
+        extract_umis_from_read_names: bool,
+        threading: ThreadingOptions,
+    ) -> Extract {
+        Extract {
+            inputs,
+            output,
+            read_structures,
+            store_umi_quals: false,
+            store_cell_quals: false,
+            store_sample_barcode_qualities: false,
+            extract_umis_from_read_names,
+            annotate_read_names: false,
+            single_tag: None,
+            clipping_attribute: None,
+            read_group_id: "A".to_string(),
+            sample: "s".to_string(),
+            library: "l".to_string(),
+            barcode: None,
+            platform: "illumina".to_string(),
+            platform_unit: None,
+            platform_model: None,
+            sequencing_center: None,
+            predicted_insert_size: None,
+            description: None,
+            comment: vec![],
+            run_date: None,
+            threading,
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
+            interleaved,
+        }
+    }
+
+    /// A single interleaved input (`--interleaved`) must produce exactly the same
+    /// extracted records as the equivalent pair of separate R1/R2 FASTQ files, on
+    /// both the single-threaded and the multi-threaded pipeline paths. Distinct R1
+    /// and R2 read structures (a 2 bp inline UMI on R1, template-only R2) prove the
+    /// split routes R1 → structure[0] and R2 → structure[1].
+    #[rstest]
+    #[case::single_threaded(ThreadingOptions::none())]
+    #[case::multi_threaded(ThreadingOptions::new(2))]
+    fn interleaved_input_matches_two_file_input(#[case] threading: ThreadingOptions) {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+
+        let r1_records = [("read0", "AACCCCGG", "IIIIIIII"), ("read1", "GGTTTTAA", "IIIIIIII")];
+        let r2_records = [("read0", "TTTTGGGG", "JJJJJJJJ"), ("read1", "CCCCAAAA", "JJJJJJJJ")];
+        // The same pairs, interleaved R1, R2, R1, R2.
+        let interleaved_records = [
+            ("read0", "AACCCCGG", "IIIIIIII"),
+            ("read0", "TTTTGGGG", "JJJJJJJJ"),
+            ("read1", "GGTTTTAA", "IIIIIIII"),
+            ("read1", "CCCCAAAA", "JJJJJJJJ"),
+        ];
+
+        let r1 = create_fastq(&tmp, "r1.fq", &r1_records);
+        let r2 = create_fastq(&tmp, "r2.fq", &r2_records);
+        let interleaved = create_fastq(&tmp, "interleaved.fq", &interleaved_records);
+
+        let read_structures = || {
+            vec![
+                ReadStructure::from_str("2M+T").expect("valid read structure"),
+                ReadStructure::from_str("+T").expect("valid read structure"),
+            ]
+        };
+
+        // Baseline: two separate FASTQ files.
+        let two_out = tmp.path().join("two_file.bam");
+        interleave_test_extract(
+            vec![r1, r2],
+            two_out.clone(),
+            read_structures(),
+            false,
+            false,
+            threading.clone(),
+        )
+        .execute("test")
+        .expect("two-file extract should succeed");
+
+        // Under test: one interleaved file.
+        let il_out = tmp.path().join("interleaved.bam");
+        interleave_test_extract(
+            vec![interleaved],
+            il_out.clone(),
+            read_structures(),
+            true,
+            false,
+            threading,
+        )
+        .execute("test")
+        .expect("interleaved extract should succeed");
+
+        // Compare as a multiset of (sequence, RX-UMI) — order-independent, so a
+        // difference in per-thread write order cannot mask a real mismatch.
+        let key_set = |path: &PathBuf| -> Vec<(Vec<u8>, Option<String>)> {
+            let mut keys: Vec<_> = read_bam_records(path)
+                .iter()
+                .map(|r| (r.sequence().as_ref().to_vec(), get_tag_string(r, "RX")))
+                .collect();
+            keys.sort();
+            keys
+        };
+
+        let two_keys = key_set(&two_out);
+        let il_keys = key_set(&il_out);
+        assert_eq!(il_keys.len(), 4, "expected 4 records (2 pairs)");
+        assert_eq!(il_keys, two_keys, "interleaved output must match two-file output");
+
+        // Routing proof: the UMIs are R1's first two bases ("AA"/"GG"), applied
+        // via structure[0]. Swapped R1/R2 routing would instead yield R2's leading
+        // bases ("TT"/"CC"). (Both mates of a pair carry the shared UMI, so each
+        // value appears twice before dedup.)
+        let mut umis: Vec<String> = il_keys.iter().filter_map(|(_, rx)| rx.clone()).collect();
+        umis.sort();
+        umis.dedup();
+        assert_eq!(umis, vec!["AA".to_string(), "GG".to_string()], "R1 UMIs via structure[0]");
+    }
+
+    #[test]
+    fn interleaved_rejects_multiple_inputs() {
+        let tmp = TempDir::new().expect("temp dir");
+        let a = create_fastq(&tmp, "a.fq", &[("r", "AC", "II")]);
+        let b = create_fastq(&tmp, "b.fq", &[("r", "GT", "II")]);
+        let structures = vec![
+            ReadStructure::from_str("+T").expect("rs"),
+            ReadStructure::from_str("+T").expect("rs"),
+        ];
+        let err = interleave_test_extract(
+            vec![a, b],
+            tmp.path().join("o.bam"),
+            structures,
+            true,
+            false,
+            ThreadingOptions::none(),
+        )
+        .execute("test")
+        .expect_err("two inputs with --interleaved must fail");
+        assert!(err.to_string().contains("exactly one --input"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn interleaved_requires_two_read_structures() {
+        let tmp = TempDir::new().expect("temp dir");
+        let il = create_fastq(&tmp, "i.fq", &[("r", "AC", "II"), ("r", "GT", "II")]);
+        let err = interleave_test_extract(
+            vec![il],
+            tmp.path().join("o.bam"),
+            vec![ReadStructure::from_str("+T").expect("rs")], // only one
+            true,
+            false,
+            ThreadingOptions::none(),
+        )
+        .execute("test")
+        .expect_err("a single read-structure with --interleaved must fail");
+        assert!(err.to_string().contains("exactly two --read-structures"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn interleaved_defaults_to_two_template_read_structures() {
+        let tmp = TempDir::new().expect("temp dir");
+        let il = create_fastq(&tmp, "i.fq", &[("r", "ACGT", "IIII"), ("r", "TGCA", "JJJJ")]);
+        let out = tmp.path().join("o.bam");
+        // No --read-structures given: interleaved defaults to `+T +T` (both reads
+        // template-only), so one pair yields two records.
+        interleave_test_extract(
+            vec![il],
+            out.clone(),
+            vec![],
+            true,
+            false,
+            ThreadingOptions::none(),
+        )
+        .execute("test")
+        .expect("interleaved with default read structures should succeed");
+        assert_eq!(read_bam_records(&out).len(), 2, "one interleaved pair → two records");
+    }
+
+    /// An interleaved stream with an odd record count (a final R1 with no R2
+    /// mate) must be rejected end-to-end — not silently truncated — on both the
+    /// single-threaded and pipeline paths. This pins the de-interleaver doc's
+    /// contract that the unpaired tail "surfaces as an out-of-sync error".
+    #[rstest]
+    #[case::single_threaded(ThreadingOptions::none())]
+    #[case::multi_threaded(ThreadingOptions::new(2))]
+    fn interleaved_odd_record_count_is_rejected(#[case] threading: ThreadingOptions) {
+        let tmp = TempDir::new().expect("temp dir");
+        let il = create_fastq(
+            &tmp,
+            "odd.fq",
+            &[
+                ("read0", "ACGT", "IIII"),
+                ("read0", "TGCA", "JJJJ"),
+                ("read1", "AAAA", "IIII"), // unpaired R1
+            ],
+        );
+        let structures = vec![
+            ReadStructure::from_str("+T").expect("rs"),
+            ReadStructure::from_str("+T").expect("rs"),
+        ];
+        let err = interleave_test_extract(
+            vec![il],
+            tmp.path().join("o.bam"),
+            structures,
+            true,
+            false,
+            threading,
+        )
+        .execute("test")
+        .expect_err("an odd-count interleaved stream must be rejected, not silently truncated");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("out of sync") || msg.contains("mismatch"),
+            "expected an out-of-sync / batch-size-mismatch error, got: {msg}"
+        );
+    }
+
+    /// The production path: `--interleaved` + `--extract-umis-from-read-names`.
+    /// The UMI is the trailing `:`-delimited field of the read name, so it must
+    /// survive the byte-preserving split and be extracted identically to the
+    /// equivalent two-file input, on both paths.
+    #[rstest]
+    #[case::single_threaded(ThreadingOptions::none())]
+    #[case::multi_threaded(ThreadingOptions::new(2))]
+    fn interleaved_extracts_umi_from_read_name(#[case] threading: ThreadingOptions) {
+        let tmp = TempDir::new().expect("temp dir");
+        let r1 = create_fastq(
+            &tmp,
+            "r1.fq",
+            &[
+                ("read0:1:2:3:4:5:6:ACGT", "AAAAAAAA", "IIIIIIII"),
+                ("read1:1:2:3:4:5:6:TTGA", "CCCCCCCC", "IIIIIIII"),
+            ],
+        );
+        let r2 = create_fastq(
+            &tmp,
+            "r2.fq",
+            &[
+                ("read0:1:2:3:4:5:6:ACGT", "GGGGGGGG", "JJJJJJJJ"),
+                ("read1:1:2:3:4:5:6:TTGA", "TTTTTTTT", "JJJJJJJJ"),
+            ],
+        );
+        let il = create_fastq(
+            &tmp,
+            "il.fq",
+            &[
+                ("read0:1:2:3:4:5:6:ACGT", "AAAAAAAA", "IIIIIIII"),
+                ("read0:1:2:3:4:5:6:ACGT", "GGGGGGGG", "JJJJJJJJ"),
+                ("read1:1:2:3:4:5:6:TTGA", "CCCCCCCC", "IIIIIIII"),
+                ("read1:1:2:3:4:5:6:TTGA", "TTTTTTTT", "JJJJJJJJ"),
+            ],
+        );
+        let structures = || {
+            vec![
+                ReadStructure::from_str("+T").expect("rs"),
+                ReadStructure::from_str("+T").expect("rs"),
+            ]
+        };
+
+        let two_out = tmp.path().join("two.bam");
+        interleave_test_extract(
+            vec![r1, r2],
+            two_out.clone(),
+            structures(),
+            false,
+            true,
+            threading.clone(),
+        )
+        .execute("test")
+        .expect("two-file umi extract should succeed");
+
+        let il_out = tmp.path().join("il.bam");
+        interleave_test_extract(vec![il], il_out.clone(), structures(), true, true, threading)
+            .execute("test")
+            .expect("interleaved umi extract should succeed");
+
+        let rx_multiset = |path: &PathBuf| {
+            let mut rx: Vec<Option<String>> =
+                read_bam_records(path).iter().map(|r| get_tag_string(r, "RX")).collect();
+            rx.sort();
+            rx
+        };
+        let il_rx = rx_multiset(&il_out);
+        assert_eq!(il_rx, rx_multiset(&two_out), "interleaved UMI extraction must match two-file");
+        // Each pair's read-name UMI lands on both mates.
+        let mut distinct: Vec<String> = il_rx.into_iter().flatten().collect();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct, vec!["ACGT".to_string(), "TTGA".to_string()], "UMIs from read names");
+    }
+
+    /// A BGZF-compressed interleaved file must be decompressed exactly once and
+    /// then split — the `all_bgzf` fast path is force-disabled for interleaved
+    /// input, so the pipeline never re-opens and line-splits the raw compressed
+    /// bytes. The BGZF and plaintext interleaved runs must produce the same
+    /// records, on both paths.
+    #[rstest]
+    #[case::single_threaded(ThreadingOptions::none())]
+    #[case::multi_threaded(ThreadingOptions::new(2))]
+    fn interleaved_bgzf_input_matches_plaintext(#[case] threading: ThreadingOptions) {
+        let tmp = TempDir::new().expect("temp dir");
+        let records = [
+            ("read0", "AACCCCGG", "IIIIIIII"),
+            ("read0", "TTTTGGGG", "JJJJJJJJ"),
+            ("read1", "GGTTTTAA", "IIIIIIII"),
+            ("read1", "CCCCAAAA", "JJJJJJJJ"),
+        ];
+        let plain = create_fastq(&tmp, "il.fq", &records);
+
+        // The same interleaved bytes, BGZF-compressed.
+        let plain_bytes = std::fs::read(&plain).expect("read plaintext interleaved");
+        let bgzf_path = tmp.path().join("il.fq.gz");
+        let mut compressed = Vec::new();
+        {
+            let mut writer = noodles_bgzf::io::Writer::new(&mut compressed);
+            writer.write_all(&plain_bytes).expect("write bgzf");
+            writer.finish().expect("finish bgzf");
+        }
+        std::fs::write(&bgzf_path, compressed).expect("write bgzf interleaved file");
+
+        let structures = || {
+            vec![
+                ReadStructure::from_str("2M+T").expect("rs"),
+                ReadStructure::from_str("+T").expect("rs"),
+            ]
+        };
+        let key_set = |path: &PathBuf| -> Vec<(Vec<u8>, Option<String>)> {
+            let mut keys: Vec<_> = read_bam_records(path)
+                .iter()
+                .map(|r| (r.sequence().as_ref().to_vec(), get_tag_string(r, "RX")))
+                .collect();
+            keys.sort();
+            keys
+        };
+
+        let plain_out = tmp.path().join("plain.bam");
+        interleave_test_extract(
+            vec![plain],
+            plain_out.clone(),
+            structures(),
+            true,
+            false,
+            threading.clone(),
+        )
+        .execute("test")
+        .expect("plaintext interleaved extract should succeed");
+
+        let bgzf_out = tmp.path().join("bgzf.bam");
+        interleave_test_extract(
+            vec![bgzf_path],
+            bgzf_out.clone(),
+            structures(),
+            true,
+            false,
+            threading,
+        )
+        .execute("test")
+        .expect("bgzf interleaved extract should succeed");
+
+        assert_eq!(
+            key_set(&bgzf_out),
+            key_set(&plain_out),
+            "BGZF interleaved output must match plaintext interleaved output"
         );
     }
 }
