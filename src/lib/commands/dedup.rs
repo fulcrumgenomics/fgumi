@@ -1327,9 +1327,13 @@ impl Command for MarkDuplicates {
             bail!("--no-umi cannot be used with --strategy paired");
         }
 
-        // Handle --no-umi mode: force identity strategy
+        // Handle --no-umi mode: force identity strategy. The effective-strategy
+        // computation itself must run on both paths (validate_index_threshold
+        // below consumes it), but the override log is gated to the non-chain
+        // path: the --threads chain re-emits it via add_dedup, so logging here
+        // too would double-log.
         let (effective_strategy, no_umi_edits_override) = if self.no_umi {
-            if !matches!(self.strategy, Strategy::Identity) {
+            if !matches!(self.strategy, Strategy::Identity) && self.threading.threads.is_none() {
                 info!("--no-umi mode: overriding strategy to identity");
             }
             (Strategy::Identity, true)
@@ -1356,6 +1360,19 @@ impl Command for MarkDuplicates {
 
         // Validate the input exists (stdin paths are exempt).
         self.io.validate()?;
+
+        // --threads N: run the dedup stage on the declarative chain builder.
+        // Dispatch here — after the reader-free pre-flight validations above
+        // (output collisions, strategy/min-umi combos, index-threshold,
+        // input existence), which must run for both paths — but BEFORE the
+        // timer/banner/reader below. `execute_chain` → `add_dedup` re-emits the
+        // timer, banner, and threading log lines and opens its own source, so
+        // running them here too would double-log and pre-consume stdin
+        // (breaking stdin + --threads). The no-`--threads` path keeps the
+        // hand-rolled unified pipeline below.
+        if self.threading.threads.is_some() {
+            return self.execute_chain(command_line);
+        }
 
         let min_mapq: u8 = self.min_map_q.unwrap_or(0);
 
@@ -1674,6 +1691,44 @@ impl Command for MarkDuplicates {
         timer.log_completion(final_counts.total_reads);
 
         Ok(())
+    }
+}
+
+impl MarkDuplicates {
+    /// Run the dedup stage on the declarative chain builder (the `--threads N`
+    /// path).
+    ///
+    /// Replaces the hand-rolled unified-pipeline construction in `execute` for
+    /// the threaded case. The chain opens its own source, validates the
+    /// template-coordinate sort order, injects `@PG`, assigns `MoleculeId`s
+    /// deterministically, writes the output BAM, and writes the metrics /
+    /// family-size histogram / duplication ladder via its finalize hook — all
+    /// through the same shared helpers as the non-chain path, so the two
+    /// orchestrations stay in parity. The no-`--threads` path keeps its own
+    /// unified pipeline in `execute`, which is the in-process parity oracle for
+    /// this one (see `test_dedup_chain_matches_single_threaded`).
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        use crate::pipeline::chains::{
+            ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
+        };
+
+        // `add_dedup` re-emits the timer/banner/threading log lines but not the
+        // CRC-verify status; emit it here so the --threads path reports it once,
+        // matching the non-chain path. (dedup has no memory-debug knobs, so
+        // unlike group there is no warn block to add here.)
+        self.io.log_effective_check_crc();
+
+        let stage_opts = StageOptionsBag { dedup: Some(self.clone()), ..Default::default() };
+        let ctx = SingleStageContext {
+            io: &self.io,
+            threading: &self.threading,
+            compression: &self.compression,
+            scheduler: &self.scheduler_opts,
+            queue_memory: &self.queue_memory,
+            command_line,
+        };
+        let spec = ChainSpec::single_stage(Stage::Dedup, stage_opts, &ctx);
+        build_for(spec)?.run()
     }
 }
 
