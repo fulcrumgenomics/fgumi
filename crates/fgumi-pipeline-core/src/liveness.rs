@@ -40,7 +40,11 @@
 //! the monitor matters most.
 //!
 //! Each worker therefore owns a slot padded to its own cache line, so a bump is
-//! an uncontended increment on a line no other worker touches. The monitor sums
+//! normally an uncontended increment on a line no other worker touches. (The one
+//! exception is a dedicated driver thread, which reuses `worker_slot` 0 and so
+//! shares slot 0 with pool worker 0; the bump is an atomic `fetch_add`, so a
+//! coincident increment is counted correctly rather than lost — it only costs the
+//! two threads a shared cache line, not accuracy.) The monitor sums
 //! the slots, which it does once per poll interval (seconds), so the read side's
 //! cost is irrelevant.
 //!

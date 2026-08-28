@@ -27,7 +27,9 @@ design:
 > So read the streaming bullet — and every claim below about the cooperative
 > consumer, including the deadlock analysis — as describing the end state this
 > landing builds toward. The analysis is about that consumer, not about
-> `SortMergeSlot`, which is a passive handoff slot rather than a driver.
+> `SortMergeSlot`, which on the inline path is a passive handoff slot rather than
+> a driver (on the block-parallel path it owns reorder admission and EOF
+> finalization — see below).
 
 Unifying these onto a single driver is a deliberate **future** refactor with its
 own design + bench gate + deadlock re-analysis. It is intentionally NOT done in
@@ -51,8 +53,14 @@ counter, a reorder buffer, and a cap+gap-filler admission rule. That design
 **deadlocked at production scale**: the framework's drain protocol could Skip
 workers during a transient "all slots at cap simultaneously" window. v4 collapsed
 read-and-decompress into one inline op per worker per slot, which made a plain
-bounded FIFO correct (blocks decompress strictly in read order) and removed the
-deadlock surface.
+bounded FIFO correct **for that inline path** (blocks decompress strictly in read
+order) and removed the deadlock surface.
+
+The reorder buffer and the in-flight counter are **back** on `SortMergeSlot`
+(`reorder`, `in_flight`) for the later **block-parallel** path, where several
+workers decompress one file's blocks concurrently and results complete out of
+order. There `queue_eof` finalizes only when `reader_eof && in_flight == 0 &&
+reorder.is_empty()`. The gap-filler escape is still gone.
 
 The pool path keeps all of that machinery and does not hit **that specific
 deadlock** — the v4 cooperative-drain Skip described above — because (a) its

@@ -147,17 +147,17 @@ jobs:
           #     `sort` filter too). Bringing it under Miri needs a separate
           #     `read_raw_record`-filtered run; tracked as a follow-up. Excluded
           #     here so this PRE-EXISTING approved site does not fail the guard.
-          stray=$(grep -rl 'allow(unsafe_code)' crates/fgumi-raw-bam/src \
+          stray=$(grep -rlE '^[[:space:]]*#!?\[[^]]*allow\(unsafe_code\)' crates/fgumi-raw-bam/src \
             | grep -vE '^crates/fgumi-raw-bam/src/(sort|raw_bam_record)\.rs$' || true)
           if [ -n "${stray}" ]; then
-            echo "::error::unsafe_code outside the Miri-scoped fgumi-raw-bam modules: ${stray}" >&2
+            echo "::error::unsafe_code outside the Miri-scoped fgumi-raw-bam modules: ${stray}"
             exit 1
           fi
           cargo +nightly miri test -p fgumi-raw-bam sort -- --list > "${RUNNER_TEMP}/miri-raw-bam-sort.list"
           n=$(grep -c ': test$' "${RUNNER_TEMP}/miri-raw-bam-sort.list" || true)
           echo "miri: the 'sort' filter matched ${n} test(s) in fgumi-raw-bam"
           if [ "${n}" -eq 0 ]; then
-            echo "::error::the 'sort' filter matched no tests in fgumi-raw-bam — the Miri scope is stale" >&2
+            echo "::error::the 'sort' filter matched no tests in fgumi-raw-bam — the Miri scope is stale"
             exit 1
           fi
           cargo +nightly miri test -p fgumi-raw-bam sort
@@ -184,17 +184,17 @@ jobs:
           # claims all four `#[allow(unsafe_code)]` sites live in `erased`, and
           # nothing else enforces it. A site that moves elsewhere would leave the
           # filter matching and the moved site unchecked.
-          stray=$(grep -rl 'allow(unsafe_code)' crates/fgumi-pipeline-core/src \
+          stray=$(grep -rlE '^[[:space:]]*#!?\[[^]]*allow\(unsafe_code\)' crates/fgumi-pipeline-core/src \
             | grep -v '^crates/fgumi-pipeline-core/src/erased.rs$' || true)
           if [ -n "${stray}" ]; then
-            echo "::error::unsafe_code outside the Miri-scoped 'erased' module: ${stray}" >&2
+            echo "::error::unsafe_code outside the Miri-scoped 'erased' module: ${stray}"
             exit 1
           fi
           cargo +nightly miri test -p fgumi-pipeline-core erased -- --list > "${RUNNER_TEMP}/miri-pipeline-core-erased.list"
           n=$(grep -c ': test$' "${RUNNER_TEMP}/miri-pipeline-core-erased.list" || true)
           echo "miri: the 'erased' filter matched ${n} test(s) in fgumi-pipeline-core"
           if [ "${n}" -eq 0 ]; then
-            echo "::error::the 'erased' filter matched no tests in fgumi-pipeline-core — the Miri scope is stale" >&2
+            echo "::error::the 'erased' filter matched no tests in fgumi-pipeline-core — the Miri scope is stale"
             exit 1
           fi
           cargo +nightly miri test -p fgumi-pipeline-core erased

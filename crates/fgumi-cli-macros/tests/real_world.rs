@@ -52,10 +52,13 @@ fn parse_memory(value: &str) -> Result<MemoryLimit, String> {
             None => (value, 1),
         },
     };
-    digits
-        .parse::<u64>()
-        .map(|n| MemoryLimit(n * multiplier))
-        .map_err(|e| format!("invalid memory value {value:?}: {e}"))
+    let n = digits.parse::<u64>().map_err(|e| format!("invalid memory value {value:?}: {e}"))?;
+    // `checked_mul` so an oversized `GiB` value maps to a parser error rather than
+    // panicking on multiplication overflow in a debug build.
+    let bytes = n
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("invalid memory value {value:?}: overflows u64"))?;
+    Ok(MemoryLimit(bytes))
 }
 
 /// Stand-in for the `parse_bool` value parser shared by every fgumi boolean flag.

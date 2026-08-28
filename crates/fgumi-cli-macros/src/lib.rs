@@ -354,6 +354,12 @@ fn validate_prefix(prefix: &str) -> Result<(), String> {
 fn reject_unsupported_struct_attrs(attrs: &[syn::Attribute]) -> syn::Result<()> {
     for attr in attrs {
         let path = attr.path();
+        // A struct-level `#[cfg_attr(...)]` needs no special handling here: rustc
+        // expands a *container* cfg_attr before this attribute macro runs, so an
+        // active predicate arrives as a literal `#[command(...)]`/`#[clap(...)]`
+        // (caught below) and an inactive one expands to nothing (correctly inert).
+        // This differs from a *field* cfg_attr, which reaches the macro verbatim
+        // as body tokens — hence the separate `reject_conditional_clap_attr` there.
         if path.is_ident("clap") || path.is_ident("structopt") {
             return Err(legacy_spelling_error(attr));
         }
@@ -819,6 +825,10 @@ impl<'a> ParsedField<'a> {
             return GeneratedField {
                 multi_field: quote! {
                     #(#forwarded)*
+                    // Blank doc line so clap keeps the required notice in long help
+                    // (`--help`) rather than merging it into the field's short help,
+                    // which is the first paragraph of the doc comment.
+                    #[doc = ""]
                     #[doc = #required_doc]
                     #[arg(long = #long_name, help_heading = #heading #(#preserved)*)]
                     #vis #prefixed_ident: Option<#field_type>,

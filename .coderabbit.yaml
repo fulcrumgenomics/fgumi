@@ -167,11 +167,13 @@ reviews:
   # Every symbol named below was verified with `git grep` to resolve at the
   # commit that introduced this revision; re-verify when touching these modules.
   #
-  # All three pipeline paths are listed together: issue #330 renames
-  # `src/lib/unified_pipeline` to `src/lib/pipeline` and extracts its engine into
-  # the `fgumi-pipeline-core` crate, so the same instructions apply to whichever
-  # is present. A glob naming only the `src/lib/` homes silently stops reviewing
-  # the engine the day it moves into the crate.
+  # The two legacy homes share one entry: issue #330 renames
+  # `src/lib/unified_pipeline` to `src/lib/pipeline`, so the same instructions
+  # apply to whichever is present. `crates/fgumi-pipeline-core` is the extracted
+  # typed-step engine and gets its OWN entry below: it is a different design and
+  # names different symbols (`queues.rs` / `ByteBoundedQueue`, not `queue.rs` /
+  # `OrderedQueue`), so folding it into the legacy entry would point the reviewer
+  # at symbols that do not exist there.
   #
   # Not yet listed, and a glob that matches nothing is exactly the failure mode
   # above — add an entry in the same PR that lands the code:
@@ -183,7 +185,7 @@ reviews:
   #     instructions of their own, so they are reviewed by the generic themes
   #     only.
   path_instructions:
-    - path: "{src/lib/unified_pipeline,src/lib/pipeline,crates/fgumi-pipeline-core/src}/**/*.rs"
+    - path: "{src/lib/unified_pipeline,src/lib/pipeline}/**/*.rs"
       instructions: >-
         This is the hand-rolled concurrent step pipeline; its bugs are deadlocks,
         lost output, unbounded memory, and panics on malformed input — not style.
@@ -211,6 +213,35 @@ reviews:
         a real, previously-shipped crash on corruption-controlled input. This
         module contains no `unsafe`; treat newly introduced `unsafe` here as out
         of policy and require it to be justified in CLAUDE.md first.
+    - path: "crates/fgumi-pipeline-core/src/**/*.rs"
+      instructions: >-
+        This is the extracted typed-step pipeline engine (the successor to the
+        `src/lib/*_pipeline` design above); its bugs are deadlocks, lost output,
+        unbounded memory, and panics on malformed input — not style. It names
+        DIFFERENT symbols than the legacy entry: queues live in `queues.rs`
+        (`ItemQueue` trait, `QueueSpec`, `CountBoundedQueue`, `ByteBoundedQueue`,
+        `UnboundedQueue`), NOT `queue.rs`/`OrderedQueue`. Require that no queue or
+        reorder buffer grows without a bound: byte-bounded transports go through
+        `ByteBoundedQueue<T: HeapSize>` (steady-state memory a function of config,
+        not input size), and consumers/drains must stay unbounded — bound the
+        producers instead. Flag a cap checked on only one sub-condition so another
+        path bypasses it, and byte accounting that measures logical length where
+        the memory held is allocation capacity. Cancellation and error propagation
+        run through `PipelineSignal` / `CancelHandle` (`signal.rs`): require every
+        worker loop and the fused driver to observe `signal.is_done()` promptly and
+        never block forever on a channel whose peer has exited. Liveness for the
+        deadlock monitor is the per-worker `LivenessCounter` (`liveness.rs`), bumped
+        only on productive `StepOutcome::Progress`/`Finished`; the fused
+        single-thread path (`runtime/fused.rs`) is NOT monitored and carries its own
+        stall budget instead. The ONLY approved `unsafe` in this crate is the typed-
+        handle dispatch cache in `erased.rs` (`TypedStep`/`TypedStep2`
+        `resolve_input`/`resolve_outputs`), whose soundness rests on the invariants
+        documented in CLAUDE.md — chiefly that every step instance is dropped before
+        the `ChainContexts` it cached from; flag any change that weakens those
+        invariants or adds `unsafe` elsewhere without a CLAUDE.md allowlist entry.
+        Byte-level framing that parses length/offset fields out of the input stream
+        must validate against the remaining buffer with checked arithmetic before
+        slicing.
     - path: "crates/fgumi-sort/**/*.rs"
       instructions: >-
         This is the sort engine, including approved `unsafe` hot paths (LSD radix

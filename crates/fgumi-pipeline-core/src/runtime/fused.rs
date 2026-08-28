@@ -299,6 +299,17 @@ pub fn run_fused_single_thread(
         }
     }
 
+    // Drop the steps before `contexts` goes out of scope. The typed-handle cache
+    // in `TypedStep`/`TypedStep2` stores handles borrowed from `contexts` as
+    // `'static` (see the "Approved typed-handle cache" note in CLAUDE.md), which is
+    // sound only while every step instance is dropped before the `ChainContexts`
+    // it cached from. Here `steps` is a by-value parameter and `contexts` is a
+    // local, so the natural drop order is inverted — parameters drop *after*
+    // locals, so `contexts` (and its handle boxes) would otherwise be freed while
+    // the cached references in `steps` still point into them. An explicit drop
+    // restores the invariant on this path.
+    drop(steps);
+
     // Map the recorded outcome to the run result (same shape as `Pipeline::run`).
     // `to_result` reconstructs the non-`Clone` `PipelineError` and synthesizes
     // `Cancelled` from the state when an external cancel published the terminal

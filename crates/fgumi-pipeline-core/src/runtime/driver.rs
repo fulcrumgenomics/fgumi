@@ -385,7 +385,10 @@ fn dispatch_one_step(
     signal: &Arc<PipelineSignal>,
     stats: Option<&Arc<PipelineStats>>,
     // Always-on liveness signal for the deadlock monitor, sharded per worker so
-    // the bump is an uncontended increment. Separate from `stats` on purpose:
+    // the bump is normally an uncontended increment (a dedicated driver reuses
+    // `worker_slot` 0 and so shares slot 0 with pool worker 0 — the atomic
+    // `fetch_add` counts a coincident bump correctly; see `crate::liveness`).
+    // Separate from `stats` on purpose:
     // liveness must be free enough to leave armed, while `stats` pays for
     // per-dispatch timing and stays opt-in. See `crate::liveness`.
     liveness: &LivenessCounter,

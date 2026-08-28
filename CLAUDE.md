@@ -358,7 +358,10 @@ storing a reference whose real lifetime the struct cannot name.
   data addresses only, so an allocator that reuses a freed box's address defeats
   it. Soundness rests on the second invariant — every step instance is dropped
   before the contexts it cached from — which is what must be preserved by any
-  future change.
+  future change. `run_fused_single_thread` (`runtime/fused.rs`) is the one path
+  where the natural drop order inverts it: `steps` is a by-value parameter and
+  `ChainContexts` is a local, and parameters drop *after* locals, so it drops the
+  steps explicitly before returning to keep the invariant holding there.
 
 ### Test-only `#[allow(unsafe_code)]` sites
 

@@ -478,6 +478,29 @@ fn no_long_alias_spelling_leaks_unprefixed(#[case] flag: &str) {
     );
 }
 
+/// Visible aliases must survive into `--help`, hidden ones must not. The parse
+/// cases above accept every spelling regardless of visibility, so a macro that
+/// re-emitted every alias as *hidden* would pass them while silently dropping the
+/// visible aliases from the rendered help — a user-facing regression the parse
+/// tests cannot see. Assert against rendered help directly (clap 4 exposes no
+/// `Arg::get_visible_aliases` getter).
+#[test]
+fn visible_aliases_reach_help_and_hidden_ones_do_not() {
+    let help = AliasWrapper::command().render_long_help().to_string();
+    for visible in ["alias::vis", "alias::vis-one", "alias::vis-two"] {
+        assert!(
+            help.contains(visible),
+            "visible alias `{visible}` should appear in --help, but did not:\n{help}"
+        );
+    }
+    for hidden in ["alias::one", "alias::two"] {
+        assert!(
+            !help.contains(hidden),
+            "hidden alias `{hidden}` must not appear in --help, but did:\n{help}"
+        );
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Bare `bool` stays a valueless flag
 // ─────────────────────────────────────────────────────────────────────────────

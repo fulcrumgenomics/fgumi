@@ -1195,7 +1195,12 @@ fn crate_docs_enumerate_every_runtime_dependency() {
             continue;
         }
         if let Some((name, _)) = line.split_once('=') {
+            // Cargo allows a dotted dependency key (`log.workspace = true`), whose
+            // crate name is the segment before the dot. Take that, so the code-span
+            // check below matches the crate name rather than `log.workspace` and
+            // never reports a false undocumented dependency.
             let name = name.trim();
+            let name = name.split_once('.').map_or(name, |(crate_name, _)| crate_name);
             if !name.is_empty() {
                 dependencies.push(name);
             }
