@@ -392,8 +392,15 @@ impl Filter {
             num_threads,
         )?;
 
-        let library_index = LibraryIndex::from_header(header);
-        pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw_no_cell(library_index));
+        // Template mode groups by QNAME and reads the key's `name_hash` fast-path
+        // (see `TemplateGrouper`), so it needs the key. Single-read mode uses
+        // `SingleRawRecordGrouper`, which discards the decoded record entirely and
+        // never reads the key — so skip its per-record computation with `None`.
+        pipeline_config.group_key_config = if self.filter_by_template {
+            Some(GroupKeyConfig::new_raw_no_cell(LibraryIndex::from_header(header)))
+        } else {
+            None
+        };
 
         let config = Arc::new(FilterConfig::new(
             &self.min_reads,

@@ -297,7 +297,7 @@ fn spawn_stalled_pipeline(
             Box::new(writer),
             grouper,
             fns,
-            group_key_config,
+            Some(group_key_config),
             None,
         )
     });
@@ -630,7 +630,7 @@ fn mi_assign_makes_progress_under_a_budget_that_binds_the_processed_queue() {
             Box::new(writer),
             grouper,
             fns,
-            group_key_config,
+            Some(group_key_config),
             None,
         )
         .unwrap_or_else(|e| panic!("budget {budget}: pipeline must complete, got {e}"));
