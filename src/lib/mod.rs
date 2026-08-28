@@ -136,6 +136,7 @@ pub mod consensus;
 pub use fgumi_dna::dna;
 pub mod errors;
 pub mod fastq;
+pub mod fastq_deinterleave;
 pub mod fastq_parse;
 pub mod grouper;
 pub(crate) mod hashing;
