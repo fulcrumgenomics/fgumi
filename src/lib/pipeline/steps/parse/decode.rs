@@ -572,6 +572,45 @@ mod tests {
         assert_eq!(decoded.cached_umi_position().0, DecodedRecord::UMI_OFFSET_UNCACHED);
     }
 
+    /// A malformed record whose header inflates the derived aux offset past the
+    /// record end must leave the cache unset rather than panicking.
+    /// `aux_data_offset_from_record` derives the offset from `n_cigar_op` /
+    /// `l_seq` without bounding it against `raw.len()`, so the `raw.get(aux..)`
+    /// guard in `cache_umi_position` is the only thing between a
+    /// framing-consistent-but-corrupt record and an out-of-range slice panic.
+    /// The well-formed cache tests never take that branch.
+    #[test]
+    fn cache_umi_position_leaves_cache_unset_when_aux_offset_is_out_of_range() {
+        use crate::sam::SamTag;
+        use fgumi_bam_io::GroupKey;
+        use fgumi_raw_bam::{SamBuilder, flags};
+
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGT")
+            .qualities(&[30u8; 4])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+        b.add_string_tag(SamTag::RX, b"ACGTACGT");
+        let raw = b.build();
+
+        // Inflate n_cigar_op (u16 at bytes 12-13) to 0xFFFF so the derived aux
+        // offset (32 + l_read_name + n_cigar_op*4 + …) lands far past the record
+        // end, without changing the record's actual byte length.
+        let mut bytes = raw.as_ref().to_vec();
+        bytes[12] = 0xFF;
+        bytes[13] = 0xFF;
+        assert!(
+            fgumi_raw_bam::aux_data_offset_from_record(&bytes).unwrap() > bytes.len(),
+            "the corrupted header must derive an out-of-range aux offset",
+        );
+
+        let mut decoded = DecodedRecord::from_raw_bytes(bytes, GroupKey::default());
+        cache_umi_position(&mut decoded, *SamTag::RX); // must not panic
+
+        assert!(decoded.cached_umi().is_none());
+        assert_eq!(decoded.cached_umi_position().0, DecodedRecord::UMI_OFFSET_UNCACHED);
+    }
+
     /// A tag present but not `Z`-typed must leave the cache unset rather than
     /// caching a bogus offset/length into non-string bytes. `cache_umi_position`
     /// relies on `find_string_tag_position` to reject the wrong type, and this

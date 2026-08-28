@@ -39,9 +39,13 @@ use std::io::{Read, Write};
 /// # Why 44
 ///
 /// 44 is the smallest capacity that keeps **every** read name we have measured
-/// inline, and it is free relative to 40: `SmallVec` rounds both to a 56-byte
-/// buffer, so 40 and 44 produce an identical 64-byte `RawQuerynameKey`. 40 would
-/// leave ~16% of native Illumina names spilling for no saving.
+/// inline. It is *not* free relative to 40: on 64-bit targets `SmallVec<[u8; 40]>`
+/// is a 48-byte `NameBuf` (a 56-byte `RawQuerynameKey`), whereas `SmallVec<[u8; 44]>`
+/// is a 56-byte `NameBuf` (a 64-byte key) — so 44 costs 8 bytes per key over 40.
+/// That is a deliberate trade to keep inline the ~16% of native Illumina names
+/// that 40 would spill to the heap (the pointer-chase this inline buffer exists
+/// to avoid); the `position_fits_in_existing_key_padding` assertion pins the
+/// resulting layout.
 ///
 /// Read names in practice fall into two regimes, and the choice was measured on
 /// both rather than on one:

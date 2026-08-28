@@ -514,6 +514,56 @@ mod tests {
         assert!(is_fusible_chain(&steps, &graph));
     }
 
+    /// The `input_arity(idx) > 1` guard: a chain containing a `Step2` merge
+    /// (input arity 2) is NOT fusible — the single-worker inline drive follows
+    /// one input stream per step. Every other condition holds (one leading
+    /// source; all branches wired strictly forward), so the merge arity is the
+    /// sole reason fusion is refused.
+    #[test]
+    fn is_fusible_rejects_a_two_input_merge() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mut graph = ChainGraph::new();
+        let s = graph.register_step("CountSource", 1);
+        let m = graph.register_step_with_input_arity("AddHundred", 1, 2);
+        let k = graph.register_step("CollectSink", 0);
+        graph.wire(s, BranchIdx(0), m);
+        graph.wire(m, BranchIdx(0), k);
+        let steps: Vec<Box<dyn ErasedStep>> = vec![
+            Box::new(TypedStep::new(CountSource { next: 0, count: 0 })),
+            Box::new(TypedStep::new(AddHundred)),
+            Box::new(TypedStep::new(CollectSink { out: Arc::clone(&out) })),
+        ];
+        assert!(
+            !is_fusible_chain(&steps, &graph),
+            "a Step2 merge (input_arity 2) must block fusion"
+        );
+    }
+
+    /// The forward-wiring guard: an output branch wired to an earlier-or-equal
+    /// step index is NOT fusible — the inline drive is a single topological pass,
+    /// so a back-edge would revisit an already-drained step. Here the mid step's
+    /// branch loops back to the source (consumer index 0 ≤ producer index 1);
+    /// every other condition holds, so the back-edge is the sole reason.
+    #[test]
+    fn is_fusible_rejects_a_backward_wired_branch() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mut graph = ChainGraph::new();
+        let s = graph.register_step("CountSource", 1);
+        let m = graph.register_step("AddHundred", 1);
+        let _k = graph.register_step("CollectSink", 0);
+        graph.wire(s, BranchIdx(0), m);
+        graph.wire(m, BranchIdx(0), s); // back-edge: consumer index 0 ≤ producer index 1
+        let steps: Vec<Box<dyn ErasedStep>> = vec![
+            Box::new(TypedStep::new(CountSource { next: 0, count: 0 })),
+            Box::new(TypedStep::new(AddHundred)),
+            Box::new(TypedStep::new(CollectSink { out: Arc::clone(&out) })),
+        ];
+        assert!(
+            !is_fusible_chain(&steps, &graph),
+            "a branch wired to an earlier-or-equal step must block fusion"
+        );
+    }
+
     // A fusible chain fuses ONLY when it is single-thread AND uninstrumented: the
     // fused fast path skips the scheduled path's edge metrics / occupancy sampler
     // / bottleneck verdict, so any instrumentation level (or ≥2 threads) must fall

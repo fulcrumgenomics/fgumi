@@ -28,19 +28,51 @@
 //!
 //! [`PooledChunkWriter`]: crate::pooled_chunk_writer::PooledChunkWriter
 
-use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::marker::PhantomData;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use fgumi_bgzf::writer::InlineBgzfCompressor;
 use fgumi_bgzf::{BGZF_EOF, BGZF_MAX_BLOCK_SIZE};
 use fgumi_raw_bam::RawRecord;
+use tempfile::NamedTempFile;
 use zstd::bulk::Compressor as ZstdCompressor;
 
 use crate::codec::{SpillCodec, ZSPILL_MAGIC};
 use crate::keys::RawSortKey;
+
+/// Open a staging temp file in the same directory as `path`.
+///
+/// The spill is written to this temp file and only renamed into place by
+/// [`persist_spill`] once `finish()` succeeds, so a crashed or errored write
+/// never leaves a partial file at `path` (a `ZspillStreamReader` would otherwise
+/// accept a partial file that happens to end on a frame boundary as a valid,
+/// shorter spill and silently drop the trailing records). The temp file shares
+/// `path`'s directory so the rename is same-filesystem and therefore atomic, and
+/// `NamedTempFile` removes it on drop if `finish()` is never reached.
+fn stage_spill(path: &Path) -> Result<(BufWriter<NamedTempFile>, PathBuf)> {
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let temp = NamedTempFile::new_in(dir)?;
+    Ok((BufWriter::with_capacity(256 * 1024, temp), path.to_path_buf()))
+}
+
+/// Atomically publish a finished spill temp file at `final_path`.
+///
+/// Uses `persist_noclobber`, so it fails closed if a file already exists at
+/// `final_path` rather than truncating a prior spill — the same "never reuse an
+/// existing path" guarantee `SpillWrite::open_file`'s `create_new` provides,
+/// preserved now that the destination is opened by rename rather than directly.
+fn persist_spill(writer: BufWriter<NamedTempFile>, final_path: &Path) -> Result<()> {
+    let temp = writer.into_inner().map_err(|e| anyhow::anyhow!("flushing spill temp file: {e}"))?;
+    temp.persist_noclobber(final_path).map_err(|e| {
+        anyhow::anyhow!("publishing spill file {}: {}", final_path.display(), e.error)
+    })?;
+    Ok(())
+}
 
 /// Compress and write a fully-sorted in-memory chunk to `path` as a keyed spill
 /// file, inline on the calling thread (no `SortWorkerPool`).
@@ -152,7 +184,9 @@ impl<K: RawSortKey> SyncSpillWriter<K> {
 /// Records are framed `[key.write_to() if !EMBEDDED][u32 LE record-len][record]`
 /// into the compressor's byte stream, identical to the zstd arm.
 pub(crate) struct BgzfSpillWriter<K: RawSortKey> {
-    writer: BufWriter<File>,
+    writer: BufWriter<NamedTempFile>,
+    /// Final destination the temp file is renamed to by `finish()`.
+    final_path: PathBuf,
     compressor: InlineBgzfCompressor,
     /// Reused staging buffer for serialized keys (non-embedded keys only).
     ///
@@ -165,13 +199,14 @@ pub(crate) struct BgzfSpillWriter<K: RawSortKey> {
 
 impl<K: RawSortKey> BgzfSpillWriter<K> {
     fn create(path: &Path, level: u32) -> Result<Self> {
-        // `create_new` fails closed on a duplicate/stale path rather than
-        // truncating an existing spill and silently corrupting merge input —
-        // matching `SpillWrite::open_file`.
-        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        let writer = BufWriter::with_capacity(256 * 1024, file);
+        // Stage into a temp file and rename into place only after `finish()`
+        // succeeds (see `stage_spill` / `persist_spill`): a partial write never
+        // reaches `path`, and the final rename still fails closed on a stale
+        // path, matching `SpillWrite::open_file`.
+        let (writer, final_path) = stage_spill(path)?;
         Ok(Self {
             writer,
+            final_path,
             compressor: InlineBgzfCompressor::new(level),
             key_scratch: Vec::new(),
             _marker: PhantomData,
@@ -218,18 +253,23 @@ impl<K: RawSortKey> BgzfSpillWriter<K> {
         // writer and noodles bgzf writer both emit.
         self.writer.write_all(&BGZF_EOF)?;
         self.writer.flush()?;
-        Ok(())
+        persist_spill(self.writer, &self.final_path)
     }
 }
 
 /// Inline zstd spill writer: `ZSPILL_MAGIC` then length-prefixed zstd frames,
 /// one frame per ≤`BGZF_MAX_BLOCK_SIZE` raw block.
 pub(crate) struct ZstdSpillWriter<K: RawSortKey> {
-    writer: BufWriter<File>,
+    writer: BufWriter<NamedTempFile>,
+    /// Final destination the temp file is renamed to by `finish()`.
+    final_path: PathBuf,
     compressor: ZstdCompressor<'static>,
     /// Raw (uncompressed) staging block; flushed as a zstd frame at
     /// `BGZF_MAX_BLOCK_SIZE`.
     block: Vec<u8>,
+    /// Reused destination for each compressed zstd frame, so `flush_block` does
+    /// not allocate a fresh `Vec` per frame (`compress` returns an owned one).
+    frame_buf: Vec<u8>,
     /// Reused staging buffer for serialized keys — see
     /// [`BgzfSpillWriter::key_scratch`].
     key_scratch: Vec<u8>,
@@ -238,17 +278,19 @@ pub(crate) struct ZstdSpillWriter<K: RawSortKey> {
 
 impl<K: RawSortKey> ZstdSpillWriter<K> {
     fn create(path: &Path, level: u32) -> Result<Self> {
-        // See `BgzfSpillWriter::create`: exclusive creation, never truncation.
-        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        let mut writer = BufWriter::with_capacity(256 * 1024, file);
+        // See `BgzfSpillWriter::create`: staged temp file, atomic rename on
+        // finish, fail-closed (no clobber) on the destination.
+        let (mut writer, final_path) = stage_spill(path)?;
         writer.write_all(&ZSPILL_MAGIC)?;
         #[allow(clippy::cast_possible_wrap)]
         let compressor = ZstdCompressor::new(level as i32)
             .map_err(|e| anyhow::anyhow!("zstd compressor init (level {level}): {e}"))?;
         Ok(Self {
             writer,
+            final_path,
             compressor,
             block: Vec::with_capacity(BGZF_MAX_BLOCK_SIZE + 1024),
+            frame_buf: Vec::new(),
             key_scratch: Vec::new(),
             _marker: PhantomData,
         })
@@ -260,14 +302,17 @@ impl<K: RawSortKey> ZstdSpillWriter<K> {
         if self.block.is_empty() {
             return Ok(());
         }
-        let frame = self
-            .compressor
-            .compress(&self.block)
+        // Reuse `frame_buf` across frames rather than letting `compress` return a
+        // freshly-allocated `Vec` for every non-empty spill frame.
+        self.frame_buf.clear();
+        self.frame_buf.reserve(zstd::zstd_safe::compress_bound(self.block.len()));
+        self.compressor
+            .compress_to_buffer(&self.block, &mut self.frame_buf)
             .map_err(|e| anyhow::anyhow!("zstd compress: {e}"))?;
-        let frame_len = u32::try_from(frame.len())
+        let frame_len = u32::try_from(self.frame_buf.len())
             .map_err(|_| anyhow::anyhow!("zstd frame larger than 4 GiB cannot fit a u32 prefix"))?;
         self.writer.write_all(&frame_len.to_le_bytes())?;
-        self.writer.write_all(&frame)?;
+        self.writer.write_all(&self.frame_buf)?;
         self.block.clear();
         Ok(())
     }
@@ -313,7 +358,7 @@ impl<K: RawSortKey> ZstdSpillWriter<K> {
     fn finish(mut self) -> Result<()> {
         self.flush_block()?;
         self.writer.flush()?;
-        Ok(())
+        persist_spill(self.writer, &self.final_path)
     }
 }
 
@@ -471,11 +516,12 @@ mod tests {
             p.shutdown();
         }
 
-        assert_eq!(
-            read_back(&sync_path),
-            read_back(&pooled_path),
-            "sync vs pooled read-back differ"
-        );
+        // Anchor one side to the original `records` first: a comparison of only
+        // sync-vs-pooled would still pass if BOTH writers dropped every record
+        // (or the reader returned nothing for both).
+        let sync_back = read_back(&sync_path);
+        assert_eq!(sync_back, records, "sync zstd writer must round-trip the original records");
+        assert_eq!(sync_back, read_back(&pooled_path), "sync vs pooled read-back differ");
     }
 
     /// A zero-length record body must round-trip through the writer, on BOTH
@@ -684,5 +730,61 @@ mod tests {
         w.finish().unwrap();
 
         assert_eq!(read_back(&path), records, "sync bgzf round-trip mismatch");
+    }
+
+    /// A spill file is published atomically: it appears at its final path only
+    /// after `finish()`, a writer dropped without `finish()` leaves nothing
+    /// there, and `finish()` refuses to clobber an existing spill (preserving
+    /// the fail-closed guarantee `create_new` gave), on BOTH codecs.
+    ///
+    /// The partial-file hazard this guards is real: `ZspillStreamReader` treats
+    /// EOF after a complete frame as a clean end, so a partial file ending on a
+    /// frame boundary would otherwise read back as a valid, shorter spill.
+    #[rstest::rstest]
+    #[case::zstd(SpillCodec::Zstd)]
+    #[case::bgzf(SpillCodec::Bgzf)]
+    fn spill_is_published_atomically_and_never_clobbers(#[case] codec: SpillCodec) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("chunk_atomic.keyed");
+
+        // A writer dropped before `finish()` must leave no file at the final
+        // path (the temp file is removed on drop).
+        {
+            let mut w = SyncSpillWriter::<TemplateKey>::create(&path, codec, 1).unwrap();
+            w.write_record(&make_key(1), &[0xAB; 64]).unwrap();
+            // dropped here without `finish()`
+        }
+        assert!(
+            !path.exists(),
+            "an unfinished spill must not appear at its final path ({codec:?})"
+        );
+
+        // `finish()` publishes the file with exactly the written records.
+        let records = sample_records(24);
+        let mut w = SyncSpillWriter::<TemplateKey>::create(&path, codec, 1).unwrap();
+        for (k, r) in &records {
+            w.write_record(k, r).unwrap();
+        }
+        w.finish().unwrap();
+        assert!(path.exists(), "a finished spill must appear at its final path ({codec:?})");
+        assert_eq!(
+            read_back(&path),
+            records,
+            "published spill must hold the written records ({codec:?})"
+        );
+
+        // A second writer targeting the same path fails closed at `finish()`
+        // rather than truncating the existing spill.
+        let mut w2 = SyncSpillWriter::<TemplateKey>::create(&path, codec, 1).unwrap();
+        w2.write_record(&make_key(99), &[0xCD; 32]).unwrap();
+        assert!(
+            w2.finish().is_err(),
+            "finishing onto an existing spill must fail closed, not clobber ({codec:?})",
+        );
+        assert_eq!(
+            read_back(&path),
+            records,
+            "the pre-existing spill must be left intact ({codec:?})"
+        );
     }
 }

@@ -545,6 +545,23 @@ fn decompress_and_verify(
     output: &mut Vec<u8>,
     verify_crc: bool,
 ) -> io::Result<()> {
+    // A corrupt footer can claim an arbitrary ISIZE — up to 4 GiB — while the
+    // BSIZE stays a valid u16. Reject any uncompressed size over the single-block
+    // maximum before it sizes an allocation, so neither the stored-copy path
+    // below nor the deflate `resize` zero-fills a multi-gigabyte buffer for a
+    // 4-byte corruption. Every real BGZF block decompresses to <= 64 KiB. This
+    // bounds the raw-`Vec` entry path (`decompress_block_into_opts`) to match the
+    // slice path, which reaches this same chokepoint.
+    if uncompressed_size > MAX_UNCOMPRESSED_BLOCK_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "BGZF block claims {uncompressed_size} uncompressed bytes, over the \
+                 {MAX_UNCOMPRESSED_BLOCK_SIZE}-byte maximum for a single block (corrupt ISIZE)"
+            ),
+        ));
+    }
+
     // Stored-block fast path. The deflate frame for a stored block is:
     //   byte 0   : BFINAL | BTYPE | (5 padding bits to next byte boundary)
     //   bytes 1-2: LEN  (little-endian, u16)
@@ -1576,6 +1593,45 @@ mod tests {
             "error should mention the size mismatch: {err}"
         );
         assert!(out.is_empty(), "output should be rolled back on failure");
+    }
+
+    /// A corrupt footer claiming a multi-gigabyte ISIZE must fail closed on the
+    /// raw-`Vec` entry path (`decompress_block_into_opts`) BEFORE `resize`
+    /// allocates for it — not after decompression, as the `+1` mismatch above
+    /// does. The `uncompressed_size` bound in `decompress_and_verify` is the only
+    /// guard on this path (the slice path reaches the same chokepoint).
+    #[test]
+    fn decompress_rejects_a_giant_isize_before_allocating() {
+        use crate::writer::InlineBgzfCompressor;
+
+        let original = b"payload for the oversized-ISIZE rejection test, long enough to deflate";
+        let mut compressor = InlineBgzfCompressor::new(6);
+        compressor.write_all(original).expect("write");
+        compressor.flush().expect("flush");
+        let blocks = compressor.take_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_ne!(
+            blocks[0].data[BGZF_HEADER_SIZE] & 0b110,
+            0,
+            "expected a deflate-coded block so the resize path (not the stored copy) runs"
+        );
+
+        // Set the footer ISIZE (last 4 bytes, little-endian) to ~4 GiB while the
+        // BSIZE stays a valid u16 — the exact shape a 4-byte corruption produces.
+        let mut giant = blocks[0].data.clone();
+        let n = giant.len();
+        giant[n - 4..].copy_from_slice(&u32::MAX.to_le_bytes());
+        let giant_block = RawBgzfBlock { data: giant };
+
+        let mut decompressor = Decompressor::new();
+        let mut out = Vec::new();
+        let err = decompress_block_into_opts(&giant_block, &mut decompressor, &mut out, false)
+            .expect_err("a >64 KiB ISIZE claim must be rejected before allocating");
+        assert!(
+            err.to_string().contains("maximum for a single block"),
+            "error should name the single-block maximum, got: {err}"
+        );
+        assert!(out.is_empty(), "no buffer must be allocated/left on the rejected path");
     }
 
     /// Slice-API twin of `decompress_opts_skips_crc_but_still_checks_size`.
