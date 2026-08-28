@@ -669,10 +669,6 @@ fn copy_stored_and_verify(
 }
 
 // ============================================================================
-// Tests
-// ============================================================================
-
-// ============================================================================
 // Slice-fill decompression (arena buffer recycling) — grafted from #714 onto
 // main's reader.rs (R10 sync). Fills a caller-provided &mut [u8] sized to the
 // block ISIZE, verifying CRC unconditionally.
