@@ -925,16 +925,22 @@ pub fn decompress_into_slice(
             ),
         ));
     }
-    // A block that carries nothing — the BGZF EOF marker is the one every
-    // reader meets — is done, and both `Vec` siblings short-circuit here too.
-    // libdeflater does return `Ok(0)` for the EOF marker's payload against a
-    // zero-length slice, so this is not repairing a failure; it is making the
-    // answer ours rather than resting on an undocumented edge of the C library.
+    // Only the *exact* BGZF EOF marker — the one every reader meets at end of
+    // stream — is waved through here, matching the `Vec` siblings
+    // (`decompress_block_slice_into` short-circuits on `data == BGZF_EOF`).
+    // Every other zero-ISIZE block, including a CRC-corrupted EOF marker whose
+    // bytes no longer match, falls through to `deflate_into_slice_and_verify`
+    // so its CRC32 is still checked. Gating on `uncompressed_size == 0` instead
+    // would let a corrupted zero-size block return `Ok(0)` unverified, which is
+    // the one thing the `Vec` path is careful not to do. libdeflater does
+    // return `Ok(0)` for the marker's `03 00` payload against a zero-length
+    // slice, so this is not repairing a failure; it makes the answer ours
+    // rather than resting on an undocumented edge of the C library.
     //
     // Placed *after* the size check on purpose: ahead of it, a caller passing a
-    // wrongly-sized slot for a zero-ISIZE block would get a silent `Ok(0)`
-    // instead of being told the slot is wrong.
-    if uncompressed_size == 0 {
+    // wrongly-sized slot for the marker would get a silent `Ok(0)` instead of
+    // being told the slot is wrong.
+    if block == BGZF_EOF {
         return Ok(0);
     }
     let compressed = compressed_data_from_slice(block);
@@ -1871,10 +1877,9 @@ mod tests {
     }
 
     /// A zero-ISIZE block must still reject a wrongly-sized slot. The obvious
-    /// place to short-circuit on `uncompressed_size == 0` is *before* the
-    /// slot-size check, which would turn this into a silent `Ok(0)` and hide the
-    /// caller's sizing bug — the same misreport the up-front check exists to
-    /// prevent.
+    /// place to short-circuit the EOF marker is *before* the slot-size check,
+    /// which would turn this into a silent `Ok(0)` and hide the caller's sizing
+    /// bug — the same misreport the up-front check exists to prevent.
     #[test]
     fn decompress_into_slice_rejects_a_sized_slot_for_an_empty_block() {
         let mut out = [0u8; 16];
@@ -1882,6 +1887,29 @@ mod tests {
             .expect_err("a 16-byte slot for a 0-byte block must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("output slice is"), "got: {err}");
+    }
+
+    /// A CRC-corrupted EOF marker has ISIZE 0 but is no longer the exact
+    /// [`BGZF_EOF`] bytes, so the slot path must run it through CRC verification
+    /// like the `Vec` siblings do, not wave it through on `uncompressed_size ==
+    /// 0`. Regression: the short-circuit here once keyed off the ISIZE, so a
+    /// corrupted zero-size block returned `Ok(0)` against its (correctly sized)
+    /// zero-length slot without the CRC ever being checked.
+    #[test]
+    fn decompress_into_slice_verifies_a_corrupted_eof_marker() {
+        // Flip a CRC32 footer bit: still ISIZE 0, but no longer the exact marker.
+        let crc_off = BGZF_EOF.len() - BGZF_FOOTER_SIZE;
+        let mut corrupted = BGZF_EOF.to_vec();
+        corrupted[crc_off] ^= 0x01;
+        assert_ne!(corrupted.as_slice(), &BGZF_EOF[..], "must not be the exact EOF marker");
+        assert_eq!(uncompressed_size(&corrupted).expect("valid framing"), 0, "still zero ISIZE");
+
+        // Correctly sized (zero-length) slot, so the size check cannot fire —
+        // the rejection must come from CRC verification, not slot sizing.
+        let err = decompress_into_slice(&corrupted, &mut Decompressor::new(), &mut [])
+            .expect_err("a corrupted zero-size block must not be waved through");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("CRC32"), "error should mention CRC32: {err}");
     }
 
     /// A block at `level` with a flipped footer CRC32 bit: it still produces

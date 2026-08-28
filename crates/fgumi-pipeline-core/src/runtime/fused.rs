@@ -896,4 +896,76 @@ mod tests {
             run_fused_single_thread(steps, &graph, &signal, None, None, 0).expect_err("must error");
         assert!(matches!(err, PipelineError::Io { step: "Boom", .. }));
     }
+
+    /// The `# Errors` contract promises `PipelineError::Cancelled` when the run
+    /// is cancelled through the `CancelHandle`, and the driver's only delivery
+    /// of it is the top-of-loop `signal.is_done()` break mapped by
+    /// `to_result()`. Every other test drives a clean run, a budget, a transient
+    /// idle, a stall, or a step error — none a cancel — so a regression that
+    /// moved or dropped this check (for example, breaking only once every step
+    /// finished) would keep the whole suite green while a cancelled fused run
+    /// reported `Ok`.
+    #[test]
+    fn drive_maps_an_external_cancel_to_cancelled() {
+        /// Source that cancels the shared signal on its first dispatch, then
+        /// keeps emitting. Models an external `CancelHandle::cancel` landing
+        /// mid-run: the typed `StepCtx` deliberately does not expose the signal,
+        /// so the step holds its own clone, exactly as an external canceller
+        /// (which owns a `CancelHandle` over the same signal) does.
+        struct CancelOnFirstDispatch {
+            signal: Arc<PipelineSignal>,
+            next: u32,
+            count: u32,
+        }
+        impl Step for CancelOnFirstDispatch {
+            type Input = ();
+            type Outputs = Single<u32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "CancelOnFirstDispatch",
+                    kind: StepKind::Serial,
+                    sticky: false,
+                    output_queues: vec![QueueSpec::Unbounded],
+                    branch_ordering: vec![BranchOrdering::None],
+                }
+            }
+            fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                if self.next == 0 {
+                    self.signal.cancel();
+                }
+                if self.next >= self.count {
+                    return Ok(StepOutcome::Finished);
+                }
+                let _ = ctx.outputs.push(self.next);
+                self.next += 1;
+                Ok(StepOutcome::Progress)
+            }
+        }
+
+        const COUNT: u32 = 8;
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let signal = PipelineSignal::new();
+        let mut graph = ChainGraph::new();
+        let s = graph.register_step("CancelOnFirstDispatch", 1);
+        let k = graph.register_step("CollectSink", 0);
+        graph.wire(s, BranchIdx(0), k);
+        let steps: Vec<Box<dyn ErasedStep>> = vec![
+            Box::new(TypedStep::new(CancelOnFirstDispatch {
+                signal: Arc::clone(&signal),
+                next: 0,
+                count: COUNT,
+            })),
+            Box::new(TypedStep::new(CollectSink { out: Arc::clone(&out) })),
+        ];
+        let err = run_fused_single_thread(steps, &graph, &signal, None, None, 0)
+            .expect_err("a cancelled run must not report success");
+        assert!(
+            matches!(err, PipelineError::Cancelled),
+            "an external cancel must map to PipelineError::Cancelled, got {err:?}"
+        );
+        assert!(
+            out.lock().unwrap().len() < COUNT as usize,
+            "the driver must break on the cancel before draining every item"
+        );
+    }
 }
