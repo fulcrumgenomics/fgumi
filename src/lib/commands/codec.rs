@@ -355,9 +355,6 @@ pub struct CodecOptions {
     pub max_duplex_disagreement_rate: f64,
     /// Maximum duplex disagreements.
     pub max_duplex_disagreements: Option<usize>,
-    /// Use fgbio's legacy `[neg.start, pos.end]` overlap window for the duplex
-    /// consensus region instead of the strict intersection (`--legacy-overlap-window`).
-    pub legacy_overlap_window: bool,
     /// Let fully-unmapped primary templates through the pre-group filter.
     ///
     /// Carried as the whole flattened sub-struct, like `io` / `rejects_opts` /
@@ -394,7 +391,6 @@ impl Codec {
             outer_bases_length: self.outer_bases_length,
             max_duplex_disagreement_rate: self.max_duplex_disagreement_rate,
             max_duplex_disagreements: self.max_duplex_disagreements,
-            legacy_overlap_window: self.legacy_overlap_window,
             allow_unmapped: self.allow_unmapped.clone(),
             io: self.io.clone(),
             rejects_opts: self.rejects_opts.clone(),
