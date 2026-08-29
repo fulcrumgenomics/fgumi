@@ -83,6 +83,19 @@ impl From<TieRuleArg> for fgumi_consensus::TieRule {
     }
 }
 
+impl From<fgumi_consensus::TieRule> for TieRuleArg {
+    /// Reverse of the `TieRuleArg → TieRule` resolution. The two enums are a
+    /// 1:1 pairing, so the `Options` projections that store the resolved
+    /// [`fgumi_consensus::TieRule`] can reconstruct the CLI-facing
+    /// [`ConsensusCallingOptions`] without losing information.
+    fn from(rule: fgumi_consensus::TieRule) -> Self {
+        match rule {
+            fgumi_consensus::TieRule::UlpRelative => Self::UlpRelative,
+            fgumi_consensus::TieRule::FgbioCompat => Self::FgbioCompat,
+        }
+    }
+}
+
 /// Resolves an optional `--methylation-mode` CLI arg to a [`MethylationMode`].
 ///
 /// Returns `Disabled` when `None` (flag not provided).
@@ -1717,6 +1730,174 @@ pub fn validate_index_threshold(
          {reason}. Drop --index-threshold to leave indexing to the default threshold, \
          or pass --index-threshold never to state that a linear scan is intended."
     )
+}
+
+// ==== ported from feat-runall for the chain builder (R2) ====
+/// Log warnings for `SchedulerOptions` / `QueueMemoryOptions` flags that the
+/// typed-step pipeline doesn't honor. Called from the chain builder's
+/// `add_*` stage methods (which back every command's multi-threaded chain
+/// dispatch) so users see why their flags might appear to be ignored.
+/// `--pipeline-stats` is honored separately via `attach_new_pipeline_stats`;
+/// this only warns about the others.
+pub(crate) fn warn_unwired_pipeline_flags(scheduler_opts: &SchedulerOptions) {
+    // --scheduler selects a legacy unified-pipeline scheduler strategy that the
+    // typed-step chain engine does not consume, so setting it (a hidden dev flag)
+    // has no effect on any chain-backed command. Mirror the --deadlock-recover
+    // diagnostic below: surface it when set to a non-default value so a developer
+    // sees the flag was inert rather than silently ignored. Use `warn!` (not
+    // `info!`) to match the sibling "flag has no effect on the chain path"
+    // diagnostics in `group::execute_chain` (--debug-memory, FGUMI_SHORT_CIRCUIT).
+    let requested_scheduler = scheduler_opts.strategy();
+    if requested_scheduler != crate::unified_pipeline::scheduler::SchedulerStrategy::default() {
+        log::warn!(
+            "--scheduler has no effect in the typed-step pipeline: the chain engine \
+             does not use a pluggable scheduler strategy, so the requested strategy \
+             ({requested_scheduler:?}) is ignored"
+        );
+    }
+    // --deadlock-recover: the legacy progressive-doubling recovery
+    // addressed a failure mode (a worker pinned on a stuck step under
+    // legacy's static scheduler) that doesn't exist in the typed-step
+    // dispatch model — every worker round-robins through every step
+    // each iteration, so there's nothing to "recover" from.
+    if scheduler_opts.deadlock_recover_enabled() {
+        log::warn!(
+            "--deadlock-recover has no effect in the typed-step pipeline: \
+             the dispatch model round-robins all workers across all steps, \
+             so the failure mode legacy's progressive recovery addressed \
+             does not occur"
+        );
+    }
+    // `--queue-memory` needs no warning here: it is honored by the chain
+    // engine — the total bytes flow into `PipelineConfig::queue_memory_total`,
+    // which seeds the initial per-queue budget AND enables the runtime
+    // rebalancer that shifts budget between consistently-full / empty queues.
+}
+
+// ==== ported from feat-runall for the chain builder (R2) ====
+/// Print the new-pipeline `PipelineStats` snapshot to the log if any
+/// were collected. Pairs with `attach_new_pipeline_stats`.
+pub(crate) fn log_new_pipeline_stats(
+    stats: Option<std::sync::Arc<crate::pipeline::core::runtime::stats::PipelineStats>>,
+) {
+    if let Some(stats) = stats {
+        let snapshot = stats.snapshot();
+        log::info!("=== Pipeline statistics ===");
+        for line in format!("{snapshot}").lines() {
+            log::info!("{line}");
+        }
+    }
+}
+
+/// How an input header satisfies `group`'s record-ordering requirement.
+///
+/// The three cases are mutually exclusive and are what the diagnostics and the
+/// rejection message key off. They must be decided in priority order: a
+/// template-coordinate header also advertises `GO:query`, so it satisfies
+/// [`crate::sam::is_query_grouped`] too and would otherwise be misreported as
+/// merely query-grouped whenever `--allow-unmapped` is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputOrdering {
+    /// Template-coordinate sorted: records sharing a position key are adjacent,
+    /// so mapped templates group by position as intended.
+    TemplateCoordinate,
+    /// Query-grouped but not template-coordinate sorted. Accepted only under
+    /// `--allow-unmapped`, which groups unmapped reads by UMI alone.
+    QueryGroupedUnmapped,
+    /// Neither ordering holds, so a template's records may not be adjacent.
+    Unusable,
+}
+
+/// Classify how an input header orders its records.
+///
+/// Template-coordinate is the ordering `group` is built around. The streaming
+/// `RecordPositionGrouper` emits a group whenever the position key changes
+/// between consecutive records, so any input where records sharing a position
+/// key aren't already adjacent (queryname-sorted, coordinate-sorted,
+/// FASTQ-order, etc.) would be split into many small groups and assigned
+/// distinct `MoleculeIds` -- silently wrong. Template-coordinate sort is what
+/// makes adjacency match the grouping key.
+///
+/// `--allow-unmapped` places every unmapped read in a single position group, so
+/// the position adjacency that template-coordinate sort exists to provide is not
+/// needed: every unmapped record lands in that one group regardless of order.
+/// Requiring a template-coordinate sort there would tell a user with unaligned
+/// data to sort by coordinates that do not exist, which is not actionable -- it
+/// blocked the unaligned-only workflow (ribosome display, for example)
+/// outright.
+///
+/// Query grouping is still required, and that is a correctness requirement
+/// rather than a policy choice: templates are assembled by comparing each
+/// record's name to the previous one, so if a template's records are not
+/// adjacent an R1/R2 pair splits into two partial templates.
+///
+/// Mapped reads in a query-grouped (rather than template-coordinate) input are
+/// not position-adjacent, so each mapped template forms its own position group
+/// and therefore its own family. That under-groups rather than merging unrelated
+/// molecules, and `--allow-unmapped` already warns that it groups by UMI alone;
+/// the caller's warning names the case explicitly so it is not a surprise.
+pub(crate) fn classify_input_ordering(header: &Header, allow_unmapped: bool) -> InputOrdering {
+    if crate::sam::is_template_coordinate_sorted(header) {
+        InputOrdering::TemplateCoordinate
+    } else if allow_unmapped && crate::sam::is_query_grouped(header) {
+        InputOrdering::QueryGroupedUnmapped
+    } else {
+        InputOrdering::Unusable
+    }
+}
+
+/// Validate that `header` advertises a record ordering the group stage accepts,
+/// emitting the accompanying info/warn logging and bailing with the
+/// order-specific remediation hint on rejection.
+///
+/// This is the single implementation shared by `Group::execute` and the chain
+/// builder's `add_group`, so the two orchestrations of the same stage cannot
+/// drift on the accepted orders, the error text, or the info/warn logging. It
+/// replaces an earlier `require_group_input_sort` whose doc claimed the same
+/// sharing but which `Group::execute` never actually called — the two paths had
+/// silently diverged (a stricter `SO:queryname` predicate and different
+/// messages), which is exactly the failure this consolidation removes.
+pub(crate) fn require_group_input_ordering(
+    header: &Header,
+    allow_unmapped: bool,
+) -> anyhow::Result<()> {
+    use anyhow::bail;
+    use log::{info, warn};
+
+    match classify_input_ordering(header, allow_unmapped) {
+        InputOrdering::TemplateCoordinate => {
+            info!("Input is template-coordinate sorted");
+        }
+        InputOrdering::QueryGroupedUnmapped => {
+            info!("Input is query-grouped; grouping unmapped reads by UMI only");
+            if !header.reference_sequences().is_empty() {
+                warn!(
+                    "Input declares reference sequences but is not template-coordinate \
+                     sorted. Any mapped templates will not be position-grouped, so each \
+                     will form its own family. Sort with --order template-coordinate if \
+                     the input contains mapped reads you want grouped by position."
+                );
+            }
+        }
+        InputOrdering::Unusable => {
+            if allow_unmapped {
+                bail!(
+                    "With --allow-unmapped the input must be either template-coordinate \
+                     sorted or query-grouped, so that a template's records are adjacent \
+                     (header must advertise SO:queryname or GO:query).\n\n\
+                     To sort your BAM file, run:\n  \
+                     fgumi sort -i input.bam -o sorted.bam --order queryname"
+                );
+            }
+            bail!(
+                "Input BAM must be template-coordinate sorted (header must advertise \
+                 SO:unsorted, GO:query, and SS:template-coordinate).\n\n\
+                 To sort your BAM file, run:\n  \
+                 fgumi sort -i input.bam -o sorted.bam --order template-coordinate"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

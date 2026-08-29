@@ -62,7 +62,7 @@ use fgumi_raw_bam;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 
 /// Duplicate flag bit in SAM flags (0x400)
-const DUPLICATE_FLAG: u16 = 0x400;
+pub(crate) const DUPLICATE_FLAG: u16 = 0x400;
 
 //////////////////////////////////////////////////////////////////////////////
 // Metrics
@@ -227,7 +227,7 @@ fn library_display_name(idx: u16, library_index: &LibraryIndex) -> String {
 /// Resolves the `sample` column value for the `--metrics` output: the
 /// `--sample` override when given, otherwise the comma-joined unique `@RG SM:`
 /// values from the header (empty string when the header declares none).
-fn resolve_sample(header: &Header, override_sample: Option<&str>) -> String {
+pub(crate) fn resolve_sample(header: &Header, override_sample: Option<&str>) -> String {
     use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
     if let Some(s) = override_sample {
         return s.to_string();
@@ -249,16 +249,22 @@ fn resolve_sample(header: &Header, override_sample: Option<&str>) -> String {
 //////////////////////////////////////////////////////////////////////////////
 
 /// Metrics collected per position group, aggregated after pipeline completion.
+///
+/// The single aggregator shape for both dedup paths: `Dedup::execute` reduces
+/// one shared `Mutex`-guarded instance, and the chain's `DedupFinalizeHook`
+/// reduces per-thread slots of it (aliased as `CollectedDedupMetrics`). Keeping
+/// one type guarantees the two paths cannot emit different metric fields for the
+/// same input.
 #[derive(Default, Debug)]
-struct CollectedDedupCounts {
+pub(crate) struct CollectedDedupCounts {
     /// Dedup-specific counts, aggregated per library (keyed by
     /// `GroupKey::library_idx` / `ProcessedDedupGroup::library_idx`). One
     /// position group always belongs to exactly one library (library is part
     /// of the grouping key), so merging is unambiguous per group.
-    dedup_counts_by_library: AHashMap<u16, DedupCounts>,
+    pub(crate) dedup_counts_by_library: AHashMap<u16, DedupCounts>,
     /// Family size counts, global across all libraries (out of scope for
     /// per-library splitting).
-    family_sizes: AHashMap<usize, u64>,
+    pub(crate) family_sizes: AHashMap<usize, u64>,
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -902,7 +908,7 @@ fn count_template_pair_orphan(template: &Template, dedup_counts: &mut DedupCount
 //////////////////////////////////////////////////////////////////////////////
 
 /// Process a position group for deduplication.
-fn process_position_group(
+pub(crate) fn process_position_group(
     group: RawPositionGroup,
     filter_config: &TemplateFilterConfig,
     assigner: &dyn UmiAssigner,
@@ -1706,7 +1712,7 @@ impl Command for MarkDuplicates {
 /// within a single library, so a value pooled across distinct libraries would be
 /// misleading. This matches dupblaster, which never estimates library size across
 /// libraries; the per-library rows carry the meaningful estimates.
-fn write_dedup_metrics(
+pub(crate) fn write_dedup_metrics(
     per_library: &AHashMap<u16, DedupCounts>,
     total: &DedupCounts,
     library_index: &LibraryIndex,
@@ -1747,7 +1753,10 @@ fn write_dedup_metrics(
     Ok(())
 }
 
-fn write_family_size_histogram(family_sizes: &AHashMap<usize, u64>, path: &PathBuf) -> Result<()> {
+pub(crate) fn write_family_size_histogram(
+    family_sizes: &AHashMap<usize, u64>,
+    path: &PathBuf,
+) -> Result<()> {
     let metrics = FamilySizeMetrics::from_size_counts(family_sizes.iter().map(|(&s, &c)| (s, c)));
     DelimFile::default()
         .write_tsv(path, metrics)
@@ -1786,6 +1795,36 @@ fn write_duplication_ladder(
 //////////////////////////////////////////////////////////////////////////////
 // Tests
 //////////////////////////////////////////////////////////////////////////////
+
+/// Metrics collected per position group, aggregated after pipeline completion.
+///
+/// The chain finalize hook's aggregator is the same shape as the non-chain
+/// path's; alias the two so a metric field added to one is shared by both (they
+/// differ only in the reduction site — per-thread slots vs one shared `Mutex`).
+pub(crate) use self::CollectedDedupCounts as CollectedDedupMetrics;
+
+/// A batch of `ProcessedDedupGroup`s carrying a monotonic ordinal so the
+/// downstream `mi_assign` + `serialize` steps preserve input order. Same
+/// shape as `BatchedProcessedPositionGroups` (used by group); see
+/// `pipeline::steps::group::position` for the rationale.
+pub struct BatchedProcessedDedupGroups {
+    pub batch_serial: u64,
+    pub groups: Vec<ProcessedDedupGroup>,
+}
+
+// ==== impls ported from feat-runall for the chain builder (R2) ====
+impl crate::pipeline::core::item::HeapSize for BatchedProcessedDedupGroups {
+    fn heap_size(&self) -> usize {
+        self.groups.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
+            + self.groups.capacity() * std::mem::size_of::<ProcessedDedupGroup>()
+    }
+}
+
+impl crate::pipeline::core::item::Ordered for BatchedProcessedDedupGroups {
+    fn ordinal(&self) -> u64 {
+        self.batch_serial
+    }
+}
 
 #[cfg(test)]
 mod tests {

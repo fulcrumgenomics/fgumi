@@ -294,11 +294,32 @@ impl UnmappedSamBuilder {
     #[inline]
     pub fn write_with_block_size(&self, output: &mut Vec<u8>) {
         debug_assert!(self.sealed, "must call build_record first");
-        let block_size =
-            u32::try_from(self.buf.len()).expect("record too large for BAM block_size");
-        output.extend_from_slice(&block_size.to_le_bytes());
-        output.extend_from_slice(&self.buf);
+        write_framed_record(output, &self.buf).expect("record too large for BAM block_size");
     }
+}
+
+/// Append `rec` to `dst` framed as a BAM record block: a 4-byte little-endian
+/// `block_size` length prefix followed by the record bytes. This is the
+/// canonical BAM record framing used by the pipeline serialize path and the
+/// BGZF compression step; call it instead of re-implementing the prefix
+/// arithmetic so every framing site stays in agreement.
+///
+/// # Errors
+///
+/// Returns [`std::io::ErrorKind::InvalidData`] if `rec.len()` exceeds
+/// `u32::MAX` — a single BAM record's `block_size` is a `u32` field, so a
+/// larger record cannot be framed without silently truncating the length.
+#[inline]
+pub fn write_framed_record(dst: &mut Vec<u8>, rec: &[u8]) -> std::io::Result<()> {
+    let block_size = u32::try_from(rec.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("BAM record too large ({} bytes)", rec.len()),
+        )
+    })?;
+    dst.extend_from_slice(&block_size.to_le_bytes());
+    dst.extend_from_slice(rec);
+    Ok(())
 }
 
 impl Default for UnmappedSamBuilder {
@@ -666,6 +687,34 @@ mod tests {
     use crate::testutil::*;
     use fgumi_tag::SamTag;
     use rstest::rstest;
+
+    // ── write_framed_record: 4-byte LE block_size prefix + record bytes ──────
+
+    #[test]
+    fn write_framed_record_prefixes_le_block_size() {
+        let rec = [0xAA_u8, 0xBB, 0xCC];
+        let mut dst = vec![0x01_u8]; // pre-existing byte: framing must append, not overwrite
+        write_framed_record(&mut dst, &rec).expect("small record frames");
+        // Existing byte preserved, then a 4-byte LE length (3), then the bytes.
+        assert_eq!(dst, vec![0x01, 3, 0, 0, 0, 0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn write_framed_record_empty_record() {
+        let mut dst = Vec::new();
+        write_framed_record(&mut dst, &[]).expect("empty record frames");
+        assert_eq!(dst, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn write_framed_record_appends_across_calls() {
+        // Two framed records concatenate into one buffer (the DecompressedBlock
+        // shape the rejects-serialization paths emit).
+        let mut dst = Vec::new();
+        write_framed_record(&mut dst, &[0x11]).unwrap();
+        write_framed_record(&mut dst, &[0x22, 0x33]).unwrap();
+        assert_eq!(dst, vec![1, 0, 0, 0, 0x11, 2, 0, 0, 0, 0x22, 0x33]);
+    }
 
     // ── try_build_record: data-derived names must error, not panic ───────────
 

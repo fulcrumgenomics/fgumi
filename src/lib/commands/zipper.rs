@@ -1345,6 +1345,496 @@ impl Command for Zipper {
     }
 }
 
+// ==== ported from feat-runall for the chain builder (R2) ====
+/// Log line emitted when the chain builder wires the typed-step zipper path
+/// (the log site lives in `pipeline::chains::builder`). Pinned as a `pub const`
+/// so integration tests that assert the new typed-step path was taken (e.g.
+/// `runall_zipper_self_pair_uses_new_pipeline`) share a single source of truth
+/// with the log site and cannot drift.
+pub const NEW_PIPELINE_START_LOG: &str = "Starting zipper (new pipeline)";
+
+/// Apply the full zipper merge body to a single (unmapped, mapped)
+/// template pair. Runs `merge_raw`, then (when `reference` is `Some`)
+/// `restore_unconverted_bases_in_raw_template` for the bisulfite path.
+///
+/// Returned errors are bare — callers add their own context (e.g. the
+/// caller's step name) via `.map_err`/`?` at the call site so the
+/// surfaced error is attributable to the dispatching context.
+///
+/// Used by:
+/// - `ZipperMergeStep::emit_merged` (typed-step zipper)
+/// - `AlignAndMergeStep::merge_zipper_batch` (AAM dispatcher)
+pub(crate) fn merge_one_template(
+    unmapped: &Template,
+    mapped: &mut Template,
+    tag_info: &TagInfo,
+    skip_tc_tags: bool,
+    reference: Option<&ReferenceReader>,
+    output_header: &Header,
+) -> Result<()> {
+    merge_raw(unmapped, mapped, tag_info, skip_tc_tags)?;
+    if let Some(ref_reader) = reference {
+        restore_unconverted_bases_in_raw_template(mapped, ref_reader, output_header)?;
+    }
+    Ok(())
+}
+
+// ── ported from feat-runall for the chain builder (R2): the Step2 merge step ──
+pub(crate) mod merge_step {
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use noodles::sam::Header;
+
+    use crate::pipeline::core::Unpushed;
+    use crate::pipeline::core::held::HeldSlot;
+    use crate::pipeline::core::outputs::OrderedBytesSingle;
+    use crate::pipeline::core::queues::QueueSpec;
+    use crate::pipeline::core::reorder::BranchOrdering;
+    use crate::pipeline::core::step::{Step2, StepCtx2, StepKind, StepOutcome, StepProfile};
+    use crate::pipeline::steps::types::BamTemplateBatch;
+    use crate::reference::ReferenceReader;
+    use crate::template::Template;
+    use crate::umi::TagInfo;
+
+    /// Cap on the number of templates one `try_run` call processes
+    /// before yielding. Bounds per-call wall time so the Serial mutex
+    /// doesn't starve other workers. Mirrors the
+    /// `MAX_BATCHES_PER_LOCK` discipline used by `GroupByQueryname`,
+    /// but in template-units since the merge body's work is
+    /// per-template.
+    const MAX_TEMPLATES_PER_CALL: usize = 1024;
+
+    /// Immutable configuration shared by the step.
+    ///
+    /// Cloning is one `Arc` clone per field — cheap; intentionally
+    /// crammed into one struct so the call-site builder stays small.
+    #[derive(Clone)]
+    pub struct ZipperMergeConfig {
+        pub tag_info: Arc<TagInfo>,
+        pub skip_tc_tags: bool,
+        pub exclude_missing_reads: bool,
+        pub reference: Option<Arc<ReferenceReader>>,
+        pub output_header: Arc<Header>,
+        /// Counter for unmapped templates that had no mapped match.
+        /// Exposed back to the command after `Pipeline::run` so the
+        /// summary log (`"Excluded N templates..."`) reflects the
+        /// final missing-mapped count.
+        pub missing_count: Arc<AtomicU64>,
+        /// Counter for records pushed into the output stream (matched
+        /// merges + unmapped-only emits). Exposed back to the command
+        /// after `Pipeline::run` so the final `log_completion` line
+        /// reports a real throughput number instead of zero.
+        pub records_emitted: Arc<AtomicU64>,
+        pub target_batch_count: usize,
+        pub output_byte_limit: u64,
+    }
+
+    /// One batch's templates in flight on a branch + the cursor into them.
+    /// Owns the `Vec<Template>` moved out of the batch (via
+    /// [`BamTemplateBatch::into_parts`]) so the drain cursor can replace
+    /// slots in place — the cached `total_bytes` is dropped with the batch,
+    /// so there is no stale accounting to worry about.
+    struct PendingBatch {
+        templates: Vec<Template>,
+        cursor: usize,
+    }
+
+    impl PendingBatch {
+        fn new(batch: BamTemplateBatch) -> Self {
+            let (_, templates) = batch.into_parts();
+            Self { templates, cursor: 0 }
+        }
+
+        fn current(&self) -> Option<&Template> {
+            self.templates.get(self.cursor)
+        }
+
+        fn take_current(&mut self) -> Option<Template> {
+            let i = self.cursor;
+            if i >= self.templates.len() {
+                return None;
+            }
+            self.cursor += 1;
+            // Replace the slot with an empty placeholder so the
+            // surrounding `Vec` can keep its length without the
+            // `Template: Default` bound (Template carries a
+            // `MoleculeId` enum that has no canonical default).
+            Some(std::mem::replace(&mut self.templates[i], Template::new(Vec::new())))
+        }
+
+        fn is_exhausted(&self) -> bool {
+            self.cursor >= self.templates.len()
+        }
+    }
+
+    /// `Serial + ByItemOrdinal` Step2 merger that pairs unmapped
+    /// (`InputA`) and mapped (`InputB`) templates by queryname order
+    /// and emits merged [`BamTemplateBatch`]es.
+    pub struct ZipperMergeStep {
+        cfg: ZipperMergeConfig,
+        pending_a: Option<PendingBatch>,
+        pending_b: Option<PendingBatch>,
+        accumulator: Vec<Template>,
+        next_ordinal: u64,
+        held: HeldSlot<Unpushed<BamTemplateBatch>>,
+        name: &'static str,
+    }
+
+    impl ZipperMergeStep {
+        #[must_use]
+        pub fn new(mut cfg: ZipperMergeConfig) -> Self {
+            // Clamp the batching threshold the loop actually compares against,
+            // not just the accumulator capacity: with `target_batch_count == 0`
+            // the `accumulator.len() >= target_batch_count` checks in `try_run`
+            // / `push_template` are true on an empty accumulator, so the step
+            // livelocks emitting empty batches and never pulls input. The
+            // sibling batch-emitting steps (`GroupByQueryname`,
+            // `GroupByPosition`, `MiAssign`) clamp the stored field the same
+            // way; clamping `cfg` here makes every `self.cfg.target_batch_count`
+            // read see the floored value.
+            cfg.target_batch_count = cfg.target_batch_count.max(1);
+            let target = cfg.target_batch_count;
+            Self {
+                cfg,
+                pending_a: None,
+                pending_b: None,
+                accumulator: Vec::with_capacity(target),
+                next_ordinal: 0,
+                held: HeldSlot::new(),
+                name: "ZipperMerge",
+            }
+        }
+
+        /// Push a fully-merged template into the accumulator and emit
+        /// a batch if the target count is reached. Increments the
+        /// records-emitted counter by the template's record count so
+        /// the post-run `log_completion` reports an accurate throughput
+        /// number.
+        fn push_template(
+            &mut self,
+            template: Template,
+            ctx: &mut StepCtx2<'_, Self>,
+        ) -> Option<StepOutcome> {
+            self.cfg.records_emitted.fetch_add(template.read_count() as u64, Ordering::Relaxed);
+            self.accumulator.push(template);
+            if self.accumulator.len() >= self.cfg.target_batch_count {
+                Some(self.emit_batch(ctx))
+            } else {
+                None
+            }
+        }
+
+        /// Both input branches are drained and every template has been
+        /// processed: flush the final partial accumulator (if any) and report
+        /// `Finished`. A bounced flush is parked in `held` and retried by
+        /// `try_run`'s held-drain preamble on the next pass (which then
+        /// re-reaches this path with an empty accumulator → `Finished`).
+        fn finish_accumulator(&mut self, ctx: &mut StepCtx2<'_, Self>) -> StepOutcome {
+            if self.accumulator.is_empty() {
+                return StepOutcome::Finished;
+            }
+            self.emit_batch(ctx)
+        }
+
+        /// Package the accumulator into a [`BamTemplateBatch`] and
+        /// emit. On rejection, hold; retry on the next `try_run`.
+        fn emit_batch(&mut self, ctx: &mut StepCtx2<'_, Self>) -> StepOutcome {
+            let serial = self.next_ordinal;
+            self.next_ordinal += 1;
+            let templates = std::mem::replace(
+                &mut self.accumulator,
+                Vec::with_capacity(self.cfg.target_batch_count),
+            );
+            let out = BamTemplateBatch::new(serial, templates);
+            if let Err(unpushed) = ctx.outputs.push(out) {
+                self.held.put(unpushed);
+            }
+            StepOutcome::Progress
+        }
+
+        /// Emit an unmapped-only template (missing-mapped path).
+        fn emit_unmapped_only(
+            &mut self,
+            unmapped: Template,
+            ctx: &mut StepCtx2<'_, Self>,
+        ) -> io::Result<Option<StepOutcome>> {
+            if self.cfg.exclude_missing_reads {
+                self.cfg.missing_count.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            } else {
+                let records =
+                    super::encode_unmapped_template_records(&unmapped, &self.cfg.output_header)
+                        .map_err(|e| {
+                            io::Error::other(format!("encode_unmapped_template_records: {e}"))
+                        })?;
+                let template = Template::from_records(records).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Template::from_records for unmapped-only: {e}"),
+                    )
+                })?;
+                Ok(self.push_template(template, ctx))
+            }
+        }
+
+        /// Apply the merge body to a matched (unmapped, mapped) pair
+        /// and emit the merged mapped template.
+        fn emit_merged(
+            &mut self,
+            unmapped: Template,
+            mut mapped: Template,
+            ctx: &mut StepCtx2<'_, Self>,
+        ) -> io::Result<Option<StepOutcome>> {
+            super::merge_one_template(
+                &unmapped,
+                &mut mapped,
+                &self.cfg.tag_info,
+                self.cfg.skip_tc_tags,
+                self.cfg.reference.as_deref(),
+                &self.cfg.output_header,
+            )
+            .map_err(|e| io::Error::other(format!("ZipperMergeStep: {e}")))?;
+            Ok(self.push_template(mapped, ctx))
+        }
+    }
+
+    impl Step2 for ZipperMergeStep {
+        type InputA = BamTemplateBatch;
+        type InputB = BamTemplateBatch;
+        type Outputs = OrderedBytesSingle<BamTemplateBatch>;
+
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: self.name,
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded {
+                    limit_bytes: self.cfg.output_byte_limit,
+                }],
+                branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+            }
+        }
+
+        fn try_run(&mut self, ctx: &mut StepCtx2<'_, Self>) -> io::Result<StepOutcome> {
+            // 1. Drain held output slot first.
+            if let Some(unpushed) = self.held.take() {
+                match ctx.outputs.retry(unpushed) {
+                    Ok(()) => {}
+                    Err(again) => {
+                        self.held.put(again);
+                        return Ok(StepOutcome::Contention);
+                    }
+                }
+            }
+
+            // 2. If the accumulator is already full, emit before pulling more input.
+            if self.accumulator.len() >= self.cfg.target_batch_count {
+                return Ok(self.emit_batch(ctx));
+            }
+
+            let mut did_work = false;
+
+            // 3. Process up to `MAX_TEMPLATES_PER_CALL` templates per try_run.
+            for _ in 0..MAX_TEMPLATES_PER_CALL {
+                // Ensure pending_a has a non-exhausted current template.
+                loop {
+                    match self.pending_a.as_ref() {
+                        Some(pa) if !pa.is_exhausted() => break,
+                        Some(_) => self.pending_a = None,
+                        None => {
+                            if let Some(b) = ctx.a.pop() {
+                                self.pending_a = Some(PendingBatch::new(b));
+                            } else {
+                                // Unmapped queue is empty right now. If A is
+                                // also fully drained (producer signalled
+                                // end-of-stream) we'll never get another
+                                // unmapped template, so check for leftover
+                                // mapped reads *now*: the both-branches-drained
+                                // completion below only fires once B is drained
+                                // too, but B may still hold records here, so
+                                // surfacing the mismatch eagerly avoids looping
+                                // forever returning `NoProgress`.
+                                if ctx.a.is_drained() {
+                                    let leftover_b = self
+                                        .pending_b
+                                        .as_ref()
+                                        .and_then(|pb| pb.current())
+                                        .map(|t| t.name.clone())
+                                        .or_else(|| {
+                                            ctx.b.pop().and_then(|batch| {
+                                                batch.templates().first().map(|t| t.name.clone())
+                                            })
+                                        });
+                                    if let Some(name) = leftover_b {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            format!(
+                                                "Error: processed all unmapped reads but there are mapped reads remaining. \
+                                                 Found template '{}'. Please ensure the unmapped and mapped reads have the \
+                                                 same set of read names in the same order, and reads with the same name \
+                                                 are consecutive (grouped) in each input.",
+                                                String::from_utf8_lossy(&name)
+                                            ),
+                                        ));
+                                    }
+                                    // Unmapped fully consumed and no mapped
+                                    // remaining. If the mapped branch is also
+                                    // drained the merge is complete — flush the
+                                    // final partial accumulator and report
+                                    // `Finished`. Otherwise (B still open) fall
+                                    // through and wait for more mapped reads.
+                                    if ctx.b.is_drained() {
+                                        return Ok(self.finish_accumulator(ctx));
+                                    }
+                                }
+                                // A not yet drained, or B still open — no input
+                                // ready right now.
+                                return Ok(if did_work {
+                                    StepOutcome::Progress
+                                } else {
+                                    StepOutcome::NoProgress
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Ensure pending_b has a non-exhausted current template
+                // (or set to None if its queue is currently empty).
+                loop {
+                    match self.pending_b.as_ref() {
+                        Some(pb) if !pb.is_exhausted() => break,
+                        Some(_) => self.pending_b = None,
+                        None => match ctx.b.pop() {
+                            Some(b) => self.pending_b = Some(PendingBatch::new(b)),
+                            None => break, // No mapped available right now; fall through.
+                        },
+                    }
+                }
+
+                // Peek both currents.
+                let pa_name: Vec<u8> = self
+                    .pending_a
+                    .as_ref()
+                    .and_then(|pa| pa.current())
+                    .expect("pending_a guaranteed non-exhausted above")
+                    .name
+                    .clone();
+                let pb_name: Option<Vec<u8>> =
+                    self.pending_b.as_ref().and_then(|pb| pb.current()).map(|t| t.name.clone());
+
+                let mapped_drained = self.pending_b.is_none() && ctx.b.is_drained();
+
+                let outcome = match pb_name {
+                    Some(ref n) if n == &pa_name => {
+                        // MERGE PATH — match.
+                        let unmapped = self.pending_a.as_mut().unwrap().take_current().unwrap();
+                        let mapped = self.pending_b.as_mut().unwrap().take_current().unwrap();
+                        self.emit_merged(unmapped, mapped, ctx)?
+                    }
+                    Some(_) => {
+                        // MISMATCH: the mapped head names a different template.
+                        // The mapped BAM is a subsequence of the unmapped BAM in
+                        // the same queryname order, so a name mismatch means the
+                        // current unmapped read is simply missing from the mapped
+                        // BAM — emit it as unmapped-only and advance the unmapped
+                        // cursor (leaving the mapped cursor put), exactly as fgbio
+                        // ZipperBams does (name-equality only).
+                        //
+                        // We deliberately do NOT compare sort order here. The
+                        // inputs may be query-GROUPED (records with the same name
+                        // consecutive) rather than queryname-sorted, in which case
+                        // successive groups can be in any order and a `natural`
+                        // comparison would spuriously reject valid input. A
+                        // genuinely orphaned mapped read (no unmapped counterpart)
+                        // is still caught by the end-of-stream "mapped reads
+                        // remaining" check once the unmapped branch drains.
+                        let unmapped = self.pending_a.as_mut().unwrap().take_current().unwrap();
+                        self.emit_unmapped_only(unmapped, ctx)?
+                    }
+                    None if mapped_drained => {
+                        // No more mapped will ever arrive.
+                        let unmapped = self.pending_a.as_mut().unwrap().take_current().unwrap();
+                        self.emit_unmapped_only(unmapped, ctx)?
+                    }
+                    None => {
+                        // No mapped right now, but ctx.b not drained — wait.
+                        return Ok(if did_work {
+                            StepOutcome::Progress
+                        } else {
+                            StepOutcome::NoProgress
+                        });
+                    }
+                };
+
+                did_work = true;
+
+                // If `emit_*` filled the accumulator and dispatched a
+                // batch, the next iteration starts with an empty
+                // accumulator — that's fine. The early-return below
+                // makes the per-call work bound predictable.
+                if let Some(stepwise) = outcome {
+                    debug_assert_eq!(stepwise, StepOutcome::Progress);
+                    return Ok(StepOutcome::Progress);
+                }
+            }
+
+            Ok(if did_work { StepOutcome::Progress } else { StepOutcome::NoProgress })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::pipeline::core::reorder::BranchOrdering;
+        use crate::umi::TagInfo;
+        use noodles::sam::Header;
+        use std::sync::Arc;
+
+        fn make_cfg(exclude: bool) -> ZipperMergeConfig {
+            ZipperMergeConfig {
+                tag_info: Arc::new(TagInfo::new(vec![], vec![], vec![])),
+                skip_tc_tags: true,
+                exclude_missing_reads: exclude,
+                reference: None,
+                output_header: Arc::new(Header::default()),
+                missing_count: Arc::new(AtomicU64::new(0)),
+                records_emitted: Arc::new(AtomicU64::new(0)),
+                target_batch_count: 4,
+                output_byte_limit: 1024 * 1024,
+            }
+        }
+
+        #[test]
+        fn profile_advertises_serial_byordinal() {
+            let s = ZipperMergeStep::new(make_cfg(false));
+            let p = s.profile();
+            assert_eq!(p.name, "ZipperMerge");
+            assert_eq!(p.kind, StepKind::Serial);
+            assert!(!p.sticky);
+            assert_eq!(p.branch_ordering, vec![BranchOrdering::ByItemOrdinal]);
+        }
+
+        /// A `target_batch_count` of 0 must be clamped to 1 in the stored
+        /// config, not just in the accumulator capacity: the `try_run` /
+        /// `push_template` emit checks compare against `self.cfg.target_batch_count`,
+        /// and an unclamped 0 would livelock emitting empty batches. Mirrors the
+        /// clamp the sibling group steps apply to their stored field.
+        #[test]
+        fn new_clamps_zero_target_batch_count_in_stored_config() {
+            let mut cfg = make_cfg(false);
+            cfg.target_batch_count = 0;
+            let step = ZipperMergeStep::new(cfg);
+            assert_eq!(
+                step.cfg.target_batch_count, 1,
+                "stored target_batch_count must be floored to 1, not left at 0"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

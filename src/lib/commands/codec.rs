@@ -419,6 +419,25 @@ fn recover_or_propagate_codec_error(e: CodecConsensusError, umi: &str) -> Result
     }
 }
 
+impl CodecOptions {
+    /// Reconstruct the shared [`ConsensusCallingOptions`] from the inlined flat
+    /// fields, so the chain builder can read `.consensus().error_rate_pre_umi`
+    /// etc. `tie_rule` is stored resolved on `CodecOptions`; convert it back to
+    /// the CLI-facing [`crate::commands::common::TieRuleArg`] via the 1:1 mapping.
+    #[must_use]
+    pub fn consensus(&self) -> ConsensusCallingOptions {
+        ConsensusCallingOptions {
+            error_rate_pre_umi: self.error_rate_pre_umi,
+            error_rate_post_umi: self.error_rate_post_umi,
+            min_input_base_quality: self.min_input_base_quality,
+            output_per_base_tags: self.output_per_base_tags,
+            trim: self.trim,
+            min_consensus_base_quality: self.min_consensus_base_quality,
+            tie_rule: self.tie_rule.into(),
+        }
+    }
+}
+
 impl Command for Codec {
     fn execute(&self, command_line: &str) -> Result<()> {
         // Validate inputs

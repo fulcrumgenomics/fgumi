@@ -44,6 +44,18 @@ impl MoleculeIdCounter {
         self.next.fetch_add(count, Ordering::SeqCst)
     }
 
+    /// Zero the block cursor so the next `rebase` restarts at id 0.
+    ///
+    /// Used by the parallel assigners' `UmiAssigner::reset` overrides: the
+    /// chain group/dedup loops reuse one assigner across position groups and
+    /// call `reset()` per group so each group emits local ids `0..k` (which the
+    /// downstream `distinct_mi_count` / `assign_mi_offsets` global rebase
+    /// depends on). Without this the cursor keeps advancing and successive
+    /// groups' ids are non-local, corrupting the MI numbering.
+    fn reset(&self) {
+        self.next.store(0, Ordering::SeqCst);
+    }
+
     /// Rebase locally-numbered (`0..k`) assignments onto a freshly reserved block.
     ///
     /// The block size is `max(local id) + 1` rather than `assignments.len()`,
@@ -583,6 +595,10 @@ impl ParallelIdentityAssigner {
 }
 
 impl UmiAssigner for ParallelIdentityAssigner {
+    fn reset(&self) {
+        self.counter.reset();
+    }
+
     fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
         let mut assignments = self.assign_local(raw_umis);
         self.counter.rebase(&mut assignments);
@@ -710,6 +726,10 @@ impl ParallelEditAssigner {
 }
 
 impl UmiAssigner for ParallelEditAssigner {
+    fn reset(&self) {
+        self.counter.reset();
+    }
+
     fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
         let mut assignments = self.assign_local(raw_umis);
         self.counter.rebase(&mut assignments);
@@ -878,6 +898,10 @@ impl ParallelAdjacencyAssigner {
 }
 
 impl UmiAssigner for ParallelAdjacencyAssigner {
+    fn reset(&self) {
+        self.counter.reset();
+    }
+
     fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
         let mut assignments = self.assign_local(raw_umis);
         self.counter.rebase(&mut assignments);
@@ -1219,6 +1243,10 @@ impl ParallelPairedAssigner {
 }
 
 impl UmiAssigner for ParallelPairedAssigner {
+    fn reset(&self) {
+        self.counter.reset();
+    }
+
     fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
         let mut assignments = self.assign_local(raw_umis);
         self.counter.rebase(&mut assignments);
@@ -1538,6 +1566,49 @@ mod tests {
         let umis: Vec<String> = vec!["ACGT".to_string()];
         let assignments = assigner.assign(&umis);
         assert_eq!(assignments.len(), 1);
+    }
+
+    // `reset()` must return a reused parallel assigner to its initial
+    // molecule-id numbering. The chain group/dedup loops reuse ONE assigner
+    // across position groups (the `--allow-unmapped` path builds a parallel
+    // `batch_assigner`) and call `reset()` per group, relying on each group
+    // emitting local ids `0..k` for `distinct_mi_count` / `assign_mi_offsets`.
+    // The trait's default `reset()` is a no-op, so a parallel assigner that
+    // holds a `MoleculeIdCounter` but forgets to override it would silently
+    // leave the counter accumulating and corrupt the per-group MI numbering.
+    // This pins that every parallel strategy resets its counter.
+    #[rstest]
+    #[case::identity(|| Box::new(ParallelIdentityAssigner::new(2)) as Box<dyn UmiAssigner>, &["AAAA", "AAAA", "CCCC"])]
+    #[case::edit(|| Box::new(ParallelEditAssigner::new(1, 2)) as Box<dyn UmiAssigner>, &["AAAA", "AAAT", "CCCC"])]
+    #[case::adjacency(
+        || Box::new(ParallelAdjacencyAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["AAAA", "AAAT", "CCCC"]
+    )]
+    #[case::paired(
+        || Box::new(ParallelPairedAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["ACT-ACT", "ACT-ACT", "TGA-TGA"]
+    )]
+    fn reset_restores_initial_molecule_numbering(
+        #[case] make: fn() -> Box<dyn UmiAssigner>,
+        #[case] umis: &[&str],
+    ) {
+        let assigner = make();
+        let umis: Vec<Umi> = umis.iter().map(|s| (*s).to_string()).collect();
+        let first = assigner.assign(&umis);
+        // Advance the block cursor with an extra batch (no reset here).
+        let _ = assigner.assign(&umis);
+        // Without reset, the reused assigner's ids drift past the first block —
+        // guards against a no-op `reset()` making the equality below pass
+        // trivially.
+        let reused = assigner.assign(&umis);
+        assert_ne!(reused, first, "reused parallel assign without reset must advance ids");
+        // reset() must restore the initial local numbering.
+        assigner.reset();
+        let after_reset = assigner.assign(&umis);
+        assert_eq!(
+            after_reset, first,
+            "reset() must restore local `0..k` molecule numbering for the parallel assigner"
+        );
     }
 
     // fgbio's GroupReadsByUmi throws on UMIs of differing length; every parallel

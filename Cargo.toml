@@ -98,6 +98,7 @@ sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 tempfile = "3.3.0"
 thiserror = "2"
 trybuild = "1.0"
+which = "8"
 wide = "1.5"
 
 [package]
@@ -167,6 +168,8 @@ fgumi-bam-io = { workspace = true }
 fgumi-sort = { workspace = true }
 fgumi-pipeline-core = { workspace = true }
 fgumi-pipeline-io = { workspace = true }
+fgumi-cli-macros = { workspace = true }
+which = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = { workspace = true }
@@ -175,20 +178,33 @@ mach2 = { workspace = true }
 nix = { workspace = true }
 
 [features]
-default = ["simplex", "duplex", "codec"]
+default = ["consensus"]
 simplex = ["fgumi-consensus/simplex"]
 # duplex and codec depend on simplex (mirrors fgumi-consensus: `duplex = ["simplex"]`
 # and `codec = ["simplex"]`), and their commands share methylation/filter paths
 # that live behind the `simplex` feature in this crate.
 duplex = ["simplex", "fgumi-consensus/duplex"]
 codec = ["simplex", "fgumi-consensus/codec"]
+# Umbrella for all consensus calling (simplex + duplex + codec). The command
+# modules gate individually on `simplex`/`duplex`/`codec`, but the always-
+# compiled chain/runall layer (`pipeline::chains`) references the consensus
+# option-bag surface all-or-nothing: gating those references per-codec lets a
+# reduced-feature build reference a half-present surface and fail to compile, so
+# `consensus` gates them as one unit. This is about consensus *coherence* only — it
+# is NOT a claim that `--no-default-features` compiles: the crate has other
+# always-on references (e.g. the methylation path) that a bare
+# `--no-default-features` build still fails on. Enabled by default and by
+# `simulate`.
+consensus = ["simplex", "duplex", "codec"]
 dhat-heap = ["dep:dhat"]
 # Enable comprehensive memory debugging infrastructure (monitor thread, hot-path atomics, CLI args)
 memory-debug = ["fgumi-sort/memory-debug"]
 # Enable compare subcommand with bams and metrics (developer tools)
 compare = []
-# Enable simulate commands for generating synthetic test data
-simulate = ["simplex"]
+# Enable simulate commands for generating synthetic test data. Pulls the full
+# consensus umbrella so the chain-builder's consensus stages are present when
+# simulate-driven end-to-end tests exercise them.
+simulate = ["consensus"]
 # Enable profiling output for adjacency UMI assigner
 profile-adjacency = []
 # Enable slow stress tests for concurrency testing

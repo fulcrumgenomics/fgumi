@@ -12,11 +12,11 @@
 //!   protocol, reorder buffers).
 //! - [`steps`]: the concrete `Step` implementations (decompress, boundaries,
 //!   parse, serialize, compress, write, …).
+//! - [`chains`]: declarative chain construction — `build_for`, `ChainBuilder`,
+//!   per-command step factories that assemble the steps into runnable pipelines.
 //!
-//! A `chains` module (declarative chain construction — `build_for`,
-//! `ChainBuilder`, per-command step factories) lands in a follow-up; until it
-//! does, nothing in `src/lib/commands` routes through this tree and every
-//! command still runs on `unified_pipeline`.
+//! Commands are rewired onto `chains` one at a time; until a given command is
+//! rewired it still runs on `unified_pipeline`.
 
 /// The typed-step execution engine, extracted into the `fgumi-pipeline-core`
 /// crate so its lightweight dependency graph (no `noodles`-bam / sort /
@@ -24,4 +24,5 @@
 /// `crate::pipeline::core::…` path resolves — which is what lets the ported
 /// step sources compile unmodified.
 pub use fgumi_pipeline_core as core;
+pub mod chains;
 pub mod steps;

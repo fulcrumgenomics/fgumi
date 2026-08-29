@@ -729,6 +729,7 @@ dependencies = [
  "fgumi",
  "fgumi-bam-io",
  "fgumi-bgzf",
+ "fgumi-cli-macros",
  "fgumi-consensus",
  "fgumi-dna",
  "fgumi-metrics",
@@ -765,6 +766,7 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "thiserror 2.0.20",
+ "which",
 ]
 
 [[package]]
@@ -2939,6 +2941,15 @@ checksum = "c435338968042f4f59a557f690a253676d47ce13ceb55d70100e7facf6620a30"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "which"
+version = "8.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f3ef584124b911bcc3875c2f1472e80f24361ceb789bd1c62b3e9a3df9ff43c"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

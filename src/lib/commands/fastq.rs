@@ -528,7 +528,7 @@ impl UmiNameAnnotation {
 /// Reusable per-record scratch buffers, kept across the conversion loop so the
 /// hot path does not allocate.
 #[derive(Debug, Default)]
-struct FastqRecordBuffers {
+pub(crate) struct FastqRecordBuffers {
     /// Decoded sequence bases.
     seq: Vec<u8>,
     /// Phred+33 encoded qualities.
@@ -538,7 +538,7 @@ struct FastqRecordBuffers {
 }
 
 impl FastqRecordBuffers {
-    fn with_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             seq: Vec::with_capacity(capacity),
             qual: Vec::with_capacity(capacity),
@@ -549,7 +549,7 @@ impl FastqRecordBuffers {
 
 /// Write a single FASTQ record to the writer.
 #[inline]
-fn write_fastq_record<W: Write>(
+pub(crate) fn write_fastq_record<W: Write>(
     writer: &mut W,
     record: &RawRecord,
     flags: u16,
@@ -610,6 +610,71 @@ fn write_fastq_record<W: Write>(
     writer.write_all(b"\n")?;
 
     Ok(())
+}
+
+// ==== ported from feat-runall for the chain builder (R2) ====
+/// Which FASTQ stream a record belongs to, based on its segment flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Segment {
+    /// First segment of a pair (`FIRST_SEGMENT` set, `LAST_SEGMENT` clear) → R1.
+    Read1,
+    /// Last segment of a pair (`LAST_SEGMENT` set, `FIRST_SEGMENT` clear) → R2.
+    Read2,
+    /// Neither or both segment bits set (single-end or ambiguous) → "other".
+    Other,
+}
+
+/// Classify a record into R1 / R2 / other from its flags, matching how
+/// `samtools fastq` routes reads to `-1` / `-2` / `-0`.
+pub(crate) fn classify_segment(flags: u16) -> Segment {
+    use fgumi_raw_bam::flags as flag_bits;
+    let is_first = (flags & flag_bits::FIRST_SEGMENT) != 0;
+    let is_last = (flags & flag_bits::LAST_SEGMENT) != 0;
+    match (is_first, is_last) {
+        (true, false) => Segment::Read1,
+        (false, true) => Segment::Read2,
+        _ => Segment::Other,
+    }
+}
+
+/// Returns `true` if `path` should be written compressed (ends in
+/// `.gz`/`.bgz`/`.bgzf`).
+///
+/// KNOWN DIVERGENCE — reconcile in the fastq WIRING PR: this is case-SENSITIVE
+/// and also matches `.bgzf`, whereas the live standalone equivalent
+/// [`is_gzip_output_path`] is case-INSENSITIVE and matches only `gz`/`bgz`. The
+/// two decide the same thing ("is this output gzip-compressed?") and should be a
+/// single shared function once the fastq stage is wired onto the chain; they
+/// cannot diverge in observable behavior today because this path is dormant.
+pub(crate) fn path_is_gzip(path: &Path) -> bool {
+    matches!(path.extension().and_then(|e| e.to_str()), Some("gz" | "bgz" | "bgzf"))
+}
+
+// ==== ported from feat-runall for the chain builder (R2) ====
+/// Per-stage options for [`crate::pipeline::chains::Stage::Fastq`] — the
+/// BAM→FASTQ encode. Carries the flag filters, read-name suffix behavior, and
+/// the optional UMI-in-read-name config the encode step needs. The output
+/// destination(s) and compression are carried by the chain's `SinkSpec`, not
+/// here.
+#[derive(Clone)]
+pub struct FastqOptions {
+    /// Exclude reads with any of these flag bits set.
+    pub exclude_flags: u16,
+    /// Only include reads with all of these flag bits set.
+    pub require_flags: u16,
+    /// When `true`, omit the `/1` `/2` read-name suffix.
+    pub no_suffix: bool,
+    /// When `Some`, append the UMI (from the configured tag) to the read name.
+    pub umi_header: Option<UmiNameAnnotation>,
+}
+
+// ==== impls ported from feat-runall for the chain builder (R2) ====
+impl FastqOptions {
+    /// Returns `true` if a record with `flags` passes the include/exclude filters.
+    #[must_use]
+    pub(crate) fn passes_filters(&self, flags: u16) -> bool {
+        (flags & self.exclude_flags) == 0 && (flags & self.require_flags) == self.require_flags
+    }
 }
 
 #[cfg(test)]
@@ -942,5 +1007,72 @@ mod tests {
         write_quality_bytes(&mut output, &[94, 100, 255])
             .expect("write_quality_bytes should succeed");
         assert_eq!(output, vec![126, 126, 126]);
+    }
+
+    /// `classify_segment` routes by the FIRST/LAST segment bits exactly as
+    /// `samtools fastq` does: first-only → R1, last-only → R2, neither/both → other.
+    #[rstest]
+    #[case::read1(fgumi_raw_bam::flags::FIRST_SEGMENT, Segment::Read1)]
+    #[case::read2(fgumi_raw_bam::flags::LAST_SEGMENT, Segment::Read2)]
+    #[case::both_bits(
+        fgumi_raw_bam::flags::FIRST_SEGMENT | fgumi_raw_bam::flags::LAST_SEGMENT,
+        Segment::Other
+    )]
+    #[case::neither(0, Segment::Other)]
+    fn classify_segment_routes_by_first_last_bits(#[case] flags: u16, #[case] expected: Segment) {
+        assert_eq!(classify_segment(flags), expected);
+    }
+
+    /// `passes_filters` requires ALL `require_flags` set and NONE of
+    /// `exclude_flags` set (an inverted bit-mask here would pass silently).
+    #[rstest]
+    // exclude FIRST_SEGMENT: an R1 read is excluded, others pass.
+    #[case::excluded(
+        fgumi_raw_bam::flags::FIRST_SEGMENT,
+        0,
+        fgumi_raw_bam::flags::FIRST_SEGMENT,
+        false
+    )]
+    #[case::not_excluded(fgumi_raw_bam::flags::FIRST_SEGMENT, 0, 0, true)]
+    // require PAIRED: only paired reads pass.
+    #[case::required_present(0, fgumi_raw_bam::flags::PAIRED, fgumi_raw_bam::flags::PAIRED, true)]
+    #[case::required_absent(0, fgumi_raw_bam::flags::PAIRED, 0, false)]
+    // both: must satisfy require AND avoid exclude.
+    #[case::require_met_exclude_hit(
+        fgumi_raw_bam::flags::FIRST_SEGMENT,
+        fgumi_raw_bam::flags::PAIRED,
+        fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
+        false
+    )]
+    #[case::require_met_exclude_clear(
+        fgumi_raw_bam::flags::FIRST_SEGMENT,
+        fgumi_raw_bam::flags::PAIRED,
+        fgumi_raw_bam::flags::PAIRED,
+        true
+    )]
+    fn passes_filters_applies_exclude_and_require(
+        #[case] exclude_flags: u16,
+        #[case] require_flags: u16,
+        #[case] flags: u16,
+        #[case] expected: bool,
+    ) {
+        let opts =
+            FastqOptions { exclude_flags, require_flags, no_suffix: false, umi_header: None };
+        assert_eq!(opts.passes_filters(flags), expected);
+    }
+
+    /// `path_is_gzip` matches `gz`/`bgz`/`bgzf`, case-sensitively. See the fn's
+    /// KNOWN DIVERGENCE note vs the live `is_gzip_output_path` (the uppercase
+    /// case below pins that divergence, to be reconciled at fastq wiring).
+    #[rstest]
+    #[case::gz("out.fq.gz", true)]
+    #[case::bgz("out.fq.bgz", true)]
+    #[case::bgzf("out.fq.bgzf", true)]
+    #[case::plain_fq("out.fq", false)]
+    #[case::no_extension("out", false)]
+    #[case::gz_in_stem("out.gz.fq", false)]
+    #[case::uppercase_not_matched("OUT.FQ.GZ", false)]
+    fn path_is_gzip_matches_gz_bgz_bgzf(#[case] path: &str, #[case] expected: bool) {
+        assert_eq!(path_is_gzip(std::path::Path::new(path)), expected);
     }
 }

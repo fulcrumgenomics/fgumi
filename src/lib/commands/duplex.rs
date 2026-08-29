@@ -290,6 +290,34 @@ pub struct DuplexOptions {
     pub reference: Option<std::path::PathBuf>,
 }
 
+impl Default for DuplexOptions {
+    /// Test/`runall`-construction default: consensus/overlapping knobs from the
+    /// shared option defaults, `min_reads = [1]`, methylation disabled.
+    fn default() -> Self {
+        let consensus = ConsensusCallingOptions::default();
+        let overlapping = OverlappingConsensusOptions::default();
+        Self {
+            error_rate_pre_umi: consensus.error_rate_pre_umi,
+            error_rate_post_umi: consensus.error_rate_post_umi,
+            min_input_base_quality: consensus.min_input_base_quality,
+            output_per_base_tags: consensus.output_per_base_tags,
+            trim: consensus.trim,
+            min_consensus_base_quality: consensus.min_consensus_base_quality,
+            tie_rule: consensus.tie_rule.into(),
+            consensus_call_overlapping_bases: overlapping.consensus_call_overlapping_bases,
+            min_reads: vec![1],
+            max_reads_per_strand: None,
+            allow_unmapped: AllowUnmappedOptions { enabled: false },
+            io: BamIoOptions::default(),
+            rejects_opts: RejectsOptions::default(),
+            stats_opts: StatsOptions::default(),
+            read_group: ReadGroupOptions::default(),
+            methylation_mode: fgumi_consensus::MethylationMode::default(),
+            reference: None,
+        }
+    }
+}
+
 impl Duplex {
     /// Project the parsed CLI flags into [`DuplexOptions`].
     #[must_use]
@@ -314,6 +342,34 @@ impl Duplex {
                 self.methylation_mode,
             ),
             reference: self.reference.clone(),
+        }
+    }
+}
+
+impl DuplexOptions {
+    /// Reconstruct the shared [`ConsensusCallingOptions`] from the inlined flat
+    /// fields, so the chain builder can read `.consensus().error_rate_pre_umi`
+    /// etc. `tie_rule` is stored resolved on `DuplexOptions`; convert it back to
+    /// the CLI-facing [`crate::commands::common::TieRuleArg`] via the 1:1 mapping.
+    #[must_use]
+    pub fn consensus(&self) -> ConsensusCallingOptions {
+        ConsensusCallingOptions {
+            error_rate_pre_umi: self.error_rate_pre_umi,
+            error_rate_post_umi: self.error_rate_post_umi,
+            min_input_base_quality: self.min_input_base_quality,
+            output_per_base_tags: self.output_per_base_tags,
+            trim: self.trim,
+            min_consensus_base_quality: self.min_consensus_base_quality,
+            tie_rule: self.tie_rule.into(),
+        }
+    }
+
+    /// Reconstruct the shared [`OverlappingConsensusOptions`] from the inlined
+    /// flat field.
+    #[must_use]
+    pub fn overlapping(&self) -> OverlappingConsensusOptions {
+        OverlappingConsensusOptions {
+            consensus_call_overlapping_bases: self.consensus_call_overlapping_bases,
         }
     }
 }
@@ -1019,7 +1075,7 @@ impl Duplex {
 /// It examines the MI tag of each record to check for /A and /B suffixes.
 /// Returns `true` only if there is at least one read with /A suffix AND at least
 /// one read with /B suffix.
-fn has_both_strands_raw(records: &[RawRecord]) -> bool {
+pub(crate) fn has_both_strands_raw(records: &[RawRecord]) -> bool {
     if records.len() < 2 {
         return false;
     }

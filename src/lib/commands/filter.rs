@@ -323,41 +323,41 @@ impl MemoryEstimate for FilterProcessedBatchRaw {
 
 /// Per-thread accumulator merged into final counts after pipeline completion.
 #[derive(Default)]
-struct CollectedFilterMetrics {
+pub(crate) struct CollectedFilterMetrics {
     /// Total records processed.
-    total_records: u64,
+    pub(crate) total_records: u64,
     /// Records that passed.
-    passed_records: u64,
+    pub(crate) passed_records: u64,
     /// Records that failed.
-    failed_records: u64,
+    pub(crate) failed_records: u64,
     /// Total bases masked.
-    total_bases_masked: u64,
+    pub(crate) total_bases_masked: u64,
 }
 
 /// Shared state for a filter pipeline run, built by `setup_pipeline`.
-struct FilterPipelineSetup {
-    pipeline_config: BamPipelineConfig,
-    config: Arc<FilterConfig>,
-    reference: Option<Arc<ReferenceReader>>,
-    collected_metrics: Arc<PerThreadAccumulator<CollectedFilterMetrics>>,
-    progress_counter: Arc<AtomicU64>,
+pub(crate) struct FilterPipelineSetup {
+    pub(crate) config: Arc<FilterConfig>,
+    pub(crate) reference: Option<Arc<ReferenceReader>>,
+    pub(crate) collected_metrics: Arc<PerThreadAccumulator<CollectedFilterMetrics>>,
+    pub(crate) progress_counter: Arc<AtomicU64>,
 }
 
 /// Captures needed by the process closure, extracted from `Filter` and `FilterPipelineSetup`.
-struct FilterProcessCaptures {
-    config: Arc<FilterConfig>,
-    reference: Option<Arc<ReferenceReader>>,
-    min_base_quality: Option<u8>,
-    should_reverse_tags: bool,
-    min_mean_base_quality: Option<f64>,
-    max_no_call_fraction: f64,
-    require_single_strand_agreement: bool,
-    methylation_depth_thresholds: Option<MethylationDepthThresholds>,
-    require_strand_methylation_agreement: bool,
-    min_conversion_fraction: Option<f64>,
-    methylation_mode: fgumi_consensus::MethylationMode,
-    ref_names: Arc<Vec<String>>,
-    header: Header,
+pub(crate) struct FilterProcessCaptures {
+    pub(crate) config: Arc<FilterConfig>,
+    pub(crate) reference: Option<Arc<ReferenceReader>>,
+    pub(crate) min_base_quality: Option<u8>,
+    pub(crate) should_reverse_tags: bool,
+    pub(crate) min_mean_base_quality: Option<f64>,
+    pub(crate) max_no_call_fraction: f64,
+    pub(crate) require_single_strand_agreement: bool,
+    pub(crate) methylation_depth_thresholds: Option<MethylationDepthThresholds>,
+    pub(crate) require_strand_methylation_agreement: bool,
+    pub(crate) min_conversion_fraction: Option<f64>,
+    pub(crate) methylation_mode: fgumi_consensus::MethylationMode,
+    pub(crate) ref_names: Arc<Vec<String>>,
+    pub(crate) progress: Arc<AtomicU64>,
+    pub(crate) header: Header,
 }
 
 impl Command for Filter {
@@ -450,32 +450,15 @@ impl Command for Filter {
     }
 }
 
-impl Filter {
-    // ========================================================================
-    // 7-Step Unified Pipeline Implementation
-    // ========================================================================
-
-    /// Build the shared pipeline configuration, filter config, reference, metrics
-    /// queue, and progress counter used by both pipeline modes.
-    fn setup_pipeline(&self, num_threads: usize, header: &Header) -> Result<FilterPipelineSetup> {
-        let mut pipeline_config = build_pipeline_config(
-            &self.scheduler_opts,
-            &self.compression,
-            &self.queue_memory,
-            &self.io,
-            num_threads,
-        )?;
-
-        // Template mode groups by QNAME and reads the key's `name_hash` fast-path
-        // (see `TemplateGrouper`), so it needs the key. Single-read mode uses
-        // `SingleRawRecordGrouper`, which discards the decoded record entirely and
-        // never reads the key — so skip its per-record computation with `None`.
-        pipeline_config.group_key_config = if self.filter_by_template {
-            Some(GroupKeyConfig::new_raw_no_cell(LibraryIndex::from_header(header)))
-        } else {
-            None
-        };
-
+impl FilterOptions {
+    /// Build the shared filter config, reference, per-thread metrics
+    /// accumulators, and progress counter used by both the chain builder and
+    /// the non-chain unified pipeline.
+    ///
+    /// The [`BamPipelineConfig`] is *not* built here: the chain builder derives
+    /// it from its [`crate::pipeline::chains::ChainSpec`], and the non-chain run
+    /// builds it via [`Filter::build_filter_pipeline_config`].
+    pub(crate) fn setup_pipeline(&self, num_threads: usize) -> Result<FilterPipelineSetup> {
         let config = Arc::new(FilterConfig::new(
             &self.min_reads,
             &self.max_read_error_rate,
@@ -499,17 +482,14 @@ impl Filter {
         let collected_metrics = PerThreadAccumulator::<CollectedFilterMetrics>::new(num_threads);
         let progress_counter = Arc::new(AtomicU64::new(0));
 
-        Ok(FilterPipelineSetup {
-            pipeline_config,
-            config,
-            reference,
-            collected_metrics,
-            progress_counter,
-        })
+        Ok(FilterPipelineSetup { config, reference, collected_metrics, progress_counter })
     }
 
-    /// Build the process closure captures from self and setup.
-    fn process_captures(
+    /// Build the process closure captures from these options and the setup.
+    ///
+    /// `methylation_mode` is already resolved on [`FilterOptions`] (`Disabled`
+    /// when the flag was unset), so it is used directly rather than re-resolved.
+    pub(crate) fn process_captures(
         &self,
         setup: &FilterPipelineSetup,
         header: &Header,
@@ -531,12 +511,208 @@ impl Filter {
             },
             require_strand_methylation_agreement: self.require_strand_methylation_agreement,
             min_conversion_fraction: self.min_conversion_fraction,
-            methylation_mode: crate::commands::common::resolve_methylation_mode(
-                self.methylation_mode,
-            ),
+            methylation_mode: self.methylation_mode,
             ref_names: Arc::new(ref_names),
+            progress: Arc::clone(&setup.progress_counter),
             header: header.clone(),
         }
+    }
+
+    /// Validates that parameter vectors have 1-3 values and are in valid ranges
+    ///
+    /// Also validates stringency ordering requirements from Scala (lines 161-167):
+    /// - For min-reads: ba <= ab <= cc (more reads required = more stringent)
+    /// - For error rates: ab <= ba (lower error allowed = more stringent)
+    pub(crate) fn validate_parameters(&self) -> Result<()> {
+        // Validate min-reads
+        if self.min_reads.is_empty() || self.min_reads.len() > 3 {
+            bail!("--min-reads must have 1-3 values, got {}", self.min_reads.len());
+        }
+
+        // Validate max-read-error-rate
+        if self.max_read_error_rate.len() > 3 {
+            bail!(
+                "--max-read-error-rate must have 1-3 values, got {}",
+                self.max_read_error_rate.len()
+            );
+        }
+        for &rate in &self.max_read_error_rate {
+            if !(0.0..=1.0).contains(&rate) {
+                bail!("--max-read-error-rate must be between 0.0 and 1.0, got {rate}");
+            }
+        }
+
+        // Validate max-base-error-rate
+        if self.max_base_error_rate.len() > 3 {
+            bail!(
+                "--max-base-error-rate must have 1-3 values, got {}",
+                self.max_base_error_rate.len()
+            );
+        }
+        for &rate in &self.max_base_error_rate {
+            if !(0.0..=1.0).contains(&rate) {
+                bail!("--max-base-error-rate must be between 0.0 and 1.0, got {rate}");
+            }
+        }
+
+        // Validate max-no-call-fraction
+        // If >= 1.0, it should be an integer (count of bases)
+        // If < 1.0, it's a fraction
+        if self.max_no_call_fraction < 0.0 {
+            bail!("--max-no-call-fraction must be >= 0.0, got {}", self.max_no_call_fraction);
+        }
+        if self.max_no_call_fraction >= 1.0 && self.max_no_call_fraction.fract() != 0.0 {
+            bail!(
+                "--max-no-call-fraction >= 1.0 must be an integer (count of bases), got {}",
+                self.max_no_call_fraction
+            );
+        }
+
+        // Validate stringency ordering for duplex parameters (following Scala lines 161-167)
+        if self.min_reads.len() >= 2 {
+            // ab_min_reads <= cc_min_reads (more reads = more stringent)
+            let cc_min = self.min_reads[0];
+            let ab_min = self.min_reads[1];
+            if ab_min > cc_min {
+                bail!(
+                    "min-reads values must be specified high to low (duplex >= AB), got {cc_min} < {ab_min}"
+                );
+            }
+        }
+
+        if self.min_reads.len() == 3 {
+            // ba_min_reads <= ab_min_reads
+            let ab_min = self.min_reads[1];
+            let ba_min = self.min_reads[2];
+            if ba_min > ab_min {
+                bail!(
+                    "min-reads values must be specified high to low (AB >= BA), got {ab_min} < {ba_min}"
+                );
+            }
+        }
+
+        // Validate error rate ordering (AB must be more stringent or equal to BA)
+        if self.max_read_error_rate.len() >= 3 {
+            let ab_error = self.max_read_error_rate[1];
+            let ba_error = self.max_read_error_rate[2];
+            if ab_error > ba_error {
+                bail!(
+                    "max-read-error-rate for AB must be <= BA (more stringent), got AB={ab_error} > BA={ba_error}"
+                );
+            }
+        }
+
+        if self.max_base_error_rate.len() >= 3 {
+            let ab_error = self.max_base_error_rate[1];
+            let ba_error = self.max_base_error_rate[2];
+            if ab_error > ba_error {
+                bail!(
+                    "max-base-error-rate for AB must be <= BA (more stringent), got AB={ab_error} > BA={ba_error}"
+                );
+            }
+        }
+
+        // Validate min-methylation-depth
+        if self.min_methylation_depth.len() > 3 {
+            bail!(
+                "--min-methylation-depth must have 1-3 values, got {}",
+                self.min_methylation_depth.len()
+            );
+        }
+
+        // Validate min-methylation-depth ordering (same as min-reads: CC >= AB >= BA)
+        if self.min_methylation_depth.len() >= 2 {
+            let cc = self.min_methylation_depth[0];
+            let ab = self.min_methylation_depth[1];
+            if ab > cc {
+                bail!(
+                    "min-methylation-depth values must be specified high to low (duplex >= AB), got {cc} < {ab}"
+                );
+            }
+        }
+        if self.min_methylation_depth.len() == 3 {
+            let ab = self.min_methylation_depth[1];
+            let ba = self.min_methylation_depth[2];
+            if ba > ab {
+                bail!(
+                    "min-methylation-depth values must be specified high to low (AB >= BA), got {ab} < {ba}"
+                );
+            }
+        }
+
+        // Validate require-strand-methylation-agreement requires --ref
+        if self.require_strand_methylation_agreement && self.reference.is_none() {
+            bail!("--require-strand-methylation-agreement requires --ref to identify CpG sites");
+        }
+
+        // Validate min-conversion-fraction
+        if let Some(frac) = self.min_conversion_fraction {
+            if !(0.0..=1.0).contains(&frac) {
+                bail!("--min-conversion-fraction must be between 0.0 and 1.0, got {frac}");
+            }
+            if self.reference.is_none() {
+                bail!("--min-conversion-fraction requires --ref to identify non-CpG cytosines");
+            }
+            // `methylation_mode` is resolved on `FilterOptions`; `Disabled` is
+            // exactly the "flag not provided" case (see `resolve_methylation_mode`).
+            if self.methylation_mode == fgumi_consensus::MethylationMode::Disabled {
+                bail!("--min-conversion-fraction requires --methylation-mode to be set");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Filter {
+    // ========================================================================
+    // 7-Step Unified Pipeline Implementation
+    // ========================================================================
+
+    /// Build the pipeline configuration for the non-chain (`unified_pipeline`)
+    /// filter run. The chain builder assembles its own [`BamPipelineConfig`]
+    /// from the [`crate::pipeline::chains::ChainSpec`], so this lives on
+    /// [`Filter`] (which carries the io/compression/scheduler/queue flags)
+    /// rather than on [`FilterOptions`] (tuning knobs only).
+    fn build_filter_pipeline_config(
+        &self,
+        num_threads: usize,
+        header: &Header,
+    ) -> Result<BamPipelineConfig> {
+        let mut pipeline_config = build_pipeline_config(
+            &self.scheduler_opts,
+            &self.compression,
+            &self.queue_memory,
+            &self.io,
+            num_threads,
+        )?;
+        // Template mode groups by QNAME and reads the key's `name_hash` fast-path
+        // (see `TemplateGrouper`), so it needs the key. Single-read mode uses
+        // `SingleRawRecordGrouper`, which discards the decoded record entirely and
+        // never reads the key — so skip its per-record computation with `None`.
+        pipeline_config.group_key_config = if self.filter_by_template {
+            Some(GroupKeyConfig::new_raw_no_cell(LibraryIndex::from_header(header)))
+        } else {
+            None
+        };
+        Ok(pipeline_config)
+    }
+
+    /// Build the shared filter config, reference, metrics queue, and progress
+    /// counter. Delegates to [`FilterOptions::setup_pipeline`] so the chain
+    /// builder and the non-chain run share one implementation.
+    pub(crate) fn setup_pipeline(&self, num_threads: usize) -> Result<FilterPipelineSetup> {
+        self.to_filter_options().setup_pipeline(num_threads)
+    }
+
+    /// Build the process closure captures. Delegates to
+    /// [`FilterOptions::process_captures`].
+    pub(crate) fn process_captures(
+        &self,
+        setup: &FilterPipelineSetup,
+        header: &Header,
+    ) -> FilterProcessCaptures {
+        self.to_filter_options().process_captures(setup, header)
     }
 
     /// Run the filter pipeline with the given grouper and process function.
@@ -546,6 +722,7 @@ impl Filter {
     /// output for rejects), and aggregates metrics.
     fn run_filter_pipeline<G, GrouperFn, ProcessFn>(
         &self,
+        pipeline_config: BamPipelineConfig,
         setup: FilterPipelineSetup,
         reader: Box<dyn std::io::Read + Send>,
         header: Header,
@@ -590,7 +767,7 @@ impl Filter {
                 };
 
             run_bam_pipeline_from_reader_with_secondary(
-                setup.pipeline_config,
+                pipeline_config,
                 reader,
                 header,
                 &self.io.output,
@@ -604,7 +781,7 @@ impl Filter {
             )?;
         } else {
             run_bam_pipeline_from_reader(
-                setup.pipeline_config,
+                pipeline_config,
                 reader,
                 header,
                 &self.io.output,
@@ -652,7 +829,8 @@ impl Filter {
         header: Header,
         track_rejects: bool,
     ) -> Result<u64> {
-        let setup = self.setup_pipeline(num_threads, &header)?;
+        let setup = self.setup_pipeline(num_threads)?;
+        let pipeline_config = self.build_filter_pipeline_config(num_threads, &header)?;
         let ctx = self.process_captures(&setup, &header);
 
         let grouper_fn = move |_header: &Header| {
@@ -705,7 +883,7 @@ impl Filter {
             })
         };
 
-        self.run_filter_pipeline(setup, reader, header, grouper_fn, process_fn)
+        self.run_filter_pipeline(pipeline_config, setup, reader, header, grouper_fn, process_fn)
     }
 
     /// Execute using the 7-step unified pipeline (template-aware mode).
@@ -718,7 +896,8 @@ impl Filter {
         header: Header,
         track_rejects: bool,
     ) -> Result<u64> {
-        let setup = self.setup_pipeline(num_threads, &header)?;
+        let setup = self.setup_pipeline(num_threads)?;
+        let pipeline_config = self.build_filter_pipeline_config(num_threads, &header)?;
         let ctx = self.process_captures(&setup, &header);
 
         #[cfg(test)]
@@ -812,7 +991,7 @@ impl Filter {
             })
         };
 
-        self.run_filter_pipeline(setup, reader, header, grouper_fn, process_fn)
+        self.run_filter_pipeline(pipeline_config, setup, reader, header, grouper_fn, process_fn)
     }
 
     /// Write filtering statistics to a file.
@@ -841,7 +1020,7 @@ impl Filter {
     ///
     /// Returns `(bases_masked, pass)`.
     #[allow(clippy::too_many_arguments)]
-    fn process_record_raw(
+    pub(crate) fn process_record_raw(
         record: &mut RawRecord,
         config: &FilterConfig,
         reference: Option<&ReferenceReader>,
@@ -1095,147 +1274,12 @@ impl Filter {
         Ok(Self::check_no_call_and_quality(bam, mean_qual, min_mean_qual, max_no_call_frac))
     }
 
-    /// Validates that parameter vectors have 1-3 values and are in valid ranges
+    /// Validates that parameter vectors have 1-3 values and are in valid ranges.
     ///
-    /// Also validates stringency ordering requirements from Scala (lines 161-167):
-    /// - For min-reads: ba <= ab <= cc (more reads required = more stringent)
-    /// - For error rates: ab <= ba (lower error allowed = more stringent)
-    fn validate_parameters(&self) -> Result<()> {
-        // Validate min-reads
-        if self.min_reads.is_empty() || self.min_reads.len() > 3 {
-            bail!("--min-reads must have 1-3 values, got {}", self.min_reads.len());
-        }
-
-        // Validate max-read-error-rate
-        if self.max_read_error_rate.len() > 3 {
-            bail!(
-                "--max-read-error-rate must have 1-3 values, got {}",
-                self.max_read_error_rate.len()
-            );
-        }
-        for &rate in &self.max_read_error_rate {
-            if !(0.0..=1.0).contains(&rate) {
-                bail!("--max-read-error-rate must be between 0.0 and 1.0, got {rate}");
-            }
-        }
-
-        // Validate max-base-error-rate
-        if self.max_base_error_rate.len() > 3 {
-            bail!(
-                "--max-base-error-rate must have 1-3 values, got {}",
-                self.max_base_error_rate.len()
-            );
-        }
-        for &rate in &self.max_base_error_rate {
-            if !(0.0..=1.0).contains(&rate) {
-                bail!("--max-base-error-rate must be between 0.0 and 1.0, got {rate}");
-            }
-        }
-
-        // Validate max-no-call-fraction
-        // If >= 1.0, it should be an integer (count of bases)
-        // If < 1.0, it's a fraction
-        if self.max_no_call_fraction < 0.0 {
-            bail!("--max-no-call-fraction must be >= 0.0, got {}", self.max_no_call_fraction);
-        }
-        if self.max_no_call_fraction >= 1.0 && self.max_no_call_fraction.fract() != 0.0 {
-            bail!(
-                "--max-no-call-fraction >= 1.0 must be an integer (count of bases), got {}",
-                self.max_no_call_fraction
-            );
-        }
-
-        // Validate stringency ordering for duplex parameters (following Scala lines 161-167)
-        if self.min_reads.len() >= 2 {
-            // ab_min_reads <= cc_min_reads (more reads = more stringent)
-            let cc_min = self.min_reads[0];
-            let ab_min = self.min_reads[1];
-            if ab_min > cc_min {
-                bail!(
-                    "min-reads values must be specified high to low (duplex >= AB), got {cc_min} < {ab_min}"
-                );
-            }
-        }
-
-        if self.min_reads.len() == 3 {
-            // ba_min_reads <= ab_min_reads
-            let ab_min = self.min_reads[1];
-            let ba_min = self.min_reads[2];
-            if ba_min > ab_min {
-                bail!(
-                    "min-reads values must be specified high to low (AB >= BA), got {ab_min} < {ba_min}"
-                );
-            }
-        }
-
-        // Validate error rate ordering (AB must be more stringent or equal to BA)
-        if self.max_read_error_rate.len() >= 3 {
-            let ab_error = self.max_read_error_rate[1];
-            let ba_error = self.max_read_error_rate[2];
-            if ab_error > ba_error {
-                bail!(
-                    "max-read-error-rate for AB must be <= BA (more stringent), got AB={ab_error} > BA={ba_error}"
-                );
-            }
-        }
-
-        if self.max_base_error_rate.len() >= 3 {
-            let ab_error = self.max_base_error_rate[1];
-            let ba_error = self.max_base_error_rate[2];
-            if ab_error > ba_error {
-                bail!(
-                    "max-base-error-rate for AB must be <= BA (more stringent), got AB={ab_error} > BA={ba_error}"
-                );
-            }
-        }
-
-        // Validate min-methylation-depth
-        if self.min_methylation_depth.len() > 3 {
-            bail!(
-                "--min-methylation-depth must have 1-3 values, got {}",
-                self.min_methylation_depth.len()
-            );
-        }
-
-        // Validate min-methylation-depth ordering (same as min-reads: CC >= AB >= BA)
-        if self.min_methylation_depth.len() >= 2 {
-            let cc = self.min_methylation_depth[0];
-            let ab = self.min_methylation_depth[1];
-            if ab > cc {
-                bail!(
-                    "min-methylation-depth values must be specified high to low (duplex >= AB), got {cc} < {ab}"
-                );
-            }
-        }
-        if self.min_methylation_depth.len() == 3 {
-            let ab = self.min_methylation_depth[1];
-            let ba = self.min_methylation_depth[2];
-            if ba > ab {
-                bail!(
-                    "min-methylation-depth values must be specified high to low (AB >= BA), got {ab} < {ba}"
-                );
-            }
-        }
-
-        // Validate require-strand-methylation-agreement requires --ref
-        if self.require_strand_methylation_agreement && self.reference.is_none() {
-            bail!("--require-strand-methylation-agreement requires --ref to identify CpG sites");
-        }
-
-        // Validate min-conversion-fraction
-        if let Some(frac) = self.min_conversion_fraction {
-            if !(0.0..=1.0).contains(&frac) {
-                bail!("--min-conversion-fraction must be between 0.0 and 1.0, got {frac}");
-            }
-            if self.reference.is_none() {
-                bail!("--min-conversion-fraction requires --ref to identify non-CpG cytosines");
-            }
-            if self.methylation_mode.is_none() {
-                bail!("--min-conversion-fraction requires --methylation-mode to be set");
-            }
-        }
-
-        Ok(())
+    /// Delegates to [`FilterOptions::validate_parameters`] so the chain builder
+    /// and the non-chain run share one implementation.
+    pub(crate) fn validate_parameters(&self) -> Result<()> {
+        self.to_filter_options().validate_parameters()
     }
 }
 
@@ -3526,6 +3570,131 @@ mod tests {
         // Only the first read should pass (depth=10 >= 5)
         // The second read fails (depth=2 < 5)
         assert_eq!(records.len(), 1);
+
+        Ok(())
+    }
+
+    /// Non-template filtering through the *multi-threaded* pipeline. With
+    /// `filter_by_template: false`, `build_filter_pipeline_config` leaves
+    /// `group_key_config = None`, so the threaded run must route records through
+    /// `SingleRawRecordGrouper` — which discards the decoded key entirely — and
+    /// filter each read independently. Every other non-template execution test
+    /// runs single-threaded, so this pins the `> 1`-thread path over that `None`
+    /// branch.
+    #[test]
+    fn test_filter_execute_non_template_mode_multithreaded() -> Result<()> {
+        let dir = TempDir::new()?;
+        let ref_path = create_test_reference(&dir);
+        let input_path = dir.path().join("input.bam");
+        let output_path = dir.path().join("output.bam");
+
+        // Six independent reads; each is kept iff its depth >= min_reads (5).
+        write_test_bam(
+            &input_path,
+            vec![
+                create_simplex_consensus_record(
+                    "r0",
+                    100,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    10,
+                    0.01,
+                    &[10, 10, 10, 10],
+                    &[0, 0, 0, 0],
+                ),
+                create_simplex_consensus_record(
+                    "r1",
+                    200,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    2,
+                    0.01,
+                    &[2, 2, 2, 2],
+                    &[0, 0, 0, 0],
+                ),
+                create_simplex_consensus_record(
+                    "r2",
+                    300,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    8,
+                    0.01,
+                    &[8, 8, 8, 8],
+                    &[0, 0, 0, 0],
+                ),
+                create_simplex_consensus_record(
+                    "r3",
+                    400,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    1,
+                    0.01,
+                    &[1, 1, 1, 1],
+                    &[0, 0, 0, 0],
+                ),
+                create_simplex_consensus_record(
+                    "r4",
+                    500,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    6,
+                    0.01,
+                    &[6, 6, 6, 6],
+                    &[0, 0, 0, 0],
+                ),
+                create_simplex_consensus_record(
+                    "r5",
+                    600,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    3,
+                    0.01,
+                    &[3, 3, 3, 3],
+                    &[0, 0, 0, 0],
+                ),
+            ],
+        )?;
+
+        let cmd = Filter {
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
+            },
+            reference: Some(ref_path.clone()),
+            min_reads: vec![5],
+            max_read_error_rate: vec![0.1],
+            max_base_error_rate: vec![0.3],
+            min_base_quality: Some(10),
+            min_mean_base_quality: None,
+            max_no_call_fraction: 0.5,
+            reverse_per_base_tags: false,
+
+            threading: ThreadingOptions::new(4),
+            compression: CompressionOptions { compression_level: 1 },
+            filter_by_template: false, // Independent filtering, threaded.
+            rejects: None,
+            stats: None,
+            require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
+            methylation_mode: None,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        };
+        cmd.execute("test")?;
+
+        let records = read_bam_records(&output_path)?;
+        // Reads with depth >= 5 pass: r0(10), r2(8), r4(6). Order is not asserted
+        // (the multi-threaded path does not preserve input order).
+        assert_eq!(
+            records.len(),
+            3,
+            "non-template multi-threaded filter must keep exactly the depth>=5 reads"
+        );
 
         Ok(())
     }
