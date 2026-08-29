@@ -1188,6 +1188,27 @@ pub(crate) const MIN_MEMORY_PER_THREAD: usize = 256 * 1024 * 1024;
 /// Default auto-reserve cap: 10 GiB.
 pub(crate) const AUTO_RESERVE_CAP: usize = 10 * 1024 * 1024 * 1024;
 
+/// Fraction of host memory (percent) above which a budget that still fits is
+/// warned about anyway. A budget that does not exceed total RAM can still leave
+/// too little headroom for a co-resident process — the common case being an
+/// aligner holding a resident genome index while its output pipes into this
+/// command.
+const BUDGET_HIGH_FRACTION_PCT: usize = 80;
+
+/// Whether a resolved `budget` should trigger the co-residency warning: an
+/// explicit (`Fixed`) budget that fits host RAM but takes more than
+/// [`BUDGET_HIGH_FRACTION_PCT`] of it, leaving little headroom for a co-resident
+/// process. `Auto` budgets are excluded — they delegate headroom to
+/// `--memory-reserve`, so the warning's "use auto" advice would never apply to a
+/// caller already on auto. Extracted as a pure predicate so the threshold and
+/// the gate are directly testable (the warning itself has no return-value
+/// effect to assert on).
+fn budget_crowds_host(is_fixed: bool, budget: usize, total: usize) -> bool {
+    is_fixed
+        && budget <= total
+        && budget.saturating_mul(100) > total.saturating_mul(BUDGET_HIGH_FRACTION_PCT)
+}
+
 /// Parse a memory size string into `usize` bytes, suitable for use in clap
 /// value parsers.
 ///
@@ -1283,6 +1304,12 @@ fn resolve_memory_budget_with_total(
         anyhow::bail!("--threads must be at least 1");
     }
 
+    // The co-residency warning below applies only to an explicit budget: `auto`
+    // delegates headroom to `--memory-reserve` (so this warning's "use auto"
+    // advice would never apply to a caller already on auto), which is why
+    // `budget_crowds_host` gates on it.
+    let is_fixed = matches!(limit, MemoryLimit::Fixed(_));
+
     let budget = match limit {
         MemoryLimit::Fixed(bytes) => {
             if per_thread {
@@ -1349,6 +1376,24 @@ fn resolve_memory_budget_with_total(
         log::warn!(
             "Memory budget {} exceeds total host memory {}; this may cause OOM (or, for sort, earlier spill-to-disk)",
             ByteSize(budget as u64),
+            ByteSize(total as u64),
+        );
+    } else if budget_crowds_host(is_fixed, budget, total) {
+        // Fits, but only just. In a pipeline the budget is rarely the only
+        // resident consumer: an aligner feeding this command holds its genome
+        // index (many GiB), so a budget at this fraction of RAM can still OOM
+        // even though it is under `total` on its own. The resolver cannot see
+        // the co-resident process, so it flags the risk and leaves the choice to
+        // the operator rather than silently shrinking a budget they set
+        // explicitly.
+        let pct = budget.saturating_mul(100) / total.max(1);
+        log::warn!(
+            "Memory budget {} is {}% of total host memory {}; in a pipeline this may leave too \
+             little headroom for co-resident processes (e.g. an aligner holding a genome index) \
+             and risk OOM. Consider a smaller --max-memory, or --max-memory auto (which subtracts \
+             --memory-reserve to self-throttle).",
+            ByteSize(budget as u64),
+            pct,
             ByteSize(total as u64),
         );
     }
@@ -2041,11 +2086,69 @@ mod tests {
     /// Enable an at-Trace logger so `log::warn!`/`debug!` macros evaluate their
     /// arguments — without an enabled logger the `log` crate skips argument
     /// evaluation, leaving the formatting expressions inside the memory-budget
-    /// warn/debug branches unexecuted under test. nextest runs each test in its
-    /// own process, so `try_init` is local and idempotent.
+    /// warn/debug branches unexecuted under test.
+    ///
+    /// Routes through [`install_capture_logger`] so it shares the single
+    /// process-global logger with [`capture_logs`] rather than installing a
+    /// competing one — see that function for why a shared, idempotent install
+    /// is required.
     fn enable_logging() {
-        let _ =
-            env_logger::builder().is_test(true).filter_level(log::LevelFilter::Trace).try_init();
+        install_capture_logger();
+    }
+
+    /// A `log` sink that records every emitted message so a test can assert a
+    /// specific `warn!`/`debug!` actually fired. It is the *only* logger the
+    /// tests install (via [`install_capture_logger`]): it doubles as the
+    /// "enabled logger" [`enable_logging`] needs and as the inspectable buffer a
+    /// test needs to prove the resolver *emits* (not merely that it does not
+    /// panic formatting).
+    struct CaptureLogger;
+
+    static CAPTURED_LOGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _metadata: &log::Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record) {
+            CAPTURED_LOGS
+                .lock()
+                .expect("captured-log lock poisoned")
+                .push(record.args().to_string());
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Install [`CaptureLogger`] as the process-global logger, at most once.
+    ///
+    /// `log::set_logger` may be called only once per process. nextest isolates
+    /// each test in its own process, but a plain `cargo test` run shares one
+    /// process across every test, so a second install would panic. Guarding the
+    /// install with a [`Once`] makes it idempotent, and routing both
+    /// [`enable_logging`] and [`capture_logs`] through here means the two helpers
+    /// share a single logger instead of racing to install competing ones (which
+    /// is what previously made the capture test panic when a sibling test had
+    /// already installed `env_logger`).
+    ///
+    /// [`Once`]: std::sync::Once
+    fn install_capture_logger() {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&CAPTURE_LOGGER).expect("no logger installed yet in this test process");
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+    }
+
+    /// Install the capturing logger (idempotently) and clear any records left by
+    /// earlier tests, so the caller asserts only on what its own operation
+    /// emits. Records accumulate in [`CAPTURED_LOGS`].
+    fn capture_logs() {
+        install_capture_logger();
+        CAPTURED_LOGS.lock().expect("captured-log lock poisoned").clear();
     }
 
     /// CONS-01: `check_consensus_sort_order` mirrors fgbio's `UmiConsensusCaller.checkSortOrder`
@@ -2405,6 +2508,53 @@ mod tests {
         )
         .expect("should resolve");
         assert_eq!(budget, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn budget_crowds_host_fires_only_for_tight_fixed_budgets() {
+        let g = 1024 * 1024 * 1024;
+        // Fixed budget above the 80% line warns; below it does not.
+        assert!(budget_crowds_host(true, 14 * g, 16 * g), "87.5% fixed should warn");
+        assert!(budget_crowds_host(true, 9 * g, 10 * g), "90% fixed should warn");
+        assert!(!budget_crowds_host(true, 12 * g, 16 * g), "75% fixed should not warn");
+        // Strict `>`: exactly 80% must NOT warn (off-by-one guard).
+        assert!(!budget_crowds_host(true, 8 * g, 10 * g), "exactly 80% must not warn");
+        // The `is_fixed` gate: an `auto` budget never takes this branch, however
+        // high its fraction of host RAM.
+        assert!(!budget_crowds_host(false, 15 * g, 16 * g), "auto must never warn");
+        // A budget that exceeds total is the other branch's job, not this one.
+        assert!(
+            !budget_crowds_host(true, 20 * g, 16 * g),
+            "over-total is the exceeds-total branch"
+        );
+    }
+
+    #[test]
+    fn test_high_fraction_fixed_budget_is_returned_unshrunk() {
+        // A 14 GiB budget on a 16 GiB host (87.5%) takes the co-residency warn
+        // branch (see `budget_crowds_host_fires_only_for_tight_fixed_budgets`
+        // for the branch logic). This asserts the complementary facts: the branch
+        // (a) emits the co-residency warning and (b) only warns — it does not
+        // shrink the explicit budget. `capture_logs` records emitted records so
+        // the warning is asserted rather than merely evaluated.
+        capture_logs();
+        let host = 16 * 1024 * 1024 * 1024;
+        let budget = resolve_memory_budget_with_total(
+            MemoryLimit::Fixed(14 * 1024 * 1024 * 1024),
+            MemoryReserve::Auto,
+            1,
+            false,
+            host,
+        )
+        .expect("should resolve");
+        assert_eq!(budget, 14 * 1024 * 1024 * 1024, "explicit budget must not be shrunk");
+
+        let logs = CAPTURED_LOGS.lock().expect("captured-log lock poisoned");
+        assert!(
+            logs.iter().any(|line| line.contains("of total host memory")
+                && line.contains("co-resident processes")),
+            "co-residency warning must be emitted; captured logs: {logs:?}"
+        );
     }
 
     #[test]

@@ -250,6 +250,12 @@ pub struct Sort {
     /// enabled (default).
     ///
     /// When the limit is reached, sorted chunks spill to temporary files.
+    ///
+    /// This bounds the in-memory record buffer, not total process RSS: ingest
+    /// decompression/parse buffers add a few percent, and the final k-way merge's
+    /// per-file read-ahead is separate again, so peak RSS runs somewhat above this
+    /// value. When sorting in a pipe alongside an aligner, size the budget to leave
+    /// headroom for the aligner's resident index on top of this.
     #[arg(short = 'm', long = "max-memory", default_value = "768M", value_parser = parse_memory)]
     pub max_memory: MemoryLimit,
 
