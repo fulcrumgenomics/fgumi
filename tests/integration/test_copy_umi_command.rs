@@ -115,9 +115,13 @@ fn copies_umi_to_rx(#[case] name: &str, #[case] expected_rx: &str) {
 // ============================================================================
 
 #[rstest]
-#[case::r_stripped_not_revcomped("blah:rAAAA", "AAAA")]
-#[case::r_stripped_dual("blah:rAAAA+CCCC", "AAAA-CCCC")]
-fn strip_only_does_not_reverse_complement(#[case] name: &str, #[case] expected_rx: &str) {
+#[case::r_stripped_not_revcomped("blah:rAAAA", "blah:rAAAA", "AAAA")]
+#[case::r_stripped_dual("blah:rAAAA+CCCC", "blah:rAAAA+CCCC", "AAAA-CCCC")]
+fn strip_only_does_not_reverse_complement(
+    #[case] name: &str,
+    #[case] expected_name: &str,
+    #[case] expected_rx: &str,
+) {
     let dir = TempDir::new().unwrap();
     let input = write_input(dir.path(), &[record_named(name)]);
     let output = dir.path().join("out.bam");
@@ -126,6 +130,7 @@ fn strip_only_does_not_reverse_complement(#[case] name: &str, #[case] expected_r
 
     let rows = read_name_and_rx(dir.path(), &output);
     assert_eq!(rows.len(), 1, "one input record must yield exactly one output record");
+    assert_eq!(rows[0].0, expected_name, "read name should be unchanged");
     assert_eq!(rows[0].1.as_deref(), Some(expected_rx));
 }
 
@@ -441,6 +446,7 @@ fn respects_non_default_field_delimiter() {
 
     let rows = read_name_and_rx(dir.path(), &output);
     assert_eq!(rows.len(), 1, "one input record must yield exactly one output record");
+    assert_eq!(rows[0].0, "a:b_c_ACGT", "read name should be unchanged");
     assert_eq!(rows[0].1.as_deref(), Some("ACGT"));
 }
 
