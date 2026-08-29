@@ -139,7 +139,7 @@ pub fn should_fuse_single_thread(
 /// [`CancelHandle`](crate::signal::CancelHandle) — matching
 /// [`crate::builder::Pipeline::run`]'s contract.
 pub fn run_fused_single_thread(
-    mut steps: Vec<Box<dyn ErasedStep>>,
+    steps: Vec<Box<dyn ErasedStep>>,
     graph: &ChainGraph,
     signal: &Arc<PipelineSignal>,
     stats: Option<&Arc<PipelineStats>>,
@@ -190,6 +190,16 @@ pub fn run_fused_single_thread(
 
     let n = steps.len();
     let contexts = build_chain_contexts_fused(&steps, graph);
+    // Re-bind `steps` as a local declared *after* `contexts` so reverse-declaration
+    // drop order runs `steps` before `contexts` on EVERY exit — the normal return,
+    // and a panic unwinding out of `try_run_erased` or the stall `debug_assert!`.
+    // The typed-handle cache in `TypedStep`/`TypedStep2` stores handles borrowed
+    // from `contexts` as `'static` (see the "Approved typed-handle cache" note in
+    // CLAUDE.md), which is sound only while every step is dropped before the
+    // `ChainContexts` it cached from. A by-value parameter drops *after* locals, so
+    // without this shadow an unwind would free `contexts` while the cached refs in
+    // `steps` still point into it. `mut` because the drive loop dispatches steps.
+    let mut steps = steps;
     // Honour `--queue-memory-total` here as the scheduled path does. The fused
     // transports keep each step's profiled byte bound (see
     // `ErasedStep::build_fused_output_set`), so without this the user's budget
@@ -299,16 +309,8 @@ pub fn run_fused_single_thread(
         }
     }
 
-    // Drop the steps before `contexts` goes out of scope. The typed-handle cache
-    // in `TypedStep`/`TypedStep2` stores handles borrowed from `contexts` as
-    // `'static` (see the "Approved typed-handle cache" note in CLAUDE.md), which is
-    // sound only while every step instance is dropped before the `ChainContexts`
-    // it cached from. Here `steps` is a by-value parameter and `contexts` is a
-    // local, so the natural drop order is inverted — parameters drop *after*
-    // locals, so `contexts` (and its handle boxes) would otherwise be freed while
-    // the cached references in `steps` still point into them. An explicit drop
-    // restores the invariant on this path.
-    drop(steps);
+    // `steps` (re-bound as a local after `contexts` above) drops before `contexts`
+    // here by reverse-declaration order, keeping the typed-handle cache invariant.
 
     // Map the recorded outcome to the run result (same shape as `Pipeline::run`).
     // `to_result` reconstructs the non-`Clone` `PipelineError` and synthesizes

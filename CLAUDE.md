@@ -360,8 +360,11 @@ storing a reference whose real lifetime the struct cannot name.
   before the contexts it cached from — which is what must be preserved by any
   future change. `run_fused_single_thread` (`runtime/fused.rs`) is the one path
   where the natural drop order inverts it: `steps` is a by-value parameter and
-  `ChainContexts` is a local, and parameters drop *after* locals, so it drops the
-  steps explicitly before returning to keep the invariant holding there.
+  `ChainContexts` is a local, and parameters drop *after* locals. It re-binds
+  `steps` as a local declared *after* the contexts, so reverse-declaration order
+  drops the steps before the contexts on every exit — the normal return and a
+  panic unwinding out of a step — rather than relying on an explicit drop that an
+  unwind would skip.
 
 ### Test-only `#[allow(unsafe_code)]` sites
 
