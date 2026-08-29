@@ -4295,7 +4295,18 @@ impl<'a> ChainBuilder<'a> {
             dedup.include_unmapped,
             accumulators_for_process,
         );
-        let mi_assign_step = build_mi_assign_step(self.tuning.per_step_byte_limit);
+        // Duplication-saturation ladder recorder (`--duplication-ladder`).
+        // `Some` only when the flag is set; shared (via `Arc`) between the serial
+        // MI-assign step, which accumulates it in coordinate order, and the
+        // finalize hook, which writes it. `None` means the MI-assign step does
+        // zero extra work.
+        let ladder_recorder = dedup.duplication_ladder.as_ref().map(|_| {
+            Arc::new(parking_lot::Mutex::new(
+                crate::commands::dedup::DuplicationLadderRecorder::new(dedup.ladder_interval),
+            ))
+        });
+        let mi_assign_step =
+            build_mi_assign_step(self.tuning.per_step_byte_limit, ladder_recorder.clone());
         let serialize_step = build_serialize_step(
             self.tuning.per_step_byte_limit,
             dedup.remove_duplicates,
@@ -4321,6 +4332,10 @@ impl<'a> ChainBuilder<'a> {
             accumulators,
             metrics_path: dedup.metrics.clone(),
             family_size_histogram_path: dedup.family_size_histogram.clone(),
+            // Pair the path with its recorder: both are derived from
+            // `dedup.duplication_ladder`, so `zip` yields `Some` exactly when the
+            // flag is set — the invariant is now in the type, not an assert.
+            duplication_ladder: dedup.duplication_ladder.clone().zip(ladder_recorder),
             library_index: fgumi_bam_io::LibraryIndex::from_header(&self.header),
             sample: crate::commands::dedup::resolve_sample(&self.header, dedup.sample.as_deref()),
             timer,

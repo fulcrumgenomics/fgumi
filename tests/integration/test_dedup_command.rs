@@ -39,7 +39,20 @@ fn create_sorted_bam(path: &Path, records: Vec<RawRecord>) {
 /// Create a group of paired-end reads at the same position with the same UMI
 /// (simulating PCR duplicates).
 fn create_duplicate_group(base_name: &str, umi: &str, count: usize, start: i32) -> Vec<RawRecord> {
-    create_duplicate_group_inner(base_name, umi, count, start, None)
+    create_duplicate_group_inner(base_name, umi, count, start, None, 60)
+}
+
+/// Like [`create_duplicate_group`] but with an explicit `mapq`, so a fixture can
+/// carry sub-threshold reads that `--min-map-q` filters (exercising the filter
+/// funnel on the chain path).
+fn create_duplicate_group_mapq(
+    base_name: &str,
+    umi: &str,
+    count: usize,
+    start: i32,
+    mapq: u8,
+) -> Vec<RawRecord> {
+    create_duplicate_group_inner(base_name, umi, count, start, None, mapq)
 }
 
 /// Shared implementation for [`create_duplicate_group`] and
@@ -54,6 +67,7 @@ fn create_duplicate_group_inner(
     count: usize,
     start: i32,
     rg_id: Option<&str>,
+    mapq: u8,
 ) -> Vec<RawRecord> {
     let mut records = Vec::new();
     for i in 0..count {
@@ -67,7 +81,7 @@ fn create_duplicate_group_inner(
                 .flags(flags::PAIRED | flags::FIRST_SEGMENT)
                 .ref_id(0)
                 .pos(start - 1)
-                .mapq(60)
+                .mapq(mapq)
                 .cigar_ops(&[8 << 4]) // 8M
                 .mate_ref_id(0)
                 .mate_pos(start + 99)
@@ -88,7 +102,7 @@ fn create_duplicate_group_inner(
                 .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
                 .ref_id(0)
                 .pos(start + 99)
-                .mapq(60)
+                .mapq(mapq)
                 .cigar_ops(&[8 << 4]) // 8M
                 .mate_ref_id(0)
                 .mate_pos(start - 1)
@@ -390,7 +404,7 @@ fn create_duplicate_group_with_rg(
     start: i32,
     rg_id: &str,
 ) -> Vec<RawRecord> {
-    create_duplicate_group_inner(base_name, umi, count, start, Some(rg_id))
+    create_duplicate_group_inner(base_name, umi, count, start, Some(rg_id), 60)
 }
 
 /// Shared implementation for [`create_sorted_bam`]: writes `records` against the
@@ -1965,4 +1979,329 @@ fn test_dedup_no_check_crc_accepts_corrupted_crc_on_file_input() {
     let expected = read_records(&clean_output);
     assert_eq!(actual.len(), 800, "all records should be in output (marked, not removed)");
     assert_eq!(actual, expected, "--no-check-crc changed the decoded records");
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Chain-path (`--threads`) parity tests
+//
+// `dedup --threads N` routes through the declarative chain builder; the
+// no-`--threads` path keeps the hand-rolled unified pipeline and is the
+// in-process oracle these tests diff against.
+//////////////////////////////////////////////////////////////////////////////
+
+/// Read a BAM's records back as decoded `RecordBuf`s, for record-for-record
+/// comparison (order-sensitive, catches drops/dupes/reorders that a bare count
+/// would miss).
+fn read_deduped_records(path: &Path) -> Vec<noodles::sam::alignment::RecordBuf> {
+    let mut reader = bam::io::Reader::new(fs::File::open(path).unwrap());
+    let header = reader.read_header().unwrap();
+    reader.record_bufs(&header).collect::<std::io::Result<Vec<_>>>().expect("read deduped records")
+}
+
+/// Run `dedup` on `input` writing `output`, with `extra` args appended
+/// (e.g. `--threads`, `--strategy`, output flags). Asserts the run succeeds.
+fn dedup_run(input: &Path, output: &Path, extra: &[&str]) {
+    let mut args =
+        vec!["dedup", "--input", input.to_str().unwrap(), "--output", output.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    MarkDuplicates::try_parse_from(args)
+        .expect("failed to parse dedup args")
+        .execute("fgumi dedup")
+        .expect("dedup run failed");
+}
+
+/// The chain (`--threads N`) path produces output records record-for-record
+/// identical to the non-chain (no-`--threads`) path. Run at both `--threads 1`
+/// (the minimal chain engine) and `--threads 4` (genuinely parallel) — dedup's
+/// output is deterministic, so both must equal the single oracle.
+#[rstest]
+#[case::threads_1(&["--threads", "1"])]
+#[case::threads_4(&["--threads", "4"])]
+fn test_dedup_chain_matches_single_threaded(#[case] thread_args: &[&str]) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+
+    // Several distinct position groups so the chain sees multiple batches.
+    let mut records = Vec::new();
+    for i in 0..16 {
+        records.extend(create_duplicate_group(&format!("g{i}"), "ACGTACGT", 3, 100 + i * 200));
+    }
+    create_sorted_bam(&input_bam, records);
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    dedup_run(&input_bam, &oracle_out, &["--strategy", "identity"]);
+
+    let chain_out = temp_dir.path().join("chain.bam");
+    let mut chain_args = vec!["--strategy", "identity"];
+    chain_args.extend_from_slice(thread_args);
+    dedup_run(&input_bam, &chain_out, &chain_args);
+
+    let expected = read_deduped_records(&oracle_out);
+    let actual = read_deduped_records(&chain_out);
+    assert!(!expected.is_empty(), "oracle output must be non-empty (guard against a vacuous pass)");
+    assert_eq!(
+        actual, expected,
+        "chain {thread_args:?} output must match the non-chain path record-for-record"
+    );
+}
+
+/// Build one position group at `start` mixing near-duplicate and distant UMIs.
+/// The `ACGTACGT`/`ACGTACGA` pair is edit-distance 1, so under `--strategy
+/// adjacency` (the CLI default) they cluster into one molecule while `TTTTTTTT`
+/// stays separate — non-trivial clustering that `--strategy identity` (which
+/// keeps all three distinct) cannot exercise. This is what makes the default-
+/// strategy parity case below meaningful rather than a vacuous pass.
+fn create_chain_parity_group(base: &str, start: i32) -> Vec<RawRecord> {
+    let mut records = create_duplicate_group(&format!("{base}a"), "ACGTACGT", 3, start);
+    records.extend(create_duplicate_group(&format!("{base}b"), "ACGTACGA", 2, start));
+    records.extend(create_duplicate_group(&format!("{base}c"), "TTTTTTTT", 2, start));
+    // A mapq-10 subfamily: passes at the default `--min-map-q 0` but is filtered
+    // by the `--min-map-q 30` case, so the chain path's filter funnel (the ported
+    // "Filtered out N templates" diagnostic + the filter-count metric columns) is
+    // exercised with a non-zero count instead of only the all-zero case.
+    records.extend(create_duplicate_group_mapq(&format!("{base}d"), "GGGGGGGG", 2, start, 10));
+    records
+}
+
+/// Read a BAM's `@HD` record (declared sort order). The `@PG` command-line field
+/// legitimately differs between the chain and non-chain invocations (different
+/// `--threads` args), so parity checks compare `@HD` rather than the whole header.
+fn read_bam_hd(path: &Path) -> Option<String> {
+    let mut reader = bam::io::Reader::new(fs::File::open(path).unwrap());
+    let header = reader.read_header().unwrap();
+    header.header().map(|hd| format!("{hd:?}"))
+}
+
+/// The chain (`--threads`) path matches the non-chain path across the
+/// output-changing knobs the identity-only parity tests leave uncovered:
+/// - the CLI-default `adjacency` strategy (the common `dedup --threads N`
+///   invocation) and `--strategy edit`, on mixed UMIs so both do real
+///   clustering work rather than collapsing to identity (vacuous);
+/// - `--remove-duplicates` (the serialize-step drop path);
+/// - `--no-umi`, whose handling this diff specifically changed (it forces
+///   identity/edits=0 and flips `filter_config.no_umi` on the chain path);
+/// - `--min-map-q 30`, which filters the fixture's mapq-10 subfamily, exercising
+///   the chain's ported filter funnel with a non-zero filtered count.
+/// The `@HD` sort-order header is compared too (the `@PG` command-line field
+/// legitimately differs between the two invocations, so it is excluded).
+#[rstest]
+#[case::identity(&["--strategy", "identity"])]
+#[case::adjacency_default(&[])]
+#[case::edit(&["--strategy", "edit"])]
+#[case::adjacency_remove(&["--strategy", "adjacency", "--remove-duplicates"])]
+#[case::identity_remove(&["--strategy", "identity", "--remove-duplicates"])]
+#[case::no_umi(&["--no-umi"])]
+#[case::min_map_q_filters(&["--strategy", "identity", "--min-map-q", "30"])]
+fn test_dedup_chain_matches_non_chain_across_knobs(#[case] extra: &[&str]) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+
+    let mut records = Vec::new();
+    for i in 0..12 {
+        records.extend(create_chain_parity_group(&format!("g{i}"), 100 + i * 200));
+    }
+    create_sorted_bam(&input_bam, records);
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    dedup_run(&input_bam, &oracle_out, extra);
+
+    let chain_out = temp_dir.path().join("chain.bam");
+    let mut chain_args = extra.to_vec();
+    chain_args.extend_from_slice(&["--threads", "4"]);
+    dedup_run(&input_bam, &chain_out, &chain_args);
+
+    let expected = read_deduped_records(&oracle_out);
+    let actual = read_deduped_records(&chain_out);
+    assert!(!expected.is_empty(), "oracle output must be non-empty (guard against a vacuous pass)");
+    assert_eq!(
+        actual, expected,
+        "chain --threads 4 output must match the non-chain path for knobs {extra:?}"
+    );
+    assert_eq!(
+        read_bam_hd(&chain_out),
+        read_bam_hd(&oracle_out),
+        "chain and non-chain must declare the same @HD sort order for knobs {extra:?}"
+    );
+}
+
+/// Non-vacuity guard for the adjacency parity cases above: on the mixed-UMI
+/// fixture, `--strategy adjacency` (which merges the edit-distance-1 UMI pair)
+/// must produce *different* output than `--strategy identity` (which keeps all
+/// three UMIs distinct). If this ever fails, the fixture stopped exercising
+/// adjacency's distinguishing logic and `case_2_adjacency_default` /
+/// `case_3_adjacency_remove` would be passing vacuously.
+#[test]
+fn test_dedup_mixed_umi_fixture_distinguishes_adjacency_from_identity() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+
+    let mut records = Vec::new();
+    for i in 0..12 {
+        records.extend(create_chain_parity_group(&format!("g{i}"), 100 + i * 200));
+    }
+    create_sorted_bam(&input_bam, records);
+
+    let identity_out = temp_dir.path().join("identity.bam");
+    dedup_run(&input_bam, &identity_out, &["--strategy", "identity"]);
+    let adjacency_out = temp_dir.path().join("adjacency.bam");
+    dedup_run(&input_bam, &adjacency_out, &["--strategy", "adjacency"]);
+
+    assert_ne!(
+        read_deduped_records(&identity_out),
+        read_deduped_records(&adjacency_out),
+        "the mixed-UMI fixture must make adjacency cluster differently than identity, \
+         else the adjacency parity cases pass vacuously"
+    );
+}
+
+/// The `--check-crc` / `--no-check-crc` / default CRC policy is honored on the
+/// chain (`--threads`) path. The accept case asserts record identity against an
+/// intact-file baseline run *also on the chain path* — not merely a non-empty
+/// output (the vacuous-pass trap).
+#[rstest]
+#[case::no_check_crc_accepts(&["--no-check-crc"], true)]
+#[case::check_crc_rejects(&["--check-crc"], false)]
+#[case::default_rejects(&[], false)]
+fn test_dedup_threaded_crc_policy(#[case] crc_args: &[&str], #[case] expect_ok: bool) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let clean_bam = temp_dir.path().join("clean.bam");
+
+    // Enough duplicate pairs to span multiple BGZF blocks (see
+    // `corrupt_last_block_crc`).
+    create_sorted_bam(&input_bam, create_duplicate_group("dup", "ACGTACGT", 400, 100));
+    fs::copy(&input_bam, &clean_bam).expect("copy pristine input");
+
+    // For the accept case, capture the intact-file chain output as the baseline
+    // BEFORE corrupting, so the accept assertion is record-identity, not merely
+    // "non-empty".
+    let baseline = expect_ok.then(|| {
+        let baseline_out = temp_dir.path().join("baseline.bam");
+        dedup_run(&clean_bam, &baseline_out, &["--strategy", "identity", "--threads", "4"]);
+        read_deduped_records(&baseline_out)
+    });
+
+    corrupt_last_block_crc(&input_bam);
+
+    let output_bam = temp_dir.path().join("output.bam");
+    let mut args = vec![
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--threads",
+        "4",
+    ];
+    args.extend_from_slice(crc_args);
+    let result = MarkDuplicates::try_parse_from(args)
+        .expect("failed to parse dedup args")
+        .execute("fgumi dedup");
+
+    if expect_ok {
+        result.expect("--no-check-crc on the chain path must accept a corrupted BGZF CRC32");
+        let records = read_deduped_records(&output_bam);
+        assert_eq!(
+            baseline.expect("baseline is captured for the accept case"),
+            records,
+            "chain --no-check-crc output must be identical to the intact-file run"
+        );
+    } else {
+        let err = result.expect_err("chain path must reject a corrupted BGZF CRC32");
+        let message = format!("{err:#}");
+        assert!(message.to_uppercase().contains("CRC32"), "error should mention CRC32: {message}");
+    }
+}
+
+/// The `--duplication-ladder` (and `--metrics` / `--family-size-histogram`)
+/// output from the chain path is byte-identical to the non-chain path.
+///
+/// This MUST run multi-threaded: the ladder is order-sensitive (it samples a
+/// saturation curve at cumulative-template intervals), and its recording seam
+/// is the chain's serial `MiAssign` step, which only actually reorders at
+/// `--threads > 1`. At `--threads 1` a reorder regression would slip through.
+/// The input carries several hundred position groups (so batches span many
+/// in-flight batches at `--threads 4`) across two libraries (so per-library
+/// ladder rows are exercised), with a small `--ladder-interval` so rows are
+/// sampled mid-stream rather than only at `finish()`.
+#[test]
+fn test_dedup_threaded_duplication_ladder_parity() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+
+    let header = create_multi_library_header("chr1", 10000);
+    let mut records = Vec::new();
+    for i in 0..400i32 {
+        let start = 100 + i * 20;
+        let (rg, umi) = if i % 2 == 0 { ("RG1", "AAAAAAAA") } else { ("RG2", "CCCCCCCC") };
+        // Non-uniform group sizes (2..6 templates) are essential: a ladder built
+        // from uniform increments is insensitive to group order, so it could not
+        // detect a reordering regression. Varying the per-group (templates,
+        // duplicates) makes the sampled saturation curve depend on the exact
+        // coordinate order the recorder observes.
+        let count = 2 + usize::try_from(i % 5).expect("0..5 fits usize");
+        records.extend(create_duplicate_group_with_rg(&format!("p{i}"), umi, count, start, rg));
+    }
+    create_sorted_bam_with_header(&input_bam, &header, records);
+
+    // Run dedup writing the BAM plus all three metric outputs; `extra` carries
+    // the thread flags (empty = non-chain oracle).
+    let run = |tag: &str, extra: &[&str]| {
+        let out = temp_dir.path().join(format!("{tag}.bam"));
+        let ladder = temp_dir.path().join(format!("{tag}.ladder.txt"));
+        let metrics = temp_dir.path().join(format!("{tag}.metrics.txt"));
+        let hist = temp_dir.path().join(format!("{tag}.hist.txt"));
+        let mut args = vec![
+            "--strategy",
+            "identity",
+            "--duplication-ladder",
+            ladder.to_str().unwrap(),
+            "--ladder-interval",
+            "7",
+            "--metrics",
+            metrics.to_str().unwrap(),
+            "--family-size-histogram",
+            hist.to_str().unwrap(),
+            "--compression-level",
+            "1",
+        ];
+        args.extend_from_slice(extra);
+        dedup_run(&input_bam, &out, &args);
+        (out, ladder, metrics, hist)
+    };
+
+    let (oracle_out, oracle_ladder, oracle_metrics, oracle_hist) = run("oracle", &[]);
+    let (chain_out, chain_ladder, chain_metrics, chain_hist) = run("chain", &["--threads", "4"]);
+
+    // Sanity: the ladder is non-vacuous (mid-stream rows actually landed).
+    assert!(
+        !read_dedup_metrics_rows(&oracle_ladder).is_empty(),
+        "ladder must have rows, else parity is vacuous"
+    );
+
+    // The ladder is the order-sensitive file — its byte-identity is the point of
+    // this test. Metrics and family-size histogram are order-insensitive
+    // aggregates but checked too for completeness.
+    assert_eq!(
+        fs::read(&oracle_ladder).unwrap(),
+        fs::read(&chain_ladder).unwrap(),
+        "duplication ladder diverged between the chain and non-chain paths"
+    );
+    assert_eq!(
+        fs::read(&oracle_metrics).unwrap(),
+        fs::read(&chain_metrics).unwrap(),
+        "metrics diverged between the chain and non-chain paths"
+    );
+    assert_eq!(
+        fs::read(&oracle_hist).unwrap(),
+        fs::read(&chain_hist).unwrap(),
+        "family-size histogram diverged between the chain and non-chain paths"
+    );
+    assert_eq!(
+        read_deduped_records(&oracle_out),
+        read_deduped_records(&chain_out),
+        "output records diverged between the chain and non-chain paths"
+    );
 }

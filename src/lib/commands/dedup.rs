@@ -288,7 +288,7 @@ pub(crate) struct CollectedDedupCounts {
 /// accumulate this in `serialize_fn`: that closure also runs once per group,
 /// but workers execute it in parallel completion order, not coordinate order.
 #[derive(Default)]
-struct DuplicationLadderRecorder {
+pub(crate) struct DuplicationLadderRecorder {
     /// Snapshot interval in cumulative templates (`--ladder-interval`).
     interval: u64,
     /// Per-library running totals and next snapshot threshold.
@@ -323,7 +323,7 @@ struct LadderLibraryState {
 }
 
 impl DuplicationLadderRecorder {
-    fn new(interval: u64) -> Self {
+    pub(crate) fn new(interval: u64) -> Self {
         Self { interval, per_library: AHashMap::new(), rows: Vec::new() }
     }
 
@@ -341,7 +341,7 @@ impl DuplicationLadderRecorder {
     ///
     /// MUST be called in serial/coordinate order — see the ordering note on
     /// [`DuplicationLadderRecorder`].
-    fn record(&mut self, library_idx: u16, group_counts: &DedupCounts) {
+    pub(crate) fn record(&mut self, library_idx: u16, group_counts: &DedupCounts) {
         if group_counts.total_templates == 0 {
             return;
         }
@@ -381,7 +381,7 @@ impl DuplicationLadderRecorder {
 
     /// Emits a final snapshot per library at its true total, unless the last
     /// interval snapshot already landed exactly on that total.
-    fn finish(&mut self) {
+    pub(crate) fn finish(&mut self) {
         for (&library_idx, state) in &self.per_library {
             if state.templates_seen > state.last_emitted_at {
                 self.rows.push((
@@ -1074,7 +1074,7 @@ pub(crate) fn process_position_group(
 //////////////////////////////////////////////////////////////////////////////
 
 /// UMI-aware duplicate marking command.
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(
     name = "dedup",
     about = "\x1b[38;5;151m[DEDUP]\x1b[0m         \x1b[36mMark or remove PCR duplicates using UMI information\x1b[0m",
@@ -1327,9 +1327,13 @@ impl Command for MarkDuplicates {
             bail!("--no-umi cannot be used with --strategy paired");
         }
 
-        // Handle --no-umi mode: force identity strategy
+        // Handle --no-umi mode: force identity strategy. The effective-strategy
+        // computation itself must run on both paths (validate_index_threshold
+        // below consumes it), but the override log is gated to the non-chain
+        // path: the --threads chain re-emits it via add_dedup, so logging here
+        // too would double-log.
         let (effective_strategy, no_umi_edits_override) = if self.no_umi {
-            if !matches!(self.strategy, Strategy::Identity) {
+            if !matches!(self.strategy, Strategy::Identity) && self.threading.threads.is_none() {
                 info!("--no-umi mode: overriding strategy to identity");
             }
             (Strategy::Identity, true)
@@ -1356,6 +1360,19 @@ impl Command for MarkDuplicates {
 
         // Validate the input exists (stdin paths are exempt).
         self.io.validate()?;
+
+        // --threads N: run the dedup stage on the declarative chain builder.
+        // Dispatch here — after the reader-free pre-flight validations above
+        // (output collisions, strategy/min-umi combos, index-threshold,
+        // input existence), which must run for both paths — but BEFORE the
+        // timer/banner/reader below. `execute_chain` → `add_dedup` re-emits the
+        // timer, banner, and threading log lines and opens its own source, so
+        // running them here too would double-log and pre-consume stdin
+        // (breaking stdin + --threads). The no-`--threads` path keeps the
+        // hand-rolled unified pipeline below.
+        if self.threading.threads.is_some() {
+            return self.execute_chain(command_line);
+        }
 
         let min_mapq: u8 = self.min_map_q.unwrap_or(0);
 
@@ -1669,25 +1686,49 @@ impl Command for MarkDuplicates {
             );
         }
 
-        // --metrics is optional, so it must not be the only channel reporting
-        // dropped templates: a run that filters everything otherwise logs a bare
-        // "0 templates" and is indistinguishable from empty input. Reasons are
-        // named by their column suffix so the log points at the metrics column.
-        let filtered = final_counts.filter_counts.total_rejected_templates();
-        if filtered > 0 {
-            let reasons: Vec<String> = TemplateFilterReason::ALL
-                .into_iter()
-                .filter_map(|reason| {
-                    let count = final_counts.filter_counts.rejected_templates(reason);
-                    (count > 0).then(|| format!("{count} {}", reason.column_suffix()))
-                })
-                .collect();
-            info!("Filtered out {filtered} templates before marking: {}", reasons.join(", "));
-        }
+        log_filtered_templates(&final_counts.filter_counts);
 
         timer.log_completion(final_counts.total_reads);
 
         Ok(())
+    }
+}
+
+impl MarkDuplicates {
+    /// Run the dedup stage on the declarative chain builder (the `--threads N`
+    /// path).
+    ///
+    /// Replaces the hand-rolled unified-pipeline construction in `execute` for
+    /// the threaded case. The chain opens its own source, validates the
+    /// template-coordinate sort order, injects `@PG`, assigns `MoleculeId`s
+    /// deterministically, writes the output BAM, and writes the metrics /
+    /// family-size histogram / duplication ladder via its finalize hook — all
+    /// through the same shared helpers as the non-chain path, so the two
+    /// orchestrations stay in parity. The no-`--threads` path keeps its own
+    /// unified pipeline in `execute`, which is the in-process parity oracle for
+    /// this one (see `test_dedup_chain_matches_single_threaded`).
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        use crate::pipeline::chains::{
+            ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
+        };
+
+        // `add_dedup` re-emits the timer/banner/threading log lines but not the
+        // CRC-verify status; emit it here so the --threads path reports it once,
+        // matching the non-chain path. (dedup has no memory-debug knobs, so
+        // unlike group there is no warn block to add here.)
+        self.io.log_effective_check_crc();
+
+        let stage_opts = StageOptionsBag { dedup: Some(self.clone()), ..Default::default() };
+        let ctx = SingleStageContext {
+            io: &self.io,
+            threading: &self.threading,
+            compression: &self.compression,
+            scheduler: &self.scheduler_opts,
+            queue_memory: &self.queue_memory,
+            command_line,
+        };
+        let spec = ChainSpec::single_stage(Stage::Dedup, stage_opts, &ctx);
+        build_for(spec)?.run()
     }
 }
 
@@ -1766,7 +1807,30 @@ pub(crate) fn write_family_size_histogram(
 
 /// Writes the `--duplication-ladder` TSV: one row per (library, snapshot),
 /// sorted deterministically by library name then ascending `templates_seen`.
-fn write_duplication_ladder(
+/// Log the "Filtered out N templates before marking" diagnostic, if any were
+/// rejected. Called by both the non-chain `execute` tail and the chain's
+/// `DedupFinalizeHook` so `--threads` and no-`--threads` report filtered
+/// templates identically.
+///
+/// `--metrics` is optional, so this must not be the only channel reporting
+/// dropped templates: a run that filters everything otherwise logs a bare
+/// "0 templates" and is indistinguishable from empty input. Reasons are named
+/// by their column suffix so the log points at the metrics column.
+pub(crate) fn log_filtered_templates(filter_counts: &TemplateFilterCounts) {
+    let filtered = filter_counts.total_rejected_templates();
+    if filtered > 0 {
+        let reasons: Vec<String> = TemplateFilterReason::ALL
+            .into_iter()
+            .filter_map(|reason| {
+                let count = filter_counts.rejected_templates(reason);
+                (count > 0).then(|| format!("{count} {}", reason.column_suffix()))
+            })
+            .collect();
+        info!("Filtered out {filtered} templates before marking: {}", reasons.join(", "));
+    }
+}
+
+pub(crate) fn write_duplication_ladder(
     recorder: &DuplicationLadderRecorder,
     library_index: &LibraryIndex,
     path: &PathBuf,
