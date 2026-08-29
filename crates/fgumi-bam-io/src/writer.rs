@@ -497,12 +497,33 @@ impl BaiBuilder {
         record_len: usize,
         record_bytes: &[u8],
     ) {
-        let alignment_context = extract_alignment_context(record_bytes);
+        self.record_with_context(
+            block_number,
+            offset_in_block,
+            record_len,
+            extract_alignment_context(record_bytes),
+        );
+    }
+
+    /// Record a written BAM record's position for later index resolution, given
+    /// an already-extracted alignment context.
+    ///
+    /// Identical to [`Self::record`] except the caller supplies `ctx` directly
+    /// instead of raw record bytes — for callers (e.g. the arena writer) that
+    /// have already extracted [`AlignmentContext`] for other purposes and would
+    /// otherwise redo the same parse.
+    pub fn record_with_context(
+        &mut self,
+        block_number: u64,
+        offset_in_block: usize,
+        record_len: usize,
+        ctx: Option<AlignmentContext>,
+    ) {
         self.entry_cache.push_back(CachedIndexEntry {
             block_number,
             offset_in_block,
             record_len,
-            alignment_context,
+            alignment_context: ctx,
         });
     }
 
@@ -608,8 +629,29 @@ impl BaiBuilder {
 
     /// Number of records still awaiting block-position resolution.
     #[must_use]
-    pub(crate) fn pending(&self) -> usize {
+    pub fn pending(&self) -> usize {
         self.entry_cache.len()
+    }
+
+    /// Drop noted block offsets no future record can reference and advance the
+    /// watermark. Called by the arena writer after each fully-drained batch
+    /// (`pending() == 0`); safe because records never cross batch boundaries, so
+    /// nothing recorded later references a block `< block_number`. Keeps
+    /// `block_positions` bounded to the in-flight window (see the field doc on
+    /// [`Self`]) — without it, the arena's per-batch full drain never triggers
+    /// `resolve`'s own front-gated prune and the map grows for the whole file.
+    pub fn prune_below(&mut self, block_number: u64) {
+        while self.pruned_below < block_number {
+            self.block_positions.remove(&self.pruned_below);
+            self.pruned_below += 1;
+        }
+    }
+
+    /// Number of entries currently retained in `block_positions`, for test
+    /// assertions that the pruning window stays bounded.
+    #[cfg(test)]
+    pub(crate) fn block_positions_len_for_test(&self) -> usize {
+        self.block_positions.len()
     }
 
     /// Build the final BAI index.
@@ -1088,6 +1130,11 @@ pub fn write_bai_sidecar<P: AsRef<Path>>(bam_path: P) -> Result<PathBuf> {
 ///
 /// # Errors
 /// Returns an error if the file cannot be created or writing the index fails.
+///
+/// The write is atomic: the serialized index is written to a temporary file in
+/// the destination directory and then renamed onto `path`, so a failure partway
+/// through never leaves a truncated or partial `.bai` at the final path (a
+/// half-written index parses as valid but silently mis-answers queries).
 pub fn write_bai_index<P: AsRef<Path>>(path: P, index: &bai::Index) -> Result<()> {
     let path_ref = path.as_ref();
     // `bai::io::Writer` serializes the index as a great many tiny fields (each
@@ -1099,8 +1146,21 @@ pub fn write_bai_index<P: AsRef<Path>>(path: P, index: &bai::Index) -> Result<()
     bai::io::Writer::new(&mut buf)
         .write_index(index)
         .with_context(|| format!("Failed to serialize BAI index for: {}", path_ref.display()))?;
-    std::fs::write(path_ref, &buf)
+    // Write to a temp file in the destination directory, then rename onto the
+    // final path. A same-directory rename is atomic, so a reader never observes
+    // a partial index, and a failed write leaves no file at `path` at all.
+    let dir = match path_ref.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".bai-")
+        .tempfile_in(dir)
+        .with_context(|| format!("Failed to create temp file for index in: {}", dir.display()))?;
+    tmp.write_all(&buf)
         .with_context(|| format!("Failed to write index to: {}", path_ref.display()))?;
+    tmp.persist(path_ref)
+        .with_context(|| format!("Failed to persist index to: {}", path_ref.display()))?;
     Ok(())
 }
 
@@ -1618,6 +1678,54 @@ mod tests {
     }
 
     #[test]
+    fn record_with_context_matches_record_from_bytes() {
+        // Same inputs via the raw-bytes path and the pre-extracted-context path must
+        // produce an identical built index.
+        let body = build_record_body(0, 99, 0, &[(10, 'M')]);
+        let record_len = 4 + body.len();
+
+        let mut a = BaiBuilder::new();
+        a.note_block(0, 1234);
+        a.record(0, 0, record_len, &body);
+        a.resolve().unwrap();
+        let ia = a.build(1).unwrap();
+
+        let mut b = BaiBuilder::new();
+        b.note_block(0, 1234);
+        b.record_with_context(0, 0, record_len, extract_alignment_context(&body));
+        b.resolve().unwrap();
+        let ib = b.build(1).unwrap();
+
+        // Serialize both and compare bytes — same index by construction.
+        let mut ba = Vec::new();
+        let mut bb = Vec::new();
+        noodles::bam::bai::io::Writer::new(&mut ba).write_index(&ia).unwrap();
+        noodles::bam::bai::io::Writer::new(&mut bb).write_index(&ib).unwrap();
+        assert_eq!(ba, bb);
+    }
+
+    #[test]
+    fn prune_below_bounds_block_positions_across_drained_batches() {
+        // Simulate the arena writer's per-batch pattern: note this batch's blocks,
+        // record its records, resolve (fully drains → pending()==0), prune_below the
+        // next batch's base. block_positions must not accumulate across batches.
+        let body = build_record_body(0, 0, 0, &[(5, 'M')]);
+        let record_len = 4 + body.len();
+        let mut b = BaiBuilder::new();
+        let mut next_block_no = 0u64;
+        for _ in 0..1000 {
+            b.note_block(next_block_no, next_block_no * 100); // one physical block/batch
+            b.record_with_context(next_block_no, 0, record_len, extract_alignment_context(&body));
+            b.resolve().unwrap();
+            assert_eq!(b.pending(), 0, "each batch drains fully");
+            next_block_no += 1;
+            b.prune_below(next_block_no);
+        }
+        // Bounded: at most the current in-flight window, not ~1000 entries.
+        assert!(b.block_positions_len_for_test() <= 1, "block_positions must stay bounded");
+    }
+
+    #[test]
     fn test_create_indexing_bam_writer() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let header = create_test_header();
@@ -1986,5 +2094,32 @@ mod tests {
         assert_eq!(reg2bin(pos(16_300), pos(16_449)), 585);
         // reg2bin(4681)'s parent must be 585, matching the fold target.
         assert_eq!(bin_parent(4681), 585);
+    }
+
+    /// `write_bai_index` writes atomically via a same-directory temp file and a
+    /// rename: the result parses as a valid BAI, and no `.bai-` temp artifact is
+    /// left behind on success (a partial `.bai` would parse yet mis-answer
+    /// queries, which is why the write must be all-or-nothing).
+    #[test]
+    fn write_bai_index_is_atomic_and_leaves_no_temp_artifact() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("out.bam.bai");
+        write_bai_index(&path, &bai::Index::default()).expect("write bai");
+
+        // The final sidecar exists and parses.
+        assert!(path.exists(), "sidecar must exist at the final path");
+        noodles::bam::bai::fs::read(&path).expect("written .bai must parse");
+
+        // The temp file was renamed onto the target, not left in the directory.
+        let temp_leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".bai-"))
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            temp_leftovers.is_empty(),
+            "temp file must be renamed away, found: {temp_leftovers:?}"
+        );
     }
 }
