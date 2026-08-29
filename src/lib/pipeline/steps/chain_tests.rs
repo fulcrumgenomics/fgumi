@@ -129,6 +129,7 @@ fn bgzf_blocks_for(records: &[RawRecord], payload_bytes: usize) -> Vec<BgzfBlock
                 batch_serial: i as u64,
                 bytes: blocks.remove(0).data,
                 uncompressed_size: u32::try_from(payload.len()).expect("payload fits u32"),
+                index: None,
             }
         })
         .collect()
@@ -561,6 +562,7 @@ fn the_no_header_boundary_variant_consumes_a_header_stripped_stream(
                 batch_serial: i as u64,
                 bytes: blocks.remove(0).data,
                 uncompressed_size: u32::try_from(payload.len()).expect("fits u32"),
+                index: None,
             }
         })
         .collect();
@@ -713,6 +715,7 @@ fn a_truncated_record_stream_fails_the_run(#[values(1, 4)] threads: usize) {
                 batch_serial: i as u64,
                 bytes: blocks.remove(0).data,
                 uncompressed_size: u32::try_from(payload.len()).expect("fits u32"),
+                index: None,
             }
         })
         .collect();

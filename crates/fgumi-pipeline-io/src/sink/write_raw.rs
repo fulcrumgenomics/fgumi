@@ -141,7 +141,12 @@ mod tests {
     fn raw_bytes_block_exposes_payload() {
         let plain = DecompressedBlock { batch_serial: 0, bytes: b"ACGT".to_vec() };
         assert_eq!(RawBytesBlock::bytes(&plain), b"ACGT");
-        let bgzf = BgzfBlock { batch_serial: 0, bytes: b"\x1f\x8b".to_vec(), uncompressed_size: 4 };
+        let bgzf = BgzfBlock {
+            batch_serial: 0,
+            bytes: b"\x1f\x8b".to_vec(),
+            uncompressed_size: 4,
+            index: None,
+        };
         assert_eq!(RawBytesBlock::bytes(&bgzf), b"\x1f\x8b");
     }
 

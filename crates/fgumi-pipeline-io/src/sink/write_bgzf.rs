@@ -353,8 +353,8 @@ mod tests {
         // first, so ordinal 0 is emitted before ordinal 1 for the `ByItemOrdinal`
         // reorder stage. The bytes are arbitrary non-EOF markers.
         let blocks = vec![
-            BgzfBlock { batch_serial: 1, bytes: vec![0xAB; 16], uncompressed_size: 0 },
-            BgzfBlock { batch_serial: 0, bytes: vec![0xCD; 16], uncompressed_size: 0 },
+            BgzfBlock { batch_serial: 1, bytes: vec![0xAB; 16], uncompressed_size: 0, index: None },
+            BgzfBlock { batch_serial: 0, bytes: vec![0xCD; 16], uncompressed_size: 0, index: None },
         ];
         let source = BlockSource { blocks, held: HeldSlot::new() };
 

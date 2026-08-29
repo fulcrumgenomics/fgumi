@@ -9,6 +9,57 @@ use fgumi_pipeline_core::{HeapSize, Ordered};
 use fgumi_raw_bam::RawRecord;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// BamIndexManifest / RecordIndexEntry — inline BAI sidecar metadata.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One record's virtual-offset bookkeeping within a compressed [`BgzfBlock`],
+/// as needed to build a BAI index inline with compression.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordIndexEntry {
+    /// Offset of the record's 4-byte `block_size` length prefix, measured
+    /// from the start of the *uncompressed* bytes of the batch that produced
+    /// this block (i.e. the BGZF virtual offset's uncompressed-offset half,
+    /// before the physical block offset is added in).
+    pub uoffset: u32,
+    /// Total record length in bytes: `4` (the length prefix) plus the body
+    /// length.
+    pub len: u32,
+    /// The record's alignment context (reference id, start/end, mapped
+    /// flag), or `None` for a record with no reference/position (fully
+    /// unplaced unmapped reads are not indexable by coordinate).
+    pub ctx: Option<fgumi_bam_io::AlignmentContext>,
+}
+
+/// Sidecar metadata riding alongside a compressed [`BgzfBlock`], carrying
+/// everything an inline BAI indexer needs to attribute records to virtual
+/// offsets without re-parsing the compressed bytes.
+///
+/// # Invariants
+///
+/// - `phys_comp_len.iter().map(|&n| n as u64).sum::<u64>() == bytes.len() as
+///   u64`, where `bytes` is the sibling [`BgzfBlock::bytes`] this manifest
+///   describes: the physical lengths of the constituent BGZF blocks sum to
+///   the total compressed byte count.
+/// - `phys_comp_len.len() == (uncompressed_size as
+///   usize).div_ceil(fgumi_bgzf::BGZF_MAX_BLOCK_SIZE)`, where
+///   `uncompressed_size` is the sibling [`BgzfBlock::uncompressed_size`]:
+///   one physical block per `BGZF_MAX_BLOCK_SIZE`-sized (or smaller, for the
+///   final one) chunk of uncompressed input.
+/// - `records` is in batch order, which is final coordinate order.
+/// - Each entry's `uoffset` is the offset of the record's 4-byte length
+///   prefix within the batch's uncompressed bytes; `len` is `4 +` the body
+///   length.
+#[derive(Debug, Clone)]
+pub struct BamIndexManifest {
+    /// Physical (compressed) length of each constituent BGZF block, in the
+    /// order those blocks appear in the sibling [`BgzfBlock::bytes`].
+    pub phys_comp_len: Vec<u32>,
+    /// Per-record virtual-offset bookkeeping, in batch (= final coordinate)
+    /// order.
+    pub records: Vec<RecordIndexEntry>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // BgzfBlock — raw compressed BGZF block + read-order serial.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -23,13 +74,22 @@ pub struct BgzfBlock {
     pub bytes: Vec<u8>,
     /// Decompressed size, parsed from the BGZF block header.
     pub uncompressed_size: u32,
+    /// Sidecar index metadata for this block's records, populated only on the
+    /// inline-BAI-indexed compress path (`None` for every other producer,
+    /// including sentinel/EOF blocks).
+    pub index: Option<Box<BamIndexManifest>>,
 }
 
 impl HeapSize for BgzfBlock {
     fn heap_size(&self) -> usize {
         // Byte-bounded queues budget on resident heap, so account for the full
         // allocation (`capacity`), not just the populated prefix (`len`).
-        self.bytes.capacity()
+        let manifest = self.index.as_ref().map_or(0, |m| {
+            std::mem::size_of::<BamIndexManifest>()
+                + m.phys_comp_len.capacity() * std::mem::size_of::<u32>()
+                + m.records.capacity() * std::mem::size_of::<RecordIndexEntry>()
+        });
+        self.bytes.capacity() + manifest
     }
 }
 
@@ -228,9 +288,42 @@ mod tests {
 
     #[test]
     fn bgzf_block_heap_size_matches_bytes_capacity() {
-        let b = BgzfBlock { batch_serial: 0, bytes: vec![0u8; 1024], uncompressed_size: 4096 };
+        let b = BgzfBlock {
+            batch_serial: 0,
+            bytes: vec![0u8; 1024],
+            uncompressed_size: 4096,
+            index: None,
+        };
         assert_eq!(b.heap_size(), 1024);
         assert_eq!(b.ordinal(), 0);
+    }
+
+    #[test]
+    fn bgzf_block_index_defaults_none_and_heap_counts_manifest() {
+        let plain =
+            BgzfBlock { batch_serial: 0, bytes: vec![0u8; 100], uncompressed_size: 0, index: None };
+        assert!(plain.index.is_none());
+        assert_eq!(plain.heap_size(), plain.bytes.capacity());
+
+        let manifest = Box::new(BamIndexManifest {
+            phys_comp_len: vec![10, 20],
+            records: vec![RecordIndexEntry { uoffset: 0, len: 50, ctx: None }],
+        });
+        let indexed = BgzfBlock {
+            batch_serial: 1,
+            bytes: vec![0u8; 30],
+            uncompressed_size: 0,
+            index: Some(manifest),
+        };
+        let m = indexed.index.as_ref().expect("manifest present");
+        assert_eq!(
+            indexed.heap_size(),
+            indexed.bytes.capacity()
+                + std::mem::size_of::<BamIndexManifest>()
+                + m.phys_comp_len.capacity() * std::mem::size_of::<u32>()
+                + m.records.capacity() * std::mem::size_of::<RecordIndexEntry>(),
+            "heap_size must account for the manifest allocation exactly"
+        );
     }
 
     #[test]
@@ -250,7 +343,7 @@ mod tests {
         assert!(bytes.capacity() >= 8192 && bytes.len() == 100);
         let cap = bytes.capacity();
 
-        let block = BgzfBlock { batch_serial: 0, bytes, uncompressed_size: 0 };
+        let block = BgzfBlock { batch_serial: 0, bytes, uncompressed_size: 0, index: None };
         assert_eq!(block.heap_size(), cap);
 
         let mut backing = Vec::with_capacity(4096);
