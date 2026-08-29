@@ -2357,9 +2357,14 @@ mod tests {
     /// `obs_qual` sweep their *entire* representable range (`0..=93`, not a sparse
     /// list), and `depth` densely covers `1..=60` — deliberately starting at `1`, not
     /// some higher floor, because the observed worst case (`base=G, post=Q35,
-    /// obs=Q56, depth=1`) is at the *shallowest* possible depth, plus a handful of
-    /// deeper spot-checks (up to `4000`) to retain the deep-depth coverage this test
-    /// has always had. `pre` is deliberately fixed at Q45 (not swept): `w`, `l`, and
+    /// obs=Q56, depth=1`) is at the *shallowest* possible depth. Deeper spot-checks
+    /// (up to `4000`) retain the deep-depth coverage this test has always had, but —
+    /// since running `add()` to depth 4000 for *every* `(post, obs_qual)` pair is what
+    /// dominated the runtime, and the gap's per-observation increment has a fixed sign
+    /// that cannot flip with depth — they run only on a coarse `DEEP_STRIDE` subset of
+    /// the `(post, obs_qual)` grid, which samples the deep regime broadly across the
+    /// whole space without re-confirming it tens of thousands of times. `pre` is
+    /// deliberately fixed at Q45 (not swept): `w`, `l`, and
     /// `gap` depend only on the post-UMI rate, observation quality, and depth, never
     /// on the pre-UMI rate, which enters only after this bound's scope (in the
     /// pre-UMI error combination step).
@@ -2394,6 +2399,20 @@ mod tests {
         /// allowance.
         const MAX_OBSERVED_RATIO_CEILING: f64 = 5.0;
 
+        // Deep depths [100..=4000] are visited only on a coarse stride of the
+        // `(post, obs_qual)` grid. Running `add()` up to depth 4000 for *every* one
+        // of the ~94×94 pairs is what made this test slow (tens of millions of
+        // accumulations), yet the worst case lives at the *shallowest* depths —
+        // which the dense `1..=60` sweep still covers for every pair — and the
+        // gap's per-observation increment has a fixed sign that cannot flip with
+        // more depth (see the doc comment), so deeper depths only re-confirm the
+        // same regime. Sampling them on a representative strided subset retains
+        // broad deep-depth coverage across the whole `(post, obs)` space at a small
+        // fraction of the cost, without moving the asserted bound or ceiling.
+        const DEEP_DEPTHS: [u32; 5] = [100, 400, 1000, 2000, 4000];
+        // Stride over the `(post, obs_qual)` grid for the deep-depth spot-checks.
+        const DEEP_STRIDE: u8 = 8;
+
         let idx = BASE_TO_INDEX[base as usize] as usize;
         let mut checked = 0u64;
         let mut max_observed_ratio = 0.0_f64;
@@ -2404,9 +2423,13 @@ mod tests {
                 let mut b = ConsensusBaseBuilder::new(45, post);
                 let mut current_depth = 0u32;
                 // Dense over the shallow depths where the worst case actually lives
-                // (do not start higher than 1), plus a handful of deep spot-checks to
-                // retain this test's historical deep-depth coverage.
-                for target_depth in (1u32..=60).chain([100, 400, 1000, 2000, 4000]) {
+                // (do not start higher than 1), plus the strided deep spot-checks.
+                let deep: &[u32] = if post % DEEP_STRIDE == 0 && obs_qual % DEEP_STRIDE == 0 {
+                    &DEEP_DEPTHS
+                } else {
+                    &[]
+                };
+                for target_depth in (1u32..=60).chain(deep.iter().copied()) {
                     for _ in current_depth..target_depth {
                         b.add(base, obs_qual);
                     }
