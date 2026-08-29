@@ -417,6 +417,67 @@ fn read_format_prefix<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     Ok(prefix[..filled].to_vec())
 }
 
+/// Whether `path` names a pipe-like input rather than a seekable regular file.
+///
+/// Covers the forms a producer is fed to fgumi through: stdin (`-`,
+/// `/dev/stdin`), process substitution (`<(cmd)`, which the shell expands to
+/// `/dev/fd/N` — Linux also exposes `/proc/self/fd/N`), and named FIFOs
+/// (`mkfifo`). For all of these an empty stream means the producer wrote
+/// nothing, which is worth distinguishing from a genuinely empty file. `stat`
+/// on a FIFO does not open it, so this never blocks on a writer.
+fn input_is_pipe_like(path: &Path) -> bool {
+    if crate::paths::is_stdin_path(path) {
+        return true;
+    }
+    // Prefer the resolved file type over the pathname. A descriptor path like
+    // `/dev/fd/N` or `/proc/self/fd/N` can name *any* open file, including a
+    // plain regular file (`exec 3< empty.bam; fgumi ... /dev/fd/3`), so keying
+    // off the prefix alone would misreport an empty regular file as an upstream
+    // pipe failure. A FIFO is always pipe-like; a regular file never is. Only
+    // when the type is inconclusive — an unusual object such as a socket, or a
+    // metadata failure (e.g. a `/dev/fd/N` whose N is not open in this process)
+    // — do we fall back to the descriptor-path heuristic.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if let Ok(md) = std::fs::metadata(path) {
+            let file_type = md.file_type();
+            if file_type.is_fifo() {
+                return true;
+            }
+            if file_type.is_file() {
+                return false;
+            }
+        }
+    }
+    let s = path.to_string_lossy();
+    s.starts_with("/dev/fd/") || s.starts_with("/proc/self/fd/")
+}
+
+/// Build the error for input that yielded no records, tailored to the source.
+///
+/// For a regular file, an empty input is a plain user error and `empty_desc`
+/// names it (`"Input is empty"`, `"Input is an empty gzip member"`). For a
+/// pipe-like source ([`input_is_pipe_like`]: stdin, `/dev/fd/*` process
+/// substitution, a FIFO), an empty stream almost always means an *upstream*
+/// stage in the pipeline exited before writing — a crash, an OOM kill, a
+/// `set -o pipefail` abort — not a genuinely empty file. There the reader that
+/// hit EOF is the messenger, not the cause, so point diagnosis back upstream
+/// rather than reporting a misleading "empty input".
+fn empty_input_error(path: &Path, empty_desc: &str) -> anyhow::Error {
+    if input_is_pipe_like(path) {
+        anyhow::anyhow!(
+            "No records read from {} (expected BAM or SAM records): the input stream \
+             closed before any records arrived. In a pipe this usually means an upstream \
+             stage exited or was killed (for example, out-of-memory) before writing — \
+             check the exit status and logs of the command feeding this one.",
+            path.display()
+        )
+    } else {
+        anyhow::anyhow!("{}: {} (expected BAM or SAM records)", empty_desc, path.display())
+    }
+}
+
 /// Normalize `reader` to a BGZF byte stream, whatever it arrived as.
 ///
 /// BGZF passes through; SAM text is transcoded; plain gzip is decompressed once
@@ -432,7 +493,9 @@ fn read_format_prefix<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
 ///
 /// Returns an error if the input is empty, decompresses to an empty gzip member,
 /// is gzip-compressed more than once, or is text whose SAM header cannot be
-/// parsed (or is absent).
+/// parsed (or is absent). For an empty input the message depends on the source
+/// (see `empty_input_error`): a regular file reports "empty input", while a
+/// pipe-like source points at a likely upstream failure instead.
 pub fn normalize_to_bgzf(
     mut reader: Box<dyn Read + Send>,
     path: &Path,
@@ -445,7 +508,7 @@ pub fn normalize_to_bgzf(
     // stream, which is why this is a pair rather than the original reader.
     let (prefix, stream): (Vec<u8>, Box<dyn Read + Send>) = match classify_input(&magic) {
         InputFormat::Empty => {
-            bail!("Input is empty: {} (expected BAM or SAM records)", path.display())
+            return Err(empty_input_error(path, "Input is empty"));
         }
         InputFormat::Bgzf => return Ok(Box::new(ChainedReader::new(magic, reader))),
         // Plain gzip: decompress at the boundary and classify what comes out, so
@@ -488,10 +551,9 @@ pub fn normalize_to_bgzf(
                     return Ok(Box::new(BgzfFramer::new(ChainedReader::new(inner, decoded))));
                 }
                 InputFormat::Text => (inner, decoded),
-                InputFormat::Empty => bail!(
-                    "Input is an empty gzip member: {} (expected BAM or SAM records)",
-                    path.display()
-                ),
+                InputFormat::Empty => {
+                    return Err(empty_input_error(path, "Input is an empty gzip member"));
+                }
                 // Two gzip layers. Unwrapping repeatedly would let a crafted input
                 // cost unbounded work for one open, so say what it is instead.
                 InputFormat::Gzip => bail!(
@@ -526,6 +588,7 @@ pub fn normalize_to_bgzf(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::fmt::Write as _;
 
     const SAM_TEXT: &str = "@HD\tVN:1.6\tSO:unsorted\n\
@@ -566,6 +629,140 @@ mod tests {
         assert_eq!(r.sequence().iter().collect::<Vec<u8>>(), b"ACGT", "SEQ");
         assert_eq!(r.quality_scores().as_ref(), &[40, 40, 40, 40], "QUAL");
         Ok(())
+    }
+
+    /// An empty *file* is a plain user error and should say so.
+    #[test]
+    fn empty_regular_file_reports_empty_input() {
+        let Err(err) = normalize_to_bgzf(Box::new(io::empty()), Path::new("reads.bam")) else {
+            panic!("expected an error for empty input");
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("Input is empty"), "got: {msg}");
+        assert!(msg.contains("reads.bam"), "path not named: {msg}");
+    }
+
+    /// An empty *pipe-like* stream almost always means an upstream stage exited
+    /// before writing, so the message must point upstream rather than report a
+    /// misleading "empty input" for a file that was never the problem. Covers the
+    /// pipe forms users actually feed producers through: stdin (`-`,
+    /// `/dev/stdin`), process substitution (`/dev/fd/N`), and — when the resolved
+    /// file type is inconclusive so classification falls back to the
+    /// descriptor-path prefix — the Linux `/proc/self/fd/N` form. The
+    /// `/proc/self/fd/N` case names a descriptor that is never open in this
+    /// process, so `metadata` fails and the prefix fallback decides; that is the
+    /// branch under test, and it stays deterministic on platforms without
+    /// `/proc`. (The named-FIFO `is_fifo()` branch is covered separately by
+    /// `empty_fifo_points_upstream`.)
+    #[rstest]
+    #[case::dash("-")]
+    #[case::dev_stdin("/dev/stdin")]
+    #[case::dev_fd("/dev/fd/63")]
+    #[case::proc_self_fd_fallback("/proc/self/fd/2147483647")]
+    fn empty_pipe_points_upstream_not_at_an_empty_file(#[case] p: &str) {
+        let Err(err) = normalize_to_bgzf(Box::new(io::empty()), Path::new(p)) else {
+            panic!("expected an error for empty {p}");
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("upstream"), "expected upstream hint for {p}, got: {msg}");
+        assert!(
+            !msg.contains("Input is empty"),
+            "should not report 'Input is empty' for pipe {p}: {msg}"
+        );
+        // Anchor to the "from <path>" fragment: a bare `contains(p)` is
+        // trivially true for `p == "-"` (the message text contains "-" in
+        // "out-of-memory"), so it would not catch a dropped path.
+        assert!(msg.contains(&format!("from {p} ")), "path not named for {p}: {msg}");
+    }
+
+    /// A named FIFO (`mkfifo`) is classified pipe-like by its *resolved file
+    /// type*, not by any descriptor-path prefix — this exercises the `is_fifo()`
+    /// metadata branch of `input_is_pipe_like`. `stat` on a FIFO does not open
+    /// it, so classification never blocks on a writer; an empty FIFO stream at
+    /// EOF means the writer closed without producing records, so the diagnostic
+    /// must point upstream rather than report a misleading empty file.
+    #[cfg(unix)]
+    #[test]
+    fn empty_fifo_points_upstream() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let fifo = dir.path().join("in.fifo");
+        // Create the FIFO via `mkfifo(1)`: the crate forbids the unsafe `libc`
+        // binding and `nix` is a Linux-only dependency here, so shelling out is
+        // the portable way to make a FIFO across the Unixes this test targets.
+        let status = std::process::Command::new("mkfifo").arg(&fifo).status().expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed for {}", fifo.display());
+
+        // The reader is an already-empty stream, standing in for a writer that
+        // opened and closed the FIFO without producing any records.
+        let Err(err) = normalize_to_bgzf(Box::new(io::empty()), fifo.as_path()) else {
+            panic!("expected an error for an empty FIFO at {}", fifo.display());
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("upstream"), "expected upstream hint for FIFO, got: {msg}");
+        assert!(
+            !msg.contains("Input is empty"),
+            "should not report 'Input is empty' for a FIFO: {msg}"
+        );
+        // Like the sibling pipe cases, confirm the source-aware message still
+        // names the input path so a regression that drops it is caught here too.
+        let named = format!("from {} ", fifo.display());
+        assert!(msg.contains(&named), "path not named for FIFO: {msg}");
+    }
+
+    /// A descriptor path such as `/dev/fd/N` can name a plain regular file, not
+    /// only a pipe (`exec 3< empty.bam; fgumi ... /dev/fd/3`). Classification
+    /// must follow the resolved file type: an empty *regular* file reached this
+    /// way is a plain empty-input user error, so it keeps the "Input is empty"
+    /// wording rather than being blamed on a nonexistent upstream producer.
+    #[cfg(unix)]
+    #[test]
+    fn empty_regular_file_via_dev_fd_reports_empty_input() {
+        use std::os::unix::io::AsRawFd;
+
+        // Anonymous regular file: the fd is open, so `/dev/fd/N` resolves to it.
+        let file = tempfile::tempfile().expect("create temp file");
+        let path = format!("/dev/fd/{}", file.as_raw_fd());
+
+        let Err(err) = normalize_to_bgzf(Box::new(io::empty()), Path::new(&path)) else {
+            panic!("expected an error for empty input at {path}");
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("Input is empty"), "regular file via {path} misclassified: {msg}");
+        assert!(!msg.contains("upstream"), "must not point upstream for a regular file: {msg}");
+    }
+
+    /// A gzip member that decompresses to nothing hits the *second* empty path
+    /// (after the gzip boundary), which is routed through the same helper: it
+    /// keeps the "empty gzip member" wording for a file but still points a pipe
+    /// upstream.
+    #[test]
+    fn empty_gzip_member_is_routed_by_source() {
+        // A gzip stream whose single member decompresses to zero bytes.
+        let empty_gz = {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(b"").expect("write");
+            enc.finish().expect("finish")
+        };
+
+        let Err(file_err) =
+            normalize_to_bgzf(Box::new(io::Cursor::new(empty_gz.clone())), Path::new("reads.bam"))
+        else {
+            panic!("expected an error for an empty gzip member");
+        };
+        let file_msg = format!("{file_err}");
+        assert!(file_msg.contains("empty gzip member"), "file wording lost: {file_msg}");
+
+        let Err(pipe_err) =
+            normalize_to_bgzf(Box::new(io::Cursor::new(empty_gz)), Path::new("/dev/stdin"))
+        else {
+            panic!("expected an error for an empty gzip member on stdin");
+        };
+        let pipe_msg = format!("{pipe_err}");
+        assert!(pipe_msg.contains("upstream"), "pipe hint lost for gzip member: {pipe_msg}");
+        assert!(
+            !pipe_msg.contains("empty gzip member"),
+            "pipe message should not carry the file-only wording: {pipe_msg}"
+        );
     }
 
     /// A one-byte-at-a-time consumer must see the same bytes as a bulk one;
