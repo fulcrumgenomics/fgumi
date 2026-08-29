@@ -5,12 +5,19 @@ name: Miri (undefined-behavior check)
 # undefined behavior (out-of-bounds, invalid pointer use, aliasing violations),
 # turning those invariants into a machine-checked gate.
 #
-# Scope: `fgumi-raw-bam`, which contains the raw-pointer queryname comparator
-# (`natural_compare` / `natural_compare_nul`, via `get_unchecked` and `*const u8`
-# walks) and has no FFI. `fgumi-sort` is intentionally not covered yet: its
-# `memory_probe` module calls the mimalloc / mach2 FFI, which Miri cannot execute,
-# so covering its radix-sort unsafe needs `#[cfg(not(miri))]` guards first
-# (tracked as a follow-up).
+# Scope: the two crates whose approved `unsafe` is pure Rust (no FFI), each
+# narrowed to the module that carries it —
+#   - `fgumi-raw-bam::sort` — the raw-pointer queryname comparator
+#     (`natural_compare` / `natural_compare_nul`, via `get_unchecked` and
+#     `*const u8` walks).
+#   - `fgumi-pipeline-core::erased` — the typed-handle dispatch cache, four
+#     `mem::transmute`s that widen `&'a Handle` to `&'static` for storage and
+#     narrow it back on read. Aliasing/lifetime UB is exactly what Stacked
+#     Borrows checks, so this is the one place Miri adds signal the type system
+#     cannot.
+# `fgumi-sort` is intentionally not covered yet: its `memory_probe` module calls
+# the mimalloc / mach2 FFI, which Miri cannot execute, so covering its radix-sort
+# unsafe needs `#[cfg(not(miri))]` guards first (tracked as a follow-up).
 #
 # Two triggers, two jobs to do.
 #
@@ -117,7 +124,80 @@ jobs:
           # discarding); and reading — on failure, writing — the
           # `.proptest-regressions` file the lookup resolves to.
           MIRIFLAGS: -Zmiri-disable-isolation
-        run: cargo +nightly miri test -p fgumi-raw-bam sort
+        #
+        # `--list` first and fail on an empty selection: `cargo test <filter>`
+        # exits 0 when the filter matches nothing, so renaming or moving the
+        # module would silently retire this gate while CI stayed green — the same
+        # zero-match hazard `compile_fail.rs`'s `EXPECTED_FIXTURES` guards.
+        run: |
+          set -euo pipefail
+          # The zero-match guard below proves the filter selects tests; it cannot
+          # prove the filter still COVERS the crate's `unsafe`. Pin that too: if a
+          # NEW `#[allow(unsafe_code)]` site appears outside the modules known to
+          # carry approved unsafe, the `sort` filter keeps matching and Miri
+          # silently stops checking the moved/new site — so flag it.
+          #
+          # Two modules are excluded because both carry documented, approved
+          # unsafe (see CLAUDE.md → "Unsafe Code"):
+          #   - `sort.rs` — the natural-order queryname comparator, which the
+          #     `sort` filter below DOES exercise under Miri.
+          #   - `raw_bam_record.rs` — `read_raw_record`'s spare-capacity read.
+          #     The `sort` filter does not run its tests, so this unsafe is not
+          #     Miri-checked here (matching `main`, whose miri job runs only the
+          #     `sort` filter too). Bringing it under Miri needs a separate
+          #     `read_raw_record`-filtered run; tracked as a follow-up. Excluded
+          #     here so this PRE-EXISTING approved site does not fail the guard.
+          stray=$(grep -rlE '^[[:space:]]*#!?\[[^]]*allow\(unsafe_code\)' crates/fgumi-raw-bam/src \
+            | grep -vE '^crates/fgumi-raw-bam/src/(sort|raw_bam_record)\.rs$' || true)
+          if [ -n "${stray}" ]; then
+            echo "::error::unsafe_code outside the Miri-scoped fgumi-raw-bam modules: ${stray}"
+            exit 1
+          fi
+          cargo +nightly miri test -p fgumi-raw-bam sort -- --list > "${RUNNER_TEMP}/miri-raw-bam-sort.list"
+          n=$(grep -c ': test$' "${RUNNER_TEMP}/miri-raw-bam-sort.list" || true)
+          echo "miri: the 'sort' filter matched ${n} test(s) in fgumi-raw-bam"
+          if [ "${n}" -eq 0 ]; then
+            echo "::error::the 'sort' filter matched no tests in fgumi-raw-bam — the Miri scope is stale"
+            exit 1
+          fi
+          cargo +nightly miri test -p fgumi-raw-bam sort
+      - name: Miri — fgumi-pipeline-core typed-handle dispatch cache
+        # Scope to the `erased` module for the same reason: all four
+        # `#[allow(unsafe_code)]` sites in the crate live there
+        # (`TypedStep::resolve_input`/`resolve_outputs` and the `TypedStep2`
+        # pair). These 25 tests run clean under Miri in ~6s. The rest of the
+        # crate is deliberately excluded: the `builder` / `runtime` tests spawn
+        # worker threads and run a full pipeline, which takes Miri well over ten
+        # minutes, and three of them (`detached_two_sided_no_deadlock`,
+        # `driver_round_robins_all_live_before_parking`,
+        # `sticky_holding_source_yields_to_its_draining_consumer`) guard against
+        # a wedge with a WALL-CLOCK watchdog that `process::abort()`s — under
+        # Miri's slowdown that fires on a healthy run. Widening this scope means
+        # giving those watchdogs a `#[cfg(miri)]` budget first.
+        #
+        # Zero-match guard, as on the `fgumi-raw-bam` step above: this filter is
+        # the only thing pointing Miri at the crate's four `unsafe` sites, and an
+        # empty selection would pass silently.
+        run: |
+          set -euo pipefail
+          # Location guard, as on the `fgumi-raw-bam` step above: the step comment
+          # claims all four `#[allow(unsafe_code)]` sites live in `erased`, and
+          # nothing else enforces it. A site that moves elsewhere would leave the
+          # filter matching and the moved site unchecked.
+          stray=$(grep -rlE '^[[:space:]]*#!?\[[^]]*allow\(unsafe_code\)' crates/fgumi-pipeline-core/src \
+            | grep -v '^crates/fgumi-pipeline-core/src/erased.rs$' || true)
+          if [ -n "${stray}" ]; then
+            echo "::error::unsafe_code outside the Miri-scoped 'erased' module: ${stray}"
+            exit 1
+          fi
+          cargo +nightly miri test -p fgumi-pipeline-core erased -- --list > "${RUNNER_TEMP}/miri-pipeline-core-erased.list"
+          n=$(grep -c ': test$' "${RUNNER_TEMP}/miri-pipeline-core-erased.list" || true)
+          echo "miri: the 'erased' filter matched ${n} test(s) in fgumi-pipeline-core"
+          if [ "${n}" -eq 0 ]; then
+            echo "::error::the 'erased' filter matched no tests in fgumi-pipeline-core — the Miri scope is stale"
+            exit 1
+          fi
+          cargo +nightly miri test -p fgumi-pipeline-core erased
 
   # Nothing watches a cron's result, so a failure has to announce itself. See the
   # action for why it reuses one issue per workflow.

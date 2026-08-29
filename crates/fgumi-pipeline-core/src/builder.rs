@@ -1,0 +1,4058 @@
+//! `Pipeline`, `PipelineBuilder`, `Chain<O>`, `MultiChain2/3/4`, `BuildError`.
+//!
+//! The builder uses `RefCell` for the steps + graph so multiple `Chain`
+//! handles (one per branch of a multi-output step) can coexist as `&self`.
+//! Move semantics on `Chain` enforce single-consumer per branch at the
+//! type-system level; the `ChainGraph` performs the runtime all-wired check.
+
+use crate::liveness::LivenessCounter;
+use std::cell::RefCell;
+use std::marker::PhantomData;
+use std::sync::Arc;
+
+use super::erased::{ErasedStep, TypedStep, TypedStep2};
+use super::item::HeapSize;
+use super::outputs::{Single, StepOutputs};
+use super::runtime::stats::PipelineStats;
+use super::signal::{CancelHandle, PipelineSignal};
+use super::step::{Step, Step2};
+use super::topology::{BranchIdx, ChainGraph, StepIdx};
+
+/// Errors from `PipelineBuilder::build()`.
+#[derive(Debug)]
+pub enum BuildError {
+    UnwiredOutput {
+        step: &'static str,
+        branch: &'static str,
+    },
+    Empty,
+    /// A step whose `Input = ()` (a source) has an edge wired INTO it. Its
+    /// input is implicit, so chain-context construction hands it a dummy unit
+    /// input handle and nothing ever pops the wired edge — the producer's
+    /// output would be silently discarded.
+    WiredIntoSource {
+        step: &'static str,
+        producer: &'static str,
+    },
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnwiredOutput { step, branch } => {
+                write!(f, "step {step:?} has unwired output branch {branch:?}")
+            }
+            Self::Empty => write!(f, "pipeline has no steps"),
+            Self::WiredIntoSource { step, producer } => write!(
+                f,
+                "step {step:?} is a source (Input = ()) but {producer:?} is wired into it; \
+                 a source's input is implicit, so those items would never be consumed"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BuildError {}
+
+/// How much pipeline instrumentation to collect. Off by default (zero overhead:
+/// queues stay non-instrumented and no sampler thread spawns). Each higher level
+/// is a superset of the one below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InstrumentationLevel {
+    /// No edge instrumentation. The pool hot path takes its existing zero-cost
+    /// route; this is the production default.
+    #[default]
+    Off,
+    /// Per-edge throughput/occupancy/latency counters + the occupancy sampler +
+    /// the end-of-run edge table and bottleneck verdict.
+    Summary,
+    /// `Summary` plus a per-tick occupancy/throughput timeline TSV.
+    Timeline,
+    /// `Timeline` plus direct dwell/park-time latency (Detached edges).
+    Deep,
+}
+
+impl InstrumentationLevel {
+    /// `true` for any level above `Off` (edge metrics are collected).
+    #[must_use]
+    pub fn is_on(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// `true` if the background occupancy sampler should run.
+    #[must_use]
+    pub fn samples(self) -> bool {
+        self.is_on()
+    }
+
+    /// `true` if the per-tick timeline TSV should be written.
+    #[must_use]
+    pub fn timeline(self) -> bool {
+        matches!(self, Self::Timeline | Self::Deep)
+    }
+
+    /// `true` if direct dwell/park-time latency should be recorded.
+    #[must_use]
+    pub fn deep(self) -> bool {
+        matches!(self, Self::Deep)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PipelineConfig {
+    pub threads: usize,
+    /// Optional shared stats collector. Construct via `Pipeline::stats()`,
+    /// then pass into the config; the framework writes per-step counters
+    /// during the run, and the caller reads them after `run` returns.
+    /// `None` (the default) keeps the worker loop on its zero-cost path.
+    pub stats: Option<Arc<PipelineStats>>,
+    /// Deadlock-detection timeout in seconds. When > 0, `Pipeline::run`
+    /// spawns a background monitor that polls liveness every `timeout / 4`
+    /// seconds (clamped to ≥1s). If no step has progressed (or finished) for
+    /// `timeout` seconds, the monitor logs at warn level so the user has a
+    /// starting point for debugging the stall. `0` (default) disables the
+    /// monitor.
+    ///
+    /// `stats` is **optional** and independent of arming: liveness comes from
+    /// [`crate::liveness::LivenessCounter`], and a stats handle only adds the
+    /// per-step snapshot to the stall report. The helpers in
+    /// `commands/common.rs` auto-attach a stats handle when this is non-zero so
+    /// those reports are populated without callers pairing the two flags.
+    ///
+    /// Mirrors the legacy framework's `--deadlock-timeout` semantics
+    /// (default 10s, 0 = disabled).
+    pub deadlock_timeout_secs: u64,
+    /// Total byte budget for byte-bounded queues across the chain.
+    /// `None` keeps each queue at the per-step limit set by its
+    /// `QueueSpec::ByteBounded { limit_bytes }`. `Some(total)`
+    /// enables the queue-memory rebalancer: an initial pass evenly
+    /// distributes `total` across all byte-bounded queues, and a
+    /// background thread periodically reads queue fullness and
+    /// shifts budget toward consistently-full queues (producer-bound
+    /// bottlenecks) at the expense of consistently-empty ones.
+    ///
+    /// Floor of 1 MiB per queue is enforced regardless of the
+    /// rebalancer's decisions to prevent pathological starvation.
+    pub queue_memory_total: Option<u64>,
+    /// How much per-edge instrumentation to collect (default `Off` = zero
+    /// overhead). Threaded into queue construction (instrumented transports) and
+    /// the occupancy sampler. See [`InstrumentationLevel`].
+    pub instrumentation: InstrumentationLevel,
+    /// Where to write the per-tick timeline TSV when
+    /// `instrumentation.timeline()`. `None` → a default `pipeline-trace.tsv`.
+    pub trace_path: Option<std::path::PathBuf>,
+    /// Per-worker dispatch-order policy. The default
+    /// [`ChainOrderScheduler`](crate::runtime::ChainOrderScheduler) walks live
+    /// steps upstream-first (historical behaviour). A chain may opt into
+    /// [`DrainFirstScheduler`](crate::runtime::DrainFirstScheduler) to walk
+    /// downstream-first (drain buffered work before producing more) — e.g. the
+    /// sort chain, to overlap its serial boundary/key scan with the parallel
+    /// inflate instead of starving it behind inflate on the shared pool.
+    pub scheduler: Arc<dyn super::runtime::Scheduler>,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            threads: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+            stats: None,
+            // Still disarmed by default — but for a different reason than
+            // before, and the remaining blocker is now the only one.
+            //
+            // It used to be unaffordable: liveness came from `PipelineStats`,
+            // so arming the monitor meant paying `Instant::now()` on every
+            // dispatch. That is fixed — liveness is now a sharded counter
+            // (`crate::liveness`), and the monitor's teardown no longer polls a
+            // flag in 25ms slices, which cost up to a full slice of dead time on
+            // every run (measured at +80% wall on a 27ms pipeline). Both costs
+            // are gone; benchmarking shows arming it is now free within noise.
+            //
+            // What still blocks flipping this to `DEFAULT_DEADLOCK_TIMEOUT_SECS`
+            // is `PipelineError::MonitorBlindTransport`: an armed monitor
+            // *rejects* any chain with a non-`ByteBounded` edge, because its
+            // stall verdict distinguishes "idle" from "wedged" by counting bytes
+            // in flight and cannot see an `Unbounded` or `CountBounded` queue.
+            // `Process2` uses `CountBounded`, so defaulting this on would fail
+            // those chains outright rather than merely watching them. Teaching
+            // the verdict to handle byte-blind edges is its own change.
+            //
+            // Both the arming and the transport requirement are properties of
+            // the *scheduled* path only: a run that fuses to a single thread
+            // returns before either, so it would neither gain the monitor nor
+            // be rejected for a byte-blind edge. It is bounded by the fused
+            // path's own stall budget instead.
+            deadlock_timeout_secs: 0,
+            queue_memory_total: None,
+            instrumentation: InstrumentationLevel::Off,
+            trace_path: None,
+            scheduler: Arc::new(super::runtime::ChainOrderScheduler),
+        }
+    }
+}
+
+impl PipelineConfig {
+    /// Builder-style helper to attach a stats collector.
+    #[must_use]
+    pub fn with_stats(mut self, stats: Arc<PipelineStats>) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
+    /// Builder-style helper to set the deadlock-detection timeout.
+    /// [`DEFAULT_DEADLOCK_TIMEOUT_SECS`] is the recommended value.
+    /// `0` disables it.
+    ///
+    /// **Scheduled path only.** A non-zero value arms the monitor, and arming
+    /// additionally requires every output transport to be `ByteBounded` — see
+    /// [`crate::signal::PipelineError::MonitorBlindTransport`]. A run that
+    /// fuses to a single thread returns before either the transport check or
+    /// the monitor spawn, so it accepts a non-zero timeout with `CountBounded`
+    /// or `Unbounded` edges and simply ignores it; the fused path is bounded by
+    /// its own stall budget instead.
+    ///
+    /// `stats` is **optional** and independent of arming: liveness comes from
+    /// [`crate::liveness::LivenessCounter`], and a stats handle only adds the
+    /// per-step snapshot to the stall report.
+    #[must_use]
+    pub fn with_deadlock_timeout(mut self, timeout_secs: u64) -> Self {
+        self.deadlock_timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Builder-style helper to set the per-worker dispatch-order policy.
+    /// Defaults to [`ChainOrderScheduler`](crate::runtime::ChainOrderScheduler)
+    /// (upstream-first); pass
+    /// [`DrainFirstScheduler`](crate::runtime::DrainFirstScheduler) to walk
+    /// downstream-first.
+    #[must_use]
+    pub fn with_scheduler(mut self, scheduler: Arc<dyn super::runtime::Scheduler>) -> Self {
+        self.scheduler = scheduler;
+        self
+    }
+
+    /// Builder-style helper to set the total queue-memory budget.
+    /// `None` keeps per-step `ByteBounded` limits at their static
+    /// values; `Some(total)` enables the rebalancer.
+    #[must_use]
+    pub fn with_queue_memory_total(mut self, total: Option<u64>) -> Self {
+        self.queue_memory_total = total;
+        self
+    }
+
+    /// Builder-style helper to set the instrumentation level (default `Off`).
+    #[must_use]
+    pub fn with_instrumentation(mut self, level: InstrumentationLevel) -> Self {
+        self.instrumentation = level;
+        self
+    }
+}
+
+pub struct PipelineBuilder {
+    inner: RefCell<BuilderInner>,
+}
+
+struct BuilderInner {
+    steps: Vec<Box<dyn ErasedStep>>,
+    graph: ChainGraph,
+}
+
+impl Default for PipelineBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PipelineBuilder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { inner: RefCell::new(BuilderInner { steps: Vec::new(), graph: ChainGraph::new() }) }
+    }
+
+    /// Add the first chain link. Requires `step: Step<Input = ()>` (i.e., a source).
+    #[must_use = "pipeline branches must be wired to a sink"]
+    pub fn chain<S>(&self, step: S) -> Chain<'_, S::Outputs>
+    where
+        S: Step<Input = ()>,
+    {
+        let mut inner = self.inner.borrow_mut();
+        // Input arity 0, not `register_step`'s default of 1: a source's input is
+        // implicit, so the graph must reject any attempt to wire an edge INTO
+        // it. See `append_source` for the failure the default lets through.
+        let producer =
+            inner.graph.register_step_with_input_arity(step.profile().name, S::Outputs::arity(), 0);
+        inner.steps.push(Box::new(TypedStep::new(step)));
+
+        Chain { builder: self, producer, branch: BranchIdx(0), _phantom: PhantomData }
+    }
+
+    /// Add a source step (first link) without requiring the typed `Chain`
+    /// return value. Used by the `ChainBuilder` in the parent `fgumi` crate's
+    /// `pipeline::chains` to accumulate steps across `add_source` /
+    /// `add_<stage>` / `add_sink` method calls.
+    ///
+    /// Returns `(StepIdx, BranchIdx(0))` for the newly registered step.
+    /// The caller tracks this tail and passes it to
+    /// [`Self::append_step`] for all subsequent steps.
+    ///
+    /// This deliberately bypasses the typed `Chain<'_, S::Outputs>` API.
+    /// Type correctness is NOT validated at [`Self::build`] time — `build()`
+    /// only checks that the chain is non-empty (rejecting a zero-step chain with
+    /// `BuildError::Empty`) and that every output branch is wired. A mis-typed step
+    /// sequence (e.g. a step whose `Input=A` consumes an output of type `B`)
+    /// builds successfully and panics at the first dispatch in
+    /// `TypedStep::resolve_input` with "input handle downcast failed —
+    /// chain topology invariant". That panic is loud and immediate but it
+    /// is a runtime check, not a compile-time or build-time one. Callers
+    /// are responsible for maintaining type correctness. `pub` so the
+    /// `chains` layer in the parent `fgumi` crate can drive incremental
+    /// assembly across the crate boundary.
+    pub fn append_source<S>(&self, step: S) -> (StepIdx, BranchIdx)
+    where
+        S: Step<Input = ()>,
+    {
+        let mut inner = self.inner.borrow_mut();
+        // Input arity 0 — see `chain`. Leaving this at `register_step`'s default
+        // of 1 makes a source look like it has a free input slot: because
+        // `HeapSize for ()` exists, a producer whose output shape is
+        // `Single<()>` type-checks against a `Step<Input = ()>`, `wire_to_slot`
+        // accepts slot 0 against the bogus arity, `build()` reports the chain
+        // fully wired, and `build_chain_contexts_inner` still takes the
+        // `is_source()` branch and hands the step a dummy unit input handle —
+        // so the wired edge's items are never popped. Registering arity 0 makes
+        // the graph reject that edge at wire time instead.
+        let producer =
+            inner.graph.register_step_with_input_arity(step.profile().name, S::Outputs::arity(), 0);
+        inner.steps.push(Box::new(TypedStep::new(step)));
+        (producer, BranchIdx(0))
+    }
+
+    /// Append a step to the chain by wiring it to the current tail
+    /// `(prev_producer, prev_branch)`. Used by the parent crate's
+    /// `ChainBuilder` for the same reason as [`Self::append_source`] —
+    /// type-erased incremental chain assembly across method-boundary calls.
+    ///
+    /// Returns `(StepIdx, BranchIdx(0))` for the newly registered step.
+    pub fn append_step<S: Step>(
+        &self,
+        step: S,
+        prev: (StepIdx, BranchIdx),
+    ) -> (StepIdx, BranchIdx) {
+        let mut inner = self.inner.borrow_mut();
+        let consumer = inner.graph.register_step(step.profile().name, S::Outputs::arity());
+        inner.graph.wire(prev.0, prev.1, consumer);
+        inner.steps.push(Box::new(TypedStep::new(step)));
+        (consumer, BranchIdx(0))
+    }
+
+    /// Append a two-input [`Step2`] step, wiring `prev_a` into input slot 0
+    /// and `prev_b` into input slot 1. The type-erased counterpart of
+    /// [`MultiChain2Ordered::join`] — used by the parent crate's
+    /// `ChainBuilder::add_zipper` to wire the unmapped and mapped source
+    /// chains into the zipper-merge step across method-boundary calls.
+    ///
+    /// Returns `(StepIdx, BranchIdx(0))` for the newly registered step.
+    pub fn append_step2<S: Step2>(
+        &self,
+        step: S,
+        prev_a: (StepIdx, BranchIdx),
+        prev_b: (StepIdx, BranchIdx),
+    ) -> (StepIdx, BranchIdx) {
+        let mut inner = self.inner.borrow_mut();
+        let consumer =
+            inner.graph.register_step_with_input_arity(step.profile().name, S::Outputs::arity(), 2);
+        inner.graph.wire_to_slot(prev_a.0, prev_a.1, consumer, 0);
+        inner.graph.wire_to_slot(prev_b.0, prev_b.1, consumer, 1);
+        inner.steps.push(Box::new(TypedStep2::new(step)));
+        (consumer, BranchIdx(0))
+    }
+
+    /// Finalize the chain. Returns `Err(UnwiredOutput)` if any output branch
+    /// is dangling, `Err(Empty)` if the chain has zero steps.
+    ///
+    /// # Errors
+    ///
+    /// See `BuildError`.
+    pub fn build(self) -> Result<Pipeline, BuildError> {
+        let inner = self.inner.into_inner();
+        if inner.steps.is_empty() {
+            return Err(BuildError::Empty);
+        }
+        if let Some((producer, _branch, branch_name)) = inner.graph.first_unwired() {
+            return Err(BuildError::UnwiredOutput {
+                step: inner.graph.step_name(producer),
+                branch: branch_name,
+            });
+        }
+        // Registering sources with `input_arity = 0` makes `wire_to_slot` reject
+        // an edge into a source built through `PipelineBuilder::{chain,
+        // append_source}`. It does NOT cover a source reached as a *consumer*:
+        // `Chain::chain` / `append_step` register any consumer with arity 1, so
+        // a `Step<Input = ()>` appended there wires cleanly. `is_source()` is
+        // `Input == ()` regardless of how the step was registered, so check it
+        // here — this is the one place every wiring path converges.
+        for (idx, step) in inner.steps.iter().enumerate() {
+            if !step.is_source() {
+                continue;
+            }
+            let consumer = super::topology::StepIdx(idx);
+            if let Some(producer) = inner.graph.first_producer_into(consumer) {
+                return Err(BuildError::WiredIntoSource {
+                    step: inner.graph.step_name(consumer),
+                    producer: inner.graph.step_name(producer),
+                });
+            }
+        }
+        Ok(Pipeline { steps: inner.steps, graph: inner.graph, signal: PipelineSignal::new() })
+    }
+}
+
+/// In-progress chain handle. Each `.chain()` call consumes self and returns
+/// a fresh `Chain` rooted at the new tail (Rust move semantics enforce
+/// single-consumer at the type-system level).
+#[must_use = "pipeline branches must be wired to a sink"]
+pub struct Chain<'b, O> {
+    builder: &'b PipelineBuilder,
+    producer: StepIdx,
+    branch: BranchIdx,
+    _phantom: PhantomData<fn() -> O>,
+}
+
+impl<'b, T: Send + HeapSize + 'static> Chain<'b, Single<T>> {
+    /// Extend the chain with a step accepting `T`.
+    #[must_use = "pipeline branches must be wired to a sink"]
+    pub fn chain<S>(self, step: S) -> Chain<'b, S::Outputs>
+    where
+        S: Step<Input = T>,
+    {
+        let mut inner = self.builder.inner.borrow_mut();
+        let consumer = inner.graph.register_step(step.profile().name, S::Outputs::arity());
+        inner.graph.wire(self.producer, self.branch, consumer);
+        inner.steps.push(Box::new(TypedStep::new(step)));
+
+        Chain {
+            builder: self.builder,
+            producer: consumer,
+            branch: BranchIdx(0),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<'b, T: Send + super::item::HeapSize + super::item::Ordered + 'static>
+    Chain<'b, super::outputs::OrderedBytesSingle<T>>
+{
+    /// Extend the chain with a step accepting `T`. Mirror of
+    /// `Chain<Single<T>>::chain` for the heap-aware ordered output shape
+    /// used by Phase 3 BAM steps.
+    #[must_use = "pipeline branches must be wired to a sink"]
+    pub fn chain<S>(self, step: S) -> Chain<'b, S::Outputs>
+    where
+        S: Step<Input = T>,
+    {
+        let mut inner = self.builder.inner.borrow_mut();
+        let consumer = inner.graph.register_step(step.profile().name, S::Outputs::arity());
+        inner.graph.wire(self.producer, self.branch, consumer);
+        inner.steps.push(Box::new(TypedStep::new(step)));
+
+        Chain {
+            builder: self.builder,
+            producer: consumer,
+            branch: BranchIdx(0),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl Chain<'_, ()> {
+    /// Convenience to drop a sink-tail chain handle without `let _ = ...`.
+    /// Sinks have `Outputs = ()` (zero branches) so the all-wired check
+    /// never flags them; this method exists only to suppress the
+    /// `#[must_use]` warning at the call site when a chain naturally ends
+    /// at a sink.
+    pub fn into_sink_marker(self) {
+        let _ = (self.builder, self.producer, self.branch);
+    }
+}
+
+impl<'b, A: Send + HeapSize + 'static, B: Send + HeapSize + 'static> Chain<'b, (A, B)> {
+    /// Convert a 2-output chain into per-branch sub-chains.
+    #[must_use = "all chain branches must be wired to a sink"]
+    pub fn into_multi(self) -> MultiChain2<'b, A, B> {
+        MultiChain2 {
+            b0: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(0),
+                _phantom: PhantomData,
+            },
+            b1: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(1),
+                _phantom: PhantomData,
+            },
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<'b, A, B> Chain<'b, super::outputs::OrderedBytesTuple2<A, B>>
+where
+    A: Send + super::item::HeapSize + super::item::Ordered + 'static,
+    B: Send + super::item::HeapSize + super::item::Ordered + 'static,
+{
+    /// Convert a 2-output ordered + byte-bounded chain into per-branch
+    /// sub-chains. Each branch is exposed as
+    /// `Chain<OrderedBytesSingle<X>>` so downstream chained steps see
+    /// the byte-aware ordered shape (matching what
+    /// `Chain<OrderedBytesSingle<T>>::chain` accepts).
+    #[must_use = "all chain branches must be wired to a sink"]
+    pub fn into_multi(self) -> MultiChain2Ordered<'b, A, B> {
+        MultiChain2Ordered {
+            b0: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(0),
+                _phantom: PhantomData,
+            },
+            b1: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(1),
+                _phantom: PhantomData,
+            },
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<'b, A, B, C> Chain<'b, super::outputs::OrderedBytesTuple3<A, B, C>>
+where
+    A: Send + super::item::HeapSize + super::item::Ordered + 'static,
+    B: Send + super::item::HeapSize + super::item::Ordered + 'static,
+    C: Send + super::item::HeapSize + super::item::Ordered + 'static,
+{
+    /// Convert a 3-output ordered + byte-bounded chain into per-branch
+    /// sub-chains, the 3-way counterpart of the
+    /// [`OrderedBytesTuple2`](super::outputs::OrderedBytesTuple2) impl above.
+    ///
+    /// Without this, a step whose `Outputs` is `OrderedBytesTuple3` cannot be
+    /// wired through the typed builder at all: `append_step` exposes only
+    /// branch 0, and branch wiring is not otherwise public — so the step type
+    /// checks, builds, and is simply unreachable.
+    #[must_use = "all chain branches must be wired to a sink"]
+    pub fn into_multi(self) -> MultiChain3Ordered<'b, A, B, C> {
+        MultiChain3Ordered {
+            b0: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(0),
+                _phantom: PhantomData,
+            },
+            b1: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(1),
+                _phantom: PhantomData,
+            },
+            b2: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(2),
+                _phantom: PhantomData,
+            },
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<'b, A, B, C> Chain<'b, (A, B, C)>
+where
+    A: Send + HeapSize + 'static,
+    B: Send + HeapSize + 'static,
+    C: Send + HeapSize + 'static,
+{
+    #[must_use = "all chain branches must be wired to a sink"]
+    pub fn into_multi(self) -> MultiChain3<'b, A, B, C> {
+        MultiChain3 {
+            b0: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(0),
+                _phantom: PhantomData,
+            },
+            b1: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(1),
+                _phantom: PhantomData,
+            },
+            b2: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(2),
+                _phantom: PhantomData,
+            },
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<'b, A, B, C, D> Chain<'b, (A, B, C, D)>
+where
+    A: Send + HeapSize + 'static,
+    B: Send + HeapSize + 'static,
+    C: Send + HeapSize + 'static,
+    D: Send + HeapSize + 'static,
+{
+    #[must_use = "all chain branches must be wired to a sink"]
+    pub fn into_multi(self) -> MultiChain4<'b, A, B, C, D> {
+        MultiChain4 {
+            b0: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(0),
+                _phantom: PhantomData,
+            },
+            b1: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(1),
+                _phantom: PhantomData,
+            },
+            b2: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(2),
+                _phantom: PhantomData,
+            },
+            b3: Chain {
+                builder: self.builder,
+                producer: self.producer,
+                branch: BranchIdx(3),
+                _phantom: PhantomData,
+            },
+            _phantom: PhantomData,
+        }
+    }
+}
+
+#[must_use = "all chain branches must be wired to a sink"]
+pub struct MultiChain2<'b, A: Send + HeapSize + 'static, B: Send + HeapSize + 'static> {
+    pub b0: Chain<'b, Single<A>>,
+    pub b1: Chain<'b, Single<B>>,
+    pub(crate) _phantom: PhantomData<&'b PipelineBuilder>,
+}
+
+impl<'b, A: Send + HeapSize + 'static, B: Send + HeapSize + 'static> MultiChain2<'b, A, B> {
+    /// Construct a `MultiChain2` from two independent source-side
+    /// chains that each produce `Single<A>` / `Single<B>`. Used when
+    /// two parallel source subchains converge at a `Step2` consumer
+    /// (e.g. zipper's mapped + unmapped BAM source subchains, AAM's
+    /// aligner-output + original-record-buffer subchains).
+    ///
+    /// Mirrors [`Chain::into_multi`]'s output-side counterpart: that
+    /// method takes one producer with two output branches and splits
+    /// it into a `MultiChain2`; this method takes two distinct
+    /// producers (each with one output branch) and packages them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `a` and `b` are anchored at different
+    /// `PipelineBuilder` instances (i.e. the framework would have to
+    /// wire across pipelines, which is meaningless).
+    #[must_use = "pipeline branches must be wired to a sink"]
+    pub fn from_chains(a: Chain<'b, Single<A>>, b: Chain<'b, Single<B>>) -> Self {
+        assert!(
+            std::ptr::eq(a.builder, b.builder),
+            "MultiChain2::from_chains: both chains must be anchored at the same builder",
+        );
+        Self { b0: a, b1: b, _phantom: PhantomData }
+    }
+
+    /// Join two parallel sub-chains into a single [`Step2`] consumer.
+    ///
+    /// Wires `b0` into the consumer's input slot 0
+    /// ([`StepCtx2`](crate::step::StepCtx2)'s `a`) and `b1` into input slot 1
+    /// ([`StepCtx2`](crate::step::StepCtx2)'s `b`), registering the consumer with input arity
+    /// 2 in the chain graph. Each branch's typed producer-side
+    /// [`OutputQueueSet`](crate::handles::OutputQueueSet) is later (at chain-run time) drained into
+    /// the consumer's
+    /// [`crate::handles::TwoInputHandles<A, B>`]
+    /// via [`TypedStep2::build_two_input_handles`].
+    ///
+    /// Returns a single-branch downstream [`Chain`] typed by the
+    /// joined step's `S::Outputs`, ready to chain further single-input
+    /// steps onto.
+    ///
+    /// # Type bounds
+    ///
+    /// `S: Step2<InputA = A, InputB = B>` — the joined step's input
+    /// types must match the two upstream branch types exactly.
+    ///
+    /// # Panics
+    ///
+    /// `wire_to_slot`'s defensive panic fires if either upstream
+    /// branch was already wired (the `Chain` move semantics prevent
+    /// this in well-formed code).
+    pub fn join<S>(self, step: S) -> Chain<'b, S::Outputs>
+    where
+        S: Step2<InputA = A, InputB = B>,
+    {
+        let builder = self.b0.builder;
+        let p0 = self.b0.producer;
+        let br0 = self.b0.branch;
+        let p1 = self.b1.producer;
+        let br1 = self.b1.branch;
+
+        let mut inner = builder.inner.borrow_mut();
+        let consumer =
+            inner.graph.register_step_with_input_arity(step.profile().name, S::Outputs::arity(), 2);
+        inner.graph.wire_to_slot(p0, br0, consumer, 0);
+        inner.graph.wire_to_slot(p1, br1, consumer, 1);
+        inner.steps.push(Box::new(TypedStep2::new(step)));
+
+        Chain { builder, producer: consumer, branch: BranchIdx(0), _phantom: PhantomData }
+    }
+}
+
+/// Ordered-bytes variant of `MultiChain2`. Each branch is typed as
+/// `Chain<OrderedBytesSingle<_>>` so downstream chained steps see the
+/// byte-aware ordered representation (matching the queue topology
+/// `OrderedBytesTuple2` actually constructed).
+#[must_use = "all chain branches must be wired to a sink"]
+pub struct MultiChain2Ordered<'b, A, B>
+where
+    A: Send + super::item::HeapSize + super::item::Ordered + 'static,
+    B: Send + super::item::HeapSize + super::item::Ordered + 'static,
+{
+    pub b0: Chain<'b, super::outputs::OrderedBytesSingle<A>>,
+    pub b1: Chain<'b, super::outputs::OrderedBytesSingle<B>>,
+    pub(crate) _phantom: PhantomData<&'b PipelineBuilder>,
+}
+
+impl<'b, A, B> MultiChain2Ordered<'b, A, B>
+where
+    A: Send + super::item::HeapSize + super::item::Ordered + 'static,
+    B: Send + super::item::HeapSize + super::item::Ordered + 'static,
+{
+    /// Construct a `MultiChain2Ordered` from two independent
+    /// source-side chains that each produce `OrderedBytesSingle<A>` /
+    /// `OrderedBytesSingle<B>`. The ordered/byte-bounded counterpart
+    /// of [`MultiChain2::from_chains`] — used when two parallel
+    /// source subchains coming out of ordered, byte-bounded BAM/FASTQ
+    /// step libraries (decompress → boundaries → decode → group) need
+    /// to converge at a [`Step2`] consumer.
+    ///
+    /// Anchored at the same `PipelineBuilder` as both input chains;
+    /// panics otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `a` and `b` are anchored at different
+    /// `PipelineBuilder` instances.
+    #[must_use = "pipeline branches must be wired to a sink"]
+    pub fn from_chains(
+        a: Chain<'b, super::outputs::OrderedBytesSingle<A>>,
+        b: Chain<'b, super::outputs::OrderedBytesSingle<B>>,
+    ) -> Self {
+        assert!(
+            std::ptr::eq(a.builder, b.builder),
+            "MultiChain2Ordered::from_chains: both chains must be anchored at the same builder",
+        );
+        Self { b0: a, b1: b, _phantom: PhantomData }
+    }
+
+    /// Join two parallel ordered/byte-bounded sub-chains into a single
+    /// [`Step2`] consumer. Ordered counterpart of
+    /// [`MultiChain2::join`]: wires `b0` into the consumer's input
+    /// slot 0 ([`StepCtx2`](crate::step::StepCtx2)'s `a`) and `b1` into input slot 1
+    /// ([`StepCtx2`](crate::step::StepCtx2)'s `b`), registering the consumer with input arity 2.
+    ///
+    /// Returns a single-branch downstream [`Chain`] typed by the
+    /// joined step's `S::Outputs`.
+    ///
+    /// # Type bounds
+    ///
+    /// `S: Step2<InputA = A, InputB = B>` — the joined step's input
+    /// types must match the two upstream branch element types exactly.
+    /// The framework only requires `HeapSize` on `Step2::InputA` /
+    /// `Step2::InputB`; the `Ordered` bound carried by
+    /// `OrderedBytesSingle` is upstream-side typing and does not flow
+    /// into the consumer's input handle (steps see plain
+    /// `InputHandle<T>` regardless of upstream queue topology).
+    ///
+    /// # Panics
+    ///
+    /// `wire_to_slot`'s defensive panic fires if either upstream
+    /// branch was already wired (the `Chain` move semantics prevent
+    /// this in well-formed code).
+    pub fn join<S>(self, step: S) -> Chain<'b, S::Outputs>
+    where
+        S: Step2<InputA = A, InputB = B>,
+    {
+        let builder = self.b0.builder;
+        let p0 = self.b0.producer;
+        let br0 = self.b0.branch;
+        let p1 = self.b1.producer;
+        let br1 = self.b1.branch;
+
+        let mut inner = builder.inner.borrow_mut();
+        let consumer =
+            inner.graph.register_step_with_input_arity(step.profile().name, S::Outputs::arity(), 2);
+        inner.graph.wire_to_slot(p0, br0, consumer, 0);
+        inner.graph.wire_to_slot(p1, br1, consumer, 1);
+        inner.steps.push(Box::new(TypedStep2::new(step)));
+
+        Chain { builder, producer: consumer, branch: BranchIdx(0), _phantom: PhantomData }
+    }
+}
+
+#[must_use = "all chain branches must be wired to a sink"]
+pub struct MultiChain3<'b, A, B, C>
+where
+    A: Send + HeapSize + 'static,
+    B: Send + HeapSize + 'static,
+    C: Send + HeapSize + 'static,
+{
+    pub b0: Chain<'b, Single<A>>,
+    pub b1: Chain<'b, Single<B>>,
+    pub b2: Chain<'b, Single<C>>,
+    pub(crate) _phantom: PhantomData<&'b PipelineBuilder>,
+}
+
+/// Per-branch sub-chains of an ordered + byte-bounded 3-way fan-out. The
+/// 3-way counterpart of [`MultiChain2Ordered`]; each branch is exposed as
+/// `Chain<OrderedBytesSingle<X>>` so downstream chained steps see the
+/// byte-aware ordered shape.
+#[must_use = "all chain branches must be wired to a sink"]
+pub struct MultiChain3Ordered<'b, A, B, C>
+where
+    A: Send + super::item::HeapSize + super::item::Ordered + 'static,
+    B: Send + super::item::HeapSize + super::item::Ordered + 'static,
+    C: Send + super::item::HeapSize + super::item::Ordered + 'static,
+{
+    pub b0: Chain<'b, super::outputs::OrderedBytesSingle<A>>,
+    pub b1: Chain<'b, super::outputs::OrderedBytesSingle<B>>,
+    pub b2: Chain<'b, super::outputs::OrderedBytesSingle<C>>,
+    pub(crate) _phantom: PhantomData<&'b PipelineBuilder>,
+}
+
+#[must_use = "all chain branches must be wired to a sink"]
+pub struct MultiChain4<'b, A, B, C, D>
+where
+    A: Send + HeapSize + 'static,
+    B: Send + HeapSize + 'static,
+    C: Send + HeapSize + 'static,
+    D: Send + HeapSize + 'static,
+{
+    pub b0: Chain<'b, Single<A>>,
+    pub b1: Chain<'b, Single<B>>,
+    pub b2: Chain<'b, Single<C>>,
+    pub b3: Chain<'b, Single<D>>,
+    pub(crate) _phantom: PhantomData<&'b PipelineBuilder>,
+}
+
+/// A built pipeline ready to run.
+///
+/// `steps` is consumed by `Pipeline::run`; `graph` is read by `run` and
+/// `dag()`; `signal` backs both `cancel_handle` and `run`'s outcome
+/// plumbing.
+pub struct Pipeline {
+    pub(crate) steps: Vec<Box<dyn ErasedStep>>,
+    pub(crate) graph: ChainGraph,
+    pub(crate) signal: Arc<PipelineSignal>,
+}
+
+impl Pipeline {
+    #[must_use]
+    pub fn builder() -> PipelineBuilder {
+        PipelineBuilder::new()
+    }
+
+    #[must_use]
+    pub fn cancel_handle(&self) -> CancelHandle {
+        CancelHandle::from_signal(Arc::clone(&self.signal))
+    }
+
+    /// Construct a fresh `PipelineStats` collector sized to this pipeline's
+    /// chain. Wrap the returned `Arc` and pass it into `PipelineConfig::stats`
+    /// (or via `PipelineConfig::with_stats`) before calling `run`. Counters
+    /// can be read at any time after the run completes.
+    #[must_use]
+    pub fn stats(&self) -> Arc<PipelineStats> {
+        let names: Vec<&'static str> = self.steps.iter().map(|s| s.profile().name).collect();
+        Arc::new(PipelineStats::new(names))
+    }
+
+    /// Render the chain shape as a multi-line debug string. Lists each step
+    /// in chain order with its profile (kind, sticky, branch count) and
+    /// the consumer for each output branch. Used for diagnostics and for
+    /// runall-style `--explain` output.
+    ///
+    /// The output isn't a stable serialization format — it's a developer-
+    /// readable summary, intended to be `println!`'d during debugging or
+    /// embedded in error messages.
+    #[must_use]
+    pub fn dag(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut s = String::new();
+        let _ = writeln!(
+            s,
+            "Pipeline DAG ({} step{}):",
+            self.steps.len(),
+            if self.steps.len() == 1 { "" } else { "s" }
+        );
+        for (idx, step) in self.steps.iter().enumerate() {
+            let profile = step.profile();
+            let n_branches = self.graph.branch_count(super::topology::StepIdx(idx));
+            // Render the *effective* (post-collapse) ordering so the diagnostic
+            // matches the transport actually built. Single-input Serial /
+            // Exclusive producers collapse declared `ByOrdinal` / `ByItemOrdinal`
+            // to `None` (no reorder stage); `Step2` producers (input_arity == 2)
+            // and `Parallel` producers keep their declared ordering verbatim.
+            // Using the shared `effective_branch_orderings` helper keeps `dag()`
+            // and `build_output_set` from drifting.
+            let effective_orderings = if step.input_arity() == 2 {
+                profile.branch_ordering.clone()
+            } else {
+                super::erased::effective_branch_orderings(profile.kind, &profile.branch_ordering)
+            };
+            let _ = write!(
+                s,
+                "  [{idx}] {name:<24} {kind:?} sticky={sticky} branches={n_branches}",
+                idx = idx,
+                name = profile.name,
+                kind = profile.kind,
+                sticky = profile.sticky,
+                n_branches = n_branches,
+            );
+            if n_branches == 0 {
+                let _ = writeln!(s, " (sink)");
+            } else {
+                let _ = writeln!(s);
+                for branch_usize in 0..n_branches {
+                    let branch = super::topology::BranchIdx(branch_usize);
+                    let consumer = self.graph.consumer(super::topology::StepIdx(idx), branch);
+                    let consumer_name = match consumer {
+                        Some(c) => self.graph.step_name(c),
+                        None => "<unwired>",
+                    };
+                    let queue_spec = profile
+                        .output_queues
+                        .get(branch_usize)
+                        .copied()
+                        .unwrap_or(super::queues::QueueSpec::Unbounded);
+                    let ordering = effective_orderings
+                        .get(branch_usize)
+                        .copied()
+                        .unwrap_or(super::reorder::BranchOrdering::None);
+                    let _ = writeln!(
+                        s,
+                        "      .{branch_usize}: {queue_spec:?} {ordering:?} → {consumer_name}",
+                    );
+                }
+            }
+        }
+        s
+    }
+
+    /// Run the pipeline to completion.
+    ///
+    /// Spawns `config.threads` worker threads, runs each step's `try_run`
+    /// until every step has reported `Finished`, joins on completion, and
+    /// returns `Ok(())` on clean exit or an `Err(PipelineError)` if any step
+    /// returned `Err` or the caller cancelled via the `CancelHandle`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PipelineError::NotEnoughThreads` if the chain has more
+    /// `Exclusive` steps than `config.threads`. Returns `PipelineError::Io`
+    /// if any step's `try_run` returned `Err`.
+    /// Returns `PipelineError::Cancelled` if `cancel_handle().cancel()` was
+    /// called during the run.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a worker thread panics — the panic is propagated via
+    /// `JoinHandle::join`. Worker panics indicate a framework or step bug
+    /// (e.g., a contract violation that triggered a `debug_assert!`).
+    #[allow(clippy::too_many_lines)]
+    pub fn run(self, config: PipelineConfig) -> Result<(), super::signal::PipelineError> {
+        use std::thread;
+
+        use super::runtime::{
+            StepDrainCounter, WorkerCore, assign_exclusive_owners, assign_sticky_owners,
+            build_chain_contexts, build_worker_storage, extract_detached_steps,
+            run_detached_driver, run_fused_single_thread, run_worker_loop,
+            should_fuse_single_thread,
+        };
+        use super::step::{DetachedGroup, StepKind};
+        use super::topology::StepIdx;
+
+        let Self { mut steps, graph, signal } = self;
+        let n_threads = config.threads;
+        let stats_arc = config.stats;
+        let deadlock_timeout_secs = config.deadlock_timeout_secs;
+        let scheduler = Arc::clone(&config.scheduler);
+        assert!(n_threads > 0, "PipelineConfig::threads must be > 0");
+        if let Some(stats) = stats_arc.as_ref() {
+            assert_eq!(
+                stats.n_steps(),
+                steps.len(),
+                "PipelineConfig::stats was sized for {} steps but pipeline has {}; \
+                 obtain the stats handle from `Pipeline::stats()` after `build()`",
+                stats.n_steps(),
+                steps.len()
+            );
+        }
+        // Always-on liveness signal for the deadlock monitor. Sized for the
+        // worker pool plus a slot per possible driver thread, so every bumper
+        // gets its own cache line (see `crate::liveness`). Deliberately NOT
+        // gated on `stats`: the monitor must be armable without paying for
+        // per-dispatch timing, which is exactly what kept it disarmed before.
+        let liveness = Arc::new(LivenessCounter::new(n_threads + steps.len()));
+
+        // 0. Fused single-thread fast path (issue #330). A single-source
+        // source→sink chain at one worker is driven inline over direct buffers,
+        // skipping the scheduler's round-robin poll / contention / reorder
+        // overhead (~2/3 of `try_run` calls at t=1 are otherwise wasted).
+        // Fan-out is allowed (e.g. the `--rejects` kept/rejects split); only
+        // two-input `Step2` merges (zipper, align) and `--threads ≥ 2` fall
+        // through to the scheduled worker pool below. The deadlock monitor and
+        // queue rebalancer are not spawned: a single-worker inline drive cannot
+        // deadlock, and its edges are driven producer-then-consumer in one pass,
+        // so there is no cross-worker imbalance to rebalance. Those edges DO
+        // carry each step's profiled byte bound, so `queue_memory_total` is
+        // handed to `run_fused_single_thread` and applied to them there — the
+        // fused contexts are built inside that call, not here.
+        // Instrumentation forces the scheduled path (see `should_fuse_single_thread`):
+        // the fused path has no per-edge metrics / occupancy sampler / verdict.
+        if should_fuse_single_thread(n_threads, config.instrumentation, &steps, &graph) {
+            log::debug!(
+                "Using fused single-thread pipeline ({} steps, direct buffers)",
+                steps.len()
+            );
+            let result = run_fused_single_thread(
+                steps,
+                &graph,
+                &signal,
+                stats_arc.as_ref(),
+                config.queue_memory_total,
+                deadlock_timeout_secs,
+            );
+            // Same end-of-run stats snapshot the scheduled path emits, so
+            // `--pipeline-stats` shows the fused chain's per-step counters.
+            if let Some(stats) = stats_arc.as_ref() {
+                let snapshot = stats.snapshot();
+                log::info!("Pipeline end-of-run stats:");
+                for line in format!("{snapshot}").lines() {
+                    log::info!("{line}");
+                }
+            }
+            return result;
+        }
+
+        // 1. Assign Exclusive owners; bail if too many.
+        let owners = assign_exclusive_owners(&steps, n_threads)?;
+
+        // 1a. Compute per-worker sticky-driven step (Exclusive sticky union
+        // with Serial+sticky+Affinity targeting). Indexed by worker id.
+        let sticky_owners = assign_sticky_owners(&steps, &owners, n_threads);
+
+        // 2. Build per-step contexts (input + output handles).
+        let contexts = Arc::new(build_chain_contexts(&steps, &graph, config.instrumentation));
+
+        // 2-pre-monitor invariant: if the deadlock monitor will be armed, every
+        // output transport must be ByteBounded so `in_flight_bytes` can see a
+        // wedge on it. A CountBounded/Unbounded edge is invisible to the probe
+        // and would silently disable fail-fast on that edge. Checked here in
+        // every build (not debug-only — it returns a real `PipelineError`) while
+        // `steps` is still alive, before it is consumed by
+        // `build_worker_storage` below. Test chains use CountBounded/Unbounded
+        // but do not arm the monitor, so this only fires for a fail-fast run.
+        //
+        // Keyed on the timeout ALONE, deliberately: liveness now comes from
+        // `LivenessCounter`, so the monitor arms on a non-zero timeout whether
+        // or not a stats handle is attached. Gating this on `stats.is_some()`
+        // too — as it was when liveness was read out of `PipelineStats` — would
+        // let an armed, stats-less run start on a blind edge, where
+        // `in_flight_bytes` reports 0, `classify_stall` reads that as
+        // `Starving`, and the stall clock resets on every poll, so the wedge
+        // never reaches the fatal timeout. The arming condition here must track
+        // the one at the monitor spawn below.
+        if deadlock_timeout_secs > 0 {
+            ensure_monitor_visible_transports(&steps, &graph)?;
+        }
+
+        // 2a. If a total queue-memory budget was supplied, evenly
+        // redistribute it across all byte-bounded queues now (before
+        // workers start) so the initial state matches the user's
+        // budget instead of the per-step defaults baked into each
+        // step's `QueueSpec::ByteBounded { limit_bytes }`. Floor at
+        // 1 MiB per queue to prevent zero-budget queues that would
+        // always reject pushes.
+        if let Some(total) = config.queue_memory_total {
+            apply_initial_queue_budget(&contexts.bounded_queues, total);
+        }
+
+        // 3. Per-step drain counter — init N for Parallel, 1 otherwise.
+        let drain_counters: Vec<Arc<StepDrainCounter>> = steps
+            .iter()
+            .map(|step| {
+                let initial = match step.profile().kind {
+                    StepKind::Parallel => n_threads,
+                    // `Detached` runs on a single dedicated thread, so (like
+                    // `Serial`/`Exclusive`) exactly one finisher closes its
+                    // output edge.
+                    StepKind::Serial | StepKind::Exclusive | StepKind::Detached => 1,
+                };
+                StepDrainCounter::new(initial)
+            })
+            .collect();
+
+        // 3a. Extract `Detached` steps' real instances for their dedicated
+        // threads, leaving same-position placeholders so `build_worker_storage`
+        // (which Skips Detached on every worker) and the `step_idx`-aligned
+        // `ChainContexts` stay correct. The contexts were already built from
+        // `&steps` above, so each extracted step's input/output handles live in
+        // `contexts[step_idx]`. Done before `build_worker_storage` consumes
+        // `steps`. Empty for every non-sort chain (nothing declares Detached).
+        let detached_steps = extract_detached_steps(&mut steps);
+
+        // 4. Build per-worker step storage (consumes `steps`).
+        let mut worker_entries = build_worker_storage(steps, &owners, n_threads);
+
+        let signal_arc = Arc::clone(&signal);
+
+        // 4a. Optional deadlock-detection monitor. Spawns a watcher
+        // thread that periodically samples the stats snapshot; if no
+        // step's `progress + finished` counter has advanced for
+        // `deadlock_timeout_secs` seconds, it logs the snapshot at
+        // `warn` level so the user has a starting point. Polls every
+        // `max(1, deadlock_timeout_secs / 4)` seconds.
+        let (monitor_stop, monitor_handle) = match deadlock_timeout_secs {
+            n if n > 0 => {
+                let stop = Arc::new(StopSignal::default());
+                let stop_clone = Arc::clone(&stop);
+                let liveness_monitor = Arc::clone(&liveness);
+                let stats_for_monitor = stats_arc.as_ref().map(Arc::clone);
+                let contexts_clone = Arc::clone(&contexts);
+                let signal_clone = Arc::clone(&signal);
+                let warn_timeout = std::time::Duration::from_secs(deadlock_timeout_secs);
+                let fatal_timeout = std::time::Duration::from_secs(
+                    deadlock_timeout_secs.saturating_mul(DEADLOCK_FATAL_MULTIPLE),
+                );
+                let poll_interval =
+                    std::time::Duration::from_secs(deadlock_timeout_secs.max(4) / 4);
+                let handle = thread::Builder::new()
+                    .name("fgumi-deadlock-monitor".to_string())
+                    .spawn(move || {
+                        run_deadlock_monitor(
+                            &stop_clone,
+                            &liveness_monitor,
+                            stats_for_monitor.as_ref(),
+                            &contexts_clone,
+                            &signal_clone,
+                            warn_timeout,
+                            fatal_timeout,
+                            poll_interval,
+                        );
+                    })
+                    .expect("failed to spawn deadlock monitor thread");
+                (Some(stop), Some(handle))
+            }
+            _ => (None, None),
+        };
+
+        // 4b. Optional queue-memory rebalancer. Spawns a watcher
+        // thread that periodically samples each registered queue's
+        // `current_bytes / limit_bytes` ratio and shifts budget
+        // toward consistently-full queues at the expense of
+        // consistently-empty ones. Total budget is preserved.
+        let (rebalancer_stop, rebalancer_handle) =
+            if config.queue_memory_total.is_some() && !contexts.bounded_queues.is_empty() {
+                let stop = Arc::new(StopSignal::default());
+                let stop_clone = Arc::clone(&stop);
+                // Capture handles into a contiguous Vec — the monitor
+                // doesn't need step indices/names beyond debug logging.
+                let handles: Vec<Arc<dyn super::queues::BoundedQueueHandle>> =
+                    contexts.bounded_queues.iter().map(|rq| Arc::clone(&rq.handle)).collect();
+                let names: Vec<&'static str> =
+                    contexts.bounded_queues.iter().map(|rq| rq.producer_step_name).collect();
+                let handle = thread::Builder::new()
+                    .name("fgumi-queue-rebalancer".to_string())
+                    .spawn(move || {
+                        run_queue_rebalancer(&stop_clone, &handles, &names);
+                    })
+                    .expect("failed to spawn queue rebalancer thread");
+                (Some(stop), Some(handle))
+            } else {
+                (None, None)
+            };
+
+        // 4c. Optional occupancy sampler (`--pipeline-trace`). Polls each
+        // byte-bounded edge's depth into its `EdgeMetrics` histogram on a fixed
+        // cadence. Runs whenever instrumentation samples AND there are edges to
+        // sample (`contexts.edges` is empty at level `Off` and on the fused
+        // single-thread fast path, so this stays inert there). Read-only over
+        // the live queues — never perturbs the worker hot path.
+        let (sampler_stop, sampler_handle) =
+            if config.instrumentation.samples() && !contexts.edges.is_empty() {
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stop_clone = Arc::clone(&stop);
+                let contexts_clone = Arc::clone(&contexts);
+                // Timeline TSV path only when the level requests it.
+                let trace_path = if config.instrumentation.timeline() {
+                    Some(
+                        config
+                            .trace_path
+                            .clone()
+                            .unwrap_or_else(|| std::path::PathBuf::from("pipeline-trace.tsv")),
+                    )
+                } else {
+                    None
+                };
+                let handle = thread::Builder::new()
+                    .name("fgumi-occupancy-sampler".to_string())
+                    .spawn(move || {
+                        crate::runtime::sampler::run_occupancy_sampler(
+                            &stop_clone,
+                            &contexts_clone.edges,
+                            crate::runtime::sampler::DEFAULT_SAMPLE_INTERVAL,
+                            trace_path,
+                        );
+                    })
+                    .expect("failed to spawn occupancy sampler thread");
+                (Some(stop), Some(handle))
+            } else {
+                (None, None)
+            };
+
+        // 4d. Spawn one dedicated OS thread per `Detached` driver GROUP, in chain
+        // order, BEFORE the workers — same lifecycle slot as the monitor /
+        // rebalancer / sampler. Each thread drives its group with the SAME
+        // `run_worker_loop` the pool uses (via `run_detached_driver`), off the
+        // work-stealing pool, so a Detached step never consumes a pool worker
+        // slot (the "N + 2" threading). A group with one step is the legacy
+        // one-thread-per-detached-step case (`DetachedGroup::PerStep`); a
+        // `Shared` group co-locates several steps on one driver thread. Joined
+        // after the workers (step 6d). Empty for every non-sort chain, so this
+        // is a no-op there.
+        let detached_handles: Vec<thread::JoinHandle<()>> = detached_steps
+            .into_iter()
+            .map(|group| {
+                let contexts_clone = Arc::clone(&contexts);
+                let signal_clone = Arc::clone(&signal_arc);
+                let drain_counters_clone: Vec<Arc<StepDrainCounter>> =
+                    drain_counters.iter().map(Arc::clone).collect();
+                let stats_clone = stats_arc.as_ref().map(Arc::clone);
+                let liveness_clone = Arc::clone(&liveness);
+                let thread_name = match group.label() {
+                    DetachedGroup::Shared(label) => format!("fgumi-driver-{label}"),
+                    DetachedGroup::PerStep => {
+                        format!("fgumi-detached-{}", group.primary_name())
+                    }
+                };
+                thread::Builder::new()
+                    .name(thread_name)
+                    .spawn(move || {
+                        // Catch a driver-thread panic so we can signal
+                        // cancellation before unwinding — a wedged pool worker
+                        // parked on this group's (now-dead) edge only exits on
+                        // `is_done()`. Re-raise after signalling so the join in
+                        // step 6d still collects the payload.
+                        if let Err(panic) =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                run_detached_driver(
+                                    group,
+                                    &contexts_clone,
+                                    &drain_counters_clone,
+                                    &signal_clone,
+                                    stats_clone.as_ref(),
+                                    &liveness_clone,
+                                );
+                            }))
+                        {
+                            signal_clone.cancel();
+                            std::panic::resume_unwind(panic);
+                        }
+                    })
+                    .expect("failed to spawn detached driver thread")
+            })
+            .collect();
+
+        // Holds the first worker panic payload; re-raised after helper threads
+        // are cleaned up so monitor/rebalancer shutdown always executes.
+        let mut worker_panic: Option<Box<dyn std::any::Any + Send>> = None;
+
+        if n_threads == 1 {
+            // Single-threaded fast path: run the worker loop directly on
+            // the caller's thread instead of spawning + joining a fresh
+            // OS thread. The framework machinery (`build_worker_storage`,
+            // drain counters, stats) is identical to the multi-threaded
+            // path — only the spawn/join is skipped.
+            //
+            // Savings: thread-spawn-and-join (a few ms one-time on Apple
+            // Silicon / Linux), and the caller's thread name / TLS is
+            // preserved (matters for log correlation in some tools).
+            //
+            // Per-call cost gap vs the legacy single-threaded path is
+            // dominated by the framework's per-record book-keeping
+            // (queue byte tracking, ordinal allocation, drain checks),
+            // not the spawn — see commit message benchmarks.
+            let entries = worker_entries
+                .pop()
+                .expect("build_worker_storage with n_threads=1 returns one entry vec");
+            debug_assert!(worker_entries.is_empty());
+            let exclusive_owner = owners
+                .iter()
+                .enumerate()
+                .find_map(|(idx, &own)| if own == Some(0) { Some(StepIdx(idx)) } else { None });
+            let sticky_owner = sticky_owners[0];
+            let mut worker = WorkerCore::new(0, exclusive_owner, sticky_owner);
+            let mut entries_local = entries;
+            // Defer a panic on the single-threaded fast path the same way the
+            // multi-worker join loop does: capture the payload, signal
+            // cancellation, and let the common monitor/rebalancer shutdown run
+            // before re-raising at step 7. Without this, a worker-loop panic
+            // unwinds straight through the caller and leaks the helper threads.
+            // `AssertUnwindSafe` is sound: after a panic we never touch `worker`
+            // or `entries_local` again — the run is shutting down.
+            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_worker_loop(
+                    &mut worker,
+                    &mut entries_local,
+                    &contexts,
+                    &drain_counters,
+                    &signal_arc,
+                    stats_arc.as_ref(),
+                    &liveness,
+                    scheduler.as_ref(),
+                );
+            })) {
+                signal_arc.cancel();
+                worker_panic = Some(panic);
+            }
+        } else {
+            // 5. Spawn worker threads.
+            let mut handles = Vec::with_capacity(n_threads);
+            for (worker_id, entries) in worker_entries.into_iter().enumerate() {
+                let exclusive_owner = owners.iter().enumerate().find_map(|(idx, &own)| {
+                    if own == Some(worker_id) { Some(StepIdx(idx)) } else { None }
+                });
+                let sticky_owner = sticky_owners[worker_id];
+
+                let contexts_clone = Arc::clone(&contexts);
+                let signal_clone = Arc::clone(&signal_arc);
+                let drain_counters_clone: Vec<Arc<StepDrainCounter>> =
+                    drain_counters.iter().map(Arc::clone).collect();
+                let stats_clone = stats_arc.as_ref().map(Arc::clone);
+                let liveness_clone = Arc::clone(&liveness);
+                let scheduler_clone = Arc::clone(&scheduler);
+
+                let handle = thread::Builder::new()
+                    .name(format!("fgumi-worker-{worker_id}"))
+                    .spawn(move || {
+                        let mut worker = WorkerCore::new(worker_id, exclusive_owner, sticky_owner);
+                        let mut entries_local = entries;
+                        // Catch a worker-loop panic so we can signal cancellation
+                        // *before* unwinding. A peer parked in its retry loop on a
+                        // full/empty queue only exits when it observes
+                        // `signal.is_done()`; without an early `cancel()` here, the
+                        // join loop below could block forever on an earlier,
+                        // now-wedged worker and never reach this thread's panic.
+                        // We re-raise after signalling so the join still collects
+                        // the payload (preserving the deferred re-raise at step 7).
+                        // `AssertUnwindSafe` is sound: on panic the run is tearing
+                        // down and neither local is used again.
+                        if let Err(panic) =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                run_worker_loop(
+                                    &mut worker,
+                                    &mut entries_local,
+                                    &contexts_clone,
+                                    &drain_counters_clone,
+                                    &signal_clone,
+                                    stats_clone.as_ref(),
+                                    &liveness_clone,
+                                    scheduler_clone.as_ref(),
+                                );
+                            }))
+                        {
+                            signal_clone.cancel();
+                            std::panic::resume_unwind(panic);
+                        }
+                    })
+                    .expect("failed to spawn worker thread");
+                handles.push(handle);
+            }
+
+            // 6. Join workers. Capture the first worker panic payload so cleanup
+            // can proceed; re-raise after monitor/rebalancer threads are stopped.
+            for h in handles {
+                if let Err(panic) = h.join()
+                    && worker_panic.is_none()
+                {
+                    worker_panic = Some(panic);
+                }
+            }
+        }
+
+        // 6d. Join the Detached step threads (after the workers). The sort
+        // writer (Detached, consuming the pool's Compress output) and merge
+        // (Detached, producing to the pool's Serialize input) finish their final
+        // flush only after their pool peers have drained, so joining them here —
+        // after the worker join, before the monitor stop — captures the full
+        // chain completion (and any Detached-thread panic) in the same deferred
+        // re-raise path the workers use. A no-op when no step is Detached.
+        for h in detached_handles {
+            if let Err(panic) = h.join()
+                && worker_panic.is_none()
+            {
+                worker_panic = Some(panic);
+            }
+        }
+
+        // 6a. Stop and join the deadlock monitor (if spawned). We
+        // signal stop *after* workers join so the monitor sees the
+        // final stats state and doesn't fire spurious warnings during
+        // normal pipeline shutdown (where steps stop progressing
+        // because they're done, not stuck).
+        if let Some(stop) = monitor_stop {
+            stop.stop();
+        }
+        if let Some(handle) = monitor_handle {
+            let _ = handle.join();
+        }
+
+        // 6b. Stop and join the queue rebalancer (if spawned).
+        if let Some(stop) = rebalancer_stop {
+            stop.stop();
+        }
+        if let Some(handle) = rebalancer_handle {
+            let _ = handle.join();
+        }
+
+        if let Some(stop) = sampler_stop {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(handle) = sampler_handle {
+            let _ = handle.join();
+        }
+
+        // 6c. End-of-run stats snapshot — emitted at info-level so
+        // bench profiling can see which step accumulated the most
+        // wall-clock time inside `try_run`. Only logged when stats
+        // were enabled (`with_stats(...)` on the config); cheap
+        // either way.
+        if let Some(stats) = stats_arc.as_ref() {
+            // When instrumentation is on, fold the per-edge table + bottleneck
+            // verdict into the snapshot (the edges live in `contexts`, only
+            // reachable here inside `run`); otherwise the edge-less snapshot.
+            let snapshot = if config.instrumentation.is_on() {
+                stats.snapshot_with_edges(&contexts.edges, stats.elapsed_ns())
+            } else {
+                stats.snapshot()
+            };
+            log::info!("Pipeline end-of-run stats:");
+            for line in format!("{snapshot}").lines() {
+                log::info!("{line}");
+            }
+        }
+
+        // 7. Re-raise worker panics after helper threads are cleaned up so
+        // monitor/rebalancer shutdown code always executes.
+        if let Some(panic) = worker_panic {
+            std::panic::resume_unwind(panic);
+        }
+
+        // 8. Surface error or cancellation. PipelineError isn't Clone
+        // (io::Error isn't Clone); `to_result` reconstructs the recorded
+        // outcome and, for an external cancel whose payload isn't yet visible
+        // to this thread, synthesizes `Cancelled` from the terminal state.
+        let _ = graph;
+        signal.to_result()
+    }
+}
+
+/// Default multiple of the warn window (`--deadlock-timeout`) after which a
+/// persistent stall *with work still in flight* is treated as a fatal wedge.
+/// Diverges from the legacy single-window kill: a single huge dispatch
+/// (busy-locus group, large sort merge) can legitimately flatten progress for
+/// many seconds, so we only fail after the stall persists well past the warn
+/// window. A real deadlock hangs forever, so waiting longer to be sure is free.
+/// Recommended stall patience for the deadlock monitor, in seconds, for callers
+/// arming it via [`PipelineConfig::with_deadlock_timeout`].
+///
+/// Matches the fused path's `DEFAULT_STALL_BUDGET` so both runtimes bound a
+/// wedge alike, and for the same reason: this catches a PERMANENT wedge, not a
+/// slow source, and the costs are asymmetric — err long.
+///
+/// Not yet the `PipelineConfig::default()` value; see the note there.
+pub const DEFAULT_DEADLOCK_TIMEOUT_SECS: u64 = 60;
+
+const DEADLOCK_FATAL_MULTIPLE: u64 = 6;
+
+/// Total bytes currently held across the **byte-bounded** transport queues and
+/// their reorder overflow stashes. Non-zero means work is stuck on a byte-bounded
+/// edge; zero means those edges are idle (e.g. waiting on a slow upstream pipe).
+/// This is the signal that distinguishes a real wedge from upstream starvation
+/// on byte-bounded edges.
+///
+/// LIMITATION: only `ByteBounded` branches register a queue handle (see
+/// `build_chain_contexts_inner`), so a `CountBounded`/`Unbounded` transport — and
+/// any reorder stash on such a branch — would not contribute here, making the
+/// monitor blind to a wedge living entirely on such an edge.
+///
+/// This is safe because **no production pipeline edge uses
+/// `CountBounded`/`Unbounded`**: every production step profile declares
+/// `QueueSpec::ByteBounded`, so the probe covers every production transport.
+/// (The sort spill→merge path is fully byte-bounded too — its deadlock-free
+/// backpressure is the internal `SortMergeSlot` slot table, not a pipeline
+/// `CountBounded` edge.) [`ensure_monitor_visible_transports`] enforces this
+/// invariant in **every** build (it returns
+/// [`crate::signal::PipelineError::MonitorBlindTransport`], not a debug assertion) whenever the
+/// monitor is armed, so a future step that declares a monitor-blind transport on
+/// a fail-fast pipeline fails at startup rather than silently losing the wedge
+/// verdict. Extending the probe to count-based queues for full defense-in-depth
+/// is tracked separately.
+///
+/// SECOND LIMITATION: byte accounting is `T::heap_size()`-only —
+/// `ByteBoundedQueue` never counts `size_of::<T>()` — so a `ByteBounded` edge
+/// holding items whose `heap_size()` is 0 also reports zero here, however many
+/// are queued. A wedge stranding only such items therefore classifies as
+/// [`StallVerdict::Starving`], which resets the stall clock on every poll, so
+/// `deadlock_timeout_secs` can never fail it. Most production item types
+/// (record batches, BGZF blocks) carry real heap payloads, but at least one does
+/// not: `InflatedBlock` (the arena-ingest completion token, whose payload lives
+/// in the shared arena rather than on its own heap) reports `heap_size() == 0` by
+/// design, so a `ByteBounded` edge carrying only inflated-block tokens is
+/// invisible to this probe. That edge is **not** wired into a monitored
+/// production chain today (the arena front is exercised only by its own
+/// tests/benches). Before it is, close the gap at the source — give
+/// `InflatedBlock` a `size_of::<Self>()` base (as the sort control events already
+/// do) — or have the monitor consult queue *occupancy*, not just bytes, on the
+/// starvation branch. Until then this remains a latent, unreachable gap.
+fn in_flight_bytes(contexts: &crate::runtime::contexts::ChainContexts) -> u64 {
+    contexts
+        .bounded_queues
+        .iter()
+        .map(|rq| {
+            rq.handle.current_bytes()
+                + rq.reorder_cap.as_ref().map_or(0, |r| r.current_buffer_bytes())
+        })
+        .sum()
+}
+
+/// Return the first `(step_name, QueueSpec)` whose output transport is invisible
+/// to the deadlock monitor's [`in_flight_bytes`] probe — i.e. a `CountBounded`
+/// or `Unbounded` branch, which registers no byte-probe handle. `None` means
+/// every output transport is monitor-visible (`ByteBounded`).
+///
+/// Used by [`ensure_monitor_visible_transports`] to pin the "no production edge
+/// is monitor-blind" invariant the [`in_flight_bytes`] doc relies on. Iterates
+/// every branch the graph declares for each step (`0..branch_count`) rather than
+/// just the explicit `output_queues` entries: a step may declare fewer specs than
+/// it has branches, and `dag()`/context-building resolve those missing branches
+/// to `QueueSpec::Unbounded`. Using the same `unwrap_or(Unbounded)` fallback here
+/// keeps the guard from overlooking an implicit (and therefore monitor-blind)
+/// Unbounded branch.
+fn first_monitor_blind_transport(
+    steps: &[Box<dyn super::erased::ErasedStep>],
+    graph: &super::topology::ChainGraph,
+) -> Option<(&'static str, super::queues::QueueSpec)> {
+    use super::queues::QueueSpec;
+    for (step_idx, step) in steps.iter().enumerate() {
+        let profile = step.profile();
+        for branch in 0..graph.branch_count(super::topology::StepIdx(step_idx)) {
+            let spec = profile.output_queues.get(branch).copied().unwrap_or(QueueSpec::Unbounded);
+            match spec {
+                QueueSpec::ByteBounded { .. } => {}
+                QueueSpec::CountBounded { .. } | QueueSpec::Unbounded => {
+                    return Some((profile.name, spec));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Invariant check (run only when the deadlock monitor is armed): every
+/// production output transport must be `ByteBounded` so the [`in_flight_bytes`]
+/// probe can see a wedge on it. A `CountBounded`/`Unbounded` edge would be
+/// invisible to the monitor, silently disabling fail-fast on that edge — exactly
+/// the blind spot this guard exists to catch. The framework still permits
+/// `CountBounded`/`Unbounded` for `#[cfg(test)]` chains (which do not arm the
+/// monitor), so this only fires for a real fail-fast pipeline.
+///
+/// Returns a [`crate::signal::PipelineError::MonitorBlindTransport`] (rather than panicking or
+/// being a debug-only check) so the guard runs in release builds — where the
+/// blind spot actually matters — yet a misconfigured chain fails gracefully at
+/// startup, consistent with the other build/run-time validations (e.g.
+/// [`crate::signal::PipelineError::NotEnoughThreads`]) rather than crashing the process.
+fn ensure_monitor_visible_transports(
+    steps: &[Box<dyn super::erased::ErasedStep>],
+    graph: &super::topology::ChainGraph,
+) -> Result<(), super::signal::PipelineError> {
+    if let Some((name, spec)) = first_monitor_blind_transport(steps, graph) {
+        return Err(super::signal::PipelineError::MonitorBlindTransport {
+            step: name,
+            spec: format!("{spec:?}"),
+        });
+    }
+    Ok(())
+}
+
+/// Background deadlock monitor body. Polls `stats` every `poll_interval`,
+/// tracking the cumulative `progress + finished` counter across all steps.
+///
+/// On a stall (no advance), it consults [`in_flight_bytes`] to tell a real
+/// wedge from upstream starvation (mirrors legacy `check_deadlock_and_restore`):
+///   - idle with nothing in flight → starvation, reset the clock, keep watching;
+///   - stuck work past `warn_timeout` → `warn` snapshot, once per warn window;
+///   - stuck work past `fatal_timeout` → record [`crate::signal::PipelineError::TimedOut`] and
+///     `cancel()`, so workers observe `is_done()` and the run fails fast instead
+///     of hanging forever.
+///
+/// Exits when `stop` is set (workers joined) or the pipeline is already done.
+#[allow(clippy::too_many_arguments)] // one monitor's worth of shared state; a struct would only rename it
+fn run_deadlock_monitor(
+    stop: &Arc<StopSignal>,
+    liveness: &Arc<LivenessCounter>,
+    stats: Option<&Arc<PipelineStats>>,
+    contexts: &Arc<crate::runtime::contexts::ChainContexts>,
+    signal: &Arc<PipelineSignal>,
+    warn_timeout: std::time::Duration,
+    fatal_timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) {
+    let mut mon_state = StallMonitorState {
+        last_total: liveness.total(),
+        stall_start: std::time::Instant::now(),
+        last_warn: None,
+    };
+    while !stop.is_stopped() {
+        sleep_until_stop(stop, poll_interval);
+        if stop.is_stopped() || signal.is_done() {
+            break;
+        }
+        let now = std::time::Instant::now();
+        let now_total = liveness.total();
+        let progressed = now_total != mon_state.last_total;
+        let stall_secs = now.duration_since(mon_state.stall_start).as_secs();
+        let stuck = in_flight_bytes(contexts);
+        let verdict = classify_stall(
+            progressed,
+            stall_secs,
+            warn_timeout.as_secs(),
+            fatal_timeout.as_secs(),
+            stuck,
+        );
+        if apply_stall_verdict(
+            verdict,
+            now,
+            now_total,
+            stall_secs,
+            stuck,
+            warn_timeout,
+            stats.map(std::convert::AsRef::as_ref),
+            signal,
+            &mut mon_state,
+        ) {
+            break;
+        }
+    }
+}
+
+/// Rolling state the deadlock monitor carries across poll iterations.
+struct StallMonitorState {
+    last_total: u64,
+    stall_start: std::time::Instant,
+    last_warn: Option<std::time::Instant>,
+}
+
+/// React to one classified [`StallVerdict`], mutating the rolling monitor
+/// `mon_state` and performing the verdict's side effect (a warn snapshot, or
+/// recording a fatal [`crate::signal::PipelineError::TimedOut`] + `cancel`). Extracted from
+/// [`run_deadlock_monitor`]'s poll loop so each per-verdict action is
+/// unit-testable without spawning a thread or waiting on wall-clock time —
+/// mirroring the pure `classify_stall` / `in_flight_bytes` split. Returns
+/// `true` when a fatal wedge was recorded and the monitor should stop.
+#[allow(clippy::too_many_arguments)]
+fn apply_stall_verdict(
+    verdict: StallVerdict,
+    now: std::time::Instant,
+    now_total: u64,
+    stall_secs: u64,
+    stuck: u64,
+    warn_timeout: std::time::Duration,
+    // Optional: the monitor no longer requires instrumentation to run, so an
+    // uninstrumented run still reports the stall — just without the per-step
+    // snapshot. Losing the snapshot is far better than losing the detection,
+    // which is what requiring `stats` used to cost.
+    stats: Option<&PipelineStats>,
+    signal: &PipelineSignal,
+    mon_state: &mut StallMonitorState,
+) -> bool {
+    use super::signal::PipelineError;
+    match verdict {
+        StallVerdict::Progressing => {
+            mon_state.last_total = now_total;
+            mon_state.stall_start = now;
+            mon_state.last_warn = None;
+        }
+        StallVerdict::Starving => {
+            // Idle, waiting on a slow upstream — not a deadlock. Reset the
+            // stall clock so an idle gap never accumulates toward a fatal.
+            mon_state.stall_start = now;
+            mon_state.last_warn = None;
+        }
+        StallVerdict::Watching => {}
+        StallVerdict::Stalled => {
+            // Warn at most once per warn window: a long stall emits periodic
+            // diagnostics without spamming every poll.
+            if mon_state.last_warn.is_none_or(|w| now.duration_since(w) >= warn_timeout) {
+                log::warn!(
+                    "Pipeline stall: no progress for {stall_secs}s with {stuck} bytes \
+                     still in flight. Snapshot follows."
+                );
+                if let Some(stats) = stats {
+                    let snapshot = stats.snapshot();
+                    for line in format!("{snapshot}").lines() {
+                        log::warn!("{line}");
+                    }
+                } else {
+                    log::warn!(
+                        "(no per-step snapshot: PipelineConfig::stats is not set; \
+                         attach a stats handle to see which step is stuck)"
+                    );
+                }
+                mon_state.last_warn = Some(now);
+            }
+        }
+        StallVerdict::Wedged => {
+            log::error!(
+                "Pipeline deadlock: no progress for {stall_secs}s with {stuck} bytes \
+                 stuck in flight; failing the pipeline. Snapshot follows."
+            );
+            if let Some(stats) = stats {
+                let snapshot = stats.snapshot();
+                for line in format!("{snapshot}").lines() {
+                    log::error!("{line}");
+                }
+            } else {
+                log::error!(
+                    "(no per-step snapshot: PipelineConfig::stats is not set; \
+                     attach a stats handle to see which step is stuck)"
+                );
+            }
+            signal.record_error(PipelineError::TimedOut { stalled_secs: stall_secs });
+            signal.cancel();
+            return true;
+        }
+    }
+    false
+}
+
+/// Sum of `progress_count + finished_count` across all steps. The
+/// monitor uses this as a single scalar progress watermark; a change
+/// means *some* step is making forward progress.
+/// Sleep up to `dur`, returning early as soon as `stop` is set. Polls the
+/// flag in short slices so a background helper thread (deadlock monitor,
+/// queue rebalancer) exits within tens of milliseconds at teardown instead
+/// of blocking the main thread's `join()` for a full poll interval after
+/// the pipeline has already finished. A plain `thread::sleep(poll_interval)`
+/// here adds a fixed dead-time tail (up to `poll_interval`) to every run —
+/// negligible on long jobs but a large *relative* regression on short ones
+/// (e.g. FASTQ extract), since the worker pool is already idle and waiting.
+fn sleep_until_stop(stop: &StopSignal, dur: std::time::Duration) {
+    // A condvar, not a polled sleep. The previous shape slept in 25ms slices and
+    // re-checked a flag, so teardown waited up to a full slice for the monitor to
+    // notice — dead time on the critical path of *every* run, since `Pipeline::run`
+    // joins this thread before returning.
+    //
+    // That is not a rounding error at the short end. With the monitor armed by
+    // default, a 27ms pipeline measured +80% wall on the dispatch benchmark, and
+    // the excess was almost exactly one slice. Waking the sleeper directly takes
+    // that to zero, which is what makes arming the monitor by default affordable.
+    let (lock, cvar) = (&stop.stopped, &stop.waker);
+    let mut stopped = lock.lock().expect("stop mutex not poisoned");
+    if *stopped {
+        return;
+    }
+    // `Instant::now() + dur` panics when the deadline is not representable (a
+    // caller could pass an enormous `deadlock_timeout_secs`). `Pipeline::run`
+    // discards this thread's join error, so a panic here would silently disarm
+    // the monitor while the run reports success. Guard with `checked_add`: an
+    // unrepresentable deadline means "effectively never", so wait untimed until
+    // `stop()` wakes us — the only teardown path that matters.
+    let Some(deadline) = std::time::Instant::now().checked_add(dur) else {
+        while !*stopped {
+            stopped = cvar.wait(stopped).expect("stop condvar not poisoned");
+        }
+        return;
+    };
+    // `wait_timeout` can wake spuriously; the loop re-checks both the flag and
+    // the deadline, so a spurious wake just resumes waiting for the remainder.
+    while !*stopped {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return;
+        };
+        let (guard, _) = cvar.wait_timeout(stopped, remaining).expect("stop condvar not poisoned");
+        stopped = guard;
+    }
+}
+
+/// Stop flag for a background helper thread, with a condvar so a waiting thread
+/// wakes the instant it is set rather than on its next poll tick.
+#[derive(Debug, Default)]
+pub(crate) struct StopSignal {
+    stopped: std::sync::Mutex<bool>,
+    waker: std::sync::Condvar,
+}
+
+impl StopSignal {
+    /// Whether `stop` has been called.
+    pub(crate) fn is_stopped(&self) -> bool {
+        *self.stopped.lock().expect("stop mutex not poisoned")
+    }
+
+    /// Set the flag and wake the sleeper immediately.
+    pub(crate) fn stop(&self) {
+        *self.stopped.lock().expect("stop mutex not poisoned") = true;
+        self.waker.notify_all();
+    }
+}
+
+/// What the deadlock monitor should do after one poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallVerdict {
+    /// Global progress advanced since the last poll — reset and keep watching.
+    Progressing,
+    /// No progress, but nothing is in flight: the pipeline is idle waiting on
+    /// a slow upstream (e.g. a stdin pipe), not deadlocked. Reset the stall
+    /// clock and keep watching. Mirrors legacy `check_deadlock_and_restore`'s
+    /// starvation guard (an empty pipeline is never a deadlock).
+    Starving,
+    /// No progress with work stuck, but below the warn threshold — no-op.
+    Watching,
+    /// No progress with work stuck past the warn (but below the fatal)
+    /// threshold — log a diagnostic snapshot and keep watching.
+    Stalled,
+    /// No progress with work stuck past the fatal threshold — a genuine wedge.
+    /// Fail the pipeline fast instead of hanging forever.
+    Wedged,
+}
+
+/// Classify one deadlock-monitor poll.
+///
+/// - `progressed`: did the global progress counter advance since the last poll?
+/// - `stall_secs`: how long progress has been flat (0 if it just advanced).
+/// - `warn_secs` / `fatal_secs`: the warn and fatal stall thresholds.
+/// - `in_flight_bytes`: bytes currently held across transport queues **and**
+///   reorder buffers.
+///
+/// The starvation guard (no progress + nothing in flight ⇒ not a deadlock) and
+/// fatal-on-stuck-work behavior mirror the legacy pipeline's
+/// `check_deadlock_and_restore`. The split warn/fatal thresholds diverge from
+/// legacy's single 10s kill: a single huge dispatch (busy-locus group, large
+/// sort merge) can legitimately flatten progress for many seconds with work
+/// stuck in queues, so we only fail after the stall persists well past the warn
+/// window.
+fn classify_stall(
+    progressed: bool,
+    stall_secs: u64,
+    warn_secs: u64,
+    fatal_secs: u64,
+    in_flight_bytes: u64,
+) -> StallVerdict {
+    if progressed {
+        return StallVerdict::Progressing;
+    }
+    if in_flight_bytes == 0 {
+        return StallVerdict::Starving;
+    }
+    if stall_secs >= fatal_secs {
+        return StallVerdict::Wedged;
+    }
+    if stall_secs >= warn_secs {
+        return StallVerdict::Stalled;
+    }
+    StallVerdict::Watching
+}
+
+/// Per-queue floor: never let the rebalancer take a queue below this
+/// (`ByteBoundedQueue` panics if `limit_bytes == 0`, and very small
+/// limits effectively wedge the producer).
+const MIN_PER_QUEUE_BYTES: u64 = 1024 * 1024;
+
+/// Floor for the per-branch reorder overflow stash. Liveness needs no floor
+/// (`next_serial` is always exempt — any cap ≥ 0 is deadlock-free), so this
+/// is purely a throughput knob: keep enough lookahead headroom that a
+/// reorder-heavy edge doesn't thrash one item per round-robin pass.
+const MIN_REORDER_OVERFLOW_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Initial-allocation pass for `queue_memory_total`. Distributes
+/// `total` evenly across all byte-bounded queues. Floors each queue
+/// at `MIN_PER_QUEUE_BYTES` even if the per-queue share would be
+/// smaller — in that case the effective total exceeds the user's
+/// budget, but starvation is the worse failure mode.
+///
+/// Each ordered byte-bounded branch's reorder overflow stash is sized from
+/// the SAME `per_queue` value (clamped to `[MIN_REORDER_OVERFLOW_BYTES,
+/// DEFAULT_REORDER_OVERFLOW_BYTES]`), so the off-budget stash tracks the
+/// transport budget instead of a fixed 256 MiB. The clamp ceiling is the
+/// prior fixed value, so high thread counts (large `per_queue`) keep today's
+/// reorder headroom — no `--threads N` regression — while low thread counts
+/// (small `per_queue`) get a streaming-sized stash.
+pub(crate) fn apply_initial_queue_budget(
+    queues: &[crate::runtime::contexts::RegisteredQueue],
+    total: u64,
+) {
+    if queues.is_empty() {
+        return;
+    }
+    let per_queue = (total / (queues.len() as u64)).max(MIN_PER_QUEUE_BYTES);
+    let reorder_cap = reorder_cap_for(per_queue);
+    for rq in queues {
+        rq.handle.set_limit_bytes(per_queue);
+        if let Some(reorder) = &rq.reorder_cap {
+            reorder.set_max_overflow_bytes(reorder_cap);
+        }
+    }
+}
+
+/// The reorder overflow cap for a branch whose transport budget is
+/// `per_queue`: track the transport budget, clamped to
+/// `[MIN_REORDER_OVERFLOW_BYTES, DEFAULT_REORDER_OVERFLOW_BYTES]`. The
+/// ceiling is the prior fixed value, so a large `per_queue` (high thread
+/// counts) keeps today's reorder headroom; a small `per_queue` (low thread
+/// counts / lean budget) shrinks the off-budget stash to a streaming size.
+fn reorder_cap_for(per_queue: u64) -> u64 {
+    per_queue.clamp(MIN_REORDER_OVERFLOW_BYTES, crate::reorder::DEFAULT_REORDER_OVERFLOW_BYTES)
+}
+
+/// Background queue-memory rebalancer body. Polls each queue's
+/// `current_bytes / limit_bytes` fullness ratio every 1 second.
+/// Identifies the most-full producer (likely bottleneck) and the
+/// least-full consumer (over-budget). Shifts a fraction of budget
+/// from least to most full, preserving total budget.
+///
+/// The algorithm is deliberately simple — incremental shifts (10%
+/// of the source's limit per tick) converge gradually so transient
+/// spikes don't overshoot. Floors each queue at `MIN_PER_QUEUE_BYTES`.
+///
+/// Exits when `stop` is set (typically after workers join).
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn run_queue_rebalancer(
+    stop: &Arc<StopSignal>,
+    handles: &[Arc<dyn super::queues::BoundedQueueHandle>],
+    names: &[&'static str],
+) {
+    if handles.len() < 2 {
+        // Nothing to rebalance with one or zero queues.
+        return;
+    }
+    let poll_interval = std::time::Duration::from_secs(1);
+    let shift_fraction: f64 = 0.10;
+
+    while !stop.is_stopped() {
+        sleep_until_stop(stop, poll_interval);
+        if stop.is_stopped() {
+            break;
+        }
+
+        // Snapshot fullness ratios.
+        let snapshot: Vec<(usize, u64, u64, f64)> = handles
+            .iter()
+            .enumerate()
+            .map(|(idx, h)| {
+                let cur = h.current_bytes();
+                let lim = h.limit_bytes();
+                let ratio = if lim == 0 { 0.0 } else { (cur as f64) / (lim as f64) };
+                (idx, cur, lim, ratio)
+            })
+            .collect();
+
+        // Find the most-full and least-full queues.
+        let max = snapshot
+            .iter()
+            .max_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal))
+            .copied();
+        let min = snapshot
+            .iter()
+            .min_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal))
+            .copied();
+
+        let (Some((max_idx, _, max_lim, max_ratio)), Some((min_idx, _, min_lim, min_ratio))) =
+            (max, min)
+        else {
+            continue;
+        };
+        if max_idx == min_idx {
+            continue;
+        }
+        // Only rebalance when the imbalance is meaningful: the
+        // fullest queue is ≥80% full AND the emptiest is ≤20% full.
+        // Otherwise the system is in steady state and we shouldn't
+        // perturb the limits.
+        if max_ratio < 0.80 || min_ratio > 0.20 {
+            continue;
+        }
+
+        // Shift from min to max.
+        let to_shift = ((min_lim as f64) * shift_fraction) as u64;
+        if to_shift == 0 {
+            continue;
+        }
+        let new_min = min_lim.saturating_sub(to_shift).max(MIN_PER_QUEUE_BYTES);
+        if new_min == min_lim {
+            // Floor reached; can't shrink further.
+            continue;
+        }
+        let actual_shift = min_lim - new_min;
+        let new_max = max_lim.saturating_add(actual_shift);
+        handles[min_idx].set_limit_bytes(new_min);
+        handles[max_idx].set_limit_bytes(new_max);
+        log::debug!(
+            "queue rebalance: shift {} bytes {} ({} -> {}) -> {} ({} -> {})",
+            actual_shift,
+            names[min_idx],
+            min_lim,
+            new_min,
+            names[max_idx],
+            max_lim,
+            new_max
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    use rstest::rstest;
+
+    use crate::outputs::Single;
+    use crate::queues::QueueSpec;
+    use crate::reorder::BranchOrdering;
+    use crate::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
+
+    // Each case pins one level's (is_on/samples, timeline, deep) predicates, so a
+    // failure identifies the specific level that regressed. `samples()` tracks
+    // `is_on()`, so the two share the `is_on` column.
+    #[rstest]
+    #[case(InstrumentationLevel::Off, false, false, false)]
+    #[case(InstrumentationLevel::Summary, true, false, false)]
+    #[case(InstrumentationLevel::Timeline, true, true, false)]
+    #[case(InstrumentationLevel::Deep, true, true, true)]
+    fn instrumentation_level_predicates(
+        #[case] level: InstrumentationLevel,
+        #[case] is_on: bool,
+        #[case] timeline: bool,
+        #[case] deep: bool,
+    ) {
+        assert_eq!(level.is_on(), is_on);
+        assert_eq!(level.samples(), is_on);
+        assert_eq!(level.timeline(), timeline);
+        assert_eq!(level.deep(), deep);
+    }
+
+    #[test]
+    fn instrumentation_defaults_are_off() {
+        assert_eq!(InstrumentationLevel::default(), InstrumentationLevel::Off);
+        assert_eq!(PipelineConfig::default().instrumentation, InstrumentationLevel::Off);
+        assert!(PipelineConfig::default().trace_path.is_none());
+    }
+
+    #[test]
+    fn apply_initial_queue_budget_sets_registered_reorder_cap() {
+        // End-to-end wiring: a registered ordered byte-bounded branch's reorder
+        // cap is re-sized by the budget pass (not left at its construction
+        // default). Guards the Pass-1.5 registration + the `set` call together.
+        use crate::queues::{BoundedQueueHandle, ByteBoundedQueue, ItemQueue};
+        use crate::reorder::{
+            DEFAULT_REORDER_OVERFLOW_BYTES, ReorderCapHandle, ReorderStage, Sequenced,
+        };
+        use crate::runtime::contexts::RegisteredQueue;
+        use crate::topology::{BranchIdx, StepIdx};
+
+        // A reorder stage constructed at the 256 MiB fallback; keep a concrete
+        // handle so we can read the cap back after the budget pass.
+        let transport: Arc<dyn ItemQueue<Sequenced<u32>>> =
+            Arc::new(ByteBoundedQueue::<Sequenced<u32>>::new(1024 * 1024));
+        let stage = Arc::new(ReorderStage::<u32>::with_max_overflow_bytes(
+            transport,
+            DEFAULT_REORDER_OVERFLOW_BYTES,
+        ));
+        assert_eq!(stage.current_max_overflow_bytes(), DEFAULT_REORDER_OVERFLOW_BYTES);
+        let reorder_dyn: Arc<dyn ReorderCapHandle> = stage.clone();
+
+        // A transport-limit handle for the `RegisteredQueue.handle` slot.
+        let transport_q = Arc::new(ByteBoundedQueue::<u32>::new(1024 * 1024));
+        let transport_handle: Arc<dyn BoundedQueueHandle> = transport_q;
+
+        let registered = vec![RegisteredQueue {
+            producer_step_name: "TestStep",
+            producer_step: StepIdx(0),
+            branch: BranchIdx(0),
+            handle: transport_handle,
+            reorder_cap: Some(reorder_dyn),
+        }];
+
+        // Lean total → per_queue = 8 MiB (1 queue) → reorder clamp = 8 MiB.
+        apply_initial_queue_budget(&registered, 8 * 1024 * 1024);
+        assert_eq!(
+            stage.current_max_overflow_bytes(),
+            8 * 1024 * 1024,
+            "budget pass must re-size the registered reorder cap to the clamped per_queue"
+        );
+
+        // Huge total → per_queue huge → reorder clamped back to the ceiling.
+        apply_initial_queue_budget(&registered, 100 * 1024 * 1024 * 1024);
+        assert_eq!(
+            stage.current_max_overflow_bytes(),
+            DEFAULT_REORDER_OVERFLOW_BYTES,
+            "high budget clamps the reorder cap to the 256 MiB ceiling (no t>1 regression)"
+        );
+    }
+
+    #[test]
+    fn apply_initial_queue_budget_floors_each_queue_at_min_when_budget_tiny() {
+        // When `total / n_queues < MIN_PER_QUEUE_BYTES`, the budget pass floors
+        // each transport at `MIN_PER_QUEUE_BYTES` even though the effective total
+        // then exceeds the user's budget — starvation (a zero/tiny-budget queue
+        // that always rejects pushes, wedging the producer) is the worse failure
+        // mode. A regression dropping the `.max(MIN_PER_QUEUE_BYTES)` would not be
+        // caught by the lean/huge cases the sibling test covers.
+        use crate::queues::{BoundedQueueHandle, ByteBoundedQueue};
+        use crate::runtime::contexts::RegisteredQueue;
+        use crate::topology::{BranchIdx, StepIdx};
+
+        // Four registered queues, each constructed at the 1 MiB floor.
+        let handles: Vec<Arc<ByteBoundedQueue<u32>>> =
+            (0..4).map(|_| Arc::new(ByteBoundedQueue::<u32>::new(MIN_PER_QUEUE_BYTES))).collect();
+        let registered: Vec<RegisteredQueue> = handles
+            .iter()
+            .enumerate()
+            .map(|(i, h)| RegisteredQueue {
+                producer_step_name: "TestStep",
+                producer_step: StepIdx(i),
+                branch: BranchIdx(0),
+                handle: Arc::clone(h) as Arc<dyn BoundedQueueHandle>,
+                reorder_cap: None,
+            })
+            .collect();
+
+        // total = 1 byte over 4 queues → per_queue would be 0, floored to 1 MiB.
+        apply_initial_queue_budget(&registered, 1);
+        for h in &handles {
+            assert_eq!(
+                h.limit_bytes(),
+                MIN_PER_QUEUE_BYTES,
+                "each queue's transport limit must be floored to MIN_PER_QUEUE_BYTES \
+                 when the per-queue share underflows the floor"
+            );
+        }
+    }
+
+    #[test]
+    fn reorder_cap_tracks_per_queue_clamped_to_floor_and_ceiling() {
+        let ceiling = crate::reorder::DEFAULT_REORDER_OVERFLOW_BYTES;
+        // Mid-range per_queue passes through unchanged.
+        assert_eq!(reorder_cap_for(32 * 1024 * 1024), 32 * 1024 * 1024);
+        // Tiny per_queue (lean / low-thread) is floored — but stays small.
+        assert_eq!(reorder_cap_for(1024), MIN_REORDER_OVERFLOW_BYTES);
+        assert_eq!(reorder_cap_for(MIN_REORDER_OVERFLOW_BYTES - 1), MIN_REORDER_OVERFLOW_BYTES);
+        // Huge per_queue (high thread counts) is capped at today's ceiling →
+        // no `--threads N` regression.
+        assert_eq!(reorder_cap_for(4 * ceiling), ceiling);
+        assert_eq!(reorder_cap_for(ceiling), ceiling);
+    }
+
+    // ───── Test stubs ─────
+
+    #[derive(Clone)]
+    struct StubSource;
+    impl Step for StubSource {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "Source",
+                kind: StepKind::Exclusive,
+                sticky: true,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 64 }],
+                branch_ordering: vec![BranchOrdering::ByOrdinal],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+    }
+
+    #[derive(Clone)]
+    struct StubTransform;
+    impl Step for StubTransform {
+        type Input = u32;
+        type Outputs = Single<u64>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "Transform",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 64 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::NoProgress)
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct StubFanOut2;
+    impl Step for StubFanOut2 {
+        type Input = u64;
+        type Outputs = (u32, String);
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "FanOut2",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![
+                    QueueSpec::CountBounded { capacity: 32 },
+                    QueueSpec::CountBounded { capacity: 32 },
+                ],
+                branch_ordering: vec![BranchOrdering::None, BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::NoProgress)
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct StubSinkU32;
+    impl Step for StubSinkU32 {
+        type Input = u32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "SinkU32",
+                kind: StepKind::Exclusive,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::NoProgress)
+        }
+    }
+
+    #[derive(Clone)]
+    struct StubSinkString;
+    impl Step for StubSinkString {
+        type Input = String;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "SinkString",
+                kind: StepKind::Exclusive,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::NoProgress)
+        }
+    }
+
+    // ───── Tests ─────
+
+    #[test]
+    fn empty_builder_returns_empty_error() {
+        let builder = PipelineBuilder::new();
+        assert!(matches!(builder.build(), Err(BuildError::Empty)));
+    }
+
+    #[test]
+    fn unwired_source_returns_unwired_output() {
+        let builder = PipelineBuilder::new();
+        let _chain = builder.chain(StubSource);
+        let result = builder.build();
+        assert!(matches!(result, Err(BuildError::UnwiredOutput { step: "Source", branch: "0" })));
+    }
+
+    /// Sources register with `input_arity = 0`, matching the contract
+    /// `ChainGraph::register_step_with_input_arity` documents. A source's input
+    /// is implicit, so the graph must have no slot to wire an edge into.
+    #[rstest]
+    #[case::chain(false)]
+    #[case::append_source(true)]
+    fn sources_register_with_zero_input_arity(#[case] via_append_source: bool) {
+        let builder = PipelineBuilder::new();
+        let source = if via_append_source {
+            builder.append_source(StubSource).0
+        } else {
+            let chain = builder.chain(StubSource);
+            // `Chain` does not expose its `StepIdx`; the source is step 0.
+            drop(chain);
+            StepIdx(0)
+        };
+        assert_eq!(
+            builder.inner.borrow().graph.input_arity(source),
+            0,
+            "a source's input is implicit — it must have no input slot"
+        );
+    }
+
+    /// Wiring a producer into a source is rejected at build time.
+    ///
+    /// Arity 0 makes `wire_to_slot` panic for a source registered through
+    /// `PipelineBuilder::{chain, append_source}`, but a source appended as a
+    /// *consumer* goes through `Chain::chain`, which registers every consumer
+    /// with arity 1 — so the wire succeeds and only `build()` can catch it.
+    /// Without the check the chain builds clean, `build_chain_contexts_inner`
+    /// hands the second source a dummy unit input handle because `is_source()`
+    /// is true, and `StubSource`'s output is silently discarded.
+    #[test]
+    fn build_rejects_a_producer_wired_into_a_source() {
+        /// Emits `()`, so its `Chain<Single<()>>` type-checks against any
+        /// `Step<Input = ()>` — i.e. against another source.
+        #[derive(Clone)]
+        struct UnitSource;
+        impl Step for UnitSource {
+            type Input = ();
+            type Outputs = Single<()>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "UnitSource",
+                    kind: StepKind::Serial,
+                    sticky: false,
+                    output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                    branch_ordering: vec![BranchOrdering::None],
+                }
+            }
+            fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+
+        let builder = PipelineBuilder::new();
+        // `StubSource: Step<Input = ()>` — accepted here purely because
+        // `HeapSize for ()` exists, not because the wiring is meaningful.
+        builder.chain(UnitSource).chain(StubSource).chain(StubSinkU32).into_sink_marker();
+
+        assert!(
+            matches!(
+                builder.build(),
+                Err(BuildError::WiredIntoSource { step: "Source", producer: "UnitSource" })
+            ),
+            "a producer wired into a source must be a build error, not silent data loss"
+        );
+    }
+
+    #[test]
+    fn source_to_transform_unwired_at_transform_returns_unwired() {
+        let builder = PipelineBuilder::new();
+        let _chain = builder.chain(StubSource).chain(StubTransform);
+        let result = builder.build();
+        assert!(matches!(
+            result,
+            Err(BuildError::UnwiredOutput { step: "Transform", branch: "0" })
+        ));
+    }
+
+    #[test]
+    fn fully_wired_source_to_sink_succeeds() {
+        let builder = PipelineBuilder::new();
+        builder.chain(StubSource).chain(StubSinkU32).into_sink_marker();
+        let result = builder.build();
+        assert!(result.is_ok());
+        let pipeline = result.unwrap();
+        assert_eq!(pipeline.graph.n_steps(), 2);
+    }
+
+    #[test]
+    fn unwired_fanout_branch_is_detected() {
+        let builder = PipelineBuilder::new();
+        let after_fanout = builder.chain(StubSource).chain(StubTransform).chain(StubFanOut2);
+        let multi = after_fanout.into_multi();
+        // Wire branch 0 to a sink, drop branch 1 (unwired).
+        multi.b0.chain(StubSinkU32).into_sink_marker();
+        drop(multi.b1);
+
+        let result = builder.build();
+        assert!(matches!(result, Err(BuildError::UnwiredOutput { step: "FanOut2", branch: "1" })));
+    }
+
+    #[test]
+    fn fanout_with_both_branches_wired_succeeds() {
+        let builder = PipelineBuilder::new();
+        let after_fanout = builder.chain(StubSource).chain(StubTransform).chain(StubFanOut2);
+        let multi = after_fanout.into_multi();
+        multi.b0.chain(StubSinkU32).into_sink_marker();
+        multi.b1.chain(StubSinkString).into_sink_marker();
+
+        let result = builder.build();
+        assert!(result.is_ok());
+        let pipeline = result.unwrap();
+        assert_eq!(pipeline.graph.n_steps(), 5);
+    }
+
+    #[test]
+    fn pipeline_config_default_uses_available_parallelism() {
+        let cfg = PipelineConfig::default();
+        assert!(cfg.threads >= 1);
+    }
+
+    #[derive(Clone)]
+    struct StubFanOut3;
+    impl Step for StubFanOut3 {
+        type Input = u64;
+        type Outputs = (u32, String, u64);
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "FanOut3",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 8 }; 3],
+                branch_ordering: vec![BranchOrdering::None; 3],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::NoProgress)
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct StubFanOut4;
+    impl Step for StubFanOut4 {
+        type Input = u64;
+        type Outputs = (u32, String, u64, u32);
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "FanOut4",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 8 }; 4],
+                branch_ordering: vec![BranchOrdering::None; 4],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::NoProgress)
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct StubSinkU64;
+    impl Step for StubSinkU64 {
+        type Input = u64;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "SinkU64",
+                kind: StepKind::Exclusive,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::NoProgress)
+        }
+    }
+
+    /// `into_multi` must hand back one `Chain` per declared branch, each
+    /// pinned to its own `BranchIdx`. If two sub-chains shared a branch index
+    /// the builder would report a phantom unwired branch even though the
+    /// caller wired every one — so wiring all of them must build cleanly.
+    #[test]
+    fn into_multi_3_exposes_one_chain_per_branch() {
+        let builder = PipelineBuilder::new();
+        let multi = builder.chain(StubSource).chain(StubTransform).chain(StubFanOut3).into_multi();
+        multi.b0.chain(StubSinkU32).into_sink_marker();
+        multi.b1.chain(StubSinkString).into_sink_marker();
+        multi.b2.chain(StubSinkU64).into_sink_marker();
+
+        let pipeline = builder.build().expect("all three branches wired");
+        assert_eq!(pipeline.graph.n_steps(), 6, "source + transform + fanout + 3 sinks");
+    }
+
+    /// The 3-branch counterpart of `unwired_fanout_branch_is_detected`: the
+    /// dropped branch must be named by index, proving `into_multi` gave branch
+    /// 2 its own identity rather than aliasing an earlier one.
+    #[test]
+    fn into_multi_3_reports_the_branch_left_unwired() {
+        let builder = PipelineBuilder::new();
+        let multi = builder.chain(StubSource).chain(StubTransform).chain(StubFanOut3).into_multi();
+        multi.b0.chain(StubSinkU32).into_sink_marker();
+        multi.b1.chain(StubSinkString).into_sink_marker();
+        drop(multi.b2);
+
+        assert!(matches!(
+            builder.build(),
+            Err(BuildError::UnwiredOutput { step: "FanOut3", branch: "2" })
+        ));
+    }
+
+    #[test]
+    fn into_multi_4_exposes_one_chain_per_branch() {
+        let builder = PipelineBuilder::new();
+        let multi = builder.chain(StubSource).chain(StubTransform).chain(StubFanOut4).into_multi();
+        multi.b0.chain(StubSinkU32).into_sink_marker();
+        multi.b1.chain(StubSinkString).into_sink_marker();
+        multi.b2.chain(StubSinkU64).into_sink_marker();
+        multi.b3.chain(StubSinkU32).into_sink_marker();
+
+        let pipeline = builder.build().expect("all four branches wired");
+        assert_eq!(pipeline.graph.n_steps(), 7, "source + transform + fanout + 4 sinks");
+    }
+
+    #[test]
+    fn into_multi_4_reports_the_branch_left_unwired() {
+        let builder = PipelineBuilder::new();
+        let multi = builder.chain(StubSource).chain(StubTransform).chain(StubFanOut4).into_multi();
+        multi.b0.chain(StubSinkU32).into_sink_marker();
+        multi.b1.chain(StubSinkString).into_sink_marker();
+        multi.b2.chain(StubSinkU64).into_sink_marker();
+        drop(multi.b3);
+
+        assert!(matches!(
+            builder.build(),
+            Err(BuildError::UnwiredOutput { step: "FanOut4", branch: "3" })
+        ));
+    }
+
+    #[derive(Clone, Copy)]
+    struct Ord32 {
+        ordinal: u64,
+    }
+    impl crate::item::HeapSize for Ord32 {}
+    impl crate::item::Ordered for Ord32 {
+        fn ordinal(&self) -> u64 {
+            self.ordinal
+        }
+    }
+
+    #[derive(Clone)]
+    struct OrderedSource;
+    impl Step for OrderedSource {
+        type Input = ();
+        type Outputs = crate::outputs::OrderedBytesTuple2<Ord32, Ord32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "OrderedSource",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1024 }; 2],
+                branch_ordering: vec![BranchOrdering::ByItemOrdinal; 2],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct OrderedSink;
+    impl Step for OrderedSink {
+        type Input = Ord32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "OrderedSink",
+                kind: StepKind::Exclusive,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::NoProgress)
+        }
+    }
+
+    /// The ordered + byte-bounded 2-way fan-out — the shape real BAM source
+    /// chains produce — is the one `into_multi` variant with no coverage. Its
+    /// sub-chains are `Chain<OrderedBytesSingle<_>>`, not `Chain<Single<_>>`,
+    /// so a branch mix-up would surface as a type error at the call site; what
+    /// this pins is that both branches are exposed and separately wireable.
+    #[test]
+    fn into_multi_ordered_bytes_2_exposes_one_chain_per_branch() {
+        let builder = PipelineBuilder::new();
+        let multi = builder.chain(OrderedSource).into_multi();
+        let _: &Chain<'_, crate::outputs::OrderedBytesSingle<Ord32>> = &multi.b0;
+        multi.b0.chain(OrderedSink).into_sink_marker();
+        multi.b1.chain(OrderedSink).into_sink_marker();
+
+        let pipeline = builder.build().expect("both ordered branches wired");
+        assert_eq!(pipeline.graph.n_steps(), 3, "source + 2 sinks");
+    }
+
+    /// The unwired branch is reported BY INDEX, so the two sub-chains are
+    /// distinct edges rather than two views of branch 0.
+    #[test]
+    fn into_multi_ordered_bytes_2_reports_the_branch_left_unwired() {
+        let builder = PipelineBuilder::new();
+        let multi = builder.chain(OrderedSource).into_multi();
+        multi.b0.chain(OrderedSink).into_sink_marker();
+        drop(multi.b1);
+
+        assert!(matches!(
+            builder.build(),
+            Err(BuildError::UnwiredOutput { step: "OrderedSource", branch: "1" })
+        ));
+    }
+
+    #[derive(Clone)]
+    struct OrderedSource3;
+    impl Step for OrderedSource3 {
+        type Input = ();
+        type Outputs = crate::outputs::OrderedBytesTuple3<Ord32, Ord32, Ord32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "OrderedSource3",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1024 }; 3],
+                branch_ordering: vec![BranchOrdering::ByItemOrdinal; 3],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// The 3-way counterpart of `into_multi_ordered_bytes_2_exposes_one_chain_per_branch`:
+    /// all three ordered + byte-bounded branches are exposed as
+    /// `Chain<OrderedBytesSingle<_>>` and separately wireable.
+    #[test]
+    fn into_multi_ordered_bytes_3_exposes_one_chain_per_branch() {
+        let builder = PipelineBuilder::new();
+        let multi = builder.chain(OrderedSource3).into_multi();
+        let _: &Chain<'_, crate::outputs::OrderedBytesSingle<Ord32>> = &multi.b0;
+        multi.b0.chain(OrderedSink).into_sink_marker();
+        multi.b1.chain(OrderedSink).into_sink_marker();
+        multi.b2.chain(OrderedSink).into_sink_marker();
+
+        let pipeline = builder.build().expect("all three ordered branches wired");
+        assert_eq!(pipeline.graph.n_steps(), 4, "source + 3 sinks");
+    }
+
+    /// The 3-way counterpart of `into_multi_ordered_bytes_2_reports_the_branch_left_unwired`:
+    /// the dropped branch is reported BY INDEX, proving `b2` is a distinct edge
+    /// rather than an alias of `b0`/`b1`.
+    #[test]
+    fn into_multi_ordered_bytes_3_reports_the_branch_left_unwired() {
+        let builder = PipelineBuilder::new();
+        let multi = builder.chain(OrderedSource3).into_multi();
+        multi.b0.chain(OrderedSink).into_sink_marker();
+        multi.b1.chain(OrderedSink).into_sink_marker();
+        drop(multi.b2);
+
+        assert!(matches!(
+            builder.build(),
+            Err(BuildError::UnwiredOutput { step: "OrderedSource3", branch: "2" })
+        ));
+    }
+
+    // Each case pins one `BuildError` variant's rendering, so a failure names
+    // the variant whose message drifted rather than a combined assert.
+    #[rstest]
+    #[case::empty(BuildError::Empty, "pipeline has no steps")]
+    #[case::unwired(
+        BuildError::UnwiredOutput { step: "FanOut2", branch: "1" },
+        "step \"FanOut2\" has unwired output branch \"1\""
+    )]
+    fn build_error_displays_actionably(#[case] err: BuildError, #[case] expected: &str) {
+        assert_eq!(err.to_string(), expected);
+    }
+
+    /// A read of one `PipelineConfig` field, so each setter case can name the
+    /// field it targets and assert on a comparable value.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ConfigProbe {
+        DeadlockTimeout(u64),
+        StatsPresent(bool),
+        QueueMemoryTotal(Option<u64>),
+        Instrumentation(InstrumentationLevel),
+        SchedulerName(&'static str),
+    }
+
+    impl ConfigProbe {
+        /// Read the same field this probe names out of `cfg`.
+        fn read_from(&self, cfg: &PipelineConfig) -> Self {
+            match self {
+                Self::DeadlockTimeout(_) => Self::DeadlockTimeout(cfg.deadlock_timeout_secs),
+                Self::StatsPresent(_) => Self::StatsPresent(cfg.stats.is_some()),
+                Self::QueueMemoryTotal(_) => Self::QueueMemoryTotal(cfg.queue_memory_total),
+                Self::Instrumentation(_) => Self::Instrumentation(cfg.instrumentation),
+                Self::SchedulerName(_) => Self::SchedulerName(cfg.scheduler.name()),
+            }
+        }
+    }
+
+    /// The builder-style setters are the only way a caller configures a
+    /// `PipelineConfig`. Each case applies one setter and asserts two things:
+    /// the field it targets took the new value, and a field it does NOT target
+    /// is still at its default — a copy-paste slip that assigned the wrong field
+    /// would silently disable instrumentation or the deadlock monitor.
+    ///
+    /// `scheduler` is a trait object, so its case asserts the observable
+    /// `name()` rather than allocation identity: pointer inequality would pass
+    /// even if the setter stored the wrong scheduler.
+    #[rstest]
+    #[case::with_deadlock_timeout(
+        &|c: PipelineConfig| c.with_deadlock_timeout(30),
+        ConfigProbe::DeadlockTimeout(30),
+        ConfigProbe::StatsPresent(false)
+    )]
+    #[case::with_stats(
+        &|c: PipelineConfig| c.with_stats(Arc::new(PipelineStats::new(vec!["Source"]))),
+        ConfigProbe::StatsPresent(true),
+        ConfigProbe::DeadlockTimeout(0)
+    )]
+    #[case::with_queue_memory_total_some(
+        &|c: PipelineConfig| c.with_queue_memory_total(Some(64 * 1024 * 1024)),
+        ConfigProbe::QueueMemoryTotal(Some(64 * 1024 * 1024)),
+        ConfigProbe::StatsPresent(false)
+    )]
+    // `None` is the documented "keep per-step static limits, rebalancer off"
+    // value, so it must round-trip as None rather than be treated as unset.
+    #[case::with_queue_memory_total_none(
+        &|c: PipelineConfig| c.with_queue_memory_total(None),
+        ConfigProbe::QueueMemoryTotal(None),
+        ConfigProbe::StatsPresent(false)
+    )]
+    #[case::with_instrumentation(
+        &|c: PipelineConfig| c.with_instrumentation(InstrumentationLevel::Deep),
+        ConfigProbe::Instrumentation(InstrumentationLevel::Deep),
+        ConfigProbe::DeadlockTimeout(0)
+    )]
+    #[case::with_scheduler(
+        &|c: PipelineConfig| c.with_scheduler(Arc::new(crate::runtime::DrainFirstScheduler)),
+        ConfigProbe::SchedulerName("drain-first"),
+        ConfigProbe::Instrumentation(InstrumentationLevel::Off)
+    )]
+    fn pipeline_config_setter_sets_only_its_own_field(
+        #[case] apply: &dyn Fn(PipelineConfig) -> PipelineConfig,
+        #[case] expected: ConfigProbe,
+        #[case] untouched: ConfigProbe,
+    ) {
+        let defaults = PipelineConfig::default();
+        assert_eq!(
+            untouched.read_from(&defaults),
+            untouched,
+            "the case's `untouched` probe must state the actual default"
+        );
+
+        let cfg = apply(PipelineConfig::default());
+        assert_eq!(expected.read_from(&cfg), expected, "setter set its own field");
+        assert_eq!(untouched.read_from(&cfg), untouched, "setter left the other field alone");
+    }
+
+    /// The default scheduler must stay upstream-first; `with_scheduler`'s case
+    /// above is only meaningful against a known baseline.
+    #[test]
+    fn default_scheduler_walks_chain_order() {
+        let cfg = PipelineConfig::default();
+        assert_eq!(cfg.scheduler.name(), "chain-order");
+        assert_eq!(cfg.scheduler.walk(), crate::runtime::WalkDirection::Forward);
+    }
+
+    /// `append_source` / `append_step` are the type-erased assembly API the
+    /// parent crate's `ChainBuilder` drives across method-boundary calls, where
+    /// the fluent `chain` API cannot be used because the chain type changes at
+    /// every step. Wiring by returned `(StepIdx, BranchIdx)` must produce the
+    /// same graph the fluent API does.
+    #[test]
+    fn append_source_and_append_step_build_the_same_graph_as_chaining() {
+        let builder = PipelineBuilder::new();
+        let src = builder.append_source(StubSource);
+        let mid = builder.append_step(StubTransform, src);
+        let _sink = builder.append_step(StubSinkU64, mid);
+
+        let pipeline = builder.build().expect("every branch wired by index");
+        assert_eq!(pipeline.graph.n_steps(), 3);
+    }
+
+    #[test]
+    fn append_step_leaves_an_unwired_branch_detectable() {
+        // Appending a fan-out and wiring only one of its branches must still be
+        // caught by `build`, exactly as with the fluent API.
+        let builder = PipelineBuilder::new();
+        let src = builder.append_source(StubSource);
+        let mid = builder.append_step(StubTransform, src);
+        let fanout = builder.append_step(StubFanOut2, mid);
+        let _sink = builder.append_step(StubSinkU32, fanout);
+
+        assert!(matches!(
+            builder.build(),
+            Err(BuildError::UnwiredOutput { step: "FanOut2", branch: "1" })
+        ));
+    }
+
+    #[derive(Clone)]
+    struct StubJoin;
+    impl crate::step::Step2 for StubJoin {
+        type InputA = u32;
+        type InputB = String;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "Join",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(
+            &mut self,
+            _ctx: &mut crate::step::StepCtx2<'_, Self>,
+        ) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::NoProgress)
+        }
+    }
+
+    /// `append_step2` must consume BOTH upstream branches — one into input slot
+    /// 0 and one into slot 1. If it wired only one, `build` would report the
+    /// other as unwired.
+    #[test]
+    fn append_step2_consumes_both_upstream_branches() {
+        let builder = PipelineBuilder::new();
+        let src = builder.append_source(StubSource);
+        let mid = builder.append_step(StubTransform, src);
+        let fanout = builder.append_step(StubFanOut2, mid);
+        let branch_b = (fanout.0, BranchIdx(1));
+        let _join = builder.append_step2(StubJoin, fanout, branch_b);
+
+        let pipeline = builder.build().expect("both fan-out branches consumed by the join");
+        assert_eq!(pipeline.graph.n_steps(), 4, "source + transform + fanout + join");
+    }
+
+    #[test]
+    fn dag_renders_chain_shape() {
+        let builder = PipelineBuilder::new();
+        builder.chain(StubSource).chain(StubSinkU32).into_sink_marker();
+        let pipeline = builder.build().unwrap();
+        let dag = pipeline.dag();
+        // Verify shape rendering — names and (sink) marker.
+        assert!(dag.contains("Source"), "DAG missing source name: {dag}");
+        assert!(dag.contains("SinkU32"), "DAG missing sink name: {dag}");
+        assert!(dag.contains("(sink)"), "DAG missing sink marker: {dag}");
+        assert!(dag.contains("→ SinkU32"), "DAG missing source→sink wiring: {dag}");
+    }
+
+    #[test]
+    fn dag_renders_effective_collapsed_ordering_for_serial_exclusive() {
+        // `StubSource` is `Exclusive` and declares `BranchOrdering::ByOrdinal`,
+        // but `build_output_set` collapses that to `None` (no reorder stage) for
+        // single-input Serial/Exclusive producers. `dag()` must render the
+        // *effective* ordering so the diagnostic matches the transport actually
+        // built — it must not print the un-collapsed declared `ByOrdinal`.
+        let builder = PipelineBuilder::new();
+        builder.chain(StubSource).chain(StubSinkU32).into_sink_marker();
+        let pipeline = builder.build().unwrap();
+        let dag = pipeline.dag();
+        // The source's output branch line is `.0: <queue> <ordering> → SinkU32`.
+        let source_branch_line = dag
+            .lines()
+            .find(|l| l.contains("→ SinkU32"))
+            .expect("DAG must have the source→sink branch line");
+        assert!(
+            source_branch_line.contains("None"),
+            "DAG must render the collapsed (effective) ordering `None`: {source_branch_line}"
+        );
+        assert!(
+            !source_branch_line.contains("ByOrdinal"),
+            "DAG must NOT render the un-collapsed declared `ByOrdinal`: {source_branch_line}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Pipeline::run smoke tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrd};
+
+    use crate::signal::PipelineError;
+
+    /// Source emitting `remaining` items via a shared atomic counter; safe
+    /// for both single-worker and multi-worker `Parallel` execution.
+    ///
+    /// Uses an `Unbounded` output queue so the test never hits backpressure
+    /// (which would require the source to use the `HeldSlot<Unpushed<T>>`
+    /// retry pattern — exercised in the bigger end-to-end smoke test below).
+    #[derive(Clone)]
+    struct SharedCountingSource {
+        remaining: Arc<AtomicU32>,
+    }
+    impl Step for SharedCountingSource {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "SharedSource",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::Unbounded],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            let n = self.remaining.load(AtomicOrd::Acquire);
+            if n == 0 {
+                return Ok(StepOutcome::Finished);
+            }
+            // CAS down to claim this item; only push on successful claim.
+            if self
+                .remaining
+                .compare_exchange(n, n - 1, AtomicOrd::AcqRel, AtomicOrd::Acquire)
+                .is_ok()
+            {
+                ctx.outputs.push(n).map_err(|_| {
+                    std::io::Error::other("Unbounded queue rejected push (impossible)")
+                })?;
+                Ok(StepOutcome::Progress)
+            } else {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Byte-bounded variant of [`SharedCountingSource`]. Identical claim/push
+    /// logic but declares a `ByteBounded` output transport so it is
+    /// monitor-visible — required by any test that arms the deadlock monitor
+    /// (`deadlock_timeout_secs > 0` + stats), which requires every output edge
+    /// to be `ByteBounded` (see `ensure_monitor_visible_transports`) before
+    /// workers spawn. Using the `Unbounded` source there would fail the run with
+    /// `PipelineError::MonitorBlindTransport` before the worker-panic path is
+    /// ever reached.
+    #[derive(Clone)]
+    struct SharedCountingSourceByteBounded {
+        remaining: Arc<AtomicU32>,
+        /// A value claimed from `remaining` but not yet accepted by the output
+        /// (the byte-bounded push hit backpressure). Held per-worker and retried
+        /// on a later tick so the exact ordinal survives — rolling `remaining`
+        /// back instead would let a peer re-claim the count and drop/duplicate an
+        /// ordinal under contention.
+        pending: Option<u32>,
+    }
+    impl Step for SharedCountingSourceByteBounded {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "SharedSourceByteBounded",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 20 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            // First flush any value claimed on a prior tick whose push was
+            // rejected by backpressure. Retrying the exact held ordinal (rather
+            // than rolling `remaining` back) keeps the emitted set a clean
+            // permutation of `1..=N` even under contention.
+            if let Some(n) = self.pending {
+                return if ctx.outputs.push(n).is_ok() {
+                    self.pending = None;
+                    Ok(StepOutcome::Progress)
+                } else {
+                    Ok(StepOutcome::NoProgress)
+                };
+            }
+            let n = self.remaining.load(AtomicOrd::Acquire);
+            if n == 0 {
+                return Ok(StepOutcome::Finished);
+            }
+            if self
+                .remaining
+                .compare_exchange(n, n - 1, AtomicOrd::AcqRel, AtomicOrd::Acquire)
+                .is_ok()
+            {
+                // Byte-bounded push can hit backpressure; hold the claimed
+                // ordinal and retry it on a later tick. Holding a claimed item
+                // counts as progress per the `StepOutcome` contract ("pushed or
+                // held an item" — see `step.rs`) and matches the production
+                // held-slot source (`sort::merge`), so the scheduler's deadlock
+                // accounting sees the claim as forward motion rather than a stall.
+                if ctx.outputs.push(n).is_ok() {
+                    Ok(StepOutcome::Progress)
+                } else {
+                    self.pending = Some(n);
+                    Ok(StepOutcome::Progress)
+                }
+            } else {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Sink that pops and counts.
+    #[derive(Clone)]
+    struct ParallelCountingSink {
+        received: Arc<AtomicU32>,
+        /// Every value popped, so a test can assert record *identity* and not
+        /// just the count — a framework bug that duplicates one item and drops
+        /// another keeps the count at N. Shared across worker copies.
+        seen: Arc<parking_lot::Mutex<Vec<u32>>>,
+    }
+    impl ParallelCountingSink {
+        fn new(received: &Arc<AtomicU32>) -> Self {
+            Self {
+                received: Arc::clone(received),
+                seen: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            }
+        }
+    }
+    impl Step for ParallelCountingSink {
+        type Input = u32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "ParallelSink",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(v) => {
+                    self.seen.lock().push(v);
+                    self.received.fetch_add(1, AtomicOrd::Relaxed);
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// `SharedCountingSource` emits the distinct ordinals `n..=1`, so a drain
+    /// test can assert the exact multiset the sink received rather than only its
+    /// size. Sorted because worker interleaving makes arrival order a valid
+    /// scheduling detail; identity is the contract, order is not.
+    fn assert_received_every_ordinal_once(sink: &ParallelCountingSink, n: u32) {
+        let mut got = sink.seen.lock().clone();
+        got.sort_unstable();
+        let expected: Vec<u32> = (1..=n).collect();
+        assert_eq!(got, expected, "every emitted ordinal 1..={n} must arrive exactly once");
+    }
+
+    #[test]
+    fn pipeline_run_with_threads_1_drains_chain() {
+        let remaining = Arc::new(AtomicU32::new(10));
+        let received = Arc::new(AtomicU32::new(0));
+        let sink = ParallelCountingSink::new(&received);
+
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(SharedCountingSource { remaining: Arc::clone(&remaining) })
+            .chain(sink.clone())
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+
+        let result = pipeline.run(PipelineConfig { threads: 1, ..Default::default() });
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+        assert_eq!(received.load(AtomicOrd::Relaxed), 10);
+        assert_received_every_ordinal_once(&sink, 10);
+    }
+
+    #[test]
+    fn pipeline_run_with_threads_4_drains_chain() {
+        let remaining = Arc::new(AtomicU32::new(50));
+        let received = Arc::new(AtomicU32::new(0));
+        let sink = ParallelCountingSink::new(&received);
+
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(SharedCountingSource { remaining: Arc::clone(&remaining) })
+            .chain(sink.clone())
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+
+        let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+        assert_eq!(received.load(AtomicOrd::Relaxed), 50);
+        assert_received_every_ordinal_once(&sink, 50);
+    }
+
+    /// A `u32 -> u32` pass-through step that runs on a dedicated Detached
+    /// thread. Pops one item per `try_run`, pushes it on (holding on
+    /// output-full backpressure), finishes once its input drains.
+    #[derive(Clone)]
+    struct DetachedPassThrough {
+        held: Option<u32>,
+    }
+    impl Step for DetachedPassThrough {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "DetachedPassThrough",
+                kind: StepKind::Detached,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 8 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            // A rejected push reports `NoProgress`, not `Contention`: the driver
+            // treats them identically, but `Contention` means "a Serial step's
+            // mutex was held by another worker" and feeds `contention_count`,
+            // which the bottleneck verdict turns into its SPIN ratio. Using it
+            // for ordinary output backpressure invents contention that never
+            // happened.
+            if let Some(v) = self.held.take() {
+                if ctx.outputs.push(v).is_err() {
+                    self.held = Some(v);
+                    return Ok(StepOutcome::NoProgress);
+                }
+                return Ok(StepOutcome::Progress);
+            }
+            match ctx.input.pop() {
+                Some(v) => match ctx.outputs.push(v) {
+                    Ok(()) => Ok(StepOutcome::Progress),
+                    Err(unpushed) => {
+                        self.held = Some(unpushed.into_item());
+                        Ok(StepOutcome::NoProgress)
+                    }
+                },
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    /// L2.3: a `source(Parallel) -> passthrough(Detached) -> sink(Parallel)`
+    /// chain runs to completion at `--threads 4` with the Detached step on its
+    /// own dedicated thread (off the pool). All N items flow through.
+    #[test]
+    fn detached_step_runs_and_drains_multithreaded() {
+        let remaining = Arc::new(AtomicU32::new(200));
+        let received = Arc::new(AtomicU32::new(0));
+        let sink = ParallelCountingSink::new(&received);
+
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(SharedCountingSource { remaining: Arc::clone(&remaining) })
+            .chain(DetachedPassThrough { held: None })
+            .chain(sink.clone())
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+
+        let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+        assert_eq!(
+            received.load(AtomicOrd::Relaxed),
+            200,
+            "all items flowed through Detached step"
+        );
+        assert_received_every_ordinal_once(&sink, 200);
+    }
+
+    /// L2.3: a chain with a Detached step and ZERO items (source finishes
+    /// immediately) cleanly drains the Detached thread and the run completes.
+    #[test]
+    fn detached_step_zero_items_run_completes() {
+        let remaining = Arc::new(AtomicU32::new(0));
+        let received = Arc::new(AtomicU32::new(0));
+        let sink = ParallelCountingSink::new(&received);
+
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(SharedCountingSource { remaining: Arc::clone(&remaining) })
+            .chain(DetachedPassThrough { held: None })
+            .chain(sink.clone())
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+
+        let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+        assert_eq!(received.load(AtomicOrd::Relaxed), 0);
+        // Empty expectation: nothing was emitted, so nothing may arrive — this
+        // also catches a spurious item the bare count check would miss if the
+        // counter and the sink ever disagreed.
+        assert_received_every_ordinal_once(&sink, 0);
+    }
+
+    /// L2.3 step 7: at `--threads 1` the fusible linear chain runs the Detached
+    /// step **inline** in the fused single-thread driver — no dedicated thread
+    /// is spawned (the fused path returns before `extract_detached_steps`), yet
+    /// the Detached step still drives to completion.
+    #[test]
+    fn detached_collapses_inline_at_t1() {
+        let remaining = Arc::new(AtomicU32::new(30));
+        let received = Arc::new(AtomicU32::new(0));
+        let sink = ParallelCountingSink::new(&received);
+
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(SharedCountingSource { remaining: Arc::clone(&remaining) })
+            .chain(DetachedPassThrough { held: None })
+            .chain(sink.clone())
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+
+        let result = pipeline.run(PipelineConfig { threads: 1, ..Default::default() });
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+        assert_eq!(received.load(AtomicOrd::Relaxed), 30);
+        assert_received_every_ordinal_once(&sink, 30);
+    }
+
+    /// Sink whose worker loop panics the moment it pops an item — used to drive
+    /// the worker-panic deferral paths in `Pipeline::run`.
+    #[derive(Clone)]
+    struct PanickingSink;
+    impl Step for PanickingSink {
+        type Input = u32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "PanickingSink",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(_) => panic!("intentional worker panic for test"),
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Run `f` with the panic hook silenced so an *expected* worker panic does
+    /// not spew a backtrace into the test log. Safe under `nextest`, which runs
+    /// each test in its own process.
+    fn with_silenced_panic_hook<R>(f: impl FnOnce() -> R) -> R {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = f();
+        std::panic::set_hook(prev);
+        result
+    }
+
+    /// Assert a caught panic carries `PanickingSink`'s payload.
+    ///
+    /// `with_silenced_panic_hook` suppresses the payload, so a bare
+    /// `is_err()` is satisfied by *any* panic — a `thread::Builder::spawn`
+    /// `expect`, a framework `debug_assert!`, or the monitor-visibility guard
+    /// tripping would all pass while the worker-panic deferral path never ran.
+    fn assert_is_the_intentional_worker_panic(payload: &(dyn std::any::Any + Send), ctx: &str) {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .expect("panic payload is a string");
+        assert!(
+            msg.contains("intentional worker panic for test"),
+            "{ctx}: run() must re-raise the SINK's panic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn pipeline_run_reraises_worker_panic_single_threaded() {
+        // A worker-loop panic on the single-threaded fast path must propagate
+        // out of `run` (after the common monitor/rebalancer shutdown), not be
+        // swallowed. The test completing at all proves the run did not hang.
+        let remaining = Arc::new(AtomicU32::new(10));
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(SharedCountingSource { remaining: Arc::clone(&remaining) })
+            .chain(PanickingSink)
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+
+        let result = with_silenced_panic_hook(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pipeline.run(PipelineConfig { threads: 1, ..Default::default() })
+            }))
+        });
+        let payload = result.expect_err("single-threaded worker panic must propagate out of run()");
+        assert_is_the_intentional_worker_panic(payload.as_ref(), "single-threaded");
+    }
+
+    #[test]
+    fn pipeline_run_reraises_worker_panic_with_monitor_enabled() {
+        // With the deadlock monitor enabled (stats + non-zero timeout), a
+        // multi-worker panic must still re-raise — after the monitor is stopped
+        // and joined — rather than deadlocking the join loop or leaking the
+        // helper thread. The panicking worker signals cancellation so any wedged
+        // peer observes `is_done()` and exits, letting every join complete.
+        //
+        // The source MUST be byte-bounded: arming the monitor (stats +
+        // non-zero timeout) runs `ensure_monitor_visible_transports`, which
+        // requires every output edge to be `ByteBounded` in every build. An
+        // `Unbounded` source would fail the run with `MonitorBlindTransport`
+        // before any worker is spawned, so the test would "pass" on the wrong
+        // error and never exercise the worker-panic deferral path it covers.
+        let remaining = Arc::new(AtomicU32::new(1_000));
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(SharedCountingSourceByteBounded {
+                remaining: Arc::clone(&remaining),
+                pending: None,
+            })
+            .chain(PanickingSink)
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+        let stats = pipeline.stats();
+
+        let result = with_silenced_panic_hook(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pipeline.run(PipelineConfig {
+                    threads: 4,
+                    stats: Some(Arc::clone(&stats)),
+                    deadlock_timeout_secs: 5,
+                    ..Default::default()
+                })
+            }))
+        });
+        let payload = result.expect_err("multi-worker panic must propagate out of run()");
+        assert_is_the_intentional_worker_panic(payload.as_ref(), "multi-worker with monitor");
+    }
+
+    #[test]
+    fn pipeline_stats_handle_matches_chain_size() {
+        let builder = PipelineBuilder::new();
+        builder.chain(StubSource).chain(StubSinkU32).into_sink_marker();
+        let pipeline = builder.build().unwrap();
+        let stats = pipeline.stats();
+        assert_eq!(stats.n_steps(), 2);
+        assert_eq!(stats.step_name(StepIdx(0)), "Source");
+        assert_eq!(stats.step_name(StepIdx(1)), "SinkU32");
+    }
+
+    #[test]
+    fn pipeline_run_populates_stats_when_enabled() {
+        let remaining = Arc::new(AtomicU32::new(20));
+        let received = Arc::new(AtomicU32::new(0));
+        let sink = ParallelCountingSink::new(&received);
+
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(SharedCountingSource { remaining: Arc::clone(&remaining) })
+            .chain(sink.clone())
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+        let stats = pipeline.stats();
+
+        let cfg =
+            PipelineConfig { threads: 2, stats: Some(Arc::clone(&stats)), ..Default::default() };
+        let result = pipeline.run(cfg);
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+        assert_eq!(received.load(AtomicOrd::Relaxed), 20);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.steps.len(), 2);
+        assert_eq!(snap.steps[0].0, "SharedSource");
+        assert_eq!(snap.steps[1].0, "ParallelSink");
+
+        // Sink saw exactly 20 items (one Progress per pop with item).
+        assert_eq!(snap.steps[1].1.progress_count, 20);
+        // Source must have made progress at least 20 times to push the items.
+        assert!(snap.steps[0].1.progress_count >= 20);
+        // Both steps accumulated wall time.
+        assert!(snap.steps[0].1.total_run_ns > 0);
+        assert!(snap.steps[1].1.total_run_ns > 0);
+        // No errors recorded.
+        assert_eq!(snap.steps[0].1.error_count, 0);
+        assert_eq!(snap.steps[1].1.error_count, 0);
+        // The source returned Finished at least once across the workers.
+        assert!(snap.steps[0].1.finished_count >= 1);
+    }
+
+    #[test]
+    fn pipeline_run_without_stats_succeeds_unchanged() {
+        let remaining = Arc::new(AtomicU32::new(5));
+        let received = Arc::new(AtomicU32::new(0));
+        let sink = ParallelCountingSink::new(&received);
+
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(SharedCountingSource { remaining: Arc::clone(&remaining) })
+            .chain(sink.clone())
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+
+        let result = pipeline.run(PipelineConfig { threads: 2, stats: None, ..Default::default() });
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+        assert_eq!(received.load(AtomicOrd::Relaxed), 5);
+    }
+
+    #[test]
+    fn pipeline_run_responds_to_cancellation() {
+        /// Source that emits forever (never returns `Finished`) until cancelled.
+        #[derive(Clone)]
+        struct InfiniteSource;
+        impl Step for InfiniteSource {
+            type Input = ();
+            type Outputs = Single<u32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "InfiniteSource",
+                    kind: StepKind::Parallel,
+                    sticky: false,
+                    output_queues: vec![QueueSpec::CountBounded { capacity: 8 }],
+                    branch_ordering: vec![BranchOrdering::None],
+                }
+            }
+            fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+                let _ = ctx.outputs.push(0);
+                Ok(StepOutcome::Progress)
+            }
+            fn new_worker_copy(&self) -> Self {
+                self.clone()
+            }
+        }
+
+        #[derive(Clone)]
+        struct DiscardSink;
+        impl Step for DiscardSink {
+            type Input = u32;
+            type Outputs = ();
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "DiscardSink",
+                    kind: StepKind::Parallel,
+                    sticky: false,
+                    output_queues: vec![],
+                    branch_ordering: vec![],
+                }
+            }
+            fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+                match ctx.input.pop() {
+                    Some(_) => Ok(StepOutcome::Progress),
+                    None => Ok(StepOutcome::NoProgress),
+                }
+            }
+            fn new_worker_copy(&self) -> Self {
+                self.clone()
+            }
+        }
+
+        let builder = PipelineBuilder::new();
+        builder.chain(InfiniteSource).chain(DiscardSink).into_sink_marker();
+        let pipeline = builder.build().unwrap();
+        let cancel = pipeline.cancel_handle();
+
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cancel.cancel();
+        });
+
+        let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
+        assert!(matches!(result, Err(PipelineError::Cancelled)));
+    }
+
+    #[test]
+    fn pipeline_run_propagates_step_error() {
+        /// Source that emits `n` items, then returns `Err`.
+        #[derive(Clone)]
+        struct FailingSource {
+            remaining: Arc<AtomicU32>,
+        }
+        impl Step for FailingSource {
+            type Input = ();
+            type Outputs = Single<u32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "FailingSource",
+                    kind: StepKind::Parallel,
+                    sticky: false,
+                    output_queues: vec![QueueSpec::CountBounded { capacity: 8 }],
+                    branch_ordering: vec![BranchOrdering::None],
+                }
+            }
+            fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+                let n = self.remaining.load(AtomicOrd::Acquire);
+                if n == 0 {
+                    return Err(std::io::Error::other("source failed"));
+                }
+                if self
+                    .remaining
+                    .compare_exchange(n, n - 1, AtomicOrd::AcqRel, AtomicOrd::Acquire)
+                    .is_ok()
+                {
+                    let _ = ctx.outputs.push(n);
+                    Ok(StepOutcome::Progress)
+                } else {
+                    Ok(StepOutcome::NoProgress)
+                }
+            }
+            fn new_worker_copy(&self) -> Self {
+                self.clone()
+            }
+        }
+
+        let received = Arc::new(AtomicU32::new(0));
+        let sink = ParallelCountingSink::new(&received);
+        let remaining = Arc::new(AtomicU32::new(5));
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(FailingSource { remaining: Arc::clone(&remaining) })
+            .chain(sink.clone())
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+
+        let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
+        match result {
+            Err(PipelineError::Io { step, source }) => {
+                assert_eq!(step, "FailingSource");
+                assert_eq!(source.kind(), std::io::ErrorKind::Other);
+            }
+            other => panic!("expected Io error, got {other:?}"),
+        }
+    }
+
+    // ───── sleep_until_stop ─────
+
+    /// When `stop` is already set, the helper must return effectively
+    /// immediately, never sleeping the full duration. This is the teardown
+    /// fast-path: the main thread sets `stop` then `join()`s, and the helper
+    /// must not block for a poll interval afterward.
+    #[test]
+    fn sleep_until_stop_returns_immediately_when_already_stopped() {
+        let stop = StopSignal::default();
+        stop.stop();
+        let start = std::time::Instant::now();
+        sleep_until_stop(&stop, std::time::Duration::from_secs(10));
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(100),
+            "expected near-immediate return, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// When `stop` is set partway through the sleep, the helper must wake and
+    /// return well before the full duration elapses (within a couple of poll
+    /// slices), proving it interrupts a long sleep rather than waiting it out.
+    #[test]
+    fn sleep_until_stop_wakes_when_stopped_midway() {
+        let stop = Arc::new(StopSignal::default());
+        let stop_clone = Arc::clone(&stop);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            stop_clone.stop();
+        });
+        let start = std::time::Instant::now();
+        sleep_until_stop(&stop, std::time::Duration::from_secs(10));
+        let elapsed = start.elapsed();
+        setter.join().unwrap();
+        // Woke shortly after the 50ms flag flip — far below the 10s budget.
+        assert!(elapsed >= std::time::Duration::from_millis(40), "woke too early: {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_millis(500), "woke too late: {elapsed:?}");
+    }
+
+    /// A duration so large that `Instant::now() + dur` is unrepresentable must
+    /// not panic: the helper falls back to an untimed wait and still wakes the
+    /// instant `stop()` fires. Regression test for the `checked_add` guard —
+    /// before it, `Duration::MAX` panicked here and silently disarmed the
+    /// monitor (whose join error `Pipeline::run` discards).
+    #[test]
+    fn sleep_until_stop_survives_an_unrepresentable_deadline() {
+        let stop = Arc::new(StopSignal::default());
+        let stop_clone = Arc::clone(&stop);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            stop_clone.stop();
+        });
+        let start = std::time::Instant::now();
+        sleep_until_stop(&stop, std::time::Duration::MAX);
+        let elapsed = start.elapsed();
+        setter.join().unwrap();
+        // Woke shortly after the 50ms flag flip, not after an (impossible) MAX wait.
+        assert!(elapsed >= std::time::Duration::from_millis(40), "woke too early: {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_millis(500), "woke too late: {elapsed:?}");
+    }
+
+    /// When `stop` is never set, the helper sleeps for approximately the full
+    /// duration (it does not return early). Generous upper bound keeps it
+    /// non-flaky on a loaded CI host.
+    #[test]
+    fn sleep_until_stop_sleeps_full_duration_when_never_stopped() {
+        let stop = StopSignal::default();
+        let start = std::time::Instant::now();
+        sleep_until_stop(&stop, std::time::Duration::from_millis(100));
+        let elapsed = start.elapsed();
+        assert!(elapsed >= std::time::Duration::from_millis(95), "returned too early: {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(2), "ran far too long: {elapsed:?}");
+    }
+
+    #[test]
+    fn classify_stall_progress_is_healthy() {
+        // Any advance in the global progress counter clears the stall,
+        // regardless of how long the prior stall was or what is in flight.
+        assert_eq!(classify_stall(true, 999, 10, 60, 1_000_000), StallVerdict::Progressing);
+    }
+
+    #[test]
+    fn classify_stall_empty_pipeline_is_starvation_not_deadlock() {
+        // No progress, but nothing is stuck anywhere: the pipeline is idle
+        // waiting on a slow upstream (e.g. a stdin pipe). Never fatal — mirrors
+        // legacy `check_deadlock_and_restore`'s starvation guard.
+        assert_eq!(classify_stall(false, 120, 10, 60, 0), StallVerdict::Starving);
+    }
+
+    /// The `in_flight_bytes` probe is blind to queued items whose `heap_size()`
+    /// is 0, because `ByteBoundedQueue` accounts `T::heap_size()` only and never
+    /// `size_of::<T>()`. A `ByteBounded` edge can therefore hold items and still
+    /// report zero bytes — which `classify_stall` reads as `Starving`, resetting
+    /// the stall clock on every poll so `deadlock_timeout_secs` never fires.
+    ///
+    /// This pins the accounting limitation documented on `in_flight_bytes`, so a
+    /// future change that starts counting `size_of::<T>()` (closing the blind
+    /// spot) fails here and prompts the doc to be updated with it.
+    #[test]
+    fn byte_bounded_queue_of_zero_heap_items_reports_no_bytes_in_flight() {
+        use crate::queues::{ByteBoundedQueue, ItemQueue};
+
+        // `u32: HeapSize` reports 0 heap bytes (see `item.rs`).
+        let q = ByteBoundedQueue::<u32>::new(64 * 1024);
+        for i in 0..100u32 {
+            q.try_push(i).expect("64 KiB budget accepts zero-heap items");
+        }
+        assert!(!q.is_empty(), "the items really are queued");
+        assert_eq!(
+            q.current_bytes(),
+            0,
+            "heap_size()-only accounting reports zero for zero-heap items"
+        );
+        // ...and a wedge stranding exactly those items is unclassifiable.
+        assert_eq!(
+            classify_stall(false, 999, 10, 60, q.current_bytes()),
+            StallVerdict::Starving,
+            "a wedge holding only zero-heap items cannot reach Wedged"
+        );
+    }
+
+    #[test]
+    fn classify_stall_stuck_work_below_fatal_only_warns() {
+        // No progress with work stuck, but the stall has not persisted long
+        // enough to be sure it is a wedge rather than one slow dispatch.
+        assert_eq!(classify_stall(false, 15, 10, 60, 4096), StallVerdict::Stalled);
+    }
+
+    #[test]
+    fn classify_stall_below_warn_threshold_keeps_watching() {
+        // Stalled with stuck work but not yet past the warn threshold: no-op.
+        assert_eq!(classify_stall(false, 5, 10, 60, 4096), StallVerdict::Watching);
+    }
+
+    #[test]
+    fn classify_stall_stuck_work_past_fatal_is_wedged() {
+        // No progress with work stuck for >= the fatal threshold: a genuine
+        // wedge — fail fast instead of hanging forever.
+        assert_eq!(classify_stall(false, 60, 10, 60, 4096), StallVerdict::Wedged);
+    }
+
+    /// L2.4: a Detached step legitimately blocked on EMPTY input (slow upstream)
+    /// must NOT trip the monitor. The Detached merge's data flows through the
+    /// internal `SortMergeSlot` table — invisible to `in_flight_bytes` — and its
+    /// framework input edge (setup events) is drained early, so while it waits
+    /// for decompress the byte-bounded edges feeding it are EMPTY:
+    /// `in_flight_bytes == 0` → `Starving` (progress-shaped), never `Wedged`,
+    /// no matter how long the wait. The starvation guard already encodes this;
+    /// this test pins the Detached interpretation against a regression.
+    #[test]
+    fn monitor_no_false_positive_on_idle_detached() {
+        // Long stall, well past the fatal threshold, but nothing is stuck on a
+        // visible byte-bounded edge (the Detached step is parked on its empty
+        // input). Must be Starving, not Wedged.
+        assert_eq!(classify_stall(false, 600, 10, 60, 0), StallVerdict::Starving);
+        // And the instant the slow producer feeds it, global progress advances.
+        assert_eq!(classify_stall(true, 600, 10, 60, 0), StallVerdict::Progressing);
+    }
+
+    /// L2.4 (revision item 10): a *genuine* wedge of the Detached merge still
+    /// trips fatal. If the merge is truly stuck, its pool upstream (decompress)
+    /// can't push to the full slots either, so the byte-bounded spill→decompress
+    /// edge stays FULL with no progress — `in_flight_bytes > 0` past the fatal
+    /// window → `Wedged`. The slot-table blindness does not hide a real wedge,
+    /// because the upstream byte edge always reflects it.
+    #[test]
+    fn monitor_still_trips_on_genuine_detached_wedge() {
+        assert_eq!(classify_stall(false, 60, 10, 60, 1_048_576), StallVerdict::Wedged);
+    }
+
+    /// A step with a single output branch of the given `QueueSpec`, used to
+    /// exercise the monitor-visibility transport check.
+    fn step_with_output_spec(
+        name: &'static str,
+        spec: QueueSpec,
+    ) -> Box<dyn crate::erased::ErasedStep> {
+        #[derive(Clone)]
+        struct SpecStep {
+            name: &'static str,
+            spec: QueueSpec,
+        }
+        impl Step for SpecStep {
+            type Input = u32;
+            type Outputs = Single<u32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: self.name,
+                    kind: StepKind::Serial,
+                    sticky: false,
+                    output_queues: vec![self.spec],
+                    branch_ordering: vec![BranchOrdering::None],
+                }
+            }
+            fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+        Box::new(crate::erased::TypedStep::new(SpecStep { name, spec }))
+    }
+
+    /// A `ChainGraph` whose per-step branch count matches each step's declared
+    /// `output_queues` length — the common shape where every branch has a spec.
+    fn graph_matching_specs(
+        steps: &[Box<dyn crate::erased::ErasedStep>],
+    ) -> crate::topology::ChainGraph {
+        let mut g = crate::topology::ChainGraph::new();
+        for step in steps {
+            g.register_step(step.profile().name, step.profile().output_queues.len());
+        }
+        g
+    }
+
+    #[test]
+    fn first_monitor_blind_transport_finds_count_and_unbounded() {
+        // All-ByteBounded: every transport is monitor-visible.
+        let visible = vec![
+            step_with_output_spec("A", QueueSpec::ByteBounded { limit_bytes: 1 << 20 }),
+            step_with_output_spec("B", QueueSpec::ByteBounded { limit_bytes: 1 << 20 }),
+        ];
+        assert!(first_monitor_blind_transport(&visible, &graph_matching_specs(&visible)).is_none());
+
+        // A CountBounded branch is flagged (it registers no byte probe).
+        let with_count = vec![
+            step_with_output_spec("A", QueueSpec::ByteBounded { limit_bytes: 1 << 20 }),
+            step_with_output_spec("Blind", QueueSpec::CountBounded { capacity: 8 }),
+        ];
+        let (name, spec) =
+            first_monitor_blind_transport(&with_count, &graph_matching_specs(&with_count)).unwrap();
+        assert_eq!(name, "Blind");
+        assert!(matches!(spec, QueueSpec::CountBounded { .. }));
+
+        // Unbounded is flagged too.
+        let with_unbounded = vec![step_with_output_spec("U", QueueSpec::Unbounded)];
+        assert!(
+            first_monitor_blind_transport(&with_unbounded, &graph_matching_specs(&with_unbounded))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn first_monitor_blind_transport_flags_implicit_unbounded_branch() {
+        // A step whose graph branch count exceeds its declared `output_queues`:
+        // the extra branch resolves to `QueueSpec::Unbounded` (matching `dag()`
+        // and context-building), which is monitor-blind and must be flagged even
+        // though the step declared only one explicit, ByteBounded spec.
+        let steps = vec![step_with_output_spec(
+            "HasImplicitBranch",
+            QueueSpec::ByteBounded { limit_bytes: 1 << 20 },
+        )];
+        let mut graph = crate::topology::ChainGraph::new();
+        graph.register_step("HasImplicitBranch", 2); // 2 branches, 1 explicit spec
+        let (name, spec) = first_monitor_blind_transport(&steps, &graph).unwrap();
+        assert_eq!(name, "HasImplicitBranch");
+        assert!(matches!(spec, QueueSpec::Unbounded), "implicit 2nd branch is Unbounded");
+    }
+
+    #[test]
+    fn ensure_monitor_visible_transports_ok_for_all_byte_bounded() {
+        // The armed-monitor invariant holds (returns Ok) when every output
+        // transport is ByteBounded.
+        let steps = vec![
+            step_with_output_spec("A", QueueSpec::ByteBounded { limit_bytes: 1 << 20 }),
+            step_with_output_spec("B", QueueSpec::ByteBounded { limit_bytes: 1 << 20 }),
+        ];
+        assert!(ensure_monitor_visible_transports(&steps, &graph_matching_specs(&steps)).is_ok());
+    }
+
+    #[test]
+    fn ensure_monitor_visible_transports_errs_on_count_bounded() {
+        // A monitor-blind transport on an armed pipeline is rejected with a
+        // graceful error (in every build, release included) instead of silently
+        // losing the wedge verdict or crashing the process.
+        let steps = vec![step_with_output_spec("Blind", QueueSpec::CountBounded { capacity: 8 })];
+        let err = ensure_monitor_visible_transports(&steps, &graph_matching_specs(&steps))
+            .expect_err("a CountBounded transport on an armed pipeline must be rejected");
+        assert!(
+            matches!(err, PipelineError::MonitorBlindTransport { step: "Blind", .. }),
+            "expected MonitorBlindTransport for the blind step, got {err:?}"
+        );
+    }
+
+    /// Arming the monitor must enforce the monitor-visible-transport invariant
+    /// even with no stats handle attached.
+    ///
+    /// This goes through `Pipeline::run` rather than calling
+    /// `ensure_monitor_visible_transports` directly on purpose: the helper's own
+    /// unit tests above pass whatever condition guards the *call site*, so they
+    /// cannot catch a guard that skips the check. Only a run-level test can.
+    ///
+    /// The failure it pins is silent, which is what makes it worth a test: on a
+    /// blind edge `in_flight_bytes` reports 0, `classify_stall` reads that as
+    /// `Starving`, and `Starving` resets the stall clock on every poll — so an
+    /// armed monitor would watch a wedged pipeline forever and never fail it.
+    ///
+    /// The converse — that a blind transport is still legal on a *disarmed* run
+    /// — needs no test of its own: most chains in this suite pair a
+    /// `CountBounded` edge with the default `deadlock_timeout_secs: 0`, so an
+    /// over-broad guard would fail them by the hundred.
+    #[test]
+    fn pipeline_run_rejects_a_monitor_blind_transport_without_stats() {
+        // `StubSource` declares `CountBounded`, which the byte-accounting probe
+        // cannot see. The chain never terminates (`StubSinkU32` always reports
+        // `NoProgress`), which is fine here and load-bearing for the assertion:
+        // the transport check runs before any worker is spawned, so a passing
+        // run proves the rejection happened at startup rather than after any
+        // work.
+        let builder = PipelineBuilder::new();
+        builder.chain(StubSource).chain(StubSinkU32).into_sink_marker();
+        let pipeline = builder.build().unwrap();
+
+        let err = pipeline
+            .run(PipelineConfig {
+                threads: 2,
+                stats: None,
+                deadlock_timeout_secs: 5,
+                ..Default::default()
+            })
+            .expect_err("an armed monitor on a blind transport must fail the run");
+        assert!(
+            matches!(err, PipelineError::MonitorBlindTransport { step: "Source", .. }),
+            "expected MonitorBlindTransport for the blind source, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn apply_stall_verdict_wedged_records_timeout_and_cancels() {
+        use crate::signal::PipelineError;
+        let stats = PipelineStats::new(vec![]);
+        let signal = PipelineSignal::new();
+        let now = std::time::Instant::now();
+        let mut mon_state = StallMonitorState { last_total: 0, stall_start: now, last_warn: None };
+
+        let stop = apply_stall_verdict(
+            StallVerdict::Wedged,
+            now,
+            0,
+            60,
+            4096,
+            std::time::Duration::from_secs(10),
+            Some(&stats),
+            &signal,
+            &mut mon_state,
+        );
+
+        assert!(stop, "a wedge must stop the monitor");
+        assert!(signal.is_done(), "a wedge must make workers observe is_done()");
+        match signal.outcome() {
+            Some(PipelineError::TimedOut { stalled_secs }) => assert_eq!(*stalled_secs, 60),
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        // Exercises the `TimedOut` Display arm.
+        assert!(signal.outcome().unwrap().to_string().contains("no progress"));
+    }
+
+    #[test]
+    fn apply_stall_verdict_stalled_warns_once_per_window() {
+        let stats = PipelineStats::new(vec![]);
+        let signal = PipelineSignal::new();
+        let now = std::time::Instant::now();
+        let mut mon_state = StallMonitorState { last_total: 0, stall_start: now, last_warn: None };
+        let warn = std::time::Duration::from_secs(10);
+
+        // First stall in the window arms the throttle without failing the run.
+        let stop = apply_stall_verdict(
+            StallVerdict::Stalled,
+            now,
+            0,
+            15,
+            4096,
+            warn,
+            Some(&stats),
+            &signal,
+            &mut mon_state,
+        );
+        assert!(!stop);
+        assert!(mon_state.last_warn.is_some(), "a stall must arm the warn throttle");
+        assert!(!signal.is_done(), "a stall must not fail the run");
+
+        // A second stall inside the same window must not re-arm (no re-warn).
+        let armed = mon_state.last_warn;
+        let stop2 = apply_stall_verdict(
+            StallVerdict::Stalled,
+            now,
+            0,
+            16,
+            4096,
+            warn,
+            Some(&stats),
+            &signal,
+            &mut mon_state,
+        );
+        assert!(!stop2);
+        assert_eq!(mon_state.last_warn, armed, "must not re-warn within the same window");
+    }
+
+    #[test]
+    fn apply_stall_verdict_progressing_and_starving_reset_the_clock() {
+        let stats = PipelineStats::new(vec![]);
+        let signal = PipelineSignal::new();
+        let t0 = std::time::Instant::now();
+        let warn = std::time::Duration::from_secs(10);
+        let mut mon_state =
+            StallMonitorState { last_total: 0, stall_start: t0, last_warn: Some(t0) };
+
+        // Progress advances the watermark and clears the warn throttle.
+        let later = t0 + std::time::Duration::from_secs(5);
+        let stop = apply_stall_verdict(
+            StallVerdict::Progressing,
+            later,
+            42,
+            0,
+            0,
+            warn,
+            Some(&stats),
+            &signal,
+            &mut mon_state,
+        );
+        assert!(!stop);
+        assert_eq!(mon_state.last_total, 42);
+        assert_eq!(mon_state.stall_start, later);
+        assert!(mon_state.last_warn.is_none());
+        assert!(!signal.is_done());
+
+        // Starvation (nothing in flight) resets the clock without failing.
+        mon_state.last_warn = Some(t0);
+        let even_later = later + std::time::Duration::from_secs(5);
+        let stop2 = apply_stall_verdict(
+            StallVerdict::Starving,
+            even_later,
+            99,
+            0,
+            0,
+            warn,
+            Some(&stats),
+            &signal,
+            &mut mon_state,
+        );
+        assert!(!stop2);
+        assert_eq!(mon_state.stall_start, even_later);
+        assert!(mon_state.last_warn.is_none());
+        assert!(!signal.is_done());
+    }
+
+    #[test]
+    fn in_flight_bytes_counts_transport_and_reorder_stash() {
+        // The wedge-vs-starvation signal must include the reorder overflow
+        // stash, not just transport queues — items can sit in a reorder buffer
+        // (waiting for a missing serial) while every transport reads empty.
+        use crate::item::HeapSize;
+        use crate::queues::{BoundedQueueHandle, ByteBoundedQueue, CountBoundedQueue, ItemQueue};
+        use crate::reorder::{ReorderCapHandle, ReorderStage, Sequenced};
+        use crate::runtime::contexts::{ChainContexts, RegisteredQueue};
+        use crate::topology::{BranchIdx, StepIdx};
+
+        #[derive(Debug)]
+        struct Heavy(Vec<u8>);
+        impl HeapSize for Heavy {
+            fn heap_size(&self) -> usize {
+                self.0.len()
+            }
+        }
+
+        // Transport queue holding 200 bytes.
+        let transport = Arc::new(ByteBoundedQueue::<Heavy>::new(10_000));
+        transport.try_push(Heavy(vec![0u8; 200])).unwrap();
+        assert_eq!(transport.current_bytes(), 200);
+
+        // Reorder stage with 300 bytes stuck in its overflow stash: with
+        // next_serial (0) absent and the inner transport (cap 1) full, the
+        // second push overflows into the buffer.
+        let inner: Arc<dyn ItemQueue<Sequenced<Heavy>>> =
+            Arc::new(CountBoundedQueue::<Sequenced<Heavy>>::new(1));
+        let reorder = Arc::new(ReorderStage::with_max_overflow_bytes(inner, 100_000));
+        reorder.try_push(5, Heavy(vec![0u8; 100])).unwrap(); // -> inner transport
+        reorder.try_push(6, Heavy(vec![0u8; 300])).unwrap(); // -> overflow stash
+        assert_eq!(reorder.current_buffer_bytes(), 300);
+
+        let handle: Arc<dyn BoundedQueueHandle> = transport.clone();
+        let cap: Arc<dyn ReorderCapHandle> = reorder.clone();
+        let rq = RegisteredQueue {
+            producer_step_name: "test",
+            producer_step: StepIdx(0),
+            branch: BranchIdx(0),
+            handle,
+            reorder_cap: Some(cap),
+        };
+        let contexts = ChainContexts {
+            inputs: vec![],
+            outputs: vec![],
+            bounded_queues: vec![rq],
+            edges: vec![],
+        };
+        // 200 (transport) + 300 (reorder stash).
+        assert_eq!(in_flight_bytes(&contexts), 500);
+
+        // An empty registry reads zero — the starvation (idle) signal.
+        let empty = ChainContexts {
+            inputs: vec![],
+            outputs: vec![],
+            bounded_queues: vec![],
+            edges: vec![],
+        };
+        assert_eq!(in_flight_bytes(&empty), 0);
+    }
+}

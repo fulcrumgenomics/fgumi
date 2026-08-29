@@ -566,7 +566,7 @@ pub const BOTTOM_STRAND_DUPLEX: &str = "/B";
 ///
 /// Determines how reads are grouped based on their UMI sequences. Each strategy makes
 /// different tradeoffs between speed, error tolerance, and grouping behavior.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 pub enum Strategy {
     /// Only reads with identical UMI sequences are grouped together

@@ -722,6 +722,103 @@ pub struct GroupReadsByUmi {
     pub memory_report_interval: u64,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GroupOptions — the stage's tuning knobs, projected out of the CLI struct
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Group-stage tuning, independent of how the values were supplied.
+///
+/// See [`crate::commands::zipper::ZipperOptions`] for why this is a plain
+/// struct rather than a flattened `clap::Args`.
+///
+/// Two fields hold *resolved* values rather than raw flags, because grouping
+/// cannot be configured from the raw ones alone: `min_map_q` applies the
+/// default that [`GroupReadsByUmi`] would otherwise apply at run time, and
+/// `effective_strategy` / `effective_edits` carry the `--no-umi` and
+/// identity-implies-zero-edits rules. Both come from the same methods
+/// `execute` uses, so the command and the chain builder cannot drift apart.
+#[derive(Debug, Clone)]
+pub struct GroupOptions {
+    /// Minimum mapping quality for mapped reads, with the default applied.
+    pub min_map_q: u8,
+    /// Include non-PF reads.
+    pub include_non_pf_reads: bool,
+    /// Allow fully unmapped templates.
+    pub allow_unmapped: bool,
+    /// The strategy as requested on the command line.
+    pub strategy: Strategy,
+    /// The edit distance as requested on the command line.
+    pub edits: u32,
+    /// Minimum UMI length to accept.
+    pub min_umi_length: Option<usize>,
+    /// When to build the N-gram/BK-tree index instead of scanning linearly.
+    ///
+    /// This is [`fgumi_umi::IndexThreshold`] rather than a bare count: the
+    /// flag also accepts `always` / `never`, which a number cannot express.
+    pub index_threshold: IndexThreshold,
+    /// Skip UMI-based grouping entirely.
+    pub no_umi: bool,
+    /// Template-count floor for handing a position group to a parallel assigner.
+    pub parallel_group_min_templates: Option<ParallelMinTemplates>,
+    /// The strategy actually used, after applying `--no-umi`.
+    pub effective_strategy: Strategy,
+    /// The edit distance actually used, after applying `--no-umi` and the
+    /// identity-implies-zero rule.
+    pub effective_edits: u32,
+    /// Optional family-size histogram output.
+    pub family_size_histogram: Option<PathBuf>,
+    /// Optional grouping-metrics output.
+    pub grouping_metrics: Option<PathBuf>,
+    /// Optional output prefix for the full set of metrics files.
+    pub metrics_prefix: Option<PathBuf>,
+}
+
+impl GroupReadsByUmi {
+    /// The minimum mapping quality to apply, defaulting when the flag is absent.
+    #[must_use]
+    pub fn resolved_min_map_q(&self) -> u8 {
+        self.min_map_q.unwrap_or(1)
+    }
+
+    /// Resolve the strategy and edit distance grouping will actually use.
+    ///
+    /// `--no-umi` forces identity grouping, and identity grouping requires an
+    /// edit distance of zero; both rules live here so `execute` and the chain
+    /// builder cannot disagree about what was configured. The caller is
+    /// responsible for rejecting `--no-umi` with `--strategy paired` and for
+    /// logging the override — this method only computes.
+    #[must_use]
+    pub fn resolve_strategy_and_edits(&self) -> (Strategy, u32) {
+        if self.no_umi {
+            return (Strategy::Identity, 0);
+        }
+        let edits = if matches!(self.strategy, Strategy::Identity) { 0 } else { self.edits };
+        (self.strategy, edits)
+    }
+
+    /// Project the parsed CLI flags into [`GroupOptions`].
+    #[must_use]
+    pub fn to_group_options(&self) -> GroupOptions {
+        let (effective_strategy, effective_edits) = self.resolve_strategy_and_edits();
+        GroupOptions {
+            min_map_q: self.resolved_min_map_q(),
+            include_non_pf_reads: self.include_non_pf_reads,
+            allow_unmapped: self.allow_unmapped,
+            strategy: self.strategy,
+            edits: self.edits,
+            min_umi_length: self.min_umi_length,
+            index_threshold: self.index_threshold,
+            no_umi: self.no_umi,
+            parallel_group_min_templates: self.parallel_group_min_templates.clone(),
+            effective_strategy,
+            effective_edits,
+            family_size_histogram: self.family_size_histogram.clone(),
+            grouping_metrics: self.grouping_metrics.clone(),
+            metrics_prefix: self.metrics.clone(),
+        }
+    }
+}
+
 /// Build [`UmiGroupingMetrics`] from filter metrics and family size counts.
 ///
 /// Shared by both the pipeline and single-threaded execution paths.
@@ -803,23 +900,10 @@ impl Command for GroupReadsByUmi {
         }
 
         // Handle --no-umi mode: force identity strategy
-        let (effective_strategy, no_umi_edits_override) = if self.no_umi {
-            if !matches!(self.strategy, Strategy::Identity) {
-                info!("--no-umi mode: overriding strategy to identity");
-            }
-            (Strategy::Identity, true)
-        } else {
-            (self.strategy, false)
-        };
-
-        // Identity strategy requires edits=0, others use the configured value
-        // Also force edits=0 in no-umi mode
-        let effective_edits =
-            if no_umi_edits_override || matches!(effective_strategy, Strategy::Identity) {
-                0
-            } else {
-                self.edits
-            };
+        if self.no_umi && !matches!(self.strategy, Strategy::Identity) {
+            info!("--no-umi mode: overriding strategy to identity");
+        }
+        let (effective_strategy, effective_edits) = self.resolve_strategy_and_edits();
 
         // `--index-threshold always` asserts that indexing will happen; reject it when
         // the resolved strategy/edits can never index rather than ignoring the flag.
@@ -833,7 +917,7 @@ impl Command for GroupReadsByUmi {
         self.io.validate()?;
 
         // Set minimum mapping quality
-        let min_mapq: u8 = self.min_map_q.unwrap_or(1);
+        let min_mapq: u8 = self.resolved_min_map_q();
 
         // Initialize tracking infrastructure
         let timer = OperationTimer::new("Grouping reads by UMI");
@@ -1802,6 +1886,161 @@ fn with_extension(prefix: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `--no-umi` and identity-implies-zero-edits rules, pinned as a table.
+    ///
+    /// These moved out of `execute` into [`GroupReadsByUmi::resolve_strategy_and_edits`]
+    /// so the command and the chain builder read them from one place; this is
+    /// the regression test for that move. Identity forces zero edits because a
+    /// non-zero edit distance would silently change which reads group together,
+    /// and `--no-umi` forces identity because there is no UMI to compare.
+    #[rstest]
+    #[case::adjacency_passes_through(Strategy::Adjacency, 2, false, Strategy::Adjacency, 2)]
+    #[case::edit_passes_through(Strategy::Edit, 3, false, Strategy::Edit, 3)]
+    #[case::paired_passes_through(Strategy::Paired, 1, false, Strategy::Paired, 1)]
+    #[case::identity_forces_zero_edits(Strategy::Identity, 2, false, Strategy::Identity, 0)]
+    #[case::no_umi_forces_identity_and_zero(Strategy::Adjacency, 2, true, Strategy::Identity, 0)]
+    #[case::no_umi_over_identity(Strategy::Identity, 0, true, Strategy::Identity, 0)]
+    fn resolve_strategy_and_edits_applies_the_no_umi_and_identity_rules(
+        #[case] strategy: Strategy,
+        #[case] edits: u32,
+        #[case] no_umi: bool,
+        #[case] expected_strategy: Strategy,
+        #[case] expected_edits: u32,
+    ) {
+        let mut cmd = GroupReadsByUmi::try_parse_from([
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "-s",
+            "adjacency",
+        ])
+        .expect("parses");
+        cmd.strategy = strategy;
+        cmd.edits = edits;
+        cmd.no_umi = no_umi;
+
+        assert_eq!(cmd.resolve_strategy_and_edits(), (expected_strategy, expected_edits));
+    }
+
+    /// `--min-map-q` is optional on the command line but not optional for
+    /// grouping, so the projection applies the same default `execute` does.
+    #[rstest]
+    #[case::absent_defaults_to_one(None, 1)]
+    #[case::zero_is_honored_not_treated_as_absent(Some(0), 0)]
+    #[case::explicit_value(Some(30), 30)]
+    fn resolved_min_map_q_applies_the_default(#[case] flag: Option<u8>, #[case] expected: u8) {
+        let mut cmd = GroupReadsByUmi::try_parse_from([
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "-s",
+            "adjacency",
+        ])
+        .expect("parses");
+        cmd.min_map_q = flag;
+
+        assert_eq!(cmd.resolved_min_map_q(), expected);
+    }
+
+    /// Every tuning flag must survive the projection into [`GroupOptions`].
+    ///
+    /// Parsed rather than constructed so a renamed or unwired flag fails here.
+    /// `metrics_prefix` is the one renamed field — it is fed by `--metrics` —
+    /// and `effective_*` are the resolved ones, so both are asserted explicitly.
+    #[test]
+    fn to_group_options_carries_every_tuning_flag() {
+        let cmd = GroupReadsByUmi::try_parse_from([
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "-s",
+            "adjacency",
+            "-e",
+            "2",
+            "-m",
+            "30",
+            "--min-umi-length",
+            "8",
+            "--index-threshold",
+            "250",
+            "--family-size-histogram",
+            "fs.txt",
+            "--grouping-metrics",
+            "gm.txt",
+            "--metrics",
+            "prefix",
+            "--include-non-pf-reads=true",
+            "--allow-unmapped=true",
+            "--parallel-group-min-templates",
+            "500",
+        ])
+        .expect("parses");
+
+        let opts = cmd.to_group_options();
+
+        assert_eq!(opts.min_map_q, 30);
+        assert!(opts.include_non_pf_reads);
+        assert!(opts.allow_unmapped);
+        assert_eq!(opts.strategy, Strategy::Adjacency);
+        assert_eq!(opts.edits, 2);
+        assert_eq!(opts.min_umi_length, Some(8));
+        assert_eq!(opts.index_threshold, IndexThreshold::MinUmis(250));
+        assert_eq!(opts.parallel_group_min_templates, Some(ParallelMinTemplates::Fixed(500)));
+        assert!(!opts.no_umi);
+        assert_eq!(opts.family_size_histogram, Some(std::path::PathBuf::from("fs.txt")));
+        assert_eq!(opts.grouping_metrics, Some(std::path::PathBuf::from("gm.txt")));
+        assert_eq!(
+            opts.metrics_prefix,
+            Some(std::path::PathBuf::from("prefix")),
+            "metrics_prefix is fed by --metrics, not by a flag of its own",
+        );
+
+        // Not overridden here, so the resolved pair matches what was requested.
+        assert_eq!(opts.effective_strategy, Strategy::Adjacency);
+        assert_eq!(opts.effective_edits, 2);
+    }
+
+    /// The projection must carry defaults faithfully too — a field hard-coded to
+    /// the value the non-default test happens to pass would slip through it.
+    ///
+    /// `min_map_q` is the interesting one: the CLI holds `Option<u8>` and the
+    /// projection resolves the absent case to 1, so this pins the resolution
+    /// rather than the raw flag.
+    #[test]
+    fn to_group_options_carries_defaults() {
+        let cmd = GroupReadsByUmi::try_parse_from([
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "-s",
+            "adjacency",
+        ])
+        .expect("parses");
+
+        let opts = cmd.to_group_options();
+
+        assert_eq!(opts.min_map_q, 1, "an absent --min-map-q resolves to 1");
+        assert!(!opts.include_non_pf_reads);
+        assert!(!opts.allow_unmapped);
+        assert_eq!(opts.edits, 1);
+        assert_eq!(opts.min_umi_length, None);
+        assert_eq!(opts.index_threshold, IndexThreshold::MinUmis(100));
+        assert_eq!(opts.parallel_group_min_templates, None);
+        assert!(!opts.no_umi);
+        assert_eq!(opts.family_size_histogram, None);
+        assert_eq!(opts.grouping_metrics, None);
+        assert_eq!(opts.metrics_prefix, None);
+    }
+
     use crate::assigner::{IdentityUmiAssigner, PairedUmiAssigner, Strategy};
     use crate::metrics::TemplateFilterReason;
     use bstr::BString;

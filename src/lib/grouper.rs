@@ -223,7 +223,7 @@ impl Grouper for TemplateGrouper {
         // records into the same template.
         for decoded in records {
             let name_hash = decoded.key.name_hash;
-            let raw = decoded.data;
+            let raw = decoded.into_raw_bytes();
             let read_name = fgumi_raw_bam::read_name(&raw);
             let same_template = match (self.current_name_hash, self.current_name.as_deref()) {
                 (Some(h), Some(name)) => h == name_hash && name == read_name,
@@ -430,7 +430,7 @@ impl RecordPositionGrouper {
     fn validate_mc_tag(decoded: &DecodedRecord) -> io::Result<()> {
         use fgumi_raw_bam::RawRecordView;
 
-        let raw = &decoded.data;
+        let raw = decoded.record();
         let flg = RawRecordView::new(raw).flags();
         let is_paired = (flg & fgumi_raw_bam::flags::PAIRED) != 0;
         let is_secondary = (flg & fgumi_raw_bam::flags::SECONDARY) != 0;
@@ -489,8 +489,8 @@ impl RecordPositionGrouper {
                     // Hash match is a fast pre-check; confirm QNAME bytes to guard
                     // against hash collisions merging unrelated templates.
                     last.key.name_hash == decoded.key.name_hash
-                        && fgumi_raw_bam::read_name(&last.data)
-                            == fgumi_raw_bam::read_name(&decoded.data)
+                        && fgumi_raw_bam::read_name(last.raw_bytes())
+                            == fgumi_raw_bam::read_name(decoded.raw_bytes())
                 }) =>
             {
                 // Different position but same template (name_hash + QNAME match with
@@ -601,7 +601,7 @@ fn group_by_name_and_build<T>(
         // borrow (and only copy it out when a new group starts) so records within
         // a group don't each allocate a QNAME `Vec` — the borrow must end before
         // `extract` consumes `decoded`.
-        let read_name = fgumi_raw_bam::read_name(&decoded.data);
+        let read_name = fgumi_raw_bam::read_name(decoded.raw_bytes());
         let same =
             current_name_hash == Some(name_hash) && current_name.as_deref() == Some(read_name);
         let new_name = if same { None } else { Some(read_name.to_vec()) };
@@ -666,6 +666,15 @@ impl MemoryEstimate for FastqTemplate {
         let records_heap: usize = self.records.iter().map(MemoryEstimate::estimate_heap_size).sum();
         let records_vec_overhead = self.records.capacity() * std::mem::size_of::<FastqRecord>();
         self.name.capacity() + records_heap + records_vec_overhead
+    }
+}
+
+/// The typed-step pipeline byte-bounds its queues on this. Delegates to
+/// [`MemoryEstimate::estimate_heap_size`] so the queue budget and the memory
+/// estimate are a single source of truth.
+impl crate::pipeline::core::item::HeapSize for FastqTemplate {
+    fn heap_size(&self) -> usize {
+        MemoryEstimate::estimate_heap_size(self)
     }
 }
 
@@ -1552,8 +1561,11 @@ mod tests {
             .finish()
             .expect("finish must succeed with a group key set")
             .expect("the buffered position must be emitted");
-        let names: Vec<Vec<u8>> =
-            group.records.iter().map(|r| fgumi_raw_bam::read_name(&r.data).to_vec()).collect();
+        let names: Vec<Vec<u8>> = group
+            .records
+            .iter()
+            .map(|r| fgumi_raw_bam::read_name(r.raw_bytes()).to_vec())
+            .collect();
         assert_eq!(
             names,
             vec![b"readA".to_vec(), b"readB".to_vec(), b"readC".to_vec()],

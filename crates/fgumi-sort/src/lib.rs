@@ -39,63 +39,41 @@ use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::header::tag as header_tag;
 use tempfile::TempDir;
 
-// All sub-modules are crate-private. Items intended for external consumers are
-// re-exported at the crate root below.
+// Sub-modules are crate-private except where a consumer needs to name the type
+// itself rather than just receive it (`arena_pool`, `segmented_buf`, `codec`,
+// `ref_sort`, `template_arena`).
+// Everything else is re-exported at the crate root below.
+pub mod arena_pool;
 pub(crate) mod bgzf_io;
+pub(crate) mod chunk_sorter;
 pub mod codec;
-/// Whether to emit the sort's performance diagnostics.
-///
-/// A plain `fgumi sort` used to print ~99 diagnostic lines at INFO -- spill
-/// geometry, per-phase breakdowns, park census tables, stall histograms -- and
-/// none of it was opt-in. Those lines exist to answer "which of three limits is
-/// this merge on, and where did the time go" during a performance investigation.
-/// They are read from a log file with a grep, never from a terminal, and they
-/// buried the handful of lines an end user can act on.
-///
-/// The flag is run-scoped, not a process-global: it lives on [`RawExternalSorter`] (the sort's
-/// options struct) and is copied into the `SortPhaseTimer` and `SortWorkerPool` that sorter
-/// builds, so two sorts in one process (fgumi-sort is a library) keep independent settings. The
-/// emitters therefore read it from the `self`/`pool` they already hold, or take it as a
-/// `sort_stats: bool` parameter where they are free functions.
-///
-/// Emit a performance diagnostic, at INFO, only when `--sort-stats` is on for the run.
-///
-/// The first argument is the run-scoped `sort_stats` flag (a `bool`); the rest is a `log::info!`
-/// format string and arguments.
-///
-/// Deliberately not `debug!`: these lines are the harness's data, and a benchmark that has to
-/// raise the global log level to collect them also collects every other crate's debug output,
-/// which is how a 1,700-line log became a 60,000-line one. `--sort-stats` selects *these* lines
-/// and nothing else.
-macro_rules! stat {
-    ($enabled:expr, $($arg:tt)*) => {
-        if $enabled {
-            log::info!($($arg)*);
-        }
-    };
-}
-
 pub(crate) mod external;
 pub(crate) mod fd_limit;
 pub(crate) mod inline;
 pub(crate) mod keys;
 pub(crate) mod loser_tree;
 pub(crate) mod memory_probe;
-pub(crate) mod merge_headroom;
 pub(crate) mod merge_phases;
+pub(crate) mod merge_slots;
 pub(crate) mod merge_stalls;
 pub(crate) mod merge_trace;
-pub(crate) mod phase1_keys;
-pub(crate) mod phase1_stats;
 pub(crate) mod pipeline;
 pub(crate) mod pooled_bam_writer;
 pub(crate) mod pooled_chunk_writer;
-pub(crate) mod progress_batch;
 pub(crate) mod radix;
 pub(crate) mod read_ahead;
 pub(crate) mod reader;
-pub(crate) mod segmented_buf;
-pub(crate) mod spill_reader;
+pub mod ref_sort;
+pub mod segmented_buf;
+pub mod template_arena;
+// Block-granular spill compression kernel for the block-parallel spill steps
+// (`SpillGather`/`SpillCompress`/`SpillWrite`). Surfaced via the re-exports
+// below.
+pub(crate) mod spill_block;
+pub(crate) mod spill_block_reader;
+// Synchronous inline spill compress for the P6 `CompressSpill` step (retires the
+// `SortWorkerPool` compress path). Surfaced via `write_sorted_chunk` below.
+pub(crate) mod sync_spill_writer;
 pub(crate) mod tmp_dir_alloc;
 pub(crate) mod verify;
 pub(crate) mod worker_pool;
@@ -234,27 +212,43 @@ fn create_temp_dir(base: Option<&Path>) -> Result<TempDir> {
     }
 }
 
+pub use arena_pool::{ArenaPool, PooledSegmentedBuf};
+pub use chunk_sorter::{CoordinateChunkSorter, TemplateChunkSorter};
 pub use codec::SpillCodec;
+pub use external::MemorySources;
 pub use external::{
-    KeyTypesSpec, LibraryLookup, RawExternalSorter, ReadStreams, cb_hasher,
-    extract_template_key_inline, format_thread_counts,
+    KeyTypesSpec, LibraryLookup, MergeDriver, MergeDriverDyn, MergeStep, RawExternalSorter,
+    ReadStreams, cb_hasher, extract_template_key_inline, format_thread_counts, open_spill_slot,
 };
 pub use fd_limit::{
     FALLBACK_MAX_TEMP_FILES, fits_nofile_budget, resolve_temp_file_limit, soft_nofile,
     temp_file_limit_from_nofile,
 };
 pub use inline::{
-    PackedCoordinateKey, RecordRef, TemplateKey, extract_coordinate_key_inline,
-    radix_sort_record_refs, radix_sort_record_refs_with_max,
+    CbKey32, InMemoryChunk, PackedCoordinateKey, RecordBuffer, RecordRef, SORT_SEGMENT_SIZE,
+    TemplateKey, TemplateKey24, TertKey32, extract_coordinate_key_inline, radix_sort_record_refs,
+    radix_sort_record_refs_with_max,
 };
 pub use keys::{
     QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
     SortContext, SortOrder, natural_compare, natural_compare_nul, normalize_natural_key,
 };
+pub use merge_slots::{PHASE2_DECOMP_CAP, SortMergeReader, SortMergeSlot};
 pub use reader::{
     OwnedRawBamRecordReader, RawBamRecordReader, open_raw_bam_record_reader,
     open_raw_bam_record_reader_with_header,
 };
+pub use ref_sort::{
+    coordinate_chunk_from_arena_refs, coordinate_chunk_from_refs, queryname_chunk_from_arena_refs,
+};
+pub use segmented_buf::SegmentedBuf;
+pub use spill_block::{SpillBlockCompressor, frame_keyed_record_into, spill_magic, spill_trailer};
+pub use spill_block_reader::SpillBlockDecompressor;
+pub use sync_spill_writer::{write_sorted_chunk, write_sorted_chunk_inmem};
+pub use template_arena::{
+    TemplateArenaAccumulator, TemplateMemChunk, template_chunk_from_arena_refs,
+};
+pub use tmp_dir_alloc::TmpDirAllocator;
 pub use verify::{VerifySummary, verify_sort_order};
 
 #[cfg(test)]

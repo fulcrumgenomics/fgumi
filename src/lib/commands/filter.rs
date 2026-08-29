@@ -218,6 +218,80 @@ pub struct Filter {
     pub queue_memory: QueueMemoryOptions,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// FilterOptions — the stage's tuning knobs, projected out of the CLI struct
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Filter-stage tuning, independent of how the values were supplied.
+///
+/// See [`crate::commands::zipper::ZipperOptions`] for why this is a plain
+/// struct rather than a flattened `clap::Args`: the chain builder only reads
+/// these values, so moving the fields off [`Filter`] would rewrite this module
+/// and its tests for no gain here.
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct FilterOptions {
+    /// Reference FASTA, required by methylation-aware filters.
+    pub reference: Option<PathBuf>,
+    /// Minimum reads supporting a consensus, per depth tier.
+    pub min_reads: Vec<usize>,
+    /// Maximum per-read error rate, per depth tier.
+    pub max_read_error_rate: Vec<f64>,
+    /// Maximum per-base error rate, per depth tier.
+    pub max_base_error_rate: Vec<f64>,
+    /// Minimum consensus base quality.
+    pub min_base_quality: Option<u8>,
+    /// Minimum mean base quality across the read.
+    pub min_mean_base_quality: Option<f64>,
+    /// Maximum fraction of no-called bases.
+    pub max_no_call_fraction: f64,
+    /// Reverse per-base tags on negative-strand reads.
+    pub reverse_per_base_tags: bool,
+    /// Filter whole templates rather than individual reads.
+    pub filter_by_template: bool,
+    /// Optional path for rejected records.
+    pub rejects: Option<PathBuf>,
+    /// Optional path for filter statistics.
+    pub stats: Option<PathBuf>,
+    /// Require both single-strand consensuses to agree.
+    pub require_single_strand_agreement: bool,
+    /// Minimum methylation depth, per tier.
+    pub min_methylation_depth: Vec<usize>,
+    /// Require both strands to agree on methylation.
+    pub require_strand_methylation_agreement: bool,
+    /// Minimum bisulfite conversion fraction.
+    pub min_conversion_fraction: Option<f64>,
+    /// Resolved methylation calling mode (`Disabled` when the flag is unset).
+    pub methylation_mode: fgumi_consensus::MethylationMode,
+}
+
+impl Filter {
+    /// Project the parsed CLI flags into [`FilterOptions`].
+    #[must_use]
+    pub fn to_filter_options(&self) -> FilterOptions {
+        FilterOptions {
+            reference: self.reference.clone(),
+            min_reads: self.min_reads.clone(),
+            max_read_error_rate: self.max_read_error_rate.clone(),
+            max_base_error_rate: self.max_base_error_rate.clone(),
+            min_base_quality: self.min_base_quality,
+            min_mean_base_quality: self.min_mean_base_quality,
+            max_no_call_fraction: self.max_no_call_fraction,
+            reverse_per_base_tags: self.reverse_per_base_tags,
+            filter_by_template: self.filter_by_template,
+            rejects: self.rejects.clone(),
+            stats: self.stats.clone(),
+            require_single_strand_agreement: self.require_single_strand_agreement,
+            min_methylation_depth: self.min_methylation_depth.clone(),
+            require_strand_methylation_agreement: self.require_strand_methylation_agreement,
+            min_conversion_fraction: self.min_conversion_fraction,
+            methylation_mode: crate::commands::common::resolve_methylation_mode(
+                self.methylation_mode,
+            ),
+        }
+    }
+}
+
 // ============================================================================
 // 7-Step Pipeline Types
 // ============================================================================
@@ -1196,6 +1270,104 @@ fn progress_heartbeat_total(before: u64, records: u64) -> Option<u64> {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    /// Every tuning flag must survive the projection into [`FilterOptions`].
+    ///
+    /// Driven through `try_parse_from` rather than a struct literal: a literal
+    /// would still compile if a flag were renamed or unwired, whereas parsing
+    /// pins the whole path from command line to option struct. Non-default
+    /// values throughout, so a field read from the wrong source fails rather
+    /// than coincidentally matching its default.
+    #[test]
+    fn to_filter_options_carries_every_tuning_flag() {
+        let cmd = Filter::try_parse_from([
+            "filter",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--ref",
+            "ref.fa",
+            "--min-reads",
+            "3,2,1",
+            "--max-read-error-rate",
+            "0.06,0.07",
+            "--max-base-error-rate",
+            "0.05",
+            "--min-base-quality",
+            "13",
+            "--min-mean-base-quality",
+            "22.5",
+            "--max-no-call-fraction",
+            "0.3",
+            "--reverse-per-base-tags=true",
+            "--filter-by-template=false",
+            "--rejects",
+            "rej.bam",
+            "--stats",
+            "stats.txt",
+            "--require-single-strand-agreement=true",
+            "--min-methylation-depth",
+            "4,5",
+            "--require-strand-methylation-agreement=true",
+            "--min-conversion-fraction",
+            "0.9",
+            "--methylation-mode",
+            "em-seq",
+        ])
+        .expect("parses");
+
+        let opts = cmd.to_filter_options();
+
+        assert_eq!(opts.reference, Some(std::path::PathBuf::from("ref.fa")));
+        assert_eq!(opts.min_reads, vec![3, 2, 1]);
+        assert_eq!(opts.max_base_error_rate, vec![0.05]);
+        assert_eq!(opts.min_base_quality, Some(13));
+        assert_eq!(opts.min_mean_base_quality, Some(22.5));
+        assert!((opts.max_no_call_fraction - 0.3).abs() < f64::EPSILON);
+        assert!(opts.reverse_per_base_tags);
+        assert!(!opts.filter_by_template, "an explicit false must not be lost");
+        assert_eq!(opts.rejects, Some(std::path::PathBuf::from("rej.bam")));
+        assert_eq!(opts.stats, Some(std::path::PathBuf::from("stats.txt")));
+        assert!(opts.require_single_strand_agreement);
+        assert_eq!(opts.min_methylation_depth, vec![4, 5]);
+        assert!(opts.require_strand_methylation_agreement);
+        assert_eq!(opts.min_conversion_fraction, Some(0.9));
+        assert_eq!(opts.max_read_error_rate, vec![0.06, 0.07]);
+        assert_eq!(
+            opts.methylation_mode,
+            fgumi_consensus::MethylationMode::EmSeq,
+            "--methylation-mode must reach the projection",
+        );
+    }
+
+    /// The projection must carry defaults faithfully too — a field hard-coded to
+    /// the value the non-default test happens to pass would slip through it.
+    #[test]
+    fn to_filter_options_carries_defaults() {
+        let cmd =
+            Filter::try_parse_from(["filter", "-i", "in.bam", "-o", "out.bam"]).expect("parses");
+
+        let opts = cmd.to_filter_options();
+
+        assert_eq!(opts.reference, None);
+        assert!(opts.min_reads.is_empty());
+        assert_eq!(opts.max_read_error_rate, vec![0.025]);
+        assert_eq!(opts.max_base_error_rate, vec![0.1]);
+        assert_eq!(opts.min_base_quality, None);
+        assert_eq!(opts.min_mean_base_quality, None);
+        assert!((opts.max_no_call_fraction - 0.2).abs() < f64::EPSILON);
+        assert!(!opts.reverse_per_base_tags);
+        assert!(opts.filter_by_template);
+        assert_eq!(opts.rejects, None);
+        assert_eq!(opts.stats, None);
+        assert!(!opts.require_single_strand_agreement);
+        assert!(opts.min_methylation_depth.is_empty());
+        assert!(!opts.require_strand_methylation_agreement);
+        assert_eq!(opts.min_conversion_fraction, None);
+        assert_eq!(opts.methylation_mode, fgumi_consensus::MethylationMode::Disabled);
+    }
+
     use crate::sam::SamTag;
     use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, aux_data_slice, flags};
     use noodles::sam::alignment::record_buf::RecordBuf;

@@ -23,12 +23,17 @@ CRATES=(
   fgumi-bgzf
   fgumi-simd-fastq
   fgumi-tag
+  fgumi-fmt
+  fgumi-cli-macros
+  fgumi-cli-common
+  fgumi-pipeline-core
   fgumi-raw-bam
   fgumi-bam-io
   fgumi-umi
   fgumi-sam
   fgumi-metrics
   fgumi-sort
+  fgumi-pipeline-io
   fgumi-consensus
   fgumi
 )

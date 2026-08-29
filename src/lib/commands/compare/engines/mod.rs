@@ -1,7 +1,7 @@
 //! Comparison engines for `fgumi compare bams`.
 //!
 //! An "engine" pairs records from the two input streams (see
-//! [`positional`](self::positional), added alongside the positional-alignment work) and
+//! [`positional`], added alongside the positional-alignment work) and
 //! decides whether each pair is content-equal via a [`content::ContentPredicate`].
 //! Splitting pairing (positional) from equality (content) keeps the pairing logic honest:
 //! it can never quietly resync past a mismatch just because two *unrelated* records

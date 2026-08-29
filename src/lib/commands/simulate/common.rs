@@ -434,7 +434,7 @@ impl ReferenceGenome {
         Some(subseq.to_vec())
     }
 
-    /// Build a BAM [`Header`] with `@SQ` lines for every loaded contig.
+    /// Build a BAM `Header` with `@SQ` lines for every loaded contig.
     pub(super) fn build_bam_header(&self) -> noodles::sam::header::Header {
         use bstr::BString;
         use noodles::sam::header::Header;

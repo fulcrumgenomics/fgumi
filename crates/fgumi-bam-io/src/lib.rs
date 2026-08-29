@@ -12,7 +12,9 @@
 #![deny(unsafe_code)]
 
 pub mod format;
+pub mod grouping;
 pub mod header;
+pub mod library;
 pub mod mem_estimate;
 pub mod os_hints;
 pub mod paths;
@@ -26,6 +28,10 @@ pub mod writer;
 pub(crate) mod vendored;
 
 pub use format::{FORMAT_PREFIX_LEN, InputFormat, classify_input};
+pub use grouping::{
+    DecodedRecord, GroupKey, GroupKeyConfig, Grouper, compute_group_key_from_raw, name_hash_key,
+};
+pub use library::{LibraryIndex, LibraryLookup, build_library_lookup, unknown_library};
 pub use mem_estimate::MemoryEstimate;
 pub use paths::{is_stdin_path, is_stdout_path};
 pub use progress::ProgressTracker;
