@@ -577,6 +577,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn is_fusible_rejects_a_second_source() {
+        // The single-source guard: the inline drive assumes exactly one
+        // implicit-input source, at index 0. A second source at index ≥ 1 must
+        // block fusion — otherwise the driver would dispatch a step whose input is
+        // implicit as if it were wired. The other three structural guards
+        // (`n < 2`, `input_arity > 1`, back-edge) each have a test; this pins the
+        // fourth. Register the second source with input arity 1 so the wire is
+        // accepted — the boxed step is still a `CountSource`, so
+        // `ErasedStep::is_source()` reports true and it is the source guard, not
+        // the arity/wiring checks, that rejects the chain.
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mut graph = ChainGraph::new();
+        let s0 = graph.register_step("CountSource", 1);
+        let s1 = graph.register_step_with_input_arity("CountSource", 1, 1);
+        let k = graph.register_step("CollectSink", 0);
+        graph.wire(s0, BranchIdx(0), s1);
+        graph.wire(s1, BranchIdx(0), k);
+        let steps: Vec<Box<dyn ErasedStep>> = vec![
+            Box::new(TypedStep::new(CountSource { next: 0, count: 0 })),
+            Box::new(TypedStep::new(CountSource { next: 0, count: 0 })),
+            Box::new(TypedStep::new(CollectSink { out })),
+        ];
+        assert!(
+            !is_fusible_chain(&steps, &graph),
+            "a second source at index >= 1 must block fusion"
+        );
+    }
+
     // A fusible chain fuses ONLY when it is single-thread AND uninstrumented: the
     // fused fast path skips the scheduled path's edge metrics / occupancy sampler
     // / bottleneck verdict, so any instrumentation level (or ≥2 threads) must fall
@@ -908,6 +937,71 @@ mod tests {
         let err =
             run_fused_single_thread(steps, &graph, &signal, None, None, 0).expect_err("must error");
         assert!(matches!(err, PipelineError::Io { step: "Boom", .. }));
+    }
+
+    #[test]
+    fn drive_records_stats_for_success_and_error_dispatches() {
+        // `PipelineBuilder::run` can hand the fused driver `Some(&Arc<PipelineStats>)`
+        // even with instrumentation Off; the driver's stats block then records
+        // every dispatch. A single erroring chain exercises BOTH arms: the source
+        // dispatches `Progress` (→ `record`), then the mid errors (→ `record_error`)
+        // before the loop breaks. Every other fused test runs with `None` stats.
+        struct Boom;
+        impl Step for Boom {
+            type Input = u32;
+            type Outputs = Single<u32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "Boom",
+                    kind: StepKind::Serial,
+                    sticky: false,
+                    output_queues: vec![QueueSpec::Unbounded],
+                    branch_ordering: vec![BranchOrdering::None],
+                }
+            }
+            fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                if ctx.input.pop().is_some() {
+                    return Err(io::Error::other("boom"));
+                }
+                if ctx.input.is_drained() {
+                    Ok(StepOutcome::Finished)
+                } else {
+                    Ok(StepOutcome::NoProgress)
+                }
+            }
+        }
+
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mut graph = ChainGraph::new();
+        let s = graph.register_step("CountSource", 1);
+        let m = graph.register_step("Boom", 1);
+        let k = graph.register_step("CollectSink", 0);
+        graph.wire(s, BranchIdx(0), m);
+        graph.wire(m, BranchIdx(0), k);
+        let steps: Vec<Box<dyn ErasedStep>> = vec![
+            Box::new(TypedStep::new(CountSource { next: 0, count: 3 })),
+            Box::new(TypedStep::new(Boom)),
+            Box::new(TypedStep::new(CollectSink { out })),
+        ];
+        let stats = Arc::new(PipelineStats::new(vec!["CountSource", "Boom", "CollectSink"]));
+        let signal = PipelineSignal::new();
+        run_fused_single_thread(steps, &graph, &signal, Some(&stats), None, 0)
+            .expect_err("must error");
+
+        let snap = stats.snapshot();
+        // `record` logged the source's Progress dispatch.
+        assert_eq!(snap.steps[0].0, "CountSource");
+        assert!(
+            snap.steps[0].1.progress_count > 0,
+            "record must log the source's progress under Some(stats)"
+        );
+        // `record_error` logged Boom's failure (error_count, not an outcome bucket).
+        assert_eq!(snap.steps[1].0, "Boom");
+        assert!(
+            snap.steps[1].1.error_count > 0,
+            "record_error must log the failing step under Some(stats)"
+        );
+        assert!(snap.steps[1].1.try_run_total > 0, "the erroring dispatch is still counted");
     }
 
     /// The `# Errors` contract promises `PipelineError::Cancelled` when the run
