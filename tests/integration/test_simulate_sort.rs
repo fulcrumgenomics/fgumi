@@ -120,7 +120,11 @@ fn simulate(
 #[case::mapped_reads("mapped-reads", 1_000, false)]
 #[case::grouped_reads_simplex("grouped-reads", 1_000, false)]
 #[case::grouped_reads_duplex("grouped-reads", 1_000, true)]
-#[case::grouped_reads_duplex_large("grouped-reads", 10_000, true)]
+// The "large" case exists only to drive a deeper spill/merge than the 1k cases:
+// at the 1M arm this still produces many spill files and a real k-way merge, but
+// 4k molecules reaches that regime far more cheaply than 10k (the sort-order
+// check does not get stronger with raw scale once several spill runs exist).
+#[case::grouped_reads_duplex_large("grouped-reads", 4_000, true)]
 fn simulate_output_is_template_coordinate_sorted(
     #[case] subcommand: &str,
     #[case] num_molecules: usize,
@@ -156,8 +160,11 @@ fn read_records(path: &Path) -> Vec<noodles::sam::alignment::RecordBuf> {
 /// generation order regardless of budget, so tie-breaking between equal sort
 /// keys cannot drift with the spill boundaries.
 #[rstest]
-#[case::mapped_reads("mapped-reads", 2_000, false)]
-#[case::grouped_reads_duplex("grouped-reads", 2_000, true)]
+// 1.5k molecules still forces the 1M arm to spill to disk and k-way merge while
+// the 768M arm stays fully in memory, so the two paths' outputs are compared
+// across the spill boundary — the property this test pins — for less work.
+#[case::mapped_reads("mapped-reads", 1_500, false)]
+#[case::grouped_reads_duplex("grouped-reads", 1_500, true)]
 fn simulate_output_is_identical_regardless_of_spilling(
     #[case] subcommand: &str,
     #[case] num_molecules: usize,

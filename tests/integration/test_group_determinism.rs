@@ -155,8 +155,12 @@ fn build_mixed_orientation_bam(path: &Path) {
     // Many position groups, each carrying templates from BOTH orientations.
     // Position-grouping is per-coordinate, so distinct positions form
     // independent subgroup AHashMaps in the assigner — each one a separate
-    // chance for iteration order to vary.
-    for group_idx in 0..40 {
+    // chance for iteration order to vary. The count is the detection knob: with
+    // 256 UMIs per orientation and `n_runs` fresh hash seeds, a couple of dozen
+    // independent position groups already make an unsorted-iteration regression
+    // overwhelmingly likely to surface, so 24 (down from 40) keeps the guard's
+    // sensitivity while cutting the per-run record count that dominates runtime.
+    for group_idx in 0..24 {
         let base_pos = 1_000 + group_idx * 1_000;
         for (u_idx, umi) in umis.iter().enumerate() {
             for is_rf in [false, true] {
