@@ -78,7 +78,6 @@ mod platform_ffi {
     /// `mi_stats_print_out(None, null_mut())` uses mimalloc's internal synchronization,
     /// making it safe to call concurrently with allocation/deallocation on other threads.
     #[cfg(feature = "memory-debug")]
-    #[allow(dead_code)] // consumed by main fgumi's unified_pipeline via the crate-root re-export
     pub fn print_mi_stats() {
         // SAFETY: mimalloc synchronizes stats collection internally.
         unsafe {
@@ -488,7 +487,7 @@ impl MergeProbe {
     /// threshold.
     ///
     /// `pool_depths` is the `(raw_input, decompressed_input, buffer_pool)`
-    /// triple from [`SortWorkerPool::phase1_queue_depths`].
+    /// triple from [`crate::worker_pool::SortWorkerPool::phase1_queue_depths`].
     pub fn log_mid_with_depths(
         &mut self,
         pool_depths: (usize, usize, usize),

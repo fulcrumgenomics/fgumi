@@ -306,8 +306,8 @@ struct LadderLibraryState {
     duplicate_templates: u64,
     /// Next cumulative `templates_seen` value that triggers a snapshot row.
     next_threshold: u64,
-    /// `templates_seen` at the last emitted row, used by [`Self::finish`] (via
-    /// [`DuplicationLadderRecorder::finish`]) to avoid a duplicate final row
+    /// `templates_seen` at the last emitted row, used by
+    /// [`DuplicationLadderRecorder::finish`] to avoid a duplicate final row
     /// when the true total already landed exactly on an interval crossing, and
     /// to size each snapshot's window (`templates_seen - last_emitted_at`).
     last_emitted_at: u64,

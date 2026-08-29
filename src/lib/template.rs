@@ -108,6 +108,23 @@ impl Template {
         }
     }
 
+    /// True allocated heap footprint in bytes: summed record **capacities** plus
+    /// the `Vec<RawRecord>` container overhead plus the queryname allocation.
+    /// Used by the pipeline framework's `BamTemplateBatch` for byte-bounded queue
+    /// budgeting, so the budget tracks real RSS. Accounting by logical `len()`
+    /// under-counts over-allocated record buffers and ignores container overhead,
+    /// which lets the pipeline buffer past its `--max-memory` budget and risk an
+    /// OOM (this mirrors `DecodedRecordBatch`, which already sizes by capacity).
+    /// `MemoryEstimate::estimate_heap_size` delegates here so the two never
+    /// diverge.
+    #[must_use]
+    pub fn heap_size(&self) -> usize {
+        let name_size = self.name.capacity();
+        let records_size = self.records.iter().map(RawRecord::capacity).sum::<usize>()
+            + self.records.capacity() * std::mem::size_of::<RawRecord>();
+        name_size + records_size
+    }
+
     /// Returns the primary R1 record if present.
     #[must_use]
     pub fn r1(&self) -> Option<&RawRecord> {
@@ -1035,14 +1052,10 @@ impl<R: std::io::Read> Iterator for TemplateIterator<R> {
 
 impl MemoryEstimate for Template {
     fn estimate_heap_size(&self) -> usize {
-        // name: Vec<u8>
-        let name_size = self.name.capacity();
-
-        // records: Vec<RawRecord>
-        let records_size = self.records.iter().map(RawRecord::capacity).sum::<usize>()
-            + self.records.capacity() * std::mem::size_of::<RawRecord>();
-
-        name_size + records_size
+        // Single source of truth: the pipeline byte-budget (`Template::heap_size`)
+        // and `MemoryEstimate` must agree, so both use the capacity-based
+        // footprint computed in `heap_size`.
+        self.heap_size()
     }
 }
 
@@ -1066,6 +1079,74 @@ mod tests {
     const FLAG_MATE_REVERSE: u16 = 0x20;
     const FLAG_UNMAPPED: u16 = 0x4;
     const FLAG_MATE_UNMAPPED: u16 = 0x8;
+    #[test]
+    fn heap_size_counts_capacity_and_matches_memory_estimate() {
+        // A queryname allocation with spare capacity: the byte budget must count
+        // the allocated capacity (real RSS), not the 5-byte logical length —
+        // otherwise the pipeline under-counts and can buffer past --max-memory.
+        let mut name = Vec::with_capacity(64);
+        name.extend_from_slice(b"read1");
+        let mut template = Template::new(name);
+
+        // Hold real records in a Vec with deliberately reserved spare capacity so
+        // BOTH record terms of `heap_size` are exercised — the per-record byte
+        // buffers (`RawRecord::capacity`) and the `Vec<RawRecord>` backing store
+        // (`records.capacity() * size_of::<RawRecord>()`). The empty-records case
+        // left both at zero, so a dropped record term would have gone unnoticed.
+        let mut records: Vec<RawRecord> = Vec::with_capacity(8);
+        let mut first = create_test_raw(b"read1", raw_flags::PAIRED | raw_flags::FIRST_SEGMENT);
+        // Force spare capacity on one record so the per-record term is genuinely
+        // capacity-based, not length-based: with `capacity() == len()` a
+        // regression from `RawRecord::capacity()` to `len()` would leave the
+        // total unchanged and slip through.
+        first.as_mut_vec().reserve(64);
+        records.push(first);
+        records.push(create_test_raw(b"read1", raw_flags::PAIRED | raw_flags::LAST_SEGMENT));
+        template.records = records;
+        assert!(
+            template.records.iter().any(|r| r.capacity() > r.len()),
+            "a record must carry spare capacity so the per-record term is capacity-based",
+        );
+
+        // heap_size (pipeline byte-budget) and estimate_heap_size (MemoryEstimate)
+        // are a single source of truth — they must never diverge.
+        assert_eq!(
+            template.heap_size(),
+            template.estimate_heap_size(),
+            "heap_size and estimate_heap_size must agree",
+        );
+
+        // Exact component total re-derived in the test (NOT via
+        // estimate_heap_size, which delegates to heap_size and is tautological).
+        // `heap_size` is exactly these three terms, so an exact equality catches a
+        // dropped record-buffer/Vec-backing term AND a capacity()→len() regression
+        // on the record buffers (which the spare capacity above makes observable).
+        let record_bytes = template.records.iter().map(RawRecord::capacity).sum::<usize>();
+        let vec_backing = template.records.capacity() * std::mem::size_of::<RawRecord>();
+        let expected_exact = template.name.capacity() + record_bytes + vec_backing;
+        assert_eq!(
+            template.heap_size(),
+            expected_exact,
+            "heap_size must equal queryname ({}) + record buffers ({record_bytes}) + \
+             Vec<RawRecord> backing ({vec_backing})",
+            template.name.capacity(),
+        );
+        // The record terms must be non-trivial: real byte buffers and the reserved
+        // spare Vec slots both contribute, not just the queryname.
+        assert!(record_bytes > 0, "records must carry real byte capacity");
+        assert!(vec_backing > 0, "Vec<RawRecord> backing store must be counted");
+        assert!(
+            template.records.capacity() >= 8,
+            "reserved spare Vec capacity must be retained ({} < 8)",
+            template.records.capacity(),
+        );
+        // And the footprint reflects the allocated queryname capacity (>= 64).
+        assert!(
+            template.heap_size() >= 64,
+            "heap_size must count allocated capacity, got {}",
+            template.heap_size(),
+        );
+    }
 
     /// Create a simple test raw record with given name and flags.
     fn create_test_raw(name: &[u8], flags: u16) -> RawRecord {
