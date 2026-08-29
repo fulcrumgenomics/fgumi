@@ -53,7 +53,7 @@ const SEED: u64 = 0xFEED_BEEF;
 /// Number of threads the parallel assigner pool spawns. Mirrors what
 /// `Command::execute` passes (`num_threads`) on a typical workstation.
 fn bench_threads() -> usize {
-    num_cpus::get().clamp(2, 8)
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get).clamp(2, 8)
 }
 
 /// Generate `n_templates` UMIs of length `UMI_LEN` with ~`COPIES_PER_UMI`

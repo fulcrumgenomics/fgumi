@@ -1,0 +1,43 @@
+error[E0277]: the trait bound `HeapNoOrdered: Ordered` is not satisfied
+  --> tests/compile-fail/ordered_bytes_single_requires_ordered.rs:17:47
+   |
+17 | fn _instantiate() -> std::marker::PhantomData<OrderedBytesSingle<HeapNoOrdered>> {
+   |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `Ordered` is not implemented for `HeapNoOrdered`
+  --> tests/compile-fail/ordered_bytes_single_requires_ordered.rs:7:1
+   |
+ 7 | struct HeapNoOrdered {
+   | ^^^^^^^^^^^^^^^^^^^^
+help: the trait `Ordered` is implemented for `Sequenced<T>`
+  --> src/reorder.rs
+   |
+   | impl<T> Ordered for Sequenced<T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `OrderedBytesSingle`
+  --> src/outputs.rs
+   |
+   | pub struct OrderedBytesSingle<T: Send + HeapSize + Ordered + 'static>(PhantomData<fn() -> T>);
+   |                                                    ^^^^^^^ required by this bound in `OrderedBytesSingle`
+
+error[E0277]: the trait bound `HeapNoOrdered: Ordered` is not satisfied
+  --> tests/compile-fail/ordered_bytes_single_requires_ordered.rs:19:5
+   |
+19 |     std::marker::PhantomData
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `Ordered` is not implemented for `HeapNoOrdered`
+  --> tests/compile-fail/ordered_bytes_single_requires_ordered.rs:7:1
+   |
+ 7 | struct HeapNoOrdered {
+   | ^^^^^^^^^^^^^^^^^^^^
+help: the trait `Ordered` is implemented for `Sequenced<T>`
+  --> src/reorder.rs
+   |
+   | impl<T> Ordered for Sequenced<T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `OrderedBytesSingle`
+  --> src/outputs.rs
+   |
+   | pub struct OrderedBytesSingle<T: Send + HeapSize + Ordered + 'static>(PhantomData<fn() -> T>);
+   |                                                    ^^^^^^^ required by this bound in `OrderedBytesSingle`

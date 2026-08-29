@@ -63,18 +63,6 @@ struct IndexState {
 }
 
 impl PooledBamWriter {
-    /// The permit pool carrying this writer's histograms, if the writer has not
-    /// yet been finalized.
-    ///
-    /// Retain this [`Arc`] before [`finish`](Self::finish) and read
-    /// [`PermitPool::writer_stats`] afterwards: the pool outlives the writer, so
-    /// the snapshot then includes the block writes and reorder waits performed
-    /// during the output drain that `finish` runs — a snapshot taken through the
-    /// live writer would omit that tail.
-    pub(crate) fn permit_pool(&self) -> Option<Arc<PermitPool>> {
-        self.staging.as_ref().map(|staging| Arc::clone(staging.permit_pool()))
-    }
-
     /// Seconds the producer spent blocked waiting for an output permit, and the
     /// number of waits.
     ///
@@ -442,7 +430,7 @@ mod tests {
         // Oversized (unmapped) record that spans multiple BGZF blocks.
         records.push(make_test_record(b"oversized", BGZF_MAX_BLOCK_SIZE + 500));
 
-        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf, false));
+        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         let plain_path = dir.path().join("plain.bam");
         {
@@ -493,7 +481,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("test.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         let num_records = 200;
         let records: Vec<Vec<u8>> = (0..num_records)
@@ -540,7 +528,7 @@ mod tests {
     #[case::dev_stdout("/dev/stdout")]
     fn test_pooled_bam_writer_indexing_rejects_stdout(#[case] spelling: &str) {
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         // Matched rather than `expect_err`: the writer is deliberately not
         // `Debug`, so unwrapping the error out of the `Result` does not compile.
@@ -569,7 +557,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("empty.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         {
             let writer =
@@ -599,7 +587,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("many.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf, false));
+        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         let num_records = 5000;
         {
@@ -628,57 +616,12 @@ mod tests {
         }
     }
 
-    /// The writer histograms must be harvested *after* `finish` drains the output
-    /// queue, not before: the drain flushes the final partial block (and any
-    /// still-queued blocks) through the I/O thread, so a snapshot taken while the
-    /// writer is still alive omits those drain-time writes. Retaining the permit
-    /// pool and reading [`PermitPool::writer_stats`] after `finish` captures the
-    /// full write count.
-    #[test]
-    fn test_writer_stats_include_finish_drain() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let bam_path = dir.path().join("drain.bam");
-        let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf, false));
-
-        // Retain the permit pool before finalizing, exactly as the merge path does,
-        // and snapshot the block-write count both before and after the drain.
-        let (before, after) = {
-            let mut writer =
-                PooledBamWriter::new(Arc::clone(&pool), &bam_path, &header).expect("create writer");
-            for i in 0..5000 {
-                let rec = make_test_record(format!("read_{i:06}").as_bytes(), 100);
-                writer.write_raw_record(&rec).expect("write record");
-            }
-            let permit_pool = writer.permit_pool().expect("permit pool present before finish");
-
-            let before = permit_pool.writer_stats().0.count;
-            writer.finish().expect("finish writer");
-            let after = permit_pool.writer_stats().0.count;
-            (before, after)
-        };
-
-        // The final flush and drain happen inside `finish`, so the post-drain
-        // count must exceed the pre-drain count -- the exact regression the
-        // pre-finalize snapshot silently dropped.
-        assert!(after > 0, "drain-inclusive snapshot must record block writes, got {after}");
-        assert!(
-            after > before,
-            "finish drain must add block writes the pre-finish snapshot missed: \
-             before={before}, after={after}"
-        );
-
-        if let Ok(pool) = Arc::try_unwrap(pool) {
-            pool.shutdown();
-        }
-    }
-
     #[test]
     fn test_pooled_bam_writer_raw_bytes_match() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("raw_match.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         let records: Vec<Vec<u8>> =
             (0..50).map(|i| make_test_record(format!("r{i}").as_bytes(), 30)).collect();
@@ -715,7 +658,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("oversized.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         // A sequence of BGZF_MAX_BLOCK_SIZE bytes exceeds the threshold.
         let oversized_rec = make_test_record(b"oversized_read", BGZF_MAX_BLOCK_SIZE);
@@ -750,7 +693,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bam_path = dir.path().join("dropped_writer.bam");
         let header = test_header();
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         {
             let mut writer =

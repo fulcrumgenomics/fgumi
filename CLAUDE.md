@@ -187,16 +187,70 @@ of records) and a safe rewrite measurably regresses sort throughput.
   `RawQuerynameKey::new`).
 - **`crates/fgumi-sort/src/radix.rs`** — internal radix-sort helpers; see file
   comments for the `SAFETY:` invariants.
-- **`crates/fgumi-sort/src/phase1_keys.rs`** — one `#[allow(unsafe_code)]` site in
-  `prefetch_read_l1`, a software-prefetch hint issued while a deferred key batch
-  scans record bodies out of a sealed arena segment. Those bytes were written up
-  to a segment ago and are cold by the time a worker reads them, so the scan is
-  latency-bound on cache misses. SAFETY: both `prfm pldl1keep` (aarch64) and
-  `_mm_prefetch` (x86_64) are *non-faulting hints* — they never read or write
-  observable memory and never trap, even on an unmapped address — and the
-  argument is a live `&u8`, so the pointer is valid to name. A no-op on other
-  architectures. Approved for the same reason as the other sort hot paths: it
-  runs once per record over hundreds of millions of records.
+- **`crates/fgumi-sort/src/ref_sort.rs`** — one `#[allow(unsafe_code)]` site in
+  `sort_coordinate_refs`: a pointer cast reinterpreting `&mut [RecordRef]` as
+  `&mut [CoordSortRef]` to feed the parallel `voracious_mt_sort` radix on the
+  large-input / multi-thread coordinate path. SAFETY: `CoordSortRef` is
+  `#[repr(transparent)]` over `RecordRef`, so the two have identical size,
+  alignment, and layout; the pointer cast (clippy rejects a ref-to-ref
+  `transmute`) is sound. This is approved for the same reason as the other sort
+  hot paths — it runs once per coordinate sort over millions of record refs, and
+  the parallel radix is measurably (~4×) faster than the safe single-threaded
+  fallback. Two tests cover this, and they establish *different* things — do not
+  read either as proving both:
+  - `prop_ref_sort_matches_copy_sorter` runs `sort_threads = 1`, so it proves
+    **byte parity** of the *serial* path against the copy sorter. It never
+    reaches the cast.
+  - `parallel_coordinate_sort_matches_serial_radix_at_threshold` is the one that
+    exercises the cast — 4 threads at the parallel cutoff over deliberately tied
+    keys — but it asserts **ref order**, comparing `(sort_key, offset)` against
+    the serial radix. It does not compare serialized bytes.
+
+  Byte-identity of the parallel path therefore follows by construction rather
+  than by direct assertion: the chunk is materialized from the refs in order, so
+  identical ref order yields identical output bytes. That is a sound inference,
+  but it is an inference, and a change that broke the materialization step would
+  not be caught by either test.
+- **`crates/fgumi-sort/src/segmented_buf.rs`** — two `#[allow(unsafe_code)]`
+  sites backing the arena record buffer (a segmented, append-only `Vec<u8>` the
+  sort engine decompresses/frames records into without per-record allocation):
+  - `grow_uninit` — grows a segment's live `len` over
+    reserved-but-uninitialized bytes via `Vec::set_len` (after `reserve`), to skip
+    zero-filling the slot on the ingest hot path. SAFETY: after `reserve(additional)`,
+    `capacity() >= new_len`, so `set_len(new_len)` only extends `len` over
+    already-allocated bytes; `u8` has no drop glue and no validity invariant, so
+    growing `len` over uninitialized bytes is not itself UB — the documented contract
+    requires the caller to fully write the grown `[old_len, new_len)` region (via
+    `slice_mut`) before any read, and a read-before-write is the only UB, which the
+    contract forbids. Pointer stability is a *separate* invariant: this `reserve`
+    MAY reallocate and move the segment, so no `slice_mut` borrow may be live across
+    a `grow_uninit` — the borrow checker enforces this in the single-threaded case
+    (`&mut self`), and `reserve_full_capacity`, called once per fresh segment,
+    makes the per-slot `reserve` a no-op so it cannot move the inner buffer.
+    That covers the inner buffer ONLY. It is NOT sufficient to run `grow_uninit`
+    concurrently with a live `slice_mut` — that overlap is exactly what
+    `slice_mut`'s third precondition forbids, and Miri reports UB on it.
+    `grow_uninit` may reach `advance_segment`, which pushes to `self.segments`;
+    that push reallocates the OUTER `Vec<Vec<u8>>` whenever the vector is at
+    capacity, freeing the buffer a concurrent reader is indexing
+    (use-after-free), while its `set_len` races that reader's bounds check on
+    every call. Neither hazard is closed by pre-sizing, and neither can be:
+    the two methods take `&mut self` and `&self`, so overlapping them is an
+    aliasing violation whatever the caller does. That is why this is stated as
+    a precondition rather than engineered around. The supported concurrent shape
+    is to reserve every slot for a segment before handing any of them to workers.
+  - `slice_mut` — synthesizes a `&mut [u8]` slot from a shared `&self`
+    (so disjoint slots can be written concurrently by different workers). SAFETY:
+    the asserted `seg_offset + len <= seg.len()` keeps the range inside the
+    segment's live region (in-bounds pointer + length); the `&mut` is sound only
+    under the caller's disjointness contract — each call's range must not overlap
+    any other concurrently-borrowed range — so the produced `&mut` aliases no
+    other `&`/`&mut`, AND under the separate requirement that no `&mut self`
+    method runs while the borrow is live (see the `grow_uninit` note above).
+    Approved for the same reason as the other sort hot paths:
+    ingest runs once per record over millions-to-billions of records, and a safe
+    rewrite (zero-fill on grow, or an owning `Vec` per slot) measurably regresses
+    sort throughput.
 
 ### Approved natural-order comparator (fgumi-raw-bam)
 
@@ -208,16 +262,17 @@ path: the comparator runs once per sort-key comparison, and the safe form
 (re-bounds-checking every byte / re-validating the null terminator) measurably
 regresses `samtools sort -n`–style throughput.
 
-- **`crates/fgumi-raw-bam/src/sort.rs`** — four `#[allow(unsafe_code)]` sites:
-  - `natural_compare` (line ~80) — `get_unchecked` over `&[u8]` in the digit-run
+- **`crates/fgumi-raw-bam/src/sort.rs`** — two production `#[allow(unsafe_code)]`
+  sites plus two test sites (the `#[cfg(test)]` boundary sits between them):
+  - `natural_compare` — `get_unchecked` over `&[u8]` in the digit-run
     hot loop. SAFETY: indices are bounded by the loop invariants `pa < alen` /
     `pb < blen`, asserted in `debug_assert!` for the `at` helper.
-  - `natural_compare_nul` (line ~180) — raw `*const u8` walk that mirrors
+  - `natural_compare_nul` — raw `*const u8` walk that mirrors
     samtools' `strnum_cmp`. SAFETY: caller guarantees both pointers are
     null-terminated; `RawQuerynameKey::new` enforces this for every production
     call site.
-  - `compare_nul` test helper and the `proptest` agreement test (lines ~273 and
-    ~300) — push an explicit NUL into a `Vec<u8>` then take `as_ptr()`.
+  - `compare_nul` test helper and the `proptest` agreement test — push an
+    explicit NUL into a `Vec<u8>` then take `as_ptr()`.
     SAFETY: the buffers are `to_vec()` + push, so the pointer is valid and
     null-terminated for the call's lifetime.
 
@@ -273,6 +328,67 @@ The sweeps compare `two_bits` only on lanes where `is_acgt` is set. That is the
 contract rather than a weakened assertion: `ENCODE_LUT` maps non-ACGT bytes to a
 don't-care value, which the SIMD paths write through unconditionally while the
 scalar path leaves those lanes zero.
+
+### Approved typed-handle cache (fgumi-pipeline-core)
+
+The pipeline runtime hands each step its input/output handles as
+`&dyn Any`, so the `ErasedStep` adapter must `downcast_ref` them back to
+their concrete types. That downcast sits on the per-item dispatch path: a
+4-thread CODEC 8M run spends ≈1.6% of samples on `TypeId` compares alone.
+The adapter resolves the handles once and caches them, which requires
+storing a reference whose real lifetime the struct cannot name.
+
+- **`crates/fgumi-pipeline-core/src/erased.rs`** — four `#[allow(unsafe_code)]`
+  sites, two on `TypedStep<S>` (`resolve_input`, `resolve_outputs`) and two on
+  `TypedStep2<S>` (`resolve_inputs`, `resolve_outputs`). Each is a
+  `std::mem::transmute` that extends a `&'a Handle` to `&'static Handle` for
+  storage in the cache slot, and narrows it back to `&'a` on read. No pointer
+  is dereferenced through the `'static` form. SAFETY rests on three invariants
+  documented on `TypedStep` itself: the handle boxes are owned by
+  `ChainContexts` (alive for the whole `Pipeline::run`), every step instance is
+  dropped before those contexts are, and every dispatch passes the *same* box
+  for a given `step_idx`. The third is the one the compiler cannot check, so
+  each cache slot stores the address of the erased box it was resolved from and
+  every cached hit `assert!`s it — **unconditionally, release included**, so a
+  step reused across two *live* `ChainContexts` panics instead of reading
+  through the wrong one. The check is one load and one compare, not the
+  `downcast_ref` `TypeId` probe the cache exists to elide. A debug-only
+  `debug_assert!` keeps re-resolving the typed pointer as a second diagnostic.
+  Treat the assert as defence in depth, not as the safety argument: it compares
+  data addresses only, so an allocator that reuses a freed box's address defeats
+  it. Soundness rests on the second invariant — every step instance is dropped
+  before the contexts it cached from — which is what must be preserved by any
+  future change. `run_fused_single_thread` (`runtime/fused.rs`) is the one path
+  where the natural drop order inverts it: `steps` is a by-value parameter and
+  `ChainContexts` is a local, and parameters drop *after* locals. It re-binds
+  `steps` as a local declared *after* the contexts, so reverse-declaration order
+  drops the steps before the contexts on every exit — the normal return and a
+  panic unwinding out of a step — rather than relying on an explicit drop that an
+  unwind would skip.
+
+### Test-only `#[allow(unsafe_code)]` sites
+
+The counts above are **production** sites. Tests carry their own
+`#[allow(unsafe_code)]` where they exercise an already-approved `unsafe` API
+directly. In `fgumi-sort` those are `segmented_buf.rs` (8), `ref_sort.rs` (3),
+and `chunk_sorter.rs` (2), all of them driving `SegmentedBuf::grow_uninit` /
+`slice_mut` to check a reserve-then-write round-trip, or that a sorted chunk
+matches its oracle. In `fgumi-raw-bam` they are the `compare_nul` helper and the
+`proptest` agreement test in `src/sort.rs`, both already named above. They add no
+new `unsafe` *surface*: each calls a function already justified above, under that
+function's documented contract.
+
+A raw `grep -c 'allow(unsafe_code)'` over either crate therefore reports more
+sites than this document names, and the difference is tests plus prose. When
+auditing, count **attributes**, not matches: exclude the production sites listed
+above, and exclude occurrences inside `///` / `//!` comments that merely *name*
+the attribute (`segmented_buf.rs` has one such mention, which is why a naive
+`grep -c` there over-counts the test sites by one). Then check each entry's own
+wording for whether it is quoting a production-only count.
+
+Entries name the function rather than a line number on purpose: approximate
+line numbers go stale the moment anything above them moves, and a confidently
+wrong pointer is worse than none.
 
 Any new `unsafe` site must extend this list and explain why the safe
 alternative is unacceptable. Do not introduce `unsafe` outside the crates

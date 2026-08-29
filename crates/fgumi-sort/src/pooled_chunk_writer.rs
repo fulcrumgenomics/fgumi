@@ -28,7 +28,7 @@ use crate::keys::RawSortKey;
 use crate::worker_pool::{CompressResult, CompressTarget, PermitPool, SortWorkerPool};
 use anyhow::Result;
 use crossbeam_channel::bounded;
-use fgumi_bgzf::BGZF_EOF;
+use fgumi_bgzf::{BGZF_EOF, BGZF_MAX_BLOCK_SIZE};
 use std::io::BufWriter;
 use std::marker::PhantomData;
 use std::path::Path;
@@ -45,16 +45,6 @@ pub struct PooledChunkWriter<K: RawSortKey> {
     staging: Option<StagingBuffer>,
     /// Reusable scratch buffer for key serialization (non-embedded keys only).
     key_buf: Vec<u8>,
-    /// Bytes a frame may hold, resolved from the codec once.
-    ///
-    /// This writer pre-flushes so a record never straddles a frame boundary --
-    /// which is what lets the merge borrow most records in place instead of
-    /// reassembling them. That budget must be the size the staging buffer will
-    /// actually flush at: when this was `BGZF_MAX_BLOCK_SIZE` outright, it
-    /// pre-flushed at 64 KiB no matter what the staging buffer was configured
-    /// for, so raising the frame size changed the block count not at all
-    /// (measured: 5,368,249 blocks at both 64 KiB and 256 KiB).
-    frame_bytes: usize,
     io_handle: Option<JoinHandle<Result<()>>>,
     _phantom: PhantomData<K>,
 }
@@ -171,7 +161,6 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
                 CompressTarget::Spill,
             )),
             key_buf: Vec::new(),
-            frame_bytes: crate::bgzf_io::spill_frame_bytes(codec),
             io_handle: Some(io_handle),
             _phantom: PhantomData,
         })
@@ -196,12 +185,11 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
             // Fast path: key is part of the record bytes, no extra serialization.
             // Budget: 4-byte length prefix + record bytes.
             let needed = 4 + record.len();
-            let frame = self.frame_bytes;
-            if staging.buf().len() + needed > frame {
+            if staging.buf().len() + needed > BGZF_MAX_BLOCK_SIZE {
                 staging.flush()?;
             }
             staging.buf().extend_from_slice(&(record.len() as u32).to_le_bytes());
-            if record.len() > frame.saturating_sub(4) {
+            if record.len() > BGZF_MAX_BLOCK_SIZE.saturating_sub(4) {
                 staging.write_chunked(record)?;
             } else {
                 staging.buf().extend_from_slice(record);
@@ -213,10 +201,10 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
             self.key_buf.clear();
             key.write_to(&mut self.key_buf)?;
             let needed = self.key_buf.len() + 4 + record.len();
-            // No size limit check: records larger than one frame are handled by
-            // write_chunked(), which splits them across multiple blocks. The
+            // No size limit check: records larger than one BGZF block are handled
+            // by write_chunked(), which splits them across multiple blocks. The
             // reader uses streaming read_exact() that transparently spans blocks.
-            if staging.buf().len() + needed > self.frame_bytes {
+            if staging.buf().len() + needed > BGZF_MAX_BLOCK_SIZE {
                 staging.flush()?;
             }
             staging.buf().extend_from_slice(&self.key_buf);
@@ -224,16 +212,6 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
             staging.write_chunked(record)?;
         }
         Ok(())
-    }
-
-    /// The frame budget this writer pre-flushes against.
-    ///
-    /// Exposed so it can be pinned to [`crate::bgzf_io::spill_frame_bytes`]
-    /// rather than trusted to match it.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn frame_bytes(&self) -> usize {
-        self.frame_bytes
     }
 
     /// Finish writing: flush remaining data, wait for I/O thread.
@@ -347,7 +325,7 @@ mod tests {
     fn test_appending_leaves_one_bgzf_terminator() {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("run.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, SpillCodec::Bgzf, false));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, SpillCodec::Bgzf));
 
         // Two chunks, the second appended to the first.
         for (chunk, appending) in [(0u64, false), (1u64, true)] {
@@ -402,7 +380,7 @@ mod tests {
         // auto-detects the magic and routes to `ZspillStreamReader`.
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("test_chunk_zstd.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Zstd, false));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Zstd));
 
         let records: Vec<(TemplateKey, Vec<u8>)> = (0..100)
             .map(|i| {
@@ -463,7 +441,7 @@ mod tests {
     fn test_pooled_writer_roundtrip() {
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("test_chunk.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         let records: Vec<(TemplateKey, Vec<u8>)> = (0..100)
             .map(|i| {
@@ -513,7 +491,7 @@ mod tests {
     fn test_pooled_writer_empty() {
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("empty_chunk.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         {
             let writer = PooledChunkWriter::<TemplateKey>::new(
@@ -539,7 +517,7 @@ mod tests {
     fn test_pooled_writer_large_records() {
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("large_chunk.keyed");
-        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf, false));
+        let pool = Arc::new(SortWorkerPool::new(4, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         let records: Vec<(TemplateKey, Vec<u8>)> = (0..500)
             .map(|i| {
@@ -587,7 +565,7 @@ mod tests {
         // `handle.wait()` must join it and surface any errors.
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("pipelined_chunk.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         let records: Vec<(TemplateKey, Vec<u8>)> =
             (0..50).map(|i| (make_key(i), vec![(i % 256) as u8; 100])).collect();
@@ -630,7 +608,7 @@ mod tests {
         // the `Drop` impl joins the thread and logs any error.
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("dropped_chunk.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         let handle = {
             let mut writer = PooledChunkWriter::<TemplateKey>::new(
@@ -661,7 +639,7 @@ mod tests {
         // deadlock — the Drop impl signals the I/O thread and joins it.
         let dir = TempDir::new().unwrap();
         let chunk_path = dir.path().join("dropped_writer.keyed");
-        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf, false));
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
 
         {
             let mut writer = PooledChunkWriter::<TemplateKey>::new(

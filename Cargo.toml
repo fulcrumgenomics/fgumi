@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/xtask"]
+members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-fmt", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/fgumi-cli-common", "crates/fgumi-cli-macros", "crates/fgumi-pipeline-core", "crates/fgumi-pipeline-io", "crates/xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -22,9 +22,14 @@ flate2 = { version = "1.1", features = ["zlib-rs"] }
 # Internal crates. Versions are bumped in lockstep by release-plz.
 fgumi-bam-io = { version = "0.7.0", path = "crates/fgumi-bam-io" }
 fgumi-bgzf = { version = "0.7.0", path = "crates/fgumi-bgzf" }
+fgumi-cli-common = { version = "0.7.0", path = "crates/fgumi-cli-common" }
+fgumi-cli-macros = { version = "0.7.0", path = "crates/fgumi-cli-macros" }
+fgumi-fmt = { version = "0.7.0", path = "crates/fgumi-fmt" }
 fgumi-consensus = { version = "0.7.0", path = "crates/fgumi-consensus", default-features = false }
 fgumi-dna = { version = "0.7.0", path = "crates/fgumi-dna" }
 fgumi-metrics = { version = "0.7.0", path = "crates/fgumi-metrics" }
+fgumi-pipeline-core = { version = "0.7.0", path = "crates/fgumi-pipeline-core" }
+fgumi-pipeline-io = { version = "0.7.0", path = "crates/fgumi-pipeline-io" }
 fgumi-raw-bam = { version = "0.7.0", path = "crates/fgumi-raw-bam" }
 fgumi-sam = { version = "0.7.0", path = "crates/fgumi-sam" }
 fgumi-simd-fastq = { version = "0.7.0", path = "crates/fgumi-simd-fastq" }
@@ -53,7 +58,7 @@ fgoxide = "0.6.0"
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 libdeflater = "1.22"
 libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
-log = "0"
+log = "0.4"
 mach2 = "0.6"
 memchr = "2"
 nix = { version = "0.31", default-features = false, features = ["fs"] }
@@ -66,8 +71,10 @@ nix = { version = "0.31", default-features = false, features = ["fs"] }
 noodles = "0.115.0"
 noodles-bgzf = { version = "0.51.0", features = ["libdeflate"] }
 noodles-csi = "0.60.0"
+num-format = "0.4"
 parking_lot = "0.12"
 proptest = "1.10"
+quote = "1"
 rand = "0.10"
 # Chosen over the two syscall wrappers already in `fgumi-sort` on purpose:
 # `libc::getrlimit` is `unsafe` and the crate root is `#![deny(unsafe_code)]`,
@@ -84,8 +91,13 @@ rustix = { version = "1.1", default-features = false, features = ["std"] }
 rayon = "1.10"
 rstest = "0.26"
 serde = { version = "1.0.228", features = ["derive"] }
+# Held at 0.38 because sysinfo >=0.39 requires rustc 1.95 > our MSRV (rust-toolchain.toml pins
+# 1.93). Centralized so `fgumi` and `fgumi-cli-common` cannot drift onto different versions and
+# silently raise the effective MSRV.
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 tempfile = "3.3.0"
 thiserror = "2"
+trybuild = "1.0"
 wide = "1.5"
 
 [package]
@@ -134,9 +146,8 @@ csv = "1.1"
 memchr = { workspace = true }
 statrs = "0.18"
 bytesize = { workspace = true }
-sysinfo = { version = "0.38", default-features = false, features = ["system"] } # unconditionally used by validate_against_system_memory; held at 0.38 because sysinfo >=0.39 requires rustc 1.95 > our MSRV (rust-toolchain.toml pins 1.93)
+sysinfo = { workspace = true } # unconditionally used by validate_against_system_memory
 fs4 = { workspace = true } # cross-platform filesystem free-space queries
-num_cpus = "1.16"
 rayon = { workspace = true }
 approx = { workspace = true }
 ahash = { workspace = true }
@@ -154,6 +165,8 @@ fgumi-umi = { workspace = true }
 fgumi-consensus = { workspace = true }
 fgumi-bam-io = { workspace = true }
 fgumi-sort = { workspace = true }
+fgumi-pipeline-core = { workspace = true }
+fgumi-pipeline-io = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = { workspace = true }
@@ -202,6 +215,12 @@ name = "core_functions"
 harness = false
 # Exercises vanilla consensus / overlap helpers that live behind `simplex`.
 required-features = ["simplex"]
+
+[[bench]]
+name = "pipeline_dispatch"
+harness = false
+# Dispatch-overhead A/B for the typed-step runtime; no command drives the
+# pipeline yet, so this is the only way to measure a hot-path change.
 
 [[bench]]
 name = "raw_bam_accessors"

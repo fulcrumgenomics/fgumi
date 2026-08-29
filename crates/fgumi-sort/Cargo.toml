@@ -13,6 +13,12 @@ keywords = ["bioinformatics", "bam", "sort", "sequencing", "ngs"]
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
 
+[lints.rust]
+# `loom` is a config flag set only for the model-checking test target
+# (`tests/loom_merge_slots.rs`, run via `RUSTFLAGS="--cfg loom"`). Declare it so
+# the unexpected-cfg lint stays quiet under the normal `-D warnings` build.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [dependencies]
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-bgzf = { workspace = true }
@@ -35,7 +41,12 @@ bytes = { workspace = true }
 bytesize = { workspace = true }
 fs4 = { workspace = true }
 log = { workspace = true }
+# `smallvec` is crate-local, not workspace-inherited: `keys.rs` is its only user
+# in the workspace, and the root manifest reserves `[workspace.dependencies]` for
+# crates shared by two or more members.
+smallvec = { version = "1.15", features = ["const_generics"] }
 zstd = "0.13"
+voracious_radix_sort = { version = "1", features = ["voracious_multithread"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -51,6 +62,7 @@ nix = { workspace = true }
 [features]
 default = []
 memory-debug = []
+test-utils = []
 
 [dev-dependencies]
 fgumi-bam-io = { workspace = true }
@@ -61,6 +73,19 @@ proptest = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 
+# loom is only compiled under `--cfg loom`. It is a *regular* (not dev)
+# dependency so `merge_slots.rs` itself can swap `std::sync` -> `loom::sync`
+# under `#[cfg(loom)]` and have its REAL atomics/locks model-checked by
+# `tests/loom_merge_slots.rs` (which drives the real `SortMergeSlot`). The test
+# is `#![cfg(loom)]` (empty under a normal build).
+# Run with:  RUSTFLAGS="--cfg loom" cargo test -p fgumi-sort --test loom_merge_slots --release
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [[bench]]
-name = "template_key"
+name = "chunk_sorter"
+harness = false
+
+[[bench]]
+name = "queryname_keys"
 harness = false

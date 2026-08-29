@@ -32,6 +32,7 @@ use crate::keys::{QuerynameComparator, RawSortKey, SortOrder};
 use crate::memory_probe::{
     BufferProbeStats, ConsumerProbeStats, MergeProbe, SpillProbe, force_mi_collect, log_snapshot,
 };
+use crate::merge_slots::SortMergeSlot;
 use crate::pooled_chunk_writer::PooledChunkWriter;
 use crate::read_ahead::{PooledInputStream, RawReadAheadReader, RecordSource};
 use crate::tmp_dir_alloc::TmpDirAllocator;
@@ -61,7 +62,7 @@ use tempfile::TempDir;
 /// Maximum number of records held in one in-memory chunk.
 ///
 /// Each key carries its ingest position within the chunk (see
-/// [`RawSortKey::set_position`](crate::keys::RawSortKey::set_position)) so that
+/// [`RawSortKey::set_position`]) so that
 /// the key is a *total* order and the chunk sort can be unstable. That position
 /// is a `u32`, so a chunk that grew past `u32::MAX` records would have to stamp
 /// two records with the same position — exact name/flag ties would stop being
@@ -116,7 +117,7 @@ pub fn format_thread_counts(sort_threads: usize, merge_threads: usize) -> String
 /// Used to identify bottlenecks and validate thread architecture changes.
 /// All times are cumulative (multiple spill cycles accumulate).
 #[derive(Debug, Default)]
-struct SortPhaseTimer {
+pub(crate) struct SortPhaseTimer {
     /// Time reading records from input BAM (includes BGZF decompression).
     read_secs: f64,
     /// Time sorting in-memory buffers (rayon parallel sort or single-threaded).
@@ -139,19 +140,13 @@ struct SortPhaseTimer {
     overall_start: Option<Instant>,
     /// Tracks the start of the current read span (between spills).
     read_span_start: Option<Instant>,
-    /// Whether the `--sort-stats` diagnostics are enabled for this run (run-scoped copy of
-    /// [`RawExternalSorter::sort_stats`]); consulted by this timer's `stat!` emitters.
-    sort_stats: bool,
 }
 
 impl SortPhaseTimer {
-    /// `sort_stats` is whether `--sort-stats` diagnostics are on for this run (the trailing
-    /// `bool` at call sites; tests pass `false`).
-    fn new(sort_stats: bool) -> Self {
+    fn new() -> Self {
         Self {
             overall_start: Some(Instant::now()),
             read_span_start: Some(Instant::now()),
-            sort_stats,
             ..Default::default()
         }
     }
@@ -251,14 +246,7 @@ impl SortPhaseTimer {
     /// `max_temp_files` is reported so a run that consolidated says which limit
     /// it consolidated against.
     #[allow(clippy::cast_precision_loss)]
-    fn log_summary(
-        &self,
-        sort_threads: usize,
-        merge_threads: usize,
-        max_temp_files: usize,
-        phase1: &Phase1FloorInputs,
-    ) {
-        let sort_stats = self.sort_stats;
+    fn log_summary(&self, sort_threads: usize, merge_threads: usize, max_temp_files: usize) {
         let overall = self.overall_start.map_or(0.0, |s| s.elapsed().as_secs_f64());
         // Guard against division by zero when sort completes in negligible time.
         let overall_nonzero = if overall > 0.0 { overall } else { f64::EPSILON };
@@ -270,15 +258,11 @@ impl SortPhaseTimer {
         let sort_secs = self.sort_secs;
         let spill_secs = self.spill_write_secs;
 
-        stat!(sort_stats, "=== Sort Phase Timing ===");
-        stat!(sort_stats, "  Read + decompress: {read_secs:.1}s ({read_pct:.0}%)");
-        stat!(
-            sort_stats,
-            "  In-memory sort:    {sort_secs:.1}s ({sort_pct:.0}%) [{spill_count} spills]"
-        );
+        info!("=== Sort Phase Timing ===");
+        info!("  Read + decompress: {read_secs:.1}s ({read_pct:.0}%)");
+        info!("  In-memory sort:    {sort_secs:.1}s ({sort_pct:.0}%) [{spill_count} spills]");
         let spill_mb = self.total_spill_bytes as f64 / (1024.0 * 1024.0);
-        stat!(
-            sort_stats,
+        info!(
             "  Spill write:       {spill_secs:.1}s ({spill_pct:.0}%) [{spill_count} writes, {spill_mb:.1} MB total]"
         );
         if self.consolidate_count > 0 {
@@ -290,301 +274,29 @@ impl SortPhaseTimer {
             // what it was up against. Reporting the number and not what to do
             // about it keeps the recommendation with the caller that chose the
             // limit -- the engine cannot know whether it was requested.
-            stat!(
-                sort_stats,
+            info!(
                 "  Consolidation:     {cons_secs:.1}s ({cons_pct:.0}%) [{cons_count} merges, limit {max_temp_files}]"
             );
         }
         if self.merge_secs > 0.0 {
             let merge_secs = self.merge_secs;
             let merge_pct = 100.0 * merge_secs / overall_nonzero;
-            stat!(sort_stats, "  K-way merge:       {merge_secs:.1}s ({merge_pct:.0}%)");
+            info!("  K-way merge:       {merge_secs:.1}s ({merge_pct:.0}%)");
         }
         if self.write_output_secs > 0.0 {
             let write_secs = self.write_output_secs;
             let write_pct = 100.0 * write_secs / overall_nonzero;
-            stat!(sort_stats, "  Write output:      {write_secs:.1}s ({write_pct:.0}%)");
+            info!("  Write output:      {write_secs:.1}s ({write_pct:.0}%)");
         }
-        stat!(sort_stats, "  Total wall clock:  {overall:.1}s");
-        stat!(sort_stats, "  Threads: {}", format_thread_counts(sort_threads, merge_threads));
-        self.log_phase1_floor(phase1);
-        stat!(sort_stats, "=========================");
-    }
-
-    /// Which of three limits Phase 1's *ingest* is against, and what is
-    /// recoverable without doing less work.
-    ///
-    /// Scoped to the read span rather than the whole phase, deliberately. The
-    /// in-memory sort is parallel (rayon) and the spill write-out overlaps the
-    /// next read, so folding them in would put parallel work on the same side of
-    /// the comparison as one thread's serial CPU and report the difference as
-    /// "coordination" -- naming a limit that is not there. The read span is the
-    /// part where one thread reads every record while the pool feeds it, which is
-    /// exactly the shape [`crate::merge_headroom`] models.
-    ///
-    /// Externally sampled, this phase is 60% of a whole-genome sort's wall clock
-    /// with its main thread 91% busy while 16 cores average 5.3. If that holds
-    /// in-process, the binding limit is the ingest thread and no amount of
-    /// additional worker capacity moves it.
-    fn log_phase1_floor(&self, phase1: &Phase1FloorInputs) {
-        let sort_stats = self.sort_stats;
-        if self.read_secs <= 0.0 {
-            return;
-        }
-        let ingest = phase1.ingest;
-        let floors = crate::merge_headroom::MergeFloors {
-            loop_secs: self.read_secs,
-            consumer_secs: (self.read_secs - ingest.park_secs).max(0.0),
-            worker_busy_secs: phase1.input_busy_secs,
-            threads: phase1.threads.max(1),
-        };
-        stat!(sort_stats, "  Phase 1 ingest floor: {} is the limit", floors.binding().label());
-        stat!(
-            sort_stats,
-            "    ingest serial {:.1}s | worker capacity {:.1}s ({} threads) | read span {:.1}s",
-            floors.consumer_secs,
-            floors.worker_floor_secs(),
-            floors.threads,
-            self.read_secs
-        );
-        stat!(
-            sort_stats,
-            "    recoverable without doing less work: {:.1}s ({:.0}% of the read span)",
-            floors.recoverable_secs(),
-            100.0 * floors.recoverable_share()
-        );
-        if ingest.parks > 0 {
-            // Mean park separates a supply problem from a handoff problem: many
-            // short parks and few long ones need opposite fixes, and the totals
-            // alone cannot tell them apart.
-            stat!(
-                sort_stats,
-                "    ingest parked {:.1}s over {} parks ({:.0} us each): {} starved, {} head-of-line",
-                ingest.park_secs,
-                ingest.parks,
-                ingest.mean_park_micros().unwrap_or(0.0),
-                ingest.parks_starved,
-                ingest.parks_head_of_line
-            );
-        } else {
-            stat!(sort_stats, "    ingest never parked: the pool always had the next block ready");
-        }
-        if ingest.spill_waits > 0 {
-            stat!(
-                sort_stats,
-                "    waited {:.1}s over {} spill handoffs (outside every phase bucket)",
-                ingest.spill_wait_secs,
-                ingest.spill_waits
-            );
-        }
-        Self::log_reader_partition(&phase1.reader, sort_stats);
-        self.log_ingest_partition(phase1);
-    }
-
-    /// What the input reader's exclusively-owned thread spent its time on.
-    ///
-    /// The reader is Phase 1's *second* serial resource and the one the floor
-    /// line cannot see: `phase1_input_busy_secs` folds it in with decompression
-    /// and divides by the thread count, which is right for a step any worker may
-    /// run and wrong for one only worker 0 ever runs. So a reader at its limit
-    /// disappears into a worker-capacity figure that looks comfortable.
-    ///
-    /// The split that matters is refill against framing, because they have
-    /// nothing in common: refill time is the disk (compare it to the volume's
-    /// measured ceiling) and framing time is header parse, per-block allocation
-    /// and the body copy (compare it to the `raw_block_read` bench). Reporting
-    /// only the step total gives a number -- 24.3 us/block on the production
-    /// cell -- that is consistent with either being the whole cost.
-    #[allow(clippy::cast_precision_loss, reason = "call and byte counts stay below 2^52")]
-    fn log_reader_partition(reader: &crate::phase1_stats::ReaderReport, sort_stats: bool) {
-        if reader.batches == 0 {
-            return;
-        }
-        stat!(
-            sort_stats,
-            "  Phase 1 input reader: {:.1}s over {} batches ({:.1} us/block, {} blocks)",
-            reader.step_secs,
-            reader.batches,
-            reader.per_block_micros(reader.step_secs),
-            reader.blocks
-        );
-        if reader.refills > 0 {
-            stat!(
-                sort_stats,
-                "    refill reads: {:.1}s over {} calls ({:.2} ms each, {:.0} MB/s, {:.1} GB)",
-                reader.refill_secs,
-                reader.refills,
-                reader.refill_secs * 1000.0 / reader.refills as f64,
-                reader.refill_mb_per_sec(),
-                reader.refill_bytes as f64 / 1e9
-            );
-        } else {
-            stat!(
-                sort_stats,
-                "    refill reads: none on this thread (async reader, or input already buffered)"
-            );
-        }
-        stat!(
-            sort_stats,
-            "    framing:      {:.1}s ({:.1} us/block)",
-            reader.framing_secs(),
-            reader.per_block_micros(reader.framing_secs())
-        );
-        stat!(
-            sort_stats,
-            "    dispatch:     {:.1}s ({:.1} us/block)",
-            reader.dispatch_secs,
-            reader.per_block_micros(reader.dispatch_secs)
-        );
-        stat!(sort_stats, "    refill latency: {}", reader.refill_latency.summary());
-        // The discriminator. A `read()` that got slower because the thread kept
-        // losing the CPU shows runqueue wait and extra timeslices; one that got
-        // slower because the device or the memory system delivered fewer bytes
-        // per second shows neither, because the thread was blocked on I/O
-        // throughout. Wall-clock timing cannot separate those, and the whole
-        // question of what a busier worker pool does to the reader turns on it.
-        if reader.refill_sched_samples > 0 {
-            stat!(
-                sort_stats,
-                "    refill scheduling: runqueue wait {:.2}s ({:.1}% of refill), on-CPU {:.2}s, \
-                 {} timeslices over {} sampled calls",
-                reader.refill_runqueue_secs,
-                100.0 * reader.refill_runqueue_share(),
-                reader.refill_oncpu_secs,
-                reader.refill_timeslices,
-                reader.refill_sched_samples,
-            );
-        } else {
-            stat!(
-                sort_stats,
-                "    refill scheduling: unavailable (needs /proc/thread-self/schedstat)"
-            );
-        }
-        stat!(
-            sort_stats,
-            "    unattributed: {:.1}s ({:.0}% of the step)",
-            reader.residual_secs(),
-            100.0 * reader.residual_share()
-        );
-    }
-
-    /// What the ingest thread's serial CPU is made of, per segment.
-    ///
-    /// Correction happens at the sampled scale and scaling second: subtracting
-    /// one clock pair from the *scaled* total instead would understate the
-    /// correction by the scale factor, which on a 1-in-1021 sample is three
-    /// orders of magnitude.
-    #[allow(clippy::cast_precision_loss, reason = "record counts stay below 2^52")]
-    fn log_ingest_partition(&self, phase1: &Phase1FloorInputs) {
-        let sort_stats = self.sort_stats;
-        if phase1.samples == 0 || phase1.records == 0 {
-            return;
-        }
-        let scale = phase1.records as f64 / phase1.samples as f64;
-        let segments =
-            phase1.sample.corrected(phase1.samples, phase1.clock_overhead_nanos).scaled(scale);
-        let partition = crate::phase1_stats::IngestPartition {
-            segments,
-            read_secs: self.read_secs,
-            park_secs: phase1.ingest.park_secs,
-        };
-        let per_record = |secs: f64| 1e9 * secs / phase1.records as f64;
-        stat!(
-            sort_stats,
-            "    Ingest segments ({} samples of {} records, scaled {scale:.0}x, clock {}ns/pair)",
-            phase1.samples,
-            phase1.records,
-            phase1.clock_overhead_nanos
-        );
-        stat!(
-            sort_stats,
-            "      fetch next record: {:.1}s ({:.0} ns/rec)  [includes {:.1}s parked]",
-            segments.fetch,
-            per_record(segments.fetch),
-            partition.park_secs
-        );
-        stat!(
-            sort_stats,
-            "      push to arena:     {:.1}s ({:.0} ns/rec)",
-            segments.push,
-            per_record(segments.push)
-        );
-        stat!(
-            sort_stats,
-            "      progress tick:     {:.1}s ({:.0} ns/rec)",
-            segments.tick,
-            per_record(segments.tick)
-        );
-        stat!(
-            sort_stats,
-            "      probe + mem check: {:.1}s ({:.0} ns/rec)",
-            segments.probe,
-            per_record(segments.probe)
-        );
-        // Exact, not sampled, and reported outside the partition above: both
-        // costs are per-batch or per-chunk, so the per-record sampler cannot see
-        // them honestly. `dispatch` is what deferral costs the serial thread;
-        // `barrier` is the extraction the pool failed to hide.
-        let census = phase1.key_overlap;
-        if let Some(pct) = census.overlap_percent() {
-            stat!(
-                sort_stats,
-                "    Deferred key extraction: {pct:.1}% overlapped ({} of {} records; \
-                 {} keyed at a barrier)",
-                census.overlapped_records,
-                census.total_records(),
-                census.barrier_records,
-            );
-            stat!(
-                sort_stats,
-                "      dispatch (exact):  {:.1}s      barrier wait (exact): {:.1}s",
-                census.dispatch_secs,
-                census.barrier_secs,
-            );
-        }
-        // Signed: a negative residual means the segments over-attribute, which is
-        // the failure mode this partition exists to make visible.
-        stat!(
-            sort_stats,
-            "      unattributed:      {:+.1}s ({:+.0}% of the read span)",
-            partition.residual_secs(),
-            100.0 * partition.residual_share()
-        );
+        info!("  Total wall clock:  {overall:.1}s");
+        info!("  Threads: {}", format_thread_counts(sort_threads, merge_threads));
+        info!("=========================");
     }
 }
 
 // ============================================================================
 // Library Lookup for Template-Coordinate Sort
 // ============================================================================
-
-/// What the Phase 1 floor line needs that [`SortPhaseTimer`] cannot see: the
-/// pool's worker time and the ingest thread's waits.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct Phase1FloorInputs {
-    /// Worker seconds reading and decompressing input blocks.
-    pub(crate) input_busy_secs: f64,
-    /// Active Phase 1 worker threads the busy total is spread over.
-    pub(crate) threads: usize,
-    /// What the ingest thread waited for.
-    pub(crate) ingest: crate::phase1_stats::Phase1IngestReport,
-    /// Raw (unscaled, uncorrected) sub-phase sample from the ingest loop, when
-    /// that loop is instrumented. Left at zero by the orders that are not.
-    pub(crate) sample: crate::phase1_stats::IngestSample,
-    /// Records timed for `sample`.
-    pub(crate) samples: u64,
-    /// Records the loop processed, the numerator of the sampling scale.
-    pub(crate) records: u64,
-    /// Measured cost of one `Instant::now()`/`elapsed()` pair, subtracted once
-    /// per segment per sample.
-    pub(crate) clock_overhead_nanos: u64,
-    /// How the exclusively-owned input reader spent its time. Unlike `sample`,
-    /// this is order-independent -- every sort order reads the same way -- so it
-    /// is filled in on all four paths.
-    pub(crate) reader: crate::phase1_stats::ReaderReport,
-    /// What deferred key extraction achieved, on the orders that defer it
-    /// (template-coordinate). Default (all zero) elsewhere.
-    pub(crate) key_overlap: crate::phase1_keys::KeyOverlapCensus,
-}
 
 /// Deterministic hasher for cell barcode hashing in template-coordinate sort.
 ///
@@ -793,41 +505,14 @@ fn process_umask() -> u32 {
     u32::from(previous)
 }
 
-/// RG-id to library-ordinal map, hashed with `ahash` rather than std's `SipHash`.
-///
-/// `ordinal_from_rg` runs once per record on the sort's serial Phase 1 thread --
-/// the thread that sets 60% of a spill-heavy sort's wall clock -- and hashing a
-/// ~40-byte RG id with `SipHash` measured **6.1% of that thread** on
-/// `1kg-wgs-HG00096` (`core::hash::sip::Hasher::write`, third-largest entry in
-/// its profile). The keys come from the header of a BAM the caller chose to
-/// sort, so there is no adversarial-input exposure that would argue for
-/// `SipHash`'s collision resistance here.
-///
-/// Unlike [`cb_hasher`] and [`LibraryLookup::hasher`], this one is left at
-/// `ahash`'s default randomly-seeded state rather than `with_seeds`. Those two
-/// feed hash values *into the sort key*, so they must be identical across
-/// processes or the same input would sort differently run to run. This map's
-/// hasher is never observed: it is probed only by `get`, and
-/// `distinct_header_ordinals` collects its values into a set, so neither the
-/// hash values nor the iteration order reaches an output.
-type RgOrdinalMap = HashMap<Vec<u8>, u32, ahash::RandomState>;
-
 /// Maps read group ID -> library ordinal for O(1) comparison.
 ///
 /// Pre-computes ordinals by sorting library names alphabetically.
 /// Empty/unknown library sorts first (ordinal 0).
-///
-/// `Clone` is derived so the deferred key-extraction context can own a copy
-/// rather than borrow one, and it is **seed-preserving on purpose**: cloning
-/// `ahash::RandomState` copies its keys rather than drawing new ones, so a clone
-/// hashes read names identically to its original. Anything that reseeded here
-/// would change the template-coordinate sort key and break byte-identity
-/// silently — the output would still be correctly sorted, just not the same
-/// order twice.
 #[derive(Clone)]
 pub struct LibraryLookup {
     /// RG ID -> library ordinal
-    rg_to_ordinal: RgOrdinalMap,
+    rg_to_ordinal: HashMap<Vec<u8>, u32>,
     /// Deterministic hasher for read name hashing, constructed once for reuse.
     hasher: ahash::RandomState,
 }
@@ -859,7 +544,7 @@ impl LibraryLookup {
         }
 
         // Build RG ID -> ordinal mapping
-        let rg_to_ordinal: RgOrdinalMap = header
+        let rg_to_ordinal: HashMap<Vec<u8>, u32> = header
             .read_groups()
             .iter()
             .map(|(id, rg)| {
@@ -1385,8 +1070,11 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
 /// individual `RawRecord`s and produces `Owned` chunks — the
 /// per-record allocation is sunk cost, so we preserve the original
 /// zero-copy `mem::swap` merge bridge.
-pub(crate) enum MemorySources<K: RawSortKey + Default + 'static> {
+pub enum MemorySources<K: RawSortKey + Default + 'static> {
+    /// Inline-buffer (coordinate / template) residual chunks sharing an
+    /// `Arc<SegmentedBuf>` — zero per-record allocation.
     Shared(Vec<InMemoryChunk<K>>),
+    /// Queryname-style residual chunks (each record an owned `RawRecord`).
     Owned(Vec<Vec<(K, fgumi_raw_bam::RawRecord)>>),
 }
 
@@ -1559,42 +1247,10 @@ struct MergeConsumerDiag {
     reassembled: u64,
 }
 
-/// Per-merge tallies of the record-fetch fast/slow split.
-///
-/// [`RECORD_BORROWED`] and [`RECORD_REASSEMBLED`] used to be incremented per
-/// record, directly from the merge consumer. That is the one serial thread that
-/// touches every record of the merge, and it is the merge's binding floor on the
-/// measured cell (`consumer serial 112.9s` against `worker capacity 89.4s` and a
-/// 157.1s loop). A relaxed `fetch_add` there is not free: on aarch64 it is an
-/// outline-atomics call into `__aarch64_ldadd8_relax`, the same helper that
-/// measured 28% of this thread's cycles while the progress counter used it
-/// per-record (see [`crate::progress_batch`]).
-///
-/// Counting into locals and publishing once per merge keeps every number the
-/// reports read -- they consume the statics as a before/after delta around the
-/// loop -- and removes two atomics per record from the critical path. Publish
-/// *before* that delta is read, or the merge reports zero.
-#[derive(Default)]
-struct RecordFetchCounts {
-    /// Records handed over borrowed from the current decompressed block.
-    borrowed: u64,
-    /// Records reassembled into scratch because they straddled a block boundary.
-    reassembled: u64,
-}
-
-impl RecordFetchCounts {
-    /// Fold this merge's tallies into the process-wide totals.
-    fn publish(&self) {
-        RECORD_BORROWED.fetch_add(self.borrowed, std::sync::atomic::Ordering::Relaxed);
-        RECORD_REASSEMBLED.fetch_add(self.reassembled, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 #[inline]
 fn winner_record_bytes<'a, K: RawSortKey + Default + 'static>(
     source: &'a ChunkSource<K>,
     consumer: Option<&'a MainThreadChunkConsumer<K>>,
-    counts: &mut RecordFetchCounts,
 ) -> Result<&'a [u8]> {
     match source {
         ChunkSource::PoolDisk { source_id, scratch } => {
@@ -1611,14 +1267,12 @@ fn winner_record_bytes<'a, K: RawSortKey + Default + 'static>(
             // that touches every record, so a clock read here would cost more
             // than the step. What was unknown is how often the copy path fires
             // at all -- a frequency answers that, and the per-record cost is a
-            // memcpy of a ~100-byte record either way. The tally is a local
-            // (see [`RecordFetchCounts`]); an atomic per record on this thread
-            // is itself measurable.
+            // memcpy of a ~100-byte record either way.
             if let Some(borrowed) = consumer.current_record_bytes(*source_id) {
-                counts.borrowed += 1;
+                RECORD_BORROWED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(borrowed)
             } else {
-                counts.reassembled += 1;
+                RECORD_REASSEMBLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(scratch.as_slice())
             }
         }
@@ -1708,9 +1362,6 @@ pub(crate) struct MainThreadChunkConsumer<K: RawSortKey + 'static> {
     /// Shared pool state, for the epoch clock and the trace counters that
     /// record both halves of a producer/consumer handoff.
     shared: Arc<crate::worker_pool::SharedPipelineState>,
-    /// Decompression state, so this thread can serve itself a block that has been
-    /// read but not yet claimed instead of parking for a worker to do it.
-    decomp: crate::worker_pool::DecompressorSet,
     /// Source the previous block came from, and how many consecutive blocks
     /// have now come from it. Says whether the merge dwells on one run at a
     /// time -- in which case lookahead on that run would pay -- or hops.
@@ -1849,11 +1500,9 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
     ) -> Self {
         let parser_state = (0..files.len()).map(|_| SourceParserState::new()).collect();
         let stalls = crate::merge_stalls::ConsumerStallTracker::new(files.len());
-        let codec = files.first().map_or(crate::codec::SpillCodec::Bgzf, |f| f.codec);
         Self {
             files,
             parser_state,
-            decomp: crate::worker_pool::DecompressorSet::for_codec(codec),
             decompression_error,
             chunk_read_error,
             worker_panicked,
@@ -2130,125 +1779,19 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             self.shared
                 .phase2_awaited_source
                 .store(source_id, std::sync::atomic::Ordering::Relaxed);
-            // Arm the park handshake. Workers stamp when the awaited block is
-            // first claimed and when the consumer is woken; the difference from
-            // `park_start` splits this park into additive stages. Cleared here
-            // rather than after so a stamp can only ever be attributed to a park
-            // that had already begun.
-            let ord = std::sync::atomic::Ordering::Relaxed;
-            self.shared.awaited_claim_nanos.store(0, ord);
-            self.shared.awaited_publish_nanos.store(0, ord);
-            let park_started_at = self.shared.now_nanos();
-            // Sampled BEFORE the park, not after: the question is why nobody had
-            // already started on this block, and the pool's state on *resume* is
-            // the answer to a different question -- by then somebody has.
-            // Before sleeping: if the block this thread is waiting for has already
-            // been read and nobody has claimed it, decompress it here rather than
-            // parking. That trades ~53us of work for a ~190us wait on a worker
-            // that has to be woken first, and it removes the producer-to-consumer
-            // handoff instead of trying to schedule around it -- which is what
-            // eight scheduling interventions failed to do.
-            //
-            // Loops while it keeps succeeding: the same argument applies to the
-            // blocks after the one immediately needed, and serving them here is
-            // depth on exactly the file being drained, which is where >=94% of
-            // consumed blocks come from. Bounded by the FIFO running dry or the
-            // reorder cap, both of which `try_pop_raw_for_decompress` enforces, so
-            // this cannot spin.
-            //
-            // Only on the way into a park, never in place of merging: this thread
-            // is the serial bottleneck at 76s of a 166s merge, and taking work it
-            // could have delegated while it still has records to emit would be
-            // strictly worse.
-            if self.serve_self_instead_of_parking(source_id) {
-                // Self-service is not a park: leave `parked_yet` untouched so the
-                // first real park of this pull still records a `stalled_pull`.
-                // Serving before the first park would otherwise suppress that
-                // increment and understate the stall rate.
-                continue;
-            }
-
-            let supply = self.shared.park_supply_now();
-            // Published for `get_sort_priorities`: while this is set, a worker
-            // serves the awaited file before it drains output compression.
-            // Ordering is Release/Acquire-free on purpose -- a worker reading it
-            // one iteration late costs one deferred block, not correctness.
-            self.shared.consumer_parked.store(true, ord);
-
             let park_start = Instant::now();
             std::thread::park();
-            self.shared.consumer_parked.store(false, ord);
             let parked_ns = crate::merge_trace::elapsed_nanos(park_start);
-            self.shared.park_supply.record(supply, parked_ns);
             self.stalls.record_park(source_id, parked_ns, !parked_yet);
             self.shared.consumer_trace.record_park(state, parked_ns, in_flight);
-
-            // Split the park. `now_nanos` is the same clock the workers stamp
-            // with, so the segments are comparable; `parked_ns` comes from
-            // `Instant` and is only used for the existing counters.
-            let resumed_at = self.shared.now_nanos();
-            let claim = self.shared.awaited_claim_nanos.load(ord);
-            let publish = self.shared.awaited_publish_nanos.load(ord);
-            let segments = crate::merge_stalls::split_park(
-                park_started_at,
-                (claim != 0).then_some(claim),
-                (publish != 0).then_some(publish),
-                resumed_at,
-            );
-            // Depth on the critical path: how many blocks the awaited file had
-            // ready the moment the consumer could run again. A mean near 1 means
-            // every block is fetched on demand, which is a different problem
-            // from a slow fetch.
-            let (_, ready, _) = self.files[source_id].depths();
-            self.shared.park_attribution.record(segments, claim != 0, ready as u64);
             parked_yet = true;
         }
     }
 
-    /// Decompress this source's already-read blocks on this thread, returning
-    /// whether anything was published.
-    ///
-    /// Called only on the way into a park. If the block the merge is waiting for
-    /// has been read and nobody has claimed it -- 12% of parks -- decompressing it
-    /// here trades ~53us of work for a ~190us wait on a worker that has to be
-    /// woken first. It removes the producer-to-consumer handoff instead of trying
-    /// to schedule around it, which is what eight scheduling interventions failed
-    /// to do. The decisive evidence: raising `PHASE2_DECOMP_CAP` 8 -> 128 cut parks
-    /// from 978,325 to 400,487 and left total park time at 89.6s against 89.7s, so
-    /// the cost is per block, not per park, and no amount of buffering reaches it.
-    ///
-    /// Loops while it keeps succeeding, because the same argument applies to the
-    /// blocks after the one immediately needed, and serving them here is depth on
-    /// exactly the file being drained -- where >=94% of consumed blocks come from
-    /// (median run is 1 block, but the mean is 31.7 and p99 is 512). It cannot
-    /// spin: each iteration either pops a block or stops, bounded by the FIFO
-    /// emptying or the reorder cap, both enforced inside
-    /// `try_pop_raw_for_decompress`.
-    ///
-    /// **Never in place of merging.** This thread is the serial bottleneck, 76s of
-    /// a 166s merge, so taking work it could have delegated while it still has
-    /// records to emit would be strictly worse. The only safe moment is the one
-    /// where it was about to sleep anyway.
-    fn serve_self_instead_of_parking(&mut self, source_id: usize) -> bool {
-        let mut served = false;
-        while crate::worker_pool::SortWorkerPool::consumer_decompress_one(
-            &self.shared,
-            &mut self.decomp,
-            &self.files[source_id],
-            source_id,
-        ) {
-            served = true;
-        }
-        if served {
-            self.shared.consumer_self_served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        served
-    }
-
     /// Parse the next record from a source's byte stream.
     ///
-    /// Handles the format: for `EMBEDDED_IN_RECORD` keys, reads [len(4)][record(len)].
-    /// For keyed format, reads [key][len(4)][record(len)].
+    /// Handles the format: for `EMBEDDED_IN_RECORD` keys, reads `[len(4)][record(len)]`.
+    /// For keyed format, reads `[key][len(4)][record(len)]`.
     fn parse_next_record(&mut self, source_id: usize, buf: &mut Vec<u8>) -> Result<Option<K>> {
         let mut len_buf = [0u8; 4];
 
@@ -2529,9 +2072,8 @@ struct RunFormer<K> {
 /// the surviving file count can be far lower than the run count for reasons that
 /// have nothing to do with how ordered the input was -- which is the one thing
 /// this line exists to report.
-fn log_run_formation(chunks_spilled: usize, runs: usize, sort_stats: bool) {
-    stat!(
-        sort_stats,
+fn log_run_formation(chunks_spilled: usize, runs: usize) {
+    info!(
         "Spill runs: {runs} from {chunks_spilled} chunks ({} extended an existing run)",
         chunks_spilled.saturating_sub(runs)
     );
@@ -2606,6 +2148,45 @@ fn probe_stats(buf: &impl ProbeableBuffer) -> BufferProbeStats {
     }
 }
 
+/// Read-stream policy for the Phase-1 input reader.
+///
+/// R10-sync compatibility shim: `main`'s `--read-streams` CLI (#838/#846) is carried on the
+/// arena engine so `commands/sort.rs` compiles and the flag keeps parsing; the arena reader
+/// does not yet honor it. Forward-porting the measured multi-stream reader onto the arena
+/// engine is tracked as R7b.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadStreams {
+    /// Measure and grow. The default.
+    #[default]
+    Auto,
+    /// Exactly this many; `1` is the plain sequential reader.
+    Fixed(usize),
+}
+
+impl std::fmt::Display for ReadStreams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Fixed(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+impl std::str::FromStr for ReadStreams {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        match text.parse::<usize>() {
+            Ok(0) => Err("--read-streams must be `auto` or at least 1".to_string()),
+            Ok(n) => Ok(Self::Fixed(n)),
+            Err(_) => Err(format!("expected `auto` or a positive number, got `{text}`")),
+        }
+    }
+}
+
 /// Raw-bytes external sorter for BAM files.
 ///
 /// This sorter uses lazy record parsing to minimize memory usage and avoid
@@ -2653,20 +2234,13 @@ pub struct RawExternalSorter {
     /// a modest allocation and let `Vec` grow on demand, while explicit limits
     /// pre-allocate the full budget upfront (preserving prior behavior).
     initial_capacity: Option<usize>,
-    /// How the input and the merge's spill files are read. See
-    /// `spill_reader` for why more than one stream is needed.
-    read_streams: ReadStreams,
+    /// When true, wrap input in a `PrefetchReader` for async I/O.
+    async_reader: bool,
     /// Which optional template-key lanes to retain (template-coordinate only).
     ///
     /// Defaults to [`KeyTypesSpec::Auto`], which provisions the narrowest key
     /// that fits the first record's optional lanes.
     key_types: KeyTypesSpec,
-    /// Whether to emit the `--sort-stats` performance diagnostics for this run.
-    ///
-    /// Run-scoped (a field on the sorter) rather than a process-global static, so two sorts
-    /// in one process (fgumi-sort is a library) keep independent settings. Copied into the
-    /// [`SortPhaseTimer`] and [`SortWorkerPool`] this sorter builds, which own the emitters.
-    sort_stats: bool,
 }
 
 /// RAII guard that ensures Phase 2 teardown runs on every exit path between
@@ -2751,6 +2325,141 @@ impl<K: RawSortKey + 'static> Drop for Phase2Guard<'_, K> {
 }
 
 impl RawExternalSorter {
+    /// The configured sort order. Read by the typed-step `SortAndSpill` adapter
+    /// to pick the matching `*SortStream` variant.
+    #[must_use]
+    pub fn sort_order(&self) -> SortOrder {
+        self.sort_order
+    }
+
+    /// The configured cell-barcode tag (template-coordinate CB hashing), if any.
+    /// Read when building a record-input arena strategy so it matches the
+    /// block-input template strategy exactly.
+    #[must_use]
+    pub fn cell_tag_value(&self) -> Option<SamTag> {
+        self.cell_tag
+    }
+
+    /// The configured `--key-types` narrowing spec (template-coordinate only).
+    #[must_use]
+    pub fn key_types_spec(&self) -> KeyTypesSpec {
+        self.key_types
+    }
+
+    /// The configured in-memory sort budget in bytes (per-run seal threshold).
+    #[must_use]
+    pub fn memory_limit_bytes(&self) -> usize {
+        self.memory_limit
+    }
+
+    /// The configured base thread count (`--threads`).
+    ///
+    /// NOT the Phase-1 sort width — that is `phase1_threads()`, which applies
+    /// the `--sort-threads` override. Reading this as the sort width is the
+    /// D1.1 regression, pinned by `test_raw_sorter_phase_threads_builders`.
+    #[must_use]
+    pub fn num_threads(&self) -> usize {
+        self.threads
+    }
+
+    /// Convert this configured sorter into a lean coordinate buffering sorter
+    /// for the P6 `SortBuffer` step.
+    ///
+    /// Same buffer sizing / rayon pool as the retired `into_coordinate_stream`,
+    /// but with **no** `SortWorkerPool`, temp dirs, or spill files — the
+    /// `SortBuffer` step only ingests + par-sorts + materializes chunks; the
+    /// `CompressSpill` step owns compression and disk I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `self.sort_order` is not `Coordinate`, the reference
+    /// count exceeds `u32::MAX`, or the rayon sort pool cannot be built.
+    pub fn into_coordinate_chunk_sorter(
+        self,
+        header: &Header,
+    ) -> Result<crate::chunk_sorter::CoordinateChunkSorter> {
+        anyhow::ensure!(
+            matches!(self.sort_order, SortOrder::Coordinate),
+            "into_coordinate_chunk_sorter requires SortOrder::Coordinate (got {:?})",
+            self.sort_order,
+        );
+        let rayon_pool = self.build_sort_rayon_pool()?;
+        let nref = u32::try_from(header.reference_sequences().len())
+            .context("reference sequence count exceeds u32::MAX")?;
+        let init_cap = self.effective_initial_capacity();
+        // Per-record footprint estimate matches `into_coordinate_stream`.
+        let estimated_records = init_cap / 240;
+        // The record *bodies* arena comes from the `ArenaPool` on the first
+        // `ensure_arena`, so no data-byte capacity is requested here. That is not
+        // the same as allocating nothing: `with_capacity` still sizes the segment
+        // for the inline headers (`estimated_records * HEADER_SIZE`), and
+        // `install_arena` replaces and drops that buffer when the pooled arena
+        // lands. Transient header storage, in other words — not zero.
+        let buffer = RecordBuffer::with_capacity(estimated_records, 0, nref);
+        // Bounded reusable-arena pool (lever-1 RSS fix). Capacity 1 = legacy's
+        // one-arena-at-a-time footprint: the next chunk cannot fill until the
+        // prior chunk is spilled and its arena returns, bounding peak RSS to
+        // ~one arena ≈ base. (Tunable via `--sort-arenas` in a later increment.)
+        let arena_pool = crate::arena_pool::ArenaPool::new(1, crate::inline::SORT_SEGMENT_SIZE);
+        Ok(crate::chunk_sorter::CoordinateChunkSorter::new(
+            buffer,
+            rayon_pool,
+            self.memory_limit,
+            arena_pool,
+        ))
+    }
+
+    /// Convert this configured sorter into a lean template-coordinate buffering
+    /// sorter for the P6 `SortBuffer` step (the template analogue of
+    /// [`Self::into_coordinate_chunk_sorter`] — same sizing as the retired
+    /// `into_template_coordinate_stream`, minus the pool/temp-dirs).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `self.sort_order` is not `TemplateCoordinate` or the
+    /// rayon sort pool cannot be built.
+    pub fn into_template_chunk_sorter(
+        self,
+        header: &Header,
+    ) -> Result<crate::chunk_sorter::TemplateChunkSorter> {
+        anyhow::ensure!(
+            matches!(self.sort_order, SortOrder::TemplateCoordinate),
+            "into_template_chunk_sorter requires SortOrder::TemplateCoordinate (got {:?})",
+            self.sort_order,
+        );
+        let rayon_pool = self.build_sort_rayon_pool()?;
+        let lib_lookup = LibraryLookup::from_header(header);
+        let header_library_varies = lib_lookup.distinct_header_ordinals() > 1;
+        let cb_hasher = cb_hasher();
+        // Capacity hints for the lazily-built narrowed-key buffer, derived the
+        // SAME way as `sort_template_coordinate_impl` so the two move together
+        // when `EST_BAM_BYTES_PER_TEMPLATE_RECORD` changes. That sibling is
+        // pinned by `estimator_bytes_per_record_matches_ref_size`; a hardcoded
+        // number here would drift silently past it.
+        //
+        // The variant — and so the exact key width — is not known until the first
+        // record, so this uses the WIDEST ref (`TemplateKey40`, 56 B). Over-
+        // estimating bytes-per-record under-estimates the record count, which
+        // only under-sizes a capacity hint: the safe direction.
+        let ref_bytes = std::mem::size_of::<TemplateRecordRef<TemplateKey40>>();
+        let data_bytes_per_record = TEMPLATE_HEADER_SIZE + EST_BAM_BYTES_PER_TEMPLATE_RECORD;
+        let bytes_per_record = data_bytes_per_record + ref_bytes;
+        let init_cap = self.effective_initial_capacity();
+        let estimated_records = (init_cap / bytes_per_record).max(1);
+        let estimated_data_bytes = init_cap * data_bytes_per_record / bytes_per_record;
+        Ok(crate::chunk_sorter::TemplateChunkSorter::new(
+            rayon_pool,
+            self.memory_limit,
+            estimated_records,
+            estimated_data_bytes,
+            lib_lookup,
+            cb_hasher,
+            self.cell_tag,
+            self.key_types,
+            header_library_varies,
+        ))
+    }
+
     /// Create a new raw external sorter with the given sort order.
     #[must_use]
     pub fn new(sort_order: SortOrder) -> Self {
@@ -2769,17 +2478,9 @@ impl RawExternalSorter {
             max_temp_files: crate::fd_limit::FALLBACK_MAX_TEMP_FILES,
             cell_tag: None,
             initial_capacity: None,
-            read_streams: ReadStreams::default(),
+            async_reader: false,
             key_types: KeyTypesSpec::default(),
-            sort_stats: false,
         }
-    }
-
-    /// Enable or disable the `--sort-stats` performance diagnostics for this run.
-    #[must_use]
-    pub fn sort_stats(mut self, enabled: bool) -> Self {
-        self.sort_stats = enabled;
-        self
     }
 
     /// Set the memory limit for in-memory sorting.
@@ -2841,6 +2542,10 @@ impl RawExternalSorter {
     }
 
     /// Effective Phase-1 worker count: `sort_threads` if set, else `threads`.
+    ///
+    /// Public so the streaming arena front (`SortBuffer::from_sorter`) sizes its
+    /// per-chunk sort with the resolved `--sort-threads` override rather than the
+    /// raw base `--threads` (`num_threads`), which silently ignores the override.
     #[must_use]
     pub fn phase1_threads(&self) -> usize {
         self.sort_threads.unwrap_or(self.threads).max(1)
@@ -2934,6 +2639,26 @@ impl RawExternalSorter {
         self
     }
 
+    /// Set the read-stream policy (R10-sync compatibility shim — see [`ReadStreams`]).
+    ///
+    /// Accepted and discarded: the arena reader does not yet honor `--read-streams`.
+    /// Forward-porting `main`'s measured multi-stream reader (#838/#846) onto the arena
+    /// engine is tracked as R7b.
+    #[must_use]
+    pub fn read_streams(self, _streams: ReadStreams) -> Self {
+        self
+    }
+
+    /// Enable `--sort-stats` phase-timing diagnostics (R10-sync compatibility shim).
+    ///
+    /// Accepted and discarded: `main`'s #855 rewired `commands/sort.rs` to a `.sort_stats(bool)`
+    /// builder (replacing the removed `set_sort_stats` global). The arena engine emits its own
+    /// diagnostics; wiring this flag to gate them is tracked as R7b.
+    #[must_use]
+    pub fn sort_stats(self, _enabled: bool) -> Self {
+        self
+    }
+
     /// Set maximum temp files before consolidation.
     ///
     /// When the number of temp files exceeds this limit, the oldest files
@@ -2981,10 +2706,13 @@ impl RawExternalSorter {
         self
     }
 
-    /// How to read the input and the merge's spill files.
+    /// Enable/disable the async prefetch reader on input.
+    ///
+    /// When enabled, the input BAM is wrapped in a `PrefetchReader` before the
+    /// BGZF layer, which overlaps block I/O with decompression.
     #[must_use]
-    pub fn read_streams(mut self, streams: ReadStreams) -> Self {
-        self.read_streams = streams;
+    pub fn async_reader(mut self, enabled: bool) -> Self {
+        self.async_reader = enabled;
         self
     }
 
@@ -3071,16 +2799,7 @@ impl RawExternalSorter {
         pool: &std::sync::Arc<crate::worker_pool::SortWorkerPool>,
     ) -> Result<()> {
         if let Some(prev) = pending.take() {
-            // Timed because it lands in no phase bucket: this sits between
-            // `end_read_span` and `time_sort`, so without its own counter the
-            // ingest thread's wall clock and its own CPU cannot be reconciled and
-            // the difference shows up only as an unexplained residual against
-            // total wall clock.
-            let waited_at = Instant::now();
             prev.handle.wait()?;
-            pool.phase1_ingest_stats().record_spill_wait(
-                u64::try_from(waited_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            );
             timer.record_spill_growth(&prev.chunk_path, prev.size_before);
             // A chunk that extended an existing run is already represented in
             // `chunk_files`; only a chunk that started a run adds a merge source.
@@ -3214,7 +2933,7 @@ impl RawExternalSorter {
         );
         let (record_source, header) = {
             let (reader, header) =
-                create_raw_bam_reader_pool_integrated(input, &pool, self.read_streams)?;
+                create_raw_bam_reader_pool_integrated(input, &pool, self.async_reader)?;
             (RecordSource::direct(reader), header)
         };
 
@@ -3292,14 +3011,12 @@ impl RawExternalSorter {
 
         // One worker pool spans both phases, so size it to the wider of the two
         // and cap the active count per phase via `set_active_workers`.
-        let mut pool = SortWorkerPool::new(
+        let pool = SortWorkerPool::new(
             self.phase1_threads().max(self.phase2_threads()),
             self.temp_compression,
             self.output_compression,
             self.spill_codec,
-            self.sort_stats,
         );
-        pool.read_streams = self.read_streams;
         // Phase 1 runs first; the merge raises this to `phase2_threads()`.
         pool.set_active_workers(self.phase1_threads());
         Ok(Arc::new(pool))
@@ -3547,7 +3264,6 @@ impl RawExternalSorter {
         )?;
 
         let mut records_merged = 0u64;
-        let mut merge_progress_batch = crate::progress_batch::BatchedProgress::new();
         let merge_progress = ProgressTracker::new("Merged records").with_interval(1_000_000);
         // Set when an input is found not to be monotonic in the merge order:
         // (source index into `inputs`, 1-based record number within that input).
@@ -3562,7 +3278,7 @@ impl RawExternalSorter {
 
             writer.write_raw_record(&records[winner])?;
             records_merged += 1;
-            merge_progress_batch.tick(&merge_progress);
+            merge_progress.log_if_needed(1);
 
             let reader_idx = source_map[winner];
             if let Some(raw_record) = readers[reader_idx].next() {
@@ -3608,9 +3324,6 @@ impl RawExternalSorter {
 
         writer.finish()?;
         out_target.persist()?;
-        // Must precede log_final: the tracker has not seen the last partial batch,
-        // and without this the reported total comes up short by up to one batch.
-        merge_progress_batch.flush(&merge_progress);
         merge_progress.log_final();
 
         Ok(records_merged)
@@ -3648,7 +3361,7 @@ impl RawExternalSorter {
         use crate::keys::RawCoordinateKey;
 
         let mut stats = RawSortStats::default();
-        let mut timer = SortPhaseTimer::new(self.sort_stats);
+        let mut timer = SortPhaseTimer::new();
 
         // Get number of references (unmapped reads map to nref)
         let nref = header.reference_sequences().len() as u32;
@@ -3671,13 +3384,6 @@ impl RawExternalSorter {
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
-        // Count records locally and forward in batches: `log_if_needed` does a
-        // relaxed `fetch_add` per call, which on aarch64 is an outline-atomics
-        // call into `__aarch64_ldadd8_relax`. On the ingest thread -- the serial
-        // thread that sets 60% of a spill-heavy sort's wall clock -- that helper
-        // measured 3.4% of the profile. The merge loops already batch for the
-        // same reason.
-        let mut progress_batch = crate::progress_batch::BatchedProgress::new();
         debug!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
         let mut probe = SpillProbe::new("phase1");
 
@@ -3687,7 +3393,7 @@ impl RawExternalSorter {
         // call, which is fine — `push_coordinate` copies the bytes into the buffer).
         while let Some(record) = record_source.next_record_borrowed()? {
             stats.total_records += 1;
-            progress_batch.tick(&progress);
+            progress.log_if_needed(1);
 
             // Push directly to buffer - key extracted inline from raw bytes
             buffer.push_coordinate(record)?;
@@ -3740,9 +3446,7 @@ impl RawExternalSorter {
                     },
                 )?);
 
-                // Keep the arena's pages mapped for the next chunk; `clear` would
-                // hand them back and cost a minor fault per page on the refill.
-                buffer.reset_for_reuse();
+                buffer.clear();
                 force_mi_collect();
                 probe.post_spill(Some(pool.phase1_queue_depths()));
                 timer.begin_read_span();
@@ -3750,7 +3454,6 @@ impl RawExternalSorter {
         }
 
         timer.end_read_span();
-        progress_batch.flush(&progress);
         progress.log_final();
         if let Some(err) = record_source.take_error() {
             return Err(anyhow::Error::from(err));
@@ -3768,16 +3471,6 @@ impl RawExternalSorter {
         probe.phase1_end(buffer.memory_usage() as u64);
 
         // Ingest is done: everything from here is Phase 2 (merge/write).
-        // Snapshot Phase 1's floor inputs before the pool is handed to the merge:
-        // the counters describe the phase that has just ended, and reading them
-        // later would both borrow a moved value and risk folding in Phase 2 work.
-        let phase1_floor = Phase1FloorInputs {
-            input_busy_secs: pool.phase1_input_busy_secs(),
-            threads: self.phase1_threads(),
-            ingest: pool.phase1_ingest_stats().snapshot(),
-            reader: pool.phase1_reader_report(),
-            ..Phase1FloorInputs::default()
-        };
         self.enter_output_phase(&pool);
 
         if chunk_files.is_empty() {
@@ -3820,7 +3513,7 @@ impl RawExternalSorter {
 
             let memory_chunks = MemorySources::Shared(memory_chunks);
             let n_memory = memory_chunks.num_non_empty();
-            log_run_formation(timer.spill_count(), stats.runs_written, self.sort_stats);
+            log_run_formation(timer.spill_count(), stats.runs_written);
             debug!(
                 "Phase 2: Merging {} chunks (keyed O(1) comparisons)...",
                 chunk_files.len() + n_memory
@@ -3842,12 +3535,7 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(
-            self.phase1_threads(),
-            self.phase2_threads(),
-            self.max_temp_files,
-            &phase1_floor,
-        );
+        timer.log_summary(self.phase1_threads(), self.phase2_threads(), self.max_temp_files);
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -3875,7 +3563,7 @@ impl RawExternalSorter {
         debug!("Indexing enabled: will write BAM index alongside output");
 
         let mut stats = RawSortStats::default();
-        let mut timer = SortPhaseTimer::new(self.sort_stats);
+        let mut timer = SortPhaseTimer::new();
 
         let nref = header.reference_sequences().len() as u32;
         let init_cap = self.effective_initial_capacity();
@@ -3895,17 +3583,9 @@ impl RawExternalSorter {
         debug!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
         let mut probe = SpillProbe::new("phase1");
 
-        // Borrow each record's bytes straight out of the decompressed block, as the
-        // non-indexed sibling does. `RecordSource`'s `Iterator` impl yields an owned
-        // `RawRecord`, which is a heap allocation plus a full-record memcpy per
-        // record -- freed again as soon as `push_coordinate` has copied the bytes
-        // into the arena -- on the serial thread that sets 60% of a spill-heavy
-        // sort's wall clock. Nothing here needs the record to outlive the push: the
-        // BAI is built by the writer from BGZF offsets during the merge, not from
-        // this loop.
-        while let Some(record) = record_source.next_record_borrowed()? {
+        for record in record_source.by_ref() {
             stats.total_records += 1;
-            buffer.push_coordinate(record)?;
+            buffer.push_coordinate(record.as_ref())?;
 
             if probe.should_sample_read(stats.total_records) {
                 probe.log_mid_read(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
@@ -3953,9 +3633,7 @@ impl RawExternalSorter {
                     },
                 )?);
 
-                // Keep the arena's pages mapped for the next chunk; `clear` would
-                // hand them back and cost a minor fault per page on the refill.
-                buffer.reset_for_reuse();
+                buffer.clear();
                 force_mi_collect();
                 probe.post_spill(Some(pool.phase1_queue_depths()));
                 timer.begin_read_span();
@@ -3982,16 +3660,6 @@ impl RawExternalSorter {
         let output_header = self.create_output_header(header);
 
         // Ingest is done: everything from here is Phase 2 (merge/write).
-        // Snapshot Phase 1's floor inputs before the pool is handed to the merge:
-        // the counters describe the phase that has just ended, and reading them
-        // later would both borrow a moved value and risk folding in Phase 2 work.
-        let phase1_floor = Phase1FloorInputs {
-            input_busy_secs: pool.phase1_input_busy_secs(),
-            threads: self.phase1_threads(),
-            ingest: pool.phase1_ingest_stats().snapshot(),
-            reader: pool.phase1_reader_report(),
-            ..Phase1FloorInputs::default()
-        };
         self.enter_output_phase(&pool);
 
         if chunk_files.is_empty() {
@@ -4040,7 +3708,7 @@ impl RawExternalSorter {
 
             let memory_chunks = MemorySources::Shared(memory_chunks);
             let n_memory = memory_chunks.num_non_empty();
-            log_run_formation(timer.spill_count(), stats.runs_written, self.sort_stats);
+            log_run_formation(timer.spill_count(), stats.runs_written);
             debug!(
                 "Phase 2: Merging {} chunks with index generation...",
                 chunk_files.len() + n_memory
@@ -4066,12 +3734,7 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(
-            self.phase1_threads(),
-            self.phase2_threads(),
-            self.max_temp_files,
-            &phase1_floor,
-        );
+        timer.log_summary(self.phase1_threads(), self.phase2_threads(), self.max_temp_files);
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -4124,7 +3787,7 @@ impl RawExternalSorter {
         use crate::keys::SortContext;
 
         let mut stats = RawSortStats::default();
-        let mut timer = SortPhaseTimer::new(self.sort_stats);
+        let mut timer = SortPhaseTimer::new();
 
         let ctx = SortContext::from_header(header);
 
@@ -4143,19 +3806,12 @@ impl RawExternalSorter {
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
-        // Count records locally and forward in batches: `log_if_needed` does a
-        // relaxed `fetch_add` per call, which on aarch64 is an outline-atomics
-        // call into `__aarch64_ldadd8_relax`. On the ingest thread -- the serial
-        // thread that sets 60% of a spill-heavy sort's wall clock -- that helper
-        // measured 3.4% of the profile. The merge loops already batch for the
-        // same reason.
-        let mut progress_batch = crate::progress_batch::BatchedProgress::new();
         debug!("Phase 1: Reading and sorting chunks (keyed output)...");
         let mut probe = SpillProbe::new("phase1");
 
         for record in record_source.by_ref() {
             stats.total_records += 1;
-            progress_batch.tick(&progress);
+            progress.log_if_needed(1);
 
             // Extract key from raw bytes. Stamp the ingest position within this
             // chunk so the key is totally ordered: read name + flags alone is not
@@ -4232,7 +3888,6 @@ impl RawExternalSorter {
         }
 
         timer.end_read_span();
-        progress_batch.flush(&progress);
         progress.log_final();
         if let Some(err) = record_source.take_error() {
             return Err(anyhow::Error::from(err));
@@ -4250,16 +3905,6 @@ impl RawExternalSorter {
         probe.phase1_end(memory_used as u64);
 
         // Ingest is done: everything from here is Phase 2 (merge/write).
-        // Snapshot Phase 1's floor inputs before the pool is handed to the merge:
-        // the counters describe the phase that has just ended, and reading them
-        // later would both borrow a moved value and risk folding in Phase 2 work.
-        let phase1_floor = Phase1FloorInputs {
-            input_busy_secs: pool.phase1_input_busy_secs(),
-            threads: self.phase1_threads(),
-            ingest: pool.phase1_ingest_stats().snapshot(),
-            reader: pool.phase1_reader_report(),
-            ..Phase1FloorInputs::default()
-        };
         self.enter_output_phase(&pool);
 
         if chunk_files.is_empty() {
@@ -4342,7 +3987,7 @@ impl RawExternalSorter {
             let memory_chunks = MemorySources::Owned(keyed_chunks);
 
             let n_memory = memory_chunks.num_non_empty();
-            log_run_formation(timer.spill_count(), stats.runs_written, self.sort_stats);
+            log_run_formation(timer.spill_count(), stats.runs_written);
             debug!(
                 "Phase 2: Merging {} chunks (keyed comparisons)...",
                 chunk_files.len() + n_memory
@@ -4364,12 +4009,7 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(
-            self.phase1_threads(),
-            self.phase2_threads(),
-            self.max_temp_files,
-            &phase1_floor,
-        );
+        timer.log_summary(self.phase1_threads(), self.phase2_threads(), self.max_temp_files);
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -4494,7 +4134,7 @@ impl RawExternalSorter {
         cb_hasher: &ahash::RandomState,
     ) -> Result<RawSortStats> {
         let mut stats = RawSortStats::default();
-        let mut timer = SortPhaseTimer::new(self.sort_stats);
+        let mut timer = SortPhaseTimer::new();
 
         // The full key the decode-time verify compares dropped lanes against.
         // On empty input, `first_record` is `None` so the pre-loop push is
@@ -4528,120 +4168,55 @@ impl RawExternalSorter {
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
-        // Count records locally and forward in batches: `log_if_needed` does a
-        // relaxed `fetch_add` per call, which on aarch64 is an outline-atomics
-        // call into `__aarch64_ldadd8_relax`. On the ingest thread -- the serial
-        // thread that sets 60% of a spill-heavy sort's wall clock -- that helper
-        // measured 3.4% of the profile. The merge loops already batch for the
-        // same reason.
-        let mut progress_batch = crate::progress_batch::BatchedProgress::new();
         debug!("Phase 1: Reading and sorting chunks (inline buffer)...");
         let mut probe = SpillProbe::new("phase1");
 
-        // Key extraction runs on the pool, not here: at 120 ns/record it was the
-        // single largest cost on this thread (93.6s of a 137.5s ingest against a
-        // 145.4s read span), and it has no ordering requirement. The ingest
-        // thread now pushes bytes and hands out batches; `deferred` cuts them,
-        // the pool runs them, and the keys are spliced back before any sort.
-        let mut deferred = crate::phase1_keys::DeferredKeys::<K>::new(
-            Arc::new(crate::phase1_keys::KeyContext {
-                lib_lookup: lib_lookup.clone(),
-                cell_tag: self.cell_tag,
-                cb_hasher: cb_hasher.clone(),
-                first_key: first,
-                variant,
-            }),
-            self.phase1_threads(),
-        );
-
-        // Process the captured first record before draining the rest. Its key is
-        // deferred like every other record's, including the dropped-lane verify
-        // (trivially satisfied for the first record, since it *is* the baseline).
-        // A single record cannot exceed the memory limit, so no spill check is
-        // needed here.
+        // Process the captured first record before draining the rest: extract its
+        // full key, verify the dropped lanes match `first` (trivially true for the
+        // first record itself), and push the narrowed key. A single record cannot
+        // exceed the memory limit, so no spill check is needed here.
         if let Some(record) = first_record {
             stats.total_records += 1;
-            progress_batch.tick(&progress);
-            deferred.push(&mut buffer, &pool, record.as_ref())?;
-        }
+            progress.log_if_needed(1);
 
-        // Sub-phase timing for the ingest thread's serial CPU, which the floor
-        // line identifies as this phase's binding limit. Sampled 1-in-N and
-        // clock-corrected, per `crate::phase1_stats::IngestSample`; the segments
-        // are checked against the measured read span with a signed residual, so a
-        // partition that over-attributes says so instead of looking tidy.
-        let ingest_sample_interval = crate::phase1_stats::INGEST_SAMPLE_INTERVAL;
-        let clock_overhead_nanos = crate::merge_headroom::measure_clock_overhead_nanos();
-        let mut ingest_raw = crate::phase1_stats::IngestSample::default();
-        let mut ingest_samples: u64 = 0;
-        let mut sample_countdown: u64 = 0;
+            let bam_bytes = record.as_ref();
+            let full = extract_template_key_inline(bam_bytes, lib_lookup, self.cell_tag, cb_hasher);
+            if let Some(violation) = verify_dropped_lanes(&first, &full, variant) {
+                let name = String::from_utf8_lossy(
+                    fgumi_raw_bam::RawRecordView::new(bam_bytes).read_name(),
+                )
+                .into_owned();
+                return Err(dropped_lane_error(&name, violation));
+            }
+            buffer.push(bam_bytes, K::from_full(&full))?;
+        }
 
         // Borrow each record's bytes in place (see the coordinate ingest loop);
         // the key is extracted and the bytes copied into the buffer before the
         // borrow ends, so no owned `RawRecord` is needed here.
-        loop {
-            // Decide sampling before the fetch, so every segment below is timed
-            // on the same records or on none. Timing a subset would bias the
-            // partition toward whichever step happened to be measured, and the
-            // partition's whole value is that its segments sum to the span.
-            let sample_this = sample_countdown == 0;
-            if sample_this {
-                sample_countdown = ingest_sample_interval - 1;
-                ingest_samples += 1;
-            } else {
-                sample_countdown -= 1;
-            }
-
-            let t = sample_this.then(Instant::now);
-            let Some(bam_bytes) = record_source.next_record_borrowed()? else { break };
-            if let Some(t0) = t {
-                ingest_raw.fetch += t0.elapsed().as_secs_f64();
-            }
-
+        while let Some(bam_bytes) = record_source.next_record_borrowed()? {
             stats.total_records += 1;
-            let t = sample_this.then(Instant::now);
-            progress_batch.tick(&progress);
-            if let Some(t0) = t {
-                ingest_raw.tick += t0.elapsed().as_secs_f64();
-            }
+            progress.log_if_needed(1);
 
-            // Push the bytes and get a key onto them. With workers to spare the
-            // key is extracted on the pool and spliced in before anything sorts
-            // this buffer; with a single worker it is extracted right here, as
-            // it always was. `push` therefore covers extraction on the
-            // single-worker path and not on the deferred one -- read it against
-            // the deferred-extraction census below, not on its own.
-            let t = sample_this.then(Instant::now);
-            deferred.push(&mut buffer, &pool, bam_bytes)?;
-            if let Some(t0) = t {
-                ingest_raw.push += t0.elapsed().as_secs_f64();
+            // Extract the full template key, verify the lanes the chosen variant
+            // dropped are constant relative to the first record, then push the
+            // narrowed key.
+            let full = extract_template_key_inline(bam_bytes, lib_lookup, self.cell_tag, cb_hasher);
+            if let Some(violation) = verify_dropped_lanes(&first, &full, variant) {
+                let name = String::from_utf8_lossy(
+                    fgumi_raw_bam::RawRecordView::new(bam_bytes).read_name(),
+                )
+                .into_owned();
+                return Err(dropped_lane_error(&name, violation));
             }
+            buffer.push(bam_bytes, K::from_full(&full))?;
 
-            let t = sample_this.then(Instant::now);
-            let should_probe = probe.should_sample_read(stats.total_records);
-            // Records whose keys are still in flight are charged here, so a
-            // lagging pool cannot let the buffer overrun the memory limit.
-            let over_limit =
-                buffer.memory_usage() + deferred.in_flight_bytes() >= self.memory_limit;
-            if let Some(t0) = t {
-                ingest_raw.probe += t0.elapsed().as_secs_f64();
-            }
-            if should_probe {
+            if probe.should_sample_read(stats.total_records) {
                 probe.log_mid_read(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
             }
 
             // Check memory usage
-            if over_limit {
-                // Finish the chunk's keys *inside* the read span. This is ingest
-                // work for records already read, and accounting it to the spill
-                // region instead would let a pool that never keeps up still
-                // report a shorter read span -- the one way this change could
-                // look successful while doing nothing.
-                let violation = deferred.finish(&mut buffer, &pool)?;
-                if let Some(v) = violation {
-                    return Err(dropped_lane_error(&v.name, v.violation));
-                }
-
+            if buffer.memory_usage() >= self.memory_limit {
                 timer.end_read_span();
                 let bstats = probe_stats(&buffer);
                 let depths = Some(pool.phase1_queue_depths());
@@ -4679,39 +4254,14 @@ impl RawExternalSorter {
                     },
                 )?);
 
-                // Keep the arena's pages mapped for the next chunk; `clear` would
-                // hand them back and cost a minor fault per page on the refill.
-                buffer.reset_for_reuse();
-                deferred.reset();
+                buffer.clear();
                 force_mi_collect();
                 probe.post_spill(Some(pool.phase1_queue_depths()));
                 timer.begin_read_span();
             }
         }
 
-        // Drain the tail before closing the read span: the records still held in
-        // the live arena segment have no keys yet, and everything below this
-        // point either sorts or spills the buffer.
-        //
-        // Inside the span on purpose. This is ingest work for records already
-        // read, and the read span is the number this whole change is trying to
-        // move -- excluding the drain would let a pool that never kept up still
-        // report a shorter span, which is the one way this optimization could
-        // look successful while doing nothing.
-        let violation = deferred.finish(&mut buffer, &pool)?;
-
-        // Ingest is over, so the arena segments held for the next chunk have no
-        // next chunk. Holding them through the merge costs peak RSS and buys
-        // nothing.
-        buffer.release_retained();
-
         timer.end_read_span();
-
-        if let Some(v) = violation {
-            return Err(dropped_lane_error(&v.name, v.violation));
-        }
-
-        progress_batch.flush(&progress);
         progress.log_final();
         if let Some(err) = record_source.take_error() {
             return Err(anyhow::Error::from(err));
@@ -4729,20 +4279,6 @@ impl RawExternalSorter {
         probe.phase1_end(buffer.memory_usage() as u64);
 
         // Ingest is done: everything from here is Phase 2 (merge/write).
-        // Snapshot Phase 1's floor inputs before the pool is handed to the merge:
-        // the counters describe the phase that has just ended, and reading them
-        // later would both borrow a moved value and risk folding in Phase 2 work.
-        let phase1_floor = Phase1FloorInputs {
-            input_busy_secs: pool.phase1_input_busy_secs(),
-            threads: self.phase1_threads(),
-            ingest: pool.phase1_ingest_stats().snapshot(),
-            reader: pool.phase1_reader_report(),
-            key_overlap: deferred.overlap_census(),
-            sample: ingest_raw,
-            samples: ingest_samples,
-            records: stats.total_records,
-            clock_overhead_nanos,
-        };
         self.enter_output_phase(&pool);
 
         if chunk_files.is_empty() {
@@ -4784,7 +4320,7 @@ impl RawExternalSorter {
 
             let memory_chunks = MemorySources::Shared(memory_chunks);
             let n_memory = memory_chunks.num_non_empty();
-            log_run_formation(timer.spill_count(), stats.runs_written, self.sort_stats);
+            log_run_formation(timer.spill_count(), stats.runs_written);
             debug!("Phase 2: Merging {} chunks...", chunk_files.len() + n_memory);
 
             // Merge using O(1) key comparisons
@@ -4803,12 +4339,7 @@ impl RawExternalSorter {
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
         }
-        timer.log_summary(
-            self.phase1_threads(),
-            self.phase2_threads(),
-            self.max_temp_files,
-            &phase1_floor,
-        );
+        timer.log_summary(self.phase1_threads(), self.phase2_threads(), self.max_temp_files);
         debug!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -4819,7 +4350,7 @@ impl RawExternalSorter {
     /// Disk chunks become `PoolDisk` sources: the shared worker pool reads and
     /// decompresses them in the background while the main thread parses records,
     /// so no per-source threads are spawned. Both the plain
-    /// ([`merge_chunks_generic`]) and indexed ([`merge_chunks_with_index`])
+    /// ([`Self::merge_chunks_generic`]) and indexed ([`Self::merge_chunks_with_index`])
     /// merges go through this pool-integrated path.
     fn build_chunk_sources<K: RawSortKey + Default + 'static>(
         chunk_files: &[PathBuf],
@@ -4848,8 +4379,8 @@ impl RawExternalSorter {
 
     /// Build the pooled merge sources and activate Phase 2.
     ///
-    /// Shared by both the plain ([`merge_chunks_generic`]) and indexed
-    /// ([`merge_chunks_with_index`]) merges so the Phase-2 lifecycle is
+    /// Shared by both the plain ([`Self::merge_chunks_generic`]) and indexed
+    /// ([`Self::merge_chunks_with_index`]) merges so the Phase-2 lifecycle is
     /// single-sourced and the two paths cannot drift. Returns the sources plus
     /// an RAII [`Phase2Guard`] (borrowing `pool`); callers finish through
     /// [`Phase2Guard::finish_output`], and `Drop` resets Phase 2 on any path
@@ -4918,20 +4449,18 @@ impl RawExternalSorter {
     /// diagnosis -- someone raising `--threads` on an I/O-bound sort -- is worse
     /// than the cost of a vague right one. The numbers above the verdict are the
     /// evidence; this line only points at them.
-    fn log_merge_verdict(utilization: Option<f64>, fetch_fraction: f64, sort_stats: bool) {
+    fn log_merge_verdict(utilization: Option<f64>, fetch_fraction: f64) {
         use crate::merge_phases::{MergeVerdict, classify_merge};
 
         let Some(utilization) = utilization else { return };
         let (util_pct, fetch_pct) = (100.0 * utilization, 100.0 * fetch_fraction);
 
         match classify_merge(utilization, fetch_fraction) {
-            MergeVerdict::CpuBound => stat!(
-                sort_stats,
+            MergeVerdict::CpuBound => info!(
                 "  Verdict: worker pool saturated ({util_pct:.0}%); the merge is CPU-bound, so \
                  more threads may help"
             ),
-            MergeVerdict::IoBound => stat!(
-                sort_stats,
+            MergeVerdict::IoBound => info!(
                 "  Verdict: workers idle ({util_pct:.0}% of capacity) while the consumer spent \
                  {fetch_pct:.0}% of its loop waiting for data -- neither side is the constraint. \
                  More threads are unlikely to help. Storage is one candidate; the pipeline's own \
@@ -4939,8 +4468,7 @@ impl RawExternalSorter {
                  workers notice new work -- is another, and the Merge Stalls block below is what \
                  separates them."
             ),
-            MergeVerdict::Mixed => stat!(
-                sort_stats,
+            MergeVerdict::Mixed => info!(
                 "  Verdict: worker pool {util_pct:.0}% utilized, consumer {fetch_pct:.0}% \
                  waiting on data -- neither clearly saturated"
             ),
@@ -4976,19 +4504,11 @@ impl RawExternalSorter {
     /// exactly. The breakdown then partitions the loop by construction rather
     /// than overshooting it by 30-50%.
     fn log_consumer_cpu(
-        loop_total: f64,
-        scaled: crate::merge_headroom::ConsumerSample,
+        sampled: (f64, f64, f64, f64),
         records: (u64, f64),
         stalls: Option<&crate::merge_stalls::ConsumerStallReport>,
-        sort_stats: bool,
     ) {
-        let crate::merge_headroom::ConsumerSample {
-            publish: est_publish,
-            present: est_present,
-            write: est_write,
-            advance: est_read,
-            tree: est_tree,
-        } = scaled;
+        let (loop_total, est_read, est_tree, est_write) = sampled;
         let (records_merged, blocked_secs) = records;
         if records_merged == 0 {
             return;
@@ -5003,9 +4523,8 @@ impl RawExternalSorter {
         // waits would be counted on both sides and inflate their shares.
         let fetch_cpu = (est_read - park_secs).max(0.0);
         let write_cpu = (est_write - blocked_secs).max(0.0);
-        let ratio_total = est_publish + est_present + fetch_cpu + est_tree + write_cpu;
-        stat!(
-            sort_stats,
+        let ratio_total = fetch_cpu + est_tree + write_cpu;
+        info!(
             "  Consumer CPU: {consumer_cpu:.1}s exact (loop {loop_total:.1}s - park \
              {park_secs:.1}s - backpressure {blocked_secs:.1}s) = {:.0} ns/record",
             consumer_cpu * 1e9 / records
@@ -5015,55 +4534,26 @@ impl RawExternalSorter {
         }
         let share = |part: f64| consumer_cpu * part / ratio_total;
         let ns = |part: f64| share(part) * 1e9 / records;
-        stat!(
-            sort_stats,
-            "    fetch + decompress:  {:.1}s ({:.0} ns/rec)",
-            share(fetch_cpu),
-            ns(fetch_cpu)
-        );
-        stat!(
-            sort_stats,
-            "    present record:      {:.1}s ({:.0} ns/rec)",
-            share(est_present),
-            ns(est_present)
-        );
-        stat!(
-            sort_stats,
-            "    loser tree:          {:.1}s ({:.0} ns/rec)",
-            share(est_tree),
-            ns(est_tree)
-        );
-        stat!(
-            sort_stats,
-            "    enqueue write:       {:.1}s ({:.0} ns/rec)",
-            share(write_cpu),
-            ns(write_cpu)
-        );
-        stat!(
-            sort_stats,
-            "    next-source predict: {:.1}s ({:.0} ns/rec)",
-            share(est_publish),
-            ns(est_publish)
-        );
-        stat!(
-            sort_stats,
+        info!("    parse + key extract: {:.1}s ({:.0} ns/rec)", share(fetch_cpu), ns(fetch_cpu));
+        info!("    loser tree:          {:.1}s ({:.0} ns/rec)", share(est_tree), ns(est_tree));
+        info!("    enqueue write:       {:.1}s ({:.0} ns/rec)", share(write_cpu), ns(write_cpu));
+        info!(
             "    (totals exact; the split between them is sampled, so read the shares as \
              proportions rather than to the tenth of a second)"
         );
     }
 
-    #[allow(clippy::too_many_lines, reason = "a single cohesive merge-phase diagnostic block")]
     fn log_merge_sub_phases(
         walls: (f64, f64),
-        consumer: crate::merge_headroom::ConsumerSample,
+        consumer: (f64, f64, f64),
         sampling: (u64, u64),
         active_workers: usize,
         pool: &Arc<SortWorkerPool>,
         stalls: Option<crate::merge_stalls::ConsumerStallReport>,
         consumer_diag: MergeConsumerDiag,
     ) {
-        let sort_stats = pool.sort_stats();
         let (loop_total, merge_total) = walls;
+        let (write_secs, read_secs, tree_secs) = consumer;
         let (samples_taken, records_merged) = sampling;
         if records_merged == 0 {
             return;
@@ -5071,27 +4561,44 @@ impl RawExternalSorter {
         #[allow(clippy::cast_precision_loss, reason = "sample counts stay far below 2^52")]
         let scale =
             if samples_taken > 0 { records_merged as f64 / samples_taken as f64 } else { 1.0 };
-        let scaled = consumer.scaled(scale);
-        let est_read = scaled.advance;
-        let park_secs = stalls.as_ref().map_or(0.0, |x| x.park_secs);
+        let (est_write, est_read, est_tree) =
+            (write_secs * scale, read_secs * scale, tree_secs * scale);
 
-        stat!(sort_stats, "=== Merge Sub-Phase Timing ===");
-        let MergeConsumerDiag { backpressure_secs: blocked_secs, .. } = consumer_diag;
-        Self::log_consumer_rows(
-            scaled,
-            (samples_taken, records_merged),
-            scale,
-            loop_total,
-            park_secs,
-            consumer_diag,
+        info!("=== Merge Sub-Phase Timing ===");
+        info!(
+            "  Consumer (main thread; {samples_taken} samples of {records_merged} records, scaled {scale:.0}x)"
         );
+        info!("    Fetch next record: {est_read:.1}s  (includes waiting on decompressed blocks)");
+        let MergeConsumerDiag {
+            backpressure_secs: blocked_secs,
+            backpressure_waits: blocked_waits,
+            borrowed,
+            reassembled,
+        } = consumer_diag;
+        if blocked_waits > 0 {
+            #[allow(clippy::cast_precision_loss, reason = "wait counts stay far below 2^52")]
+            let mean_us = blocked_secs * 1e6 / blocked_waits as f64;
+            info!(
+                "    Output backpressure: {blocked_secs:.1}s over {blocked_waits} waits \
+                 (mean {mean_us:.0} us, exact) -- the consumer blocked for an output permit"
+            );
+        } else {
+            info!("    Output backpressure: none -- the compressors always had a permit ready");
+        }
+        if borrowed + reassembled > 0 {
+            #[allow(clippy::cast_precision_loss, reason = "record counts stay far below 2^52")]
+            let pct = 100.0 * reassembled as f64 / (borrowed + reassembled) as f64;
+            info!(
+                "    Record presentation: {borrowed} borrowed zero-copy, {reassembled} \
+                 reassembled across a block boundary ({pct:.2}%, exact)"
+            );
+        }
+        info!("    Loser tree:        {est_tree:.1}s");
 
         Self::log_consumer_cpu(
-            loop_total,
-            scaled,
+            (loop_total, est_read, est_tree, est_write),
             (records_merged, blocked_secs),
             stalls.as_ref(),
-            sort_stats,
         );
 
         // Parking is a subset of "fetch next record", so exact park time cannot
@@ -5103,8 +4610,7 @@ impl RawExternalSorter {
         if let Some(s) = stalls
             && s.park_secs > est_read * 1.05
         {
-            stat!(
-                sort_stats,
+            info!(
                 "    NOTE: exact park time is {:.1}s, above the sampled fetch estimate of \
                  {est_read:.1}s -- the sample under-caught stalls; prefer the Merge Stalls block",
                 s.park_secs
@@ -5120,15 +4626,10 @@ impl RawExternalSorter {
             let (comp_s, comp_n) = workers.output_compress;
             let (spill_s, spill_n) = workers.spill_compress;
             let workers_n = active_workers;
-            stat!(
-                sort_stats,
+            info!(
                 "  Workers ({workers_n} active threads; busy time, overlaps the above and itself)"
             );
-            stat!(
-                sort_stats,
-                "    Spill disk read:   {read_s:.1}s ({:.0}%) [{read_n} batches]",
-                pct(read_s)
-            );
+            info!("    Spill disk read:   {read_s:.1}s ({:.0}%) [{read_n} batches]", pct(read_s));
             // Blocks-per-batch, split by allowance. A deep share near zero means
             // the deep-read gate (drain frontier or awaited source) is not
             // firing, which reads identically to "the deeper read-ahead did not
@@ -5136,33 +4637,20 @@ impl RawExternalSorter {
             let (deep_b, deep_blk, shal_b, shal_blk) = pool.read_batch_split();
             #[allow(clippy::cast_precision_loss, reason = "block counts stay far below 2^52")]
             let per = |blk: u64, b: u64| if b == 0 { 0.0 } else { blk as f64 / b as f64 };
-            stat!(
-                sort_stats,
+            info!(
                 "      deep {deep_b} batches / {deep_blk} blocks ({:.1} per batch), \
                  other {shal_b} batches / {shal_blk} blocks ({:.1} per batch)",
                 per(deep_blk, deep_b),
                 per(shal_blk, shal_b)
             );
-            stat!(
-                sort_stats,
-                "    Spill decompress:  {dec_s:.1}s ({:.0}%) [{dec_n} blocks]",
-                pct(dec_s)
-            );
-            stat!(
-                sort_stats,
-                "    Output compress:   {comp_s:.1}s ({:.0}%) [{comp_n} blocks]",
-                pct(comp_s)
-            );
-            stat!(
-                sort_stats,
-                "    Total worker busy: {busy:.1}s  (NOT comparable to loop wall clock)"
-            );
+            info!("    Spill decompress:  {dec_s:.1}s ({:.0}%) [{dec_n} blocks]", pct(dec_s));
+            info!("    Output compress:   {comp_s:.1}s ({:.0}%) [{comp_n} blocks]", pct(comp_s));
+            info!("    Total worker busy: {busy:.1}s  (NOT comparable to loop wall clock)");
             // Utilization is the thread-efficiency question: well below 100%
             // means the pool idled, the merge was bound by something other than
             // worker CPU, and adding compression threads cannot help.
             if let Some(util) = workers.worker_utilization(merge_total, workers_n) {
-                stat!(
-                    sort_stats,
+                info!(
                     "    Worker utilization: {:.0}% of {workers_n} active threads x \
                      {merge_total:.1}s",
                     100.0 * util
@@ -5170,8 +4658,8 @@ impl RawExternalSorter {
             }
             // Phase 1 spill compression rides the same worker step, so it is
             // reported for context but excluded from the merge totals above.
-            stat!(sort_stats, "  Phase 1 (not part of the merge)");
-            stat!(sort_stats, "    Spill compress:    {spill_s:.1}s [{spill_n} blocks]");
+            info!("  Phase 1 (not part of the merge)");
+            info!("    Spill compress:    {spill_s:.1}s [{spill_n} blocks]");
 
             // Utilization over the full merge window; the fetch fraction stays
             // relative to the consumer loop, which is the only thing it is a
@@ -5179,126 +4667,10 @@ impl RawExternalSorter {
             Self::log_merge_verdict(
                 workers.worker_utilization(merge_total, workers_n),
                 if loop_total > 0.0 { est_read / loop_total } else { 0.0 },
-                sort_stats,
-            );
-            Self::log_merge_headroom(
-                loop_total,
-                busy,
-                workers_n,
-                park_secs,
-                blocked_secs,
-                sort_stats,
             );
         }
         Self::log_merge_stalls(loop_total, merge_total, active_workers, stalls, pool);
-        stat!(sort_stats, "==============================");
-    }
-
-    /// The consumer's sampled sub-phase rows, and their reconciliation against the
-    /// loop they partition.
-    ///
-    /// Extracted from [`Self::log_merge_sub_phases`] to keep that function inside
-    /// the line limit; it is one cohesive block of reporting rather than a
-    /// mechanical split.
-    fn log_consumer_rows(
-        scaled: crate::merge_headroom::ConsumerSample,
-        sampling: (u64, u64),
-        scale: f64,
-        loop_total: f64,
-        park_secs: f64,
-        consumer_diag: MergeConsumerDiag,
-    ) {
-        let (samples_taken, records_merged) = sampling;
-        let est_tree = scaled.tree;
-        let est_read = scaled.advance;
-        debug!(
-            "  Consumer (main thread; {samples_taken} samples of {records_merged} records, scaled {scale:.0}x)"
-        );
-        debug!("    Fetch next record: {est_read:.1}s  (includes waiting on decompressed blocks)");
-        let MergeConsumerDiag {
-            backpressure_secs: blocked_secs,
-            backpressure_waits: blocked_waits,
-            borrowed,
-            reassembled,
-        } = consumer_diag;
-        if blocked_waits > 0 {
-            #[allow(clippy::cast_precision_loss, reason = "wait counts stay far below 2^52")]
-            let mean_us = blocked_secs * 1e6 / blocked_waits as f64;
-            debug!(
-                "    Output backpressure: {blocked_secs:.1}s over {blocked_waits} waits \
-                 (mean {mean_us:.0} us, exact) -- the consumer blocked for an output permit"
-            );
-        } else {
-            debug!("    Output backpressure: none -- the compressors always had a permit ready");
-        }
-        if borrowed + reassembled > 0 {
-            #[allow(clippy::cast_precision_loss, reason = "record counts stay far below 2^52")]
-            let pct = 100.0 * reassembled as f64 / (borrowed + reassembled) as f64;
-            debug!(
-                "    Record presentation: {borrowed} borrowed zero-copy, {reassembled} \
-                 reassembled across a block boundary ({pct:.2}%, exact)"
-            );
-        }
-        debug!("    Loser tree:        {est_tree:.1}s");
-        // Reconcile the sampled segments against the loop they are meant to
-        // partition. Three of these rows were reported for a long time without
-        // ever being summed against the loop, so there was no way to tell whether
-        // they accounted for most of it or a third. A signed residual is the check:
-        // positive means real time is unaccounted for, negative means the sampled
-        // regions over-attribute (their own clock overhead, or a sample biased
-        // toward expensive records).
-        let partition = crate::merge_headroom::LoopPartition {
-            segments: scaled,
-            loop_secs: loop_total,
-            park_secs,
-        };
-        debug!(
-            "    Sampled segments sum to {:.1}s of a {loop_total:.1}s loop \
-             ({:+.0}% unattributed); {:.1}s of the fetch bucket was the consumer \
-             working rather than waiting",
-            scaled.total(),
-            100.0 * partition.unattributed_share(),
-            partition.advance_work_secs()
-        );
-    }
-
-    /// Name the wall this merge is against, and what is recoverable without
-    /// doing less work.
-    ///
-    /// Three limits, three different fixes, and they are routinely confused: the
-    /// serial consumer's own CPU, worker capacity, and coordination. Measured on
-    /// one cell, the same build at 8 and 16 threads gave opposite advice -- 1.8%
-    /// recoverable against 28% -- and nothing in the wall clock distinguished them.
-    /// Printing the floor turns "is my sort slow?" into "which limit am I on?",
-    /// which is the only version of the question that has an action attached.
-    fn log_merge_headroom(
-        loop_total: f64,
-        worker_busy_secs: f64,
-        threads: usize,
-        park_secs: f64,
-        blocked_secs: f64,
-        sort_stats: bool,
-    ) {
-        let floors = crate::merge_headroom::MergeFloors {
-            loop_secs: loop_total,
-            consumer_secs: (loop_total - park_secs - blocked_secs).max(0.0),
-            worker_busy_secs,
-            threads,
-        };
-        stat!(sort_stats, "  Merge floor: {} is the limit", floors.binding().label());
-        stat!(
-            sort_stats,
-            "    consumer serial {:.1}s | worker capacity {:.1}s ({threads} threads) | \
-             loop {loop_total:.1}s",
-            floors.consumer_secs,
-            floors.worker_floor_secs()
-        );
-        stat!(
-            sort_stats,
-            "    recoverable without doing less work: {:.1}s ({:.0}% of the merge)",
-            floors.recoverable_secs(),
-            100.0 * floors.recoverable_share()
-        );
+        info!("==============================");
     }
 
     /// Log why the merge stalled, as opposed to where its time went.
@@ -5324,7 +4696,6 @@ impl RawExternalSorter {
         pool: &Arc<SortWorkerPool>,
     ) {
         use crate::merge_stalls::{Phase2Skip, ScanVerdict};
-        let sort_stats = pool.sort_stats();
 
         // Utilization gates the stall shape: "no worker on it" means a
         // scheduling defect on an idle pool and plain saturation on a busy one.
@@ -5340,10 +4711,10 @@ impl RawExternalSorter {
         let wake = pool.wake_latency_report();
         let stalls = stalls.filter(|s| !s.is_empty());
         if !merge_stalls_are_silent(stalls.as_ref(), &scans, &wake) {
-            debug!("=== Merge Stalls ===");
+            info!("=== Merge Stalls ===");
 
             if let Some(s) = stalls {
-                Self::log_consumer_stalls(loop_total, utilization, s, sort_stats);
+                Self::log_consumer_stalls(loop_total, utilization, s);
             }
 
             if !scans.is_empty() {
@@ -5352,8 +4723,8 @@ impl RawExternalSorter {
                     .map(|&r| format!("{}={}", r.label(), scans.skips[r as usize]))
                     .collect::<Vec<_>>()
                     .join(" ");
-                debug!("  Worker scans finding no work: {} ({reasons})", scans.scans);
-                debug!(
+                info!("  Worker scans finding no work: {} ({reasons})", scans.scans);
+                info!(
                     "    Of those: {:.0}% backpressured, {:.0}% waiting on a peer's read, {:.0}% \
                      contended",
                     100.0 * scans.verdict_share(ScanVerdict::Backpressured),
@@ -5363,7 +4734,7 @@ impl RawExternalSorter {
             }
 
             if !wake.is_empty() {
-                debug!(
+                info!(
                     "  Worker discovery lag: ~{:.1}s of {:.1}s deep-sleep worker-seconds; {} \
                      sleeps ended in a find, {:.0}% of them after >=320us",
                     wake.estimated_discovery_lag_secs(),
@@ -5371,70 +4742,17 @@ impl RawExternalSorter {
                     wake.productive_sleep_count(),
                     100.0 * wake.deep_sleep_wake_share()
                 );
-                debug!(
+                info!(
                     "    (the consumer unparks one worker when a reorder buffer drains, so this \
                      bounds how late work arriving any other way is noticed; it delays the merge \
                      only when every worker is asleep at once)"
                 );
-                // Why the discovery lag above is as large as it is. A wake aimed at a
-                // worker that is already running does nothing, and the consumer then
-                // waits for some other worker's backoff to expire -- bounded by
-                // MAX_BACKOFF_US, not by unpark cost. `recoverable` is the subset where a
-                // parked worker existed and the rotating target passed it over; the rest
-                // is a genuinely saturated pool and is nobody's fault.
-                let wakes = pool.wake_accounting();
-                if wakes.issued > 0 {
-                    debug!(
-                        "  Wake targeting: {} of {} wakes hit an already-running worker ({:.0}%), {} of \
-                 those had a parked worker available ({:.0}% recoverable)",
-                        wakes.on_running,
-                        wakes.issued,
-                        Self::percent(wakes.on_running, wakes.issued),
-                        wakes.recoverable,
-                        Self::percent(wakes.recoverable, wakes.issued)
-                    );
-                }
-                debug!(
-                    "    Wakes issued: {} (backoff 10us doubling to {}us ceiling; one worker woken \
-                     per wake)",
-                    pool.wakes_issued(),
-                    crate::worker_pool::MAX_BACKOFF_US
-                );
             }
-
-            // What the pool looked like when the consumer parked, which is the
-            // question "why did nobody start on this block yet" reduced to three
-            // mutually exclusive answers with three different fixes. Splitting park
-            // *time* as well as park counts matters: a rare-but-long class is
-            // invisible in counts alone. Outside the wake gate above so it stands
-            // on its own park count: a heavy-parking consumer whose wake report is
-            // empty would otherwise collect this census and never print it.
-            let supply = pool.park_supply_report();
-            if supply.total_parks() > 0 {
-                const LABELS: [&str; crate::merge_stalls::ParkSupply::COUNT] =
-                    ["a worker was asleep", "all busy, compress queued", "all busy merging"];
-                stat!(
-                    sort_stats,
-                    "  Why nobody had started on the awaited block, at the moment of the park:"
-                );
-                for (i, label) in LABELS.iter().enumerate() {
-                    stat!(
-                        sort_stats,
-                        "    {label:<26} {:>10} parks ({:>4.1}%)  {:>7.1}s ({:>4.1}% of park time)",
-                        supply.counts[i],
-                        Self::percent(supply.counts[i], supply.total_parks()),
-                        Self::secs(supply.nanos[i]),
-                        Self::percent(supply.nanos[i], supply.total_nanos())
-                    );
-                }
-            }
-
-            Self::log_park_attribution(pool, loop_total);
 
             // Close this block before delegating: `log_block_lifecycle` opens and
             // closes its own, so without a terminator here the lifecycle block
             // reads as nested inside the stall block rather than following it.
-            debug!("====================");
+            info!("====================");
         }
 
         // Outside the gate above, not inside it. The lifecycle reports record the
@@ -5442,253 +4760,6 @@ impl RawExternalSorter {
         // never stalled is precisely the run with a complete lifecycle trace and
         // nothing to say above. `log_block_lifecycle` carries its own gate.
         Self::log_block_lifecycle(pool);
-
-        // Also outside the gate: these two counters say whether the targeted-depth
-        // paths ran at all, which matters most on the runs that did not stall.
-        Self::log_merge_validity_gates(pool);
-    }
-
-    /// Nanoseconds as seconds.
-    #[expect(clippy::cast_precision_loss, reason = "nanosecond totals stay below 2^52")]
-    fn secs(nanos: u64) -> f64 {
-        nanos as f64 / 1e9
-    }
-
-    /// `part` as a percentage of `whole`, or 0.0 when `whole` is zero.
-    #[expect(clippy::cast_precision_loss, reason = "counts stay far below 2^52")]
-    fn percent(part: u64, whole: u64) -> f64 {
-        if whole == 0 {
-            return 0.0;
-        }
-        100.0 * part as f64 / whole as f64
-    }
-
-    /// Validity gates for the two targeted-depth paths in the merge.
-    ///
-    /// Both changes are inert in a way that a wall-clock number cannot reveal: the
-    /// consumer may never find an unclaimed block to decompress, and the loser tree
-    /// may never name a next source. Either would land as "no measurable change"
-    /// rather than as "the mechanism did not run", so each gets a counter and each
-    /// counter is printed.
-    fn log_merge_validity_gates(pool: &SortWorkerPool) {
-        let sort_stats = pool.sort_stats();
-        let self_served = pool.consumer_self_served();
-        if self_served > 0 {
-            stat!(
-                sort_stats,
-                "  Consumer served itself: {self_served} parks avoided by decompressing an \
-                 already-read block inline"
-            );
-        }
-        let predictions = pool.phase2_predictions();
-        if predictions > 0 {
-            stat!(sort_stats, "  Next-source predictions published: {predictions}");
-        }
-    }
-
-    /// `total` divided over `claims`, or 0.0 when there are none.
-    #[expect(clippy::cast_precision_loss, reason = "counts stay far below 2^52")]
-    fn per_claim(total: u64, claims: u64) -> f64 {
-        if claims == 0 {
-            return 0.0;
-        }
-        total as f64 / claims as f64
-    }
-
-    /// Log a latency distribution for every stage a block passes through.
-    ///
-    /// [`crate::merge_phases::MergePhaseBreakdown`] already gives each stage a
-    /// busy total and a block count, which yields a mean. A mean cannot settle
-    /// an argument: output compression averages ~187 us over five million blocks
-    /// and a uniform 187 us behaves nothing like a bimodal mix with a long tail,
-    /// yet only the tail explains a worker being unavailable when the consumer
-    /// needs one. So report count, total, mean and three percentiles for each,
-    /// including the writer -- previously visible only as the consumer's
-    /// backpressure wait, which jumped 0.0s to 29.9s across one sweep with no
-    /// way to attribute it.
-    ///
-    /// `wasted visits` is the other half: files a worker passed over before one
-    /// gave it work. The scan tally is published only when a scan finds nothing,
-    /// so the walk to a *successful* claim was never counted -- and on an 89-way
-    /// merge that walk is most of what an "idle" worker is doing.
-    ///
-    /// The distributions log at **debug** and the wasted-visit line at **info**,
-    /// the same split [`Self::log_block_lifecycle`] uses: a percentile table is
-    /// for an investigation, not for someone who just sorted a BAM. Collection
-    /// is unconditional either way.
-    fn log_stage_latency(
-        pool: &SortWorkerPool,
-        writer: &(
-            crate::merge_trace::HistogramReport,
-            crate::merge_trace::HistogramReport,
-            crate::merge_trace::HistogramReport,
-        ),
-    ) {
-        let sort_stats = pool.sort_stats();
-        let stage = pool.stage_latency();
-        let &(write_dur, reorder_wait, reorder_depth) = writer;
-        let rows: [(&str, crate::merge_trace::HistogramReport); 6] = [
-            ("read (batched)", stage.read.snapshot()),
-            ("decompress spill", stage.decompress.snapshot()),
-            ("compress output", stage.output_compress.snapshot()),
-            ("compress spill (ph1)", stage.spill_compress.snapshot()),
-            ("write block", write_dur),
-            ("write reorder wait", reorder_wait),
-        ];
-        if rows.iter().all(|(_, r)| r.is_empty()) {
-            return;
-        }
-        // Distributions go to debug and decision-changing numbers stay at info,
-        // matching `log_block_lifecycle` above: a six-row percentile table is
-        // what an investigation needs and far more than someone who just sorted
-        // a BAM should have to scroll past. Collection stays unconditional --
-        // gating collection is what made these questions unanswerable from logs
-        // already in hand.
-        debug!("=== Stage Latency ===");
-        debug!(
-            "  {:<22} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9}",
-            "stage", "count", "total", "mean", "p50", "p90", "p99"
-        );
-        for (label, r) in rows {
-            if r.is_empty() {
-                continue;
-            }
-            debug!(
-                "  {label:<22} {:>10} {:>8.1}s {:>8.0}us {:>8}us {:>8}us {:>8}us",
-                r.count,
-                r.total_secs(),
-                r.mean_micros(),
-                r.percentile_micros(0.50),
-                r.percentile_micros(0.90),
-                r.percentile_micros(0.99)
-            );
-        }
-        if !reorder_depth.is_empty() {
-            debug!(
-                "  Writer reorder depth: mean {:.1} blocks, p90 {}, p99 {} (blocks held waiting \
-                 for an earlier serial)",
-                reorder_depth.mean_micros(),
-                reorder_depth.percentile_micros(0.90),
-                reorder_depth.percentile_micros(0.99)
-            );
-        }
-        // Closes the debug block above, so the separator does not outlive its
-        // header when only info is enabled.
-        debug!("=====================");
-        // Stays at info: this one is a decision-changer, not a distribution. It
-        // is how much of an "idle" worker is scanning rather than waiting, and
-        // reading it wrong sends an investigation at the scan loop -- filling
-        // the walk with more work per claim was measured at +36% (see
-        // `PHASE2_DECOMP_CAP`).
-        let claims = stage.useful_claims.load(std::sync::atomic::Ordering::Relaxed);
-        if claims > 0 {
-            stat!(
-                sort_stats,
-                "  Wasted file visits: {:.1} per claim over {} claims ({} visits produced \
-                 nothing) -- what an idle worker is actually doing",
-                stage.wasted_visits_per_claim(),
-                claims,
-                stage.wasted_visits.load(std::sync::atomic::Ordering::Relaxed)
-            );
-        }
-    }
-
-    /// Log where consumer park time went, and what each worker did.
-    ///
-    /// The park table is the one figure in this report that partitions an exact
-    /// total by construction, which is why it is the one to read first. Earlier
-    /// attempts to explain park were shares of park *events* (blind to a
-    /// rare-but-long cause) or sums over workers (which overcount, because the
-    /// consumer waits for whichever worker arrives first). `unattributed` is the
-    /// honesty term: a large value means the model is incomplete, not that the
-    /// merge is idle for no reason.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "nanosecond and count totals are within f64's exact-integer range here"
-    )]
-    fn log_park_attribution(pool: &SortWorkerPool, loop_total: f64) {
-        let sort_stats = pool.sort_stats();
-        let park = pool.park_attribution_report();
-        if park.is_empty() {
-            return;
-        }
-        let total = park.total_nanos();
-        if total == 0 {
-            return;
-        }
-        let secs = |ns: u64| ns as f64 / 1e9;
-        let share = |ns: u64| 100.0 * ns as f64 / total as f64;
-        let per_park = |ns: u64| ns as f64 / park.parks as f64 / 1e3;
-
-        stat!(sort_stats, "  Consumer park, by stage (exact, partitions the park):");
-        stat!(sort_stats, "    {:<28} {:>8} {:>7} {:>10}", "stage", "time", "share", "per park");
-        for (label, ns) in [
-            ("waiting for a worker", park.to_claim_nanos),
-            ("read + decompress work", park.work_nanos),
-            ("waiting for its own wake", park.to_resume_nanos),
-            ("unattributed", park.unattributed_nanos),
-        ] {
-            stat!(
-                sort_stats,
-                "    {label:<28} {:>7.1}s {:>6.0}% {:>9.0}us",
-                secs(ns),
-                share(ns),
-                per_park(ns)
-            );
-        }
-        stat!(
-            sort_stats,
-            "    {:<28} {:>7.1}s {:>6.0}% {:>9.0}us  over {} parks ({:.0}% of loop wall)",
-            "TOTAL",
-            secs(total),
-            100.0,
-            per_park(total),
-            park.parks,
-            if loop_total > 0.0 { 100.0 * secs(total) / loop_total } else { 0.0 }
-        );
-        stat!(
-            sort_stats,
-            "    Blocks ready on the awaited file at resume: mean {:.2} (1.0 = every block \
-             fetched on demand, one round trip per block)",
-            park.mean_ready_on_resume()
-        );
-        stat!(
-            sort_stats,
-            "    Parks with no claim during them: {} of {} ({:.0}%) -- the block was already \
-             in flight or already done",
-            park.unclaimed_parks,
-            park.parks,
-            100.0 * park.unclaimed_parks as f64 / park.parks as f64
-        );
-
-        let threads = pool.per_thread_report();
-        let claims_total: u64 = threads.iter().map(|&(_, _, c)| c).sum();
-        if claims_total == 0 {
-            return;
-        }
-        stat!(sort_stats, "  Per worker (merge + phase 1 combined):");
-        stat!(
-            sort_stats,
-            "    {:>3} {:>9} {:>9} {:>7} {:>10} {:>5}",
-            "wid",
-            "busy",
-            "idle",
-            "busy%",
-            "claims",
-            "share"
-        );
-        for (w, &(busy, idle, claims)) in threads.iter().enumerate() {
-            let denom = busy + idle;
-            stat!(
-                sort_stats,
-                "    {w:>3} {:>8.1}s {:>8.1}s {:>6.0}% {:>10} {:>4.0}%",
-                secs(busy),
-                secs(idle),
-                if denom > 0 { 100.0 * busy as f64 / denom as f64 } else { 0.0 },
-                claims,
-                100.0 * claims as f64 / claims_total as f64
-            );
-        }
     }
 
     /// Log every stage of a spill block's journey, and the refill cycle.
@@ -5713,7 +4784,6 @@ impl RawExternalSorter {
     ) {
         use crate::merge_stalls::AwaitedState;
         use crate::merge_trace::MAX_TRACKED_IN_FLIGHT;
-        let sort_stats = pool.sort_stats();
 
         // A merge that never stalled still has source runs to report, so this
         // block stands on its own park count rather than on the report being
@@ -5730,31 +4800,6 @@ impl RawExternalSorter {
                 debug!("    {:<14} {}", state.label(), hist.summary());
             }
         }
-        // The same five states weighted by TIME, not by park count, and at info
-        // because the two disagree and only one of them is a cost.
-        //
-        // The park-supply census made this concrete: by count its largest class
-        // was "all busy, compress queued" at 41%, by time that class was 13%
-        // while "a worker was asleep" was 81%. Counts named the wrong fix,
-        // confidently. These histograms have always carried the nanoseconds --
-        // they were simply reported one level down, so every arm collected the
-        // answer and none printed it.
-        let state_secs: [f64; AwaitedState::COUNT] =
-            std::array::from_fn(|i| consumer.park_by_state[i].total_secs());
-        let state_total: f64 = state_secs.iter().sum();
-        if state_total > 0.0 {
-            let share = |i: usize| 100.0 * state_secs[i] / state_total;
-            stat!(
-                sort_stats,
-                "    The awaited file by park TIME ({state_total:.1}s): {:.0}% gap-filling, \
-                 {:.0}% gap-stalled, {:.0}% decompressing, {:.0}% raw-queued, {:.0}% starved",
-                share(AwaitedState::ReorderGapFilling as usize),
-                share(AwaitedState::ReorderGapStalled as usize),
-                share(AwaitedState::Decompressing as usize),
-                share(AwaitedState::RawQueued as usize),
-                share(AwaitedState::Starved as usize)
-            );
-        }
 
         let parks_pct = |count: u64| {
             #[allow(clippy::cast_precision_loss, reason = "park counts stay far below 2^52")]
@@ -5762,8 +4807,7 @@ impl RawExternalSorter {
             pct
         };
         let mean_depth = consumer.mean_in_flight();
-        stat!(
-            sort_stats,
+        info!(
             "    Workers on the awaited file at a park: none {:.0}%, exactly one {:.0}%, \
              two or more {:.0}% (mean {mean_depth:.1}, tracked to {MAX_TRACKED_IN_FLIGHT})",
             parks_pct(consumer.idle_file_parks()),
@@ -5785,8 +4829,7 @@ impl RawExternalSorter {
         // batch produced it.
         let (mean_block_bytes, derived_cap, derived_batch) = pool.awaited_sizing();
         if mean_block_bytes > 0 {
-            stat!(
-                sort_stats,
+            info!(
                 "    Hot-file refill sized from measured blocks: {mean_block_bytes} B/block \
                  -> batch {derived_batch}, cap {derived_cap}"
             );
@@ -5796,8 +4839,7 @@ impl RawExternalSorter {
         if skip_total > 0 {
             #[allow(clippy::cast_precision_loss, reason = "skip counts stay far below 2^52")]
             let pct = |n: u64| 100.0 * n as f64 / skip_total as f64;
-            stat!(
-                sort_stats,
+            info!(
                 "    Why the pool passed over the awaited file: raw-lock {:.0}%, raw-empty \
                  {:.0}%, decomp-lock {:.0}%, decomp-capped {:.0}% (of {skip_total})",
                 pct(skips[0]),
@@ -5807,15 +4849,13 @@ impl RawExternalSorter {
             );
         }
         if mean_depth >= cap / 2.0 {
-            stat!(
-                sort_stats,
+            info!(
                 "      -> the pool is running near its tracked depth on the file the merge is \
                  blocked on, so these parks are the head block's decompress latency; more \
                  concurrency on that file cannot shorten them"
             );
         } else if consumer.multi_worker_parks() > 0 {
-            stat!(
-                sort_stats,
+            info!(
                 "      -> the pool is on the awaited file but only {mean_depth:.1} deep of \
                  {MAX_TRACKED_IN_FLIGHT} tracked, so capacity is going unused on the file the \
                  merge is blocked on -- supply to that file, not decompress latency, is the \
@@ -5826,7 +4866,6 @@ impl RawExternalSorter {
 
     fn log_block_lifecycle(pool: &Arc<SortWorkerPool>) {
         use crate::merge_trace::EmptyCause;
-        let sort_stats = pool.sort_stats();
 
         let life = pool.block_lifecycle_report();
         let refill = pool.refill_report();
@@ -5842,7 +4881,7 @@ impl RawExternalSorter {
         // change a decision stay at info. Collection is unconditional either
         // way -- gating collection is what made the original question
         // unanswerable from logs we had already collected.
-        stat!(sort_stats, "=== Merge Block Lifecycle ===");
+        info!("=== Merge Block Lifecycle ===");
         debug!("  disk read   -> {}", life.read_batch.summary());
         debug!("  raw dwell   -> {}   (queued, waiting for a worker)", life.raw_dwell.summary());
         debug!("  decompress  -> {}", life.decompress.summary());
@@ -5850,8 +4889,7 @@ impl RawExternalSorter {
             "  reorder     -> {}   (decompressed, waiting for the consumer)",
             life.reorder_dwell.summary()
         );
-        stat!(
-            sort_stats,
+        info!(
             "  Per block: {:.0}us in the raw FIFO unclaimed, {:.0}us decompressing, {:.0}us \
              buffered before use (p50)",
             life.raw_dwell.percentile_micros(0.50),
@@ -5859,8 +4897,7 @@ impl RawExternalSorter {
             life.reorder_dwell.percentile_micros(0.50)
         );
         if life.reorder_is_pass_through() {
-            stat!(
-                sort_stats,
+            info!(
                 "    NOTE: blocks are consumed almost as fast as they are inserted, so the \
                  reorder buffer is a pass-through and PHASE2_DECOMP_CAP is not the binding \
                  constraint -- however full the other files look"
@@ -5868,13 +4905,8 @@ impl RawExternalSorter {
         }
 
         if !refill.is_empty() {
-            stat!(
-                sort_stats,
-                "  Refill cycle ({} times a file's buffer ran dry)",
-                refill.empties()
-            );
-            stat!(
-                sort_stats,
+            info!("  Refill cycle ({} times a file's buffer ran dry)", refill.empties());
+            info!(
                 "    At the moment it emptied: {:.0}% had raw blocks unclaimed, {:.0}% already \
                  decompressing, {:.0}% nothing at all",
                 100.0 * refill.cause_share(EmptyCause::RawReady),
@@ -5886,8 +4918,7 @@ impl RawExternalSorter {
             if !refill.read_lag.is_empty() {
                 debug!("    empty -> read     {}", refill.read_lag.summary());
             }
-            stat!(
-                sort_stats,
+            info!(
                 "    -> {:.0}% of refill latency is spent waiting for a worker to START, {:.0}% \
                  doing the work",
                 100.0 * refill.claim_share(),
@@ -5902,14 +4933,12 @@ impl RawExternalSorter {
             // it and divides by zero to fill the line below.
             Self::log_awaited_file_depth(&consumer, pool);
             if !consumer.source_run_length.is_empty() {
-                stat!(
-                    sort_stats,
+                info!(
                     "  Consecutive blocks per source: {}",
                     consumer.source_run_length.summary_blocks()
                 );
                 if consumer.source_run_length.percentile_micros(0.90) <= 1 {
-                    stat!(
-                        sort_stats,
+                    info!(
                         "    -> the merge switches source almost every block, so there is no hot \
                          file to prioritise; demand is spread across all runs at once"
                     );
@@ -5920,7 +4949,7 @@ impl RawExternalSorter {
         if !scans.is_empty() {
             debug!("  Fruitless worker scan cost: {}", scans.summary());
         }
-        stat!(sort_stats, "=============================");
+        info!("=============================");
     }
 
     /// Log where the merge loop blocked and what the other files were doing.
@@ -5933,20 +4962,17 @@ impl RawExternalSorter {
         loop_total: f64,
         utilization: f64,
         s: crate::merge_stalls::ConsumerStallReport,
-        sort_stats: bool,
     ) {
         use crate::merge_stalls::{StallShape, classify_stall};
 
         let park_fraction = if loop_total > 0.0 { s.park_secs / loop_total } else { 0.0 };
-        stat!(
-            sort_stats,
+        info!(
             "  Consumer parked: {:.1}s ({:.0}% of loop wall, exact) over {} parks",
             s.park_secs,
             100.0 * park_fraction,
             s.parks
         );
-        stat!(
-            sort_stats,
+        info!(
             "    Block pulls that had to wait: {}/{} ({:.0}%), {:.1} parks each (1.0 = no wasted \
              wake-ups)",
             s.stalled_pulls,
@@ -5954,8 +4980,7 @@ impl RawExternalSorter {
             100.0 * s.stall_rate(),
             s.parks_per_stall()
         );
-        stat!(
-            sort_stats,
+        info!(
             "    Worst source: #{} at {:.1}s ({:.0}% of park time; {} sources parked on)",
             s.top_source,
             s.top_source_park_secs,
@@ -5963,8 +4988,7 @@ impl RawExternalSorter {
             s.sources_parked_on
         );
         if s.censuses > 0 {
-            stat!(
-                sort_stats,
+            info!(
                 "    Other files at a park ({} parks sampled): {:.0}% at cap, {:.0}% starved, \
                  {:.0}% unreadable",
                 s.censuses,
@@ -5972,8 +4996,7 @@ impl RawExternalSorter {
                 100.0 * s.starved_share,
                 100.0 * s.contended_share
             );
-            stat!(
-                sort_stats,
+            info!(
                 "    The awaited file: {:.0}% gap-filling, {:.0}% gap-stalled, {:.0}% \
                  decompressing, {:.0}% raw-queued, {:.0}% starved",
                 100.0 * s.awaited.reorder_gap_filling,
@@ -5982,8 +5005,7 @@ impl RawExternalSorter {
                 100.0 * s.awaited.raw_queued,
                 100.0 * s.awaited.starved
             );
-            stat!(
-                sort_stats,
+            info!(
                 "      -> block not read yet {:.0}%, exists but unclaimed {:.0}%, being produced \
                  {:.0}%",
                 100.0 * s.awaited.starved,
@@ -5992,40 +5014,33 @@ impl RawExternalSorter {
             );
         }
         match classify_stall(park_fraction, utilization, s.contended_share, s.awaited) {
-            StallShape::NotStalled => {
-                stat!(sort_stats, "    Shape: the consumer is not waiting on blocks");
-            }
-            StallShape::PoolSaturated => stat!(
-                sort_stats,
+            StallShape::NotStalled => info!("    Shape: the consumer is not waiting on blocks"),
+            StallShape::PoolSaturated => info!(
                 "    Shape: pool saturated -- the consumer waits because every worker is busy, \
                  which is what a healthy CPU-bound merge looks like. Fewer bytes to compress or \
                  more threads would help; nothing here is misscheduled"
             ),
-            StallShape::HeadOfLine => stat!(
-                sort_stats,
+            StallShape::HeadOfLine => info!(
                 "    Shape: head-of-line -- the awaited file has nothing anywhere in its \
                  pipeline, so the block has not been read from disk yet. The constraint is \
                  upstream of the pool: storage, or read concurrency"
             ),
-            StallShape::WorkUnclaimed => stat!(
-                sort_stats,
+            StallShape::WorkUnclaimed => info!(
                 "    Shape: work unclaimed -- the block the consumer needs already exists and no \
                  worker is on it. Capacity is not the problem; scheduling and wake latency are. \
                  Compare the discovery-lag line below"
             ),
-            StallShape::DecompressLatency => stat!(
-                sort_stats,
+            StallShape::DecompressLatency => info!(
                 "    Shape: decompression latency -- a worker is already producing the needed \
                  block, so the consumer is paying the per-block cost serially. Check the reorder \
                  dwell below before reaching for a deeper cap: if blocks are consumed as fast as \
                  they are inserted, the buffer is not what the pipeline is running into"
             ),
-            StallShape::Contended => stat!(
-                sort_stats,
+            StallShape::Contended => info!(
                 "    Shape: lock contention -- a large share of file state could not be read \
                  without blocking, so the shares above understate what was available"
             ),
-            StallShape::Mixed => stat!(sort_stats, "    Shape: no single candidate dominates"),
+            StallShape::Mixed => info!("    Shape: no single candidate dominates"),
         }
     }
 
@@ -6046,7 +5061,6 @@ impl RawExternalSorter {
     ) -> Result<u64> {
         use crate::loser_tree::LoserTree;
         use crate::pooled_bam_writer::PooledBamWriter;
-        let sort_stats = self.sort_stats;
 
         let (mut sources, mut guard) =
             Self::setup_phase2_merge::<K>(chunk_files, memory_chunks, pool)?;
@@ -6080,7 +5094,6 @@ impl RawExternalSorter {
         let mut writer = PooledBamWriter::new(Arc::clone(pool), output, &output_header)?;
 
         let mut records_merged = 0u64;
-        let mut merge_progress_batch = crate::progress_batch::BatchedProgress::new();
         let merge_progress = ProgressTracker::new("Merged records")
             .with_interval(1_000_000)
             .with_total(total_records);
@@ -6101,13 +5114,6 @@ impl RawExternalSorter {
         // than the loop wall clock they are supposed to partition. A prime
         // interval decorrelates the sample from any block-size-derived period.
         let merge_sample_interval: u64 = 1021;
-        // Calibrated once per merge, not assumed: the clock pair that brackets each
-        // sampled segment costs 15-35ns depending on host, which is the same order
-        // as the segments themselves. Without subtracting it the rows are more clock
-        // than work -- measured at -70% residual before this existed.
-        let clock_overhead_nanos = crate::merge_headroom::measure_clock_overhead_nanos();
-        let mut merge_publish_secs = 0.0f64;
-        let mut merge_present_secs = 0.0f64;
         let mut merge_write_secs = 0.0f64;
         let mut merge_read_secs = 0.0f64;
         let mut merge_tree_secs = 0.0f64;
@@ -6131,59 +5137,31 @@ impl RawExternalSorter {
         // Snapshot the process-wide presentation counters so the sub-phase log
         // reports only this merge's delta, not totals accumulated by any prior
         // (sequential or concurrent) sort sharing the process.
-        let mut fetch_counts = RecordFetchCounts::default();
         let borrowed_before = RECORD_BORROWED.load(std::sync::atomic::Ordering::Relaxed);
         let reassembled_before = RECORD_REASSEMBLED.load(std::sync::atomic::Ordering::Relaxed);
         let loop_start = Instant::now();
 
-        let mut published_src: Option<usize> = None;
         while tree.winner_is_active() {
-            // Decide sampling first, so every segment below is timed on the same
-            // records or on none. Timing a subset would bias the partition toward
-            // whichever step happened to be measured, and the partition's whole
-            // value is that its segments sum to the loop.
+            let winner = tree.winner();
+            let src_idx = source_map[winner];
             let sample_this = sample_countdown == 0;
             if sample_this {
                 sample_countdown = merge_sample_interval - 1;
-                samples_taken += 1;
             } else {
                 sample_countdown -= 1;
             }
 
-            let t = sample_this.then(Instant::now);
-            let winner = tree.winner();
-            let src_idx = source_map[winner];
-            // Publish the next likely source on run change. That is not once per
-            // record but it is far from rare: 25,003,410 publications against
-            // 779,820,469 records on the measured cell, one per ~31 records, each
-            // calling `runner_up()` at ~11.6ns. The pool gives the named file the
-            // deep read allowance, so its first read starts while the consumer is
-            // still draining the current file instead of after it has stalled. A
-            // wrong prediction costs one deep read on a file the merge reaches
-            // eventually; there is no correctness component.
-            if published_src != Some(src_idx) {
-                published_src = Some(src_idx);
-                pool.set_phase2_next_source(tree.runner_up().map(|w| source_map[w]));
-            }
-            if let Some(t0) = t {
-                merge_publish_secs += t0.elapsed().as_secs_f64();
-            }
-
-            let t = sample_this.then(Instant::now);
-            let record_bytes =
-                winner_record_bytes(&sources[src_idx], guard.consumer_ref(), &mut fetch_counts)?;
-            if let Some(t0) = t {
-                merge_present_secs += t0.elapsed().as_secs_f64();
-            }
-
-            let t = sample_this.then(Instant::now);
-            writer.write_raw_record(record_bytes)?;
-            if let Some(t0) = t {
+            let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref())?;
+            if sample_this {
+                let t0 = Instant::now();
+                writer.write_raw_record(record_bytes)?;
                 merge_write_secs += t0.elapsed().as_secs_f64();
+            } else {
+                writer.write_raw_record(record_bytes)?;
             }
 
             records_merged += 1;
-            merge_progress_batch.tick(&merge_progress);
+            merge_progress.log_if_needed(1);
 
             if merge_probe.should_sample(records_merged) {
                 let depths = pool.phase1_queue_depths();
@@ -6191,25 +5169,28 @@ impl RawExternalSorter {
                 merge_probe.log_mid_with_depths(depths, consumer_stats);
             }
 
-            let t = sample_this.then(Instant::now);
-            let next = sources[src_idx].advance(guard.consumer_mut())?;
-            if let Some(t0) = t {
+            if sample_this {
+                let t0 = Instant::now();
+                let next = sources[src_idx].advance(guard.consumer_mut())?;
                 merge_read_secs += t0.elapsed().as_secs_f64();
-            }
 
-            let t = sample_this.then(Instant::now);
-            if let Some(key) = next {
-                tree.replace_winner(key);
-            } else {
-                tree.remove_winner();
-            }
-            if let Some(t0) = t {
+                let t0 = Instant::now();
+                if let Some(key) = next {
+                    tree.replace_winner(key);
+                } else {
+                    tree.remove_winner();
+                }
                 merge_tree_secs += t0.elapsed().as_secs_f64();
+                samples_taken += 1;
+            } else {
+                let next = sources[src_idx].advance(guard.consumer_mut())?;
+                if let Some(key) = next {
+                    tree.replace_winner(key);
+                } else {
+                    tree.remove_winner();
+                }
             }
         }
-
-        // Before the delta below is read, or this merge reports zero.
-        fetch_counts.publish();
 
         let loop_total = loop_start.elapsed().as_secs_f64();
         let borrowed_this_merge =
@@ -6233,13 +5214,6 @@ impl RawExternalSorter {
         // compressors are behind, which the sampled breakdown charged to "enqueue
         // write" -- a bucket documented as a handoff that excludes compression.
         let (write_blocked_secs, write_blocked_waits) = writer.write_backpressure();
-        // Retain the permit pool so the writer histograms can be harvested *after*
-        // `finish` drains the output queue: the pool outlives the writer, and the
-        // block writes and reorder waits incurred during that drain belong in the
-        // "write block" and "write reorder wait" rows. A snapshot taken here,
-        // before the drain, would omit the tail -- the same reason the stall
-        // report below is harvested pre-finalize but the histograms are not.
-        let writer_permit_pool = writer.permit_pool();
 
         // Harvest the consumer's stall report before finalizing: `finish_output`
         // releases the merge sources and with them the consumer, and the report
@@ -6261,32 +5235,9 @@ impl RawExternalSorter {
         // before the drain.
         guard.finish_output(|| writer.finish())?;
 
-        // Harvest now, after the drain, from the retained pool. Empty only if the
-        // writer was already finalized when the pool was retained, which cannot
-        // happen on this path.
-        let writer_stats = writer_permit_pool
-            .as_deref()
-            .map_or_else(Default::default, crate::worker_pool::PermitPool::writer_stats);
-
-        let raw_sample = crate::merge_headroom::ConsumerSample {
-            publish: merge_publish_secs,
-            present: merge_present_secs,
-            write: merge_write_secs,
-            advance: merge_read_secs,
-            tree: merge_tree_secs,
-        };
-        let corrected_sample = raw_sample.corrected(samples_taken, clock_overhead_nanos);
-        stat!(
-            sort_stats,
-            "  Consumer sampling: {samples_taken} samples, clock {clock_overhead_nanos}ns per \
-             segment; sampled total {:.1}ms -> {:.1}ms after removing measurement overhead \
-             (sampled basis, before scaling to the full merge)",
-            raw_sample.total() * 1e3,
-            corrected_sample.total() * 1e3
-        );
         Self::log_merge_sub_phases(
             (loop_total, loop_start.elapsed().as_secs_f64()),
-            corrected_sample,
+            (merge_write_secs, merge_read_secs, merge_tree_secs),
             (samples_taken, records_merged),
             active_workers,
             pool,
@@ -6298,11 +5249,7 @@ impl RawExternalSorter {
                 reassembled: reassembled_this_merge,
             },
         );
-        Self::log_stage_latency(pool, &writer_stats);
 
-        // Must precede log_final: the tracker has not seen the last partial batch,
-        // and without this the reported total comes up short by up to one batch.
-        merge_progress_batch.flush(&merge_progress);
         merge_progress.log_final();
         log_snapshot("phase2.end", 0);
 
@@ -6314,7 +5261,7 @@ impl RawExternalSorter {
     /// Identical input/output pipeline to `merge_chunks_generic` — the shared
     /// worker pool decompresses the input runs (`PoolDisk` sources) and
     /// compresses the output blocks — but the output goes through
-    /// [`PooledBamWriter::new_indexing`], which tracks each record's virtual
+    /// [`crate::pooled_bam_writer::PooledBamWriter::new_indexing`], which tracks each record's virtual
     /// file offset and returns the generated BAI index. A single pool of
     /// workers therefore serves both decompression and compression; there is no
     /// separate writer thread pool and no serialized single-reader input.
@@ -6358,7 +5305,6 @@ impl RawExternalSorter {
         let mut tree = LoserTree::new(initial_keys);
 
         let mut writer = PooledBamWriter::new_indexing(Arc::clone(pool), output, &output_header)?;
-        let mut merge_progress_batch = crate::progress_batch::BatchedProgress::new();
         let merge_progress = ProgressTracker::new("Merged records")
             .with_interval(1_000_000)
             .with_total(total_records);
@@ -6374,28 +5320,13 @@ impl RawExternalSorter {
         }
         let loop_start = Instant::now();
         let mut records_merged: u64 = 0;
-        let mut published_src: Option<usize> = None;
-        let mut fetch_counts = RecordFetchCounts::default();
         while tree.winner_is_active() {
             let winner = tree.winner();
             let src_idx = source_map[winner];
-            // Publish the next likely source, but only when the run changes. The
-            // pool gives it the deep read allowance, so its first read starts
-            // while the consumer is still draining the current file instead of
-            // after it has already stalled. A wrong prediction costs one deep
-            // read on a file the merge will reach anyway; there is no correctness
-            // component. Mirrors `merge_chunks_generic`; without it the indexed
-            // path -- the default coordinate sort -- gets no predictive
-            // read-ahead.
-            if published_src != Some(src_idx) {
-                published_src = Some(src_idx);
-                pool.set_phase2_next_source(tree.runner_up().map(|w| source_map[w]));
-            }
-            let record_bytes =
-                winner_record_bytes(&sources[src_idx], guard.consumer_ref(), &mut fetch_counts)?;
+            let record_bytes = winner_record_bytes(&sources[src_idx], guard.consumer_ref())?;
             writer.write_raw_record(record_bytes)?;
             records_merged += 1;
-            merge_progress_batch.tick(&merge_progress);
+            merge_progress.log_if_needed(1);
 
             if let Some(key) = sources[src_idx].advance(guard.consumer_mut())? {
                 tree.replace_winner(key);
@@ -6414,7 +5345,6 @@ impl RawExternalSorter {
         // cannot change it, and the consumer's report is harvested before
         // `finish_output` releases the merge sources and with them the
         // consumer. Both describe the loop that has just ended.
-        fetch_counts.publish();
         let loop_total = loop_start.elapsed().as_secs_f64();
         let active_workers = pool.active_workers();
         let stalls = {
@@ -6426,14 +5356,6 @@ impl RawExternalSorter {
             guard.consumer_ref().map(MainThreadChunkConsumer::stall_report)
         };
 
-        // Retain the permit pool so the writer histograms can be harvested *after*
-        // `finish_index` drains the output queue, exactly as the generic path
-        // does: the pool outlives the writer, and the block writes and reorder
-        // waits incurred during that drain belong in the "write block" and
-        // "write reorder wait" rows. A snapshot taken here, before the drain,
-        // would omit the tail.
-        let writer_permit_pool = writer.permit_pool();
-
         // Finalize before logging, for the reason the generic path does: `finish`
         // drains the output queue, and every block still in it is compressed by
         // the same workers `log_merge_stalls` divides into `merge_total`. Logging
@@ -6444,14 +5366,6 @@ impl RawExternalSorter {
         // number. `loop_total` stays the consumer's park-fraction denominator,
         // which is a fraction of the merge loop alone.
         let index = guard.finish_output(|| writer.finish_index())?;
-
-        // Harvest now, after the drain, from the retained pool. Empty only if the
-        // writer was already finalized when the pool was retained, which cannot
-        // happen on this path.
-        let writer_stats = writer_permit_pool
-            .as_deref()
-            .map_or_else(Default::default, crate::worker_pool::PermitPool::writer_stats);
-
         Self::log_merge_stalls(
             loop_total,
             loop_start.elapsed().as_secs_f64(),
@@ -6459,15 +5373,7 @@ impl RawExternalSorter {
             stalls,
             pool,
         );
-        // `--write-index` is the default for a coordinate sort, so wiring the
-        // stage-latency table here -- matching `merge_chunks_generic` -- is what
-        // gives most production merges any stage-latency and writer-histogram
-        // rows at all.
-        Self::log_stage_latency(pool, &writer_stats);
 
-        // Must precede log_final: the tracker has not seen the last partial batch,
-        // and without this the reported total comes up short by up to one batch.
-        merge_progress_batch.flush(&merge_progress);
         merge_progress.log_final();
         Ok((index, records_merged))
     }
@@ -6475,6 +5381,22 @@ impl RawExternalSorter {
     /// Create output header with appropriate sort order tags.
     fn create_output_header(&self, header: &Header) -> Header {
         super::create_output_header(self.sort_order, header)
+    }
+
+    /// Create the spill temp dirs + allocator for the P6 `CompressSpill` step.
+    ///
+    /// Public wrapper over `Self::create_temp_dirs`: honors `--temp-dir` /
+    /// `FGUMI_TMP_DIRS` (the configured `temp_dirs`) exactly as the legacy
+    /// streaming path does. The caller hands the [`Vec<TempDir>`] RAII handles to
+    /// `CompressSpill` (held for the step's lifetime) and the [`TmpDirAllocator`]
+    /// behind a shared mutex for per-file base-dir allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a temp directory cannot be created or has insufficient
+    /// free space.
+    pub fn create_spill_dirs(&self) -> Result<(Vec<TempDir>, TmpDirAllocator)> {
+        self.create_temp_dirs()
     }
 
     /// Create per-base temp directories and an allocator over their subdirs.
@@ -6685,104 +5607,16 @@ pub(crate) use crate::SortStats as RawSortStats;
 // rather than in `fgumi-bam-io`.
 // ============================================================================
 
-/// How many concurrent streams to read a file with.
-///
-/// `Auto` starts at one and grows only when fills are demonstrably occupying
-/// the span (see `spill_reader`); a fixed value pins it. One measured
-/// device wants four and another wants one, and the difference is 28% on the
-/// first and -1.8% on the second, which is why the default measures rather
-/// than guesses.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ReadStreams {
-    /// Measure and grow. The default.
-    #[default]
-    Auto,
-    /// Exactly this many; `1` is the plain sequential reader.
-    Fixed(usize),
-}
-
-impl std::fmt::Display for ReadStreams {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Auto => f.write_str("auto"),
-            Self::Fixed(n) => write!(f, "{n}"),
-        }
-    }
-}
-
-impl ReadStreams {
-    /// Whether this asks for the plain sequential reader, which is what every
-    /// phase did before scattered reads existed.
-    #[must_use]
-    pub fn is_sequential(self) -> bool {
-        matches!(self, Self::Fixed(1))
-    }
-
-    /// Streams to start with. `Auto` starts at one and grows from what it
-    /// measures, so it costs nothing until it has evidence.
-    #[must_use]
-    pub fn initial(self) -> usize {
-        match self {
-            Self::Auto => 1,
-            Self::Fixed(n) => n.max(1),
-        }
-    }
-
-    /// Whether the reader should tune itself as it goes.
-    #[must_use]
-    pub fn is_auto(self) -> bool {
-        matches!(self, Self::Auto)
-    }
-}
-
-impl std::str::FromStr for ReadStreams {
-    type Err = String;
-
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        if text.eq_ignore_ascii_case("auto") {
-            return Ok(Self::Auto);
-        }
-        match text.parse::<usize>() {
-            Ok(0) => Err("--read-streams must be `auto` or at least 1".to_string()),
-            Ok(n) => Ok(Self::Fixed(n)),
-            Err(_) => Err(format!("expected `auto` or a positive number, got `{text}`")),
-        }
-    }
-}
-
-/// Fills the phase-1 input reader keeps in flight ahead of the framer.
-///
-/// One, and deeper does not help. Swept in a single boot on
-/// `1kg-wgs-HG00096` (t16, 4 streams), read span against total wall:
-///
-/// | depth | read span | wall |
-/// | --- | --- | --- |
-/// | 0 | 69.4s | 271.8s |
-/// | 1 | 66.9s | 267.7s |
-/// | 2 | 66.7s | 269.4s |
-/// | 4 | 66.4s | 268.5s |
-///
-/// Depths 2 and 4 move the span by less than a second and the wall clock not
-/// at all -- all three sit inside the +/-0.7% in-boot noise floor -- and depth
-/// 2 cost 277 MB of peak RSS for it. One is enough because the span is not
-/// fetch-bound: the fetch runs at 1327 MB/s and takes 32.5s of a 66.4s span
-/// against an ingest-serial floor of 53.0s, so what is left is coordination
-/// between the reader, the decompress workers and the ingest thread, which no
-/// amount of read-ahead touches.
-///
-/// Costs `(n + 1) * FILL_BYTES` of buffers on one reader, which is also why
-/// the merge's spill readers -- there are K of them, and the merge is already
-/// at its consumer-serial floor -- get none.
-const PHASE1_LOOKAHEAD_FILLS: usize = 1;
-
 /// Create a raw BAM reader using the pool's Phase 1 integrated reading.
 ///
 /// Workers in the pool do `ReadInputBlocks` + `DecompressInput`. The main
 /// thread consumes decompressed bytes via `PooledInputStream`.
 ///
-/// No extra threads are spawned either way: with one stream the pool's block
-/// reader reads directly from the input file, and with several it offers byte
-/// slices to the pool (see `spill_reader`).
+/// When `async_reader` is false, no extra threads are spawned: the pool's
+/// block reader reads directly from the input file. When `async_reader` is
+/// true, the input file is wrapped in a `PrefetchReader`, which spawns one
+/// dedicated OS thread (`fgumi-prefetch`) that reads raw bytes ahead into a
+/// bounded queue so the pool's block reader never blocks on disk I/O.
 ///
 /// # Flow
 ///
@@ -6800,84 +5634,45 @@ const PHASE1_LOOKAHEAD_FILLS: usize = 1;
 fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
     path: P,
     pool: &Arc<SortWorkerPool>,
-    read_streams: ReadStreams,
+    async_reader: bool,
 ) -> Result<(fgumi_raw_bam::RawBamReader<PooledInputStream>, Header)> {
     use crate::worker_pool::phase;
     use std::io;
 
     let path_ref = path.as_ref();
 
-    // Times the reads that refill the buffer below, so that `framing_secs` --
-    // time inside `read_raw_blocks` that was *not* spent fetching -- means what
-    // it says. Both arms report into it: the sequential one through
-    // `TimedReader`, the scattered one by timing its own fills. Leaving the
-    // scattered arm out booked its fill waits as framing and showed 10.9
-    // us/block against a true 0.9.
-    let reader_stats = pool.reader_stats();
-
     let opened: Box<dyn io::Read + Send> = if is_stdin_path(path_ref) {
-        // `io::Stdin` re-acquires a mutex and reads through an 8 KiB buffer on
-        // every call; the pool's block reader wants far bigger gulps than that,
-        // so give the stdin path the same 2 MiB buffer the file path gets.
-        // Scattered reads are not available here -- a pipe has no offsets.
-        Box::new(io::BufReader::with_capacity(
-            SORT_INPUT_BUFFER_SIZE,
-            crate::phase1_stats::TimedReader::new(io::stdin(), reader_stats),
-        ))
+        if async_reader {
+            // `--async-reader` is about decoupling the read from the block
+            // reader, which stdin needs at least as much as a file does: the
+            // prefetch thread also subsumes the buffering below, reading ahead
+            // in chunks into a bounded queue.
+            log::debug!("async sort reader enabled: spawning fgumi-prefetch thread for stdin");
+            Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::new(io::stdin()))
+        } else {
+            // `io::Stdin` re-acquires a mutex and reads through an 8 KiB buffer
+            // on every call; the pool's block reader wants far bigger gulps than
+            // that, so give the stdin path the same 2 MiB buffer the file path
+            // gets.
+            Box::new(io::BufReader::with_capacity(SORT_INPUT_BUFFER_SIZE, io::stdin()))
+        }
     } else {
         let file = std::fs::File::open(path_ref)
             .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
 
-        // Grow the per-fd readahead window. Measured worth almost nothing on
-        // its own (359 MB/s against 360 with no hint), but it is free and
-        // applies however the bytes are subsequently read.
+        // Grow the per-fd readahead window. This is the plain sequential hint
+        // and applies however the bytes are subsequently read; the WILLNEED
+        // hints that `PrefetchReader` issues are a separate, async-only extra.
         fgumi_bam_io::os_hints::advise_sequential(&file);
 
-        if read_streams.is_sequential() {
-            // `--read-streams 1`: the plain buffered reader every phase used
-            // before scattered reads existed.
-            Box::new(io::BufReader::with_capacity(
-                SORT_INPUT_BUFFER_SIZE,
-                crate::phase1_stats::TimedReader::new(file, reader_stats),
-            ))
+        if async_reader {
+            log::debug!(
+                "async sort reader enabled: spawning fgumi-prefetch thread for {}",
+                path_ref.display()
+            );
+            Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file))
         } else {
-            // Scattered positional reads, the same mechanism the merge uses on
-            // spill files: slices are offered to the pool so the device sees
-            // real queue depth, which one blocking `read()` cannot produce
-            // however large its buffer. The framer downstream is unchanged --
-            // this still presents a sequential `Read`.
-            //
-            // Only reachable on a real file: stdin and other non-seekable inputs
-            // take the branch above, where positional reads do not exist.
-            match crate::spill_reader::ScatterReader::for_streams(
-                file,
-                0,
-                read_streams,
-                Some(pool.fetch_queue()),
-            )
-            .map(|reader| {
-                reader.timed(Arc::clone(&reader_stats)).looking_ahead(PHASE1_LOOKAHEAD_FILLS)
-            }) {
-                Ok(reader) => {
-                    log::debug!(
-                        "scattered sort reader: {read_streams} over {}",
-                        path_ref.display()
-                    );
-                    Box::new(reader)
-                }
-                Err(e) => {
-                    // A file whose length we cannot read is one we cannot slice.
-                    // Fall back rather than fail a sort over a prefetch tweak.
-                    log::warn!("scattered sort reader unavailable ({e}); using one stream");
-                    let file = std::fs::File::open(path_ref).with_context(|| {
-                        format!("Failed to reopen input BAM: {}", path_ref.display())
-                    })?;
-                    Box::new(io::BufReader::with_capacity(
-                        SORT_INPUT_BUFFER_SIZE,
-                        crate::phase1_stats::TimedReader::new(file, reader_stats),
-                    ))
-                }
-            }
+            Box::new(io::BufReader::with_capacity(SORT_INPUT_BUFFER_SIZE, file))
         }
     };
 
@@ -6898,7 +5693,6 @@ fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
         pool.decompressed_input_done_flag(),
         pool.input_read_error_flag(),
         pool.decompress_error_flag(),
-        pool.phase1_ingest_stats(),
     );
 
     // Deliberately not phrased as a header failure. The header was parsed
@@ -7106,6 +5900,668 @@ pub(crate) fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow:
          re-run with --key-types {}",
         v.key_types_token(),
     )
+}
+
+/// Open `path` as a single [`SortMergeSlot`] with the given `file_id`.
+///
+/// The spill codec is auto-detected from the file magic: for zstd (`ZSP1`) the
+/// 4-byte magic is consumed here, leaving the reader at the first `[len][frame]`
+/// record; for BGZF the `1f 8b` is part of the first block, so the reader is
+/// rewound to byte 0. `SortSpillDecompress` reads `slot.codec` to decompress
+/// accordingly.
+///
+/// `file_id` is the slot's stable merge-order identifier — `SortMerge` orders
+/// sources by it so the `LoserTree` tie-break for equal sort keys matches the
+/// legacy chunk-files order. The P6 `CompressSpill` step passes a chunk's
+/// **logical spill index** here so the tie-break is independent of which worker
+/// happened to write the file.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened, its magic cannot be read, or
+/// (for BGZF) the rewind fails.
+pub fn open_spill_slot(path: &std::path::Path, file_id: u32) -> Result<Arc<SortMergeSlot>> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open spill chunk {}", path.display()))?;
+    let mut magic = [0u8; 4];
+    let filled = read_exact_or_eof(&mut file, &mut magic)
+        .with_context(|| format!("failed to read spill chunk magic {}", path.display()))?;
+    let codec = if filled {
+        crate::codec::SpillCodec::from_magic(&magic).unwrap_or(crate::codec::SpillCodec::Bgzf)
+    } else {
+        crate::codec::SpillCodec::Bgzf
+    };
+    if matches!(codec, crate::codec::SpillCodec::Bgzf) {
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(0))
+            .with_context(|| format!("failed to rewind spill chunk {}", path.display()))?;
+    }
+    let reader = std::io::BufReader::new(file);
+    Ok(Arc::new(SortMergeSlot::new(file_id, reader, codec)))
+}
+
+// ============================================================================
+// CoordinateSortStream — streaming coordinate-sort handle
+// ============================================================================
+
+// ============================================================================
+// QuerynameSortStream — streaming queryname-sort handle (lex or natural)
+// ============================================================================
+
+// ============================================================================
+// TemplateCoordinateSortStream — streaming template-coordinate-sort handle
+// ============================================================================
+
+// ============================================================================
+// Streaming-sort merge path (unified pipeline `SortMerge` step)
+// ============================================================================
+//
+// Ported from the issue-#330 branch onto main's sort engine. This is the
+// slot-backed, *non-blocking* merge driver used exclusively by the typed-step
+// pipeline (`MergeDriver::from_slots`). It reads records out of
+// `SortMergeSlot` queues, which the `SortSpillDecompress` step has *already*
+// filled with decompressed `Vec<u8>` blocks — so this path is **codec-agnostic**
+// (it never touches disk or the spill codec) and carries no chunk-corruption
+// risk. The eager pool-integrated `MergeDriver::new` path from #330 is
+// intentionally NOT ported: standalone `fgumi sort` uses main's own
+// `merge_chunks_*` engine, and the pipeline only ever calls `from_slots`.
+
+/// Result of a non-blocking source read. `WouldBlock` is only ever produced by
+/// `Slot` sources whose decompressed queue is momentarily empty and not yet at
+/// EOF; the in-memory source always returns `Ready`.
+pub(crate) enum TryRead<K> {
+    /// A record was read (`Some`) or the source is at clean EOF (`None`).
+    Ready(Option<K>),
+    /// The source has no bytes available right now but is not at EOF; the
+    /// caller should yield and retry on a later dispatch.
+    WouldBlock,
+}
+
+/// Per-slot byte-stream parser state for the non-blocking merge reader.
+///
+/// As decompressed blocks are popped from a `SortMergeSlot`, their bytes are
+/// stashed in `current_buf` and consumed left-to-right by the record parser.
+/// Named distinctly from main's own `SourceParserState` (the pool-merge path)
+/// because this one additionally carries resumable cross-block framing state.
+struct SlotParserState {
+    /// Current decompressed block being consumed.
+    current_buf: Vec<u8>,
+    /// Read position within `current_buf`.
+    current_pos: usize,
+    /// Resumable framing state for [`slot_try_next_record`]. `Some` while a
+    /// record spans a block boundary and the next block was not yet available,
+    /// so the read returned `WouldBlock` mid-record; the next call resumes from
+    /// here.
+    pending: Option<PendingRecord>,
+}
+
+/// Partially-read record, retained across a `WouldBlock` so the non-blocking
+/// slot reader can resume. The wire layout is `[key:ksize][len:4][body:len]`
+/// for non-embedded keys (`ksize = K::SERIALIZED_SIZE`) and `[len:4][body:len]`
+/// for embedded keys (`ksize = 0`, key extracted from the body). We collect the
+/// key prefix (if any), then the length prefix, then the body.
+#[derive(Default)]
+struct PendingRecord {
+    /// Expected serialized key size (`0` for embedded keys).
+    key_size: usize,
+    /// Key-prefix bytes collected so far (length grows to `key_size`).
+    key_buf: Vec<u8>,
+    /// Length-prefix bytes collected so far (`0..=4`).
+    len_buf: [u8; 4],
+    /// Count of `len_buf` bytes filled.
+    len_got: usize,
+    /// Total body length, known once `len_got == 4`. The body accumulates
+    /// directly into the caller's record buffer; progress is `out.len()`.
+    body_len: Option<usize>,
+}
+
+impl SlotParserState {
+    fn new() -> Self {
+        Self { current_buf: Vec::new(), current_pos: 0, pending: None }
+    }
+
+    fn remaining(&self) -> usize {
+        self.current_buf.len() - self.current_pos
+    }
+}
+
+/// Outcome of a non-blocking attempt to pull the next decompressed block from a
+/// slot into `parser.current_buf`.
+enum BlockLoad {
+    /// A block was moved into `parser.current_buf`.
+    Loaded,
+    /// The slot is fully delivered (queue empty AND `queue_eof`).
+    Eof,
+    /// The queue is empty but the producer is still feeding this slot.
+    WouldBlock,
+}
+
+/// Pop one decompressed block (FIFO) into `parser`, surfacing a decompression
+/// error in preference to EOF, reporting clean EOF, or `WouldBlock` while the
+/// producer is still active. Never parks.
+fn slot_try_load_block(
+    slot: &Arc<crate::merge_slots::SortMergeSlot>,
+    parser: &mut SlotParserState,
+) -> Result<BlockLoad> {
+    use std::sync::atomic::Ordering;
+
+    let mut guard = slot.decompressed.lock().expect("slot.decompressed mutex poisoned");
+    if let Some(data) = guard.pop_front() {
+        drop(guard);
+        parser.current_buf = data;
+        parser.current_pos = 0;
+        return Ok(BlockLoad::Loaded);
+    }
+    // Queue empty. Both atomics are visible under the lock release-acquire
+    // chain (producer stores them while holding this same mutex). Surface
+    // error in preference to EOF.
+    if slot.decomp_error.load(Ordering::Acquire) {
+        drop(guard);
+        anyhow::bail!("spill decompression error on slot {}", slot.file_id);
+    }
+    if slot.queue_eof.load(Ordering::Acquire) {
+        return Ok(BlockLoad::Eof);
+    }
+    Ok(BlockLoad::WouldBlock)
+}
+
+/// Serialized key size on the wire for a slot source: `0` for embedded keys
+/// (key extracted from the body), else `K::SERIALIZED_SIZE`. Variable-length
+/// non-embedded keys are unsupported on the slot path (none exist in
+/// production — every slot-path key is embedded).
+fn slot_key_size<K: RawSortKey>() -> Result<usize> {
+    if K::EMBEDDED_IN_RECORD {
+        Ok(0)
+    } else {
+        K::SERIALIZED_SIZE.ok_or_else(|| {
+            anyhow::anyhow!("non-embedded slot key must have a fixed serialized size")
+        })
+    }
+}
+
+/// Parse a sort key from `bytes`: extracted from the body for embedded keys, or
+/// deserialized from the `key_size`-byte prefix for non-embedded keys.
+fn slot_parse_key<K: RawSortKey + Default + 'static>(key_bytes: &[u8], body: &[u8]) -> Result<K> {
+    if K::EMBEDDED_IN_RECORD {
+        // An embedded key is read out of the body, so an empty body cannot
+        // carry one. Every extractor indexes straight into the slice
+        // (`RawCoordinateKey` reads `ref_id` off the front), so without this an
+        // empty body panics mid-merge instead of surfacing a corrupt-slot
+        // error — and it is reachable: a corrupt length prefix of 0 makes the
+        // body loop break immediately with `out` still empty.
+        //
+        // This is a floor, not a full bounds check. The minimum body an
+        // extractor needs is key-specific (8 bytes here, 16 for the coordinate
+        // key, more for queryname), and `RawSortKey` does not expose it, so a
+        // corrupt *small but non-zero* length can still panic inside an
+        // extractor. Closing that needs a per-key minimum on the trait.
+        anyhow::ensure!(
+            !body.is_empty(),
+            "record body is empty and cannot carry an embedded sort key (corrupt slot)",
+        );
+        Ok(K::extract_from_record(body))
+    } else {
+        let mut r = key_bytes;
+        K::read_from(&mut r).map_err(|e| anyhow::anyhow!("malformed slot key: {e}"))
+    }
+}
+
+/// Non-blocking, resumable read of the next record from a slot.
+///
+/// Returns `Ready(Some(key))` with the record body in `out`, `Ready(None)` at
+/// clean source EOF, or `WouldBlock` when a needed block is not yet available
+/// (progress is saved in `parser.pending` so the next call resumes).
+///
+/// # Errors
+///
+/// Truncation (EOF mid-record), a malformed key, or a producer-side
+/// decompression error.
+fn slot_try_next_record<K: RawSortKey + Default + 'static>(
+    slot: &Arc<crate::merge_slots::SortMergeSlot>,
+    parser: &mut SlotParserState,
+    out: &mut Vec<u8>,
+) -> Result<TryRead<K>> {
+    let key_size = slot_key_size::<K>()?;
+
+    if parser.pending.is_none() {
+        // Ensure at least one byte is available, or detect clean EOF at a
+        // record boundary.
+        if parser.remaining() == 0 {
+            match slot_try_load_block(slot, parser)? {
+                BlockLoad::Loaded => {}
+                BlockLoad::Eof => return Ok(TryRead::Ready(None)),
+                BlockLoad::WouldBlock => return Ok(TryRead::WouldBlock),
+            }
+        }
+        // Fast path: the entire record lives in the current block → parse in
+        // place with a single copy of the body into `out`.
+        let header = key_size + 4;
+        if parser.remaining() >= header {
+            let p = parser.current_pos;
+            let len = u32::from_le_bytes(
+                parser.current_buf[p + key_size..p + header].try_into().expect("4-byte slice"),
+            ) as usize;
+            if parser.remaining() >= header + len {
+                out.clear();
+                out.extend_from_slice(&parser.current_buf[p + header..p + header + len]);
+                let key = slot_parse_key::<K>(&parser.current_buf[p..p + key_size], out)?;
+                parser.current_pos += header + len;
+                return Ok(TryRead::Ready(Some(key)));
+            }
+        }
+        // Slow path: record spans a block boundary (or fewer than `header`
+        // bytes remain). Begin a resumable pending record.
+        parser.pending = Some(PendingRecord { key_size, ..PendingRecord::default() });
+    }
+
+    slot_collect_pending::<K>(slot, parser, out)
+}
+
+/// Resumable continuation of [`slot_try_next_record`]'s slow path. Collects the
+/// key prefix (if any), the 4-byte length prefix, then the body across as many
+/// blocks as needed, returning `WouldBlock` (state retained in
+/// `parser.pending`) whenever the next block isn't ready yet.
+fn slot_collect_pending<K: RawSortKey + Default + 'static>(
+    slot: &Arc<crate::merge_slots::SortMergeSlot>,
+    parser: &mut SlotParserState,
+    out: &mut Vec<u8>,
+) -> Result<TryRead<K>> {
+    // Stage 0: key prefix (non-embedded keys only; `key_size == 0` is a no-op).
+    loop {
+        let (key_size, key_have) = {
+            let pending = parser.pending.as_ref().expect("pending set");
+            (pending.key_size, pending.key_buf.len())
+        };
+        let need = key_size - key_have;
+        if need == 0 {
+            break;
+        }
+        if parser.current_pos == parser.current_buf.len() {
+            match slot_try_load_block(slot, parser)? {
+                BlockLoad::Loaded => {}
+                BlockLoad::Eof => anyhow::bail!(
+                    "truncated record key in slot {} ({key_have} of {key_size} key bytes at EOF)",
+                    slot.file_id,
+                ),
+                BlockLoad::WouldBlock => return Ok(TryRead::WouldBlock),
+            }
+        }
+        let avail = parser.current_buf.len() - parser.current_pos;
+        let take = need.min(avail);
+        let src = &parser.current_buf[parser.current_pos..parser.current_pos + take];
+        parser.pending.as_mut().expect("pending set").key_buf.extend_from_slice(src);
+        parser.current_pos += take;
+    }
+
+    // Stage 1: length prefix.
+    loop {
+        let len_got = parser.pending.as_ref().expect("pending set").len_got;
+        if len_got == 4 {
+            break;
+        }
+        if parser.current_pos == parser.current_buf.len() {
+            match slot_try_load_block(slot, parser)? {
+                BlockLoad::Loaded => {}
+                BlockLoad::Eof => anyhow::bail!(
+                    "truncated record length in slot {} ({len_got} of 4 length bytes at EOF)",
+                    slot.file_id,
+                ),
+                BlockLoad::WouldBlock => return Ok(TryRead::WouldBlock),
+            }
+        }
+        let avail = parser.current_buf.len() - parser.current_pos;
+        let take = (4 - len_got).min(avail);
+        let src = &parser.current_buf[parser.current_pos..parser.current_pos + take];
+        let pending = parser.pending.as_mut().expect("pending set");
+        pending.len_buf[len_got..len_got + take].copy_from_slice(src);
+        pending.len_got += take;
+        parser.current_pos += take;
+    }
+
+    // Compute body length once and reset `out` for accumulation.
+    {
+        let pending = parser.pending.as_mut().expect("pending set");
+        if pending.body_len.is_none() {
+            let len = u32::from_le_bytes(pending.len_buf) as usize;
+            // The prefix is untrusted — it comes straight off a decompressed
+            // spill block — and the next statement hands it to `reserve`, which
+            // answers an allocation failure by aborting the process rather than
+            // returning an error. Bound it first, so a corrupt slot surfaces
+            // `Err` like the `decomp_error` and truncation arms do. The ceiling
+            // is the one a single record already cannot exceed: a record must
+            // fit within one sort segment (see `SORT_SEGMENT_SIZE`).
+            anyhow::ensure!(
+                len <= crate::inline::SORT_SEGMENT_SIZE,
+                "implausible record length {len} in slot {} (exceeds the \
+                 {}-byte segment a single record must fit in)",
+                slot.file_id,
+                crate::inline::SORT_SEGMENT_SIZE,
+            );
+            pending.body_len = Some(len);
+            out.clear();
+            out.reserve(len);
+        }
+    }
+
+    // Stage 2: body.
+    loop {
+        let body_len = parser.pending.as_ref().expect("pending set").body_len.expect("len known");
+        if out.len() >= body_len {
+            break;
+        }
+        if parser.current_pos == parser.current_buf.len() {
+            match slot_try_load_block(slot, parser)? {
+                BlockLoad::Loaded => {}
+                BlockLoad::Eof => anyhow::bail!(
+                    "truncated record body in slot {} ({} of {body_len} bytes at EOF)",
+                    slot.file_id,
+                    out.len(),
+                ),
+                BlockLoad::WouldBlock => return Ok(TryRead::WouldBlock),
+            }
+        }
+        let avail = parser.current_buf.len() - parser.current_pos;
+        let take = (body_len - out.len()).min(avail);
+        out.extend_from_slice(&parser.current_buf[parser.current_pos..parser.current_pos + take]);
+        parser.current_pos += take;
+    }
+
+    let key = {
+        let pending = parser.pending.as_ref().expect("pending set");
+        slot_parse_key::<K>(&pending.key_buf, out)?
+    };
+    parser.pending = None;
+    Ok(TryRead::Ready(Some(key)))
+}
+
+/// Merge source for the slot-backed `MergeDriver`: either a decompressing slot
+/// (read non-blocking) or an already-sorted in-memory residual chunk.
+enum SlotMergeSource<K: RawSortKey + Default + 'static> {
+    /// Pipeline-integrated source — `SortSpillDecompress` fills
+    /// `slot.decompressed` with decompressed blocks; this driver reads them
+    /// in-order via the per-source [`SlotParserState`].
+    Slot { slot: Arc<crate::merge_slots::SortMergeSlot>, parser: SlotParserState },
+    /// In-memory sorted residual records from a queryname-style sort (each
+    /// record an owned `RawRecord`). Read via a zero-copy `mem::swap` bridge.
+    Memory { records: Vec<(K, fgumi_raw_bam::RawRecord)>, idx: usize },
+    /// In-memory sorted residual from an inline-buffer (coordinate / template)
+    /// sort, sharing an `Arc<SegmentedBuf>` — zero per-record allocation. Read
+    /// copies each record's bytes into the caller's reused `buf`.
+    MemoryShared { chunk: InMemoryChunk<K>, idx: usize },
+}
+
+impl<K: RawSortKey + Default + 'static> SlotMergeSource<K> {
+    /// Non-blocking read of the next record into `buf`, returning the sort key.
+    /// `Slot` sources may return `WouldBlock`; `Memory` always returns `Ready`.
+    fn try_next_record(&mut self, buf: &mut Vec<u8>) -> Result<TryRead<K>> {
+        match self {
+            SlotMergeSource::Slot { slot, parser } => slot_try_next_record::<K>(slot, parser, buf),
+            SlotMergeSource::Memory { records, idx } => {
+                if *idx < records.len() {
+                    let (ref mut key, ref mut data) = records[*idx];
+                    // Bridge: RawRecord wraps Vec<u8>; swap via the inner vec to
+                    // avoid re-allocating. The caller's buf is a plain Vec<u8>.
+                    std::mem::swap(buf, data.as_mut_vec());
+                    let key = std::mem::take(key);
+                    *idx += 1;
+                    Ok(TryRead::Ready(Some(key)))
+                } else {
+                    Ok(TryRead::Ready(None))
+                }
+            }
+            SlotMergeSource::MemoryShared { chunk, idx } => {
+                if *idx < chunk.len() {
+                    // Bytes are borrowed from the shared `Arc<SegmentedBuf>`, so
+                    // copy them into the caller's reused `buf` (one memcpy, no
+                    // per-record allocation — the materialise-time copy is gone).
+                    buf.clear();
+                    buf.extend_from_slice(chunk.record_bytes(*idx));
+                    let key = chunk.take_key(*idx);
+                    *idx += 1;
+                    Ok(TryRead::Ready(Some(key)))
+                } else {
+                    Ok(TryRead::Ready(None))
+                }
+            }
+        }
+    }
+}
+
+/// One step of a non-blocking k-way merge.
+pub enum MergeStep<'a> {
+    /// The next merged record. The bytes borrow the driver's internal winner
+    /// buffer and are valid only until the next `try_step` call — the caller
+    /// must copy them out before stepping again. The borrow checker enforces
+    /// this, which is what makes the deferred-refill protocol sound.
+    Produced(&'a [u8]),
+    /// A source's decompressed queue is momentarily empty (and not at EOF), or
+    /// a source hasn't been primed yet. No record is available right now; the
+    /// caller should yield and retry on a later dispatch, by which point the
+    /// producer will have refilled the slot.
+    Stalled,
+    /// The merge is exhausted.
+    Done,
+}
+
+impl std::fmt::Debug for MergeStep<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Produced(bytes) => write!(f, "Produced({} bytes)", bytes.len()),
+            Self::Stalled => f.write_str("Stalled"),
+            Self::Done => f.write_str("Done"),
+        }
+    }
+}
+
+/// Object-safe view over `MergeDriver<K>` so the pipeline `SortMerge` step can
+/// hold a single concrete type regardless of sort order.
+pub trait MergeDriverDyn: Send {
+    /// Produce the next merged record **without blocking**. Any step that needs
+    /// a not-yet-ready slot block returns [`MergeStep::Stalled`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates spill-file corruption or decompression errors from the
+    /// underlying slot sources.
+    fn try_step(&mut self) -> Result<MergeStep<'_>>;
+    /// Total records emitted since the driver was constructed.
+    fn records_merged(&self) -> u64;
+}
+
+/// Internal phase of the [`MergeDriver`] non-blocking state machine.
+enum MergePhase<K> {
+    /// Lazily priming the loser tree: each source's first record is pulled one
+    /// at a time (non-blocking). `next` is the index of the next source to
+    /// prime; `keys` accumulates the primed initial keys; `rec` is the partial
+    /// record buffer for the source currently being primed (retained across a
+    /// `Stalled` so a spanning first record resumes correctly).
+    Priming { next: usize, keys: Vec<K>, rec: Vec<u8> },
+    /// Active k-way merge. `pending_refill` is set after a record is emitted
+    /// (`Produced`) and means the winner's source must be refilled before the
+    /// next winner is produced.
+    Merging { tree: crate::loser_tree::LoserTree<K>, pending_refill: bool },
+    /// Exhausted.
+    Done,
+}
+
+/// Pausable state machine for a non-blocking k-way merge over slot + in-memory
+/// sources. Constructed via [`MergeDriver::from_slots`]; driven by the pipeline
+/// `SortMerge` step via [`MergeDriverDyn::try_step`].
+pub struct MergeDriver<K: RawSortKey + Default + Send + 'static> {
+    sources: Vec<SlotMergeSource<K>>,
+    /// Per-active-source current record buffer, indexed by loser-tree leaf
+    /// (parallel to `source_map`). Grows during `Priming`.
+    records: Vec<Vec<u8>>,
+    /// Loser-tree leaf → `sources` index. Built during `Priming`.
+    source_map: Vec<usize>,
+    /// Non-blocking merge state machine.
+    phase: MergePhase<K>,
+    records_merged: u64,
+    progress: ProgressTracker,
+}
+
+impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
+    /// Construct a driver from `SortMergeSlot`s and already-sorted in-memory
+    /// chunks. Used by the cooperative pipeline `SortMerge` step.
+    ///
+    /// Each slot becomes a slot source read **non-blocking** by
+    /// [`MergeDriverDyn::try_step`]. Priming is **lazy**: the loser tree is
+    /// built on the first `try_step` call(s) as each source yields its first
+    /// record, so construction never blocks on a not-yet-decompressed slot.
+    /// Construction is infallible (read errors surface from `try_step`), and
+    /// the empty-input case is reported by the first `try_step` returning
+    /// [`MergeStep::Done`].
+    #[must_use]
+    pub fn from_slots(
+        slots: Vec<Arc<crate::merge_slots::SortMergeSlot>>,
+        memory: MemorySources<K>,
+        total_records: u64,
+    ) -> Self {
+        let num_slots = slots.len();
+        let num_memory = memory.num_non_empty();
+        let num_sources = num_slots + num_memory;
+
+        if num_slots > 0 {
+            info!(
+                "Pipeline-integrated merge: {num_slots} slot sources + {num_memory} memory sources"
+            );
+        }
+
+        let mut sources: Vec<SlotMergeSource<K>> = Vec::with_capacity(num_sources);
+        // Order by `file_id`, do not trust the caller's `Vec` order. `file_id`
+        // is documented on `SortMergeSlot` as the stable merge-order identity,
+        // and the `LoserTree` breaks ties between equal sort keys by leaf index
+        // — so if the leaf order came from push order instead, two records with
+        // the same key could be emitted in a different order than the legacy
+        // chunk-files path produces. That is an output-identity divergence in a
+        // tool whose sort output is checked byte-for-byte, and it would be
+        // invisible except on inputs that happen to contain ties. Sorting a
+        // handful of slots once per merge costs nothing next to that.
+        let mut slots = slots;
+        slots.sort_by_key(|s| s.file_id);
+        for slot in slots {
+            sources.push(SlotMergeSource::Slot { slot, parser: SlotParserState::new() });
+        }
+        match memory {
+            MemorySources::Owned(chunks) => {
+                for chunk in chunks {
+                    if !chunk.is_empty() {
+                        sources.push(SlotMergeSource::Memory { records: chunk, idx: 0 });
+                    }
+                }
+            }
+            MemorySources::Shared(chunks) => {
+                for chunk in chunks {
+                    if !chunk.is_empty() {
+                        sources.push(SlotMergeSource::MemoryShared { chunk, idx: 0 });
+                    }
+                }
+            }
+        }
+
+        let progress = ProgressTracker::new("Merged records")
+            .with_interval(1_000_000)
+            .with_total(total_records);
+
+        Self {
+            sources,
+            records: Vec::with_capacity(num_sources),
+            source_map: Vec::with_capacity(num_sources),
+            // Lazy priming: tree built on first try_step as sources yield.
+            phase: MergePhase::Priming {
+                next: 0,
+                keys: Vec::with_capacity(num_sources),
+                rec: Vec::new(),
+            },
+            records_merged: 0,
+            progress,
+        }
+    }
+}
+
+impl<K: RawSortKey + Default + Send + 'static> MergeDriverDyn for MergeDriver<K> {
+    fn try_step(&mut self) -> Result<MergeStep<'_>> {
+        // Move the phase out so the body works with owned `tree`/`keys`/`rec`
+        // and can borrow `self.{sources,records,source_map}` freely without
+        // aliasing the phase; the phase is written back before every return.
+        // `Done` is the placeholder; any early `?` leaves the driver `Done`,
+        // which is safe because the whole merge aborts on error.
+        loop {
+            match std::mem::replace(&mut self.phase, MergePhase::Done) {
+                MergePhase::Priming { mut next, mut keys, mut rec } => {
+                    let mut stalled = false;
+                    while next < self.sources.len() {
+                        match self.sources[next].try_next_record(&mut rec)? {
+                            TryRead::WouldBlock => {
+                                stalled = true;
+                                break;
+                            }
+                            TryRead::Ready(Some(key)) => {
+                                keys.push(key);
+                                self.records.push(std::mem::take(&mut rec));
+                                self.source_map.push(next);
+                                next += 1;
+                            }
+                            TryRead::Ready(None) => {
+                                rec.clear();
+                                next += 1;
+                            }
+                        }
+                    }
+                    if stalled {
+                        self.phase = MergePhase::Priming { next, keys, rec };
+                        return Ok(MergeStep::Stalled);
+                    }
+                    if keys.is_empty() {
+                        return Ok(MergeStep::Done);
+                    }
+                    info!("Merging from {} sources...", keys.len());
+                    let tree = crate::loser_tree::LoserTree::new(keys);
+                    self.phase = MergePhase::Merging { tree, pending_refill: false };
+                    // Loop to emit the first winner.
+                }
+                MergePhase::Merging { mut tree, pending_refill } => {
+                    // Resolve the refill deferred from the previous `Produced`
+                    // (the read that would overwrite the just-emitted winner's
+                    // buffer). On `WouldBlock`, yield with the refill still
+                    // pending.
+                    if pending_refill && tree.winner_is_active() {
+                        let winner = tree.winner();
+                        let src = self.source_map[winner];
+                        match self.sources[src].try_next_record(&mut self.records[winner])? {
+                            TryRead::WouldBlock => {
+                                self.phase = MergePhase::Merging { tree, pending_refill: true };
+                                return Ok(MergeStep::Stalled);
+                            }
+                            TryRead::Ready(Some(key)) => tree.replace_winner(key),
+                            TryRead::Ready(None) => tree.remove_winner(),
+                        }
+                    }
+                    if !tree.winner_is_active() {
+                        return Ok(MergeStep::Done);
+                    }
+                    let winner = tree.winner();
+                    self.records_merged += 1;
+                    self.progress.log_if_needed(1);
+                    // Defer this winner's refill to the next call so the
+                    // returned borrow stays valid until the caller copies it.
+                    self.phase = MergePhase::Merging { tree, pending_refill: true };
+                    return Ok(MergeStep::Produced(&self.records[winner]));
+                }
+                MergePhase::Done => return Ok(MergeStep::Done),
+            }
+        }
+    }
+
+    fn records_merged(&self) -> u64 {
+        self.records_merged
+    }
+}
+
+impl<K: RawSortKey + Default + Send + 'static> Drop for MergeDriver<K> {
+    fn drop(&mut self) {
+        self.progress.log_final();
+    }
 }
 
 #[cfg(test)]
@@ -7741,6 +7197,163 @@ mod tests {
     }
 
     #[test]
+    fn test_raw_sorter_phase_threads_builders() {
+        let new = || RawExternalSorter::new(SortOrder::Coordinate).threads(8);
+        // Default: both phases fall back to threads.
+        let base = new();
+        assert_eq!((base.sort_threads, base.merge_threads), (None, None));
+        assert_eq!((base.phase1_threads(), base.phase2_threads()), (8, 8));
+        // sort_threads overrides only Phase 1.
+        let sort_only = new().sort_threads(2);
+        assert_eq!((sort_only.phase1_threads(), sort_only.phase2_threads()), (2, 8));
+        // The public `num_threads()` accessor returns the BASE count, unaffected
+        // by the Phase-1 override — so the streaming front must read
+        // `phase1_threads()`, not `num_threads()`, to honor `--sort-threads`
+        // (the D1.1 regression was reading the base here). Pin the distinction.
+        assert_eq!(sort_only.num_threads(), 8);
+        assert_eq!(sort_only.phase1_threads(), 2);
+        // merge_threads overrides only Phase 2.
+        let merge_only = new().merge_threads(3);
+        assert_eq!((merge_only.phase1_threads(), merge_only.phase2_threads()), (8, 3));
+        // Both override independently.
+        let both = new().sort_threads(2).merge_threads(16);
+        assert_eq!((both.phase1_threads(), both.phase2_threads()), (2, 16));
+        // Clamp to >= 1.
+        let zero = new().sort_threads(0).merge_threads(0);
+        assert_eq!((zero.phase1_threads(), zero.phase2_threads()), (1, 1));
+    }
+
+    /// Read every record's raw bytes from a BAM, in file order.
+    fn records_bytes(path: &Path) -> Vec<Vec<u8>> {
+        let (mut reader, _h) = create_raw_bam_reader(path, 1).expect("open bam");
+        let mut out = Vec::new();
+        let mut rec = fgumi_raw_bam::RawRecord::new();
+        while reader.read_record(&mut rec).expect("read record") != 0 {
+            out.push(rec.view().as_bytes().to_vec());
+        }
+        out
+    }
+
+    /// Splitting Phase-1 (`sort_threads`) and Phase-2 (`merge_threads`) from the
+    /// base `threads` is a pure scheduling knob: output must be byte-identical to
+    /// the unsplit sort, with spills forced. Matrixed over every order (`#[values]`)
+    /// and every thread-split variant (`#[case]`) so a failure names the exact order
+    /// and split. The cases mirror the prior inline matrix: `sort_low` (Phase-1 on
+    /// 1), `merge_low` (Phase-2 on 1), `both` (Phase-1 on 1 / Phase-2 on 2), and
+    /// `sort_high` (Phase-1 above base).
+    #[rstest::rstest]
+    #[case::sort_low(Some(1), None)]
+    #[case::merge_low(None, Some(1))]
+    #[case::both(Some(1), Some(2))]
+    #[case::sort_high(Some(8), Some(2))]
+    fn phase_thread_split_is_byte_identical(
+        #[values(
+            SortOrder::Coordinate,
+            SortOrder::Queryname(QuerynameComparator::Natural),
+            SortOrder::Queryname(QuerynameComparator::Lexicographic),
+            SortOrder::TemplateCoordinate
+        )]
+        order: SortOrder,
+        #[case] sort_t: Option<usize>,
+        #[case] merge_t: Option<usize>,
+    ) {
+        use fgumi_sam::SamBuilder;
+        let mut builder = SamBuilder::new();
+        for i in 0..2000 {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i}"))
+                .start1(i * 50 + 1)
+                .start2(i * 50 + 101)
+                .build();
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("in.bam");
+        builder.write_bam(&input).expect("write bam");
+
+        let mk = |out: &Path, sort_t: Option<usize>, merge_t: Option<usize>| {
+            let mut s = RawExternalSorter::new(order)
+                .threads(4)
+                .memory_limit(32 * 1024) // force spills
+                .spill_codec(crate::codec::SpillCodec::Bgzf)
+                .temp_compression(0)
+                .output_compression(0);
+            if let Some(j) = sort_t {
+                s = s.sort_threads(j);
+            }
+            if let Some(k) = merge_t {
+                s = s.merge_threads(k);
+            }
+            s.sort(&input, out).expect("sort");
+        };
+        // Base: both phases on the unsplit `threads(4)`.
+        let base = dir.path().join("base.bam");
+        mk(&base, None, None);
+        let golden = records_bytes(&base);
+        // The split variant must reproduce the base output exactly.
+        let out = dir.path().join("variant.bam");
+        mk(&out, sort_t, merge_t);
+        assert_eq!(
+            records_bytes(&out),
+            golden,
+            "order {order:?} split sort_t={sort_t:?} merge_t={merge_t:?}: \
+             thread split must not change output"
+        );
+    }
+
+    /// Regression guard for the residual Phase-1 sort honoring `sort_threads`
+    /// rather than the base `threads`. With `threads(1).sort_threads(4)` the
+    /// residual sort/chunk decision must take the *parallel* `phase1_threads()`
+    /// branch (previously it gated on `threads`, so it ran serially and ignored
+    /// `sort_threads`). Spills are forced so the keyed-chunk residual path
+    /// (`chunk_files` non-empty) is exercised; output must be byte-identical to
+    /// the serial `threads(1)` sort for every order.
+    #[rstest::rstest]
+    #[case::coordinate(SortOrder::Coordinate)]
+    #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
+    #[case::queryname_lex(SortOrder::Queryname(QuerynameComparator::Lexicographic))]
+    #[case::template_coordinate(SortOrder::TemplateCoordinate)]
+    fn residual_phase1_honors_sort_threads_with_single_base_thread(#[case] order: SortOrder) {
+        use fgumi_sam::SamBuilder;
+        let mut builder = SamBuilder::new();
+        for i in 0..2000 {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i}"))
+                .start1(i * 50 + 1)
+                .start2(i * 50 + 101)
+                .build();
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("in.bam");
+        builder.write_bam(&input).expect("write bam");
+
+        let mk = |out: &Path, sort_t: Option<usize>| {
+            let mut s = RawExternalSorter::new(order)
+                .threads(1)
+                .memory_limit(32 * 1024) // force spills -> exercise residual chunk path
+                .spill_codec(crate::codec::SpillCodec::Bgzf)
+                .temp_compression(0)
+                .output_compression(0);
+            if let Some(j) = sort_t {
+                s = s.sort_threads(j);
+            }
+            s.sort(&input, out).expect("sort");
+        };
+        let serial = dir.path().join("serial.bam");
+        mk(&serial, None); // threads(1): residual sort runs serially
+        let golden = records_bytes(&serial);
+
+        let parallel = dir.path().join("parallel.bam");
+        mk(&parallel, Some(4)); // sort_threads(4): residual sort now parallel
+        assert_eq!(
+            records_bytes(&parallel),
+            golden,
+            "order {order:?}: threads(1).sort_threads(4) must match the serial sort output"
+        );
+    }
+
+    #[test]
     fn test_raw_sorter_memory_limit() {
         let sorter = RawExternalSorter::new(SortOrder::Coordinate).memory_limit(256 * 1024 * 1024);
         assert_eq!(sorter.memory_limit, 256 * 1024 * 1024);
@@ -7750,168 +7363,6 @@ mod tests {
     fn test_raw_sorter_temp_compression() {
         let sorter = RawExternalSorter::new(SortOrder::Coordinate).temp_compression(0);
         assert_eq!(sorter.temp_compression, 0);
-    }
-
-    /// `--sort-stats` is run-scoped: off by default on a fresh sorter (a plain `fgumi sort`
-    /// prints none of the ~99 diagnostic lines) and set per-sorter through the builder, so two
-    /// sorts in one process keep independent settings without any process-global flag.
-    #[test]
-    fn test_raw_sorter_sort_stats_default_off_and_builder() {
-        let sorter = RawExternalSorter::new(SortOrder::Coordinate);
-        assert!(!sorter.sort_stats, "sort stats must default to off");
-        assert!(sorter.sort_stats(true).sort_stats);
-        assert!(!RawExternalSorter::new(SortOrder::Coordinate).sort_stats(false).sort_stats);
-    }
-
-    /// End-to-end run-scoped `--sort-stats`: a spilling, consolidating,
-    /// k-way-merged sort with `sort_stats(true)` drives the diagnostic emitters
-    /// (phase timing, the Phase 1 ingest floor with its reader/ingest partitions,
-    /// and the merge sub-phase / consumer-CPU reporting) through the real path
-    /// rather than a hand-built struct.
-    ///
-    /// Two details make the diagnostic expressions actually execute: the record
-    /// count clears the 1-in-1021 ingest sampler so the ingest partition has
-    /// samples, and the max log level is raised to `Info` so `stat!`'s inner
-    /// `log::info!` evaluates and formats its arguments (with the default no-op
-    /// logger the formatted record is discarded, but every diagnostic expression
-    /// still runs -- which is exactly the run-scoped path under test). A sort with
-    /// the flag off leaves those expressions unevaluated.
-    ///
-    /// `--sort-stats` is diagnostics-only, so both settings must sort the same
-    /// records to the same output -- asserted here, not merely that the emitters
-    /// did not panic.
-    #[test]
-    fn test_sort_stats_true_drives_diagnostics_through_a_spilling_merge() {
-        use fgumi_sam::SamBuilder;
-
-        // Above INGEST_SAMPLE_INTERVAL (1021 records) so the ingest sampler fires;
-        // descending coordinates yield many chunks under the tiny memory limit.
-        let num_pairs = 2000;
-        let mut builder = SamBuilder::new();
-        for i in 0..num_pairs {
-            let descending = num_pairs - 1 - i;
-            let _ = builder
-                .add_pair()
-                .name(&format!("read{descending:06}"))
-                .start1(descending * 200 + 1)
-                .start2(descending * 200 + 101)
-                .build();
-        }
-        let dir = tempfile::tempdir().expect("failed to create temp directory");
-        let input = dir.path().join("input.bam");
-        builder.write_bam(&input).expect("failed to write BAM");
-
-        // Info so the `stat!` emitters evaluate (and format) their arguments.
-        log::set_max_level(log::LevelFilter::Info);
-
-        let run = |out: &Path, stats_on: bool| {
-            RawExternalSorter::new(SortOrder::Coordinate)
-                .memory_limit(1024) // 1 KB — forces many chunks
-                .max_temp_files(4) // forces consolidation + a k-way merge
-                .output_compression(0)
-                .threads(4) // parallel Phase 1 exercises deferred key extraction
-                .sort_stats(stats_on)
-                .sort(input.as_path(), out)
-                .expect("sort should succeed")
-        };
-
-        let out_on = dir.path().join("stats_on.bam");
-        let out_off = dir.path().join("stats_off.bam");
-        let stats_on = run(&out_on, true);
-        run(&out_off, false);
-
-        // A real spilling merge actually ran, so the merge diagnostics were reached.
-        assert!(
-            stats_on.runs_written >= 5,
-            "expected a spilling merge to exercise the diagnostics, got {} runs",
-            stats_on.runs_written
-        );
-
-        // Diagnostics-only: the flag must not change what the sort produces.
-        let expected = (num_pairs * 2) as u64;
-        assert_eq!(count_bam_records(&out_on), expected, "records lost with --sort-stats on");
-        assert_eq!(
-            count_bam_records(&out_off),
-            expected,
-            "sort_stats must not change the sorted output"
-        );
-    }
-
-    /// `log_consumer_stalls` renders a distinct `Shape:` line for each
-    /// [`crate::merge_stalls::StallShape`] the classifier can return. A real merge
-    /// lands on exactly one shape, and which one is timing-dependent, so driving
-    /// the emitter through every arm here both pins the `classify_stall` -> shape
-    /// mapping (the real behavior asserted) and exercises each `stat!(sort_stats,
-    /// ...)` arm run-scoped. Info level is raised so the emitter formats its
-    /// arguments (the no-op logger discards the record).
-    #[rstest::rstest]
-    #[case::not_stalled(0.1, 0.0, 0.5, 0.0, 0.0, 0.0, crate::merge_stalls::StallShape::NotStalled)]
-    #[case::contended(5.0, 0.4, 0.5, 0.0, 0.0, 0.0, crate::merge_stalls::StallShape::Contended)]
-    #[case::pool_saturated(
-        5.0,
-        0.0,
-        0.9,
-        0.0,
-        0.0,
-        0.0,
-        crate::merge_stalls::StallShape::PoolSaturated
-    )]
-    #[case::head_of_line(5.0, 0.0, 0.5, 0.6, 0.0, 0.0, crate::merge_stalls::StallShape::HeadOfLine)]
-    #[case::work_unclaimed(
-        5.0,
-        0.0,
-        0.5,
-        0.0,
-        0.6,
-        0.0,
-        crate::merge_stalls::StallShape::WorkUnclaimed
-    )]
-    #[case::decompress_latency(
-        5.0,
-        0.0,
-        0.5,
-        0.0,
-        0.0,
-        0.6,
-        crate::merge_stalls::StallShape::DecompressLatency
-    )]
-    #[case::mixed(5.0, 0.0, 0.5, 0.0, 0.0, 0.0, crate::merge_stalls::StallShape::Mixed)]
-    fn test_log_consumer_stalls_renders_every_shape(
-        #[case] park_secs: f64,
-        #[case] contended_share: f64,
-        #[case] utilization: f64,
-        #[case] starved: f64,
-        #[case] raw_queued: f64,
-        #[case] decompressing: f64,
-        #[case] expected: crate::merge_stalls::StallShape,
-    ) {
-        use crate::merge_stalls::{AwaitedShares, ConsumerStallReport, classify_stall};
-
-        log::set_max_level(log::LevelFilter::Info);
-        let loop_total = 10.0;
-        let awaited = AwaitedShares { decompressing, raw_queued, starved, ..Default::default() };
-        let report = ConsumerStallReport {
-            block_pulls: 10,
-            stalled_pulls: 5,
-            parks: 8,
-            park_secs,
-            capped_share: 0.1,
-            starved_share: 0.1,
-            contended_share,
-            awaited,
-            censuses: 4, // > 0 so the per-file census rows render too
-            top_source: 1,
-            top_source_park_secs: 2.0,
-            sources_parked_on: 3,
-        };
-
-        // The classifier maps these inputs to the expected shape ...
-        assert_eq!(
-            classify_stall(park_secs / loop_total, utilization, contended_share, awaited),
-            expected
-        );
-        // ... and the emitter renders that arm run-scoped, without panicking.
-        RawExternalSorter::log_consumer_stalls(loop_total, utilization, report, true);
     }
 
     /// `RawExternalSorter::sort` rejects `temp_compression=0` + `SpillCodec::Zstd`
@@ -8416,76 +7867,6 @@ mod tests {
         aux.extend_from_slice(value);
         aux.push(0); // null terminator
         aux
-    }
-
-    /// Build `MC:Z:<value>` aux tag bytes.
-    fn mc_aux(value: &[u8]) -> Vec<u8> {
-        let mut aux = Vec::new();
-        aux.extend_from_slice(b"MCZ");
-        aux.extend_from_slice(value);
-        aux.push(0); // null terminator
-        aux
-    }
-
-    /// Overwrite the mate position of a record built by `build_mapped_bam`,
-    /// which otherwise sets it equal to the record's own position.
-    fn with_mate_pos(mut bam: Vec<u8>, mate_pos: i32) -> Vec<u8> {
-        bam[24..28].copy_from_slice(&mate_pos.to_le_bytes());
-        bam
-    }
-
-    /// The mate lane resolves through `MC`, and it lands where a record whose
-    /// mate is already at the unclipped position lands.
-    ///
-    /// The template-coordinate key is output-identity-critical against
-    /// `samtools sort`, and the mate lane is the one part of it that comes from
-    /// parsing a tag rather than from a fixed field offset. Asserting the two
-    /// keys are equal pins the whole lane -- packing included -- rather than
-    /// just the parser, which `cigar.rs` already covers.
-    #[test]
-    fn test_extract_template_key_mate_lane_comes_from_mc() {
-        let header = Header::builder().build();
-        let lib_lookup = LibraryLookup::from_header(&header);
-
-        // Mate at 100 with 10 leading soft clips: unclipped 5' is 90.
-        let with_mc = with_mate_pos(build_mapped_bam(0, 50, b"read1", &mc_aux(b"10S40M")), 100);
-        // The same record whose mate is already reported at 90, and no MC to parse.
-        let without_mc = with_mate_pos(build_mapped_bam(0, 50, b"read1", &[]), 90);
-
-        let keyed = extract_template_key_inline(&with_mc, &lib_lookup, None, &test_cb_hasher());
-        let expected =
-            extract_template_key_inline(&without_mc, &lib_lookup, None, &test_cb_hasher());
-        assert_eq!(keyed, expected, "MC-derived mate lane must equal the unclipped position");
-    }
-
-    /// A non-UTF-8 `MC` reaches the parser and its valid prefix still sets the
-    /// mate lane.
-    ///
-    /// Extraction hands `MC` over as raw bytes rather than validating it as
-    /// UTF-8 first, so this value is parsed where it was previously discarded
-    /// (leaving the mate lane at the raw mate position). This pins the change at
-    /// the key level, which is the level the sort order is defined at.
-    #[test]
-    fn test_extract_template_key_mate_lane_parses_a_non_utf8_mc_prefix() {
-        let header = Header::builder().build();
-        let lib_lookup = LibraryLookup::from_header(&header);
-
-        let with_bad_mc =
-            with_mate_pos(build_mapped_bam(0, 50, b"read1", &mc_aux(b"10S40M\xff")), 100);
-        let unclipped = with_mate_pos(build_mapped_bam(0, 50, b"read1", &[]), 90);
-        let raw_mate = with_mate_pos(build_mapped_bam(0, 50, b"read1", &[]), 100);
-
-        let keyed = extract_template_key_inline(&with_bad_mc, &lib_lookup, None, &test_cb_hasher());
-        assert_eq!(
-            keyed,
-            extract_template_key_inline(&unclipped, &lib_lookup, None, &test_cb_hasher()),
-            "the valid CIGAR prefix must still be applied"
-        );
-        assert_ne!(
-            keyed,
-            extract_template_key_inline(&raw_mate, &lib_lookup, None, &test_cb_hasher()),
-            "discarding the tag would leave the mate lane at the raw mate position"
-        );
     }
 
     #[test]
@@ -10006,6 +9387,31 @@ mod tests {
 
         assert_eq!(count, 40);
         assert_eq!(count_bam_records(&merged), 40);
+
+        // Verify template-coordinate order/identity via an independent oracle
+        // (mirrors `narrow_sort_output_passes_full_width_verify`): re-extract the
+        // template key from every merged record and assert non-decreasing core
+        // order. A count-only check would pass even if the merge reordered or
+        // duplicated records.
+        let (_, hdr) = create_raw_bam_reader(&merged, 1).expect("header");
+        let lib = LibraryLookup::from_header(&hdr);
+        let hasher = cb_hasher();
+        let file = std::fs::File::open(&merged).expect("open merged");
+        let mut raw_reader = crate::reader::RawBamRecordReader::new(file).expect("reader");
+        raw_reader.skip_header().expect("skip header");
+        let (total, violations, first) = crate::verify::verify_sort_order(
+            raw_reader,
+            |bam| extract_template_key_inline(bam, &lib, None, &hasher),
+            |cur: &TemplateKey40, prev: &TemplateKey40| {
+                cur.core_cmp(prev) == std::cmp::Ordering::Less
+            },
+        )
+        .expect("verify runs");
+        assert_eq!(total, 40, "verify must see every merged record");
+        assert_eq!(
+            violations, 0,
+            "template-coordinate order violated after merge (first={first:?}, total={total})"
+        );
     }
 
     #[test]
@@ -10160,7 +9566,7 @@ mod tests {
 
     #[test]
     fn test_sort_phase_timer_all_methods() {
-        let mut timer = SortPhaseTimer::new(false);
+        let mut timer = SortPhaseTimer::new();
         assert!(timer.overall_start.is_some());
         assert!(timer.read_span_start.is_some());
 
@@ -10224,7 +9630,7 @@ mod tests {
 
         // log_summary must not panic (output goes to log sink). `consolidate_count`
         // is 1 here, so the consolidation branch is exercised too.
-        timer.log_summary(4, 4, 64, &Phase1FloorInputs::default());
+        timer.log_summary(4, 4, 64);
     }
 
     // ========================================================================
@@ -11645,5 +11051,762 @@ mod tests {
                 "a completely-unmapped read in a single-library input must not trigger a \
                  false dropped-lane library violation",
             );
+    }
+}
+
+#[cfg(test)]
+mod from_slots_merge_tests {
+    //! Direct unit tests for the slot-backed `MergeDriver::from_slots` merge
+    //! driver: cross-block record parsing (incl. records spanning many blocks),
+    //! non-blocking stall/resume on empty-non-EOF slots, the embedded and
+    //! non-embedded sort-key arms, and memory-chunk mixing. Ported verbatim
+    //! from the issue-#330 source branch (the slimmed `from_slots` API is
+    //! identical at this layer). These exercise the parser/state-machine paths
+    //! that the end-to-end `three_step_chain_*` tests do not isolate.
+    use super::*;
+    use std::io::{BufReader, Read, Write};
+    use std::sync::Arc as StdArc;
+
+    #[derive(Default, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
+    struct TestKey(u64);
+
+    impl RawSortKey for TestKey {
+        const SERIALIZED_SIZE: Option<usize> = Some(8);
+        const EMBEDDED_IN_RECORD: bool = false;
+        fn extract(_bam: &[u8], _ctx: &crate::keys::SortContext) -> Self {
+            unimplemented!(
+                "TestKey is only used in MergeDriver::from_slots tests, not for ingestion"
+            )
+        }
+        fn write_to<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
+            w.write_all(&self.0.to_le_bytes())
+        }
+        fn read_from<R: Read>(r: &mut R) -> std::io::Result<Self> {
+            let mut buf = [0u8; 8];
+            r.read_exact(&mut buf)?;
+            Ok(TestKey(u64::from_le_bytes(buf)))
+        }
+    }
+
+    /// Serialize a sequence of `(TestKey, record_bytes)` pairs in the spill
+    /// file's wire format: `[key(8)][len(4)][record(len)]` per entry.
+    fn serialize_records(records: &[(TestKey, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (key, rec) in records {
+            key.write_to(&mut out).unwrap();
+            #[allow(clippy::cast_possible_truncation)]
+            let len = rec.len() as u32;
+            out.write_all(&len.to_le_bytes()).unwrap();
+            out.write_all(rec).unwrap();
+        }
+        out
+    }
+
+    /// Build a populated `SortMergeSlot` with `file_id` whose decompressed
+    /// queue contains `records` partitioned across `n_blocks` "blocks"
+    /// (so the slot parser exercises cross-block reads). Sets `queue_eof`
+    /// so the slot reports drained once consumer empties it.
+    fn populated_slot(
+        file_id: u32,
+        records: &[(TestKey, Vec<u8>)],
+        n_blocks: usize,
+    ) -> StdArc<SortMergeSlot> {
+        assert!(n_blocks >= 1, "n_blocks must be >= 1");
+        let bytes = serialize_records(records);
+        let block_size = bytes.len().div_ceil(n_blocks);
+        let slot = StdArc::new(SortMergeSlot::new(
+            file_id,
+            BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
+        ));
+        {
+            let mut dec = slot.decompressed.lock().unwrap();
+            for chunk in bytes.chunks(block_size) {
+                dec.push_back(chunk.to_vec());
+            }
+            slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
+        }
+        slot
+    }
+
+    /// Drive a `MergeDriver` to exhaustion via the non-blocking `try_step`,
+    /// returning the emitted record bytes in emission order.
+    ///
+    /// Tests validate ordering by inspecting the human-readable record bytes
+    /// (e.g. `b"AAA-1"`, `b"BBB-2"`) — the keys themselves are consumed by
+    /// the parser before the record is exposed, so we have no direct access to
+    /// them at this layer. These slots are pre-populated and EOF-marked before
+    /// the merge, so `try_step` never returns `Stalled` here.
+    fn drain_merge_driver_bytes<K: RawSortKey + Default + Send + 'static>(
+        mut driver: MergeDriver<K>,
+    ) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            match driver.try_step().expect("try_step") {
+                MergeStep::Produced(bytes) => out.push(bytes.to_vec()),
+                MergeStep::Done => break,
+                MergeStep::Stalled => panic!("unexpected Stalled on pre-populated EOF slots"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn from_slots_merges_three_pre_populated_slots() {
+        // Three slots, each with sorted records by TestKey. The merged output
+        // should be globally sorted.
+        let file0: Vec<(TestKey, Vec<u8>)> = vec![
+            (TestKey(1), b"AAA-1".to_vec()),
+            (TestKey(4), b"AAA-4".to_vec()),
+            (TestKey(7), b"AAA-7".to_vec()),
+        ];
+        let file1: Vec<(TestKey, Vec<u8>)> = vec![
+            (TestKey(2), b"BBB-2".to_vec()),
+            (TestKey(5), b"BBB-5".to_vec()),
+            (TestKey(8), b"BBB-8".to_vec()),
+        ];
+        let file2: Vec<(TestKey, Vec<u8>)> = vec![
+            (TestKey(3), b"CCC-3".to_vec()),
+            (TestKey(6), b"CCC-6".to_vec()),
+            (TestKey(9), b"CCC-9".to_vec()),
+        ];
+
+        let slots = vec![
+            populated_slot(0, &file0, 1),
+            populated_slot(1, &file1, 1),
+            populated_slot(2, &file2, 1),
+        ];
+
+        let driver = MergeDriver::<TestKey>::from_slots(slots, MemorySources::Owned(Vec::new()), 9);
+        let emitted_bytes = drain_merge_driver_bytes(driver);
+        let expected: Vec<Vec<u8>> = vec![
+            b"AAA-1".to_vec(),
+            b"BBB-2".to_vec(),
+            b"CCC-3".to_vec(),
+            b"AAA-4".to_vec(),
+            b"BBB-5".to_vec(),
+            b"CCC-6".to_vec(),
+            b"AAA-7".to_vec(),
+            b"BBB-8".to_vec(),
+            b"CCC-9".to_vec(),
+        ];
+        assert_eq!(emitted_bytes, expected, "merged sequence not globally sorted by key");
+    }
+
+    #[test]
+    fn from_slots_handles_records_spanning_block_boundaries() {
+        // Same data, but each slot's bytes are split across 4 "decompressed
+        // blocks" so the slot parser's read_exact + advance_to_next_block
+        // path is exercised. The key+len header itself may straddle a block
+        // boundary depending on byte counts.
+        let records: Vec<(TestKey, Vec<u8>)> = (0u64..20)
+            .map(|i| (TestKey(i), format!("record-{i:02}-with-some-padding").into_bytes()))
+            .collect();
+
+        let slots = vec![populated_slot(0, &records, 4)];
+        let driver =
+            MergeDriver::<TestKey>::from_slots(slots, MemorySources::Owned(Vec::new()), 20);
+        let emitted_bytes = drain_merge_driver_bytes(driver);
+        let expected: Vec<Vec<u8>> = records.into_iter().map(|(_, b)| b).collect();
+        assert_eq!(emitted_bytes, expected, "cross-block parse corrupted record sequence");
+    }
+
+    #[test]
+    fn from_slots_empty_sources_drain_to_zero_records() {
+        let empty_slot = StdArc::new(SortMergeSlot::new(
+            0,
+            BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
+        ));
+        // Mark drained without inserting any blocks.
+        empty_slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
+        // Lazy priming: `from_slots` always yields a driver; the empty
+        // determination happens on the first `try_step`, which returns `Done`.
+        let driver = MergeDriver::<TestKey>::from_slots(
+            vec![empty_slot],
+            MemorySources::Owned(Vec::new()),
+            0,
+        );
+        let emitted = drain_merge_driver_bytes(driver);
+        assert!(emitted.is_empty(), "all-empty merge must emit zero records");
+    }
+
+    /// The length prefix is untrusted: it comes straight off a decompressed
+    /// spill block. The slow path used to hand it to `out.reserve(len)` with no
+    /// check, so a corrupt slot could request up to 4 GiB — and `reserve`
+    /// answers an allocation failure by aborting the process, not by returning
+    /// the truncation error the next loop iteration would have produced.
+    ///
+    /// The length here is over the bound but still allocatable, so this test
+    /// discriminates on the *error message* rather than on surviving: before
+    /// the bound existed it reserved happily and then failed as a truncated
+    /// body, which is the wrong diagnosis for a corrupt length.
+    #[test]
+    fn implausible_record_length_is_rejected_before_reserving() {
+        let bogus_len = u32::try_from(crate::inline::SORT_SEGMENT_SIZE).unwrap() + 1;
+        let mut bytes = Vec::new();
+        TestKey(1).write_to(&mut bytes).unwrap();
+        bytes.write_all(&bogus_len.to_le_bytes()).unwrap();
+        bytes.write_all(b"only-a-few-body-bytes").unwrap();
+
+        let slot = StdArc::new(SortMergeSlot::new(
+            5,
+            BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
+        ));
+        slot.decompressed.lock().unwrap().push_back(bytes);
+        slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
+
+        let mut driver =
+            MergeDriver::<TestKey>::from_slots(vec![slot], MemorySources::Owned(Vec::new()), 1);
+        let err = driver.try_step().expect_err("an implausible length must surface as Err");
+        assert!(
+            err.to_string().contains("implausible record length") && err.to_string().contains('5'),
+            "the error must name the bad length and the slot; got: {err}",
+        );
+    }
+
+    /// An embedded key is read out of the record body itself, so an empty body
+    /// cannot carry one. `RawCoordinateKey::extract_from_record` reads `ref_id`
+    /// off the front, which on an empty body indexes out of bounds — a panic in
+    /// the middle of a merge rather than a corrupt-slot error. A zero length is
+    /// reachable from a corrupt length prefix: the body loop sees
+    /// `out.len() >= 0` and breaks immediately with `out` still empty.
+    #[test]
+    fn embedded_key_on_an_empty_body_is_an_error_not_a_panic() {
+        let err = slot_parse_key::<crate::keys::RawCoordinateKey>(&[], &[])
+            .expect_err("an empty body cannot carry an embedded key");
+        assert!(
+            err.to_string().contains("empty and cannot carry an embedded sort key"),
+            "the error must name the empty body; got: {err}",
+        );
+    }
+
+    /// Truncation at EOF must be an error, not a stall — at **every** stage of
+    /// the framer, not just the last one.
+    ///
+    /// Every other test either completes its record or stalls on a non-EOF slot,
+    /// so the three `BlockLoad::Eof` arms in `slot_collect_pending` were
+    /// unexercised. They are siblings: swapping any one for `WouldBlock` hangs
+    /// the pipeline forever on a truncated spill while the suite stays green, so
+    /// covering only the body arm left two of the three live.
+    ///
+    /// A serialized record is `[key(8)][len(4)][body(len)]`, so keeping 4 and 10
+    /// bytes lands mid-key and mid-length; `None` means "all but the last 5",
+    /// which lands mid-body.
+    #[rstest::rstest]
+    #[case::mid_key(Some(4), "truncated record key in slot 3")]
+    #[case::mid_length(Some(10), "truncated record length in slot 3")]
+    #[case::mid_body(None, "truncated record body in slot 3")]
+    fn truncation_at_eof_is_an_error_not_a_stall_at_every_stage(
+        #[case] keep: Option<usize>,
+        #[case] expected: &str,
+    ) {
+        let serialized = serialize_records(&[(TestKey(1), b"a-body-that-is-cut-short".to_vec())]);
+        let keep = keep.unwrap_or(serialized.len() - 5);
+        assert!(keep < serialized.len(), "the case must actually truncate");
+
+        let slot = StdArc::new(SortMergeSlot::new(
+            3,
+            BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
+        ));
+        slot.decompressed.lock().unwrap().push_back(serialized[..keep].to_vec());
+        slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
+
+        let mut driver =
+            MergeDriver::<TestKey>::from_slots(vec![slot], MemorySources::Owned(Vec::new()), 1);
+        let err = driver.try_step().expect_err("truncation must surface as Err");
+        assert!(err.to_string().contains(expected), "expected `{expected}`, got: {err}");
+    }
+
+    /// `from_slots` sorts slots by `file_id` so equal-key ties resolve the same
+    /// way the legacy chunk-files path resolves them — the `LoserTree` breaks
+    /// ties by leaf index, so leaf order must follow `file_id` and not the
+    /// caller's `Vec` order. Nothing pinned that, so the sort could vanish in a
+    /// later cleanup and the divergence would be invisible except on inputs
+    /// that contain ties. Pass the slots reversed and require `file_id` to win.
+    #[test]
+    fn key_ties_break_by_file_id_not_by_caller_push_order() {
+        let file0 = populated_slot(0, &[(TestKey(1), b"from-file-0".to_vec())], 1);
+        let file1 = populated_slot(1, &[(TestKey(1), b"from-file-1".to_vec())], 1);
+        let driver = MergeDriver::<TestKey>::from_slots(
+            vec![file1, file0], // reversed on purpose
+            MemorySources::Owned(Vec::new()),
+            2,
+        );
+        assert_eq!(
+            drain_merge_driver_bytes(driver),
+            vec![b"from-file-0".to_vec(), b"from-file-1".to_vec()],
+            "equal-key ties must resolve by file_id, not by caller push order",
+        );
+    }
+
+    /// The core BUG #3 regression: a slot whose decompressed queue is empty
+    /// and `!queue_eof` must make `try_step` return `Stalled` (yield), NOT
+    /// block the caller. The old blocking consumer (`block_ready.wait()`)
+    /// would park here forever at a single worker. After the producer fills
+    /// the slot and marks EOF, the merge resumes and drains to completion.
+    #[test]
+    fn from_slots_try_step_stalls_on_empty_non_eof_slot_then_resumes() {
+        let slot = StdArc::new(SortMergeSlot::new(
+            0,
+            BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
+        ));
+        // Empty queue, NOT eof — the producer is "still feeding".
+        let mut driver = MergeDriver::<TestKey>::from_slots(
+            vec![StdArc::clone(&slot)],
+            MemorySources::Owned(Vec::new()),
+            0,
+        );
+
+        // Priming cannot read the slot's first record → Stalled, not a hang.
+        assert!(
+            matches!(driver.try_step().expect("try_step"), MergeStep::Stalled),
+            "empty non-eof slot must Stall, not block"
+        );
+        // Repeated calls keep stalling (idempotent yield).
+        assert!(matches!(driver.try_step().expect("try_step"), MergeStep::Stalled));
+
+        // Producer fills the slot and marks EOF.
+        {
+            let bytes = serialize_records(&[(TestKey(1), b"only-1".to_vec())]);
+            let mut dec = slot.decompressed.lock().unwrap();
+            dec.push_back(bytes);
+            slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        // The merge now resumes: emits the record, then is Done.
+        match driver.try_step().expect("try_step") {
+            MergeStep::Produced(bytes) => assert_eq!(bytes, b"only-1"),
+            MergeStep::Stalled => panic!("should have resumed, not Stalled"),
+            MergeStep::Done => panic!("should have produced the record, not Done"),
+        }
+        assert!(matches!(driver.try_step().expect("try_step"), MergeStep::Done));
+    }
+
+    /// `try_step` must also stall (not block) when a slot drains to empty
+    /// **mid-merge** (after priming) while still `!queue_eof`, then resume
+    /// once the producer pushes the next block and marks EOF.
+    #[test]
+    fn from_slots_try_step_stalls_mid_merge_then_resumes() {
+        let slot = StdArc::new(SortMergeSlot::new(
+            0,
+            BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
+        ));
+        // One record present, NOT eof (more "coming").
+        {
+            let bytes = serialize_records(&[(TestKey(1), b"rec-A".to_vec())]);
+            slot.decompressed.lock().unwrap().push_back(bytes);
+        }
+        let mut driver = MergeDriver::<TestKey>::from_slots(
+            vec![StdArc::clone(&slot)],
+            MemorySources::Owned(Vec::new()),
+            0,
+        );
+
+        // Prime + emit the first record.
+        match driver.try_step().expect("try_step") {
+            MergeStep::Produced(bytes) => assert_eq!(bytes, b"rec-A"),
+            other => panic!("expected Produced(rec-A), got {other:?}"),
+        }
+        // Deferred refill finds the slot drained + not eof → Stalled.
+        assert!(
+            matches!(driver.try_step().expect("try_step"), MergeStep::Stalled),
+            "drained mid-merge non-eof slot must Stall"
+        );
+
+        // Producer pushes the next record and marks EOF.
+        {
+            let bytes = serialize_records(&[(TestKey(2), b"rec-B".to_vec())]);
+            let mut dec = slot.decompressed.lock().unwrap();
+            dec.push_back(bytes);
+            slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        match driver.try_step().expect("try_step") {
+            MergeStep::Produced(bytes) => assert_eq!(bytes, b"rec-B"),
+            other => panic!("expected Produced(rec-B), got {other:?}"),
+        }
+        assert!(matches!(driver.try_step().expect("try_step"), MergeStep::Done));
+    }
+
+    /// Resumable-framer regression: feed a single **non-embedded** record one
+    /// byte per block, asserting `try_step` `Stalled`s (retaining
+    /// `parser.pending`) until the whole record is available, then reassembles
+    /// the exact bytes. With 1-byte blocks the framer takes the slow path and
+    /// resumes a `WouldBlock` across the key prefix, the length prefix, AND the
+    /// body — the partial-record path no other test covers byte-for-byte.
+    #[test]
+    fn from_slots_try_step_resumes_record_fed_one_byte_at_a_time() {
+        let rec_body = b"multi-stage-resumable-record-body".to_vec();
+        let serialized = serialize_records(&[(TestKey(7), rec_body.clone())]);
+        assert!(serialized.len() > 12, "must span the 8-byte key + 4-byte len header");
+
+        let slot = StdArc::new(SortMergeSlot::new(
+            0,
+            BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
+        ));
+        slot.decompressed.lock().unwrap().push_back(vec![serialized[0]]);
+
+        let mut driver = MergeDriver::<TestKey>::from_slots(
+            vec![StdArc::clone(&slot)],
+            MemorySources::Owned(Vec::new()),
+            1,
+        );
+
+        // Each step before the last byte consumes one byte into the pending
+        // record and stalls (queue empty, not EOF).
+        for (i, &b) in serialized.iter().enumerate().skip(1) {
+            assert!(
+                matches!(driver.try_step().expect("try_step"), MergeStep::Stalled),
+                "expected Stalled with only {i} of {} bytes available",
+                serialized.len(),
+            );
+            slot.decompressed.lock().unwrap().push_back(vec![b]);
+        }
+
+        // The step that consumes the final byte completes the record.
+        match driver.try_step().expect("try_step") {
+            MergeStep::Produced(bytes) => assert_eq!(bytes, rec_body.as_slice()),
+            other => panic!("expected Produced(reassembled), got {other:?}"),
+        }
+        // No more bytes and not yet EOF → Stalled; EOF → Done.
+        assert!(matches!(driver.try_step().expect("try_step"), MergeStep::Stalled));
+        slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
+        assert!(matches!(driver.try_step().expect("try_step"), MergeStep::Done));
+    }
+
+    /// Same resumable-framer property for an **embedded**-key record split mid
+    /// body across two blocks (the key lives in the body, so this exercises the
+    /// embedded `extract_from_record` path resuming after a `WouldBlock`).
+    #[test]
+    fn from_slots_try_step_resumes_embedded_record_split_mid_body() {
+        // Embedded record: [len:4][body], key = first 8 body bytes.
+        let record = embedded_record(123, b"-embedded-tail-bytes");
+        let serialized = serialize_embedded(std::slice::from_ref(&record));
+        // Cut mid-body: 4-byte len + 10 body bytes in the first block.
+        let split = 4 + 10;
+        assert!(split < serialized.len() && split > 4 + 8, "split mid-body, past the key");
+        let (head, tail) = serialized.split_at(split);
+
+        let slot = StdArc::new(SortMergeSlot::new(
+            0,
+            BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
+        ));
+        slot.decompressed.lock().unwrap().push_back(head.to_vec());
+
+        let mut driver = MergeDriver::<TestEmbeddedKey>::from_slots(
+            vec![StdArc::clone(&slot)],
+            MemorySources::Owned(Vec::new()),
+            1,
+        );
+
+        // Body incomplete in the first block → Stalled mid-record.
+        assert!(matches!(driver.try_step().expect("try_step"), MergeStep::Stalled));
+
+        // Deliver the rest + EOF; the record reassembles exactly.
+        {
+            let mut dec = slot.decompressed.lock().unwrap();
+            dec.push_back(tail.to_vec());
+            slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
+        }
+        match driver.try_step().expect("try_step") {
+            MergeStep::Produced(bytes) => assert_eq!(bytes, record.as_slice()),
+            other => panic!("expected Produced(reassembled embedded), got {other:?}"),
+        }
+        assert!(matches!(driver.try_step().expect("try_step"), MergeStep::Done));
+    }
+
+    #[test]
+    fn from_slots_merges_slots_with_memory_chunks() {
+        let slot_records: Vec<(TestKey, Vec<u8>)> = vec![
+            (TestKey(1), b"slot-1".to_vec()),
+            (TestKey(3), b"slot-3".to_vec()),
+            (TestKey(5), b"slot-5".to_vec()),
+        ];
+        let memory_records: Vec<(TestKey, fgumi_raw_bam::RawRecord)> = vec![
+            (TestKey(2), fgumi_raw_bam::RawRecord::from(b"mem-2".to_vec())),
+            (TestKey(4), fgumi_raw_bam::RawRecord::from(b"mem-4".to_vec())),
+            (TestKey(6), fgumi_raw_bam::RawRecord::from(b"mem-6".to_vec())),
+        ];
+
+        let slots = vec![populated_slot(0, &slot_records, 2)];
+        let driver = MergeDriver::<TestKey>::from_slots(
+            slots,
+            MemorySources::Owned(vec![memory_records]),
+            6,
+        );
+        let emitted_bytes = drain_merge_driver_bytes(driver);
+        let expected: Vec<Vec<u8>> = vec![
+            b"slot-1".to_vec(),
+            b"mem-2".to_vec(),
+            b"slot-3".to_vec(),
+            b"mem-4".to_vec(),
+            b"slot-5".to_vec(),
+            b"mem-6".to_vec(),
+        ];
+        assert_eq!(emitted_bytes, expected, "slot+memory merge not globally sorted");
+    }
+
+    /// The same merge through `MemorySources::Shared`, which is the arm
+    /// production actually uses: `sort_coordinate_optimized` and
+    /// `sort_template_coordinate_impl` both build `Shared`, and `Owned` is the
+    /// queryname arm only. Every other `from_slots` test drove `Owned`, so the
+    /// arm carrying two of the three sort orders had no coverage here at all.
+    ///
+    /// The two arms differ in mechanism, not just in type: `Owned` swaps the
+    /// record vec out, while `Shared` copies `chunk.record_bytes(idx)` into the
+    /// caller's buffer and takes the key by index. A defect in that copy, or in
+    /// the `idx`/`len` pairing, is invisible to the `Owned` tests.
+    #[test]
+    fn from_slots_merges_slots_with_shared_memory_chunks() {
+        let slot_records: Vec<(TestKey, Vec<u8>)> = vec![
+            (TestKey(1), b"slot-1".to_vec()),
+            (TestKey(3), b"slot-3".to_vec()),
+            (TestKey(5), b"slot-5".to_vec()),
+        ];
+        let memory_chunk = crate::inline::InMemoryChunk::from_owned_records(vec![
+            (TestKey(2), b"mem-2".to_vec()),
+            (TestKey(4), b"mem-4".to_vec()),
+            (TestKey(6), b"mem-6".to_vec()),
+        ]);
+
+        let slots = vec![populated_slot(0, &slot_records, 2)];
+        let driver =
+            MergeDriver::<TestKey>::from_slots(slots, MemorySources::Shared(vec![memory_chunk]), 6);
+        let expected: Vec<Vec<u8>> = vec![
+            b"slot-1".to_vec(),
+            b"mem-2".to_vec(),
+            b"slot-3".to_vec(),
+            b"mem-4".to_vec(),
+            b"slot-5".to_vec(),
+            b"mem-6".to_vec(),
+        ];
+        assert_eq!(
+            drain_merge_driver_bytes(driver),
+            expected,
+            "slot + shared-memory merge not globally sorted",
+        );
+    }
+
+    // (v4: `from_slots_bails_on_unfilled_gap_in_decompressed` removed.
+    //  v3.1's `decompressed: Mutex<ReorderBuffer<Vec<u8>>>` is now a
+    //  `Mutex<VecDeque<Vec<u8>>>` (FIFO). There is no concept of
+    //  "ordinals" or "gaps" — the producer pushes in order under the
+    //  reader lock, so a missing-block-in-the-middle state is no
+    //  longer representable.)
+
+    // ------------------------------------------------------------------------
+    // Coverage for the EMBEDDED_IN_RECORD = true parser arm.
+    //
+    // All three production sort keys (RawCoordinateKey, RawQuerynameKey,
+    // TemplateKey) set EMBEDDED_IN_RECORD = true, but TestKey above uses
+    // the non-embedded format. This test pins the embedded-format slot path
+    // with a synthetic embedded key (TestEmbeddedKey) whose value lives at
+    // bytes 0..8 of the record itself.
+
+    /// Embedded-key test type: serialized format is `[len(4)][record(len)]`
+    /// (no separate key prefix). The key is the first 8 LE bytes of the record.
+    #[derive(Default, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
+    struct TestEmbeddedKey(u64);
+
+    impl RawSortKey for TestEmbeddedKey {
+        const SERIALIZED_SIZE: Option<usize> = Some(0);
+        const EMBEDDED_IN_RECORD: bool = true;
+        fn extract(_bam: &[u8], _ctx: &crate::keys::SortContext) -> Self {
+            unimplemented!("TestEmbeddedKey is only used in MergeDriver::from_slots tests")
+        }
+        fn extract_from_record(bam: &[u8]) -> Self {
+            assert!(bam.len() >= 8, "embedded-key test record must have ≥8 bytes");
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&bam[..8]);
+            TestEmbeddedKey(u64::from_le_bytes(buf))
+        }
+        fn write_to<W: Write>(&self, _w: &mut W) -> std::io::Result<()> {
+            // No-op: embedded keys are not written separately; they live
+            // inside the record bytes.
+            Ok(())
+        }
+        fn read_from<R: Read>(_r: &mut R) -> std::io::Result<Self> {
+            unreachable!(
+                "EMBEDDED_IN_RECORD = true keys take the slot_try_next_record \
+                 embedded arm, which never calls read_from"
+            )
+        }
+    }
+
+    /// Build a record whose first 8 bytes encode the embedded sort key.
+    fn embedded_record(key: u64, tail: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(8 + tail.len());
+        v.extend_from_slice(&key.to_le_bytes());
+        v.extend_from_slice(tail);
+        v
+    }
+
+    /// Serialize records in the embedded-key spill format: `[len(4)][record(len)]`.
+    fn serialize_embedded(records: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for rec in records {
+            #[allow(clippy::cast_possible_truncation)]
+            let len = rec.len() as u32;
+            out.write_all(&len.to_le_bytes()).unwrap();
+            out.write_all(rec).unwrap();
+        }
+        out
+    }
+
+    fn embedded_populated_slot(
+        file_id: u32,
+        records: &[Vec<u8>],
+        n_blocks: usize,
+    ) -> StdArc<SortMergeSlot> {
+        let bytes = serialize_embedded(records);
+        let block_size = bytes.len().div_ceil(n_blocks.max(1));
+        let slot = StdArc::new(SortMergeSlot::new(
+            file_id,
+            BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
+        ));
+        {
+            let mut dec = slot.decompressed.lock().unwrap();
+            for chunk in bytes.chunks(block_size) {
+                dec.push_back(chunk.to_vec());
+            }
+            slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
+        }
+        slot
+    }
+
+    #[test]
+    fn from_slots_embedded_key_path_merges_correctly() {
+        // Three slots, each with sorted records by embedded key. The merged
+        // output must be globally sorted. Exercises `slot_try_next_record`'s
+        // EMBEDDED_IN_RECORD arm + the `extract_from_record` key-from-bytes
+        // path.
+        let file0 =
+            vec![embedded_record(1, b"-A"), embedded_record(4, b"-A"), embedded_record(7, b"-A")];
+        let file1 =
+            vec![embedded_record(2, b"-B"), embedded_record(5, b"-B"), embedded_record(8, b"-B")];
+        let file2 =
+            vec![embedded_record(3, b"-C"), embedded_record(6, b"-C"), embedded_record(9, b"-C")];
+        let slots = vec![
+            embedded_populated_slot(0, &file0, 1),
+            embedded_populated_slot(1, &file1, 1),
+            embedded_populated_slot(2, &file2, 1),
+        ];
+
+        let driver =
+            MergeDriver::<TestEmbeddedKey>::from_slots(slots, MemorySources::Owned(Vec::new()), 9);
+        let emitted = drain_merge_driver_bytes(driver);
+
+        // Verify keys are emitted in sorted order. Tail bytes prove the
+        // identity of each source.
+        let expected = vec![
+            embedded_record(1, b"-A"),
+            embedded_record(2, b"-B"),
+            embedded_record(3, b"-C"),
+            embedded_record(4, b"-A"),
+            embedded_record(5, b"-B"),
+            embedded_record(6, b"-C"),
+            embedded_record(7, b"-A"),
+            embedded_record(8, b"-B"),
+            embedded_record(9, b"-C"),
+        ];
+        assert_eq!(emitted, expected);
+    }
+
+    #[test]
+    fn from_slots_skips_empty_slots_mixed_with_populated() {
+        // Verify a slot whose decompressed queue is empty (and reader marked EOF)
+        // is correctly elided from the LoserTree. Without correct handling
+        // the priming step would either panic or produce a phantom source.
+        let populated = vec![
+            (TestKey(1), b"one".to_vec()),
+            (TestKey(2), b"two".to_vec()),
+            (TestKey(3), b"three".to_vec()),
+        ];
+
+        let empty_slot = StdArc::new(SortMergeSlot::new(
+            99,
+            BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
+        ));
+        empty_slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
+        // Insert empty-slot first, then a populated slot. The driver should
+        // skip the empty one during priming and only emit records from the
+        // populated slot.
+        let slots = vec![empty_slot, populated_slot(0, &populated, 1)];
+
+        let driver = MergeDriver::<TestKey>::from_slots(slots, MemorySources::Owned(Vec::new()), 3);
+        let emitted = drain_merge_driver_bytes(driver);
+        assert_eq!(emitted, vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
+    }
+
+    /// `slot_try_load_block` checks `decomp_error` BEFORE `queue_eof`, so a slot
+    /// whose decompression failed surfaces `Err` rather than the clean EOF that
+    /// an empty queue plus `queue_eof` looks like. Nothing exercised the error
+    /// arm: every existing test drives `queue_eof`, so swapping the two checks
+    /// would silently convert a failed spill into a short read — records
+    /// dropped, exit status zero — with the whole suite green.
+    #[test]
+    fn decomp_error_surfaces_as_an_error_not_a_clean_eof() {
+        let slot = StdArc::new(SortMergeSlot::new(
+            7,
+            BufReader::new(tempfile::tempfile().expect("tempfile")),
+            crate::codec::SpillCodec::Bgzf,
+        ));
+        // The shape a failed decompression leaves behind: queue drained, EOF
+        // set, and the error flag raised. Ordering matters — both are set, so
+        // only the check order decides the outcome.
+        slot.decomp_error.store(true, std::sync::atomic::Ordering::Release);
+        slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
+
+        let mut parser = SlotParserState::new();
+        let msg = match slot_try_load_block(&slot, &mut parser) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a slot with decomp_error must not report a clean EOF"),
+        };
+        // The whole phrase, not a bare `7`: a lone digit matches any number that
+        // happens to appear in the message, which is a weaker claim than "this
+        // error named the slot that failed".
+        assert!(
+            msg.contains("spill decompression error on slot 7"),
+            "the error must name the failure and the slot; got: {msg}",
+        );
+    }
+
+    #[test]
+    fn from_slots_records_merged_equals_emitted_total() {
+        // `records_merged()` (surfaced by `SortMerge` at completion) must equal
+        // the number of records actually emitted across all sources.
+        let f0: Vec<(TestKey, Vec<u8>)> =
+            (0u64..15).map(|i| (TestKey(i * 2), format!("a-{i:02}").into_bytes())).collect();
+        let f1: Vec<(TestKey, Vec<u8>)> =
+            (0u64..15).map(|i| (TestKey(i * 2 + 1), format!("b-{i:02}").into_bytes())).collect();
+        let total = (f0.len() + f1.len()) as u64;
+
+        let slots = vec![populated_slot(0, &f0, 3), populated_slot(1, &f1, 2)];
+        let mut driver =
+            MergeDriver::<TestKey>::from_slots(slots, MemorySources::Owned(Vec::new()), total);
+
+        let mut emitted = 0u64;
+        loop {
+            match driver.try_step().expect("try_step") {
+                MergeStep::Produced(_) => emitted += 1,
+                MergeStep::Done => break,
+                MergeStep::Stalled => panic!("unexpected Stalled on pre-populated EOF slots"),
+            }
+        }
+        assert_eq!(emitted, total, "should emit every input record");
+        assert_eq!(
+            driver.records_merged(),
+            total,
+            "records_merged must equal the emitted record count"
+        );
     }
 }

@@ -1,0 +1,1491 @@
+//! Type erasure: `ErasedStep` trait + `TypedStep<S>` adapter.
+//!
+//! The runtime holds a heterogeneous chain in `Vec<Box<dyn ErasedStep>>`.
+//! `TypedStep<S>` is the adapter that bridges between the type-erased
+//! dispatch in the worker loop and the concrete `S::try_run` body.
+//!
+//! Each `ErasedStep` exposes the methods the runtime needs:
+//!   - `clone_boxed` — make per-worker copies for `Parallel` steps
+//!   - `build_output_set` — construct the producer's queue set + view from
+//!     `StepProfile::output_queues` + `branch_ordering`
+//!   - `build_input_handle` — pull the consumer's typed input handle out of
+//!     the producer's `OutputQueueSet` (mutable: takes ownership of the
+//!     branch's slot)
+//!   - `wrap_outputs_view` — wrap the type-erased view into a typed
+//!     `OutputHandles<S::Outputs>` for the worker to pass into `ctx.outputs`
+//!   - `mark_outputs_drained` — close all output branches (called by the
+//!     driver when a step returns `StepOutcome::Finished`, counter-gated for
+//!     `Parallel` so only the last clone closes the shared output)
+//!   - `is_source` — true iff `S::Input == ()` (used by chain-context
+//!     construction to pick the source's unit-input path)
+
+use std::any::{Any, TypeId};
+use std::io;
+use std::marker::PhantomData;
+use std::sync::Arc;
+
+use super::handles::{BranchInputHandle, OutputQueueSet};
+use super::outputs::StepOutputs;
+use super::reorder::BranchOrdering;
+use super::signal::PipelineSignal;
+use super::step::{
+    Affinity, DetachedGroup, OutputHandles, OutputsViewAny, Step, StepCtx, StepKind, StepOutcome,
+    StepProfile,
+};
+
+/// The branch orderings the framework actually *builds* for a single-input
+/// producer of the given [`StepKind`], given its declared profile orderings.
+///
+/// `Serial` / `Exclusive` producers emit items in arrival order by construction
+/// (the framework's mutex serializes pushes; an Exclusive-owned step has a
+/// single dispatcher), so inserting a `ReorderStage` on their output edges is
+/// pure overhead. The framework collapses any declared
+/// `ByOrdinal` / `ByItemOrdinal` to [`BranchOrdering::None`] for those kinds —
+/// `build_queues` then constructs the direct transport with no reorder stage.
+/// `Parallel` producers keep their declared orderings verbatim.
+///
+/// # Precondition for `ByItemOrdinal`
+///
+/// The collapse preserves *arrival* order, which equals *ordinal* order only if
+/// the producer already receives its input in ordinal order. A single-input
+/// `Serial` / `Exclusive` / `Detached` step fed by a
+/// [`BranchOrdering::None`] edge can be handed items out of ordinal order
+/// (multiple `Parallel` upstream workers push in nondeterministic order), and
+/// collapsing its declared `ByItemOrdinal` output to `None` then propagates that
+/// disorder to a consumer that asked for ordinal order.
+///
+/// So a chain declaring `ByItemOrdinal` must keep every edge upstream of that
+/// producer ordered — which the canonical BAM pattern does: the source declares
+/// an ordering and every intermediate transform propagates the input's serial
+/// onto its outputs. Declaring `ByItemOrdinal` downstream of an unordered
+/// (`None`) edge is a chain-construction error, not something this collapse can
+/// detect: the rule is a function of `(kind, declared)` only and has no view of
+/// the graph.
+///
+/// This is the single source of truth for the collapse rule, shared by
+/// [`TypedStep::build_output_set`] (which constructs the transport) and
+/// `Pipeline::dag` (which must render the *effective* — post-collapse —
+/// ordering so the diagnostic matches the transport actually built). Note
+/// `Step2` producers (`TypedStep2`) do **not** collapse, so this helper is only
+/// for single-input steps.
+#[must_use]
+pub(crate) fn effective_branch_orderings(
+    kind: StepKind,
+    declared: &[BranchOrdering],
+) -> Vec<BranchOrdering> {
+    match kind {
+        StepKind::Parallel => declared.to_vec(),
+        // Single-producer kinds emit in-order from one thread, so a downstream
+        // reorder stage is redundant. `Detached` is single-producer too (one
+        // dedicated thread), so it collapses like `Serial`/`Exclusive`.
+        StepKind::Serial | StepKind::Exclusive | StepKind::Detached => {
+            declared.iter().map(|_| BranchOrdering::None).collect()
+        }
+    }
+}
+
+/// Type-erased step interface used by the worker loop.
+pub trait ErasedStep: Send + 'static {
+    fn profile(&self) -> StepProfile;
+
+    /// The step's static name, returned WITHOUT building a `StepProfile`.
+    ///
+    /// `dispatch_one_step` reads the name on every dispatch (for stats /
+    /// error reporting), so going through `profile()` there would heap-
+    /// allocate the profile's two `Vec`s per dispatch (a virtual call, so
+    /// the optimizer cannot elide them). Adapters cache the name at
+    /// construction and return it here for free.
+    fn name(&self) -> &'static str;
+
+    /// The step's [`StepKind`], returned WITHOUT building a `StepProfile`.
+    ///
+    /// The setup passes (`pool::assign_exclusive_owners`,
+    /// `pool::assign_sticky_owners`, `storage::build_worker_storage`) read the
+    /// kind per step; going through `profile()` there heap-allocates the
+    /// profile's two `Vec`s per read (a virtual call, so the optimizer cannot
+    /// elide them). Adapters cache the kind at construction and return it free.
+    fn kind(&self) -> StepKind;
+
+    /// Whether the step is `sticky`, returned WITHOUT building a `StepProfile`.
+    /// Same rationale as [`Self::kind`]: the sticky-owner assignment passes read
+    /// it per step. Adapters cache it at construction.
+    fn sticky(&self) -> bool;
+
+    /// Forward `Step::affinity` for worker-eligibility gating. Only
+    /// consulted for `Serial` steps; the runtime calls this once during
+    /// `build_worker_storage` to decide which workers get a `Shared`
+    /// entry vs a `Skip` placeholder.
+    fn affinity(&self) -> Affinity;
+
+    /// Forward `Step::detached_group` — which dedicated driver thread a
+    /// `Detached` step runs on. Read once by `extract_detached_steps` to group
+    /// detached steps onto shared driver threads (the N+2 model). Only
+    /// meaningful for `Detached` kinds.
+    fn detached_group(&self) -> DetachedGroup;
+
+    /// Dispatch `S::try_run` after downcasting queue handles.
+    ///
+    /// # Errors
+    ///
+    /// Forwards any I/O error from the step body.
+    fn try_run_erased(&mut self, ctx: &mut ErasedStepCtx<'_>) -> io::Result<StepOutcome>;
+
+    /// Construct a fresh per-worker copy of this step. Used for Parallel
+    /// steps. Cheap — implementing types call `S::clone()`, where typical
+    /// state is unit-struct or `Arc<dyn Fn>` (one atomic increment).
+    fn clone_boxed(&self) -> Box<dyn ErasedStep>;
+
+    /// Take ownership of the consumer's input handle from the producer's
+    /// output queue set. Used by the framework when constructing chain
+    /// topology; each branch is taken exactly once.
+    fn build_input_handle(
+        &self,
+        producer_set: &mut OutputQueueSet,
+        branch_idx: usize,
+    ) -> Box<dyn Any + Send + Sync>;
+
+    /// Input arity. Default `1` for single-input
+    /// [`crate::step::Step`] impls; multi-input
+    /// adapters (`TypedStep2`, future `StepN`) override to return their
+    /// arity. Used by [`crate::runtime::contexts`]
+    /// to decide which input-construction path to take.
+    fn input_arity(&self) -> usize {
+        1
+    }
+
+    /// Take ownership of TWO consumer input handles from two
+    /// upstream output queue sets, paired into a typed
+    /// [`crate::handles::TwoInputHandles<A, B>`]
+    /// per the consumer's [`crate::step::Step2`]
+    /// associated types.
+    ///
+    /// Default impl panics — single-input steps never have arity 2.
+    /// `TypedStep2<S>` overrides to call `take_typed_input` twice
+    /// (once per input slot) and wrap the pair.
+    ///
+    /// # Panics
+    ///
+    /// Default impl always panics; multi-input adapters override.
+    fn build_two_input_handles(
+        &self,
+        _producer_sets: &mut [OutputQueueSet],
+        _p0_idx: usize,
+        _p0_branch: usize,
+        _p1_idx: usize,
+        _p1_branch: usize,
+    ) -> Box<dyn Any + Send + Sync> {
+        let p = self.profile();
+        panic!(
+            "build_two_input_handles called on '{}' (kind = {:?}); \
+             only Step2 adapters (`TypedStep2`) support arity-2 input \
+             construction. This is a framework bug — chain-build code \
+             should only dispatch arity-2 input construction to steps \
+             that override `input_arity` to return 2.",
+            p.name, p.kind
+        );
+    }
+
+    /// Build this step's output queue set + outputs view from the profile's
+    /// per-branch queue specs and ordering directives.
+    fn build_output_set(
+        &self,
+        level: crate::builder::InstrumentationLevel,
+    ) -> (OutputQueueSet, OutputsViewAny);
+
+    /// Like [`Self::build_output_set`] but forces every output branch to a
+    /// **direct** transport (no reorder stage), keeping the profile's configured
+    /// queue bound.
+    ///
+    /// Used only by the single-thread *fused* driver
+    /// ([`crate::runtime::run_fused_single_thread`]). At one worker, FIFO push
+    /// order is already the correct order, so the reorder stage is dead weight.
+    /// The count/byte bound stays: the fused driver runs a producer before its
+    /// consumer in each pass, so a step emitting more items per `try_run` than
+    /// its consumer removes would grow the edge every pass. The bound turns that
+    /// into ordinary backpressure — the producer holds and retries, as it must
+    /// under the scheduled driver anyway — instead of unbounded growth.
+    fn build_fused_output_set(
+        &self,
+        level: crate::builder::InstrumentationLevel,
+    ) -> (OutputQueueSet, OutputsViewAny);
+
+    /// Wrap a typed `OutputsViewAny` into `Box<OutputHandles<S::Outputs>>`
+    /// (type-erased as `Any`). The runtime stores this box per step so the
+    /// worker loop's `try_run_erased` can downcast it to the typed
+    /// `OutputHandles<S::Outputs>` the step expects in its `ctx.outputs`.
+    fn wrap_outputs_view(&self, view: OutputsViewAny) -> Box<dyn Any + Send + Sync>;
+
+    /// Mark all of this step's output branches drained. Downcasts the
+    /// type-erased outputs handle to `OutputHandles<S::Outputs>` and calls
+    /// the typed `mark_all_drained`. Called by the driver when a step returns
+    /// `StepOutcome::Finished` (counter-gated for `Parallel`).
+    fn mark_outputs_drained(&self, outputs: &(dyn Any + Send + Sync));
+
+    /// Returns `true` iff `S::Input = ()` — i.e., this is a source step.
+    /// Used by chain-context construction to pick the source's unit-input
+    /// path (a source has no upstream queue to take an input handle from).
+    fn is_source(&self) -> bool;
+}
+
+/// Identity of a type-erased handle box: the address of the value the
+/// `&dyn Any` points at.
+///
+/// The typed-handle caches below record this alongside each cached pointer and
+/// compare it on every cached hit, so a step handed a *different*
+/// `ChainContexts` is rejected instead of reading through a stale pointer. A
+/// `usize` rather than a raw pointer keeps `TypedStep` / `TypedStep2` auto-`Send`
+/// (raw pointers are `!Send`); the value is only ever compared, never
+/// dereferenced.
+fn erased_addr(handle: &(dyn Any + Send + Sync)) -> usize {
+    std::ptr::from_ref(handle).cast::<()>().addr()
+}
+
+/// One slot of a step adapter's typed-handle cache: the resolved handle plus the
+/// [`erased_addr`] of the `&dyn Any` box it came from.
+///
+/// The `'static` lifetime is a lie — the real bound is `ChainContexts` — held up
+/// by the invariants documented on [`TypedStep`], the third of which is what the
+/// stored address is checked against on every cached hit.
+type CachedHandle<H> = Option<(usize, &'static H)>;
+
+/// Context the worker loop hands to `ErasedStep` methods.
+pub struct ErasedStepCtx<'a> {
+    /// Boxed `BranchInputHandle<S::Input>`. Adapter downcasts.
+    pub input: &'a (dyn Any + Send + Sync),
+    /// `OutputHandles<S::Outputs>`. Adapter downcasts.
+    pub outputs: &'a (dyn Any + Send + Sync),
+    /// Shared signal (error/cancel). Workers consult; steps don't directly.
+    pub signal: &'a Arc<PipelineSignal>,
+}
+
+/// Adapter that wraps a concrete `Step` impl as an `ErasedStep`.
+///
+/// ## Cached typed handles
+///
+/// `try_run_erased` needs typed
+/// `&BranchInputHandle<S::Input>` / `&OutputHandles<S::Outputs>` views
+/// of the type-erased context boxes. The first call resolves them via
+/// `Any::downcast_ref` (a `TypeId` compare + transmute); subsequent calls
+/// reuse the cached references through the `cached_input` /
+/// `cached_outputs` fields. Without the cache, a 4-thread CODEC 8M
+/// run pays ≈230 samples (~1.6%) on `downcast_ref` `TypeId` compares
+/// across the dispatch hot path; the cache eliminates them entirely.
+///
+/// The cache is sound because:
+///
+///   1. The boxes are owned by `ChainContexts` (an `Arc` held alive
+///      for the entire `Pipeline::run` call by every worker thread).
+///   2. Every `TypedStep<S>` instance — owned (`Parallel`), shared
+///      (`Serial`, behind `Mutex`), or pinned (`Exclusive`) — is
+///      destroyed before `ChainContexts` goes out of scope (workers
+///      exit, then the runtime drops the contexts).
+///   3. Every dispatch passes the **same** box reference for a given
+///      `step_idx` (see `run_worker_loop`'s
+///      `contexts.inputs[step_idx.0].as_ref()`). The cached pointer
+///      always refers to that same box.
+///
+/// Only (3) is invisible to the compiler, so each cache slot also records the
+/// `erased_addr` of the box it was resolved from and every cached hit asserts
+/// it — unconditionally, in release too. A step handed a different,
+/// **still-live** `ChainContexts` panics on the spot instead of reading through
+/// a pointer into the other one.
+///
+/// That check is a best-effort guard, not a proof. It compares data addresses
+/// only, so it cannot detect a *freed* box whose address the allocator handed
+/// back out: a new `ChainContexts` whose input box lands on a dead one's address
+/// passes the assert and the `transmute` reads through a dangling pointer.
+/// Soundness therefore still rests entirely on invariant (2) — every
+/// `TypedStep` is dropped before the `ChainContexts` it cached from. Relaxing
+/// (2) is not made safe by this guard.
+///
+/// `clone_boxed` calls `TypedStep::new(...)` which initializes the
+/// cache to `None`, so per-worker clones (`Parallel` steps) start
+/// with a fresh cache.
+pub struct TypedStep<S: Step> {
+    inner: S,
+    /// Static step name, cached from `inner.profile().name` at
+    /// construction so `ErasedStep::name()` (read per dispatch) never
+    /// rebuilds the profile's `Vec`s. See the `ErasedStep::name` doc.
+    name: &'static str,
+    /// `StepKind`, cached at construction so the setup passes read it without
+    /// rebuilding the profile's `Vec`s. See the `ErasedStep::kind` doc.
+    kind: StepKind,
+    /// `sticky` flag, cached at construction for the same reason as `kind`.
+    sticky: bool,
+    /// Cached downcast of `ctx.input` after the first dispatch, paired with the
+    /// [`erased_addr`] of the box it was resolved from (checked on every cached
+    /// hit). `'static` is a lie — the actual lifetime is bounded by
+    /// `ChainContexts` — enforced via the `// SAFETY:` comment below.
+    cached_input: CachedHandle<BranchInputHandle<S::Input>>,
+    /// Cached downcast of `ctx.outputs`, with its box address. Same lifetime story.
+    cached_outputs: CachedHandle<OutputHandles<S::Outputs>>,
+    _phantom: PhantomData<fn() -> S>,
+}
+
+impl<S: Step> TypedStep<S> {
+    pub fn new(step: S) -> Self {
+        let profile = step.profile();
+        let name = profile.name;
+        let kind = profile.kind;
+        let sticky = profile.sticky;
+        Self {
+            inner: step,
+            name,
+            kind,
+            sticky,
+            cached_input: None,
+            cached_outputs: None,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Resolve the typed input handle from the dispatch context, caching
+    /// the result for subsequent dispatches.
+    ///
+    /// # Panics
+    ///
+    /// Panics on the first dispatch if the `ctx.input` box doesn't
+    /// downcast to `BranchInputHandle<S::Input>` (a chain topology
+    /// invariant violation; the builder should have caught this).
+    #[allow(unsafe_code)]
+    fn resolve_input<'a>(&mut self, ctx: &ErasedStepCtx<'a>) -> &'a BranchInputHandle<S::Input> {
+        if let Some((cached_addr, cached)) = self.cached_input {
+            // Point 3 -- every dispatch passes the same box for a given
+            // `step_idx` -- is the invariant the cache rests on, and the one the
+            // type system cannot enforce. Violating it makes `cached` point at a
+            // box this dispatch does not own, so reject a mismatch in EVERY
+            // build: a `debug_assert!` alone would leave release builds reading
+            // through a stale pointer. The check is one load and one compare —
+            // not the `downcast_ref` `TypeId` probe this cache exists to elide.
+            assert_eq!(
+                erased_addr(ctx.input),
+                cached_addr,
+                "cached input handle does not match the dispatch context — a \
+                 TypedStep was reused across two ChainContexts"
+            );
+            // Same box implies the same typed pointer, so this adds nothing in
+            // release; keep it in debug as a check that the cached pointer was
+            // derived from that box correctly in the first place.
+            debug_assert!(
+                ctx.input
+                    .downcast_ref::<BranchInputHandle<S::Input>>()
+                    .is_some_and(|live| std::ptr::eq(live, cached)),
+                "cached input handle disagrees with a fresh downcast of the same box"
+            );
+            // SAFETY: Lifetime extension from `'static` (cache slot) back
+            // to `'a` (the dispatch context's lifetime). The cached
+            // pointer was originally a `&'a BranchInputHandle<S::Input>`
+            // pulled out of `ChainContexts.inputs[step_idx]`; that box
+            // outlives every `TypedStep<S>` (point 2 in the type-level
+            // doc). Dispatches always pass the same box for the same
+            // `step_idx` (point 3), so the pointer is still pointing
+            // at the live box on every subsequent dispatch.
+            return unsafe {
+                std::mem::transmute::<&BranchInputHandle<S::Input>, &'a BranchInputHandle<S::Input>>(
+                    cached,
+                )
+            };
+        }
+        let r: &'a BranchInputHandle<S::Input> = ctx
+            .input
+            .downcast_ref::<BranchInputHandle<S::Input>>()
+            .expect("input handle downcast failed — chain topology invariant");
+        // SAFETY: Lifetime extension from `'a` to `'static` for storage.
+        // The same point-2/point-3 invariants from `// SAFETY:` above
+        // apply: the box outlives `self`, and we only ever read the
+        // cache through `resolve_input`, which immediately re-extends
+        // back to a bounded `'a` before handing it to user code.
+        let cached: &'static BranchInputHandle<S::Input> = unsafe {
+            std::mem::transmute::<
+                &'a BranchInputHandle<S::Input>,
+                &'static BranchInputHandle<S::Input>,
+            >(r)
+        };
+        self.cached_input = Some((erased_addr(ctx.input), cached));
+        r
+    }
+
+    /// Resolve the typed outputs handle from the dispatch context,
+    /// caching the result for subsequent dispatches. See `resolve_input`
+    /// for the safety argument.
+    #[allow(unsafe_code)]
+    fn resolve_outputs<'a>(&mut self, ctx: &ErasedStepCtx<'a>) -> &'a OutputHandles<S::Outputs> {
+        if let Some((cached_addr, cached)) = self.cached_outputs {
+            // See `resolve_input` for why the address check is unconditional and
+            // the downcast re-check is debug-only.
+            assert_eq!(
+                erased_addr(ctx.outputs),
+                cached_addr,
+                "cached outputs handle does not match the dispatch context — a \
+                 TypedStep was reused across two ChainContexts"
+            );
+            debug_assert!(
+                ctx.outputs
+                    .downcast_ref::<OutputHandles<S::Outputs>>()
+                    .is_some_and(|live| std::ptr::eq(live, cached)),
+                "cached outputs handle disagrees with a fresh downcast of the same box"
+            );
+            // SAFETY: see `resolve_input`; same boxes/lifetimes story.
+            return unsafe {
+                std::mem::transmute::<&OutputHandles<S::Outputs>, &'a OutputHandles<S::Outputs>>(
+                    cached,
+                )
+            };
+        }
+        let r: &'a OutputHandles<S::Outputs> = ctx
+            .outputs
+            .downcast_ref::<OutputHandles<S::Outputs>>()
+            .expect("outputs handle downcast failed — chain topology invariant");
+        // SAFETY: see `resolve_input`; same boxes/lifetimes story.
+        let cached: &'static OutputHandles<S::Outputs> = unsafe {
+            std::mem::transmute::<&'a OutputHandles<S::Outputs>, &'static OutputHandles<S::Outputs>>(
+                r,
+            )
+        };
+        self.cached_outputs = Some((erased_addr(ctx.outputs), cached));
+        r
+    }
+}
+
+impl<S> ErasedStep for TypedStep<S>
+where
+    S: Step,
+{
+    fn profile(&self) -> StepProfile {
+        self.inner.profile()
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn kind(&self) -> StepKind {
+        self.kind
+    }
+
+    fn sticky(&self) -> bool {
+        self.sticky
+    }
+
+    fn affinity(&self) -> Affinity {
+        self.inner.affinity()
+    }
+
+    fn detached_group(&self) -> DetachedGroup {
+        self.inner.detached_group()
+    }
+
+    fn try_run_erased(&mut self, ctx: &mut ErasedStepCtx<'_>) -> io::Result<StepOutcome> {
+        let input = self.resolve_input(ctx);
+        let outputs = self.resolve_outputs(ctx);
+        let mut step_ctx = StepCtx { input, outputs };
+        self.inner.try_run(&mut step_ctx)
+    }
+
+    fn clone_boxed(&self) -> Box<dyn ErasedStep> {
+        // `TypedStep::new` initializes `cached_input` / `cached_outputs`
+        // to `None` so the new clone resolves them fresh on its first
+        // dispatch (the box references in *this* `TypedStep<S>`'s cache
+        // are still valid for the new clone too — they refer to the
+        // same `ChainContexts` boxes — but resolving fresh is simpler
+        // and keeps the cache lifetime story local to each clone).
+        Box::new(TypedStep::new(self.inner.new_worker_copy()))
+    }
+
+    fn build_input_handle(
+        &self,
+        producer_set: &mut OutputQueueSet,
+        branch_idx: usize,
+    ) -> Box<dyn Any + Send + Sync> {
+        let handle: BranchInputHandle<S::Input> =
+            producer_set.take_typed_input::<S::Input>(branch_idx);
+        Box::new(handle)
+    }
+
+    fn build_output_set(
+        &self,
+        level: crate::builder::InstrumentationLevel,
+    ) -> (OutputQueueSet, OutputsViewAny) {
+        let profile = self.inner.profile();
+        // Producers with `StepKind::Serial` or `StepKind::Exclusive` emit
+        // items in arrival order by construction (the framework's mutex
+        // serializes pushes; an Exclusive-owned step has a single
+        // dispatcher). Inserting a `ReorderStage` on those output edges
+        // is pure overhead — every push pays an ordinal allocation +
+        // `Sequenced<T>` wrap + reorder mutex hop for items that are
+        // already in order. The framework collapses any
+        // `BranchOrdering::ByOrdinal` / `ByItemOrdinal` declaration to
+        // `None` here, so `build_queues` constructs the direct transport
+        // path with no reorder stage. Step authors keep declaring
+        // `ByItemOrdinal` (preserves the intent in the profile;
+        // documents what the consumer needs); the framework is just
+        // smart enough to skip the wrap when the producer can already
+        // satisfy that need.
+        let effective_orderings =
+            effective_branch_orderings(profile.kind, &profile.branch_ordering);
+        <S::Outputs as StepOutputs>::build_queues(
+            &profile.output_queues,
+            &effective_orderings,
+            level,
+        )
+    }
+
+    fn build_fused_output_set(
+        &self,
+        level: crate::builder::InstrumentationLevel,
+    ) -> (OutputQueueSet, OutputsViewAny) {
+        // Force a DIRECT transport on every branch — at one worker FIFO push
+        // order is already the correct order, so the reorder stage is pure
+        // overhead. The profile's queue specs are kept as-is: the fused driver
+        // dispatches a producer before its consumer in each pass, so a step that
+        // emits k > 1 items per `try_run` while its consumer takes one would
+        // grow the edge by k - 1 every pass. Dropping the bound turns that into
+        // unbounded memory growth; keeping it makes the producer hold and retry,
+        // exactly as it already must under the scheduled driver.
+        let profile = self.inner.profile();
+        let orderings = vec![BranchOrdering::None; profile.output_queues.len()];
+        <S::Outputs as StepOutputs>::build_queues(&profile.output_queues, &orderings, level)
+    }
+
+    fn wrap_outputs_view(&self, view: OutputsViewAny) -> Box<dyn Any + Send + Sync> {
+        let outputs: OutputHandles<S::Outputs> = OutputHandles::new(view);
+        Box::new(outputs)
+    }
+
+    fn mark_outputs_drained(&self, outputs: &(dyn Any + Send + Sync)) {
+        let typed = outputs
+            .downcast_ref::<OutputHandles<S::Outputs>>()
+            .expect("outputs handle downcast failed in mark_outputs_drained");
+        <S::Outputs as StepOutputs>::mark_all_drained(typed);
+    }
+
+    fn is_source(&self) -> bool {
+        TypeId::of::<S::Input>() == TypeId::of::<()>()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TypedStep2<S> — adapter for `Step2` impls (two-input merge steps).
+//
+// Same shape as TypedStep<S> for outputs: one `OutputHandles<S::Outputs>`
+// cached after the first dispatch. Inputs differ — instead of a single
+// `BranchInputHandle<S::Input>`, the adapter caches a single
+// `&TwoInputHandles<S::InputA, S::InputB>` and lends per-branch refs
+// (`ctx.a`, `ctx.b`) into the wrapped `Step2::try_run`.
+//
+// Drain detection: a `Step2` consumer is "drained" when **both** input
+// branches report drained. The step itself checks this in `try_run`
+// (`ctx.a.is_drained() && ctx.b.is_drained()`) to decide when to report
+// `Finished`; the typed-erased input box is a `TwoInputHandles<A, B>`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use super::handles::TwoInputHandles;
+use super::step::{Step2, StepCtx2};
+
+/// Adapter wrapping a [`Step2`] impl as an [`ErasedStep`].
+///
+/// Cached typed handles follow the same pattern as [`TypedStep`]:
+/// the first dispatch resolves `&TwoInputHandles<S::InputA, S::InputB>`
+/// / `&OutputHandles<S::Outputs>` via `Any::downcast_ref`, subsequent
+/// dispatches reuse the cached references through unsafe lifetime
+/// extension. The safety argument is identical (the boxes are owned
+/// by `ChainContexts` which outlives every adapter instance, and
+/// every dispatch passes the same box reference for a given
+/// `step_idx`).
+pub struct TypedStep2<S: Step2> {
+    inner: S,
+    /// Static step name, cached at construction. See `ErasedStep::name`.
+    name: &'static str,
+    /// `StepKind`, cached at construction. See `ErasedStep::kind`.
+    kind: StepKind,
+    /// `sticky` flag, cached at construction. See `ErasedStep::sticky`.
+    sticky: bool,
+    /// Cached downcasts, each paired with the [`erased_addr`] of the box it was
+    /// resolved from — see [`CachedHandle`].
+    cached_inputs: CachedHandle<TwoInputHandles<S::InputA, S::InputB>>,
+    cached_outputs: CachedHandle<OutputHandles<S::Outputs>>,
+    _phantom: PhantomData<fn() -> S>,
+}
+
+impl<S: Step2> TypedStep2<S> {
+    pub fn new(step: S) -> Self {
+        let profile = step.profile();
+        let name = profile.name;
+        let kind = profile.kind;
+        let sticky = profile.sticky;
+        Self {
+            inner: step,
+            name,
+            kind,
+            sticky,
+            cached_inputs: None,
+            cached_outputs: None,
+            _phantom: PhantomData,
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn resolve_inputs<'a>(
+        &mut self,
+        ctx: &ErasedStepCtx<'a>,
+    ) -> &'a TwoInputHandles<S::InputA, S::InputB> {
+        if let Some((cached_addr, cached)) = self.cached_inputs {
+            // See `TypedStep::resolve_input` for why the address check is
+            // unconditional and the downcast re-check is debug-only.
+            assert_eq!(
+                erased_addr(ctx.input),
+                cached_addr,
+                "cached input handles do not match the dispatch context — a \
+                 TypedStep2 was reused across two ChainContexts"
+            );
+            debug_assert!(
+                ctx.input
+                    .downcast_ref::<TwoInputHandles<S::InputA, S::InputB>>()
+                    .is_some_and(|live| std::ptr::eq(live, cached)),
+                "cached input handles disagree with a fresh downcast of the same box"
+            );
+            // SAFETY: lifetime extension from `'static` (cache slot)
+            // back to `'a` (the dispatch context's lifetime). The
+            // cached pointer was originally a
+            // `&'a TwoInputHandles<S::InputA, S::InputB>` pulled out
+            // of `ChainContexts.inputs[step_idx]`; that box outlives
+            // every `TypedStep2<S>` instance (same point-2/point-3
+            // invariants as `TypedStep::resolve_input`).
+            return unsafe {
+                std::mem::transmute::<
+                    &TwoInputHandles<S::InputA, S::InputB>,
+                    &'a TwoInputHandles<S::InputA, S::InputB>,
+                >(cached)
+            };
+        }
+        let r: &'a TwoInputHandles<S::InputA, S::InputB> = ctx
+            .input
+            .downcast_ref::<TwoInputHandles<S::InputA, S::InputB>>()
+            .expect("input handle downcast failed — Step2 chain topology invariant");
+        // SAFETY: lifetime extension from `'a` to `'static` for
+        // storage. The box outlives `self`; we only ever read the
+        // cache through `resolve_inputs`, which immediately re-extends
+        // back to a bounded `'a` before handing it to user code.
+        let cached: &'static TwoInputHandles<S::InputA, S::InputB> = unsafe {
+            std::mem::transmute::<
+                &'a TwoInputHandles<S::InputA, S::InputB>,
+                &'static TwoInputHandles<S::InputA, S::InputB>,
+            >(r)
+        };
+        self.cached_inputs = Some((erased_addr(ctx.input), cached));
+        r
+    }
+
+    #[allow(unsafe_code)]
+    fn resolve_outputs<'a>(&mut self, ctx: &ErasedStepCtx<'a>) -> &'a OutputHandles<S::Outputs> {
+        if let Some((cached_addr, cached)) = self.cached_outputs {
+            // See `TypedStep::resolve_input` for why the address check is
+            // unconditional and the downcast re-check is debug-only.
+            assert_eq!(
+                erased_addr(ctx.outputs),
+                cached_addr,
+                "cached outputs handle does not match the dispatch context — a \
+                 TypedStep2 was reused across two ChainContexts"
+            );
+            debug_assert!(
+                ctx.outputs
+                    .downcast_ref::<OutputHandles<S::Outputs>>()
+                    .is_some_and(|live| std::ptr::eq(live, cached)),
+                "cached outputs handle disagrees with a fresh downcast of the same box"
+            );
+            // SAFETY: lifetime extension from `'static` (cache slot) back to
+            // `'a`; same boxes/lifetimes story as `resolve_inputs`.
+            return unsafe {
+                std::mem::transmute::<&OutputHandles<S::Outputs>, &'a OutputHandles<S::Outputs>>(
+                    cached,
+                )
+            };
+        }
+        let r: &'a OutputHandles<S::Outputs> = ctx
+            .outputs
+            .downcast_ref::<OutputHandles<S::Outputs>>()
+            .expect("outputs handle downcast failed — Step2 chain topology invariant");
+        // SAFETY: lifetime extension from `'a` to `'static` for storage; same
+        // boxes/lifetimes story as `resolve_inputs`.
+        let cached: &'static OutputHandles<S::Outputs> = unsafe {
+            std::mem::transmute::<&'a OutputHandles<S::Outputs>, &'static OutputHandles<S::Outputs>>(
+                r,
+            )
+        };
+        self.cached_outputs = Some((erased_addr(ctx.outputs), cached));
+        r
+    }
+}
+
+impl<S: Step2> ErasedStep for TypedStep2<S> {
+    fn profile(&self) -> StepProfile {
+        self.inner.profile()
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn kind(&self) -> StepKind {
+        self.kind
+    }
+
+    fn sticky(&self) -> bool {
+        self.sticky
+    }
+
+    fn affinity(&self) -> Affinity {
+        self.inner.affinity()
+    }
+
+    fn detached_group(&self) -> DetachedGroup {
+        self.inner.detached_group()
+    }
+
+    fn try_run_erased(&mut self, ctx: &mut ErasedStepCtx<'_>) -> io::Result<StepOutcome> {
+        let inputs = self.resolve_inputs(ctx);
+        let outputs = self.resolve_outputs(ctx);
+        let mut typed_ctx = StepCtx2::<S> { a: &inputs.a, b: &inputs.b, outputs };
+        self.inner.try_run(&mut typed_ctx)
+    }
+
+    fn clone_boxed(&self) -> Box<dyn ErasedStep> {
+        Box::new(TypedStep2::new(self.inner.new_worker_copy()))
+    }
+
+    fn build_input_handle(
+        &self,
+        _producer_set: &mut OutputQueueSet,
+        _branch_idx: usize,
+    ) -> Box<dyn Any + Send + Sync> {
+        let p = self.profile();
+        panic!(
+            "build_input_handle called on Step2 adapter '{}' (kind = {:?}); \
+             multi-input steps build their inputs via build_two_input_handles. \
+             This is a framework bug — chain-build code should dispatch on \
+             input_arity().",
+            p.name, p.kind
+        );
+    }
+
+    fn input_arity(&self) -> usize {
+        2
+    }
+
+    fn build_two_input_handles(
+        &self,
+        producer_sets: &mut [OutputQueueSet],
+        p0_idx: usize,
+        p0_branch: usize,
+        p1_idx: usize,
+        p1_branch: usize,
+    ) -> Box<dyn Any + Send + Sync> {
+        if p0_idx == p1_idx {
+            assert_ne!(
+                p0_branch,
+                p1_branch,
+                "Step2 inputs must consume distinct branches when they share \
+                 producer step {p0_idx} for step '{}'.",
+                self.profile().name
+            );
+            let set = &mut producer_sets[p0_idx];
+            let a: BranchInputHandle<S::InputA> = set.take_typed_input::<S::InputA>(p0_branch);
+            let b: BranchInputHandle<S::InputB> = set.take_typed_input::<S::InputB>(p1_branch);
+            return Box::new(TwoInputHandles::<S::InputA, S::InputB>::new(a, b));
+        }
+        // Borrow two disjoint elements of `producer_sets` simultaneously.
+        // `split_at_mut(lo+1)` puts producer_sets[lo] in the first half;
+        // we index into the second half for the hi side.
+        let (lo_idx, hi_idx, swap) =
+            if p0_idx < p1_idx { (p0_idx, p1_idx, false) } else { (p1_idx, p0_idx, true) };
+        let (lo_half, hi_half) = producer_sets.split_at_mut(lo_idx + 1);
+        let lo_set: &mut OutputQueueSet = &mut lo_half[lo_idx];
+        let hi_set: &mut OutputQueueSet = &mut hi_half[hi_idx - (lo_idx + 1)];
+        let (a_set, b_set) = if swap {
+            (hi_set, lo_set) // p0 = high, p1 = low
+        } else {
+            (lo_set, hi_set) // p0 = low,  p1 = high
+        };
+        let a: BranchInputHandle<S::InputA> = a_set.take_typed_input::<S::InputA>(p0_branch);
+        let b: BranchInputHandle<S::InputB> = b_set.take_typed_input::<S::InputB>(p1_branch);
+        Box::new(TwoInputHandles::<S::InputA, S::InputB>::new(a, b))
+    }
+
+    fn build_output_set(
+        &self,
+        level: crate::builder::InstrumentationLevel,
+    ) -> (OutputQueueSet, OutputsViewAny) {
+        // Unlike `TypedStep::build_output_set`, a `Step2` does NOT collapse a
+        // `ByOrdinal` / `ByItemOrdinal` output to `None` for `Serial` /
+        // `Exclusive` kinds — the ordering is passed through verbatim and the
+        // reorder stage is kept.
+        //
+        // The single-input collapse rests on a universal property: a Serial
+        // single-input step consumes one already-ordered stream, so any input
+        // ordinal it propagates onto an output is emitted in push order, making
+        // the reorder stage redundant. A two-input MERGE has no such guarantee.
+        // It interleaves two branches, so a `ByItemOrdinal` output that
+        // propagates an *input's* ordinal can be pushed out of ordinal order
+        // even under serial (mutex-serialized, single-dispatcher) execution —
+        // e.g. when branch B's next-needed ordinal hasn't arrived yet but
+        // branch A's later one has. For such a step the reorder stage is
+        // load-bearing: dropping it would deliver records out of order.
+        //
+        // Today's production `Step2`s happen not to need it (`PairRawFastq`
+        // declares `BranchOrdering::None`; `ZipperMergeStep` assigns fresh
+        // *sequential* output ordinals, so its push order already equals its
+        // ordinal order). But the framework cannot assume that for an arbitrary
+        // merge, so it conservatively keeps the reorder for every ordered Step2
+        // output. Do not add the single-input collapse here: a `Step2` that
+        // propagates an input ordinal can emit out of ordinal order even under
+        // serial execution, so dropping the reorder would deliver records out of
+        // order.
+        // Bind the profile once — each `profile()` call rebuilds its two `Vec`s.
+        // Matches the single-input adapter and this adapter's own
+        // `build_fused_output_set`.
+        let profile = self.inner.profile();
+        <S::Outputs as StepOutputs>::build_queues(
+            &profile.output_queues,
+            &profile.branch_ordering,
+            level,
+        )
+    }
+
+    fn build_fused_output_set(
+        &self,
+        _level: crate::builder::InstrumentationLevel,
+    ) -> (OutputQueueSet, OutputsViewAny) {
+        // `is_fusible_chain` rejects any step with `input_arity() > 1`, so a
+        // `Step2` never reaches the fused driver. Collapsing its ordering to
+        // `None` here would drop the reorder stage that `build_output_set`
+        // documents as load-bearing for a merge, so refuse instead of
+        // returning an unordered transport.
+        panic!(
+            "build_fused_output_set called on Step2 adapter '{}': fusing a \
+             two-input merge would drop its load-bearing reorder stage. \
+             Extend the fused driver's ordering handling before allowing this.",
+            self.name
+        );
+    }
+
+    fn wrap_outputs_view(&self, view: OutputsViewAny) -> Box<dyn Any + Send + Sync> {
+        let typed: OutputHandles<S::Outputs> = OutputHandles::<S::Outputs>::new(view);
+        Box::new(typed)
+    }
+
+    fn mark_outputs_drained(&self, outputs: &(dyn Any + Send + Sync)) {
+        let typed = outputs
+            .downcast_ref::<OutputHandles<S::Outputs>>()
+            .expect("mark_outputs_drained downcast failed — Step2 chain topology invariant");
+        <S::Outputs as StepOutputs>::mark_all_drained(typed);
+    }
+
+    fn is_source(&self) -> bool {
+        // Step2 consumers are never sources by definition (they have
+        // two non-unit input branches).
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::handles::BranchInputHandle;
+    use crate::outputs::Single;
+    use crate::queues::QueueSpec;
+    use crate::reorder::BranchOrdering;
+    use crate::step::{
+        InputHandle, OutputHandles, Step, StepCtx, StepCtx2, StepKind, StepOutcome, StepProfile,
+    };
+
+    /// Trivial step: u32 → u32+1 (single output).
+    #[derive(Clone)]
+    struct AddOne;
+
+    impl Step for AddOne {
+        type Input = u32;
+        type Outputs = Single<u32>;
+
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "AddOne",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(n) => {
+                    let _ = ctx.outputs.push(n + 1);
+                    Ok(StepOutcome::Progress)
+                }
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Build a `(producer_set, producer_outputs)` pair so we can simulate a
+    /// chain link by manually constructing the upstream side.
+    fn build_addone_outputs() -> (OutputQueueSet, OutputHandles<Single<u32>>) {
+        let producer: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
+        let (queue_set, outputs_view) =
+            producer.build_output_set(crate::builder::InstrumentationLevel::Off);
+        let outputs: OutputHandles<Single<u32>> = OutputHandles::new(outputs_view);
+        (queue_set, outputs)
+    }
+
+    #[rstest]
+    #[case(StepKind::Serial, false)]
+    #[case(StepKind::Serial, true)]
+    #[case(StepKind::Parallel, false)]
+    #[case(StepKind::Parallel, true)]
+    #[case(StepKind::Exclusive, false)]
+    #[case(StepKind::Exclusive, true)]
+    #[case(StepKind::Detached, false)]
+    #[case(StepKind::Detached, true)]
+    fn cached_kind_and_sticky_match_profile(#[case] kind: StepKind, #[case] sticky: bool) {
+        // The `kind()` / `sticky()` accessors return values cached at
+        // construction (so the setup passes don't rebuild the profile's `Vec`s).
+        // They must agree with `profile()` for every kind/sticky combination,
+        // or a stale cache could mis-route worker assignment. Each combination is
+        // an independent `#[case]` so a failure isolates the offending pair.
+        #[derive(Clone)]
+        struct Tagged(StepKind, bool);
+        impl Step for Tagged {
+            type Input = u32;
+            type Outputs = Single<u32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "Tagged",
+                    kind: self.0,
+                    sticky: self.1,
+                    output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                    branch_ordering: vec![BranchOrdering::None],
+                }
+            }
+            fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(StepOutcome::NoProgress)
+            }
+            fn new_worker_copy(&self) -> Self {
+                self.clone()
+            }
+        }
+
+        let erased: Box<dyn ErasedStep> = Box::new(TypedStep::new(Tagged(kind, sticky)));
+        let profile = erased.profile();
+        assert_eq!(erased.kind(), profile.kind, "kind() must match profile for {kind:?}");
+        assert_eq!(
+            erased.sticky(),
+            profile.sticky,
+            "sticky() must match profile for {kind:?}/{sticky}"
+        );
+    }
+
+    #[rstest]
+    #[case(StepKind::Serial, false)]
+    #[case(StepKind::Serial, true)]
+    #[case(StepKind::Parallel, false)]
+    #[case(StepKind::Parallel, true)]
+    #[case(StepKind::Exclusive, false)]
+    #[case(StepKind::Exclusive, true)]
+    #[case(StepKind::Detached, false)]
+    #[case(StepKind::Detached, true)]
+    fn cached_kind_and_sticky_match_profile_step2(#[case] kind: StepKind, #[case] sticky: bool) {
+        // Mirror `cached_kind_and_sticky_match_profile` for the `Step2` adapter.
+        // `TypedStep2::{new, kind, sticky}` caches the same metadata at
+        // construction, and runtime setup reads `ErasedStep::kind()`/`sticky()`
+        // for ALL erased steps — `Step` and `Step2` alike (e.g. zipper's merge
+        // step). A stale `TypedStep2` cache could mis-route owner assignment for
+        // a merge step just as a `TypedStep` cache could, so pin both paths.
+        #[derive(Clone)]
+        struct Tagged2(StepKind, bool);
+        impl Step2 for Tagged2 {
+            type InputA = u32;
+            type InputB = u32;
+            type Outputs = Single<u32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "Tagged2",
+                    kind: self.0,
+                    sticky: self.1,
+                    output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                    branch_ordering: vec![BranchOrdering::None],
+                }
+            }
+            fn try_run(&mut self, _ctx: &mut StepCtx2<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(StepOutcome::NoProgress)
+            }
+            fn new_worker_copy(&self) -> Self {
+                self.clone()
+            }
+        }
+
+        let erased: Box<dyn ErasedStep> = Box::new(TypedStep2::new(Tagged2(kind, sticky)));
+        let profile = erased.profile();
+        assert_eq!(erased.kind(), profile.kind, "kind() must match profile for {kind:?}");
+        assert_eq!(
+            erased.sticky(),
+            profile.sticky,
+            "sticky() must match profile for {kind:?}/{sticky}"
+        );
+    }
+
+    #[test]
+    fn typed_step_round_trips_through_erased_dispatch() {
+        // Producer's output set carries the input handle that the consumer
+        // (also an AddOne) will pull from. The consumer's own output set is
+        // separate.
+        let (mut producer_set, producer_outputs) = build_addone_outputs();
+
+        // Push a u32 onto the producer's output (which is the consumer's input).
+        producer_outputs.push(41).unwrap();
+
+        // Consumer takes the typed input handle out of the producer's set.
+        let mut consumer: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
+        let input_any = consumer.build_input_handle(&mut producer_set, 0);
+
+        // Consumer needs its own output set + view to run.
+        let (consumer_set, consumer_view) =
+            consumer.build_output_set(crate::builder::InstrumentationLevel::Off);
+        let consumer_outputs: OutputHandles<Single<u32>> = OutputHandles::new(consumer_view);
+
+        let signal = PipelineSignal::new();
+        let mut ctx = ErasedStepCtx {
+            input: input_any.as_ref(),
+            outputs: &consumer_outputs as &(dyn Any + Send + Sync),
+            signal: &signal,
+        };
+        let outcome = consumer.try_run_erased(&mut ctx).unwrap();
+        assert_eq!(outcome, StepOutcome::Progress);
+
+        // Consumer pushed (41 + 1) = 42 onto its own output. Pull it.
+        let mut consumer_set = consumer_set;
+        let consumer_input = consumer_set.take_typed_input::<u32>(0);
+        assert_eq!(consumer_input.pop(), Some(42));
+    }
+
+    /// Every other dispatch test calls `try_run_erased` exactly once, so
+    /// `resolve_input` / `resolve_outputs` always take the first-resolve path
+    /// and the cached-hit arm — which holds both `transmute`s and the
+    /// box-address assert guarding the dispatch-identity invariant — is never
+    /// executed. Dispatch twice against the same `ErasedStepCtx` so the second
+    /// call resolves from cache.
+    #[test]
+    fn second_dispatch_resolves_handles_from_the_cache() {
+        let (mut producer_set, producer_outputs) = build_addone_outputs();
+        producer_outputs.push(1).unwrap();
+        producer_outputs.push(2).unwrap();
+
+        let mut consumer: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
+        let input_any = consumer.build_input_handle(&mut producer_set, 0);
+        let (mut consumer_set, consumer_view) =
+            consumer.build_output_set(crate::builder::InstrumentationLevel::Off);
+        let consumer_outputs: OutputHandles<Single<u32>> = OutputHandles::new(consumer_view);
+
+        let signal = PipelineSignal::new();
+        let mut ctx = ErasedStepCtx {
+            input: input_any.as_ref(),
+            outputs: &consumer_outputs as &(dyn Any + Send + Sync),
+            signal: &signal,
+        };
+        // First dispatch populates the cache; the second must hit it — and both
+        // its unconditional box-address assert and the debug-only downcast
+        // re-check, which is live in this test build.
+        assert_eq!(consumer.try_run_erased(&mut ctx).unwrap(), StepOutcome::Progress);
+        assert_eq!(consumer.try_run_erased(&mut ctx).unwrap(), StepOutcome::Progress);
+
+        let out = consumer_set.take_typed_input::<u32>(0);
+        assert_eq!(
+            (out.pop(), out.pop()),
+            (Some(2), Some(3)),
+            "both dispatches must produce output through the cached handles"
+        );
+    }
+
+    /// Point 3 of the `TypedStep` safety argument — every dispatch passes the
+    /// same box for a given `step_idx` — is the one the compiler cannot enforce.
+    /// A step whose cache is populated and is then handed a *different* input box
+    /// must panic rather than resolve from the stale entry. The check is an
+    /// unconditional `assert!`, so this holds in release builds too; when it was
+    /// a `debug_assert!` a release build read through the pointer into the
+    /// previous `ChainContexts` instead.
+    #[test]
+    #[should_panic(expected = "cached input handle does not match the dispatch context")]
+    fn dispatch_against_a_different_context_box_panics() {
+        let (mut first_producer_set, first_producer_outputs) = build_addone_outputs();
+        first_producer_outputs.push(1).unwrap();
+        let (mut second_producer_set, second_producer_outputs) = build_addone_outputs();
+        second_producer_outputs.push(2).unwrap();
+
+        let mut consumer: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
+        let first_input = consumer.build_input_handle(&mut first_producer_set, 0);
+        let second_input = consumer.build_input_handle(&mut second_producer_set, 0);
+        let (_consumer_set, consumer_view) =
+            consumer.build_output_set(crate::builder::InstrumentationLevel::Off);
+        let consumer_outputs: OutputHandles<Single<u32>> = OutputHandles::new(consumer_view);
+        let outputs_any = &consumer_outputs as &(dyn Any + Send + Sync);
+
+        let signal = PipelineSignal::new();
+        // First dispatch populates the cache from `first_input`.
+        let mut ctx =
+            ErasedStepCtx { input: first_input.as_ref(), outputs: outputs_any, signal: &signal };
+        assert_eq!(consumer.try_run_erased(&mut ctx).unwrap(), StepOutcome::Progress);
+
+        // Same step, different input box — the invariant violation.
+        let mut wrong_ctx =
+            ErasedStepCtx { input: second_input.as_ref(), outputs: outputs_any, signal: &signal };
+        let _ = consumer.try_run_erased(&mut wrong_ctx);
+    }
+
+    #[test]
+    fn typed_step_returns_noprogress_on_empty_input() {
+        let (mut producer_set, _producer_outputs) = build_addone_outputs();
+        let mut consumer: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
+        let input_any = consumer.build_input_handle(&mut producer_set, 0);
+
+        let (_consumer_set, consumer_view) =
+            consumer.build_output_set(crate::builder::InstrumentationLevel::Off);
+        let consumer_outputs: OutputHandles<Single<u32>> = OutputHandles::new(consumer_view);
+
+        let signal = PipelineSignal::new();
+        let mut ctx = ErasedStepCtx {
+            input: input_any.as_ref(),
+            outputs: &consumer_outputs as &(dyn Any + Send + Sync),
+            signal: &signal,
+        };
+        let outcome = consumer.try_run_erased(&mut ctx).unwrap();
+        assert_eq!(outcome, StepOutcome::NoProgress);
+    }
+
+    #[test]
+    fn clone_boxed_yields_independent_step() {
+        let original: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
+        let cloned = original.clone_boxed();
+        assert_eq!(original.profile().name, "AddOne");
+        assert_eq!(cloned.profile().name, "AddOne");
+    }
+
+    /// `ErasedStep::name()` (the per-dispatch, allocation-free accessor)
+    /// must agree with `profile().name`, including across `clone_boxed`
+    /// (the per-worker clone path that re-caches the name in `new`).
+    #[test]
+    fn erased_name_matches_profile_name() {
+        let step: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
+        assert_eq!(step.name(), step.profile().name);
+        assert_eq!(step.name(), "AddOne");
+        let cloned = step.clone_boxed();
+        assert_eq!(cloned.name(), cloned.profile().name);
+        assert_eq!(cloned.name(), "AddOne");
+    }
+
+    #[test]
+    fn build_output_set_uses_profile_queues_and_ordering() {
+        let typed: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
+        let (mut queue_set, _outputs_view) =
+            typed.build_output_set(crate::builder::InstrumentationLevel::Off);
+        assert_eq!(queue_set.n_branches(), 1);
+        // Verify the queue is u32-typed by taking the input handle.
+        let input = queue_set.take_typed_input::<u32>(0);
+        // Empty initially.
+        assert_eq!(input.pop(), None);
+    }
+
+    /// The fused transport keeps the profile's queue bound; only the ordering is
+    /// dropped. It previously forced `QueueSpec::Unbounded` on every branch, so a
+    /// step emitting more items per `try_run` than its consumer removed grew the
+    /// edge by the difference on every pass of the fused driver — the driver runs
+    /// a producer before its consumer, so nothing capped it. `AddOne` declares
+    /// `CountBounded { capacity: 4 }`, so the fifth push must be rejected.
+    #[test]
+    fn build_fused_output_set_keeps_the_profile_queue_bound() {
+        let typed: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
+        let (mut queue_set, outputs_view) =
+            typed.build_fused_output_set(crate::builder::InstrumentationLevel::Off);
+        assert_eq!(queue_set.n_branches(), 1);
+        let outputs: OutputHandles<Single<u32>> = OutputHandles::new(outputs_view);
+
+        for n in 0..4u32 {
+            outputs.push(n).expect("the capacity-4 fused transport admits four items");
+        }
+        assert!(
+            outputs.push(4).is_err(),
+            "the fused transport must apply the profile's capacity-4 backpressure \
+             rather than growing without limit"
+        );
+
+        // Backpressure, not a wedge: draining one item frees exactly one slot.
+        let input = queue_set.take_typed_input::<u32>(0);
+        assert_eq!(input.pop(), Some(0), "direct FIFO transport, no reorder stage");
+        outputs.push(4).expect("one pop frees one slot");
+    }
+
+    #[test]
+    fn build_input_handle_downcasts_to_typed_branch_handle() {
+        // Producer pushes a value onto its output.
+        let (mut producer_set, producer_outputs) = build_addone_outputs();
+        producer_outputs.push(7).unwrap();
+
+        // Consumer grabs the typed input handle.
+        let consumer: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
+        let input_any = consumer.build_input_handle(&mut producer_set, 0);
+        let input =
+            input_any.downcast_ref::<BranchInputHandle<u32>>().expect("input handle downcast");
+        assert_eq!(input.pop(), Some(7));
+    }
+
+    #[test]
+    fn wrap_outputs_view_yields_typed_outputs_handles() {
+        let typed: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
+        let (mut queue_set, view) =
+            typed.build_output_set(crate::builder::InstrumentationLevel::Off);
+        let outputs_any = typed.wrap_outputs_view(view);
+
+        // Downcast back to OutputHandles<Single<u32>> and push.
+        let outputs = outputs_any
+            .downcast_ref::<OutputHandles<Single<u32>>>()
+            .expect("OutputHandles downcast");
+        outputs.push(99).unwrap();
+
+        let input = queue_set.take_typed_input::<u32>(0);
+        assert_eq!(input.pop(), Some(99));
+    }
+
+    #[test]
+    fn mark_outputs_drained_propagates_to_consumer_input() {
+        // Producer is an AddOne; its outputs feed a consumer's input.
+        let producer: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
+        let (mut producer_set, producer_view) =
+            producer.build_output_set(crate::builder::InstrumentationLevel::Off);
+        let producer_outputs_any = producer.wrap_outputs_view(producer_view);
+
+        let consumer: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
+        let input_any = consumer.build_input_handle(&mut producer_set, 0);
+        let consumer_input = input_any
+            .downcast_ref::<BranchInputHandle<u32>>()
+            .expect("consumer input handle is BranchInputHandle<u32>");
+
+        // Initially not drained.
+        assert!(!InputHandle::is_drained(consumer_input));
+
+        // Producer marks its outputs drained via the type-erased path.
+        producer.mark_outputs_drained(producer_outputs_any.as_ref());
+
+        // Drained signal reaches consumer.
+        assert!(InputHandle::is_drained(consumer_input));
+    }
+
+    /// Multi-output step: u32 → (u32, u32) split into low + high bytes.
+    #[derive(Clone)]
+    struct SplitBytes;
+
+    impl Step for SplitBytes {
+        type Input = u32;
+        type Outputs = (u32, u32);
+
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "SplitBytes",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![
+                    QueueSpec::CountBounded { capacity: 2 },
+                    QueueSpec::CountBounded { capacity: 2 },
+                ],
+                branch_ordering: vec![BranchOrdering::None, BranchOrdering::None],
+            }
+        }
+
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(n) => {
+                    let v = ctx.outputs.view();
+                    let _ = v.a.push(n & 0xFF);
+                    let _ = v.b.push((n >> 8) & 0xFF);
+                    Ok(StepOutcome::Progress)
+                }
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    #[test]
+    fn split_bytes_routes_to_two_branches() {
+        // Producer feeding `SplitBytes`: another AddOne (Single<u32> → Single<u32>).
+        // We just need a way to feed u32 into SplitBytes, so reuse AddOne's outputs.
+        let (mut producer_set, producer_outputs) = build_addone_outputs();
+        producer_outputs.push(0xABCD).unwrap();
+
+        // SplitBytes is the consumer; takes the typed input from the producer.
+        let mut splitter: Box<dyn ErasedStep> = Box::new(TypedStep::new(SplitBytes));
+        let input_any = splitter.build_input_handle(&mut producer_set, 0);
+
+        // Splitter's own output set has two branches.
+        let (mut splitter_set, splitter_view) =
+            splitter.build_output_set(crate::builder::InstrumentationLevel::Off);
+        let splitter_outputs: OutputHandles<(u32, u32)> = OutputHandles::new(splitter_view);
+
+        let signal = PipelineSignal::new();
+        let mut ctx = ErasedStepCtx {
+            input: input_any.as_ref(),
+            outputs: &splitter_outputs as &(dyn Any + Send + Sync),
+            signal: &signal,
+        };
+
+        let outcome = splitter.try_run_erased(&mut ctx).unwrap();
+        assert_eq!(outcome, StepOutcome::Progress);
+
+        let in_a = splitter_set.take_typed_input::<u32>(0);
+        let in_b = splitter_set.take_typed_input::<u32>(1);
+        assert_eq!(in_a.pop(), Some(0xCD));
+        assert_eq!(in_b.pop(), Some(0xAB));
+    }
+
+    #[test]
+    fn is_source_true_for_unit_input_steps() {
+        #[derive(Clone)]
+        struct UnitInputStep;
+        impl Step for UnitInputStep {
+            type Input = ();
+            type Outputs = Single<u32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "UnitInput",
+                    kind: StepKind::Exclusive,
+                    sticky: false,
+                    output_queues: vec![QueueSpec::CountBounded { capacity: 1 }],
+                    branch_ordering: vec![BranchOrdering::ByOrdinal],
+                }
+            }
+            fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(StepOutcome::Finished)
+            }
+        }
+
+        let source: Box<dyn ErasedStep> = Box::new(TypedStep::new(UnitInputStep));
+        let mid: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
+        assert!(source.is_source());
+        assert!(!mid.is_source());
+    }
+
+    /// Pins the deliberate asymmetry between `TypedStep::build_output_set`
+    /// (collapses ordered output → `None` for Serial/Exclusive) and
+    /// `TypedStep2::build_output_set` (keeps the reorder stage). A two-input
+    /// merge can push a `ByItemOrdinal` output out of ordinal order even under
+    /// serial execution, so the reorder stage is load-bearing. This test fails
+    /// if a future change adds the single-input collapse to the Step2 path.
+    #[test]
+    fn step2_serial_byitemordinal_output_is_reordered_not_collapsed() {
+        use crate::item::{HeapSize, Ordered};
+        use crate::outputs::OrderedBytesSingle;
+        use crate::step::{Step2, StepCtx2};
+
+        #[derive(Debug)]
+        struct Ord32 {
+            ordinal: u64,
+        }
+        impl HeapSize for Ord32 {
+            fn heap_size(&self) -> usize {
+                0
+            }
+        }
+        impl Ordered for Ord32 {
+            fn ordinal(&self) -> u64 {
+                self.ordinal
+            }
+        }
+
+        // A Serial two-input merge with a `ByItemOrdinal` output. We only need
+        // its output edge (via `build_output_set`), never run it, so `try_run`
+        // is trivial.
+        struct OutOfOrderMerge;
+        impl Step2 for OutOfOrderMerge {
+            type InputA = u32;
+            type InputB = u32;
+            type Outputs = OrderedBytesSingle<Ord32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "OutOfOrderMerge",
+                    kind: StepKind::Serial,
+                    sticky: false,
+                    output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 64 * 1024 }],
+                    branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+                }
+            }
+            fn try_run(&mut self, _ctx: &mut StepCtx2<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+
+        let step: Box<dyn ErasedStep> = Box::new(TypedStep2::new(OutOfOrderMerge));
+        let (mut queue_set, view) =
+            step.build_output_set(crate::builder::InstrumentationLevel::Off);
+        let outputs_any = step.wrap_outputs_view(view);
+        let outputs = outputs_any
+            .downcast_ref::<OutputHandles<OrderedBytesSingle<Ord32>>>()
+            .expect("OutputHandles downcast");
+
+        // Push OUT of ordinal order: 2, then 0, then 1.
+        outputs.push(Ord32 { ordinal: 2 }).unwrap();
+        outputs.push(Ord32 { ordinal: 0 }).unwrap();
+        outputs.push(Ord32 { ordinal: 1 }).unwrap();
+
+        // The reorder stage must deliver them in ORDINAL order (0, 1, 2). With
+        // the single-input collapse the consumer would see push order (2, 0, 1).
+        let input = queue_set.take_typed_input::<Ord32>(0);
+        let got: Vec<u64> = std::iter::from_fn(|| input.pop().map(|o| o.ordinal)).collect();
+        assert_eq!(got, vec![0, 1, 2], "ordered Step2 output must be reordered by ordinal");
+    }
+
+    /// Input construction is dispatched on `input_arity()`, so a single-input
+    /// adapter must never be asked for two-input handles and a `Step2` adapter
+    /// must never be asked for one. Both defaults panic rather than silently
+    /// mis-wiring a chain, and both messages must name the step so a real hit
+    /// is debuggable. These pin the guard, not the happy path.
+    #[test]
+    #[should_panic(expected = "AddOne")]
+    fn build_two_input_handles_on_a_single_input_adapter_panics() {
+        let step: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
+        let (mut producer_set, _view) =
+            step.build_output_set(crate::builder::InstrumentationLevel::Off);
+        let _ = step.build_two_input_handles(std::slice::from_mut(&mut producer_set), 0, 0, 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "build_input_handle called on Step2 adapter")]
+    fn build_input_handle_on_a_step2_adapter_panics() {
+        use crate::step::{Step2, StepCtx2};
+
+        #[derive(Clone)]
+        struct JoinStub;
+        impl Step2 for JoinStub {
+            type InputA = u32;
+            type InputB = u32;
+            type Outputs = ();
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "JoinStub",
+                    kind: StepKind::Serial,
+                    sticky: false,
+                    output_queues: vec![],
+                    branch_ordering: vec![],
+                }
+            }
+            fn try_run(&mut self, _ctx: &mut StepCtx2<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+
+        let (mut producer_set, _outputs) = build_addone_outputs();
+        let step: Box<dyn ErasedStep> = Box::new(TypedStep2::new(JoinStub));
+        let _ = step.build_input_handle(&mut producer_set, 0);
+    }
+}

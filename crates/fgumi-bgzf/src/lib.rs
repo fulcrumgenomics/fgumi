@@ -17,9 +17,9 @@ pub use header::{
     is_bgzf_header,
 };
 pub use reader::{
-    BGZF_EOF, BGZF_FOOTER_SIZE, RawBgzfBlock, decompress_block, decompress_block_into,
-    decompress_block_into_opts, decompress_block_slice_into, decompress_block_slice_into_opts,
-    read_raw_blocks,
+    BGZF_EOF, BGZF_FOOTER_SIZE, MAX_UNCOMPRESSED_BLOCK_SIZE, RawBgzfBlock, decompress_block,
+    decompress_block_into, decompress_block_into_opts, decompress_block_slice_into,
+    decompress_block_slice_into_opts, decompress_into_slice, read_raw_blocks, uncompressed_size,
 };
 // Re-export the libdeflater decompressor so downstream crates can name the type
 // required by `decompress_block_into_opts` without depending on libdeflater

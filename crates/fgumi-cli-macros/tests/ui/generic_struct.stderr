@@ -1,0 +1,5 @@
+error: multi_options does not support generic structs: the generated Multi struct and its conversions are emitted without generic parameters, so the expansion would not compile. Use a concrete options struct.
+  --> tests/ui/generic_struct.rs:11:23
+   |
+11 | pub struct GenericOpts<T>
+   |                       ^^^

@@ -291,8 +291,6 @@ pub struct PooledInputStream {
     current_buf: Vec<u8>,
     /// Read position within `current_buf`.
     current_pos: usize,
-    /// Where this stream records the ingest thread's waits.
-    stats: std::sync::Arc<crate::phase1_stats::Phase1IngestStats>,
     /// Reusable scratch buffer for records (or their length prefixes) that
     /// straddle a decompressed-block boundary and therefore cannot be borrowed
     /// directly out of `current_buf`. See [`PooledInputStream::next_record_borrowed`].
@@ -307,14 +305,12 @@ impl PooledInputStream {
         decompressed_input_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
         input_read_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
         decompression_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        stats: std::sync::Arc<crate::phase1_stats::Phase1IngestStats>,
     ) -> Self {
         Self {
             decompressed_input,
             decompressed_input_done,
             input_read_error,
             decompression_error,
-            stats,
             reorder: fgumi_bam_io::ReorderBuffer::new(),
             current_buf: Vec::new(),
             current_pos: 0,
@@ -387,27 +383,8 @@ impl PooledInputStream {
                 return None;
             }
 
-            // Park until a worker pushes a block and calls unpark().
-            //
-            // Timed exactly rather than sampled: a park is microseconds to
-            // milliseconds against a ~30 ns clock read, so the clock is orders of
-            // magnitude below the quantity it measures. The cause is captured
-            // before parking because it is not recoverable afterwards -- and the
-            // two causes have different fixes. An empty reorder buffer means the
-            // workers are behind; a non-empty one means blocks are ready and the
-            // serial order will not let the consumer have them, which no amount
-            // of extra decompression capacity would help.
-            let cause = if self.reorder.buffer_len() == 0 {
-                crate::phase1_stats::ParkCause::Starved
-            } else {
-                crate::phase1_stats::ParkCause::HeadOfLine
-            };
-            let parked_at = std::time::Instant::now();
+            // Park until a worker pushes a block and calls unpark()
             std::thread::park();
-            self.stats.record_park(
-                u64::try_from(parked_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                cause,
-            );
 
             // After waking, check for errors before looping back to drain.
             // A worker may have set an error flag instead of pushing a block.
@@ -422,7 +399,7 @@ impl PooledInputStream {
     /// Read the next raw BAM record, borrowing its bytes from the current
     /// decompressed block when possible.
     ///
-    /// This is the borrow-in-place counterpart to [`read_raw_record`]: it removes
+    /// This is the borrow-in-place counterpart to [`fgumi_raw_bam::read_raw_record`]: it removes
     /// the per-record `read_exact` copy into a `RawRecord` on the common path
     /// where the record body lies wholly within the current decompressed block.
     ///
@@ -437,7 +414,7 @@ impl PooledInputStream {
     /// The returned slice borrows `self`; it is invalidated by the next call to
     /// any method on this stream. Returns `Ok(None)` at clean EOF.
     ///
-    /// A `block_size` of 0 is treated as EOF, mirroring [`read_raw_record`].
+    /// A `block_size` of 0 is treated as EOF, mirroring [`fgumi_raw_bam::read_raw_record`].
     ///
     /// # Errors
     ///
@@ -829,7 +806,6 @@ mod tests {
             Arc::new(AtomicBool::new(true)), // decompressed_input_done
             Arc::new(AtomicBool::new(false)), // input_read_error
             Arc::new(AtomicBool::new(false)), // decompression_error
-            Arc::default(),                  // ingest wait counters
         )
     }
 
@@ -937,7 +913,6 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
-            Arc::default(),
         );
         let err = pooled.next_record_borrowed().expect_err("truncated body should error");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
