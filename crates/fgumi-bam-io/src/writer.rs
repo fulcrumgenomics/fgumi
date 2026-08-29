@@ -43,6 +43,9 @@ use crate::vendored::{BlockInfoRx, MultithreadedWriter, MultithreadedWriterBuild
 ///   `BGZF_BLOCK_SIZE` (`crate::vendored::bgzf_multithreaded`), a deliberately
 ///   independent copy that keeps the vendored module self-contained. It is equal
 ///   to this value today; keep the two in step, since nothing enforces it.
+/// - The arena chain sink's inline indexer, which derives physical-block numbers
+///   as `uoffset / fgumi_bgzf::BGZF_MAX_BLOCK_SIZE` — statically equal to this
+///   value (`fgumi-bgzf/src/writer.rs:17,325`).
 const MAX_BLOCK_SIZE: usize = bgzf::BGZF_BLOCK_SIZE;
 
 /// Fast, non-cryptographic hasher for the dense sequential `u64` block numbers
@@ -360,23 +363,41 @@ struct CachedIndexEntry {
     offset_in_block: usize,
     /// Length of record (including 4-byte size prefix).
     record_len: usize,
-    /// Alignment context: (reference ID, start, end, mapped flag).
-    alignment_context: Option<(usize, Position, Position, bool)>,
+    /// Alignment context, if the record is placed.
+    alignment_context: Option<AlignmentContext>,
+}
+
+/// A placed record's reference, span, and mapped status.
+///
+/// Public so pipeline steps in other crates can extract context once and carry
+/// it in the BAM index manifest, keeping this the single source of the logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlignmentContext {
+    /// Reference sequence ID (0-based).
+    pub ref_id: usize,
+    /// 1-based start position (inclusive).
+    pub start: Position,
+    /// 1-based end position (exclusive), spanning the reference length
+    /// consumed by the CIGAR (see [`extract_alignment_context`]).
+    pub end: Position,
+    /// Whether the record is mapped (the `UNMAPPED` flag is unset).
+    pub is_mapped: bool,
 }
 
 /// Extract alignment context from raw BAM bytes.
 ///
-/// Returns `Some((ref_id, start, end, is_mapped))` for any read that has a
-/// reference and a position — **including a placed-but-unmapped read** (e.g. the
-/// unmapped mate of a mapped read, which carries its mate's `tid`/`pos` so it
-/// sorts alongside it). Such reads are position-binned exactly as htslib/samtools
-/// do, so region queries and `idxstats` see them; the `is_mapped` flag records
-/// that they are unmapped without excluding them from the index. Only a truly
-/// unplaced read (no reference or no position) returns `None`, which the indexer
-/// counts toward the unplaced total.
+/// Returns `Some(AlignmentContext)` for any read that has a reference and a
+/// position — **including a placed-but-unmapped read** (e.g. the unmapped mate
+/// of a mapped read, which carries its mate's `tid`/`pos` so it sorts alongside
+/// it). Such reads are position-binned exactly as htslib/samtools do, so region
+/// queries and `idxstats` see them; the `is_mapped` flag records that they are
+/// unmapped without excluding them from the index. Only a truly unplaced read
+/// (no reference or no position) returns `None`, which the indexer counts
+/// toward the unplaced total.
 #[inline]
+#[must_use]
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-pub(crate) fn extract_alignment_context(bam: &[u8]) -> Option<(usize, Position, Position, bool)> {
+pub fn extract_alignment_context(bam: &[u8]) -> Option<AlignmentContext> {
     let v = fgumi_raw_bam::RawRecordView::new(bam);
     let tid = v.ref_id();
     let pos = v.pos();
@@ -401,7 +422,7 @@ pub(crate) fn extract_alignment_context(bam: &[u8]) -> Option<(usize, Position, 
     let start = Position::try_from((pos + 1) as usize).ok()?;
     let end = Position::try_from((pos + ref_len) as usize).ok()?;
 
-    Some((tid as usize, start, end, is_mapped))
+    Some(AlignmentContext { ref_id: tid as usize, start, end, is_mapped })
 }
 
 /// Incrementally builds a BAI index from per-record positions plus per-block
@@ -534,7 +555,7 @@ impl BaiBuilder {
             // starts a fresh run. The record's own context still drives bin
             // routing and the linear index inside `add_record`; only the chunk's
             // start position is widened.
-            let chunk_start = if let Some((reference_sequence_id, start, end, _)) =
+            let chunk_start = if let Some(AlignmentContext { ref_id, start, end, .. }) =
                 alignment_context
             {
                 let bin = reg2bin(start, end);
@@ -542,13 +563,15 @@ impl BaiBuilder {
                 // `self.run` below doesn't overlap the borrow.
                 let current = self.run.as_ref().map(|r| (r.reference_sequence_id, r.bin, r.start));
                 match current {
-                    Some((run_ref, run_bin, run_start))
-                        if run_ref == reference_sequence_id && run_bin == bin =>
-                    {
+                    Some((run_ref, run_bin, run_start)) if run_ref == ref_id && run_bin == bin => {
                         run_start
                     }
                     _ => {
-                        self.run = Some(ChunkRun { reference_sequence_id, bin, start: start_vpos });
+                        self.run = Some(ChunkRun {
+                            reference_sequence_id: ref_id,
+                            bin,
+                            start: start_vpos,
+                        });
                         start_vpos
                     }
                 }
@@ -559,7 +582,10 @@ impl BaiBuilder {
                 start_vpos
             };
             self.indexer
-                .add_record(alignment_context, Chunk::new(chunk_start, end_vpos))
+                .add_record(
+                    alignment_context.map(|c| (c.ref_id, c.start, c.end, c.is_mapped)),
+                    Chunk::new(chunk_start, end_vpos),
+                )
                 .map_err(io::Error::other)?;
             self.entry_cache.pop_front();
         }
@@ -1508,20 +1534,18 @@ mod tests {
         // binned over a 1-base span at its position, flagged unmapped — so region
         // queries and idxstats see it, matching htslib.
         let rec = create_placed_unmapped_bam_record(0, 100, b"unmapped_mate");
-        let (ref_id, start, end, is_mapped) =
-            extract_alignment_context(&rec).expect("placed-unmapped read must be binned");
-        assert_eq!(ref_id, 0);
-        assert_eq!(usize::from(start), 101, "0-based pos 100 -> 1-based 101");
-        assert_eq!(usize::from(end), 101, "no CIGAR -> 1-base span [pos, pos+1)");
-        assert!(!is_mapped, "flag must still record it as unmapped");
+        let ctx = extract_alignment_context(&rec).expect("placed-unmapped read must be binned");
+        assert_eq!(ctx.ref_id, 0);
+        assert_eq!(usize::from(ctx.start), 101, "0-based pos 100 -> 1-based 101");
+        assert_eq!(usize::from(ctx.end), 101, "no CIGAR -> 1-base span [pos, pos+1)");
+        assert!(!ctx.is_mapped, "flag must still record it as unmapped");
 
         // A mapped read is binned over its CIGAR span and flagged mapped.
         let mapped = create_test_bam_record(0, 100, b"mapped");
-        let (_, m_start, m_end, m_mapped) =
-            extract_alignment_context(&mapped).expect("mapped read must be binned");
-        assert_eq!(usize::from(m_start), 101);
-        assert_eq!(usize::from(m_end), 110, "10M CIGAR -> span of 10");
-        assert!(m_mapped);
+        let m_ctx = extract_alignment_context(&mapped).expect("mapped read must be binned");
+        assert_eq!(usize::from(m_ctx.start), 101);
+        assert_eq!(usize::from(m_ctx.end), 110, "10M CIGAR -> span of 10");
+        assert!(m_ctx.is_mapped);
 
         // A truly unplaced read (no reference) is not binned.
         assert!(
@@ -1529,6 +1553,68 @@ mod tests {
                 .is_none(),
             "unplaced read -> None (counted as unplaced by the indexer)"
         );
+    }
+
+    /// Encode a CIGAR op (`(length, op_char)`) as the BAM-packed `u32` word
+    /// [`SamBuilder::cigar_ops`] expects: `(length << 4) | op_code`, per the SAM
+    /// spec's op-code table (`MIDNSHP=X` -> `0..=8`).
+    fn cigar_op_word(length: u32, op: char) -> u32 {
+        let op_code = match op {
+            'M' => 0,
+            'I' => 1,
+            'D' => 2,
+            'N' => 3,
+            'S' => 4,
+            'H' => 5,
+            'P' => 6,
+            '=' => 7,
+            'X' => 8,
+            _ => panic!("unsupported CIGAR op: {op}"),
+        };
+        (length << 4) | op_code
+    }
+
+    /// Build a record **body** (no 4-byte length prefix) via [`SamBuilder`], for
+    /// use with [`extract_alignment_context`].
+    fn build_record_body(ref_id: i32, pos: i32, flags: u16, cigar: &[(u32, char)]) -> Vec<u8> {
+        let ops: Vec<u32> = cigar.iter().map(|&(len, op)| cigar_op_word(len, op)).collect();
+        fgumi_raw_bam::SamBuilder::new()
+            .ref_id(ref_id)
+            .pos(pos)
+            .flags(flags)
+            .cigar_ops(&ops)
+            .build()
+            .to_vec()
+    }
+
+    #[test]
+    fn extract_alignment_context_classifies_placed_unmapped_and_unplaced() {
+        use noodles::core::Position;
+        // Placed + mapped: tid=0, pos=99 (0-based) → start=100 (1-based).
+        let mapped = build_record_body(
+            /*ref_id*/ 0,
+            /*pos*/ 99,
+            /*flags*/ 0,
+            /*cigar*/ &[(10, 'M')],
+        );
+        let ctx = extract_alignment_context(&mapped).expect("placed");
+        assert_eq!(ctx.ref_id, 0);
+        assert_eq!(ctx.start, Position::try_from(100).unwrap());
+        // 0-based pos=99, 10M -> reference span [99, 109) (0-based, exclusive) ->
+        // 1-based inclusive end = 109 (matches `bam_endpos`-style pos + ref_len).
+        assert_eq!(ctx.end, Position::try_from(109).unwrap());
+        assert!(ctx.is_mapped);
+
+        // Placed-but-unmapped mate: tid/pos valid, UNMAPPED flag set, no CIGAR → span floored to 1.
+        let placed_unmapped = build_record_body(0, 99, fgumi_raw_bam::flags::UNMAPPED, &[]);
+        let ctx =
+            extract_alignment_context(&placed_unmapped).expect("placed-unmapped is still placed");
+        assert!(!ctx.is_mapped);
+        assert_eq!(ctx.end, Position::try_from(100).unwrap());
+
+        // Truly unplaced: tid < 0 → None.
+        let unplaced = build_record_body(-1, -1, fgumi_raw_bam::flags::UNMAPPED, &[]);
+        assert!(extract_alignment_context(&unplaced).is_none());
     }
 
     #[test]
