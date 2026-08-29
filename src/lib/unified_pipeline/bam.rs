@@ -1087,6 +1087,14 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
             return true;
         }
         let in_flight = self.queue_bytes_in_flight();
+        // Test-only observation hook (`None` in production — a single predictable
+        // branch). Publishing the in-flight total from the very check that gates
+        // the reader lets backpressure tests wait on the *actual* park condition
+        // (`in_flight >= limit`) instead of inferring it from wall-clock
+        // quiescence, which false-settles when the reader is descheduled (#809).
+        if let Some(probe) = &self.config.queue_bytes_probe {
+            probe.store(in_flight, Ordering::Relaxed);
+        }
         in_flight == 0 || in_flight < limit
     }
 

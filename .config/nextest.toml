@@ -1,13 +1,2 @@
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 2 }
-
-# `read_ahead_under_a_stalled_writer_shrinks_with_the_queue_memory_budget` measures
-# each budget arm's read-ahead as the maximum over READ_AHEAD_REPS stalled-writer
-# runs (issue #809), so it spawns the stalled pipeline several times back to back,
-# each with its own settle wait. That is legitimately slow (~30s locally, and 2-3x
-# that under llvm-cov instrumentation plus CI's 2x CPU oversubscription), enough to
-# trip the default 120s (60s x 2) terminate-after. Give this one test a longer leash
-# rather than dropping reps and weakening the flake-suppression the maximum provides.
-[[profile.default.overrides]]
-filter = 'test(=test_pipeline_memory_backpressure::read_ahead_under_a_stalled_writer_shrinks_with_the_queue_memory_budget)'
-slow-timeout = { period = "60s", terminate-after = 4 }

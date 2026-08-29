@@ -67,7 +67,16 @@ const TEST_BUDGET_BYTES: u64 = 2 * 1024 * 1024;
 /// gives the needed compressed margin for the least build cost; the pipeline is
 /// exercised with a pass-through grouper, so family structure is immaterial
 /// here.
-const FAMILIES: usize = 175_000;
+///
+/// Sized just above the [`MIN_INPUT_HEADROOM_BUDGETS`] floor rather than well
+/// over it: building and draining this fixture dominates every test's runtime
+/// (it is rebuilt per test process under nextest), so trimming the record count
+/// to the smallest size that still clears the floor with drift headroom is the
+/// biggest single speedup here. At this count the compressed input measures
+/// ~3.3 budgets — comfortably above the 3-budget floor while leaving ~1.8
+/// budgets unread past where the reader stops, so the margin assertions keep
+/// well over a full budget of BGZF block-size drift headroom (issue #789).
+const FAMILIES: usize = 143_000;
 const DEPTH: usize = 1;
 
 /// The compressed fixture must be at least this many `TEST_BUDGET_BYTES` in
@@ -79,7 +88,7 @@ const DEPTH: usize = 1;
 /// budget left unread on top of wherever the reader stops, so anything below
 /// three budgets has no slack for BGZF block-size drift (issue #789). The floor
 /// holds with room to spare at the current `FAMILIES`: the input measures
-/// ~4 budgets and the reader stops by ~1.5, leaving ~2.5 budgets unread on
+/// ~3.3 budgets and the reader stops by ~1.5, leaving ~1.8 budgets unread on
 /// every arm. [`shared_bam_bytes`] asserts this floor once at fixture
 /// construction so a future shrink of `FAMILIES` fails loudly for *every* test
 /// — not only the one that happens to re-check it — rather than silently
@@ -233,6 +242,11 @@ fn build_bam_bytes(header: &Header, num_families: usize, depth: usize) -> Vec<u8
 struct StalledRun {
     /// Input bytes the Read step has pulled so far.
     consumed: Arc<AtomicU64>,
+    /// The pipeline's live accounted in-flight-bytes total, published by the Read
+    /// step's own admission check (see `PipelineConfig::queue_bytes_probe`). The
+    /// reader is gated exactly when this reaches `queue_memory_limit`, so tests
+    /// wait on this rather than inferring the park from wall-clock quiescence.
+    in_flight: Arc<AtomicU64>,
     /// Set to release the writer.
     released: Arc<AtomicBool>,
     /// Output bytes accepted after release (record blocks only, no header).
@@ -256,6 +270,7 @@ fn spawn_stalled_pipeline(
     blocks_per_read_batch: Option<usize>,
 ) -> StalledRun {
     let consumed = Arc::new(AtomicU64::new(0));
+    let in_flight = Arc::new(AtomicU64::new(0));
     let released = Arc::new(AtomicBool::new(false));
     let sink = Arc::new(Mutex::new(Vec::new()));
 
@@ -275,6 +290,9 @@ fn spawn_stalled_pipeline(
         config.blocks_per_read_batch = blocks;
     }
     config.queue_memory_limit = queue_memory_limit;
+    // Publish the in-flight-bytes total from the Read admission check so the test
+    // can observe the gate directly (see `wait_until_gated`).
+    config.queue_bytes_probe = Some(Arc::clone(&in_flight));
     // A permanently stalled writer is exactly what the deadlock detector is
     // meant to flag, and flagging it would tear the pipeline down before the
     // assertion. Disable it so the test observes backpressure, not recovery.
@@ -302,57 +320,105 @@ fn spawn_stalled_pipeline(
         )
     });
 
-    StalledRun { consumed, released, sink, handle }
+    StalledRun { consumed, in_flight, released, sink, handle }
 }
 
 /// Outcome of waiting for the reader to stop pulling input.
 struct Consumption {
     /// Input bytes consumed when the wait ended.
     bytes: u64,
-    /// Whether consumption actually settled (or reached EOF), as opposed to the
-    /// wait timing out with the counter still moving. A timeout means the
-    /// caller's premise — that the reader had stopped — never held, so tests
-    /// assert on this to fail loudly rather than silently comparing a
-    /// still-moving figure.
+    /// Whether the reader actually parked at the byte gate (or reached EOF), as
+    /// opposed to the wait timing out with the reader still admitting input. A
+    /// timeout means the caller's premise — that the reader had stopped — never
+    /// held, so tests assert on this to fail loudly rather than silently
+    /// comparing a still-moving figure.
     settled: bool,
 }
 
-/// Wait until input consumption stops growing, or `timeout` elapses.
+/// Wait until the Read step is gated by the byte budget, or `timeout` elapses.
 ///
-/// Reports the number of input bytes consumed once the counter has held still
-/// across `STABLE_SAMPLES` consecutive samples, or as soon as the whole input
-/// has been read, with `settled: true`. Several samples rather than one guards
-/// against a loaded CI machine descheduling the reader briefly and looking like
-/// backpressure. If the deadline is reached with the counter still moving, it
-/// reports the last figure with `settled: false`.
-fn wait_for_consumption_to_settle(
+/// Observes the pipeline's *actual* park condition rather than inferring it from
+/// wall-clock quiescence. The Read step admits input only while accounted
+/// in-flight bytes stay under `queue_memory_limit`
+/// (`BamPipelineState::read_admission_allowed`); `in_flight` mirrors that total,
+/// published by the very check that gates the reader. Under a permanently
+/// stalled writer, once `in_flight` reaches the limit the reader parks and stays
+/// parked — a terminal state — so `consumed` at that point is the final
+/// read-ahead.
+///
+/// This is immune to the scheduler-noise false-settle that a "consumed stopped
+/// moving" heuristic suffers (issue #809): a reader descheduled mid-fill shows
+/// `in_flight` *below* the limit, so the wait correctly keeps going instead of
+/// declaring a partial read-ahead settled. That is what lets the read-ahead test
+/// take a single measurement per arm rather than a max over repeated samples.
+///
+/// The gate must *hold* across a short confirmation, because `queue_bytes_in_flight`
+/// can transiently read a counter high during a cross-queue handoff; a real gate
+/// under a stalled writer persists, a transient does not. Reaching EOF (the whole
+/// input consumed) also settles — that is the "gate did nothing" outcome the
+/// read-ahead test asserts against.
+///
+/// Only the byte-gate park (`in_flight >= limit`) or EOF settle this; a reader
+/// parked for any *other* reason (e.g. a Q1 slot-count bound reached with
+/// `in_flight < limit`) is deliberately not treated as settled, because these
+/// tests size the slot counts to swallow the whole input so the byte budget is
+/// the only bound that can engage (see [`spawn_stalled_pipeline`]). If a future
+/// change ever let a slot bound bind first, this returns `settled: false` at the
+/// `timeout` and the caller fails loudly with "reader never stopped" rather than
+/// silently measuring a slot-bounded stop — a truthful failure, not a wrong
+/// number.
+fn wait_until_gated(
     consumed: &AtomicU64,
+    in_flight: &AtomicU64,
+    limit: u64,
     input_len: u64,
     timeout: Duration,
 ) -> Consumption {
-    /// Consecutive unchanged samples required before calling it settled.
-    const STABLE_SAMPLES: u32 = 4;
+    /// Poll cadence. The Read step republishes `in_flight` on every admission
+    /// check (sub-millisecond while it is spinning on the gate), so a short poll
+    /// sees the transition promptly without busy-spinning.
+    const POLL: Duration = Duration::from_millis(2);
+    /// Once `in_flight` reaches the limit, require the reader to hold there — at
+    /// or above the limit, with `consumed` unmoving — for this long before
+    /// calling it parked. Under a stalled writer a real byte gate is a permanent
+    /// terminal state (nothing drains, so in-flight is constant and the reader
+    /// never reads again), so this passes on the first try and costs it only
+    /// once per arm. Its job is the *broken-gate* case: without a real gate the
+    /// reader keeps reading, and `in_flight` sails through the limit while
+    /// `consumed` is still climbing — a window long enough to outlast any
+    /// filling lull rejects that as not-yet-parked, so the reader is only sampled
+    /// where it truly stops (the budget-independent slot bound or EOF), which is
+    /// what lets the two arms' read-ahead gap collapse and fail the assertion.
+    const PARK_CONFIRM: Duration = Duration::from_millis(100);
 
     let deadline = Instant::now() + timeout;
-    let mut previous = u64::MAX;
-    let mut stable = 0u32;
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(250));
-        let current = consumed.load(Ordering::Relaxed);
-        if current >= input_len {
-            return Consumption { bytes: current, settled: true };
+    loop {
+        let c = consumed.load(Ordering::Relaxed);
+        if c >= input_len {
+            // Reached EOF: the reader was never gated (e.g. a broken budget).
+            return Consumption { bytes: c, settled: true };
         }
-        if current == previous {
-            stable += 1;
-            if stable >= STABLE_SAMPLES {
-                return Consumption { bytes: current, settled: true };
+        // Bound *every* path by the deadline, not only the `in_flight < limit`
+        // one: a leaky gate that keeps trickling reads through while in-flight
+        // hovers at/above the limit would otherwise loop past `timeout` (only
+        // terminating at EOF). Checking here keeps the `timeout` contract honest
+        // regardless of which branch below runs.
+        if Instant::now() >= deadline {
+            return Consumption { bytes: c, settled: false };
+        }
+        if in_flight.load(Ordering::Relaxed) >= limit {
+            // Candidate gate — confirm the reader has actually parked here (in
+            // flight stays at/above the limit AND consumed does not advance),
+            // rejecting a transient counter-high mid-handoff or a brief lull
+            // while the reader is still filling toward its true stopping point.
+            std::thread::sleep(PARK_CONFIRM);
+            if in_flight.load(Ordering::Relaxed) >= limit && consumed.load(Ordering::Relaxed) == c {
+                return Consumption { bytes: c, settled: true };
             }
-        } else {
-            stable = 0;
+            continue;
         }
-        previous = current;
+        std::thread::sleep(POLL);
     }
-    Consumption { bytes: consumed.load(Ordering::Relaxed), settled: false }
 }
 
 /// Join a stalled pipeline within a deadline, returning the count of records it
@@ -404,10 +470,16 @@ fn stalled_writer_stops_the_reader_within_the_queue_memory_budget() {
     // `shared_bam_bytes`, so a `FAMILIES` shrink fails there before reaching here
     // (#789).
 
-    let StalledRun { consumed, released, handle, .. } =
+    let StalledRun { consumed, in_flight, released, handle, .. } =
         spawn_stalled_pipeline(header, bam_bytes.clone(), 4, TEST_BUDGET_BYTES, None);
 
-    let settled = wait_for_consumption_to_settle(&consumed, input_len, Duration::from_secs(30));
+    let settled = wait_until_gated(
+        &consumed,
+        &in_flight,
+        TEST_BUDGET_BYTES,
+        input_len,
+        Duration::from_secs(30),
+    );
     assert!(settled.settled, "reader never stopped under a stalled writer within the timeout");
     // Budget-relative, not a bare fraction of the input: the reader must leave at
     // least one whole queue memory budget's worth of input unread. A naive
@@ -458,19 +530,6 @@ fn read_ahead_under_a_stalled_writer_shrinks_with_the_queue_memory_budget() {
     /// Read batch small enough that read-ahead tracks the byte budget instead of
     /// the ~1 MiB production batch quantum.
     const FINE_READ_BLOCKS: usize = 4;
-    /// Reps per arm whose maximum read-ahead is taken as that arm's measurement.
-    ///
-    /// The budget-bounded stopping point is an *upper* bound the reader
-    /// approaches from below, and the only scheduler noise on it is one-sided and
-    /// downward: if the reader is starved of CPU for a full second mid-read,
-    /// [`wait_for_consumption_to_settle`] can call the arm settled at a partial
-    /// read-ahead — well short of where the budget would actually stop it. That
-    /// rare downward tail (observed on the generous arm) is what made a single
-    /// sample flap (issue #809). It never lifts an arm *above* its true ceiling,
-    /// so the maximum across a few reps recovers that ceiling and is immune to
-    /// the tail; three reps drive the odds of every rep tailing at once low
-    /// enough to be irrelevant while keeping the test cheap.
-    const READ_AHEAD_REPS: usize = 3;
 
     let (header, bam_bytes) = shared_bam_bytes();
     let input_len = bam_bytes.len() as u64;
@@ -483,12 +542,16 @@ fn read_ahead_under_a_stalled_writer_shrinks_with_the_queue_memory_budget() {
     let budget_difference = generous_budget - tight_budget;
 
     // Measure one arm's read-ahead: how far the reader runs before a stalled
-    // writer backs it up under `budget`. Returned as the settled input-bytes
-    // consumed, after asserting the arm actually settled short of EOF.
+    // writer backs it up under `budget`. A single measurement per arm suffices —
+    // `wait_until_gated` observes the reader parking at `in_flight >= budget`
+    // directly, so there is no scheduler-noise downward tail to average out with
+    // repeated samples (the max-over-reps this test carried for issue #809 was a
+    // workaround for a wall-clock quiescence heuristic that this signal replaces).
     let measure_read_ahead = |budget: u64| -> u64 {
-        let StalledRun { consumed, released, handle, .. } =
+        let StalledRun { consumed, in_flight, released, handle, .. } =
             spawn_stalled_pipeline(header, bam_bytes.clone(), 4, budget, Some(FINE_READ_BLOCKS));
-        let settled = wait_for_consumption_to_settle(&consumed, input_len, Duration::from_secs(30));
+        let settled =
+            wait_until_gated(&consumed, &in_flight, budget, input_len, Duration::from_secs(30));
         assert!(
             settled.settled,
             "reader never stopped under a {budget}-byte budget within the timeout"
@@ -503,14 +566,8 @@ fn read_ahead_under_a_stalled_writer_shrinks_with_the_queue_memory_budget() {
         settled.bytes
     };
 
-    // Take each arm's *maximum* read-ahead over a few reps, not a single sample:
-    // the measurement noise is a one-sided downward tail (see `READ_AHEAD_REPS`),
-    // so the max is the robust estimator of the arm's true budget-bounded ceiling.
-    let arm_read_ahead = |budget: u64| -> u64 {
-        (0..READ_AHEAD_REPS).map(|_| measure_read_ahead(budget)).max().expect("at least one rep")
-    };
-    let tight = arm_read_ahead(tight_budget);
-    let generous = arm_read_ahead(generous_budget);
+    let tight = measure_read_ahead(tight_budget);
+    let generous = measure_read_ahead(generous_budget);
 
     // A margin tied to the budget difference, not bare ordering: `tight < generous`
     // alone could be one stray block, and if a bound ignored the budget entirely
@@ -680,19 +737,25 @@ fn reader_resumes_and_completes_after_the_writer_recovers() {
     let expected_records = record_bufs(bam_bytes);
     assert_eq!(expected_records.len(), FAMILIES * DEPTH, "input should hold every generated read");
 
-    let StalledRun { consumed, released, sink, handle } =
+    let StalledRun { consumed, in_flight, released, sink, handle } =
         spawn_stalled_pipeline(header, bam_bytes.clone(), 4, TEST_BUDGET_BYTES, None);
 
-    let settled =
-        wait_for_consumption_to_settle(&consumed, bam_bytes.len() as u64, Duration::from_secs(30));
+    let input_len = bam_bytes.len() as u64;
+    let settled = wait_until_gated(
+        &consumed,
+        &in_flight,
+        TEST_BUDGET_BYTES,
+        input_len,
+        Duration::from_secs(30),
+    );
     assert!(settled.settled, "reader never stopped under a stalled writer within the timeout");
     released.store(true, Ordering::Release);
 
-    let written = join_pipeline_within(handle, &consumed, bam_bytes.len() as u64, JOIN_DEADLINE);
+    let written = join_pipeline_within(handle, &consumed, input_len, JOIN_DEADLINE);
     assert_eq!(written, expected_records.len() as u64, "every input record must reach the writer");
     assert_eq!(
         consumed.load(Ordering::Relaxed),
-        bam_bytes.len() as u64,
+        input_len,
         "the whole input must be consumed once the writer recovers"
     );
 

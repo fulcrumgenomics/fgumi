@@ -2634,6 +2634,17 @@ pub struct PipelineConfig {
     /// `BamIoOptions::pipeline_reader_opts().verify_crc`), which defaults to
     /// verifying for file input and skipping for stdin input.
     pub verify_crc: bool,
+    /// Optional observation hook for the Read step's accounted in-flight bytes.
+    ///
+    /// When `Some`, every Read-admission check stores the current
+    /// `BamPipelineState::queue_bytes_in_flight` total into this atomic. It is
+    /// `None` in every production path (a single predictable branch, no store),
+    /// and exists only so backpressure tests can observe the *actual* gate
+    /// condition the reader parks on — `in_flight >= queue_memory_limit` — rather
+    /// than inferring it from wall-clock quiescence, which is subject to a
+    /// scheduler-noise false-settle (issue #809). It carries no pipeline
+    /// behaviour: nothing reads it back inside the pipeline.
+    pub queue_bytes_probe: Option<Arc<AtomicU64>>,
 }
 
 impl PipelineConfig {
@@ -2657,6 +2668,7 @@ impl PipelineConfig {
             deadlock_recover_enabled: false, // Detection only by default
             shared_stats: None,              // No shared stats by default
             verify_crc: true,                // Verify by default (safe baseline)
+            queue_bytes_probe: None,         // Test-only observation hook; off in production
         }
     }
 
@@ -2758,6 +2770,7 @@ impl PipelineConfig {
             deadlock_recover_enabled: false, // Detection only by default
             shared_stats: None,              // No shared stats by default
             verify_crc: true,                // Verify by default (safe baseline)
+            queue_bytes_probe: None,         // Test-only observation hook; off in production
         }
     }
 
