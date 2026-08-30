@@ -2470,7 +2470,7 @@ impl<'a> ChainBuilder<'a> {
             let total_memory = resolve_memory_budget(
                 sort.max_memory,
                 sort.memory_reserve,
-                num_threads,
+                sort_budget_threads(num_threads, sort.sort_threads),
                 sort.memory_per_thread,
             )?;
 
@@ -4422,6 +4422,13 @@ fn resolve_phase_threads(override_threads: Option<usize>, num_sorter_threads: us
     override_threads.unwrap_or(num_sorter_threads).max(1)
 }
 
+/// Thread count for sizing the sort buffer, mirroring the owned engine's
+/// `Sort::memory_budget_threads` (sort.rs:607-616): `max(threads, sort_threads)`,
+/// but 0 when the pool is 0 so `resolve_memory_budget` still rejects a zero-thread run.
+fn sort_budget_threads(num_threads: usize, sort_threads: Option<usize>) -> usize {
+    if num_threads == 0 { 0 } else { num_threads.max(sort_threads.unwrap_or(0)) }
+}
+
 /// Uniform "reference dictionary not found" error, shared by the zipper source
 /// open (`open_source`) and `add_align`, so both dict-resolution sites report
 /// the same actionable message (which paths were tried + the `samtools dict`
@@ -4441,7 +4448,7 @@ fn dict_not_found_error(reference: &std::path::Path) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_phase_threads;
+    use super::{resolve_phase_threads, sort_budget_threads};
 
     /// Pin the per-phase thread resolution contract shared by the standalone and
     /// streaming sort branches in `add_sort`: each phase falls back to the base
@@ -4466,5 +4473,34 @@ mod tests {
         assert_eq!(resolve_phase_threads(None, 0), 1);
         // And both zero at once still clamps to 1.
         assert_eq!(resolve_phase_threads(Some(0), 0), 1);
+    }
+
+    /// Pin `sort_budget_threads` against the owned engine's
+    /// `Sort::memory_budget_threads` (sort.rs:607-616): `max(threads,
+    /// sort_threads)`, but 0 when `threads == 0` so `resolve_memory_budget`
+    /// still rejects a zero-thread run.
+    #[test]
+    fn sort_budget_threads_mirrors_owned_memory_budget_threads() {
+        assert_eq!(sort_budget_threads(2, Some(8)), 8); // sort_threads > threads → max
+        assert_eq!(sort_budget_threads(4, Some(2)), 4); // sort_threads < threads → threads
+        assert_eq!(sort_budget_threads(4, None), 4); // no override → threads (runall)
+        assert_eq!(sort_budget_threads(0, Some(8)), 0); // threads==0 → 0 (rejection preserved)
+    }
+
+    /// Prove `add_sort`'s `resolve_memory_budget` call is sized by
+    /// `sort_budget_threads`, not the raw `num_threads`. With
+    /// `MemoryLimit::Fixed` and `per_thread = true` the budget scales linearly
+    /// with the thread count fed in, so a larger budget-thread count must
+    /// yield a larger resolved budget. `MemoryLimit::Auto` cannot be used here:
+    /// it clamps to available memory, so both calls return ~available and
+    /// integer division makes `b8 <= b2` — a false RED.
+    #[test]
+    fn add_sort_budget_uses_fixed_budget_scaled_by_max_threads() {
+        use crate::commands::common::{MemoryLimit, MemoryReserve, resolve_memory_budget};
+        let fixed = MemoryLimit::Fixed(64 * 1024 * 1024);
+        let per_thread = true;
+        let b2 = resolve_memory_budget(fixed, MemoryReserve::Auto, 2, per_thread).unwrap();
+        let b8 = resolve_memory_budget(fixed, MemoryReserve::Auto, 8, per_thread).unwrap();
+        assert!(b8 > b2, "Fixed per-thread budget scales with thread count");
     }
 }
