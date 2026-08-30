@@ -640,6 +640,8 @@ impl Sort {
     /// # Errors
     ///
     /// Returns an error if the per-thread product overflows `usize`.
+    // used by the owned-engine oracle path; PR B removes
+    #[allow(dead_code)]
     fn auto_initial_capacity(&self, effective_memory: usize) -> Result<usize> {
         let init = 768_usize
             .checked_mul(1024 * 1024)
@@ -771,7 +773,11 @@ impl Sort {
             );
         }
 
-        let timer = OperationTimer::new("Sorting BAM");
+        // `OperationTimer::new` logs the "Sorting BAM ..." start line as a side effect on
+        // construction; its completion half (`log_completion`) lived in the tail this cutover
+        // replaces (the chain has no total-record count to hand it here), so the binding
+        // itself is now unread -- prefixed to silence that, not to drop the start-line log.
+        let _timer = OperationTimer::new("Sorting BAM");
 
         // Resolve memory limit (auto-detect or fixed)
         let budget_threads = self.memory_budget_threads();
@@ -792,7 +798,7 @@ impl Sort {
 
         // Built before the config log so the log can report the sorter's own
         // effective per-phase thread counts.
-        let mut sorter = self.build_sorter(effective_memory, command_line, soft_nofile);
+        let sorter = self.build_sorter(effective_memory, command_line, soft_nofile);
 
         debug!("Starting Sort");
         info!("Input: {}", self.input.display());
@@ -850,42 +856,44 @@ impl Sort {
             info!("Temp directories: {joined}");
         }
 
-        // For auto mode, cap initial buffer pre-allocation at 768 MiB/thread
-        // (matching samtools default) to avoid huge upfront allocations.
-        // The buffer will grow on demand up to memory_limit.
-        if matches!(self.max_memory, MemoryLimit::Auto) {
-            sorter = sorter.initial_capacity(self.auto_initial_capacity(effective_memory)?);
-        }
+        // --- cutover: run via the chain instead of sorter.sort() ---
+        // (self.build_sorter above is retained only to source the banner's thread/temp-file
+        //  numbers; the owned sorter is not executed. PR B removes the owned engine + banner-build.)
+        use crate::commands::common::{
+            BamIoOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
+        };
+        use crate::pipeline::chains::{
+            ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag, build_for,
+        };
 
-        if let Some(ct) = cell_tag {
-            sorter = sorter.cell_tag(ct);
-        }
+        let output = self.output.as_ref().expect("output present (validated in execute)");
 
-        let key_types = self.key_types.unwrap_or_default(); // Auto
-        if !matches!(self.order, SortOrderArg::TemplateCoordinate) && self.key_types.is_some() {
-            info!("--key-types is ignored for --order {:?}", self.order);
-        }
-        sorter = sorter.key_types(key_types);
+        // Bake resolved tmp dirs (incl. FGUMI_TMP_DIRS) into SortOptions — add_sort uses
+        // SortOptions.tmp_dirs verbatim and never reads the env var; to_sort_options copies raw.
+        let mut sort_options = self.to_sort_options();
+        sort_options.tmp_dirs = resolved_tmp_dirs; // already computed for the banner at :842-843
 
-        if !resolved_tmp_dirs.is_empty() {
-            sorter = sorter.temp_dirs(resolved_tmp_dirs);
-        }
-
-        let stats = sorter.sort(&self.input, output)?;
-        let (total_records, output_records, runs_written) =
-            (stats.total_records, stats.output_records, stats.runs_written);
-
-        // Summary
-        info!("=== Summary ===");
-        info!("Records processed: {total_records}");
-        info!("Records written: {output_records}");
-        if runs_written > 0 {
-            info!("Spill runs: {runs_written}");
-        }
-        info!("Output: {}", output.display());
-
-        timer.log_completion(total_records);
-        Ok(())
+        let stage_opts = StageOptionsBag { sort: Some(sort_options), ..Default::default() };
+        let sink = if self.write_index {
+            SinkSpec::BamWithIndex(output.clone())
+        } else {
+            SinkSpec::Bam(output.clone())
+        };
+        let spec = ChainSpec {
+            stages: vec![Stage::Sort],
+            source: SourceSpec::Bam(self.input.clone()),
+            sink,
+            stage_opts,
+            threading: ThreadingOptions { threads: Some(self.threads) },
+            compression: self.compression.clone(),
+            // Match sibling chain commands (10s), not the derived Default (0 = monitor off).
+            scheduler: SchedulerOptions { deadlock_timeout: 10, ..Default::default() },
+            queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
+            verify_crc: BamIoOptions::new(&self.input, output).effective_check_crc(),
+            command_line: command_line.to_string(),
+        };
+        build_for(spec)?.run()
     }
 
     /// Execute verify mode: read records and check sort order.

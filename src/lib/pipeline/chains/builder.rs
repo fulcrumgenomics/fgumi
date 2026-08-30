@@ -750,19 +750,17 @@ impl<'a> ChainBuilder<'a> {
                         }
                     }
                     InputSource::Sam { reader: sam_reader, .. } => {
-                        // Sort-as-first-stage needs a `RecordBatch` source, but the
-                        // SAM preamble only produces `DecodedRecordBatch`; feeding
-                        // that into the sort ingest (`SortBuffer`) is a handle-type
-                        // mismatch (see `add_sort`). SAM input to a sort-first chain was never
-                        // supported (the legacy file→file sorter read BAM only), so
-                        // reject it with a clear message instead of a downstream
-                        // typed-step panic.
-                        if sort_is_first_intermediate {
-                            anyhow::bail!(
-                                "sort requires BAM input; SAM input is not supported \
-                                 (convert with `samtools view -b` first)"
-                            );
-                        }
+                        // Sort-as-first-stage over SAM decodes through the same
+                        // `ParseSamChunk` preamble as every other SAM ingest
+                        // (`DecodedRecordBatch`); `add_sort` bridges that to the
+                        // sort ingest's `RecordBatch` shape via
+                        // `DecodedRecordBatchToRecordBatch` when
+                        // `chain_tail_kind == DecodedRecordBatch`. The owned
+                        // engine (`RawExternalSorter`, used by `execute_sort`
+                        // pre-cutover) accepts SAM input directly, and
+                        // `test_input_source_matrix`'s `CONTRACTS` table declares
+                        // `sam: Required` for `sort` — so SAM-first is a binding
+                        // contract, not an optional extra.
                         let buf = sam_reader.into_inner();
                         let tail = self.build_sam_parse_preamble(
                             buf,
@@ -2396,9 +2394,10 @@ impl<'a> ChainBuilder<'a> {
             //
             // Chain topology (continuing from current_tail):
             //
-            //   [BamTemplateBatch or RecordBatch at current_tail]
-            //       ↓ (TemplatesToRecordBatch if BamTemplateBatch)
-            //   RecordBatch (SAM) │ BgzfBlockArena (BAM)
+            //   [BamTemplateBatch, DecodedRecordBatch, or RecordBatch at current_tail]
+            //       ↓ (TemplatesToRecordBatch if BamTemplateBatch;
+            //          DecodedRecordBatchToRecordBatch if DecodedRecordBatch — SAM source)
+            //   RecordBatch (SAM, or fused non-Align/Correct upstream) │ BgzfBlockArena (BAM)
             //       ↓ arena sort ingest (SortBuffer, or ReadBlocks →
             //         InflateToArena → FindBoundariesAndSort for BAM)
             //       ↓
@@ -2573,13 +2572,24 @@ impl<'a> ChainBuilder<'a> {
 
             // If the upstream stage produced BamTemplateBatch (from Align or
             // Correct), flatten it to RecordBatch before feeding the sort ingest.
+            // If it produced DecodedRecordBatch (a SAM source: `add_source`'s SAM
+            // arm always decodes through `ParseSamChunk`, sort-first or not),
+            // flatten that instead — `SortBuffer::Input = RecordBatch`, and a SAM
+            // source never reaches the BAM-only arena front (`BgzfBlockArena`),
+            // so this is the only path a SAM-sourced sort takes.
             let tail = if self.chain_tail_kind == ChainTailKind::BamTemplateBatch {
                 use crate::pipeline::steps::templates_to_records::TemplatesToRecordBatch;
                 self.pipeline
                     .append_step(TemplatesToRecordBatch::new(self.tuning.per_step_byte_limit), tail)
+            } else if self.chain_tail_kind == ChainTailKind::DecodedRecordBatch {
+                use crate::pipeline::steps::decoded_to_records::DecodedRecordBatchToRecordBatch;
+                self.pipeline.append_step(
+                    DecodedRecordBatchToRecordBatch::new(self.tuning.per_step_byte_limit),
+                    tail,
+                )
             } else {
-                // chain_tail_kind == RecordBatch (from ParseBamRecords in add_source)
-                // or DecodedRecordBatch would be a bug caught at runtime.
+                // chain_tail_kind == RecordBatch (from ParseBamRecords in add_source);
+                // anything else would be a bug caught at runtime.
                 tail
             };
 

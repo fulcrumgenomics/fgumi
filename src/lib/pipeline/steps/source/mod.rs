@@ -135,9 +135,10 @@ pub enum InputSource {
 impl InputSource {
     /// Open `path` and detect the input shape.
     ///
-    /// Detection: `is_stdin_path` chooses stdin vs file; then the file
-    /// extension (`.sam`/`.bam`/none) selects the reader, and anything without
-    /// one is classified by content through [`fgumi_bam_io::classify_input`].
+    /// Detection: `is_stdin_path` chooses stdin vs file; a `.bam` extension
+    /// selects the BAM reader (itself content-aware — see below); anything
+    /// else (no extension, or `.sam`) is classified by content through
+    /// [`fgumi_bam_io::classify_input`].
     ///
     /// Content classification never reduces to a magic-byte test. A leading
     /// `\x1f` says "gzip", not "BGZF", and plain gzip is a supported input on
@@ -166,11 +167,15 @@ impl InputSource {
         let path = path.as_ref();
         let is_stdin = fgumi_bam_io::is_stdin_path(path);
 
-        // Suffix hint: explicit `.sam` → SAM; `.bam` → BAM. Anything else is
-        // decided by content — including `.gz`, whose extension says only that
-        // it is compressed, not by what.
+        // Suffix hint: `.bam` → BAM, handed to `create_bam_reader_for_pipeline_with_opts`,
+        // which is itself content-aware (its `normalize_to_bgzf` transcodes SAM text or
+        // plain gzip found under a `.bam` name, so a mislabeled BAM self-corrects there).
+        // A `.sam` suffix carries no equivalent self-correction below it — `sam::io::Reader`
+        // has no fallback for BGZF/BAM bytes — so it is deliberately NOT special-cased here;
+        // it falls through to the same content classification as no extension at all. Content
+        // always decides in the end, including for `.gz`, whose extension says only that it
+        // is compressed, not by what.
         let extension = path.extension();
-        let suffix_says_sam = extension.is_some_and(|e| e.eq_ignore_ascii_case("sam"));
         let suffix_is_bam = extension.is_some_and(|e| e.eq_ignore_ascii_case("bam"));
 
         if is_stdin {
@@ -179,11 +184,6 @@ impl InputSource {
             // there is no path to reopen, so there is no async-reader wiring.
             let _ = opts;
             open_stream_by_content(Box::new(io::stdin()))
-        } else if suffix_says_sam {
-            let file = File::open(path).map_err(|e| open_error(path, &e))?;
-            let buf: Box<dyn BufRead + Send> =
-                Box::new(BufReader::with_capacity(2 * 1024 * 1024, file));
-            open_sam_from_boxed_buf(buf)
         } else if suffix_is_bam {
             // BAM file: parse header via the existing helper, which
             // handles the seek-to-0 + opt.async_reader wiring.
@@ -192,7 +192,8 @@ impl InputSource {
                     .map_err(|e| open_bam_error(path, &e))?;
             Ok(InputSource::Bam { reader, header })
         } else {
-            // No suffix hint: the content decides.
+            // No suffix hint, or a `.sam` suffix that content may contradict:
+            // the content decides.
             let file = File::open(path).map_err(|e| open_error(path, &e))?;
             // Whether re-opening `path` can replay the bytes classification
             // consumes. Only a regular file can: for a FIFO or a `/dev/fd/N`
@@ -376,6 +377,22 @@ fn open_sam_from_boxed_buf(buf: Box<dyn BufRead + Send>) -> io::Result<InputSour
         // See the BAM header read above: keep the source `ErrorKind`.
         io::Error::new(e.kind(), format!("read SAM header: {e}"))
     })?;
+    // A SAM header parse consumes only lines beginning with `@`, so arbitrary
+    // text yields an *empty* header rather than an error — mirroring
+    // `fgumi_bam_io::sam_input`'s `SamToBamStream`, which has the identical
+    // check for the identical reason. Left unchecked, this would silently
+    // treat a truncated or wrong-format file as a valid, headerless SAM
+    // stream and only fail later — confusingly, on the first "record" line
+    // (which is really just more non-SAM text) — instead of naming the input
+    // itself as the problem. Before SAM was accepted this input was rejected
+    // outright for not being BGZF, and it stays rejected.
+    if header.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Input is neither BAM nor SAM (no SAM header found; SAM input must begin with \
+             an `@` header line)",
+        ));
+    }
     Ok(InputSource::Sam { reader: sam_reader, header })
 }
 

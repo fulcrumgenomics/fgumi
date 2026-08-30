@@ -4,11 +4,10 @@
 //! terminal (lever 2, legacy "N + 2"). Receives pre-compressed `BgzfBlock`s
 //! from `BgzfCompress` and writes them directly to disk.
 
-use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use fgumi_bam_io::{BaiBuilder, write_bai_index};
+use fgumi_bam_io::{BaiBuilder, open_output_writer, write_bai_index};
 use fgumi_bgzf::{BGZF_EOF, BGZF_MAX_BLOCK_SIZE, InlineBgzfCompressor};
 use noodles::sam::Header;
 use parking_lot::Mutex;
@@ -34,7 +33,10 @@ pub struct WriteBgzfFile {
 }
 
 struct WriterState {
-    out: BufWriter<File>,
+    /// Boxed rather than a concrete `File` so a `-`/stdout path (opened via
+    /// [`open_output_writer`]) and a regular file share one type: stdout is
+    /// non-seekable, so this can no longer be `BufWriter<File>`.
+    out: BufWriter<Box<dyn Write + Send>>,
     pending_header: Option<PendingHeader>,
     /// Cumulative compressed bytes written so far, header included. Used to
     /// attribute each joined block's constituent BGZF blocks to their
@@ -74,6 +76,15 @@ impl WriteBgzfFile {
     /// Open `path`, BGZF-compress and write the BAM header bytes, return
     /// the sink ready to receive `BgzfBlock`s.
     ///
+    /// Opens the sink through [`open_output_writer`], so `-`/`/dev/stdout`
+    /// stream to the pipe rather than creating a regular file with that name
+    /// (mirrors the owned sort engine's `PooledBamWriter::new_inner`, the only
+    /// other production BAM writer in the tree, and `WriteRawFile::new`'s `-`
+    /// handling for the FASTQ sink). `SinkSpec::BamWithIndex` still rejects
+    /// stdout upstream in `add_sink` (`with_bai_index` requires a seekable
+    /// sidecar path), so this only ever streams for the plain `SinkSpec::Bam`
+    /// sink.
+    ///
     /// # Errors
     ///
     /// Returns I/O errors from path open or header write.
@@ -82,8 +93,9 @@ impl WriteBgzfFile {
         header: &Header,
         compression_level: u32,
     ) -> io::Result<Self> {
-        let file = File::create(path.as_ref())?;
-        let mut out = BufWriter::with_capacity(256 * 1024, file);
+        let sink = open_output_writer(path.as_ref())
+            .map_err(|e| io::Error::other(format!("open_output_writer: {e}")))?;
+        let mut out = BufWriter::with_capacity(256 * 1024, sink);
 
         let mut header_bytes = Vec::new();
         fgumi_bam_io::write_bam_header(&mut header_bytes, header)
@@ -183,6 +195,9 @@ impl WriteBgzfFile {
     /// written — see [`ResolvedHeaderTransform`] for why this exists; pass `None`
     /// when the resolved header should be written unchanged.
     ///
+    /// Opens the sink through [`open_output_writer`] — see [`Self::new`]'s doc
+    /// for why.
+    ///
     /// # Errors
     ///
     /// Returns I/O errors from path open. Header-write errors are
@@ -193,8 +208,9 @@ impl WriteBgzfFile {
         compression_level: u32,
         transform: Option<ResolvedHeaderTransform>,
     ) -> io::Result<Self> {
-        let file = File::create(path.as_ref())?;
-        let out = BufWriter::with_capacity(256 * 1024, file);
+        let sink = open_output_writer(path.as_ref())
+            .map_err(|e| io::Error::other(format!("open_output_writer: {e}")))?;
+        let out = BufWriter::with_capacity(256 * 1024, sink);
         Ok(Self {
             state: Mutex::new(Some(WriterState {
                 out,
