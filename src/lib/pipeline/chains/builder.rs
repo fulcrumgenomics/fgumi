@@ -1397,6 +1397,30 @@ impl<'a> ChainBuilder<'a> {
                 self.pending_header_handle.is_none(),
                 "inline BAI indexing requires a resolved (non-deferred) header"
             );
+            // The inline BAI indexer (`WriteBgzfFile::with_bai_index`) position-bins
+            // records purely by arrival order and does not itself verify sort order
+            // — see that method's doc. Coordinate-only is already enforced above us:
+            // `validate_cross_stage_constraints` (Rule 3) rejects a non-coordinate
+            // terminal sort under `BamWithIndex` unconditionally (release included),
+            // and the command layer rejects `--write-index` for a non-coordinate
+            // `--order`. This `debug_assert!` is a complementary developer-only
+            // guardrail on the *produced* @HD SO header tag, catching a future
+            // producer that advertises the wrong order despite passing spec
+            // validation; it is not the release-mode enforcement point.
+            debug_assert!(
+                self.header
+                    .header()
+                    .and_then(|hd| {
+                        hd.other_fields().get(
+                            &noodles::sam::header::record::value::map::header::tag::SORT_ORDER,
+                        )
+                    })
+                    .is_some_and(|so| {
+                        AsRef::<[u8]>::as_ref(so)
+                            == noodles::sam::header::record::value::map::header::sort_order::COORDINATE
+                    }),
+                "inline BAI indexing requires an @HD SO:coordinate header"
+            );
         }
 
         let compress_step = BgzfCompress::new(

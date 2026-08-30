@@ -136,6 +136,27 @@ impl WriteBgzfFile {
     /// underneath it would produce a `.bai` with wrong virtual offsets.
     /// Deferred-header inline indexing is unsupported for now.
     ///
+    /// # Precondition: the record stream MUST already be coordinate-sorted
+    ///
+    /// The inline indexer position-bins each record's [`AlignmentContext`]
+    /// (from its manifest entry) into the [`BaiBuilder`] purely by the order
+    /// records arrive at this sink — it does **not** read or verify `@HD SO`,
+    /// and it does not re-derive sort order from the coordinates themselves
+    /// (unlike the retired `IndexBamFinalizeHook`, which built the `.bai` via
+    /// `noodles::bam::fs::index` reading back a `SO:coordinate` BAM). Feeding
+    /// a non-coordinate-sorted stream through this sink produces a `.bai` that
+    /// parses and looks valid but is semantically wrong (queries against it
+    /// will silently miss or misattribute records).
+    ///
+    /// Coordinate-only is enforced upstream of this sink today, not here: the
+    /// command layer rejects non-coordinate `--write-index` requests, and the
+    /// chain builder (`fgumi_lib::pipeline::chains::builder`) only constructs
+    /// a `BamWithIndex` sink spec for coordinate sorts. Any future caller of
+    /// `with_bai_index` must preserve (or re-verify) that guarantee before
+    /// wiring a new record stream into this sink.
+    ///
+    /// [`AlignmentContext`]: fgumi_bam_io::AlignmentContext
+    ///
     /// # Panics
     ///
     /// Panics if `state.pending_header` is `Some` (i.e. this was built via
