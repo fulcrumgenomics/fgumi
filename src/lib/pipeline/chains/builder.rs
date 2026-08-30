@@ -35,7 +35,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail, ensure};
 use noodles::sam::Header;
 
 use crate::pipeline::chains::{
@@ -401,10 +401,13 @@ pub struct ChainBuilder<'a> {
     /// Post-pipeline hooks that run **only on a fully successful run**.
     /// Populated by `add_<stage>` methods for actions that publish a derived
     /// artifact from the run's output (currently only `add_sort`'s
-    /// `IndexBamFinalizeHook`, which writes the `.bai` sidecar by re-reading
-    /// the finished BAM). Gating these mirrors the standalone `fgumi sort`
-    /// flow, where the index write is behind `run_result?`: a failed run
-    /// leaves a partial BAM, so publishing its index would be stale.
+    /// `SortSummaryFinalizeHook`, which logs the `=== Summary ===` block from
+    /// the standalone-sort stats slot). Gating these mirrors the standalone
+    /// `fgumi sort` flow: a failed run leaves a partial BAM, so publishing a
+    /// derived artifact or summary from it would be stale. The `.bai` sidecar
+    /// for `SinkSpec::BamWithIndex` is NOT one of these — it is written inline
+    /// by the `WriteBgzfFile` sink itself (see `add_sink`), not by a
+    /// finalize hook.
     finalize_on_success: Vec<Box<dyn FinalizeHook>>,
 
     /// Shared progress counter threaded through source + stage steps for
@@ -1341,11 +1344,19 @@ impl<'a> ChainBuilder<'a> {
     /// Add the output sink step(s) to the pipeline.
     ///
     /// Appends `BgzfCompress` + `WriteBgzfFile`. Reads `spec.sink` for the
-    /// output path and uses the output header from `self.header`.
+    /// output path and uses the output header from `self.header`. For
+    /// `SinkSpec::BamWithIndex`, also builds `BgzfCompress` with inline
+    /// indexing enabled and attaches
+    /// [`WriteBgzfFile::with_bai_index`](crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile::with_bai_index)
+    /// to the sink, so the `.bai` sidecar is produced as the BAM is written
+    /// rather than by a post-pipeline re-read.
     ///
     /// # Errors
     ///
-    /// Returns errors from sink step construction (e.g., cannot create output file).
+    /// Returns errors from sink step construction (e.g., cannot create output
+    /// file), or if `SinkSpec::BamWithIndex` targets stdout or a chain with a
+    /// deferred (not-yet-resolved) header — inline indexing requires an eager
+    /// header, since it needs a fixed starting compressed-byte offset.
     ///
     /// # Panics
     ///
@@ -1371,10 +1382,27 @@ impl<'a> ChainBuilder<'a> {
         let tail = self.current_tail.expect("add_sink called before add_source");
         let output_path = self.spec.sink.path();
 
+        // `SinkSpec::BamWithIndex` selects the inline BAI indexer: `BgzfCompress`
+        // emits a `BamIndexManifest` alongside each block it produces, and
+        // `WriteBgzfFile::with_bai_index` joins those manifests against its own
+        // cumulative compressed offset as it writes, building the `.bai`
+        // in-band rather than re-reading the finished BAM afterward.
+        let want_index = matches!(self.spec.sink, SinkSpec::BamWithIndex(_));
+        if want_index {
+            ensure!(
+                !fgumi_bam_io::is_stdout_path(output_path),
+                "--write-index cannot target stdout"
+            );
+            ensure!(
+                self.pending_header_handle.is_none(),
+                "inline BAI indexing requires a resolved (non-deferred) header"
+            );
+        }
+
         let compress_step = BgzfCompress::new(
             self.tuning.compression_level,
             self.tuning.per_step_byte_limit,
-            false,
+            want_index,
         );
         let tail = self.pipeline.append_step(compress_step, tail);
 
@@ -1394,6 +1422,19 @@ impl<'a> ChainBuilder<'a> {
         } else {
             WriteBgzfFile::new(output_path, &self.header, self.tuning.compression_level)
                 .map_err(|e| anyhow!("WriteBgzfFile::new: {e}"))?
+        };
+        // `want_index` is only ever true on the eager-header branch above (the
+        // `ensure!` on `pending_header_handle` guarantees it), so
+        // `with_bai_index`'s eager-header requirement always holds here.
+        let write_step = if want_index {
+            let num_refs = self.header.reference_sequences().len();
+            // The derived `.bai` sidecar's collision with the BAM or a rejects
+            // branch is rejected up front by `validate_cross_stage_constraints`
+            // (before any sink opens and truncates a file), not here.
+            let bai_path = fgumi_bam_io::bai_sidecar_path(output_path);
+            write_step.with_bai_index(bai_path, num_refs)
+        } else {
+            write_step
         };
         // Lever 2: on the standalone-sort terminal only, run the writer on the
         // sort's I/O driver thread (legacy "N + 2"), sharing it with the phase-1
@@ -2295,10 +2336,11 @@ impl<'a> ChainBuilder<'a> {
     ///     ↓ [Intermediate] SortMerge (Serial) → RecordBatch → DecodeFromRecords
     /// ```
     ///
-    /// For a `SinkSpec::BamWithIndex` (terminal sort only), an
-    /// [`IndexBamFinalizeHook`] is registered on the success-gated finalize
-    /// list. `--sort::max-memory=auto` is only honoured for a sole-`[Sort]`
-    /// chain (it owns the whole budget); a fused chain must pass a fixed value.
+    /// For a `SinkSpec::BamWithIndex` (terminal sort only), `add_sink` attaches
+    /// the inline BAI indexer directly to the `WriteBgzfFile` sink — no
+    /// finalize hook is involved. `--sort::max-memory=auto` is only honoured
+    /// for a sole-`[Sort]` chain (it owns the whole budget); a fused chain must
+    /// pass a fixed value.
     ///
     /// The chain-level [`StageTimingFinalizeHook`] (registered by [`Self::build`])
     /// covers the wall time; sort does not register a per-stage summary hook.
@@ -2307,12 +2349,9 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// Returns errors if sort options are missing from the spec bag, or if
     /// `--sort::max-memory=auto` is requested in a fused multi-stage pipeline.
-    ///
-    /// [`IndexBamFinalizeHook`]: crate::pipeline::chains::commands::sort::IndexBamFinalizeHook
     #[allow(clippy::too_many_lines)]
     fn add_sort(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::{MemoryLimit, resolve_memory_budget};
-        use crate::pipeline::chains::commands::sort::IndexBamFinalizeHook;
 
         let sort = self
             .spec
@@ -2690,9 +2729,13 @@ impl<'a> ChainBuilder<'a> {
                 // error path, and the stats slot is unset (default zeros) whenever
                 // SortMerge never reached `Done`, so an always-run summary would
                 // report a bogus "Records processed: 0 ... completed" line on a
-                // failed run. Registered before the index hook so on success the
-                // summary still lands before any "Indexing BAM:" line, mirroring
-                // the legacy SortFinalizeHook ordering.
+                // failed run.
+                //
+                // A `SinkSpec::BamWithIndex` request needs no finalize hook here:
+                // `add_sink` wires the inline BAI indexer directly onto the
+                // `WriteBgzfFile` sink (`with_bai_index`), so the `.bai` is
+                // produced as part of the sink's own drained-finish, not by a
+                // post-pipeline re-read step queued from this branch.
                 if let Some(slot) = sort_stats_slot {
                     let output_path = self.spec.sink.path().clone();
                     self.finalize_on_success.push(Box::new(
@@ -2702,26 +2745,6 @@ impl<'a> ChainBuilder<'a> {
                             timer: crate::logging::OperationTimer::new("Sorting BAM"),
                         },
                     ));
-                }
-
-                // When the spec asks for a sidecar BAI, queue the
-                // `IndexBamFinalizeHook` on the *success-gated* finalize list
-                // so the indexer runs after the chain has flushed the final
-                // BAM on a successful run only (a failed run leaves a partial
-                // BAM whose index would be stale). Every Sort-terminal chain —
-                // standalone `[Stage::Sort]` or fused (e.g.
-                // `[Stage::Correct, Stage::Sort]`) — lands here in the unified
-                // `add_sort` flow, so without this wire a `BamWithIndex` request
-                // would pass Rule 3 and silently skip indexing. Today only
-                // standalone `fgumi sort` builds such specs (runall never
-                // constructs `SinkSpec::BamWithIndex` because its sort output is
-                // template-coordinate, where BAI is undefined), but the
-                // architectural invariant — "BamWithIndex triggers the hook in
-                // every terminal-sort path" — is enforced here for future
-                // producers.
-                if let SinkSpec::BamWithIndex(p) = &self.spec.sink {
-                    self.finalize_on_success
-                        .push(Box::new(IndexBamFinalizeHook { output_path: p.clone() }));
                 }
             } else {
                 // Intermediate: `SortMerge<RecordBatchOutput>` (the default)

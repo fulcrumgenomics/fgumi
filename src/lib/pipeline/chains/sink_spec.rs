@@ -7,8 +7,9 @@ use std::path::PathBuf;
 /// **Note for programmatic callers constructing a `ChainSpec` directly:**
 /// `Bam` is the default — picking it on a sort-terminal chain produces
 /// a coordinate-sorted BAM with **no** companion `.bai`. If you want a
-/// sidecar BAI, use `BamWithIndex`; the chain-builder will register an
-/// `IndexBamFinalizeHook` that reads the finished BAM and emits
+/// sidecar BAI, use `BamWithIndex`; the chain builder's `add_sink` attaches an
+/// inline indexer directly to the output sink, which builds the `.bai`
+/// alongside the BAM as it writes (no post-pipeline re-read) and emits
 /// `<output>.bam.bai`. There is no "auto-index" inference from sort
 /// order; the caller must opt in via this variant.
 ///

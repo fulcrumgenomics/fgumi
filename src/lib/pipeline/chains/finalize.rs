@@ -82,11 +82,13 @@ pub struct BuiltPipeline {
     /// completed and every always-drain `finalize` hook succeeded.
     ///
     /// Use this for actions that publish a derived artifact from the output
-    /// the run produced (e.g. writing a `.bai` sidecar by re-reading the
-    /// finished BAM). On the error path the output is incomplete, so running
-    /// these would publish a stale/partial artifact — exactly the
-    /// `IndexBamFinalizeHook` footgun the standalone `fgumi sort` flow guards
-    /// against by gating the index write behind `run_result?`.
+    /// the run produced (e.g. a post-run summary computed from stats the run
+    /// collected). On the error path the output is incomplete, so running
+    /// these would publish a stale/partial artifact — the footgun the
+    /// standalone `fgumi sort` flow guards against by gating such publication
+    /// behind `run_result?`. A `.bai` sidecar for `SinkSpec::BamWithIndex` is
+    /// NOT an example of this: it is written inline by the `WriteBgzfFile`
+    /// sink as part of the run itself, not by a finalize hook.
     pub finalize_on_success: Vec<Box<dyn FinalizeHook>>,
 }
 
