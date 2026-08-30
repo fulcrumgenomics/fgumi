@@ -1078,6 +1078,7 @@ fn reverse_ordered_input_forms_many_runs_but_stays_byte_parity() {
 /// byte-for-byte. This is the partial-coalescing correctness case.
 #[rstest]
 #[case::coordinate(SortOrder::Coordinate)]
+#[case::queryname_lex(SortOrder::Queryname(QuerynameComparator::Lexicographic))]
 #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
 #[case::template(SortOrder::TemplateCoordinate)]
 fn shuffled_input_matches_the_oracle_through_the_split(#[case] order: SortOrder) {
@@ -1088,7 +1089,7 @@ fn shuffled_input_matches_the_oracle_through_the_split(#[case] order: SortOrder)
         .threads(2)
         .output_compression(1)
         .temp_compression(1);
-    let (out, _runs) = drive_spill_split_pipeline(
+    let (out, runs) = drive_spill_split_pipeline(
         sorter,
         &header,
         pack_batches(&records, 256),
@@ -1099,6 +1100,9 @@ fn shuffled_input_matches_the_oracle_through_the_split(#[case] order: SortOrder)
 
     let expected = sort_via_legacy(order, &header, &records, 256 * 1024 * 1024, 1).expect("oracle");
     assert_eq!(out, expected, "{order:?}: shuffled-input sort diverged from the oracle");
+    // Shuffled input under a tiny budget must open more than one run (partial
+    // coalescing: a new run wherever a chunk cannot extend the previous one).
+    assert!(runs >= 2, "{order:?}: shuffled input must form >=2 runs (got {runs})");
 }
 
 /// An in-memory sort (memory budget above the whole input) never spills, so the
@@ -1126,6 +1130,40 @@ fn in_memory_input_forms_no_runs() {
     let expected = sort_via_legacy(order, &header, &records, 256 * 1024 * 1024, 1).expect("oracle");
     assert_eq!(out, expected, "in-memory sort diverged from the oracle");
     assert_eq!(runs, 0, "a budget-sized run never spills");
+}
+
+/// The single-thread scheduled path the fusion-policy change (t1 fix) newly
+/// activates: at `threads == 1` this chain declares Detached steps (`SpillGather`
+/// and `SortMerge`), so it does NOT fuse and runs on the scheduled path (one pool
+/// worker plus the detached driver threads). Pin that path's spilling output
+/// against the oracle end-to-end through the production spill split — the
+/// buffer-chain parity matrix only covers threads 2/4, and its harness cannot
+/// take a `threads == 1` case (its `VecSource` + `VecSink` are both Exclusive).
+#[rstest]
+#[case::coordinate(SortOrder::Coordinate)]
+#[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
+fn sorts_at_one_thread_through_the_scheduled_path(#[case] order: SortOrder) {
+    let (header, records) = synthesize_sized_records(8_000, 0x0057_0001, 40);
+
+    let sorter = RawExternalSorter::new(order)
+        .memory_limit(256 * 1024) // small ⇒ spills, exercising the merge at t1
+        .threads(1)
+        .output_compression(1)
+        .temp_compression(1);
+    let (out, runs) = drive_spill_split_pipeline(
+        sorter,
+        &header,
+        pack_batches(&records, 256),
+        4 * 1024 * 1024,
+        1,
+    )
+    .expect("spill-split pipeline drives to completion at one thread");
+
+    let expected = sort_via_legacy(order, &header, &records, 256 * 1024 * 1024, 1).expect("oracle");
+    assert_eq!(out, expected, "{order:?}: single-thread scheduled sort diverged from the oracle");
+    // The small budget must actually spill; otherwise this degrades to an
+    // in-memory sort and no longer exercises the merge path it names.
+    assert!(runs >= 1, "{order:?}: the small budget must spill (got {runs} run(s))");
 }
 
 /// Block-parallel decompression completes out of order (workers decompress one
@@ -2242,10 +2280,13 @@ fn shuffled_bam_matches_the_oracle_through_the_arena_split() {
     let n_ref = u32::try_from(header.reference_sequences().len()).expect("n_ref fits u32");
 
     let blocks = bgzf_blocks_for(&records, n_ref, 4096);
-    let (out, _runs) = drive_arena_split_pipeline(blocks, n_ref, 64 * 1024, 4 * 1024 * 1024, 4)
+    let (out, runs) = drive_arena_split_pipeline(blocks, n_ref, 64 * 1024, 4 * 1024 * 1024, 4)
         .expect("arena-split pipeline drives to completion");
 
     let expected = sort_via_legacy(SortOrder::Coordinate, &header, &records, 256 * 1024 * 1024, 1)
         .expect("oracle");
     assert_eq!(out, expected, "arena/BAM-path shuffled output diverged from the oracle");
+    // Shuffled BAM input under a tiny per-block budget must open more than one
+    // run (partial coalescing), otherwise the case no longer exercises it.
+    assert!(runs >= 2, "arena/BAM shuffled input must form >=2 runs (got {runs})");
 }

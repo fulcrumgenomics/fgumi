@@ -53,7 +53,10 @@
 //! `MAX_EVENTS_PER_LOCK` blocks into `pending`, drains them, and only frees the
 //! source chunk once its last record is framed. `pending` therefore holds ≤ a
 //! handful of 64 KiB blocks (~½ MiB) regardless of chunk size, and the chunk
-//! drains as fast as `SpillBlockCompress` consumes blocks.
+//! drains as fast as `SpillBlockCompress` consumes blocks. Run extension adds
+//! one more retained block — `held_last_block`, the withheld run-final block —
+//! which is O(1) (a single ~64 KiB block across a chunk boundary), not a
+//! per-chunk or per-run accumulation.
 
 use std::collections::VecDeque;
 use std::io;
@@ -192,8 +195,13 @@ pub struct SpillGather {
     /// spill and after a `Residual` / `AllAnnounced` closes the run.
     open_run: Option<(u32, RunBound)>,
     /// The open run's final framed block, withheld pending the extend/close
-    /// decision of the next event (lazy run-close). At most one 64 KiB block.
-    held_last_block: Option<HeldBlock>,
+    /// decision of the next event (lazy run-close). At most one ~64 KiB block
+    /// retained across a chunk boundary (O(1), not a per-chunk/-run accumulation).
+    /// Uses [`HeldSlot`] rather than a bare `Option` so `put` is a hard `assert!`:
+    /// overwriting a withheld block would silently drop a whole spill block (many
+    /// records), so an invariant break must fail loudly in release too, not only
+    /// under `debug_assert!`.
+    held_last_block: HeldSlot<HeldBlock>,
     /// Number of distinct runs (spill files) formed. Rewritten into
     /// `AllAnnounced.slot_count`, since that is how many `SpillReady`s the merge
     /// will receive and gate on.
@@ -220,7 +228,7 @@ impl SpillGather {
             next_ordinal: 0,
             held: HeldSlot::new(),
             open_run: None,
-            held_last_block: None,
+            held_last_block: HeldSlot::new(),
             runs_written: 0,
             chunks_spilled: 0,
             summary_logged: false,
@@ -237,17 +245,16 @@ impl SpillGather {
     }
 
     /// The owned-engine-style run-formation summary line, or `None` when nothing
-    /// spilled. Mirrors `fgumi_sort::external`'s `log_run_formation` so both sort
-    /// engines report run formation identically: every spilled chunk either
-    /// starts a run or extends one, so `extended = chunks_spilled - runs_written`.
+    /// spilled. Formats through the shared [`fgumi_sort::format_run_formation`] so
+    /// both sort engines report run formation with byte-identical wording (the
+    /// owned engine's `log_run_formation` calls the same function).
     fn run_formation_summary(&self) -> Option<String> {
         if self.chunks_spilled == 0 {
             return None;
         }
-        let extended = self.chunks_spilled.saturating_sub(self.runs_written);
-        Some(format!(
-            "Spill runs: {} from {} chunks ({extended} extended an existing run)",
-            self.runs_written, self.chunks_spilled
+        Some(fgumi_sort::format_run_formation(
+            self.runs_written as usize,
+            self.chunks_spilled as usize,
         ))
     }
 
@@ -360,12 +367,10 @@ impl SpillGather {
                 // Withhold the run's final block: it is closed lazily once we know
                 // whether the next chunk extends this run (see `stage_event` /
                 // `flush_held_block`). The previous run's block was already flushed
-                // before this chunk was staged, so nothing is being overwritten.
-                debug_assert!(
-                    self.held_last_block.is_none(),
-                    "a prior held block must be flushed before withholding a new one"
-                );
-                self.held_last_block = Some(HeldBlock { bytes, file_id, records_ingested_so_far });
+                // before this chunk was staged, so nothing is being overwritten —
+                // `HeldSlot::put` hard-asserts that invariant (overwriting would
+                // silently drop a whole spill block, i.e. lose records).
+                self.held_last_block.put(HeldBlock { bytes, file_id, records_ingested_so_far });
                 self.active = None;
                 return Ok(());
             }
@@ -462,7 +467,7 @@ impl Step for SpillGather {
             // that close never happened — a lost run terminator would leave
             // `SpillWrite` with a dangling open file. Fail loudly rather than
             // silently drop a run.
-            if self.held_last_block.is_some() {
+            if self.held_last_block.is_held() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "SpillGather drained with an unclosed run (a withheld spill block was \

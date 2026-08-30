@@ -22,17 +22,25 @@
 //! open run's max is retained while later chunks are ingested and the source
 //! chunk is spilled and dropped), so it must own its key rather than borrow it.
 //!
-//! # Queryname tie-break is parity-safe
+//! # Tie behaviour is parity-safe (all orders)
 //!
-//! Queryname keys ([`RawQuerynameKey`], [`RawQuerynameLexKey`]) carry an
-//! intra-chunk ingest `pos` as their final `cmp` tie-break. Within a chunk `pos`
-//! increases with ingest order, so the open run's max (`key_at(len-1)`, a large
-//! `pos`) never precedes-or-equals the next chunk's min (`key_at(0)`, `pos`
-//! reset near 0) on an exact name+flags tie — extension is conservatively
-//! declined. This is safe: `pos` is *not* serialized (the on-disk key is
-//! `[name_len][name][flags]`), so an extended run and a non-extended run produce
-//! byte-identical spill output. Coordinate and template keys are content-based
-//! (no `pos`), so their ties *do* extend — also byte-identical either way.
+//! An exact boundary tie (the open run's max key equals the incoming chunk's min
+//! key) *extends* the run in the arena path, for every order. That is safe
+//! whether a tie extends or splits, because equal-key records keep the same
+//! relative order either way: within one physical run they are concatenated in
+//! (chunk seal order, intra-chunk order); across two runs the merge combines the
+//! slots in the same (`file_id`, intra-chunk) order — the byte output is identical.
+//!
+//! Note the `pos` field on the queryname keys ([`RawQuerynameKey`],
+//! [`RawQuerynameLexKey`]) does **not** change this. `pos` is a per-chunk ingest
+//! index and is the keys' final `cmp` tie-break, but it is set (via
+//! [`RawSortKey::set_position`](crate::RawSortKey::set_position)) **only** in the
+//! owned engine's `RunFormer`, which never uses `RunBound`. The arena ingest that
+//! builds `RunBound` breaks equal-key ties by arena offset in the sort comparator
+//! and never calls `set_position`, so every arena queryname key carries `pos == 0`
+//! — an exact name+flags tie therefore compares `Equal` and the run extends. And
+//! even if `pos` did differ, it is not serialized (the on-disk key is
+//! `[name_len][name][flags]`), so extend-vs-split is byte-identical regardless.
 
 use crate::inline::{CbKey32, TemplateKey, TemplateKey24, TertKey32};
 use crate::keys::{RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey};
@@ -87,6 +95,21 @@ impl RunBound {
     }
 }
 
+/// The run-formation summary line both sort engines log, so the wording and the
+/// `extended = chunks_spilled - runs` arithmetic have a single source of truth:
+/// the owned engine's `log_run_formation` and the arena's
+/// `SpillGather::run_formation_summary` both format through this.
+///
+/// Every spilled chunk either starts a run or extends an existing one, so the
+/// number that extended is exactly `chunks_spilled - runs`.
+#[must_use]
+pub fn format_run_formation(runs: usize, chunks_spilled: usize) -> String {
+    format!(
+        "Spill runs: {runs} from {chunks_spilled} chunks ({} extended an existing run)",
+        chunks_spilled.saturating_sub(runs)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,26 +139,40 @@ mod tests {
         assert!(a.precedes_or_equal(&b));
     }
 
-    /// Queryname keys carry `pos`, so an exact name+flags boundary tie does NOT
-    /// extend: the open run's max (`pos` large) is not `<=` the incoming min
-    /// (`pos` reset). Parity-safe because `pos` is not serialized. Uses the lex
-    /// comparator; the natural comparator shares the same `pos` tie-break.
+    /// The ARENA path never sets `pos` (it breaks ties by arena offset in the
+    /// sort comparator, not via `set_position`), so every arena queryname key has
+    /// `pos == 0`. An exact name+flags boundary tie therefore compares `Equal` and
+    /// the run EXTENDS — this is the real production behaviour, and it is
+    /// parity-safe (see the module docs: extend-vs-split is byte-identical).
     #[test]
-    fn queryname_exact_name_tie_does_not_extend_due_to_pos() {
-        // Same name + flags, differing only in the intra-chunk ingest position:
-        // the open run's max record was ingested later (larger pos) than the
-        // incoming chunk's first record (pos reset near 0).
-        let mut open_max = RawQuerynameLexKey::new(b"readAAA".to_vec(), 0);
-        open_max.set_position(9);
-        let mut incoming_min = RawQuerynameLexKey::new(b"readAAA".to_vec(), 0);
-        incoming_min.set_position(0);
+    fn queryname_exact_name_tie_with_default_pos_extends() {
+        // As built by the arena ingest: pos defaults to 0 on both sides.
+        let open_max = RawQuerynameLexKey::new(b"readAAA".to_vec(), 0);
+        let incoming_min = RawQuerynameLexKey::new(b"readAAA".to_vec(), 0);
+        assert_eq!(open_max.name(), incoming_min.name());
 
         let open = RunBound::QuerynameLex(open_max);
         let incoming = RunBound::QuerynameLex(incoming_min);
         assert!(
-            !open.precedes_or_equal(&incoming),
-            "an exact name tie must NOT extend: pos makes max > min"
+            open.precedes_or_equal(&incoming),
+            "with the default pos==0 the arena builds, an exact tie extends"
         );
+    }
+
+    /// `RunBound` compares the *full* key, so its comparator honours the `pos`
+    /// tie-break when the two keys carry different `pos` values. This pins the
+    /// comparator itself; note the differing-`pos` state does NOT arise in the
+    /// arena path (see `queryname_exact_name_tie_with_default_pos_extends`) — it
+    /// is only reachable through the owned engine's `set_position`.
+    #[test]
+    fn run_bound_queryname_compare_honours_pos_tiebreak() {
+        let mut later = RawQuerynameLexKey::new(b"readAAA".to_vec(), 0);
+        later.set_position(9);
+        let mut earlier = RawQuerynameLexKey::new(b"readAAA".to_vec(), 0);
+        earlier.set_position(0);
+
+        // Same name+flags; larger pos does not precede-or-equal the smaller pos.
+        assert!(!RunBound::QuerynameLex(later).precedes_or_equal(&RunBound::QuerynameLex(earlier)));
     }
 
     /// A strictly-smaller queryname name in the open run's max still extends

@@ -583,6 +583,42 @@ fn run_formation_summary_is_none_when_nothing_spilled() {
 }
 
 #[test]
+fn the_run_final_block_is_withheld_until_the_run_is_closed() {
+    // Frame a single spill chunk with no terminating event yet: its final block
+    // is withheld (the run is still open), which is exactly the state the drain
+    // guard fails closed on — `held_last_block.is_held()` at drain.
+    let mut step = SpillGather::new(1 << 20);
+    step.stage_event(SortChunkEvent::Spill {
+        seq: 0,
+        chunk: coord_chunk_keyed(&[10, 20]),
+        records_ingested_so_far: 2,
+    });
+    step.produce_blocks().unwrap();
+    assert!(step.active.is_none(), "the one-block chunk is fully framed");
+    assert!(step.pending.is_empty(), "the sole (run-final) block is withheld, not emitted");
+    assert!(
+        step.held_last_block.is_held(),
+        "a run-final block is withheld until close — a drain here would trip the guard"
+    );
+
+    // Closing the run (AllAnnounced) flushes the withheld block with is_last=true
+    // and leaves nothing held, so the drain guard is clear.
+    step.stage_event(SortChunkEvent::AllAnnounced {
+        slot_count: 1,
+        memory_chunk_count: 0,
+        total_records: 2,
+    });
+    assert!(!step.held_last_block.is_held(), "closing the run flushes the withheld block");
+    assert!(
+        matches!(
+            step.pending.front(),
+            Some(SpillBlockEvent::Block { is_last_in_file: true, file_id: 0, .. })
+        ),
+        "the flushed block closes its file"
+    );
+}
+
+#[test]
 fn a_non_empty_spill_chunk_becomes_active_without_emitting_yet() {
     let mut step = SpillGather::new(1 << 20);
     step.stage_event(SortChunkEvent::Spill {

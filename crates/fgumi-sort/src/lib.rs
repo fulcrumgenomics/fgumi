@@ -250,7 +250,7 @@ pub use reader::{
 pub use ref_sort::{
     coordinate_chunk_from_arena_refs, coordinate_chunk_from_refs, queryname_chunk_from_arena_refs,
 };
-pub use run_bound::RunBound;
+pub use run_bound::{RunBound, format_run_formation};
 pub use segmented_buf::SegmentedBuf;
 pub use spill_block::{SpillBlockCompressor, frame_keyed_record_into, spill_magic, spill_trailer};
 pub use spill_block_reader::SpillBlockDecompressor;
