@@ -859,9 +859,7 @@ impl Sort {
         // --- cutover: run via the chain instead of sorter.sort() ---
         // (self.build_sorter above is retained only to source the banner's thread/temp-file
         //  numbers; the owned sorter is not executed. PR B removes the owned engine + banner-build.)
-        use crate::commands::common::{
-            BamIoOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-        };
+        use crate::commands::common::{QueueMemoryOptions, SchedulerOptions, ThreadingOptions};
         use crate::pipeline::chains::{
             ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag, build_for,
         };
@@ -890,7 +888,11 @@ impl Sort {
             scheduler: SchedulerOptions { deadlock_timeout: 10, ..Default::default() },
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
-            verify_crc: BamIoOptions::new(&self.input, output).effective_check_crc(),
+            // The owned engine always verified CRC (incl. stdin); keep parity -- a future
+            // PR can add --no-check-crc if opt-out is wanted. `effective_check_crc()` would
+            // skip verification for stdin input (the file-vs-stdin default other commands
+            // use), which is a silent regression from the owned sorter's behavior.
+            verify_crc: true,
             command_line: command_line.to_string(),
         };
         build_for(spec)?.run()

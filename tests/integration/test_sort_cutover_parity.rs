@@ -13,6 +13,7 @@
 //! job, not this test's.
 
 use std::ffi::OsStr;
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -430,8 +431,8 @@ fn order_flag(order_label: &str) -> &'static str {
 /// and template-coordinate cases still run their samtools cross-check;
 /// queryname-lex has no samtools equivalent (samtools' `-n` is natural order,
 /// not lexicographic), so it is baseline-only and is *skipped* there. Setting
-/// `FGUMI_BASELINE_BIN` (or having the default baseline path present) adds the
-/// baseline half to every case, queryname-lex included.
+/// `FGUMI_BASELINE_BIN` (when it names an existing file) adds the baseline half
+/// to every case, queryname-lex included.
 #[rstest]
 #[case::coordinate("coordinate", Some(&["sort"] as &[&str]))]
 #[case::queryname_lex("queryname", None)] // no samtools equivalent: samtools -n is natural order
@@ -452,7 +453,7 @@ fn cutover_matches_baseline_and_samtools(
     if baseline.is_none() && !run_samtools {
         eprintln!(
             "SKIP cutover_matches_baseline_and_samtools[{order}]: neither FGUMI_BASELINE_BIN \
-             (nor the default baseline path) nor a usable samtools cross-check is available -- \
+             (unset or naming a missing file) nor a usable samtools cross-check is available -- \
              no oracle to compare against"
         );
         return;
@@ -485,7 +486,7 @@ fn cutover_matches_baseline_and_samtools(
         None => {
             eprintln!(
                 "SKIP baseline half of cutover_matches_baseline_and_samtools[{order}]: \
-                 FGUMI_BASELINE_BIN not set and the default baseline path was not found"
+                 FGUMI_BASELINE_BIN is unset or does not name an existing file"
             );
         }
     }
@@ -521,4 +522,654 @@ fn cutover_matches_baseline_and_samtools(
             );
         }
     }
+}
+
+// ============================================================================
+// Task 5: --write-index, edge cases, spill identity, env fallback, and guards
+//
+// Command-level coverage of the pieces the cutover changed or left inert:
+// the coordinate-only `--write-index` guard and its inline BAI content, the
+// empty/single/already-sorted edges, spill-vs-in-memory byte identity,
+// `FGUMI_TMP_DIRS` reaching the chain, and the `--threads 0` /
+// accept-but-inert-flag guards. A genuine failure here is a real cutover bug,
+// not a test to relax -- see the module-level correctness discipline note.
+// ============================================================================
+
+/// `n` mapped, single-end records on one reference, placed at *ascending*
+/// positions -- already in coordinate order. Used for the "already sorted"
+/// edge case; at `n <= 1` it also serves as the empty/single-record input,
+/// where position order is moot.
+fn sorted_records(n: usize) -> Vec<RawRecord> {
+    (0..n)
+        .map(|i| {
+            let pos = i32::try_from((i + 1) * 100).expect("pos fits i32");
+            let mut b = SamBuilder::new();
+            b.read_name(format!("read{i}").as_bytes())
+                .ref_id(0)
+                .pos(pos)
+                .mapq(60)
+                .flags(0)
+                .cigar_ops(&[4u32 << 4]) // 4M
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4]);
+            b.build()
+        })
+        .collect()
+}
+
+/// `samtools idxstats <bam>` output: per-reference mapped/unmapped counts
+/// read off the `.bai` sidecar currently sitting next to `bam`.
+fn idxstats(bam: &Path) -> String {
+    let out = Command::new("samtools")
+        .args(["idxstats", bam.to_str().expect("path is valid UTF-8")])
+        .output()
+        .expect("failed to spawn samtools idxstats");
+    assert!(
+        out.status.success(),
+        "samtools idxstats failed for {}: {}",
+        bam.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// `samtools view <bam> <region>` output: the records a region query returns
+/// via the `.bai` sidecar currently sitting next to `bam`.
+fn region_records(bam: &Path, region: &str) -> String {
+    let out = Command::new("samtools")
+        .args(["view", bam.to_str().expect("path is valid UTF-8"), region])
+        .output()
+        .expect("failed to spawn samtools view");
+    assert!(
+        out.status.success(),
+        "samtools view {region} failed for {}: {}",
+        bam.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// `fgumi sort --write-index` (coordinate) writes the output BAM plus an
+/// inline `.bai` sidecar built by the arena indexer (PR A0). That `.bai` must
+/// be equivalent to one `samtools index` builds for the identical output
+/// bytes: identical `idxstats`, identical region-query results.
+///
+/// The inline and samtools-built indexes are compared by staging each, in
+/// turn, at the BAM's default `.bai` sidecar path (only one can occupy that
+/// path at a time), rather than by asking samtools to look at a differently
+/// named index file, which it has no flag for.
+#[test]
+fn cutover_write_index_matches_samtools_idxstats() {
+    if !samtools_available() {
+        eprintln!("SKIP cutover_write_index_matches_samtools_idxstats: samtools not on PATH");
+        return;
+    }
+
+    let dir = TempDir::new().expect("create temp dir");
+    let input_bam = dir.path().join("in.bam");
+    write_bam(&input_bam, &diverse_header(), &diverse_unsorted_records(1_000));
+
+    let output_bam = dir.path().join("out.bam");
+    let bai_sidecar = dir.path().join("out.bam.bai");
+
+    let current_bin = Path::new(env!("CARGO_BIN_EXE_fgumi"));
+    let status = Command::new(current_bin)
+        .args([
+            OsStr::new("sort"),
+            OsStr::new("-i"),
+            input_bam.as_os_str(),
+            OsStr::new("-o"),
+            output_bam.as_os_str(),
+            OsStr::new("--order"),
+            OsStr::new("coordinate"),
+            OsStr::new("--write-index"),
+            OsStr::new("-m"),
+            OsStr::new("64K"),
+        ])
+        .status()
+        .expect("failed to spawn fgumi sort --write-index");
+    assert!(status.success(), "fgumi sort --write-index failed");
+    assert!(output_bam.exists(), "sorted output BAM was not created");
+    assert!(bai_sidecar.exists(), "inline .bai was not created next to the output BAM");
+
+    // Move the inline index aside, then let samtools build its own index over
+    // the identical output bytes.
+    let fgumi_bai = dir.path().join("fgumi.bai");
+    fs::rename(&bai_sidecar, &fgumi_bai).expect("move inline .bai aside");
+
+    let index_status = Command::new("samtools")
+        .args(["index", output_bam.to_str().expect("path is valid UTF-8")])
+        .status()
+        .expect("failed to spawn samtools index");
+    assert!(index_status.success(), "samtools index failed");
+    assert!(bai_sidecar.exists(), "samtools did not (re)create the .bai sidecar");
+    let samtools_bai = dir.path().join("samtools.bai");
+    fs::rename(&bai_sidecar, &samtools_bai).expect("move samtools .bai aside");
+
+    let regions = ["chr1", "chr2", "chr3", "chr1:300000-350000", "chr2:350000-400500"];
+
+    fs::copy(&fgumi_bai, &bai_sidecar).expect("stage fgumi .bai");
+    let fgumi_idxstats = idxstats(&output_bam);
+    let fgumi_regions: Vec<String> =
+        regions.iter().map(|r| region_records(&output_bam, r)).collect();
+    fs::remove_file(&bai_sidecar).expect("remove staged fgumi .bai");
+
+    fs::copy(&samtools_bai, &bai_sidecar).expect("stage samtools .bai");
+    let samtools_idxstats = idxstats(&output_bam);
+    let samtools_regions: Vec<String> =
+        regions.iter().map(|r| region_records(&output_bam, r)).collect();
+    fs::remove_file(&bai_sidecar).expect("remove staged samtools .bai");
+
+    assert_eq!(
+        fgumi_idxstats, samtools_idxstats,
+        "idxstats via fgumi's inline .bai must match samtools' own index over the same bytes"
+    );
+    for (region, (fgumi_out, samtools_out)) in
+        regions.iter().zip(fgumi_regions.iter().zip(samtools_regions.iter()))
+    {
+        assert_eq!(
+            fgumi_out, samtools_out,
+            "region {region}: records retrieved via fgumi's inline .bai differ from samtools' \
+             own index over the identical output bytes"
+        );
+    }
+}
+
+/// `--write-index` is coordinate-only; `--order queryname --write-index` must
+/// be rejected up front (before any output is opened) and leave no partial
+/// output or `.bai` sidecar behind.
+#[test]
+fn cutover_write_index_rejects_non_coordinate() {
+    let dir = TempDir::new().expect("create temp dir");
+    let input_bam = dir.path().join("in.bam");
+    write_bam(&input_bam, &create_minimal_header("chr1", 1_000_000), &unsorted_records(10));
+    let output_bam = dir.path().join("out.bam");
+
+    let cmd = Sort::try_parse_from([
+        OsStr::new("sort"),
+        OsStr::new("-i"),
+        input_bam.as_os_str(),
+        OsStr::new("-o"),
+        output_bam.as_os_str(),
+        OsStr::new("--order"),
+        OsStr::new("queryname"),
+        OsStr::new("--write-index"),
+    ])
+    .expect("failed to parse sort args");
+
+    let result = cmd.execute("fgumi sort");
+    assert!(result.is_err(), "--order queryname --write-index must be rejected");
+    let err_msg = format!("{:#}", result.unwrap_err());
+    assert!(
+        err_msg.contains("--write-index is only valid for coordinate sort"),
+        "unexpected error message for --order queryname --write-index: {err_msg}"
+    );
+
+    assert!(!output_bam.exists(), "a rejected --write-index run must leave no partial output BAM");
+    let bai_sidecar = dir.path().join("out.bam.bai");
+    assert!(!bai_sidecar.exists(), "a rejected --write-index run must leave no partial .bai");
+}
+
+/// Empty, single-record, and already-coordinate-sorted inputs must all
+/// produce valid, correctly-counted output through the cutover, and --
+/// wherever the owned-engine baseline binary is available -- byte-identical
+/// output (modulo `@PG`) to it.
+#[rstest]
+#[case::empty(0)]
+#[case::single(1)]
+#[case::already_sorted(1000)]
+fn cutover_edge_cases_match_baseline(#[case] n: usize) {
+    let dir = TempDir::new().expect("create temp dir");
+    let input_bam = dir.path().join("in.bam");
+    write_bam(&input_bam, &create_minimal_header("chr1", 1_000_000), &sorted_records(n));
+
+    let current_bin = Path::new(env!("CARGO_BIN_EXE_fgumi"));
+    let current_out = dir.path().join("current.bam");
+    run_fgumi_sort(current_bin, &input_bam, &current_out, "coordinate");
+
+    let (_, out_records) = read_bam_output(&current_out);
+    assert_eq!(out_records.len(), n, "output record count must match input record count (n={n})");
+    // The baseline half below is skipped whenever FGUMI_BASELINE_BIN is unset, so
+    // assert order here too: a count-only assertion cannot see a reordered output.
+    assert!(
+        fgumi_verify_sorted(current_bin, &current_out, "coordinate"),
+        "cutover output for n={n} is not order-valid per `fgumi sort --verify`"
+    );
+
+    match baseline_bin() {
+        Some(baseline_bin_path) => {
+            let baseline_out = dir.path().join("baseline.bam");
+            run_fgumi_sort(&baseline_bin_path, &input_bam, &baseline_out, "coordinate");
+
+            assert_eq!(
+                decompressed_records_without_pg(&current_out),
+                decompressed_records_without_pg(&baseline_out),
+                "cutover output for n={n} diverges from the owned-engine baseline binary after \
+                 stripping the @PG header line -- this is a real cutover parity bug, not \
+                 something to relax the assertion for"
+            );
+        }
+        None => {
+            eprintln!(
+                "SKIP baseline half of cutover_edge_cases_match_baseline[n={n}]: \
+                 FGUMI_BASELINE_BIN is unset or does not name an existing file"
+            );
+        }
+    }
+}
+
+/// The same unsorted input, sorted once under a tiny `--max-memory` budget
+/// (forcing spill into a `--tmp-dir` tempfile directory) and once under the
+/// (large) default budget (fitting entirely in memory), must produce
+/// byte-identical output -- spilling must never change what the sort emits,
+/// only how it gets there.
+///
+/// The spill branch runs as a subprocess (mirroring
+/// `cutover_honors_fgumi_tmp_dirs_env`) so the test can assert on
+/// `SortSummaryFinalizeHook`'s `"Spill runs: {n}"` stderr line -- only emitted
+/// when `runs_written > 0` -- rather than merely assuming a 64K budget over
+/// 5,000 records spills. Without that check, a future change to the
+/// memory-budget math that silently stopped the spill would leave this test
+/// green while comparing two in-memory sorts, for the wrong reason.
+#[test]
+fn cutover_spill_and_nonspill_are_identical() {
+    let dir = TempDir::new().expect("create temp dir");
+    let input_bam = dir.path().join("in.bam");
+    write_bam(&input_bam, &create_minimal_header("chr1", 1_000_000), &unsorted_records(5_000));
+
+    let spill_tmp_dir = TempDir::new().expect("create spill tmp dir");
+    let spill_out = dir.path().join("spill.bam");
+    let current_bin = Path::new(env!("CARGO_BIN_EXE_fgumi"));
+    let spill_output = Command::new(current_bin)
+        .env("RUST_LOG", "info")
+        .args([
+            OsStr::new("sort"),
+            OsStr::new("-i"),
+            input_bam.as_os_str(),
+            OsStr::new("-o"),
+            spill_out.as_os_str(),
+            OsStr::new("--order"),
+            OsStr::new("coordinate"),
+            OsStr::new("--max-memory"),
+            OsStr::new("64K"),
+            OsStr::new("--tmp-dir"),
+            spill_tmp_dir.path().as_os_str(),
+        ])
+        .output()
+        .expect("failed to spawn fgumi sort (spill)");
+    let spill_stderr = String::from_utf8_lossy(&spill_output.stderr);
+    assert!(spill_output.status.success(), "spill sort should succeed:\n{spill_stderr}");
+    assert!(
+        spill_stderr.contains("Spill runs:"),
+        "expected at least one spill run under a 64K budget over 5,000 records -- otherwise \
+         this test cannot prove the spill branch actually spilled, only that it resolved a \
+         tmp-dir nothing wrote to; stderr:\n{spill_stderr}"
+    );
+
+    // Default --max-memory (768M/thread) trivially fits 5,000 tiny records in
+    // memory with zero spills. Run this arm as a subprocess too (mirroring the
+    // spill arm) so it can assert `"Spill runs:"` is *absent* -- otherwise a
+    // future memory-budget change that made the default path spill would leave
+    // this test comparing two spill sorts while still named "non-spill".
+    let nonspill_out = dir.path().join("nonspill.bam");
+    let nonspill_output = Command::new(current_bin)
+        .env("RUST_LOG", "info")
+        .args([
+            OsStr::new("sort"),
+            OsStr::new("-i"),
+            input_bam.as_os_str(),
+            OsStr::new("-o"),
+            nonspill_out.as_os_str(),
+            OsStr::new("--order"),
+            OsStr::new("coordinate"),
+        ])
+        .output()
+        .expect("failed to spawn fgumi sort (non-spill)");
+    let nonspill_stderr = String::from_utf8_lossy(&nonspill_output.stderr);
+    assert!(nonspill_output.status.success(), "non-spill sort should succeed:\n{nonspill_stderr}");
+    assert!(
+        !nonspill_stderr.contains("Spill runs:"),
+        "the default budget must keep this sort in memory, otherwise this test compares two \
+         spill sorts; stderr:\n{nonspill_stderr}"
+    );
+
+    // Assert order against an independent oracle before the byte-identity check:
+    // comparing two fgumi runs alone cannot catch a spill bug that misorders both
+    // the same way.
+    assert!(
+        fgumi_verify_sorted(current_bin, &spill_out, "coordinate"),
+        "spill output is not order-valid per `fgumi sort --verify`"
+    );
+    assert_eq!(
+        decompressed_records_without_pg(&spill_out),
+        decompressed_records_without_pg(&nonspill_out),
+        "spill and non-spill sorts of the same input must produce byte-identical output"
+    );
+}
+
+/// `FGUMI_TMP_DIRS` must reach `SortOptions.tmp_dirs` via `execute_sort` when
+/// no `--tmp-dir` flag is given, and the sort must actually spill into it.
+///
+/// This has to run as a subprocess: `std::env::set_var` is `unsafe` under
+/// edition 2024 and this crate forbids unsafe code, so the only way to set an
+/// environment variable for a run without touching the current process's
+/// environment is to hand it to a child's `Command::env`.
+///
+/// Evidence gathered from the child's stderr (default `info`-level logging,
+/// pinned explicitly via `RUST_LOG` in case the ambient environment overrides
+/// it):
+/// - `execute_sort`'s own `"Temp directories: {joined}"` banner names exactly
+///   the resolved `tmp_dirs`, so its presence with our env tempdir's path
+///   proves the env var reached `SortOptions.tmp_dirs`.
+/// - `SortSummaryFinalizeHook`'s `"Spill runs: {n}"` line is only emitted
+///   when `runs_written > 0`, so its presence proves the tiny `--max-memory`
+///   budget actually forced the sort to spill (into that same resolved
+///   directory) rather than merely resolving a path nothing used.
+#[test]
+fn cutover_honors_fgumi_tmp_dirs_env() {
+    let dir = TempDir::new().expect("create temp dir");
+    let input_bam = dir.path().join("in.bam");
+    let records = unsorted_records(8_000);
+    let input_count = records.len();
+    write_bam(&input_bam, &create_minimal_header("chr1", 1_000_000), &records);
+    let output_bam = dir.path().join("out.bam");
+
+    let env_tmp_dir = TempDir::new().expect("create env tmp dir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .env("RUST_LOG", "info")
+        .env("FGUMI_TMP_DIRS", env_tmp_dir.path())
+        .args([
+            OsStr::new("sort"),
+            OsStr::new("-i"),
+            input_bam.as_os_str(),
+            OsStr::new("-o"),
+            output_bam.as_os_str(),
+            OsStr::new("--order"),
+            OsStr::new("coordinate"),
+            OsStr::new("--max-memory"),
+            OsStr::new("64K"),
+        ])
+        // --tmp-dir deliberately left unset, so tmp_dirs can only have come
+        // from the FGUMI_TMP_DIRS env var above.
+        .output()
+        .expect("failed to spawn fgumi sort subprocess");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "fgumi sort (FGUMI_TMP_DIRS) failed:\n{stderr}");
+
+    let expected_banner = format!("Temp directories: {}", env_tmp_dir.path().display());
+    assert!(
+        stderr.contains(&expected_banner),
+        "expected the resolved-tmp-dirs banner to name the FGUMI_TMP_DIRS path \
+         ({expected_banner:?}); stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Spill runs:"),
+        "expected at least one spill run under a 64K budget over {input_count} records -- \
+         otherwise this test cannot prove the env-resolved directory was actually used, only \
+         that it was resolved; stderr:\n{stderr}"
+    );
+
+    let (_, out_records) = read_bam_output(&output_bam);
+    assert_eq!(out_records.len(), input_count, "output record count must match input");
+    // A record count cannot see a reordering; assert order against the independent
+    // `--verify` oracle so a spill that misordered records fails here.
+    assert!(
+        fgumi_verify_sorted(Path::new(env!("CARGO_BIN_EXE_fgumi")), &output_bam, "coordinate"),
+        "FGUMI_TMP_DIRS spill output is not order-valid per `fgumi sort --verify`"
+    );
+}
+
+/// `fgumi sort --threads 0` must be rejected cleanly, before any output is
+/// created.
+///
+/// In practice this bails out of `resolve_memory_budget` inside
+/// `execute_sort`'s pre-chain setup (`self.memory_budget_threads()` returns 0
+/// verbatim for `--threads 0`, and `resolve_memory_budget` rejects a
+/// zero-thread budget with this exact message) -- the chain is never built
+/// for this case, so `ChainBuilder::new`'s own identical `num_threads == 0`
+/// guard is not what fires here. Both call sites bail with the same message
+/// ("--threads must be at least 1"), so this test's assertion holds
+/// regardless of which one is reached; it also cross-checks against the
+/// owned-engine baseline binary where available, since the baseline's
+/// `execute_sort` hits the identical `resolve_memory_budget` guard (the
+/// chain-cutover in Task 3 did not touch this code path).
+#[test]
+fn cutover_threads_zero_is_rejected() {
+    let dir = TempDir::new().expect("create temp dir");
+    let input_bam = dir.path().join("in.bam");
+    write_bam(&input_bam, &create_minimal_header("chr1", 1_000_000), &unsorted_records(10));
+    let output_bam = dir.path().join("out.bam");
+
+    let cmd = Sort::try_parse_from([
+        OsStr::new("sort"),
+        OsStr::new("-i"),
+        input_bam.as_os_str(),
+        OsStr::new("-o"),
+        output_bam.as_os_str(),
+        OsStr::new("--order"),
+        OsStr::new("coordinate"),
+        OsStr::new("--threads"),
+        OsStr::new("0"),
+    ])
+    .expect("failed to parse sort args");
+
+    let result = cmd.execute("fgumi sort");
+    assert!(result.is_err(), "--threads 0 must be rejected");
+    let err_msg = format!("{:#}", result.unwrap_err());
+    assert!(
+        err_msg.contains("--threads must be at least 1"),
+        "unexpected error message for --threads 0: {err_msg}"
+    );
+    assert!(!output_bam.exists(), "a rejected --threads 0 run must leave no partial output");
+
+    match baseline_bin() {
+        Some(baseline_bin_path) => {
+            let baseline_output = Command::new(&baseline_bin_path)
+                .args([
+                    OsStr::new("sort"),
+                    OsStr::new("-i"),
+                    input_bam.as_os_str(),
+                    OsStr::new("-o"),
+                    output_bam.as_os_str(),
+                    OsStr::new("--order"),
+                    OsStr::new("coordinate"),
+                    OsStr::new("--threads"),
+                    OsStr::new("0"),
+                ])
+                .output()
+                .expect("failed to spawn baseline binary");
+            assert!(
+                !baseline_output.status.success(),
+                "baseline binary's --threads 0 unexpectedly succeeded"
+            );
+            let baseline_err = String::from_utf8_lossy(&baseline_output.stderr);
+            assert!(
+                baseline_err.contains("--threads must be at least 1"),
+                "baseline binary's --threads 0 error message differs from the cutover's \
+                 (\"--threads must be at least 1\"): {baseline_err}"
+            );
+        }
+        None => {
+            eprintln!(
+                "SKIP baseline comparison in cutover_threads_zero_is_rejected: \
+                 FGUMI_BASELINE_BIN is unset or does not name an existing file"
+            );
+        }
+    }
+}
+
+/// `--sort-stats` and `--read-streams` are inert on the chain: neither field
+/// even exists on the chain-facing `SortOptions` struct (`to_sort_options`
+/// drops both), so nothing downstream reads them. Restoring
+/// `--read-streams`'s real behavior is tracked as R7b. Passing them must be
+/// accept-but-inert -- not a hard error -- and the sort must still produce
+/// correct, coordinate-sorted output.
+#[test]
+fn cutover_inert_flags_do_not_error() {
+    let dir = TempDir::new().expect("create temp dir");
+    let input_bam = dir.path().join("in.bam");
+    let records = unsorted_records(200);
+    let input_count = records.len();
+    write_bam(&input_bam, &create_minimal_header("chr1", 1_000_000), &records);
+    let output_bam = dir.path().join("out.bam");
+
+    // Run as a subprocess (with `RUST_LOG=info` pinned so the ambient environment
+    // cannot filter the notices out) so the test can assert on stderr: the ignored
+    // flags are `warn`-level and each must announce that it is inert, otherwise a
+    // silently-dropped flag would leave the user thinking it took effect.
+    let current_bin = Path::new(env!("CARGO_BIN_EXE_fgumi"));
+    let output = Command::new(current_bin)
+        .env("RUST_LOG", "info")
+        .args([
+            OsStr::new("sort"),
+            OsStr::new("-i"),
+            input_bam.as_os_str(),
+            OsStr::new("-o"),
+            output_bam.as_os_str(),
+            OsStr::new("--order"),
+            OsStr::new("coordinate"),
+            OsStr::new("--sort-stats"),
+            OsStr::new("--read-streams"),
+            OsStr::new("4"),
+        ])
+        .output()
+        .expect("failed to spawn fgumi sort (inert flags)");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "--sort-stats/--read-streams are accept-but-inert on the chain and must not error:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--read-streams=4 is ignored by the sort chain"),
+        "the ignored `--read-streams` notice must be visible on stderr; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--sort-stats is ignored by the sort chain"),
+        "the ignored `--sort-stats` notice must be visible on stderr; stderr:\n{stderr}"
+    );
+
+    let (_, out_records) = read_bam_output(&output_bam);
+    assert_eq!(out_records.len(), input_count, "output record count must match input");
+    let keys: Vec<(usize, usize)> = out_records
+        .iter()
+        .map(|r| {
+            (
+                r.reference_sequence_id().unwrap_or(usize::MAX),
+                r.alignment_start().map_or(0, usize::from),
+            )
+        })
+        .collect();
+    assert!(
+        keys.windows(2).all(|w| w[0] <= w[1]),
+        "output is not coordinate-sorted with --sort-stats/--read-streams set: {keys:?}"
+    );
+}
+
+/// The owned engine always verified BGZF CRC32, including on stdin input
+/// (`decompress_block` has no CRC opt-out at all). Standalone `fgumi sort`'s
+/// input decode must reject a corrupted block on stdin too, not silently sort
+/// past it.
+///
+/// Only the block's footer CRC32 is corrupted (one bit flipped, mirroring
+/// `decompress_opts_skips_crc_on_stored_block` in `fgumi-bgzf`): the
+/// compressed payload is left untouched and decodes normally to the same
+/// bytes, so this corruption is detectable *only* by comparing the
+/// decompressed output's CRC32 against the (now-wrong) footer value. A
+/// structural decode failure could never catch it, so a pass here proves a
+/// live CRC check ran -- not just that some unrelated error-detection caught
+/// the file.
+///
+/// 20,000 records (rather than a handful) is deliberate: it forces the
+/// uncompressed SAM header + record stream well past a single 64 KiB BGZF
+/// block, so the *last* real block is a pure record (body) block, never the
+/// one `fgumi_bam_io::read_header_and_replay` decompresses in full while
+/// parsing the header via noodles. Corrupting the last block therefore
+/// exercises stdin sort's own record-decode path (the arena ingest
+/// `InflateToArena` uses for the sole-`[Stage::Sort]` chain), not just the
+/// separate header-parse tee.
+///
+/// **Not a RED/GREEN gate for the `verify_crc: true` change in
+/// `execute_sort`.** This test passes identically with or without that flag:
+/// standalone sort's `[Stage::Sort]`-only chain always takes the arena-ingest
+/// path (`InflateToArena` -> `fgumi_bgzf::decompress_into_slice`), which has
+/// no CRC opt-out and checks unconditionally regardless of `ChainSpec.verify_crc`
+/// -- the flag is only read by `build_bam_decode_preamble`'s `BgzfDecompress`,
+/// a path standalone sort never takes. It exists as a regression guard on its
+/// own terms (stdin corruption must be rejected end-to-end, through whichever
+/// layer catches it), and as a tripwire: if a future chain-topology change
+/// ever routes standalone sort through `BgzfDecompress` instead, making
+/// `verify_crc` load-bearing, a stale `effective_check_crc()`-style stdin skip
+/// would fail this test rather than silently reintroducing the regression.
+#[test]
+fn cutover_stdin_input_detects_corrupt_crc() {
+    let dir = TempDir::new().expect("create temp dir");
+    let input_bam = dir.path().join("in.bam");
+    write_bam(&input_bam, &create_minimal_header("chr1", 2_100_000), &unsorted_records(20_000));
+
+    let raw = fs::read(&input_bam).expect("read seed BAM");
+    let mut reader = std::io::Cursor::new(raw.as_slice());
+    let mut blocks = fgumi_bgzf::read_raw_blocks(&mut reader, 4_096).expect("parse BGZF blocks");
+    let target_idx = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| !b.is_eof() && !b.is_empty())
+        .map(|(i, _)| i)
+        .next_back()
+        .expect("expected at least one real (non-EOF) BGZF block to corrupt");
+    assert!(
+        target_idx > 0,
+        "expected 20,000 records to span more than one real BGZF block (got only 1) -- \
+         corrupting it would land in the header-parse block instead of a pure body block"
+    );
+    let target = &mut blocks[target_idx];
+    let crc_off = target.data.len() - fgumi_bgzf::BGZF_FOOTER_SIZE;
+    target.data[crc_off] ^= 0x01;
+
+    let mut corrupted = Vec::with_capacity(raw.len());
+    for block in &blocks {
+        corrupted.extend_from_slice(&block.data);
+    }
+    // `read_raw_blocks` silently drops BGZF EOF-marker blocks it reads (see
+    // its own doc comment), so re-append the standard marker for a
+    // well-formed, correctly-terminated stream.
+    corrupted.extend_from_slice(&fgumi_bgzf::BGZF_EOF);
+    let corrupted_bam = dir.path().join("corrupted.bam");
+    fs::write(&corrupted_bam, &corrupted).expect("write corrupted BAM");
+
+    let output_bam = dir.path().join("out.bam");
+    let current_bin = Path::new(env!("CARGO_BIN_EXE_fgumi"));
+    let output = Command::new(current_bin)
+        .args([
+            OsStr::new("sort"),
+            OsStr::new("-i"),
+            OsStr::new("-"),
+            OsStr::new("-o"),
+            output_bam.as_os_str(),
+            OsStr::new("--order"),
+            OsStr::new("coordinate"),
+        ])
+        .stdin(std::process::Stdio::from(
+            fs::File::open(&corrupted_bam).expect("open corrupted BAM to pipe"),
+        ))
+        .output()
+        .expect("failed to spawn fgumi sort on corrupted stdin input");
+
+    assert!(
+        !output.status.success(),
+        "fgumi sort must reject a corrupted-CRC BGZF block on stdin, not silently sort past it"
+    );
+    // Wording varies by which layer catches it (fgumi-bgzf's own "CRC32
+    // mismatch" vs. noodles' "checksum mismatch" in the header-parse tee), so
+    // accept either rather than pinning one literal message.
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(
+        stderr.contains("crc") || stderr.contains("checksum"),
+        "expected the failure to name CRC/checksum verification as the cause; stderr:\n{stderr}"
+    );
+    // Unlike the upfront `--write-index`/`--threads 0` guards, this failure
+    // surfaces mid-stream (well after the output file was opened for
+    // writing), so a truncated partial output file is expected here -- not
+    // asserted against.
 }
