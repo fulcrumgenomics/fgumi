@@ -703,8 +703,13 @@ impl<'a> ChainBuilder<'a> {
         // instead of `DecodeRecords → DecodedRecordBatch`, so `add_sort`'s
         // parallel-inflate arena front (`ReadBlocks → InflateToArena →
         // FindBoundariesAndSort`) can consume it directly without an extra
-        // round-trip. SAM sort-first is rejected outright (see the `Sam` arm
-        // below); `SortBuffer` is only reached by the non-arena path in
+        // round-trip. SAM sort-first is supported too (see the `Sam` arm
+        // below): it decodes through the same `ParseSamChunk` preamble as
+        // every other SAM ingest, and `add_sort` bridges the resulting
+        // `DecodedRecordBatch` to the sort ingest's `RecordBatch` shape via
+        // `DecodedRecordBatchToRecordBatch`; only the BAM path gets the
+        // arena-backed front described above. `SortBuffer` is only reached by
+        // the non-arena path in
         // `add_sort`, where sort is *not* first (a fused earlier stage feeds it
         // `DecodedRecordBatch` / `BamTemplateBatch`). This covers both the
         // sole-`[Sort]` chain (standalone `fgumi sort`) and

@@ -13,11 +13,13 @@
 //!
 //! ## Task 7 additions: the arena-chain correctness gate
 //!
-//! `fgumi sort --write-index` does **not** route through this chain builder
-//! today — only `SinkSpec::BamWithIndex`, built chain-direct as above, reaches
-//! the inline indexer (see `task-7-report.md` for the full investigation).
-//! The three tests below are therefore the correctness gate for the arena
-//! sink's inline `.bai`, run the same chain-direct way as
+//! `fgumi sort --write-index` now routes through this same chain builder (via
+//! `SinkSpec::BamWithIndex`, constructed in `Sort::execute`) — see
+//! `task-7-report.md` for the investigation that predates the cutover. This
+//! test still builds the `ChainSpec` directly rather than going through the
+//! CLI, so it stays a chain-level gate independent of `Sort::execute`'s own
+//! argument handling. The three tests below are therefore the correctness
+//! gate for the arena sink's inline `.bai`, run the same chain-direct way as
 //! `bam_with_index_produces_inline_sidecar_not_reread` above, but with the
 //! full samtools-equivalence and byte-identity assertions Task 7 specifies:
 //!
