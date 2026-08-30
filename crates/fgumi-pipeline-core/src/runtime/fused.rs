@@ -93,9 +93,43 @@ pub fn is_fusible_chain(steps: &[Box<dyn ErasedStep>], graph: &ChainGraph) -> bo
 /// and the `snapshot_with_edges` bottleneck verdict). An instrumented run
 /// (`InstrumentationLevel != Off`) must therefore NOT fuse, or its
 /// `--pipeline-stats` / `--pipeline-trace` output would silently omit all edge /
-/// occupancy data. When instrumentation is `Off` (the default), fusion is taken
-/// whenever the chain is single-thread and fusible (zero-overhead fast path
-/// preserved).
+/// occupancy data.
+///
+/// **Capability vs. policy.** [`is_fusible_chain`] answers whether the fused
+/// driver *can* drive a chain inline; this function decides whether it *should*.
+/// A chain that declares a [`StepKind::Detached`](crate::step::StepKind::Detached)
+/// step is fusible (the fused driver runs it inline correctly — pinned by
+/// `run_fused_drives_a_detached_step_inline`), but detachment exists to run that
+/// step on its own OS thread so its serial coordination / I/O overlaps the pool's
+/// (de)compression (the sort chain's "N+2" model). Fusing collapses that overlap
+/// onto the single driver thread — measured as a ~8-11% single-thread wall
+/// regression on `fgumi sort` (`mean_load` 96% fused vs ~111% scheduled). So a
+/// chain with any Detached step declines fusion and takes the scheduled path even
+/// single-threaded. That is not new territory: an instrumented single-thread run
+/// already takes exactly that path (1 pool worker + the detached driver threads),
+/// because `!instrumentation.is_on()` already declines fusion — this makes the
+/// default single-thread run match the instrumented one.
+///
+/// When instrumentation is `Off` (the default) and no Detached step is present,
+/// fusion is taken whenever the chain is single-thread and fusible (zero-overhead
+/// fast path preserved).
+///
+/// This keys off [`StepKind::Detached`](crate::step::StepKind::Detached) alone,
+/// so it applies to **any** chain that declares a Detached step, not only the
+/// sort chain: declaring a step Detached *is* the author's request for off-pool
+/// execution, so declining to fuse it away is the correct default. A future
+/// single-thread chain that declared Detached purely for isolation rather than
+/// overlap would pay the scheduled-path thread-spawn cost under this policy; that
+/// is an accepted trade — a per-chain fusion opt-in would be unwarranted
+/// complexity while every Detached chain in the tree wants the scheduled
+/// semantics.
+///
+/// Caveat: a (hypothetical) chain declaring a Detached step *and* two or more
+/// [`Exclusive`](crate::step::StepKind::Exclusive) steps would now reach
+/// `assign_exclusive_owners` at `--threads 1` and fail with
+/// `NotEnoughThreads` where fusion previously ran it. No production chain does
+/// this (the sort chain has zero Exclusive steps), and the scheduled semantics
+/// are the correct ones for such a chain regardless.
 #[must_use]
 pub fn should_fuse_single_thread(
     n_threads: usize,
@@ -103,7 +137,19 @@ pub fn should_fuse_single_thread(
     steps: &[Box<dyn ErasedStep>],
     graph: &ChainGraph,
 ) -> bool {
-    n_threads == 1 && !instrumentation.is_on() && is_fusible_chain(steps, graph)
+    n_threads == 1
+        && !instrumentation.is_on()
+        && !has_detached_step(steps)
+        && is_fusible_chain(steps, graph)
+}
+
+/// Whether any step in the chain declares
+/// [`StepKind::Detached`](crate::step::StepKind::Detached). Such a step was built
+/// to run on a dedicated off-pool thread; see
+/// [`should_fuse_single_thread`] for why its presence declines fusion.
+#[must_use]
+fn has_detached_step(steps: &[Box<dyn ErasedStep>]) -> bool {
+    steps.iter().any(|s| s.kind() == crate::step::StepKind::Detached)
 }
 
 /// Drive a fusible chain to completion on the calling thread, fused.
@@ -491,6 +537,58 @@ mod tests {
         (steps, graph)
     }
 
+    /// Mid step declaring `StepKind::Detached` — the shape a chain author uses
+    /// to ask for a dedicated off-pool OS thread (the sort chain's "N+2"
+    /// coordination/I/O steps do this). Behaviourally an identity relay; only
+    /// its `kind` distinguishes it from `AddHundred`.
+    #[derive(Clone)]
+    struct DetachedRelay;
+    impl Step for DetachedRelay {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "DetachedRelay",
+                kind: StepKind::Detached,
+                sticky: false,
+                output_queues: vec![QueueSpec::Unbounded],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(v) => {
+                    let _ = ctx.outputs.push(v);
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    /// Build a linear `source → detached relay → sink` chain — structurally
+    /// fusible, but declaring a Detached step, so the *policy* declines to fuse
+    /// it (the overlap that detachment buys must not be collapsed onto one
+    /// thread).
+    fn detached_chain(
+        count: u32,
+        out: &Arc<Mutex<Vec<u32>>>,
+    ) -> (Vec<Box<dyn ErasedStep>>, ChainGraph) {
+        let mut graph = ChainGraph::new();
+        let s = graph.register_step("CountSource", 1);
+        let m = graph.register_step("DetachedRelay", 1);
+        let k = graph.register_step("CollectSink", 0);
+        graph.wire(s, BranchIdx(0), m);
+        graph.wire(m, BranchIdx(0), k);
+        let steps: Vec<Box<dyn ErasedStep>> = vec![
+            Box::new(TypedStep::new(CountSource { next: 0, count })),
+            Box::new(TypedStep::new(DetachedRelay)),
+            Box::new(TypedStep::new(CollectSink { out: Arc::clone(out) })),
+        ];
+        (steps, graph)
+    }
+
     #[test]
     fn is_fusible_detects_source_mid_sink() {
         let out = Arc::new(Mutex::new(Vec::new()));
@@ -625,6 +723,43 @@ mod tests {
         let (steps, graph) = linear_chain(4, &out);
         assert!(is_fusible_chain(&steps, &graph), "linear chain is fusible");
         assert_eq!(should_fuse_single_thread(n_threads, level, &steps, &graph), expected);
+    }
+
+    // A chain that declares a `Detached` step is *structurally* fusible, but the
+    // policy declines to fuse it: fusing collapses the dedicated off-pool thread
+    // the author asked for onto the single driver thread, discarding the
+    // read/(de)compress/write overlap detachment exists to provide (measured
+    // ~8-11% single-thread wall regression on `fgumi sort`). This is the only
+    // test that can distinguish the two paths — an end-to-end run cannot, because
+    // both the fused and scheduled paths produce identical correct output.
+    #[test]
+    fn should_not_fuse_a_chain_containing_a_detached_step() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let (steps, graph) = detached_chain(4, &out);
+        // Still structurally fusible — the capability claim stays true (and is
+        // pinned by `run_fused_drives_a_detached_step_inline`).
+        assert!(is_fusible_chain(&steps, &graph), "a detached chain is still structurally fusible");
+        // ...but the policy declines, even single-thread and uninstrumented.
+        assert!(
+            !should_fuse_single_thread(1, InstrumentationLevel::Off, &steps, &graph),
+            "a chain with a Detached step must not fuse (overlap must be preserved)"
+        );
+    }
+
+    // Capability pin: `is_fusible_chain` staying `true` for a detached chain is
+    // only honest if the fused driver can in fact drive a Detached step inline to
+    // a correct result. This exercises that directly (bypassing the policy), so
+    // the "still structurally fusible" claim above is tested, not merely asserted
+    // in a doc comment. Mirrors the correctness that the former
+    // `detached_collapses_inline_at_t1` end-to-end test used to prove.
+    #[test]
+    fn run_fused_drives_a_detached_step_inline() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let (steps, graph) = detached_chain(5, &out);
+        let signal = PipelineSignal::new();
+        run_fused_single_thread(steps, &graph, &signal, None, None, 0).expect("clean run");
+        // DetachedRelay is an identity relay, so the sink sees the source's 0..5.
+        assert_eq!(*out.lock().unwrap(), vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
