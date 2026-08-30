@@ -58,6 +58,7 @@ pub mod common;
 #[cfg(feature = "compare")]
 pub mod compare;
 pub mod consensus_runner;
+pub mod copy_umi;
 pub mod correct;
 pub mod dedup;
 pub mod downsample;

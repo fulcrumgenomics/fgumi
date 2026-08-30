@@ -19,6 +19,7 @@ use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::compare::Compare;
 #[cfg(feature = "compare")]
 use fgumi_lib::commands::compare::CompareMismatch;
+use fgumi_lib::commands::copy_umi::CopyUmi;
 use fgumi_lib::commands::correct::CorrectUmis;
 use fgumi_lib::commands::dedup::MarkDuplicates;
 use fgumi_lib::commands::downsample::Downsample;
@@ -146,12 +147,14 @@ enum Subcommand {
     #[command(display_order = 17)]
     Downsample(Downsample),
     #[command(display_order = 18)]
+    CopyUmi(CopyUmi),
+    #[command(display_order = 19)]
     Retag(Retag),
     #[cfg(feature = "compare")]
-    #[command(display_order = 19)]
+    #[command(display_order = 20)]
     Compare(Compare),
     #[cfg(feature = "simulate")]
-    #[command(display_order = 20)]
+    #[command(display_order = 21)]
     Simulate(Simulate),
 }
 
@@ -180,6 +183,7 @@ impl Subcommand {
             Self::SimplexMetrics(cmd) => cmd.execute(command_line),
             Self::Review(cmd) => cmd.execute(command_line),
             Self::Downsample(cmd) => cmd.execute(command_line),
+            Self::CopyUmi(cmd) => cmd.execute(command_line),
             Self::Retag(cmd) => cmd.execute(command_line),
             #[cfg(feature = "compare")]
             Self::Compare(cmd) => cmd.execute(command_line),

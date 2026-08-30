@@ -14,3 +14,4 @@ pub use fgumi_umi::assigner::{
 };
 
 pub mod parallel_assigner;
+pub mod read_name;
