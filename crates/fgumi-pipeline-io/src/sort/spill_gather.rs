@@ -60,6 +60,7 @@ use std::io;
 
 use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;
 use fgumi_sort::{RunBound, frame_keyed_record_into};
+use log::info;
 
 use crate::sort::protocol::{MemoryChunkErased, SortChunkEvent, SpillBlockEvent};
 use fgumi_pipeline_core::{
@@ -197,6 +198,12 @@ pub struct SpillGather {
     /// `AllAnnounced.slot_count`, since that is how many `SpillReady`s the merge
     /// will receive and gate on.
     runs_written: u32,
+    /// Number of non-empty spill chunks seen. With `runs_written`, gives the
+    /// owned-style run-formation report (`extended = chunks_spilled - runs`).
+    chunks_spilled: u32,
+    /// Whether the run-formation summary has been logged (guards the single-shot
+    /// log at the drained `Finished` transition).
+    summary_logged: bool,
     /// Raw-block size threshold (records are cut into blocks of ≤ this many bytes).
     block_size: usize,
     output_byte_limit: u64,
@@ -215,6 +222,8 @@ impl SpillGather {
             open_run: None,
             held_last_block: None,
             runs_written: 0,
+            chunks_spilled: 0,
+            summary_logged: false,
             block_size: BGZF_MAX_BLOCK_SIZE,
             output_byte_limit,
         }
@@ -225,6 +234,21 @@ impl SpillGather {
         let o = self.next_ordinal;
         self.next_ordinal += 1;
         o
+    }
+
+    /// The owned-engine-style run-formation summary line, or `None` when nothing
+    /// spilled. Mirrors `fgumi_sort::external`'s `log_run_formation` so both sort
+    /// engines report run formation identically: every spilled chunk either
+    /// starts a run or extends one, so `extended = chunks_spilled - runs_written`.
+    fn run_formation_summary(&self) -> Option<String> {
+        if self.chunks_spilled == 0 {
+            return None;
+        }
+        let extended = self.chunks_spilled.saturating_sub(self.runs_written);
+        Some(format!(
+            "Spill runs: {} from {} chunks ({extended} extended an existing run)",
+            self.runs_written, self.chunks_spilled
+        ))
     }
 
     /// Flush the withheld run-final block (if any) into `pending`, marking it
@@ -258,6 +282,7 @@ impl SpillGather {
                 if chunk.is_empty() {
                     return;
                 }
+                self.chunks_spilled += 1;
                 let chunk_min = chunk.min_bound().expect("a non-empty chunk has a min bound");
                 let chunk_max = chunk.max_bound().expect("a non-empty chunk has a max bound");
                 // Extends the open run iff every record already in the run precedes
@@ -443,6 +468,15 @@ impl Step for SpillGather {
                     "SpillGather drained with an unclosed run (a withheld spill block was \
                      never flushed by AllAnnounced)",
                 ));
+            }
+            // Report run formation once, matching the owned engine's line so
+            // benchmark log parsing and cross-engine comparison see the same
+            // "Spill runs: R from C chunks (E extended…)" wording.
+            if !self.summary_logged {
+                self.summary_logged = true;
+                if let Some(line) = self.run_formation_summary() {
+                    info!("{line}");
+                }
             }
             return Ok(StepOutcome::Finished);
         }
