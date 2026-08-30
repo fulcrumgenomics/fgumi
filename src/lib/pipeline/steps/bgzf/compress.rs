@@ -26,7 +26,9 @@ use crate::pipeline::core::outputs::OrderedBytesSingle;
 use crate::pipeline::core::queues::QueueSpec;
 use crate::pipeline::core::reorder::BranchOrdering;
 use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
-use crate::pipeline::steps::types::{BgzfBlock, DecompressedBlock};
+use crate::pipeline::steps::types::{
+    BamIndexManifest, BgzfBlock, DecompressedBlock, RecordIndexEntry,
+};
 
 /// Per-worker BGZF compressed-output scratch capacity. The compressed
 /// output of `BgzfCompress` is the concatenation of physical 64 KiB BGZF
@@ -46,17 +48,23 @@ pub struct BgzfCompress {
     output_scratch: Vec<u8>,
     held: HeldSlot<Unpushed<BgzfBlock>>,
     output_byte_limit: u64,
+    /// When set, `try_run` walks the input batch's framed BAM records to
+    /// build a `BamIndexManifest` and emits it on the output `BgzfBlock`.
+    /// When unset, the frame walk and per-physical-block length capture are
+    /// skipped entirely (zero overhead on the non-indexed path).
+    index_bam: bool,
 }
 
 impl BgzfCompress {
     #[must_use]
-    pub fn new(compression_level: u32, output_byte_limit: u64) -> Self {
+    pub fn new(compression_level: u32, output_byte_limit: u64, index_bam: bool) -> Self {
         Self {
             compressor: InlineBgzfCompressor::new(compression_level),
             compression_level,
             output_scratch: Vec::with_capacity(COMPRESS_SCRATCH_CAPACITY),
             held: HeldSlot::new(),
             output_byte_limit,
+            index_bam,
         }
     }
 }
@@ -69,8 +77,34 @@ impl Clone for BgzfCompress {
             output_scratch: Vec::with_capacity(COMPRESS_SCRATCH_CAPACITY),
             held: HeldSlot::new(),
             output_byte_limit: self.output_byte_limit,
+            index_bam: self.index_bam,
         }
     }
+}
+
+/// Walk a batch of `[u32 le len][body]*` frames into per-record index
+/// entries. `uoffset` is the frame start (offset of the length prefix,
+/// measured from the start of the batch's uncompressed bytes); `len` is `4 +`
+/// the body length.
+///
+/// Pure and unit-testable without a full pipeline: this is the shape a
+/// `SerializeBamRecords` batch always takes, so no `StepCtx` is needed to
+/// exercise it.
+fn build_record_entries(batch: &[u8]) -> Vec<RecordIndexEntry> {
+    let mut out = Vec::new();
+    let mut u = 0usize;
+    while u + 4 <= batch.len() {
+        let block_size = u32::from_le_bytes(batch[u..u + 4].try_into().expect("4 bytes")) as usize;
+        let body = &batch[u + 4..u + 4 + block_size];
+        out.push(RecordIndexEntry {
+            uoffset: u32::try_from(u).expect("batch offset fits u32"),
+            len: u32::try_from(4 + block_size).expect("record len fits u32"),
+            ctx: fgumi_bam_io::extract_alignment_context(body),
+        });
+        u += 4 + block_size;
+    }
+    debug_assert_eq!(u, batch.len(), "frames must exactly cover the batch");
+    out
 }
 
 impl BgzfCompress {
@@ -116,6 +150,35 @@ impl BgzfCompress {
             }
         }
     }
+
+    /// Like [`Self::assemble_output_bytes`], but also returns each physical
+    /// block's compressed length (`data.len()`, before it moves or is
+    /// concatenated away), in emission order — exactly the `phys_comp_len`
+    /// a `BamIndexManifest` needs. Only called on the `index_bam` path; the
+    /// non-indexed path uses `assemble_output_bytes` and never allocates a
+    /// `lens` vec.
+    fn assemble_output_bytes_with_lens(&mut self) -> (Vec<u8>, Vec<u32>) {
+        let mut children = self.compressor.take_blocks();
+        let lens: Vec<u32> = children
+            .iter()
+            .map(|c| u32::try_from(c.data.len()).expect("block len fits u32"))
+            .collect();
+        let bytes = match children.len() {
+            0 => Vec::new(),
+            1 => children.pop().expect("len == 1").data,
+            _ => {
+                for child in children {
+                    self.output_scratch.extend_from_slice(&child.data);
+                    self.compressor.recycle_buffer(child.data);
+                }
+                std::mem::replace(
+                    &mut self.output_scratch,
+                    Vec::with_capacity(COMPRESS_SCRATCH_CAPACITY),
+                )
+            }
+        };
+        (bytes, lens)
+    }
 }
 
 impl Step for BgzfCompress {
@@ -154,15 +217,37 @@ impl Step for BgzfCompress {
             }
             return Ok(StepOutcome::NoProgress);
         };
-        let DecompressedBlock { batch_serial, bytes } = parent;
-        let uncompressed_size = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        let DecompressedBlock { batch_serial, bytes: input_bytes } = parent;
+        let uncompressed_size = u32::try_from(input_bytes.len()).unwrap_or(u32::MAX);
 
         // Compress and harvest physical BGZF blocks.
-        self.compressor.write_all(&bytes)?;
+        self.compressor.write_all(&input_bytes)?;
         self.compressor.flush()?;
-        let bytes = self.assemble_output_bytes();
 
-        let out = BgzfBlock { batch_serial, bytes, uncompressed_size, index: None };
+        // Build the index manifest from the ORIGINAL uncompressed input
+        // bytes (the framed BAM records), before they are consumed below —
+        // never from the compressed output.
+        let (bytes, index) = if self.index_bam {
+            let records = build_record_entries(&input_bytes);
+            let (bytes, phys_comp_len) = self.assemble_output_bytes_with_lens();
+            debug_assert_eq!(
+                phys_comp_len.iter().map(|&n| u64::from(n)).sum::<u64>(),
+                bytes.len() as u64,
+                "physical block lengths must sum to the total compressed byte count"
+            );
+            debug_assert_eq!(
+                phys_comp_len.len(),
+                (uncompressed_size as usize).div_ceil(fgumi_bgzf::BGZF_MAX_BLOCK_SIZE),
+                "one physical block per BGZF_MAX_BLOCK_SIZE-sized chunk of uncompressed input"
+            );
+            let index =
+                (!bytes.is_empty()).then(|| Box::new(BamIndexManifest { phys_comp_len, records }));
+            (bytes, index)
+        } else {
+            (self.assemble_output_bytes(), None)
+        };
+
+        let out = BgzfBlock { batch_serial, bytes, uncompressed_size, index };
         match ctx.outputs.push(out) {
             Ok(()) => Ok(StepOutcome::Progress),
             Err(unpushed) => {
@@ -183,7 +268,7 @@ mod tests {
 
     #[test]
     fn profile_advertises_parallel_byordinal() {
-        let s = BgzfCompress::new(1, 1024);
+        let s = BgzfCompress::new(1, 1024, false);
         let p = s.profile();
         assert_eq!(p.name, "BgzfCompress");
         assert_eq!(p.kind, StepKind::Parallel);
@@ -192,13 +277,13 @@ mod tests {
 
     #[test]
     fn clone_constructs_fresh_compressor() {
-        let s = BgzfCompress::new(1, 1024);
+        let s = BgzfCompress::new(1, 1024, false);
         let _cloned = s.clone();
     }
 
     #[test]
     fn small_input_produces_single_concatenated_output() {
-        let mut s = BgzfCompress::new(1, 1024);
+        let mut s = BgzfCompress::new(1, 1024, false);
         s.compressor.write_all(b"hello bgzf").unwrap();
         s.compressor.flush().unwrap();
         let blocks = s.compressor.take_blocks();
@@ -224,7 +309,7 @@ mod tests {
 
     /// Drive `assemble_output_bytes` on a fresh step over `input`.
     fn assemble(level: u32, input: &[u8]) -> Vec<u8> {
-        let mut s = BgzfCompress::new(level, 1024);
+        let mut s = BgzfCompress::new(level, 1024, false);
         s.compressor.write_all(input).unwrap();
         s.compressor.flush().unwrap();
         s.assemble_output_bytes()
@@ -234,7 +319,7 @@ mod tests {
     fn single_block_fast_path_is_byte_identical() {
         // Small input → one physical block → move fast path.
         let input = b"the quick brown fox jumps over the lazy dog";
-        let mut s = BgzfCompress::new(1, 1024);
+        let mut s = BgzfCompress::new(1, 1024, false);
         s.compressor.write_all(input).unwrap();
         s.compressor.flush().unwrap();
         assert_eq!(s.compressor.take_blocks().len(), 1, "input should fit one block");
@@ -252,7 +337,7 @@ mod tests {
         for i in 0..(200 * 1024u32) {
             input.push((i % 251) as u8);
         }
-        let mut s = BgzfCompress::new(1, 1024);
+        let mut s = BgzfCompress::new(1, 1024, false);
         s.compressor.write_all(&input).unwrap();
         s.compressor.flush().unwrap();
         assert!(s.compressor.take_blocks().len() > 1, "input should span >1 block");
@@ -266,7 +351,7 @@ mod tests {
         // After the multi-block path recycles buffers, a subsequent compression
         // reuses them, and output remains byte-identical to a fresh compressor.
         let big: Vec<u8> = (0..(200 * 1024u32)).map(|i| (i % 251) as u8).collect();
-        let mut s = BgzfCompress::new(1, 1024);
+        let mut s = BgzfCompress::new(1, 1024, false);
 
         s.compressor.write_all(&big).unwrap();
         s.compressor.flush().unwrap();
@@ -286,7 +371,7 @@ mod tests {
         // assembled output must be a truly empty `Vec`, not the per-worker
         // scratch — otherwise an "empty" output carries a retained
         // `COMPRESS_SCRATCH_CAPACITY` allocation and inflates queue memory.
-        let mut s = BgzfCompress::new(1, 1024);
+        let mut s = BgzfCompress::new(1, 1024, false);
 
         // Fresh compressor, nothing written → no blocks.
         let fresh = s.assemble_output_bytes();
@@ -310,4 +395,109 @@ mod tests {
             "empty batch after a multi-block batch must not retain scratch"
         );
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Frame-walk + manifest emission (`index_bam`).
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Encode a CIGAR op (`(length, op_char)`) as the BAM-packed `u32` word
+    /// [`fgumi_raw_bam::SamBuilder::cigar_ops`] expects: `(length << 4) |
+    /// op_code`, per the SAM spec's op-code table (`MIDNSHP=X` -> `0..=8`).
+    fn cigar_op_word(length: u32, op: char) -> u32 {
+        let op_code = match op {
+            'M' => 0,
+            'I' => 1,
+            'D' => 2,
+            'N' => 3,
+            'S' => 4,
+            'H' => 5,
+            'P' => 6,
+            '=' => 7,
+            'X' => 8,
+            _ => panic!("unsupported CIGAR op: {op}"),
+        };
+        (length << 4) | op_code
+    }
+
+    /// Build a record **body** (no 4-byte length prefix) via `SamBuilder`,
+    /// mirroring `fgumi_bam_io::writer`'s Task-1 test helper of the same
+    /// name — duplicated locally since that helper is private to its own
+    /// `#[cfg(test)]` module in a different crate.
+    fn build_record_body(ref_id: i32, pos: i32, flags: u16, cigar: &[(u32, char)]) -> Vec<u8> {
+        let ops: Vec<u32> = cigar.iter().map(|&(len, op)| cigar_op_word(len, op)).collect();
+        fgumi_raw_bam::SamBuilder::new()
+            .ref_id(ref_id)
+            .pos(pos)
+            .flags(flags)
+            .cigar_ops(&ops)
+            .build()
+            .to_vec()
+    }
+
+    #[test]
+    fn build_record_entries_matches_frames() {
+        // Concatenate framed BAM records: [u32 le len][body].
+        let bodies: Vec<Vec<u8>> = vec![
+            build_record_body(0, 0, 0, &[(5, 'M')]),
+            build_record_body(0, 100, 0, &[(5, 'M')]),
+        ];
+        let mut batch = Vec::new();
+        let mut expected_uoffsets = Vec::new();
+        for body in &bodies {
+            expected_uoffsets.push(u32::try_from(batch.len()).unwrap());
+            batch.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
+            batch.extend_from_slice(body);
+        }
+        let entries = build_record_entries(&batch);
+        assert_eq!(entries.len(), 2);
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(e.uoffset, expected_uoffsets[i]);
+            assert_eq!(e.len as usize, 4 + bodies[i].len());
+            assert!(e.ctx.is_some());
+        }
+    }
+
+    #[test]
+    fn assemble_with_lens_sums_to_bytes_and_ceildiv_blocks() {
+        use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;
+        // Small input → one physical block.
+        let mut s = BgzfCompress::new(1, 1 << 20, true);
+        let small = b"the quick brown fox";
+        s.compressor.write_all(small).unwrap();
+        s.compressor.flush().unwrap();
+        let (bytes, lens) = s.assemble_output_bytes_with_lens();
+        assert_eq!(
+            lens.iter().map(|&n| u64::from(n)).sum::<u64>(),
+            u64::try_from(bytes.len()).unwrap()
+        );
+        assert_eq!(lens.len(), small.len().div_ceil(BGZF_MAX_BLOCK_SIZE)); // == 1
+
+        // Input > one block → phys count == ceil(len / 65280).
+        let big: Vec<u8> = (0..(200 * 1024u32)).map(|i| (i % 251) as u8).collect();
+        let mut s = BgzfCompress::new(1, 1 << 20, true);
+        s.compressor.write_all(&big).unwrap();
+        s.compressor.flush().unwrap();
+        let (bytes, lens) = s.assemble_output_bytes_with_lens();
+        assert_eq!(
+            lens.iter().map(|&n| u64::from(n)).sum::<u64>(),
+            u64::try_from(bytes.len()).unwrap()
+        );
+        assert_eq!(lens.len(), big.len().div_ceil(BGZF_MAX_BLOCK_SIZE)); // > 1
+    }
+
+    // `try_run`'s `index_bam=false`/`true` emit contract (whether the
+    // resulting `BgzfBlock.index` is `None`/`Some` for a real, driven
+    // `try_run` call) is pinned by
+    // `compress_step_emits_no_manifest_when_index_bam_false` and
+    // `compress_step_emits_manifest_matching_frames_when_index_bam_true` in
+    // `steps/chain_tests.rs`. This module's own tests only drive
+    // `assemble_output_bytes`/`assemble_output_bytes_with_lens`/
+    // `build_record_entries` directly (see the `assemble` helper above) —
+    // it has no `StepCtx`/pipeline harness, and building one here would
+    // duplicate the `ReplaySource`/`CollectSink` test-step machinery
+    // `chain_tests.rs` already has for exactly this purpose. An earlier
+    // version of this test hand-built a `BgzfBlock { index: None }` and
+    // asserted `None` on a value it wrote itself, which pinned nothing
+    // about `try_run`'s actual behavior — replaced by the two chain-level
+    // tests above.
 }

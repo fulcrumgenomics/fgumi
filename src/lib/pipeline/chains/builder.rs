@@ -1145,7 +1145,11 @@ impl<'a> ChainBuilder<'a> {
 
         let rejects_branch = (consensus_pt.0, BranchIdx(1));
         let rejects_compress_tail = self.pipeline.append_step(
-            BgzfCompress::new(self.tuning.compression_level, self.tuning.per_step_byte_limit),
+            BgzfCompress::new(
+                self.tuning.compression_level,
+                self.tuning.per_step_byte_limit,
+                false,
+            ),
             rejects_branch,
         );
         self.pipeline.append_step(rejects_write, rejects_compress_tail);
@@ -1367,8 +1371,11 @@ impl<'a> ChainBuilder<'a> {
         let tail = self.current_tail.expect("add_sink called before add_source");
         let output_path = self.spec.sink.path();
 
-        let compress_step =
-            BgzfCompress::new(self.tuning.compression_level, self.tuning.per_step_byte_limit);
+        let compress_step = BgzfCompress::new(
+            self.tuning.compression_level,
+            self.tuning.per_step_byte_limit,
+            false,
+        );
         let tail = self.pipeline.append_step(compress_step, tail);
 
         // When Stage::Align is in the chain, the merged output header is
@@ -1428,8 +1435,11 @@ impl<'a> ChainBuilder<'a> {
         use crate::pipeline::steps::types::{BgzfBlock, DecompressedBlock};
 
         if path_is_gzip(path) {
-            let compress =
-                BgzfCompress::new(self.tuning.compression_level, self.tuning.per_step_byte_limit);
+            let compress = BgzfCompress::new(
+                self.tuning.compression_level,
+                self.tuning.per_step_byte_limit,
+                false,
+            );
             let compress_tail = self.pipeline.append_step(compress, tail);
             let writer = WriteRawFile::<BgzfBlock>::new(path, &fgumi_bgzf::BGZF_EOF)
                 .map_err(|e| anyhow!("WriteRawFile: {e}"))?;
@@ -1838,7 +1848,11 @@ impl<'a> ChainBuilder<'a> {
             // Branch 1 = pre-framed rejects bytes → BgzfCompress → WriteBgzfFile.
             let rejects_branch = (pt.0, BranchIdx(1));
             let rejects_compress_tail = self.pipeline.append_step(
-                BgzfCompress::new(self.tuning.compression_level, self.tuning.per_step_byte_limit),
+                BgzfCompress::new(
+                    self.tuning.compression_level,
+                    self.tuning.per_step_byte_limit,
+                    false,
+                ),
                 rejects_branch,
             );
             let _rejects_write_tail =
@@ -4101,8 +4115,11 @@ impl<'a> ChainBuilder<'a> {
                 .rejects
                 .as_ref()
                 .ok_or_else(|| anyhow!("rejects path missing (build_for dispatch bug)"))?;
-            let rejects_compress =
-                BgzfCompress::new(self.tuning.compression_level, self.tuning.per_step_byte_limit);
+            let rejects_compress = BgzfCompress::new(
+                self.tuning.compression_level,
+                self.tuning.per_step_byte_limit,
+                false,
+            );
             let rejects_writer =
                 WriteBgzfFile::new(rejects_path, &self.header, self.tuning.compression_level)
                     .map_err(|e| anyhow!("WriteBgzfFile (rejects)::new: {e}"))?;

@@ -128,7 +128,7 @@ fn build_full_chain(input: &std::path::Path, output: &std::path::Path) -> Pipeli
         .chain(DecodeRecords::new(GroupKeyConfig::default(), bytes_4mb))
         .chain(GroupBam::new(64, bytes_4mb))
         .chain(SerializeBamRecords::new(bytes_4mb))
-        .chain(BgzfCompress::new(1, bytes_4mb))
+        .chain(BgzfCompress::new(1, bytes_4mb, false))
         .chain(WriteBgzfFile::new(output, &header, 1).unwrap())
         .into_sink_marker();
     builder.build().unwrap()
@@ -297,7 +297,7 @@ fn full_chain_with_process_mutates_mq() {
         .chain(bump_mq)
         .chain(GroupBam::new(64, bytes_4mb))
         .chain(SerializeBamRecords::new(bytes_4mb))
-        .chain(BgzfCompress::new(1, bytes_4mb))
+        .chain(BgzfCompress::new(1, bytes_4mb, false))
         .chain(WriteBgzfFile::new(&output, &header, 1).unwrap())
         .into_sink_marker();
     let pipeline = builder.build().unwrap();

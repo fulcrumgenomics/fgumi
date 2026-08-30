@@ -54,7 +54,9 @@ use crate::pipeline::steps::boundaries::bam::FindBamBoundaries;
 use crate::pipeline::steps::group::position::BatchedProcessedPositionGroups;
 use crate::pipeline::steps::parse::bam::ParseBamRecords;
 use crate::pipeline::steps::parse::decode::{DecodeFromRecords, DecodeRecords};
-use crate::pipeline::steps::types::{BgzfBlock, DecodedRecordBatch, RecordBatch};
+use crate::pipeline::steps::types::{
+    BgzfBlock, DecodedRecordBatch, DecompressedBlock, RecordBatch,
+};
 use crate::template::Template;
 
 /// Per-edge byte budget. Deliberately small relative to the multi-record
@@ -438,7 +440,7 @@ fn compress_chain_output_decompresses_back_to_the_record_stream(#[values(1, 4)] 
         .chain(ReplaySource::new(blocks))
         .chain(BgzfDecompress::new(EDGE_LIMIT_BYTES))
         .chain(FindBamBoundaries::new(EDGE_LIMIT_BYTES))
-        .chain(BgzfCompress::new(1, EDGE_LIMIT_BYTES))
+        .chain(BgzfCompress::new(1, EDGE_LIMIT_BYTES, false))
         .chain(CollectSink { collected: sink_handle })
         .into_sink_marker();
     let pipeline = builder.build().expect("chain builds");
@@ -479,6 +481,109 @@ fn compress_chain_output_decompresses_back_to_the_record_stream(#[values(1, 4)] 
         expected.extend_from_slice(bytes);
     }
     assert_eq!(inflated, expected, "compress must preserve the record stream byte-for-byte");
+}
+
+/// Concatenate records into a `[u32 le len][body]*` framed batch — the shape
+/// `SerializeBamRecords` produces and `BgzfCompress`'s frame walk consumes.
+/// No header: this is a `DecompressedBlock.bytes` payload, injected straight
+/// into `BgzfCompress` without the header-stripping `FindBamBoundaries` step.
+fn framed_batch(records: &[RawRecord]) -> Vec<u8> {
+    let mut batch = Vec::new();
+    for record in records {
+        let bytes = record.as_ref();
+        let block_size = u32::try_from(bytes.len()).expect("record fits u32");
+        batch.extend_from_slice(&block_size.to_le_bytes());
+        batch.extend_from_slice(bytes);
+    }
+    batch
+}
+
+/// `ReplaySource<DecompressedBlock>` → `BgzfCompress` (`index_bam = false`) →
+/// `CollectSink<BgzfBlock>`, injecting `DecompressedBlock` directly (skipping
+/// decompress/boundary-finding, since it is exactly `BgzfCompress`'s input
+/// type). This drives a real `try_run` and asserts on what it actually
+/// emits — replacing a prior unit test that hand-built a `BgzfBlock { index:
+/// None }` and asserted `None` on a value it wrote itself, which pinned
+/// nothing about `try_run`'s actual behavior.
+#[rstest]
+fn compress_step_emits_no_manifest_when_index_bam_false(#[values(1, 4)] threads: usize) {
+    let records = test_records(4);
+    let batch = framed_batch(&records);
+    let collected: Arc<Mutex<Vec<BgzfBlock>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let sink_handle = Arc::clone(&collected);
+    let builder = Pipeline::builder();
+    builder
+        .chain(ReplaySource::new(vec![DecompressedBlock { batch_serial: 0, bytes: batch }]))
+        .chain(BgzfCompress::new(1, EDGE_LIMIT_BYTES, false))
+        .chain(CollectSink { collected: sink_handle })
+        .into_sink_marker();
+    let pipeline = builder.build().expect("chain builds");
+    pipeline.run(PipelineConfig { threads, ..Default::default() }).expect("chain runs");
+
+    let blocks = collected.lock().expect("mutex not poisoned");
+    assert_eq!(blocks.len(), 1, "one input DecompressedBlock maps to exactly one output");
+    assert!(blocks[0].index.is_none(), "index_bam=false must never emit a manifest");
+}
+
+/// Symmetric to [`compress_step_emits_no_manifest_when_index_bam_false`]: the
+/// same framed batch through a `true` step must emit a manifest whose
+/// `phys_comp_len` sums to the compressed byte count, has the expected
+/// ceil-div physical-block count, and whose `records` match the input frames
+/// — pinning the emit seam `BamIndexManifest` consumers (Task 5's join) rely
+/// on.
+#[rstest]
+fn compress_step_emits_manifest_matching_frames_when_index_bam_true(
+    #[values(1, 4)] threads: usize,
+) {
+    let records = test_records(4);
+    let batch = framed_batch(&records);
+    let batch_len = batch.len();
+    let collected: Arc<Mutex<Vec<BgzfBlock>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let sink_handle = Arc::clone(&collected);
+    let builder = Pipeline::builder();
+    builder
+        .chain(ReplaySource::new(vec![DecompressedBlock { batch_serial: 0, bytes: batch }]))
+        .chain(BgzfCompress::new(1, EDGE_LIMIT_BYTES, true))
+        .chain(CollectSink { collected: sink_handle })
+        .into_sink_marker();
+    let pipeline = builder.build().expect("chain builds");
+    pipeline.run(PipelineConfig { threads, ..Default::default() }).expect("chain runs");
+
+    let blocks = collected.lock().expect("mutex not poisoned");
+    assert_eq!(blocks.len(), 1, "one input DecompressedBlock maps to exactly one output");
+    let block = &blocks[0];
+    let index = block.index.as_ref().expect("index_bam=true must emit a manifest");
+
+    assert_eq!(
+        index.phys_comp_len.iter().map(|&n| u64::from(n)).sum::<u64>(),
+        u64::try_from(block.bytes.len()).expect("compressed len fits u64"),
+        "phys_comp_len must sum to the total compressed byte count"
+    );
+    assert_eq!(
+        index.phys_comp_len.len(),
+        batch_len.div_ceil(fgumi_bgzf::BGZF_MAX_BLOCK_SIZE),
+        "one physical block per BGZF_MAX_BLOCK_SIZE-sized chunk of uncompressed input"
+    );
+    assert_eq!(index.records.len(), records.len(), "one index entry per framed record");
+    let mut expected_uoffset = 0u32;
+    for (i, (entry, record)) in index.records.iter().zip(records.iter()).enumerate() {
+        let body_len = u32::try_from(record.as_ref().len()).expect("record fits u32");
+        assert_eq!(entry.uoffset, expected_uoffset, "uoffset must be the frame start");
+        assert_eq!(entry.len, 4 + body_len, "len must be 4 + body length");
+        // `test_records(i)` places record i at ref 0, 0-based pos 100 + i*10 with
+        // a 4M CIGAR, mapped. `extract_alignment_context` yields the 1-based,
+        // inclusive span [pos + 1, pos + ref_span]. A join that emitted a
+        // constant or shifted context would still pass an `is_some()` check.
+        let ctx = entry.ctx.as_ref().expect("mapped test records carry a context");
+        let pos = 100 + i * 10;
+        assert_eq!(ctx.ref_id, 0, "ref_id must be 0");
+        assert_eq!(ctx.start.get(), pos + 1, "1-based start = pos + 1");
+        assert_eq!(ctx.end.get(), pos + 4, "end = pos + 4M reference span");
+        assert!(ctx.is_mapped, "test records are mapped");
+        expected_uoffset += 4 + body_len;
+    }
 }
 
 /// An input with a header but no records must still complete cleanly and
