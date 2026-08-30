@@ -985,6 +985,22 @@ mod proptests {
     }
 }
 
+/// Soak-iteration count, collapsed to a minimal pass under coverage
+/// instrumentation.
+///
+/// `cargo llvm-cov` (the coverage CI job) sets `cfg(coverage)`. Under it these
+/// soak tests run only to exercise the ~200 lines nothing else reaches, and a
+/// couple of iterations covers every one of them — so we drop to `min` there and
+/// skip the sustained repetition whose sole purpose is hunting rare races. The
+/// FULL soak (its actual race-hunting value) still runs on the nightly
+/// `cargo ci-test-stress` job, which does NOT set `cfg(coverage)`, so nothing is
+/// lost on the path where the soak matters; only the coverage job — which repeats
+/// the same covered lines dozens of times for no extra coverage — gets faster.
+#[cfg(feature = "stress-tests")]
+fn soak_iterations(full: usize, min: usize) -> usize {
+    if cfg!(coverage) { min } else { full }
+}
+
 #[cfg(feature = "stress-tests")]
 /// Maximum-contention soak for the block-parallel decompress path
 /// (`file_granularity == false`). Drives the path repeatedly under the most
@@ -1010,7 +1026,6 @@ mod proptests {
 fn block_parallel_high_contention_soak_matches_legacy() {
     use std::time::Duration;
 
-    const ITERATIONS: usize = 40;
     const RECORDS_PER_ITER: usize = 15_000;
     const PIPELINE_THREADS: usize = 12;
     const SORTER_THREADS: usize = 2;
@@ -1024,8 +1039,9 @@ fn block_parallel_high_contention_soak_matches_legacy() {
     // Per-iteration watchdog: a livelock in any single iteration fails fast.
     const WATCHDOG: Duration = Duration::from_secs(60);
 
+    let iterations = soak_iterations(40, 2);
     let sort_order = SortOrder::Coordinate;
-    for iter in 0..ITERATIONS {
+    for iter in 0..iterations {
         let seed = 0xA5A5_0000_u64 ^ (iter as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let (header, records) = synthesize_sized_records(RECORDS_PER_ITER, seed, 110);
         run_watchdogged_parity(
@@ -1064,7 +1080,6 @@ fn block_parallel_high_contention_soak_matches_legacy() {
 fn sort_buffer_chain_tight_memory_soak_no_deadlock() {
     use std::time::Duration;
 
-    const ITERATIONS: usize = 24;
     const RECORDS_PER_ITER: usize = 12_000;
     const PIPELINE_THREADS: usize = 8;
     const SORTER_THREADS: usize = 4;
@@ -1074,7 +1089,8 @@ fn sort_buffer_chain_tight_memory_soak_no_deadlock() {
     const OUTPUT_BYTE_LIMIT: u64 = 48 * 1024;
     const WATCHDOG: Duration = Duration::from_secs(60);
 
-    for iter in 0..ITERATIONS {
+    let iterations = soak_iterations(24, 2);
+    for iter in 0..iterations {
         let seed = 0xC0FF_EE00_u64 ^ (iter as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let (header, records) = synthesize_sized_records(RECORDS_PER_ITER, seed, 130);
         run_watchdogged_parity(
@@ -1274,15 +1290,15 @@ fn block_parallel_soak_matrix_matches_legacy(
 ) {
     use std::time::Duration;
 
-    const ITERATIONS: usize = 4;
     const SORTER_THREADS: usize = 2;
     const WATCHDOG: Duration = Duration::from_secs(120);
 
+    let iterations = soak_iterations(4, 1);
     let sort_order = SortOrder::Coordinate;
     let SoakParams { records, seq_len, memory_limit, output_byte_limit, block_batch } =
         regime.params();
 
-    for iter in 0..ITERATIONS {
+    for iter in 0..iterations {
         // Distinct seed per (regime, threads, granularity, iter).
         let seed = 0x50A4_0000_u64
             .wrapping_add((iter as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))

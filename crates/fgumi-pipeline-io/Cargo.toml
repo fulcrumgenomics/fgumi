@@ -27,6 +27,15 @@ test-utils = []
 # root crate's `stress-tests` convention.
 stress-tests = []
 
+[lints.rust]
+# `coverage` is a config flag set only by `cargo llvm-cov` (the coverage CI job).
+# The `stress-tests` soak suites read it via `cfg!(coverage)` to collapse their
+# iteration counts to a minimal line-coverage pass there — the full race-hunting
+# soak still runs on the nightly `cargo ci-test-stress` job, which does not set
+# it. Declare the cfg so the unexpected-cfg lint stays quiet under the normal
+# `-D warnings` build (mirrors `fgumi-sort`'s `loom` registration).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
+
 [dev-dependencies]
 # fgumi-bam-io, fgumi-bgzf, and tempfile are omitted here: each is already a
 # normal dependency with identical configuration, which tests and benches
