@@ -492,7 +492,15 @@ pub fn compute_group_key_from_raw(
         // UNKNOWN position that relies on the read sorting adjacent to its
         // primary. Library/cell are extracted the same way as primaries so the
         // position key matches (they share their template's RG/CB).
-        let aux_offset = fgumi_raw_bam::aux_data_offset_from_record(raw).unwrap_or(raw.len());
+        //
+        // `.min(raw.len())` guards a malformed record: `aux_data_offset_from_record`
+        // computes the offset from the record's own `n_cigar_op` / `l_seq` fields, so
+        // a corrupt or truncated record can report an offset past the body. Left
+        // unclamped the slice below would panic; clamp it to an empty aux slice
+        // instead — the same fallback `aux_data_offset_from_record`'s companion
+        // `aux_data_slice` helper applies, and the same one used for a missing offset.
+        let aux_offset =
+            fgumi_raw_bam::aux_data_offset_from_record(raw).unwrap_or(raw.len()).min(raw.len());
         let aux_data = &raw[aux_offset..];
         if let Some([tid1, pos1, neg1, tid2, pos2, neg2]) =
             fgumi_raw_bam::read_tc_template_coordinate(aux_data)
@@ -537,9 +545,19 @@ pub fn compute_group_key_from_raw(
     let strand = u8::from(reverse);
 
     // Single-pass aux tag extraction (RG, cell barcode, MC, optional UMI).
-    // Resolve aux_offset once so we can both slice aux data and convert the
-    // returned UMI position from aux-relative to record-relative.
-    let aux_offset = fgumi_raw_bam::aux_data_offset_from_record(raw).unwrap_or(raw.len());
+    // Resolve aux_offset once so we can slice aux data and convert the UMI
+    // position from aux-relative to record-relative. A corrupt/truncated record
+    // can report `None` or an offset past the body, leaving the aux unreadable:
+    // return a name-only key rather than a position key with defaulted
+    // library/cell hashes, which — since `position_key` excludes `name_hash` —
+    // would group this record with unrelated records at the same position
+    // (matching the sec/supp and `i32::MAX` fallbacks above). A valid tagless
+    // record resolves to `off == raw.len()` and takes the normal path below.
+    let Some(aux_offset) =
+        fgumi_raw_bam::aux_data_offset_from_record(raw).filter(|&off| off <= raw.len())
+    else {
+        return (GroupKey { name_hash, ..GroupKey::default() }, None);
+    };
     let aux_data = &raw[aux_offset..];
     let cell_tag_bytes = cell_tag.map_or([0u8; 2], |t| [t.as_ref()[0], t.as_ref()[1]]);
     let aux_tags = fgumi_raw_bam::extract_aux_string_tags(aux_data, cell_tag_bytes, umi_tag);
@@ -551,15 +569,10 @@ pub fn compute_group_key_from_raw(
         Some((value_offset, value_len))
     });
 
-    let library_idx = if let Some(rg) = aux_tags.rg {
-        let rg_hash = LibraryIndex::hash_rg(rg);
-        library_index.get(rg_hash)
-    } else {
-        0
-    };
-
-    let cell_hash =
-        if let Some(cb) = aux_tags.cell { LibraryIndex::hash_cell_barcode(Some(cb)) } else { 0 };
+    // Same idiom as the secondary/supplementary branch above so the two paths
+    // resolve RG/CB identically.
+    let library_idx = aux_tags.rg.map_or(0, |rg| library_index.get(LibraryIndex::hash_rg(rg)));
+    let cell_hash = aux_tags.cell.map_or(0, |cb| LibraryIndex::hash_cell_barcode(Some(cb)));
 
     // Check if paired
     let is_paired = (flg & fgumi_raw_bam::flags::PAIRED) != 0;
@@ -5863,6 +5876,107 @@ mod tests {
             .cigar_ops(&[4u32 << 4]);
         b.add_string_tag(SamTag::RX, umi);
         b.build()
+    }
+
+    /// A malformed record whose header fields imply an auxiliary-data offset past
+    /// the end of the record body must not panic `compute_group_key_from_raw`, and
+    /// must not silently produce a *position* key from an unreadable aux region —
+    /// that key would carry defaulted library/cell hashes and, since the position
+    /// key excludes `name_hash`, group this record with unrelated records at the
+    /// same position. Inflating `l_seq` drives `aux_data_offset_from_record` well
+    /// beyond `raw.len()` while leaving the CIGAR (and thus the position) intact,
+    /// so both aux-slice sites are reachable: the primary path (own position
+    /// computed) and the secondary/supplementary path (keyed off `tc`). Both must
+    /// converge on the same name-only fallback key with no UMI position.
+    #[rstest]
+    #[case::primary(0u16)]
+    #[case::secondary(fgumi_raw_bam::flags::SECONDARY)]
+    fn compute_group_key_from_raw_survives_out_of_range_aux_offset(#[case] extra_flags: u16) {
+        use crate::unified_pipeline::GroupKey;
+        use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags as raw_flags};
+
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGT")
+            .qualities(&[30u8; 4])
+            .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT | extra_flags)
+            .ref_id(0)
+            .pos(0)
+            .mapq(30)
+            .cigar_ops(&[4u32 << 4]);
+        b.add_string_tag(SamTag::RX, b"ACGT");
+        let record = b.build();
+
+        // Corrupt `l_seq` (bytes 16..20) to `u32::MAX` so the derived aux offset
+        // lands far past the record body.
+        let mut raw = record.as_ref().to_vec();
+        raw[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(
+            fgumi_raw_bam::aux_data_offset_from_record(&raw).is_some_and(|off| off > raw.len()),
+            "the corrupted record must report an out-of-range aux offset for this test to bite"
+        );
+
+        let header = Header::default();
+        let library_index = LibraryIndex::from_header(&header);
+
+        // Request the UMI tag so the aux scan is actually reached: with
+        // `umi_tag: None` the UMI assertion below would pass even if the aux
+        // offset were honored. The record carries a real RX, so only the
+        // out-of-range guard keeps the returned key name-only and the UMI `None`.
+        let (key, umi_position) =
+            compute_group_key_from_raw(&raw, &library_index, None, Some(*SamTag::RX));
+
+        // The unreadable aux offset must yield the name-only fallback key, not a
+        // position key built from defaulted library/cell hashes. Both the primary
+        // and the secondary/supplementary branch converge on this same key.
+        let name_only =
+            GroupKey { name_hash: LibraryIndex::hash_name(Some(b"read1")), ..GroupKey::default() };
+        assert_eq!(key, name_only, "an unreadable aux offset must yield the name-only key");
+        assert!(umi_position.is_none(), "an empty aux slice must yield no UMI position");
+    }
+
+    /// The out-of-range guard must not over-fire on a *valid* record that simply
+    /// has no optional fields: there `aux_data_offset_from_record` returns
+    /// `Some(off)` with `off == raw.len()` (an empty aux slice) — the normal
+    /// no-tags case, not a malformed one. Such a record must still take the normal
+    /// path and receive a *position* key; a `<`-vs-`<=` boundary slip would
+    /// silently regroup every tagless record by name only.
+    #[test]
+    fn compute_group_key_from_raw_keeps_position_key_for_tagless_record() {
+        use crate::unified_pipeline::GroupKey;
+        use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags as raw_flags};
+
+        // A well-formed mapped read with a real CIGAR but no optional (aux) tags.
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGT")
+            .qualities(&[30u8; 4])
+            .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT)
+            .ref_id(0)
+            .pos(0)
+            .mapq(30)
+            .cigar_ops(&[4u32 << 4]);
+        let raw = b.build().as_ref().to_vec();
+
+        // Precondition: the aux offset lands exactly at the record end (empty aux) —
+        // the boundary the `off <= raw.len()` guard must admit as the normal path.
+        assert_eq!(
+            fgumi_raw_bam::aux_data_offset_from_record(&raw),
+            Some(raw.len()),
+            "a tagless record's aux offset must land exactly at raw.len()"
+        );
+
+        let header = Header::default();
+        let library_index = LibraryIndex::from_header(&header);
+        let (key, _umi) = compute_group_key_from_raw(&raw, &library_index, None, None);
+
+        // A real position key, NOT the name-only fallback: the record's own ref/pos
+        // must reach the key rather than the all-sentinel defaults.
+        let name_only =
+            GroupKey { name_hash: LibraryIndex::hash_name(Some(b"read1")), ..GroupKey::default() };
+        assert_ne!(key, name_only, "a valid tagless record must not fall back to a name-only key");
+        assert_eq!(key.ref_id1, 0, "own reference id must reach the position key");
+        assert_ne!(key.pos1, GroupKey::UNKNOWN_POS, "own position must reach the position key");
     }
 
     #[test]
