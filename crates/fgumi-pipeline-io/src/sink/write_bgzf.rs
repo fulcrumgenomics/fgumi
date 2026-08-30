@@ -94,7 +94,10 @@ impl WriteBgzfFile {
         compression_level: u32,
     ) -> io::Result<Self> {
         let sink = open_output_writer(path.as_ref())
-            .map_err(|e| io::Error::other(format!("open_output_writer: {e}")))?;
+            // `{e:#}` (alternate) so the anyhow source chain — the underlying OS
+            // error, e.g. permission denied / ENOENT — survives, not just the
+            // generic path-context line.
+            .map_err(|e| io::Error::other(format!("open_output_writer: {e:#}")))?;
         let mut out = BufWriter::with_capacity(256 * 1024, sink);
 
         let mut header_bytes = Vec::new();
@@ -209,7 +212,10 @@ impl WriteBgzfFile {
         transform: Option<ResolvedHeaderTransform>,
     ) -> io::Result<Self> {
         let sink = open_output_writer(path.as_ref())
-            .map_err(|e| io::Error::other(format!("open_output_writer: {e}")))?;
+            // `{e:#}` (alternate) so the anyhow source chain — the underlying OS
+            // error, e.g. permission denied / ENOENT — survives, not just the
+            // generic path-context line.
+            .map_err(|e| io::Error::other(format!("open_output_writer: {e:#}")))?;
         let out = BufWriter::with_capacity(256 * 1024, sink);
         Ok(Self {
             state: Mutex::new(Some(WriterState {

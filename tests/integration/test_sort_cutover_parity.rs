@@ -110,27 +110,24 @@ fn sort_command_produces_coordinate_sorted_output_via_chain() {
 
 /// Resolves the saved owned-engine baseline binary to compare against.
 ///
-/// Precedence: `FGUMI_BASELINE_BIN` env var, then the known checked-in-CI-host
-/// path, then `None` (meaning: skip the baseline half of the gate). A `None`
-/// return is only ever a "no oracle available" signal, not a passing result --
-/// callers must still require the samtools half (where one exists) or skip the
-/// whole case with an explicit `eprintln!`.
+/// The baseline path comes solely from the `FGUMI_BASELINE_BIN` env var; when it
+/// is unset (or names a missing file) this returns `None` — "no baseline oracle
+/// available", never a passing result. Callers layer the baseline byte-parity
+/// check on top of the always-available order oracle (`fgumi sort --verify`) and,
+/// where it exists, a `samtools` cross-check; a missing baseline just drops the
+/// byte-parity half, it never skips the case outright.
+/// No hardcoded fallback: a baseline binary is host-specific and must never be a
+/// path committed into the repo.
 fn baseline_bin() -> Option<std::path::PathBuf> {
-    if let Ok(path) = std::env::var("FGUMI_BASELINE_BIN") {
-        let path = std::path::PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-        eprintln!(
-            "FGUMI_BASELINE_BIN={} does not name an existing file; baseline oracle unavailable",
-            path.display()
-        );
-        return None;
+    let path = std::path::PathBuf::from(std::env::var_os("FGUMI_BASELINE_BIN")?);
+    if path.is_file() {
+        return Some(path);
     }
-
-    let fallback =
-        std::path::PathBuf::from("/Users/nhomer/work/git/fgumi/baselines/fgumi-owned-07b4a51b");
-    fallback.is_file().then_some(fallback)
+    eprintln!(
+        "FGUMI_BASELINE_BIN={} does not name an existing file; baseline oracle unavailable",
+        path.display()
+    );
+    None
 }
 
 /// Whether `samtools` is on `PATH` and runnable.
@@ -170,6 +167,18 @@ fn fgumi_verify_sorted(bin: &Path, path: &Path, order_flag: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Order-independent multiset of full records, each rendered to a stable string
+/// via noodles (`read_bam_output`). Needs neither `samtools` nor a baseline
+/// binary, so it works in the fallback path; sorting makes the comparison
+/// order-independent, which is what lets a sorted output be compared against its
+/// unsorted input to prove every record survived unaltered.
+fn sorted_record_multiset(path: &Path) -> Vec<String> {
+    let (_, records) = read_bam_output(path);
+    let mut rendered: Vec<String> = records.iter().map(|r| format!("{r:?}")).collect();
+    rendered.sort();
+    rendered
 }
 
 /// Runs `samtools <args> -o <output> <input>` and asserts success.
@@ -221,6 +230,11 @@ fn record_identities(bam_path: &Path) -> Vec<String> {
 /// here because neither side emits more than one `@PG` record for this input
 /// (the test BAMs carry no pre-existing `@PG`).
 fn strip_pg_lines(text: &str) -> String {
+    // Empty in, empty out: `"".split('\n')` yields `[""]`, which the
+    // trailing-newline logic below would otherwise turn into `"\n"`.
+    if text.is_empty() {
+        return String::new();
+    }
     let mut lines: Vec<&str> = text.split('\n').collect();
     let had_trailing_newline = lines.last() == Some(&"");
     if had_trailing_newline {
@@ -228,7 +242,9 @@ fn strip_pg_lines(text: &str) -> String {
     }
     lines.retain(|line| !line.starts_with("@PG"));
     let mut out = lines.join("\n");
-    if !out.is_empty() || had_trailing_newline {
+    // Restore the trailing newline iff the source had one — never synthesize one
+    // the source lacked (the prior `!out.is_empty()` clause did exactly that).
+    if had_trailing_newline {
         out.push('\n');
     }
     out
@@ -450,15 +466,11 @@ fn cutover_matches_baseline_and_samtools(
     let baseline = baseline_bin();
     let run_samtools = samtools_args.is_some() && samtools_available();
 
-    if baseline.is_none() && !run_samtools {
-        eprintln!(
-            "SKIP cutover_matches_baseline_and_samtools[{order}]: neither FGUMI_BASELINE_BIN \
-             (unset or naming a missing file) nor a usable samtools cross-check is available -- \
-             no oracle to compare against"
-        );
-        return;
-    }
-
+    // Never skip the case outright: even with no baseline binary and no samtools,
+    // the sort still runs and its order is checked against the always-available
+    // `fgumi sort --verify` oracle (see the samtools-unavailable and no-samtools
+    // arms below). The baseline and samtools cross-checks are added on top
+    // wherever those oracles exist.
     let dir = TempDir::new().expect("create temp dir");
     let input_bam = dir.path().join("in.bam");
     write_bam(&input_bam, &diverse_header(), &diverse_unsorted_records(300));
@@ -510,15 +522,45 @@ fn cutover_matches_baseline_and_samtools(
             );
         }
         Some(_) => {
+            // No samtools cross-check here, and the baseline half may also be
+            // absent, so fall back to the always-available order oracle plus an
+            // order-independent full-record multiset check: an empty or
+            // record-swapped output can still be order-valid.
+            assert!(
+                fgumi_verify_sorted(current_bin, &current_out, flag),
+                "cutover output for order={order} is not order-valid per `fgumi sort --verify`"
+            );
+            assert_eq!(
+                sorted_record_multiset(&current_out),
+                sorted_record_multiset(&input_bam),
+                "cutover output for order={order} is not the same full-record multiset as the \
+                 input (records dropped, added, or altered)"
+            );
             eprintln!(
                 "SKIP samtools half of cutover_matches_baseline_and_samtools[{order}]: \
                  samtools not found on PATH"
             );
         }
         None => {
+            // queryname-lex has no samtools equivalent (samtools `-n` is natural
+            // order), so no cross-tool comparison is possible. Fall back to the
+            // always-available self-consistency oracle: assert the cutover output
+            // is order-valid per `fgumi sort --verify` (itself validated against
+            // samtools in fgumi-sort's own suite). This holds even in plain CI
+            // with no baseline binary — the case is no longer effectively unchecked.
+            assert!(
+                fgumi_verify_sorted(current_bin, &current_out, flag),
+                "cutover output for order={order} is not order-valid per `fgumi sort --verify`"
+            );
+            assert_eq!(
+                sorted_record_multiset(&current_out),
+                sorted_record_multiset(&input_bam),
+                "cutover output for order={order} is not the same full-record multiset as the \
+                 input (records dropped, added, or altered)"
+            );
             eprintln!(
                 "no samtools equivalent for order={order} (queryname-lex is fgumi-specific, \
-                 samtools' -n is natural order) -- baseline-only oracle"
+                 samtools' -n is natural order) -- verified via `fgumi sort --verify`"
             );
         }
     }
@@ -752,6 +794,98 @@ fn cutover_edge_cases_match_baseline(#[case] n: usize) {
         None => {
             eprintln!(
                 "SKIP baseline half of cutover_edge_cases_match_baseline[n={n}]: \
+                 FGUMI_BASELINE_BIN is unset or does not name an existing file"
+            );
+        }
+    }
+}
+
+/// Degenerate records -- an empty CIGAR, an empty sequence, and zero-length
+/// qualities -- must round-trip through the cutover sort without error, stay
+/// coordinate-ordered, and (where the baseline binary is available) match it
+/// byte-for-byte. `sorted_records`/`unsorted_records` only build mapped
+/// `4M`/`ACGT`/four-quality records, so this covers the degenerate record
+/// shapes those generators omit.
+#[test]
+fn cutover_sorts_degenerate_records() {
+    // `(name, pos, cigar ops, seq, qual)` for one degenerate record shape each.
+    type DegenerateSpec = (&'static [u8], i32, &'static [u32], &'static [u8], &'static [u8]);
+
+    let dir = TempDir::new().expect("create temp dir");
+    let input_bam = dir.path().join("in.bam");
+
+    // One record per degenerate shape, `(name, pos, cigar ops, seq, qual)`. All
+    // are mapped on chr1 so each carries a coordinate key. (An empty sequence
+    // forces zero-length qualities: BAM ties QUAL length to SEQ length.) One
+    // source of truth, mapped twice below: once in input order (deliberately out
+    // of coordinate order so the sort has real work) and once in the expected
+    // coordinate order.
+    let specs: [DegenerateSpec; 3] = [
+        (b"empty_cigar", 300, &[], b"ACGT", &[30u8; 4]),
+        (b"empty_seq_and_qual", 100, &[], b"", &[]),
+        (b"normal", 200, &[4u32 << 4], b"ACGT", &[30u8; 4]),
+    ];
+    let build = |&(name, pos, cigar, seq, qual): &DegenerateSpec| {
+        let mut b = SamBuilder::new();
+        b.read_name(name)
+            .ref_id(0)
+            .pos(pos)
+            .mapq(0)
+            .flags(0)
+            .cigar_ops(cigar)
+            .sequence(seq)
+            .qualities(qual);
+        b.build()
+    };
+
+    let records: Vec<RawRecord> = specs.iter().map(build).collect();
+    let input_count = records.len();
+    write_bam(&input_bam, &create_minimal_header("chr1", 1_000_000), &records);
+
+    // The same records in the expected coordinate order (by POS), written to a
+    // second BAM so the sorted output can be compared field-for-field against a
+    // known-good ordering even when no baseline binary is available.
+    let mut sorted_specs = specs;
+    sorted_specs.sort_by_key(|&(_, pos, ..)| pos);
+    let expected_records: Vec<RawRecord> = sorted_specs.iter().map(build).collect();
+    let expected_bam = dir.path().join("expected.bam");
+    write_bam(&expected_bam, &create_minimal_header("chr1", 1_000_000), &expected_records);
+
+    let current_bin = Path::new(env!("CARGO_BIN_EXE_fgumi"));
+    let current_out = dir.path().join("current.bam");
+    run_fgumi_sort(current_bin, &input_bam, &current_out, "coordinate");
+
+    let (_, out_records) = read_bam_output(&current_out);
+    let (_, expected) = read_bam_output(&expected_bam);
+    assert_eq!(out_records.len(), input_count, "degenerate-record count must round-trip");
+    // Unconditional content check: every field (CIGAR/SEQ/QUAL included) of every
+    // record must survive the sort, in coordinate order. A count- or order-only
+    // assertion cannot see a corrupted degenerate field.
+    assert_eq!(
+        out_records, expected,
+        "degenerate-record cutover output must match the coordinate-sorted input records \
+         field-for-field (CIGAR/SEQ/QUAL included)"
+    );
+    assert!(
+        fgumi_verify_sorted(current_bin, &current_out, "coordinate"),
+        "degenerate-record cutover output is not order-valid per `fgumi sort --verify`"
+    );
+
+    // Where the baseline binary exists, additionally require byte-identity to it.
+    match baseline_bin() {
+        Some(baseline_bin_path) => {
+            let baseline_out = dir.path().join("baseline.bam");
+            run_fgumi_sort(&baseline_bin_path, &input_bam, &baseline_out, "coordinate");
+            assert_eq!(
+                decompressed_records_without_pg(&current_out),
+                decompressed_records_without_pg(&baseline_out),
+                "degenerate-record cutover output diverges from the owned-engine baseline \
+                 binary after stripping the @PG header line"
+            );
+        }
+        None => {
+            eprintln!(
+                "SKIP baseline half of cutover_sorts_degenerate_records: \
                  FGUMI_BASELINE_BIN is unset or does not name an existing file"
             );
         }

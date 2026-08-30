@@ -1292,6 +1292,19 @@ pub(crate) fn resolve_reserve(reserve: MemoryReserve, total_memory: usize) -> us
 /// For [`MemoryLimit::Fixed`]: multiplies by `threads` when `per_thread` is set;
 /// the reserve and host size are ignored.
 ///
+/// The thread count that sizes a sort's per-thread memory budget: `--threads`
+/// is the floor, raised to `--sort-threads` when that override is larger, but
+/// **0 when `--threads` is 0** so `resolve_memory_budget` still rejects a
+/// zero-thread run rather than being clamped up here.
+///
+/// Single source of truth for both the owned-engine banner path
+/// (`Sort::memory_budget_threads`) and the chain builder's `add_sort`
+/// (`sort_budget_threads`), so the two cannot drift.
+#[must_use]
+pub(crate) fn sort_memory_budget_threads(num_threads: usize, sort_threads: Option<usize>) -> usize {
+    if num_threads == 0 { 0 } else { num_threads.max(sort_threads.unwrap_or(0)) }
+}
+
 /// Calls [`detect_total_memory`] exactly once (it invokes `sysinfo`, which is
 /// not free).
 pub(crate) fn resolve_memory_budget(
@@ -1900,6 +1913,92 @@ pub(crate) fn require_group_input_ordering(
     Ok(())
 }
 
+/// Shared, process-global capturing logger for tests across the crate.
+///
+/// `log::set_logger` may be called only once per process. `nextest` isolates
+/// each test in its own process, but the plain `cargo test` / `cargo t`
+/// workflow shares one process across every test, so two modules each
+/// installing their own logger panic on the second install. Routing every
+/// capture-using test through this one shared, `Once`-guarded installer keeps
+/// `cargo t` working. `pub(crate)` so any test module can share it (e.g. the
+/// standalone-sort summary test in `pipeline::chains::commands::sort`).
+#[cfg(test)]
+pub(crate) mod test_log_capture {
+    use std::sync::{Mutex, MutexGuard, Once};
+
+    static CAPTURED_LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// Serializes whole capture sessions. `CAPTURED_LOGS` is process-global, so
+    /// under plain `cargo test` (one process, tests running concurrently) two
+    /// capture-using tests would otherwise interleave: one test's `capture_logs`
+    /// clear wipes another's records mid-assertion, or its emitted lines pollute
+    /// the other's snapshot. Holding this session lock from the clear through the
+    /// final `captured()` makes each capture session exclusive.
+    ///
+    /// Deliberately a *separate* lock from `CAPTURED_LOGS`: `CaptureLogger::log`
+    /// takes `CAPTURED_LOGS` on every emitted record, so reusing that buffer's
+    /// lock to serialize sessions would deadlock the instant a held session
+    /// logged anything.
+    static CAPTURE_SESSION: Mutex<()> = Mutex::new(());
+
+    struct CaptureLogger;
+    static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _metadata: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            CAPTURED_LOGS
+                .lock()
+                .expect("captured-log lock poisoned")
+                .push(record.args().to_string());
+        }
+        fn flush(&self) {}
+    }
+
+    /// Exclusive log-capture session. Bind it for the whole test and keep it
+    /// alive through the final `captured()` call; dropping it releases the
+    /// session so another capture-using test may run. The held `MutexGuard` is
+    /// never read — it exists purely for its `Drop`.
+    #[must_use = "bind the capture session; dropping it immediately ends the exclusive capture window"]
+    pub(crate) struct CaptureSession(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    /// Install the shared capturing logger at most once per process.
+    fn install_capture_logger() {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&CAPTURE_LOGGER).expect("no logger installed yet in this test process");
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+    }
+
+    /// Begin an exclusive capture session and enable the logger (so `log` macros
+    /// evaluate their arguments) *without* clearing prior records.
+    pub(crate) fn enable_logging() -> CaptureSession {
+        // Recover from a poisoned session lock: a prior test that panicked
+        // mid-session must not wedge every later capture-using test.
+        let guard = CAPTURE_SESSION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_capture_logger();
+        CaptureSession(guard)
+    }
+
+    /// Begin an exclusive capture session, install the logger (idempotently),
+    /// and clear prior records, so the caller asserts only on what its own
+    /// operation emits.
+    pub(crate) fn capture_logs() -> CaptureSession {
+        let session = enable_logging();
+        CAPTURED_LOGS.lock().expect("captured-log lock poisoned").clear();
+        session
+    }
+
+    /// Snapshot the captured log lines so far. Call while still holding the
+    /// `CaptureSession` returned by `enable_logging` / `capture_logs`.
+    pub(crate) fn captured() -> Vec<String> {
+        CAPTURED_LOGS.lock().expect("captured-log lock poisoned").clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2260,77 +2359,14 @@ mod tests {
         #[values(IndexThreshold::Always, IndexThreshold::Never, IndexThreshold::MinUmis(100))]
         index_threshold: IndexThreshold,
     ) {
-        enable_logging();
+        let _session = enable_logging();
         log_index_threshold(strategy, effective_edits, index_threshold);
     }
 
-    /// Enable an at-Trace logger so `log::warn!`/`debug!` macros evaluate their
-    /// arguments — without an enabled logger the `log` crate skips argument
-    /// evaluation, leaving the formatting expressions inside the memory-budget
-    /// warn/debug branches unexecuted under test.
-    ///
-    /// Routes through [`install_capture_logger`] so it shares the single
-    /// process-global logger with [`capture_logs`] rather than installing a
-    /// competing one — see that function for why a shared, idempotent install
-    /// is required.
-    fn enable_logging() {
-        install_capture_logger();
-    }
-
-    /// A `log` sink that records every emitted message so a test can assert a
-    /// specific `warn!`/`debug!` actually fired. It is the *only* logger the
-    /// tests install (via [`install_capture_logger`]): it doubles as the
-    /// "enabled logger" [`enable_logging`] needs and as the inspectable buffer a
-    /// test needs to prove the resolver *emits* (not merely that it does not
-    /// panic formatting).
-    struct CaptureLogger;
-
-    static CAPTURED_LOGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
-
-    impl log::Log for CaptureLogger {
-        fn enabled(&self, _metadata: &log::Metadata) -> bool {
-            true
-        }
-
-        fn log(&self, record: &log::Record) {
-            CAPTURED_LOGS
-                .lock()
-                .expect("captured-log lock poisoned")
-                .push(record.args().to_string());
-        }
-
-        fn flush(&self) {}
-    }
-
-    /// Install [`CaptureLogger`] as the process-global logger, at most once.
-    ///
-    /// `log::set_logger` may be called only once per process. nextest isolates
-    /// each test in its own process, but a plain `cargo test` run shares one
-    /// process across every test, so a second install would panic. Guarding the
-    /// install with a [`Once`] makes it idempotent, and routing both
-    /// [`enable_logging`] and [`capture_logs`] through here means the two helpers
-    /// share a single logger instead of racing to install competing ones (which
-    /// is what previously made the capture test panic when a sibling test had
-    /// already installed `env_logger`).
-    ///
-    /// [`Once`]: std::sync::Once
-    fn install_capture_logger() {
-        use std::sync::Once;
-        static INSTALL: Once = Once::new();
-        INSTALL.call_once(|| {
-            log::set_logger(&CAPTURE_LOGGER).expect("no logger installed yet in this test process");
-            log::set_max_level(log::LevelFilter::Trace);
-        });
-    }
-
-    /// Install the capturing logger (idempotently) and clear any records left by
-    /// earlier tests, so the caller asserts only on what its own operation
-    /// emits. Records accumulate in [`CAPTURED_LOGS`].
-    fn capture_logs() {
-        install_capture_logger();
-        CAPTURED_LOGS.lock().expect("captured-log lock poisoned").clear();
-    }
+    // Capture-logging helpers are shared crate-wide (see `super::test_log_capture`)
+    // so the plain `cargo t` process, which runs every test in one process,
+    // installs exactly one global logger instead of panicking on a second install.
+    use super::test_log_capture::{capture_logs, captured, enable_logging};
 
     /// CONS-01: `check_consensus_sort_order` mirrors fgbio's `UmiConsensusCaller.checkSortOrder`
     /// (the cases pinned by `UmiConsensusCallerTest.scala:34-60`): template-coordinate is
@@ -2346,7 +2382,7 @@ mod tests {
     #[case::coordinate("@HD\tVN:1.6\tSO:coordinate\n", false)]
     #[case::ungrouped("@HD\tVN:1.6\n", false)]
     fn test_check_consensus_sort_order(#[case] header_str: &str, #[case] should_accept: bool) {
-        enable_logging();
+        let _session = enable_logging();
         let header: Header = header_str.parse().expect("parse");
         let result = check_consensus_sort_order(&header, "foo.bam");
         if should_accept {
@@ -2637,7 +2673,7 @@ mod tests {
 
     #[test]
     fn test_auto_never_oversubscribes_small_host() {
-        enable_logging(); // exercise the cap-warning and auto-debug log branches
+        let _session = enable_logging(); // exercise the cap-warning and auto-debug log branches
         // Simulated 4 GiB host, 16 threads: the 256 MiB/thread floor would want
         // 4 GiB before reserve, which cannot fit after the auto reserve. The
         // budget must be capped to `available`, never `floor × threads`.
@@ -2677,7 +2713,7 @@ mod tests {
 
     #[test]
     fn test_fixed_budget_independent_of_host() {
-        enable_logging(); // exercise the "budget exceeds host total" warn branch
+        let _session = enable_logging(); // exercise the "budget exceeds host total" warn branch
         // Fixed limits ignore host size entirely (reserve is irrelevant).
         let tiny_host = 512 * 1024 * 1024;
         let budget = resolve_memory_budget_with_total(
@@ -2718,7 +2754,7 @@ mod tests {
         // (a) emits the co-residency warning and (b) only warns — it does not
         // shrink the explicit budget. `capture_logs` records emitted records so
         // the warning is asserted rather than merely evaluated.
-        capture_logs();
+        let _session = capture_logs();
         let host = 16 * 1024 * 1024 * 1024;
         let budget = resolve_memory_budget_with_total(
             MemoryLimit::Fixed(14 * 1024 * 1024 * 1024),
@@ -2730,7 +2766,7 @@ mod tests {
         .expect("should resolve");
         assert_eq!(budget, 14 * 1024 * 1024 * 1024, "explicit budget must not be shrunk");
 
-        let logs = CAPTURED_LOGS.lock().expect("captured-log lock poisoned");
+        let logs = captured();
         assert!(
             logs.iter().any(|line| line.contains("of total host memory")
                 && line.contains("co-resident processes")),

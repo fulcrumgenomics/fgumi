@@ -1059,16 +1059,21 @@ impl<'a> ChainBuilder<'a> {
     /// Group-key config for the **source preamble's** `DecodeRecords`.
     ///
     /// A first stage that groups by queryname (correct's `GroupByQueryname`)
-    /// reads only `key.name_hash` and discards the rest of the `GroupKey`, so
-    /// the source decode uses
-    /// [`fgumi_bam_io::GroupKeyConfig::name_hash_only`] — skipping the CIGAR
-    /// 5′-position walk and the RG/CB/MC aux-tag extraction pass entirely.
+    /// reads only `key.name_hash` and discards the rest of the `GroupKey`; a sort
+    /// first stage discards the `GroupKey` *entirely* (it computes its own sort
+    /// keys straight off the raw record bytes — see
+    /// `DecodedRecordBatchToRecordBatch`). Both therefore use
+    /// [`fgumi_bam_io::GroupKeyConfig::name_hash_only`] — the cheapest config —
+    /// skipping the CIGAR 5′-position walk and the RG/CB/MC aux-tag extraction
+    /// pass entirely; for a SAM-first sort that pass runs once per record in
+    /// `ParseSamChunk` and would otherwise be pure waste. This changes only the
+    /// discarded key, never the record bytes, so sort output is unchanged.
     /// (The legacy single-threaded path uses `new_raw_no_cell`, which still
     /// pays the combined aux pass; name-hash-only is strictly less work.) All
     /// other first stages (group/dedup/consensus/clip) need the full
     /// position/cell key, so they fall through to [`Self::bam_group_key_config`].
     fn source_group_key_config(&self) -> fgumi_bam_io::GroupKeyConfig {
-        if matches!(self.spec.stages.first(), Some(Stage::Correct)) {
+        if matches!(self.spec.stages.first(), Some(Stage::Correct | Stage::Sort)) {
             let library_index = fgumi_bam_io::LibraryIndex::from_header(&self.header);
             fgumi_bam_io::GroupKeyConfig::name_hash_only(library_index)
         } else {
@@ -4441,7 +4446,9 @@ fn resolve_phase_threads(override_threads: Option<usize>, num_sorter_threads: us
 /// `Sort::memory_budget_threads` (sort.rs:607-616): `max(threads, sort_threads)`,
 /// but 0 when the pool is 0 so `resolve_memory_budget` still rejects a zero-thread run.
 fn sort_budget_threads(num_threads: usize, sort_threads: Option<usize>) -> usize {
-    if num_threads == 0 { 0 } else { num_threads.max(sort_threads.unwrap_or(0)) }
+    // Single source of truth shared with `Sort::memory_budget_threads` — see
+    // `commands::common::sort_memory_budget_threads` — so the two cannot drift.
+    crate::commands::common::sort_memory_budget_threads(num_threads, sort_threads)
 }
 
 /// Uniform "reference dictionary not found" error, shared by the zipper source
@@ -4502,15 +4509,19 @@ mod tests {
         assert_eq!(sort_budget_threads(0, Some(8)), 0); // threads==0 → 0 (rejection preserved)
     }
 
-    /// Prove `add_sort`'s `resolve_memory_budget` call is sized by
-    /// `sort_budget_threads`, not the raw `num_threads`. With
-    /// `MemoryLimit::Fixed` and `per_thread = true` the budget scales linearly
-    /// with the thread count fed in, so a larger budget-thread count must
-    /// yield a larger resolved budget. `MemoryLimit::Auto` cannot be used here:
-    /// it clamps to available memory, so both calls return ~available and
-    /// integer division makes `b8 <= b2` — a false RED.
+    /// `resolve_memory_budget` (the function `add_sort` feeds
+    /// `sort_budget_threads` into) scales a `Fixed` per-thread budget linearly
+    /// with the thread count, so a larger budget-thread count yields a larger
+    /// budget. This pins that scaling in isolation; that `add_sort` passes
+    /// `sort_budget_threads(num_threads, sort_threads)` (not the raw
+    /// `num_threads`) into it is guaranteed by the shared
+    /// `common::sort_memory_budget_threads` and pinned by
+    /// `sort_budget_threads_mirrors_owned_memory_budget_threads`.
+    /// `MemoryLimit::Auto` cannot be used here: it clamps to available memory, so
+    /// both calls return ~available and integer division makes `b8 <= b2` — a
+    /// false RED.
     #[test]
-    fn add_sort_budget_uses_fixed_budget_scaled_by_max_threads() {
+    fn resolve_memory_budget_scales_with_thread_count() {
         use crate::commands::common::{MemoryLimit, MemoryReserve, resolve_memory_budget};
         let fixed = MemoryLimit::Fixed(64 * 1024 * 1024);
         let per_thread = true;

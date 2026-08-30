@@ -64,48 +64,12 @@ impl FinalizeHook for SortSummaryFinalizeHook {
 mod tests {
     use super::*;
 
-    /// A `log` sink that records every emitted message so a test can assert a
-    /// specific `info!` line actually fired.
-    ///
-    /// This mirrors the `CaptureLogger` pattern in
-    /// `crate::commands::common::tests` (that one is private to its own
-    /// module, so it cannot be reused here). Installing a process-global
-    /// logger is safe under `cargo nextest run` (the repo's standard test
-    /// runner), which isolates each test in its own process; a plain `cargo
-    /// test` run sharing one process across multiple such loggers would
-    /// panic on the second install, same as the existing pattern.
-    struct CaptureLogger;
-
-    static CAPTURED_LOGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
-
-    impl log::Log for CaptureLogger {
-        fn enabled(&self, _metadata: &log::Metadata) -> bool {
-            true
-        }
-
-        fn log(&self, record: &log::Record) {
-            CAPTURED_LOGS
-                .lock()
-                .expect("captured-log lock poisoned")
-                .push(record.args().to_string());
-        }
-
-        fn flush(&self) {}
-    }
-
-    /// Install [`CaptureLogger`] as the process-global logger and clear any
-    /// records left by an earlier test, so the caller asserts only on what
-    /// its own operation emits.
-    fn capture_logs() {
-        use std::sync::Once;
-        static INSTALL: Once = Once::new();
-        INSTALL.call_once(|| {
-            log::set_logger(&CAPTURE_LOGGER).expect("no logger installed yet in this test process");
-            log::set_max_level(log::LevelFilter::Trace);
-        });
-        CAPTURED_LOGS.lock().expect("captured-log lock poisoned").clear();
-    }
+    // Shares the crate-wide capturing logger (see
+    // `crate::commands::common::test_log_capture`) so this test and the
+    // memory-budget capture tests in `commands::common` do not each install a
+    // competing process-global logger — the second install panics under plain
+    // `cargo t`, which runs every test in one process.
+    use crate::commands::common::test_log_capture::{capture_logs, captured};
 
     /// `SortSummaryFinalizeHook::finalize` must log the "Spill runs:" wording
     /// the owned `execute_sort` engine uses (`src/lib/commands/sort.rs`), not
@@ -126,7 +90,7 @@ mod tests {
         };
         Box::new(hook).finalize().expect("finalize must succeed");
 
-        let logs = CAPTURED_LOGS.lock().expect("captured-log lock poisoned");
+        let logs = captured();
         assert!(
             logs.iter().any(|line| line.contains("Spill runs: 3")),
             "expected a 'Spill runs: 3' log line; got: {logs:?}"

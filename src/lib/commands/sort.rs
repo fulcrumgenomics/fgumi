@@ -605,14 +605,11 @@ impl Sort {
     /// raises the budget when the sort phase is the wider one -- the case where
     /// `--threads` alone under-counts -- and never lowers it.
     fn memory_budget_threads(&self) -> usize {
-        // `--threads 0` has to keep reaching `resolve_memory_budget`'s rejection
-        // rather than being clamped up here.
-        if self.threads == 0 {
-            return 0;
-        }
-        // `unwrap_or(0)` leaves `--threads` as the floor when the override is
-        // unset, or is itself 0 (which the engine clamps to one worker).
-        self.threads.max(self.sort_threads.unwrap_or(0))
+        // Single source of truth shared with the chain builder's `add_sort`
+        // (`sort_budget_threads`) — see `common::sort_memory_budget_threads` — so
+        // the banner path and the chain path cannot drift. `--threads 0` still
+        // resolves to 0 there, so `resolve_memory_budget` rejects a zero-thread run.
+        crate::commands::common::sort_memory_budget_threads(self.threads, self.sort_threads)
     }
 
     /// The flag [`memory_budget_threads`](Self::memory_budget_threads) took its
@@ -773,11 +770,10 @@ impl Sort {
             );
         }
 
-        // `OperationTimer::new` logs the "Sorting BAM ..." start line as a side effect on
-        // construction; its completion half (`log_completion`) lived in the tail this cutover
-        // replaces (the chain has no total-record count to hand it here), so the binding
-        // itself is now unread -- prefixed to silence that, not to drop the start-line log.
-        let _timer = OperationTimer::new("Sorting BAM");
+        // The "Sorting BAM ..." start line and its completion line are both owned
+        // by the chain's `SortSummaryFinalizeHook` timer (`add_sort` constructs an
+        // `OperationTimer::new("Sorting BAM")` there). execute_sort no longer
+        // builds its own timer — doing so logged the identical start line twice.
 
         // Resolve memory limit (auto-detect or fixed)
         let budget_threads = self.memory_budget_threads();
@@ -856,6 +852,22 @@ impl Sort {
             info!("Temp directories: {joined}");
         }
 
+        // The cutover chain does not yet thread the owned engine's `--read-streams`
+        // / `--sort-stats` knobs. Warn (not info) on a non-default value so the
+        // ignored behavior stays visible under a default `warn` log filter rather
+        // than being silently dropped. Restoring `--read-streams` end-to-end is
+        // tracked as follow-up R7b.
+        if !matches!(self.read_streams, fgumi_sort::ReadStreams::Auto) {
+            warn!(
+                "--read-streams={} is ignored by the sort chain (not yet threaded); \
+                 using the default read strategy",
+                self.read_streams
+            );
+        }
+        if self.sort_stats {
+            warn!("--sort-stats is ignored by the sort chain (not yet threaded)");
+        }
+
         // --- cutover: run via the chain instead of sorter.sort() ---
         // (self.build_sorter above is retained only to source the banner's thread/temp-file
         //  numbers; the owned sorter is not executed. PR B removes the owned engine + banner-build.)
@@ -864,12 +876,13 @@ impl Sort {
             ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag, build_for,
         };
 
-        let output = self.output.as_ref().expect("output present (validated in execute)");
+        // `output` is already bound at the top of this method (validated in
+        // `execute`); reuse it rather than re-`expect`ing.
 
         // Bake resolved tmp dirs (incl. FGUMI_TMP_DIRS) into SortOptions — add_sort uses
         // SortOptions.tmp_dirs verbatim and never reads the env var; to_sort_options copies raw.
         let mut sort_options = self.to_sort_options();
-        sort_options.tmp_dirs = resolved_tmp_dirs; // already computed for the banner at :842-843
+        sort_options.tmp_dirs = resolved_tmp_dirs; // already resolved above for the banner
 
         let stage_opts = StageOptionsBag { sort: Some(sort_options), ..Default::default() };
         let sink = if self.write_index {
