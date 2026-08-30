@@ -933,6 +933,201 @@ fn block_parallel_bgzf_spill_matches_legacy() {
     assert_eq!(new_out, legacy_out, "sorted bytes differ (bgzf block-parallel)");
 }
 
+// ── Production spill split + run extension (SpillGather run-former) ────────────
+//
+// `drive_sort_buffer_pipeline` above drives the retired monolithic `CompressSpill`
+// for legacy Phase-2 coverage. The tests below drive the PRODUCTION spill split
+// (`SortBuffer` → `SpillGather` → `SpillBlockCompress` → `SpillWrite` →
+// `SortSpillDecompress` → `SortMerge`) that `fgumi sort` actually builds, so they
+// exercise the run-forming `SpillGather` end-to-end: contiguous chunks coalesce
+// into one run, and the merge sees one slot per run.
+
+/// Drive the production spill split and return `(merged record bytes, run count)`.
+/// The run count is the `SortMerge` stats `runs_written`, which equals the number
+/// of spill files (`SpillReady`s) the merge saw — i.e. the number of runs the
+/// `SpillGather` run-former formed. Mirrors `ChainBuilder::add_sort`'s wiring.
+fn drive_spill_split_pipeline(
+    sorter: RawExternalSorter,
+    header: &Header,
+    batches: Vec<RecordBatch>,
+    output_byte_limit: u64,
+    threads: usize,
+) -> Result<(Vec<Vec<u8>>, usize)> {
+    use fgumi_sort::TmpDirAllocator;
+
+    let received: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let stats_slot: Arc<Mutex<Option<fgumi_sort::SortStats>>> = Arc::new(Mutex::new(None));
+    let sort_order = sorter.sort_order();
+
+    let dir = tempfile::TempDir::new()?;
+    let alloc =
+        TmpDirAllocator::with_probe(vec![dir.path().to_path_buf()], Box::new(|_| Ok(u64::MAX)), 0)?;
+    let temp_dirs = Arc::new(vec![dir]);
+    let codec = SpillCodec::Zstd;
+
+    let source = VecSource::new(batches, output_byte_limit);
+    let sort_buffer = SortBuffer::from_sorter(sorter, header, output_byte_limit)?;
+    let gather = SpillGather::new(output_byte_limit);
+    let compress = SpillBlockCompress::new(codec, 3, output_byte_limit);
+    let write = SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, output_byte_limit, temp_dirs);
+    let decompress = SortSpillDecompress::new(output_byte_limit, SortDecompressTuning::default());
+    let merge =
+        SortMerge::<RecordBatchOutput>::with_target_batch_count(sort_order, output_byte_limit, 256)
+            .with_stats_slot(Arc::clone(&stats_slot));
+    let sink = VecSink { received: Arc::clone(&received), kind: StepKind::Serial };
+
+    let builder = Pipeline::builder();
+    builder
+        .chain(source)
+        .chain(sort_buffer)
+        .chain(gather)
+        .chain(compress)
+        .chain(write)
+        .chain(decompress)
+        .chain(merge)
+        .chain(sink)
+        .into_sink_marker();
+    let pipeline = builder.build()?;
+    pipeline.run(PipelineConfig { threads, ..Default::default() })?;
+
+    let collected = std::mem::take(&mut *received.lock());
+    let mut out = Vec::new();
+    for batch in collected {
+        for bytes in batch.iter_record_bytes() {
+            out.push(bytes.to_vec());
+        }
+    }
+    let runs = stats_slot.lock().take().expect("SortMerge published its stats").runs_written;
+    Ok((out, runs))
+}
+
+/// Records sorted into `order`, obtained by running them through the oracle and
+/// parsing its (byte-identical) sorted output back into `RawRecord`s. Feeding
+/// this back in is the already-sorted-input case the run-former must coalesce.
+fn presorted_records(order: SortOrder, header: &Header, records: &[RawRecord]) -> Vec<RawRecord> {
+    sort_via_legacy(order, header, records, 256 * 1024 * 1024, 1)
+        .expect("oracle sort")
+        .into_iter()
+        .map(RawRecord::from)
+        .collect()
+}
+
+/// An already-sorted input, re-sorted under a small memory budget through the
+/// production split, must coalesce every contiguous chunk into ONE run — and
+/// stay byte-identical to the oracle. This is the t16 fix's headline behaviour,
+/// exercised across all four sort orders via the shared `SpillGather` run-former.
+#[rstest]
+#[case::coordinate(SortOrder::Coordinate)]
+#[case::queryname_lex(SortOrder::Queryname(QuerynameComparator::Lexicographic))]
+#[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
+#[case::template(SortOrder::TemplateCoordinate)]
+fn presorted_input_coalesces_to_one_run(#[case] order: SortOrder) {
+    let (header, records) = synthesize_sized_records(20_000, 0xC0FF_EE00, 40);
+    let sorted = presorted_records(order, &header, &records);
+
+    let sorter = RawExternalSorter::new(order)
+        .memory_limit(256 * 1024) // small ⇒ many contiguous chunks to coalesce
+        .threads(2)
+        .output_compression(1)
+        .temp_compression(1);
+    let (out, runs) =
+        drive_spill_split_pipeline(sorter, &header, pack_batches(&sorted, 256), 4 * 1024 * 1024, 4)
+            .expect("spill-split pipeline drives to completion");
+
+    let expected = sort_via_legacy(order, &header, &sorted, 256 * 1024 * 1024, 1).expect("oracle");
+    assert_eq!(out, expected, "{order:?}: coalesced output diverged from the oracle");
+    assert_eq!(
+        runs, 1,
+        "{order:?}: contiguous chunks must coalesce into a single run (SpillReady==#runs)"
+    );
+}
+
+/// A reverse-ordered input cannot coalesce: every chunk's minimum precedes the
+/// open run's maximum, so the run-former opens a fresh run per chunk. Output must
+/// still be byte-identical to the oracle — extension is a layout optimisation,
+/// never a reordering.
+#[test]
+fn reverse_ordered_input_forms_many_runs_but_stays_byte_parity() {
+    let order = SortOrder::Coordinate;
+    let (header, records) = synthesize_sized_records(20_000, 0xBEEF_0001, 40);
+    let mut reversed = presorted_records(order, &header, &records);
+    reversed.reverse();
+
+    let sorter = RawExternalSorter::new(order)
+        .memory_limit(256 * 1024)
+        .threads(2)
+        .output_compression(1)
+        .temp_compression(1);
+    let (out, runs) = drive_spill_split_pipeline(
+        sorter,
+        &header,
+        pack_batches(&reversed, 256),
+        4 * 1024 * 1024,
+        4,
+    )
+    .expect("spill-split pipeline drives to completion");
+
+    let expected =
+        sort_via_legacy(order, &header, &reversed, 256 * 1024 * 1024, 1).expect("oracle");
+    assert_eq!(out, expected, "reverse-ordered sort diverged from the oracle");
+    assert!(runs >= 2, "reverse-ordered chunks must not coalesce (got {runs} run(s))");
+}
+
+/// A fully shuffled input: the run-former coalesces the runs it can and opens new
+/// ones where it cannot, and the merged output must still match the oracle
+/// byte-for-byte. This is the partial-coalescing correctness case.
+#[rstest]
+#[case::coordinate(SortOrder::Coordinate)]
+#[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
+#[case::template(SortOrder::TemplateCoordinate)]
+fn shuffled_input_matches_the_oracle_through_the_split(#[case] order: SortOrder) {
+    let (header, records) = synthesize_sized_records(20_000, 0x5EED_1234, 40);
+
+    let sorter = RawExternalSorter::new(order)
+        .memory_limit(256 * 1024)
+        .threads(2)
+        .output_compression(1)
+        .temp_compression(1);
+    let (out, _runs) = drive_spill_split_pipeline(
+        sorter,
+        &header,
+        pack_batches(&records, 256),
+        4 * 1024 * 1024,
+        4,
+    )
+    .expect("spill-split pipeline drives to completion");
+
+    let expected = sort_via_legacy(order, &header, &records, 256 * 1024 * 1024, 1).expect("oracle");
+    assert_eq!(out, expected, "{order:?}: shuffled-input sort diverged from the oracle");
+}
+
+/// An in-memory sort (memory budget above the whole input) never spills, so the
+/// run-former forms zero runs — the residual fast path stays intact under the
+/// production split.
+#[test]
+fn in_memory_input_forms_no_runs() {
+    let order = SortOrder::Coordinate;
+    let (header, records) = synthesize_sized_records(5_000, 0xA110_0C00, 40);
+
+    let sorter = RawExternalSorter::new(order)
+        .memory_limit(256 * 1024 * 1024) // above the whole input ⇒ no spill
+        .threads(2)
+        .output_compression(1)
+        .temp_compression(1);
+    let (out, runs) = drive_spill_split_pipeline(
+        sorter,
+        &header,
+        pack_batches(&records, 256),
+        4 * 1024 * 1024,
+        4,
+    )
+    .expect("spill-split pipeline drives to completion");
+
+    let expected = sort_via_legacy(order, &header, &records, 256 * 1024 * 1024, 1).expect("oracle");
+    assert_eq!(out, expected, "in-memory sort diverged from the oracle");
+    assert_eq!(runs, 0, "a budget-sized run never spills");
+}
+
 /// Block-parallel decompression completes out of order (workers decompress one
 /// file's blocks concurrently), yet the reassembled output must be byte-
 /// identical to the in-order (file-granularity) result. Property test over a
@@ -1956,4 +2151,101 @@ fn arena_front_chain_seals_multiple_runs_without_losing_records() {
     got.sort_unstable();
     want.sort_unstable();
     assert_eq!(got, want, "the sealed runs must carry every input record exactly once");
+}
+
+/// Drive the full BAM sort path — the benchmark path — end to end:
+/// `BgzfBlockSource → ReadBlocks → InflateToArena → FindBoundariesAndSort →
+/// SpillGather → SpillBlockCompress → SpillWrite → SortSpillDecompress →
+/// SortMerge`. Returns `(merged record bytes, run count)`. This is the head the
+/// 43 GB `1kg-wgs` benchmark actually uses (SAM/`SortBuffer` is the other head),
+/// so the run-former must coalesce here, not only on the `SortBuffer` path.
+fn drive_arena_split_pipeline(
+    blocks: Vec<crate::types::BgzfBlock>,
+    n_ref: u32,
+    memory_limit: usize,
+    output_byte_limit: u64,
+    threads: usize,
+) -> Result<(Vec<Vec<u8>>, usize)> {
+    use fgumi_sort::TmpDirAllocator;
+
+    let received: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let stats_slot: Arc<Mutex<Option<fgumi_sort::SortStats>>> = Arc::new(Mutex::new(None));
+
+    let dir = tempfile::TempDir::new()?;
+    let alloc =
+        TmpDirAllocator::with_probe(vec![dir.path().to_path_buf()], Box::new(|_| Ok(u64::MAX)), 0)?;
+    let temp_dirs = Arc::new(vec![dir]);
+    let codec = SpillCodec::Zstd;
+
+    let merge = SortMerge::<RecordBatchOutput>::with_target_batch_count(
+        SortOrder::Coordinate,
+        output_byte_limit,
+        256,
+    )
+    .with_stats_slot(Arc::clone(&stats_slot));
+
+    let builder = Pipeline::builder();
+    builder
+        .chain(BgzfBlockSource::new(blocks, output_byte_limit))
+        .chain(ReadBlocks::new(memory_limit, output_byte_limit))
+        .chain(InflateToArena::new(output_byte_limit))
+        .chain(FindBoundariesAndSort::new(CoordinateStrategy::new(n_ref), 1, output_byte_limit))
+        .chain(SpillGather::new(output_byte_limit))
+        .chain(SpillBlockCompress::new(codec, 3, output_byte_limit))
+        .chain(SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, output_byte_limit, temp_dirs))
+        .chain(SortSpillDecompress::new(output_byte_limit, SortDecompressTuning::default()))
+        .chain(merge)
+        .chain(VecSink { received: Arc::clone(&received), kind: StepKind::Serial })
+        .into_sink_marker();
+    let pipeline = builder.build()?;
+    pipeline.run(PipelineConfig { threads, ..Default::default() })?;
+
+    let collected = std::mem::take(&mut *received.lock());
+    let mut out = Vec::new();
+    for batch in collected {
+        for bytes in batch.iter_record_bytes() {
+            out.push(bytes.to_vec());
+        }
+    }
+    let runs = stats_slot.lock().take().expect("SortMerge published its stats").runs_written;
+    Ok((out, runs))
+}
+
+/// The benchmark case, in miniature: a pre-sorted BAM re-sorted through the full
+/// arena/BAM path under a small memory budget must coalesce every contiguous
+/// sealed run into ONE spill file, and stay byte-identical to the oracle. This is
+/// the `FindBoundariesAndSort` head (not `SortBuffer`), so it proves the
+/// run-former covers the path the 43 GB `1kg-wgs` sort exercises.
+#[test]
+fn presorted_bam_coalesces_to_one_run_through_the_arena_split() {
+    let (header, records) = synthesize_sized_records(8_000, 0xB00C_0001, 40);
+    let n_ref = u32::try_from(header.reference_sequences().len()).expect("n_ref fits u32");
+    let sorted = presorted_records(SortOrder::Coordinate, &header, &records);
+
+    // Small per-block payload ⇒ many BGZF blocks; small memory ⇒ ReadBlocks seals
+    // several contiguous runs the run-former must coalesce.
+    let blocks = bgzf_blocks_for(&sorted, n_ref, 4096);
+    let (out, runs) = drive_arena_split_pipeline(blocks, n_ref, 64 * 1024, 4 * 1024 * 1024, 4)
+        .expect("arena-split pipeline drives to completion");
+
+    let expected = sort_via_legacy(SortOrder::Coordinate, &header, &sorted, 256 * 1024 * 1024, 1)
+        .expect("oracle");
+    assert_eq!(out, expected, "arena/BAM-path coalesced output diverged from the oracle");
+    assert_eq!(runs, 1, "contiguous sealed runs must coalesce into a single run on the BAM path");
+}
+
+/// The same full BAM path on a shuffled input: partial coalescing, but the merged
+/// output must still match the oracle byte-for-byte.
+#[test]
+fn shuffled_bam_matches_the_oracle_through_the_arena_split() {
+    let (header, records) = synthesize_sized_records(8_000, 0xB00C_0002, 40);
+    let n_ref = u32::try_from(header.reference_sequences().len()).expect("n_ref fits u32");
+
+    let blocks = bgzf_blocks_for(&records, n_ref, 4096);
+    let (out, _runs) = drive_arena_split_pipeline(blocks, n_ref, 64 * 1024, 4 * 1024 * 1024, 4)
+        .expect("arena-split pipeline drives to completion");
+
+    let expected = sort_via_legacy(SortOrder::Coordinate, &header, &records, 256 * 1024 * 1024, 1)
+        .expect("oracle");
+    assert_eq!(out, expected, "arena/BAM-path shuffled output diverged from the oracle");
 }
