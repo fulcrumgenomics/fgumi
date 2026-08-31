@@ -236,6 +236,49 @@ pub type BamReaderAuto = noodles::bam::io::Reader<BgzfReaderEnum>;
 /// Type alias for a raw BAM reader that supports both single and multi-threaded BGZF.
 pub type RawBamReaderAuto = RawBamReader<BgzfReaderEnum>;
 
+/// Read-stream policy for a seekable BAM/SAM source: how many concurrent
+/// positional reads to issue per fill window.
+///
+/// Ports the semantics of fgumi v0.7.0's `fgumi sort --read-streams` flag. The
+/// mechanism (concurrent positional reads that raise the device's read queue
+/// depth) lives in the `scatter_reader` module; on a slow, deep-queue device
+/// (e.g. EBS gp3) issuing several reads at once is markedly faster than the
+/// single outstanding read a plain reader issues.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadStreams {
+    /// Measure the device's single-stream throughput once, then pick a stream
+    /// count from it. The default.
+    #[default]
+    Auto,
+    /// Exactly this many concurrent streams; `1` is the plain sequential /
+    /// async-prefetch reader (no scatter).
+    Fixed(usize),
+}
+
+impl std::fmt::Display for ReadStreams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Fixed(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+impl std::str::FromStr for ReadStreams {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        match text.parse::<usize>() {
+            Ok(0) => Err("--read-streams must be `auto` or at least 1".to_string()),
+            Ok(n) => Ok(Self::Fixed(n)),
+            Err(_) => Err(format!("expected `auto` or a positive number, got `{text}`")),
+        }
+    }
+}
+
 /// Options controlling how [`create_bam_reader_for_pipeline_with_opts`] opens
 /// and wraps its input file.
 #[derive(Debug, Clone, Copy)]
@@ -812,9 +855,41 @@ mod tests {
     use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
     use rstest::rstest;
     use std::num::NonZeroUsize;
+    use std::str::FromStr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::NamedTempFile;
+
+    #[rstest]
+    #[case::auto_lower("auto", ReadStreams::Auto)]
+    #[case::auto_mixed_case("Auto", ReadStreams::Auto)]
+    #[case::one("1", ReadStreams::Fixed(1))]
+    #[case::four("4", ReadStreams::Fixed(4))]
+    fn read_streams_from_str_accepts_valid(#[case] text: &str, #[case] expected: ReadStreams) {
+        assert_eq!(ReadStreams::from_str(text).expect("valid"), expected);
+    }
+
+    #[rstest]
+    #[case::zero("0")]
+    #[case::negative("-1")]
+    #[case::garbage("many")]
+    fn read_streams_from_str_rejects_invalid(#[case] text: &str) {
+        assert!(ReadStreams::from_str(text).is_err(), "'{text}' must be rejected");
+    }
+
+    #[rstest]
+    #[case::auto(ReadStreams::Auto, "auto")]
+    #[case::one(ReadStreams::Fixed(1), "1")]
+    #[case::four(ReadStreams::Fixed(4), "4")]
+    fn read_streams_display_round_trips(#[case] value: ReadStreams, #[case] expected: &str) {
+        assert_eq!(value.to_string(), expected);
+        assert_eq!(ReadStreams::from_str(expected).expect("round-trip"), value);
+    }
+
+    #[test]
+    fn read_streams_default_is_auto() {
+        assert_eq!(ReadStreams::default(), ReadStreams::Auto);
+    }
 
     fn create_test_header() -> Header {
         let mut builder = Header::builder();

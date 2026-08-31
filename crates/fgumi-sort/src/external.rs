@@ -2142,42 +2142,10 @@ fn probe_stats(buf: &impl ProbeableBuffer) -> BufferProbeStats {
 
 /// Read-stream policy for the Phase-1 input reader.
 ///
-/// R10-sync compatibility shim: `main`'s `--read-streams` CLI (#838/#846) is carried on the
-/// arena engine so `commands/sort.rs` compiles and the flag keeps parsing; the arena reader
-/// does not yet honor it. Forward-porting the measured multi-stream reader onto the arena
-/// engine is tracked as R7b.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ReadStreams {
-    /// Measure and grow. The default.
-    #[default]
-    Auto,
-    /// Exactly this many; `1` is the plain sequential reader.
-    Fixed(usize),
-}
-
-impl std::fmt::Display for ReadStreams {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Auto => f.write_str("auto"),
-            Self::Fixed(n) => write!(f, "{n}"),
-        }
-    }
-}
-
-impl std::str::FromStr for ReadStreams {
-    type Err = String;
-
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        if text.eq_ignore_ascii_case("auto") {
-            return Ok(Self::Auto);
-        }
-        match text.parse::<usize>() {
-            Ok(0) => Err("--read-streams must be `auto` or at least 1".to_string()),
-            Ok(n) => Ok(Self::Fixed(n)),
-            Err(_) => Err(format!("expected `auto` or a positive number, got `{text}`")),
-        }
-    }
-}
+/// The canonical definition now lives in `fgumi-bam-io` (next to the reader that
+/// honors it); re-exported here so the `fgumi_sort::ReadStreams` path and the
+/// `commands/sort.rs` CLI arg keep resolving unchanged.
+pub use fgumi_bam_io::ReadStreams;
 
 /// Raw-bytes external sorter for BAM files.
 ///

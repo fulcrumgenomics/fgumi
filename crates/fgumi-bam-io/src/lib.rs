@@ -37,7 +37,7 @@ pub use paths::{is_stdin_path, is_stdout_path};
 pub use progress::ProgressTracker;
 pub use reader::{
     BamReaderAuto, BgzfReaderEnum, ChainedReader, FgumiBgzfReader, PipelineReaderOpts,
-    RawBamReaderAuto, TeeReader, create_bam_reader, create_bam_reader_for_pipeline,
+    RawBamReaderAuto, ReadStreams, TeeReader, create_bam_reader, create_bam_reader_for_pipeline,
     create_bam_reader_for_pipeline_with_opts, create_bam_reader_with_opts, create_raw_bam_reader,
     create_raw_bam_reader_from_stream_with_opts, create_raw_bam_reader_with_opts, make_bgzf_reader,
     open_normalized_input, read_header_and_replay, read_prefix,
