@@ -115,6 +115,7 @@ fn bam_with_index_produces_inline_sidecar_not_reread() {
         scheduler: SchedulerOptions::default(),
         queue_memory: QueueMemoryOptions::default(),
         async_reader: false,
+        read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
         verify_crc: true,
         command_line: "fgumi sort --write-index".to_string(),
     };
@@ -344,6 +345,7 @@ fn bam_with_index_spec(
         scheduler: SchedulerOptions::default(),
         queue_memory: QueueMemoryOptions::default(),
         async_reader: false,
+        read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
         verify_crc: true,
         command_line: "fgumi sort --write-index".to_string(),
     }

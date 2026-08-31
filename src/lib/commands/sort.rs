@@ -409,26 +409,28 @@ pub struct Sort {
     #[arg(long = "write-index", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub write_index: bool,
 
-    /// Concurrent streams to read the input BAM and the merge's spill files
-    /// with: `auto`, or a fixed count.
+    /// Concurrent positional reads to fetch the input BAM with: `auto`, or a
+    /// fixed count (`1` = the plain sequential reader).
     ///
     /// One blocking read keeps only about one read-ahead window outstanding at
     /// the device, which on network-attached storage is far below what it can
     /// serve -- and no buffer size fixes it, because a bigger single request is
     /// not more concurrency. How much that matters depends entirely on the
-    /// storage: on EBS gp3 four streams took a whole-genome sort 28% faster,
-    /// while on a direct-attached instance-store SSD one stream is already faster than four
-    /// are on gp3 and adding more costs 1.8%.
+    /// storage: on EBS gp3 a 38 GB coordinate sort ran ~14% faster at four
+    /// streams, while on a direct-attached instance-store SSD one stream is
+    /// already faster than four are on gp3 and adding more costs 1.8%.
     ///
-    /// `auto` therefore measures instead of guessing. It starts at one stream
-    /// -- exactly the pre-existing behaviour -- and doubles only while fills
-    /// are occupying most of the read span, which is the condition under which
-    /// concurrency has something to buy. It lands on four for gp3 and stays at
-    /// one for `NVMe` without being told which is which.
+    /// `auto` therefore measures instead of guessing. It reads the first several
+    /// fills at a single stream -- exactly the pre-existing behaviour -- then
+    /// commits once to a count of `ceil(target-throughput / measured)`, capped at
+    /// 8. It lands on four for gp3 and stays at one for `NVMe` without being told
+    /// which is which, and does not revisit the choice afterwards.
     ///
-    /// The streams are existing pool workers, not new threads, so this never
-    /// exceeds `--threads`. Ignored for stdin and other non-seekable inputs,
-    /// where positional reads do not exist.
+    /// Each active stream is served by a scoped OS thread spawned per fill window,
+    /// bounded by the chosen count (at most 8) -- this is independent of
+    /// `--threads`. Applies to the input BAM only, not the merge's spill files.
+    /// Ignored for stdin and other non-seekable inputs, where positional reads do
+    /// not exist.
     #[arg(long = "read-streams", default_value_t = fgumi_sort::ReadStreams::Auto)]
     pub read_streams: fgumi_sort::ReadStreams,
 
@@ -588,6 +590,10 @@ impl Sort {
             // budget scales by `--threads`; the sorter's by max(threads, sort_threads).
             queue_memory: self.queue_memory_options(),
             async_reader: false,
+            // Thread the sort command's --read-streams into the chain's BAM
+            // source: Auto probes the device and picks a concurrent-read count,
+            // Fixed(n) pins it, Fixed(1) is the plain sequential reader.
+            read_streams: self.read_streams,
             // The owned engine always verified CRC (incl. stdin); keep parity -- a future
             // PR can add --no-check-crc if opt-out is wanted. `effective_check_crc()` would
             // skip verification for stdin input (the file-vs-stdin default other commands
@@ -958,18 +964,8 @@ impl Sort {
             info!("Temp directories: {joined}");
         }
 
-        // The cutover chain does not yet thread the owned engine's `--read-streams`
-        // / `--sort-stats` knobs. Warn (not info) on a non-default value so the
-        // ignored behavior stays visible under a default `warn` log filter rather
-        // than being silently dropped. Restoring `--read-streams` end-to-end is
-        // tracked as follow-up R7b.
-        if !matches!(self.read_streams, fgumi_sort::ReadStreams::Auto) {
-            warn!(
-                "--read-streams={} is ignored by the sort chain (not yet threaded); \
-                 using the default read strategy",
-                self.read_streams
-            );
-        }
+        // `--read-streams` is now threaded end-to-end (into the chain's BAM
+        // source below); no warn shim. `--sort-stats` is still unthreaded.
         if self.sort_stats {
             warn!("--sort-stats is ignored by the sort chain (not yet threaded)");
         }
@@ -1379,6 +1375,9 @@ mod tests {
         assert_eq!(spec.threading.threads, Some(sort.threads));
         assert!(matches!(spec.source, SourceSpec::Bam(_)));
         assert!(spec.verify_crc);
+        // --read-streams reaches the chain's BAM source (defaulted to Auto here),
+        // proving the field is wired even without an explicit flag.
+        assert_eq!(spec.read_streams, sort.read_streams);
         match (write_index, &spec.sink) {
             (true, SinkSpec::BamWithIndex(_)) | (false, SinkSpec::Bam(_)) => {}
             (wi, other) => panic!("write_index={wi} produced the wrong sink: {other:?}"),

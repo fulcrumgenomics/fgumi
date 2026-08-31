@@ -4,6 +4,7 @@ use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
 };
 use crate::pipeline::chains::{SinkSpec, SourceSpec, Stage, StageOptionsBag};
+use fgumi_bam_io::ReadStreams;
 
 /// Declarative chain specification. Both standalone commands and
 /// `runall` construct one of these and pass it to
@@ -29,6 +30,12 @@ pub struct ChainSpec {
     /// When true, the BAM/SAM source is opened with a userspace async
     /// prefetch reader (`--async-reader`), overlapping disk I/O with compute.
     pub async_reader: bool,
+    /// Concurrent positional-read policy for a seekable file source. `Fixed(1)`
+    /// (the default every command but `sort` uses) is the plain
+    /// sequential/async reader; `sort` sets this from its `--read-streams` flag
+    /// to raise the device read queue depth (see
+    /// [`fgumi_bam_io::scatter_reader`]).
+    pub read_streams: ReadStreams,
     /// Whether the BAM source's BGZF decode verifies each block's CRC32. Set
     /// from the command's `--check-crc`/`--no-check-crc` policy (via
     /// [`crate::commands::common::BamIoOptions::effective_check_crc`]) so the
@@ -78,6 +85,9 @@ impl ChainSpec {
             scheduler: ctx.scheduler.clone(),
             queue_memory: ctx.queue_memory.clone(),
             async_reader: ctx.io.async_reader,
+            // Non-sort single-stage commands do not expose a read-stream knob;
+            // keep the plain sequential/async reader. Only sort sets this.
+            read_streams: ReadStreams::Fixed(1),
             verify_crc: ctx.io.effective_check_crc(),
             command_line: ctx.command_line.to_string(),
         }

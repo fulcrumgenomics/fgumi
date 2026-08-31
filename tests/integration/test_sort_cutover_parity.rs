@@ -1134,14 +1134,13 @@ fn cutover_threads_zero_is_rejected() {
     }
 }
 
-/// `--sort-stats` and `--read-streams` are inert on the chain: neither field
-/// even exists on the chain-facing `SortOptions` struct (`to_sort_options`
-/// drops both), so nothing downstream reads them. Restoring
-/// `--read-streams`'s real behavior is tracked as R7b. Passing them must be
-/// accept-but-inert -- not a hard error -- and the sort must still produce
-/// correct, coordinate-sorted output.
+/// `--sort-stats` is still inert on the chain (nothing downstream reads it), so
+/// it must be accept-but-inert with a visible notice. `--read-streams`, by
+/// contrast, is now threaded into the chain's BAM source (R7b), so it must NOT
+/// be reported as ignored. Either way the sort must still produce correct,
+/// coordinate-sorted output.
 #[test]
-fn cutover_inert_flags_do_not_error() {
+fn cutover_sort_stats_inert_read_streams_active() {
     let dir = TempDir::new().expect("create temp dir");
     let input_bam = dir.path().join("in.bam");
     let records = unsorted_records(200);
@@ -1173,11 +1172,11 @@ fn cutover_inert_flags_do_not_error() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "--sort-stats/--read-streams are accept-but-inert on the chain and must not error:\n{stderr}"
+        "--sort-stats (inert) and --read-streams (active) must not error:\n{stderr}"
     );
     assert!(
-        stderr.contains("--read-streams=4 is ignored by the sort chain"),
-        "the ignored `--read-streams` notice must be visible on stderr; stderr:\n{stderr}"
+        !stderr.contains("--read-streams=4 is ignored"),
+        "`--read-streams` is threaded now and must not be reported as ignored; stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("--sort-stats is ignored by the sort chain"),
@@ -1199,6 +1198,55 @@ fn cutover_inert_flags_do_not_error() {
         keys.windows(2).all(|w| w[0] <= w[1]),
         "output is not coordinate-sorted with --sort-stats/--read-streams set: {keys:?}"
     );
+}
+
+/// The `--read-streams` count changes only *how* the input is read (disk queue
+/// depth), never *what* is read. Sorted output must be byte-identical across
+/// `1`, `4`, and `auto` — the load-bearing correctness gate for the concurrent
+/// scatter reader on the real sort command path. `-m 32K` forces the *sort* to
+/// spill through the external-merge path (it does not resize the reader's fill
+/// window, which is fixed at 4 MiB), so this exercises `--read-streams` end to
+/// end through spill+merge. The scatter reader's own multi-fill / multi-slice
+/// behaviour is covered directly by the unit proptests in `scatter_reader`.
+#[rstest]
+#[case::coordinate("coordinate")]
+#[case::queryname_natural("queryname-natural")]
+#[case::template_coordinate("template-coordinate")]
+fn cutover_read_streams_produce_identical_output(#[case] order: &str) {
+    let flag = order_flag(order);
+    let dir = TempDir::new().expect("create temp dir");
+    let input_bam = dir.path().join("in.bam");
+    let records = unsorted_records(4000);
+    write_bam(&input_bam, &create_minimal_header("chr1", 100_000_000), &records);
+
+    let current_bin = Path::new(env!("CARGO_BIN_EXE_fgumi"));
+    let run = |streams: &str| -> Vec<u8> {
+        let out = dir.path().join(format!("out_{order}_{streams}.bam"));
+        let status = Command::new(current_bin)
+            .args([
+                OsStr::new("sort"),
+                OsStr::new("-i"),
+                input_bam.as_os_str(),
+                OsStr::new("-o"),
+                out.as_os_str(),
+                OsStr::new("--order"),
+                OsStr::new(flag),
+                OsStr::new("-m"),
+                OsStr::new("32K"),
+                OsStr::new("--read-streams"),
+                OsStr::new(streams),
+            ])
+            .status()
+            .expect("spawn fgumi sort");
+        assert!(status.success(), "sort --read-streams {streams} --order {flag} failed");
+        decompressed_records_without_pg(&out)
+    };
+
+    let one = run("1");
+    let four = run("4");
+    let auto = run("auto");
+    assert_eq!(one, four, "--read-streams 1 vs 4 must be byte-identical ({order})");
+    assert_eq!(one, auto, "--read-streams 1 vs auto must be byte-identical ({order})");
 }
 
 /// The owned engine always verified BGZF CRC32, including on stdin input
