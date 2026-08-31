@@ -30,6 +30,7 @@ use crate::inline::{
     TemplateRecordRef, TertKey32, parallel_radix_sort_template_refs, radix_sort_template_refs,
 };
 use crate::ref_sort::PARALLEL_SORT_THRESHOLD;
+use crate::run_bound::RunBound;
 use crate::{SpillCodec, frame_keyed_record_into, write_sorted_chunk_inmem};
 use fgumi_raw_bam::{RawRecordView, SamTag};
 
@@ -100,6 +101,36 @@ impl TemplateMemChunk {
     #[must_use]
     pub fn record_bytes(&self, i: usize) -> &[u8] {
         with_template_chunk!(self, c => c.record_bytes(i))
+    }
+
+    /// The chunk's minimum sort key (`key_at(0)`) as an owned [`RunBound`], or
+    /// `None` if the chunk is empty. The variant matches this chunk's narrowed
+    /// template lane. Records are pre-sorted, so this is `O(1)`.
+    #[must_use]
+    pub fn min_bound(&self) -> Option<RunBound> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(match self {
+            TemplateMemChunk::K24(c) => RunBound::TemplateK24(*c.key_at(0)),
+            TemplateMemChunk::Cb32(c) => RunBound::TemplateCb32(*c.key_at(0)),
+            TemplateMemChunk::Tert32(c) => RunBound::TemplateTert32(*c.key_at(0)),
+            TemplateMemChunk::K40(c) => RunBound::TemplateK40(*c.key_at(0)),
+        })
+    }
+
+    /// The chunk's maximum sort key (`key_at(len - 1)`) as an owned [`RunBound`],
+    /// or `None` if the chunk is empty. The variant matches this chunk's
+    /// narrowed template lane. Records are pre-sorted, so this is `O(1)`.
+    #[must_use]
+    pub fn max_bound(&self) -> Option<RunBound> {
+        let last = self.len().checked_sub(1)?;
+        Some(match self {
+            TemplateMemChunk::K24(c) => RunBound::TemplateK24(*c.key_at(last)),
+            TemplateMemChunk::Cb32(c) => RunBound::TemplateCb32(*c.key_at(last)),
+            TemplateMemChunk::Tert32(c) => RunBound::TemplateTert32(*c.key_at(last)),
+            TemplateMemChunk::K40(c) => RunBound::TemplateK40(*c.key_at(last)),
+        })
     }
 
     /// Frame the `i`th record into `out` in the spill layout
@@ -451,5 +482,51 @@ impl TemplateArenaAccumulator {
             // Share the holder, not a new one: see the field's doc.
             sort_pool: Arc::clone(&self.sort_pool),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `TemplateKey24` with the given `primary` lane (the leading comparison
+    /// field); other lanes zeroed. Enough to order bounds in these tests.
+    fn k24(primary: u64) -> TemplateKey24 {
+        TemplateKey24 { primary, secondary: 0, name_hash_upper: 0 }
+    }
+
+    /// Build a K24 lane chunk from pre-sorted `(primary, body)` records (the seal
+    /// path always produces sorted chunks; `from_owned_records` preserves order).
+    fn k24_chunk(records: Vec<(u64, Vec<u8>)>) -> TemplateMemChunk {
+        TemplateMemChunk::K24(InMemoryChunk::from_owned_records(
+            records.into_iter().map(|(p, b)| (k24(p), b)).collect(),
+        ))
+    }
+
+    #[test]
+    fn empty_template_chunk_has_no_bounds() {
+        let chunk = k24_chunk(Vec::new());
+        assert_eq!(chunk.min_bound(), None);
+        assert_eq!(chunk.max_bound(), None);
+    }
+
+    #[test]
+    fn template_bounds_are_first_and_last_keys() {
+        let chunk = k24_chunk(vec![(10, vec![0xAA; 4]), (20, vec![0xBB; 4]), (30, vec![0xCC; 4])]);
+        assert_eq!(chunk.min_bound(), Some(RunBound::TemplateK24(k24(10))));
+        assert_eq!(chunk.max_bound(), Some(RunBound::TemplateK24(k24(30))));
+    }
+
+    #[test]
+    fn contiguous_template_chunks_extend_overlapping_do_not() {
+        let first = k24_chunk(vec![(10, vec![1; 4]), (20, vec![1; 4])]);
+        let contiguous = k24_chunk(vec![(20, vec![1; 4]), (30, vec![1; 4])]);
+        let overlapping = k24_chunk(vec![(15, vec![1; 4]), (25, vec![1; 4])]);
+
+        let open_max = first.max_bound().unwrap();
+        // second chunk's min (20) >= open run max (20) → extend (content tie).
+        assert!(open_max.precedes_or_equal(&contiguous.min_bound().unwrap()));
+        // overlapping chunk's min (15) < open run max (20) → new run.
+        assert!(!open_max.precedes_or_equal(&overlapping.min_bound().unwrap()));
     }
 }

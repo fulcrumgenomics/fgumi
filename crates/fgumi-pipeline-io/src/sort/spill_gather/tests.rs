@@ -18,6 +18,26 @@ fn coord_chunk(payloads: Vec<Vec<u8>>) -> MemoryChunkErased {
     MemoryChunkErased::Coordinate(InMemoryChunk::from_owned_records(recs))
 }
 
+/// Build a coordinate chunk with explicit (already-sorted) `sort_key`s and dummy
+/// record bodies, so the run-former's min/max bounds are controllable. `keys`
+/// must be non-decreasing (chunks are pre-sorted at seal).
+fn coord_chunk_keyed(keys: &[u64]) -> MemoryChunkErased {
+    let recs = keys.iter().map(|&k| (RawCoordinateKey { sort_key: k }, vec![0u8; 8])).collect();
+    MemoryChunkErased::Coordinate(InMemoryChunk::from_owned_records(recs))
+}
+
+/// The `(file_id, is_last_in_file)` of every `Block` event, in order. Panics if a
+/// non-`Block` event is present, so callers separate spills from passthroughs.
+fn block_files(events: &[SpillBlockEvent]) -> Vec<(u32, bool)> {
+    events
+        .iter()
+        .map(|e| match e {
+            SpillBlockEvent::Block { file_id, is_last_in_file, .. } => (*file_id, *is_last_in_file),
+            _ => panic!("expected only Block events (a non-Block event was present)"),
+        })
+        .collect()
+}
+
 /// Concatenate the framed-record bytes of all blocks (drops the per-block
 /// boundaries) — the decompressed-stream-equivalent the readers see.
 fn concat(blocks: &[Vec<u8>]) -> Vec<u8> {
@@ -29,6 +49,10 @@ fn concat(blocks: &[Vec<u8>]) -> Vec<u8> {
 /// blocks) before staging the next — and return every emitted event in order.
 /// This preserves the dense-ordinal invariant (a chunk is fully framed, and its
 /// block ordinals minted, before the next event is staged).
+///
+/// After the last event, it closes the final run by flushing any withheld block
+/// with `is_last_in_file = true` — mirroring `try_run`'s drain path (in
+/// production `AllAnnounced` closes it; a `drive` without one relies on this).
 fn drive(step: &mut SpillGather, events: Vec<SortChunkEvent>) -> Vec<SpillBlockEvent> {
     let mut out = Vec::new();
     for event in events {
@@ -44,6 +68,11 @@ fn drive(step: &mut SpillGather, events: Vec<SortChunkEvent>) -> Vec<SpillBlockE
         while let Some(ev) = step.pending.pop_front() {
             out.push(ev);
         }
+    }
+    // Close the final run (no-op if a Residual/AllAnnounced already flushed it).
+    step.flush_held_block(true);
+    while let Some(ev) = step.pending.pop_front() {
+        out.push(ev);
     }
     out
 }
@@ -266,6 +295,327 @@ fn an_empty_spill_chunk_is_skipped_rather_than_opening_a_file() {
     assert!(step.active.is_none(), "an empty chunk must not become the active spill");
     assert!(step.pending.is_empty(), "and must emit nothing");
     assert_eq!(step.next_ordinal, 0, "and must not consume an ordinal");
+}
+
+// ── Run extension (spill coalescing) ─────────────────────────────────────────
+
+/// The `slot_count` an `AllAnnounced` event carries (its rewritten run count).
+/// Panics unless the last event is an `AllAnnounced`.
+fn announced_slot_count(events: &[SpillBlockEvent]) -> u32 {
+    match events.last().expect("at least one event") {
+        SpillBlockEvent::AllAnnounced { slot_count, .. } => *slot_count,
+        _ => panic!("last event must be AllAnnounced"),
+    }
+}
+
+/// Split the emitted stream into its `Block` events and the trailing
+/// `AllAnnounced` (asserting there are no other event kinds).
+fn blocks_and_announced(events: &[SpillBlockEvent]) -> (Vec<(u32, bool)>, u32) {
+    let (last, blocks) = events.split_last().expect("at least an AllAnnounced");
+    let slot_count = match last {
+        SpillBlockEvent::AllAnnounced { slot_count, .. } => *slot_count,
+        _ => panic!("last event must be AllAnnounced"),
+    };
+    (block_files(blocks), slot_count)
+}
+
+#[test]
+fn contiguous_chunks_coalesce_into_one_run() {
+    // Two chunks, the second starting strictly after the first ends → one run:
+    // both blocks share file_id 0, and only the final block closes the file.
+    let mut step = SpillGather::new(1 << 20);
+    let events = drive(
+        &mut step,
+        vec![
+            SortChunkEvent::Spill {
+                seq: 0,
+                chunk: coord_chunk_keyed(&[10, 20]),
+                records_ingested_so_far: 2,
+            },
+            SortChunkEvent::Spill {
+                seq: 1,
+                chunk: coord_chunk_keyed(&[30, 40]),
+                records_ingested_so_far: 4,
+            },
+            SortChunkEvent::AllAnnounced { slot_count: 2, memory_chunk_count: 0, total_records: 4 },
+        ],
+    );
+
+    let (blocks, slot_count) = blocks_and_announced(&events);
+    assert_eq!(blocks, vec![(0, false), (0, true)], "both blocks in one file, last closes it");
+    assert_eq!(slot_count, 1, "slot_count is the RUN count, not the chunk count");
+    assert_eq!(step.runs_written, 1);
+    // Ordinals stay dense across the withheld-block flush.
+    let ords: Vec<u64> = events.iter().map(SpillBlockEvent::ordinal).collect();
+    assert_eq!(ords, vec![0, 1, 2]);
+}
+
+#[test]
+fn exact_boundary_tie_extends_the_run_for_content_keys() {
+    // Coordinate keys are content-based: an exact boundary tie (20 == 20) still
+    // satisfies precedes-or-equal, so the chunks coalesce.
+    let mut step = SpillGather::new(1 << 20);
+    let events = drive(
+        &mut step,
+        vec![
+            SortChunkEvent::Spill {
+                seq: 0,
+                chunk: coord_chunk_keyed(&[10, 20]),
+                records_ingested_so_far: 2,
+            },
+            SortChunkEvent::Spill {
+                seq: 1,
+                chunk: coord_chunk_keyed(&[20, 30]),
+                records_ingested_so_far: 4,
+            },
+            SortChunkEvent::AllAnnounced { slot_count: 2, memory_chunk_count: 0, total_records: 4 },
+        ],
+    );
+    let (blocks, slot_count) = blocks_and_announced(&events);
+    assert_eq!(blocks, vec![(0, false), (0, true)]);
+    assert_eq!(slot_count, 1);
+}
+
+#[test]
+fn non_contiguous_chunk_starts_a_new_run() {
+    // The second chunk's min (20) falls inside the first run (…40), so it cannot
+    // extend it: two runs, each a self-contained file.
+    let mut step = SpillGather::new(1 << 20);
+    let events = drive(
+        &mut step,
+        vec![
+            SortChunkEvent::Spill {
+                seq: 0,
+                chunk: coord_chunk_keyed(&[10, 40]),
+                records_ingested_so_far: 2,
+            },
+            SortChunkEvent::Spill {
+                seq: 1,
+                chunk: coord_chunk_keyed(&[20, 30]),
+                records_ingested_so_far: 4,
+            },
+            SortChunkEvent::AllAnnounced { slot_count: 2, memory_chunk_count: 0, total_records: 4 },
+        ],
+    );
+    let (blocks, slot_count) = blocks_and_announced(&events);
+    assert_eq!(blocks, vec![(0, true), (1, true)], "each chunk closes its own file");
+    assert_eq!(slot_count, 2);
+    assert_eq!(step.runs_written, 2);
+}
+
+#[test]
+fn many_presorted_chunks_collapse_to_a_single_run() {
+    // The already-sorted-input case: every chunk is contiguous, so N chunks
+    // become one run — the whole point of run extension.
+    let mut step = SpillGather::new(1 << 20);
+    let events = drive(
+        &mut step,
+        vec![
+            SortChunkEvent::Spill {
+                seq: 0,
+                chunk: coord_chunk_keyed(&[0, 1]),
+                records_ingested_so_far: 2,
+            },
+            SortChunkEvent::Spill {
+                seq: 1,
+                chunk: coord_chunk_keyed(&[2, 3]),
+                records_ingested_so_far: 4,
+            },
+            SortChunkEvent::Spill {
+                seq: 2,
+                chunk: coord_chunk_keyed(&[4, 5]),
+                records_ingested_so_far: 6,
+            },
+            SortChunkEvent::AllAnnounced { slot_count: 3, memory_chunk_count: 0, total_records: 6 },
+        ],
+    );
+    let (blocks, slot_count) = blocks_and_announced(&events);
+    assert_eq!(blocks, vec![(0, false), (0, false), (0, true)], "one file, only the last closes");
+    assert_eq!(slot_count, 1);
+}
+
+#[test]
+fn an_empty_chunk_does_not_close_the_open_run() {
+    // An empty spill is a pure no-op — it neither closes the run nor breaks the
+    // contiguity of the chunks on either side of it.
+    let mut step = SpillGather::new(1 << 20);
+    let events = drive(
+        &mut step,
+        vec![
+            SortChunkEvent::Spill {
+                seq: 0,
+                chunk: coord_chunk_keyed(&[10, 20]),
+                records_ingested_so_far: 2,
+            },
+            SortChunkEvent::Spill {
+                seq: 1,
+                chunk: coord_chunk_keyed(&[]),
+                records_ingested_so_far: 2,
+            },
+            SortChunkEvent::Spill {
+                seq: 2,
+                chunk: coord_chunk_keyed(&[30, 40]),
+                records_ingested_so_far: 4,
+            },
+            SortChunkEvent::AllAnnounced { slot_count: 3, memory_chunk_count: 0, total_records: 4 },
+        ],
+    );
+    let (blocks, slot_count) = blocks_and_announced(&events);
+    assert_eq!(blocks, vec![(0, false), (0, true)], "the empty chunk contributes nothing");
+    assert_eq!(slot_count, 1, "still one run — the empty chunk did not split it");
+}
+
+#[test]
+fn a_residual_closes_the_open_run_before_a_later_spill() {
+    // A residual (in-memory tail) ends the spill run; a spill after it starts a
+    // fresh run even if its keys would otherwise have been contiguous.
+    let mut step = SpillGather::new(1 << 20);
+    let events = drive(
+        &mut step,
+        vec![
+            SortChunkEvent::Spill {
+                seq: 0,
+                chunk: coord_chunk_keyed(&[10, 20]),
+                records_ingested_so_far: 2,
+            },
+            SortChunkEvent::Residual {
+                chunk: coord_chunk_keyed(&[25]),
+                records_ingested_so_far: 3,
+            },
+            SortChunkEvent::Spill {
+                seq: 2,
+                chunk: coord_chunk_keyed(&[30, 40]),
+                records_ingested_so_far: 5,
+            },
+            SortChunkEvent::AllAnnounced { slot_count: 2, memory_chunk_count: 1, total_records: 5 },
+        ],
+    );
+    // Stream: Block(file0,last), Residual, Block(file2,last), AllAnnounced.
+    assert!(matches!(events[0], SpillBlockEvent::Block { file_id: 0, is_last_in_file: true, .. }));
+    assert!(matches!(events[1], SpillBlockEvent::Residual { .. }));
+    assert!(matches!(events[2], SpillBlockEvent::Block { file_id: 2, is_last_in_file: true, .. }));
+    assert_eq!(announced_slot_count(&events), 2, "two runs, split by the residual");
+    let ords: Vec<u64> = events.iter().map(SpillBlockEvent::ordinal).collect();
+    assert_eq!(ords, vec![0, 1, 2, 3], "ordinals dense across the residual boundary");
+}
+
+#[test]
+fn run_formation_summary_matches_the_owned_engine_wording() {
+    // Three contiguous chunks → one run, so 2 of the 3 chunks extended it. The
+    // line must read exactly like fgumi_sort::external::log_run_formation.
+    let mut step = SpillGather::new(1 << 20);
+    drive(
+        &mut step,
+        vec![
+            SortChunkEvent::Spill {
+                seq: 0,
+                chunk: coord_chunk_keyed(&[0, 1]),
+                records_ingested_so_far: 2,
+            },
+            SortChunkEvent::Spill {
+                seq: 1,
+                chunk: coord_chunk_keyed(&[2, 3]),
+                records_ingested_so_far: 4,
+            },
+            SortChunkEvent::Spill {
+                seq: 2,
+                chunk: coord_chunk_keyed(&[4, 5]),
+                records_ingested_so_far: 6,
+            },
+            SortChunkEvent::AllAnnounced { slot_count: 3, memory_chunk_count: 0, total_records: 6 },
+        ],
+    );
+    assert_eq!(step.chunks_spilled, 3);
+    assert_eq!(step.runs_written, 1);
+    assert_eq!(
+        step.run_formation_summary().as_deref(),
+        Some("Spill runs: 1 from 3 chunks (2 extended an existing run)"),
+    );
+}
+
+#[test]
+fn run_formation_summary_counts_each_run_when_nothing_coalesces() {
+    // Reverse-ordered chunks never extend: 3 chunks → 3 runs, 0 extended.
+    let mut step = SpillGather::new(1 << 20);
+    drive(
+        &mut step,
+        vec![
+            SortChunkEvent::Spill {
+                seq: 0,
+                chunk: coord_chunk_keyed(&[40, 50]),
+                records_ingested_so_far: 2,
+            },
+            SortChunkEvent::Spill {
+                seq: 1,
+                chunk: coord_chunk_keyed(&[20, 30]),
+                records_ingested_so_far: 4,
+            },
+            SortChunkEvent::Spill {
+                seq: 2,
+                chunk: coord_chunk_keyed(&[0, 10]),
+                records_ingested_so_far: 6,
+            },
+            SortChunkEvent::AllAnnounced { slot_count: 3, memory_chunk_count: 0, total_records: 6 },
+        ],
+    );
+    assert_eq!(step.chunks_spilled, 3);
+    assert_eq!(step.runs_written, 3);
+    assert_eq!(
+        step.run_formation_summary().as_deref(),
+        Some("Spill runs: 3 from 3 chunks (0 extended an existing run)"),
+    );
+}
+
+#[test]
+fn run_formation_summary_is_none_when_nothing_spilled() {
+    // A residual-only sort (no spills) reports no run-formation line, matching
+    // the owned engine (which only logs when it spilled).
+    let mut step = SpillGather::new(1 << 20);
+    drive(
+        &mut step,
+        vec![
+            SortChunkEvent::Residual { chunk: coord_chunk_keyed(&[1]), records_ingested_so_far: 1 },
+            SortChunkEvent::AllAnnounced { slot_count: 0, memory_chunk_count: 1, total_records: 1 },
+        ],
+    );
+    assert_eq!(step.chunks_spilled, 0);
+    assert_eq!(step.run_formation_summary(), None);
+}
+
+#[test]
+fn the_run_final_block_is_withheld_until_the_run_is_closed() {
+    // Frame a single spill chunk with no terminating event yet: its final block
+    // is withheld (the run is still open), which is exactly the state the drain
+    // guard fails closed on — `held_last_block.is_held()` at drain.
+    let mut step = SpillGather::new(1 << 20);
+    step.stage_event(SortChunkEvent::Spill {
+        seq: 0,
+        chunk: coord_chunk_keyed(&[10, 20]),
+        records_ingested_so_far: 2,
+    });
+    step.produce_blocks().unwrap();
+    assert!(step.active.is_none(), "the one-block chunk is fully framed");
+    assert!(step.pending.is_empty(), "the sole (run-final) block is withheld, not emitted");
+    assert!(
+        step.held_last_block.is_held(),
+        "a run-final block is withheld until close — a drain here would trip the guard"
+    );
+
+    // Closing the run (AllAnnounced) flushes the withheld block with is_last=true
+    // and leaves nothing held, so the drain guard is clear.
+    step.stage_event(SortChunkEvent::AllAnnounced {
+        slot_count: 1,
+        memory_chunk_count: 0,
+        total_records: 2,
+    });
+    assert!(!step.held_last_block.is_held(), "closing the run flushes the withheld block");
+    assert!(
+        matches!(
+            step.pending.front(),
+            Some(SpillBlockEvent::Block { is_last_in_file: true, file_id: 0, .. })
+        ),
+        "the flushed block closes its file"
+    );
 }
 
 #[test]

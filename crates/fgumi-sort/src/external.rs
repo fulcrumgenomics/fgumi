@@ -2068,10 +2068,7 @@ struct RunFormer<K> {
 /// have nothing to do with how ordered the input was -- which is the one thing
 /// this line exists to report.
 fn log_run_formation(chunks_spilled: usize, runs: usize) {
-    info!(
-        "Spill runs: {runs} from {chunks_spilled} chunks ({} extended an existing run)",
-        chunks_spilled.saturating_sub(runs)
-    );
+    info!("{}", crate::run_bound::format_run_formation(runs, chunks_spilled));
 }
 
 /// The smallest and largest keys in an already-sorted slice.

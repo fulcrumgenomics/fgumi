@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use fgumi_sort::{
-    InMemoryChunk, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, SortMergeSlot,
+    InMemoryChunk, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RunBound, SortMergeSlot,
     TemplateMemChunk,
 };
 
@@ -79,6 +79,44 @@ impl MemoryChunkErased {
             Self::QuerynameLex(v) => v.record_bytes(i),
             Self::QuerynameNatural(v) => v.record_bytes(i),
             Self::TemplateCoordinate(v) => v.record_bytes(i),
+        }
+    }
+
+    /// The chunk's minimum sort key (`key_at(0)`) as an owned [`RunBound`], or
+    /// `None` if the chunk is empty. Records are pre-sorted at seal, so this is
+    /// `O(1)`. Used by the arena spill run-former to decide whether this chunk
+    /// extends the open run.
+    #[must_use]
+    pub fn min_bound(&self) -> Option<RunBound> {
+        match self {
+            Self::Coordinate(v) => (!v.is_empty()).then(|| RunBound::Coordinate(*v.key_at(0))),
+            Self::QuerynameLex(v) => {
+                (!v.is_empty()).then(|| RunBound::QuerynameLex(v.key_at(0).clone()))
+            }
+            Self::QuerynameNatural(v) => {
+                (!v.is_empty()).then(|| RunBound::QuerynameNatural(v.key_at(0).clone()))
+            }
+            Self::TemplateCoordinate(v) => v.min_bound(),
+        }
+    }
+
+    /// The chunk's maximum sort key (`key_at(len - 1)`) as an owned [`RunBound`],
+    /// or `None` if the chunk is empty. Records are pre-sorted at seal, so this
+    /// is `O(1)`. Used by the arena spill run-former to advance the open run's
+    /// upper bound after appending this chunk.
+    #[must_use]
+    pub fn max_bound(&self) -> Option<RunBound> {
+        match self {
+            Self::Coordinate(v) => {
+                v.len().checked_sub(1).map(|i| RunBound::Coordinate(*v.key_at(i)))
+            }
+            Self::QuerynameLex(v) => {
+                v.len().checked_sub(1).map(|i| RunBound::QuerynameLex(v.key_at(i).clone()))
+            }
+            Self::QuerynameNatural(v) => {
+                v.len().checked_sub(1).map(|i| RunBound::QuerynameNatural(v.key_at(i).clone()))
+            }
+            Self::TemplateCoordinate(v) => v.max_bound(),
         }
     }
 
@@ -291,6 +329,51 @@ mod tests {
         InMemoryChunk::from_owned_records(
             payloads.into_iter().map(|b| (RawCoordinateKey::default(), b)).collect(),
         )
+    }
+
+    /// Build a coordinate chunk whose keys carry the given packed `sort_key`s,
+    /// in the supplied (already-sorted) order, with dummy record bodies.
+    fn coord_keyed(keys: Vec<u64>) -> InMemoryChunk<RawCoordinateKey> {
+        InMemoryChunk::from_owned_records(
+            keys.into_iter().map(|k| (RawCoordinateKey { sort_key: k }, vec![0u8; 4])).collect(),
+        )
+    }
+
+    #[test]
+    fn coordinate_chunk_bounds_are_first_and_last_keys() {
+        let chunk = MemoryChunkErased::Coordinate(coord_keyed(vec![100, 200, 300]));
+        assert_eq!(
+            chunk.min_bound(),
+            Some(RunBound::Coordinate(RawCoordinateKey { sort_key: 100 }))
+        );
+        assert_eq!(
+            chunk.max_bound(),
+            Some(RunBound::Coordinate(RawCoordinateKey { sort_key: 300 }))
+        );
+    }
+
+    #[test]
+    fn empty_chunk_has_no_bounds() {
+        let chunk = MemoryChunkErased::Coordinate(coord(Vec::new()));
+        assert_eq!(chunk.min_bound(), None);
+        assert_eq!(chunk.max_bound(), None);
+    }
+
+    #[test]
+    fn queryname_chunk_bounds_clone_the_owned_keys() {
+        let chunk = MemoryChunkErased::QuerynameLex(InMemoryChunk::from_owned_records(vec![
+            (RawQuerynameLexKey::new(b"aaa".to_vec(), 0), vec![0u8; 4]),
+            (RawQuerynameLexKey::new(b"zzz".to_vec(), 0), vec![0u8; 4]),
+        ]));
+        let min = chunk.min_bound().unwrap();
+        let max = chunk.max_bound().unwrap();
+        assert_eq!(min, RunBound::QuerynameLex(RawQuerynameLexKey::new(b"aaa".to_vec(), 0)));
+        assert_eq!(max, RunBound::QuerynameLex(RawQuerynameLexKey::new(b"zzz".to_vec(), 0)));
+        // A contiguous next chunk starting at "zzz" or later extends the run.
+        assert!(max.precedes_or_equal(&RunBound::QuerynameLex(RawQuerynameLexKey::new(
+            b"zzz".to_vec(),
+            0
+        ))));
     }
 
     #[test]

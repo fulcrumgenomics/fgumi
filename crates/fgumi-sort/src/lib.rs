@@ -64,6 +64,9 @@ pub(crate) mod radix;
 pub(crate) mod read_ahead;
 pub(crate) mod reader;
 pub mod ref_sort;
+// Per-order run boundary key for the arena spill run-former (extend-vs-new-run
+// decision). Surfaced via the re-export below.
+pub(crate) mod run_bound;
 pub mod segmented_buf;
 pub mod template_arena;
 // Block-granular spill compression kernel for the block-parallel spill steps
@@ -247,6 +250,7 @@ pub use reader::{
 pub use ref_sort::{
     coordinate_chunk_from_arena_refs, coordinate_chunk_from_refs, queryname_chunk_from_arena_refs,
 };
+pub use run_bound::{RunBound, format_run_formation};
 pub use segmented_buf::SegmentedBuf;
 pub use spill_block::{SpillBlockCompressor, frame_keyed_record_into, spill_magic, spill_trailer};
 pub use spill_block_reader::SpillBlockDecompressor;
