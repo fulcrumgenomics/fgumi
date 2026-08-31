@@ -241,7 +241,7 @@ pub type RawBamReaderAuto = RawBamReader<BgzfReaderEnum>;
 ///
 /// Ports the semantics of fgumi v0.7.0's `fgumi sort --read-streams` flag. The
 /// mechanism (concurrent positional reads that raise the device's read queue
-/// depth) lives in the `scatter_reader` module; on a slow, deep-queue device
+/// depth) lives in [`crate::scatter_reader`]; on a slow, deep-queue device
 /// (e.g. EBS gp3) issuing several reads at once is markedly faster than the
 /// single outstanding read a plain reader issues.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

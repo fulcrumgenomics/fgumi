@@ -23,6 +23,7 @@ pub mod progress;
 pub mod reader;
 pub mod reorder;
 pub mod sam_input;
+pub mod scatter_reader;
 pub mod writer;
 
 pub(crate) mod vendored;
