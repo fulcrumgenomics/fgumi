@@ -1789,6 +1789,7 @@ mod tests {
                 batch_serial: 0,
                 bytes: blk0.clone(),
                 uncompressed_size: u32::try_from(isz0).unwrap(),
+                index: None,
             })
             .is_ok()
         );
@@ -1797,6 +1798,7 @@ mod tests {
                 batch_serial: 1,
                 bytes: blk1.clone(),
                 uncompressed_size: u32::try_from(isz1).unwrap(),
+                index: None,
             })
             .is_ok()
         );
@@ -1869,6 +1871,7 @@ mod tests {
                 batch_serial: 0,
                 bytes: blk0.clone(),
                 uncompressed_size: u32::try_from(isz0).unwrap(),
+                index: None,
             })
             .is_ok()
         );
@@ -1877,6 +1880,7 @@ mod tests {
                 batch_serial: 1,
                 bytes: blk1.clone(),
                 uncompressed_size: u32::try_from(isz1).unwrap(),
+                index: None,
             })
             .is_ok()
         );
@@ -1922,6 +1926,7 @@ mod tests {
                 batch_serial: 99,
                 bytes: probe_blk,
                 uncompressed_size: u32::try_from(probe_isz).unwrap(),
+                index: None,
             });
             assert!(result.is_err(), "pool must be exhausted while run 0 Arc is still in flight");
             // A failed admit (ensure_arena returned false) must not leak state: the
@@ -1940,6 +1945,7 @@ mod tests {
                 batch_serial: 2,
                 bytes: blk2.clone(),
                 uncompressed_size: u32::try_from(isz2).unwrap(),
+                index: None,
             })
             .is_ok(),
             "run 1 admit must succeed after pool release"
@@ -1949,6 +1955,7 @@ mod tests {
                 batch_serial: 3,
                 bytes: blk3.clone(),
                 uncompressed_size: u32::try_from(isz3).unwrap(),
+                index: None,
             })
             .is_ok(),
             "run 1 second admit must succeed"

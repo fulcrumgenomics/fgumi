@@ -31,7 +31,10 @@ use fgumi_bam_io::{DecodedRecord, MemoryEstimate};
 // `crate::template::Template`.
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub use fgumi_pipeline_io::types::{BgzfBlock, DecompressedBlock, RecordBatch, RecordBatchBuilder};
+pub use fgumi_pipeline_io::types::{
+    BamIndexManifest, BgzfBlock, DecompressedBlock, RecordBatch, RecordBatchBuilder,
+    RecordIndexEntry,
+};
 
 /// Bytes held by a `Vec`'s backing store, counted by **allocated capacity**.
 ///

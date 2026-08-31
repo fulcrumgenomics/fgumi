@@ -3,9 +3,13 @@
 //! The stage-by-stage construction lives in
 //! [`crate::pipeline::chains::builder::ChainBuilder`]'s `add_sort` method.
 //! This module provides the standalone-sort summary finalize hook
-//! (`SortSummaryFinalizeHook`) and the `IndexBamFinalizeHook` BAI indexer
-//! (defined locally — see its doc), which `add_sort` registers for a
-//! `SinkSpec::BamWithIndex` request.
+//! (`SortSummaryFinalizeHook`), registered by `add_sort` for a sole-
+//! `[Stage::Sort]` chain. A `SinkSpec::BamWithIndex` request needs no
+//! finalize hook here: `ChainBuilder::add_sink` attaches an inline BAI
+//! indexer directly to the `WriteBgzfFile` sink
+//! (`WriteBgzfFile::with_bai_index`), which builds the `.bai` from the
+//! `BamIndexManifest`s each `BgzfCompress`-produced block carries, as the sink
+//! drains — no post-pipeline re-read of the finished BAM.
 //!
 //! ## Sort pipeline topology
 //!
@@ -52,59 +56,6 @@ impl FinalizeHook for SortSummaryFinalizeHook {
         }
         info!("Output: {}", output_path.display());
         timer.log_completion(stats.total_records);
-        Ok(())
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// IndexBamFinalizeHook
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Post-pipeline action that builds a BAI index for a finished
-/// coordinate-sorted BAM, writing the `.bai` sidecar next to the BAM.
-///
-/// Reads the BAM via `noodles::bam::fs::index` (walking BGZF block offsets) and
-/// writes the sidecar via [`fgumi_bam_io::write_bai_sidecar`], which appends
-/// `.bai` to the full output path (samtools convention), so `foo.bam` →
-/// `foo.bam.bai` and `foo.sorted` → `foo.sorted.bai`.
-///
-/// **Invariant:** the BAM at `output_path` must be writer-closed before
-/// `finalize` runs — guaranteed by `Pipeline::run` returning (every step's
-/// writer has dropped). The hook does not `fsync`: the same process re-reading
-/// via the OS page cache sees all flushed bytes on every supported local
-/// filesystem.
-///
-/// `pub(crate)` so [`crate::pipeline::chains::builder::ChainBuilder::add_sort`]
-/// can construct and register it. Defined here (rather than re-exported from a
-/// sort-cli crate as upstream did) because `main-runall` keeps the sort command
-/// local to `crate::commands::sort`.
-pub(crate) struct IndexBamFinalizeHook {
-    /// Path of the finished coordinate-sorted BAM to index.
-    pub(crate) output_path: PathBuf,
-}
-
-impl FinalizeHook for IndexBamFinalizeHook {
-    /// Build and write the BAI index alongside the BAM.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if indexing or writing the BAI sidecar fails.
-    fn finalize(self: Box<Self>) -> Result<()> {
-        use std::time::Instant;
-
-        use crate::logging::format_duration;
-
-        let IndexBamFinalizeHook { output_path } = *self;
-
-        info!("Indexing BAM: {}", output_path.display());
-        let start = Instant::now();
-
-        // Index + write the `<output>.bai` sidecar in one call; the path is
-        // derived by appending `.bai` to the full BAM path (samtools
-        // convention), correct for any path — not just `*.bam`.
-        let index_path = fgumi_bam_io::write_bai_sidecar(&output_path)?;
-        info!("Wrote BAM index: {} ({})", index_path.display(), format_duration(start.elapsed()));
-
         Ok(())
     }
 }

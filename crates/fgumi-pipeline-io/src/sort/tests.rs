@@ -1842,6 +1842,7 @@ fn bgzf_blocks_for(
                 batch_serial: i as u64,
                 bytes: blocks.remove(0).data,
                 uncompressed_size: u32::try_from(payload.len()).expect("payload fits u32"),
+                index: None,
             }
         })
         .collect()

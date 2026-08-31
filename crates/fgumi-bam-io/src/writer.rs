@@ -43,6 +43,9 @@ use crate::vendored::{BlockInfoRx, MultithreadedWriter, MultithreadedWriterBuild
 ///   `BGZF_BLOCK_SIZE` (`crate::vendored::bgzf_multithreaded`), a deliberately
 ///   independent copy that keeps the vendored module self-contained. It is equal
 ///   to this value today; keep the two in step, since nothing enforces it.
+/// - The arena chain sink's inline indexer, which derives physical-block numbers
+///   as `uoffset / fgumi_bgzf::BGZF_MAX_BLOCK_SIZE` — statically equal to this
+///   value (`fgumi-bgzf/src/writer.rs:17,325`).
 const MAX_BLOCK_SIZE: usize = bgzf::BGZF_BLOCK_SIZE;
 
 /// Fast, non-cryptographic hasher for the dense sequential `u64` block numbers
@@ -360,23 +363,41 @@ struct CachedIndexEntry {
     offset_in_block: usize,
     /// Length of record (including 4-byte size prefix).
     record_len: usize,
-    /// Alignment context: (reference ID, start, end, mapped flag).
-    alignment_context: Option<(usize, Position, Position, bool)>,
+    /// Alignment context, if the record is placed.
+    alignment_context: Option<AlignmentContext>,
+}
+
+/// A placed record's reference, span, and mapped status.
+///
+/// Public so pipeline steps in other crates can extract context once and carry
+/// it in the BAM index manifest, keeping this the single source of the logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlignmentContext {
+    /// Reference sequence ID (0-based).
+    pub ref_id: usize,
+    /// 1-based start position (inclusive).
+    pub start: Position,
+    /// 1-based end position (exclusive), spanning the reference length
+    /// consumed by the CIGAR (see [`extract_alignment_context`]).
+    pub end: Position,
+    /// Whether the record is mapped (the `UNMAPPED` flag is unset).
+    pub is_mapped: bool,
 }
 
 /// Extract alignment context from raw BAM bytes.
 ///
-/// Returns `Some((ref_id, start, end, is_mapped))` for any read that has a
-/// reference and a position — **including a placed-but-unmapped read** (e.g. the
-/// unmapped mate of a mapped read, which carries its mate's `tid`/`pos` so it
-/// sorts alongside it). Such reads are position-binned exactly as htslib/samtools
-/// do, so region queries and `idxstats` see them; the `is_mapped` flag records
-/// that they are unmapped without excluding them from the index. Only a truly
-/// unplaced read (no reference or no position) returns `None`, which the indexer
-/// counts toward the unplaced total.
+/// Returns `Some(AlignmentContext)` for any read that has a reference and a
+/// position — **including a placed-but-unmapped read** (e.g. the unmapped mate
+/// of a mapped read, which carries its mate's `tid`/`pos` so it sorts alongside
+/// it). Such reads are position-binned exactly as htslib/samtools do, so region
+/// queries and `idxstats` see them; the `is_mapped` flag records that they are
+/// unmapped without excluding them from the index. Only a truly unplaced read
+/// (no reference or no position) returns `None`, which the indexer counts
+/// toward the unplaced total.
 #[inline]
+#[must_use]
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-pub(crate) fn extract_alignment_context(bam: &[u8]) -> Option<(usize, Position, Position, bool)> {
+pub fn extract_alignment_context(bam: &[u8]) -> Option<AlignmentContext> {
     let v = fgumi_raw_bam::RawRecordView::new(bam);
     let tid = v.ref_id();
     let pos = v.pos();
@@ -401,7 +422,7 @@ pub(crate) fn extract_alignment_context(bam: &[u8]) -> Option<(usize, Position, 
     let start = Position::try_from((pos + 1) as usize).ok()?;
     let end = Position::try_from((pos + ref_len) as usize).ok()?;
 
-    Some((tid as usize, start, end, is_mapped))
+    Some(AlignmentContext { ref_id: tid as usize, start, end, is_mapped })
 }
 
 /// Incrementally builds a BAI index from per-record positions plus per-block
@@ -476,12 +497,33 @@ impl BaiBuilder {
         record_len: usize,
         record_bytes: &[u8],
     ) {
-        let alignment_context = extract_alignment_context(record_bytes);
+        self.record_with_context(
+            block_number,
+            offset_in_block,
+            record_len,
+            extract_alignment_context(record_bytes),
+        );
+    }
+
+    /// Record a written BAM record's position for later index resolution, given
+    /// an already-extracted alignment context.
+    ///
+    /// Identical to [`Self::record`] except the caller supplies `ctx` directly
+    /// instead of raw record bytes — for callers (e.g. the arena writer) that
+    /// have already extracted [`AlignmentContext`] for other purposes and would
+    /// otherwise redo the same parse.
+    pub fn record_with_context(
+        &mut self,
+        block_number: u64,
+        offset_in_block: usize,
+        record_len: usize,
+        ctx: Option<AlignmentContext>,
+    ) {
         self.entry_cache.push_back(CachedIndexEntry {
             block_number,
             offset_in_block,
             record_len,
-            alignment_context,
+            alignment_context: ctx,
         });
     }
 
@@ -534,7 +576,7 @@ impl BaiBuilder {
             // starts a fresh run. The record's own context still drives bin
             // routing and the linear index inside `add_record`; only the chunk's
             // start position is widened.
-            let chunk_start = if let Some((reference_sequence_id, start, end, _)) =
+            let chunk_start = if let Some(AlignmentContext { ref_id, start, end, .. }) =
                 alignment_context
             {
                 let bin = reg2bin(start, end);
@@ -542,13 +584,15 @@ impl BaiBuilder {
                 // `self.run` below doesn't overlap the borrow.
                 let current = self.run.as_ref().map(|r| (r.reference_sequence_id, r.bin, r.start));
                 match current {
-                    Some((run_ref, run_bin, run_start))
-                        if run_ref == reference_sequence_id && run_bin == bin =>
-                    {
+                    Some((run_ref, run_bin, run_start)) if run_ref == ref_id && run_bin == bin => {
                         run_start
                     }
                     _ => {
-                        self.run = Some(ChunkRun { reference_sequence_id, bin, start: start_vpos });
+                        self.run = Some(ChunkRun {
+                            reference_sequence_id: ref_id,
+                            bin,
+                            start: start_vpos,
+                        });
                         start_vpos
                     }
                 }
@@ -559,7 +603,10 @@ impl BaiBuilder {
                 start_vpos
             };
             self.indexer
-                .add_record(alignment_context, Chunk::new(chunk_start, end_vpos))
+                .add_record(
+                    alignment_context.map(|c| (c.ref_id, c.start, c.end, c.is_mapped)),
+                    Chunk::new(chunk_start, end_vpos),
+                )
                 .map_err(io::Error::other)?;
             self.entry_cache.pop_front();
         }
@@ -582,8 +629,29 @@ impl BaiBuilder {
 
     /// Number of records still awaiting block-position resolution.
     #[must_use]
-    pub(crate) fn pending(&self) -> usize {
+    pub fn pending(&self) -> usize {
         self.entry_cache.len()
+    }
+
+    /// Drop noted block offsets no future record can reference and advance the
+    /// watermark. Called by the arena writer after each fully-drained batch
+    /// (`pending() == 0`); safe because records never cross batch boundaries, so
+    /// nothing recorded later references a block `< block_number`. Keeps
+    /// `block_positions` bounded to the in-flight window (see the field doc on
+    /// [`Self`]) — without it, the arena's per-batch full drain never triggers
+    /// `resolve`'s own front-gated prune and the map grows for the whole file.
+    pub fn prune_below(&mut self, block_number: u64) {
+        while self.pruned_below < block_number {
+            self.block_positions.remove(&self.pruned_below);
+            self.pruned_below += 1;
+        }
+    }
+
+    /// Number of entries currently retained in `block_positions`, for test
+    /// assertions that the pruning window stays bounded.
+    #[cfg(test)]
+    pub(crate) fn block_positions_len_for_test(&self) -> usize {
+        self.block_positions.len()
     }
 
     /// Build the final BAI index.
@@ -1062,6 +1130,11 @@ pub fn write_bai_sidecar<P: AsRef<Path>>(bam_path: P) -> Result<PathBuf> {
 ///
 /// # Errors
 /// Returns an error if the file cannot be created or writing the index fails.
+///
+/// The write is atomic: the serialized index is written to a temporary file in
+/// the destination directory and then renamed onto `path`, so a failure partway
+/// through never leaves a truncated or partial `.bai` at the final path (a
+/// half-written index parses as valid but silently mis-answers queries).
 pub fn write_bai_index<P: AsRef<Path>>(path: P, index: &bai::Index) -> Result<()> {
     let path_ref = path.as_ref();
     // `bai::io::Writer` serializes the index as a great many tiny fields (each
@@ -1073,8 +1146,21 @@ pub fn write_bai_index<P: AsRef<Path>>(path: P, index: &bai::Index) -> Result<()
     bai::io::Writer::new(&mut buf)
         .write_index(index)
         .with_context(|| format!("Failed to serialize BAI index for: {}", path_ref.display()))?;
-    std::fs::write(path_ref, &buf)
+    // Write to a temp file in the destination directory, then rename onto the
+    // final path. A same-directory rename is atomic, so a reader never observes
+    // a partial index, and a failed write leaves no file at `path` at all.
+    let dir = match path_ref.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".bai-")
+        .tempfile_in(dir)
+        .with_context(|| format!("Failed to create temp file for index in: {}", dir.display()))?;
+    tmp.write_all(&buf)
         .with_context(|| format!("Failed to write index to: {}", path_ref.display()))?;
+    tmp.persist(path_ref)
+        .with_context(|| format!("Failed to persist index to: {}", path_ref.display()))?;
     Ok(())
 }
 
@@ -1508,20 +1594,18 @@ mod tests {
         // binned over a 1-base span at its position, flagged unmapped — so region
         // queries and idxstats see it, matching htslib.
         let rec = create_placed_unmapped_bam_record(0, 100, b"unmapped_mate");
-        let (ref_id, start, end, is_mapped) =
-            extract_alignment_context(&rec).expect("placed-unmapped read must be binned");
-        assert_eq!(ref_id, 0);
-        assert_eq!(usize::from(start), 101, "0-based pos 100 -> 1-based 101");
-        assert_eq!(usize::from(end), 101, "no CIGAR -> 1-base span [pos, pos+1)");
-        assert!(!is_mapped, "flag must still record it as unmapped");
+        let ctx = extract_alignment_context(&rec).expect("placed-unmapped read must be binned");
+        assert_eq!(ctx.ref_id, 0);
+        assert_eq!(usize::from(ctx.start), 101, "0-based pos 100 -> 1-based 101");
+        assert_eq!(usize::from(ctx.end), 101, "no CIGAR -> 1-base span [pos, pos+1)");
+        assert!(!ctx.is_mapped, "flag must still record it as unmapped");
 
         // A mapped read is binned over its CIGAR span and flagged mapped.
         let mapped = create_test_bam_record(0, 100, b"mapped");
-        let (_, m_start, m_end, m_mapped) =
-            extract_alignment_context(&mapped).expect("mapped read must be binned");
-        assert_eq!(usize::from(m_start), 101);
-        assert_eq!(usize::from(m_end), 110, "10M CIGAR -> span of 10");
-        assert!(m_mapped);
+        let m_ctx = extract_alignment_context(&mapped).expect("mapped read must be binned");
+        assert_eq!(usize::from(m_ctx.start), 101);
+        assert_eq!(usize::from(m_ctx.end), 110, "10M CIGAR -> span of 10");
+        assert!(m_ctx.is_mapped);
 
         // A truly unplaced read (no reference) is not binned.
         assert!(
@@ -1529,6 +1613,116 @@ mod tests {
                 .is_none(),
             "unplaced read -> None (counted as unplaced by the indexer)"
         );
+    }
+
+    /// Encode a CIGAR op (`(length, op_char)`) as the BAM-packed `u32` word
+    /// [`SamBuilder::cigar_ops`] expects: `(length << 4) | op_code`, per the SAM
+    /// spec's op-code table (`MIDNSHP=X` -> `0..=8`).
+    fn cigar_op_word(length: u32, op: char) -> u32 {
+        let op_code = match op {
+            'M' => 0,
+            'I' => 1,
+            'D' => 2,
+            'N' => 3,
+            'S' => 4,
+            'H' => 5,
+            'P' => 6,
+            '=' => 7,
+            'X' => 8,
+            _ => panic!("unsupported CIGAR op: {op}"),
+        };
+        (length << 4) | op_code
+    }
+
+    /// Build a record **body** (no 4-byte length prefix) via [`SamBuilder`], for
+    /// use with [`extract_alignment_context`].
+    fn build_record_body(ref_id: i32, pos: i32, flags: u16, cigar: &[(u32, char)]) -> Vec<u8> {
+        let ops: Vec<u32> = cigar.iter().map(|&(len, op)| cigar_op_word(len, op)).collect();
+        fgumi_raw_bam::SamBuilder::new()
+            .ref_id(ref_id)
+            .pos(pos)
+            .flags(flags)
+            .cigar_ops(&ops)
+            .build()
+            .to_vec()
+    }
+
+    #[test]
+    fn extract_alignment_context_classifies_placed_unmapped_and_unplaced() {
+        use noodles::core::Position;
+        // Placed + mapped: tid=0, pos=99 (0-based) → start=100 (1-based).
+        let mapped = build_record_body(
+            /*ref_id*/ 0,
+            /*pos*/ 99,
+            /*flags*/ 0,
+            /*cigar*/ &[(10, 'M')],
+        );
+        let ctx = extract_alignment_context(&mapped).expect("placed");
+        assert_eq!(ctx.ref_id, 0);
+        assert_eq!(ctx.start, Position::try_from(100).unwrap());
+        // 0-based pos=99, 10M -> reference span [99, 109) (0-based, exclusive) ->
+        // 1-based inclusive end = 109 (matches `bam_endpos`-style pos + ref_len).
+        assert_eq!(ctx.end, Position::try_from(109).unwrap());
+        assert!(ctx.is_mapped);
+
+        // Placed-but-unmapped mate: tid/pos valid, UNMAPPED flag set, no CIGAR → span floored to 1.
+        let placed_unmapped = build_record_body(0, 99, fgumi_raw_bam::flags::UNMAPPED, &[]);
+        let ctx =
+            extract_alignment_context(&placed_unmapped).expect("placed-unmapped is still placed");
+        assert!(!ctx.is_mapped);
+        assert_eq!(ctx.end, Position::try_from(100).unwrap());
+
+        // Truly unplaced: tid < 0 → None.
+        let unplaced = build_record_body(-1, -1, fgumi_raw_bam::flags::UNMAPPED, &[]);
+        assert!(extract_alignment_context(&unplaced).is_none());
+    }
+
+    #[test]
+    fn record_with_context_matches_record_from_bytes() {
+        // Same inputs via the raw-bytes path and the pre-extracted-context path must
+        // produce an identical built index.
+        let body = build_record_body(0, 99, 0, &[(10, 'M')]);
+        let record_len = 4 + body.len();
+
+        let mut a = BaiBuilder::new();
+        a.note_block(0, 1234);
+        a.record(0, 0, record_len, &body);
+        a.resolve().unwrap();
+        let ia = a.build(1).unwrap();
+
+        let mut b = BaiBuilder::new();
+        b.note_block(0, 1234);
+        b.record_with_context(0, 0, record_len, extract_alignment_context(&body));
+        b.resolve().unwrap();
+        let ib = b.build(1).unwrap();
+
+        // Serialize both and compare bytes — same index by construction.
+        let mut ba = Vec::new();
+        let mut bb = Vec::new();
+        noodles::bam::bai::io::Writer::new(&mut ba).write_index(&ia).unwrap();
+        noodles::bam::bai::io::Writer::new(&mut bb).write_index(&ib).unwrap();
+        assert_eq!(ba, bb);
+    }
+
+    #[test]
+    fn prune_below_bounds_block_positions_across_drained_batches() {
+        // Simulate the arena writer's per-batch pattern: note this batch's blocks,
+        // record its records, resolve (fully drains → pending()==0), prune_below the
+        // next batch's base. block_positions must not accumulate across batches.
+        let body = build_record_body(0, 0, 0, &[(5, 'M')]);
+        let record_len = 4 + body.len();
+        let mut b = BaiBuilder::new();
+        let mut next_block_no = 0u64;
+        for _ in 0..1000 {
+            b.note_block(next_block_no, next_block_no * 100); // one physical block/batch
+            b.record_with_context(next_block_no, 0, record_len, extract_alignment_context(&body));
+            b.resolve().unwrap();
+            assert_eq!(b.pending(), 0, "each batch drains fully");
+            next_block_no += 1;
+            b.prune_below(next_block_no);
+        }
+        // Bounded: at most the current in-flight window, not ~1000 entries.
+        assert!(b.block_positions_len_for_test() <= 1, "block_positions must stay bounded");
     }
 
     #[test]
@@ -1900,5 +2094,32 @@ mod tests {
         assert_eq!(reg2bin(pos(16_300), pos(16_449)), 585);
         // reg2bin(4681)'s parent must be 585, matching the fold target.
         assert_eq!(bin_parent(4681), 585);
+    }
+
+    /// `write_bai_index` writes atomically via a same-directory temp file and a
+    /// rename: the result parses as a valid BAI, and no `.bai-` temp artifact is
+    /// left behind on success (a partial `.bai` would parse yet mis-answer
+    /// queries, which is why the write must be all-or-nothing).
+    #[test]
+    fn write_bai_index_is_atomic_and_leaves_no_temp_artifact() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("out.bam.bai");
+        write_bai_index(&path, &bai::Index::default()).expect("write bai");
+
+        // The final sidecar exists and parses.
+        assert!(path.exists(), "sidecar must exist at the final path");
+        noodles::bam::bai::fs::read(&path).expect("written .bai must parse");
+
+        // The temp file was renamed onto the target, not left in the directory.
+        let temp_leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".bai-"))
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            temp_leftovers.is_empty(),
+            "temp file must be renamed away, found: {temp_leftovers:?}"
+        );
     }
 }

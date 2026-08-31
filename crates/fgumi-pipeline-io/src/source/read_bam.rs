@@ -141,6 +141,7 @@ impl Step for ReadBgzfBlocks {
                     )
                 })?,
                 bytes: raw.data,
+                index: None,
             });
         }
 

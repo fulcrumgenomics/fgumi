@@ -27,12 +27,12 @@ bstr = { workspace = true }
 bytes = { workspace = true }
 crossbeam-channel = { workspace = true }
 log = { workspace = true }
+tempfile = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 rstest = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
