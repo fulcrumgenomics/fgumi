@@ -535,13 +535,25 @@ fn sort_buffer_chain_fails_the_pipeline_on_a_dropped_lane_violation() {
         .memory_limit(256 * 1024 * 1024)
         .threads(1)
         .key_types(KeyTypesSpec::None);
+    // Serial sink (production's actual `WriteBgzfFile` kind), not the parity
+    // matrix's `Exclusive`: a sort chain declares a Detached step (the merge), so
+    // at `--threads 1` it no longer fuses (see
+    // `should_fuse_single_thread`/`has_detached_step`) and runs on the scheduled
+    // path. `VecSource` above is itself `StepKind::Exclusive`, so an `Exclusive`
+    // sink here would make TWO exclusive steps, and `assign_exclusive_owners`
+    // fails when `total_exclusive (2) > n_threads (1)` — before the ingest
+    // failure this test targets is even reached. A `Serial` sink leaves exactly
+    // one exclusive step (the source), which fits one thread, and also matches
+    // production's `WriteBgzfFile` kind — keeping the dropped-lane propagation
+    // assertion meaningful at one thread. (A *lone* Exclusive step is fine at
+    // `--threads 1`; only two or more exceed the budget — see `fused.rs`.)
     let err = drive_sort_buffer_pipeline(
         sorter,
         &Header::default(),
         pack_batches(&records, 256),
         4 * 1024 * 1024,
         1,
-        StepKind::Exclusive,
+        StepKind::Serial,
         SortDecompressTuning::default(),
         SpillCodec::Zstd,
     )

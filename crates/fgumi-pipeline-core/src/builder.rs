@@ -3215,12 +3215,17 @@ mod tests {
         assert_received_every_ordinal_once(&sink, 0);
     }
 
-    /// L2.3 step 7: at `--threads 1` the fusible linear chain runs the Detached
-    /// step **inline** in the fused single-thread driver — no dedicated thread
-    /// is spawned (the fused path returns before `extract_detached_steps`), yet
-    /// the Detached step still drives to completion.
+    /// L2.3 step 7: a chain declaring a Detached step drives to completion at
+    /// `--threads 1` with every ordinal delivered exactly once. End-to-end this
+    /// asserts *correctness*, not which path ran: the fused and scheduled paths
+    /// produce identical output, so a run cannot distinguish them (that is the
+    /// whole reason detachment is safe to decline-fuse). The *policy* — that such
+    /// a chain does NOT fuse and takes the scheduled path — is pinned directly by
+    /// `runtime::fused::tests::should_not_fuse_a_chain_containing_a_detached_step`,
+    /// and the fused driver's *ability* to drive a Detached step inline by
+    /// `runtime::fused::tests::run_fused_drives_a_detached_step_inline`.
     #[test]
-    fn detached_collapses_inline_at_t1() {
+    fn detached_chain_at_t1_completes_with_every_ordinal_once() {
         let remaining = Arc::new(AtomicU32::new(30));
         let received = Arc::new(AtomicU32::new(0));
         let sink = ParallelCountingSink::new(&received);
@@ -3237,6 +3242,35 @@ mod tests {
         assert!(result.is_ok(), "run failed: {:?}", result.err());
         assert_eq!(received.load(AtomicOrd::Relaxed), 30);
         assert_received_every_ordinal_once(&sink, 30);
+    }
+
+    /// Executable form of the documented caveat on
+    /// `runtime::fused::should_fuse_single_thread`: a chain that declares a
+    /// Detached step AND two or more Exclusive steps no longer fuses at
+    /// `--threads 1`, so it reaches the scheduled path's `assign_exclusive_owners`
+    /// and fails with `NotEnoughThreads` (2 Exclusive > 1 thread) where the fused
+    /// path previously ran it inline. `StubSource` and `StubSinkU32` are both
+    /// `StepKind::Exclusive`; `DetachedPassThrough` is `StepKind::Detached`. No
+    /// production chain has this shape (sort chains have zero Exclusive steps);
+    /// this pins the caveat so it stays true.
+    #[test]
+    fn detached_chain_with_two_exclusive_steps_fails_not_enough_threads_at_t1() {
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(StubSource)
+            .chain(DetachedPassThrough { held: None })
+            .chain(StubSinkU32)
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+
+        let result = pipeline.run(PipelineConfig { threads: 1, ..Default::default() });
+        assert!(
+            matches!(
+                result,
+                Err(crate::signal::PipelineError::NotEnoughThreads { required: 2, available: 1 })
+            ),
+            "expected NotEnoughThreads {{ required: 2, available: 1 }}, got {result:?}"
+        );
     }
 
     /// Sink whose worker loop panics the moment it pops an item — used to drive
