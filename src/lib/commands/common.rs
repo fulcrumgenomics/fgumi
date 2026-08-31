@@ -551,6 +551,9 @@ impl BamIoOptions {
         fgumi_bam_io::PipelineReaderOpts {
             async_reader: self.async_reader,
             verify_crc: self.effective_check_crc(),
+            // This helper serves non-sort command paths, which do not expose a
+            // read-stream knob; keep the plain sequential/async reader.
+            read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
         }
     }
 
