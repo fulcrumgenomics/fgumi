@@ -224,7 +224,12 @@ rstest = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["test-utils", "noodles"] }
-noodles = { workspace = true, features = ["bam", "sam"] }
+# "bgzf" is needed by test_sort_cutover_parity.rs, which decompresses a sort
+# output BAM's raw BGZF stream directly (via `noodles::bgzf::io::Reader`) to
+# compare cutover vs. baseline-binary output byte-for-byte after stripping the
+# `@PG` header line -- BGZF block layouts differ between the two writers even
+# when the decompressed content is identical.
+noodles = { workspace = true, features = ["bam", "sam", "bgzf"] }
 
 [[bench]]
 name = "core_functions"

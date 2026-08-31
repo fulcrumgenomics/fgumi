@@ -86,7 +86,14 @@ pub fn parse_sam_chunk_into_decoded(
             continue;
         }
         let mut sam_reader = sam::io::Reader::new(line);
-        let n = sam_reader.read_record(&mut sam_record)?;
+        // Labelled the same way `fgumi_bam_io::sam_input`'s single-threaded SAM
+        // transcode labels this exact fault: without it, the raw noodles message
+        // (e.g. "unexpected EOL") is the only clue the fault is in a record
+        // rather than in the chunk framing around it, and reads as a truncated
+        // or corrupted stream rather than one bad line.
+        let n = sam_reader
+            .read_record(&mut sam_record)
+            .map_err(|e| io::Error::new(e.kind(), format!("Failed to parse SAM record: {e}")))?;
         if n == 0 {
             continue;
         }

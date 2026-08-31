@@ -703,8 +703,13 @@ impl<'a> ChainBuilder<'a> {
         // instead of `DecodeRecords → DecodedRecordBatch`, so `add_sort`'s
         // parallel-inflate arena front (`ReadBlocks → InflateToArena →
         // FindBoundariesAndSort`) can consume it directly without an extra
-        // round-trip. SAM sort-first is rejected outright (see the `Sam` arm
-        // below); `SortBuffer` is only reached by the non-arena path in
+        // round-trip. SAM sort-first is supported too (see the `Sam` arm
+        // below): it decodes through the same `ParseSamChunk` preamble as
+        // every other SAM ingest, and `add_sort` bridges the resulting
+        // `DecodedRecordBatch` to the sort ingest's `RecordBatch` shape via
+        // `DecodedRecordBatchToRecordBatch`; only the BAM path gets the
+        // arena-backed front described above. `SortBuffer` is only reached by
+        // the non-arena path in
         // `add_sort`, where sort is *not* first (a fused earlier stage feeds it
         // `DecodedRecordBatch` / `BamTemplateBatch`). This covers both the
         // sole-`[Sort]` chain (standalone `fgumi sort`) and
@@ -750,19 +755,17 @@ impl<'a> ChainBuilder<'a> {
                         }
                     }
                     InputSource::Sam { reader: sam_reader, .. } => {
-                        // Sort-as-first-stage needs a `RecordBatch` source, but the
-                        // SAM preamble only produces `DecodedRecordBatch`; feeding
-                        // that into the sort ingest (`SortBuffer`) is a handle-type
-                        // mismatch (see `add_sort`). SAM input to a sort-first chain was never
-                        // supported (the legacy file→file sorter read BAM only), so
-                        // reject it with a clear message instead of a downstream
-                        // typed-step panic.
-                        if sort_is_first_intermediate {
-                            anyhow::bail!(
-                                "sort requires BAM input; SAM input is not supported \
-                                 (convert with `samtools view -b` first)"
-                            );
-                        }
+                        // Sort-as-first-stage over SAM decodes through the same
+                        // `ParseSamChunk` preamble as every other SAM ingest
+                        // (`DecodedRecordBatch`); `add_sort` bridges that to the
+                        // sort ingest's `RecordBatch` shape via
+                        // `DecodedRecordBatchToRecordBatch` when
+                        // `chain_tail_kind == DecodedRecordBatch`. The owned
+                        // engine (`RawExternalSorter`, used by `execute_sort`
+                        // pre-cutover) accepts SAM input directly, and
+                        // `test_input_source_matrix`'s `CONTRACTS` table declares
+                        // `sam: Required` for `sort` — so SAM-first is a binding
+                        // contract, not an optional extra.
                         let buf = sam_reader.into_inner();
                         let tail = self.build_sam_parse_preamble(
                             buf,
@@ -1056,16 +1059,21 @@ impl<'a> ChainBuilder<'a> {
     /// Group-key config for the **source preamble's** `DecodeRecords`.
     ///
     /// A first stage that groups by queryname (correct's `GroupByQueryname`)
-    /// reads only `key.name_hash` and discards the rest of the `GroupKey`, so
-    /// the source decode uses
-    /// [`fgumi_bam_io::GroupKeyConfig::name_hash_only`] — skipping the CIGAR
-    /// 5′-position walk and the RG/CB/MC aux-tag extraction pass entirely.
+    /// reads only `key.name_hash` and discards the rest of the `GroupKey`; a sort
+    /// first stage discards the `GroupKey` *entirely* (it computes its own sort
+    /// keys straight off the raw record bytes — see
+    /// `DecodedRecordBatchToRecordBatch`). Both therefore use
+    /// [`fgumi_bam_io::GroupKeyConfig::name_hash_only`] — the cheapest config —
+    /// skipping the CIGAR 5′-position walk and the RG/CB/MC aux-tag extraction
+    /// pass entirely; for a SAM-first sort that pass runs once per record in
+    /// `ParseSamChunk` and would otherwise be pure waste. This changes only the
+    /// discarded key, never the record bytes, so sort output is unchanged.
     /// (The legacy single-threaded path uses `new_raw_no_cell`, which still
     /// pays the combined aux pass; name-hash-only is strictly less work.) All
     /// other first stages (group/dedup/consensus/clip) need the full
     /// position/cell key, so they fall through to [`Self::bam_group_key_config`].
     fn source_group_key_config(&self) -> fgumi_bam_io::GroupKeyConfig {
-        if matches!(self.spec.stages.first(), Some(Stage::Correct)) {
+        if matches!(self.spec.stages.first(), Some(Stage::Correct | Stage::Sort)) {
             let library_index = fgumi_bam_io::LibraryIndex::from_header(&self.header);
             fgumi_bam_io::GroupKeyConfig::name_hash_only(library_index)
         } else {
@@ -2396,9 +2404,10 @@ impl<'a> ChainBuilder<'a> {
             //
             // Chain topology (continuing from current_tail):
             //
-            //   [BamTemplateBatch or RecordBatch at current_tail]
-            //       ↓ (TemplatesToRecordBatch if BamTemplateBatch)
-            //   RecordBatch (SAM) │ BgzfBlockArena (BAM)
+            //   [BamTemplateBatch, DecodedRecordBatch, or RecordBatch at current_tail]
+            //       ↓ (TemplatesToRecordBatch if BamTemplateBatch;
+            //          DecodedRecordBatchToRecordBatch if DecodedRecordBatch — SAM source)
+            //   RecordBatch (SAM, or fused non-Align/Correct upstream) │ BgzfBlockArena (BAM)
             //       ↓ arena sort ingest (SortBuffer, or ReadBlocks →
             //         InflateToArena → FindBoundariesAndSort for BAM)
             //       ↓
@@ -2470,7 +2479,7 @@ impl<'a> ChainBuilder<'a> {
             let total_memory = resolve_memory_budget(
                 sort.max_memory,
                 sort.memory_reserve,
-                num_threads,
+                sort_budget_threads(num_threads, sort.sort_threads),
                 sort.memory_per_thread,
             )?;
 
@@ -2573,13 +2582,24 @@ impl<'a> ChainBuilder<'a> {
 
             // If the upstream stage produced BamTemplateBatch (from Align or
             // Correct), flatten it to RecordBatch before feeding the sort ingest.
+            // If it produced DecodedRecordBatch (a SAM source: `add_source`'s SAM
+            // arm always decodes through `ParseSamChunk`, sort-first or not),
+            // flatten that instead — `SortBuffer::Input = RecordBatch`, and a SAM
+            // source never reaches the BAM-only arena front (`BgzfBlockArena`),
+            // so this is the only path a SAM-sourced sort takes.
             let tail = if self.chain_tail_kind == ChainTailKind::BamTemplateBatch {
                 use crate::pipeline::steps::templates_to_records::TemplatesToRecordBatch;
                 self.pipeline
                     .append_step(TemplatesToRecordBatch::new(self.tuning.per_step_byte_limit), tail)
+            } else if self.chain_tail_kind == ChainTailKind::DecodedRecordBatch {
+                use crate::pipeline::steps::decoded_to_records::DecodedRecordBatchToRecordBatch;
+                self.pipeline.append_step(
+                    DecodedRecordBatchToRecordBatch::new(self.tuning.per_step_byte_limit),
+                    tail,
+                )
             } else {
-                // chain_tail_kind == RecordBatch (from ParseBamRecords in add_source)
-                // or DecodedRecordBatch would be a bug caught at runtime.
+                // chain_tail_kind == RecordBatch (from ParseBamRecords in add_source);
+                // anything else would be a bug caught at runtime.
                 tail
             };
 
@@ -4422,6 +4442,15 @@ fn resolve_phase_threads(override_threads: Option<usize>, num_sorter_threads: us
     override_threads.unwrap_or(num_sorter_threads).max(1)
 }
 
+/// Thread count for sizing the sort buffer, mirroring the owned engine's
+/// `Sort::memory_budget_threads` (sort.rs:607-616): `max(threads, sort_threads)`,
+/// but 0 when the pool is 0 so `resolve_memory_budget` still rejects a zero-thread run.
+fn sort_budget_threads(num_threads: usize, sort_threads: Option<usize>) -> usize {
+    // Single source of truth shared with `Sort::memory_budget_threads` — see
+    // `commands::common::sort_memory_budget_threads` — so the two cannot drift.
+    crate::commands::common::sort_memory_budget_threads(num_threads, sort_threads)
+}
+
 /// Uniform "reference dictionary not found" error, shared by the zipper source
 /// open (`open_source`) and `add_align`, so both dict-resolution sites report
 /// the same actionable message (which paths were tried + the `samtools dict`
@@ -4441,7 +4470,7 @@ fn dict_not_found_error(reference: &std::path::Path) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_phase_threads;
+    use super::{resolve_phase_threads, sort_budget_threads};
 
     /// Pin the per-phase thread resolution contract shared by the standalone and
     /// streaming sort branches in `add_sort`: each phase falls back to the base
@@ -4466,5 +4495,38 @@ mod tests {
         assert_eq!(resolve_phase_threads(None, 0), 1);
         // And both zero at once still clamps to 1.
         assert_eq!(resolve_phase_threads(Some(0), 0), 1);
+    }
+
+    /// Pin `sort_budget_threads` against the owned engine's
+    /// `Sort::memory_budget_threads` (sort.rs:607-616): `max(threads,
+    /// sort_threads)`, but 0 when `threads == 0` so `resolve_memory_budget`
+    /// still rejects a zero-thread run.
+    #[test]
+    fn sort_budget_threads_mirrors_owned_memory_budget_threads() {
+        assert_eq!(sort_budget_threads(2, Some(8)), 8); // sort_threads > threads → max
+        assert_eq!(sort_budget_threads(4, Some(2)), 4); // sort_threads < threads → threads
+        assert_eq!(sort_budget_threads(4, None), 4); // no override → threads (runall)
+        assert_eq!(sort_budget_threads(0, Some(8)), 0); // threads==0 → 0 (rejection preserved)
+    }
+
+    /// `resolve_memory_budget` (the function `add_sort` feeds
+    /// `sort_budget_threads` into) scales a `Fixed` per-thread budget linearly
+    /// with the thread count, so a larger budget-thread count yields a larger
+    /// budget. This pins that scaling in isolation; that `add_sort` passes
+    /// `sort_budget_threads(num_threads, sort_threads)` (not the raw
+    /// `num_threads`) into it is guaranteed by the shared
+    /// `common::sort_memory_budget_threads` and pinned by
+    /// `sort_budget_threads_mirrors_owned_memory_budget_threads`.
+    /// `MemoryLimit::Auto` cannot be used here: it clamps to available memory, so
+    /// both calls return ~available and integer division makes `b8 <= b2` — a
+    /// false RED.
+    #[test]
+    fn resolve_memory_budget_scales_with_thread_count() {
+        use crate::commands::common::{MemoryLimit, MemoryReserve, resolve_memory_budget};
+        let fixed = MemoryLimit::Fixed(64 * 1024 * 1024);
+        let per_thread = true;
+        let b2 = resolve_memory_budget(fixed, MemoryReserve::Auto, 2, per_thread).unwrap();
+        let b8 = resolve_memory_budget(fixed, MemoryReserve::Auto, 8, per_thread).unwrap();
+        assert!(b8 > b2, "Fixed per-thread budget scales with thread count");
     }
 }

@@ -52,10 +52,52 @@ impl FinalizeHook for SortSummaryFinalizeHook {
         info!("Records processed: {}", stats.total_records);
         info!("Records written: {}", stats.output_records);
         if stats.runs_written > 0 {
-            info!("Temporary runs: {}", stats.runs_written);
+            info!("Spill runs: {}", stats.runs_written);
         }
         info!("Output: {}", output_path.display());
         timer.log_completion(stats.total_records);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Shares the crate-wide capturing logger (see
+    // `crate::commands::common::test_log_capture`) so this test and the
+    // memory-budget capture tests in `commands::common` do not each install a
+    // competing process-global logger — the second install panics under plain
+    // `cargo t`, which runs every test in one process.
+    use crate::commands::common::test_log_capture::{capture_logs, captured};
+
+    /// `SortSummaryFinalizeHook::finalize` must log the "Spill runs:" wording
+    /// the owned `execute_sort` engine uses (`src/lib/commands/sort.rs`), not
+    /// the chain's former "Temporary runs:" wording -- `test_streaming_output`
+    /// asserts the former through the sort command once the chain owns the
+    /// summary.
+    #[test]
+    fn sort_summary_uses_spill_runs_wording() {
+        let _session = capture_logs();
+
+        let hook = SortSummaryFinalizeHook {
+            stats_slot: Arc::new(Mutex::new(Some(fgumi_sort::SortStats {
+                runs_written: 3,
+                ..Default::default()
+            }))),
+            output_path: PathBuf::from("out.bam"),
+            timer: OperationTimer::new("Sort"),
+        };
+        Box::new(hook).finalize().expect("finalize must succeed");
+
+        let logs = captured();
+        assert!(
+            logs.iter().any(|line| line.contains("Spill runs: 3")),
+            "expected a 'Spill runs: 3' log line; got: {logs:?}"
+        );
+        assert!(
+            !logs.iter().any(|line| line.contains("Temporary runs:")),
+            "must not emit the old 'Temporary runs:' wording; got: {logs:?}"
+        );
     }
 }

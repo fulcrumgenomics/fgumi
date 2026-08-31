@@ -5,6 +5,8 @@
 //! - `bgzf/`                    — BGZF compress/decompress
 //! - `boundaries/`              — record-boundary discovery
 //! - `correct/`                 — UMI correction against a known-UMI set
+//! - `decoded_to_records.rs`    — flatten decoded (SAM-parsed) records back
+//!   into records, for the sort ingest
 //! - `group/`                   — template grouping (BAM, position, queryname, MI)
 //! - `parse/`                   — record parsing
 //! - `process.rs`               — closure-driven mid-steps (`Process`,
@@ -31,6 +33,7 @@ pub mod boundaries;
 #[cfg(test)]
 mod chain_tests;
 pub mod correct;
+pub mod decoded_to_records;
 pub mod extract;
 pub mod group;
 pub mod parse;

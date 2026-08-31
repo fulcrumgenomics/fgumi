@@ -605,14 +605,11 @@ impl Sort {
     /// raises the budget when the sort phase is the wider one -- the case where
     /// `--threads` alone under-counts -- and never lowers it.
     fn memory_budget_threads(&self) -> usize {
-        // `--threads 0` has to keep reaching `resolve_memory_budget`'s rejection
-        // rather than being clamped up here.
-        if self.threads == 0 {
-            return 0;
-        }
-        // `unwrap_or(0)` leaves `--threads` as the floor when the override is
-        // unset, or is itself 0 (which the engine clamps to one worker).
-        self.threads.max(self.sort_threads.unwrap_or(0))
+        // Single source of truth shared with the chain builder's `add_sort`
+        // (`sort_budget_threads`) — see `common::sort_memory_budget_threads` — so
+        // the banner path and the chain path cannot drift. `--threads 0` still
+        // resolves to 0 there, so `resolve_memory_budget` rejects a zero-thread run.
+        crate::commands::common::sort_memory_budget_threads(self.threads, self.sort_threads)
     }
 
     /// The flag [`memory_budget_threads`](Self::memory_budget_threads) took its
@@ -640,6 +637,8 @@ impl Sort {
     /// # Errors
     ///
     /// Returns an error if the per-thread product overflows `usize`.
+    // used by the owned-engine oracle path; PR B removes
+    #[allow(dead_code)]
     fn auto_initial_capacity(&self, effective_memory: usize) -> Result<usize> {
         let init = 768_usize
             .checked_mul(1024 * 1024)
@@ -771,7 +770,10 @@ impl Sort {
             );
         }
 
-        let timer = OperationTimer::new("Sorting BAM");
+        // The "Sorting BAM ..." start line and its completion line are both owned
+        // by the chain's `SortSummaryFinalizeHook` timer (`add_sort` constructs an
+        // `OperationTimer::new("Sorting BAM")` there). execute_sort no longer
+        // builds its own timer — doing so logged the identical start line twice.
 
         // Resolve memory limit (auto-detect or fixed)
         let budget_threads = self.memory_budget_threads();
@@ -792,7 +794,7 @@ impl Sort {
 
         // Built before the config log so the log can report the sorter's own
         // effective per-phase thread counts.
-        let mut sorter = self.build_sorter(effective_memory, command_line, soft_nofile);
+        let sorter = self.build_sorter(effective_memory, command_line, soft_nofile);
 
         debug!("Starting Sort");
         info!("Input: {}", self.input.display());
@@ -850,42 +852,63 @@ impl Sort {
             info!("Temp directories: {joined}");
         }
 
-        // For auto mode, cap initial buffer pre-allocation at 768 MiB/thread
-        // (matching samtools default) to avoid huge upfront allocations.
-        // The buffer will grow on demand up to memory_limit.
-        if matches!(self.max_memory, MemoryLimit::Auto) {
-            sorter = sorter.initial_capacity(self.auto_initial_capacity(effective_memory)?);
+        // The cutover chain does not yet thread the owned engine's `--read-streams`
+        // / `--sort-stats` knobs. Warn (not info) on a non-default value so the
+        // ignored behavior stays visible under a default `warn` log filter rather
+        // than being silently dropped. Restoring `--read-streams` end-to-end is
+        // tracked as follow-up R7b.
+        if !matches!(self.read_streams, fgumi_sort::ReadStreams::Auto) {
+            warn!(
+                "--read-streams={} is ignored by the sort chain (not yet threaded); \
+                 using the default read strategy",
+                self.read_streams
+            );
+        }
+        if self.sort_stats {
+            warn!("--sort-stats is ignored by the sort chain (not yet threaded)");
         }
 
-        if let Some(ct) = cell_tag {
-            sorter = sorter.cell_tag(ct);
-        }
+        // --- cutover: run via the chain instead of sorter.sort() ---
+        // (self.build_sorter above is retained only to source the banner's thread/temp-file
+        //  numbers; the owned sorter is not executed. PR B removes the owned engine + banner-build.)
+        use crate::commands::common::{QueueMemoryOptions, SchedulerOptions, ThreadingOptions};
+        use crate::pipeline::chains::{
+            ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag, build_for,
+        };
 
-        let key_types = self.key_types.unwrap_or_default(); // Auto
-        if !matches!(self.order, SortOrderArg::TemplateCoordinate) && self.key_types.is_some() {
-            info!("--key-types is ignored for --order {:?}", self.order);
-        }
-        sorter = sorter.key_types(key_types);
+        // `output` is already bound at the top of this method (validated in
+        // `execute`); reuse it rather than re-`expect`ing.
 
-        if !resolved_tmp_dirs.is_empty() {
-            sorter = sorter.temp_dirs(resolved_tmp_dirs);
-        }
+        // Bake resolved tmp dirs (incl. FGUMI_TMP_DIRS) into SortOptions — add_sort uses
+        // SortOptions.tmp_dirs verbatim and never reads the env var; to_sort_options copies raw.
+        let mut sort_options = self.to_sort_options();
+        sort_options.tmp_dirs = resolved_tmp_dirs; // already resolved above for the banner
 
-        let stats = sorter.sort(&self.input, output)?;
-        let (total_records, output_records, runs_written) =
-            (stats.total_records, stats.output_records, stats.runs_written);
-
-        // Summary
-        info!("=== Summary ===");
-        info!("Records processed: {total_records}");
-        info!("Records written: {output_records}");
-        if runs_written > 0 {
-            info!("Spill runs: {runs_written}");
-        }
-        info!("Output: {}", output.display());
-
-        timer.log_completion(total_records);
-        Ok(())
+        let stage_opts = StageOptionsBag { sort: Some(sort_options), ..Default::default() };
+        let sink = if self.write_index {
+            SinkSpec::BamWithIndex(output.clone())
+        } else {
+            SinkSpec::Bam(output.clone())
+        };
+        let spec = ChainSpec {
+            stages: vec![Stage::Sort],
+            source: SourceSpec::Bam(self.input.clone()),
+            sink,
+            stage_opts,
+            threading: ThreadingOptions { threads: Some(self.threads) },
+            compression: self.compression.clone(),
+            // Match sibling chain commands (10s), not the derived Default (0 = monitor off).
+            scheduler: SchedulerOptions { deadlock_timeout: 10, ..Default::default() },
+            queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
+            // The owned engine always verified CRC (incl. stdin); keep parity -- a future
+            // PR can add --no-check-crc if opt-out is wanted. `effective_check_crc()` would
+            // skip verification for stdin input (the file-vs-stdin default other commands
+            // use), which is a silent regression from the owned sorter's behavior.
+            verify_crc: true,
+            command_line: command_line.to_string(),
+        };
+        build_for(spec)?.run()
     }
 
     /// Execute verify mode: read records and check sort order.
