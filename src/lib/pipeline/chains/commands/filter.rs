@@ -30,6 +30,7 @@ use fgumi_raw_bam::RawRecord;
 use log::info;
 
 use crate::commands::filter::{CollectedFilterMetrics, Filter, FilterProcessCaptures};
+use crate::consensus_filter::retained_primary_masked_bases;
 use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::pipeline::chains::FinalizeHook;
@@ -224,7 +225,14 @@ pub(crate) fn build_filter_step_single_no_rejects(
                 let mut record = decoded.into_raw_bytes();
                 let (bases_masked, pass) =
                     process_record_raw_call(&mut record, &captures).map_err(io::Error::other)?;
-                bases_masked_total += bases_masked;
+                // Match the legacy path's fgbio-parity "Total bases masked" tally:
+                // count masked bases only in a retained primary read (0 for a
+                // rejected read / secondary / supplementary), not the raw count.
+                bases_masked_total += retained_primary_masked_bases(
+                    std::slice::from_ref(&record),
+                    &[bases_masked],
+                    pass,
+                );
 
                 if pass {
                     passed_count += 1;
@@ -294,7 +302,11 @@ pub(crate) fn build_filter_step_single_with_rejects(
                 let mut record = decoded.into_raw_bytes();
                 let (bases_masked, pass) = process_record_raw_call(&mut record, &captures)
                     .map_err(io::Error::other)?;
-                bases_masked_total += bases_masked;
+                // Match the legacy path's fgbio-parity "Total bases masked" tally:
+                // count masked bases only in a retained primary read (0 for a
+                // rejected read / secondary / supplementary), not the raw count.
+                bases_masked_total +=
+                    retained_primary_masked_bases(std::slice::from_ref(&record), &[bases_masked], pass);
 
                 let target = if pass {
                     passed_count += 1;
@@ -352,16 +364,25 @@ pub(crate) fn build_filter_step_template_no_rejects(
             for template in templates {
                 let mut template_records: Vec<RawRecord> = template.into_records();
                 let mut pass_map: AHashMap<usize, bool> = AHashMap::new();
+                let mut masked_by_record: Vec<u64> = Vec::with_capacity(template_records.len());
 
                 for (idx, record) in template_records.iter_mut().enumerate() {
                     total_records += 1;
                     let (masked, pass) =
                         process_record_raw_call(record, &captures).map_err(io::Error::other)?;
-                    bases_masked_total += masked;
+                    masked_by_record.push(masked);
                     pass_map.insert(idx, pass);
                 }
 
                 let template_pass = template_passes(&template_records, &pass_map);
+                // Match the legacy path's fgbio-parity "Total bases masked" tally:
+                // count masked bases only in retained primary reads of a retained
+                // template (0 for a dropped template), not the raw per-record sum.
+                bases_masked_total += retained_primary_masked_bases(
+                    &template_records,
+                    &masked_by_record,
+                    template_pass,
+                );
 
                 for (idx, record) in template_records.into_iter().enumerate() {
                     let flags = fgumi_raw_bam::RawRecordView::new(&record).flags();
@@ -434,16 +455,25 @@ pub(crate) fn build_filter_step_template_with_rejects(
             for template in templates {
                 let mut template_records: Vec<RawRecord> = template.into_records();
                 let mut pass_map: AHashMap<usize, bool> = AHashMap::new();
+                let mut masked_by_record: Vec<u64> = Vec::with_capacity(template_records.len());
 
                 for (idx, record) in template_records.iter_mut().enumerate() {
                     total_records += 1;
                     let (masked, pass) = process_record_raw_call(record, &captures)
                         .map_err(io::Error::other)?;
-                    bases_masked_total += masked;
+                    masked_by_record.push(masked);
                     pass_map.insert(idx, pass);
                 }
 
                 let template_pass = template_passes(&template_records, &pass_map);
+                // Match the legacy path's fgbio-parity "Total bases masked" tally:
+                // count masked bases only in retained primary reads of a retained
+                // template (0 for a dropped template), not the raw per-record sum.
+                bases_masked_total += retained_primary_masked_bases(
+                    &template_records,
+                    &masked_by_record,
+                    template_pass,
+                );
 
                 for (idx, record) in template_records.into_iter().enumerate() {
                     let flags = fgumi_raw_bam::RawRecordView::new(&record).flags();
