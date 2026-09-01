@@ -3942,6 +3942,22 @@ impl<'a> ChainBuilder<'a> {
             );
         }
 
+        // fgbio's ClipBam requires query-grouped input (a template's reads must be
+        // adjacent). Both legacy clip paths enforce this — `execute_single_threaded`
+        // (the parity oracle) and the pre-cutover `--threads` path, via
+        // `require_query_grouped` — so the chain `--threads` path must too; otherwise
+        // coordinate-sorted input that the legacy path rejected would be silently
+        // mis-clipped. Gated on Clip being the source stage: a future fused
+        // group→clip chain has an upstream stage that orders the records, so this
+        // guard must not reject that. `ChainSpec` exposes only `single_stage` today,
+        // so clip is always the source stage and the guard always fires.
+        if self.spec.stages.first() == Some(&Stage::Clip) {
+            crate::commands::common::require_query_grouped(
+                &self.header,
+                &input_path.display().to_string(),
+            )?;
+        }
+
         let timer = OperationTimer::new("Clipping reads");
 
         info!("Clip");
@@ -3973,13 +3989,7 @@ impl<'a> ChainBuilder<'a> {
             ClipProcessCaptures {
                 clipping_mode: clip.clipping_mode,
                 auto_clip_attributes: clip.auto_clip_attributes,
-                upgrade_clipping: clip.upgrade_clipping,
-                clip_overlapping_reads: clip.clip_overlapping_reads,
-                clip_extending_past_mate: clip.clip_extending_past_mate,
-                read_one_five_prime: clip.read_one_five_prime,
-                read_one_three_prime: clip.read_one_three_prime,
-                read_two_five_prime: clip.read_two_five_prime,
-                read_two_three_prime: clip.read_two_three_prime,
+                params: crate::commands::clip::ClipParams::from_clip(clip),
                 header: self.header.clone(),
                 reference: Arc::clone(&reference),
                 metrics: Arc::clone(&metrics),
