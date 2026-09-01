@@ -381,6 +381,10 @@ impl Command for Filter {
         // Validate parameter counts (1-3 values for duplex support)
         self.validate_parameters()?;
 
+        if self.threading.threads.is_some() {
+            return self.execute_chain(command_line);
+        }
+
         let timer = OperationTimer::new("Filtering consensus reads");
 
         info!("Starting Filter");
@@ -447,6 +451,44 @@ impl Command for Filter {
 
         timer.log_completion(total_reads);
         Ok(())
+    }
+}
+
+impl Filter {
+    /// Run the filter stage on the declarative chain builder (the `--threads N`
+    /// path).
+    ///
+    /// Replaces the hand-rolled unified-pipeline construction in `execute` for
+    /// the threaded case. The chain opens its own source, validates the
+    /// query-grouped input ordering, injects `@PG`, runs the shared filter
+    /// process step(s), writes the kept records (and, when configured, the
+    /// rejects BAM and stats file) via its finalize hooks — all through the
+    /// same shared helpers as the non-chain path, so the two orchestrations
+    /// stay in parity. The no-`--threads` path keeps its own unified pipeline
+    /// in `execute`, which is the in-process parity oracle for this one (see
+    /// `test_filter_chain_matches_single_threaded`).
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        use crate::pipeline::chains::{
+            ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
+        };
+
+        // `add_filter` re-emits the timer/banner/threading log lines but not the
+        // CRC-verify status; emit it here so the --threads path reports it once,
+        // matching the non-chain path.
+        self.io.log_effective_check_crc();
+
+        let stage_opts =
+            StageOptionsBag { filter: Some(self.to_filter_options()), ..Default::default() };
+        let ctx = SingleStageContext {
+            io: &self.io,
+            threading: &self.threading,
+            compression: &self.compression,
+            scheduler: &self.scheduler_opts,
+            queue_memory: &self.queue_memory,
+            command_line,
+        };
+        let spec = ChainSpec::single_stage(Stage::Filter, stage_opts, &ctx);
+        build_for(spec)?.run()
     }
 }
 

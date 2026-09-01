@@ -12,6 +12,7 @@ use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
+use rstest::rstest;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -523,4 +524,402 @@ fn test_filter_command_no_ref_mapped_reads_fails() {
         err_msg.contains("--ref is required"),
         "Error should mention --ref requirement, got: {err_msg}"
     );
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// R3.1 chain-cutover parity tests: `--threads N` (declarative chain builder)
+// vs. no-`--threads` (legacy unified-pipeline oracle).
+//////////////////////////////////////////////////////////////////////////////
+
+/// Run `filter` on `input` writing `output`, with `extra` args appended
+/// (e.g. `--threads`, `--rejects`, `--stats`, `--filter-by-template`). Always
+/// passes `--ref` (mapped fixtures need it for tag regeneration) and
+/// `--min-reads 3` -- deliberately *not* overriding `--max-no-call-fraction`
+/// (default 0.2), so a fully-masked low-depth read is actually rejected rather
+/// than passed through. Asserts the run succeeds.
+fn filter_run(input: &Path, output: &Path, ref_path: &Path, extra: &[&str]) {
+    let mut args = vec![
+        "filter",
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--min-reads",
+        "3",
+        "--compression-level",
+        "1",
+    ];
+    args.extend_from_slice(extra);
+    Filter::try_parse_from(args)
+        .expect("failed to parse filter args")
+        .execute("fgumi filter")
+        .unwrap_or_else(|e| panic!("filter run failed: {e:#}"));
+}
+
+/// Read a BAM's records back as decoded `RecordBuf`s, for record-for-record
+/// comparison (order-sensitive, catches drops/dupes/reorders that a bare count
+/// would miss).
+fn read_filter_records(path: &Path) -> Vec<noodles::sam::alignment::RecordBuf> {
+    let mut reader = bam::io::Reader::new(fs::File::open(path).unwrap());
+    let header = reader.read_header().unwrap();
+    reader.record_bufs(&header).collect::<std::io::Result<Vec<_>>>().expect("read filter records")
+}
+
+/// Build `n` two-mate templates (R1/R2 sharing a read name, both mapped
+/// primaries). Even-indexed templates have both mates at passing depth
+/// (`cD 10 >= --min-reads 3`); odd-indexed templates have a passing R1 but a
+/// failing (`cD 1`, fully masked) R2. This is what makes both filter step
+/// factories do genuinely non-trivial, non-vacuous work:
+/// - filter-by-template mode drops the *whole* odd template (fgbio's
+///   "all primaries must pass" rule), so both mates of an odd template are
+///   rejected even though R1 alone would have passed;
+/// - single-read mode keeps every R1 and drops only the failing R2s.
+fn build_mixed_depth_templates(n: usize) -> Vec<RawRecord> {
+    let mut records = Vec::with_capacity(n * 2);
+    for i in 0..i32::try_from(n).expect("n fits in i32") {
+        let name = format!("t{i}");
+        let pos = 100 + i * 20;
+        let r2_depth: u16 = if i % 2 == 0 { 10 } else { 1 };
+
+        let mut r1 = RawSamBuilder::new();
+        r1.read_name(name.as_bytes())
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .ref_id(0)
+            .pos(pos)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .sequence(b"ACGTACGT")
+            .qualities(&[35; 8]);
+        r1.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.0_f32);
+        r1.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
+        records.push(r1.build());
+
+        let mut r2 = RawSamBuilder::new();
+        r2.read_name(name.as_bytes())
+            .flags(flags::PAIRED | flags::LAST_SEGMENT)
+            .ref_id(0)
+            .pos(pos + 8)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .sequence(b"ACGTACGT")
+            .qualities(&[35; 8]);
+        r2.add_int_tag(SamTag::CD, i32::from(r2_depth)).add_float_tag(SamTag::CE, 0.0_f32);
+        r2.add_array_u16(SamTag::CD_BASES, &[r2_depth; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
+        records.push(r2.build());
+    }
+    records
+}
+
+/// The chain (`--threads N`) path produces output identical to the non-chain
+/// (no-`--threads`) path, for both `--threads 1` (the minimal chain engine)
+/// and `--threads 4` (genuinely parallel), and for both `filter-by-template`
+/// step factories (template mode groups via `GroupByQueryname` before
+/// filtering; single-read mode filters each record independently -- distinct
+/// step factories in `chains/commands/filter.rs`). `build_mixed_depth_templates`
+/// guarantees a non-vacuous mix of passing and rejected reads in every case.
+#[rstest]
+#[case::threads1_template(1, true)]
+#[case::threads4_template(4, true)]
+#[case::threads1_single_read(1, false)]
+#[case::threads4_single_read(4, false)]
+fn test_filter_chain_matches_single_threaded(
+    #[case] threads: usize,
+    #[case] filter_by_template: bool,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+    create_consensus_bam(&input_bam, build_mixed_depth_templates(8));
+
+    let template_flag = if filter_by_template { "true" } else { "false" };
+    let threads_str = threads.to_string();
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    filter_run(&input_bam, &oracle_out, &ref_path, &["--filter-by-template", template_flag]);
+
+    let chain_out = temp_dir.path().join("chain.bam");
+    filter_run(
+        &input_bam,
+        &chain_out,
+        &ref_path,
+        &["--filter-by-template", template_flag, "--threads", &threads_str],
+    );
+
+    // Compare the COMPLETE normalized header (not just `@HD`): `read_bam_output`
+    // normalizes the `@PG` command-line field that legitimately differs by
+    // `--threads`, so a chain regression that changed `@RG`/`@SQ`/`@CO` or any
+    // other header record — not only sort order — is caught too.
+    let (oracle_header, expected) = crate::helpers::read_bam_output(&oracle_out);
+    let (chain_header, actual) = crate::helpers::read_bam_output(&chain_out);
+    // Non-vacuous: filtering must actually drop records, or a pass-through
+    // regression on BOTH paths would satisfy `actual == expected` silently.
+    // `build_mixed_depth_templates(8)` = 16 records; template mode drops the 4
+    // odd templates whole (keeps 8), single-read mode drops only the 4 failing
+    // R2s (keeps 12).
+    let expected_kept = if filter_by_template { 8 } else { 12 };
+    assert_eq!(
+        expected.len(),
+        expected_kept,
+        "oracle must keep exactly {expected_kept} of 16 records \
+         (filter_by_template={filter_by_template})"
+    );
+    assert_eq!(
+        actual, expected,
+        "chain (threads={threads}, filter_by_template={filter_by_template}) output must match \
+         the non-chain path record-for-record"
+    );
+    // Guard against a vacuous header comparison: if a regression dropped `@HD` on
+    // both paths, the header equality could still pass on two equally-broken
+    // headers, so assert the oracle actually declares `@HD` first.
+    assert!(oracle_header.header().is_some(), "oracle output must declare @HD");
+    assert_eq!(
+        chain_header, oracle_header,
+        "chain (threads={threads}, filter_by_template={filter_by_template}) output header must \
+         match the non-chain path (complete normalized header, not just @HD)"
+    );
+}
+
+/// The `--rejects` output BAM matches record-for-record between the chain and
+/// oracle paths, not just the kept output. Template mode over
+/// `build_mixed_depth_templates` rejects both mates of every odd-indexed
+/// template (8 records across 4 templates), so the rejects comparison is
+/// non-vacuous.
+#[test]
+fn test_filter_chain_rejects_bam_matches_single_threaded() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+    create_consensus_bam(&input_bam, build_mixed_depth_templates(8));
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    let oracle_rejects = temp_dir.path().join("oracle.rejects.bam");
+    filter_run(
+        &input_bam,
+        &oracle_out,
+        &ref_path,
+        &["--rejects", oracle_rejects.to_str().unwrap()],
+    );
+
+    let chain_out = temp_dir.path().join("chain.bam");
+    let chain_rejects = temp_dir.path().join("chain.rejects.bam");
+    filter_run(
+        &input_bam,
+        &chain_out,
+        &ref_path,
+        &["--rejects", chain_rejects.to_str().unwrap(), "--threads", "4"],
+    );
+
+    let expected_kept = read_filter_records(&oracle_out);
+    let actual_kept = read_filter_records(&chain_out);
+    assert!(!expected_kept.is_empty(), "oracle kept output must be non-empty");
+    assert_eq!(actual_kept, expected_kept, "kept output must match record-for-record");
+
+    let expected_rejects = read_filter_records(&oracle_rejects);
+    let actual_rejects = read_filter_records(&chain_rejects);
+    assert!(
+        !expected_rejects.is_empty(),
+        "oracle rejects output must be non-empty (guard against a vacuous pass)"
+    );
+    assert_eq!(
+        actual_rejects, expected_rejects,
+        "rejects output must match record-for-record between chain and oracle"
+    );
+}
+
+/// The `--stats` file is byte-identical between the chain and oracle paths.
+#[test]
+fn test_filter_chain_stats_file_matches_single_threaded() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+    create_consensus_bam(&input_bam, build_mixed_depth_templates(8));
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    let oracle_stats = temp_dir.path().join("oracle.stats.txt");
+    filter_run(&input_bam, &oracle_out, &ref_path, &["--stats", oracle_stats.to_str().unwrap()]);
+
+    let chain_out = temp_dir.path().join("chain.bam");
+    let chain_stats = temp_dir.path().join("chain.stats.txt");
+    filter_run(
+        &input_bam,
+        &chain_out,
+        &ref_path,
+        &["--stats", chain_stats.to_str().unwrap(), "--threads", "4"],
+    );
+
+    let oracle_content = fs::read_to_string(&oracle_stats).expect("read oracle stats");
+    let chain_content = fs::read_to_string(&chain_stats).expect("read chain stats");
+    assert!(!oracle_content.trim().is_empty(), "oracle stats file should not be empty");
+    assert!(oracle_content.contains("total_reads"), "stats should contain total_reads");
+    // Non-vacuous: the stats must record that filtering actually rejected reads,
+    // or a pass-through regression on both paths would still byte-match.
+    let failed = oracle_content
+        .lines()
+        .find_map(|l| l.strip_prefix("failed_reads\t"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .expect("stats file must report failed_reads");
+    assert!(failed > 0, "filtering must reject at least one read; stats:\n{oracle_content}");
+    assert_eq!(
+        oracle_content, chain_content,
+        "stats file must be byte-identical across chain and oracle modes"
+    );
+}
+
+/// Build a query-grouped BAM with `n` **paired** templates: each template `t{i}`
+/// is two mates (R1/R2) sharing a query name, both mapped primaries, both
+/// passing consensus reads (`cD 10 >= --min-reads 3`). Two properties make this
+/// a genuine multi-batch / carry-over exercise (a one-record-per-name fixture
+/// triggers neither):
+/// - The `2 * n` records span multiple byte-aligned input record-batches
+///   (`DecompressedBlock`s are record-aligned but NOT template-aligned), so some
+///   template's two mates land in consecutive input batches — exercising
+///   `GroupByQueryname`'s cross-input-batch `current_template` carry-over
+///   (`pipeline/steps/group/queryname.rs`), which a single-record-per-name
+///   fixture never triggers (every group flushes within one batch).
+/// - The `n` templates also push past `GroupByQueryname`'s 1000-template
+///   `DEFAULT_TARGET_BATCH_COUNT`, so its output-emit boundary is crossed too.
+fn create_multi_batch_filter_input(path: &Path, n: usize) {
+    let mut records = Vec::with_capacity(n * 2);
+    for i in 0..i32::try_from(n).expect("n fits in i32") {
+        let name = format!("t{i}");
+        let pos = 100 + i;
+        for (flag, mate_pos) in [
+            (flags::PAIRED | flags::FIRST_SEGMENT, pos),
+            (flags::PAIRED | flags::LAST_SEGMENT, pos + 8),
+        ] {
+            let mut b = RawSamBuilder::new();
+            b.read_name(name.as_bytes())
+                .flags(flag)
+                .ref_id(0)
+                .pos(mate_pos)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]) // 8M
+                .sequence(b"ACGTACGT")
+                .qualities(&[35; 8]);
+            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.0_f32);
+            b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
+            records.push(b.build());
+        }
+    }
+    create_consensus_bam(path, records);
+}
+
+/// The chain's multi-worker path (`--threads 4`) must match the single-threaded
+/// oracle across `GroupByQueryname`'s batch machinery: both its cross-input-batch
+/// `current_template` carry-over (a paired template whose two mates land in
+/// consecutive input record-batches) AND its 1000-template output-emit boundary.
+/// `create_multi_batch_filter_input(1200)` emits 1200 paired templates (2400
+/// records) to exercise both -- the small-fixture parity tests above (well under
+/// one batch, single-record templates) exercise neither. Compare `--threads 4`
+/// output record-for-record against the oracle.
+#[test]
+fn test_filter_chain_threads4_matches_single_threaded_multi_batch() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+    create_multi_batch_filter_input(&input_bam, 1200);
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    filter_run(&input_bam, &oracle_out, &ref_path, &[]);
+
+    let chain_out = temp_dir.path().join("chain.bam");
+    filter_run(&input_bam, &chain_out, &ref_path, &["--threads", "4"]);
+
+    let expected = read_filter_records(&oracle_out);
+    let actual = read_filter_records(&chain_out);
+    // 1200 paired templates, all passing -> all 2400 records kept on both paths.
+    assert_eq!(
+        expected.len(),
+        2400,
+        "expected all 2400 records (1200 paired passing templates) in the oracle output"
+    );
+    assert_eq!(
+        actual, expected,
+        "chain (--threads 4) output must match the single-threaded oracle record-for-record \
+         across GroupByQueryname input-batch carry-over and output-emit boundaries"
+    );
+}
+
+/// FILT3-02 on the chain path: mirrors `test_filter_rejects_coordinate_sorted_input`
+/// but with `--threads 4`, proving the `require_query_grouped` guard added to
+/// `add_filter` (builder.rs) rejects coordinate-sorted input on the chain path
+/// exactly as the legacy path does -- not just when the legacy oracle is used.
+#[test]
+fn test_filter_chain_rejects_coordinate_sorted_input() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    let header = create_coordinate_sorted_header("chr1", 10000);
+    create_consensus_bam_with_header(&input_bam, &header, filter_consensus_records());
+
+    let cmd = Filter::try_parse_from([
+        "filter",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--max-no-call-fraction",
+        "1.0",
+        "--compression-level",
+        "1",
+        "--threads",
+        "4",
+    ])
+    .expect("failed to parse filter args");
+
+    let err = cmd
+        .execute("fgumi filter")
+        .expect_err("chain path must also reject coordinate-sorted input");
+    let msg = err.to_string();
+    assert!(msg.contains("queryname sorted or query grouped"), "unexpected error message: {msg}");
+}
+
+/// FILT3-02 on the chain path, header-less variant: mirrors
+/// `test_filter_rejects_headerless_input` but with `--threads 4`. Both paths now
+/// synthesize `@HD VN:1.6 SO:unsorted` for header-less input — the legacy path
+/// via `ensure_hd_record` in `execute()`, the chain path via `ensure_hd_record`
+/// in `ChainBuilder::new` (before `add_pg_record`) — and `require_query_grouped`
+/// rejects `SO:unsorted`, so the chain path rejects header-less input with the
+/// same message. Pins chain-path header-less rejection so a future
+/// header-handling refactor cannot silently break it.
+#[test]
+fn test_filter_chain_rejects_headerless_input() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    write_headerless_consensus_bam(&input_bam);
+
+    let cmd = Filter::try_parse_from([
+        "filter",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--max-no-call-fraction",
+        "1.0",
+        "--compression-level",
+        "1",
+        "--threads",
+        "4",
+    ])
+    .expect("failed to parse filter args");
+
+    let err =
+        cmd.execute("fgumi filter").expect_err("chain path must also reject header-less input");
+    let msg = err.to_string();
+    assert!(msg.contains("queryname sorted or query grouped"), "unexpected error message: {msg}");
 }

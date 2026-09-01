@@ -4087,6 +4087,18 @@ impl<'a> ChainBuilder<'a> {
         // Validate parameter counts (1-3 values for duplex support).
         filter.validate_parameters()?;
 
+        // FILT3-02: filtering is template-based, so coordinate-sorted input
+        // silently scatters mates and corrupts the both-primaries-pass logic.
+        // Reject it here exactly as `Filter::execute`'s legacy path does, so
+        // the two orchestrations of the filter stage cannot drift on accepted
+        // orders, error text, or logging (mirrors `add_group`'s
+        // `require_group_input_ordering` call, shared verbatim with
+        // `Group::execute`).
+        crate::commands::common::require_query_grouped(
+            &self.header,
+            &input_path.display().to_string(),
+        )?;
+
         let timer = OperationTimer::new("Filtering consensus reads");
 
         // Resolve output path for log.
