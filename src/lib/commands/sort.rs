@@ -32,13 +32,15 @@ use fgumi_sort::{
 };
 
 use log::{debug, info, warn};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::commands::command::Command;
 use crate::commands::common::{
-    CompressionOptions, MaxTempFiles, MemoryLimit, MemoryReserve, parse_max_temp_files,
-    parse_memory, parse_memory_reserve, resolve_memory_budget,
+    CompressionOptions, MaxTempFiles, MemoryLimit, MemoryReserve, QueueMemoryOptions,
+    SchedulerOptions, ThreadingOptions, parse_max_temp_files, parse_memory, parse_memory_reserve,
+    resolve_memory_budget,
 };
+use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag, build_for};
 
 /// Sort order for BAM files.
 ///
@@ -251,11 +253,22 @@ pub struct Sort {
     ///
     /// When the limit is reached, sorted chunks spill to temporary files.
     ///
-    /// This bounds the in-memory record buffer, not total process RSS: ingest
-    /// decompression/parse buffers add a few percent, and the final k-way merge's
-    /// per-file read-ahead is separate again, so peak RSS runs somewhat above this
-    /// value. When sorting in a pipe alongside an aligner, size the budget to leave
-    /// headroom for the aligner's resident index on top of this.
+    /// This bounds two budgets: the in-memory record buffer (the dominant
+    /// consumer, reported on the "Max memory" log line) and the bytes held in the
+    /// queues between pipeline stages (applied, but not separately logged). It is
+    /// not a hard cap on total process RSS: ingest decompression/parse buffers add
+    /// a few percent, and the final k-way merge's per-file read-ahead is separate
+    /// again, so peak RSS runs somewhat above this value. When sorting in a pipe
+    /// alongside an aligner, size the budget to leave headroom for the aligner's
+    /// resident index on top of this.
+    ///
+    /// The two budgets scale by different thread counts: the record buffer by
+    /// max(--threads, --sort-threads) (the sort phase fills it), the queue budget
+    /// by --threads (the width of the ingest/output plumbing), so their resolved
+    /// totals can differ for the same value when --sort-threads > --threads.
+    /// Raising this value does not raise the queues' per-stage backpressure marks,
+    /// so a large or `auto` value bounds the queues at those marks, not the full
+    /// total; only a value below them tightens the queues.
     #[arg(short = 'm', long = "max-memory", default_value = "768M", value_parser = parse_memory)]
     pub max_memory: MemoryLimit,
 
@@ -276,6 +289,10 @@ pub struct Sort {
     /// memory = `max_memory` × the larger of --threads and --sort-threads, since
     /// the sort phase is what fills the in-memory buffer. Disable for fixed total
     /// memory.
+    ///
+    /// This formula is for the in-memory sort buffer. --max-memory also bounds
+    /// the inter-stage queue budget (see its docs), which scales by --threads
+    /// alone, so the two totals differ when --sort-threads > --threads.
     #[arg(long = "memory-per-thread", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub memory_per_thread: bool,
 
@@ -488,6 +505,95 @@ impl Sort {
             // Chain-engine defaults (see `SortOptions` docs) — not yet CLI flags.
             block_batch: 4,
             file_granularity: false,
+        }
+    }
+
+    /// Projects the sort command's single memory budget onto the pipeline's
+    /// inter-stage queue budget ([`QueueMemoryOptions`]).
+    ///
+    /// The sort command exposes exactly one memory knob (`--max-memory`, plus
+    /// `--memory-reserve` and `--memory-per-thread`), so that one knob bounds
+    /// *both* the sorter's in-memory record buffer (via [`Self::to_sort_options`])
+    /// and the bytes held in the queues between pipeline stages. Without this the
+    /// chain hardcoded `QueueMemoryOptions::default()` (768 MiB/thread), so a small
+    /// `--max-memory` shrank the record buffer while the queues stayed large.
+    ///
+    /// The two budgets do not resolve to the same *number*: the sorter scales by
+    /// `max(--threads, --sort-threads)` (`memory_budget_threads`, since the
+    /// sort phase is what fills the buffer), whereas the queue budget scales by
+    /// plain `--threads` (the width of the ingest/output plumbing the queues
+    /// track). So a run with `--sort-threads` > `--threads` resolves a larger
+    /// per-command sorter budget than queue budget for the same `--max-memory`;
+    /// that asymmetry is intentional, not a drift.
+    ///
+    /// Two consequences of sharing the flag are deliberate and benign:
+    /// - The default queue budget now follows `--max-memory`'s default (`"768M"`
+    ///   = 768 MB decimal via the size parser), marginally below the former
+    ///   hardcoded `QueueMemoryOptions::default()` of 768 MiB. This aligns the
+    ///   queue default with the sorter's own default rather than leaving the two
+    ///   at different units.
+    /// - A large or `auto` `--max-memory` does not balloon queue memory: raising
+    ///   the queue *total* does not raise the per-stage backpressure high-water
+    ///   marks (512 MiB / 256 MiB — see [`QueueMemoryOptions`] and issue #765),
+    ///   which is what actually bounds in-flight queue bytes. A budget *below*
+    ///   those marks tightens them (the point of a small `--max-memory`); a budget
+    ///   above them leaves them alone.
+    #[must_use]
+    pub fn queue_memory_options(&self) -> QueueMemoryOptions {
+        QueueMemoryOptions {
+            max_memory: self.max_memory,
+            memory_reserve: self.memory_reserve,
+            memory_per_thread: self.memory_per_thread,
+        }
+    }
+
+    /// Builds the declarative [`ChainSpec`] that `fgumi sort` runs.
+    ///
+    /// Extracted from [`Self::execute_sort`] so the wiring is unit-testable: the
+    /// spec's `queue_memory` (see [`Self::queue_memory_options`]), `stages`,
+    /// `threading`, and `write_index`-selected sink are all otherwise only
+    /// exercised through a full run, where a dropped knob is invisible (it does
+    /// not change output bytes).
+    ///
+    /// `resolved_tmp_dirs` is the already-resolved temp-dir list (CLI flags with
+    /// the `FGUMI_TMP_DIRS` fallback applied); it is baked into the `SortOptions`
+    /// verbatim because `add_sort` reads `SortOptions.tmp_dirs` and never consults
+    /// the environment.
+    fn build_sort_chain_spec(
+        &self,
+        output: &Path,
+        resolved_tmp_dirs: Vec<PathBuf>,
+        command_line: &str,
+    ) -> ChainSpec {
+        let mut sort_options = self.to_sort_options();
+        sort_options.tmp_dirs = resolved_tmp_dirs;
+
+        let stage_opts = StageOptionsBag { sort: Some(sort_options), ..Default::default() };
+        let sink = if self.write_index {
+            SinkSpec::BamWithIndex(output.to_path_buf())
+        } else {
+            SinkSpec::Bam(output.to_path_buf())
+        };
+        ChainSpec {
+            stages: vec![Stage::Sort],
+            source: SourceSpec::Bam(self.input.clone()),
+            sink,
+            stage_opts,
+            threading: ThreadingOptions { threads: Some(self.threads) },
+            compression: self.compression.clone(),
+            // Match sibling chain commands (10s), not the derived Default (0 = monitor off).
+            scheduler: SchedulerOptions { deadlock_timeout: 10, ..Default::default() },
+            // The single `--max-memory` knob bounds the inter-stage queue budget too,
+            // not just the sorter buffer (see `queue_memory_options`). The queue
+            // budget scales by `--threads`; the sorter's by max(threads, sort_threads).
+            queue_memory: self.queue_memory_options(),
+            async_reader: false,
+            // The owned engine always verified CRC (incl. stdin); keep parity -- a future
+            // PR can add --no-check-crc if opt-out is wanted. `effective_check_crc()` would
+            // skip verification for stdin input (the file-vs-stdin default other commands
+            // use), which is a silent regression from the owned sorter's behavior.
+            verify_crc: true,
+            command_line: command_line.to_string(),
         }
     }
 }
@@ -871,43 +977,12 @@ impl Sort {
         // --- cutover: run via the chain instead of sorter.sort() ---
         // (self.build_sorter above is retained only to source the banner's thread/temp-file
         //  numbers; the owned sorter is not executed. PR B removes the owned engine + banner-build.)
-        use crate::commands::common::{QueueMemoryOptions, SchedulerOptions, ThreadingOptions};
-        use crate::pipeline::chains::{
-            ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag, build_for,
-        };
-
-        // `output` is already bound at the top of this method (validated in
-        // `execute`); reuse it rather than re-`expect`ing.
-
-        // Bake resolved tmp dirs (incl. FGUMI_TMP_DIRS) into SortOptions — add_sort uses
-        // SortOptions.tmp_dirs verbatim and never reads the env var; to_sort_options copies raw.
-        let mut sort_options = self.to_sort_options();
-        sort_options.tmp_dirs = resolved_tmp_dirs; // already resolved above for the banner
-
-        let stage_opts = StageOptionsBag { sort: Some(sort_options), ..Default::default() };
-        let sink = if self.write_index {
-            SinkSpec::BamWithIndex(output.clone())
-        } else {
-            SinkSpec::Bam(output.clone())
-        };
-        let spec = ChainSpec {
-            stages: vec![Stage::Sort],
-            source: SourceSpec::Bam(self.input.clone()),
-            sink,
-            stage_opts,
-            threading: ThreadingOptions { threads: Some(self.threads) },
-            compression: self.compression.clone(),
-            // Match sibling chain commands (10s), not the derived Default (0 = monitor off).
-            scheduler: SchedulerOptions { deadlock_timeout: 10, ..Default::default() },
-            queue_memory: QueueMemoryOptions::default(),
-            async_reader: false,
-            // The owned engine always verified CRC (incl. stdin); keep parity -- a future
-            // PR can add --no-check-crc if opt-out is wanted. `effective_check_crc()` would
-            // skip verification for stdin input (the file-vs-stdin default other commands
-            // use), which is a silent regression from the owned sorter's behavior.
-            verify_crc: true,
-            command_line: command_line.to_string(),
-        };
+        //
+        // `output` is already bound at the top of this method (validated in `execute`),
+        // and `resolved_tmp_dirs` was resolved above for the banner; hand both to the
+        // (unit-tested) spec builder. `resolved_tmp_dirs` is moved here — its last
+        // borrow was the banner log above.
+        let spec = self.build_sort_chain_spec(output, resolved_tmp_dirs, command_line);
         build_for(spec)?.run()
     }
 
@@ -1196,6 +1271,118 @@ mod tests {
         let sort = Sort::try_parse_from(args).expect("parse should succeed");
         assert_eq!(sort.sort_threads, expected_sort);
         assert_eq!(sort.merge_threads, expected_merge);
+    }
+
+    /// The single `--max-memory` knob must drive the pipeline's queue budget too,
+    /// not just the sorter buffer. The helper projects the command's three memory
+    /// flags 1:1 onto `QueueMemoryOptions`, so a run's queue budget agrees with its
+    /// sorter budget on those fields (one flag, both budgets). Assert against the
+    /// parsed command fields rather than hardcoded byte counts — the byte math is
+    /// the memory-size parser's contract, not this projection's.
+    #[rstest]
+    #[case::defaults(&[])]
+    #[case::small_fixed(&["-m", "64KiB"])]
+    #[case::auto_with_reserve(&["-m", "auto", "--memory-reserve", "8GiB"])]
+    #[case::fixed_total(&["-m", "2GiB", "--memory-per-thread", "false"])]
+    fn test_queue_memory_options_projects_command_flags(#[case] extra: &[&str]) {
+        let base = ["sort", "-i", "in.bam", "-o", "out.bam", "--order", "coordinate"];
+        let args: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
+        let sort = Sort::try_parse_from(args).expect("parse should succeed");
+
+        let queue = sort.queue_memory_options();
+        assert_eq!(queue.max_memory, sort.max_memory);
+        assert_eq!(queue.memory_reserve, sort.memory_reserve);
+        assert_eq!(queue.memory_per_thread, sort.memory_per_thread);
+
+        // One flag drives both budgets: the queue options must agree with the
+        // sorter options on the three shared memory fields.
+        let sorter = sort.to_sort_options();
+        assert_eq!(queue.max_memory, sorter.max_memory);
+        assert_eq!(queue.memory_reserve, sorter.memory_reserve);
+        assert_eq!(queue.memory_per_thread, sorter.memory_per_thread);
+    }
+
+    /// Regression guard for the exact bug this follow-up fixes: before threading
+    /// `--max-memory` into `queue_memory`, the chain hardcoded
+    /// `QueueMemoryOptions::default()` (768 MiB/thread), so a small `--max-memory`
+    /// shrank the sorter buffer while the queues stayed large. A small explicit
+    /// value must now move the queue budget off that default.
+    #[test]
+    fn small_max_memory_moves_queue_budget_off_default() {
+        let sort = Sort::try_parse_from([
+            "sort",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--order",
+            "coordinate",
+            "-m",
+            "64KiB",
+        ])
+        .expect("parse should succeed");
+
+        let queue = sort.queue_memory_options();
+        assert_ne!(
+            queue.max_memory,
+            QueueMemoryOptions::default().max_memory,
+            "a small --max-memory must move the queue budget off the 768 MiB default",
+        );
+        assert_eq!(queue.max_memory, sort.max_memory);
+    }
+
+    /// The projection helper being correct is not enough: the whole point of this
+    /// change is line-of-code wiring — that `execute_sort`'s `ChainSpec` actually
+    /// carries `queue_memory_options()` (and the other flag-derived fields). That
+    /// wiring is invisible to a full run (the queue budget does not change output
+    /// bytes) and to the isolated helper tests, so reverting it to
+    /// `QueueMemoryOptions::default()` would keep every other test green. Assert on
+    /// the built spec directly. `QueueMemoryOptions` has no `PartialEq`, so compare
+    /// its fields rather than the whole struct.
+    #[rstest]
+    #[case::plain(false)]
+    #[case::write_index(true)]
+    fn build_sort_chain_spec_wires_flags_into_the_spec(#[case] write_index: bool) {
+        let mut args = vec![
+            "sort",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--order",
+            "coordinate",
+            "-m",
+            "64KiB",
+            "-@",
+            "3",
+        ];
+        if write_index {
+            args.push("--write-index");
+        }
+        let sort = Sort::try_parse_from(args).expect("parse should succeed");
+
+        let spec =
+            sort.build_sort_chain_spec(Path::new("out.bam"), Vec::new(), "fgumi sort (test)");
+
+        // The queue budget must carry the parsed --max-memory, not the default.
+        assert_eq!(spec.queue_memory.max_memory, sort.max_memory);
+        assert_eq!(spec.queue_memory.memory_reserve, sort.memory_reserve);
+        assert_eq!(spec.queue_memory.memory_per_thread, sort.memory_per_thread);
+        assert_ne!(
+            spec.queue_memory.max_memory,
+            QueueMemoryOptions::default().max_memory,
+            "the spec must carry the parsed --max-memory, proving the wiring is live",
+        );
+
+        // The other flag-derived spec fields the run relies on.
+        assert_eq!(spec.stages, vec![Stage::Sort]);
+        assert_eq!(spec.threading.threads, Some(sort.threads));
+        assert!(matches!(spec.source, SourceSpec::Bam(_)));
+        assert!(spec.verify_crc);
+        match (write_index, &spec.sink) {
+            (true, SinkSpec::BamWithIndex(_)) | (false, SinkSpec::Bam(_)) => {}
+            (wi, other) => panic!("write_index={wi} produced the wrong sink: {other:?}"),
+        }
     }
 
     /// The flags must actually reach the sorter. This cannot be checked through
