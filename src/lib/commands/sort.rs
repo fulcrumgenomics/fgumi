@@ -738,6 +738,28 @@ impl Sort {
         }
     }
 
+    /// Effective Phase-1 (accumulate/sort/spill) worker count.
+    ///
+    /// Mirrors `RawExternalSorter::phase1_threads` in
+    /// `fgumi-sort/src/external.rs` exactly. Duplicated rather than shared:
+    /// the engine's own version is used only internally by
+    /// `SortBuffer::from_sorter` after this method replaces the CLI's only
+    /// other caller, so there is no third call site to justify a cross-crate
+    /// export. Kept honest by `test_phase_threads_match_sorters_formula`
+    /// here and the engine's own equivalent unit tests in `fgumi-sort`.
+    // Used by the startup banner; will be wired in Task 2
+    #[allow(dead_code)]
+    fn phase1_threads(&self) -> usize {
+        self.sort_threads.unwrap_or(self.threads).max(1)
+    }
+
+    /// Effective Phase-2 (merge/write) worker count. See `phase1_threads`.
+    // Used by the startup banner; will be wired in Task 2
+    #[allow(dead_code)]
+    fn phase2_threads(&self) -> usize {
+        self.merge_threads.unwrap_or(self.threads).max(1)
+    }
+
     /// Initial buffer pre-allocation for `--max-memory auto`, in bytes.
     ///
     /// Capped at 768 MiB per budget thread (matching the samtools default) so an
@@ -1410,6 +1432,33 @@ mod tests {
             sort.build_sorter(512 * 1024 * 1024, "fgumi sort (test)", fgumi_sort::soft_nofile());
         assert_eq!(sorter.phase1_threads(), expected_phase1);
         assert_eq!(sorter.phase2_threads(), expected_phase2);
+    }
+
+    /// The sorter-free phase thread helpers `Sort::phase1_threads` /
+    /// `Sort::phase2_threads` must match the engine's own formula, since
+    /// they replace the CLI's only other caller of `RawExternalSorter`'s
+    /// methods. This test uses the same case table as
+    /// `test_build_sorter_wires_per_phase_threads` to ensure both paths
+    /// produce the same results end to end.
+    #[rstest]
+    #[case::defaults(None, None, 2, 2)]
+    #[case::narrow_sort(Some(1), Some(4), 1, 4)]
+    #[case::narrow_merge(Some(4), Some(1), 4, 1)]
+    #[case::sort_only(Some(3), None, 3, 2)]
+    #[case::merge_only(None, Some(3), 2, 3)]
+    fn test_phase_threads_match_sorters_formula(
+        #[case] sort_threads: Option<usize>,
+        #[case] merge_threads: Option<usize>,
+        #[case] expected_phase1: usize,
+        #[case] expected_phase2: usize,
+    ) {
+        let mut sort = make_sort(SortOrderArg::Coordinate);
+        sort.threads = 2;
+        sort.sort_threads = sort_threads;
+        sort.merge_threads = merge_threads;
+
+        assert_eq!(sort.phase1_threads(), expected_phase1);
+        assert_eq!(sort.phase2_threads(), expected_phase2);
     }
 
     /// The per-thread budget sizes the buffer the sort phase fills, so it follows
