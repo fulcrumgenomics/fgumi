@@ -738,21 +738,20 @@ impl Sort {
 
     /// Effective Phase-1 (accumulate/sort/spill) worker count.
     ///
-    /// Mirrors `RawExternalSorter::phase1_threads` in
-    /// `fgumi-sort/src/external.rs` exactly. Duplicated rather than shared:
-    /// the engine's own version is used only internally by
-    /// `SortBuffer::from_sorter` after this method replaces the CLI's only
-    /// other caller, so there is no third call site to justify a cross-crate
-    /// export. Kept honest by `test_phase_threads_match_sorters_formula`
+    /// Delegates to `pipeline::chains::builder::resolve_phase_threads`, the
+    /// same intra-crate resolver the chain uses to size the streaming sorter
+    /// in `add_sort` — so the banner reports exactly the per-phase counts the
+    /// chain will actually run with, rather than a separately maintained copy
+    /// of the formula. Kept honest by `test_phase_threads_match_sorters_formula`
     /// (values) and `test_phase_threads_match_engine` (direct parity with
     /// the engine's formula) here.
     fn phase1_threads(&self) -> usize {
-        self.sort_threads.unwrap_or(self.threads).max(1)
+        crate::pipeline::chains::builder::resolve_phase_threads(self.sort_threads, self.threads)
     }
 
     /// Effective Phase-2 (merge/write) worker count. See `phase1_threads`.
     fn phase2_threads(&self) -> usize {
-        self.merge_threads.unwrap_or(self.threads).max(1)
+        crate::pipeline::chains::builder::resolve_phase_threads(self.merge_threads, self.threads)
     }
 
     /// The spill-file consolidation limit this command will use.
@@ -1428,6 +1427,27 @@ mod tests {
         assert_eq!(sort.memory_budget_threads(), expected);
     }
 
+    /// `memory_budget_threads` sizes the sort buffer for at least as many workers
+    /// as the sort phase runs. Guards that relationship (with `phase1_threads` now
+    /// delegating to the chain's resolver) so the two cannot silently diverge for
+    /// threads >= 1; at threads == 0 they intentionally differ (budget is 0).
+    #[rstest]
+    #[case::defaults(1, None)]
+    #[case::threads_only(4, None)]
+    #[case::sort_above_threads(1, Some(8))]
+    #[case::sort_below_threads(32, Some(4))]
+    #[case::sort_equals_threads(4, Some(4))]
+    #[case::zero_sort_override(4, Some(0))]
+    fn test_memory_budget_covers_phase1(
+        #[case] threads: usize,
+        #[case] sort_threads: Option<usize>,
+    ) {
+        let mut sort = make_sort(SortOrderArg::Coordinate);
+        sort.threads = threads;
+        sort.sort_threads = sort_threads;
+        assert_eq!(sort.memory_budget_threads(), sort.threads.max(sort.phase1_threads()));
+    }
+
     /// The `Max memory:` line names whichever flag supplied the multiplier.
     ///
     /// `--threads` is the floor, so it stays the attributed source whenever it
@@ -1686,9 +1706,6 @@ mod tests {
         // so it exercises the same consolidation behavior.
         let run = |max_temp_files: MaxTempFiles, out: PathBuf| {
             let mut sort = make_sort(SortOrderArg::Coordinate);
-            sort.input = input.clone();
-            sort.output = Some(out.clone());
-            sort.threads = 1;
             sort.max_temp_files = max_temp_files;
 
             let sorter = fgumi_sort::RawExternalSorter::new(sort.order.into())
