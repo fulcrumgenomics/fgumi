@@ -446,9 +446,6 @@ impl Command for Duplex {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     fn execute(&self, command_line: &str) -> Result<()> {
-        // Start timing
-        let timer = OperationTimer::new("Calling duplex consensus");
-
         // Validate the input exists (stdin paths are exempt — the reader
         // streams them in a single pass).
         self.io.validate()?;
@@ -463,6 +460,23 @@ impl Command for Duplex {
 
         // Validate consensus arguments (e.g. error rates must be > 0).
         self.validate()?;
+
+        // ---- --threads N on a consensus build: run on the declarative chain ----
+        // Dispatch here, after the reader-free pre-flight (io.validate /
+        // output-collision / validate — which must run on both paths) and BEFORE
+        // building the timer/reader below, because `execute_chain` -> `add_duplex`
+        // builds its own timer and reader. Placing the dispatch above the timer
+        // avoids logging the "Calling duplex consensus" start line twice on the
+        // threaded path. On a non-consensus build the chain machinery isn't
+        // compiled, so this block is absent and we fall through to legacy.
+        #[cfg(feature = "consensus")]
+        if self.threading.threads.is_some() {
+            return self.execute_chain(command_line);
+        }
+
+        // Start timing (legacy single-threaded path only; the chain path above
+        // builds its own timer).
+        let timer = OperationTimer::new("Calling duplex consensus");
 
         // Get threading configuration (duplex is worker-heavy with consensus calling)
         let reader_threads = self.threading.num_threads();
@@ -790,6 +804,37 @@ impl Duplex {
     /// raw `min_reads` slice rather than reading it off a constructed caller.
     fn allows_single_strand_consensus(&self) -> bool {
         DuplexConsensusCaller::allows_single_strand_consensus(&self.min_reads)
+    }
+
+    /// Run the duplex stage on the declarative chain builder (the `--threads N`
+    /// path on a `consensus`-feature build).
+    ///
+    /// Replaces the hand-rolled unified-pipeline construction in `execute` for
+    /// the threaded case. The chain opens its own source, validates the
+    /// template-coordinate sort order, calls consensus, writes the output BAM,
+    /// and writes the rejects/stats via `DuplexFinalizeHook` — all through the
+    /// same shared helpers as the non-chain path, so the two orchestrations stay
+    /// in parity. The no-`--threads` path keeps its own single-threaded fast
+    /// path in `execute`, which is the in-process parity oracle for this one
+    /// (see `test_duplex_chain_matches_single_threaded`).
+    #[cfg(feature = "consensus")]
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        use crate::pipeline::chains::{
+            ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
+        };
+        self.io.log_effective_check_crc();
+        let stage_opts =
+            StageOptionsBag { duplex: Some(self.to_duplex_options()), ..Default::default() };
+        let ctx = SingleStageContext {
+            io: &self.io,
+            threading: &self.threading,
+            compression: &self.compression,
+            scheduler: &self.scheduler_opts,
+            queue_memory: &self.queue_memory,
+            command_line,
+        };
+        let spec = ChainSpec::single_stage(Stage::Duplex, stage_opts, &ctx);
+        build_for(spec)?.run()
     }
 
     /// Execute using 7-step unified pipeline with --threads.
