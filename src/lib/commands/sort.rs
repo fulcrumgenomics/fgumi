@@ -744,7 +744,8 @@ impl Sort {
     /// `SortBuffer::from_sorter` after this method replaces the CLI's only
     /// other caller, so there is no third call site to justify a cross-crate
     /// export. Kept honest by `test_phase_threads_match_sorters_formula`
-    /// here and the engine's own equivalent unit tests in `fgumi-sort`.
+    /// (values) and `test_phase_threads_match_engine` (direct parity with
+    /// the engine's formula) here.
     fn phase1_threads(&self) -> usize {
         self.sort_threads.unwrap_or(self.threads).max(1)
     }
@@ -891,17 +892,17 @@ impl Sort {
                 info!("Max memory: {} (fixed)", ByteSize(effective_memory as u64));
             }
         }
-        // Read the counts off the sorter rather than off `--threads`, which is
-        // only where `--sort-threads`/`--merge-threads` default from: logging the
-        // flag alone reports 1 thread for a run that was asked for more.
+        // Report the effective per-phase thread counts (not the raw --threads,
+        // which is only where --sort-threads/--merge-threads default from):
+        // logging the flag alone reports 1 thread for a run that asked for more.
         info!(
             "Threads: {}",
             fgumi_sort::format_thread_counts(self.phase1_threads(), self.phase2_threads())
         );
         info!("Temp compression level: {}", self.temp_compression);
-        // Read off the sorter, like the thread counts above: it is the number
-        // the engine will actually consolidate at, so it cannot drift from what
-        // this line reports.
+        // The resolved max-temp-files the sort will actually consolidate at,
+        // sourced the same way as the thread counts above so the banner cannot
+        // drift from the value handed to the sort.
         let max_temp_files = self.resolved_max_temp_files(soft_nofile);
         info!("{}", max_temp_files_log_line(self.max_temp_files, max_temp_files, soft_nofile));
         if let Some(warning) = fd_budget_warning(self.max_temp_files, max_temp_files, soft_nofile) {
@@ -1365,6 +1366,39 @@ mod tests {
 
         assert_eq!(sort.phase1_threads(), expected_phase1);
         assert_eq!(sort.phase2_threads(), expected_phase2);
+    }
+
+    /// The CLI's `phase1_threads`/`phase2_threads` are hand-copied from
+    /// `RawExternalSorter`'s formula. Pin them against the engine directly so
+    /// the two copies cannot drift silently (both would otherwise stay green
+    /// against their own tables).
+    #[rstest]
+    #[case::defaults(2, None, None)]
+    #[case::narrow_sort(2, Some(1), Some(4))]
+    #[case::narrow_merge(2, Some(4), Some(1))]
+    #[case::sort_only(2, Some(3), None)]
+    #[case::merge_only(2, None, Some(3))]
+    #[case::zero_sort_override_clamps(4, Some(0), None)]
+    #[case::zero_merge_override_clamps(4, None, Some(0))]
+    fn test_phase_threads_match_engine(
+        #[case] threads: usize,
+        #[case] sort_threads: Option<usize>,
+        #[case] merge_threads: Option<usize>,
+    ) {
+        let mut sort = make_sort(SortOrderArg::Coordinate);
+        sort.threads = threads;
+        sort.sort_threads = sort_threads;
+        sort.merge_threads = merge_threads;
+
+        let mut engine = fgumi_sort::RawExternalSorter::new(sort.order.into()).threads(threads);
+        if let Some(n) = sort_threads {
+            engine = engine.sort_threads(n);
+        }
+        if let Some(n) = merge_threads {
+            engine = engine.merge_threads(n);
+        }
+        assert_eq!(sort.phase1_threads(), engine.phase1_threads());
+        assert_eq!(sort.phase2_threads(), engine.phase2_threads());
     }
 
     /// The per-thread budget sizes the buffer the sort phase fills, so it follows
