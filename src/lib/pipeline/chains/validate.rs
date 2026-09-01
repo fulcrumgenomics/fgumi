@@ -37,7 +37,15 @@ fn stage_ord(stage: Stage) -> usize {
         Stage::Zipper => 3,
         Stage::Sort => 4,
         Stage::Group => 5,
-        Stage::Clip | Stage::Dedup | Stage::Downsample => 6,
+        // Retag is a standalone-only per-record transform; it only ever appears
+        // as the sole stage of a `fgumi retag` chain, so its rank is nominal and
+        // it joins the post-group standalone bucket. `validate_stage_progression`
+        // rejects any multi-stage chain containing Retag outright, so this rank is
+        // never actually exercised against a neighbour — if a future fused chain
+        // ever pairs Retag with another stage, drop that standalone-only guard and
+        // revisit this rank (at 6 the non-decreasing rule would reject a trailing
+        // Sort/Group but accept a leading one).
+        Stage::Clip | Stage::Dedup | Stage::Retag | Stage::Downsample => 6,
         Stage::Simplex | Stage::Duplex | Stage::Codec => 7,
         Stage::Filter => 8,
         // Terminal BAM→FASTQ export. Only ever appears as the sole stage of a
@@ -50,6 +58,8 @@ fn stage_ord(stage: Stage) -> usize {
 ///
 /// Rules:
 /// - At least one stage (empty chain is meaningless).
+/// - `Stage::Retag` is standalone-only — it must be the sole stage of a chain
+///   (a multi-stage chain containing Retag is rejected).
 /// - Each adjacent pair must be non-decreasing in `stage_ord`.
 /// - At most one `Align` per chain (mutually exclusive with `Zipper`).
 /// - At most one `Zipper` per chain (mutually exclusive with `Align`).
@@ -67,6 +77,23 @@ pub fn validate_stage_progression(spec: &ChainSpec) -> Result<()> {
     let stages = &spec.stages;
     if stages.is_empty() {
         bail!("ChainSpec.stages is empty — a chain needs at least one stage");
+    }
+
+    // Retag is standalone-only: it is only ever the sole stage of a `fgumi retag`
+    // chain (routed via `ChainSpec::single_stage`). A multi-stage chain containing
+    // Retag is not a shape any command builds or that the retag step is tested for
+    // — and `[Sort, Retag]` in particular slips past the non-decreasing ord rule
+    // below (Sort ord 4 <= Retag ord 6), leaving an untested fused sort→retag path
+    // that terminal `add_retag` would happily consume. Reject it here, at the spec
+    // boundary, before progression validation succeeds. Checked ahead of the
+    // ordering loop so `[Retag, Sort]` gets this precise message rather than the
+    // generic "canonical pipeline order" one.
+    if stages.len() > 1 && stages.contains(&Stage::Retag) {
+        bail!(
+            "Stage::Retag is standalone-only: it must be the sole stage of a chain, \
+             but got a {}-stage chain containing Retag ({stages:?})",
+            stages.len(),
+        );
     }
 
     // Extract must be first when present.
@@ -173,6 +200,18 @@ pub fn validate_stage_opts_present(spec: &ChainSpec) -> Result<()> {
             Stage::Codec => bag.codec.is_some(),
             Stage::Dedup => bag.dedup.is_some(),
             Stage::Filter => bag.filter.is_some(),
+            // Retag requires its options AND at least one operation. The CLI
+            // enforces `>= 1` via clap (`required = true, num_args = 1..`), but a
+            // directly-constructed `ChainSpec` could pass
+            // `Some(RetagOptions { operations: vec![], .. })`, which would make
+            // Retag a no-op that rewrites nothing — silently defeating the
+            // required-operation contract. Reject the empty case here, at the
+            // spec-construction boundary, rather than let it build.
+            Stage::Retag => match bag.retag.as_ref() {
+                Some(retag) if !retag.operations.is_empty() => true,
+                Some(_) => bail!("Stage::Retag requires at least one operation"),
+                None => false,
+            },
             Stage::Clip => bag.clip.is_some(),
             #[cfg(feature = "consensus")]
             Stage::Simplex => bag.simplex.is_some(),
@@ -548,6 +587,34 @@ mod tests {
         assert!(err.to_string().contains("canonical pipeline order"));
     }
 
+    #[rstest]
+    #[case::sort_then_retag(vec![Stage::Sort, Stage::Retag])]
+    #[case::retag_then_sort(vec![Stage::Retag, Stage::Sort])]
+    #[case::group_then_retag(vec![Stage::Group, Stage::Retag])]
+    fn retag_multi_stage_rejected(#[case] stages: Vec<Stage>) {
+        // Retag is standalone-only (the sole stage of a `fgumi retag` chain). A
+        // multi-stage chain containing Retag — in either order — must be rejected
+        // at the spec boundary. `[Sort, Retag]` is the case the non-decreasing ord
+        // rule would otherwise accept (Sort ord 4 <= Retag ord 6), leaving an
+        // untested fused sort→retag path.
+        let err = validate_stage_progression(&empty_spec(stages)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Retag"), "expected Retag in error, got: {msg}");
+        assert!(
+            msg.contains("standalone-only"),
+            "expected the standalone-only rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn retag_single_stage_accepted() {
+        // The valid case: Retag as the sole stage of a chain must still pass
+        // progression — the standalone-only guard must not reject the shape the
+        // `fgumi retag` command actually builds.
+        validate_stage_progression(&empty_spec(vec![Stage::Retag]))
+            .expect("lone Stage::Retag must be a valid progression");
+    }
+
     #[test]
     fn align_and_zipper_mutually_exclusive() {
         let spec = empty_spec(vec![Stage::Align, Stage::Zipper]);
@@ -600,6 +667,34 @@ mod tests {
         let spec = empty_spec(vec![Stage::Correct]);
         let err = validate_stage_opts_present(&spec).unwrap_err();
         assert!(err.to_string().contains("Correct"));
+    }
+
+    #[test]
+    fn opts_present_retag_rejects_empty_operations() {
+        // The CLI enforces `>= 1` operation via clap, but a directly-constructed
+        // `ChainSpec` could pass empty operations, making Retag a silent no-op.
+        // `validate_stage_opts_present` must reject it at the spec boundary.
+        use crate::commands::retag::RetagOptions;
+        let mut spec = empty_spec(vec![Stage::Retag]);
+        spec.stage_opts.retag = Some(RetagOptions { operations: vec![], metrics: None });
+        let msg = validate_stage_opts_present(&spec).unwrap_err().to_string();
+        assert!(
+            msg.contains("at least one operation"),
+            "expected the empty-operations error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn opts_present_retag_accepts_populated_operations() {
+        use crate::commands::retag::{RetagOp, RetagOptions};
+        use crate::sam::SamTag;
+        let mut spec = empty_spec(vec![Stage::Retag]);
+        spec.stage_opts.retag = Some(RetagOptions {
+            operations: vec![RetagOp::Delete { src: SamTag::RX }],
+            metrics: None,
+        });
+        validate_stage_opts_present(&spec)
+            .expect("Retag with at least one operation must pass options-presence validation");
     }
 
     #[test]

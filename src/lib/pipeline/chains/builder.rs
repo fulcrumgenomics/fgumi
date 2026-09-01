@@ -1081,7 +1081,18 @@ impl<'a> ChainBuilder<'a> {
     /// other first stages (group/dedup/consensus/clip) need the full
     /// position/cell key, so they fall through to [`Self::bam_group_key_config`].
     fn source_group_key_config(&self) -> fgumi_bam_io::GroupKeyConfig {
-        if matches!(self.spec.stages.first(), Some(Stage::Correct | Stage::Sort)) {
+        if matches!(self.spec.stages.first(), Some(Stage::Retag)) {
+            // Retag is a pure per-record transform that never reads the group key
+            // (the deleted run_threaded used `new_raw_no_cell` for the same reason),
+            // so it takes the cheap name-hash key and skips the per-record aux-tag
+            // scan + CIGAR walk `bam_group_key_config` would compute. Use a DEFAULT
+            // library index rather than `LibraryIndex::from_header`: `name_hash_only`
+            // ignores `library_index` entirely, and `from_header` panics on a header
+            // with >65,535 @RG libraries — a crash the serial oracle
+            // (`run_single_threaded`) never has, so routing Retag through the shared
+            // `from_header` arm would newly expose `--threads` to it.
+            fgumi_bam_io::GroupKeyConfig::name_hash_only(fgumi_bam_io::LibraryIndex::default())
+        } else if matches!(self.spec.stages.first(), Some(Stage::Correct | Stage::Sort)) {
             let library_index = fgumi_bam_io::LibraryIndex::from_header(&self.header);
             fgumi_bam_io::GroupKeyConfig::name_hash_only(library_index)
         } else {
@@ -1277,6 +1288,7 @@ impl<'a> ChainBuilder<'a> {
         match stage {
             Stage::Dedup => self.add_dedup(position),
             Stage::Filter => self.add_filter(position),
+            Stage::Retag => self.add_retag(position),
             Stage::Clip => self.add_clip(position),
             Stage::Sort => self.add_sort(position),
             Stage::Group => self.add_group(position),
@@ -4240,6 +4252,104 @@ impl<'a> ChainBuilder<'a> {
         self.finalize.push(Box::new(FilterFinalizeHook {
             accumulators,
             has_rejects: track_rejects,
+            timer,
+        }));
+
+        Ok(())
+    }
+
+    /// Retag-specific step: a single per-record `ProcessOrdered` transform.
+    ///
+    /// retag is a pure per-record tag rewriter (no grouping, no rejects), so this
+    /// mirrors `add_filter`'s `(false, false)` branch: consume the
+    /// `DecodedRecordBatch` tail, apply the ops, serialise every record. The
+    /// `OperationTimer` + `Starting Retag` banner are constructed here (matching
+    /// `add_filter`/`add_dedup` — the builder owns the banner, not the command's
+    /// `execute_chain`), and the timer is moved into `RetagFinalizeHook`. Two
+    /// finalize hooks are registered: a success-only `RetagMetricsFinalizeHook`
+    /// (warn-on-zero + `--metrics` TSV, so a failed run publishes neither) and an
+    /// always-run `RetagFinalizeHook` (summary banner + timer completion).
+    ///
+    /// # Errors
+    /// Returns an error if `position` is `Intermediate`, if the chain tail is not
+    /// a record stream, or if the retag options are missing from the bag.
+    fn add_retag(&mut self, position: StagePosition) -> Result<()> {
+        use crate::commands::common::warn_unwired_pipeline_flags;
+        use crate::logging::OperationTimer;
+        use crate::pipeline::chains::commands::retag::{
+            RetagFinalizeHook, RetagMetricsFinalizeHook, build_retag_process_step,
+        };
+        use crate::validation::validate_file_exists;
+        use fgumi_bam_io::is_stdin_path;
+        use log::info;
+
+        if position == StagePosition::Intermediate {
+            bail!(
+                "intermediate retag not implemented; retag is a standalone terminal transform \
+                 (no runall combination requires it as an intermediate stage)"
+            );
+        }
+
+        // retag consumes a record stream (DecodedRecordBatch), like filter/clip/dedup.
+        if self.chain_tail_kind != ChainTailKind::DecodedRecordBatch {
+            bail!(
+                "Stage::Retag requires a record-stream input (DecodedRecordBatch), but the chain \
+                 tail is {:?}; retag cannot follow a stage that emits grouped templates or \
+                 serialized bytes.",
+                self.chain_tail_kind
+            );
+        }
+
+        let retag = self
+            .spec
+            .stage_opts
+            .retag
+            .as_ref()
+            .ok_or_else(|| anyhow!("Stage::Retag options missing from StageOptionsBag"))?;
+
+        let tail = self.current_tail.expect("add_retag called before add_source");
+
+        let input_path = self.resolve_log_input_path();
+        if !is_stdin_path(&input_path) {
+            validate_file_exists(&input_path, "Input BAM")?;
+        }
+
+        let timer = OperationTimer::new("Rewriting tags");
+        let output_path = self.spec.sink.path().clone();
+        info!("Starting Retag");
+        info!("Input: {}", input_path.display());
+        info!("Output: {}", output_path.display());
+        for op in &retag.operations {
+            info!("Operation: {op}");
+        }
+
+        warn_unwired_pipeline_flags(&self.spec.scheduler);
+        let num_threads = self.spec.threading.num_threads();
+        info!("{}", self.spec.threading.log_message());
+        info!("Using pipeline with {num_threads} threads");
+
+        let setup = retag.setup_pipeline(num_threads);
+        let accumulators = Arc::clone(&setup.collected_metrics);
+
+        let captures = retag.process_captures(&setup);
+        let step = build_retag_process_step(
+            self.tuning.per_step_byte_limit,
+            captures,
+            Arc::clone(&accumulators),
+        );
+        self.current_tail = Some(self.pipeline.append_step(step, tail));
+
+        // Success-only: warn-on-zero + metrics TSV (a failed run publishes neither).
+        self.finalize_on_success.push(Box::new(RetagMetricsFinalizeHook {
+            accumulators: Arc::clone(&accumulators),
+            operations: retag.operations.clone(),
+            metrics: retag.metrics.clone(),
+        }));
+        // Always-run: summary banner + timer completion.
+        self.finalize.push(Box::new(RetagFinalizeHook {
+            accumulators,
+            operations: retag.operations.clone(),
+            progress: Arc::clone(&setup.progress_counter),
             timer,
         }));
 
