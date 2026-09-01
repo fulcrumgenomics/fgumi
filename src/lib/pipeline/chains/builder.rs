@@ -1098,22 +1098,27 @@ impl<'a> ChainBuilder<'a> {
     /// other first stages (group/dedup/consensus/clip) need the full
     /// position/cell key, so they fall through to [`Self::bam_group_key_config`].
     fn source_group_key_config(&self) -> fgumi_bam_io::GroupKeyConfig {
-        if matches!(self.spec.stages.first(), Some(Stage::Retag)) {
-            // Retag is a pure per-record transform that never reads the group key
-            // (the deleted run_threaded used `new_raw_no_cell` for the same reason),
-            // so it takes the cheap name-hash key and skips the per-record aux-tag
-            // scan + CIGAR walk `bam_group_key_config` would compute. Use a DEFAULT
-            // library index rather than `LibraryIndex::from_header`: `name_hash_only`
-            // ignores `library_index` entirely, and `from_header` panics on a header
-            // with >65,535 @RG libraries — a crash the serial oracle
-            // (`run_single_threaded`) never has, so routing Retag through the shared
-            // `from_header` arm would newly expose `--threads` to it.
-            fgumi_bam_io::GroupKeyConfig::name_hash_only(fgumi_bam_io::LibraryIndex::default())
-        } else if matches!(self.spec.stages.first(), Some(Stage::Correct | Stage::Sort)) {
-            let library_index = fgumi_bam_io::LibraryIndex::from_header(&self.header);
-            fgumi_bam_io::GroupKeyConfig::name_hash_only(library_index)
-        } else {
-            self.bam_group_key_config()
+        match self.spec.stages.first() {
+            Some(Stage::Correct | Stage::Sort) => {
+                let library_index = fgumi_bam_io::LibraryIndex::from_header(&self.header);
+                fgumi_bam_io::GroupKeyConfig::name_hash_only(library_index)
+            }
+            Some(Stage::CopyUmi | Stage::Retag) => {
+                // copy-umi and retag are pure per-record transforms that never read
+                // the group key, like Sort, so they take the cheap name-hash key and
+                // skip the per-record CIGAR position walk + aux-tag scan
+                // `bam_group_key_config` would otherwise compute for every record and
+                // then discard. (The deleted `run_threaded` used `new_raw_no_cell`
+                // for the same reason.)
+                //
+                // Use a DEFAULT LibraryIndex, NOT `from_header`: `name_hash_only`
+                // never reads `library_index`, and `LibraryIndex::from_header`
+                // panics on a header with >65,535 @RG libraries — a crash the serial
+                // oracle (which builds no group key) never has, so routing these
+                // through the shared `from_header` arm would newly expose it.
+                fgumi_bam_io::GroupKeyConfig::name_hash_only(fgumi_bam_io::LibraryIndex::default())
+            }
+            _ => self.bam_group_key_config(),
         }
     }
 
@@ -1312,6 +1317,7 @@ impl<'a> ChainBuilder<'a> {
             Stage::Simplex => self.add_simplex(position),
             Stage::Duplex => self.add_duplex(position),
             Stage::Codec => self.add_codec(position),
+            Stage::CopyUmi => self.add_copy_umi(position),
             Stage::Correct => self.add_correct(position),
             Stage::Zipper => self.add_zipper(position),
             Stage::Align => self.add_align(position),
@@ -4153,6 +4159,99 @@ impl<'a> ChainBuilder<'a> {
         // build() after all stages have been added — that way a single timer
         // covers the full pipeline run regardless of how many stages there are.
         self.finalize.push(Box::new(ClipFinalizeHook { metrics, progress_counter, timer }));
+
+        Ok(())
+    }
+
+    /// Add the copy-umi stage (`Stage::CopyUmi`).
+    ///
+    /// A pure per-record transform that copies the read-name UMI into `RX`.
+    /// Mirrors filter's single-no-rejects shape (no template grouping, no
+    /// rejects, no sort-order guard). The header is `self.header` — already
+    /// `ensure_hd`'d + `add_pg`'d in `ChainBuilder::new` — and is not reassigned
+    /// (a pure transform leaves the header shape unchanged). The no-`--threads`
+    /// serial path in `CopyUmi::execute` is the in-process parity oracle.
+    fn add_copy_umi(&mut self, position: StagePosition) -> Result<()> {
+        use crate::commands::common::warn_unwired_pipeline_flags;
+        use crate::logging::OperationTimer;
+        use crate::pipeline::chains::commands::copy_umi::{
+            CopyUmiFinalizeHook, CopyUmiMetricsFinalizeHook, build_copy_umi_process_step,
+        };
+        use crate::validation::validate_file_exists;
+        use fgumi_bam_io::is_stdin_path;
+        use log::info;
+
+        if position == StagePosition::Intermediate {
+            bail!(
+                "intermediate copy-umi not implemented; copy-umi is a terminal, \
+                standalone per-record transform"
+            );
+        }
+
+        // Copy-umi consumes a record stream, so it needs a DecodedRecordBatch
+        // tail (same requirement as filter/clip). Reject any other upstream tail.
+        if self.chain_tail_kind != ChainTailKind::DecodedRecordBatch {
+            bail!(
+                "Stage::CopyUmi requires a record-stream input (DecodedRecordBatch), but the chain \
+                 tail is {:?}; copy-umi cannot follow a stage that emits grouped templates or \
+                 serialized bytes.",
+                self.chain_tail_kind
+            );
+        }
+
+        let copy_umi = self
+            .spec
+            .stage_opts
+            .copy_umi
+            .as_ref()
+            .ok_or_else(|| anyhow!("Stage::CopyUmi options missing from StageOptionsBag"))?;
+
+        let tail = self.current_tail.expect("add_copy_umi called before add_source");
+
+        let input_path = self.resolve_log_input_path();
+        if !is_stdin_path(&input_path) {
+            validate_file_exists(&input_path, "Input BAM")?;
+        }
+
+        let timer = OperationTimer::new("Copying UMIs from read names");
+        let output_path = self.spec.sink.path().clone();
+        info!("Starting copy-umi");
+        info!("Input: {}", input_path.display());
+        info!("Output: {}", output_path.display());
+
+        warn_unwired_pipeline_flags(&self.spec.scheduler);
+        let num_threads = self.spec.threading.num_threads();
+        info!("{}", self.spec.threading.log_message());
+        info!("Using pipeline with {num_threads} threads");
+
+        let setup = copy_umi.setup_pipeline(num_threads);
+        let accumulators = Arc::clone(&setup.collected_metrics);
+
+        let captures = copy_umi.process_captures(&setup)?;
+        let step = build_copy_umi_process_step(
+            self.tuning.per_step_byte_limit,
+            captures,
+            Arc::clone(&accumulators),
+        );
+        self.current_tail = Some(self.pipeline.append_step(step, tail));
+
+        // Register the finalize hooks — BOTH on `finalize_on_success` (not the
+        // always-run `finalize`): the serial oracle `?`-aborts before its summary
+        // on a fail-fast error, so an always-run summary hook would log a partial
+        // summary the serial path never logs. The chain-level
+        // StageTimingFinalizeHook is inserted at index 0 by `build()`.
+        //
+        // Order matters: the SUMMARY hook is registered BEFORE the metrics hook so
+        // it runs first, matching the serial path (`warn_and_log_copy_umi_summary`
+        // then `write_copy_umi_metrics`). This keeps log parity on a `--metrics`
+        // write failure — the summary + completion-timer are already logged on both
+        // paths before the failing write, rather than being swallowed on the chain.
+        self.finalize_on_success
+            .push(Box::new(CopyUmiFinalizeHook { accumulators: Arc::clone(&accumulators), timer }));
+        if let Some(metrics_path) = copy_umi.metrics.clone() {
+            self.finalize_on_success
+                .push(Box::new(CopyUmiMetricsFinalizeHook { accumulators, metrics_path }));
+        }
 
         Ok(())
     }

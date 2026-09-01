@@ -18,15 +18,15 @@ use crate::pipeline::chains::{ChainSpec, Stage};
 /// they're mutually exclusive in a chain.
 ///
 /// Adjustments vs runall's ord:
-/// - Extract = 0 (input-producing, must precede everything)
-/// - Correct = 1 (was 0)
-/// - Align = 2 (was 1, was `AlignAndMerge`)
-/// - Zipper = 3 (was 2)
-/// - Sort = 4 (was 3)
-/// - Group = 5 (was 4)
-/// - Clip, Dedup, Downsample = 6 (post-group standalone-only)
-/// - Simplex, Duplex, Codec = 7 (terminal consensus, was 5)
-/// - Filter = 8 (post-consensus filtering; follows the consensus caller
+/// - `Extract` = 0 (input-producing, must precede everything)
+/// - `Correct` = 1 (was 0)
+/// - `Align` = 2 (was 1, was `AlignAndMerge`)
+/// - `Zipper` = 3 (was 2)
+/// - `Sort` = 4 (was 3)
+/// - `Group` = 5 (was 4)
+/// - `CopyUmi`, `Clip`, `Dedup`, `Downsample` = 6 (post-group standalone-only)
+/// - `Simplex`, `Duplex`, `Codec` = 7 (terminal consensus, was 5)
+/// - `Filter` = 8 (post-consensus filtering; follows the consensus caller
 ///   in a runall `consensus → filter` chain, so it sorts after the
 ///   consensus bucket)
 fn stage_ord(stage: Stage) -> usize {
@@ -37,15 +37,15 @@ fn stage_ord(stage: Stage) -> usize {
         Stage::Zipper => 3,
         Stage::Sort => 4,
         Stage::Group => 5,
-        // Retag is a standalone-only per-record transform; it only ever appears
-        // as the sole stage of a `fgumi retag` chain, so its rank is nominal and
-        // it joins the post-group standalone bucket. `validate_stage_progression`
-        // rejects any multi-stage chain containing Retag outright, so this rank is
-        // never actually exercised against a neighbour — if a future fused chain
-        // ever pairs Retag with another stage, drop that standalone-only guard and
-        // revisit this rank (at 6 the non-decreasing rule would reject a trailing
-        // Sort/Group but accept a leading one).
-        Stage::Clip | Stage::Dedup | Stage::Retag | Stage::Downsample => 6,
+        // `CopyUmi` and `Retag` are standalone-only per-record transforms that
+        // join the post-group standalone bucket; both ranks are nominal because
+        // `validate_stage_progression` rejects any multi-stage chain containing
+        // either one outright, so neither rank is ever exercised against a
+        // neighbour. (copy-umi semantically belongs BEFORE sort/group — it
+        // populates RX at the boundary — so a future fused `[CopyUmi, Sort]` /
+        // `[CopyUmi, Group]` chain would need CopyUmi < Sort(4)/Group(5); drop the
+        // standalone-only guard and revisit these ranks if such a chain is added.)
+        Stage::CopyUmi | Stage::Clip | Stage::Dedup | Stage::Retag | Stage::Downsample => 6,
         Stage::Simplex | Stage::Duplex | Stage::Codec => 7,
         Stage::Filter => 8,
         // Terminal BAM→FASTQ export. Only ever appears as the sole stage of a
@@ -58,8 +58,8 @@ fn stage_ord(stage: Stage) -> usize {
 ///
 /// Rules:
 /// - At least one stage (empty chain is meaningless).
-/// - `Stage::Retag` is standalone-only — it must be the sole stage of a chain
-///   (a multi-stage chain containing Retag is rejected).
+/// - `Stage::Retag` and `Stage::CopyUmi` are standalone-only — each must be the
+///   sole stage of a chain (a multi-stage chain containing either is rejected).
 /// - Each adjacent pair must be non-decreasing in `stage_ord`.
 /// - At most one `Align` per chain (mutually exclusive with `Zipper`).
 /// - At most one `Zipper` per chain (mutually exclusive with `Align`).
@@ -92,6 +92,21 @@ pub fn validate_stage_progression(spec: &ChainSpec) -> Result<()> {
         bail!(
             "Stage::Retag is standalone-only: it must be the sole stage of a chain, \
              but got a {}-stage chain containing Retag ({stages:?})",
+            stages.len(),
+        );
+    }
+
+    // CopyUmi is standalone-only for the same reason as Retag: it is only ever the
+    // sole stage of a `fgumi copy-umi` chain (routed via `ChainSpec::single_stage`).
+    // `[Sort, CopyUmi]` in particular slips past the non-decreasing ord rule below
+    // (Sort ord 4 <= CopyUmi ord 6), and `add_sort` (intermediate) leaves a
+    // `DecodedRecordBatch` that terminal `add_copy_umi` would happily consume —
+    // an untested fused sort→copy-umi path. Reject it here, ahead of the ordering
+    // loop, so `[CopyUmi, Sort]` gets this precise message too.
+    if stages.len() > 1 && stages.contains(&Stage::CopyUmi) {
+        bail!(
+            "Stage::CopyUmi is standalone-only: it must be the sole stage of a chain, \
+             but got a {}-stage chain containing CopyUmi ({stages:?})",
             stages.len(),
         );
     }
@@ -167,9 +182,9 @@ pub fn validate_stage_progression(spec: &ChainSpec) -> Result<()> {
 
 /// Reject specs where a referenced stage has no options in the bag.
 ///
-/// As of Phase 5 T5.3, thirteen stages have their options in the bag:
-/// Correct, Sort, Group, Zipper, Duplex, Codec, Dedup, Filter, Clip, Simplex,
-/// Align, Extract, and Fastq. The remaining stage (Downsample) adds its slot
+/// As of the copy-umi cutover, fourteen stages have their options in the bag:
+/// `Correct`, `Sort`, `Group`, `Zipper`, `Duplex`, `Codec`, `Dedup`, `Filter`, `Clip`,
+/// `Simplex`, `Align`, `Extract`, `Fastq`, and `CopyUmi`. The remaining stage (`Downsample`) adds its slot
 /// incrementally during its migration task (T2.19–T2.22). For now that stage
 /// skips the options-presence check — once its slot lands in the bag, add the
 /// check here.
@@ -190,6 +205,7 @@ pub fn validate_stage_opts_present(spec: &ChainSpec) -> Result<()> {
 
         // Check wired stages have their options present.
         let present = match stage {
+            Stage::CopyUmi => bag.copy_umi.is_some(),
             Stage::Correct => bag.correct.is_some(),
             Stage::Zipper => bag.zipper.is_some(),
             Stage::Sort => bag.sort.is_some(),
@@ -628,6 +644,25 @@ mod tests {
         let err = validate_stage_progression(&empty_spec(stages)).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Retag"), "expected Retag in error, got: {msg}");
+        assert!(
+            msg.contains("standalone-only"),
+            "expected the standalone-only rejection, got: {msg}"
+        );
+    }
+
+    #[rstest]
+    #[case::sort_then_copy_umi(vec![Stage::Sort, Stage::CopyUmi])]
+    #[case::copy_umi_then_sort(vec![Stage::CopyUmi, Stage::Sort])]
+    #[case::group_then_copy_umi(vec![Stage::Group, Stage::CopyUmi])]
+    fn copy_umi_multi_stage_rejected(#[case] stages: Vec<Stage>) {
+        // CopyUmi is standalone-only (the sole stage of a `fgumi copy-umi` chain).
+        // A multi-stage chain containing CopyUmi — in either order — must be
+        // rejected at the spec boundary. `[Sort, CopyUmi]` is the case the
+        // non-decreasing ord rule would otherwise accept (Sort ord 4 <= CopyUmi
+        // ord 6), leaving an untested fused sort→copy-umi path.
+        let err = validate_stage_progression(&empty_spec(stages)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CopyUmi"), "expected CopyUmi in error, got: {msg}");
         assert!(
             msg.contains("standalone-only"),
             "expected the standalone-only rejection, got: {msg}"

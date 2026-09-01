@@ -9,6 +9,7 @@ pub mod align;
 pub mod clip;
 #[cfg(feature = "consensus")]
 pub mod codec;
+pub mod copy_umi;
 pub mod correct;
 pub mod dedup;
 #[cfg(feature = "consensus")]

@@ -14,28 +14,24 @@
 //! normalization step (`crate::umi::read_name::normalize_read_name_umi`) but keep
 //! their own field-location logic.
 
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use log::{info, warn};
-use noodles::sam::Header;
 
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    add_pg_record, build_pipeline_config, ensure_hd_record, reject_output_collisions,
-    serialize_raw_bam_records,
+    add_pg_record, ensure_hd_record, reject_output_collisions,
 };
-use crate::grouper::SingleRawRecordGrouper;
 use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::sam::SamTag;
 use crate::umi::read_name::normalize_read_name_umi;
-use crate::unified_pipeline::{Grouper, MemoryEstimate, run_bam_pipeline_from_reader};
-use fgumi_bam_io::create_bam_reader_for_pipeline_with_opts;
+use fgumi_bam_io::{ProgressTracker, create_raw_bam_reader_with_opts, create_raw_bam_writer};
 use fgumi_raw_bam::{RawRecord, update_string_tag};
 
 /// Copy the UMI from a BAM read name into the RX tag.
@@ -129,39 +125,30 @@ pub struct CopyUmi {
     pub queue_memory: QueueMemoryOptions,
 }
 
-/// Per-record outcome flags, aggregated into [`CopyUmiCounts`] during serialize.
+/// Per-record outcome flags, aggregated into [`CollectedCopyUmiMetrics`].
+///
+/// `pub(crate)` so the chain step module can fold the outcome into its batch
+/// counters.
 #[derive(Debug, Clone, Copy, Default)]
-struct RecordOutcome {
+pub(crate) struct RecordOutcome {
     /// An existing RX tag was overwritten with the newly extracted UMI.
-    overwrote_rx: bool,
+    pub(crate) overwrote_rx: bool,
     /// The UMI was trimmed off the read name (`--remove-umi`).
-    trimmed_name: bool,
-}
-
-/// One record after processing, carried from the parallel process step to the
-/// serial serialize step.
-struct CopyUmiProcessed {
-    /// The record with RX written (and the name trimmed, if requested).
-    record: RawRecord,
-    /// What happened to this record, for metrics.
-    outcome: RecordOutcome,
-}
-
-impl MemoryEstimate for CopyUmiProcessed {
-    fn estimate_heap_size(&self) -> usize {
-        self.record.capacity()
-    }
+    pub(crate) trimmed_name: bool,
 }
 
 /// Aggregated run counters, one instance per pipeline slot.
+///
+/// Shared by the serial oracle and the chain finalize hooks, so the two paths
+/// reduce the same counters (`pub(crate)` fields for the chain step module).
 #[derive(Debug, Clone, Default)]
-struct CopyUmiCounts {
+pub(crate) struct CollectedCopyUmiMetrics {
     /// Records processed (all successful; a failure aborts the run).
-    total_records: u64,
+    pub(crate) total_records: u64,
     /// Records where an existing RX tag was overwritten.
-    rx_overwritten: u64,
+    pub(crate) rx_overwritten: u64,
     /// Records whose read name had the UMI trimmed off.
-    names_trimmed: u64,
+    pub(crate) names_trimmed: u64,
 }
 
 /// One metrics row summarizing the run, written to the optional `--metrics` TSV.
@@ -193,7 +180,7 @@ impl fgumi_metrics::Metric for CopyUmiMetric {
 /// # Errors
 /// Fails if the read name has no delimiter, has an empty last field, yields an
 /// invalid UMI, or already carries an RX tag when `fail_if_tag_present` is set.
-fn copy_umi_into_record(
+pub(crate) fn copy_umi_into_record(
     record: &mut RawRecord,
     field_delimiter: u8,
     reverse_complement_prefixed: bool,
@@ -283,16 +270,141 @@ impl CopyUmi {
     }
 }
 
+/// Validate that the read-name field delimiter is a single ASCII byte.
+///
+/// The sole delimiter validator, called by both `execute()`'s reader-free
+/// pre-flight and `CopyUmiOptions::process_captures` (so a chain built directly,
+/// bypassing `execute()`, still validates) — no divergence between the paths.
+pub(crate) fn validate_field_delimiter(c: char) -> Result<u8> {
+    u8::try_from(c)
+        .ok()
+        .filter(u8::is_ascii)
+        .with_context(|| format!("--field-delimiter must be a single ASCII character, got '{c}'"))
+}
+
+/// Write the single-row `--metrics` TSV from the reduced counters. Shared by the
+/// serial oracle and the chain's success-only metrics finalize hook so the two
+/// paths cannot drift.
+pub(crate) fn write_copy_umi_metrics(path: &Path, totals: &CollectedCopyUmiMetrics) -> Result<()> {
+    let row = CopyUmiMetric {
+        total_records: totals.total_records,
+        rx_written: totals.total_records,
+        rx_overwritten: totals.rx_overwritten,
+        names_trimmed: totals.names_trimmed,
+    };
+    fgumi_metrics::write_metrics(path, std::slice::from_ref(&row), "copy_umi")?;
+    info!("Wrote metrics to: {}", path.display());
+    Ok(())
+}
+
+/// Emit the overwrite warning (when any) and the `=== Summary ===` block. Shared
+/// by the serial oracle and the chain's summary finalize hook so the log content
+/// is byte-identical across the two paths.
+pub(crate) fn warn_and_log_copy_umi_summary(totals: &CollectedCopyUmiMetrics) {
+    if totals.rx_overwritten > 0 {
+        warn!("overwrote a pre-existing RX tag on {} record(s)", totals.rx_overwritten);
+    }
+    info!("=== Summary ===");
+    info!("Records processed: {}", totals.total_records);
+    info!("RX tags written: {}", totals.total_records);
+    info!("RX tags overwritten: {}", totals.rx_overwritten);
+    info!("Read names trimmed: {}", totals.names_trimmed);
+}
+
+/// Copy-umi tuning projected off the parsed CLI flags, independent of how they
+/// were supplied. Mirrors `FilterOptions`: the chain builder reads only these
+/// values, so they are projected into a plain struct rather than the bag holding
+/// the whole `CopyUmi` command.
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct CopyUmiOptions {
+    /// Read-name field delimiter (the UMI is the last field). Validated to a
+    /// single ASCII byte in `CopyUmiOptions::process_captures`.
+    pub field_delimiter: char,
+    /// Remove the UMI (and its delimiter) from the read name after copying it.
+    pub remove_umi: bool,
+    /// Reverse-complement `r`-prefixed UMI segments (fgbio default).
+    pub reverse_complement_r_umis: bool,
+    /// Error if a record already carries an RX tag, instead of overwriting it.
+    pub fail_if_tag_present: bool,
+    /// Optional TSV file for run metrics.
+    pub metrics: Option<PathBuf>,
+}
+
+impl CopyUmi {
+    /// Project the parsed CLI flags into [`CopyUmiOptions`].
+    #[must_use]
+    pub fn to_copy_umi_options(&self) -> CopyUmiOptions {
+        CopyUmiOptions {
+            field_delimiter: self.field_delimiter,
+            remove_umi: self.remove_umi,
+            reverse_complement_r_umis: self.reverse_complement_r_umis,
+            fail_if_tag_present: self.fail_if_tag_present,
+            metrics: self.metrics.clone(),
+        }
+    }
+}
+
+/// Shared state for a copy-umi chain run, built by
+/// [`CopyUmiOptions::setup_pipeline`].
+pub(crate) struct CopyUmiPipelineSetup {
+    /// Per-thread run counters, reduced by the finalize hooks.
+    pub(crate) collected_metrics: Arc<PerThreadAccumulator<CollectedCopyUmiMetrics>>,
+    /// Cross-thread processed-record counter driving the heartbeat.
+    pub(crate) progress_counter: Arc<AtomicU64>,
+}
+
+/// Captures the chain process closure needs, extracted from
+/// [`CopyUmiOptions`] and [`CopyUmiPipelineSetup`]. Copy-umi's transform ignores
+/// the header, so — unlike `FilterProcessCaptures` — this carries no header.
+pub(crate) struct CopyUmiProcessCaptures {
+    /// The validated single-byte read-name field delimiter.
+    pub(crate) field_delimiter: u8,
+    /// Reverse-complement `r`-prefixed UMI segments (fgbio default).
+    pub(crate) reverse_complement_prefixed: bool,
+    /// Trim the UMI off the read name after copying it.
+    pub(crate) remove_umi: bool,
+    /// Error on a pre-existing RX tag instead of overwriting.
+    pub(crate) fail_if_tag_present: bool,
+    /// Cross-thread processed-record counter for the heartbeat.
+    pub(crate) progress: Arc<AtomicU64>,
+}
+
+impl CopyUmiOptions {
+    /// Build the per-thread metrics accumulators and progress counter shared by
+    /// the chain builder's process step and finalize hooks. The
+    /// `BamPipelineConfig` is not built here — the chain builder derives it from
+    /// its `ChainSpec`.
+    pub(crate) fn setup_pipeline(&self, num_threads: usize) -> CopyUmiPipelineSetup {
+        CopyUmiPipelineSetup {
+            collected_metrics: PerThreadAccumulator::<CollectedCopyUmiMetrics>::new(num_threads),
+            progress_counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Build the process-closure captures. Validates the field delimiter here too
+    /// (not only in `execute()`'s pre-flight), so a chain built directly still
+    /// rejects a non-ASCII delimiter.
+    pub(crate) fn process_captures(
+        &self,
+        setup: &CopyUmiPipelineSetup,
+    ) -> Result<CopyUmiProcessCaptures> {
+        Ok(CopyUmiProcessCaptures {
+            field_delimiter: validate_field_delimiter(self.field_delimiter)?,
+            reverse_complement_prefixed: self.reverse_complement_r_umis,
+            remove_umi: self.remove_umi,
+            fail_if_tag_present: self.fail_if_tag_present,
+            progress: Arc::clone(&setup.progress_counter),
+        })
+    }
+}
+
 impl Command for CopyUmi {
     fn execute(&self, command_line: &str) -> Result<()> {
         self.io.validate()?;
-        let field_delimiter =
-            u8::try_from(self.field_delimiter).ok().filter(u8::is_ascii).with_context(|| {
-                format!(
-                    "--field-delimiter must be a single ASCII character, got '{}'",
-                    self.field_delimiter
-                )
-            })?;
+        // Fail fast on a non-ASCII delimiter before any reader opens; each path
+        // (serial oracle / chain) re-derives the validated byte itself.
+        validate_field_delimiter(self.field_delimiter)?;
 
         // Reject two writers to one destination, and a write target aliasing input.
         let mut outputs: Vec<(&Path, &str)> = vec![(self.io.output.as_path(), "--output")];
@@ -302,109 +414,108 @@ impl Command for CopyUmi {
         reject_output_collisions(&outputs)?;
         self.reject_write_aliasing_input()?;
 
+        if self.threading.threads.is_some() {
+            return self.execute_chain(command_line);
+        }
+
+        // No-`--threads` serial path: the in-process parity oracle.
         let timer = OperationTimer::new("Copying UMIs from read names");
         info!("Starting copy-umi");
         info!("Input: {}", self.io.input.display());
         info!("Output: {}", self.io.output.display());
 
-        let threads = self.threading.threads.unwrap_or(1);
-        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-            &self.io.input,
-            self.io.pipeline_reader_opts(),
-        )?;
+        let totals = self.run_single_threaded(command_line)?;
+        warn_and_log_copy_umi_summary(&totals);
+        if let Some(path) = &self.metrics {
+            write_copy_umi_metrics(path, &totals)?;
+        }
+        timer.log_completion(totals.total_records);
+        Ok(())
+    }
+}
+
+impl CopyUmi {
+    /// Serial no-`--threads` path: a read → copy-umi → write loop, and the
+    /// in-process parity oracle for the chain path. Uses `pipeline_reader_opts()`
+    /// so the CRC-check policy matches the chain, and `ensure_hd_record` +
+    /// `add_pg_record` so the header matches. A bad/empty UMI (or an existing RX
+    /// under `--fail-if-tag-present`) aborts the run via `?`, naming the read name.
+    ///
+    /// Parity: chain and oracle produce identical output on well-formed BAM, and
+    /// BOTH reject a framing-consistent-but-malformed record (`l_read_name` past
+    /// the record end) with a clean `InvalidData` error. This serial loop
+    /// validates each record via `validate_record_for_decode` before touching
+    /// read-name bytes, exactly as the chain path does through `DecodeRecords` —
+    /// without that guard the loop would panic in `read_name` on such a record,
+    /// a regression from the pre-cutover pipeline, which decoded and thus
+    /// validated.
+    fn run_single_threaded(&self, command_line: &str) -> Result<CollectedCopyUmiMetrics> {
+        let field_delimiter = validate_field_delimiter(self.field_delimiter)?;
+        let (mut reader, header) =
+            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
         let header = ensure_hd_record(header)?;
         let header = add_pg_record(header, command_line)?;
+        let mut writer =
+            create_raw_bam_writer(&self.io.output, &header, 1, self.compression.compression_level)?;
 
-        let pipeline_config = build_pipeline_config(
-            &self.scheduler_opts,
-            &self.compression,
-            &self.queue_memory,
-            &self.io,
-            threads,
-        )?;
-
-        let counts = PerThreadAccumulator::<CopyUmiCounts>::new(threads);
-
-        let grouper_fn = move |_header: &Header| {
-            Box::new(SingleRawRecordGrouper::new()) as Box<dyn Grouper<Group = RawRecord> + Send>
-        };
-
-        // fgbio-style RC is the default; `--reverse-complement-r-umis false` switches
-        // to strip-only.
-        let reverse_complement_prefixed = self.reverse_complement_r_umis;
-        let remove_umi = self.remove_umi;
-        let fail_if_tag_present = self.fail_if_tag_present;
-        let process_fn = move |mut record: RawRecord| -> io::Result<CopyUmiProcessed> {
+        let mut totals = CollectedCopyUmiMetrics::default();
+        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
+        let mut record = RawRecord::new();
+        while reader.read_record(&mut record)? != 0 {
+            // Validate record framing (record length + l_read_name bound) before
+            // touching read-name bytes, exactly as the `--threads` chain path does
+            // via `DecodeRecords`. Without this, a framing-consistent-but-malformed
+            // record (l_read_name past the record end) would panic here in
+            // `read_name` instead of failing with a clean error — a regression from
+            // the pre-cutover pipeline, which validated. Both paths now reject a
+            // malformed record with the same InvalidData error.
+            crate::pipeline::steps::parse::decode::validate_record_for_decode(record.as_ref())?;
             let outcome = copy_umi_into_record(
                 &mut record,
                 field_delimiter,
-                reverse_complement_prefixed,
-                remove_umi,
-                fail_if_tag_present,
-            )
-            .map_err(io::Error::other)?;
-            Ok(CopyUmiProcessed { record, outcome })
+                self.reverse_complement_r_umis,
+                self.remove_umi,
+                self.fail_if_tag_present,
+            )?;
+            totals.total_records += 1;
+            if outcome.overwrote_rx {
+                totals.rx_overwritten += 1;
+            }
+            if outcome.trimmed_name {
+                totals.names_trimmed += 1;
+            }
+            writer.write_raw_record(record.as_ref())?;
+            progress.log_if_needed(1);
+        }
+        progress.log_final();
+        // Flush before returning so any write error surfaces here, not on drop.
+        writer.finish()?;
+        Ok(totals)
+    }
+
+    /// Run the copy-umi stage on the declarative chain builder (the `--threads N`
+    /// path). The no-`--threads` `CopyUmi::run_single_threaded` loop is the
+    /// in-process parity oracle. `add_copy_umi` re-emits the timer/banner/threading
+    /// logs and opens its own source, so — like dedup/group — this method only
+    /// builds and runs the chain. Copy-umi's `execute()` never emitted
+    /// `log_effective_check_crc`, so this does NOT call it either (adding it would
+    /// make the `--threads` path log a line the serial path never does).
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        use crate::pipeline::chains::{
+            ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
         };
 
-        let counts_for_serialize = Arc::clone(&counts);
-        let serialize_fn = move |processed: CopyUmiProcessed,
-                                 _header: &Header,
-                                 output: &mut Vec<u8>|
-              -> io::Result<u64> {
-            counts_for_serialize.with_slot(|c| {
-                c.total_records += 1;
-                if processed.outcome.overwrote_rx {
-                    c.rx_overwritten += 1;
-                }
-                if processed.outcome.trimmed_name {
-                    c.names_trimmed += 1;
-                }
-            });
-            serialize_raw_bam_records(std::slice::from_ref(&processed.record), output)
+        let stage_opts =
+            StageOptionsBag { copy_umi: Some(self.to_copy_umi_options()), ..Default::default() };
+        let ctx = SingleStageContext {
+            io: &self.io,
+            threading: &self.threading,
+            compression: &self.compression,
+            scheduler: &self.scheduler_opts,
+            queue_memory: &self.queue_memory,
+            command_line,
         };
-
-        run_bam_pipeline_from_reader(
-            pipeline_config,
-            reader,
-            header,
-            &self.io.output,
-            None,
-            grouper_fn,
-            process_fn,
-            serialize_fn,
-        )?;
-
-        // Aggregate per-slot counters.
-        let mut totals = CopyUmiCounts::default();
-        for slot in counts.slots() {
-            let c = slot.lock();
-            totals.total_records += c.total_records;
-            totals.rx_overwritten += c.rx_overwritten;
-            totals.names_trimmed += c.names_trimmed;
-        }
-
-        if totals.rx_overwritten > 0 {
-            warn!("overwrote a pre-existing RX tag on {} record(s)", totals.rx_overwritten);
-        }
-
-        if let Some(path) = &self.metrics {
-            let row = CopyUmiMetric {
-                total_records: totals.total_records,
-                rx_written: totals.total_records,
-                rx_overwritten: totals.rx_overwritten,
-                names_trimmed: totals.names_trimmed,
-            };
-            fgumi_metrics::write_metrics(path, std::slice::from_ref(&row), "copy_umi")?;
-            info!("Wrote metrics to: {}", path.display());
-        }
-
-        info!("=== Summary ===");
-        info!("Records processed: {}", totals.total_records);
-        info!("RX tags written: {}", totals.total_records);
-        info!("RX tags overwritten: {}", totals.rx_overwritten);
-        info!("Read names trimmed: {}", totals.names_trimmed);
-
-        timer.log_completion(totals.total_records);
-        Ok(())
+        let spec = ChainSpec::single_stage(Stage::CopyUmi, stage_opts, &ctx);
+        build_for(spec)?.run()
     }
 }
