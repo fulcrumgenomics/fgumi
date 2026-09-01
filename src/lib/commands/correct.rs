@@ -664,6 +664,17 @@ impl Command for CorrectUmis {
         }
         reject_output_collisions(&outputs)?;
 
+        // --threads N: run the correct stage on the declarative chain builder. Dispatch
+        // here — after the reader-free pre-flight above, but BEFORE the timer / UMI-set
+        // load / distance check / reader below. execute_chain → add_correct re-emits the
+        // timer, banner, UMI-set load, distance check, and threading logs and opens its
+        // own source, so running them here too would double-log and pre-consume stdin.
+        // The no-`--threads` single-threaded path below stays the in-process parity oracle.
+        if self.threading.threads.is_some() {
+            return self.execute_chain(command_line);
+        }
+
+        // ---- legacy no-threads oracle path (everything below stays as-is) ----
         let timer = OperationTimer::new("Correcting UMIs");
 
         // Load UMI sequences
@@ -688,31 +699,14 @@ impl Command for CorrectUmis {
         // Add @PG record with PP chaining to input's last program
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
-        // Dispatch based on thread count:
-        // - Some(threads) -> 7-step pipeline
-        // - None -> single-threaded fast path
-        let total_records = if let Some(threads) = self.threading.threads {
-            // Multi-threaded: 7-step pipeline
-            self.execute_threads_mode(
-                threads,
-                reader,
-                header,
-                Arc::new(encoded_umi_set),
-                umi_length,
-                self.rejects_opts.rejects.is_some(),
-            )?
-        } else {
-            // Single-threaded: reuse the already-opened reader (required for stdin —
-            // re-opening would double-consume a pipe). Mirrors group::execute_single_threaded.
-            self.execute_single_thread_mode(
-                reader,
-                reader_opts.verify_crc,
-                header,
-                encoded_umi_set,
-                umi_length,
-                self.rejects_opts.rejects.is_some(),
-            )?
-        };
+        let total_records = self.execute_single_thread_mode(
+            reader,
+            reader_opts.verify_crc,
+            header,
+            encoded_umi_set,
+            umi_length,
+            self.rejects_opts.rejects.is_some(),
+        )?;
 
         timer.log_completion(total_records);
         Ok(())
@@ -1021,11 +1015,48 @@ impl CorrectUmis {
         self.to_correct_options().finalize_metrics(umi_metrics, unmatched_umi)
     }
 
+    /// Runs the `--threads N` path via the declarative chain builder
+    /// (`ChainSpec::single_stage(Stage::Correct, ...)` → `build_for(spec)?.run()`).
+    ///
+    /// `add_correct` opens its own source, re-emits the timer/banner/threading
+    /// log lines, reloads the UMI set, and re-runs the distance check, so none
+    /// of those may run again here — only the CRC-verify status line, which
+    /// `add_correct` does not re-emit. The no-`--threads` path in `execute`
+    /// keeps its own single-threaded engine, which is the in-process parity
+    /// oracle for this one (see `test_correct_chain_matches_single_threaded`).
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        use crate::pipeline::chains::{
+            ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
+        };
+        // add_correct re-emits the timer/banner/threading lines but NOT the
+        // CRC-verify status line.
+        self.io.log_effective_check_crc();
+        let stage_opts =
+            StageOptionsBag { correct: Some(self.to_correct_options()), ..Default::default() };
+        let ctx = SingleStageContext {
+            io: &self.io,
+            threading: &self.threading,
+            compression: &self.compression,
+            scheduler: &self.scheduler_opts,
+            queue_memory: &self.queue_memory,
+            command_line,
+        };
+        let spec = ChainSpec::single_stage(Stage::Correct, stage_opts, &ctx);
+        build_for(spec)?.run()
+    }
+
     /// Execute using the 7-step unified pipeline.
     ///
     /// This method uses the template-based grouper to process records in batches,
     /// with parallel decompression, processing, and compression.
+    ///
+    /// Retained as the parity oracle's twin until the follow-up PR removes the
+    /// legacy engine (mirrors sort PR A→B). `execute()` no longer calls this —
+    /// the `--threads` path now dispatches to `execute_chain` before the reader
+    /// opens — so it has no call site and would otherwise trip `cargo ci-lint`
+    /// as dead code.
     #[allow(clippy::too_many_lines)]
+    #[allow(dead_code)]
     fn execute_threads_mode(
         &self,
         num_threads: usize,
@@ -1810,31 +1841,23 @@ impl CorrectOptions {
     /// - At least one of `umis` / `umi_files` is provided (the macro
     ///   only sees each as a separately optional `Vec<>`, so it
     ///   cannot enforce "at least one of two Vecs must be non-empty").
-    /// - `min_distance_diff >= 1` (a value of 0 would disable the ambiguity
-    ///   check and underflow the `min_distance_diff - 1` window).
     /// - `min_corrected`, when set, lies in `[0.0, 1.0]`.
     ///
-    /// This is the runall/chain-builder validator. It is **not yet wired to the
-    /// standalone `fgumi correct` CLI**, which validates via its own
-    /// `CorrectUmis::validate` and — unlike this — still accepts
+    /// This is the runall/chain-builder validator. It now accepts
     /// `--min-distance 0` (fgbio parity; `check_umi_distances` early-returns on
-    /// it, matching `CorrectUmis.scala:180`). The follow-up EC-C2/EC-C3 commits
-    /// will plumb this into runall via the `MultiCorrectOptions::validate()`
-    /// round-trip when `--start-from <= correct`; the standalone/runall
-    /// divergence on `--min-distance 0` must be reconciled then.
+    /// it, matching `CorrectUmis.scala:180`), matching the standalone
+    /// `fgumi correct` CLI's own `CorrectUmis::validate`, which has always
+    /// accepted 0. `min_distance_diff` reaching 0 is safe: the only
+    /// `min_distance_diff - 1` subtraction (`check_umi_distances`) is guarded
+    /// by an `if self.min_distance_diff == 0` early return, and the actual
+    /// correction-matching threshold (`distance_to_second >= min_distance_diff`)
+    /// handles 0 correctly without underflow.
     pub fn validate(&self) -> Result<()> {
         if self.umis.is_empty() && self.umi_files.is_empty() {
             bail!(
                 "At least one UMI or UMI file must be provided \
                  (via --umis / --umi-files for `fgumi correct`, or \
                  --correct::umis / --correct::umi-files for `fgumi runall`)."
-            );
-        }
-        if self.min_distance_diff == 0 {
-            bail!(
-                "--min-distance must be >= 1 \
-                 (a value of 0 would disable the ambiguity check and underflow \
-                 the `min_distance_diff - 1` distance window)."
             );
         }
         if let Some(min) = self.min_corrected
@@ -3685,8 +3708,10 @@ mod tests {
 
     #[test]
     fn test_metrics_unmatched_row_with_multithreaded() -> Result<()> {
-        // Test that unmatched UMI row is correct with multi-threaded processing
-        // This specifically tests the bug fix in execute_threads_mode
+        // Test that unmatched UMI row is correct with multi-threaded processing.
+        // On a chain build (`--threads`), `execute()` now routes through
+        // `execute_chain` -> the declarative chain builder, so this exercises the
+        // chain path's metrics accounting (not the legacy `execute_threads_mode`).
         let mut records: Vec<(&str, Option<&str>)> = Vec::new();
 
         // Create a mix of correctable and uncorrectable reads

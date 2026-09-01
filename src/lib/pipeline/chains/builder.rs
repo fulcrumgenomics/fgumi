@@ -540,6 +540,11 @@ impl<'a> ChainBuilder<'a> {
         // the input itself) is gone: standalone sort now streams through the
         // normal source path, so `@PG` injection applies to it too.
         let (raw_header, pending_source) = Self::open_source(spec)?;
+        // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio,
+        // which never passes a header-less BAM straight through). Every legacy
+        // command's execute() does this before add_pg_record; ChainBuilder must
+        // match the same order so @HD lands before @PG is appended.
+        let raw_header = crate::commands::common::ensure_hd_record(raw_header)?;
         let header = crate::commands::common::add_pg_record(raw_header, &spec.command_line)?;
 
         Ok(Self {
@@ -1830,7 +1835,6 @@ impl<'a> ChainBuilder<'a> {
         };
         use crate::pipeline::steps::group::queryname::GroupByQueryname;
         use crate::pipeline::steps::serialize::SerializeBamRecords;
-        use crate::sam::SamTag;
         use log::info;
 
         // `Intermediate` is used when correct feeds into align-and-merge
@@ -1876,7 +1880,10 @@ impl<'a> ChainBuilder<'a> {
         let metrics = PerThreadAccumulator::<CollectedCorrectMetrics>::new(metrics_slots);
         let records_emitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        let umi_tag_bytes: [u8; 2] = SamTag::RX.into();
+        // Observed-sequence tag to read/write, derived from the correction target
+        // (RX for umi, BC for barcode), matching the non-chain correct path
+        // (`correct.rs`'s `self.target.sequence_tag().into()`).
+        let umi_tag_bytes: [u8; 2] = correct_opts.target.sequence_tag().into();
         // Original-sequence stash tag, derived from the correction target (RX→OX
         // for umi, BC→ob for barcode), matching the non-chain correct path.
         let original_tag_bytes: [u8; 2] = correct_opts.target.original_tag().into();

@@ -9,7 +9,7 @@ use clap::Parser;
 use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::correct::{CorrectUmis, Target};
 use fgumi_lib::sam::SamTag;
-use fgumi_raw_bam::RawRecord;
+use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::data::field::Tag;
@@ -23,6 +23,7 @@ use tempfile::TempDir;
 use crate::helpers::bam_generator::{
     create_family_with_tag, create_minimal_header, create_umi_family, to_record_buf,
 };
+use crate::helpers::read_bam_output;
 
 /// Write a BAM with UMI-tagged reads.
 fn create_umi_bam(path: &PathBuf, families: Vec<Vec<RawRecord>>) {
@@ -626,4 +627,434 @@ fn test_correct_check_crc_rejects_corrupted_crc() {
         cmd.execute("fgumi correct").expect_err("--check-crc must reject a corrupted BGZF CRC32");
     let message = format!("{err:#}");
     assert!(message.to_uppercase().contains("CRC32"), "error should mention CRC32: {message}");
+}
+
+// ============================================================================
+// Chain (`--threads N`) vs single-threaded oracle parity (R3.2 cutover)
+// ============================================================================
+
+/// Read the complete `RecordBuf` for every output record, in output order, via
+/// the shared `read_bam_output` helper. Positional `Vec` equality across two
+/// runs catches re-ordering, drops, duplicates, and any per-record field
+/// difference. (The full-header half of `read_bam_output` is used directly in
+/// the main parity test for whole-header comparison.)
+fn read_correct_records(path: &std::path::Path) -> Vec<noodles::sam::alignment::RecordBuf> {
+    read_bam_output(path).1
+}
+
+/// Runs `correct --umi-files <whitelist> --max-mismatches 1
+/// --compression-level 1` plus `extra` (e.g. `--threads`, `--rejects`,
+/// `--metrics`, `--min-distance`), panicking with the command's error on
+/// failure. `--min-distance` is left to `extra` (rather than baked in here)
+/// so a case that needs a non-default value doesn't pass the flag twice --
+/// clap rejects a `--min-distance` argument repeated across the base args
+/// and `extra`.
+fn run_correct(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    whitelist: &std::path::Path,
+    extra: &[&str],
+    tag: &str,
+) {
+    let mut args = vec![
+        "correct",
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--umi-files",
+        whitelist.to_str().unwrap(),
+        "--max-mismatches",
+        "1",
+        "--compression-level",
+        "1",
+    ];
+    args.extend_from_slice(extra);
+    let cmd = CorrectUmis::try_parse_from(args).expect("parse correct args");
+    cmd.execute("fgumi correct").unwrap_or_else(|e| panic!("correct ({tag}) failed: {e:#}"));
+}
+
+/// `--threads N` (chain) vs no-`--threads` (single-thread oracle) on a
+/// non-vacuous fixture: one exact-match family (kept as-is), one correctable
+/// (1-mismatch) family (corrected), and one uncorrectable (far) family
+/// (dropped from the main output, since no `--rejects` is given). Exercises
+/// the keep/rewrite/reject paths together so the parity check cannot pass on
+/// a trivial pass-through.
+#[rstest]
+#[case::threads1(1)]
+#[case::threads4(4)]
+fn test_correct_chain_matches_single_threaded(#[case] threads: usize) {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+
+    let exact = create_umi_family("ACGTACGT", 3, "exact", "AAAAGGGG", 30);
+    let corr = create_umi_family("ACGTACGA", 2, "corr", "AAAAGGGG", 30);
+    let far = create_umi_family("TTTTTTTT", 2, "far", "AAAAGGGG", 30);
+    create_umi_bam(&input_bam, vec![exact, corr, far]);
+    create_whitelist(&whitelist, &["ACGTACGT"]);
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    let chain_out = temp_dir.path().join("chain.bam");
+    run_correct(&input_bam, &oracle_out, &whitelist, &["--min-distance", "1"], "oracle");
+    let threads_arg = threads.to_string();
+    run_correct(
+        &input_bam,
+        &chain_out,
+        &whitelist,
+        &["--min-distance", "1", "--threads", &threads_arg],
+        "chain",
+    );
+
+    // 3 exact + 2 corrected are kept; the 2 far-family records are dropped
+    // (no --rejects). This count is computed from the fixture, not derived
+    // from the code under test, so the parity check below cannot pass
+    // vacuously on two empty/degenerate outputs.
+    let expected_kept = 5;
+    let (oracle_header, oracle_records) = read_bam_output(&oracle_out);
+    let (chain_header, chain_records) = read_bam_output(&chain_out);
+    assert_eq!(oracle_records.len(), expected_kept, "oracle output should keep exactly 5 records");
+    assert_eq!(
+        oracle_records, chain_records,
+        "chain (--threads {threads}) output must match the single-threaded oracle record-for-record",
+    );
+    // Whole-header parity (read_bam_output normalizes the @PG CL, which
+    // legitimately differs by --threads): also catches a dropped @SQ/@RG/@HD/@CO.
+    assert_eq!(
+        oracle_header, chain_header,
+        "chain and oracle output headers must match (with @PG CL normalized)",
+    );
+}
+
+/// The `--rejects` output must also match record-for-record between the
+/// chain and oracle paths -- rejects flow through the chain's own
+/// `correct_step_with_rejects` branch, a code path the main-output-only
+/// parity test above does not exercise.
+#[test]
+fn test_correct_chain_matches_single_threaded_rejects() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+
+    let exact = create_umi_family("ACGTACGT", 3, "exact", "AAAAGGGG", 30);
+    let far = create_umi_family("TTTTTTTT", 4, "far", "AAAAGGGG", 30);
+    create_umi_bam(&input_bam, vec![exact, far]);
+    create_whitelist(&whitelist, &["ACGTACGT"]);
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    let oracle_rejects = temp_dir.path().join("oracle.rejects.bam");
+    let chain_out = temp_dir.path().join("chain.bam");
+    let chain_rejects = temp_dir.path().join("chain.rejects.bam");
+
+    run_correct(
+        &input_bam,
+        &oracle_out,
+        &whitelist,
+        &["--min-distance", "1", "--rejects", oracle_rejects.to_str().unwrap()],
+        "oracle",
+    );
+    run_correct(
+        &input_bam,
+        &chain_out,
+        &whitelist,
+        &["--min-distance", "1", "--rejects", chain_rejects.to_str().unwrap(), "--threads", "4"],
+        "chain",
+    );
+
+    let oracle_rejects_records = read_correct_records(&oracle_rejects);
+    assert!(!oracle_rejects_records.is_empty(), "oracle rejects must be non-empty");
+    assert_eq!(oracle_rejects_records.len(), 4, "the far family (4 reads) is entirely rejected");
+    assert_eq!(
+        oracle_rejects_records,
+        read_correct_records(&chain_rejects),
+        "chain (--threads 4) rejects output must match the oracle record-for-record",
+    );
+    assert_eq!(
+        read_correct_records(&oracle_out),
+        read_correct_records(&chain_out),
+        "main output must also match between chain and oracle",
+    );
+}
+
+/// Byte-compares the `--metrics` TSV between the chain and oracle paths.
+/// Metrics counting runs through a per-thread accumulator on the chain path
+/// vs. a single accumulator on the oracle, even though both eventually call
+/// the same `UmiCorrectionMetrics::write_metrics` writer -- so this axis is
+/// load-bearing: it is the one test that would catch a per-thread counting
+/// divergence that a record-parity check alone would miss.
+#[test]
+fn test_correct_metrics_files_match_across_modes() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+
+    let exact = create_umi_family("ACGTACGT", 5, "exact", "AAAAGGGG", 30);
+    let corr = create_umi_family("ACGTACGA", 3, "corr", "AAAAGGGG", 30);
+    create_umi_bam(&input_bam, vec![exact, corr]);
+    create_whitelist(&whitelist, &["ACGTACGT"]);
+
+    let oracle_metrics = temp_dir.path().join("oracle.metrics.tsv");
+    let chain_metrics = temp_dir.path().join("chain.metrics.tsv");
+    run_correct(
+        &input_bam,
+        &temp_dir.path().join("oracle.bam"),
+        &whitelist,
+        &["--min-distance", "1", "--metrics", oracle_metrics.to_str().unwrap()],
+        "oracle",
+    );
+    run_correct(
+        &input_bam,
+        &temp_dir.path().join("chain.bam"),
+        &whitelist,
+        &["--min-distance", "1", "--metrics", chain_metrics.to_str().unwrap(), "--threads", "4"],
+        "chain",
+    );
+
+    // Non-vacuous: the corrected family's one-mismatch match must show up as
+    // a real, non-zero count -- not an all-zero table.
+    let parsed = fgumi_lib::metrics::UmiCorrectionMetrics::read_metrics(&oracle_metrics)
+        .expect("parse oracle metrics");
+    assert!(
+        parsed.iter().any(|m| m.one_mismatch_matches > 0),
+        "metrics must record a non-zero one-mismatch match count: {parsed:?}",
+    );
+
+    let oracle_content = fs::read_to_string(&oracle_metrics).expect("read oracle metrics");
+    let chain_content = fs::read_to_string(&chain_metrics).expect("read chain metrics");
+    assert_eq!(oracle_content, chain_content, "metrics TSV must be byte-identical across modes");
+}
+
+/// Build a **paired** template: two mates (R1/R2) sharing query name `name`,
+/// both carrying the same `RX` UMI, both mapped primaries. Unlike
+/// `create_umi_family` (which emits distinct-named single reads), these two
+/// records share one query name, so `GroupByQueryname` groups them as one
+/// multi-record template. When such a pair straddles a byte-aligned input
+/// record-batch boundary (`DecompressedBlock`s are record-aligned but not
+/// template-aligned), it exercises the cross-batch `current_template`
+/// carry-over that a single-record-per-name fixture never triggers.
+fn create_paired_umi_template(name: &str, umi: &str, pos: i32) -> Vec<RawRecord> {
+    [(flags::PAIRED | flags::FIRST_SEGMENT, pos), (flags::PAIRED | flags::LAST_SEGMENT, pos + 8)]
+        .into_iter()
+        .map(|(flag, mate_pos)| {
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .ref_id(0)
+                .pos(mate_pos)
+                .mapq(60)
+                .flags(flag)
+                .cigar_ops(&[8 << 4]) // 8M
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8]);
+            b.add_string_tag(SamTag::RX, umi.as_bytes());
+            b.build()
+        })
+        .collect()
+}
+
+/// The chain's multi-worker path reorders across batches and accumulates
+/// per-batch state -- including `GroupByQueryname`'s cross-input-batch
+/// `current_template` carry-over, which only fires when a query-name group
+/// (a multi-record template) straddles an input record-batch boundary.
+/// `create_paired_umi_template` emits `N` two-mate templates (`2 * N`
+/// records) so the input spans multiple byte-aligned input record-batches
+/// (exercising the carry-over) and comfortably exceeds `GroupByQueryname`'s
+/// default template-batch size (exercising the output-emit boundary). A
+/// single-record-per-name fixture exercises neither. Compare `--threads 4`
+/// against the oracle record-for-record.
+#[test]
+fn test_correct_chain_matches_single_threaded_multi_batch() {
+    const N: usize = 1200;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+
+    let families: Vec<Vec<RawRecord>> = (0..N)
+        .map(|i| {
+            create_paired_umi_template(
+                &format!("fam{i}"),
+                "ACGTACGT",
+                100 + i32::try_from(i).expect("i fits in i32"),
+            )
+        })
+        .collect();
+    create_umi_bam(&input_bam, families);
+    create_whitelist(&whitelist, &["ACGTACGT"]);
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    let chain_out = temp_dir.path().join("chain.bam");
+    run_correct(&input_bam, &oracle_out, &whitelist, &["--min-distance", "1"], "oracle");
+    run_correct(
+        &input_bam,
+        &chain_out,
+        &whitelist,
+        &["--min-distance", "1", "--threads", "4"],
+        "chain",
+    );
+
+    let oracle_records = read_correct_records(&oracle_out);
+    assert_eq!(
+        oracle_records.len(),
+        N * 2,
+        "all {} records ({N} paired templates) should be kept",
+        N * 2
+    );
+    assert_eq!(
+        oracle_records,
+        read_correct_records(&chain_out),
+        "chain (--threads 4) output must match the single-threaded oracle record-for-record across batches",
+    );
+}
+
+/// `--min-distance 0` parity (proves Task 2A): the chain path routes through
+/// `add_correct`'s `CorrectOptions::validate`, which used to bail on
+/// `min_distance_diff == 0` before the relaxation. Both paths must succeed
+/// and match record-for-record; a panic/error here would mean the "no
+/// unguarded `- 1` subtraction" safety analysis backing the relaxation was
+/// wrong.
+#[test]
+fn test_correct_chain_matches_single_threaded_min_distance_zero() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+
+    let exact = create_umi_family("ACGTACGT", 3, "exact", "AAAAGGGG", 30);
+    let corr = create_umi_family("ACGTACGA", 2, "corr", "AAAAGGGG", 30);
+    create_umi_bam(&input_bam, vec![exact, corr]);
+    create_whitelist(&whitelist, &["ACGTACGT"]);
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    let chain_out = temp_dir.path().join("chain.bam");
+    run_correct(&input_bam, &oracle_out, &whitelist, &["--min-distance", "0"], "oracle");
+    run_correct(
+        &input_bam,
+        &chain_out,
+        &whitelist,
+        &["--min-distance", "0", "--threads", "4"],
+        "chain",
+    );
+
+    let oracle_records = read_correct_records(&oracle_out);
+    assert_eq!(oracle_records.len(), 5, "both families should be kept under --min-distance 0");
+    assert_eq!(
+        oracle_records,
+        read_correct_records(&chain_out),
+        "--min-distance 0 output must match between the chain and single-threaded oracle",
+    );
+}
+
+/// The chain (`--threads`) path rejects empty input under a positive
+/// `--min-corrected`, where the legacy single-threaded oracle silently passes
+/// (its `0 / 0 = NaN` kept-ratio compares false against the floor -- a latent
+/// bug). This is an intentional correctness improvement of the chain path, not
+/// a regression: an empty run cannot meet a positive minimum, so the chain's
+/// explicit error is the right behavior. Pin it so it is not lost; the legacy
+/// engine's NaN-pass is left to the follow-up PR that removes that engine.
+#[test]
+fn test_correct_chain_rejects_empty_input_with_min_corrected() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+
+    // Header-only BAM: no records at all.
+    create_umi_bam(&input_bam, vec![]);
+    create_whitelist(&whitelist, &["ACGTACGT"]);
+
+    let cmd = CorrectUmis::try_parse_from([
+        "correct",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        temp_dir.path().join("chain.bam").to_str().unwrap(),
+        "--umi-files",
+        whitelist.to_str().unwrap(),
+        "--max-mismatches",
+        "1",
+        "--min-distance",
+        "1",
+        "--min-corrected",
+        "0.5",
+        "--compression-level",
+        "1",
+        "--threads",
+        "4",
+    ])
+    .expect("parse correct args");
+    let err = cmd
+        .execute("fgumi correct")
+        .expect_err("chain path must reject empty input under a positive --min-corrected");
+    assert!(err.to_string().contains("No reads were processed"), "unexpected error: {err:#}");
+}
+
+/// Write a header-less UMI-tagged BAM (no `@HD`) -- the shape
+/// `ChainBuilder::new`'s `ensure_hd_record` call (Task 2B) must synthesize
+/// `@HD` for. Mirrors `write_headerless_consensus_bam` in
+/// `test_filter_command.rs`.
+fn write_headerless_umi_bam(path: &std::path::Path) {
+    use noodles::sam::header::record::value::Map;
+    use noodles::sam::header::record::value::map::ReferenceSequence;
+
+    let header = noodles::sam::Header::builder()
+        .add_reference_sequence(
+            "chr1",
+            Map::<ReferenceSequence>::new(
+                std::num::NonZero::new(10000).expect("non-zero reference length"),
+            ),
+        )
+        .build();
+    assert!(header.header().is_none(), "precondition: input must lack @HD");
+
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
+    writer.write_header(&header).expect("Failed to write header");
+    for record in create_umi_family("ACGTACGT", 3, "read", "AAAAGGGG", 30) {
+        writer
+            .write_alignment_record(&header, &to_record_buf(&record))
+            .expect("Failed to write record");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+}
+
+/// `@HD` synthesis parity (proves Task 2B): correct enforces no
+/// query-grouped guard, so header-less input flows through to completion on
+/// both paths. Before the `ChainBuilder::new` fix, the chain path would have
+/// emitted a header without `@HD` while the oracle synthesized one -- a real
+/// output-byte divergence.
+#[rstest]
+#[case::threads1(1)]
+#[case::threads4(4)]
+fn test_correct_chain_synthesizes_hd_for_headerless_input(#[case] threads: usize) {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+    write_headerless_umi_bam(&input_bam);
+    create_whitelist(&whitelist, &["ACGTACGT"]);
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    let chain_out = temp_dir.path().join("chain.bam");
+    run_correct(&input_bam, &oracle_out, &whitelist, &["--min-distance", "1"], "oracle");
+    let threads_arg = threads.to_string();
+    run_correct(
+        &input_bam,
+        &chain_out,
+        &whitelist,
+        &["--min-distance", "1", "--threads", &threads_arg],
+        "chain",
+    );
+
+    let (oracle_header, _) = read_bam_output(&oracle_out);
+    let (chain_header, _) = read_bam_output(&chain_out);
+    assert!(
+        oracle_header.header().is_some(),
+        "oracle output must synthesize @HD for headerless input",
+    );
+    assert!(
+        chain_header.header().is_some(),
+        "chain output must synthesize @HD for headerless input",
+    );
+    assert_eq!(
+        chain_header.header(),
+        oracle_header.header(),
+        "chain (--threads {threads}) must synthesize the same @HD as the oracle for headerless input",
+    );
 }
