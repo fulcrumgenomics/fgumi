@@ -754,27 +754,6 @@ impl Sort {
         self.merge_threads.unwrap_or(self.threads).max(1)
     }
 
-    /// Initial buffer pre-allocation for `--max-memory auto`, in bytes.
-    ///
-    /// Capped at 768 MiB per budget thread (matching the samtools default) so an
-    /// `auto` budget on a large host doesn't allocate the whole budget upfront;
-    /// the buffer still grows on demand up to `effective_memory`. Scales by
-    /// [`memory_budget_threads`](Self::memory_budget_threads) for the same reason
-    /// the budget does — the sort phase is what fills the buffer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the per-thread product overflows `usize`.
-    // used by the owned-engine oracle path; PR B removes
-    #[allow(dead_code)]
-    fn auto_initial_capacity(&self, effective_memory: usize) -> Result<usize> {
-        let init = 768_usize
-            .checked_mul(1024 * 1024)
-            .and_then(|b| b.checked_mul(self.memory_budget_threads()))
-            .ok_or_else(|| anyhow::anyhow!("initial auto buffer size overflowed"))?;
-        Ok(effective_memory.min(init))
-    }
-
     /// The spill-file consolidation limit this command will use.
     ///
     /// The engine's own default is a fixed, portable value; sizing it to the
@@ -1468,43 +1447,6 @@ mod tests {
         .expect("budget should resolve");
 
         assert_eq!(resolved, expected_bytes);
-    }
-
-    /// `--max-memory auto` pre-allocates 768 MiB per budget thread, so it follows
-    /// `--sort-threads` upward exactly as the budget does, and never exceeds the
-    /// resolved budget.
-    #[rstest]
-    #[case::sort_above_threads(1, Some(8), usize::MAX, 8 * 768 * 1024 * 1024)]
-    #[case::sort_below_threads(4, Some(2), usize::MAX, 4 * 768 * 1024 * 1024)]
-    #[case::threads_only(2, None, usize::MAX, 2 * 768 * 1024 * 1024)]
-    #[case::capped_by_effective_memory(8, Some(16), 1024, 1024)]
-    fn test_auto_initial_capacity(
-        #[case] threads: usize,
-        #[case] sort_threads: Option<usize>,
-        #[case] effective_memory: usize,
-        #[case] expected: usize,
-    ) {
-        let mut sort = make_sort(SortOrderArg::Coordinate);
-        sort.threads = threads;
-        sort.sort_threads = sort_threads;
-
-        assert_eq!(
-            sort.auto_initial_capacity(effective_memory).expect("capacity should resolve"),
-            expected
-        );
-    }
-
-    /// The per-thread product is checked, not wrapped.
-    #[test]
-    fn test_auto_initial_capacity_rejects_overflow() {
-        let mut sort = make_sort(SortOrderArg::Coordinate);
-        sort.threads = usize::MAX;
-
-        let err = sort.auto_initial_capacity(usize::MAX).expect_err("should overflow");
-        assert!(
-            err.to_string().contains("initial auto buffer size overflowed"),
-            "unexpected error: {err}"
-        );
     }
 
     /// `--max-temp-files` parses onto the struct and defaults to `auto`, which
