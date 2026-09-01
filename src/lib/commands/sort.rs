@@ -747,15 +747,11 @@ impl Sort {
     /// other caller, so there is no third call site to justify a cross-crate
     /// export. Kept honest by `test_phase_threads_match_sorters_formula`
     /// here and the engine's own equivalent unit tests in `fgumi-sort`.
-    // Used by the startup banner; will be wired in Task 2
-    #[allow(dead_code)]
     fn phase1_threads(&self) -> usize {
         self.sort_threads.unwrap_or(self.threads).max(1)
     }
 
     /// Effective Phase-2 (merge/write) worker count. See `phase1_threads`.
-    // Used by the startup banner; will be wired in Task 2
-    #[allow(dead_code)]
     fn phase2_threads(&self) -> usize {
         self.merge_threads.unwrap_or(self.threads).max(1)
     }
@@ -961,7 +957,7 @@ impl Sort {
         // flag alone reports 1 thread for a run that was asked for more.
         info!(
             "Threads: {}",
-            fgumi_sort::format_thread_counts(sorter.phase1_threads(), sorter.phase2_threads())
+            fgumi_sort::format_thread_counts(self.phase1_threads(), self.phase2_threads())
         );
         info!("Temp compression level: {}", self.temp_compression);
         // Read off the sorter, like the thread counts above: it is the number
