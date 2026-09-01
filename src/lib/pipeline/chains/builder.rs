@@ -385,6 +385,16 @@ pub struct ChainBuilder<'a> {
     /// `add_source()` (SAM parse step uses it).
     header: Header,
 
+    /// The raw source header exactly as read from the input, **before** this
+    /// chain's `@PG` record is injected. Populated by `new()`. Used where a
+    /// stage must advertise the *unmodified* input header rather than the
+    /// chain's output header — specifically the consensus commands' `--rejects`
+    /// sink, whose records are raw-input records in input order (the PR #332
+    /// contract) and so must carry the input's `@PG`/`@RG`/`@HD` verbatim, to
+    /// match the single-threaded fast path (which opens the raw reader and
+    /// writes rejects with that header, un-augmented).
+    raw_source_header: Header,
+
     /// In-progress chain state. `None` before the first step (before
     /// `add_source` runs); `Some((producer, branch))` after. Updated
     /// by every `add_source` / `add_<stage>` / `add_sink` call.
@@ -545,12 +555,19 @@ impl<'a> ChainBuilder<'a> {
         // command's execute() does this before add_pg_record; ChainBuilder must
         // match the same order so @HD lands before @PG is appended.
         let raw_header = crate::commands::common::ensure_hd_record(raw_header)?;
+        // Retain the raw source header (post-`@HD`, pre-`@PG`) so stages that
+        // must advertise the unmodified input header (the consensus `--rejects`
+        // sink) can use it verbatim; see `raw_source_header`. This matches the
+        // legacy simplex/codec `execute()`, which likewise synthesizes `@HD`
+        // before writing rejects but never stamps `@PG` on the rejects header.
+        let raw_source_header = raw_header.clone();
         let header = crate::commands::common::add_pg_record(raw_header, &spec.command_line)?;
 
         Ok(Self {
             spec,
             tuning,
             header,
+            raw_source_header,
             current_tail: None,
             pipeline: PipelineBuilder::new(),
             finalize: Vec::new(),
@@ -3154,10 +3171,29 @@ impl<'a> ChainBuilder<'a> {
         // rejects, breaking the "same as standalone" contract.
         simplex.validate_read_bounds()?;
 
+        // Resolve source path for log messages and the sort-order guard below.
+        let input_path = self.resolve_log_input_path();
+
+        // Both legacy simplex paths call `check_consensus_sort_order` right
+        // after opening the reader; reproduce that guard here so a mis-sorted
+        // input is rejected instead of silently mis-grouped by `GroupByMi`
+        // (which has no out-of-order/duplicate detection of its own). Guard only
+        // when simplex consumes the raw source directly (the standalone
+        // `[Stage::Simplex]` chain): in a fused runall chain (e.g.
+        // group -> simplex) an upstream stage already orders/produces the records
+        // simplex groups, and `self.header` is the pre-upstream source header
+        // whose order simplex no longer depends on -- guarding it there would
+        // reject inputs the upstream stage (with its own guard) legitimately
+        // accepts.
+        if self.spec.stages.first() == Some(&Stage::Simplex) {
+            crate::commands::common::check_consensus_sort_order(
+                &self.header,
+                &input_path.display().to_string(),
+            )?;
+        }
+
         let tail = self.current_tail.expect("add_simplex called before add_source");
 
-        // Resolve source path for log messages only.
-        let input_path = self.resolve_log_input_path();
         let output_path = self.spec.sink.path().clone();
 
         let timer = OperationTimer::new("Calling simplex consensus");
@@ -3212,11 +3248,25 @@ impl<'a> ChainBuilder<'a> {
         // make_prefix_from_header returns "" which is the correct empty prefix.
         let read_name_prefix = simplex.read_group.prefix_or_from_header(&self.header);
 
-        // Capture the input header (raw-input RG/PG + @HD sort fields) BEFORE
-        // replacing self.header with the consensus output header. Per the PR
-        // #332 rejects contract, the rejects branch is written with this input
-        // header verbatim (rejects are raw-input records in input order).
-        let input_header = self.header.clone();
+        // The rejects branch is written with the raw-input header verbatim
+        // (raw-input RG/PG + @HD sort fields), per the PR #332 rejects contract:
+        // rejects are raw-input records in input order. Select that header
+        // stage-aware, mirroring the `check_consensus_sort_order` guard above:
+        // when simplex consumes the raw source directly (the standalone
+        // `[Stage::Simplex]` chain), it is `raw_source_header` (the header before
+        // this chain's `@PG` injection), so threaded rejects carry the same
+        // provenance as the single-threaded fast path — which writes rejects with
+        // the un-augmented input header. In a fused chain (e.g. `sort -> simplex`)
+        // an upstream stage rewrote `self.header`; the rejects must then advertise
+        // that stage-input header, not the original source — so use `self.header`,
+        // which is still the stage input here (`replace_header` below has not yet
+        // run). Reachable only once a multi-stage builder lands; single_stage
+        // chains always take the first arm today.
+        let input_header = if self.spec.stages.first() == Some(&Stage::Simplex) {
+            self.raw_source_header.clone()
+        } else {
+            self.header.clone()
+        };
 
         // Replace self.header with the consensus output header so add_sink()
         // uses the correct header for WriteBgzfFile.

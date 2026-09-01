@@ -377,10 +377,7 @@ impl SimplexOptions {
 
 impl Command for Simplex {
     fn execute(&self, command_line: &str) -> Result<()> {
-        // Start timing
-        let timer = OperationTimer::new("Calling simplex consensus");
-
-        // Validate inputs
+        // ---- reader-free pre-flight (runs on BOTH paths) ----
         self.io.validate()?;
         let mut outputs: Vec<(&Path, &str)> = vec![(self.io.output.as_path(), "--output")];
         if let Some(path) = &self.rejects_opts.rejects {
@@ -392,6 +389,26 @@ impl Command for Simplex {
         reject_output_collisions(&outputs)?;
 
         self.validate_read_bounds()?;
+
+        if self.reference.is_some() && self.methylation_mode.is_none() {
+            bail!("--ref requires --methylation-mode to be set");
+        }
+
+        // ---- --threads N on a consensus build: run on the declarative chain ----
+        // Dispatch BEFORE the timer/banner/reader below (execute_chain ->
+        // add_simplex builds its own). On a non-consensus build the chain
+        // machinery isn't compiled, so this block is absent and we fall through
+        // to the legacy threaded path.
+        #[cfg(feature = "consensus")]
+        if self.threading.threads.is_some() {
+            return self.execute_chain(command_line);
+        }
+
+        // ---- legacy tail (UNCHANGED): timer, banner, methylation resolve,
+        //      reader, Some(threads)->execute_threads_mode / None->single-
+        //      threaded fast path ----
+        // Start timing
+        let timer = OperationTimer::new("Calling simplex consensus");
 
         info!("Starting Simplex");
         info!("Input: {}", self.io.input.display());
@@ -411,9 +428,6 @@ impl Command for Simplex {
         // Enable rejects tracking if rejects file is specified
         let track_rejects = self.rejects_opts.is_enabled();
 
-        if self.reference.is_some() && self.methylation_mode.is_none() {
-            bail!("--ref requires --methylation-mode to be set");
-        }
         let methylation_mode =
             crate::commands::common::resolve_methylation_mode(self.methylation_mode);
 
@@ -665,6 +679,37 @@ impl Simplex {
     /// Returns an error if `min_reads` is 0, or if `max_reads` is below `min_reads`.
     fn validate_read_bounds(&self) -> Result<()> {
         self.to_simplex_options().validate_read_bounds()
+    }
+
+    /// Run the simplex stage on the declarative chain builder (the `--threads N`
+    /// path on a `consensus`-feature build).
+    ///
+    /// Replaces the hand-rolled unified-pipeline construction in `execute` for
+    /// the threaded case. The chain opens its own source, validates the
+    /// template-coordinate sort order, calls consensus, writes the output BAM,
+    /// and writes the rejects/stats via `SimplexFinalizeHook` — all through the
+    /// same shared helpers as the non-chain path, so the two orchestrations stay
+    /// in parity. The no-`--threads` path keeps its own single-threaded fast
+    /// path in `execute`, which is the in-process parity oracle for this one
+    /// (see `test_simplex_chain_matches_single_threaded`).
+    #[cfg(feature = "consensus")]
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        use crate::pipeline::chains::{
+            ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
+        };
+        self.io.log_effective_check_crc();
+        let stage_opts =
+            StageOptionsBag { simplex: Some(self.to_simplex_options()), ..Default::default() };
+        let ctx = SingleStageContext {
+            io: &self.io,
+            threading: &self.threading,
+            compression: &self.compression,
+            scheduler: &self.scheduler_opts,
+            queue_memory: &self.queue_memory,
+            command_line,
+        };
+        let spec = ChainSpec::single_stage(Stage::Simplex, stage_opts, &ctx);
+        build_for(spec)?.run()
     }
 
     /// Execute using 7-step unified pipeline with --threads.

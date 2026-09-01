@@ -26,8 +26,10 @@ use tempfile::TempDir;
 
 use crate::helpers::assertions::{int_tag, string_tag};
 use crate::helpers::bam_generator::{
-    create_minimal_header, create_paired_umi_family, create_umi_family, to_record_buf,
+    create_coordinate_sorted_header, create_minimal_header, create_paired_umi_family,
+    create_umi_family, to_record_buf,
 };
+use crate::helpers::read_bam_output;
 
 /// Write grouped BAM file (reads grouped by MI tag).
 fn create_grouped_bam(path: &Path, families: Vec<(&str, Vec<fgumi_raw_bam::RawRecord>)>) {
@@ -873,4 +875,457 @@ fn test_simplex_indel_at_overlap_boundary_still_calls_a_consensus() {
             if is_r1 { "R1" } else { "R2" }
         );
     }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Chain-path (`--threads`) parity tests
+//
+// `simplex --threads N` routes through the declarative chain builder; the
+// no-`--threads` path keeps its own single-threaded fast path and is the
+// in-process parity oracle these tests diff against.
+//////////////////////////////////////////////////////////////////////////////
+
+/// Read a BAM's records back as decoded `RecordBuf`s, for record-for-record
+/// comparison (order-sensitive, catches drops/dupes/reorders that a bare count
+/// would miss), via the shared `read_bam_output` helper. (The full-header half
+/// of `read_bam_output` is used directly in the main parity test.)
+fn read_consensus_records(path: &Path) -> Vec<noodles::sam::alignment::RecordBuf> {
+    read_bam_output(path).1
+}
+
+/// Run `simplex` on `input` writing `output`, with `extra` args appended
+/// (e.g. `--threads`, `--min-reads`, output flags). Asserts the run succeeds.
+fn simplex_run(input: &Path, output: &Path, extra: &[&str]) {
+    let mut args =
+        vec!["simplex", "--input", input.to_str().unwrap(), "--output", output.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    Simplex::try_parse_from(args)
+        .expect("failed to parse simplex args")
+        .execute("fgumi simplex")
+        .expect("simplex run failed");
+}
+
+/// A mix of single-end and paired-end MI families, several distinct MI groups
+/// each deep enough to survive `--min-reads 2` -- the default parity fixture
+/// for axes that don't need a more specialized shape.
+fn create_parity_families(count: usize) -> Vec<(String, Vec<fgumi_raw_bam::RawRecord>)> {
+    (0..count)
+        .map(|i| {
+            let mi = i.to_string();
+            let depth = 3 + (i % 3);
+            let family = if i % 2 == 0 {
+                create_umi_family("ACGT", depth, &format!("fam{i}"), "ACGTACGTAC", 30)
+            } else {
+                create_paired_umi_family(
+                    "TGCA",
+                    depth,
+                    &format!("fam{i}"),
+                    "ACGTACGTAC",
+                    "TTTTAAAAGG",
+                    30,
+                )
+            };
+            (mi, family)
+        })
+        .collect()
+}
+
+/// Writes [`create_parity_families`]-shaped families as the `(&str, Vec<RawRecord>)`
+/// pairs [`create_grouped_bam`] expects.
+fn write_parity_bam(path: &Path, families: &[(String, Vec<fgumi_raw_bam::RawRecord>)]) {
+    let refs: Vec<(&str, Vec<fgumi_raw_bam::RawRecord>)> =
+        families.iter().map(|(mi, records)| (mi.as_str(), records.clone())).collect();
+    create_grouped_bam(path, refs);
+}
+
+/// Axis 1 + 7: the chain (`--threads N`) path produces output records
+/// record-for-record identical to the non-chain (no-`--threads`) path, at both
+/// `--threads 1` (the minimal chain engine) and `--threads 4` (genuinely
+/// parallel, with enough distinct MI families to cross `GroupByMi` batch
+/// boundaries).
+#[rstest]
+#[case::threads_1(1)]
+#[case::threads_4(4)]
+fn test_simplex_chain_matches_single_threaded(#[case] threads: usize) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+
+    // 40 distinct MI families is enough to span multiple in-flight batches at
+    // `--threads 4` without slowing the test down.
+    let families = create_parity_families(40);
+    write_parity_bam(&input_bam, &families);
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    simplex_run(&input_bam, &oracle_out, &["--min-reads", "2"]);
+
+    let chain_out = temp_dir.path().join("chain.bam");
+    let threads_str = threads.to_string();
+    simplex_run(&input_bam, &chain_out, &["--min-reads", "2", "--threads", &threads_str]);
+
+    let (oracle_header, expected) = read_bam_output(&oracle_out);
+    let (chain_header, actual) = read_bam_output(&chain_out);
+    assert!(!expected.is_empty(), "oracle output must be non-empty (guard against a vacuous pass)");
+    assert_eq!(
+        actual, expected,
+        "chain --threads {threads} output must match the non-chain path record-for-record"
+    );
+    // Whole-header parity (read_bam_output normalizes the @PG CL that differs by
+    // --threads): also catches a dropped @SQ/@RG/@HD/@CO.
+    assert_eq!(
+        chain_header, oracle_header,
+        "chain and non-chain output headers must match (with @PG CL normalized)"
+    );
+}
+
+/// The `--ref requires --methylation-mode` validation (relocated to run before
+/// the `--threads` chain dispatch) must reject on BOTH paths -- passing `--ref`
+/// without `--methylation-mode` errors regardless of `--threads`. The bail sits
+/// in the reader-free pre-flight, before the reference is opened, so a
+/// nonexistent `--ref` path still hits it.
+#[rstest]
+#[case::single_threaded(&[])]
+#[case::threaded(&["--threads", "2"])]
+fn test_simplex_rejects_ref_without_methylation_mode(#[case] extra: &[&str]) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let families = create_parity_families(4);
+    write_parity_bam(&input_bam, &families);
+    let out = temp_dir.path().join("out.bam");
+    let fake_ref = temp_dir.path().join("ref.fa");
+
+    let mut args = vec![
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        out.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--ref",
+        fake_ref.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
+    let err = Simplex::try_parse_from(args)
+        .expect("failed to parse simplex args")
+        .execute("fgumi simplex")
+        .expect_err("simplex must reject --ref without --methylation-mode");
+    assert!(
+        err.to_string().contains("--ref requires --methylation-mode"),
+        "unexpected error: {err:#}",
+    );
+}
+
+/// Axis 2: `--rejects` output from the chain path matches the non-chain path
+/// record-for-record, and is non-vacuous (the singleton family must actually be
+/// rejected on both paths). Also pins rejects **header** parity: the rejects
+/// BAM carries the raw input header verbatim on both paths (the PR #332
+/// contract), so the chain path must not leak its own `@PG` into rejects.
+#[test]
+fn test_simplex_chain_rejects_matches_single_threaded() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+
+    let mut families = create_parity_families(10);
+    // A singleton family that fails --min-reads 2 on both paths.
+    families
+        .push(("singleton".to_string(), create_umi_family("GATC", 1, "reject", "GGGGCCCCTT", 30)));
+    write_parity_bam(&input_bam, &families);
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    let oracle_rejects = temp_dir.path().join("oracle.rejects.bam");
+    simplex_run(
+        &input_bam,
+        &oracle_out,
+        &["--min-reads", "2", "--rejects", oracle_rejects.to_str().unwrap()],
+    );
+
+    let chain_out = temp_dir.path().join("chain.bam");
+    let chain_rejects = temp_dir.path().join("chain.rejects.bam");
+    simplex_run(
+        &input_bam,
+        &chain_out,
+        &["--min-reads", "2", "--rejects", chain_rejects.to_str().unwrap(), "--threads", "4"],
+    );
+
+    let expected_out = read_consensus_records(&oracle_out);
+    let actual_out = read_consensus_records(&chain_out);
+    assert_eq!(actual_out, expected_out, "chain primary output must match the non-chain path");
+
+    let (oracle_rejects_header, expected_rejects) = read_bam_output(&oracle_rejects);
+    let (chain_rejects_header, actual_rejects) = read_bam_output(&chain_rejects);
+    assert!(
+        !expected_rejects.is_empty(),
+        "oracle rejects must be non-empty (guard against a vacuous pass)"
+    );
+    assert_eq!(
+        actual_rejects, expected_rejects,
+        "chain --rejects output must match the non-chain path record-for-record"
+    );
+
+    // Rejects-header provenance: rejects are raw-input records, so both paths
+    // must write them under the raw input header verbatim. `read_bam_output`
+    // normalizes the `@PG` CL, so the input header (which carries no fgumi `@PG`)
+    // must equal both rejects headers — a chain path that injected its own `@PG`
+    // into the rejects sink would fail this.
+    let (input_header, _) = read_bam_output(&input_bam);
+    assert_eq!(
+        chain_rejects_header, oracle_rejects_header,
+        "chain and non-chain rejects headers must match"
+    );
+    assert_eq!(
+        chain_rejects_header, input_header,
+        "rejects header must be the raw input header verbatim (no injected @PG)"
+    );
+}
+
+/// Axis 3: `--stats` output from the chain path is byte-identical to the
+/// non-chain path (recipe: byte-compare, not just field-by-field).
+#[test]
+fn test_simplex_chain_stats_matches_single_threaded() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+
+    let families = create_parity_families(20);
+    write_parity_bam(&input_bam, &families);
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    let oracle_stats = temp_dir.path().join("oracle.stats.txt");
+    simplex_run(
+        &input_bam,
+        &oracle_out,
+        &["--min-reads", "2", "--stats", oracle_stats.to_str().unwrap()],
+    );
+
+    let chain_out = temp_dir.path().join("chain.bam");
+    let chain_stats = temp_dir.path().join("chain.stats.txt");
+    simplex_run(
+        &input_bam,
+        &chain_out,
+        &["--min-reads", "2", "--stats", chain_stats.to_str().unwrap(), "--threads", "4"],
+    );
+
+    let expected = fs::read(&oracle_stats).expect("read oracle stats");
+    let actual = fs::read(&chain_stats).expect("read chain stats");
+    assert!(!expected.is_empty(), "oracle stats must be non-empty (guard against a vacuous pass)");
+    assert_eq!(
+        actual, expected,
+        "chain --stats output must be byte-identical to the non-chain path"
+    );
+}
+
+/// Axis 4: methylation mode (`--methylation-mode em-seq` + `--ref`) output
+/// parity between the chain and non-chain paths. Builds a minimal grouped
+/// input with mapped, fully-methylated reads against a synthetic all-C
+/// reference, since no dedicated methylation test infra exists in this file.
+#[test]
+fn test_simplex_chain_methylation_matches_single_threaded() {
+    use fgumi_raw_bam::SamBuilder;
+    use fgumi_sam::builder::create_test_fasta;
+
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+
+    // An all-C reference so every read shows a fully-methylated (unconverted) signal.
+    let ref_seq = "C".repeat(200);
+    let ref_fasta = create_test_fasta(&[("chr1", &ref_seq)]).expect("build test fasta");
+
+    let header = create_minimal_header("chr1", 200);
+    let seq = "CCCCCCCCCC";
+    let cigar = u32::try_from(seq.len()).expect("fits u32") << 4;
+    let mut families = Vec::new();
+    for family_idx in 0..3 {
+        let records: Vec<fgumi_raw_bam::RawRecord> = (0..3)
+            .map(|read_idx| {
+                let mut b = SamBuilder::new();
+                b.read_name(format!("f{family_idx}_r{read_idx}").as_bytes())
+                    .ref_id(0)
+                    .pos(0)
+                    .mapq(60)
+                    .flags(0)
+                    .cigar_ops(&[cigar])
+                    .sequence(seq.as_bytes())
+                    .qualities(&vec![30u8; seq.len()])
+                    .add_string_tag(SamTag::RX, b"ACGT");
+                b.build()
+            })
+            .collect();
+        families.push((family_idx.to_string(), records));
+    }
+    let refs: Vec<(&str, Vec<fgumi_raw_bam::RawRecord>)> =
+        families.iter().map(|(mi, records)| (mi.as_str(), records.clone())).collect();
+    create_grouped_bam_with_header(&input_bam, &header, refs);
+
+    let methylation_args = &[
+        "--min-reads",
+        "2",
+        "--methylation-mode",
+        "em-seq",
+        "--ref",
+        ref_fasta.path().to_str().unwrap(),
+    ];
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    simplex_run(&input_bam, &oracle_out, methylation_args);
+
+    let mut chain_args = methylation_args.to_vec();
+    chain_args.extend_from_slice(&["--threads", "4"]);
+    let chain_out = temp_dir.path().join("chain.bam");
+    simplex_run(&input_bam, &chain_out, &chain_args);
+
+    let expected = read_consensus_records(&oracle_out);
+    let actual = read_consensus_records(&chain_out);
+    assert!(!expected.is_empty(), "oracle output must be non-empty (guard against a vacuous pass)");
+    assert_eq!(
+        actual, expected,
+        "chain methylation-mode output must match the non-chain path record-for-record"
+    );
+
+    // Non-vacuity: the methylation tags this mode adds must actually be present.
+    let cu_tag = noodles::sam::alignment::record::data::field::Tag::from([b'c', b'u']);
+    assert!(
+        expected.iter().all(|r| r.data().get(&cu_tag).is_some()),
+        "methylation-mode consensus reads must carry the cu tag"
+    );
+}
+
+/// Axis 5: `--consensus-call-overlapping-bases false` output parity between the
+/// chain and non-chain paths. Uses the overlapping read-through fixture (real
+/// mate overlap), so this exercises the *disabled* overlap path -- the default
+/// (enabled) case is already covered by [`test_simplex_chain_matches_single_threaded`].
+#[test]
+fn test_simplex_chain_overlapping_disabled_matches_single_threaded() {
+    const DEPTH: usize = 3;
+
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    create_grouped_bam(&input_bam, vec![("1", indel_readthrough_family(DEPTH))]);
+
+    let args = &["--min-reads", "3", "--consensus-call-overlapping-bases", "false"];
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    simplex_run(&input_bam, &oracle_out, args);
+
+    let mut chain_args = args.to_vec();
+    chain_args.extend_from_slice(&["--threads", "4"]);
+    let chain_out = temp_dir.path().join("chain.bam");
+    simplex_run(&input_bam, &chain_out, &chain_args);
+
+    let expected = read_consensus_records(&oracle_out);
+    let actual = read_consensus_records(&chain_out);
+    assert!(!expected.is_empty(), "oracle output must be non-empty (guard against a vacuous pass)");
+    assert_eq!(
+        actual, expected,
+        "chain --consensus-call-overlapping-bases false output must match the non-chain path"
+    );
+}
+
+/// Axis 6: `--allow-unmapped` output parity between the chain and non-chain
+/// paths, using a wholly-unmapped family (the case that most exercises the
+/// flag -- see `test_simplex_allow_unmapped_still_consenses_a_wholly_unmapped_family`).
+#[test]
+fn test_simplex_chain_allow_unmapped_matches_single_threaded() {
+    use fgumi_raw_bam::{SamBuilder, flags};
+
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+
+    let mut records = Vec::new();
+    for i in 0..3 {
+        for (segment, seq) in
+            [(flags::FIRST_SEGMENT, "ACGTACGTAC"), (flags::LAST_SEGMENT, "GGGGGGGGGG")]
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(format!("unmapped_{i}").as_bytes())
+                .ref_id(-1)
+                .pos(-1)
+                .mapq(0)
+                .flags(flags::PAIRED | segment | flags::UNMAPPED | flags::MATE_UNMAPPED)
+                .mate_ref_id(-1)
+                .mate_pos(-1)
+                .sequence(seq.as_bytes())
+                .qualities(&vec![30u8; seq.len()])
+                .add_string_tag(SamTag::RX, b"ACGT");
+            records.push(b.build());
+        }
+    }
+    create_grouped_bam(&input_bam, vec![("1", records)]);
+
+    let args = &["--min-reads", "1", "--allow-unmapped"];
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    simplex_run(&input_bam, &oracle_out, args);
+
+    let mut chain_args = args.to_vec();
+    chain_args.extend_from_slice(&["--threads", "4"]);
+    let chain_out = temp_dir.path().join("chain.bam");
+    simplex_run(&input_bam, &chain_out, &chain_args);
+
+    let expected = read_consensus_records(&oracle_out);
+    let actual = read_consensus_records(&chain_out);
+    assert!(!expected.is_empty(), "oracle output must be non-empty (guard against a vacuous pass)");
+    assert_eq!(
+        actual, expected,
+        "chain --allow-unmapped output must match the non-chain path record-for-record"
+    );
+}
+
+/// Axis 8 (proves Task 2A): a coordinate-sorted input is REJECTED on the chain
+/// (`--threads 4`) path with the same "not sorted correctly for consensus
+/// calling" error the non-chain path already raises. `add_simplex` has no
+/// out-of-order/duplicate detection of its own (`GroupByMi` doesn't either), so
+/// without the `check_consensus_sort_order` guard a mis-sorted input would be
+/// silently mis-grouped instead of rejected.
+#[test]
+fn test_simplex_chain_rejects_coordinate_sorted_input() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+
+    let header = create_coordinate_sorted_header("chr1", 10000);
+    let family = create_umi_family("ACGT", 3, "fam1", "ACGTACGTAC", 30);
+    create_grouped_bam_with_header(&input_bam, &header, vec![("1", family)]);
+
+    let output_bam = temp_dir.path().join("output.bam");
+
+    // Non-chain path (no --threads): must already reject.
+    let oracle_err = Simplex::try_parse_from([
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "2",
+    ])
+    .expect("failed to parse simplex args")
+    .execute("fgumi simplex")
+    .expect_err("non-chain path must reject coordinate-sorted input");
+    let oracle_message = format!("{oracle_err:#}");
+    assert!(
+        oracle_message.contains("not sorted correctly for consensus calling"),
+        "non-chain error should mention sort order: {oracle_message}"
+    );
+
+    // Chain path (--threads 4): must reject with the same message, proving the
+    // Task 2A `check_consensus_sort_order` guard in `add_simplex`.
+    let chain_out = temp_dir.path().join("chain_output.bam");
+    let chain_err = Simplex::try_parse_from([
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        chain_out.to_str().unwrap(),
+        "--min-reads",
+        "2",
+        "--threads",
+        "4",
+    ])
+    .expect("failed to parse simplex args")
+    .execute("fgumi simplex")
+    .expect_err("chain path must reject coordinate-sorted input");
+    let chain_message = format!("{chain_err:#}");
+    assert!(
+        chain_message.contains("not sorted correctly for consensus calling"),
+        "chain error should mention sort order: {chain_message}"
+    );
+    assert!(!chain_out.exists(), "chain path must not create an output file on rejection");
 }
