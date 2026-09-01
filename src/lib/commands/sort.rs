@@ -27,9 +27,7 @@ use anyhow::{Result, bail};
 use bytesize::ByteSize;
 use clap::Parser;
 use fgumi_bam_io::is_stdout_path;
-use fgumi_sort::{
-    KeyTypesSpec, QuerynameComparator, RawExternalSorter, SortOrder, verify_sort_order,
-};
+use fgumi_sort::{KeyTypesSpec, QuerynameComparator, SortOrder, verify_sort_order};
 
 use log::{debug, info, warn};
 use std::path::{Path, PathBuf};
@@ -777,40 +775,6 @@ impl Sort {
         Ok(effective_memory.min(init))
     }
 
-    /// Construct the sorter from this command's options.
-    ///
-    /// Extracted from `execute` so the option-to-builder wiring is testable on
-    /// its own. That matters most for `--sort-threads` / `--merge-threads`:
-    /// they only affect scheduling, so an end-to-end run cannot distinguish a
-    /// correctly wired flag from one that was parsed and then dropped.
-    fn build_sorter(
-        &self,
-        effective_memory: usize,
-        command_line: &str,
-        soft_nofile: Option<u64>,
-    ) -> RawExternalSorter {
-        let mut sorter = RawExternalSorter::new(self.order.into())
-            .memory_limit(effective_memory)
-            .threads(self.threads)
-            .output_compression(self.compression.compression_level)
-            .temp_compression(self.temp_compression)
-            .spill_codec(self.temp_codec)
-            .write_index(self.write_index)
-            .read_streams(self.read_streams)
-            .sort_stats(self.sort_stats)
-            .pg_info(crate::version::VERSION.to_string(), command_line.to_string());
-
-        // Each per-phase override is optional and falls back to `--threads`.
-        if let Some(n) = self.sort_threads {
-            sorter = sorter.sort_threads(n);
-        }
-        if let Some(n) = self.merge_threads {
-            sorter = sorter.merge_threads(n);
-        }
-        sorter = sorter.max_temp_files(self.resolved_max_temp_files(soft_nofile));
-        sorter
-    }
-
     /// The spill-file consolidation limit this command will use.
     ///
     /// The engine's own default is a fixed, portable value; sizing it to the
@@ -985,8 +949,9 @@ impl Sort {
         }
 
         // --- cutover: run via the chain instead of sorter.sort() ---
-        // (self.build_sorter above is retained only to source the banner's thread/temp-file
-        //  numbers; the owned sorter is not executed. PR B removes the owned engine + banner-build.)
+        // (`phase1_threads`/`phase2_threads`/`resolved_max_temp_files` above are retained
+        //  only to source the banner's thread/temp-file numbers; the owned sorter is not
+        //  constructed or executed here. PR B removes the owned engine.)
         //
         // `output` is already bound at the top of this method (validated in `execute`),
         // and `resolved_tmp_dirs` was resolved above for the banner; hand both to the
@@ -1398,40 +1363,10 @@ mod tests {
         }
     }
 
-    /// The flags must actually reach the sorter. This cannot be checked through
-    /// an end-to-end run: the per-phase counts only affect scheduling, so a flag
-    /// that parsed and was then silently dropped produces byte-identical output
-    /// to one that was wired correctly. Assert the resolved per-phase counts on
-    /// the built sorter instead.
-    #[rstest]
-    #[case::defaults(None, None, 2, 2)]
-    #[case::narrow_sort(Some(1), Some(4), 1, 4)]
-    #[case::narrow_merge(Some(4), Some(1), 4, 1)]
-    #[case::sort_only(Some(3), None, 3, 2)]
-    #[case::merge_only(None, Some(3), 2, 3)]
-    fn test_build_sorter_wires_per_phase_threads(
-        #[case] sort_threads: Option<usize>,
-        #[case] merge_threads: Option<usize>,
-        #[case] expected_phase1: usize,
-        #[case] expected_phase2: usize,
-    ) {
-        let mut sort = make_sort(SortOrderArg::Coordinate);
-        sort.threads = 2;
-        sort.sort_threads = sort_threads;
-        sort.merge_threads = merge_threads;
-
-        let sorter =
-            sort.build_sorter(512 * 1024 * 1024, "fgumi sort (test)", fgumi_sort::soft_nofile());
-        assert_eq!(sorter.phase1_threads(), expected_phase1);
-        assert_eq!(sorter.phase2_threads(), expected_phase2);
-    }
-
     /// The sorter-free phase thread helpers `Sort::phase1_threads` /
     /// `Sort::phase2_threads` must match the engine's own formula, since
     /// they replace the CLI's only other caller of `RawExternalSorter`'s
-    /// methods. This test uses the same case table as
-    /// `test_build_sorter_wires_per_phase_threads` to ensure both paths
-    /// produce the same results end to end.
+    /// methods.
     #[rstest]
     #[case::defaults(None, None, 2, 2)]
     #[case::narrow_sort(Some(1), Some(4), 1, 4)]
@@ -1478,39 +1413,6 @@ mod tests {
         sort.sort_threads = sort_threads;
 
         assert_eq!(sort.memory_budget_threads(), expected);
-    }
-
-    /// `memory_budget_threads` re-derives the sort-phase fallback that the engine
-    /// owns (the budget is needed before the sorter exists, so it cannot read
-    /// `phase1_threads` off it). Keep the two definitions in agreement.
-    ///
-    /// `expected_phase1` is spelled out per case rather than read back off the
-    /// sorter: asserting `threads.max(sorter.phase1_threads())` would re-apply the
-    /// implementation's own `max` and so could not detect an engine fallback that
-    /// resolves *below* `--threads`, which is the drift this test exists to catch.
-    ///
-    /// The two definitions intentionally diverge at `threads == 0`:
-    /// `memory_budget_threads` returns 0 so `resolve_memory_budget` can reject it,
-    /// while `phase1_threads` clamps to one worker. That case is covered by
-    /// `test_memory_budget_threads` and is excluded here.
-    #[rstest]
-    #[case::defaults(2, None, 2)]
-    #[case::sort_above_threads(1, Some(8), 8)]
-    #[case::sort_below_threads(32, Some(4), 4)]
-    #[case::zero_sort_override(4, Some(0), 1)]
-    fn test_memory_budget_threads_agrees_with_the_sorters_sort_phase(
-        #[case] threads: usize,
-        #[case] sort_threads: Option<usize>,
-        #[case] expected_phase1: usize,
-    ) {
-        let mut sort = make_sort(SortOrderArg::Coordinate);
-        sort.threads = threads;
-        sort.sort_threads = sort_threads;
-
-        let sorter =
-            sort.build_sorter(512 * 1024 * 1024, "fgumi sort (test)", fgumi_sort::soft_nofile());
-        assert_eq!(sorter.phase1_threads(), expected_phase1, "engine sort-phase fallback drifted");
-        assert_eq!(sort.memory_budget_threads(), threads.max(expected_phase1));
     }
 
     /// The `Max memory:` line names whichever flag supplied the multiplier.
@@ -1737,12 +1639,12 @@ mod tests {
         assert!(Sort::try_parse_from(args).is_err(), "--max-temp-files {value} must be rejected");
     }
 
-    /// The flag reaches the sorter: an explicit limit passes through untouched;
-    /// `auto` derives one from the descriptor budget it is handed. The budget is
-    /// supplied rather than read from the host, so the expected derived value is
-    /// a fixed number instead of one that depends on the machine the test runs
-    /// on — and it is deliberately *not* the engine's own default, which stays a
-    /// fixed portable value now that the derivation lives in the command.
+    /// An explicit limit passes through untouched; `auto` derives one from the
+    /// descriptor budget it is handed. The budget is supplied rather than read
+    /// from the host, so the expected derived value is a fixed number instead of
+    /// one that depends on the machine the test runs on — and it is deliberately
+    /// *not* the engine's own default, which stays a fixed portable value now
+    /// that the derivation lives in the command.
     #[rstest]
     #[case::set(MaxTempFiles::Fixed(256), Some(1024), 256)]
     #[case::auto_derives_from_the_budget(MaxTempFiles::Auto, Some(1024), 992)]
@@ -1751,16 +1653,14 @@ mod tests {
         None,
         fgumi_sort::FALLBACK_MAX_TEMP_FILES
     )]
-    fn test_build_sorter_wires_max_temp_files(
+    fn test_resolved_max_temp_files(
         #[case] max_temp_files: MaxTempFiles,
         #[case] soft_nofile: Option<u64>,
         #[case] expected: usize,
     ) {
         let mut sort = make_sort(SortOrderArg::Coordinate);
         sort.max_temp_files = max_temp_files;
-
-        let sorter = sort.build_sorter(512 * 1024 * 1024, "fgumi sort (test)", soft_nofile);
-        assert_eq!(sorter.temp_file_limit(), expected);
+        assert_eq!(sort.resolved_max_temp_files(soft_nofile), expected);
     }
 
     /// The accessor test above only proves the flag reaches the builder. This
@@ -1805,8 +1705,9 @@ mod tests {
         let input = dir.path().join("in.bam");
         builder.write_bam(&input).expect("write bam");
 
-        // 1 KiB memory forces spilling; `build_sorter` is the exact option ->
-        // builder path `execute` uses, so this exercises the real wiring.
+        // 1 KiB memory forces spilling; this mirrors the order/memory/threads/
+        // max-temp-files fields the command's owned-engine wiring used to set,
+        // so it exercises the same consolidation behavior.
         let run = |max_temp_files: MaxTempFiles, out: PathBuf| {
             let mut sort = make_sort(SortOrderArg::Coordinate);
             sort.input = input.clone();
@@ -1814,7 +1715,10 @@ mod tests {
             sort.threads = 1;
             sort.max_temp_files = max_temp_files;
 
-            let sorter = sort.build_sorter(1024, "fgumi sort (test)", fgumi_sort::soft_nofile());
+            let sorter = fgumi_sort::RawExternalSorter::new(sort.order.into())
+                .memory_limit(1024)
+                .threads(1)
+                .max_temp_files(sort.resolved_max_temp_files(fgumi_sort::soft_nofile()));
             let stats = sorter.sort(&input, &out).expect("sort should succeed");
 
             let mut reader =
