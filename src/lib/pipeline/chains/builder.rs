@@ -2523,8 +2523,8 @@ impl<'a> ChainBuilder<'a> {
 
             // Thread `--max-temp-files` through: `Auto` resolves against the host
             // `RLIMIT_NOFILE` (one snapshot), matching the standalone
-            // `Sort::build_sorter`. Without this the chain used the engine's
-            // portable fallback and silently ignored the CLI value.
+            // `Sort::resolved_max_temp_files`. Without this the chain used the
+            // engine's portable fallback and silently ignored the CLI value.
             let resolved_max_temp_files = match sort.max_temp_files {
                 crate::commands::common::MaxTempFiles::Auto => {
                     fgumi_sort::temp_file_limit_from_nofile(fgumi_sort::soft_nofile())
@@ -4441,7 +4441,10 @@ impl<'a> ChainBuilder<'a> {
 /// never disables a phase. This is the single source of truth for both the
 /// sole-stage (`SortStepCaptures`) and streaming (`RawExternalSorter`) sort
 /// paths in `add_sort`.
-fn resolve_phase_threads(override_threads: Option<usize>, num_sorter_threads: usize) -> usize {
+pub(crate) fn resolve_phase_threads(
+    override_threads: Option<usize>,
+    num_sorter_threads: usize,
+) -> usize {
     override_threads.unwrap_or(num_sorter_threads).max(1)
 }
 
