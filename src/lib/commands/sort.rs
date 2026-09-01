@@ -559,14 +559,27 @@ impl Sort {
     /// the `FGUMI_TMP_DIRS` fallback applied); it is baked into the `SortOptions`
     /// verbatim because `add_sort` reads `SortOptions.tmp_dirs` and never consults
     /// the environment.
+    ///
+    /// `resolved_max_temp_files` is the already-resolved `--max-temp-files`
+    /// value (see [`Self::resolved_max_temp_files`]), computed once by the
+    /// caller from a single `RLIMIT_NOFILE` snapshot and baked in here as
+    /// `MaxTempFiles::Fixed`. This avoids the chain builder re-resolving
+    /// `MaxTempFiles::Auto` itself from a second, independent snapshot that
+    /// could disagree with the one used for the startup banner.
     fn build_sort_chain_spec(
         &self,
         output: &Path,
         resolved_tmp_dirs: Vec<PathBuf>,
+        resolved_max_temp_files: usize,
         command_line: &str,
     ) -> ChainSpec {
         let mut sort_options = self.to_sort_options();
         sort_options.tmp_dirs = resolved_tmp_dirs;
+        // Bake in the already-resolved value so the chain builder does not
+        // re-resolve `Auto` itself (which would take an independent
+        // `RLIMIT_NOFILE` snapshot that could disagree with the one used for
+        // the startup banner above).
+        sort_options.max_temp_files = MaxTempFiles::Fixed(resolved_max_temp_files);
 
         let stage_opts = StageOptionsBag { sort: Some(sort_options), ..Default::default() };
         let sink = if self.write_index {
@@ -928,15 +941,18 @@ impl Sort {
         }
 
         // --- cutover: run via the chain instead of sorter.sort() ---
-        // (`phase1_threads`/`phase2_threads`/`resolved_max_temp_files` above are retained
-        //  only to source the banner's thread/temp-file numbers; the owned sorter is not
-        //  constructed or executed here. PR B removes the owned engine.)
+        // (`phase1_threads`/`phase2_threads` above are retained only to source the
+        //  banner's thread numbers; the owned sorter is not constructed or executed
+        //  here. PR B removes the owned engine.)
         //
         // `output` is already bound at the top of this method (validated in `execute`),
         // and `resolved_tmp_dirs` was resolved above for the banner; hand both to the
-        // (unit-tested) spec builder. `resolved_tmp_dirs` is moved here — its last
-        // borrow was the banner log above.
-        let spec = self.build_sort_chain_spec(output, resolved_tmp_dirs, command_line);
+        // (unit-tested) spec builder, along with `max_temp_files` (already resolved
+        // above from a single `RLIMIT_NOFILE` snapshot) so the chain builder does not
+        // re-resolve `Auto` itself from a second, independent snapshot.
+        // `resolved_tmp_dirs` is moved here — its last borrow was the banner log above.
+        let spec =
+            self.build_sort_chain_spec(output, resolved_tmp_dirs, max_temp_files, command_line);
         build_for(spec)?.run()
     }
 
@@ -1315,8 +1331,23 @@ mod tests {
         }
         let sort = Sort::try_parse_from(args).expect("parse should succeed");
 
-        let spec =
-            sort.build_sort_chain_spec(Path::new("out.bam"), Vec::new(), "fgumi sort (test)");
+        let resolved_max_temp_files = sort.resolved_max_temp_files(fgumi_sort::soft_nofile());
+        let spec = sort.build_sort_chain_spec(
+            Path::new("out.bam"),
+            Vec::new(),
+            resolved_max_temp_files,
+            "fgumi sort (test)",
+        );
+
+        // The spec must carry the already-resolved `Fixed` value, not the raw
+        // `Auto` -- proving the chain builder is handed a single resolution
+        // instead of re-resolving `--max-temp-files auto` itself from a second,
+        // independent `RLIMIT_NOFILE` snapshot.
+        assert_eq!(sort.max_temp_files, MaxTempFiles::Auto);
+        assert_eq!(
+            spec.stage_opts.sort.as_ref().expect("sort options must be set").max_temp_files,
+            MaxTempFiles::Fixed(resolved_max_temp_files),
+        );
 
         // The queue budget must carry the parsed --max-memory, not the default.
         assert_eq!(spec.queue_memory.max_memory, sort.max_memory);
