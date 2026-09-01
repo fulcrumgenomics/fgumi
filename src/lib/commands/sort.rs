@@ -922,10 +922,6 @@ impl Sort {
         // different limits if `RLIMIT_NOFILE` changes mid-run.
         let soft_nofile = fgumi_sort::soft_nofile();
 
-        // Built before the config log so the log can report the sorter's own
-        // effective per-phase thread counts.
-        let sorter = self.build_sorter(effective_memory, command_line, soft_nofile);
-
         debug!("Starting Sort");
         info!("Input: {}", self.input.display());
         info!("Output: {}", output.display());
@@ -963,7 +959,7 @@ impl Sort {
         // Read off the sorter, like the thread counts above: it is the number
         // the engine will actually consolidate at, so it cannot drift from what
         // this line reports.
-        let max_temp_files = sorter.temp_file_limit();
+        let max_temp_files = self.resolved_max_temp_files(soft_nofile);
         info!("{}", max_temp_files_log_line(self.max_temp_files, max_temp_files, soft_nofile));
         if let Some(warning) = fd_budget_warning(self.max_temp_files, max_temp_files, soft_nofile) {
             warn!("{warning}");
