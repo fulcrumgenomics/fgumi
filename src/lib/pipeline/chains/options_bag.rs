@@ -9,6 +9,7 @@ pub use crate::aligner::AlignerOptions;
 pub use crate::commands::clip::Clip;
 #[cfg(feature = "consensus")]
 pub use crate::commands::codec::CodecOptions;
+pub use crate::commands::copy_umi::CopyUmiOptions;
 pub use crate::commands::correct::CorrectOptions;
 pub use crate::commands::dedup::MarkDuplicates;
 #[cfg(feature = "consensus")]
@@ -56,16 +57,17 @@ pub struct AlignOptions {
 /// that every stage in `spec.stages` has its matching options
 /// present before constructing any chain steps.
 ///
-/// Fourteen fields are wired: Correct, Zipper, Sort, Group, Duplex, Codec,
-/// Filter, Retag, Simplex, Align, Extract, and Fastq hold free-standing
-/// `<Command>Options` structs, while Dedup and Clip hold the command struct
-/// directly (`MarkDuplicates` / `Clip`) — no separate `DedupOptions`/
-/// `ClipOptions` is extracted, because test code constructs those via
-/// `clap::Parser::parse_from` and extracting a sub-struct would destabilise
-/// that surface. The remaining stage (Downsample) has no slot yet; it is
-/// added incrementally in T2.19–T2.22.
+/// Fifteen fields are wired: `CopyUmi`, `Correct`, `Zipper`, `Sort`, `Group`,
+/// `Duplex`, `Codec`, `Filter`, `Retag`, `Simplex`, `Align`, `Extract`, and
+/// `Fastq` hold free-standing `<Command>Options` structs, while `Dedup` and
+/// `Clip` hold the command struct directly (`MarkDuplicates` / `Clip`) — no
+/// separate `DedupOptions`/`ClipOptions` is extracted, because test code
+/// constructs those via `clap::Parser::parse_from` and extracting a sub-struct
+/// would destabilise that surface. The remaining stage (`Downsample`) has no
+/// slot yet; it is added incrementally in T2.19–T2.22.
 #[derive(Default)]
 pub struct StageOptionsBag {
+    pub copy_umi: Option<CopyUmiOptions>,
     pub correct: Option<CorrectOptions>,
     pub zipper: Option<ZipperOptions>,
     pub sort: Option<SortOptions>,

@@ -15,6 +15,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
     Extract,
+    CopyUmi,
     Correct,
     Align,
     Zipper,
@@ -58,8 +59,9 @@ mod tests {
     /// enum rather than a hand-picked subset. A new variant that is not added
     /// here is still forced through the exhaustive `match`es in the
     /// `expected_*` helpers, which fail to compile until it is classified.
-    const ALL_STAGES: [Stage; 15] = [
+    const ALL_STAGES: [Stage; 16] = [
         Stage::Extract,
+        Stage::CopyUmi,
         Stage::Correct,
         Stage::Align,
         Stage::Zipper,
@@ -83,6 +85,7 @@ mod tests {
         match stage {
             Stage::Simplex | Stage::Duplex | Stage::Codec => true,
             Stage::Extract
+            | Stage::CopyUmi
             | Stage::Correct
             | Stage::Align
             | Stage::Zipper
@@ -103,6 +106,7 @@ mod tests {
         match stage {
             Stage::Align | Stage::Zipper => true,
             Stage::Extract
+            | Stage::CopyUmi
             | Stage::Correct
             | Stage::Sort
             | Stage::Group

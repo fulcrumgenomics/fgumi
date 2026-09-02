@@ -67,7 +67,7 @@ use fgumi_bam_io::{DecodedRecord, GroupKeyConfig, compute_group_key_from_raw, na
 ///   `raw.len() >= 32 + l_read_name - 1` (the exclusive end of that slice).
 ///   When `l_read_name <= 1`, `read_name` returns `&[]` without slicing, so the
 ///   32-byte header is enough.
-fn validate_record_for_decode(raw: &[u8]) -> io::Result<()> {
+pub(crate) fn validate_record_for_decode(raw: &[u8]) -> io::Result<()> {
     if raw.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
