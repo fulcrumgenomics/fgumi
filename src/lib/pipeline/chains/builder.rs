@@ -3468,10 +3468,36 @@ impl<'a> ChainBuilder<'a> {
         // pipeline — instead of surfacing a clean error here before it is built.
         fgumi_consensus::DuplexConsensusCaller::validate_min_reads(&duplex.min_reads)?;
 
+        // Resolve source path for log messages and the sort-order guard below.
+        let input_path = self.resolve_log_input_path();
+
+        // Both legacy duplex paths call `check_consensus_sort_order` right
+        // after opening the reader; reproduce that guard here so a mis-sorted
+        // input is rejected instead of silently mis-grouped by `GroupByMi`
+        // (which has no out-of-order/duplicate detection of its own). Guard only
+        // when duplex consumes the raw source directly (the standalone
+        // `[Stage::Duplex]` chain): in a fused runall chain (e.g.
+        // group -> duplex) an upstream stage already orders/produces the records
+        // duplex groups, and `self.header` is the pre-upstream source header
+        // whose order duplex no longer depends on -- guarding it there would
+        // reject inputs the upstream stage (with its own guard) legitimately
+        // accepts.
+        //
+        // The false branch (duplex not the first stage) is not exercised by a
+        // test yet: `ChainSpec` only exposes `single_stage`, so no command can
+        // construct a fused `group -> duplex` chain through `build_for` today —
+        // that branch becomes reachable (and testable end to end) once the
+        // runall multi-stage builder lands. The guard is written conditionally
+        // now so that wiring does not have to revisit it.
+        if self.spec.stages.first() == Some(&Stage::Duplex) {
+            crate::commands::common::check_consensus_sort_order(
+                &self.header,
+                &input_path.display().to_string(),
+            )?;
+        }
+
         let tail = self.current_tail.expect("add_duplex called before add_source");
 
-        // Resolve source path for log messages only.
-        let input_path = self.resolve_log_input_path();
         let output_path = self.spec.sink.path().clone();
 
         let timer = OperationTimer::new("Calling duplex consensus");
@@ -3573,6 +3599,9 @@ impl<'a> ChainBuilder<'a> {
             max_reads_per_strand,
             error_rate_pre_umi,
             error_rate_post_umi,
+            // Resolved `--tie-rule`, converted exactly as both oracle paths do
+            // (`self.consensus.tie_rule.into()` in Duplex::execute).
+            tie_rule: consensus.tie_rule.into(),
             cell_tag,
             accumulators: accumulators_for_step,
             progress: progress_records,
@@ -3604,7 +3633,10 @@ impl<'a> ChainBuilder<'a> {
             // with the fused bridge above and standalone duplex.
             // MI transform: strip /A and /B so both strands group together.
             let mi_transform = |mi_bytes: &[u8]| -> String {
-                let mi_str = std::borrow::Cow::from(std::str::from_utf8(mi_bytes).unwrap_or(""));
+                // Match the oracle's `MiGroupIterator` transform: decode with
+                // `from_utf8_lossy` (not `from_utf8().unwrap_or("")`) so malformed
+                // MI bytes group identically on both paths.
+                let mi_str = String::from_utf8_lossy(mi_bytes);
                 extract_mi_base(&mi_str).to_string()
             };
             // `with_cell_tag` is defensive/redundant given MI uniqueness

@@ -13,8 +13,9 @@
 //!
 //! This module supplies the chain-builder pieces for the duplex stage; the
 //! chain is constructed via `ChainBuilder` /
-//! [`crate::pipeline::chains::build::build_for`]. It is not yet wired as
-//! `Duplex::execute`'s live path.
+//! [`crate::pipeline::chains::build::build_for`]. `Duplex::execute` routes the
+//! `--threads N` path through this chain (via `execute_chain`), keeping the
+//! no-`--threads` in-process path as the parity oracle.
 
 use std::io;
 use std::sync::Arc;
@@ -76,6 +77,13 @@ pub(crate) struct CollectedDuplexMetrics {
 pub(crate) struct DuplexState {
     pub(crate) caller: DuplexConsensusCaller,
     pub(crate) overlapping: Option<OverlappingBasesConsensusCaller>,
+    /// Whether a molecule seen on only one strand can still yield a consensus
+    /// (`DuplexConsensusCaller::allows_single_strand_consensus(&min_reads)`),
+    /// i.e. fgbio's `-M 1 1 0` single-strand mode. Computed once at worker
+    /// init and read (never recomputed) by the overlapping-consensus gate in
+    /// [`run_duplex_consensus_batch`], mirroring the oracle's
+    /// `(single_strand_allowed || has_both_strands_raw(..))` condition.
+    pub(crate) single_strand_allowed: bool,
 }
 
 impl crate::pipeline::core::item::HeapSize for DuplexState {}
@@ -178,6 +186,9 @@ pub(crate) struct DuplexConsensusCaptures {
     pub(crate) max_reads_per_strand: Option<usize>,
     pub(crate) error_rate_pre_umi: u8,
     pub(crate) error_rate_post_umi: u8,
+    /// Resolved tie-breaking rule (`--tie-rule`). Threaded through so the chain
+    /// caller applies `.with_tie_rule(..)` exactly like both oracle paths.
+    pub(crate) tie_rule: fgumi_consensus::TieRule,
     pub(crate) cell_tag: noodles::sam::alignment::record::data::field::Tag,
     pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedDuplexMetrics>>,
     pub(crate) progress: Arc<AtomicU64>,
@@ -207,6 +218,7 @@ fn make_duplex_consensus_init(
     methylation_ref: MethylationRef,
     methylation_mode: fgumi_consensus::MethylationMode,
     overlapping_enabled: bool,
+    tie_rule: fgumi_consensus::TieRule,
 ) -> impl Fn() -> DuplexState + Send + Sync + 'static {
     move || {
         let mut caller = DuplexConsensusCaller::new(
@@ -222,7 +234,12 @@ fn make_duplex_consensus_init(
             error_rate_pre_umi,
             error_rate_post_umi,
         )
-        .expect("DuplexConsensusCaller::new failed during worker init");
+        .expect("DuplexConsensusCaller::new failed during worker init")
+        // Apply the resolved `--tie-rule`, matching both oracle paths
+        // (`with_tie_rule` in Duplex::execute's single-threaded and legacy
+        // threaded callers). `TieRule` is `Copy`, so the `Fn` closure re-applies
+        // it on every per-worker init.
+        .with_tie_rule(tie_rule);
         if let Some((ref reference, ref ref_names)) = methylation_ref {
             caller.set_reference(Arc::clone(reference), Arc::clone(ref_names), methylation_mode);
         }
@@ -234,7 +251,9 @@ fn make_duplex_consensus_init(
         } else {
             None
         };
-        DuplexState { caller, overlapping }
+        let single_strand_allowed =
+            DuplexConsensusCaller::allows_single_strand_consensus(&min_reads);
+        DuplexState { caller, overlapping, single_strand_allowed }
     }
 }
 
@@ -268,7 +287,8 @@ fn run_duplex_consensus_batch(
         total_input_records += group_reads.len() as u64;
 
         if let Some(ref mut oc) = state.overlapping
-            && crate::commands::duplex::has_both_strands_raw(&group_reads)
+            && (state.single_strand_allowed
+                || crate::commands::duplex::has_both_strands_raw(&group_reads))
         {
             oc.reset_stats();
             apply_overlapping_consensus(&mut group_reads, oc).map_err(|e| {
@@ -337,6 +357,7 @@ pub(crate) fn build_duplex_consensus_step_with_rejects(
         max_reads_per_strand,
         error_rate_pre_umi,
         error_rate_post_umi,
+        tie_rule,
         cell_tag,
         accumulators,
         progress,
@@ -357,6 +378,7 @@ pub(crate) fn build_duplex_consensus_step_with_rejects(
         methylation_ref,
         methylation_mode,
         overlapping_enabled,
+        tie_rule,
     );
     let body = move |state: &mut DuplexState,
                      item: BatchedMiGroups|
@@ -425,6 +447,7 @@ pub(crate) fn build_duplex_consensus_step_kept_only(
         max_reads_per_strand,
         error_rate_pre_umi,
         error_rate_post_umi,
+        tie_rule,
         cell_tag,
         accumulators,
         progress,
@@ -445,6 +468,7 @@ pub(crate) fn build_duplex_consensus_step_kept_only(
         methylation_ref,
         methylation_mode,
         overlapping_enabled,
+        tie_rule,
     );
     let body =
         move |state: &mut DuplexState, item: BatchedMiGroups| -> io::Result<DecompressedBlock> {

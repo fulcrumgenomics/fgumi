@@ -18,7 +18,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
+use crate::helpers::bam_generator::{
+    create_coordinate_sorted_header, create_minimal_header, create_test_reference, to_record_buf,
+};
 
 /// Create a paired-end read pair for duplex consensus testing.
 ///
@@ -1876,4 +1878,551 @@ fn test_duplex_ignores_unmapped_end_when_mapped_reads_present() {
     // the AB and BA strands, so it does not expose the AB single-strand bases this test is about.
     // (The simplex counterpart can assert bases because it has only one strand.)
     assert_eq!(depth(r2, SamTag::AD), 2, "R2 must use only the two mapped AB reads");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Chain-vs-single-threaded parity tests (R3.6 duplex cutover)
+//
+// `Duplex::execute`'s no-`--threads` single-threaded fast path is the
+// in-process parity oracle. `--threads N` on a `consensus`-feature build now
+// runs on the declarative chain builder (`ChainBuilder::add_duplex`). These
+// tests pin record/header parity between the two paths across duplex's knobs,
+// including the Task 1A overlapping-consensus single-strand fix.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run `duplex` with `extra` args appended to a base `-i/-o --min-reads
+/// --compression-level` invocation, returning the output header and records
+/// via [`crate::helpers::read_bam_output`] (which normalizes the `@PG` `CL`
+/// field so two runs against different temp paths compare equal).
+fn run_duplex_output(
+    input: &Path,
+    output: &Path,
+    min_reads: &str,
+    extra: &[&str],
+) -> (noodles::sam::Header, Vec<noodles::sam::alignment::RecordBuf>) {
+    let mut args = vec![
+        "duplex",
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--min-reads",
+        min_reads,
+        "--compression-level",
+        "1",
+    ];
+    args.extend_from_slice(extra);
+    Duplex::try_parse_from(args)
+        .expect("failed to parse duplex args")
+        .execute("fgumi duplex")
+        .expect("Duplex command failed");
+    crate::helpers::read_bam_output(output)
+}
+
+/// Plain parity: full-header + record parity, chain `--threads 4` vs the
+/// single-threaded oracle. Input exercises AB/BA strand pairing (the
+/// strand-stripping preamble is the load-bearing duplex behavior).
+#[rstest]
+#[case::threads1("1")]
+#[case::threads2("2")]
+#[case::threads4("4")]
+fn test_duplex_chain_matches_single_threaded(#[case] threads: &str) {
+    // `--threads 1` is the dispatch-predicate boundary (`Some(1)` still routes to
+    // the chain, not the serial oracle), so it must be in the matrix alongside 2/4.
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    create_duplex_bam(&input_bam, vec![create_duplex_molecule("1", "ACGTACGT", 30, 100, 5)]);
+
+    let single = run_duplex_output(&input_bam, &temp_dir.path().join("single.bam"), "1", &[]);
+    let chain = run_duplex_output(
+        &input_bam,
+        &temp_dir.path().join("chain.bam"),
+        "1",
+        &["--threads", threads],
+    );
+
+    assert!(!single.1.is_empty(), "sanity: expected duplex consensus records");
+    assert_eq!(
+        single, chain,
+        "chain (--threads {threads}) output header+records must match the single-threaded oracle",
+    );
+}
+
+/// Build a single duplex molecule whose position 0 is a verified one-ULP
+/// near-tie: four Q37 observations reading `C,C,T,T` on each strand. At duplex's
+/// default error rates (45 pre-UMI / 40 post-UMI — the exact `ConsensusBaseBuilder`
+/// params the base-builder unit tests pin) the two bases' log-likelihoods differ
+/// by a single ULP of accumulation noise, so the two tie rules disagree there and
+/// nowhere else: `fgbio-compat` (the default) calls `T`, `ulp-relative` no-calls
+/// (`N`). All other positions are unanimous `A`, so they call identically under
+/// both rules. This is what makes the fixture *tie-sensitive* — the property the
+/// old `"ACGTACGT"` fixture lacked, which let a chain that dropped
+/// `.with_tie_rule(..)` still pass.
+fn create_tie_sensitive_molecule() -> Vec<(RawRecord, RawRecord)> {
+    // Two `C` and two `T` at position 0; the remaining positions agree.
+    let split_seqs = ["CAAAAAAA", "CAAAAAAA", "TAAAAAAA", "TAAAAAAA"];
+    let mut molecule = Vec::new();
+    for (i, seq) in split_seqs.iter().enumerate() {
+        molecule.push(create_duplex_read_pair(&format!("ab_{i}"), "1/A", seq, 37, 100, false));
+    }
+    for (i, seq) in split_seqs.iter().enumerate() {
+        molecule.push(create_duplex_read_pair(&format!("ba_{i}"), "1/B", seq, 37, 100, true));
+    }
+    molecule
+}
+
+/// `--tie-rule` parity (pins F1/F2): the chain path must apply the resolved
+/// `--tie-rule` to its `DuplexConsensusCaller` exactly like the oracle. A chain
+/// that dropped `.with_tie_rule(..)` (the original bug) would fall back to the
+/// default rule and diverge on any tie-sensitive call.
+///
+/// The fixture is a *verified* one-ULP near-tie (see
+/// [`create_tie_sensitive_molecule`]), so the two rules produce genuinely
+/// different consensus output — the test guards that with an explicit
+/// `default != ulp-relative` assertion, so it can never silently regress into
+/// the vacuous shape (identical output under both rules) that would let a
+/// dropped `.with_tie_rule(..)` pass unnoticed.
+#[test]
+fn test_duplex_chain_tie_rule_parity() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    create_duplex_bam(&input_bam, vec![create_tie_sensitive_molecule()]);
+
+    // Oracle (serial) under the default rule vs the opted-in ulp-relative rule.
+    let default_out = run_duplex_output(&input_bam, &temp_dir.path().join("default.bam"), "1", &[]);
+    let extra = ["--tie-rule", "ulp-relative"];
+    let single = run_duplex_output(&input_bam, &temp_dir.path().join("single.bam"), "1", &extra);
+
+    // The fixture must actually distinguish the two rules; otherwise the parity
+    // assertion below is vacuous and would pass even with the tie-rule dropped.
+    assert!(!single.1.is_empty(), "sanity: expected duplex consensus records");
+    assert_ne!(
+        default_out, single,
+        "fixture must be tie-sensitive: the default (fgbio-compat) and ulp-relative rules \
+         must produce different output, else this test cannot catch a dropped --tie-rule",
+    );
+
+    // Pin the known per-rule call at the tied position: default calls `T`,
+    // ulp-relative no-calls (`N`) — the base-builder-verified divergence.
+    let first_base = |out: &(noodles::sam::Header, Vec<noodles::sam::alignment::RecordBuf>)| {
+        let seq = out.1[0].sequence().as_ref();
+        seq[0]
+    };
+    assert_eq!(first_base(&default_out), b'T', "default (fgbio-compat) resolves the tie to T");
+    assert_eq!(first_base(&single), b'N', "ulp-relative no-calls the one-ULP tie");
+
+    // The chain path (--threads 4) under ulp-relative must match the oracle
+    // exactly. If `.with_tie_rule(..)` were dropped the chain would fall back to
+    // the default rule and call `T` where the oracle calls `N`, failing here.
+    let mut chain_extra = extra.to_vec();
+    chain_extra.extend_from_slice(&["--threads", "4"]);
+    let chain =
+        run_duplex_output(&input_bam, &temp_dir.path().join("chain.bam"), "1", &chain_extra);
+    assert_eq!(single, chain, "chain must honor --tie-rule ulp-relative identically to the oracle");
+}
+
+/// `--rejects` parity: record parity AND header parity (pins Task 2A — duplex
+/// intentionally keeps the `@PG` on rejects, unlike simplex/codec). Uses a
+/// family that fails `--min-reads` on both strands so rejects are non-empty.
+#[test]
+fn test_duplex_chain_rejects_parity() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    // depth=1 per strand; --min-reads 2 (-> [2,2,2]) requires >=2 templates
+    // per strand, so both strands fail and the whole group's raw records land
+    // in rejects.
+    create_duplex_bam(&input_bam, vec![create_duplex_molecule("1", "ACGTACGT", 30, 100, 1)]);
+
+    let run = |tag: &str, extra: &[&str]| {
+        let output = temp_dir.path().join(format!("{tag}-out.bam"));
+        let rejects = temp_dir.path().join(format!("{tag}-rej.bam"));
+        let mut args = vec![
+            "duplex",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--min-reads",
+            "2",
+            "--rejects",
+            rejects.to_str().unwrap(),
+            "--compression-level",
+            "1",
+        ];
+        args.extend_from_slice(extra);
+        Duplex::try_parse_from(args)
+            .expect("failed to parse duplex args")
+            .execute("fgumi duplex")
+            .expect("Duplex command failed");
+        (crate::helpers::read_bam_output(&output), crate::helpers::read_bam_output(&rejects))
+    };
+
+    let (single_out, single_rej) = run("single", &[]);
+    let (chain_out, chain_rej) = run("chain", &["--threads", "4"]);
+
+    assert!(single_out.1.is_empty(), "sanity: both strands fail --min-reads 2, no consensus");
+    assert!(!single_rej.1.is_empty(), "sanity: rejects must be non-vacuous");
+    assert_eq!(single_out, chain_out, "output header+records parity");
+    assert_eq!(
+        single_rej.0, chain_rej.0,
+        "rejects header parity (pins Task 2A: duplex keeps @PG on rejects)"
+    );
+    assert_eq!(single_rej.1, chain_rej.1, "rejects record parity");
+}
+
+/// `--stats` parity: byte-compare the duplex stats TSV between the two paths.
+#[test]
+fn test_duplex_chain_stats_parity() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    create_duplex_bam(&input_bam, vec![create_duplex_molecule("1", "ACGTACGT", 30, 100, 3)]);
+
+    let run = |tag: &str, extra: &[&str]| -> String {
+        let output = temp_dir.path().join(format!("{tag}-out.bam"));
+        let stats = temp_dir.path().join(format!("{tag}-stats.txt"));
+        let mut args = vec![
+            "duplex",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--min-reads",
+            "1",
+            "--stats",
+            stats.to_str().unwrap(),
+            "--compression-level",
+            "1",
+        ];
+        args.extend_from_slice(extra);
+        Duplex::try_parse_from(args)
+            .expect("failed to parse duplex args")
+            .execute("fgumi duplex")
+            .expect("Duplex command failed");
+        fs::read_to_string(&stats).expect("read stats")
+    };
+
+    let single = run("single", &[]);
+    let chain = run("chain", &["--threads", "4"]);
+
+    assert!(!single.trim().is_empty(), "sanity: stats file must be non-empty");
+    assert_eq!(single, chain, "duplex stats TSV must be byte-identical across the two paths");
+}
+
+/// `--stats` parity on an input that PRODUCES rejects (pins F6): the prior
+/// stats-parity test uses an all-kept input, so the reject/filter accounting
+/// columns are all zero and never compared. Here `--min-reads 2` on a depth-1
+/// molecule fails both strands, so the reject-count columns are non-zero and
+/// their chain-vs-oracle parity is actually exercised.
+#[test]
+fn test_duplex_chain_stats_parity_with_rejects() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    create_duplex_bam(&input_bam, vec![create_duplex_molecule("1", "ACGTACGT", 30, 100, 1)]);
+
+    let run = |tag: &str, extra: &[&str]| -> String {
+        let output = temp_dir.path().join(format!("{tag}-out.bam"));
+        let stats = temp_dir.path().join(format!("{tag}-stats.txt"));
+        let mut args = vec![
+            "duplex",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--min-reads",
+            "2",
+            "--stats",
+            stats.to_str().unwrap(),
+            "--compression-level",
+            "1",
+        ];
+        args.extend_from_slice(extra);
+        Duplex::try_parse_from(args)
+            .expect("failed to parse duplex args")
+            .execute("fgumi duplex")
+            .expect("Duplex command failed");
+        fs::read_to_string(&stats).expect("read stats")
+    };
+
+    let single = run("single", &[]);
+    let chain = run("chain", &["--threads", "4"]);
+
+    assert!(!single.trim().is_empty(), "sanity: stats file must be non-empty");
+    assert_eq!(
+        single, chain,
+        "duplex stats TSV (with non-zero reject columns) must be byte-identical across paths",
+    );
+}
+
+/// Methylation mode (`--methylation-mode em-seq` + `--ref`) parity.
+#[test]
+fn test_duplex_chain_methylation_mode_parity() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+    create_duplex_bam(&input_bam, vec![create_duplex_molecule("1", "ACGTACGT", 30, 100, 3)]);
+
+    let extra = ["--methylation-mode", "em-seq", "--ref", ref_path.to_str().unwrap()];
+    let single = run_duplex_output(&input_bam, &temp_dir.path().join("single.bam"), "1", &extra);
+    let mut chain_extra = extra.to_vec();
+    chain_extra.extend_from_slice(&["--threads", "4"]);
+    let chain =
+        run_duplex_output(&input_bam, &temp_dir.path().join("chain.bam"), "1", &chain_extra);
+
+    assert!(!single.1.is_empty(), "sanity: expected consensus records");
+    assert_eq!(single, chain, "methylation-mode output header+records must match across paths");
+}
+
+/// Overlapping-consensus disabled (`--consensus-call-overlapping-bases
+/// false`) parity, on the overlapping-mates fixture.
+#[test]
+fn test_duplex_chain_overlapping_disabled_parity() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    write_overlapping_single_strand_fixture(&input_bam);
+
+    let extra = ["--consensus-call-overlapping-bases", "false"];
+    let single =
+        run_duplex_output(&input_bam, &temp_dir.path().join("single.bam"), "1,1,0", &extra);
+    let mut chain_extra = extra.to_vec();
+    chain_extra.extend_from_slice(&["--threads", "4"]);
+    let chain =
+        run_duplex_output(&input_bam, &temp_dir.path().join("chain.bam"), "1,1,0", &chain_extra);
+
+    assert!(!single.1.is_empty(), "sanity: expected a single-strand consensus pair");
+    assert_eq!(single, chain, "overlapping-disabled output header+records must match across paths");
+}
+
+/// BLOCKING-bug regression pin (Task 1A). The chain path's overlapping-consensus
+/// gate must apply `single_strand_allowed || has_both_strands_raw(..)`, matching
+/// the oracle, rather than `has_both_strands_raw(..)` alone. `--min-reads 1,1,0`
+/// (single-strand mode) plus `--consensus-call-overlapping-bases true` on a
+/// single-strand-only molecule is the exact condition the buggy chain path
+/// skipped overlapping correction for. Before the Task 1A fix this fails at
+/// every `--threads` value below (the chain path emits the *uncorrected*
+/// single-strand consensus while the oracle emits the corrected one); after
+/// the fix both paths agree.
+#[rstest]
+#[case::threads_2("2")]
+#[case::threads_4("4")]
+fn test_duplex_chain_single_strand_overlapping_parity(#[case] threads: &str) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    write_overlapping_single_strand_fixture(&input_bam);
+
+    let extra = ["--consensus-call-overlapping-bases", "true"];
+    let oracle =
+        run_duplex_output(&input_bam, &temp_dir.path().join("oracle.bam"), "1,1,0", &extra);
+    let mut chain_extra = extra.to_vec();
+    chain_extra.extend_from_slice(&["--threads", threads]);
+    let chain =
+        run_duplex_output(&input_bam, &temp_dir.path().join("chain.bam"), "1,1,0", &chain_extra);
+
+    assert!(!oracle.1.is_empty(), "sanity: expected a single-strand consensus pair");
+    assert_eq!(
+        oracle, chain,
+        "chain (--threads {threads}) must match the oracle's overlapping-corrected \
+         single-strand consensus (Task 1A regression pin)",
+    );
+}
+
+/// A molecule seen on only one strand, with `--min-reads` requiring both
+/// strands (the default `1,1,1`), must be rejected identically by the chain
+/// and the single-threaded oracle: no consensus, and — with `--rejects` set —
+/// every raw record streamed to rejects.
+#[test]
+fn test_duplex_chain_only_one_strand_rejects_parity() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    create_duplex_bam(
+        &input_bam,
+        vec![create_single_strand_molecule("1", "ACGTACGT", 30, 100, 3, false)],
+    );
+
+    let run = |tag: &str, extra: &[&str]| {
+        let output = temp_dir.path().join(format!("{tag}-out.bam"));
+        let rejects = temp_dir.path().join(format!("{tag}-rej.bam"));
+        let mut args = vec![
+            "duplex",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--min-reads",
+            "1",
+            "--rejects",
+            rejects.to_str().unwrap(),
+            "--compression-level",
+            "1",
+        ];
+        args.extend_from_slice(extra);
+        Duplex::try_parse_from(args)
+            .expect("failed to parse duplex args")
+            .execute("fgumi duplex")
+            .expect("Duplex command failed");
+        (crate::helpers::read_bam_output(&output), crate::helpers::read_bam_output(&rejects))
+    };
+
+    let (single_out, single_rej) = run("single", &[]);
+    let (chain_out, chain_rej) = run("chain", &["--threads", "4"]);
+
+    assert!(
+        single_out.1.is_empty(),
+        "sanity: single-strand molecule rejected under default --min-reads"
+    );
+    assert_eq!(single_rej.1.len(), 6, "sanity: all 3 read pairs (6 records) must land in rejects");
+    assert_eq!(single_out, chain_out, "output header+records parity");
+    assert_eq!(single_rej, chain_rej, "rejects header+records parity");
+}
+
+/// A strand-count-mismatch molecule (4 `/A` pairs, 1 `/B` pair) proves the
+/// `/A`/`/B` strand-stripping MI transform (`extract_mi_base`) groups both
+/// strands into the same consensus identically on both paths.
+#[test]
+fn test_duplex_chain_strand_mismatch_parity() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let mut molecule = create_single_strand_molecule("1", "ACGTACGT", 30, 100, 4, false);
+    molecule.extend(create_single_strand_molecule("1", "ACGTACGT", 30, 100, 1, true));
+    create_duplex_bam(&input_bam, vec![molecule]);
+
+    let single = run_duplex_output(&input_bam, &temp_dir.path().join("single.bam"), "1", &[]);
+    let chain =
+        run_duplex_output(&input_bam, &temp_dir.path().join("chain.bam"), "1", &["--threads", "4"]);
+
+    assert!(!single.1.is_empty(), "sanity: 4 AB + 1 BA reads satisfy --min-reads 1,1,1");
+    assert_eq!(single, chain, "strand-mismatch output header+records must match across paths");
+}
+
+/// Enough distinct-MI molecules to force the chain path's `--threads 4` run
+/// across multiple pipeline batches (precedent:
+/// `test_group_command.rs::create_multi_batch_input_bam` +
+/// `test_group_chain_threads4_matches_single_threaded_multi_batch`).
+fn create_multi_batch_duplex_bam(path: &Path, n: usize) {
+    let molecules = (0..n)
+        .map(|i| {
+            let ref_start = 100 + i32::try_from(i).expect("n fits i32") * 200;
+            create_duplex_molecule(&i.to_string(), "ACGTACGT", 30, ref_start, 1)
+        })
+        .collect();
+    // The molecules span positions out to ~200*n, well past the 10 kb `chr1`
+    // that `create_duplex_bam`'s minimal header declares, which would place the
+    // mapped records off the end of the contig. Declare a contig large enough to
+    // hold every generated alignment — matching the sibling group precedent
+    // (`test_group_command.rs::create_multi_batch_input_bam`, LN 10_000_000).
+    let header = create_minimal_header("chr1", 10_000_000);
+    create_duplex_bam_with_header(path, &header, molecules);
+}
+
+/// `--threads 4` output must match the single-threaded oracle record-for-record
+/// across many pipeline batches, not just within a single one.
+#[test]
+fn test_duplex_chain_threads4_matches_single_threaded_multi_batch() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    create_multi_batch_duplex_bam(&input_bam, 600);
+
+    let single = run_duplex_output(&input_bam, &temp_dir.path().join("single.bam"), "1", &[]);
+    let chain =
+        run_duplex_output(&input_bam, &temp_dir.path().join("chain.bam"), "1", &["--threads", "4"]);
+
+    assert_eq!(single.1.len(), 1200, "600 molecules x (consensus R1 + R2) = 1200 records");
+    assert_eq!(
+        single, chain,
+        "chain (--threads 4) output must match the single-threaded oracle across batches",
+    );
+}
+
+/// Task 2's conditional sort-order guard: a coordinate-sorted (not
+/// template-coordinate) input must be rejected with the same message on both
+/// paths.
+#[test]
+fn test_duplex_chain_rejects_coordinate_sorted_input_same_as_oracle() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    let header = create_coordinate_sorted_header("chr1", 10000);
+    create_duplex_bam_with_header(
+        &input_bam,
+        &header,
+        vec![create_duplex_molecule("1", "ACGTACGT", 30, 100, 2)],
+    );
+
+    let run = |extra: &[&str]| -> String {
+        let mut args = vec![
+            "duplex",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--min-reads",
+            "1",
+            "--compression-level",
+            "1",
+        ];
+        args.extend_from_slice(extra);
+        let error = Duplex::try_parse_from(args)
+            .expect("failed to parse duplex args")
+            .execute("fgumi duplex")
+            .expect_err("coordinate-sorted input must be rejected");
+        format!("{error:#}")
+    };
+
+    let single_msg = run(&[]);
+    let chain_msg = run(&["--threads", "4"]);
+
+    assert!(
+        single_msg.contains("not sorted correctly"),
+        "expected a sort-order error, got: {single_msg}"
+    );
+    assert_eq!(
+        single_msg, chain_msg,
+        "coordinate-sorted input must be rejected with the same message on both paths",
+    );
+}
+
+/// `--ref` without `--methylation-mode` must be rejected identically by both
+/// paths (mirrors the simplex #894 precedent).
+#[test]
+fn test_duplex_chain_ref_without_methylation_mode_rejected_same_as_oracle() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    create_duplex_bam(&input_bam, vec![create_duplex_molecule("1", "ACGTACGT", 30, 100, 2)]);
+
+    let run = |extra: &[&str]| -> String {
+        let mut args = vec![
+            "duplex",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--min-reads",
+            "1",
+            "--compression-level",
+            "1",
+            "--ref",
+            ref_path.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let error = Duplex::try_parse_from(args)
+            .expect("failed to parse duplex args")
+            .execute("fgumi duplex")
+            .expect_err("--ref without --methylation-mode must be rejected");
+        format!("{error:#}")
+    };
+
+    let single_msg = run(&[]);
+    let chain_msg = run(&["--threads", "4"]);
+
+    assert!(
+        single_msg.contains("--ref requires --methylation-mode"),
+        "expected the --ref/--methylation-mode error, got: {single_msg}"
+    );
+    assert_eq!(
+        single_msg, chain_msg,
+        "--ref without --methylation-mode must be rejected with the same message on both paths",
+    );
 }
