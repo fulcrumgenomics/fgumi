@@ -3685,7 +3685,10 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns errors if codec options are missing from the spec bag.
+    /// Returns errors if codec options are missing from the spec bag, if the
+    /// disagreement-rate or fixed-quality-override knobs are out of range (see
+    /// the validation block below), or if the source is coordinate-sorted
+    /// rather than template-coordinate-sorted.
     ///
     /// [`BatchedMiGroups`]: crate::pipeline::steps::group::mi::BatchedMiGroups
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
@@ -3715,10 +3718,39 @@ impl<'a> ChainBuilder<'a> {
             .as_ref()
             .ok_or_else(|| anyhow!("Stage::Codec options missing from StageOptionsBag"))?;
 
+        // Defense-in-depth builder hardening (Task 2A): validate the full set of
+        // codec parameter bounds via the shared `CodecOptions::validate()` — the
+        // SAME function `Codec::validate()` now delegates to — so `add_codec` is
+        // fully self-guarding as a reusable API and the two paths cannot drift.
+        // This is NOT a fix for a currently-exploitable bug: `Codec::execute()`
+        // already calls `self.validate()` unconditionally before ever dispatching
+        // to `execute_chain`/`add_codec`. It guards a future caller that
+        // constructs a `StageOptionsBag { codec: .. }` directly (e.g. a fused
+        // `group -> codec` runall chain), which would bypass that top-level check.
+        codec.validate()?;
+
+        // Resolve source path for log messages and the sort-order guard below.
+        let input_path = self.resolve_log_input_path();
+
+        // Both legacy codec paths call `check_consensus_sort_order` right after
+        // opening the reader; reproduce that guard here so a mis-sorted input is
+        // rejected instead of silently mis-grouped by `GroupByMi` (which has no
+        // out-of-order/duplicate detection of its own). Guard only when codec
+        // consumes the raw source directly (the standalone `[Stage::Codec]`
+        // chain): in a fused runall chain (e.g. group -> codec) an upstream stage
+        // already orders/produces the records codec groups, and `self.header` is
+        // the pre-upstream source header whose order codec no longer depends on
+        // -- guarding it there would reject inputs the upstream stage (with its
+        // own guard) legitimately accepts.
+        if self.spec.stages.first() == Some(&Stage::Codec) {
+            crate::commands::common::check_consensus_sort_order(
+                &self.header,
+                &input_path.display().to_string(),
+            )?;
+        }
+
         let tail = self.current_tail.expect("add_codec called before add_source");
 
-        // Resolve source path for log messages only.
-        let input_path = self.resolve_log_input_path();
         let output_path = self.spec.sink.path().clone();
 
         let timer = OperationTimer::new("Calling CODEC consensus");
@@ -3768,10 +3800,25 @@ impl<'a> ChainBuilder<'a> {
         // make_prefix_from_header returns "" which is the correct empty prefix.
         let read_name_prefix = codec.read_group.prefix_or_from_header(&self.header);
 
-        // Capture the input header BEFORE replacing self.header with the
-        // consensus output header — the rejects branch is written with the
-        // input header verbatim (PR #332 contract).
-        let input_header = self.header.clone();
+        // The rejects branch is written with the raw source header verbatim
+        // (raw-input RG/PG + @HD sort fields), per the PR #332 rejects contract:
+        // rejects are raw-input records in input order. Use `raw_source_header`
+        // (the header before this chain's `@PG` injection), NOT `self.header`,
+        // so threaded rejects carry the same provenance as the single-threaded
+        // fast path — which writes rejects with the un-augmented input header
+        // (codec.rs's `create_optional_bam_writer(.., &header, ..)`, where
+        // `header` is the raw reader header with no `@PG` applied). In a future
+        // fused chain (e.g. `group -> codec`) an upstream stage rewrote
+        // `self.header`; the rejects must then advertise that stage-input header,
+        // not the original source — so gate on codec being the source stage
+        // (mirrors `add_simplex`). `replace_header` below has not yet run, so
+        // `self.header` is still the stage input here. Reachable only once a
+        // multi-stage builder lands; single_stage chains always take the first arm.
+        let input_header = if self.spec.stages.first() == Some(&Stage::Codec) {
+            self.raw_source_header.clone()
+        } else {
+            self.header.clone()
+        };
 
         // Replace self.header with the consensus output header so add_sink()
         // uses the correct header for WriteBgzfFile.

@@ -9,19 +9,23 @@
 use clap::Parser;
 use fgumi_bam_io::create_raw_bam_writer;
 use fgumi_dna::reverse_complement;
-use fgumi_lib::commands::codec::Codec;
+use fgumi_lib::commands::codec::{Codec, CodecOptions};
 use fgumi_lib::commands::command::Command;
+use fgumi_lib::pipeline::chains::{
+    ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
+};
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, RawRecordView, SamBuilder, flags as raw_flags};
 use noodles::bam;
 use rstest::rstest;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 use crate::helpers::assertions::{int_tag, string_tag};
-use crate::helpers::bam_generator::create_minimal_header;
+use crate::helpers::bam_generator::{create_coordinate_sorted_header, create_minimal_header};
+use crate::helpers::read_bam_output;
 
 /// Creates a CODEC read pair (R1 forward, R2 reverse from opposite strand).
 ///
@@ -1176,10 +1180,16 @@ fn test_codec_command_recovers_from_duplex_disagreement() {
     assert_eq!(consensus_count, 0, "Disagreeing molecule should produce no consensus");
 }
 
-/// Verifies that the parallel `Codec::execute_threads_mode` path recovers
-/// from a duplex-disagreement molecule via the typed `CodecConsensusError`
-/// — covers `src/lib/commands/codec.rs:617-630` (issue #338) which the
-/// single-threaded test above does not exercise.
+/// Verifies that the parallel `--threads` path recovers from a
+/// duplex-disagreement molecule via the typed `CodecConsensusError` — covers
+/// what the single-threaded test above does not exercise.
+///
+/// Since the R3.7 codec-command cutover, `default = ["consensus"]` means
+/// `--threads 2` here routes through the declarative chain builder
+/// (`Codec::execute_chain` / `add_codec`), not the legacy
+/// `Codec::execute_threads_mode`. This integration binary is built with the
+/// workspace default features, so that chain path is what this test exercises —
+/// a de-facto chain-path disagreement-recovery regression test.
 #[test]
 fn test_codec_command_recovers_from_duplex_disagreement_threaded() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -1227,12 +1237,15 @@ fn test_codec_command_recovers_from_duplex_disagreement_threaded() {
     let consensus_count = reader.records().count();
     assert_eq!(consensus_count, 0, "Disagreeing molecule should produce no consensus");
 
-    // Exercising --rejects forces the parallel-mode `flush_byte_records`
-    // call inside the typed-disagreement arm (`is_duplex_disagreement()`
-    // branch in `execute_threads_mode`). CODEC3-08: `consensus_reads_typed`
-    // now preserves the disagreeing molecule's raw records for the --rejects
-    // output before returning the recoverable error (fgbio routes these to its
-    // rejectsWriter), so the two input reads land in the rejects BAM.
+    // Exercising --rejects forces the parallel-mode reject-collection path
+    // through the typed-disagreement arm (`is_duplex_disagreement()`) — on a
+    // consensus build that's the chain's `build_codec_consensus_step_with_rejects`
+    // step (`add_codec`); on a non-consensus build it's the legacy
+    // `execute_threads_mode`'s `flush_byte_records` call. CODEC3-08:
+    // `consensus_reads_typed` preserves the disagreeing molecule's raw records
+    // for the --rejects output before returning the recoverable error (fgbio
+    // routes these to its rejectsWriter), so the two input reads land in the
+    // rejects BAM on either path.
     assert!(rejects_bam.exists(), "Rejects BAM file should be created");
 
     // Read the rejects back as raw BAM records so we can compare the *entire*
@@ -1376,4 +1389,495 @@ fn test_codec_ignores_half_mapped_pair_when_mapped_reads_present() {
     // Only the two fully mapped pairs contribute to each single-strand consensus.
     assert_eq!(int_tag(&records[0], SamTag::AD), 2, "R1 strand must use only the mapped reads");
     assert_eq!(int_tag(&records[0], SamTag::BD), 2, "R2 strand must use only the mapped reads");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R3.7 codec-command cutover: chain-vs-oracle parity tests
+//
+// The no-`--threads` single-threaded fast path (`Codec::execute`) is the
+// in-process parity oracle; `--threads N` now routes onto the declarative
+// chain builder (`Codec::execute_chain` -> `add_codec`). These tests prove
+// byte/record identity between the two paths across the codec knobs, plus the
+// Task 2 (sort-order guard) and Task 2A (validation mirroring) hardening.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parses and runs `codec` with the given input/output/extra args, panicking
+/// on failure. Shared by the parity tests below.
+fn codec_run(input: &Path, output: &Path, extra: &[&str]) {
+    let mut args: Vec<&str> =
+        vec!["codec", "--input", input.to_str().unwrap(), "--output", output.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    Codec::try_parse_from(args)
+        .expect("failed to parse codec args")
+        .execute("fgumi codec")
+        .expect("codec run failed");
+}
+
+/// Reads only the records of a codec output BAM, delegating to the shared
+/// [`read_bam_output`] helper (full-header comparisons use that directly).
+fn read_consensus_records(path: &Path) -> Vec<noodles::sam::alignment::RecordBuf> {
+    read_bam_output(path).1
+}
+
+/// Builds `count` distinct-MI, full-overlap CODEC read pairs (one full duplex
+/// molecule per pair) spread across increasing reference positions, using
+/// [`create_codec_read_pair`]. Each pair is written to the BAM back-to-back,
+/// which keeps `create_codec_test_bam`'s template-coordinate-sorted header
+/// truthful (MI groups are contiguous in input order).
+///
+/// A large `count` pushes the chain's `GroupByMi` batching machinery to close
+/// an internal batch mid-molecule-set, exercising cross-input-batch MI
+/// bookkeeping that a handful of paired templates (or any single-record-per-
+/// name fixture) never reaches.
+fn create_paired_codec_templates(count: usize) -> Vec<(RawRecord, RawRecord)> {
+    (0..count)
+        .map(|i| {
+            let name = format!("read{i:04}");
+            let umi = format!("UMI{i:04}");
+            let pos = 100 + i * 20;
+            create_codec_read_pair(
+                &name,
+                b"ACGTACGT",
+                b"ACGTACGT",
+                &[30; 8],
+                &[30; 8],
+                pos,
+                &umi,
+                None,
+            )
+        })
+        .collect()
+}
+
+/// Task 3 item 1: plain chain (`--threads 4`) vs oracle, full-header + record
+/// parity.
+#[test]
+fn test_codec_chain_matches_single_threaded() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    create_codec_test_bam(&input_bam, create_paired_codec_templates(10));
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    codec_run(&input_bam, &oracle_out, &["--min-reads", "1"]);
+
+    let chain_out = temp_dir.path().join("chain.bam");
+    codec_run(&input_bam, &chain_out, &["--min-reads", "1", "--threads", "4"]);
+
+    let (oracle_header, expected) = read_bam_output(&oracle_out);
+    let (chain_header, actual) = read_bam_output(&chain_out);
+    assert!(!expected.is_empty(), "oracle output must be non-empty (guard against a vacuous pass)");
+    assert_eq!(
+        actual, expected,
+        "chain --threads 4 output must match the non-chain path record-for-record"
+    );
+    assert_eq!(
+        chain_header, oracle_header,
+        "chain and non-chain output headers must match (with @PG CL normalized)"
+    );
+}
+
+/// Knob-parity: set several non-default content-affecting codec knobs and assert
+/// the chain (`--threads 4`) output matches the single-threaded oracle
+/// record-for-record. Guards against `add_codec`'s hand-built
+/// `CodecConsensusOptions` dropping or mis-wiring a knob that the oracle's
+/// `to_codec_options()` honors — the default-only parity tests would pass green
+/// on such a drop, since both paths would then agree on the (identical) default.
+#[test]
+fn test_codec_chain_matches_single_threaded_with_nondefault_knobs() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    create_codec_test_bam(&input_bam, create_paired_codec_templates(10));
+
+    // Non-default values for every content-affecting knob the chain builds by
+    // hand in `add_codec` (quality overrides, outer-base trimming, duplex-length
+    // gate). Both paths get the SAME flags, so any divergence means the chain
+    // dropped or mis-wired one of them.
+    let knobs: &[&str] = &[
+        "--min-reads",
+        "1",
+        "--min-duplex-length",
+        "2",
+        "--outer-bases-length",
+        "3",
+        "--outer-bases-qual",
+        "10",
+        "--single-strand-qual",
+        "20",
+    ];
+    let mut chain_args: Vec<&str> = knobs.to_vec();
+    chain_args.extend_from_slice(&["--threads", "4"]);
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    codec_run(&input_bam, &oracle_out, knobs);
+    let chain_out = temp_dir.path().join("chain.bam");
+    codec_run(&input_bam, &chain_out, &chain_args);
+
+    let (oracle_header, expected) = read_bam_output(&oracle_out);
+    let (chain_header, actual) = read_bam_output(&chain_out);
+    assert!(!expected.is_empty(), "oracle output must be non-empty (guard against a vacuous pass)");
+    assert_eq!(
+        actual, expected,
+        "chain --threads 4 output with non-default knobs must match the oracle record-for-record"
+    );
+    assert_eq!(
+        chain_header, oracle_header,
+        "chain and non-chain output headers must match (with @PG CL normalized)"
+    );
+}
+
+/// Task 3 item 4: multi-batch parity — many distinct-MI paired templates so
+/// cross-input-batch MI carry-over inside the chain's `GroupByMi` is actually
+/// exercised (a handful of templates all land in one batch and would never
+/// reach this code path).
+#[test]
+fn test_codec_chain_multi_batch_matches_single_threaded() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    create_codec_test_bam(&input_bam, create_paired_codec_templates(200));
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    codec_run(&input_bam, &oracle_out, &["--min-reads", "1"]);
+
+    let chain_out = temp_dir.path().join("chain.bam");
+    codec_run(&input_bam, &chain_out, &["--min-reads", "1", "--threads", "4"]);
+
+    let expected = read_consensus_records(&oracle_out);
+    let actual = read_consensus_records(&chain_out);
+    assert!(!expected.is_empty(), "oracle output must be non-empty (guard against a vacuous pass)");
+    assert_eq!(
+        actual.len(),
+        200,
+        "every one of the 200 distinct-MI molecules must produce a consensus read"
+    );
+    assert_eq!(
+        actual, expected,
+        "chain multi-batch output must match the non-chain path record-for-record"
+    );
+}
+
+/// Task 3 item 2: `--rejects` parity — record parity **and** header parity.
+/// The rejects BAM must carry the raw input header verbatim on both paths (the
+/// PR #332 contract; Task 2B), so a chain path that leaked its own `@PG` into
+/// rejects would fail this.
+#[test]
+fn test_codec_chain_rejects_matches_single_threaded() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+
+    let mut pairs = create_paired_codec_templates(5);
+    // A duplex-disagreement molecule that `--max-duplex-disagreements 0` rejects
+    // on both paths.
+    pairs.push(create_offset_codec_pair("disagree_read", "UMI_DISAGREE"));
+    create_codec_test_bam(&input_bam, pairs);
+
+    let base_args = &["--min-reads", "1", "--max-duplex-disagreements", "0"];
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    let oracle_rejects = temp_dir.path().join("oracle.rejects.bam");
+    let mut oracle_args = base_args.to_vec();
+    oracle_args.extend_from_slice(&["--rejects", oracle_rejects.to_str().unwrap()]);
+    codec_run(&input_bam, &oracle_out, &oracle_args);
+
+    let chain_out = temp_dir.path().join("chain.bam");
+    let chain_rejects = temp_dir.path().join("chain.rejects.bam");
+    let mut chain_args = base_args.to_vec();
+    chain_args.extend_from_slice(&["--rejects", chain_rejects.to_str().unwrap(), "--threads", "4"]);
+    codec_run(&input_bam, &chain_out, &chain_args);
+
+    let expected_out = read_consensus_records(&oracle_out);
+    let actual_out = read_consensus_records(&chain_out);
+    assert_eq!(actual_out, expected_out, "chain primary output must match the non-chain path");
+
+    let (oracle_rejects_header, expected_rejects) = read_bam_output(&oracle_rejects);
+    let (chain_rejects_header, actual_rejects) = read_bam_output(&chain_rejects);
+    assert!(
+        !expected_rejects.is_empty(),
+        "oracle rejects must be non-empty (guard against a vacuous pass)"
+    );
+    assert_eq!(
+        actual_rejects, expected_rejects,
+        "chain --rejects output must match the non-chain path record-for-record"
+    );
+
+    // Rejects-header provenance (Task 2B): rejects are raw-input records, so
+    // both paths must write them under the raw input header verbatim.
+    // `read_bam_output` normalizes the `@PG` CL, so the input header (which
+    // carries no fgumi `@PG`) must equal both rejects headers.
+    let (input_header, _) = read_bam_output(&input_bam);
+    assert_eq!(
+        chain_rejects_header, oracle_rejects_header,
+        "chain and non-chain rejects headers must match"
+    );
+    assert_eq!(
+        chain_rejects_header, input_header,
+        "rejects header must be the raw input header verbatim (no injected @PG)"
+    );
+}
+
+/// Task 3 item 3: `--stats` output from the chain path is byte-identical to
+/// the non-chain path (byte-compare, not field-by-field).
+#[test]
+fn test_codec_chain_stats_matches_single_threaded() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    create_codec_test_bam(&input_bam, create_paired_codec_templates(15));
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    let oracle_stats = temp_dir.path().join("oracle.stats.txt");
+    codec_run(
+        &input_bam,
+        &oracle_out,
+        &["--min-reads", "1", "--stats", oracle_stats.to_str().unwrap()],
+    );
+
+    let chain_out = temp_dir.path().join("chain.bam");
+    let chain_stats = temp_dir.path().join("chain.stats.txt");
+    codec_run(
+        &input_bam,
+        &chain_out,
+        &["--min-reads", "1", "--stats", chain_stats.to_str().unwrap(), "--threads", "4"],
+    );
+
+    let expected = fs::read(&oracle_stats).expect("read oracle stats");
+    let actual = fs::read(&chain_stats).expect("read chain stats");
+    assert!(!expected.is_empty(), "oracle stats must be non-empty (guard against a vacuous pass)");
+    assert_eq!(
+        actual, expected,
+        "chain --stats output must be byte-identical to the non-chain path"
+    );
+}
+
+/// Task 3 item 5 (proves Task 2): a coordinate-sorted input is REJECTED on
+/// both the non-chain and chain (`--threads 4`) paths with the same
+/// "not sorted correctly for consensus calling" error. `add_codec` has no
+/// out-of-order/duplicate detection of its own (`GroupByMi` doesn't either),
+/// so without the `check_consensus_sort_order` guard a mis-sorted input would
+/// be silently mis-grouped instead of rejected.
+#[test]
+fn test_codec_chain_rejects_coordinate_sorted_input() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+
+    let header = create_coordinate_sorted_header("chr1", 10000);
+    let pair = create_codec_read_pair(
+        "read1",
+        b"ACGTACGT",
+        b"ACGTACGT",
+        &[30; 8],
+        &[30; 8],
+        100,
+        "UMI1",
+        None,
+    );
+    let mut writer =
+        create_raw_bam_writer(&input_bam, &header, 1, 6).expect("failed to create raw BAM writer");
+    writer.write_raw_record(pair.0.as_ref()).expect("failed to write R1");
+    writer.write_raw_record(pair.1.as_ref()).expect("failed to write R2");
+    writer.finish().expect("failed to finish BAM");
+
+    let output_bam = temp_dir.path().join("output.bam");
+
+    let oracle_err = Codec::try_parse_from([
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+    ])
+    .expect("failed to parse codec args")
+    .execute("fgumi codec")
+    .expect_err("codec must reject non-template-coordinate input");
+
+    let chain_err = Codec::try_parse_from([
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--threads",
+        "4",
+    ])
+    .expect("failed to parse codec args")
+    .execute("fgumi codec")
+    .expect_err("codec chain path must reject non-template-coordinate input");
+
+    assert!(
+        oracle_err.to_string().contains("template-coordinate"),
+        "oracle error must suggest template-coordinate sorting: {oracle_err}"
+    );
+    assert_eq!(
+        oracle_err.to_string(),
+        chain_err.to_string(),
+        "both paths must reject a coordinate-sorted input with the same error message"
+    );
+}
+
+/// Task 3 item 6a: an out-of-range `--max-duplex-disagreement-rate` is
+/// rejected identically on both `--threads`/no-`--threads` paths with the same
+/// error. This passes with or without Task 2A's mirrored checks in
+/// `add_codec`, because `Codec::execute()`'s top-level `validate()` rejects it
+/// before either branch dispatches — it is a parity/regression guard, not an
+/// isolation test for `add_codec`'s new checks (see the builder-level test
+/// below for that).
+#[rstest]
+#[case::single_threaded(&[])]
+#[case::threaded(&["--threads", "4"])]
+fn test_codec_rejects_out_of_range_disagreement_rate_end_to_end(#[case] extra: &[&str]) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    create_codec_test_bam(&input_bam, create_paired_codec_templates(2));
+    let output_bam = temp_dir.path().join("output.bam");
+
+    let mut args = vec![
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+        "--max-duplex-disagreement-rate",
+        "1.5",
+    ];
+    args.extend_from_slice(extra);
+
+    let err = Codec::try_parse_from(args)
+        .expect("failed to parse codec args")
+        .execute("fgumi codec")
+        .expect_err("codec must reject an out-of-range --max-duplex-disagreement-rate");
+    assert!(
+        err.to_string().contains("max-duplex-disagreement-rate must be between 0.0 and 1.0"),
+        "unexpected error: {err:#}"
+    );
+}
+
+/// Task 3 item 6b (the test that actually pins Task 2A): drives `add_codec`
+/// directly via `ChainSpec::single_stage(Stage::Codec, ..)` with an
+/// out-of-range `CodecOptions`, bypassing `Codec::execute`'s top-level
+/// `validate()` entirely. This is the test that fails if Task 2A's mirrored
+/// checks were absent from `add_codec` — the end-to-end test above cannot
+/// distinguish "the builder validates" from "the CLI's `validate()` already
+/// caught it first".
+#[test]
+fn test_add_codec_rejects_out_of_range_disagreement_rate_bypassing_cli_validate() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    create_codec_test_bam(&input_bam, create_paired_codec_templates(2));
+    let output_bam = temp_dir.path().join("output.bam");
+
+    let cmd = Codec::try_parse_from([
+        "codec",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+    ])
+    .expect("failed to parse codec args");
+
+    // Bypass `Codec::execute`'s top-level `validate()` entirely by going
+    // straight through `to_codec_options()` into a hand-built `ChainSpec` --
+    // never calling `Command::execute`/`Codec::validate` at all.
+    let mut codec_opts = cmd.to_codec_options();
+    codec_opts.max_duplex_disagreement_rate = 1.5;
+
+    let ctx = SingleStageContext {
+        io: &cmd.io,
+        threading: &cmd.threading,
+        compression: &cmd.compression,
+        scheduler: &cmd.scheduler_opts,
+        queue_memory: &cmd.queue_memory,
+        command_line: "test",
+    };
+    let stage_opts = StageOptionsBag { codec: Some(codec_opts), ..Default::default() };
+    let spec = ChainSpec::single_stage(Stage::Codec, stage_opts, &ctx);
+
+    let err = build_for(spec).and_then(fgumi_lib::pipeline::chains::BuiltPipeline::run).expect_err(
+        "add_codec must reject an out-of-range disagreement rate itself, even when \
+             Codec::execute's top-level validate() is bypassed entirely",
+    );
+    assert!(
+        err.to_string().contains("max-duplex-disagreement-rate must be between 0.0 and 1.0"),
+        "unexpected error: {err:#}"
+    );
+}
+
+/// Task 2A (exhaustive): pin every bound `CodecOptions::validate()` enforces.
+/// `validate()` is the single source of truth that BOTH `Codec::validate()` (the
+/// CLI pre-flight) and `add_codec` (the chain builder) delegate to, so a guard
+/// dropped from it silently weakens both paths at once — a green end-to-end
+/// parity test cannot catch that, because both paths would drop the guard
+/// together. Driving `validate()` directly (a pure function; no BAM/I/O needed)
+/// is the isolation test that would fail if any one check were removed.
+#[rstest]
+#[case::error_rate_pre_umi_zero(
+    |o: &mut CodecOptions| o.error_rate_pre_umi = 0,
+    "error-rate-pre-umi must be > 0"
+)]
+#[case::error_rate_post_umi_zero(
+    |o: &mut CodecOptions| o.error_rate_post_umi = 0,
+    "error-rate-post-umi must be > 0"
+)]
+#[case::min_reads_zero(
+    |o: &mut CodecOptions| o.min_reads = 0,
+    "min-reads must be >= 1"
+)]
+#[case::max_reads_below_min_reads(
+    |o: &mut CodecOptions| { o.min_reads = 3; o.max_reads = Some(2); },
+    "max-reads (2) must be >= min-reads (3)"
+)]
+#[case::min_duplex_length_zero(
+    |o: &mut CodecOptions| o.min_duplex_length = 0,
+    "min-duplex-length must be >= 1"
+)]
+#[case::disagreement_rate_nan(
+    |o: &mut CodecOptions| o.max_duplex_disagreement_rate = f64::NAN,
+    "max-duplex-disagreement-rate must be a finite number"
+)]
+#[case::disagreement_rate_above_one(
+    |o: &mut CodecOptions| o.max_duplex_disagreement_rate = 1.5,
+    "max-duplex-disagreement-rate must be between 0.0 and 1.0"
+)]
+#[case::disagreement_rate_negative(
+    |o: &mut CodecOptions| o.max_duplex_disagreement_rate = -0.1,
+    "max-duplex-disagreement-rate must be between 0.0 and 1.0"
+)]
+#[case::single_strand_qual_above_max_phred(
+    |o: &mut CodecOptions| o.single_strand_qual = Some(200),
+    "single-strand-qual (200) exceeds maximum Phred score"
+)]
+#[case::outer_bases_qual_above_max_phred(
+    |o: &mut CodecOptions| o.outer_bases_qual = Some(200),
+    "outer-bases-qual (200) exceeds maximum Phred score"
+)]
+fn test_codec_options_validate_rejects_invalid(
+    #[case] mutate: fn(&mut CodecOptions),
+    #[case] expected_msg: &str,
+) {
+    // A valid baseline projected from a normally-parsed command. `validate()` is
+    // pure, so the referenced paths are never opened.
+    let cmd = Codec::try_parse_from([
+        "codec",
+        "--input",
+        "in.bam",
+        "--output",
+        "out.bam",
+        "--min-reads",
+        "1",
+    ])
+    .expect("failed to parse codec args");
+    let mut opts = cmd.to_codec_options();
+    opts.validate().expect("baseline CodecOptions must be valid (or the case proves nothing)");
+
+    mutate(&mut opts);
+    let err = opts.validate().expect_err("validate() must reject the mutated options");
+    assert!(
+        err.to_string().contains(expected_msg),
+        "expected error containing {expected_msg:?}, got: {err:#}"
+    );
 }

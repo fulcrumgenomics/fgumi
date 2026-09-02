@@ -420,6 +420,68 @@ fn recover_or_propagate_codec_error(e: CodecConsensusError, umi: &str) -> Result
 }
 
 impl CodecOptions {
+    /// Validate the codec consensus parameter bounds. Single source of truth,
+    /// shared by `Codec::validate` (the CLI pre-flight) and `add_codec` (the
+    /// chain builder), so the two paths cannot drift and every direct
+    /// `StageOptionsBag { codec: .. }` caller is guarded identically to the CLI.
+    /// Pure function of the options — no I/O, no side effects.
+    pub fn validate(&self) -> Result<()> {
+        // Validate error rates.
+        if self.error_rate_pre_umi == 0 {
+            bail!("error-rate-pre-umi must be > 0");
+        }
+        if self.error_rate_post_umi == 0 {
+            bail!("error-rate-post-umi must be > 0");
+        }
+
+        // Validate min/max reads.
+        if self.min_reads == 0 {
+            bail!("min-reads must be >= 1");
+        }
+        if let Some(max) = self.max_reads
+            && max < self.min_reads
+        {
+            bail!("max-reads ({}) must be >= min-reads ({})", max, self.min_reads);
+        }
+
+        // Validate duplex length.
+        if self.min_duplex_length == 0 {
+            bail!("min-duplex-length must be >= 1");
+        }
+
+        // Validate disagreement rate. The non-finite check must come first: `NaN`
+        // compares `false` against both bounds, so a bare range test admits it, and
+        // every downstream `rate > threshold` comparison is then false — silently
+        // disabling duplex-disagreement rejection so molecules that should be
+        // rejected are emitted as consensus reads.
+        if !self.max_duplex_disagreement_rate.is_finite() {
+            bail!(
+                "max-duplex-disagreement-rate must be a finite number, got {}",
+                self.max_duplex_disagreement_rate
+            );
+        }
+        if self.max_duplex_disagreement_rate < 0.0 || self.max_duplex_disagreement_rate > 1.0 {
+            bail!("max-duplex-disagreement-rate must be between 0.0 and 1.0");
+        }
+
+        // Validate the fixed quality overrides. These are written straight into the
+        // consensus record's QUAL array, so a value above the maximum Phred score
+        // would emit BAM quality bytes outside the legal SAM `!`..`~` range.
+        let max_phred = ConsensusCallingOptions::MAX_PHRED;
+        for (name, value) in [
+            ("single-strand-qual", self.single_strand_qual),
+            ("outer-bases-qual", self.outer_bases_qual),
+        ] {
+            if let Some(qual) = value
+                && qual > max_phred
+            {
+                bail!("{name} ({qual}) exceeds maximum Phred score ({max_phred})");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Reconstruct the shared [`ConsensusCallingOptions`] from the inlined flat
     /// fields, so the chain builder can read `.consensus().error_rate_pre_umi`
     /// etc. `tie_rule` is stored resolved on `CodecOptions`; convert it back to
@@ -453,6 +515,16 @@ impl Command for Codec {
             outputs.push((path.as_path(), "--stats"));
         }
         reject_output_collisions(&outputs)?;
+
+        // ---- --threads N on a consensus build: run on the declarative chain ----
+        // Dispatch BEFORE the timer/banner/reader below (execute_chain ->
+        // add_codec builds its own). On a non-consensus build the chain
+        // machinery isn't compiled, so this block is absent and we fall through
+        // to the legacy threaded path.
+        #[cfg(feature = "consensus")]
+        if self.threading.threads.is_some() {
+            return self.execute_chain(command_line);
+        }
 
         let timer = OperationTimer::new("Calling CODEC consensus");
 
@@ -682,6 +754,37 @@ impl Command for Codec {
     }
 }
 impl Codec {
+    /// Run the codec stage on the declarative chain builder (the `--threads N`
+    /// path on a `consensus`-feature build).
+    ///
+    /// Replaces the hand-rolled unified-pipeline construction in `execute` for
+    /// the threaded case. The chain opens its own source, validates the
+    /// template-coordinate sort order, calls consensus, writes the output BAM,
+    /// and writes the rejects/stats via the codec finalize hook — all through
+    /// the same shared helpers as the non-chain path, so the two orchestrations
+    /// stay in parity. The no-`--threads` path keeps its own single-threaded
+    /// fast path in `execute`, which is the in-process parity oracle for this
+    /// one (see `test_codec_chain_matches_single_threaded`).
+    #[cfg(feature = "consensus")]
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        use crate::pipeline::chains::{
+            ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
+        };
+        self.io.log_effective_check_crc();
+        let stage_opts =
+            StageOptionsBag { codec: Some(self.to_codec_options()), ..Default::default() };
+        let ctx = SingleStageContext {
+            io: &self.io,
+            threading: &self.threading,
+            compression: &self.compression,
+            scheduler: &self.scheduler_opts,
+            queue_memory: &self.queue_memory,
+            command_line,
+        };
+        let spec = ChainSpec::single_stage(Stage::Codec, stage_opts, &ctx);
+        build_for(spec)?.run()
+    }
+
     /// Convert the caller's merged statistics to fgbio's KV metrics, log the
     /// consensus summary, and write the seeded KV stats file when `--stats` is
     /// requested. Returns the number of consensus reads.
@@ -707,62 +810,13 @@ impl Codec {
         Ok(consensus_count)
     }
 
-    /// Validates command-line arguments
+    /// Validates command-line arguments.
+    ///
+    /// Delegates to [`CodecOptions::validate`], the single source of truth for
+    /// the codec parameter bounds, so this CLI pre-flight and the chain builder
+    /// (`add_codec`, via the same `CodecOptions::validate`) cannot drift.
     fn validate(&self) -> Result<()> {
-        // Validate error rates
-        if self.consensus.error_rate_pre_umi == 0 {
-            bail!("error-rate-pre-umi must be > 0");
-        }
-        if self.consensus.error_rate_post_umi == 0 {
-            bail!("error-rate-post-umi must be > 0");
-        }
-
-        // Validate min/max reads
-        if self.min_reads == 0 {
-            bail!("min-reads must be >= 1");
-        }
-        if let Some(max) = self.max_reads
-            && max < self.min_reads
-        {
-            bail!("max-reads ({}) must be >= min-reads ({})", max, self.min_reads);
-        }
-
-        // Validate duplex length
-        if self.min_duplex_length == 0 {
-            bail!("min-duplex-length must be >= 1");
-        }
-
-        // Validate disagreement rate. The non-finite check must come first: `NaN`
-        // compares `false` against both bounds, so a bare range test admits it, and
-        // every downstream `rate > threshold` comparison is then false — silently
-        // disabling duplex-disagreement rejection so molecules that should be
-        // rejected are emitted as consensus reads.
-        if !self.max_duplex_disagreement_rate.is_finite() {
-            bail!(
-                "max-duplex-disagreement-rate must be a finite number, got {}",
-                self.max_duplex_disagreement_rate
-            );
-        }
-        if self.max_duplex_disagreement_rate < 0.0 || self.max_duplex_disagreement_rate > 1.0 {
-            bail!("max-duplex-disagreement-rate must be between 0.0 and 1.0");
-        }
-
-        // Validate the fixed quality overrides. These are written straight into the
-        // consensus record's QUAL array, so a value above the maximum Phred score
-        // would emit BAM quality bytes outside the legal SAM `!`..`~` range.
-        let max_phred = ConsensusCallingOptions::MAX_PHRED;
-        for (name, value) in [
-            ("single-strand-qual", self.single_strand_qual),
-            ("outer-bases-qual", self.outer_bases_qual),
-        ] {
-            if let Some(qual) = value
-                && qual > max_phred
-            {
-                bail!("{name} ({qual}) exceeds maximum Phred score ({max_phred})");
-            }
-        }
-
-        Ok(())
+        self.to_codec_options().validate()
     }
 
     /// Execute using 7-step unified pipeline with --threads.

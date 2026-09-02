@@ -402,6 +402,34 @@ pub fn validate_cross_stage_constraints(spec: &ChainSpec) -> Result<()> {
         );
     }
 
+    // Rule 6: a `Stage::Sort` that immediately precedes a consensus stage
+    // (Simplex/Duplex/Codec) must sort by template-coordinate. Consensus callers
+    // group a molecule's reads by *adjacency* on the MI tag (`GroupByMi`), which
+    // only merges runs of consecutive identical MI values. In a fused
+    // `Sort → <consensus>` chain the consensus stage's own
+    // `check_consensus_sort_order` guard is skipped — it fires only when the
+    // consensus stage is first and consumes the raw source — so a coordinate- or
+    // queryname-ordered intermediate sort would scatter a molecule's reads across
+    // the stream and silently split it into multiple consensus groups (a
+    // success-exit correctness bug). Template-coordinate is the only order that
+    // guarantees same-MI reads are contiguous. No CLI builds this chain today;
+    // like Rules 3/3b this protects a directly-constructed programmatic chain.
+    for window in spec.stages.windows(2) {
+        if window[0] == Stage::Sort
+            && window[1].is_consensus()
+            && let Some(sort_opts) = spec.stage_opts.sort.as_ref()
+            && !matches!(sort_opts.order, SortOrderArg::TemplateCoordinate)
+        {
+            bail!(
+                "Stage::Sort immediately preceding consensus stage {:?} must sort by \
+                 template-coordinate (consensus groups reads by adjacency on the MI tag, so \
+                 same-MI reads must be contiguous); got sort order {:?}",
+                window[1],
+                sort_opts.order,
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -722,6 +750,62 @@ mod tests {
         spec.stage_opts.sort = Some(sort_opts_with_order(SortOrderArg::Coordinate));
         validate_cross_stage_constraints(&spec)
             .expect("BamWithIndex with a coordinate terminal sort is valid");
+    }
+
+    #[rstest]
+    // A `Sort → <consensus>` fused chain skips the consensus stage's own
+    // `check_consensus_sort_order` guard, so the validator must reject any
+    // intermediate sort order that does not leave same-MI reads contiguous.
+    // Cover every non-template-coordinate order against every consensus stage.
+    fn cross_stage_sort_before_consensus_rejects_non_template_coordinate(
+        #[values(Stage::Simplex, Stage::Duplex, Stage::Codec)] consensus: Stage,
+        #[values(
+            SortOrderArg::Coordinate,
+            SortOrderArg::Queryname,
+            SortOrderArg::QuerynameNatural
+        )]
+        order: SortOrderArg,
+    ) {
+        let mut spec = empty_spec(vec![Stage::Sort, consensus]);
+        spec.stage_opts.sort = Some(sort_opts_with_order(order));
+        let msg = validate_cross_stage_constraints(&spec).unwrap_err().to_string();
+        assert!(
+            msg.contains("template-coordinate"),
+            "expected 'template-coordinate' in error, got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{consensus:?}")),
+            "expected consensus stage {consensus:?} in error, got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{order:?}")),
+            "expected the rejected order {order:?} in error, got: {msg}"
+        );
+    }
+
+    #[rstest]
+    fn cross_stage_sort_before_consensus_accepts_template_coordinate(
+        #[values(Stage::Simplex, Stage::Duplex, Stage::Codec)] consensus: Stage,
+    ) {
+        // Template-coordinate is the one intermediate order that keeps same-MI
+        // reads contiguous, so a `Sort(template-coordinate) → <consensus>` chain
+        // passes the cross-stage validator.
+        let mut spec = empty_spec(vec![Stage::Sort, consensus]);
+        spec.stage_opts.sort = Some(sort_opts_with_order(SortOrderArg::TemplateCoordinate));
+        validate_cross_stage_constraints(&spec).unwrap_or_else(|e| {
+            panic!("Sort(template-coordinate) → {consensus:?} should be valid, got: {e}")
+        });
+    }
+
+    #[test]
+    fn cross_stage_non_adjacent_sort_before_consensus_is_unconstrained() {
+        // `Sort → Group → Simplex`: Group re-groups by MI, so the intermediate
+        // sort order does not feed the consensus stage directly and Rule 6 must
+        // not fire even for a coordinate sort.
+        let mut spec = empty_spec(vec![Stage::Sort, Stage::Group, Stage::Simplex]);
+        spec.stage_opts.sort = Some(sort_opts_with_order(SortOrderArg::Coordinate));
+        validate_cross_stage_constraints(&spec)
+            .expect("Sort → Group → Simplex is not a direct Sort → consensus feed");
     }
 
     #[rstest]
