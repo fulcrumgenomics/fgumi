@@ -6,43 +6,28 @@
 
 use crate::alignment_tags::regenerate_alignment_tags_raw;
 use crate::clipper::{ClippingMode, RawRecordClipper};
-use crate::grouper::TemplateGrouper;
 use crate::logging::OperationTimer;
 use crate::metrics::clip::{ClipCounts, ClippingMetricsCollection};
 use crate::metrics::writer::write_metrics as write_metrics_tsv;
-use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::reference::ReferenceReader;
 use crate::sam::SamTag;
-use crate::template::{
-    InsertSizeEnd, TemplateBatch, TemplateIterator, compute_insert_size_from_ends,
-};
-use crate::unified_pipeline::{
-    GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
-};
+use crate::template::{InsertSizeEnd, TemplateIterator, compute_insert_size_from_ends};
 use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{
-    create_bam_reader_for_pipeline_with_opts, create_raw_bam_reader_with_opts,
-    create_raw_bam_writer,
-};
+use fgumi_bam_io::{create_raw_bam_reader_with_opts, create_raw_bam_writer};
 use fgumi_raw_bam::RawRecord;
 use log::info;
-use noodles::sam::Header;
-use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::command::Command;
 use super::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config,
 };
 
 /// Clips reads in a BAM file to remove overlaps
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "clip",
     about = "\x1b[38;5;173m[POST-CONSENSUS]\x1b[0m \x1b[36mClip overlapping reads in BAM files\x1b[0m",
@@ -160,36 +145,6 @@ pub struct Clip {
 // Types for 7-step pipeline processing
 // ============================================================================
 
-/// Result from processing a batch of templates through clipping.
-struct ClipProcessedBatch {
-    /// Clipped records to write to output BAM.
-    clipped_records: Vec<RawRecord>,
-    /// Number of templates processed.
-    templates_count: u64,
-    /// Number of templates with overlap clipping applied.
-    overlap_clipped_count: u64,
-    /// Number of templates with mate extension clipping applied.
-    extend_clipped_count: u64,
-}
-
-impl MemoryEstimate for ClipProcessedBatch {
-    fn estimate_heap_size(&self) -> usize {
-        self.clipped_records.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
-            + self.clipped_records.capacity() * std::mem::size_of::<RawRecord>()
-    }
-}
-
-/// Metrics collected from clipping processing, aggregated post-pipeline.
-#[derive(Default)]
-struct CollectedClipMetrics {
-    /// Total templates processed.
-    total_templates: u64,
-    /// Templates with overlap clipping.
-    overlap_clipped: u64,
-    /// Templates with mate extension clipping.
-    extend_clipped: u64,
-}
-
 /// Per-template clipping configuration, decoupled from `&Clip`.
 ///
 /// The single-threaded path holds a `&Clip` and could read these fields directly, but the
@@ -198,7 +153,7 @@ struct CollectedClipMetrics {
 /// clipping logic (`clip_template`/`clip_pair`/`clip_fragment`) instead of maintaining two
 /// copies that can silently drift apart.
 #[derive(Debug, Clone, Copy)]
-struct ClipParams {
+pub(crate) struct ClipParams {
     /// Upgrade existing clipping to the configured mode before applying new clipping.
     upgrade_clipping: bool,
     /// Clip the overlapping bases of an FR read pair.
@@ -217,7 +172,7 @@ struct ClipParams {
 
 impl ClipParams {
     /// Builds the per-template clip configuration from the parsed `Clip` command.
-    fn from_clip(clip: &Clip) -> Self {
+    pub(crate) fn from_clip(clip: &Clip) -> Self {
         Self {
             upgrade_clipping: clip.upgrade_clipping,
             clip_overlapping_reads: clip.clip_overlapping_reads,
@@ -258,7 +213,7 @@ impl ClipParams {
     /// # Errors
     ///
     /// Returns an error if primary-pair detection or a clipping operation fails.
-    fn clip_template(
+    pub(crate) fn clip_template(
         &self,
         records: &mut [RawRecord],
         clipper: &RawRecordClipper,
@@ -512,22 +467,8 @@ impl Command for Clip {
         self.io.validate()?;
         validate_file_exists(&self.reference, "Reference FASTA")?;
 
-        info!("Clip");
-        info!("  Input: {}", self.io.input.display());
-        info!("  Output: {}", self.io.output.display());
-        info!("  Clipping mode: {}", self.clipping_mode);
-        info!("  Clip overlapping reads: {}", self.clip_overlapping_reads);
-        info!("  Clip extending past mate: {}", self.clip_extending_past_mate);
-        info!("  {}", self.threading.log_message());
-        // Both the single-threaded fast path (via create_raw_bam_reader_with_opts)
-        // and the multi-threaded pipeline honor --check-crc/--no-check-crc (#800).
-        self.io.log_effective_check_crc();
-
-        let timer = OperationTimer::new("Clipping reads");
-
-        let mode = self.clipping_mode;
-
-        // Validate clipping parameters
+        // Validate clipping parameters (reader-free; must run on both execution
+        // paths). At least one clipping option must be requested.
         if self.upgrade_clipping
             || self.clip_overlapping_reads
             || self.clip_extending_past_mate
@@ -542,7 +483,9 @@ impl Command for Clip {
         }
 
         // --metrics is not produced in --threads mode; fail fast rather than
-        // silently dropping a user-requested output file.
+        // silently dropping a user-requested output file. Reader-free, so it runs
+        // before the chain dispatch below (add_clip re-checks it, but failing here
+        // keeps the error identical whether or not the chain path is taken).
         if self.threading.threads.is_some()
             && let Some(path) = &self.metrics
         {
@@ -553,49 +496,69 @@ impl Command for Clip {
             );
         }
 
-        // ========================================================================
-        // CRITICAL: Check --threads mode BEFORE creating any file handles.
-        // The 7-step pipeline manages its own I/O and writer lifecycle, so we
-        // must not create a writer here if we're going to use the pipeline.
-        // Route: Some(threads) -> pipeline, None -> single-threaded fast path
-        // ========================================================================
-        let total_records = if let Some(threads) = self.threading.threads {
-            // Read header for the 7-step pipeline (supports stdin)
-            let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-                &self.io.input,
-                self.io.pipeline_reader_opts(),
-            )?;
+        // --threads N: run the clip stage on the declarative chain builder. Dispatch
+        // here — after the reader-free pre-flight above (output collisions, input +
+        // reference existence, clipping-option and --metrics validation), which must
+        // run for both paths — but BEFORE the banner / timer / reader below.
+        // execute_chain → add_clip re-emits the banner, timer, and threading log
+        // lines, re-enforces require_query_grouped, and opens its own source, so
+        // running them here too would double-log and pre-consume stdin. The
+        // no-`--threads` single-threaded path below stays the in-process parity oracle.
+        if self.threading.threads.is_some() {
+            return self.execute_chain(command_line);
+        }
 
-            // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio).
-            // Run before require_query_grouped so both execution modes guard the same
-            // normalized header (matching execute_single_threaded's ordering).
-            let header = crate::commands::common::ensure_hd_record(header)?;
+        // ---- legacy no-`--threads` oracle path (single-threaded engine) ----
+        info!("Clip");
+        info!("  Input: {}", self.io.input.display());
+        info!("  Output: {}", self.io.output.display());
+        info!("  Clipping mode: {}", self.clipping_mode);
+        info!("  Clip overlapping reads: {}", self.clip_overlapping_reads);
+        info!("  Clip extending past mate: {}", self.clip_extending_past_mate);
+        info!("  {}", self.threading.log_message());
+        // The single-threaded fast path (via create_raw_bam_reader_with_opts) honors
+        // --check-crc/--no-check-crc (#800).
+        self.io.log_effective_check_crc();
 
-            // CLIP3-05: fgbio's ClipBam calls Bams.requireQueryGrouped. Clipping is
-            // template-based (pair clip, overlap, past-mate, mate-fix), so coordinate-
-            // sorted input silently mis-groups mates. Guard the *input* header.
-            crate::commands::common::require_query_grouped(
-                &header,
-                &self.io.input.display().to_string(),
-            )?;
-
-            // Load reference (always required for clip)
-            let reference = Arc::new(ReferenceReader::new(&self.reference)?);
-
-            // Add @PG record with PP chaining to input's last program
-            let header = crate::commands::common::add_pg_record(header, command_line)?;
-
-            self.execute_threads_mode(reader, threads, header, reference)?
-        } else {
-            self.execute_single_threaded(mode, command_line)?
-        };
-
+        let timer = OperationTimer::new("Clipping reads");
+        let mode = self.clipping_mode;
+        let total_records = self.execute_single_threaded(mode, command_line)?;
         timer.log_completion(total_records);
         Ok(())
     }
 }
 
 impl Clip {
+    /// Runs the `--threads N` path via the declarative chain builder
+    /// (`ChainSpec::single_stage(Stage::Clip, ...)` → `build_for(spec)?.run()`).
+    ///
+    /// `add_clip` opens its own source, re-emits the timer/banner/threading log
+    /// lines, reloads the reference, re-validates the clipping options and the
+    /// `--metrics`/`--threads` combination, and re-enforces `require_query_grouped`,
+    /// so none of those may run again here — only the CRC-verify status line, which
+    /// `add_clip` does not re-emit. The no-`--threads` path in `execute` keeps its
+    /// own single-threaded engine, which is the in-process parity oracle for this
+    /// one (see `test_clip_chain_matches_single_threaded`).
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        use crate::pipeline::chains::{
+            ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
+        };
+        // add_clip re-emits the timer/banner/threading lines but NOT the
+        // CRC-verify status line.
+        self.io.log_effective_check_crc();
+        let stage_opts = StageOptionsBag { clip: Some(self.clone()), ..Default::default() };
+        let ctx = SingleStageContext {
+            io: &self.io,
+            threading: &self.threading,
+            compression: &self.compression,
+            scheduler: &self.scheduler_opts,
+            queue_memory: &self.queue_memory,
+            command_line,
+        };
+        let spec = ChainSpec::single_stage(Stage::Clip, stage_opts, &ctx);
+        build_for(spec)?.run()
+    }
+
     /// Execute single-threaded clipping.
     #[allow(clippy::too_many_lines)]
     fn execute_single_threaded(&self, mode: ClippingMode, command_line: &str) -> Result<u64> {
@@ -651,7 +614,8 @@ impl Clip {
         let mut total_clipped_mate_extension: u64 = 0;
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
-        // Shared per-template clip configuration (see `execute_threads_mode` for the parallel use).
+        // Shared per-template clip configuration (see `build_clip_process_step` in the chain
+        // builder for the parallel `--threads` use).
         let params = ClipParams::from_clip(self);
 
         // Single-threaded processing: iterate raw templates, clip in place
@@ -705,165 +669,6 @@ impl Clip {
 
         info!("Done!");
         Ok(total_records as u64)
-    }
-
-    /// Execute using the 7-step unified pipeline with multi-threading.
-    ///
-    /// Uses `TemplateGrouper` to batch records by template (QNAME) for parallel processing.
-    #[allow(clippy::too_many_lines)]
-    fn execute_threads_mode(
-        &self,
-        reader: Box<dyn std::io::Read + Send>,
-        num_threads: usize,
-        header: Header,
-        reference: Arc<ReferenceReader>,
-    ) -> Result<u64> {
-        // Configure pipeline - clip is writer-heavy workload
-        let mut pipeline_config = build_pipeline_config(
-            &self.scheduler_opts,
-            &self.compression,
-            &self.queue_memory,
-            &self.io,
-            num_threads,
-        )?;
-        // Clip uses raw-byte mode so TemplateGrouper receives RawRecord items.
-        pipeline_config.group_key_config =
-            Some(GroupKeyConfig::new_raw_no_cell(crate::read_info::LibraryIndex::default()));
-
-        // Per-thread metrics accumulator: bounded memory, no unbounded queue.
-        let collected_metrics = PerThreadAccumulator::<CollectedClipMetrics>::new(num_threads);
-        let collected_for_serialize = Arc::clone(&collected_metrics);
-
-        // Configuration for closures
-        const BATCH_SIZE: usize = 1000;
-        let clipping_mode = self.clipping_mode;
-        let auto_clip_attributes = self.auto_clip_attributes;
-        // Shared per-template clip configuration (Copy), captured by the `process_fn` closure so
-        // it runs the exact same clipping logic as the single-threaded path.
-        let params = ClipParams::from_clip(self);
-        let reference_for_process = Arc::clone(&reference);
-        let header_for_process = header.clone();
-
-        // Progress tracking
-        let progress_counter = Arc::new(AtomicU64::new(0));
-        let progress_for_process = Arc::clone(&progress_counter);
-
-        // Grouper: batch records by template (QNAME)
-        let grouper_fn = move |_header: &Header| {
-            Box::new(TemplateGrouper::new(BATCH_SIZE))
-                as Box<dyn Grouper<Group = TemplateBatch> + Send>
-        };
-
-        // Process function: clip each template batch
-        let process_fn = move |batch: TemplateBatch| -> io::Result<ClipProcessedBatch> {
-            // Create per-worker clipper
-            let clipper = if auto_clip_attributes {
-                RawRecordClipper::with_auto_clip(clipping_mode, true)
-            } else {
-                RawRecordClipper::new(clipping_mode)
-            };
-
-            let mut clipped_records = Vec::new();
-            let mut templates_count = 0u64;
-            let mut overlap_clipped_count = 0u64;
-            let mut extend_clipped_count = 0u64;
-
-            for template in batch {
-                templates_count += 1;
-                let mut records: Vec<RawRecord> = template.into_records();
-
-                // Clip the primary R1/R2 (or a lone fragment) and repair mate info via the shared
-                // per-template logic (matches the single-threaded path exactly). This worker does
-                // not collect the detailed per-read metrics, so pass `None` and rely on the
-                // returned per-template flags for the overlap/extend counts.
-                let (overlap_clip, extend_clip) =
-                    params.clip_template(&mut records, &clipper, None).map_err(io::Error::other)?;
-                if overlap_clip {
-                    overlap_clipped_count += 1;
-                }
-                if extend_clip {
-                    extend_clipped_count += 1;
-                }
-
-                // Regenerate alignment tags (always done to match fgbio behavior)
-                for record in &mut records {
-                    regenerate_alignment_tags_raw(
-                        record.as_mut_vec(),
-                        &header_for_process,
-                        &reference_for_process,
-                    )
-                    .map_err(io::Error::other)?;
-                }
-
-                clipped_records.extend(records);
-            }
-
-            // Progress logging (count records, not templates)
-            let records_count = clipped_records.len() as u64;
-            let count = progress_for_process.fetch_add(records_count, Ordering::Relaxed);
-            if (count + records_count) / 1_000_000 > count / 1_000_000 {
-                info!("Processed {} records", count + records_count);
-            }
-
-            Ok(ClipProcessedBatch {
-                clipped_records,
-                templates_count,
-                overlap_clipped_count,
-                extend_clipped_count,
-            })
-        };
-
-        // Serialize function: write raw records directly into the output buffer
-        let serialize_fn = move |processed: ClipProcessedBatch,
-                                 _header: &Header,
-                                 output: &mut Vec<u8>|
-              -> io::Result<u64> {
-            // Merge per-batch counts into this worker's accumulator slot
-            collected_for_serialize.with_slot(|m| {
-                m.total_templates += processed.templates_count;
-                m.overlap_clipped += processed.overlap_clipped_count;
-                m.extend_clipped += processed.extend_clipped_count;
-            });
-
-            // Write raw records directly (4-byte block_size + bytes per record)
-            let count = processed.clipped_records.len() as u64;
-            fgumi_raw_bam::write_raw_records(output, &processed.clipped_records)?;
-            Ok(count)
-        };
-
-        // Run the 7-step pipeline
-        let records_written = run_bam_pipeline_from_reader(
-            pipeline_config,
-            reader,
-            header.clone(),
-            &self.io.output,
-            None, // Use input header for output
-            grouper_fn,
-            process_fn,
-            serialize_fn,
-        )?;
-
-        // ========== Post-pipeline: Aggregate metrics ==========
-        let mut total_templates = 0u64;
-        let mut total_overlap_clipped = 0u64;
-        let mut total_extend_clipped = 0u64;
-
-        for slot in collected_metrics.slots() {
-            let m = slot.lock();
-            total_templates += m.total_templates;
-            total_overlap_clipped += m.overlap_clipped;
-            total_extend_clipped += m.extend_clipped;
-        }
-
-        info!("Total templates processed: {total_templates}");
-        info!("Templates with overlap clipping: {total_overlap_clipped}");
-        info!("Templates with mate extension clipping: {total_extend_clipped}");
-
-        // `--metrics` with `--threads` is rejected in `execute()` before we ever
-        // reach this path, so no per-pipeline metrics file is written here.
-
-        info!("Done!");
-        Ok(records_written)
     }
 }
 
@@ -1138,40 +943,6 @@ fn clipped_bases_raw(record: &RawRecord) -> usize {
         })
         .map(|op| op.len() as usize)
         .sum()
-}
-
-// ==== ported from feat-runall for the chain builder (R2) ====
-/// Updates mate information tags (MC and MQ) for a read based on its mate.
-///
-/// After clipping operations, mate information tags need to be updated to reflect
-/// the new state of the mate read. This function updates:
-/// - MC tag: Mate CIGAR string
-/// - MQ tag: Mate mapping quality
-///
-/// These tags are standard SAM optional tags that store information about the mate
-/// to enable single-ended processing.
-///
-/// KNOWN DIVERGENCE — resolve in the clip WIRING PR: this is a NARROWER update
-/// than the canonical [`set_mate_info_raw`]. It updates only the MC/MQ tags and
-/// still does not update mate ref/pos/strand or TLEN; the clip wiring PR must
-/// delegate to `ClipParams::clip_template` / `set_mate_info_raw` and add
-/// byte-parity tests (same deferral as the Cluster-4 chain-clip divergence). The
-/// MC/MQ unmapped-mate divergence is closed here (see below) rather than
-/// deferred, so it cannot survive to the wiring PR.
-///
-/// # Arguments
-///
-/// * `record` - The record to update (mutable)
-/// * `mate` - The mate record to read information from
-pub(crate) fn update_mate_info_raw(record: &mut RawRecord, mate: &RawRecord) {
-    use fgumi_raw_bam::flags as rflags;
-    // An unmapped mate has no CIGAR and no meaningful MAPQ: remove MC/MQ rather
-    // than writing an empty `MC:Z:` and a stale MQ. Matches `set_mate_info_raw`.
-    if mate.flags() & rflags::UNMAPPED != 0 {
-        clear_mate_mq_mc_raw(record);
-        return;
-    }
-    set_mate_mq_mc_raw(record, mate.mapq(), &mate.cigar_to_string());
 }
 
 #[cfg(test)]
@@ -3162,29 +2933,6 @@ mod tests {
         assert_eq!(output_records.len(), 2, "Should have 2 records");
 
         Ok(())
-    }
-
-    #[test]
-    fn test_clip_processed_batch_memory_estimate() {
-        let record =
-            fgumi_raw_bam::SamBuilder::new().sequence(b"ACGT").qualities(&[30, 30, 30, 30]).build();
-        let mut records = Vec::with_capacity(10);
-        records.push(record);
-
-        let batch = ClipProcessedBatch {
-            clipped_records: records,
-            templates_count: 1,
-            overlap_clipped_count: 0,
-            extend_clipped_count: 0,
-        };
-
-        let estimate = batch.estimate_heap_size();
-        // Should include Vec overhead for capacity * size_of::<RawRecord>()
-        let vec_overhead = 10 * std::mem::size_of::<RawRecord>();
-        assert!(
-            estimate >= vec_overhead,
-            "estimate {estimate} should include Vec<RawRecord> overhead {vec_overhead}"
-        );
     }
 
     /// Helper to create a `Clip` struct with specified clipping parameters and

@@ -102,21 +102,16 @@ impl FinalizeHook for ClipFinalizeHook {
 /// `pub(crate)` — consumed only by `ChainBuilder::add_clip` and
 /// [`build_clip_process_step`].
 ///
-/// The five boolean fields reflect the five independent clipping control
-/// flags from the `Clip` command struct. Refactoring into a state-machine
-/// enum is not warranted here — each flag is checked individually in the
-/// hot-path closure.
-#[allow(clippy::struct_excessive_bools)]
+/// The clipping control flags are bundled into a single `params: ClipParams`,
+/// shared verbatim with the single-threaded oracle (`Clip::execute_single_threaded`);
+/// the hot-path closure delegates the whole per-template decision to
+/// `params.clip_template(...)` rather than branching on individual flags.
 pub(crate) struct ClipProcessCaptures {
     pub(crate) clipping_mode: crate::clipper::ClippingMode,
     pub(crate) auto_clip_attributes: bool,
-    pub(crate) upgrade_clipping: bool,
-    pub(crate) clip_overlapping_reads: bool,
-    pub(crate) clip_extending_past_mate: bool,
-    pub(crate) read_one_five_prime: usize,
-    pub(crate) read_one_three_prime: usize,
-    pub(crate) read_two_five_prime: usize,
-    pub(crate) read_two_three_prime: usize,
+    /// The per-template clip configuration, shared verbatim with the
+    /// single-threaded `Clip::execute` path (its in-process parity oracle).
+    pub(crate) params: crate::commands::clip::ClipParams,
     pub(crate) header: noodles::sam::Header,
     pub(crate) reference: Arc<ReferenceReader>,
     pub(crate) metrics: Arc<ClipAtomicMetrics>,
@@ -143,7 +138,6 @@ pub(crate) fn build_clip_process_step(
         limit_bytes,
         move |batch: BamTemplateBatch| -> io::Result<BamTemplateBatch> {
             use crate::alignment_tags::regenerate_alignment_tags_raw;
-            use crate::commands::clip::update_mate_info_raw;
 
             // Per-worker clipper: cheap to construct (no large state).
             let clipper = if cap.auto_clip_attributes {
@@ -169,86 +163,25 @@ pub(crate) fn build_clip_process_step(
                 // in place keeps allocation count near-equal to legacy.
                 let records: &mut Vec<RawRecord> = &mut template.records;
 
-                // KNOWN DIVERGENCE — MUST be resolved in the clip wiring PR
-                // (this chain path is dormant / has no callers today, so the
-                // divergence cannot yet reach output; the wiring PR must add
-                // byte-parity tests vs the standalone `clip`). This closure
-                // reimplements per-template clipping and has drifted from the
-                // canonical `ClipParams::clip_template` (src/lib/commands/clip.rs)
-                // in two ways:
-                //   1. It selects R1/R2 by POSITIONAL index (records[0]/[1]) and
-                //      does nothing for templates with >=3 records
-                //      (secondary/supplementary), whereas `clip_template` finds
-                //      the primary pair by SAM flag and upgrades all reads.
-                //   2. Fixed-position clipping calls `clip_*_end_of_alignment`
-                //      (clip N MORE aligned bases) where the canonical path calls
-                //      `clip_*_end_of_read_raw` (ensure at least N total clipped),
-                //      so this over-clips any read already carrying soft/hard clips.
-                // Fix: expose `ClipParams`/`clip_template` as `pub(crate)` and
-                // delegate to it here instead of reimplementing the loop.
-                if records.len() == 1 {
-                    let record = &mut records[0];
-                    if cap.upgrade_clipping {
-                        clipper.upgrade_all_clipping_raw(record).map_err(io::Error::other)?;
-                    }
-                    if cap.read_one_five_prime > 0 {
-                        clipper.clip_5_prime_end_of_alignment(record, cap.read_one_five_prime);
-                    }
-                    if cap.read_one_three_prime > 0 {
-                        clipper.clip_3_prime_end_of_alignment(record, cap.read_one_three_prime);
-                    }
-                } else if records.len() == 2 {
-                    let (r1_slice, r2_slice) = records.split_at_mut(1);
-                    let r1 = &mut r1_slice[0];
-                    let r2 = &mut r2_slice[0];
-
-                    if cap.upgrade_clipping {
-                        clipper.upgrade_all_clipping_raw(r1).map_err(io::Error::other)?;
-                        clipper.upgrade_all_clipping_raw(r2).map_err(io::Error::other)?;
-                    }
-
-                    let is_r1_first = r1.is_first_segment();
-                    let is_r2_last = r2.is_last_segment();
-
-                    if is_r1_first && cap.read_one_five_prime > 0 {
-                        clipper.clip_5_prime_end_of_alignment(r1, cap.read_one_five_prime);
-                    } else if !is_r1_first && cap.read_two_five_prime > 0 {
-                        clipper.clip_5_prime_end_of_alignment(r1, cap.read_two_five_prime);
-                    }
-                    if is_r1_first && cap.read_one_three_prime > 0 {
-                        clipper.clip_3_prime_end_of_alignment(r1, cap.read_one_three_prime);
-                    } else if !is_r1_first && cap.read_two_three_prime > 0 {
-                        clipper.clip_3_prime_end_of_alignment(r1, cap.read_two_three_prime);
-                    }
-                    if is_r2_last && cap.read_two_five_prime > 0 {
-                        clipper.clip_5_prime_end_of_alignment(r2, cap.read_two_five_prime);
-                    } else if !is_r2_last && cap.read_one_five_prime > 0 {
-                        clipper.clip_5_prime_end_of_alignment(r2, cap.read_one_five_prime);
-                    }
-                    if is_r2_last && cap.read_two_three_prime > 0 {
-                        clipper.clip_3_prime_end_of_alignment(r2, cap.read_two_three_prime);
-                    } else if !is_r2_last && cap.read_one_three_prime > 0 {
-                        clipper.clip_3_prime_end_of_alignment(r2, cap.read_one_three_prime);
-                    }
-
-                    if cap.clip_overlapping_reads {
-                        let (n1, n2) = clipper.clip_overlapping_reads(r1, r2);
-                        if n1 > 0 || n2 > 0 {
-                            local_overlap_clipped += 1;
-                        }
-                    }
-                    if cap.clip_extending_past_mate {
-                        let (n1, n2) = clipper.clip_extending_past_mate_ends(r1, r2);
-                        if n1 > 0 || n2 > 0 {
-                            local_extend_clipped += 1;
-                        }
-                    }
-
-                    update_mate_info_raw(r1, r2);
-                    update_mate_info_raw(r2, r1);
+                // Delegate to the canonical per-template clip implementation —
+                // the exact code the single-threaded `Clip::execute` oracle runs
+                // (`ClipParams::clip_template`). It finds the primary pair by SAM
+                // flag (so secondary/supplementary reads are handled, not just
+                // records[0]/[1]), applies fixed clipping with "ensure at least N
+                // including existing clipping" semantics (not "clip N more"), and
+                // repairs mate info. The `--metrics` detailed collection is never
+                // produced under `--threads` (rejected up front), so pass `None`
+                // and use the returned per-template flags for the atomic counters.
+                let (overlap_clipped, extend_clipped) =
+                    cap.params.clip_template(records, &clipper, None).map_err(io::Error::other)?;
+                if overlap_clipped {
+                    local_overlap_clipped += 1;
+                }
+                if extend_clipped {
+                    local_extend_clipped += 1;
                 }
 
-                // Regenerate alignment tags for every record.
+                // Regenerate alignment tags for every record (matches the oracle).
                 for record in records.iter_mut() {
                     regenerate_alignment_tags_raw(record.as_mut_vec(), &cap.header, &cap.reference)
                         .map_err(io::Error::other)?;

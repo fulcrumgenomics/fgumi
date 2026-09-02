@@ -283,6 +283,43 @@ fn test_clip_rejects_coordinate_sorted_input(#[case] extra_args: &[&str]) {
     );
 }
 
+/// `--metrics` combined with `--threads` must fail fast: detailed clipping metrics are only
+/// produced by the single-threaded path, so accepting `--metrics` under `--threads` would
+/// silently drop a user-requested output file. This reader-free guard runs before the chain
+/// dispatch; pin it so a regression that dropped it would be caught rather than silently
+/// ignoring the flag.
+#[test]
+fn test_clip_rejects_metrics_with_threads() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+    let ref_path = create_test_reference(temp_dir.path());
+    build_clip_parity_bam(&input_bam, 8);
+
+    let cmd = Clip::try_parse_from([
+        "clip",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--clip-overlapping-reads",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--threads",
+        "2",
+    ])
+    .expect("failed to parse clip args");
+
+    let err = cmd.execute("fgumi clip").expect_err("--metrics must be rejected under --threads");
+    assert!(
+        err.to_string().contains("cannot be used with --threads"),
+        "unexpected error message: {err}"
+    );
+}
+
 /// A header carrying only `@SQ` (no `@HD` line) -- mirrors header-less input.
 fn headerless_header(ref_name: &str, ref_len: usize) -> noodles::sam::Header {
     use noodles::sam::header::record::value::Map;
@@ -367,6 +404,137 @@ fn test_clip_command_basic() {
     let _header = reader.read_header().unwrap();
     let count = reader.records().count();
     assert_eq!(count, 2, "Should have both reads in output");
+}
+
+/// Build a query-grouped BAM of `count` overlapping paired templates. Each
+/// template is an 8M R1 at pos 99 and an 8M reverse R2 at pos 103 (mates overlap
+/// in [103,106]), so `--clip-overlapping-reads` plus fixed-end clipping both do
+/// real work. Read names are `tmpl{i}`, with R1/R2 kept adjacent (query-grouped),
+/// as clip requires.
+fn build_clip_parity_bam(path: &Path, count: usize) {
+    let pairs: Vec<(RawRecord, RawRecord)> = (0..count)
+        .map(|i| {
+            let name = format!("tmpl{i}");
+            let r1 = {
+                let mut b = SamBuilder::new();
+                b.read_name(name.as_bytes())
+                    .sequence(b"ACGTACGT")
+                    .qualities(&[30; 8])
+                    .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+                    .ref_id(0)
+                    .pos(99)
+                    .mapq(60)
+                    .cigar_ops(&[8 << 4]) // 8M
+                    .mate_ref_id(0)
+                    .mate_pos(103)
+                    .template_length(12);
+                b.build()
+            };
+            let r2 = {
+                let mut b = SamBuilder::new();
+                b.read_name(name.as_bytes())
+                    .sequence(b"ACGTACGT")
+                    .qualities(&[30; 8])
+                    .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+                    .ref_id(0)
+                    .pos(103)
+                    .mapq(60)
+                    .cigar_ops(&[8 << 4]) // 8M
+                    .mate_ref_id(0)
+                    .mate_pos(99)
+                    .template_length(-12);
+                b.build()
+            };
+            (r1, r2)
+        })
+        .collect();
+    create_paired_bam(path, pairs);
+}
+
+/// Chain-vs-oracle parity: the `--threads N` chain path
+/// (`ChainSpec::single_stage(Stage::Clip, ...)` → `build_for(spec)?.run()`) must
+/// produce the same records AND the same normalized header as the single-threaded
+/// oracle (`execute_single_threaded`). This is the load-bearing test for the R3
+/// clip cutover; `read_bam_output` normalizes only the `@PG` `CL` field, which
+/// legitimately differs by `--threads`, so a dropped `@SQ`/`@RG`/`@HD`/`@CO` line
+/// or any record divergence fails the test. Parameterized over thread counts to
+/// exercise single- and multi-worker scheduling.
+#[rstest]
+#[case::threads_1(1)]
+#[case::threads_2(2)]
+#[case::threads_4(4)]
+fn test_clip_chain_matches_single_threaded(#[case] threads: usize) {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+    build_clip_parity_bam(&input_bam, 8);
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    let chain_out = temp_dir.path().join("chain.bam");
+
+    let opts =
+        ["--clip-overlapping-reads", "--read-one-five-prime", "1", "--read-two-three-prime", "1"];
+
+    // Oracle: no --threads (single-threaded engine).
+    {
+        let mut args = vec![
+            "clip",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            oracle_out.to_str().unwrap(),
+            "--ref",
+            ref_path.to_str().unwrap(),
+        ];
+        args.extend_from_slice(&opts);
+        Clip::try_parse_from(args)
+            .expect("parse oracle args")
+            .execute("fgumi clip")
+            .expect("oracle clip failed");
+    }
+
+    // Chain: --threads N (declarative chain builder).
+    {
+        let threads_arg = threads.to_string();
+        let mut args = vec![
+            "clip",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            chain_out.to_str().unwrap(),
+            "--ref",
+            ref_path.to_str().unwrap(),
+            "--threads",
+            &threads_arg,
+        ];
+        args.extend_from_slice(&opts);
+        Clip::try_parse_from(args)
+            .expect("parse chain args")
+            .execute("fgumi clip")
+            .expect("chain clip failed");
+    }
+
+    let (oracle_header, oracle_records) = crate::helpers::read_bam_output(&oracle_out);
+    let (chain_header, chain_records) = crate::helpers::read_bam_output(&chain_out);
+
+    // Non-vacuous guards: all 16 records (8 templates x 2) survive, and clipping
+    // actually ran -- at least one output CIGAR differs from the input's plain 8M
+    // (robust to soft/hard clipping mode). Without this a two-empty-output run
+    // would pass the equality check vacuously.
+    assert_eq!(oracle_records.len(), 16, "oracle should keep all 16 records");
+    assert!(
+        oracle_records.iter().any(|r| cigar_ops(r) != vec![(CigarKind::Match, 8)]),
+        "fixture must actually clip (expected an output CIGAR other than 8M)",
+    );
+
+    assert_eq!(
+        oracle_records, chain_records,
+        "chain (--threads {threads}) output must match the single-threaded oracle record-for-record",
+    );
+    assert_eq!(
+        oracle_header, chain_header,
+        "chain and oracle output headers must match (with @PG CL normalized)",
+    );
 }
 
 /// CLIP3-05: clip must reject header-less input. A header-less BAM synthesizes
@@ -788,7 +956,9 @@ fn test_upgrade_clipping_upgrades_supplementary(#[case] threads: Option<&str>) {
     run_supplementary_upgrade_case(threads);
 }
 
-/// `--threads` mode routes through `execute_threads_mode`; exercise the `(Some, Some)` primary-pair
+/// `--threads` mode routes through the declarative chain builder (`execute_chain` → `add_clip` →
+/// `build_clip_process_step`, which delegates to `ClipParams::clip_template`); exercise the
+/// `(Some, Some)` primary-pair
 /// branch with fixed R1/R2 clipping, overlap clipping, mate-extension clipping and clip upgrading
 /// all enabled. R1 (fwd, 150M) and R2 (rev, 100M) fully overlap, so overlap clipping engages.
 #[test]
@@ -963,7 +1133,8 @@ fn test_clip_command_threads_mode_secondary_only() {
 /// R1 — exercises the PR's headline fix end-to-end: after the primary pair is clipped,
 /// `fix_supplemental_mate_info` must repair the supplementary alignment's mate metadata to point
 /// at the *post-clip* primary R2. The `clip.rs` unit test covers the helper in isolation; this
-/// verifies the `execute_threads_mode` wiring (correct r1/r2 indices, and that the supplemental
+/// verifies the `--threads` chain-builder wiring (`execute_chain` → `build_clip_process_step`:
+/// correct r1/r2 indices, and that the supplemental
 /// mate snapshot is taken *after* the primary is clipped, not before). A wiring bug (wrong
 /// index, or records mutated out of order) would be invisible to every other test in this file.
 #[test]
@@ -1085,7 +1256,8 @@ fn test_clip_command_threads_mode_supplementary_mate_repair() {
     assert_eq!(supp.mate_alignment_start(), r2.alignment_start());
 }
 
-/// The single-threaded (`execute_single_threaded`) and multi-threaded (`execute_threads_mode`)
+/// The single-threaded (`execute_single_threaded`) and multi-threaded (`--threads`, via the chain
+/// builder's `build_clip_process_step`)
 /// paths share one per-template clipping implementation (`ClipParams::clip_template`), so clipping
 /// the same input under both must yield byte-identical output. This pins that invariant end-to-end:
 /// if the two paths ever diverge (e.g. a future edit touches only one), this comparison fails.
