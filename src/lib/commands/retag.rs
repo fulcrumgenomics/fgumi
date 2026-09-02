@@ -25,34 +25,26 @@
 //! in `fgumi extract`.
 
 use std::fmt;
-use std::io;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use anyhow::{Result, bail, ensure};
 use clap::Parser;
-use fgumi_bam_io::{
-    ProgressTracker, create_bam_reader_for_pipeline_with_opts, create_raw_bam_reader_with_opts,
-    create_raw_bam_writer,
-};
+use fgumi_bam_io::{ProgressTracker, create_raw_bam_reader_with_opts, create_raw_bam_writer};
 use fgumi_raw_bam::{RawRecord, append_raw_tag, remove_tag};
 use log::{info, warn};
-use noodles::sam::Header;
 use serde::{Deserialize, Serialize};
 
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    add_pg_record, build_pipeline_config, ensure_hd_record, reject_output_collisions,
-    serialize_raw_bam_records,
+    add_pg_record, ensure_hd_record, reject_output_collisions,
 };
-use crate::grouper::SingleRawRecordGrouper;
 use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
-use crate::unified_pipeline::{GroupKeyConfig, Grouper, run_bam_pipeline_from_reader};
 
 /// A single tag-rewrite operation, parsed from one `SRC::op::DST` positional argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,7 +228,7 @@ pub struct RetagMetric {
 
 impl RetagMetric {
     /// Build a metrics row from an operation and its accumulated counts.
-    fn from_counts(op: RetagOp, counts: &OpCounts) -> Self {
+    pub(crate) fn from_counts(op: RetagOp, counts: &OpCounts) -> Self {
         Self {
             operation: op.to_string(),
             kind: op.kind().to_string(),
@@ -250,6 +242,55 @@ impl RetagMetric {
 impl fgumi_metrics::Metric for RetagMetric {
     fn metric_name() -> &'static str {
         "retag"
+    }
+}
+
+/// Projected options the chain builder needs for the retag stage.
+///
+/// A free-standing struct (mirrors filter/group) rather than `Some(self.clone())`,
+/// because `Retag` does not derive `Clone`. Compression/threading come from the
+/// [`crate::pipeline::chains::SingleStageContext`], so they are not carried here.
+#[derive(Debug, Clone)]
+pub struct RetagOptions {
+    /// Tag-rewrite operations, applied left-to-right per record.
+    pub operations: Vec<RetagOp>,
+    /// Optional per-operation metrics TSV.
+    pub metrics: Option<PathBuf>,
+}
+
+/// Shared per-run state for a retag chain, built by [`RetagOptions::setup_pipeline`].
+pub(crate) struct RetagPipelineSetup {
+    /// Per-thread per-operation counters, positionally indexed by operation.
+    pub(crate) collected_metrics: Arc<PerThreadAccumulator<Vec<OpCounts>>>,
+    /// Global processed-record counter — the finalize hook's `record_count`.
+    pub(crate) progress_counter: Arc<AtomicU64>,
+}
+
+/// Captures the retag chain process closure needs. retag's transform ignores the
+/// header, so — unlike filter's `process_captures` — this takes no header argument.
+pub(crate) struct RetagProcessCaptures {
+    /// The operations to apply per record, in order (shared, read-only).
+    pub(crate) operations: Arc<Vec<RetagOp>>,
+    /// Global processed-record counter, incremented once per record.
+    pub(crate) progress: Arc<AtomicU64>,
+}
+
+impl RetagOptions {
+    /// Build the shared per-thread accumulator + progress counter. Nothing here
+    /// is fallible (contrast filter, which loads a reference), so no `Result`.
+    pub(crate) fn setup_pipeline(&self, num_threads: usize) -> RetagPipelineSetup {
+        RetagPipelineSetup {
+            collected_metrics: PerThreadAccumulator::<Vec<OpCounts>>::new(num_threads),
+            progress_counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Build the process-closure captures from these options and the setup.
+    pub(crate) fn process_captures(&self, setup: &RetagPipelineSetup) -> RetagProcessCaptures {
+        RetagProcessCaptures {
+            operations: Arc::new(self.operations.clone()),
+            progress: Arc::clone(&setup.progress_counter),
+        }
     }
 }
 
@@ -313,7 +354,8 @@ pub struct Retag {
     #[command(flatten)]
     pub compression: CompressionOptions,
 
-    /// Threading options: `--threads N` routes through the unified pipeline.
+    /// Threading options: `--threads N` routes through the declarative chain
+    /// builder (the typed-step pipeline) via `execute_chain`.
     #[command(flatten)]
     pub threading: ThreadingOptions,
 
@@ -327,6 +369,12 @@ pub struct Retag {
 }
 
 impl Retag {
+    /// Project the clap fields into [`RetagOptions`] for the chain builder.
+    #[must_use]
+    pub fn to_retag_options(&self) -> RetagOptions {
+        RetagOptions { operations: self.operations.clone(), metrics: self.metrics.clone() }
+    }
+
     /// Reject a `--output`/`--metrics` path that resolves to the same file as
     /// `--input`, which would clobber the BAM being read.
     ///
@@ -389,91 +437,33 @@ impl Retag {
         Ok((record_count, counts))
     }
 
-    /// Multi-threaded path: route records through the unified 7-step pipeline.
+    /// Route `--threads N` onto the declarative chain builder
+    /// (`ChainSpec::single_stage(Stage::Retag, …)` → `build_for(spec)?.run()`).
     ///
-    /// retag is a pure per-record transform, so it uses [`SingleRawRecordGrouper`]
-    /// (one record per unit — no template batching) and applies the ops inside the
-    /// pipeline's `process_fn`. The pipeline preserves input order, so output order
-    /// matches the single-threaded path.
-    ///
-    /// Per-operation counts are accumulated into a [`PerThreadAccumulator`] and
-    /// summed after the pipeline drains. Because [`OpCounts`] fields are `u64` and
-    /// addition is commutative, the aggregated counts — and therefore the `--metrics`
-    /// TSV — are identical to the single-threaded path regardless of thread count.
-    /// This is a deliberate divergence from `clip`, which rejects `--metrics` with
-    /// `--threads` because its metrics are non-summable per-read collections; retag's
-    /// three summable counters aggregate cleanly, so `--metrics` stays available here.
-    fn run_threaded(&self, num_threads: usize, command_line: &str) -> Result<(u64, Vec<OpCounts>)> {
-        // The pipeline manages its own I/O lifecycle, so open the streaming reader
-        // (header pre-consumed) here rather than the serial record reader.
-        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-            &self.io.input,
-            self.io.pipeline_reader_opts(),
-        )?;
-        let header = ensure_hd_record(header)?;
-        let header = add_pg_record(header, command_line)?;
-
-        let mut pipeline_config = build_pipeline_config(
-            &self.scheduler_opts,
-            &self.compression,
-            &self.queue_memory,
-            &self.io,
-            num_threads,
-        )?;
-        // Raw-byte mode: hand the grouper RawRecord items and skip the per-record
-        // cell-barcode scan the default config would otherwise perform. retag never
-        // groups by key (one record per group), so the library index the key would
-        // carry is irrelevant — pass the default and skip the header scan, matching
-        // clip's raw-passthrough setup.
-        pipeline_config.group_key_config =
-            Some(GroupKeyConfig::new_raw_no_cell(LibraryIndex::default()));
-
-        let n_ops = self.operations.len();
-        let ops = self.operations.clone();
-        let collected = PerThreadAccumulator::<Vec<OpCounts>>::new(num_threads);
-        let collected_for_process = Arc::clone(&collected);
-
-        // One record per group: retag is a pure per-record transform, so no template
-        // batching is needed.
-        let grouper_fn = |_header: &Header| {
-            Box::new(SingleRawRecordGrouper::new()) as Box<dyn Grouper<Group = RawRecord> + Send>
+    /// The no-`--threads` `run_single_threaded` serial loop is the in-process
+    /// parity oracle; this path produces identical output records + `--metrics`
+    /// TSV. Diagnostics (the `Starting Retag` banner, the `OperationTimer`, and
+    /// the summary/warn/metrics finalize hooks) are emitted inside
+    /// `ChainBuilder::add_retag`, matching the `add_filter`/`add_dedup`
+    /// convention — so `execute_chain` itself only surfaces the CRC policy and
+    /// runs the pipeline (mirrors `dedup`/`group` `execute_chain`).
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        use crate::pipeline::chains::{
+            ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
         };
-        // Apply every op to the record and merge the resulting counts into this
-        // worker's accumulator slot.
-        let process_fn = move |mut record: RawRecord| -> io::Result<RawRecord> {
-            collected_for_process.with_slot(|slot| {
-                // Lazily size the slot to the operation count on first use.
-                if slot.is_empty() {
-                    slot.resize(n_ops, OpCounts::default());
-                }
-                for (op, op_counts) in ops.iter().zip(slot.iter_mut()) {
-                    apply_op(&mut record, op, op_counts);
-                }
-            });
-            Ok(record)
+        self.io.log_effective_check_crc();
+        let stage_opts =
+            StageOptionsBag { retag: Some(self.to_retag_options()), ..Default::default() };
+        let ctx = SingleStageContext {
+            io: &self.io,
+            threading: &self.threading,
+            compression: &self.compression,
+            scheduler: &self.scheduler_opts,
+            queue_memory: &self.queue_memory,
+            command_line,
         };
-
-        // Serialize: write the rewritten record. The pipeline owns the
-        // "Processed records" heartbeat (its output stage logs it at each
-        // million-record boundary), so this closure must not log progress or it
-        // would double the heartbeat line.
-        let serialize_fn =
-            move |record: RawRecord, _header: &Header, output: &mut Vec<u8>| -> io::Result<u64> {
-                serialize_raw_bam_records(std::slice::from_ref(&record), output)
-            };
-
-        let record_count = run_bam_pipeline_from_reader(
-            pipeline_config,
-            reader,
-            header,
-            &self.io.output,
-            None, // reuse the input header for output
-            grouper_fn,
-            process_fn,
-            serialize_fn,
-        )?;
-
-        Ok((record_count, sum_slot_counts(&collected, n_ops)))
+        let spec = ChainSpec::single_stage(Stage::Retag, stage_opts, &ctx);
+        build_for(spec)?.run()
     }
 }
 
@@ -485,9 +475,15 @@ impl Retag {
 /// untouched slot is empty and contributes nothing (the `zip` stops early). The
 /// counters are `u64`, so the sum is exact and order-independent — the result is
 /// identical regardless of how the scheduler spread records across slots. Pulled
-/// out of [`Retag::run_threaded`] so the cross-slot merge is unit-testable with
-/// several deliberately-populated slots, rather than left to scheduler luck.
-fn sum_slot_counts(collected: &PerThreadAccumulator<Vec<OpCounts>>, n_ops: usize) -> Vec<OpCounts> {
+/// out into a shared free function — used by the chain finalize hooks
+/// (`RetagFinalizeHook` and `RetagMetricsFinalizeHook`) to reduce the per-thread
+/// accumulator; the serial oracle builds its `Vec<OpCounts>` directly and does
+/// not call this — so the cross-slot merge is unit-testable with several
+/// deliberately-populated slots, rather than left to scheduler luck.
+pub(crate) fn sum_slot_counts(
+    collected: &PerThreadAccumulator<Vec<OpCounts>>,
+    n_ops: usize,
+) -> Vec<OpCounts> {
     let mut counts = vec![OpCounts::default(); n_ops];
     for slot in collected.slots() {
         let slot = slot.lock();
@@ -515,9 +511,18 @@ impl Command for Retag {
         // Reject it up front, resolving symlinks/`.`/`..` via canonicalize, before any
         // reader or writer opens (matching `merge`'s output-vs-input guard).
         self.reject_write_aliasing_input()?;
+        // Route on --threads BEFORE the CRC log / banner / timer. `--threads`
+        // dispatches to the chain builder, which emits its own banner + timer in
+        // `add_retag` and its own CRC log in `execute_chain`; running them here
+        // first would double-log and pre-consume stdin. The no-`--threads` serial
+        // path (the in-process parity oracle) keeps the CRC log, banner, and the
+        // metrics/summary tail below.
+        if self.threading.threads.is_some() {
+            return self.execute_chain(command_line);
+        }
+
         // Surface the effective CRC-verification policy once, at run start, honoring
-        // the `--check-crc` doc's promise of a per-run `CRC verify:` line. Both modes
-        // take their policy from `pipeline_reader_opts()` / `build_pipeline_config`.
+        // the `--check-crc` doc's promise of a per-run `CRC verify:` line.
         self.io.log_effective_check_crc();
 
         let timer = OperationTimer::new("Rewriting tags");
@@ -528,12 +533,8 @@ impl Command for Retag {
             info!("Operation: {op}");
         }
 
-        // Route on --threads: absent → serial fast path; present → unified pipeline.
-        // Both return the record count and per-operation counts for shared reporting.
-        let (record_count, counts) = match self.threading.threads {
-            None => self.run_single_threaded(command_line)?,
-            Some(threads) => self.run_threaded(threads, command_line)?,
-        };
+        // No-`--threads` serial fast path: the in-process parity oracle.
+        let (record_count, counts) = self.run_single_threaded(command_line)?;
 
         // Warn on operations that never matched — the usual sign of a mistyped source tag.
         for (op, op_counts) in self.operations.iter().zip(&counts) {
@@ -574,10 +575,41 @@ impl Command for Retag {
 mod tests {
     use super::*;
     use fgumi_raw_bam::{RawTagsView, SamBuilder, aux_data_slice};
+    use noodles::sam::Header;
     use rstest::rstest;
 
     fn tag(s: &str) -> SamTag {
         s.parse().expect("valid tag")
+    }
+
+    // ── projector parity (to_retag_options) ────────────────────────────────
+
+    #[test]
+    fn to_retag_options_carries_every_tuning_flag() {
+        let cmd = Retag::try_parse_from([
+            "retag",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "-M",
+            "m.tsv",
+            "RX::copy::BX",
+            "BX::move::CB",
+        ])
+        .expect("parse");
+        let o = cmd.to_retag_options();
+        assert_eq!(o.operations, cmd.operations);
+        assert_eq!(o.metrics.as_deref(), Some(std::path::Path::new("m.tsv")));
+    }
+
+    #[test]
+    fn to_retag_options_carries_defaults() {
+        let cmd = Retag::try_parse_from(["retag", "-i", "in.bam", "-o", "out.bam", "RX::delete"])
+            .expect("parse");
+        let o = cmd.to_retag_options();
+        assert_eq!(o.operations, cmd.operations);
+        assert_eq!(o.metrics, None);
     }
 
     /// Read a tag's exact on-disk `(type_byte, value_bytes)`, for verbatim-copy assertions.

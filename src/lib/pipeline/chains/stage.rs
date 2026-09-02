@@ -26,6 +26,9 @@ pub enum Stage {
     Clip,
     Filter,
     Dedup,
+    /// Rewrite SAM aux tags (copy/move/delete) — a pure per-record transform,
+    /// standalone-only (like `Clip`/`Dedup`/`Downsample`).
+    Retag,
     Downsample,
     /// Terminal BAM → FASTQ encode (interleaved or paired split output).
     Fastq,
@@ -55,7 +58,7 @@ mod tests {
     /// enum rather than a hand-picked subset. A new variant that is not added
     /// here is still forced through the exhaustive `match`es in the
     /// `expected_*` helpers, which fail to compile until it is classified.
-    const ALL_STAGES: [Stage; 14] = [
+    const ALL_STAGES: [Stage; 15] = [
         Stage::Extract,
         Stage::Correct,
         Stage::Align,
@@ -68,6 +71,7 @@ mod tests {
         Stage::Clip,
         Stage::Filter,
         Stage::Dedup,
+        Stage::Retag,
         Stage::Downsample,
         Stage::Fastq,
     ];
@@ -87,6 +91,7 @@ mod tests {
             | Stage::Clip
             | Stage::Filter
             | Stage::Dedup
+            | Stage::Retag
             | Stage::Downsample
             | Stage::Fastq => false,
         }
@@ -107,6 +112,7 @@ mod tests {
             | Stage::Clip
             | Stage::Filter
             | Stage::Dedup
+            | Stage::Retag
             | Stage::Downsample
             | Stage::Fastq => false,
         }

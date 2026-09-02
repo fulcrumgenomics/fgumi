@@ -17,6 +17,7 @@ pub use crate::commands::extract::ExtractOptions;
 pub use crate::commands::fastq::FastqOptions;
 pub use crate::commands::filter::FilterOptions;
 pub use crate::commands::group::GroupOptions;
+pub use crate::commands::retag::RetagOptions;
 #[cfg(feature = "consensus")]
 pub use crate::commands::simplex::SimplexOptions;
 pub use crate::commands::sort::SortOptions;
@@ -55,8 +56,8 @@ pub struct AlignOptions {
 /// that every stage in `spec.stages` has its matching options
 /// present before constructing any chain steps.
 ///
-/// Thirteen fields are wired: Correct, Zipper, Sort, Group, Duplex, Codec,
-/// Filter, Simplex, Align, Extract, and Fastq hold free-standing
+/// Fourteen fields are wired: Correct, Zipper, Sort, Group, Duplex, Codec,
+/// Filter, Retag, Simplex, Align, Extract, and Fastq hold free-standing
 /// `<Command>Options` structs, while Dedup and Clip hold the command struct
 /// directly (`MarkDuplicates` / `Clip`) — no separate `DedupOptions`/
 /// `ClipOptions` is extracted, because test code constructs those via
@@ -82,6 +83,9 @@ pub struct StageOptionsBag {
     pub filter: Option<FilterOptions>,
     /// Clip options. Holds `Clip` directly (same approach as Dedup/Filter).
     pub clip: Option<Clip>,
+    /// Retag options. Holds the free-standing `RetagOptions` struct (operations
+    /// + metrics path) — a pure per-record tag rewriter, un-feature-gated.
+    pub retag: Option<RetagOptions>,
     /// Simplex options. Holds the free-standing `SimplexOptions` struct
     /// (same approach as Duplex/Codec), so runall can re-expose the tuning
     /// knobs via `--simplex::*` through `MultiSimplexOptions`.

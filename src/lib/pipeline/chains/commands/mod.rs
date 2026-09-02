@@ -17,6 +17,7 @@ pub mod extract;
 pub mod fastq;
 pub mod filter;
 pub mod group;
+pub mod retag;
 #[cfg(feature = "consensus")]
 pub mod simplex;
 pub mod sort;
