@@ -29,6 +29,18 @@ pub enum SourceSpec {
     /// re-checks it for any spec that was constructed directly.
     Fastqs { paths: Vec<PathBuf>, read_structures: Vec<ReadStructure> },
 
+    /// A single interleaved FASTQ stream (`R1, R2, R1, R2, …`, or `-` for
+    /// stdin) that the chain de-interleaves into two logical reads. Used by
+    /// `fgumi extract --interleaved`.
+    ///
+    /// Distinct from [`SourceSpec::Fastqs`] because interleaved input is one
+    /// physical `path` carrying **two** `read_structures` — the R1/R2 pair —
+    /// which would violate the `Fastqs` "one read structure per path"
+    /// invariant. Build this via [`SourceSpec::interleaved_fastq`] (which
+    /// enforces exactly two read structures); [`SourceSpec::validate`]
+    /// re-checks it.
+    InterleavedFastq { path: PathBuf, read_structures: Vec<ReadStructure> },
+
     /// SAM text file (or `-` for stdin). Standalone-only — runall does
     /// not accept SAM input (it always reads from a BAM intermediate).
     Sam(PathBuf),
@@ -53,25 +65,54 @@ impl SourceSpec {
         Ok(spec)
     }
 
+    /// Constructs a [`SourceSpec::InterleavedFastq`] source, enforcing that
+    /// the single interleaved `path` carries exactly two read structures
+    /// (the R1/R2 pair the stream de-interleaves into).
+    ///
+    /// Prefer this over an `InterleavedFastq { .. }` struct literal so a
+    /// wrong read-structure count fails here rather than downstream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `read_structures.len() != 2`.
+    pub fn interleaved_fastq(path: PathBuf, read_structures: Vec<ReadStructure>) -> Result<Self> {
+        let spec = Self::InterleavedFastq { path, read_structures };
+        spec.validate()?;
+        Ok(spec)
+    }
+
     /// Re-checks structural invariants that the variant types cannot
-    /// encode. Currently this validates that a [`SourceSpec::Fastqs`]
-    /// source has one read structure per path. Call this when accepting a
-    /// `SourceSpec` that may have been built via a struct literal rather
-    /// than [`SourceSpec::fastqs`].
+    /// encode: a [`SourceSpec::Fastqs`] source has one read structure per
+    /// path, and a [`SourceSpec::InterleavedFastq`] source has exactly two.
+    /// Call this when accepting a `SourceSpec` that may have been built via a
+    /// struct literal rather than [`SourceSpec::fastqs`] /
+    /// [`SourceSpec::interleaved_fastq`].
     ///
     /// # Errors
     ///
     /// Returns an error if a `Fastqs` source has diverging `paths` and
-    /// `read_structures` lengths.
+    /// `read_structures` lengths, or an `InterleavedFastq` source does not
+    /// carry exactly two read structures.
     pub fn validate(&self) -> Result<()> {
-        if let Self::Fastqs { paths, read_structures } = self {
-            ensure!(
-                paths.len() == read_structures.len(),
-                "FASTQ source is mis-sized: {} path(s) but {} read structure(s); \
-                 each path needs exactly one read structure",
-                paths.len(),
-                read_structures.len(),
-            );
+        match self {
+            Self::Fastqs { paths, read_structures } => {
+                ensure!(
+                    paths.len() == read_structures.len(),
+                    "FASTQ source is mis-sized: {} path(s) but {} read structure(s); \
+                     each path needs exactly one read structure",
+                    paths.len(),
+                    read_structures.len(),
+                );
+            }
+            Self::InterleavedFastq { read_structures, .. } => {
+                ensure!(
+                    read_structures.len() == 2,
+                    "interleaved FASTQ source needs exactly two read structures \
+                     (R1/R2); got {}",
+                    read_structures.len(),
+                );
+            }
+            Self::Bam(_) | Self::PairedBams { .. } | Self::Sam(_) => {}
         }
         Ok(())
     }
@@ -82,7 +123,10 @@ impl SourceSpec {
     #[must_use]
     pub fn is_runall_compatible(&self) -> bool {
         match self {
-            Self::Bam(_) | Self::PairedBams { .. } | Self::Fastqs { .. } => true,
+            Self::Bam(_)
+            | Self::PairedBams { .. }
+            | Self::Fastqs { .. }
+            | Self::InterleavedFastq { .. } => true,
             Self::Sam(_) => false,
         }
     }
@@ -138,5 +182,37 @@ mod tests {
     fn validate_is_ok_for_non_fastq_sources() {
         assert!(SourceSpec::Bam(PathBuf::from("a.bam")).validate().is_ok());
         assert!(SourceSpec::Sam(PathBuf::from("a.sam")).validate().is_ok());
+    }
+
+    #[test]
+    fn interleaved_constructor_accepts_exactly_two_read_structures() {
+        let spec = SourceSpec::interleaved_fastq(
+            PathBuf::from("interleaved.fq"),
+            vec![read_structure(), read_structure()],
+        )
+        .expect("two read structures should construct");
+        assert!(spec.validate().is_ok());
+        assert!(spec.is_runall_compatible());
+    }
+
+    #[rstest::rstest]
+    #[case::one(1)]
+    #[case::three(3)]
+    fn interleaved_constructor_rejects_non_two_read_structures(#[case] n: usize) {
+        let err = SourceSpec::interleaved_fastq(
+            PathBuf::from("interleaved.fq"),
+            std::iter::repeat_with(read_structure).take(n).collect(),
+        )
+        .expect_err("only two read structures are valid");
+        assert!(err.to_string().contains("exactly two read structures"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_catches_mismatched_interleaved_struct_literal() {
+        let spec = SourceSpec::InterleavedFastq {
+            path: PathBuf::from("interleaved.fq"),
+            read_structures: vec![read_structure()],
+        };
+        assert!(spec.validate().is_err());
     }
 }

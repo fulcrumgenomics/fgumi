@@ -64,9 +64,14 @@ fn zip_records(
     // rather than letting it surface as an incidental name mismatch from the
     // back-pop below.
     if records_a.len() != records_b.len() {
+        // Name streams R1/R2 (1-based) and the shorter one as having "ended
+        // before" the other, matching the serial oracle's wording so the operator
+        // learns which FASTQ ran out (issue #773). `records_a` is R1, `records_b`
+        // is R2. `ZipFastqRecords` (the N>=3 path) reports the same shape.
+        let (ended, before) = if records_a.len() < records_b.len() { (1, 2) } else { (2, 1) };
         return Err(io::Error::other(format!(
-            "FASTQ sources out of sync at chunk_serial {chunk_serial}: \
-             stream 0 has {} records, stream 1 has {}",
+            "FASTQ sources out of sync at chunk_serial {chunk_serial}: R{ended} ended before \
+             R{before} (R1 has {} record(s), R2 has {} in this chunk)",
             records_a.len(),
             records_b.len(),
         )));

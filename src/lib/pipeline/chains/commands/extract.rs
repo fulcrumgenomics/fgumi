@@ -167,6 +167,8 @@ mod tests {
             extract_umis_from_read_names: false,
             store_sample_barcode_qualities: false,
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         }
     }
 

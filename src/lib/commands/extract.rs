@@ -26,18 +26,15 @@ use crate::fastq::FastqSet;
 use crate::fastq::ReadSetIterator;
 use crate::fastq_deinterleave::deinterleave;
 use crate::fastq_parse::strip_read_suffix;
-use crate::grouper::FastqTemplate;
 use crate::logging::OperationTimer;
 use crate::sam::SamTag;
-use crate::unified_pipeline::{
-    FastqPipelineConfig, MemoryEstimate, fastq_out_of_sync_error, run_fastq_pipeline,
-};
+use crate::unified_pipeline::fastq_out_of_sync_error;
 use crate::validation::validate_input_exists;
 use anyhow::{Context, Result, bail, ensure};
 use bstr::{BString, ByteSlice};
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{RawBamWriter, create_raw_bam_writer, open_output_writer};
+use fgumi_bam_io::{RawBamWriter, create_raw_bam_writer};
 use fgumi_raw_bam::UnmappedSamBuilder;
 use fgumi_raw_bam::fields::flags;
 use log::{debug, info};
@@ -66,28 +63,6 @@ use std::str::FromStr;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 const QUALITY_DETECTION_SAMPLE_SIZE: usize = 400;
-
-/// Output buffer for the parallel (`--threads N`) pipeline, which writes whole
-/// compressed BGZF blocks. Sized well above `BGZF_MAX_BLOCK_SIZE` so a block
-/// lands in the buffer instead of passing straight through it.
-const PIPELINE_OUTPUT_BUF_CAPACITY: usize = 256 * 1024;
-
-/// Pre-serialized batch of BAM records for the pipeline output type.
-///
-/// Contains raw BAM record bytes with `block_size` prefixes, ready for
-/// the compress step. Replaces `Vec<RecordBuf>` as the pipeline `P` type.
-struct ExtractedBatch {
-    /// BAM records with `block_size` prefixes, ready for compress step.
-    data: Vec<u8>,
-    /// Number of records in this batch.
-    num_records: u64,
-}
-
-impl MemoryEstimate for ExtractedBatch {
-    fn estimate_heap_size(&self) -> usize {
-        self.data.capacity()
-    }
-}
 
 /// Compression format detected from file header
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -701,15 +676,94 @@ pub struct Extract {
 }
 
 impl Extract {
-    /// CRC-verification policy for the `all_bgzf` pipeline path, which decodes
-    /// BGZF-file inputs itself (Step 2). That path never includes stdin — a
-    /// piped input takes the pre-opened-reader path — so every input there is a
-    /// file and the default is verify-on. `--no-check-crc` turns it off;
-    /// `--check-crc` and the default both verify. (The non-`all_bgzf` path
-    /// resolves per input path in [`open_fastq_reader`], honoring trusted-stdin.)
+    /// Project the parsed CLI struct into the per-stage [`ExtractOptions`] the
+    /// chain builder consumes (`StageOptionsBag::extract`).
+    ///
+    /// `quality_encoding` is a placeholder here (`QualityEncoding::Standard`):
+    /// the chain FASTQ source detects the real encoding while opening its readers
+    /// and overrides the field before the extract step runs (see
+    /// [`ExtractOptions::quality_encoding`]). Every other field maps directly
+    /// from the identically-named CLI flag; `platform` (CLI default `"illumina"`)
+    /// becomes `Some(..)` so `build_fastq_header` always emits `@RG PL:`, matching
+    /// `Self::create_header`. `clipping_attribute` is intentionally dropped — it
+    /// does not apply to FASTQ input (there is no existing clipping to adjust).
     #[must_use]
-    fn bgzf_input_verify_crc(&self) -> bool {
-        !self.no_check_crc
+    pub fn to_extract_options(&self) -> ExtractOptions {
+        ExtractOptions {
+            sample: self.sample.clone(),
+            library: self.library.clone(),
+            platform: Some(self.platform.clone()),
+            platform_unit: self.platform_unit.clone(),
+            read_group_id: self.read_group_id.clone(),
+            comments: self.comment.clone(),
+            barcode: self.barcode.clone(),
+            platform_model: self.platform_model.clone(),
+            sequencing_center: self.sequencing_center.clone(),
+            predicted_insert_size: self.predicted_insert_size,
+            description: self.description.clone(),
+            run_date: self.run_date.clone(),
+            quality_encoding: QualityEncoding::Standard,
+            store_umi_quals: self.store_umi_quals,
+            store_cell_quals: self.store_cell_quals,
+            single_tag: self.single_tag,
+            annotate_read_names: self.annotate_read_names,
+            extract_umis_from_read_names: self.extract_umis_from_read_names,
+            store_sample_barcode_qualities: self.store_sample_barcode_qualities,
+            async_reader: self.async_reader,
+            check_crc: self.check_crc,
+            no_check_crc: self.no_check_crc,
+        }
+    }
+
+    /// Run extract on the declarative chain builder (the `--threads` path).
+    ///
+    /// Hand-builds the [`ChainSpec`] (rather than using
+    /// [`ChainSpec::single_stage`], which is BAM-in/BAM-out): the source is a
+    /// FASTQ source — [`SourceSpec::InterleavedFastq`] for `--interleaved`, else
+    /// [`SourceSpec::Fastqs`] — and the sink is a BAM. The chain opens its own
+    /// readers and detects the quality encoding in `ChainBuilder::open_source`;
+    /// `read_streams`/`verify_crc` are BAM-reader knobs and inert here (the FASTQ
+    /// source carries its CRC policy in [`ExtractOptions`]). The no-`--threads`
+    /// serial loop in [`Command::execute`] is the in-process parity oracle.
+    ///
+    /// [`ChainSpec`]: crate::pipeline::chains::ChainSpec
+    /// [`ChainSpec::single_stage`]: crate::pipeline::chains::ChainSpec::single_stage
+    /// [`SourceSpec::Fastqs`]: crate::pipeline::chains::SourceSpec::Fastqs
+    /// [`SourceSpec::InterleavedFastq`]: crate::pipeline::chains::SourceSpec::InterleavedFastq
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        use crate::pipeline::chains::{
+            ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag, build_for,
+        };
+
+        let read_structures = self.get_read_structures()?;
+        let source = if self.interleaved {
+            SourceSpec::interleaved_fastq(self.inputs[0].clone(), read_structures)?
+        } else {
+            SourceSpec::fastqs(self.inputs.clone(), read_structures)?
+        };
+
+        let stage_opts =
+            StageOptionsBag { extract: Some(self.to_extract_options()), ..Default::default() };
+
+        let spec = ChainSpec {
+            stages: vec![Stage::Extract],
+            source,
+            sink: SinkSpec::Bam(self.output.clone()),
+            stage_opts,
+            threading: self.threading.clone(),
+            compression: self.compression.clone(),
+            scheduler: self.scheduler_opts.clone(),
+            queue_memory: self.queue_memory.clone(),
+            async_reader: self.async_reader,
+            // Inert for a FASTQ source: `read_streams` is a seekable-BAM knob and
+            // `verify_crc` is the BAM BGZF-decode policy; the FASTQ source carries
+            // its own CRC policy in `ExtractOptions` (`check_crc`/`no_check_crc`).
+            read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
+            verify_crc: false,
+            command_line: command_line.to_string(),
+        };
+
+        build_for(spec)?.run()
     }
 
     /// Get actual read structures (default to +T if none provided).
@@ -727,58 +781,6 @@ impl Extract {
             }
         }
         Ok(self.read_structures.clone())
-    }
-
-    /// Open every input FASTQ as a decompressed reader.
-    ///
-    /// `stdin_reader` is the already-opened stdin stream, if one of the inputs
-    /// is `-`. It is moved in rather than re-opened: stdin can be consumed only
-    /// once, and re-opening it yields an empty stream and a silently
-    /// record-less run. [`Self::validate`] guarantees stdin is the *sole* input
-    /// when present, so it is the whole reader list.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a file input cannot be opened.
-    fn open_input_readers(
-        &self,
-        decomp_threads: usize,
-        stdin_reader: Option<Box<dyn BufRead + Send>>,
-    ) -> Result<Vec<Box<dyn BufRead + Send>>> {
-        // Interleaved: one physical source (stdin or the sole file), split into
-        // an R1 and an R2 reader. Validation guarantees exactly one input, so the
-        // stdin reader — when present — is that whole source. Decompression has
-        // already happened (stdin via the pre-opened reader, a file via
-        // `open_fastq_reader`), so the de-interleaver splits decompressed bytes.
-        if self.interleaved {
-            let source = match stdin_reader {
-                Some(reader) => reader,
-                None => open_fastq_reader(
-                    &self.inputs[0],
-                    decomp_threads,
-                    self.async_reader,
-                    self.check_crc,
-                    self.no_check_crc,
-                )?,
-            };
-            let (r1, r2) = deinterleave(source);
-            return Ok(vec![r1, r2]);
-        }
-        if let Some(reader) = stdin_reader {
-            return Ok(vec![reader]);
-        }
-        self.inputs
-            .iter()
-            .map(|path| {
-                open_fastq_reader(
-                    path,
-                    decomp_threads,
-                    self.async_reader,
-                    self.check_crc,
-                    self.no_check_crc,
-                )
-            })
-            .collect()
     }
 
     /// Validate inputs
@@ -1091,8 +1093,9 @@ impl Extract {
     /// `try_build_record` instead of panicking partway through writing the output BAM, and
     /// attach [`Self::read_name_too_long_context`] so the message names the offending read.
     ///
-    /// Shared by the single-threaded (`make_raw_records`) and threaded
-    /// (`make_raw_records_static`) paths, which are otherwise easy to let drift apart.
+    /// Used by the serial-oracle `make_raw_records` path; the chain path's
+    /// `make_raw_records_from_fastq_set` builds records through the same
+    /// `UnmappedSamBuilder` API, which the parity tests keep in step.
     fn build_template_record(
         builder: &mut UnmappedSamBuilder,
         name: &[u8],
@@ -1309,301 +1312,6 @@ impl Extract {
         progress.log_final();
         Ok(read_pair_count)
     }
-
-    /// Process records using the 7-step pipeline.
-    ///
-    /// Returns the number of records written.
-    fn process_with_pipeline(
-        &self,
-        header: &Header,
-        output: Box<dyn std::io::Write + Send>,
-        encoding: QualityEncoding,
-        read_structures: &[ReadStructure],
-        stdin_reader: Option<Box<dyn BufRead + Send>>,
-    ) -> Result<u64> {
-        // Detect if all inputs are BGZF. stdin is never "all BGZF" for this
-        // purpose: that path has the pipeline open the files itself, which stdin
-        // cannot support, so it must take the pre-opened-reader path below.
-        // Interleaved is likewise never "all BGZF": the single source must be
-        // read once and de-interleaved into two readers (in `open_input_readers`),
-        // which the pipeline consumes as decompressed streams — it cannot re-open
-        // and re-split the file itself.
-        let all_bgzf = !self.interleaved
-            && stdin_reader.is_none()
-            && self.inputs.iter().all(|p| {
-                detect_compression_format(p).map(|f| f == CompressionFormat::Bgzf).unwrap_or(false)
-            });
-
-        let num_threads = self.threading.threads.unwrap_or(1);
-
-        let mut config =
-            FastqPipelineConfig::new(num_threads, all_bgzf, self.compression.compression_level)
-                .with_stats(self.scheduler_opts.collect_stats())
-                .with_scheduler_strategy(self.scheduler_opts.strategy())
-                .with_deadlock_timeout(self.scheduler_opts.deadlock_timeout_secs())
-                .with_deadlock_recovery(self.scheduler_opts.deadlock_recover_enabled())
-                .with_async_reader(self.async_reader)
-                .with_verify_crc(self.bgzf_input_verify_crc());
-
-        // Calculate and apply queue memory limit
-        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
-        config.queue_memory_limit = queue_memory_limit_bytes;
-        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
-
-        // For Gzip/Plain: open decompressed readers upfront
-        // For BGZF: pass None, pipeline opens files directly
-        let decomp_threads = self.threading.num_threads().max(1);
-        let decompressed_readers: Option<Vec<Box<dyn BufRead + Send>>> = if all_bgzf {
-            None
-        } else {
-            Some(self.open_input_readers(decomp_threads, stdin_reader)?)
-        };
-
-        // Clone read_structures for the closure
-        let read_structures = read_structures.to_vec();
-
-        // Build config capturing all user options for the pipeline closure
-        let extract_config = ExtractConfig {
-            read_group_id: self.read_group_id.clone(),
-            store_umi_quals: self.store_umi_quals,
-            store_cell_quals: self.store_cell_quals,
-            single_tag: self.single_tag,
-            annotate_read_names: self.annotate_read_names,
-            extract_umis_from_read_names: self.extract_umis_from_read_names,
-            store_sample_barcode_qualities: self.store_sample_barcode_qualities,
-        };
-
-        let records_written = run_fastq_pipeline(
-            config,
-            &self.inputs,
-            decompressed_readers,
-            header,
-            output,
-            // process_fn: FastqTemplate → ExtractedBatch
-            move |template: FastqTemplate| -> std::io::Result<ExtractedBatch> {
-                // A template must carry one record per read structure; a short
-                // template would silently drop that read's segments below (see
-                // `validate_template_record_count`, issue #773).
-                validate_template_record_count(&template, read_structures.len())?;
-
-                // Validate read names match (synchronized mode defers this from Group step)
-                if template.records.len() >= 2 {
-                    let base_name = strip_read_suffix(template.records[0].name());
-                    for (i, record) in template.records.iter().enumerate().skip(1) {
-                        let other_base = strip_read_suffix(record.name());
-                        if base_name != other_base {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!(
-                                    "FASTQ files out of sync: R1 has '{}', R{} has '{}'",
-                                    String::from_utf8_lossy(base_name),
-                                    i + 1,
-                                    String::from_utf8_lossy(other_base),
-                                ),
-                            ));
-                        }
-                    }
-                }
-                // Convert each FastqRecord to a FastqSet using its read structure
-                let mut fastq_sets: Vec<FastqSet> = Vec::with_capacity(template.records.len());
-                for (record, rs) in template.records.iter().zip(read_structures.iter()) {
-                    let fastq_set = FastqSet::from_record_with_structure(
-                        record.name(),
-                        record.sequence(),
-                        record.quality(),
-                        rs,
-                        &[], // No skip reasons
-                    )
-                    .map_err(std::io::Error::other)?;
-                    fastq_sets.push(fastq_set);
-                }
-
-                // Combine all FastqSets into one
-                let combined = FastqSet::combine_readsets(fastq_sets);
-
-                // Build raw BAM records
-                // Render the whole `anyhow` chain (`{:#}`), not just the
-                // outermost context: the pipeline carries `io::Error`, so
-                // `to_string()` here would drop the underlying cause and leave
-                // the user with a context line and no reason for it.
-                let result = make_raw_records_static(&combined, encoding, &extract_config)
-                    .map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}"))
-                    })?;
-
-                // Debug: Check if we produce fewer records than template has
-                if result.num_records as usize != template.records.len() {
-                    log::warn!(
-                        "Template with {} FASTQ records produced {} BAM records",
-                        template.records.len(),
-                        result.num_records
-                    );
-                }
-
-                Ok(result)
-            },
-            // serialize_fn: ExtractedBatch → copy pre-serialized bytes to buffer
-            |batch: ExtractedBatch, _header: &Header, buffer: &mut Vec<u8>| {
-                buffer.extend_from_slice(&batch.data);
-                Ok(batch.num_records)
-            },
-        )?;
-
-        info!("Wrote {records_written} records via 7-step pipeline");
-        Ok(records_written)
-    }
-}
-
-/// Cloneable config for the extract pipeline closure, capturing all user options
-/// needed by `make_raw_records_static` so they aren't hardcoded.
-#[derive(Clone)]
-#[allow(clippy::struct_excessive_bools)]
-struct ExtractConfig {
-    read_group_id: String,
-    store_umi_quals: bool,
-    store_cell_quals: bool,
-    single_tag: Option<SamTag>,
-    annotate_read_names: bool,
-    extract_umis_from_read_names: bool,
-    store_sample_barcode_qualities: bool,
-}
-
-/// Build raw BAM records from a `FastqSet` without requiring `&self`.
-/// Uses the provided `ExtractConfig` for all user-configurable options.
-fn make_raw_records_static(
-    read_set: &FastqSet,
-    encoding: QualityEncoding,
-    cfg: &ExtractConfig,
-) -> Result<ExtractedBatch> {
-    let templates: Vec<&FastqSegment> = read_set.template_segments().collect();
-
-    let read_name = String::from_utf8_lossy(&read_set.header);
-    ensure!(!templates.is_empty(), "No template segments found for read: {read_name}");
-
-    // Extract various barcode types as BString
-    let cell_barcode_bs = Extract::join_bytes_with_separator(
-        read_set.cell_barcode_segments().map(|s| s.seq.as_slice()),
-        b'-',
-    );
-    let cell_quals_bs = Extract::join_bytes_with_separator(
-        read_set.cell_barcode_segments().map(|s| s.quals.as_slice()),
-        b' ',
-    );
-    let sample_barcode_bs = Extract::join_bytes_with_separator(
-        read_set.sample_barcode_segments().map(|s| s.seq.as_slice()),
-        b'-',
-    );
-    let sample_quals_bs = Extract::join_bytes_with_separator(
-        read_set.sample_barcode_segments().map(|s| s.quals.as_slice()),
-        b' ',
-    );
-    let umi_bs = Extract::join_bytes_with_separator(
-        read_set.molecular_barcode_segments().map(|s| s.seq.as_slice()),
-        b'-',
-    );
-    let umi_qual_bs = Extract::join_bytes_with_separator(
-        read_set.molecular_barcode_segments().map(|s| s.quals.as_slice()),
-        b' ',
-    );
-
-    // Extract UMI from read name if requested
-    let (read_name_bytes, umi_from_name) =
-        Extract::extract_read_name_and_umi(&read_set.header, cfg.extract_umis_from_read_names)?;
-
-    // Prepare final UMI
-    let final_umi_bs: BString = match (umi_bs.is_empty(), &umi_from_name) {
-        (true, Some(from_name)) => BString::from(from_name.as_slice()),
-        (true, None) => BString::default(),
-        (false, Some(from_name)) => {
-            let mut combined = Vec::with_capacity(from_name.len() + 1 + umi_bs.len());
-            combined.extend_from_slice(from_name);
-            combined.push(b'-');
-            combined.extend_from_slice(umi_bs.as_bytes());
-            BString::from(combined)
-        }
-        (false, None) => umi_bs,
-    };
-
-    let num_templates = templates.len();
-    let mut builder = UnmappedSamBuilder::new();
-    let mut data = Vec::new();
-
-    for (index, template) in templates.iter().enumerate() {
-        // Compute flags for unmapped reads
-        let mut flag = flags::UNMAPPED;
-        if num_templates == 2 {
-            flag |= flags::PAIRED | flags::MATE_UNMAPPED;
-            if index == 0 {
-                flag |= flags::FIRST_SEGMENT;
-            } else {
-                flag |= flags::LAST_SEGMENT;
-            }
-        }
-
-        // Set read name (optionally with UMI annotation)
-        let annotated_name: Option<Vec<u8>> = if cfg.annotate_read_names && !final_umi_bs.is_empty()
-        {
-            let mut name = Vec::with_capacity(read_name_bytes.len() + 1 + final_umi_bs.len());
-            name.extend_from_slice(&read_name_bytes);
-            name.push(b'+');
-            name.extend_from_slice(final_umi_bs.as_bytes());
-            Some(name)
-        } else {
-            None
-        };
-        let final_read_name: &[u8] = annotated_name.as_deref().unwrap_or(&read_name_bytes);
-
-        Extract::build_template_record(
-            &mut builder,
-            final_read_name,
-            flag,
-            &template.seq,
-            &template.quals,
-            encoding,
-        )?;
-
-        // Append tags
-        // Read group
-        builder.append_string_tag(SamTag::RG, cfg.read_group_id.as_bytes());
-
-        // Cell barcode
-        if !cell_barcode_bs.is_empty() {
-            builder.append_string_tag(SamTag::CB, cell_barcode_bs.as_bytes());
-        }
-
-        if !cell_quals_bs.is_empty() && cfg.store_cell_quals {
-            builder.append_string_tag(SamTag::CY, cell_quals_bs.as_bytes());
-        }
-
-        // Sample barcode
-        if !sample_barcode_bs.is_empty() {
-            builder.append_string_tag(SamTag::BC, sample_barcode_bs.as_bytes());
-        }
-
-        if cfg.store_sample_barcode_qualities && !sample_quals_bs.is_empty() {
-            builder.append_string_tag(SamTag::QT, sample_quals_bs.as_bytes());
-        }
-
-        // UMI
-        if !final_umi_bs.is_empty() {
-            builder.append_string_tag(SamTag::RX, final_umi_bs.as_bytes());
-
-            // Single tag for all concatenated UMIs (if specified)
-            if let Some(st) = cfg.single_tag {
-                builder.append_string_tag(st, final_umi_bs.as_bytes());
-            }
-
-            // Only add UMI qualities if not extracted from read names
-            if umi_from_name.is_none() && !umi_qual_bs.is_empty() && cfg.store_umi_quals {
-                builder.append_string_tag(SamTag::QX, umi_qual_bs.as_bytes());
-            }
-        }
-
-        builder.write_with_block_size(&mut data);
-        builder.clear();
-    }
-
-    Ok(ExtractedBatch { data, num_records: num_templates as u64 })
 }
 
 /// Pool quality strings for encoding detection across the first
@@ -1691,136 +1399,176 @@ fn sample_detection_quals_from_stream(
     Ok((stats, replayed))
 }
 
+/// Open the decompressed FASTQ input readers for a run.
+///
+/// De-interleaves a single interleaved stream into an R1/R2 pair and consumes a
+/// pre-sampled stdin reader when present. Both the serial oracle and the chain
+/// reach it through [`detect_encoding_and_open_fastq_readers`] — the serial
+/// `Extract::execute` path directly, and the chain FASTQ source via
+/// `ChainBuilder::open_source` — so both open readers identically, the parity
+/// contract for the `--threads` cutover.
+fn open_fastq_input_readers(
+    inputs: &[PathBuf],
+    interleaved: bool,
+    decomp_threads: usize,
+    async_reader: bool,
+    check_crc: bool,
+    no_check_crc: bool,
+    stdin_reader: Option<Box<dyn BufRead + Send>>,
+) -> Result<Vec<Box<dyn BufRead + Send>>> {
+    // Interleaved: one physical source (stdin or the sole file), split into an R1
+    // and an R2 reader. Validation guarantees exactly one input, so the stdin
+    // reader — when present — is that whole source. A single physical stream gets
+    // the full `decomp_threads` BGZF-decode budget: the pipeline reads it on one
+    // worker and the de-interleaver splits one shared decoder, so per-stream
+    // decode threads are the only decode parallelism available here.
+    if interleaved {
+        let source = match stdin_reader {
+            Some(reader) => reader,
+            None => open_fastq_reader(
+                &inputs[0],
+                decomp_threads,
+                async_reader,
+                check_crc,
+                no_check_crc,
+            )?,
+        };
+        let (r1, r2) = deinterleave(source);
+        return Ok(vec![r1, r2]);
+    }
+    // stdin is a single stream, already opened with `decomp_threads` by the caller
+    // (the replay reader wraps that decoder), so its decode budget is fixed.
+    if let Some(reader) = stdin_reader {
+        return Ok(vec![reader]);
+    }
+    // Multiple file inputs: on the chain path the pipeline reads (and BGZF-decodes)
+    // the streams concurrently, one reader per typed-step worker, so each reader
+    // decodes single-threaded. Handing each file its own `decomp_threads` BGZF
+    // workers would spawn up to N×threads decode threads ON TOP OF the pipeline's
+    // own worker pool — over-subscription the pre-cutover chain deliberately
+    // avoided (it passed 1 here, "the pipeline framework provides the
+    // parallelism"). The serial oracle reaches this branch with `decomp_threads`
+    // == 1 (it is single-threaded), so hardcoding 1 leaves it unchanged; per-file
+    // BGZF-decode parallelism, if wanted, is a separate benchmarked change.
+    inputs
+        .iter()
+        .map(|path| open_fastq_reader(path, 1, async_reader, check_crc, no_check_crc))
+        .collect()
+}
+
+/// Detect the input FASTQ quality encoding and open the decompressed input
+/// readers in one pass, mirroring `Extract::execute`'s detection + reader-open
+/// exactly so the serial oracle and the `--threads` chain path see identical
+/// readers and encoding.
+///
+/// stdin is sampled once and its bytes replayed into the returned reader (there
+/// is no second open); file inputs are sampled through separate readers so the
+/// returned readers are fresh. The stdin sampling reader is opened with the run's
+/// decompression thread count (not a sampling one) because that same reader
+/// decompresses every record that follows.
+///
+/// # Errors
+///
+/// Returns an error if a reader cannot be opened, the FASTQ is malformed, or the
+/// encoding cannot be determined from the sampled qualities.
+pub(crate) fn detect_encoding_and_open_fastq_readers(
+    inputs: &[PathBuf],
+    interleaved: bool,
+    num_threads: usize,
+    async_reader: bool,
+    check_crc: bool,
+    no_check_crc: bool,
+) -> Result<(Vec<Box<dyn BufRead + Send>>, QualityEncoding)> {
+    let decomp_threads = num_threads.max(1);
+    let mut stdin_reader: Option<Box<dyn BufRead + Send>> = None;
+    let detection_stats = if let Some(stdin_input) = inputs.iter().find(|p| is_stdin_path(p)) {
+        let opened =
+            open_fastq_reader(stdin_input, decomp_threads, async_reader, check_crc, no_check_crc)?;
+        let (stats, replayed) = sample_detection_quals_from_stream(opened)?;
+        stdin_reader = Some(replayed);
+        stats
+    } else {
+        sample_detection_quals(inputs, check_crc, no_check_crc)?
+    };
+    let encoding = QualityEncoding::from_stats(&detection_stats)?;
+    let readers = open_fastq_input_readers(
+        inputs,
+        interleaved,
+        decomp_threads,
+        async_reader,
+        check_crc,
+        no_check_crc,
+        stdin_reader,
+    )?;
+    Ok((readers, encoding))
+}
+
 impl Command for Extract {
     fn execute(&self, command_line: &str) -> Result<()> {
         // Validate inputs
         self.validate()?;
 
+        // `--threads N` routes onto the declarative chain builder — the chain
+        // opens its own FASTQ readers and detects the quality encoding inside
+        // `ChainBuilder::open_source`. The no-`--threads` serial loop below is the
+        // in-process parity oracle. `--threads 1` takes the chain like any other
+        // `Some(n)`: the old dispatch was `is_parallel()`, which was already true
+        // for every `Threads(n)` including `Threads(1)`, so this
+        // `threads.is_some()` predicate is behaviorally identical — the cutover
+        // swaps the parallel *implementation* (the now-deleted legacy
+        // `process_with_pipeline`) for the chain builder, it does not change which
+        // `--threads` values run in parallel.
+        if self.threading.threads.is_some() {
+            return self.execute_chain(command_line);
+        }
+
         let timer = OperationTimer::new("Extracting UMIs");
         let read_structures = self.get_read_structures()?;
 
-        // Detect quality encoding from the pooled heads of ALL input FASTQs.
-        //
-        // For file inputs this opens a separate reader per input, so the main
-        // readers are untouched. stdin has no second open, so it is opened once
-        // here and the sampled bytes are replayed to the main pass; the reader
-        // below is that replaying stream, handed to whichever branch runs.
-        //
-        // It is opened with the *main pass's* decompression thread count, not a
-        // sampling one: this same reader decompresses every record that follows,
-        // so a hardcoded single thread would leave `--threads` unable to reach
-        // the BGZF decoder on the stdin path, where file inputs get the full
-        // count from [`Self::open_input_readers`].
-        let mut stdin_reader: Option<Box<dyn BufRead + Send>> = None;
-        let detection_stats =
-            if let Some(stdin_input) = self.inputs.iter().find(|p| is_stdin_path(p)) {
-                let decomp_threads = self.threading.num_threads().max(1);
-                let opened = open_fastq_reader(
-                    stdin_input,
-                    decomp_threads,
-                    self.async_reader,
-                    self.check_crc,
-                    self.no_check_crc,
-                )?;
-                let (stats, replayed) = sample_detection_quals_from_stream(opened)?;
-                stdin_reader = Some(replayed);
-                stats
-            } else {
-                sample_detection_quals(&self.inputs, self.check_crc, self.no_check_crc)?
-            };
-        let encoding = QualityEncoding::from_stats(&detection_stats)?;
+        // Serial oracle: detect the quality encoding and open the input readers
+        // in one pass — the same helper the chain FASTQ source uses, so both
+        // paths open identical readers (de-interleaving / stdin-replay included)
+        // and apply the same detected encoding.
+        let (fq_readers, encoding) = detect_encoding_and_open_fastq_readers(
+            &self.inputs,
+            self.interleaved,
+            self.threading.num_threads(),
+            self.async_reader,
+            self.check_crc,
+            self.no_check_crc,
+        )?;
 
         // Create header with @PG record
         let header = self.create_header(command_line)?;
 
-        let records_written = if self.threading.is_parallel() {
-            // Unified 7-step pipeline mode (--threads N was specified)
-            // Uses work-stealing for better CPU utilization with strict thread cap
-            // The 7-step pipeline handles its own BGZF compression internally
-            // `open_output_writer`, not `File::create`: the single-threaded
-            // branch below reaches stdout through `create_raw_bam_writer`, and
-            // which of the two runs is a function of `--threads`, which has
-            // nothing to do with where the output goes.
-            // 256 KiB, not the 8 KiB default: the pipeline hands this writer
-            // whole compressed BGZF blocks, which run up to 64 KiB and so would
-            // bypass the default buffer entirely, one `write` syscall apiece.
-            let output: Box<dyn std::io::Write + Send> =
-                Box::new(std::io::BufWriter::with_capacity(
-                    PIPELINE_OUTPUT_BUF_CAPACITY,
-                    open_output_writer(&self.output)?,
-                ));
+        let fq_sources: Vec<SimdFastqReader<Box<dyn BufRead + Send>>> = fq_readers
+            .into_iter()
+            .map(|fq| SimdFastqReader::with_capacity(fq, BUFFER_SIZE))
+            .collect();
 
-            self.process_with_pipeline(&header, output, encoding, &read_structures, stdin_reader)?
-        } else {
-            // Single-threaded mode: raw BAM writer
-            // Determine thread count for parallel BGZF decompression
-            let decomp_threads = self.threading.num_threads().max(1);
+        let mut fq_iterators: Vec<ReadSetIterator> = fq_sources
+            .into_iter()
+            .zip(read_structures.iter())
+            .map(|(source, rs)| ReadSetIterator::new(rs.clone(), source, Vec::new()))
+            .collect();
 
-            // Open input FASTQs with automatic BGZF detection
-            let fq_readers: Vec<Box<dyn BufRead + Send>> =
-                self.open_input_readers(decomp_threads, stdin_reader)?;
+        // Raw BAM writer (single-threaded oracle output).
+        let writer_threads = self.threading.num_threads();
+        let mut writer = create_raw_bam_writer(
+            &self.output,
+            &header,
+            writer_threads,
+            self.compression.compression_level,
+        )?;
 
-            let fq_sources: Vec<SimdFastqReader<Box<dyn BufRead + Send>>> = fq_readers
-                .into_iter()
-                .map(|fq| SimdFastqReader::with_capacity(fq, BUFFER_SIZE))
-                .collect();
+        let count = self.process_singlethreaded(&mut fq_iterators, &mut writer, encoding)?;
 
-            // Create iterators
-            let fq_iterators: Vec<ReadSetIterator> = fq_sources
-                .into_iter()
-                .zip(read_structures.iter())
-                .map(|(source, rs)| ReadSetIterator::new(rs.clone(), source, Vec::new()))
-                .collect();
+        // Flush and finish the writer so any write error surfaces here, not on drop.
+        writer.finish()?;
 
-            // Create output writer with multi-threaded BGZF
-            let writer_threads = self.threading.num_threads();
-            let mut writer = create_raw_bam_writer(
-                &self.output,
-                &header,
-                writer_threads,
-                self.compression.compression_level,
-            )?;
-
-            // Single-threaded processing: original simple loop (iterators are borrowed)
-            let mut fq_iterators = fq_iterators;
-            let count = self.process_singlethreaded(&mut fq_iterators, &mut writer, encoding)?;
-
-            // Flush and finish the writer
-            writer.finish()?;
-
-            count
-        };
-
-        timer.log_completion(records_written);
+        timer.log_completion(count);
         Ok(())
     }
-}
-
-/// Reject an assembled template that does not carry exactly one record per read
-/// structure.
-///
-/// `--inputs` and `--read-structures` are validated to be the same length, and
-/// the pipeline now rejects inputs of unequal record count, so a short template
-/// cannot normally be assembled. This enforces the invariant rather than logging
-/// it: the segment `zip` downstream stops at the shorter side, so a short
-/// template would silently drop that read's segments (issue #773).
-fn validate_template_record_count(
-    template: &FastqTemplate,
-    read_structure_count: usize,
-) -> std::io::Result<()> {
-    if template.records.len() != read_structure_count {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "FASTQ sources out of sync: template '{}' has {} record(s) but {} \
-                 read structure(s) were given",
-                String::from_utf8_lossy(&template.name),
-                template.records.len(),
-                read_structure_count,
-            ),
-        ));
-    }
-    Ok(())
 }
 
 // ==== ported from feat-runall for the chain builder (R2) ====
@@ -1869,6 +1617,13 @@ pub struct ExtractOptions {
 
     // ── Extract behavior options ──
     /// Quality encoding of the input FASTQ files.
+    ///
+    /// On the chain path this is a placeholder at spec-construction time: the
+    /// FASTQ source detects the encoding while opening its readers (in
+    /// `ChainBuilder::open_source`) and overrides this field before the extract
+    /// step runs, so both the serial oracle and the chain apply the same
+    /// source-detected encoding. Tests that construct `ExtractOptions` directly
+    /// set the encoding they want to exercise.
     pub quality_encoding: QualityEncoding,
     /// Store UMI base qualities in the `QX` tag.
     pub store_umi_quals: bool,
@@ -1885,6 +1640,12 @@ pub struct ExtractOptions {
     pub store_sample_barcode_qualities: bool,
     /// Wrap FASTQ readers in a userspace async prefetch thread.
     pub async_reader: bool,
+    /// Force BGZF input CRC verification (`--check-crc`). Consumed when the chain
+    /// FASTQ source opens its readers, so `--check-crc`/`--no-check-crc` reach
+    /// `open_fastq_reader` on the `--threads` path exactly as on the serial path.
+    pub check_crc: bool,
+    /// Disable BGZF input CRC verification (`--no-check-crc`). See `check_crc`.
+    pub no_check_crc: bool,
 }
 
 /// Build raw BAM `RawRecord`s from a [`FastqSet`].
@@ -1894,13 +1655,17 @@ pub struct ExtractOptions {
 /// tags, and produces one `RawRecord` per template segment. The caller wraps
 /// the result in a [`crate::template::Template`] for the typed-step pipeline.
 ///
-/// KNOWN DUPLICATION — resolve in the extract WIRING PR: this is a third
-/// near-identical copy of the FASTQ→`RawRecord` per-read loop, alongside
-/// `Extract::make_raw_records` (writes to a `RawBamWriter`) and
-/// `make_raw_records_static` (builds an `ExtractedBatch`). The three differ only
-/// in output target, so tag-extraction/flag logic can drift between them. The
-/// extract wiring PR should unify them (sharing `Extract::create_header` and the
-/// per-read tag loop) once the chain extract path is live; dormant today.
+/// KNOWN DUPLICATION: this is the chain path's copy of the FASTQ→`RawRecord`
+/// per-read loop, near-identical to `Extract::make_raw_records` (the serial
+/// oracle's, which writes to a `RawBamWriter`). The two differ only in output
+/// target, so tag-extraction/flag logic can drift between them. The
+/// `chain_matches_serial_oracle*` integration tests guard against drift by
+/// comparing chain-vs-oracle output: the base case covers RX/RG, and
+/// `chain_matches_serial_oracle_barcode_and_annotate_tags` covers the
+/// CB/CY, BC/QT, QX, `--single-tag`, and `--annotate-read-names` branches.
+/// Unifying the two onto one shared per-read loop is a worthwhile follow-up.
+/// (The former third copy, `make_raw_records_static`, was deleted with the
+/// legacy threaded pipeline when extract cut over to the chain builder.)
 ///
 /// # Errors
 ///
@@ -3498,9 +3263,9 @@ mod tests {
         // suffixes must produce a single shared QNAME (no suffix) for both mates,
         // as required by the SAM spec. Guards the wiring from
         // `extract_read_name_and_umi` through to the written BAM QNAME in both the
-        // single-threaded (`make_raw_records`) and threaded
-        // (`make_raw_records_static` + `strip_read_suffix`) record-building
-        // paths.
+        // serial-oracle (`make_raw_records`) and the chain
+        // (`make_raw_records_from_fastq_set` + `strip_read_suffix`) record-building
+        // paths — this test is parameterized over threading to exercise both.
         let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("SRR001.1/1", "AAAAAAAAAA", "==========")]);
         let r2 = create_fastq(&tmp, "r2.fq", &[("SRR001.1/2", "CCCCCCCCCC", "##########")]);
@@ -3555,8 +3320,9 @@ mod tests {
     /// Rust panic partway through writing the output BAM and leave a truncated
     /// file behind.
     ///
-    /// Both record-building paths are covered: `make_raw_records`
-    /// (single-threaded) and `make_raw_records_static` (threaded).
+    /// Both record-building paths are covered (the test is parameterized over
+    /// threading): `make_raw_records` (serial oracle) and
+    /// `make_raw_records_from_fastq_set` (chain, `--threads`).
     #[rstest]
     #[case::at_limit(254, true)]
     #[case::one_over(255, false)]
@@ -5211,8 +4977,8 @@ mod tests {
         Ok(())
     }
 
-    /// Verifies that the threaded pipeline path emits the same tags (RX, QX, RG) as the
-    /// single-threaded path, ensuring `make_raw_records_static` stays in sync with
+    /// Verifies that the chain (`--threads`) path emits the same tags (RX, QX, RG) as the
+    /// serial oracle, ensuring `make_raw_records_from_fastq_set` stays in sync with
     /// `make_raw_records`.
     #[rstest]
     #[case::fast_path(ThreadingOptions::none())]
@@ -5274,57 +5040,6 @@ mod tests {
         assert_eq!(rg.as_deref(), Some("RG1"), "RG tag should match read_group_id");
 
         Ok(())
-    }
-
-    /// Build a `FastqTemplate` carrying `record_count` records under a shared name.
-    fn template_with_record_count(name: &str, record_count: usize) -> FastqTemplate {
-        let records = (0..record_count)
-            .map(|_| {
-                crate::fastq_parse::FastqRecord::from_slice(
-                    format!("@{name}\nACGT\n+\nIIII\n").as_bytes(),
-                )
-                .expect("failed to parse synthetic FASTQ record")
-            })
-            .collect();
-        FastqTemplate { records, name: name.as_bytes().to_vec() }
-    }
-
-    /// A template with one record per read structure passes validation.
-    #[rstest]
-    #[case::single_end(1)]
-    #[case::paired_end(2)]
-    #[case::triple(3)]
-    fn test_validate_template_record_count_matched_is_accepted(#[case] count: usize) {
-        let template = template_with_record_count("read0", count);
-        validate_template_record_count(&template, count)
-            .expect("a template matching the read-structure count must be accepted");
-    }
-
-    /// A template whose record count differs from the read-structure count is
-    /// rejected, naming the template and both counts (issue #773).
-    #[rstest]
-    #[case::short(1, 2)]
-    #[case::surplus(3, 2)]
-    #[case::empty(0, 2)]
-    fn test_validate_template_record_count_mismatch_is_rejected(
-        #[case] record_count: usize,
-        #[case] read_structure_count: usize,
-    ) {
-        let template = template_with_record_count("read0", record_count);
-        let error = validate_template_record_count(&template, read_structure_count)
-            .expect_err("a template that disagrees with the read-structure count must be rejected");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        let message = error.to_string();
-        assert!(message.contains("out of sync"), "unexpected message: {message}");
-        assert!(message.contains("read0"), "message must name the template: {message}");
-        assert!(
-            message.contains(&format!("{record_count} record(s)")),
-            "message must report the record count: {message}"
-        );
-        assert!(
-            message.contains(&format!("{read_structure_count} read structure(s)")),
-            "message must report the read-structure count: {message}"
-        );
     }
 
     /// Build an `Extract` for the interleaved-equivalence test, varying only the
@@ -5629,10 +5344,11 @@ mod tests {
     }
 
     /// A BGZF-compressed interleaved file must be decompressed exactly once and
-    /// then split — the `all_bgzf` fast path is force-disabled for interleaved
-    /// input, so the pipeline never re-opens and line-splits the raw compressed
+    /// then split: the chain opens the sole interleaved input once via
+    /// `open_fastq_reader` and `deinterleave` splits the *decompressed* bytes into
+    /// R1/R2, so BGZF is never decoded twice or line-split as raw compressed
     /// bytes. The BGZF and plaintext interleaved runs must produce the same
-    /// records, on both paths.
+    /// records, on both the serial and chain paths.
     #[rstest]
     #[case::single_threaded(ThreadingOptions::none())]
     #[case::multi_threaded(ThreadingOptions::new(2))]
@@ -5750,7 +5466,79 @@ mod tests {
             extract_umis_from_read_names: false,
             store_sample_barcode_qualities: false,
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         }
+    }
+
+    /// `Extract::to_extract_options` must project every CLI field onto the
+    /// matching `ExtractOptions` field so the chain path sees the same options
+    /// the serial oracle uses. `quality_encoding` is a placeholder (`Standard`)
+    /// because the chain FASTQ source overrides it with the detected encoding.
+    #[test]
+    fn to_extract_options_maps_all_fields() {
+        let extract = Extract {
+            inputs: vec![PathBuf::from("in.fq")],
+            output: PathBuf::from("out.bam"),
+            read_structures: vec![],
+            // Alternate true/false across the adjacent bool fields so an accidental
+            // field swap in `to_extract_options` (e.g. store_umi_quals <->
+            // store_cell_quals) flips an assertion below instead of passing
+            // silently. Bools can't be pairwise-distinct, so this catches the
+            // realistic adjacent copy-paste swap, not every possible pair.
+            store_umi_quals: true,
+            store_cell_quals: false,
+            store_sample_barcode_qualities: true,
+            extract_umis_from_read_names: false,
+            annotate_read_names: true,
+            single_tag: Some(SamTag::MI),
+            clipping_attribute: None,
+            read_group_id: "RGX".to_string(),
+            sample: "SAMP".to_string(),
+            library: "LIBR".to_string(),
+            barcode: Some("ACGT".to_string()),
+            platform: "ont".to_string(),
+            platform_unit: Some("PU1".to_string()),
+            platform_model: Some("PM1".to_string()),
+            sequencing_center: Some("CN1".to_string()),
+            predicted_insert_size: Some(300),
+            description: Some("desc".to_string()),
+            comment: vec!["c1".to_string(), "c2".to_string()],
+            run_date: Some("2020-01-01".to_string()),
+            threading: ThreadingOptions::new(4),
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
+            check_crc: true,
+            no_check_crc: false,
+            interleaved: false,
+        };
+        let opts = extract.to_extract_options();
+        assert_eq!(opts.sample, "SAMP");
+        assert_eq!(opts.library, "LIBR");
+        // platform is Option in ExtractOptions but String on the CLI: always Some.
+        assert_eq!(opts.platform.as_deref(), Some("ont"));
+        assert_eq!(opts.platform_unit.as_deref(), Some("PU1"));
+        assert_eq!(opts.read_group_id, "RGX");
+        assert_eq!(opts.comments, vec!["c1".to_string(), "c2".to_string()]);
+        assert_eq!(opts.barcode.as_deref(), Some("ACGT"));
+        assert_eq!(opts.platform_model.as_deref(), Some("PM1"));
+        assert_eq!(opts.sequencing_center.as_deref(), Some("CN1"));
+        assert_eq!(opts.predicted_insert_size, Some(300));
+        assert_eq!(opts.description.as_deref(), Some("desc"));
+        assert_eq!(opts.run_date.as_deref(), Some("2020-01-01"));
+        // Placeholder — the chain source detects and overrides this.
+        assert_eq!(opts.quality_encoding, QualityEncoding::Standard);
+        assert!(opts.store_umi_quals);
+        assert!(!opts.store_cell_quals);
+        assert_eq!(opts.single_tag, Some(SamTag::MI));
+        assert!(opts.annotate_read_names);
+        assert!(!opts.extract_umis_from_read_names);
+        assert!(opts.store_sample_barcode_qualities);
+        assert!(!opts.async_reader);
+        assert!(opts.check_crc);
+        assert!(!opts.no_check_crc);
     }
 
     /// `ExtractOptions::validate` must reject a `--single-tag` that collides with

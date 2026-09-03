@@ -80,11 +80,27 @@ pub(crate) enum PendingSource {
         reference: std::path::PathBuf,
     },
 
-    /// `SourceSpec::Fastqs` — extract's input form.
-    /// `add_source` consumes this to build the FASTQ read preamble:
-    /// `ReadFastqInputs → ZipFastqRecords`. Read structures are read
-    /// from `self.spec.source` by `add_extract`, not carried here.
-    Fastq { paths: Vec<std::path::PathBuf> },
+    /// `SourceSpec::Fastqs` / `SourceSpec::InterleavedFastq` — extract's input
+    /// form. `open_source` opens the decompressed readers and detects the quality
+    /// encoding (so both live here, not in the path-only `SourceSpec`);
+    /// `add_source` consumes the readers to build the FASTQ read preamble
+    /// (`ReadFastqInputs → … → ZipFastqRecords`). Read structures are read from
+    /// `self.spec.source` by `add_extract`, not carried here.
+    Fastq {
+        /// Opened, decompressed FASTQ readers — one per stream (two for an
+        /// interleaved source, already de-interleaved).
+        readers: Vec<Box<dyn std::io::BufRead + Send>>,
+        /// Quality encoding detected from the input heads; applied by
+        /// `add_extract` (overrides the placeholder in `ExtractOptions`).
+        encoding: crate::commands::extract::QualityEncoding,
+        /// When `true`, force the drift-bounded round-robin read topology
+        /// (`ReadFastqInputs::new → ParseFastqChunks → ZipFastqRecords`) even for
+        /// two streams. Set for an interleaved source: its two halves share one
+        /// physical stream and the de-interleaver caps how far they may diverge,
+        /// so the N==2 `PairRawFastq` topology (which lets R1 outrun R2) can
+        /// overrun that cap.
+        force_round_robin: bool,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -517,6 +533,13 @@ pub struct ChainBuilder<'a> {
     /// clip) keeps the pool-scheduled writer. `add_sink` reads this flag.
     /// Default `false`.
     detached_writer: bool,
+
+    /// Quality encoding detected by `open_source` for a FASTQ source, pulled out
+    /// of [`PendingSource::Fastq`] in `new()`. `add_extract` overrides the
+    /// placeholder `ExtractOptions::quality_encoding` with this so the chain
+    /// applies the same source-detected encoding the serial oracle does. `None`
+    /// for non-FASTQ sources.
+    fastq_encoding: Option<crate::commands::extract::QualityEncoding>,
 }
 
 impl<'a> ChainBuilder<'a> {
@@ -550,6 +573,13 @@ impl<'a> ChainBuilder<'a> {
         // the input itself) is gone: standalone sort now streams through the
         // normal source path, so `@PG` injection applies to it too.
         let (raw_header, pending_source) = Self::open_source(spec)?;
+        // A FASTQ source detects the input quality encoding while opening its
+        // readers; pull it out here so `add_extract` can override the placeholder
+        // in `ExtractOptions`. Non-FASTQ sources leave this `None`.
+        let fastq_encoding = match &pending_source {
+            Some(PendingSource::Fastq { encoding, .. }) => Some(*encoding),
+            _ => None,
+        };
         // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio,
         // which never passes a header-less BAM straight through). Every legacy
         // command's execute() does this before add_pg_record; ChainBuilder must
@@ -585,6 +615,7 @@ impl<'a> ChainBuilder<'a> {
             // Pool-scheduled writer by default; add_sort opts the standalone
             // sort terminal into a Detached writer (lever 2).
             detached_writer: false,
+            fastq_encoding,
         })
     }
 
@@ -676,14 +707,45 @@ impl<'a> ChainBuilder<'a> {
                 ))
             }
             SourceSpec::Fastqs { paths, read_structures: _ } => {
-                let extract_opts = spec.stage_opts.extract.as_ref().ok_or_else(|| {
-                    anyhow!("Fastqs source requires extract options in StageOptionsBag")
-                })?;
-                let header =
-                    crate::pipeline::chains::commands::extract::build_fastq_header(extract_opts)?;
-                Ok((header, Some(PendingSource::Fastq { paths: paths.clone() })))
+                let (header, pending) = Self::open_fastq_source(spec, paths, false)?;
+                Ok((header, Some(pending)))
+            }
+            SourceSpec::InterleavedFastq { path, read_structures: _ } => {
+                let (header, pending) =
+                    Self::open_fastq_source(spec, std::slice::from_ref(path), true)?;
+                Ok((header, Some(pending)))
             }
         }
+    }
+
+    /// Open the decompressed FASTQ readers and detect the input quality encoding
+    /// for a `Fastqs` / `InterleavedFastq` source, then build the unmapped-BAM
+    /// header. Shared by both FASTQ arms of [`Self::open_source`].
+    ///
+    /// The chain opens its own readers here (the conformant "chain owns its
+    /// source" shape) through the same helper the serial oracle uses, so both see
+    /// identical readers and encoding. `interleaved` de-interleaves the sole input
+    /// into the R1/R2 pair and selects the drift-bounded round-robin read topology
+    /// (carried downstream as `PendingSource::Fastq::force_round_robin`).
+    fn open_fastq_source(
+        spec: &ChainSpec,
+        inputs: &[std::path::PathBuf],
+        interleaved: bool,
+    ) -> Result<(Header, PendingSource)> {
+        let extract_opts =
+            spec.stage_opts.extract.as_ref().ok_or_else(|| {
+                anyhow!("a FASTQ source requires extract options in StageOptionsBag")
+            })?;
+        let (readers, encoding) = crate::commands::extract::detect_encoding_and_open_fastq_readers(
+            inputs,
+            interleaved,
+            spec.threading.num_threads(),
+            extract_opts.async_reader,
+            extract_opts.check_crc,
+            extract_opts.no_check_crc,
+        )?;
+        let header = crate::pipeline::chains::commands::extract::build_fastq_header(extract_opts)?;
+        Ok((header, PendingSource::Fastq { readers, encoding, force_round_robin: interleaved }))
     }
 
     /// Add the input source step(s) to the pipeline.
@@ -871,7 +933,7 @@ impl<'a> ChainBuilder<'a> {
                 self.current_tail = Some(unmapped_tail);
                 self.paired_tail = Some(mapped_tail);
             }
-            PendingSource::Fastq { paths } => {
+            PendingSource::Fastq { readers, encoding: _, force_round_robin } => {
                 use crate::pipeline::core::step::Affinity;
                 use crate::pipeline::steps::source::pair_fastq::PairRawFastq;
                 use crate::pipeline::steps::source::parse_fastq::ParseFastqChunks;
@@ -881,37 +943,13 @@ impl<'a> ChainBuilder<'a> {
                 };
                 use crate::pipeline::steps::source::zip_fastq::ZipFastqRecords;
 
-                // Open one BufRead reader per FASTQ path. Extract's
-                // `open_fastq_reader` handles BGZF / gzip / plain
-                // detection and optional async prefetch wrapping.
-                let extract_opts = self.spec.stage_opts.extract.as_ref().ok_or_else(|| {
-                    anyhow!("Fastq source requires extract options in StageOptionsBag")
-                })?;
-                let async_reader = extract_opts.async_reader;
-                // CRC-verification policy: `ExtractOptions` (the projection) does
-                // not yet carry the `--check-crc` / `--no-check-crc` flags — that
-                // wiring lands when `Extract::execute` builds the projection at the
-                // extract rewire. Until the chain is the live extract caller, use
-                // the default policy (verify a file, trust stdin), which
-                // `open_fastq_reader` selects when both flags are false.
-                let check_crc = false;
-                let no_check_crc = false;
-                // FASTQ decompression threads: for BGZF inputs the reader
-                // can multi-thread; for gzip/plain it is single-threaded
-                // regardless.  Pass 1 here — the pipeline framework
-                // provides the parallelism via typed steps.
-                let mut readers: Vec<Box<dyn std::io::BufRead + Send>> = paths
-                    .iter()
-                    .map(|p| {
-                        crate::commands::extract::open_fastq_reader(
-                            p,
-                            1,
-                            async_reader,
-                            check_crc,
-                            no_check_crc,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                // Readers were opened by `open_source` — one per stream, or the
+                // de-interleaved R1/R2 pair for an interleaved source — using the
+                // run's thread count and CRC policy, with BGZF/gzip/plain
+                // detection and optional async prefetch already applied. Consume
+                // them directly; the detected quality encoding is applied by
+                // `add_extract` via `self.fastq_encoding`.
+                let mut readers = readers;
 
                 let n_streams = readers.len();
                 // batch_record_count — same default as the legacy pipeline.
@@ -952,8 +990,8 @@ impl<'a> ChainBuilder<'a> {
                 // worker index is clamped to `num_threads - 1` so a low
                 // `--threads` count can never request a non-existent worker
                 // (which would deadlock).
-                let tail = match n_streams {
-                    1 => {
+                let tail = match (n_streams, force_round_robin) {
+                    (1, _) => {
                         let only = readers.pop().expect("n_streams == 1");
                         let read_step = ReadFastqInputs::new_single(
                             only,
@@ -968,7 +1006,7 @@ impl<'a> ChainBuilder<'a> {
                             self.pipeline.append_step(ParseFastqChunks::new(byte_limit), tail);
                         self.pipeline.append_step(ZipFastqRecords::new(1, byte_limit), parse_tail)
                     }
-                    2 => {
+                    (2, false) => {
                         // Two concurrent single-stream readers (R1, R2) →
                         // PairRawFastq (Step2) → ParseAndZipFastq.
                         let r2_in = readers.pop().expect("n_streams == 2");
@@ -1013,8 +1051,13 @@ impl<'a> ChainBuilder<'a> {
                         self.pipeline.append_step(ParseAndZipFastq::new(byte_limit), pair_tail)
                     }
                     _ => {
-                        // N >= 3 fallback: single all-streams round-robin
-                        // reader (Affinity::Reader), serial decompress.
+                        // Round-robin fallback (N >= 3, or the two-stream
+                        // interleaved case where `force_round_robin` is set): one
+                        // all-streams reader (Affinity::Reader), serial decompress.
+                        // Reading one chunk per stream per cycle bounds how far the
+                        // streams diverge to `batch_records`, which the interleaved
+                        // de-interleaver's lockstep cap requires (the N==2
+                        // `PairRawFastq` path would let R1 outrun R2 past it).
                         let read_step = ReadFastqInputs::new(readers, batch_records, byte_limit);
                         let tail = self.pipeline.append_source(read_step);
                         let parse_tail =
@@ -1049,6 +1092,7 @@ impl<'a> ChainBuilder<'a> {
             SourceSpec::Bam(p) | SourceSpec::Sam(p) => p.clone(),
             SourceSpec::PairedBams { mapped, .. } => mapped.clone(),
             SourceSpec::Fastqs { paths, .. } => paths.first().cloned().unwrap_or_default(),
+            SourceSpec::InterleavedFastq { path, .. } => path.clone(),
         }
     }
 
@@ -1766,8 +1810,11 @@ impl<'a> ChainBuilder<'a> {
         let timer = OperationTimer::new("Extracting UMIs");
 
         let read_structures = match &self.spec.source {
-            SourceSpec::Fastqs { read_structures, .. } => Arc::new(read_structures.clone()),
-            other => bail!("add_extract requires SourceSpec::Fastqs, got {other:?}"),
+            SourceSpec::Fastqs { read_structures, .. }
+            | SourceSpec::InterleavedFastq { read_structures, .. } => {
+                Arc::new(read_structures.clone())
+            }
+            other => bail!("add_extract requires a FASTQ source, got {other:?}"),
         };
 
         // Enforce the same read-structure guard the standalone `Extract` command
@@ -1782,9 +1829,19 @@ impl<'a> ChainBuilder<'a> {
 
         let records_emitted = Arc::new(AtomicU64::new(0));
 
+        // Apply the source-detected quality encoding over the placeholder in the
+        // projected options: `open_source` detected it while opening the FASTQ
+        // readers and stashed it in `self.fastq_encoding`, so the chain applies
+        // the same encoding the serial oracle does. `None` only for a
+        // (non-existent) non-FASTQ extract source, where the placeholder stands.
+        let mut extract_opts = extract_opts.clone();
+        if let Some(encoding) = self.fastq_encoding {
+            extract_opts.quality_encoding = encoding;
+        }
+
         let step = build_extract_step(
             read_structures,
-            Arc::new(extract_opts.clone()),
+            Arc::new(extract_opts),
             Arc::clone(&records_emitted),
             self.tuning.per_step_byte_limit,
         );
