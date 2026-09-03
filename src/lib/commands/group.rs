@@ -674,42 +674,64 @@ pub struct GroupReadsByUmi {
 /// `effective_strategy` / `effective_edits` carry the `--no-umi` and
 /// identity-implies-zero-edits rules. Both come from the same methods
 /// `execute` uses, so the command and the chain builder cannot drift apart.
-#[derive(Debug, Clone)]
+#[fgumi_cli_macros::multi_options("group", "Group Options")]
+#[derive(Debug, Clone, clap::Args)]
 #[allow(clippy::struct_excessive_bools)] // mirrors the CLI flags 1:1; each bool is a distinct option
 pub struct GroupOptions {
     /// Minimum mapping quality for mapped reads, with the default applied.
+    #[arg(short = 'm', long = "min-map-q", default_value_t = 1)]
     pub min_map_q: u8,
     /// Include non-PF reads.
+    #[arg(short = 'n', long = "include-non-pf-reads", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub include_non_pf_reads: bool,
     /// Allow fully unmapped templates.
+    #[arg(long = "allow-unmapped", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub allow_unmapped: bool,
     /// The strategy as requested on the command line.
+    #[arg(short = 's', long = "strategy", value_enum)]
     pub strategy: Strategy,
     /// The edit distance as requested on the command line.
+    #[arg(short = 'e', long = "edits", default_value = "1")]
     pub edits: u32,
     /// Minimum UMI length to accept.
+    #[arg(short = 'l', long = "min-umi-length")]
     pub min_umi_length: Option<usize>,
     /// When to build the N-gram/BK-tree index instead of scanning linearly.
     ///
     /// This is [`fgumi_umi::IndexThreshold`] rather than a bare count: the
     /// flag also accepts `always` / `never`, which a number cannot express.
+    #[arg(long = "index-threshold", default_value = "100")]
     pub index_threshold: IndexThreshold,
     /// Skip UMI-based grouping entirely.
+    #[arg(long = "no-umi", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub no_umi: bool,
     /// Template-count floor for handing a position group to a parallel assigner.
+    #[arg(long = "parallel-group-min-templates", value_name = "N|auto")]
     pub parallel_group_min_templates: Option<ParallelMinTemplates>,
     /// The strategy actually used, after applying `--no-umi`.
+    ///
+    /// Placeholder in PR A: `Multi<Group>::validate()` leaves this at the skip
+    /// default rather than resolving it — resolution via
+    /// [`GroupOptions::resolve_strategy_and_edits`] is wired up by PR B.
+    #[arg(skip = Strategy::Identity)]
     pub effective_strategy: Strategy,
     /// The edit distance actually used, after applying `--no-umi` and the
     /// identity-implies-zero rule.
+    ///
+    /// Placeholder in PR A; see `effective_strategy`.
+    #[arg(skip)]
     pub effective_edits: u32,
     /// Optional family-size histogram output.
+    #[arg(short = 'f', long = "family-size-histogram")]
     pub family_size_histogram: Option<PathBuf>,
     /// Optional grouping-metrics output.
+    #[arg(short = 'g', long = "grouping-metrics")]
     pub grouping_metrics: Option<PathBuf>,
     /// Optional output prefix for the full set of metrics files.
+    #[arg(short = 'M', long = "metrics")]
     pub metrics_prefix: Option<PathBuf>,
     /// Verify the input is in strict template-coordinate sort order (`--verify`).
+    #[arg(long = "verify", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub verify: bool,
 }
 
@@ -1634,6 +1656,96 @@ mod tests {
         assert_eq!(opts.family_size_histogram, None);
         assert_eq!(opts.grouping_metrics, None);
         assert_eq!(opts.metrics_prefix, None);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // GroupOptions / MultiGroupOptions parity (multi_options)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[derive(clap::Parser, Debug)]
+    struct PrefixedGroup {
+        #[command(flatten)]
+        opts: MultiGroupOptions,
+    }
+
+    /// The re-exposed `MultiGroupOptions` defaults must equal the standalone
+    /// `group` command's defaults, projected through `to_group_options` —
+    /// except `effective_strategy`/`effective_edits`, which PR A leaves at
+    /// their `#[arg(skip)]` placeholders (`Multi<Group>::validate()` does not
+    /// call `resolve_strategy_and_edits`; that wiring lands in PR B).
+    #[test]
+    fn multi_group_options_defaults_match_command() {
+        let base = GroupReadsByUmi::try_parse_from([
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "o.bam",
+            "-s",
+            "adjacency",
+        ])
+        .expect("parses")
+        .to_group_options();
+        let multi = PrefixedGroup::try_parse_from(["x", "--group::strategy", "adjacency"])
+            .expect("parses")
+            .opts
+            .validate()
+            .expect("valid");
+
+        assert_eq!(multi.min_map_q, base.min_map_q);
+        assert_eq!(multi.include_non_pf_reads, base.include_non_pf_reads);
+        assert_eq!(multi.allow_unmapped, base.allow_unmapped);
+        assert_eq!(multi.strategy, base.strategy);
+        assert_eq!(multi.edits, base.edits);
+        assert_eq!(multi.min_umi_length, base.min_umi_length);
+        assert_eq!(multi.index_threshold, base.index_threshold);
+        assert_eq!(multi.no_umi, base.no_umi);
+        assert_eq!(multi.parallel_group_min_templates, base.parallel_group_min_templates);
+        assert_eq!(multi.family_size_histogram, base.family_size_histogram);
+        assert_eq!(multi.grouping_metrics, base.grouping_metrics);
+        assert_eq!(multi.metrics_prefix, base.metrics_prefix);
+        assert_eq!(multi.verify, base.verify);
+
+        // Divergence: PR A leaves effective_* at the skip defaults. The
+        // standalone `to_group_options` resolves them to (Adjacency, 1) for
+        // this same input; resolved in PR B via resolve_strategy_and_edits.
+        assert_eq!((multi.effective_strategy, multi.effective_edits), (Strategy::Identity, 0));
+    }
+
+    /// `--group::strategy` has no default on the standalone command, so the
+    /// macro must lift it to a staged-required field: omitting it must parse
+    /// fine (staged validation, not clap, owns the requirement) but fail
+    /// `validate()`.
+    #[test]
+    fn multi_group_options_strategy_is_staged_required() {
+        let parsed = PrefixedGroup::try_parse_from(["x"]).expect("parse is staged, not clap");
+        let err = parsed.opts.validate().expect_err("strategy must be required");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--group::strategy is required"),
+            "error should name --group::strategy: {msg}"
+        );
+    }
+
+    /// Prefixed flags must round-trip through `MultiGroupOptions::validate`,
+    /// including the boolean `--group::verify` (whose base default is `false`,
+    /// so an enabled value is what proves the mapping is wired, not inherited).
+    #[test]
+    fn multi_group_options_round_trips_a_supplied_flag() {
+        let multi = PrefixedGroup::try_parse_from([
+            "x",
+            "--group::strategy",
+            "adjacency",
+            "--group::edits",
+            "3",
+            "--group::verify=true",
+        ])
+        .expect("parses")
+        .opts
+        .validate()
+        .expect("valid");
+        assert_eq!(multi.edits, 3);
+        assert!(multi.verify, "--group::verify=true must round-trip to verify=true");
     }
 
     use crate::assigner::{IdentityUmiAssigner, PairedUmiAssigner, Strategy};
