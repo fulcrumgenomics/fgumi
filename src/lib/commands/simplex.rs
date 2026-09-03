@@ -255,50 +255,140 @@ pub struct Simplex {
 
 /// Simplex-stage tuning, independent of how the values were supplied.
 ///
-/// See [`crate::commands::zipper::ZipperOptions`] for why this is a plain
-/// struct rather than a flattened `clap::Args`. Note that the consensus-calling
+/// Derives `clap::Args` and carries `#[fgumi_cli_macros::multi_options]` so a
+/// future fused `runall` command can re-expose each field as a prefixed
+/// `--simplex::<flag>`, via the generated `MultiSimplexOptions` companion,
+/// without hand-maintaining a parallel option set. This struct itself is not
+/// flattened into [`Simplex`] or anywhere else by this change — the standalone
+/// command still fills [`Simplex`]'s own fields (including its nested
+/// `consensus` / `overlapping` sub-structs) and projects them through
+/// [`Simplex::to_simplex_options`]; that path is untouched. The consensus-calling
 /// knobs are held **flat** here even though [`Simplex`] nests them behind
-/// `#[command(flatten)]` sub-structs: the chain builder wants one bag per stage,
-/// not a re-run of the CLI's grouping.
-#[derive(Debug, Clone)]
+/// `#[command(flatten)]` sub-structs: the chain builder wants one bag per
+/// stage, not a re-run of the CLI's grouping. Each `#[arg]` below is copied
+/// verbatim from the corresponding field on [`ConsensusCallingOptions`] /
+/// [`OverlappingConsensusOptions`].
+///
+/// `min_reads` has no `default_value` on the standalone command (fgbio's
+/// `CallMolecularConsensusReads` requires it explicitly), so the macro lifts
+/// it to a staged-required field: `MultiSimplexOptions::validate()` demands
+/// `--simplex::min-reads`.
+///
+/// `tie_rule` is `#[arg(skip)]`: on the standalone command it is resolved from
+/// `TieRuleArg` (a hidden, cross-tool equivalency-testing knob), and
+/// `--simplex::tie-rule` is not re-exposed by `runall`. [`fgumi_consensus::TieRule`]
+/// implements `Default` (`FgbioCompat`), matching `TieRuleArg::FgbioCompat`'s
+/// resolution.
+///
+/// `allow_unmapped` is `#[arg(skip = AllowUnmappedOptions { enabled: false })]`:
+/// [`AllowUnmappedOptions`] does not implement `Default`, so the explicit
+/// expression form is required; `enabled: false` matches the standalone
+/// command's default.
+///
+/// `io` / `rejects_opts` / `stats_opts` / `read_group` are `#[arg(skip)]`
+/// data carriers baked in by `runall`, not `--simplex::` flags — each carrier
+/// type implements `Default`.
+///
+/// `methylation_mode` is `#[arg(skip)]`: on the standalone command it is
+/// resolved from `Option<MethylationModeArg>` via
+/// [`crate::commands::common::resolve_methylation_mode`], and
+/// `--methylation-mode` itself is a cross-stage top-level `runall` flag
+/// (PR B), not a `--simplex::` flag. [`fgumi_consensus::MethylationMode`]
+/// implements `Default` (`Disabled`), which is what the skipped field falls
+/// back to.
+///
+/// `reference` is `#[arg(skip)]`: `--ref` is a cross-stage top-level `runall`
+/// flag (PR B), not a `--simplex::` flag.
+#[fgumi_cli_macros::multi_options("simplex", "Simplex Options")]
+#[derive(Debug, Clone, clap::Args)]
 pub struct SimplexOptions {
     /// Pre-UMI error rate (phred).
+    #[arg(short = '1', long = "error-rate-pre-umi", default_value = "45")]
     pub error_rate_pre_umi: u8,
     /// Post-UMI error rate (phred).
+    #[arg(short = '2', long = "error-rate-post-umi", default_value = "40")]
     pub error_rate_post_umi: u8,
     /// Minimum input base quality.
+    #[arg(short = 'm', long = "min-input-base-quality", default_value = "10")]
     pub min_input_base_quality: u8,
     /// Emit per-base consensus tags.
+    #[arg(short = 'B', long = "output-per-base-tags", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub output_per_base_tags: bool,
     /// Trim consensus reads.
+    #[arg(long = "trim", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub trim: bool,
     /// Minimum consensus base quality.
+    #[arg(long = "min-consensus-base-quality", default_value = "2")]
     pub min_consensus_base_quality: u8,
     /// How to resolve a near-tie between the two most likely consensus bases.
+    #[arg(skip)]
     pub tie_rule: fgumi_consensus::TieRule,
     /// Call overlapping bases jointly.
+    #[arg(long = "consensus-call-overlapping-bases", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub consensus_call_overlapping_bases: bool,
     /// Minimum reads per consensus.
+    #[arg(short = 'M', long = "min-reads")]
     pub min_reads: usize,
     /// Cap on reads per consensus.
+    #[arg(long = "max-reads")]
     pub max_reads: Option<usize>,
     /// Let fully-unmapped primary templates through the pre-group filter.
     ///
     /// Carried as the whole flattened sub-struct, like `io` / `rejects_opts` /
     /// `read_group`, rather than as a bare `bool`.
+    #[arg(skip = AllowUnmappedOptions { enabled: false })]
     pub allow_unmapped: AllowUnmappedOptions,
     /// Input/output paths and reader mode.
+    #[arg(skip)]
     pub io: BamIoOptions,
     /// Optional rejects output.
+    #[arg(skip)]
     pub rejects_opts: RejectsOptions,
     /// Optional stats output.
+    #[arg(skip)]
     pub stats_opts: StatsOptions,
     /// Read-group identity for emitted reads.
+    #[arg(skip)]
     pub read_group: ReadGroupOptions,
     /// Resolved methylation calling mode (`Disabled` when the flag is unset).
+    #[arg(skip)]
     pub methylation_mode: fgumi_consensus::MethylationMode,
     /// Reference FASTA for methylation-aware modes.
+    #[arg(skip)]
     pub reference: Option<std::path::PathBuf>,
+}
+
+/// Test/`runall`-construction default: consensus/overlapping knobs from the
+/// shared option defaults, methylation disabled. `min_reads` has no
+/// `default_value` on the standalone command (it is staged-required on the
+/// `runall` side), so this picks `1` — the smallest valid family size —
+/// purely for a usable `Default::default()`; it is never read back through
+/// `MultiSimplexOptions::validate()`, which demands `--simplex::min-reads`
+/// explicitly.
+impl Default for SimplexOptions {
+    fn default() -> Self {
+        let consensus = ConsensusCallingOptions::default();
+        let overlapping = OverlappingConsensusOptions::default();
+        Self {
+            error_rate_pre_umi: consensus.error_rate_pre_umi,
+            error_rate_post_umi: consensus.error_rate_post_umi,
+            min_input_base_quality: consensus.min_input_base_quality,
+            output_per_base_tags: consensus.output_per_base_tags,
+            trim: consensus.trim,
+            min_consensus_base_quality: consensus.min_consensus_base_quality,
+            tie_rule: consensus.tie_rule.into(),
+            consensus_call_overlapping_bases: overlapping.consensus_call_overlapping_bases,
+            min_reads: 1,
+            max_reads: None,
+            allow_unmapped: AllowUnmappedOptions { enabled: false },
+            io: BamIoOptions::default(),
+            rejects_opts: RejectsOptions::default(),
+            stats_opts: StatsOptions::default(),
+            read_group: ReadGroupOptions::default(),
+            methylation_mode: fgumi_consensus::MethylationMode::default(),
+            reference: None,
+        }
+    }
 }
 
 impl Simplex {
@@ -2237,5 +2327,108 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // SimplexOptions / MultiSimplexOptions parity (multi_options)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// `MultiSimplexOptions` derives `clap::Args`, not `Parser` — flatten it
+    /// into a local wrapper to drive it through `try_parse_from`.
+    #[derive(clap::Parser, Debug)]
+    struct PrefixedSimplex {
+        #[command(flatten)]
+        opts: MultiSimplexOptions,
+    }
+
+    /// The re-exposed `MultiSimplexOptions` defaults must equal the standalone
+    /// `simplex` command's defaults, projected through `to_simplex_options`.
+    /// This is the strong oracle: it fails on a dropped default, a
+    /// misclassified field, or a value that only happens to match by
+    /// coincidence.
+    ///
+    /// `--min-reads` has no `default_value` on the standalone command, so
+    /// both sides are anchored with the same value (`-M 3` /
+    /// `--simplex::min-reads 3`) rather than compared against a default — the
+    /// standalone side is NOT staged-required (clap itself demands it), while
+    /// the multi side IS staged-required and would fail `validate()` if
+    /// omitted.
+    ///
+    /// `io` / `rejects_opts` / `stats_opts` / `read_group` are `#[arg(skip)]`
+    /// data carriers on `MultiSimplexOptions`, so their values come from each
+    /// carrier's own `Default` rather than from `base` — `base.io.input` /
+    /// `base.io.output` are real paths (`-i`/`-o` are required), while
+    /// `multi.io.input` / `multi.io.output` are the empty `PathBuf` default.
+    /// Every other carrier sub-field is unset on both sides and does compare
+    /// equal.
+    #[test]
+    fn multi_simplex_options_defaults_match_command() {
+        let base =
+            Simplex::try_parse_from(["simplex", "-i", "in.bam", "-o", "o.bam", "--min-reads", "3"])
+                .expect("parses")
+                .to_simplex_options();
+        let multi = PrefixedSimplex::try_parse_from(["x", "--simplex::min-reads", "3"])
+            .expect("parses")
+            .opts
+            .validate()
+            .expect("valid");
+
+        // Anchor field: both sides were fed the same non-default value.
+        assert_eq!(multi.min_reads, 3);
+        assert_eq!(multi.min_reads, base.min_reads);
+
+        // Every other projected field must sit at its default on both sides.
+        assert_eq!(multi.error_rate_pre_umi, base.error_rate_pre_umi);
+        assert_eq!(multi.error_rate_post_umi, base.error_rate_post_umi);
+        assert_eq!(multi.min_input_base_quality, base.min_input_base_quality);
+        assert_eq!(multi.output_per_base_tags, base.output_per_base_tags);
+        assert_eq!(multi.trim, base.trim);
+        assert_eq!(multi.min_consensus_base_quality, base.min_consensus_base_quality);
+        assert_eq!(multi.tie_rule, base.tie_rule);
+        assert_eq!(multi.consensus_call_overlapping_bases, base.consensus_call_overlapping_bases);
+        assert_eq!(multi.max_reads, base.max_reads);
+        assert_eq!(multi.methylation_mode, base.methylation_mode);
+        assert_eq!(multi.reference, base.reference);
+
+        assert_eq!(multi.allow_unmapped.enabled, base.allow_unmapped.enabled);
+        assert_eq!(multi.io.async_reader, base.io.async_reader);
+        assert_eq!(multi.io.check_crc, base.io.check_crc);
+        assert_eq!(multi.io.no_check_crc, base.io.no_check_crc);
+        assert_eq!(multi.rejects_opts.rejects, base.rejects_opts.rejects);
+        assert_eq!(multi.stats_opts.stats, base.stats_opts.stats);
+        assert_eq!(multi.read_group.read_group_id, base.read_group.read_group_id);
+        assert_eq!(multi.read_group.read_name_prefix, base.read_group.read_name_prefix);
+    }
+
+    /// A prefixed flag must round-trip through `MultiSimplexOptions::validate`.
+    #[test]
+    fn multi_simplex_options_round_trips_max_reads() {
+        let multi = PrefixedSimplex::try_parse_from([
+            "x",
+            "--simplex::min-reads",
+            "1",
+            "--simplex::max-reads",
+            "50",
+        ])
+        .expect("parses")
+        .opts
+        .validate()
+        .expect("valid");
+        assert_eq!(multi.max_reads, Some(50));
+    }
+
+    /// `--simplex::min-reads` has no default on the standalone command, so the
+    /// macro must lift it to a staged-required field: omitting it must parse
+    /// fine (staged validation, not clap, owns the requirement) but fail
+    /// `validate()`.
+    #[test]
+    fn multi_simplex_options_min_reads_is_staged_required() {
+        let parsed = PrefixedSimplex::try_parse_from(["x"]).expect("parse is staged, not clap");
+        let err = parsed.opts.validate().expect_err("min-reads must be required");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--simplex::min-reads is required"),
+            "error should name --simplex::min-reads: {msg}"
+        );
     }
 }
