@@ -738,6 +738,19 @@ impl Default for GroupOptions {
     }
 }
 
+impl GroupOptions {
+    /// Resolve the effective grouping strategy/edits: `--no-umi` forces
+    /// Identity/0; Identity forces edits 0; otherwise the requested pair.
+    #[must_use]
+    pub fn resolve_strategy_and_edits(&self) -> (Strategy, u32) {
+        if self.no_umi {
+            return (Strategy::Identity, 0);
+        }
+        let edits = if matches!(self.strategy, Strategy::Identity) { 0 } else { self.edits };
+        (self.strategy, edits)
+    }
+}
+
 impl GroupReadsByUmi {
     /// The minimum mapping quality to apply, defaulting when the flag is absent.
     #[must_use]
@@ -1484,6 +1497,24 @@ mod tests {
         cmd.no_umi = no_umi;
 
         assert_eq!(cmd.resolve_strategy_and_edits(), (expected_strategy, expected_edits));
+    }
+
+    /// [`GroupOptions::resolve_strategy_and_edits`] applies the same `--no-umi`
+    /// and identity-implies-zero-edits rules as [`GroupReadsByUmi::resolve_strategy_and_edits`],
+    /// but reads them from the already-projected `GroupOptions` fields, which
+    /// `runall`'s future stage config needs without going through the CLI struct.
+    #[rstest]
+    #[case::adjacency(false, Strategy::Adjacency, 2, (Strategy::Adjacency, 2))]
+    #[case::identity_forces_zero_edits(false, Strategy::Identity, 2, (Strategy::Identity, 0))]
+    #[case::no_umi_forces_identity(true, Strategy::Adjacency, 5, (Strategy::Identity, 0))]
+    fn group_options_resolve_strategy_and_edits(
+        #[case] no_umi: bool,
+        #[case] strategy: Strategy,
+        #[case] edits: u32,
+        #[case] expected: (Strategy, u32),
+    ) {
+        let o = GroupOptions { strategy, edits, no_umi, ..GroupOptions::default() };
+        assert_eq!(o.resolve_strategy_and_edits(), expected);
     }
 
     /// `--min-map-q` is optional on the command line but not optional for
