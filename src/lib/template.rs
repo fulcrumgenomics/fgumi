@@ -1064,6 +1064,8 @@ impl MemoryEstimate for Template {
 
 #[cfg(test)]
 #[allow(clippy::similar_names)]
+// rstest case tables pass one param per field, tripping `too_many_arguments` on the generated fns.
+#[allow(clippy::too_many_arguments)]
 mod tests {
     use super::*;
     use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags as raw_flags};
@@ -1874,6 +1876,185 @@ mod tests {
         assert_eq!(compute_insert_size_from_ends(huge, at_max), 1);
     }
 
+    /// Parses a CIGAR string (e.g. `"35S86M30S"`) into encoded BAM ops for tests.
+    ///
+    /// Supports the operators used by the insert-size matrix below: `M`, `I`, `D`, `N`, `S`.
+    fn cigar_string_to_ops(cigar: &str) -> Vec<u32> {
+        use fgumi_raw_bam::testutil::encode_op;
+        let mut ops = Vec::new();
+        let mut len = 0usize;
+        for ch in cigar.chars() {
+            if let Some(digit) = ch.to_digit(10) {
+                len = len * 10 + digit as usize;
+            } else {
+                let op_code = match ch {
+                    'M' => 0,
+                    'I' => 1,
+                    'D' => 2,
+                    'N' => 3,
+                    'S' => 4,
+                    other => panic!("unsupported CIGAR op '{other}' in test CIGAR '{cigar}'"),
+                };
+                ops.push(encode_op(op_code, len));
+                len = 0;
+            }
+        }
+        ops
+    }
+
+    /// Query-consuming length of a CIGAR (`M`/`I`/`S`/`=`/`X`), used to size SEQ/QUAL.
+    fn cigar_query_len(ops: &[u32]) -> usize {
+        ops.iter()
+            .map(|&op| {
+                let (op_code, op_len) = (op & 0xf, (op >> 4) as usize);
+                match op_code {
+                    0 | 1 | 4 | 7 | 8 => op_len,
+                    _ => 0,
+                }
+            })
+            .sum()
+    }
+
+    /// Builds a mapped primary record with a given 1-based POS and CIGAR on ref 0.
+    ///
+    /// SEQ/QUAL are sized to the CIGAR's query length so the record is self-consistent; the
+    /// input TLEN is left 0 so [`Template::fix_mate_info`] recomputes it from scratch.
+    fn build_mapped_for_insert_size(
+        name: &[u8],
+        flags: u16,
+        pos_1based: i32,
+        cigar: &str,
+    ) -> RawRecord {
+        let ops = cigar_string_to_ops(cigar);
+        let query_len = cigar_query_len(&ops);
+        let mut builder = RawSamBuilder::new();
+        builder
+            .read_name(name)
+            .sequence(&vec![b'A'; query_len])
+            .qualities(&vec![30u8; query_len])
+            .flags(flags)
+            .ref_id(0)
+            .pos(pos_1based - 1)
+            .mapq(60)
+            .template_length(0)
+            .cigar_ops(&ops);
+        builder.build()
+    }
+
+    /// Pins `fix_mate_info`'s primary-pair TLEN against htsjdk across a broad matrix of insert
+    /// sizes and orientations, exercising the full `insert_size_end` path from real CIGARs (the
+    /// soft-clip / strand / 5'-end selection that plain `InsertSizeEnd::new` cases skip).
+    ///
+    /// **Oracle.** Every `expected_r1_tlen` / `expected_r2_tlen` was produced by htsjdk
+    /// `SamPairUtil.setMateInfo` via `fgbio SetMateInformation` 4.1.0 on the identical record
+    /// pair — the same code path fgbio `ZipperBams` uses and that `fgumi zipper` matches by
+    /// design. fgumi must reproduce these exactly; a mismatch is a real divergence from
+    /// fgbio/htsjdk parity, not a test to relax.
+    ///
+    /// **Relationship to samtools (issue #902).** For a proper FR pair htsjdk and
+    /// `samtools fixmate` agree, and 30 of these cases do. They diverge only when the aligned
+    /// 5' anchors are not in FR order: crossed-anchor / dovetail and RF pairs by ±2
+    /// (`issue902_*`, `dovetail_*`, `rf_gap*`, `fr_overlap_r2at900`, `r2_left_fr`), and
+    /// same-strand tandem pairs by ±1 (`ff_gap*`, `rr_gap*`). That divergence is a documented
+    /// htsjdk-vs-samtools convention difference (SAM leaves TLEN unspecified for overlapping
+    /// pairs); fgumi intentionally follows htsjdk. These cases therefore also lock in the #902
+    /// behavior as intended: were fgumi to drift toward samtools, they would fail here.
+    #[rstest]
+    // --- Group A: canonical FR (r1 fwd left, r2 rev right), no clips, sweep insert size.
+    #[case::fr_ins_gap400(1000, "100M", false, 1400, "100M", true, 500, -500)]
+    #[case::fr_ins_gap300(1000, "100M", false, 1300, "100M", true, 400, -400)]
+    #[case::fr_ins_gap200(1000, "100M", false, 1200, "100M", true, 300, -300)]
+    #[case::fr_ins_gap150(1000, "100M", false, 1150, "100M", true, 250, -250)]
+    #[case::fr_ins_gap100(1000, "100M", false, 1100, "100M", true, 200, -200)]
+    #[case::fr_ins_gap50(1000, "100M", false, 1050, "100M", true, 150, -150)]
+    #[case::fr_ins_gap25(1000, "100M", false, 1025, "100M", true, 125, -125)]
+    #[case::fr_ins_gap10(1000, "100M", false, 1010, "100M", true, 110, -110)]
+    #[case::fr_ins_gap5(1000, "100M", false, 1005, "100M", true, 105, -105)]
+    #[case::fr_ins_gap1(1000, "100M", false, 1001, "100M", true, 101, -101)]
+    #[case::fr_ins_gap0(1000, "100M", false, 1000, "100M", true, 100, -100)]
+    #[case::fr_overlap_r2at1080(1000, "100M", false, 1080, "100M", true, 180, -180)]
+    #[case::fr_overlap_r2at1050(1000, "100M", false, 1050, "100M", true, 150, -150)]
+    #[case::fr_overlap_r2at1000(1000, "100M", false, 1000, "100M", true, 100, -100)]
+    #[case::fr_overlap_r2at980(1000, "100M", false, 980, "100M", true, 80, -80)]
+    #[case::fr_overlap_r2at950(1000, "100M", false, 950, "100M", true, 50, -50)]
+    // Forward 5' right of reverse 5' -> anchors crossed even at "FR" flags; ±2 vs samtools.
+    #[case::fr_overlap_r2at900(1000, "100M", false, 900, "100M", true, -2, 2)]
+    // --- Group B: FR with soft-clips (5', 3', both) at a fixed short insert.
+    #[case::fr_clip5_fwd(1000, "20S80M", false, 1060, "100M", true, 160, -160)]
+    #[case::fr_clip3_fwd(1000, "80M20S", false, 1060, "100M", true, 160, -160)]
+    #[case::fr_clip_both_fwd(1000, "10S80M10S", false, 1060, "100M", true, 160, -160)]
+    #[case::fr_clip5_rev(1000, "100M", false, 1060, "20S80M", true, 140, -140)]
+    #[case::fr_clip3_rev(1000, "100M", false, 1060, "80M20S", true, 140, -140)]
+    #[case::fr_clip_both_both(1000, "10S80M10S", false, 1060, "10S80M10S", true, 140, -140)]
+    // --- Group C: the #902 dovetail family (both mates 5'-soft-clipped, anchors crossed).
+    #[case::issue902_exact(1000, "35S86M30S", true, 1100, "21S51M79S", false, 16, -16)]
+    #[case::issue902_cross1(1000, "35S86M30S", true, 1085, "21S51M79S", false, 1, -1)]
+    #[case::issue902_cross2(1000, "35S86M30S", true, 1084, "21S51M79S", false, -2, 2)]
+    #[case::issue902_cross3(1000, "35S86M30S", true, 1090, "21S51M79S", false, 6, -6)]
+    #[case::dovetail_small_a(1000, "3S6M2S", true, 1018, "2S5M3S", false, 14, -14)]
+    #[case::dovetail_small_b(1000, "3S6M2S", true, 1016, "2S5M3S", false, 12, -12)]
+    // --- Group D: RF (outie): r1 reverse left, r2 forward right.
+    #[case::rf_gap200(1000, "100M", true, 1200, "100M", false, 102, -102)]
+    #[case::rf_gap100(1000, "100M", true, 1100, "100M", false, 2, -2)]
+    #[case::rf_gap50(1000, "100M", true, 1050, "100M", false, -50, 50)]
+    #[case::rf_gap10(1000, "100M", true, 1010, "100M", false, -90, 90)]
+    // --- Group E: tandem (same strand) FF and RR, sweep separation.
+    #[case::ff_gap300(1000, "100M", false, 1300, "100M", false, 301, -301)]
+    #[case::ff_gap100(1000, "100M", false, 1100, "100M", false, 101, -101)]
+    #[case::ff_gap50(1000, "100M", false, 1050, "100M", false, 51, -51)]
+    #[case::ff_gap10(1000, "100M", false, 1010, "100M", false, 11, -11)]
+    #[case::ff_gap1(1000, "100M", false, 1001, "100M", false, 2, -2)]
+    #[case::ff_gap0(1000, "100M", false, 1000, "100M", false, 1, -1)]
+    #[case::rr_gap300(1000, "100M", true, 1300, "100M", true, 301, -301)]
+    #[case::rr_gap100(1000, "100M", true, 1100, "100M", true, 101, -101)]
+    #[case::rr_gap50(1000, "100M", true, 1050, "100M", true, 51, -51)]
+    #[case::rr_gap10(1000, "100M", true, 1010, "100M", true, 11, -11)]
+    #[case::rr_gap1(1000, "100M", true, 1001, "100M", true, 2, -2)]
+    #[case::rr_gap0(1000, "100M", true, 1000, "100M", true, 1, -1)]
+    // --- Group F: edge cases.
+    #[case::coincident_5p_fr(1000, "100M", false, 901, "100M", true, 1, -1)]
+    #[case::r2_left_fr(1000, "100M", false, 800, "100M", true, -102, 102)]
+    #[case::unequal_len_fr(1000, "150M", false, 1060, "60M", true, 120, -120)]
+    #[case::with_indels_fr(1000, "50M5I45M", false, 1060, "40M5D60M", true, 165, -165)]
+    #[case::large_insert_fr(1000, "100M", false, 1900, "100M", true, 1000, -1000)]
+    fn test_fix_mate_info_tlen_matches_htsjdk_across_orientations(
+        #[case] r1_pos: i32,
+        #[case] r1_cigar: &str,
+        #[case] r1_rev: bool,
+        #[case] r2_pos: i32,
+        #[case] r2_cigar: &str,
+        #[case] r2_rev: bool,
+        #[case] expected_r1_tlen: i32,
+        #[case] expected_r2_tlen: i32,
+    ) -> Result<()> {
+        let r1_flags = FLAG_PAIRED
+            | FLAG_READ1
+            | if r1_rev { FLAG_REVERSE } else { 0 }
+            | if r2_rev { FLAG_MATE_REVERSE } else { 0 };
+        let r2_flags = FLAG_PAIRED
+            | FLAG_READ2
+            | if r2_rev { FLAG_REVERSE } else { 0 }
+            | if r1_rev { FLAG_MATE_REVERSE } else { 0 };
+
+        let r1 = build_mapped_for_insert_size(b"pair", r1_flags, r1_pos, r1_cigar);
+        let r2 = build_mapped_for_insert_size(b"pair", r2_flags, r2_pos, r2_cigar);
+
+        let mut template = Template::from_records(vec![r1, r2])?;
+        template.fix_mate_info()?;
+
+        assert_eq!(
+            template.records()[0].template_length(),
+            expected_r1_tlen,
+            "R1 TLEN mismatch vs htsjdk",
+        );
+        assert_eq!(
+            template.records()[1].template_length(),
+            expected_r2_tlen,
+            "R2 TLEN mismatch vs htsjdk",
+        );
+        Ok(())
+    }
+
     /// Tests that `fix_mate_info` recalculates TLEN for supplementaries based on primary positions
     #[test]
     fn test_fix_mate_info_tlen_recalculated() -> Result<()> {
@@ -2536,121 +2717,64 @@ mod tests {
 
     // ==================== pair_orientation tests ====================
 
-    /// Test FR pair: R1 forward at pos 100, R2 reverse at pos 200 (positive insert size)
-    /// This matches htsjdk's test case for getPairOrientation
-    #[test]
-    fn test_pair_orientation_fr_pair() -> Result<()> {
-        // R1: forward strand at pos 100, mate (R2) is reverse at pos 200
-        // positive 5' = 100 (R1 start), negative 5' = 100 + 200 = 300
-        // 100 < 300 => FR
-        let r1 = create_mapped_record_with_flags(
-            b"read1",
-            FLAG_PAIRED | FLAG_READ1 | FLAG_MATE_REVERSE,
-            100,
-            30,
-            200, // positive TLEN for FR
-            Some(0),
-            Some(200),
+    /// Ports htsjdk `SamPairUtilTest.testGetPairOrientation` verbatim: its 15-vector data
+    /// provider, run through the same flow (populate mate info first, then classify).
+    ///
+    /// Each case gives `(read1Start, read1Length, read1Reverse, read2Start, read2Length,
+    /// read2Reverse)` and the expected orientation. htsjdk builds both reads, calls
+    /// `SamPairUtil.setMateInfo(rec1, rec2, true)`, then asserts `getPairOrientation` on each
+    /// end; here `fix_mate_info` is the `setMateInfo` equivalent (it populates mate positions,
+    /// mate-strand flags, and TLEN that `pair_orientation` reads), so the reads are built with
+    /// only their own strand set. Case labels are htsjdk's own test names.
+    #[rstest]
+    #[case::normal_innie(1, 100, false, 500, 100, true, PairOrientation::FR)]
+    #[case::overlapping_innie(1, 100, false, 50, 100, true, PairOrientation::FR)]
+    #[case::second_end_enclosed_innie(1, 100, false, 50, 50, true, PairOrientation::FR)]
+    #[case::first_end_enclosed_innie(1, 50, false, 1, 100, true, PairOrientation::FR)]
+    #[case::completely_overlapping_innie(1, 100, false, 1, 100, true, PairOrientation::FR)]
+    #[case::normal_outie(1, 100, true, 500, 100, false, PairOrientation::RF)]
+    #[case::nojump_outie(1, 100, true, 101, 100, false, PairOrientation::RF)]
+    #[case::forward_tandem(1, 100, true, 500, 100, true, PairOrientation::Tandem)]
+    #[case::reverse_tandem(1, 100, false, 500, 100, false, PairOrientation::Tandem)]
+    #[case::overlapping_forward_tandem(1, 100, true, 50, 100, true, PairOrientation::Tandem)]
+    #[case::overlapping_reverse_tandem(1, 100, false, 50, 100, false, PairOrientation::Tandem)]
+    #[case::second_end_enclosed_forward_tandem(1, 100, true, 50, 50, true, PairOrientation::Tandem)]
+    #[case::second_end_enclosed_reverse_tandem(
+        1,
+        100,
+        false,
+        50,
+        50,
+        false,
+        PairOrientation::Tandem
+    )]
+    #[case::first_end_enclosed_forward_tandem(1, 50, true, 1, 100, true, PairOrientation::Tandem)]
+    #[case::first_end_enclosed_reverse_tandem(1, 50, false, 1, 100, false, PairOrientation::Tandem)]
+    fn test_get_pair_orientation_matches_htsjdk(
+        #[case] r1_start: i32,
+        #[case] r1_length: usize,
+        #[case] r1_reverse: bool,
+        #[case] r2_start: i32,
+        #[case] r2_length: usize,
+        #[case] r2_reverse: bool,
+        #[case] expected: PairOrientation,
+    ) -> Result<()> {
+        let r1 = build_mapped_for_insert_size(
+            b"pair",
+            FLAG_PAIRED | FLAG_READ1 | if r1_reverse { FLAG_REVERSE } else { 0 },
+            r1_start,
+            &format!("{r1_length}M"),
         );
-        let r2 = create_mapped_record_with_flags(
-            b"read1",
-            FLAG_PAIRED | FLAG_READ2 | FLAG_REVERSE,
-            200,
-            30,
-            -200,
-            Some(0),
-            Some(100),
-        );
-
-        let template = Template::from_records(vec![r1, r2])?;
-        assert_eq!(template.pair_orientation(), Some(PairOrientation::FR));
-        Ok(())
-    }
-
-    /// Test RF pair: R1 forward but positioned after mate's 5' end
-    /// This is an "outie" pair
-    #[test]
-    fn test_pair_orientation_rf_pair() -> Result<()> {
-        // R1: forward at pos 300, R2: reverse at pos 100
-        // positive 5' = 300 (R1 start), negative 5' = 300 + (-200) = 100
-        // 300 >= 100 => RF
-        let r1 = create_mapped_record_with_flags(
-            b"read1",
-            FLAG_PAIRED | FLAG_READ1 | FLAG_MATE_REVERSE,
-            300,
-            30,
-            -200, // negative TLEN for RF
-            Some(0),
-            Some(100),
-        );
-        let r2 = create_mapped_record_with_flags(
-            b"read1",
-            FLAG_PAIRED | FLAG_READ2 | FLAG_REVERSE,
-            100,
-            30,
-            200,
-            Some(0),
-            Some(300),
+        let r2 = build_mapped_for_insert_size(
+            b"pair",
+            FLAG_PAIRED | FLAG_READ2 | if r2_reverse { FLAG_REVERSE } else { 0 },
+            r2_start,
+            &format!("{r2_length}M"),
         );
 
-        let template = Template::from_records(vec![r1, r2])?;
-        assert_eq!(template.pair_orientation(), Some(PairOrientation::RF));
-        Ok(())
-    }
-
-    /// Test TANDEM pair: both reads on forward strand
-    #[test]
-    fn test_pair_orientation_tandem_both_forward() -> Result<()> {
-        // Both R1 and R2 on forward strand => TANDEM
-        let r1 = create_mapped_record_with_flags(
-            b"read1",
-            FLAG_PAIRED | FLAG_READ1, // forward, mate also forward (no MATE_REVERSE)
-            100,
-            30,
-            100,
-            Some(0),
-            Some(200),
-        );
-        let r2 = create_mapped_record_with_flags(
-            b"read1",
-            FLAG_PAIRED | FLAG_READ2, // forward
-            200,
-            30,
-            -100,
-            Some(0),
-            Some(100),
-        );
-
-        let template = Template::from_records(vec![r1, r2])?;
-        assert_eq!(template.pair_orientation(), Some(PairOrientation::Tandem));
-        Ok(())
-    }
-
-    /// Test TANDEM pair: both reads on reverse strand
-    #[test]
-    fn test_pair_orientation_tandem_both_reverse() -> Result<()> {
-        // Both R1 and R2 on reverse strand => TANDEM
-        let r1 = create_mapped_record_with_flags(
-            b"read1",
-            FLAG_PAIRED | FLAG_READ1 | FLAG_REVERSE | FLAG_MATE_REVERSE,
-            100,
-            30,
-            100,
-            Some(0),
-            Some(200),
-        );
-        let r2 = create_mapped_record_with_flags(
-            b"read1",
-            FLAG_PAIRED | FLAG_READ2 | FLAG_REVERSE | FLAG_MATE_REVERSE,
-            200,
-            30,
-            -100,
-            Some(0),
-            Some(100),
-        );
-
-        let template = Template::from_records(vec![r1, r2])?;
-        assert_eq!(template.pair_orientation(), Some(PairOrientation::Tandem));
+        let mut template = Template::from_records(vec![r1, r2])?;
+        template.fix_mate_info()?;
+        assert_eq!(template.pair_orientation(), Some(expected));
         Ok(())
     }
 
