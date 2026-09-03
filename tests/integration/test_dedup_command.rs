@@ -39,7 +39,17 @@ fn create_sorted_bam(path: &Path, records: Vec<RawRecord>) {
 /// Create a group of paired-end reads at the same position with the same UMI
 /// (simulating PCR duplicates).
 fn create_duplicate_group(base_name: &str, umi: &str, count: usize, start: i32) -> Vec<RawRecord> {
-    create_duplicate_group_inner(base_name, umi, count, start, None, 60)
+    create_duplicate_group_inner(base_name, umi, count, start, None, 60, 30)
+}
+
+/// A single paired-end template (R1 + R2) at `start` with UMI `umi`, every base
+/// at quality `base_qual`. `dedup` scores a template by the sum of its primary
+/// reads' base qualities, so building several same-coordinate/same-UMI templates
+/// with *distinct* `base_qual`s makes which one wins the representative slot (and
+/// which are marked duplicate) deterministic — the unique maximum wins, with no
+/// score tie whose resolution would depend on stream order.
+fn create_template_qual(name: &str, umi: &str, start: i32, base_qual: u8) -> Vec<RawRecord> {
+    create_duplicate_group_inner(name, umi, 1, start, None, 60, base_qual)
 }
 
 /// Like [`create_duplicate_group`] but with an explicit `mapq`, so a fixture can
@@ -52,7 +62,7 @@ fn create_duplicate_group_mapq(
     start: i32,
     mapq: u8,
 ) -> Vec<RawRecord> {
-    create_duplicate_group_inner(base_name, umi, count, start, None, mapq)
+    create_duplicate_group_inner(base_name, umi, count, start, None, mapq, 30)
 }
 
 /// Shared implementation for [`create_duplicate_group`] and
@@ -68,6 +78,7 @@ fn create_duplicate_group_inner(
     start: i32,
     rg_id: Option<&str>,
     mapq: u8,
+    base_qual: u8,
 ) -> Vec<RawRecord> {
     let mut records = Vec::new();
     for i in 0..count {
@@ -77,7 +88,7 @@ fn create_duplicate_group_inner(
             let mut b = SamBuilder::new();
             b.read_name(name.as_bytes())
                 .sequence(b"ACGTACGT")
-                .qualities(&[30; 8])
+                .qualities(&[base_qual; 8])
                 .flags(flags::PAIRED | flags::FIRST_SEGMENT)
                 .ref_id(0)
                 .pos(start - 1)
@@ -98,7 +109,7 @@ fn create_duplicate_group_inner(
             let mut b = SamBuilder::new();
             b.read_name(name.as_bytes())
                 .sequence(b"ACGTACGT")
-                .qualities(&[30; 8])
+                .qualities(&[base_qual; 8])
                 .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
                 .ref_id(0)
                 .pos(start + 99)
@@ -404,7 +415,7 @@ fn create_duplicate_group_with_rg(
     start: i32,
     rg_id: &str,
 ) -> Vec<RawRecord> {
-    create_duplicate_group_inner(base_name, umi, count, start, Some(rg_id), 60)
+    create_duplicate_group_inner(base_name, umi, count, start, Some(rg_id), 60, 30)
 }
 
 /// Shared implementation for [`create_sorted_bam`]: writes `records` against the
@@ -2303,5 +2314,171 @@ fn test_dedup_threaded_duplication_ladder_parity() {
         read_deduped_records(&oracle_out),
         read_deduped_records(&chain_out),
         "output records diverged between the chain and non-chain paths"
+    );
+}
+
+/// Complement to the `group` #901 regression, on a fixture that exercises the
+/// full PCR-duplicate marking contract rather than mere retention. `dedup` must:
+///
+/// 1. Mark the correct read in each duplicate family: the representative (highest
+///    base-quality template) is kept unflagged and every other template in the
+///    family gets the `PCR/optical duplicate` flag (`0x400`).
+/// 2. *Retain* a `tc`-keyed secondary/supplementary read (the opposite of `group`,
+///    which filters it) and propagate its primary's duplicate status onto it —
+///    guarding against a regression that hoists the secondary/supplementary filter
+///    above the `include_secondary_supplementary` guard, or that marks primaries
+///    but skips the coalesced non-primary record.
+///
+/// The fixture is 10 paired templates across four independent duplicate families
+/// (distinct coordinate + UMI, so they never cross-contaminate) of sizes 1, 4, 3,
+/// and 2. Within each family every template gets a *distinct* base quality, so the
+/// representative is the unique maximum — deterministic, with no score tie whose
+/// resolution would depend on stream order. Every one of the 20 primary reads is
+/// asserted to carry exactly the flag its family membership dictates. The flagged
+/// alignment is attached to a marked duplicate (`famD_dup`), so its output flag
+/// pins the propagation this test's ancestor could not: the single-template
+/// fixture it replaced never marked any record duplicate.
+#[rstest]
+#[case::secondary(flags::SECONDARY)]
+#[case::supplementary(flags::SUPPLEMENTARY)]
+fn test_dedup_marks_families_and_flags_tc_keyed_secondary_supplementary(#[case] extra_flag: u16) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    // Four duplicate families at distinct coordinates and UMIs, of sizes 1/4/3/2.
+    // Each entry is (UMI, start position, templates), where a template is a
+    // (QNAME base, base quality) pair — `create_template_qual` builds one template
+    // per pair, named `{base}_0`. Within a family the unique top quality (40) is the
+    // representative and the rest (35/30/25) are marked duplicate.
+    #[expect(clippy::type_complexity, reason = "an inline fixture table of duplicate families")]
+    let families: [(&str, i32, &[(&str, u8)]); 4] = [
+        // Family A: a lone template — a singleton is never a duplicate.
+        ("AAAAAAAA", 100, &[("famA_rep", 40)]),
+        // Family B: 4 templates -> 1 kept + 3 marked.
+        (
+            "CCCCCCCC",
+            500,
+            &[("famB_rep", 40), ("famB_dup0", 35), ("famB_dup1", 30), ("famB_dup2", 25)],
+        ),
+        // Family C: 3 templates -> 1 kept + 2 marked.
+        ("GGGGGGGG", 900, &[("famC_rep", 40), ("famC_dup0", 35), ("famC_dup1", 30)]),
+        // Family D: 2 templates -> 1 kept + 1 marked. This is the highest
+        // coordinate, so family D's reads sort last; the flagged alignment below
+        // (own position 5000, past every primary) sorts to the very end and
+        // coalesces — by QNAME adjacency — onto whichever family-D primary sorts
+        // last. `famD_dup` is named so it sorts after `famD_rep` (the
+        // template-coordinate tie-break below the shared coordinate is `name_hash`,
+        // not lexicographic), making the marked duplicate the trailing record. If
+        // that ordering ever changes, the flagged read coalesces onto the wrong
+        // primary (or is dropped) and the assertions below fail loudly.
+        ("TTTTTTTT", 1300, &[("famD_rep", 40), ("famD_dup", 35)]),
+    ];
+
+    // Names that must be kept (representatives) vs. marked duplicate, derived from
+    // the family table so the expectation and the fixture cannot drift.
+    let mut expected_kept: Vec<String> = Vec::new();
+    let mut expected_duplicate: Vec<String> = Vec::new();
+    let mut records = Vec::new();
+    for (umi, start, templates) in families {
+        // Representative = the unique maximum base quality in the family.
+        let rep_qual = templates.iter().map(|&(_, q)| q).max().expect("family is non-empty");
+        for &(name, qual) in templates {
+            records.extend(create_template_qual(name, umi, start, qual));
+            let read_name = format!("{name}_0");
+            if qual == rep_qual {
+                expected_kept.push(read_name);
+            } else {
+                expected_duplicate.push(read_name);
+            }
+        }
+    }
+
+    // A `tc`-keyed secondary/supplementary alignment of `famD_dup` (a marked
+    // duplicate). Its `tc` tag carries family D's template coordinate — R1 fwd
+    // unclipped-5' = 1300, R2 rev unclipped-5' = 1407 -> [0,1300,0,0,1407,1] — the
+    // resolved key dedup uses to place it in family D's molecule. dedup coalesces
+    // it into `famD_dup`'s template, where it must inherit that template's
+    // duplicate flag.
+    let supp_primary = "famD_dup_0";
+    let mut supp = SamBuilder::new();
+    supp.read_name(supp_primary.as_bytes())
+        .sequence(b"ACGTACGT")
+        .qualities(&[30; 8])
+        .flags(flags::PAIRED | flags::FIRST_SEGMENT | extra_flag)
+        .ref_id(0)
+        .pos(5000)
+        .mapq(60)
+        .cigar_ops(&[8u32 << 4])
+        .mate_ref_id(0)
+        .mate_pos(1399)
+        .add_string_tag(SamTag::RX, b"TTTTTTTT")
+        .add_string_tag(SamTag::MC, b"8M")
+        .add_array_i32(SamTag::TC, &[0, 1300, 0, 0, 1407, 1]);
+    records.push(supp.build());
+
+    create_sorted_bam(&input_bam, records);
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("dedup should succeed");
+
+    // Collect the full output: primary reads keyed by QNAME -> the duplicate flag on
+    // each of that template's records (R1 and R2 must agree), plus the retained
+    // secondary/supplementary alignment.
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let header = reader.read_header().unwrap();
+    let mut primary_flags: std::collections::HashMap<String, Vec<bool>> =
+        std::collections::HashMap::new();
+    let mut secondary_supplementary: Vec<(String, bool)> = Vec::new();
+    let mut total = 0usize;
+    for record in reader.record_bufs(&header) {
+        let record = record.expect("read dedup output record");
+        let flag = record.flags();
+        let name = record.name().map(ToString::to_string).expect("output record has a name");
+        total += 1;
+        if flag.is_secondary() || flag.is_supplementary() {
+            secondary_supplementary.push((name, flag.is_duplicate()));
+        } else {
+            primary_flags.entry(name).or_default().push(flag.is_duplicate());
+        }
+    }
+
+    // 10 templates * 2 mates + 1 flagged alignment, nothing removed (mark mode).
+    assert_eq!(total, 21, "mark mode retains all 20 primary reads plus the flagged alignment");
+    assert_eq!(primary_flags.len(), 10, "every one of the 10 templates must be present by QNAME");
+
+    // Every primary template carries exactly the flag its family membership dictates,
+    // on BOTH mates — checked read-by-read, not merely by count.
+    for name in &expected_kept {
+        assert_eq!(
+            primary_flags.get(name).map(Vec::as_slice),
+            Some([false, false].as_slice()),
+            "representative {name} must keep both mates unflagged"
+        );
+    }
+    for name in &expected_duplicate {
+        assert_eq!(
+            primary_flags.get(name).map(Vec::as_slice),
+            Some([true, true].as_slice()),
+            "duplicate {name} must have the PCR-duplicate flag on both mates"
+        );
+    }
+
+    // The flagged alignment is retained, belongs to its `famD_dup` primary, and
+    // inherits that primary's duplicate flag — the propagation this test pins.
+    assert_eq!(
+        secondary_supplementary,
+        vec![(supp_primary.to_string(), true)],
+        "the tc-keyed sec/supp read must be retained as {supp_primary}'s and marked duplicate"
     );
 }

@@ -368,10 +368,14 @@ impl MemoryEstimate for RawPositionGroup {
 /// [`DecodedRecord`]s with keys from some other source is likewise not
 /// validated; both in-tree producers go through `compute_group_key_from_raw`.
 ///
-/// By default, secondary/supplementary reads are skipped (they have UNKNOWN
-/// position keys). Use [`with_secondary_supplementary`](Self::with_secondary_supplementary)
-/// to include them — they are coalesced by `name_hash` into the group of their
-/// adjacent primary read (requires template-coordinate sorted input).
+/// By default, secondary/supplementary reads are skipped — filtered by their
+/// `SECONDARY`/`SUPPLEMENTARY` flags (not by position key: a `tc` tag on
+/// template-coordinate input gives them a *resolved* key, so the key alone no
+/// longer identifies them — see [`Self::add_record`]). Use
+/// [`with_secondary_supplementary`](Self::with_secondary_supplementary) to
+/// include them — they are then coalesced into their template's group by QNAME
+/// adjacency to the preceding accumulated record (requires template-coordinate
+/// sorted input so each template's reads are contiguous).
 pub struct RecordPositionGrouper {
     /// Current position key being accumulated (tuple for fast comparison).
     current_position_key: Option<PositionKeyTuple>,
@@ -380,9 +384,10 @@ pub struct RecordPositionGrouper {
     /// Records at the current position.
     current_records: Vec<DecodedRecord>,
     /// Whether to include secondary and supplementary reads in groups.
-    /// When true, secondary/supplementary reads (which have UNKNOWN position keys)
-    /// are kept and coalesced by `name_hash` into the group of their primary read.
-    /// When false (default), they are skipped.
+    /// When true, secondary/supplementary reads are kept and coalesced into their
+    /// template's group by QNAME adjacency to the preceding accumulated record.
+    /// When false (default), they are filtered by their `SECONDARY`/`SUPPLEMENTARY`
+    /// flags in [`Self::add_record`].
     include_secondary_supplementary: bool,
 }
 
@@ -402,8 +407,16 @@ impl RecordPositionGrouper {
 
     /// Create a record-level position grouper that includes secondary/supplementary reads.
     ///
-    /// Secondary/supplementary reads have UNKNOWN position keys and are coalesced
-    /// by `name_hash` into the group of their adjacent primary read.
+    /// Secondary/supplementary reads may carry a name-only key or, on
+    /// template-coordinate input carrying a `tc` tag, a resolved position key.
+    /// Either way they are coalesced into their template's group by QNAME match
+    /// against the preceding accumulated record — coalescing is driven by that
+    /// stream adjacency, independent of whether the key is resolved. A
+    /// secondary/supplementary read that is not stream-adjacent to a same-template
+    /// record would start its own group, so this relies on template-coordinate
+    /// ordering keeping each template's reads contiguous. Used by `fgumi dedup`,
+    /// which must retain these reads so its duplicate flag propagates across split
+    /// alignments.
     #[must_use]
     pub fn with_secondary_supplementary() -> Self {
         Self { include_secondary_supplementary: true, ..Self::new() }
@@ -467,10 +480,23 @@ impl RecordPositionGrouper {
 
     /// Process a single decoded record, potentially emitting a completed group.
     fn process_record(&mut self, decoded: DecodedRecord) -> io::Result<Option<RawPositionGroup>> {
-        // Skip secondary and supplementary reads (they have UNKNOWN ref_id1)
-        // unless configured to include them (for dedup, which needs them in templates).
-        if decoded.key.ref_id1 == GroupKey::UNKNOWN_REF && !self.include_secondary_supplementary {
-            return Ok(None);
+        // Skip secondary and supplementary reads unless configured to include them
+        // (dedup needs them in templates so its duplicate flag propagates across
+        // split alignments). Filter by the record's own flags rather than by
+        // `ref_id1 == UNKNOWN_REF`: a `tc` tag (stamped by `fgumi zipper` for
+        // template-coordinate ordering) gives a secondary/supplementary read a
+        // *resolved* position key, so `UNKNOWN_REF` no longer identifies it. Left
+        // unfiltered, such a record enters position grouping and — when its key
+        // differs from a neighboring group's — breaks the streaming grouper's
+        // contiguity assumption, splitting one molecule across groups and inflating
+        // the reported molecule count (issue #901). The `UNKNOWN_REF` skip is
+        // retained for records that resolve to a name-only key for other reasons.
+        if !self.include_secondary_supplementary {
+            let record = decoded.record();
+            let is_secondary_or_supplementary = record.is_secondary() || record.is_supplementary();
+            if is_secondary_or_supplementary || decoded.key.ref_id1 == GroupKey::UNKNOWN_REF {
+                return Ok(None);
+            }
         }
 
         // Validate the mate position resolved during decode (i.e. the MC tag was usable)
@@ -1167,6 +1193,17 @@ mod tests {
         DecodedRecord::from_raw_bytes(b.build(), key)
     }
 
+    /// Helper: create a secondary/supplementary `DecodedRecord` carrying a
+    /// *resolved* position key (real `ref_id1`), as `tc`-tag keying produces for
+    /// template-coordinate input. `flag` selects SECONDARY or SUPPLEMENTARY, and
+    /// `name` sets the read name (its match against a preceding record's name
+    /// drives the dedup-mode QNAME coalescing path).
+    fn make_sec_supp_decoded(flag: u16, name: &[u8], key: GroupKey) -> DecodedRecord {
+        let mut b = RawSamBuilder::new();
+        b.read_name(name).sequence(b"ACGT").qualities(&[30; 4]).flags(flag);
+        DecodedRecord::from_raw_bytes(b.build(), key)
+    }
+
     #[test]
     fn test_record_position_grouper_empty() {
         let mut grouper = RecordPositionGrouper::new();
@@ -1256,6 +1293,117 @@ mod tests {
         let final_group =
             grouper.finish().expect("finish should succeed").expect("should emit final group");
         assert_eq!(final_group.records.len(), 1); // Only primary kept
+    }
+
+    /// Regression test for issue #901: a secondary/supplementary read that carries
+    /// a `tc` tag (stamped by `fgumi zipper` / `fgumi sort` for template-coordinate
+    /// ordering) receives a *resolved* position key — a real `ref_id1`, not the
+    /// `UNKNOWN_REF` the grouper's original skip keyed off. If such a record is not
+    /// filtered it enters position grouping, and when its key differs from a
+    /// neighboring group's it breaks the streaming grouper's contiguity assumption,
+    /// splitting one molecule's reads across two position groups (inflating the
+    /// reported molecule count). It must be dropped by its flags regardless of its
+    /// key, matching fgbio and the documented `fgumi group` behavior.
+    #[rstest]
+    #[case::secondary(raw_flags::SECONDARY)]
+    #[case::supplementary(raw_flags::SUPPLEMENTARY)]
+    fn test_record_position_grouper_skips_tc_keyed_secondary_supplementary(
+        #[case] flag: u16,
+        // The sec/supp read must be dropped by its flags whether its resolved
+        // position key DIFFERS from the primaries' (500 — left unfiltered it would
+        // split the group by breaking stream contiguity) or MATCHES them (100 —
+        // left unfiltered it would instead merge in and inflate the group's record
+        // count). Both must yield the same clean result, so a future skip that is
+        // conditional on the key (e.g. only when it differs) is caught here.
+        #[values(500, 100)] sec_supp_pos: i32,
+    ) {
+        let mut grouper = RecordPositionGrouper::new();
+
+        // Two primary reads at the same position (one molecule's worth of reads),
+        // with a tc-keyed sec/supp read placed between them in the stream. The
+        // distinct name hashes keep the sec/supp read off the unmapped-mate
+        // name-match path so this exercises the flag-based filter specifically.
+        let key_primary1 = GroupKey::single(0, 100, 0, 0, 0, 11111);
+        let key_primary2 = GroupKey::single(0, 100, 0, 0, 0, 22222);
+        let sec_supp_key = GroupKey::single(0, sec_supp_pos, 0, 0, 0, 99999); // real ref_id1
+
+        let primary1 = make_decoded(key_primary1, false, false, None);
+        let sec_supp = make_sec_supp_decoded(flag, b"read2", sec_supp_key);
+        let primary2 = make_decoded(key_primary2, false, false, None);
+
+        let mut groups = grouper
+            .add_records(vec![primary1, sec_supp, primary2])
+            .expect("add_records should succeed");
+        if let Some(final_group) = grouper.finish().expect("finish should succeed") {
+            groups.push(final_group);
+        }
+
+        // Both primaries stay in a single position group; the sec/supp read is
+        // dropped entirely — it neither forms its own group, splits the primaries
+        // across two groups, nor merges into their group.
+        assert_eq!(
+            groups.len(),
+            1,
+            "a filtered secondary/supplementary read must not split the primaries across groups"
+        );
+        assert_eq!(
+            groups[0].records.len(),
+            2,
+            "both primaries must remain in one group, with the sec/supp read excluded"
+        );
+        for group in &groups {
+            for rec in &group.records {
+                let record = rec.record();
+                assert!(
+                    !record.is_secondary() && !record.is_supplementary(),
+                    "no secondary/supplementary record should appear in a group"
+                );
+            }
+        }
+    }
+
+    /// The dedup path (`with_secondary_supplementary`) must do the opposite of the
+    /// `group` path: it *retains* secondary/supplementary reads, coalescing them
+    /// into their template's group so the duplicate flag propagates across split
+    /// alignments. This pins that retention contract for a tc-keyed (resolved-key)
+    /// sec/supp read, so a future change that hoists the flag filter above the
+    /// `!include_secondary_supplementary` guard — silently dropping them for dedup
+    /// — fails here rather than passing an `is_ok()`-only assertion.
+    #[rstest]
+    #[case::secondary(raw_flags::SECONDARY)]
+    #[case::supplementary(raw_flags::SUPPLEMENTARY)]
+    fn test_record_position_grouper_dedup_mode_retains_tc_keyed_secondary_supplementary(
+        #[case] flag: u16,
+    ) {
+        let mut grouper = RecordPositionGrouper::with_secondary_supplementary();
+
+        // Primary then a same-QNAME sec/supp read carrying a *resolved* key that
+        // differs from the primary's position. Coalescing is by QNAME adjacency to
+        // the preceding record, so both must share read name and name_hash.
+        let name_hash = 42424;
+        let primary_key = GroupKey::single(0, 100, 0, 0, 0, name_hash);
+        let sec_supp_key = GroupKey::single(0, 500, 0, 0, 0, name_hash); // resolved, != primary
+
+        let primary = make_decoded(primary_key, false, false, None); // read name "read1"
+        let sec_supp = make_sec_supp_decoded(flag, b"read1", sec_supp_key);
+
+        let mut groups =
+            grouper.add_records(vec![primary, sec_supp]).expect("add_records should succeed");
+        if let Some(final_group) = grouper.finish().expect("finish should succeed") {
+            groups.push(final_group);
+        }
+
+        // The sec/supp read is retained in the primary's group (not dropped, not
+        // split into its own group).
+        assert_eq!(groups.len(), 1, "the sec/supp read must coalesce into the primary's group");
+        assert_eq!(groups[0].records.len(), 2, "dedup mode must retain the sec/supp read");
+        assert!(
+            groups[0].records.iter().any(|rec| {
+                let record = rec.record();
+                record.is_secondary() || record.is_supplementary()
+            }),
+            "the retained record must be the secondary/supplementary read"
+        );
     }
 
     #[test]
