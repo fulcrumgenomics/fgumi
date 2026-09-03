@@ -372,8 +372,13 @@ impl Step2 for PairRawFastq {
 /// surface byte-for-byte identical diagnostics regardless of which path detects
 /// the mismatch.
 fn out_of_sync_error(short_stream: usize, chunk_serial: u64) -> io::Error {
+    // Name streams R1/R2 (1-based) and the short one as having "ended before" the
+    // other, matching the serial oracle's wording so the operator learns which
+    // FASTQ ran out (issue #773). `short_stream` is 0-based (0 = R1, 1 = R2).
+    let ended = short_stream + 1;
+    let other = if short_stream == 0 { 2 } else { 1 };
     io::Error::other(format!(
-        "FASTQ sources out of sync: stream {short_stream} ended before chunk_serial \
+        "FASTQ sources out of sync: R{ended} ended before R{other} at chunk_serial \
          {chunk_serial} while the other stream had more records"
     ))
 }
@@ -954,8 +959,8 @@ mod tests {
             "desync abort must report an out-of-sync error, got: {err}"
         );
         assert!(
-            err.contains("stream 1 ended before chunk_serial 2"),
-            "desync error must name the short stream (index 1) and the orphaned \
+            err.contains("R2 ended before R1 at chunk_serial 2"),
+            "desync error must name the short stream (R2) and the orphaned \
              serial (2), got: {err}"
         );
     }
@@ -973,8 +978,8 @@ mod tests {
             "desync abort must report an out-of-sync error, got: {err}"
         );
         assert!(
-            err.contains("stream 0 ended before chunk_serial 2"),
-            "desync error must name the short stream (index 0) and the orphaned \
+            err.contains("R1 ended before R2 at chunk_serial 2"),
+            "desync error must name the short stream (R1) and the orphaned \
              serial (2), got: {err}"
         );
     }
@@ -993,9 +998,9 @@ mod tests {
         let result = run_desync_harness_with_backpressure(3, 1, Some(X3_SOFT_LIMIT_BYTES));
         let err = result.expect_err("truncated stream over backpressure must abort, not hang");
         assert!(
-            err.contains("out of sync") && err.contains("stream 1 ended before chunk_serial 1"),
+            err.contains("out of sync") && err.contains("R2 ended before R1 at chunk_serial 1"),
             "backpressure fail-fast must reuse the shared out-of-sync error naming the \
-             short stream (index 1) and the orphaned serial (1), got: {err}"
+             short stream (R2) and the orphaned serial (1), got: {err}"
         );
     }
 
@@ -1009,9 +1014,9 @@ mod tests {
         let result = run_desync_harness_with_backpressure(1, 3, Some(X3_SOFT_LIMIT_BYTES));
         let err = result.expect_err("truncated stream over backpressure must abort, not hang");
         assert!(
-            err.contains("out of sync") && err.contains("stream 0 ended before chunk_serial 1"),
+            err.contains("out of sync") && err.contains("R1 ended before R2 at chunk_serial 1"),
             "backpressure fail-fast must reuse the shared out-of-sync error naming the \
-             short stream (index 0) and the orphaned serial (1), got: {err}"
+             short stream (R1) and the orphaned serial (1), got: {err}"
         );
     }
 }

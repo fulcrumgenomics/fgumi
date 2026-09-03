@@ -608,6 +608,177 @@ fn test_parallel_parse_output_equivalence_across_threads() {
     }
 }
 
+/// The chain (`--threads`) output must equal the serial oracle (no `--threads`)
+/// on decoded records AND normalized header, with `--threads 1` explicitly
+/// covered. `--threads 1` already ran a parallel path before this change (the
+/// now-deleted legacy `process_with_pipeline`, since the old `is_parallel()`
+/// dispatch was true for every `Threads(n)`); the cutover moves it onto the chain
+/// builder. The earlier across-threads equivalence test only compares the chain
+/// against itself at different `--threads` values, so this is the test that pins
+/// the chain against the serial oracle.
+///
+/// Fixed-value anchors (record count, each mate's template sequence, the combined
+/// `RX`, and the `RG`) are pinned in addition to chain==oracle, so a regression
+/// in the shared record-building code is caught even when both paths still agree
+/// with each other.
+#[rstest]
+#[case::threads_one(1)]
+#[case::threads_four(4)]
+fn chain_matches_serial_oracle(#[case] threads: usize) {
+    use fgumi_lib::sam::SamTag;
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record_buf::data::field::Value;
+
+    let tmp = TempDir::new().unwrap();
+    // 5M+T over a 10 bp read: a 5 bp UMI then a 5 bp template. One paired template.
+    let r1 = create_plain_fastq(&tmp, "r1.fq", &[("pair0", "AAAAACCCCC", "IIIIIIIIII")]);
+    let r2 = create_plain_fastq(&tmp, "r2.fq", &[("pair0", "GGGGGTTTTT", "IIIIIIIIII")]);
+
+    let run = |threads: Option<usize>, out: &Path| {
+        let mut args: Vec<String> = vec![
+            "extract".into(),
+            "--inputs".into(),
+            r1.to_str().unwrap().into(),
+            r2.to_str().unwrap().into(),
+            "--output".into(),
+            out.to_str().unwrap().into(),
+            "--read-structures".into(),
+            "5M+T".into(),
+            "5M+T".into(),
+            "--sample".into(),
+            "psample".into(),
+            "--library".into(),
+            "plib".into(),
+            "--compression-level".into(),
+            "1".into(),
+        ];
+        if let Some(t) = threads {
+            args.push("--threads".into());
+            args.push(t.to_string());
+        }
+        Extract::try_parse_from(args)
+            .expect("failed to parse extract args")
+            .execute("fgumi extract")
+            .expect("extract failed");
+    };
+
+    let oracle_out = tmp.path().join("oracle.bam");
+    let chain_out = tmp.path().join(format!("chain_t{threads}.bam"));
+    run(None, &oracle_out); // serial oracle (no --threads)
+    run(Some(threads), &chain_out); // chain (--threads N, incl. N == 1)
+
+    let (oracle_hdr, oracle_recs) = crate::helpers::read_bam_output(&oracle_out);
+    let (chain_hdr, chain_recs) = crate::helpers::read_bam_output(&chain_out);
+    assert_eq!(chain_hdr, oracle_hdr, "normalized header parity (threads={threads})");
+    assert_eq!(chain_recs, oracle_recs, "record parity (threads={threads})");
+
+    // Fixed-value anchors on the oracle output (which the chain now equals): one
+    // record per mate, the template halves after the 5 bp UMI, the combined
+    // R1-R2 UMI in RX, and the default read group on every record.
+    assert_eq!(oracle_recs.len(), 2, "one BAM record per mate");
+    assert_eq!(oracle_recs[0].sequence().as_ref(), b"CCCCC", "R1 template after 5M UMI");
+    assert_eq!(oracle_recs[1].sequence().as_ref(), b"TTTTT", "R2 template after 5M UMI");
+    let string_tag = |rec: &RecordBuf, tag: SamTag| -> Vec<u8> {
+        match rec.data().get(&Tag::from(tag)) {
+            Some(Value::String(s)) => s.to_vec(),
+            other => panic!("expected a string {tag:?} tag, got {other:?}"),
+        }
+    };
+    for rec in &oracle_recs {
+        assert_eq!(string_tag(rec, SamTag::RX), b"AAAAA-GGGGG", "combined R1-R2 UMI in RX");
+        assert_eq!(string_tag(rec, SamTag::RG), b"A", "default read group id");
+    }
+}
+
+/// Chain-vs-oracle parity across the barcode / single-tag / annotate branches of
+/// the record builder. `chain_matches_serial_oracle` covers only RX/RG, and every
+/// threading-parameterized tag test pins `store_cell_quals` / `single_tag` /
+/// `annotate_read_names` / `store_sample_barcode_qualities` off, so nothing else
+/// exercises those branches on the chain path — yet the chain
+/// (`make_raw_records_from_fastq_set`) and the serial oracle (`make_raw_records`)
+/// are two independent copies of that tag-append block. A single-end `2C2B2M+T`
+/// read with every tag flag on drives CB/CY, BC/QT, RX/QX, the `--single-tag`
+/// copy, and `--annotate-read-names`; the chain must match the serial oracle
+/// byte-for-byte, and the emitted tag values are pinned so a shared-code
+/// regression is caught even when the two paths still agree.
+#[rstest]
+#[case::threads_one(1)]
+#[case::threads_four(4)]
+fn chain_matches_serial_oracle_barcode_and_annotate_tags(#[case] threads: usize) {
+    use fgumi_lib::sam::SamTag;
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record_buf::data::field::Value;
+
+    let tmp = TempDir::new().unwrap();
+    // 3C 3B 3M then template over a 13 bp read "AAACCCGGGTTTT": cell=AAA,
+    // sample=CCC, umi=GGG, template=TTTT. (3 bp segments, so the pinned barcode/UMI
+    // payloads are not 2-char tag-shaped literals the tag-literal lint would flag.)
+    let input = create_plain_fastq(&tmp, "r1.fq", &[("readX", "AAACCCGGGTTTT", "IIIIIIIIIIIII")]);
+
+    let run = |threads: Option<usize>, out: &Path| {
+        let mut args: Vec<String> = vec![
+            "extract".into(),
+            "--inputs".into(),
+            input.to_str().unwrap().into(),
+            "--output".into(),
+            out.to_str().unwrap().into(),
+            "--read-structures".into(),
+            "3C3B3M+T".into(),
+            "--sample".into(),
+            "s".into(),
+            "--library".into(),
+            "l".into(),
+            "--store-umi-quals".into(),
+            "--store-cell-quals".into(),
+            "--store-sample-barcode-qualities".into(),
+            "--annotate-read-names".into(),
+            "--single-tag".into(),
+            "MI".into(),
+            "--compression-level".into(),
+            "1".into(),
+        ];
+        if let Some(t) = threads {
+            args.push("--threads".into());
+            args.push(t.to_string());
+        }
+        Extract::try_parse_from(args)
+            .expect("failed to parse extract args")
+            .execute("fgumi extract")
+            .expect("extract failed");
+    };
+
+    let oracle_out = tmp.path().join("oracle.bam");
+    let chain_out = tmp.path().join(format!("chain_t{threads}.bam"));
+    run(None, &oracle_out);
+    run(Some(threads), &chain_out);
+
+    let (oracle_hdr, oracle_recs) = crate::helpers::read_bam_output(&oracle_out);
+    let (chain_hdr, chain_recs) = crate::helpers::read_bam_output(&chain_out);
+    assert_eq!(chain_hdr, oracle_hdr, "header parity (threads={threads})");
+    assert_eq!(chain_recs, oracle_recs, "record parity (threads={threads})");
+
+    assert_eq!(oracle_recs.len(), 1, "one record for the single-end read");
+    let rec = &oracle_recs[0];
+    let string_tag = |rec: &RecordBuf, tag: SamTag| -> Vec<u8> {
+        match rec.data().get(&Tag::from(tag)) {
+            Some(Value::String(s)) => s.to_vec(),
+            other => panic!("expected a string {tag:?} tag, got {other:?}"),
+        }
+    };
+    assert_eq!(rec.sequence().as_ref(), b"TTTT", "template after 3C3B3M");
+    assert_eq!(string_tag(rec, SamTag::CB), b"AAA", "cell barcode");
+    assert_eq!(string_tag(rec, SamTag::BC), b"CCC", "sample barcode");
+    assert_eq!(string_tag(rec, SamTag::RX), b"GGG", "UMI");
+    assert_eq!(string_tag(rec, SamTag::MI), b"GGG", "--single-tag copy of the UMI");
+    // The store_* flags are on, so the quality tags must be present.
+    assert!(rec.data().get(&Tag::from(SamTag::CY)).is_some(), "cell-barcode quals (CY)");
+    assert!(rec.data().get(&Tag::from(SamTag::QT)).is_some(), "sample-barcode quals (QT)");
+    assert!(rec.data().get(&Tag::from(SamTag::QX)).is_some(), "UMI quals (QX)");
+    // --annotate-read-names appends `+<UMI>` to the read name.
+    let name: &[u8] = rec.name().expect("read name must be present").as_ref();
+    assert_eq!(name, &b"readX+GGG"[..], "annotated read name");
+}
+
 /// Test that running the same input multiple times produces identical output.
 ///
 /// This verifies determinism of the parallel parse pipeline.

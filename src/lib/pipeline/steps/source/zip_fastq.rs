@@ -221,9 +221,18 @@ impl ZipFastqRecords {
         // it surface as an incidental name mismatch from the back-pop below.
         for (stream_idx, recs) in stream_records.iter().enumerate().skip(1) {
             if recs.len() != n_records {
+                // Name streams R1/R2/… (1-based) and the shorter one as having
+                // "ended before" the other, matching the serial oracle and the
+                // N==2 `ParseAndZipFastq` path so the operator learns which FASTQ
+                // ran out (issue #773).
+                let (ended, before) =
+                    if recs.len() < n_records { (stream_idx, 0) } else { (0, stream_idx) };
                 return Err(io::Error::other(format!(
-                    "FASTQ sources out of sync at chunk_serial {lowest_serial}: \
-                     stream 0 has {n_records} records, stream {stream_idx} has {}",
+                    "FASTQ sources out of sync at chunk_serial {lowest_serial}: R{} ended before \
+                     R{} (R1 has {n_records} record(s), R{} has {} in this chunk)",
+                    ended + 1,
+                    before + 1,
+                    stream_idx + 1,
                     recs.len(),
                 )));
             }
@@ -403,9 +412,17 @@ impl Step for ZipFastqRecords {
                 if let Some((&serial, slots)) = self.pending.iter().next() {
                     for (idx, slot) in slots.iter().enumerate() {
                         if slot.is_none() {
+                            // `idx` (0-based) ended early; name a stream that still
+                            // had a record here as the "before" reference. R1/R2/…
+                            // (1-based) matches the serial oracle and the N==2 path.
+                            let before = slots.iter().position(Option::is_some).map_or_else(
+                                || "the other stream".to_string(),
+                                |o| format!("R{}", o + 1),
+                            );
                             return Err(io::Error::other(format!(
-                                "FASTQ sources out of sync: stream {idx} ended before \
+                                "FASTQ sources out of sync: R{} ended before {before} at \
                                  chunk_serial {serial} while other streams had more records",
+                                idx + 1,
                             )));
                         }
                     }
@@ -623,6 +640,27 @@ mod tests {
         let err = zip.try_emit_complete().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("out of sync"), "expected count out-of-sync error, got: {msg}");
+        // stream 0 (R1) has 2 records, stream 1 (R2) has 1 → R2 ran short. Assert
+        // the directional wording so a flipped `ended`/`before` mapping is caught.
+        assert!(msg.contains("R2 ended before R1"), "expected directional wording, got: {msg}");
+    }
+
+    /// The reverse of `test_zip_unequal_counts_out_of_sync`: stream 0 (R1) has
+    /// fewer records than stream 1 (R2), so the directional wording must name R1
+    /// as the short stream. Exercises the other branch of the `ended`/`before`
+    /// selection so a flipped mapping cannot pass on both directions.
+    #[test]
+    fn test_zip_unequal_counts_out_of_sync_reversed() {
+        let mut zip = ZipFastqRecords::new(2, 64 * 1024 * 1024);
+        let s0 = make_chunk(0, 0, vec![make_record("read1/1", "ACGT")]);
+        let s1 =
+            make_chunk(1, 0, vec![make_record("read1/2", "GGGG"), make_record("read2/2", "TT")]);
+        zip.pending.insert(0, vec![Some(s0), Some(s1)]);
+
+        let err = zip.try_emit_complete().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("out of sync"), "expected count out-of-sync error, got: {msg}");
+        assert!(msg.contains("R1 ended before R2"), "expected directional wording, got: {msg}");
     }
 
     #[test]
@@ -956,9 +994,12 @@ mod tests {
             .expect_err("a stream that ends early must fail the run");
 
         let msg = err.to_string();
+        // The final stream (R2, with n_streams == 2) is the one truncated, so it
+        // ends before R1. Assert the directional wording, not just "ended before",
+        // so an inverted stream-index mapping is caught.
         assert!(
-            msg.contains("ended before"),
-            "expected the EOF-desync diagnosis naming the stream and serial, got: {msg}"
+            msg.contains("R2 ended before R1"),
+            "expected the EOF-desync diagnosis naming R2 as the short stream, got: {msg}"
         );
     }
 

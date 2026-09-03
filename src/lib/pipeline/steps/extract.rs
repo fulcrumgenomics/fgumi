@@ -130,7 +130,14 @@ pub(crate) fn extract_batch(
         let combined = FastqSet::combine_readsets(fastq_sets);
 
         let raw_records = make_raw_records_from_fastq_set(&combined, extract_opts)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            // Render the full anyhow context chain into the io::Error string (the
+            // alternate `{:#}` form: "context: cause"). A bare
+            // `io::Error::new(_, e)` Displays only the top context, dropping the
+            // root cause — e.g. it would keep "could not write the record for read
+            // …" but lose the "read name too long" underneath, so the chain path's
+            // error would diverge from the serial oracle's. Preserving the chain
+            // keeps the two paths' messages in parity.
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:#}")))?;
 
         let template = Template::from_records(raw_records)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -176,6 +183,8 @@ mod tests {
             extract_umis_from_read_names: false,
             store_sample_barcode_qualities: false,
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         }
     }
 

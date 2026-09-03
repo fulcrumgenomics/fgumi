@@ -431,13 +431,15 @@ pub fn validate_cross_stage_constraints(spec: &ChainSpec) -> Result<()> {
         )?;
     }
 
-    // Rule 4: `Stage::Extract` requires a `SourceSpec::Fastqs` source.
-    // Extract reads directly from FASTQ files; feeding it a BAM, SAM, or
-    // paired-BAM source is a programmer error that would be caught late
-    // (at chain-build time) without this guard. Catching it here at
-    // spec-validation time gives a clearer error message.
-    if spec.stages.contains(&Stage::Extract) && !matches!(spec.source, SourceSpec::Fastqs { .. }) {
-        bail!("Stage::Extract requires SourceSpec::Fastqs; got {:?}", spec.source);
+    // Rule 4: `Stage::Extract` requires a FASTQ source — `SourceSpec::Fastqs`
+    // or `SourceSpec::InterleavedFastq`. Extract reads directly from FASTQ;
+    // feeding it a BAM, SAM, or paired-BAM source is a programmer error that
+    // would be caught late (at chain-build time) without this guard. Catching it
+    // here at spec-validation time gives a clearer error message.
+    if spec.stages.contains(&Stage::Extract)
+        && !matches!(spec.source, SourceSpec::Fastqs { .. } | SourceSpec::InterleavedFastq { .. })
+    {
+        bail!("Stage::Extract requires a FASTQ source; got {:?}", spec.source);
     }
 
     // Rule 5: the FASTQ sink and `Stage::Fastq` must go together. A `Fastq`
@@ -1051,7 +1053,7 @@ mod tests {
         validate_cross_stage_constraints(&spec).expect("standalone duplex skips paired check");
     }
 
-    // ── Rule 4: Stage::Extract requires SourceSpec::Fastqs ──────────────────
+    // ── Rule 4: Stage::Extract requires a FASTQ source ──────────────────────
 
     /// Helper: a minimal `ExtractOptions` suitable for tests.
     fn minimal_extract_opts() -> crate::commands::extract::ExtractOptions {
@@ -1077,6 +1079,8 @@ mod tests {
             extract_umis_from_read_names: false,
             store_sample_barcode_qualities: false,
             async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
         }
     }
 
@@ -1088,7 +1092,7 @@ mod tests {
         spec.stage_opts.extract = Some(minimal_extract_opts());
         let err = validate_cross_stage_constraints(&spec).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("requires SourceSpec::Fastqs"), "got: {msg}");
+        assert!(msg.contains("requires a FASTQ source"), "got: {msg}");
     }
 
     #[test]
