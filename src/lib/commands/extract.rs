@@ -1691,7 +1691,8 @@ pub struct ExtractRunallOptions {
     /// Treat a single input as interleaved paired-end FASTQ (`R1, R2, R1, R2, …`),
     /// de-interleaving it into the two reads. Requires exactly one `--input` (a
     /// file or `-` for stdin) and describes both reads with two `--read-structures`
-    /// (defaults to `+T +T`). This lets a streaming trimmer or converter pipe
+    /// (required for this runall variant — unlike the standalone `Extract`, there
+    /// is no `+T +T` default). This lets a streaming trimmer or converter pipe
     /// interleaved pairs straight into extract without staging two FASTQ files.
     #[arg(long = "interleaved", default_value_t = false)]
     pub interleaved: bool,
@@ -1883,7 +1884,7 @@ impl ExtractRunallOptions {
     }
 
     /// Re-enforce the cross-field conflicts the `multi_options` macro required us
-    /// to drop from the `#[arg]` attributes (mirrors [`Extract::validate`]).
+    /// to drop from the `#[arg]` attributes (mirrors `Extract::validate`).
     ///
     /// This is separate from the macro-generated `MultiExtractRunallOptions::
     /// validate()`, which only lifts the staged-required flags; `runall`/PR B
