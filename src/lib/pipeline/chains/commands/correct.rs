@@ -122,13 +122,20 @@ impl FinalizeHook for CorrectFinalizeHook {
         info!("Total templates processed: {}", counts.templates);
 
         // fgbio logs this summary at error level (CorrectUmis.scala:275-280).
+        // Each detail line is individually guarded so a run with only one of the
+        // two problem counters nonzero does not print a spurious `# 0 ...` line
+        // (the retired serial path and fgbio both guard each line separately).
         if counts.missing > 0 || counts.wrong_length > 0 {
             error!("###################################################################");
-            error!("# {} were missing UMI attributes in the BAM file!", counts.missing);
-            error!(
-                "# {} had unexpected UMIs of differing lengths in the BAM file!",
-                counts.wrong_length
-            );
+            if counts.missing > 0 {
+                error!("# {} were missing UMI attributes in the BAM file!", counts.missing);
+            }
+            if counts.wrong_length > 0 {
+                error!(
+                    "# {} had unexpected UMIs of differing lengths in the BAM file!",
+                    counts.wrong_length
+                );
+            }
             error!("###################################################################");
         }
 
@@ -272,9 +279,12 @@ mod tests {
     ///   emits the banner unconditionally would still pass the positive case
     ///   alone.
     ///
-    /// Whenever a banner is expected, both message needles must be present
-    /// (the guard emits both lines together), not merely one -- requiring only
-    /// one would let a dropped message line slip through.
+    /// Each detail line is guarded on its own counter in production (correct.rs:
+    /// `if counts.missing > 0` / `if counts.wrong_length > 0`), so a
+    /// single-trigger case emits only its one line. Assert each line's presence
+    /// against its own counter -- not against `expect_banner` -- so a dropped
+    /// line is still caught without demanding the other line the guard correctly
+    /// suppressed.
     #[rstest]
     #[case::missing_and_wrong_length_present(2, 1, true)]
     #[case::missing_only(2, 0, true)]
@@ -303,38 +313,40 @@ mod tests {
         Box::new(hook).finalize().expect("finalize must succeed");
 
         let logs = captured_with_level();
-        // The banner emits both message lines together whenever it fires, so
-        // locate each independently and require both when a banner is expected
-        // (requiring only one would let a dropped line pass).
+        // Each detail line is guarded on its own counter, so locate each
+        // independently and check its presence against that counter.
         let missing_line = logs.iter().find(|(_, msg)| msg.contains(MISSING_UMI_NEEDLE));
         let wrong_length_line = logs.iter().find(|(_, msg)| msg.contains(WRONG_LENGTH_NEEDLE));
 
-        if expect_banner {
-            // `assert!` + `unwrap` rather than `unwrap_or_else(|| panic!(..))`: the
-            // never-taken closure of the latter is an uncovered region on the
-            // (always-passing) happy path, whereas an `assert!`'s panic branch
-            // folds onto its covered line. Same rigor -- both lines must be present.
-            assert!(
-                missing_line.is_some(),
-                "expected the missing-UMI banner line ({MISSING_UMI_NEEDLE:?}); got: {logs:?}"
-            );
-            assert!(
-                wrong_length_line.is_some(),
-                "expected the wrong-length-UMI banner line ({WRONG_LENGTH_NEEDLE:?}); got: {logs:?}"
-            );
-            for (level, msg) in [missing_line.unwrap(), wrong_length_line.unwrap()] {
-                assert_eq!(
-                    *level,
-                    log::Level::Error,
-                    "banner line {msg:?} logged at {level:?}; fgbio parity requires error level \
-                    (CorrectUmis.scala:275-280)"
-                );
-            }
-        } else {
-            assert!(
-                missing_line.is_none() && wrong_length_line.is_none(),
-                "expected no missing/wrong-length-UMI banner when neither counter is nonzero \
-                (the guard must suppress it); got: {logs:?}"
+        // Presence of each line tracks its own counter (not `expect_banner`):
+        // the missing line iff `missing_umis > 0`, the wrong-length line iff
+        // `wrong_length > 0`. `expect_banner` is the disjunction of the two.
+        assert_eq!(
+            missing_line.is_some(),
+            missing_umis > 0,
+            "missing-UMI banner line ({MISSING_UMI_NEEDLE:?}) presence must match \
+             missing_umis > 0 ({missing_umis}); got: {logs:?}"
+        );
+        assert_eq!(
+            wrong_length_line.is_some(),
+            wrong_length > 0,
+            "wrong-length-UMI banner line ({WRONG_LENGTH_NEEDLE:?}) presence must match \
+             wrong_length > 0 ({wrong_length}); got: {logs:?}"
+        );
+        assert_eq!(
+            missing_line.is_some() || wrong_length_line.is_some(),
+            expect_banner,
+            "a banner must fire iff either counter is nonzero; got: {logs:?}"
+        );
+        // Every line that IS present must be at error level -- the regression
+        // guard against the chain path silently downgrading the banner to
+        // `warn!` (fgbio parity, CorrectUmis.scala:275-280).
+        for (level, msg) in [missing_line, wrong_length_line].into_iter().flatten() {
+            assert_eq!(
+                *level,
+                log::Level::Error,
+                "banner line {msg:?} logged at {level:?}; fgbio parity requires error level \
+                (CorrectUmis.scala:275-280)"
             );
         }
     }
