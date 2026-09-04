@@ -19,6 +19,8 @@ use crate::helpers::bam_generator::{
     create_minimal_header, create_query_grouped_header, create_umi_family,
     create_umi_family_at_pos, to_record_buf,
 };
+use fgumi_lib::sam::SamTag;
+use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 
 /// Test that the group command properly writes metrics in the new format.
 #[test]
@@ -601,4 +603,189 @@ fn test_group_chain_threads4_matches_single_threaded_multi_batch() {
         single, threads4,
         "chain (--threads 4) output must match the single-threaded oracle record-for-record across batches",
     );
+}
+
+/// End-to-end regression for issue #901: a secondary/supplementary read carrying
+/// a `tc` tag (stamped by `fgumi zipper` for template-coordinate ordering) is
+/// documented as filtered from grouping, so it must not change the molecule
+/// count. Before the fix, such a read received a resolved position key and, being
+/// interleaved between two same-UMI reads of one molecule, split that molecule
+/// across position groups — inflating the reported molecule count and diverging
+/// from fgbio. This pins the reported symptom (distinct MI count), not just the
+/// internal position-group shape the unit tests cover.
+///
+/// Records are written in a deliberately split-inducing order (the tc-keyed
+/// supplementary sits between the two primaries); `group` trusts the declared
+/// template-coordinate order and does not re-sort, so this reproduces the
+/// interleaving that real template-coordinate sort can produce.
+fn create_supplementary_split_bam(path: &PathBuf) {
+    let header = create_minimal_header("chr1", 20000);
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
+    writer.write_header(&header).expect("Failed to write header");
+
+    // Two single-read "molecules" sharing one UMI at the same position — one
+    // molecule that must group together.
+    let mut records = Vec::new();
+    records.extend(create_umi_family_at_pos("AAAAAAAA", 1, "b1", "ACGTACGT", 30, 200));
+
+    // A supplementary read carrying the same UMI and a `tc` tag whose resolved
+    // template coordinate (pos 1) differs from the primaries' (pos 200).
+    let mut supp = SamBuilder::new();
+    supp.read_name(b"supp")
+        .ref_id(0)
+        .pos(4999)
+        .mapq(60)
+        .flags(flags::SUPPLEMENTARY)
+        .cigar_ops(&[8u32 << 4]) // 8M
+        .sequence(b"ACGTACGT")
+        .qualities(&[30u8; 8]);
+    supp.add_string_tag(SamTag::RX, b"AAAAAAAA");
+    supp.add_array_i32(SamTag::TC, &[0, 1, 0, 0, 1, 0]);
+    records.push(supp.build());
+
+    records.extend(create_umi_family_at_pos("AAAAAAAA", 1, "b2", "ACGTACGT", 30, 200));
+
+    for record in &records {
+        writer
+            .write_alignment_record(&header, &to_record_buf(record))
+            .expect("Failed to write record");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+}
+
+/// Build the paired-end analogue of [`create_supplementary_split_bam`]: two
+/// paired templates sharing one UMI at the same 5' positions (one molecule), with
+/// a `tc`-keyed supplementary interleaved between them. This mirrors real client
+/// data, where the reads are paired and carry `MC` tags.
+fn create_paired_supplementary_split_bam(path: &PathBuf) {
+    let header = create_minimal_header("chr1", 20000);
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
+    writer.write_header(&header).expect("Failed to write header");
+
+    // One paired template (R1 fwd @200, R2 rev @400) with MC tags, sharing a UMI.
+    let paired = |name: &[u8]| -> Vec<RawRecord> {
+        let mut r1 = SamBuilder::new();
+        r1.read_name(name)
+            .ref_id(0)
+            .pos(199)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .mate_ref_id(0)
+            .mate_pos(399)
+            .cigar_ops(&[8u32 << 4])
+            .sequence(b"ACGTACGT")
+            .qualities(&[30u8; 8])
+            .add_string_tag(SamTag::RX, b"AAAAAAAA")
+            .add_string_tag(SamTag::MC, b"8M");
+        let mut r2 = SamBuilder::new();
+        r2.read_name(name)
+            .ref_id(0)
+            .pos(399)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .mate_ref_id(0)
+            .mate_pos(199)
+            .cigar_ops(&[8u32 << 4])
+            .sequence(b"ACGTACGT")
+            .qualities(&[30u8; 8])
+            .add_string_tag(SamTag::RX, b"AAAAAAAA")
+            .add_string_tag(SamTag::MC, b"8M");
+        vec![r1.build(), r2.build()]
+    };
+
+    // A supplementary carrying the same UMI and a `tc` tag whose resolved
+    // template coordinate differs from the primaries', written between the two
+    // templates so it would break contiguity if not filtered.
+    let mut supp = SamBuilder::new();
+    supp.read_name(b"supp")
+        .ref_id(0)
+        .pos(4999)
+        .mapq(60)
+        .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::SUPPLEMENTARY)
+        .mate_ref_id(0)
+        .mate_pos(399)
+        .cigar_ops(&[8u32 << 4])
+        .sequence(b"ACGTACGT")
+        .qualities(&[30u8; 8])
+        .add_string_tag(SamTag::RX, b"AAAAAAAA")
+        .add_array_i32(SamTag::TC, &[0, 1, 0, 0, 1, 0]);
+
+    let mut records = paired(b"pair1");
+    records.push(supp.build());
+    records.extend(paired(b"pair2"));
+
+    for record in &records {
+        writer
+            .write_alignment_record(&header, &to_record_buf(record))
+            .expect("Failed to write record");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+}
+
+/// Shared oracle for the #901 regression: grouped output must contain exactly one
+/// molecule (one distinct MI) and no secondary/supplementary records.
+fn assert_single_molecule_no_secondary(
+    records: &[noodles::sam::alignment::RecordBuf],
+    expected_qnames: &[&str],
+) {
+    use noodles::sam::alignment::record_buf::data::field::Value;
+    let mi = SamTag::MI.to_noodles_tag();
+    let distinct_mi: std::collections::BTreeSet<String> = records
+        .iter()
+        .filter_map(|r| match r.data().get(&mi) {
+            Some(Value::String(s)) => Some(s.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        distinct_mi.len(),
+        1,
+        "the tc-keyed supplementary must not split the single molecule (got MIs {distinct_mi:?})"
+    );
+    // Assert record identity, not just the count: a regression that dropped one
+    // of the two primaries would still leave a single MI and no flagged record,
+    // so pin the exact set of output QNAMEs.
+    let output_qnames: std::collections::BTreeSet<String> =
+        records.iter().filter_map(|r| r.name().map(ToString::to_string)).collect();
+    let expected: std::collections::BTreeSet<String> =
+        expected_qnames.iter().map(|s| (*s).to_string()).collect();
+    assert_eq!(
+        output_qnames, expected,
+        "both primaries must survive: expected QNAMEs {expected:?}, got {output_qnames:?}"
+    );
+    for r in records {
+        let flag = r.flags();
+        assert!(
+            !flag.is_secondary() && !flag.is_supplementary(),
+            "no secondary/supplementary record should appear in grouped output"
+        );
+    }
+}
+
+/// Regression for issue #901 across both the single-threaded fast path and the
+/// `--threads N` chain path, for single-end and paired input. A `tc`-keyed
+/// supplementary interleaved between two same-UMI reads of one molecule must not
+/// split it or appear in the output, on every path.
+#[rstest]
+#[case::single_end(false)]
+#[case::paired(true)]
+fn test_group_supplementary_does_not_inflate_molecule_count(
+    #[case] paired: bool,
+    #[values(&[] as &[&str], &["--threads", "2"])] extra: &[&str],
+) {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    if paired {
+        create_paired_supplementary_split_bam(&input_bam);
+    } else {
+        create_supplementary_split_bam(&input_bam);
+    }
+
+    let records = run_group_records(temp_dir.path(), "supp_split", &input_bam, extra);
+    // Single-end input names its two primaries `b1_0`/`b2_0`; the paired input
+    // names its two templates `pair1`/`pair2` (R1 and R2 share the QNAME).
+    let expected_qnames: &[&str] = if paired { &["pair1", "pair2"] } else { &["b1_0", "b2_0"] };
+    assert_single_molecule_no_secondary(&records, expected_qnames);
 }
