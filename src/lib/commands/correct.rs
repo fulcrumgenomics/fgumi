@@ -1370,14 +1370,7 @@ impl CorrectUmis {
 
         // Check minimum correction ratio
         if let Some(min) = self.min_corrected {
-            #[allow(clippy::cast_precision_loss)]
-            let ratio_kept = records_written as f64 / total_records as f64;
-            if ratio_kept < min {
-                bail!(
-                    "Final ratio of reads kept / total was {ratio_kept:.2} (user specified minimum was {min:.2}). \
-                    This could indicate a mismatch between library preparation and the provided UMI file."
-                );
-            }
+            check_min_corrected(records_written, total_records, min)?;
         }
 
         Ok(total_records)
@@ -1604,18 +1597,52 @@ impl CorrectUmis {
 
         // Check minimum correction ratio
         if let Some(min) = self.min_corrected {
-            #[allow(clippy::cast_precision_loss)]
-            let ratio_kept = kept as f64 / total_records as f64;
-            if ratio_kept < min {
-                bail!(
-                    "Final ratio of reads kept / total was {ratio_kept:.2} (user specified minimum was {min:.2}). \
-                    This could indicate a mismatch between library preparation and the provided UMI file."
-                );
-            }
+            check_min_corrected(kept, total_records, min)?;
         }
 
         Ok(total_records)
     }
+}
+
+/// Enforce the `--min-corrected` floor on the ratio of kept records.
+///
+/// Errors when `records_written / total_records` falls below `min`. When no
+/// records were processed (`total_records == 0`) the ratio is undefined, so a
+/// positive `min` errors (it cannot be met) while a zero `min` passes.
+///
+/// The single shared implementation of the `--min-corrected` gate: both
+/// legacy (non-chain) paths call this directly, and
+/// `crate::pipeline::chains::commands::correct` imports and reuses it, so all
+/// correct paths agree on empty-input behavior instead of drifting across
+/// separate copies.
+pub(crate) fn check_min_corrected(
+    records_written: u64,
+    total_records: u64,
+    min: f64,
+) -> Result<()> {
+    // No reads processed: the kept ratio is undefined (0 / 0 = NaN), and
+    // `NaN < min` is always false — which would silently bypass the gate. A
+    // positive minimum cannot be satisfied with zero reads, so fail explicitly;
+    // a zero minimum imposes no requirement and passes.
+    if total_records == 0 {
+        if min > 0.0 {
+            bail!(
+                "No reads were processed, so the minimum ratio of reads kept (user specified minimum was {min:.2}) \
+                could not be met. This could indicate empty input or a mismatch between library \
+                preparation and the provided UMI file."
+            );
+        }
+        return Ok(());
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let ratio_kept = records_written as f64 / total_records as f64;
+    if ratio_kept < min {
+        bail!(
+            "Final ratio of reads kept / total was {ratio_kept:.2} (user specified minimum was {min:.2}). \
+            This could indicate a mismatch between library preparation and the provided UMI file."
+        );
+    }
+    Ok(())
 }
 
 /// Merges `counts` into `dst[umi]`, creating a zero-initialized entry if the
@@ -3122,6 +3149,190 @@ mod tests {
         let result = corrector2.execute("test");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Final ratio of reads kept"));
+
+        Ok(())
+    }
+
+    /// Regression test for the `--min-corrected` NaN bypass on empty input.
+    ///
+    /// `execute_single_thread_mode` (the no-`--threads` legacy path reached via
+    /// `ThreadingOptions::none()`) computes `ratio_kept = records_written as f64
+    /// / total_records as f64`. On empty input `total_records == 0`, so this was
+    /// `0.0 / 0.0 = NaN`, and `NaN < min` is always `false` — silently bypassing
+    /// `--min-corrected` instead of erroring. This must instead match
+    /// `check_min_corrected`'s semantics (the shared gate that
+    /// `pipeline::chains::commands::correct` also imports and reuses): zero
+    /// records with a positive minimum errors; zero records with `min == 0.0`
+    /// (or no minimum at all) passes.
+    #[rstest]
+    #[case::empty_input_positive_min_errors(vec![], Some(0.5), true)]
+    #[case::empty_input_zero_min_passes(vec![], Some(0.0), false)]
+    #[case::empty_input_no_min_passes(vec![], None, false)]
+    #[case::non_empty_input_min_met_passes(vec![("q1", Some("AAAAAA"))], Some(0.5), false)]
+    fn test_min_corrected_empty_input_single_threaded_mode(
+        #[case] records: Vec<(&str, Option<&str>)>,
+        #[case] min_corrected: Option<f64>,
+        #[case] expect_err: bool,
+    ) -> Result<()> {
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let corrector = CorrectUmis {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
+            },
+            rejects_opts: RejectsOptions::default(),
+            metrics: None,
+            target: Target::Umi,
+            max_mismatches: 1,
+            min_distance_diff: 2,
+            umis: vec!["AAAAAA".to_string()],
+            umi_files: vec![],
+            dont_store_original_umis: false,
+            cache_size: 100_000,
+            min_corrected,
+            revcomp: false,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        };
+
+        let result = corrector.execute("test");
+        if expect_err {
+            let err =
+                result.expect_err("--min-corrected must error on empty input, not silently pass");
+            assert!(
+                err.to_string().contains("No reads were processed"),
+                "error should explain empty input (chain-path parity), got: {err}"
+            );
+        } else {
+            result?;
+        }
+
+        Ok(())
+    }
+
+    /// Sibling regression test covering the second legacy site,
+    /// `execute_threads_mode`. This method has no live call site any more
+    /// (`execute()` routes `--threads` to `execute_chain` and no-`--threads` to
+    /// `execute_single_thread_mode`; see its `#[allow(dead_code)]` doc comment),
+    /// but it still carried the same NaN-bypass bug and is retained pending a
+    /// follow-up removal, so it is exercised directly here rather than through
+    /// `CorrectUmis::execute`.
+    #[test]
+    fn test_min_corrected_errors_on_empty_input_threads_mode() -> Result<()> {
+        let input = create_test_bam(vec![])?;
+        let paths = TestPaths::new()?;
+
+        let corrector = CorrectUmis {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
+            },
+            rejects_opts: RejectsOptions::default(),
+            metrics: None,
+            target: Target::Umi,
+            max_mismatches: 1,
+            min_distance_diff: 2,
+            umis: vec!["AAAAAA".to_string()],
+            umi_files: vec![],
+            dont_store_original_umis: false,
+            cache_size: 100_000,
+            min_corrected: Some(0.5),
+            revcomp: false,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        };
+
+        let (umi_sequences, umi_length) = corrector.load_umi_sequences()?;
+        let encoded_umi_set = Arc::new(EncodedUmiSet::new(&umi_sequences));
+
+        let reader_opts = corrector.io.pipeline_reader_opts();
+        let (reader, header) =
+            create_bam_reader_for_pipeline_with_opts(&corrector.io.input, reader_opts)?;
+        let header = crate::commands::common::ensure_hd_record(header)?;
+
+        let result =
+            corrector.execute_threads_mode(1, reader, header, encoded_umi_set, umi_length, false);
+
+        let err = result.expect_err("--min-corrected must error on empty input, not silently pass");
+        assert!(
+            err.to_string().contains("No reads were processed"),
+            "error should explain empty input (chain-path parity), got: {err}"
+        );
+
+        Ok(())
+    }
+
+    /// End-to-end regression test for the LIVE `--threads N` (chain) path:
+    /// empty input under a positive `--min-corrected` must error, exactly
+    /// like the legacy no-`--threads` path covered above. The chain path
+    /// dispatches through `execute_chain` → `CorrectFinalizeHook::finalize`,
+    /// which already called the shared `check_min_corrected` before this PR
+    /// (this PR only fixed the two legacy sites' inline NaN-prone checks), so
+    /// this pins that existing chain-path correctness rather than a new fix.
+    ///
+    /// See also the equivalent integration-level test
+    /// `test_correct_chain_rejects_empty_input_with_min_corrected` in
+    /// `tests/integration/test_correct_command.rs`, which drives the same
+    /// scenario through `CorrectUmis::try_parse_from`.
+    #[rstest]
+    #[case::empty_input_positive_min_errors(vec![], Some(0.5), true)]
+    #[case::non_empty_input_min_met_passes(vec![("q1", Some("AAAAAA"))], Some(0.5), false)]
+    fn test_min_corrected_empty_input_chain_mode(
+        #[case] records: Vec<(&str, Option<&str>)>,
+        #[case] min_corrected: Option<f64>,
+        #[case] expect_err: bool,
+    ) -> Result<()> {
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let corrector = CorrectUmis {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
+            },
+            rejects_opts: RejectsOptions::default(),
+            metrics: None,
+            target: Target::Umi,
+            max_mismatches: 1,
+            min_distance_diff: 2,
+            umis: vec!["AAAAAA".to_string()],
+            umi_files: vec![],
+            dont_store_original_umis: false,
+            cache_size: 100_000,
+            min_corrected,
+            revcomp: false,
+            threading: ThreadingOptions::new(2),
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        };
+
+        let result = corrector.execute("test");
+        if expect_err {
+            let err = result
+                .expect_err("--min-corrected must error on empty input on the chain path too");
+            assert!(
+                err.to_string().contains("No reads were processed"),
+                "error should explain empty input, got: {err}"
+            );
+        } else {
+            result?;
+        }
 
         Ok(())
     }
