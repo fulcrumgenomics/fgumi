@@ -339,10 +339,11 @@ pub struct Codec {
 /// implements `Default` (`FgbioCompat`), matching `TieRuleArg::FgbioCompat`'s
 /// resolution.
 ///
-/// `min_reads` has a `default_value` on the standalone command (unlike
-/// simplex/duplex's `min-reads`), so the macro does NOT lift it to a
-/// staged-required field: `MultiCodecOptions::validate()` accepts an omitted
-/// `--codec::min-reads`.
+/// `min_reads` has a `default_value` on the standalone command (like duplex's
+/// `min-reads`, which also carries `default_value = "1"` — unlike simplex's
+/// `min-reads`, which has none and is clap-required), so the macro does NOT
+/// lift it to a staged-required field: `MultiCodecOptions::validate()`
+/// accepts an omitted `--codec::min-reads`.
 ///
 /// `allow_unmapped` is `#[arg(skip = AllowUnmappedOptions { enabled: false })]`:
 /// [`AllowUnmappedOptions`] does not implement `Default`, so the explicit

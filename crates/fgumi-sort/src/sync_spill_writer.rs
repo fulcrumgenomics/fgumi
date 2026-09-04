@@ -138,7 +138,7 @@ impl<K: RawSortKey> SyncSpillWriter<K> {
     /// Create a writer for `path` using `codec` at `compression` level.
     ///
     /// For zstd, `compression` is the zstd level (must be ≥ 1 — level 0 is
-    /// rejected up front by `SortOptions::validate`, since zstd has no
+    /// rejected up front by `SortOptions::validate_spill_settings`, since zstd has no
     /// uncompressed mode). For bgzf, `compression == 0` writes *framed* stored
     /// (uncompressed) BGZF blocks and `> 0` writes deflate-compressed BGZF blocks
     /// at that level — in both cases valid, reader-consumable BGZF.
