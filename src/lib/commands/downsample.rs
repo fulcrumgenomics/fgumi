@@ -2,6 +2,8 @@
 //!
 //! This tool reads a BAM file that has been processed by fgumi group (or fgbio `GroupReadsByUmi`),
 //! uniformly samples UMI families based on the MI tag, and outputs kept reads directly to a BAM file.
+//! By default the two duplex strands of a molecule (`<base>/A` and `<base>/B`) are sampled as one
+//! family; `--per-strand` restores the legacy behavior of sampling each raw MI tag independently.
 //!
 //! Requires input BAM to be in template-coordinate order (from group).
 
@@ -24,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use crate::commands::command::Command;
 use crate::commands::common::{BamIoOptions, CompressionOptions, reject_output_collisions};
+use crate::umi::extract_mi_base;
 
 /// Downsample a BAM file by UMI family using streaming.
 ///
@@ -62,10 +65,20 @@ design, and differs from `DownsampleSam` in several deliberate ways:
 Because the sampling unit, decision function, and RNG all differ, output is intentionally not
 bit-identical to `DownsampleSam`; only a statistically-equivalent fraction of families is kept.
 
+DUPLEX DATA: the `paired` grouping strategy tags the two strands of a molecule `<base>/A` and
+`<base>/B`. By default downsample reduces each MI to its molecule base (the same last-`/`
+truncation `group` and `duplex` use) and samples whole molecules — both strands kept or dropped
+together — so duplex families survive at the intended fraction. Simplex MIs (no `/A`,`/B` suffix)
+are a no-op under this rule and unaffected. Pass `--per-strand` to instead sample each raw MI tag
+independently (legacy behavior); on duplex data this collapses duplex families, because a molecule
+then survives as a duplex only with probability fraction^2 — use it only when you deliberately want
+strand-level sampling.
+
 Example usage:
   fgumi downsample -i grouped.bam -o downsampled.bam -f 0.1 --seed 42
   fgumi downsample -i grouped.bam -o kept.bam -f 0.5 --rejects rejected.bam
   fgumi downsample -i grouped.bam -o kept.bam -f 0.1 --histogram-kept kept_hist.txt
+  fgumi downsample -i duplex.grouped.bam -o kept.bam -f 0.1 --per-strand   # legacy per-strand
 "#
 )]
 pub struct Downsample {
@@ -88,6 +101,20 @@ pub struct Downsample {
     /// Validate that MI tags appear in consecutive groups (error if seen non-consecutively)
     #[arg(long = "validate-mi-order", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub validate_mi_order: bool,
+
+    /// Sample by raw MI tag rather than by molecule, sampling each duplex strand independently.
+    ///
+    /// By default downsample groups by molecule: each MI is reduced to its molecule base
+    /// before grouping (the same last-`/` truncation `group`/`duplex` use), so the two
+    /// strands the `paired` (duplex) strategy tags `<base>/A` and `<base>/B` form ONE family
+    /// sharing a single keep/reject draw and are kept or dropped together. Simplex MIs (no
+    /// `/A`,`/B` suffix) have no `/` to strip and are unaffected either way. With this flag
+    /// each raw MI value is a separate family with its own draw — so a duplex molecule
+    /// survives as a duplex only if BOTH strand draws hit (probability `fraction`^2),
+    /// collapsing duplex families at low fractions. Use only when you deliberately want
+    /// strand-level sampling. Off by default.
+    #[arg(long = "per-strand", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub per_strand: bool,
 
     /// Output file for kept family size histogram
     #[arg(long = "histogram-kept")]
@@ -157,6 +184,13 @@ impl Command for Downsample {
         if self.validate_mi_order {
             info!("MI order validation: enabled");
         }
+        if self.per_strand {
+            info!(
+                "Sampling unit: strand (legacy per-MI sampling; duplex strands sampled independently)"
+            );
+        } else {
+            info!("Sampling unit: molecule (duplex strands /A,/B grouped and sampled together)");
+        }
         // downsample is single-threaded and reads through fgumi-bgzf's decoder
         // (`create_raw_bam_reader_with_opts` with threads=1), so it honors
         // --check-crc/--no-check-crc (#800).
@@ -212,7 +246,7 @@ impl Command for Downsample {
 
         info!("Processing reads...");
 
-        let mut family_iter = FamilyIterator::new(raw_record_iter(reader));
+        let mut family_iter = FamilyIterator::new(raw_record_iter(reader), self.per_strand);
 
         while let Some(family_result) = family_iter.next_family()? {
             let (mi, family) = family_result;
@@ -343,23 +377,30 @@ where
     I: Iterator<Item = Result<RawRecord>>,
 {
     records: std::iter::Peekable<I>,
+    /// When true (`--per-strand`), group by the raw MI tag (legacy). When false
+    /// (default), group by the molecule base MI so a duplex molecule's `<base>/A`
+    /// and `<base>/B` strands fall into one family. See `Downsample::per_strand`.
+    per_strand: bool,
 }
 
 impl<I> FamilyIterator<I>
 where
     I: Iterator<Item = Result<RawRecord>>,
 {
-    fn new(records: I) -> Self {
-        Self { records: records.peekable() }
+    fn new(records: I, per_strand: bool) -> Self {
+        Self { records: records.peekable(), per_strand }
     }
 
-    /// Get the next family of records sharing the same MI tag.
+    /// Get the next family of records sharing the same family key.
     ///
-    /// Returns `Ok(Some((mi_tag`, records))) for each family, or Ok(None) when exhausted.
+    /// The key is the molecule base MI (any trailing `/A`/`/B` duplex-strand suffix
+    /// stripped, so both strands of a molecule fall into one family), or — when
+    /// `per_strand` is set — the raw MI tag. Returns `Ok(Some((key, records)))` for
+    /// each family, or `Ok(None)` when exhausted.
     fn next_family(&mut self) -> Result<Option<(String, Vec<RawRecord>)>> {
-        // Peek at the first record to get the MI tag
-        let mi = match self.records.peek() {
-            Some(Ok(record)) => get_mi_tag(record)?,
+        // Peek at the first record to get the family key
+        let key = match self.records.peek() {
+            Some(Ok(record)) => family_key(record, self.per_strand)?,
             Some(Err(_)) => {
                 // Consume the error — next() is Some because peek() was Some(Err(_))
                 return Err(self.records.next().expect("peek() returned Some").unwrap_err());
@@ -367,16 +408,16 @@ where
             None => return Ok(None),
         };
 
-        // Collect all records with the same MI tag
+        // Collect all records with the same family key
         let mut family = Vec::new();
 
         while let Some(peek_result) = self.records.peek() {
             match peek_result {
                 Ok(record) => {
-                    // Compare the MI against the family key without allocating a
+                    // Compare the key against the family key without allocating a
                     // `String` per record — the family key was already materialized
                     // once above.
-                    if !mi_tag_equals(record, mi.as_bytes())? {
+                    if !family_key_equals(record, key.as_bytes(), self.per_strand)? {
                         break;
                     }
                     // Consume the record — next() is Some because peek() was Some
@@ -389,8 +430,56 @@ where
             }
         }
 
-        Ok(Some((mi, family)))
+        Ok(Some((key, family)))
     }
+}
+
+/// The family key for a record: its molecule base by default, or the raw MI tag
+/// when `per_strand` is set. The molecule base is computed by the canonical
+/// [`extract_mi_base`], which truncates at the last `/` exactly as `group`,
+/// `duplex`, and `duplex_metrics` do when collapsing strands to their source
+/// molecule — so grouping here matches the rest of the pipeline rather than a
+/// second, divergent strip rule.
+fn family_key(record: &RawRecord, per_strand: bool) -> Result<String> {
+    let mut mi = get_mi_tag(record)?;
+    if !per_strand {
+        // `mi` is already valid UTF-8, and `extract_mi_base` truncates at an ASCII
+        // '/' boundary, so truncating in place stays on a char boundary and reuses
+        // the existing allocation rather than round-tripping through a new String.
+        let base_len = extract_mi_base(&mi).len();
+        mi.truncate(base_len);
+    }
+    Ok(mi)
+}
+
+/// Whether a record's family key equals `target`, without allocating.
+///
+/// Mirrors [`family_key`]: compares its molecule base by default, or the raw MI
+/// tag when `per_strand` is set. Delegates to [`mi_tag_equals`] in the raw case;
+/// in the molecule case it reduces the record's MI to its base via the canonical
+/// [`extract_mi_base`] (the Z-typed path) and compares to `target`, which is
+/// itself already a base key.
+fn family_key_equals(record: &RawRecord, target: &[u8], per_strand: bool) -> Result<bool> {
+    if per_strand {
+        return mi_tag_equals(record, target);
+    }
+
+    let aux = aux_data_slice(record.as_ref());
+
+    if let Some(bytes) = find_string_tag(aux, SamTag::MI) {
+        let mi = std::str::from_utf8(bytes)
+            .map_err(|e| anyhow::anyhow!("MI tag is not valid UTF-8: {e}"))?;
+        return Ok(extract_mi_base(mi).as_bytes() == target);
+    }
+
+    if let Some(v) = find_int_tag(aux, SamTag::MI) {
+        // Integer MIs never carry a strand suffix, so the base equals the rendering.
+        return Ok(v.to_string().as_bytes() == target);
+    }
+
+    let name = String::from_utf8_lossy(read_name(record.as_ref())).into_owned();
+    let display_name = if name.is_empty() { "<unknown>".to_string() } else { name };
+    bail!("Read '{display_name}' is missing required MI tag")
 }
 
 /// Extract the MI tag value from a raw BAM record.
@@ -573,7 +662,7 @@ mod tests {
             Ok(create_test_record("r3", "100")),
         ];
 
-        let mut iter = FamilyIterator::new(records.into_iter());
+        let mut iter = FamilyIterator::new(records.into_iter(), false);
 
         let family1 =
             iter.next_family().expect("next_family should succeed").expect("expected a family");
@@ -595,7 +684,7 @@ mod tests {
             Ok(create_test_record("r6", "300")),
         ];
 
-        let mut iter = FamilyIterator::new(records.into_iter());
+        let mut iter = FamilyIterator::new(records.into_iter(), false);
 
         let family1 =
             iter.next_family().expect("next_family should succeed").expect("expected family 1");
@@ -619,7 +708,7 @@ mod tests {
     #[test]
     fn test_family_iterator_empty() {
         let records: Vec<Result<RawRecord>> = vec![];
-        let mut iter = FamilyIterator::new(records.into_iter());
+        let mut iter = FamilyIterator::new(records.into_iter(), false);
 
         let family = iter.next_family().expect("next_family should succeed");
         assert!(family.is_none());
@@ -655,6 +744,7 @@ mod tests {
             rejects: Some(PathBuf::from("rejects.bam")),
             seed: Some(42),
             validate_mi_order: true,
+            per_strand: true,
             histogram_kept: Some(PathBuf::from("kept.txt")),
             histogram_rejected: Some(PathBuf::from("rejected.txt")),
             compression: CompressionOptions { compression_level: 1 },
@@ -663,6 +753,7 @@ mod tests {
         assert_eq!(cmd.fraction, 0.1);
         assert_eq!(cmd.seed, Some(42));
         assert!(cmd.validate_mi_order);
+        assert!(cmd.per_strand);
         assert!(cmd.rejects.is_some());
         assert!(cmd.histogram_kept.is_some());
         assert!(cmd.histogram_rejected.is_some());
@@ -698,5 +789,107 @@ mod tests {
         // BTreeMap maintains sorted order
         let sizes: Vec<usize> = hist.keys().copied().collect();
         assert_eq!(sizes, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn test_family_key_respects_per_strand() {
+        let a = create_test_record("r", "7/A");
+        // Default (molecule) strips the strand suffix; --per-strand keeps the raw tag.
+        assert_eq!(family_key(&a, false).unwrap(), "7");
+        assert_eq!(family_key(&a, true).unwrap(), "7/A");
+
+        // An integer MI has no `/`, so both modes agree.
+        let i = create_test_record_int_mi("r", 7);
+        assert_eq!(family_key(&i, false).unwrap(), "7");
+        assert_eq!(family_key(&i, true).unwrap(), "7");
+    }
+
+    /// The default molecule key uses the canonical `extract_mi_base` rule (strip at
+    /// the last `/`), NOT a `/A`,`/B`-only strip: any final `/`-suffix is removed, and
+    /// a leading `/` (empty base) is preserved. Pinned deliberately so a future change
+    /// cannot silently narrow the rule to `/A`,`/B` and diverge downsample's grouping
+    /// from `group`/`duplex`, which collapse strands with this same canonical rule.
+    #[test]
+    fn test_family_key_default_strips_any_suffix_canonically() {
+        // A non-/A,/B suffix is still stripped (matches group/duplex, not narrowed).
+        assert_eq!(family_key(&create_test_record("r", "7/C"), false).unwrap(), "7");
+        // A leading '/' is an empty base and is preserved verbatim (extract_mi_base).
+        assert_eq!(family_key(&create_test_record("r", "/A"), false).unwrap(), "/A");
+    }
+
+    #[test]
+    fn test_family_key_equals_per_strand() {
+        let a = create_test_record("r", "7/A");
+        let b = create_test_record("r", "7/B");
+
+        // Default (molecule): both strands match the base key "7".
+        assert!(family_key_equals(&a, b"7", false).unwrap());
+        assert!(family_key_equals(&b, b"7", false).unwrap());
+        assert!(!family_key_equals(&a, b"8", false).unwrap());
+
+        // --per-strand: /A and /B are different families.
+        assert!(family_key_equals(&a, b"7/A", true).unwrap());
+        assert!(!family_key_equals(&b, b"7/A", true).unwrap());
+
+        // A missing MI is an error in both modes (mirrors get_mi_tag).
+        let none = create_test_record_no_mi("r");
+        assert!(family_key_equals(&none, b"7", false).is_err());
+        assert!(family_key_equals(&none, b"7", true).is_err());
+    }
+
+    /// `family_key_equals` must agree with `family_key` + compare, in BOTH modes and
+    /// across Z-typed and integer MIs — they are the two sides of the same grouping
+    /// decision and drift between them would split or merge families incorrectly.
+    #[test]
+    fn test_family_key_equals_matches_family_key() {
+        let records = [
+            create_test_record("r", "7/A"),
+            create_test_record("r", "7/B"),
+            create_test_record("r", "7"), // simplex MI, no suffix
+            create_test_record_int_mi("r", 7),
+        ];
+        for per_strand in [false, true] {
+            for rec in &records {
+                let key = family_key(rec, per_strand).unwrap();
+                assert!(
+                    family_key_equals(rec, key.as_bytes(), per_strand).unwrap(),
+                    "family_key_equals disagreed with family_key (per_strand={per_strand})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_family_iterator_duplex_strands_grouped_by_default_and_split_by_per_strand() {
+        // One molecule's two strands (7/A, 7/B), then a second molecule (8/A).
+        // Built fresh per iterator: Vec<Result<_, anyhow::Error>> is not Clone.
+        let records = || {
+            vec![
+                Ok(create_test_record("r1", "7/A")),
+                Ok(create_test_record("r2", "7/A")),
+                Ok(create_test_record("r3", "7/B")),
+                Ok(create_test_record("r4", "8/A")),
+            ]
+        };
+
+        // Default (per_strand = false): 7/A + 7/B collapse into ONE family keyed "7".
+        let mut iter = FamilyIterator::new(records().into_iter(), false);
+        let fam1 = iter.next_family().unwrap().expect("family 1");
+        assert_eq!(fam1.0, "7");
+        assert_eq!(fam1.1.len(), 3); // both strands of molecule 7
+        let fam2 = iter.next_family().unwrap().expect("family 2");
+        assert_eq!(fam2.0, "8");
+        assert_eq!(fam2.1.len(), 1);
+        assert!(iter.next_family().unwrap().is_none());
+
+        // --per-strand (true): 7/A and 7/B are separate families.
+        let mut iter = FamilyIterator::new(records().into_iter(), true);
+        let f1 = iter.next_family().unwrap().expect("family 7/A");
+        assert_eq!((f1.0.as_str(), f1.1.len()), ("7/A", 2));
+        let f2 = iter.next_family().unwrap().expect("family 7/B");
+        assert_eq!((f2.0.as_str(), f2.1.len()), ("7/B", 1));
+        let f3 = iter.next_family().unwrap().expect("family 8/A");
+        assert_eq!((f3.0.as_str(), f3.1.len()), ("8/A", 1));
+        assert!(iter.next_family().unwrap().is_none());
     }
 }

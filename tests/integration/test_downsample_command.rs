@@ -12,6 +12,7 @@ use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::Value;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -459,6 +460,245 @@ fn test_downsample_keep_all() {
     // All records should be kept
     let output_records = read_bam_records(&output_bam);
     assert_eq!(output_records.len(), 15, "All 15 records should be kept with fraction=1.0");
+}
+
+/// Collect `(read_name, MI)` for every record in a BAM, in file order. Used to
+/// assert source-record IDENTITY (which named reads survived), not just counts.
+fn read_bam_name_mi_pairs(path: &PathBuf) -> Vec<(String, String)> {
+    read_bam_records(path)
+        .iter()
+        .map(|r| {
+            let name = r.name().map(ToString::to_string).unwrap_or_default();
+            let mi = match r.data().get(&MI_TAG) {
+                Some(Value::String(s)) => s.to_string(),
+                Some(_) => panic!("MI tag is not a string"),
+                None => panic!("record is missing its MI tag"),
+            };
+            (name, mi)
+        })
+        .collect()
+}
+
+/// The molecule base of an MI: everything before the last `/` (mirrors
+/// `extract_mi_base`), so `100/A` and `100/B` share the base `100`.
+fn mi_base(mi: &str) -> &str {
+    match mi.rfind('/') {
+        Some(i) if i > 0 => &mi[..i],
+        _ => mi,
+    }
+}
+
+/// End-to-end: by default (molecule grouping), the two duplex strands of a
+/// molecule are sampled as ONE family — kept or dropped together — so no
+/// surviving molecule base ever appears with only one of its strands. This holds
+/// for ANY seed, which is what makes the assertion robust: it is the atomicity
+/// guarantee, not a specific RNG outcome. The complementary `--per-strand`
+/// behavior (strands sampled independently) is covered by
+/// `test_downsample_per_strand_splits_duplex_strands` and the `FamilyIterator`
+/// unit tests.
+#[test]
+fn test_downsample_default_keeps_duplex_strands_together() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    // 12 duplex molecules, each with an /A strand (3 reads) and a /B strand
+    // (2 reads) laid out consecutively as group emits them, plus one simplex
+    // family with no strand suffix. Enough molecules that a fraction of 0.5
+    // keeps some and drops some, exercising the all-or-nothing path on both.
+    // create_grouped_bam names reads `read_{idx}` sequentially in family order,
+    // so molecule i owns read indices [i*5, i*5+5) — the exact set we assert
+    // survives as a unit below.
+    let mut families: Vec<(String, usize)> = Vec::new();
+    for i in 0..12 {
+        families.push((format!("{i}/A"), 3));
+        families.push((format!("{i}/B"), 2));
+    }
+    families.push(("999".to_string(), 4)); // simplex family, no suffix
+    let families_ref: Vec<(&str, usize)> =
+        families.iter().map(|(mi, n)| (mi.as_str(), *n)).collect();
+    create_grouped_bam(&input_bam, families_ref);
+
+    // No flag: molecule grouping is the default.
+    let cmd = Downsample::try_parse_from([
+        "downsample",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_bam.to_str().unwrap(),
+        "-f",
+        "0.5",
+        "--seed",
+        "7",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse downsample args");
+    cmd.execute("fgumi downsample").expect("Downsample command failed");
+
+    // Group the surviving reads by molecule base: which named reads and which
+    // strand suffixes survived under each base.
+    let mut names_by_base: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut strands_by_base: HashMap<String, HashSet<String>> = HashMap::new();
+    for (name, mi) in read_bam_name_mi_pairs(&output_bam) {
+        let base = mi_base(&mi).to_string();
+        let suffix = mi.strip_prefix(base.as_str()).unwrap_or("").to_string();
+        names_by_base.entry(base.clone()).or_default().insert(name);
+        strands_by_base.entry(base).or_default().insert(suffix);
+    }
+
+    // At least one duplex molecule survived and at least one was dropped, so the
+    // test actually exercises both branches (not a vacuous pass on an empty or
+    // full output).
+    let duplex_survivors = (0..12).filter(|i| names_by_base.contains_key(&i.to_string())).count();
+    assert!(duplex_survivors > 0, "expected some duplex molecules to survive at f=0.5");
+    assert!(duplex_survivors < 12, "expected some duplex molecules to be dropped at f=0.5");
+
+    // The core invariant, asserted by source-record IDENTITY (not just counts):
+    // every surviving duplex molecule kept BOTH strands and EXACTLY its own five
+    // reads (`read_{i*5}`..`read_{i*5+4}`: 3 from /A + 2 from /B). A molecule with
+    // only one strand — or with a read that belongs to a different molecule —
+    // would mean the strands were sampled independently or mis-grouped.
+    for i in 0..12 {
+        let base = i.to_string();
+        if let Some(names) = names_by_base.get(&base) {
+            let expected_names: HashSet<String> =
+                (i * 5..i * 5 + 5).map(|idx| format!("read_{idx}")).collect();
+            assert_eq!(
+                names, &expected_names,
+                "molecule {base} survived with reads {names:?}, expected exactly {expected_names:?}"
+            );
+            assert_eq!(
+                strands_by_base.get(&base),
+                Some(&HashSet::from(["/A".to_string(), "/B".to_string()])),
+                "molecule {base} survived without both /A and /B strands present"
+            );
+        }
+    }
+}
+
+/// By default at `f=1.0`, a simplex family (an MI with no `/A`/`/B` strand
+/// suffix) is preserved in full: exactly its own records survive, each still
+/// carrying its original MI. Deterministic complement to
+/// `keeps_duplex_strands_together`, which samples a mixed input at `f=0.5` where
+/// any single family's survival is not guaranteed. As per CLAUDE.md path
+/// instructions, which require coverage of simplex-record preservation by
+/// identity, not just its shape.
+#[test]
+fn test_downsample_default_preserves_simplex_family() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    // A single simplex family: MI `999`, four reads (read_0..read_3), no suffix.
+    create_grouped_bam(&input_bam, vec![("999", 4)]);
+
+    // No flag: molecule grouping is the default (a no-op for a simplex MI,
+    // which has no `/` to strip).
+    let cmd = Downsample::try_parse_from([
+        "downsample",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_bam.to_str().unwrap(),
+        "-f",
+        "1.0",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse downsample args");
+    cmd.execute("fgumi downsample").expect("Downsample command failed");
+
+    // f=1.0 keeps everything: exactly the four input reads survive, each with MI
+    // `999`. Assert identity (which named reads), not just the count/MI shape.
+    let pairs = read_bam_name_mi_pairs(&output_bam);
+    let got: HashSet<(String, String)> = pairs.iter().cloned().collect();
+    let expected: HashSet<(String, String)> =
+        (0..4).map(|idx| (format!("read_{idx}"), "999".to_string())).collect();
+    assert_eq!(
+        got, expected,
+        "all four simplex reads (read_0..read_3) must be kept with MI 999 at f=1.0, got {pairs:?}"
+    );
+}
+
+/// With `--per-strand`, the legacy behavior is restored: a molecule's two strands
+/// are sampled INDEPENDENTLY, so a surviving molecule base may have only one of
+/// its strands. This is the opt-out inverse of the default atomicity invariant.
+/// Seed-pinned so the input is large enough that some molecule splits under
+/// independent draws (the whole reason `--per-strand` collapses duplex families).
+#[test]
+fn test_downsample_per_strand_splits_duplex_strands() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    // 12 duplex molecules laid out as group emits them (/A then /B per molecule).
+    let mut families: Vec<(String, usize)> = Vec::new();
+    for i in 0..12 {
+        families.push((format!("{i}/A"), 3));
+        families.push((format!("{i}/B"), 2));
+    }
+    let families_ref: Vec<(&str, usize)> =
+        families.iter().map(|(mi, n)| (mi.as_str(), *n)).collect();
+    create_grouped_bam(&input_bam, families_ref);
+
+    let cmd = Downsample::try_parse_from([
+        "downsample",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-o",
+        output_bam.to_str().unwrap(),
+        "-f",
+        "0.5",
+        "--seed",
+        "7",
+        "--per-strand",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse downsample args");
+    cmd.execute("fgumi downsample").expect("Downsample command failed");
+
+    // Each raw MI (`i/A`, `i/B`) was its own family with its own draw. Collect the
+    // surviving read NAMES per raw MI, and the surviving strand suffixes per base.
+    // create_grouped_bam names reads `read_{idx}` sequentially in family order, so
+    // molecule i occupies [i*5, i*5+5): `i/A` = read_{i*5..i*5+3}, `i/B` = the next 2.
+    let mut names_by_raw_mi: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut strands_by_base: HashMap<String, HashSet<String>> = HashMap::new();
+    for (name, mi) in read_bam_name_mi_pairs(&output_bam) {
+        let base = mi_base(&mi).to_string();
+        let suffix = mi.strip_prefix(base.as_str()).unwrap_or("").to_string();
+        names_by_raw_mi.entry(mi).or_default().insert(name);
+        strands_by_base.entry(base).or_default().insert(suffix);
+    }
+
+    // Per-strand keeps or drops each raw MI family ATOMICALLY (it is still a
+    // family-atomic sampler — only the family key differs). So every RETAINED raw
+    // MI must contain exactly its own source reads — all three of an `/A`, both of
+    // a `/B` — never a partial family. This is the raw-MI identity contract, the
+    // per-strand analogue of the by-molecule identity check.
+    for (mi, names) in &names_by_raw_mi {
+        let i: usize = mi_base(mi).parse().expect("base MI is an integer in this fixture");
+        let expected: HashSet<String> = if mi.ends_with("/A") {
+            (i * 5..i * 5 + 3).map(|idx| format!("read_{idx}")).collect()
+        } else {
+            (i * 5 + 3..i * 5 + 5).map(|idx| format!("read_{idx}")).collect()
+        };
+        assert_eq!(
+            names, &expected,
+            "raw MI {mi} survived with reads {names:?}, expected exactly its own family {expected:?}"
+        );
+    }
+
+    // The defining property of per-strand sampling: at least one molecule survived
+    // with only ONE of its two strands. (Under the default molecule grouping this
+    // can never happen — see keeps_duplex_strands_together.)
+    let split = strands_by_base.values().any(|strands| strands.len() == 1);
+    assert!(
+        split,
+        "expected at least one molecule to survive with a single strand under --per-strand, \
+         got {strands_by_base:?}"
+    );
 }
 
 /// Test error handling for invalid fractions. Each case writes to a
