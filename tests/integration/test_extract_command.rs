@@ -608,23 +608,23 @@ fn test_parallel_parse_output_equivalence_across_threads() {
     }
 }
 
-/// The chain (`--threads`) output must equal the serial oracle (no `--threads`)
-/// on decoded records AND normalized header, with `--threads 1` explicitly
-/// covered. `--threads 1` already ran a parallel path before this change (the
-/// now-deleted legacy `process_with_pipeline`, since the old `is_parallel()`
-/// dispatch was true for every `Threads(n)`); the cutover moves it onto the chain
-/// builder. The earlier across-threads equivalence test only compares the chain
-/// against itself at different `--threads` values, so this is the test that pins
-/// the chain against the serial oracle.
+/// Extract's output must be independent of the worker count: a no-`--threads`
+/// run (the chain at a single worker) must equal a `--threads N` run on decoded
+/// records AND normalized header, with `--threads 1` explicitly covered. Since
+/// the legacy serial path was retired, both invocations route through the
+/// declarative chain builder; this pins single-worker output against
+/// multi-worker output (the earlier across-threads test only compares
+/// `--threads` values against each other, never the no-`--threads` default).
 ///
 /// Fixed-value anchors (record count, each mate's template sequence, the combined
-/// `RX`, and the `RG`) are pinned in addition to chain==oracle, so a regression
-/// in the shared record-building code is caught even when both paths still agree
-/// with each other.
+/// `RX`, and the `RG`) are pinned in addition to the cross-worker-count equality,
+/// so a regression in the shared record-building code is caught even when both
+/// runs still agree with each other. (Byte-parity against the pre-removal serial
+/// binary lives in `test_extract_cutover_parity.rs`.)
 #[rstest]
 #[case::threads_one(1)]
 #[case::threads_four(4)]
-fn chain_matches_serial_oracle(#[case] threads: usize) {
+fn no_threads_matches_threaded(#[case] threads: usize) {
     use fgumi_lib::sam::SamTag;
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::data::field::Value;
@@ -664,7 +664,7 @@ fn chain_matches_serial_oracle(#[case] threads: usize) {
 
     let oracle_out = tmp.path().join("oracle.bam");
     let chain_out = tmp.path().join(format!("chain_t{threads}.bam"));
-    run(None, &oracle_out); // serial oracle (no --threads)
+    run(None, &oracle_out); // chain at a single worker (no --threads)
     run(Some(threads), &chain_out); // chain (--threads N, incl. N == 1)
 
     let (oracle_hdr, oracle_recs) = crate::helpers::read_bam_output(&oracle_out);
@@ -672,7 +672,7 @@ fn chain_matches_serial_oracle(#[case] threads: usize) {
     assert_eq!(chain_hdr, oracle_hdr, "normalized header parity (threads={threads})");
     assert_eq!(chain_recs, oracle_recs, "record parity (threads={threads})");
 
-    // Fixed-value anchors on the oracle output (which the chain now equals): one
+    // Fixed-value anchors on the single-worker output (which the threaded run now equals): one
     // record per mate, the template halves after the 5 bp UMI, the combined
     // R1-R2 UMI in RX, and the default read group on every record.
     assert_eq!(oracle_recs.len(), 2, "one BAM record per mate");
@@ -690,21 +690,19 @@ fn chain_matches_serial_oracle(#[case] threads: usize) {
     }
 }
 
-/// Chain-vs-oracle parity across the barcode / single-tag / annotate branches of
-/// the record builder. `chain_matches_serial_oracle` covers only RX/RG, and every
-/// threading-parameterized tag test pins `store_cell_quals` / `single_tag` /
-/// `annotate_read_names` / `store_sample_barcode_qualities` off, so nothing else
-/// exercises those branches on the chain path — yet the chain
-/// (`make_raw_records_from_fastq_set`) and the serial oracle (`make_raw_records`)
-/// are two independent copies of that tag-append block. A single-end `2C2B2M+T`
-/// read with every tag flag on drives CB/CY, BC/QT, RX/QX, the `--single-tag`
-/// copy, and `--annotate-read-names`; the chain must match the serial oracle
-/// byte-for-byte, and the emitted tag values are pinned so a shared-code
-/// regression is caught even when the two paths still agree.
+/// Cross-worker-count parity across the barcode / single-tag / annotate branches
+/// of the record builder. `no_threads_matches_threaded` covers only RX/RG, and
+/// every threading-parameterized tag test pins `store_cell_quals` / `single_tag`
+/// / `annotate_read_names` / `store_sample_barcode_qualities` off, so nothing else
+/// exercises those branches. A single-end `3C3B3M+T` read with every tag flag on
+/// drives CB/CY, BC/QT, RX/QX, the `--single-tag` copy, and
+/// `--annotate-read-names`; the single-worker (no-`--threads`) and multi-worker
+/// (`--threads N`) runs must agree byte-for-byte, and the emitted tag values are
+/// pinned so a shared-code regression is caught even when the two runs still agree.
 #[rstest]
 #[case::threads_one(1)]
 #[case::threads_four(4)]
-fn chain_matches_serial_oracle_barcode_and_annotate_tags(#[case] threads: usize) {
+fn no_threads_matches_threaded_barcode_and_annotate_tags(#[case] threads: usize) {
     use fgumi_lib::sam::SamTag;
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::data::field::Value;
@@ -713,7 +711,11 @@ fn chain_matches_serial_oracle_barcode_and_annotate_tags(#[case] threads: usize)
     // 3C 3B 3M then template over a 13 bp read "AAACCCGGGTTTT": cell=AAA,
     // sample=CCC, umi=GGG, template=TTTT. (3 bp segments, so the pinned barcode/UMI
     // payloads are not 2-char tag-shaped literals the tag-literal lint would flag.)
-    let input = create_plain_fastq(&tmp, "r1.fq", &[("readX", "AAACCCGGGTTTT", "IIIIIIIIIIIII")]);
+    // The quality string is per-position distinct AND unambiguously Phred+33 (every
+    // char < ASCII 64), so each segment's quality slice is pinnable to a known value
+    // and cannot be shifted by Phred+64 encoding detection: cell qual "+,-",
+    // sample qual "./0", umi qual "123", template qual "4567".
+    let input = create_plain_fastq(&tmp, "r1.fq", &[("readX", "AAACCCGGGTTTT", "+,-./01234567")]);
 
     let run = |threads: Option<usize>, out: &Path| {
         let mut args: Vec<String> = vec![
@@ -770,10 +772,11 @@ fn chain_matches_serial_oracle_barcode_and_annotate_tags(#[case] threads: usize)
     assert_eq!(string_tag(rec, SamTag::BC), b"CCC", "sample barcode");
     assert_eq!(string_tag(rec, SamTag::RX), b"GGG", "UMI");
     assert_eq!(string_tag(rec, SamTag::MI), b"GGG", "--single-tag copy of the UMI");
-    // The store_* flags are on, so the quality tags must be present.
-    assert!(rec.data().get(&Tag::from(SamTag::CY)).is_some(), "cell-barcode quals (CY)");
-    assert!(rec.data().get(&Tag::from(SamTag::QT)).is_some(), "sample-barcode quals (QT)");
-    assert!(rec.data().get(&Tag::from(SamTag::QX)).is_some(), "UMI quals (QX)");
+    // The store_* flags are on, so the quality tags carry the per-segment quality
+    // slices verbatim (the input is unambiguously Phred+33, so no encoding shift).
+    assert_eq!(string_tag(rec, SamTag::CY), b"+,-", "cell-barcode quals (CY)");
+    assert_eq!(string_tag(rec, SamTag::QT), b"./0", "sample-barcode quals (QT)");
+    assert_eq!(string_tag(rec, SamTag::QX), b"123", "UMI quals (QX)");
     // --annotate-read-names appends `+<UMI>` to the read name.
     let name: &[u8] = rec.name().expect("read name must be present").as_ref();
     assert_eq!(name, &b"readX+GGG"[..], "annotated read name");
@@ -847,11 +850,11 @@ fn test_parallel_parse_determinism() {
 // Unified Pipeline Path Tests
 // ============================================================================
 
-/// Test BGZF+sync: multithreaded output matches single-threaded content.
+/// Test BGZF+sync: multi-worker output matches single-worker content.
 ///
-/// This verifies the new BGZF+synchronized code path (which didn't exist before
-/// the unified pipeline) produces correct output by comparing against the
-/// single-threaded fast-path result.
+/// This verifies the BGZF+synchronized code path produces correct output by
+/// comparing a `--threads 1` (single-worker) chain run against a multi-worker
+/// chain run over BGZF-compressed input.
 #[test]
 fn test_bgzf_sync_multithreaded_matches_single_threaded() {
     let tmp = TempDir::new().unwrap();
@@ -870,7 +873,7 @@ fn test_bgzf_sync_multithreaded_matches_single_threaded() {
     let r1 = create_bgzf_fastq(&tmp, "r1.fq.bgz", &records_r1);
     let r2 = create_bgzf_fastq(&tmp, "r2.fq.bgz", &records_r2);
 
-    // Run single-threaded (fast-path)
+    // Run at a single worker (--threads 1)
     let output_st = tmp.path().join("output_st.bam");
     let cmd = Extract::try_parse_from([
         "extract",
@@ -892,7 +895,7 @@ fn test_bgzf_sync_multithreaded_matches_single_threaded() {
         "1",
     ])
     .expect("failed to parse extract args");
-    cmd.execute("fgumi extract").expect("Failed to execute single-threaded extract");
+    cmd.execute("fgumi extract").expect("Failed to execute single-worker extract");
 
     // Run multithreaded (BGZF+sync through unified pipeline)
     let output_threaded = tmp.path().join("output_mt.bam");
@@ -1600,9 +1603,8 @@ fn run_extract_pair(r1: &Path, r2: &Path, output: &Path, threads: usize) -> anyh
     cmd.execute("fgumi extract")
 }
 
-/// Run `fgumi extract` over a paired FASTQ input on the single-threaded fast
-/// path (no `--threads`), returning the command result. This path runs
-/// `process_singlethreaded` rather than the 7-step pipeline.
+/// Run `fgumi extract` over a paired FASTQ input with no `--threads` flag (the
+/// chain at a single worker), returning the command result.
 fn run_extract_pair_single_threaded(r1: &Path, r2: &Path, output: &Path) -> anyhow::Result<()> {
     let cmd = Extract::try_parse_from([
         "extract",
@@ -1852,11 +1854,11 @@ fn test_extract_rejects_mismatched_fastq_pair(#[case] flavor: FastqFlavor, #[cas
     }
 }
 
-/// The single-threaded fast path (no `--threads`) must reject a mismatched pair
-/// with a message that names which stream ended first, matching the threaded
-/// pipeline and the help text's promise (#773). `--threads N` (even `N == 1`)
-/// runs the pipeline, so `process_singlethreaded` is reachable only with no
-/// `--threads` flag at all — the other rejection test never exercises it.
+/// A no-`--threads` run (the chain at a single worker) must reject a mismatched
+/// pair with a message that names which stream ended first, matching the
+/// multi-worker pipeline and the help text's promise (#773). This pins the
+/// directional out-of-sync wording on the no-`--threads` invocation specifically
+/// — the other rejection test always passes `--threads N`.
 #[rstest]
 #[case::plain(FastqFlavor::Plain)]
 #[case::gzip(FastqFlavor::Gzip)]
