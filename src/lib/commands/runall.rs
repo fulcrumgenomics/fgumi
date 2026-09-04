@@ -2142,6 +2142,57 @@ mod tests {
         }
     }
 
+    /// The reverse of `stopafter_maps_to_runallstage_minus_align`: every
+    /// `RunAllStage` variant EXCEPT `AlignAndMerge` has a corresponding
+    /// `StopAfter` variant that round-trips back to it via `RunAllStage::from`.
+    ///
+    /// Enumerates all `RunAllStage` variants in a fixed array and maps each to
+    /// its `StopAfter` counterpart through an EXHAUSTIVE match (no wildcard
+    /// arm) — so if a new `RunAllStage` variant is ever added without also
+    /// adding a matching `StopAfter` variant (and updating this match), this
+    /// test fails to compile rather than silently passing.
+    #[test]
+    fn every_runallstage_except_align_has_a_stopafter() {
+        let variants = [
+            RunAllStage::Extract,
+            RunAllStage::Correct,
+            RunAllStage::AlignAndMerge,
+            RunAllStage::Zipper,
+            RunAllStage::Sort,
+            RunAllStage::Group,
+            RunAllStage::Consensus,
+            RunAllStage::Filter,
+        ];
+        for stage in variants {
+            let stop_after: Option<StopAfter> = match stage {
+                RunAllStage::Extract => Some(StopAfter::Extract),
+                RunAllStage::Correct => Some(StopAfter::Correct),
+                RunAllStage::AlignAndMerge => None,
+                RunAllStage::Zipper => Some(StopAfter::Zipper),
+                RunAllStage::Sort => Some(StopAfter::Sort),
+                RunAllStage::Group => Some(StopAfter::Group),
+                RunAllStage::Consensus => Some(StopAfter::Consensus),
+                RunAllStage::Filter => Some(StopAfter::Filter),
+            };
+            match stop_after {
+                Some(stop) => {
+                    assert_eq!(
+                        RunAllStage::from(stop),
+                        stage,
+                        "{stage} should round-trip through its StopAfter counterpart"
+                    );
+                }
+                None => {
+                    assert_eq!(
+                        stage,
+                        RunAllStage::AlignAndMerge,
+                        "only AlignAndMerge should have no StopAfter counterpart"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn display_matches_cli_values() {
         assert_eq!(RunAllStage::AlignAndMerge.to_string(), "align");

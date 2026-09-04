@@ -7,11 +7,15 @@
 
 #![allow(dead_code, unused_imports)]
 
+pub mod aligner;
 pub mod assertions;
 pub mod bam_generator;
+pub mod fastq;
 
+pub use aligner::*;
 pub use assertions::*;
 pub use bam_generator::*;
+pub use fastq::*;
 
 /// Writes `contents` to `dir/name` and returns the path.
 ///

@@ -1,10 +1,7 @@
 //! In-process `build_for`+run tests for each multi-stage transition `runall`
 //! depends on. These validate the chain plumbing (type-erased hand-offs)
 //! BEFORE the CLI is wired, per spec §9.
-use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use fgumi_lib::aligner::AlignerOptions;
 use fgumi_lib::assigner::Strategy;
@@ -41,6 +38,7 @@ use crate::helpers::bam_generator::{
     write_bam,
 };
 use crate::helpers::read_bam_output;
+use crate::helpers::{aligner_binary, build_aligner_index, write_gzip_fastq};
 
 /// Assembles a [`ChainSpec`] with the boilerplate fields every test below
 /// shares (threading/compression/scheduler/queue-memory defaults, a plain
@@ -68,16 +66,6 @@ fn base_chain_spec(
         verify_crc: false,
         command_line: "test".into(),
     }
-}
-
-/// Write a gzip-compressed FASTQ from `(name, seq, qual)` records.
-fn write_gzip_fastq(path: &Path, records: &[(&str, &str, &str)]) {
-    let file = fs::File::create(path).expect("create gzip fastq");
-    let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-    for (name, seq, qual) in records {
-        writeln!(encoder, "@{name}\n{seq}\n+\n{qual}").expect("write fastq record");
-    }
-    encoder.finish().expect("finish gzip fastq");
 }
 
 /// Build a small paired gzip FASTQ (`r1.fq.gz`, `r2.fq.gz`) with a 4 bp UMI on
@@ -167,7 +155,8 @@ fn extract_to_correct_chain_builds_and_runs() {
     };
 
     build_for(spec).expect("build").run().expect("run without panic");
-    assert!(fs::metadata(&out).unwrap().len() > 0, "corrected BAM is non-empty");
+    let (_, records) = read_bam_output(&out);
+    assert!(!records.is_empty(), "corrected BAM should have records");
 }
 
 // ─────────────────────────── Sort→Group, Group→consensus, Consensus→Filter ───────────────────────────
@@ -564,25 +553,6 @@ fn zipper_to_sort_chain_builds_and_runs() {
 // `validate_stage_opts_present` / `validate_cross_stage_constraints`), so the
 // transition's wiring is still exercised at the spec level everywhere.
 
-/// Returns the first real aligner binary found on `PATH` (`bwa-mem3`
-/// preferred, then classic `bwa`), or `None` if neither is installed.
-fn aligner_binary() -> Option<&'static str> {
-    ["bwa-mem3", "bwa"].into_iter().find(|bin| which::which(bin).is_ok())
-}
-
-/// Runs `<binary> index <reference>`, panicking on failure. Only called after
-/// the caller has confirmed `binary` is on `PATH` via [`aligner_binary`], so a
-/// failure here is a real setup regression, not a skip condition.
-fn build_aligner_index(reference: &Path, binary: &str) {
-    let status = Command::new(binary)
-        .args(["index", reference.to_str().expect("reference path is valid UTF-8")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap_or_else(|e| panic!("failed to run `{binary} index`: {e}"));
-    assert!(status.success(), "`{binary} index` failed with status {status}");
-}
-
 /// Writes a single-end unmapped BAM: `n` reads, each carrying an `RX` UMI tag
 /// and a 12bp template sequence (`ACGTACGTACGT`) that is an exact substring of
 /// `create_test_reference`'s repeating `ACGTACGT` `chr1`, so a real aligner
@@ -656,7 +626,8 @@ fn extract_to_align_chain_builds_and_runs_or_validates() {
             bag,
         );
         build_for(spec).expect("build").run().expect("run");
-        assert!(fs::metadata(&out).unwrap().len() > 0, "aligned BAM is non-empty");
+        let (_, records) = read_bam_output(&out);
+        assert!(!records.is_empty(), "aligned BAM should have records");
     } else {
         eprintln!(
             "no bwa/bwa-mem3 on PATH: validating the Extract→Align spec instead of running it"
@@ -716,7 +687,8 @@ fn correct_to_align_chain_builds_and_runs_or_validates() {
             bag,
         );
         build_for(spec).expect("build").run().expect("run");
-        assert!(fs::metadata(&out).unwrap().len() > 0, "aligned BAM is non-empty");
+        let (_, records) = read_bam_output(&out);
+        assert!(!records.is_empty(), "aligned BAM should have records");
     } else {
         eprintln!(
             "no bwa/bwa-mem3 on PATH: validating the Correct→Align spec instead of running it"
