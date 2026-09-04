@@ -39,6 +39,7 @@ use crate::helpers::bam_generator::{
     create_minimal_header, create_test_reference, create_umi_family_at_pos, write_bam,
 };
 use crate::helpers::read_bam_output;
+use crate::helpers::{aligner_binary, build_aligner_index, write_gzip_fastq};
 
 // ─────────────────────────── process + assertion helpers ───────────────────────────
 
@@ -208,27 +209,6 @@ fn grouped_bam(dir: &Path, strategy: &str, tag: &str) -> PathBuf {
     grouped
 }
 
-/// Writes a gzip-compressed FASTQ from `(name, seq, qual)` triples.
-fn write_gzip_fastq(path: &Path, records: &[(&str, &str, &str)]) {
-    let file = std::fs::File::create(path).expect("create gzip fastq");
-    let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-    for (name, seq, qual) in records {
-        writeln!(encoder, "@{name}\n{seq}\n+\n{qual}").expect("write fastq record");
-    }
-    encoder.finish().expect("finish gzip fastq");
-}
-
-/// Returns the first real aligner binary found on `PATH` (`bwa-mem3`
-/// preferred, then classic `bwa`), or `None` if neither is installed.
-///
-/// Mirrors the guard `test_runall_chain_transitions.rs` uses for the
-/// chain-builder-level Align-stage tests: align-bearing CLI tests here run
-/// end-to-end only when a real aligner is available, and are skipped (with an
-/// `eprintln!`) otherwise — never failed.
-fn aligner_binary() -> Option<&'static str> {
-    ["bwa-mem3", "bwa"].into_iter().find(|bin| which::which(bin).is_ok())
-}
-
 /// Deterministic pseudo-random ACGT sequence (xorshift64), long enough that a
 /// short substring is very unlikely to recur elsewhere in it.
 ///
@@ -273,31 +253,6 @@ fn write_unique_reference(dir: &Path, len: usize) -> (PathBuf, String) {
     (ref_path, sequence)
 }
 
-/// Runs `<binary> index <reference>`, panicking on failure. Only called after
-/// [`aligner_binary`] has confirmed `binary` is on `PATH`.
-fn build_aligner_index(reference: &Path, binary: &str) {
-    let status = Command::new(binary)
-        .args(["index", p(reference)])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap_or_else(|e| panic!("failed to run `{binary} index`: {e}"));
-    assert!(status.success(), "`{binary} index` failed with status {status}");
-}
-
-fn reverse_complement(seq: &str) -> String {
-    seq.chars()
-        .rev()
-        .map(|c| match c {
-            'A' => 'T',
-            'C' => 'G',
-            'G' => 'C',
-            'T' => 'A',
-            other => other,
-        })
-        .collect()
-}
-
 /// Writes a paired gzip FASTQ pair encoding `molecules.len()` duplex
 /// molecules, each with BOTH strands present, over a `write_unique_reference`
 /// `sequence`.
@@ -336,7 +291,7 @@ fn write_duplex_umi_fastq(
     for (mi, &(p, r1_umi, r2_umi)) in molecules.iter().enumerate() {
         let anchor_near = &sequence[p..p + TEMPLATE_LEN];
         let anchor_far = &sequence[p + SPAN..p + SPAN + TEMPLATE_LEN];
-        let anchor_far_rc = reverse_complement(anchor_far);
+        let anchor_far_rc = fgumi_dna::reverse_complement_str(anchor_far);
 
         for i in 0..DEPTH {
             // Strand A: R1 forward at the near anchor, R2 at the far anchor.
@@ -497,6 +452,67 @@ fn simplex_self_pair_matches_standalone_simplex() {
     assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
 }
 
+/// Spec §7: `--methylation-mode` (+ `--ref`) must actually reach the consensus
+/// stage's `#[arg(skip)]` `methylation_mode`/`reference` slots (wired via
+/// `resolve_methylation_mode`/`consensus_reference` in
+/// `build_stage_options_bag`), not just be accepted and silently dropped.
+/// Compares the fused `consensus(simplex)` self-pair against the standalone
+/// `fgumi simplex --methylation-mode em-seq --ref ...` oracle — record parity
+/// between the two proves the flags were threaded through identically,
+/// alongside `simplex_self_pair_matches_standalone_simplex` above proving the
+/// non-methylation self-pair.
+#[cfg(feature = "consensus")]
+#[test]
+fn simplex_self_pair_with_methylation_mode_matches_standalone() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = grouped_bam(tmp.path(), "identity", "simplex_methylation");
+    let reference = create_test_reference(tmp.path());
+    let runall_out = tmp.path().join("runall.bam");
+    let staged_out = tmp.path().join("staged.bam");
+
+    run_ok(
+        [
+            "runall",
+            "--start-from",
+            "consensus",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "-i",
+            p(&fixture),
+            "-o",
+            p(&runall_out),
+            "--simplex::min-reads",
+            "1",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            p(&reference),
+        ],
+        "runall consensus(simplex)+methylation-mode",
+    );
+    run_ok(
+        [
+            "simplex",
+            "-i",
+            p(&fixture),
+            "-o",
+            p(&staged_out),
+            "--min-reads",
+            "1",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            p(&reference),
+        ],
+        "standalone simplex+methylation-mode",
+    );
+
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
+}
+
 // ══════════════════════════ Class B: multi-stage compositions ══════════════════════════
 
 #[test]
@@ -603,13 +619,136 @@ fn sort_to_simplex_matches_staged_chain() {
     assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
 }
 
-// `codec` requires FR-overlapping paired-end fragments (each duplex molecule's
-// two strands must overlap) — the single-end UMI-family fixtures used
+// `codec` requires FR-overlapping paired-end fragments (each molecule's R1/R2
+// overlap at the same position) — the single-end UMI-family fixtures used
 // elsewhere in this file don't satisfy that, so `--consensus simplex` covers
 // the "group -> consensus (one mode)" and "group -> consensus -> filter (one
-// mode)" compositions instead. `simplex_self_pair_matches_standalone_simplex`
-// above already covers the Class A self-pair; codec's own CLI wiring is still
-// exercised by `rejects_codec_with_methylation_mode` below.
+// mode)" compositions below via those fixtures instead.
+// `group_to_codec_matches_staged_chain` below gives codec its own dedicated
+// FR-overlapping fixture and record/header parity test; codec's numeric-bounds
+// CLI wiring is additionally exercised by `rejects_codec_with_methylation_mode`.
+
+/// One CODEC-shaped read pair: R1 forward, R2 reverse, fully overlapping at
+/// the same position (mirrors real CODEC sequencing, where R1/R2 read
+/// opposite strands of the same short fragment), sharing an `RX` UMI so the
+/// `Group` stage — not a pre-set `MI` — assigns the molecule id. Mirrors
+/// `test_runall_chain_transitions.rs`'s `create_codec_umi_pair` (this file's
+/// own copy: the two integration-test binaries share fixtures only through
+/// the `helpers` module, and this one is specific to the CLI-parity shape
+/// here).
+fn create_codec_umi_pair(
+    name: &str,
+    seq: &[u8],
+    qual: &[u8],
+    ref_start: i32,
+    umi: &str,
+) -> (fgumi_raw_bam::RawRecord, fgumi_raw_bam::RawRecord) {
+    use fgumi_lib::sam::SamTag;
+    use fgumi_raw_bam::{SamBuilder, flags};
+
+    let len = seq.len();
+    let cigar_op = u32::try_from(len).expect("len fits u32") << 4;
+    let template_length = i32::try_from(len).expect("len fits i32");
+    let mate_cigar = format!("{len}M");
+
+    let mut b1 = SamBuilder::new();
+    b1.read_name(name.as_bytes())
+        .sequence(seq)
+        .qualities(qual)
+        .cigar_ops(&[cigar_op])
+        .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+        .ref_id(0)
+        .pos(ref_start)
+        .mapq(60)
+        .mate_ref_id(0)
+        .mate_pos(ref_start)
+        .template_length(template_length)
+        .add_string_tag(SamTag::RX, umi.as_bytes())
+        .add_string_tag(SamTag::MC, mate_cigar.as_bytes());
+
+    let mut b2 = SamBuilder::new();
+    b2.read_name(name.as_bytes())
+        .sequence(seq)
+        .qualities(qual)
+        .cigar_ops(&[cigar_op])
+        .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+        .ref_id(0)
+        .pos(ref_start)
+        .mapq(60)
+        .mate_ref_id(0)
+        .mate_pos(ref_start)
+        .template_length(-template_length)
+        .add_string_tag(SamTag::RX, umi.as_bytes())
+        .add_string_tag(SamTag::MC, mate_cigar.as_bytes());
+
+    (b1.build(), b2.build())
+}
+
+/// `Group→Codec` record/header parity: two overlapping CODEC-shaped read
+/// pairs sharing one `RX` UMI, grouped by identity, consensus-called by
+/// `runall --consensus codec` and compared against the staged standalone
+/// `fgumi group | fgumi codec` chain. codec (like simplex) requires a
+/// non-`Paired` group strategy (`validate_strategy_for_mode`), hence
+/// `--strategy identity` here rather than `paired`.
+#[cfg(feature = "consensus")]
+#[test]
+fn group_to_codec_matches_staged_chain() {
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10_000);
+    let mut records = Vec::new();
+    for i in 0..2 {
+        let (r1, r2) =
+            create_codec_umi_pair(&format!("pair{i}"), b"ACGTACGTAC", &[30; 10], 500, "ACGT");
+        records.push(r1);
+        records.push(r2);
+    }
+    let input = tmp.path().join("codec_input.bam");
+    write_bam(&input, &header, &records);
+
+    let runall_out = tmp.path().join("runall.bam");
+    let staged_grouped = tmp.path().join("staged_grouped.bam");
+    let staged_out = tmp.path().join("staged.bam");
+
+    run_ok(
+        [
+            "runall",
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "codec",
+            "-i",
+            p(&input),
+            "-o",
+            p(&runall_out),
+            "--group::strategy",
+            "identity",
+            "--group::edits",
+            "0",
+        ],
+        "runall group->codec",
+    );
+
+    run_ok(
+        [
+            "group",
+            "-i",
+            p(&input),
+            "-o",
+            p(&staged_grouped),
+            "--strategy",
+            "identity",
+            "--edits",
+            "0",
+        ],
+        "staged group",
+    );
+    run_ok(["codec", "-i", p(&staged_grouped), "-o", p(&staged_out)], "staged codec");
+
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
+}
 
 #[cfg(feature = "consensus")]
 #[test]
@@ -722,6 +861,316 @@ fn group_to_simplex_to_filter_matches_staged_chain() {
     run_ok(
         ["filter", "-i", p(&staged_simplex), "-o", p(&staged_out), "--min-reads", "1"],
         "staged filter",
+    );
+
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
+}
+
+// ══════════════════════════ Extract→Correct (no aligner) ══════════════════════════
+
+/// A small paired gzip FASTQ pair (`r1.fq.gz`, `r2.fq.gz`) with a 4 bp UMI on
+/// R1 only (read structures `4M+T` / `+T`) — 2 UMI families x 3 read pairs
+/// each. Both R1 UMIs (`ACGT`, `TGCA`) are exact entries in the correct
+/// step's own whitelist, so every extracted record is an exact match and
+/// `correct` keeps it (no UMI rejects), which is what makes the plain
+/// (non-`--rejects`) parity case below meaningful. Returns `(r1_path,
+/// r2_path)`.
+fn write_extract_correct_fastqs(dir: &Path) -> (PathBuf, PathBuf) {
+    let r1 = dir.join("ec_r1.fq.gz");
+    let r2 = dir.join("ec_r2.fq.gz");
+    let families =
+        [("ACGT", "ACGTACGTACGT", "GGTTAACCGGTT"), ("TGCA", "TGCATGCATGCA", "CCAATTGGCCAA")];
+    let r1_qual = "I".repeat(4 + 12);
+    let r2_qual = "I".repeat(12);
+    let mut r1_records: Vec<(String, String)> = Vec::new();
+    let mut r2_records: Vec<(String, String)> = Vec::new();
+    for (fi, (umi, r1_tmpl, r2_tmpl)) in families.iter().enumerate() {
+        for i in 0..3 {
+            let name = format!("fam{fi}_{i}");
+            r1_records.push((name.clone(), format!("{umi}{r1_tmpl}")));
+            r2_records.push((name, (*r2_tmpl).to_string()));
+        }
+    }
+    let r1_slices: Vec<(&str, &str, &str)> =
+        r1_records.iter().map(|(n, s)| (n.as_str(), s.as_str(), r1_qual.as_str())).collect();
+    let r2_slices: Vec<(&str, &str, &str)> =
+        r2_records.iter().map(|(n, s)| (n.as_str(), s.as_str(), r2_qual.as_str())).collect();
+    write_gzip_fastq(&r1, &r1_slices);
+    write_gzip_fastq(&r2, &r2_slices);
+    (r1, r2)
+}
+
+/// `runall --start-from extract --stop-after correct` vs the staged standalone
+/// `fgumi extract | fgumi correct` chain — no aligner involved, so this closes
+/// the "extract→correct builder change only verified by an aligner-gated
+/// test" gap (the extract→correct chain-builder wiring itself is exercised
+/// in-process by `test_runall_chain_transitions.rs`'s
+/// `extract_to_correct_chain_builds_and_runs`; this is the CLI-level parity
+/// counterpart).
+#[test]
+fn extract_to_correct_matches_staged_chain() {
+    let tmp = TempDir::new().unwrap();
+    let (r1, r2) = write_extract_correct_fastqs(tmp.path());
+    let runall_out = tmp.path().join("runall.bam");
+    let staged_extracted = tmp.path().join("staged_extracted.bam");
+    let staged_out = tmp.path().join("staged.bam");
+
+    run_ok(
+        [
+            "runall",
+            "--start-from",
+            "extract",
+            "--stop-after",
+            "correct",
+            "--extract::inputs",
+            p(&r1),
+            p(&r2),
+            "--extract::read-structures",
+            "4M+T",
+            "+T",
+            "--extract::sample",
+            "s1",
+            "--extract::library",
+            "lib1",
+            "--correct::umis",
+            "ACGT",
+            "--correct::umis",
+            "TGCA",
+            "--correct::min-distance",
+            "1",
+            "-o",
+            p(&runall_out),
+        ],
+        "runall extract->correct",
+    );
+
+    run_ok(
+        [
+            "extract",
+            "--inputs",
+            p(&r1),
+            p(&r2),
+            "--read-structures",
+            "4M+T",
+            "+T",
+            "--sample",
+            "s1",
+            "--library",
+            "lib1",
+            "-o",
+            p(&staged_extracted),
+        ],
+        "staged extract",
+    );
+    run_ok(
+        [
+            "correct",
+            "-i",
+            p(&staged_extracted),
+            "-o",
+            p(&staged_out),
+            "--umis",
+            "ACGT",
+            "--umis",
+            "TGCA",
+            "--min-distance",
+            "1",
+        ],
+        "staged correct",
+    );
+
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
+}
+
+/// Same extract→correct self-pair as above, but with a top-level `--rejects`
+/// — exercising the 2-output rejects branch off the `add_correct`
+/// `BamTemplateBatch` tail (`build_stage_options_bag`'s self-pair rule: honor
+/// top-level `--rejects`, falling back to `--correct::rejects`), previously
+/// untested. Every UMI in this fixture is an exact whitelist match (see
+/// [`write_extract_correct_fastqs`]), so no UMI is actually rejected — the
+/// rejects BAM is expected to be header-only (still non-empty as bytes: a
+/// BGZF header + EOF block) rather than record-bearing. What this test
+/// actually locks down is that (a) the run succeeds with `--rejects` wired
+/// through a self-pair correct stage fed by extract, (b) the rejects file is
+/// created, and (c) the kept output is unaffected by rejects tracking being
+/// enabled, by comparing it against the same staged oracle used above (run
+/// with its own `--rejects`).
+#[test]
+fn extract_to_correct_with_rejects_matches_staged_chain() {
+    let tmp = TempDir::new().unwrap();
+    let (r1, r2) = write_extract_correct_fastqs(tmp.path());
+    let runall_out = tmp.path().join("runall.bam");
+    let runall_rejects = tmp.path().join("runall_rejects.bam");
+    let staged_extracted = tmp.path().join("staged_extracted.bam");
+    let staged_out = tmp.path().join("staged.bam");
+    let staged_rejects = tmp.path().join("staged_rejects.bam");
+
+    run_ok(
+        [
+            "runall",
+            "--start-from",
+            "extract",
+            "--stop-after",
+            "correct",
+            "--extract::inputs",
+            p(&r1),
+            p(&r2),
+            "--extract::read-structures",
+            "4M+T",
+            "+T",
+            "--extract::sample",
+            "s1",
+            "--extract::library",
+            "lib1",
+            "--correct::umis",
+            "ACGT",
+            "--correct::umis",
+            "TGCA",
+            "--correct::min-distance",
+            "1",
+            "--rejects",
+            p(&runall_rejects),
+            "-o",
+            p(&runall_out),
+        ],
+        "runall extract->correct --rejects",
+    );
+    assert!(
+        std::fs::metadata(&runall_rejects).is_ok(),
+        "runall's --rejects file was not created: {}",
+        runall_rejects.display()
+    );
+    let (_, runall_rejects_records) = read_bam_output(&runall_rejects);
+    assert!(
+        runall_rejects_records.is_empty(),
+        "every UMI in this fixture is an exact whitelist match, so runall's rejects BAM must be \
+         header-only, got {} record(s)",
+        runall_rejects_records.len()
+    );
+
+    run_ok(
+        [
+            "extract",
+            "--inputs",
+            p(&r1),
+            p(&r2),
+            "--read-structures",
+            "4M+T",
+            "+T",
+            "--sample",
+            "s1",
+            "--library",
+            "lib1",
+            "-o",
+            p(&staged_extracted),
+        ],
+        "staged extract",
+    );
+    run_ok(
+        [
+            "correct",
+            "-i",
+            p(&staged_extracted),
+            "-o",
+            p(&staged_out),
+            "--umis",
+            "ACGT",
+            "--umis",
+            "TGCA",
+            "--min-distance",
+            "1",
+            "--rejects",
+            p(&staged_rejects),
+        ],
+        "staged correct --rejects",
+    );
+    assert!(
+        std::fs::metadata(&staged_rejects).is_ok(),
+        "staged --rejects file was not created: {}",
+        staged_rejects.display()
+    );
+    let (_, staged_rejects_records) = read_bam_output(&staged_rejects);
+    assert!(
+        staged_rejects_records.is_empty(),
+        "every UMI in this fixture is an exact whitelist match, so the staged rejects BAM must be \
+         header-only, got {} record(s)",
+        staged_rejects_records.len()
+    );
+
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
+}
+
+// ══════════════════════════ Extract→Extract (interleaved, no aligner) ══════════════════════════
+
+/// Validates A2 (`--extract::interleaved`'s interleaved-vs-count check):
+/// `runall --start-from extract --stop-after extract --extract::interleaved`
+/// vs standalone `fgumi extract --interleaved`. Before A2 this would have
+/// failed at the interleaved-vs-count check; it must pass now.
+#[test]
+fn extract_interleaved_matches_standalone_extract() {
+    let tmp = TempDir::new().unwrap();
+    let interleaved = tmp.path().join("interleaved.fq.gz");
+    // 3 read pairs, interleaved R1,R2,R1,R2,R1,R2: R1 = 4bp UMI + 8bp
+    // template (read structure `4M+T`), R2 = 8bp template only (`+T`).
+    let pairs = [
+        ("read0", "ACGTAAAACCCC", "GGGGTTTT"),
+        ("read1", "ACGTAAAACCCC", "GGGGTTTT"),
+        ("read2", "ACGTAAAACCCC", "GGGGTTTT"),
+    ];
+    let r1_qual = "I".repeat(12);
+    let r2_qual = "I".repeat(8);
+    let mut records: Vec<(&str, &str, &str)> = Vec::new();
+    for (name, r1_seq, r2_seq) in &pairs {
+        records.push((name, r1_seq, r1_qual.as_str()));
+        records.push((name, r2_seq, r2_qual.as_str()));
+    }
+    write_gzip_fastq(&interleaved, &records);
+
+    let runall_out = tmp.path().join("runall.bam");
+    let staged_out = tmp.path().join("staged.bam");
+
+    run_ok(
+        [
+            "runall",
+            "--start-from",
+            "extract",
+            "--stop-after",
+            "extract",
+            "--extract::interleaved",
+            "--extract::inputs",
+            p(&interleaved),
+            "--extract::read-structures",
+            "4M+T",
+            "+T",
+            "--extract::sample",
+            "s1",
+            "--extract::library",
+            "lib1",
+            "-o",
+            p(&runall_out),
+        ],
+        "runall extract(interleaved)->extract",
+    );
+    run_ok(
+        [
+            "extract",
+            "--interleaved",
+            "--inputs",
+            p(&interleaved),
+            "--read-structures",
+            "4M+T",
+            "+T",
+            "--sample",
+            "s1",
+            "--library",
+            "lib1",
+            "-o",
+            p(&staged_out),
+        ],
+        "standalone extract --interleaved",
     );
 
     assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
@@ -1323,6 +1772,32 @@ fn rejects_codec_with_methylation_mode() {
         ],
         "not supported with codec consensus",
         "codec + --methylation-mode",
+    );
+}
+
+/// Spec §7: `--consensus <simplex|duplex|codec>` is required whenever the
+/// derived chain reaches the consensus stage. `derive_stages_for` returns this
+/// error before the input BAM is ever opened (`nonexistent-input.bam` is never
+/// read), mirroring `rejects_duplex_without_paired_strategy` below.
+#[cfg(feature = "consensus")]
+#[test]
+fn rejects_missing_consensus_mode_when_chain_reaches_consensus() {
+    assert_rejected_with(
+        [
+            "runall",
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "-i",
+            "nonexistent-input.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+        ],
+        "--consensus <simplex|duplex|codec> is required",
+        "group->consensus without --consensus",
     );
 }
 
