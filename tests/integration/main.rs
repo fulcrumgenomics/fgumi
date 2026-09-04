@@ -11,6 +11,7 @@ mod test_bam_pipeline;
 mod test_bgzf_eof;
 mod test_chain_bam_with_index;
 mod test_clip_command;
+mod test_clip_cutover_parity;
 #[cfg(feature = "codec")]
 mod test_codec_command;
 #[cfg(feature = "codec")]

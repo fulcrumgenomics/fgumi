@@ -48,12 +48,11 @@ fn write_paired_bam_with_header(
 }
 
 // ============================================================================
-// --check-crc / --no-check-crc on the multi-threaded (`--threads N`) path (#800)
+// --check-crc / --no-check-crc on the chain (`--threads N`) path (#800)
 //
-// clip is the one command whose `--threads N` mode decodes its input through the
-// unified pipeline (not the single-threaded raw reader). These prove that path
-// honors the flag: `--no-check-crc` accepts a corrupted block, while the default
-// and `--check-crc` reject it.
+// clip always decodes its input through the unified pipeline (the chain is its
+// only execution path). These prove that path honors the flag: `--no-check-crc`
+// accepts a corrupted block, while the default and `--check-crc` reject it.
 // ============================================================================
 
 /// Flip a byte in the last BGZF block's CRC32 footer, so decoding that block
@@ -219,10 +218,11 @@ fn test_clip_threads_check_crc_rejects_corrupted_crc() {
 /// matching fgbio's `Bams.requireQueryGrouped`. On coordinate-sorted input mates
 /// scatter, so pair clip / overlap / mate-fix silently no-op — hard-fail instead.
 ///
-/// Exercised on both `Clip::execute` paths (the single-threaded fast path and the
-/// `--threads` pipeline) since the guard is wired into each.
+/// Exercised at both worker counts (no `--threads`, i.e. the chain at a single
+/// worker, and `--threads N`) since `require_query_grouped` fires on the chain
+/// regardless of worker count.
 #[rstest]
-#[case::single_threaded(&[])]
+#[case::single_worker(&[])]
 #[case::threaded(&["--threads", "2"])]
 fn test_clip_rejects_coordinate_sorted_input(#[case] extra_args: &[&str]) {
     let temp_dir = TempDir::new().unwrap();
@@ -445,15 +445,18 @@ fn push_clip_metrics_parity_records(records: &mut Vec<RawRecord>, repeats: usize
 /// lucky scheduling accident.
 const REPEATS: usize = 2000;
 
-/// `--metrics` on the chain `--threads N` path must now succeed (previously a hard
-/// error) and produce a metrics TSV that matches the single-threaded oracle exactly.
+/// The chain `--metrics` output must be independent of the worker count: a
+/// no-`--threads` run (the chain at a single worker) and `--threads N` runs must
+/// produce a byte-identical metrics TSV.
 ///
 /// Detailed metrics are collected via a per-thread `ClippingMetricsCollection`
 /// accumulator (one slot per worker), reduced by summing raw `fragment`/`read_one`/
 /// `read_two` counters across slots and then calling `finalize()` once -- pure integer
 /// addition is commutative and associative, so the reduction is order-independent and
-/// the TSV is byte-identical to the oracle's regardless of thread count or how work was
-/// sharded. This is the load-bearing parity test for this feature.
+/// the TSV is byte-identical regardless of thread count or how work was sharded. This
+/// is the load-bearing worker-count-independence test for `--metrics`. (Byte-parity
+/// against the pre-removal single-threaded binary lives in
+/// `test_clip_cutover_parity.rs`.)
 ///
 /// The fixture is sized (`REPEATS`, see its doc comment) to force real cross-worker
 /// `PerThreadAccumulator` sharding at `--threads 2`/`4`, not just a single-slot
@@ -480,7 +483,7 @@ fn test_clip_metrics_match_across_threading_modes(#[case] threads: usize) {
     let opts =
         ["--clip-overlapping-reads", "--read-one-five-prime", "1", "--read-two-three-prime", "1"];
 
-    // Oracle: no --threads (single-threaded engine, the parity reference).
+    // Reference: no --threads (the chain at a single worker).
     {
         let mut args = vec![
             "clip",
@@ -495,9 +498,9 @@ fn test_clip_metrics_match_across_threading_modes(#[case] threads: usize) {
         ];
         args.extend_from_slice(&opts);
         Clip::try_parse_from(args)
-            .expect("parse oracle args")
+            .expect("parse single-worker args")
             .execute("fgumi clip")
-            .expect("oracle clip failed");
+            .expect("single-worker clip failed");
     }
 
     // Chain: --threads N with --metrics. Must succeed and write the metrics file.
@@ -788,14 +791,15 @@ fn build_clip_parity_bam(path: &Path, count: usize) {
     create_paired_bam(path, pairs);
 }
 
-/// Chain-vs-oracle parity: the `--threads N` chain path
-/// (`ChainSpec::single_stage(Stage::Clip, ...)` → `build_for(spec)?.run()`) must
-/// produce the same records AND the same normalized header as the single-threaded
-/// oracle (`execute_single_threaded`). This is the load-bearing test for the R3
-/// clip cutover; `read_bam_output` normalizes only the `@PG` `CL` field, which
-/// legitimately differs by `--threads`, so a dropped `@SQ`/`@RG`/`@HD`/`@CO` line
-/// or any record divergence fails the test. Parameterized over thread counts to
-/// exercise single- and multi-worker scheduling.
+/// Worker-count independence: clip always runs on the declarative chain
+/// (`ChainSpec::single_stage(Stage::Clip, ...)` → `build_for(spec)?.run()`), so a
+/// no-`--threads` run (the chain at a single worker) and `--threads N` runs must
+/// produce the same records AND the same normalized header. `read_bam_output`
+/// normalizes only the `@PG` `CL` field, which legitimately differs by `--threads`,
+/// so a dropped `@SQ`/`@RG`/`@HD`/`@CO` line or any record divergence fails the
+/// test. Parameterized over thread counts to exercise single- and multi-worker
+/// scheduling. (Byte-parity against the pre-removal single-threaded binary lives in
+/// `test_clip_cutover_parity.rs`.)
 #[rstest]
 #[case::threads_1(1)]
 #[case::threads_2(2)]
@@ -812,7 +816,7 @@ fn test_clip_chain_matches_single_threaded(#[case] threads: usize) {
     let opts =
         ["--clip-overlapping-reads", "--read-one-five-prime", "1", "--read-two-three-prime", "1"];
 
-    // Oracle: no --threads (single-threaded engine).
+    // Reference: no --threads (the chain at a single worker).
     {
         let mut args = vec![
             "clip",
@@ -825,9 +829,9 @@ fn test_clip_chain_matches_single_threaded(#[case] threads: usize) {
         ];
         args.extend_from_slice(&opts);
         Clip::try_parse_from(args)
-            .expect("parse oracle args")
+            .expect("parse single-worker args")
             .execute("fgumi clip")
-            .expect("oracle clip failed");
+            .expect("single-worker clip failed");
     }
 
     // Chain: --threads N (declarative chain builder).
@@ -866,7 +870,7 @@ fn test_clip_chain_matches_single_threaded(#[case] threads: usize) {
 
     assert_eq!(
         oracle_records, chain_records,
-        "chain (--threads {threads}) output must match the single-threaded oracle record-for-record",
+        "chain (--threads {threads}) output must match the single-worker run record-for-record",
     );
     assert_eq!(
         oracle_header, chain_header,
@@ -880,11 +884,12 @@ fn test_clip_chain_matches_single_threaded(#[case] threads: usize) {
 /// fgbio's `Bams.requireQueryGrouped`. The `@HD` synthesis itself is still exercised
 /// end-to-end by `correct`/`review` (which have no query-grouped guard).
 ///
-/// Exercised on both `Clip::execute` paths (the single-threaded fast path and the
-/// `--threads` pipeline): both run `ensure_hd_record` before `require_query_grouped`,
-/// so header-less input is rejected the same way regardless of execution mode.
+/// Exercised at both worker counts (no `--threads`, i.e. the chain at a single
+/// worker, and `--threads N`): the chain runs `ensure_hd_record` before
+/// `require_query_grouped`, so header-less input is rejected the same way
+/// regardless of worker count.
 #[rstest]
-#[case::single_threaded(&[])]
+#[case::single_worker(&[])]
 #[case::threaded(&["--threads", "2"])]
 fn test_clip_rejects_headerless_input(#[case] extra_args: &[&str]) {
     let temp_dir = TempDir::new().unwrap();
@@ -1179,8 +1184,8 @@ fn read_with_cigar_mc(
 /// Runs `clip --upgrade-clipping` (Hard mode) over a template whose only clipped read is a
 /// supplementary alignment (`10S40M`), and asserts the supplementary's leading soft clip is
 /// upgraded to hard. fgbio `ClipBam` upgrades `template.allReads` (`ClipBam.scala:123`), not just
-/// the primary R1/R2, so the supplementary must be upgraded too. `threads` selects the
-/// single-threaded (`None`) vs `--threads` code path — the fix must hold on both.
+/// the primary R1/R2, so the supplementary must be upgraded too. `threads` selects a
+/// single worker (`None`) vs `--threads` — the fix must hold at both worker counts.
 fn run_supplementary_upgrade_case(threads: Option<&str>) {
     let temp_dir = TempDir::new().unwrap();
     let input_bam = temp_dir.path().join("input.bam");
@@ -1284,10 +1289,10 @@ fn run_supplementary_upgrade_case(threads: Option<&str>) {
     }
 }
 
-/// `--upgrade-clipping` upgrades a supplementary alignment's clipping on both the single-threaded
-/// (`None`) and `--threads` (`Some("2")`) code paths.
+/// `--upgrade-clipping` upgrades a supplementary alignment's clipping at both a single
+/// worker (`None`) and `--threads` (`Some("2")`).
 #[rstest]
-#[case::single_threaded(None)]
+#[case::single_worker(None)]
 #[case::threaded(Some("2"))]
 fn test_upgrade_clipping_upgrades_supplementary(#[case] threads: Option<&str>) {
     run_supplementary_upgrade_case(threads);
@@ -1593,11 +1598,11 @@ fn test_clip_command_threads_mode_supplementary_mate_repair() {
     assert_eq!(supp.mate_alignment_start(), r2.alignment_start());
 }
 
-/// The single-threaded (`execute_single_threaded`) and multi-threaded (`--threads`, via the chain
-/// builder's `build_clip_process_step`)
-/// paths share one per-template clipping implementation (`ClipParams::clip_template`), so clipping
-/// the same input under both must yield byte-identical output. This pins that invariant end-to-end:
-/// if the two paths ever diverge (e.g. a future edit touches only one), this comparison fails.
+/// Clip always runs on the declarative chain (via `build_clip_process_step` →
+/// `ClipParams::clip_template`), so its output must be independent of the worker count: a
+/// no-`--threads` run (the chain at a single worker) and a `--threads N` run must yield
+/// byte-identical output. This pins that invariant end-to-end: if the two configurations
+/// ever diverge (e.g. a future edit to the batching or reduction), this comparison fails.
 #[test]
 fn test_clip_command_single_and_multi_threaded_outputs_match() {
     let temp_dir = TempDir::new().unwrap();
@@ -1665,7 +1670,7 @@ fn test_clip_command_single_and_multi_threaded_outputs_match() {
     let multi_records = read_output_record_bufs(&multi_out);
     assert_eq!(
         single_records, multi_records,
-        "single-threaded and multi-threaded clip output must be identical"
+        "single-worker and multi-worker clip output must be identical"
     );
 
     // Independent oracle: the cross-mode equality above only proves the two paths agree — a
@@ -1798,9 +1803,7 @@ fn test_clip_command_lone_r2_primary_passed_through_unclipped() {
     let multi_records = read_output_record_bufs(&multi_out);
 
     // Both modes emit the single input record with no clipping applied (still 100M at 1-based 200).
-    for (label, records) in
-        [("single-threaded", &single_records), ("multi-threaded", &multi_records)]
-    {
+    for (label, records) in [("single-worker", &single_records), ("multi-worker", &multi_records)] {
         assert_eq!(records.len(), 1, "{label}: expected exactly one output record");
         assert_eq!(
             cigar_ops(&records[0]),
@@ -1840,7 +1843,7 @@ fn test_clip_command_lone_r2_primary_passed_through_unclipped() {
 /// mode is Hard, so Soft is forced explicitly here to match the unit test
 /// (`deletion_knock_on`) this test's expected CIGARs are hand-derived from.
 #[rstest]
-#[case::single_threaded(None)]
+#[case::single_worker(None)]
 #[case::threaded(Some("2"))]
 fn test_clip_command_past_mate_knock_on_regression(#[case] threads: Option<&str>) {
     let temp_dir = TempDir::new().unwrap();
@@ -1965,7 +1968,7 @@ fn test_clip_command_past_mate_knock_on_regression(#[case] threads: Option<&str>
 ///   soft-clipped bases to hard, leaving the other 20 still soft: r1 -> `20M20S60H`, r2
 ///   (symmetric, on its leading/low-coordinate side) -> `60H20S20M`.
 #[rstest]
-#[case::single_threaded(None)]
+#[case::single_worker(None)]
 #[case::threaded(Some("2"))]
 fn test_clip_command_past_mate_hard_mode_cigars(#[case] threads: Option<&str>) {
     let temp_dir = TempDir::new().unwrap();
