@@ -762,16 +762,34 @@ impl Default for GroupOptions {
     }
 }
 
+/// Resolve the effective grouping strategy/edits: `--no-umi` forces
+/// `Strategy::Identity`/0; `Strategy::Identity` forces `edits` 0; otherwise the
+/// requested pair.
+///
+/// Shared by [`GroupOptions::resolve_strategy_and_edits`] and
+/// [`GroupReadsByUmi::resolve_strategy_and_edits`] so the standalone command,
+/// the chain builder, and `execute` cannot disagree about what was
+/// configured — both methods delegate here rather than each re-implementing
+/// the same two rules.
+fn resolve_strategy_and_edits(no_umi: bool, strategy: Strategy, edits: u32) -> (Strategy, u32) {
+    if no_umi {
+        return (Strategy::Identity, 0);
+    }
+    let edits = if matches!(strategy, Strategy::Identity) { 0 } else { edits };
+    (strategy, edits)
+}
+
 impl GroupOptions {
     /// Resolve the effective grouping strategy/edits: `--no-umi` forces
-    /// Identity/0; Identity forces edits 0; otherwise the requested pair.
+    /// `Strategy::Identity`/0; `Strategy::Identity` forces `edits` 0; otherwise
+    /// the requested pair.
+    ///
+    /// Delegates to the shared free function [`resolve_strategy_and_edits`] so
+    /// this and [`GroupReadsByUmi::resolve_strategy_and_edits`] cannot
+    /// disagree.
     #[must_use]
     pub fn resolve_strategy_and_edits(&self) -> (Strategy, u32) {
-        if self.no_umi {
-            return (Strategy::Identity, 0);
-        }
-        let edits = if matches!(self.strategy, Strategy::Identity) { 0 } else { self.edits };
-        (self.strategy, edits)
+        resolve_strategy_and_edits(self.no_umi, self.strategy, self.edits)
     }
 }
 
@@ -785,17 +803,16 @@ impl GroupReadsByUmi {
     /// Resolve the strategy and edit distance grouping will actually use.
     ///
     /// `--no-umi` forces identity grouping, and identity grouping requires an
-    /// edit distance of zero; both rules live here so `execute` and the chain
-    /// builder cannot disagree about what was configured. The caller is
-    /// responsible for rejecting `--no-umi` with `--strategy paired` and for
-    /// logging the override — this method only computes.
+    /// edit distance of zero; both rules live in the shared free function
+    /// [`resolve_strategy_and_edits`], which this and
+    /// [`GroupOptions::resolve_strategy_and_edits`] both delegate to, so
+    /// `execute` and the chain builder cannot disagree about what was
+    /// configured. The caller is responsible for rejecting `--no-umi` with
+    /// `--strategy paired` and for logging the override — this method only
+    /// computes.
     #[must_use]
     pub fn resolve_strategy_and_edits(&self) -> (Strategy, u32) {
-        if self.no_umi {
-            return (Strategy::Identity, 0);
-        }
-        let edits = if matches!(self.strategy, Strategy::Identity) { 0 } else { self.edits };
-        (self.strategy, edits)
+        resolve_strategy_and_edits(self.no_umi, self.strategy, self.edits)
     }
 
     /// Project the parsed CLI flags into [`GroupOptions`].
