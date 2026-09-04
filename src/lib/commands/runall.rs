@@ -1680,7 +1680,16 @@ impl Command for RunAll {
         let mut write_targets: Vec<(&std::path::Path, &str)> =
             vec![(self.output.as_path(), "--output")];
         if let Some(rejects) = stage_opts.correct.as_ref().and_then(|c| c.rejects_path.as_ref()) {
-            write_targets.push((rejects.as_path(), "--rejects"));
+            // Name the flag that actually supplied this path: the correct
+            // self-pair prefers top-level `--rejects`, falling back to
+            // `--correct::rejects` (see the Stage::Correct arm), so the
+            // collision message points at the flag the user really typed.
+            let label = if self.rejects_opts.rejects.is_some() {
+                "--rejects"
+            } else {
+                "--correct::rejects"
+            };
+            write_targets.push((rejects.as_path(), label));
         }
         #[cfg(feature = "consensus")]
         {
@@ -2198,6 +2207,42 @@ mod tests {
         assert_eq!(RunAllStage::AlignAndMerge.to_string(), "align");
         assert_eq!(RunAllStage::Consensus.to_string(), "consensus");
         assert_eq!(RunAllMode::Simplex.to_string(), "simplex");
+    }
+
+    /// Drift guard: the hand-written `Display` impls must agree with the CLI
+    /// value names clap derives from `#[derive(ValueEnum)]` + the
+    /// `rename_all = "kebab-case"` / `#[clap(name = ...)]` attributes. Error
+    /// messages use `Display`, so a variant whose `Display` string diverged
+    /// from what the flag actually accepts would name a value the user cannot
+    /// type. This pins the two together for every variant.
+    #[test]
+    fn display_matches_clap_value_names() {
+        use clap::ValueEnum;
+        for stage in [
+            RunAllStage::Extract,
+            RunAllStage::Correct,
+            RunAllStage::AlignAndMerge,
+            RunAllStage::Zipper,
+            RunAllStage::Sort,
+            RunAllStage::Group,
+            RunAllStage::Consensus,
+            RunAllStage::Filter,
+        ] {
+            let clap_name = stage.to_possible_value().expect("stage is a real value-enum variant");
+            assert_eq!(
+                stage.to_string(),
+                clap_name.get_name(),
+                "RunAllStage::{stage:?} Display drifted from its clap value name"
+            );
+        }
+        for mode in [RunAllMode::Simplex, RunAllMode::Codec, RunAllMode::Duplex] {
+            let clap_name = mode.to_possible_value().expect("mode is a real value-enum variant");
+            assert_eq!(
+                mode.to_string(),
+                clap_name.get_name(),
+                "RunAllMode::{mode:?} Display drifted from its clap value name"
+            );
+        }
     }
 
     #[test]
