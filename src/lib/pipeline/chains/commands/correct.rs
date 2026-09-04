@@ -122,13 +122,20 @@ impl FinalizeHook for CorrectFinalizeHook {
         info!("Total templates processed: {}", counts.templates);
 
         // fgbio logs this summary at error level (CorrectUmis.scala:275-280).
+        // Each detail line is individually guarded so a run with only one of the
+        // two problem counters nonzero does not print a spurious `# 0 ...` line
+        // (the retired serial path and fgbio both guard each line separately).
         if counts.missing > 0 || counts.wrong_length > 0 {
             error!("###################################################################");
-            error!("# {} were missing UMI attributes in the BAM file!", counts.missing);
-            error!(
-                "# {} had unexpected UMIs of differing lengths in the BAM file!",
-                counts.wrong_length
-            );
+            if counts.missing > 0 {
+                error!("# {} were missing UMI attributes in the BAM file!", counts.missing);
+            }
+            if counts.wrong_length > 0 {
+                error!(
+                    "# {} had unexpected UMIs of differing lengths in the BAM file!",
+                    counts.wrong_length
+                );
+            }
             error!("###################################################################");
         }
 
