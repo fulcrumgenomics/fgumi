@@ -1113,16 +1113,44 @@ impl<'a> ChainBuilder<'a> {
         let cell_tag = Tag::from(SamTag::CB);
         let library_index = fgumi_bam_io::LibraryIndex::from_header(&self.header);
         let config = fgumi_bam_io::GroupKeyConfig::new(library_index, cell_tag);
-        // When a Group stage is in the chain, cache the UMI (RX) value position
-        // during decode so `fgumi group`'s per-template UMI-assignment lookup can
-        // slice it without re-scanning aux data (#334). Group's UMI tag is fixed
-        // to RX (see `add_group`'s `raw_tag`). Chains without a Group stage skip
-        // the cache to avoid the extra per-record aux scan.
-        if self.spec.stages.contains(&Stage::Group) {
+        // When a Group or Dedup stage is in the chain, cache the UMI (RX) value
+        // position during decode so the per-template UMI-assignment lookup
+        // (`fgumi group`'s and `fgumi dedup`'s) can slice it without re-scanning
+        // aux data (#334). Both stages' UMI tag is fixed to RX (see `add_group`'s
+        // and `add_dedup`'s `raw_tag`), and both consume the cache through the
+        // same `Template::cached_umi()` fallback path, so enabling it changes only
+        // how the RX position is found, never the grouping/dedup result. Chains
+        // with neither stage skip the cache to avoid the extra per-record aux
+        // scan. Extracted into `stages_want_umi_cache` so the gate is unit
+        // testable without constructing a full `ChainBuilder`.
+        //
+        // `--no-umi` additionally suppresses the cache even when Group/Dedup is
+        // present: no UMI grouping happens under `--no-umi` (both stages force
+        // identity/position-only grouping and never call `cached_umi()`), so the
+        // non-chain paths (`GroupReadsByUmi::execute`, `MarkDuplicates::execute`)
+        // deliberately skip `with_umi_tag` in that mode too. Without this the
+        // chain would pay a per-record decode-time RX aux-scan to populate a
+        // cache nothing ever reads under `--no-umi` — output-neutral, but a
+        // wasted-work regression the non-chain path doesn't have. `no_umi` is
+        // threaded in through `umi_cache_enabled` (rather than into
+        // `stages_want_umi_cache`, which stays a pure function of `stages` alone)
+        // since only this call site has `self.spec.stage_opts` in scope.
+        if umi_cache_enabled(&self.spec.stages, self.stage_no_umi()) {
             config.with_umi_tag(*SamTag::RX)
         } else {
             config
         }
+    }
+
+    /// Whether the chain's `Group` or `Dedup` stage options request `--no-umi`.
+    ///
+    /// Used only to gate the UMI-position cache in [`Self::bam_group_key_config`]
+    /// (see its doc comment); a chain has at most one of `Group`/`Dedup` in
+    /// practice (`Dedup` is currently always a standalone single-stage chain),
+    /// but checking both keeps this correct if that ever changes.
+    fn stage_no_umi(&self) -> bool {
+        self.spec.stage_opts.group.as_ref().is_some_and(|g| g.no_umi)
+            || self.spec.stage_opts.dedup.as_ref().is_some_and(|d| d.no_umi)
     }
 
     /// Group-key config for the **source preamble's** `DecodeRecords`.
@@ -4881,6 +4909,40 @@ fn sort_budget_threads(num_threads: usize, sort_threads: Option<usize>) -> usize
     crate::commands::common::sort_memory_budget_threads(num_threads, sort_threads)
 }
 
+/// Whether `stages` should have the Decode step cache the UMI (RX) value
+/// position (see [`ChainBuilder::bam_group_key_config`]).
+///
+/// `Group` and `Dedup` both key their per-template UMI-assignment lookup on a
+/// fixed RX tag and consume the cache through the same
+/// `Template::cached_umi()` fallback path (see `bam_group_key_config`'s doc
+/// comment for the full rationale), so both enable it. Extracted as a free
+/// function so the gate can be unit tested without constructing a full
+/// `ChainBuilder` (which requires an opened BAM/SAM/FASTQ source).
+///
+/// [`ChainBuilder::bam_group_key_config`]: ChainBuilder::bam_group_key_config
+fn stages_want_umi_cache(stages: &[Stage]) -> bool {
+    stages.iter().any(|s| matches!(s, Stage::Group | Stage::Dedup))
+}
+
+/// Whether the Decode step should actually cache the UMI (RX) value position,
+/// combining [`stages_want_umi_cache`] with the `--no-umi` override.
+///
+/// `--no-umi` forces identity/position-only grouping on both `Group` and
+/// `Dedup` (see their `no_umi` handling in `src/lib/commands/{group,dedup}.rs`),
+/// so neither ever calls `Template::cached_umi()` in that mode — the non-chain
+/// paths (`GroupReadsByUmi::execute`, `MarkDuplicates::execute`) already skip
+/// `GroupKeyConfig::with_umi_tag` under `--no-umi` for exactly this reason. This
+/// keeps `stages_want_umi_cache` a pure function of `stages` alone (so its
+/// existing tests need no `no_umi` parameter) while still gating the combined
+/// decision on it; `no_umi` is threaded in here, at
+/// [`ChainBuilder::bam_group_key_config`]'s call site, rather than folded into
+/// `stages_want_umi_cache` itself.
+///
+/// [`ChainBuilder::bam_group_key_config`]: ChainBuilder::bam_group_key_config
+fn umi_cache_enabled(stages: &[Stage], no_umi: bool) -> bool {
+    stages_want_umi_cache(stages) && !no_umi
+}
+
 /// Uniform "reference dictionary not found" error, shared by the zipper source
 /// open (`open_source`) and `add_align`, so both dict-resolution sites report
 /// the same actionable message (which paths were tried + the `samtools dict`
@@ -4900,7 +4962,83 @@ fn dict_not_found_error(reference: &std::path::Path) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_phase_threads, sort_budget_threads};
+    use super::{
+        resolve_phase_threads, sort_budget_threads, stages_want_umi_cache, umi_cache_enabled,
+    };
+
+    /// `bam_group_key_config`'s UMI-position-cache gate (issue #334: dedup-only
+    /// chains left the cache gate inert, falling back to an aux-data rescan per
+    /// record). The cache must be enabled whenever `Group` or
+    /// `Dedup` is in the chain, and skipped otherwise. Exercised directly
+    /// against `stages_want_umi_cache` — the exact gate `bam_group_key_config`
+    /// calls — so this cannot drift from the production decision.
+    #[test]
+    fn stages_want_umi_cache_enables_for_group_and_dedup() {
+        use crate::pipeline::chains::Stage;
+
+        assert!(
+            stages_want_umi_cache(&[Stage::Group]),
+            "a Group-only chain must enable the UMI-position cache"
+        );
+        assert!(
+            stages_want_umi_cache(&[Stage::Dedup]),
+            "a Dedup-only chain must enable the UMI-position cache"
+        );
+        // [Sort, Dedup] is not a combination `validate_stage_progression` (and every
+        // real command's `ChainSpec`) ever produces: `Dedup` is currently always the
+        // sole stage of a standalone `fgumi dedup` chain (`ChainSpec::single_stage`),
+        // and `add_dedup` itself rejects an intermediate position. [Sort, Group] is
+        // the reachable multi-stage combination instead — `stage_ord(Sort) = 4 <=
+        // stage_ord(Group) = 5` passes `validate_stage_progression`, and `add_group`
+        // has no positional restriction — so it exercises the `.any()` finding its
+        // trigger stage past the first position on an input the validator actually
+        // permits.
+        assert!(
+            stages_want_umi_cache(&[Stage::Sort, Stage::Group]),
+            "Group anywhere in the chain must enable the UMI-position cache"
+        );
+        assert!(
+            !stages_want_umi_cache(&[Stage::Sort]),
+            "a chain with neither Group nor Dedup must skip the UMI-position cache"
+        );
+        assert!(
+            !stages_want_umi_cache(&[]),
+            "an empty stage list must skip the UMI-position cache"
+        );
+    }
+
+    /// `umi_cache_enabled` combines `stages_want_umi_cache` with the `--no-umi`
+    /// override (see its doc comment / `bam_group_key_config`'s doc comment for
+    /// the full rationale): `--no-umi` must suppress the cache even when `Group`
+    /// or `Dedup` is present, matching the non-chain paths
+    /// (`GroupReadsByUmi::execute`, `MarkDuplicates::execute`), which skip
+    /// `GroupKeyConfig::with_umi_tag` under `--no-umi` because neither ever
+    /// calls `Template::cached_umi()` in that mode.
+    #[test]
+    fn umi_cache_enabled_respects_no_umi_for_group_and_dedup() {
+        use crate::pipeline::chains::Stage;
+
+        assert!(
+            umi_cache_enabled(&[Stage::Group], false),
+            "Group without --no-umi must enable the UMI-position cache"
+        );
+        assert!(
+            !umi_cache_enabled(&[Stage::Group], true),
+            "Group with --no-umi must NOT enable the UMI-position cache"
+        );
+        assert!(
+            umi_cache_enabled(&[Stage::Dedup], false),
+            "Dedup without --no-umi must enable the UMI-position cache"
+        );
+        assert!(
+            !umi_cache_enabled(&[Stage::Dedup], true),
+            "Dedup with --no-umi must NOT enable the UMI-position cache"
+        );
+        assert!(
+            !umi_cache_enabled(&[Stage::Sort], true),
+            "a chain with neither Group nor Dedup must stay disabled regardless of --no-umi"
+        );
+    }
 
     /// Pin the per-phase thread resolution contract shared by the standalone and
     /// streaming sort branches in `add_sort`: each phase falls back to the base
