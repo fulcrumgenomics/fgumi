@@ -17,10 +17,11 @@ use rstest::rstest;
 
 /// `CorrectOptions` mirroring the CLI's documented defaults.
 ///
-/// Spelled out rather than derived: a `Default` impl on `CorrectOptions` would
-/// hand back `max_mismatches: 0`, `min_distance_diff: 0` and `cache_size: 0`,
-/// none of which match the flags' `default_value`s, so it would be a trap for
-/// any non-test caller that reached for it.
+/// `CorrectOptions` now has an `impl Default` matching those same
+/// `default_value`s (`max_mismatches: 2`, `min_distance_diff: 2`,
+/// `cache_size: 100_000`); this fixture spells the values out explicitly
+/// rather than delegating to it so the test data stays self-contained and
+/// doesn't silently drift if the `Default` impl ever changes.
 fn make_default_opts() -> CorrectOptions {
     CorrectOptions {
         metrics: None,

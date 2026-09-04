@@ -665,8 +665,10 @@ pub struct GroupReadsByUmi {
 
 /// Group-stage tuning, independent of how the values were supplied.
 ///
-/// See [`crate::commands::zipper::ZipperOptions`] for why this is a plain
-/// struct rather than a flattened `clap::Args`.
+/// Derives `clap::Args` and carries `#[fgumi_cli_macros::multi_options]` so a
+/// future `runall` command can re-expose each field as a prefixed
+/// `--group::<flag>`, via the generated `MultiGroupOptions` companion, without
+/// hand-maintaining a parallel option set.
 ///
 /// Two fields hold *resolved* values rather than raw flags, because grouping
 /// cannot be configured from the raw ones alone: `min_map_q` applies the
