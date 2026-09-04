@@ -487,6 +487,7 @@ because multiple pipeline workers can each spawn a --threads-sized pool concurre
 the live thread count higher still. See --parallel-group-min-templates for details.
 "#
 )]
+#[allow(clippy::struct_excessive_bools)] // CLI flags: each bool is a distinct user-facing option
 pub struct GroupReadsByUmi {
     /// Input and output BAM files
     #[command(flatten)]
@@ -515,6 +516,20 @@ pub struct GroupReadsByUmi {
     /// Include non-PF reads
     #[arg(short = 'n', long = "include-non-pf-reads", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub include_non_pf_reads: bool,
+
+    /// Verify the input is in strict template-coordinate sort order.
+    ///
+    /// Off by default. Each record is checked against the exact ordering of
+    /// `fgumi sort --order template-coordinate` as it is read; the run aborts with
+    /// a non-zero exit on the first out-of-order record. This composes with
+    /// `--output` (a precondition gate, not a check-only mode): output is written
+    /// normally when the input is correctly ordered, and may be left partial if
+    /// the check fails mid-stream. The check is intentionally STRICTER than
+    /// grouping requires (grouping only needs a template's mates adjacent by
+    /// position), which is why it is opt-in; for a standalone check with no output
+    /// use `fgumi sort --verify`.
+    #[arg(long = "verify", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub verify: bool,
 
     /// Allow fully unmapped templates (both reads unmapped). Input must be
     /// template-coordinate sorted (`fgumi sort --order template-coordinate`).
@@ -660,6 +675,7 @@ pub struct GroupReadsByUmi {
 /// identity-implies-zero-edits rules. Both come from the same methods
 /// `execute` uses, so the command and the chain builder cannot drift apart.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // mirrors the CLI flags 1:1; each bool is a distinct option
 pub struct GroupOptions {
     /// Minimum mapping quality for mapped reads, with the default applied.
     pub min_map_q: u8,
@@ -693,6 +709,8 @@ pub struct GroupOptions {
     pub grouping_metrics: Option<PathBuf>,
     /// Optional output prefix for the full set of metrics files.
     pub metrics_prefix: Option<PathBuf>,
+    /// Verify the input is in strict template-coordinate sort order (`--verify`).
+    pub verify: bool,
 }
 
 impl Default for GroupOptions {
@@ -715,6 +733,7 @@ impl Default for GroupOptions {
             family_size_histogram: None,
             grouping_metrics: None,
             metrics_prefix: None,
+            verify: false,
         }
     }
 }
@@ -761,6 +780,7 @@ impl GroupReadsByUmi {
             family_size_histogram: self.family_size_histogram.clone(),
             grouping_metrics: self.grouping_metrics.clone(),
             metrics_prefix: self.metrics.clone(),
+            verify: self.verify,
         }
     }
 }
@@ -1051,8 +1071,12 @@ impl GroupReadsByUmi {
         // Build library index for GroupKey computation
         let library_index = LibraryIndex::from_header(header);
 
-        // Create RecordPositionGrouper (same grouper used in pipeline mode)
+        // Create RecordPositionGrouper (same grouper used in pipeline mode).
+        // With --verify, gate on strict template-coordinate order as records stream.
         let mut grouper = RecordPositionGrouper::new();
+        if self.verify {
+            grouper.enable_verify(header);
+        }
 
         // Metrics accumulators (no lock-free queue needed in single-threaded mode)
         let mut total_filter_counts = TemplateFilterCounts::new();
@@ -1515,6 +1539,7 @@ mod tests {
             "prefix",
             "--include-non-pf-reads=true",
             "--allow-unmapped=true",
+            "--verify=true",
             "--parallel-group-min-templates",
             "500",
         ])
@@ -1525,6 +1550,7 @@ mod tests {
         assert_eq!(opts.min_map_q, 30);
         assert!(opts.include_non_pf_reads);
         assert!(opts.allow_unmapped);
+        assert!(opts.verify);
         assert_eq!(opts.strategy, Strategy::Adjacency);
         assert_eq!(opts.edits, 2);
         assert_eq!(opts.min_umi_length, Some(8));
@@ -1568,6 +1594,7 @@ mod tests {
         assert_eq!(opts.min_map_q, 1, "an absent --min-map-q resolves to 1");
         assert!(!opts.include_non_pf_reads);
         assert!(!opts.allow_unmapped);
+        assert!(!opts.verify, "an absent --verify defaults to false");
         assert_eq!(opts.edits, 1);
         assert_eq!(opts.min_umi_length, None);
         assert_eq!(opts.index_threshold, IndexThreshold::MinUmis(100));
@@ -1776,6 +1803,7 @@ mod tests {
             metrics: None,
             min_map_q: None,
             include_non_pf_reads: false,
+            verify: false,
             strategy,
             edits,
             min_umi_length: None,

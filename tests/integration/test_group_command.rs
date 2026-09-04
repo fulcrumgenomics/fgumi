@@ -654,6 +654,32 @@ fn create_supplementary_split_bam(path: &PathBuf) {
     writer.try_finish().expect("Failed to finish BAM");
 }
 
+// ============================================================================
+// --verify (strict template-coordinate sort-order gate)
+// ============================================================================
+
+/// Build a BAM whose header advertises template-coordinate order but whose
+/// records are written in the given position order. `create_minimal_header`
+/// stamps `SS:template-coordinate`, so a descending `positions` list passes the
+/// header-level ordering check while the records are genuinely out of order —
+/// exactly what `--verify` exists to catch.
+fn create_tc_bam_at_positions(path: &std::path::Path, positions: &[usize]) {
+    let header = create_minimal_header("chr1", 10_000_000);
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
+    writer.write_header(&header).expect("Failed to write header");
+    for (i, &pos) in positions.iter().enumerate() {
+        for record in
+            &create_umi_family_at_pos("AAAAAAAA", 1, &format!("fam{i}"), "ACGTACGT", 30, pos)
+        {
+            writer
+                .write_alignment_record(&header, &to_record_buf(record))
+                .expect("Failed to write record");
+        }
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+}
+
 /// Build the paired-end analogue of [`create_supplementary_split_bam`]: two
 /// paired templates sharing one UMI at the same 5' positions (one molecule), with
 /// a `tc`-keyed supplementary interleaved between them. This mirrors real client
@@ -788,4 +814,103 @@ fn test_group_supplementary_does_not_inflate_molecule_count(
     // names its two templates `pair1`/`pair2` (R1 and R2 share the QNAME).
     let expected_qnames: &[&str] = if paired { &["pair1", "pair2"] } else { &["b1_0", "b2_0"] };
     assert_single_molecule_no_secondary(&records, expected_qnames);
+}
+
+/// Run `group --verify` (plus `threads`), returning the raw execute result so a
+/// test can assert on either success or the ordering error.
+fn group_verify_result(
+    dir: &std::path::Path,
+    input: &std::path::Path,
+    threads: &[&str],
+) -> anyhow::Result<()> {
+    let output = dir.join("verify_out.bam");
+    let mut extra = threads.to_vec();
+    extra.push("--verify");
+    let cmd = GroupReadsByUmi::try_parse_from(group_args(
+        input.to_str().unwrap(),
+        output.to_str().unwrap(),
+        &extra,
+    ))
+    .expect("failed to parse group args");
+    cmd.execute("fgumi group")
+}
+
+/// `--verify` on a correctly template-coordinate-sorted input must succeed and
+/// produce output byte-for-byte identical (record-for-record) to the same run
+/// without `--verify` — the flag is a precondition gate, not a mode, so it must
+/// not perturb the result. Covers both the single-threaded fast path and the
+/// `--threads N` chain path.
+#[rstest]
+#[case::single_threaded(&[])]
+#[case::chain_threads2(&["--threads", "2"])]
+fn test_group_verify_accepts_sorted_input(#[case] threads: &[&str]) {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    // Ascending positions → correctly template-coordinate sorted.
+    create_tc_bam_at_positions(&input_bam, &[100, 200, 300, 400, 500]);
+
+    let baseline = run_group_records(temp_dir.path(), "baseline", &input_bam, threads);
+    let mut extra = threads.to_vec();
+    extra.push("--verify");
+    let verified = run_group_records(temp_dir.path(), "verified", &input_bam, &extra);
+
+    assert_eq!(verified.len(), 5, "expected one grouped record per position group");
+    assert_eq!(
+        baseline, verified,
+        "--verify must not change the output on a correctly-sorted input (--output still written)",
+    );
+}
+
+/// `--verify` on an input that is out of template-coordinate order (despite a
+/// header that advertises it) must abort with a non-zero exit and an error that
+/// names the ordering requirement. The same input WITHOUT `--verify` is accepted
+/// — proving the gate is what rejects it, not some other validation. Covers both
+/// the single-threaded and `--threads N` chain paths.
+#[rstest]
+#[case::single_threaded(&[])]
+#[case::chain_threads2(&["--threads", "2"])]
+fn test_group_verify_rejects_out_of_order_input(#[case] threads: &[&str]) {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    // Descending positions → genuinely out of order under a TC-advertising header.
+    create_tc_bam_at_positions(&input_bam, &[500, 400, 300, 200, 100]);
+
+    // Without --verify the out-of-order input is accepted (no ordering guard).
+    let without = run_group_records(temp_dir.path(), "without_verify", &input_bam, threads);
+    assert!(!without.is_empty(), "sanity: without --verify the input is grouped without error");
+
+    // With --verify it is rejected before completing.
+    let err = group_verify_result(temp_dir.path(), &input_bam, threads)
+        .expect_err("out-of-order input must be rejected under --verify");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("template-coordinate sort order"),
+        "error should name the ordering requirement, got: {message}",
+    );
+}
+
+/// The verify-accepts cases above use a single-batch input. The real risk of
+/// `--verify` on the chain path is that records reach the *serial* grouper in
+/// genuine input order after multi-worker decode/reorder — a reorder regression
+/// that only bites past the pipeline's batch boundaries (both the position-group
+/// accumulator and the upstream decode batch) would make `--verify` spuriously
+/// reject correctly-sorted real inputs, and no other test would catch it. Run
+/// `--threads 4 --verify` over a 600-position input and require both that it
+/// succeeds and that its output equals the non-verify run.
+#[test]
+fn test_group_verify_accepts_sorted_multi_batch_chain() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_multi_batch_input_bam(&input_bam, 600);
+
+    let baseline = run_group_records(temp_dir.path(), "baseline", &input_bam, &["--threads", "4"]);
+    let verified =
+        run_group_records(temp_dir.path(), "verified", &input_bam, &["--threads", "4", "--verify"]);
+
+    assert_eq!(baseline.len(), 600, "expected 600 grouped records (one per position group)");
+    assert_eq!(
+        baseline, verified,
+        "--verify must accept a correctly-sorted input spanning many pipeline batches \
+         under multi-worker reordering, and must not change the output",
+    );
 }
