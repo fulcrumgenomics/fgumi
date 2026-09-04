@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::AHashMap;
 use anyhow::Result;
-use log::{info, warn};
+use log::{error, info};
 
 use crate::commands::correct::{
     CollectedCorrectMetrics, CorrectOptions, EncodedUmiSet, merge_umi_counts,
@@ -35,8 +35,9 @@ use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::pipeline::chains::FinalizeHook;
 
 /// Post-pipeline finalize hook for correct. Reduces per-thread metrics,
-/// writes the optional metrics TSV, logs summary + warn banners, enforces
-/// the `--min-corrected` ratio gate, and calls `timer.log_completion`.
+/// writes the optional metrics TSV, logs the summary and the
+/// missing/wrong-length-UMI error banner, enforces the `--min-corrected`
+/// ratio gate, and calls `timer.log_completion`.
 ///
 /// Mirrors the body of `CorrectUmis::finalize_correct_run`, extracted here so
 /// `BuiltPipeline::run` can call it after `Pipeline::run` returns.
@@ -100,18 +101,14 @@ impl FinalizeHook for CorrectFinalizeHook {
         info!("Read {total_records}; kept {records_written} and rejected {rejected}");
         info!("Total templates processed: {total_templates}");
 
-        // Warn banner on missing/wrong-length UMIs.
+        // fgbio logs this summary at error level (CorrectUmis.scala:275-280).
         if total_missing > 0 || total_wrong_length > 0 {
-            warn!("###################################################################");
-            if total_missing > 0 {
-                warn!("# {total_missing} were missing UMI attributes in the BAM file!");
-            }
-            if total_wrong_length > 0 {
-                warn!(
-                    "# {total_wrong_length} had unexpected UMIs of differing lengths in the BAM file!"
-                );
-            }
-            warn!("###################################################################");
+            error!("###################################################################");
+            error!("# {total_missing} were missing UMI attributes in the BAM file!");
+            error!(
+                "# {total_wrong_length} had unexpected UMIs of differing lengths in the BAM file!"
+            );
+            error!("###################################################################");
         }
 
         // Check minimum correction ratio.
@@ -189,5 +186,121 @@ mod tests {
         // 95 / 100 = 0.95 >= 0.90, and an exact match passes.
         assert!(check_min_corrected(95, 100, 0.9).is_ok());
         assert!(check_min_corrected(90, 100, 0.9).is_ok());
+    }
+
+    // Shares the crate-wide capturing logger (see
+    // `crate::commands::common::test_log_capture`) so this test does not
+    // install a competing process-global logger under plain `cargo t`.
+    use crate::commands::common::test_log_capture::{capture_logs, captured_with_level};
+    use crate::commands::correct::Target;
+    use rstest::rstest;
+
+    /// Content needles identifying the missing/wrong-length-UMI banner lines,
+    /// deliberately excluding the `###`-only separator lines: those would
+    /// also match an unrelated banner, so anchoring on the two message lines
+    /// keeps a false match from masking a real regression.
+    const MISSING_UMI_NEEDLE: &str = "were missing UMI attributes";
+    const WRONG_LENGTH_NEEDLE: &str = "had unexpected UMIs of differing lengths";
+
+    /// fgbio logs the missing/wrong-length-UMI summary banner at error level
+    /// (`CorrectUmis.scala:275-280`), and the legacy single-threaded path
+    /// (`src/lib/commands/correct.rs`) matches that. Pin the chain
+    /// (`--threads`) path to the same level and presence:
+    ///
+    /// - `missing_and_wrong_length_present`: regression coverage for the
+    ///   banner silently being downgraded to `warn!` here while the legacy
+    ///   path stayed at `error!`, which let `correct --threads` users'
+    ///   banners slip past error-level log filters that the legacy path's
+    ///   banners would not.
+    /// - `missing_only` / `wrong_length_only`: independent single-trigger
+    ///   cases. Each on its own would flip to no-banner under a `||`->`&&`
+    ///   guard regression (`2 > 0 && 0 > 0` is false), which the combined
+    ///   `(2, 1)` case cannot catch since both counters are nonzero there.
+    /// - `none_missing_or_wrong_length`: without this case, a mutant that
+    ///   drops the `if total_missing > 0 || total_wrong_length > 0` guard and
+    ///   emits the banner unconditionally would still pass the positive case
+    ///   alone.
+    ///
+    /// Whenever a banner is expected, both message needles must be present
+    /// (the guard emits both lines together), not merely one -- requiring only
+    /// one would let a dropped message line slip through.
+    #[rstest]
+    #[case::missing_and_wrong_length_present(2, 1, true)]
+    #[case::missing_only(2, 0, true)]
+    #[case::wrong_length_only(0, 1, true)]
+    #[case::none_missing_or_wrong_length(0, 0, false)]
+    fn missing_or_wrong_length_umi_banner_level_and_presence(
+        #[case] missing_umis: u64,
+        #[case] wrong_length: u64,
+        #[case] expect_banner: bool,
+    ) {
+        let _session = capture_logs();
+
+        let metrics = PerThreadAccumulator::new(1);
+        metrics.with_slot(|m: &mut CollectedCorrectMetrics| {
+            m.templates_processed = 3;
+            m.missing_umis = missing_umis;
+            m.wrong_length = wrong_length;
+        });
+
+        let hook = CorrectFinalizeHook {
+            metrics,
+            records_emitted: Arc::new(AtomicU64::new(5)),
+            encoded_umi_set: Arc::new(EncodedUmiSet::new(&["AAA".to_string(), "CCC".to_string()])),
+            unmatched_umi: "NNN".to_string(),
+            min_corrected: None,
+            correct: CorrectOptions {
+                metrics: None,
+                target: Target::Umi,
+                max_mismatches: 1,
+                min_distance_diff: 1,
+                umis: vec!["AAA".to_string(), "CCC".to_string()],
+                umi_files: vec![],
+                dont_store_original_umis: false,
+                cache_size: 10,
+                min_corrected: None,
+                revcomp: false,
+                rejects_path: None,
+            },
+            timer: OperationTimer::new("Correct"),
+        };
+
+        Box::new(hook).finalize().expect("finalize must succeed");
+
+        let logs = captured_with_level();
+        // The banner emits both message lines together whenever it fires, so
+        // locate each independently and require both when a banner is expected
+        // (requiring only one would let a dropped line pass).
+        let missing_line = logs.iter().find(|(_, msg)| msg.contains(MISSING_UMI_NEEDLE));
+        let wrong_length_line = logs.iter().find(|(_, msg)| msg.contains(WRONG_LENGTH_NEEDLE));
+
+        if expect_banner {
+            // `assert!` + `unwrap` rather than `unwrap_or_else(|| panic!(..))`: the
+            // never-taken closure of the latter is an uncovered region on the
+            // (always-passing) happy path, whereas an `assert!`'s panic branch
+            // folds onto its covered line. Same rigor -- both lines must be present.
+            assert!(
+                missing_line.is_some(),
+                "expected the missing-UMI banner line ({MISSING_UMI_NEEDLE:?}); got: {logs:?}"
+            );
+            assert!(
+                wrong_length_line.is_some(),
+                "expected the wrong-length-UMI banner line ({WRONG_LENGTH_NEEDLE:?}); got: {logs:?}"
+            );
+            for (level, msg) in [missing_line.unwrap(), wrong_length_line.unwrap()] {
+                assert_eq!(
+                    *level,
+                    log::Level::Error,
+                    "banner line {msg:?} logged at {level:?}; fgbio parity requires error level \
+                    (CorrectUmis.scala:275-280)"
+                );
+            }
+        } else {
+            assert!(
+                missing_line.is_none() && wrong_length_line.is_none(),
+                "expected no missing/wrong-length-UMI banner when neither counter is nonzero \
+                (the guard must suppress it); got: {logs:?}"
+            );
+        }
     }
 }
