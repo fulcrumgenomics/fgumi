@@ -1648,6 +1648,265 @@ pub struct ExtractOptions {
     pub no_check_crc: bool,
 }
 
+/// Extract-stage options for the fused `runall` pipeline — a `runall`-only
+/// `clap::Args` variant of [`Extract`]'s options.
+///
+/// The standalone [`Extract`] CLI struct owns `--output` and the flattened
+/// engine sub-structs (`threading`/`compression`/`scheduler_opts`/
+/// `queue_memory`), which `runall` supplies itself, so [`Extract`] cannot be
+/// flattened into a fused command directly. This struct mirrors the current
+/// [`Extract`] CLI-struct field shapes minus those, and carries
+/// `#[fgumi_cli_macros::multi_options]` so `runall` can re-expose each field as a
+/// prefixed `--extract::<flag>` via the generated `MultiExtractRunallOptions`
+/// companion, without hand-maintaining a parallel option set.
+///
+/// The `inputs`/`read_structures`/`interleaved` source-construction fields are
+/// not projected by [`Self::to_extract_options`] — they build the FASTQ source
+/// for PR B and are exposed `pub` for that consumer. Every other field maps into
+/// [`ExtractOptions`] exactly as [`Extract::to_extract_options`] does; in
+/// particular `platform` (default `"illumina"`) becomes `Some(..)` and
+/// `quality_encoding` is the [`QualityEncoding::Standard`] placeholder the chain
+/// FASTQ source overrides at runtime. `--read-structures` is `required` here
+/// (unlike the standalone's `+T` default): a fused `runall` always demands it.
+///
+/// The three cross-field `conflicts_with` attrs on [`Extract`]
+/// (`--store-umi-quals` vs `--extract-umis-from-read-names`, and the
+/// `--check-crc`/`--no-check-crc` pair) are dropped because the `multi_options`
+/// macro rejects `conflicts_with`; they are re-enforced in [`Self::validate`].
+#[fgumi_cli_macros::multi_options("extract", "Extract Options")]
+#[derive(Debug, Clone, clap::Args)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ExtractRunallOptions {
+    // ── Source-construction fields (not projected by to_extract_options) ──
+    /// Input FASTQ files corresponding to each sequencing read (e.g. R1, I1, etc.).
+    /// Accepts one or more space-separated values; required for this runall variant.
+    #[arg(long = "inputs", required = true, num_args = 1..)]
+    pub inputs: Vec<PathBuf>,
+
+    /// Read structures, one for each of the FASTQs (optional if 1-2 template-only FASTQs).
+    /// Accepts one or more space-separated values; required for this runall variant.
+    #[arg(long = "read-structures", required = true, num_args = 1..)]
+    pub read_structures: Vec<ReadStructure>,
+
+    /// Treat a single input as interleaved paired-end FASTQ (`R1, R2, R1, R2, …`),
+    /// de-interleaving it into the two reads. Requires exactly one `--input` (a
+    /// file or `-` for stdin) and describes both reads with two `--read-structures`
+    /// (defaults to `+T +T`). This lets a streaming trimmer or converter pipe
+    /// interleaved pairs straight into extract without staging two FASTQ files.
+    #[arg(long = "interleaved", default_value_t = false)]
+    pub interleaved: bool,
+
+    // ── Header / behavior fields (projected into ExtractOptions) ──
+    /// The name of the sequenced sample
+    #[arg(long, required = true)]
+    pub sample: String,
+
+    /// The name/ID of the sequenced library
+    #[arg(long, required = true)]
+    pub library: String,
+
+    /// Sequencing Platform
+    #[arg(long, default_value = "illumina")]
+    pub platform: String,
+
+    /// Library or Sample barcode sequence
+    #[arg(long)]
+    pub barcode: Option<String>,
+
+    /// Read group ID to use in the file header
+    #[arg(long = "read-group-id", default_value = "A")]
+    pub read_group_id: String,
+
+    /// Platform unit (e.g. 'flowcell-barcode.lane.sample-barcode')
+    #[arg(long = "platform-unit")]
+    pub platform_unit: Option<String>,
+
+    /// Platform model to insert into the group header (ex. miseq, hiseq2500, hiseqX)
+    #[arg(long = "platform-model")]
+    pub platform_model: Option<String>,
+
+    /// The sequencing center from which the data originated
+    #[arg(long = "sequencing-center")]
+    pub sequencing_center: Option<String>,
+
+    /// Predicted median insert size, to insert into the read group header
+    #[arg(long = "predicted-insert-size")]
+    pub predicted_insert_size: Option<u32>,
+
+    /// Description of the read group
+    #[arg(long)]
+    pub description: Option<String>,
+
+    /// Comment(s) to include in the output file's header
+    #[arg(long, num_args = 0..)]
+    pub comment: Vec<String>,
+
+    /// Date the run was produced, to insert into the read group header
+    #[arg(long = "run-date")]
+    pub run_date: Option<String>,
+
+    /// Store UMI base quality scores in the QX SAM tag
+    #[arg(long = "store-umi-quals")]
+    pub store_umi_quals: bool,
+
+    /// Store cell barcode base quality scores in the CY SAM tag
+    #[arg(long = "store-cell-quals")]
+    pub store_cell_quals: bool,
+
+    /// Store the sample barcode qualities in the QT Tag
+    #[arg(long = "store-sample-barcode-qualities")]
+    pub store_sample_barcode_qualities: bool,
+
+    /// Extract UMI(s) from read names and prepend to UMIs from reads
+    #[arg(long = "extract-umis-from-read-names")]
+    #[allow(clippy::struct_field_names)]
+    pub extract_umis_from_read_names: bool,
+
+    /// Annotate read names with UMIs (appends "+UMIs" to read names)
+    #[arg(long = "annotate-read-names")]
+    pub annotate_read_names: bool,
+
+    /// Single tag to store all concatenated UMIs (in addition to per-segment tags)
+    #[arg(long = "single-tag")]
+    pub single_tag: Option<SamTag>,
+
+    /// Tag containing adapter clipping position to adjust (e.g. 'XT' from `MarkIlluminaAdapters`)
+    #[arg(long = "clipping-attribute")]
+    pub clipping_attribute: Option<SamTag>,
+
+    /// Wrap FASTQ inputs in a userspace async prefetch reader. Dedicates one
+    /// OS thread per input stream to issue reads ahead of decompression/parsing.
+    /// Hidden experimental flag.
+    #[arg(long = "async-reader", default_value_t = false, hide = true)]
+    pub async_reader: bool,
+
+    /// Verify each BGZF block's CRC32 checksum while decoding the input.
+    ///
+    /// Applies to BGZF-compressed FASTQ input (bgzip'd); plain gzip is not
+    /// block-structured and has no per-block CRC to skip. The policy is honored
+    /// at any thread count, though BGZF decode runs single-threaded when skipping
+    /// (verifying BGZF input can decode in parallel). Without either flag,
+    /// verification defaults on for file input and off for trusted stdin (a
+    /// freshly-piped stream is trusted; a file may have been archived or
+    /// transferred since it was written, where a flipped bit is what CRC32 exists
+    /// to catch). Pass `--check-crc` to force it on. Mutually exclusive with
+    /// `--no-check-crc`.
+    #[arg(long = "check-crc", default_value_t = false)]
+    pub check_crc: bool,
+
+    /// Skip CRC32 verification while decoding BGZF FASTQ input.
+    ///
+    /// Trades the CRC32 integrity check for faster BGZF decode (which then runs
+    /// single-threaded). See `--check-crc` for the default policy this overrides.
+    /// Mutually exclusive with `--check-crc`.
+    #[arg(long = "no-check-crc", default_value_t = false)]
+    pub no_check_crc: bool,
+}
+
+/// Hand-written to match what parsing the minimal required flags (`--extract::sample`,
+/// `--extract::library`, `--extract::inputs`, `--extract::read-structures`) through
+/// `MultiExtractRunallOptions::try_parse_from` and `validate()` would produce, per the
+/// branch-wide invariant "Default == the minimal-parse projection". `#[derive(Default)]`
+/// cannot be used here because it would give `platform`/`read_group_id` empty-string
+/// defaults instead of the CLI defaults (`"illumina"` / `"A"`). `sample`/`library`/
+/// `inputs`/`read_structures` have no natural default (they are staged-required, lifted
+/// by `MultiExtractRunallOptions::validate`, never `Extract`'s own `Default`) and are set
+/// to placeholders that are never consumed, mirroring how the other structs' `Default`
+/// impls handle required fields.
+impl Default for ExtractRunallOptions {
+    fn default() -> Self {
+        Self {
+            inputs: Vec::new(),
+            read_structures: Vec::new(),
+            interleaved: false,
+            sample: String::new(),
+            library: String::new(),
+            platform: "illumina".to_string(),
+            barcode: None,
+            read_group_id: "A".to_string(),
+            platform_unit: None,
+            platform_model: None,
+            sequencing_center: None,
+            predicted_insert_size: None,
+            description: None,
+            comment: Vec::new(),
+            run_date: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
+            store_sample_barcode_qualities: false,
+            extract_umis_from_read_names: false,
+            annotate_read_names: false,
+            single_tag: None,
+            clipping_attribute: None,
+            async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
+        }
+    }
+}
+
+impl ExtractRunallOptions {
+    /// Project into the per-stage [`ExtractOptions`] the chain builder consumes.
+    ///
+    /// Verbatim-logic copy of [`Extract::to_extract_options`]: `quality_encoding`
+    /// is the [`QualityEncoding::Standard`] placeholder (the chain FASTQ source
+    /// overrides it while opening its readers), `platform` becomes `Some(..)`, and
+    /// `clipping_attribute` is intentionally dropped — it does not apply to FASTQ
+    /// input. The `inputs`/`read_structures`/`interleaved` source fields are not
+    /// part of this projection (PR B builds the FASTQ source from them).
+    #[must_use]
+    pub fn to_extract_options(&self) -> ExtractOptions {
+        ExtractOptions {
+            sample: self.sample.clone(),
+            library: self.library.clone(),
+            platform: Some(self.platform.clone()),
+            platform_unit: self.platform_unit.clone(),
+            read_group_id: self.read_group_id.clone(),
+            comments: self.comment.clone(),
+            barcode: self.barcode.clone(),
+            platform_model: self.platform_model.clone(),
+            sequencing_center: self.sequencing_center.clone(),
+            predicted_insert_size: self.predicted_insert_size,
+            description: self.description.clone(),
+            run_date: self.run_date.clone(),
+            quality_encoding: QualityEncoding::Standard,
+            store_umi_quals: self.store_umi_quals,
+            store_cell_quals: self.store_cell_quals,
+            single_tag: self.single_tag,
+            annotate_read_names: self.annotate_read_names,
+            extract_umis_from_read_names: self.extract_umis_from_read_names,
+            store_sample_barcode_qualities: self.store_sample_barcode_qualities,
+            async_reader: self.async_reader,
+            check_crc: self.check_crc,
+            no_check_crc: self.no_check_crc,
+        }
+    }
+
+    /// Re-enforce the cross-field conflicts the `multi_options` macro required us
+    /// to drop from the `#[arg]` attributes (mirrors [`Extract::validate`]).
+    ///
+    /// This is separate from the macro-generated `MultiExtractRunallOptions::
+    /// validate()`, which only lifts the staged-required flags; `runall`/PR B
+    /// calls this after building the [`ExtractRunallOptions`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `--store-umi-quals` is combined with
+    /// `--extract-umis-from-read-names`, or if `--check-crc` and `--no-check-crc`
+    /// are both set.
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.extract_umis_from_read_names || !self.store_umi_quals,
+            "Cannot store UMI qualities (--store-umi-quals) when also extracting UMIs from read names (--extract-umis-from-read-names)."
+        );
+        ensure!(
+            !(self.check_crc && self.no_check_crc),
+            "--check-crc and --no-check-crc are mutually exclusive."
+        );
+        Ok(())
+    }
+}
+
 /// Build raw BAM `RawRecord`s from a [`FastqSet`].
 ///
 /// This is the core extract logic: applies read structures (via the segments
@@ -5573,5 +5832,144 @@ mod tests {
         let mut only_from_name = minimal_extract_options();
         only_from_name.extract_umis_from_read_names = true;
         only_from_name.validate().expect("extract-umis-from-read-names alone must validate");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ExtractRunallOptions / MultiExtractRunallOptions parity (multi_options)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// `MultiExtractRunallOptions` derives `clap::Args` (not `Parser`), so parse
+    /// it through a local `#[command(flatten)]` wrapper.
+    #[derive(clap::Parser, Debug)]
+    struct PrefixedExtract {
+        #[command(flatten)]
+        opts: MultiExtractRunallOptions,
+    }
+
+    /// The minimal required flags to parse a `MultiExtractRunallOptions`.
+    fn minimal_runall_args() -> Vec<&'static str> {
+        vec![
+            "x",
+            "--extract::sample",
+            "s1",
+            "--extract::library",
+            "lib1",
+            "--extract::inputs",
+            "r1.fq",
+            "--extract::read-structures",
+            "+T",
+        ]
+    }
+
+    /// Parsing the minimal required flags projects to the expected
+    /// [`ExtractOptions`] (all defaults), and the source fields round-trip.
+    #[test]
+    fn multi_extract_runall_options_defaults_match_projection() {
+        let opts = PrefixedExtract::try_parse_from(minimal_runall_args())
+            .expect("parses")
+            .opts
+            .validate()
+            .expect("valid");
+
+        let projected = opts.to_extract_options();
+        assert_eq!(projected.sample, "s1");
+        assert_eq!(projected.library, "lib1");
+        assert_eq!(projected.platform, Some("illumina".to_string()));
+        assert_eq!(projected.read_group_id, "A");
+        assert_eq!(projected.quality_encoding, QualityEncoding::Standard);
+        assert!(projected.platform_unit.is_none());
+        assert!(projected.barcode.is_none());
+        assert!(projected.platform_model.is_none());
+        assert!(projected.sequencing_center.is_none());
+        assert!(projected.predicted_insert_size.is_none());
+        assert!(projected.description.is_none());
+        assert!(projected.run_date.is_none());
+        assert!(projected.single_tag.is_none());
+        assert!(projected.comments.is_empty());
+        assert!(!projected.store_umi_quals);
+        assert!(!projected.store_cell_quals);
+        assert!(!projected.store_sample_barcode_qualities);
+        assert!(!projected.annotate_read_names);
+        assert!(!projected.extract_umis_from_read_names);
+        assert!(!projected.async_reader);
+        assert!(!projected.check_crc);
+        assert!(!projected.no_check_crc);
+
+        assert_eq!(opts.inputs, vec![PathBuf::from("r1.fq")]);
+        assert_eq!(opts.read_structures.len(), 1);
+    }
+
+    /// Each staged-required flag omitted makes `validate()` fail.
+    #[rstest]
+    #[case::sample("--extract::sample")]
+    #[case::library("--extract::library")]
+    #[case::inputs("--extract::inputs")]
+    #[case::read_structures("--extract::read-structures")]
+    fn multi_extract_runall_options_missing_required_is_err(#[case] flag_to_drop: &str) {
+        // Drop the flag and its following value from the minimal arg list.
+        let full = minimal_runall_args();
+        let mut args: Vec<&str> = Vec::with_capacity(full.len());
+        let mut idx = 0;
+        while idx < full.len() {
+            if full[idx] == flag_to_drop {
+                idx += 2; // skip the flag and its value
+            } else {
+                args.push(full[idx]);
+                idx += 1;
+            }
+        }
+        let parsed = PrefixedExtract::try_parse_from(args).expect("parses").opts.validate();
+        assert!(parsed.is_err(), "omitting {flag_to_drop} must fail validate()");
+    }
+
+    /// `--store-umi-quals` with `--extract-umis-from-read-names` is rejected by
+    /// the struct's own `validate()` (the dropped `conflicts_with`).
+    #[test]
+    fn extract_runall_options_store_umi_quals_conflicts_with_extract_from_names() {
+        let mut args = minimal_runall_args();
+        args.push("--extract::store-umi-quals");
+        args.push("--extract::extract-umis-from-read-names");
+        let opts = PrefixedExtract::try_parse_from(args)
+            .expect("parses")
+            .opts
+            .validate()
+            .expect("staged-required lifting passes");
+        assert!(opts.validate().is_err());
+    }
+
+    /// `--check-crc` with `--no-check-crc` is rejected by `validate()`.
+    #[test]
+    fn extract_runall_options_check_crc_conflicts_with_no_check_crc() {
+        let mut args = minimal_runall_args();
+        args.push("--extract::check-crc");
+        args.push("--extract::no-check-crc");
+        let opts = PrefixedExtract::try_parse_from(args)
+            .expect("parses")
+            .opts
+            .validate()
+            .expect("staged-required lifting passes");
+        assert!(opts.validate().is_err());
+    }
+
+    /// `ExtractRunallOptions::default()` must match the CLI defaults
+    /// (`"illumina"` / `"A"`), not the derived-`Default` empty strings — guards
+    /// the branch-wide invariant "Default == the minimal-parse projection".
+    #[test]
+    fn multi_extract_runall_options_default_matches_cli_defaults() {
+        let defaults = ExtractRunallOptions::default();
+        assert_eq!(defaults.platform, "illumina");
+        assert_eq!(defaults.read_group_id, "A");
+    }
+
+    /// A supplied `--extract::barcode` round-trips into the projection.
+    #[test]
+    fn multi_extract_runall_options_round_trips_barcode() {
+        let mut args = minimal_runall_args();
+        args.push("--extract::barcode");
+        args.push("ACGT");
+        let opts =
+            PrefixedExtract::try_parse_from(args).expect("parses").opts.validate().expect("valid");
+        assert_eq!(opts.barcode, Some("ACGT".to_string()));
+        assert_eq!(opts.to_extract_options().barcode, Some("ACGT".to_string()));
     }
 }
