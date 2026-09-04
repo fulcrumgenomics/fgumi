@@ -962,11 +962,10 @@ impl RunAll {
     /// requested, `None` otherwise (even if `--ref` was supplied — e.g. to
     /// feed an upstream align stage in the same chain).
     ///
-    /// Not yet called outside tests: the production call site (the
-    /// stage-options-bag builder) lands in a later task of this same PR-B
-    /// campaign.
+    /// Called by [`Self::build_stage_options_bag`] to populate the
+    /// `#[arg(skip)]` `reference` slot on the Simplex/Duplex consensus
+    /// options structs.
     #[must_use]
-    #[allow(dead_code)]
     pub(crate) fn consensus_reference(&self) -> Option<PathBuf> {
         if self.methylation_mode.is_some() { self.reference.clone() } else { None }
     }
@@ -1108,6 +1107,279 @@ impl RunAll {
     #[allow(dead_code)]
     pub(crate) fn derive_sink_spec(&self) -> Result<crate::pipeline::chains::SinkSpec> {
         Ok(crate::pipeline::chains::SinkSpec::Bam(self.output.clone()))
+    }
+
+    /// Build the [`StageOptionsBag`](crate::pipeline::chains::StageOptionsBag)
+    /// for the `ChainSpec` derived from the active stages in
+    /// [`Self::derive_stages`].
+    ///
+    /// Each active stage's options slot is populated; inactive slots remain
+    /// `None`. Fields annotated `#[arg(skip)]` on the per-stage options
+    /// structs are populated here using the same logic the existing
+    /// single-stage `execute_*_only` paths apply.
+    ///
+    /// # Option-population rules by stage
+    ///
+    /// * **Correct** — validates `MultiCorrectOptions`, then sets
+    ///   `rejects_path`:
+    ///   - Self-pair (`--stop-after correct`): honors the top-level
+    ///     `--rejects`, falling back to `--correct::rejects`.
+    ///   - Cross-stage (correct feeds AAM): `rejects_path` = `None` (the
+    ///     fused chain uses the kept-only correct step; UMI rejects are
+    ///     discarded — `RunAll::execute` emits a warning when `--rejects` is
+    ///     set on a chained correct run).
+    ///
+    /// * **Align** — constructs
+    ///   [`AlignOptions`](crate::pipeline::chains::options_bag::AlignOptions)
+    ///   from `--aligner::*` + `--aligner-bin` + `--ref`. Requires `--ref` to
+    ///   be set.
+    ///
+    /// * **Zipper** — validates `MultiZipperOptions`. No `#[arg(skip)]` fields.
+    ///
+    /// * **Sort** — validates `MultiSortOptions`, forces
+    ///   `order = TemplateCoordinate` (runall's sort step always feeds
+    ///   downstream group; coordinate order is not applicable), resolves
+    ///   `tmp_dirs` against `FGUMI_TMP_DIRS`, and — when sort is fused with
+    ///   another stage — overrides an explicit `--sort::max-memory auto` to
+    ///   the standalone 768 MiB default (auto-detection is not supported in a
+    ///   fused chain).
+    ///
+    /// * **Group** — validates `MultiGroupOptions`, then computes
+    ///   `effective_strategy` / `effective_edits` via
+    ///   [`crate::commands::group::GroupOptions::resolve_strategy_and_edits`]
+    ///   and clears the three histogram/metrics paths (anti-goal documented
+    ///   in the module-level doc).
+    ///
+    /// * **Simplex** / **Duplex** — validate the per-mode `Multi<X>`, then
+    ///   populate the cross-cutting `#[arg(skip)]` fields
+    ///   (`rejects_opts`/`stats_opts`/`read_group`/`methylation_mode`/
+    ///   `reference`) from `self`.
+    ///
+    /// * **Codec** — rejects `--methylation-mode` up front (codec has no
+    ///   methylation support), validates `MultiCodecOptions`, runs the
+    ///   inherent numeric-bounds `CodecOptions::validate`, then populates
+    ///   `rejects_opts`/`stats_opts`/`read_group`.
+    ///
+    /// * **Extract** — validates `MultiExtractRunallOptions`, runs the
+    ///   inherent `ExtractRunallOptions::validate` (the 2 macro-dropped
+    ///   conflicts), then the interleaved-vs-count check, template-count
+    ///   validation, non-empty-read-structure check, and
+    ///   `ExtractOptions::validate` (reserved-tag + store-umi-quals).
+    ///
+    /// * **Filter** — validates `MultiFilterOptions`. No cross-stage
+    ///   rewiring is needed: filter is always terminal in a runall chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if any per-stage `validate()` call fails (e.g. missing
+    /// required option like `--group::strategy` or `--correct::min-distance`),
+    /// if `Stage::Align` is present but `--ref` is absent, if
+    /// `--methylation-mode` is combined with `Stage::Codec`, or if `stages`
+    /// contains a stage `derive_stages` never emits for a runall chain (an
+    /// internal-error bail naming the unexpected stage).
+    ///
+    /// Not yet called outside tests: the production call site (`execute`)
+    /// lands in a later task of this same PR-B campaign.
+    #[allow(dead_code)]
+    pub(crate) fn build_stage_options_bag(
+        &self,
+        stages: &[crate::pipeline::chains::Stage],
+    ) -> Result<crate::pipeline::chains::StageOptionsBag> {
+        use crate::commands::common::MemoryLimit;
+        use crate::commands::sort::{SortOrderArg, TMP_DIRS_ENV, resolve_tmp_dirs};
+        use crate::pipeline::chains::options_bag::AlignOptions;
+        use crate::pipeline::chains::{Stage, StageOptionsBag};
+
+        let mut bag = StageOptionsBag::default();
+
+        for &stage in stages {
+            match stage {
+                Stage::Correct => {
+                    let mut opts = self.correct_opts.clone().validate()?;
+                    opts.rejects_path = if self.stop_after_stage() == RunAllStage::Correct {
+                        // self-pair: honor top-level --rejects, falling back to --correct::rejects.
+                        self.rejects_opts.rejects.clone().or(opts.rejects_path)
+                    } else {
+                        // fused kept-only correct discards UMI rejects (see execute() warn)
+                        None
+                    };
+                    bag.correct = Some(opts);
+                }
+
+                Stage::Align => {
+                    let reference = self.reference.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--start-from align requires --ref (the aligner reference \
+                             FASTA with its index files alongside)"
+                        )
+                    })?;
+                    let aligner = self.aligner_opts.clone().validate()?;
+                    bag.aligner = Some(AlignOptions {
+                        aligner,
+                        reference,
+                        aligner_bin: self.aligner_bin.clone(),
+                    });
+                }
+
+                Stage::Zipper => {
+                    let opts = self.zipper_opts.clone().validate()?;
+                    bag.zipper = Some(opts);
+                }
+
+                Stage::Sort => {
+                    let mut sort_opts = self.sort_opts.clone().validate()?;
+                    // Runall's sort step always produces template-coordinate
+                    // output — the only order compatible with downstream Group.
+                    sort_opts.order = SortOrderArg::TemplateCoordinate;
+                    sort_opts.tmp_dirs = resolve_tmp_dirs(
+                        &sort_opts.tmp_dirs,
+                        std::env::var(TMP_DIRS_ENV).ok().as_deref(),
+                    );
+                    // --sort::max-memory=auto bails in any non-sole-[Sort] chain
+                    // (builder.rs:2560), so override auto -> the standalone
+                    // 768 MiB default when sort is fused with other stages.
+                    if stages != [Stage::Sort] && sort_opts.max_memory == MemoryLimit::Auto {
+                        log::warn!(
+                            "--sort::max-memory auto is not supported in a fused runall \
+                             chain; using 768M"
+                        );
+                        sort_opts.max_memory = MemoryLimit::Fixed(768 * 1024 * 1024);
+                    }
+                    bag.sort = Some(sort_opts);
+                }
+
+                Stage::Group => {
+                    let mut group_opts = self.group_opts.clone().validate()?;
+                    // Mirror GroupReadsByUmi::execute: compute
+                    // effective_strategy / effective_edits via the shared
+                    // helper, then null the per-position metrics outputs
+                    // (anti-goal documented in the module-level doc comment).
+                    let (effective_strategy, effective_edits) =
+                        group_opts.resolve_strategy_and_edits();
+                    group_opts.effective_strategy = effective_strategy;
+                    group_opts.effective_edits = effective_edits;
+                    group_opts.family_size_histogram = None;
+                    group_opts.grouping_metrics = None;
+                    group_opts.metrics_prefix = None;
+                    bag.group = Some(group_opts);
+                }
+
+                #[cfg(feature = "consensus")]
+                Stage::Simplex => {
+                    let mut opts = self.simplex_opts.clone().validate()?;
+                    opts.rejects_opts.clone_from(&self.rejects_opts);
+                    opts.stats_opts.clone_from(&self.stats_opts);
+                    opts.read_group.clone_from(&self.read_group);
+                    opts.methylation_mode =
+                        crate::commands::common::resolve_methylation_mode(self.methylation_mode);
+                    opts.reference = self.consensus_reference();
+                    bag.simplex = Some(opts);
+                }
+
+                #[cfg(feature = "consensus")]
+                Stage::Duplex => {
+                    let mut opts = self.duplex_opts.clone().validate()?;
+                    opts.rejects_opts.clone_from(&self.rejects_opts);
+                    opts.stats_opts.clone_from(&self.stats_opts);
+                    opts.read_group.clone_from(&self.read_group);
+                    opts.methylation_mode =
+                        crate::commands::common::resolve_methylation_mode(self.methylation_mode);
+                    opts.reference = self.consensus_reference();
+                    bag.duplex = Some(opts);
+                }
+
+                #[cfg(feature = "consensus")]
+                Stage::Codec => {
+                    // Codec does not support methylation calling — fail loud
+                    // rather than silently dropping the flag.
+                    if self.methylation_mode.is_some() {
+                        bail!(
+                            "--methylation-mode is not supported with codec consensus; \
+                             it is valid only for simplex/duplex"
+                        );
+                    }
+                    // Validate the `--codec::*` flags into CodecOptions, then
+                    // run the numeric/semantic checks (min-reads, qual
+                    // ceilings, disagreement-rate, …) that standalone `fgumi
+                    // codec` runs — otherwise runall would accept degenerate
+                    // configs the standalone command rejects.
+                    let mut opts = self.codec_opts.clone().validate()?;
+                    opts.validate()?;
+                    opts.rejects_opts.clone_from(&self.rejects_opts);
+                    opts.stats_opts.clone_from(&self.stats_opts);
+                    opts.read_group.clone_from(&self.read_group);
+                    bag.codec = Some(opts);
+                }
+
+                Stage::Extract => {
+                    use crate::commands::extract::validate_template_count;
+
+                    let opts = self.extract_opts.clone().validate()?; // -> ExtractRunallOptions
+                    opts.validate()?; // the 2 macro-dropped conflicts
+                    let rs = &opts.read_structures;
+                    if opts.interleaved {
+                        anyhow::ensure!(
+                            opts.inputs.len() == 1,
+                            "--extract::interleaved requires exactly one --extract::inputs; got {}",
+                            opts.inputs.len()
+                        );
+                        anyhow::ensure!(
+                            rs.len() == 2,
+                            "--extract::interleaved requires exactly two \
+                             --extract::read-structures; got {}",
+                            rs.len()
+                        );
+                    } else {
+                        anyhow::ensure!(
+                            opts.inputs.len() == rs.len(),
+                            "--extract::inputs and --extract::read-structures must have the \
+                             same count"
+                        );
+                    }
+                    validate_template_count(rs)?;
+                    for (i, r) in rs.iter().enumerate() {
+                        anyhow::ensure!(
+                            !r.segments().is_empty(),
+                            "Read structure {} is empty",
+                            i + 1
+                        );
+                    }
+                    let extract_options = opts.to_extract_options();
+                    extract_options.validate()?; // reserved-tag + store-umi-quals
+                    bag.extract = Some(extract_options);
+                }
+
+                Stage::Filter => {
+                    // The standalone filter chain builder reads `rejects` and
+                    // `stats` straight off the bag's FilterOptions, so
+                    // `--filter::rejects` / `--filter::stats` flow through
+                    // unchanged. No cross-stage rewiring is needed: filter is
+                    // always terminal in a runall chain.
+                    let filter_opts = self.filter_opts.clone().validate()?;
+                    bag.filter = Some(filter_opts);
+                }
+
+                // Stages runall never derives — a programming error if they appear.
+                Stage::Clip
+                | Stage::Dedup
+                | Stage::Downsample
+                | Stage::Fastq
+                | Stage::CopyUmi
+                | Stage::Retag => bail!(
+                    "internal error: build_stage_options_bag encountered unexpected \
+                     stage {stage:?} in a runall chain; this is a bug in derive_stages"
+                ),
+                // When built without the consensus feature, the
+                // Simplex/Duplex/Codec arms above are compiled out; keep the
+                // match exhaustive (mirrors validate.rs).
+                #[cfg(not(feature = "consensus"))]
+                Stage::Simplex | Stage::Duplex | Stage::Codec => {
+                    bail!("Stage {stage:?} requires building fgumi with the `consensus` feature")
+                }
+            }
+        }
+
+        Ok(bag)
     }
 }
 
@@ -1263,6 +1535,136 @@ mod derive_tests {
     #[case::simplex_adjacency_ok(RunAllMode::Simplex, Strategy::Adjacency, false)]
     fn strategy_for_mode(#[case] mode: RunAllMode, #[case] strat: Strategy, #[case] is_err: bool) {
         assert_eq!(validate_strategy_for_mode(mode, strat).is_err(), is_err);
+    }
+}
+
+#[cfg(test)]
+mod bag_tests {
+    use super::*;
+    use crate::assigner::Strategy;
+    use crate::commands::sort::SortOrderArg;
+    use crate::pipeline::chains::Stage;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> RunAll {
+        RunAll::try_parse_from(std::iter::once("runall").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn sort_order_is_forced_template_coordinate() {
+        let r = parse(&[
+            "--start-from",
+            "sort",
+            "--stop-after",
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+            "--sort::order",
+            "coordinate",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Sort, Stage::Group]).unwrap();
+        assert_eq!(bag.sort.unwrap().order, SortOrderArg::TemplateCoordinate);
+    }
+
+    #[test]
+    fn group_effective_strategy_resolved() {
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+            "--group::edits",
+            "1",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Group]).unwrap();
+        let g = bag.group.unwrap();
+        assert_eq!(g.effective_strategy, Strategy::Adjacency);
+        assert_eq!(g.effective_edits, 1);
+    }
+
+    #[test]
+    fn fused_sort_max_memory_auto_is_overridden_to_fixed() {
+        let r = parse(&[
+            "--start-from",
+            "sort",
+            "--stop-after",
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+            "--sort::max-memory",
+            "auto",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Sort, Stage::Group]).unwrap();
+        assert!(matches!(
+            bag.sort.unwrap().max_memory,
+            crate::commands::common::MemoryLimit::Fixed(_)
+        ));
+    }
+
+    #[cfg(feature = "consensus")]
+    #[test]
+    fn codec_rejects_methylation_mode() {
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+            "--consensus",
+            "codec",
+            "--codec::min-reads",
+            "1",
+            "--methylation-mode",
+            "em-seq",
+        ]);
+        let Err(err) = r.build_stage_options_bag(&[Stage::Codec]) else {
+            panic!("expected --methylation-mode + codec to be rejected");
+        };
+        let err = err.to_string();
+        assert!(err.contains("not supported with codec consensus"), "got: {err}");
+    }
+
+    #[cfg(not(feature = "consensus"))]
+    #[test]
+    fn consensus_stages_rejected_without_consensus_feature() {
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+        ]);
+        for stage in [Stage::Simplex, Stage::Duplex, Stage::Codec] {
+            let Err(err) = r.build_stage_options_bag(&[stage]) else {
+                panic!("expected {stage:?} to be rejected without the consensus feature");
+            };
+            let err = err.to_string();
+            assert!(err.contains("requires building fgumi with the `consensus` feature"));
+        }
     }
 }
 
