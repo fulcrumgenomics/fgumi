@@ -4141,11 +4141,10 @@ impl<'a> ChainBuilder<'a> {
         let num_threads = self.spec.threading.num_threads();
 
         // fgbio's ClipBam requires query-grouped input (a template's reads must be
-        // adjacent). Both legacy clip paths enforce this — `execute_single_threaded`
-        // (the parity oracle) and the pre-cutover `--threads` path, via
-        // `require_query_grouped` — so the chain `--threads` path must too; otherwise
-        // coordinate-sorted input that the legacy path rejected would be silently
-        // mis-clipped. Gated on Clip being the source stage: a future fused
+        // adjacent). The chain is clip's only execution path, so it must enforce this
+        // via `require_query_grouped`; otherwise coordinate-sorted input would be
+        // silently mis-clipped (mates scatter, so pair clip / overlap / mate-fix
+        // no-op). Gated on Clip being the source stage: a future fused
         // group→clip chain has an upstream stage that orders the records, so this
         // guard must not reject that. `ChainSpec` exposes only `single_stage` today,
         // so clip is always the source stage and the guard always fires.
@@ -4183,8 +4182,7 @@ impl<'a> ChainBuilder<'a> {
 
         // Per-thread detailed `--metrics` accumulator, bundled with the metrics
         // path in one `Option` — built only when `--metrics` is requested, one
-        // slot per worker thread, merged by `ClipMetricsFinalizeHook` (success-only)
-        // exactly like the single-threaded oracle's `ClippingMetricsCollection`.
+        // slot per worker thread, merged by `ClipMetricsFinalizeHook` (success-only).
         // Bundling means the "accumulator and path are both Some or both None"
         // invariant is structural (a single `Option`, not two kept in sync), so
         // the finalize-hook registration below never needs to prove it via `.expect()`.
@@ -4227,9 +4225,8 @@ impl<'a> ChainBuilder<'a> {
         self.finalize.push(Box::new(ClipFinalizeHook { metrics, progress_counter, timer }));
 
         // Success-only: reduce the per-thread `--metrics` accumulator and write
-        // the TSV. A failed/partial run publishes no stale metrics file, matching
-        // the single-threaded oracle (which only reaches its metrics-write code
-        // after a fully successful pass over the input).
+        // the TSV. A failed/partial run publishes no stale metrics file — a metrics
+        // TSV is only meaningful once every record was processed.
         if let Some((accumulator, metrics_path)) = metrics_target {
             self.finalize_on_success
                 .push(Box::new(ClipMetricsFinalizeHook { accumulator, metrics_path }));
