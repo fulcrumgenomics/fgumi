@@ -441,6 +441,103 @@ mod tests {
         }
     }
 
+    /// Guards the `name_hash_only` decode skip that the chain filter path relies
+    /// on (`source_group_key_config` routes `Stage::Filter` — and `Correct` — to
+    /// `GroupKeyConfig::name_hash_only`). filter groups templates through
+    /// `GroupByQueryname`, which reads only `key.name_hash`, and its process step
+    /// operates on the raw record bytes (untouched by the key config), so the skip
+    /// is output-safe **iff** `name_hash_only` produces the same `name_hash` the
+    /// full key would for every record — even when the fields the full key also
+    /// computes (library index from `RG`, unclipped position) vary across records.
+    ///
+    /// This is the in-repo replacement for the parity that
+    /// `test_filter_chain_matches_single_threaded_with_rg_and_cb_variation` used
+    /// to provide before the cutover made both of its runs take the same
+    /// `name_hash_only` chain: it pins the invariant directly against the two
+    /// decode-consumer key branches (`compute_group_key_from_raw` vs
+    /// `name_hash_key`) without needing `FGUMI_BASELINE_BIN`.
+    #[test]
+    fn name_hash_only_matches_full_key_grouping_when_rg_and_position_vary() {
+        use crate::sam::SamTag;
+        use fgumi_bam_io::{GroupKey, LibraryIndex};
+        use fgumi_raw_bam::SamBuilder;
+        use fgumi_raw_bam::flags::{FIRST_SEGMENT, LAST_SEGMENT, PAIRED};
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReadGroup;
+        use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+
+        // Two read groups in distinct libraries, so the full key's `library_idx`
+        // genuinely differs by RG — the field name_hash_only skips computing.
+        let mut header = noodles::sam::Header::builder();
+        for (id, library) in [("RG1", "libA"), ("RG2", "libB")] {
+            let rg = Map::<ReadGroup>::builder()
+                .insert(rg_tag::LIBRARY, String::from(library))
+                .build()
+                .expect("read group builds");
+            header = header.add_read_group(bstr::BString::from(id), rg);
+        }
+        let lib = LibraryIndex::from_header(&header.build());
+        let cb = Some(Tag::from([b'C', b'B']));
+
+        // Two paired templates, each R1+R2 sharing a name; the templates carry
+        // DIFFERENT read groups and DIFFERENT mapped positions, so the full key's
+        // library_idx and pos1 differ across them (the test is non-vacuous only if
+        // the skipped fields actually vary).
+        let mate = |name: &[u8], rg: &[u8], pos: i32, first: bool| -> fgumi_raw_bam::RawRecord {
+            let mut b = SamBuilder::new();
+            b.read_name(name)
+                .flags(PAIRED | if first { FIRST_SEGMENT } else { LAST_SEGMENT })
+                .ref_id(0)
+                .pos(pos)
+                .mapq(60)
+                .cigar_ops(&[4u32 << 4]) // 4M
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4]);
+            b.add_string_tag(SamTag::RG, rg);
+            b.build()
+        };
+        let records = [
+            mate(b"tmpl-A", b"RG1", 100, true),
+            mate(b"tmpl-A", b"RG1", 200, false),
+            mate(b"tmpl-B", b"RG2", 300, true),
+            mate(b"tmpl-B", b"RG2", 400, false),
+        ];
+
+        let full: Vec<_> =
+            records.iter().map(|r| compute_group_key_from_raw(r.as_ref(), &lib, cb)).collect();
+        let name_only: Vec<_> = records.iter().map(|r| name_hash_key(r.as_ref())).collect();
+
+        for (i, (full_key, name_key)) in full.iter().zip(&name_only).enumerate() {
+            assert_eq!(
+                name_key.name_hash, full_key.name_hash,
+                "record {i}: name_hash_only must reproduce the full key's name_hash despite \
+                 differing RG/position, or filter's GroupByQueryname would group differently"
+            );
+            // Everything except name_hash is left at the config-independent default,
+            // so the RG/position the full key computes cannot leak into the grouping
+            // key the chain actually uses.
+            assert_eq!(
+                *name_key,
+                GroupKey { name_hash: full_key.name_hash, ..GroupKey::default() },
+                "record {i}: name_hash_only must leave all non-name fields at default"
+            );
+        }
+
+        // Mates of a template share a name_hash under BOTH configs, so template
+        // membership (and thus filter's both-primaries aggregation) is identical.
+        assert_eq!(name_only[0].name_hash, name_only[1].name_hash, "tmpl-A mates group together");
+        assert_eq!(name_only[2].name_hash, name_only[3].name_hash, "tmpl-B mates group together");
+        assert_ne!(name_only[0].name_hash, name_only[2].name_hash, "distinct templates stay apart");
+
+        // Non-vacuous: the full key really does populate the fields name_hash_only
+        // drops, and they differ across the two read groups / positions — so the
+        // name_hash parity above is a genuine skip guard, not a comparison of two
+        // all-default keys.
+        assert_ne!(full[0].library_idx, full[2].library_idx, "full key varies library_idx by RG");
+        assert_ne!(full[0].pos1, full[2].pos1, "full key varies pos1 by mapped position");
+    }
+
     // ========================================================================
     // Fail-closed validation of undersized / malformed records
     // ========================================================================

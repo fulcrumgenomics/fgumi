@@ -225,7 +225,7 @@ pub(crate) fn build_filter_step_single_no_rejects(
                 let mut record = decoded.into_raw_bytes();
                 let (bases_masked, pass) =
                     process_record_raw_call(&mut record, &captures).map_err(io::Error::other)?;
-                // Match the legacy path's fgbio-parity "Total bases masked" tally:
+                // Match fgbio's "Total bases masked" tally:
                 // count masked bases only in a retained primary read (0 for a
                 // rejected read / secondary / supplementary), not the raw count.
                 bases_masked_total += retained_primary_masked_bases(
@@ -302,7 +302,7 @@ pub(crate) fn build_filter_step_single_with_rejects(
                 let mut record = decoded.into_raw_bytes();
                 let (bases_masked, pass) = process_record_raw_call(&mut record, &captures)
                     .map_err(io::Error::other)?;
-                // Match the legacy path's fgbio-parity "Total bases masked" tally:
+                // Match fgbio's "Total bases masked" tally:
                 // count masked bases only in a retained primary read (0 for a
                 // rejected read / secondary / supplementary), not the raw count.
                 bases_masked_total +=
@@ -375,7 +375,7 @@ pub(crate) fn build_filter_step_template_no_rejects(
                 }
 
                 let template_pass = template_passes(&template_records, &pass_map);
-                // Match the legacy path's fgbio-parity "Total bases masked" tally:
+                // Match fgbio's "Total bases masked" tally:
                 // count masked bases only in retained primary reads of a retained
                 // template (0 for a dropped template), not the raw per-record sum.
                 bases_masked_total += retained_primary_masked_bases(
@@ -466,7 +466,7 @@ pub(crate) fn build_filter_step_template_with_rejects(
                 }
 
                 let template_pass = template_passes(&template_records, &pass_map);
-                // Match the legacy path's fgbio-parity "Total bases masked" tally:
+                // Match fgbio's "Total bases masked" tally:
                 // count masked bases only in retained primary reads of a retained
                 // template (0 for a dropped template), not the raw per-record sum.
                 bases_masked_total += retained_primary_masked_bases(

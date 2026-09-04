@@ -37,6 +37,7 @@ mod test_extract_command;
 mod test_fastq_command;
 mod test_fastq_pipeline_memory_backpressure;
 mod test_filter_command;
+mod test_filter_cutover_parity;
 mod test_group_command;
 mod test_group_determinism;
 mod test_input_source_matrix;
