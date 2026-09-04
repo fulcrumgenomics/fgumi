@@ -6,6 +6,7 @@
 //! Note: BAM record parsing is handled by the Decode step in the pipeline.
 //! Groupers receive pre-decoded raw-byte records.
 
+use std::cmp::Ordering;
 use std::io;
 
 use noodles::sam::alignment::RecordBuf;
@@ -15,6 +16,7 @@ use crate::unified_pipeline::{BatchWeight, DecodedRecord, Grouper, MemoryEstimat
 use fgumi_metrics::TemplateFilterCounts;
 use fgumi_raw_bam;
 use fgumi_raw_bam::{RawRecord, raw_record_to_record_buf};
+use fgumi_sort::{LibraryLookup, TemplateKey, cb_hasher, extract_template_key_inline};
 
 // ============================================================================
 // BatchWeight Implementations
@@ -348,6 +350,92 @@ impl MemoryEstimate for RawPositionGroup {
     }
 }
 
+/// Inline, opt-in verifier that the records fed to a [`RecordPositionGrouper`]
+/// arrive in strict template-coordinate sort order.
+///
+/// This is the `--verify` gate for `fgumi group` and `fgumi dedup`. It reuses the
+/// **exact** template-coordinate key `fgumi sort --order template-coordinate`
+/// emits ([`extract_template_key_inline`]) and the same tolerant comparison
+/// `fgumi sort --verify` uses ([`TemplateKey::core_cmp`], which ignores the
+/// `name_hash`/`is_upper` tie-breaker so both fgumi- and samtools-sorted inputs
+/// pass). A record whose key sorts strictly before its predecessor is a
+/// violation and aborts the run.
+///
+/// It is deliberately **stricter than grouping requires**: grouping only needs a
+/// template's mates adjacent by position, whereas this asserts the whole file is
+/// in canonical sort order. That extra strictness is why the flag is opt-in.
+///
+/// Cell-barcode keying matches `fgumi sort --order template-coordinate`, which
+/// keys on the `CB` tag by default (see `parse_cell_tag` in `commands::sort`) —
+/// so `--verify` uses `Some(CB)` too. The `cb_hasher` is the same fixed-seed
+/// hasher the sorter uses ([`cb_hasher`]), so a recomputed `cb_hash` is
+/// bit-identical to what the sort produced for the same `CB` bytes; a record
+/// without a `CB` tag hashes to `0` on both sides. Keying with `None` here would
+/// force every `cb_hash` to `0` and spuriously reject a correctly-sorted
+/// pooled/single-cell input whose `CB` order disagrees with its library order.
+struct OrderVerifier {
+    /// Read-group -> library-ordinal lookup, built once from the BAM header.
+    lib_lookup: LibraryLookup,
+    /// Deterministic (fixed-seed) hasher for the cell-barcode lane, matching the
+    /// sorter's; constructed once and reused so key extraction is allocation-free
+    /// per record.
+    cb_hasher: ahash::RandomState,
+    /// Template-coordinate key of the previous record, or `None` before the first.
+    prev_key: Option<TemplateKey>,
+    /// Read name of the previous record, reused across calls (cleared + refilled,
+    /// so no per-record allocation) to name both records in a violation error.
+    prev_name: Vec<u8>,
+}
+
+impl OrderVerifier {
+    /// The cell-barcode tag `fgumi sort --order template-coordinate` keys on.
+    const CELL_TAG: fgumi_raw_bam::SamTag = fgumi_raw_bam::SamTag::CB;
+
+    /// Build a verifier from the input BAM header (for library-ordinal mapping).
+    fn from_header(header: &noodles::sam::Header) -> Self {
+        Self {
+            lib_lookup: LibraryLookup::from_header(header),
+            cb_hasher: cb_hasher(),
+            prev_key: None,
+            prev_name: Vec::new(),
+        }
+    }
+
+    /// Check `bam` (raw record bytes) against the previous record's key.
+    ///
+    /// # Errors
+    /// Returns [`io::ErrorKind::InvalidData`] naming both the offending read and
+    /// its predecessor when the record's template-coordinate key sorts strictly
+    /// before the previous record's.
+    fn check(&mut self, bam: &[u8]) -> io::Result<()> {
+        let key = extract_template_key_inline(
+            bam,
+            &self.lib_lookup,
+            Some(Self::CELL_TAG),
+            &self.cb_hasher,
+        );
+        let name = fgumi_raw_bam::RawRecordView::new(bam).read_name();
+        if let Some(prev) = self.prev_key.as_ref()
+            && key.core_cmp(prev) == Ordering::Less
+        {
+            let cur = String::from_utf8_lossy(name);
+            let previous = String::from_utf8_lossy(&self.prev_name);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "--verify: input is not in template-coordinate sort order; record '{cur}' \
+                     sorts before the preceding record '{previous}'. Sort the input first, e.g. \
+                     `fgumi sort --order template-coordinate`, or drop --verify."
+                ),
+            ));
+        }
+        self.prev_key = Some(key);
+        self.prev_name.clear();
+        self.prev_name.extend_from_slice(name);
+        Ok(())
+    }
+}
+
 /// A lightweight position grouper that compares per-record [`GroupKey::position_key`]
 /// values to detect group boundaries.
 ///
@@ -389,6 +477,13 @@ pub struct RecordPositionGrouper {
     /// When false (default), they are filtered by their `SECONDARY`/`SUPPLEMENTARY`
     /// flags in [`Self::add_record`].
     include_secondary_supplementary: bool,
+    /// Opt-in strict template-coordinate sort-order gate (`--verify`).
+    ///
+    /// When `Some`, every record — including secondary/supplementary reads that
+    /// are otherwise skipped — is order-checked *before* the skip, so the check
+    /// matches the full `fgumi sort --order template-coordinate` output. `None`
+    /// (default) disables verification.
+    verifier: Option<OrderVerifier>,
 }
 
 impl RecordPositionGrouper {
@@ -402,6 +497,7 @@ impl RecordPositionGrouper {
             current_group_key: None,
             current_records: Vec::new(),
             include_secondary_supplementary: false,
+            verifier: None,
         }
     }
 
@@ -420,6 +516,22 @@ impl RecordPositionGrouper {
     #[must_use]
     pub fn with_secondary_supplementary() -> Self {
         Self { include_secondary_supplementary: true, ..Self::new() }
+    }
+
+    /// Enable strict template-coordinate sort-order verification (`--verify`).
+    ///
+    /// `header` supplies the read-group -> library-ordinal mapping used to build
+    /// the template-coordinate keys. Every subsequent record is checked, and
+    /// `process_record` aborts on the first record that sorts out of order.
+    ///
+    /// Orthogonal to secondary/supplementary inclusion: it composes with both
+    /// [`new`](Self::new) and [`with_secondary_supplementary`](Self::with_secondary_supplementary).
+    ///
+    /// The chain (`--threads N`) path reaches this through
+    /// [`GroupByPosition::verifying`](crate::pipeline::steps::group::position::GroupByPosition::verifying);
+    /// the non-chain paths call it directly on a `let mut` grouper.
+    pub fn enable_verify(&mut self, header: &noodles::sam::Header) {
+        self.verifier = Some(OrderVerifier::from_header(header));
     }
 
     /// Validate that a paired primary record has a resolved mate position.
@@ -480,6 +592,14 @@ impl RecordPositionGrouper {
 
     /// Process a single decoded record, potentially emitting a completed group.
     fn process_record(&mut self, decoded: DecodedRecord) -> io::Result<Option<RawPositionGroup>> {
+        // Strict sort-order verification (`--verify`), if enabled. Runs *before*
+        // the secondary/supplementary skip so every record — including the
+        // sec/supp reads that grouping otherwise drops — is order-checked,
+        // matching the full `fgumi sort --order template-coordinate` output.
+        if let Some(verifier) = self.verifier.as_mut() {
+            verifier.check(decoded.record())?;
+        }
+
         // Skip secondary and supplementary reads unless configured to include them
         // (dedup needs them in templates so its duplicate flag propagates across
         // split alignments). Filter by the record's own flags rather than by
@@ -1202,6 +1322,220 @@ mod tests {
         let mut b = RawSamBuilder::new();
         b.read_name(name).sequence(b"ACGT").qualities(&[30; 4]).flags(flag);
         DecodedRecord::from_raw_bytes(b.build(), key)
+    }
+
+    /// Helper: a mapped, forward, unpaired record at `(tid, pos0)` (0-based),
+    /// with a distinct read name/`name_hash` per `idx`. Used by the `--verify`
+    /// tests, whose template-coordinate order is driven purely by `(tid, pos0)`.
+    fn make_mapped_forward(tid: i32, pos0: i32, idx: usize) -> DecodedRecord {
+        use fgumi_raw_bam::testutil::encode_op;
+        let name = format!("read{idx}");
+        let mut b = RawSamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(b"ACGT")
+            .qualities(&[30; 4])
+            .flags(0) // unpaired, mapped, forward
+            .ref_id(tid)
+            .pos(pos0)
+            .cigar_ops(&[encode_op(0, 4)]);
+        let key = GroupKey::single(tid, pos0 + 1, 0, 0, 0, idx as u64 + 1);
+        DecodedRecord::from_raw_bytes(b.build(), key)
+    }
+
+    /// Helper: a mapped, forward SECONDARY record at `(tid, pos0)` with a resolved
+    /// real position in its raw bytes but an UNKNOWN `GroupKey` (as decode assigns
+    /// sec/supp), so grouping's skip fires on it. Used to prove `--verify` checks
+    /// order *before* the skip.
+    fn make_secondary_at(tid: i32, pos0: i32, idx: usize) -> DecodedRecord {
+        use fgumi_raw_bam::testutil::encode_op;
+        let name = format!("sec{idx}");
+        let mut b = RawSamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(b"ACGT")
+            .qualities(&[30; 4])
+            .flags(raw_flags::SECONDARY)
+            .ref_id(tid)
+            .pos(pos0)
+            .cigar_ops(&[encode_op(0, 4)]);
+        let key = GroupKey { name_hash: idx as u64 + 1, ..GroupKey::default() };
+        DecodedRecord::from_raw_bytes(b.build(), key)
+    }
+
+    /// Feed a sequence of `(tid, pos0)` records to a `--verify`-enabled grouper
+    /// and return the first ordering error, if any.
+    fn run_verify(positions: &[(i32, i32)], grouper: &mut RecordPositionGrouper) -> io::Result<()> {
+        for (idx, &(tid, pos0)) in positions.iter().enumerate() {
+            grouper.add_record(make_mapped_forward(tid, pos0, idx))?;
+        }
+        grouper.finish()?;
+        Ok(())
+    }
+
+    /// `--verify` accepts input in strict template-coordinate order (ties and
+    /// ascending positions across references) and rejects the first record that
+    /// sorts before its predecessor. Ordering is by `(tid, unclipped-5' pos)`.
+    #[rstest]
+    #[case::ascending_same_ref(&[(0, 100), (0, 200), (0, 300)], true)]
+    #[case::equal_positions_ok(&[(0, 100), (0, 100), (0, 100)], true)]
+    #[case::ascending_across_refs(&[(0, 500), (1, 100), (1, 200)], true)]
+    #[case::descending_same_ref(&[(0, 300), (0, 100)], false)]
+    #[case::descending_ref(&[(1, 100), (0, 100)], false)]
+    #[case::regression_after_run(&[(0, 100), (0, 200), (0, 150)], false)]
+    fn record_position_grouper_verify_order(
+        #[case] positions: &[(i32, i32)],
+        #[case] should_pass: bool,
+    ) {
+        let header = noodles::sam::Header::default();
+        let mut grouper = RecordPositionGrouper::new();
+        grouper.enable_verify(&header);
+        let result = run_verify(positions, &mut grouper);
+        assert_eq!(
+            result.is_ok(),
+            should_pass,
+            "verify result {result:?} did not match expected pass={should_pass}"
+        );
+        if let Err(e) = result {
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+            let msg = e.to_string();
+            assert!(
+                msg.contains("template-coordinate sort order"),
+                "error should name the ordering requirement, got: {msg}"
+            );
+        }
+    }
+
+    /// Without `--verify`, an out-of-order stream is grouped without error — the
+    /// verifier is the only thing that rejects it, proving the guard is what bites.
+    #[test]
+    fn record_position_grouper_without_verify_accepts_out_of_order() {
+        let mut grouper = RecordPositionGrouper::new();
+        run_verify(&[(0, 300), (0, 100)], &mut grouper)
+            .expect("no verifier: out-of-order input must not be rejected");
+    }
+
+    /// `--verify` composes with `with_secondary_supplementary`: in-order primaries
+    /// still pass with sec/supp inclusion enabled.
+    #[test]
+    fn record_position_grouper_verify_composes_with_secondary_supplementary() {
+        let header = noodles::sam::Header::default();
+        let mut grouper = RecordPositionGrouper::with_secondary_supplementary();
+        grouper.enable_verify(&header);
+        run_verify(&[(0, 100), (0, 200), (0, 300)], &mut grouper)
+            .expect("in-order input must pass verification with sec/supp inclusion");
+    }
+
+    /// An out-of-order secondary read is rejected by `--verify` in BOTH grouper
+    /// modes:
+    /// - `new()` (group): sec/supp are skipped, but verify runs BEFORE the skip, so
+    ///   the out-of-order secondary is still caught — pinning the check-before-skip
+    ///   placement (moving the check after the skip would let it through).
+    /// - `with_secondary_supplementary()` (dedup): sec/supp are included, and are
+    ///   order-checked like any record — this is the mode dedup always runs in
+    ///   production, so it must catch out-of-order sec/supp reads too.
+    #[rstest]
+    #[case::group_mode_skips_but_verify_checks_first(false)]
+    #[case::dedup_mode_includes_and_checks(true)]
+    fn record_position_grouper_verify_rejects_out_of_order_secondary(
+        #[case] include_secondary_supplementary: bool,
+    ) {
+        let header = noodles::sam::Header::default();
+        let mut grouper = if include_secondary_supplementary {
+            RecordPositionGrouper::with_secondary_supplementary()
+        } else {
+            RecordPositionGrouper::new()
+        };
+        grouper.enable_verify(&header);
+
+        grouper.add_record(make_mapped_forward(0, 299, 0)).expect("in-order primary is accepted");
+        // A SECONDARY read whose raw tid/pos (chr0:100) sorts before the primary
+        // (chr0:300).
+        let err = grouper
+            .add_record(make_secondary_at(0, 99, 1))
+            .expect_err("an out-of-order secondary read must be rejected under --verify");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("template-coordinate sort order"),
+            "error should name the ordering requirement, got: {err}"
+        );
+    }
+
+    /// Extract the template-coordinate key the verifier uses, for the property
+    /// tests' oracle. Keys on `CB` and uses the fixed-seed hasher, exactly as
+    /// [`OrderVerifier`] does.
+    fn oracle_key(
+        rec: &DecodedRecord,
+        lib: &LibraryLookup,
+        hasher: &ahash::RandomState,
+    ) -> TemplateKey {
+        extract_template_key_inline(rec.record(), lib, Some(fgumi_raw_bam::SamTag::CB), hasher)
+    }
+
+    proptest::proptest! {
+        /// Fuzz the verifier's fold over random `(tid, pos)` streams (arbitrary
+        /// orders, shuffles, and ties): `--verify` accepts a stream IFF it is
+        /// non-decreasing under the template-coordinate key (`core_cmp`) — i.e. it
+        /// rejects EVERY out-of-order arrangement, not just the hand-picked shapes
+        /// above. This exercises the control flow (prev-key tracking, checking
+        /// every adjacent pair, no per-position state reset, fail-fast on the first
+        /// violation) against the pure "is it sorted?" predicate. Key extraction
+        /// and `core_cmp` are themselves pinned in fgumi-sort's own suite; this
+        /// pins the verifier's fold, which is the code this change adds.
+        #[test]
+        fn verify_accepts_iff_key_nondecreasing(
+            seq in proptest::collection::vec((0i32..4, 0i32..500), 1..40)
+        ) {
+            let header = noodles::sam::Header::default();
+            let records: Vec<DecodedRecord> =
+                seq.iter().enumerate().map(|(i, &(tid, pos))| make_mapped_forward(tid, pos, i)).collect();
+
+            // Oracle: is the stream non-decreasing under the same key/comparison?
+            let lib = LibraryLookup::from_header(&header);
+            let hasher = cb_hasher();
+            let keys: Vec<TemplateKey> =
+                records.iter().map(|r| oracle_key(r, &lib, &hasher)).collect();
+            let expected_ok =
+                keys.windows(2).all(|w| w[0].core_cmp(&w[1]) != Ordering::Greater);
+
+            let mut grouper = RecordPositionGrouper::new();
+            grouper.enable_verify(&header);
+            let mut got_ok = true;
+            for r in records {
+                if grouper.add_record(r).is_err() {
+                    got_ok = false;
+                    break;
+                }
+            }
+            if got_ok {
+                grouper.finish().expect("finish after a fully-accepted stream must succeed");
+            }
+            proptest::prop_assert_eq!(got_ok, expected_ok);
+        }
+
+        /// Any random set of records, once sorted into template-coordinate key
+        /// order, is ALWAYS accepted — the verifier never rejects a genuinely
+        /// sorted stream, including runs of equal-key ties. The dual of the
+        /// property above: shuffle arbitrarily, sort by the key, and it must pass.
+        #[test]
+        fn verify_accepts_any_key_sorted_stream(
+            seq in proptest::collection::vec((0i32..4, 0i32..500), 1..40)
+        ) {
+            let header = noodles::sam::Header::default();
+            let lib = LibraryLookup::from_header(&header);
+            let hasher = cb_hasher();
+            let mut records: Vec<DecodedRecord> =
+                seq.iter().enumerate().map(|(i, &(tid, pos))| make_mapped_forward(tid, pos, i)).collect();
+            records.sort_by(|a, b| oracle_key(a, &lib, &hasher).core_cmp(&oracle_key(b, &lib, &hasher)));
+
+            let mut grouper = RecordPositionGrouper::new();
+            grouper.enable_verify(&header);
+            for r in records {
+                proptest::prop_assert!(
+                    grouper.add_record(r).is_ok(),
+                    "a key-sorted stream must never be rejected by --verify"
+                );
+            }
+            proptest::prop_assert!(grouper.finish().is_ok());
+        }
     }
 
     #[test]

@@ -2482,3 +2482,315 @@ fn test_dedup_marks_families_and_flags_tc_keyed_secondary_supplementary(#[case] 
         "the tc-keyed sec/supp read must be retained as {supp_primary}'s and marked duplicate"
     );
 }
+
+// ============================================================================
+// --verify (strict template-coordinate sort-order gate)
+// ============================================================================
+
+/// Build `count` paired-end duplicate templates with INTERNALLY CONSISTENT
+/// mate-strand flags: R1 forward with `MATE_REVERSE` set, R2 reverse with its
+/// mate forward. Unlike [`create_duplicate_group`], whose R1 omits
+/// `MATE_REVERSE`, this makes R1 and R2 resolve to the *same* template
+/// coordinate — a prerequisite for the strict `--verify` order check, which keys
+/// on the exact `fgumi sort --order template-coordinate` key. (An inconsistent
+/// pair splits into two different coordinates, which the strict check then reads
+/// as an out-of-order file.)
+fn create_consistent_pair_group(
+    base_name: &str,
+    umi: &str,
+    count: usize,
+    start: i32,
+) -> Vec<RawRecord> {
+    let mut records = Vec::new();
+    for i in 0..count {
+        let name = format!("{base_name}_{i}");
+        let r1 = {
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+                .ref_id(0)
+                .pos(start - 1)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]) // 8M
+                .mate_ref_id(0)
+                .mate_pos(start + 99)
+                .template_length(108)
+                .add_string_tag(SamTag::RX, umi.as_bytes())
+                .add_string_tag(SamTag::MC, b"8M");
+            b.build()
+        };
+        let r2 = {
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+                .ref_id(0)
+                .pos(start + 99)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]) // 8M
+                .mate_ref_id(0)
+                .mate_pos(start - 1)
+                .template_length(-108)
+                .add_string_tag(SamTag::RX, umi.as_bytes())
+                .add_string_tag(SamTag::MC, b"8M");
+            b.build()
+        };
+        records.push(r1);
+        records.push(r2);
+    }
+    records
+}
+
+/// Write `records` verbatim (NO sorting) under a header that advertises
+/// `SS:template-coordinate`. Unlike [`create_sorted_bam`], which shells out to
+/// `fgumi sort`, this preserves the caller's record order, so the header-level
+/// ordering check passes while the records can be genuinely out of order — the
+/// exact shape `--verify` exists to catch.
+fn write_bam_tc_header_unsorted(path: &Path, records: &[RawRecord]) {
+    let header = create_minimal_header("chr1", 10000);
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
+    writer.write_header(&header).expect("Failed to write header");
+    for record in records {
+        writer
+            .write_alignment_record(&header, &to_record_buf(record))
+            .expect("Failed to write record");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+}
+
+/// Run `dedup --verify` (plus `threads`), returning the raw execute result so a
+/// test can assert on either success or the ordering error.
+fn dedup_verify_result(input: &Path, output: &Path, threads: &[&str]) -> anyhow::Result<()> {
+    let mut args = vec![
+        "dedup",
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--verify",
+    ];
+    args.extend_from_slice(threads);
+    MarkDuplicates::try_parse_from(args).expect("failed to parse dedup args").execute("fgumi dedup")
+}
+
+/// `--verify` on a correctly template-coordinate-sorted input must succeed and
+/// produce output record-for-record identical to the same run without `--verify`
+/// — the flag is a precondition gate, not a mode, so it must not perturb the
+/// result (and `--output` is still written). Covers the non-chain path and the
+/// `--threads N` chain path.
+#[rstest]
+#[case::single_threaded(&[])]
+#[case::chain_threads2(&["--threads", "2"])]
+fn test_dedup_verify_accepts_sorted_input(#[case] threads: &[&str]) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    // Ascending start positions → correctly template-coordinate sorted.
+    let mut records = create_consistent_pair_group("dup1", "ACGTACGT", 3, 100);
+    records.extend(create_consistent_pair_group("dup2", "TGCATGCA", 2, 500));
+    create_sorted_bam(&input_bam, records);
+
+    let baseline_out = temp_dir.path().join("baseline.bam");
+    dedup_run(&input_bam, &baseline_out, threads);
+    let verified_out = temp_dir.path().join("verified.bam");
+    let mut extra = threads.to_vec();
+    extra.push("--verify");
+    dedup_run(&input_bam, &verified_out, &extra);
+
+    let baseline = read_deduped_records(&baseline_out);
+    assert_eq!(baseline.len(), 10, "sanity: all 10 reads present (duplicates marked, not removed)");
+    assert_eq!(
+        baseline,
+        read_deduped_records(&verified_out),
+        "--verify must not change dedup output on a correctly-sorted input",
+    );
+}
+
+/// `--verify` on an input that is out of template-coordinate order (despite a
+/// header that advertises it) must abort with a non-zero exit and an error that
+/// names the ordering requirement. The same input WITHOUT `--verify` is accepted
+/// — proving the gate is what rejects it. Covers the non-chain and `--threads N`
+/// chain paths.
+#[rstest]
+#[case::single_threaded(&[])]
+#[case::chain_threads2(&["--threads", "2"])]
+fn test_dedup_verify_rejects_out_of_order_input(#[case] threads: &[&str]) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    // Descending start positions → genuinely out of order under a TC-advertising
+    // header (the group at 500 is written before the group at 100). Written
+    // verbatim — NOT through `fgumi sort`, which would reorder it into order.
+    let mut records = create_consistent_pair_group("late", "ACGTACGT", 2, 500);
+    records.extend(create_consistent_pair_group("early", "TGCATGCA", 2, 100));
+    write_bam_tc_header_unsorted(&input_bam, &records);
+
+    // Without --verify the out-of-order input is accepted (no ordering guard).
+    let plain_out = temp_dir.path().join("plain.bam");
+    dedup_run(&input_bam, &plain_out, threads);
+    assert!(
+        !read_deduped_records(&plain_out).is_empty(),
+        "sanity: without --verify the input is deduplicated without error",
+    );
+
+    // With --verify it is rejected before completing.
+    let verified_out = temp_dir.path().join("verified.bam");
+    let err = dedup_verify_result(&input_bam, &verified_out, threads)
+        .expect_err("out-of-order input must be rejected under --verify");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("template-coordinate sort order"),
+        "error should name the ordering requirement, got: {message}",
+    );
+}
+
+/// dedup's chain verify path must accept a correctly-sorted input that spans many
+/// pipeline batches under multi-worker reordering — the sibling of group's
+/// `test_group_verify_accepts_sorted_multi_batch_chain`. Both commands wire the
+/// same serial `GroupByPosition` step, so the reorder-across-batches risk is
+/// identical; dedup additionally uses `with_secondary_supplementary`, so this also
+/// exercises verify on that grouper variant across batch boundaries.
+#[test]
+fn test_dedup_verify_accepts_sorted_multi_batch_chain() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    // 600 single-pair templates at distinct ascending positions → many position
+    // groups spanning multiple pipeline batches (both the position-group
+    // accumulator and the upstream decode batch).
+    let mut records = Vec::new();
+    for i in 0..600i32 {
+        records.extend(create_consistent_pair_group(&format!("t{i}"), "ACGTACGT", 1, 100 + i * 10));
+    }
+    create_sorted_bam(&input_bam, records);
+
+    let baseline_out = temp_dir.path().join("baseline.bam");
+    dedup_run(&input_bam, &baseline_out, &["--threads", "4"]);
+    let verified_out = temp_dir.path().join("verified.bam");
+    dedup_run(&input_bam, &verified_out, &["--threads", "4", "--verify"]);
+
+    let baseline = read_deduped_records(&baseline_out);
+    assert_eq!(
+        baseline.len(),
+        1200,
+        "600 pairs → 1200 reads present (duplicates marked, not removed)"
+    );
+    assert_eq!(
+        baseline,
+        read_deduped_records(&verified_out),
+        "--verify must accept a correctly-sorted input spanning many pipeline batches under \
+         multi-worker reordering, and must not change the output",
+    );
+}
+
+/// Build a single-end mapped read carrying `RG` and `CB` tags at `start`
+/// (1-based). Used to exercise the cell-barcode lane of the template-coordinate
+/// sort key, which `--verify` must key on to match `fgumi sort`'s default.
+fn single_end_rg_cb(name: &str, start: i32, rg_id: &str, cb: &str) -> RawRecord {
+    let mut b = SamBuilder::new();
+    b.read_name(name.as_bytes())
+        .sequence(b"ACGTACGT")
+        .qualities(&[30; 8])
+        .flags(0) // unpaired, mapped, forward
+        .ref_id(0)
+        .pos(start - 1)
+        .mapq(60)
+        .cigar_ops(&[8 << 4]) // 8M
+        .add_string_tag(SamTag::RX, b"ACGTACGT")
+        .add_string_tag(SamTag::RG, rg_id.as_bytes())
+        .add_string_tag(SamTag::CB, cb.as_bytes());
+    b.build()
+}
+
+/// Write `records` under `header`, then sort with `fgumi sort --order
+/// template-coordinate` using the DEFAULT `--key-types` (auto-detect, which
+/// INCLUDES the CB lane for CB-tagged input). Unlike [`create_sorted_bam`], which
+/// passes `--key-types mi` and drops the CB lane, this reproduces the exact order
+/// the command `--verify`'s help/error tells users to run.
+fn sort_default_keytypes(
+    temp_dir: &Path,
+    header: &noodles::sam::Header,
+    records: &[RawRecord],
+) -> std::path::PathBuf {
+    let unsorted = temp_dir.join("cb_unsorted.bam");
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(&unsorted).expect("Failed to create BAM file"));
+    writer.write_header(header).expect("Failed to write header");
+    for r in records {
+        writer.write_alignment_record(header, &to_record_buf(r)).expect("Failed to write record");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+
+    let sorted = temp_dir.join("cb_sorted.bam");
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "sort",
+            "-i",
+            unsorted.to_str().unwrap(),
+            "-o",
+            sorted.to_str().unwrap(),
+            "--order",
+            "template-coordinate",
+        ])
+        .status()
+        .expect("failed to spawn `fgumi sort` for CB test input");
+    assert!(status.success(), "failed to template-coordinate sort CB test input");
+    sorted
+}
+
+/// Regression for the CB-keying bug: `fgumi sort --order template-coordinate` keys
+/// on the `CB` tag by default (`parse_cell_tag`), and `cb_hash` outranks the
+/// library lane in `TemplateKey::core_cmp`. Two same-position reads whose `CB`
+/// order is the OPPOSITE of their library order are emitted by that sort in `CB`
+/// order; `--verify` must accept it because it keys on `CB` too. A CB-blind
+/// verifier (`cell_tag = None`) would see the library lane out of order and
+/// spuriously reject. `cb_hash(AAAAAAAA) < cb_hash(TTTTTTTT)` under fgumi's
+/// fixed-seed hasher, so pairing `CB=AAAAAAAA` with the higher library ordinal
+/// (`libB` = `RG2`) makes the CB-sorted order run library-descending — the exact
+/// shape that trips a `None` verifier. (Sorted via `fgumi sort` itself, so the
+/// input is genuinely what the recommended command produces, whatever the hash.)
+#[test]
+fn test_dedup_verify_accepts_cb_sorted_multi_library() {
+    let temp_dir = TempDir::new().unwrap();
+    let header = create_multi_library_header("chr1", 10000);
+    let records = [
+        single_end_rg_cb("readA", 501, "RG1", "TTTTTTTT"), // libA (ordinal 1), high cb_hash
+        single_end_rg_cb("readB", 501, "RG2", "AAAAAAAA"), // libB (ordinal 2), low cb_hash
+    ];
+    let sorted = sort_default_keytypes(temp_dir.path(), &header, &records);
+
+    let out = temp_dir.path().join("out.bam");
+    dedup_verify_result(&sorted, &out, &[])
+        .expect("--verify must accept the CB-sorted multi-library input `fgumi sort` produced");
+}
+
+/// A coordinate-ordered (mate-interleaved) paired file is a realistic mislabel:
+/// records physically in `SO:coordinate` order but under a header advertising
+/// `SS:template-coordinate`. That is NOT template-coordinate order — coordinate
+/// sort interleaves mates by each read's own leftmost position instead of
+/// grouping a template's two reads at their shared canonical coordinate — so
+/// `--verify` must reject it. (An *honestly*-labeled non-TC file, i.e. an
+/// `SO:coordinate`/`SO:queryname` header, is already rejected upstream by the
+/// header-ordering check before `--verify` runs; this exercises the record-order
+/// discontinuity that check cannot see.)
+#[test]
+fn test_dedup_verify_rejects_coordinate_ordered_input() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    // Two templates. Template-coordinate order keeps each mate pair adjacent
+    // (T1.R1,T1.R2,T2.R1,T2.R2); coordinate order interleaves them by leftmost
+    // position: R1@100, R1@150, R2@200, R2@250.
+    let t1 = create_consistent_pair_group("T1", "ACGTACGT", 1, 100); // [R1@100, R2@200]
+    let t2 = create_consistent_pair_group("T2", "TGCATGCA", 1, 150); // [R1@150, R2@250]
+    let coordinate_order = vec![t1[0].clone(), t2[0].clone(), t1[1].clone(), t2[1].clone()];
+    write_bam_tc_header_unsorted(&input_bam, &coordinate_order);
+
+    let out = temp_dir.path().join("out.bam");
+    let err = dedup_verify_result(&input_bam, &out, &[])
+        .expect_err("coordinate-ordered (mate-interleaved) input must be rejected under --verify");
+    assert!(
+        format!("{err:#}").contains("template-coordinate sort order"),
+        "error should name the ordering requirement, got: {err:#}",
+    );
+}

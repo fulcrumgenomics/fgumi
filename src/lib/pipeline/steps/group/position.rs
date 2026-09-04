@@ -199,6 +199,16 @@ impl GroupByPosition {
         )
     }
 
+    /// Enable strict template-coordinate sort-order verification (`--verify`) on
+    /// the inner grouper. `header` supplies the read-group -> library-ordinal
+    /// mapping used to build the template-coordinate keys. Composes with either
+    /// constructor (`new` / `with_secondary_supplementary`).
+    #[must_use]
+    pub fn verifying(mut self, header: &noodles::sam::Header) -> Self {
+        self.grouper.enable_verify(header);
+        self
+    }
+
     fn with_grouper(
         grouper: RecordPositionGrouper,
         output_byte_limit: u64,

@@ -3092,8 +3092,13 @@ impl<'a> ChainBuilder<'a> {
         let mi_assign_step = build_group_mi_assign_step(self.tuning.per_step_byte_limit);
 
         // Wire GroupByPosition → ProcessOrdered → MiAssign (always appended).
-        let tail =
-            self.pipeline.append_step(GroupByPosition::new(self.tuning.per_step_byte_limit), tail);
+        // With --verify, the position grouper strictly checks template-coordinate
+        // order as records stream through the serial step.
+        let mut group_by_position = GroupByPosition::new(self.tuning.per_step_byte_limit);
+        if group.verify {
+            group_by_position = group_by_position.verifying(&self.header);
+        }
+        let tail = self.pipeline.append_step(group_by_position, tail);
         let tail = self.pipeline.append_step(process_step, tail);
         let tail = self.pipeline.append_step(mi_assign_step, tail);
 
@@ -4825,11 +4830,15 @@ impl<'a> ChainBuilder<'a> {
             Arc::clone(&self.progress_records),
         );
 
-        // Wire the dedup-specific steps.
-        let tail = self.pipeline.append_step(
-            GroupByPosition::with_secondary_supplementary(self.tuning.per_step_byte_limit),
-            tail,
-        );
+        // Wire the dedup-specific steps. With --verify, the position grouper
+        // strictly checks template-coordinate order as records stream through the
+        // serial step.
+        let mut group_by_position =
+            GroupByPosition::with_secondary_supplementary(self.tuning.per_step_byte_limit);
+        if dedup.verify {
+            group_by_position = group_by_position.verifying(&self.header);
+        }
+        let tail = self.pipeline.append_step(group_by_position, tail);
         let tail = self.pipeline.append_step(process_step, tail);
         let tail = self.pipeline.append_step(mi_assign_step, tail);
         let tail = self.pipeline.append_step(serialize_step, tail);

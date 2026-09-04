@@ -1246,6 +1246,20 @@ pub struct MarkDuplicates {
     #[arg(short = 'n', long = "include-non-pf-reads", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub include_non_pf_reads: bool,
 
+    /// Verify the input is in strict template-coordinate sort order.
+    ///
+    /// Off by default. Each record is checked against the exact ordering of
+    /// `fgumi sort --order template-coordinate` as it is read; the run aborts with
+    /// a non-zero exit on the first out-of-order record. This composes with
+    /// `--output` (a precondition gate, not a check-only mode): output is written
+    /// normally when the input is correctly ordered, and may be left partial if
+    /// the check fails mid-stream. The check is intentionally STRICTER than
+    /// deduplication requires (dedup only needs a template's mates adjacent by
+    /// position), which is why it is opt-in; for a standalone check with no output
+    /// use `fgumi sort --verify`.
+    #[arg(long = "verify", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub verify: bool,
+
     /// Emit templates with no mapped read (both mates unmapped) untouched instead of
     /// discarding them. Such templates carry no alignment coordinate and no duplicate
     /// signal; passing them through preserves a complete record set (like Picard
@@ -1503,10 +1517,18 @@ impl Command for MarkDuplicates {
             header,
             &self.io.output,
             None,
-            // Grouper factory - use with_secondary_supplementary to include all reads
-            move |_header: &Header| {
-                Box::new(RecordPositionGrouper::with_secondary_supplementary())
-                    as Box<dyn Grouper<Group = RawPositionGroup> + Send>
+            // Grouper factory - use with_secondary_supplementary to include all reads.
+            // With --verify, gate on strict template-coordinate order (the factory
+            // receives the header, which supplies library-ordinal mapping for keys).
+            {
+                let verify = self.verify;
+                move |header: &Header| {
+                    let mut grouper = RecordPositionGrouper::with_secondary_supplementary();
+                    if verify {
+                        grouper.enable_verify(header);
+                    }
+                    Box::new(grouper) as Box<dyn Grouper<Group = RawPositionGroup> + Send>
+                }
             },
             // Process function (parallel) — builds templates from raw records
             move |group: RawPositionGroup| -> io::Result<ProcessedDedupGroup> {
