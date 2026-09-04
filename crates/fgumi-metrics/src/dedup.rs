@@ -30,24 +30,28 @@ use crate::library_size::estimate_library_size;
 ///    dropped at write time, after they have been counted here.
 /// 3. **Diagnostics** — `secondary_reads`, `supplementary_reads`,
 ///    `missing_tc_tag`.
-/// 4. **Pair/orphan breakdown** — the Picard `DuplicationMetrics` split. Because
-///    `dedup` dedups each mate in its own position group, reads are classified by
-///    their SAM flags: `mapped_pairs`/`duplicate_pairs` count mapped read *pairs*
+/// 4. **Pair/orphan breakdown** — the Picard `DuplicationMetrics` split. A read
+///    pair is one *template* but two *reads*; `dedup` classifies each primary read
+///    by its SAM flags: `mapped_pairs`/`duplicate_pairs` count mapped read *pairs*
 ///    (both mates mapped; Picard `READ_PAIRS_EXAMINED`/`READ_PAIR_DUPLICATES`,
-///    already halved from the two mates to whole pairs), `mapped_orphans`/
+///    halved from the two mates to whole pairs), `mapped_orphans`/
 ///    `duplicate_orphans` count mapped reads with no mapped mate (Picard
 ///    `UNPAIRED_READS_EXAMINED`/`UNPAIRED_READ_DUPLICATES`), and `unmapped_pairs`,
 ///    `unmapped_orphans`, `unmated_templates` are read-unit diagnostics. Every
-///    counted primary read falls in exactly one mapping bucket, so (ignoring the
-///    at-most-one truncated half per library from integer halving)
-///    `2*mapped_pairs + mapped_orphans + unmapped_pairs + unmapped_orphans ==
-///    total_templates` and `2*duplicate_pairs + duplicate_orphans ==
-///    duplicate_templates` — but only for templates holding a single primary
-///    read, which is every deduplicated template (each mate is dedup'd in its
-///    own position group). The one exception is a `--include-unmapped`
-///    pass-through: a fully unmapped pair is emitted verbatim as one template
-///    holding both mates, so it adds 1 to `total_templates` but 2 to
-///    `unmapped_pairs`, and the left-hand side then exceeds `total_templates`.
+///    counted primary read falls in exactly one mapping bucket, so in *read*
+///    units (ignoring the at-most-one truncated half per library from integer
+///    halving) `2*mapped_pairs + mapped_orphans + unmapped_pairs +
+///    unmapped_orphans == total_reads` and `2*duplicate_pairs + duplicate_orphans
+///    == duplicate_reads`. This read-unit reconciliation is the robust one; there
+///    is no general *template*-unit identity, because a single template can spread
+///    its two primary reads across two buckets. A mixed-mapping pair (one mate
+///    mapped, one unmapped) adds 1 to `mapped_orphans` and 1 to `unmapped_pairs`
+///    yet 1 to `total_templates`, and a `--include-unmapped` pass-through adds 2 to
+///    `unmapped_pairs` yet 1 to `total_templates`. The template-unit sum
+///    `mapped_pairs + mapped_orphans + unmapped_pairs + unmapped_orphans` therefore
+///    equals `total_templates` only for an all-mapped fixture — every surviving
+///    template a fully-mapped pair or a mapped single-end read — and exceeds it
+///    otherwise.
 /// 5. **Complexity** — `percent_duplication` (Picard-parity pair/orphan units) and
 ///    the Lander-Waterman `estimated_library_size`.
 ///
@@ -576,6 +580,8 @@ mod tests {
             library: "lib1".to_string(),
             total_templates: 100,
             duplicate_templates: 30,
+            total_reads: 100,
+            duplicate_reads: 30,
             mapped_pairs: 35,
             duplicate_pairs: 12,
             mapped_orphans: 20,
@@ -592,18 +598,20 @@ mod tests {
         assert_eq!(metrics.unmapped_pairs, 6);
         assert_eq!(metrics.unmapped_orphans, 4);
         assert_eq!(metrics.unmated_templates, 24);
-        // Documented read-unit invariants: each pair is two counted primary
-        // reads, so pairs count double against the template total.
+        // Documented read-unit reconciliation: each pair is two counted primary
+        // reads, so pairs count double against the read total. This is the robust
+        // identity (it holds regardless of mixed-mapping templates), so it is
+        // asserted against the read-unit fields, not the template counts.
         assert_eq!(
             2 * metrics.mapped_pairs
                 + metrics.mapped_orphans
                 + metrics.unmapped_pairs
                 + metrics.unmapped_orphans,
-            metrics.total_templates
+            metrics.total_reads
         );
         assert_eq!(
             2 * metrics.duplicate_pairs + metrics.duplicate_orphans,
-            metrics.duplicate_templates
+            metrics.duplicate_reads
         );
     }
 
