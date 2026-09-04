@@ -13,9 +13,16 @@
 //! excludes `align` because raw aligner output before the zipper-merge has
 //! lost every original tag).
 
+use std::path::PathBuf;
+
 use anyhow::{Result, bail};
+use clap::Parser;
 
 use crate::assigner::Strategy;
+use crate::commands::common::{
+    CompressionOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions, SchedulerOptions,
+    StatsOptions, ThreadingOptions,
+};
 
 /// Consensus mode selector for `runall`. Controls which consensus
 /// caller runs after the fused group + MI-grouping stages.
@@ -315,9 +322,7 @@ fn validate_strategy_for_mode(mode: RunAllMode, strategy: Strategy) -> Result<()
 /// strategy/stage compatibility beyond what `validate_with`
 /// expresses) have a clear home.
 ///
-/// Not yet called outside tests: `RunAll::validate_stages` (a later task of
-/// this same PR-B campaign) is the production call site.
-#[allow(dead_code)]
+/// `RunAll::validate_stages` is the thin wrapper that calls this.
 fn validate_stages_for(start_from: RunAllStage, stop_after: RunAllStage) -> Result<()> {
     start_from.validate_with(stop_after)?;
     // `--stop-after align-and-merge` would mean "stop after the
@@ -392,9 +397,7 @@ fn validate_stages_for(start_from: RunAllStage, stop_after: RunAllStage) -> Resu
 /// if the Stage derivation reaches a branch that is a programming error (e.g.
 /// a non-consensus `stop` that makes it through all prior early-returns).
 ///
-/// Not yet called outside tests: `RunAll::derive_stages` (a later task of
-/// this same PR-B campaign) is the production call site.
-#[allow(dead_code)]
+/// `RunAll::derive_stages` is the thin wrapper that calls this.
 fn derive_stages_for(
     start_from: RunAllStage,
     stop_after: RunAllStage,
@@ -571,6 +574,608 @@ fn derive_stages_for(
     }
 
     Ok(stages)
+}
+
+/// Fused runall command. Stages are selected by `--start-from` and
+/// `--stop-after`; the accepted starts are
+/// `{Extract, Correct, AlignAndMerge, Zipper, Sort, Group, Consensus,
+/// Filter}` (the consensus algorithm is chosen by `--consensus`, not by a
+/// per-algorithm start value — `simplex`/`duplex`/`codec` are NOT accepted
+/// start values) and the accepted stops are
+/// `{Extract, Correct, Zipper, Sort, Group, Consensus, Filter}`
+/// (no `--stop-after align` — raw aligner output without zipper-merge
+/// would lose every original tag).
+#[derive(Debug, Parser)]
+#[command(
+    name = "runall",
+    about = "\x1b[38;5;166m[UTILITIES]\x1b[0m      \x1b[36mFused multi-stage pipeline (correct + align + zipper + sort + group + consensus, no intermediate BAM)\x1b[0m",
+    long_about = "\
+Fuses extract, UMI correction, alignment + zipper-merge, sort, group, and \
+consensus calling (optionally followed by filter) into a single in-memory \
+pipeline. Select the slice to run with `--start-from` and `--stop-after` (both \
+required); the stages run in the fixed order extract < correct < align < zipper \
+< sort < group < consensus < filter. Records flow directly between stages in \
+memory, so every intermediate BAM a sequential run would write is elided. The \
+record stream matches running the equivalent standalone commands in turn, as do \
+the `@HD` `SO`/`GO`/`SS` fields, the `@SQ` dictionary, and the `@RG` records. The \
+output is NOT byte-for-byte identical: the fused chain writes a single `@PG` \
+record while the staged run writes one `@PG` per command, and `@HD` `VN` and \
+`@CO` are not compared.
+
+`--start-from` declares the state of the input and selects the upstream work:
+
+* `extract` reads FASTQ via `--extract::inputs` / `--extract::read-structures` \
+  (no `--input`).
+* `correct` reads an unmapped BAM via `--input` and corrects UMIs against \
+  `--correct::umis` / `--correct::umi-files`.
+* `align` reads an unmapped BAM via `--input`, runs the aligner subprocess \
+  (`--aligner::preset` or `--aligner::command`) against `--ref`, and \
+  zipper-merges the result.
+* `zipper` reads a queryname-sorted mapped BAM via `--input` plus the matching \
+  unmapped BAM via `--unmapped` and the reference (`--ref` + `.dict`).
+* `sort` reads a raw unsorted aligned BAM via `--input`.
+* `group` reads a template-coordinate-sorted BAM via `--input`.
+* `consensus` reads a grouped (MI-tagged) BAM via `--input`.
+* `filter` reads a consensus BAM via `--input`.
+
+The consensus algorithm is chosen by `--consensus {simplex,duplex,codec}`, not \
+by a stage name; `--stop-after consensus` produces the same BAM as the matching \
+`fgumi {simplex,duplex,codec}` command. `--stop-after filter` fuses a \
+post-consensus `fgumi filter` pass (tunable via `--filter::*`) into the same \
+pipeline, so no intermediate consensus BAM is written. Tune any stage with its \
+prefixed flags: `--sort::max-memory`, `--group::strategy`, `--duplex::min-reads`, \
+and so on.
+
+`--stop-after align` is not allowed: raw aligner output before the zipper-merge \
+has lost every original tag, so the earliest stop after `--start-from align` is \
+`zipper`. The validator checks the requested stage range but cannot verify that \
+the on-disk input actually matches `--start-from` — make sure it does."
+)]
+pub struct RunAll {
+    /// Input BAM/SAM file. Optional because runall's input contract is
+    /// stage-dependent, unlike the standard single-required-BAM commands
+    /// that flatten `BamIoOptions`: `--start-from extract` reads FASTQ
+    /// from `--extract::inputs` (no `--input`); `--start-from zipper`
+    /// pairs `--input` (mapped) with `--unmapped`; the BAM-source start
+    /// stages (`correct`/`align`/`sort`/`group`/consensus) require
+    /// `--input`. Presence is validated per start-stage in
+    /// `RunAll::derive_source_spec`.
+    #[arg(short = 'i', long = "input")]
+    pub input: Option<PathBuf>,
+
+    /// Output BAM file.
+    #[arg(short = 'o', long = "output")]
+    pub output: PathBuf,
+
+    /// Wrap the input in a userspace async prefetch reader: a background
+    /// thread reads ahead so disk I/O overlaps decompression/compute.
+    /// Defaults to off.
+    #[arg(long = "async-reader", default_value_t = false, hide = true)]
+    pub async_reader: bool,
+
+    /// Optional output for rejected reads.
+    #[command(flatten)]
+    pub rejects_opts: RejectsOptions,
+
+    /// Optional output for statistics.
+    #[command(flatten)]
+    pub stats_opts: StatsOptions,
+
+    /// Read group and read name prefix options.
+    #[command(flatten)]
+    pub read_group: ReadGroupOptions,
+
+    /// Threading options.
+    #[command(flatten)]
+    pub threading: ThreadingOptions,
+
+    /// Compression options for output BAM.
+    #[command(flatten)]
+    pub compression: CompressionOptions,
+
+    /// Scheduler and pipeline statistics options.
+    #[command(flatten)]
+    pub scheduler_opts: SchedulerOptions,
+
+    /// Queue memory options.
+    #[command(flatten)]
+    pub queue_memory: QueueMemoryOptions,
+
+    /// Methylation-aware consensus calling mode (requires --ref).
+    #[arg(long = "methylation-mode", value_enum)]
+    pub methylation_mode: Option<crate::commands::common::MethylationModeArg>,
+
+    /// Path to the reference FASTA file. Required when `--methylation-mode`
+    /// is set (consensus stages), when `--start-from zipper` is used (zipper
+    /// requires the FASTA + `.dict` to build the output BAM header from the
+    /// reference dictionary), and whenever the derived stage chain includes
+    /// `Stage::Align` (the aligner reference) — not only `--start-from
+    /// align`, but also fused runs that reach align from an upstream start
+    /// (e.g. `--start-from extract`/`--start-from correct` with a
+    /// `--stop-after` past zipper). For those align-bearing upstream starts
+    /// the reference is consumed by the align stage and is accepted without
+    /// `--methylation-mode`.
+    #[arg(long = "ref")]
+    pub reference: Option<PathBuf>,
+
+    // ───────── extract-side options (used only when --start-from=extract) ─────────
+    /// Per-stage extract tuning, exposed as `--extract::inputs`,
+    /// `--extract::read-structures`, `--extract::sample`,
+    /// `--extract::library`, etc. via the `MultiExtractRunallOptions`
+    /// companion struct (generated by `#[multi_options]` on
+    /// `ExtractRunallOptions` in `commands::extract`).
+    /// Ignored when `--start-from` is not `extract`.
+    #[command(flatten)]
+    pub extract_opts: crate::commands::extract::MultiExtractRunallOptions,
+
+    // ───────── correct-side options (used only when --start-from <= correct) ─────────
+    /// Per-stage UMI-correction tuning, exposed as `--correct::umis`,
+    /// `--correct::umi-files`, `--correct::max-mismatches`,
+    /// `--correct::min-distance`, `--correct::revcomp`, etc. via the
+    /// `MultiCorrectOptions` companion struct (generated by
+    /// `#[multi_options]` on `CorrectOptions` in `commands::correct`).
+    /// `--correct::min-distance` is required when `--start-from
+    /// correct` is selected (no default); at least one of
+    /// `--correct::umis` / `--correct::umi-files` is required.
+    /// Ignored when `--start-from` is not `correct`.
+    #[command(flatten)]
+    pub correct_opts: crate::commands::correct::MultiCorrectOptions,
+
+    // ───────── aligner-side options (used whenever the chain includes Stage::Align) ─────────
+    /// Per-stage aligner tuning, exposed as `--aligner::preset`,
+    /// `--aligner::command`, `--aligner::threads`, `--aligner::chunk-size`
+    /// via the `MultiAlignerOptions` companion struct (generated by
+    /// `#[multi_options]` on `AlignerOptions` in `crate::aligner`).
+    /// Used whenever the derived stage chain includes `Stage::Align` — not
+    /// only on `--start-from=align`, but also on fused runs that reach align
+    /// from an upstream start (e.g. `--start-from extract` or
+    /// `--start-from correct` with a `--stop-after` past zipper). Ignored
+    /// only when the chain has no align stage.
+    #[command(flatten)]
+    pub aligner_opts: crate::aligner::MultiAlignerOptions,
+
+    /// Override path for the aligner binary (preset mode only). When
+    /// unset, the preset's binary (`bwa-mem3` / `bwa`) is found via
+    /// `which::which()` on `PATH`. Rejected with a clear error if
+    /// `--aligner::command` is used (command mode owns its own
+    /// binary). Used whenever the chain includes `Stage::Align` (see
+    /// `--aligner::*` above); ignored only when the chain has no align stage.
+    ///
+    /// Note: this flag is at the runall top level (`--aligner-bin`),
+    /// NOT inside the `--aligner::*` family. The `--aligner::*` flags
+    /// are mode-orthogonal tuning knobs (chunk-size, threads); the
+    /// binary identity is mode-shaped — command mode owns it inside
+    /// `--aligner::command "..."`, preset mode owns it here. Putting
+    /// the override in the `--aligner::*` family would suggest a
+    /// non-existent `--aligner::bin` symmetry.
+    #[arg(long = "aligner-bin")]
+    pub aligner_bin: Option<PathBuf>,
+
+    // ───────── zipper-side options (used only when --start-from=zipper) ─────────
+    /// Path to the unmapped BAM (required when `--start-from zipper`).
+    /// The standalone `fgumi zipper` reads this via `-u`/`--unmapped`;
+    /// runall surfaces it as a top-level flag because the
+    /// `BamIoOptions`-shared `--input` already names the mapped BAM.
+    /// Ignored when `--start-from` is not `zipper`.
+    #[arg(long = "unmapped")]
+    pub unmapped: Option<PathBuf>,
+
+    /// Per-stage zipper tuning, exposed as `--zipper::tags-to-remove`,
+    /// `--zipper::buffer`, `--zipper::skip-tc-tags`, etc. via the
+    /// `MultiZipperOptions` companion struct (generated by
+    /// `#[multi_options]` on `ZipperOptions` in `commands::zipper`).
+    /// Ignored when `--start-from` is not `zipper`.
+    #[command(flatten)]
+    pub zipper_opts: crate::commands::zipper::MultiZipperOptions,
+
+    // ───────── group-side options ─────────
+    /// Per-stage group tuning, exposed as `--group::strategy`,
+    /// `--group::edits`, `--group::min-map-q`, etc. via the
+    /// `MultiGroupOptions` companion struct (generated by
+    /// `#[multi_options]` on `GroupOptions` in `commands::group`).
+    /// `--group::strategy` is required when `--start-from {sort,group}`
+    /// is selected (no default).
+    #[command(flatten)]
+    pub group_opts: crate::commands::group::MultiGroupOptions,
+
+    // ───────── codec-specific options (used only when --consensus=codec) ─────────
+    /// Per-stage codec tuning, exposed as `--codec::min-duplex-length`,
+    /// `--codec::single-strand-qual`, `--codec::outer-bases-qual`,
+    /// `--codec::outer-bases-length`, `--codec::max-duplex-disagreements`,
+    /// `--codec::max-duplex-disagreement-rate`. Ignored when `--consensus`
+    /// is not `codec`.
+    ///
+    /// `--codec::allow-unmapped` is NOT exposed: PR A implemented spec
+    /// §12.2 option (b) (`CodecOptions` carries a skipped, always-disabled
+    /// `AllowUnmappedOptions`), so every runall codec stage runs with
+    /// `allow_unmapped: false` — a known, deferred capability gap versus
+    /// the standalone `fgumi codec` command.
+    #[cfg(feature = "consensus")]
+    #[command(flatten)]
+    pub codec_opts: crate::commands::codec::MultiCodecOptions,
+
+    // ───────── simplex-specific options (used only with --consensus simplex) ─────────
+    /// Per-stage simplex tuning, exposed as `--simplex::error-rate-pre-umi`,
+    /// `--simplex::min-reads`, `--simplex::max-reads`,
+    /// `--simplex::min-input-base-quality`, etc. via the
+    /// `MultiSimplexOptions` companion struct (generated by
+    /// `#[multi_options]` on `SimplexOptions` in `commands::simplex`).
+    /// `--simplex::min-reads` is required when `--consensus simplex` is
+    /// selected (no default). Ignored unless the chain reaches the
+    /// consensus stage with `--consensus simplex`.
+    ///
+    /// `--simplex::allow-unmapped` is NOT exposed: PR A implemented spec
+    /// §12.2 option (b) (`SimplexOptions` carries a skipped, always-disabled
+    /// `AllowUnmappedOptions`), so every runall simplex stage runs with
+    /// `allow_unmapped: false` — a known, deferred capability gap versus
+    /// the standalone `fgumi simplex` command.
+    #[cfg(feature = "consensus")]
+    #[command(flatten)]
+    pub simplex_opts: crate::commands::simplex::MultiSimplexOptions,
+
+    // ───────── duplex-specific options (used only with --consensus duplex) ─────────
+    /// Per-stage duplex tuning, exposed as `--duplex::error-rate-pre-umi`,
+    /// `--duplex::min-reads`, `--duplex::max-reads-per-strand`,
+    /// `--duplex::consensus-call-overlapping-bases`, etc. via the
+    /// `MultiDuplexOptions` companion struct. Ignored unless the chain
+    /// reaches the consensus stage with `--consensus duplex`.
+    ///
+    /// `--duplex::allow-unmapped` is NOT exposed: PR A implemented spec
+    /// §12.2 option (b) (`DuplexOptions` carries a skipped, always-disabled
+    /// `AllowUnmappedOptions`), so every runall duplex stage runs with
+    /// `allow_unmapped: false` — a known, deferred capability gap versus
+    /// the standalone `fgumi duplex` command.
+    #[cfg(feature = "consensus")]
+    #[command(flatten)]
+    pub duplex_opts: crate::commands::duplex::MultiDuplexOptions,
+
+    // ───────── pipeline stage control ─────────
+    /// Pipeline stage to start from: extract, correct, align, zipper, sort,
+    /// group, consensus, or filter (required, case-insensitive).
+    ///
+    /// Declares the state of the input and selects the upstream work
+    /// runall performs before the terminal `--stop-after` stage. See the
+    /// command description for what each start stage reads (FASTQ for
+    /// `extract`; `--input` plus, for `zipper`, `--unmapped`; a
+    /// template-coordinate-sorted BAM for `group`; a grouped MI-tagged
+    /// BAM for `consensus`; and so on).
+    ///
+    /// **Consensus-start chain:** `--start-from consensus` (with
+    /// `--consensus {simplex,duplex,codec}`) runs the standalone consensus
+    /// chain, which groups by the *existing* `MI` tag. It does NOT add a
+    /// position-grouping stage — doing so would double-group an
+    /// already-grouped input (see `derive_stages_for`'s
+    /// consensus-self-pair exception).
+    ///
+    /// Case-insensitive. Must satisfy `start_from.ord() <=
+    /// stop_after.ord()` (see [`RunAllStage::validate_with`]).
+    #[arg(long = "start-from", value_enum, ignore_case = true)]
+    pub start_from: RunAllStage,
+
+    /// Pipeline stage to stop after: extract, correct, zipper, sort, group,
+    /// consensus, or filter (required, case-insensitive).
+    ///
+    /// Determines the terminal stage of the chain. `--stop-after
+    /// consensus` writes the consensus BAM produced by the caller chosen
+    /// with `--consensus`; `--stop-after filter` fuses a post-consensus
+    /// filter pass into the same pipeline.
+    ///
+    /// `align` is intentionally not a valid stop: raw aligner output
+    /// before the zipper-merge has lost every original tag, so the
+    /// earliest stop after `--start-from align` is `zipper`. Must satisfy
+    /// `start_from.ord() <= stop_after.ord()` (`RunAllStage::validate_with`);
+    /// use `RunAll::stop_after_stage` to read this as a [`RunAllStage`].
+    #[arg(long = "stop-after", value_enum, ignore_case = true)]
+    pub stop_after: StopAfter,
+
+    /// Consensus algorithm to run at the consensus stage: `simplex`,
+    /// `duplex`, or `codec`. Required whenever the chain reaches the
+    /// consensus stage (`--stop-after consensus`, or `--start-from
+    /// consensus`); ignored otherwise. `duplex` requires
+    /// `--strategy paired`. Selects which standalone caller's output the
+    /// run reproduces (`fgumi simplex` / `duplex` / `codec`).
+    #[arg(long = "consensus", value_enum, ignore_case = true)]
+    pub consensus_mode: Option<RunAllMode>,
+
+    /// Per-stage sort tuning, exposed as `--sort::max-memory`,
+    /// `--sort::tmp-dir`, etc. Consumed only when `--start-from sort`
+    /// is selected; otherwise ignored. The full standalone option
+    /// set of `fgumi sort` is mirrored here via the
+    /// `#[multi_options]` macro — see `SortOptions` in
+    /// `commands::sort` for the field list.
+    #[command(flatten)]
+    pub sort_opts: crate::commands::sort::MultiSortOptions,
+
+    /// Per-stage filter tuning, exposed as `--filter::min-reads`,
+    /// `--filter::max-read-error-rate`, `--filter::ref`, … Used when the
+    /// chain reaches the filter stage (`--stop-after filter` or
+    /// `--start-from filter`); otherwise ignored. The full standalone
+    /// option set of `fgumi filter` is mirrored here via the
+    /// `#[multi_options]` macro — see `FilterOptions` in
+    /// `commands::filter` for the field list.
+    #[command(flatten)]
+    pub filter_opts: crate::commands::filter::MultiFilterOptions,
+}
+
+impl RunAll {
+    /// Returns `true` if the user passed enough `--correct::*` flags to
+    /// make Correct a load-bearing stage in an extract-fed chain.
+    /// Concretely: at least one of `--correct::umi-files` or
+    /// `--correct::umis` is non-empty. Used by `derive_stages` to
+    /// decide whether to splice Correct between Extract and Align.
+    #[must_use]
+    pub(crate) fn extract_chain_wants_correct(&self) -> bool {
+        !self.correct_opts.correct_umis.is_empty()
+            || !self.correct_opts.correct_umi_files.is_empty()
+    }
+
+    /// Returns the consensus algorithm for this run, from `--consensus`.
+    /// Errors (does not panic) if `--consensus` was omitted — it is required
+    /// whenever the chain reaches the consensus stage. Only called on chains
+    /// that actually reach consensus; `--stop-after sort`/`group`/`filter` are
+    /// accepted stops that may not require it.
+    ///
+    /// Not yet called outside tests: the production call site (the
+    /// stage-options-bag builder) lands in a later task of this same PR-B
+    /// campaign.
+    #[allow(dead_code)]
+    pub(crate) fn require_consensus_mode(&self) -> Result<RunAllMode> {
+        self.consensus_mode.ok_or_else(|| {
+            anyhow::anyhow!(
+                "--consensus <simplex|duplex|codec> is required when the chain \
+                 reaches the consensus stage"
+            )
+        })
+    }
+
+    /// Reads `--stop-after` as a [`RunAllStage`] (`StopAfter` converts via
+    /// [`From<StopAfter> for RunAllStage`]).
+    #[must_use]
+    pub(crate) fn stop_after_stage(&self) -> RunAllStage {
+        self.stop_after.into()
+    }
+
+    /// Returns `self.input`, or an actionable error naming `--start-from`
+    /// when it is absent. Used by every BAM-source `--start-from` stage
+    /// (`correct`/`align`/`zipper`(mapped)/`sort`/`group`/`consensus`/`filter`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `--input` was not supplied.
+    ///
+    /// Not yet called outside tests: the production call sites (`execute`
+    /// and the stage-options-bag builder) land in a later task of this same
+    /// PR-B campaign.
+    #[allow(dead_code)]
+    pub(crate) fn require_input(&self) -> Result<PathBuf> {
+        self.input.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--input is required with --start-from {} (the input BAM)",
+                self.start_from
+            )
+        })
+    }
+
+    /// Returns the reference FASTA to thread into the consensus caller's
+    /// `#[arg(skip)]` `reference` slot, gated on `--methylation-mode` being
+    /// set: `Some(self.reference.clone())` when methylation mode is
+    /// requested, `None` otherwise (even if `--ref` was supplied — e.g. to
+    /// feed an upstream align stage in the same chain).
+    ///
+    /// Not yet called outside tests: the production call site (the
+    /// stage-options-bag builder) lands in a later task of this same PR-B
+    /// campaign.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn consensus_reference(&self) -> Option<PathBuf> {
+        if self.methylation_mode.is_some() { self.reference.clone() } else { None }
+    }
+
+    /// Validate the `--start-from` / `--stop-after` pair. Thin wrapper over
+    /// the free function [`validate_stages_for`] so the ordering rules stay
+    /// unit-testable without constructing a full `RunAll`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` under the same conditions as [`validate_stages_for`].
+    ///
+    /// Not yet called outside tests: the production call site (`execute`)
+    /// lands in a later task of this same PR-B campaign.
+    #[allow(dead_code)]
+    pub(crate) fn validate_stages(&self) -> Result<()> {
+        validate_stages_for(self.start_from, self.stop_after_stage())
+    }
+
+    /// Derive the ordered stage list for this run. Thin wrapper over the
+    /// free function [`derive_stages_for`] so the derivation rules stay
+    /// unit-testable without constructing a full `RunAll`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` under the same conditions as [`derive_stages_for`].
+    ///
+    /// Not yet called outside tests: the production call site (`execute`)
+    /// lands in a later task of this same PR-B campaign.
+    #[allow(dead_code)]
+    pub(crate) fn derive_stages(&self) -> Result<Vec<crate::pipeline::chains::Stage>> {
+        derive_stages_for(
+            self.start_from,
+            self.stop_after_stage(),
+            self.extract_chain_wants_correct(),
+            self.consensus_mode,
+        )
+    }
+
+    /// Build the [`SourceSpec`](crate::pipeline::chains::SourceSpec) for the
+    /// `ChainSpec` derived from `--start-from`.
+    ///
+    /// | `--start-from`     | `SourceSpec` variant                                              |
+    /// |--------------------|-------------------------------------------------------------------|
+    /// | `extract`          | `Fastqs`/`InterleavedFastq` from `--extract::inputs`              |
+    /// | `correct`          | `Bam(self.require_input()?)` — unmapped BAM feeding correct       |
+    /// | `align`            | `Bam(self.require_input()?)` — unmapped BAM feeding AAM           |
+    /// | `zipper`           | `PairedBams { unmapped, mapped: input, reference }`               |
+    /// | `sort` / `group` / consensus / `filter` | `Bam(self.require_input()?)` — aligned BAM |
+    ///
+    /// # Errors
+    ///
+    /// - `Extract` start with `--input` set is rejected (FASTQ paths come
+    ///   from `--extract::inputs`, not `-i`/`--input`).
+    /// - `Extract` start requires a non-empty `--extract::inputs` and
+    ///   `--extract::read-structures` of matching length.
+    /// - `Zipper` start requires `--unmapped` and `--ref`; returns `Err` if
+    ///   either is absent.
+    ///
+    /// Exercised directly by `source_tests` below; the production call site
+    /// (`execute`) lands in a later task of this same PR-B campaign.
+    #[allow(dead_code)]
+    pub(crate) fn derive_source_spec(&self) -> Result<crate::pipeline::chains::SourceSpec> {
+        use crate::pipeline::chains::SourceSpec;
+        match self.start_from {
+            RunAllStage::Extract => {
+                // When --start-from extract, FASTQ paths come from
+                // --extract::inputs, not from -i/--input.
+                if self.input.is_some() {
+                    bail!(
+                        "when --start-from extract, pass --extract::inputs instead of \
+                         -i/--input (--input is for BAM-source start-from values)"
+                    );
+                }
+                let opts = self.extract_opts.clone().validate()?;
+                anyhow::ensure!(
+                    !opts.inputs.is_empty(),
+                    "--extract::inputs is required when --start-from extract"
+                );
+                anyhow::ensure!(
+                    !opts.read_structures.is_empty(),
+                    "--extract::read-structures is required when --start-from extract"
+                );
+                anyhow::ensure!(
+                    opts.inputs.len() == opts.read_structures.len(),
+                    "--extract::inputs and --extract::read-structures must have the same count"
+                );
+                if opts.interleaved {
+                    let path = opts.inputs.first().cloned().ok_or_else(|| {
+                        anyhow::anyhow!("--extract::inputs is required when --start-from extract")
+                    })?;
+                    // Enforces exactly 2 read structures (the R1/R2 pair).
+                    SourceSpec::interleaved_fastq(path, opts.read_structures)
+                } else {
+                    // Enforces paths.len() == read_structures.len().
+                    SourceSpec::fastqs(opts.inputs, opts.read_structures)
+                }
+            }
+
+            RunAllStage::Correct
+            | RunAllStage::AlignAndMerge
+            | RunAllStage::Sort
+            | RunAllStage::Group
+            | RunAllStage::Consensus
+            | RunAllStage::Filter => Ok(SourceSpec::Bam(self.require_input()?)),
+
+            RunAllStage::Zipper => {
+                let unmapped = self.unmapped.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--unmapped is required with --start-from zipper (the second \
+                         input BAM, queryname-sorted, that carries the source tags)"
+                    )
+                })?;
+                let reference = self.reference.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--ref is required with --start-from zipper (the reference FASTA \
+                         with an accompanying `.dict` for the output BAM header)"
+                    )
+                })?;
+                Ok(SourceSpec::PairedBams { unmapped, mapped: self.require_input()?, reference })
+            }
+        }
+    }
+
+    /// Build the [`SinkSpec`](crate::pipeline::chains::SinkSpec) for the
+    /// `ChainSpec`. Runall always writes a plain BAM via `SinkSpec::Bam` —
+    /// `BamWithIndex` is never constructed here because runall's sort output
+    /// is either intermediate or a final template-coordinate BAM, neither of
+    /// which admits a valid BAI. Runall does not expose a
+    /// `--sort::write-index` flag.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; returns `Result` for API symmetry with the
+    /// other `derive_*` helpers.
+    ///
+    /// Not yet called outside tests: the production call site (`execute`)
+    /// lands in a later task of this same PR-B campaign.
+    #[allow(dead_code)]
+    pub(crate) fn derive_sink_spec(&self) -> Result<crate::pipeline::chains::SinkSpec> {
+        Ok(crate::pipeline::chains::SinkSpec::Bam(self.output.clone()))
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+    use crate::pipeline::chains::SourceSpec;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> RunAll {
+        RunAll::try_parse_from(std::iter::once("runall").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn bam_start_uses_input() {
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+        ]);
+        assert!(matches!(r.derive_source_spec().unwrap(), SourceSpec::Bam(_)));
+    }
+
+    #[test]
+    fn extract_start_rejects_input() {
+        let r = parse(&[
+            "--start-from",
+            "extract",
+            "--stop-after",
+            "extract",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--extract::inputs",
+            "r1.fq",
+            "--extract::read-structures",
+            "+T",
+            "--extract::sample",
+            "s",
+            "--extract::library",
+            "l",
+        ]);
+        let err = r.derive_source_spec().unwrap_err().to_string();
+        assert!(err.contains("--extract::inputs instead of"), "got: {err}");
+    }
+
+    #[test]
+    fn zipper_start_requires_unmapped_and_ref() {
+        let r = parse(&[
+            "--start-from",
+            "zipper",
+            "--stop-after",
+            "zipper",
+            "-i",
+            "mapped.bam",
+            "-o",
+            "out.bam",
+        ]);
+        assert!(r.derive_source_spec().unwrap_err().to_string().contains("--unmapped is required"));
+    }
 }
 
 #[cfg(test)]
