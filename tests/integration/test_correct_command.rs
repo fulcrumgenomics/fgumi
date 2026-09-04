@@ -26,7 +26,7 @@ use crate::helpers::bam_generator::{
 use crate::helpers::read_bam_output;
 
 /// Write a BAM with UMI-tagged reads.
-fn create_umi_bam(path: &PathBuf, families: Vec<Vec<RawRecord>>) {
+pub(crate) fn create_umi_bam(path: &PathBuf, families: Vec<Vec<RawRecord>>) {
     let header = create_minimal_header("chr1", 10000);
     let mut writer =
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
@@ -317,8 +317,8 @@ fn test_correct_command_rejects_streaming_threaded_integrity() {
 /// that drops/duplicates records — fails rather than passing an aggregate
 /// count. `seq_tag`/`original_tag` come from the case table (literal tags),
 /// not from `Target::sequence_tag()`, so the oracle does not derive its
-/// expectations from the code under test. Both the single-thread (`None`) and
-/// multi-threaded (`Some(2)`) pipeline paths are covered per target.
+/// expectations from the code under test. Both the single-worker (`None`) and
+/// multi-worker (`Some(2)`) chain paths are covered per target.
 #[rstest]
 #[case::umi_serial(Target::Umi, SamTag::RX, SamTag::OX, None)]
 #[case::umi_threaded(Target::Umi, SamTag::RX, SamTag::OX, Some(2))]
@@ -507,7 +507,7 @@ fn correct_barcode_leaves_umi_tags_untouched() {
 }
 
 // ============================================================================
-// --check-crc / --no-check-crc on the single-threaded fast path (#800)
+// --check-crc / --no-check-crc on correct's reader (#800)
 // ============================================================================
 
 /// Flip a byte in the last BGZF block's CRC32 footer, so decoding that block
@@ -539,8 +539,8 @@ fn create_multiblock_umi_bam(path: &PathBuf, umi: &str) {
     create_umi_bam(path, vec![create_umi_family(umi, 3000, "read", "ACGTACGT", 30)]);
 }
 
-/// Build correct's argv for the single-threaded fast path (no `--threads`),
-/// appending any extra flags (e.g. `--no-check-crc`).
+/// Build correct's argv for a no-`--threads` run (the chain at a single
+/// worker), appending any extra flags (e.g. `--no-check-crc`).
 fn correct_args<'a>(input: &'a str, output: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
     let mut args = vec![
         "correct",
@@ -561,7 +561,7 @@ fn correct_args<'a>(input: &'a str, output: &'a str, extra: &[&'a str]) -> Vec<&
     args
 }
 
-/// `--no-check-crc` must let correct's single-threaded reader accept a corrupted
+/// `--no-check-crc` must let correct's reader accept a corrupted
 /// BGZF CRC32: it decodes through fgumi-bgzf, honoring the flag (#800). Against
 /// the noodles reader this path used before, this could not pass.
 #[test]
@@ -630,7 +630,7 @@ fn test_correct_check_crc_rejects_corrupted_crc() {
 }
 
 // ============================================================================
-// Chain (`--threads N`) vs single-threaded oracle parity (R3.2 cutover)
+// Worker-count-invariance parity (R3.2 cutover)
 // ============================================================================
 
 /// Read the complete `RecordBuf` for every output record, in output order, via
@@ -674,16 +674,16 @@ fn run_correct(
     cmd.execute("fgumi correct").unwrap_or_else(|e| panic!("correct ({tag}) failed: {e:#}"));
 }
 
-/// `--threads N` (chain) vs no-`--threads` (single-thread oracle) on a
-/// non-vacuous fixture: one exact-match family (kept as-is), one correctable
-/// (1-mismatch) family (corrected), and one uncorrectable (far) family
-/// (dropped from the main output, since no `--rejects` is given). Exercises
-/// the keep/rewrite/reject paths together so the parity check cannot pass on
-/// a trivial pass-through.
+/// Worker-count invariance: a multi-worker (`--threads N`) run must produce the
+/// same output as a single-worker (no-`--threads`) run on a non-vacuous fixture:
+/// one exact-match family (kept as-is), one correctable (1-mismatch) family
+/// (corrected), and one uncorrectable (far) family (dropped from the main
+/// output, since no `--rejects` is given). Exercises the keep/rewrite/reject
+/// paths together so the parity check cannot pass on a trivial pass-through.
 #[rstest]
 #[case::threads1(1)]
 #[case::threads4(4)]
-fn test_correct_chain_matches_single_threaded(#[case] threads: usize) {
+fn correct_output_matches_across_worker_counts(#[case] threads: usize) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let input_bam = temp_dir.path().join("input.bam");
     let whitelist = temp_dir.path().join("whitelist.txt");
@@ -694,9 +694,15 @@ fn test_correct_chain_matches_single_threaded(#[case] threads: usize) {
     create_umi_bam(&input_bam, vec![exact, corr, far]);
     create_whitelist(&whitelist, &["ACGTACGT"]);
 
-    let oracle_out = temp_dir.path().join("oracle.bam");
+    let single_worker_out = temp_dir.path().join("single_worker.bam");
     let chain_out = temp_dir.path().join("chain.bam");
-    run_correct(&input_bam, &oracle_out, &whitelist, &["--min-distance", "1"], "oracle");
+    run_correct(
+        &input_bam,
+        &single_worker_out,
+        &whitelist,
+        &["--min-distance", "1"],
+        "single-worker",
+    );
     let threads_arg = threads.to_string();
     run_correct(
         &input_bam,
@@ -711,27 +717,31 @@ fn test_correct_chain_matches_single_threaded(#[case] threads: usize) {
     // from the code under test, so the parity check below cannot pass
     // vacuously on two empty/degenerate outputs.
     let expected_kept = 5;
-    let (oracle_header, oracle_records) = read_bam_output(&oracle_out);
+    let (single_worker_header, single_worker_records) = read_bam_output(&single_worker_out);
     let (chain_header, chain_records) = read_bam_output(&chain_out);
-    assert_eq!(oracle_records.len(), expected_kept, "oracle output should keep exactly 5 records");
     assert_eq!(
-        oracle_records, chain_records,
-        "chain (--threads {threads}) output must match the single-threaded oracle record-for-record",
+        single_worker_records.len(),
+        expected_kept,
+        "single-worker output should keep exactly 5 records"
+    );
+    assert_eq!(
+        single_worker_records, chain_records,
+        "multi-worker (--threads {threads}) output must match the single-worker run record-for-record",
     );
     // Whole-header parity (read_bam_output normalizes the @PG CL, which
     // legitimately differs by --threads): also catches a dropped @SQ/@RG/@HD/@CO.
     assert_eq!(
-        oracle_header, chain_header,
-        "chain and oracle output headers must match (with @PG CL normalized)",
+        single_worker_header, chain_header,
+        "multi-worker and single-worker output headers must match (with @PG CL normalized)",
     );
 }
 
-/// The `--rejects` output must also match record-for-record between the
-/// chain and oracle paths -- rejects flow through the chain's own
-/// `correct_step_with_rejects` branch, a code path the main-output-only
-/// parity test above does not exercise.
+/// The `--rejects` output must also match record-for-record across worker
+/// counts -- rejects flow through the chain's own `correct_step_with_rejects`
+/// branch, a code path the main-output-only parity test above does not
+/// exercise.
 #[test]
-fn test_correct_chain_matches_single_threaded_rejects() {
+fn correct_output_matches_across_worker_counts_rejects() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let input_bam = temp_dir.path().join("input.bam");
     let whitelist = temp_dir.path().join("whitelist.txt");
@@ -741,17 +751,17 @@ fn test_correct_chain_matches_single_threaded_rejects() {
     create_umi_bam(&input_bam, vec![exact, far]);
     create_whitelist(&whitelist, &["ACGTACGT"]);
 
-    let oracle_out = temp_dir.path().join("oracle.bam");
-    let oracle_rejects = temp_dir.path().join("oracle.rejects.bam");
+    let single_worker_out = temp_dir.path().join("single_worker.bam");
+    let single_worker_rejects = temp_dir.path().join("single_worker.rejects.bam");
     let chain_out = temp_dir.path().join("chain.bam");
     let chain_rejects = temp_dir.path().join("chain.rejects.bam");
 
     run_correct(
         &input_bam,
-        &oracle_out,
+        &single_worker_out,
         &whitelist,
-        &["--min-distance", "1", "--rejects", oracle_rejects.to_str().unwrap()],
-        "oracle",
+        &["--min-distance", "1", "--rejects", single_worker_rejects.to_str().unwrap()],
+        "single-worker",
     );
     run_correct(
         &input_bam,
@@ -761,27 +771,31 @@ fn test_correct_chain_matches_single_threaded_rejects() {
         "chain",
     );
 
-    let oracle_rejects_records = read_correct_records(&oracle_rejects);
-    assert!(!oracle_rejects_records.is_empty(), "oracle rejects must be non-empty");
-    assert_eq!(oracle_rejects_records.len(), 4, "the far family (4 reads) is entirely rejected");
+    let single_worker_rejects_records = read_correct_records(&single_worker_rejects);
+    assert!(!single_worker_rejects_records.is_empty(), "single-worker rejects must be non-empty");
     assert_eq!(
-        oracle_rejects_records,
-        read_correct_records(&chain_rejects),
-        "chain (--threads 4) rejects output must match the oracle record-for-record",
+        single_worker_rejects_records.len(),
+        4,
+        "the far family (4 reads) is entirely rejected"
     );
     assert_eq!(
-        read_correct_records(&oracle_out),
+        single_worker_rejects_records,
+        read_correct_records(&chain_rejects),
+        "multi-worker (--threads 4) rejects output must match the single-worker run record-for-record",
+    );
+    assert_eq!(
+        read_correct_records(&single_worker_out),
         read_correct_records(&chain_out),
-        "main output must also match between chain and oracle",
+        "main output must also match across worker counts",
     );
 }
 
-/// Byte-compares the `--metrics` TSV between the chain and oracle paths.
-/// Metrics counting runs through a per-thread accumulator on the chain path
-/// vs. a single accumulator on the oracle, even though both eventually call
-/// the same `UmiCorrectionMetrics::write_metrics` writer -- so this axis is
-/// load-bearing: it is the one test that would catch a per-thread counting
-/// divergence that a record-parity check alone would miss.
+/// Byte-compares the `--metrics` TSV across worker counts.
+/// Metrics counting runs through a per-thread accumulator on the multi-worker
+/// run vs. a single accumulator on the single-worker run, even though both
+/// eventually call the same `UmiCorrectionMetrics::write_metrics` writer -- so
+/// this axis is load-bearing: it is the one test that would catch a per-thread
+/// counting divergence that a record-parity check alone would miss.
 #[test]
 fn test_correct_metrics_files_match_across_modes() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -793,14 +807,14 @@ fn test_correct_metrics_files_match_across_modes() {
     create_umi_bam(&input_bam, vec![exact, corr]);
     create_whitelist(&whitelist, &["ACGTACGT"]);
 
-    let oracle_metrics = temp_dir.path().join("oracle.metrics.tsv");
+    let single_worker_metrics = temp_dir.path().join("single_worker.metrics.tsv");
     let chain_metrics = temp_dir.path().join("chain.metrics.tsv");
     run_correct(
         &input_bam,
-        &temp_dir.path().join("oracle.bam"),
+        &temp_dir.path().join("single_worker.bam"),
         &whitelist,
-        &["--min-distance", "1", "--metrics", oracle_metrics.to_str().unwrap()],
-        "oracle",
+        &["--min-distance", "1", "--metrics", single_worker_metrics.to_str().unwrap()],
+        "single-worker",
     );
     run_correct(
         &input_bam,
@@ -812,16 +826,20 @@ fn test_correct_metrics_files_match_across_modes() {
 
     // Non-vacuous: the corrected family's one-mismatch match must show up as
     // a real, non-zero count -- not an all-zero table.
-    let parsed = fgumi_lib::metrics::UmiCorrectionMetrics::read_metrics(&oracle_metrics)
-        .expect("parse oracle metrics");
+    let parsed = fgumi_lib::metrics::UmiCorrectionMetrics::read_metrics(&single_worker_metrics)
+        .expect("parse single-worker metrics");
     assert!(
         parsed.iter().any(|m| m.one_mismatch_matches > 0),
         "metrics must record a non-zero one-mismatch match count: {parsed:?}",
     );
 
-    let oracle_content = fs::read_to_string(&oracle_metrics).expect("read oracle metrics");
+    let single_worker_content =
+        fs::read_to_string(&single_worker_metrics).expect("read single-worker metrics");
     let chain_content = fs::read_to_string(&chain_metrics).expect("read chain metrics");
-    assert_eq!(oracle_content, chain_content, "metrics TSV must be byte-identical across modes");
+    assert_eq!(
+        single_worker_content, chain_content,
+        "metrics TSV must be byte-identical across worker counts"
+    );
 }
 
 /// Build a **paired** template: two mates (R1/R2) sharing query name `name`,
@@ -860,9 +878,9 @@ fn create_paired_umi_template(name: &str, umi: &str, pos: i32) -> Vec<RawRecord>
 /// (exercising the carry-over) and comfortably exceeds `GroupByQueryname`'s
 /// default template-batch size (exercising the output-emit boundary). A
 /// single-record-per-name fixture exercises neither. Compare `--threads 4`
-/// against the oracle record-for-record.
+/// against the single-worker run record-for-record.
 #[test]
-fn test_correct_chain_matches_single_threaded_multi_batch() {
+fn correct_output_matches_across_worker_counts_multi_batch() {
     const N: usize = 1200;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -881,9 +899,15 @@ fn test_correct_chain_matches_single_threaded_multi_batch() {
     create_umi_bam(&input_bam, families);
     create_whitelist(&whitelist, &["ACGTACGT"]);
 
-    let oracle_out = temp_dir.path().join("oracle.bam");
+    let single_worker_out = temp_dir.path().join("single_worker.bam");
     let chain_out = temp_dir.path().join("chain.bam");
-    run_correct(&input_bam, &oracle_out, &whitelist, &["--min-distance", "1"], "oracle");
+    run_correct(
+        &input_bam,
+        &single_worker_out,
+        &whitelist,
+        &["--min-distance", "1"],
+        "single-worker",
+    );
     run_correct(
         &input_bam,
         &chain_out,
@@ -892,17 +916,17 @@ fn test_correct_chain_matches_single_threaded_multi_batch() {
         "chain",
     );
 
-    let oracle_records = read_correct_records(&oracle_out);
+    let single_worker_records = read_correct_records(&single_worker_out);
     assert_eq!(
-        oracle_records.len(),
+        single_worker_records.len(),
         N * 2,
         "all {} records ({N} paired templates) should be kept",
         N * 2
     );
     assert_eq!(
-        oracle_records,
+        single_worker_records,
         read_correct_records(&chain_out),
-        "chain (--threads 4) output must match the single-threaded oracle record-for-record across batches",
+        "multi-worker (--threads 4) output must match the single-worker run record-for-record across batches",
     );
 }
 
@@ -913,7 +937,7 @@ fn test_correct_chain_matches_single_threaded_multi_batch() {
 /// unguarded `- 1` subtraction" safety analysis backing the relaxation was
 /// wrong.
 #[test]
-fn test_correct_chain_matches_single_threaded_min_distance_zero() {
+fn correct_output_matches_across_worker_counts_min_distance_zero() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let input_bam = temp_dir.path().join("input.bam");
     let whitelist = temp_dir.path().join("whitelist.txt");
@@ -923,9 +947,15 @@ fn test_correct_chain_matches_single_threaded_min_distance_zero() {
     create_umi_bam(&input_bam, vec![exact, corr]);
     create_whitelist(&whitelist, &["ACGTACGT"]);
 
-    let oracle_out = temp_dir.path().join("oracle.bam");
+    let single_worker_out = temp_dir.path().join("single_worker.bam");
     let chain_out = temp_dir.path().join("chain.bam");
-    run_correct(&input_bam, &oracle_out, &whitelist, &["--min-distance", "0"], "oracle");
+    run_correct(
+        &input_bam,
+        &single_worker_out,
+        &whitelist,
+        &["--min-distance", "0"],
+        "single-worker",
+    );
     run_correct(
         &input_bam,
         &chain_out,
@@ -934,22 +964,26 @@ fn test_correct_chain_matches_single_threaded_min_distance_zero() {
         "chain",
     );
 
-    let oracle_records = read_correct_records(&oracle_out);
-    assert_eq!(oracle_records.len(), 5, "both families should be kept under --min-distance 0");
+    let single_worker_records = read_correct_records(&single_worker_out);
     assert_eq!(
-        oracle_records,
+        single_worker_records.len(),
+        5,
+        "both families should be kept under --min-distance 0"
+    );
+    assert_eq!(
+        single_worker_records,
         read_correct_records(&chain_out),
-        "--min-distance 0 output must match between the chain and single-threaded oracle",
+        "--min-distance 0 output must match across worker counts",
     );
 }
 
-/// The chain (`--threads`) path rejects empty input under a positive
-/// `--min-corrected`, where the legacy single-threaded oracle silently passes
-/// (its `0 / 0 = NaN` kept-ratio compares false against the floor -- a latent
-/// bug). This is an intentional correctness improvement of the chain path, not
-/// a regression: an empty run cannot meet a positive minimum, so the chain's
-/// explicit error is the right behavior. Pin it so it is not lost; the legacy
-/// engine's NaN-pass is left to the follow-up PR that removes that engine.
+/// `correct` rejects empty input under a positive `--min-corrected`. The
+/// retired legacy single-threaded engine used to silently pass this case (its
+/// `0 / 0 = NaN` kept-ratio compared false against the floor -- a latent bug);
+/// removing that engine in this cutover eliminated the NaN-pass, so the chain's
+/// explicit error is now the only behavior. This is an intentional correctness
+/// fix, not a regression: an empty run cannot meet a positive minimum, so the
+/// error is right. Pin it so it is not lost.
 #[test]
 fn test_correct_chain_rejects_empty_input_with_min_corrected() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -1197,10 +1231,10 @@ fn write_headerless_umi_bam(path: &std::path::Path) {
 }
 
 /// `@HD` synthesis parity (proves Task 2B): correct enforces no
-/// query-grouped guard, so header-less input flows through to completion on
-/// both paths. Before the `ChainBuilder::new` fix, the chain path would have
-/// emitted a header without `@HD` while the oracle synthesized one -- a real
-/// output-byte divergence.
+/// query-grouped guard, so header-less input flows through to completion at any
+/// worker count. Before the `ChainBuilder::new` fix, the multi-worker path
+/// would have emitted a header without `@HD` while the single-worker run
+/// synthesized one -- a real output-byte divergence.
 #[rstest]
 #[case::threads1(1)]
 #[case::threads4(4)]
@@ -1211,9 +1245,15 @@ fn test_correct_chain_synthesizes_hd_for_headerless_input(#[case] threads: usize
     write_headerless_umi_bam(&input_bam);
     create_whitelist(&whitelist, &["ACGTACGT"]);
 
-    let oracle_out = temp_dir.path().join("oracle.bam");
+    let single_worker_out = temp_dir.path().join("single_worker.bam");
     let chain_out = temp_dir.path().join("chain.bam");
-    run_correct(&input_bam, &oracle_out, &whitelist, &["--min-distance", "1"], "oracle");
+    run_correct(
+        &input_bam,
+        &single_worker_out,
+        &whitelist,
+        &["--min-distance", "1"],
+        "single-worker",
+    );
     let threads_arg = threads.to_string();
     run_correct(
         &input_bam,
@@ -1223,11 +1263,11 @@ fn test_correct_chain_synthesizes_hd_for_headerless_input(#[case] threads: usize
         "chain",
     );
 
-    let (oracle_header, _) = read_bam_output(&oracle_out);
+    let (single_worker_header, _) = read_bam_output(&single_worker_out);
     let (chain_header, _) = read_bam_output(&chain_out);
     assert!(
-        oracle_header.header().is_some(),
-        "oracle output must synthesize @HD for headerless input",
+        single_worker_header.header().is_some(),
+        "single-worker output must synthesize @HD for headerless input",
     );
     assert!(
         chain_header.header().is_some(),
@@ -1235,7 +1275,7 @@ fn test_correct_chain_synthesizes_hd_for_headerless_input(#[case] threads: usize
     );
     assert_eq!(
         chain_header.header(),
-        oracle_header.header(),
-        "chain (--threads {threads}) must synthesize the same @HD as the oracle for headerless input",
+        single_worker_header.header(),
+        "multi-worker (--threads {threads}) must synthesize the same @HD as the single-worker run for headerless input",
     );
 }
