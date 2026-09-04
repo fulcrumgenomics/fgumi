@@ -696,10 +696,10 @@ fn test_filter_reads_stdin_once(#[case] threads: &str) {
     });
 }
 
-/// clip has a single-threaded fast path (no `--threads`) plus the
-/// multi-threaded path; cover both.
+/// clip always runs on the chain: a no-`--threads` run is the chain at a single
+/// worker, and `--threads N` is the multi-worker pipeline; cover both.
 #[rstest]
-#[case::single_threaded(None)]
+#[case::single_worker(None)]
 #[case::multi_threaded(Some("2"))]
 fn test_clip_reads_stdin_once(#[case] threads: Option<&str>) {
     use crate::helpers::bam_generator::{create_paired_umi_family, create_test_reference};
