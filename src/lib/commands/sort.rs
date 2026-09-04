@@ -560,9 +560,17 @@ pub struct SortOptions {
     /// Applies to the codec selected by `--temp-codec`:
     ///   * For `bgzf`, level 0 produces uncompressed (stored) BGZF blocks
     ///     (fastest, uses most disk space); 1..=9 are libdeflate levels.
-    ///   * For `zstd`, only 1..=9 are valid; level 0 is rejected because zstd
-    ///     has no equivalent "stored" mode and silently remapping it to 1
-    ///     would surprise users counting on uncompressed spill.
+    ///   * For `zstd`, only 1..=9 are valid; the standalone `sort` command
+    ///     rejects level 0 with `--temp-codec zstd` at start-up
+    ///     (`Sort::execute_sort`), since zstd has no equivalent "stored" mode
+    ///     and silently remapping it to 1 would surprise users counting on
+    ///     uncompressed spill. Clap only enforces the per-field range (0..=9)
+    ///     here; the cross-field zstd/level-0 check lives in
+    ///     [`SortOptions::validate`] (shared with `Sort::execute_sort`). A chain
+    ///     consumer that builds a sort stage from a `SortOptions`/
+    ///     `MultiSortOptions` must call `validate()` before stage construction to
+    ///     reject the combination up front rather than failing on the first
+    ///     spill.
     ///
     /// Level 1 (default) provides fast compression with reasonable space savings.
     /// Higher levels (up to 9) provide better compression but are slower.
@@ -591,14 +599,18 @@ pub struct SortOptions {
     /// overhead whenever the descriptor budget could have carried the runs.
     /// Raising this avoids it on very large inputs (at the cost of more open
     /// file descriptors during the final merge); lowering it keeps fewer files
-    /// open. Must be at least 2; to effectively disable consolidation, pass a
-    /// value larger than the number of runs you expect to spill.
+    /// open. Must be at least 2 (enforced by the shared clap value parser); to
+    /// effectively disable consolidation, pass a value larger than the number
+    /// of runs you expect to spill.
     ///
     /// "auto" (default) sizes the limit to the process's soft open-file limit
     /// (`ulimit -n`), less a reserve for the input, output and index handles,
-    /// and capped at a tested maximum. Explicit values like "64", "256" pin it;
-    /// a pinned value larger than the open-file budget is reported at startup.
-    /// Must be at least 2.
+    /// and capped at a tested maximum. Explicit values like "64", "256" pin it.
+    /// The standalone `sort` command reports at start-up (`Sort::execute_sort`)
+    /// when a pinned value exceeds the open-file budget; this field itself
+    /// carries no such check, so nothing warns on a `SortOptions`/
+    /// `MultiSortOptions` value that overruns the budget until (and unless) a
+    /// future consumer applies it.
     #[arg(long = "max-temp-files", default_value = "auto", value_parser = parse_max_temp_files)]
     pub max_temp_files: MaxTempFiles,
 
@@ -627,6 +639,43 @@ impl Default for SortOptions {
             block_batch: 4,
             file_granularity: false,
         }
+    }
+}
+
+/// Rejects the one invalid temp-codec/compression pairing: zstd with level 0.
+///
+/// zstd has no level-0 "stored" (uncompressed) mode, so silently remapping to 1
+/// would surprise users who pass `--temp-compression 0` to disable temp
+/// compression (which works for BGZF). This is the single cross-field check
+/// shared by the standalone `sort` command ([`Sort::execute_sort`]) and by
+/// [`SortOptions::validate`] so a chain consumer (e.g. a fused `runall`) can
+/// reject the combination before constructing the spill stages, rather than
+/// failing later during lazy compressor creation on the first spill.
+fn reject_zstd_uncompressed(
+    temp_compression: u32,
+    temp_codec: fgumi_sort::SpillCodec,
+) -> Result<()> {
+    if temp_compression == 0 && matches!(temp_codec, fgumi_sort::SpillCodec::Zstd) {
+        bail!(
+            "--temp-compression 0 is only supported with --temp-codec bgzf; \
+             zstd does not have an uncompressed mode. Pass --temp-codec bgzf \
+             to keep level-0 spill, or pick a zstd level >= 1."
+        );
+    }
+    Ok(())
+}
+
+impl SortOptions {
+    /// Validates cross-field invariants that clap's per-field parsers cannot
+    /// express.
+    ///
+    /// Currently this rejects the zstd/level-0 combination (zstd has no
+    /// uncompressed mode). A chain consumer that builds a sort stage from a
+    /// `SortOptions`/`MultiSortOptions` (e.g. a fused `runall`) should call this
+    /// before stage construction so the invalid combination is reported up front
+    /// rather than during the first spill.
+    pub fn validate(&self) -> Result<()> {
+        reject_zstd_uncompressed(self.temp_compression, self.temp_codec)
     }
 }
 
@@ -991,14 +1040,8 @@ impl Sort {
         // zstd has no level-0 "stored" mode; silently remapping to 1 would
         // surprise users who pass --temp-compression 0 to disable temp
         // compression (which works for BGZF). Reject the combination
-        // explicitly.
-        if self.temp_compression == 0 && matches!(self.temp_codec, fgumi_sort::SpillCodec::Zstd) {
-            bail!(
-                "--temp-compression 0 is only supported with --temp-codec bgzf; \
-                 zstd does not have an uncompressed mode. Pass --temp-codec bgzf \
-                 to keep level-0 spill, or pick a zstd level >= 1."
-            );
-        }
+        // explicitly, via the same shared check `SortOptions::validate` uses.
+        reject_zstd_uncompressed(self.temp_compression, self.temp_codec)?;
 
         // The "Sorting BAM ..." start line and its completion line are both owned
         // by the chain's `SortSummaryFinalizeHook` timer (`add_sort` constructs an
@@ -2300,6 +2343,29 @@ mod tests {
             msg.contains("--temp-compression 0 is only supported with --temp-codec bgzf"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[rstest]
+    #[case::zstd_level_zero_rejected(0, fgumi_sort::SpillCodec::Zstd, false)]
+    #[case::zstd_level_one_ok(1, fgumi_sort::SpillCodec::Zstd, true)]
+    #[case::zstd_level_nine_ok(9, fgumi_sort::SpillCodec::Zstd, true)]
+    #[case::bgzf_level_zero_ok(0, fgumi_sort::SpillCodec::Bgzf, true)]
+    #[case::bgzf_level_one_ok(1, fgumi_sort::SpillCodec::Bgzf, true)]
+    fn test_sort_options_validate_temp_codec_compression(
+        #[case] temp_compression: u32,
+        #[case] temp_codec: fgumi_sort::SpillCodec,
+        #[case] expect_ok: bool,
+    ) {
+        let opts = SortOptions { temp_compression, temp_codec, ..SortOptions::default() };
+        let result = opts.validate();
+        assert_eq!(result.is_ok(), expect_ok, "unexpected result: {result:?}");
+        if !expect_ok {
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("--temp-compression 0 is only supported with --temp-codec bgzf"),
+                "unexpected error: {msg}"
+            );
+        }
     }
 
     #[test]

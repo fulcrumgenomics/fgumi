@@ -1883,8 +1883,26 @@ impl ExtractRunallOptions {
         }
     }
 
-    /// Re-enforce the cross-field conflicts the `multi_options` macro required us
-    /// to drop from the `#[arg]` attributes (mirrors `Extract::validate`).
+    /// Re-enforce ONLY the two cross-field conflicts the `multi_options` macro
+    /// required us to drop from the `#[arg]` attributes: on the standalone
+    /// [`Extract`], `--store-umi-quals`/`--extract-umis-from-read-names` and
+    /// `--check-crc`/`--no-check-crc` are each a clap-level `conflicts_with`
+    /// pair (not part of `Extract::validate`'s own body), and the macro
+    /// rejects `conflicts_with` on a `multi_options` struct, so those two
+    /// checks are re-implemented here by hand.
+    ///
+    /// This method does NOT re-implement the rest of [`Extract::validate`] —
+    /// the template-count-1-to-2 check, the `--single-tag` reserved-tag
+    /// collision check, the read-structure-non-empty check, or the
+    /// input/read-structure count and stdin/file-existence checks. Those all
+    /// depend on the fully-resolved read structures and input list, which are
+    /// only known once the FASTQ source is built; applying them here would
+    /// duplicate logic that must live with that construction. The future
+    /// `runall` command (PR B) is responsible for running the remaining
+    /// `Extract::validate` checks (template-count 1–2, the `single_tag`
+    /// reserved-tag collision, and read-structure non-emptiness) when it
+    /// builds the FASTQ source from [`Self::inputs`] / [`Self::read_structures`]
+    /// / [`Self::interleaved`]; nothing in this PR calls those checks.
     ///
     /// This is separate from the macro-generated `MultiExtractRunallOptions::
     /// validate()`, which only lifts the staged-required flags; `runall`/PR B
