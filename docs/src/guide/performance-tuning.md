@@ -293,7 +293,7 @@ Prints detailed per-step timing, throughput, contention metrics, and per-thread 
 fgumi sort --sort-stats --input reads.bam --output sorted.bam
 ```
 
-`fgumi sort` has its own engine rather than the shared pipeline, so it carries a dedicated `--sort-stats` flag instead of `--pipeline-stats`. It prints the spill geometry, per-phase timing, the merge's floor (which of consumer serial CPU, worker capacity, or coordination limits the merge, and how much is recoverable), worker utilization, and park attribution — roughly a hundred lines. Off by default; it is instrumentation for performance work, read from a log with a `grep`.
+`fgumi sort` runs through the same shared `ChainBuilder` pipeline as every other command, but it carries a dedicated `--sort-stats` flag instead of `--pipeline-stats` for its own merge-loop diagnostic. Whenever the k-way merge runs -- any sort that spills, or a no-spill sort that still holds more than one in-memory chunk -- it prints a single `Sort merge diag: stalls=... contention=... output_full=... progress_dispatches=...` line reporting merge-loop stalls (waiting on decompress), contention (dispatches that produced nothing), and output backpressure. Only when the sort spills nothing *and* fits in a single in-memory chunk does no k-way merge run; there it instead prints one `Sort fast-path diag: ...` line noting the single-chunk in-memory fast path was taken. Off by default; it is instrumentation for performance work, read from a log with a `grep`.
 
 ### Scheduler Strategy
 

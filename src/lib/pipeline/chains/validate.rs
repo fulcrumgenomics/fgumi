@@ -579,6 +579,7 @@ mod tests {
             max_temp_files: MaxTempFiles::Auto,
             block_batch: 4,
             file_granularity: false,
+            sort_stats: false,
         }
     }
 

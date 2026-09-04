@@ -103,6 +103,7 @@ fn bam_with_index_produces_inline_sidecar_not_reread() {
         max_temp_files: MaxTempFiles::Auto,
         block_batch: 4,
         file_granularity: false,
+        sort_stats: false,
     };
 
     let spec = ChainSpec {
@@ -319,6 +320,7 @@ fn sort_options(max_memory: MemoryLimit, tmp_dirs: Vec<PathBuf>) -> SortOptions 
         max_temp_files: MaxTempFiles::Auto,
         block_batch: 4,
         file_granularity: false,
+        sort_stats: false,
     }
 }
 

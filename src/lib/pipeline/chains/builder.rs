@@ -2859,7 +2859,8 @@ impl<'a> ChainBuilder<'a> {
                 // produced, but emitted on the already-in-order `Detached` merge
                 // thread, dropping one pool step and one memcpy per record.
                 let mut merge =
-                    SortMerge::<BlockOutput>::new(sort_order, self.tuning.per_step_byte_limit);
+                    SortMerge::<BlockOutput>::new(sort_order, self.tuning.per_step_byte_limit)
+                        .with_sort_stats(sort.sort_stats);
                 if let Some(slot) = &sort_stats_slot {
                     merge = merge.with_stats_slot(Arc::clone(slot));
                 }
@@ -2900,11 +2901,14 @@ impl<'a> ChainBuilder<'a> {
                 // during this decode — otherwise group would re-scan aux per
                 // template and lose the #334/#343 optimization on the sort→group
                 // path. The intermediate sort is never standalone, so the stats
-                // slot is `None`; no `with_stats_slot` call is needed.
+                // slot is `None`; no `with_stats_slot` call is needed. The
+                // merge-loop diagnostic still honors `--sort-stats` like the
+                // terminal branch, for a fused pipeline that ever exposes it.
                 let merge = SortMerge::<RecordBatchOutput>::new(
                     sort_order,
                     self.tuning.per_step_byte_limit,
-                );
+                )
+                .with_sort_stats(sort.sort_stats);
                 let merge_tail = self.pipeline.append_step(merge, decompress_tail);
                 let group_key_config = self.bam_group_key_config();
                 let tail = self.pipeline.append_step(

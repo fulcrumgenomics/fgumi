@@ -434,12 +434,16 @@ pub struct Sort {
 
     /// Emit the sort's performance diagnostics.
     ///
-    /// Prints spill geometry, per-phase timing, the merge's floor (which of
-    /// consumer serial CPU, worker capacity, or coordination limits it, and how
-    /// much is recoverable), worker utilization, and park attribution -- roughly
-    /// a hundred lines. Off by default: it is instrumentation for performance
-    /// work, read from a log with a grep, and it buried the handful of lines a
-    /// normal run should show.
+    /// Whenever the k-way merge runs -- any sort that spills, or that keeps
+    /// more than one in-memory chunk -- prints the `SortMerge` merge-loop
+    /// diagnostic ("Sort merge diag: ..."): stalls (merge-loop passes that were
+    /// input-starved waiting on decompress), contention (dispatches that
+    /// produced nothing), and output-backpressure counts. Only when the sort
+    /// spills nothing *and* fits in a single in-memory chunk is there no merge
+    /// to diagnose -- there it instead prints a one-line note ("Sort fast-path
+    /// diag: ...") saying the single-chunk in-memory fast path was taken.
+    /// Off by default: it is instrumentation for performance work, read from a
+    /// log with a grep, and it is not something a normal run should show.
     #[arg(long = "sort-stats", default_value_t = false, hide = true)]
     pub sort_stats: bool,
 }
@@ -484,6 +488,8 @@ pub struct SortOptions {
     pub block_batch: usize,
     /// Spill at file rather than block granularity (chain engine; not a CLI flag).
     pub file_granularity: bool,
+    /// Emit the sort's performance diagnostics (`--sort-stats`).
+    pub sort_stats: bool,
 }
 
 impl Sort {
@@ -505,6 +511,7 @@ impl Sort {
             // Chain-engine defaults (see `SortOptions` docs) — not yet CLI flags.
             block_batch: 4,
             file_granularity: false,
+            sort_stats: self.sort_stats,
         }
     }
 
@@ -934,11 +941,9 @@ impl Sort {
             info!("Temp directories: {joined}");
         }
 
-        // `--read-streams` is now threaded end-to-end (into the chain's BAM
-        // source below); no warn shim. `--sort-stats` is still unthreaded.
-        if self.sort_stats {
-            warn!("--sort-stats is ignored by the sort chain (not yet threaded)");
-        }
+        // `--read-streams` and `--sort-stats` are threaded end-to-end (into the
+        // chain's BAM source and `SortMerge` respectively, below); no warn shim
+        // needed for either.
 
         // --- cutover: run via the chain instead of sorter.sort() ---
         // (`phase1_threads`/`phase2_threads` above are retained only to source the
