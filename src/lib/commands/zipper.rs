@@ -532,7 +532,13 @@ impl TagBitset {
 /// Precomputed tag lookups for `merge_raw`, built once per zipper run from the
 /// user's `TagInfo` and reused for every template. Building the bitsets once
 /// rather than per template is the entire reason this type exists.
-struct ZipperTags {
+///
+/// `pub(crate)` so callers that merge many templates per `TagInfo` (e.g.
+/// `AlignAndMergeStep` and `ZipperMergeStep`) can build one `ZipperTags` for
+/// the whole step and drive [`merge_one_template_with`] directly, instead of
+/// paying the three-`TagBitset`-allocation cost on every template. Fields
+/// stay private — callers hold this opaquely.
+pub(crate) struct ZipperTags {
     /// Two-byte tag names to remove from mapped reads (Step 2), pre-filtered to
     /// exactly the two-byte names (mirrors the old `len() == 2` guard).
     remove_list: Vec<[u8; 2]>,
@@ -545,7 +551,7 @@ struct ZipperTags {
 }
 
 impl ZipperTags {
-    fn from_tag_info(tag_info: &TagInfo) -> Self {
+    pub(crate) fn from_tag_info(tag_info: &TagInfo) -> Self {
         let remove_list = tag_info
             .remove
             .iter()
@@ -1353,26 +1359,30 @@ impl Command for Zipper {
 /// with the log site and cannot drift.
 pub const NEW_PIPELINE_START_LOG: &str = "Starting zipper (new pipeline)";
 
-/// Apply the full zipper merge body to a single (unmapped, mapped)
-/// template pair. Runs `merge_raw`, then (when `reference` is `Some`)
-/// `restore_unconverted_bases_in_raw_template` for the bisulfite path.
+/// Apply the full zipper merge body to a single (unmapped, mapped) template
+/// pair, given precomputed [`ZipperTags`]. Runs `merge_raw_with`, then (when
+/// `reference` is `Some`) `restore_unconverted_bases_in_raw_template` for the
+/// bisulfite path.
+///
+/// Both callers that merge many templates against the same `TagInfo` —
+/// `ZipperMergeStep::emit_merged` (typed-step zipper) and
+/// `AlignAndMergeStep::merge_zipper_batch` (AAM dispatcher) — build the
+/// `ZipperTags` once, outside their per-template loop, and hold it on the
+/// step for the step's whole lifetime rather than rebuilding it (three
+/// `TagBitset` allocations) on every call.
 ///
 /// Returned errors are bare — callers add their own context (e.g. the
-/// caller's step name) via `.map_err`/`?` at the call site so the
-/// surfaced error is attributable to the dispatching context.
-///
-/// Used by:
-/// - `ZipperMergeStep::emit_merged` (typed-step zipper)
-/// - `AlignAndMergeStep::merge_zipper_batch` (AAM dispatcher)
-pub(crate) fn merge_one_template(
+/// caller's step name) via `.map_err`/`?` at the call site so the surfaced
+/// error is attributable to the dispatching context.
+pub(crate) fn merge_one_template_with(
     unmapped: &Template,
     mapped: &mut Template,
-    tag_info: &TagInfo,
+    tags: &ZipperTags,
     skip_tc_tags: bool,
     reference: Option<&ReferenceReader>,
     output_header: &Header,
 ) -> Result<()> {
-    merge_raw(unmapped, mapped, tag_info, skip_tc_tags)?;
+    merge_raw_with(unmapped, mapped, tags, skip_tc_tags)?;
     if let Some(ref_reader) = reference {
         restore_unconverted_bases_in_raw_template(mapped, ref_reader, output_header)?;
     }
@@ -1474,6 +1484,12 @@ pub(crate) mod merge_step {
     /// and emits merged [`BamTemplateBatch`]es.
     pub struct ZipperMergeStep {
         cfg: ZipperMergeConfig,
+        /// Precomputed tag-merge bitsets, built once in [`ZipperMergeStep::new`]
+        /// from `cfg.tag_info` and reused for every template `emit_merged`
+        /// processes over the step's lifetime — `cfg.tag_info` is immutable for
+        /// the whole step, so there is no reason to rebuild
+        /// [`super::ZipperTags`] (three `TagBitset` allocations) per template.
+        tags: super::ZipperTags,
         pending_a: Option<PendingBatch>,
         pending_b: Option<PendingBatch>,
         accumulator: Vec<Template>,
@@ -1496,8 +1512,10 @@ pub(crate) mod merge_step {
             // read see the floored value.
             cfg.target_batch_count = cfg.target_batch_count.max(1);
             let target = cfg.target_batch_count;
+            let tags = super::ZipperTags::from_tag_info(&cfg.tag_info);
             Self {
                 cfg,
+                tags,
                 pending_a: None,
                 pending_b: None,
                 accumulator: Vec::with_capacity(target),
@@ -1587,10 +1605,10 @@ pub(crate) mod merge_step {
             mut mapped: Template,
             ctx: &mut StepCtx2<'_, Self>,
         ) -> io::Result<Option<StepOutcome>> {
-            super::merge_one_template(
+            super::merge_one_template_with(
                 &unmapped,
                 &mut mapped,
-                &self.cfg.tag_info,
+                &self.tags,
                 self.cfg.skip_tc_tags,
                 self.cfg.reference.as_deref(),
                 &self.cfg.output_header,
@@ -1831,6 +1849,79 @@ pub(crate) mod merge_step {
                 step.cfg.target_batch_count, 1,
                 "stored target_batch_count must be floored to 1, not left at 0"
             );
+        }
+
+        /// Regression guard for F3: `ZipperMergeStep::new` builds `ZipperTags`
+        /// once (`self.tags`) and `emit_merged` reuses that same cached value
+        /// for every matched (unmapped, mapped) pair the step ever merges,
+        /// instead of rebuilding it per template. This drives the exact
+        /// cached `step.tags` through `merge_one_template_with` — what
+        /// `emit_merged` calls — across THREE (unmapped, mapped) pairs under
+        /// a non-trivial remove/reverse/revcomp `TagInfo`, and asserts each
+        /// pair independently gets the correct treatment. A bug that
+        /// misapplied the cached tags past the first template would only
+        /// show up on the second or third pair, which is what this test is
+        /// sized to catch.
+        #[test]
+        fn cached_tags_apply_transforms_to_every_template() {
+            let mut cfg = make_cfg(false);
+            cfg.tag_info = Arc::new(TagInfo::new(
+                vec!["XA".to_string()],
+                vec!["XV".to_string()],
+                vec!["XC".to_string()],
+            ));
+            let step = ZipperMergeStep::new(cfg);
+
+            let names: [&[u8]; 3] = [b"readA", b"readB", b"readC"];
+            for name in names {
+                // Mapped (aligner) record: negative strand, single unpaired
+                // read, carrying a stale XA tag that must be removed on merge.
+                let mut mb = fgumi_raw_bam::SamBuilder::new();
+                mb.read_name(name)
+                    .flags(fgumi_raw_bam::flags::REVERSE)
+                    .sequence(b"ACGT")
+                    .qualities(b"IIII")
+                    .add_string_tag(*b"XA", b"stale");
+                let mut mapped = Template::from_records(vec![mb.build()]).expect("mapped template");
+
+                // Unmapped record carries the tags to remove/reverse/revcomp.
+                let mut ub = fgumi_raw_bam::SamBuilder::new();
+                ub.read_name(name)
+                    .flags(fgumi_raw_bam::flags::UNMAPPED)
+                    .sequence(b"ACGT")
+                    .qualities(b"IIII")
+                    .add_string_tag(*b"XV", b"abcde")
+                    .add_string_tag(*b"XC", b"AGAGG")
+                    .add_string_tag(*b"XA", b"drop-me");
+                let unmapped = Template::from_records(vec![ub.build()]).expect("unmapped template");
+
+                crate::commands::zipper::merge_one_template_with(
+                    &unmapped,
+                    &mut mapped,
+                    &step.tags,
+                    step.cfg.skip_tc_tags,
+                    step.cfg.reference.as_deref(),
+                    &step.cfg.output_header,
+                )
+                .expect("merge ok");
+
+                let rec = &mapped.records[0];
+                let aux = fgumi_raw_bam::fields::aux_data_slice(rec);
+                assert_eq!(
+                    fgumi_raw_bam::tags::find_string_tag(aux, *b"XV"),
+                    Some(&b"edcba"[..]),
+                    "XV must be reversed on the negative-strand read"
+                );
+                assert_eq!(
+                    fgumi_raw_bam::tags::find_string_tag(aux, *b"XC"),
+                    Some(&b"CCTCT"[..]),
+                    "XC must be reverse-complemented on the negative-strand read"
+                );
+                assert!(
+                    fgumi_raw_bam::tags::find_string_tag(aux, *b"XA").is_none(),
+                    "XA must be removed (stale mapped copy + skipped on tag-copy)"
+                );
+            }
         }
     }
 }
