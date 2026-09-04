@@ -25,9 +25,8 @@ use crate::template::Template;
 /// Serial mutex acquisition; mirrors `GroupByMi::MAX_BATCHES_PER_LOCK`.
 const MAX_BATCHES_PER_LOCK: usize = 8;
 
-/// Default target batch count. Mirrors legacy's
-/// `TemplateGrouper::new(1000)` (the production batch size in
-/// `Filter::execute_threads_mode_template`).
+/// Default target batch count: the production batch size used when filter
+/// groups templates on the chain (`fgumi filter --filter-by-template=true`).
 pub const DEFAULT_TARGET_BATCH_COUNT: usize = 1000;
 
 /// `Serial + ByItemOrdinal` queryname grouper. Records arriving in

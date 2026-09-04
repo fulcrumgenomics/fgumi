@@ -17,38 +17,26 @@ use crate::consensus_filter::{
     filter_read, is_duplex_consensus, mask_bases, mask_duplex_bases,
     mask_methylation_depth_duplex_raw_with_tags, mask_methylation_depth_simplex_raw_with_tags,
     mask_strand_methylation_agreement_raw_with_ref_bases_and_tags, mean_base_quality_full_length,
-    retained_primary_masked_bases, template_passes,
 };
-use crate::grouper::{SingleRawRecordGrouper, TemplateGrouper};
-use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::read_info::LibraryIndex;
 use crate::reference::ReferenceReader;
 use crate::tag_reversal::reverse_per_base_tags_raw;
-use crate::template::TemplateBatch;
-use crate::unified_pipeline::{
-    BamPipelineConfig, BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate,
-    run_bam_pipeline_from_reader, run_bam_pipeline_from_reader_with_secondary,
-};
 use crate::validation::validate_file_exists;
-use ahash::AHashMap;
 use anyhow::{Result, bail};
 use clap::Parser;
-use fgumi_bam_io::create_bam_reader_for_pipeline_with_opts;
 use fgumi_raw_bam;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 use log::info;
 use noodles::sam::Header;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config, reject_output_collisions, serialize_raw_bam_records,
+    reject_output_collisions,
 };
 
 /// Filters and masks consensus reads based on various quality metrics.
@@ -293,33 +281,8 @@ impl Filter {
 }
 
 // ============================================================================
-// 7-Step Pipeline Types
+// Pipeline Types
 // ============================================================================
-
-/// Result from processing a batch of records through raw-byte filtering.
-struct FilterProcessedBatchRaw {
-    /// Records that passed filtering (raw bytes).
-    kept_records: Vec<RawRecord>,
-    /// Records that failed filtering (raw bytes, if tracking rejects).
-    rejected_records: Vec<RawRecord>,
-    /// Number of records processed.
-    records_count: u64,
-    /// Number of records that passed.
-    passed_count: u64,
-    /// Number of bases masked.
-    bases_masked: u64,
-}
-
-impl MemoryEstimate for FilterProcessedBatchRaw {
-    fn estimate_heap_size(&self) -> usize {
-        let vec_overhead = std::mem::size_of::<RawRecord>();
-        let kept_outer = self.kept_records.capacity() * vec_overhead;
-        let kept_inner: usize = self.kept_records.iter().map(RawRecord::capacity).sum();
-        let rejected_outer = self.rejected_records.capacity() * vec_overhead;
-        let rejected_inner: usize = self.rejected_records.iter().map(RawRecord::capacity).sum();
-        kept_outer + kept_inner + rejected_outer + rejected_inner
-    }
-}
 
 /// Per-thread accumulator merged into final counts after pipeline completion.
 #[derive(Default)]
@@ -381,100 +344,38 @@ impl Command for Filter {
         // Validate parameter counts (1-3 values for duplex support)
         self.validate_parameters()?;
 
-        if self.threading.threads.is_some() {
-            return self.execute_chain(command_line);
-        }
-
-        let timer = OperationTimer::new("Filtering consensus reads");
-
-        info!("Starting Filter");
-        info!("Input: {}", self.io.input.display());
-        info!("Output: {}", self.io.output.display());
-        match &self.reference {
-            Some(r) => info!("Reference: {}", r.display()),
-            None => info!("Reference: <none> (tag regeneration disabled)"),
-        }
-        info!("Min reads: {:?}", self.min_reads);
-        info!("Max read error rate: {:?}", self.max_read_error_rate);
-        info!("Max base error rate: {:?}", self.max_base_error_rate);
-        if let Some(q) = self.min_base_quality {
-            info!("Min base quality: {q}");
-        }
-        if let Some(q) = self.min_mean_base_quality {
-            info!("Min mean base quality: {q}");
-        }
-        info!("Max no-call fraction: {}", self.max_no_call_fraction);
-        if !self.min_methylation_depth.is_empty() {
-            info!("Min methylation depth: {:?}", self.min_methylation_depth);
-        }
-        if self.require_strand_methylation_agreement {
-            info!("Require strand methylation agreement: true");
-        }
-        if let Some(frac) = self.min_conversion_fraction {
-            info!("Min conversion fraction: {frac}");
-        }
-        if let Some(mode) = &self.methylation_mode {
-            info!("Methylation mode: {mode:?}");
-        }
-
-        self.io.log_effective_check_crc();
-
-        // Open input using streaming-capable reader for pipeline use
-        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-            &self.io.input,
-            self.io.pipeline_reader_opts(),
-        )?;
-
-        // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio,
-        // which never passes a header-less BAM straight through).
-        let header = crate::commands::common::ensure_hd_record(header)?;
-        // FILT3-02: fgbio's FilterConsensusReads calls Bams.requireQueryGrouped.
-        // Filtering is template-based, so coordinate-sorted input silently scatters
-        // mates and corrupts the both-primaries-pass logic. Reject it like fgbio.
-        crate::commands::common::require_query_grouped(
-            &header,
-            &self.io.input.display().to_string(),
-        )?;
-
-        // Add @PG record with PP chaining to input's last program
-        let header = crate::commands::common::add_pg_record(header, command_line)?;
-
-        let track_rejects = self.rejects.is_some();
-        let threads = self.threading.threads.unwrap_or(1);
-
-        // Route to appropriate 7-step pipeline mode
-        let total_reads = if self.filter_by_template {
-            self.execute_threads_mode_template(threads, reader, header, track_rejects)?
-        } else {
-            self.execute_threads_mode_single_read(threads, reader, header, track_rejects)?
-        };
-
-        timer.log_completion(total_reads);
-        Ok(())
+        // The declarative chain is the only execution path. `execute_chain` emits
+        // the CRC-verify log, and `ChainBuilder::add_filter` (plus its finalize
+        // hooks) emits the `Starting Filter` banner + `OperationTimer`, the
+        // query-grouped input check, `@PG` injection, the summary banner, and the
+        // stats-file/rejects hooks (running any of those here first would
+        // double-log and pre-consume stdin), so `execute` does only the pre-flight
+        // validation above and then dispatches. Absent `--threads` runs the chain
+        // at a single worker.
+        self.execute_chain(command_line)
     }
 }
 
 impl Filter {
-    /// Run the filter stage on the declarative chain builder (the `--threads N`
-    /// path).
+    /// Run the filter stage on the declarative chain builder.
     ///
-    /// Replaces the hand-rolled unified-pipeline construction in `execute` for
-    /// the threaded case. The chain opens its own source, validates the
-    /// query-grouped input ordering, injects `@PG`, runs the shared filter
-    /// process step(s), writes the kept records (and, when configured, the
-    /// rejects BAM and stats file) via its finalize hooks — all through the
-    /// same shared helpers as the non-chain path, so the two orchestrations
-    /// stay in parity. The no-`--threads` path keeps its own unified pipeline
-    /// in `execute`, which is the in-process parity oracle for this one (see
-    /// `test_filter_chain_matches_single_threaded`).
+    /// The chain is the only execution path: `execute` always dispatches here,
+    /// with or without `--threads` (absent `--threads` runs the chain at a single
+    /// worker). The chain opens its own source, validates the query-grouped input
+    /// ordering, injects `@PG`, runs the shared filter process step(s), and writes
+    /// the kept records (and, when configured, the rejects BAM and stats file) via
+    /// its finalize hooks. All user-facing diagnostics — the `Starting Filter`
+    /// banner, the `OperationTimer`, the parameter log lines, and the
+    /// summary/stats finalize hooks — are emitted inside
+    /// `ChainBuilder::add_filter`, so `execute_chain` itself only surfaces the CRC
+    /// policy and runs the pipeline (mirrors `dedup`/`retag` `execute_chain`).
     fn execute_chain(&self, command_line: &str) -> Result<()> {
         use crate::pipeline::chains::{
             ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
         };
 
         // `add_filter` re-emits the timer/banner/threading log lines but not the
-        // CRC-verify status; emit it here so the --threads path reports it once,
-        // matching the non-chain path.
+        // CRC-verify status; emit it here so the run reports it exactly once.
         self.io.log_effective_check_crc();
 
         let stage_opts =
@@ -494,12 +395,10 @@ impl Filter {
 
 impl FilterOptions {
     /// Build the shared filter config, reference, per-thread metrics
-    /// accumulators, and progress counter used by both the chain builder and
-    /// the non-chain unified pipeline.
+    /// accumulators, and progress counter used by the chain builder.
     ///
-    /// The [`BamPipelineConfig`] is *not* built here: the chain builder derives
-    /// it from its [`crate::pipeline::chains::ChainSpec`], and the non-chain run
-    /// builds it via [`Filter::build_filter_pipeline_config`].
+    /// The `BamPipelineConfig` is *not* built here: the chain builder derives it
+    /// from its [`crate::pipeline::chains::ChainSpec`].
     pub(crate) fn setup_pipeline(&self, num_threads: usize) -> Result<FilterPipelineSetup> {
         let config = Arc::new(FilterConfig::new(
             &self.min_reads,
@@ -707,356 +606,6 @@ impl FilterOptions {
 }
 
 impl Filter {
-    // ========================================================================
-    // 7-Step Unified Pipeline Implementation
-    // ========================================================================
-
-    /// Build the pipeline configuration for the non-chain (`unified_pipeline`)
-    /// filter run. The chain builder assembles its own [`BamPipelineConfig`]
-    /// from the [`crate::pipeline::chains::ChainSpec`], so this lives on
-    /// [`Filter`] (which carries the io/compression/scheduler/queue flags)
-    /// rather than on [`FilterOptions`] (tuning knobs only).
-    fn build_filter_pipeline_config(
-        &self,
-        num_threads: usize,
-        header: &Header,
-    ) -> Result<BamPipelineConfig> {
-        let mut pipeline_config = build_pipeline_config(
-            &self.scheduler_opts,
-            &self.compression,
-            &self.queue_memory,
-            &self.io,
-            num_threads,
-        )?;
-        // Template mode groups by QNAME and reads the key's `name_hash` fast-path
-        // (see `TemplateGrouper`), so it needs the key. Single-read mode uses
-        // `SingleRawRecordGrouper`, which discards the decoded record entirely and
-        // never reads the key — so skip its per-record computation with `None`.
-        pipeline_config.group_key_config = if self.filter_by_template {
-            Some(GroupKeyConfig::new_raw_no_cell(LibraryIndex::from_header(header)))
-        } else {
-            None
-        };
-        Ok(pipeline_config)
-    }
-
-    /// Build the shared filter config, reference, metrics queue, and progress
-    /// counter. Delegates to [`FilterOptions::setup_pipeline`] so the chain
-    /// builder and the non-chain run share one implementation.
-    pub(crate) fn setup_pipeline(&self, num_threads: usize) -> Result<FilterPipelineSetup> {
-        self.to_filter_options().setup_pipeline(num_threads)
-    }
-
-    /// Build the process closure captures. Delegates to
-    /// [`FilterOptions::process_captures`].
-    pub(crate) fn process_captures(
-        &self,
-        setup: &FilterPipelineSetup,
-        header: &Header,
-    ) -> FilterProcessCaptures {
-        self.to_filter_options().process_captures(setup, header)
-    }
-
-    /// Run the filter pipeline with the given grouper and process function.
-    ///
-    /// This is the common pipeline executor shared by single-read and template modes.
-    /// It builds the serialize function, runs the pipeline (with optional secondary
-    /// output for rejects), and aggregates metrics.
-    fn run_filter_pipeline<G, GrouperFn, ProcessFn>(
-        &self,
-        pipeline_config: BamPipelineConfig,
-        setup: FilterPipelineSetup,
-        reader: Box<dyn std::io::Read + Send>,
-        header: Header,
-        grouper_fn: GrouperFn,
-        process_fn: ProcessFn,
-    ) -> Result<u64>
-    where
-        G: Send + BatchWeight + MemoryEstimate + 'static,
-        GrouperFn: FnOnce(&Header) -> Box<dyn Grouper<Group = G> + Send>,
-        ProcessFn: Fn(G) -> io::Result<FilterProcessedBatchRaw> + Send + Sync + 'static,
-    {
-        let collected_for_serialize = Arc::clone(&setup.collected_metrics);
-        let progress = Arc::clone(&setup.progress_counter);
-
-        // Primary serialize: write kept records
-        let serialize_fn = move |processed: FilterProcessedBatchRaw,
-                                 _header: &Header,
-                                 output: &mut Vec<u8>|
-              -> io::Result<u64> {
-            collected_for_serialize.with_slot(|m| {
-                m.total_records += processed.records_count;
-                m.passed_records += processed.passed_count;
-                m.failed_records += processed.records_count - processed.passed_count;
-                m.total_bases_masked += processed.bases_masked;
-            });
-
-            // Interim "Processed N records" heartbeat, advanced once per batch
-            // here rather than once per record inside the parallel `process_fn` —
-            // the per-record `fetch_add` was a contended shared atomic (cacheline
-            // ping-pong across pipeline workers). Log-only; the authoritative total
-            // is aggregated from `records_count` below.
-            advance_progress(&progress, processed.records_count);
-
-            serialize_raw_bam_records(&processed.kept_records, output)
-        };
-
-        if let Some(rejects_path) = &self.rejects {
-            // Secondary serialize: write rejected records
-            let secondary_serialize_fn =
-                |batch: &FilterProcessedBatchRaw, buf: &mut Vec<u8>| -> io::Result<u64> {
-                    serialize_raw_bam_records(&batch.rejected_records, buf)
-                };
-
-            run_bam_pipeline_from_reader_with_secondary(
-                pipeline_config,
-                reader,
-                header,
-                &self.io.output,
-                None,
-                rejects_path,
-                None, // secondary uses resolved primary output header
-                grouper_fn,
-                process_fn,
-                serialize_fn,
-                secondary_serialize_fn,
-            )?;
-        } else {
-            run_bam_pipeline_from_reader(
-                pipeline_config,
-                reader,
-                header,
-                &self.io.output,
-                None,
-                grouper_fn,
-                process_fn,
-                serialize_fn,
-            )?;
-        }
-
-        // Aggregate metrics
-        let mut total_reads = 0u64;
-        let mut passed_reads = 0u64;
-        let mut failed_reads = 0u64;
-        let mut total_bases_masked = 0u64;
-
-        for slot in setup.collected_metrics.slots() {
-            let m = slot.lock();
-            total_reads += m.total_records;
-            passed_reads += m.passed_records;
-            failed_reads += m.failed_records;
-            total_bases_masked += m.total_bases_masked;
-        }
-
-        if let Some(stats_path) = &self.stats {
-            self.write_filter_stats(stats_path, total_reads, passed_reads, failed_reads)?;
-        }
-
-        info!("Processed {total_reads} reads; kept {passed_reads} and rejected {failed_reads}");
-        if self.rejects.is_some() && failed_reads > 0 {
-            info!("Wrote {failed_reads} rejected records to rejects file");
-        }
-        info!("Total bases masked: {total_bases_masked}");
-
-        Ok(total_reads)
-    }
-
-    /// Execute using the 7-step unified pipeline (single-read mode, raw bytes).
-    ///
-    /// Each record is filtered independently without template awareness.
-    fn execute_threads_mode_single_read(
-        &self,
-        num_threads: usize,
-        reader: Box<dyn std::io::Read + Send>,
-        header: Header,
-        track_rejects: bool,
-    ) -> Result<u64> {
-        let setup = self.setup_pipeline(num_threads)?;
-        let pipeline_config = self.build_filter_pipeline_config(num_threads, &header)?;
-        let ctx = self.process_captures(&setup, &header);
-
-        let grouper_fn = move |_header: &Header| {
-            Box::new(SingleRawRecordGrouper::new()) as Box<dyn Grouper<Group = RawRecord> + Send>
-        };
-
-        let process_fn = move |mut record: RawRecord| -> io::Result<FilterProcessedBatchRaw> {
-            let mut kept_records: Vec<RawRecord> = Vec::new();
-            let mut rejected_records: Vec<RawRecord> = Vec::new();
-            let mut passed_count = 0u64;
-
-            let (masked, pass) = Self::process_record_raw(
-                &mut record,
-                &ctx.config,
-                ctx.reference.as_deref(),
-                &ctx.header,
-                ctx.should_reverse_tags,
-                ctx.min_base_quality,
-                ctx.require_single_strand_agreement,
-                ctx.min_mean_base_quality,
-                ctx.max_no_call_fraction,
-                ctx.methylation_depth_thresholds.as_ref(),
-                ctx.require_strand_methylation_agreement,
-                ctx.min_conversion_fraction,
-                ctx.methylation_mode,
-                &ctx.ref_names,
-            )
-            .map_err(io::Error::other)?;
-
-            // Match fgbio's `maskedBases`: count a record's masked bases only when it is a
-            // retained primary read (FilterConsensusReads.scala:207-219). In this per-record
-            // streaming mode the record is its own single-read "template", so `pass` is the
-            // template result; secondary/supplementary reads still contribute nothing.
-            let bases_masked =
-                retained_primary_masked_bases(std::slice::from_ref(&record), &[masked], pass);
-
-            if pass {
-                passed_count = 1;
-                kept_records.push(record);
-            } else if track_rejects {
-                rejected_records.push(record);
-            }
-
-            Ok(FilterProcessedBatchRaw {
-                kept_records,
-                rejected_records,
-                records_count: 1,
-                passed_count,
-                bases_masked,
-            })
-        };
-
-        self.run_filter_pipeline(pipeline_config, setup, reader, header, grouper_fn, process_fn)
-    }
-
-    /// Execute using the 7-step unified pipeline (template-aware mode).
-    ///
-    /// All primary reads in a template must pass for the template to pass.
-    fn execute_threads_mode_template(
-        &self,
-        num_threads: usize,
-        reader: Box<dyn std::io::Read + Send>,
-        header: Header,
-        track_rejects: bool,
-    ) -> Result<u64> {
-        let setup = self.setup_pipeline(num_threads)?;
-        let pipeline_config = self.build_filter_pipeline_config(num_threads, &header)?;
-        let ctx = self.process_captures(&setup, &header);
-
-        #[cfg(test)]
-        const BATCH_SIZE: usize = 50;
-        #[cfg(not(test))]
-        const BATCH_SIZE: usize = 1000;
-
-        let grouper_fn = move |_header: &Header| {
-            Box::new(TemplateGrouper::new(BATCH_SIZE))
-                as Box<dyn Grouper<Group = TemplateBatch> + Send>
-        };
-
-        let process_fn = move |batch: TemplateBatch| -> io::Result<FilterProcessedBatchRaw> {
-            let mut kept_records: Vec<RawRecord> = Vec::new();
-            let mut rejected_records: Vec<RawRecord> = Vec::new();
-            let mut total_records = 0u64;
-            let mut passed_count = 0u64;
-            let mut bases_masked = 0u64;
-
-            for template in batch {
-                let mut template_records: Vec<RawRecord> = template.into_records();
-                let mut pass_map: AHashMap<usize, bool> =
-                    AHashMap::with_hasher(crate::hashing::deterministic_state());
-                let mut masked_by_record: Vec<u64> = Vec::with_capacity(template_records.len());
-
-                for (idx, record) in template_records.iter_mut().enumerate() {
-                    total_records += 1;
-
-                    let (masked, pass) = Self::process_record_raw(
-                        record,
-                        &ctx.config,
-                        ctx.reference.as_deref(),
-                        &ctx.header,
-                        ctx.should_reverse_tags,
-                        ctx.min_base_quality,
-                        ctx.require_single_strand_agreement,
-                        ctx.min_mean_base_quality,
-                        ctx.max_no_call_fraction,
-                        ctx.methylation_depth_thresholds.as_ref(),
-                        ctx.require_strand_methylation_agreement,
-                        ctx.min_conversion_fraction,
-                        ctx.methylation_mode,
-                        &ctx.ref_names,
-                    )
-                    .map_err(io::Error::other)?;
-                    masked_by_record.push(masked);
-                    pass_map.insert(idx, pass);
-                }
-
-                let template_pass = template_passes(&template_records, &pass_map);
-
-                // fgbio tallies masked bases only over the primary reads of retained
-                // templates (FilterConsensusReads.scala:207-219); a dropped template and
-                // any secondary/supplementary read contribute nothing.
-                bases_masked += retained_primary_masked_bases(
-                    &template_records,
-                    &masked_by_record,
-                    template_pass,
-                );
-
-                for (idx, record) in template_records.into_iter().enumerate() {
-                    let flags = RawRecordView::new(&record).flags();
-                    let is_primary = (flags & fgumi_raw_bam::flags::SECONDARY) == 0
-                        && (flags & fgumi_raw_bam::flags::SUPPLEMENTARY) == 0;
-
-                    if is_primary {
-                        if template_pass {
-                            passed_count += 1;
-                            kept_records.push(record);
-                        } else if track_rejects {
-                            rejected_records.push(record);
-                        }
-                    } else {
-                        let record_pass = pass_map.get(&idx).copied().unwrap_or(false);
-                        if template_pass && record_pass {
-                            passed_count += 1;
-                            kept_records.push(record);
-                        } else if track_rejects {
-                            rejected_records.push(record);
-                        }
-                    }
-                }
-            }
-
-            Ok(FilterProcessedBatchRaw {
-                kept_records,
-                rejected_records,
-                records_count: total_records,
-                passed_count,
-                bases_masked,
-            })
-        };
-
-        self.run_filter_pipeline(pipeline_config, setup, reader, header, grouper_fn, process_fn)
-    }
-
-    /// Write filtering statistics to a file.
-    fn write_filter_stats(
-        &self,
-        path: &std::path::Path,
-        total: u64,
-        passed: u64,
-        failed: u64,
-    ) -> Result<()> {
-        use std::fs::File;
-        use std::io::Write;
-
-        let mut file = File::create(path)?;
-        writeln!(file, "total_reads\t{total}")?;
-        writeln!(file, "passed_reads\t{passed}")?;
-        writeln!(file, "failed_reads\t{failed}")?;
-        #[allow(clippy::cast_precision_loss)]
-        let pass_rate = if total > 0 { passed as f64 / total as f64 } else { 0.0 };
-        writeln!(file, "pass_rate\t{pass_rate:.4}")?;
-        Ok(())
-    }
-
     /// Process a single raw BAM record: reverse tags, mask bases, regenerate alignment
     /// tags, and check filters.
     ///
@@ -1318,40 +867,12 @@ impl Filter {
 
     /// Validates that parameter vectors have 1-3 values and are in valid ranges.
     ///
-    /// Delegates to [`FilterOptions::validate_parameters`] so the chain builder
-    /// and the non-chain run share one implementation.
+    /// Delegates to [`FilterOptions::validate_parameters`] so `execute`'s
+    /// pre-flight and the chain builder share one implementation.
     pub(crate) fn validate_parameters(&self) -> Result<()> {
         self.to_filter_options().validate_parameters()
     }
 }
-
-/// Advances the shared interim-progress `counter` by `records` and logs a
-/// "Processed N records" heartbeat when the running total crosses a
-/// 1,000,000-record boundary.
-///
-/// This is log-only — the authoritative record total is aggregated from each
-/// batch's `records_count` and logged at completion — so callers may batch the
-/// update coarsely to keep the shared atomic off the per-record hot path.
-fn advance_progress(counter: &AtomicU64, records: u64) {
-    let before = counter.fetch_add(records, Ordering::Relaxed);
-    if let Some(total) = progress_heartbeat_total(before, records) {
-        info!("Processed {total} records");
-    }
-}
-
-/// Returns the running total to announce in a "Processed N records" heartbeat
-/// when advancing the interim-progress counter from `before` by `records`, or
-/// `None` when the advance does not cross a 1,000,000-record boundary.
-///
-/// This is the pure boundary-crossing decision behind [`advance_progress`]'s
-/// heartbeat: a non-`None` result means a heartbeat should be emitted for that
-/// exact running total. Extracting it keeps the emit-or-not behavior directly
-/// testable without capturing log output.
-fn progress_heartbeat_total(before: u64, records: u64) -> Option<u64> {
-    let after = before + records;
-    if after / 1_000_000 > before / 1_000_000 { Some(after) } else { None }
-}
-
 #[cfg(test)]
 #[allow(clippy::float_cmp)]
 mod tests {
@@ -1458,44 +979,6 @@ mod tests {
     use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, aux_data_slice, flags};
     use noodles::sam::alignment::record_buf::RecordBuf;
     use rstest::rstest;
-
-    /// `advance_progress` accumulates exactly across successive batched advances,
-    /// regardless of whether any given advance crosses a heartbeat boundary. The
-    /// counter is the authoritative side of the function; the heartbeat cadence
-    /// is verified separately by [`test_progress_heartbeat_total`].
-    #[test]
-    fn test_advance_progress_accumulates_and_crosses_boundary() {
-        let counter = AtomicU64::new(0);
-        advance_progress(&counter, 1_000_000); // 0 -> 1_000_000: crosses, logs
-        assert_eq!(counter.load(Ordering::Relaxed), 1_000_000);
-        advance_progress(&counter, 5); // 1_000_000 -> 1_000_005: no crossing
-        assert_eq!(counter.load(Ordering::Relaxed), 1_000_005);
-        advance_progress(&counter, 1_000_000); // crosses again
-        assert_eq!(counter.load(Ordering::Relaxed), 2_000_005);
-    }
-
-    /// The heartbeat fires exactly when an advance crosses a 1,000,000-record
-    /// boundary, and reports the *running total* (not the batch size). Each case
-    /// mirrors a step of the accumulation walk plus the boundary edge cases:
-    /// a first crossing, a within-window increment that must stay silent, a
-    /// repeated crossing at the next boundary, a no-op advance, an advance that
-    /// lands exactly on a boundary, and a single advance that spans several
-    /// boundaries (still one heartbeat, at the final total).
-    #[rstest]
-    #[case::first_crossing(0, 1_000_000, Some(1_000_000))]
-    #[case::within_window_is_silent(1_000_000, 5, None)]
-    #[case::repeated_crossing(1_000_005, 999_995, Some(2_000_000))]
-    #[case::zero_advance_is_silent(1_000_005, 0, None)]
-    #[case::partial_within_window_is_silent(0, 999_999, None)]
-    #[case::lands_exactly_on_boundary(999_999, 1, Some(1_000_000))]
-    #[case::spans_multiple_boundaries(500_000, 2_500_000, Some(3_000_000))]
-    fn test_progress_heartbeat_total(
-        #[case] before: u64,
-        #[case] records: u64,
-        #[case] expected: Option<u64>,
-    ) {
-        assert_eq!(progress_heartbeat_total(before, records), expected);
-    }
 
     /// Helper function to create a Filter command with commonly used test defaults.
     fn create_filter_with_paths(input: PathBuf, output: PathBuf, reference: PathBuf) -> Filter {
@@ -3616,13 +3099,11 @@ mod tests {
         Ok(())
     }
 
-    /// Non-template filtering through the *multi-threaded* pipeline. With
-    /// `filter_by_template: false`, `build_filter_pipeline_config` leaves
-    /// `group_key_config = None`, so the threaded run must route records through
-    /// `SingleRawRecordGrouper` — which discards the decoded key entirely — and
-    /// filter each read independently. Every other non-template execution test
-    /// runs single-threaded, so this pins the `> 1`-thread path over that `None`
-    /// branch.
+    /// Non-template filtering through the *multi-threaded* chain. With
+    /// `filter_by_template: false`, the chain's single-read filter step filters
+    /// each record independently (no queryname grouping). Every other
+    /// non-template execution test runs the chain at a single worker, so this
+    /// pins the `> 1`-thread configuration of that single-read step.
     #[test]
     fn test_filter_execute_non_template_mode_multithreaded() -> Result<()> {
         let dir = TempDir::new()?;

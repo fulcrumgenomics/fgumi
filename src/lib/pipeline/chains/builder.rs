@@ -1140,10 +1140,10 @@ impl<'a> ChainBuilder<'a> {
     /// pass entirely; for a SAM-first sort that pass runs once per record in
     /// `ParseSamChunk` and would otherwise be pure waste. This changes only the
     /// discarded key, never the record bytes, so output is unchanged.
-    /// (The legacy single-threaded path uses `new_raw_no_cell`, which still
-    /// pays the combined aux pass; name-hash-only is strictly less work.) All
-    /// other first stages (group/dedup/consensus) need the full position/cell
-    /// key, so they fall through to [`Self::bam_group_key_config`].
+    /// (The full-key config `new_raw_no_cell` still pays the combined aux pass;
+    /// name-hash-only is strictly less work.) All other first stages
+    /// (group/dedup/consensus) need the full position/cell key, so they fall
+    /// through to [`Self::bam_group_key_config`].
     ///
     /// Every arm below uses a DEFAULT `LibraryIndex`, never `from_header`:
     /// `name_hash_only` never reads `library_index` (see `name_hash_key` in
@@ -1152,11 +1152,7 @@ impl<'a> ChainBuilder<'a> {
     /// `library_index` at all), so resolving it from the header is pure waste
     /// for these stages — and `LibraryIndex::from_header` panics on a header
     /// with more than 65,535 distinct `@RG` libraries, a needless crash risk
-    /// this avoids. (Some of these stages' serial oracles independently build
-    /// a full-header group key of their own — e.g. filter-by-template's
-    /// `build_filter_pipeline_config` calls `LibraryIndex::from_header` — so
-    /// this isn't "a panic the oracle never has"; it is simply dead work this
-    /// arm has no reason to repeat.)
+    /// this avoids.
     fn source_group_key_config(&self) -> fgumi_bam_io::GroupKeyConfig {
         match self.spec.stages.first() {
             Some(
@@ -4403,11 +4399,10 @@ impl<'a> ChainBuilder<'a> {
 
         // FILT3-02: filtering is template-based, so coordinate-sorted input
         // silently scatters mates and corrupts the both-primaries-pass logic.
-        // Reject it here exactly as `Filter::execute`'s legacy path does, so
-        // the two orchestrations of the filter stage cannot drift on accepted
-        // orders, error text, or logging (mirrors `add_group`'s
-        // `require_group_input_ordering` call, shared verbatim with
-        // `Group::execute`).
+        // Reject it on the chain — the only filter execution path — so filter
+        // rejects mis-ordered input before any record is processed (mirrors
+        // `add_group`'s `require_group_input_ordering` call, shared verbatim
+        // with `Group::execute`).
         crate::commands::common::require_query_grouped(
             &self.header,
             &input_path.display().to_string(),
