@@ -71,6 +71,18 @@ pub fn generate(
         }
     }
 
+    // NanoSeq sub-group
+    let nanoseq = [("Pipeline Guide", "guide/nanoseq.md")];
+    let nanoseq_exists = nanoseq.iter().any(|(_, p)| docs_src.join(p).exists());
+    if nanoseq_exists {
+        md.push_str("- [NanoSeq (Duplex-Seq)]()\n");
+        for (title, path) in &nanoseq {
+            if docs_src.join(path).exists() {
+                let _ = writeln!(md, "  - [{title}]({path})");
+            }
+        }
+    }
+
     // Advanced Topics sub-group
     let advanced = [
         ("Best Practices", "guide/best-practices.md"),
@@ -181,4 +193,48 @@ pub fn generate(
 
     fs::write(docs_src.join("SUMMARY.md"), md)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Generate `SUMMARY.md` for a docs tree that either has or lacks the
+    /// `NanoSeq` guide page, and return the markdown it wrote.
+    fn summary_with_nanoseq(present: bool) -> String {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let docs_src = tmp.path();
+        let guide_dir = docs_src.join("guide");
+        fs::create_dir_all(&guide_dir).expect("failed to create guide dir");
+        if present {
+            fs::write(guide_dir.join("nanoseq.md"), "# NanoSeq\n").expect("failed to write guide");
+        }
+        generate(docs_src, &[], &[]).expect("generate failed");
+        fs::read_to_string(docs_src.join("SUMMARY.md")).expect("failed to read SUMMARY.md")
+    }
+
+    #[test]
+    fn nanoseq_group_present_when_guide_exists() {
+        let md = summary_with_nanoseq(true);
+        assert!(md.contains("- [NanoSeq (Duplex-Seq)]()"), "missing NanoSeq group:\n{md}");
+        assert!(
+            md.contains("  - [Pipeline Guide](guide/nanoseq.md)"),
+            "missing NanoSeq guide link:\n{md}"
+        );
+    }
+
+    #[test]
+    fn nanoseq_group_absent_when_guide_missing() {
+        let md = summary_with_nanoseq(false);
+        assert!(
+            !md.contains("NanoSeq"),
+            "NanoSeq group should be omitted when guide is missing:\n{md}"
+        );
+        assert!(
+            !md.contains("guide/nanoseq.md"),
+            "NanoSeq link should be omitted when guide is missing:\n{md}"
+        );
+    }
 }
