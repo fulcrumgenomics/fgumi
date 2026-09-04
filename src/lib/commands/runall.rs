@@ -19,9 +19,10 @@ use anyhow::{Result, bail};
 use clap::Parser;
 
 use crate::assigner::Strategy;
+use crate::commands::command::Command;
 use crate::commands::common::{
-    CompressionOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions, SchedulerOptions,
-    StatsOptions, ThreadingOptions,
+    BamIoOptions, CompressionOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions,
+    SchedulerOptions, StatsOptions, ThreadingOptions,
 };
 
 /// Consensus mode selector for `runall`. Controls which consensus
@@ -291,11 +292,6 @@ impl std::fmt::Display for RunAllStage {
 ///
 /// Free function so the error-message Display formatting is unit-testable
 /// without constructing a full `RunAll`.
-///
-/// Not yet called outside tests: the `RunAll` struct and its
-/// `validate_strategy` wrapper land in a later task of this same PR-B
-/// campaign, at which point this has a production call site.
-#[allow(dead_code)]
 fn validate_strategy_for_mode(mode: RunAllMode, strategy: Strategy) -> Result<()> {
     match (mode, strategy) {
         (RunAllMode::Duplex, Strategy::Paired) => Ok(()),
@@ -915,10 +911,6 @@ impl RunAll {
     /// that actually reach consensus; `--stop-after sort`/`group`/`filter` are
     /// accepted stops that may not require it.
     ///
-    /// Not yet called outside tests: the production call site (the
-    /// stage-options-bag builder) lands in a later task of this same PR-B
-    /// campaign.
-    #[allow(dead_code)]
     pub(crate) fn require_consensus_mode(&self) -> Result<RunAllMode> {
         self.consensus_mode.ok_or_else(|| {
             anyhow::anyhow!(
@@ -942,11 +934,6 @@ impl RunAll {
     /// # Errors
     ///
     /// Returns `Err` if `--input` was not supplied.
-    ///
-    /// Not yet called outside tests: the production call sites (`execute`
-    /// and the stage-options-bag builder) land in a later task of this same
-    /// PR-B campaign.
-    #[allow(dead_code)]
     pub(crate) fn require_input(&self) -> Result<PathBuf> {
         self.input.clone().ok_or_else(|| {
             anyhow::anyhow!(
@@ -977,10 +964,6 @@ impl RunAll {
     /// # Errors
     ///
     /// Returns `Err` under the same conditions as [`validate_stages_for`].
-    ///
-    /// Not yet called outside tests: the production call site (`execute`)
-    /// lands in a later task of this same PR-B campaign.
-    #[allow(dead_code)]
     pub(crate) fn validate_stages(&self) -> Result<()> {
         validate_stages_for(self.start_from, self.stop_after_stage())
     }
@@ -992,10 +975,6 @@ impl RunAll {
     /// # Errors
     ///
     /// Returns `Err` under the same conditions as [`derive_stages_for`].
-    ///
-    /// Not yet called outside tests: the production call site (`execute`)
-    /// lands in a later task of this same PR-B campaign.
-    #[allow(dead_code)]
     pub(crate) fn derive_stages(&self) -> Result<Vec<crate::pipeline::chains::Stage>> {
         derive_stages_for(
             self.start_from,
@@ -1024,10 +1003,6 @@ impl RunAll {
     ///   `--extract::read-structures` of matching length.
     /// - `Zipper` start requires `--unmapped` and `--ref`; returns `Err` if
     ///   either is absent.
-    ///
-    /// Exercised directly by `source_tests` below; the production call site
-    /// (`execute`) lands in a later task of this same PR-B campaign.
-    #[allow(dead_code)]
     pub(crate) fn derive_source_spec(&self) -> Result<crate::pipeline::chains::SourceSpec> {
         use crate::pipeline::chains::SourceSpec;
         match self.start_from {
@@ -1101,12 +1076,71 @@ impl RunAll {
     ///
     /// Currently infallible; returns `Result` for API symmetry with the
     /// other `derive_*` helpers.
-    ///
-    /// Not yet called outside tests: the production call site (`execute`)
-    /// lands in a later task of this same PR-B campaign.
-    #[allow(dead_code)]
     pub(crate) fn derive_sink_spec(&self) -> Result<crate::pipeline::chains::SinkSpec> {
         Ok(crate::pipeline::chains::SinkSpec::Bam(self.output.clone()))
+    }
+
+    /// Validate the align-stage CLI surface without executing the chain.
+    /// Runs the same [`crate::aligner::AlignerOptions::resolve`] path the
+    /// eventual align step uses, so a misconfigured invocation fails before
+    /// any input is read AND produces the same error message users will see
+    /// at execute time.
+    ///
+    /// Called from [`Command::execute`] whenever the derived stage list
+    /// contains `Stage::Align`.
+    ///
+    /// # Errors
+    ///
+    /// - `--ref` not set (the aligner needs a reference path).
+    /// - `--methylation-mode` combined with an align-bearing chain (not yet
+    ///   supported; see the error message for the EM-seq workaround).
+    /// - No sequence-dictionary file (`.dict`) found next to `--ref`.
+    /// - `--aligner::preset` and `--aligner::command` both unset, or both
+    ///   set, or a preset-only flag paired with command mode, or preset-mode
+    ///   index files missing, or a command-mode template missing `{ref}`
+    ///   (delegated to [`crate::aligner::AlignerOptions::resolve`]).
+    pub(crate) fn validate_align_and_merge(&self) -> Result<()> {
+        let reference = self.reference.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "a runall chain that includes align requires --ref (the aligner \
+                 reference FASTA with its index files alongside)"
+            )
+        })?;
+        // `--methylation-mode` drives the *consensus* stage (which AAM never
+        // reaches alone) and would also conflict with the aligner's
+        // reference handling. Reject explicitly rather than silently ignore;
+        // methylation-aware AAM presets are a follow-up PR per the design doc.
+        if self.methylation_mode.is_some() {
+            bail!(
+                "--methylation-mode is not yet supported for runall chains that include \
+                 align. For EM-seq today, use `--aligner::command \"bwameth.py ...\"` (or \
+                 `bwa-mem3 --methylation-mode em-seq ...`) in command mode and apply \
+                 methylation downstream as a separate step."
+            );
+        }
+        // The downstream zipper-merge step needs a `.dict` file alongside
+        // the reference FASTA (used to populate the output BAM header).
+        // Validate up front so a missing `.dict` fails before the aligner
+        // runs — saves potentially hours of CPU.
+        if crate::reference::find_dict_path(reference).is_none() {
+            bail!(
+                "no sequence-dictionary file found next to --ref {} \
+                 (expected `<ref>.dict` or `<ref-without-extension>.dict`). \
+                 Generate one with `samtools dict {} -o <ref>.dict` before running \
+                 a runall chain that includes align.",
+                reference.display(),
+                reference.display(),
+            );
+        }
+        let top_threads = self.threading.num_threads();
+        // `resolve` consumes the options struct; we clone so the validator
+        // can be called multiple times if needed.
+        let _resolved = self.aligner_opts.clone().validate()?.resolve(
+            reference,
+            top_threads,
+            self.aligner_bin.as_deref(),
+        )?;
+        Ok(())
     }
 
     /// Build the [`StageOptionsBag`](crate::pipeline::chains::StageOptionsBag)
@@ -1177,10 +1211,6 @@ impl RunAll {
     /// `--methylation-mode` is combined with `Stage::Codec`, or if `stages`
     /// contains a stage `derive_stages` never emits for a runall chain (an
     /// internal-error bail naming the unexpected stage).
-    ///
-    /// Not yet called outside tests: the production call site (`execute`)
-    /// lands in a later task of this same PR-B campaign.
-    #[allow(dead_code)]
     pub(crate) fn build_stage_options_bag(
         &self,
         stages: &[crate::pipeline::chains::Stage],
@@ -1380,6 +1410,254 @@ impl RunAll {
         }
 
         Ok(bag)
+    }
+}
+
+impl Command for RunAll {
+    fn execute(&self, command_line: &str) -> Result<()> {
+        use crate::pipeline::chains::{ChainSpec, Stage};
+
+        let timer = crate::logging::OperationTimer::new(&format!(
+            "runall (--start-from {} --stop-after {})",
+            self.start_from,
+            self.stop_after_stage()
+        ));
+
+        // stdin is supported: the input flows into `SourceSpec::Bam`/`Fastqs`
+        // and is opened once via `InputSource::open` (BGZF/SAM auto-detected,
+        // stdin-aware). runall reads the source exactly once per run, so a
+        // streamed `-` works for every start stage.
+
+        self.validate_stages()?;
+
+        log::info!(
+            "Starting runall (--start-from {} --stop-after {})",
+            self.start_from,
+            self.stop_after_stage()
+        );
+        if let Some(input) = &self.input {
+            log::info!("Input: {}", input.display());
+        }
+        log::info!("Output: {}", self.output.display());
+
+        // Derive the ordered stage list for this (start_from, stop_after) pair.
+        let stages = self.derive_stages()?;
+
+        // `--ref` pairs with `--methylation-mode` for the consensus stages, but
+        // it is also legitimately consumed *without* methylation when the
+        // derived chain includes `Stage::Align` (the aligner reference) or
+        // starts at `zipper` (the FASTA + `.dict` for the output BAM header).
+        // For any other chain `--ref` is dead, so reject it without
+        // `--methylation-mode` rather than silently ignore it. Keyed on the
+        // derived chain — not the start stage — so a fused `extract`/`correct →
+        // … → align` run is exempted while a non-aligning chain (e.g.
+        // `correct → correct`) is not. This must run after `derive_stages()`.
+        let ref_is_consumed_without_methylation =
+            self.start_from == RunAllStage::Zipper || stages.contains(&Stage::Align);
+        if !ref_is_consumed_without_methylation
+            && self.reference.is_some()
+            && self.methylation_mode.is_none()
+        {
+            bail!("--ref requires --methylation-mode to be set");
+        }
+
+        // Symmetric guard for the *other* flag: in runall, `--methylation-mode`
+        // is wired only into the simplex/duplex consensus stages (see the
+        // `simplex_opts`/`duplex_opts` bag population in
+        // `build_stage_options_bag`; codec and align reject it with their own
+        // messages). On a chain that reaches no consensus stage (e.g.
+        // `group → group`, `correct → sort`) it is dead — silently ignored —
+        // so reject it rather than mislead. Align chains are exempt here:
+        // `validate_align_and_merge` (run just below for any chain containing
+        // `Stage::Align`) owns the align-specific EM-seq message, which is
+        // more actionable than this generic one.
+        let chain_reaches_consensus = stages.iter().any(|s| s.is_consensus());
+        let chain_includes_align = stages.contains(&Stage::Align);
+        // `--methylation-mode` on a simplex/duplex chain requires `--ref`: the
+        // consensus stage consumes the FASTA (via `consensus_reference()`), and
+        // the standalone contract (`--methylation-mode` doc, "requires --ref")
+        // demands it. Without this guard a non-align `group → simplex` run with
+        // `--methylation-mode` but no `--ref` slips through (the dead-consensus
+        // guard below does not fire because the chain *does* reach consensus),
+        // and `build_stage_options_bag()` then threads `methylation_mode =
+        // Some(...)` with `reference = None` into the stage — deferring the
+        // failure to a later, less actionable path. Codec is excluded (it
+        // rejects `--methylation-mode` outright below), and align chains are
+        // exempt (`validate_align_and_merge` owns the more specific message).
+        let chain_uses_methylation_capable_consensus =
+            stages.iter().any(|s| matches!(s, Stage::Simplex | Stage::Duplex));
+        if self.methylation_mode.is_some()
+            && chain_uses_methylation_capable_consensus
+            && !chain_includes_align
+            && self.reference.is_none()
+        {
+            bail!("--methylation-mode requires --ref to be set");
+        }
+        if self.methylation_mode.is_some() && !chain_reaches_consensus && !chain_includes_align {
+            bail!(
+                "--methylation-mode is only consumed by the consensus stage; \
+                 it is dead on a runall chain that stops before consensus"
+            );
+        }
+
+        // D12: log auto-inserted stages for extract-fed chains so users
+        // understand the chain expansion rules.
+        if self.start_from == RunAllStage::Extract {
+            if stages.contains(&Stage::Correct) {
+                log::info!(
+                    "Including Stage::Correct between Extract and downstream \
+                     (because --correct::umi-files or --correct::umis is set)"
+                );
+            }
+            if stages.contains(&Stage::Align) {
+                log::info!(
+                    "Including Stage::Align between Extract and downstream \
+                     (FASTQ source requires alignment)"
+                );
+            }
+            if stages.contains(&Stage::Sort) && self.start_from != RunAllStage::Sort {
+                log::info!(
+                    "Including Stage::Sort between Align and Group \
+                     (template-coordinate sort precedes Group)"
+                );
+            }
+        }
+
+        // Align-stage pre-flight: run `validate_align_and_merge` so that
+        // aligner option conflicts (preset vs command, missing --ref,
+        // --methylation-mode with AAM) are caught before the pipeline starts.
+        if stages.contains(&Stage::Align) {
+            self.validate_align_and_merge()?;
+        }
+
+        // Cross-stage validation: when Group feeds a consensus stage, the
+        // group strategy must be compatible with the consensus mode (e.g.
+        // duplex requires `--strategy paired`).
+        let has_group = stages.contains(&Stage::Group);
+        let has_consensus = stages.iter().any(|s| s.is_consensus());
+        if has_group && has_consensus {
+            let consensus_mode = self.require_consensus_mode()?;
+            let group_opts = self.group_opts.clone().validate()?;
+            validate_strategy_for_mode(consensus_mode, group_opts.strategy)?;
+            // Log group/consensus summary banner (mirrors old fused dispatcher).
+            log::info!("Strategy: {:?}, edits: {}", group_opts.strategy, group_opts.edits);
+        }
+
+        // Surface a warning if --rejects is set with --start-from
+        // extract/correct and a chained --stop-after. The fused chain uses
+        // the kept-only correct step (no UMI-rejects branch), so the rejects
+        // file collects only downstream rejects (post-consensus / etc.), not
+        // correct's UMI rejects. Users who need UMI rejects should stage a
+        // `fgumi correct --rejects` step separately.
+        if matches!(self.start_from, RunAllStage::Extract | RunAllStage::Correct)
+            && self.stop_after_stage() != RunAllStage::Correct
+            && self.rejects_opts.rejects.is_some()
+        {
+            log::warn!(
+                "--rejects with --start-from correct --stop-after {} discards correct's UMI rejects \
+                 (the fused chain has no UMI-rejects branch). The rejects file will collect only \
+                 downstream rejects. Use a separate `fgumi correct --rejects` step if you need \
+                 UMI rejects captured.",
+                self.stop_after_stage()
+            );
+        }
+
+        // Validate the input BAM exists, once every earlier guard (stage
+        // ordering, --ref/--methylation-mode, align pre-flight) has already
+        // passed — those checks are pure CLI-argument reasoning and should
+        // fail before we require any file to be present on disk.
+        // `--start-from extract` has no `--input` (FASTQ comes from
+        // `--extract::inputs`, validated in `derive_source_spec`), so this is
+        // conditional.
+        if let Some(input) = &self.input {
+            BamIoOptions::new(input, &self.output).validate()?;
+        }
+
+        // Construct the ChainSpec from the derived stages + spec-construction
+        // helpers. Build `source`/`sink`/`stage_opts` into locals FIRST — the
+        // bag borrows `stages`, so `stages` cannot be moved into the struct
+        // literal before that borrow is done with.
+        let verify_crc = match &self.input {
+            Some(p) => BamIoOptions::new(p, &self.output).effective_check_crc(),
+            // FASTQ source ignores verify_crc; value is inert.
+            None => true,
+        };
+        let source = self.derive_source_spec()?;
+        let sink = self.derive_sink_spec()?;
+        let stage_opts = self.build_stage_options_bag(&stages)?;
+
+        let spec = ChainSpec {
+            stages,
+            source,
+            sink,
+            stage_opts,
+            threading: self.threading.clone(),
+            compression: self.compression.clone(),
+            scheduler: self.scheduler_opts.clone(),
+            queue_memory: self.queue_memory.clone(),
+            async_reader: self.async_reader,
+            read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
+            verify_crc,
+            command_line: command_line.to_string(),
+        };
+
+        crate::pipeline::chains::build_for(spec)?.run()?;
+
+        timer.log_completion(0);
+        log::info!("runall completed successfully");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod execute_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn run(args: &[&str]) -> anyhow::Result<()> {
+        RunAll::try_parse_from(std::iter::once("runall").chain(args.iter().copied()))
+            .unwrap()
+            .execute("runall test")
+    }
+
+    #[test]
+    fn rejects_ref_without_methylation_on_nonalign_chain() {
+        let e = run(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "o.bam",
+            "--group::strategy",
+            "adjacency",
+            "--ref",
+            "ref.fa",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("--ref requires --methylation-mode"), "got: {e}");
+    }
+
+    #[test]
+    fn rejects_stop_after_align_at_clap_layer() {
+        // StopAfter has no `align` variant → clap rejects it before execute().
+        assert!(
+            RunAll::try_parse_from([
+                "runall",
+                "--start-from",
+                "align",
+                "--stop-after",
+                "align",
+                "-i",
+                "i.bam",
+                "-o",
+                "o.bam"
+            ])
+            .is_err()
+        );
     }
 }
 
