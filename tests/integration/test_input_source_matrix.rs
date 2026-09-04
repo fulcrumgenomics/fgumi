@@ -195,6 +195,22 @@ const CONTRACTS: &[IoContract] = &[
         stdout: Required,
         output_depends_on_input: Required,
     },
+    IoContract {
+        command: "runall",
+        sam: NotApplicable(
+            "reads a BAM/FASTQ intermediate selected by `--start-from`; it never constructs a \
+             SAM source",
+        ),
+        stdin: NotApplicable(
+            "its input contract is stage-dependent (`--start-from` selects FASTQ, BAM, or \
+             paired BAM), so this harness's bare `-i`/`-o` invocation cannot exercise it",
+        ),
+        stdout: NotApplicable(
+            "requires `--start-from`/`--stop-after`, which this harness does not supply, so it \
+             is not invoked here",
+        ),
+        output_depends_on_input: NotApplicable("declares no axis this harness invokes"),
+    },
     #[cfg(feature = "duplex")]
     IoContract {
         command: "duplex-metrics",
