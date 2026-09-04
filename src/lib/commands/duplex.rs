@@ -2564,4 +2564,29 @@ mod tests {
             .expect("valid");
         assert_eq!(multi.min_reads, vec![2, 3]);
     }
+
+    /// Guards the hand-written `impl Default for DuplexOptions` against
+    /// drifting from the standalone `duplex` command's
+    /// `#[arg(default_value...)]` literals.
+    #[test]
+    fn duplex_options_default_matches_cli_defaults() {
+        let parsed = Duplex::try_parse_from(["duplex", "-i", "in.bam", "-o", "o.bam"])
+            .expect("parses")
+            .to_duplex_options();
+        let d = DuplexOptions::default();
+        assert_eq!(d.error_rate_pre_umi, parsed.error_rate_pre_umi);
+        assert_eq!(d.error_rate_post_umi, parsed.error_rate_post_umi);
+        assert_eq!(d.min_input_base_quality, parsed.min_input_base_quality);
+        assert_eq!(d.output_per_base_tags, parsed.output_per_base_tags);
+        assert_eq!(d.trim, parsed.trim);
+        assert_eq!(d.min_consensus_base_quality, parsed.min_consensus_base_quality);
+        assert_eq!(d.consensus_call_overlapping_bases, parsed.consensus_call_overlapping_bases);
+        assert_eq!(d.min_reads, parsed.min_reads);
+        // Chain-engine skip field: no `--duplex::tie-rule` CLI flag exists to
+        // parse, so compare directly against the resolved default.
+        assert_eq!(d.tie_rule, fgumi_consensus::TieRule::default());
+        // Skip field: `AllowUnmappedOptions` has no `PartialEq`, so compare its
+        // `enabled` flag directly against the `#[arg(skip = ...)]` literal.
+        assert!(!d.allow_unmapped.enabled);
+    }
 }

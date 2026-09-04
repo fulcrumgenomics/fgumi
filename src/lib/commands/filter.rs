@@ -1605,6 +1605,31 @@ mod tests {
         );
     }
 
+    /// Guards the hand-written `impl Default for FilterOptions` against
+    /// drifting from the standalone `filter` command's
+    /// `#[arg(default_value...)]` literals. `--min-reads` has no CLI default
+    /// (it is required), so it is supplied but not asserted here.
+    #[test]
+    fn filter_options_default_matches_cli_defaults() {
+        let parsed = Filter::try_parse_from(["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1"])
+            .expect("parses")
+            .to_filter_options();
+        let d = FilterOptions::default();
+        assert_eq!(d.max_read_error_rate, parsed.max_read_error_rate);
+        assert_eq!(d.max_base_error_rate, parsed.max_base_error_rate);
+        assert_eq!(d.max_no_call_fraction, parsed.max_no_call_fraction);
+        assert_eq!(d.reverse_per_base_tags, parsed.reverse_per_base_tags);
+        assert_eq!(d.filter_by_template, parsed.filter_by_template);
+        assert_eq!(d.require_single_strand_agreement, parsed.require_single_strand_agreement);
+        assert_eq!(
+            d.require_strand_methylation_agreement,
+            parsed.require_strand_methylation_agreement
+        );
+        // Chain-engine skip field: resolved from `Option<MethylationModeArg>`
+        // on the standalone command, not from a CLI default literal.
+        assert_eq!(d.methylation_mode, fgumi_consensus::MethylationMode::Disabled);
+    }
+
     use crate::sam::SamTag;
     use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, aux_data_slice, flags};
     use noodles::sam::alignment::record_buf::RecordBuf;

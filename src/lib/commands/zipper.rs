@@ -5058,4 +5058,31 @@ mod tests {
             .expect("valid");
         assert_eq!(multi.buffer, 99);
     }
+
+    /// Guards the hand-written `impl Default for ZipperOptions` against
+    /// drifting from the standalone `zipper` command's
+    /// `#[arg(default_value...)]` literals.
+    #[test]
+    fn zipper_options_default_matches_cli_defaults() {
+        // NB: zipper's reference flag is --reference (short -r), NOT --ref.
+        let parsed = Zipper::try_parse_from([
+            "zipper",
+            "-i",
+            "m.bam",
+            "--unmapped",
+            "u.bam",
+            "--reference",
+            "r.fa",
+            "-o",
+            "o.bam",
+        ])
+        .expect("parses")
+        .to_zipper_options();
+        let d = ZipperOptions::default();
+        assert_eq!(d.buffer, parsed.buffer);
+        assert_eq!(d.bwa_chunk_size, parsed.bwa_chunk_size);
+        assert_eq!(d.exclude_missing_reads, parsed.exclude_missing_reads);
+        assert_eq!(d.skip_tc_tags, parsed.skip_tc_tags);
+        assert_eq!(d.restore_unconverted_bases, parsed.restore_unconverted_bases);
+    }
 }

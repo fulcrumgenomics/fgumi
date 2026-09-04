@@ -2431,4 +2431,30 @@ mod tests {
             "error should name --simplex::min-reads: {msg}"
         );
     }
+
+    /// Guards the hand-written `impl Default for SimplexOptions` against
+    /// drifting from the standalone `simplex` command's
+    /// `#[arg(default_value...)]` literals. `--min-reads` has no CLI default
+    /// (it is required), so it is supplied but not asserted here.
+    #[test]
+    fn simplex_options_default_matches_cli_defaults() {
+        let parsed =
+            Simplex::try_parse_from(["simplex", "-i", "in.bam", "-o", "o.bam", "--min-reads", "3"])
+                .expect("parses")
+                .to_simplex_options();
+        let d = SimplexOptions::default();
+        assert_eq!(d.error_rate_pre_umi, parsed.error_rate_pre_umi);
+        assert_eq!(d.error_rate_post_umi, parsed.error_rate_post_umi);
+        assert_eq!(d.min_input_base_quality, parsed.min_input_base_quality);
+        assert_eq!(d.output_per_base_tags, parsed.output_per_base_tags);
+        assert_eq!(d.trim, parsed.trim);
+        assert_eq!(d.min_consensus_base_quality, parsed.min_consensus_base_quality);
+        assert_eq!(d.consensus_call_overlapping_bases, parsed.consensus_call_overlapping_bases);
+        // Chain-engine skip field: no `--simplex::tie-rule` CLI flag exists to
+        // parse, so compare directly against the resolved default.
+        assert_eq!(d.tie_rule, fgumi_consensus::TieRule::default());
+        // Skip field: `AllowUnmappedOptions` has no `PartialEq`, so compare its
+        // `enabled` flag directly against the `#[arg(skip = ...)]` literal.
+        assert!(!d.allow_unmapped.enabled);
+    }
 }
