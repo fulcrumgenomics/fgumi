@@ -1767,6 +1767,43 @@ mod tests {
         assert!(multi.verify, "--group::verify=true must round-trip to verify=true");
     }
 
+    /// Guards the hand-written `impl Default for GroupOptions` against
+    /// drifting from the standalone `group` command's
+    /// `#[arg(default_value...)]`/`default_value_t` literals. `--strategy` has
+    /// no CLI default (it is required), so it is supplied but not asserted
+    /// here. `effective_strategy`/`effective_edits` are the deliberate PR-A
+    /// skip-default (`Strategy::Identity`/0), asserted directly rather than against
+    /// `parsed` (which resolves them via `to_group_options`).
+    #[test]
+    fn group_options_default_matches_cli_defaults() {
+        let parsed = GroupReadsByUmi::try_parse_from([
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "o.bam",
+            "-s",
+            "adjacency",
+        ])
+        .expect("parses")
+        .to_group_options();
+        let d = GroupOptions::default();
+        assert_eq!(d.min_map_q, parsed.min_map_q);
+        assert_eq!(d.include_non_pf_reads, parsed.include_non_pf_reads);
+        assert_eq!(d.allow_unmapped, parsed.allow_unmapped);
+        assert_eq!(d.edits, parsed.edits);
+        assert_eq!(d.min_umi_length, parsed.min_umi_length);
+        assert_eq!(d.index_threshold, parsed.index_threshold);
+        assert_eq!(d.no_umi, parsed.no_umi);
+        assert_eq!(d.parallel_group_min_templates, parsed.parallel_group_min_templates);
+        assert_eq!(d.family_size_histogram, parsed.family_size_histogram);
+        assert_eq!(d.grouping_metrics, parsed.grouping_metrics);
+        assert_eq!(d.metrics_prefix, parsed.metrics_prefix);
+        assert_eq!(d.verify, parsed.verify);
+        assert_eq!(d.effective_strategy, Strategy::Identity);
+        assert_eq!(d.effective_edits, 0);
+    }
+
     use crate::assigner::{IdentityUmiAssigner, PairedUmiAssigner, Strategy};
     use crate::metrics::TemplateFilterReason;
     use bstr::BString;
