@@ -1891,7 +1891,7 @@ impl ExtractRunallOptions {
     /// rejects `conflicts_with` on a `multi_options` struct, so those two
     /// checks are re-implemented here by hand.
     ///
-    /// This method does NOT re-implement the rest of [`Extract::validate`] —
+    /// This method does NOT re-implement the rest of `Extract::validate` —
     /// the template-count-1-to-2 check, the `--single-tag` reserved-tag
     /// collision check, the read-structure-non-empty check, or the
     /// input/read-structure count and stdin/file-existence checks. Those all
