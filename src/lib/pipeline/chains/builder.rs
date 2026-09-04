@@ -1901,9 +1901,16 @@ impl<'a> ChainBuilder<'a> {
     /// `self.header` is the input header (correct preserves input order and does
     /// not replace `self.header` with a consensus header), so it is used as-is.
     ///
-    /// Registers a [`CorrectFinalizeHook`] for: per-thread accumulator reduce →
-    /// `finalize_metrics` → summary + warn banners → `--min-corrected` ratio
-    /// gate (bail!) → `timer.log_completion`.
+    /// Registers two finalize hooks. Always-run: [`CorrectFinalizeHook`]
+    /// (per-thread counter reduce → summary → warn banners →
+    /// `timer.log_completion`). Success-only: [`CorrectMetricsFinalizeHook`],
+    /// which writes the `--metrics` TSV FIRST and then, only when
+    /// `--min-corrected` was given, enforces the ratio gate. That ordering
+    /// matches fgbio: `CorrectUmis` writes its metrics before checking the
+    /// `--min-corrected` ratio, so a ratio-below-floor failure is not treated
+    /// as a processing failure and still leaves the metrics file in place. A
+    /// genuine pipeline processing failure skips `finalize_on_success`
+    /// entirely, withholding the metrics write (and thus the gate never runs).
     /// The chain-level [`StageTimingFinalizeHook`] is registered by
     /// [`Self::build`] (not here), so it captures the correct `Instant`.
     ///
@@ -1915,13 +1922,16 @@ impl<'a> ChainBuilder<'a> {
     /// [`EncodedUmiSet`]: crate::commands::correct::EncodedUmiSet
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
     /// [`CorrectFinalizeHook`]: crate::pipeline::chains::commands::correct::CorrectFinalizeHook
+    /// [`CorrectMetricsFinalizeHook`]: crate::pipeline::chains::commands::correct::CorrectMetricsFinalizeHook
     #[allow(clippy::too_many_lines)]
     fn add_correct(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::warn_unwired_pipeline_flags;
         use crate::commands::correct::{CollectedCorrectMetrics, EncodedUmiSet};
         use crate::logging::OperationTimer;
         use crate::per_thread_accumulator::PerThreadAccumulator;
-        use crate::pipeline::chains::commands::correct::CorrectFinalizeHook;
+        use crate::pipeline::chains::commands::correct::{
+            CorrectFinalizeHook, CorrectMetricsFinalizeHook,
+        };
         use crate::pipeline::steps::correct::{
             CorrectStepConfig, correct_step_kept_only, correct_step_with_rejects,
         };
@@ -2059,19 +2069,28 @@ impl<'a> ChainBuilder<'a> {
             self.chain_tail_kind = ChainTailKind::BamTemplateBatch;
         }
 
-        // Register the correct finalize hook.
+        // Register the correct finalize hooks.
         // The chain-level StageTimingFinalizeHook is inserted at index 0 by
         // build() after all stages have been added — that way a single timer
         // covers the full pipeline run regardless of how many stages there are.
-        self.finalize.push(Box::new(CorrectFinalizeHook {
-            metrics,
-            records_emitted,
+
+        // Success-only: writes the --metrics TSV, THEN (only when
+        // --min-corrected was given) enforces the ratio gate -- in that exact
+        // order, within one hook. This matches fgbio: a ratio-below-floor
+        // failure is not a processing failure, so the metrics file must
+        // already be on disk by the time the gate can error. Skipped
+        // entirely on a genuine pipeline failure, since finalize_on_success
+        // does not run at all in that case.
+        self.finalize_on_success.push(Box::new(CorrectMetricsFinalizeHook {
+            metrics: Arc::clone(&metrics),
+            records_emitted: Arc::clone(&records_emitted),
             encoded_umi_set,
             unmatched_umi,
-            min_corrected: correct_opts.min_corrected,
             correct: correct_opts.clone(),
-            timer,
         }));
+        // Always-run: summary + warn banners + timer completion. No longer
+        // includes the --min-corrected gate (see above).
+        self.finalize.push(Box::new(CorrectFinalizeHook { metrics, records_emitted, timer }));
 
         Ok(())
     }
