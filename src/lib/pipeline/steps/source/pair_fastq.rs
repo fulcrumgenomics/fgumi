@@ -367,10 +367,16 @@ impl Step2 for PairRawFastq {
 /// records first (0 = R1/A, 1 = R2/B) and `chunk_serial` is the orphaned serial
 /// still holding only the other stream's chunk.
 ///
-/// Shared by both fail paths — the both-drained [`PairRawFastq::finalize_pairs`]
-/// desync report and the over-backpressure mid-stream fail-fast — so the two
-/// surface byte-for-byte identical diagnostics regardless of which path detects
-/// the mismatch.
+/// Shared by both of `PairRawFastq`'s fail paths — the both-drained
+/// [`PairRawFastq::finalize_pairs`] desync report and the over-backpressure
+/// mid-stream fail-fast — so those two sites surface byte-for-byte identical
+/// diagnostics within this step. That guarantee is scoped to this file: it does
+/// NOT extend to the other FASTQ-pairing implementations (the serial oracle in
+/// `grouper.rs`, the zip path in `zip_fastq.rs` / `parse_zip_fastq.rs`, and the
+/// unified-pipeline path in `unified_pipeline/fastq.rs`). Every path detects the
+/// same out-of-sync CONDITION — one stream's records running out before its
+/// mate's — but each words its own diagnostic independently, so the exact
+/// message text differs by path.
 fn out_of_sync_error(short_stream: usize, chunk_serial: u64) -> io::Error {
     // Name streams R1/R2 (1-based) and the short one as having "ended before" the
     // other, matching the serial oracle's wording so the operator learns which

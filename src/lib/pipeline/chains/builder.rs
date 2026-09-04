@@ -3014,12 +3014,11 @@ impl<'a> ChainBuilder<'a> {
         if group.no_umi {
             info!("No-UMI mode: grouping by position only");
         }
-        if matches!(
+        crate::commands::common::log_index_threshold(
             group.effective_strategy,
-            crate::assigner::Strategy::Adjacency | crate::assigner::Strategy::Paired
-        ) {
-            info!("Index threshold: {}", group.index_threshold);
-        }
+            group.effective_edits,
+            group.index_threshold,
+        );
         if group.allow_unmapped {
             info!("Allow unmapped: enabled (unmapped templates will be grouped by UMI only)");
             warn!(
@@ -4766,9 +4765,11 @@ impl<'a> ChainBuilder<'a> {
         if dedup.no_umi {
             info!("No-UMI mode: deduplicating by position only");
         }
-        if matches!(effective_strategy, Strategy::Adjacency | Strategy::Paired) {
-            info!("Index threshold: {}", dedup.index_threshold);
-        }
+        crate::commands::common::log_index_threshold(
+            effective_strategy,
+            effective_edits,
+            dedup.index_threshold,
+        );
 
         warn_unwired_pipeline_flags(&self.spec.scheduler);
         let num_threads = self.spec.threading.num_threads();

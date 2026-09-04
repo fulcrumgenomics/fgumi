@@ -9,9 +9,11 @@
 
 pub mod assertions;
 pub mod bam_generator;
+pub mod cli;
 
 pub use assertions::*;
 pub use bam_generator::*;
+pub use cli::*;
 
 /// Writes `contents` to `dir/name` and returns the path.
 ///

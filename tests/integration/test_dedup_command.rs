@@ -24,6 +24,7 @@ use tempfile::TempDir;
 
 use crate::helpers::assertions::assert_bam_sorted;
 use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
+use crate::helpers::cli::run_and_capture_logs;
 
 /// Create a template-coordinate sorted BAM with UMI-tagged reads.
 ///
@@ -1851,6 +1852,80 @@ fn test_dedup_accepts_index_threshold_never() {
     // One template is the primary; the other two pairs are marked duplicates.
     let duplicates = never.iter().filter(|(_, flags, _)| flags & flags::DUPLICATE != 0).count();
     assert_eq!(duplicates, 4, "two of the three pairs must be marked duplicate: {never:?}");
+}
+
+/// The chain (`--threads N`) dedup path's `Index threshold:` startup banner must
+/// be strategy/edits-aware, matching the non-chain path's
+/// `common::log_index_threshold` wording exactly (see
+/// `test_index_threshold_log_message` in `commands::common` for the full case
+/// table) -- not the flat `Index threshold: {dedup.index_threshold}` (the raw
+/// `--index-threshold` value, unfloored) the chain path used to emit whenever
+/// `matches!(effective_strategy, Strategy::Adjacency | Strategy::Paired)`.
+///
+/// `old_flat_regression_line` is `Some(line)` only when the OLD `matches!`-gated
+/// flat `info!` would actually have printed something distinguishable from the
+/// NEW correct output for that case's exact config -- i.e. a string that WOULD
+/// reappear if `add_dedup` regressed back to the flat banner. It is `None` for
+/// the `edit`-strategy cases: the old `matches!` guard excluded `Edit`
+/// unconditionally (regardless of `--edits`/`--index-threshold`), so old code
+/// printed no `Index threshold:` line at all there -- the positive assertion
+/// alone (expecting a line that old code never emitted) already catches a
+/// regression, and asserting the absence of some placeholder string would be
+/// vacuous (never true or false, since the string was never on the table).
+#[rstest]
+#[case::edit_off_its_indexing_edits_reports_not_used(
+    &["--threads", "1", "--strategy", "edit", "--edits", "2"],
+    "Index threshold: not used (edit indexes only at --edits 1)",
+    None
+)]
+#[case::adjacency_off_its_indexing_edits_reports_not_used(
+    &["--threads", "1", "--strategy", "adjacency", "--edits", "2"],
+    "Index threshold: not used (adjacency indexes only at --edits 1)",
+    // Old code: `matches!(Adjacency, Adjacency | Paired)` is true, so it printed
+    // the raw `--index-threshold` (default 100) verbatim -- misleadingly implying
+    // the index is consulted at 2 mismatches, when adjacency only ever indexes at
+    // exactly 1.
+    Some("Index threshold: 100")
+)]
+#[case::edit_at_one_mismatch_reports_the_edit_floored_value(
+    &["--threads", "1", "--strategy", "edit", "--edits", "1", "--index-threshold", "50"],
+    "Index threshold: 200 (edit)",
+    None
+)]
+#[case::adjacency_default_edits_one_reports_the_flag_verbatim(
+    // CLI defaults: --strategy adjacency --edits 1 --index-threshold 100.
+    &["--threads", "1"],
+    "Index threshold: 100",
+    // Old code prints the SAME text here: Adjacency/Paired at edits == 1 report
+    // the raw flag verbatim in both old and new code (this is the one branch FIX
+    // A left byte-identical to the old flat banner), so there is no distinct
+    // flat-regression string to guard against -- this case instead pins that the
+    // ordinary default path still reports the plain numeric threshold, unfloored
+    // and un-annotated.
+    None
+)]
+fn test_dedup_chain_index_threshold_banner_is_strategy_aware(
+    #[case] extra_args: &[&str],
+    #[case] expected_line: &str,
+    #[case] old_flat_regression_line: Option<&str>,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    create_sorted_bam(&input_bam, create_duplicate_group("banner", "ACGTACGT", 2, 100));
+
+    let stderr = run_and_capture_logs("dedup", &input_bam, &output_bam, extra_args);
+    assert!(
+        stderr.lines().any(|line| line.contains(expected_line)),
+        "expected a line containing {expected_line:?}; got:\n{stderr}"
+    );
+    if let Some(old_line) = old_flat_regression_line {
+        assert!(
+            !stderr.lines().any(|line| line.trim_end() == old_line),
+            "must not emit {old_line:?}, the pre-fix flat, strategy-unaware banner \
+             for this exact config; got:\n{stderr}"
+        );
+    }
 }
 
 /// Corrupt the CRC32 footer of the LAST non-EOF BGZF block in `path`, in place.

@@ -16,6 +16,7 @@ use std::path::Path;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, transcode_bam_to_sam, write_bam};
+use crate::helpers::cli::run_and_capture_logs;
 
 /// A minimal mapped record carrying the given read name (sequence/quals are fixed
 /// filler — `copy-umi` never touches them).
@@ -499,6 +500,77 @@ fn runs_on_multiple_threads() {
     assert_eq!(
         rows, want,
         "the parallel path must preserve every record's QNAME and its copied RX, in input order"
+    );
+}
+
+// ============================================================================
+// Unwired scheduler/pipeline flags must warn on BOTH the chain and serial paths
+// ============================================================================
+
+/// Unwired scheduler/pipeline-queue flags must warn on BOTH the `--threads N`
+/// chain path and the no-`--threads` serial path -- but with DIFFERENT wording,
+/// since the two paths are unwired for different reasons and the warning must
+/// stay true to whichever one is actually running:
+///
+/// * Chain path (`execute_chain` -> `add_copy_umi` ->
+///   `common::warn_unwired_pipeline_flags`): `--deadlock-recover`/`--scheduler`
+///   are inert because the typed-step engine has no pluggable scheduler and no
+///   deadlock-recovery mechanism to enable. `--max-memory` etc. are NOT warned
+///   here -- the chain DOES honor them (`PipelineConfig::queue_memory_total`).
+/// * Serial path (`CopyUmi::warn_unwired_flags_on_serial_path`): ALL THREE are
+///   inert, because there is no chain/pipeline at all on this path -- only a
+///   plain read -> copy-umi -> write loop with no scheduler, no deadlock
+///   detector, and no queues to budget.
+///
+/// `--max-memory`/`--scheduler` on the serial path is what regresses if
+/// `warn_unwired_flags_on_serial_path` is reverted to reusing
+/// `common::warn_unwired_pipeline_flags` (issue: that reuse asserted a false
+/// "chain engine" rationale on a path with no chain engine, AND silently
+/// skipped the queue-memory flags, which -- unlike on the chain path -- really
+/// are inert here).
+#[rstest]
+#[case::deadlock_recover_serial(
+    &["--deadlock-recover"],
+    &[],
+    "--deadlock-recover has no effect on the single-threaded path"
+)]
+#[case::deadlock_recover_threads(
+    &["--deadlock-recover"],
+    &["--threads", "1"],
+    "--deadlock-recover has no effect in the typed-step pipeline"
+)]
+#[case::scheduler_serial(
+    &["--scheduler", "fixed-priority"],
+    &[],
+    "--scheduler has no effect on the single-threaded path"
+)]
+#[case::scheduler_threads(
+    &["--scheduler", "fixed-priority"],
+    &["--threads", "1"],
+    "--scheduler has no effect in the typed-step pipeline"
+)]
+#[case::queue_memory_serial(
+    &["--max-memory", "100M"],
+    &[],
+    "--max-memory/--memory-reserve/--memory-per-thread have no effect on the \
+     single-threaded path"
+)]
+fn unwired_pipeline_flags_warn_with_path_appropriate_wording(
+    #[case] flag_args: &[&str],
+    #[case] thread_args: &[&str],
+    #[case] expected_substring: &str,
+) {
+    let dir = TempDir::new().unwrap();
+    let input = write_input(dir.path(), &[record_named("blah:AAAA")]);
+    let output = dir.path().join("out.bam");
+
+    let mut extra_args: Vec<&str> = flag_args.to_vec();
+    extra_args.extend_from_slice(thread_args);
+    let stderr = run_and_capture_logs("copy-umi", &input, &output, &extra_args);
+
+    assert!(
+        stderr.lines().any(|line| line.contains(expected_substring)),
+        "expected a line containing {expected_substring:?}; got:\n{stderr}"
     );
 }
 
