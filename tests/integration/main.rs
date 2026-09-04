@@ -46,6 +46,7 @@ mod test_pipeline_memory_backpressure;
 mod test_retag_command;
 mod test_review_command;
 mod test_runall_chain_transitions;
+mod test_runall_command;
 mod test_sam_input;
 #[cfg(feature = "simplex")]
 mod test_simplex_command;
