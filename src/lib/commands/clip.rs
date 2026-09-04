@@ -8,7 +8,6 @@ use crate::alignment_tags::regenerate_alignment_tags_raw;
 use crate::clipper::{ClippingMode, RawRecordClipper};
 use crate::logging::OperationTimer;
 use crate::metrics::clip::{ClipCounts, ClippingMetricsCollection};
-use crate::metrics::writer::write_metrics as write_metrics_tsv;
 use crate::reference::ReferenceReader;
 use crate::sam::SamTag;
 use crate::template::{InsertSizeEnd, TemplateIterator, compute_insert_size_from_ends};
@@ -119,8 +118,8 @@ pub struct Clip {
     #[arg(short = 'a', long = "auto-clip-attributes", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub auto_clip_attributes: bool,
 
-    /// Output file for clipping metrics (only produced by the single-threaded path; cannot be
-    /// combined with --threads)
+    /// Output file for clipping metrics (produced on both the single-threaded and
+    /// --threads paths)
     #[arg(short = 'm', long = "metrics")]
     pub metrics: Option<PathBuf>,
 
@@ -202,8 +201,10 @@ impl ClipParams {
     ///
     /// This is the single shared implementation used by both the single-threaded and
     /// multi-threaded clip paths. When `metrics` is `Some`, per-read base-clip counts are
-    /// accumulated (single-threaded metrics output); the multi-threaded path passes `None` and
-    /// relies solely on the returned per-template flags.
+    /// accumulated into it. The single-threaded path always passes a collector when
+    /// `--metrics` is set; the multi-threaded path passes the calling worker's
+    /// `PerThreadAccumulator` slot when `--metrics` is set and `None` otherwise, relying
+    /// solely on the returned per-template flags for its atomic summary counters.
     ///
     /// Returns `(overlap_clipped, extend_clipped)`: whether overlap and/or mate-extension
     /// clipping removed any bases from the pair. A lone fragment returns `(false, false)`, as do
@@ -482,24 +483,12 @@ impl Command for Clip {
             anyhow::bail!("At least one clipping option is required");
         }
 
-        // --metrics is not produced in --threads mode; fail fast rather than
-        // silently dropping a user-requested output file. Reader-free, so it runs
-        // before the chain dispatch below (add_clip re-checks it, but failing here
-        // keeps the error identical whether or not the chain path is taken).
-        if self.threading.threads.is_some()
-            && let Some(path) = &self.metrics
-        {
-            anyhow::bail!(
-                "--metrics {} cannot be used with --threads: detailed clipping metrics \
-                     are only produced by the single-threaded path",
-                path.display()
-            );
-        }
-
         // --threads N: run the clip stage on the declarative chain builder. Dispatch
-        // here — after the reader-free pre-flight above (output collisions, input +
-        // reference existence, clipping-option and --metrics validation), which must
-        // run for both paths — but BEFORE the banner / timer / reader below.
+        // here — after the reader-free pre-flight above (output collisions, including
+        // --metrics; input + reference existence; clipping-option validation), which
+        // must run for both paths — but BEFORE the banner / timer / reader below.
+        // `--metrics` itself is no longer rejected under `--threads`: `add_clip`
+        // collects detailed metrics on the chain path too (see `execute_chain`).
         // execute_chain → add_clip re-emits the banner, timer, and threading log
         // lines, re-enforces require_query_grouped, and opens its own source, so
         // running them here too would double-log and pre-consume stdin. The
@@ -533,12 +522,15 @@ impl Clip {
     /// (`ChainSpec::single_stage(Stage::Clip, ...)` → `build_for(spec)?.run()`).
     ///
     /// `add_clip` opens its own source, re-emits the timer/banner/threading log
-    /// lines, reloads the reference, re-validates the clipping options and the
-    /// `--metrics`/`--threads` combination, and re-enforces `require_query_grouped`,
-    /// so none of those may run again here — only the CRC-verify status line, which
-    /// `add_clip` does not re-emit. The no-`--threads` path in `execute` keeps its
-    /// own single-threaded engine, which is the in-process parity oracle for this
-    /// one (see `test_clip_chain_matches_single_threaded`).
+    /// lines, reloads the reference, re-validates the clipping options, and
+    /// re-enforces `require_query_grouped`, so none of those may run again here —
+    /// only the CRC-verify status line, which `add_clip` does not re-emit. The
+    /// no-`--threads` path in `execute` keeps its own single-threaded engine,
+    /// which is the in-process parity oracle for this one (see
+    /// `test_clip_chain_matches_single_threaded`). `--metrics` is produced on both
+    /// paths: `add_clip` builds a per-thread `ClippingMetricsCollection`
+    /// accumulator when `self.metrics.is_some()` and reduces it in a
+    /// success-only finalize hook.
     fn execute_chain(&self, command_line: &str) -> Result<()> {
         use crate::pipeline::chains::{
             ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
@@ -653,15 +645,14 @@ impl Clip {
         info!("Templates with overlap clipping: {total_clipped_overlap}");
         info!("Templates with mate extension clipping: {total_clipped_mate_extension}");
 
-        // Write metrics if requested
+        // Write metrics if requested. `finalize_and_write` (shared with the chain
+        // `--threads` path's `ClipMetricsFinalizeHook`) aggregates pair/all and
+        // writes the TSV in one call, so the two paths' metrics output cannot drift.
         if let Some(metrics_path) = &self.metrics
             && let Some(mut metrics) = metrics_collection
         {
-            info!("Writing metrics to {}", metrics_path.display());
-            metrics.finalize();
-            let all_metrics = metrics.all_metrics().map(Clone::clone);
-            write_metrics_tsv(metrics_path, &all_metrics, "clipping")?;
-            info!("Metrics written successfully");
+            metrics.finalize_and_write(metrics_path)?;
+            info!("Wrote metrics to: {}", metrics_path.display());
         }
 
         // Flush and finish the writer
