@@ -424,6 +424,34 @@ impl DuplexOptions {
             consensus_call_overlapping_bases: self.consensus_call_overlapping_bases,
         }
     }
+
+    /// Validate the numeric bounds fgbio's `CallDuplexConsensusReads` enforces:
+    /// both pre- and post-UMI Phred error rates strictly greater than zero, the
+    /// `--min-reads` ordering rule (each value no larger than the one before it),
+    /// and a `--max-reads-per-strand` of at least one. A rate of Q0 corresponds
+    /// to `P(error) = 1` (nonsensical as a prior) and a cap of 0 empties every
+    /// strand, so no molecule can produce a consensus (a silent empty BAM).
+    ///
+    /// Shared by `Duplex::validate` (the standalone CLI path) and the runall
+    /// duplex arm, so both reject the same degenerate configs from one guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if either error rate is 0, if `--min-reads` violates the
+    /// ordering rule, or if `--max-reads-per-strand` is `Some(0)`.
+    pub fn validate_numeric(&self) -> Result<()> {
+        if self.error_rate_pre_umi == 0 {
+            bail!("error-rate-pre-umi must be > 0");
+        }
+        if self.error_rate_post_umi == 0 {
+            bail!("error-rate-post-umi must be > 0");
+        }
+        DuplexConsensusCaller::validate_min_reads(&self.min_reads)?;
+        if self.max_reads_per_strand == Some(0) {
+            bail!("--max-reads-per-strand must be >= 1");
+        }
+        Ok(())
+    }
 }
 
 impl Command for Duplex {
@@ -812,12 +840,6 @@ impl Duplex {
     /// a prior and would corrupt the duplex consensus quality model, so fgbio
     /// rejects it (`CallDuplexConsensusReads.scala:131-132`).
     fn validate(&self) -> Result<()> {
-        if self.consensus.error_rate_pre_umi == 0 {
-            bail!("error-rate-pre-umi must be > 0");
-        }
-        if self.consensus.error_rate_post_umi == 0 {
-            bail!("error-rate-post-umi must be > 0");
-        }
         // `--min-reads` is deliberately not bounded below, matching fgbio, which validates
         // only the ordering -- each value no larger than the one before it
         // (`total >= XY >= YX`). A 0 in the per-strand slots is fgbio's single-strand mode
@@ -832,19 +854,18 @@ impl Duplex {
         // caller inside the pipeline's per-batch closure, i.e. after the output BAM has
         // been created, so relying on the constructor alone would turn an argument error
         // into a mid-run worker failure that leaves a partial output file behind.
-        DuplexConsensusCaller::validate_min_reads(&self.min_reads)?;
-
+        //
         // `--max-reads-per-strand 0` empties every strand, so no molecule can produce a
         // consensus. fgbio failed deep in consensus calling with a bare
         // `IllegalArgumentException` (fixed in fulcrumgenomics/fgbio#1166); fgumi was quieter
-        // still, exiting 0 having written an empty BAM. Only a lower bound is checked here,
+        // still, exiting 0 having written an empty BAM. Only a lower bound is checked,
         // matching fgbio: unlike `simplex` and `codec`, duplex cannot compare the cap against
         // `--min-reads` (a vector with its own ordering rule), and a cap below it is already
         // handled gracefully -- `consensus_call` returns no consensus rather than panicking.
-        if self.max_reads_per_strand == Some(0) {
-            bail!("--max-reads-per-strand must be >= 1");
-        }
-        Ok(())
+        //
+        // All of these numeric guards live on [`DuplexOptions::validate_numeric`] so the
+        // runall duplex arm reuses the exact same checks.
+        self.to_duplex_options().validate_numeric()
     }
 
     /// Whether a molecule seen on only one strand can still yield a consensus, i.e. whether
