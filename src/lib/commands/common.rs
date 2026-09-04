@@ -967,11 +967,11 @@ impl ThreadingMode {
 /// ```
 #[derive(Debug, Clone, Args)]
 pub struct ThreadingOptions {
-    /// Number of threads for the multi-threaded pipeline.
+    /// Number of worker threads for the processing pipeline.
     ///
-    /// If not specified, uses a single-threaded fast path optimized for
-    /// simple streaming. When specified (even with --threads 1), uses the
-    /// 7-step parallel pipeline with work-stealing scheduler.
+    /// If not specified, the command runs at a single worker. When specified
+    /// (even with --threads 1), it runs the multi-worker pipeline with a
+    /// work-stealing scheduler, capping total threads at N.
     #[arg(long = "threads")]
     pub threads: Option<usize>,
 }
