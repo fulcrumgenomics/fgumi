@@ -171,7 +171,7 @@ pub enum RunAllStage {
 ///
 /// Convert to [`RunAllStage`] with `RunAllStage::from(stop)` /
 /// `stop.into()`; the two enums are kept in sync by
-/// `stop_after_values_are_runallstage_minus_align`.
+/// `stopafter_maps_to_runallstage_minus_align`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[clap(rename_all = "kebab-case")]
 pub enum StopAfter {
@@ -233,12 +233,6 @@ impl RunAllStage {
     #[must_use]
     pub fn is_consensus(self) -> bool {
         matches!(self, Self::Consensus)
-    }
-
-    /// `true` if this stage is the extract stage.
-    #[must_use]
-    pub fn is_extract(self) -> bool {
-        matches!(self, Self::Extract)
     }
 
     /// Validate that `self` (as `--start-from`) and `stop_after` form
@@ -1024,18 +1018,32 @@ impl RunAll {
                     !opts.read_structures.is_empty(),
                     "--extract::read-structures is required when --start-from extract"
                 );
-                anyhow::ensure!(
-                    opts.inputs.len() == opts.read_structures.len(),
-                    "--extract::inputs and --extract::read-structures must have the same count"
-                );
+                // The equal-count check is only correct for the non-interleaved
+                // (one FASTQ per read structure) shape. Interleaved packs both
+                // reads of a pair into a single FASTQ, so it is 1 input + 2 read
+                // structures. Mirror `build_stage_options_bag`'s Extract arm and
+                // extract.rs so the two agree.
                 if opts.interleaved {
+                    anyhow::ensure!(
+                        opts.inputs.len() == 1,
+                        "--extract::interleaved requires exactly one --extract::inputs; got {}",
+                        opts.inputs.len()
+                    );
+                    anyhow::ensure!(
+                        opts.read_structures.len() == 2,
+                        "--extract::interleaved requires exactly two \
+                         --extract::read-structures; got {}",
+                        opts.read_structures.len()
+                    );
                     let path = opts.inputs.first().cloned().ok_or_else(|| {
                         anyhow::anyhow!("--extract::inputs is required when --start-from extract")
                     })?;
-                    // Enforces exactly 2 read structures (the R1/R2 pair).
                     SourceSpec::interleaved_fastq(path, opts.read_structures)
                 } else {
-                    // Enforces paths.len() == read_structures.len().
+                    anyhow::ensure!(
+                        opts.inputs.len() == opts.read_structures.len(),
+                        "--extract::inputs and --extract::read-structures must have the same count"
+                    );
                     SourceSpec::fastqs(opts.inputs, opts.read_structures)
                 }
             }
@@ -1176,7 +1184,10 @@ impl RunAll {
     ///   `tmp_dirs` against `FGUMI_TMP_DIRS`, and — when sort is fused with
     ///   another stage — overrides an explicit `--sort::max-memory auto` to
     ///   the standalone 768 MiB default (auto-detection is not supported in a
-    ///   fused chain).
+    ///   fused chain). Finally runs the inherent
+    ///   [`crate::commands::sort::SortOptions::validate`] cross-field check
+    ///   (rejects `--sort::temp-codec zstd` with `--sort::temp-compression 0`)
+    ///   before the chain builder wires the spill compressor.
     ///
     /// * **Group** — validates `MultiGroupOptions`, then computes
     ///   `effective_strategy` / `effective_edits` via
@@ -1239,8 +1250,8 @@ impl RunAll {
                 Stage::Align => {
                     let reference = self.reference.clone().ok_or_else(|| {
                         anyhow::anyhow!(
-                            "--start-from align requires --ref (the aligner reference \
-                             FASTA with its index files alongside)"
+                            "a runall chain that includes align requires --ref (the aligner \
+                             reference FASTA with its index files alongside)"
                         )
                     })?;
                     let aligner = self.aligner_opts.clone().validate()?;
@@ -1260,6 +1271,15 @@ impl RunAll {
                     let mut sort_opts = self.sort_opts.clone().validate()?;
                     // Runall's sort step always produces template-coordinate
                     // output — the only order compatible with downstream Group.
+                    // Warn before overriding a user-supplied order so the
+                    // override is not silent (mirrors the max-memory warn below).
+                    if sort_opts.order != SortOrderArg::TemplateCoordinate {
+                        log::warn!(
+                            "--sort::order {:?} is ignored; runall forces template-coordinate \
+                             sort order for its sort step",
+                            sort_opts.order
+                        );
+                    }
                     sort_opts.order = SortOrderArg::TemplateCoordinate;
                     sort_opts.tmp_dirs = resolve_tmp_dirs(
                         &sort_opts.tmp_dirs,
@@ -1267,14 +1287,25 @@ impl RunAll {
                     );
                     // --sort::max-memory=auto bails in any non-sole-[Sort] chain
                     // (builder.rs:2560), so override auto -> the standalone
-                    // 768 MiB default when sort is fused with other stages.
+                    // 768 MiB default when sort is fused with other stages. Use
+                    // the exact expression SortOptions::default() uses so the
+                    // value cannot diverge from the standalone default.
                     if stages != [Stage::Sort] && sort_opts.max_memory == MemoryLimit::Auto {
                         log::warn!(
                             "--sort::max-memory auto is not supported in a fused runall \
                              chain; using 768M"
                         );
-                        sort_opts.max_memory = MemoryLimit::Fixed(768 * 1024 * 1024);
+                        sort_opts.max_memory =
+                            crate::commands::common::parse_memory("768M").expect("valid default");
                     }
+                    // Inherent cross-field check (mirrors the Codec/Extract
+                    // branches below): reject `--sort::temp-codec zstd` paired
+                    // with `--sort::temp-compression 0` here, before the chain
+                    // builder wires `SpillBlockCompress`, rather than failing
+                    // lazily on the first spill. The macro-generated
+                    // `MultiSortOptions::validate` only converts staged-required
+                    // fields; it does not run this check.
+                    sort_opts.validate()?;
                     bag.sort = Some(sort_opts);
                 }
 
@@ -1288,6 +1319,28 @@ impl RunAll {
                         group_opts.resolve_strategy_and_edits();
                     group_opts.effective_strategy = effective_strategy;
                     group_opts.effective_edits = effective_edits;
+                    // `--index-threshold always` asserts indexing will happen;
+                    // reject it when the resolved strategy/edits can never index,
+                    // matching standalone `fgumi group` (group.rs
+                    // GroupReadsByUmi::validate) rather than silently ignoring it.
+                    crate::commands::common::validate_index_threshold(
+                        group_opts.index_threshold,
+                        effective_strategy,
+                        effective_edits,
+                    )?;
+                    // Forcing these to None is spec-mandated (runall does not
+                    // emit per-position group metrics in a fused run), but warn
+                    // so the dropped flags are not silent.
+                    if group_opts.family_size_histogram.is_some()
+                        || group_opts.grouping_metrics.is_some()
+                        || group_opts.metrics_prefix.is_some()
+                    {
+                        log::warn!(
+                            "--group::family-size-histogram / --group::grouping-metrics / \
+                             --group::metrics are ignored: runall does not emit per-position \
+                             group metrics in a fused run"
+                        );
+                    }
                     group_opts.family_size_histogram = None;
                     group_opts.grouping_metrics = None;
                     group_opts.metrics_prefix = None;
@@ -1309,6 +1362,12 @@ impl RunAll {
                 #[cfg(feature = "consensus")]
                 Stage::Duplex => {
                     let mut opts = self.duplex_opts.clone().validate()?;
+                    // `add_duplex` (builder.rs) does not validate numeric bounds
+                    // the way `add_simplex`/codec do, so run the same guards the
+                    // standalone `fgumi duplex` applies (DuplexOptions::validate_numeric,
+                    // extracted from duplex.rs Duplex::validate) — otherwise runall
+                    // accepts degenerate configs that yield a silent empty BAM.
+                    opts.validate_numeric()?;
                     opts.rejects_opts.clone_from(&self.rejects_opts);
                     opts.stats_opts.clone_from(&self.stats_opts);
                     opts.read_group.clone_from(&self.read_group);
@@ -1551,14 +1610,39 @@ impl Command for RunAll {
         // `fgumi correct --rejects` step separately.
         if matches!(self.start_from, RunAllStage::Extract | RunAllStage::Correct)
             && self.stop_after_stage() != RunAllStage::Correct
+            && stages.contains(&Stage::Correct)
             && self.rejects_opts.rejects.is_some()
         {
             log::warn!(
-                "--rejects with --start-from correct --stop-after {} discards correct's UMI rejects \
+                "--rejects with --start-from {} --stop-after {} discards correct's UMI rejects \
                  (the fused chain has no UMI-rejects branch). The rejects file will collect only \
                  downstream rejects. Use a separate `fgumi correct --rejects` step if you need \
                  UMI rejects captured.",
+                self.start_from,
                 self.stop_after_stage()
+            );
+        }
+
+        // A7: warn on top-level --stats / --rejects that the derived chain
+        // never consumes, so a silently-dead flag does not mislead. Top-level
+        // --stats is cloned only into consensus stages; top-level --rejects is
+        // wired only into a correct self-pair or a consensus stage. Filter reads
+        // its own --filter::stats / --filter::rejects, so point the user there.
+        // Use warn (not bail) — the run is still valid, just missing the output
+        // the user expected on the wrong flag.
+        if self.stats_opts.stats.is_some() && !chain_reaches_consensus {
+            log::warn!(
+                "--stats is consumed only by the consensus stage; it is dead on a runall chain \
+                 that reaches no consensus stage. Use --filter::stats to capture filter statistics."
+            );
+        }
+        if self.rejects_opts.rejects.is_some()
+            && !chain_reaches_consensus
+            && !stages.contains(&Stage::Correct)
+        {
+            log::warn!(
+                "--rejects is wired nowhere on this runall chain (it is consumed only by a correct \
+                 self-pair or a consensus stage). Use --filter::rejects to capture filter rejects."
             );
         }
 
@@ -1585,6 +1669,53 @@ impl Command for RunAll {
         let source = self.derive_source_spec()?;
         let sink = self.derive_sink_spec()?;
         let stage_opts = self.build_stage_options_bag(&stages)?;
+
+        // A1: reject an --output that collides with any rejects/stats path the
+        // derived chain will actually open as a *second* writer. Two writers on
+        // one file silently corrupt it (see `reject_output_collisions` in
+        // common.rs). Enumerate only the writer paths the bag actually wired —
+        // reading them off the populated `stage_opts` so the guard fires on the
+        // exact paths the chain will open. `--input`/`--unmapped` are read-only
+        // and exempt; stdin/`-`/`/dev/null` are handled inside the guard.
+        let mut write_targets: Vec<(&std::path::Path, &str)> =
+            vec![(self.output.as_path(), "--output")];
+        if let Some(rejects) = stage_opts.correct.as_ref().and_then(|c| c.rejects_path.as_ref()) {
+            write_targets.push((rejects.as_path(), "--rejects"));
+        }
+        #[cfg(feature = "consensus")]
+        {
+            // Only one consensus stage is ever wired, but enumerate all three
+            // uniformly; the absent bags contribute nothing.
+            for rejects in [
+                stage_opts.simplex.as_ref().and_then(|o| o.rejects_opts.rejects.as_ref()),
+                stage_opts.duplex.as_ref().and_then(|o| o.rejects_opts.rejects.as_ref()),
+                stage_opts.codec.as_ref().and_then(|o| o.rejects_opts.rejects.as_ref()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                write_targets.push((rejects.as_path(), "--rejects"));
+            }
+            for stats in [
+                stage_opts.simplex.as_ref().and_then(|o| o.stats_opts.stats.as_ref()),
+                stage_opts.duplex.as_ref().and_then(|o| o.stats_opts.stats.as_ref()),
+                stage_opts.codec.as_ref().and_then(|o| o.stats_opts.stats.as_ref()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                write_targets.push((stats.as_path(), "--stats"));
+            }
+        }
+        if let Some(filter) = stage_opts.filter.as_ref() {
+            if let Some(rejects) = filter.rejects.as_ref() {
+                write_targets.push((rejects.as_path(), "--filter::rejects"));
+            }
+            if let Some(stats) = filter.stats.as_ref() {
+                write_targets.push((stats.as_path(), "--filter::stats"));
+            }
+        }
+        crate::commands::common::reject_output_collisions(&write_targets)?;
 
         let spec = ChainSpec {
             stages,
@@ -1891,6 +2022,38 @@ mod bag_tests {
             bag.sort.unwrap().max_memory,
             crate::commands::common::MemoryLimit::Fixed(_)
         ));
+    }
+
+    #[test]
+    fn sort_rejects_zstd_with_zero_temp_compression() {
+        // The inherent `SortOptions::validate` cross-field check must run in the
+        // runall sort branch, rejecting the invalid zstd/level-0 pairing before
+        // the chain builder wires the spill compressor (rather than failing
+        // lazily on the first spill).
+        let r = parse(&[
+            "--start-from",
+            "sort",
+            "--stop-after",
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+            "--sort::temp-codec",
+            "zstd",
+            "--sort::temp-compression",
+            "0",
+        ]);
+        let Err(err) = r.build_stage_options_bag(&[Stage::Sort, Stage::Group]) else {
+            panic!("expected --sort::temp-codec zstd + --sort::temp-compression 0 to be rejected");
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("--temp-compression 0 is only supported with --temp-codec bgzf"),
+            "got: {err}"
+        );
     }
 
     #[cfg(feature = "consensus")]
