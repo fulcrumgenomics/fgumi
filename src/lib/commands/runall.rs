@@ -15,6 +15,8 @@
 
 use anyhow::{Result, bail};
 
+use crate::assigner::Strategy;
+
 /// Consensus mode selector for `runall`. Controls which consensus
 /// caller runs after the fused group + MI-grouping stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum)]
@@ -269,6 +271,393 @@ impl std::fmt::Display for RunAllStage {
             Self::Filter => "filter",
         };
         f.write_str(name)
+    }
+}
+
+/// Validate that the `--strategy` chosen by the user is compatible
+/// with the terminal consensus mode derived from `--stop-after`.
+///
+/// `Duplex` requires `Strategy::Paired` (MIs need `/A`/`/B` suffixes);
+/// `Simplex` and `Codec` require any non-paired strategy. Error
+/// messages name `--stop-after` (Display, lowercase) so the user
+/// sees the flag they typed.
+///
+/// Free function so the error-message Display formatting is unit-testable
+/// without constructing a full `RunAll`.
+///
+/// Not yet called outside tests: the `RunAll` struct and its
+/// `validate_strategy` wrapper land in a later task of this same PR-B
+/// campaign, at which point this has a production call site.
+#[allow(dead_code)]
+fn validate_strategy_for_mode(mode: RunAllMode, strategy: Strategy) -> Result<()> {
+    match (mode, strategy) {
+        (RunAllMode::Duplex, Strategy::Paired) => Ok(()),
+        (RunAllMode::Duplex, _) => {
+            bail!("--consensus duplex requires --strategy paired (so MIs carry /A and /B suffixes)")
+        }
+        (RunAllMode::Simplex | RunAllMode::Codec, Strategy::Paired) => {
+            bail!("--consensus {mode} requires a non-paired strategy (identity/edit/adjacency)")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Validate the `--start-from` / `--stop-after` pair against the
+/// structural (linear-ordering) rules. Delegates to
+/// [`RunAllStage::validate_with`]; consensus is no longer terminal-only
+/// (it fuses into `consensus → filter`), so only the ordinal order is
+/// enforced.
+///
+/// Historically this function also enforced "not yet implemented"
+/// gates while #33 tasks 4-9 incrementally wired each combination;
+/// those gates are all lifted now. The function is kept as the
+/// runall-side entry point so future validation rules (e.g.
+/// strategy/stage compatibility beyond what `validate_with`
+/// expresses) have a clear home.
+///
+/// Not yet called outside tests: `RunAll::validate_stages` (a later task of
+/// this same PR-B campaign) is the production call site.
+#[allow(dead_code)]
+fn validate_stages_for(start_from: RunAllStage, stop_after: RunAllStage) -> Result<()> {
+    start_from.validate_with(stop_after)?;
+    // `--stop-after align-and-merge` would mean "stop after the
+    // alignment but before zipper-merge". The design dropped that
+    // stop point because raw aligner output without the zipper-merge
+    // loses every original tag (RX, QX, RG, etc.) and isn't useful.
+    // Earliest stop point reachable from `--start-from align-and-merge`
+    // is `--stop-after zipper`. `validate_with`'s linear-order check
+    // would have let this combo through (ord 0 → ord 0 is structurally
+    // valid as a self-pair), so we reject it explicitly here.
+    if stop_after == RunAllStage::AlignAndMerge {
+        bail!(
+            "--stop-after align is not supported; raw aligner output \
+             without zipper-merge loses every original tag (RX, QX, RG, ...). \
+             Use `--stop-after zipper` for merged-but-unsorted output."
+        );
+    }
+    Ok(())
+}
+
+/// Derive the ordered [`Stage`](crate::pipeline::chains::Stage) list for a
+/// given `(start_from, stop_after)` pair.
+///
+/// Free function so the stage-derivation logic is unit-testable without
+/// constructing a full `RunAll` instance — same pattern as
+/// [`validate_stages_for`]. `RunAll::derive_stages` is the thin wrapper
+/// that reads `self` and calls this.
+///
+/// # Stage derivation rules
+///
+/// 1. **Correct**: included when `start_from == Correct`.
+///    When `stop_after > Correct`, the chain always chains through AAM
+///    (`Correct → Align` is the only supported downstream path; a corrected
+///    unmapped BAM must be aligned before it can be sorted or grouped).
+///
+/// 2. **Align**: included when `start_from <= AlignAndMerge` AND
+///    `stop_after >= Zipper`. `Stage::Align` encapsulates both the aligner
+///    subprocess AND the zipper-merge; there is no separate
+///    `--stop-after align` stop point (the validator rejects it).
+///    Included when:
+///    - `start_from == AlignAndMerge` (explicit AAM start), OR
+///    - `start_from == Correct` and `stop_after > Correct` (correct feeds
+///      into AAM as the mandatory next step).
+///
+/// 3. **Zipper**: included when `start_from == Zipper` (standalone zipper
+///    start). Mutually exclusive with `Stage::Align` — both produce a merged
+///    BAM from different source shapes.
+///
+/// 4. **Sort**: included when `start_from <= Sort` OR when `Align` /
+///    `Zipper` is in the chain AND `stop_after >= Sort`.
+///    **Sort-forcing rule**: `Stage::Align` and `Stage::Zipper` both emit
+///    queryname-sorted output. Downstream `Stage::Group` requires
+///    template-coordinate order — Sort is therefore mandatory between any
+///    Align/Zipper stage and Group, even when `--start-from` is not `sort`.
+///
+/// 5. **Group**: included when `stop_after >= Group` AND `start_from` is NOT
+///    a consensus stage. **Consensus-self-pair exception**: when
+///    `start_from.is_consensus()`, the input BAM is already MI-tagged. The
+///    standalone consensus chain builders handle MI-tag grouping internally
+///    via `GroupByMi` — adding an explicit `Stage::Group` here would
+///    double-group an already-grouped input. For all other start stages
+///    (correct, align, zipper, sort, group), the Group step is required to
+///    produce MI-tagged output before the consensus caller sees it.
+///
+/// 6. **Simplex / Duplex / Codec**: one of the three is appended when
+///    `stop_after` names that consensus stage (terminal, mutually exclusive).
+///
+/// # Errors
+///
+/// Returns `Err` for any `(start, stop)` pair that `validate_stages` would
+/// reject (should not be reached if `validate_stages` was called first), or
+/// if the Stage derivation reaches a branch that is a programming error (e.g.
+/// a non-consensus `stop` that makes it through all prior early-returns).
+///
+/// Not yet called outside tests: `RunAll::derive_stages` (a later task of
+/// this same PR-B campaign) is the production call site.
+#[allow(dead_code)]
+fn derive_stages_for(
+    start_from: RunAllStage,
+    stop_after: RunAllStage,
+    extract_wants_correct: bool,
+    consensus_mode: Option<RunAllMode>,
+) -> Result<Vec<crate::pipeline::chains::Stage>> {
+    use crate::pipeline::chains::Stage;
+
+    // `validate_stages` must have been called before this; the assert
+    // catches misuse in tests or future refactors.
+    debug_assert!(
+        start_from.ord() <= stop_after.ord() && stop_after != RunAllStage::AlignAndMerge,
+        "derive_stages_for called with invalid (start={start_from}, stop={stop_after}); \
+         validate_stages must run first"
+    );
+
+    let mut stages: Vec<Stage> = Vec::with_capacity(7);
+
+    // ── Step 0: Extract ──────────────────────────────────────────────────
+    // Included when the chain starts at Extract.
+    if start_from == RunAllStage::Extract {
+        stages.push(Stage::Extract);
+        // extract → extract: extract-only chain (FASTQ → unmapped BAM).
+        // The terminal Extract stage serialises and writes the unmapped
+        // BAM directly; there are no downstream stages.
+        if stop_after == RunAllStage::Extract {
+            return Ok(stages);
+        }
+    }
+
+    // Spec §6: an extract-start that stops at correct without a UMI source has
+    // no buildable chain (Correct would be skipped, and the ordinal fall-through
+    // would misreport "--consensus required"). Return the actionable error here
+    // so the pure fn is total over every (start, stop, wants_correct, mode).
+    if start_from == RunAllStage::Extract
+        && stop_after == RunAllStage::Correct
+        && !extract_wants_correct
+    {
+        bail!(
+            "--start-from extract --stop-after correct requires \
+             --correct::umi-files or --correct::umis"
+        );
+    }
+
+    // ── Filter self-pair ─────────────────────────────────────────────────
+    // `--start-from filter --stop-after filter`: input is a consensus BAM;
+    // run only the (terminal) filter stage. No group/consensus steps apply
+    // (the standalone filter chain handles its own queryname grouping when
+    // `--filter::filter-by-template` is set), so short-circuit here. The
+    // validator guarantees `start_from == Filter` implies
+    // `stop_after == Filter` (filter is the last stage in the linear order).
+    if start_from == RunAllStage::Filter {
+        stages.push(Stage::Filter);
+        return Ok(stages);
+    }
+
+    // ── Step 1: Correct ──────────────────────────────────────────────────
+    // Included when the chain starts at Correct. Also included when the
+    // chain starts at Extract AND the user supplied --correct::umi-files
+    // or --correct::umis (the extract_wants_correct flag).
+    // For a Correct self-pair there are no downstream stages; return early.
+    if start_from == RunAllStage::Correct
+        || (start_from == RunAllStage::Extract && extract_wants_correct)
+    {
+        stages.push(Stage::Correct);
+        if stop_after == RunAllStage::Correct {
+            return Ok(stages);
+        }
+        // `Correct → stop > Correct` always chains through AAM.
+        // Any stop beyond Correct (Zipper, Sort, Group, consensus)
+        // requires align-and-merge — a corrected unmapped BAM cannot
+        // be fed directly to Sort (no query-coordinate BAM).
+    }
+
+    // ── Step 2: Align (AAM = align + zipper-merge, fused) ────────────────
+    // `Stage::Align` covers both the aligner subprocess and the
+    // zipper-merge; there is no separate `--stop-after align` stop point.
+    // Included when:
+    //   (a) start_from == AlignAndMerge (explicit AAM start), OR
+    //   (b) start_from == Correct and stop_after > Correct (correct feeds
+    //       into AAM — see Step 1 above).
+    //   (c) start_from == Extract and stop_after > Correct (extract feeds
+    //       into Align, possibly through Correct first).
+    let includes_align = start_from == RunAllStage::AlignAndMerge
+        || (start_from == RunAllStage::Correct && stop_after != RunAllStage::Correct)
+        || (start_from == RunAllStage::Extract && stop_after.ord() > RunAllStage::Correct.ord());
+    if includes_align {
+        stages.push(Stage::Align);
+        // `--stop-after zipper` stops after the AAM step (which includes
+        // the zipper-merge internally). Return early.
+        if stop_after == RunAllStage::Zipper {
+            return Ok(stages);
+        }
+    }
+
+    // ── Step 3: Zipper (standalone zipper start) ─────────────────────────
+    // Mutually exclusive with `Stage::Align`. Included only when
+    // `start_from == Zipper` (the user supplies separate mapped + unmapped
+    // BAMs and the zipper-merge runs as the first step).
+    let includes_zipper = start_from == RunAllStage::Zipper;
+    if includes_zipper {
+        stages.push(Stage::Zipper);
+        if stop_after == RunAllStage::Zipper {
+            return Ok(stages);
+        }
+    }
+
+    // ── Step 4: Sort ──────────────────────────────────────────────────────
+    // Sort-forcing rule: Sort is ALWAYS included when Align or Zipper
+    // precede anything past Sort, because both produce queryname-sorted
+    // output and downstream Group requires template-coordinate order.
+    // Sort is also included when start_from == Sort (explicit sort start).
+    let sort_forced =
+        (includes_align || includes_zipper) && stop_after.ord() >= RunAllStage::Sort.ord();
+    let sort_explicit = start_from == RunAllStage::Sort;
+    if sort_forced || sort_explicit {
+        stages.push(Stage::Sort);
+    }
+    if stop_after == RunAllStage::Sort {
+        return Ok(stages);
+    }
+
+    // ── Step 5: Group ─────────────────────────────────────────────────────
+    // Included when stop_after >= Group AND start_from is NOT a consensus
+    // stage. The consensus-self-pair exception: when start_from is already
+    // a consensus stage (Simplex/Duplex/Codec), the input BAM is already
+    // MI-tagged. The standalone consensus chain builder (build_simplex_chain
+    // / build_duplex_chain / build_codec_chain) handles MI-tag grouping
+    // internally via GroupByMi — it does NOT run GroupByPosition /
+    // ProcessGroups / MiAssign. Adding an explicit Group stage here would
+    // double-group an already-grouped input.
+    //
+    // For `--start-from group --stop-after {consensus}` or any upstream
+    // start (sort, align, zipper, correct), Group IS required because the
+    // input is not yet MI-tagged.
+    let includes_group = !start_from.is_consensus()
+        && (start_from == RunAllStage::Group || stop_after.ord() >= RunAllStage::Group.ord());
+    if includes_group {
+        stages.push(Stage::Group);
+    }
+    if stop_after == RunAllStage::Group {
+        return Ok(stages);
+    }
+
+    // ── Step 6: Consensus ────────────────────────────────────────────────
+    // Reached when stop_after is Consensus or Filter (all earlier stops
+    // have returned, and the filter self-pair short-circuited above). The
+    // chain stage is chosen by the `--consensus` algorithm. When
+    // stop_after == Filter, consensus runs first, then Filter is appended
+    // below (consensus → filter chain).
+    debug_assert!(
+        matches!(stop_after, RunAllStage::Consensus | RunAllStage::Filter),
+        "derive_stages_for reached the consensus branch with unexpected \
+         stop stage {stop_after}; validate_stages must run first"
+    );
+    let mode = consensus_mode.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--consensus <simplex|duplex|codec> is required when --stop-after \
+             reaches the consensus stage"
+        )
+    })?;
+    match mode {
+        RunAllMode::Simplex => stages.push(Stage::Simplex),
+        RunAllMode::Duplex => stages.push(Stage::Duplex),
+        RunAllMode::Codec => stages.push(Stage::Codec),
+    }
+
+    // ── Step 7: Filter (terminal) ────────────────────────────────────────
+    // Appended after the consensus caller when `--stop-after filter` chains
+    // consensus → filter. Filter is the last stage in the linear order, so
+    // no stage follows it.
+    if stop_after == RunAllStage::Filter {
+        stages.push(Stage::Filter);
+    }
+
+    Ok(stages)
+}
+
+#[cfg(test)]
+mod derive_tests {
+    use super::*;
+    use crate::assigner::Strategy;
+    use crate::pipeline::chains::Stage;
+    use RunAllStage::*;
+    use rstest::rstest;
+
+    #[rstest]
+    // ── self-pairs ──
+    #[case::extract_only(Extract, Extract, false, None, vec![Stage::Extract])]
+    #[case::correct_only(Correct, Correct, false, None, vec![Stage::Correct])]
+    #[case::sort_only(Sort, Sort, false, None, vec![Stage::Sort])]
+    #[case::group_only(Group, Group, false, None, vec![Stage::Group])]
+    #[case::filter_only(Filter, Filter, false, None, vec![Stage::Filter])]
+    // ── extract-fed fan-out ──
+    #[case::extract_to_group_no_umi(
+        Extract, Group, false, None,
+        vec![Stage::Extract, Stage::Align, Stage::Sort, Stage::Group])]
+    #[case::extract_to_group_with_umi(
+        Extract, Group, true, None,
+        vec![Stage::Extract, Stage::Correct, Stage::Align, Stage::Sort, Stage::Group])]
+    #[case::extract_to_zipper_allowed(
+        Extract, Zipper, false, None,
+        vec![Stage::Extract, Stage::Align])] // §6: ALLOW; align satisfies a zipper stop
+    #[case::extract_to_simplex(
+        Extract, Consensus, false, Some(RunAllMode::Simplex),
+        vec![Stage::Extract, Stage::Align, Stage::Sort, Stage::Group, Stage::Simplex])]
+    // ── correct-fed ──
+    #[case::correct_to_sort(
+        Correct, Sort, false, None,
+        vec![Stage::Correct, Stage::Align, Stage::Sort])]
+    // ── sort/group/consensus fed ──
+    #[case::sort_to_group(Sort, Group, false, None, vec![Stage::Sort, Stage::Group])]
+    #[case::sort_to_duplex(
+        Sort, Consensus, false, Some(RunAllMode::Duplex),
+        vec![Stage::Sort, Stage::Group, Stage::Duplex])]
+    #[case::group_to_codec(
+        Group, Consensus, false, Some(RunAllMode::Codec),
+        vec![Stage::Group, Stage::Codec])]
+    #[case::group_to_consensus_to_filter(
+        Group, Filter, false, Some(RunAllMode::Simplex),
+        vec![Stage::Group, Stage::Simplex, Stage::Filter])]
+    // ── consensus self-pair: NO Stage::Group (already MI-tagged) ──
+    #[case::consensus_self_pair(
+        Consensus, Consensus, false, Some(RunAllMode::Simplex),
+        vec![Stage::Simplex])]
+    // ── zipper start ──
+    #[case::zipper_to_sort(Zipper, Sort, false, None, vec![Stage::Zipper, Stage::Sort])]
+    fn derive_stages_matches_spec(
+        #[case] start: RunAllStage,
+        #[case] stop: RunAllStage,
+        #[case] wants_correct: bool,
+        #[case] mode: Option<RunAllMode>,
+        #[case] expected: Vec<Stage>,
+    ) {
+        let got = derive_stages_for(start, stop, wants_correct, mode).expect("derives");
+        assert_eq!(got, expected);
+    }
+
+    #[rstest]
+    #[case::extract_correct_no_umi(Extract, Correct, false, None)]
+    fn derive_stages_errors(
+        #[case] start: RunAllStage,
+        #[case] stop: RunAllStage,
+        #[case] wants_correct: bool,
+        #[case] mode: Option<RunAllMode>,
+    ) {
+        let err = derive_stages_for(start, stop, wants_correct, mode).unwrap_err().to_string();
+        assert!(err.contains("--correct::umi-files or --correct::umis"), "got: {err}");
+    }
+
+    #[rstest]
+    #[case::backwards(Group, Sort)]
+    fn validate_stages_rejects_backwards(#[case] start: RunAllStage, #[case] stop: RunAllStage) {
+        assert!(validate_stages_for(start, stop).is_err());
+    }
+
+    #[rstest]
+    #[case::duplex_needs_paired(RunAllMode::Duplex, Strategy::Adjacency, true)]
+    #[case::duplex_paired_ok(RunAllMode::Duplex, Strategy::Paired, false)]
+    #[case::simplex_paired_rejected(RunAllMode::Simplex, Strategy::Paired, true)]
+    #[case::simplex_adjacency_ok(RunAllMode::Simplex, Strategy::Adjacency, false)]
+    fn strategy_for_mode(#[case] mode: RunAllMode, #[case] strat: Strategy, #[case] is_err: bool) {
+        assert_eq!(validate_strategy_for_mode(mode, strat).is_err(), is_err);
     }
 }
 
