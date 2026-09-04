@@ -5971,13 +5971,35 @@ mod tests {
     }
 
     /// `ExtractRunallOptions::default()` must match the CLI defaults
-    /// (`"illumina"` / `"A"`), not the derived-`Default` empty strings — guards
-    /// the branch-wide invariant "Default == the minimal-parse projection".
+    /// (`"illumina"` / `"A"`, plus every other default-bearing field), not the
+    /// derived-`Default` empty strings — guards the branch-wide invariant
+    /// "Default == the minimal-parse projection". `sample`/`library`/`inputs`/
+    /// `read_structures` are required (staged/clap), so they have no CLI
+    /// default and are not asserted here.
     #[test]
     fn multi_extract_runall_options_default_matches_cli_defaults() {
         let defaults = ExtractRunallOptions::default();
         assert_eq!(defaults.platform, "illumina");
         assert_eq!(defaults.read_group_id, "A");
+        assert!(!defaults.interleaved);
+        assert_eq!(defaults.barcode, None);
+        assert_eq!(defaults.platform_unit, None);
+        assert_eq!(defaults.platform_model, None);
+        assert_eq!(defaults.sequencing_center, None);
+        assert_eq!(defaults.predicted_insert_size, None);
+        assert_eq!(defaults.description, None);
+        assert!(defaults.comment.is_empty());
+        assert_eq!(defaults.run_date, None);
+        assert!(!defaults.store_umi_quals);
+        assert!(!defaults.store_cell_quals);
+        assert!(!defaults.store_sample_barcode_qualities);
+        assert!(!defaults.extract_umis_from_read_names);
+        assert!(!defaults.annotate_read_names);
+        assert_eq!(defaults.single_tag, None);
+        assert_eq!(defaults.clipping_attribute, None);
+        assert!(!defaults.async_reader);
+        assert!(!defaults.check_crc);
+        assert!(!defaults.no_check_crc);
     }
 
     /// A supplied `--extract::barcode` round-trips into the projection.

@@ -2547,4 +2547,28 @@ mod tests {
             .expect("valid");
         assert_eq!(multi.max_memory, parse_memory("1G").expect("valid"));
     }
+
+    /// Guards the hand-written `impl Default for SortOptions` against drifting
+    /// from the standalone `sort` command's `#[arg(default_value...)]` literals.
+    /// Asserts every default-bearing field (plus the chain-engine skip fields,
+    /// whose defaults are checked directly against the struct) matches the
+    /// standalone command's own default, parsed with only its required flags.
+    #[test]
+    fn sort_options_default_matches_cli_defaults() {
+        let parsed = Sort::try_parse_from(["sort", "-i", "in.bam", "-o", "o.bam"])
+            .expect("parses")
+            .to_sort_options();
+        let d = SortOptions::default();
+        assert_eq!(d.order, parsed.order);
+        assert_eq!(d.max_memory, parsed.max_memory);
+        assert_eq!(d.memory_reserve, parsed.memory_reserve);
+        assert_eq!(d.memory_per_thread, parsed.memory_per_thread);
+        assert_eq!(d.temp_compression, parsed.temp_compression);
+        assert_eq!(d.temp_codec, parsed.temp_codec);
+        assert_eq!(d.max_temp_files, parsed.max_temp_files);
+        // Chain-engine skip fields: no CLI flag on `Sort` exists to parse, so
+        // compare directly against the struct's documented defaults.
+        assert_eq!(d.block_batch, 4);
+        assert!(!d.file_granularity);
+    }
 }

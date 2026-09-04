@@ -4544,4 +4544,23 @@ mod tests {
             "error should name --correct::min-distance: {msg}"
         );
     }
+
+    /// Guards the hand-written `impl Default for CorrectOptions` against
+    /// drifting from the standalone `correct` command's
+    /// `#[arg(default_value...)]` literals. `--min-distance` has no CLI
+    /// default (it is required), so it is supplied but not asserted here.
+    #[test]
+    fn correct_options_default_matches_cli_defaults() {
+        let parsed = CorrectUmis::try_parse_from([
+            "correct", "-i", "in.bam", "-o", "o.bam", "-d", "1", "-u", "AAA",
+        ])
+        .expect("parses")
+        .to_correct_options();
+        let d = CorrectOptions::default();
+        assert_eq!(d.target, parsed.target);
+        assert_eq!(d.max_mismatches, parsed.max_mismatches);
+        assert_eq!(d.dont_store_original_umis, parsed.dont_store_original_umis);
+        assert_eq!(d.cache_size, parsed.cache_size);
+        assert_eq!(d.revcomp, parsed.revcomp);
+    }
 }
