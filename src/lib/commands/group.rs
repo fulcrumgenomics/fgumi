@@ -784,7 +784,7 @@ impl GroupOptions {
     /// `Strategy::Identity`/0; `Strategy::Identity` forces `edits` 0; otherwise
     /// the requested pair.
     ///
-    /// Delegates to the shared free function [`resolve_strategy_and_edits`] so
+    /// Delegates to the shared free function `resolve_strategy_and_edits` so
     /// this and [`GroupReadsByUmi::resolve_strategy_and_edits`] cannot
     /// disagree.
     #[must_use]
@@ -804,7 +804,7 @@ impl GroupReadsByUmi {
     ///
     /// `--no-umi` forces identity grouping, and identity grouping requires an
     /// edit distance of zero; both rules live in the shared free function
-    /// [`resolve_strategy_and_edits`], which this and
+    /// `resolve_strategy_and_edits`, which this and
     /// [`GroupOptions::resolve_strategy_and_edits`] both delegate to, so
     /// `execute` and the chain builder cannot disagree about what was
     /// configured. The caller is responsible for rejecting `--no-umi` with
