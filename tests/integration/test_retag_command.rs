@@ -1,12 +1,12 @@
-//! End-to-end parity tests for the `retag` command's chain-builder cutover.
+//! End-to-end determinism tests for the `retag` command on the chain builder.
 //!
-//! `retag --threads N` routes through the declarative chain builder; the
-//! no-`--threads` serial `run_single_threaded` loop is the in-process parity
-//! oracle. These assert the two paths produce identical output records +
-//! normalized header and an identical `--metrics` TSV, across thread counts —
-//! including `--threads 1`, which dispatches to the chain at single-worker
-//! concurrency (a distinct code path from both the serial oracle and
-//! `--threads N`).
+//! retag always routes through the declarative chain builder (the legacy serial
+//! path is retired). These assert the output is independent of the worker count:
+//! a no-`--threads` run (the chain at a single worker) produces identical output
+//! records + normalized header and an identical `--metrics` TSV to a
+//! `--threads N` run. `--threads 1` is exercised explicitly as a distinct
+//! single-worker configuration. (Byte-parity against the pre-removal serial
+//! binary lives in `test_retag_cutover_parity.rs`.)
 
 use clap::Parser;
 use fgumi_lib::commands::command::Command;
@@ -64,8 +64,8 @@ fn mixed_input(dir: &Path, count: usize) -> PathBuf {
     write_input(dir, "in.bam", &records)
 }
 
-/// Parse + run `retag`. `threads = None` omits `--threads` (the serial oracle);
-/// `Some(n)` passes `--threads n` (the chain path).
+/// Parse + run `retag`. `threads = None` omits `--threads` (the chain at a
+/// single worker); `Some(n)` passes `--threads n`. Both take the chain.
 fn run_retag(
     input: &Path,
     output: &Path,
@@ -93,29 +93,32 @@ fn run_retag(
     cmd.execute("retag test")
 }
 
-// ── chain-vs-oracle record + header parity ─────────────────────────────────
+// ── worker-count invariance: record + header ───────────────────────────────
 
 #[rstest]
 #[case::threads_1(1)]
 #[case::threads_2(2)]
 #[case::threads_4(4)]
-fn retag_chain_matches_single_threaded(#[case] threads: usize) {
+fn output_matches_across_worker_counts(#[case] threads: usize) {
     let dir = TempDir::new().unwrap();
     let input = mixed_input(dir.path(), 40);
     // Fan RX out to BX and CB, then drop RX — exercises applied/overwritten/missing
     // across three positional ops.
     let ops = ["RX::copy::BX", "RX::copy::CB", "RX::delete"];
 
-    let oracle_out = dir.path().join("oracle.bam");
-    run_retag(&input, &oracle_out, None, &ops, None).expect("oracle run");
+    let single_worker_out = dir.path().join("single_worker.bam");
+    run_retag(&input, &single_worker_out, None, &ops, None).expect("single-worker run");
 
-    let chain_out = dir.path().join("chain.bam");
-    run_retag(&input, &chain_out, Some(threads), &ops, None).expect("chain run");
+    let multi_worker_out = dir.path().join("multi_worker.bam");
+    run_retag(&input, &multi_worker_out, Some(threads), &ops, None).expect("multi-worker run");
 
-    let oracle = read_bam_output(&oracle_out);
-    let chain = read_bam_output(&chain_out);
-    assert_eq!(oracle.1.len(), 40, "all records emitted");
-    assert_eq!(chain, oracle, "chain (--threads {threads}) must match the serial oracle");
+    let single_worker = read_bam_output(&single_worker_out);
+    let multi_worker = read_bam_output(&multi_worker_out);
+    assert_eq!(single_worker.1.len(), 40, "all records emitted");
+    assert_eq!(
+        multi_worker, single_worker,
+        "--threads {threads} output must match the single-worker run"
+    );
 }
 
 // ── --metrics TSV byte-parity ──────────────────────────────────────────────
@@ -124,29 +127,35 @@ fn retag_chain_matches_single_threaded(#[case] threads: usize) {
 #[case::threads_1(1)]
 #[case::threads_2(2)]
 #[case::threads_4(4)]
-fn retag_chain_metrics_match_single_threaded(#[case] threads: usize) {
+fn metrics_match_across_worker_counts(#[case] threads: usize) {
     let dir = TempDir::new().unwrap();
     let input = mixed_input(dir.path(), 40);
     let ops = ["RX::copy::BX", "RX::move::CB"];
 
-    let oracle_out = dir.path().join("oracle.bam");
-    let oracle_m = dir.path().join("oracle.tsv");
-    run_retag(&input, &oracle_out, None, &ops, Some(&oracle_m)).expect("oracle run");
+    let single_worker_out = dir.path().join("single_worker.bam");
+    let single_worker_m = dir.path().join("single_worker.tsv");
+    run_retag(&input, &single_worker_out, None, &ops, Some(&single_worker_m))
+        .expect("single-worker run");
 
-    let chain_out = dir.path().join("chain.bam");
-    let chain_m = dir.path().join("chain.tsv");
-    run_retag(&input, &chain_out, Some(threads), &ops, Some(&chain_m)).expect("chain run");
+    let multi_worker_out = dir.path().join("multi_worker.bam");
+    let multi_worker_m = dir.path().join("multi_worker.tsv");
+    run_retag(&input, &multi_worker_out, Some(threads), &ops, Some(&multi_worker_m))
+        .expect("multi-worker run");
 
-    let oracle_tsv = std::fs::read_to_string(&oracle_m).expect("read oracle tsv");
-    let chain_tsv = std::fs::read_to_string(&chain_m).expect("read chain tsv");
-    assert_eq!(chain_tsv, oracle_tsv, "--metrics TSV must be byte-identical across paths");
+    let single_worker_tsv =
+        std::fs::read_to_string(&single_worker_m).expect("read single-worker tsv");
+    let multi_worker_tsv = std::fs::read_to_string(&multi_worker_m).expect("read multi-worker tsv");
+    assert_eq!(
+        multi_worker_tsv, single_worker_tsv,
+        "--metrics TSV must be byte-identical across worker counts"
+    );
     // Non-vacuous: at least one op actually applied to some records.
     assert!(
-        oracle_tsv.lines().any(|l| {
+        single_worker_tsv.lines().any(|l| {
             let cols: Vec<&str> = l.split('\t').collect();
             cols.len() >= 3 && cols[2].parse::<u64>().map(|n| n > 0).unwrap_or(false)
         }),
-        "expected a non-zero records_applied somewhere in the metrics:\n{oracle_tsv}"
+        "expected a non-zero records_applied somewhere in the metrics:\n{single_worker_tsv}"
     );
 }
 
@@ -155,29 +164,34 @@ fn retag_chain_metrics_match_single_threaded(#[case] threads: usize) {
 #[rstest]
 #[case::threads_1(1)]
 #[case::threads_2(2)]
-fn retag_chain_zero_match_op_matches_oracle(#[case] threads: usize) {
+fn zero_match_op_consistent_across_worker_counts(#[case] threads: usize) {
     let dir = TempDir::new().unwrap();
     let input = mixed_input(dir.path(), 20);
-    // `ZZ` is present on no record, so this op matches zero records on both paths.
+    // `ZZ` is present on no record, so this op matches zero records at any worker count.
     let ops = ["ZZ::delete"];
 
-    let oracle_out = dir.path().join("oracle.bam");
-    let oracle_m = dir.path().join("oracle.tsv");
-    run_retag(&input, &oracle_out, None, &ops, Some(&oracle_m)).expect("oracle run");
+    let single_worker_out = dir.path().join("single_worker.bam");
+    let single_worker_m = dir.path().join("single_worker.tsv");
+    run_retag(&input, &single_worker_out, None, &ops, Some(&single_worker_m))
+        .expect("single-worker run");
 
-    let chain_out = dir.path().join("chain.bam");
-    let chain_m = dir.path().join("chain.tsv");
-    run_retag(&input, &chain_out, Some(threads), &ops, Some(&chain_m)).expect("chain run");
+    let multi_worker_out = dir.path().join("multi_worker.bam");
+    let multi_worker_m = dir.path().join("multi_worker.tsv");
+    run_retag(&input, &multi_worker_out, Some(threads), &ops, Some(&multi_worker_m))
+        .expect("multi-worker run");
 
-    let oracle_tsv = std::fs::read_to_string(&oracle_m).unwrap();
-    let chain_tsv = std::fs::read_to_string(&chain_m).unwrap();
-    assert_eq!(chain_tsv, oracle_tsv, "zero-match metrics must match across paths");
+    let single_worker_tsv = std::fs::read_to_string(&single_worker_m).unwrap();
+    let multi_worker_tsv = std::fs::read_to_string(&multi_worker_m).unwrap();
+    assert_eq!(
+        multi_worker_tsv, single_worker_tsv,
+        "zero-match metrics must match across worker counts"
+    );
     // The durable observable of the warn: records_applied == 0 for the op.
     // TSV columns: operation, kind, records_applied, dst_overwritten, src_missing.
-    let zz_row = oracle_tsv
+    let zz_row = single_worker_tsv
         .lines()
         .find(|l| l.starts_with("ZZ::delete\t"))
-        .unwrap_or_else(|| panic!("metrics should carry the ZZ::delete row:\n{oracle_tsv}"));
+        .unwrap_or_else(|| panic!("metrics should carry the ZZ::delete row:\n{single_worker_tsv}"));
     let fields: Vec<&str> = zz_row.split('\t').collect();
     assert_eq!(
         fields.get(2).copied(),
@@ -185,7 +199,7 @@ fn retag_chain_zero_match_op_matches_oracle(#[case] threads: usize) {
         "records_applied must be 0 for a zero-match op, got row: {zz_row}"
     );
     // Output records are unchanged (no ZZ to delete), and the two BAMs agree.
-    assert_eq!(read_bam_output(&chain_out), read_bam_output(&oracle_out));
+    assert_eq!(read_bam_output(&multi_worker_out), read_bam_output(&single_worker_out));
 }
 
 // ── empty input: zero-record parity (degenerate boundary for the hooks) ─────
@@ -193,54 +207,58 @@ fn retag_chain_zero_match_op_matches_oracle(#[case] threads: usize) {
 #[rstest]
 #[case::threads_1(1)]
 #[case::threads_4(4)]
-fn retag_chain_empty_input_matches_oracle(#[case] threads: usize) {
+fn empty_input_consistent_across_worker_counts(#[case] threads: usize) {
     let dir = TempDir::new().unwrap();
     // Header-only BAM: exercises the finalize hooks' zero-record path.
     let input = write_input(dir.path(), "empty.bam", &[]);
     let ops = ["RX::copy::BX", "ZZ::delete"];
 
-    let oracle_out = dir.path().join("oracle.bam");
-    let oracle_m = dir.path().join("oracle.tsv");
-    run_retag(&input, &oracle_out, None, &ops, Some(&oracle_m)).expect("oracle run");
+    let single_worker_out = dir.path().join("single_worker.bam");
+    let single_worker_m = dir.path().join("single_worker.tsv");
+    run_retag(&input, &single_worker_out, None, &ops, Some(&single_worker_m))
+        .expect("single-worker run");
 
-    let chain_out = dir.path().join("chain.bam");
-    let chain_m = dir.path().join("chain.tsv");
-    run_retag(&input, &chain_out, Some(threads), &ops, Some(&chain_m)).expect("chain run");
+    let multi_worker_out = dir.path().join("multi_worker.bam");
+    let multi_worker_m = dir.path().join("multi_worker.tsv");
+    run_retag(&input, &multi_worker_out, Some(threads), &ops, Some(&multi_worker_m))
+        .expect("multi-worker run");
 
-    // Header-only output, identical across paths.
-    assert_eq!(read_bam_output(&chain_out), read_bam_output(&oracle_out));
-    // Metrics TSVs byte-identical (all counts zero on both paths).
+    // Header-only output, identical across worker counts.
+    assert_eq!(read_bam_output(&multi_worker_out), read_bam_output(&single_worker_out));
+    // Metrics TSVs byte-identical (all counts zero at any worker count).
     assert_eq!(
-        std::fs::read_to_string(&chain_m).unwrap(),
-        std::fs::read_to_string(&oracle_m).unwrap(),
-        "empty-input metrics must match across paths"
+        std::fs::read_to_string(&multi_worker_m).unwrap(),
+        std::fs::read_to_string(&single_worker_m).unwrap(),
+        "empty-input metrics must match across worker counts"
     );
 }
 
 // ── multi-batch: enough records to cross pipeline batch boundaries ──────────
 
 #[test]
-fn retag_chain_multi_batch_matches_oracle() {
+fn multi_batch_consistent_across_worker_counts() {
     let dir = TempDir::new().unwrap();
     let input = mixed_input(dir.path(), 5_000);
     let ops = ["RX::copy::BX", "RX::delete"];
 
-    let oracle_out = dir.path().join("oracle.bam");
-    let oracle_m = dir.path().join("oracle.tsv");
-    run_retag(&input, &oracle_out, None, &ops, Some(&oracle_m)).expect("oracle run");
+    let single_worker_out = dir.path().join("single_worker.bam");
+    let single_worker_m = dir.path().join("single_worker.tsv");
+    run_retag(&input, &single_worker_out, None, &ops, Some(&single_worker_m))
+        .expect("single-worker run");
 
-    let chain_out = dir.path().join("chain.bam");
-    let chain_m = dir.path().join("chain.tsv");
-    run_retag(&input, &chain_out, Some(4), &ops, Some(&chain_m)).expect("chain run");
+    let multi_worker_out = dir.path().join("multi_worker.bam");
+    let multi_worker_m = dir.path().join("multi_worker.tsv");
+    run_retag(&input, &multi_worker_out, Some(4), &ops, Some(&multi_worker_m))
+        .expect("multi-worker run");
 
     assert_eq!(
-        read_bam_output(&chain_out),
-        read_bam_output(&oracle_out),
-        "multi-batch chain output must match the serial oracle"
+        read_bam_output(&multi_worker_out),
+        read_bam_output(&single_worker_out),
+        "multi-batch multi-worker output must match the single-worker run"
     );
     assert_eq!(
-        std::fs::read_to_string(&chain_m).unwrap(),
-        std::fs::read_to_string(&oracle_m).unwrap(),
-        "multi-batch summed metrics must match across paths"
+        std::fs::read_to_string(&multi_worker_m).unwrap(),
+        std::fs::read_to_string(&single_worker_m).unwrap(),
+        "multi-batch summed metrics must match across worker counts"
     );
 }
