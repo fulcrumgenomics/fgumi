@@ -307,6 +307,23 @@ impl ClippingMetricsCollection {
         }
     }
 
+    /// Merges another collection's raw `fragment`/`read_one`/`read_two` counters
+    /// into `self`.
+    ///
+    /// Deliberately does NOT touch `pair`/`all` — those are derived aggregates
+    /// that [`Self::finalize`] computes from the raw counters, so callers that
+    /// accumulate per-thread collections (e.g. the chain `--threads` clip path)
+    /// must merge every collection first and call `finalize` exactly once on the
+    /// merged total. That mirrors the single-threaded oracle's call sequence
+    /// (accumulate through the whole run, then finalize once at the end), so the
+    /// reported `pair`/`all` totals are identical regardless of how work was
+    /// sharded across threads.
+    pub fn merge(&mut self, other: &ClippingMetricsCollection) {
+        self.fragment.add(&other.fragment);
+        self.read_one.add(&other.read_one);
+        self.read_two.add(&other.read_two);
+    }
+
     /// Finalizes metrics by aggregating pair and all categories
     pub fn finalize(&mut self) {
         // Aggregate ReadOne and ReadTwo into Pair
@@ -322,6 +339,23 @@ impl ClippingMetricsCollection {
     #[must_use]
     pub fn all_metrics(&self) -> [&ClippingMetrics; 5] {
         [&self.fragment, &self.read_one, &self.read_two, &self.pair, &self.all]
+    }
+
+    /// Finalizes this collection (see [`Self::finalize`]) and writes the five-row
+    /// clipping-metrics TSV to `path`.
+    ///
+    /// Shared by the `clip` command's single-threaded oracle and the chain
+    /// `--threads` path's success-only finalize hook, so the
+    /// finalize → row-order → write sequence exists exactly once and the two
+    /// paths' metrics output cannot drift apart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `path` cannot be created or written to.
+    pub fn finalize_and_write<P: AsRef<std::path::Path>>(&mut self, path: P) -> anyhow::Result<()> {
+        self.finalize();
+        let rows = self.all_metrics().map(Clone::clone);
+        crate::writer::write_metrics(path, &rows, "clipping")
     }
 }
 
@@ -526,6 +560,60 @@ mod tests {
     fn test_clipping_metrics_collection_default() {
         let collection = ClippingMetricsCollection::default();
         assert_eq!(collection.fragment.reads, 0);
+    }
+
+    #[test]
+    fn test_clipping_metrics_collection_merge() {
+        // Two "worker" collections, each with raw fragment/read_one/read_two
+        // counters populated but never finalized (mirrors per-thread accumulator
+        // slots mid-run).
+        let mut worker_a = ClippingMetricsCollection::new();
+        let mut worker_b = ClippingMetricsCollection::new();
+
+        let record = create_test_record("90M", false);
+        worker_a.read_one.update(&record, ClipCounts { five_prime: 10, ..ClipCounts::default() });
+        worker_a.fragment.update(&record, ClipCounts { prior: 2, ..ClipCounts::default() });
+
+        worker_b.read_one.update(&record, ClipCounts { three_prime: 4, ..ClipCounts::default() });
+        worker_b.read_two.update(&record, ClipCounts { overlapping: 6, ..ClipCounts::default() });
+
+        let mut merged = ClippingMetricsCollection::new();
+        merged.merge(&worker_a);
+        merged.merge(&worker_b);
+
+        // Raw per-category counters are summed across both workers.
+        assert_eq!(merged.fragment.reads, 1);
+        assert_eq!(merged.fragment.bases_clipped_pre, 2);
+        assert_eq!(merged.read_one.reads, 2);
+        assert_eq!(merged.read_one.bases_clipped_five_prime, 10);
+        assert_eq!(merged.read_one.bases_clipped_three_prime, 4);
+        assert_eq!(merged.read_two.reads, 1);
+        assert_eq!(merged.read_two.bases_clipped_overlapping, 6);
+
+        // pair/all are untouched by merge (still zero) until finalize runs once
+        // on the merged total.
+        assert_eq!(merged.pair.reads, 0);
+        assert_eq!(merged.all.reads, 0);
+
+        merged.finalize();
+        assert_eq!(merged.pair.reads, 3); // read_one (2) + read_two (1)
+        assert_eq!(merged.all.reads, 4); // fragment (1) + pair (3)
+
+        // Merging then finalizing once must equal updating a single collection
+        // directly with the same operations (the property the chain path relies
+        // on: cross-worker sharding cannot change the reported totals).
+        let mut direct = ClippingMetricsCollection::new();
+        direct.read_one.update(&record, ClipCounts { five_prime: 10, ..ClipCounts::default() });
+        direct.fragment.update(&record, ClipCounts { prior: 2, ..ClipCounts::default() });
+        direct.read_one.update(&record, ClipCounts { three_prime: 4, ..ClipCounts::default() });
+        direct.read_two.update(&record, ClipCounts { overlapping: 6, ..ClipCounts::default() });
+        direct.finalize();
+
+        assert_eq!(merged.fragment.reads, direct.fragment.reads);
+        assert_eq!(merged.read_one.reads, direct.read_one.reads);
+        assert_eq!(merged.read_two.reads, direct.read_two.reads);
+        assert_eq!(merged.pair.reads, direct.pair.reads);
+        assert_eq!(merged.all.reads, direct.all.reads);
     }
 
     #[test]

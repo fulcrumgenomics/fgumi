@@ -283,19 +283,348 @@ fn test_clip_rejects_coordinate_sorted_input(#[case] extra_args: &[&str]) {
     );
 }
 
-/// `--metrics` combined with `--threads` must fail fast: detailed clipping metrics are only
-/// produced by the single-threaded path, so accepting `--metrics` under `--threads` would
-/// silently drop a user-requested output file. This reader-free guard runs before the chain
-/// dispatch; pin it so a regression that dropped it would be caught rather than silently
-/// ignoring the flag.
+/// Builds a query-grouped BAM covering the shapes `--metrics` must count correctly:
+/// a lone fragment, a plain overlapping pair (no pre-existing clipping), a pair with
+/// pre-existing SOFT clipping on R1, and a pair with pre-existing HARD clipping on R2.
+/// Every `ClipCounts` field the chain `--metrics` path can populate (`prior`,
+/// `five_prime`/`three_prime` fixed clipping, `overlapping`) ends up non-zero when run
+/// with `--clip-overlapping-reads --read-one-five-prime 1 --read-two-three-prime 1`.
+///
+/// The four-shape block is repeated `repeats` times (unique QNAME per repeat, same
+/// positions -- clip only ever compares records *within* one template, so distinct
+/// templates sharing coordinates is harmless) so callers can force the chain
+/// `--threads N` path across enough `GroupBam` batches to exercise real cross-worker
+/// `PerThreadAccumulator` sharding -- see
+/// `test_clip_metrics_match_across_threading_modes` for why that matters.
+fn build_clip_metrics_parity_bam(path: &Path, repeats: usize) {
+    let mut records: Vec<RawRecord> = Vec::new();
+    push_clip_metrics_parity_records(&mut records, repeats);
+    create_bam_from_records(path, &records);
+}
+
+/// Appends `repeats` copies of the four-shape block to `records`. Factored out of
+/// [`build_clip_metrics_parity_bam`] so `test_clip_metrics_not_written_on_chain_failure`
+/// can append a malformed template after a run of otherwise-valid ones, in the same
+/// query-grouped record stream.
+fn push_clip_metrics_parity_records(records: &mut Vec<RawRecord>, repeats: usize) {
+    for i in 0..repeats {
+        // A lone fragment (unpaired primary), no pre-existing clipping.
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(format!("frag1_{i:05}").as_bytes())
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .flags(0)
+                .ref_id(0)
+                .pos(499)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]); // 8M
+            records.push(b.build());
+        }
+
+        // A proper, overlapping pair with no pre-existing clipping.
+        {
+            let mut r1 = SamBuilder::new();
+            r1.read_name(format!("pair1_{i:05}").as_bytes())
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]) // 8M
+                .mate_ref_id(0)
+                .mate_pos(103)
+                .template_length(12);
+            records.push(r1.build());
+
+            let mut r2 = SamBuilder::new();
+            r2.read_name(format!("pair1_{i:05}").as_bytes())
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+                .ref_id(0)
+                .pos(103)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]) // 8M
+                .mate_ref_id(0)
+                .mate_pos(99)
+                .template_length(-12);
+            records.push(r2.build());
+        }
+
+        // A pair with pre-existing SOFT clipping on R1 (2S6M): non-zero `prior`
+        // base-clip count for read_one.
+        {
+            let mut r1 = SamBuilder::new();
+            r1.read_name(format!("pair2_{i:05}").as_bytes())
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+                .ref_id(0)
+                .pos(199)
+                .mapq(60)
+                .cigar_ops(&[(2 << 4) | 4, 6 << 4]) // 2S6M
+                .mate_ref_id(0)
+                .mate_pos(203)
+                .template_length(12);
+            records.push(r1.build());
+
+            let mut r2 = SamBuilder::new();
+            r2.read_name(format!("pair2_{i:05}").as_bytes())
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+                .ref_id(0)
+                .pos(203)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]) // 8M
+                .mate_ref_id(0)
+                .mate_pos(199)
+                .template_length(-12);
+            records.push(r2.build());
+        }
+
+        // A pair with pre-existing HARD clipping on R2 (6M2H): non-zero `prior`
+        // base-clip count for read_two. Hard-clipped bases are absent from SEQ/QUAL,
+        // so R2's sequence is only 6 bases long.
+        {
+            let mut r1 = SamBuilder::new();
+            r1.read_name(format!("pair3_{i:05}").as_bytes())
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+                .ref_id(0)
+                .pos(299)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]) // 8M
+                .mate_ref_id(0)
+                .mate_pos(303)
+                .template_length(10);
+            records.push(r1.build());
+
+            let mut r2 = SamBuilder::new();
+            r2.read_name(format!("pair3_{i:05}").as_bytes())
+                .sequence(b"ACGTAC")
+                .qualities(&[30; 6])
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+                .ref_id(0)
+                .pos(303)
+                .mapq(60)
+                .cigar_ops(&[6 << 4, (2 << 4) | 5]) // 6M2H
+                .mate_ref_id(0)
+                .mate_pos(299)
+                .template_length(-10);
+            records.push(r2.build());
+        }
+    }
+}
+
+/// Number of times the 4-shape block (`build_clip_metrics_parity_bam`) is repeated
+/// in `test_clip_metrics_match_across_threading_modes`'s fixture: `4 * REPEATS`
+/// templates total.
+///
+/// This must be large enough to force the chain `--threads N` path across *many*
+/// `GroupBam` batches, not just one -- `GroupBam` caps every emitted batch at
+/// `BamPipelineTuning::template_batch_size` (fixed at 500 templates regardless of
+/// `--threads`; see `crates/.../pipeline/steps/tuning.rs`), and each `ClipTemplates`
+/// worker call (one call per batch) runs `with_slot` on whichever `PerThreadAccumulator`
+/// slot its calling OS thread owns. A too-small fixture (one batch) would let every
+/// batch land on a single worker/slot even at `--threads 4`, so a
+/// `ClipMetricsFinalizeHook` bug that reduced only a subset of slots (e.g. summed only
+/// slot 0) would still merge correctly by accident and this test would not catch it --
+/// exactly the gap `parallel_threads_populate_and_merge_distinct_clip_metrics_slots`
+/// (`src/lib/per_thread_accumulator.rs`) closes deterministically at the
+/// `PerThreadAccumulator` level. Here, `4 * REPEATS = 8000` templates make `16`
+/// `GroupBam` batches (`8000 / 500`) available to the pipeline's pull-based `Parallel`
+/// worker scheduler (every idle worker thread can claim the next available batch --
+/// see `crates/fgumi-pipeline-core/src/runtime/pool.rs`'s "each worker has its own
+/// clone" note) -- 4x the `--threads 4` worker count, so multiple distinct worker
+/// threads claiming at least one batch each (and therefore populating multiple
+/// distinct accumulator slots) is the expected, reliably-reproduced outcome, not a
+/// lucky scheduling accident.
+const REPEATS: usize = 2000;
+
+/// `--metrics` on the chain `--threads N` path must now succeed (previously a hard
+/// error) and produce a metrics TSV that matches the single-threaded oracle exactly.
+///
+/// Detailed metrics are collected via a per-thread `ClippingMetricsCollection`
+/// accumulator (one slot per worker), reduced by summing raw `fragment`/`read_one`/
+/// `read_two` counters across slots and then calling `finalize()` once -- pure integer
+/// addition is commutative and associative, so the reduction is order-independent and
+/// the TSV is byte-identical to the oracle's regardless of thread count or how work was
+/// sharded. This is the load-bearing parity test for this feature.
+///
+/// The fixture is sized (`REPEATS`, see its doc comment) to force real cross-worker
+/// `PerThreadAccumulator` sharding at `--threads 2`/`4`, not just a single-slot
+/// accumulation -- so a reduction bug that dropped a worker's slot would change the
+/// merged totals and fail the byte-identity assertion below, rather than passing by
+/// accident because everything happened to land in one slot.
+#[rstest]
+#[case::threads_1(1)]
+#[case::threads_2(2)]
+#[case::threads_4(4)]
+fn test_clip_metrics_match_across_threading_modes(#[case] threads: usize) {
+    use fgumi_lib::metrics::{ClippingMetrics, ReadType};
+
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+    build_clip_metrics_parity_bam(&input_bam, REPEATS);
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    let chain_out = temp_dir.path().join("chain.bam");
+    let oracle_metrics = temp_dir.path().join("oracle.metrics.txt");
+    let chain_metrics = temp_dir.path().join("chain.metrics.txt");
+
+    let opts =
+        ["--clip-overlapping-reads", "--read-one-five-prime", "1", "--read-two-three-prime", "1"];
+
+    // Oracle: no --threads (single-threaded engine, the parity reference).
+    {
+        let mut args = vec![
+            "clip",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            oracle_out.to_str().unwrap(),
+            "--ref",
+            ref_path.to_str().unwrap(),
+            "--metrics",
+            oracle_metrics.to_str().unwrap(),
+        ];
+        args.extend_from_slice(&opts);
+        Clip::try_parse_from(args)
+            .expect("parse oracle args")
+            .execute("fgumi clip")
+            .expect("oracle clip failed");
+    }
+
+    // Chain: --threads N with --metrics. Must succeed and write the metrics file.
+    {
+        let threads_arg = threads.to_string();
+        let mut args = vec![
+            "clip",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            chain_out.to_str().unwrap(),
+            "--ref",
+            ref_path.to_str().unwrap(),
+            "--metrics",
+            chain_metrics.to_str().unwrap(),
+            "--threads",
+            &threads_arg,
+        ];
+        args.extend_from_slice(&opts);
+        Clip::try_parse_from(args)
+            .expect("parse chain args")
+            .execute("fgumi clip")
+            .expect("chain clip with --metrics must now succeed under --threads");
+    }
+    assert!(chain_metrics.exists(), "chain --metrics file must be written");
+
+    // Non-vacuous: every ClipCounts field the fixture exercises (prior soft/hard
+    // clip, fixed 5'/3' clipping, overlap clipping) must show up as a real,
+    // non-zero count in the oracle -- not an all-zero table.
+    let oracle_rows =
+        fgumi_lib::metrics::read_metrics::<_, ClippingMetrics>(&oracle_metrics, "clipping")
+            .expect("parse oracle metrics");
+    let by_type = |t: ReadType| {
+        oracle_rows
+            .iter()
+            .find(|m| m.read_type == t)
+            .unwrap_or_else(|| panic!("missing {t:?} row in metrics TSV"))
+    };
+    assert_eq!(by_type(ReadType::Fragment).reads, REPEATS, "one fragment read per repeat");
+    assert!(
+        by_type(ReadType::ReadOne).bases_clipped_pre > 0,
+        "pair2's pre-existing R1 soft clip must count as `prior`"
+    );
+    assert!(
+        by_type(ReadType::ReadTwo).bases_clipped_pre > 0,
+        "pair3's pre-existing R2 hard clip must count as `prior`"
+    );
+    assert!(
+        by_type(ReadType::ReadOne).bases_clipped_five_prime > 0
+            || by_type(ReadType::ReadTwo).bases_clipped_five_prime > 0,
+        "--read-one-five-prime 1 must clip at least one read"
+    );
+    assert!(
+        by_type(ReadType::ReadTwo).bases_clipped_three_prime > 0
+            || by_type(ReadType::ReadOne).bases_clipped_three_prime > 0,
+        "--read-two-three-prime 1 must clip at least one read"
+    );
+    assert!(
+        by_type(ReadType::Pair).bases_clipped_overlapping > 0,
+        "pair1's overlap must be clipped and rolled up into Pair"
+    );
+
+    // The chain (--threads N) metrics TSV must be byte-identical to the oracle's.
+    let oracle_content = fs::read_to_string(&oracle_metrics).expect("read oracle metrics");
+    let chain_content = fs::read_to_string(&chain_metrics).expect("read chain metrics");
+    assert_eq!(
+        oracle_content, chain_content,
+        "metrics TSV must be byte-identical between the oracle and chain (--threads {threads}) paths",
+    );
+}
+
+/// Builds a query-grouped BAM of `valid_repeats` copies of the four-shape parity
+/// block, followed by one malformed template: two primary (non-secondary,
+/// non-supplementary) first-of-pair reads sharing one QNAME. The chain's `GroupBam`
+/// step groups records into `Template`s via the shared grouper (`src/lib/template.rs`),
+/// which rejects that shape ("Multiple non-secondary, non-supplemental R1 records") --
+/// the same invariant `find_primary_pair_indices` in `commands::clip` also enforces,
+/// defensively, on the `RawRecord` path. Placed last, so grouping fails only after every
+/// valid template ahead of it has already been grouped into complete batches and handed
+/// to the downstream `ClipTemplates` workers -- `clip_templates_in_batch` commits each
+/// template's counts into its calling worker's live `PerThreadAccumulator` slot as it
+/// loops, not just at batch end, so by the time `GroupBam` hits the malformed record and
+/// fails the run, real (non-zero) metrics have very likely already been written into at
+/// least one slot.
+fn build_clip_metrics_failure_bam(path: &Path, valid_repeats: usize) {
+    let mut records: Vec<RawRecord> = Vec::new();
+    push_clip_metrics_parity_records(&mut records, valid_repeats);
+
+    for i in 0..2 {
+        let mut b = SamBuilder::new();
+        b.read_name(b"malformed1")
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .ref_id(0)
+            .pos(900 + i * 20)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]); // 8M
+        records.push(b.build());
+    }
+
+    create_bam_from_records(path, &records);
+}
+
+/// A failed/partial chain `--threads N` run must leave NO `--metrics` file on disk at
+/// all, not a partial/stale one.
+///
+/// `ClipMetricsFinalizeHook` is registered on `finalize_on_success`
+/// (`src/lib/pipeline/chains/builder.rs::add_clip`), which `drain_finalize`
+/// (`src/lib/pipeline/chains/finalize.rs`) runs only once `Pipeline::run` AND every
+/// always-run `finalize` hook have succeeded -- see
+/// `drain_finalize_skips_success_hooks_when_pipeline_fails` for the generic mechanism
+/// this test exercises end-to-end through the real `clip` command. The fixture
+/// (`build_clip_metrics_failure_bam`) forces a genuine mid-run pipeline failure via a
+/// malformed template appended after many valid ones, so real metrics accumulation
+/// happens in at least one `PerThreadAccumulator` slot before the failure -- proving the
+/// hook actually discards in-progress state rather than merely never having any to write.
 #[test]
-fn test_clip_rejects_metrics_with_threads() {
-    let temp_dir = TempDir::new().unwrap();
+fn test_clip_metrics_not_written_on_chain_failure() {
+    let temp_dir = TempDir::new().expect("temp dir");
     let input_bam = temp_dir.path().join("input.bam");
     let output_bam = temp_dir.path().join("output.bam");
     let metrics_path = temp_dir.path().join("metrics.txt");
     let ref_path = create_test_reference(temp_dir.path());
-    build_clip_parity_bam(&input_bam, 8);
+    // REPEATS (many `GroupBam` batches' worth) valid templates ahead of the malformed
+    // one, so grouping fails only after real work has already reached `ClipTemplates`.
+    build_clip_metrics_failure_bam(&input_bam, REPEATS);
 
     let cmd = Clip::try_parse_from([
         "clip",
@@ -306,17 +635,25 @@ fn test_clip_rejects_metrics_with_threads() {
         "--ref",
         ref_path.to_str().unwrap(),
         "--clip-overlapping-reads",
+        "--read-one-five-prime",
+        "1",
+        "--read-two-three-prime",
+        "1",
         "--metrics",
         metrics_path.to_str().unwrap(),
         "--threads",
-        "2",
+        "4",
     ])
     .expect("failed to parse clip args");
 
-    let err = cmd.execute("fgumi clip").expect_err("--metrics must be rejected under --threads");
+    let err = cmd.execute("fgumi clip").expect_err("malformed template must fail the chain run");
     assert!(
-        err.to_string().contains("cannot be used with --threads"),
+        err.to_string().contains("Multiple non-secondary, non-supplemental R1"),
         "unexpected error message: {err}"
+    );
+    assert!(
+        !metrics_path.exists(),
+        "a failed chain run must not write a --metrics file, even a partial one"
     );
 }
 
