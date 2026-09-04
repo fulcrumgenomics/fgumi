@@ -4,12 +4,12 @@
 //! helper that synthesizes an unmapped-BAM `@HD`/`@RG`/`@CO` header from
 //! [`ExtractOptions`], both consumed by `ChainBuilder::add_extract`.
 //!
-//! The header builder reproduces the same `@HD`, `@RG`, and `@CO` records
-//! that [`Extract::create_header`] emits, minus the `@PG` record —
-//! [`ChainBuilder::new`] adds that uniformly for all chains.
+//! `build_fastq_header` is the only unmapped-BAM header synthesizer for extract
+//! (the chain is extract's only execution path). It emits the `@HD`, `@RG`, and
+//! `@CO` records minus the `@PG` record — [`ChainBuilder::new`] adds that
+//! uniformly for all chains.
 //!
 //! [`ExtractOptions`]: crate::commands::extract::ExtractOptions
-//! [`Extract::create_header`]: crate::commands::extract::Extract
 //! [`ChainBuilder::new`]: crate::pipeline::chains::builder::ChainBuilder
 
 use std::sync::Arc;
@@ -59,13 +59,13 @@ impl FinalizeHook for ExtractFinalizeHook {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// build_fastq_header — reproduce Extract::create_header sans @PG
+// build_fastq_header — the unmapped-BAM header synthesizer (sans @PG)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Conditionally add a read-group tag value to a [`Builder<ReadGroup>`].
 ///
 /// If `value` is `Some`, inserts the tag with the value. Otherwise returns
-/// the builder unchanged. Mirrors `Extract::add_to_read_group`.
+/// the builder unchanged.
 fn add_to_read_group(
     rg: Builder<ReadGroup>,
     tag: noodles::sam::header::record::value::map::tag::Other<rg_tag::Standard>,
@@ -84,11 +84,10 @@ fn add_to_read_group(
 /// The header does **not** include a `@PG` record — [`ChainBuilder::new`]
 /// injects that uniformly for every chain.
 ///
-/// This reproduces the header structure of [`Extract::create_header`] so the
-/// two code paths produce byte-identical headers (modulo `@PG`).
+/// This is the sole header synthesizer for extract (the chain is extract's only
+/// execution path).
 ///
 /// [`ChainBuilder::new`]: crate::pipeline::chains::builder::ChainBuilder
-/// [`Extract::create_header`]: crate::commands::extract::Extract
 pub(crate) fn build_fastq_header(extract_opts: &ExtractOptions) -> Result<Header> {
     let mut header = Header::builder();
 
@@ -111,11 +110,11 @@ pub(crate) fn build_fastq_header(extract_opts: &ExtractOptions) -> Result<Header
     rg = add_to_read_group(rg, rg_tag::SAMPLE, Some(&extract_opts.sample));
     rg = add_to_read_group(rg, rg_tag::LIBRARY, Some(&extract_opts.library));
     rg = add_to_read_group(rg, rg_tag::BARCODE, extract_opts.barcode.as_ref());
-    // PLATFORM/PL is always written, defaulting to "illumina" — the standalone
-    // `Extract::create_header` takes a non-optional platform (CLI default
-    // "illumina") and always emits PL, so omitting it when `platform` is None
-    // would diverge. (Reusing `Extract::create_header` outright to erase this
-    // whole duplication is deferred to the extract wiring PR.)
+    // PLATFORM/PL is always written, defaulting to "illumina": the `extract` CLI
+    // takes a non-optional platform (default "illumina"), and `to_extract_options`
+    // projects it as `Some(..)`, so PL is always emitted. Defaulting here too keeps
+    // the header well-formed if a caller constructs `ExtractOptions` with a `None`
+    // platform directly (e.g. in tests).
     let platform = extract_opts.platform.clone().unwrap_or_else(|| "illumina".to_string());
     rg = add_to_read_group(rg, rg_tag::PLATFORM, Some(&platform));
     rg = add_to_read_group(rg, rg_tag::PLATFORM_UNIT, extract_opts.platform_unit.as_ref());
@@ -234,8 +233,8 @@ mod tests {
     #[test]
     fn build_fastq_header_platform_defaults_unit_omitted() {
         // With platform unset, PL is still written (defaulted to "illumina"),
-        // matching the standalone `Extract::create_header`, which always emits
-        // PL. Platform-unit has no default and is omitted when None.
+        // so a directly-constructed `ExtractOptions` with no platform still yields
+        // a well-formed @RG. Platform-unit has no default and is omitted when None.
         let mut opts = test_extract_opts();
         opts.platform = None;
         opts.platform_unit = None;
@@ -245,7 +244,7 @@ mod tests {
         assert_eq!(
             rg.other_fields().get(&rg_tag::PLATFORM).map(std::string::ToString::to_string),
             Some("illumina".to_string()),
-            "PL must default to illumina when platform is None, matching standalone create_header"
+            "PL must default to illumina when platform is None"
         );
         assert!(rg.other_fields().get(&rg_tag::PLATFORM_UNIT).is_none());
     }

@@ -23,18 +23,13 @@ use crate::commands::common::{
 };
 use crate::fastq::FastqSegment;
 use crate::fastq::FastqSet;
-use crate::fastq::ReadSetIterator;
 use crate::fastq_deinterleave::deinterleave;
 use crate::fastq_parse::strip_read_suffix;
-use crate::logging::OperationTimer;
 use crate::sam::SamTag;
-use crate::unified_pipeline::fastq_out_of_sync_error;
 use crate::validation::validate_input_exists;
 use anyhow::{Context, Result, bail, ensure};
 use bstr::{BString, ByteSlice};
 use clap::Parser;
-use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{RawBamWriter, create_raw_bam_writer};
 use fgumi_raw_bam::UnmappedSamBuilder;
 use fgumi_raw_bam::fields::flags;
 use log::{debug, info};
@@ -45,17 +40,6 @@ use crate::read_structure::{ReadStructure, SegmentType};
 use fgumi_bam_io::create_bam_reader;
 use fgumi_bam_io::{ChainedReader, InputFormat, TeeReader, is_stdin_path};
 use fgumi_simd_fastq::SimdFastqReader;
-use noodles::sam::header::Header;
-use noodles::sam::header::record::value::Map;
-use noodles::sam::header::record::value::map::ReadGroup;
-use noodles::sam::header::record::value::map::builder::Builder;
-use noodles::sam::header::record::value::map::header::group_order;
-use noodles::sam::header::record::value::map::header::sort_order;
-use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
-use noodles::sam::header::record::value::{
-    Map as HeaderRecordMap,
-    map::{Header as HeaderRecord, Tag as HeaderTag},
-};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -684,9 +668,9 @@ impl Extract {
     /// and overrides the field before the extract step runs (see
     /// [`ExtractOptions::quality_encoding`]). Every other field maps directly
     /// from the identically-named CLI flag; `platform` (CLI default `"illumina"`)
-    /// becomes `Some(..)` so `build_fastq_header` always emits `@RG PL:`, matching
-    /// `Self::create_header`. `clipping_attribute` is intentionally dropped — it
-    /// does not apply to FASTQ input (there is no existing clipping to adjust).
+    /// becomes `Some(..)` so `build_fastq_header` always emits `@RG PL:`.
+    /// `clipping_attribute` is intentionally dropped — it does not apply to FASTQ
+    /// input (there is no existing clipping to adjust).
     #[must_use]
     pub fn to_extract_options(&self) -> ExtractOptions {
         ExtractOptions {
@@ -715,16 +699,17 @@ impl Extract {
         }
     }
 
-    /// Run extract on the declarative chain builder (the `--threads` path).
+    /// Run extract on the declarative chain builder — the only execution path.
     ///
-    /// Hand-builds the [`ChainSpec`] (rather than using
-    /// [`ChainSpec::single_stage`], which is BAM-in/BAM-out): the source is a
-    /// FASTQ source — [`SourceSpec::InterleavedFastq`] for `--interleaved`, else
+    /// [`Command::execute`] always dispatches here, with or without `--threads`
+    /// (absent `--threads` runs the chain at a single worker). Hand-builds the
+    /// [`ChainSpec`] (rather than using [`ChainSpec::single_stage`], which is
+    /// BAM-in/BAM-out): the source is a FASTQ source —
+    /// [`SourceSpec::InterleavedFastq`] for `--interleaved`, else
     /// [`SourceSpec::Fastqs`] — and the sink is a BAM. The chain opens its own
     /// readers and detects the quality encoding in `ChainBuilder::open_source`;
     /// `read_streams`/`verify_crc` are BAM-reader knobs and inert here (the FASTQ
-    /// source carries its CRC policy in [`ExtractOptions`]). The no-`--threads`
-    /// serial loop in [`Command::execute`] is the in-process parity oracle.
+    /// source carries its CRC policy in [`ExtractOptions`]).
     ///
     /// [`ChainSpec`]: crate::pipeline::chains::ChainSpec
     /// [`ChainSpec::single_stage`]: crate::pipeline::chains::ChainSpec::single_stage
@@ -863,70 +848,6 @@ impl Extract {
         Ok(())
     }
 
-    /// Helper to conditionally add a tag/value pair to a read group
-    ///
-    /// If the value is Some, inserts the tag with the value into the read group builder.
-    /// If the value is None, returns the builder unchanged.
-    ///
-    /// # Arguments
-    /// * `rg` - The read group builder
-    /// * `tag` - The tag to insert
-    /// * `value` - Optional value to insert
-    ///
-    /// # Returns
-    /// The read group builder, potentially with the tag added
-    fn add_to_read_group(
-        rg: Builder<ReadGroup>,
-        tag: noodles::sam::header::record::value::map::tag::Other<rg_tag::Standard>,
-        value: Option<&String>,
-    ) -> Builder<ReadGroup> {
-        if let Some(v) = value { rg.insert(tag, v.clone()) } else { rg }
-    }
-
-    /// Create SAM header
-    fn create_header(&self, command_line: &str) -> Result<Header> {
-        let mut header = Header::builder();
-
-        // Sort and group order
-        let HeaderTag::Other(so_tag) = HeaderTag::from([b'S', b'O']) else { unreachable!() };
-        let HeaderTag::Other(go_tag) = HeaderTag::from([b'G', b'O']) else { unreachable!() };
-        let map = HeaderRecordMap::<HeaderRecord>::builder()
-            .insert(so_tag, sort_order::UNSORTED)
-            .insert(go_tag, group_order::QUERY)
-            .build()?;
-        header = header.set_header(map);
-
-        // Add comments
-        for comment in &self.comment {
-            header = header.add_comment(comment.clone());
-        }
-
-        // Create read group
-        let mut rg = Map::<ReadGroup>::builder();
-        rg = Self::add_to_read_group(rg, rg_tag::SAMPLE, Some(&self.sample.clone()));
-        rg = Self::add_to_read_group(rg, rg_tag::LIBRARY, Some(&self.library.clone()));
-        rg = Self::add_to_read_group(rg, rg_tag::BARCODE, self.barcode.as_ref());
-        rg = Self::add_to_read_group(rg, rg_tag::PLATFORM, Some(&self.platform));
-        rg = Self::add_to_read_group(rg, rg_tag::PLATFORM_UNIT, self.platform_unit.as_ref());
-        rg = Self::add_to_read_group(rg, rg_tag::PLATFORM_MODEL, self.platform_model.as_ref());
-        rg =
-            Self::add_to_read_group(rg, rg_tag::SEQUENCING_CENTER, self.sequencing_center.as_ref());
-        rg = Self::add_to_read_group(
-            rg,
-            rg_tag::PREDICTED_MEDIAN_INSERT_SIZE,
-            self.predicted_insert_size.map(|i| i.to_string()).as_ref(),
-        );
-        rg = Self::add_to_read_group(rg, rg_tag::DESCRIPTION, self.description.as_ref());
-        rg = Self::add_to_read_group(rg, rg_tag::PRODUCED_AT, self.run_date.as_ref());
-
-        header = header.add_read_group(self.read_group_id.clone(), rg.build()?);
-
-        // Add @PG record
-        header = crate::commands::common::add_pg_to_builder(header, command_line)?;
-
-        Ok(header.build())
-    }
-
     /// Joins byte slices with a separator, pre-allocating capacity.
     /// Returns empty `BString` if iterator is empty.
     fn join_bytes_with_separator<'a>(
@@ -1024,43 +945,6 @@ impl Extract {
         Ok((name_part.to_vec(), None))
     }
 
-    /// Validates that all read names match across the read sets
-    fn validate_read_names_match(read_sets: &[FastqSet]) -> Result<()> {
-        if read_sets.is_empty() {
-            return Ok(());
-        }
-
-        // Extract the read name from the first header (removing @ prefix if present)
-        let first_header = &read_sets[0].header;
-        let first_name = if first_header.starts_with(b"@") {
-            &first_header[1..]
-        } else {
-            first_header.as_slice()
-        };
-
-        // Strip space comments and /1, /2 suffixes for comparison
-        let first_name_part = strip_read_suffix(first_name);
-
-        // Check that all other read sets have the same name
-        for (i, read_set) in read_sets.iter().enumerate().skip(1) {
-            let header = &read_set.header;
-            let name = if header.starts_with(b"@") { &header[1..] } else { header.as_slice() };
-
-            let name_part = strip_read_suffix(name);
-
-            if name_part != first_name_part {
-                bail!(
-                    "Read names do not match across FASTQs: '{}' vs '{}' (FASTQ index 0 vs {})",
-                    String::from_utf8_lossy(first_name_part),
-                    String::from_utf8_lossy(name_part),
-                    i
-                );
-            }
-        }
-
-        Ok(())
-    }
-
     /// Context for a read name that BAM cannot represent.
     ///
     /// The builder's own error reports the length and the limit but not which
@@ -1083,234 +967,6 @@ impl Extract {
             format!("'{head}...{tail}' (name shown truncated)")
         };
         format!("could not write the record for read {shown}")
-    }
-
-    /// Builds one raw BAM record for a template segment, substituting a single `N` @ Q2 when
-    /// the segment has no sequence.
-    ///
-    /// The name comes from the input FASTQ header (plus the UMI when `--annotate-read-names`
-    /// is set), so an over-long name is bad input rather than a bug: fail cleanly via
-    /// `try_build_record` instead of panicking partway through writing the output BAM, and
-    /// attach [`Self::read_name_too_long_context`] so the message names the offending read.
-    ///
-    /// Used by the serial-oracle `make_raw_records` path; the chain path's
-    /// `make_raw_records_from_fastq_set` builds records through the same
-    /// `UnmappedSamBuilder` API, which the parity tests keep in step.
-    fn build_template_record(
-        builder: &mut UnmappedSamBuilder,
-        name: &[u8],
-        flag: u16,
-        seq: &[u8],
-        quals: &[u8],
-        encoding: QualityEncoding,
-    ) -> Result<()> {
-        if seq.is_empty() {
-            builder.try_build_record(name, flag, b"N", &[2u8])
-        } else {
-            builder.try_build_record(name, flag, seq, &encoding.to_standard_numeric(quals))
-        }
-        .with_context(|| Self::read_name_too_long_context(name))
-    }
-
-    /// Write raw BAM records from a read set directly to a writer.
-    ///
-    /// Uses `UnmappedSamBuilder` to construct records as raw bytes,
-    /// bypassing `RecordBuf` allocation and encoding overhead.
-    ///
-    /// Returns the number of records written.
-    #[allow(clippy::too_many_lines)]
-    fn make_raw_records(
-        &self,
-        read_set: &FastqSet,
-        encoding: QualityEncoding,
-        builder: &mut UnmappedSamBuilder,
-        writer: &mut RawBamWriter,
-    ) -> Result<u64> {
-        let templates: Vec<&FastqSegment> = read_set.template_segments().collect();
-
-        let read_name = String::from_utf8_lossy(&read_set.header);
-        ensure!(!templates.is_empty(), "No template segments found for read: {read_name}");
-
-        // Extract various barcode types as BString - use optimized join
-        let cell_barcode_bs = Self::join_bytes_with_separator(
-            read_set.cell_barcode_segments().map(|s| s.seq.as_slice()),
-            b'-',
-        );
-        let cell_quals_bs = Self::join_bytes_with_separator(
-            read_set.cell_barcode_segments().map(|s| s.quals.as_slice()),
-            b' ',
-        );
-        let sample_barcode_bs = Self::join_bytes_with_separator(
-            read_set.sample_barcode_segments().map(|s| s.seq.as_slice()),
-            b'-',
-        );
-        let sample_quals_bs = Self::join_bytes_with_separator(
-            read_set.sample_barcode_segments().map(|s| s.quals.as_slice()),
-            b' ',
-        );
-        let umi_bs = Self::join_bytes_with_separator(
-            read_set.molecular_barcode_segments().map(|s| s.seq.as_slice()),
-            b'-',
-        );
-        let umi_qual_bs = Self::join_bytes_with_separator(
-            read_set.molecular_barcode_segments().map(|s| s.quals.as_slice()),
-            b' ',
-        );
-
-        // Extract UMI from read name if requested
-        let (read_name_bytes, umi_from_name) =
-            Self::extract_read_name_and_umi(&read_set.header, self.extract_umis_from_read_names)?;
-
-        // Prepare final UMI as BString - avoid format! and unnecessary allocations
-        let final_umi_bs: BString = match (umi_bs.is_empty(), &umi_from_name) {
-            (true, Some(from_name)) => BString::from(from_name.as_slice()),
-            (true, None) => BString::default(),
-            (false, Some(from_name)) => {
-                let mut combined = Vec::with_capacity(from_name.len() + 1 + umi_bs.len());
-                combined.extend_from_slice(from_name);
-                combined.push(b'-');
-                combined.extend_from_slice(umi_bs.as_bytes());
-                BString::from(combined)
-            }
-            (false, None) => umi_bs,
-        };
-
-        let num_templates = templates.len();
-
-        for (index, template) in templates.iter().enumerate() {
-            // Compute flags for unmapped reads
-            let mut flag = flags::UNMAPPED;
-            if num_templates == 2 {
-                flag |= flags::PAIRED | flags::MATE_UNMAPPED;
-                if index == 0 {
-                    flag |= flags::FIRST_SEGMENT;
-                } else {
-                    flag |= flags::LAST_SEGMENT;
-                }
-            }
-
-            // Set read name (optionally with UMI annotation)
-            let annotated_name: Option<Vec<u8>> = if self.annotate_read_names
-                && !final_umi_bs.is_empty()
-            {
-                let mut name = Vec::with_capacity(read_name_bytes.len() + 1 + final_umi_bs.len());
-                name.extend_from_slice(&read_name_bytes);
-                name.push(b'+');
-                name.extend_from_slice(final_umi_bs.as_bytes());
-                Some(name)
-            } else {
-                None
-            };
-            let final_read_name: &[u8] = annotated_name.as_deref().unwrap_or(&read_name_bytes);
-
-            Self::build_template_record(
-                builder,
-                final_read_name,
-                flag,
-                &template.seq,
-                &template.quals,
-                encoding,
-            )?;
-
-            // Append tags
-            // Read group
-            builder.append_string_tag(SamTag::RG, self.read_group_id.as_bytes());
-
-            // Cell barcode
-            if !cell_barcode_bs.is_empty() {
-                builder.append_string_tag(SamTag::CB, cell_barcode_bs.as_bytes());
-            }
-
-            if !cell_quals_bs.is_empty() && self.store_cell_quals {
-                builder.append_string_tag(SamTag::CY, cell_quals_bs.as_bytes());
-            }
-
-            // Sample barcode
-            if !sample_barcode_bs.is_empty() {
-                builder.append_string_tag(SamTag::BC, sample_barcode_bs.as_bytes());
-            }
-
-            if self.store_sample_barcode_qualities && !sample_quals_bs.is_empty() {
-                builder.append_string_tag(SamTag::QT, sample_quals_bs.as_bytes());
-            }
-
-            // UMI
-            if !final_umi_bs.is_empty() {
-                builder.append_string_tag(SamTag::RX, final_umi_bs.as_bytes());
-
-                // Single tag for all concatenated UMIs (if specified)
-                if let Some(single_tag) = self.single_tag {
-                    builder.append_string_tag(single_tag, final_umi_bs.as_bytes());
-                }
-
-                // Only add UMI qualities if not extracted from read names
-                if umi_from_name.is_none() && !umi_qual_bs.is_empty() && self.store_umi_quals {
-                    builder.append_string_tag(SamTag::QX, umi_qual_bs.as_bytes());
-                }
-            }
-
-            // Write the record directly
-            writer.write_raw_record(builder.as_bytes())?;
-            builder.clear();
-        }
-
-        Ok(num_templates as u64)
-    }
-
-    /// Process records in single-threaded mode
-    ///
-    /// Returns the number of records written.
-    fn process_singlethreaded(
-        &self,
-        fq_iterators: &mut [ReadSetIterator],
-        writer: &mut RawBamWriter,
-        encoding: QualityEncoding,
-    ) -> Result<u64> {
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
-        let mut read_pair_count: u64 = 0;
-        let mut builder = UnmappedSamBuilder::new();
-
-        // One record per stream at this position; `1` = a record was read, `0` =
-        // the stream ended. Naming the streams (rather than a vague "some ended
-        // before others") matches the threaded pipeline and the help text's
-        // promise to name which input ended first. Hoisted out of the loop and
-        // reset each iteration to avoid a per-template allocation on this fast path.
-        let mut counts = vec![0usize; fq_iterators.len()];
-        loop {
-            counts.fill(0);
-            let mut next_read_sets = Vec::with_capacity(fq_iterators.len());
-            for (idx, iter) in fq_iterators.iter_mut().enumerate() {
-                match iter.next() {
-                    Some(Ok(rec)) => {
-                        counts[idx] = 1;
-                        next_read_sets.push(rec);
-                    }
-                    Some(Err(e)) => return Err(e),
-                    None => {} // stream ended; leave its count at 0
-                }
-            }
-
-            // Every stream ended together: clean EOF.
-            if counts.iter().all(|count| *count == 0) {
-                break;
-            }
-            // Some streams still had a record while others ended: out of sync.
-            if counts.iter().any(|count| *count != counts[0]) {
-                return Err(fastq_out_of_sync_error(&counts).into());
-            }
-
-            //  Validate read names match across all FASTQs
-            Self::validate_read_names_match(&next_read_sets)?;
-
-            let read_set = FastqSet::combine_readsets(next_read_sets);
-            let num_records = self.make_raw_records(&read_set, encoding, &mut builder, writer)?;
-
-            read_pair_count += num_records;
-            progress.log_if_needed(num_records);
-        }
-
-        progress.log_final();
-        Ok(read_pair_count)
     }
 }
 
@@ -1402,11 +1058,9 @@ fn sample_detection_quals_from_stream(
 /// Open the decompressed FASTQ input readers for a run.
 ///
 /// De-interleaves a single interleaved stream into an R1/R2 pair and consumes a
-/// pre-sampled stdin reader when present. Both the serial oracle and the chain
-/// reach it through [`detect_encoding_and_open_fastq_readers`] — the serial
-/// `Extract::execute` path directly, and the chain FASTQ source via
-/// `ChainBuilder::open_source` — so both open readers identically, the parity
-/// contract for the `--threads` cutover.
+/// pre-sampled stdin reader when present. Reached through
+/// [`detect_encoding_and_open_fastq_readers`] from the chain FASTQ source
+/// (`ChainBuilder::open_source`), the only execution path for extract.
 fn open_fastq_input_readers(
     inputs: &[PathBuf],
     interleaved: bool,
@@ -1447,9 +1101,9 @@ fn open_fastq_input_readers(
     // workers would spawn up to N×threads decode threads ON TOP OF the pipeline's
     // own worker pool — over-subscription the pre-cutover chain deliberately
     // avoided (it passed 1 here, "the pipeline framework provides the
-    // parallelism"). The serial oracle reaches this branch with `decomp_threads`
-    // == 1 (it is single-threaded), so hardcoding 1 leaves it unchanged; per-file
-    // BGZF-decode parallelism, if wanted, is a separate benchmarked change.
+    // parallelism"). A no-`--threads` run reaches this branch through the chain at
+    // a single worker, so hardcoding 1 leaves it unchanged; per-file BGZF-decode
+    // parallelism, if wanted, is a separate benchmarked change.
     inputs
         .iter()
         .map(|path| open_fastq_reader(path, 1, async_reader, check_crc, no_check_crc))
@@ -1457,9 +1111,8 @@ fn open_fastq_input_readers(
 }
 
 /// Detect the input FASTQ quality encoding and open the decompressed input
-/// readers in one pass, mirroring `Extract::execute`'s detection + reader-open
-/// exactly so the serial oracle and the `--threads` chain path see identical
-/// readers and encoding.
+/// readers in one pass. Called by the chain FASTQ source
+/// (`ChainBuilder::open_source`), the only execution path for extract.
 ///
 /// stdin is sampled once and its bytes replayed into the returned reader (there
 /// is no second open); file inputs are sampled through separate readers so the
@@ -1505,69 +1158,20 @@ pub(crate) fn detect_encoding_and_open_fastq_readers(
 
 impl Command for Extract {
     fn execute(&self, command_line: &str) -> Result<()> {
-        // Validate inputs
+        // Validate inputs.
         self.validate()?;
 
-        // `--threads N` routes onto the declarative chain builder — the chain
-        // opens its own FASTQ readers and detects the quality encoding inside
-        // `ChainBuilder::open_source`. The no-`--threads` serial loop below is the
-        // in-process parity oracle. `--threads 1` takes the chain like any other
-        // `Some(n)`: the old dispatch was `is_parallel()`, which was already true
-        // for every `Threads(n)` including `Threads(1)`, so this
-        // `threads.is_some()` predicate is behaviorally identical — the cutover
-        // swaps the parallel *implementation* (the now-deleted legacy
-        // `process_with_pipeline`) for the chain builder, it does not change which
-        // `--threads` values run in parallel.
-        if self.threading.threads.is_some() {
-            return self.execute_chain(command_line);
-        }
-
-        let timer = OperationTimer::new("Extracting UMIs");
-        let read_structures = self.get_read_structures()?;
-
-        // Serial oracle: detect the quality encoding and open the input readers
-        // in one pass — the same helper the chain FASTQ source uses, so both
-        // paths open identical readers (de-interleaving / stdin-replay included)
-        // and apply the same detected encoding.
-        let (fq_readers, encoding) = detect_encoding_and_open_fastq_readers(
-            &self.inputs,
-            self.interleaved,
-            self.threading.num_threads(),
-            self.async_reader,
-            self.check_crc,
-            self.no_check_crc,
-        )?;
-
-        // Create header with @PG record
-        let header = self.create_header(command_line)?;
-
-        let fq_sources: Vec<SimdFastqReader<Box<dyn BufRead + Send>>> = fq_readers
-            .into_iter()
-            .map(|fq| SimdFastqReader::with_capacity(fq, BUFFER_SIZE))
-            .collect();
-
-        let mut fq_iterators: Vec<ReadSetIterator> = fq_sources
-            .into_iter()
-            .zip(read_structures.iter())
-            .map(|(source, rs)| ReadSetIterator::new(rs.clone(), source, Vec::new()))
-            .collect();
-
-        // Raw BAM writer (single-threaded oracle output).
-        let writer_threads = self.threading.num_threads();
-        let mut writer = create_raw_bam_writer(
-            &self.output,
-            &header,
-            writer_threads,
-            self.compression.compression_level,
-        )?;
-
-        let count = self.process_singlethreaded(&mut fq_iterators, &mut writer, encoding)?;
-
-        // Flush and finish the writer so any write error surfaces here, not on drop.
-        writer.finish()?;
-
-        timer.log_completion(count);
-        Ok(())
+        // The declarative chain is the only execution path: `execute` always
+        // dispatches to `execute_chain`, with or without `--threads` (absent
+        // `--threads` runs the chain at a single worker). The chain opens its own
+        // FASTQ readers and detects the quality encoding inside
+        // `ChainBuilder::open_source`, and emits every user-facing diagnostic —
+        // the CRC-verify log, the `Starting Extract` banner + Input/Output lines,
+        // the `Extracting UMIs` `OperationTimer`, and the records-emitted summary
+        // — inside `ChainBuilder::add_extract` and its finalize hook. Running any
+        // of those here first would double-log and pre-consume stdin, so `execute`
+        // does only the pre-flight validation above and then dispatches.
+        self.execute_chain(command_line)
     }
 }
 
@@ -1580,11 +1184,12 @@ impl Command for Extract {
 ///
 /// - **Header-synthesis fields** (`sample`, `library`, `platform`,
 ///   `platform_unit`, `read_group_id`, `comments`) map directly to the
-///   corresponding `@RG` and `@CO` entries written by `Extract::create_header`.
+///   corresponding `@RG` and `@CO` entries written by the chain's
+///   `build_fastq_header`.
 /// - **Behavior options** control tag output and name annotation in the same
 ///   way as the identically-named [`Extract`] CLI flags.
 ///
-/// Constructed by `Extract::execute` (T5.7) from the parsed CLI struct and
+/// Constructed by `Extract::to_extract_options` from the parsed CLI struct and
 /// placed into [`crate::pipeline::chains::StageOptionsBag::extract`].
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -1621,9 +1226,8 @@ pub struct ExtractOptions {
     /// On the chain path this is a placeholder at spec-construction time: the
     /// FASTQ source detects the encoding while opening its readers (in
     /// `ChainBuilder::open_source`) and overrides this field before the extract
-    /// step runs, so both the serial oracle and the chain apply the same
-    /// source-detected encoding. Tests that construct `ExtractOptions` directly
-    /// set the encoding they want to exercise.
+    /// step runs, so the chain applies the source-detected encoding. Tests that
+    /// construct `ExtractOptions` directly set the encoding they want to exercise.
     pub quality_encoding: QualityEncoding,
     /// Store UMI base qualities in the `QX` tag.
     pub store_umi_quals: bool,
@@ -1642,7 +1246,7 @@ pub struct ExtractOptions {
     pub async_reader: bool,
     /// Force BGZF input CRC verification (`--check-crc`). Consumed when the chain
     /// FASTQ source opens its readers, so `--check-crc`/`--no-check-crc` reach
-    /// `open_fastq_reader` on the `--threads` path exactly as on the serial path.
+    /// `open_fastq_reader` on the chain path.
     pub check_crc: bool,
     /// Disable BGZF input CRC verification (`--no-check-crc`). See `check_crc`.
     pub no_check_crc: bool,
@@ -1655,17 +1259,15 @@ pub struct ExtractOptions {
 /// tags, and produces one `RawRecord` per template segment. The caller wraps
 /// the result in a [`crate::template::Template`] for the typed-step pipeline.
 ///
-/// KNOWN DUPLICATION: this is the chain path's copy of the FASTQ→`RawRecord`
-/// per-read loop, near-identical to `Extract::make_raw_records` (the serial
-/// oracle's, which writes to a `RawBamWriter`). The two differ only in output
-/// target, so tag-extraction/flag logic can drift between them. The
-/// `chain_matches_serial_oracle*` integration tests guard against drift by
-/// comparing chain-vs-oracle output: the base case covers RX/RG, and
-/// `chain_matches_serial_oracle_barcode_and_annotate_tags` covers the
-/// CB/CY, BC/QT, QX, `--single-tag`, and `--annotate-read-names` branches.
-/// Unifying the two onto one shared per-read loop is a worthwhile follow-up.
-/// (The former third copy, `make_raw_records_static`, was deleted with the
-/// legacy threaded pipeline when extract cut over to the chain builder.)
+/// This is the single per-read FASTQ→`RawRecord` builder for extract: the chain
+/// is the only execution path, so there is no second copy to keep in sync (the
+/// legacy serial `make_raw_records` and the earlier `make_raw_records_static`
+/// were both removed with the single-threaded path). Its output is pinned by the
+/// `no_threads_matches_threaded*` integration tests, which assert byte-identical
+/// output across worker counts and pin the emitted tag values: the base case
+/// covers RX/RG, and `no_threads_matches_threaded_barcode_and_annotate_tags`
+/// covers the CB/CY, BC/QT, QX, `--single-tag`, and `--annotate-read-names`
+/// branches.
 ///
 /// # Errors
 ///
@@ -1758,7 +1360,7 @@ pub(crate) fn make_raw_records_from_fastq_set(
         // derived from the input FASTQ header (plus an optional `+<UMI>`), so an
         // over-long (>=255-byte) name is bad input, not a bug — fail cleanly with
         // context instead of panicking partway through the batch and truncating
-        // the output BAM. Mirrors the standalone path's `build_template_record`.
+        // the output BAM.
         if template.seq.is_empty() {
             builder.try_build_record(final_read_name, flag, b"N", &[2u8])
         } else {
@@ -3207,11 +2809,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Read names do not match")]
+    #[should_panic(expected = "FASTQ read name mismatch")]
     fn test_extract_fails_on_underscore_read_number_suffix() {
         // A `read_1`/`read_2` pair previously passed validation (`_1`/`_2` were stripped)
-        // yet was written with two different QNAMEs, violating the SAM spec. Validation
-        // now only strips `/<digit>`, so the mismatch is reported instead.
+        // yet was written with two different QNAMEs, violating the SAM spec. Only `/<digit>`
+        // is stripped, so the mismatch is reported instead. The rejection comes from the
+        // chain's FASTQ zip step (the only execution path), which names the two disagreeing
+        // read names.
         let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("read_1", "AAAAAAAAAA", "==========")]);
         let r2 = create_fastq(&tmp, "r2.fq", &[("read_2", "CCCCCCCCCC", "##########")]);
@@ -3254,7 +2858,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::fast_path(ThreadingOptions::none())]
+    #[case::single_worker(ThreadingOptions::none())]
     #[case::threaded(ThreadingOptions::new(2))]
     fn test_extract_strips_read_number_suffix_from_written_qname(
         #[case] threading: ThreadingOptions,
@@ -3262,10 +2866,10 @@ mod tests {
         // End-to-end: paired FASTQs with old-style `/1` and `/2` read-number
         // suffixes must produce a single shared QNAME (no suffix) for both mates,
         // as required by the SAM spec. Guards the wiring from
-        // `extract_read_name_and_umi` through to the written BAM QNAME in both the
-        // serial-oracle (`make_raw_records`) and the chain
+        // `extract_read_name_and_umi` through to the written BAM QNAME in the chain
         // (`make_raw_records_from_fastq_set` + `strip_read_suffix`) record-building
-        // paths — this test is parameterized over threading to exercise both.
+        // path — parameterized over worker count (no-`--threads` single worker and
+        // `--threads 2`) to exercise both concurrency configurations.
         let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("SRR001.1/1", "AAAAAAAAAA", "==========")]);
         let r2 = create_fastq(&tmp, "r2.fq", &[("SRR001.1/2", "CCCCCCCCCC", "##########")]);
@@ -3320,9 +2924,9 @@ mod tests {
     /// Rust panic partway through writing the output BAM and leave a truncated
     /// file behind.
     ///
-    /// Both record-building paths are covered (the test is parameterized over
-    /// threading): `make_raw_records` (serial oracle) and
-    /// `make_raw_records_from_fastq_set` (chain, `--threads`).
+    /// The chain record-builder (`make_raw_records_from_fastq_set`) is exercised
+    /// across worker counts (the test is parameterized over threading:
+    /// no-`--threads` single worker and `--threads 2`).
     #[rstest]
     #[case::at_limit(254, true)]
     #[case::one_over(255, false)]
@@ -3598,7 +3202,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Read names do not match")]
+    #[should_panic(expected = "FASTQ read name mismatch")]
     fn test_fail_mismatched_read_names() {
         let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "AAAAAAAAAA", "==========")]);
@@ -4910,11 +4514,11 @@ mod tests {
         assert_eq!(format, CompressionFormat::Bgzf);
     }
 
-    /// Test that extraction works correctly across all threading modes.
-    /// This parameterized test ensures both the single-threaded fast path (None)
-    /// and the multi-threaded pipeline (Some(1), Some(2)) produce correct results.
+    /// Test that extraction works correctly across all worker-count modes.
+    /// This parameterized test ensures the chain produces correct results at a
+    /// single worker (no `--threads`) and at `--threads 1` / `--threads 2`.
     #[rstest]
-    #[case::fast_path(ThreadingOptions::none())]
+    #[case::single_worker(ThreadingOptions::none())]
     #[case::pipeline_1(ThreadingOptions::new(1))]
     #[case::pipeline_2(ThreadingOptions::new(2))]
     fn test_threading_modes(#[case] threading: ThreadingOptions) -> Result<()> {
@@ -4977,11 +4581,11 @@ mod tests {
         Ok(())
     }
 
-    /// Verifies that the chain (`--threads`) path emits the same tags (RX, QX, RG) as the
-    /// serial oracle, ensuring `make_raw_records_from_fastq_set` stays in sync with
-    /// `make_raw_records`.
+    /// Verifies that the chain emits the correct tags (RX, QX, RG) regardless of
+    /// worker count, exercising `make_raw_records_from_fastq_set` under both a
+    /// no-`--threads` single worker and `--threads 2`.
     #[rstest]
-    #[case::fast_path(ThreadingOptions::none())]
+    #[case::single_worker(ThreadingOptions::none())]
     #[case::threaded(ThreadingOptions::new(2))]
     fn test_threading_modes_emit_correct_tags(#[case] threading: ThreadingOptions) -> Result<()> {
         let tmp = TempDir::new()?;
@@ -5088,12 +4692,12 @@ mod tests {
     }
 
     /// A single interleaved input (`--interleaved`) must produce exactly the same
-    /// extracted records as the equivalent pair of separate R1/R2 FASTQ files, on
-    /// both the single-threaded and the multi-threaded pipeline paths. Distinct R1
-    /// and R2 read structures (a 2 bp inline UMI on R1, template-only R2) prove the
-    /// split routes R1 → structure[0] and R2 → structure[1].
+    /// extracted records as the equivalent pair of separate R1/R2 FASTQ files,
+    /// across worker counts (no-`--threads` single worker and `--threads 2`).
+    /// Distinct R1 and R2 read structures (a 2 bp inline UMI on R1, template-only
+    /// R2) prove the split routes R1 → structure[0] and R2 → structure[1].
     #[rstest]
-    #[case::single_threaded(ThreadingOptions::none())]
+    #[case::single_worker(ThreadingOptions::none())]
     #[case::multi_threaded(ThreadingOptions::new(2))]
     fn interleaved_input_matches_two_file_input(#[case] threading: ThreadingOptions) {
         let tmp = TempDir::new().expect("failed to create temp dir");
@@ -5348,9 +4952,10 @@ mod tests {
     /// `open_fastq_reader` and `deinterleave` splits the *decompressed* bytes into
     /// R1/R2, so BGZF is never decoded twice or line-split as raw compressed
     /// bytes. The BGZF and plaintext interleaved runs must produce the same
-    /// records, on both the serial and chain paths.
+    /// records, across worker counts (no-`--threads` single worker and
+    /// `--threads 2`).
     #[rstest]
-    #[case::single_threaded(ThreadingOptions::none())]
+    #[case::single_worker(ThreadingOptions::none())]
     #[case::multi_threaded(ThreadingOptions::new(2))]
     fn interleaved_bgzf_input_matches_plaintext(#[case] threading: ThreadingOptions) {
         let tmp = TempDir::new().expect("temp dir");
@@ -5472,9 +5077,9 @@ mod tests {
     }
 
     /// `Extract::to_extract_options` must project every CLI field onto the
-    /// matching `ExtractOptions` field so the chain path sees the same options
-    /// the serial oracle uses. `quality_encoding` is a placeholder (`Standard`)
-    /// because the chain FASTQ source overrides it with the detected encoding.
+    /// matching `ExtractOptions` field so the chain path sees every option the
+    /// user set. `quality_encoding` is a placeholder (`Standard`) because the
+    /// chain FASTQ source overrides it with the detected encoding.
     #[test]
     fn to_extract_options_maps_all_fields() {
         let extract = Extract {
