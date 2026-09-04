@@ -986,6 +986,187 @@ fn test_correct_chain_rejects_empty_input_with_min_corrected() {
     assert!(err.to_string().contains("No reads were processed"), "unexpected error: {err:#}");
 }
 
+/// Regression: a chain (`--threads`) `correct` run that fails the
+/// `--min-corrected` gate on EMPTY input (the `total_records == 0` branch of
+/// `check_min_corrected`) must still WRITE the `--metrics` TSV. fgbio writes
+/// its metrics once processing completes, before checking the
+/// `--min-corrected` ratio, so a ratio-below-floor failure is not treated as
+/// a processing failure and still leaves the metrics file in place -- only a
+/// genuine pipeline processing error (I/O, malformed input) should withhold
+/// it. The command must still exit non-zero. See
+/// `test_correct_chain_writes_metrics_on_min_corrected_ratio_failure` for the
+/// companion case where real records ARE processed and the ratio itself (not
+/// the empty-input guard) is what fails.
+#[test]
+fn test_correct_chain_writes_metrics_on_min_corrected_failure_empty_input() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+    let metrics_path = temp_dir.path().join("metrics.tsv");
+
+    // Header-only BAM: no records at all, so the --min-corrected gate always
+    // bails (0 / 0 cannot meet a positive minimum), even though processing
+    // itself completes without error.
+    create_umi_bam(&input_bam, vec![]);
+    create_whitelist(&whitelist, &["ACGTACGT"]);
+
+    let cmd = CorrectUmis::try_parse_from([
+        "correct",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        temp_dir.path().join("chain.bam").to_str().unwrap(),
+        "--umi-files",
+        whitelist.to_str().unwrap(),
+        "--max-mismatches",
+        "1",
+        "--min-distance",
+        "1",
+        "--min-corrected",
+        "0.5",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+        "--threads",
+        "4",
+    ])
+    .expect("parse correct args");
+    let err = cmd
+        .execute("fgumi correct")
+        .expect_err("chain path must reject empty input under a positive --min-corrected");
+    assert!(err.to_string().contains("No reads were processed"), "unexpected error: {err:#}");
+
+    // Strengthen beyond exists(): the file must actually parse, and must
+    // carry a row for every UMI (including the unmatched bucket) -- a
+    // truncated or empty file would fail this, not just a missing one.
+    let parsed = fgumi_lib::metrics::UmiCorrectionMetrics::read_metrics(&metrics_path)
+        .expect("metrics TSV must be parseable");
+    assert_eq!(
+        parsed.len(),
+        2,
+        "expected one row for the whitelisted UMI and one for the unmatched bucket: {parsed:?}"
+    );
+    assert!(
+        parsed.iter().any(|m| m.umi == "ACGTACGT"),
+        "expected a row for the whitelisted UMI: {parsed:?}"
+    );
+}
+
+/// Regression: a chain (`--threads`) `correct` run that fails the
+/// `--min-corrected` gate because the ACHIEVED ratio is below the floor --
+/// with real records processed, exercising `check_min_corrected`'s ratio
+/// branch (`total_records > 0`), not the empty-input branch covered by
+/// `test_correct_chain_writes_metrics_on_min_corrected_failure_empty_input`
+/// -- must still WRITE the `--metrics` TSV, for the same fgbio-parity reason.
+#[test]
+fn test_correct_chain_writes_metrics_on_min_corrected_ratio_failure() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+    let metrics_path = temp_dir.path().join("metrics.tsv");
+
+    // 3 correctable reads (kept) + 2 reads with a UMI at edit distance 8 from
+    // the whitelist (uncorrectable at --max-mismatches 1, so rejected) gives
+    // a real, non-empty run with kept/total = 3/5 = 0.6 -- below a 0.9 floor,
+    // so the RATIO branch fails, not the "no reads processed" branch.
+    let correctable = create_umi_family("ACGTACGT", 3, "exact", "AAAAGGGG", 30);
+    let uncorrectable = create_umi_family("TTTTTTTT", 2, "far", "AAAAGGGG", 30);
+    create_umi_bam(&input_bam, vec![correctable, uncorrectable]);
+    create_whitelist(&whitelist, &["ACGTACGT"]);
+
+    let cmd = CorrectUmis::try_parse_from([
+        "correct",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        temp_dir.path().join("chain.bam").to_str().unwrap(),
+        "--umi-files",
+        whitelist.to_str().unwrap(),
+        "--max-mismatches",
+        "1",
+        "--min-distance",
+        "1",
+        "--min-corrected",
+        "0.9",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+        "--threads",
+        "4",
+    ])
+    .expect("parse correct args");
+    let err = cmd
+        .execute("fgumi correct")
+        .expect_err("chain path must reject a kept/total ratio below --min-corrected");
+    let message = err.to_string();
+    assert!(
+        message.contains("Final ratio of reads kept / total was"),
+        "expected the ratio-branch error (not the empty-input branch): {message}"
+    );
+    assert!(
+        !message.contains("No reads were processed"),
+        "this run processed real records; the empty-input branch must not fire: {message}"
+    );
+
+    // Strengthen beyond exists(): parse the file and confirm the whitelisted
+    // UMI's row reflects the 3 kept records, not a truncated/empty write.
+    let parsed = fgumi_lib::metrics::UmiCorrectionMetrics::read_metrics(&metrics_path)
+        .expect("metrics TSV must be parseable");
+    assert!(!parsed.is_empty(), "metrics TSV must have at least one row: {parsed:?}");
+    let whitelisted = parsed
+        .iter()
+        .find(|m| m.umi == "ACGTACGT")
+        .unwrap_or_else(|| panic!("expected a row for the whitelisted UMI: {parsed:?}"));
+    assert_eq!(
+        whitelisted.total_matches, 3,
+        "the whitelisted UMI's row must reflect all 3 kept records: {parsed:?}"
+    );
+}
+
+/// Regression: a chain (`--threads`) `correct` run that fails mid-pipeline
+/// (a genuine `Pipeline::run` error, not just a finalize-hook gate) must not
+/// leave a `--metrics` TSV behind either -- mirrors the clip/retag pattern of
+/// gating the metrics write on `finalize_on_success`, which is skipped
+/// entirely whenever the pipeline run itself errors.
+#[test]
+fn test_correct_chain_no_metrics_on_pipeline_failure() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.tsv");
+
+    create_multiblock_umi_bam(&input_bam, "ACGTACGT");
+    corrupt_last_block_crc(&input_bam);
+
+    let cmd = CorrectUmis::try_parse_from([
+        "correct",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--umis",
+        "ACGTACGT",
+        "--max-mismatches",
+        "1",
+        "--min-distance",
+        "1",
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--compression-level",
+        "1",
+        "--threads",
+        "4",
+    ])
+    .expect("parse correct args");
+    let err =
+        cmd.execute("fgumi correct").expect_err("chain path must reject corrupted BGZF CRC32");
+    let message = format!("{err:#}");
+    assert!(message.to_uppercase().contains("CRC32"), "error should mention CRC32: {message}");
+    assert!(!metrics_path.exists(), "metrics TSV must not be written on a failed chain run");
+}
+
 /// Write a header-less UMI-tagged BAM (no `@HD`) -- the shape
 /// `ChainBuilder::new`'s `ensure_hd_record` call (Task 2B) must synthesize
 /// `@HD` for. Mirrors `write_headerless_consensus_bam` in
