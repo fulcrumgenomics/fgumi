@@ -596,6 +596,11 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// reaches `Done`. The standalone-sort summary finalize hook reads it to
     /// log records processed/written and the spill-chunk count.
     stats_slot: Option<Arc<parking_lot::Mutex<Option<fgumi_sort::SortStats>>>>,
+    /// Whether to log the `--sort-stats` merge-loop performance diagnostic
+    /// (`Sort merge diag: ...`: stalls/contention/backpressure counters). Off
+    /// by default -- it is instrumentation for performance investigations, not
+    /// something a normal run should show. See [`Self::with_sort_stats`].
+    sort_stats: bool,
     /// Total records ingested, captured at the merge transition (the summary's
     /// "records processed").
     processed: u64,
@@ -655,6 +660,7 @@ impl<O: MergeOutput> SortMerge<O> {
             target_batch_count: target_batch_count.max(1),
             output_byte_limit,
             stats_slot: None,
+            sort_stats: false,
             processed: 0,
             chunk_count: 0,
             dbg: MergeDiag::default(),
@@ -670,6 +676,14 @@ impl<O: MergeOutput> SortMerge<O> {
         slot: Arc<parking_lot::Mutex<Option<fgumi_sort::SortStats>>>,
     ) -> Self {
         self.stats_slot = Some(slot);
+        self
+    }
+
+    /// Enable or disable the `--sort-stats` merge-loop performance diagnostic
+    /// (`Sort merge diag: ...`). Off by default.
+    #[must_use]
+    pub fn with_sort_stats(mut self, enabled: bool) -> Self {
+        self.sort_stats = enabled;
         self
     }
 
@@ -848,17 +862,23 @@ impl<O: MergeOutput> SortMerge<O> {
                     // passes that ended input-starved; `contention` counts
                     // dispatches that produced nothing (pure idle spin);
                     // `output_full` counts downstream-backpressure events.
-                    let d = self.dbg;
-                    log::info!(
-                        "Sort merge diag: stalls={} contention={} output_full={} \
-                         progress_dispatches={} ({} records, {} sources)",
-                        d.stalls,
-                        d.contention,
-                        d.output_full,
-                        d.progress_dispatches,
-                        merged,
-                        self.chunk_count,
-                    );
+                    //
+                    // Gated on `--sort-stats` (`self.sort_stats`): this is
+                    // performance-investigation instrumentation, not something a
+                    // normal run should print.
+                    if self.sort_stats {
+                        let d = self.dbg;
+                        log::info!(
+                            "Sort merge diag: stalls={} contention={} output_full={} \
+                             progress_dispatches={} ({} records, {} sources)",
+                            d.stalls,
+                            d.contention,
+                            d.output_full,
+                            d.progress_dispatches,
+                            merged,
+                            self.chunk_count,
+                        );
+                    }
                     if let Some(slot) = &self.stats_slot {
                         *slot.lock() = Some(fgumi_sort::SortStats {
                             total_records: self.processed,
@@ -959,6 +979,20 @@ impl<O: MergeOutput> SortMerge<O> {
                         "Sort in-memory fast path complete: {count} records (single source, \
                          no merge)"
                     );
+                    // `--sort-stats` (`self.sort_stats`): the merge-loop diagnostic in
+                    // `emit_batches_cooperative` never runs on this path (there is no
+                    // k-way merge to diagnose -- the single already-sorted chunk is
+                    // gathered directly), so say so explicitly rather than staying
+                    // silent, which is indistinguishable from the flag being ignored.
+                    // Deliberately a different prefix from "Sort merge diag:" (the
+                    // k-way-merge counters emitted by `emit_batches_cooperative`) so
+                    // the two are never mistaken for one another in a log or a test.
+                    if self.sort_stats {
+                        log::info!(
+                            "Sort fast-path diag: in-memory fast path taken, no k-way merge \
+                             occurred"
+                        );
+                    }
                     if let Some(slot) = &self.stats_slot {
                         *slot.lock() = Some(fgumi_sort::SortStats {
                             total_records: self.processed,

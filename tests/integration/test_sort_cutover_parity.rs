@@ -569,12 +569,14 @@ fn cutover_matches_baseline_and_samtools(
 // ============================================================================
 // Task 5: --write-index, edge cases, spill identity, env fallback, and guards
 //
-// Command-level coverage of the pieces the cutover changed or left inert:
-// the coordinate-only `--write-index` guard and its inline BAI content, the
+// Command-level coverage of the pieces the cutover changed: the
+// coordinate-only `--write-index` guard and its inline BAI content, the
 // empty/single/already-sorted edges, spill-vs-in-memory byte identity,
-// `FGUMI_TMP_DIRS` reaching the chain, and the `--threads 0` /
-// accept-but-inert-flag guards. A genuine failure here is a real cutover bug,
-// not a test to relax -- see the module-level correctness discipline note.
+// `FGUMI_TMP_DIRS` reaching the chain, the `--threads 0` rejection guard, and
+// `--sort-stats`/`--read-streams`, both now threaded into the chain and
+// active (neither is reported as ignored). A genuine failure here is a real
+// cutover bug, not a test to relax -- see the module-level correctness
+// discipline note.
 // ============================================================================
 
 /// `n` mapped, single-end records on one reference, placed at *ascending*
@@ -1134,13 +1136,12 @@ fn cutover_threads_zero_is_rejected() {
     }
 }
 
-/// `--sort-stats` is still inert on the chain (nothing downstream reads it), so
-/// it must be accept-but-inert with a visible notice. `--read-streams`, by
-/// contrast, is now threaded into the chain's BAM source (R7b), so it must NOT
-/// be reported as ignored. Either way the sort must still produce correct,
-/// coordinate-sorted output.
+/// `--sort-stats` and `--read-streams` are both threaded into the chain now
+/// (the former into `SortMerge`'s performance diagnostic, the latter into the
+/// chain's BAM source), so neither must be reported as ignored. Either way the
+/// sort must still produce correct, coordinate-sorted output.
 #[test]
-fn cutover_sort_stats_inert_read_streams_active() {
+fn cutover_sort_stats_and_read_streams_are_active() {
     let dir = TempDir::new().expect("create temp dir");
     let input_bam = dir.path().join("in.bam");
     let records = unsorted_records(200);
@@ -1149,9 +1150,9 @@ fn cutover_sort_stats_inert_read_streams_active() {
     let output_bam = dir.path().join("out.bam");
 
     // Run as a subprocess (with `RUST_LOG=info` pinned so the ambient environment
-    // cannot filter the notices out) so the test can assert on stderr: the ignored
-    // flags are `warn`-level and each must announce that it is inert, otherwise a
-    // silently-dropped flag would leave the user thinking it took effect.
+    // cannot filter the notices out) so the test can assert on stderr: both flags
+    // are threaded into the chain now, so neither must log a stale "ignored"
+    // notice, which would wrongly tell the user an active flag did nothing.
     let current_bin = Path::new(env!("CARGO_BIN_EXE_fgumi"));
     let output = Command::new(current_bin)
         .env("RUST_LOG", "info")
@@ -1168,19 +1169,16 @@ fn cutover_sort_stats_inert_read_streams_active() {
             OsStr::new("4"),
         ])
         .output()
-        .expect("failed to spawn fgumi sort (inert flags)");
+        .expect("failed to spawn fgumi sort (--sort-stats/--read-streams)");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "--sort-stats (inert) and --read-streams (active) must not error:\n{stderr}"
-    );
+    assert!(output.status.success(), "--sort-stats and --read-streams must not error:\n{stderr}");
     assert!(
         !stderr.contains("--read-streams=4 is ignored"),
         "`--read-streams` is threaded now and must not be reported as ignored; stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("--sort-stats is ignored by the sort chain"),
-        "the ignored `--sort-stats` notice must be visible on stderr; stderr:\n{stderr}"
+        !stderr.contains("--sort-stats is ignored by the sort chain"),
+        "`--sort-stats` is threaded now and must not be reported as ignored; stderr:\n{stderr}"
     );
 
     let (_, out_records) = read_bam_output(&output_bam);
