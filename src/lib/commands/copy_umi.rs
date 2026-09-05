@@ -424,6 +424,17 @@ impl Command for CopyUmi {
         info!("Input: {}", self.io.input.display());
         info!("Output: {}", self.io.output.display());
 
+        // Without this, a scheduler/pipeline flag set here (e.g.
+        // `--deadlock-recover`) is silently ignored on the serial path with no
+        // diagnostic at all. This is NOT `common::warn_unwired_pipeline_flags`:
+        // that helper is chain-specific (its wording says "the chain engine ...",
+        // and it deliberately skips `--max-memory`/`--memory-reserve`/
+        // `--memory-per-thread` because the chain DOES honor them) — on this
+        // serial path there is no chain engine at all, so those queue-memory
+        // flags are inert here too and must be warned, with wording that is true
+        // for the single-threaded context.
+        self.warn_unwired_flags_on_serial_path();
+
         let totals = self.run_single_threaded(command_line)?;
         warn_and_log_copy_umi_summary(&totals);
         if let Some(path) = &self.metrics {
@@ -435,6 +446,51 @@ impl Command for CopyUmi {
 }
 
 impl CopyUmi {
+    /// Warn about scheduler/pipeline-queue flags that have no effect on THIS
+    /// serial (no-`--threads`) path.
+    ///
+    /// Deliberately NOT `common::warn_unwired_pipeline_flags`: that helper is
+    /// chain-specific -- its wording ("the chain engine ...", "the typed-step
+    /// pipeline") describes a running chain, and it deliberately skips
+    /// `--max-memory`/`--memory-reserve`/`--memory-per-thread` because the chain
+    /// DOES honor them (they seed `PipelineConfig::queue_memory_total`). On this
+    /// serial path there is no chain and no queue to budget, so reusing that
+    /// helper would both assert a false rationale and fail to warn about the
+    /// queue-memory flags, which are genuinely inert here. Each flag is warned
+    /// only when set away from its default, mirroring how the chain-path helper
+    /// gates its own warnings.
+    fn warn_unwired_flags_on_serial_path(&self) {
+        let requested_scheduler = self.scheduler_opts.strategy();
+        if requested_scheduler != crate::unified_pipeline::scheduler::SchedulerStrategy::default() {
+            warn!(
+                "--scheduler has no effect on the single-threaded path: the serial \
+                 read -> copy-umi -> write loop does not use a pluggable scheduler \
+                 strategy, so the requested strategy ({requested_scheduler:?}) is \
+                 ignored (run with --threads to use the pipeline)"
+            );
+        }
+        if self.scheduler_opts.deadlock_recover_enabled() {
+            warn!(
+                "--deadlock-recover has no effect on the single-threaded path: there \
+                 is no pipeline to deadlock-detect or recover on, only a serial \
+                 read -> copy-umi -> write loop (run with --threads to use the \
+                 pipeline)"
+            );
+        }
+        let default_queue_memory = QueueMemoryOptions::default();
+        if self.queue_memory.max_memory != default_queue_memory.max_memory
+            || self.queue_memory.memory_reserve != default_queue_memory.memory_reserve
+            || self.queue_memory.memory_per_thread != default_queue_memory.memory_per_thread
+        {
+            warn!(
+                "--max-memory/--memory-reserve/--memory-per-thread have no effect on \
+                 the single-threaded path: there are no pipeline queues to budget on \
+                 a serial read -> copy-umi -> write loop (run with --threads to use \
+                 the pipeline)"
+            );
+        }
+    }
+
     /// Serial no-`--threads` path: a read → copy-umi → write loop, and the
     /// in-process parity oracle for the chain path. Uses `pipeline_reader_opts()`
     /// so the CRC-check policy matches the chain, and `ensure_hd_record` +
