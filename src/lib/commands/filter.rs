@@ -224,45 +224,108 @@ pub struct Filter {
 
 /// Filter-stage tuning, independent of how the values were supplied.
 ///
-/// See [`crate::commands::zipper::ZipperOptions`] for why this is a plain
-/// struct rather than a flattened `clap::Args`: the chain builder only reads
-/// these values, so moving the fields off [`Filter`] would rewrite this module
-/// and its tests for no gain here.
-#[derive(Debug, Clone)]
+/// Derives `clap::Args` and carries `#[fgumi_cli_macros::multi_options]` so a
+/// future fused `runall` command can re-expose each field as a prefixed
+/// `--filter::<flag>`, via the generated `MultiFilterOptions` companion,
+/// without hand-maintaining a parallel option set. This struct itself is not
+/// flattened into [`Filter`] or anywhere else by this change — the standalone
+/// command still fills [`Filter`]'s own fields and projects them through
+/// [`Filter::to_filter_options`]; that path is untouched. `rejects` and
+/// `stats` are held **flat** here, matching how [`Filter`] itself exposes
+/// them (bare `--rejects`/`--stats` flags, not a nested sub-struct).
+///
+/// `methylation_mode` is `#[arg(skip)]`: on the standalone command it is
+/// resolved from `Option<MethylationModeArg>` via
+/// [`crate::commands::common::resolve_methylation_mode`], and
+/// `--methylation-mode` itself is a cross-stage top-level `runall` flag
+/// (PR B), not a `--filter::` flag. [`fgumi_consensus::MethylationMode`]
+/// implements `Default` (`Disabled`), which is what the skipped field falls
+/// back to.
+#[fgumi_cli_macros::multi_options("filter", "Filter Options")]
+#[derive(Debug, Clone, clap::Args)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct FilterOptions {
     /// Reference FASTA, required by methylation-aware filters.
+    #[arg(short = 'r', long = "ref")]
     pub reference: Option<PathBuf>,
     /// Minimum reads supporting a consensus, per depth tier.
+    #[arg(short = 'M', long = "min-reads", value_delimiter = ',', required = true)]
     pub min_reads: Vec<usize>,
     /// Maximum per-read error rate, per depth tier.
+    #[arg(
+        short = 'E',
+        long = "max-read-error-rate",
+        value_delimiter = ',',
+        default_value = "0.025"
+    )]
     pub max_read_error_rate: Vec<f64>,
     /// Maximum per-base error rate, per depth tier.
+    #[arg(short = 'e', long = "max-base-error-rate", value_delimiter = ',', default_value = "0.1")]
     pub max_base_error_rate: Vec<f64>,
     /// Minimum consensus base quality.
+    #[arg(short = 'N', long = "min-base-quality")]
     pub min_base_quality: Option<u8>,
     /// Minimum mean base quality across the read.
+    #[arg(short = 'q', long = "min-mean-base-quality")]
     pub min_mean_base_quality: Option<f64>,
     /// Maximum fraction of no-called bases.
+    #[arg(short = 'n', long = "max-no-call-fraction", default_value = "0.2")]
     pub max_no_call_fraction: f64,
     /// Reverse per-base tags on negative-strand reads.
+    #[arg(short = 'R', long = "reverse-per-base-tags", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub reverse_per_base_tags: bool,
     /// Filter whole templates rather than individual reads.
+    #[arg(long = "filter-by-template", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub filter_by_template: bool,
     /// Optional path for rejected records.
+    #[arg(long = "rejects")]
     pub rejects: Option<PathBuf>,
     /// Optional path for filter statistics.
+    #[arg(long = "stats")]
     pub stats: Option<PathBuf>,
     /// Require both single-strand consensuses to agree.
+    #[arg(short = 's', long = "require-single-strand-agreement", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub require_single_strand_agreement: bool,
     /// Minimum methylation depth, per tier.
+    #[arg(long = "min-methylation-depth", value_delimiter = ',')]
     pub min_methylation_depth: Vec<usize>,
     /// Require both strands to agree on methylation.
+    #[arg(long = "require-strand-methylation-agreement", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub require_strand_methylation_agreement: bool,
     /// Minimum bisulfite conversion fraction.
+    #[arg(long = "min-conversion-fraction")]
     pub min_conversion_fraction: Option<f64>,
     /// Resolved methylation calling mode (`Disabled` when the flag is unset).
+    #[arg(skip)]
     pub methylation_mode: fgumi_consensus::MethylationMode,
+}
+
+/// Values equal `Filter::try_parse_from(["filter", "-i", "in.bam", "-o",
+/// "out.bam", "-M", "1"]).to_filter_options()` — the minimal invocation that
+/// satisfies every clap-required flag (`--min-reads` has no `default_value`
+/// so clap demands it once staged as required here; `-M 1` mirrors the
+/// smallest valid depth tier).
+impl Default for FilterOptions {
+    fn default() -> Self {
+        Self {
+            reference: None,
+            min_reads: vec![1],
+            max_read_error_rate: vec![0.025],
+            max_base_error_rate: vec![0.1],
+            min_base_quality: None,
+            min_mean_base_quality: None,
+            max_no_call_fraction: 0.2,
+            reverse_per_base_tags: false,
+            filter_by_template: true,
+            rejects: None,
+            stats: None,
+            require_single_strand_agreement: false,
+            min_methylation_depth: Vec::new(),
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
+            methylation_mode: fgumi_consensus::MethylationMode::Disabled,
+        }
+    }
 }
 
 impl Filter {
@@ -1452,6 +1515,119 @@ mod tests {
         assert!(!opts.require_strand_methylation_agreement);
         assert_eq!(opts.min_conversion_fraction, None);
         assert_eq!(opts.methylation_mode, fgumi_consensus::MethylationMode::Disabled);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // FilterOptions / MultiFilterOptions parity (multi_options)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[derive(clap::Parser, Debug)]
+    struct PrefixedFilter {
+        #[command(flatten)]
+        opts: MultiFilterOptions,
+    }
+
+    /// The re-exposed `MultiFilterOptions` defaults must equal the standalone
+    /// `filter` command's defaults, projected through `to_filter_options`. This
+    /// is the strong oracle: it fails on a dropped default, a misclassified
+    /// field, or a value that only happens to match by coincidence.
+    /// `--min-reads` has no `default_value` on the standalone command, so both
+    /// sides are anchored with the same value (`-M 1` / `--filter::min-reads
+    /// 1`) rather than compared against a default — the standalone side is
+    /// NOT staged-required and would otherwise come back empty (see
+    /// `to_filter_options_carries_defaults` above), while the multi side IS
+    /// staged-required and would fail `validate()` if omitted.
+    #[test]
+    fn multi_filter_options_defaults_match_command() {
+        let base = Filter::try_parse_from(["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1"])
+            .expect("parses")
+            .to_filter_options();
+        let multi = PrefixedFilter::try_parse_from(["x", "--filter::min-reads", "1"])
+            .expect("parses")
+            .opts
+            .validate()
+            .expect("valid");
+
+        // Anchor field: both sides were fed the same non-default value.
+        assert_eq!(multi.min_reads, vec![1]);
+        assert_eq!(multi.min_reads, base.min_reads);
+
+        // Every other projected field must sit at its default on both sides.
+        assert_eq!(multi.reference, base.reference);
+        assert_eq!(multi.max_read_error_rate, base.max_read_error_rate);
+        assert_eq!(multi.max_base_error_rate, base.max_base_error_rate);
+        assert_eq!(multi.min_base_quality, base.min_base_quality);
+        assert_eq!(multi.min_mean_base_quality, base.min_mean_base_quality);
+        assert_eq!(multi.max_no_call_fraction, base.max_no_call_fraction);
+        assert_eq!(multi.reverse_per_base_tags, base.reverse_per_base_tags);
+        assert_eq!(multi.filter_by_template, base.filter_by_template);
+        assert_eq!(multi.rejects, base.rejects);
+        assert_eq!(multi.stats, base.stats);
+        assert_eq!(multi.require_single_strand_agreement, base.require_single_strand_agreement);
+        assert_eq!(multi.min_methylation_depth, base.min_methylation_depth);
+        assert_eq!(
+            multi.require_strand_methylation_agreement,
+            base.require_strand_methylation_agreement
+        );
+        assert_eq!(multi.min_conversion_fraction, base.min_conversion_fraction);
+        assert_eq!(multi.methylation_mode, base.methylation_mode);
+    }
+
+    /// A prefixed flag must round-trip through `MultiFilterOptions::validate`.
+    #[test]
+    fn multi_filter_options_round_trips_a_supplied_flag() {
+        let multi = PrefixedFilter::try_parse_from([
+            "x",
+            "--filter::min-reads",
+            "1",
+            "--filter::max-base-error-rate",
+            "0.3",
+        ])
+        .expect("parses")
+        .opts
+        .validate()
+        .expect("valid");
+        assert_eq!(multi.max_base_error_rate, vec![0.3]);
+    }
+
+    /// `--filter::min-reads` has no default on the standalone command, so the
+    /// macro must lift it to a staged-required field: omitting it must parse
+    /// fine (staged validation, not clap, owns the requirement) but fail
+    /// `validate()`.
+    #[test]
+    fn multi_filter_options_min_reads_is_staged_required() {
+        let parsed = PrefixedFilter::try_parse_from(["x"]).expect("parse is staged, not clap");
+        let err = parsed.opts.validate().expect_err("min-reads must be required");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--filter::min-reads is required"),
+            "error should name --filter::min-reads: {msg}"
+        );
+    }
+
+    /// Guards the hand-written `impl Default for FilterOptions` against
+    /// drifting from the standalone `filter` command's
+    /// `#[arg(default_value...)]` literals. `--min-reads` has no CLI default
+    /// (it is required), so it is supplied but not asserted here.
+    #[test]
+    fn filter_options_default_matches_cli_defaults() {
+        let parsed = Filter::try_parse_from(["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1"])
+            .expect("parses")
+            .to_filter_options();
+        let d = FilterOptions::default();
+        assert_eq!(d.max_read_error_rate, parsed.max_read_error_rate);
+        assert_eq!(d.max_base_error_rate, parsed.max_base_error_rate);
+        assert_eq!(d.max_no_call_fraction, parsed.max_no_call_fraction);
+        assert_eq!(d.reverse_per_base_tags, parsed.reverse_per_base_tags);
+        assert_eq!(d.filter_by_template, parsed.filter_by_template);
+        assert_eq!(d.require_single_strand_agreement, parsed.require_single_strand_agreement);
+        assert_eq!(
+            d.require_strand_methylation_agreement,
+            parsed.require_strand_methylation_agreement
+        );
+        // Chain-engine skip field: resolved from `Option<MethylationModeArg>`
+        // on the standalone command, not from a CLI default literal.
+        assert_eq!(d.methylation_mode, fgumi_consensus::MethylationMode::Disabled);
     }
 
     use crate::sam::SamTag;

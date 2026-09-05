@@ -315,59 +315,147 @@ pub struct Codec {
 
 /// Codec-stage tuning, independent of how the values were supplied.
 ///
-/// See [`crate::commands::zipper::ZipperOptions`] for why this is a plain
-/// struct rather than a flattened `clap::Args`. Note that the consensus-calling
+/// Derives `clap::Args` and carries `#[fgumi_cli_macros::multi_options]` so a
+/// future fused `runall` command can re-expose each field as a prefixed
+/// `--codec::<flag>`, via the generated `MultiCodecOptions` companion,
+/// without hand-maintaining a parallel option set. This struct itself is not
+/// flattened into [`Codec`] or anywhere else by this change — the standalone
+/// command still fills [`Codec`]'s own fields (including its nested
+/// `consensus` sub-struct) and projects them through
+/// [`Codec::to_codec_options`]; that path is untouched. The consensus-calling
 /// knobs are held **flat** here even though [`Codec`] nests them behind
-/// `#[command(flatten)]` sub-structs: the chain builder wants one bag per stage,
-/// not a re-run of the CLI's grouping.
-#[derive(Debug, Clone)]
+/// `#[command(flatten)]` sub-structs: the chain builder wants one bag per
+/// stage, not a re-run of the CLI's grouping. Each `#[arg]` below is copied
+/// verbatim from the corresponding field on [`ConsensusCallingOptions`] (the
+/// 6 consensus scalars) or [`Codec`] itself (the codec-specific fields).
+/// Unlike [`crate::commands::duplex::DuplexOptions`] /
+/// [`crate::commands::simplex::SimplexOptions`], CODEC has no
+/// `OverlappingConsensusOptions`, no `consensus_call_overlapping_bases`, no
+/// methylation mode, and no reference fields.
+///
+/// `tie_rule` is `#[arg(skip)]`: on the standalone command it is resolved from
+/// `TieRuleArg` (a hidden, cross-tool equivalency-testing knob), and
+/// `--codec::tie-rule` is not re-exposed by `runall`. [`fgumi_consensus::TieRule`]
+/// implements `Default` (`FgbioCompat`), matching `TieRuleArg::FgbioCompat`'s
+/// resolution.
+///
+/// `min_reads` has a `default_value` on the standalone command (like duplex's
+/// `min-reads`, which also carries `default_value = "1"` — unlike simplex's
+/// `min-reads`, which has none and is clap-required), so the macro does NOT
+/// lift it to a staged-required field: `MultiCodecOptions::validate()`
+/// accepts an omitted `--codec::min-reads`.
+///
+/// `allow_unmapped` is `#[arg(skip = AllowUnmappedOptions { enabled: false })]`:
+/// [`AllowUnmappedOptions`] does not implement `Default`, so the explicit
+/// expression form is required; `enabled: false` matches the standalone
+/// command's default.
+///
+/// `io` / `rejects_opts` / `stats_opts` / `read_group` are `#[arg(skip)]`
+/// data carriers baked in by `runall`, not `--codec::` flags — each carrier
+/// type implements `Default`.
+#[fgumi_cli_macros::multi_options("codec", "Codec Options")]
+#[derive(Debug, Clone, clap::Args)]
 pub struct CodecOptions {
     /// Pre-UMI error rate (phred).
+    #[arg(short = '1', long = "error-rate-pre-umi", default_value = "45")]
     pub error_rate_pre_umi: u8,
     /// Post-UMI error rate (phred).
+    #[arg(short = '2', long = "error-rate-post-umi", default_value = "40")]
     pub error_rate_post_umi: u8,
     /// Minimum input base quality.
+    #[arg(short = 'm', long = "min-input-base-quality", default_value = "10")]
     pub min_input_base_quality: u8,
     /// Emit per-base consensus tags.
+    #[arg(short = 'B', long = "output-per-base-tags", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub output_per_base_tags: bool,
     /// Trim consensus reads.
+    #[arg(long = "trim", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub trim: bool,
     /// Minimum consensus base quality.
+    #[arg(long = "min-consensus-base-quality", default_value = "2")]
     pub min_consensus_base_quality: u8,
     /// How to resolve a near-tie between the two most likely consensus bases.
+    #[arg(skip)]
     pub tie_rule: fgumi_consensus::TieRule,
     /// Minimum reads per consensus.
+    #[arg(short = 'M', long = "min-reads", default_value = "1")]
     pub min_reads: usize,
     /// Cap on reads per consensus.
+    #[arg(long = "max-reads")]
     pub max_reads: Option<usize>,
     /// Minimum duplex overlap length.
+    #[arg(short = 'd', long = "min-duplex-length", default_value = "1")]
     pub min_duplex_length: usize,
     /// Reproduce fgbio's legacy (pre-fgumi#761) overlap window for dovetailed
     /// FR pairs. Off by default; see [`Codec::legacy_overlap_window`].
+    #[arg(long = "legacy-overlap-window")]
     pub legacy_overlap_window: bool,
     /// Quality cap for single-strand positions.
+    #[arg(long = "single-strand-qual")]
     pub single_strand_qual: Option<u8>,
     /// Quality cap for outer bases.
+    #[arg(short = 'Q', long = "outer-bases-qual")]
     pub outer_bases_qual: Option<u8>,
     /// How many bases count as outer.
+    #[arg(short = 'O', long = "outer-bases-length", default_value = "5")]
     pub outer_bases_length: usize,
     /// Maximum duplex disagreement rate.
+    #[arg(short = 'x', long = "max-duplex-disagreement-rate", default_value = "1.0")]
     pub max_duplex_disagreement_rate: f64,
     /// Maximum duplex disagreements.
+    #[arg(short = 'X', long = "max-duplex-disagreements")]
     pub max_duplex_disagreements: Option<usize>,
     /// Let fully-unmapped primary templates through the pre-group filter.
     ///
     /// Carried as the whole flattened sub-struct, like `io` / `rejects_opts` /
     /// `read_group`, rather than as a bare `bool`.
+    #[arg(skip = AllowUnmappedOptions { enabled: false })]
     pub allow_unmapped: AllowUnmappedOptions,
     /// Input/output paths and reader mode.
+    #[arg(skip)]
     pub io: BamIoOptions,
     /// Optional rejects output.
+    #[arg(skip)]
     pub rejects_opts: RejectsOptions,
     /// Optional stats output.
+    #[arg(skip)]
     pub stats_opts: StatsOptions,
     /// Read-group identity for emitted reads.
+    #[arg(skip)]
     pub read_group: ReadGroupOptions,
+}
+
+/// Test/`runall`-construction default: consensus knobs from the shared
+/// option defaults, codec-specific fields matching the standalone command's
+/// `default_value`s (`min_reads: 1`, `min_duplex_length: 1`,
+/// `outer_bases_length: 5`, `max_duplex_disagreement_rate: 1.0`).
+impl Default for CodecOptions {
+    fn default() -> Self {
+        let consensus = ConsensusCallingOptions::default();
+        Self {
+            error_rate_pre_umi: consensus.error_rate_pre_umi,
+            error_rate_post_umi: consensus.error_rate_post_umi,
+            min_input_base_quality: consensus.min_input_base_quality,
+            output_per_base_tags: consensus.output_per_base_tags,
+            trim: consensus.trim,
+            min_consensus_base_quality: consensus.min_consensus_base_quality,
+            tie_rule: consensus.tie_rule.into(),
+            min_reads: 1,
+            max_reads: None,
+            min_duplex_length: 1,
+            legacy_overlap_window: false,
+            single_strand_qual: None,
+            outer_bases_qual: None,
+            outer_bases_length: 5,
+            max_duplex_disagreement_rate: 1.0,
+            max_duplex_disagreements: None,
+            allow_unmapped: AllowUnmappedOptions { enabled: false },
+            io: BamIoOptions::default(),
+            rejects_opts: RejectsOptions::default(),
+            stats_opts: StatsOptions::default(),
+            read_group: ReadGroupOptions::default(),
+        }
+    }
 }
 
 impl Codec {
@@ -2163,5 +2251,103 @@ mod tests {
             chain.contains("synthetic upstream failure"),
             "underlying source must be preserved; got: {chain}"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // CodecOptions / MultiCodecOptions parity (multi_options)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// `MultiCodecOptions` derives `clap::Args`, not `Parser` — flatten it
+    /// into a local wrapper to drive it through `try_parse_from`.
+    #[derive(clap::Parser, Debug)]
+    struct PrefixedCodec {
+        #[command(flatten)]
+        opts: MultiCodecOptions,
+    }
+
+    /// The re-exposed `MultiCodecOptions` defaults must equal the standalone
+    /// `codec` command's defaults, projected through `to_codec_options`.
+    /// Unlike simplex, `min_reads` has a `default_value` on the standalone
+    /// command, so `MultiCodecOptions` is NOT staged-required and validates
+    /// with no flags at all.
+    #[test]
+    fn multi_codec_options_defaults_match_command() {
+        let base = Codec::try_parse_from(["codec", "-i", "in.bam", "-o", "o.bam"])
+            .expect("parses")
+            .to_codec_options();
+        let multi =
+            PrefixedCodec::try_parse_from(["x"]).expect("parses").opts.validate().expect("valid");
+
+        assert_eq!(multi.error_rate_pre_umi, base.error_rate_pre_umi);
+        assert_eq!(multi.error_rate_post_umi, base.error_rate_post_umi);
+        assert_eq!(multi.min_input_base_quality, base.min_input_base_quality);
+        assert_eq!(multi.output_per_base_tags, base.output_per_base_tags);
+        assert_eq!(multi.trim, base.trim);
+        assert_eq!(multi.min_consensus_base_quality, base.min_consensus_base_quality);
+        assert_eq!(multi.tie_rule, base.tie_rule);
+        assert_eq!(multi.min_reads, base.min_reads);
+        assert_eq!(multi.min_reads, 1);
+        assert_eq!(multi.max_reads, base.max_reads);
+        assert_eq!(multi.min_duplex_length, base.min_duplex_length);
+        assert_eq!(multi.min_duplex_length, 1);
+        assert_eq!(multi.legacy_overlap_window, base.legacy_overlap_window);
+        assert_eq!(multi.single_strand_qual, base.single_strand_qual);
+        assert_eq!(multi.outer_bases_qual, base.outer_bases_qual);
+        assert_eq!(multi.outer_bases_length, base.outer_bases_length);
+        assert_eq!(multi.outer_bases_length, 5);
+        assert!(
+            (multi.max_duplex_disagreement_rate - base.max_duplex_disagreement_rate).abs() < 1e-12
+        );
+        assert!((multi.max_duplex_disagreement_rate - 1.0).abs() < 1e-12);
+        assert_eq!(multi.max_duplex_disagreements, base.max_duplex_disagreements);
+
+        assert_eq!(multi.allow_unmapped.enabled, base.allow_unmapped.enabled);
+        assert_eq!(multi.io.async_reader, base.io.async_reader);
+        assert_eq!(multi.io.check_crc, base.io.check_crc);
+        assert_eq!(multi.io.no_check_crc, base.io.no_check_crc);
+        assert_eq!(multi.rejects_opts.rejects, base.rejects_opts.rejects);
+        assert_eq!(multi.stats_opts.stats, base.stats_opts.stats);
+        assert_eq!(multi.read_group.read_group_id, base.read_group.read_group_id);
+        assert_eq!(multi.read_group.read_name_prefix, base.read_group.read_name_prefix);
+    }
+
+    /// A prefixed flag must round-trip through `MultiCodecOptions::validate`.
+    #[test]
+    fn multi_codec_options_round_trips_outer_bases_length() {
+        let multi = PrefixedCodec::try_parse_from(["x", "--codec::outer-bases-length", "7"])
+            .expect("parses")
+            .opts
+            .validate()
+            .expect("valid");
+        assert_eq!(multi.outer_bases_length, 7);
+    }
+
+    /// Guards the hand-written `impl Default for CodecOptions` against
+    /// drifting from the standalone `codec` command's
+    /// `#[arg(default_value...)]` literals.
+    #[test]
+    fn codec_options_default_matches_cli_defaults() {
+        let parsed = Codec::try_parse_from(["codec", "-i", "in.bam", "-o", "o.bam"])
+            .expect("parses")
+            .to_codec_options();
+        let d = CodecOptions::default();
+        assert_eq!(d.error_rate_pre_umi, parsed.error_rate_pre_umi);
+        assert_eq!(d.error_rate_post_umi, parsed.error_rate_post_umi);
+        assert_eq!(d.min_input_base_quality, parsed.min_input_base_quality);
+        assert_eq!(d.output_per_base_tags, parsed.output_per_base_tags);
+        assert_eq!(d.trim, parsed.trim);
+        assert_eq!(d.min_consensus_base_quality, parsed.min_consensus_base_quality);
+        assert_eq!(d.min_reads, parsed.min_reads);
+        assert_eq!(d.min_duplex_length, parsed.min_duplex_length);
+        assert_eq!(d.outer_bases_length, parsed.outer_bases_length);
+        assert!(
+            (d.max_duplex_disagreement_rate - parsed.max_duplex_disagreement_rate).abs() < 1e-12
+        );
+        // Chain-engine skip field: no `--codec::tie-rule` CLI flag exists to
+        // parse, so compare directly against the resolved default.
+        assert_eq!(d.tie_rule, fgumi_consensus::TieRule::default());
+        // Skip field: `AllowUnmappedOptions` has no `PartialEq`, so compare its
+        // `enabled` flag directly against the `#[arg(skip = ...)]` literal.
+        assert!(!d.allow_unmapped.enabled);
     }
 }

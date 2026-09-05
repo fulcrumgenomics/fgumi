@@ -457,39 +457,232 @@ pub struct Sort {
 /// does not yet expose as CLI flags; until the sort command is rewired onto the
 /// chain they take the engine defaults (`block_batch = 4`, the original
 /// `MAX_BATCH_PER_CALL`; `file_granularity = false`, block-parallel).
-#[derive(Debug, Clone)]
+#[fgumi_cli_macros::multi_options("sort", "Sort Options")]
+#[derive(Debug, Clone, clap::Args)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct SortOptions {
-    /// Requested output sort order.
+    /// Sort order.
+    ///
+    /// Queryname sort supports sub-sort specifiers:
+    ///   `queryname`                  Lexicographic byte ordering (default, fast)
+    ///   `queryname::lexicographic`   Explicit lexicographic ordering (alias: `queryname::lex`)
+    ///   `queryname::lexicographical` Alias; written as `queryname:lexicographical` in `@HD` SS
+    ///   `queryname::natural`         Natural numeric ordering (samtools-compatible)
+    #[arg(long = "order", default_value = "template-coordinate", value_parser = SortOrderArg::parse)]
     pub order: SortOrderArg,
-    /// Expert override for the provisioned template-coordinate key lanes.
+
+    /// Which optional lanes to keep in the template-coordinate sort key.
+    ///
+    /// Smaller keys use less memory and spill less. Only meaningful for
+    /// `--order template-coordinate`; ignored for other orders.
+    ///
+    ///   (omitted)            Auto-detect from the first record + verify (default).
+    ///   full                 Keep all lanes (CB + library/MI). Largest key.
+    ///   none                 Drop all optional lanes (smallest, bulk pre-group).
+    ///   cb,library,mi        Comma/space list; keep the named lanes.
+    ///
+    /// A record carrying a value in a dropped lane aborts the sort with a message
+    /// naming the field and the token to re-include it.
+    #[arg(long = "key-types", value_parser = parse_key_types)]
     pub key_types: Option<KeyTypesSpec>,
-    /// In-memory sort budget before spilling.
+
+    /// Maximum memory for in-memory sorting.
+    ///
+    /// Default is "768M" per thread (matching samtools behavior). Pass "auto"
+    /// to detect system memory and subtract --memory-reserve, leaving room
+    /// for the OS and co-running processes (e.g. an aligner). Explicit values
+    /// like "512M", "1G", "4GiB" are per-thread when --memory-per-thread is
+    /// enabled (default).
+    ///
+    /// When the limit is reached, sorted chunks spill to temporary files.
+    #[arg(short = 'm', long = "max-memory", default_value = "768M", value_parser = parse_memory)]
     pub max_memory: MemoryLimit,
-    /// Memory reserved for other processes under `--max-memory=auto`.
+
+    /// Memory to reserve for other processes when --max-memory=auto.
+    ///
+    /// "auto" (default) reserves min(10 GiB, 50% of system memory). Explicit
+    /// values like "10G", "8GiB" set a fixed reservation. Set higher when
+    /// running alongside a memory-intensive aligner (e.g. `bwa mem` with a
+    /// human genome index uses ~8 GiB).
+    ///
+    /// Ignored when --max-memory is set to an explicit value.
+    #[arg(long = "memory-reserve", default_value = "auto", value_parser = parse_memory_reserve)]
     pub memory_reserve: MemoryReserve,
-    /// Whether `max_memory` is per-thread (samtools behavior).
+
+    /// Scale memory limit by thread count (samtools behavior).
+    ///
+    /// When enabled (default), --max-memory specifies memory per thread. Total
+    /// memory = `max_memory` × the larger of --threads and --sort-threads, since
+    /// the sort phase is what fills the in-memory buffer. Disable for fixed total
+    /// memory.
+    ///
+    /// This formula is for the in-memory sort buffer. --max-memory also bounds
+    /// the inter-stage queue budget (see its docs), which scales by --threads
+    /// alone, so the two totals differ when --sort-threads > --threads.
+    #[arg(long = "memory-per-thread", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub memory_per_thread: bool,
-    /// Temp directories for spill chunks (free-space-aware round-robin).
+
+    /// Temporary directory for intermediate files. Repeatable.
+    ///
+    /// Pass `-T <path>` one or more times to spread spill chunks across multiple
+    /// directories in free-space-aware round-robin order. Useful when one
+    /// filesystem is too small or slower than the aggregate of several.
+    ///
+    /// If no flags are given and the `FGUMI_TMP_DIRS` environment variable is
+    /// set, its value is parsed as a `PATH`-style list (colon-separated on
+    /// Unix, semicolon-separated on Windows) and used instead.
+    ///
+    /// If neither is provided, the system default temp directory is used.
+    /// For best performance, use fast SSDs.
+    #[arg(short = 'T', long = "tmp-dir", action = clap::ArgAction::Append)]
     pub tmp_dirs: Vec<PathBuf>,
-    /// Worker threads for the accumulate/sort/spill phase (Phase 1).
+
+    /// Number of threads for the sort phase (accumulate, sort, spill).
+    ///
+    /// Defaults to `--threads`. Lower this to cede cores to an upstream
+    /// producer while keeping the merge wide -- with `-@ 8 --sort-threads 4`,
+    /// ingest contends with the producer over only 4 threads, while the merge
+    /// still uses 8 because it cannot start until the input is exhausted, by
+    /// which point the producer has finished writing.
+    ///
+    /// The output is byte-identical, but this is not purely a scheduling knob:
+    /// with --memory-per-thread enabled (default) the budget scales by the larger
+    /// of --threads and --sort-threads, so raising this above --threads raises
+    /// total memory by the same factor.
+    #[arg(long = "sort-threads")]
     pub sort_threads: Option<usize>,
-    /// Worker threads for the k-way merge phase (Phase 2).
+
+    /// Number of threads for the merge phase (k-way merge and output write).
+    ///
+    /// Defaults to `--threads`. This only changes scheduling; the output is
+    /// byte-identical.
+    #[arg(long = "merge-threads")]
     pub merge_threads: Option<usize>,
-    /// Compression level for temporary spill files (0-9).
+
+    /// Compression level for temporary chunk files (0-9).
+    ///
+    /// Applies to the codec selected by `--temp-codec`:
+    ///   * For `bgzf`, level 0 produces uncompressed (stored) BGZF blocks
+    ///     (fastest, uses most disk space); 1..=9 are libdeflate levels.
+    ///   * For `zstd`, only 1..=9 are valid; the standalone `sort` command
+    ///     rejects level 0 with `--temp-codec zstd` at start-up
+    ///     (`Sort::execute_sort`), since zstd has no equivalent "stored" mode
+    ///     and silently remapping it to 1 would surprise users counting on
+    ///     uncompressed spill. Clap only enforces the per-field range (0..=9)
+    ///     here; the cross-field zstd/level-0 check lives in
+    ///     [`SortOptions::validate`] (shared with `Sort::execute_sort`). A chain
+    ///     consumer that builds a sort stage from a `SortOptions`/
+    ///     `MultiSortOptions` must call `validate()` before stage construction to
+    ///     reject the combination up front rather than failing on the first
+    ///     spill.
+    ///
+    /// Level 1 (default) provides fast compression with reasonable space savings.
+    /// Higher levels (up to 9) provide better compression but are slower.
+    #[arg(long = "temp-compression", default_value = "1", value_parser = clap::value_parser!(u32).range(0..=9))]
     pub temp_compression: u32,
-    /// Codec for temporary spill files.
+
+    /// Codec used for temporary spill chunks: `zstd` (default) or `bgzf`.
+    ///
+    /// zstd is significantly faster than bgzf at comparable compression
+    /// ratios for BAM-record data; we default to zstd because spill files
+    /// are internal to the sort and never read by other tools. Pass `bgzf`
+    /// to fall back to the legacy on-disk format.
+    #[arg(long = "temp-codec", default_value = "zstd")]
     pub temp_codec: fgumi_sort::SpillCodec,
-    /// Spill-file consolidation limit (`--max-temp-files`). Resolved against the
-    /// host `RLIMIT_NOFILE` when `Auto`; without this the chain sorter fell back
-    /// to the engine's portable default and ignored the CLI value.
+
+    /// Maximum number of temporary spill files kept before the oldest are
+    /// consolidated into a single run.
+    ///
+    /// Large inputs spill many sorted runs to disk. When the number of runs
+    /// reaches this limit, the oldest are merged together in a single pass so
+    /// the final k-way merge opens fewer files at once. That merge is the only
+    /// reason the limit exists: it opens every remaining run at once, so the
+    /// limit bounds how many file descriptors the sort needs.
+    ///
+    /// Consolidation rewrites data that is already sorted, so it is pure
+    /// overhead whenever the descriptor budget could have carried the runs.
+    /// Raising this avoids it on very large inputs (at the cost of more open
+    /// file descriptors during the final merge); lowering it keeps fewer files
+    /// open. Must be at least 2 (enforced by the shared clap value parser); to
+    /// effectively disable consolidation, pass a value larger than the number
+    /// of runs you expect to spill.
+    ///
+    /// "auto" (default) sizes the limit to the process's soft open-file limit
+    /// (`ulimit -n`), less a reserve for the input, output and index handles,
+    /// and capped at a tested maximum. Explicit values like "64", "256" pin it.
+    /// The standalone `sort` command reports at start-up (`Sort::execute_sort`)
+    /// when a pinned value exceeds the open-file budget; this field itself
+    /// carries no such check, so nothing warns on a `SortOptions`/
+    /// `MultiSortOptions` value that overruns the budget until (and unless) a
+    /// future consumer applies it.
+    #[arg(long = "max-temp-files", default_value = "auto", value_parser = parse_max_temp_files)]
     pub max_temp_files: MaxTempFiles,
+
     /// Records batched per parallel sort call (chain engine; not a CLI flag).
+    #[arg(skip = 4usize)]
     pub block_batch: usize,
     /// Spill at file rather than block granularity (chain engine; not a CLI flag).
+    #[arg(skip)]
     pub file_granularity: bool,
     /// Emit the sort's performance diagnostics (`--sort-stats`).
     pub sort_stats: bool,
+}
+
+impl Default for SortOptions {
+    fn default() -> Self {
+        Self {
+            order: SortOrderArg::TemplateCoordinate,
+            key_types: None,
+            max_memory: parse_memory("768M").expect("valid default"),
+            memory_reserve: parse_memory_reserve("auto").expect("valid default"),
+            memory_per_thread: true,
+            tmp_dirs: Vec::new(),
+            sort_threads: None,
+            merge_threads: None,
+            temp_compression: 1,
+            temp_codec: fgumi_sort::SpillCodec::Zstd,
+            max_temp_files: parse_max_temp_files("auto").expect("valid default"),
+            block_batch: 4,
+            file_granularity: false,
+        }
+    }
+}
+
+/// Rejects the one invalid temp-codec/compression pairing: zstd with level 0.
+///
+/// zstd has no level-0 "stored" (uncompressed) mode, so silently remapping to 1
+/// would surprise users who pass `--temp-compression 0` to disable temp
+/// compression (which works for BGZF). This is the single cross-field check
+/// shared by the standalone `sort` command ([`Sort::execute_sort`]) and by
+/// [`SortOptions::validate`] so a chain consumer (e.g. a fused `runall`) can
+/// reject the combination before constructing the spill stages, rather than
+/// failing later during lazy compressor creation on the first spill.
+fn reject_zstd_uncompressed(
+    temp_compression: u32,
+    temp_codec: fgumi_sort::SpillCodec,
+) -> Result<()> {
+    if temp_compression == 0 && matches!(temp_codec, fgumi_sort::SpillCodec::Zstd) {
+        bail!(
+            "--temp-compression 0 is only supported with --temp-codec bgzf; \
+             zstd does not have an uncompressed mode. Pass --temp-codec bgzf \
+             to keep level-0 spill, or pick a zstd level >= 1."
+        );
+    }
+    Ok(())
+}
+
+impl SortOptions {
+    /// Validates cross-field invariants that clap's per-field parsers cannot
+    /// express.
+    ///
+    /// Currently this rejects the zstd/level-0 combination (zstd has no
+    /// uncompressed mode). A chain consumer that builds a sort stage from a
+    /// `SortOptions`/`MultiSortOptions` (e.g. a fused `runall`) should call this
+    /// before stage construction so the invalid combination is reported up front
+    /// rather than during the first spill.
+    pub fn validate(&self) -> Result<()> {
+        reject_zstd_uncompressed(self.temp_compression, self.temp_codec)
+    }
 }
 
 impl Sort {
@@ -854,14 +1047,8 @@ impl Sort {
         // zstd has no level-0 "stored" mode; silently remapping to 1 would
         // surprise users who pass --temp-compression 0 to disable temp
         // compression (which works for BGZF). Reject the combination
-        // explicitly.
-        if self.temp_compression == 0 && matches!(self.temp_codec, fgumi_sort::SpillCodec::Zstd) {
-            bail!(
-                "--temp-compression 0 is only supported with --temp-codec bgzf; \
-                 zstd does not have an uncompressed mode. Pass --temp-codec bgzf \
-                 to keep level-0 spill, or pick a zstd level >= 1."
-            );
-        }
+        // explicitly, via the same shared check `SortOptions::validate` uses.
+        reject_zstd_uncompressed(self.temp_compression, self.temp_codec)?;
 
         // The "Sorting BAM ..." start line and its completion line are both owned
         // by the chain's `SortSummaryFinalizeHook` timer (`add_sort` constructs an
@@ -2163,6 +2350,29 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::zstd_level_zero_rejected(0, fgumi_sort::SpillCodec::Zstd, false)]
+    #[case::zstd_level_one_ok(1, fgumi_sort::SpillCodec::Zstd, true)]
+    #[case::zstd_level_nine_ok(9, fgumi_sort::SpillCodec::Zstd, true)]
+    #[case::bgzf_level_zero_ok(0, fgumi_sort::SpillCodec::Bgzf, true)]
+    #[case::bgzf_level_one_ok(1, fgumi_sort::SpillCodec::Bgzf, true)]
+    fn test_sort_options_validate_temp_codec_compression(
+        #[case] temp_compression: u32,
+        #[case] temp_codec: fgumi_sort::SpillCodec,
+        #[case] expect_ok: bool,
+    ) {
+        let opts = SortOptions { temp_compression, temp_codec, ..SortOptions::default() };
+        let result = opts.validate();
+        assert_eq!(result.is_ok(), expect_ok, "unexpected result: {result:?}");
+        if !expect_ok {
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("--temp-compression 0 is only supported with --temp-codec bgzf"),
+                "unexpected error: {msg}"
+            );
+        }
+    }
+
     #[test]
     fn test_verify_coordinate_fails_on_unsorted() -> Result<()> {
         use fgumi_sort::RawBamRecordReader;
@@ -2287,5 +2497,83 @@ mod tests {
     fn test_key_types_clap_default_is_none_option() {
         let sort = Sort::try_parse_from(["sort", "-i", "in.bam", "-o", "out.bam"]).expect("parse");
         assert!(sort.key_types.is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // SortOptions / MultiSortOptions parity (multi_options)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[derive(clap::Parser, Debug)]
+    struct PrefixedSort {
+        #[command(flatten)]
+        opts: MultiSortOptions,
+    }
+
+    /// The re-exposed `MultiSortOptions` defaults must equal the standalone
+    /// `sort` command's defaults, projected through `to_sort_options`. This is
+    /// the strong oracle: it fails on a dropped default, a misclassified field,
+    /// or a value that only happens to match by coincidence — including the two
+    /// chain-engine skip fields (`block_batch`, `file_granularity`), which have
+    /// no CLI flag on `Sort` at all.
+    #[test]
+    fn multi_sort_options_defaults_match_command() {
+        let base = Sort::try_parse_from(["sort", "-i", "in.bam", "-o", "o.bam"])
+            .expect("parses")
+            .to_sort_options();
+        let multi =
+            PrefixedSort::try_parse_from(["x"]).expect("parses").opts.validate().expect("valid");
+
+        assert_eq!(multi.order, base.order);
+        assert_eq!(multi.order, SortOrderArg::TemplateCoordinate);
+        assert_eq!(multi.key_types, base.key_types);
+        assert_eq!(multi.max_memory, base.max_memory);
+        assert_eq!(multi.max_memory, parse_memory("768M").expect("valid"));
+        assert_eq!(multi.memory_reserve, base.memory_reserve);
+        assert_eq!(multi.memory_per_thread, base.memory_per_thread);
+        assert_eq!(multi.tmp_dirs, base.tmp_dirs);
+        assert_eq!(multi.sort_threads, base.sort_threads);
+        assert_eq!(multi.merge_threads, base.merge_threads);
+        assert_eq!(multi.temp_compression, base.temp_compression);
+        assert_eq!(multi.temp_codec, base.temp_codec);
+        assert_eq!(multi.max_temp_files, base.max_temp_files);
+        assert_eq!(multi.block_batch, base.block_batch);
+        assert_eq!(multi.block_batch, 4);
+        assert_eq!(multi.file_granularity, base.file_granularity);
+        assert!(!multi.file_granularity);
+    }
+
+    /// A prefixed flag must round-trip through `MultiSortOptions::validate`.
+    #[test]
+    fn multi_sort_options_round_trips_a_supplied_flag() {
+        let multi = PrefixedSort::try_parse_from(["x", "--sort::max-memory", "1G"])
+            .expect("parses")
+            .opts
+            .validate()
+            .expect("valid");
+        assert_eq!(multi.max_memory, parse_memory("1G").expect("valid"));
+    }
+
+    /// Guards the hand-written `impl Default for SortOptions` against drifting
+    /// from the standalone `sort` command's `#[arg(default_value...)]` literals.
+    /// Asserts every default-bearing field (plus the chain-engine skip fields,
+    /// whose defaults are checked directly against the struct) matches the
+    /// standalone command's own default, parsed with only its required flags.
+    #[test]
+    fn sort_options_default_matches_cli_defaults() {
+        let parsed = Sort::try_parse_from(["sort", "-i", "in.bam", "-o", "o.bam"])
+            .expect("parses")
+            .to_sort_options();
+        let d = SortOptions::default();
+        assert_eq!(d.order, parsed.order);
+        assert_eq!(d.max_memory, parsed.max_memory);
+        assert_eq!(d.memory_reserve, parsed.memory_reserve);
+        assert_eq!(d.memory_per_thread, parsed.memory_per_thread);
+        assert_eq!(d.temp_compression, parsed.temp_compression);
+        assert_eq!(d.temp_codec, parsed.temp_codec);
+        assert_eq!(d.max_temp_files, parsed.max_temp_files);
+        // Chain-engine skip fields: no CLI flag on `Sort` exists to parse, so
+        // compare directly against the struct's documented defaults.
+        assert_eq!(d.block_batch, 4);
+        assert!(!d.file_granularity);
     }
 }
