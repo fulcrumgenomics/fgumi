@@ -9,9 +9,11 @@
 
 pub mod assertions;
 pub mod bam_generator;
+pub mod cutover;
 
 pub use assertions::*;
 pub use bam_generator::*;
+pub use cutover::*;
 
 /// Writes `contents` to `dir/name` and returns the path.
 ///

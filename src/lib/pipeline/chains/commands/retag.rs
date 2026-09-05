@@ -6,12 +6,12 @@
 //! grouping preamble, no rejects), so it mirrors filter's
 //! `build_filter_step_single_no_rejects` shape.
 //!
-//! The per-operation counters (`Vec<OpCounts>`, positionally indexed by op) and
-//! the row-building (`RetagMetric::from_counts`) are shared verbatim with the
-//! serial oracle in `commands::retag`, so the two paths' metrics rows cannot
-//! drift. `sum_slot_counts` reduces the chain's per-thread accumulator into that
-//! shared `Vec<OpCounts>` (the serial oracle has no per-thread slots, so it does
-//! not call it).
+//! The per-operation counters (`Vec<OpCounts>`, positionally indexed by op), the
+//! per-record apply engine (`apply_op`), and the row-building
+//! (`RetagMetric::from_counts`) all live in `commands::retag` and are reused
+//! verbatim here, so the metrics rows are defined in exactly one place.
+//! `sum_slot_counts` reduces the chain's per-thread accumulator into that shared
+//! `Vec<OpCounts>`.
 
 use std::io;
 use std::path::PathBuf;
@@ -35,10 +35,9 @@ use crate::pipeline::steps::types::{DecodedRecordBatch, DecompressedBlock};
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Always-run finalize hook: logs the `=== Summary ===` banner and completes the
-/// timer. Registered on the always-run `finalize` list, so — unlike the serial
-/// oracle, whose summary sits downstream of a fallible `?` — it reports even on a
-/// failed run; this is an accepted, intentional divergence (matches filter/dedup)
-/// and is not parity-tested.
+/// timer. Registered on the always-run `finalize` list (matching filter/dedup),
+/// so it reports even on a failed/partial run — the summary counts what was
+/// processed before the failure rather than being suppressed by an early `?`.
 ///
 /// `record_count` comes from the shared `progress` counter (the process step
 /// increments it once per record), NOT from summing `records_applied` across ops
@@ -72,9 +71,8 @@ impl FinalizeHook for RetagFinalizeHook {
 
 /// Success-only finalize hook: the warn-on-zero-match loop and the `--metrics`
 /// TSV write. Registered on `finalize_on_success` (not the always-run list) so a
-/// failed/partial run publishes neither the warning nor the TSV — matching the
-/// serial oracle, which only reaches its warn/metrics code after a fully
-/// successful run.
+/// failed/partial run publishes neither the warning nor the TSV — a zero-match
+/// warning or a metrics file are only meaningful once every record was processed.
 pub(crate) struct RetagMetricsFinalizeHook {
     pub(crate) accumulators: Arc<PerThreadAccumulator<Vec<OpCounts>>>,
     pub(crate) operations: Vec<RetagOp>,
@@ -87,7 +85,7 @@ impl FinalizeHook for RetagMetricsFinalizeHook {
         let counts = sum_slot_counts(&accumulators, operations.len());
 
         // Warn on operations that never matched — the usual sign of a mistyped
-        // source tag (verbatim message from the serial oracle's tail).
+        // source tag.
         for (op, op_counts) in operations.iter().zip(&counts) {
             if op_counts.records_applied == 0 {
                 warn!(
@@ -152,7 +150,7 @@ pub(crate) fn build_retag_process_step(
             for decoded in records {
                 let mut record = decoded.into_raw_bytes();
                 for (op, op_counts) in captures.operations.iter().zip(batch_counts.iter_mut()) {
-                    apply_op(&mut record, op, op_counts);
+                    apply_op(&mut record, *op, op_counts);
                 }
                 fgumi_raw_bam::write_framed_record(&mut bytes, record.as_ref())?;
             }

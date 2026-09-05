@@ -44,6 +44,7 @@ mod test_merge_command;
 mod test_pipeline_concurrency;
 mod test_pipeline_memory_backpressure;
 mod test_retag_command;
+mod test_retag_cutover_parity;
 mod test_review_command;
 mod test_sam_input;
 #[cfg(feature = "simplex")]
