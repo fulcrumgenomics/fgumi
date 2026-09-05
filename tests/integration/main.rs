@@ -11,9 +11,9 @@ mod test_bam_pipeline;
 mod test_bgzf_eof;
 mod test_chain_bam_with_index;
 mod test_clip_command;
-#[cfg(feature = "codec")]
+#[cfg(feature = "consensus")]
 mod test_codec_command;
-#[cfg(feature = "codec")]
+#[cfg(feature = "consensus")]
 mod test_codec_pipeline;
 #[cfg(feature = "compare")]
 mod test_compare_bams;
@@ -21,14 +21,16 @@ mod test_compare_bams;
 mod test_compare_metrics_command;
 #[cfg(feature = "compare")]
 mod test_compare_mutation;
+#[cfg(feature = "consensus")]
+mod test_consensus_cutover_parity;
 mod test_consensus_downsampling;
 mod test_copy_umi_command;
 mod test_correct_command;
 mod test_dedup_command;
 mod test_downsample_command;
-#[cfg(feature = "duplex")]
+#[cfg(feature = "consensus")]
 mod test_duplex_command;
-#[cfg(feature = "duplex")]
+#[cfg(feature = "consensus")]
 mod test_duplex_metrics_command;
 #[cfg(all(feature = "compare", feature = "simulate"))]
 mod test_e2e_regression;
@@ -46,11 +48,11 @@ mod test_pipeline_memory_backpressure;
 mod test_retag_command;
 mod test_review_command;
 mod test_sam_input;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 mod test_simplex_command;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 mod test_simplex_metrics_command;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 mod test_simplex_pipeline;
 mod test_simulate_sort;
 mod test_sort_correctness;

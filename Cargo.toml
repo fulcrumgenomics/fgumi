@@ -179,23 +179,20 @@ nix = { workspace = true }
 
 [features]
 default = ["consensus"]
-simplex = ["fgumi-consensus/simplex"]
-# duplex and codec depend on simplex (mirrors fgumi-consensus: `duplex = ["simplex"]`
-# and `codec = ["simplex"]`), and their commands share methylation/filter paths
-# that live behind the `simplex` feature in this crate.
-duplex = ["simplex", "fgumi-consensus/duplex"]
-codec = ["simplex", "fgumi-consensus/codec"]
-# Umbrella for all consensus calling (simplex + duplex + codec). The command
-# modules gate individually on `simplex`/`duplex`/`codec`, but the always-
-# compiled chain/runall layer (`pipeline::chains`) references the consensus
-# option-bag surface all-or-nothing: gating those references per-codec lets a
-# reduced-feature build reference a half-present surface and fail to compile, so
-# `consensus` gates them as one unit. This is about consensus *coherence* only — it
-# is NOT a claim that `--no-default-features` compiles: the crate has other
-# always-on references (e.g. the methylation path) that a bare
+# Single umbrella feature for all consensus calling (simplex + duplex + codec).
+# The three commands share one options-bag / builder surface in this crate, and
+# duplex/codec build on simplex, so there is no coherent way to compile one
+# without the others; the always-compiled chain/runall layer
+# (`pipeline::chains`) already references that shared surface as one unit
+# regardless of which individual codec is in play. Splitting this into
+# per-codec features would let a reduced-feature build reference a
+# half-present surface and fail to compile, so `consensus` gates the whole
+# surface as a single unit instead. This is about consensus *coherence*
+# only — it is NOT a claim that `--no-default-features` compiles: the crate
+# has other always-on references (e.g. the methylation path) that a bare
 # `--no-default-features` build still fails on. Enabled by default and by
 # `simulate`.
-consensus = ["simplex", "duplex", "codec"]
+consensus = ["fgumi-consensus/simplex", "fgumi-consensus/duplex", "fgumi-consensus/codec"]
 dhat-heap = ["dep:dhat"]
 # Enable comprehensive memory debugging infrastructure (monitor thread, hot-path atomics, CLI args)
 memory-debug = ["fgumi-sort/memory-debug"]
@@ -234,8 +231,8 @@ noodles = { workspace = true, features = ["bam", "sam", "bgzf"] }
 [[bench]]
 name = "core_functions"
 harness = false
-# Exercises vanilla consensus / overlap helpers that live behind `simplex`.
-required-features = ["simplex"]
+# Exercises vanilla consensus / overlap helpers that live behind `consensus`.
+required-features = ["consensus"]
 
 [[bench]]
 name = "pipeline_dispatch"

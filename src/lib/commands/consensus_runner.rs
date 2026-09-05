@@ -3,7 +3,7 @@
 //! This module provides shared traits and utilities used by simplex, duplex, and codec
 //! consensus calling commands to reduce code duplication.
 
-#[cfg(feature = "codec")]
+#[cfg(feature = "consensus")]
 use crate::consensus::codec_caller::CodecConsensusStats;
 use crate::consensus_caller::ConsensusCallingStats;
 use crate::metrics::consensus::ConsensusMetrics;
@@ -49,7 +49,7 @@ impl ConsensusStatsOps for ConsensusCallingStats {
     }
 }
 
-#[cfg(feature = "codec")]
+#[cfg(feature = "consensus")]
 impl ConsensusStatsOps for CodecConsensusStats {
     fn merge(&mut self, other: &Self) {
         self.total_input_reads += other.total_input_reads;
@@ -413,7 +413,7 @@ mod tests {
     /// into `ConsensusMetrics`, which is the only thing `to_kv_metrics` can see.
     /// They were dropped here, so all five fgbio codec rows were absent from
     /// `codec --stats` regardless of what the caller had counted.
-    #[cfg(feature = "codec")]
+    #[cfg(feature = "consensus")]
     #[test]
     fn test_codec_stats_to_metrics_carries_codec_counters() {
         let mut stats = CodecConsensusStats {

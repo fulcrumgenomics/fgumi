@@ -6,11 +6,11 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 use std::sync::Arc;
 
 use crate::assigner::Strategy;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 use crate::logging::OperationTimer;
 use crate::unified_pipeline::{
     BACKPRESSURE_THRESHOLD_BYTES, BamPipelineConfig, Q5_BACKPRESSURE_THRESHOLD_BYTES,
@@ -22,7 +22,7 @@ use clap::Args;
 use fgumi_bam_io::is_stdout_path;
 use fgumi_consensus::methylation::RefBaseProvider;
 use fgumi_umi::IndexThreshold;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 use log::{info, warn};
 use noodles::sam::Header;
 
@@ -108,7 +108,7 @@ pub fn resolve_methylation_mode(
 }
 
 /// Methylation reference pair: reference base provider + contig name mapping.
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 pub type MethylationRef = Option<(
     Arc<dyn fgumi_consensus::methylation::RefBaseProvider + Send + Sync>,
     Arc<Vec<String>>,
@@ -117,7 +117,7 @@ pub type MethylationRef = Option<(
 /// Loads the reference FASTA and builds contig name mapping for methylation-aware modes.
 ///
 /// Returns `None` if methylation mode is disabled. Errors if enabled but `reference` is `None`.
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 pub fn load_methylation_reference(
     methylation_mode: fgumi_consensus::MethylationMode,
     reference: &Option<PathBuf>,

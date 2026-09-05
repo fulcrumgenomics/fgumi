@@ -406,9 +406,8 @@ pub struct ChainBuilder<'a> {
     /// stage must advertise the *unmodified* input header rather than the
     /// chain's output header — specifically the consensus commands' `--rejects`
     /// sink, whose records are raw-input records in input order (the PR #332
-    /// contract) and so must carry the input's `@PG`/`@RG`/`@HD` verbatim, to
-    /// match the single-threaded fast path (which opens the raw reader and
-    /// writes rejects with that header, un-augmented).
+    /// contract) and so must carry the input's `@PG`/`@RG`/`@HD` verbatim,
+    /// un-augmented.
     raw_source_header: Header,
 
     /// In-progress chain state. `None` before the first step (before
@@ -3190,8 +3189,8 @@ impl<'a> ChainBuilder<'a> {
     /// output is already record-aligned, so no boundary/parse step is needed.
     ///
     /// Applies the M5 fix: enforces that `--ref` requires `--methylation-mode`
-    /// to be set (mirrors the same check in `Simplex::execute`'s
-    /// single-threaded fast path).
+    /// to be set (mirrors the same check in `Simplex::execute`'s CLI
+    /// pre-flight).
     ///
     /// Registers a `SimplexFinalizeHook` for accumulators reduce, stats write,
     /// overlapping-consensus stats log, summary banner, rejects-writer
@@ -3221,10 +3220,10 @@ impl<'a> ChainBuilder<'a> {
         use crate::pipeline::chains::commands::simplex::{
             CollectedSimplexMetrics, SimplexConsensusCaptures, SimplexFinalizeHook,
             build_simplex_consensus_step_kept_only, build_simplex_consensus_step_with_rejects,
+            simplex_consensus_options,
         };
         use crate::pipeline::steps::group::mi::GroupByMi;
         use crate::sam::SamTag;
-        use crate::vanilla_consensus_caller::VanillaUmiConsensusOptions;
         use log::info;
         use noodles::sam::alignment::record::data::field::Tag;
 
@@ -3235,9 +3234,9 @@ impl<'a> ChainBuilder<'a> {
             .as_ref()
             .ok_or_else(|| anyhow!("Stage::Simplex options missing from StageOptionsBag"))?;
 
-        // M5 fix: mirrors the same check in Simplex::execute's single-threaded
-        // fast path. Enforced here so runall's execute_consensus_only path also
-        // rejects --ref without --methylation-mode.
+        // M5 fix: mirrors the same check in Simplex::execute's CLI pre-flight.
+        // Enforced here so runall's execute_consensus_only path also rejects
+        // --ref without --methylation-mode.
         if simplex.reference.is_some()
             && simplex.methylation_mode == fgumi_consensus::MethylationMode::Disabled
         {
@@ -3334,9 +3333,8 @@ impl<'a> ChainBuilder<'a> {
         // stage-aware, mirroring the `check_consensus_sort_order` guard above:
         // when simplex consumes the raw source directly (the standalone
         // `[Stage::Simplex]` chain), it is `raw_source_header` (the header before
-        // this chain's `@PG` injection), so threaded rejects carry the same
-        // provenance as the single-threaded fast path — which writes rejects with
-        // the un-augmented input header. In a fused chain (e.g. `sort -> simplex`)
+        // this chain's `@PG` injection), so rejects carry the un-augmented input
+        // header. In a fused chain (e.g. `sort -> simplex`)
         // an upstream stage rewrote `self.header`; the rejects must then advertise
         // that stage-input header, not the original source — so use `self.header`,
         // which is still the stage input here (`replace_header` below has not yet
@@ -3362,21 +3360,11 @@ impl<'a> ChainBuilder<'a> {
         let cell_tag = Tag::from(SamTag::CB);
 
         let read_group_id = simplex.read_group.read_group_id.clone();
-        let consensus_options = VanillaUmiConsensusOptions {
-            tag: "MI".to_string(),
-            error_rate_pre_umi: consensus.error_rate_pre_umi,
-            error_rate_post_umi: consensus.error_rate_post_umi,
-            min_input_base_quality: consensus.min_input_base_quality,
-            min_reads: simplex.min_reads,
-            max_reads: simplex.max_reads,
-            produce_per_base_tags: consensus.output_per_base_tags,
-            trim: consensus.trim,
-            min_consensus_base_quality: consensus.min_consensus_base_quality,
-            cell_tag: Some(cell_tag),
-            methylation_mode,
-            // `simplex.tie_rule` is already the resolved `TieRule` on `SimplexOptions`.
-            tie_rule: simplex.tie_rule,
-        };
+        // The `SimplexOptions -> VanillaUmiConsensusOptions` mapping is
+        // extracted into `simplex_consensus_options` (see its doc comment for
+        // why) so it has its own direct unit test independent of this parity
+        // comparison.
+        let consensus_options = simplex_consensus_options(simplex, cell_tag);
 
         let progress_records = Arc::clone(&self.progress_records);
 
@@ -3488,8 +3476,8 @@ impl<'a> ChainBuilder<'a> {
     /// where `prefix_or_from_header` was called on `input_header`.
     ///
     /// Applies the M5 fix: enforces that `--ref` requires `--methylation-mode`
-    /// to be set (mirrors the same check in `Duplex::execute`'s single-threaded
-    /// fast path).
+    /// to be set (mirrors the same check in `Duplex::execute`'s CLI
+    /// pre-flight).
     ///
     /// Registers a `DuplexFinalizeHook` for accumulators reduce, stats write,
     /// overlapping-consensus stats log, summary banner, rejects-writer
@@ -3518,6 +3506,7 @@ impl<'a> ChainBuilder<'a> {
         use crate::pipeline::chains::commands::duplex::{
             CollectedDuplexMetrics, DuplexConsensusCaptures, DuplexFinalizeHook,
             build_duplex_consensus_step_kept_only, build_duplex_consensus_step_with_rejects,
+            duplex_consensus_tuning,
         };
         use crate::pipeline::steps::group::mi::GroupByMi;
         use crate::sam::SamTag;
@@ -3532,17 +3521,17 @@ impl<'a> ChainBuilder<'a> {
             .as_ref()
             .ok_or_else(|| anyhow!("Stage::Duplex options missing from StageOptionsBag"))?;
 
-        // M5 fix: mirrors the same check in Duplex::execute's single-threaded
-        // fast path. Enforced here so runall's execute_consensus_only path also
-        // rejects --ref without --methylation-mode.
+        // M5 fix: mirrors the same check in Duplex::execute's CLI pre-flight.
+        // Enforced here so runall's execute_consensus_only path also rejects
+        // --ref without --methylation-mode.
         if duplex.reference.is_some()
             && duplex.methylation_mode == fgumi_consensus::MethylationMode::Disabled
         {
             bail!("--ref requires --methylation-mode to be set");
         }
 
-        // Validate min_reads UP FRONT (mirrors Duplex::execute's single-threaded
-        // path). The per-worker init closure builds DuplexConsensusCaller with
+        // Validate min_reads UP FRONT (mirrors Duplex::execute's CLI
+        // pre-flight). The per-worker init closure builds DuplexConsensusCaller with
         // `.expect()`, so an invalid ordering (e.g. `--duplex::min-reads 1 5`)
         // would otherwise panic inside a worker thread — likely wedging the
         // pipeline — instead of surfacing a clean error here before it is built.
@@ -3610,10 +3599,15 @@ impl<'a> ChainBuilder<'a> {
         info!("Processing reads and calling duplex consensus (streaming)...");
         info!("Reading input");
 
+        // The `DuplexOptions -> DuplexConsensusCaptures` scalar-tuning mapping
+        // is extracted into `duplex_consensus_tuning` (see its doc comment for
+        // why) so it has its own direct unit test independent of this parity
+        // comparison.
+        let tuning = duplex_consensus_tuning(duplex);
+
         // Resolve methylation mode and load reference if needed.
-        let methylation_mode = duplex.methylation_mode;
         let methylation_ref =
-            load_methylation_reference(methylation_mode, &duplex.reference, &self.header)?;
+            load_methylation_reference(tuning.methylation_mode, &duplex.reference, &self.header)?;
 
         // create_unmapped_consensus_header already inserts the @PG record via
         // add_pg_to_builder, so no second add_pg_record call is needed here.
@@ -3653,13 +3647,6 @@ impl<'a> ChainBuilder<'a> {
         let cell_tag = Tag::from(SamTag::CB);
 
         let read_group_id = duplex.read_group.read_group_id.clone();
-        let min_reads = duplex.min_reads.clone();
-        let min_input_base_quality = consensus.min_input_base_quality;
-        let output_per_base_tags = consensus.output_per_base_tags;
-        let trim = consensus.trim;
-        let max_reads_per_strand = duplex.max_reads_per_strand;
-        let error_rate_pre_umi = consensus.error_rate_pre_umi;
-        let error_rate_post_umi = consensus.error_rate_post_umi;
 
         let progress_records = Arc::clone(&self.progress_records);
 
@@ -3669,19 +3656,17 @@ impl<'a> ChainBuilder<'a> {
             track_rejects,
             overlapping_enabled,
             methylation_ref,
-            methylation_mode,
+            methylation_mode: tuning.methylation_mode,
             read_name_prefix,
             read_group_id,
-            min_reads,
-            min_input_base_quality,
-            output_per_base_tags,
-            trim,
-            max_reads_per_strand,
-            error_rate_pre_umi,
-            error_rate_post_umi,
-            // Resolved `--tie-rule`, converted exactly as both oracle paths do
-            // (`self.consensus.tie_rule.into()` in Duplex::execute).
-            tie_rule: consensus.tie_rule.into(),
+            min_reads: tuning.min_reads,
+            min_input_base_quality: tuning.min_input_base_quality,
+            output_per_base_tags: tuning.output_per_base_tags,
+            trim: tuning.trim,
+            max_reads_per_strand: tuning.max_reads_per_strand,
+            error_rate_pre_umi: tuning.error_rate_pre_umi,
+            error_rate_post_umi: tuning.error_rate_post_umi,
+            tie_rule: tuning.tie_rule,
             cell_tag,
             accumulators: accumulators_for_step,
             progress: progress_records,
@@ -3811,12 +3796,12 @@ impl<'a> ChainBuilder<'a> {
     fn add_codec(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::{consensus_pregroup_keep_raw, warn_unwired_pipeline_flags};
         use crate::commands::consensus_runner::create_unmapped_consensus_header;
-        use crate::consensus::codec_caller::CodecConsensusOptions;
         use crate::logging::OperationTimer;
         use crate::per_thread_accumulator::PerThreadAccumulator;
         use crate::pipeline::chains::commands::codec::{
             CodecConsensusCaptures, CodecFinalizeHook, CollectedCodecMetrics,
             build_codec_consensus_step_kept_only, build_codec_consensus_step_with_rejects,
+            codec_consensus_options,
         };
         use crate::pipeline::steps::group::mi::GroupByMi;
         use crate::sam::SamTag;
@@ -3916,10 +3901,7 @@ impl<'a> ChainBuilder<'a> {
         // (raw-input RG/PG + @HD sort fields), per the PR #332 rejects contract:
         // rejects are raw-input records in input order. Use `raw_source_header`
         // (the header before this chain's `@PG` injection), NOT `self.header`,
-        // so threaded rejects carry the same provenance as the single-threaded
-        // fast path — which writes rejects with the un-augmented input header
-        // (codec.rs's `create_optional_bam_writer(.., &header, ..)`, where
-        // `header` is the raw reader header with no `@PG` applied). In a future
+        // so rejects carry the un-augmented input header. In a future
         // fused chain (e.g. `group -> codec`) an upstream stage rewrote
         // `self.header`; the rejects must then advertise that stage-input header,
         // not the original source — so gate on codec being the source stage
@@ -3946,26 +3928,10 @@ impl<'a> ChainBuilder<'a> {
         let cell_tag = Tag::from(SamTag::CB);
 
         let read_group_id = codec.read_group.read_group_id.clone();
-        let consensus_options = CodecConsensusOptions {
-            min_input_base_quality: consensus.min_input_base_quality,
-            error_rate_pre_umi: consensus.error_rate_pre_umi,
-            error_rate_post_umi: consensus.error_rate_post_umi,
-            min_reads_per_strand: codec.min_reads,
-            max_reads_per_strand: codec.max_reads,
-            min_duplex_length: codec.min_duplex_length,
-            single_strand_qual: codec.single_strand_qual,
-            outer_bases_qual: codec.outer_bases_qual,
-            outer_bases_length: codec.outer_bases_length,
-            max_duplex_disagreements: codec.max_duplex_disagreements.unwrap_or(usize::MAX),
-            max_duplex_disagreement_rate: codec.max_duplex_disagreement_rate,
-            legacy_overlap_window: codec.legacy_overlap_window,
-            cell_tag: Some(cell_tag),
-            produce_per_base_tags: consensus.output_per_base_tags,
-            trim: consensus.trim,
-            min_consensus_base_quality: consensus.min_consensus_base_quality,
-            // `codec.tie_rule` is already the resolved `TieRule` on `CodecOptions`.
-            tie_rule: codec.tie_rule,
-        };
+        // The `CodecOptions -> CodecConsensusOptions` mapping is extracted
+        // into `codec_consensus_options` (see its doc comment for why) so it
+        // has its own direct unit test independent of this parity comparison.
+        let consensus_options = codec_consensus_options(codec, cell_tag);
 
         let progress_records = Arc::clone(&self.progress_records);
 

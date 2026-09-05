@@ -12,8 +12,9 @@
 //! or methylation mode — matching fgbio's `CallCodecConsensusReads` behaviour.
 //!
 //! This is the chain-builder construction path for the codec stage, consumed via
-//! `ChainBuilder` / [`crate::pipeline::chains::build::build_for`]. It is not
-//! yet wired as `Codec::execute`'s live path.
+//! `ChainBuilder` / [`crate::pipeline::chains::build::build_for`]. It is the
+//! sole path for `Codec::execute` (via `execute_chain`), with or without
+//! `--threads` — absent `--threads` runs the chain at a single worker.
 
 use std::io;
 use std::sync::Arc;
@@ -43,8 +44,7 @@ use crate::pipeline::steps::types::DecompressedBlock;
 // CollectedCodecMetrics
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Per-thread accumulator for codec consensus metrics (mirrors
-/// `commands::codec::CollectedCodecMetrics`).
+/// Per-thread accumulator for codec consensus metrics.
 ///
 /// Merged into final aggregates after the pipeline completes; one instance
 /// per worker slot (see [`PerThreadAccumulator`]).
@@ -112,9 +112,9 @@ impl FinalizeHook for CodecFinalizeHook {
 
         if let Some(ref stats_path) = stats_path {
             use fgoxide::io::DelimFile;
-            // Write the key-value stats format, matching the standalone
-            // `Codec::finalize_stats` and the sibling simplex/duplex chain hooks;
-            // the wide-table `[metrics]` form diverged from both.
+            // Write the key-value stats format, matching the sibling
+            // simplex/duplex chain hooks; the wide-table `[metrics]` form
+            // diverged from both.
             let kv_metrics = metrics.to_kv_metrics(fgumi_metrics::ConsensusCallerKind::Codec);
             DelimFile::default().write_tsv(stats_path, kv_metrics).map_err(|e| {
                 anyhow::anyhow!("Failed to write statistics: {}: {e}", stats_path.display())
@@ -141,6 +141,46 @@ impl FinalizeHook for CodecFinalizeHook {
 // `impl Step<...>` is blocked here because the closure types embed in
 // opaque-return position and cannot name themselves.
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Maps `CodecOptions` (the resolved options-bag entry `add_codec` receives)
+/// into the `CodecConsensusOptions` the per-worker consensus caller is built
+/// from.
+///
+/// Extracted out of `ChainBuilder::add_codec` so this mapping is
+/// unit-testable on its own: the `test_codec_chain_matches_single_threaded`
+/// parity tests compare two chain runs (single- vs multi-worker) that BOTH go
+/// through this same mapping, so a field dropped or swapped inside it would
+/// make the two sides agree with each other and still pass. See
+/// `codec_consensus_options_carries_every_tuning_flag` below, which mirrors
+/// `to_codec_options_carries_every_tuning_flag`'s non-default-everywhere
+/// discipline for the other half of the CLI-args -> `CodecOptions` ->
+/// `CodecConsensusOptions` pipeline.
+pub(crate) fn codec_consensus_options(
+    codec: &crate::commands::codec::CodecOptions,
+    cell_tag: noodles::sam::alignment::record::data::field::Tag,
+) -> CodecConsensusOptions {
+    let consensus = codec.consensus();
+    CodecConsensusOptions {
+        min_input_base_quality: consensus.min_input_base_quality,
+        error_rate_pre_umi: consensus.error_rate_pre_umi,
+        error_rate_post_umi: consensus.error_rate_post_umi,
+        min_reads_per_strand: codec.min_reads,
+        max_reads_per_strand: codec.max_reads,
+        min_duplex_length: codec.min_duplex_length,
+        single_strand_qual: codec.single_strand_qual,
+        outer_bases_qual: codec.outer_bases_qual,
+        outer_bases_length: codec.outer_bases_length,
+        max_duplex_disagreements: codec.max_duplex_disagreements.unwrap_or(usize::MAX),
+        max_duplex_disagreement_rate: codec.max_duplex_disagreement_rate,
+        legacy_overlap_window: codec.legacy_overlap_window,
+        cell_tag: Some(cell_tag),
+        produce_per_base_tags: consensus.output_per_base_tags,
+        trim: consensus.trim,
+        min_consensus_base_quality: consensus.min_consensus_base_quality,
+        // `codec.tie_rule` is already the resolved `TieRule` on `CodecOptions`.
+        tie_rule: codec.tie_rule,
+    }
+}
 
 /// Captures passed into [`build_codec_consensus_step_with_rejects`] / [`build_codec_consensus_step_kept_only`] from `add_codec`.
 ///
@@ -206,10 +246,9 @@ fn run_codec_consensus_batch(
 
         // Use the typed entry point so recoverable "duplex disagreement" errors
         // are classified by the `CodecConsensusError::is_duplex_disagreement()`
-        // predicate, matching the standalone `recover_or_propagate_codec_error`.
-        // The generic `consensus_reads` erases the typed variant into
-        // `anyhow::Error`, which would force a fragile substring match on the
-        // Display text.
+        // predicate. The generic `consensus_reads` erases the typed variant
+        // into `anyhow::Error`, which would force a fragile substring match on
+        // the Display text.
         let result = state.caller.consensus_reads_typed(records);
         match result {
             Ok(group_output) => {
@@ -363,4 +402,90 @@ pub(crate) fn build_codec_consensus_step_kept_only(
         init,
         body,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::codec::Codec;
+    use clap::Parser;
+
+    /// The `CodecOptions -> CodecConsensusOptions` mapping inside `add_codec`
+    /// must carry every tuning flag. The
+    /// `test_codec_chain_matches_single_threaded` parity tests compare two
+    /// chain runs that BOTH go through this mapping, so they cannot catch a
+    /// field dropped or swapped inside it; this test exercises the mapping
+    /// directly, driven through `try_parse_from` + `to_codec_options()` (not
+    /// a hand-built `CodecOptions` literal) with every value non-default, so
+    /// a field read from the wrong source fails rather than coincidentally
+    /// matching a default. Mirrors `to_codec_options_carries_every_tuning_flag`
+    /// in `commands::codec`, which covers the other half of the pipeline
+    /// (CLI args -> `CodecOptions`).
+    #[test]
+    fn codec_consensus_options_carries_every_tuning_flag() {
+        let cmd = Codec::try_parse_from([
+            "codec",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--error-rate-pre-umi",
+            "42",
+            "--error-rate-post-umi",
+            "37",
+            "--min-input-base-quality",
+            "16",
+            "--output-per-base-tags=false",
+            "--trim=true",
+            "--min-consensus-base-quality",
+            "23",
+            "--tie-rule",
+            "ulp-relative",
+            "--min-reads",
+            "4",
+            "--max-reads",
+            "88",
+            "--min-duplex-length",
+            "9",
+            "--legacy-overlap-window",
+            "--single-strand-qual",
+            "12",
+            "--outer-bases-qual",
+            "15",
+            "--outer-bases-length",
+            "7",
+            "--max-duplex-disagreement-rate",
+            "0.25",
+            "--max-duplex-disagreements",
+            "6",
+        ])
+        .expect("parses");
+        let codec_options = cmd.to_codec_options();
+
+        let cell_tag =
+            noodles::sam::alignment::record::data::field::Tag::from(crate::sam::SamTag::CB);
+        let opts = codec_consensus_options(&codec_options, cell_tag);
+
+        assert_eq!(opts.min_input_base_quality, 16);
+        assert_eq!(opts.error_rate_pre_umi, 42);
+        assert_eq!(opts.error_rate_post_umi, 37);
+        assert_eq!(opts.min_reads_per_strand, 4);
+        assert_eq!(opts.max_reads_per_strand, Some(88));
+        assert_eq!(opts.min_duplex_length, 9);
+        assert_eq!(opts.single_strand_qual, Some(12));
+        assert_eq!(opts.outer_bases_qual, Some(15));
+        assert_eq!(opts.outer_bases_length, 7);
+        assert_eq!(opts.max_duplex_disagreements, 6);
+        assert!((opts.max_duplex_disagreement_rate - 0.25).abs() < f64::EPSILON);
+        assert!(opts.legacy_overlap_window, "--legacy-overlap-window must reach the mapping");
+        assert_eq!(opts.cell_tag, Some(cell_tag));
+        assert!(!opts.produce_per_base_tags, "an explicit false must not be lost");
+        assert!(opts.trim);
+        assert_eq!(opts.min_consensus_base_quality, 23);
+        assert_eq!(
+            opts.tie_rule,
+            fgumi_consensus::TieRule::UlpRelative,
+            "--tie-rule must reach the mapping"
+        );
+    }
 }

@@ -6,87 +6,33 @@
 //! of the original duplex molecule. R1 comes from one strand, R2 from the opposite strand,
 //! allowing even a single read-pair to generate duplex consensus.
 //!
-//! When `--rejects` is set, the threaded pipeline routes rejected records through
-//! the unified pipeline's first-class secondary output (see
-//! [`crate::unified_pipeline::run_bam_pipeline_from_reader_with_secondary`]).
-//! Both reject paths (success and duplex-disagreement recovery) flow through a
-//! per-batch buffer and land in batch-input order. The rejects BAM advertises
-//! the input header so raw-input RG/PG/contig metadata is preserved. The pattern
-//! matches `commands::filter`, `commands::correct`, `commands::simplex`, and
-//! `commands::duplex`.
+//! When `--rejects` is set, the declarative chain (see [`crate::pipeline::chains`])
+//! routes rejected records through its rejects fan-out branch. Both reject
+//! paths (success and duplex-disagreement recovery) land in batch-input order.
+//! The rejects BAM advertises the input header so raw-input RG/PG/contig
+//! metadata is preserved. The pattern matches `commands::filter`,
+//! `commands::correct`, `commands::simplex`, and `commands::duplex`.
 
-use crate::commands::command::Command;
-use crate::commands::consensus_runner::{ConsensusStatsOps, create_unmapped_consensus_header};
-use crate::per_thread_accumulator::PerThreadAccumulator;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
-use fgoxide::io::DelimFile;
-use fgumi_bam_io::{
-    create_bam_reader_for_pipeline_with_opts, create_bam_writer, create_optional_bam_writer,
-    create_raw_bam_reader_with_opts,
-};
 use std::path::Path;
 
 use super::common::{
     AllowUnmappedOptions, BamIoOptions, CompressionOptions, ConsensusCallingOptions,
     QueueMemoryOptions, ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions,
-    ThreadingOptions, build_pipeline_config, reject_output_collisions, serialize_raw_bam_records,
+    ThreadingOptions, reject_output_collisions,
 };
-use crate::consensus::codec_caller::{
-    CodecConsensusCaller, CodecConsensusError, CodecConsensusOptions, CodecConsensusStats,
-};
-use crate::consensus_caller::ConsensusOutput;
-use crate::logging::{OperationTimer, log_consensus_summary};
-use crate::mi_group::{MiGroup, MiGroupBatch, MiGroupIterator, MiGrouper};
-use crate::read_info::LibraryIndex;
-use crate::unified_pipeline::{
-    GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
-    run_bam_pipeline_from_reader_with_secondary,
-};
-use fgumi_bam_io::ProgressTracker;
-use fgumi_raw_bam::{RawRecord, RawRecordView};
-// RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
+use crate::commands::command::Command;
+// Used only by unit tests that build stats structs directly, read back the
+// `--stats` TSV, or set string tags on synthetic test records.
+#[cfg(test)]
+use crate::commands::consensus_runner::ConsensusStatsOps;
+#[cfg(test)]
+use crate::consensus::codec_caller::CodecConsensusStats;
+#[cfg(test)]
 use crate::sam::SamTag;
-use log::info;
-use noodles::sam::Header;
-use noodles::sam::alignment::record::data::field::Tag;
-use std::io::{self, Write as IoWrite};
-use std::sync::Arc;
-
-// ============================================================================
-// Types for 7-step pipeline processing
-// ============================================================================
-
-/// Result from processing a batch of MI groups through CODEC consensus calling.
-struct CodecProcessedBatch {
-    /// Consensus reads to write to output BAM
-    consensus_output: ConsensusOutput,
-    /// Raw-byte rejected records (consensus-caller rejects from both the
-    /// success and duplex-disagreement paths), in batch-input order. Empty
-    /// unless `track_rejects` is true.
-    rejected_records: Vec<Vec<u8>>,
-    /// Number of MI groups in this batch
-    groups_count: u64,
-    /// CODEC consensus calling statistics for this batch
-    stats: CodecConsensusStats,
-}
-
-impl MemoryEstimate for CodecProcessedBatch {
-    fn estimate_heap_size(&self) -> usize {
-        let rej_size: usize = self.rejected_records.iter().map(Vec::capacity).sum();
-        let rej_vec_overhead = self.rejected_records.capacity() * std::mem::size_of::<Vec<u8>>();
-        self.consensus_output.estimate_heap_size() + rej_size + rej_vec_overhead
-    }
-}
-
-/// Metrics collected from each batch during parallel processing.
-#[derive(Default)]
-struct CollectedCodecMetrics {
-    /// CODEC consensus calling statistics
-    stats: CodecConsensusStats,
-    /// Number of MI groups processed
-    groups_processed: u64,
-}
+#[cfg(test)]
+use fgoxide::io::DelimFile;
 
 /// Call CODEC consensus reads from template-coordinate sorted BAM
 ///
@@ -400,25 +346,6 @@ impl Codec {
     }
 }
 
-/// Decide how the single-thread codec loop should handle a typed
-/// [`CodecConsensusError`]: silently swallow recoverable duplex-disagreement
-/// rejects (so the loop continues) and surface any other variant as a fatal
-/// `anyhow::Error` with UMI context.
-///
-/// Extracted from the inline `match` arm so the `Other`-variant branch can be
-/// unit-tested. That branch is unreachable from valid CLI input today —
-/// `consensus_reads_raw` only returns `Other` when `ss_caller.consensus_call`
-/// propagates an error, and the public API gates against the conditions that
-/// trigger it (see `crates/fgumi-consensus/src/vanilla_caller.rs`).
-fn recover_or_propagate_codec_error(e: CodecConsensusError, umi: &str) -> Result<()> {
-    if e.is_duplex_disagreement() {
-        Ok(())
-    } else {
-        Err(anyhow::Error::from(e))
-            .with_context(|| format!("Failed to call consensus for UMI: {umi}"))
-    }
-}
-
 impl CodecOptions {
     /// Validate the codec consensus parameter bounds. Single source of truth,
     /// shared by `Codec::validate` (the CLI pre-flight) and `add_codec` (the
@@ -516,256 +443,27 @@ impl Command for Codec {
         }
         reject_output_collisions(&outputs)?;
 
-        // ---- --threads N on a consensus build: run on the declarative chain ----
-        // Dispatch BEFORE the timer/banner/reader below (execute_chain ->
-        // add_codec builds its own). On a non-consensus build the chain
-        // machinery isn't compiled, so this block is absent and we fall through
-        // to the legacy threaded path.
-        #[cfg(feature = "consensus")]
-        if self.threading.threads.is_some() {
-            return self.execute_chain(command_line);
-        }
-
-        let timer = OperationTimer::new("Calling CODEC consensus");
-
-        // Get threading configuration (codec is balanced workload)
-        let reader_threads = self.threading.num_threads();
-        let worker_threads = self.threading.num_threads();
-        let writer_threads = self.threading.num_threads();
-
-        info!("Starting CODEC consensus calling");
-        info!("Input: {}", self.io.input.display());
-        info!("Output: {}", self.io.output.display());
-        info!("Min reads: {}", self.min_reads);
-        if let Some(max) = self.max_reads {
-            info!("Max reads: {max}");
-        }
-        info!("Error rate pre-UMI: Q{}", self.consensus.error_rate_pre_umi);
-        info!("Error rate post-UMI: Q{}", self.consensus.error_rate_post_umi);
-        info!("Min duplex length: {}", self.min_duplex_length);
-        info!("Worker threads: {worker_threads}");
-        info!("Reader threads: {reader_threads}");
-        if self.consensus.trim {
-            info!("Quality trimming enabled");
-        }
-        // Note: Unlike simplex/duplex, CODEC does not support overlapping consensus calling
-        // (matching fgbio's CallCodecConsensusReads which has no such option).
-
-        // Parse cell tag
-        let cell_tag = Tag::from(SamTag::CB);
-
-        // Enable rejects tracking if rejects file is specified
-        let track_rejects = self.rejects_opts.is_enabled();
-
-        // Process reads using streaming by MI groups
-        info!("Processing reads and calling consensus (streaming)...");
-        // Both the single-threaded fast path (create_raw_bam_reader_with_opts)
-        // and the multi-threaded pipeline honor --check-crc/--no-check-crc (#800).
-        self.io.log_effective_check_crc();
-
-        // ============================================================
-        // --threads N mode: Use 7-step unified pipeline
-        // None: Use single-threaded fast path
-        // ============================================================
-        // IMPORTANT: Check threading BEFORE opening any reader so we only open
-        // the input once — opening twice wastes I/O and breaks stdin streaming.
-        if let Some(threads) = self.threading.threads {
-            let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-                &self.io.input,
-                self.io.pipeline_reader_opts(),
-            )?;
-            crate::commands::common::check_consensus_sort_order(
-                &header,
-                &self.io.input.display().to_string(),
-            )?;
-            let output_header = create_unmapped_consensus_header(
-                &header,
-                &self.read_group.read_group_id,
-                "Read group",
-                command_line,
-            )?;
-            let read_name_prefix = self.read_group.prefix_or_from_header(&header);
-
-            let result = self.execute_threads_mode(
-                threads,
-                reader,
-                header,
-                output_header,
-                read_name_prefix,
-                track_rejects,
-            );
-            timer.log_completion(0); // Completion logged in execute_threads_mode
-            return result;
-        }
-
-        // Single-threaded fast path: open the raw reader once and derive the header from it.
-        let (mut raw_reader, header) =
-            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
-        crate::commands::common::check_consensus_sort_order(
-            &header,
-            &self.io.input.display().to_string(),
-        )?;
-        let output_header = create_unmapped_consensus_header(
-            &header,
-            &self.read_group.read_group_id,
-            "Read group",
-            command_line,
-        )?;
-        let read_name_prefix = self.read_group.prefix_or_from_header(&header);
-
-        // ============================================================
-        // For non-pipeline modes, create output writers here
-        // ============================================================
-
-        // Open output BAM writer with multi-threaded BGZF compression
-        let mut writer = create_bam_writer(
-            &self.io.output,
-            &output_header,
-            writer_threads,
-            self.compression.compression_level,
-        )?;
-
-        // Open rejects writer if rejects file is specified
-        let mut rejects_writer = create_optional_bam_writer(
-            self.rejects_opts.rejects.as_ref(),
-            &header,
-            writer_threads,
-            self.compression.compression_level,
-        )?;
-
-        // Create options
-        let options = CodecConsensusOptions {
-            min_input_base_quality: self.consensus.min_input_base_quality,
-            error_rate_pre_umi: self.consensus.error_rate_pre_umi,
-            error_rate_post_umi: self.consensus.error_rate_post_umi,
-            tie_rule: self.consensus.tie_rule.into(),
-            min_reads_per_strand: self.min_reads,
-            max_reads_per_strand: self.max_reads,
-            min_duplex_length: self.min_duplex_length,
-            legacy_overlap_window: self.legacy_overlap_window,
-            single_strand_qual: self.single_strand_qual,
-            outer_bases_qual: self.outer_bases_qual,
-            outer_bases_length: self.outer_bases_length,
-            max_duplex_disagreements: self.max_duplex_disagreements.unwrap_or(usize::MAX),
-            max_duplex_disagreement_rate: self.max_duplex_disagreement_rate,
-            cell_tag: Some(cell_tag),
-            produce_per_base_tags: self.consensus.output_per_base_tags,
-            trim: self.consensus.trim,
-            min_consensus_base_quality: self.consensus.min_consensus_base_quality,
-        };
-
-        // Note: CODEC does not support overlapping consensus (matching fgbio)
-        // We keep the infrastructure in place but it's always disabled.
-
-        // Track progress (count records written, not UMI groups)
-        let mut record_count: usize = 0;
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
-
-        // Use the raw_reader opened above (single input open). Apply the fgbio
-        // pre-group filter: always drop secondary/supplementary; --allow-unmapped
-        // relaxes only the mapped-record rule.
-        let allow_unmapped = self.allow_unmapped.enabled;
-        let raw_record_iter = std::iter::from_fn(move || {
-            loop {
-                let mut record = RawRecord::new();
-                match raw_reader.read_record(&mut record) {
-                    Ok(0) => return None, // EOF
-                    Ok(_) => {
-                        if crate::commands::common::consensus_pregroup_keep_flags(
-                            RawRecordView::new(&record).flags(),
-                            allow_unmapped,
-                        ) {
-                            return Some(Ok(record));
-                        }
-                        // Otherwise filtered out: keep reading.
-                    }
-                    Err(e) => return Some(Err(e.into())),
-                }
-            }
-        });
-        let mi_group_iter =
-            MiGroupIterator::new(raw_record_iter, "MI").with_cell_tag(Some(*SamTag::CB));
-
-        let mut caller = CodecConsensusCaller::new_with_rejects_tracking(
-            read_name_prefix,
-            self.read_group.read_group_id.clone(),
-            options,
-            track_rejects,
-        );
-
-        for result in mi_group_iter {
-            let (umi, records) = result.context("Failed to read MI group")?;
-
-            // Call consensus directly — records are already RawRecord values.
-            // `consensus_reads_typed` returns a typed `CodecConsensusError` so we
-            // can distinguish recoverable duplex disagreements from genuine
-            // failures without string matching (see issue #338).
-            let result: std::result::Result<ConsensusOutput, CodecConsensusError> =
-                caller.consensus_reads_typed(records);
-            match result {
-                Ok(output) => {
-                    let batch_size = output.count;
-                    record_count += batch_size;
-                    writer
-                        .get_mut()
-                        .write_all(&output.data)
-                        .context("Failed to write consensus read")?;
-                    progress.log_if_needed(batch_size as u64);
-                }
-                Err(e) => recover_or_propagate_codec_error(e, &umi)?,
-            }
-
-            // Write rejected reads if tracking is enabled (already raw BAM bytes)
-            if let Some(ref mut rw) = rejects_writer {
-                for raw_record in caller.rejected_reads() {
-                    let block_size = raw_record.len() as u32;
-                    rw.get_mut()
-                        .write_all(&block_size.to_le_bytes())
-                        .context("Failed to write rejected read block size")?;
-                    rw.get_mut().write_all(raw_record).context("Failed to write rejected read")?;
-                }
-                caller.clear_rejected_reads();
-            }
-        }
-
-        // For single-threaded, use the caller's stats
-        let merged_stats = caller.statistics().clone();
-
-        progress.log_final();
-
-        // Finish the buffered writer (flush remaining records and wait for writer thread)
-        writer.into_inner().finish().context("Failed to finish output BAM")?;
-
-        // Log statistics and write to file
-        info!("Consensus calling complete");
-        info!("Total records processed: {record_count}");
-
-        let consensus_count = self.finalize_stats(&merged_stats)?;
-
-        timer.log_completion(consensus_count);
-
-        // Close rejects writer if it was opened
-        if let Some(rw) = rejects_writer {
-            rw.into_inner().finish().context("Failed to finish rejects file")?;
-            info!("Rejected reads written successfully");
-        }
-
-        Ok(())
+        // The declarative chain is the only execution path: `execute` runs the
+        // reader-free pre-flight above and then always dispatches to
+        // `execute_chain`, with or without `--threads` (absent `--threads` runs
+        // the chain at a single worker). `add_codec` logs the `Calling CODEC
+        // consensus` timer, the `Starting CODEC consensus calling` banner +
+        // option lines, and the codec finalize hook logs the summary and the
+        // `--stats` TSV. Running any of those here would double-log and
+        // pre-consume stdin, so `execute` only does the pre-flight above.
+        self.execute_chain(command_line)
     }
 }
 impl Codec {
-    /// Run the codec stage on the declarative chain builder (the `--threads N`
-    /// path on a `consensus`-feature build).
+    /// Run the codec stage on the declarative chain builder — the only
+    /// execution path, with or without `--threads`.
     ///
-    /// Replaces the hand-rolled unified-pipeline construction in `execute` for
-    /// the threaded case. The chain opens its own source, validates the
-    /// template-coordinate sort order, calls consensus, writes the output BAM,
-    /// and writes the rejects/stats via the codec finalize hook — all through
-    /// the same shared helpers as the non-chain path, so the two orchestrations
-    /// stay in parity. The no-`--threads` path keeps its own single-threaded
-    /// fast path in `execute`, which is the in-process parity oracle for this
-    /// one (see `test_codec_chain_matches_single_threaded`).
-    #[cfg(feature = "consensus")]
+    /// The chain opens its own source, validates the template-coordinate sort
+    /// order, calls consensus, writes the output BAM, and writes the
+    /// rejects/stats via the codec finalize hook. `--threads 1` (or absent
+    /// `--threads`) runs the chain at a single worker, which is the in-process
+    /// parity oracle for the multi-worker case (see
+    /// `test_codec_chain_matches_single_threaded`).
     fn execute_chain(&self, command_line: &str) -> Result<()> {
         use crate::pipeline::chains::{
             ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
@@ -785,31 +483,6 @@ impl Codec {
         build_for(spec)?.run()
     }
 
-    /// Convert the caller's merged statistics to fgbio's KV metrics, log the
-    /// consensus summary, and write the seeded KV stats file when `--stats` is
-    /// requested. Returns the number of consensus reads.
-    ///
-    /// Shared by the single- and multi-threaded paths so their metrics output
-    /// cannot drift — emitting the wide table from one path and the KV format
-    /// from the other is exactly the bug this fix addresses. The KV format
-    /// matches `simplex`/`duplex` and is readable by fgbio's `Metric.read`; the
-    /// output must not depend on the number of threads.
-    fn finalize_stats(&self, merged_stats: &CodecConsensusStats) -> Result<u64> {
-        let metrics = merged_stats.to_metrics();
-        let consensus_count = metrics.consensus_reads;
-        log_consensus_summary(&metrics);
-
-        if let Some(stats_path) = &self.stats_opts.stats {
-            let kv_metrics = metrics.to_kv_metrics(fgumi_metrics::ConsensusCallerKind::Codec);
-            DelimFile::default()
-                .write_tsv(stats_path, kv_metrics)
-                .with_context(|| format!("Failed to write statistics: {}", stats_path.display()))?;
-            info!("Wrote statistics to: {}", stats_path.display());
-        }
-
-        Ok(consensus_count)
-    }
-
     /// Validates command-line arguments.
     ///
     /// Delegates to [`CodecOptions::validate`], the single source of truth for
@@ -817,234 +490,6 @@ impl Codec {
     /// (`add_codec`, via the same `CodecOptions::validate`) cannot drift.
     fn validate(&self) -> Result<()> {
         self.to_codec_options().validate()
-    }
-
-    /// Execute using 7-step unified pipeline with --threads.
-    ///
-    /// This method is called when `--threads N` is specified with N > 1.
-    /// It uses the lock-free 7-step unified pipeline for maximum performance.
-    fn execute_threads_mode(
-        &self,
-        num_threads: usize,
-        reader: Box<dyn std::io::Read + Send>,
-        input_header: Header,
-        output_header: Header,
-        read_name_prefix: String,
-        track_rejects: bool,
-    ) -> Result<()> {
-        // Configure pipeline
-        let mut pipeline_config = build_pipeline_config(
-            &self.scheduler_opts,
-            &self.compression,
-            &self.queue_memory,
-            &self.io,
-            num_threads,
-        )?;
-
-        // Per-thread metrics accumulator: bounded metric memory, no unbounded
-        // queue. Rejects buffering semantics are preserved (see follow-up).
-        let collected_metrics = PerThreadAccumulator::<CollectedCodecMetrics>::new(num_threads);
-        let collected_metrics_for_serialize = Arc::clone(&collected_metrics);
-
-        // Parse cell tag
-        let cell_tag = Tag::from(SamTag::CB);
-
-        // Create options for CODEC consensus caller
-        let options = CodecConsensusOptions {
-            min_input_base_quality: self.consensus.min_input_base_quality,
-            error_rate_pre_umi: self.consensus.error_rate_pre_umi,
-            error_rate_post_umi: self.consensus.error_rate_post_umi,
-            tie_rule: self.consensus.tie_rule.into(),
-            min_reads_per_strand: self.min_reads,
-            max_reads_per_strand: self.max_reads,
-            min_duplex_length: self.min_duplex_length,
-            legacy_overlap_window: self.legacy_overlap_window,
-            single_strand_qual: self.single_strand_qual,
-            outer_bases_qual: self.outer_bases_qual,
-            outer_bases_length: self.outer_bases_length,
-            max_duplex_disagreements: self.max_duplex_disagreements.unwrap_or(usize::MAX),
-            max_duplex_disagreement_rate: self.max_duplex_disagreement_rate,
-            cell_tag: Some(cell_tag),
-            produce_per_base_tags: self.consensus.output_per_base_tags,
-            trim: self.consensus.trim,
-            min_consensus_base_quality: self.consensus.min_consensus_base_quality,
-        };
-
-        // Capture configuration for closures
-        let read_group_id = self.read_group.read_group_id.clone();
-
-        // Use larger batch size for codec (less work per group than simplex)
-        let batch_size = 1000;
-
-        // Rejects flow through the unified pipeline's first-class secondary
-        // output (see correct.rs / simplex.rs / duplex.rs / filter.rs for the
-        // shared pattern). `process_fn` collects caller-emitted rejects from
-        // both the success path and the duplex-disagreement recovery path into
-        // `CodecProcessedBatch::rejected_records`; the pipeline's
-        // `secondary_serialize_fn` writes them in batch-input order with the
-        // input header.
-
-        let library_index = LibraryIndex::from_header(&input_header);
-        pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
-
-        // ========== grouper_fn ==========
-        // Apply the fgbio pre-group filter (always drop secondary/supplementary;
-        // --allow-unmapped relaxes only the mapped-record rule).
-        let allow_unmapped = self.allow_unmapped.enabled;
-        let grouper_fn = move |_header: &Header| {
-            let grouper = MiGrouper::new("MI", batch_size)
-                .with_cell_tag(Some(*SamTag::CB))
-                .with_record_filter(move |raw| {
-                    crate::commands::common::consensus_pregroup_keep_raw(raw, allow_unmapped)
-                });
-            Box::new(grouper) as Box<dyn Grouper<Group = MiGroupBatch> + Send>
-        };
-
-        // ========== process_fn: CODEC consensus calling ==========
-        let process_fn = move |batch: MiGroupBatch| -> io::Result<CodecProcessedBatch> {
-            // Create per-thread CODEC consensus caller
-            let mut caller = CodecConsensusCaller::new_with_rejects_tracking(
-                read_name_prefix.clone(),
-                read_group_id.clone(),
-                options.clone(),
-                track_rejects,
-            );
-
-            let mut all_output = ConsensusOutput::default();
-            let mut batch_stats = CodecConsensusStats::default();
-            let groups_count = batch.groups.len() as u64;
-            // Caller-emitted rejects collected per-batch (success +
-            // duplex-disagreement recovery paths) and drained by the
-            // pipeline's secondary serializer.
-            let mut rejected_records: Vec<Vec<u8>> = Vec::new();
-
-            for MiGroup { mi, records } in batch.groups {
-                caller.clear();
-
-                // Call CODEC consensus directly — records are already RawRecord values.
-                // `consensus_reads_typed` returns a typed `CodecConsensusError` so we
-                // can distinguish recoverable duplex disagreements from genuine
-                // failures without string matching (see issue #338).
-                let result: std::result::Result<ConsensusOutput, CodecConsensusError> =
-                    caller.consensus_reads_typed(records);
-                match result {
-                    Ok(batch_output) => {
-                        all_output.merge(batch_output);
-                        batch_stats.merge(caller.statistics());
-                        if track_rejects {
-                            for raw in caller.take_rejected_reads() {
-                                rejected_records.push(raw);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Handle duplex disagreement errors by merging stats and
-                        // preserving rejects so --rejects output matches single-threaded mode.
-                        if e.is_duplex_disagreement() {
-                            batch_stats.merge(caller.statistics());
-                            if track_rejects {
-                                for raw in caller.take_rejected_reads() {
-                                    rejected_records.push(raw);
-                                }
-                            }
-                        } else {
-                            return Err(io::Error::other(format!(
-                                "CODEC consensus error for MI {mi}: {e}"
-                            )));
-                        }
-                    }
-                }
-            }
-
-            Ok(CodecProcessedBatch {
-                consensus_output: all_output,
-                rejected_records,
-                groups_count,
-                stats: batch_stats,
-            })
-        };
-
-        // ========== serialize_fn: Serialize + collect metrics ==========
-        let serialize_fn = move |processed: CodecProcessedBatch,
-                                 _header: &Header,
-                                 output: &mut Vec<u8>|
-              -> io::Result<u64> {
-            // Merge per-batch metrics into this worker's accumulator slot.
-            // Rejects are drained by `secondary_serialize_fn` separately.
-            let batch_stats = processed.stats;
-            let groups_count = processed.groups_count;
-            collected_metrics_for_serialize.with_slot(|m| {
-                m.stats.merge(&batch_stats);
-                m.groups_processed += groups_count;
-            });
-
-            // Serialize consensus reads
-            let count = processed.consensus_output.count as u64;
-            output.extend_from_slice(&processed.consensus_output.data);
-            Ok(count)
-        };
-
-        // ========== secondary_serialize_fn: Drain rejected records ==========
-        let secondary_serialize_fn =
-            |batch: &CodecProcessedBatch, buf: &mut Vec<u8>| -> io::Result<u64> {
-                serialize_raw_bam_records(&batch.rejected_records, buf)
-            };
-
-        // Run the 7-step pipeline with the already-opened reader (supports streaming).
-        // When `--rejects` is set, route rejects through the unified pipeline's
-        // first-class secondary output so they land in input/batch-serial order
-        // and the rejects BAM carries the input header.
-        let consensus_reads_written = if let Some(rejects_path) = self.rejects_opts.rejects.as_ref()
-        {
-            let secondary_header = input_header.clone();
-            run_bam_pipeline_from_reader_with_secondary(
-                pipeline_config,
-                reader,
-                input_header,
-                &self.io.output,
-                Some(output_header.clone()),
-                rejects_path,
-                Some(secondary_header),
-                grouper_fn,
-                process_fn,
-                serialize_fn,
-                secondary_serialize_fn,
-            )
-            .map_err(|e| anyhow::anyhow!("Pipeline error: {e}"))?
-        } else {
-            run_bam_pipeline_from_reader(
-                pipeline_config,
-                reader,
-                input_header,
-                &self.io.output,
-                Some(output_header.clone()),
-                grouper_fn,
-                process_fn,
-                serialize_fn,
-            )
-            .map_err(|e| anyhow::anyhow!("Pipeline error: {e}"))?
-        };
-
-        // ========== Post-pipeline: Aggregate metrics ==========
-        let mut total_groups = 0u64;
-        let mut merged_stats = CodecConsensusStats::default();
-
-        for slot in collected_metrics.slots() {
-            let m = slot.lock();
-            total_groups += m.groups_processed;
-            merged_stats.merge(&m.stats);
-        }
-
-        // Log statistics
-        info!("CODEC consensus calling complete");
-        info!("Total MI groups processed: {total_groups}");
-        info!("Total consensus reads written by pipeline: {consensus_reads_written}");
-
-        let consensus_count = self.finalize_stats(&merged_stats)?;
-
-        info!("Wrote {consensus_count} CODEC consensus reads");
-
-        Ok(())
     }
 }
 
@@ -1291,11 +736,12 @@ mod tests {
     /// consensus caller (observed via `total_input_reads`, which counts
     /// post-filter reads) — with the flag both off and on. This pins the leak
     /// where a bypassed filter would let non-primary alignments into grouping.
-    /// Runs the single-threaded fast path and the multi-threaded pipeline path,
-    /// which install the filter at independent sites.
+    /// Runs the single-worker chain (absent `--threads`) and the multi-worker
+    /// chain, which install the filter at the same `add_codec` site — worker
+    /// count is the only difference between the two cases.
     #[rstest]
-    #[case::fast_path_default(ThreadingOptions::none(), false)]
-    #[case::fast_path_allow_unmapped(ThreadingOptions::none(), true)]
+    #[case::no_threads_default(ThreadingOptions::none(), false)]
+    #[case::no_threads_allow_unmapped(ThreadingOptions::none(), true)]
     #[case::threaded_default(ThreadingOptions::new(2), false)]
     #[case::threaded_allow_unmapped(ThreadingOptions::new(2), true)]
     fn test_codec_allow_unmapped_gates_pregroup_filter(
@@ -1692,9 +1138,9 @@ mod tests {
         // CONS-01: codec requires template-coordinate-sorted input. An ungrouped header must be
         // rejected by execute() (via check_consensus_sort_order) rather than silently
         // mis-grouping molecules; the accept branch is covered by the other execute tests.
-        // `check_consensus_sort_order` is invoked separately on the single-threaded fast path and
-        // inside the `--threads` pipeline path, so parameterize over both to guard either branch
-        // from silently dropping the check.
+        // `check_consensus_sort_order` is guarded on codec being the chain's source stage, so
+        // parameterize over both the absent-`--threads` (single-worker) and `--threads` cases to
+        // guard that the check still fires regardless of worker count.
         use noodles::sam::header::record::value::Map;
         use noodles::sam::header::record::value::map::{ReferenceSequence, header::Version};
         use std::num::NonZeroUsize;
@@ -1995,50 +1441,6 @@ mod tests {
         Ok(())
     }
 
-    #[rstest]
-    #[case::empty_rejects(1024, 100, vec![])]
-    #[case::non_empty_rejects(64, 32, vec![256, 128])]
-    fn test_codec_processed_batch_memory_estimate(
-        #[case] consensus_capacity: usize,
-        #[case] consensus_len: usize,
-        #[case] rej_capacities: Vec<usize>,
-    ) {
-        let mut data = Vec::with_capacity(consensus_capacity);
-        data.resize(consensus_len, 0u8);
-
-        let rejected_records: Vec<Vec<u8>> = rej_capacities
-            .iter()
-            .map(|&cap| {
-                let mut v = Vec::with_capacity(cap);
-                v.extend_from_slice(&[1u8; 8]);
-                v
-            })
-            .collect();
-        let rej_outer_capacity = rejected_records.capacity();
-        // Vec::with_capacity(n) only guarantees AT LEAST n; the allocator may
-        // round up. Read the observed capacities back so the expected value
-        // matches what was actually allocated under any allocator.
-        let rej_inner_total: usize = rejected_records.iter().map(Vec::capacity).sum();
-
-        let batch = CodecProcessedBatch {
-            consensus_output: ConsensusOutput { data, count: 0 },
-            rejected_records,
-            groups_count: 0,
-            stats: CodecConsensusStats::default(),
-        };
-
-        // Heap = consensus capacity + sum of per-reject inner capacities
-        // + outer-vec capacity * size_of::<Vec<u8>>().
-        let expected = consensus_capacity
-            + rej_inner_total
-            + rej_outer_capacity * std::mem::size_of::<Vec<u8>>();
-        assert_eq!(
-            batch.estimate_heap_size(),
-            expected,
-            "estimate should account for consensus capacity, rejects inner capacities, and outer-vec overhead",
-        );
-    }
-
     /// Asserts that single-threaded and multi-threaded codec produce the same number of
     /// consensus records and identical CB tag presence when some groups have CB and some do not.
     #[test]
@@ -2125,43 +1527,5 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    /// `recover_or_propagate_codec_error` must let
-    /// [`CodecConsensusError::DuplexDisagreementCount`] flow through as `Ok(())`
-    /// so the single-thread codec loop continues processing the next MI group.
-    #[test]
-    fn test_recover_or_propagate_codec_error_swallows_disagreement_count() {
-        let err = CodecConsensusError::DuplexDisagreementCount { disagreements: 42 };
-        recover_or_propagate_codec_error(err, "UMI_X")
-            .expect("disagreement-count must be recoverable");
-    }
-
-    /// Same as above for the rate variant.
-    #[test]
-    fn test_recover_or_propagate_codec_error_swallows_disagreement_rate() {
-        let err = CodecConsensusError::DuplexDisagreementRate { rate: 0.42 };
-        recover_or_propagate_codec_error(err, "UMI_Y")
-            .expect("disagreement-rate must be recoverable");
-    }
-
-    /// The `Other` variant (any non-disagreement failure) must be propagated as
-    /// a fatal `anyhow::Error` with the UMI threaded into the context. Covers
-    /// the codec.rs propagation branch that's unreachable from valid CLI input
-    /// today (issue #338).
-    #[test]
-    fn test_recover_or_propagate_codec_error_propagates_other_with_umi_context() {
-        let err = CodecConsensusError::Other(anyhow::anyhow!("synthetic upstream failure"));
-        let result = recover_or_propagate_codec_error(err, "UMI_FATAL");
-        let propagated = result.expect_err("non-disagreement variant must propagate");
-        let chain = format!("{propagated:#}");
-        assert!(
-            chain.contains("Failed to call consensus for UMI: UMI_FATAL"),
-            "context must include the UMI; got: {chain}"
-        );
-        assert!(
-            chain.contains("synthetic upstream failure"),
-            "underlying source must be preserved; got: {chain}"
-        );
     }
 }
