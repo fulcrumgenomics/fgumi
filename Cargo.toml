@@ -59,7 +59,7 @@ fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 libdeflater = "1.22"
 libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
 log = "0.4"
-mach2 = "0.6"
+mach2 = "0.7"
 memchr = "2"
 nix = { version = "0.31", default-features = false, features = ["fs"] }
 # The noodles stack is held one minor behind (noodles 0.111 / noodles-bgzf 0.47 / noodles-csi
@@ -68,9 +68,9 @@ nix = { version = "0.31", default-features = false, features = ["fs"] }
 # thread pool, so `--threads` would silently stop bounding BGZF decompression/compression
 # parallelism — and fgumi already runs work inside its own scoped rayon pools. Upgrading needs a
 # dedicated, benchmarked migration PR.
-noodles = "0.115.0"
+noodles = "0.116.0"
 noodles-bgzf = { version = "0.51.0", features = ["libdeflate"] }
-noodles-csi = "0.60.0"
+noodles-csi = "0.61.0"
 num-format = "0.4"
 parking_lot = "0.12"
 proptest = "1.10"
@@ -94,7 +94,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 # Held at 0.38 because sysinfo >=0.39 requires rustc 1.95 > our MSRV (rust-toolchain.toml pins
 # 1.93). Centralized so `fgumi` and `fgumi-cli-common` cannot drift onto different versions and
 # silently raise the effective MSRV.
-sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 tempfile = "3.3.0"
 thiserror = "2"
 trybuild = "1.0"
