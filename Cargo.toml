@@ -3,7 +3,7 @@ members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf",
 resolver = "2"
 
 [workspace.package]
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 rust-version = "1.93.0"
 repository = "https://github.com/fulcrumgenomics/fgumi"
@@ -20,22 +20,22 @@ license = "MIT"
 flate2 = { version = "1.1", features = ["zlib-rs"] }
 
 # Internal crates. Versions are bumped in lockstep by release-plz.
-fgumi-bam-io = { version = "0.7.0", path = "crates/fgumi-bam-io" }
-fgumi-bgzf = { version = "0.7.0", path = "crates/fgumi-bgzf" }
-fgumi-cli-common = { version = "0.7.0", path = "crates/fgumi-cli-common" }
-fgumi-cli-macros = { version = "0.7.0", path = "crates/fgumi-cli-macros" }
-fgumi-fmt = { version = "0.7.0", path = "crates/fgumi-fmt" }
-fgumi-consensus = { version = "0.7.0", path = "crates/fgumi-consensus", default-features = false }
-fgumi-dna = { version = "0.7.0", path = "crates/fgumi-dna" }
-fgumi-metrics = { version = "0.7.0", path = "crates/fgumi-metrics" }
-fgumi-pipeline-core = { version = "0.7.0", path = "crates/fgumi-pipeline-core" }
-fgumi-pipeline-io = { version = "0.7.0", path = "crates/fgumi-pipeline-io" }
-fgumi-raw-bam = { version = "0.7.0", path = "crates/fgumi-raw-bam" }
-fgumi-sam = { version = "0.7.0", path = "crates/fgumi-sam" }
-fgumi-simd-fastq = { version = "0.7.0", path = "crates/fgumi-simd-fastq" }
-fgumi-sort = { version = "0.7.0", path = "crates/fgumi-sort" }
-fgumi-tag = { version = "0.7.0", path = "crates/fgumi-tag" }
-fgumi-umi = { version = "0.7.0", path = "crates/fgumi-umi" }
+fgumi-bam-io = { version = "0.7.1", path = "crates/fgumi-bam-io" }
+fgumi-bgzf = { version = "0.7.1", path = "crates/fgumi-bgzf" }
+fgumi-cli-common = { version = "0.7.1", path = "crates/fgumi-cli-common" }
+fgumi-cli-macros = { version = "0.7.1", path = "crates/fgumi-cli-macros" }
+fgumi-fmt = { version = "0.7.1", path = "crates/fgumi-fmt" }
+fgumi-consensus = { version = "0.7.1", path = "crates/fgumi-consensus", default-features = false }
+fgumi-dna = { version = "0.7.1", path = "crates/fgumi-dna" }
+fgumi-metrics = { version = "0.7.1", path = "crates/fgumi-metrics" }
+fgumi-pipeline-core = { version = "0.7.1", path = "crates/fgumi-pipeline-core" }
+fgumi-pipeline-io = { version = "0.7.1", path = "crates/fgumi-pipeline-io" }
+fgumi-raw-bam = { version = "0.7.1", path = "crates/fgumi-raw-bam" }
+fgumi-sam = { version = "0.7.1", path = "crates/fgumi-sam" }
+fgumi-simd-fastq = { version = "0.7.1", path = "crates/fgumi-simd-fastq" }
+fgumi-sort = { version = "0.7.1", path = "crates/fgumi-sort" }
+fgumi-tag = { version = "0.7.1", path = "crates/fgumi-tag" }
+fgumi-umi = { version = "0.7.1", path = "crates/fgumi-umi" }
 
 # Third-party crates shared by two or more members. Declared once here so a member can
 # never drift onto a different version: two versions of a crate whose types cross crate
