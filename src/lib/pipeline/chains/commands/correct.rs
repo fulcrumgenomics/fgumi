@@ -27,7 +27,7 @@ use anyhow::Result;
 use log::{info, warn};
 
 use crate::commands::correct::{
-    CollectedCorrectMetrics, CorrectOptions, EncodedUmiSet, merge_umi_counts,
+    CollectedCorrectMetrics, CorrectOptions, EncodedUmiSet, check_min_corrected, merge_umi_counts,
 };
 use crate::logging::OperationTimer;
 use crate::metrics::correct::UmiCorrectionMetrics;
@@ -123,37 +123,6 @@ impl FinalizeHook for CorrectFinalizeHook {
 
         Ok(())
     }
-}
-
-/// Enforce the `--min-corrected` floor on the ratio of kept records.
-///
-/// Errors when `records_written / total_records` falls below `min`. When no
-/// records were processed (`total_records == 0`) the ratio is undefined, so a
-/// positive `min` errors (it cannot be met) while a zero `min` passes.
-fn check_min_corrected(records_written: u64, total_records: u64, min: f64) -> Result<()> {
-    // No reads processed: the kept ratio is undefined (0 / 0 = NaN), and
-    // `NaN < min` is always false — which would silently bypass the gate. A
-    // positive minimum cannot be satisfied with zero reads, so fail explicitly;
-    // a zero minimum imposes no requirement and passes.
-    if total_records == 0 {
-        if min > 0.0 {
-            anyhow::bail!(
-                "No reads were processed, so the minimum ratio of reads kept (user specified minimum was {min:.2}) \
-                could not be met. This could indicate empty input or a mismatch between library \
-                preparation and the provided UMI file."
-            );
-        }
-        return Ok(());
-    }
-    #[allow(clippy::cast_precision_loss)]
-    let ratio_kept = records_written as f64 / total_records as f64;
-    if ratio_kept < min {
-        anyhow::bail!(
-            "Final ratio of reads kept / total was {ratio_kept:.2} (user specified minimum was {min:.2}). \
-            This could indicate a mismatch between library preparation and the provided UMI file."
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]
