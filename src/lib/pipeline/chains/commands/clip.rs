@@ -8,6 +8,7 @@
 //! step-factory functions used by `ChainBuilder::add_clip`.
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -15,7 +16,10 @@ use anyhow::Result;
 use log::info;
 
 use crate::clipper::RawRecordClipper;
+use crate::commands::clip::ClipParams;
 use crate::logging::OperationTimer;
+use crate::metrics::clip::ClippingMetricsCollection;
+use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::pipeline::chains::FinalizeHook;
 use crate::pipeline::steps::process::{ProcessOrdered, process_ordered};
 use crate::pipeline::steps::serialize::SerializeBamRecords;
@@ -85,6 +89,47 @@ impl FinalizeHook for ClipFinalizeHook {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ClipMetricsFinalizeHook
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Success-only finalize hook: reduces the per-thread `--metrics` accumulator
+/// and writes the detailed clipping-metrics TSV. Registered on
+/// `finalize_on_success` (not the always-run `finalize` list) so a
+/// failed/partial run publishes no stale metrics file — matching the
+/// single-threaded oracle, which only reaches its metrics-write code after a
+/// fully successful pass over the input.
+///
+/// Reduction mirrors the single-threaded oracle's call sequence exactly: each
+/// worker's slot holds raw (unfinalized) `fragment`/`read_one`/`read_two`
+/// counters (see [`ClippingMetricsCollection::merge`]), which are summed
+/// across all slots into one collection and then finalized/written via
+/// [`ClippingMetricsCollection::finalize_and_write`] — the same helper the
+/// single-threaded oracle calls, so the two paths' metrics output cannot drift
+/// apart — with `finalize` running exactly once, after every slot is merged
+/// (the same order the oracle uses: accumulate, then finalize once at the
+/// end). That makes the `pair`/`all` aggregates the TSV reports byte-for-byte
+/// reproducible regardless of how work was sharded across threads.
+pub(crate) struct ClipMetricsFinalizeHook {
+    pub(crate) accumulator: Arc<PerThreadAccumulator<ClippingMetricsCollection>>,
+    pub(crate) metrics_path: PathBuf,
+}
+
+impl FinalizeHook for ClipMetricsFinalizeHook {
+    fn finalize(self: Box<Self>) -> Result<()> {
+        let ClipMetricsFinalizeHook { accumulator, metrics_path } = *self;
+
+        let mut merged = ClippingMetricsCollection::new();
+        for slot in accumulator.slots() {
+            merged.merge(&slot.lock());
+        }
+        merged.finalize_and_write(&metrics_path)?;
+        info!("Wrote metrics to: {}", metrics_path.display());
+
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Step factories — extracted from build_clip_chain (T3a.5).
 //
 // Each factory receives its captured state as plain arguments and returns the
@@ -111,11 +156,16 @@ pub(crate) struct ClipProcessCaptures {
     pub(crate) auto_clip_attributes: bool,
     /// The per-template clip configuration, shared verbatim with the
     /// single-threaded `Clip::execute` path (its in-process parity oracle).
-    pub(crate) params: crate::commands::clip::ClipParams,
+    pub(crate) params: ClipParams,
     pub(crate) header: noodles::sam::Header,
     pub(crate) reference: Arc<ReferenceReader>,
     pub(crate) metrics: Arc<ClipAtomicMetrics>,
     pub(crate) progress: Arc<AtomicU64>,
+    /// Per-thread detailed `--metrics` accumulator. `None` when `--metrics` was
+    /// not requested, in which case the hot-path closure passes `None` into
+    /// `clip_template` and skips detailed collection entirely (the fast path is
+    /// unchanged from before this field existed).
+    pub(crate) metrics_accumulator: Option<Arc<PerThreadAccumulator<ClippingMetricsCollection>>>,
 }
 
 /// Build the `ClipTemplates` step: parallel, `ByItemOrdinal`. Operates in
@@ -137,8 +187,6 @@ pub(crate) fn build_clip_process_step(
         "ClipTemplates",
         limit_bytes,
         move |batch: BamTemplateBatch| -> io::Result<BamTemplateBatch> {
-            use crate::alignment_tags::regenerate_alignment_tags_raw;
-
             // Per-worker clipper: cheap to construct (no large state).
             let clipper = if cap.auto_clip_attributes {
                 RawRecordClipper::with_auto_clip(cap.clipping_mode, true)
@@ -147,48 +195,33 @@ pub(crate) fn build_clip_process_step(
             };
 
             let (batch_serial, mut templates) = batch.into_parts();
-            let mut local_templates: u64 = 0;
-            let mut local_overlap_clipped: u64 = 0;
-            let mut local_extend_clipped: u64 = 0;
-            let mut local_record_count: u64 = 0;
 
-            for template in &mut templates {
-                local_templates += 1;
-                // Mutate the template's records in place. The earlier
-                // version of this closure cloned `template.name` and
-                // re-allocated a fresh `Template` per template — that
-                // showed up as ~6% extra mimalloc CPU in profiling
-                // (mi_page_free_list_extend, mi_free) and pushed the
-                // new pipeline ~7% behind legacy at threads=4. Mutating
-                // in place keeps allocation count near-equal to legacy.
-                let records: &mut Vec<RawRecord> = &mut template.records;
-
-                // Delegate to the canonical per-template clip implementation —
-                // the exact code the single-threaded `Clip::execute` oracle runs
-                // (`ClipParams::clip_template`). It finds the primary pair by SAM
-                // flag (so secondary/supplementary reads are handled, not just
-                // records[0]/[1]), applies fixed clipping with "ensure at least N
-                // including existing clipping" semantics (not "clip N more"), and
-                // repairs mate info. The `--metrics` detailed collection is never
-                // produced under `--threads` (rejected up front), so pass `None`
-                // and use the returned per-template flags for the atomic counters.
-                let (overlap_clipped, extend_clipped) =
-                    cap.params.clip_template(records, &clipper, None).map_err(io::Error::other)?;
-                if overlap_clipped {
-                    local_overlap_clipped += 1;
-                }
-                if extend_clipped {
-                    local_extend_clipped += 1;
-                }
-
-                // Regenerate alignment tags for every record (matches the oracle).
-                for record in records.iter_mut() {
-                    regenerate_alignment_tags_raw(record.as_mut_vec(), &cap.header, &cap.reference)
-                        .map_err(io::Error::other)?;
-                }
-
-                local_record_count += records.len() as u64;
-            }
+            // When `--metrics` is requested, run the batch under this worker's
+            // `PerThreadAccumulator` slot so `clip_template` collects detailed
+            // per-read base-clip counts (exactly like the single-threaded oracle);
+            // otherwise pass `None` and stay on the fast, collection-free path.
+            let (local_templates, local_overlap_clipped, local_extend_clipped, local_record_count) =
+                if let Some(accumulator) = &cap.metrics_accumulator {
+                    accumulator.with_slot(|slot| {
+                        clip_templates_in_batch(
+                            &mut templates,
+                            &cap.params,
+                            &clipper,
+                            &cap.header,
+                            &cap.reference,
+                            Some(slot),
+                        )
+                    })?
+                } else {
+                    clip_templates_in_batch(
+                        &mut templates,
+                        &cap.params,
+                        &clipper,
+                        &cap.header,
+                        &cap.reference,
+                        None,
+                    )?
+                };
 
             // Aggregate metrics (relaxed atomics, lock-free).
             cap.metrics.total_templates.fetch_add(local_templates, Ordering::Relaxed);
@@ -206,6 +239,76 @@ pub(crate) fn build_clip_process_step(
             Ok(BamTemplateBatch::new(batch_serial, templates))
         },
     )
+}
+
+/// Clips every template in a batch in place, optionally accumulating detailed
+/// per-read base-clip counts into `metrics`.
+///
+/// Shared by both the `--metrics`-enabled and fast (`None`) call sites in
+/// [`build_clip_process_step`] so the per-template loop — clip, then
+/// regenerate alignment tags — exists exactly once. `metrics` is reborrowed
+/// on each iteration via `as_deref_mut` so the same `&mut ClippingMetricsCollection`
+/// (the calling worker's `PerThreadAccumulator` slot) accumulates across the
+/// whole batch.
+///
+/// Returns `(templates, overlap_clipped, extend_clipped, records)` counts for
+/// the batch, for the caller to fold into the chain's atomic summary counters
+/// and progress tracker.
+fn clip_templates_in_batch(
+    templates: &mut [crate::template::Template],
+    params: &ClipParams,
+    clipper: &RawRecordClipper,
+    header: &noodles::sam::Header,
+    reference: &ReferenceReader,
+    mut metrics: Option<&mut ClippingMetricsCollection>,
+) -> io::Result<(u64, u64, u64, u64)> {
+    use crate::alignment_tags::regenerate_alignment_tags_raw;
+
+    let mut local_templates: u64 = 0;
+    let mut local_overlap_clipped: u64 = 0;
+    let mut local_extend_clipped: u64 = 0;
+    let mut local_record_count: u64 = 0;
+
+    for template in templates.iter_mut() {
+        local_templates += 1;
+        // Mutate the template's records in place. The earlier
+        // version of this closure cloned `template.name` and
+        // re-allocated a fresh `Template` per template — that
+        // showed up as ~6% extra mimalloc CPU in profiling
+        // (mi_page_free_list_extend, mi_free) and pushed the
+        // new pipeline ~7% behind legacy at threads=4. Mutating
+        // in place keeps allocation count near-equal to legacy.
+        let records: &mut Vec<RawRecord> = &mut template.records;
+
+        // Delegate to the canonical per-template clip implementation — the exact
+        // code the single-threaded `Clip::execute` oracle runs
+        // (`ClipParams::clip_template`). It finds the primary pair by SAM flag (so
+        // secondary/supplementary reads are handled, not just records[0]/[1]),
+        // applies fixed clipping with "ensure at least N including existing
+        // clipping" semantics (not "clip N more"), and repairs mate info. When the
+        // caller passed a `--metrics` accumulator slot, detailed per-read base-clip
+        // counts are collected here too; otherwise `metrics` is `None` and only the
+        // returned per-template flags feed the atomic counters.
+        let (overlap_clipped, extend_clipped) = params
+            .clip_template(records, clipper, metrics.as_deref_mut())
+            .map_err(io::Error::other)?;
+        if overlap_clipped {
+            local_overlap_clipped += 1;
+        }
+        if extend_clipped {
+            local_extend_clipped += 1;
+        }
+
+        // Regenerate alignment tags for every record (matches the oracle).
+        for record in records.iter_mut() {
+            regenerate_alignment_tags_raw(record.as_mut_vec(), header, reference)
+                .map_err(io::Error::other)?;
+        }
+
+        local_record_count += records.len() as u64;
+    }
+
+    Ok((local_templates, local_overlap_clipped, local_extend_clipped, local_record_count))
 }
 
 /// Build the `SerializeBamRecords` step for clip: parallel, `ByItemOrdinal`.

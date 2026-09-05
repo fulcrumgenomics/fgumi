@@ -4067,16 +4067,17 @@ impl<'a> ChainBuilder<'a> {
     /// query-grouped order it requires on input), matching `main`'s non-chain
     /// clip, which writes `&header` unchanged.
     ///
-    /// Registers a `ClipFinalizeHook` for metrics logging + timer.
-    /// The chain-level [`StageTimingFinalizeHook`] is registered by
-    /// [`Self::build`] (not here), so it captures the correct `Instant`.
+    /// Registers a `ClipFinalizeHook` for summary banner + timer, and — when
+    /// `--metrics` is set — a success-only `ClipMetricsFinalizeHook` that reduces
+    /// the per-thread detailed `ClippingMetricsCollection` accumulator and writes
+    /// the metrics TSV. The chain-level [`StageTimingFinalizeHook`] is registered
+    /// by [`Self::build`] (not here), so it captures the correct `Instant`.
     ///
     /// # Errors
     ///
     /// Returns errors if clip options are missing from the spec bag, if the
-    /// reference FASTA is absent, if no clipping operation is requested, if
-    /// `--metrics` is used with `--threads` mode, or if `position` is
-    /// `Intermediate` (not yet implemented).
+    /// reference FASTA is absent, if no clipping operation is requested, or if
+    /// `position` is `Intermediate` (not yet implemented).
     ///
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
     /// [`BamTemplateBatch`]: crate::pipeline::steps::types::BamTemplateBatch
@@ -4084,9 +4085,11 @@ impl<'a> ChainBuilder<'a> {
     fn add_clip(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::warn_unwired_pipeline_flags;
         use crate::logging::OperationTimer;
+        use crate::metrics::clip::ClippingMetricsCollection;
+        use crate::per_thread_accumulator::PerThreadAccumulator;
         use crate::pipeline::chains::commands::clip::{
-            ClipAtomicMetrics, ClipFinalizeHook, ClipProcessCaptures, build_clip_process_step,
-            build_clip_serialize_step,
+            ClipAtomicMetrics, ClipFinalizeHook, ClipMetricsFinalizeHook, ClipProcessCaptures,
+            build_clip_process_step, build_clip_serialize_step,
         };
         use crate::pipeline::steps::group::bam::GroupBam;
         use log::info;
@@ -4140,16 +4143,7 @@ impl<'a> ChainBuilder<'a> {
             bail!("At least one clipping option is required");
         }
 
-        // --metrics is not produced in --threads mode; fail fast rather than
-        // silently dropping a user-requested output file.
         let num_threads = self.spec.threading.num_threads();
-        if let Some(path) = &clip.metrics {
-            anyhow::bail!(
-                "--metrics {} cannot be used with --threads: detailed clipping metrics \
-                 are only produced by the single-threaded path",
-                path.display()
-            );
-        }
 
         // fgbio's ClipBam requires query-grouped input (a template's reads must be
         // adjacent). Both legacy clip paths enforce this — `execute_single_threaded`
@@ -4192,6 +4186,20 @@ impl<'a> ChainBuilder<'a> {
         let metrics = Arc::new(ClipAtomicMetrics::default());
         let progress_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+        // Per-thread detailed `--metrics` accumulator, bundled with the metrics
+        // path in one `Option` — built only when `--metrics` is requested, one
+        // slot per worker thread, merged by `ClipMetricsFinalizeHook` (success-only)
+        // exactly like the single-threaded oracle's `ClippingMetricsCollection`.
+        // Bundling means the "accumulator and path are both Some or both None"
+        // invariant is structural (a single `Option`, not two kept in sync), so
+        // the finalize-hook registration below never needs to prove it via `.expect()`.
+        let metrics_target: Option<(
+            Arc<PerThreadAccumulator<ClippingMetricsCollection>>,
+            std::path::PathBuf,
+        )> = clip.metrics.clone().map(|path| {
+            (PerThreadAccumulator::<ClippingMetricsCollection>::new(num_threads.max(1)), path)
+        });
+
         // ── Step factories (see chains::commands::clip) ──────────────────
         let process_step = build_clip_process_step(
             self.tuning.per_step_byte_limit,
@@ -4203,6 +4211,7 @@ impl<'a> ChainBuilder<'a> {
                 reference: Arc::clone(&reference),
                 metrics: Arc::clone(&metrics),
                 progress: Arc::clone(&progress_counter),
+                metrics_accumulator: metrics_target.as_ref().map(|(acc, _)| Arc::clone(acc)),
             },
         );
         let serialize_step = build_clip_serialize_step(self.tuning.per_step_byte_limit);
@@ -4221,6 +4230,15 @@ impl<'a> ChainBuilder<'a> {
         // build() after all stages have been added — that way a single timer
         // covers the full pipeline run regardless of how many stages there are.
         self.finalize.push(Box::new(ClipFinalizeHook { metrics, progress_counter, timer }));
+
+        // Success-only: reduce the per-thread `--metrics` accumulator and write
+        // the TSV. A failed/partial run publishes no stale metrics file, matching
+        // the single-threaded oracle (which only reaches its metrics-write code
+        // after a fully successful pass over the input).
+        if let Some((accumulator, metrics_path)) = metrics_target {
+            self.finalize_on_success
+                .push(Box::new(ClipMetricsFinalizeHook { accumulator, metrics_path }));
+        }
 
         Ok(())
     }
