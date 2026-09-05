@@ -34,6 +34,7 @@ use fgumi_lib::commands::group::GroupReadsByUmi;
 use fgumi_lib::commands::merge::Merge;
 use fgumi_lib::commands::retag::Retag;
 use fgumi_lib::commands::review::Review;
+use fgumi_lib::commands::runall::RunAll;
 #[cfg(feature = "simplex")]
 use fgumi_lib::commands::simplex::Simplex;
 #[cfg(feature = "simplex")]
@@ -150,6 +151,8 @@ enum Subcommand {
     CopyUmi(CopyUmi),
     #[command(display_order = 19)]
     Retag(Retag),
+    #[command(name = "runall", display_order = 22)]
+    RunAll(RunAll),
     #[cfg(feature = "compare")]
     #[command(display_order = 20)]
     Compare(Compare),
@@ -185,6 +188,7 @@ impl Subcommand {
             Self::Downsample(cmd) => cmd.execute(command_line),
             Self::CopyUmi(cmd) => cmd.execute(command_line),
             Self::Retag(cmd) => cmd.execute(command_line),
+            Self::RunAll(cmd) => cmd.execute(command_line),
             #[cfg(feature = "compare")]
             Self::Compare(cmd) => cmd.execute(command_line),
             #[cfg(feature = "simulate")]
