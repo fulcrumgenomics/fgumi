@@ -957,19 +957,31 @@ pub(crate) fn process_position_group(
         });
     }
 
-    // Clear existing duplicate flags before re-marking
-    let mut templates: Vec<Template> = filtered_templates
-        .into_iter()
-        .map(|mut t| {
-            for raw in t.records_mut().iter_mut() {
-                let flg = RawRecordView::new(raw.as_ref()).flags();
-                fgumi_raw_bam::set_flags(raw, flg & !DUPLICATE_FLAG);
-            }
-            t
-        })
-        .collect();
+    // Assign UMI groups before clearing duplicate flags, so this read runs while
+    // `cached_umi_position` (recorded during the parallel Decode step; see
+    // `GroupKeyConfig::with_umi_tag` and `Template::from_decoded_records`) is
+    // still valid. `assign_umi_groups` only reads record state (`cached_umi()`,
+    // and R1/R2 orientation for `get_pair_orientation`) and writes
+    // `Template::mi`; it never calls `records_mut()` or touches the BAM bytes.
+    let mut templates: Vec<Template> = filtered_templates;
     if let Err(e) = assign_umi_groups(&mut templates, assigner, raw_tag, min_umi_length, no_umi) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+    }
+
+    // Clear existing duplicate flags before re-marking. This runs *after* UMI
+    // assignment above: nothing reads `cached_umi()` again below, so
+    // `records_mut()`'s blanket cache invalidation (needed for callers like
+    // `fix_mate_info` that rewrite aux tags) is harmless here, and
+    // `fgumi_raw_bam::set_flags` only ever writes the 2-byte FLAG field
+    // (`bam[14..16]`), never the aux block, so it cannot itself move RX. The
+    // two steps touch disjoint state (the duplicate flag bit vs. `Template::mi`
+    // plus read-only record access) and therefore commute, so this reorder is
+    // byte-identical to the previous ordering.
+    for t in &mut templates {
+        for raw in t.records_mut().iter_mut() {
+            let flg = RawRecordView::new(raw.as_ref()).flags();
+            fgumi_raw_bam::set_flags(raw, flg & !DUPLICATE_FLAG);
+        }
     }
 
     // Sort by molecule ID for grouping
@@ -4007,5 +4019,119 @@ mod tests {
         // In no_umi mode, short UMIs should be accepted (min_umi_length is not checked)
         assert!(filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.accepted_templates(), 1);
+    }
+
+    // ========================================================================
+    // UMI-position-cache reorder pin (#334)
+    // ========================================================================
+
+    /// Builds one raw BAM record carrying a decoy `ZZ:Z:POISONXX` tag
+    /// immediately followed by the real `RX:Z:<umi>` tag, via
+    /// [`RawSamBuilder`] rather than hand-rolled record bytes: `ZZ` is one of
+    /// `xtask check-tag-literals`' allowlisted opaque test-fixture tags (it
+    /// carries no SAM-tag semantics of its own -- see that scanner's
+    /// `PAYLOAD_ALLOWLIST`), and `add_string_tag` appends aux tags in call
+    /// order, so calling it for `ZZ` before `RX` deterministically places the
+    /// decoy first without any manual offset arithmetic.
+    ///
+    /// Returns the record plus the record-relative byte offset of the decoy
+    /// tag's *value* bytes (found the same way production decode finds a
+    /// cached UMI position: [`fgumi_raw_bam::aux_data_offset_from_record`] +
+    /// [`fgumi_raw_bam::find_string_tag_position`]). The decoy sits before
+    /// `RX` at a layout fixed by `name`'s length, so two records built with
+    /// same-length names place it at the same offset — which is what lets the
+    /// test below poison both records' caches to one shared, identical,
+    /// WRONG position.
+    fn build_record_with_decoy_before_rx(name: &[u8], umi: &[u8]) -> (RawRecord, u32) {
+        let mut b = RawSamBuilder::new();
+        b.read_name(name)
+            .ref_id(0)
+            .pos(100)
+            .mapq(30)
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .cigar_ops(&[encode_op(0, 4)])
+            .sequence(b"ACGT")
+            .add_string_tag(*b"ZZ", b"POISONXX")
+            .add_string_tag(*SamTag::RX, umi);
+        let raw = b.build();
+
+        let aux_offset = fgumi_raw_bam::aux_data_offset_from_record(raw.as_ref())
+            .expect("record has aux data past the fixed/name/cigar/seq/qual fields");
+        let aux = fgumi_raw_bam::aux_data_slice(raw.as_ref());
+        let (decoy_off_in_aux, decoy_len) = fgumi_raw_bam::find_string_tag_position(aux, *b"ZZ")
+            .expect("decoy ZZ tag must be present in aux data");
+        assert_eq!(decoy_len, 8, "decoy value POISONXX must be 8 bytes");
+        let decoy_value_offset =
+            u32::try_from(aux_offset + decoy_off_in_aux as usize).expect("offset fits in a u32");
+
+        (raw, decoy_value_offset)
+    }
+
+    /// Pins the reorder in `process_position_group` itself, not merely its
+    /// output. Two single-end templates share one position; their real `RX`
+    /// aux tags carry two DISTINCT UMIs (`AAAAAAAA`, `CCCCCCCC`), but each
+    /// record's `cached_umi_position` is deliberately poisoned (as a
+    /// wrong-offset cache mis-slice would poison it) to point at a decoy
+    /// region holding the SAME literal string (`POISONXX`) in both records.
+    ///
+    /// - Under the fixed ordering (`assign_umi_groups` before the
+    ///   duplicate-flag-clearing `records_mut()` preamble), the poisoned cache
+    ///   is still valid when `assign_umi_groups` reads it via
+    ///   `Template::cached_umi()`: both templates resolve to the identical
+    ///   decoy string, so `IdentityUmiAssigner` collapses them into ONE
+    ///   molecule.
+    /// - Under the pre-fix ordering (`records_mut()` before
+    ///   `assign_umi_groups`), `records_mut()` unconditionally clears
+    ///   `cached_umi_position`, so `assign_umi_groups` falls back to scanning
+    ///   aux data for the real `RX` tag and correctly finds the two DISTINCT
+    ///   UMI values, yielding TWO molecules.
+    ///
+    /// This test therefore fails under the pre-fix ordering and passes under
+    /// the fix: unlike an output-correctness check (which the aux-scan
+    /// fallback already satisfies on its own), it is a direct behavioral pin
+    /// on "the cache is actually consulted, not silently bypassed".
+    #[test]
+    fn test_assign_umi_groups_reads_the_cache_not_a_rescan_after_reorder() {
+        use crate::unified_pipeline::{DecodedRecord, GroupKey};
+
+        let (raw_a, decoy_offset_a) = build_record_with_decoy_before_rx(b"polyA1", b"AAAAAAAA");
+        let (raw_b, decoy_offset_b) = build_record_with_decoy_before_rx(b"polyA2", b"CCCCCCCC");
+        assert_eq!(
+            decoy_offset_a, decoy_offset_b,
+            "fixture invariant: the decoy value must sit at the same record-relative offset \
+             in both records so poisoning both caches to it is an apples-to-apples test"
+        );
+
+        let mut decoded_a = DecodedRecord::from_raw_bytes(raw_a, GroupKey::default());
+        decoded_a.set_cached_umi(decoy_offset_a, 8);
+        let mut decoded_b = DecodedRecord::from_raw_bytes(raw_b, GroupKey::default());
+        decoded_b.set_cached_umi(decoy_offset_b, 8);
+
+        let group = RawPositionGroup {
+            group_key: GroupKey::default(),
+            records: vec![decoded_a, decoded_b],
+        };
+
+        let filter_config = TemplateFilterConfig::default();
+        let assigner = IdentityUmiAssigner::new();
+        let processed = process_position_group(
+            group,
+            &filter_config,
+            &assigner,
+            SamTag::RX,
+            None,
+            false,
+            false,
+        )
+        .expect("process_position_group should succeed on this well-formed fixture");
+
+        assert_eq!(
+            processed.distinct_mi_count, 1,
+            "assign_umi_groups must read the still-valid UMI-position cache (poisoned to an \
+             identical decoy string on both templates) rather than falling back to an aux-data \
+             rescan of the real, distinct RX values -- got {} distinct molecule(s), which means \
+             the cache was NOT consulted at the point assign_umi_groups ran",
+            processed.distinct_mi_count
+        );
     }
 }
