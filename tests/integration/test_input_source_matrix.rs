@@ -143,7 +143,7 @@ const CONTRACTS: &[IoContract] = &[
         stdout: Required,
         output_depends_on_input: Required,
     },
-    #[cfg(feature = "simplex")]
+    #[cfg(feature = "consensus")]
     IoContract {
         command: "simplex",
         sam: Required,
@@ -151,7 +151,7 @@ const CONTRACTS: &[IoContract] = &[
         stdout: Required,
         output_depends_on_input: Required,
     },
-    #[cfg(feature = "duplex")]
+    #[cfg(feature = "consensus")]
     IoContract {
         command: "duplex",
         sam: Required,
@@ -159,7 +159,7 @@ const CONTRACTS: &[IoContract] = &[
         stdout: Required,
         output_depends_on_input: Required,
     },
-    #[cfg(feature = "codec")]
+    #[cfg(feature = "consensus")]
     IoContract {
         command: "codec",
         sam: Required,
@@ -195,7 +195,7 @@ const CONTRACTS: &[IoContract] = &[
         stdout: Required,
         output_depends_on_input: Required,
     },
-    #[cfg(feature = "duplex")]
+    #[cfg(feature = "consensus")]
     IoContract {
         command: "duplex-metrics",
         sam: Required,
@@ -203,7 +203,7 @@ const CONTRACTS: &[IoContract] = &[
         stdout: NotApplicable("`-o` names a prefix for several metrics files, not one stream"),
         output_depends_on_input: Required,
     },
-    #[cfg(feature = "simplex")]
+    #[cfg(feature = "consensus")]
     IoContract {
         command: "simplex-metrics",
         sam: Required,

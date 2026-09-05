@@ -788,7 +788,7 @@ const fn saturating_refund(current: u64, bytes: u64) -> u64 {
 /// Default high-water mark for Q5, the processed queue (256 MiB).
 ///
 /// This is set lower than the Q3 mark (256 MiB vs 512 MiB) because items in Q5
-/// are typically larger (e.g., `SimplexProcessedBatch` with `RecordBuf` vectors).
+/// are typically larger (e.g., `CorrectProcessedBatch` with `RecordBuf` vectors).
 /// When Q5 memory reaches this mark, the Process step pauses to let
 /// downstream steps (Serialize, Compress, Write) catch up.
 ///

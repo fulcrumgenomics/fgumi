@@ -1138,9 +1138,10 @@ fn create_offset_codec_pair(name: &str, umi: &str) -> (RawRecord, RawRecord) {
     (b1.build(), b2.build())
 }
 
-/// Verifies that the single-threaded `Codec::run` path recovers from a
-/// duplex-disagreement molecule via the typed `CodecConsensusError` instead
-/// of bailing — covers `src/lib/commands/codec.rs:383-397` (issue #338).
+/// Verifies that the absent-`--threads` (single-worker) chain path recovers
+/// from a duplex-disagreement molecule via the typed `CodecConsensusError`
+/// instead of bailing — covers `src/lib/commands/codec.rs:383-397` (issue
+/// #338).
 #[test]
 fn test_codec_command_recovers_from_duplex_disagreement() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -1180,16 +1181,11 @@ fn test_codec_command_recovers_from_duplex_disagreement() {
     assert_eq!(consensus_count, 0, "Disagreeing molecule should produce no consensus");
 }
 
-/// Verifies that the parallel `--threads` path recovers from a
+/// Verifies that the multi-worker `--threads` chain path recovers from a
 /// duplex-disagreement molecule via the typed `CodecConsensusError` — covers
-/// what the single-threaded test above does not exercise.
-///
-/// Since the R3.7 codec-command cutover, `default = ["consensus"]` means
-/// `--threads 2` here routes through the declarative chain builder
-/// (`Codec::execute_chain` / `add_codec`), not the legacy
-/// `Codec::execute_threads_mode`. This integration binary is built with the
-/// workspace default features, so that chain path is what this test exercises —
-/// a de-facto chain-path disagreement-recovery regression test.
+/// what the single-worker test above does not exercise (both route through
+/// `Codec::execute_chain` / `add_codec`; worker count is the only
+/// difference).
 #[test]
 fn test_codec_command_recovers_from_duplex_disagreement_threaded() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -1238,14 +1234,12 @@ fn test_codec_command_recovers_from_duplex_disagreement_threaded() {
     assert_eq!(consensus_count, 0, "Disagreeing molecule should produce no consensus");
 
     // Exercising --rejects forces the parallel-mode reject-collection path
-    // through the typed-disagreement arm (`is_duplex_disagreement()`) — on a
-    // consensus build that's the chain's `build_codec_consensus_step_with_rejects`
-    // step (`add_codec`); on a non-consensus build it's the legacy
-    // `execute_threads_mode`'s `flush_byte_records` call. CODEC3-08:
-    // `consensus_reads_typed` preserves the disagreeing molecule's raw records
-    // for the --rejects output before returning the recoverable error (fgbio
-    // routes these to its rejectsWriter), so the two input reads land in the
-    // rejects BAM on either path.
+    // through the typed-disagreement arm (`is_duplex_disagreement()`) in the
+    // chain's `build_codec_consensus_step_with_rejects` step (`add_codec`).
+    // CODEC3-08: `consensus_reads_typed` preserves the disagreeing molecule's
+    // raw records for the --rejects output before returning the recoverable
+    // error (fgbio routes these to its rejectsWriter), so the two input reads
+    // land in the rejects BAM.
     assert!(rejects_bam.exists(), "Rejects BAM file should be created");
 
     // Read the rejects back as raw BAM records so we can compare the *entire*
@@ -1392,13 +1386,17 @@ fn test_codec_ignores_half_mapped_pair_when_mapped_reads_present() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// R3.7 codec-command cutover: chain-vs-oracle parity tests
+// R3.7 codec-command cutover: chain worker-count determinism tests
 //
-// The no-`--threads` single-threaded fast path (`Codec::execute`) is the
-// in-process parity oracle; `--threads N` now routes onto the declarative
-// chain builder (`Codec::execute_chain` -> `add_codec`). These tests prove
-// byte/record identity between the two paths across the codec knobs, plus the
-// Task 2 (sort-order guard) and Task 2A (validation mirroring) hardening.
+// `Codec::execute` always routes onto the declarative chain builder
+// (`Codec::execute_chain` -> `add_codec`) on a `consensus`-feature build; the
+// legacy single-threaded fast path is retired. These tests diff a no-`--threads`
+// run (the chain at a single worker) against a `--threads N` run (N workers):
+// the "oracle" / "non-chain path" naming below now means the single-worker
+// chain, not the retired serial loop. They prove byte/record identity across the
+// codec knobs, plus the Task 2 (sort-order guard) and Task 2A (validation
+// mirroring) hardening. Byte-parity against the pre-removal serial binary lives
+// in `test_consensus_cutover_parity.rs`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Parses and runs `codec` with the given input/output/extra args, panicking
@@ -1477,11 +1475,18 @@ fn test_codec_chain_matches_single_threaded() {
 }
 
 /// Knob-parity: set several non-default content-affecting codec knobs and assert
-/// the chain (`--threads 4`) output matches the single-threaded oracle
-/// record-for-record. Guards against `add_codec`'s hand-built
-/// `CodecConsensusOptions` dropping or mis-wiring a knob that the oracle's
-/// `to_codec_options()` honors — the default-only parity tests would pass green
-/// on such a drop, since both paths would then agree on the (identical) default.
+/// the chain (`--threads 4`) output matches the single-worker oracle
+/// record-for-record. Both sides route through `add_codec`'s
+/// `codec_consensus_options` mapping (worker count is the only difference),
+/// so this test alone cannot catch a knob that mapping drops or mis-wires —
+/// both sides would silently agree — which is why
+/// `codec_consensus_options_carries_every_tuning_flag`
+/// (`pipeline::chains::commands::codec`) exercises that mapping directly.
+/// This test instead guards that non-default values actually reach the
+/// consensus caller identically at every worker count; the default-only
+/// parity tests would pass green even if a knob's *value* (not the mapping)
+/// were silently ignored downstream, since both paths would then agree on the
+/// (identical) default.
 #[test]
 fn test_codec_chain_matches_single_threaded_with_nondefault_knobs() {
     let temp_dir = TempDir::new().unwrap();
