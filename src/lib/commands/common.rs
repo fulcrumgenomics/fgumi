@@ -12,10 +12,11 @@ use std::sync::Arc;
 use crate::assigner::Strategy;
 #[cfg(feature = "simplex")]
 use crate::logging::OperationTimer;
-use crate::unified_pipeline::{
-    BACKPRESSURE_THRESHOLD_BYTES, BamPipelineConfig, Q5_BACKPRESSURE_THRESHOLD_BYTES,
-    SchedulerStrategy, stage_high_water_mark,
+use crate::pipeline::backpressure::{
+    BACKPRESSURE_THRESHOLD_BYTES, Q5_BACKPRESSURE_THRESHOLD_BYTES, stage_high_water_mark,
 };
+use crate::scheduler_strategy::SchedulerStrategy;
+use crate::unified_pipeline::BamPipelineConfig;
 use crate::validation::validate_input_exists;
 use bytesize::ByteSize;
 use clap::Args;
@@ -1764,7 +1765,7 @@ pub(crate) fn warn_unwired_pipeline_flags(scheduler_opts: &SchedulerOptions) {
     // `info!`) to match the sibling "flag has no effect on the chain path"
     // diagnostics in `group::execute_chain` (--debug-memory, FGUMI_SHORT_CIRCUIT).
     let requested_scheduler = scheduler_opts.strategy();
-    if requested_scheduler != crate::unified_pipeline::scheduler::SchedulerStrategy::default() {
+    if requested_scheduler != SchedulerStrategy::default() {
         log::warn!(
             "--scheduler has no effect in the typed-step pipeline: the chain engine \
              does not use a pluggable scheduler strategy, so the requested strategy \

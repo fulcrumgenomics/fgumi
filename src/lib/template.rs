@@ -36,8 +36,8 @@
 //! ```
 
 use crate::sam::SamTag;
-use crate::unified_pipeline::{DecodedRecord, MemoryEstimate};
 use anyhow::{Result, bail};
+use fgumi_bam_io::{DecodedRecord, MemoryEstimate};
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 
 // Re-export PairOrientation from sam module for backwards compatibility
@@ -3021,7 +3021,7 @@ mod tests {
     // Template::from_decoded_records / cached_umi tests (issue #334)
     // ========================================================================
 
-    use crate::unified_pipeline::{DecodedRecord, GroupKey};
+    use fgumi_bam_io::{DecodedRecord, GroupKey};
 
     fn build_raw_with_umi(name: &[u8], flags: u16, umi: &[u8]) -> RawRecord {
         let mut b = RawSamBuilder::new();

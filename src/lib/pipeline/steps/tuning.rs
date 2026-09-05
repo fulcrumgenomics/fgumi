@@ -34,9 +34,9 @@ pub struct BamPipelineTuning {
 
 impl BamPipelineTuning {
     /// Auto-tuned defaults for `threads` worker threads, mirroring the legacy
-    /// `PipelineConfig::auto_tuned` (`unified_pipeline::base`). Deliberately not
-    /// an intra-doc link: that module is deleted once the commands migrate off
-    /// it, and a link would break again then.
+    /// `PipelineConfig::auto_tuned` from the now-deprecated unified pipeline.
+    /// Deliberately not an intra-doc link: that code is deleted once the
+    /// commands migrate off it, and a link would break again then.
     #[must_use]
     pub fn auto_tuned(threads: usize) -> Self {
         let threads = threads.max(1);
