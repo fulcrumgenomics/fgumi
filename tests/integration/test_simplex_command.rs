@@ -878,11 +878,15 @@ fn test_simplex_indel_at_overlap_boundary_still_calls_a_consensus() {
 }
 
 //////////////////////////////////////////////////////////////////////////////
-// Chain-path (`--threads`) parity tests
+// Chain-path worker-count determinism tests
 //
-// `simplex --threads N` routes through the declarative chain builder; the
-// no-`--threads` path keeps its own single-threaded fast path and is the
-// in-process parity oracle these tests diff against.
+// `simplex` always routes through the declarative chain builder (the legacy
+// single-threaded fast path is retired on a `consensus` build). These tests
+// diff a no-`--threads` run (the chain at a single worker) against a
+// `--threads N` run (the chain at N workers): the "non-chain path" / "oracle"
+// naming below now means the single-worker chain, not the retired serial loop.
+// Byte-parity against the pre-removal serial binary lives in
+// `test_consensus_cutover_parity.rs`.
 //////////////////////////////////////////////////////////////////////////////
 
 /// Read a BAM's records back as decoded `RecordBuf`s, for record-for-record

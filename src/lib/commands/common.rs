@@ -6,11 +6,11 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 use std::sync::Arc;
 
 use crate::assigner::Strategy;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 use crate::logging::OperationTimer;
 use crate::unified_pipeline::{
     BACKPRESSURE_THRESHOLD_BYTES, BamPipelineConfig, Q5_BACKPRESSURE_THRESHOLD_BYTES,
@@ -22,7 +22,7 @@ use clap::Args;
 use fgumi_bam_io::is_stdout_path;
 use fgumi_consensus::methylation::RefBaseProvider;
 use fgumi_umi::IndexThreshold;
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 use log::{info, warn};
 use noodles::sam::Header;
 
@@ -108,7 +108,7 @@ pub fn resolve_methylation_mode(
 }
 
 /// Methylation reference pair: reference base provider + contig name mapping.
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 pub type MethylationRef = Option<(
     Arc<dyn fgumi_consensus::methylation::RefBaseProvider + Send + Sync>,
     Arc<Vec<String>>,
@@ -117,7 +117,7 @@ pub type MethylationRef = Option<(
 /// Loads the reference FASTA and builds contig name mapping for methylation-aware modes.
 ///
 /// Returns `None` if methylation mode is disabled. Errors if enabled but `reference` is `None`.
-#[cfg(feature = "simplex")]
+#[cfg(feature = "consensus")]
 pub fn load_methylation_reference(
     methylation_mode: fgumi_consensus::MethylationMode,
     reference: &Option<PathBuf>,
@@ -1580,11 +1580,23 @@ impl QueueMemoryOptions {
 /// downstream BGZF compression stage operates on the framed bytes verbatim.
 ///
 /// Used by command-level `serialize_fn` and `secondary_serialize_fn`
-/// closures that produce raw record bytes (e.g. `commands::filter`,
-/// the `--rejects` paths in `commands::correct`/`simplex`/`duplex`/`codec`).
+/// closures that produce raw record bytes: `commands::filter`'s no-`--threads`
+/// pipeline and the `--rejects` path in `commands::correct`'s legacy
+/// `execute_threads_mode`.
 ///
 /// Generic over `R: AsRef<[u8]>` so callers can pass either
 /// `&[fgumi_raw_bam::RawRecord]` or `&[Vec<u8>]` without copying.
+///
+/// `#[allow(dead_code)]`: after this PR retired the `simplex`/`duplex`/`codec`
+/// serial paths (their non-generic `--rejects` call sites), the only remaining
+/// references are through generic pipeline code (`filter::run_filter_pipeline`,
+/// still live on filter's not-yet-migrated no-`--threads` path) and
+/// `correct::execute_threads_mode` (itself already `#[allow(dead_code)]` — see
+/// its doc). `cargo ci-lint`'s reachability analysis does not credit those
+/// generic/legacy references, so it flags this as dead even though it is live
+/// on filter's path — the same migration-transitional situation, and the same
+/// remedy, as `correct::execute_threads_mode`. Drop the attribute once filter's
+/// serial path is retired and this becomes a genuine chain-only helper.
 ///
 /// # Errors
 ///
@@ -1598,6 +1610,7 @@ impl QueueMemoryOptions {
 /// Both error paths are checked in a single up-front validation pass, so
 /// `output` is never partially appended on error: either every record is
 /// written or none of `output`'s bytes are touched.
+#[allow(dead_code)]
 pub(crate) fn serialize_raw_bam_records<R: AsRef<[u8]>>(
     records: &[R],
     output: &mut Vec<u8>,

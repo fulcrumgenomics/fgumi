@@ -13,9 +13,10 @@
 //!
 //! This module supplies the chain-builder pieces for the duplex stage; the
 //! chain is constructed via `ChainBuilder` /
-//! [`crate::pipeline::chains::build::build_for`]. `Duplex::execute` routes the
-//! `--threads N` path through this chain (via `execute_chain`), keeping the
-//! no-`--threads` in-process path as the parity oracle.
+//! [`crate::pipeline::chains::build::build_for`]. `Duplex::execute` routes
+//! every run through this chain (via `execute_chain`), with or without
+//! `--threads` — absent `--threads` runs the chain at a single worker, which
+//! is the in-process parity oracle for the multi-worker case.
 
 use std::io;
 use std::sync::Arc;
@@ -48,8 +49,7 @@ use crate::pipeline::steps::types::DecompressedBlock;
 // CollectedDuplexMetrics
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Per-thread accumulator for duplex consensus metrics (mirrors
-/// `commands::duplex::CollectedDuplexMetrics`).
+/// Per-thread accumulator for duplex consensus metrics.
 ///
 /// Merged into final aggregates after the pipeline completes; one instance
 /// per worker slot (see [`PerThreadAccumulator`]).
@@ -164,6 +164,51 @@ impl FinalizeHook for DuplexFinalizeHook {
 // opaque-return position and cannot name themselves.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The subset of `DuplexOptions` tuning knobs that `add_duplex` maps into
+/// [`DuplexConsensusCaptures`] for the per-worker `DuplexConsensusCaller`.
+///
+/// Extracted out of `ChainBuilder::add_duplex` (a single field-name-mismatch
+/// or swap away from a silent bug, since `DuplexConsensusCaptures` has no
+/// single "options" sub-struct the way simplex/codec do) so this mapping is
+/// unit-testable on its own: the `test_duplex_chain_matches_single_threaded`
+/// parity tests compare two chain runs (single- vs multi-worker) that BOTH go
+/// through this same mapping, so a field dropped or swapped inside it would
+/// make the two sides agree with each other and still pass. See
+/// `duplex_consensus_tuning_carries_every_tuning_flag` below, which mirrors
+/// `to_duplex_options_carries_every_tuning_flag`'s non-default-everywhere
+/// discipline for the other half of the CLI-args -> `DuplexOptions` ->
+/// `DuplexConsensusCaptures` pipeline.
+#[derive(Debug, PartialEq)]
+pub(crate) struct DuplexConsensusTuning {
+    pub(crate) min_reads: Vec<usize>,
+    pub(crate) min_input_base_quality: u8,
+    pub(crate) output_per_base_tags: bool,
+    pub(crate) trim: bool,
+    pub(crate) max_reads_per_strand: Option<usize>,
+    pub(crate) error_rate_pre_umi: u8,
+    pub(crate) error_rate_post_umi: u8,
+    pub(crate) tie_rule: fgumi_consensus::TieRule,
+    pub(crate) methylation_mode: fgumi_consensus::MethylationMode,
+}
+
+pub(crate) fn duplex_consensus_tuning(
+    duplex: &crate::commands::duplex::DuplexOptions,
+) -> DuplexConsensusTuning {
+    let consensus = duplex.consensus();
+    DuplexConsensusTuning {
+        min_reads: duplex.min_reads.clone(),
+        min_input_base_quality: consensus.min_input_base_quality,
+        output_per_base_tags: consensus.output_per_base_tags,
+        trim: consensus.trim,
+        max_reads_per_strand: duplex.max_reads_per_strand,
+        error_rate_pre_umi: consensus.error_rate_pre_umi,
+        error_rate_post_umi: consensus.error_rate_post_umi,
+        // `duplex.tie_rule` is already the resolved `TieRule` on `DuplexOptions`.
+        tie_rule: duplex.tie_rule,
+        methylation_mode: duplex.methylation_mode,
+    }
+}
+
 /// Captures passed into [`build_duplex_consensus_step_with_rejects`] / [`build_duplex_consensus_step_kept_only`] from `add_duplex`.
 ///
 /// Bundles all the cloned scalars and Arcs the closure needs so `add_duplex`
@@ -187,7 +232,7 @@ pub(crate) struct DuplexConsensusCaptures {
     pub(crate) error_rate_pre_umi: u8,
     pub(crate) error_rate_post_umi: u8,
     /// Resolved tie-breaking rule (`--tie-rule`). Threaded through so the chain
-    /// caller applies `.with_tie_rule(..)` exactly like both oracle paths.
+    /// caller applies `.with_tie_rule(..)`.
     pub(crate) tie_rule: fgumi_consensus::TieRule,
     pub(crate) cell_tag: noodles::sam::alignment::record::data::field::Tag,
     pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedDuplexMetrics>>,
@@ -235,10 +280,8 @@ fn make_duplex_consensus_init(
             error_rate_post_umi,
         )
         .expect("DuplexConsensusCaller::new failed during worker init")
-        // Apply the resolved `--tie-rule`, matching both oracle paths
-        // (`with_tie_rule` in Duplex::execute's single-threaded and legacy
-        // threaded callers). `TieRule` is `Copy`, so the `Fn` closure re-applies
-        // it on every per-worker init.
+        // Apply the resolved `--tie-rule`. `TieRule` is `Copy`, so the `Fn`
+        // closure re-applies it on every per-worker init.
         .with_tie_rule(tie_rule);
         if let Some((ref reference, ref ref_names)) = methylation_ref {
             caller.set_reference(Arc::clone(reference), Arc::clone(ref_names), methylation_mode);
@@ -489,4 +532,75 @@ pub(crate) fn build_duplex_consensus_step_kept_only(
         init,
         body,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::duplex::Duplex;
+    use clap::Parser;
+
+    /// The `DuplexOptions -> DuplexConsensusCaptures` scalar-tuning mapping
+    /// inside `add_duplex` must carry every tuning flag. The
+    /// `test_duplex_chain_matches_single_threaded` parity tests compare two
+    /// chain runs that BOTH go through this mapping, so they cannot catch a
+    /// field dropped or swapped inside it; this test exercises the mapping
+    /// directly, driven through `try_parse_from` + `to_duplex_options()` (not
+    /// a hand-built `DuplexOptions` literal) with every value non-default, so
+    /// a field read from the wrong source fails rather than coincidentally
+    /// matching a default. Mirrors `to_duplex_options_carries_every_tuning_flag`
+    /// in `commands::duplex`, which covers the other half of the pipeline
+    /// (CLI args -> `DuplexOptions`).
+    #[test]
+    fn duplex_consensus_tuning_carries_every_tuning_flag() {
+        let cmd = Duplex::try_parse_from([
+            "duplex",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--error-rate-pre-umi",
+            "41",
+            "--error-rate-post-umi",
+            "36",
+            "--min-input-base-quality",
+            "18",
+            "--output-per-base-tags=false",
+            "--trim=true",
+            "--min-consensus-base-quality",
+            "21",
+            "--tie-rule",
+            "ulp-relative",
+            "--min-reads",
+            "3,2,1",
+            "--max-reads-per-strand",
+            "55",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            "ref.fa",
+        ])
+        .expect("parses");
+        let duplex_options = cmd.to_duplex_options();
+
+        let tuning = duplex_consensus_tuning(&duplex_options);
+
+        assert_eq!(tuning.min_reads, vec![3, 2, 1]);
+        assert_eq!(tuning.min_input_base_quality, 18);
+        assert!(!tuning.output_per_base_tags, "an explicit false must not be lost");
+        assert!(tuning.trim);
+        assert_eq!(tuning.max_reads_per_strand, Some(55));
+        assert_eq!(tuning.error_rate_pre_umi, 41);
+        assert_eq!(tuning.error_rate_post_umi, 36);
+        assert_eq!(
+            tuning.tie_rule,
+            fgumi_consensus::TieRule::UlpRelative,
+            "--tie-rule must reach the mapping"
+        );
+        assert_eq!(
+            tuning.methylation_mode,
+            fgumi_consensus::MethylationMode::EmSeq,
+            "--methylation-mode must reach the mapping"
+        );
+    }
 }
