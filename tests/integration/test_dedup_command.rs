@@ -1908,9 +1908,8 @@ fn test_dedup_accepts_index_threshold_never() {
     assert_eq!(duplicates, 4, "two of the three pairs must be marked duplicate: {never:?}");
 }
 
-/// The chain (`--threads N`) dedup path's `Index threshold:` startup banner must
-/// be strategy/edits-aware, matching the non-chain path's
-/// `common::log_index_threshold` wording exactly (see
+/// `dedup`'s `Index threshold:` startup banner must be strategy/edits-aware,
+/// using the shared `common::log_index_threshold` wording exactly (see
 /// `test_index_threshold_log_message` in `commands::common` for the full case
 /// table) -- not the flat `Index threshold: {dedup.index_threshold}` (the raw
 /// `--index-threshold` value, unfloored) the chain path used to emit whenever
@@ -2122,11 +2121,8 @@ fn test_dedup_no_check_crc_accepts_corrupted_crc_on_file_input() {
 }
 
 //////////////////////////////////////////////////////////////////////////////
-// Chain-path (`--threads`) parity tests
-//
-// `dedup --threads N` routes through the declarative chain builder; the
-// no-`--threads` path keeps the hand-rolled unified pipeline and is the
-// in-process oracle these tests diff against.
+// Chain-backed `dedup` path (the only execution path since the C4 cutover):
+// worker-count determinism across `--threads` values.
 //////////////////////////////////////////////////////////////////////////////
 
 /// Read a BAM's records back as decoded `RecordBuf`s, for record-for-record
@@ -2150,29 +2146,28 @@ fn dedup_run(input: &Path, output: &Path, extra: &[&str]) {
         .expect("dedup run failed");
 }
 
-/// The chain (`--threads N`) path produces output records record-for-record
-/// identical to the non-chain (no-`--threads`) path. Run at both `--threads 1`
-/// (the minimal chain engine) and `--threads 4` (genuinely parallel) — dedup's
-/// output is deterministic, so both must equal the single oracle.
+/// The `--threads 4` (genuinely parallel) chain path produces output records
+/// record-for-record identical to the `--threads 1` (single-worker) oracle.
+/// Both worker counts run through the declarative chain — the legacy
+/// single-threaded path is retired — so this pins dedup's cross-worker-count
+/// determinism.
 ///
 /// The fixture uses [`create_duplicate_group_rx_offset`] with a cycling filler
 /// count (0-3) so RX lands at a different aux-data offset from one group to the
 /// next, rather than always at offset 0. This is still a useful structural
-/// check (any divergence between the two engines shows up here), but it does
-/// NOT isolate the UMI-position cache: the non-chain oracle already enables
-/// the same cache unconditionally outside `--no-umi` mode (see
-/// `MarkDuplicates::execute`), so a wrong-offset mis-slice would corrupt both
-/// sides identically and this parity check would still pass; the fixture also
-/// gives every record in a group the SAME UMI under `--strategy identity`, so
-/// the UMI *value* never affects the result either. See
+/// check (any divergence between the two worker counts shows up here), but it
+/// does NOT isolate the UMI-position cache: both worker counts enable the same
+/// cache unconditionally outside `--no-umi` mode (see `MarkDuplicates::execute`),
+/// so a wrong-offset mis-slice would corrupt both sides identically and this
+/// parity check would still pass; the fixture also gives every record in a group
+/// the SAME UMI under `--strategy identity`, so the UMI *value* never affects the
+/// result either. See
 /// [`test_dedup_umi_grouping_correct_with_varied_rx_aux_offsets`] for the
 /// hand-computed, cache-independent check this gap motivates -- and its doc
 /// comment for why no *end-to-end* dedup test can currently isolate the
 /// cache specifically.
-#[rstest]
-#[case::threads_1(&["--threads", "1"])]
-#[case::threads_4(&["--threads", "4"])]
-fn test_dedup_chain_matches_single_threaded(#[case] thread_args: &[&str]) {
+#[test]
+fn test_dedup_threads4_matches_threads1() {
     let temp_dir = TempDir::new().unwrap();
     let input_bam = temp_dir.path().join("input.bam");
 
@@ -2192,33 +2187,31 @@ fn test_dedup_chain_matches_single_threaded(#[case] thread_args: &[&str]) {
     create_sorted_bam(&input_bam, records);
 
     let oracle_out = temp_dir.path().join("oracle.bam");
-    dedup_run(&input_bam, &oracle_out, &["--strategy", "identity"]);
+    dedup_run(&input_bam, &oracle_out, &["--strategy", "identity", "--threads", "1"]);
 
     let chain_out = temp_dir.path().join("chain.bam");
-    let mut chain_args = vec!["--strategy", "identity"];
-    chain_args.extend_from_slice(thread_args);
-    dedup_run(&input_bam, &chain_out, &chain_args);
+    dedup_run(&input_bam, &chain_out, &["--strategy", "identity", "--threads", "4"]);
 
     let expected = read_deduped_records(&oracle_out);
     let actual = read_deduped_records(&chain_out);
     assert!(!expected.is_empty(), "oracle output must be non-empty (guard against a vacuous pass)");
     assert_eq!(
         actual, expected,
-        "chain {thread_args:?} output must match the non-chain path record-for-record"
+        "chain --threads 4 output must match the --threads 1 oracle record-for-record"
     );
 }
 
 /// Cache-discriminating regression test for the UMI-position cache (#334).
 ///
-/// [`test_dedup_chain_matches_single_threaded`] above compares chain vs
-/// non-chain output, but that comparison structurally cannot detect a cache
-/// mis-slice: both paths already enable the UMI-position cache (the
-/// non-chain path unconditionally, outside `--no-umi` mode), so a
+/// [`test_dedup_threads4_matches_threads1`] above compares `--threads 4` vs
+/// `--threads 1` output, but that comparison structurally cannot detect a cache
+/// mis-slice: both worker counts already enable the UMI-position cache
+/// (unconditionally, outside `--no-umi` mode), so a
 /// wrong-offset mis-slice corrupts both sides identically and the two would
 /// still agree; its fixture also gives every record in a group the same UMI
 /// under `--strategy identity`, so the UMI *value* never affects the result.
 /// This test fixes both gaps: it asserts against a CACHE-INDEPENDENT,
-/// hand-computed expectation (not "chain == non-chain"), and it varies the
+/// hand-computed expectation (not "`--threads 4` == `--threads 1`"), and it varies the
 /// UMI *value* across records that share a position, with a varied number of
 /// filler tags before RX per record.
 ///
@@ -2399,24 +2392,24 @@ fn create_chain_parity_group(base: &str, start: i32) -> Vec<RawRecord> {
 }
 
 /// Read a BAM's `@HD` record (declared sort order). The `@PG` command-line field
-/// legitimately differs between the chain and non-chain invocations (different
-/// `--threads` args), so parity checks compare `@HD` rather than the whole header.
+/// legitimately differs between two invocations with different `--threads`
+/// args, so parity checks compare `@HD` rather than the whole header.
 fn read_bam_hd(path: &Path) -> Option<String> {
     let mut reader = bam::io::Reader::new(fs::File::open(path).unwrap());
     let header = reader.read_header().unwrap();
     header.header().map(|hd| format!("{hd:?}"))
 }
 
-/// The chain (`--threads`) path matches the non-chain path across the
-/// output-changing knobs the identity-only parity tests leave uncovered:
+/// `--threads 4` must match the `--threads 1` oracle across the
+/// output-changing knobs the identity-only determinism test above leaves
+/// uncovered:
 /// - the CLI-default `adjacency` strategy (the common `dedup --threads N`
 ///   invocation) and `--strategy edit`, on mixed UMIs so both do real
 ///   clustering work rather than collapsing to identity (vacuous);
 /// - `--remove-duplicates` (the serialize-step drop path);
-/// - `--no-umi`, whose handling this diff specifically changed (it forces
-///   identity/edits=0 and flips `filter_config.no_umi` on the chain path);
+/// - `--no-umi` (forces identity/edits=0 and flips `filter_config.no_umi`);
 /// - `--min-map-q 30`, which filters the fixture's mapq-10 subfamily, exercising
-///   the chain's ported filter funnel with a non-zero filtered count.
+///   the filter funnel with a non-zero filtered count.
 /// The `@HD` sort-order header is compared too (the `@PG` command-line field
 /// legitimately differs between the two invocations, so it is excluded).
 #[rstest]
@@ -2427,7 +2420,7 @@ fn read_bam_hd(path: &Path) -> Option<String> {
 #[case::identity_remove(&["--strategy", "identity", "--remove-duplicates"])]
 #[case::no_umi(&["--no-umi"])]
 #[case::min_map_q_filters(&["--strategy", "identity", "--min-map-q", "30"])]
-fn test_dedup_chain_matches_non_chain_across_knobs(#[case] extra: &[&str]) {
+fn test_dedup_threads4_matches_threads1_across_knobs(#[case] extra: &[&str]) {
     let temp_dir = TempDir::new().unwrap();
     let input_bam = temp_dir.path().join("input.bam");
 
@@ -2438,7 +2431,9 @@ fn test_dedup_chain_matches_non_chain_across_knobs(#[case] extra: &[&str]) {
     create_sorted_bam(&input_bam, records);
 
     let oracle_out = temp_dir.path().join("oracle.bam");
-    dedup_run(&input_bam, &oracle_out, extra);
+    let mut oracle_args = extra.to_vec();
+    oracle_args.extend_from_slice(&["--threads", "1"]);
+    dedup_run(&input_bam, &oracle_out, &oracle_args);
 
     let chain_out = temp_dir.path().join("chain.bam");
     let mut chain_args = extra.to_vec();
@@ -2450,12 +2445,12 @@ fn test_dedup_chain_matches_non_chain_across_knobs(#[case] extra: &[&str]) {
     assert!(!expected.is_empty(), "oracle output must be non-empty (guard against a vacuous pass)");
     assert_eq!(
         actual, expected,
-        "chain --threads 4 output must match the non-chain path for knobs {extra:?}"
+        "chain --threads 4 output must match the --threads 1 oracle for knobs {extra:?}"
     );
     assert_eq!(
         read_bam_hd(&chain_out),
         read_bam_hd(&oracle_out),
-        "chain and non-chain must declare the same @HD sort order for knobs {extra:?}"
+        "--threads 4 and --threads 1 must declare the same @HD sort order for knobs {extra:?}"
     );
 }
 
@@ -2551,12 +2546,16 @@ fn test_dedup_threaded_crc_policy(#[case] crc_args: &[&str], #[case] expect_ok: 
 }
 
 /// The `--duplication-ladder` (and `--metrics` / `--family-size-histogram`)
-/// output from the chain path is byte-identical to the non-chain path.
+/// text outputs at `--threads 4` are byte-identical to the no-flag (single-worker)
+/// oracle. The BAM output is compared at the decoded-record level (via
+/// `read_deduped_records` below), not byte-for-byte on the serialized stream, so a
+/// pure BAM header or BGZF-encoding regression is out of this test's scope; the
+/// order-sensitive byte-parity claim applies to the three metric text files.
 ///
 /// This MUST run multi-threaded: the ladder is order-sensitive (it samples a
 /// saturation curve at cumulative-template intervals), and its recording seam
 /// is the chain's serial `MiAssign` step, which only actually reorders at
-/// `--threads > 1`. At `--threads 1` a reorder regression would slip through.
+/// `--threads > 1`. At a single worker a reorder regression would slip through.
 /// The input carries several hundred position groups (so batches span many
 /// in-flight batches at `--threads 4`) across two libraries (so per-library
 /// ladder rows are exercised), with a small `--ladder-interval` so rows are
@@ -2582,7 +2581,7 @@ fn test_dedup_threaded_duplication_ladder_parity() {
     create_sorted_bam_with_header(&input_bam, &header, records);
 
     // Run dedup writing the BAM plus all three metric outputs; `extra` carries
-    // the thread flags (empty = non-chain oracle).
+    // the thread flags (empty = the no-flag single-worker oracle).
     let run = |tag: &str, extra: &[&str]| {
         let out = temp_dir.path().join(format!("{tag}.bam"));
         let ladder = temp_dir.path().join(format!("{tag}.ladder.txt"));
@@ -2622,22 +2621,22 @@ fn test_dedup_threaded_duplication_ladder_parity() {
     assert_eq!(
         fs::read(&oracle_ladder).unwrap(),
         fs::read(&chain_ladder).unwrap(),
-        "duplication ladder diverged between the chain and non-chain paths"
+        "duplication ladder diverged between the no-flag oracle and --threads 4"
     );
     assert_eq!(
         fs::read(&oracle_metrics).unwrap(),
         fs::read(&chain_metrics).unwrap(),
-        "metrics diverged between the chain and non-chain paths"
+        "metrics diverged between the no-flag oracle and --threads 4"
     );
     assert_eq!(
         fs::read(&oracle_hist).unwrap(),
         fs::read(&chain_hist).unwrap(),
-        "family-size histogram diverged between the chain and non-chain paths"
+        "family-size histogram diverged between the no-flag oracle and --threads 4"
     );
     assert_eq!(
         read_deduped_records(&oracle_out),
         read_deduped_records(&chain_out),
-        "output records diverged between the chain and non-chain paths"
+        "output records diverged between the no-flag oracle and --threads 4"
     );
 }
 

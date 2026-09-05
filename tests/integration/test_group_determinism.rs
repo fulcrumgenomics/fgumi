@@ -211,11 +211,10 @@ fn read_qname_mi(path: &Path) -> Vec<(String, u16, String)> {
 /// comparing pairwise raises the probability of catching the variance even
 /// when only a handful of subgroup keys are present.
 ///
-/// `threads = None` omits the `--threads` flag entirely. For `fgumi group`
-/// this triggers the dedicated `execute_single_threaded` fast path
-/// (`src/lib/commands/group.rs`'s `if self.threading.threads.is_none()` at
-/// the top of `execute`); `Some("1")` runs the parallel pipeline with one
-/// worker, which is a different code path. Both must be deterministic.
+/// `threads = None` omits the `--threads` flag entirely, which still runs the
+/// declarative chain builder (the only execution path for `group`/`dedup`) —
+/// `ThreadingOptions::num_threads` resolves the omitted flag to 1 worker, the
+/// same as `Some("1")` below. Both must be deterministic.
 fn assert_mi_deterministic(subcommand: &str, threads: Option<&str>, n_runs: usize) {
     let temp_dir = TempDir::new().unwrap();
     let input_bam = temp_dir.path().join("input.bam");
@@ -299,13 +298,13 @@ fn assert_mi_deterministic(subcommand: &str, threads: Option<&str>, n_runs: usiz
 /// must assign identical `MI:Z` tags to every record across runs and across
 /// every supported threading mode.
 ///
-/// The three threads cases exercise three distinct code paths:
+/// The three threads cases all run the declarative chain builder (the only
+/// execution path), at different worker counts:
 ///
-/// * `None` — `group` only: the dedicated `execute_single_threaded` fast
-///   path (taken when `--threads` is omitted), which assigns `MoleculeId`s
-///   inline without going through the unified pipeline scheduler.
-/// * `Some("1")` — the unified pipeline with a single worker.
-/// * `Some("4")` — the unified pipeline with four workers, which was the
+/// * `None` — `group` only: `--threads` omitted, which resolves to 1 worker
+///   (same as `Some("1")` below).
+/// * `Some("1")` — the chain pipeline with a single worker.
+/// * `Some("4")` — the chain pipeline with four workers, which was the
 ///   originally failing case before the serial-ordered `MI Assign` hook.
 #[rstest]
 #[case::group_no_threads("group", None)]
