@@ -135,7 +135,7 @@ use parking_lot::Mutex;
 
 use crate::aligner::AlignerProcess;
 use crate::commands::fastq::{FastqRecordBuffers, write_fastq_record};
-use crate::commands::zipper::merge_one_template;
+use crate::commands::zipper::{ZipperTags, merge_one_template_with};
 use crate::pipeline::core::header::HeaderHandle;
 use crate::pipeline::core::item::{HeapSize, Ordered};
 use crate::pipeline::core::{
@@ -494,6 +494,14 @@ impl SharedState {
 pub struct AlignAndMergeStep {
     cfg: AlignAndMergeConfig,
 
+    /// Precomputed tag-merge bitsets, built once in [`AlignAndMergeStep::new`]
+    /// from `cfg.tag_info` and reused for every template across every batch
+    /// this step ever merges — `cfg.tag_info` is immutable for the step's
+    /// whole lifetime, so there is no reason to rebuild `ZipperTags` (three
+    /// `TagBitset` allocations) per batch, let alone per template. Passed
+    /// into `merge_zipper_batch` at each call site.
+    tags: Arc<ZipperTags>,
+
     /// Owned aligner subprocess. Taken out in `finalize` (or `Drop` on the
     /// error path) for `wait()`.
     aligner: Option<AlignerProcess>,
@@ -538,6 +546,12 @@ impl AlignAndMergeStep {
     ///   impossible given `Stdio::piped()` is used by `AlignerProcess`),
     /// - either I/O thread spawn fails.
     pub fn new(cfg: AlignAndMergeConfig, aligner_command: &str) -> io::Result<Self> {
+        // Built once for the step's whole lifetime — `cfg.tag_info` never
+        // changes after construction, so every batch this step ever merges
+        // reuses the same bitsets rather than rebuilding them. See the
+        // `tags` field doc.
+        let tags = Arc::new(ZipperTags::from_tag_info(&cfg.tag_info));
+
         let mut aligner = AlignerProcess::spawn(aligner_command, ALIGNER_STDERR_RING_SIZE)
             .map_err(|e| io::Error::other(format!("AlignAndMergeStep::new: spawn: {e:#}")))?;
 
@@ -606,6 +620,7 @@ impl AlignAndMergeStep {
 
         Ok(Self {
             cfg,
+            tags,
             aligner: Some(aligner),
             in_tx: Some(in_tx),
             out_rx: Some(out_rx),
@@ -1011,11 +1026,13 @@ fn reader_loop_inner(
     Ok(())
 }
 
-/// Merge one `ZipperBatch` into a `BamTemplateBatch`. Per-template
-/// `merge_raw` plus optional bisulfite restore; folds record-count
-/// and heap-size accounting into the same single pass so the
-/// resulting `BamTemplateBatch` doesn't re-walk the templates to
-/// compute `total_bytes`.
+/// Merge one `ZipperBatch` into a `BamTemplateBatch`. Takes the caller's
+/// precomputed `tags` (built once for the whole `AlignAndMergeStep`, since
+/// `cfg.tag_info` is immutable for the step's lifetime — see
+/// `AlignAndMergeStep::new`) and, per template, runs `merge_one_template_with`
+/// (`merge_raw_with` plus optional bisulfite restore); folds record-count and
+/// heap-size accounting into the same single pass so the resulting
+/// `BamTemplateBatch` doesn't re-walk the templates to compute `total_bytes`.
 ///
 /// **Single-threaded by construction.** This runs synchronously on
 /// whichever worker dispatches AAM (Serial); merge throughput is
@@ -1028,7 +1045,11 @@ fn reader_loop_inner(
 /// intermediate is shaped for that promotion — no fixture/test
 /// refactor required at the call site. See
 /// `docs/design/aam-bridge-refactor.md` §8 (out-of-scope follow-ups).
-fn merge_zipper_batch(zb: ZipperBatch, cfg: &AlignAndMergeConfig) -> io::Result<BamTemplateBatch> {
+fn merge_zipper_batch(
+    zb: ZipperBatch,
+    cfg: &AlignAndMergeConfig,
+    tags: &ZipperTags,
+) -> io::Result<BamTemplateBatch> {
     let ZipperBatch { serial, mapped, unmapped } = zb;
     // Release-safe guard (not a debug_assert): a violated length invariant would
     // otherwise make the `zip` below silently truncate to the shorter side,
@@ -1048,10 +1069,10 @@ fn merge_zipper_batch(zb: ZipperBatch, cfg: &AlignAndMergeConfig) -> io::Result<
     let mut total_records: u64 = 0;
     let mut total_bytes: usize = 0;
     for (mut mapped_template, unmapped_template) in mapped.into_iter().zip(unmapped.templates()) {
-        merge_one_template(
+        merge_one_template_with(
             unmapped_template,
             &mut mapped_template,
-            &cfg.tag_info,
+            tags,
             cfg.skip_tc_tags,
             cfg.reference.as_deref(),
             &cfg.partial_output_header,
@@ -1524,7 +1545,7 @@ impl Step for AlignAndMergeStep {
             // (reader done — if it errored, the slot is set and the next pass
             // surfaces it). Either way the receiver is drained for this call.
             while let Ok(zb) = out_rx.try_recv() {
-                let merged = merge_zipper_batch(zb, &self.cfg)?;
+                let merged = merge_zipper_batch(zb, &self.cfg, &self.tags)?;
                 match ctx.outputs.push(merged) {
                     Ok(()) => did_work = true,
                     Err(unpushed) => {
@@ -1625,7 +1646,7 @@ impl Step for AlignAndMergeStep {
             {
                 let out_rx = self.out_rx.as_ref().expect("out_rx Some (checked above)");
                 while let Ok(zb) = out_rx.try_recv() {
-                    let merged = merge_zipper_batch(zb, &self.cfg)?;
+                    let merged = merge_zipper_batch(zb, &self.cfg, &self.tags)?;
                     if let Err(unpushed) = ctx.outputs.push(merged) {
                         self.held_out.put(unpushed);
                         return Ok(StepOutcome::Progress);
@@ -2494,6 +2515,7 @@ mod tests {
     #[test]
     fn merge_zipper_batch_transfers_unmapped_tags_and_counts_records() {
         let cfg = make_test_cfg();
+        let tags = ZipperTags::from_tag_info(&cfg.tag_info);
         // Unmapped half carries RX; the mapped half (aligner output) does not.
         let unmapped_rec = make_record_with_string_tag(
             b"readA",
@@ -2510,7 +2532,7 @@ mod tests {
             mapped: vec![mapped],
             unmapped: BamTemplateBatch::new(5, vec![unmapped]),
         };
-        let out = merge_zipper_batch(zb, &cfg).expect("merge ok");
+        let out = merge_zipper_batch(zb, &cfg, &tags).expect("merge ok");
 
         assert_eq!(out.ordinal(), 5, "batch serial is preserved through the merge");
         assert_eq!(out.templates().len(), 1, "one merged template out");
@@ -2536,6 +2558,7 @@ mod tests {
     #[test]
     fn merge_zipper_batch_errors_on_length_mismatch() {
         let cfg = make_test_cfg();
+        let tags = ZipperTags::from_tag_info(&cfg.tag_info);
         let mapped = Template::from_records(vec![make_record(b"readA", 0)]).expect("mapped");
         // One mapped template, zero unmapped -> lengths differ.
         let zb = ZipperBatch {
@@ -2543,11 +2566,90 @@ mod tests {
             mapped: vec![mapped],
             unmapped: BamTemplateBatch::new(0, Vec::new()),
         };
-        let err =
-            merge_zipper_batch(zb, &cfg).expect_err("length mismatch must error, not truncate");
+        let err = merge_zipper_batch(zb, &cfg, &tags)
+            .expect_err("length mismatch must error, not truncate");
         assert!(
             err.to_string().contains("ZipperBatch invariant violated"),
             "error must name the invariant: {err}"
         );
+    }
+
+    /// Regression guard for hoisting the `ZipperTags` bitset build out of the
+    /// per-template merge loop: `merge_zipper_batch` takes the tags as a
+    /// caller-supplied `&ZipperTags` (built once for the whole step — see
+    /// `AlignAndMergeStep::new` — and reused across every batch). A
+    /// non-trivial `TagInfo` (one remove + one reverse + one revcomp tag) is
+    /// applied across THREE templates in a single batch; every template's
+    /// negative-strand read must get the same remove/reverse/revcomp
+    /// treatment, not just the first one merged. A bug that reused the tag
+    /// lookups incorrectly across templates would only show up past the
+    /// first iteration, which is exactly what this test is sized to catch.
+    #[test]
+    fn merge_zipper_batch_applies_transforms_to_every_template() {
+        let mut cfg = make_test_cfg();
+        cfg.tag_info = Arc::new(TagInfo::new(
+            vec!["XA".to_string()],
+            vec!["XV".to_string()],
+            vec!["XC".to_string()],
+        ));
+        let tags = ZipperTags::from_tag_info(&cfg.tag_info);
+
+        let names: [&[u8]; 3] = [b"readA", b"readB", b"readC"];
+        let mut mapped_templates = Vec::new();
+        let mut unmapped_templates = Vec::new();
+        for name in names {
+            // Mapped (aligner) record: negative strand, single unpaired read,
+            // carrying a stale XA tag that must be removed on merge.
+            let mut mb = fgumi_raw_bam::SamBuilder::new();
+            mb.read_name(name)
+                .flags(fgumi_raw_bam::flags::REVERSE)
+                .sequence(b"ACGT")
+                .qualities(b"IIII")
+                .add_string_tag(*b"XA", b"stale");
+            let mapped_rec = mb.build();
+            mapped_templates
+                .push(Template::from_records(vec![mapped_rec]).expect("mapped template"));
+
+            // Unmapped record carries the tags to remove/reverse/revcomp.
+            let mut ub = fgumi_raw_bam::SamBuilder::new();
+            ub.read_name(name)
+                .flags(fgumi_raw_bam::flags::UNMAPPED)
+                .sequence(b"ACGT")
+                .qualities(b"IIII")
+                .add_string_tag(*b"XV", b"abcde")
+                .add_string_tag(*b"XC", b"AGAGG")
+                .add_string_tag(*b"XA", b"drop-me");
+            let unmapped_rec = ub.build();
+            unmapped_templates
+                .push(Template::from_records(vec![unmapped_rec]).expect("unmapped template"));
+        }
+
+        let zb = ZipperBatch {
+            serial: 0,
+            mapped: mapped_templates,
+            unmapped: BamTemplateBatch::new(0, unmapped_templates),
+        };
+        let out = merge_zipper_batch(zb, &cfg, &tags).expect("merge ok");
+
+        assert_eq!(out.templates().len(), 3, "all three templates survive the merge");
+        for (i, template) in out.templates().iter().enumerate() {
+            let rec = &template.records[0];
+            let aux = fgumi_raw_bam::fields::aux_data_slice(rec);
+
+            assert_eq!(
+                fgumi_raw_bam::tags::find_string_tag(aux, *b"XV"),
+                Some(&b"edcba"[..]),
+                "template {i}: XV must be reversed on the negative-strand read"
+            );
+            assert_eq!(
+                fgumi_raw_bam::tags::find_string_tag(aux, *b"XC"),
+                Some(&b"CCTCT"[..]),
+                "template {i}: XC must be reverse-complemented on the negative-strand read"
+            );
+            assert!(
+                fgumi_raw_bam::tags::find_string_tag(aux, *b"XA").is_none(),
+                "template {i}: XA must be removed (stale mapped copy + skipped on tag-copy)"
+            );
+        }
     }
 }
