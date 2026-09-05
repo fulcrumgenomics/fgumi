@@ -1127,39 +1127,46 @@ impl<'a> ChainBuilder<'a> {
 
     /// Group-key config for the **source preamble's** `DecodeRecords`.
     ///
-    /// A first stage that groups by queryname (correct's `GroupByQueryname`)
-    /// reads only `key.name_hash` and discards the rest of the `GroupKey`; a sort
-    /// first stage discards the `GroupKey` *entirely* (it computes its own sort
-    /// keys straight off the raw record bytes — see
-    /// `DecodedRecordBatchToRecordBatch`). Both therefore use
+    /// A first stage that groups by queryname (correct's `GroupByQueryname`;
+    /// filter's own `GroupByQueryname` in filter-by-template mode; clip's
+    /// `GroupBam`/`TemplateGrouper`) reads only `key.name_hash` and discards
+    /// the rest of the `GroupKey`; a sort first stage discards the `GroupKey`
+    /// *entirely* (it computes its own sort keys straight off the raw record
+    /// bytes — see `DecodedRecordBatchToRecordBatch`); copy-umi/retag/
+    /// single-record-mode filter are per-record transforms that never build
+    /// or consume a `GroupKey` at all. All of these therefore use
     /// [`fgumi_bam_io::GroupKeyConfig::name_hash_only`] — the cheapest config —
     /// skipping the CIGAR 5′-position walk and the RG/CB/MC aux-tag extraction
     /// pass entirely; for a SAM-first sort that pass runs once per record in
     /// `ParseSamChunk` and would otherwise be pure waste. This changes only the
-    /// discarded key, never the record bytes, so sort output is unchanged.
+    /// discarded key, never the record bytes, so output is unchanged.
     /// (The legacy single-threaded path uses `new_raw_no_cell`, which still
     /// pays the combined aux pass; name-hash-only is strictly less work.) All
-    /// other first stages (group/dedup/consensus/clip) need the full
-    /// position/cell key, so they fall through to [`Self::bam_group_key_config`].
+    /// other first stages (group/dedup/consensus) need the full position/cell
+    /// key, so they fall through to [`Self::bam_group_key_config`].
+    ///
+    /// Every arm below uses a DEFAULT `LibraryIndex`, never `from_header`:
+    /// `name_hash_only` never reads `library_index` (see `name_hash_key` in
+    /// `fgumi-bam-io`, and the `name_hash_only` branches in `DecodeRecords`
+    /// and `parse_sam_chunk_into_decoded`, which call it without touching
+    /// `library_index` at all), so resolving it from the header is pure waste
+    /// for these stages — and `LibraryIndex::from_header` panics on a header
+    /// with more than 65,535 distinct `@RG` libraries, a needless crash risk
+    /// this avoids. (Some of these stages' serial oracles independently build
+    /// a full-header group key of their own — e.g. filter-by-template's
+    /// `build_filter_pipeline_config` calls `LibraryIndex::from_header` — so
+    /// this isn't "a panic the oracle never has"; it is simply dead work this
+    /// arm has no reason to repeat.)
     fn source_group_key_config(&self) -> fgumi_bam_io::GroupKeyConfig {
         match self.spec.stages.first() {
-            Some(Stage::Correct | Stage::Sort) => {
-                let library_index = fgumi_bam_io::LibraryIndex::from_header(&self.header);
-                fgumi_bam_io::GroupKeyConfig::name_hash_only(library_index)
-            }
-            Some(Stage::CopyUmi | Stage::Retag) => {
-                // copy-umi and retag are pure per-record transforms that never read
-                // the group key, like Sort, so they take the cheap name-hash key and
-                // skip the per-record CIGAR position walk + aux-tag scan
-                // `bam_group_key_config` would otherwise compute for every record and
-                // then discard. (The deleted `run_threaded` used `new_raw_no_cell`
-                // for the same reason.)
-                //
-                // Use a DEFAULT LibraryIndex, NOT `from_header`: `name_hash_only`
-                // never reads `library_index`, and `LibraryIndex::from_header`
-                // panics on a header with >65,535 @RG libraries — a crash the serial
-                // oracle (which builds no group key) never has, so routing these
-                // through the shared `from_header` arm would newly expose it.
+            Some(
+                Stage::Correct
+                | Stage::Sort
+                | Stage::CopyUmi
+                | Stage::Retag
+                | Stage::Filter
+                | Stage::Clip,
+            ) => {
                 fgumi_bam_io::GroupKeyConfig::name_hash_only(fgumi_bam_io::LibraryIndex::default())
             }
             _ => self.bam_group_key_config(),
@@ -4909,7 +4916,115 @@ fn dict_not_found_error(reference: &std::path::Path) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_phase_threads, sort_budget_threads};
+    use super::*;
+
+    /// A `ChainSpec` with the given stages and every other field at its
+    /// simplest valid default. Mirrors `validate::tests::empty_spec` — kept as
+    /// a separate copy (not shared) since each module's tests exercise a
+    /// different pure function over `ChainSpec` and neither depends on the
+    /// other's test scaffolding.
+    fn empty_spec(stages: Vec<Stage>) -> ChainSpec {
+        use crate::commands::common::{
+            CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
+        };
+        use crate::pipeline::chains::{SinkSpec, StageOptionsBag};
+        use std::path::PathBuf;
+        ChainSpec {
+            stages,
+            source: SourceSpec::Bam(PathBuf::from("in.bam")),
+            sink: SinkSpec::Bam(PathBuf::from("out.bam")),
+            stage_opts: StageOptionsBag::default(),
+            threading: ThreadingOptions { threads: None },
+            compression: CompressionOptions::default(),
+            scheduler: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
+            read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
+            verify_crc: true,
+            command_line: String::new(),
+        }
+    }
+
+    /// Construct a `ChainBuilder` directly (bypassing `ChainBuilder::new`'s
+    /// source-open I/O) so `source_group_key_config`'s pure stage-routing
+    /// logic can be unit-tested without a real BAM file on disk. Every field
+    /// gets the same placeholder `new()` would produce before `add_source`
+    /// runs; `source_group_key_config` only reads `spec.stages.first()`
+    /// (never `header`, for the `name_hash_only` arms), so the placeholder
+    /// header is inert for the cases this helper is used to test.
+    fn chain_builder_for_stages(spec: &ChainSpec) -> ChainBuilder<'_> {
+        ChainBuilder {
+            spec,
+            tuning: BamPipelineTuning::auto_tuned(1),
+            header: Header::default(),
+            raw_source_header: Header::default(),
+            current_tail: None,
+            pipeline: PipelineBuilder::new(),
+            finalize: Vec::new(),
+            finalize_on_success: Vec::new(),
+            progress_records: Arc::new(AtomicU64::new(0)),
+            pending_source: None,
+            paired_tail: None,
+            override_pipeline_threads: None,
+            use_drain_first_scheduler: false,
+            pending_header_handle: None,
+            pending_header_transform: None,
+            chain_tail_kind: ChainTailKind::DecodedRecordBatch,
+            detached_writer: false,
+            fastq_encoding: None,
+        }
+    }
+
+    /// `source_group_key_config` routes a chain-filter first stage to the
+    /// cheap `name_hash_only` config, like `Correct`/`Sort`/`CopyUmi`/`Retag`
+    /// — the chain filter grouper (`GroupByQueryname` in
+    /// `filter-by-template` mode, or nothing at all in single-record mode)
+    /// never reads the position/RG/CB portion of the `GroupKey`, so
+    /// computing it is pure waste (see `add_filter` /
+    /// `GroupByQueryname::process_record`, which reads only
+    /// `GroupKey::name_hash`).
+    #[test]
+    fn source_group_key_config_is_name_hash_only_for_filter_first_stage() {
+        let spec = empty_spec(vec![Stage::Filter]);
+        let builder = chain_builder_for_stages(&spec);
+        let config = builder.source_group_key_config();
+        assert!(
+            config.name_hash_only,
+            "Stage::Filter as the first stage must skip the discarded position/RG/CB key"
+        );
+    }
+
+    /// `source_group_key_config` routes a chain-clip first stage to the cheap
+    /// `name_hash_only` config too — clip's grouper (`GroupBam` /
+    /// `TemplateGrouper::add_records`) reads only `decoded.key.name_hash`
+    /// before discarding the rest of the key via `into_raw_bytes()`, exactly
+    /// like filter's `GroupByQueryname`, in every clipping mode (the
+    /// clipping-mode-specific logic runs downstream, on the grouped raw
+    /// `Template` records, never on the discarded `GroupKey`).
+    #[test]
+    fn source_group_key_config_is_name_hash_only_for_clip_first_stage() {
+        let spec = empty_spec(vec![Stage::Clip]);
+        let builder = chain_builder_for_stages(&spec);
+        let config = builder.source_group_key_config();
+        assert!(
+            config.name_hash_only,
+            "Stage::Clip as the first stage must skip the discarded position/RG/CB key"
+        );
+    }
+
+    /// Sanity check that the `Stage::Filter`/`Stage::Clip` additions to
+    /// `source_group_key_config` didn't broaden the match arm: a first stage
+    /// that genuinely needs the full key (e.g. `Group`) still gets it.
+    #[test]
+    fn source_group_key_config_is_full_for_group_first_stage() {
+        let spec = empty_spec(vec![Stage::Group]);
+        let builder = chain_builder_for_stages(&spec);
+        let config = builder.source_group_key_config();
+        assert!(
+            !config.name_hash_only,
+            "Stage::Group as the first stage must compute the full position/RG/CB key"
+        );
+    }
 
     /// Pin the per-phase thread resolution contract shared by the standalone and
     /// streaming sort branches in `add_sort`: each phase falls back to the base

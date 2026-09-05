@@ -537,6 +537,192 @@ fn test_clip_chain_matches_single_threaded(#[case] threads: usize) {
     );
 }
 
+/// Header carrying two `@RG` lines with distinct `LB` values, for
+/// `test_clip_chain_matches_single_threaded_with_rg_and_cb_variation`. The
+/// `source_group_key_config` perf fix routes the chain clip path's first
+/// stage to a `name_hash_only` `GroupKeyConfig`, which never resolves a
+/// per-record library index or extracts the `CB` tag during decode — so the
+/// parity test needs a header/record set where that discarded information
+/// genuinely varies, not `build_clip_parity_bam`'s single-library, no-`CB`,
+/// single-position records.
+fn create_clip_header_with_read_groups(ref_name: &str, ref_len: usize) -> noodles::sam::Header {
+    use bstr::BString;
+    use noodles::sam::header::record::value::Map;
+    use noodles::sam::header::record::value::map::Map as HeaderRecordMap;
+    use noodles::sam::header::record::value::map::header::tag::Tag as HeaderTag;
+    use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+    use noodles::sam::header::record::value::map::{
+        Header as HeaderRecord, ReadGroup, ReferenceSequence,
+    };
+    use std::num::NonZeroUsize;
+
+    let mut header_builder = HeaderRecordMap::<HeaderRecord>::builder();
+    for &(tag_bytes, value) in
+        &[(*b"SO", "unsorted"), (*b"GO", "query"), (*b"SS", "template-coordinate")]
+    {
+        let HeaderTag::Other(tag) = HeaderTag::from(tag_bytes) else { unreachable!() };
+        header_builder = header_builder.insert(tag, value);
+    }
+    let header_map = header_builder.build().expect("valid header map");
+
+    let reference_sequence = Map::<ReferenceSequence>::new(
+        NonZeroUsize::new(ref_len).expect("reference length must be non-zero"),
+    );
+
+    let rg_a = Map::<ReadGroup>::builder()
+        .insert(rg_tag::LIBRARY, String::from("libA"))
+        .build()
+        .expect("building read group RG1 should succeed");
+    let rg_b = Map::<ReadGroup>::builder()
+        .insert(rg_tag::LIBRARY, String::from("libB"))
+        .build()
+        .expect("building read group RG2 should succeed");
+
+    noodles::sam::Header::builder()
+        .set_header(header_map)
+        .add_reference_sequence(BString::from(ref_name), reference_sequence)
+        .add_read_group(BString::from("RG1"), rg_a)
+        .add_read_group(BString::from("RG2"), rg_b)
+        .build()
+}
+
+/// Like [`build_clip_parity_bam`], but each mate additionally carries an `RG`
+/// tag (alternating `RG1`/`RG2`, so both `@RG` lines in
+/// [`create_clip_header_with_read_groups`] are exercised), a `CB` tag that
+/// varies per template (`CB{i}`), and positions that advance per template
+/// (`99 + i*20` / `103 + i*20`, preserving the same overlap shape) rather than
+/// every template sharing one fixed position.
+fn build_clip_parity_bam_with_rg_and_cb(path: &Path, count: usize) {
+    let header = create_clip_header_with_read_groups("chr1", 10000);
+    let pairs: Vec<(RawRecord, RawRecord)> = (0..count)
+        .map(|i| {
+            let name = format!("tmpl{i}");
+            let offset = i32::try_from(i).expect("count fits in i32") * 20;
+            let pos1 = 99 + offset;
+            let pos2 = 103 + offset;
+            let rg_id: &[u8] = if i % 2 == 0 { b"RG1" } else { b"RG2" };
+            let cb = format!("CB{i}");
+            let r1 = {
+                let mut b = SamBuilder::new();
+                b.read_name(name.as_bytes())
+                    .sequence(b"ACGTACGT")
+                    .qualities(&[30; 8])
+                    .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+                    .ref_id(0)
+                    .pos(pos1)
+                    .mapq(60)
+                    .cigar_ops(&[8 << 4]) // 8M
+                    .mate_ref_id(0)
+                    .mate_pos(pos2)
+                    .template_length(12);
+                b.add_string_tag(SamTag::RG, rg_id).add_string_tag(SamTag::CB, cb.as_bytes());
+                b.build()
+            };
+            let r2 = {
+                let mut b = SamBuilder::new();
+                b.read_name(name.as_bytes())
+                    .sequence(b"ACGTACGT")
+                    .qualities(&[30; 8])
+                    .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+                    .ref_id(0)
+                    .pos(pos2)
+                    .mapq(60)
+                    .cigar_ops(&[8 << 4]) // 8M
+                    .mate_ref_id(0)
+                    .mate_pos(pos1)
+                    .template_length(-12);
+                b.add_string_tag(SamTag::RG, rg_id).add_string_tag(SamTag::CB, cb.as_bytes());
+                b.build()
+            };
+            (r1, r2)
+        })
+        .collect();
+    write_paired_bam_with_header(path, &header, pairs);
+}
+
+/// The chain (`--threads N`) path matches the non-chain oracle record-for-record
+/// even when the discarded position/RG/CB portion of the group key genuinely
+/// varies per record (distinct `@RG`/`LB` per template, a distinct `CB` per
+/// template, and positions that advance per template).
+/// `test_clip_chain_matches_single_threaded` already covers the thread-count
+/// matrix on RG/CB-free, single-position records; this test's unique
+/// contribution is exercising the exact fields `source_group_key_config`'s
+/// `name_hash_only` routing stops computing for the chain clip path,
+/// confirming the skip is genuinely invisible in the output.
+#[test]
+fn test_clip_chain_matches_single_threaded_with_rg_and_cb_variation() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+    build_clip_parity_bam_with_rg_and_cb(&input_bam, 8);
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    let chain_out = temp_dir.path().join("chain.bam");
+
+    let opts =
+        ["--clip-overlapping-reads", "--read-one-five-prime", "1", "--read-two-three-prime", "1"];
+
+    // Oracle: no --threads (single-threaded engine).
+    {
+        let mut args = vec![
+            "clip",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            oracle_out.to_str().unwrap(),
+            "--ref",
+            ref_path.to_str().unwrap(),
+        ];
+        args.extend_from_slice(&opts);
+        Clip::try_parse_from(args)
+            .expect("parse oracle args")
+            .execute("fgumi clip")
+            .expect("oracle clip failed");
+    }
+
+    // Chain: --threads 4 (declarative chain builder).
+    {
+        let mut args = vec![
+            "clip",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            chain_out.to_str().unwrap(),
+            "--ref",
+            ref_path.to_str().unwrap(),
+            "--threads",
+            "4",
+        ];
+        args.extend_from_slice(&opts);
+        Clip::try_parse_from(args)
+            .expect("parse chain args")
+            .execute("fgumi clip")
+            .expect("chain clip failed");
+    }
+
+    let (oracle_header, oracle_records) = crate::helpers::read_bam_output(&oracle_out);
+    let (chain_header, chain_records) = crate::helpers::read_bam_output(&chain_out);
+
+    // Non-vacuous guards: all 16 records (8 templates x 2) survive, and clipping
+    // actually ran, same as the RG/CB-free matrix test.
+    assert_eq!(oracle_records.len(), 16, "oracle should keep all 16 records with RG/CB variation");
+    assert!(
+        oracle_records.iter().any(|r| cigar_ops(r) != vec![(CigarKind::Match, 8)]),
+        "fixture must actually clip (expected an output CIGAR other than 8M)",
+    );
+
+    assert_eq!(
+        oracle_records, chain_records,
+        "chain output must match the single-threaded oracle record-for-record with RG/CB \
+         variation present, proving source_group_key_config's name_hash_only skip for \
+         Stage::Clip changes no output",
+    );
+    assert_eq!(
+        oracle_header, chain_header,
+        "chain and oracle output headers must match with RG/CB variation present",
+    );
+}
+
 /// CLIP3-05: clip must reject header-less input. A header-less BAM synthesizes
 /// `@HD VN:1.6 SO:unsorted` (via `ensure_hd_record`), which is neither queryname
 /// sorted nor query grouped, so `require_query_grouped` rejects it — matching
