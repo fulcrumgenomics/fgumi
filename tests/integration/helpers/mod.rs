@@ -9,9 +9,11 @@
 
 pub mod assertions;
 pub mod bam_generator;
+pub mod copy_umi_fixtures;
 
 pub use assertions::*;
 pub use bam_generator::*;
+pub use copy_umi_fixtures::*;
 
 /// Writes `contents` to `dir/name` and returns the path.
 ///

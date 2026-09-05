@@ -23,6 +23,7 @@ mod test_compare_metrics_command;
 mod test_compare_mutation;
 mod test_consensus_downsampling;
 mod test_copy_umi_command;
+mod test_copy_umi_cutover_parity;
 mod test_correct_command;
 mod test_dedup_command;
 mod test_downsample_command;

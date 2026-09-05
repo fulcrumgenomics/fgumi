@@ -40,10 +40,9 @@ fn reduce(accumulators: &PerThreadAccumulator<CollectedCopyUmiMetrics>) -> Colle
 /// Success-only finalize hook: emits the overwrite warning + `=== Summary ===`
 /// block (via the shared [`warn_and_log_copy_umi_summary`]) and logs completion.
 ///
-/// Registered on `finalize_on_success` (NOT the always-run `finalize`): the
-/// serial oracle `?`-returns on the first bad record and never reaches its
-/// summary, so an always-run summary would log a partial summary on a fail-fast
-/// abort the serial path never logs.
+/// Registered on `finalize_on_success` (NOT the always-run `finalize`): a bad
+/// record aborts the run via `map_err` before the pipeline drains, so an
+/// always-run summary would log a partial summary on a fail-fast abort.
 pub(crate) struct CopyUmiFinalizeHook {
     pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedCopyUmiMetrics>>,
     pub(crate) timer: OperationTimer,
@@ -84,10 +83,10 @@ fn record_batch_metrics(
     names_trimmed: u64,
 ) {
     // Cross-thread heartbeat: workers run this concurrently, so the milestone
-    // counter is a shared `AtomicU64` rather than `fgumi_bam_io::ProgressTracker`
-    // (which the single-threaded serial oracle uses but is not built for
-    // concurrent workers). The finalize hooks read the record total from the
-    // accumulator, not from this counter — it drives only the periodic log.
+    // counter is a shared `AtomicU64` rather than `fgumi_bam_io::ProgressTracker`,
+    // which is built for a single reader thread, not concurrent workers. The
+    // finalize hooks read the record total from the accumulator, not from this
+    // counter — it drives only the periodic log.
     let prev = captures.progress.fetch_add(total_records, Ordering::Relaxed);
     if (prev + total_records) / 1_000_000 > prev / 1_000_000 {
         info!("Processed {} records", prev + total_records);
@@ -103,8 +102,12 @@ fn record_batch_metrics(
 ///
 /// Parallel, `ByItemOrdinal`. Every record is kept (no filtering, no rejects);
 /// the read-name UMI is copied into `RX` in place. A bad/empty UMI (or an
-/// existing RX under `--fail-if-tag-present`) aborts the run via
-/// `map_err(io::Error::other)?`, matching the pre-cutover pipeline `process_fn`.
+/// existing RX under `--fail-if-tag-present`) aborts the run, matching the
+/// pre-cutover pipeline `process_fn`. The error crosses an `io::Error`
+/// boundary (`map_err`) with its full `anyhow` cause chain flattened into the
+/// message via `{e:#}` first, so the pipeline's step-failure reconstruction
+/// (which reads only the `io::Error`'s top-level Display) still surfaces the
+/// inner cause, not just the outer "extracting UMI from read name" context.
 ///
 /// Returns the concrete `ProcessOrdered` (not `impl Step`), because the closure
 /// type embeds in opaque-return position and cannot name itself — the same
@@ -139,7 +142,14 @@ pub(crate) fn build_copy_umi_process_step(
                     captures.remove_umi,
                     captures.fail_if_tag_present,
                 )
-                .map_err(io::Error::other)?;
+                // `{e:#}` (anyhow's alternate Display) joins the full cause chain into
+                // one string before crossing the `io::Error` boundary: `io::Error`'s own
+                // Display only ever shows its wrapped error's top-level Display, so a
+                // bare `io::Error::other(e)` would silently drop the inner cause (e.g.
+                // "Invalid UMI ... illegal character ...") once the pipeline reconstructs
+                // a step failure from this `io::Error` — exactly the diagnostic the
+                // no-`--threads` path used to show before the chain became the only path.
+                .map_err(|e| io::Error::other(format!("{e:#}")))?;
                 if outcome.overwrote_rx {
                     rx_overwritten += 1;
                 }
