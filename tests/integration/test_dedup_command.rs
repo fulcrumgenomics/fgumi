@@ -89,7 +89,11 @@ fn create_duplicate_group_inner(
             b.read_name(name.as_bytes())
                 .sequence(b"ACGTACGT")
                 .qualities(&[base_qual; 8])
-                .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                // R1 is forward and its mate (R2) is reverse, so MATE_REVERSE must
+                // be set for the pair to be self-consistent (R1.MATE_REVERSE must
+                // match R2.REVERSE). Omitting it makes template-coordinate sort
+                // assign the two reads different strand lanes and separate them.
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
                 .ref_id(0)
                 .pos(start - 1)
                 .mapq(mapq)
@@ -269,11 +273,12 @@ fn test_dedup_command_with_metrics() {
 }
 
 /// End-to-end guard for the #804 pair/orphan breakdown. The fixture is entirely
-/// mapped paired-end duplicates. `dedup` dedups each mate in its own position
-/// group, so the 3 read-pairs become 6 single-mate templates (4 marked duplicate:
-/// 2 per group); classified by flags they are 6 pair halves -> `mapped_pairs = 3`,
-/// `duplicate_pairs = 2`, with nothing in the orphan or unmapped categories. Also
-/// asserts the documented read-unit reconciliation invariants.
+/// mapped paired-end duplicates. A read pair is one template but two reads, so
+/// the 3 read pairs are 3 templates (2 marked duplicate) and 6 reads; classified
+/// by flags they are 6 pair halves -> `mapped_pairs = 3`, `duplicate_pairs = 2`,
+/// with nothing in the orphan or unmapped categories. Also asserts the
+/// reconciliation invariants in both template units (against `total_templates`)
+/// and read units (against `total_reads`).
 #[test]
 fn test_dedup_metrics_pair_orphan_breakdown_all_mapped_pairs() {
     let temp_dir = TempDir::new().unwrap();
@@ -310,28 +315,46 @@ fn test_dedup_metrics_pair_orphan_breakdown_all_mapped_pairs() {
     // every row, including the aggregate. This fixture has a single library, so the aggregate
     // repeats the per-library counts — but asserting it exercises the merge path all the same.
     let assert_breakdown = |row: &DeduplicationMetrics, label: &str| {
-        // 3 read-pairs -> 6 single-mate templates, 4 marked duplicate (2 per group).
-        assert_eq!(row.total_templates, 6, "{label}: 3 pairs -> 6 single-mate templates");
-        assert_eq!(row.duplicate_templates, 4, "{label}: duplicate templates");
-        // Every read is a pair half, halved to whole pairs.
-        assert_eq!(row.mapped_pairs, 3, "{label}: 6 pair halves -> 3 mapped pairs");
-        assert_eq!(row.duplicate_pairs, 2, "{label}: 4 duplicate pair halves -> 2 duplicate pairs");
+        // 3 read pairs -> 3 templates (a read pair is one template), 2 of them
+        // marked duplicate; every template here is a fully-mapped pair (2 reads).
+        assert_eq!(row.total_templates, 3, "{label}: 3 read pairs -> 3 templates");
+        assert_eq!(
+            row.duplicate_templates, 2,
+            "{label}: 2 duplicate pairs -> 2 duplicate templates"
+        );
+        assert_eq!(row.total_reads, 6, "{label}: 3 pairs -> 6 reads");
+        assert_eq!(row.duplicate_reads, 4, "{label}: 2 duplicate pairs -> 4 duplicate reads");
+        assert_eq!(row.mapped_pairs, 3, "{label}: 3 mapped pairs");
+        assert_eq!(row.duplicate_pairs, 2, "{label}: 2 duplicate pairs");
         assert_eq!(row.mapped_orphans, 0, "{label}: mapped orphans");
         assert_eq!(row.duplicate_orphans, 0, "{label}: duplicate orphans");
         assert_eq!(row.unmapped_pairs, 0, "{label}: unmapped pairs");
         assert_eq!(row.unmapped_orphans, 0, "{label}: unmapped orphans");
         assert_eq!(row.unmated_templates, 0, "{label}: no single-end reads in this fixture");
 
-        // Documented read-unit reconciliation invariants (each pair == two templates).
+        // Reconciliation in the correct units: a mapped pair is one *template* but
+        // two *reads*. Every template in this fixture is a mapped pair, so the
+        // template-unit buckets sum to total_templates and the read-unit buckets
+        // (each pair counted twice) sum to total_reads.
+        assert_eq!(
+            row.mapped_pairs + row.mapped_orphans + row.unmapped_pairs + row.unmapped_orphans,
+            row.total_templates,
+            "{label}: mapping buckets must reconcile with total_templates in template units"
+        );
         assert_eq!(
             2 * row.mapped_pairs + row.mapped_orphans + row.unmapped_pairs + row.unmapped_orphans,
-            row.total_templates,
-            "{label}: mapping buckets must reconcile with total_templates in read units"
+            row.total_reads,
+            "{label}: mapping buckets must reconcile with total_reads in read units"
+        );
+        assert_eq!(
+            row.duplicate_pairs + row.duplicate_orphans,
+            row.duplicate_templates,
+            "{label}: duplicate buckets must reconcile with duplicate_templates in template units"
         );
         assert_eq!(
             2 * row.duplicate_pairs + row.duplicate_orphans,
-            row.duplicate_templates,
-            "{label}: duplicate buckets must reconcile with duplicate_templates in read units"
+            row.duplicate_reads,
+            "{label}: duplicate buckets must reconcile with duplicate_reads in read units"
         );
     };
 
@@ -589,13 +612,12 @@ fn assert_ladder_library_ok(
 /// `duplicate_templates`/`percent_duplication`, and `estimated_library_size`
 /// populated for both (both libraries have duplicates).
 ///
-/// Each mate's position group is dedup'd independently (R1's group and R2's
-/// group are template-coordinate-adjacent but distinct `RawPositionGroup`s,
-/// each holding single-mate templates), so a library's `count` duplicate
-/// pairs contribute `2 * count` templates/reads to its row: `count` from R1's
-/// group (1 unique + `count - 1` duplicate) and `count` from R2's group
-/// (same split) — e.g. library A's 3 pairs give `total_templates = 6`,
-/// `unique_templates = 2`, `duplicate_templates = 4`.
+/// A read pair is one template (its two mates are dedup'd in
+/// template-coordinate-adjacent position groups but counted as a single
+/// template), so a library's `count` duplicate pairs contribute `count`
+/// templates and `2 * count` reads to its row: 1 unique template + `count - 1`
+/// duplicate templates — e.g. library A's 3 pairs give `total_templates = 3`,
+/// `unique_templates = 1`, `duplicate_templates = 2`, `total_reads = 6`.
 #[test]
 fn test_dedup_command_per_library_metrics() {
     let temp_dir = TempDir::new().unwrap();
@@ -640,14 +662,13 @@ fn test_dedup_command_per_library_metrics() {
         assert_eq!(row["sample"], "sampleX", "sample resolved from @RG SM: {row:?}");
     }
 
-    // Each position group in `fgumi dedup` holds a single mate (R1's group and
-    // R2's group are template-coordinate-adjacent but distinct groups), so a
-    // library's `count` duplicate pairs contribute `2 * count` templates/reads
-    // (one per mate's own position group), each with exactly one record.
+    // A read pair is one template but two reads, so a library's `count` duplicate
+    // pairs give `count` templates (1 unique + `count - 1` duplicate) and
+    // `2 * count` reads. Library A's 3 duplicate pairs: 3 templates, 6 reads.
     let lib_a = &rows[0];
-    assert_eq!(lib_a["total_templates"], "6");
-    assert_eq!(lib_a["unique_templates"], "2");
-    assert_eq!(lib_a["duplicate_templates"], "4");
+    assert_eq!(lib_a["total_templates"], "3");
+    assert_eq!(lib_a["unique_templates"], "1");
+    assert_eq!(lib_a["duplicate_templates"], "2");
     assert_eq!(lib_a["total_reads"], "6");
     assert_eq!(lib_a["duplicate_reads"], "4");
     assert!(
@@ -660,9 +681,9 @@ fn test_dedup_command_per_library_metrics() {
     );
 
     let lib_b = &rows[1];
-    assert_eq!(lib_b["total_templates"], "4");
-    assert_eq!(lib_b["unique_templates"], "2");
-    assert_eq!(lib_b["duplicate_templates"], "2");
+    assert_eq!(lib_b["total_templates"], "2");
+    assert_eq!(lib_b["unique_templates"], "1");
+    assert_eq!(lib_b["duplicate_templates"], "1");
     assert_eq!(lib_b["total_reads"], "4");
     assert_eq!(lib_b["duplicate_reads"], "2");
     assert!(
@@ -675,9 +696,9 @@ fn test_dedup_command_per_library_metrics() {
     );
 
     let total = &rows[2];
-    assert_eq!(total["total_templates"], "10");
-    assert_eq!(total["unique_templates"], "4");
-    assert_eq!(total["duplicate_templates"], "6");
+    assert_eq!(total["total_templates"], "5");
+    assert_eq!(total["unique_templates"], "2");
+    assert_eq!(total["duplicate_templates"], "3");
     assert_eq!(total["total_reads"], "10");
     assert_eq!(total["duplicate_reads"], "6");
     // The aggregate row spans two distinct libraries, so a pooled Lander-Waterman
@@ -975,19 +996,17 @@ fn test_dedup_command_single_library_metrics_has_unknown_and_total_rows() {
 /// `--ladder-interval`, verifying per-library snapshot rows are correct.
 ///
 /// libA gets three duplicate-group positions with `count` = 3, 2, 2 pairs
-/// (spaced far enough apart to fall in distinct position groups). Per
-/// [`test_dedup_command_per_library_metrics`]'s documented shape, each
-/// position's mate groups (R1 then R2, in coordinate order) each contribute
-/// `count` templates, so libA's cumulative per-group `templates_seen`
-/// sequence is 3, 6, 8, 10, 12, 14 (true total 14). With `--ladder-interval
-/// 4`, thresholds are crossed at cumulative values 6, 8, 12 — three interval
-/// rows — and the true total (14) does not land on a crossing, so a fourth,
-/// final row is appended at 14: four rows total.
+/// (spaced far enough apart to fall in distinct position groups). A read pair is
+/// one template, so libA's cumulative per-group `templates_seen` sequence is 3,
+/// 5, 7 (true total 7). With `--ladder-interval 4`, an interval multiple (4) is
+/// first crossed when the second group brings the count to 5 — one interval row
+/// — and the true total (7) does not land on a multiple of 4, so a final row is
+/// appended at 7: two rows total.
 ///
 /// libB gets two duplicate-group positions with `count` = 2 each, giving the
-/// cumulative sequence 2, 4, 6, 8 (true total 8). Thresholds are crossed at 4
-/// and 8 — two interval rows — and the second crossing lands exactly on the
-/// true total, so no extra final row is appended: two rows total.
+/// cumulative sequence 2, 4 (true total 4). The interval multiple 4 is crossed
+/// when the second group brings the count to 4, which lands exactly on the true
+/// total, so no extra final row is appended: one row total.
 #[test]
 fn test_dedup_duplication_ladder_multi_library() {
     let temp_dir = TempDir::new().unwrap();
@@ -1034,39 +1053,20 @@ fn test_dedup_duplication_ladder_multi_library() {
 
     let ladder_rows = read_dedup_metrics_rows(&ladder_path);
 
-    // Expected snapshot sequence per library, pinned exactly (not merely by row
-    // count) so a regression that emitted the right number of rows at the wrong
-    // interval crossings is still caught: libA crosses the interval at 6, 8, 12,
-    // then gets a final row at its true total (14), which doesn't land on a
-    // crossing — 4 rows. libB crosses at 4 and 8, with 8 landing exactly on its
-    // true total, so no extra final row — 2 rows.
-    // Every snapshot row is pinned exactly — both `templates_seen` and the
-    // cumulative `duplicate_fraction` (as `(numerator, denominator)`) — so a
-    // regression that emits the right row count at the wrong interval crossings,
-    // reorders the library rows, or writes the wrong intermediate saturation
-    // values is caught, not just one with a wrong final row. libA crosses the
-    // interval at 6, 8, 12, then gets a final row at its true total (14), which
-    // doesn't land on a crossing — 4 rows. libB crosses at 4 and 8, with 8
-    // landing exactly on its true total, so no extra final row — 2 rows.
-    // Per snapshot row, keyed by library: (templates_seen, cumulative (num,
-    // den), window (num, den)), pinned so the table reads as a spec. The window
-    // duplicate count is the cumulative duplicates minus the previous snapshot's,
-    // over the window's templates: libA cumulative dups run 4, 5, 7, 8 over seen
-    // 6, 8, 12, 14, so the windows are 4/6, 1/2, 2/4, 1/2; libB runs 2, 4 over 4,
-    // 8, so 2/4, 2/4.
+    // Every snapshot row is pinned exactly — `templates_seen`, the cumulative
+    // `duplicate_fraction` (as `(numerator, denominator)`), and the window
+    // fraction — so a regression that emits the right row count at the wrong
+    // interval crossings, reorders the library rows, or writes the wrong
+    // intermediate saturation values is caught. A read pair is one template, so:
+    // libA's per-group `templates_seen` runs 3, 5, 7 (interval 4 first crossed at
+    // 5; final row at the true total 7) and its cumulative duplicates run 2, 3, 4
+    // — so the two pinned rows are seen 5 (cum 3/5, window 3/5) and seen 7 (cum
+    // 4/7, window 1/2 over the 5->7 window). libB runs 2, 4 (crossing 4 exactly at
+    // the total, so a single row) with cumulative duplicates 1, 2 — one row at
+    // seen 4 (cum 2/4, window 2/4).
     #[expect(clippy::type_complexity, reason = "an inline pinned table of expected rows")]
-    let expected_sequences: [(&str, &[(u64, (u64, u64), (u64, u64))]); 2] = [
-        (
-            "libA",
-            &[
-                (6, (4, 6), (4, 6)),
-                (8, (5, 8), (1, 2)),
-                (12, (7, 12), (2, 4)),
-                (14, (8, 14), (1, 2)),
-            ],
-        ),
-        ("libB", &[(4, (2, 4), (2, 4)), (8, (4, 8), (2, 4))]),
-    ];
+    let expected_sequences: [(&str, &[(u64, (u64, u64), (u64, u64))]); 2] =
+        [("libA", &[(5, (3, 5), (3, 5)), (7, (4, 7), (1, 2))]), ("libB", &[(4, (2, 4), (2, 4))])];
     let mut matched_row_count = 0usize;
 
     // For each library: every row's templates_seen, cumulative duplicate_fraction,
@@ -1191,12 +1191,13 @@ fn test_dedup_duplication_ladder_off_by_default() {
 /// row per call, not one row per crossed multiple.
 ///
 /// A single 10-pair duplicate group (no `@RG`, so library = "Unknown
-/// Library") with `--ladder-interval 3` produces two position groups (R1
-/// then R2, in coordinate order), each contributing 10 templates in one
-/// `record()` call — each call alone crosses three interval multiples (the
-/// first call crosses 3, 6, 9; the second crosses 12, 15, 18). Before the fix
-/// this produced duplicate rows `[10, 10, 10, 20, 20, 20]`; after the fix it
-/// must produce exactly `[10, 20]`.
+/// Library") with `--ladder-interval 3`: a read pair is one template, so the
+/// group contributes 10 templates, registered in a single `record()` call that
+/// alone leaps past three interval multiples (3, 6, 9). The recorder must emit
+/// exactly one row for that call — one row per `record()` call, not one per
+/// crossed multiple (the regression that motivated this test produced
+/// `[10, 10, 10, ...]`). The true total (10) is where the single row lands, so
+/// the ladder is exactly `[10]`.
 #[test]
 fn test_dedup_duplication_ladder_single_group_exceeds_interval() {
     let temp_dir = TempDir::new().unwrap();
@@ -1242,11 +1243,11 @@ fn test_dedup_duplication_ladder_single_group_exceeds_interval() {
 
     assert_eq!(
         templates_seen,
-        vec![10, 20],
+        vec![10],
         "a single group whose increment leaps past more than one interval \
          multiple must still emit exactly one row per record() call, not one \
          row per crossed multiple (regression: previously produced \
-         [10, 10, 10, 20, 20, 20]): {ladder_rows:?}"
+         [10, 10, 10, ...]); 10 duplicate pairs are 10 templates: {ladder_rows:?}"
     );
 
     // Redundant with the exact-sequence check above, but states the general
@@ -1438,28 +1439,26 @@ fn test_dedup_include_unmapped(
         "unexpected filtered_unmapped"
     );
 
-    // The fully-unmapped pass-through pair is the multi-primary case the
-    // pair/orphan reconciliation invariant explicitly excludes: it is emitted as
-    // ONE template holding both mates, so it adds 1 to `total_templates` but 2 to
-    // `unmapped_pairs` (one per primary read). Under `--include-unmapped` that is
-    // two unmapped pairs from a single template; by default the pair is filtered
-    // out before pair/orphan counting, so the counter stays zero.
+    // The fully-unmapped pass-through pair is emitted as ONE template holding both
+    // mates, so it adds 1 to `total_templates` but 2 to `unmapped_pairs` (one per
+    // primary read). Under `--include-unmapped` that is two unmapped pairs from a
+    // single template; by default the pair is filtered out before pair/orphan
+    // counting, so the counter stays zero.
     assert_eq!(metrics.unmapped_pairs, expected_unmapped_pairs, "unexpected unmapped_pairs");
 
-    // The single-primary-read reconciliation `2*mapped_pairs + mapped_orphans +
-    // unmapped_pairs + unmapped_orphans == total_templates` holds only for
-    // deduplicated (single-primary) templates. This fixture's sole pass-through is
-    // a fully-unmapped *pair* (two primary reads in one template), so the left
-    // side runs ahead of `total_templates` by exactly `passthrough_templates`.
-    let reconciliation_lhs = 2 * metrics.mapped_pairs
+    // Pair/orphan reconciliation in READ units: each pair-half bucket is counted in
+    // reads (a mapped pair is two reads; each unmapped pass-through primary is one),
+    // so the sum equals `total_reads` — 6 for the three mapped pairs alone (default),
+    // 8 once the fully-unmapped pass-through pair's two reads are kept
+    // (`--include-unmapped`). This reconciles against `total_reads`, not
+    // `total_templates`: a mapped pair is one template but two reads.
+    let reconciliation_reads = 2 * metrics.mapped_pairs
         + metrics.mapped_orphans
         + metrics.unmapped_pairs
         + metrics.unmapped_orphans;
     assert_eq!(
-        reconciliation_lhs,
-        metrics.total_templates + metrics.passthrough_templates,
-        "pair/orphan reconciliation must exceed total_templates by the fully-unmapped \
-         pass-through pairs: {metrics:?}"
+        reconciliation_reads, metrics.total_reads,
+        "pair/orphan buckets must reconcile with total_reads: {metrics:?}"
     );
 }
 
@@ -1814,37 +1813,21 @@ fn test_dedup_accepts_index_threshold_never() {
     // Absolute expectations, so this still fails if both runs regress together.
     assert_eq!(never.len(), 6, "all six records must be emitted (marked, not removed)");
 
-    // All six records, pinned by name, flags and molecule. The two ends sit in
-    // different template-coordinate position groups (99 and 199), so each end gets its
-    // own molecule id -- the three copies of each end share one, which is the grouping
-    // the index would have had to get wrong to matter here.
+    // All six records, pinned by name, flags and molecule. The three duplicate
+    // pairs form one molecule (MI 0): both ends of each pair share the molecule id,
+    // `dup1_0` is kept and `dup1_1`/`dup1_2` are marked duplicate. Output is in
+    // template-coordinate order, so each pair's two ends are contiguous. R1 carries
+    // `MATE_REVERSE` (its mate R2 is reverse); this is the grouping the index would
+    // have had to get wrong to matter here.
+    let r1 = flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE;
+    let r2 = flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE;
     let expected = vec![
-        ("dup1_0".to_string(), flags::PAIRED | flags::FIRST_SEGMENT, Some("0".to_string())),
-        (
-            "dup1_1".to_string(),
-            flags::PAIRED | flags::FIRST_SEGMENT | flags::DUPLICATE,
-            Some("0".to_string()),
-        ),
-        (
-            "dup1_2".to_string(),
-            flags::PAIRED | flags::FIRST_SEGMENT | flags::DUPLICATE,
-            Some("0".to_string()),
-        ),
-        (
-            "dup1_0".to_string(),
-            flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE,
-            Some("1".to_string()),
-        ),
-        (
-            "dup1_1".to_string(),
-            flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE | flags::DUPLICATE,
-            Some("1".to_string()),
-        ),
-        (
-            "dup1_2".to_string(),
-            flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE | flags::DUPLICATE,
-            Some("1".to_string()),
-        ),
+        ("dup1_0".to_string(), r1, Some("0".to_string())),
+        ("dup1_0".to_string(), r2, Some("0".to_string())),
+        ("dup1_1".to_string(), r1 | flags::DUPLICATE, Some("0".to_string())),
+        ("dup1_1".to_string(), r2 | flags::DUPLICATE, Some("0".to_string())),
+        ("dup1_2".to_string(), r1 | flags::DUPLICATE, Some("0".to_string())),
+        ("dup1_2".to_string(), r2 | flags::DUPLICATE, Some("0".to_string())),
     ];
     assert_eq!(never, expected, "--index-threshold never changed the grouping");
 
@@ -2405,7 +2388,9 @@ fn test_dedup_marks_families_and_flags_tc_keyed_secondary_supplementary(#[case] 
     supp.read_name(supp_primary.as_bytes())
         .sequence(b"ACGTACGT")
         .qualities(&[30; 8])
-        .flags(flags::PAIRED | flags::FIRST_SEGMENT | extra_flag)
+        // R1 of `famD_dup_0`, whose primary R2 is reverse-strand, so `MATE_REVERSE`
+        // must be set to match the paired primary records' mate-strand semantics.
+        .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE | extra_flag)
         .ref_id(0)
         .pos(5000)
         .mapq(60)

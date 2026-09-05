@@ -101,8 +101,8 @@ pub struct DedupCounts {
     /// Templates emitted untouched by `--include-unmapped` (bypass the filter)
     pub passthrough_templates: u64,
     /// Mapped primary reads whose mate is also mapped, i.e. one half of a mapped
-    /// pair. Accumulated in read (pair-half) units because a pair's two mates are
-    /// dedup'd in separate position groups; halved to `mapped_pairs`
+    /// pair. Accumulated in read (pair-half) units — a mapped pair's two primary
+    /// reads are each counted here — and halved to `mapped_pairs`
     /// (Picard `READ_PAIRS_EXAMINED`) only when the final row is built.
     pub mapped_pair_reads: u64,
     /// Duplicate-marked half of a mapped pair; halved to `duplicate_pairs`
@@ -855,11 +855,11 @@ fn mark_template_as_duplicate(template: &mut Template, dedup_counts: &mut DedupC
 /// Classify each primary read of a counted template into the Picard-style
 /// pair/orphan breakdown (#804).
 ///
-/// fgumi `dedup` dedups each mate in its own position group, so a template here
-/// almost always holds a single primary read; classifying **per primary read**
-/// (rather than per template) is what lets a normal read-pair — split across two
-/// templates in two groups — be recognised as a pair at all. Each read is bucketed
-/// by its own SAM flags, mirroring Picard `DuplicationMetrics`:
+/// A template holds a read pair's primary reads (a read pair is one template but
+/// two reads). Classifying **per primary read** (rather than per template) is
+/// what mirrors Picard `DuplicationMetrics`: a mapped pair contributes two
+/// pair-halves, one per mate, later halved to whole pairs. Each read is bucketed
+/// by its own SAM flags:
 ///
 /// - mapped with a mapped mate  -> `mapped_pair_reads` (a pair half; Picard
 ///   `READ_PAIRS_EXAMINED` after halving), and `duplicate_pair_reads` if marked.
@@ -2343,8 +2343,8 @@ mod tests {
     // ========================================================================
 
     /// Build a single-primary-read template whose read carries exactly `flags`.
-    /// `dedup` sees single-mate templates, so classifying one read is the real
-    /// unit of the pair/orphan pass.
+    /// The pair/orphan pass classifies per primary read, so a one-read template
+    /// exercises exactly one bucket in isolation.
     fn template_with_primary_flags(flags: u16) -> Template {
         let mut b = RawSamBuilder::new();
         b.read_name(b"q1").sequence(b"ACGT").qualities(&[30, 30, 30, 30]).flags(flags);
@@ -2381,6 +2381,63 @@ mod tests {
         let mut counts = DedupCounts::default();
         count_template_pair_orphan(&template, &mut counts);
         assert_eq!(breakdown(&counts), expected);
+    }
+
+    /// A mixed-mapping pair (one mate mapped, the other unmapped) is one template
+    /// but two primary reads that land in *different* buckets: the mapped mate is a
+    /// `mapped_orphan` (mapped, no mapped mate) and the unmapped mate is an
+    /// `unmapped_pair`. This is why the pair/orphan breakdown reconciles in **read**
+    /// units and NOT in template units — the read-unit sum for this template is 2
+    /// (== its reads), while the template-unit sum is also 2 yet the template counts
+    /// once. Pins that the documented reconciliation is read-unit, not template-unit
+    /// (which the `--include-unmapped` pass-through is not the only exception to).
+    #[test]
+    fn test_count_pair_orphan_mixed_mapping_pair_reconciles_in_read_units() {
+        // R1 mapped with its mate unmapped -> mapped_orphan; R2 unmapped, paired ->
+        // unmapped_pair. Both primary reads of ONE template.
+        let mut r1 = RawSamBuilder::new();
+        r1.read_name(b"q1")
+            .sequence(b"ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_UNMAPPED);
+        let mut r2 = RawSamBuilder::new();
+        r2.read_name(b"q1")
+            .sequence(b"TGCA")
+            .qualities(&[30, 30, 30, 30])
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::UNMAPPED);
+        let template = Template::from_records(vec![r1.build(), r2.build()])
+            .expect("test template construction should not fail");
+
+        let mut counts = DedupCounts::default();
+        count_template_pair_orphan(&template, &mut counts);
+        // mapped_pair_reads, mapped_orphans, unmapped_pairs, unmapped_orphans, unmated.
+        assert_eq!(breakdown(&counts), (0, 1, 1, 0, 0));
+
+        // One mixed pair: one surviving template holding two primary reads.
+        counts.total_templates = 1;
+        counts.total_reads = 2;
+        let metrics = to_deduplication_metrics("smpl".to_string(), "lib1".to_string(), &counts);
+
+        // Read-unit reconciliation holds: each primary read is counted in exactly
+        // one bucket, so the read-unit sum equals total_reads.
+        assert_eq!(
+            2 * metrics.mapped_pairs
+                + metrics.mapped_orphans
+                + metrics.unmapped_pairs
+                + metrics.unmapped_orphans,
+            metrics.total_reads,
+            "the pair/orphan breakdown must reconcile against total_reads",
+        );
+        // The template-unit identity does NOT hold: a mixed pair adds 2 to the
+        // breakdown sum but only 1 to total_templates.
+        assert_ne!(
+            metrics.mapped_pairs
+                + metrics.mapped_orphans
+                + metrics.unmapped_pairs
+                + metrics.unmapped_orphans,
+            metrics.total_templates,
+            "a mixed-mapping pair breaks the template-unit reconciliation",
+        );
     }
 
     /// A duplicate-marked read increments the duplicate sub-counter of its bucket:
