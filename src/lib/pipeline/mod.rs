@@ -24,5 +24,6 @@
 /// `crate::pipeline::core::…` path resolves — which is what lets the ported
 /// step sources compile unmodified.
 pub use fgumi_pipeline_core as core;
+pub mod backpressure;
 pub mod chains;
 pub mod steps;

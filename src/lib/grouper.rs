@@ -11,8 +11,9 @@ use std::io;
 
 use noodles::sam::alignment::RecordBuf;
 
+use crate::batch_weight::BatchWeight;
 use crate::template::{Template, TemplateBatch};
-use crate::unified_pipeline::{BatchWeight, DecodedRecord, Grouper, MemoryEstimate};
+use fgumi_bam_io::{DecodedRecord, Grouper, MemoryEstimate};
 use fgumi_metrics::TemplateFilterCounts;
 use fgumi_raw_bam;
 use fgumi_raw_bam::{RawRecord, raw_record_to_record_buf};
@@ -268,7 +269,7 @@ impl Grouper for TemplateGrouper {
     }
 }
 
-use crate::unified_pipeline::GroupKey;
+use fgumi_bam_io::GroupKey;
 
 impl MemoryEstimate for ProcessedPositionGroup {
     fn estimate_heap_size(&self) -> usize {
@@ -1089,7 +1090,7 @@ mod tests {
 
     #[test]
     fn test_single_raw_record_grouper_emits_each_record() {
-        use crate::unified_pipeline::{DecodedRecord, GroupKey};
+        use fgumi_bam_io::{DecodedRecord, GroupKey};
 
         let mut grouper = SingleRawRecordGrouper::new();
         let raw1 = RawRecord::from(vec![1u8; 36]);
@@ -1901,10 +1902,10 @@ mod tests {
     /// group contract. Every MC-validation test below builds its record this way.
     fn decoded_via_decode(flags: u16, pos: i32, mc: Option<&str>, name: &[u8]) -> DecodedRecord {
         use crate::read_info::LibraryIndex;
-        use crate::unified_pipeline::compute_group_key_from_raw;
+        use fgumi_bam_io::compute_group_key_from_raw;
 
         let raw = build_raw(flags, pos, mc, name, false);
-        let (key, _) = compute_group_key_from_raw(&raw, &LibraryIndex::default(), None, None);
+        let key = compute_group_key_from_raw(&raw, &LibraryIndex::default(), None);
         DecodedRecord::from_raw_bytes(raw, key)
     }
 
@@ -1937,10 +1938,10 @@ mod tests {
         #[case] byte_scan_finds_mc: bool,
     ) {
         use crate::read_info::LibraryIndex;
-        use crate::unified_pipeline::compute_group_key_from_raw;
+        use fgumi_bam_io::compute_group_key_from_raw;
 
         let raw = build_raw(flags, 99, mc, b"read1", prepend_non_z_mc);
-        let (key, _) = compute_group_key_from_raw(&raw, &LibraryIndex::default(), None, None);
+        let key = compute_group_key_from_raw(&raw, &LibraryIndex::default(), None);
 
         assert_eq!(
             fgumi_raw_bam::find_mc_tag_in_record(&raw).is_some(),
@@ -2186,7 +2187,7 @@ mod tests {
 
     #[test]
     fn test_build_templates_from_raw_bytes() {
-        use crate::unified_pipeline::{DecodedRecord, GroupKey};
+        use fgumi_bam_io::{DecodedRecord, GroupKey};
         use fgumi_raw_bam;
 
         let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
@@ -2210,7 +2211,7 @@ mod tests {
 
     #[test]
     fn test_build_templates_from_raw_bytes_paired() {
-        use crate::unified_pipeline::{DecodedRecord, GroupKey};
+        use fgumi_bam_io::{DecodedRecord, GroupKey};
         use fgumi_raw_bam;
 
         let key1 = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
