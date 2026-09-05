@@ -4273,8 +4273,8 @@ impl<'a> ChainBuilder<'a> {
     /// Mirrors filter's single-no-rejects shape (no template grouping, no
     /// rejects, no sort-order guard). The header is `self.header` — already
     /// `ensure_hd`'d + `add_pg`'d in `ChainBuilder::new` — and is not reassigned
-    /// (a pure transform leaves the header shape unchanged). The no-`--threads`
-    /// serial path in `CopyUmi::execute` is the in-process parity oracle.
+    /// (a pure transform leaves the header shape unchanged). `CopyUmi::execute`
+    /// always runs through this chain — there is no other execution path.
     fn add_copy_umi(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::warn_unwired_pipeline_flags;
         use crate::logging::OperationTimer;
@@ -4340,16 +4340,15 @@ impl<'a> ChainBuilder<'a> {
         self.current_tail = Some(self.pipeline.append_step(step, tail));
 
         // Register the finalize hooks — BOTH on `finalize_on_success` (not the
-        // always-run `finalize`): the serial oracle `?`-aborts before its summary
-        // on a fail-fast error, so an always-run summary hook would log a partial
-        // summary the serial path never logs. The chain-level
-        // StageTimingFinalizeHook is inserted at index 0 by `build()`.
+        // always-run `finalize`): a bad record aborts the run before the pipeline
+        // drains, so an always-run summary hook would log a partial summary on a
+        // fail-fast error. The chain-level StageTimingFinalizeHook is inserted at
+        // index 0 by `build()`.
         //
         // Order matters: the SUMMARY hook is registered BEFORE the metrics hook so
-        // it runs first, matching the serial path (`warn_and_log_copy_umi_summary`
-        // then `write_copy_umi_metrics`). This keeps log parity on a `--metrics`
-        // write failure — the summary + completion-timer are already logged on both
-        // paths before the failing write, rather than being swallowed on the chain.
+        // it runs first (`warn_and_log_copy_umi_summary` then
+        // `write_copy_umi_metrics`) — the summary + completion-timer are logged
+        // before a `--metrics` write failure, rather than being swallowed.
         self.finalize_on_success
             .push(Box::new(CopyUmiFinalizeHook { accumulators: Arc::clone(&accumulators), timer }));
         if let Some(metrics_path) = copy_umi.metrics.clone() {
@@ -5194,6 +5193,43 @@ mod tests {
         spec.stage_opts.dedup = Some(dedup);
         let builder = chain_builder_for_stages(&spec);
         assert_eq!(builder.bam_group_key_config().umi_tag, expected_umi_tag);
+    }
+
+    /// `add_copy_umi` refuses an intermediate position: copy-umi is a terminal,
+    /// standalone per-record transform (`CopyUmi::execute` only ever composes it
+    /// as the sole, last stage), so composing it before another stage must bail
+    /// rather than build an unsupported chain. Exercises the guard directly — it
+    /// precedes the options/`current_tail` reads — pinning a defensive branch the
+    /// CLI never reaches.
+    #[test]
+    fn add_copy_umi_rejects_intermediate_position() {
+        let spec = empty_spec(vec![Stage::CopyUmi]);
+        let mut builder = chain_builder_for_stages(&spec);
+        let err = builder
+            .add_copy_umi(StagePosition::Intermediate)
+            .expect_err("intermediate copy-umi must be rejected");
+        assert!(
+            err.to_string().contains("intermediate copy-umi not implemented"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `add_copy_umi` refuses a non-record-stream upstream tail: like filter/clip
+    /// it consumes a `DecodedRecordBatch`, so a tail emitting grouped templates
+    /// must bail rather than mis-wire the step onto an incompatible input.
+    /// Exercises the guard directly by seeding a `BamTemplateBatch` tail.
+    #[test]
+    fn add_copy_umi_rejects_non_record_stream_tail() {
+        let spec = empty_spec(vec![Stage::CopyUmi]);
+        let mut builder = chain_builder_for_stages(&spec);
+        builder.chain_tail_kind = ChainTailKind::BamTemplateBatch;
+        let err = builder
+            .add_copy_umi(StagePosition::Terminal)
+            .expect_err("copy-umi after a grouped-template tail must be rejected");
+        assert!(
+            err.to_string().contains("requires a record-stream input"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Pin the per-phase thread resolution contract shared by the standalone and

@@ -11,6 +11,7 @@ pub mod aligner;
 pub mod assertions;
 pub mod bam_generator;
 pub mod cli;
+pub mod copy_umi_fixtures;
 pub mod cutover;
 pub mod fastq;
 
@@ -18,6 +19,7 @@ pub use aligner::*;
 pub use assertions::*;
 pub use bam_generator::*;
 pub use cli::*;
+pub use copy_umi_fixtures::*;
 pub use cutover::*;
 pub use fastq::*;
 

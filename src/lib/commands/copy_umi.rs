@@ -25,13 +25,11 @@ use log::{info, warn};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    add_pg_record, ensure_hd_record, reject_output_collisions,
+    reject_output_collisions,
 };
-use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::sam::SamTag;
 use crate::umi::read_name::normalize_read_name_umi;
-use fgumi_bam_io::{ProgressTracker, create_raw_bam_reader_with_opts, create_raw_bam_writer};
 use fgumi_raw_bam::{RawRecord, update_string_tag};
 
 /// Copy the UMI from a BAM read name into the RX tag.
@@ -139,8 +137,8 @@ pub(crate) struct RecordOutcome {
 
 /// Aggregated run counters, one instance per pipeline slot.
 ///
-/// Shared by the serial oracle and the chain finalize hooks, so the two paths
-/// reduce the same counters (`pub(crate)` fields for the chain step module).
+/// Reduced by the chain finalize hooks (`pub(crate)` fields for the chain step
+/// module).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CollectedCopyUmiMetrics {
     /// Records processed (all successful; a failure aborts the run).
@@ -282,9 +280,8 @@ pub(crate) fn validate_field_delimiter(c: char) -> Result<u8> {
         .with_context(|| format!("--field-delimiter must be a single ASCII character, got '{c}'"))
 }
 
-/// Write the single-row `--metrics` TSV from the reduced counters. Shared by the
-/// serial oracle and the chain's success-only metrics finalize hook so the two
-/// paths cannot drift.
+/// Write the single-row `--metrics` TSV from the reduced counters. Called by
+/// the chain's success-only metrics finalize hook.
 pub(crate) fn write_copy_umi_metrics(path: &Path, totals: &CollectedCopyUmiMetrics) -> Result<()> {
     let row = CopyUmiMetric {
         total_records: totals.total_records,
@@ -297,9 +294,8 @@ pub(crate) fn write_copy_umi_metrics(path: &Path, totals: &CollectedCopyUmiMetri
     Ok(())
 }
 
-/// Emit the overwrite warning (when any) and the `=== Summary ===` block. Shared
-/// by the serial oracle and the chain's summary finalize hook so the log content
-/// is byte-identical across the two paths.
+/// Emit the overwrite warning (when any) and the `=== Summary ===` block.
+/// Called by the chain's summary finalize hook.
 pub(crate) fn warn_and_log_copy_umi_summary(totals: &CollectedCopyUmiMetrics) {
     if totals.rx_overwritten > 0 {
         warn!("overwrote a pre-existing RX tag on {} record(s)", totals.rx_overwritten);
@@ -402,8 +398,8 @@ impl CopyUmiOptions {
 impl Command for CopyUmi {
     fn execute(&self, command_line: &str) -> Result<()> {
         self.io.validate()?;
-        // Fail fast on a non-ASCII delimiter before any reader opens; each path
-        // (serial oracle / chain) re-derives the validated byte itself.
+        // Fail fast on a non-ASCII delimiter before any reader opens; the chain's
+        // own `CopyUmiOptions::process_captures` re-derives the validated byte too.
         validate_field_delimiter(self.field_delimiter)?;
 
         // Reject two writers to one destination, and a write target aliasing input.
@@ -414,148 +410,16 @@ impl Command for CopyUmi {
         reject_output_collisions(&outputs)?;
         self.reject_write_aliasing_input()?;
 
-        if self.threading.threads.is_some() {
-            return self.execute_chain(command_line);
-        }
-
-        // No-`--threads` serial path: the in-process parity oracle.
-        let timer = OperationTimer::new("Copying UMIs from read names");
-        info!("Starting copy-umi");
-        info!("Input: {}", self.io.input.display());
-        info!("Output: {}", self.io.output.display());
-
-        // Without this, a scheduler/pipeline flag set here (e.g.
-        // `--deadlock-recover`) is silently ignored on the serial path with no
-        // diagnostic at all. This is NOT `common::warn_unwired_pipeline_flags`:
-        // that helper is chain-specific (its wording says "the chain engine ...",
-        // and it deliberately skips `--max-memory`/`--memory-reserve`/
-        // `--memory-per-thread` because the chain DOES honor them) — on this
-        // serial path there is no chain engine at all, so those queue-memory
-        // flags are inert here too and must be warned, with wording that is true
-        // for the single-threaded context.
-        self.warn_unwired_flags_on_serial_path();
-
-        let totals = self.run_single_threaded(command_line)?;
-        warn_and_log_copy_umi_summary(&totals);
-        if let Some(path) = &self.metrics {
-            write_copy_umi_metrics(path, &totals)?;
-        }
-        timer.log_completion(totals.total_records);
-        Ok(())
+        self.execute_chain(command_line)
     }
 }
 
 impl CopyUmi {
-    /// Warn about scheduler/pipeline-queue flags that have no effect on THIS
-    /// serial (no-`--threads`) path.
-    ///
-    /// Deliberately NOT `common::warn_unwired_pipeline_flags`: that helper is
-    /// chain-specific -- its wording ("the chain engine ...", "the typed-step
-    /// pipeline") describes a running chain, and it deliberately skips
-    /// `--max-memory`/`--memory-reserve`/`--memory-per-thread` because the chain
-    /// DOES honor them (they seed `PipelineConfig::queue_memory_total`). On this
-    /// serial path there is no chain and no queue to budget, so reusing that
-    /// helper would both assert a false rationale and fail to warn about the
-    /// queue-memory flags, which are genuinely inert here. Each flag is warned
-    /// only when set away from its default, mirroring how the chain-path helper
-    /// gates its own warnings.
-    fn warn_unwired_flags_on_serial_path(&self) {
-        let requested_scheduler = self.scheduler_opts.strategy();
-        if requested_scheduler != crate::unified_pipeline::scheduler::SchedulerStrategy::default() {
-            warn!(
-                "--scheduler has no effect on the single-threaded path: the serial \
-                 read -> copy-umi -> write loop does not use a pluggable scheduler \
-                 strategy, so the requested strategy ({requested_scheduler:?}) is \
-                 ignored (run with --threads to use the pipeline)"
-            );
-        }
-        if self.scheduler_opts.deadlock_recover_enabled() {
-            warn!(
-                "--deadlock-recover has no effect on the single-threaded path: there \
-                 is no pipeline to deadlock-detect or recover on, only a serial \
-                 read -> copy-umi -> write loop (run with --threads to use the \
-                 pipeline)"
-            );
-        }
-        let default_queue_memory = QueueMemoryOptions::default();
-        if self.queue_memory.max_memory != default_queue_memory.max_memory
-            || self.queue_memory.memory_reserve != default_queue_memory.memory_reserve
-            || self.queue_memory.memory_per_thread != default_queue_memory.memory_per_thread
-        {
-            warn!(
-                "--max-memory/--memory-reserve/--memory-per-thread have no effect on \
-                 the single-threaded path: there are no pipeline queues to budget on \
-                 a serial read -> copy-umi -> write loop (run with --threads to use \
-                 the pipeline)"
-            );
-        }
-    }
-
-    /// Serial no-`--threads` path: a read → copy-umi → write loop, and the
-    /// in-process parity oracle for the chain path. Uses `pipeline_reader_opts()`
-    /// so the CRC-check policy matches the chain, and `ensure_hd_record` +
-    /// `add_pg_record` so the header matches. A bad/empty UMI (or an existing RX
-    /// under `--fail-if-tag-present`) aborts the run via `?`, naming the read name.
-    ///
-    /// Parity: chain and oracle produce identical output on well-formed BAM, and
-    /// BOTH reject a framing-consistent-but-malformed record (`l_read_name` past
-    /// the record end) with a clean `InvalidData` error. This serial loop
-    /// validates each record via `validate_record_for_decode` before touching
-    /// read-name bytes, exactly as the chain path does through `DecodeRecords` —
-    /// without that guard the loop would panic in `read_name` on such a record,
-    /// a regression from the pre-cutover pipeline, which decoded and thus
-    /// validated.
-    fn run_single_threaded(&self, command_line: &str) -> Result<CollectedCopyUmiMetrics> {
-        let field_delimiter = validate_field_delimiter(self.field_delimiter)?;
-        let (mut reader, header) =
-            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
-        let header = ensure_hd_record(header)?;
-        let header = add_pg_record(header, command_line)?;
-        let mut writer =
-            create_raw_bam_writer(&self.io.output, &header, 1, self.compression.compression_level)?;
-
-        let mut totals = CollectedCopyUmiMetrics::default();
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
-        let mut record = RawRecord::new();
-        while reader.read_record(&mut record)? != 0 {
-            // Validate record framing (record length + l_read_name bound) before
-            // touching read-name bytes, exactly as the `--threads` chain path does
-            // via `DecodeRecords`. Without this, a framing-consistent-but-malformed
-            // record (l_read_name past the record end) would panic here in
-            // `read_name` instead of failing with a clean error — a regression from
-            // the pre-cutover pipeline, which validated. Both paths now reject a
-            // malformed record with the same InvalidData error.
-            crate::pipeline::steps::parse::decode::validate_record_for_decode(record.as_ref())?;
-            let outcome = copy_umi_into_record(
-                &mut record,
-                field_delimiter,
-                self.reverse_complement_r_umis,
-                self.remove_umi,
-                self.fail_if_tag_present,
-            )?;
-            totals.total_records += 1;
-            if outcome.overwrote_rx {
-                totals.rx_overwritten += 1;
-            }
-            if outcome.trimmed_name {
-                totals.names_trimmed += 1;
-            }
-            writer.write_raw_record(record.as_ref())?;
-            progress.log_if_needed(1);
-        }
-        progress.log_final();
-        // Flush before returning so any write error surfaces here, not on drop.
-        writer.finish()?;
-        Ok(totals)
-    }
-
-    /// Run the copy-umi stage on the declarative chain builder (the `--threads N`
-    /// path). The no-`--threads` `CopyUmi::run_single_threaded` loop is the
-    /// in-process parity oracle. `add_copy_umi` re-emits the timer/banner/threading
-    /// logs and opens its own source, so — like dedup/group — this method only
-    /// builds and runs the chain. Copy-umi's `execute()` never emitted
-    /// `log_effective_check_crc`, so this does NOT call it either (adding it would
-    /// make the `--threads` path log a line the serial path never does).
+    /// Run the copy-umi stage on the declarative chain builder. `add_copy_umi`
+    /// re-emits the timer/banner/threading logs and opens its own source, so —
+    /// like dedup/group — this method only builds and runs the chain. Copy-umi's
+    /// `execute()` never emitted `log_effective_check_crc`, and neither does
+    /// `add_copy_umi`.
     fn execute_chain(&self, command_line: &str) -> Result<()> {
         use crate::pipeline::chains::{
             ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
