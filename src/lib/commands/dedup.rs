@@ -19,43 +19,33 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
-use crate::grouper::{RawPositionGroup, RecordPositionGrouper, build_templates_from_records};
-use crate::logging::OperationTimer;
+use crate::grouper::{RawPositionGroup, build_templates_from_records};
 use crate::metrics::group::FamilySizeMetrics;
 use crate::metrics::{DeduplicationCounts, DeduplicationMetrics, DuplicationLadderMetrics};
 use crate::metrics::{TemplateFilterCounts, TemplateFilterReason};
 use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
-use crate::sam::is_template_coordinate_sorted;
 use crate::template::Template;
 use crate::template_filter::{
     TemplateFilterConfig, filter_template, template_has_malformed_record,
     template_is_fully_unmapped,
 };
-use crate::unified_pipeline::{
-    BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate,
-    run_bam_pipeline_from_reader_with_mi_assign,
-};
+use crate::unified_pipeline::{BatchWeight, MemoryEstimate};
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use fgumi_bam_io::create_bam_reader_for_pipeline_with_opts;
 use fgumi_umi::IndexThreshold;
 
 use log::info;
 use noodles::sam::Header;
-use noodles::sam::alignment::record::data::field::Tag;
-use parking_lot::Mutex;
 
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config, is_r1_genomically_earlier_raw,
+    is_r1_genomically_earlier_raw,
 };
 use crate::sam::TC_TAG;
 use fgumi_raw_bam;
@@ -250,11 +240,8 @@ pub(crate) fn resolve_sample(header: &Header, override_sample: Option<&str>) -> 
 
 /// Metrics collected per position group, aggregated after pipeline completion.
 ///
-/// The single aggregator shape for both dedup paths: `Dedup::execute` reduces
-/// one shared `Mutex`-guarded instance, and the chain's `DedupFinalizeHook`
-/// reduces per-thread slots of it (aliased as `CollectedDedupMetrics`). Keeping
-/// one type guarantees the two paths cannot emit different metric fields for the
-/// same input.
+/// The chain's `DedupFinalizeHook` reduces per-thread slots of this type
+/// (aliased as `CollectedDedupMetrics`).
 #[derive(Default, Debug)]
 pub(crate) struct CollectedDedupCounts {
     /// Dedup-specific counts, aggregated per library (keyed by
@@ -279,14 +266,14 @@ pub(crate) struct CollectedDedupCounts {
 /// A saturation curve plots "after N templates processed, in coordinate
 /// order, what cumulative fraction were duplicates" — so [`Self::record`]
 /// MUST be called in strict serial/coordinate order, one call per position
-/// group. It is wired into the `mi_assign_fn` hook installed on the pipeline
-/// (`run_bam_pipeline_from_reader_with_mi_assign`), which the pipeline
-/// harness runs in serial order by the MI Assign zone before each item's
-/// `serialize_fn`. `dedup` installs this hook unconditionally — not gated on
+/// group. It is wired into the chain's `MiAssignDedup` step (see
+/// `pipeline::chains::commands::dedup::build_mi_assign_step`), which the
+/// pipeline runs in serial order by the MI Assign zone before each item's
+/// serialize step. `dedup` installs this hook unconditionally — not gated on
 /// `--no-umi`, strategy, or any other flag — so it runs for every position
 /// group in every mode, making it the correct accumulation point. Do NOT
-/// accumulate this in `serialize_fn`: that closure also runs once per group,
-/// but workers execute it in parallel completion order, not coordinate order.
+/// accumulate this in the serialize step: that also runs once per group, but
+/// workers execute it in parallel completion order, not coordinate order.
 #[derive(Default)]
 pub(crate) struct DuplicationLadderRecorder {
     /// Snapshot interval in cumulative templates (`--ladder-interval`).
@@ -1302,6 +1289,9 @@ pub struct MarkDuplicates {
 }
 
 impl Command for MarkDuplicates {
+    /// Execute the tool. After reader-free pre-flight validation, this always
+    /// dispatches to `execute_chain` — the declarative chain builder is the
+    /// only execution path.
     fn execute(&self, command_line: &str) -> Result<()> {
         // Reject two outputs resolving to one destination before any writer opens.
         let mut outputs: Vec<(&std::path::Path, &str)> =
@@ -1327,22 +1317,11 @@ impl Command for MarkDuplicates {
             bail!("--no-umi cannot be used with --strategy paired");
         }
 
-        // Handle --no-umi mode: force identity strategy. The effective-strategy
-        // computation itself must run on both paths (validate_index_threshold
-        // below consumes it), but the override log is gated to the non-chain
-        // path: the --threads chain re-emits it via add_dedup, so logging here
-        // too would double-log.
-        let (effective_strategy, no_umi_edits_override) = if self.no_umi {
-            if !matches!(self.strategy, Strategy::Identity) && self.threading.threads.is_none() {
-                info!("--no-umi mode: overriding strategy to identity");
-            }
-            (Strategy::Identity, true)
-        } else {
-            (self.strategy, false)
-        };
-
-        // Identity strategy requires edits=0, others use the configured value
-        // Also force edits=0 in no-umi mode
+        // Resolve the effective strategy/edits (identity forces edits=0; `--no-umi`
+        // forces identity) purely to validate `--index-threshold` below. The
+        // override notice itself is logged once, by `add_dedup`.
+        let (effective_strategy, no_umi_edits_override) =
+            if self.no_umi { (Strategy::Identity, true) } else { (self.strategy, false) };
         let effective_edits =
             if no_umi_edits_override || matches!(effective_strategy, Strategy::Identity) {
                 0
@@ -1361,361 +1340,37 @@ impl Command for MarkDuplicates {
         // Validate the input exists (stdin paths are exempt).
         self.io.validate()?;
 
-        // --threads N: run the dedup stage on the declarative chain builder.
-        // Dispatch here — after the reader-free pre-flight validations above
-        // (output collisions, strategy/min-umi combos, index-threshold,
-        // input existence), which must run for both paths — but BEFORE the
-        // timer/banner/reader below. `execute_chain` → `add_dedup` re-emits the
-        // timer, banner, and threading log lines and opens its own source, so
-        // running them here too would double-log and pre-consume stdin
-        // (breaking stdin + --threads). The no-`--threads` path keeps the
-        // hand-rolled unified pipeline below.
-        if self.threading.threads.is_some() {
-            return self.execute_chain(command_line);
-        }
-
-        let min_mapq: u8 = self.min_map_q.unwrap_or(0);
-
-        let timer = OperationTimer::new("Marking duplicates");
-
-        info!("Starting dedup");
-        info!("Input: {}", self.io.input.display());
-        info!("Output: {}", self.io.output.display());
-        info!("Strategy: {effective_strategy:?}");
-        info!("Edits: {effective_edits}");
-        info!("Remove duplicates: {}", self.remove_duplicates);
-        if self.no_umi {
-            info!("No-UMI mode: deduplicating by position only");
-        }
-        crate::commands::common::log_index_threshold(
-            effective_strategy,
-            effective_edits,
-            self.index_threshold,
-        );
-        info!("{}", self.threading.log_message());
-        self.io.log_effective_check_crc();
-
-        // Open input BAM
-        let reader_opts = self.io.pipeline_reader_opts();
-        let (reader, header) =
-            create_bam_reader_for_pipeline_with_opts(&self.io.input, reader_opts)?;
-
-        if !is_template_coordinate_sorted(&header) {
-            bail!(
-                "Input BAM must be template-coordinate sorted (header must advertise \
-                 SO:unsorted, GO:query, and SS:template-coordinate).\n\n\
-                 To prepare your BAM file, run:\n  \
-                 fgumi zipper -i mapped.bam -u unmapped.bam -r reference.fa -o merged.bam\n  \
-                 fgumi sort -i merged.bam -o sorted.bam --order template-coordinate"
-            );
-        }
-        info!("Template-coordinate sorted");
-
-        // Add @PG record
-        let header = crate::commands::common::add_pg_record(header, command_line)?;
-
-        // Tag constants per SAM specification
-        let raw_tag = SamTag::RX;
-        let cell_tag = Tag::from(SamTag::CB);
-        let assign_tag_bytes: [u8; 2] = *SamTag::MI;
-
-        let filter_config = TemplateFilterConfig {
-            umi_tag: *raw_tag,
-            min_mapq,
-            include_non_pf: self.include_non_pf_reads,
-            min_umi_length: self.min_umi_length,
-            no_umi: self.no_umi,
-            // Always false: --include-unmapped splits no-mapped-read templates off
-            // *before* the filter runs (see `template_is_unmapped_passthrough`), so
-            // an unmapped template reaching the filter is always a rejection.
-            allow_unmapped: false,
-        };
-
-        // Shared state for collecting metrics
-        let collected_metrics: Arc<Mutex<CollectedDedupCounts>> =
-            Arc::new(Mutex::new(CollectedDedupCounts::default()));
-
-        // Clone values needed by closures
-        let strategy = effective_strategy;
-        let index_threshold = self.index_threshold;
-        let min_umi_length = self.min_umi_length;
-        let no_umi = self.no_umi;
-        let include_unmapped = self.include_unmapped;
-        let remove_duplicates = self.remove_duplicates;
-        let collected_metrics_clone = Arc::clone(&collected_metrics);
-
-        // Configure pipeline
-        let num_threads = self.threading.num_threads();
-        let mut pipeline_config = build_pipeline_config(
-            &self.scheduler_opts,
-            &self.compression,
-            &self.queue_memory,
-            &self.io,
-            num_threads,
-        )?;
-        info!("Scheduler: {:?}", self.scheduler_opts.strategy());
-        info!("Using pipeline with {num_threads} threads");
-
-        let library_index = LibraryIndex::from_header(&header);
-        // `GroupKeyConfig::new` takes `library_index` by value; keep a clone so
-        // the metrics writer can still map `library_idx -> name` after the
-        // pipeline consumes the original.
-        let library_index_for_metrics = library_index.clone();
-        // Resolve the metrics `sample` value now, while `header` is still
-        // available — the pipeline consumes `header` by value below.
-        let sample_for_metrics = resolve_sample(&header, self.sample.as_deref());
-        // Cache the UMI tag's value position on each DecodedRecord so the
-        // Process step's UMI-assignment pass can slice the value without
-        // re-scanning aux data (issue #334). In `--no-umi` mode the
-        // assignment site emits `String::new()` and never reads the cache,
-        // so populating it during decode would be pure overhead.
-        let group_key_config = GroupKeyConfig::new(library_index, cell_tag);
-        pipeline_config.group_key_config = Some(if self.no_umi {
-            group_key_config
-        } else {
-            group_key_config.with_umi_tag(*raw_tag)
-        });
-
-        // Cumulative MoleculeId counter, advanced **only** by the
-        // serial-ordered MI Assign hook installed below. Mirrors the
-        // pattern used by `fgumi group`; see
-        // `docs/design/deterministic-mi-numbering.md` for why this lives
-        // in the hook rather than in `serialize_fn`. The `Arc` is owned
-        // by the hook closure; nothing outside the closure needs to read
-        // its final value.
-        let next_mi_base_for_hook = Arc::new(AtomicU64::new(0));
-
-        // Duplication saturation ladder recorder (--duplication-ladder). `None`
-        // when the flag is off, so the hook below does zero added work
-        // (a single `Option` check, no lock, no allocation) — see the ordering
-        // note on `DuplicationLadderRecorder` for why this must be populated
-        // from the serial MI Assign hook rather than `serialize_fn`.
-        let duplication_ladder_recorder: Option<Arc<Mutex<DuplicationLadderRecorder>>> = self
-            .duplication_ladder
-            .as_ref()
-            .map(|_| Arc::new(Mutex::new(DuplicationLadderRecorder::new(self.ladder_interval))));
-        let duplication_ladder_recorder_for_hook = duplication_ladder_recorder.clone();
-
-        // Run the pipeline
-        let _records_processed = run_bam_pipeline_from_reader_with_mi_assign(
-            pipeline_config,
-            reader,
-            header,
-            &self.io.output,
-            None,
-            // Grouper factory - use with_secondary_supplementary to include all reads
-            move |_header: &Header| {
-                Box::new(RecordPositionGrouper::with_secondary_supplementary())
-                    as Box<dyn Grouper<Group = RawPositionGroup> + Send>
-            },
-            // Process function (parallel) — builds templates from raw records
-            move |group: RawPositionGroup| -> io::Result<ProcessedDedupGroup> {
-                let assigner = strategy.new_assigner_full(effective_edits, 1, index_threshold);
-                process_position_group(
-                    group,
-                    &filter_config,
-                    assigner.as_ref(),
-                    raw_tag,
-                    min_umi_length,
-                    no_umi,
-                    include_unmapped,
-                )
-            },
-            // Serialize function (parallel, output ordered by serial numbers)
-            move |processed: ProcessedDedupGroup,
-                  _header: &Header,
-                  output: &mut Vec<u8>|
-                  -> io::Result<u64> {
-                // Collect metrics
-                {
-                    let mut agg = collected_metrics_clone.lock();
-                    agg.dedup_counts_by_library
-                        .entry(processed.library_idx)
-                        .or_default()
-                        .merge(&processed.dedup_counts);
-                    for (size, count) in &processed.family_sizes {
-                        *agg.family_sizes.entry(*size).or_insert(0) += count;
-                    }
-                }
-
-                let input_record_count = processed.input_record_count;
-
-                // Templates already carry their final global `MoleculeId`s
-                // because the MI Assign hook (installed below) ran in
-                // serial order before this closure was called, so we pass
-                // `base_mi = 0` to `write_with_offset`.
-                // Pre-allocate output buffer: ~2 records/template × ~400 bytes/record
-                output.reserve(processed.templates.len() * 2 * 400);
-                let mut scratch = Vec::with_capacity(512);
-                let mut mi_buf = String::with_capacity(16);
-                for template in &processed.templates {
-                    let mi = template.mi;
-                    let has_mi = mi.is_assigned();
-                    if has_mi {
-                        mi.write_with_offset(0, &mut mi_buf);
-                    }
-                    for raw in template.records() {
-                        // Skip duplicates if remove mode
-                        if remove_duplicates
-                            && (RawRecordView::new(raw).flags() & DUPLICATE_FLAG) != 0
-                        {
-                            continue;
-                        }
-                        if has_mi {
-                            scratch.clear();
-                            scratch.extend_from_slice(raw);
-                            fgumi_raw_bam::update_string_tag(
-                                &mut scratch,
-                                assign_tag_bytes,
-                                mi_buf.as_bytes(),
-                            );
-                            let block_size = scratch.len() as u32;
-                            output.extend_from_slice(&block_size.to_le_bytes());
-                            output.extend_from_slice(&scratch);
-                        } else {
-                            let block_size = raw.len() as u32;
-                            output.extend_from_slice(&block_size.to_le_bytes());
-                            output.extend_from_slice(raw);
-                        }
-                    }
-                }
-
-                Ok(input_record_count)
-            },
-            // mi_assign_fn: called in serial order by the MI Assign zone
-            // before each item's `serialize_fn`. Folds a cumulative offset
-            // into every template's local `MoleculeId`. Advances the counter
-            // by `distinct_mi_count` so the offset matches what `serialize_fn`
-            // emits even when families contain multiple templates.
-            //
-            // `fetch_update` + `checked_add` so wraparound is detected and surfaced
-            // rather than silently reusing MI integers (which would defeat
-            // `MoleculeId::with_offset`'s own overflow check on the per-template add).
-            move |_ord, processed: &mut ProcessedDedupGroup| {
-                let base = next_mi_base_for_hook
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                        current.checked_add(processed.distinct_mi_count)
-                    })
-                    .map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "MoleculeId offset overflow: cumulative MI counter exceeded u64::MAX",
-                        )
-                    })?;
-                for template in &mut processed.templates {
-                    template.mi = template.mi.with_offset(base);
-                }
-
-                // Accumulate the duplication saturation ladder here, in this
-                // same serial/coordinate-order hook — not in `serialize_fn`,
-                // which runs in parallel completion order. See the ordering
-                // note on `DuplicationLadderRecorder`. `dedup_counts` belongs
-                // entirely to `processed.library_idx` (a position group is
-                // always single-library).
-                if let Some(recorder) = &duplication_ladder_recorder_for_hook {
-                    recorder.lock().record(processed.library_idx, &processed.dedup_counts);
-                }
-
-                Ok(())
-            },
-        )?;
-
-        // Aggregate metrics
-        let aggregated = Arc::try_unwrap(collected_metrics)
-            .expect("bug: metrics Arc still shared after pipeline join")
-            .into_inner();
-        let final_counts_by_library = aggregated.dedup_counts_by_library;
-        let final_family_sizes = aggregated.family_sizes;
-
-        // Total across all libraries: used both for the summary log / `tc`-tag
-        // check below and as the metrics file's aggregate "All Reads" row.
-        let mut final_counts = DedupCounts::default();
-        for library_counts in final_counts_by_library.values() {
-            final_counts.merge(library_counts);
-        }
-
-        // Write metrics file
-        if let Some(metrics_path) = &self.metrics {
-            write_dedup_metrics(
-                &final_counts_by_library,
-                &final_counts,
-                &library_index_for_metrics,
-                &sample_for_metrics,
-                metrics_path,
-            )?;
-        }
-
-        // Write family size histogram
-        if let Some(histogram_path) = &self.family_size_histogram {
-            write_family_size_histogram(&final_family_sizes, histogram_path)?;
-        }
-
-        // Write duplication saturation ladder
-        if let Some(path) = &self.duplication_ladder {
-            let mut recorder = Arc::try_unwrap(duplication_ladder_recorder.expect(
-                "bug: duplication_ladder_recorder must be Some when --duplication-ladder is set",
-            ))
-            .unwrap_or_else(|_| {
-                panic!("bug: duplication ladder recorder Arc still shared after pipeline join")
-            })
-            .into_inner();
-            recorder.finish();
-            write_duplication_ladder(&recorder, &library_index_for_metrics, path)?;
-        }
-
-        // Log summary
-        info!(
-            "Deduplication complete: {} templates ({} unique, {} duplicates, {:.2}% duplicate rate)",
-            final_counts.total_templates,
-            final_counts.unique_templates,
-            final_counts.duplicate_templates,
-            final_counts.duplicate_rate() * 100.0
-        );
-
-        if final_counts.missing_tc_tag > 0 {
-            bail!(
-                "{} secondary/supplementary reads are missing the `tc` tag.\n\n\
-                The `tc` tag is required for correct UMI-aware deduplication of \
-                secondary and supplementary alignments. This tag is added by \
-                `fgumi zipper` during the merge of unmapped and mapped BAMs.\n\n\
-                To fix this, re-run your pipeline starting from `fgumi zipper`:\n  \
-                fgumi zipper -i aligned.bam --unmapped unmapped.bam -r reference.fa -o merged.bam\n  \
-                fgumi sort -i merged.bam -o sorted.bam --order template-coordinate\n  \
-                fgumi dedup -i sorted.bam -o deduped.bam",
-                final_counts.missing_tc_tag
-            );
-        }
-
-        log_filtered_templates(&final_counts.filter_counts);
-
-        timer.log_completion(final_counts.total_reads);
-
-        Ok(())
+        // Run the dedup stage on the declarative chain builder — the only
+        // execution path. Dispatch after the reader-free pre-flight validations
+        // above (output collisions, strategy/min-umi combos, index-threshold,
+        // input existence); `execute_chain` opens its own source and re-emits
+        // the timer, banner (Starting/Input/Output/Strategy/Edits/etc.), and
+        // threading log lines via `add_dedup`. One line the retired
+        // `unified_pipeline` path logged and `add_dedup` does not is
+        // `Scheduler: <strategy>` — the chain has no equivalent per-pipeline
+        // scheduler-strategy diagnostic; this is a pre-existing chain gap
+        // (already true of every other `--threads N` dedup run before this
+        // change), not something this cutover newly drops.
+        self.execute_chain(command_line)
     }
 }
 
 impl MarkDuplicates {
-    /// Run the dedup stage on the declarative chain builder (the `--threads N`
-    /// path).
+    /// Run the dedup stage on the declarative chain builder — the only
+    /// execution path for `dedup`.
     ///
-    /// Replaces the hand-rolled unified-pipeline construction in `execute` for
-    /// the threaded case. The chain opens its own source, validates the
-    /// template-coordinate sort order, injects `@PG`, assigns `MoleculeId`s
-    /// deterministically, writes the output BAM, and writes the metrics /
-    /// family-size histogram / duplication ladder via its finalize hook — all
-    /// through the same shared helpers as the non-chain path, so the two
-    /// orchestrations stay in parity. The no-`--threads` path keeps its own
-    /// unified pipeline in `execute`, which is the in-process parity oracle for
-    /// this one (see `test_dedup_chain_matches_single_threaded`).
+    /// The chain opens its own source, validates the template-coordinate sort
+    /// order, injects `@PG`, assigns `MoleculeId`s deterministically, writes
+    /// the output BAM, and writes the metrics / family-size histogram /
+    /// duplication ladder via its finalize hook.
     fn execute_chain(&self, command_line: &str) -> Result<()> {
         use crate::pipeline::chains::{
             ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
         };
 
         // `add_dedup` re-emits the timer/banner/threading log lines but not the
-        // CRC-verify status; emit it here so the --threads path reports it once,
-        // matching the non-chain path. (dedup has no memory-debug knobs, so
-        // unlike group there is no warn block to add here.)
+        // CRC-verify status; emit it here so it is reported once. (dedup has no
+        // memory-debug knobs, so unlike group there is no warn block to add here.)
         self.io.log_effective_check_crc();
 
         let stage_opts = StageOptionsBag { dedup: Some(self.clone()), ..Default::default() };
@@ -1805,12 +1460,8 @@ pub(crate) fn write_family_size_histogram(
     Ok(())
 }
 
-/// Writes the `--duplication-ladder` TSV: one row per (library, snapshot),
-/// sorted deterministically by library name then ascending `templates_seen`.
 /// Log the "Filtered out N templates before marking" diagnostic, if any were
-/// rejected. Called by both the non-chain `execute` tail and the chain's
-/// `DedupFinalizeHook` so `--threads` and no-`--threads` report filtered
-/// templates identically.
+/// rejected. Called by the chain's `DedupFinalizeHook`.
 ///
 /// `--metrics` is optional, so this must not be the only channel reporting
 /// dropped templates: a run that filters everything otherwise logs a bare
@@ -1830,6 +1481,8 @@ pub(crate) fn log_filtered_templates(filter_counts: &TemplateFilterCounts) {
     }
 }
 
+/// Writes the `--duplication-ladder` TSV: one row per (library, snapshot),
+/// sorted deterministically by library name then ascending `templates_seen`.
 pub(crate) fn write_duplication_ladder(
     recorder: &DuplicationLadderRecorder,
     library_index: &LibraryIndex,
@@ -1860,11 +1513,8 @@ pub(crate) fn write_duplication_ladder(
 // Tests
 //////////////////////////////////////////////////////////////////////////////
 
-/// Metrics collected per position group, aggregated after pipeline completion.
-///
-/// The chain finalize hook's aggregator is the same shape as the non-chain
-/// path's; alias the two so a metric field added to one is shared by both (they
-/// differ only in the reduction site — per-thread slots vs one shared `Mutex`).
+/// Alias for [`CollectedDedupCounts`] under the name the chain finalize hook
+/// (`DedupFinalizeHook`) uses for its per-thread accumulator slots.
 pub(crate) use self::CollectedDedupCounts as CollectedDedupMetrics;
 
 /// A batch of `ProcessedDedupGroup`s carrying a monotonic ordinal so the

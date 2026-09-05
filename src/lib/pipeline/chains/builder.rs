@@ -3046,10 +3046,12 @@ impl<'a> ChainBuilder<'a> {
         info!("{}", self.spec.threading.log_message());
         info!("Using pipeline with {num_threads} threads");
 
-        // Record-ordering precondition + info/warn logging, shared verbatim
-        // with `Group::execute` (see `require_group_input_ordering`) so the two
-        // orchestrations of the group stage cannot drift on accepted orders,
-        // error text, or logging.
+        // Record-ordering precondition + info/warn logging
+        // (`require_group_input_ordering`). `group`'s legacy non-chain call
+        // site was retired in the C4 cutover, so the chain is now the only
+        // path that reaches this helper — kept as its own function (rather
+        // than inlined here) so a future second caller cannot drift on
+        // accepted orders, error text, or logging.
         crate::commands::common::require_group_input_ordering(&self.header, group.allow_unmapped)?;
 
         // Tag constants per SAM specification.
@@ -4397,9 +4399,9 @@ impl<'a> ChainBuilder<'a> {
         // silently scatters mates and corrupts the both-primaries-pass logic.
         // Reject it here exactly as `Filter::execute`'s legacy path does, so
         // the two orchestrations of the filter stage cannot drift on accepted
-        // orders, error text, or logging (mirrors `add_group`'s
-        // `require_group_input_ordering` call, shared verbatim with
-        // `Group::execute`).
+        // orders, error text, or logging (mirrors `add_group`'s own
+        // `require_group_input_ordering` call, kept as its own function for
+        // the same reason).
         crate::commands::common::require_query_grouped(
             &self.header,
             &input_path.display().to_string(),
@@ -4735,9 +4737,12 @@ impl<'a> ChainBuilder<'a> {
 
         let timer = OperationTimer::new("Marking duplicates");
 
+        // Resolve source path for log messages only (mirrors `add_group`).
+        let input_path = self.resolve_log_input_path();
         let output_path = self.spec.sink.path().clone();
 
         info!("Starting dedup");
+        info!("Input: {}", input_path.display());
         info!("Output: {}", output_path.display());
 
         // Handle --no-umi mode: force identity strategy.

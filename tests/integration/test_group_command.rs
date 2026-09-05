@@ -16,8 +16,7 @@ use tempfile::TempDir;
 
 use crate::helpers::assertions::assert_bam_sorted;
 use crate::helpers::bam_generator::{
-    create_minimal_header, create_query_grouped_header, create_umi_family,
-    create_umi_family_at_pos, to_record_buf,
+    create_minimal_header, create_umi_family, create_umi_family_at_pos, to_record_buf,
 };
 use crate::helpers::cli::run_and_capture_logs;
 use fgumi_lib::sam::SamTag;
@@ -205,7 +204,7 @@ fn create_test_bam_with_n_umis(path: &PathBuf) {
 }
 
 // ============================================================================
-// --check-crc / --no-check-crc on the single-threaded fast path (#800)
+// --check-crc / --no-check-crc on the default (no `--threads`) chain path (#800)
 // ============================================================================
 
 /// Flip a byte in the last BGZF block's CRC32 footer, so decoding that block
@@ -247,8 +246,8 @@ fn create_multiblock_group_bam(path: &PathBuf) {
     writer.try_finish().expect("Failed to finish BAM");
 }
 
-/// Build group's argv for the single-threaded fast path (no `--threads`),
-/// appending any extra flags (e.g. `--no-check-crc`).
+/// Build group's argv for the default (no `--threads`) invocation, appending
+/// any extra flags (e.g. `--no-check-crc`).
 fn group_args<'a>(input: &'a str, output: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
     let mut args = vec![
         "group",
@@ -267,9 +266,10 @@ fn group_args<'a>(input: &'a str, output: &'a str, extra: &[&'a str]) -> Vec<&'a
     args
 }
 
-/// `--no-check-crc` must let group's single-threaded reader accept a corrupted
-/// BGZF CRC32: it decodes through fgumi-bgzf, honoring the flag (#800). Against
-/// the noodles reader this path used before, this could not pass.
+/// `--no-check-crc` must let `group`'s default (no `--threads`) reader accept a
+/// corrupted BGZF CRC32: it decodes through fgumi-bgzf, honoring the flag
+/// (#800). Against the noodles reader this path used before, this could not
+/// pass.
 #[test]
 fn test_group_no_check_crc_accepts_corrupted_crc() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -337,11 +337,8 @@ fn test_group_check_crc_rejects_corrupted_crc() {
 }
 
 // ============================================================================
-// Chain-backed `--threads N` path: parity with the single-threaded fast path
-// (the `group` pilot rewire). The `--threads` path now runs on the declarative
-// chain builder; these tests pin the behaviors the single-threaded oracle
-// cannot see: the chain's CRC policy and its record-ordering acceptance, plus
-// cross-mode output parity.
+// Chain-backed `group` path (the only execution path since the C4 cutover):
+// CRC policy, record-ordering acceptance, and worker-count determinism.
 // ============================================================================
 
 /// Read the complete `RecordBuf` for every output record, in output order,
@@ -391,12 +388,12 @@ fn run_group_records(
     read_group_records(&output)
 }
 
-/// The chain-backed `--threads N` path must honor the same CRC-verification
-/// policy as the single-threaded fast path — the plumbing that threads
-/// `effective_check_crc()` into the chain's BGZF decode. Before that plumbing
-/// the chain hardcoded verify-on, so `--no-check-crc --threads N` would have
-/// wrongly rejected a corrupted-CRC file. The single-threaded CRC tests above
-/// cannot see this path.
+/// `group --threads N` must honor `--no-check-crc`/`--check-crc` — the
+/// plumbing that threads `effective_check_crc()` into the chain's BGZF
+/// decode. Before that plumbing the chain hardcoded verify-on, so
+/// `--no-check-crc --threads N` would have wrongly rejected a corrupted-CRC
+/// file. The default-mode CRC tests above run through the same chain but
+/// don't exercise `--threads`, so they cannot see this path.
 #[rstest]
 #[case::no_check_crc_accepts(&["--no-check-crc"], true)]
 #[case::default_rejects(&[], false)]
@@ -441,34 +438,11 @@ fn test_group_threaded_crc_policy(#[case] extra: &[&str], #[case] expect_ok: boo
     }
 }
 
-/// The chain-backed `--threads 1` output must match the single-threaded fast
-/// path record-for-record on a normal template-coordinate input. This is the
-/// cross-mode parity oracle the within-mode determinism tests cannot provide.
-#[test]
-fn test_group_chain_matches_single_threaded() {
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let input_bam = temp_dir.path().join("input.bam");
-    create_test_input_bam(&input_bam);
-
-    let single = run_group_records(temp_dir.path(), "single", &input_bam, &[]);
-    let chained = run_group_records(temp_dir.path(), "chained", &input_bam, &["--threads", "1"]);
-
-    assert!(
-        !single.is_empty(),
-        "sanity: expected grouped records so the parity check is not vacuous"
-    );
-    assert_eq!(
-        single, chained,
-        "chain (--threads 1) output must match the single-threaded fast path record-for-record",
-    );
-}
-
 /// Sibling of `dedup`'s `test_dedup_chain_index_threshold_banner_is_strategy_aware`:
-/// `group`'s non-chain path also reports the `Index threshold:` startup banner
-/// via the shared strategy/edits-aware `common::log_index_threshold` (see
-/// `group.rs`'s `execute`), so the chain path's banner must match it exactly --
-/// not the flat `Index threshold: {group.index_threshold}` (the raw
-/// `--index-threshold` value, unfloored) the chain path used to emit whenever
+/// `group`'s `Index threshold:` startup banner must be strategy/edits-aware,
+/// using the shared `common::log_index_threshold` wording exactly -- not the
+/// flat `Index threshold: {group.index_threshold}` (the raw `--index-threshold`
+/// value, unfloored) the chain path used to emit whenever
 /// `matches!(group.effective_strategy, Strategy::Adjacency | Strategy::Paired)`.
 ///
 /// `old_flat_regression_line` is `Some(line)` only when the OLD `matches!`-gated
@@ -617,104 +591,39 @@ fn test_group_chain_index_threshold_banner_paired_strategy() {
     );
 }
 
-/// A query-grouped (GO:query, not template-coordinate) input under
-/// `--allow-unmapped` must be accepted by the chain and produce output
-/// identical to the single-threaded path. The chain builder previously required
-/// `SO:queryname` and would have rejected this input; sharing the classifier
-/// (`require_group_input_ordering`) fixed that.
+/// `FGUMI_SHORT_CIRCUIT` was honored by the retired single-threaded path; the
+/// chain builder — now the only execution path — cannot honor it, so `execute_chain`
+/// warns and ignores it rather than silently no-op'ing. A dedicated process is
+/// required because the trigger is an environment variable (not a CLI flag), and
+/// the run must still succeed — the flag is ignored, not an error.
 #[test]
-fn test_group_allow_unmapped_query_grouped_chain_parity() {
+fn test_group_chain_warns_and_ignores_short_circuit_env() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let input_bam = temp_dir.path().join("input.bam");
-
-    // Query-grouped (GO:query) input, not template-coordinate sorted.
-    let header = create_query_grouped_header("chr1", 10000);
-    let mut writer =
-        bam::io::Writer::new(fs::File::create(&input_bam).expect("Failed to create BAM file"));
-    writer.write_header(&header).expect("Failed to write header");
-    let family1 = create_umi_family("AAAAAAAA", 10, "family1", "ACGTACGT", 30);
-    let family2 = create_umi_family("CCCCCCCC", 5, "family2", "TGCATGCA", 30);
-    for record in family1.iter().chain(family2.iter()) {
-        writer
-            .write_alignment_record(&header, &to_record_buf(record))
-            .expect("Failed to write record");
-    }
-    writer.try_finish().expect("Failed to finish BAM");
-
-    let single = run_group_records(temp_dir.path(), "single", &input_bam, &["--allow-unmapped"]);
-    let chained = run_group_records(
-        temp_dir.path(),
-        "chained",
-        &input_bam,
-        &["--allow-unmapped", "--threads", "1"],
-    );
-
-    // This fixture/flag combo is content-pinned by no other test, so guard
-    // against a vacuous pass where both paths regressed to empty/all-dropped
-    // output: 10 + 5 input reads across two UMI families, all accepted.
-    assert_eq!(single.len(), 15, "expected all 15 query-grouped reads in the output");
-    assert_eq!(
-        single, chained,
-        "chain and single-threaded --allow-unmapped output must match on a query-grouped input",
-    );
-}
-
-/// The chain's finalize hook writes metrics via `write_metrics_for_chain`, a
-/// separate path from the single-threaded `write_all_metrics`. This pins that
-/// the two produce identical metrics files (grouping-metrics and the
-/// family-size histogram) on the same input, so the two orchestrations cannot
-/// drift on secondary output. Metrics files are deterministic TSV count tables
-/// with no embedded paths/timestamps, so a byte comparison is stable.
-#[test]
-fn test_group_metrics_files_match_across_modes() {
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
     create_test_input_bam(&input_bam);
 
-    // Run `group` for one mode, returning (grouping-metrics, family-size-histogram) contents.
-    let run = |tag: &str, extra: &[&str]| -> (String, String) {
-        let output = temp_dir.path().join(format!("{tag}.bam"));
-        let grouping = temp_dir.path().join(format!("{tag}.grouping.txt"));
-        let famsize = temp_dir.path().join(format!("{tag}.famsize.txt"));
-        let mut args: Vec<&str> = vec![
-            "--grouping-metrics",
-            grouping.to_str().unwrap(),
-            "--family-size-histogram",
-            famsize.to_str().unwrap(),
-        ];
-        args.extend_from_slice(extra);
-        let cmd = GroupReadsByUmi::try_parse_from(group_args(
-            input_bam.to_str().unwrap(),
-            output.to_str().unwrap(),
-            &args,
-        ))
-        .expect("failed to parse group args");
-        cmd.execute("fgumi group").unwrap_or_else(|e| panic!("group ({tag}) failed: {e:#}"));
-        (
-            fs::read_to_string(&grouping).expect("read grouping metrics"),
-            fs::read_to_string(&famsize).expect("read family-size histogram"),
-        )
-    };
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .env("RUST_LOG", "info")
+        .env("FGUMI_SHORT_CIRCUIT", "1")
+        .args(["group", "-i"])
+        .arg(&input_bam)
+        .arg("-o")
+        .arg(&output_bam)
+        .args(["--strategy", "adjacency", "--threads", "1"])
+        .output()
+        .expect("failed to spawn `fgumi group`");
 
-    let single = run("single", &[]);
-    let chained = run("chained", &["--threads", "1"]);
-
-    // Pin a concrete value so the equality checks below cannot pass on two empty
-    // or degenerate files: create_test_input_bam has 30 accepted records, and
-    // `accepted_sam_records` is the first grouping-metrics column.
+    let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        single.0.lines().nth(1).is_some_and(|row| row.starts_with("30\t")),
-        "grouping-metrics should report 30 accepted records; got:\n{}",
-        single.0
+        result.status.success(),
+        "FGUMI_SHORT_CIRCUIT must be ignored, not fatal; group failed:\n{stderr}"
     );
-
-    assert_eq!(
-        single.0, chained.0,
-        "grouping-metrics file must be identical across single-threaded and chain modes",
-    );
-    assert_eq!(
-        single.1, chained.1,
-        "family-size histogram must be identical across single-threaded and chain modes",
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.contains("FGUMI_SHORT_CIRCUIT is not supported by the chain builder")),
+        "expected a warning that FGUMI_SHORT_CIRCUIT is ignored on the chain path; got:\n{stderr}"
     );
 }
 
@@ -739,24 +648,24 @@ fn create_multi_batch_input_bam(path: &std::path::Path, n: usize) {
 }
 
 /// The chain's multi-worker path (`--threads N>1`) reorders across batches and
-/// accumulates per-batch `MoleculeId` offsets — machinery the `--threads 1` parity
-/// tests do not exercise. Compare `--threads 4` output record-for-record against
-/// the single-threaded oracle on an input spanning many position groups and
-/// multiple pipeline batches (> the 500-template batch size).
+/// accumulates per-batch `MoleculeId` offsets — machinery the `--threads 1`
+/// parity tests do not exercise. Compare `--threads 4` output record-for-record
+/// against the `--threads 1` oracle on an input spanning many position groups
+/// and multiple pipeline batches (> the 500-template batch size).
 #[test]
-fn test_group_chain_threads4_matches_single_threaded_multi_batch() {
+fn test_group_threads4_matches_threads1_multi_batch() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let input_bam = temp_dir.path().join("input.bam");
     create_multi_batch_input_bam(&input_bam, 600);
 
-    let single = run_group_records(temp_dir.path(), "single", &input_bam, &[]);
+    let threads1 = run_group_records(temp_dir.path(), "threads1", &input_bam, &["--threads", "1"]);
     let threads4 = run_group_records(temp_dir.path(), "threads4", &input_bam, &["--threads", "4"]);
 
     // 600 positions × 1 read → 600 output records spanning multiple batches.
-    assert_eq!(single.len(), 600, "expected 600 grouped records (one per position group)");
+    assert_eq!(threads1.len(), 600, "expected 600 grouped records (one per position group)");
     assert_eq!(
-        single, threads4,
-        "chain (--threads 4) output must match the single-threaded oracle record-for-record across batches",
+        threads1, threads4,
+        "chain (--threads 4) output must match the --threads 1 oracle record-for-record across batches",
     );
 }
 
@@ -919,10 +828,10 @@ fn assert_single_molecule_no_secondary(
     }
 }
 
-/// Regression for issue #901 across both the single-threaded fast path and the
-/// `--threads N` chain path, for single-end and paired input. A `tc`-keyed
-/// supplementary interleaved between two same-UMI reads of one molecule must not
-/// split it or appear in the output, on every path.
+/// Regression for issue #901 across both the default (no `--threads`) and
+/// `--threads N` chain invocations, for single-end and paired input. A
+/// `tc`-keyed supplementary interleaved between two same-UMI reads of one
+/// molecule must not split it or appear in the output, at any worker count.
 #[rstest]
 #[case::single_end(false)]
 #[case::paired(true)]
