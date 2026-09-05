@@ -11,50 +11,13 @@ use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::copy_umi::CopyUmi;
 use fgumi_raw_bam::{RawRecord, SamBuilder};
 use rstest::rstest;
-use std::collections::HashMap;
 use std::path::Path;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, transcode_bam_to_sam, write_bam};
-
-/// A minimal mapped record carrying the given read name (sequence/quals are fixed
-/// filler — `copy-umi` never touches them).
-fn record_named(name: &str) -> RawRecord {
-    let mut b = SamBuilder::new();
-    b.read_name(name.as_bytes())
-        .sequence(b"ACGT")
-        .qualities(&[30; 4])
-        .flags(0)
-        .ref_id(0)
-        .pos(99)
-        .mapq(60)
-        .cigar_ops(&[4 << 4]);
-    b.build()
-}
-
-/// As [`record_named`], but pre-populated with an `RX` tag to exercise the
-/// overwrite / fail-if-present policy.
-fn record_named_with_rx(name: &str, rx: &str) -> RawRecord {
-    let mut b = SamBuilder::new();
-    b.read_name(name.as_bytes())
-        .sequence(b"ACGT")
-        .qualities(&[30; 4])
-        .flags(0)
-        .ref_id(0)
-        .pos(99)
-        .mapq(60)
-        .cigar_ops(&[4 << 4])
-        .add_string_tag(fgumi_lib::sam::SamTag::RX, rx.as_bytes());
-    b.build()
-}
-
-/// Write `records` to a BAM in `dir` and return its path.
-fn write_input(dir: &Path, records: &[RawRecord]) -> std::path::PathBuf {
-    let path = dir.join("in.bam");
-    let header = create_minimal_header("chr1", 10_000);
-    write_bam(&path, &header, records);
-    path
-}
+use crate::helpers::{
+    read_copy_umi_metrics, read_name_and_rx, record_named, record_named_with_rx, write_input,
+};
 
 /// Parse + run `copy-umi -i input -o output [extra...]`.
 fn run_copy_umi(input: &Path, output: &Path, extra: &[&str]) -> anyhow::Result<()> {
@@ -68,23 +31,6 @@ fn run_copy_umi(input: &Path, output: &Path, extra: &[&str]) -> anyhow::Result<(
     args.extend(extra.iter().map(|s| (*s).to_string()));
     let cmd = CopyUmi::try_parse_from(args).expect("failed to parse copy-umi args");
     cmd.execute("copy-umi test")
-}
-
-/// Read (`name`, `RX`) for every record in a BAM by transcoding to SAM text.
-fn read_name_and_rx(dir: &Path, bam: &Path) -> Vec<(String, Option<String>)> {
-    let sam = dir.join("out.sam");
-    transcode_bam_to_sam(bam, &sam);
-    std::fs::read_to_string(&sam)
-        .expect("read sam")
-        .lines()
-        .filter(|l| !l.starts_with('@'))
-        .map(|line| {
-            let fields: Vec<&str> = line.split('\t').collect();
-            let name = fields[0].to_string();
-            let rx = fields.iter().find_map(|f| f.strip_prefix("RX:Z:").map(str::to_string));
-            (name, rx)
-        })
-        .collect()
 }
 
 // ============================================================================
@@ -167,12 +113,12 @@ fn overwrites_existing_rx_by_default() {
     assert_eq!(rows[0].1.as_deref(), Some("ACGT"), "stale RX should be replaced");
 }
 
-/// `--fail-if-tag-present` must abort on both the serial oracle and the
-/// `--threads` chain path — proving the flag is wired on the parallel path too,
-/// not just the serial one.
+/// `--fail-if-tag-present` must abort both with `--threads` unset (default
+/// thread count) and with `--threads N` set — both route through the same
+/// chain, so this proves the flag stays wired regardless of thread count.
 #[rstest]
-#[case::serial(&[][..])]
-#[case::chain(&["--threads", "2"][..])]
+#[case::default_threads(&[][..])]
+#[case::explicit_threads(&["--threads", "2"][..])]
 fn fail_if_tag_present_errors_on_existing_rx(#[case] thread_flags: &[&str]) {
     let dir = TempDir::new().unwrap();
     let input = write_input(dir.path(), &[record_named_with_rx("blah:ACGT", "STALEVAL")]);
@@ -188,26 +134,49 @@ fn fail_if_tag_present_errors_on_existing_rx(#[case] thread_flags: &[&str]) {
 }
 
 // ============================================================================
-// Fail-fast on malformed read names — each error must name its actual cause,
-// so an unrelated failure cannot pass the test.
+// Fail-fast on malformed read names. Each case pins every substring the error
+// must contain: the single-level errors (raised directly in
+// `copy_umi_into_record` with no `.with_context()` wrapper) are one message;
+// the two-level errors (a `normalize_read_name_umi` failure wrapped in
+// "extracting UMI from read name" context) must show BOTH that outer context
+// AND the inner cause. The process step's `.map_err` joins the full `anyhow`
+// cause chain into the `io::Error` it hands the pipeline (via `{e:#}`) before
+// the pipeline reconstructs a step failure from that `io::Error`'s `Display`,
+// so the inner cause survives the chain the same as it did pre-cutover.
 // ============================================================================
 
 #[rstest]
-#[case::single_field("NAME", "no ':'-delimited UMI field")]
-#[case::empty_last_field("1:2:3:", "empty UMI field")]
-#[case::illegal_char("NAME:CCKC", "illegal character")]
-#[case::coordinate_not_a_umi("inst:1:FC:1:1101:5:7:10799", "illegal character")]
-#[case::empty_after_normalization("blah:r", "normalizes to an empty UMI")]
-fn errors_on_malformed_name(#[case] name: &str, #[case] expected_msg: &str) {
+#[case::single_field("NAME", &["no ':'-delimited UMI field"])]
+#[case::empty_last_field("1:2:3:", &["empty UMI field"])]
+#[case::illegal_char(
+    "NAME:CCKC",
+    &["extracting UMI from read name 'NAME:CCKC'", "Invalid UMI", "illegal character"]
+)]
+#[case::coordinate_not_a_umi(
+    "inst:1:FC:1:1101:5:7:10799",
+    &[
+        "extracting UMI from read name 'inst:1:FC:1:1101:5:7:10799'",
+        "Invalid UMI",
+        "illegal character",
+    ]
+)]
+#[case::empty_after_normalization(
+    "blah:r",
+    &["extracting UMI from read name 'blah:r'", "normalizes to an empty UMI"]
+)]
+fn errors_on_malformed_name(#[case] name: &str, #[case] expected_substrings: &[&str]) {
     let dir = TempDir::new().unwrap();
     let input = write_input(dir.path(), &[record_named(name)]);
     let output = dir.path().join("out.bam");
     let err =
         run_copy_umi(&input, &output, &[]).expect_err(&format!("expected failure for '{name}'"));
-    assert!(
-        format!("{err:#}").contains(expected_msg),
-        "error for '{name}' should contain '{expected_msg}', got: {err:#}"
-    );
+    let msg = format!("{err:#}");
+    for expected in expected_substrings {
+        assert!(
+            msg.contains(expected),
+            "error for '{name}' should contain '{expected}', got: {msg}"
+        );
+    }
 }
 
 #[test]
@@ -250,23 +219,6 @@ fn idempotent_without_trim() {
 // Metrics
 // ============================================================================
 
-/// Read the single metrics row as a `column -> value` map.
-fn read_metrics_row(path: &Path) -> HashMap<String, String> {
-    let text = std::fs::read_to_string(path).expect("read metrics");
-    let mut lines = text.lines();
-    let header: Vec<String> =
-        lines.next().expect("header line").split('\t').map(str::to_string).collect();
-    let values: Vec<String> =
-        lines.next().expect("value line").split('\t').map(str::to_string).collect();
-    assert_eq!(
-        header.len(),
-        values.len(),
-        "metrics header and value rows must have equal column counts"
-    );
-    assert!(lines.next().is_none(), "metrics file must contain exactly one data row");
-    header.into_iter().zip(values).collect()
-}
-
 #[test]
 fn writes_metrics_row() {
     let dir = TempDir::new().unwrap();
@@ -283,11 +235,11 @@ fn writes_metrics_row() {
     run_copy_umi(&input, &output, &["-M", &metrics.display().to_string()])
         .expect("copy-umi failed");
 
-    let row = read_metrics_row(&metrics);
-    assert_eq!(row["total_records"], "3");
-    assert_eq!(row["rx_written"], "3");
-    assert_eq!(row["rx_overwritten"], "1");
-    assert_eq!(row["names_trimmed"], "0");
+    let row = read_copy_umi_metrics(&metrics);
+    assert_eq!(row.total_records, 3);
+    assert_eq!(row.rx_written, 3);
+    assert_eq!(row.rx_overwritten, 1);
+    assert_eq!(row.names_trimmed, 0);
 }
 
 #[test]
@@ -299,9 +251,9 @@ fn metrics_count_trimmed_names_under_remove_umi() {
     run_copy_umi(&input, &output, &["--remove-umi", "-M", &metrics.display().to_string()])
         .expect("copy-umi failed");
 
-    let row = read_metrics_row(&metrics);
-    assert_eq!(row["total_records"], "2");
-    assert_eq!(row["names_trimmed"], "2", "every record's name was trimmed");
+    let row = read_copy_umi_metrics(&metrics);
+    assert_eq!(row.total_records, 2);
+    assert_eq!(row.names_trimmed, 2, "every record's name was trimmed");
 }
 
 // ============================================================================
@@ -503,11 +455,14 @@ fn runs_on_multiple_threads() {
 }
 
 // ============================================================================
-// Chain-vs-oracle parity (the R3 cutover contract)
+// Thread-count consistency (post-cutover: `execute()` always routes through
+// the chain builder)
 //
-// The no-`--threads` serial path (`run_single_threaded`) is the in-process
-// oracle; `--threads N` routes through the chain builder. `--threads 1` is a
-// distinct chain-at-single-worker path from both, so the matrix includes it.
+// `--threads` unset (the chain's default thread count) and `--threads N` for
+// several `N` all build and run the same `ChainSpec::single_stage(Stage::CopyUmi,
+// ..)`, so any divergence here is a real thread-count-dependent bug, not two
+// implementations disagreeing. Locals below are named `default_threads_*` for
+// the no-`--threads` run and `explicit_threads_*` for the `--threads N` run.
 // ============================================================================
 
 /// Build a copy-umi input of `n` records with `:`-delimited UMI read names.
@@ -528,36 +483,44 @@ fn build_parity_input(dir: &Path, n: usize) -> std::path::PathBuf {
 #[case::t1(1)]
 #[case::t2(2)]
 #[case::t4(4)]
-fn chain_matches_single_threaded(#[case] threads: u8) {
+fn chain_output_consistent_across_thread_counts(#[case] threads: u8) {
     let dir = TempDir::new().unwrap();
     let input = build_parity_input(dir.path(), 500);
 
-    let oracle_out = dir.path().join("oracle.bam");
-    run_copy_umi(&input, &oracle_out, &[]).expect("serial oracle run");
+    let default_threads_out = dir.path().join("default_threads.bam");
+    run_copy_umi(&input, &default_threads_out, &[]).expect("default-threads run");
 
-    let chain_out = dir.path().join("chain.bam");
-    run_copy_umi(&input, &chain_out, &["--threads", &threads.to_string()]).expect("chain run");
+    let explicit_threads_out = dir.path().join("explicit_threads.bam");
+    run_copy_umi(&input, &explicit_threads_out, &["--threads", &threads.to_string()])
+        .expect("explicit-threads run");
 
-    let (oracle_hdr, oracle_recs) = crate::helpers::read_bam_output(&oracle_out);
-    let (chain_hdr, chain_recs) = crate::helpers::read_bam_output(&chain_out);
-    assert_eq!(chain_hdr, oracle_hdr, "normalized header parity (threads={threads})");
-    assert_eq!(chain_recs, oracle_recs, "record parity (threads={threads})");
+    let (default_threads_hdr, default_threads_recs) =
+        crate::helpers::read_bam_output(&default_threads_out);
+    let (explicit_threads_hdr, explicit_threads_recs) =
+        crate::helpers::read_bam_output(&explicit_threads_out);
+    assert_eq!(
+        explicit_threads_hdr, default_threads_hdr,
+        "normalized header parity (threads={threads})"
+    );
+    assert_eq!(explicit_threads_recs, default_threads_recs, "record parity (threads={threads})");
     // Non-vacuous: every record survived and carries the copied RX.
-    assert_eq!(chain_recs.len(), 500, "all records emitted");
+    assert_eq!(explicit_threads_recs.len(), 500, "all records emitted");
 }
 
-/// Every non-default, output-producing knob must be wired identically on the
-/// chain (`--threads`) path and the serial oracle. The default-flag parity test
-/// above exercises none of them, so a knob dropped or mis-wired on the parallel
-/// path would go unnoticed. The input carries `r`-prefixed and dual UMIs so both
+/// Every non-default, output-producing knob must produce identical output with
+/// `--threads` unset and with `--threads N` set. The default-flag consistency
+/// test above exercises none of them, so a knob dropped or mis-wired at a
+/// non-default thread count would go unnoticed. The input carries `r`-prefixed
+/// and dual UMIs so both
 /// `--remove-umi` (name trim) and `--reverse-complement-r-umis false` (strip vs
-/// reverse-complement) change the output — if the chain dropped a flag, its
-/// records would diverge from the oracle's.
-/// The `expected` case column is the absolute `(read_name, RX)` the oracle must
-/// produce for each of the three input records under the case's flags. Pinning
-/// these fixed values — not just chain-vs-oracle parity — is what catches a bug
-/// present on *both* paths (e.g. a flag mis-parsed in shared code): parity alone
-/// would still pass. Verified against the command's observed output; note
+/// reverse-complement) change the output — if a non-default thread count
+/// dropped a flag, its records would diverge from the default-threads run's.
+/// The `expected` case column is the absolute `(read_name, RX)` the
+/// default-threads run must produce for each of the three input records under
+/// the case's flags. Pinning these fixed values — not just cross-thread-count
+/// consistency — is what catches a bug present at *every* thread count (e.g. a
+/// flag mis-parsed in shared code): consistency alone would still pass.
+/// Verified against the command's observed output; note
 /// `--reverse-complement-r-umis false` still maps the `+` dual-UMI delimiter to
 /// `-` (it only disables the `r`-prefix reverse-complement), so the strip case
 /// yields `AAAA-CCCC`, not `AAAA+CCCC`.
@@ -586,7 +549,7 @@ fn chain_matches_single_threaded(#[case] threads: u8) {
         ("inst:1:FC:1:1101:5:9", "TTTT"),
     ],
 )]
-fn chain_matches_oracle_with_nondefault_options(
+fn nondefault_options_consistent_across_thread_counts(
     #[case] option_flags: &[&str],
     #[case] expected: &[(&str, &str)],
 ) {
@@ -598,36 +561,46 @@ fn chain_matches_oracle_with_nondefault_options(
     ];
     let input = write_input(dir.path(), &records);
 
-    let oracle_out = dir.path().join("oracle.bam");
-    run_copy_umi(&input, &oracle_out, option_flags).expect("serial oracle run");
+    let default_threads_out = dir.path().join("default_threads.bam");
+    run_copy_umi(&input, &default_threads_out, option_flags).expect("default-threads run");
 
-    let mut chain_flags = option_flags.to_vec();
-    chain_flags.extend_from_slice(&["--threads", "4"]);
-    let chain_out = dir.path().join("chain.bam");
-    run_copy_umi(&input, &chain_out, &chain_flags).expect("chain run");
+    let mut explicit_threads_flags = option_flags.to_vec();
+    explicit_threads_flags.extend_from_slice(&["--threads", "4"]);
+    let explicit_threads_out = dir.path().join("explicit_threads.bam");
+    run_copy_umi(&input, &explicit_threads_out, &explicit_threads_flags)
+        .expect("explicit-threads run");
 
-    // Absolute anchor: the oracle must produce exactly these names+RX. A flag
-    // dropped in shared code would change these, even though chain==oracle held.
-    let oracle_name_rx = read_name_and_rx(dir.path(), &oracle_out);
+    // Absolute anchor: the default-threads run must produce exactly these
+    // names+RX. A flag dropped in shared code would change these, even though
+    // cross-thread-count consistency held.
+    let default_threads_name_rx = read_name_and_rx(dir.path(), &default_threads_out);
     let expected_name_rx: Vec<(String, Option<String>)> =
         expected.iter().map(|(name, rx)| ((*name).to_string(), Some((*rx).to_string()))).collect();
     assert_eq!(
-        oracle_name_rx, expected_name_rx,
-        "oracle (name, RX) must match the pinned expected values (flags={option_flags:?})",
+        default_threads_name_rx, expected_name_rx,
+        "default-threads (name, RX) must match the pinned expected values (flags={option_flags:?})",
     );
 
-    let (oracle_hdr, oracle_recs) = crate::helpers::read_bam_output(&oracle_out);
-    let (chain_hdr, chain_recs) = crate::helpers::read_bam_output(&chain_out);
-    assert_eq!(chain_hdr, oracle_hdr, "normalized header parity (flags={option_flags:?})");
-    assert_eq!(chain_recs, oracle_recs, "record parity (flags={option_flags:?})");
-    assert_eq!(chain_recs.len(), 3, "all records emitted (flags={option_flags:?})");
+    let (default_threads_hdr, default_threads_recs) =
+        crate::helpers::read_bam_output(&default_threads_out);
+    let (explicit_threads_hdr, explicit_threads_recs) =
+        crate::helpers::read_bam_output(&explicit_threads_out);
+    assert_eq!(
+        explicit_threads_hdr, default_threads_hdr,
+        "normalized header parity (flags={option_flags:?})"
+    );
+    assert_eq!(
+        explicit_threads_recs, default_threads_recs,
+        "record parity (flags={option_flags:?})"
+    );
+    assert_eq!(explicit_threads_recs.len(), 3, "all records emitted (flags={option_flags:?})");
 }
 
-/// `--metrics` TSV must be byte-identical between the serial oracle and the
-/// chain. `fgumi_metrics::write_metrics` embeds no timestamp, so a raw byte
-/// compare is stable.
+/// `--metrics` TSV must be byte-identical with `--threads` unset and with
+/// `--threads N` set. `fgumi_metrics::write_metrics` embeds no timestamp, so a
+/// raw byte compare is stable.
 #[test]
-fn chain_metrics_match_single_threaded() {
+fn chain_metrics_consistent_across_thread_counts() {
     let dir = TempDir::new().unwrap();
     // Include a record with a pre-existing RX so `rx_overwritten` is non-zero.
     let mut records: Vec<RawRecord> =
@@ -635,34 +608,44 @@ fn chain_metrics_match_single_threaded() {
     records.push(record_named_with_rx("q:99:TTTT", "AAAA"));
     let input = write_input(dir.path(), &records);
 
-    let oracle_out = dir.path().join("oracle.bam");
-    let oracle_metrics = dir.path().join("oracle.tsv");
-    run_copy_umi(&input, &oracle_out, &["-M", &oracle_metrics.display().to_string()])
-        .expect("serial run");
-
-    let chain_out = dir.path().join("chain.bam");
-    let chain_metrics = dir.path().join("chain.tsv");
+    let default_threads_out = dir.path().join("default_threads.bam");
+    let default_threads_metrics = dir.path().join("default_threads.tsv");
     run_copy_umi(
         &input,
-        &chain_out,
-        &["--threads", "4", "-M", &chain_metrics.display().to_string()],
+        &default_threads_out,
+        &["-M", &default_threads_metrics.display().to_string()],
     )
-    .expect("chain run");
+    .expect("default-threads run");
 
-    let oracle_tsv = std::fs::read(&oracle_metrics).expect("read oracle metrics");
-    let chain_tsv = std::fs::read(&chain_metrics).expect("read chain metrics");
-    assert_eq!(chain_tsv, oracle_tsv, "the --metrics TSV must be byte-identical across paths");
+    let explicit_threads_out = dir.path().join("explicit_threads.bam");
+    let explicit_threads_metrics = dir.path().join("explicit_threads.tsv");
+    run_copy_umi(
+        &input,
+        &explicit_threads_out,
+        &["--threads", "4", "-M", &explicit_threads_metrics.display().to_string()],
+    )
+    .expect("explicit-threads run");
+
+    let default_threads_tsv =
+        std::fs::read(&default_threads_metrics).expect("read default-threads metrics");
+    let explicit_threads_tsv =
+        std::fs::read(&explicit_threads_metrics).expect("read explicit-threads metrics");
+    assert_eq!(
+        explicit_threads_tsv, default_threads_tsv,
+        "the --metrics TSV must be byte-identical across thread counts"
+    );
 
     // Absolute anchor: pin the metrics row to fixed expected counts, not just
-    // chain==oracle parity. 50 fresh names + 1 with a pre-existing RX = 51
-    // records; every record gets an RX (rx_written 51), the one carrying a stale
-    // RX is overwritten (rx_overwritten 1), and no `--remove-umi` means no name
-    // trims (names_trimmed 0). Shared miscounting would slip past a byte compare.
-    let row = read_metrics_row(&oracle_metrics);
-    assert_eq!(row.get("total_records").map(String::as_str), Some("51"), "row: {row:?}");
-    assert_eq!(row.get("rx_written").map(String::as_str), Some("51"), "row: {row:?}");
-    assert_eq!(row.get("rx_overwritten").map(String::as_str), Some("1"), "row: {row:?}");
-    assert_eq!(row.get("names_trimmed").map(String::as_str), Some("0"), "row: {row:?}");
+    // cross-thread-count consistency. 50 fresh names + 1 with a pre-existing RX =
+    // 51 records; every record gets an RX (rx_written 51), the one carrying a
+    // stale RX is overwritten (rx_overwritten 1), and no `--remove-umi` means no
+    // name trims (names_trimmed 0). A miscounting shared by both thread counts
+    // would slip past a byte compare.
+    let row = read_copy_umi_metrics(&default_threads_metrics);
+    assert_eq!(row.total_records, 51, "row: {row:?}");
+    assert_eq!(row.rx_written, 51, "row: {row:?}");
+    assert_eq!(row.rx_overwritten, 1, "row: {row:?}");
+    assert_eq!(row.names_trimmed, 0, "row: {row:?}");
 }
 
 /// Fail-fast under `--threads`: one record with an empty last field aborts the
@@ -681,45 +664,60 @@ fn fail_fast_under_threads_single_bad_record() {
 }
 
 /// Two-level fail-fast: an illegal-character UMI is a
-/// `with_context`-wrapped error. Both paths must abort naming the read name and
-/// the outer "extracting UMI from read name" context. The serial oracle also
-/// preserves the inner reason (full `anyhow` chain); the chain path's
-/// `reconstruct` flattens to Display-only, so the inner reason is not asserted on
-/// the chain path — this documents the framework flattening rather than asserting
-/// a parity that does not hold.
+/// `with_context`-wrapped error. Both `--threads` unset and `--threads N` set
+/// must abort naming the read name, the outer "extracting UMI from read name"
+/// context, AND the inner cause ("Invalid UMI" / "illegal character") — the
+/// process step's `.map_err` flattens the full `anyhow` chain into the
+/// `io::Error` it hands the pipeline via `{e:#}`, so the inner cause is not
+/// lost crossing that boundary.
 #[test]
-fn two_level_fail_fast_names_read_name_on_both_paths() {
+fn two_level_fail_fast_names_read_name_across_thread_counts() {
     let dir = TempDir::new().unwrap();
     let bad = "q:1:ZZZZ"; // Z is outside ACGTN-, so normalization fails.
     let input = write_input(dir.path(), &[record_named(bad)]);
 
-    let serial_out = dir.path().join("serial.bam");
-    let serial_err = run_copy_umi(&input, &serial_out, &[])
-        .expect_err("illegal UMI char must abort the serial run");
-    let serial_msg = format!("{serial_err:#}");
-    assert!(serial_msg.contains(bad), "serial names the read name; got: {serial_msg}");
+    let default_threads_out = dir.path().join("default_threads.bam");
+    let default_threads_err = run_copy_umi(&input, &default_threads_out, &[])
+        .expect_err("illegal UMI char must abort the default-threads run");
+    let default_threads_msg = format!("{default_threads_err:#}");
     assert!(
-        serial_msg.contains("extracting UMI from read name"),
-        "serial carries the outer context; got: {serial_msg}"
+        default_threads_msg.contains(bad),
+        "default-threads run names the read name; got: {default_threads_msg}"
+    );
+    assert!(
+        default_threads_msg.contains("extracting UMI from read name"),
+        "default-threads run carries the outer context; got: {default_threads_msg}"
+    );
+    assert!(
+        default_threads_msg.contains("Invalid UMI")
+            && default_threads_msg.contains("illegal character"),
+        "default-threads run carries the inner cause; got: {default_threads_msg}"
     );
 
-    let chain_out = dir.path().join("chain.bam");
-    let chain_err = run_copy_umi(&input, &chain_out, &["--threads", "2"])
-        .expect_err("illegal UMI char must abort the chain run");
-    let chain_msg = format!("{chain_err:#}");
-    assert!(chain_msg.contains(bad), "chain names the read name; got: {chain_msg}");
+    let explicit_threads_out = dir.path().join("explicit_threads.bam");
+    let explicit_threads_err = run_copy_umi(&input, &explicit_threads_out, &["--threads", "2"])
+        .expect_err("illegal UMI char must abort the explicit-threads run");
+    let explicit_threads_msg = format!("{explicit_threads_err:#}");
     assert!(
-        chain_msg.contains("extracting UMI from read name"),
-        "chain carries the outer context; got: {chain_msg}"
+        explicit_threads_msg.contains(bad),
+        "explicit-threads run names the read name; got: {explicit_threads_msg}"
+    );
+    assert!(
+        explicit_threads_msg.contains("extracting UMI from read name"),
+        "explicit-threads run carries the outer context; got: {explicit_threads_msg}"
+    );
+    assert!(
+        explicit_threads_msg.contains("Invalid UMI")
+            && explicit_threads_msg.contains("illegal character"),
+        "explicit-threads run carries the inner cause; got: {explicit_threads_msg}"
     );
 }
 
-/// Header-less input: both the chain and the serial oracle synthesize
+/// Header-less input: `--threads` unset and `--threads N` set both synthesize
 /// `@HD VN:1.6 SO:unsorted` and stay in header parity (`ChainBuilder::new`
-/// calls `ensure_hd_record`, so the chain path
-/// synthesizes @HD just like the oracle).
+/// calls `ensure_hd_record` regardless of thread count).
 #[test]
-fn chain_and_oracle_synthesize_hd_for_headerless_input() {
+fn synthesizes_hd_for_headerless_input_across_thread_counts() {
     use noodles::sam::Header as SamHeader;
     use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
     use std::num::NonZeroUsize;
@@ -736,20 +734,21 @@ fn chain_and_oracle_synthesize_hd_for_headerless_input() {
     let input = dir.path().join("headerless.bam");
     write_bam(&input, &header, &[record_named("q:1:ACGT")]);
 
-    let oracle_out = dir.path().join("oracle.bam");
-    run_copy_umi(&input, &oracle_out, &[]).expect("serial run");
-    let chain_out = dir.path().join("chain.bam");
-    run_copy_umi(&input, &chain_out, &["--threads", "2"]).expect("chain run");
+    let default_threads_out = dir.path().join("default_threads.bam");
+    run_copy_umi(&input, &default_threads_out, &[]).expect("default-threads run");
+    let explicit_threads_out = dir.path().join("explicit_threads.bam");
+    run_copy_umi(&input, &explicit_threads_out, &["--threads", "2"]).expect("explicit-threads run");
 
-    let (oracle_hdr, _) = crate::helpers::read_bam_output(&oracle_out);
-    let (chain_hdr, _) = crate::helpers::read_bam_output(&chain_out);
-    assert!(oracle_hdr.header().is_some(), "serial synthesizes @HD");
-    assert!(chain_hdr.header().is_some(), "chain synthesizes @HD");
-    assert_eq!(chain_hdr, oracle_hdr, "header-less-input @HD parity");
+    let (default_threads_hdr, _) = crate::helpers::read_bam_output(&default_threads_out);
+    let (explicit_threads_hdr, _) = crate::helpers::read_bam_output(&explicit_threads_out);
+    assert!(default_threads_hdr.header().is_some(), "default-threads run synthesizes @HD");
+    assert!(explicit_threads_hdr.header().is_some(), "explicit-threads run synthesizes @HD");
+    assert_eq!(explicit_threads_hdr, default_threads_hdr, "header-less-input @HD parity");
 
-    // Absolute anchor: pin the exact synthesized @HD contract on BOTH paths, not
-    // just their equality — otherwise both could synthesize the same *wrong* @HD
-    // and pass. `ChainBuilder::new`/the oracle synthesize `@HD VN:1.6 SO:unsorted`.
+    // Absolute anchor: pin the exact synthesized @HD contract at BOTH thread
+    // counts, not just their equality — otherwise both could synthesize the
+    // same *wrong* @HD and pass. `ChainBuilder::new` synthesizes
+    // `@HD VN:1.6 SO:unsorted` regardless of thread count.
     let hd_line = |bam: &Path, tag: &str| -> String {
         let sam = dir.path().join(format!("{tag}.sam"));
         transcode_bam_to_sam(bam, &sam);
@@ -760,7 +759,9 @@ fn chain_and_oracle_synthesize_hd_for_headerless_input() {
             .unwrap_or_else(|| panic!("{tag} output must carry an @HD line"))
             .to_string()
     };
-    for (tag, bam) in [("oracle", &oracle_out), ("chain", &chain_out)] {
+    for (tag, bam) in
+        [("default_threads", &default_threads_out), ("explicit_threads", &explicit_threads_out)]
+    {
         let hd = hd_line(bam, tag);
         assert!(hd.contains("VN:1.6"), "{tag} @HD must declare VN:1.6, got: {hd}");
         assert!(hd.contains("SO:unsorted"), "{tag} @HD must declare SO:unsorted, got: {hd}");
@@ -768,12 +769,10 @@ fn chain_and_oracle_synthesize_hd_for_headerless_input() {
 }
 
 // ============================================================================
-// CRC-policy parity: the serial oracle (no `--threads`) and the
-// chain (`--threads N`) derive `verify_crc` from independent sources — the
-// serial path from `self.io.pipeline_reader_opts()`, the chain from
-// `spec.verify_crc` — so pin them equal: both must honor `--check-crc` /
-// `--no-check-crc` identically (default verify-on for file input rejects a
-// corrupted block; `--no-check-crc` accepts it).
+// CRC-policy consistency: `--threads` unset and `--threads N` both derive
+// `verify_crc` from `spec.verify_crc` in the same chain, so both must honor
+// `--check-crc` / `--no-check-crc` identically (default verify-on for file
+// input rejects a corrupted block; `--no-check-crc` accepts it).
 // ============================================================================
 
 /// Flip a byte in the last BGZF block's CRC32 footer, so decoding that block
@@ -797,27 +796,27 @@ fn corrupt_last_block_crc(path: &Path) {
     std::fs::write(path, bytes).expect("write corrupted bam");
 }
 
-/// Both the serial oracle and the `--threads` chain must honor the CRC policy
+/// Both `--threads` unset and `--threads N` set must honor the CRC policy
 /// identically: the default (verify-on for file input) rejects a corrupted BGZF
 /// block, while `--no-check-crc` accepts it and completes.
 #[rstest]
-#[case::serial(&[][..])]
-#[case::chain(&["--threads", "4"][..])]
-fn crc_policy_parity_serial_and_chain(#[case] path_flags: &[&str]) {
+#[case::default_threads(&[][..])]
+#[case::explicit_threads(&["--threads", "4"][..])]
+fn crc_policy_consistent_across_thread_counts(#[case] path_flags: &[&str]) {
     let dir = TempDir::new().unwrap();
     // 6000 records span several BGZF blocks, so the corrupted last block is a
     // record block, not the header's.
     let input = build_parity_input(dir.path(), 6000);
     corrupt_last_block_crc(&input);
 
-    // Default policy: both paths reject the corrupted block.
+    // Default policy: both thread counts reject the corrupted block.
     let out_reject = dir.path().join("reject.bam");
     assert!(
         run_copy_umi(&input, &out_reject, path_flags).is_err(),
         "default CRC policy must reject a corrupted block (flags={path_flags:?})"
     );
 
-    // `--no-check-crc`: both paths accept the corrupted block and complete.
+    // `--no-check-crc`: both thread counts accept the corrupted block and complete.
     let out_accept = dir.path().join("accept.bam");
     let mut accept_flags = path_flags.to_vec();
     accept_flags.push("--no-check-crc");
@@ -849,11 +848,12 @@ fn crc_policy_parity_serial_and_chain(#[case] path_flags: &[&str]) {
 
 // ============================================================================
 // Malformed-record safety: a framing-consistent-but-malformed record (an
-// `l_read_name` that runs past the record end) must fail with a CLEAN error on
-// BOTH the serial oracle and the `--threads` chain — never panic. Before the
-// serial path revalidated framing, `copy_umi_into_record`'s `read_name()` slice
-// would panic (index out of bounds) on such a record, a regression from the
-// pre-cutover pipeline, which decoded (and thus validated) every record.
+// `l_read_name` that runs past the record end) must fail with a CLEAN error
+// with `--threads` unset and with `--threads N` set — never panic.
+// `copy_umi_into_record`'s `read_name()` slice would panic (index out of
+// bounds) on such a record if it were reached unvalidated; the chain's
+// `DecodeRecords` validates framing before `copy_umi_into_record` ever sees
+// the record, on every thread count.
 // ============================================================================
 
 /// Write a one-record BAM whose record has a corrupted `l_read_name` (claims a
@@ -874,9 +874,9 @@ fn write_malformed_l_read_name_bam(dir: &Path) -> std::path::PathBuf {
 }
 
 #[rstest]
-#[case::serial(&[][..])]
-#[case::chain(&["--threads", "2"][..])]
-fn malformed_record_errors_cleanly_on_both_paths(#[case] thread_flags: &[&str]) {
+#[case::default_threads(&[][..])]
+#[case::explicit_threads(&["--threads", "2"][..])]
+fn malformed_record_errors_cleanly_across_thread_counts(#[case] thread_flags: &[&str]) {
     let dir = TempDir::new().unwrap();
     let input = write_malformed_l_read_name_bam(dir.path());
     let output = dir.path().join("out.bam");
@@ -884,6 +884,6 @@ fn malformed_record_errors_cleanly_on_both_paths(#[case] thread_flags: &[&str]) 
         .expect_err("a malformed l_read_name record must error, not panic");
     assert!(
         format!("{err:#}").contains("read-name region runs past record end"),
-        "expected the clean framing error on both paths (flags={thread_flags:?}), got: {err:#}"
+        "expected the clean framing error at every thread count (flags={thread_flags:?}), got: {err:#}"
     );
 }

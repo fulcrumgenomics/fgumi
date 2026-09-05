@@ -1157,9 +1157,10 @@ impl<'a> ChainBuilder<'a> {
                 //
                 // Use a DEFAULT LibraryIndex, NOT `from_header`: `name_hash_only`
                 // never reads `library_index`, and `LibraryIndex::from_header`
-                // panics on a header with >65,535 @RG libraries — a crash the serial
-                // oracle (which builds no group key) never has, so routing these
-                // through the shared `from_header` arm would newly expose it.
+                // panics on a header with >65,535 @RG libraries — a crash a pure
+                // per-record transform (which builds no group key at all) has no
+                // reason to risk, so routing these through the shared `from_header`
+                // arm would needlessly expose it.
                 fgumi_bam_io::GroupKeyConfig::name_hash_only(fgumi_bam_io::LibraryIndex::default())
             }
             _ => self.bam_group_key_config(),
@@ -4231,8 +4232,8 @@ impl<'a> ChainBuilder<'a> {
     /// Mirrors filter's single-no-rejects shape (no template grouping, no
     /// rejects, no sort-order guard). The header is `self.header` — already
     /// `ensure_hd`'d + `add_pg`'d in `ChainBuilder::new` — and is not reassigned
-    /// (a pure transform leaves the header shape unchanged). The no-`--threads`
-    /// serial path in `CopyUmi::execute` is the in-process parity oracle.
+    /// (a pure transform leaves the header shape unchanged). `CopyUmi::execute`
+    /// always runs through this chain — there is no other execution path.
     fn add_copy_umi(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::warn_unwired_pipeline_flags;
         use crate::logging::OperationTimer;
@@ -4298,16 +4299,15 @@ impl<'a> ChainBuilder<'a> {
         self.current_tail = Some(self.pipeline.append_step(step, tail));
 
         // Register the finalize hooks — BOTH on `finalize_on_success` (not the
-        // always-run `finalize`): the serial oracle `?`-aborts before its summary
-        // on a fail-fast error, so an always-run summary hook would log a partial
-        // summary the serial path never logs. The chain-level
-        // StageTimingFinalizeHook is inserted at index 0 by `build()`.
+        // always-run `finalize`): a bad record aborts the run before the pipeline
+        // drains, so an always-run summary hook would log a partial summary on a
+        // fail-fast error. The chain-level StageTimingFinalizeHook is inserted at
+        // index 0 by `build()`.
         //
         // Order matters: the SUMMARY hook is registered BEFORE the metrics hook so
-        // it runs first, matching the serial path (`warn_and_log_copy_umi_summary`
-        // then `write_copy_umi_metrics`). This keeps log parity on a `--metrics`
-        // write failure — the summary + completion-timer are already logged on both
-        // paths before the failing write, rather than being swallowed on the chain.
+        // it runs first (`warn_and_log_copy_umi_summary` then
+        // `write_copy_umi_metrics`) — the summary + completion-timer are logged
+        // before a `--metrics` write failure, rather than being swallowed.
         self.finalize_on_success
             .push(Box::new(CopyUmiFinalizeHook { accumulators: Arc::clone(&accumulators), timer }));
         if let Some(metrics_path) = copy_umi.metrics.clone() {
