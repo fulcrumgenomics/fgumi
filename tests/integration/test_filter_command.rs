@@ -681,6 +681,166 @@ fn test_filter_chain_matches_single_threaded(
     );
 }
 
+/// Header carrying two `@RG` lines with distinct `LB` values, for
+/// `test_filter_chain_matches_single_threaded_with_rg_and_cb_variation`. The
+/// `source_group_key_config` perf fix routes the chain filter path's first
+/// stage to a `name_hash_only` `GroupKeyConfig`, which never resolves a
+/// per-record library index or walks the CIGAR for position during decode —
+/// unlike the filter-by-template oracle's own decode config
+/// (`Filter::build_filter_pipeline_config`'s `new_raw_no_cell`), which
+/// resolves the library index and the position but, like `name_hash_only`,
+/// never extracts `CB` either way. So RG (library index) and position are the
+/// fields that genuinely differ between the two decode configs, and are what
+/// this parity test needs to vary to be non-vacuous; the `CB` variation below
+/// is incidental fixture realism, not a discriminating input — the oracle
+/// never reads `CB` regardless of this change, so it cannot expose a
+/// regression here.
+fn create_consensus_header_with_read_groups(
+    ref_name: &str,
+    ref_len: usize,
+) -> noodles::sam::Header {
+    use bstr::BString;
+    use noodles::sam::header::record::value::Map;
+    use noodles::sam::header::record::value::map::Map as HeaderRecordMap;
+    use noodles::sam::header::record::value::map::header::tag::Tag as HeaderTag;
+    use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+    use noodles::sam::header::record::value::map::{
+        Header as HeaderRecord, ReadGroup, ReferenceSequence,
+    };
+    use std::num::NonZeroUsize;
+
+    let mut header_builder = HeaderRecordMap::<HeaderRecord>::builder();
+    for &(tag_bytes, value) in
+        &[(*b"SO", "unsorted"), (*b"GO", "query"), (*b"SS", "template-coordinate")]
+    {
+        let HeaderTag::Other(tag) = HeaderTag::from(tag_bytes) else { unreachable!() };
+        header_builder = header_builder.insert(tag, value);
+    }
+    let header_map = header_builder.build().expect("valid header map");
+
+    let reference_sequence = Map::<ReferenceSequence>::new(
+        NonZeroUsize::new(ref_len).expect("reference length must be non-zero"),
+    );
+
+    let rg_a = Map::<ReadGroup>::builder()
+        .insert(rg_tag::LIBRARY, String::from("libA"))
+        .build()
+        .expect("building read group RG1 should succeed");
+    let rg_b = Map::<ReadGroup>::builder()
+        .insert(rg_tag::LIBRARY, String::from("libB"))
+        .build()
+        .expect("building read group RG2 should succeed");
+
+    noodles::sam::Header::builder()
+        .set_header(header_map)
+        .add_reference_sequence(BString::from(ref_name), reference_sequence)
+        .add_read_group(BString::from("RG1"), rg_a)
+        .add_read_group(BString::from("RG2"), rg_b)
+        .build()
+}
+
+/// Like [`build_mixed_depth_templates`], but each mate additionally carries an
+/// `RG` tag (alternating `RG1`/`RG2`, so both `@RG` lines in
+/// [`create_consensus_header_with_read_groups`] are exercised) and a `CB` tag
+/// that varies per template (`CB{i}`). Same mixed pass/fail depth pattern, so
+/// filtering still does non-trivial work.
+fn build_mixed_depth_templates_with_rg_and_cb(n: usize) -> Vec<RawRecord> {
+    let mut records = Vec::with_capacity(n * 2);
+    for i in 0..i32::try_from(n).expect("n fits in i32") {
+        let name = format!("t{i}");
+        let pos = 100 + i * 20;
+        let r2_depth: u16 = if i % 2 == 0 { 10 } else { 1 };
+        let rg_id: &[u8] = if i % 2 == 0 { b"RG1" } else { b"RG2" };
+        let cb = format!("CB{i}");
+
+        let mut r1 = RawSamBuilder::new();
+        r1.read_name(name.as_bytes())
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .ref_id(0)
+            .pos(pos)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .sequence(b"ACGTACGT")
+            .qualities(&[35; 8]);
+        r1.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.0_f32);
+        r1.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
+        r1.add_string_tag(SamTag::RG, rg_id).add_string_tag(SamTag::CB, cb.as_bytes());
+        records.push(r1.build());
+
+        let mut r2 = RawSamBuilder::new();
+        r2.read_name(name.as_bytes())
+            .flags(flags::PAIRED | flags::LAST_SEGMENT)
+            .ref_id(0)
+            .pos(pos + 8)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .sequence(b"ACGTACGT")
+            .qualities(&[35; 8]);
+        r2.add_int_tag(SamTag::CD, i32::from(r2_depth)).add_float_tag(SamTag::CE, 0.0_f32);
+        r2.add_array_u16(SamTag::CD_BASES, &[r2_depth; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
+        r2.add_string_tag(SamTag::RG, rg_id).add_string_tag(SamTag::CB, cb.as_bytes());
+        records.push(r2.build());
+    }
+    records
+}
+
+/// The chain (`--threads N`) path matches the non-chain oracle record-for-record
+/// even when the discarded position/RG portion of the group key genuinely
+/// varies per record (distinct `@RG`/`LB` per template and distinct positions
+/// — the fields the oracle's decode config resolves but `name_hash_only`
+/// does not, per `create_consensus_header_with_read_groups`'s doc comment).
+/// `test_filter_chain_matches_single_threaded` already covers the
+/// `threads`/`filter_by_template` matrix on RG-free, single-position records;
+/// this test's unique contribution is exercising the exact fields
+/// `source_group_key_config`'s `name_hash_only` routing stops computing for
+/// the chain filter path, confirming the skip is genuinely invisible in the
+/// output. Records also carry a per-template `CB` tag for fixture realism,
+/// but it is not discriminating: the oracle's own decode config never
+/// extracts `CB` either, so `CB` variation cannot expose a regression here.
+#[test]
+fn test_filter_chain_matches_single_threaded_with_rg_and_cb_variation() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+    let header = create_consensus_header_with_read_groups("chr1", 10000);
+    create_consensus_bam_with_header(
+        &input_bam,
+        &header,
+        build_mixed_depth_templates_with_rg_and_cb(8),
+    );
+
+    let oracle_out = temp_dir.path().join("oracle.bam");
+    filter_run(&input_bam, &oracle_out, &ref_path, &["--filter-by-template", "true"]);
+
+    let chain_out = temp_dir.path().join("chain.bam");
+    filter_run(
+        &input_bam,
+        &chain_out,
+        &ref_path,
+        &["--filter-by-template", "true", "--threads", "4"],
+    );
+
+    let (oracle_header, expected) = crate::helpers::read_bam_output(&oracle_out);
+    let (chain_header, actual) = crate::helpers::read_bam_output(&chain_out);
+    // Non-vacuous: filter-by-template drops the 4 odd templates whole (keeps 8
+    // of 16), same as the RG/CB-free matrix test.
+    assert_eq!(
+        expected.len(),
+        8,
+        "oracle must keep exactly 8 of 16 records with RG/CB variation present"
+    );
+    assert_eq!(
+        actual, expected,
+        "chain output must match the non-chain path record-for-record with RG/CB variation \
+         present, proving source_group_key_config's name_hash_only skip for Stage::Filter \
+         changes no output"
+    );
+    assert_eq!(
+        chain_header, oracle_header,
+        "chain output header must match the non-chain path with RG/CB variation present"
+    );
+}
+
 /// The `--rejects` output BAM matches record-for-record between the chain and
 /// oracle paths, not just the kept output. Template mode over
 /// `build_mixed_depth_templates` rejects both mates of every odd-indexed
