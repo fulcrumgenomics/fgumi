@@ -19,6 +19,7 @@ use crate::helpers::bam_generator::{
     create_minimal_header, create_query_grouped_header, create_umi_family,
     create_umi_family_at_pos, to_record_buf,
 };
+use crate::helpers::cli::run_and_capture_logs;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 
@@ -459,6 +460,160 @@ fn test_group_chain_matches_single_threaded() {
     assert_eq!(
         single, chained,
         "chain (--threads 1) output must match the single-threaded fast path record-for-record",
+    );
+}
+
+/// Sibling of `dedup`'s `test_dedup_chain_index_threshold_banner_is_strategy_aware`:
+/// `group`'s non-chain path also reports the `Index threshold:` startup banner
+/// via the shared strategy/edits-aware `common::log_index_threshold` (see
+/// `group.rs`'s `execute`), so the chain path's banner must match it exactly --
+/// not the flat `Index threshold: {group.index_threshold}` (the raw
+/// `--index-threshold` value, unfloored) the chain path used to emit whenever
+/// `matches!(group.effective_strategy, Strategy::Adjacency | Strategy::Paired)`.
+///
+/// `old_flat_regression_line` is `Some(line)` only when the OLD `matches!`-gated
+/// flat `info!` would actually have printed something distinguishable from the
+/// NEW correct output for that case's exact config -- i.e. a string that WOULD
+/// reappear if `add_group` regressed back to the flat banner. It is `None` for
+/// the `edit`-strategy cases: the old `matches!` guard excluded `Edit`
+/// unconditionally (regardless of `--edits`/`--index-threshold`), so old code
+/// printed no `Index threshold:` line at all there -- the positive assertion
+/// alone (expecting a line that old code never emitted) already catches a
+/// regression, and asserting the absence of some placeholder string would be
+/// vacuous (never true or false, since the string was never on the table).
+#[rstest]
+#[case::edit_off_its_indexing_edits_reports_not_used(
+    &["--threads", "1", "--strategy", "edit", "--edits", "2"],
+    "Index threshold: not used (edit indexes only at --edits 1)",
+    None
+)]
+#[case::adjacency_off_its_indexing_edits_reports_not_used(
+    &["--threads", "1", "--strategy", "adjacency", "--edits", "2"],
+    "Index threshold: not used (adjacency indexes only at --edits 1)",
+    // Old code: `matches!(Adjacency, Adjacency | Paired)` is true, so it printed
+    // the raw `--index-threshold` (default 100) verbatim -- misleadingly implying
+    // the index is consulted at 2 mismatches, when adjacency only ever indexes at
+    // exactly 1.
+    Some("Index threshold: 100")
+)]
+#[case::edit_at_one_mismatch_reports_the_edit_floored_value(
+    &["--threads", "1", "--strategy", "edit", "--edits", "1", "--index-threshold", "50"],
+    "Index threshold: 200 (edit)",
+    None
+)]
+#[case::adjacency_default_edits_one_reports_the_flag_verbatim(
+    // `--strategy` is mandatory for `group` (no CLI default), so this pins
+    // adjacency at its own edits/index-threshold defaults (1 / 100) -- the most
+    // ordinary config, not covered by any `edit`-strategy case above.
+    &["--threads", "1", "--strategy", "adjacency"],
+    "Index threshold: 100",
+    // Old code prints the SAME text here: Adjacency/Paired at edits == 1 report
+    // the raw flag verbatim in both old and new code (this is the one branch FIX
+    // A left byte-identical to the old flat banner), so there is no distinct
+    // flat-regression string to guard against -- this case instead pins that the
+    // ordinary default path still reports the plain numeric threshold, unfloored
+    // and un-annotated.
+    None
+)]
+fn test_group_chain_index_threshold_banner_is_strategy_aware(
+    #[case] extra_args: &[&str],
+    #[case] expected_line: &str,
+    #[case] old_flat_regression_line: Option<&str>,
+) {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_test_input_bam(&input_bam);
+    let output_bam = temp_dir.path().join("output.bam");
+
+    let stderr = run_and_capture_logs("group", &input_bam, &output_bam, extra_args);
+    assert!(
+        stderr.lines().any(|line| line.contains(expected_line)),
+        "expected a line containing {expected_line:?}; got:\n{stderr}"
+    );
+    if let Some(old_line) = old_flat_regression_line {
+        assert!(
+            !stderr.lines().any(|line| line.trim_end() == old_line),
+            "must not emit {old_line:?}, the pre-fix flat, strategy-unaware banner \
+             for this exact config; got:\n{stderr}"
+        );
+    }
+}
+
+/// `Strategy::Paired` companion to
+/// `test_group_chain_index_threshold_banner_is_strategy_aware`. Paired grouping
+/// requires valid two-segment UMIs and proper paired-end templates, so it
+/// cannot share that test's single-end `create_test_input_bam` fixture and runs
+/// on its own paired-UMI input instead. Paired at the default `--edits 1`
+/// reports the raw `--index-threshold` verbatim in both old and new code (the
+/// one branch FIX A left byte-identical to the old flat banner), so — like the
+/// `adjacency_default_edits_one` case — there is no distinct flat-regression
+/// string to guard against; this case pins that the chain path still emits the
+/// `Index threshold:` startup banner for the paired strategy at all.
+#[test]
+fn test_group_chain_index_threshold_banner_paired_strategy() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    // Paired-end templates with a valid two-segment (`-`-delimited) UMI so
+    // `--strategy paired` accepts them, and `MC` tags (mate CIGAR) so the
+    // position grouper accepts the paired reads (it requires `MC` on paired-end
+    // input). All pairs share one UMI at the same 5' positions, so they form one
+    // molecule group and the fixture is already template-coordinate ordered.
+    let header = create_minimal_header("chr1", 10000);
+    let paired = |name: &[u8]| -> Vec<RawRecord> {
+        let mut r1 = SamBuilder::new();
+        r1.read_name(name)
+            .ref_id(0)
+            .pos(199)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .mate_ref_id(0)
+            .mate_pos(399)
+            .cigar_ops(&[8u32 << 4])
+            .sequence(b"ACGTACGT")
+            .qualities(&[30u8; 8])
+            .add_string_tag(SamTag::RX, b"AAAA-TTTT")
+            .add_string_tag(SamTag::MC, b"8M");
+        let mut r2 = SamBuilder::new();
+        r2.read_name(name)
+            .ref_id(0)
+            .pos(399)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .mate_ref_id(0)
+            .mate_pos(199)
+            .cigar_ops(&[8u32 << 4])
+            .sequence(b"ACGTACGT")
+            .qualities(&[30u8; 8])
+            .add_string_tag(SamTag::RX, b"AAAA-TTTT")
+            .add_string_tag(SamTag::MC, b"8M");
+        vec![r1.build(), r2.build()]
+    };
+
+    let mut records = paired(b"paired_fam_0");
+    records.extend(paired(b"paired_fam_1"));
+    records.extend(paired(b"paired_fam_2"));
+
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(&input_bam).expect("Failed to create BAM file"));
+    writer.write_header(&header).expect("Failed to write header");
+    for record in &records {
+        writer
+            .write_alignment_record(&header, &to_record_buf(record))
+            .expect("Failed to write record");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+
+    let stderr = run_and_capture_logs(
+        "group",
+        &input_bam,
+        &output_bam,
+        &["--threads", "1", "--strategy", "paired"],
+    );
+    assert!(
+        stderr.lines().any(|line| line.contains("Index threshold:")),
+        "expected the paired strategy to emit an `Index threshold:` startup banner; got:\n{stderr}"
     );
 }
 
