@@ -1154,48 +1154,20 @@ fn cutover_read_streams_produce_identical_output(#[case] order: &str) {
     assert_eq!(one, auto, "--read-streams 1 vs auto must be byte-identical ({order})");
 }
 
-/// The owned engine always verified BGZF CRC32, including on stdin input
-/// (`decompress_block` has no CRC opt-out at all). Standalone `fgumi sort`'s
-/// input decode must reject a corrupted block on stdin too, not silently sort
-/// past it.
+/// Build a BAM whose *last* real BGZF body block has one footer-CRC32 bit
+/// flipped. The compressed payload is untouched and decodes to the same bytes,
+/// so the fault is detectable *only* by comparing the decompressed CRC32
+/// against the footer -- a structural decode failure can never catch it. That
+/// is what makes it a clean probe of whether a live CRC check ran.
 ///
-/// Only the block's footer CRC32 is corrupted (one bit flipped, mirroring
-/// `decompress_opts_skips_crc_on_stored_block` in `fgumi-bgzf`): the
-/// compressed payload is left untouched and decodes normally to the same
-/// bytes, so this corruption is detectable *only* by comparing the
-/// decompressed output's CRC32 against the (now-wrong) footer value. A
-/// structural decode failure could never catch it, so a pass here proves a
-/// live CRC check ran -- not just that some unrelated error-detection caught
-/// the file.
-///
-/// 20,000 records (rather than a handful) is deliberate: it forces the
-/// uncompressed SAM header + record stream well past a single 64 KiB BGZF
-/// block, so the *last* real block is a pure record (body) block, never the
-/// one `fgumi_bam_io::read_header_and_replay` decompresses in full while
-/// parsing the header via noodles. Corrupting the last block therefore
-/// exercises stdin sort's own record-decode path (the arena ingest
-/// `InflateToArena` uses for the sole-`[Stage::Sort]` chain), not just the
-/// separate header-parse tee.
-///
-/// **Not a RED/GREEN gate for the `verify_crc: true` change in
-/// `execute_sort`.** This test passes identically with or without that flag:
-/// standalone sort's `[Stage::Sort]`-only chain always takes the arena-ingest
-/// path (`InflateToArena` -> `fgumi_bgzf::decompress_into_slice`), which has
-/// no CRC opt-out and checks unconditionally regardless of `ChainSpec.verify_crc`
-/// -- the flag is only read by `build_bam_decode_preamble`'s `BgzfDecompress`,
-/// a path standalone sort never takes. It exists as a regression guard on its
-/// own terms (stdin corruption must be rejected end-to-end, through whichever
-/// layer catches it), and as a tripwire: if a future chain-topology change
-/// ever routes standalone sort through `BgzfDecompress` instead, making
-/// `verify_crc` load-bearing, a stale `effective_check_crc()`-style stdin skip
-/// would fail this test rather than silently reintroducing the regression.
-#[test]
-fn cutover_stdin_input_detects_corrupt_crc() {
-    let dir = TempDir::new().expect("create temp dir");
-    let input_bam = dir.path().join("in.bam");
-    write_bam(&input_bam, &create_minimal_header("chr1", 2_100_000), &unsorted_records(20_000));
+/// 20,000 records force the stream well past one 64 KiB block, so the last
+/// block is a pure record block and never the header block that
+/// `fgumi_bam_io::read_header_and_replay` always CRC-verifies via noodles.
+fn write_bam_with_crc_fault(dir: &Path) -> std::path::PathBuf {
+    let seed = dir.join("seed.bam");
+    write_bam(&seed, &create_minimal_header("chr1", 2_100_000), &unsorted_records(20_000));
 
-    let raw = fs::read(&input_bam).expect("read seed BAM");
+    let raw = fs::read(&seed).expect("read seed BAM");
     let mut reader = std::io::Cursor::new(raw.as_slice());
     let mut blocks = fgumi_bgzf::read_raw_blocks(&mut reader, 4_096).expect("parse BGZF blocks");
     let target_idx = blocks
@@ -1205,58 +1177,132 @@ fn cutover_stdin_input_detects_corrupt_crc() {
         .map(|(i, _)| i)
         .next_back()
         .expect("expected at least one real (non-EOF) BGZF block to corrupt");
-    assert!(
-        target_idx > 0,
-        "expected 20,000 records to span more than one real BGZF block (got only 1) -- \
-         corrupting it would land in the header-parse block instead of a pure body block"
-    );
-    let target = &mut blocks[target_idx];
-    let crc_off = target.data.len() - fgumi_bgzf::BGZF_FOOTER_SIZE;
-    target.data[crc_off] ^= 0x01;
+    assert!(target_idx > 0, "20,000 records must span more than one real BGZF block");
+    let crc_off = blocks[target_idx].data.len() - fgumi_bgzf::BGZF_FOOTER_SIZE;
+    blocks[target_idx].data[crc_off] ^= 0x01;
 
     let mut corrupted = Vec::with_capacity(raw.len());
     for block in &blocks {
         corrupted.extend_from_slice(&block.data);
     }
-    // `read_raw_blocks` silently drops BGZF EOF-marker blocks it reads (see
-    // its own doc comment), so re-append the standard marker for a
-    // well-formed, correctly-terminated stream.
+    // `read_raw_blocks` drops EOF markers; re-append one for a well-formed stream.
     corrupted.extend_from_slice(&fgumi_bgzf::BGZF_EOF);
-    let corrupted_bam = dir.path().join("corrupted.bam");
+    let corrupted_bam = dir.join("corrupted.bam");
     fs::write(&corrupted_bam, &corrupted).expect("write corrupted BAM");
+    corrupted_bam
+}
 
+/// How the corrupted BAM reaches `fgumi sort -i`.
+#[derive(Debug, Clone, Copy)]
+enum InputMode {
+    /// `-i -` with the file piped on stdin (the "trusted stream" case).
+    Stdin,
+    /// `-i <path>` (the "data at rest" case).
+    File,
+}
+
+/// End-to-end gate for #931: the CRC policy `fgumi sort` resolves from
+/// `--check-crc` / `--no-check-crc` and the input kind must be what actually
+/// runs on the standalone sort's arena decode path. A CRC-only fault is
+/// rejected exactly when the policy says verify, and sorted past (payload
+/// intact, output fully sorted) exactly when it says skip.
+///
+/// Default stdin -> skip is the deliberate behavior change from the previous
+/// always-verify: piped aligner output is trusted unless `--check-crc`.
+#[rstest]
+#[case::stdin_default_sorts_past(InputMode::Stdin, &[], true)]
+#[case::stdin_check_crc_rejects(InputMode::Stdin, &["--check-crc"], false)]
+#[case::stdin_no_check_crc_sorts_past(InputMode::Stdin, &["--no-check-crc"], true)]
+#[case::file_default_rejects(InputMode::File, &[], false)]
+#[case::file_check_crc_rejects(InputMode::File, &["--check-crc"], false)]
+#[case::file_no_check_crc_sorts_past(InputMode::File, &["--no-check-crc"], true)]
+fn cutover_check_crc_policy_on_corrupt_crc(
+    #[case] mode: InputMode,
+    #[case] extra: &[&str],
+    #[case] expect_success: bool,
+) {
+    let dir = TempDir::new().expect("create temp dir");
+    let corrupted_bam = write_bam_with_crc_fault(dir.path());
     let output_bam = dir.path().join("out.bam");
-    let current_bin = Path::new(env!("CARGO_BIN_EXE_fgumi"));
-    let output = Command::new(current_bin)
-        .args([
-            OsStr::new("sort"),
-            OsStr::new("-i"),
-            OsStr::new("-"),
-            OsStr::new("-o"),
-            output_bam.as_os_str(),
-            OsStr::new("--order"),
-            OsStr::new("coordinate"),
-        ])
-        .stdin(std::process::Stdio::from(
-            fs::File::open(&corrupted_bam).expect("open corrupted BAM to pipe"),
-        ))
-        .output()
-        .expect("failed to spawn fgumi sort on corrupted stdin input");
+    let bin = Path::new(env!("CARGO_BIN_EXE_fgumi"));
 
-    assert!(
-        !output.status.success(),
-        "fgumi sort must reject a corrupted-CRC BGZF block on stdin, not silently sort past it"
-    );
-    // Wording varies by which layer catches it (fgumi-bgzf's own "CRC32
-    // mismatch" vs. noodles' "checksum mismatch" in the header-parse tee), so
-    // accept either rather than pinning one literal message.
+    let mut cmd = Command::new(bin);
+    cmd.arg("sort");
+    match mode {
+        InputMode::Stdin => {
+            cmd.args(["-i", "-"]).stdin(std::process::Stdio::from(
+                fs::File::open(&corrupted_bam).expect("open corrupted BAM to pipe"),
+            ));
+        }
+        InputMode::File => {
+            cmd.arg("-i").arg(&corrupted_bam);
+        }
+    }
+    cmd.arg("-o").arg(&output_bam).args(["--order", "coordinate"]).args(extra);
+    let output = cmd.output().expect("failed to spawn fgumi sort");
     let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+
+    if expect_success {
+        assert!(
+            output.status.success(),
+            "{mode:?} {extra:?}: CRC skipped, so the CRC-only fault must sort past; stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("crc32 mismatch") && !stderr.contains("checksum mismatch"),
+            "{mode:?} {extra:?}: no CRC error may be reported; stderr:\n{stderr}"
+        );
+        // The payload was never altered, so every record survives unchanged and ordered.
+        assert_eq!(
+            sorted_record_multiset(&output_bam),
+            sorted_record_multiset(&dir.path().join("seed.bam")),
+            "{mode:?} {extra:?}: CRC-skipped sorting must preserve record identity"
+        );
+        assert!(fgumi_verify_sorted(bin, &output_bam, "coordinate"));
+    } else {
+        assert!(
+            !output.status.success(),
+            "{mode:?} {extra:?}: CRC verified, so the fault must be rejected, not sorted past"
+        );
+        // Wording varies by layer (fgumi-bgzf "CRC32 mismatch" vs. noodles
+        // "checksum mismatch"), so accept either.
+        assert!(
+            stderr.contains("crc") || stderr.contains("checksum"),
+            "{mode:?} {extra:?}: failure must name CRC/checksum; stderr:\n{stderr}"
+        );
+        // Mid-stream failure: a truncated partial output is expected, not asserted.
+    }
+}
+
+/// `--check-crc` / `--no-check-crc` are inert under `--verify`, which reads
+/// through a separate always-verifying reader rather than the chain. Passing
+/// one must warn rather than silently do nothing (the CLI layer's
+/// characteristic failure is a flag that quietly has no effect).
+#[rstest]
+#[case::no_check_crc("--no-check-crc")]
+#[case::check_crc("--check-crc")]
+fn verify_mode_warns_that_crc_flags_are_inert(#[case] flag: &str) {
+    let dir = TempDir::new().expect("create temp dir");
+    let bam = dir.path().join("one.bam");
+    // A single record is trivially coordinate-sorted, so `--verify` succeeds and
+    // the warning is the only thing under test.
+    write_bam(&bam, &create_minimal_header("chr1", 10_000), &unsorted_records(1));
+
+    let bin = Path::new(env!("CARGO_BIN_EXE_fgumi"));
+    let output = Command::new(bin)
+        .args([OsStr::new("sort"), OsStr::new("--verify"), OsStr::new("-i")])
+        .arg(&bam)
+        .args([OsStr::new("--order"), OsStr::new("coordinate"), OsStr::new(flag)])
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("failed to spawn fgumi sort --verify");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("crc") || stderr.contains("checksum"),
-        "expected the failure to name CRC/checksum verification as the cause; stderr:\n{stderr}"
+        output.status.success(),
+        "fgumi sort --verify must succeed on a trivially sorted BAM; stderr:\n{stderr}"
     );
-    // Unlike the upfront `--write-index`/`--threads 0` guards, this failure
-    // surfaces mid-stream (well after the output file was opened for
-    // writing), so a truncated partial output file is expected here -- not
-    // asserted against.
+    assert!(
+        stderr.contains("have no effect with --verify"),
+        "passing {flag} with --verify must warn it is inert; stderr:\n{stderr}"
+    );
 }
