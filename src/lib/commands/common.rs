@@ -1929,7 +1929,7 @@ pub(crate) fn require_group_input_ordering(
 pub(crate) mod test_log_capture {
     use std::sync::{Mutex, MutexGuard, Once};
 
-    static CAPTURED_LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static CAPTURED_LOGS: Mutex<Vec<(log::Level, String)>> = Mutex::new(Vec::new());
 
     /// Serializes whole capture sessions. `CAPTURED_LOGS` is process-global, so
     /// under plain `cargo test` (one process, tests running concurrently) two
@@ -1955,7 +1955,7 @@ pub(crate) mod test_log_capture {
             CAPTURED_LOGS
                 .lock()
                 .expect("captured-log lock poisoned")
-                .push(record.args().to_string());
+                .push((record.level(), record.args().to_string()));
         }
         fn flush(&self) {}
     }
@@ -1995,9 +1995,24 @@ pub(crate) mod test_log_capture {
         session
     }
 
-    /// Snapshot the captured log lines so far. Call while still holding the
-    /// `CaptureSession` returned by `enable_logging` / `capture_logs`.
+    /// Snapshot the captured log lines so far (messages only). Call while
+    /// still holding the `CaptureSession` returned by `enable_logging` /
+    /// `capture_logs`.
     pub(crate) fn captured() -> Vec<String> {
+        CAPTURED_LOGS
+            .lock()
+            .expect("captured-log lock poisoned")
+            .iter()
+            .map(|(_, msg)| msg.clone())
+            .collect()
+    }
+
+    /// Snapshot the captured log lines so far, paired with the level each was
+    /// emitted at. For tests asserting *which level* a message logged at
+    /// (e.g. error-vs-warn parity checks), where `captured()`'s message-only
+    /// view can't distinguish them. Call while still holding the
+    /// `CaptureSession` returned by `enable_logging` / `capture_logs`.
+    pub(crate) fn captured_with_level() -> Vec<(log::Level, String)> {
         CAPTURED_LOGS.lock().expect("captured-log lock poisoned").clone()
     }
 }
