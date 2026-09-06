@@ -164,4 +164,69 @@ mod tests {
         assert_eq!(slots.len(), 4);
         assert_eq!(slots.iter().map(|c| c.0).sum::<u64>(), 7);
     }
+
+    /// Regression guard for the clip `--metrics` chain path
+    /// (`ClipMetricsFinalizeHook`): a reduction bug that summed only a *subset*
+    /// of `PerThreadAccumulator` slots (e.g. an off-by-one `.take(n)`, or
+    /// iterating a stale slice) would silently drop a worker's contribution and
+    /// undercount the merged metrics. `parallel_threads_share_total_count`
+    /// above proves the *sum* is right; this test additionally proves the sum
+    /// is right *because multiple genuinely distinct slots were populated* —
+    /// directly inspecting slot occupancy via `slots()`, exactly as
+    /// `ClipMetricsFinalizeHook::finalize` does — not merely because the writes
+    /// happened to collapse into one slot that a buggy partial reduction would
+    /// still catch.
+    ///
+    /// Spawns `N_THREADS` real (never-before-used) OS threads via
+    /// `thread::scope`; each is assigned a fresh, sequential index by the
+    /// process-wide `SLOT_COUNTER` on its first `with_slot` call, so — modulo
+    /// any other test in this binary racing the same global counter, which
+    /// would if anything spread the indices further apart, not collapse them —
+    /// these threads land across more than one of the `N_THREADS` slots.
+    #[test]
+    fn parallel_threads_populate_and_merge_distinct_clip_metrics_slots() {
+        use crate::metrics::clip::{ClipCounts, ClippingMetricsCollection};
+        use fgumi_sam::builder::RecordBuilder;
+
+        const N_THREADS: usize = 8;
+        let acc: Arc<PerThreadAccumulator<ClippingMetricsCollection>> =
+            PerThreadAccumulator::new(N_THREADS);
+        let record = RecordBuilder::new().cigar("90M").build();
+
+        thread::scope(|s| {
+            for i in 0..N_THREADS {
+                let acc = Arc::clone(&acc);
+                let record = record.clone();
+                s.spawn(move || {
+                    acc.with_slot(|slot: &mut ClippingMetricsCollection| {
+                        slot.read_one.update(
+                            &record,
+                            ClipCounts { five_prime: i + 1, ..ClipCounts::default() },
+                        );
+                    });
+                });
+            }
+        });
+
+        // Slot occupancy: more than one PerThreadAccumulator slot actually
+        // received data, proving the concurrent threads landed in genuinely
+        // different slots rather than all serializing onto one.
+        let populated_slots = acc.slots().iter().filter(|m| m.lock().read_one.reads > 0).count();
+        assert!(
+            populated_slots > 1,
+            "expected more than one PerThreadAccumulator slot to be populated by \
+             {N_THREADS} concurrent OS threads, got {populated_slots}",
+        );
+
+        // Reducing every slot (mirrors ClipMetricsFinalizeHook::finalize: merge
+        // each slot, in order, into one collection) recovers the exact combined
+        // total. A reduction that skipped any slot would undercount both.
+        let mut merged = ClippingMetricsCollection::new();
+        for slot in acc.slots() {
+            merged.merge(&slot.lock());
+        }
+        let expected_five_prime: usize = (1..=N_THREADS).sum();
+        assert_eq!(merged.read_one.reads, N_THREADS);
+        assert_eq!(merged.read_one.bases_clipped_five_prime, expected_five_prime);
+    }
 }
