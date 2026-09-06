@@ -415,6 +415,26 @@ reviews:
         strand-bias distributions) for bias, off-by-one, and mis-seeded RNG, and
         require its writers to propagate the FIRST error from a worker or I/O
         thread rather than a later generic channel-closed error that masks it.
+    - path: "{src/lib/commands/common.rs,src/lib/pipeline/steps/source/**/*.rs,src/lib/pipeline/chains/builder.rs,src/lib/pipeline/chains/spec.rs,crates/fgumi-bam-io/src/reader.rs}"
+      instructions: >-
+        BGZF CRC32 verification policy here is intentional and settled (PRs
+        #786/#798) — do NOT re-flag it as a data-integrity gap or a missing
+        `--no-check-crc` wiring. The default is verify-file / skip-trusted-stdin,
+        resolved by `BamIoOptions::effective_check_crc()` (`commands/common.rs`,
+        `!is_stdin` when neither flag is set) and threaded to the chain as
+        `ChainSpec::verify_crc`, which `BgzfDecompress::new_with_crc` honors;
+        `--check-crc` / `--no-check-crc` override it. A `PipelineReaderOpts` left
+        at its default `verify_crc: true` in `ChainBuilder::open_source` is INERT
+        for the chain (the chain takes its CRC policy from `spec.verify_crc`, not
+        that field), so do not flag it as forcing verification. The BAM header
+        block is deliberately ALWAYS CRC-verified (noodles) in
+        `read_header_and_replay` and `open_bam_from_stdin_boxed_buf`: the
+        CRC-configurable fgumi-bgzf reader's readahead over-consumes the
+        `TeeReader` and breaks the exact-byte header replay — documented on
+        `read_header_and_replay`, not a bug. `fgumi sort` intentionally pins
+        `verify_crc: true` (parity with the pre-chain owned sorter, which always
+        verified incl. stdin); its missing `--no-check-crc` opt-out is tracked in
+        a separate issue, not a defect.
     - path: "**/tests/**/*.rs"
       instructions: >-
         Generate test data programmatically (SamBuilder / fgpyo-style builders);
