@@ -32,17 +32,14 @@ use std::sync::atomic::AtomicU64;
 
 use anyhow::{Result, bail, ensure};
 use clap::Parser;
-use fgumi_bam_io::{ProgressTracker, create_raw_bam_reader_with_opts, create_raw_bam_writer};
 use fgumi_raw_bam::{RawRecord, append_raw_tag, remove_tag};
-use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    add_pg_record, ensure_hd_record, reject_output_collisions,
+    reject_output_collisions,
 };
-use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::sam::SamTag;
 
@@ -145,7 +142,7 @@ impl FromStr for RetagOp {
 /// `dst_overwritten` counts `copy`/`move` records whose destination already held a
 /// value that was replaced (always `0` for `delete`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct OpCounts {
+pub(crate) struct OpCounts {
     /// Records where the source tag was present and the operation was applied.
     pub records_applied: u64,
     /// Records (copy/move) where an existing destination value was overwritten.
@@ -188,21 +185,21 @@ fn copy_tag(record: &mut RawRecord, src: SamTag, dst: SamTag, counts: &mut OpCou
 /// Operations are pure per-record edits: `copy` adds `dst` and keeps `src`, `move`
 /// additionally drops `src`, and `delete` drops `src`. A record missing the source
 /// tag is left unchanged and counted in `src_missing`.
-pub fn apply_op(record: &mut RawRecord, op: &RetagOp, counts: &mut OpCounts) {
+pub(crate) fn apply_op(record: &mut RawRecord, op: RetagOp, counts: &mut OpCounts) {
     match op {
         RetagOp::Copy { src, dst } => {
-            copy_tag(record, *src, *dst, counts);
+            copy_tag(record, src, dst, counts);
         }
         RetagOp::Move { src, dst } => {
             // The parser rejects `src == dst`, so removing `src` never touches the
             // just-written `dst`.
-            if copy_tag(record, *src, *dst, counts) {
-                remove_tag(record.as_mut_vec(), *src);
+            if copy_tag(record, src, dst, counts) {
+                remove_tag(record.as_mut_vec(), src);
             }
         }
         RetagOp::Delete { src } => {
-            if record.tags().contains(*src) {
-                remove_tag(record.as_mut_vec(), *src);
+            if record.tags().contains(src) {
+                remove_tag(record.as_mut_vec(), src);
                 counts.records_applied += 1;
             } else {
                 counts.src_missing += 1;
@@ -343,10 +340,10 @@ pub struct Retag {
 
     /// Optional TSV file for per-operation metrics.
     ///
-    /// Works with `--threads`: the per-operation counts are summed across the
-    /// pipeline's worker threads, so the metrics are identical to a
-    /// single-threaded run. (This differs from `clip`, whose per-read metrics
-    /// are not summable and so are rejected under `--threads`.)
+    /// The per-operation counts are summed across the pipeline's worker threads,
+    /// so the metrics are identical regardless of `--threads`. (This differs from
+    /// `clip`, whose per-read metrics are not summable and so are rejected under
+    /// `--threads`.)
     #[arg(short = 'M', long = "metrics")]
     pub metrics: Option<PathBuf>,
 
@@ -354,16 +351,17 @@ pub struct Retag {
     #[command(flatten)]
     pub compression: CompressionOptions,
 
-    /// Threading options: `--threads N` routes through the declarative chain
-    /// builder (the typed-step pipeline) via `execute_chain`.
+    /// Threading options. retag always runs on the declarative chain builder (the
+    /// typed-step pipeline) via `execute_chain`; `--threads N` only sets the
+    /// worker count. Absent, the chain runs at a single worker.
     #[command(flatten)]
     pub threading: ThreadingOptions,
 
-    /// Scheduler and pipeline stats options (used only in `--threads` mode).
+    /// Scheduler and pipeline stats options.
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
 
-    /// Pipeline queue memory options (used only in `--threads` mode).
+    /// Pipeline queue memory options.
     #[command(flatten)]
     pub queue_memory: QueueMemoryOptions,
 }
@@ -401,51 +399,16 @@ impl Retag {
 }
 
 impl Retag {
-    /// Single-threaded fast path: a serial read → rewrite → write loop.
-    ///
-    /// Reached when `--threads` is absent. Opens its own record reader and
-    /// writer (both single-thread), synthesizes the `@HD`/`@PG` header, and
-    /// returns the record count plus the per-operation counts (positionally
-    /// indexed against `self.operations`) for shared summary/metrics reporting.
-    fn run_single_threaded(&self, command_line: &str) -> Result<(u64, Vec<OpCounts>)> {
-        let (mut reader, header) =
-            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
-        // Synthesize @HD VN:1.6 SO:unsorted when absent, then chain a @PG for provenance.
-        let header = ensure_hd_record(header)?;
-        let header = add_pg_record(header, command_line)?;
-
-        let mut writer =
-            create_raw_bam_writer(&self.io.output, &header, 1, self.compression.compression_level)?;
-
-        let mut counts = vec![OpCounts::default(); self.operations.len()];
-        let mut record_count: u64 = 0;
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
-
-        let mut record = RawRecord::new();
-        while reader.read_record(&mut record)? != 0 {
-            for (op, op_counts) in self.operations.iter().zip(counts.iter_mut()) {
-                apply_op(&mut record, op, op_counts);
-            }
-            writer.write_raw_record(record.as_ref())?;
-            record_count += 1;
-            progress.log_if_needed(1);
-        }
-        progress.log_final();
-
-        // Flush before summarizing so any write error surfaces here, not silently on drop.
-        writer.finish()?;
-        Ok((record_count, counts))
-    }
-
-    /// Route `--threads N` onto the declarative chain builder
+    /// Run the retag on the declarative chain builder
     /// (`ChainSpec::single_stage(Stage::Retag, …)` → `build_for(spec)?.run()`).
     ///
-    /// The no-`--threads` `run_single_threaded` serial loop is the in-process
-    /// parity oracle; this path produces identical output records + `--metrics`
-    /// TSV. Diagnostics (the `Starting Retag` banner, the `OperationTimer`, and
-    /// the summary/warn/metrics finalize hooks) are emitted inside
+    /// The chain is the only execution path: `execute` always dispatches here,
+    /// with or without `--threads` (absent `--threads` runs the chain at a single
+    /// worker). All user-facing diagnostics — the `Starting Retag` banner, the
+    /// `OperationTimer`, the Input/Output/Operation lines, and the
+    /// summary/warn/metrics finalize hooks — are emitted inside
     /// `ChainBuilder::add_retag`, matching the `add_filter`/`add_dedup`
-    /// convention — so `execute_chain` itself only surfaces the CRC policy and
+    /// convention, so `execute_chain` itself only surfaces the CRC policy and
     /// runs the pipeline (mirrors `dedup`/`group` `execute_chain`).
     fn execute_chain(&self, command_line: &str) -> Result<()> {
         use crate::pipeline::chains::{
@@ -477,8 +440,7 @@ impl Retag {
 /// identical regardless of how the scheduler spread records across slots. Pulled
 /// out into a shared free function — used by the chain finalize hooks
 /// (`RetagFinalizeHook` and `RetagMetricsFinalizeHook`) to reduce the per-thread
-/// accumulator; the serial oracle builds its `Vec<OpCounts>` directly and does
-/// not call this — so the cross-slot merge is unit-testable with several
+/// accumulator — so the cross-slot merge is unit-testable with several
 /// deliberately-populated slots, rather than left to scheduler luck.
 pub(crate) fn sum_slot_counts(
     collected: &PerThreadAccumulator<Vec<OpCounts>>,
@@ -511,69 +473,20 @@ impl Command for Retag {
         // Reject it up front, resolving symlinks/`.`/`..` via canonicalize, before any
         // reader or writer opens (matching `merge`'s output-vs-input guard).
         self.reject_write_aliasing_input()?;
-        // Route on --threads BEFORE the CRC log / banner / timer. `--threads`
-        // dispatches to the chain builder, which emits its own banner + timer in
-        // `add_retag` and its own CRC log in `execute_chain`; running them here
-        // first would double-log and pre-consume stdin. The no-`--threads` serial
-        // path (the in-process parity oracle) keeps the CRC log, banner, and the
-        // metrics/summary tail below.
-        if self.threading.threads.is_some() {
-            return self.execute_chain(command_line);
-        }
-
-        // Surface the effective CRC-verification policy once, at run start, honoring
-        // the `--check-crc` doc's promise of a per-run `CRC verify:` line.
-        self.io.log_effective_check_crc();
-
-        let timer = OperationTimer::new("Rewriting tags");
-        info!("Starting Retag");
-        info!("Input: {}", self.io.input.display());
-        info!("Output: {}", self.io.output.display());
-        for op in &self.operations {
-            info!("Operation: {op}");
-        }
-
-        // No-`--threads` serial fast path: the in-process parity oracle.
-        let (record_count, counts) = self.run_single_threaded(command_line)?;
-
-        // Warn on operations that never matched — the usual sign of a mistyped source tag.
-        for (op, op_counts) in self.operations.iter().zip(&counts) {
-            if op_counts.records_applied == 0 {
-                warn!(
-                    "operation '{op}' matched zero records: no record carried the source tag '{}'",
-                    op.src()
-                );
-            }
-        }
-
-        if let Some(path) = &self.metrics {
-            let rows: Vec<RetagMetric> = self
-                .operations
-                .iter()
-                .zip(&counts)
-                .map(|(op, c)| RetagMetric::from_counts(*op, c))
-                .collect();
-            fgumi_metrics::write_metrics(path, &rows, "retag")?;
-            info!("Wrote metrics to: {}", path.display());
-        }
-
-        info!("=== Summary ===");
-        info!("Records processed: {record_count}");
-        for (op, op_counts) in self.operations.iter().zip(&counts) {
-            info!(
-                "{op}: applied={} overwritten={} missing={}",
-                op_counts.records_applied, op_counts.dst_overwritten, op_counts.src_missing
-            );
-        }
-
-        timer.log_completion(record_count);
-        Ok(())
+        // The declarative chain is the only execution path. It emits its own CRC
+        // log, `Starting Retag` banner + `OperationTimer`, and the
+        // summary/warn/metrics finalize hooks inside `ChainBuilder::add_retag`
+        // (running any of those here first would double-log and pre-consume
+        // stdin), so `execute` does only the pre-flight validation above and then
+        // dispatches. Absent `--threads` runs the chain at a single worker.
+        self.execute_chain(command_line)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fgumi_bam_io::{create_raw_bam_reader_with_opts, create_raw_bam_writer};
     use fgumi_raw_bam::{RawTagsView, SamBuilder, aux_data_slice};
     use noodles::sam::Header;
     use rstest::rstest;
@@ -623,7 +536,7 @@ mod tests {
     /// Apply one op to a record starting from zeroed counts; return the counts.
     fn apply_one(record: &mut RawRecord, op: RetagOp) -> OpCounts {
         let mut counts = OpCounts::default();
-        apply_op(record, &op, &mut counts);
+        apply_op(record, op, &mut counts);
         counts
     }
 
@@ -676,7 +589,7 @@ mod tests {
     fn apply_all(record: &mut RawRecord, ops: &[RetagOp]) -> Vec<OpCounts> {
         let mut counts = vec![OpCounts::default(); ops.len()];
         for (op, c) in ops.iter().zip(counts.iter_mut()) {
-            apply_op(record, op, c);
+            apply_op(record, *op, c);
         }
         counts
     }
@@ -911,7 +824,7 @@ mod tests {
     }
 
     /// Build a `Retag` command with explicit operations and threading, for the
-    /// serial-vs-pipeline parity tests.
+    /// worker-count invariance tests (single worker vs multi-worker chain).
     fn retag_cmd_with(
         input: PathBuf,
         output: PathBuf,
@@ -960,7 +873,7 @@ mod tests {
         assert_eq!(records[0].tags().find_string(tag("RX")), Some(b"ACGT".as_ref()));
     }
 
-    // ── threaded pipeline: parity with the single-threaded path ──────────────
+    // ── worker-count invariance: output independent of --threads ─────────────
 
     /// A header with one `@SQ` (`chr1`), so the mapped records in
     /// [`build_varied_records`] carry a valid reference id.
@@ -993,18 +906,18 @@ mod tests {
         header
     }
 
-    /// Build 50 varied records spanning the record classes where a serial-vs-threaded
-    /// decode divergence could hide. Every record carries a distinct `RX`; read names
-    /// encode the input index (`r0000`..`r0049`) so order can be asserted after a
-    /// parallel run. `ZZ` is never present.
+    /// Build 50 varied records spanning the record classes where a
+    /// worker-count-dependent decode divergence could hide. Every record carries a
+    /// distinct `RX`; read names encode the input index (`r0000`..`r0049`) so order
+    /// can be asserted after a multi-worker run. `ZZ` is never present.
     ///
     /// - even `i` also carry `MI`;
     /// - every 5th record pre-carries `BX`, so `RX::copy::BX` overwrites it and the
-    ///   `dst_overwritten` counter is exercised (and its threaded aggregation checked);
+    ///   `dst_overwritten` counter is exercised (and its cross-worker aggregation checked);
     /// - every 3rd record is a mapped, paired read (real CIGAR, position, `MC`/`RG`
-    ///   tags, mate info) — some flagged secondary — so the threaded path's extra
-    ///   per-record decode work (CIGAR walk, aux/mate parsing) runs on real input,
-    ///   not just trivial unmapped primaries.
+    ///   tags, mate info) — some flagged secondary — so the per-record decode work
+    ///   (CIGAR walk, aux/mate parsing) runs on real input, not just trivial
+    ///   unmapped primaries.
     fn build_varied_records() -> Vec<RawRecord> {
         use fgumi_raw_bam::flags;
         (0..50u32)
@@ -1022,7 +935,7 @@ mod tests {
                 }
                 if i % 3 == 0 {
                     // Mapped, paired read: exercises the CIGAR walk + mate/aux parsing
-                    // the threaded decode performs but the serial loop skips.
+                    // the per-record decode performs on real input.
                     let mut f = flags::PAIRED;
                     if i % 6 == 0 {
                         f |= flags::SECONDARY;
@@ -1049,7 +962,7 @@ mod tests {
     #[rstest]
     #[case::threads_1(1)]
     #[case::threads_4(4)]
-    fn threaded_output_matches_single_threaded(#[case] threads: usize) {
+    fn output_is_independent_of_worker_count(#[case] threads: usize) {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let input = dir.path().join("in.bam");
         write_bam_with_header(&input, &parity_header(), &build_varied_records());
@@ -1058,17 +971,18 @@ mod tests {
         // evens), delete a never-present tag.
         let ops = ["RX::copy::BX", "MI::move::CB", "ZZ::delete"];
 
-        let serial_out = dir.path().join("serial.bam");
-        let serial_tsv = dir.path().join("serial.tsv");
+        // No `--threads`: the chain at a single worker.
+        let single_worker_out = dir.path().join("single_worker.bam");
+        let single_worker_tsv = dir.path().join("single_worker.tsv");
         retag_cmd_with(
             input.clone(),
-            serial_out.clone(),
-            Some(serial_tsv.clone()),
+            single_worker_out.clone(),
+            Some(single_worker_tsv.clone()),
             &ops,
             ThreadingOptions::none(),
         )
         .execute("fgumi retag")
-        .expect("serial retag");
+        .expect("single-worker retag");
 
         let threaded_out = dir.path().join("threaded.bam");
         let threaded_tsv = dir.path().join("threaded.tsv");
@@ -1085,28 +999,32 @@ mod tests {
         // Decoded records are identical in order and content. (Compressed BAM bytes
         // may differ — the pipeline writer chunks BGZF blocks differently — so we
         // compare decoded records, not file bytes.)
-        let serial_recs = read_bam(&serial_out);
+        let single_worker_recs = read_bam(&single_worker_out);
         let threaded_recs = read_bam(&threaded_out);
-        assert_eq!(serial_recs.len(), threaded_recs.len(), "record count differs");
-        for (i, (a, b)) in serial_recs.iter().zip(&threaded_recs).enumerate() {
-            assert_eq!(a.as_ref(), b.as_ref(), "record {i} differs between modes");
+        assert_eq!(single_worker_recs.len(), threaded_recs.len(), "record count differs");
+        for (i, (a, b)) in single_worker_recs.iter().zip(&threaded_recs).enumerate() {
+            assert_eq!(a.as_ref(), b.as_ref(), "record {i} differs between worker counts");
         }
 
-        // The synthesized @HD and chained @PG header must also match between modes.
-        // Both runs pass the same command line, so the headers are byte-identical.
+        // The synthesized @HD and chained @PG header must also match across worker
+        // counts. Both runs pass the same command line, so the headers are byte-identical.
         assert_eq!(
-            read_bam_header(&serial_out),
+            read_bam_header(&single_worker_out),
             read_bam_header(&threaded_out),
-            "output header differs between modes"
+            "output header differs between worker counts"
         );
 
-        // Per-operation metrics TSV is byte-identical between modes (u64 counts sum
-        // commutatively, rows emitted in operation order).
-        let serial_metrics = std::fs::read_to_string(&serial_tsv).expect("serial tsv");
+        // Per-operation metrics TSV is byte-identical across worker counts (u64 counts
+        // sum commutatively, rows emitted in operation order).
+        let single_worker_metrics =
+            std::fs::read_to_string(&single_worker_tsv).expect("single-worker tsv");
         let threaded_metrics = std::fs::read_to_string(&threaded_tsv).expect("threaded tsv");
-        assert_eq!(serial_metrics, threaded_metrics, "metrics TSV differ between modes");
+        assert_eq!(
+            single_worker_metrics, threaded_metrics,
+            "metrics TSV differ between worker counts"
+        );
 
-        // Guard that the corpus actually exercises the counters whose threaded
+        // Guard that the corpus actually exercises the counters whose cross-worker
         // aggregation this test is here to check: `dst_overwritten > 0` (10 records
         // pre-carry BX) and the zero-match `delete` (drives the warning).
         let rx_row = threaded_metrics.lines().nth(1).expect("RX row");
