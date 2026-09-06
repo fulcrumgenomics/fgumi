@@ -244,49 +244,101 @@ pub struct Duplex {
 
 /// Duplex-stage tuning, independent of how the values were supplied.
 ///
-/// See [`crate::commands::zipper::ZipperOptions`] for why this is a plain
-/// struct rather than a flattened `clap::Args`. Note that the consensus-calling
+/// Derives `clap::Args` and carries `#[fgumi_cli_macros::multi_options]` so a
+/// future fused `runall` command can re-expose each field as a prefixed
+/// `--duplex::<flag>`, via the generated `MultiDuplexOptions` companion,
+/// without hand-maintaining a parallel option set. This struct itself is not
+/// flattened into [`Duplex`] or anywhere else by this change — the standalone
+/// command still fills [`Duplex`]'s own fields (including its nested
+/// `consensus` / `overlapping` sub-structs) and projects them through
+/// [`Duplex::to_duplex_options`]; that path is untouched. The consensus-calling
 /// knobs are held **flat** here even though [`Duplex`] nests them behind
-/// `#[command(flatten)]` sub-structs: the chain builder wants one bag per stage,
-/// not a re-run of the CLI's grouping.
-#[derive(Debug, Clone)]
+/// `#[command(flatten)]` sub-structs: the chain builder wants one bag per
+/// stage, not a re-run of the CLI's grouping. Each `#[arg]` below is copied
+/// verbatim from the corresponding field on [`ConsensusCallingOptions`] /
+/// [`OverlappingConsensusOptions`].
+///
+/// `tie_rule` is `#[arg(skip)]`: on the standalone command it is resolved from
+/// `TieRuleArg` (a hidden, cross-tool equivalency-testing knob), and
+/// `--duplex::tie-rule` is not re-exposed by `runall`. [`fgumi_consensus::TieRule`]
+/// implements `Default` (`FgbioCompat`), matching `TieRuleArg::FgbioCompat`'s
+/// resolution.
+///
+/// `allow_unmapped` is `#[arg(skip = AllowUnmappedOptions { enabled: false })]`:
+/// [`AllowUnmappedOptions`] does not implement `Default`, so the explicit
+/// expression form is required; `enabled: false` matches the standalone
+/// command's default.
+///
+/// `io` / `rejects_opts` / `stats_opts` / `read_group` are `#[arg(skip)]`
+/// data carriers baked in by `runall`, not `--duplex::` flags — each carrier
+/// type implements `Default`.
+///
+/// `methylation_mode` is `#[arg(skip)]`: on the standalone command it is
+/// resolved from `Option<MethylationModeArg>` via
+/// [`crate::commands::common::resolve_methylation_mode`], and
+/// `--methylation-mode` itself is a cross-stage top-level `runall` flag
+/// (PR B), not a `--duplex::` flag. [`fgumi_consensus::MethylationMode`]
+/// implements `Default` (`Disabled`), which is what the skipped field falls
+/// back to.
+///
+/// `reference` is `#[arg(skip)]`: `--ref` is a cross-stage top-level `runall`
+/// flag (PR B), not a `--duplex::` flag.
+#[fgumi_cli_macros::multi_options("duplex", "Duplex Options")]
+#[derive(Debug, Clone, clap::Args)]
 pub struct DuplexOptions {
     /// Pre-UMI error rate (phred).
+    #[arg(short = '1', long = "error-rate-pre-umi", default_value = "45")]
     pub error_rate_pre_umi: u8,
     /// Post-UMI error rate (phred).
+    #[arg(short = '2', long = "error-rate-post-umi", default_value = "40")]
     pub error_rate_post_umi: u8,
     /// Minimum input base quality.
+    #[arg(short = 'm', long = "min-input-base-quality", default_value = "10")]
     pub min_input_base_quality: u8,
     /// Emit per-base consensus tags.
+    #[arg(short = 'B', long = "output-per-base-tags", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub output_per_base_tags: bool,
     /// Trim consensus reads.
+    #[arg(long = "trim", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub trim: bool,
     /// Minimum consensus base quality.
+    #[arg(long = "min-consensus-base-quality", default_value = "2")]
     pub min_consensus_base_quality: u8,
     /// How to resolve a near-tie between the two most likely consensus bases.
+    #[arg(skip)]
     pub tie_rule: fgumi_consensus::TieRule,
     /// Call overlapping bases jointly.
+    #[arg(long = "consensus-call-overlapping-bases", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub consensus_call_overlapping_bases: bool,
     /// Minimum reads per consensus, per tier.
+    #[arg(short = 'M', long = "min-reads", value_delimiter = ',', default_value = "1")]
     pub min_reads: Vec<usize>,
     /// Cap on reads per strand.
+    #[arg(long = "max-reads-per-strand")]
     pub max_reads_per_strand: Option<usize>,
     /// Let fully-unmapped primary templates through the pre-group filter.
     ///
     /// Carried as the whole flattened sub-struct, like `io` / `rejects_opts` /
     /// `read_group`, rather than as a bare `bool`.
+    #[arg(skip = AllowUnmappedOptions { enabled: false })]
     pub allow_unmapped: AllowUnmappedOptions,
     /// Input/output paths and reader mode.
+    #[arg(skip)]
     pub io: BamIoOptions,
     /// Optional rejects output.
+    #[arg(skip)]
     pub rejects_opts: RejectsOptions,
     /// Optional stats output.
+    #[arg(skip)]
     pub stats_opts: StatsOptions,
     /// Read-group identity for emitted reads.
+    #[arg(skip)]
     pub read_group: ReadGroupOptions,
     /// Resolved methylation calling mode (`Disabled` when the flag is unset).
+    #[arg(skip)]
     pub methylation_mode: fgumi_consensus::MethylationMode,
     /// Reference FASTA for methylation-aware modes.
+    #[arg(skip)]
     pub reference: Option<std::path::PathBuf>,
 }
 
@@ -2445,5 +2497,96 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // DuplexOptions / MultiDuplexOptions parity (multi_options)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// `MultiDuplexOptions` derives `clap::Args`, not `Parser` — flatten it into
+    /// a local wrapper to drive it through `try_parse_from`.
+    #[derive(clap::Parser, Debug)]
+    struct PrefixedDuplex {
+        #[command(flatten)]
+        opts: MultiDuplexOptions,
+    }
+
+    /// The re-exposed `MultiDuplexOptions` defaults must equal the standalone
+    /// `duplex` command's defaults, projected through `to_duplex_options`. This
+    /// is the strong oracle: it fails on a dropped default, a misclassified
+    /// field, or a value that only happens to match by coincidence.
+    ///
+    /// `io` / `rejects_opts` / `stats_opts` / `read_group` are `#[arg(skip)]`
+    /// data carriers on `MultiDuplexOptions`, so their values come from each
+    /// carrier's own `Default` rather than from `base` — `base.io.input` /
+    /// `base.io.output` are real paths (`-i`/`-o` are required), while
+    /// `multi.io.input` / `multi.io.output` are the empty `PathBuf` default.
+    /// Every other carrier sub-field is unset on both sides and does compare
+    /// equal.
+    #[test]
+    fn multi_duplex_options_defaults_match_command() {
+        let base = Duplex::try_parse_from(["duplex", "-i", "in.bam", "-o", "o.bam"])
+            .expect("parses")
+            .to_duplex_options();
+        let multi =
+            PrefixedDuplex::try_parse_from(["x"]).expect("parses").opts.validate().expect("valid");
+
+        assert_eq!(multi.error_rate_pre_umi, base.error_rate_pre_umi);
+        assert_eq!(multi.error_rate_post_umi, base.error_rate_post_umi);
+        assert_eq!(multi.min_input_base_quality, base.min_input_base_quality);
+        assert_eq!(multi.output_per_base_tags, base.output_per_base_tags);
+        assert_eq!(multi.trim, base.trim);
+        assert_eq!(multi.min_consensus_base_quality, base.min_consensus_base_quality);
+        assert_eq!(multi.tie_rule, base.tie_rule);
+        assert_eq!(multi.consensus_call_overlapping_bases, base.consensus_call_overlapping_bases);
+        assert_eq!(multi.min_reads, base.min_reads);
+        assert_eq!(multi.max_reads_per_strand, base.max_reads_per_strand);
+        assert_eq!(multi.methylation_mode, base.methylation_mode);
+        assert_eq!(multi.reference, base.reference);
+
+        assert_eq!(multi.allow_unmapped.enabled, base.allow_unmapped.enabled);
+        assert_eq!(multi.io.async_reader, base.io.async_reader);
+        assert_eq!(multi.io.check_crc, base.io.check_crc);
+        assert_eq!(multi.io.no_check_crc, base.io.no_check_crc);
+        assert_eq!(multi.rejects_opts.rejects, base.rejects_opts.rejects);
+        assert_eq!(multi.stats_opts.stats, base.stats_opts.stats);
+        assert_eq!(multi.read_group.read_group_id, base.read_group.read_group_id);
+        assert_eq!(multi.read_group.read_name_prefix, base.read_group.read_name_prefix);
+    }
+
+    /// A prefixed flag must round-trip through `MultiDuplexOptions::validate`.
+    #[test]
+    fn multi_duplex_options_round_trips_min_reads() {
+        let multi = PrefixedDuplex::try_parse_from(["x", "--duplex::min-reads", "2,3"])
+            .expect("parses")
+            .opts
+            .validate()
+            .expect("valid");
+        assert_eq!(multi.min_reads, vec![2, 3]);
+    }
+
+    /// Guards the hand-written `impl Default for DuplexOptions` against
+    /// drifting from the standalone `duplex` command's
+    /// `#[arg(default_value...)]` literals.
+    #[test]
+    fn duplex_options_default_matches_cli_defaults() {
+        let parsed = Duplex::try_parse_from(["duplex", "-i", "in.bam", "-o", "o.bam"])
+            .expect("parses")
+            .to_duplex_options();
+        let d = DuplexOptions::default();
+        assert_eq!(d.error_rate_pre_umi, parsed.error_rate_pre_umi);
+        assert_eq!(d.error_rate_post_umi, parsed.error_rate_post_umi);
+        assert_eq!(d.min_input_base_quality, parsed.min_input_base_quality);
+        assert_eq!(d.output_per_base_tags, parsed.output_per_base_tags);
+        assert_eq!(d.trim, parsed.trim);
+        assert_eq!(d.min_consensus_base_quality, parsed.min_consensus_base_quality);
+        assert_eq!(d.consensus_call_overlapping_bases, parsed.consensus_call_overlapping_bases);
+        assert_eq!(d.min_reads, parsed.min_reads);
+        // Chain-engine skip field: no `--duplex::tie-rule` CLI flag exists to
+        // parse, so compare directly against the resolved default.
+        assert_eq!(d.tie_rule, fgumi_consensus::TieRule::default());
+        // Skip field: `AllowUnmappedOptions` has no `PartialEq`, so compare its
+        // `enabled` flag directly against the `#[arg(skip = ...)]` literal.
+        assert!(!d.allow_unmapped.enabled);
     }
 }

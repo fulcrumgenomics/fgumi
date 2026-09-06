@@ -341,35 +341,87 @@ pub struct CorrectUmis {
 
 /// CorrectUmis-stage tuning, independent of how the values were supplied.
 ///
-/// See [`crate::commands::zipper::ZipperOptions`] for why this is a plain
-/// struct rather than a flattened `clap::Args`. Note that the rejects path is
-/// held **flat** here even though [`CorrectUmis`] nests it behind a
-/// `#[command(flatten)]` sub-struct: the chain builder wants one bag per stage,
-/// not a re-run of the CLI's grouping.
-#[derive(Debug, Clone)]
+/// See [`crate::commands::zipper::ZipperOptions`] for why this derives
+/// `clap::Args` and carries `#[fgumi_cli_macros::multi_options]` even though it
+/// is never flattened into [`CorrectUmis`] or anywhere else by this change —
+/// the standalone command still fills [`CorrectUmis`]'s own fields and projects
+/// them through [`CorrectUmis::to_correct_options`]; that path is untouched.
+/// Note that `rejects_path` is held **flat** here even though [`CorrectUmis`]
+/// nests it behind a `#[command(flatten)]` `RejectsOptions` sub-struct: the
+/// chain builder wants one bag per stage, not a re-run of the CLI's grouping,
+/// and the macro rejects a field-level `#[command(flatten)]` outright — so it
+/// is re-exposed directly as its own `--correct::rejects` flag here.
+#[fgumi_cli_macros::multi_options("correct", "Correct Options")]
+#[derive(Debug, Clone, clap::Args)]
 pub struct CorrectOptions {
     /// Optional metrics output.
+    #[arg(short = 'M', long)]
     pub metrics: Option<PathBuf>,
     /// Which SAM tag is corrected: `RX`/`OX` for UMIs, `BC`/`ob` for barcodes.
+    #[arg(short = 't', long, value_enum, default_value_t = Target::Umi)]
     pub target: Target,
     /// Maximum mismatches when matching a UMI.
+    #[arg(long, default_value = "2")]
     pub max_mismatches: usize,
     /// Minimum distance to the runner-up UMI.
+    #[arg(short = 'd', long = "min-distance")]
     pub min_distance_diff: usize,
     /// Expected UMI sequences.
+    #[arg(short = 'u', long)]
     pub umis: Vec<String>,
     /// Files holding expected UMI sequences.
+    #[arg(short = 'U', long)]
     pub umi_files: Vec<PathBuf>,
     /// Skip storing the original UMI.
+    #[arg(
+        long = "dont-store-original",
+        alias = "dont-store-original-umis",
+        value_name = "true|false",
+        default_value = "false",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true
+    )]
     pub dont_store_original_umis: bool,
     /// UMI match cache size.
+    #[arg(long, default_value = "100000")]
     pub cache_size: usize,
     /// Minimum corrected fraction before failing.
+    #[arg(long)]
     pub min_corrected: Option<f64>,
     /// Also match the reverse complement.
+    #[arg(long, value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub revcomp: bool,
     /// Optional rejects output path.
+    #[arg(long = "rejects")]
     pub rejects_path: Option<PathBuf>,
+}
+
+/// Values equal `CorrectUmis::try_parse_from(["correct", "-i", "in.bam", "-o",
+/// "out.bam", "-d", "2"]).to_correct_options()` — the minimal invocation that
+/// satisfies every clap-required flag (`--min-distance` has no `default_value`
+/// so clap demands it; `--umis` is a bare `Vec<String>` and is not clap-required,
+/// so it comes back empty). `min_distance_diff: 2` mirrors the module doc
+/// example and the pipeline step's hand-written test fixture
+/// (`pipeline::steps::correct::tests::make_default_opts`) rather than a
+/// meaningless `0`.
+impl Default for CorrectOptions {
+    fn default() -> Self {
+        Self {
+            metrics: None,
+            target: Target::Umi,
+            max_mismatches: 2,
+            min_distance_diff: 2,
+            umis: Vec::new(),
+            umi_files: Vec::new(),
+            dont_store_original_umis: false,
+            cache_size: 100_000,
+            min_corrected: None,
+            revcomp: false,
+            rejects_path: None,
+        }
+    }
 }
 
 impl CorrectUmis {
@@ -4405,5 +4457,110 @@ mod tests {
     #[test]
     fn target_default_is_umi() {
         assert_eq!(Target::default(), Target::Umi);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // CorrectOptions / MultiCorrectOptions parity (multi_options)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[derive(clap::Parser, Debug)]
+    struct PrefixedCorrect {
+        #[command(flatten)]
+        opts: MultiCorrectOptions,
+    }
+
+    /// The re-exposed `MultiCorrectOptions` defaults must equal the standalone
+    /// `correct` command's defaults, projected through `to_correct_options`.
+    /// This is the strong oracle: it fails on a dropped default, a
+    /// misclassified field, or a value that only happens to match by
+    /// coincidence. `--min-distance` has no `default_value` on the standalone
+    /// command, so both sides are anchored with the SAME non-default value
+    /// (`-d 1 -u AAA`) rather than compared against a default.
+    #[test]
+    fn multi_correct_options_defaults_match_command() {
+        let base = CorrectUmis::try_parse_from([
+            "correct", "-i", "in.bam", "-o", "o.bam", "-d", "1", "-u", "AAA",
+        ])
+        .expect("parses")
+        .to_correct_options();
+        let multi = PrefixedCorrect::try_parse_from([
+            "x",
+            "--correct::min-distance",
+            "1",
+            "--correct::umis",
+            "AAA",
+        ])
+        .expect("parses")
+        .opts
+        .validate()
+        .expect("valid");
+
+        // Anchor fields: both sides were fed the same non-default value.
+        assert_eq!(multi.min_distance_diff, base.min_distance_diff);
+        assert_eq!(multi.umis, base.umis);
+
+        // Every other projected field must sit at its default on both sides.
+        assert_eq!(multi.max_mismatches, base.max_mismatches);
+        assert_eq!(multi.cache_size, base.cache_size);
+        assert_eq!(multi.min_corrected, base.min_corrected);
+        assert_eq!(multi.revcomp, base.revcomp);
+        assert_eq!(multi.dont_store_original_umis, base.dont_store_original_umis);
+        assert_eq!(multi.metrics, base.metrics);
+        assert_eq!(multi.target, base.target);
+        assert_eq!(multi.umi_files, base.umi_files);
+        assert_eq!(multi.rejects_path, base.rejects_path);
+    }
+
+    /// A prefixed flag must round-trip through `MultiCorrectOptions::validate`.
+    #[test]
+    fn multi_correct_options_round_trips_a_supplied_flag() {
+        let multi = PrefixedCorrect::try_parse_from([
+            "x",
+            "--correct::min-distance",
+            "1",
+            "--correct::umis",
+            "AAA",
+            "--correct::max-mismatches",
+            "3",
+        ])
+        .expect("parses")
+        .opts
+        .validate()
+        .expect("valid");
+        assert_eq!(multi.max_mismatches, 3);
+    }
+
+    /// `--correct::min-distance` has no default on the standalone command, so
+    /// the macro must lift it to a staged-required field: omitting it must
+    /// parse fine (staged validation, not clap, owns the requirement) but fail
+    /// `validate()`.
+    #[test]
+    fn multi_correct_options_min_distance_is_staged_required() {
+        let parsed = PrefixedCorrect::try_parse_from(["x"]).expect("parse is staged, not clap");
+        let err = parsed.opts.validate().expect_err("min-distance must be required");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--correct::min-distance is required"),
+            "error should name --correct::min-distance: {msg}"
+        );
+    }
+
+    /// Guards the hand-written `impl Default for CorrectOptions` against
+    /// drifting from the standalone `correct` command's
+    /// `#[arg(default_value...)]` literals. `--min-distance` has no CLI
+    /// default (it is required), so it is supplied but not asserted here.
+    #[test]
+    fn correct_options_default_matches_cli_defaults() {
+        let parsed = CorrectUmis::try_parse_from([
+            "correct", "-i", "in.bam", "-o", "o.bam", "-d", "1", "-u", "AAA",
+        ])
+        .expect("parses")
+        .to_correct_options();
+        let d = CorrectOptions::default();
+        assert_eq!(d.target, parsed.target);
+        assert_eq!(d.max_mismatches, parsed.max_mismatches);
+        assert_eq!(d.dont_store_original_umis, parsed.dont_store_original_umis);
+        assert_eq!(d.cache_size, parsed.cache_size);
+        assert_eq!(d.revcomp, parsed.revcomp);
     }
 }
