@@ -182,6 +182,10 @@ EXAMPLES:
   # Reserve extra memory for bwa mem running in a pipeline
   fgumi sort -i input.bam -o sorted.bam --memory-reserve 12GiB --threads 4
 
+  # Skip CRC32 verification on a file you trust (stdin input already skips
+  # by default; pass --check-crc to force verification on)
+  fgumi sort -i input.bam -o sorted.bam --no-check-crc
+
   # Cede cores to the aligner during ingest, but keep the merge wide
   bwa mem -t 32 ref.fa r1.fq r2.fq | fgumi sort -i - -o sorted.bam -@ 8 --sort-threads 4
 
