@@ -820,12 +820,15 @@ fn copy_stored_and_verify_slice(
     out: &mut [u8],
     expected_crc: u32,
     block_len: usize,
+    verify_crc: bool,
 ) -> io::Result<usize> {
     // `out` is caller-sized to the footer's ISIZE, so passing `out.len()` also
     // enforces LEN == ISIZE; the returned payload is then exactly `out.len()`.
+    // The LEN/ISIZE check runs unconditionally; `verify_crc` gates only the
+    // footer CRC32 compare (see `verify_decompression`).
     let payload = parse_stored_frame(compressed, out.len())?;
     out.copy_from_slice(payload);
-    verify_decompression(out, out.len(), expected_crc, block_len, true)?;
+    verify_decompression(out, out.len(), expected_crc, block_len, verify_crc)?;
     Ok(out.len())
 }
 
@@ -833,22 +836,24 @@ fn copy_stored_and_verify_slice(
 /// the BGZF footer, returning the number of bytes written.
 ///
 /// `out.len()` is taken as the expected uncompressed size, so
-/// [`verify_decompression`] checks both the exact fill
-/// (`bytes_written == out.len()`) and the CRC32. Shared by
-/// [`decompress_into_slice`] and [`decompress_and_verify`]'s non-stored branch
-/// so the inflate-then-verify invariant lives in one place — the same reason
-/// [`parse_stored_frame`] exists for the stored branch.
+/// [`verify_decompression`] checks the exact fill
+/// (`bytes_written == out.len()`) unconditionally; `verify_crc` gates only the
+/// CRC32 compare. Shared by [`decompress_into_slice`] and
+/// [`decompress_and_verify`]'s non-stored branch so the inflate-then-verify
+/// invariant lives in one place — the same reason [`parse_stored_frame`] exists
+/// for the stored branch.
 fn deflate_into_slice_and_verify(
     compressed: &[u8],
     expected_crc: u32,
     block_len: usize,
     decompressor: &mut Decompressor,
     out: &mut [u8],
+    verify_crc: bool,
 ) -> io::Result<usize> {
     let bytes_written = decompressor.deflate_decompress(compressed, out).map_err(|e| {
         io::Error::new(io::ErrorKind::InvalidData, format!("BGZF decompression failed: {e:?}"))
     })?;
-    verify_decompression(&out[..bytes_written], out.len(), expected_crc, block_len, true)?;
+    verify_decompression(&out[..bytes_written], out.len(), expected_crc, block_len, verify_crc)?;
     Ok(bytes_written)
 }
 
@@ -896,10 +901,36 @@ fn deflate_into_slice_and_verify(
 /// their output back. There is nothing to roll back to here: the buffer belongs
 /// to the caller, who must treat its contents as undefined unless this returns
 /// `Ok`.
+///
+/// This entry point always verifies the CRC32; see
+/// [`decompress_into_slice_with_crc`] to opt out of the CRC compare for trusted
+/// input (the size and framing checks still run either way).
 pub fn decompress_into_slice(
     block: &[u8],
     decompressor: &mut Decompressor,
     out: &mut [u8],
+) -> io::Result<usize> {
+    decompress_into_slice_with_crc(block, decompressor, out, true)
+}
+
+/// [`decompress_into_slice`] with an explicit CRC32 policy.
+///
+/// `verify_crc = false` skips **only** the CRC32 compare against the BGZF
+/// footer, for trusted input (a freshly piped aligner stream). Everything else
+/// is unconditional: the ISIZE bound and slot-size check, the exact `BGZF_EOF`
+/// short-circuit, the stored-frame LEN/ISIZE checks, and the exact-fill check.
+/// `verify_crc = true` is identical to [`decompress_into_slice`]. This is the
+/// fixed-slice analogue of [`decompress_block_slice_into`]'s CRC opt-out.
+///
+/// # Errors
+///
+/// As [`decompress_into_slice`], except that a CRC32 mismatch is only reported
+/// when `verify_crc` is true.
+pub fn decompress_into_slice_with_crc(
+    block: &[u8],
+    decompressor: &mut Decompressor,
+    out: &mut [u8],
+    verify_crc: bool,
 ) -> io::Result<usize> {
     // Same accessor the caller sizes `out` with, so the two cannot disagree
     // about either the value or the bound. It carries the length and ISIZE
@@ -944,7 +975,13 @@ pub fn decompress_into_slice(
     // level-0 writer, [`InlineBgzfCompressor::new(0)`]) skip the libdeflater
     // round-trip and get the stored-framing-specific LEN/ISIZE diagnostics.
     if is_stored_block(compressed) {
-        return copy_stored_and_verify_slice(compressed, out, crc32_from_slice(block), block.len());
+        return copy_stored_and_verify_slice(
+            compressed,
+            out,
+            crc32_from_slice(block),
+            block.len(),
+            verify_crc,
+        );
     }
     deflate_into_slice_and_verify(
         compressed,
@@ -952,6 +989,7 @@ pub fn decompress_into_slice(
         block.len(),
         decompressor,
         out,
+        verify_crc,
     )
 }
 
@@ -2023,5 +2061,99 @@ mod tests {
             err.to_string().contains(expect_substr),
             "error should contain {expect_substr:?}, got: {err}"
         );
+    }
+
+    /// `decompress_into_slice_with_crc(.., verify_crc = false)` skips **only**
+    /// the CRC32 compare. A one-bit footer-CRC flip is rejected under `true`
+    /// and accepted under `false`, on both decode branches — level 0 takes
+    /// `copy_stored_and_verify_slice`, level 6 takes
+    /// `deflate_into_slice_and_verify` — and the decoded bytes are right.
+    #[rstest]
+    #[case::deflate_rejects_when_verifying(6, true, false)]
+    #[case::deflate_accepts_when_skipping(6, false, true)]
+    #[case::stored_rejects_when_verifying(0, true, false)]
+    #[case::stored_accepts_when_skipping(0, false, true)]
+    fn decompress_into_slice_with_crc_gates_only_the_crc_compare(
+        #[case] level: u32,
+        #[case] verify_crc: bool,
+        #[case] expect_ok: bool,
+    ) {
+        let (block, mut out) = block_bad_crc(level);
+        let result =
+            decompress_into_slice_with_crc(&block, &mut Decompressor::new(), &mut out, verify_crc);
+        if expect_ok {
+            let n = result.expect("verify_crc=false must skip the CRC32 compare");
+            assert_eq!(n, out.len(), "must still exactly fill the slot");
+            assert_eq!(out.as_slice(), one_block_payload().as_slice(), "payload decodes intact");
+        } else {
+            let err = result.expect_err("verify_crc=true must reject a CRC32 mismatch");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("CRC32"), "error should mention CRC32: {err}");
+        }
+    }
+
+    /// Every non-CRC check stays unconditional when `verify_crc = false`: the
+    /// size / framing / bound errors from `decompress_into_slice_rejects_invalid`
+    /// must fire identically. Only the `bad_crc` fixtures are excluded, because
+    /// they are the one class the flag is allowed to wave through.
+    #[rstest]
+    #[case::short_fill(block_short_fill(), "size mismatch")]
+    #[case::isize_above_max(block_isize_above_max(), "above the")]
+    #[case::oversized_out(block_oversized_out(), "output slice is")]
+    #[case::truncated_stored_framing(block_truncated_stored_framing(), "stored block too small")]
+    #[case::too_short_block(block_too_short(), "too short to contain")]
+    fn decompress_into_slice_with_crc_false_still_rejects_non_crc_faults(
+        #[case] block_and_out: (Vec<u8>, Vec<u8>),
+        #[case] expect_substr: &str,
+    ) {
+        let (block, mut out) = block_and_out;
+        let err = decompress_into_slice_with_crc(&block, &mut Decompressor::new(), &mut out, false)
+            .expect_err("non-CRC faults must be rejected even with verify_crc=false");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "expected InvalidData, got {err:?}");
+        assert!(
+            err.to_string().contains(expect_substr),
+            "error should contain {expect_substr:?}, got: {err}"
+        );
+    }
+
+    /// The exact `BGZF_EOF` marker short-circuits to `Ok(0)` regardless of the
+    /// flag, and a CRC-corrupted marker (still ISIZE 0, no longer the exact
+    /// bytes) is rejected under `true` and accepted under `false` — the same
+    /// contract the `Vec` API already has for the marker.
+    #[rstest]
+    #[case::exact_marker_verifying(false, true, true)]
+    #[case::exact_marker_skipping(false, false, true)]
+    #[case::corrupted_marker_verifying(true, true, false)]
+    #[case::corrupted_marker_skipping(true, false, true)]
+    fn decompress_into_slice_with_crc_eof_marker_contract(
+        #[case] corrupt: bool,
+        #[case] verify_crc: bool,
+        #[case] expect_ok: bool,
+    ) {
+        let mut block = BGZF_EOF.to_vec();
+        if corrupt {
+            block[BGZF_EOF.len() - BGZF_FOOTER_SIZE] ^= 0x01;
+        }
+        let result =
+            decompress_into_slice_with_crc(&block, &mut Decompressor::new(), &mut [], verify_crc);
+        if expect_ok {
+            assert_eq!(result.expect("zero-length slot must succeed"), 0);
+        } else {
+            let err = result.expect_err("a corrupted zero-size block must be verified");
+            assert!(err.to_string().contains("CRC32"), "got: {err}");
+        }
+    }
+
+    /// The pre-existing three-argument entry point is a thin `verify_crc = true`
+    /// delegate: it must keep rejecting a bad CRC on both branches. (Guards the
+    /// published API against a refactor that flips the delegate's default.)
+    #[rstest]
+    #[case::deflate(6)]
+    #[case::stored(0)]
+    fn decompress_into_slice_delegates_with_verify_crc_true(#[case] level: u32) {
+        let (block, mut out) = block_bad_crc(level);
+        let err = decompress_into_slice(&block, &mut Decompressor::new(), &mut out)
+            .expect_err("the plain entry point must still verify CRC32");
+        assert!(err.to_string().contains("CRC32"), "got: {err}");
     }
 }
