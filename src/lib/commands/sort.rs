@@ -35,8 +35,8 @@ use std::path::{Path, PathBuf};
 use crate::commands::command::Command;
 use crate::commands::common::{
     CompressionOptions, MaxTempFiles, MemoryLimit, MemoryReserve, QueueMemoryOptions,
-    SchedulerOptions, ThreadingOptions, parse_max_temp_files, parse_memory, parse_memory_reserve,
-    resolve_memory_budget,
+    SchedulerOptions, ThreadingOptions, log_check_crc, parse_max_temp_files, parse_memory,
+    parse_memory_reserve, resolve_check_crc, resolve_memory_budget,
 };
 use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag, build_for};
 
@@ -207,6 +207,30 @@ pub struct Sort {
     /// Output BAM file (required unless --verify is used).
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
+
+    /// Force CRC32 verification on while decoding the input BAM.
+    ///
+    /// Without either `--check-crc` or `--no-check-crc`, sorting verifies for
+    /// file input and skips verification for stdin input: a freshly-piped
+    /// aligner stream is trusted, since any corruption there is a bug in the
+    /// upstream process rather than data at rest, while a file may have been
+    /// archived, transferred, or copied since it was written, where a flipped
+    /// bit is exactly what CRC32 exists to catch. Pass `--check-crc` to force
+    /// verification on (e.g. for stdin input you don't trust). Mutually
+    /// exclusive with `--no-check-crc`. Applies to the sort's own record
+    /// decode; the BAM header block is always verified, and `--verify` mode is
+    /// unaffected. Every run logs a `CRC verify:` line at startup stating what
+    /// actually happened.
+    #[arg(long = "check-crc", default_value_t = false, conflicts_with = "no_check_crc")]
+    pub check_crc: bool,
+
+    /// Skip CRC32 verification while decoding the input BAM.
+    ///
+    /// Trades the CRC32 integrity check for faster decode. See `--check-crc`
+    /// for the default policy this overrides. Mutually exclusive with
+    /// `--check-crc`.
+    #[arg(long = "no-check-crc", default_value_t = false, conflicts_with = "check_crc")]
+    pub no_check_crc: bool,
 
     /// Verify the input file is correctly sorted (no output written).
     ///
@@ -810,11 +834,11 @@ impl Sort {
             // source: Auto probes the device and picks a concurrent-read count,
             // Fixed(n) pins it, Fixed(1) is the plain sequential reader.
             read_streams: self.read_streams,
-            // The owned engine always verified CRC (incl. stdin); keep parity -- a future
-            // PR can add --no-check-crc if opt-out is wanted. `effective_check_crc()` would
-            // skip verification for stdin input (the file-vs-stdin default other commands
-            // use), which is a silent regression from the owned sorter's behavior.
-            verify_crc: true,
+            // Same policy every other BAM command uses (`resolve_check_crc`):
+            // explicit flag wins, else verify file input and trust stdin. This
+            // reaches both decode paths -- the arena front (`InflateToArena`)
+            // for standalone sort and `BgzfDecompress` otherwise.
+            verify_crc: resolve_check_crc(self.check_crc, self.no_check_crc, &self.input),
             command_line: command_line.to_string(),
         }
     }
@@ -914,6 +938,16 @@ impl Command for Sort {
         }
 
         if self.verify {
+            // `--verify` reads through a separate noodles-backed reader that
+            // always verifies CRC, so the chain's `--check-crc`/`--no-check-crc`
+            // policy never reaches it. Warn rather than silently ignore a flag
+            // the user set.
+            if self.check_crc || self.no_check_crc {
+                warn!(
+                    "--check-crc/--no-check-crc have no effect with --verify: verification always \
+                     reads and checks every block; the flags apply only when sorting to --output"
+                );
+            }
             return self.execute_verify();
         }
 
@@ -1081,6 +1115,7 @@ impl Sort {
         info!("Input: {}", self.input.display());
         info!("Output: {}", output.display());
         info!("Sort order: {:?}", self.order);
+        log_check_crc(self.check_crc, self.no_check_crc, &self.input);
         if let Some(ct) = cell_tag {
             let ct_bytes = *ct;
             info!("Cell tag: {}{}", ct_bytes[0] as char, ct_bytes[1] as char);
@@ -1560,7 +1595,8 @@ mod tests {
         assert_eq!(spec.stages, vec![Stage::Sort]);
         assert_eq!(spec.threading.threads, Some(sort.threads));
         assert!(matches!(spec.source, SourceSpec::Bam(_)));
-        assert!(spec.verify_crc);
+        // File input with neither CRC flag: the file-vs-stdin default verifies.
+        assert!(spec.verify_crc, "file input must verify CRC by default");
         // --read-streams reaches the chain's BAM source (defaulted to Auto here),
         // proving the field is wired even without an explicit flag.
         assert_eq!(spec.read_streams, sort.read_streams);
@@ -1568,6 +1604,52 @@ mod tests {
             (true, SinkSpec::BamWithIndex(_)) | (false, SinkSpec::Bam(_)) => {}
             (wi, other) => panic!("write_index={wi} produced the wrong sink: {other:?}"),
         }
+    }
+
+    /// `--check-crc` / `--no-check-crc` reach `ChainSpec.verify_crc` through the
+    /// shared `resolve_check_crc` policy: explicit flag wins, else file input
+    /// verifies and stdin is trusted. This is the default-behavior change #931
+    /// signed off on (stdin used to always verify).
+    #[rstest]
+    #[case::file_default_verifies("in.bam", &[], true)]
+    #[case::file_no_check_crc_skips("in.bam", &["--no-check-crc"], false)]
+    #[case::file_check_crc_verifies("in.bam", &["--check-crc"], true)]
+    #[case::stdin_default_skips("-", &[], false)]
+    #[case::dev_stdin_default_skips("/dev/stdin", &[], false)]
+    #[case::stdin_check_crc_verifies("-", &["--check-crc"], true)]
+    #[case::stdin_no_check_crc_skips("-", &["--no-check-crc"], false)]
+    fn build_sort_chain_spec_resolves_verify_crc(
+        #[case] input: &str,
+        #[case] extra: &[&str],
+        #[case] expected: bool,
+    ) {
+        let mut args = vec!["sort", "-i", input, "-o", "out.bam", "--order", "coordinate"];
+        args.extend_from_slice(extra);
+        let sort = Sort::try_parse_from(args).expect("parse should succeed");
+        let spec = sort.build_sort_chain_spec(
+            Path::new("out.bam"),
+            Vec::new(),
+            sort.resolved_max_temp_files(fgumi_sort::soft_nofile()),
+            "fgumi sort (test)",
+        );
+        assert_eq!(spec.verify_crc, expected);
+    }
+
+    /// The two CRC flags are mutually exclusive at the CLI layer, exactly as on
+    /// `BamIoOptions`.
+    #[test]
+    fn check_crc_flags_conflict() {
+        let err = Sort::try_parse_from([
+            "sort",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--check-crc",
+            "--no-check-crc",
+        ])
+        .expect_err("--check-crc and --no-check-crc must conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     /// The sorter-free phase thread helpers `Sort::phase1_threads` /
@@ -2025,6 +2107,8 @@ mod tests {
         Sort {
             input: PathBuf::from("test.bam"),
             output: None,
+            check_crc: false,
+            no_check_crc: false,
             verify: false,
             order,
             key_types: None,
