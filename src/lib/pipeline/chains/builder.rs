@@ -1997,9 +1997,17 @@ impl<'a> ChainBuilder<'a> {
         info!("{}", self.spec.threading.log_message());
         info!("Using pipeline with {num_threads} threads");
 
-        // Wire GroupByQueryname before the correct step.
-        let tail =
-            self.pipeline.append_step(GroupByQueryname::new(self.tuning.per_step_byte_limit), tail);
+        // Wire GroupByQueryname before the correct step — but only when the upstream
+        // stage emits DecodedRecordBatch (the normal source-preamble path). When
+        // `chain_tail_kind == BamTemplateBatch`, an upstream stage (e.g. Extract) has
+        // already grouped records into templates, which is exactly the input the
+        // correct step consumes. Skip GroupByQueryname in that case to avoid a
+        // DecodedRecordBatch→BamTemplateBatch type mismatch (mirrors `add_align`).
+        let tail = if self.chain_tail_kind == ChainTailKind::BamTemplateBatch {
+            tail
+        } else {
+            self.pipeline.append_step(GroupByQueryname::new(self.tuning.per_step_byte_limit), tail)
+        };
 
         // Dispatch on rejects presence: either a 2-output or a 1-output step.
         let process_tail = if track_rejects {

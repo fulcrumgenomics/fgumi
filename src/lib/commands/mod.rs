@@ -73,6 +73,7 @@ pub mod group;
 pub mod merge;
 pub mod retag;
 pub mod review;
+pub mod runall;
 pub mod shared_metrics;
 #[cfg(feature = "simplex")]
 pub mod simplex;
