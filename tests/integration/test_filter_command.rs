@@ -527,8 +527,11 @@ fn test_filter_command_no_ref_mapped_reads_fails() {
 }
 
 //////////////////////////////////////////////////////////////////////////////
-// R3.1 chain-cutover parity tests: `--threads N` (declarative chain builder)
-// vs. no-`--threads` (legacy unified-pipeline oracle).
+// Worker-count-independence tests: filter always runs on the declarative chain
+// builder (the legacy single-threaded path is retired), so a no-`--threads` run
+// (the chain at a single worker) must produce output identical to a `--threads N`
+// run. Byte-parity against the pre-removal binary lives in
+// `test_filter_cutover_parity.rs`.
 //////////////////////////////////////////////////////////////////////////////
 
 /// Run `filter` on `input` writing `output`, with `extra` args appended
@@ -612,8 +615,8 @@ fn build_mixed_depth_templates(n: usize) -> Vec<RawRecord> {
     records
 }
 
-/// The chain (`--threads N`) path produces output identical to the non-chain
-/// (no-`--threads`) path, for both `--threads 1` (the minimal chain engine)
+/// A `--threads N` run produces output identical to a no-`--threads` run (the
+/// chain at a single worker), for both `--threads 1` (the minimal chain engine)
 /// and `--threads 4` (genuinely parallel), and for both `filter-by-template`
 /// step factories (template mode groups via `GroupByQueryname` before
 /// filtering; single-read mode filters each record independently -- distinct
@@ -636,8 +639,8 @@ fn test_filter_chain_matches_single_threaded(
     let template_flag = if filter_by_template { "true" } else { "false" };
     let threads_str = threads.to_string();
 
-    let oracle_out = temp_dir.path().join("oracle.bam");
-    filter_run(&input_bam, &oracle_out, &ref_path, &["--filter-by-template", template_flag]);
+    let single_worker_out = temp_dir.path().join("single_worker.bam");
+    filter_run(&input_bam, &single_worker_out, &ref_path, &["--filter-by-template", template_flag]);
 
     let chain_out = temp_dir.path().join("chain.bam");
     filter_run(
@@ -651,7 +654,7 @@ fn test_filter_chain_matches_single_threaded(
     // normalizes the `@PG` command-line field that legitimately differs by
     // `--threads`, so a chain regression that changed `@RG`/`@SQ`/`@CO` or any
     // other header record — not only sort order — is caught too.
-    let (oracle_header, expected) = crate::helpers::read_bam_output(&oracle_out);
+    let (single_worker_header, expected) = crate::helpers::read_bam_output(&single_worker_out);
     let (chain_header, actual) = crate::helpers::read_bam_output(&chain_out);
     // Non-vacuous: filtering must actually drop records, or a pass-through
     // regression on BOTH paths would satisfy `actual == expected` silently.
@@ -662,39 +665,34 @@ fn test_filter_chain_matches_single_threaded(
     assert_eq!(
         expected.len(),
         expected_kept,
-        "oracle must keep exactly {expected_kept} of 16 records \
+        "single-worker run must keep exactly {expected_kept} of 16 records \
          (filter_by_template={filter_by_template})"
     );
     assert_eq!(
         actual, expected,
         "chain (threads={threads}, filter_by_template={filter_by_template}) output must match \
-         the non-chain path record-for-record"
+         the single-worker chain record-for-record"
     );
     // Guard against a vacuous header comparison: if a regression dropped `@HD` on
     // both paths, the header equality could still pass on two equally-broken
-    // headers, so assert the oracle actually declares `@HD` first.
-    assert!(oracle_header.header().is_some(), "oracle output must declare @HD");
+    // headers, so assert the single-worker run actually declares `@HD` first.
+    assert!(single_worker_header.header().is_some(), "single-worker output must declare @HD");
     assert_eq!(
-        chain_header, oracle_header,
+        chain_header, single_worker_header,
         "chain (threads={threads}, filter_by_template={filter_by_template}) output header must \
-         match the non-chain path (complete normalized header, not just @HD)"
+         match the single-worker chain (complete normalized header, not just @HD)"
     );
 }
 
 /// Header carrying two `@RG` lines with distinct `LB` values, for
 /// `test_filter_chain_matches_single_threaded_with_rg_and_cb_variation`. The
-/// `source_group_key_config` perf fix routes the chain filter path's first
-/// stage to a `name_hash_only` `GroupKeyConfig`, which never resolves a
-/// per-record library index or walks the CIGAR for position during decode —
-/// unlike the filter-by-template oracle's own decode config
-/// (`Filter::build_filter_pipeline_config`'s `new_raw_no_cell`), which
-/// resolves the library index and the position but, like `name_hash_only`,
-/// never extracts `CB` either way. So RG (library index) and position are the
-/// fields that genuinely differ between the two decode configs, and are what
-/// this parity test needs to vary to be non-vacuous; the `CB` variation below
-/// is incidental fixture realism, not a discriminating input — the oracle
-/// never reads `CB` regardless of this change, so it cannot expose a
-/// regression here.
+/// `source_group_key_config` perf fix routes the chain filter's first stage to a
+/// `name_hash_only` `GroupKeyConfig`, which never resolves a per-record library
+/// index or walks the CIGAR for position during decode. This fixture varies the
+/// `@RG`/`LB` (library index) and position fields precisely so a regression that
+/// made those fields load-bearing for filtering — despite the skip — would change
+/// the output and be caught. The per-template `CB` tag is incidental fixture
+/// realism, not a discriminating input.
 fn create_consensus_header_with_read_groups(
     ref_name: &str,
     ref_len: usize,
@@ -784,19 +782,22 @@ fn build_mixed_depth_templates_with_rg_and_cb(n: usize) -> Vec<RawRecord> {
     records
 }
 
-/// The chain (`--threads N`) path matches the non-chain oracle record-for-record
-/// even when the discarded position/RG portion of the group key genuinely
-/// varies per record (distinct `@RG`/`LB` per template and distinct positions
-/// — the fields the oracle's decode config resolves but `name_hash_only`
-/// does not, per `create_consensus_header_with_read_groups`'s doc comment).
-/// `test_filter_chain_matches_single_threaded` already covers the
-/// `threads`/`filter_by_template` matrix on RG-free, single-position records;
-/// this test's unique contribution is exercising the exact fields
-/// `source_group_key_config`'s `name_hash_only` routing stops computing for
-/// the chain filter path, confirming the skip is genuinely invisible in the
-/// output. Records also carry a per-template `CB` tag for fixture realism,
-/// but it is not discriminating: the oracle's own decode config never
-/// extracts `CB` either, so `CB` variation cannot expose a regression here.
+/// A `--threads 4` run matches the single-worker run record-for-record when the
+/// input carries per-template `@RG`/`LB` and position variation (both runs take
+/// the chain post-cutover, so this is a worker-count-invariance check, not a
+/// chain-vs-legacy one). `test_filter_chain_matches_single_threaded` already
+/// covers the `threads`/`filter_by_template` matrix on RG-free, single-position
+/// records; this test's unique contribution is holding that invariance with the
+/// RG/position fields present in the input.
+///
+/// It does NOT by itself guard `source_group_key_config`'s `name_hash_only` skip
+/// (the perf routing that stops computing library index/position during decode
+/// for `Stage::Filter`): post-cutover both runs here take that same skip, so a bug
+/// in it would change both sides equally. That invariant is pinned directly at the
+/// decode consumer by
+/// `decode::tests::name_hash_only_matches_full_key_grouping_when_rg_and_position_vary`.
+/// The per-template `CB` tag below is incidental fixture realism; the decode config
+/// never extracts `CB`.
 #[test]
 fn test_filter_chain_matches_single_threaded_with_rg_and_cb_variation() {
     let temp_dir = TempDir::new().unwrap();
@@ -809,8 +810,8 @@ fn test_filter_chain_matches_single_threaded_with_rg_and_cb_variation() {
         build_mixed_depth_templates_with_rg_and_cb(8),
     );
 
-    let oracle_out = temp_dir.path().join("oracle.bam");
-    filter_run(&input_bam, &oracle_out, &ref_path, &["--filter-by-template", "true"]);
+    let single_worker_out = temp_dir.path().join("single_worker.bam");
+    filter_run(&input_bam, &single_worker_out, &ref_path, &["--filter-by-template", "true"]);
 
     let chain_out = temp_dir.path().join("chain.bam");
     filter_run(
@@ -820,46 +821,46 @@ fn test_filter_chain_matches_single_threaded_with_rg_and_cb_variation() {
         &["--filter-by-template", "true", "--threads", "4"],
     );
 
-    let (oracle_header, expected) = crate::helpers::read_bam_output(&oracle_out);
+    let (single_worker_header, expected) = crate::helpers::read_bam_output(&single_worker_out);
     let (chain_header, actual) = crate::helpers::read_bam_output(&chain_out);
     // Non-vacuous: filter-by-template drops the 4 odd templates whole (keeps 8
     // of 16), same as the RG/CB-free matrix test.
     assert_eq!(
         expected.len(),
         8,
-        "oracle must keep exactly 8 of 16 records with RG/CB variation present"
+        "single-worker run must keep exactly 8 of 16 records with RG/CB variation present"
     );
     assert_eq!(
         actual, expected,
-        "chain output must match the non-chain path record-for-record with RG/CB variation \
+        "chain output must match the single-worker chain record-for-record with RG/CB variation \
          present, proving source_group_key_config's name_hash_only skip for Stage::Filter \
          changes no output"
     );
     assert_eq!(
-        chain_header, oracle_header,
-        "chain output header must match the non-chain path with RG/CB variation present"
+        chain_header, single_worker_header,
+        "chain output header must match the single-worker chain with RG/CB variation present"
     );
 }
 
 /// The `--rejects` output BAM matches record-for-record between the chain and
-/// oracle paths, not just the kept output. Template mode over
+/// single-worker runs, not just the kept output. Template mode over
 /// `build_mixed_depth_templates` rejects both mates of every odd-indexed
 /// template (8 records across 4 templates), so the rejects comparison is
 /// non-vacuous.
 #[test]
-fn test_filter_chain_rejects_bam_matches_single_threaded() {
+fn test_filter_chain_rejects_bam_matches_single_worker() {
     let temp_dir = TempDir::new().unwrap();
     let input_bam = temp_dir.path().join("input.bam");
     let ref_path = create_test_reference(temp_dir.path());
     create_consensus_bam(&input_bam, build_mixed_depth_templates(8));
 
-    let oracle_out = temp_dir.path().join("oracle.bam");
-    let oracle_rejects = temp_dir.path().join("oracle.rejects.bam");
+    let single_worker_out = temp_dir.path().join("single_worker.bam");
+    let single_worker_rejects = temp_dir.path().join("single_worker.rejects.bam");
     filter_run(
         &input_bam,
-        &oracle_out,
+        &single_worker_out,
         &ref_path,
-        &["--rejects", oracle_rejects.to_str().unwrap()],
+        &["--rejects", single_worker_rejects.to_str().unwrap()],
     );
 
     let chain_out = temp_dir.path().join("chain.bam");
@@ -871,34 +872,39 @@ fn test_filter_chain_rejects_bam_matches_single_threaded() {
         &["--rejects", chain_rejects.to_str().unwrap(), "--threads", "4"],
     );
 
-    let expected_kept = read_filter_records(&oracle_out);
+    let expected_kept = read_filter_records(&single_worker_out);
     let actual_kept = read_filter_records(&chain_out);
-    assert!(!expected_kept.is_empty(), "oracle kept output must be non-empty");
+    assert!(!expected_kept.is_empty(), "single-worker kept output must be non-empty");
     assert_eq!(actual_kept, expected_kept, "kept output must match record-for-record");
 
-    let expected_rejects = read_filter_records(&oracle_rejects);
+    let expected_rejects = read_filter_records(&single_worker_rejects);
     let actual_rejects = read_filter_records(&chain_rejects);
     assert!(
         !expected_rejects.is_empty(),
-        "oracle rejects output must be non-empty (guard against a vacuous pass)"
+        "single-worker rejects output must be non-empty (guard against a vacuous pass)"
     );
     assert_eq!(
         actual_rejects, expected_rejects,
-        "rejects output must match record-for-record between chain and oracle"
+        "rejects output must match record-for-record between chain and single-worker runs"
     );
 }
 
-/// The `--stats` file is byte-identical between the chain and oracle paths.
+/// The `--stats` file is byte-identical between the chain and single-worker runs.
 #[test]
-fn test_filter_chain_stats_file_matches_single_threaded() {
+fn test_filter_chain_stats_file_matches_single_worker() {
     let temp_dir = TempDir::new().unwrap();
     let input_bam = temp_dir.path().join("input.bam");
     let ref_path = create_test_reference(temp_dir.path());
     create_consensus_bam(&input_bam, build_mixed_depth_templates(8));
 
-    let oracle_out = temp_dir.path().join("oracle.bam");
-    let oracle_stats = temp_dir.path().join("oracle.stats.txt");
-    filter_run(&input_bam, &oracle_out, &ref_path, &["--stats", oracle_stats.to_str().unwrap()]);
+    let single_worker_out = temp_dir.path().join("single_worker.bam");
+    let single_worker_stats = temp_dir.path().join("single_worker.stats.txt");
+    filter_run(
+        &input_bam,
+        &single_worker_out,
+        &ref_path,
+        &["--stats", single_worker_stats.to_str().unwrap()],
+    );
 
     let chain_out = temp_dir.path().join("chain.bam");
     let chain_stats = temp_dir.path().join("chain.stats.txt");
@@ -909,21 +915,25 @@ fn test_filter_chain_stats_file_matches_single_threaded() {
         &["--stats", chain_stats.to_str().unwrap(), "--threads", "4"],
     );
 
-    let oracle_content = fs::read_to_string(&oracle_stats).expect("read oracle stats");
+    let single_worker_content =
+        fs::read_to_string(&single_worker_stats).expect("read single-worker stats");
     let chain_content = fs::read_to_string(&chain_stats).expect("read chain stats");
-    assert!(!oracle_content.trim().is_empty(), "oracle stats file should not be empty");
-    assert!(oracle_content.contains("total_reads"), "stats should contain total_reads");
+    assert!(
+        !single_worker_content.trim().is_empty(),
+        "single-worker stats file should not be empty"
+    );
+    assert!(single_worker_content.contains("total_reads"), "stats should contain total_reads");
     // Non-vacuous: the stats must record that filtering actually rejected reads,
     // or a pass-through regression on both paths would still byte-match.
-    let failed = oracle_content
+    let failed = single_worker_content
         .lines()
         .find_map(|l| l.strip_prefix("failed_reads\t"))
         .and_then(|v| v.trim().parse::<u64>().ok())
         .expect("stats file must report failed_reads");
-    assert!(failed > 0, "filtering must reject at least one read; stats:\n{oracle_content}");
+    assert!(failed > 0, "filtering must reject at least one read; stats:\n{single_worker_content}");
     assert_eq!(
-        oracle_content, chain_content,
-        "stats file must be byte-identical across chain and oracle modes"
+        single_worker_content, chain_content,
+        "stats file must be byte-identical across chain and single-worker modes"
     );
 }
 
@@ -966,14 +976,14 @@ fn create_multi_batch_filter_input(path: &Path, n: usize) {
     create_consensus_bam(path, records);
 }
 
-/// The chain's multi-worker path (`--threads 4`) must match the single-threaded
-/// oracle across `GroupByQueryname`'s batch machinery: both its cross-input-batch
+/// The chain's multi-worker run (`--threads 4`) must match the single-worker
+/// run across `GroupByQueryname`'s batch machinery: both its cross-input-batch
 /// `current_template` carry-over (a paired template whose two mates land in
 /// consecutive input record-batches) AND its 1000-template output-emit boundary.
 /// `create_multi_batch_filter_input(1200)` emits 1200 paired templates (2400
 /// records) to exercise both -- the small-fixture parity tests above (well under
 /// one batch, single-record templates) exercise neither. Compare `--threads 4`
-/// output record-for-record against the oracle.
+/// output record-for-record against the single-worker run.
 #[test]
 fn test_filter_chain_threads4_matches_single_threaded_multi_batch() {
     let temp_dir = TempDir::new().unwrap();
@@ -981,31 +991,31 @@ fn test_filter_chain_threads4_matches_single_threaded_multi_batch() {
     let ref_path = create_test_reference(temp_dir.path());
     create_multi_batch_filter_input(&input_bam, 1200);
 
-    let oracle_out = temp_dir.path().join("oracle.bam");
-    filter_run(&input_bam, &oracle_out, &ref_path, &[]);
+    let single_worker_out = temp_dir.path().join("single_worker.bam");
+    filter_run(&input_bam, &single_worker_out, &ref_path, &[]);
 
     let chain_out = temp_dir.path().join("chain.bam");
     filter_run(&input_bam, &chain_out, &ref_path, &["--threads", "4"]);
 
-    let expected = read_filter_records(&oracle_out);
+    let expected = read_filter_records(&single_worker_out);
     let actual = read_filter_records(&chain_out);
     // 1200 paired templates, all passing -> all 2400 records kept on both paths.
     assert_eq!(
         expected.len(),
         2400,
-        "expected all 2400 records (1200 paired passing templates) in the oracle output"
+        "expected all 2400 records (1200 paired passing templates) in the single-worker output"
     );
     assert_eq!(
         actual, expected,
-        "chain (--threads 4) output must match the single-threaded oracle record-for-record \
+        "chain (--threads 4) output must match the single-worker chain record-for-record \
          across GroupByQueryname input-batch carry-over and output-emit boundaries"
     );
 }
 
-/// FILT3-02 on the chain path: mirrors `test_filter_rejects_coordinate_sorted_input`
-/// but with `--threads 4`, proving the `require_query_grouped` guard added to
-/// `add_filter` (builder.rs) rejects coordinate-sorted input on the chain path
-/// exactly as the legacy path does -- not just when the legacy oracle is used.
+/// FILT3-02 with `--threads 4`: mirrors `test_filter_rejects_coordinate_sorted_input`
+/// (a no-`--threads` run) but at four workers, proving the `require_query_grouped`
+/// guard in `add_filter` (builder.rs) rejects coordinate-sorted input regardless of
+/// worker count (the chain is the only filter execution path).
 #[test]
 fn test_filter_chain_rejects_coordinate_sorted_input() {
     let temp_dir = TempDir::new().unwrap();
@@ -1042,14 +1052,13 @@ fn test_filter_chain_rejects_coordinate_sorted_input() {
     assert!(msg.contains("queryname sorted or query grouped"), "unexpected error message: {msg}");
 }
 
-/// FILT3-02 on the chain path, header-less variant: mirrors
-/// `test_filter_rejects_headerless_input` but with `--threads 4`. Both paths now
-/// synthesize `@HD VN:1.6 SO:unsorted` for header-less input — the legacy path
-/// via `ensure_hd_record` in `execute()`, the chain path via `ensure_hd_record`
-/// in `ChainBuilder::new` (before `add_pg_record`) — and `require_query_grouped`
-/// rejects `SO:unsorted`, so the chain path rejects header-less input with the
-/// same message. Pins chain-path header-less rejection so a future
-/// header-handling refactor cannot silently break it.
+/// FILT3-02 header-less variant with `--threads 4`: mirrors
+/// `test_filter_rejects_headerless_input` (a no-`--threads` run) but at four
+/// workers. The chain synthesizes `@HD VN:1.6 SO:unsorted` for header-less input
+/// via `ensure_hd_record` in `ChainBuilder::new` (before `add_pg_record`), and
+/// `require_query_grouped` rejects `SO:unsorted`, so header-less input is rejected
+/// with the same message regardless of worker count. Pins header-less rejection so
+/// a future header-handling refactor cannot silently break it.
 #[test]
 fn test_filter_chain_rejects_headerless_input() {
     let temp_dir = TempDir::new().unwrap();
