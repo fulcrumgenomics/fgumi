@@ -34,6 +34,7 @@ mod test_duplex_metrics_command;
 mod test_e2e_regression;
 mod test_error_paths;
 mod test_extract_command;
+mod test_extract_cutover_parity;
 mod test_fastq_command;
 mod test_fastq_pipeline_memory_backpressure;
 mod test_filter_command;
