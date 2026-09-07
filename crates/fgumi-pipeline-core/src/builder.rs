@@ -96,6 +96,44 @@ impl InstrumentationLevel {
     pub fn deep(self) -> bool {
         matches!(self, Self::Deep)
     }
+
+    /// The lowercase token for this level, as accepted by [`FromStr`](std::str::FromStr) and
+    /// printed by [`Display`](std::fmt::Display).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Summary => "summary",
+            Self::Timeline => "timeline",
+            Self::Deep => "deep",
+        }
+    }
+}
+
+impl std::str::FromStr for InstrumentationLevel {
+    type Err = String;
+
+    /// Parse a `--pipeline-trace` / `FGUMI_PIPELINE_TRACE` token
+    /// (case-insensitive). Used directly as the clap value parser (the field is
+    /// typed `InstrumentationLevel`, with no `value_parser` attribute), so an
+    /// unrecognized `--pipeline-trace` value is rejected at parse time.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "summary" => Ok(Self::Summary),
+            "timeline" => Ok(Self::Timeline),
+            "deep" => Ok(Self::Deep),
+            other => Err(format!(
+                "invalid instrumentation level '{other}' (expected: off | summary | timeline | deep)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for InstrumentationLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2059,6 +2097,48 @@ mod tests {
         assert_eq!(level.samples(), is_on);
         assert_eq!(level.timeline(), timeline);
         assert_eq!(level.deep(), deep);
+    }
+
+    // Each case pins a level's canonical lowercase token: `as_str`, `Display`,
+    // and the `FromStr` round-trip from that exact token all agree, so a failure
+    // names the level whose string mapping regressed.
+    #[rstest]
+    #[case::off(InstrumentationLevel::Off, "off")]
+    #[case::summary(InstrumentationLevel::Summary, "summary")]
+    #[case::timeline(InstrumentationLevel::Timeline, "timeline")]
+    #[case::deep(InstrumentationLevel::Deep, "deep")]
+    fn instrumentation_level_string_roundtrip(
+        #[case] level: InstrumentationLevel,
+        #[case] token: &str,
+    ) {
+        assert_eq!(level.as_str(), token);
+        assert_eq!(level.to_string(), token);
+        assert_eq!(token.parse::<InstrumentationLevel>().expect("parse token"), level);
+    }
+
+    // `FromStr` is case-insensitive (it lowercases before matching), so tokens in
+    // any case resolve to the same level — this is the clap value parser, so a CLI
+    // `--pipeline-trace Deep` must be accepted the same as `deep`.
+    #[rstest]
+    #[case::upper("OFF", InstrumentationLevel::Off)]
+    #[case::mixed("Summary", InstrumentationLevel::Summary)]
+    #[case::title("Timeline", InstrumentationLevel::Timeline)]
+    #[case::caps("DEEP", InstrumentationLevel::Deep)]
+    fn instrumentation_level_from_str_is_case_insensitive(
+        #[case] input: &str,
+        #[case] expected: InstrumentationLevel,
+    ) {
+        assert_eq!(input.parse::<InstrumentationLevel>().expect("parse"), expected);
+    }
+
+    #[test]
+    fn instrumentation_level_from_str_rejects_unknown() {
+        let err = "verbose".parse::<InstrumentationLevel>().expect_err("should reject");
+        assert!(err.contains("verbose"), "error should name the bad token: {err}");
+        assert!(
+            err.contains("off | summary | timeline | deep"),
+            "error should list the valid set: {err}"
+        );
     }
 
     #[test]

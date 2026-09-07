@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Features
+
+- Expose the per-edge pipeline instrumentation ladder on the CLI: a hidden
+  `--pipeline-trace <off|summary|timeline|deep>` (with `--pipeline-trace-out` for
+  the per-tick timeline TSV) threaded through every chain-builder command, plus
+  `--pipeline-stats` on `fgumi sort`. `FGUMI_PIPELINE_TRACE` enables it without
+  the flag. Off by default (zero overhead); `summary` adds the end-of-run edge
+  table + bottleneck verdict, `timeline`/`deep` add the TSV and dwell/park
+  latency. All flags are hidden from `--help` ([#937](https://github.com/fulcrumgenomics/fgumi/pull/937)).
+
 ## [0.7.0] - 2026-08-24
 
 ### Bug Fixes

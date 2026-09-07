@@ -67,6 +67,7 @@ mod test_simplex_pipeline;
 mod test_simulate_sort;
 mod test_sort_correctness;
 mod test_sort_cutover_parity;
+mod test_sort_pipeline_trace;
 mod test_sort_stats_diagnostics;
 mod test_sort_thread_logging;
 mod test_sort_write_index;
