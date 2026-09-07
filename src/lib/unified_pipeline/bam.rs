@@ -1790,9 +1790,6 @@ impl<G: Send> GroupState<G> {
 /// `batch_len` is the total number of items in the enclosing batch; the
 /// hook can compare `idx_in_batch + 1 == batch_len` to detect the final
 /// item if it needs to finalize per-batch state before returning.
-///
-/// See `docs/design/deterministic-mi-numbering.md` for the design that
-/// motivates this struct.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BatchOrdinal {
     /// Group-step serial of the enclosing batch.

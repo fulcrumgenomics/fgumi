@@ -7,8 +7,7 @@
 //! queue, parses records, drives the k-way merge) via
 //! `Arc<SortMergeSlot>` clones.
 //!
-//! # Per-slot bounded queue design (v4 — see commit `9c39dea` / PR #389 and
-//! `docs/design/sort-phase2-unification-deferral.md`)
+//! # Per-slot bounded queue design (v4 — see commit `9c39dea` / PR #389)
 //!
 //! Each slot carries a bounded queue of decompressed BGZF blocks
 //! (`PHASE2_DECOMP_CAP` entries). Backpressure lives here — the
@@ -86,12 +85,10 @@
 //! `worker_pool::Phase2FileState`, driven through `RawExternalSorter::sort`
 //! — which is what `fgumi sort` and `fgumi merge` actually call.
 //!
-//! That "no production driver yet" fact is now stated in four places — twice
-//! here, once on `worker_pool::Phase2FileState`, and once in
-//! `docs/design/sort-phase2-unification-deferral.md`, which is **canonical**.
-//! All four have to change together when the pipeline steps land, so start
-//! from the design doc. (This PR already had to correct that doc for a stale
-//! method name, which is the failure mode.)
+//! That "no production driver yet" fact is now stated in three places — twice
+//! here and once on `worker_pool::Phase2FileState`. All three have to change
+//! together when the pipeline steps land, so keep them in sync (a stale count
+//! here is the characteristic failure mode).
 //!
 //! `worker_pool::Phase2FileState` keeps its own reorder buffer and
 //! in-flight counter because its single-reader/**multi-decompressor**
@@ -100,8 +97,7 @@
 //! Phase-2 for both standalone `fgumi sort` and the fused `runall`
 //! sort, and `Phase2FileState` is retained as the
 //! `RawExternalSorter::sort` library path and the `#[cfg(test)]`
-//! parity oracle. (History: commit `9d6d7e9` / PR #395 and
-//! `docs/design/sort-phase2-unification-deferral.md`.)
+//! parity oracle. (History: commit `9d6d7e9` / PR #395.)
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -152,9 +148,7 @@ use crate::codec::SpillCodec;
 /// `fgumi_sort::PHASE2_DECOMP_CAP` resolves to 32 while the merge that actually
 /// runs is bounded at 8. The two are deliberately unequal (see this constant's
 /// history above); the confusable part is only which is in force, and that
-/// flips when the pipeline steps land — see
-/// `docs/design/sort-phase2-unification-deferral.md`, the canonical statement
-/// of when that happens.
+/// flips when the pipeline steps land.
 pub const PHASE2_DECOMP_CAP: usize = 32;
 
 /// Disk reader state for a single spill file. Mutex'd separately
