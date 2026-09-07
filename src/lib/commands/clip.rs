@@ -4,20 +4,14 @@
 //! This is useful for variant calling to avoid double-counting evidence from
 //! overlapping portions of paired reads.
 
-use crate::alignment_tags::regenerate_alignment_tags_raw;
 use crate::clipper::{ClippingMode, RawRecordClipper};
-use crate::logging::OperationTimer;
 use crate::metrics::clip::{ClipCounts, ClippingMetricsCollection};
-use crate::reference::ReferenceReader;
 use crate::sam::SamTag;
-use crate::template::{InsertSizeEnd, TemplateIterator, compute_insert_size_from_ends};
+use crate::template::{InsertSizeEnd, compute_insert_size_from_ends};
 use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
-use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{create_raw_bam_reader_with_opts, create_raw_bam_writer};
 use fgumi_raw_bam::RawRecord;
-use log::info;
 use std::path::PathBuf;
 
 use super::command::Command;
@@ -118,8 +112,8 @@ pub struct Clip {
     #[arg(short = 'a', long = "auto-clip-attributes", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub auto_clip_attributes: bool,
 
-    /// Output file for clipping metrics (produced on both the single-threaded and
-    /// --threads paths)
+    /// Output file for clipping metrics (produced on the declarative chain, the
+    /// only execution path, regardless of `--threads`)
     #[arg(short = 'm', long = "metrics")]
     pub metrics: Option<PathBuf>,
 
@@ -146,11 +140,11 @@ pub struct Clip {
 
 /// Per-template clipping configuration, decoupled from `&Clip`.
 ///
-/// The single-threaded path holds a `&Clip` and could read these fields directly, but the
-/// multi-threaded pipeline's `process_fn` runs in a `move` closure that cannot borrow `&self`.
-/// Capturing this small `Copy` value lets both paths share the exact same per-template
-/// clipping logic (`clip_template`/`clip_pair`/`clip_fragment`) instead of maintaining two
-/// copies that can silently drift apart.
+/// The declarative chain's `process_fn` runs in a `move` closure that cannot borrow `&self`,
+/// so the per-template clipping decision is driven from this small `Copy` value rather than
+/// from `&Clip`. Capturing it lets the chain's worker closure share the exact same
+/// per-template clipping logic (`clip_template`/`clip_pair`/`clip_fragment`) that the unit
+/// tests exercise directly, instead of maintaining two copies that can silently drift apart.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ClipParams {
     /// Upgrade existing clipping to the configured mode before applying new clipping.
@@ -199,10 +193,9 @@ impl ClipParams {
     /// inside `clip_pair`/`clip_fragment`) is what lets supplementary reads' clipping be
     /// upgraded too, and keeps both threading paths in lockstep since both go through this method.
     ///
-    /// This is the single shared implementation used by both the single-threaded and
-    /// multi-threaded clip paths. When `metrics` is `Some`, per-read base-clip counts are
-    /// accumulated into it. The single-threaded path always passes a collector when
-    /// `--metrics` is set; the multi-threaded path passes the calling worker's
+    /// This is the single shared per-template implementation the chain's worker closure
+    /// runs (and the unit tests exercise directly). When `metrics` is `Some`, per-read
+    /// base-clip counts are accumulated into it: the chain passes the calling worker's
     /// `PerThreadAccumulator` slot when `--metrics` is set and `None` otherwise, relying
     /// solely on the returned per-template flags for its atomic summary counters.
     ///
@@ -454,7 +447,6 @@ impl ClipParams {
 }
 
 impl Command for Clip {
-    #[allow(clippy::too_many_lines)]
     fn execute(&self, command_line: &str) -> Result<()> {
         // Reject two outputs resolving to one destination before any writer opens.
         let mut outputs: Vec<(&std::path::Path, &str)> =
@@ -468,8 +460,9 @@ impl Command for Clip {
         self.io.validate()?;
         validate_file_exists(&self.reference, "Reference FASTA")?;
 
-        // Validate clipping parameters (reader-free; must run on both execution
-        // paths). At least one clipping option must be requested.
+        // Validate clipping parameters (reader-free). At least one clipping option
+        // must be requested. (`add_clip` re-checks this on the chain, but keeping it
+        // here reports the error before any reader/writer opens.)
         if self.upgrade_clipping
             || self.clip_overlapping_reads
             || self.clip_extending_past_mate
@@ -483,60 +476,38 @@ impl Command for Clip {
             anyhow::bail!("At least one clipping option is required");
         }
 
-        // --threads N: run the clip stage on the declarative chain builder. Dispatch
-        // here — after the reader-free pre-flight above (output collisions, including
-        // --metrics; input + reference existence; clipping-option validation), which
-        // must run for both paths — but BEFORE the banner / timer / reader below.
-        // `--metrics` itself is no longer rejected under `--threads`: `add_clip`
-        // collects detailed metrics on the chain path too (see `execute_chain`).
-        // execute_chain → add_clip re-emits the banner, timer, and threading log
-        // lines, re-enforces require_query_grouped, and opens its own source, so
-        // running them here too would double-log and pre-consume stdin. The
-        // no-`--threads` single-threaded path below stays the in-process parity oracle.
-        if self.threading.threads.is_some() {
-            return self.execute_chain(command_line);
-        }
-
-        // ---- legacy no-`--threads` oracle path (single-threaded engine) ----
-        info!("Clip");
-        info!("  Input: {}", self.io.input.display());
-        info!("  Output: {}", self.io.output.display());
-        info!("  Clipping mode: {}", self.clipping_mode);
-        info!("  Clip overlapping reads: {}", self.clip_overlapping_reads);
-        info!("  Clip extending past mate: {}", self.clip_extending_past_mate);
-        info!("  {}", self.threading.log_message());
-        // The single-threaded fast path (via create_raw_bam_reader_with_opts) honors
-        // --check-crc/--no-check-crc (#800).
-        self.io.log_effective_check_crc();
-
-        let timer = OperationTimer::new("Clipping reads");
-        let mode = self.clipping_mode;
-        let total_records = self.execute_single_threaded(mode, command_line)?;
-        timer.log_completion(total_records);
-        Ok(())
+        // The declarative chain is the only execution path. `execute` does the
+        // reader-free pre-flight above (output collisions, including --metrics;
+        // input + reference existence; clipping-option validation) and then always
+        // dispatches to the chain, with or without `--threads` (absent `--threads`
+        // runs the chain at a single worker). All user-facing diagnostics — the
+        // `Clip` banner + Input/Output/mode lines, the `OperationTimer`, the
+        // threading log lines, `require_query_grouped`, the summary counters, and
+        // the `--metrics` TSV — are emitted inside `ChainBuilder::add_clip` and its
+        // finalize hooks; running any of those here first would double-log and
+        // pre-consume stdin. `--metrics` is produced on the chain too (#915).
+        self.execute_chain(command_line)
     }
 }
 
 impl Clip {
-    /// Runs the `--threads N` path via the declarative chain builder
+    /// Runs the clip stage on the declarative chain builder
     /// (`ChainSpec::single_stage(Stage::Clip, ...)` → `build_for(spec)?.run()`).
     ///
-    /// `add_clip` opens its own source, re-emits the timer/banner/threading log
-    /// lines, reloads the reference, re-validates the clipping options, and
-    /// re-enforces `require_query_grouped`, so none of those may run again here —
-    /// only the CRC-verify status line, which `add_clip` does not re-emit. The
-    /// no-`--threads` path in `execute` keeps its own single-threaded engine,
-    /// which is the in-process parity oracle for this one (see
-    /// `test_clip_chain_matches_single_threaded`). `--metrics` is produced on both
-    /// paths: `add_clip` builds a per-thread `ClippingMetricsCollection`
-    /// accumulator when `self.metrics.is_some()` and reduces it in a
-    /// success-only finalize hook.
+    /// The chain is the only execution path: `execute` always dispatches here, with
+    /// or without `--threads` (absent `--threads` runs the chain at a single
+    /// worker). `add_clip` opens its own source, emits the timer/banner/threading
+    /// log lines, loads the reference, validates the clipping options, and enforces
+    /// `require_query_grouped`, so none of those run here — only the CRC-verify
+    /// status line, which `add_clip` does not emit. `--metrics` is produced by the
+    /// chain: `add_clip` builds a per-thread `ClippingMetricsCollection` accumulator
+    /// when `self.metrics.is_some()` and reduces it in a success-only finalize hook.
     fn execute_chain(&self, command_line: &str) -> Result<()> {
         use crate::pipeline::chains::{
             ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
         };
-        // add_clip re-emits the timer/banner/threading lines but NOT the
-        // CRC-verify status line.
+        // add_clip emits the timer/banner/threading lines but NOT the CRC-verify
+        // status line, so surface the effective CRC policy here.
         self.io.log_effective_check_crc();
         let stage_opts = StageOptionsBag { clip: Some(self.clone()), ..Default::default() };
         let ctx = SingleStageContext {
@@ -549,117 +520,6 @@ impl Clip {
         };
         let spec = ChainSpec::single_stage(Stage::Clip, stage_opts, &ctx);
         build_for(spec)?.run()
-    }
-
-    /// Execute single-threaded clipping.
-    #[allow(clippy::too_many_lines)]
-    fn execute_single_threaded(&self, mode: ClippingMode, command_line: &str) -> Result<u64> {
-        // Create clipper
-        let clipper = if self.auto_clip_attributes {
-            RawRecordClipper::with_auto_clip(mode, true)
-        } else {
-            RawRecordClipper::new(mode)
-        };
-
-        // Create metrics collection if metrics output requested
-        let mut metrics_collection =
-            self.metrics.as_ref().map(|_| ClippingMetricsCollection::new());
-
-        // Load reference (always required and tags are always regenerated to match Scala fgbio)
-        let reference_reader = ReferenceReader::new(&self.reference)?;
-
-        // Open input BAM. This fast path is only reached with no --threads, so
-        // reader_threads is 1 and the reader decodes through fgumi-bgzf, honoring
-        // --check-crc/--no-check-crc via pipeline_reader_opts (#800).
-        let reader_threads = self.threading.num_threads();
-        let (reader, header) = create_raw_bam_reader_with_opts(
-            &self.io.input,
-            reader_threads,
-            self.io.pipeline_reader_opts(),
-        )?;
-
-        // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio).
-        let header = crate::commands::common::ensure_hd_record(header)?;
-        // CLIP3-05: require query-grouped input (fgbio Bams.requireQueryGrouped).
-        crate::commands::common::require_query_grouped(
-            &header,
-            &self.io.input.display().to_string(),
-        )?;
-
-        // Add @PG record with PP chaining to input's last program
-        let header = crate::commands::common::add_pg_record(header, command_line)?;
-
-        // Create output BAM writer with multi-threaded BGZF compression
-        let writer_threads = self.threading.num_threads();
-        let mut writer = create_raw_bam_writer(
-            &self.io.output,
-            &header,
-            writer_threads,
-            self.compression.compression_level,
-        )?;
-
-        // Process templates
-        info!("Processing templates...");
-
-        let mut total_records: usize = 0;
-        let mut total_clipped_overlap: u64 = 0;
-        let mut total_clipped_mate_extension: u64 = 0;
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
-
-        // Shared per-template clip configuration (see `build_clip_process_step` in the chain
-        // builder for the parallel `--threads` use).
-        let params = ClipParams::from_clip(self);
-
-        // Single-threaded processing: iterate raw templates, clip in place
-        let template_iter = TemplateIterator::new(reader);
-
-        for template in template_iter {
-            let template = template?;
-            let mut records: Vec<RawRecord> = template.into_records();
-
-            let (overlap_clip, extend_clip) =
-                params.clip_template(&mut records, &clipper, metrics_collection.as_mut())?;
-            if overlap_clip {
-                total_clipped_overlap += 1;
-            }
-            if extend_clip {
-                total_clipped_mate_extension += 1;
-            }
-
-            // Regenerate alignment tags (always done to match Scala fgbio behavior)
-            for record in &mut records {
-                regenerate_alignment_tags_raw(record.as_mut_vec(), &header, &reference_reader)?;
-            }
-
-            // Count and write records
-            let batch_size = records.len();
-            total_records += batch_size;
-            for record in &records {
-                writer.write_raw_record(record.as_ref())?;
-            }
-            progress.log_if_needed(batch_size as u64);
-        }
-
-        progress.log_final();
-        info!("Total records processed: {total_records}");
-        info!("Templates with overlap clipping: {total_clipped_overlap}");
-        info!("Templates with mate extension clipping: {total_clipped_mate_extension}");
-
-        // Write metrics if requested. `finalize_and_write` (shared with the chain
-        // `--threads` path's `ClipMetricsFinalizeHook`) aggregates pair/all and
-        // writes the TSV in one call, so the two paths' metrics output cannot drift.
-        if let Some(metrics_path) = &self.metrics
-            && let Some(mut metrics) = metrics_collection
-        {
-            metrics.finalize_and_write(metrics_path)?;
-            info!("Wrote metrics to: {}", metrics_path.display());
-        }
-
-        // Flush and finish the writer
-        writer.finish()?;
-
-        info!("Done!");
-        Ok(total_records as u64)
     }
 }
 
@@ -2042,7 +1902,7 @@ mod tests {
     /// `clip5PrimeEndOfRead`/`clip3PrimeEndOfRead`. A read that already carries >= N
     /// bases of clipping at the requested end must not be clipped further.
     #[rstest]
-    #[case::single_threaded(ThreadingOptions::none())]
+    #[case::single_worker(ThreadingOptions::none())]
     #[case::multi_threaded(ThreadingOptions::new(2))]
     fn test_fixed_position_clip_counts_existing_clipping(
         #[case] threading: ThreadingOptions,
@@ -2122,10 +1982,10 @@ mod tests {
     /// CLIP3-01 (command level): overlap clipping must be strand-normalized end to end.
     /// A pair whose first-of-pair read is the reverse strand must yield the same
     /// per-strand output as the mirror pair whose first-of-pair read is the forward
-    /// strand — the `clip` command must not clip the wrong (outer) ends. Exercised in
-    /// both the single-threaded (`threads == 0`) and multi-threaded pipeline paths.
+    /// strand — the `clip` command must not clip the wrong (outer) ends. Exercised at
+    /// both a single worker (no `--threads`) and a multi-worker pipeline.
     #[rstest]
-    #[case::single_threaded(0)]
+    #[case::single_worker(0)]
     #[case::multi_threaded(4)]
     fn test_clip_overlap_negative_strand_first_matches_mirror(
         #[case] threads: usize,
@@ -2865,14 +2725,14 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("At least one clipping option"));
     }
 
-    /// Parameterized test for all threading modes.
+    /// Parameterized test for all threading modes (all run on the chain).
     ///
     /// Tests:
-    /// - `None`: Single-threaded fast path, no pipeline
-    /// - `Some(1)`: Pipeline with 1 thread
-    /// - `Some(2)`: Pipeline with 2 threads
+    /// - `None`: the chain at a single worker (no `--threads`)
+    /// - `Some(1)`: pipeline with 1 thread
+    /// - `Some(2)`: pipeline with 2 threads
     #[rstest]
-    #[case::fast_path(ThreadingOptions::none())]
+    #[case::single_worker(ThreadingOptions::none())]
     #[case::pipeline_1(ThreadingOptions::new(1))]
     #[case::pipeline_2(ThreadingOptions::new(2))]
     fn test_threading_modes(#[case] threading: ThreadingOptions) -> Result<()> {

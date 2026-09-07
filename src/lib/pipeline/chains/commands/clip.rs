@@ -95,20 +95,17 @@ impl FinalizeHook for ClipFinalizeHook {
 /// Success-only finalize hook: reduces the per-thread `--metrics` accumulator
 /// and writes the detailed clipping-metrics TSV. Registered on
 /// `finalize_on_success` (not the always-run `finalize` list) so a
-/// failed/partial run publishes no stale metrics file — matching the
-/// single-threaded oracle, which only reaches its metrics-write code after a
-/// fully successful pass over the input.
+/// failed/partial run publishes no stale metrics file — a metrics TSV is only
+/// meaningful once every record was processed.
 ///
-/// Reduction mirrors the single-threaded oracle's call sequence exactly: each
-/// worker's slot holds raw (unfinalized) `fragment`/`read_one`/`read_two`
+/// Each worker's slot holds raw (unfinalized) `fragment`/`read_one`/`read_two`
 /// counters (see [`ClippingMetricsCollection::merge`]), which are summed
 /// across all slots into one collection and then finalized/written via
-/// [`ClippingMetricsCollection::finalize_and_write`] — the same helper the
-/// single-threaded oracle calls, so the two paths' metrics output cannot drift
-/// apart — with `finalize` running exactly once, after every slot is merged
-/// (the same order the oracle uses: accumulate, then finalize once at the
-/// end). That makes the `pair`/`all` aggregates the TSV reports byte-for-byte
-/// reproducible regardless of how work was sharded across threads.
+/// [`ClippingMetricsCollection::finalize_and_write`], with `finalize` running
+/// exactly once, after every slot is merged (accumulate, then finalize once at
+/// the end). Because the reduction is pure integer addition, that makes the
+/// `pair`/`all` aggregates the TSV reports byte-for-byte reproducible regardless
+/// of how work was sharded across threads.
 pub(crate) struct ClipMetricsFinalizeHook {
     pub(crate) accumulator: Arc<PerThreadAccumulator<ClippingMetricsCollection>>,
     pub(crate) metrics_path: PathBuf,
@@ -147,15 +144,13 @@ impl FinalizeHook for ClipMetricsFinalizeHook {
 /// `pub(crate)` — consumed only by `ChainBuilder::add_clip` and
 /// [`build_clip_process_step`].
 ///
-/// The clipping control flags are bundled into a single `params: ClipParams`,
-/// shared verbatim with the single-threaded oracle (`Clip::execute_single_threaded`);
+/// The clipping control flags are bundled into a single `params: ClipParams`;
 /// the hot-path closure delegates the whole per-template decision to
 /// `params.clip_template(...)` rather than branching on individual flags.
 pub(crate) struct ClipProcessCaptures {
     pub(crate) clipping_mode: crate::clipper::ClippingMode,
     pub(crate) auto_clip_attributes: bool,
-    /// The per-template clip configuration, shared verbatim with the
-    /// single-threaded `Clip::execute` path (its in-process parity oracle).
+    /// The per-template clip configuration built from the parsed `Clip` command.
     pub(crate) params: ClipParams,
     pub(crate) header: noodles::sam::Header,
     pub(crate) reference: Arc<ReferenceReader>,
@@ -198,8 +193,8 @@ pub(crate) fn build_clip_process_step(
 
             // When `--metrics` is requested, run the batch under this worker's
             // `PerThreadAccumulator` slot so `clip_template` collects detailed
-            // per-read base-clip counts (exactly like the single-threaded oracle);
-            // otherwise pass `None` and stay on the fast, collection-free path.
+            // per-read base-clip counts; otherwise pass `None` and stay on the
+            // fast, collection-free path.
             let (local_templates, local_overlap_clipped, local_extend_clipped, local_record_count) =
                 if let Some(accumulator) = &cap.metrics_accumulator {
                     accumulator.with_slot(|slot| {
@@ -280,8 +275,7 @@ fn clip_templates_in_batch(
         // in place keeps allocation count near-equal to legacy.
         let records: &mut Vec<RawRecord> = &mut template.records;
 
-        // Delegate to the canonical per-template clip implementation — the exact
-        // code the single-threaded `Clip::execute` oracle runs
+        // Delegate to the canonical per-template clip implementation
         // (`ClipParams::clip_template`). It finds the primary pair by SAM flag (so
         // secondary/supplementary reads are handled, not just records[0]/[1]),
         // applies fixed clipping with "ensure at least N including existing
@@ -299,7 +293,7 @@ fn clip_templates_in_batch(
             local_extend_clipped += 1;
         }
 
-        // Regenerate alignment tags for every record (matches the oracle).
+        // Regenerate alignment tags for every record (always done to match fgbio).
         for record in records.iter_mut() {
             regenerate_alignment_tags_raw(record.as_mut_vec(), header, reference)
                 .map_err(io::Error::other)?;
