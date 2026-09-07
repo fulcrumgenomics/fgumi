@@ -40,7 +40,7 @@ fn create_sorted_bam(path: &Path, records: Vec<RawRecord>) {
 /// Create a group of paired-end reads at the same position with the same UMI
 /// (simulating PCR duplicates).
 fn create_duplicate_group(base_name: &str, umi: &str, count: usize, start: i32) -> Vec<RawRecord> {
-    create_duplicate_group_inner(base_name, umi, count, start, None, 60, 30)
+    create_duplicate_group_inner(base_name, umi, count, start, DuplicateGroupOptions::default())
 }
 
 /// A single paired-end template (R1 + R2) at `start` with UMI `umi`, every base
@@ -50,7 +50,13 @@ fn create_duplicate_group(base_name: &str, umi: &str, count: usize, start: i32) 
 /// which are marked duplicate) deterministic — the unique maximum wins, with no
 /// score tie whose resolution would depend on stream order.
 fn create_template_qual(name: &str, umi: &str, start: i32, base_qual: u8) -> Vec<RawRecord> {
-    create_duplicate_group_inner(name, umi, 1, start, None, 60, base_qual)
+    create_duplicate_group_inner(
+        name,
+        umi,
+        1,
+        start,
+        DuplicateGroupOptions { base_qual, ..Default::default() },
+    )
 }
 
 /// Like [`create_duplicate_group`] but with an explicit `mapq`, so a fixture can
@@ -63,24 +69,79 @@ fn create_duplicate_group_mapq(
     start: i32,
     mapq: u8,
 ) -> Vec<RawRecord> {
-    create_duplicate_group_inner(base_name, umi, count, start, None, mapq, 30)
+    create_duplicate_group_inner(
+        base_name,
+        umi,
+        count,
+        start,
+        DuplicateGroupOptions { mapq, ..Default::default() },
+    )
 }
 
-/// Shared implementation for [`create_duplicate_group`] and
-/// [`create_duplicate_group_with_rg`]: builds `count` paired-end duplicate
-/// templates, tagging each record with `RG:Z:{rg_id}` only when `rg_id` is
-/// `Some`. Keeping one implementation means the exact record shape the per-library
-/// and ladder tests derive their template counts from can never diverge between
-/// the RG and non-RG variants.
+/// Like [`create_duplicate_group`] but inserts `filler_tags` throwaway integer
+/// tags (`Z0`, `Z1`, ...) before the `RX` tag on every record, shifting the RX
+/// value's aux-data byte offset. `create_duplicate_group` always adds `RX`
+/// first, so its records all carry RX at aux offset 0 — too uniform to
+/// exercise the UMI-position cache (`ChainBuilder::bam_group_key_config`,
+/// issue #334), which caches whatever offset `RX` happens to land at during
+/// decode.
+fn create_duplicate_group_rx_offset(
+    base_name: &str,
+    umi: &str,
+    count: usize,
+    start: i32,
+    filler_tags: u8,
+) -> Vec<RawRecord> {
+    create_duplicate_group_inner(
+        base_name,
+        umi,
+        count,
+        start,
+        DuplicateGroupOptions { filler_tags, ..Default::default() },
+    )
+}
+
+/// Per-record knobs for [`create_duplicate_group_inner`], beyond the always-required
+/// name/UMI/count/start. Grouped into a struct (rather than four trailing positional
+/// `bool`/`u8` params) so call sites name only the field they vary and read as a
+/// spec, not a run of unlabeled literals like `(None, 60, 30, 0)`.
+#[derive(Debug, Clone, Copy)]
+struct DuplicateGroupOptions<'a> {
+    /// `RG:Z:<rg_id>` tag value; omitted from every record when `None`.
+    rg_id: Option<&'a str>,
+    /// Mapping quality for both mates.
+    mapq: u8,
+    /// Base quality for every base of both mates.
+    base_qual: u8,
+    /// Number of throwaway integer filler tags (`Z0`, `Z1`, ...) inserted
+    /// before `RX`, shifting its aux-data byte offset.
+    filler_tags: u8,
+}
+
+impl Default for DuplicateGroupOptions<'_> {
+    /// Matches [`create_duplicate_group`]'s plain case: no `RG`, MAPQ 60, base
+    /// quality 30, `RX` at aux offset 0 (no filler tags).
+    fn default() -> Self {
+        Self { rg_id: None, mapq: 60, base_qual: 30, filler_tags: 0 }
+    }
+}
+
+/// Shared implementation for [`create_duplicate_group`], [`create_duplicate_group_rx_offset`],
+/// and [`create_duplicate_group_with_rg`]: builds `count` paired-end duplicate
+/// templates, tagging each record with `RG:Z:{rg_id}` only when `opts.rg_id` is
+/// `Some` and inserting `opts.filler_tags` throwaway integer tags (`Z0`, `Z1`, ...)
+/// before `RX` to shift its aux-data offset. Keeping one implementation means
+/// the exact record shape the per-library and ladder tests derive their
+/// template counts from can never diverge between the RG, non-RG, and
+/// offset-varied variants.
 fn create_duplicate_group_inner(
     base_name: &str,
     umi: &str,
     count: usize,
     start: i32,
-    rg_id: Option<&str>,
-    mapq: u8,
-    base_qual: u8,
+    opts: DuplicateGroupOptions<'_>,
 ) -> Vec<RawRecord> {
+    let DuplicateGroupOptions { rg_id, mapq, base_qual, filler_tags } = opts;
     let mut records = Vec::new();
     for i in 0..count {
         let name = format!("{base_name}_{i}");
@@ -101,9 +162,11 @@ fn create_duplicate_group_inner(
                 .cigar_ops(&[8 << 4]) // 8M
                 .mate_ref_id(0)
                 .mate_pos(start + 99)
-                .template_length(108)
-                .add_string_tag(SamTag::RX, umi.as_bytes())
-                .add_string_tag(SamTag::MC, b"8M");
+                .template_length(108);
+            for f in 0..filler_tags {
+                b.add_int_tag([b'Z', b'0' + f], i32::from(f));
+            }
+            b.add_string_tag(SamTag::RX, umi.as_bytes()).add_string_tag(SamTag::MC, b"8M");
             if let Some(rg_id) = rg_id {
                 b.add_string_tag(SamTag::RG, rg_id.as_bytes());
             }
@@ -122,9 +185,11 @@ fn create_duplicate_group_inner(
                 .cigar_ops(&[8 << 4]) // 8M
                 .mate_ref_id(0)
                 .mate_pos(start - 1)
-                .template_length(-108)
-                .add_string_tag(SamTag::RX, umi.as_bytes())
-                .add_string_tag(SamTag::MC, b"8M");
+                .template_length(-108);
+            for f in 0..filler_tags {
+                b.add_int_tag([b'Z', b'0' + f], i32::from(f));
+            }
+            b.add_string_tag(SamTag::RX, umi.as_bytes()).add_string_tag(SamTag::MC, b"8M");
             if let Some(rg_id) = rg_id {
                 b.add_string_tag(SamTag::RG, rg_id.as_bytes());
             }
@@ -439,7 +504,13 @@ fn create_duplicate_group_with_rg(
     start: i32,
     rg_id: &str,
 ) -> Vec<RawRecord> {
-    create_duplicate_group_inner(base_name, umi, count, start, Some(rg_id), 60, 30)
+    create_duplicate_group_inner(
+        base_name,
+        umi,
+        count,
+        start,
+        DuplicateGroupOptions { rg_id: Some(rg_id), ..Default::default() },
+    )
 }
 
 /// Shared implementation for [`create_sorted_bam`]: writes `records` against the
@@ -2083,6 +2154,21 @@ fn dedup_run(input: &Path, output: &Path, extra: &[&str]) {
 /// identical to the non-chain (no-`--threads`) path. Run at both `--threads 1`
 /// (the minimal chain engine) and `--threads 4` (genuinely parallel) — dedup's
 /// output is deterministic, so both must equal the single oracle.
+///
+/// The fixture uses [`create_duplicate_group_rx_offset`] with a cycling filler
+/// count (0-3) so RX lands at a different aux-data offset from one group to the
+/// next, rather than always at offset 0. This is still a useful structural
+/// check (any divergence between the two engines shows up here), but it does
+/// NOT isolate the UMI-position cache: the non-chain oracle already enables
+/// the same cache unconditionally outside `--no-umi` mode (see
+/// `MarkDuplicates::execute`), so a wrong-offset mis-slice would corrupt both
+/// sides identically and this parity check would still pass; the fixture also
+/// gives every record in a group the SAME UMI under `--strategy identity`, so
+/// the UMI *value* never affects the result either. See
+/// [`test_dedup_umi_grouping_correct_with_varied_rx_aux_offsets`] for the
+/// hand-computed, cache-independent check this gap motivates -- and its doc
+/// comment for why no *end-to-end* dedup test can currently isolate the
+/// cache specifically.
 #[rstest]
 #[case::threads_1(&["--threads", "1"])]
 #[case::threads_4(&["--threads", "4"])]
@@ -2090,10 +2176,18 @@ fn test_dedup_chain_matches_single_threaded(#[case] thread_args: &[&str]) {
     let temp_dir = TempDir::new().unwrap();
     let input_bam = temp_dir.path().join("input.bam");
 
-    // Several distinct position groups so the chain sees multiple batches.
+    // Several distinct position groups so the chain sees multiple batches,
+    // with RX at a varied aux-data offset (0-3 filler tags) per group.
     let mut records = Vec::new();
     for i in 0..16 {
-        records.extend(create_duplicate_group(&format!("g{i}"), "ACGTACGT", 3, 100 + i * 200));
+        let filler_tags = u8::try_from(i % 4).expect("i % 4 is in 0..4, always fits in u8");
+        records.extend(create_duplicate_group_rx_offset(
+            &format!("g{i}"),
+            "ACGTACGT",
+            3,
+            100 + i * 200,
+            filler_tags,
+        ));
     }
     create_sorted_bam(&input_bam, records);
 
@@ -2111,6 +2205,178 @@ fn test_dedup_chain_matches_single_threaded(#[case] thread_args: &[&str]) {
     assert_eq!(
         actual, expected,
         "chain {thread_args:?} output must match the non-chain path record-for-record"
+    );
+}
+
+/// Cache-discriminating regression test for the UMI-position cache (#334).
+///
+/// [`test_dedup_chain_matches_single_threaded`] above compares chain vs
+/// non-chain output, but that comparison structurally cannot detect a cache
+/// mis-slice: both paths already enable the UMI-position cache (the
+/// non-chain path unconditionally, outside `--no-umi` mode), so a
+/// wrong-offset mis-slice corrupts both sides identically and the two would
+/// still agree; its fixture also gives every record in a group the same UMI
+/// under `--strategy identity`, so the UMI *value* never affects the result.
+/// This test fixes both gaps: it asserts against a CACHE-INDEPENDENT,
+/// hand-computed expectation (not "chain == non-chain"), and it varies the
+/// UMI *value* across records that share a position, with a varied number of
+/// filler tags before RX per record.
+///
+/// Five templates share one position: three carry UMI `AAAAAAAA` with 0, 1,
+/// and 2 filler tags before RX; two carry UMI `CCCCCCCC` with 0 and 3 filler
+/// tags before RX. `dedup` dedups each mate in its own
+/// position group rather than pairing R1 with R2 into one template first
+/// (see the doc comment on `count_template_pair_orphan` in
+/// `src/lib/commands/dedup.rs`), so this fixture yields TWO independent
+/// `assign_umi_groups` calls — one over the five R1 records, one over the
+/// five R2 records — confirmed empirically by dumping `(name, MI, duplicate)`
+/// for this exact fixture at `--threads 4`, `--threads 1`, and no `--threads`
+/// (all three agree). `IdentityUmiAssigner` (see
+/// `crates/fgumi-umi/src/assigner.rs`) mints exactly one molecule ID per
+/// distinct canonical UMI string among the UMIs given to one call, so EACH
+/// of the two independent calls collapses its three `AAAAAAAA` values and two
+/// `CCCCCCCC` values into 2 molecules — 4 molecules total, under
+/// `--strategy identity`, regardless of where RX sits in each record. This
+/// expectation is computed purely from the fixture's two distinct UMI
+/// strings and dedup's documented per-mate grouping; it holds independent of
+/// whatever engine or cache state produced it.
+///
+/// IMPORTANT — what this test does and does NOT prove: it pins dedup's
+/// output as correct on an RX-at-varied-aux-offsets fixture end-to-end,
+/// which is valuable regression coverage for exactly the input shape the
+/// `Stage::Dedup` cache-gate change touches. It does **not**,
+/// by itself, prove the UMI-position cache is what produced this result: the
+/// aux-tag rescan fallback in `assign_umi_groups_for_indices`
+/// (`src/lib/commands/dedup.rs`) is equally correct on this fixture, so an
+/// end-to-end output check like this one cannot distinguish "cache
+/// consulted" from "cache bypassed, rescanned aux data instead" — both paths
+/// agree on the right answer.
+///
+/// `process_position_group` now runs `assign_umi_groups` *before* the
+/// duplicate-flag-clearing preamble (previously it ran after), specifically
+/// so the still-valid `cached_umi_position` written during decode survives to
+/// this read instead of being cleared first by `Template::records_mut()`'s
+/// blanket cache invalidation. That reorder is pinned directly — not via an
+/// output-correctness fixture like this one, which cannot discriminate the
+/// two orderings — by
+/// `commands::dedup::tests::test_assign_umi_groups_reads_the_cache_not_a_rescan_after_reorder`
+/// in `src/lib/commands/dedup.rs`: it poisons the cached position on two
+/// templates to a shared decoy value distinct from their real (and mutually
+/// distinct) `RX` tags, so "cache consulted" and "cache bypassed" produce
+/// different molecule counts (1 vs. 2) rather than agreeing as they do here.
+#[test]
+fn test_dedup_umi_grouping_correct_with_varied_rx_aux_offsets() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+
+    let mut records = Vec::new();
+    // Three "AAAAAAAA" templates, with 0, 1, 2 filler tags before RX.
+    for (i, filler_tags) in [0u8, 1, 2].into_iter().enumerate() {
+        records.extend(create_duplicate_group_rx_offset(
+            &format!("a{i}"),
+            "AAAAAAAA",
+            1,
+            500,
+            filler_tags,
+        ));
+    }
+    // Two "CCCCCCCC" templates, with 0, 3 filler tags before RX.
+    for (i, filler_tags) in [0u8, 3].into_iter().enumerate() {
+        records.extend(create_duplicate_group_rx_offset(
+            &format!("c{i}"),
+            "CCCCCCCC",
+            1,
+            500,
+            filler_tags,
+        ));
+    }
+    create_sorted_bam(&input_bam, records);
+
+    let output = temp_dir.path().join("output.bam");
+    dedup_run(&input_bam, &output, &["--strategy", "identity", "--threads", "4"]);
+
+    let deduped = read_deduped_records(&output);
+    assert_eq!(deduped.len(), 10, "5 templates x 2 records must all be present in output");
+
+    let mi_tag = Tag::from(SamTag::MI);
+    let mi_of = |r: &noodles::sam::alignment::RecordBuf| -> String {
+        r.data()
+            .get(&mi_tag)
+            .map(|value| match value {
+                Value::String(mi) => mi.to_string(),
+                other => panic!("MI must be a string tag, got {other:?}"),
+            })
+            .expect("every identity-strategy record must carry an MI tag")
+    };
+
+    // Partition the deduped records by (UMI class, mate side) and collect the MI
+    // value(s) each partition carries. A bare "distinct MI count" is too weak:
+    // incorrect grouping (e.g. an AAAAAAAA record mis-binned with a CCCCCCCC one)
+    // can still yield the expected number of labels. Assert the partitions directly
+    // -- every record in a partition must share ONE MI, and the two UMIs' MI sets
+    // must be disjoint (see the two assertions below).
+    let mut partition_mis: std::collections::BTreeMap<
+        (&str, bool),
+        std::collections::BTreeSet<String>,
+    > = std::collections::BTreeMap::new();
+    let mut partition_sizes: std::collections::BTreeMap<(&str, bool), usize> =
+        std::collections::BTreeMap::new();
+    for r in &deduped {
+        let name = r.name().expect("output record must be named").to_string();
+        let umi_class = if name.starts_with('a') {
+            "AAAAAAAA"
+        } else if name.starts_with('c') {
+            "CCCCCCCC"
+        } else {
+            panic!("unexpected read name {name:?}");
+        };
+        let key = (umi_class, r.flags().is_first_segment());
+        partition_mis.entry(key).or_default().insert(mi_of(r));
+        *partition_sizes.entry(key).or_default() += 1;
+    }
+
+    // Each (UMI class, mate side) partition must carry exactly one MI: the three
+    // AAAAAAAA records share one MI per mate, and the two CCCCCCCC records share
+    // another MI per mate.
+    for (key, mis) in &partition_mis {
+        assert_eq!(
+            mis.len(),
+            1,
+            "the {} {} records must all share one MI, got {mis:?}",
+            key.0,
+            if key.1 { "R1" } else { "R2" },
+        );
+    }
+
+    // Partition sizes: AAAAAAAA has 3 templates (3 records per mate side),
+    // CCCCCCCC has 2 (2 records per mate side).
+    assert_eq!(partition_sizes.get(&("AAAAAAAA", true)).copied(), Some(3));
+    assert_eq!(partition_sizes.get(&("AAAAAAAA", false)).copied(), Some(3));
+    assert_eq!(partition_sizes.get(&("CCCCCCCC", true)).copied(), Some(2));
+    assert_eq!(partition_sizes.get(&("CCCCCCCC", false)).copied(), Some(2));
+
+    // Distinct UMIs are distinct molecules: the MI(s) the AAAAAAAA records carry
+    // must be disjoint from the MI(s) the CCCCCCCC records carry, so no record of
+    // one UMI is grouped with the other. Assert cross-UMI disjointness rather than
+    // a fixed total MI count: the exact molecule-id integers -- and whether the two
+    // mate sides of one UMI happen to share an id -- are non-deterministic under
+    // `--threads` (the parallel assigner hands out molecule-id blocks in
+    // thread-completion order), so a "4 distinct MIs" count is flaky while the
+    // grouping contract this test exists to check is not.
+    let aaaa_mis: std::collections::BTreeSet<&String> = partition_mis
+        .iter()
+        .filter(|((umi_class, _), _)| *umi_class == "AAAAAAAA")
+        .flat_map(|(_, mis)| mis)
+        .collect();
+    let cccc_mis: std::collections::BTreeSet<&String> = partition_mis
+        .iter()
+        .filter(|((umi_class, _), _)| *umi_class == "CCCCCCCC")
+        .flat_map(|(_, mis)| mis)
+        .collect();
+    assert!(
+        aaaa_mis.is_disjoint(&cccc_mis),
+        "AAAAAAAA and CCCCCCCC records must not share any MI (distinct UMIs are distinct \
+         molecules); AAAAAAAA MIs = {aaaa_mis:?}, CCCCCCCC MIs = {cccc_mis:?}",
     );
 }
 
@@ -2547,63 +2813,6 @@ fn test_dedup_marks_families_and_flags_tc_keyed_secondary_supplementary(#[case] 
 // --verify (strict template-coordinate sort-order gate)
 // ============================================================================
 
-/// Build `count` paired-end duplicate templates with INTERNALLY CONSISTENT
-/// mate-strand flags: R1 forward with `MATE_REVERSE` set, R2 reverse with its
-/// mate forward. Unlike [`create_duplicate_group`], whose R1 omits
-/// `MATE_REVERSE`, this makes R1 and R2 resolve to the *same* template
-/// coordinate — a prerequisite for the strict `--verify` order check, which keys
-/// on the exact `fgumi sort --order template-coordinate` key. (An inconsistent
-/// pair splits into two different coordinates, which the strict check then reads
-/// as an out-of-order file.)
-fn create_consistent_pair_group(
-    base_name: &str,
-    umi: &str,
-    count: usize,
-    start: i32,
-) -> Vec<RawRecord> {
-    let mut records = Vec::new();
-    for i in 0..count {
-        let name = format!("{base_name}_{i}");
-        let r1 = {
-            let mut b = SamBuilder::new();
-            b.read_name(name.as_bytes())
-                .sequence(b"ACGTACGT")
-                .qualities(&[30; 8])
-                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
-                .ref_id(0)
-                .pos(start - 1)
-                .mapq(60)
-                .cigar_ops(&[8 << 4]) // 8M
-                .mate_ref_id(0)
-                .mate_pos(start + 99)
-                .template_length(108)
-                .add_string_tag(SamTag::RX, umi.as_bytes())
-                .add_string_tag(SamTag::MC, b"8M");
-            b.build()
-        };
-        let r2 = {
-            let mut b = SamBuilder::new();
-            b.read_name(name.as_bytes())
-                .sequence(b"ACGTACGT")
-                .qualities(&[30; 8])
-                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
-                .ref_id(0)
-                .pos(start + 99)
-                .mapq(60)
-                .cigar_ops(&[8 << 4]) // 8M
-                .mate_ref_id(0)
-                .mate_pos(start - 1)
-                .template_length(-108)
-                .add_string_tag(SamTag::RX, umi.as_bytes())
-                .add_string_tag(SamTag::MC, b"8M");
-            b.build()
-        };
-        records.push(r1);
-        records.push(r2);
-    }
-    records
-}
-
 /// Write `records` verbatim (NO sorting) under a header that advertises
 /// `SS:template-coordinate`. Unlike [`create_sorted_bam`], which shells out to
 /// `fgumi sort`, this preserves the caller's record order, so the header-level
@@ -2649,8 +2858,8 @@ fn test_dedup_verify_accepts_sorted_input(#[case] threads: &[&str]) {
     let temp_dir = TempDir::new().unwrap();
     let input_bam = temp_dir.path().join("input.bam");
     // Ascending start positions → correctly template-coordinate sorted.
-    let mut records = create_consistent_pair_group("dup1", "ACGTACGT", 3, 100);
-    records.extend(create_consistent_pair_group("dup2", "TGCATGCA", 2, 500));
+    let mut records = create_duplicate_group("dup1", "ACGTACGT", 3, 100);
+    records.extend(create_duplicate_group("dup2", "TGCATGCA", 2, 500));
     create_sorted_bam(&input_bam, records);
 
     let baseline_out = temp_dir.path().join("baseline.bam");
@@ -2683,8 +2892,8 @@ fn test_dedup_verify_rejects_out_of_order_input(#[case] threads: &[&str]) {
     // Descending start positions → genuinely out of order under a TC-advertising
     // header (the group at 500 is written before the group at 100). Written
     // verbatim — NOT through `fgumi sort`, which would reorder it into order.
-    let mut records = create_consistent_pair_group("late", "ACGTACGT", 2, 500);
-    records.extend(create_consistent_pair_group("early", "TGCATGCA", 2, 100));
+    let mut records = create_duplicate_group("late", "ACGTACGT", 2, 500);
+    records.extend(create_duplicate_group("early", "TGCATGCA", 2, 100));
     write_bam_tc_header_unsorted(&input_bam, &records);
 
     // Without --verify the out-of-order input is accepted (no ordering guard).
@@ -2721,7 +2930,7 @@ fn test_dedup_verify_accepts_sorted_multi_batch_chain() {
     // accumulator and the upstream decode batch).
     let mut records = Vec::new();
     for i in 0..600i32 {
-        records.extend(create_consistent_pair_group(&format!("t{i}"), "ACGTACGT", 1, 100 + i * 10));
+        records.extend(create_duplicate_group(&format!("t{i}"), "ACGTACGT", 1, 100 + i * 10));
     }
     create_sorted_bam(&input_bam, records);
 
@@ -2841,8 +3050,8 @@ fn test_dedup_verify_rejects_coordinate_ordered_input() {
     // Two templates. Template-coordinate order keeps each mate pair adjacent
     // (T1.R1,T1.R2,T2.R1,T2.R2); coordinate order interleaves them by leftmost
     // position: R1@100, R1@150, R2@200, R2@250.
-    let t1 = create_consistent_pair_group("T1", "ACGTACGT", 1, 100); // [R1@100, R2@200]
-    let t2 = create_consistent_pair_group("T2", "TGCATGCA", 1, 150); // [R1@150, R2@250]
+    let t1 = create_duplicate_group("T1", "ACGTACGT", 1, 100); // [R1@100, R2@200]
+    let t2 = create_duplicate_group("T2", "TGCATGCA", 1, 150); // [R1@150, R2@250]
     let coordinate_order = vec![t1[0].clone(), t2[0].clone(), t1[1].clone(), t2[1].clone()];
     write_bam_tc_header_unsorted(&input_bam, &coordinate_order);
 
