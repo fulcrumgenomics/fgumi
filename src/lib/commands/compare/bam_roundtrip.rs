@@ -120,6 +120,12 @@ impl Command for CompareBamRoundtrip {
 
         // Validation passed: move the staging file into place (if requested).
         if let Some(p) = &self.output {
+            // Re-stamp the staging file to the mode a plain `File::create(p)`
+            // would produce before persisting it: `NamedTempFile` is owner-only
+            // (`0o600`), and `persist` is a rename that keeps that mode, so
+            // without this the user's `--output` BAM would land 0600.
+            fgumi_bam_io::restamp_for_persist(staging.as_file(), p)
+                .with_context(|| format!("setting output permissions on {}", p.display()))?;
             staging.persist(p).map_err(|e| {
                 anyhow!("failed to move validated output into {}: {}", p.display(), e.error)
             })?;
@@ -222,6 +228,43 @@ mod tests {
         };
         cmd.execute("compare bam-roundtrip").expect("round-trip should pass parity");
         assert_eq!(count_records(output.path()).expect("count output"), 1500);
+    }
+
+    /// The `--output` BAM lands at the umask-respecting mode a plain
+    /// `File::create` produces, not the owner-only `0o600` that the staging
+    /// `NamedTempFile` starts with. Compared against a live `File::create` in
+    /// the same test so it tracks the runner's ambient umask.
+    #[cfg(unix)]
+    #[test]
+    fn execute_output_is_not_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let input = write_input_bam(10);
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        // Reference mode under the ambient umask.
+        let reference_mode = std::fs::File::create(dir.path().join("reference"))
+            .expect("create reference")
+            .metadata()
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        let output = dir.path().join("out.bam");
+        let cmd = CompareBamRoundtrip {
+            input: input.path().to_path_buf(),
+            output: Some(output.clone()),
+            threads: 1,
+            compression_level: 1,
+        };
+        cmd.execute("compare bam-roundtrip").expect("round-trip should pass parity");
+
+        let mode = std::fs::metadata(&output).expect("stat output").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, reference_mode,
+            "--output mode ({mode:o}) must match File::create ({reference_mode:o}), not 0600"
+        );
     }
 
     /// `--output` is written atomically: a run that fails before the parity check

@@ -50,7 +50,6 @@ zstd = "0.13"
 voracious_radix_sort = { version = "1", features = ["voracious_multithread"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
 # `process` adds `getrlimit`, used by `fd_limit`. See the workspace entry.
 rustix = { workspace = true, features = ["process"] }
 

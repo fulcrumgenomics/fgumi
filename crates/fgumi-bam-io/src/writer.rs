@@ -1159,6 +1159,11 @@ pub fn write_bai_index<P: AsRef<Path>>(path: P, index: &bai::Index) -> Result<()
         .with_context(|| format!("Failed to create temp file for index in: {}", dir.display()))?;
     tmp.write_all(&buf)
         .with_context(|| format!("Failed to write index to: {}", path_ref.display()))?;
+    // Re-stamp the temp to the mode `File::create` would produce before the
+    // rename: `NamedTempFile` is owner-only (`0o600`), so the persisted `.bai`
+    // sidecar would otherwise be `0600` while the BAM it indexes is `0644`.
+    crate::fs_mode::restamp_for_persist(tmp.as_file(), path_ref)
+        .with_context(|| format!("Failed to set mode on index temp for: {}", path_ref.display()))?;
     tmp.persist(path_ref)
         .with_context(|| format!("Failed to persist index to: {}", path_ref.display()))?;
     Ok(())
@@ -1948,6 +1953,28 @@ mod tests {
         // The collision the old expression produced: distinct outputs, one index.
         assert_eq!(with_ext("foo.sorted"), with_ext("foo.other"));
         assert_ne!(bai_sidecar_path("foo.sorted"), bai_sidecar_path("foo.other"));
+    }
+
+    /// The persisted `.bai` sidecar lands at the umask-respecting mode a plain
+    /// `File::create` produces, not the owner-only `0o600` the staging
+    /// `NamedTempFile` starts with. Compared against a live `File::create` so it
+    /// tracks the runner's ambient umask.
+    #[cfg(unix)]
+    #[test]
+    fn test_write_bai_index_output_is_not_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let reference_mode = {
+            let p = dir.path().join("reference");
+            std::fs::File::create(&p).expect("create reference");
+            std::fs::metadata(&p).expect("meta").permissions().mode() & 0o777
+        };
+
+        let path = dir.path().join("out.bam.bai");
+        write_bai_index(&path, &bai::Index::default()).expect("write bai index");
+
+        let mode = std::fs::metadata(&path).expect("stat bai").permissions().mode() & 0o777;
+        assert_eq!(mode, reference_mode, "bai sidecar must match File::create, not 0600");
     }
 
     // ---- BAI index compaction (port of htslib's compress_binning) ----
