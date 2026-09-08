@@ -30,6 +30,7 @@ mod test_copy_umi_cutover_parity;
 mod test_correct_command;
 mod test_correct_cutover_parity;
 mod test_dedup_command;
+mod test_dedup_cutover_parity;
 mod test_downsample_command;
 #[cfg(feature = "consensus")]
 mod test_duplex_command;
@@ -45,6 +46,7 @@ mod test_fastq_pipeline_memory_backpressure;
 mod test_filter_command;
 mod test_filter_cutover_parity;
 mod test_group_command;
+mod test_group_cutover_parity;
 mod test_group_determinism;
 mod test_input_source_matrix;
 mod test_merge_command;

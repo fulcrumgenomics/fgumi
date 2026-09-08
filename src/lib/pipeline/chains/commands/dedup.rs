@@ -268,12 +268,11 @@ pub(crate) fn build_process_step(
 /// monotonically increasing MI offsets to each batch.
 ///
 /// When `ladder_recorder` is `Some`, this step also records the
-/// `--duplication-ladder` saturation curve — per position group, in the same
-/// serial/coordinate-order seam the non-chain path records it (`mi_assign_fn`),
-/// **not** in the parallel serialize step. `MiAssign` is `Serial` +
-/// `ByItemOrdinal`, so batches reach this closure in input-record order and the
-/// groups within a batch are in coordinate order, exactly reproducing the
-/// non-chain per-group stream — see the ordering note on
+/// `--duplication-ladder` saturation curve — per position group, in this
+/// serial/coordinate-order seam, **not** in the parallel serialize step.
+/// `MiAssign` is `Serial` + `ByItemOrdinal`, so batches reach this closure in
+/// input-record order and the groups within a batch are in coordinate order —
+/// see the ordering note on
 /// [`crate::commands::dedup::DuplicationLadderRecorder`].
 ///
 /// `pub(crate)` — consumed only by `ChainBuilder::add_dedup`.
