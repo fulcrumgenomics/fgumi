@@ -31,12 +31,16 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::commands::shared_metrics::{
     DOWNSAMPLING_FRACTIONS, Interval, ReadInfoKey, TemplateInfo, build_template_info,
     overlaps_intervals, record_duplex_coordinate_group, record_simplex_coordinate_group,
 };
 use crate::mi_group::MiGroup;
+use crate::per_thread_accumulator::PerThreadAccumulator;
+use crate::pipeline::chains::FinalizeHook;
 use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
 use crate::template::Template;
 use anyhow::Result;
@@ -198,6 +202,106 @@ impl ConsensusMetricsAccumulator {
         }
         Ok(())
     }
+}
+
+/// Bundles everything T1's (fused/runall) inline-metrics accumulator needs
+/// across its lifetime. Constructed once, by `add_group`, whenever a
+/// downstream consensus stage's `metrics` field is set — Task 11. **T1
+/// only** — T2 (standalone) has no equivalent captures type; its `Serial`
+/// collector step (Task 8) owns its accumulator directly.
+pub(crate) struct ConsensusMetricsCaptures {
+    pub(crate) accumulator: Arc<PerThreadAccumulator<ConsensusMetricsAccumulator>>,
+    pub(crate) intervals: Vec<Interval>,
+    pub(crate) output_prefix: PathBuf,
+}
+
+/// Simplex needs one min-reads threshold; duplex and codec need two
+/// (AB/BA) — codec's caller has a single symmetric `min_reads_per_strand`
+/// (verified: `crates/fgumi-consensus/src/codec_caller.rs:155-156`, checked
+/// identically against both strands), so codec constructs this variant with
+/// `min_ab_reads == min_ba_reads == codec's min_reads` (Task 11).
+pub(crate) enum MetricsThresholds {
+    Simplex { min_reads: usize },
+    Duplex { min_ab_reads: usize, min_ba_reads: usize },
+}
+
+/// **T1 only.** Finalize hook: merges every `PerThreadAccumulator` slot's
+/// accumulator into one, then writes the same file set the separate-pass
+/// simplex-metrics/duplex-metrics commands write. T2 has no equivalent hook
+/// — its collector step (Task 8) owns one un-sharded accumulator directly
+/// and calls these same writer functions from its own `on_finish` callback
+/// (Task 11), with no fold step (there is nothing to merge).
+pub(crate) struct ConsensusMetricsFinalizeHook {
+    pub(crate) accumulators: Arc<PerThreadAccumulator<ConsensusMetricsAccumulator>>,
+    pub(crate) output_prefix: PathBuf,
+    pub(crate) thresholds: MetricsThresholds,
+}
+
+impl FinalizeHook for ConsensusMetricsFinalizeHook {
+    fn finalize(self: Box<Self>) -> anyhow::Result<()> {
+        let ConsensusMetricsFinalizeHook { accumulators, output_prefix, thresholds } = *self;
+
+        // `ConsensusMetricsAccumulator` has no mode-less `Default` (Task 7),
+        // so draining the sharded slots goes through `into_slots_with`
+        // (Task 6's Default-free constructor's sibling) rather than
+        // `into_slots`. The `init` closure only matters for the lossy
+        // fallback path (outstanding `Arc` holders, a caller bug) — pick the
+        // constructor matching this hook's own mode so the fallback's type
+        // checks out; its *values* are never read since that path replaces,
+        // rather than merges, an in-progress slot.
+        let init: fn() -> ConsensusMetricsAccumulator = match &thresholds {
+            MetricsThresholds::Simplex { .. } => ConsensusMetricsAccumulator::new_simplex,
+            MetricsThresholds::Duplex { .. } => duplex_fallback_init,
+        };
+
+        let slots = accumulators.into_slots_with(init);
+        let mut slots_iter = slots.into_iter();
+        let Some(mut merged) = slots_iter.next() else {
+            return Ok(()); // zero worker threads — nothing to merge
+        };
+        for slot in slots_iter {
+            merged.merge(slot)?;
+        }
+
+        match thresholds {
+            MetricsThresholds::Simplex { min_reads } => {
+                write_simplex_metrics_files(&merged, &output_prefix, min_reads)
+            }
+            MetricsThresholds::Duplex { min_ab_reads, min_ba_reads } => {
+                write_duplex_metrics_files(&merged, &output_prefix, min_ab_reads, min_ba_reads)
+            }
+        }
+    }
+}
+
+/// Non-capturing fallback constructor for `ConsensusMetricsFinalizeHook`'s
+/// `Duplex` `into_slots_with` `init` argument — see the SAFETY-style comment
+/// at that call site for why the `duplex_umi_counts` value here (`false`)
+/// is inconsequential.
+fn duplex_fallback_init() -> ConsensusMetricsAccumulator {
+    ConsensusMetricsAccumulator::new_duplex(false)
+}
+
+// Stub bodies always return `Ok(())` for now — Task 11's real bodies do
+// fallible file I/O, so the `Result` return type is not unnecessary once
+// they land; only the placeholder is infallible.
+#[allow(clippy::unnecessary_wraps)]
+fn write_simplex_metrics_files(
+    _merged: &ConsensusMetricsAccumulator,
+    _output_prefix: &Path,
+    _min_reads: usize,
+) -> anyhow::Result<()> {
+    Ok(()) // real body lands in Task 11
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn write_duplex_metrics_files(
+    _merged: &ConsensusMetricsAccumulator,
+    _output_prefix: &Path,
+    _min_ab_reads: usize,
+    _min_ba_reads: usize,
+) -> anyhow::Result<()> {
+    Ok(()) // real body lands in Task 11
 }
 
 /// A `CoordinateGroupFragment` carries one **batch**'s worth of already-paired
@@ -517,6 +621,27 @@ mod tests {
             "sub-1.0 fraction (5%) must not record UMI metrics"
         );
         assert!(!collectors[19].umi_metrics().is_empty(), "100% fraction must record UMI metrics");
+    }
+}
+
+#[cfg(test)]
+mod consensus_metrics_finalize_hook_tests {
+    use super::*;
+
+    #[test]
+    fn consensus_metrics_finalize_hook_merges_slots_and_writes() {
+        let accumulators =
+            PerThreadAccumulator::new_with(1, ConsensusMetricsAccumulator::new_simplex);
+        accumulators.with_slot(|acc| {
+            acc.record_coordinate_group(&[template("0", "chr1", 100, 1.0)], &[]).unwrap();
+        });
+
+        let hook = ConsensusMetricsFinalizeHook {
+            accumulators,
+            output_prefix: std::env::temp_dir().join("consensus_metrics_finalize_hook_test"),
+            thresholds: MetricsThresholds::Simplex { min_reads: 1 },
+        };
+        Box::new(hook).finalize().expect("finalize succeeds");
     }
 }
 

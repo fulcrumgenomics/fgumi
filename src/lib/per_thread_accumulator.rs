@@ -80,6 +80,35 @@ impl<A: Send> PerThreadAccumulator<A> {
     pub fn slots(&self) -> &[Mutex<A>] {
         &self.slots
     }
+
+    /// Consumes the accumulator and yields each slot's inner value, without
+    /// requiring `A: Default` — the same relationship [`Self::new_with`] has
+    /// to [`PerThreadAccumulator::new`]. Use for a type (like
+    /// `ConsensusMetricsAccumulator`) whose construction depends on runtime
+    /// configuration rather than having one universal default value.
+    ///
+    /// Requires unique `Arc` ownership — i.e. the pipeline closures that held
+    /// clones have been dropped. Debug builds assert this invariant. If other
+    /// `Arc` holders remain in release builds, falls back to replacing each
+    /// slot with `init()`, which is lossy under concurrent use in exactly the
+    /// same way [`Self::into_slots`]'s `A::default()` fallback is: any
+    /// `with_slot` call racing from a surviving holder after the replacement
+    /// will land in the freshly re-initialized slot and be dropped when that
+    /// holder releases its `Arc`. Callers must quiesce all writers before
+    /// invoking.
+    pub fn into_slots_with(self: Arc<Self>, init: impl Fn() -> A) -> Vec<A> {
+        debug_assert_eq!(
+            Arc::strong_count(&self),
+            1,
+            "into_slots_with called with outstanding Arc holders; fallback is lossy under concurrent writes",
+        );
+        match Arc::try_unwrap(self) {
+            Ok(inner) => inner.slots.into_iter().map(Mutex::into_inner).collect(),
+            Err(arc) => {
+                arc.slots.iter().map(|m| std::mem::replace(&mut *m.lock(), init())).collect()
+            }
+        }
+    }
 }
 
 impl<A: Default + Send> PerThreadAccumulator<A> {
@@ -177,6 +206,18 @@ mod tests {
         let slots = acc.into_slots();
         assert_eq!(slots.len(), 4);
         assert_eq!(slots.iter().map(|c| c.0).sum::<u64>(), 7);
+    }
+
+    /// `into_slots_with` is the `Default`-free sibling of `into_slots`
+    /// (mirroring `new_with`'s relationship to `new`) — proves it drains
+    /// every slot under unique ownership for a type with no `Default` impl.
+    #[test]
+    fn into_slots_with_drains_under_unique_ownership_without_default() {
+        let acc = PerThreadAccumulator::<NoDefault>::new_with(4, || NoDefault(0));
+        acc.with_slot(|c| c.0 = 7);
+        let slots = acc.into_slots_with(|| NoDefault(0));
+        assert_eq!(slots.len(), 4);
+        assert_eq!(slots.iter().map(|c| c.0).sum::<usize>(), 7);
     }
 
     /// Regression guard for the clip `--metrics` chain path

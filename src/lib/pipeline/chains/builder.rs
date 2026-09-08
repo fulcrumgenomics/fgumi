@@ -558,6 +558,19 @@ pub struct ChainBuilder<'a> {
     /// applies the same source-detected encoding the serial oracle does. `None`
     /// for non-FASTQ sources.
     fastq_encoding: Option<crate::commands::extract::QualityEncoding>,
+
+    /// Set by `add_group` when a downstream consensus stage's `metrics`
+    /// field is present (fused/T1 case), so `add_simplex`/`add_duplex`/
+    /// `add_codec` reuse the SAME accumulator `Arc` the T1 closure already
+    /// writes into, rather than constructing a second, disconnected one.
+    /// `None` in the standalone case (no `Group` stage in this chain) — those
+    /// stages instead build the T2 3-branch/`ReorderStage`/
+    /// `MetricsCollectorStep` chain directly (Task 11); there is no T2
+    /// equivalent of `ConsensusMetricsCaptures` for this field to ever hold.
+    #[allow(dead_code)]
+    // set by add_group (Task 11); read by add_simplex/add_duplex/add_codec (Task 11)
+    consensus_metrics_captures:
+        Option<Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>>,
 }
 
 impl<'a> ChainBuilder<'a> {
@@ -634,6 +647,7 @@ impl<'a> ChainBuilder<'a> {
             // sort terminal into a Detached writer (lever 2).
             detached_writer: false,
             fastq_encoding,
+            consensus_metrics_captures: None,
         })
     }
 
@@ -5223,6 +5237,7 @@ mod tests {
             chain_tail_kind: ChainTailKind::DecodedRecordBatch,
             detached_writer: false,
             fastq_encoding: None,
+            consensus_metrics_captures: None,
         }
     }
 
