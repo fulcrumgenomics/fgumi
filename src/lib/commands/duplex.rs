@@ -140,6 +140,19 @@ pub struct Duplex {
     #[arg(long = "max-reads-per-strand")]
     pub max_reads_per_strand: Option<usize>,
 
+    /// Optional prefix for inline consensus QC metrics (CS/SS/DS family
+    /// sizes, UMI counts, downsampling yield curve) — same numeric output as
+    /// running `duplex-metrics` separately, computed inline during this call
+    /// with no second BAM read.
+    #[arg(long = "metrics")]
+    pub metrics: Option<std::path::PathBuf>,
+
+    /// Optional interval file (BED or Picard interval list) restricting
+    /// which templates contribute to `--metrics` output. Ignored if
+    /// `--metrics` is not set.
+    #[arg(long = "intervals")]
+    pub intervals: Option<std::path::PathBuf>,
+
     /// Whether to process unmapped reads (the shared `--allow-unmapped` flag).
     #[command(flatten)]
     pub allow_unmapped: AllowUnmappedOptions,
@@ -242,6 +255,12 @@ pub struct DuplexOptions {
     /// Cap on reads per strand.
     #[arg(long = "max-reads-per-strand")]
     pub max_reads_per_strand: Option<usize>,
+    /// Optional prefix for inline consensus QC metrics. See `Duplex::metrics`.
+    #[arg(long = "metrics")]
+    pub metrics: Option<std::path::PathBuf>,
+    /// Optional interval file restricting `--metrics` output. See `Duplex::intervals`.
+    #[arg(long = "intervals")]
+    pub intervals: Option<std::path::PathBuf>,
     /// Let fully-unmapped primary templates through the pre-group filter.
     ///
     /// Carried as the whole flattened sub-struct, like `io` / `rejects_opts` /
@@ -285,6 +304,8 @@ impl Default for DuplexOptions {
             consensus_call_overlapping_bases: overlapping.consensus_call_overlapping_bases,
             min_reads: vec![1],
             max_reads_per_strand: None,
+            metrics: None,
+            intervals: None,
             allow_unmapped: AllowUnmappedOptions { enabled: false },
             io: BamIoOptions::default(),
             rejects_opts: RejectsOptions::default(),
@@ -311,6 +332,8 @@ impl Duplex {
             consensus_call_overlapping_bases: self.overlapping.consensus_call_overlapping_bases,
             min_reads: self.min_reads.clone(),
             max_reads_per_strand: self.max_reads_per_strand,
+            metrics: self.metrics.clone(),
+            intervals: self.intervals.clone(),
             allow_unmapped: self.allow_unmapped.clone(),
             io: self.io.clone(),
             rejects_opts: self.rejects_opts.clone(),
@@ -764,6 +787,8 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             min_reads: vec![1],
             max_reads_per_strand: None,
+            metrics: None,
+            intervals: None,
             allow_unmapped: AllowUnmappedOptions { enabled: false },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),

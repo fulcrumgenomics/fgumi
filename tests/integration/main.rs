@@ -24,6 +24,8 @@ mod test_compare_mutation;
 #[cfg(feature = "consensus")]
 mod test_consensus_cutover_parity;
 mod test_consensus_downsampling;
+#[cfg(feature = "consensus")]
+mod test_consensus_metrics_chain_shape;
 mod test_copy_umi_command;
 mod test_copy_umi_cutover_parity;
 mod test_correct_command;

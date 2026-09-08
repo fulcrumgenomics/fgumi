@@ -28,15 +28,17 @@ use crate::consensus::codec_caller::{
     CodecConsensusCaller, CodecConsensusOptions, CodecConsensusStats,
 };
 use crate::consensus_caller::ConsensusOutput;
+use crate::inline_metrics_collector::{CoordinateGroupFragment, push_mi_group_entries};
 use crate::logging::OperationTimer;
 use crate::mi_group::MiGroup;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::pipeline::chains::FinalizeHook;
-use crate::pipeline::core::outputs::OrderedBytesTuple2;
+use crate::pipeline::core::outputs::{OrderedBytesTuple2, OrderedBytesTuple3};
 use crate::pipeline::core::step::Step;
 use crate::pipeline::steps::group::mi::BatchedMiGroups;
 use crate::pipeline::steps::process::{
-    Process2Output, ProcessWithWorkerState, process_with_worker_state, process2_with_worker_state,
+    Process2Output, Process3Output, ProcessWithWorkerState, process_with_worker_state,
+    process2_with_worker_state, process3_with_worker_state,
 };
 use crate::pipeline::steps::types::DecompressedBlock;
 
@@ -69,6 +71,10 @@ pub(crate) struct CollectedCodecMetrics {
 /// after executable statements in a function body.
 pub(crate) struct CodecState {
     pub(crate) caller: CodecConsensusCaller,
+    /// Input header + library index for the inline-metrics T2 path (Task 11);
+    /// read only by the metrics-on batch body.
+    pub(crate) header: Arc<noodles::sam::Header>,
+    pub(crate) library_index: Arc<fgumi_bam_io::LibraryIndex>,
 }
 
 impl crate::pipeline::core::item::HeapSize for CodecState {}
@@ -196,6 +202,9 @@ pub(crate) struct CodecConsensusCaptures {
     pub(crate) consensus_options: CodecConsensusOptions,
     pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedCodecMetrics>>,
     pub(crate) progress: Arc<AtomicU64>,
+    /// Threaded onto every `CodecState`; read only by the metrics-on variants.
+    pub(crate) header: Arc<noodles::sam::Header>,
+    pub(crate) library_index: Arc<fgumi_bam_io::LibraryIndex>,
 }
 
 /// Per-worker init: build the `CodecConsensusCaller` once, reused across
@@ -205,6 +214,8 @@ fn make_codec_consensus_init(
     read_group_id: String,
     consensus_options: CodecConsensusOptions,
     track_rejects: bool,
+    header: Arc<noodles::sam::Header>,
+    library_index: Arc<fgumi_bam_io::LibraryIndex>,
 ) -> impl Fn() -> CodecState + Send + Sync + 'static {
     move || {
         let caller = CodecConsensusCaller::new_with_rejects_tracking(
@@ -213,7 +224,11 @@ fn make_codec_consensus_init(
             consensus_options.clone(),
             track_rejects,
         );
-        CodecState { caller }
+        CodecState {
+            caller,
+            header: Arc::clone(&header),
+            library_index: Arc::clone(&library_index),
+        }
     }
 }
 
@@ -303,6 +318,146 @@ fn run_codec_consensus_batch(
     Ok((consensus, rejects))
 }
 
+/// Metrics-on variant of the per-batch codec body. Collects one
+/// `(TemplateInfo, ReadInfoKey)` entry per qualifying template across every
+/// family in the batch (before `run_codec_consensus_batch` consumes the
+/// groups), then delegates the unchanged consensus calling. The metrics-off
+/// build calls `run_codec_consensus_batch` directly (spec §7.1).
+fn run_codec_consensus_batch_with_metrics(
+    state: &mut CodecState,
+    item: BatchedMiGroups,
+    track_rejects: bool,
+    accumulators: &Arc<PerThreadAccumulator<CollectedCodecMetrics>>,
+    progress: &Arc<AtomicU64>,
+) -> io::Result<(DecompressedBlock, Option<DecompressedBlock>, CoordinateGroupFragment)> {
+    let batch_serial = item.batch_serial;
+    let mut metrics_entries = Vec::new();
+    for group in &item.groups {
+        push_mi_group_entries(group, &state.header, &state.library_index, &mut metrics_entries)
+            .map_err(|e| io::Error::other(format!("metrics conversion error: {e:#}")))?;
+    }
+    let fragment = CoordinateGroupFragment { batch_serial, entries: metrics_entries };
+
+    let (consensus, rejects) =
+        run_codec_consensus_batch(state, item, track_rejects, accumulators, progress)?;
+    Ok((consensus, rejects, fragment))
+}
+
+/// Build the 3-output `CodecConsensus` step (BOTH `--rejects` and `--metrics`):
+/// branch 0 = consensus, branch 1 = rejects, branch 2 = the inline-metrics
+/// `CoordinateGroupFragment`.
+///
+/// `pub(crate)` — consumed only by `ChainBuilder::add_codec`.
+pub(crate) fn build_codec_consensus_step_with_rejects_and_metrics(
+    limit_bytes: u64,
+    cap: CodecConsensusCaptures,
+) -> impl Step<
+    Input = BatchedMiGroups,
+    Outputs = OrderedBytesTuple3<DecompressedBlock, DecompressedBlock, CoordinateGroupFragment>,
+> {
+    let CodecConsensusCaptures {
+        track_rejects,
+        read_name_prefix,
+        read_group_id,
+        consensus_options,
+        accumulators,
+        progress,
+        header,
+        library_index,
+    } = cap;
+
+    let init = make_codec_consensus_init(
+        read_name_prefix,
+        read_group_id,
+        consensus_options,
+        track_rejects,
+        header,
+        library_index,
+    );
+    let body = move |state: &mut CodecState,
+                     item: BatchedMiGroups|
+          -> io::Result<
+        Process3Output<DecompressedBlock, DecompressedBlock, CoordinateGroupFragment>,
+    > {
+        let (consensus, rejects, fragment) = run_codec_consensus_batch_with_metrics(
+            state,
+            item,
+            track_rejects,
+            &accumulators,
+            &progress,
+        )?;
+        let rejects = rejects.unwrap_or(DecompressedBlock {
+            batch_serial: consensus.batch_serial,
+            bytes: Vec::new(),
+        });
+        Ok(Process3Output::both3(consensus, rejects, fragment))
+    };
+
+    process3_with_worker_state::<
+        BatchedMiGroups,
+        DecompressedBlock,
+        DecompressedBlock,
+        CoordinateGroupFragment,
+        CodecState,
+        _,
+        _,
+    >("CodecConsensus", limit_bytes, limit_bytes, limit_bytes, init, body)
+}
+
+/// Build the 2-output `CodecConsensus` step (used when `--metrics` is set but
+/// `--rejects` is not): branch 0 = consensus, branch 1 = the inline-metrics
+/// `CoordinateGroupFragment`.
+///
+/// `pub(crate)` — consumed only by `ChainBuilder::add_codec`.
+pub(crate) fn build_codec_consensus_step_metrics(
+    limit_bytes: u64,
+    cap: CodecConsensusCaptures,
+) -> impl Step<
+    Input = BatchedMiGroups,
+    Outputs = OrderedBytesTuple2<DecompressedBlock, CoordinateGroupFragment>,
+> {
+    let CodecConsensusCaptures {
+        track_rejects,
+        read_name_prefix,
+        read_group_id,
+        consensus_options,
+        accumulators,
+        progress,
+        header,
+        library_index,
+    } = cap;
+
+    let init = make_codec_consensus_init(
+        read_name_prefix,
+        read_group_id,
+        consensus_options,
+        track_rejects,
+        header,
+        library_index,
+    );
+    let body = move |state: &mut CodecState,
+                     item: BatchedMiGroups|
+          -> io::Result<Process2Output<DecompressedBlock, CoordinateGroupFragment>> {
+        let (consensus, _rejects, fragment) = run_codec_consensus_batch_with_metrics(
+            state,
+            item,
+            track_rejects,
+            &accumulators,
+            &progress,
+        )?;
+        Ok(Process2Output::both(consensus, fragment))
+    };
+
+    process2_with_worker_state::<
+        BatchedMiGroups,
+        DecompressedBlock,
+        CoordinateGroupFragment,
+        CodecState,
+        _,
+        _,
+    >("CodecConsensus", limit_bytes, limit_bytes, init, body)
+}
+
 /// Build the 2-output `CodecConsensus` step (used when `--rejects` is set):
 /// branch 0 = consensus, branch 1 = rejects.
 ///
@@ -319,6 +474,8 @@ pub(crate) fn build_codec_consensus_step_with_rejects(
         consensus_options,
         accumulators,
         progress,
+        header,
+        library_index,
     } = cap;
 
     let init = make_codec_consensus_init(
@@ -326,6 +483,8 @@ pub(crate) fn build_codec_consensus_step_with_rejects(
         read_group_id,
         consensus_options,
         track_rejects,
+        header,
+        library_index,
     );
     let body = move |state: &mut CodecState,
                      item: BatchedMiGroups|
@@ -381,6 +540,8 @@ pub(crate) fn build_codec_consensus_step_kept_only(
         consensus_options,
         accumulators,
         progress,
+        header,
+        library_index,
     } = cap;
 
     let init = make_codec_consensus_init(
@@ -388,6 +549,8 @@ pub(crate) fn build_codec_consensus_step_kept_only(
         read_group_id,
         consensus_options,
         track_rejects,
+        header,
+        library_index,
     );
     let body =
         move |state: &mut CodecState, item: BatchedMiGroups| -> io::Result<DecompressedBlock> {

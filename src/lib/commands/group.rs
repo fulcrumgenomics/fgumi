@@ -997,7 +997,7 @@ fn write_metrics<S: serde::Serialize>(
 }
 
 /// Build a path by appending `.{suffix}` to a prefix path.
-fn with_extension(prefix: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn with_extension(prefix: &Path, suffix: &str) -> PathBuf {
     let mut s = prefix.as_os_str().to_owned();
     s.push(".");
     s.push(suffix);

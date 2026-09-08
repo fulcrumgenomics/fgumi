@@ -374,6 +374,36 @@ fn templates_to_mi_step(
     )
 }
 
+/// Build the shared T1 (fused) inline-consensus-metrics captures: an interval
+/// list parsed from `intervals_path` (empty when unset), a per-thread
+/// accumulator seeded via `new_accumulator`, and the output prefix. Constructed
+/// by `add_group` when a downstream consensus stage in the same chain requested
+/// `--metrics`, so both the T1 tap closure and that stage's `FinalizeHook`
+/// share one accumulator `Arc` (Task 11, Part D).
+#[cfg(feature = "consensus")]
+fn build_consensus_metrics_captures(
+    metrics_prefix: &std::path::Path,
+    intervals_path: Option<&std::path::PathBuf>,
+    num_threads: usize,
+    new_accumulator: impl Fn() -> crate::inline_metrics_collector::ConsensusMetricsAccumulator
+    + Send
+    + Sync
+    + 'static,
+) -> Result<crate::inline_metrics_collector::ConsensusMetricsCaptures> {
+    let intervals = match intervals_path {
+        Some(path) => crate::commands::shared_metrics::parse_intervals(path)?,
+        None => Vec::new(),
+    };
+    Ok(crate::inline_metrics_collector::ConsensusMetricsCaptures {
+        accumulator: crate::per_thread_accumulator::PerThreadAccumulator::new_with(
+            num_threads,
+            new_accumulator,
+        ),
+        intervals,
+        output_prefix: metrics_prefix.to_path_buf(),
+    })
+}
+
 /// In-progress chain builder. Constructed by
 /// [`crate::pipeline::chains::build_for`] (or by a per-command
 /// builder during Phase 3a).
@@ -3209,6 +3239,56 @@ impl<'a> ChainBuilder<'a> {
             );
         let accumulators_for_process = Arc::clone(&accumulators);
 
+        // If a downstream consensus stage in THIS chain requested `--metrics`,
+        // construct the shared T1 captures now (before that stage's own
+        // add_simplex/add_duplex/add_codec runs) so both the T1 tap closure in
+        // build_group_process_step and that stage's FinalizeHook share one
+        // accumulator Arc. `self.spec.stage_opts.{simplex,duplex,codec}` are
+        // themselves consensus-feature-gated, so the whole peek is gated; the
+        // header/library index are needed on both feature paths.
+        let header_arc = Arc::new(self.header.clone());
+        let library_index_arc = Arc::new(fgumi_bam_io::LibraryIndex::from_header(&self.header));
+
+        #[cfg(feature = "consensus")]
+        let consensus_metrics: Option<
+            Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>,
+        > = if let Some(simplex) =
+            self.spec.stage_opts.simplex.as_ref().filter(|s| s.metrics.is_some())
+        {
+            Some(Arc::new(build_consensus_metrics_captures(
+                simplex.metrics.as_ref().unwrap(),
+                simplex.intervals.as_ref(),
+                num_threads,
+                crate::inline_metrics_collector::ConsensusMetricsAccumulator::new_simplex,
+            )?))
+        } else if let Some(duplex) =
+            self.spec.stage_opts.duplex.as_ref().filter(|d| d.metrics.is_some())
+        {
+            Some(Arc::new(build_consensus_metrics_captures(
+                duplex.metrics.as_ref().unwrap(),
+                duplex.intervals.as_ref(),
+                num_threads,
+                || crate::inline_metrics_collector::ConsensusMetricsAccumulator::new_duplex(false),
+            )?))
+        } else if let Some(codec) =
+            self.spec.stage_opts.codec.as_ref().filter(|c| c.metrics.is_some())
+        {
+            Some(Arc::new(build_consensus_metrics_captures(
+                codec.metrics.as_ref().unwrap(),
+                codec.intervals.as_ref(),
+                num_threads,
+                || crate::inline_metrics_collector::ConsensusMetricsAccumulator::new_duplex(false),
+            )?))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "consensus"))]
+        let consensus_metrics: Option<
+            Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>,
+        > = None;
+
+        self.consensus_metrics_captures.clone_from(&consensus_metrics);
+
         // ── Step factories (see chains::commands::group) ──────────────────
         let process_step = build_group_process_step(
             self.tuning.per_step_byte_limit,
@@ -3222,6 +3302,9 @@ impl<'a> ChainBuilder<'a> {
             num_threads,
             filter_config,
             accumulators_for_process,
+            consensus_metrics,
+            header_arc,
+            library_index_arc,
         );
         let mi_assign_step = build_group_mi_assign_step(self.tuning.per_step_byte_limit);
 
@@ -3369,8 +3452,9 @@ impl<'a> ChainBuilder<'a> {
         use crate::per_thread_accumulator::PerThreadAccumulator;
         use crate::pipeline::chains::commands::simplex::{
             CollectedSimplexMetrics, SimplexConsensusCaptures, SimplexFinalizeHook,
-            build_simplex_consensus_step_kept_only, build_simplex_consensus_step_with_rejects,
-            simplex_consensus_options,
+            build_simplex_consensus_step_kept_only, build_simplex_consensus_step_metrics,
+            build_simplex_consensus_step_with_rejects,
+            build_simplex_consensus_step_with_rejects_and_metrics, simplex_consensus_options,
         };
         use crate::pipeline::steps::group::mi::GroupByMi;
         use crate::sam::SamTag;
@@ -3520,6 +3604,13 @@ impl<'a> ChainBuilder<'a> {
 
         // ── Step factories (see chains::commands::simplex) ────────────────
 
+        // The consensus step reads INPUT records (grouped by MI), so their ref
+        // IDs index into the input header — build the metrics header/library
+        // index from `input_header`, not the (now-replaced) consensus output
+        // `self.header`.
+        let header_arc = Arc::new(input_header.clone());
+        let library_index_arc = Arc::new(fgumi_bam_io::LibraryIndex::from_header(&input_header));
+
         let consensus_cap = SimplexConsensusCaptures {
             track_rejects,
             overlapping_enabled,
@@ -3530,6 +3621,8 @@ impl<'a> ChainBuilder<'a> {
             accumulators: accumulators_for_step,
             min_reads: simplex.min_reads,
             progress: progress_records,
+            header: header_arc,
+            library_index: library_index_arc,
         };
 
         // ── Group-MI preamble: two paths depending on the incoming tail type ──
@@ -3562,26 +3655,88 @@ impl<'a> ChainBuilder<'a> {
             self.pipeline.append_step(group_mi_step, tail)
         };
 
-        // Wire the simplex consensus step. With `--rejects` it is a 2-output
-        // step (branch 0 = consensus DecompressedBlock, branch 1 = rejects
-        // DecompressedBlock → BgzfCompress → WriteBgzfFile with the INPUT
-        // header, in input order — the PR #332 fan-out contract); without
-        // rejects it is the 1-output kept-only variant (the framework has no
-        // public discard sink). Mirrors add_correct.
-        let limit = self.tuning.per_step_byte_limit;
-        let consensus_branch0 = if track_rejects {
-            let step = build_simplex_consensus_step_with_rejects(limit, consensus_cap);
-            let pt = self.pipeline.append_step(step, tail);
-            self.wire_consensus_rejects_branch(
-                pt,
-                simplex.rejects_opts.rejects.as_deref(),
-                &input_header,
-                "simplex",
-            )?;
-            pt
+        // Inline consensus metrics wiring (Task 11). Two independent paths:
+        //  - T1 (fused): add_group already built the shared captures and its
+        //    tap closure fills the accumulator. Register the FinalizeHook that
+        //    merges + writes; the consensus step here stays the existing
+        //    metrics-OFF variant (T1 never touches a third branch).
+        //  - T2 (standalone): no upstream group tap, but this stage's own
+        //    `--metrics` is set. Select a metrics-ON step variant with an extra
+        //    CoordinateGroupFragment branch feeding a MetricsCollectorStep.
+        let t1_captures = self.consensus_metrics_captures.take();
+        if let Some(existing) = &t1_captures {
+            self.finalize.push(Box::new(
+                crate::inline_metrics_collector::ConsensusMetricsFinalizeHook {
+                    accumulators: Arc::clone(&existing.accumulator),
+                    output_prefix: existing.output_prefix.clone(),
+                    thresholds: crate::inline_metrics_collector::MetricsThresholds::Simplex {
+                        min_reads: simplex.min_reads,
+                    },
+                },
+            ));
+        }
+        let metrics_on = t1_captures.is_none() && simplex.metrics.is_some();
+
+        // Build the T2 collector once (only when metrics_on); it is moved into
+        // whichever metrics-on match arm runs.
+        let t2_collector = if metrics_on {
+            let intervals = match simplex.intervals.as_ref() {
+                Some(path) => crate::commands::shared_metrics::parse_intervals(path)?,
+                None => Vec::new(),
+            };
+            let output_prefix = simplex.metrics.as_ref().unwrap().clone();
+            let min_reads = simplex.min_reads;
+            Some(crate::inline_metrics_collector::CoordinateGroupCollector::new(
+                crate::inline_metrics_collector::ConsensusMetricsAccumulator::new_simplex(),
+                intervals,
+                Box::new(move |merged| {
+                    crate::inline_metrics_collector::write_simplex_metrics_files(
+                        &merged,
+                        &output_prefix,
+                        min_reads,
+                    )
+                }),
+            ))
         } else {
-            let step = build_simplex_consensus_step_kept_only(limit, consensus_cap);
-            self.pipeline.append_step(step, tail)
+            None
+        };
+
+        // Wire the simplex consensus step. Selects one of four monomorphized
+        // variants on the (rejects, metrics) axes; the metrics-OFF variants are
+        // the existing, unmodified builders (spec §7.1 zero-overhead-when-off).
+        let limit = self.tuning.per_step_byte_limit;
+        let rejects_path = simplex.rejects_opts.rejects.as_deref();
+        let consensus_branch0 = match (track_rejects, metrics_on) {
+            (true, false) => {
+                let step = build_simplex_consensus_step_with_rejects(limit, consensus_cap);
+                let pt = self.pipeline.append_step(step, tail);
+                self.wire_consensus_rejects_branch(pt, rejects_path, &input_header, "simplex")?;
+                pt
+            }
+            (false, false) => {
+                let step = build_simplex_consensus_step_kept_only(limit, consensus_cap);
+                self.pipeline.append_step(step, tail)
+            }
+            (true, true) => {
+                let step =
+                    build_simplex_consensus_step_with_rejects_and_metrics(limit, consensus_cap);
+                let pt = self.pipeline.append_step(step, tail);
+                self.wire_consensus_rejects_branch(pt, rejects_path, &input_header, "simplex")?;
+                self.pipeline.append_step(
+                    fgumi_pipeline_core::MetricsCollectorStep::new(t2_collector.unwrap()),
+                    (pt.0, BranchIdx(2)),
+                );
+                pt
+            }
+            (false, true) => {
+                let step = build_simplex_consensus_step_metrics(limit, consensus_cap);
+                let pt = self.pipeline.append_step(step, tail);
+                self.pipeline.append_step(
+                    fgumi_pipeline_core::MetricsCollectorStep::new(t2_collector.unwrap()),
+                    (pt.0, BranchIdx(1)),
+                );
+                pt
+            }
         };
         // Branch 0 = consensus DecompressedBlock. For an Intermediate consensus
         // stage finish_consensus_tail appends DecodeRecords; Terminal leaves the
@@ -3655,8 +3810,9 @@ impl<'a> ChainBuilder<'a> {
         use crate::per_thread_accumulator::PerThreadAccumulator;
         use crate::pipeline::chains::commands::duplex::{
             CollectedDuplexMetrics, DuplexConsensusCaptures, DuplexFinalizeHook,
-            build_duplex_consensus_step_kept_only, build_duplex_consensus_step_with_rejects,
-            duplex_consensus_tuning,
+            build_duplex_consensus_step_kept_only, build_duplex_consensus_step_metrics,
+            build_duplex_consensus_step_with_rejects,
+            build_duplex_consensus_step_with_rejects_and_metrics, duplex_consensus_tuning,
         };
         use crate::pipeline::steps::group::mi::GroupByMi;
         use crate::sam::SamTag;
@@ -3802,6 +3958,10 @@ impl<'a> ChainBuilder<'a> {
 
         // ── Step factories (see chains::commands::duplex) ────────────────────
 
+        // Metrics header/library index from the INPUT header (see add_simplex).
+        let header_arc = Arc::new(input_header.clone());
+        let library_index_arc = Arc::new(fgumi_bam_io::LibraryIndex::from_header(&input_header));
+
         let consensus_cap = DuplexConsensusCaptures {
             track_rejects,
             overlapping_enabled,
@@ -3820,6 +3980,8 @@ impl<'a> ChainBuilder<'a> {
             cell_tag,
             accumulators: accumulators_for_step,
             progress: progress_records,
+            header: header_arc,
+            library_index: library_index_arc,
         };
 
         // ── Group-MI preamble: two paths depending on the incoming tail type ──
@@ -3863,24 +4025,92 @@ impl<'a> ChainBuilder<'a> {
             self.pipeline.append_step(group_mi_step, tail)
         };
 
-        // Wire the duplex consensus step. With `--rejects` it is a 2-output step
-        // (branch 0 = consensus, branch 1 = rejects → BgzfCompress → WriteBgzfFile
-        // with the INPUT header, in input order — the PR #332 fan-out contract);
-        // without rejects it is the 1-output kept-only variant. Mirrors add_correct.
-        let limit = self.tuning.per_step_byte_limit;
-        let consensus_branch0 = if track_rejects {
-            let step = build_duplex_consensus_step_with_rejects(limit, consensus_cap);
-            let pt = self.pipeline.append_step(step, tail);
-            self.wire_consensus_rejects_branch(
-                pt,
-                duplex.rejects_opts.rejects.as_deref(),
-                &input_header,
-                "duplex",
-            )?;
-            pt
+        // Inline consensus metrics wiring (Task 11) — see add_simplex for the
+        // T1/T2 split. Duplex thresholds: the BA (smaller-strand) threshold is
+        // `min_yx_reads_for`; the AB (larger-strand) threshold is the inline
+        // `min_reads.get(1).unwrap_or(last)` one-liner the caller uses (never
+        // raw `min_reads[1]`/`[2]`). `validate_min_reads` ran above, so both
+        // `.expect(...)`s are infallible here.
+        let last_min_read =
+            *duplex.min_reads.last().expect("validated non-empty by validate_min_reads");
+        let min_ab_reads = duplex.min_reads.get(1).copied().unwrap_or(last_min_read);
+        let min_ba_reads =
+            fgumi_consensus::DuplexConsensusCaller::min_yx_reads_for(&duplex.min_reads)
+                .expect("validated non-empty by validate_min_reads");
+
+        let t1_captures = self.consensus_metrics_captures.take();
+        if let Some(existing) = &t1_captures {
+            self.finalize.push(Box::new(
+                crate::inline_metrics_collector::ConsensusMetricsFinalizeHook {
+                    accumulators: Arc::clone(&existing.accumulator),
+                    output_prefix: existing.output_prefix.clone(),
+                    thresholds: crate::inline_metrics_collector::MetricsThresholds::Duplex {
+                        min_ab_reads,
+                        min_ba_reads,
+                    },
+                },
+            ));
+        }
+        let metrics_on = t1_captures.is_none() && duplex.metrics.is_some();
+
+        let t2_collector = if metrics_on {
+            let intervals = match duplex.intervals.as_ref() {
+                Some(path) => crate::commands::shared_metrics::parse_intervals(path)?,
+                None => Vec::new(),
+            };
+            let output_prefix = duplex.metrics.as_ref().unwrap().clone();
+            Some(crate::inline_metrics_collector::CoordinateGroupCollector::new(
+                crate::inline_metrics_collector::ConsensusMetricsAccumulator::new_duplex(false),
+                intervals,
+                Box::new(move |merged| {
+                    crate::inline_metrics_collector::write_duplex_metrics_files(
+                        &merged,
+                        &output_prefix,
+                        min_ab_reads,
+                        min_ba_reads,
+                    )
+                }),
+            ))
         } else {
-            let step = build_duplex_consensus_step_kept_only(limit, consensus_cap);
-            self.pipeline.append_step(step, tail)
+            None
+        };
+
+        // Wire the duplex consensus step: one of four monomorphized variants on
+        // the (rejects, metrics) axes; metrics-OFF variants are the existing,
+        // unmodified builders (spec §7.1).
+        let limit = self.tuning.per_step_byte_limit;
+        let rejects_path = duplex.rejects_opts.rejects.as_deref();
+        let consensus_branch0 = match (track_rejects, metrics_on) {
+            (true, false) => {
+                let step = build_duplex_consensus_step_with_rejects(limit, consensus_cap);
+                let pt = self.pipeline.append_step(step, tail);
+                self.wire_consensus_rejects_branch(pt, rejects_path, &input_header, "duplex")?;
+                pt
+            }
+            (false, false) => {
+                let step = build_duplex_consensus_step_kept_only(limit, consensus_cap);
+                self.pipeline.append_step(step, tail)
+            }
+            (true, true) => {
+                let step =
+                    build_duplex_consensus_step_with_rejects_and_metrics(limit, consensus_cap);
+                let pt = self.pipeline.append_step(step, tail);
+                self.wire_consensus_rejects_branch(pt, rejects_path, &input_header, "duplex")?;
+                self.pipeline.append_step(
+                    fgumi_pipeline_core::MetricsCollectorStep::new(t2_collector.unwrap()),
+                    (pt.0, BranchIdx(2)),
+                );
+                pt
+            }
+            (false, true) => {
+                let step = build_duplex_consensus_step_metrics(limit, consensus_cap);
+                let pt = self.pipeline.append_step(step, tail);
+                self.pipeline.append_step(
+                    fgumi_pipeline_core::MetricsCollectorStep::new(t2_collector.unwrap()),
+                    (pt.0, BranchIdx(1)),
+                );
+                pt
+            }
         };
         // Branch 0 = consensus DecompressedBlock. Intermediate appends
         // DecodeRecords; Terminal leaves the DecompressedBlock for add_sink.
@@ -3950,8 +4180,9 @@ impl<'a> ChainBuilder<'a> {
         use crate::per_thread_accumulator::PerThreadAccumulator;
         use crate::pipeline::chains::commands::codec::{
             CodecConsensusCaptures, CodecFinalizeHook, CollectedCodecMetrics,
-            build_codec_consensus_step_kept_only, build_codec_consensus_step_with_rejects,
-            codec_consensus_options,
+            build_codec_consensus_step_kept_only, build_codec_consensus_step_metrics,
+            build_codec_consensus_step_with_rejects,
+            build_codec_consensus_step_with_rejects_and_metrics, codec_consensus_options,
         };
         use crate::pipeline::steps::group::mi::GroupByMi;
         use crate::sam::SamTag;
@@ -4087,6 +4318,10 @@ impl<'a> ChainBuilder<'a> {
 
         // ── Step factories (see chains::commands::codec) ─────────────────────
 
+        // Metrics header/library index from the INPUT header (see add_simplex).
+        let header_arc = Arc::new(input_header.clone());
+        let library_index_arc = Arc::new(fgumi_bam_io::LibraryIndex::from_header(&input_header));
+
         let consensus_cap = CodecConsensusCaptures {
             track_rejects,
             read_name_prefix,
@@ -4094,6 +4329,8 @@ impl<'a> ChainBuilder<'a> {
             consensus_options,
             accumulators: accumulators_for_step,
             progress: progress_records,
+            header: header_arc,
+            library_index: library_index_arc,
         };
 
         // ── Group-MI preamble: two paths depending on the incoming tail type ──
@@ -4127,24 +4364,85 @@ impl<'a> ChainBuilder<'a> {
             self.pipeline.append_step(group_mi_step, tail)
         };
 
-        // Wire the codec consensus step. With `--rejects` it is a 2-output step
-        // (branch 0 = consensus, branch 1 = rejects → BgzfCompress → WriteBgzfFile
-        // with the INPUT header, in input order — the PR #332 fan-out contract);
-        // without rejects it is the 1-output kept-only variant. Mirrors add_correct.
-        let limit = self.tuning.per_step_byte_limit;
-        let consensus_branch0 = if track_rejects {
-            let step = build_codec_consensus_step_with_rejects(limit, consensus_cap);
-            let pt = self.pipeline.append_step(step, tail);
-            self.wire_consensus_rejects_branch(
-                pt,
-                codec.rejects_opts.rejects.as_deref(),
-                &input_header,
-                "codec",
-            )?;
-            pt
+        // Inline consensus metrics wiring (Task 11) — see add_simplex for the
+        // T1/T2 split. Codec's caller has a single symmetric min_reads_per_strand
+        // (verified codec_caller.rs, checked identically against both strands),
+        // so the duplex-shaped thresholds collapse to AB == BA == codec.min_reads.
+        let min_reads = codec.min_reads;
+
+        let t1_captures = self.consensus_metrics_captures.take();
+        if let Some(existing) = &t1_captures {
+            self.finalize.push(Box::new(
+                crate::inline_metrics_collector::ConsensusMetricsFinalizeHook {
+                    accumulators: Arc::clone(&existing.accumulator),
+                    output_prefix: existing.output_prefix.clone(),
+                    thresholds: crate::inline_metrics_collector::MetricsThresholds::Duplex {
+                        min_ab_reads: min_reads,
+                        min_ba_reads: min_reads,
+                    },
+                },
+            ));
+        }
+        let metrics_on = t1_captures.is_none() && codec.metrics.is_some();
+
+        let t2_collector = if metrics_on {
+            let intervals = match codec.intervals.as_ref() {
+                Some(path) => crate::commands::shared_metrics::parse_intervals(path)?,
+                None => Vec::new(),
+            };
+            let output_prefix = codec.metrics.as_ref().unwrap().clone();
+            Some(crate::inline_metrics_collector::CoordinateGroupCollector::new(
+                crate::inline_metrics_collector::ConsensusMetricsAccumulator::new_duplex(false),
+                intervals,
+                Box::new(move |merged| {
+                    crate::inline_metrics_collector::write_duplex_metrics_files(
+                        &merged,
+                        &output_prefix,
+                        min_reads,
+                        min_reads,
+                    )
+                }),
+            ))
         } else {
-            let step = build_codec_consensus_step_kept_only(limit, consensus_cap);
-            self.pipeline.append_step(step, tail)
+            None
+        };
+
+        // Wire the codec consensus step: one of four monomorphized variants on
+        // the (rejects, metrics) axes; metrics-OFF variants are the existing,
+        // unmodified builders (spec §7.1).
+        let limit = self.tuning.per_step_byte_limit;
+        let rejects_path = codec.rejects_opts.rejects.as_deref();
+        let consensus_branch0 = match (track_rejects, metrics_on) {
+            (true, false) => {
+                let step = build_codec_consensus_step_with_rejects(limit, consensus_cap);
+                let pt = self.pipeline.append_step(step, tail);
+                self.wire_consensus_rejects_branch(pt, rejects_path, &input_header, "codec")?;
+                pt
+            }
+            (false, false) => {
+                let step = build_codec_consensus_step_kept_only(limit, consensus_cap);
+                self.pipeline.append_step(step, tail)
+            }
+            (true, true) => {
+                let step =
+                    build_codec_consensus_step_with_rejects_and_metrics(limit, consensus_cap);
+                let pt = self.pipeline.append_step(step, tail);
+                self.wire_consensus_rejects_branch(pt, rejects_path, &input_header, "codec")?;
+                self.pipeline.append_step(
+                    fgumi_pipeline_core::MetricsCollectorStep::new(t2_collector.unwrap()),
+                    (pt.0, BranchIdx(2)),
+                );
+                pt
+            }
+            (false, true) => {
+                let step = build_codec_consensus_step_metrics(limit, consensus_cap);
+                let pt = self.pipeline.append_step(step, tail);
+                self.pipeline.append_step(
+                    fgumi_pipeline_core::MetricsCollectorStep::new(t2_collector.unwrap()),
+                    (pt.0, BranchIdx(1)),
+                );
+                pt
+            }
         };
         // Branch 0 = consensus DecompressedBlock. Intermediate appends
         // DecodeRecords; Terminal leaves the DecompressedBlock for add_sink.

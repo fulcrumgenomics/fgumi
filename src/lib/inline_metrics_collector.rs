@@ -28,12 +28,11 @@
 //! matching how the separate-pass `simplex_metrics`/`duplex_metrics` commands
 //! call them (`simplex_metrics.rs:131-147`, `duplex_metrics.rs:176`).
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::commands::group::with_extension;
 use crate::commands::shared_metrics::{
     DOWNSAMPLING_FRACTIONS, Interval, ReadInfoKey, TemplateInfo, build_template_info,
     overlaps_intervals, record_duplex_coordinate_group, record_simplex_coordinate_group,
@@ -282,26 +281,107 @@ fn duplex_fallback_init() -> ConsensusMetricsAccumulator {
     ConsensusMetricsAccumulator::new_duplex(false)
 }
 
-// Stub bodies always return `Ok(())` for now — Task 11's real bodies do
-// fallible file I/O, so the `Result` return type is not unnecessary once
-// they land; only the placeholder is infallible.
-#[allow(clippy::unnecessary_wraps)]
-fn write_simplex_metrics_files(
-    _merged: &ConsensusMetricsAccumulator,
-    _output_prefix: &Path,
-    _min_reads: usize,
+/// Writes the same three files the separate-pass `simplex-metrics` command
+/// writes (`simplex_metrics.rs`'s `execute()` tail): `<prefix>.family_sizes.txt`,
+/// `<prefix>.umi_counts.txt`, `<prefix>.simplex_yield_metrics.txt`. The 100%
+/// fraction collector (the last slot) supplies the family-size and UMI
+/// metrics; the yield curve is built across all 20 fraction slots, each paired
+/// with its running per-fraction template count.
+pub(crate) fn write_simplex_metrics_files(
+    merged: &ConsensusMetricsAccumulator,
+    output_prefix: &Path,
+    min_reads: usize,
 ) -> anyhow::Result<()> {
-    Ok(()) // real body lands in Task 11
+    let ConsensusMetricsAccumulator::Simplex { collectors, fraction_template_counts, .. } = merged
+    else {
+        anyhow::bail!("internal error: Simplex thresholds passed to a Duplex-mode accumulator");
+    };
+    // The 100% fraction is the last slot — matching `simplex_metrics.rs`'s
+    // `collectors.pop()` (the final entry is always the 1.0 fraction).
+    let main_collector = &collectors[DOWNSAMPLING_FRACTIONS.len() - 1];
+    let family_size_metrics = main_collector.family_size_metrics();
+    let umi_metrics = main_collector.umi_metrics();
+    let yield_metrics: Vec<_> = collectors
+        .iter()
+        .zip(DOWNSAMPLING_FRACTIONS.iter())
+        .zip(fraction_template_counts.iter())
+        .map(|((collector, &fraction), &read_pairs)| {
+            collector.into_yield_metric(fraction, read_pairs, min_reads)
+        })
+        .collect();
+
+    crate::metrics::writer::write_metrics_auto(
+        with_extension(output_prefix, "family_sizes.txt"),
+        &family_size_metrics,
+    )?;
+    crate::metrics::writer::write_metrics_auto(
+        with_extension(output_prefix, "umi_counts.txt"),
+        &umi_metrics,
+    )?;
+    crate::metrics::writer::write_metrics_auto(
+        with_extension(output_prefix, "simplex_yield_metrics.txt"),
+        &yield_metrics,
+    )?;
+    Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps)]
-fn write_duplex_metrics_files(
-    _merged: &ConsensusMetricsAccumulator,
-    _output_prefix: &Path,
-    _min_ab_reads: usize,
-    _min_ba_reads: usize,
+/// Writes the same file set the separate-pass `duplex-metrics` command writes
+/// (`duplex_metrics.rs`'s `execute()` tail): `<prefix>.family_sizes.txt`,
+/// `<prefix>.duplex_family_sizes.txt`, `<prefix>.umi_counts.txt`, optionally
+/// `<prefix>.duplex_umi_counts.txt` (only when `duplex_umi_counts` is on), and
+/// `<prefix>.duplex_yield_metrics.txt`.
+pub(crate) fn write_duplex_metrics_files(
+    merged: &ConsensusMetricsAccumulator,
+    output_prefix: &Path,
+    min_ab_reads: usize,
+    min_ba_reads: usize,
 ) -> anyhow::Result<()> {
-    Ok(()) // real body lands in Task 11
+    let ConsensusMetricsAccumulator::Duplex {
+        collectors,
+        fraction_template_counts,
+        duplex_umi_counts,
+        ..
+    } = merged
+    else {
+        anyhow::bail!("internal error: Duplex thresholds passed to a Simplex-mode accumulator");
+    };
+    let main_collector = &collectors[DOWNSAMPLING_FRACTIONS.len() - 1];
+    let family_size_metrics = main_collector.family_size_metrics();
+    let duplex_family_size_metrics = main_collector.duplex_family_size_metrics();
+    let umi_metrics = main_collector.umi_metrics();
+    let yield_metrics: Vec<_> = collectors
+        .iter()
+        .zip(DOWNSAMPLING_FRACTIONS.iter())
+        .zip(fraction_template_counts.iter())
+        .map(|((collector, &fraction), &read_pairs)| {
+            collector.into_yield_metric(fraction, read_pairs, min_ab_reads, min_ba_reads)
+        })
+        .collect();
+
+    crate::metrics::writer::write_metrics_auto(
+        with_extension(output_prefix, "family_sizes.txt"),
+        &family_size_metrics,
+    )?;
+    crate::metrics::writer::write_metrics_auto(
+        with_extension(output_prefix, "duplex_family_sizes.txt"),
+        &duplex_family_size_metrics,
+    )?;
+    crate::metrics::writer::write_metrics_auto(
+        with_extension(output_prefix, "umi_counts.txt"),
+        &umi_metrics,
+    )?;
+    if *duplex_umi_counts {
+        let duplex_umi_metrics = main_collector.duplex_umi_metrics(&umi_metrics);
+        crate::metrics::writer::write_metrics_auto(
+            with_extension(output_prefix, "duplex_umi_counts.txt"),
+            &duplex_umi_metrics,
+        )?;
+    }
+    crate::metrics::writer::write_metrics_auto(
+        with_extension(output_prefix, "duplex_yield_metrics.txt"),
+        &yield_metrics,
+    )?;
+    Ok(())
 }
 
 /// A `CoordinateGroupFragment` carries one **batch**'s worth of already-paired
@@ -713,6 +793,93 @@ mod coordinate_group_from_processed_position_tests {
         let infos = coordinate_group_from_processed_position(&[], &header, &library_index)
             .expect("converts");
         assert!(infos.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pair_and_push_tests {
+    use super::*;
+
+    /// Encode a mapped, paired, primary R1/R2 pair through the same raw-record
+    /// path production code uses (`build_pair` → `encode_record_buf_to_raw`).
+    fn raw_pair(name: &str, mi: &str, header: &noodles::sam::Header) -> (RawRecord, RawRecord) {
+        let (r1_buf, r2_buf) =
+            crate::commands::shared_metrics::tests::build_pair(name, 0, 100, 0, 150, mi);
+        let r1 = fgumi_raw_bam::encode_record_buf_to_raw(&r1_buf, header).expect("encode r1");
+        let r2 = fgumi_raw_bam::encode_record_buf_to_raw(&r2_buf, header).expect("encode r2");
+        (r1, r2)
+    }
+
+    #[test]
+    fn pair_records_by_read_name_pairs_two_complete_pairs() {
+        let header = crate::commands::shared_metrics::tests::test_header();
+        let (a1, a2) = raw_pair("a", "0", &header);
+        let (b1, b2) = raw_pair("b", "1", &header);
+        let pairs = pair_records_by_read_name(&[a1, a2, b1, b2]);
+        assert_eq!(pairs.len(), 2, "two complete R1/R2 pairs must produce two tuples");
+    }
+
+    #[test]
+    fn pair_records_by_read_name_drops_a_record_missing_its_mate() {
+        let header = crate::commands::shared_metrics::tests::test_header();
+        let (a1, _a2) = raw_pair("a", "0", &header);
+        let pairs = pair_records_by_read_name(&[a1]);
+        assert!(pairs.is_empty(), "an R1 with no matching R2 must be dropped");
+    }
+
+    #[test]
+    fn pair_records_by_read_name_excludes_a_secondary_alignment() {
+        use fgumi_raw_bam::{SamBuilder, testutil::encode_op};
+        let cigar = encode_op(0, 100); // 100M
+        let seq = vec![b'A'; 100];
+        let quals = vec![30u8; 100];
+        let mut builder = SamBuilder::new();
+        builder
+            .read_name(b"sec")
+            .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT | raw_flags::SECONDARY)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(0)
+            .mate_pos(149);
+        let secondary = builder.build();
+        let pairs = pair_records_by_read_name(&[secondary]);
+        assert!(pairs.is_empty(), "a SECONDARY record must never qualify for pairing");
+    }
+
+    #[test]
+    fn push_mi_group_entries_converts_every_qualifying_pair() {
+        let header = crate::commands::shared_metrics::tests::test_header();
+        let library_index = LibraryIndex::from_header(&header);
+        let (a1, a2) = raw_pair("a", "0", &header);
+        let (b1, b2) = raw_pair("b", "1", &header);
+        let group = MiGroup::new("0".to_string(), vec![a1, a2, b1, b2]);
+
+        let mut entries = Vec::new();
+        push_mi_group_entries(&group, &header, &library_index, &mut entries).expect("pushes");
+
+        assert_eq!(entries.len(), 2, "each complete pair becomes one entry");
+        let mut mis: Vec<&str> = entries.iter().map(|(info, _key)| info.mi.as_str()).collect();
+        mis.sort_unstable();
+        assert_eq!(mis, vec!["0", "1"], "each pair's MI tag must survive the conversion");
+    }
+
+    #[test]
+    fn push_mi_group_entries_appends_onto_a_non_empty_accumulator() {
+        let header = crate::commands::shared_metrics::tests::test_header();
+        let library_index = LibraryIndex::from_header(&header);
+        let (a1, a2) = raw_pair("a", "0", &header);
+        let group = MiGroup::new("0".to_string(), vec![a1, a2]);
+
+        // Pre-seed with one unrelated entry to prove the function appends
+        // rather than replacing the caller-owned accumulator (batch semantics).
+        let mut entries = vec![(template("seed", "chr1", 10, 1.0), key(0, 10))];
+        push_mi_group_entries(&group, &header, &library_index, &mut entries).expect("pushes");
+
+        assert_eq!(entries.len(), 2, "the seed entry must be retained and the new pair appended");
     }
 }
 

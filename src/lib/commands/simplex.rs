@@ -144,6 +144,19 @@ pub struct Simplex {
     #[arg(long = "max-reads")]
     pub max_reads: Option<usize>,
 
+    /// Optional prefix for inline consensus QC metrics (CS/SS family sizes,
+    /// UMI counts, downsampling yield curve) — same numeric output as
+    /// running `simplex-metrics` separately, computed inline during this
+    /// call with no second BAM read.
+    #[arg(long = "metrics")]
+    pub metrics: Option<std::path::PathBuf>,
+
+    /// Optional interval file (BED or Picard interval list) restricting
+    /// which templates contribute to `--metrics` output. Ignored if
+    /// `--metrics` is not set.
+    #[arg(long = "intervals")]
+    pub intervals: Option<std::path::PathBuf>,
+
     /// Whether to process unmapped reads (the shared `--allow-unmapped` flag).
     #[command(flatten)]
     pub allow_unmapped: AllowUnmappedOptions,
@@ -251,6 +264,12 @@ pub struct SimplexOptions {
     /// Cap on reads per consensus.
     #[arg(long = "max-reads")]
     pub max_reads: Option<usize>,
+    /// Optional prefix for inline consensus QC metrics. See `Simplex::metrics`.
+    #[arg(long = "metrics")]
+    pub metrics: Option<std::path::PathBuf>,
+    /// Optional interval file restricting `--metrics` output. See `Simplex::intervals`.
+    #[arg(long = "intervals")]
+    pub intervals: Option<std::path::PathBuf>,
     /// Let fully-unmapped primary templates through the pre-group filter.
     ///
     /// Carried as the whole flattened sub-struct, like `io` / `rejects_opts` /
@@ -299,6 +318,8 @@ impl Default for SimplexOptions {
             consensus_call_overlapping_bases: overlapping.consensus_call_overlapping_bases,
             min_reads: 1,
             max_reads: None,
+            metrics: None,
+            intervals: None,
             allow_unmapped: AllowUnmappedOptions { enabled: false },
             io: BamIoOptions::default(),
             rejects_opts: RejectsOptions::default(),
@@ -325,6 +346,8 @@ impl Simplex {
             consensus_call_overlapping_bases: self.overlapping.consensus_call_overlapping_bases,
             min_reads: self.min_reads,
             max_reads: self.max_reads,
+            metrics: self.metrics.clone(),
+            intervals: self.intervals.clone(),
             allow_unmapped: self.allow_unmapped.clone(),
             io: self.io.clone(),
             rejects_opts: self.rejects_opts.clone(),
@@ -642,6 +665,8 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
             min_reads: 1,
             max_reads: None,
+            metrics: None,
+            intervals: None,
             // These fixtures use `SamBuilder::new_unmapped()` synthetic reads to
             // exercise consensus behavior; opt back into consensus on unmapped
             // input so they survive the default fgbio pre-group filter. The

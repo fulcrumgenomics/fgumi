@@ -147,6 +147,9 @@ pub(crate) fn build_group_process_step(
     num_threads: usize,
     filter_config: TemplateFilterConfig,
     accumulators: Arc<PerThreadAccumulator<GroupMetricsAccumulator>>,
+    consensus_metrics: Option<Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>>,
+    header: Arc<noodles::sam::Header>,
+    library_index: Arc<fgumi_bam_io::LibraryIndex>,
 ) -> ProcessOrdered<
     BatchedRawPositionGroups,
     BatchedProcessedPositionGroups,
@@ -286,6 +289,26 @@ pub(crate) fn build_group_process_step(
                 accumulators.with_slot(|acc| {
                     acc.record_group(family_sizes.clone(), &filter_counts);
                 });
+
+                // T1 fused inline-metrics tap: when a downstream consensus
+                // stage in this chain requested `--metrics`, record this
+                // position group's templates into the shared accumulator now,
+                // reusing the already-decoded `Template`s (no second BAM read).
+                if let Some(consensus_metrics) = &consensus_metrics {
+                    let infos =
+                        crate::inline_metrics_collector::coordinate_group_from_processed_position(
+                            &templates,
+                            &header,
+                            &library_index,
+                        )
+                        .map_err(io::Error::other)?;
+                    consensus_metrics
+                        .accumulator
+                        .with_slot(|acc| {
+                            acc.record_coordinate_group(&infos, &consensus_metrics.intervals)
+                        })
+                        .map_err(io::Error::other)?;
+                }
 
                 processed_batch.push(ProcessedPositionGroup {
                     templates,
