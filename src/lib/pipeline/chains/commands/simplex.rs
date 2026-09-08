@@ -12,8 +12,9 @@
 //!
 //! This module supplies the chain-builder pieces for the simplex stage; the
 //! chain is constructed via `ChainBuilder` /
-//! [`crate::pipeline::chains::build::build_for`]. It is not yet wired as
-//! `Simplex::execute`'s live path.
+//! [`crate::pipeline::chains::build::build_for`]. It is the sole path for
+//! `Simplex::execute` (via `execute_chain`), with or without `--threads` —
+//! absent `--threads` runs the chain at a single worker.
 
 use std::io;
 use std::sync::Arc;
@@ -48,8 +49,7 @@ use crate::vanilla_consensus_caller::{VanillaUmiConsensusCaller, VanillaUmiConse
 // CollectedSimplexMetrics
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Per-thread accumulator for simplex consensus metrics (mirrors
-/// `commands::simplex::CollectedSimplexMetrics`).
+/// Per-thread accumulator for simplex consensus metrics.
 ///
 /// Merged into final aggregates after the pipeline completes; one instance
 /// per worker slot (see [`PerThreadAccumulator`]).
@@ -158,6 +158,40 @@ impl FinalizeHook for SimplexFinalizeHook {
 // opaque-return position and cannot name themselves.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Maps `SimplexOptions` (the resolved options-bag entry `add_simplex`
+/// receives) into the `VanillaUmiConsensusOptions` the per-worker consensus
+/// caller is built from.
+///
+/// Extracted out of `ChainBuilder::add_simplex` so this mapping is
+/// unit-testable on its own: the `test_simplex_chain_matches_single_threaded`
+/// parity tests compare two chain runs (single- vs multi-worker) that BOTH go
+/// through this same mapping, so a field dropped or swapped inside it would
+/// make the two sides agree with each other and still pass. See
+/// `simplex_consensus_options_carries_every_tuning_flag` below, which mirrors
+/// `to_simplex_options_carries_every_tuning_flag`'s non-default-everywhere
+/// discipline for the other half of the CLI-args -> `SimplexOptions` ->
+/// `VanillaUmiConsensusOptions` pipeline.
+pub(crate) fn simplex_consensus_options(
+    simplex: &crate::commands::simplex::SimplexOptions,
+    cell_tag: noodles::sam::alignment::record::data::field::Tag,
+) -> VanillaUmiConsensusOptions {
+    let consensus = simplex.consensus();
+    VanillaUmiConsensusOptions {
+        tag: "MI".to_string(),
+        error_rate_pre_umi: consensus.error_rate_pre_umi,
+        error_rate_post_umi: consensus.error_rate_post_umi,
+        min_input_base_quality: consensus.min_input_base_quality,
+        min_reads: simplex.min_reads,
+        max_reads: simplex.max_reads,
+        produce_per_base_tags: consensus.output_per_base_tags,
+        trim: consensus.trim,
+        min_consensus_base_quality: consensus.min_consensus_base_quality,
+        cell_tag: Some(cell_tag),
+        methylation_mode: simplex.methylation_mode,
+        tie_rule: simplex.tie_rule,
+    }
+}
+
 /// Captures passed into [`build_simplex_consensus_step_with_rejects`] / [`build_simplex_consensus_step_kept_only`] from `add_simplex`.
 ///
 /// Bundles all the cloned scalars and Arcs the closure needs so `add_simplex`
@@ -254,11 +288,10 @@ fn run_simplex_consensus_batch(
 
         if let Some(ref mut oc) = state.overlapping {
             oc.reset_stats();
-            // A failure here must be fatal to match the single-thread fast path
-            // in `src/lib/commands/simplex.rs`, which propagates
-            // `apply_overlapping_consensus` errors with `?`. Downgrading to a
-            // `RejectionReason::Other` reject would make the same input fail
-            // without `--threads` but succeed with it.
+            // A failure here must be fatal so the absent-`--threads`
+            // (single-worker) and `--threads N` chain runs behave identically.
+            // Downgrading to a `RejectionReason::Other` reject would make the
+            // same input fail at one worker count but succeed at another.
             apply_overlapping_consensus(&mut raw_records, oc).map_err(|e| {
                 io::Error::other(format!("Overlapping consensus error for MI {mi}: {e}"))
             })?;
@@ -433,4 +466,81 @@ pub(crate) fn build_simplex_consensus_step_kept_only(
         init,
         body,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::simplex::Simplex;
+    use clap::Parser;
+
+    /// The `SimplexOptions -> VanillaUmiConsensusOptions` mapping inside
+    /// `add_simplex` must carry every tuning flag. The
+    /// `test_simplex_chain_matches_single_threaded` parity tests compare two
+    /// chain runs that BOTH go through this mapping, so they cannot catch a
+    /// field dropped or swapped inside it; this test exercises the mapping
+    /// directly, driven through `try_parse_from` + `to_simplex_options()` (not
+    /// a hand-built `SimplexOptions` literal) with every value non-default, so
+    /// a field read from the wrong source fails rather than coincidentally
+    /// matching a default. Mirrors
+    /// `to_simplex_options_carries_every_tuning_flag` in
+    /// `commands::simplex`, which covers the other half of the pipeline
+    /// (CLI args -> `SimplexOptions`).
+    #[test]
+    fn simplex_consensus_options_carries_every_tuning_flag() {
+        let cmd = Simplex::try_parse_from([
+            "simplex",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--error-rate-pre-umi",
+            "40",
+            "--error-rate-post-umi",
+            "35",
+            "--min-input-base-quality",
+            "17",
+            "--output-per-base-tags=false",
+            "--trim=true",
+            "--min-consensus-base-quality",
+            "19",
+            "--tie-rule",
+            "ulp-relative",
+            "--min-reads",
+            "3",
+            "--max-reads",
+            "77",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            "ref.fa",
+        ])
+        .expect("parses");
+        let simplex_options = cmd.to_simplex_options();
+
+        let cell_tag =
+            noodles::sam::alignment::record::data::field::Tag::from(crate::sam::SamTag::CB);
+        let opts = simplex_consensus_options(&simplex_options, cell_tag);
+
+        assert_eq!(opts.tag, "MI");
+        assert_eq!(opts.error_rate_pre_umi, 40);
+        assert_eq!(opts.error_rate_post_umi, 35);
+        assert_eq!(opts.min_input_base_quality, 17);
+        assert!(!opts.produce_per_base_tags, "an explicit false must not be lost");
+        assert!(opts.trim);
+        assert_eq!(opts.min_consensus_base_quality, 19);
+        assert_eq!(
+            opts.tie_rule,
+            fgumi_consensus::TieRule::UlpRelative,
+            "--tie-rule must reach the mapping"
+        );
+        assert_eq!(opts.min_reads, 3);
+        assert_eq!(opts.max_reads, Some(77));
+        assert_eq!(opts.cell_tag, Some(cell_tag));
+        assert_eq!(
+            opts.methylation_mode,
+            fgumi_consensus::MethylationMode::EmSeq,
+            "--methylation-mode must reach the mapping"
+        );
+    }
 }

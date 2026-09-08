@@ -1881,13 +1881,17 @@ fn test_duplex_ignores_unmapped_end_when_mapped_reads_present() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Chain-vs-single-threaded parity tests (R3.6 duplex cutover)
+// Chain worker-count determinism tests (R3.6 duplex cutover)
 //
-// `Duplex::execute`'s no-`--threads` single-threaded fast path is the
-// in-process parity oracle. `--threads N` on a `consensus`-feature build now
-// runs on the declarative chain builder (`ChainBuilder::add_duplex`). These
-// tests pin record/header parity between the two paths across duplex's knobs,
-// including the Task 1A overlapping-consensus single-strand fix.
+// `Duplex::execute` always runs on the declarative chain builder
+// (`ChainBuilder::add_duplex`) on a `consensus`-feature build; the legacy
+// single-threaded fast path is retired. These tests diff a no-`--threads` run
+// (the chain at a single worker) against a `--threads N` run (N workers): the
+// "single-threaded oracle" naming below now means the single-worker chain, not
+// the retired serial loop. They pin record/header parity across duplex's knobs,
+// including the Task 1A overlapping-consensus single-strand fix. Byte-parity
+// against the pre-removal serial binary lives in
+// `test_consensus_cutover_parity.rs`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Run `duplex` with `extra` args appended to a base `-i/-o --min-reads
