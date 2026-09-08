@@ -5,6 +5,7 @@
 //! sampling levels.
 
 use serde::{Deserialize, Serialize};
+use statrs::distribution::{Binomial, DiscreteCDF};
 use std::collections::HashMap;
 
 use crate::shared::{UmiCountTracker, UmiMetric};
@@ -516,6 +517,129 @@ impl DuplexMetricsCollector {
         // collectors in one accumulator are always constructed with the
         // same flag, so self and other never disagree.
     }
+
+    /// Builds the yield-metric row for this collector at one downsampling
+    /// fraction. `min_ab_reads`/`min_ba_reads` are the calling command's own
+    /// AB/BA family-size thresholds — the separate-pass command sources
+    /// these from its own `--min-ab-reads`/`--min-ba-reads` flags; the
+    /// inline path derives them from the calling command's `min_reads`
+    /// (Task 11).
+    #[must_use]
+    pub fn into_yield_metric(
+        &self,
+        fraction: f64,
+        read_pairs: usize,
+        min_ab_reads: usize,
+        min_ba_reads: usize,
+    ) -> DuplexYieldMetric {
+        let family_size_metrics = self.family_size_metrics();
+
+        let ds_families_count: usize = family_size_metrics.iter().map(|m| m.ds_count).sum();
+
+        let duplex_family_size_metrics = self.duplex_family_size_metrics();
+        let ds_duplexes_count: usize = duplex_family_size_metrics
+            .iter()
+            .filter(|m| m.ab_size >= min_ab_reads && m.ba_size >= min_ba_reads)
+            .map(|m| m.count)
+            .sum();
+
+        let ideal_fraction = Self::calculate_ideal_duplex_fraction_per_size(
+            &family_size_metrics,
+            min_ab_reads,
+            min_ba_reads,
+        );
+
+        let cs_families: usize = family_size_metrics.iter().map(|m| m.cs_count).sum();
+        let ss_families: usize = duplex_family_size_metrics
+            .iter()
+            .map(|m| {
+                let mut count = 0;
+                if m.ab_size > 0 {
+                    count += 1;
+                }
+                if m.ba_size > 0 {
+                    count += 1;
+                }
+                count * m.count
+            })
+            .sum();
+
+        DuplexYieldMetric {
+            fraction,
+            read_pairs,
+            cs_families,
+            ss_families,
+            ds_families: ds_families_count,
+            ds_duplexes: ds_duplexes_count,
+            ds_fraction_duplexes: frac(ds_duplexes_count, ds_families_count),
+            ds_fraction_duplexes_ideal: ideal_fraction,
+        }
+    }
+
+    /// Calculates the ideal duplex fraction directly from per-family-size
+    /// counts, weighting each family size's probability by its DS count
+    /// instead of materializing a flat `Vec<usize>` of repeated sizes.
+    ///
+    /// For each family size N with `ds_count` observations, calculates the
+    /// probability that both strands have sufficient reads
+    /// (A >= `min_ab` AND B >= `min_ba` where A + B = N), assuming each read
+    /// has 0.5 probability of being on each strand. The numerator
+    /// accumulates `prob × ds_count` per unique size; the denominator is the
+    /// total number of DS family observations.
+    #[expect(clippy::cast_precision_loss, reason = "metric counts never exceed 2^53")]
+    fn calculate_ideal_duplex_fraction_per_size(
+        family_size_metrics: &[FamilySizeMetric],
+        min_ab: usize,
+        min_ba: usize,
+    ) -> f64 {
+        let total_families: usize = family_size_metrics.iter().map(|m| m.ds_count).sum();
+        if total_families == 0 {
+            return 0.0;
+        }
+
+        let mut ideal_duplexes = 0.0;
+
+        for m in family_size_metrics {
+            if m.ds_count == 0 {
+                continue;
+            }
+            let size = m.family_size;
+            if size < min_ab + min_ba {
+                // Impossible to form a duplex with this family size
+                continue;
+            }
+
+            // Calculate P(A >= min_ab AND B >= min_ba) where A ~ Binomial(n=size, p=0.5)
+            // and B = size - A. Equivalent to:
+            //   P(min_ba <= A <= size - min_ab)
+            //   = CDF(size - min_ab) - CDF(min_ba - 1)
+
+            // `Binomial::new(p, n)` only returns `Err` when `p` is NaN or
+            // outside `[0, 1]` (statrs 0.18 `BinomialError::ProbabilityInvalid`).
+            // With `p = 0.5` hardcoded the `Err` arm is statically unreachable;
+            // expect rather than silently skip so a future refactor that lets
+            // `p` become dynamic surfaces immediately instead of silently
+            // dropping families from the ideal-fraction calculation.
+            let binomial = Binomial::new(0.5, size as u64)
+                .expect("p = 0.5 is always a valid probability for Binomial::new");
+
+            let upper_bound = size - min_ba;
+            let lower_bound = min_ab;
+
+            let prob = if upper_bound >= lower_bound {
+                let p_upper = binomial.cdf(upper_bound as u64);
+                let p_lower =
+                    if lower_bound > 0 { binomial.cdf((lower_bound - 1) as u64) } else { 0.0 };
+                p_upper - p_lower
+            } else {
+                0.0
+            };
+
+            ideal_duplexes += prob * (m.ds_count as f64);
+        }
+
+        ideal_duplexes / (total_families as f64)
+    }
 }
 
 #[cfg(test)]
@@ -948,6 +1072,24 @@ mod tests {
 
         let umi_metrics = collector.umi_metrics();
         assert!(umi_metrics.is_empty());
+    }
+
+    // =========================================================================
+    // DuplexMetricsCollector::into_yield_metric tests
+    // =========================================================================
+
+    #[test]
+    fn into_yield_metric_counts_ds_duplexes_at_the_ab_ba_thresholds() {
+        let mut collector = DuplexMetricsCollector::new(false);
+        collector.record_ds_family(2);
+        collector.record_duplex_family(1, 5); // normalizes to ab=5, ba=1
+        collector.record_ds_family(1);
+        collector.record_duplex_family(1, 0); // ab=1, ba=0
+
+        // min_ab_reads=3, min_ba_reads=1: only the (ab=5, ba=1) family qualifies.
+        let metric = collector.into_yield_metric(1.0, 10, 3, 1);
+
+        assert_eq!(metric.ds_duplexes, 1);
     }
 
     #[test]

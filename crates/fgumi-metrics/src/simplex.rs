@@ -235,6 +235,50 @@ impl SimplexMetricsCollector {
         }
         self.umi_counts.merge(other.umi_counts);
     }
+
+    /// Builds the yield-metric row for this collector at one downsampling
+    /// fraction. `min_reads` is the family-size threshold a family must meet
+    /// to count toward `ss_consensus_families` — the separate-pass command
+    /// sources this from its own `--min-reads` flag; the inline path sources
+    /// it from the calling command's own `min_reads` option (Task 11), so
+    /// the two agree by construction rather than by convention.
+    #[must_use]
+    pub fn into_yield_metric(
+        &self,
+        fraction: f64,
+        read_pairs: usize,
+        min_reads: usize,
+    ) -> SimplexYieldMetric {
+        let family_size_metrics = self.family_size_metrics();
+
+        let cs_families: usize = family_size_metrics.iter().map(|m| m.cs_count).sum();
+        let ss_families: usize = family_size_metrics.iter().map(|m| m.ss_count).sum();
+
+        let total_ss_reads: usize =
+            family_size_metrics.iter().map(|m| m.family_size * m.ss_count).sum();
+        let mean_ss_family_size = frac(total_ss_reads, ss_families);
+
+        let ss_singletons: usize =
+            family_size_metrics.iter().find(|m| m.family_size == 1).map_or(0, |m| m.ss_count);
+        let ss_singleton_fraction = frac(ss_singletons, ss_families);
+
+        let ss_consensus_families: usize = family_size_metrics
+            .iter()
+            .filter(|m| m.family_size >= min_reads)
+            .map(|m| m.ss_count)
+            .sum();
+
+        SimplexYieldMetric {
+            fraction,
+            read_pairs,
+            cs_families,
+            ss_families,
+            mean_ss_family_size,
+            ss_singletons,
+            ss_singleton_fraction,
+            ss_consensus_families,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -359,6 +403,22 @@ mod tests {
         assert_eq!(size_3.ss_count, 1);
         assert!((size_3.ss_fraction - 0.25).abs() < 0.001); // 1/4 = 0.25
         assert!((size_3.ss_fraction_gt_or_eq_size - 0.25).abs() < 0.001); // Only size 3
+    }
+
+    #[test]
+    fn into_yield_metric_counts_ss_consensus_families_at_the_min_reads_threshold() {
+        let mut collector = SimplexMetricsCollector::new();
+        collector.record_cs_family(4);
+        collector.record_ss_family(1); // below min_reads=2, excluded
+        collector.record_ss_family(3); // at/above min_reads=2, included
+
+        let metric = collector.into_yield_metric(0.5, 100, 2);
+
+        assert!((metric.fraction - 0.5).abs() < f64::EPSILON);
+        assert_eq!(metric.read_pairs, 100);
+        assert_eq!(metric.cs_families, 1);
+        assert_eq!(metric.ss_families, 2);
+        assert_eq!(metric.ss_consensus_families, 1);
     }
 
     #[test]

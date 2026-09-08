@@ -14,6 +14,7 @@ fgoxide = { workspace = true }
 tempfile = { workspace = true }
 noodles = { workspace = true, features = ["sam"], optional = true }
 fgumi-raw-bam = { workspace = true, optional = true }
+statrs = "0.18"
 
 [dev-dependencies]
 tempfile = { workspace = true }

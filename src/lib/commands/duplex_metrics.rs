@@ -7,14 +7,13 @@
 //! - Optional interval filtering (BED or Picard interval list format) to restrict analysis to specific regions
 
 use crate::logging::OperationTimer;
-use crate::metrics::duplex::{DuplexMetricsCollector, DuplexYieldMetric, FamilySizeMetric};
+use crate::metrics::duplex::DuplexMetricsCollector;
 use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
 use crate::umi::extract_mi_base;
 use crate::validation::validate_input_exists;
 use anyhow::Result;
 use clap::Parser;
 use log::info;
-use statrs::distribution::{Binomial, DiscreteCDF};
 use std::path::PathBuf;
 
 use super::command::Command;
@@ -193,7 +192,12 @@ impl Command for DuplexMetrics {
         for ((&fraction, collector), &read_pairs) in
             fractions.iter().zip(collectors.iter()).zip(fraction_template_counts.iter())
         {
-            let yield_metric = self.generate_yield_metric(collector, fraction, read_pairs);
+            let yield_metric = collector.into_yield_metric(
+                fraction,
+                read_pairs,
+                self.min_ab_reads,
+                self.min_ba_reads,
+            );
             yield_metrics.push(yield_metric);
         }
 
@@ -398,154 +402,6 @@ impl DuplexMetrics {
         Ok(())
     }
 
-    /// Generates a yield metric from a collector at a specific downsampling fraction.
-    ///
-    /// Computes summary yield metrics including family counts (CS, SS, DS), duplex counts,
-    /// duplex fractions, and ideal duplex fraction based on binomial probability. The ideal
-    /// fraction represents the expected duplex yield if strands were randomly distributed.
-    ///
-    /// # Arguments
-    ///
-    /// * `collector` - Metrics collector containing accumulated family and duplex data
-    /// * `fraction` - Downsampling fraction (0.05 to 1.00)
-    /// * `read_pairs` - Number of read pairs at this downsampling fraction
-    ///
-    /// # Returns
-    ///
-    /// A `DuplexYieldMetric` containing all computed yield statistics.
-    fn generate_yield_metric(
-        &self,
-        collector: &DuplexMetricsCollector,
-        fraction: f64,
-        read_pairs: usize,
-    ) -> DuplexYieldMetric {
-        let family_size_metrics = collector.family_size_metrics();
-
-        // Sum up DS family counts from family_size_metrics
-        let ds_families_count: usize = family_size_metrics.iter().map(|m| m.ds_count).sum();
-
-        let duplex_family_size_metrics = collector.duplex_family_size_metrics();
-        let ds_duplexes_count: usize = duplex_family_size_metrics
-            .iter()
-            .filter(|m| m.ab_size >= self.min_ab_reads && m.ba_size >= self.min_ba_reads)
-            .map(|m| m.count)
-            .sum();
-
-        // Calculate ideal fraction directly from the per-size DS counts. The
-        // previous implementation flat-mapped each `family_size_metric` into a
-        // `Vec<usize>` containing `m.family_size` repeated `m.ds_count` times,
-        // then iterated that flat Vec computing one `Binomial::cdf` per entry.
-        // For inputs with even one family that ran into the tens-of-thousands
-        // of reads the flat Vec adds tens of MB and the inner loop recomputes
-        // the *same* binomial probability `ds_count` times for every distinct
-        // family size. Iterating the per-size buckets is mathematically
-        // equivalent: each family size's contribution is `prob × ds_count`.
-        let ideal_fraction = Self::calculate_ideal_duplex_fraction_per_size(
-            &family_size_metrics,
-            self.min_ab_reads,
-            self.min_ba_reads,
-        );
-
-        let cs_families: usize = family_size_metrics.iter().map(|m| m.cs_count).sum();
-        let ss_families: usize = duplex_family_size_metrics
-            .iter()
-            .map(|m| {
-                let mut count = 0;
-                if m.ab_size > 0 {
-                    count += 1;
-                }
-                if m.ba_size > 0 {
-                    count += 1;
-                }
-                count * m.count
-            })
-            .sum();
-
-        DuplexYieldMetric {
-            fraction,
-            read_pairs,
-            cs_families,
-            ss_families,
-            ds_families: ds_families_count,
-            ds_duplexes: ds_duplexes_count,
-            ds_fraction_duplexes: if ds_families_count > 0 {
-                ds_duplexes_count as f64 / ds_families_count as f64
-            } else {
-                0.0
-            },
-            ds_fraction_duplexes_ideal: ideal_fraction,
-        }
-    }
-
-    /// Calculates the ideal duplex fraction directly from per-family-size
-    /// counts, weighting each family size's probability by its DS count
-    /// instead of materializing a flat `Vec<usize>` of repeated sizes.
-    ///
-    /// For each family size N with `ds_count` observations, calculates the
-    /// probability that both strands have sufficient reads
-    /// (A >= `min_ab` AND B >= `min_ba` where A + B = N), assuming each read
-    /// has 0.5 probability of being on each strand. The numerator
-    /// accumulates `prob × ds_count` per unique size; the denominator is the
-    /// total number of DS family observations.
-    ///
-    /// This is mathematically equivalent to the previous
-    /// `calculate_ideal_duplex_fraction(&[usize])` form but avoids both the
-    /// `vec![size; ds_count]` allocation and the redundant `Binomial::cdf`
-    /// recomputation for repeated family sizes.
-    fn calculate_ideal_duplex_fraction_per_size(
-        family_size_metrics: &[FamilySizeMetric],
-        min_ab: usize,
-        min_ba: usize,
-    ) -> f64 {
-        let total_families: usize = family_size_metrics.iter().map(|m| m.ds_count).sum();
-        if total_families == 0 {
-            return 0.0;
-        }
-
-        let mut ideal_duplexes = 0.0;
-
-        for m in family_size_metrics {
-            if m.ds_count == 0 {
-                continue;
-            }
-            let size = m.family_size;
-            if size < min_ab + min_ba {
-                // Impossible to form a duplex with this family size
-                continue;
-            }
-
-            // Calculate P(A >= min_ab AND B >= min_ba) where A ~ Binomial(n=size, p=0.5)
-            // and B = size - A. Equivalent to:
-            //   P(min_ba <= A <= size - min_ab)
-            //   = CDF(size - min_ab) - CDF(min_ba - 1)
-
-            // `Binomial::new(p, n)` only returns `Err` when `p` is NaN or
-            // outside `[0, 1]` (statrs 0.18 `BinomialError::ProbabilityInvalid`).
-            // With `p = 0.5` hardcoded the `Err` arm is statically unreachable;
-            // expect rather than silently skip so a future refactor that lets
-            // `p` become dynamic surfaces immediately instead of silently
-            // dropping families from the ideal-fraction calculation.
-            let binomial = Binomial::new(0.5, size as u64)
-                .expect("p = 0.5 is always a valid probability for Binomial::new");
-
-            let upper_bound = size - min_ba;
-            let lower_bound = min_ab;
-
-            let prob = if upper_bound >= lower_bound {
-                let p_upper = binomial.cdf(upper_bound as u64);
-                let p_lower =
-                    if lower_bound > 0 { binomial.cdf((lower_bound - 1) as u64) } else { 0.0 };
-                p_upper - p_lower
-            } else {
-                0.0
-            };
-
-            ideal_duplexes += prob * (m.ds_count as f64);
-        }
-
-        ideal_duplexes / (total_families as f64)
-    }
-
     /// Updates UMI metrics for a duplex family
     ///
     /// This method:
@@ -667,7 +523,9 @@ mod tests {
     use crate::commands::shared_metrics::{
         Interval, TemplateInfo, compute_hash_fraction, overlaps_intervals, parse_intervals,
     };
-    use crate::metrics::duplex::{DuplexFamilySizeMetric, DuplexUmiMetric, FamilySizeMetric};
+    use crate::metrics::duplex::{
+        DuplexFamilySizeMetric, DuplexUmiMetric, DuplexYieldMetric, FamilySizeMetric,
+    };
     use crate::metrics::shared::UmiMetric;
     use crate::sam::SamTag;
     use anyhow::Result;

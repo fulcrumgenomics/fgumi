@@ -8,7 +8,7 @@
 //! - Optional PDF plots via an embedded R script
 
 use crate::logging::OperationTimer;
-use crate::metrics::simplex::{SimplexMetricsCollector, SimplexYieldMetric};
+use crate::metrics::simplex::SimplexMetricsCollector;
 use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
 use crate::validation::validate_input_exists;
 use anyhow::Result;
@@ -153,8 +153,7 @@ impl Command for SimplexMetrics {
         for ((&fraction, collector), &read_pairs) in
             fractions.iter().zip(collectors.iter()).zip(fraction_template_counts.iter())
         {
-            let yield_metric =
-                Self::generate_yield_metric(collector, fraction, read_pairs, self.min_reads);
+            let yield_metric = collector.into_yield_metric(fraction, read_pairs, self.min_reads);
             yield_metrics.push(yield_metric);
         }
 
@@ -322,50 +321,6 @@ impl SimplexMetrics {
         }
         Ok(())
     }
-
-    /// Generates a yield metric from a collector at a specific downsampling fraction.
-    ///
-    /// Computes summary statistics including CS and SS family counts, mean SS family size,
-    /// singleton fraction, and number of SS families meeting the minimum read threshold.
-    fn generate_yield_metric(
-        collector: &SimplexMetricsCollector,
-        fraction: f64,
-        read_pairs: usize,
-        min_reads: usize,
-    ) -> SimplexYieldMetric {
-        let family_size_metrics = collector.family_size_metrics();
-
-        let cs_families: usize = family_size_metrics.iter().map(|m| m.cs_count).sum();
-        let ss_families: usize = family_size_metrics.iter().map(|m| m.ss_count).sum();
-
-        // Total reads in SS families = sum(family_size * ss_count)
-        let total_ss_reads: usize =
-            family_size_metrics.iter().map(|m| m.family_size * m.ss_count).sum();
-        let mean_ss_family_size =
-            if ss_families > 0 { total_ss_reads as f64 / ss_families as f64 } else { 0.0 };
-
-        let ss_singletons: usize =
-            family_size_metrics.iter().find(|m| m.family_size == 1).map_or(0, |m| m.ss_count);
-        let ss_singleton_fraction =
-            if ss_families > 0 { ss_singletons as f64 / ss_families as f64 } else { 0.0 };
-
-        let ss_consensus_families: usize = family_size_metrics
-            .iter()
-            .filter(|m| m.family_size >= min_reads)
-            .map(|m| m.ss_count)
-            .sum();
-
-        SimplexYieldMetric {
-            fraction,
-            read_pairs,
-            cs_families,
-            ss_families,
-            mean_ss_family_size,
-            ss_singletons,
-            ss_singleton_fraction,
-            ss_consensus_families,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -375,7 +330,9 @@ mod tests {
         consensus_guard_record, ensure_not_consensus_record, is_consensus_guard_record,
     };
     use crate::metrics::shared::UmiMetric;
-    use crate::metrics::simplex::{SimplexFamilySizeMetric, SimplexMetricsCollector};
+    use crate::metrics::simplex::{
+        SimplexFamilySizeMetric, SimplexMetricsCollector, SimplexYieldMetric,
+    };
     use crate::sam::SamTag;
     use anyhow::Result;
     use fgoxide::io::DelimFile;
@@ -593,7 +550,7 @@ mod tests {
         collector.record_ss_family(3);
         collector.record_cs_family(6);
 
-        let metric = SimplexMetrics::generate_yield_metric(&collector, 1.0, 6, 2);
+        let metric = collector.into_yield_metric(1.0, 6, 2);
 
         assert_eq!(metric.cs_families, 1);
         assert_eq!(metric.ss_families, 3);
@@ -606,7 +563,7 @@ mod tests {
     #[test]
     fn test_generate_yield_metric_empty() {
         let collector = SimplexMetricsCollector::new();
-        let metric = SimplexMetrics::generate_yield_metric(&collector, 0.5, 0, 1);
+        let metric = collector.into_yield_metric(0.5, 0, 1);
 
         assert_eq!(metric.cs_families, 0);
         assert_eq!(metric.ss_families, 0);
@@ -622,7 +579,7 @@ mod tests {
         collector.record_ss_family(1);
         collector.record_ss_family(1);
 
-        let metric = SimplexMetrics::generate_yield_metric(&collector, 1.0, 3, 2);
+        let metric = collector.into_yield_metric(1.0, 3, 2);
 
         assert_eq!(metric.ss_families, 3);
         assert_eq!(metric.ss_singletons, 3);

@@ -882,6 +882,7 @@ dependencies = [
  "proptest",
  "rstest",
  "serde",
+ "statrs",
  "strum 0.28.0",
  "tempfile",
 ]
