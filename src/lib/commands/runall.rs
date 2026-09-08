@@ -1193,9 +1193,10 @@ impl RunAll {
     ///
     /// * **Group** — validates `MultiGroupOptions`, then computes
     ///   `effective_strategy` / `effective_edits` via
-    ///   [`crate::commands::group::GroupOptions::resolve_strategy_and_edits`]
-    ///   and clears the three histogram/metrics paths (anti-goal documented
-    ///   in the module-level doc).
+    ///   [`crate::commands::group::GroupOptions::resolve_strategy_and_edits`].
+    ///   The family-size-histogram / grouping-metrics / metrics-prefix outputs
+    ///   flow through unmodified, producing the same output as standalone
+    ///   `group` given the same flags.
     ///
     /// * **Simplex** / **Duplex** — validate the per-mode `Multi<X>`, then
     ///   populate the cross-cutting `#[arg(skip)]` fields
@@ -1315,8 +1316,9 @@ impl RunAll {
                     let mut group_opts = self.group_opts.clone().validate()?;
                     // Mirror GroupReadsByUmi::execute: compute
                     // effective_strategy / effective_edits via the shared
-                    // helper, then null the per-position metrics outputs
-                    // (anti-goal documented in the module-level doc comment).
+                    // helper. The family-size-histogram / grouping-metrics /
+                    // metrics-prefix outputs flow through unmodified, same as
+                    // standalone `group`.
                     let (effective_strategy, effective_edits) =
                         group_opts.resolve_strategy_and_edits();
                     group_opts.effective_strategy = effective_strategy;
@@ -1330,22 +1332,6 @@ impl RunAll {
                         effective_strategy,
                         effective_edits,
                     )?;
-                    // Forcing these to None is spec-mandated (runall does not
-                    // emit per-position group metrics in a fused run), but warn
-                    // so the dropped flags are not silent.
-                    if group_opts.family_size_histogram.is_some()
-                        || group_opts.grouping_metrics.is_some()
-                        || group_opts.metrics_prefix.is_some()
-                    {
-                        log::warn!(
-                            "--group::family-size-histogram / --group::grouping-metrics / \
-                             --group::metrics are ignored: runall does not emit per-position \
-                             group metrics in a fused run"
-                        );
-                    }
-                    group_opts.family_size_histogram = None;
-                    group_opts.grouping_metrics = None;
-                    group_opts.metrics_prefix = None;
                     bag.group = Some(group_opts);
                 }
 

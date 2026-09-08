@@ -48,6 +48,8 @@ mod test_filter_cutover_parity;
 mod test_group_command;
 mod test_group_cutover_parity;
 mod test_group_determinism;
+#[cfg(feature = "consensus")]
+mod test_group_metrics_fused_parity;
 mod test_input_source_matrix;
 mod test_merge_command;
 mod test_retag_command;
