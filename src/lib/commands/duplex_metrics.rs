@@ -9,7 +9,6 @@
 use crate::logging::OperationTimer;
 use crate::metrics::duplex::DuplexMetricsCollector;
 use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
-use crate::umi::extract_mi_base;
 use crate::validation::validate_input_exists;
 use anyhow::Result;
 use clap::Parser;
@@ -18,8 +17,8 @@ use std::path::PathBuf;
 
 use super::command::Command;
 use super::shared_metrics::{
-    DOWNSAMPLING_FRACTIONS, TemplateInfo, TemplateMetadata, compute_template_metadata,
-    execute_r_script, is_r_available, parse_intervals, process_templates_from_bam,
+    DOWNSAMPLING_FRACTIONS, execute_r_script, is_r_available, parse_intervals,
+    process_templates_from_bam, record_duplex_coordinate_group,
 };
 
 /// Embedded R script for PDF plot generation (bundled with binary)
@@ -174,13 +173,13 @@ impl Command for DuplexMetrics {
             &intervals,
             fractions.len(),
             |group, fraction_counts| {
-                Self::process_coordinate_group(
+                record_duplex_coordinate_group(
                     group,
                     fractions,
                     &mut collectors,
                     &mut umi_consensus_caller,
                     fraction_counts,
-                    self,
+                    self.duplex_umi_counts,
                 )
             },
         )?;
@@ -278,241 +277,6 @@ impl Command for DuplexMetrics {
 
         info!("Done!");
         timer.log_completion(total_template_count as u64);
-        Ok(())
-    }
-}
-
-impl DuplexMetrics {
-    /// Processes a single coordinate group for all downsampling fractions.
-    ///
-    /// Optimized using fgbio's approach: filter once per fraction, then groupBy.
-    /// This is O(fractions × `group_size`) instead of O(fractions × `unique_keys` × `group_size`).
-    fn process_coordinate_group(
-        group: &[TemplateInfo],
-        fractions: &[f64],
-        collectors: &mut [DuplexMetricsCollector],
-        umi_consensus_caller: &mut SimpleUmiConsensusCaller,
-        fraction_template_counts: &mut [usize],
-        metrics: &DuplexMetrics,
-    ) -> Result<()> {
-        use std::collections::HashMap;
-
-        if group.is_empty() {
-            return Ok(());
-        }
-
-        // Pre-compute metadata once for the entire group
-        let metadata = compute_template_metadata(group);
-
-        // Hoist scratch buffers outside the 20-fraction loop. `HashMap::clear()`
-        // preserves the outer bucket array across iterations — that's the
-        // dominant allocator win on real cfDNA inputs with millions of
-        // coordinate groups, and is the same pattern
-        // `simplex_metrics::process_coordinate_group` already uses for its
-        // `ss_groups` map.
-        //
-        // The inner `Vec<(&str, &str, bool)>` stored as `ds_groups` entry.2 is
-        // still freed per entry on `.clear()`. Combined with the
-        // `is_full_fraction` gate below, that inner Vec now allocates exactly
-        // once per coordinate group (at the 100% fraction) rather than once
-        // per fraction × per `or_default()` slot. The `bool` is `r1_positive`
-        // (read 1 on the positive strand), used to orient the duplex UMI.
-        let mut downsampled: Vec<&TemplateMetadata> = Vec::new();
-        let mut ss_groups: HashMap<&str, usize> = HashMap::new();
-        #[allow(clippy::type_complexity)]
-        let mut ds_groups: HashMap<&str, (usize, usize, Vec<(&str, &str, bool)>)> = HashMap::new();
-
-        // For each fraction: filter ONCE, then groupBy (like fgbio)
-        for (idx, &fraction) in fractions.iter().enumerate() {
-            // Filter once per fraction - equivalent to fgbio's downsampledGroup
-            downsampled.clear();
-            downsampled.extend(metadata.iter().filter(|m| m.template.hash_fraction <= fraction));
-
-            if downsampled.is_empty() {
-                continue;
-            }
-
-            // CS family size
-            fraction_template_counts[idx] += downsampled.len();
-            collectors[idx].record_cs_family(downsampled.len());
-
-            let is_full_fraction = (fraction - 1.0_f64).abs() < 0.01;
-
-            // Group by MI tag for SS families (like fgbio's groupBy)
-            ss_groups.clear();
-            for m in &downsampled {
-                *ss_groups.entry(m.template.mi.as_str()).or_default() += 1;
-            }
-            for &ss_size in ss_groups.values() {
-                collectors[idx].record_ss_family(ss_size);
-            }
-
-            // Group by base_umi for DS families with strand counts.
-            // HashMap value: (a_count, b_count, mi_rx_pairs for UMI metrics).
-            // The mi/rx pair vec is consumed only at the 100% fraction by
-            // `update_umi_metrics`; skip populating it on downsampled fractions
-            // to avoid O(group_size) wasted pushes per non-full fraction.
-            ds_groups.clear();
-            for m in &downsampled {
-                let entry = ds_groups.entry(m.base_umi).or_default();
-                if m.is_b_strand {
-                    entry.1 += 1;
-                } else {
-                    // /A or an unsuffixed MI counts toward the AB strand. fgbio treats a
-                    // single unsuffixed MI as Pair(ab=n, ba=0) — a valid single-strand DS
-                    // family (CollectDuplexSeqMetrics). Without this, unsuffixed families
-                    // get ds_size=0 and are silently dropped by the family-size histogram
-                    // (which iterates 1..=max), undercounting ds_families (DXM3-03).
-                    entry.0 += 1;
-                }
-                if is_full_fraction {
-                    entry.2.push((
-                        m.template.mi.as_str(),
-                        m.template.rx.as_str(),
-                        m.template.r1_positive,
-                    ));
-                }
-            }
-
-            for (base_umi, (a_count, b_count, mi_rx_pairs)) in &ds_groups {
-                let ds_size = a_count + b_count;
-                collectors[idx].record_ds_family(ds_size);
-
-                let (ab_count, ba_count) =
-                    if a_count >= b_count { (*a_count, *b_count) } else { (*b_count, *a_count) };
-
-                collectors[idx].record_duplex_family(ab_count, ba_count);
-
-                // Only collect UMI metrics for the 100% fraction. Pass the
-                // (&str, &str) pairs directly — the underlying String storage
-                // lives in `group`, which outlives this call, so the previous
-                // `Vec<(String, String)>` clone was pure overhead.
-                if is_full_fraction {
-                    metrics.update_umi_metrics(
-                        &mut collectors[idx],
-                        umi_consensus_caller,
-                        mi_rx_pairs.as_slice(),
-                        base_umi,
-                        *a_count,
-                        *b_count,
-                    )?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Updates UMI metrics for a duplex family
-    ///
-    /// This method:
-    /// 1. Uses RX tags (raw UMI sequences) to extract individual UMI observations
-    /// 2. Separates by strand (/A and /B suffixes in MI tags), swapping UMI parts for B strand
-    /// 3. Calls consensus for each UMI position
-    /// 4. Records raw observations, errors, and unique observations for each individual UMI
-    /// 5. Records duplex UMI metrics if enabled
-    ///
-    /// This matches the Scala implementation in CollectDuplexSeqMetrics.scala:407-431
-    fn update_umi_metrics(
-        &self,
-        collector: &mut DuplexMetricsCollector,
-        umi_consensus_caller: &mut SimpleUmiConsensusCaller,
-        group_pairs: &[(&str, &str, bool)],
-        base_umi: &str,
-        _a_count: usize,
-        _b_count: usize,
-    ) -> Result<()> {
-        // Collect the two UMI positions, each oriented to the F1R2 reading of the
-        // top strand. umi1s holds the leading half, umi2s the trailing half.
-        let mut umi1s = Vec::new();
-        let mut umi2s = Vec::new();
-
-        for &(mi, rx, r1_positive) in group_pairs {
-            // Check if this MI tag belongs to the current base_umi family
-            let mi_base = extract_mi_base(mi);
-
-            if mi_base != base_umi {
-                continue;
-            }
-
-            // Split the RX tag to get individual UMI parts. fgbio uses
-            // `split("-", -1)`, which keeps a trailing empty field, and requires
-            // exactly two parts (`case Array(u1, u2)`), throwing a `MatchError` on
-            // anything else. Reject a malformed duplex UMI here with a clear error
-            // rather than silently skipping it — matching fgbio's fail-fast and
-            // fgumi's own `group`/`dedup`, which bail on non-2-segment paired UMIs
-            // (DXM-03). Empty molecule-end halves (`-CCC`, `CCC-`) are still two
-            // parts and are kept (DXM-01).
-            let parts: Vec<&str> = rx.split('-').collect();
-            if parts.len() != 2 {
-                anyhow::bail!(
-                    "Duplex UMI did not contain 2 segments delimited by '-': '{rx}' (MI '{mi}')"
-                );
-            }
-
-            // Do NOT skip empty molecule-end halves (e.g. `-CCC` or `CCC-`). fgbio
-            // counts them, recording the empty half as an empty-string UMI, so
-            // single-index / single-strand designs are not undercounted (DXM-01).
-
-            // Orient by the actual R1 strand, not the MI `/A`,`/B` suffix (which is
-            // not strand-reliable — e.g. an `/A` family can be on the negative
-            // strand). If R1 is on the positive strand the molecule was read
-            // top-strand-first, so the RX is already `u1-u2`; otherwise it was read
-            // bottom-strand-first, so swap the halves. Because metrics collection is
-            // R1-only, this reproduces fgbio's per-read F1R2 normalization
-            // (CollectDuplexSeqMetrics.scala:407-408) and its duplex-UMI orientation
-            // pick (:419-425), which then reduces to "lead with the positive-strand
-            // read's half" (DXM-02).
-            if r1_positive {
-                umi1s.push(parts[0].to_string());
-                umi2s.push(parts[1].to_string());
-            } else {
-                umi1s.push(parts[1].to_string());
-                umi2s.push(parts[0].to_string());
-            }
-        }
-
-        // Call consensus for each UMI position and record metrics
-        let mut consensus_umis = Vec::new();
-
-        if !umi1s.is_empty() {
-            let (consensus, _had_errors) = umi_consensus_caller.consensus(&umi1s);
-            let raw_count = umi1s.len();
-            let error_count = umi1s.iter().filter(|u| **u != consensus).count();
-            collector.record_umi(&consensus, raw_count, error_count, true);
-            consensus_umis.push(consensus);
-        }
-
-        if !umi2s.is_empty() {
-            let (consensus, _had_errors) = umi_consensus_caller.consensus(&umi2s);
-            let raw_count = umi2s.len();
-            let error_count = umi2s.iter().filter(|u| **u != consensus).count();
-            collector.record_umi(&consensus, raw_count, error_count, true);
-            consensus_umis.push(consensus);
-        }
-
-        // Record duplex UMI metrics if enabled
-        if self.duplex_umi_counts && consensus_umis.len() == 2 {
-            let duplex_umi = format!("{}-{}", consensus_umis[0], consensus_umis[1]);
-            // Each read pair contributes one observation to the duplex UMI
-            // (not two, even though we track each component separately)
-            let total_raw = umi1s.len();
-
-            // Count how many raw RX tags had errors (don't match either duplex orientation)
-            let expected_duplex1 = format!("{}-{}", consensus_umis[0], consensus_umis[1]);
-            let expected_duplex2 = format!("{}-{}", consensus_umis[1], consensus_umis[0]);
-            let error_count = group_pairs
-                .iter()
-                .filter(|&&(mi, rx, _r1_positive)| {
-                    let mi_base = extract_mi_base(mi);
-                    mi_base == base_umi
-                        && rx != expected_duplex1.as_str()
-                        && rx != expected_duplex2.as_str()
-                })
-                .count();
-
-            collector.record_duplex_umi(&duplex_umi, total_raw, error_count, true);
-        }
-
         Ok(())
     }
 }
