@@ -18,8 +18,8 @@ use std::path::PathBuf;
 
 use super::command::Command;
 use super::shared_metrics::{
-    DOWNSAMPLING_FRACTIONS, TemplateInfo, compute_template_metadata, execute_r_script,
-    is_r_available, parse_intervals, process_templates_from_bam,
+    DOWNSAMPLING_FRACTIONS, execute_r_script, is_r_available, parse_intervals,
+    process_templates_from_bam, record_simplex_coordinate_group,
 };
 
 /// Embedded R script for PDF plot generation (bundled with binary).
@@ -133,7 +133,7 @@ impl Command for SimplexMetrics {
             &intervals,
             fractions.len(),
             |group, fraction_counts| {
-                Self::process_coordinate_group(
+                record_simplex_coordinate_group(
                     group,
                     fractions,
                     &mut collectors,
@@ -210,115 +210,6 @@ impl Command for SimplexMetrics {
 
         info!("Done!");
         timer.log_completion(total_template_count as u64);
-        Ok(())
-    }
-}
-
-impl SimplexMetrics {
-    /// Processes a single coordinate group for all downsampling fractions.
-    ///
-    /// For each fraction, filters templates by hash, records CS family size (the entire
-    /// group), groups by MI tag for SS families, and (at 100% only) collects UMI
-    /// observations via consensus calling per UMI position.
-    fn process_coordinate_group(
-        group: &[TemplateInfo],
-        fractions: &[f64],
-        collectors: &mut [SimplexMetricsCollector],
-        umi_consensus_caller: &mut SimpleUmiConsensusCaller,
-        fraction_template_counts: &mut [usize],
-    ) -> Result<()> {
-        use std::collections::HashMap;
-
-        if group.is_empty() {
-            return Ok(());
-        }
-
-        // Pre-compute metadata once for the entire group
-        let metadata = compute_template_metadata(group);
-
-        // SIMM3-01: simplex-metrics assumes single-strand (non-duplex) input. If a base
-        // UMI carries reads from BOTH the /A and /B strands, the input is duplex data:
-        // the per-base_umi RX consensus below would mix the two strands' swapped UMI
-        // orientations and produce garbage counts. Fail loud and point at duplex-metrics.
-        let mut base_umi_strands: HashMap<&str, (bool, bool)> = HashMap::new();
-        for m in &metadata {
-            let seen = base_umi_strands.entry(m.base_umi).or_default();
-            seen.0 |= m.is_a_strand;
-            seen.1 |= m.is_b_strand;
-            if seen.0 && seen.1 {
-                anyhow::bail!(
-                    "simplex-metrics received duplex-UMI data: base UMI '{}' has reads on \
-                     both the /A and /B strands. Run duplex-metrics for duplex data.",
-                    m.base_umi
-                );
-            }
-        }
-
-        let last_fraction_idx = fractions.len() - 1;
-
-        let mut ss_groups: HashMap<&str, usize> = HashMap::new();
-
-        for (idx, &fraction) in fractions.iter().enumerate() {
-            // Filter once per fraction
-            let downsampled: Vec<_> =
-                metadata.iter().filter(|m| m.template.hash_fraction <= fraction).collect();
-
-            if downsampled.is_empty() {
-                continue;
-            }
-
-            // CS family size
-            fraction_template_counts[idx] += downsampled.len();
-            collectors[idx].record_cs_family(downsampled.len());
-
-            // Group by MI tag for SS families
-            ss_groups.clear();
-            for m in &downsampled {
-                *ss_groups.entry(m.template.mi.as_str()).or_default() += 1;
-            }
-            for &ss_size in ss_groups.values() {
-                collectors[idx].record_ss_family(ss_size);
-            }
-
-            // UMI metrics only at the 100% fraction (last index)
-            if idx == last_fraction_idx {
-                // Group by base_umi (MI without strand suffix) and collect RX tags
-                let mut umi_groups: HashMap<&str, Vec<&str>> = HashMap::new();
-                for m in &downsampled {
-                    umi_groups.entry(m.base_umi).or_default().push(m.template.rx.as_str());
-                }
-
-                for rx_tags in umi_groups.values() {
-                    // For simplex: no strand-swapping. Split each RX by '-' for
-                    // multi-component UMIs and call consensus per position.
-                    let split_rx: Vec<Vec<&str>> =
-                        rx_tags.iter().map(|rx| rx.split('-').collect()).collect();
-                    let num_components = split_rx.first().map_or(0, Vec::len);
-
-                    for pos in 0..num_components {
-                        // Do NOT drop empty molecule-end halves (e.g. the trailing half
-                        // of `CCC-` or the leading half of `-GGG`). fgbio counts them,
-                        // recording the empty half as an empty-string UMI, so single-index
-                        // designs are not undercounted (SIM-01, mirroring DXM-01). A read
-                        // that simply has fewer components than `pos` contributes nothing
-                        // (its `parts.get(pos)` is `None`).
-                        let umis_at_pos: Vec<String> = split_rx
-                            .iter()
-                            .filter_map(|parts| parts.get(pos).map(|s| (*s).to_string()))
-                            .collect();
-
-                        if umis_at_pos.is_empty() {
-                            continue;
-                        }
-
-                        let (consensus, _had_errors) = umi_consensus_caller.consensus(&umis_at_pos);
-                        let raw_count = umis_at_pos.len();
-                        let error_count = umis_at_pos.iter().filter(|u| **u != consensus).count();
-                        collectors[idx].record_umi(&consensus, raw_count, error_count, true);
-                    }
-                }
-            }
-        }
         Ok(())
     }
 }

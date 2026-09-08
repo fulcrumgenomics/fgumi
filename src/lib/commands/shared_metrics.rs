@@ -5,8 +5,10 @@
 //! deterministic downsampling. Both `duplex_metrics` and `simplex_metrics` commands
 //! build on these shared primitives.
 
+use crate::metrics::simplex::SimplexMetricsCollector;
 use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
+use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
 use crate::template::TemplateIterator;
 use anyhow::{Context, Result};
 use fgumi_bam_io::ProgressTracker;
@@ -418,6 +420,102 @@ pub fn compute_template_metadata(group: &[TemplateInfo]) -> Vec<TemplateMetadata
             TemplateMetadata { template: t, base_umi, is_a_strand: is_a, is_b_strand: is_b }
         })
         .collect()
+}
+
+/// Records one coordinate/strand group's family-size and UMI-consensus
+/// contributions across every downsampling fraction. Shared by the
+/// separate-pass `simplex-metrics` command and the inline consensus-metrics
+/// accumulator — extracted verbatim from `SimplexMetrics::process_coordinate_group`.
+///
+/// `group` must already be interval-filtered by the caller.
+pub(crate) fn record_simplex_coordinate_group(
+    group: &[TemplateInfo],
+    fractions: &[f64],
+    collectors: &mut [SimplexMetricsCollector],
+    umi_consensus_caller: &mut SimpleUmiConsensusCaller,
+    fraction_template_counts: &mut [usize],
+) -> Result<()> {
+    use std::collections::HashMap;
+
+    if group.is_empty() {
+        return Ok(());
+    }
+
+    let metadata = compute_template_metadata(group);
+
+    let mut base_umi_strands: HashMap<&str, (bool, bool)> = HashMap::new();
+    for m in &metadata {
+        let seen = base_umi_strands.entry(m.base_umi).or_default();
+        seen.0 |= m.is_a_strand;
+        seen.1 |= m.is_b_strand;
+        if seen.0 && seen.1 {
+            anyhow::bail!(
+                "simplex-metrics received duplex-UMI data: base UMI '{}' has reads on \
+                 both the /A and /B strands. Run duplex-metrics for duplex data.",
+                m.base_umi
+            );
+        }
+    }
+
+    let last_fraction_idx = fractions.len() - 1;
+    let mut ss_groups: HashMap<&str, usize> = HashMap::new();
+
+    for (idx, &fraction) in fractions.iter().enumerate() {
+        let downsampled: Vec<_> =
+            metadata.iter().filter(|m| m.template.hash_fraction <= fraction).collect();
+
+        if downsampled.is_empty() {
+            continue;
+        }
+
+        fraction_template_counts[idx] += downsampled.len();
+        collectors[idx].record_cs_family(downsampled.len());
+
+        ss_groups.clear();
+        for m in &downsampled {
+            *ss_groups.entry(m.template.mi.as_str()).or_default() += 1;
+        }
+        for &ss_size in ss_groups.values() {
+            collectors[idx].record_ss_family(ss_size);
+        }
+
+        if idx == last_fraction_idx {
+            let mut umi_groups: HashMap<&str, Vec<&str>> = HashMap::new();
+            for m in &downsampled {
+                umi_groups.entry(m.base_umi).or_default().push(m.template.rx.as_str());
+            }
+
+            for rx_tags in umi_groups.values() {
+                let split_rx: Vec<Vec<&str>> =
+                    rx_tags.iter().map(|rx| rx.split('-').collect()).collect();
+                // Use the maximum component count across the family, not the first
+                // value's. `--no-umi` assigns one MI to every template while keeping
+                // their raw `RX` tags, so a base-UMI family can hold ragged values
+                // (e.g. "A-C" alongside "A-C-G"). Keying off the first value would
+                // drop trailing components from longer values; `parts.get(pos)` below
+                // still skips components absent from shorter values. Simplex
+                // intentionally supports N-component UMIs, so no segment-count bail.
+                let num_components = split_rx.iter().map(Vec::len).max().unwrap_or(0);
+
+                for pos in 0..num_components {
+                    let umis_at_pos: Vec<String> = split_rx
+                        .iter()
+                        .filter_map(|parts| parts.get(pos).map(|s| (*s).to_string()))
+                        .collect();
+
+                    if umis_at_pos.is_empty() {
+                        continue;
+                    }
+
+                    let (consensus, _had_errors) = umi_consensus_caller.consensus(&umis_at_pos);
+                    let raw_count = umis_at_pos.len();
+                    let error_count = umis_at_pos.iter().filter(|u| **u != consensus).count();
+                    collectors[idx].record_umi(&consensus, raw_count, error_count, true);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Builds [`TemplateInfo`] and [`ReadInfoKey`] from one already-selected R1/R2
@@ -849,5 +947,145 @@ mod tests {
         assert!(key.strand2, "read 2 (R2) is reverse");
         assert_eq!(key.library, 0, "no @RG in the header, so unknown library");
         assert!(key.cell_barcode.is_none(), "no CB tag was set");
+    }
+
+    #[test]
+    fn record_simplex_coordinate_group_rejects_mixed_strand_input() {
+        // SIMM3-01: a base UMI with reads on BOTH /A and /B strands is
+        // duplex data, rejected with a specific error pointing at
+        // duplex-metrics.
+        let group = vec![
+            TemplateInfo {
+                mi: "1/A".to_string(),
+                rx: "AAA".to_string(),
+                ref_name: Some("chr1".to_string()),
+                position: Some(100),
+                end_position: Some(150),
+                r1_positive: true,
+                hash_fraction: 0.1,
+            },
+            TemplateInfo {
+                mi: "1/B".to_string(),
+                rx: "TTT".to_string(),
+                ref_name: Some("chr1".to_string()),
+                position: Some(100),
+                end_position: Some(150),
+                r1_positive: false,
+                hash_fraction: 0.2,
+            },
+        ];
+        let fractions = [1.0];
+        let mut collectors = vec![SimplexMetricsCollector::new()];
+        let mut caller = SimpleUmiConsensusCaller::default();
+        let mut counts = vec![0usize];
+
+        let err = record_simplex_coordinate_group(
+            &group,
+            &fractions,
+            &mut collectors,
+            &mut caller,
+            &mut counts,
+        )
+        .expect_err("mixed-strand input must be rejected");
+        assert!(err.to_string().contains("duplex-UMI data"));
+    }
+
+    #[test]
+    fn record_simplex_coordinate_group_uses_max_rx_component_count_for_ragged_families() {
+        // A `--no-umi` base-UMI family can hold ragged `RX` values: one MI is
+        // assigned to every template while their raw `RX` tags are preserved. Here
+        // both templates share MI "1" (single strand, so no /A|/B mixing) but carry
+        // a 2-component and a 3-component RX. The shorter value appears FIRST, so
+        // keying `num_components` off the first entry would drop the trailing "GG"
+        // component entirely. The max-length calculation must still record it.
+        let group = vec![
+            TemplateInfo {
+                mi: "1".to_string(),
+                rx: "AA-CC".to_string(),
+                ref_name: Some("chr1".to_string()),
+                position: Some(100),
+                end_position: Some(150),
+                r1_positive: true,
+                hash_fraction: 0.1,
+            },
+            TemplateInfo {
+                mi: "1".to_string(),
+                rx: "AA-CC-GG".to_string(),
+                ref_name: Some("chr1".to_string()),
+                position: Some(100),
+                end_position: Some(150),
+                r1_positive: true,
+                hash_fraction: 0.2,
+            },
+        ];
+        let fractions = [1.0];
+        let mut collectors = vec![SimplexMetricsCollector::new()];
+        let mut caller = SimpleUmiConsensusCaller::default();
+        let mut counts = vec![0usize];
+
+        record_simplex_coordinate_group(
+            &group,
+            &fractions,
+            &mut collectors,
+            &mut caller,
+            &mut counts,
+        )
+        .expect("records");
+
+        let umis: Vec<String> = collectors[0].umi_metrics().into_iter().map(|m| m.umi).collect();
+        assert!(umis.contains(&"AA".to_string()), "first component recorded: {umis:?}");
+        assert!(umis.contains(&"CC".to_string()), "second component recorded: {umis:?}");
+        assert!(
+            umis.contains(&"GG".to_string()),
+            "trailing component of the longer ragged RX must not be dropped: {umis:?}"
+        );
+    }
+
+    #[test]
+    fn record_simplex_coordinate_group_bucketing_is_deterministic_and_cumulative() {
+        let group: Vec<TemplateInfo> = (0..20)
+            .map(|i| TemplateInfo {
+                mi: i.to_string(),
+                rx: "AAA".to_string(),
+                ref_name: Some("chr1".to_string()),
+                position: Some(100),
+                end_position: Some(150),
+                r1_positive: true,
+                hash_fraction: compute_hash_fraction(&format!("read-{i}")),
+            })
+            .collect();
+
+        let run = || {
+            let fractions = DOWNSAMPLING_FRACTIONS;
+            let mut collectors: Vec<SimplexMetricsCollector> =
+                fractions.iter().map(|_| SimplexMetricsCollector::new()).collect();
+            let mut caller = SimpleUmiConsensusCaller::default();
+            let mut counts = vec![0usize; fractions.len()];
+            record_simplex_coordinate_group(
+                &group,
+                &fractions,
+                &mut collectors,
+                &mut caller,
+                &mut counts,
+            )
+            .expect("records");
+            counts
+        };
+
+        let counts_a = run();
+        let counts_b = run();
+        assert_eq!(counts_a, counts_b, "bucketing must be deterministic across repeated calls");
+
+        for window in counts_a.windows(2) {
+            assert!(
+                window[1] >= window[0],
+                "cumulative-superset violated: counts must be non-decreasing, got {counts_a:?}"
+            );
+        }
+        assert_eq!(
+            *counts_a.last().unwrap(),
+            group.len(),
+            "100% fraction must include every template"
+        );
     }
 }
