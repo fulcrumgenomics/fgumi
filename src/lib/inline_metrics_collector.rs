@@ -30,14 +30,20 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
 use crate::commands::shared_metrics::{
-    DOWNSAMPLING_FRACTIONS, Interval, TemplateInfo, overlaps_intervals,
-    record_duplex_coordinate_group, record_simplex_coordinate_group,
+    DOWNSAMPLING_FRACTIONS, Interval, ReadInfoKey, TemplateInfo, build_template_info,
+    overlaps_intervals, record_duplex_coordinate_group, record_simplex_coordinate_group,
 };
+use crate::mi_group::MiGroup;
 use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
 use anyhow::Result;
+use fgumi_bam_io::LibraryIndex;
 use fgumi_metrics::duplex::DuplexMetricsCollector;
 use fgumi_metrics::simplex::SimplexMetricsCollector;
+use fgumi_pipeline_core::{HeapSize, MetricsReducer, Ordered};
+use fgumi_raw_bam::{RawRecord, flags as raw_flags};
 
 /// Accumulator state for one consensus stage's inline metrics. Shared by T1
 /// (wrapped in `PerThreadAccumulator`, N sharded instances folded via
@@ -193,26 +199,220 @@ impl ConsensusMetricsAccumulator {
     }
 }
 
+/// A `CoordinateGroupFragment` carries one **batch**'s worth of already-paired
+/// `(TemplateInfo, ReadInfoKey)` entries — matching the verified precedent the
+/// existing rejects branch already establishes (X5-001, spec §3: exactly one
+/// item pushed onto the ordered third branch per input batch, always, even
+/// when empty) — so `Task 11`'s wiring pushes one of these per `MiGroup`
+/// batch, tagged with that batch's `batch_serial`.
+///
+/// `Ordered::ordinal` returns `batch_serial` so the framework's
+/// `ReorderStage` (Task 11) can restore true cross-batch emission order in
+/// front of [`CoordinateGroupCollector`] — the whole reason this collector
+/// never needs to reconstruct a group split across worker threads: by the
+/// time it sees fragments, they arrive strictly in order, adjacent.
+pub(crate) struct CoordinateGroupFragment {
+    pub(crate) batch_serial: u64,
+    pub(crate) entries: Vec<(TemplateInfo, ReadInfoKey)>,
+}
+
+impl Ordered for CoordinateGroupFragment {
+    fn ordinal(&self) -> u64 {
+        self.batch_serial
+    }
+}
+
+impl HeapSize for CoordinateGroupFragment {
+    /// Approximate heap footprint: the entries `Vec`'s allocated capacity.
+    /// `TemplateInfo`/`ReadInfoKey` themselves hold their own heap
+    /// allocations (`String`s, an optional `Box<[u8]>`), but this collector
+    /// is never routed through a `ByteBoundedQueue` in this task (Task 8 unit
+    /// tests it directly, with no queue at all) — Task 11's wiring is what
+    /// actually exercises this bound, and a capacity-only estimate matches
+    /// the level of precision `BatchedMiGroups::heap_size` already accepts
+    /// for its own `Vec<MiGroup>` (`crate::pipeline::steps::group::mi`).
+    fn heap_size(&self) -> usize {
+        self.entries.capacity() * std::mem::size_of::<(TemplateInfo, ReadInfoKey)>()
+    }
+}
+
+/// Re-pairs one `MiGroup`'s flat record list into R1/R2 pairs by read name,
+/// applying the same paired/mapped/primary filter
+/// `process_templates_from_bam` uses. Records within one `MiGroup` all
+/// belong to the same UMI family (already clustered at essentially one
+/// physical position by upstream grouping), so pairing via an unordered
+/// `HashMap` does not risk interleaving templates from genuinely different
+/// `ReadInfoKey`s within a single `MiGroup`.
+fn pair_records_by_read_name(records: &[RawRecord]) -> Vec<(RawRecord, RawRecord)> {
+    let mut by_name: HashMap<Vec<u8>, (Option<RawRecord>, Option<RawRecord>)> = HashMap::new();
+    for record in records {
+        let flags = record.flags();
+        let qualifies = (flags & raw_flags::PAIRED) != 0
+            && (flags & raw_flags::UNMAPPED) == 0
+            && (flags & raw_flags::MATE_UNMAPPED) == 0
+            && (flags & raw_flags::SECONDARY) == 0
+            && (flags & raw_flags::SUPPLEMENTARY) == 0;
+        if !qualifies {
+            continue;
+        }
+        let name = fgumi_raw_bam::read_name(record.as_ref()).to_vec();
+        let entry = by_name.entry(name).or_default();
+        if (flags & raw_flags::FIRST_SEGMENT) != 0 {
+            entry.0 = Some(record.clone());
+        } else if (flags & raw_flags::LAST_SEGMENT) != 0 {
+            entry.1 = Some(record.clone());
+        }
+    }
+    by_name
+        .into_values()
+        .filter_map(|(r1, r2)| match (r1, r2) {
+            (Some(r1), Some(r2)) => Some((r1, r2)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Appends one `MiGroup`'s entries onto a caller-owned, per-**batch**
+/// `entries` accumulator. **One `CoordinateGroupFragment` is emitted per
+/// BATCH, not per `MiGroup`** — Task 11's wiring calls this once per
+/// `MiGroup` inside a batch's loop, into ONE shared `Vec`, then constructs
+/// exactly one `CoordinateGroupFragment { batch_serial, entries }` at the end
+/// of that batch's processing. (Within one batch, `MiGroup`s are already
+/// processed strictly in order by one worker thread — only *cross-batch*
+/// order needs `ReorderStage` to restore, which is exactly what tagging the
+/// whole batch's fragment with that batch's `batch_serial` achieves.) Every
+/// paired, successfully-converted template in the group becomes one
+/// `(TemplateInfo, ReadInfoKey)` entry; a template that fails to produce one
+/// (missing R1/R2, unmapped, no CIGAR) is silently omitted, matching
+/// `process_templates_from_bam`'s own behavior.
+///
+/// # Errors
+///
+/// Returns an error if a qualifying R1/R2 pair is missing a required `MI`/`RX`
+/// tag (propagated from [`build_template_info`]).
+pub(crate) fn push_mi_group_entries(
+    mi_group: &MiGroup,
+    header: &noodles::sam::Header,
+    library_index: &LibraryIndex,
+    entries: &mut Vec<(TemplateInfo, ReadInfoKey)>,
+) -> Result<()> {
+    for (r1, r2) in pair_records_by_read_name(&mi_group.records) {
+        if let Some((info, key)) = build_template_info(&r1, &r2, header, library_index)? {
+            entries.push((info, key));
+        }
+    }
+    Ok(())
+}
+
+/// `T2` standalone-consensus reducer: owns ONE un-sharded
+/// `ConsensusMetricsAccumulator`, buffers consecutive same-`ReadInfoKey`
+/// entries across fragments, and flushes a coordinate group into the
+/// accumulator when the key changes. Fed by an ordered stream of
+/// `CoordinateGroupFragment`s (Task 11's `ReorderStage` restores true
+/// emission order upstream), so — unlike the retired
+/// `MiGroupCoordinateBuffer`/`open_groups` carry-state design — there is
+/// never more than one instance and never any question of which worker saw
+/// which fragment first.
+pub(crate) struct CoordinateGroupCollector {
+    current_key: Option<ReadInfoKey>,
+    current_group: Vec<TemplateInfo>,
+    accumulator: ConsensusMetricsAccumulator,
+    intervals: Vec<Interval>,
+    on_finish: Box<dyn FnOnce(ConsensusMetricsAccumulator) -> Result<()> + Send>,
+}
+
+impl CoordinateGroupCollector {
+    pub(crate) fn new(
+        accumulator: ConsensusMetricsAccumulator,
+        intervals: Vec<Interval>,
+        on_finish: Box<dyn FnOnce(ConsensusMetricsAccumulator) -> Result<()> + Send>,
+    ) -> Self {
+        Self { current_key: None, current_group: Vec::new(), accumulator, intervals, on_finish }
+    }
+}
+
+impl MetricsReducer for CoordinateGroupCollector {
+    type Item = CoordinateGroupFragment;
+
+    /// A near-verbatim port of `process_templates_from_bam`'s inner loop
+    /// (`shared_metrics.rs`) and of `GroupByMi::process_record`'s own
+    /// buffer-then-flush shape (`mi.rs`) — the only difference is that this
+    /// reads from an already-ordered stream of fragments (each fragment
+    /// holding one batch's worth of entries) rather than raw BAM records one
+    /// at a time.
+    fn record(&mut self, fragment: CoordinateGroupFragment) -> Result<()> {
+        for (info, key) in fragment.entries {
+            match &self.current_key {
+                Some(k) if *k == key => self.current_group.push(info),
+                Some(_) => {
+                    let finished = std::mem::take(&mut self.current_group);
+                    self.accumulator.record_coordinate_group(&finished, &self.intervals)?;
+                    self.current_group = vec![info];
+                    self.current_key = Some(key);
+                }
+                None => {
+                    self.current_group.push(info);
+                    self.current_key = Some(key);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// End-of-stream flush, mirroring `process_templates_from_bam`'s own
+    /// end-of-loop flush, then hands the finished accumulator to
+    /// `on_finish` — real file-writing is supplied by the caller (Task 11),
+    /// not this type; Task 8 tests `on_finish` with a plain observer closure.
+    fn finish(mut self) -> Result<()> {
+        if !self.current_group.is_empty() {
+            self.accumulator.record_coordinate_group(&self.current_group, &self.intervals)?;
+        }
+        (self.on_finish)(self.accumulator)
+    }
+}
+
+/// Shared `#[cfg(test)]` fixtures, used by both `mod tests` (Task 7's
+/// `ConsensusMetricsAccumulator` tests) and `mod coordinate_group_collector_tests`
+/// below.
+#[cfg(test)]
+pub(crate) fn template(
+    mi: &str,
+    ref_name: &str,
+    position: i32,
+    hash_fraction: f64,
+) -> TemplateInfo {
+    TemplateInfo {
+        mi: mi.to_string(),
+        rx: "AAA".to_string(),
+        ref_name: Some(ref_name.to_string()),
+        position: Some(position),
+        end_position: Some(position + 50),
+        r1_positive: true,
+        hash_fraction,
+    }
+}
+
+/// Builds a minimal `ReadInfoKey` distinguished only by `ref_index`/`start1`
+/// — the two fields the ordered-stream tests below vary — with every other
+/// field pinned to a fixed, arbitrary value so two keys built from the same
+/// `(ref_index, start)` always compare equal.
+#[cfg(test)]
+pub(crate) fn key(ref_index: usize, start: i32) -> ReadInfoKey {
+    ReadInfoKey {
+        ref_index1: ref_index,
+        start1: start,
+        strand1: false,
+        ref_index2: ref_index,
+        start2: start + 50,
+        strand2: true,
+        library: 0,
+        cell_barcode: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    pub(crate) fn template(
-        mi: &str,
-        ref_name: &str,
-        position: i32,
-        hash_fraction: f64,
-    ) -> TemplateInfo {
-        TemplateInfo {
-            mi: mi.to_string(),
-            rx: "AAA".to_string(),
-            ref_name: Some(ref_name.to_string()),
-            position: Some(position),
-            end_position: Some(position + 50),
-            r1_positive: true,
-            hash_fraction,
-        }
-    }
 
     #[test]
     fn record_coordinate_group_drops_templates_outside_intervals() {
@@ -284,5 +484,184 @@ mod tests {
             "sub-1.0 fraction (5%) must not record UMI metrics"
         );
         assert!(!collectors[19].umi_metrics().is_empty(), "100% fraction must record UMI metrics");
+    }
+}
+
+#[cfg(test)]
+mod coordinate_group_fragment_tests {
+    use super::*;
+
+    #[test]
+    fn coordinate_group_fragment_ordinal_is_its_batch_serial() {
+        let fragment = CoordinateGroupFragment { batch_serial: 7, entries: vec![] };
+        assert_eq!(fragment.ordinal(), 7);
+    }
+}
+
+#[cfg(test)]
+mod coordinate_group_collector_tests {
+    use super::*;
+
+    /// Fresh `CoordinateGroupCollector` over a simplex accumulator, plus a
+    /// handle to observe the accumulator `finish` hands back.
+    fn observing_collector() -> (
+        CoordinateGroupCollector,
+        std::sync::Arc<std::sync::Mutex<Option<ConsensusMetricsAccumulator>>>,
+    ) {
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed_clone = std::sync::Arc::clone(&observed);
+        let collector = CoordinateGroupCollector::new(
+            ConsensusMetricsAccumulator::new_simplex(),
+            vec![],
+            Box::new(move |acc| {
+                *observed_clone.lock().unwrap() = Some(acc);
+                Ok(())
+            }),
+        );
+        (collector, observed)
+    }
+
+    fn size_1_family_count(acc: &ConsensusMetricsAccumulator) -> usize {
+        let ConsensusMetricsAccumulator::Simplex { collectors, .. } = acc else {
+            panic!("expected Simplex accumulator");
+        };
+        collectors[19]
+            .family_size_metrics()
+            .iter()
+            .filter(|m| m.family_size == 1)
+            .map(|m| m.cs_count)
+            .sum()
+    }
+
+    fn size_2_family_count(acc: &ConsensusMetricsAccumulator) -> usize {
+        let ConsensusMetricsAccumulator::Simplex { collectors, .. } = acc else {
+            panic!("expected Simplex accumulator");
+        };
+        collectors[19]
+            .family_size_metrics()
+            .iter()
+            .filter(|m| m.family_size == 2)
+            .map(|m| m.cs_count)
+            .sum()
+    }
+
+    #[test]
+    fn one_fragment_per_group_is_the_common_case() {
+        let (mut collector, observed) = observing_collector();
+        collector
+            .record(CoordinateGroupFragment {
+                batch_serial: 0,
+                entries: vec![(template("0", "chr1", 100, 1.0), key(0, 100))],
+            })
+            .expect("records");
+        collector.finish().expect("finishes");
+        assert_eq!(size_1_family_count(observed.lock().unwrap().as_ref().unwrap()), 1);
+    }
+
+    /// The `GroupByMi`-batch-boundary-split case that motivated the whole
+    /// redesign — now just "the buffer doesn't flush until the key changes,"
+    /// because the `ReorderStage` upstream (Task 11) guarantees these two
+    /// fragments arrive in true emission order, adjacent. This is the core
+    /// ordered-stream correctness claim: a coordinate group split across
+    /// MULTIPLE fragments/batches must aggregate to ONE group when delivered
+    /// in order.
+    #[test]
+    fn a_group_split_across_consecutive_fragments_with_the_same_key_stays_one_family() {
+        let (mut collector, observed) = observing_collector();
+        collector
+            .record(CoordinateGroupFragment {
+                batch_serial: 0,
+                entries: vec![(template("0", "chr1", 100, 1.0), key(0, 100))],
+            })
+            .expect("records");
+        collector
+            .record(CoordinateGroupFragment {
+                batch_serial: 1,
+                entries: vec![(template("1", "chr1", 100, 1.0), key(0, 100))],
+            })
+            .expect("records");
+        collector.finish().expect("finishes");
+        let acc = observed.lock().unwrap();
+        let acc = acc.as_ref().unwrap();
+        assert_eq!(
+            size_2_family_count(acc),
+            1,
+            "both fragments' templates must land in one CS family of size 2"
+        );
+        assert_eq!(size_1_family_count(acc), 0);
+    }
+
+    /// The X5-001 placeholder case (spec §3): every input batch must push
+    /// SOMETHING on the third branch, even an empty fragment, so the reorder
+    /// stage never stalls. Assert it doesn't spuriously flush.
+    #[test]
+    fn an_empty_fragment_in_the_middle_of_the_stream_is_a_pure_no_op() {
+        let (mut collector, observed) = observing_collector();
+        collector
+            .record(CoordinateGroupFragment {
+                batch_serial: 0,
+                entries: vec![(template("0", "chr1", 100, 1.0), key(0, 100))],
+            })
+            .expect("records");
+        collector
+            .record(CoordinateGroupFragment { batch_serial: 1, entries: vec![] })
+            .expect("records");
+        collector
+            .record(CoordinateGroupFragment {
+                batch_serial: 2,
+                entries: vec![(template("1", "chr1", 100, 1.0), key(0, 100))],
+            })
+            .expect("records");
+        collector.finish().expect("finishes");
+        assert_eq!(
+            size_2_family_count(observed.lock().unwrap().as_ref().unwrap()),
+            1,
+            "the empty fragment must not break up the group spanning around it"
+        );
+    }
+
+    #[test]
+    fn finish_flushes_whatever_is_still_buffered_at_end_of_stream() {
+        let (mut collector, observed) = observing_collector();
+        collector
+            .record(CoordinateGroupFragment {
+                batch_serial: 0,
+                entries: vec![(template("0", "chr1", 100, 1.0), key(0, 100))],
+            })
+            .expect("records");
+        // No key change ever occurs — the group is still open when finish() runs.
+        collector.finish().expect("finishes");
+        assert_eq!(
+            size_1_family_count(observed.lock().unwrap().as_ref().unwrap()),
+            1,
+            "finish() must flush the still-open group, not drop it"
+        );
+    }
+
+    /// A key change across TWO different `ReadInfoKey`s (rather than the
+    /// same one repeated) must close the first group and open a second —
+    /// pins that the buffer-then-flush-on-key-change branch itself (not just
+    /// the same-key and end-of-stream branches above) works correctly across
+    /// fragment boundaries.
+    #[test]
+    fn a_genuine_key_change_across_fragments_closes_one_group_and_opens_another() {
+        let (mut collector, observed) = observing_collector();
+        collector
+            .record(CoordinateGroupFragment {
+                batch_serial: 0,
+                entries: vec![(template("0", "chr1", 100, 1.0), key(0, 100))],
+            })
+            .expect("records");
+        collector
+            .record(CoordinateGroupFragment {
+                batch_serial: 1,
+                entries: vec![(template("1", "chr2", 200, 1.0), key(1, 200))],
+            })
+            .expect("records");
+        collector.finish().expect("finishes");
+        let acc = observed.lock().unwrap();
+        let acc = acc.as_ref().unwrap();
+        assert_eq!(size_1_family_count(acc), 2, "two distinct size-1 families, one per key");
+        assert_eq!(size_2_family_count(acc), 0);
     }
 }
