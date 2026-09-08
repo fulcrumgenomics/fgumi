@@ -420,6 +420,98 @@ pub fn compute_template_metadata(group: &[TemplateInfo]) -> Vec<TemplateMetadata
         .collect()
 }
 
+/// Builds [`TemplateInfo`] and [`ReadInfoKey`] from one already-selected R1/R2
+/// raw-record pair. Extracted from `process_templates_from_bam`'s per-template
+/// loop body so both the separate-pass metrics commands and the inline
+/// consensus-metrics adapters (which source R1/R2 pairs differently — one
+/// from a `Template`'s cached views, one from a re-paired `MiGroup`) share
+/// one construction path and cannot numerically drift apart.
+///
+/// Returns `Ok(None)` for the same two defensive-skip cases the original
+/// loop had: an unmapped reference id on either mate, or a missing CIGAR (no
+/// unclipped 5' position). Returns `Err` only if a required `MI`/`RX` tag is
+/// absent from `r1`.
+pub(crate) fn build_template_info(
+    r1: &RawRecord,
+    r2: &RawRecord,
+    header: &noodles::sam::Header,
+    library_index: &LibraryIndex,
+) -> Result<Option<(TemplateInfo, ReadInfoKey)>> {
+    let read_name = String::from_utf8_lossy(fgumi_raw_bam::read_name(r1.as_ref())).into_owned();
+    let mi = required_z_tag(r1, SamTag::MI, &read_name)?;
+    let rx = required_z_tag(r1, SamTag::RX, &read_name)?;
+
+    let r1_tid = r1.ref_id();
+    let r2_tid = r2.ref_id();
+    if r1_tid < 0 || r2_tid < 0 {
+        return Ok(None);
+    }
+    let r1_ref = r1_tid as usize;
+    let r2_ref = r2_tid as usize;
+    let same_ref = r1_ref == r2_ref;
+
+    let ref_name = header.reference_sequences().get_index(r1_ref).map(|(name, _)| name.to_string());
+
+    let (s1, s2) =
+        match (unclipped_five_prime_position_raw(r1), unclipped_five_prime_position_raw(r2)) {
+            (Some(s1), Some(s2)) => (s1, s2),
+            _ => return Ok(None),
+        };
+
+    let r1_strand = (r1.flags() & raw_flags::REVERSE) != 0;
+    let r2_strand = (r2.flags() & raw_flags::REVERSE) != 0;
+
+    let r1_start = r1.pos() + 1;
+    let r2_start = r2.pos() + 1;
+    let r1_end = alignment_end_from_raw(r1.as_ref()).map(|e| e as i32);
+    let r2_end = alignment_end_from_raw(r2.as_ref()).map(|e| e as i32);
+
+    let (position, end_position) = if same_ref {
+        match (r1_end, r2_end) {
+            (Some(re1), Some(re2)) => (r1_start.min(r2_start), re1.max(re2)),
+            _ => (r1_start.min(r2_start), r1_start.max(r2_start)),
+        }
+    } else {
+        (r1_start, r1_end.unwrap_or(r1_start))
+    };
+
+    let library = find_string_tag_in_record(r1.as_ref(), SamTag::RG)
+        .map_or(0u16, |rg| library_index.get(LibraryIndex::hash_rg(rg)));
+    let cell_barcode: Option<Box<[u8]>> =
+        find_string_tag_in_record(r1.as_ref(), SamTag::CB).map(Box::from);
+
+    let (ref_index1, start1, strand1, ref_index2, start2, strand2) =
+        if (r1_ref, s1, r1_strand) <= (r2_ref, s2, r2_strand) {
+            (r1_ref, s1, r1_strand, r2_ref, s2, r2_strand)
+        } else {
+            (r2_ref, s2, r2_strand, r1_ref, s1, r1_strand)
+        };
+    let read_info_key = ReadInfoKey {
+        ref_index1,
+        start1,
+        strand1,
+        ref_index2,
+        start2,
+        strand2,
+        library,
+        cell_barcode,
+    };
+
+    let hash_fraction = compute_hash_fraction(&read_name);
+
+    let template_info = TemplateInfo {
+        mi,
+        rx,
+        ref_name,
+        position: Some(position),
+        end_position: Some(end_position),
+        r1_positive: !r1_strand,
+        hash_fraction,
+    };
+
+    Ok(Some((template_info, read_info_key)))
+}
+
 /// Reads a BAM file, groups templates by [`ReadInfoKey`], and calls a closure for each group.
 ///
 /// This is the shared BAM processing loop used by both duplex-metrics and simplex-metrics.
@@ -504,96 +596,10 @@ where
             _ => continue,
         };
 
-        let read_name = String::from_utf8_lossy(fgumi_raw_bam::read_name(r1.as_ref())).into_owned();
-        let mi = required_z_tag(r1, SamTag::MI, &read_name)?;
-        let rx = required_z_tag(r1, SamTag::RX, &read_name)?;
-
-        // Filter already excluded unmapped reads, so tid >= 0 here; skip defensively.
-        let r1_tid = r1.ref_id();
-        let r2_tid = r2.ref_id();
-        if r1_tid < 0 || r2_tid < 0 {
+        let Some((template_info, read_info_key)) =
+            build_template_info(r1, r2, &header, &library_index)?
+        else {
             continue;
-        }
-        let r1_ref = r1_tid as usize;
-        let r2_ref = r2_tid as usize;
-        let same_ref = r1_ref == r2_ref;
-
-        // `ref_name` is always R1's reference. Interval overlap uses R1's own range
-        // when R1 and R2 are on different chromosomes, matching fgbio
-        // CollectDuplexSeqMetrics: `if (rec.refIndex == rec.mateRefIndex)
-        // Bams.insertCoordinates(rec) else (rec.start, rec.end)`.
-        let ref_name =
-            header.reference_sequences().get_index(r1_ref).map(|(name, _)| name.to_string());
-
-        // None here implies a malformed mapped record (no CIGAR); skip defensively.
-        let (s1, s2) =
-            match (unclipped_five_prime_position_raw(r1), unclipped_five_prime_position_raw(r2)) {
-                (Some(s1), Some(s2)) => (s1, s2),
-                _ => continue,
-            };
-
-        let r1_strand = (r1.flags() & raw_flags::REVERSE) != 0;
-        let r2_strand = (r2.flags() & raw_flags::REVERSE) != 0;
-
-        let r1_start = r1.pos() + 1;
-        let r2_start = r2.pos() + 1;
-        let r1_end = alignment_end_from_raw(r1.as_ref()).map(|e| e as i32);
-        let r2_end = alignment_end_from_raw(r2.as_ref()).map(|e| e as i32);
-
-        let (position, end_position) = if same_ref {
-            match (r1_end, r2_end) {
-                (Some(re1), Some(re2)) => (r1_start.min(r2_start), re1.max(re2)),
-                _ => (r1_start.min(r2_start), r1_start.max(r2_start)),
-            }
-        } else {
-            // No single insert interval spans both mates; use R1's own range so
-            // interval filters still evaluate against R1's side of the pair.
-            (r1_start, r1_end.unwrap_or(r1_start))
-        };
-
-        // Template-level library (RG -> LB) and cell barcode (CB), taken from the primary
-        // R1, matching fgbio's ReadInfo(library, cellBarcode). Different libraries or cells
-        // at the same coordinate/strand form separate families (DXM3-02). The cell tag is
-        // hardcoded to CB, matching fgumi's opinionated group/dedup (no --cell-tag flag).
-        let library = find_string_tag_in_record(r1.as_ref(), SamTag::RG)
-            .map_or(0u16, |rg| library_index.get(LibraryIndex::hash_rg(rg)));
-        let cell_barcode: Option<Box<[u8]>> =
-            find_string_tag_in_record(r1.as_ref(), SamTag::CB).map(Box::from);
-
-        // Order the two mate positions so the earlier-mapping read comes first. The
-        // tie-break includes strand (positive sorts before negative, since Rust
-        // `false < true` and `strand == is_reverse`), matching fgumi's own group/dedup
-        // canonicalization (the `(ref, pos, strand)` key ordering) and
-        // fgbio's ReadInfo `r1Earlier` (GroupReadsByUmi.scala:105-111). Without the strand
-        // tie-break, the two strands of a duplex whose mates share an identical
-        // (ref, unclipped-5') canonicalize to different keys and fail to co-group.
-        let (ref_index1, start1, strand1, ref_index2, start2, strand2) =
-            if (r1_ref, s1, r1_strand) <= (r2_ref, s2, r2_strand) {
-                (r1_ref, s1, r1_strand, r2_ref, s2, r2_strand)
-            } else {
-                (r2_ref, s2, r2_strand, r1_ref, s1, r1_strand)
-            };
-        let read_info_key = ReadInfoKey {
-            ref_index1,
-            start1,
-            strand1,
-            ref_index2,
-            start2,
-            strand2,
-            library,
-            cell_barcode,
-        };
-
-        let hash_fraction = compute_hash_fraction(&read_name);
-
-        let template_info = TemplateInfo {
-            mi,
-            rx,
-            ref_name,
-            position: Some(position),
-            end_position: Some(end_position),
-            r1_positive: !r1_strand,
-            hash_fraction,
         };
 
         if !overlaps_intervals(&template_info, intervals) {
@@ -788,5 +794,60 @@ mod tests {
         assert!(mis.contains(&"1".to_string()));
         assert!(mis.contains(&"2".to_string()));
         assert!(mis.contains(&"3".to_string()), "inter-ref pair's MI must be in output");
+    }
+
+    #[test]
+    fn build_template_info_populates_all_template_info_and_read_info_key_fields() {
+        // build_pair (this module's own helper, above) builds an R1/R2 pair via
+        // fgumi_raw_bam::RawSamBuilder. Both mates: 100M, no soft-clips, no RG/CB
+        // tags. R1 is FIRST_SEGMENT + MATE_REVERSE (forward strand) at 1-based pos
+        // 100; R2 is LAST_SEGMENT + REVERSE (reverse strand) at 1-based pos 150.
+        // Both are tagged MI="7", RX="ACGT-TGCA".
+        //
+        // Every expected value below is derived directly from those known inputs
+        // (not by re-running build_template_info against process_templates_from_bam),
+        // so a regression in the builder itself is caught rather than mirrored.
+        let (r1_buf, r2_buf) = build_pair("read-1", 0, 100, 0, 150, "7");
+        // `encode_record_buf_to_raw` needs a non-empty `@SQ` dictionary to round-trip a
+        // mapped record's reference id (see its docstring); `sam::Header::default()` has
+        // none, so use this module's `test_header()` (chr1 at index 0), matching build_pair's
+        // ref_id 0 for both mates.
+        let header = test_header();
+        let r1 = fgumi_raw_bam::encode_record_buf_to_raw(&r1_buf, &header).expect("encode r1");
+        let r2 = fgumi_raw_bam::encode_record_buf_to_raw(&r2_buf, &header).expect("encode r2");
+        let library_index = LibraryIndex::from_header(&header);
+
+        let (info, key) = build_template_info(&r1, &r2, &header, &library_index)
+            .expect("build_template_info succeeds")
+            .expect("both records map, so Some");
+
+        // TemplateInfo: tags carried through verbatim; ref_name is always R1's ref
+        // (chr1 at index 0). The two mates share a reference, so the template span
+        // is min(start) .. max(end): min(100, 150) .. max(100+99, 150+99) = 100..249.
+        // R1 is forward, so r1_positive is true. hash_fraction is keyed off the read
+        // NAME "read-1" (independently pinned by compute_hash_fraction's own tests).
+        assert_eq!(info.mi, "7");
+        assert_eq!(info.rx, "ACGT-TGCA");
+        assert_eq!(info.ref_name.as_deref(), Some("chr1"));
+        assert_eq!(info.position, Some(100));
+        assert_eq!(info.end_position, Some(249));
+        assert!(info.r1_positive, "R1 is on the forward strand");
+        // Bit-exact: both sides are the same deterministic murmur3 computation over
+        // the read name, so this pins the hash to the read NAME without a tolerance
+        // (and satisfies clippy::float_cmp).
+        assert_eq!(info.hash_fraction.to_bits(), compute_hash_fraction("read-1").to_bits());
+
+        // ReadInfoKey: mates are ordered so the earlier (ref, unclipped-5', strand)
+        // sorts first. R1's forward 5' is its start (100); R2's reverse 5' is its
+        // unclipped end (150 + 99 = 249). (0, 100, false) < (0, 249, true), so R1
+        // is read 1 in the key. No RG -> library 0; no CB tag -> no cell barcode.
+        assert_eq!(key.ref_index1, 0);
+        assert_eq!(key.start1, 100);
+        assert!(!key.strand1, "read 1 (R1) is forward");
+        assert_eq!(key.ref_index2, 0);
+        assert_eq!(key.start2, 249);
+        assert!(key.strand2, "read 2 (R2) is reverse");
+        assert_eq!(key.library, 0, "no @RG in the header, so unknown library");
+        assert!(key.cell_barcode.is_none(), "no CB tag was set");
     }
 }
