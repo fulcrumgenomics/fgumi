@@ -490,6 +490,54 @@ impl Default for BamIoOptions {
     }
 }
 
+/// Resolve the effective CRC-verification policy from `--check-crc` /
+/// `--no-check-crc` and the input's stdin-vs-file status.
+///
+/// Single source of truth for every command: `--check-crc` forces
+/// verification on; `--no-check-crc` forces it off; with neither given,
+/// verification defaults on for file input and off for stdin (`-` or
+/// `/dev/stdin`), since a fresh aligner-piped stream is trusted while a file
+/// may have been archived or transferred since it was written. The two flags
+/// are mutually exclusive at the CLI layer (`conflicts_with`), so at most one
+/// is ever true; if both were somehow set, `check_crc` wins.
+///
+/// A free function (rather than only a [`BamIoOptions`] method) so commands
+/// whose I/O block is not `BamIoOptions` — `sort`, whose output is optional —
+/// share the policy instead of re-deriving it.
+#[must_use]
+pub fn resolve_check_crc(check_crc: bool, no_check_crc: bool, input: &Path) -> bool {
+    if check_crc {
+        true
+    } else if no_check_crc {
+        false
+    } else {
+        !fgumi_bam_io::is_stdin_path(input)
+    }
+}
+
+/// The parenthesised reason suffix for the `CRC verify:` startup log line —
+/// which flag or default produced the policy [`resolve_check_crc`] returns.
+#[must_use]
+pub fn check_crc_reason(check_crc: bool, no_check_crc: bool, input: &Path) -> &'static str {
+    if check_crc {
+        " (--check-crc)"
+    } else if no_check_crc {
+        " (--no-check-crc)"
+    } else if fgumi_bam_io::is_stdin_path(input) {
+        " (trusted stdin)"
+    } else {
+        ""
+    }
+}
+
+/// Log the effective CRC-verification setting at info level, once, at run
+/// start, so a default-derived decision is visible in every run's log.
+pub fn log_check_crc(check_crc: bool, no_check_crc: bool, input: &Path) {
+    let effective = resolve_check_crc(check_crc, no_check_crc, input);
+    let reason = check_crc_reason(check_crc, no_check_crc, input);
+    log::info!("CRC verify: {}{reason}", if effective { "on" } else { "off" });
+}
+
 impl BamIoOptions {
     /// Construct a `BamIoOptions` from input and output paths. Leaves
     /// opt-in tuning flags (e.g. `async_reader`) and the CRC-verification
@@ -515,34 +563,19 @@ impl BamIoOptions {
     /// aligner-piped stream is trusted while a file may have been archived
     /// or transferred since it was written. `check_crc` and `no_check_crc`
     /// are mutually exclusive at the CLI layer (`conflicts_with`), so at most
-    /// one is ever true.
+    /// one is ever true. Delegates to the free [`resolve_check_crc`] so this
+    /// method and commands that do not embed `BamIoOptions` share one policy.
     #[must_use]
     pub fn effective_check_crc(&self) -> bool {
-        if self.check_crc {
-            true
-        } else if self.no_check_crc {
-            false
-        } else {
-            !fgumi_bam_io::is_stdin_path(&self.input)
-        }
+        resolve_check_crc(self.check_crc, self.no_check_crc, &self.input)
     }
 
     /// Log the effective CRC-verification setting at info level, once, at
     /// run start. Makes the `effective_check_crc` policy — a default-behavior
     /// change from fgumi's previous always-verify default — visible in every
-    /// run's log rather than a silent decision.
+    /// run's log rather than a silent decision. Delegates to [`log_check_crc`].
     pub fn log_effective_check_crc(&self) {
-        let effective = self.effective_check_crc();
-        let reason = if self.check_crc {
-            " (--check-crc)"
-        } else if self.no_check_crc {
-            " (--no-check-crc)"
-        } else if fgumi_bam_io::is_stdin_path(&self.input) {
-            " (trusted stdin)"
-        } else {
-            ""
-        };
-        log::info!("CRC verify: {}{reason}", if effective { "on" } else { "off" });
+        log_check_crc(self.check_crc, self.no_check_crc, &self.input);
     }
 
     /// Build [`fgumi_bam_io::PipelineReaderOpts`] from the async-reader flag
@@ -2057,6 +2090,50 @@ mod tests {
             no_check_crc,
         };
         assert_eq!(io.effective_check_crc(), expected);
+    }
+
+    /// The free `resolve_check_crc` is the single source of truth for the CRC
+    /// policy; `BamIoOptions::effective_check_crc` must agree with it on every
+    /// cell of the truth table (explicit flag wins; otherwise file → verify,
+    /// stdin → skip).
+    #[rstest::rstest]
+    #[case::file_default_verifies(false, false, "input.bam", true)]
+    #[case::dash_stdin_default_skips(false, false, "-", false)]
+    #[case::dev_stdin_default_skips(false, false, "/dev/stdin", false)]
+    #[case::check_crc_forces_on_for_stdin(true, false, "-", true)]
+    #[case::no_check_crc_forces_off_for_file(false, true, "input.bam", false)]
+    fn resolve_check_crc_truth_table(
+        #[case] check_crc: bool,
+        #[case] no_check_crc: bool,
+        #[case] input: &str,
+        #[case] expected: bool,
+    ) {
+        let input = Path::new(input);
+        assert_eq!(resolve_check_crc(check_crc, no_check_crc, input), expected);
+        let io = BamIoOptions {
+            input: input.to_path_buf(),
+            output: PathBuf::from("output.bam"),
+            async_reader: false,
+            check_crc,
+            no_check_crc,
+        };
+        assert_eq!(io.effective_check_crc(), expected, "method must delegate to the free fn");
+    }
+
+    /// The logged reason suffix names why the policy landed where it did, in the
+    /// exact wording the other commands already emit.
+    #[rstest::rstest]
+    #[case::explicit_on(true, false, "in.bam", " (--check-crc)")]
+    #[case::explicit_off(false, true, "in.bam", " (--no-check-crc)")]
+    #[case::trusted_stdin(false, false, "-", " (trusted stdin)")]
+    #[case::file_default(false, false, "in.bam", "")]
+    fn check_crc_reason_wording(
+        #[case] check_crc: bool,
+        #[case] no_check_crc: bool,
+        #[case] input: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(check_crc_reason(check_crc, no_check_crc, Path::new(input)), expected);
     }
 
     /// `reject_output_collisions` compares destinations, not the strings naming

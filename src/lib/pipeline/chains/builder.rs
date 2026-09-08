@@ -2808,7 +2808,11 @@ impl<'a> ChainBuilder<'a> {
                     // full-budget run, so data that fits the budget sorts entirely
                     // in memory with zero spills — matching legacy.
                     let read_blocks = ReadBlocks::new(total_memory, byte_limit);
-                    let inflate = InflateToArena::new(byte_limit);
+                    // The arena front is the only decode path standalone sort
+                    // takes, so the chain's CRC policy has to reach it here --
+                    // `BgzfDecompress` (which also honors `spec.verify_crc`) is
+                    // never on this path.
+                    let inflate = InflateToArena::new_with_crc(byte_limit, self.spec.verify_crc);
                     // Hand the resolved Phase-1 count (honoring `--sort-threads`,
                     // else `--threads`) to the per-chunk sort so large chunks use
                     // the parallel radix. Using the raw global `num_threads()` here

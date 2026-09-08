@@ -13,7 +13,8 @@
 //! for the full justification.
 //!
 //! `InflateToArena`: each worker decompresses one BGZF block directly into its
-//! disjoint arena slot via [`fgumi_bgzf::decompress_into_slice`].  This is the first
+//! disjoint arena slot via [`fgumi_bgzf::decompress_into_slice_with_crc`] under
+//! the step's CRC policy.  This is the first
 //! `unsafe` site in `fgumi-pipeline-io`; see CLAUDE.md §"Approved hot-path
 //! unsafe (parallel-inflate sort ingest, fgumi-pipeline-io)" for the
 //! full justification and SAFETY invariant.
@@ -34,7 +35,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 
-use fgumi_bgzf::{Decompressor, decompress_into_slice};
+use fgumi_bgzf::{Decompressor, decompress_into_slice_with_crc};
 use fgumi_sort::{
     ArenaPool, InMemoryChunk, PooledSegmentedBuf, RawSortKey, RecordRef,
     coordinate_chunk_from_refs, extract_coordinate_key_inline, queryname_chunk_from_arena_refs,
@@ -706,17 +707,36 @@ pub struct InflateToArena {
     decompressor: Decompressor,
     held: HeldSlot<Unpushed<InflatedBlock>>,
     output_byte_limit: u64,
+    /// Whether each block's BGZF footer CRC32 is compared after inflate. The
+    /// ISIZE / exact-fill checks always run; see
+    /// [`fgumi_bgzf::decompress_into_slice_with_crc`].
+    verify_crc: bool,
 }
 
 impl InflateToArena {
-    /// Create a new `InflateToArena` step.
+    /// Create a new `InflateToArena` step that verifies every block's CRC32.
+    ///
+    /// Equivalent to [`Self::new_with_crc`]`(output_byte_limit, true)`.
+    #[must_use]
+    pub fn new(output_byte_limit: u64) -> Self {
+        Self::new_with_crc(output_byte_limit, true)
+    }
+
+    /// Create a new `InflateToArena` step with an explicit CRC32 policy.
     ///
     /// `output_byte_limit` bounds the byte-counted output queue (tokens carry
     /// `heap_size == 0`, so this mainly controls queue depth via the framework's
-    /// backpressure mechanism).
+    /// backpressure mechanism). `verify_crc = false` skips only the footer
+    /// CRC32 compare, for trusted input; the ISIZE / exact-fill checks always
+    /// run.
     #[must_use]
-    pub fn new(output_byte_limit: u64) -> Self {
-        Self { decompressor: Decompressor::new(), held: HeldSlot::new(), output_byte_limit }
+    pub fn new_with_crc(output_byte_limit: u64, verify_crc: bool) -> Self {
+        Self {
+            decompressor: Decompressor::new(),
+            held: HeldSlot::new(),
+            output_byte_limit,
+            verify_crc,
+        }
     }
 
     /// Decompress `item.block` into the arena slot `(item.offset, item.len)`,
@@ -751,7 +771,9 @@ impl InflateToArena {
         // prefix-sum partitions the arena into non-overlapping slots, so this
         // `&mut [u8]` aliases no other concurrent inflate worker's slice.
         // `u8` has no validity invariant, so writing before reading is the only
-        // required contract — `decompress_into_slice` below fills every byte.
+        // required contract — `decompress_into_slice_with_crc` below fills every
+        // byte (the exact-fill guarantee is unconditional; `verify_crc` gates
+        // only the CRC32 compare).
         // `offset` is a u64 byte offset into the arena; on a 64-bit platform
         // this always fits in usize — the arena itself cannot exceed
         // `isize::MAX` bytes, which is the Rust allocation bound.
@@ -762,7 +784,8 @@ impl InflateToArena {
         #[allow(unsafe_code)]
         let slot = unsafe { arena.slice_mut(offset_usize, len_usize) };
 
-        let n = decompress_into_slice(&block, &mut self.decompressor, slot)?;
+        let n =
+            decompress_into_slice_with_crc(&block, &mut self.decompressor, slot, self.verify_crc)?;
         debug_assert_eq!(n, len_usize, "decompressed length must match ISIZE");
 
         Ok(InflatedBlock { arena, ordinal, offset, len, is_last_of_run, run_seq, seals_to_spill })
@@ -821,7 +844,7 @@ impl Step for InflateToArena {
     }
 
     fn new_worker_copy(&self) -> Self {
-        Self::new(self.output_byte_limit)
+        Self::new_with_crc(self.output_byte_limit, self.verify_crc)
     }
 }
 
@@ -1615,6 +1638,7 @@ impl<S: ArenaSortStrategy> Step for FindBoundariesAndSort<S> {
 mod tests {
     use super::*;
     use fgumi_sort::{CoordinateChunkSorter, PooledSegmentedBuf, SegmentedBuf};
+    use rstest::rstest;
     use std::sync::Arc;
 
     // -----------------------------------------------------------------------
@@ -2626,5 +2650,93 @@ mod tests {
                  (the value FindBoundariesAndSort was constructed with)"
             );
         }
+    }
+
+    /// Build a one-block `ArenaBlock` over a fresh unpooled arena with its slot
+    /// reserved, for `inflate_one` tests. Returns the token and the arena so the
+    /// caller can read the slot back.
+    fn arena_block_for(
+        block: Vec<u8>,
+        payload_len: usize,
+    ) -> (ArenaBlock, Arc<PooledSegmentedBuf>) {
+        let mut arena = SegmentedBuf::with_capacity(0, 1 << 20);
+        arena.reserve_full_capacity();
+        // Reserve the slot with the safe API (zero placeholder); `inflate_one`
+        // fully overwrites it before any read, so the placeholder is never
+        // observed. `extend_from_slice` returns the write offset to use.
+        let offset = arena.extend_from_slice(&vec![0u8; payload_len]) as u64;
+        let arena = Arc::new(PooledSegmentedBuf::unpooled(arena));
+        let item = ArenaBlock {
+            arena: Arc::clone(&arena),
+            ordinal: 0,
+            offset,
+            len: u32::try_from(payload_len).unwrap(),
+            block,
+            is_last_of_run: true,
+            run_seq: 0,
+            seals_to_spill: false,
+        };
+        (item, arena)
+    }
+
+    /// Flip one footer-CRC32 bit of a raw BGZF block (the payload is untouched).
+    fn with_flipped_crc(mut block: Vec<u8>) -> Vec<u8> {
+        let crc_off = block.len() - fgumi_bgzf::BGZF_FOOTER_SIZE;
+        block[crc_off] ^= 0x01;
+        block
+    }
+
+    /// `InflateToArena::new_with_crc` decides whether a CRC-only-corrupted block
+    /// is rejected or inflated into the slot. Covered on both decode branches
+    /// (level 6 → libdeflater; level 0 → stored fast path) because the CRC is
+    /// checked at two separate call sites in fgumi-bgzf. The plain `new`
+    /// constructor must behave as `verify_crc = true`.
+    #[rstest]
+    #[case::deflate_verify_rejects(6, Some(true), false)]
+    #[case::deflate_skip_accepts(6, Some(false), true)]
+    #[case::stored_verify_rejects(0, Some(true), false)]
+    #[case::stored_skip_accepts(0, Some(false), true)]
+    #[case::plain_new_verifies(6, None, false)]
+    fn inflate_honors_verify_crc(
+        #[case] level: u32,
+        #[case] verify_crc: Option<bool>,
+        #[case] expect_ok: bool,
+    ) {
+        let payload = b"CRC-POLICY-ARENA-TEST".repeat(40);
+        let block = match level {
+            0 => make_test_bgzf_block(&payload),
+            _ => compress_one_block(&payload),
+        };
+        let (item, arena) = arena_block_for(with_flipped_crc(block), payload.len());
+        let mut step = match verify_crc {
+            Some(v) => InflateToArena::new_with_crc(64 * 1024 * 1024, v),
+            None => InflateToArena::new(64 * 1024 * 1024),
+        };
+        let result = step.inflate_one(item);
+        if expect_ok {
+            let inflated = result.expect("verify_crc=false must inflate past a CRC-only fault");
+            assert_eq!(usize::try_from(inflated.len).unwrap(), payload.len());
+            assert_eq!(arena.slice(0, payload.len()), &payload[..], "slot holds the payload");
+        } else {
+            // `InflatedBlock` is not `Debug`, so match rather than `expect_err`.
+            let Err(err) = result else {
+                panic!("verify_crc=true must reject a CRC32 mismatch");
+            };
+            assert!(err.to_string().contains("CRC32"), "got: {err}");
+        }
+    }
+
+    /// Parallel workers are cloned via `new_worker_copy`; the policy must ride
+    /// along or only the seed worker would honor `--no-check-crc`.
+    #[rstest]
+    #[case::skip(false)]
+    #[case::verify(true)]
+    fn new_worker_copy_propagates_verify_crc(#[case] verify_crc: bool) {
+        let seed = InflateToArena::new_with_crc(1024, verify_crc);
+        let mut copy = seed.new_worker_copy();
+        let payload = b"WORKER-COPY".repeat(20);
+        let (item, _arena) =
+            arena_block_for(with_flipped_crc(compress_one_block(&payload)), payload.len());
+        assert_eq!(copy.inflate_one(item).is_ok(), !verify_crc);
     }
 }
