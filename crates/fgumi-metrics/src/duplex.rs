@@ -244,6 +244,7 @@ impl Metric for DuplexUmiMetric {
 /// Collector for duplex sequencing metrics.
 ///
 /// Tracks family sizes, UMI frequencies, and yields at multiple sampling levels.
+#[derive(Debug, Clone)]
 pub struct DuplexMetricsCollector {
     /// Whether to collect duplex UMI counts (memory intensive)
     collect_duplex_umi_counts: bool,
@@ -492,10 +493,35 @@ impl DuplexMetricsCollector {
         });
         metrics
     }
+
+    /// Merges `other`'s counts into `self`. Same commutative/associative
+    /// integer-sum shape as `SimplexMetricsCollector::merge`.
+    pub fn merge(&mut self, other: Self) {
+        for (size, count) in other.cs_family_sizes {
+            *self.cs_family_sizes.entry(size).or_insert(0) += count;
+        }
+        for (size, count) in other.ss_family_sizes {
+            *self.ss_family_sizes.entry(size).or_insert(0) += count;
+        }
+        for (size, count) in other.ds_family_sizes {
+            *self.ds_family_sizes.entry(size).or_insert(0) += count;
+        }
+        for (key, count) in other.duplex_family_sizes {
+            *self.duplex_family_sizes.entry(key).or_insert(0) += count;
+        }
+        self.umi_counts.merge(other.umi_counts);
+        self.duplex_umi_counts.merge(other.duplex_umi_counts);
+        // collect_duplex_umi_counts is a per-collector config flag, not
+        // accumulated state — self's own value is authoritative; both
+        // collectors in one accumulator are always constructed with the
+        // same flag, so self and other never disagree.
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     // =========================================================================
@@ -931,5 +957,39 @@ mod tests {
         assert_eq!(DuplexYieldMetric::metric_name(), "duplex yield");
         assert_eq!(UmiMetric::metric_name(), "UMI");
         assert_eq!(DuplexUmiMetric::metric_name(), "duplex UMI");
+    }
+
+    // =========================================================================
+    // DuplexMetricsCollector::merge tests
+    // =========================================================================
+
+    #[rstest]
+    #[case::disjoint_duplex_pairs(vec![((5, 3), 2)], vec![((7, 1), 1)], vec![((5, 3), 2), ((7, 1), 1)])]
+    #[case::overlapping_duplex_pairs(vec![((5, 3), 2)], vec![((5, 3), 1)], vec![((5, 3), 3)])]
+    fn merge_sums_duplex_family_sizes_by_key(
+        #[case] a: Vec<((usize, usize), usize)>,
+        #[case] b: Vec<((usize, usize), usize)>,
+        #[case] expected: Vec<((usize, usize), usize)>,
+    ) {
+        let mut left = DuplexMetricsCollector::new(false);
+        for ((ab, ba), count) in a {
+            for _ in 0..count {
+                left.record_duplex_family(ab, ba);
+            }
+        }
+        let mut right = DuplexMetricsCollector::new(false);
+        for ((ab, ba), count) in b {
+            for _ in 0..count {
+                right.record_duplex_family(ab, ba);
+            }
+        }
+
+        left.merge(right);
+
+        let mut got: Vec<((usize, usize), usize)> = left.duplex_family_sizes.into_iter().collect();
+        got.sort_unstable();
+        let mut expected = expected;
+        expected.sort_unstable();
+        assert_eq!(got, expected);
     }
 }

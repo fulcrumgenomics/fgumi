@@ -63,6 +63,7 @@ impl Metric for UmiMetric {
 /// Each UMI string maps to a tuple of `(raw_count, error_count, unique_count)`.
 /// Use [`record`](Self::record) to accumulate observations and [`to_metrics`](Self::to_metrics)
 /// to produce sorted [`UmiMetric`] output.
+#[derive(Debug, Clone)]
 pub struct UmiCountTracker {
     /// Maps UMI string to `(raw_count, error_count, unique_count)`.
     counts: HashMap<String, (usize, usize, usize)>,
@@ -103,6 +104,17 @@ impl UmiCountTracker {
     /// Iterates over all tracked UMIs, yielding `(umi, raw_count, error_count, unique_count)`.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, usize, usize, usize)> {
         self.counts.iter().map(|(umi, &(raw, errors, unique))| (umi.as_str(), raw, errors, unique))
+    }
+
+    /// Merges `other`'s per-UMI counts into `self`, summing the
+    /// `(raw, errors, unique)` tuple for any UMI present in both.
+    pub(crate) fn merge(&mut self, other: Self) {
+        for (umi, (raw, errors, unique)) in other.counts {
+            let entry = self.counts.entry(umi).or_insert((0, 0, 0));
+            entry.0 += raw;
+            entry.1 += errors;
+            entry.2 += unique;
+        }
     }
 
     /// Generates [`UmiMetric`] entries sorted alphabetically by UMI sequence.

@@ -15,7 +15,7 @@ use crate::{Metric, frac};
 /// Two kinds of families are described:
 /// - **CS** (Coordinate & Strand): families grouped by unclipped 5' genomic positions and strands
 /// - **SS** (Single Strand): single-strand families using UMIs, not linking opposing strands
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimplexFamilySizeMetric {
     /// The family size (number of read pairs grouped together)
     pub family_size: usize,
@@ -121,6 +121,7 @@ impl Metric for SimplexYieldMetric {
 /// Collector for simplex sequencing metrics.
 ///
 /// Tracks CS and SS family sizes and UMI frequencies.
+#[derive(Debug, Clone, Default)]
 pub struct SimplexMetricsCollector {
     /// CS family size counts: `family_size` -> count
     cs_family_sizes: HashMap<usize, usize>,
@@ -220,16 +221,26 @@ impl SimplexMetricsCollector {
     pub fn umi_metrics(&self) -> Vec<UmiMetric> {
         self.umi_counts.to_metrics()
     }
-}
 
-impl Default for SimplexMetricsCollector {
-    fn default() -> Self {
-        Self::new()
+    /// Merges `other`'s counts into `self`. Commutative and associative: an
+    /// integer `HashMap` sum per key, so the result is independent of how
+    /// many workers produced partial collectors or in what order they are
+    /// folded together.
+    pub fn merge(&mut self, other: Self) {
+        for (size, count) in other.cs_family_sizes {
+            *self.cs_family_sizes.entry(size).or_insert(0) += count;
+        }
+        for (size, count) in other.ss_family_sizes {
+            *self.ss_family_sizes.entry(size).or_insert(0) += count;
+        }
+        self.umi_counts.merge(other.umi_counts);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     // =========================================================================
@@ -381,5 +392,93 @@ mod tests {
             metrics.iter().find(|m| m.umi == "CCCC").expect("CCCC UMI metric should be present");
         assert_eq!(cccc.raw_observations, 8);
         assert_eq!(cccc.unique_observations, 1);
+    }
+
+    // =========================================================================
+    // SimplexMetricsCollector::merge tests
+    // =========================================================================
+
+    #[rstest]
+    #[case::disjoint_sizes(vec![(1, 3)], vec![(2, 5)], vec![(1, 3), (2, 5)])]
+    #[case::overlapping_sizes(vec![(1, 3)], vec![(1, 2)], vec![(1, 5)])]
+    #[case::empty_other(vec![(1, 3)], vec![], vec![(1, 3)])]
+    fn merge_sums_cs_family_sizes_by_key(
+        #[case] a: Vec<(usize, usize)>,
+        #[case] b: Vec<(usize, usize)>,
+        #[case] expected: Vec<(usize, usize)>,
+    ) {
+        let mut left = SimplexMetricsCollector::new();
+        for (size, count) in a {
+            for _ in 0..count {
+                left.record_cs_family(size);
+            }
+        }
+        let mut right = SimplexMetricsCollector::new();
+        for (size, count) in b {
+            for _ in 0..count {
+                right.record_cs_family(size);
+            }
+        }
+
+        left.merge(right);
+
+        let mut got: Vec<(usize, usize)> = left.cs_family_sizes.into_iter().collect();
+        got.sort_unstable();
+        let mut expected = expected;
+        expected.sort_unstable();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn merge_is_commutative() {
+        let mut a1 = SimplexMetricsCollector::new();
+        a1.record_cs_family(3);
+        a1.record_ss_family(1);
+        a1.record_umi("AAA", 2, 0, true);
+
+        let mut b1 = SimplexMetricsCollector::new();
+        b1.record_cs_family(5);
+        b1.record_ss_family(1);
+        b1.record_umi("TTT", 1, 1, true);
+
+        let (a2, mut b2) = (a1.clone(), b1.clone());
+        a1.merge(b1);
+        b2.merge(a2);
+        assert_eq!(a1.family_size_metrics(), b2.family_size_metrics());
+    }
+
+    #[rstest]
+    #[case::two_shards(vec![vec![1, 2], vec![3]])]
+    #[case::three_shards(vec![vec![1], vec![2], vec![3]])]
+    #[case::one_shard_per_item(vec![vec![1], vec![2], vec![3]])]
+    #[case::single_shard(vec![vec![1, 2, 3]])]
+    fn merge_is_associative_regardless_of_shard_partitioning(#[case] shards: Vec<Vec<usize>>) {
+        // Partitioning the SAME fixed input (family sizes 1, 2, 3, one
+        // record each) into N shards in several arrangements, then folding
+        // all shards together pairwise, must always yield the identical
+        // final result — proving associativity, not just two-way
+        // commutativity (already covered above).
+        let mut shard_collectors: Vec<SimplexMetricsCollector> = shards
+            .iter()
+            .map(|sizes| {
+                let mut c = SimplexMetricsCollector::new();
+                for &size in sizes {
+                    c.record_cs_family(size);
+                }
+                c
+            })
+            .collect();
+
+        let mut folded = shard_collectors.remove(0);
+        for shard in shard_collectors {
+            folded.merge(shard);
+        }
+
+        let mut expected = SimplexMetricsCollector::new();
+        expected.record_cs_family(1);
+        expected.record_cs_family(2);
+        expected.record_cs_family(3);
+
+        assert_eq!(folded.family_size_metrics(), expected.family_size_metrics());
     }
 }
