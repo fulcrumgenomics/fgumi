@@ -911,7 +911,7 @@ pub(crate) struct Phase2Reader {
 /// Do NOT delete the gap-filler or the reorder buffer
 /// here to "match" `merge_slots` — it would reintroduce a real deadlock and/or
 /// out-of-order merge output. (History: commits `9d6d7e9` / `9c39dea`, PRs
-/// #389 / #395, `docs/design/sort-phase2-unification-deferral.md`.)
+/// #389 / #395.)
 pub(crate) struct Phase2FileState {
     /// Disk reader. Held only while popping bytes from disk.
     pub(crate) reader: Mutex<Phase2Reader>,

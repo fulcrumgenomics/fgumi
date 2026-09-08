@@ -41,6 +41,9 @@ docs/src/SUMMARY.md
 docs/src/tools/
 docs/src/metrics/
 
+# Design docs / specs are not tracked in-tree
+docs/design/
+
 # Benchmark data
 /tmp/
 

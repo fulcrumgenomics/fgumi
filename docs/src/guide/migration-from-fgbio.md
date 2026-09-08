@@ -109,8 +109,7 @@ The two tools agree on the overall numbering scheme:
 They diverge only on *which* integer a molecule within a single coordinate cluster receives,
 because the within-cluster numbering order differs (fgumi uses deterministic sorted orders; fgbio
 uses Scala hash-bucket iteration order, which can also shift across Scala/JVM versions). Both are
-deterministic per tool version — fgumi even under `--threads N > 1`. See
-`docs/design/deterministic-mi-numbering.md` for the per-strategy specifics.
+deterministic per tool version — fgumi even under `--threads N > 1`.
 
 Because downstream consensus callers derive read names from the input `MI` base (e.g.
 `<prefix>:<mi_base>`), comparing two pipelines' consensus BAMs by read name or raw `MI` will

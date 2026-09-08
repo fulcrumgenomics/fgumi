@@ -27,8 +27,8 @@
 //! monotonic counter. Ordinals form a contiguous `0, 1, 2, …` sequence
 //! so the downstream `ReorderStage` can release batches in
 //! input-record order — required for the `Serial` `MiAssign` step to
-//! produce deterministic MI numbering across runs (matches legacy
-//! `docs/design/deterministic-mi-numbering.md`).
+//! produce deterministic MI numbering across runs (matching legacy
+//! fgbio's per-strategy numbering behavior).
 //!
 //! ## Batch sizing
 //!
