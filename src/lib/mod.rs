@@ -127,6 +127,7 @@
 //! - [noodles](https://github.com/zaeleus/noodles) - Rust bioinformatics I/O
 
 pub mod aligner;
+pub mod batch_weight;
 pub mod commands;
 pub mod version;
 pub use fgumi_bgzf::reader as bgzf_reader;
@@ -152,6 +153,7 @@ pub mod read_structure;
 pub mod reference;
 pub use fgumi_metrics::rejection;
 pub mod sam;
+pub mod scheduler_strategy;
 pub mod system;
 pub mod tag_reversal;
 pub mod template;
