@@ -985,7 +985,7 @@ fn required_z_tag(record: &RawRecord, tag: impl AsTagBytes, read_name: &str) -> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags as raw_flags, testutil::encode_op};
     use noodles::bam;
@@ -995,7 +995,7 @@ mod tests {
     use std::num::NonZeroUsize;
     use tempfile::NamedTempFile;
 
-    fn test_header() -> sam::Header {
+    pub(crate) fn test_header() -> sam::Header {
         use noodles::sam::header::record::value::Map;
         use noodles::sam::header::record::value::map::ReferenceSequence;
         sam::Header::builder()
@@ -1011,7 +1011,7 @@ mod tests {
     }
 
     /// Build an R1/R2 pair with independent refs/positions for each mate.
-    fn build_pair(
+    pub(crate) fn build_pair(
         name: &str,
         r1_ref: i32,
         r1_pos: i32,

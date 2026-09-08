@@ -38,6 +38,7 @@ use crate::commands::shared_metrics::{
 };
 use crate::mi_group::MiGroup;
 use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
+use crate::template::Template;
 use anyhow::Result;
 use fgumi_bam_io::LibraryIndex;
 use fgumi_metrics::duplex::DuplexMetricsCollector;
@@ -304,6 +305,38 @@ pub(crate) fn push_mi_group_entries(
     Ok(())
 }
 
+/// Converts a fused position group's `Template`s into `TemplateInfo`s, the
+/// shape `ConsensusMetricsAccumulator::record_coordinate_group` consumes.
+/// This is the T1 (fused/runall) adapter — zero cross-batch risk, because
+/// `chains/commands/group.rs`'s per-position closure only ever sees a whole,
+/// already-complete position group (`GroupByPosition` only batches whole
+/// `RawPositionGroup`s, `src/lib/pipeline/steps/group/position.rs`).
+///
+/// A template that fails to produce a `TemplateInfo` (missing R1 or R2, an
+/// unmapped reference, or no CIGAR) is silently omitted, matching
+/// `process_templates_from_bam`'s own behavior for the same cases.
+///
+/// # Errors
+///
+/// Returns an error if a qualifying R1/R2 pair is missing a required `MI`/`RX`
+/// tag (propagated from [`build_template_info`]).
+pub(crate) fn coordinate_group_from_processed_position(
+    templates: &[Template],
+    header: &noodles::sam::Header,
+    library_index: &LibraryIndex,
+) -> Result<Vec<TemplateInfo>> {
+    let mut infos = Vec::with_capacity(templates.len());
+    for template in templates {
+        let (Some(r1), Some(r2)) = (template.r1(), template.r2()) else {
+            continue;
+        };
+        if let Some((info, _key)) = build_template_info(r1, r2, header, library_index)? {
+            infos.push(info);
+        }
+    }
+    Ok(infos)
+}
+
 /// `T2` standalone-consensus reducer: owns ONE un-sharded
 /// `ConsensusMetricsAccumulator`, buffers consecutive same-`ReadInfoKey`
 /// entries across fragments, and flushes a coordinate group into the
@@ -495,6 +528,66 @@ mod coordinate_group_fragment_tests {
     fn coordinate_group_fragment_ordinal_is_its_batch_serial() {
         let fragment = CoordinateGroupFragment { batch_serial: 7, entries: vec![] };
         assert_eq!(fragment.ordinal(), 7);
+    }
+}
+
+#[cfg(test)]
+mod coordinate_group_from_processed_position_tests {
+    use super::*;
+
+    /// Builds a two-record `Template` (R1 + R2) from a `shared_metrics::tests::build_pair`
+    /// pair, going through the same raw-record encode path production code uses
+    /// (`encode_record_buf_to_raw`), then `Template::from_records` — the real
+    /// constructor (`template.rs` has no `Builder` type).
+    fn template_from_pair(name: &str, header: &noodles::sam::Header, mi: &str) -> Template {
+        let (r1_buf, r2_buf) =
+            crate::commands::shared_metrics::tests::build_pair(name, 0, 100, 0, 150, mi);
+        let r1 = fgumi_raw_bam::encode_record_buf_to_raw(&r1_buf, header).expect("encode r1");
+        let r2 = fgumi_raw_bam::encode_record_buf_to_raw(&r2_buf, header).expect("encode r2");
+        Template::from_records(vec![r1, r2]).expect("builds template")
+    }
+
+    #[test]
+    fn coordinate_group_from_processed_position_converts_every_paired_template() {
+        let header = crate::commands::shared_metrics::tests::test_header();
+        let template1 = template_from_pair("t1", &header, "0");
+        let template2 = template_from_pair("t2", &header, "1");
+
+        let library_index = LibraryIndex::from_header(&header);
+        let infos = coordinate_group_from_processed_position(
+            &[template1, template2],
+            &header,
+            &library_index,
+        )
+        .expect("converts");
+
+        assert_eq!(infos.len(), 2);
+        let mis: Vec<&str> = infos.iter().map(|info| info.mi.as_str()).collect();
+        assert_eq!(mis, vec!["0", "1"], "each Template's MI tag must survive the conversion");
+    }
+
+    #[test]
+    fn coordinate_group_from_processed_position_omits_a_template_missing_r2() {
+        let header = crate::commands::shared_metrics::tests::test_header();
+        let (r1_buf, _r2_buf) =
+            crate::commands::shared_metrics::tests::build_pair("unpaired", 0, 100, 0, 150, "0");
+        let r1 = fgumi_raw_bam::encode_record_buf_to_raw(&r1_buf, &header).expect("encode r1");
+        let template = Template::from_records(vec![r1]).expect("builds R1-only template");
+
+        let library_index = LibraryIndex::from_header(&header);
+        let infos = coordinate_group_from_processed_position(&[template], &header, &library_index)
+            .expect("converts");
+
+        assert!(infos.is_empty(), "a template missing R2 must be silently omitted");
+    }
+
+    #[test]
+    fn coordinate_group_from_processed_position_handles_an_empty_group() {
+        let header = crate::commands::shared_metrics::tests::test_header();
+        let library_index = LibraryIndex::from_header(&header);
+        let infos = coordinate_group_from_processed_position(&[], &header, &library_index)
+            .expect("converts");
+        assert!(infos.is_empty());
     }
 }
 
