@@ -503,6 +503,23 @@ pub struct Sort {
     /// (default `pipeline-trace.tsv` in the working directory).
     #[arg(long = "pipeline-trace-out", hide = true)]
     pub pipeline_trace_out: Option<std::path::PathBuf>,
+
+    /// Raw spill blocks claimed per reader-lock acquisition during Phase-2
+    /// spill-merge decompression (chain-engine `MAX_BATCH_PER_CALL`). A "block"
+    /// is one BGZF block or one zstd frame, depending on `--temp-codec`.
+    ///
+    /// Hidden expert knob for fleet/benchmark tuning; defaults to the engine's 4.
+    /// Wired to [`SortOptions::block_batch`] via [`Self::to_sort_options`].
+    #[arg(long = "block-batch", default_value_t = 4usize, hide = true)]
+    pub block_batch: usize,
+
+    /// Spill at file rather than block granularity (chain-engine knob).
+    ///
+    /// Hidden expert knob for fleet/benchmark tuning; defaults to `false`
+    /// (block-parallel). Wired to [`SortOptions::file_granularity`] via
+    /// [`Self::to_sort_options`].
+    #[arg(long = "file-granularity", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true, hide = true)]
+    pub file_granularity: bool,
 }
 
 /// Sort-stage tuning, projected out of the [`Sort`] CLI struct for the chain
@@ -510,10 +527,12 @@ pub struct Sort {
 /// [`crate::pipeline::chains::StageOptionsBag`] rather than from `Sort`
 /// directly).
 ///
-/// `block_batch` and `file_granularity` are chain-engine knobs that `Sort`
-/// does not yet expose as CLI flags; until the sort command is rewired onto the
-/// chain they take the engine defaults (`block_batch = 4`, the original
-/// `MAX_BATCH_PER_CALL`; `file_granularity = false`, block-parallel).
+/// `block_batch` and `file_granularity` are chain-engine knobs. The standalone
+/// `Sort` command exposes them as the hidden `--block-batch` / `--file-granularity`
+/// flags and projects them here via [`Sort::to_sort_options`]; on the flattened
+/// (`runall`) path they are not surfaced and take the engine defaults
+/// (`block_batch = 4`, the original `MAX_BATCH_PER_CALL`; `file_granularity = false`,
+/// block-parallel).
 #[fgumi_cli_macros::multi_options("sort", "Sort Options")]
 #[derive(Debug, Clone, clap::Args)]
 #[allow(clippy::struct_excessive_bools)]
@@ -675,10 +694,16 @@ pub struct SortOptions {
     #[arg(long = "max-temp-files", default_value = "auto", value_parser = parse_max_temp_files)]
     pub max_temp_files: MaxTempFiles,
 
-    /// Records batched per parallel sort call (chain engine; not a CLI flag).
+    /// Raw spill blocks claimed per reader-lock acquisition during Phase-2
+    /// spill-merge decompression (a BGZF block or zstd frame per `--temp-codec`).
+    /// Not a flag on this struct; populated from the standalone command's hidden
+    /// `--block-batch` (see [`Sort::to_sort_options`]), and the engine default on
+    /// the `runall` path.
     #[arg(skip = 4usize)]
     pub block_batch: usize,
-    /// Spill at file rather than block granularity (chain engine; not a CLI flag).
+    /// Spill at file rather than block granularity (chain engine). Not a flag on
+    /// this struct; populated from the standalone command's hidden
+    /// `--file-granularity` (see [`Sort::to_sort_options`]), engine default on `runall`.
     #[arg(skip)]
     pub file_granularity: bool,
     /// Emit the sort's performance diagnostics (`--sort-stats`).
@@ -763,9 +788,10 @@ impl Sort {
             temp_compression: self.temp_compression,
             temp_codec: self.temp_codec,
             max_temp_files: self.max_temp_files,
-            // Chain-engine defaults (see `SortOptions` docs) — not yet CLI flags.
-            block_batch: 4,
-            file_granularity: false,
+            // Chain-engine knobs, exposed as hidden `--block-batch` /
+            // `--file-granularity` flags on the standalone `sort` command.
+            block_batch: self.block_batch,
+            file_granularity: self.file_granularity,
             sort_stats: self.sort_stats,
         }
     }
@@ -1517,6 +1543,79 @@ mod tests {
         assert_eq!(sort.merge_threads, expected_merge);
     }
 
+    /// `--block-batch` is a hidden chain-engine knob (raw spill blocks claimed
+    /// per reader-lock acquisition during Phase-2 decompression). It must parse
+    /// and reach the command struct, defaulting to 4 (the engine
+    /// `MAX_BATCH_PER_CALL`) when the flag is omitted.
+    #[rstest]
+    #[case::default_omitted(&[], 4)]
+    #[case::explicit_override(&["--block-batch", "8"], 8)]
+    #[case::explicit_one(&["--block-batch", "1"], 1)]
+    fn test_parse_block_batch(#[case] extra: &[&str], #[case] expected: usize) {
+        let base = ["sort", "-i", "in.bam", "-o", "out.bam", "--order", "coordinate"];
+        let args: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
+        let sort = Sort::try_parse_from(args).expect("parse should succeed");
+        assert_eq!(sort.block_batch, expected);
+    }
+
+    /// `--file-granularity` is a hidden chain-engine knob (spill at file rather
+    /// than block granularity). It must parse and reach the command struct,
+    /// defaulting to `false` (block-parallel) when the flag is omitted.
+    #[rstest]
+    #[case::default_omitted(&[], false)]
+    #[case::bare_flag(&["--file-granularity"], true)]
+    #[case::explicit_true(&["--file-granularity", "true"], true)]
+    #[case::explicit_false(&["--file-granularity", "false"], false)]
+    fn test_parse_file_granularity(#[case] extra: &[&str], #[case] expected: bool) {
+        let base = ["sort", "-i", "in.bam", "-o", "out.bam", "--order", "coordinate"];
+        let args: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
+        let sort = Sort::try_parse_from(args).expect("parse should succeed");
+        assert_eq!(sort.file_granularity, expected);
+    }
+
+    /// The hidden `--block-batch` / `--file-granularity` flags must reach the
+    /// engine through `to_sort_options`, not be dropped back to hardcoded
+    /// defaults (the bug that would make the flags silently no-ops).
+    #[rstest]
+    #[case::defaults(&[], 4, false)]
+    #[case::overrides(&["--block-batch", "16", "--file-granularity", "true"], 16, true)]
+    fn test_to_sort_options_carries_chain_engine_knobs(
+        #[case] extra: &[&str],
+        #[case] expected_batch: usize,
+        #[case] expected_granularity: bool,
+    ) {
+        let base = ["sort", "-i", "in.bam", "-o", "out.bam", "--order", "coordinate"];
+        let args: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
+        let sort = Sort::try_parse_from(args).expect("parse should succeed");
+        let opts = sort.to_sort_options();
+        assert_eq!(opts.block_batch, expected_batch);
+        assert_eq!(opts.file_granularity, expected_granularity);
+    }
+
+    /// Both chain-engine knobs are exposed for fleet/benchmark tuning but must
+    /// stay hidden from `--help` (they are expert overrides, not everyday flags).
+    #[rstest]
+    #[case::block_batch("block-batch")]
+    #[case::file_granularity("file-granularity")]
+    fn test_chain_engine_flags_are_hidden(#[case] flag: &str) {
+        use clap::CommandFactory;
+        let command = Sort::command();
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some(flag))
+            .unwrap_or_else(|| panic!("--{flag} should be a defined argument"));
+        assert!(arg.is_hide_set(), "--{flag} should be hidden from --help");
+
+        // `is_hide_set()` only inspects clap metadata; assert the flag is also
+        // absent from the actually-rendered help, so a future change that
+        // surfaces it (e.g. dropping `hide = true`) fails here regardless.
+        let help = Sort::command().render_long_help().to_string();
+        assert!(
+            !help.contains(&format!("--{flag}")),
+            "--{flag} must not appear in generated `fgumi sort` help"
+        );
+    }
+
     /// The single `--max-memory` knob must drive the pipeline's queue budget too,
     /// not just the sorter buffer. The helper projects the command's three memory
     /// flags 1:1 onto `QueueMemoryOptions`, so a run's queue budget agrees with its
@@ -1750,6 +1849,42 @@ mod tests {
             err.to_string().contains("invalid instrumentation level"),
             "expected the FromStr error to name the invalid level; got: {err}"
         );
+    }
+
+    /// The hidden `--block-batch` / `--file-granularity` overrides must survive
+    /// into the built `ChainSpec`, not just into `to_sort_options`. `add_sort`
+    /// reads `spec.stage_opts.sort` to build the `SortDecompressTuning`, so
+    /// reverting `build_sort_chain_spec` to bake the engine defaults after the
+    /// projection would leave the parse/`to_sort_options` tests green while the
+    /// flags silently do nothing. Assert on the built spec directly.
+    #[test]
+    fn build_sort_chain_spec_carries_chain_engine_knob_overrides() {
+        let sort = Sort::try_parse_from([
+            "sort",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--order",
+            "coordinate",
+            "--block-batch",
+            "16",
+            "--file-granularity",
+            "true",
+        ])
+        .expect("parse should succeed");
+
+        let resolved_max_temp_files = sort.resolved_max_temp_files(fgumi_sort::soft_nofile());
+        let spec = sort.build_sort_chain_spec(
+            Path::new("out.bam"),
+            Vec::new(),
+            resolved_max_temp_files,
+            "fgumi sort (test)",
+        );
+
+        let bag_sort = spec.stage_opts.sort.as_ref().expect("sort options must be set");
+        assert_eq!(bag_sort.block_batch, 16, "--block-batch must reach the chain spec");
+        assert!(bag_sort.file_granularity, "--file-granularity must reach the chain spec");
     }
 
     /// The sorter-free phase thread helpers `Sort::phase1_threads` /
@@ -2229,6 +2364,8 @@ mod tests {
             pipeline_stats: false,
             pipeline_trace: InstrumentationLevel::Off,
             pipeline_trace_out: None,
+            block_batch: 4,
+            file_granularity: false,
         }
     }
 

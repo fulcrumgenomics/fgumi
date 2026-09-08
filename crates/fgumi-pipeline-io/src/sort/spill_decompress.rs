@@ -86,7 +86,8 @@ pub struct SortDecompressTuning {
     /// formerly-hardcoded batch size). Default `4` (restores the original
     /// `MAX_BATCH_PER_CALL`; a fleet decompress-throughput bench will pick the
     /// final value). Must be `>= 1`; [`SortSpillDecompress::new`] clamps lower
-    /// values and the CLI rejects them.
+    /// values (the single construction chokepoint, so every entry point —
+    /// standalone `--block-batch`, `runall`, direct construction — is defended).
     pub block_batch: usize,
 }
 
