@@ -1051,6 +1051,29 @@ pub struct AllowUnmappedOptions {
     pub enabled: bool,
 }
 
+/// Override for the chain-builder pool dispatch scheduler.
+///
+/// The chain engine normally chooses the pool's step-walk direction per chain:
+/// drain-bound shapes (terminal `group`/`dedup`, and a BAM `sort` source) run
+/// downstream-first (`DrainFirstScheduler`), everything else runs upstream-first
+/// (`ChainOrderScheduler`). This hidden override forces one choice regardless, so
+/// the tuning can be A/B-benchmarked on any command from a single binary without
+/// a rebuild. `Auto` is the default and changes nothing.
+///
+/// The value names match the scheduler names surfaced in `--pipeline-stats`
+/// (`drain-first` / `chain-order`), so a benchmark can correlate the flag with
+/// what actually ran.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum PoolScheduler {
+    /// Use the automatic per-chain decision (the default; no override).
+    #[default]
+    Auto,
+    /// Force downstream-first dispatch (`DrainFirstScheduler`) on every chain.
+    DrainFirst,
+    /// Force upstream-first dispatch (`ChainOrderScheduler`) on every chain.
+    ChainOrder,
+}
+
 /// Options for pipeline scheduler configuration.
 ///
 /// Controls which scheduling strategy is used for thread work assignment
@@ -1067,6 +1090,17 @@ pub struct SchedulerOptions {
     ///   Thread 0 prioritizes reading, Thread N-1 prioritizes writing.
     #[arg(long = "scheduler", value_enum, default_value_t = SchedulerStrategy::default(), hide = true)]
     pub scheduler: SchedulerStrategy,
+
+    /// Override for the chain-builder pool dispatch scheduler (hidden; A/B knob).
+    ///
+    /// `auto` (default) uses the automatic per-chain decision; `drain-first` and
+    /// `chain-order` force one dispatch direction on every chain, for
+    /// benchmarking the tuning without a rebuild. When it overrides the automatic
+    /// choice, `ChainBuilder::build` logs a warning so a benchmark records that a
+    /// non-default scheduler ran. Unlike the legacy `--scheduler` strategy, this
+    /// IS consumed by the typed-step chain engine.
+    #[arg(long = "pool-scheduler", value_enum, default_value_t = PoolScheduler::Auto, hide = true)]
+    pub pool_scheduler: PoolScheduler,
 
     /// Print detailed pipeline statistics at completion.
     ///
@@ -1114,6 +1148,13 @@ impl SchedulerOptions {
     #[must_use]
     pub fn strategy(&self) -> SchedulerStrategy {
         self.scheduler
+    }
+
+    /// Returns the pool-dispatch scheduler override (`Auto` unless the hidden
+    /// `--pool-scheduler` flag was set). Consumed by `ChainBuilder::build`.
+    #[must_use]
+    pub fn pool_scheduler(&self) -> PoolScheduler {
+        self.pool_scheduler
     }
 
     /// Returns true if pipeline stats should be collected and printed.
@@ -2750,6 +2791,7 @@ mod tests {
     fn test_scheduler_options_strategy() {
         let opts = SchedulerOptions {
             scheduler: SchedulerStrategy::FixedPriority,
+            pool_scheduler: PoolScheduler::Auto,
             pipeline_stats: false,
             pipeline_trace: InstrumentationLevel::Off,
             pipeline_trace_out: None,
@@ -2766,6 +2808,7 @@ mod tests {
             pipeline_stats: true,
             pipeline_trace: InstrumentationLevel::Off,
             pipeline_trace_out: None,
+            pool_scheduler: PoolScheduler::Auto,
             deadlock_timeout: 10,
             deadlock_recover: false,
         };
@@ -2780,6 +2823,7 @@ mod tests {
             pipeline_trace: InstrumentationLevel::Off,
             pipeline_trace_out: None,
             deadlock_timeout: 30,
+            pool_scheduler: PoolScheduler::Auto,
             deadlock_recover: false,
         };
         assert_eq!(opts.deadlock_timeout_secs(), 30);
@@ -2794,6 +2838,7 @@ mod tests {
             pipeline_trace_out: None,
             deadlock_timeout: 10,
             deadlock_recover: true,
+            pool_scheduler: PoolScheduler::Auto,
         };
         assert!(opts.deadlock_recover_enabled());
     }
