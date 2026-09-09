@@ -26,17 +26,17 @@ For memory-constrained environments, pass `--max-memory auto` to detect (cgroup-
 
 ### No-flag Fast Path (default)
 - **Usage**: Omit `--threads` entirely
-- **Behavior**: Uses optimized single-threaded fast path with minimal overhead
+- **Behavior**: Command-dependent. Commands that special-case `ThreadingMode::SingleThreaded` run an optimized fast path with minimal pipeline overhead; others (e.g. `correct`) always run the declarative chain and simply execute it with a single worker. Either way, omitting `--threads` never runs more than one worker.
 - **Best for**: Small files, memory-constrained systems, debugging
 
 ### Explicit Single-threaded Mode
 - **Usage**: `--threads 1`
-- **Behavior**: Uses the unified pipeline with a single worker thread — same pipeline as `--threads N` but with N=1; does **not** use the no-flag fast path
+- **Behavior**: Uses the chain pipeline with a single worker thread — same pipeline as `--threads N` but with N=1; does **not** use the no-flag fast path
 - **Best for**: Isolating pipeline behavior in a single-threaded context
 
 ### Multi-threaded Mode
 - **Usage**: `--threads N` where N > 1
-- **Behavior**: Uses unified 7-step pipeline with work-stealing scheduler
+- **Behavior**: Uses the declarative chain pipeline with N worker threads (the same engine as `--threads 1`, scaled out); the legacy `--scheduler` flag is inert on the chain — it selects no dispatch policy
 - **Best for**: Large files, high-performance systems, production workloads
 
 ## Memory Management
@@ -295,21 +295,17 @@ fgumi sort --sort-stats --input reads.bam --output sorted.bam
 
 `fgumi sort` runs through the same shared `ChainBuilder` pipeline as every other command, but it carries a dedicated `--sort-stats` flag instead of `--pipeline-stats` for its own merge-loop diagnostic. Whenever the k-way merge runs -- any sort that spills, or a no-spill sort that still holds more than one in-memory chunk -- it prints a single `Sort merge diag: stalls=... contention=... output_full=... progress_dispatches=...` line reporting merge-loop stalls (waiting on decompress), contention (dispatches that produced nothing), and output backpressure. Only when the sort spills nothing *and* fits in a single in-memory chunk does no k-way merge run; there it instead prints one `Sort fast-path diag: ...` line noting the single-chunk in-memory fast path was taken. Off by default; it is instrumentation for performance work, read from a log with a `grep`.
 
-### Scheduler Strategy
+### Scheduler Strategy (legacy, inert)
 
-```bash
-fgumi group --scheduler balanced-chase-drain --input reads.bam --output grouped.bam
-```
+The `--scheduler` flag selects a legacy scheduler strategy that the typed-step chain engine does **not** consume, so it has no effect on any chain-backed command. It is retained for backward compatibility only; setting it to a non-default value logs a warning that the requested strategy is ignored. The strategy names still parse, and the common ones once meant:
 
-Controls which scheduling strategy threads use for work assignment. The default (`balanced-chase-drain`) is recommended for most workloads. Available strategies:
-
-| Strategy | Description |
-|----------|-------------|
+| Strategy | Former behavior |
+|----------|-----------------|
 | `balanced-chase-drain` | Default. Balanced work distribution with output drain mode. |
 | `fixed-priority` | Static thread roles (reader, writer, workers). Simple baseline. |
 | `chase-bottleneck` | Threads dynamically follow work through the pipeline. |
 
-Other experimental strategies are available (`thompson-sampling`, `ucb`, `epsilon-greedy`, etc.) but are not recommended for production use.
+Additional legacy strategy names (`thompson-sampling`, `ucb`, `epsilon-greedy`, and others) also parse but are equally inert.
 
 ### Deadlock Detection
 

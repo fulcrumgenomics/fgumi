@@ -372,8 +372,8 @@ impl Step2 for PairRawFastq {
 /// mid-stream fail-fast — so those two sites surface byte-for-byte identical
 /// diagnostics within this step. That guarantee is scoped to this file: it does
 /// NOT extend to the other FASTQ-pairing implementations (the serial oracle in
-/// `grouper.rs`, the zip path in `zip_fastq.rs` / `parse_zip_fastq.rs`, and the
-/// unified-pipeline path in `unified_pipeline/fastq.rs`). Every path detects the
+/// `grouper.rs`, and the zip path in `zip_fastq.rs` / `parse_zip_fastq.rs`).
+/// Every path detects the
 /// same out-of-sync CONDITION — one stream's records running out before its
 /// mate's — but each words its own diagnostic independently, so the exact
 /// message text differs by path.

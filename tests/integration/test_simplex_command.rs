@@ -399,12 +399,10 @@ fn test_simplex_command_collapses_read_group_attributes() {
 /// Verifies that the rejects BAM advertises the **input** header (RGs included),
 /// while the primary output BAM advertises the **consensus** header (RGs collapsed).
 ///
-/// This is the end-to-end check for the `secondary_output_header` parameter on
-/// [`run_bam_pipeline_from_reader_with_secondary`][rbprws]. A regression where a
-/// caller accidentally passes the primary `output_header` (consensus header) for
-/// the secondary would collapse rejects' RGs to "A" — this test catches that.
-///
-/// [rbprws]: fgumi_lib::unified_pipeline::run_bam_pipeline_from_reader_with_secondary
+/// This is the end-to-end check for the secondary reject-output header (the
+/// chain's separate rejects sink). A regression where a caller accidentally
+/// passes the primary `output_header` (consensus header) for the secondary
+/// would collapse rejects' RGs to "A" — this test catches that.
 #[test]
 fn test_simplex_command_rejects_inherits_input_read_groups() {
     let temp_dir = TempDir::new().unwrap();

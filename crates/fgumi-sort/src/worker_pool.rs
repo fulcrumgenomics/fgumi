@@ -271,7 +271,7 @@ const SORT_MAX_THREADS: usize = 32;
 
 /// Comprehensive instrumentation for sort pipeline worker pool.
 ///
-/// Modeled on `PipelineStats` from the unified pipeline but tailored to sort's
+/// Modeled on `PipelineStats` from the legacy pipeline but tailored to sort's
 /// step set. All fields are `AtomicU64` for lock-free updates from workers.
 pub(crate) struct SortPipelineStats {
     // Per-step timing (nanoseconds) — indexed by SortStep as usize
@@ -1709,7 +1709,7 @@ fn get_sort_priorities(bp: &SortBackpressureState) -> &'static [SortStep] {
 }
 
 // ============================================================================
-// Backoff (ported from unified pipeline base.rs)
+// Backoff (ported from the legacy pipeline base.rs)
 // ============================================================================
 
 /// Minimum backoff duration in microseconds.
@@ -1771,7 +1771,7 @@ fn jittered_wait_micros(backoff_us: u64, worker_id: usize, iter: u64) -> u64 {
 }
 
 // ============================================================================
-// Held-Item Helpers (ported from unified pipeline)
+// Held-Item Helpers (ported from the legacy pipeline)
 // ============================================================================
 
 /// Try to advance a held item to its output `ArrayQueue`.
@@ -1953,7 +1953,7 @@ impl SortWorkerPool {
 
     /// The main worker loop — phase-aware, non-blocking, with held-item pattern.
     ///
-    /// Follows the unified pipeline's `generic_worker_loop` pattern exactly:
+    /// Follows the legacy pipeline's `generic_worker_loop` pattern exactly:
     /// 1. Check shutdown
     /// 2. Check completion (safe exit requires no held items)
     /// 3. Try to advance ALL held items first (deadlock prevention)
@@ -2067,7 +2067,7 @@ impl SortWorkerPool {
                 }
             }
 
-            // 7. Backoff with jitter (ported from unified pipeline)
+            // 7. Backoff with jitter (ported from the legacy pipeline)
             if did_work {
                 // The wait that preceded this step was slept *through* work
                 // becoming available, so the work may have arrived at any point

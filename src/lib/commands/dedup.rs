@@ -21,6 +21,7 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
+use crate::batch_weight::BatchWeight;
 use crate::grouper::{RawPositionGroup, build_templates_from_records};
 use crate::metrics::group::FamilySizeMetrics;
 use crate::metrics::{DeduplicationCounts, DeduplicationMetrics, DuplicationLadderMetrics};
@@ -32,11 +33,11 @@ use crate::template_filter::{
     TemplateFilterConfig, filter_template, template_has_malformed_record,
     template_is_fully_unmapped,
 };
-use crate::unified_pipeline::{BatchWeight, MemoryEstimate};
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
+use fgumi_bam_io::MemoryEstimate;
 use fgumi_umi::IndexThreshold;
 
 use log::info;
@@ -1371,8 +1372,8 @@ impl Command for MarkDuplicates {
         // above (output collisions, strategy/min-umi combos, index-threshold,
         // input existence); `execute_chain` opens its own source and re-emits
         // the timer, banner (Starting/Input/Output/Strategy/Edits/etc.), and
-        // threading log lines via `add_dedup`. One line the retired
-        // `unified_pipeline` path logged and `add_dedup` does not is
+        // threading log lines via `add_dedup`. One line the retired legacy
+        // multi-thread engine logged and `add_dedup` does not is
         // `Scheduler: <strategy>` — the chain has no equivalent per-pipeline
         // scheduler-strategy diagnostic; this is a pre-existing chain gap
         // (already true of every other `--threads N` dedup run before this
@@ -3734,7 +3735,7 @@ mod tests {
     /// on "the cache is actually consulted, not silently bypassed".
     #[test]
     fn test_assign_umi_groups_reads_the_cache_not_a_rescan_after_reorder() {
-        use crate::unified_pipeline::{DecodedRecord, GroupKey};
+        use fgumi_bam_io::{DecodedRecord, GroupKey};
 
         let (raw_a, decoy_offset_a) = build_record_with_decoy_before_rx(b"polyA1", b"AAAAAAAA");
         let (raw_b, decoy_offset_b) = build_record_with_decoy_before_rx(b"polyA2", b"CCCCCCCC");

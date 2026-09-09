@@ -9,7 +9,7 @@
 //!   everything fits under `--max-memory`, a k-way merge when it does not — and
 //!   `--write-index` selects a third that needs a seekable file and so cannot be
 //!   satisfied by a pipe at all.
-//! - `extract` writes through the unified pipeline when `--threads` makes it
+//! - `extract` writes through the chain when `--threads` makes it
 //!   parallel and through a plain raw-BAM writer when it does not. Only one of
 //!   those two used to reach stdout, which made the bug depend on a flag that has
 //!   nothing to do with where the output goes.
@@ -422,7 +422,7 @@ fn rejects_secondary_output_on_the_output_file(#[case] command: &[&str], #[case]
 /// `extract` reaches stdout whether or not `--threads` makes it parallel.
 ///
 /// The two cases select different writers — a plain raw-BAM writer when the flag
-/// is absent, the unified pipeline when it is present — so `-o -` streamed for a
+/// is absent, the chain when it is present — so `-o -` streamed for a
 /// bare `fgumi extract` and silently wrote a file named `-` once `--threads` was
 /// given. A user has no reason to expect where their output lands to depend on
 /// how many threads they asked for.

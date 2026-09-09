@@ -16,7 +16,6 @@ use crate::pipeline::backpressure::{
     BACKPRESSURE_THRESHOLD_BYTES, Q5_BACKPRESSURE_THRESHOLD_BYTES, stage_high_water_mark,
 };
 use crate::scheduler_strategy::SchedulerStrategy;
-use crate::unified_pipeline::BamPipelineConfig;
 use crate::validation::validate_input_exists;
 use bytesize::ByteSize;
 use clap::Args;
@@ -464,7 +463,7 @@ pub struct BamIoOptions {
     /// exclusive with `--no-check-crc`. Honored on every command's input decode,
     /// in both single- and multi-threaded modes: single-threaded decodes route
     /// through fgumi-bgzf, and `--threads N` runs (e.g. `clip --threads N`) decode
-    /// through the unified pipeline, which takes its CRC policy from the same
+    /// through the chain pipeline, which takes its CRC policy from the same
     /// flag. Every run logs a `CRC verify:` line at startup stating what actually
     /// happened.
     #[arg(long = "check-crc", default_value_t = false, conflicts_with = "no_check_crc")]
@@ -1074,20 +1073,25 @@ pub enum PoolScheduler {
     ChainOrder,
 }
 
-/// Options for pipeline scheduler configuration.
+/// Options backing the legacy, now-inert `--scheduler` flag.
 ///
-/// Controls which scheduling strategy is used for thread work assignment
-/// in the unified pipeline. Also controls pipeline statistics output.
+/// The chain engine does not consume the scheduler strategy — it no longer
+/// assigns thread work from this setting — so the flag is retained only for
+/// backward compatibility (`warn_unwired_pipeline_flags` warns when it is set).
+/// Also carries the pipeline-statistics output flag.
 #[derive(Debug, Clone, Default, Args)]
 pub struct SchedulerOptions {
-    /// Scheduler strategy for thread work assignment.
+    /// Inert scheduler strategy (see [`SchedulerStrategy`]); the chain engine
+    /// does not use it to assign thread work. Retained for backward
+    /// compatibility only — the values below describe what each once meant to
+    /// the removed legacy engine:
     ///
-    /// - `chase-bottleneck` (default): Threads dynamically follow work through
-    ///   the pipeline, moving downstream when output is blocked and upstream
-    ///   when input is empty. Shows ~10% improvement at medium thread counts.
+    /// - `chase-bottleneck` (default): threads followed work through the
+    ///   pipeline, moving downstream when output was blocked and upstream when
+    ///   input was empty (~10% improvement at medium thread counts).
     ///
-    /// - `fixed-priority`: Assigns fixed thread roles (reader, writer, workers).
-    ///   Thread 0 prioritizes reading, Thread N-1 prioritizes writing.
+    /// - `fixed-priority`: fixed thread roles (reader, writer, workers) —
+    ///   thread 0 prioritized reading, thread N-1 prioritized writing.
     #[arg(long = "scheduler", value_enum, default_value_t = SchedulerStrategy::default(), hide = true)]
     pub scheduler: SchedulerStrategy,
 
@@ -1589,19 +1593,16 @@ fn resolve_memory_budget_with_total(
 /// a hard RSS cap — a single pathological position group is still processed
 /// whole, and each worker has transient working-set memory on top of the queue.
 ///
-/// Both pipelines enforce the budget at the Read step: they stop admitting
-/// input once the bytes queued between their stages reach it, so a slow or
-/// contended output device backs pressure up to the reader instead of filling
-/// every queue to its slot count. See `BamPipelineState::read_admission_allowed`
-/// and `FastqPipelineState::read_admission_allowed`.
+/// The chain enforces the budget at the Read step: it stops admitting input
+/// once the bytes queued between stages reach it, so a slow or contended output
+/// device backs pressure up to the reader instead of filling every queue to its
+/// slot count.
 ///
-/// Memory held *outside* those aggregates is not covered: a worker's
-/// in-progress batch is bounded by the thread count rather than by this budget.
-/// The write reorder buffers, by contrast, *are* summed into the aggregates
-/// (the FASTQ aggregate counts its write reorder state and the BAM aggregate its
-/// input and write reorder states), so this budget bounds them through the Read
-/// gate; they additionally apply their own threshold, capped at
-/// [`BACKPRESSURE_THRESHOLD_BYTES`].
+/// Memory held *outside* that aggregate is not covered: a worker's in-progress
+/// batch is bounded by the thread count rather than by this budget. The write
+/// reorder buffers, by contrast, *are* summed into the aggregate, so this budget
+/// bounds them through the Read gate; they additionally apply their own
+/// threshold, capped at [`BACKPRESSURE_THRESHOLD_BYTES`].
 ///
 /// The budget is a **total**, and it is not the same thing as what any one stage
 /// may hold. Stages back off at their own high-water marks —
@@ -1831,43 +1832,6 @@ pub(crate) fn is_r1_genomically_earlier_raw(r1: &[u8], r2: &[u8]) -> bool {
 pub(crate) use crate::system::detect_total_memory;
 pub use crate::validation::parse_memory_size;
 
-/// Builds a [`BamPipelineConfig`] from the common CLI option structs.
-///
-/// This consolidates the pipeline configuration boilerplate that is repeated
-/// across all multi-threaded commands: auto-tuning, scheduler strategy,
-/// stats collection, deadlock settings, queue memory limits, and the
-/// `--check-crc`/`--no-check-crc` CRC-verification policy (`io`).
-/// Centralizing `verify_crc` here (rather than each command setting
-/// `config.pipeline.verify_crc` individually after calling this) means every
-/// pipeline-backed command is guaranteed to populate it from
-/// [`BamIoOptions::effective_check_crc`] — a command that builds a
-/// `PipelineConfig` without going through here can't silently leave
-/// `verify_crc` at its default and log a setting it doesn't actually apply.
-///
-/// After calling this, commands can further customize the returned config
-/// (e.g. setting `group_key_config` for raw-byte mode).
-pub fn build_pipeline_config(
-    scheduler_opts: &SchedulerOptions,
-    compression: &CompressionOptions,
-    queue_memory: &QueueMemoryOptions,
-    io: &BamIoOptions,
-    num_threads: usize,
-) -> anyhow::Result<BamPipelineConfig> {
-    let mut config = BamPipelineConfig::auto_tuned(num_threads, compression.compression_level);
-    config.pipeline.scheduler_strategy = scheduler_opts.strategy();
-    if scheduler_opts.collect_stats() {
-        config.pipeline = config.pipeline.with_stats(true);
-    }
-    config.pipeline.deadlock_timeout_secs = scheduler_opts.deadlock_timeout_secs();
-    config.pipeline.deadlock_recover_enabled = scheduler_opts.deadlock_recover_enabled();
-    config.pipeline.verify_crc = io.effective_check_crc();
-
-    let queue_memory_limit_bytes = queue_memory.calculate_memory_limit(num_threads)?;
-    config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
-    queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
-    Ok(config)
-}
-
 /// Reject an `--index-threshold` that demands indexing under a configuration that can
 /// never index.
 ///
@@ -1917,7 +1881,7 @@ pub fn validate_index_threshold(
 /// `--pipeline-stats` is honored separately via `attach_new_pipeline_stats`;
 /// this only warns about the others.
 pub(crate) fn warn_unwired_pipeline_flags(scheduler_opts: &SchedulerOptions) {
-    // --scheduler selects a legacy unified-pipeline scheduler strategy that the
+    // --scheduler selects a legacy scheduler strategy that the
     // typed-step chain engine does not consume, so setting it (a hidden dev flag)
     // has no effect on any chain-backed command. Mirror the --deadlock-recover
     // diagnostic below: surface it when set to a non-default value so a developer

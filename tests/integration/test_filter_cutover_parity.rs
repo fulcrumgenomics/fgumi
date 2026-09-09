@@ -1,5 +1,5 @@
 //! Parity gate for the `filter` command's single-threaded-path retirement (C4):
-//! `Filter::execute` no longer has a serial in-process unified-pipeline loop
+//! `Filter::execute` no longer has a serial in-process legacy loop
 //! reached when `--threads` is absent — it *always* routes through the
 //! declarative chain builder. This test proves that cutover lost nothing
 //! user-observable.
@@ -9,7 +9,7 @@
 //! 1. **The cutover actually happened** (`filter_no_threads_routes_through_chain`).
 //!    A no-`--threads` run now emits the chain-only `"Using pipeline with N
 //!    threads"` banner that `ChainBuilder::add_filter` logs and the retired
-//!    unified-pipeline tail never did. This is the genuine RED/GREEN
+//!    legacy tail never did. This is the genuine RED/GREEN
 //!    discriminator: before the removal a no-`--threads` run took the serial
 //!    path and printed no such line; after it, the chain does.
 //!
@@ -244,7 +244,7 @@ fn run_filter(
 
 /// A no-`--threads` run now routes through the declarative chain, which logs the
 /// `"Using pipeline with N threads"` banner from `ChainBuilder::add_filter`. The
-/// retired unified-pipeline tail logged no such line, so this is the RED
+/// retired legacy tail logged no such line, so this is the RED
 /// (pre-removal) → GREEN (post-removal) discriminator for the cutover.
 #[test]
 fn filter_no_threads_routes_through_chain() {

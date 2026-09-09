@@ -167,9 +167,9 @@ reviews:
   # Every symbol named below was verified with `git grep` to resolve at the
   # commit that introduced this revision; re-verify when touching these modules.
   #
-  # The two legacy homes share one entry: issue #330 renames
-  # `src/lib/unified_pipeline` to `src/lib/pipeline`, so the same instructions
-  # apply to whichever is present. `crates/fgumi-pipeline-core` is the extracted
+  # The hand-rolled pipeline lives at `src/lib/pipeline` (the legacy multi-thread
+  # engine it replaced was removed in R6/C6).
+  # `crates/fgumi-pipeline-core` is the extracted
   # typed-step engine and gets its OWN entry below: it is a different design and
   # names different symbols (`queues.rs` / `ByteBoundedQueue`, not `queue.rs` /
   # `OrderedQueue`), so folding it into the legacy entry would point the reviewer
@@ -185,34 +185,29 @@ reviews:
   #     instructions of their own, so they are reviewed by the generic themes
   #     only.
   path_instructions:
-    - path: "{src/lib/unified_pipeline,src/lib/pipeline}/**/*.rs"
+    - path: "src/lib/pipeline/**/*.rs"
       instructions: >-
-        This is the hand-rolled concurrent step pipeline; its bugs are deadlocks,
-        lost output, unbounded memory, and panics on malformed input — not style.
-        Treat any change to the reorder stage, queue push/pop, backpressure, or
-        producer gating as liveness- and memory-critical. Require that no path
-        lets a queue or reorder buffer grow without a byte bound, so steady-state
-        memory stays a function of config rather than input size: the per-queue
-        bound is `OrderedQueue::limit_bytes` (`queue.rs`); the pipeline total is
-        gated at Read by `BamPipelineState::read_admission_allowed` (`bam.rs`);
-        and each stage's own high-water mark comes from `stage_high_water_mark`
-        (`base.rs`), which caps the mark rather than scaling it with the budget.
-        `MemoryTracker` (`base.rs`) is NOT on that path — nothing in this crate
-        constructs one, so do not cite it as the live budget check. Flag a cap
-        checked on only one sub-condition so another code path bypasses it; flag
-        capping a consumer drain loop (consumers must stay unbounded — bound the
-        producers instead); and flag byte accounting that measures logical length
-        where the memory actually held is allocation capacity. Require error and
-        cancel paths to set the shared `shutdown_signal: Arc<AtomicBool>`
-        (`base.rs`) so every worker's `load()` loop observes the stop, and that
-        no worker can block forever on a channel whose peer has already exited.
-        Byte-level framing here parses length and offset fields out of the input
-        stream: require every such field to be validated against the remaining
-        buffer with checked arithmetic before it is used to slice — an
-        underflowing `offset + block_size - 4` on a corrupt or truncated block is
-        a real, previously-shipped crash on corruption-controlled input. This
-        module contains no `unsafe`; treat newly introduced `unsafe` here as out
-        of policy and require it to be justified in CLAUDE.md first.
+        This is the declarative chain: the typed step definitions (`steps/`), the
+        chain assembly (`chains/` — `ChainBuilder`, `build_for`, the per-command
+        `add_*` stage methods, `ChainSpec`), and the per-stage backpressure
+        thresholds (`backpressure.rs`: `stage_high_water_mark`). Its bugs are
+        lost/dropped/duplicated or mis-ordered records, mis-wired stages (a command
+        assembling the wrong step sequence, or a step reading a field a prior stage
+        did not populate), and panics on malformed input — not style. The concurrent
+        execution engine itself — the work-stealing pool, queues, scheduler,
+        liveness/deadlock detection, reorder buffer — lives in
+        `crates/fgumi-pipeline-core` and has its OWN entry below; do not review
+        queue/backpressure/liveness internals against this entry. Require per-stage
+        memory to stay a function of config rather than input size via
+        `stage_high_water_mark` (`backpressure.rs`), which caps the mark rather than
+        scaling it with the budget. Byte-level framing in the source/parse steps
+        reads length and offset fields out of the input stream: require every such
+        field to be validated against the remaining buffer with checked arithmetic
+        before it is used to slice — an underflowing `offset + block_size - 4` on a
+        corrupt or truncated block is a real, previously-shipped crash on
+        corruption-controlled input. These modules contain no `unsafe`; treat newly
+        introduced `unsafe` here as out of policy and require it to be justified in
+        CLAUDE.md first.
     - path: "crates/fgumi-pipeline-core/src/**/*.rs"
       instructions: >-
         This is the extracted typed-step pipeline engine (the successor to the

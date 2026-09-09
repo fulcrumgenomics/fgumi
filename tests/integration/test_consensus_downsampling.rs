@@ -4,7 +4,7 @@
 //! the consensus caller. The RNG is stateful, so the surviving subset for a family depended
 //! on how many families that caller instance had already processed.
 //!
-//! fgumi never had fgbio's thread-count bug — the unified pipeline builds a fresh caller per
+//! fgumi never had fgbio's thread-count bug — the chain builds a fresh caller per
 //! batch at a fixed batch size, so `--threads 1` and `--threads 8` agreed. But the
 //! no-`--threads` path holds a single caller for the entire run, putting its RNG at a
 //! different position for every family, so the two execution *modes* disagreed under a cap.

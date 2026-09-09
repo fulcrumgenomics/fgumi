@@ -57,9 +57,8 @@ use fgumi_pipeline_core::{
 };
 
 /// Default reorder-window byte budget substituted when the caller's
-/// `output_byte_limit` is `0`. Mirrors the legacy pipeline's `effective_limit`
-/// (`unified_pipeline`), which normalizes a `0` memory limit to a fixed cap
-/// rather than treating it as "unlimited": `SortMergeSlot::bp_reorder_admits`
+/// `output_byte_limit` is `0`. A `0` memory limit is normalized to a fixed cap
+/// rather than treated as "unlimited": `SortMergeSlot::bp_reorder_admits`
 /// (via `ReorderBuffer::would_accept`) reads `window_budget == 0` as *no bound*,
 /// so passing a resolved-to-zero budget straight through would remove the only
 /// byte cap on decompressed stragglers. Matches

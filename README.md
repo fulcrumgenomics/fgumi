@@ -267,7 +267,7 @@ fgumi is written in Rust for maximum performance.
 
 - **2-bit DNA encoding**: 4 bases in 1 byte, 32 bases in u64
 - **CPU intrinsics**: XOR + popcount for Hamming distance
-- **Work-stealing scheduler**: Unified pipeline with dynamic load balancing
+- **Work-stealing scheduler**: Declarative chain with dynamic load balancing
 - **libdeflate**: Fast BGZF compression
 
 ## Acknowledgements

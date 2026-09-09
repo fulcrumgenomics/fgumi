@@ -1,4 +1,4 @@
-//! Compile-fail tests for the unified pipeline core. Each `.rs` file under
+//! Compile-fail tests for the pipeline core. Each `.rs` file under
 //! `tests/compile-fail/` is expected to fail to compile with the trait
 //! bounds and type checks the framework promises.
 //!

@@ -1,4 +1,4 @@
-//! Per-spill-file shared state for the unified-pipeline merge phase.
+//! Per-spill-file shared state for the chain merge phase.
 //!
 //! `SortMergeSlot` is the per-spill-file shared state shuttled between
 //! `SortSpillDecompress` (producer side: reads raw BGZF blocks from

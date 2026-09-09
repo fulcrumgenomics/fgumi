@@ -90,7 +90,7 @@ pub fn assert_has_bgzf_eof(path: &std::path::Path) {
 /// Asserts that a rejects BAM's `@HD` sort-order fields (`SO`, `GO`, `SS`)
 /// match those of the input BAM.
 ///
-/// Pipeline commands route rejects through the unified pipeline's first-class
+/// Pipeline commands route rejects through the pipeline's first-class
 /// secondary output, which emits rejects in batch-input order (a subset of an
 /// SO-X stream is still SO-X). The rejects BAM therefore inherits the input
 /// header verbatim — including whatever sort-order claim the input made (or
@@ -345,14 +345,64 @@ mod tests {
         assert_text_files_eq(&a, &b, "divergent files");
     }
 
-    #[test]
-    #[should_panic(expected = "reading actual")]
-    fn assert_text_files_eq_panics_naming_a_missing_file() {
+    /// Serializes the process-global panic-hook swap in `capture_panic_message`.
+    /// The hook is global, so parallel `rstest` cases could otherwise interleave
+    /// `take_hook`/`set_hook` and leave the wrong hook installed or leak panic
+    /// output. Held across the whole take/set/catch/restore sequence.
+    static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Captures the panic message from `f` (which must panic), silencing the
+    /// default hook's stderr print while the expected panic fires and restoring
+    /// the prior hook afterward so a passing run stays quiet.
+    fn capture_panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
+        let _guard = PANIC_HOOK_LOCK.lock().expect("panic hook lock poisoned");
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(f);
+        std::panic::set_hook(prev);
+        let payload = result.expect_err("assert_text_files_eq should have panicked");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .expect("panic payload should be a string")
+    }
+
+    /// The missing-file diagnostic must name the failing side (`reading actual`
+    /// vs `reading expected`), the caller's `label`, and the offending path —
+    /// for BOTH read branches, not just the actual side. `actual` is read
+    /// first, so exercising the `reading expected` branch requires `actual` to
+    /// exist while `expected` is missing.
+    #[rstest::rstest]
+    #[case::actual_missing(false, true, "reading actual", "missing-actual")]
+    #[case::expected_missing(true, false, "reading expected", "missing-expected")]
+    fn assert_text_files_eq_names_the_missing_file_and_side(
+        #[case] write_actual: bool,
+        #[case] write_expected: bool,
+        #[case] expected_side: &str,
+        #[case] missing_name: &str,
+    ) {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert_text_files_eq(
-            &dir.path().join("missing-actual"),
-            &dir.path().join("missing-expected"),
-            "missing file",
+        let actual = dir.path().join("missing-actual");
+        let expected = dir.path().join("missing-expected");
+        if write_actual {
+            std::fs::write(&actual, "col1\n1\n").expect("write actual");
+        }
+        if write_expected {
+            std::fs::write(&expected, "col1\n1\n").expect("write expected");
+        }
+        let label = "missing file";
+        // The file named by `missing_name` is the one left unwritten; the diagnostic
+        // must name its FULL path (as `Path::display`), not merely the basename.
+        // Capture it before the paths are moved into the closure below.
+        let missing_path = dir.path().join(missing_name);
+        let msg = capture_panic_message(move || assert_text_files_eq(&actual, &expected, label));
+        assert!(msg.contains(expected_side), "names the failing side ({expected_side}): {msg}");
+        assert!(msg.contains(label), "names the caller label ({label}): {msg}");
+        assert!(
+            msg.contains(&missing_path.display().to_string()),
+            "names the full missing path ({}): {msg}",
+            missing_path.display()
         );
     }
 

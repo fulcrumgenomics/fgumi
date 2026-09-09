@@ -563,7 +563,7 @@ where
         // Order the two mate positions so the earlier-mapping read comes first. The
         // tie-break includes strand (positive sorts before negative, since Rust
         // `false < true` and `strand == is_reverse`), matching fgumi's own group/dedup
-        // canonicalization (`unified_pipeline/base.rs`: `(ref, pos, strand) <= ...`) and
+        // canonicalization (the `(ref, pos, strand)` key ordering) and
         // fgbio's ReadInfo `r1Earlier` (GroupReadsByUmi.scala:105-111). Without the strand
         // tie-break, the two strands of a duplex whose mates share an identical
         // (ref, unclipped-5') canonicalize to different keys and fail to co-group.

@@ -7,7 +7,6 @@
 
 mod helpers;
 mod test_async_reader;
-mod test_bam_pipeline;
 mod test_bgzf_eof;
 mod test_chain_bam_with_index;
 mod test_clip_command;
@@ -42,7 +41,6 @@ mod test_error_paths;
 mod test_extract_command;
 mod test_extract_cutover_parity;
 mod test_fastq_command;
-mod test_fastq_pipeline_memory_backpressure;
 mod test_filter_command;
 mod test_filter_cutover_parity;
 mod test_group_command;
@@ -50,8 +48,6 @@ mod test_group_cutover_parity;
 mod test_group_determinism;
 mod test_input_source_matrix;
 mod test_merge_command;
-mod test_pipeline_concurrency;
-mod test_pipeline_memory_backpressure;
 mod test_retag_command;
 mod test_retag_cutover_parity;
 mod test_review_command;

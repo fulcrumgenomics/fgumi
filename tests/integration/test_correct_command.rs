@@ -218,7 +218,7 @@ fn test_correct_command_with_rejects() {
 /// Exercises the multi-threaded rejects-streaming path end-to-end and asserts:
 /// 1. The rejects BAM is a valid BGZF stream with the terminating EOF block.
 /// 2. The `@HD` sort fields (`SO`/`GO`/`SS`) match the input BAM, because
-///    rejects flow through the unified pipeline's secondary output in
+///    rejects flow through the chain's secondary output in
 ///    batch/input order (a subset of an SO-X stream is still SO-X).
 /// 3. Every uncorrectable input record appears exactly once in the rejects
 ///    BAM — the writer does not drop records under worker contention and does

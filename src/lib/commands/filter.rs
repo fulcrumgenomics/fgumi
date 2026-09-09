@@ -460,7 +460,7 @@ impl FilterOptions {
     /// Build the shared filter config, reference, per-thread metrics
     /// accumulators, and progress counter used by the chain builder.
     ///
-    /// The `BamPipelineConfig` is *not* built here: the chain builder derives it
+    /// The pipeline config is *not* built here: the chain builder derives it
     /// from its [`crate::pipeline::chains::ChainSpec`].
     pub(crate) fn setup_pipeline(&self, num_threads: usize) -> Result<FilterPipelineSetup> {
         let config = Arc::new(FilterConfig::new(

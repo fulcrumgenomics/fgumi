@@ -159,7 +159,6 @@ pub mod tag_reversal;
 pub mod template;
 pub mod template_filter;
 pub mod umi;
-pub mod unified_pipeline;
 pub mod validation;
 pub mod variant_review;
 

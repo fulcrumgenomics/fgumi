@@ -1,32 +1,35 @@
-//! Scheduler strategy enum shared by the scheduler dispatch and the CLI.
+//! Scheduler strategy enum for the legacy `--scheduler` CLI flag.
 //!
-//! Relocated out of `unified_pipeline::scheduler` (C5/R6a) to a neutral root
-//! module rather than `commands::common`: it is consumed both by the
-//! scheduler dispatch (`unified_pipeline::scheduler::create_scheduler`, a
-//! pipeline-layer concern) and by the CLI's `SchedulerOptions`
-//! (`commands::common`, the CLI layer). Homing it under `commands` would have
-//! made the pipeline layer depend upward on the CLI layer through
-//! `unified_pipeline::scheduler`'s shim; this module is downward-reachable
-//! from both. It also survives C6, since the enum outlives
-//! `unified_pipeline`.
+//! The typed-step chain engine does not use a pluggable scheduler strategy, so
+//! this enum no longer drives any dispatch: it backs the hidden `--scheduler`
+//! flag on `SchedulerOptions` (`commands::common`), and
+//! `warn_unwired_pipeline_flags` warns when it is set to a non-default value so
+//! a developer sees the flag is inert rather than silently ignored. It was
+//! relocated to this neutral root module in C5/R6a (out of the legacy
+//! multi-thread engine's `scheduler` module, removed in R6/C6).
 
-/// Scheduler strategy for pipeline execution.
+/// Scheduler strategy that once selected a dispatch policy for the removed
+/// legacy multi-thread engine.
+///
+/// The typed-step chain engine ignores this setting (see the module docs), so
+/// none of the variants below drive any current dispatch. Their descriptions
+/// are retained only as a historical record of what each `--scheduler` value
+/// meant to the legacy engine.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum SchedulerStrategy {
-    /// Fixed priority scheduling based on thread role.
+    /// Historical: fixed-priority scheduling based on thread role.
     ///
-    /// Thread 0 prioritizes reading, Thread N-1 prioritizes writing,
-    /// middle threads rotate among parallel steps. Includes backpressure
-    /// override when output queue fills.
+    /// Thread 0 prioritized reading, thread N-1 prioritized writing,
+    /// middle threads rotated among parallel steps, with a backpressure
+    /// override when the output queue filled.
     #[value(name = "fixed-priority")]
     FixedPriority,
 
-    /// Chase-bottleneck scheduling with dynamic adaptation.
+    /// Historical: chase-bottleneck scheduling with dynamic adaptation.
     ///
-    /// Threads follow work: move downstream when output blocked,
-    /// move upstream when input empty, stay sticky on success.
-    /// Automatically rebalances as pipeline stages progress.
-    /// Shows ~10% improvement at medium thread counts (4 threads).
+    /// Threads followed work: downstream when output blocked, upstream when
+    /// input empty, sticky on success, rebalancing as pipeline stages
+    /// progressed (~10% improvement at medium thread counts).
     #[value(name = "chase-bottleneck")]
     ChaseBottleneck,
 

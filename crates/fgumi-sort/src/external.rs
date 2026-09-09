@@ -5848,7 +5848,7 @@ pub fn open_spill_slot(path: &std::path::Path, file_id: u32) -> Result<Arc<SortM
 // ============================================================================
 
 // ============================================================================
-// Streaming-sort merge path (unified pipeline `SortMerge` step)
+// Streaming-sort merge path (the chain's `SortMerge` step)
 // ============================================================================
 //
 // Ported from the issue-#330 branch onto main's sort engine. This is the
