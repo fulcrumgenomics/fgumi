@@ -6,6 +6,8 @@
 //! background sampler point-samples every slot each tick to build a thread-state
 //! profile. This is statistics, not synchronization — staleness is fine.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::topology::StepIdx;
 
 /// What an OS thread is doing at the instant it is sampled.
@@ -59,6 +61,51 @@ pub fn unpack(bits: u64) -> (WorkerState, Option<StepIdx>) {
     (state, step)
 }
 
+/// One `AtomicU64` per pipeline OS thread. Sized at `Pipeline::run` start to
+/// `n_pool_workers + n_detached_driver_threads`; each thread is handed a fixed
+/// slot index (its "state slot") distinct from `WorkerCore::thread_id` — a
+/// detached driver reuses `thread_id` 0, so keying the board on `thread_id`
+/// would collide it with pool worker 0.
+#[derive(Debug)]
+pub struct WorkerStateBoard {
+    slots: Box<[AtomicU64]>,
+}
+
+impl WorkerStateBoard {
+    #[must_use]
+    pub fn new(n_slots: usize) -> Self {
+        let init = pack(WorkerState::Idle, None);
+        let slots = (0..n_slots).map(|_| AtomicU64::new(init)).collect();
+        Self { slots }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Stamp `slot`'s current `(state, step)` — one `Relaxed` store. Out-of-range
+    /// slots are ignored (telemetry must never panic a worker).
+    pub fn stamp(&self, slot: usize, state: WorkerState, step: Option<StepIdx>) {
+        if let Some(cell) = self.slots.get(slot) {
+            cell.store(pack(state, step), Ordering::Relaxed);
+        }
+    }
+
+    /// Point-read `slot`. Out-of-range reads report `(Idle, None)`.
+    #[must_use]
+    pub fn read(&self, slot: usize) -> (WorkerState, Option<StepIdx>) {
+        self.slots
+            .get(slot)
+            .map_or((WorkerState::Idle, None), |c| unpack(c.load(Ordering::Relaxed)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +119,20 @@ mod tests {
     #[case::parked_none(WorkerState::Parked, None)]
     fn pack_round_trips(#[case] state: WorkerState, #[case] step: Option<StepIdx>) {
         assert_eq!(unpack(pack(state, step)), (state, step));
+    }
+
+    #[test]
+    fn board_stamp_and_read_per_slot_are_independent() {
+        let board = WorkerStateBoard::new(3);
+        assert_eq!(board.len(), 3);
+        // All slots start Idle/None.
+        for slot in 0..3 {
+            assert_eq!(board.read(slot), (WorkerState::Idle, None));
+        }
+        board.stamp(0, WorkerState::Running, Some(StepIdx(2)));
+        board.stamp(2, WorkerState::Parked, None);
+        assert_eq!(board.read(0), (WorkerState::Running, Some(StepIdx(2))));
+        assert_eq!(board.read(1), (WorkerState::Idle, None), "untouched slot unchanged");
+        assert_eq!(board.read(2), (WorkerState::Parked, None));
     }
 }
