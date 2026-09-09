@@ -65,6 +65,7 @@ cargo build --release
 | `duplex` | Call duplex consensus reads |
 | `codec` | Call CODEC consensus |
 | `filter` | Filter consensus reads |
+| `runall` | Fuse two or more pipeline stages into a single streaming pass (see [Running Pipelines](guide/running-pipelines.md)) |
 | `clip` | Clip overlapping read pairs |
 | `duplex-metrics` | Collect duplex metrics |
 | `review` | Review consensus variants |

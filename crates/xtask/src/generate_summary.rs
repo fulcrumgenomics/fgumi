@@ -7,6 +7,21 @@ use std::path::Path;
 use crate::generate_metrics::MetricPage;
 use crate::generate_tools::ToolPage;
 
+/// Emit one collapsible User Guide sub-group: a bracketed section header
+/// followed by a `guide/<page>.md` link for each entry whose page exists on
+/// disk. The whole group (header included) is omitted when none of its pages
+/// exist, so a stripped-down docs tree never renders an empty section.
+fn push_group(md: &mut String, docs_src: &Path, header: &str, entries: &[(&str, &str)]) {
+    if entries.iter().any(|(_, path)| docs_src.join(path).exists()) {
+        let _ = writeln!(md, "- [{header}]()");
+        for (title, path) in entries {
+            if docs_src.join(path).exists() {
+                let _ = writeln!(md, "  - [{title}]({path})");
+            }
+        }
+    }
+}
+
 /// Generate `SUMMARY.md` for mdBook from static guide pages and dynamic tool/metric pages.
 #[allow(clippy::too_many_lines)]
 pub fn generate(
@@ -28,77 +43,60 @@ pub fn generate(
         let _ = writeln!(md, "- [{}]({})", entry.0, entry.1);
     }
 
-    // Core Concepts sub-group
-    let core_concepts = [
-        ("Read Structures", "guide/read-structures.md"),
-        ("UMI Grouping", "guide/umi-grouping.md"),
-        ("Tracking Reads", "guide/tracking-reads.md"),
-    ];
-    let core_exists = core_concepts.iter().any(|(_, p)| docs_src.join(p).exists());
-    if core_exists {
-        md.push_str("- [Core Concepts]()\n");
-        for (title, path) in &core_concepts {
-            if docs_src.join(path).exists() {
-                let _ = writeln!(md, "  - [{title}]({path})");
-            }
-        }
+    // Running Pipelines — fgumi runall vs individual commands. A standalone
+    // top-level leaf, listed right after Getting Started.
+    let running = ("Running Pipelines", "guide/running-pipelines.md");
+    if docs_src.join(running.1).exists() {
+        let _ = writeln!(md, "- [{}]({})", running.0, running.1);
     }
 
-    // Consensus sub-group
-    let consensus = [
-        ("Consensus Calling", "guide/consensus-calling.md"),
-        ("Duplex Consensus Calling", "guide/duplex-consensus-calling.md"),
-    ];
-    let consensus_exists = consensus.iter().any(|(_, p)| docs_src.join(p).exists());
-    if consensus_exists {
-        md.push_str("- [Consensus Calling]()\n");
-        for (title, path) in &consensus {
-            if docs_src.join(path).exists() {
-                let _ = writeln!(md, "  - [{title}]({path})");
-            }
-        }
-    }
-
-    // Methylation sub-group
-    let methylation = [("Pipeline Guide", "guide/methylation.md")];
-    let methylation_exists = methylation.iter().any(|(_, p)| docs_src.join(p).exists());
-    if methylation_exists {
-        md.push_str("- [Methylation]()\n");
-        for (title, path) in &methylation {
-            if docs_src.join(path).exists() {
-                let _ = writeln!(md, "  - [{title}]({path})");
-            }
-        }
-    }
-
-    // NanoSeq sub-group
-    let nanoseq = [("Pipeline Guide", "guide/nanoseq.md")];
-    let nanoseq_exists = nanoseq.iter().any(|(_, p)| docs_src.join(p).exists());
-    if nanoseq_exists {
-        md.push_str("- [NanoSeq (Duplex-Seq)]()\n");
-        for (title, path) in &nanoseq {
-            if docs_src.join(path).exists() {
-                let _ = writeln!(md, "  - [{title}]({path})");
-            }
-        }
-    }
-
-    // Advanced Topics sub-group
-    let advanced = [
-        ("Best Practices", "guide/best-practices.md"),
-        ("Performance Tuning", "guide/performance-tuning.md"),
-        ("Working with Metrics", "guide/working-with-metrics.md"),
-        ("Migration from fgbio", "guide/migration-from-fgbio.md"),
-    ];
-    let advanced_exists = advanced.iter().any(|(_, p)| docs_src.join(p).exists());
-    if advanced_exists {
-        md.push_str("- [Advanced Topics]()\n");
-        for (title, path) in &advanced {
-            if docs_src.join(path).exists() {
-                let _ = writeln!(md, "  - [{title}]({path})");
-            }
-        }
-    }
+    // Sub-groups: each renders a collapsible sidebar section, omitted entirely
+    // when none of its pages exist. Standalone leaf pages (above) are listed
+    // before these so the sidebar's plain links and expandable section headers
+    // form two visually distinct zones.
+    push_group(
+        &mut md,
+        docs_src,
+        "Core Concepts",
+        &[
+            ("Read Structures", "guide/read-structures.md"),
+            ("UMI Grouping", "guide/umi-grouping.md"),
+            ("Tracking Reads", "guide/tracking-reads.md"),
+        ],
+    );
+    push_group(
+        &mut md,
+        docs_src,
+        "Consensus Calling",
+        &[
+            ("Consensus Calling", "guide/consensus-calling.md"),
+            ("Duplex Consensus Calling", "guide/duplex-consensus-calling.md"),
+        ],
+    );
+    push_group(&mut md, docs_src, "Methylation", &[("Pipeline Guide", "guide/methylation.md")]);
+    push_group(
+        &mut md,
+        docs_src,
+        "NanoSeq (Duplex-Seq)",
+        &[("Pipeline Guide", "guide/nanoseq.md")],
+    );
+    push_group(
+        &mut md,
+        docs_src,
+        "Advanced Topics",
+        &[
+            ("Best Practices", "guide/best-practices.md"),
+            ("Performance Tuning", "guide/performance-tuning.md"),
+            ("Working with Metrics", "guide/working-with-metrics.md"),
+            ("Migration from fgbio", "guide/migration-from-fgbio.md"),
+        ],
+    );
+    push_group(
+        &mut md,
+        docs_src,
+        "Reference",
+        &[("Glossary", "guide/glossary.md"), ("Troubleshooting", "guide/troubleshooting.md")],
+    );
 
     md.push('\n');
 
@@ -235,6 +233,77 @@ mod tests {
         assert!(
             !md.contains("guide/nanoseq.md"),
             "NanoSeq link should be omitted when guide is missing:\n{md}"
+        );
+    }
+
+    /// Generate `SUMMARY.md` for a docs tree that optionally contains the
+    /// Running Pipelines leaf and the Reference-group guide pages, and return
+    /// the markdown it wrote.
+    fn summary_with_pages(pages: &[&str]) -> String {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let docs_src = tmp.path();
+        let guide_dir = docs_src.join("guide");
+        fs::create_dir_all(&guide_dir).expect("failed to create guide dir");
+        for page in pages {
+            fs::write(guide_dir.join(page), "# Page\n").expect("failed to write guide");
+        }
+        generate(docs_src, &[], &[]).expect("generate failed");
+        fs::read_to_string(docs_src.join("SUMMARY.md")).expect("failed to read SUMMARY.md")
+    }
+
+    #[test]
+    fn running_pipelines_leaf_present_when_guide_exists() {
+        let md = summary_with_pages(&["running-pipelines.md"]);
+        assert!(
+            md.contains("- [Running Pipelines](guide/running-pipelines.md)"),
+            "missing Running Pipelines leaf:\n{md}"
+        );
+    }
+
+    #[test]
+    fn running_pipelines_leaf_absent_when_guide_missing() {
+        let md = summary_with_pages(&[]);
+        assert!(
+            !md.contains("guide/running-pipelines.md"),
+            "Running Pipelines link should be omitted when guide is missing:\n{md}"
+        );
+    }
+
+    #[test]
+    fn reference_group_present_when_a_guide_exists() {
+        let md = summary_with_pages(&["glossary.md", "troubleshooting.md"]);
+        assert!(md.contains("- [Reference]()"), "missing Reference group:\n{md}");
+        assert!(md.contains("  - [Glossary](guide/glossary.md)"), "missing Glossary link:\n{md}");
+        assert!(
+            md.contains("  - [Troubleshooting](guide/troubleshooting.md)"),
+            "missing Troubleshooting link:\n{md}"
+        );
+    }
+
+    #[test]
+    fn reference_group_present_with_only_one_guide() {
+        // Pins the `.any()` group guard and the per-entry existence filter: with
+        // only Glossary present the group still renders, but the missing
+        // Troubleshooting link is omitted (an `.all()` group guard, or an
+        // unconditional per-entry emit, would fail this).
+        let md = summary_with_pages(&["glossary.md"]);
+        assert!(
+            md.contains("- [Reference]()"),
+            "Reference group should render with one guide:\n{md}"
+        );
+        assert!(md.contains("  - [Glossary](guide/glossary.md)"), "missing Glossary link:\n{md}");
+        assert!(
+            !md.contains("guide/troubleshooting.md"),
+            "Troubleshooting link should be omitted when its guide is missing:\n{md}"
+        );
+    }
+
+    #[test]
+    fn reference_group_absent_when_guides_missing() {
+        let md = summary_with_pages(&[]);
+        assert!(
+            !md.contains("- [Reference]()"),
+            "Reference group should be omitted when its guides are missing:\n{md}"
         );
     }
 }
