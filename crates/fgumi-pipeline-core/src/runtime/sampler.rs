@@ -28,24 +28,222 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::contexts::RegisteredEdge;
+use super::metrics::{EdgeMetricsSnapshot, RawOccupancy};
+use super::telemetry::{EdgeSample, SummarySample, TelemetryWriters, WorkerBins, WorkerSample};
+use super::worker_state::{WorkerState, WorkerStateBoard};
 
 /// Default sampling interval. Two milliseconds is cheap (one atomic load per
 /// edge) yet fine-grained enough to resolve a chain's phase structure over a
 /// multi-second run.
 pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_millis(2);
 
+/// Extra tick telemetry driven by the occupancy sampler loop, additive to the
+/// existing per-edge occupancy histogram + `pipeline-trace.tsv` timeline path
+/// (that path is untouched whether or not `tele` is passed).
+///
+/// `source_edge_idxs` / `sink_edge_idxs` are indices into the same `edges`
+/// slice passed to [`run_occupancy_sampler`] — the edges whose producer is a
+/// chain source and whose consumer is the terminal sink, respectively. They
+/// are computed by the caller (`Pipeline::run`); the sampler only consumes
+/// them.
+pub struct TelemetryArgs<'a> {
+    /// Per-OS-thread `(state, step)` board, one slot per pipeline thread.
+    pub board: &'a WorkerStateBoard,
+    /// Number of worker rows to emit per tick (must match `worker_slots.len()`).
+    pub n_workers: usize,
+    /// Step names indexed by `StepIdx`, for the `workers` TSV's per-step
+    /// fraction columns and the `steps` TSV.
+    pub step_names: &'a [&'static str],
+    /// Optional RSS probe for the summary row's `rss_bytes` column; `None`
+    /// when no probe is wired up.
+    pub rss_probe: Option<&'a (dyn Fn() -> Option<u64> + Send + Sync)>,
+    /// Total queue-byte budget for the summary row's `queue_bytes_budget`
+    /// column, if known.
+    pub queue_bytes_budget: Option<u64>,
+    /// Open TSV writers for the four `<stem>.ticks.*.tsv` files.
+    pub writers: TelemetryWriters,
+    /// Indices into `edges` whose producer is a chain source; their
+    /// (cumulative) `pushed_items` sum to the summary row's `reads_in`.
+    pub source_edge_idxs: Vec<usize>,
+    /// Indices into `edges` whose consumer is the terminal sink; their
+    /// (cumulative) `popped_items` sum to the summary row's `reads_out`.
+    pub sink_edge_idxs: Vec<usize>,
+    /// Worker index (row number in the `workers` TSV) -> `WorkerStateBoard`
+    /// slot index.
+    pub worker_slots: Vec<usize>,
+}
+
+/// A zero-valued edge snapshot, used to seed the tick telemetry's per-edge
+/// "previous" store so tick 0's deltas are the totals since run start (i.e.
+/// since the edge's counters were created), not since the sampler thread's
+/// first tick.
+fn zero_edge_snapshot() -> EdgeMetricsSnapshot {
+    EdgeMetricsSnapshot {
+        pushed_items: 0,
+        pushed_bytes: 0,
+        popped_items: 0,
+        popped_bytes: 0,
+        push_rejections: 0,
+        pop_empties: 0,
+        depth_samples: 0,
+        raw_occupancy: RawOccupancy::Unknown,
+        mean_occupancy: 0.0,
+        mean_occupancy_bytes: 0.0,
+    }
+}
+
+/// Mutable per-run state for the tick telemetry: one [`WorkerBins`] per
+/// worker (per-step occupancy over the emit window), a parallel
+/// Running-sample counter per worker (`d_serviced` — see below), the last
+/// point-sampled `(state, step)` per worker (reused for the row so the
+/// sampler doesn't read the board twice per tick), the previous tick's edge
+/// counter snapshots (for computing deltas), the tick index, and the
+/// `Instant` of the last emit (for `dt_ms`).
+///
+/// `d_serviced` is a **sample-derived activity proxy, not an exact per-worker
+/// item count**: exact counts would require a step-side counter that doesn't
+/// exist yet (a deferred future upgrade). Here it is simply the number of
+/// `Running` point-samples taken for that worker during the emit window — at
+/// v1's 1:1 sample:emit cadence that is 0 or 1 per tick, but the field stays
+/// meaningful if a future cadence samples faster than it emits.
+struct TelemetryState<'a> {
+    args: TelemetryArgs<'a>,
+    bins: Vec<WorkerBins>,
+    d_serviced: Vec<u64>,
+    last_read: Vec<(WorkerState, Option<crate::topology::StepIdx>)>,
+    prev_edges: Vec<EdgeMetricsSnapshot>,
+    tick: u64,
+    last_emit: Instant,
+}
+
+impl<'a> TelemetryState<'a> {
+    fn new(args: TelemetryArgs<'a>, edges: &[RegisteredEdge]) -> Self {
+        let n_steps = args.step_names.len();
+        let bins = (0..args.n_workers).map(|_| WorkerBins::new(n_steps)).collect();
+        let d_serviced = vec![0u64; args.n_workers];
+        let last_read = vec![(WorkerState::Idle, None); args.n_workers];
+        let prev_edges = vec![zero_edge_snapshot(); edges.len()];
+        Self { args, bins, d_serviced, last_read, prev_edges, tick: 0, last_emit: Instant::now() }
+    }
+
+    /// Point-sample every worker slot's current `(state, step)` into its
+    /// `WorkerBins`, bump the `d_serviced` proxy on `Running`, and stash the
+    /// read for reuse by [`Self::emit`]'s worker row (one board read per
+    /// worker per tick, shared the same way `read_depths` is shared between
+    /// the occupancy histogram and the timeline row).
+    fn sample_workers(&mut self) {
+        for (w, &slot) in self.args.worker_slots.iter().enumerate() {
+            let (state, step) = self.args.board.read(slot);
+            if let Some(bins) = self.bins.get_mut(w) {
+                bins.record(state, step);
+            }
+            if state == WorkerState::Running
+                && let Some(count) = self.d_serviced.get_mut(w)
+            {
+                *count += 1;
+            }
+            if let Some(slot_read) = self.last_read.get_mut(w) {
+                *slot_read = (state, step);
+            }
+        }
+    }
+
+    /// Compute this tick's edge deltas / `reads_in` / `reads_out` /
+    /// `queue_bytes_used`, write the summary/edge/worker rows, and reset the
+    /// per-window accumulators (bins, `d_serviced`, previous edge snapshots).
+    ///
+    /// `depths` is the SAME per-tick read `run_occupancy_sampler` already
+    /// took via `read_depths` for the occupancy histogram / timeline row —
+    /// reused here rather than re-read, for the same reason the timeline
+    /// writer reuses it (one edge read per tick, not one per consumer).
+    fn emit(&mut self, edges: &[RegisteredEdge], depths: &[EdgeDepth], t_ms: f64) {
+        let dt_ms = self.last_emit.elapsed().as_secs_f64() * 1000.0;
+        self.last_emit = Instant::now();
+
+        let mut reads_in = 0u64;
+        let mut reads_out = 0u64;
+        let mut queue_bytes_used = 0u64;
+        let mut edge_rows: Vec<EdgeSample> = Vec::with_capacity(edges.len());
+        for (i, e) in edges.iter().enumerate() {
+            let cur = e.metrics.snapshot();
+            let prev = self.prev_edges[i];
+            if let Some(src) = &e.depth_source {
+                queue_bytes_used += src.current_bytes();
+            }
+            if self.args.source_edge_idxs.contains(&i) {
+                reads_in += cur.pushed_items;
+            }
+            if self.args.sink_edge_idxs.contains(&i) {
+                reads_out += cur.popped_items;
+            }
+            let (depth_bytes, limit_bytes) =
+                depths.get(i).copied().flatten().map_or((None, None), |(o, l)| (Some(o), Some(l)));
+            edge_rows.push(EdgeSample {
+                edge: edge_column_prefix(e),
+                depth_bytes,
+                limit_bytes,
+                d_pushed: cur.pushed_items.saturating_sub(prev.pushed_items),
+                d_popped: cur.popped_items.saturating_sub(prev.popped_items),
+                d_push_rej: cur.push_rejections.saturating_sub(prev.push_rejections),
+                d_pop_empty: cur.pop_empties.saturating_sub(prev.pop_empties),
+            });
+            self.prev_edges[i] = cur;
+        }
+
+        let rss_bytes = self.args.rss_probe.and_then(|f| f());
+        let summary = SummarySample {
+            reads_in,
+            reads_out,
+            rss_bytes,
+            queue_bytes_used,
+            queue_bytes_budget: self.args.queue_bytes_budget,
+        };
+        self.args.writers.write_summary_row(self.tick, t_ms, dt_ms, &summary);
+        for row in &edge_rows {
+            self.args.writers.write_edge_row(self.tick, t_ms, row);
+        }
+        for w in 0..self.args.n_workers {
+            let (state, step) = self.last_read.get(w).copied().unwrap_or((WorkerState::Idle, None));
+            let fractions = self.bins[w].fractions();
+            let sample = WorkerSample {
+                worker: w,
+                state,
+                step,
+                d_serviced: self.d_serviced[w],
+                samples: self.bins[w].total(),
+                fractions,
+            };
+            self.args.writers.write_worker_row(self.tick, t_ms, &sample);
+            self.bins[w].reset();
+            self.d_serviced[w] = 0;
+        }
+        self.tick += 1;
+    }
+
+    fn flush(mut self) {
+        self.args.writers.flush();
+    }
+}
+
 /// Poll each byte-bounded edge's occupancy into its histogram until `stop` is
 /// set. Edges without a `depth_source` (count/unbounded) are skipped. When
 /// `trace_path` is `Some` (the `Timeline` level), also append one TSV row per
 /// tick — `t_ms` plus, per edge, its depth fraction and cumulative
 /// pushed/popped item counts — so the run's phase structure can be plotted.
+///
+/// When `tele` is `Some`, ALSO drives the tick telemetry (`.ticks.*.tsv`)
+/// each tick, additively — see [`TelemetryState`]. This never disturbs the
+/// `read_depths` / `record_depths` / `TraceWriter` path above: both consumers
+/// share the same per-tick `read_depths` result.
 pub fn run_occupancy_sampler(
     stop: &AtomicBool,
     edges: &[RegisteredEdge],
     interval: Duration,
     trace_path: Option<PathBuf>,
+    tele: Option<TelemetryArgs<'_>>,
 ) {
     let mut trace = trace_path.and_then(|p| TraceWriter::open(&p, edges));
+    let mut tele_state = tele.map(|args| TelemetryState::new(args, edges));
     let start = Instant::now();
     let mut sampled_in_loop = false;
     while !stop.load(Ordering::Relaxed) {
@@ -55,23 +253,36 @@ pub fn run_occupancy_sampler(
         if let Some(t) = trace.as_mut() {
             t.write_row(edges, &depths, start.elapsed());
         }
+        if let Some(ts) = tele_state.as_mut() {
+            ts.sample_workers();
+            let t_ms = start.elapsed().as_secs_f64() * 1000.0;
+            ts.emit(edges, &depths, t_ms);
+        }
         sampled_in_loop = true;
         std::thread::sleep(interval);
     }
     // Guard the final sample: only take it when the loop never sampled (a run
     // so short `stop` was already set before the first iteration). Sampling
     // unconditionally here would add an extra occupancy point + timeline row
-    // taken AFTER the pipeline already drained, biasing the mean toward the
-    // empty final state.
+    // (and, symmetrically, an extra telemetry tick) taken AFTER the pipeline
+    // already drained, biasing toward the empty final state.
     if !sampled_in_loop {
         let depths = read_depths(edges);
         record_depths(edges, &depths);
         if let Some(t) = trace.as_mut() {
             t.write_row(edges, &depths, start.elapsed());
         }
+        if let Some(ts) = tele_state.as_mut() {
+            ts.sample_workers();
+            let t_ms = start.elapsed().as_secs_f64() * 1000.0;
+            ts.emit(edges, &depths, t_ms);
+        }
     }
     if let Some(mut t) = trace {
         t.flush();
+    }
+    if let Some(ts) = tele_state {
+        ts.flush();
     }
 }
 
@@ -288,7 +499,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_c = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
-            run_occupancy_sampler(&stop_c, &edges, Duration::from_millis(1), None);
+            run_occupancy_sampler(&stop_c, &edges, Duration::from_millis(1), None, None);
         });
         std::thread::sleep(Duration::from_millis(30));
         stop.store(true, Ordering::Relaxed);
@@ -391,7 +602,7 @@ mod tests {
         let stop_c = Arc::clone(&stop);
         let path_c = path.clone();
         let handle = std::thread::spawn(move || {
-            run_occupancy_sampler(&stop_c, &edges, Duration::from_millis(2), Some(path_c));
+            run_occupancy_sampler(&stop_c, &edges, Duration::from_millis(2), Some(path_c), None);
         });
         std::thread::sleep(Duration::from_millis(30));
         stop.store(true, Ordering::Relaxed);
@@ -412,6 +623,65 @@ mod tests {
     }
 
     #[test]
+    fn sampler_emits_telemetry_files() {
+        use crate::runtime::telemetry::TelemetryWriters;
+        use crate::runtime::worker_state::{WorkerState, WorkerStateBoard};
+        let m = EdgeMetrics::new();
+        m.record_push(100);
+        m.record_pop(40);
+        let q = Arc::new(ByteBoundedQueue::<Heavy>::new(1000));
+        q.try_push(Heavy(vec![0; 300])).unwrap();
+        let edges =
+            vec![edge_over(Arc::clone(&m), Some(Arc::clone(&q) as Arc<dyn BoundedQueueHandle>))];
+        let dir = std::env::temp_dir().join(format!("fgumi-sampler-tele-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("run");
+        let board = WorkerStateBoard::new(1);
+        board.stamp(0, WorkerState::Running, Some(StepIdx(0)));
+        let writers = TelemetryWriters::open(&stem, &["producer"], 1).unwrap();
+        let tele = crate::runtime::sampler::TelemetryArgs {
+            board: &board,
+            n_workers: 1,
+            step_names: &["producer"],
+            rss_probe: None,
+            queue_bytes_budget: Some(1000),
+            writers,
+            source_edge_idxs: vec![0],
+            sink_edge_idxs: vec![0],
+            worker_slots: vec![0],
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_c = Arc::clone(&stop);
+        let edges_c = edges;
+        // `thread::scope` (not `thread::spawn`) because `tele.board` borrows the
+        // stack-local `board` — `spawn` would require that borrow to be
+        // `'static`. This is a test-driver detail only: it does not change
+        // `TelemetryArgs`'s lifetime shape, which stays a plain borrow (the
+        // real caller in `builder.rs` constructs it from an owned `Arc` moved
+        // into its spawned closure, so the borrow there is local to that
+        // closure's body, not held across the `spawn` boundary itself).
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(move || {
+                run_occupancy_sampler(
+                    &stop_c,
+                    &edges_c,
+                    Duration::from_millis(2),
+                    None,
+                    Some(tele),
+                );
+            });
+            std::thread::sleep(Duration::from_millis(30));
+            stop.store(true, Ordering::Relaxed);
+            handle.join().unwrap();
+        });
+        let summary = std::fs::read_to_string(dir.join("run.ticks.summary.tsv")).unwrap();
+        assert!(summary.lines().count() >= 2, "header + >=1 data row");
+        assert!(std::fs::metadata(dir.join("run.ticks.workers.tsv")).is_ok());
+        assert!(std::fs::metadata(dir.join("run.ticks.edges.tsv")).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn timeline_tsv_marks_unsampled_edge_na() {
         // A count/unbounded edge (no depth_source) is unsampled: its depth column
         // must read `NA`, not `0.000` (which would misread as an empty byte edge).
@@ -423,7 +693,7 @@ mod tests {
         let stop_c = Arc::clone(&stop);
         let path_c = path.clone();
         let handle = std::thread::spawn(move || {
-            run_occupancy_sampler(&stop_c, &edges, Duration::from_millis(2), Some(path_c));
+            run_occupancy_sampler(&stop_c, &edges, Duration::from_millis(2), Some(path_c), None);
         });
         std::thread::sleep(Duration::from_millis(30));
         stop.store(true, Ordering::Relaxed);

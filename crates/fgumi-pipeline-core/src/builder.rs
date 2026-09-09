@@ -1260,6 +1260,9 @@ impl Pipeline {
                             &contexts_clone.edges,
                             crate::runtime::sampler::DEFAULT_SAMPLE_INTERVAL,
                             trace_path,
+                            // Task 8 wires the real `TelemetryArgs` (board,
+                            // step names, edge index sets, writers) here.
+                            None,
                         );
                     })
                     .expect("failed to spawn occupancy sampler thread");
