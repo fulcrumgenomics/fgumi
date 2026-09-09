@@ -35,7 +35,8 @@ use std::sync::Arc;
 use crate::commands::group::with_extension;
 use crate::commands::shared_metrics::{
     DOWNSAMPLING_FRACTIONS, Interval, ReadInfoKey, TemplateInfo, build_template_info,
-    overlaps_intervals, record_duplex_coordinate_group, record_simplex_coordinate_group,
+    build_template_info_with_mi, overlaps_intervals, record_duplex_coordinate_group,
+    record_simplex_coordinate_group,
 };
 use crate::mi_group::MiGroup;
 use crate::per_thread_accumulator::PerThreadAccumulator;
@@ -500,10 +501,22 @@ pub(crate) fn push_mi_group_entries(
 /// unmapped reference, or no CIGAR) is silently omitted, matching
 /// `process_templates_from_bam`'s own behavior for the same cases.
 ///
+/// Sources `mi` from the `Template`'s own `mi` FIELD (via
+/// [`build_template_info_with_mi`]) rather than reading the `MI` aux tag —
+/// at this point in the fused pipeline, `group` has already assigned
+/// `template.mi`, but the tag is not written onto the record until BAM
+/// serialization runs later, so reading it from the aux data here would
+/// fail with "missing the required MI tag" on every fused
+/// `runall --start-from group --consensus <mode> --<mode>::metrics=<prefix>`
+/// run. `template.mi` is the LOCAL (pre-`MiAssignGroups`-offset) id, which is
+/// correct here: the family partition within one coordinate group is
+/// identical whether local or globally offset, and the local id still
+/// carries any `/A`,`/B` duplex suffix.
+///
 /// # Errors
 ///
-/// Returns an error if a qualifying R1/R2 pair is missing a required `MI`/`RX`
-/// tag (propagated from [`build_template_info`]).
+/// Returns an error if a qualifying R1/R2 pair is missing a required `RX`
+/// tag (propagated from [`build_template_info_with_mi`]).
 pub(crate) fn coordinate_group_from_processed_position(
     templates: &[Template],
     header: &noodles::sam::Header,
@@ -514,7 +527,9 @@ pub(crate) fn coordinate_group_from_processed_position(
         let (Some(r1), Some(r2)) = (template.r1(), template.r2()) else {
             continue;
         };
-        if let Some((info, _key)) = build_template_info(r1, r2, header, library_index)? {
+        if let Some((info, _key)) =
+            build_template_info_with_mi(r1, r2, header, library_index, template.mi.to_string())?
+        {
             infos.push(info);
         }
     }
@@ -744,12 +759,20 @@ mod coordinate_group_from_processed_position_tests {
     /// pair, going through the same raw-record encode path production code uses
     /// (`encode_record_buf_to_raw`), then `Template::from_records` — the real
     /// constructor (`template.rs` has no `Builder` type).
+    /// `mi` is a plain non-negative integer string (e.g. `"0"`, `"1"`) — set on
+    /// both the record's `MI` aux tag (via `build_pair`, unused by production
+    /// once the adapter sources `mi` from the field, but kept so a stray
+    /// tag-read regression would still be caught) AND, since the fix, on the
+    /// `Template.mi` FIELD as a `MoleculeId::Single` — matching what `group`
+    /// has actually assigned by the time the fused tap runs.
     fn template_from_pair(name: &str, header: &noodles::sam::Header, mi: &str) -> Template {
         let (r1_buf, r2_buf) =
             crate::commands::shared_metrics::tests::build_pair(name, 0, 100, 0, 150, mi);
         let r1 = fgumi_raw_bam::encode_record_buf_to_raw(&r1_buf, header).expect("encode r1");
         let r2 = fgumi_raw_bam::encode_record_buf_to_raw(&r2_buf, header).expect("encode r2");
-        Template::from_records(vec![r1, r2]).expect("builds template")
+        let mut template = Template::from_records(vec![r1, r2]).expect("builds template");
+        template.mi = fgumi_umi::MoleculeId::Single(mi.parse().expect("mi is a plain integer"));
+        template
     }
 
     #[test]
@@ -793,6 +816,82 @@ mod coordinate_group_from_processed_position_tests {
         let infos = coordinate_group_from_processed_position(&[], &header, &library_index)
             .expect("converts");
         assert!(infos.is_empty());
+    }
+
+    /// Regression test for the verified T1 bug: at the fused inline-metrics
+    /// tap in `chains/commands/group.rs`, `group` has already assigned the
+    /// `Template.mi` FIELD, but the `MI` aux tag is not written onto the
+    /// records until BAM serialization runs later. Build an R1/R2 pair
+    /// carrying an `RX` tag but deliberately **no `MI` tag** (mirroring the
+    /// fused-tap reality), set `Template.mi` directly, and assert the
+    /// adapter still produces the correct `TemplateInfo.mi` — sourced from
+    /// the field, not a tag read. Against the pre-fix
+    /// `build_template_info` (which unconditionally read the `MI` aux tag)
+    /// this failed with "missing the required MI tag".
+    #[test]
+    fn coordinate_group_from_processed_position_sources_mi_from_the_template_field_when_the_mi_tag_is_absent()
+     {
+        use crate::sam::SamTag;
+        use fgumi_raw_bam::{SamBuilder as RawSamBuilder, testutil::encode_op};
+
+        let header = crate::commands::shared_metrics::tests::test_header();
+        let seq = vec![b'A'; 100];
+        let quals = vec![30u8; 100];
+        let cigar = encode_op(0, 100); // 100M
+
+        let mut b1 = RawSamBuilder::new();
+        b1.read_name(b"no-mi-tag")
+            .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT | raw_flags::MATE_REVERSE)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(0)
+            .mate_pos(149);
+        b1.add_string_tag(SamTag::RX, b"ACGT-TGCA");
+        // Deliberately no MI tag — this is what distinguishes the fused-tap
+        // reality from the existing `build_pair`-based tests above, whose
+        // records always carry one.
+        let r1_buf =
+            fgumi_raw_bam::raw_record_to_record_buf(&b1.build(), &noodles::sam::Header::default())
+                .expect("decode r1");
+
+        let mut b2 = RawSamBuilder::new();
+        b2.read_name(b"no-mi-tag")
+            .flags(raw_flags::PAIRED | raw_flags::LAST_SEGMENT | raw_flags::REVERSE)
+            .ref_id(0)
+            .pos(149)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(0)
+            .mate_pos(99);
+        b2.add_string_tag(SamTag::RX, b"ACGT-TGCA");
+        let r2_buf =
+            fgumi_raw_bam::raw_record_to_record_buf(&b2.build(), &noodles::sam::Header::default())
+                .expect("decode r2");
+
+        let r1 = fgumi_raw_bam::encode_record_buf_to_raw(&r1_buf, &header).expect("encode r1");
+        let r2 = fgumi_raw_bam::encode_record_buf_to_raw(&r2_buf, &header).expect("encode r2");
+
+        let mut template = Template::from_records(vec![r1, r2]).expect("builds template");
+        // Mirrors what `group` has done by the time the fused tap runs: the
+        // in-memory field is assigned, independent of the (not-yet-written)
+        // aux tag.
+        template.mi = fgumi_umi::MoleculeId::PairedA(7);
+
+        let library_index = LibraryIndex::from_header(&header);
+        let infos = coordinate_group_from_processed_position(&[template], &header, &library_index)
+            .expect("must succeed by reading Template.mi, not error on the absent MI aux tag");
+
+        assert_eq!(infos.len(), 1);
+        assert_eq!(
+            infos[0].mi, "7/A",
+            "TemplateInfo.mi must come from the Template.mi field's Display format"
+        );
     }
 }
 

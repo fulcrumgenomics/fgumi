@@ -769,8 +769,15 @@ pub(crate) fn record_duplex_umi_metrics(
 ///
 /// Returns `Ok(None)` for the same two defensive-skip cases the original
 /// loop had: an unmapped reference id on either mate, or a missing CIGAR (no
-/// unclipped 5' position). Returns `Err` only if a required `MI`/`RX` tag is
-/// absent from `r1`.
+/// unclipped 5' position). Returns `Err` if a required `MI`/`RX` tag is
+/// absent from `r1` or does not contain valid UTF-8.
+///
+/// Reads `mi` from `r1`'s `MI` aux tag, then delegates to
+/// [`build_template_info_with_mi`]. This is the separate-pass path (and any
+/// other caller reading from a BAM where `group`'s serializer has already
+/// written the `MI` tag onto the record); its numeric output must stay
+/// byte-identical across refactors, since `simplex-metrics`/`duplex-metrics`
+/// depend on it.
 pub(crate) fn build_template_info(
     r1: &RawRecord,
     r2: &RawRecord,
@@ -779,6 +786,48 @@ pub(crate) fn build_template_info(
 ) -> Result<Option<(TemplateInfo, ReadInfoKey)>> {
     let read_name = String::from_utf8_lossy(fgumi_raw_bam::read_name(r1.as_ref())).into_owned();
     let mi = required_z_tag(r1, SamTag::MI, &read_name)?;
+    build_template_info_with_mi_and_name(r1, r2, header, library_index, read_name, mi)
+}
+
+/// Same as [`build_template_info`], but takes `mi` explicitly instead of
+/// reading it from `r1`'s `MI` aux tag.
+///
+/// For the **T1 fused inline-metrics tap**
+/// (`inline_metrics_collector::coordinate_group_from_processed_position`):
+/// at that point in the fused `runall` pipeline, `group`'s in-memory
+/// `Template.mi` field has already been assigned, but the `MI` aux tag is
+/// not written onto the records until BAM serialization runs later — so
+/// reading it via [`build_template_info`] fails with "missing the required
+/// MI tag" even though the grouping itself succeeded. Callers in that
+/// position should pass the grouped `Template`'s own `mi` field (its
+/// `Display` string matches the `MI` tag format written at serialization —
+/// see `fgumi_umi::MoleculeId`) instead.
+///
+/// # Errors
+///
+/// Returns an error if `r1` is missing the required `RX` tag.
+pub(crate) fn build_template_info_with_mi(
+    r1: &RawRecord,
+    r2: &RawRecord,
+    header: &noodles::sam::Header,
+    library_index: &LibraryIndex,
+    mi: String,
+) -> Result<Option<(TemplateInfo, ReadInfoKey)>> {
+    let read_name = String::from_utf8_lossy(fgumi_raw_bam::read_name(r1.as_ref())).into_owned();
+    build_template_info_with_mi_and_name(r1, r2, header, library_index, read_name, mi)
+}
+
+/// Shared core of [`build_template_info`] and [`build_template_info_with_mi`]:
+/// everything except how `mi` is obtained (`read_name` is threaded through so
+/// it is computed exactly once regardless of caller).
+fn build_template_info_with_mi_and_name(
+    r1: &RawRecord,
+    r2: &RawRecord,
+    header: &noodles::sam::Header,
+    library_index: &LibraryIndex,
+    read_name: String,
+    mi: String,
+) -> Result<Option<(TemplateInfo, ReadInfoKey)>> {
     let rx = required_z_tag(r1, SamTag::RX, &read_name)?;
 
     let r1_tid = r1.ref_id();
