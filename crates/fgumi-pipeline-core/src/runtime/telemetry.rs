@@ -113,8 +113,31 @@ pub struct EdgeSample {
 }
 
 /// One tick's sample for a single worker (current state/step + this-window fractions).
+///
+/// # v1 worker-state semantics (what the `state`/`f_*` columns actually mean)
+///
+/// The worker loop (`runtime/driver.rs`) stamps only two of the four
+/// [`WorkerState`] variants at runtime:
+/// - `Running` — stamped in `dispatch_one_step` immediately before a step's
+///   `try_run`, so it covers the whole dispatch **whether or not the step made
+///   progress** (a step that returns `NoProgress` is still counted `Running`).
+/// - `Parked` — stamped on a no-work iteration when the loop backs off.
+/// - `Idle` — only the board's initial pre-run value; at runtime it folds into
+///   `Parked`, so it is effectively never sampled once work starts.
+/// - `Waiting` — NOT tracked in v1. A worker holding an item it cannot push
+///   (producer backpressure) is stamped `Running`, not `Waiting`, because that
+///   held item lives inside the step's output handle and is invisible to the
+///   loop. Producer backpressure is instead observable in the EDGES TSV via
+///   `d_push_rej` (push rejections per tick).
+///
+/// So `f_waiting` is always 0 and `f_idle` is inert in v1: a reader must not
+/// interpret them as meaningful busy/blocked signal. The `waiting`/`idle`
+/// columns are retained for schema stability, not because they carry data.
 pub struct WorkerSample {
     pub worker: usize,
+    /// `"pool"` for a work-stealing pool worker, `"detached"` for a dedicated
+    /// detached-driver thread. Decided by the sampler from the slot boundary.
+    pub role: &'static str,
     pub state: WorkerState,
     pub step: Option<StepIdx>,
     pub d_serviced: u64,
@@ -187,7 +210,7 @@ impl TelemetryWriters {
             "tick\tt_ms\tedge\tdepth_bytes\tlimit_bytes\td_pushed\td_popped\td_push_rej\td_pop_empty"
         )
         .is_ok();
-        let mut whdr = String::from("tick\tt_ms\tworker\tstate\tstep\td_serviced\tsamples");
+        let mut whdr = String::from("tick\tt_ms\tworker\trole\tstate\tstep\td_serviced\tsamples");
         for k in 0..step_names.len() {
             let _ = write!(whdr, "\tf_s{k}");
         }
@@ -242,8 +265,9 @@ impl TelemetryWriters {
         }
         let step = w.step.map_or(String::new(), |s| s.0.to_string());
         let mut line = format!(
-            "{tick}\t{t_ms:.3}\t{}\t{}\t{}\t{}\t{}",
+            "{tick}\t{t_ms:.3}\t{}\t{}\t{}\t{}\t{}\t{}",
             w.worker,
+            w.role,
             state_str(w.state),
             step,
             w.d_serviced,
@@ -389,6 +413,7 @@ mod tests {
             0.5,
             &WorkerSample {
                 worker: 0,
+                role: "pool",
                 state: WorkerState::Running,
                 step: Some(StepIdx(1)),
                 d_serviced: 3,
@@ -427,12 +452,15 @@ mod tests {
         let workers = read("workers");
         let hdr = workers.lines().next().unwrap();
         assert!(
+            hdr.contains("worker\trole\tstate\tstep\td_serviced\tsamples"),
+            "role column sits right after worker"
+        );
+        assert!(
             hdr.contains("f_s0\tf_s1\tf_s2\tf_idle\tf_waiting\tf_parked"),
             "per-step + state cols"
         );
-        assert!(
-            workers.lines().nth(1).unwrap().contains("running\t1\t3\t4\t0.2500\t0.7500\t0.0000")
-        );
+        let row = workers.lines().nth(1).unwrap();
+        assert!(row.contains("\tpool\trunning\t1\t3\t4\t0.2500\t0.7500\t0.0000"), "row: {row}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

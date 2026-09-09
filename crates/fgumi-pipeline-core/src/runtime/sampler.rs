@@ -51,6 +51,11 @@ pub struct TelemetryArgs<'a> {
     pub board: &'a WorkerStateBoard,
     /// Number of worker rows to emit per tick (must match `worker_slots.len()`).
     pub n_workers: usize,
+    /// Count of pool (work-stealing) threads, which occupy the low slot range
+    /// `0..n_pool`; slots at or above it are detached-driver threads. The sampler
+    /// uses this boundary to label each worker row's `role` column
+    /// (`pool` / `detached`).
+    pub n_pool: usize,
     /// Step names indexed by `StepIdx`, for the `workers` TSV's per-step
     /// fraction columns and the `steps` TSV.
     pub step_names: &'a [&'static str],
@@ -168,6 +173,11 @@ impl<'a> TelemetryState<'a> {
             let cur = e.metrics.snapshot();
             let prev = self.prev_edges[i];
             if let Some(src) = &e.depth_source {
+                // `queue_bytes_used` = Σ transport `current_bytes()` only; it does
+                // NOT include an ordered edge's reorder-stash bytes, whereas an
+                // edge's `depth_bytes` (from `read_depths`) DOES add the stash. So
+                // for ordered edges Σ `depth_bytes` ≥ `queue_bytes_used` — the two
+                // intentionally won't reconcile exactly.
                 queue_bytes_used += src.current_bytes();
             }
             if self.args.source_edge_idxs.contains(&i) {
@@ -205,8 +215,10 @@ impl<'a> TelemetryState<'a> {
         for w in 0..self.args.n_workers {
             let (state, step) = self.last_read.get(w).copied().unwrap_or((WorkerState::Idle, None));
             let fractions = self.bins[w].fractions();
+            let role = if w < self.args.n_pool { "pool" } else { "detached" };
             let sample = WorkerSample {
                 worker: w,
+                role,
                 state,
                 step,
                 d_serviced: self.d_serviced[w],
@@ -642,6 +654,7 @@ mod tests {
         let tele = crate::runtime::sampler::TelemetryArgs {
             board: &board,
             n_workers: 1,
+            n_pool: 1,
             step_names: &["producer"],
             rss_probe: None,
             queue_bytes_budget: Some(1000),

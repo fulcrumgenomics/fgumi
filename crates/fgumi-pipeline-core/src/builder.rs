@@ -1339,24 +1339,32 @@ impl Pipeline {
                     (Some(tele), Some(board)) => {
                         let step_names: Vec<&'static str> =
                             (0..graph.n_steps()).map(|i| graph.step_name(StepIdx(i))).collect();
+                        // Sample EVERY stamped board slot: pool workers occupy
+                        // `0..n_threads` and detached drivers `n_threads..`, so the
+                        // sampled range and row count must cover `n_threads +
+                        // n_detached` — the exact size the board was allocated with
+                        // above — or detached-driver rows (e.g. sort's serial
+                        // boundary/key-scan driver) would be stamped and never read.
+                        let n_slots = n_threads + n_detached;
                         crate::runtime::telemetry::TelemetryWriters::open(
                             &tele.stem,
                             &step_names,
-                            n_threads,
+                            n_slots,
                         )
                         .map(|writers| {
                             let (source_edge_idxs, sink_edge_idxs) =
                                 source_and_sink_edge_idxs(&contexts.edges);
                             SamplerTelemetryInputs {
                                 board: Arc::clone(board),
-                                n_workers: n_threads,
+                                n_workers: n_slots,
+                                n_pool: n_threads,
                                 step_names,
                                 rss_probe: config.rss_probe.clone(),
                                 queue_bytes_budget: config.queue_memory_total,
                                 writers,
                                 source_edge_idxs,
                                 sink_edge_idxs,
-                                worker_slots: (0..n_threads).collect(),
+                                worker_slots: (0..n_slots).collect(),
                             }
                         })
                     }
@@ -1376,6 +1384,7 @@ impl Pipeline {
                             let SamplerTelemetryInputs {
                                 board,
                                 n_workers,
+                                n_pool,
                                 step_names,
                                 rss_probe,
                                 queue_bytes_budget,
@@ -1387,6 +1396,7 @@ impl Pipeline {
                             let args = crate::runtime::sampler::TelemetryArgs {
                                 board: &board,
                                 n_workers,
+                                n_pool,
                                 step_names: &step_names,
                                 rss_probe: rss_probe.as_deref(),
                                 queue_bytes_budget,
@@ -1694,6 +1704,7 @@ impl Pipeline {
 struct SamplerTelemetryInputs {
     board: Arc<crate::runtime::worker_state::WorkerStateBoard>,
     n_workers: usize,
+    n_pool: usize,
     step_names: Vec<&'static str>,
     rss_probe: Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
     queue_bytes_budget: Option<u64>,
@@ -4538,11 +4549,22 @@ mod tests {
         // both worker 0 and worker 1 must appear.
         let workers = std::fs::read_to_string(dir.join("run.ticks.workers.tsv")).unwrap();
         let mut lines = workers.lines();
-        let _header = lines.next().expect("workers header");
+        let header = lines.next().expect("workers header");
+        // The `role` column sits right after `worker` (col 2 → col 3).
+        let cols: Vec<&str> = header.split('\t').collect();
+        assert_eq!(cols.get(2).copied(), Some("worker"), "col 2 is worker, header: {header}");
+        assert_eq!(cols.get(3).copied(), Some("role"), "col 3 is role, header: {header}");
+        let data_rows: Vec<&str> = lines.collect();
         let worker_ids: std::collections::BTreeSet<&str> =
-            lines.filter_map(|l| l.split('\t').nth(2)).collect();
+            data_rows.iter().filter_map(|l| l.split('\t').nth(2)).collect();
         assert!(worker_ids.contains("0"), "worker 0 row present, got {worker_ids:?}");
         assert!(worker_ids.contains("1"), "worker 1 row present, got {worker_ids:?}");
+        // This pipeline has no Detached steps, so every worker is a pool thread:
+        // each row's `role` (col 3) must read `pool`.
+        for row in &data_rows {
+            let role = row.split('\t').nth(3).expect("role column");
+            assert_eq!(role, "pool", "pool-worker row must be labeled pool, row: {row}");
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

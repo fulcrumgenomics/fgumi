@@ -1264,7 +1264,17 @@ impl SchedulerOptions {
         let stem = stem.unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_STEM));
         let interval = interval_str
             .as_deref()
-            .map(|s| parse_telemetry_interval(s).unwrap_or(DEFAULT_INTERVAL))
+            .map(|s| {
+                parse_telemetry_interval(s).unwrap_or_else(|_| {
+                    // A typo'd cadence must not be silently mistaken for the
+                    // requested one: name the bad value and the fallback.
+                    log::warn!(
+                        "pipeline telemetry: could not parse interval {s:?}; \
+                         falling back to the {DEFAULT_INTERVAL:?} default"
+                    );
+                    DEFAULT_INTERVAL
+                })
+            })
             .unwrap_or(DEFAULT_INTERVAL);
 
         Some(TelemetryConfig { stem, interval })

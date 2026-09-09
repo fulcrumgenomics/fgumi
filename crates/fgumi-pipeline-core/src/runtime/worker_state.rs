@@ -11,13 +11,36 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::topology::StepIdx;
 
 /// What an OS thread is doing at the instant it is sampled.
+///
+/// # v1 semantics — which variants the worker loop actually stamps
+///
+/// Only two variants are stamped at runtime (`runtime/driver.rs`):
+/// - `Running` is stamped in `dispatch_one_step` right before a step's
+///   `try_run`, so it spans the whole dispatch **whether or not the step made
+///   progress**.
+/// - `Parked` is stamped on a no-work iteration when the loop backs off.
+///
+/// `Idle` is only this board's initial pre-run value (see
+/// [`WorkerStateBoard::new`]); once work starts it folds into `Parked` and is
+/// effectively never sampled. `Waiting` is NOT stamped anywhere in v1: a worker
+/// holding an item it cannot push is stamped `Running`, because the held item
+/// lives inside the step's output handle and the loop cannot see it. Producer
+/// backpressure is instead observable in the EDGES telemetry via `d_push_rej`
+/// (push rejections per tick). The two inert variants are kept for schema
+/// stability — a telemetry reader must treat `f_waiting`/`f_idle` as
+/// non-meaningful in v1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerState {
-    /// Inside a step's `try_run` (executing `step`).
+    /// Inside a step's `try_run` (executing `step`), progress or not. The only
+    /// "busy" state stamped in v1.
     Running,
-    /// Between dispatches / round-robin walk found no work this pass.
+    /// Board init value only; folds into `Parked` at runtime (never stamped by
+    /// the worker loop once work starts). Inert in v1.
     Idle,
-    /// Holding an item it could not push (producer-side backpressure).
+    /// Intended: holding an item it could not push (producer-side backpressure).
+    /// NOT stamped in v1 — such a worker reads as `Running`; see the enum-level
+    /// note. Retained for schema stability. Backpressure shows up as EDGES
+    /// `d_push_rej` instead.
     Waiting,
     /// Sleeping/parked on the backoff (no work; ramped backoff).
     Parked,
