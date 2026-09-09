@@ -14,6 +14,7 @@ pub mod scheduler;
 pub mod stats;
 pub mod storage;
 pub mod worker_core;
+pub mod worker_state;
 
 pub use contexts::{ChainContexts, build_chain_contexts, build_chain_contexts_fused};
 pub use detached::{
