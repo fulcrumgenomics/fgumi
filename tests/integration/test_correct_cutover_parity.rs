@@ -46,6 +46,7 @@ use std::process::Command;
 use rstest::rstest;
 use tempfile::TempDir;
 
+use crate::helpers::assertions::assert_text_files_eq;
 use crate::helpers::bam_generator::create_umi_family;
 use crate::helpers::read_bam_output;
 use crate::test_correct_command::create_umi_bam;
@@ -284,10 +285,10 @@ fn cutover_matches_baseline(#[case] with_metrics: bool) {
             baseline.display(),
         );
         if with_metrics {
-            assert_eq!(
-                std::fs::read_to_string(&current_tsv).expect("current tsv"),
-                std::fs::read_to_string(&baseline_tsv).expect("baseline tsv"),
-                "chain --metrics TSV diverges from the serial baseline binary"
+            assert_text_files_eq(
+                &current_tsv,
+                &baseline_tsv,
+                "chain --metrics TSV diverges from the serial baseline binary",
             );
         }
     } else {
@@ -406,9 +407,9 @@ fn cutover_min_corrected_failure_writes_metrics() {
             baseline_tsv.exists(),
             "the baseline's legacy path must also leave a --metrics TSV behind on the failure"
         );
-        assert_eq!(
-            std::fs::read_to_string(&current_tsv).expect("current tsv"),
-            std::fs::read_to_string(&baseline_tsv).expect("baseline tsv"),
+        assert_text_files_eq(
+            &current_tsv,
+            &baseline_tsv,
             "chain --metrics TSV on a --min-corrected failure diverges from the serial baseline",
         );
         assert_eq!(

@@ -50,6 +50,7 @@ use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use rstest::rstest;
 use tempfile::TempDir;
 
+use crate::helpers::assertions::assert_text_files_eq;
 use crate::helpers::bam_generator::{create_minimal_header, create_test_reference, write_bam};
 use crate::helpers::read_bam_output;
 
@@ -491,10 +492,10 @@ fn cutover_matches_baseline(#[case] with_metrics: bool) {
             baseline.display(),
         );
         if with_metrics {
-            assert_eq!(
-                std::fs::read_to_string(&current_tsv).expect("current tsv"),
-                std::fs::read_to_string(&baseline_tsv).expect("baseline tsv"),
-                "chain --metrics TSV diverges from the serial baseline binary"
+            assert_text_files_eq(
+                &current_tsv,
+                &baseline_tsv,
+                "chain --metrics TSV diverges from the serial baseline binary",
             );
         }
     } else {

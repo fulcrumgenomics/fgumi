@@ -40,6 +40,7 @@ use tempfile::TempDir;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 
+use crate::helpers::assertions::assert_text_files_eq;
 use crate::helpers::bam_generator::{create_minimal_header, write_bam};
 use crate::helpers::read_bam_output;
 
@@ -578,16 +579,20 @@ fn cutover_matches_baseline_by_strategy(#[case] strategy: &str) {
              baseline binary ({}) after stripping @PG — a real cutover parity bug",
             baseline.display(),
         );
-        assert_eq!(
-            std::fs::read_to_string(&current_metrics).expect("current metrics"),
-            std::fs::read_to_string(&baseline_metrics).expect("baseline metrics"),
-            "chain --metrics TSV (--strategy {strategy}) diverges from the legacy baseline"
+        assert_text_files_eq(
+            &current_metrics,
+            &baseline_metrics,
+            &format!(
+                "chain --metrics TSV (--strategy {strategy}) diverges from the legacy baseline"
+            ),
         );
-        assert_eq!(
-            std::fs::read_to_string(&current_hist).expect("current histogram"),
-            std::fs::read_to_string(&baseline_hist).expect("baseline histogram"),
-            "chain --family-size-histogram TSV (--strategy {strategy}) diverges from the legacy \
-             baseline"
+        assert_text_files_eq(
+            &current_hist,
+            &baseline_hist,
+            &format!(
+                "chain --family-size-histogram TSV (--strategy {strategy}) diverges from the \
+                 legacy baseline"
+            ),
         );
     } else {
         eprintln!(
