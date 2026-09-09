@@ -91,6 +91,7 @@ rustix = { version = "1.1", default-features = false, features = ["std"] }
 rayon = "1.10"
 rstest = "0.26"
 serde = { version = "1.0.228", features = ["derive"] }
+statrs = "0.18"
 # Held at 0.38 because sysinfo >=0.39 requires rustc 1.95 > our MSRV (rust-toolchain.toml pins
 # 1.93). Centralized so `fgumi` and `fgumi-cli-common` cannot drift onto different versions and
 # silently raise the effective MSRV.
@@ -145,7 +146,7 @@ indexmap = "2"
 rand = { workspace = true }
 csv = "1.1"
 memchr = { workspace = true }
-statrs = "0.18"
+statrs = { workspace = true }
 bytesize = { workspace = true }
 sysinfo = { workspace = true } # unconditionally used by validate_against_system_memory
 fs4 = { workspace = true } # cross-platform filesystem free-space queries

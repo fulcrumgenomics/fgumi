@@ -66,7 +66,7 @@ use fgumi_raw_bam::{RawRecord, flags as raw_flags};
 /// accumulator ever sees, not per-call scratch. It is persisted here (not
 /// reallocated per `record_coordinate_group` call) so a future finalize step
 /// can build yield metrics from it the same way the separate-pass commands
-/// do (`collector.into_yield_metric(fraction, read_pairs, min_reads)` with
+/// do (`collector.to_yield_metric(fraction, read_pairs, min_reads)` with
 /// `read_pairs` sourced from this array).
 pub(crate) enum ConsensusMetricsAccumulator {
     Simplex {
@@ -124,15 +124,29 @@ impl ConsensusMetricsAccumulator {
         group: &[TemplateInfo],
         intervals: &[Interval],
     ) -> Result<()> {
-        let filtered: Vec<TemplateInfo> =
-            group.iter().filter(|t| overlaps_intervals(t, intervals)).cloned().collect();
+        // In the common case (no `--intervals`) `overlaps_intervals` is an
+        // unconditional pass-through, so borrow the caller's group directly
+        // and only materialize a filtered `Vec` when an interval filter is
+        // actually set — avoiding a full clone of every `TemplateInfo` on the
+        // hot path.
+        let owned_filtered;
+        let filtered: &[TemplateInfo] = if intervals.is_empty() {
+            group
+        } else {
+            owned_filtered = group
+                .iter()
+                .filter(|t| overlaps_intervals(t, intervals))
+                .cloned()
+                .collect::<Vec<_>>();
+            &owned_filtered
+        };
         if filtered.is_empty() {
             return Ok(());
         }
         match self {
             Self::Simplex { collectors, umi_caller, fraction_template_counts } => {
                 record_simplex_coordinate_group(
-                    &filtered,
+                    filtered,
                     &DOWNSAMPLING_FRACTIONS,
                     &mut collectors[..],
                     umi_caller,
@@ -145,7 +159,7 @@ impl ConsensusMetricsAccumulator {
                 fraction_template_counts,
                 duplex_umi_counts,
             } => record_duplex_coordinate_group(
-                &filtered,
+                filtered,
                 &DOWNSAMPLING_FRACTIONS,
                 &mut collectors[..],
                 umi_caller,
@@ -305,7 +319,7 @@ pub(crate) fn write_simplex_metrics_files(
         .zip(DOWNSAMPLING_FRACTIONS.iter())
         .zip(fraction_template_counts.iter())
         .map(|((collector, &fraction), &read_pairs)| {
-            collector.into_yield_metric(fraction, read_pairs, min_reads)
+            collector.to_yield_metric(fraction, read_pairs, min_reads)
         })
         .collect();
 
@@ -353,7 +367,7 @@ pub(crate) fn write_duplex_metrics_files(
         .zip(DOWNSAMPLING_FRACTIONS.iter())
         .zip(fraction_template_counts.iter())
         .map(|((collector, &fraction), &read_pairs)| {
-            collector.into_yield_metric(fraction, read_pairs, min_ab_reads, min_ba_reads)
+            collector.to_yield_metric(fraction, read_pairs, min_ab_reads, min_ba_reads)
         })
         .collect();
 
@@ -407,16 +421,30 @@ impl Ordered for CoordinateGroupFragment {
 }
 
 impl HeapSize for CoordinateGroupFragment {
-    /// Approximate heap footprint: the entries `Vec`'s allocated capacity.
-    /// `TemplateInfo`/`ReadInfoKey` themselves hold their own heap
-    /// allocations (`String`s, an optional `Box<[u8]>`), but this collector
-    /// is never routed through a `ByteBoundedQueue` in this task (Task 8 unit
-    /// tests it directly, with no queue at all) — Task 11's wiring is what
-    /// actually exercises this bound, and a capacity-only estimate matches
-    /// the level of precision `BatchedMiGroups::heap_size` already accepts
-    /// for its own `Vec<MiGroup>` (`crate::pipeline::steps::group::mi`).
+    /// Heap footprint: the entries `Vec`'s allocated capacity PLUS the heap
+    /// each entry owns behind its inline fields — `TemplateInfo`'s `mi`/`rx`
+    /// `String`s and optional `ref_name`, and `ReadInfoKey`'s optional
+    /// `cell_barcode: Box<[u8]>`. Counting only the `Vec` capacity would
+    /// under-report real memory held, which matters because this fragment is
+    /// the item type of a `ByteBoundedQueue` on the T2 metrics branch (wired
+    /// in `builder.rs::add_{simplex,duplex,codec}`), so an undercount lets the
+    /// queue hold more than its configured `limit_bytes`. Mirrors
+    /// `MiGroup::estimate_heap_size` (`crate::mi_group`), which likewise sums
+    /// its `String` capacity and its records' bytes rather than a flat count.
     fn heap_size(&self) -> usize {
-        self.entries.capacity() * std::mem::size_of::<(TemplateInfo, ReadInfoKey)>()
+        let vec_overhead =
+            self.entries.capacity() * std::mem::size_of::<(TemplateInfo, ReadInfoKey)>();
+        let content: usize = self
+            .entries
+            .iter()
+            .map(|(info, key)| {
+                info.mi.capacity()
+                    + info.rx.capacity()
+                    + info.ref_name.as_ref().map_or(0, String::capacity)
+                    + key.cell_barcode.as_ref().map_or(0, |b| b.len())
+            })
+            .sum();
+        vec_overhead + content
     }
 }
 
@@ -427,8 +455,8 @@ impl HeapSize for CoordinateGroupFragment {
 /// physical position by upstream grouping), so pairing via an unordered
 /// `HashMap` does not risk interleaving templates from genuinely different
 /// `ReadInfoKey`s within a single `MiGroup`.
-fn pair_records_by_read_name(records: &[RawRecord]) -> Vec<(RawRecord, RawRecord)> {
-    let mut by_name: HashMap<Vec<u8>, (Option<RawRecord>, Option<RawRecord>)> = HashMap::new();
+fn pair_records_by_read_name(records: &[RawRecord]) -> Vec<(&RawRecord, &RawRecord)> {
+    let mut by_name: HashMap<Vec<u8>, (Option<&RawRecord>, Option<&RawRecord>)> = HashMap::new();
     for record in records {
         let flags = record.flags();
         let qualifies = (flags & raw_flags::PAIRED) != 0
@@ -442,9 +470,9 @@ fn pair_records_by_read_name(records: &[RawRecord]) -> Vec<(RawRecord, RawRecord
         let name = fgumi_raw_bam::read_name(record.as_ref()).to_vec();
         let entry = by_name.entry(name).or_default();
         if (flags & raw_flags::FIRST_SEGMENT) != 0 {
-            entry.0 = Some(record.clone());
+            entry.0 = Some(record);
         } else if (flags & raw_flags::LAST_SEGMENT) != 0 {
-            entry.1 = Some(record.clone());
+            entry.1 = Some(record);
         }
     }
     by_name
@@ -481,7 +509,7 @@ pub(crate) fn push_mi_group_entries(
     entries: &mut Vec<(TemplateInfo, ReadInfoKey)>,
 ) -> Result<()> {
     for (r1, r2) in pair_records_by_read_name(&mi_group.records) {
-        if let Some((info, key)) = build_template_info(&r1, &r2, header, library_index)? {
+        if let Some((info, key)) = build_template_info(r1, r2, header, library_index)? {
             entries.push((info, key));
         }
     }
@@ -912,7 +940,8 @@ mod pair_and_push_tests {
         let header = crate::commands::shared_metrics::tests::test_header();
         let (a1, a2) = raw_pair("a", "0", &header);
         let (b1, b2) = raw_pair("b", "1", &header);
-        let pairs = pair_records_by_read_name(&[a1, a2, b1, b2]);
+        let records = [a1, a2, b1, b2];
+        let pairs = pair_records_by_read_name(&records);
         assert_eq!(pairs.len(), 2, "two complete R1/R2 pairs must produce two tuples");
     }
 
@@ -920,7 +949,8 @@ mod pair_and_push_tests {
     fn pair_records_by_read_name_drops_a_record_missing_its_mate() {
         let header = crate::commands::shared_metrics::tests::test_header();
         let (a1, _a2) = raw_pair("a", "0", &header);
-        let pairs = pair_records_by_read_name(&[a1]);
+        let records = [a1];
+        let pairs = pair_records_by_read_name(&records);
         assert!(pairs.is_empty(), "an R1 with no matching R2 must be dropped");
     }
 
@@ -943,7 +973,8 @@ mod pair_and_push_tests {
             .mate_ref_id(0)
             .mate_pos(149);
         let secondary = builder.build();
-        let pairs = pair_records_by_read_name(&[secondary]);
+        let records = [secondary];
+        let pairs = pair_records_by_read_name(&records);
         assert!(pairs.is_empty(), "a SECONDARY record must never qualify for pairing");
     }
 

@@ -191,7 +191,7 @@ impl Command for DuplexMetrics {
         for ((&fraction, collector), &read_pairs) in
             fractions.iter().zip(collectors.iter()).zip(fraction_template_counts.iter())
         {
-            let yield_metric = collector.into_yield_metric(
+            let yield_metric = collector.to_yield_metric(
                 fraction,
                 read_pairs,
                 self.min_ab_reads,

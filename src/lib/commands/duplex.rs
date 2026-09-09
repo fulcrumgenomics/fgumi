@@ -143,7 +143,11 @@ pub struct Duplex {
     /// Optional prefix for inline consensus QC metrics (CS/SS/DS family
     /// sizes, UMI counts, downsampling yield curve) — same numeric output as
     /// running `duplex-metrics` separately, computed inline during this call
-    /// with no second BAM read.
+    /// with no second BAM read. One exception: the inline path does not emit
+    /// `<prefix>.duplex_umi_counts.txt` (the per-duplex-UMI tally that
+    /// `duplex-metrics` gates behind its own `--duplex-umi-counts` flag); it
+    /// has no inline equivalent, so run `duplex-metrics` separately if you
+    /// need that file.
     #[arg(long = "metrics")]
     pub metrics: Option<std::path::PathBuf>,
 
@@ -469,6 +473,8 @@ impl Command for Duplex {
     ///     queue_memory: QueueMemoryOptions::default(),
     ///     methylation_mode: None,
     ///     reference: None,
+    ///     metrics: None,
+    ///     intervals: None,
     /// };
     ///
     /// duplex.execute("test")?;

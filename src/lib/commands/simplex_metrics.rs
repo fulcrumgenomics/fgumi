@@ -153,7 +153,7 @@ impl Command for SimplexMetrics {
         for ((&fraction, collector), &read_pairs) in
             fractions.iter().zip(collectors.iter()).zip(fraction_template_counts.iter())
         {
-            let yield_metric = collector.into_yield_metric(fraction, read_pairs, self.min_reads);
+            let yield_metric = collector.to_yield_metric(fraction, read_pairs, self.min_reads);
             yield_metrics.push(yield_metric);
         }
 
@@ -441,7 +441,7 @@ mod tests {
         collector.record_ss_family(3);
         collector.record_cs_family(6);
 
-        let metric = collector.into_yield_metric(1.0, 6, 2);
+        let metric = collector.to_yield_metric(1.0, 6, 2);
 
         assert_eq!(metric.cs_families, 1);
         assert_eq!(metric.ss_families, 3);
@@ -454,7 +454,7 @@ mod tests {
     #[test]
     fn test_generate_yield_metric_empty() {
         let collector = SimplexMetricsCollector::new();
-        let metric = collector.into_yield_metric(0.5, 0, 1);
+        let metric = collector.to_yield_metric(0.5, 0, 1);
 
         assert_eq!(metric.cs_families, 0);
         assert_eq!(metric.ss_families, 0);
@@ -470,7 +470,7 @@ mod tests {
         collector.record_ss_family(1);
         collector.record_ss_family(1);
 
-        let metric = collector.into_yield_metric(1.0, 3, 2);
+        let metric = collector.to_yield_metric(1.0, 3, 2);
 
         assert_eq!(metric.ss_families, 3);
         assert_eq!(metric.ss_singletons, 3);

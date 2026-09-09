@@ -72,6 +72,20 @@ fn assert_metrics_file_eq(
     let expected = std::fs::read_to_string(suffixed(expected_prefix, suffix)).unwrap_or_else(|e| {
         panic!("{context}: missing {suffix} at {}: {e}", expected_prefix.display())
     });
+    // Non-vacuity guard: a `family_sizes` file with only a header (no data
+    // rows) means the input produced no counted families — which happens
+    // silently if the test data is single-end, since every metrics path drops
+    // non-PAIRED records. An empty-vs-empty comparison would pass without
+    // exercising the metric at all, so require at least one data row on the
+    // family-size files (the ones that are empty exactly when nothing was
+    // counted).
+    if suffix.ends_with("family_sizes.txt") {
+        assert!(
+            expected.lines().count() >= 2,
+            "{context}: ground-truth {suffix} has no data rows — the parity assertion would be \
+             vacuous (is the test input PAIRED? simplex metrics count paired templates only)",
+        );
+    }
     assert_eq!(actual, expected, "{context}: {suffix} diverges from ground truth");
 }
 
@@ -81,23 +95,76 @@ fn assert_metrics_file_eq(
 // single-threaded, one family per case.
 // ============================================================================
 
+/// Builds one simplex read PAIR (R1 + R2, one single-strand UMI) sharing
+/// `name`, `umi`, and optionally an `mi` tag. R1 sits at `r1_pos` spanning
+/// `r1_len`; R2 is stacked immediately after it (reverse strand), forming a
+/// valid FR template.
+///
+/// Simplex metrics count PAIRED templates only — every metrics path
+/// (`pair_records_by_read_name`, and the separate-pass `simplex-metrics`)
+/// drops non-`PAIRED` records — so these builders MUST emit real pairs. With
+/// single-end records (`flags(0)`) both the inline output and the ground
+/// truth come out empty and the parity assertions pass vacuously.
+fn simplex_pair(
+    name: &str,
+    umi: &str,
+    mi: Option<&str>,
+    r1_pos: i32,
+    r1_len: usize,
+) -> (RawRecord, RawRecord) {
+    let r2_pos = r1_pos + i32::try_from(r1_len).expect("r1_len fits i32");
+    let r1_cigar = u32::try_from(r1_len).expect("r1_len fits u32") << 4;
+    let r2_cigar = 10u32 << 4;
+    let tlen = (r2_pos + 10) - r1_pos;
+
+    let mut b1 = SamBuilder::new();
+    b1.read_name(name.as_bytes())
+        .sequence(&vec![b'A'; r1_len])
+        .qualities(&vec![30u8; r1_len])
+        .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+        .ref_id(0)
+        .pos(r1_pos)
+        .mapq(60)
+        .cigar_ops(&[r1_cigar])
+        .mate_ref_id(0)
+        .mate_pos(r2_pos)
+        .template_length(tlen);
+    b1.add_string_tag(SamTag::RX, umi.as_bytes());
+    b1.add_string_tag(SamTag::MC, b"10M");
+    if let Some(mi) = mi {
+        b1.add_string_tag(SamTag::MI, mi.as_bytes());
+    }
+    let r1 = b1.build();
+
+    let mut b2 = SamBuilder::new();
+    b2.read_name(name.as_bytes())
+        .sequence(b"ACGTACGTAC")
+        .qualities(&[30u8; 10])
+        .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+        .ref_id(0)
+        .pos(r2_pos)
+        .mapq(60)
+        .cigar_ops(&[r2_cigar])
+        .mate_ref_id(0)
+        .mate_pos(r1_pos)
+        .template_length(-tlen);
+    b2.add_string_tag(SamTag::RX, umi.as_bytes());
+    b2.add_string_tag(SamTag::MC, format!("{r1_len}M").as_bytes());
+    if let Some(mi) = mi {
+        b2.add_string_tag(SamTag::MI, mi.as_bytes());
+    }
+    let r2 = b2.build();
+
+    (r1, r2)
+}
+
 /// Builds `family_size` read pairs, all sharing one MI (one UMI family) at
 /// one position, so the whole group forms exactly one CS/SS family.
 fn one_family_records(family_size: usize) -> Vec<RawRecord> {
     (0..family_size)
-        .map(|i| {
-            let mut b = SamBuilder::new();
-            b.read_name(format!("read-{i}").as_bytes())
-                .sequence(b"ACGTACGTAC")
-                .qualities(&[30; 10])
-                .flags(0)
-                .ref_id(0)
-                .pos(100)
-                .mapq(60)
-                .cigar_ops(&[10 << 4]);
-            b.add_string_tag(SamTag::MI, b"0");
-            b.add_string_tag(SamTag::RX, b"ACGT-TGCA");
-            b.build()
+        .flat_map(|i| {
+            let (r1, r2) = simplex_pair(&format!("read-{i}"), "ACGT-TGCA", Some("0"), 100, 10);
+            [r1, r2]
         })
         .collect()
 }
@@ -260,17 +327,9 @@ fn simplex_shape_records(shape: Shape) -> Vec<RawRecord> {
     for f in 0..shape.n_families() {
         let umi = indexed_umi(f);
         for i in 0..shape.depth() {
-            let mut b = SamBuilder::new();
-            b.read_name(format!("f{f}_r{i}").as_bytes())
-                .sequence(b"ACGTACGTAC")
-                .qualities(&[30; 10])
-                .flags(0)
-                .ref_id(0)
-                .pos(100)
-                .mapq(60)
-                .cigar_ops(&[10 << 4]);
-            b.add_string_tag(SamTag::RX, umi.as_bytes());
-            records.push(b.build());
+            let (r1, r2) = simplex_pair(&format!("f{f}_r{i}"), &umi, None, 100, 10);
+            records.push(r1);
+            records.push(r2);
         }
     }
     records
@@ -400,20 +459,17 @@ fn split_interval_duplex_family() -> Vec<RawRecord> {
 /// two single-end reads sharing one position/strand key but differing read
 /// length, so their spans differ while remaining one coordinate group.
 fn split_interval_simplex_family() -> Vec<RawRecord> {
-    let build = |name: &str, umi: &str, len: usize| {
-        let mut b = SamBuilder::new();
-        b.read_name(name.as_bytes())
-            .sequence(&vec![b'A'; len])
-            .qualities(&vec![30u8; len])
-            .flags(0)
-            .ref_id(0)
-            .pos(100)
-            .mapq(60)
-            .cigar_ops(&[u32::try_from(len).expect("len fits u32") << 4]);
-        b.add_string_tag(SamTag::RX, umi.as_bytes());
-        b.build()
-    };
-    vec![build("near", "AAAAAAAAAA", 10), build("far", "CCCCCCCCCC", 600)]
+    let mut records = Vec::new();
+    // "near" (R1 spans 100..110) falls outside the 500..600 interval; "far"
+    // (R1 spans 100..700) overlaps it — so interval filtering must drop one
+    // template and keep the other. Both must be PAIRED or they are dropped
+    // before the interval filter ever runs.
+    for (name, umi, len) in [("near", "AAAAAAAAAA", 10usize), ("far", "CCCCCCCCCC", 600usize)] {
+        let (r1, r2) = simplex_pair(name, umi, None, 100, len);
+        records.push(r1);
+        records.push(r2);
+    }
+    records
 }
 
 /// Writes a BED-format interval file (0-based, half-open).
@@ -1137,17 +1193,9 @@ fn three_batch_multi_worker_t2_matches_ground_truth() {
     let mut records = Vec::new();
     for f in 0..130 {
         let umi = indexed_umi(f);
-        let mut b = SamBuilder::new();
-        b.read_name(format!("f{f}").as_bytes())
-            .sequence(b"ACGTACGTAC")
-            .qualities(&[30; 10])
-            .flags(0)
-            .ref_id(0)
-            .pos(100)
-            .mapq(60)
-            .cigar_ops(&[10 << 4]);
-        b.add_string_tag(SamTag::RX, umi.as_bytes());
-        records.push(b.build());
+        let (r1, r2) = simplex_pair(&format!("f{f}"), &umi, None, 100, 10);
+        records.push(r1);
+        records.push(r2);
     }
     write_bam(&bam_path, &header, &records);
 

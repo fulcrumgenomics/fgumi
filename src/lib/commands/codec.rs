@@ -246,7 +246,10 @@ pub struct Codec {
     /// duplex-shaped file set `duplex-metrics` writes (CS/SS/DS family
     /// sizes, UMI counts, downsampling yield curve), since codec is
     /// DS-capable and shares the `Duplex` inline-collector variant.
-    /// Computed inline with no second BAM read.
+    /// Computed inline with no second BAM read. As with `duplex --metrics`,
+    /// the inline path does not emit `<prefix>.duplex_umi_counts.txt` (the
+    /// tally `duplex-metrics` gates behind `--duplex-umi-counts`); run
+    /// `duplex-metrics` separately if you need that file.
     #[arg(long = "metrics")]
     pub metrics: Option<std::path::PathBuf>,
 

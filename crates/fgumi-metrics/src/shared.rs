@@ -190,6 +190,26 @@ mod tests {
         assert_eq!(items[1], ("CCCC", 8, 0, 1));
     }
 
+    /// Exercises `merge`'s accumulate-onto-existing arm: an overlapping UMI
+    /// key must SUM its `(raw, errors, unique)` tuple across the two trackers,
+    /// not overwrite it. The other `merge` coverage only ever folds disjoint
+    /// UMIs, so an overwrite-instead-of-sum bug would slip through.
+    #[test]
+    fn merge_sums_overlapping_umi_counts() {
+        let mut a = UmiCountTracker::new();
+        a.record("AAAA", 10, 2, true); // -> (10, 2, unique 1)
+        let mut b = UmiCountTracker::new();
+        b.record("AAAA", 5, 1, false); // -> (5, 1, unique 0), overlaps "AAAA"
+        b.record("CCCC", 3, 0, true); // disjoint
+
+        a.merge(b);
+
+        let mut items: Vec<_> = a.iter().collect();
+        items.sort_by(|x, y| x.0.cmp(y.0));
+        assert_eq!(items[0], ("AAAA", 15, 3, 1), "overlapping UMI must sum raw/errors/unique");
+        assert_eq!(items[1], ("CCCC", 3, 0, 1));
+    }
+
     // =========================================================================
     // UmiMetric tests
     // =========================================================================

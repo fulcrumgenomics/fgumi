@@ -243,7 +243,7 @@ impl SimplexMetricsCollector {
     /// it from the calling command's own `min_reads` option (Task 11), so
     /// the two agree by construction rather than by convention.
     #[must_use]
-    pub fn into_yield_metric(
+    pub fn to_yield_metric(
         &self,
         fraction: f64,
         read_pairs: usize,
@@ -406,13 +406,13 @@ mod tests {
     }
 
     #[test]
-    fn into_yield_metric_counts_ss_consensus_families_at_the_min_reads_threshold() {
+    fn to_yield_metric_counts_ss_consensus_families_at_the_min_reads_threshold() {
         let mut collector = SimplexMetricsCollector::new();
         collector.record_cs_family(4);
         collector.record_ss_family(1); // below min_reads=2, excluded
         collector.record_ss_family(3); // at/above min_reads=2, included
 
-        let metric = collector.into_yield_metric(0.5, 100, 2);
+        let metric = collector.to_yield_metric(0.5, 100, 2);
 
         assert!((metric.fraction - 0.5).abs() < f64::EPSILON);
         assert_eq!(metric.read_pairs, 100);
@@ -487,6 +487,34 @@ mod tests {
         let mut expected = expected;
         expected.sort_unstable();
         assert_eq!(got, expected);
+    }
+
+    /// The `ss_family_sizes` sibling of `merge_sums_cs_family_sizes_by_key`:
+    /// `merge` folds `ss_family_sizes` with the same accumulate-onto-existing
+    /// loop, but the only other coverage (`merge_is_commutative`) records the
+    /// same ss size on both sides and asserts commutativity alone, which a
+    /// sum-vs-overwrite bug in the ss loop would still satisfy. This pins the
+    /// overlapping-key SUM directly.
+    #[test]
+    fn merge_sums_overlapping_ss_family_sizes() {
+        let mut left = SimplexMetricsCollector::new();
+        left.record_ss_family(1);
+        left.record_ss_family(1); // size 1 -> count 2
+        left.record_ss_family(3);
+        let mut right = SimplexMetricsCollector::new();
+        right.record_ss_family(1); // overlaps size 1
+        right.record_ss_family(5);
+
+        left.merge(right);
+
+        let mut got: Vec<(usize, usize)> =
+            left.ss_family_sizes.iter().map(|(k, v)| (*k, *v)).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![(1, 3), (3, 1), (5, 1)],
+            "overlapping ss size 1 must sum to 3, not overwrite",
+        );
     }
 
     #[test]

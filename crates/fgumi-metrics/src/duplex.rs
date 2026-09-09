@@ -525,7 +525,7 @@ impl DuplexMetricsCollector {
     /// inline path derives them from the calling command's `min_reads`
     /// (Task 11).
     #[must_use]
-    pub fn into_yield_metric(
+    pub fn to_yield_metric(
         &self,
         fraction: f64,
         read_pairs: usize,
@@ -610,9 +610,12 @@ impl DuplexMetricsCollector {
             }
 
             // Calculate P(A >= min_ab AND B >= min_ba) where A ~ Binomial(n=size, p=0.5)
-            // and B = size - A. Equivalent to:
-            //   P(min_ba <= A <= size - min_ab)
-            //   = CDF(size - min_ab) - CDF(min_ba - 1)
+            // and B = size - A. Since B >= min_ba <=> A <= size - min_ba, this is:
+            //   P(min_ab <= A <= size - min_ba)
+            //   = CDF(size - min_ba) - CDF(min_ab - 1)
+            // (matching upper_bound = size - min_ba, lower_bound = min_ab below;
+            // the min_ab/min_ba roles are NOT interchangeable except by the
+            // p = 0.5 symmetry that makes A and size - A identically distributed).
 
             // `Binomial::new(p, n)` only returns `Err` when `p` is NaN or
             // outside `[0, 1]` (statrs 0.18 `BinomialError::ProbabilityInvalid`).
@@ -1075,11 +1078,11 @@ mod tests {
     }
 
     // =========================================================================
-    // DuplexMetricsCollector::into_yield_metric tests
+    // DuplexMetricsCollector::to_yield_metric tests
     // =========================================================================
 
     #[test]
-    fn into_yield_metric_counts_ds_duplexes_at_the_ab_ba_thresholds() {
+    fn to_yield_metric_counts_ds_duplexes_at_the_ab_ba_thresholds() {
         let mut collector = DuplexMetricsCollector::new(false);
         collector.record_ds_family(2);
         collector.record_duplex_family(1, 5); // normalizes to ab=5, ba=1
@@ -1087,9 +1090,29 @@ mod tests {
         collector.record_duplex_family(1, 0); // ab=1, ba=0
 
         // min_ab_reads=3, min_ba_reads=1: only the (ab=5, ba=1) family qualifies.
-        let metric = collector.into_yield_metric(1.0, 10, 3, 1);
+        let metric = collector.to_yield_metric(1.0, 10, 3, 1);
 
         assert_eq!(metric.ds_duplexes, 1);
+    }
+
+    /// Pins the binomial-CDF `ds_fraction_duplexes_ideal` math directly (the
+    /// parity fixtures cannot, since `to_yield_metric` is only reachable via
+    /// the separate-pass command). One DS family of size 4 with
+    /// `min_ab = min_ba = 1`: the ideal fraction is
+    /// `P(1 <= A <= 3)` for `A ~ Binomial(4, 0.5)`
+    /// `= CDF(3) - CDF(0) = (1 - 1/16) - 1/16 = 14/16 = 0.875`.
+    #[test]
+    fn to_yield_metric_ideal_duplex_fraction_is_the_binomial_cdf_value() {
+        let mut collector = DuplexMetricsCollector::new(false);
+        collector.record_ds_family(4);
+
+        let metric = collector.to_yield_metric(1.0, 8, 1, 1);
+
+        assert!(
+            (metric.ds_fraction_duplexes_ideal - 0.875).abs() < 1e-9,
+            "ideal duplex fraction must be the binomial CDF value 0.875, got {}",
+            metric.ds_fraction_duplexes_ideal,
+        );
     }
 
     #[test]

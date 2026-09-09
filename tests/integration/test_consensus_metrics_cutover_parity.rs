@@ -64,21 +64,51 @@ const N_MIS: usize = 60;
 /// `N_MIS` distinct single-index UMIs, one single-end read each, all at one
 /// position — one coordinate group split across `N_MIS` MIs, straddling
 /// `GroupByMi`'s 50-MI batch boundary.
+/// One simplex read PAIR (R1 + R2, single UMI strand) sharing `name` and
+/// `umi` at `pos`. Simplex metrics count PAIRED templates only, so single-end
+/// records are dropped by every metrics path and would make the parity
+/// assertions compare empty files.
+fn simplex_pair(name: &str, umi: &str, pos: i32) -> (RawRecord, RawRecord) {
+    let mut b1 = SamBuilder::new();
+    b1.read_name(name.as_bytes())
+        .sequence(b"ACGTACGTAC")
+        .qualities(&[30u8; 10])
+        .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+        .ref_id(0)
+        .pos(pos)
+        .mapq(60)
+        .cigar_ops(&[10 << 4])
+        .mate_ref_id(0)
+        .mate_pos(pos + 10)
+        .template_length(20);
+    b1.add_string_tag(SamTag::RX, umi.as_bytes());
+    b1.add_string_tag(SamTag::MC, b"10M");
+    let r1 = b1.build();
+
+    let mut b2 = SamBuilder::new();
+    b2.read_name(name.as_bytes())
+        .sequence(b"ACGTACGTAC")
+        .qualities(&[30u8; 10])
+        .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+        .ref_id(0)
+        .pos(pos + 10)
+        .mapq(60)
+        .cigar_ops(&[10 << 4])
+        .mate_ref_id(0)
+        .mate_pos(pos)
+        .template_length(-20);
+    b2.add_string_tag(SamTag::RX, umi.as_bytes());
+    b2.add_string_tag(SamTag::MC, b"10M");
+    let r2 = b2.build();
+
+    (r1, r2)
+}
+
 fn simplex_many_mi_records() -> Vec<RawRecord> {
     (0..N_MIS)
-        .map(|f| {
-            let umi = indexed_umi(f);
-            let mut b = SamBuilder::new();
-            b.read_name(format!("f{f}").as_bytes())
-                .sequence(b"ACGTACGTAC")
-                .qualities(&[30; 10])
-                .flags(0)
-                .ref_id(0)
-                .pos(100)
-                .mapq(60)
-                .cigar_ops(&[10 << 4]);
-            b.add_string_tag(SamTag::RX, umi.as_bytes());
-            b.build()
+        .flat_map(|f| {
+            let (r1, r2) = simplex_pair(&format!("f{f}"), &indexed_umi(f), 100);
+            [r1, r2]
         })
         .collect()
 }
