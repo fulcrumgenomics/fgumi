@@ -136,7 +136,7 @@ impl std::fmt::Display for InstrumentationLevel {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PipelineConfig {
     pub threads: usize,
     /// Optional shared stats collector. Construct via `Pipeline::stats()`,
@@ -187,6 +187,37 @@ pub struct PipelineConfig {
     /// sort chain, to overlap its serial boundary/key scan with the parallel
     /// inflate instead of starving it behind inflate on the shared pool.
     pub scheduler: Arc<dyn super::runtime::Scheduler>,
+    /// Where + how often to emit the four-file per-tick telemetry TSVs
+    /// (`<stem>.ticks.{summary,edges,workers,steps}.tsv`). `None` (the default)
+    /// keeps the zero-cost path: no [`WorkerStateBoard`](crate::runtime::WorkerStateBoard)
+    /// is built and every worker/sampler is handed `None`. `Some(..)` sizes the
+    /// board, stamps each worker/detached-driver thread, and drives the tick
+    /// telemetry from the occupancy sampler.
+    pub telemetry: Option<crate::runtime::telemetry::TelemetryConfig>,
+    /// Optional resident-set-size probe. When set, the sampler calls it once per
+    /// tick for the summary row's `rss_bytes` column. `None` (the default) leaves
+    /// that column empty. Boxed behind an `Arc` so the config stays `Clone`; the
+    /// probe must be `Send + Sync` because the sampler invokes it from its own
+    /// thread.
+    pub rss_probe: Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for PipelineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `rss_probe` holds an `Arc<dyn Fn>`, which is not `Debug`; render it as a
+        // presence marker and delegate every other field to its own `Debug`.
+        f.debug_struct("PipelineConfig")
+            .field("threads", &self.threads)
+            .field("stats", &self.stats)
+            .field("deadlock_timeout_secs", &self.deadlock_timeout_secs)
+            .field("queue_memory_total", &self.queue_memory_total)
+            .field("instrumentation", &self.instrumentation)
+            .field("trace_path", &self.trace_path)
+            .field("scheduler", &self.scheduler)
+            .field("telemetry", &self.telemetry)
+            .field("rss_probe", &self.rss_probe.as_ref().map(|_| &"<fn>"))
+            .finish()
+    }
 }
 
 impl Default for PipelineConfig {
@@ -224,6 +255,8 @@ impl Default for PipelineConfig {
             instrumentation: InstrumentationLevel::Off,
             trace_path: None,
             scheduler: Arc::new(super::runtime::ChainOrderScheduler),
+            telemetry: None,
+            rss_probe: None,
         }
     }
 }
@@ -281,6 +314,24 @@ impl PipelineConfig {
     #[must_use]
     pub fn with_instrumentation(mut self, level: InstrumentationLevel) -> Self {
         self.instrumentation = level;
+        self
+    }
+
+    /// Builder-style helper to enable the four-file per-tick telemetry. `Some(..)`
+    /// sizes the [`WorkerStateBoard`](crate::runtime::WorkerStateBoard) and drives
+    /// the tick telemetry from the occupancy sampler; the default (`None`) keeps
+    /// the zero-cost path.
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: crate::runtime::telemetry::TelemetryConfig) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+
+    /// Builder-style helper to attach an RSS probe for the telemetry summary
+    /// row's `rss_bytes` column.
+    #[must_use]
+    pub fn with_rss_probe(mut self, probe: Arc<dyn Fn() -> Option<u64> + Send + Sync>) -> Self {
+        self.rss_probe = Some(probe);
         self
     }
 }
@@ -1158,6 +1209,19 @@ impl Pipeline {
         // `contexts[step_idx]`. Done before `build_worker_storage` consumes
         // `steps`. Empty for every non-sort chain (nothing declares Detached).
         let detached_steps = extract_detached_steps(&mut steps);
+        let n_detached = detached_steps.len();
+
+        // 3b. Per-OS-thread state board for tick telemetry. Sized to cover every
+        // pipeline thread: pool workers take slots `0..n_threads`, detached
+        // drivers take `n_threads..`. Built ONLY when telemetry is on, so the
+        // telemetry-off path keeps its byte-identical zero-cost route (no board,
+        // `None` threaded into every worker/driver/sampler).
+        let worker_board: Option<Arc<crate::runtime::worker_state::WorkerStateBoard>> =
+            config.telemetry.as_ref().map(|_| {
+                Arc::new(crate::runtime::worker_state::WorkerStateBoard::new(
+                    n_threads + n_detached,
+                ))
+            });
 
         // 4. Build per-worker step storage (consumes `steps`).
         let mut worker_entries = build_worker_storage(steps, &owners, n_threads);
@@ -1236,40 +1300,125 @@ impl Pipeline {
         // sample (`contexts.edges` is empty at level `Off` and on the fused
         // single-thread fast path, so this stays inert there). Read-only over
         // the live queues — never perturbs the worker hot path.
-        let (sampler_stop, sampler_handle) =
-            if config.instrumentation.samples() && !contexts.edges.is_empty() {
-                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let stop_clone = Arc::clone(&stop);
-                let contexts_clone = Arc::clone(&contexts);
-                // Timeline TSV path only when the level requests it.
-                let trace_path = if config.instrumentation.timeline() {
-                    Some(
-                        config
-                            .trace_path
-                            .clone()
-                            .unwrap_or_else(|| std::path::PathBuf::from("pipeline-trace.tsv")),
-                    )
-                } else {
-                    None
-                };
-                let handle = thread::Builder::new()
-                    .name("fgumi-occupancy-sampler".to_string())
-                    .spawn(move || {
-                        crate::runtime::sampler::run_occupancy_sampler(
-                            &stop_clone,
-                            &contexts_clone.edges,
-                            crate::runtime::sampler::DEFAULT_SAMPLE_INTERVAL,
-                            trace_path,
-                            // Task 8 wires the real `TelemetryArgs` (board,
-                            // step names, edge index sets, writers) here.
-                            None,
-                        );
-                    })
-                    .expect("failed to spawn occupancy sampler thread");
-                (Some(stop), Some(handle))
+        // Spawn the sampler when instrumentation samples (and there are edges to
+        // sample) OR when tick telemetry is requested. Telemetry guarantees the
+        // sampler even at a level that would otherwise skip it (Task 9 bumps
+        // `Off`→`Summary` when telemetry is on, so edges are non-empty then).
+        let (sampler_stop, sampler_handle) = if (config.instrumentation.samples()
+            && !contexts.edges.is_empty())
+            || config.telemetry.is_some()
+        {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_clone = Arc::clone(&stop);
+            let contexts_clone = Arc::clone(&contexts);
+            // Timeline TSV path only when the level requests it.
+            let trace_path = if config.instrumentation.timeline() {
+                Some(
+                    config
+                        .trace_path
+                        .clone()
+                        .unwrap_or_else(|| std::path::PathBuf::from("pipeline-trace.tsv")),
+                )
             } else {
-                (None, None)
+                None
             };
+            // Telemetry drives the sampler's cadence when enabled; otherwise the
+            // occupancy histogram uses its default interval.
+            let interval = config
+                .telemetry
+                .as_ref()
+                .map_or(crate::runtime::sampler::DEFAULT_SAMPLE_INTERVAL, |t| t.interval);
+
+            // Build the OWNED telemetry inputs the closure moves in. `TelemetryArgs`
+            // holds borrows (board, step names, probe) and the detached `spawn`
+            // below requires a `'static` closure, so the args cannot be built here —
+            // only these owned values are captured, and the args are constructed
+            // INSIDE the closure from borrows of them (see the closure body).
+            let telemetry_inputs: Option<SamplerTelemetryInputs> =
+                match (config.telemetry.as_ref(), worker_board.as_ref()) {
+                    (Some(tele), Some(board)) => {
+                        let step_names: Vec<&'static str> =
+                            (0..graph.n_steps()).map(|i| graph.step_name(StepIdx(i))).collect();
+                        crate::runtime::telemetry::TelemetryWriters::open(
+                            &tele.stem,
+                            &step_names,
+                            n_threads,
+                        )
+                        .map(|writers| {
+                            let (source_edge_idxs, sink_edge_idxs) =
+                                source_and_sink_edge_idxs(&contexts.edges);
+                            SamplerTelemetryInputs {
+                                board: Arc::clone(board),
+                                n_workers: n_threads,
+                                step_names,
+                                rss_probe: config.rss_probe.clone(),
+                                queue_bytes_budget: config.queue_memory_total,
+                                writers,
+                                source_edge_idxs,
+                                sink_edge_idxs,
+                                worker_slots: (0..n_threads).collect(),
+                            }
+                        })
+                    }
+                    _ => None,
+                };
+
+            let handle = thread::Builder::new()
+                .name("fgumi-occupancy-sampler".to_string())
+                .spawn(move || {
+                    // Construct `TelemetryArgs` HERE, from borrows of the owned
+                    // values held as closure-body locals (board/step_names/probe),
+                    // so nothing is borrowed across the `spawn` boundary — the
+                    // closure itself stays `'static`. `writers` and the index/slot
+                    // vectors move into the args by value.
+                    match telemetry_inputs {
+                        Some(inputs) => {
+                            let SamplerTelemetryInputs {
+                                board,
+                                n_workers,
+                                step_names,
+                                rss_probe,
+                                queue_bytes_budget,
+                                writers,
+                                source_edge_idxs,
+                                sink_edge_idxs,
+                                worker_slots,
+                            } = inputs;
+                            let args = crate::runtime::sampler::TelemetryArgs {
+                                board: &board,
+                                n_workers,
+                                step_names: &step_names,
+                                rss_probe: rss_probe.as_deref(),
+                                queue_bytes_budget,
+                                writers,
+                                source_edge_idxs,
+                                sink_edge_idxs,
+                                worker_slots,
+                            };
+                            crate::runtime::sampler::run_occupancy_sampler(
+                                &stop_clone,
+                                &contexts_clone.edges,
+                                interval,
+                                trace_path,
+                                Some(args),
+                            );
+                        }
+                        None => {
+                            crate::runtime::sampler::run_occupancy_sampler(
+                                &stop_clone,
+                                &contexts_clone.edges,
+                                interval,
+                                trace_path,
+                                None,
+                            );
+                        }
+                    }
+                })
+                .expect("failed to spawn occupancy sampler thread");
+            (Some(stop), Some(handle))
+        } else {
+            (None, None)
+        };
 
         // 4d. Spawn one dedicated OS thread per `Detached` driver GROUP, in chain
         // order, BEFORE the workers — same lifecycle slot as the monitor /
@@ -1283,13 +1432,17 @@ impl Pipeline {
         // is a no-op there.
         let detached_handles: Vec<thread::JoinHandle<()>> = detached_steps
             .into_iter()
-            .map(|group| {
+            .enumerate()
+            .map(|(driver_idx, group)| {
                 let contexts_clone = Arc::clone(&contexts);
                 let signal_clone = Arc::clone(&signal_arc);
                 let drain_counters_clone: Vec<Arc<StepDrainCounter>> =
                     drain_counters.iter().map(Arc::clone).collect();
                 let stats_clone = stats_arc.as_ref().map(Arc::clone);
                 let liveness_clone = Arc::clone(&liveness);
+                // Detached drivers take board slots after the pool workers.
+                let board_clone = worker_board.clone();
+                let state_slot = n_threads + driver_idx;
                 let thread_name = match group.label() {
                     DetachedGroup::Shared(label) => format!("fgumi-driver-{label}"),
                     DetachedGroup::PerStep => {
@@ -1313,6 +1466,8 @@ impl Pipeline {
                                     &signal_clone,
                                     stats_clone.as_ref(),
                                     &liveness_clone,
+                                    board_clone.as_deref(),
+                                    state_slot,
                                 );
                             }))
                         {
@@ -1371,9 +1526,9 @@ impl Pipeline {
                     stats_arc.as_ref(),
                     &liveness,
                     scheduler.as_ref(),
-                    // Placeholder wiring: no board yet (Task 8 builds the real
-                    // `WorkerStateBoard` and assigns distinct slots per thread).
-                    None,
+                    // Pool worker 0 takes board slot 0 (telemetry on); `None` on
+                    // the zero-cost path.
+                    worker_board.as_deref(),
                     0,
                 );
             })) {
@@ -1396,6 +1551,9 @@ impl Pipeline {
                 let stats_clone = stats_arc.as_ref().map(Arc::clone);
                 let liveness_clone = Arc::clone(&liveness);
                 let scheduler_clone = Arc::clone(&scheduler);
+                // Pool worker `worker_id` takes board slot `worker_id` (telemetry
+                // on); `None` on the zero-cost path.
+                let board_clone = worker_board.clone();
 
                 let handle = thread::Builder::new()
                     .name(format!("fgumi-worker-{worker_id}"))
@@ -1423,10 +1581,7 @@ impl Pipeline {
                                     stats_clone.as_ref(),
                                     &liveness_clone,
                                     scheduler_clone.as_ref(),
-                                    // Placeholder wiring: no board yet (Task 8
-                                    // builds the real `WorkerStateBoard` and
-                                    // assigns distinct slots per thread).
-                                    None,
+                                    board_clone.as_deref(),
                                     worker_id,
                                 );
                             }))
@@ -1525,6 +1680,57 @@ impl Pipeline {
         let _ = graph;
         signal.to_result()
     }
+}
+
+/// Owned inputs the occupancy-sampler closure moves in to construct its
+/// [`TelemetryArgs`](crate::runtime::sampler::TelemetryArgs) on the sampler
+/// thread. `TelemetryArgs` holds BORROWS (`board`, `step_names`, `rss_probe`),
+/// and the sampler is launched with a detached `thread::Builder::spawn` that
+/// requires a `'static` closure — so the args cannot be built at the call site
+/// and moved in. Instead these owned values are moved into the closure and the
+/// borrows are taken from closure-body locals (see `Pipeline::run`'s sampler
+/// spawn), keeping the borrow local to the closure rather than held across the
+/// `spawn` boundary.
+struct SamplerTelemetryInputs {
+    board: Arc<crate::runtime::worker_state::WorkerStateBoard>,
+    n_workers: usize,
+    step_names: Vec<&'static str>,
+    rss_probe: Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
+    queue_bytes_budget: Option<u64>,
+    writers: crate::runtime::telemetry::TelemetryWriters,
+    source_edge_idxs: Vec<usize>,
+    sink_edge_idxs: Vec<usize>,
+    worker_slots: Vec<usize>,
+}
+
+/// Compute `(source_edge_idxs, sink_edge_idxs)` over `edges` for the tick
+/// telemetry's `reads_in` / `reads_out` summary columns.
+///
+/// A **source edge**'s producer step never appears as any edge's consumer — it
+/// is a chain head, so its `pushed_items` count the reads entering the pipeline.
+/// A **sink edge**'s consumer step never appears as any edge's producer — it is
+/// a chain tail, so its `popped_items` count the reads leaving the pipeline. A
+/// terminal branch with no consumer step (`consumer_step == None`, e.g. a
+/// `--rejects` tail) is not a sink here: it feeds no consuming step.
+fn source_and_sink_edge_idxs(
+    edges: &[crate::runtime::contexts::RegisteredEdge],
+) -> (Vec<usize>, Vec<usize>) {
+    use std::collections::HashSet;
+    let producers: HashSet<StepIdx> = edges.iter().map(|e| e.producer_step).collect();
+    let consumers: HashSet<StepIdx> = edges.iter().filter_map(|e| e.consumer_step).collect();
+    let source_edge_idxs = edges
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !consumers.contains(&e.producer_step))
+        .map(|(i, _)| i)
+        .collect();
+    let sink_edge_idxs = edges
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.consumer_step.is_some_and(|c| !producers.contains(&c)))
+        .map(|(i, _)| i)
+        .collect();
+    (source_edge_idxs, sink_edge_idxs)
 }
 
 /// Default multiple of the warn window (`--deadlock-timeout`) after which a
@@ -4180,5 +4386,164 @@ mod tests {
             edges: vec![],
         };
         assert_eq!(in_flight_bytes(&empty), 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Tick-telemetry end-to-end wiring (Task 8).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Serial source emitting `remaining..0` (one item per `try_run`) through a
+    /// byte-bounded edge, then `Finished`.
+    #[derive(Clone)]
+    struct TeleSource {
+        remaining: u32,
+    }
+    impl Step for TeleSource {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "TeleSource",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 64 * 1024 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            if self.remaining == 0 {
+                return Ok(StepOutcome::Finished);
+            }
+            match ctx.outputs.push(self.remaining) {
+                Ok(()) => {
+                    self.remaining -= 1;
+                    Ok(StepOutcome::Progress)
+                }
+                Err(_full) => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    /// Serial pass-through: pop one item and push it on, holding it across a
+    /// full-output backpressure tick so no item is lost; `Finished` once input
+    /// drains and nothing is held.
+    #[derive(Clone)]
+    struct TeleMiddle {
+        held: Option<u32>,
+    }
+    impl Step for TeleMiddle {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "TeleMiddle",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 64 * 1024 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            if let Some(v) = self.held.take() {
+                if ctx.outputs.push(v).is_err() {
+                    self.held = Some(v);
+                    return Ok(StepOutcome::NoProgress);
+                }
+                return Ok(StepOutcome::Progress);
+            }
+            match ctx.input.pop() {
+                Some(n) => {
+                    if ctx.outputs.push(n).is_err() {
+                        self.held = Some(n);
+                    }
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    /// Serial sink counting every item it receives.
+    #[derive(Clone)]
+    struct TeleSink {
+        received: Arc<std::sync::Mutex<u32>>,
+    }
+    impl Step for TeleSink {
+        type Input = u32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "TeleSink",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(_n) => {
+                    *self.received.lock().expect("sink mutex not poisoned") += 1;
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    #[test]
+    fn run_emits_telemetry_for_two_workers() {
+        use std::time::Duration;
+
+        use crate::runtime::telemetry::TelemetryConfig;
+
+        const N: u32 = 50_000;
+
+        let dir = std::env::temp_dir().join(format!(
+            "fgumi-run-tele-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let stem = dir.join("run");
+
+        let received = Arc::new(std::sync::Mutex::new(0u32));
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(TeleSource { remaining: N })
+            .chain(TeleMiddle { held: None })
+            .chain(TeleSink { received: Arc::clone(&received) })
+            .into_sink_marker();
+        let pipeline = builder.build().expect("pipeline build");
+
+        let mut cfg = PipelineConfig { threads: 2, ..Default::default() };
+        cfg.instrumentation = InstrumentationLevel::Summary;
+        cfg.telemetry =
+            Some(TelemetryConfig { stem: stem.clone(), interval: Duration::from_millis(5) });
+
+        pipeline.run(cfg).expect("pipeline run");
+
+        // Every emitted item reached the sink (correctness, not just timing).
+        assert_eq!(*received.lock().unwrap(), N, "sink received every item");
+
+        // All four tick-telemetry TSVs exist.
+        for suffix in ["summary", "edges", "workers", "steps"] {
+            let path = dir.join(format!("run.ticks.{suffix}.tsv"));
+            assert!(std::fs::metadata(&path).is_ok(), "missing {}", path.display());
+        }
+
+        // The workers TSV emits a row per worker per tick: with `threads = 2`
+        // both worker 0 and worker 1 must appear.
+        let workers = std::fs::read_to_string(dir.join("run.ticks.workers.tsv")).unwrap();
+        let mut lines = workers.lines();
+        let _header = lines.next().expect("workers header");
+        let worker_ids: std::collections::BTreeSet<&str> =
+            lines.filter_map(|l| l.split('\t').nth(2)).collect();
+        assert!(worker_ids.contains("0"), "worker 0 row present, got {worker_ids:?}");
+        assert!(worker_ids.contains("1"), "worker 1 row present, got {worker_ids:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
