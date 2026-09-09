@@ -1075,6 +1075,25 @@ pub struct SchedulerOptions {
     #[arg(long = "pipeline-stats", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true, hide = true)]
     pub pipeline_stats: bool,
 
+    /// Per-edge instrumentation level: off | summary | timeline | deep.
+    ///
+    /// `summary` adds per-edge throughput/occupancy/latency + a bottleneck
+    /// verdict to the end-of-run report; `timeline` also writes a per-tick TSV
+    /// (see `--pipeline-trace-out`); `deep` adds direct dwell/park-time latency.
+    /// Diagnostic only — throughput is slightly depressed under tracing; confirm
+    /// final wall/RSS with the flag off. Overridable via `FGUMI_PIPELINE_TRACE`.
+    ///
+    /// Typed `InstrumentationLevel` with no `value_parser`: clap infers the
+    /// parser from the type's `FromStr`, so an invalid value is rejected at parse
+    /// time (mirrors `--temp-codec`'s `SpillCodec` field).
+    #[arg(long = "pipeline-trace", default_value = "off", hide = true)]
+    pub pipeline_trace: crate::pipeline::core::builder::InstrumentationLevel,
+
+    /// Path for the `--pipeline-trace timeline` per-tick TSV
+    /// (default `pipeline-trace.tsv` in the working directory).
+    #[arg(long = "pipeline-trace-out", hide = true)]
+    pub pipeline_trace_out: Option<std::path::PathBuf>,
+
     /// Timeout in seconds for deadlock detection (default: 10, 0 = disabled).
     ///
     /// When no progress is made for this duration, a warning is logged with
@@ -1103,6 +1122,41 @@ impl SchedulerOptions {
         self.pipeline_stats
     }
 
+    /// Resolve the instrumentation level from `--pipeline-trace`, with the
+    /// `FGUMI_PIPELINE_TRACE` env var taking precedence (so standalone commands
+    /// can enable it without flattening the flag). Unknown values → `Off`.
+    ///
+    /// The precedence/mapping itself lives in the pure
+    /// `resolve_instrumentation_level` (unit-tested without touching the
+    /// process environment); this accessor only supplies the env read and the
+    /// one side effect that cannot be pure: a warning when the env var holds an
+    /// unrecognized value. Unlike `--pipeline-trace` (which clap validates
+    /// against the accepted set), the env var is unvalidated, so a typo like
+    /// `FGUMI_PIPELINE_TRACE=summry` would otherwise silently disable tracing
+    /// with no signal.
+    #[must_use]
+    pub fn instrumentation_level(&self) -> crate::pipeline::core::builder::InstrumentationLevel {
+        let env = std::env::var("FGUMI_PIPELINE_TRACE").ok();
+        if let Some(value) = env.as_deref()
+            && !value.is_empty()
+            && value.parse::<crate::pipeline::core::builder::InstrumentationLevel>().is_err()
+        {
+            log::warn!(
+                "FGUMI_PIPELINE_TRACE={value:?} is not a recognized level \
+                 (off|summary|timeline|deep); pipeline tracing stays off"
+            );
+        }
+        resolve_instrumentation_level(env.as_deref(), self.pipeline_trace)
+    }
+
+    /// Path for the per-tick timeline TSV (`--pipeline-trace-out`), if set.
+    /// `None` lets [`PipelineConfig`](crate::pipeline::core::builder::PipelineConfig)
+    /// fall back to its default `pipeline-trace.tsv`.
+    #[must_use]
+    pub fn trace_path(&self) -> Option<std::path::PathBuf> {
+        self.pipeline_trace_out.clone()
+    }
+
     /// Returns the deadlock detection timeout in seconds (0 = disabled).
     #[must_use]
     pub fn deadlock_timeout_secs(&self) -> u64 {
@@ -1113,6 +1167,25 @@ impl SchedulerOptions {
     #[must_use]
     pub fn deadlock_recover_enabled(&self) -> bool {
         self.deadlock_recover
+    }
+}
+
+/// Resolve the instrumentation level from the `FGUMI_PIPELINE_TRACE` env value
+/// (`env`) and the already-parsed `--pipeline-trace` flag (`flag`): the env var,
+/// when set, takes precedence over the flag; an unrecognized (or empty) env
+/// value maps to `Off`. Pure — no env read and no logging — so the precedence
+/// contract is unit-testable in isolation from ambient process state (the env
+/// read and the unrecognized-value warning live in
+/// [`SchedulerOptions::instrumentation_level`], which cannot be pure). The flag
+/// side needs no fallback: clap already parsed it through `FromStr`.
+fn resolve_instrumentation_level(
+    env: Option<&str>,
+    flag: crate::pipeline::core::builder::InstrumentationLevel,
+) -> crate::pipeline::core::builder::InstrumentationLevel {
+    use crate::pipeline::core::builder::InstrumentationLevel;
+    match env {
+        Some(value) => value.parse().unwrap_or(InstrumentationLevel::Off),
+        None => flag,
     }
 }
 
@@ -2067,6 +2140,7 @@ pub(crate) mod test_log_capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::core::builder::InstrumentationLevel;
 
     /// `effective_check_crc` truth table (dupblaster policy): an explicit flag
     /// always wins; with neither flag given, the policy falls back to
@@ -2677,6 +2751,8 @@ mod tests {
         let opts = SchedulerOptions {
             scheduler: SchedulerStrategy::FixedPriority,
             pipeline_stats: false,
+            pipeline_trace: InstrumentationLevel::Off,
+            pipeline_trace_out: None,
             deadlock_timeout: 10,
             deadlock_recover: false,
         };
@@ -2688,6 +2764,8 @@ mod tests {
         let opts = SchedulerOptions {
             scheduler: SchedulerStrategy::default(),
             pipeline_stats: true,
+            pipeline_trace: InstrumentationLevel::Off,
+            pipeline_trace_out: None,
             deadlock_timeout: 10,
             deadlock_recover: false,
         };
@@ -2699,6 +2777,8 @@ mod tests {
         let opts = SchedulerOptions {
             scheduler: SchedulerStrategy::default(),
             pipeline_stats: false,
+            pipeline_trace: InstrumentationLevel::Off,
+            pipeline_trace_out: None,
             deadlock_timeout: 30,
             deadlock_recover: false,
         };
@@ -2710,10 +2790,73 @@ mod tests {
         let opts = SchedulerOptions {
             scheduler: SchedulerStrategy::default(),
             pipeline_stats: false,
+            pipeline_trace: InstrumentationLevel::Off,
+            pipeline_trace_out: None,
             deadlock_timeout: 10,
             deadlock_recover: true,
         };
         assert!(opts.deadlock_recover_enabled());
+    }
+
+    // `InstrumentationLevel`'s `FromStr` is both clap's inferred parser for the
+    // `--pipeline-trace` field and the `FGUMI_PIPELINE_TRACE` parser: the four
+    // tokens parse case-insensitively; anything else is an error (clap surfaces
+    // it as a usage error on the flag; the env accessor maps it to `Off`).
+    #[rstest::rstest]
+    #[case::off("off", Some(InstrumentationLevel::Off))]
+    #[case::summary("summary", Some(InstrumentationLevel::Summary))]
+    #[case::timeline("timeline", Some(InstrumentationLevel::Timeline))]
+    #[case::deep("deep", Some(InstrumentationLevel::Deep))]
+    #[case::case_insensitive("DEEP", Some(InstrumentationLevel::Deep))]
+    #[case::unknown("bogus", None)]
+    #[case::empty("", None)]
+    fn instrumentation_level_from_str(
+        #[case] input: &str,
+        #[case] expected: Option<InstrumentationLevel>,
+    ) {
+        assert_eq!(input.parse::<InstrumentationLevel>().ok(), expected);
+    }
+
+    /// Precedence contract behind `instrumentation_level()`: the
+    /// `FGUMI_PIPELINE_TRACE` env value (when `Some`) wins over the already-parsed
+    /// `--pipeline-trace` flag; env `None` falls back to the flag; an unrecognized
+    /// env value maps to `Off`. The flag is a typed `InstrumentationLevel`, so an
+    /// invalid flag value is impossible by construction (clap rejects it) — there
+    /// is no `flag_unknown` case to test any more. Exercised through the pure
+    /// `resolve_instrumentation_level` so every case runs deterministically
+    /// regardless of the ambient `FGUMI_PIPELINE_TRACE`; the impure accessor's env
+    /// read is covered end-to-end by the sort integration tests
+    /// (`tests/integration/test_sort_pipeline_trace.rs`), where a child process
+    /// gets its own environment.
+    #[rstest::rstest]
+    // env unset → flag decides.
+    #[case::flag_only_default(None, InstrumentationLevel::Off, InstrumentationLevel::Off)]
+    #[case::flag_only_deep(None, InstrumentationLevel::Deep, InstrumentationLevel::Deep)]
+    // env set → env wins over the flag, in both directions.
+    #[case::env_overrides_flag_up(
+        Some("deep"),
+        InstrumentationLevel::Off,
+        InstrumentationLevel::Deep
+    )]
+    #[case::env_overrides_flag_down(
+        Some("off"),
+        InstrumentationLevel::Deep,
+        InstrumentationLevel::Off
+    )]
+    #[case::env_summary_over_flag_deep(
+        Some("summary"),
+        InstrumentationLevel::Deep,
+        InstrumentationLevel::Summary
+    )]
+    // unrecognized / empty env value → Off (the flag would otherwise have applied).
+    #[case::env_unknown_off(Some("summry"), InstrumentationLevel::Deep, InstrumentationLevel::Off)]
+    #[case::env_empty_off(Some(""), InstrumentationLevel::Deep, InstrumentationLevel::Off)]
+    fn resolve_instrumentation_level_precedence(
+        #[case] env: Option<&str>,
+        #[case] flag: InstrumentationLevel,
+        #[case] expected: InstrumentationLevel,
+    ) {
+        assert_eq!(resolve_instrumentation_level(env, flag), expected);
     }
 
     // ========== Tests for QueueMemoryOptions ==========

@@ -39,6 +39,7 @@ use crate::commands::common::{
     parse_memory_reserve, resolve_check_crc, resolve_memory_budget,
 };
 use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag, build_for};
+use crate::pipeline::core::builder::InstrumentationLevel;
 
 /// Sort order for BAM files.
 ///
@@ -472,8 +473,36 @@ pub struct Sort {
     /// diag: ...") saying the single-chunk in-memory fast path was taken.
     /// Off by default: it is instrumentation for performance work, read from a
     /// log with a grep, and it is not something a normal run should show.
+    ///
+    /// This is the sort-engine's own k-way-merge-loop diagnostic; see
+    /// `--pipeline-stats` for the whole-chain per-step timing/throughput report.
     #[arg(long = "sort-stats", default_value_t = false, hide = true)]
     pub sort_stats: bool,
+
+    /// Print detailed pipeline statistics at completion (per-step timing,
+    /// throughput, contention). Hidden diagnostic; mirrors the `--pipeline-stats`
+    /// flag every chain-builder command flattens from `SchedulerOptions`. See
+    /// `--sort-stats` for the sort-engine's own merge-loop diagnostic instead.
+    #[arg(long = "pipeline-stats", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true, hide = true)]
+    pub pipeline_stats: bool,
+
+    /// Per-edge instrumentation level: off | summary | timeline | deep.
+    ///
+    /// `summary` adds per-edge throughput/occupancy/latency + a bottleneck
+    /// verdict to the end-of-run report; `timeline` also writes a per-tick TSV
+    /// (see `--pipeline-trace-out`); `deep` adds direct dwell/park-time latency.
+    /// Diagnostic only — throughput is slightly depressed under tracing; confirm
+    /// final wall/RSS with the flag off. Overridable via `FGUMI_PIPELINE_TRACE`.
+    ///
+    /// Typed `InstrumentationLevel`, parsed by its `FromStr` (no `value_parser`),
+    /// so an invalid value is rejected at parse time — matching `--temp-codec`.
+    #[arg(long = "pipeline-trace", default_value = "off", hide = true)]
+    pub pipeline_trace: InstrumentationLevel,
+
+    /// Path for the `--pipeline-trace timeline` per-tick TSV
+    /// (default `pipeline-trace.tsv` in the working directory).
+    #[arg(long = "pipeline-trace-out", hide = true)]
+    pub pipeline_trace_out: Option<std::path::PathBuf>,
 }
 
 /// Sort-stage tuning, projected out of the [`Sort`] CLI struct for the chain
@@ -828,7 +857,16 @@ impl Sort {
             threading: ThreadingOptions { threads: Some(self.threads) },
             compression: self.compression.clone(),
             // Match sibling chain commands (10s), not the derived Default (0 = monitor off).
-            scheduler: SchedulerOptions { deadlock_timeout: 10, ..Default::default() },
+            // Carry the sort command's diagnostic instrumentation flags (sort does not
+            // flatten `SchedulerOptions`, so they must be forwarded explicitly) — this
+            // is what makes `fgumi sort --pipeline-trace <level>` reach the chain.
+            scheduler: SchedulerOptions {
+                deadlock_timeout: 10,
+                pipeline_stats: self.pipeline_stats,
+                pipeline_trace: self.pipeline_trace,
+                pipeline_trace_out: self.pipeline_trace_out.clone(),
+                ..Default::default()
+            },
             // The single `--max-memory` knob bounds the inter-stage queue budget too,
             // not just the sorter buffer (see `queue_memory_options`). The queue
             // budget scales by `--threads`; the sorter's by max(threads, sort_threads).
@@ -1656,6 +1694,64 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
+    /// `fgumi sort` does not flatten `SchedulerOptions`, so its `--pipeline-stats`
+    /// / `--pipeline-trace` / `--pipeline-trace-out` diagnostic flags must be
+    /// forwarded by hand into the chain spec's scheduler. A dropped forward is
+    /// invisible to a full run (tracing does not change output bytes), so assert
+    /// on the built spec directly.
+    #[test]
+    fn build_sort_chain_spec_forwards_pipeline_diagnostic_flags() {
+        let sort = Sort::try_parse_from([
+            "sort",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--pipeline-stats",
+            "--pipeline-trace",
+            "summary",
+            "--pipeline-trace-out",
+            "trace.tsv",
+        ])
+        .expect("parse should succeed");
+
+        let resolved_max_temp_files = sort.resolved_max_temp_files(fgumi_sort::soft_nofile());
+        let spec = sort.build_sort_chain_spec(
+            Path::new("out.bam"),
+            Vec::new(),
+            resolved_max_temp_files,
+            "fgumi sort (test)",
+        );
+
+        assert!(spec.scheduler.collect_stats(), "--pipeline-stats must reach the chain scheduler");
+        assert_eq!(spec.scheduler.pipeline_trace, InstrumentationLevel::Summary);
+        assert_eq!(spec.scheduler.pipeline_trace_out.as_deref(), Some(Path::new("trace.tsv")));
+        // The deadlock timeout the sort spec pins (10s) must survive alongside the
+        // forwarded flags — the `..Default::default()` spread must not clobber it.
+        assert_eq!(spec.scheduler.deadlock_timeout_secs(), 10);
+    }
+
+    /// `--pipeline-trace` is a typed `InstrumentationLevel` parsed via `FromStr`,
+    /// so clap rejects an unrecognized value at parse time (rather than the old
+    /// string field silently mapping it to `Off`).
+    #[test]
+    fn pipeline_trace_rejects_an_invalid_value() {
+        let err = Sort::try_parse_from([
+            "sort",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--pipeline-trace",
+            "bogus",
+        ])
+        .expect_err("an invalid --pipeline-trace value must be rejected at parse time");
+        assert!(
+            err.to_string().contains("invalid instrumentation level"),
+            "expected the FromStr error to name the invalid level; got: {err}"
+        );
+    }
+
     /// The sorter-free phase thread helpers `Sort::phase1_threads` /
     /// `Sort::phase2_threads` must match the engine's own formula, since
     /// they replace the CLI's only other caller of `RawExternalSorter`'s
@@ -2130,6 +2226,9 @@ mod tests {
             write_index: false,
             read_streams: fgumi_sort::ReadStreams::Auto,
             sort_stats: false,
+            pipeline_stats: false,
+            pipeline_trace: InstrumentationLevel::Off,
+            pipeline_trace_out: None,
         }
     }
 

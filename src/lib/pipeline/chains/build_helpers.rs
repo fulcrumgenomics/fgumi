@@ -60,9 +60,25 @@ pub(crate) fn build_pipeline_config_for_chain(
     let mut config = PipelineConfig { threads: num_threads, ..Default::default() };
     config.deadlock_timeout_secs = scheduler.deadlock_timeout_secs();
     config.queue_memory_total = Some(queue_memory.calculate_memory_limit(num_threads)?);
-    // `main-runall`'s command-layer `SchedulerOptions` does not carry per-edge
-    // instrumentation (`--pipeline-trace`); `config.instrumentation` / `trace_path`
-    // stay at their `Off` / `None` defaults from `PipelineConfig::default()`.
+    // Per-edge instrumentation (`--pipeline-trace` / `FGUMI_PIPELINE_TRACE`),
+    // threaded through the command-layer `SchedulerOptions`. Left at `Off` / `None`
+    // when the flag/env are unset, which keeps `PipelineConfig::default()`'s
+    // zero-overhead path (no sampler thread, non-instrumented queues).
+    config.instrumentation = scheduler.instrumentation_level();
+    config.trace_path = scheduler.trace_path();
+    // A `--pipeline-trace-out` path is only consulted at `timeline`/`deep` (the
+    // levels that write the per-tick TSV). If a path was given but the *resolved*
+    // level (after the `FGUMI_PIPELINE_TRACE` override) does not write one, the
+    // flag is a silent no-op — warn rather than drop it without a trace. Checking
+    // `config.instrumentation` here, not the raw flag, keeps the env override in
+    // scope, so an env-enabled `timeline` run with a path does not false-warn.
+    if config.trace_path.is_some() && !config.instrumentation.timeline() {
+        log::warn!(
+            "--pipeline-trace-out was set but the resolved trace level ({:?}) does not write a \
+             timeline TSV (only `timeline` or `deep` do); the path is ignored",
+            config.instrumentation
+        );
+    }
 
     let user_wants_stats = scheduler.collect_stats();
     let monitor_needs_stats = config.deadlock_timeout_secs > 0;
