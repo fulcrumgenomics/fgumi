@@ -13,6 +13,7 @@ pub mod sampler;
 pub mod scheduler;
 pub mod stats;
 pub mod storage;
+pub mod telemetry;
 pub mod worker_core;
 pub mod worker_state;
 
