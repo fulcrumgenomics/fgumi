@@ -454,7 +454,7 @@ fn simplex_self_pair_matches_standalone_simplex() {
 
 /// Spec §7: `--methylation-mode` (+ `--ref`) must actually reach the consensus
 /// stage's `#[arg(skip)]` `methylation_mode`/`reference` slots (wired via
-/// `resolve_methylation_mode`/`consensus_reference` in
+/// `resolve_methylation_mode`/`methylation_reference` in
 /// `build_stage_options_bag`), not just be accepted and silently dropped.
 /// Compares the fused `consensus(simplex)` self-pair against the standalone
 /// `fgumi simplex --methylation-mode em-seq --ref ...` oracle — record parity
@@ -861,6 +861,94 @@ fn group_to_simplex_to_filter_matches_staged_chain() {
     run_ok(
         ["filter", "-i", p(&staged_simplex), "-o", p(&staged_out), "--min-reads", "1"],
         "staged filter",
+    );
+
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
+}
+
+/// Audit A1: the fused filter stage must thread the top-level `--methylation-mode`
+/// / `--ref` into filter's methylation-aware options — `--filter::min-conversion-fraction`
+/// requires BOTH to be set. Before the wiring fix, the fused stage saw
+/// `MethylationMode::Disabled` and rejected the legitimately-set flag ("requires
+/// --methylation-mode to be set"), so the methylation filters were unreachable
+/// through runall. Compares the fused consensus(simplex)->filter chain against the
+/// staged equivalent where standalone simplex and filter each receive
+/// `--methylation-mode em-seq --ref`; `--min-conversion-fraction 0.0` exercises the
+/// threaded flags (validation requires them) while keeping the output non-empty.
+/// Reuses the same `grouped_bam` + `create_test_reference` fixture as
+/// `simplex_self_pair_with_methylation_mode_matches_standalone`, which is known to
+/// produce methylation-tagged consensus records.
+#[cfg(feature = "consensus")]
+#[test]
+fn consensus_to_filter_with_methylation_matches_staged_chain() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = grouped_bam(tmp.path(), "identity", "filter_methylation");
+    let reference = create_test_reference(tmp.path());
+    let runall_out = tmp.path().join("runall.bam");
+    let staged_simplex = tmp.path().join("staged_simplex.bam");
+    let staged_out = tmp.path().join("staged.bam");
+
+    run_ok(
+        [
+            "runall",
+            "--start-from",
+            "consensus",
+            "--stop-after",
+            "filter",
+            "--consensus",
+            "simplex",
+            "-i",
+            p(&fixture),
+            "-o",
+            p(&runall_out),
+            "--simplex::min-reads",
+            "1",
+            "--filter::min-reads",
+            "1",
+            "--filter::min-conversion-fraction",
+            "0.0",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            p(&reference),
+        ],
+        "runall consensus(simplex)->filter+methylation",
+    );
+
+    run_ok(
+        [
+            "simplex",
+            "-i",
+            p(&fixture),
+            "-o",
+            p(&staged_simplex),
+            "--min-reads",
+            "1",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            p(&reference),
+        ],
+        "staged simplex+methylation",
+    );
+    run_ok(
+        [
+            "filter",
+            "-i",
+            p(&staged_simplex),
+            "-o",
+            p(&staged_out),
+            "--min-reads",
+            "1",
+            "--min-conversion-fraction",
+            "0.0",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            p(&reference),
+        ],
+        "staged filter+methylation",
     );
 
     assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
