@@ -1368,6 +1368,10 @@ impl Pipeline {
                     stats_arc.as_ref(),
                     &liveness,
                     scheduler.as_ref(),
+                    // Placeholder wiring: no board yet (Task 8 builds the real
+                    // `WorkerStateBoard` and assigns distinct slots per thread).
+                    None,
+                    0,
                 );
             })) {
                 signal_arc.cancel();
@@ -1416,6 +1420,11 @@ impl Pipeline {
                                     stats_clone.as_ref(),
                                     &liveness_clone,
                                     scheduler_clone.as_ref(),
+                                    // Placeholder wiring: no board yet (Task 8
+                                    // builds the real `WorkerStateBoard` and
+                                    // assigns distinct slots per thread).
+                                    None,
+                                    worker_id,
                                 );
                             }))
                         {

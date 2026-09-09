@@ -35,6 +35,7 @@ use crate::runtime::scheduler::{Scheduler, WalkDirection};
 use crate::runtime::stats::PipelineStats;
 use crate::runtime::storage::WorkerStepEntry;
 use crate::runtime::worker_core::{WorkerCore, WorkerRole};
+use crate::runtime::worker_state::WorkerStateBoard;
 use crate::signal::{PipelineError, PipelineSignal};
 use crate::step::StepOutcome;
 use crate::topology::StepIdx;
@@ -64,7 +65,11 @@ const STICKY_BURST_LIMIT: usize = 1024;
 /// output close on `Finished` (init N for Parallel so only the last clone
 /// closes the shared output; init 1 for Serial/Exclusive).
 /// `signal` — error/cancel broadcast.
+/// `board` — optional per-thread state board for scheduling telemetry; `None`
+/// keeps the loop's stamping a no-op (telemetry-off parity).
+/// `state_slot` — this thread's slot in `board` (ignored when `board` is `None`).
 #[allow(clippy::too_many_arguments)] // per-step shared state plus the liveness shard; a struct would only rename it
+#[allow(clippy::too_many_lines)] // the whole-pass sticky + round-robin + backoff discipline is documented inline; splitting it would scatter the invariant across functions
 pub fn run_worker_loop(
     worker: &mut WorkerCore,
     entries: &mut [WorkerStepEntry],
@@ -74,6 +79,8 @@ pub fn run_worker_loop(
     stats: Option<&Arc<PipelineStats>>,
     liveness: &LivenessCounter,
     scheduler: &dyn Scheduler,
+    board: Option<&WorkerStateBoard>,
+    state_slot: usize,
 ) {
     // Per-worker worklist of still-dispatchable steps, in chain order. A step
     // is removed when it returns `StepOutcome::Finished`; the worker exits once
@@ -147,6 +154,8 @@ pub fn run_worker_loop(
                     liveness,
                     worker.thread_id,
                     is_driver,
+                    board,
+                    state_slot,
                 ) else {
                     break; // Skip
                 };
@@ -192,6 +201,8 @@ pub fn run_worker_loop(
                 worker.thread_id,
                 scheduler.walk(),
                 is_driver,
+                board,
+                state_slot,
             );
             did_work |= outcome.did_work;
             if outcome.removed_sticky_owner {
@@ -223,6 +234,9 @@ pub fn run_worker_loop(
         } else if signal.is_done() {
             break;
         } else {
+            if let Some(b) = board {
+                b.stamp(state_slot, crate::runtime::worker_state::WorkerState::Parked, None);
+            }
             let sleep_start = stats.map(|_| Instant::now());
             worker.sleep_backoff();
             worker.increase_backoff();
@@ -271,6 +285,8 @@ fn round_robin_dispatch(
     worker_slot: usize,
     walk: WalkDirection,
     is_driver: bool,
+    board: Option<&WorkerStateBoard>,
+    state_slot: usize,
 ) -> RoundRobinOutcome {
     let mut did_work = false;
     // Steps that finished this pass, removed from `live` after the walk. A
@@ -306,6 +322,8 @@ fn round_robin_dispatch(
             liveness,
             worker_slot,
             is_driver,
+            board,
+            state_slot,
         ) else {
             continue; // Skip (build-time placeholder; should not appear in `live`)
         };
@@ -398,6 +416,11 @@ fn dispatch_one_step(
     // reports its own busy. Pool workers pass `false` and record aggregate busy
     // by `thread_id` in the loop instead.
     is_driver: bool,
+    // Optional per-thread state board for scheduling telemetry; `None` keeps
+    // stamping a no-op (telemetry-off parity). `state_slot` is this thread's
+    // slot in `board` (ignored when `board` is `None`).
+    board: Option<&WorkerStateBoard>,
+    state_slot: usize,
 ) -> Option<DispatchInfo> {
     let outputs_any: &(dyn Any + Send + Sync) = contexts.outputs[step_idx.0].as_ref();
     let mut ctx =
@@ -430,6 +453,10 @@ fn dispatch_one_step(
     // `Parallel` — would leave the counter stuck above 0 and never close the
     // shared output, hanging the downstream consumer. Keep the init (builder.rs)
     // and this gate in lockstep.
+    if let Some(b) = board {
+        b.stamp(state_slot, crate::runtime::worker_state::WorkerState::Running, Some(step_idx));
+    }
+
     let info: Option<DispatchInfo> = match entry {
         WorkerStepEntry::Owned { step } | WorkerStepEntry::Exclusive { step } => {
             let result = step.try_run_erased(&mut ctx);
@@ -551,6 +578,8 @@ mod tests {
             None,
             &crate::liveness::LivenessCounter::new(1),
             &crate::runtime::scheduler::ChainOrderScheduler,
+            None,
+            0,
         );
         // If we reach this line, the loop exited cleanly.
     }
@@ -756,6 +785,8 @@ mod tests {
                 &LivenessCounter::new(1),
                 0,
                 false,
+                None,
+                0,
             )
             .unwrap();
             assert!(matches!(info.result, Ok(StepOutcome::Finished)));
@@ -797,6 +828,8 @@ mod tests {
             &LivenessCounter::new(1),
             0,
             false,
+            None,
+            0,
         )
         .unwrap();
         assert!(matches!(info1.result, Ok(StepOutcome::Finished)));
@@ -816,6 +849,8 @@ mod tests {
             &LivenessCounter::new(1),
             0,
             false,
+            None,
+            0,
         )
         .unwrap();
         assert!(matches!(info2.result, Ok(StepOutcome::Finished)));
@@ -871,6 +906,8 @@ mod tests {
             None,
             &crate::liveness::LivenessCounter::new(1),
             &crate::runtime::scheduler::ChainOrderScheduler,
+            None,
+            0,
         );
     }
 
@@ -933,6 +970,8 @@ mod tests {
             None,
             &crate::liveness::LivenessCounter::new(1),
             &crate::runtime::scheduler::ChainOrderScheduler,
+            None,
+            0,
         );
 
         // The source must have been called EXACTLY twice: call 1 = idle in the
@@ -1075,6 +1114,8 @@ mod tests {
             None,
             &crate::liveness::LivenessCounter::new(1),
             &crate::runtime::scheduler::ChainOrderScheduler,
+            None,
+            0,
         );
         done.store(true, Ordering::SeqCst);
 
@@ -1233,6 +1274,8 @@ mod tests {
             None,
             &crate::liveness::LivenessCounter::new(1),
             &crate::runtime::scheduler::ChainOrderScheduler,
+            None,
+            0,
         );
         done.store(true, Ordering::SeqCst);
 
@@ -1311,6 +1354,8 @@ mod tests {
             &LivenessCounter::new(1),
             0,
             true,
+            None,
+            0,
         );
         let snap = stats.snapshot();
         assert!(
@@ -1338,10 +1383,85 @@ mod tests {
             &LivenessCounter::new(1),
             0,
             false,
+            None,
+            0,
         );
         assert!(
             stats_pool.snapshot().detached.is_empty(),
             "pool dispatch must not record on the off-pool detached line"
         );
+    }
+
+    #[test]
+    fn dispatch_stamps_running_step_when_board_present() {
+        // A dispatch of step idx 3 with a board present must leave the board's
+        // slot reading Running(step 3) at the point try_run is entered. We use a
+        // step that finishes immediately; after dispatch the slot holds the last
+        // stamp (Running, 3) since nothing overwrites it here.
+        use crate::runtime::worker_state::{WorkerState, WorkerStateBoard};
+        let mut graph = ChainGraph::new();
+        let a = graph.register_step("SrcFinished", 1);
+        let sink = graph.register_step("Sink", 0);
+        graph.wire(a, BranchIdx(0), sink);
+        let steps: Vec<Box<dyn ErasedStep>> =
+            vec![Box::new(TypedStep::new(SrcFinished)), Box::new(TypedStep::new(SinkStep))];
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+        ));
+        let counter = StepDrainCounter::new(1);
+        let signal = PipelineSignal::new();
+        let board = WorkerStateBoard::new(1);
+        let mut entry = WorkerStepEntry::Owned { step: Box::new(TypedStep::new(SrcFinished)) };
+        let _ = dispatch_one_step(
+            &mut entry,
+            StepIdx(0),
+            &contexts,
+            &counter,
+            &signal,
+            None,
+            &LivenessCounter::new(1),
+            0,
+            false,
+            Some(&board),
+            0,
+        );
+        assert_eq!(board.read(0), (WorkerState::Running, Some(StepIdx(0))));
+    }
+
+    #[test]
+    fn dispatch_with_no_board_is_a_noop_on_state() {
+        // The telemetry-off path must not require a board (None) and must behave
+        // exactly as before — this dispatch simply must not panic and must run.
+        let mut graph = ChainGraph::new();
+        let a = graph.register_step("SrcFinished", 1);
+        let sink = graph.register_step("Sink", 0);
+        graph.wire(a, BranchIdx(0), sink);
+        let steps: Vec<Box<dyn ErasedStep>> =
+            vec![Box::new(TypedStep::new(SrcFinished)), Box::new(TypedStep::new(SinkStep))];
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+        ));
+        let counter = StepDrainCounter::new(1);
+        let signal = PipelineSignal::new();
+        let mut entry = WorkerStepEntry::Owned { step: Box::new(TypedStep::new(SrcFinished)) };
+        let info = dispatch_one_step(
+            &mut entry,
+            StepIdx(0),
+            &contexts,
+            &counter,
+            &signal,
+            None,
+            &LivenessCounter::new(1),
+            0,
+            false,
+            None,
+            0,
+        )
+        .unwrap();
+        assert!(matches!(info.result, Ok(StepOutcome::Finished)));
     }
 }

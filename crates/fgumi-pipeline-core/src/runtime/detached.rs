@@ -342,6 +342,11 @@ pub fn run_detached_driver(
         stats,
         liveness,
         &DrainFirstScheduler,
+        // Placeholder wiring: no board yet (Task 8 threads the real
+        // `WorkerStateBoard` + a distinct slot per detached driver thread
+        // through `run_detached_driver`'s own signature).
+        None,
+        0,
     );
 }
 
