@@ -470,14 +470,33 @@ pub struct ChainBuilder<'a> {
     /// and uses the requested thread count like every other stage.
     override_pipeline_threads: Option<usize>,
 
-    /// Set when a BAM sort source is wired through the parallel-inflate arena
-    /// front (`ReadBlocks → InflateToArena → FindBoundariesAndSort`), for any
-    /// sort order. [`Self::build`] then opts the ENTIRE sort-first pipeline —
-    /// including fused `Sort → Group/Simplex/Duplex/Codec` chains — into the
-    /// downstream-first [`DrainFirstScheduler`](crate::pipeline::core::runtime::DrainFirstScheduler), so the sort's serial
-    /// boundary/key scan overlaps the parallel inflate (drained ahead of
-    /// production) instead of starving behind it on the shared pool. Chains
-    /// without a sort source keep the default upstream-first scheduler.
+    /// Set for a chain whose drain-bound shape benefits from downstream-first
+    /// dispatch. [`Self::build`] reads it to select the
+    /// [`DrainFirstScheduler`](crate::pipeline::core::runtime::DrainFirstScheduler)
+    /// in place of the default upstream-first scheduler. Two shapes set it:
+    ///
+    /// - A BAM sort source wired through the parallel-inflate arena front
+    ///   (`ReadBlocks → InflateToArena → FindBoundariesAndSort`), for any sort
+    ///   order — set in [`Self::add_sort`]. This opts the ENTIRE sort-first
+    ///   pipeline (including fused `Sort → Group/Simplex/Duplex/Codec` chains)
+    ///   in, so the sort's serial boundary/key scan overlaps the parallel inflate
+    ///   (drained ahead of production) instead of starving behind it on the pool.
+    /// - A group-, dedup-, or clip-terminated chain (standalone `group`/`dedup`/
+    ///   `clip`, or `sort→group` / `correct→group`) — set in [`Self::add_group`]
+    ///   (Terminal only), [`Self::add_dedup`], and [`Self::add_clip`] (both always
+    ///   terminal). Its serial grouping spine (`GroupByPosition`/`GroupBam` →
+    ///   process → … → Serialize), which must see a template's records together,
+    ///   is fed by the parallel decompress front — the same drain-bound shape as
+    ///   the sort front.
+    ///
+    /// Absent a sort source, production-bound chains keep the default
+    /// upstream-first scheduler, where downstream-first dispatch can hurt: a
+    /// group fused into a consensus stage (Intermediate), and the standalone
+    /// consensus/correct/filter chains (terminal `clip`, like terminal
+    /// group/dedup, is drain-first per the first bullet). A sort source, however, opts the
+    /// whole pipeline in per the first bullet — so `sort→group→consensus` runs
+    /// drain-first even though its group is Intermediate, because the flag is
+    /// only ever set, never cleared.
     use_drain_first_scheduler: bool,
 
     /// `HeaderHandle` stashed by [`Self::add_align`] for consumption by
@@ -1737,10 +1756,12 @@ impl<'a> ChainBuilder<'a> {
         if let Some(t) = self.override_pipeline_threads {
             config.threads = t;
         }
-        // Opt the whole sort-first pipeline into downstream-first dispatch so the
-        // arena front's serial scan overlaps the parallel inflate (flag set in
-        // add_sort for any sort order). Chains without a sort source keep the
-        // default upstream-first scheduler.
+        // Opt drain-bound chains into downstream-first dispatch: a sort source
+        // (flag set in add_sort, so the arena front's serial scan overlaps the
+        // parallel inflate), or a terminal group/dedup/clip chain (set in
+        // add_group/add_dedup/add_clip, so the serial grouping spine overlaps the
+        // parallel decompress front). Production-bound chains keep the default
+        // upstream-first scheduler.
         if self.use_drain_first_scheduler {
             config = config.with_scheduler(std::sync::Arc::new(
                 crate::pipeline::core::runtime::DrainFirstScheduler,
@@ -3189,6 +3210,21 @@ impl<'a> ChainBuilder<'a> {
             self.chain_tail_kind = ChainTailKind::BatchedProcessedPositionGroups;
         }
 
+        // A terminal `group` (standalone, or `sort→group` / `correct→group`) is
+        // drain-bound: the serial `GroupByPosition → process → MiAssign →
+        // SerializeGroups` spine is fed by the N-way parallel decompress front.
+        // Under the default upstream-first scheduler the workers pile onto the
+        // spine's mutex and park on the OS condvar (profiler-confirmed contention
+        // in `OutputHandles::retry` / `TypedStep::try_run_erased`), which cost
+        // threaded `group` ~7–11% vs the pre-chain-builder runtime. Opt this shape
+        // into the downstream-first `DrainFirstScheduler`. A group fused into a
+        // consensus stage (Intermediate) is production-bound and does not qualify
+        // — see `grouping_stage_wants_drain_first`. Only ever set the flag true,
+        // never clear it: a sort source may already have set it in `add_sort`.
+        if grouping_stage_wants_drain_first(Stage::Group, position) {
+            self.use_drain_first_scheduler = true;
+        }
+
         // The assign tag is always `MI` (`assign_tag_bytes == *SamTag::MI`, a
         // pub const). On the Terminal path it was passed to the serialize step
         // above; on the Intermediate (fused group→consensus) path the consensus
@@ -4256,6 +4292,17 @@ impl<'a> ChainBuilder<'a> {
         let tail = self.pipeline.append_step(serialize_step, tail);
         self.current_tail = Some(tail);
 
+        // Clip has the same drain-bound shape as terminal group/dedup: the serial
+        // GroupBam template-assembly spine (a template's reads must be gathered
+        // together) is fed by the parallel decompress front, with light
+        // per-template work (overlap trim + tag regen). Benchmarked ~7% faster
+        // under downstream-first dispatch, output positionally identical. Clip is
+        // always terminal (Intermediate bails above), so this is unconditional.
+        // Only ever set the flag true, never clear it.
+        if grouping_stage_wants_drain_first(Stage::Clip, position) {
+            self.use_drain_first_scheduler = true;
+        }
+
         // Register the clip finalize hook.
         // The chain-level StageTimingFinalizeHook is inserted at index 0 by
         // build() after all stages have been added — that way a single timer
@@ -4895,6 +4942,15 @@ impl<'a> ChainBuilder<'a> {
         let tail = self.pipeline.append_step(serialize_step, tail);
         self.current_tail = Some(tail);
 
+        // Dedup has the same drain-bound shape as terminal `group` (a serial
+        // grouping spine fed by the parallel decompress front) and is always
+        // terminal (Intermediate bails above), so it opts into the downstream-first
+        // `DrainFirstScheduler` — see `grouping_stage_wants_drain_first`. Only ever
+        // set the flag true, never clear it.
+        if grouping_stage_wants_drain_first(Stage::Dedup, position) {
+            self.use_drain_first_scheduler = true;
+        }
+
         // Register the dedup finalize hook.
         // The chain-level StageTimingFinalizeHook is inserted at index 0 by
         // build() after all stages have been added — that way a single timer
@@ -4973,6 +5029,44 @@ fn stages_want_umi_cache(stages: &[Stage]) -> bool {
 /// [`ChainBuilder::bam_group_key_config`]: ChainBuilder::bam_group_key_config
 fn umi_cache_enabled(stages: &[Stage], no_umi: bool) -> bool {
     stages_want_umi_cache(stages) && !no_umi
+}
+
+/// Whether a `Group`, `Dedup`, or `Clip` stage at this position makes the chain
+/// drain-bound, so [`ChainBuilder::add_group`]/[`ChainBuilder::add_dedup`]/
+/// [`ChainBuilder::add_clip`] opt it into the downstream-first
+/// [`DrainFirstScheduler`](crate::pipeline::core::runtime::DrainFirstScheduler)
+/// in place of the default upstream-first scheduler.
+///
+/// A *terminal* `Group`, `Dedup`, or `Clip` is drain-bound: a serial grouping
+/// spine (`GroupByPosition`/`GroupBam` → process → … → Serialize) that must see
+/// a template's records together is fed by the N-way parallel decompress front,
+/// so one worker should drain the spine while the rest keep producing. A `Group`
+/// fused into a consensus stage (Intermediate) is production-bound downstream,
+/// where downstream-first dispatch can hurt, so it does not qualify. `Dedup` and
+/// `Clip` are always terminal (their Intermediate forms are rejected in
+/// [`ChainBuilder::add_dedup`]/[`ChainBuilder::add_clip`]), so only the Terminal
+/// arm is ever reachable for them.
+///
+/// This gate is deliberately narrow. An empirical scheduler sweep (via the
+/// hidden `--pool-scheduler` override) found drain-first modestly helps several
+/// other commands (retag ~5%, simplex/codec ~3%) but *catastrophically* hurts
+/// `extract` (~5.6× slower — its FASTQ source is the bottleneck and
+/// downstream-first starves it), so nothing is enabled here without a measured,
+/// output-verified win. Group/dedup/clip are the confirmed strong, zero-output-
+/// change winners; the others stay on the default pending their own decision.
+///
+/// This governs only the group/dedup opt-in. A BAM **sort source** opts the
+/// whole sort-first pipeline in separately, in [`ChainBuilder::add_sort`], keyed
+/// on runtime source information this predicate does not see — so a
+/// `sort→group→consensus` chain still runs drain-first even though its group is
+/// Intermediate here (the flag, once set, is never cleared). Extracted as a free
+/// function so the gate can be unit tested without constructing a full
+/// `ChainBuilder` (which requires an opened source).
+fn grouping_stage_wants_drain_first(stage: Stage, position: StagePosition) -> bool {
+    matches!(
+        (stage, position),
+        (Stage::Group | Stage::Dedup | Stage::Clip, StagePosition::Terminal)
+    )
 }
 
 /// Uniform "reference dictionary not found" error, shared by the zipper source
@@ -5142,6 +5236,37 @@ mod tests {
         assert!(
             !stages_want_umi_cache(&[]),
             "an empty stage list must skip the UMI-position cache"
+        );
+    }
+
+    /// Pin the drain-first scheduler-selection matrix that `add_group` and
+    /// `add_dedup` drive through `grouping_stage_wants_drain_first`: a terminal
+    /// `Group` or `Dedup` is drain-bound and opts into `DrainFirstScheduler`; a
+    /// `Group` fused into a consensus stage (Intermediate) is production-bound and
+    /// does not; and no other stage opts in through this gate (a sort source opts
+    /// in separately, in `add_sort`). Exercised against the exact predicate both
+    /// call sites use, so the deliberate Terminal-vs-Intermediate distinction
+    /// cannot silently regress — scheduler choice never changes output records, so
+    /// no functional/e2e test can catch a wrong selection.
+    #[rstest::rstest]
+    #[case::terminal_group(Stage::Group, StagePosition::Terminal, true)]
+    #[case::intermediate_group(Stage::Group, StagePosition::Intermediate, false)]
+    #[case::terminal_dedup(Stage::Dedup, StagePosition::Terminal, true)]
+    #[case::intermediate_dedup(Stage::Dedup, StagePosition::Intermediate, false)]
+    #[case::terminal_clip(Stage::Clip, StagePosition::Terminal, true)]
+    #[case::intermediate_clip(Stage::Clip, StagePosition::Intermediate, false)]
+    #[case::terminal_sort(Stage::Sort, StagePosition::Terminal, false)]
+    #[case::terminal_simplex(Stage::Simplex, StagePosition::Terminal, false)]
+    #[case::terminal_correct(Stage::Correct, StagePosition::Terminal, false)]
+    fn grouping_stage_wants_drain_first_matrix(
+        #[case] stage: Stage,
+        #[case] position: StagePosition,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            grouping_stage_wants_drain_first(stage, position),
+            expected,
+            "{stage:?} at {position:?}: drain-first opt-in mismatch"
         );
     }
 
