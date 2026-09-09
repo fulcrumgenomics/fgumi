@@ -1757,6 +1757,31 @@ impl<'a> ChainBuilder<'a> {
         let user_wants_stats = self.spec.scheduler.collect_stats()
             || super::build_helpers::env_flag_enabled("FGUMI_PIPELINE_STATS");
         if user_wants_stats && let Some(s) = pipeline_stats {
+            // Re-derive the `=== Sort Phase Timing ===` per-phase breakdown from
+            // the same stats snapshot. This restores the diagnostic the retired
+            // owned engine printed (see `commands::sort::SortPhaseTimingFinalizeHook`);
+            // it reads the already-collected per-step timings, so it adds nothing
+            // to the default (stats-off) sort path. Registered before the generic
+            // stats table so the phase roll-up reads as a focused summary above
+            // the full per-step dump.
+            //
+            // Gated on a sole-`[Stage::Sort]` chain (`is_sort_terminal`), matching
+            // how `add_sort` scopes `SortSummaryFinalizeHook`. In a fused chain
+            // (an intermediate sort, e.g. `runall`'s sort→group→…) the six phase
+            // step names do NOT cleanly bound the sort's work: the terminal
+            // `BgzfCompress`/`WriteBgzfFile` sink serializes the *final* stage's
+            // output, not the sort's, and the intermediate `DecodeFromRecords` /
+            // `ParseBamRecords` adapters around the sort are unclassified — so a
+            // phase block there would misattribute the shared sink and drop
+            // adapter time. A faithful fused-chain breakdown needs step-index
+            // scoping, which is out of scope here.
+            if self.spec.is_sort_terminal() {
+                self.finalize.push(Box::new(
+                    crate::pipeline::chains::commands::sort::SortPhaseTimingFinalizeHook {
+                        stats: std::sync::Arc::clone(&s),
+                    },
+                ));
+            }
             self.finalize.push(Box::new(PipelineStatsFinalizeHook { stats: s }));
         }
 

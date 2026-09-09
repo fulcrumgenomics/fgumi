@@ -121,6 +121,54 @@ fn sort_and_capture_logs(families: usize, max_memory: &str, extra_args: &[&str])
     stderr
 }
 
+/// The stable header pinning the restored per-phase timing roll-up
+/// (`src/lib/pipeline/chains/commands/sort.rs`,
+/// `SortPhaseTimingFinalizeHook`). Emitted only when a `PipelineStats`
+/// collector is attached (`--pipeline-stats` / `FGUMI_PIPELINE_STATS=1`).
+const PHASE_TIMING_HEADER: &str = "=== Sort Phase Timing ===";
+
+/// Parse the percentage from a `=== Sort Phase Timing ===` phase line
+/// (`  <label>   <secs>s   <pct>%`), or `None` if no line contains `label`.
+/// The percentage is the last whitespace-separated token, e.g. `9.8%`.
+fn phase_timing_pct(stderr: &str, label: &str) -> Option<f64> {
+    stderr
+        .lines()
+        .find(|line| line.contains(label))
+        .and_then(|line| line.split_whitespace().last())
+        .and_then(|token| token.strip_suffix('%'))
+        .and_then(|pct| pct.trim().parse::<f64>().ok())
+}
+
+/// Runs `fgumi sort` at info verbosity with `FGUMI_PIPELINE_STATS=1` set (which
+/// force-attaches the pipeline stats collector even though standalone
+/// `fgumi sort` does not flatten `--pipeline-stats`), and returns its stderr.
+fn sort_and_capture_logs_with_pipeline_stats(
+    families: usize,
+    max_memory: &str,
+    extra_args: &[&str],
+) -> String {
+    let tmp = TempDir::new().expect("tempdir");
+    let input: PathBuf = tmp.path().join("unsorted.bam");
+    write_bam_fixture(&input, families);
+    let output = tmp.path().join("sorted.bam");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .env("RUST_LOG", "info")
+        .env("FGUMI_PIPELINE_STATS", "1")
+        .args(["sort", "-i"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .args(["--order", "coordinate", "-m", max_memory])
+        .args(extra_args)
+        .output()
+        .expect("run fgumi sort");
+
+    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+    assert!(result.status.success(), "fgumi sort failed:\n{stderr}");
+    stderr
+}
+
 /// Runs `fgumi sort` with a small `--max-memory` (forcing spills + a real
 /// k-way merge) and returns its stderr.
 ///
@@ -204,6 +252,80 @@ fn sort_stats_gates_fast_path_note(#[case] extra_args: &[&str], #[case] expect_p
     assert!(
         !stderr.contains(MERGE_DIAG_SUBSTRING),
         "the k-way-merge diagnostic must not appear when no merge ran:\n{stderr}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Restored `=== Sort Phase Timing ===` per-phase diagnostic
+// ─────────────────────────────────────────────────────────────────────────
+//
+// The chain cutover dropped the owned engine's unconditional phase-timing
+// block (the retired `RawExternalSorter::sort` was its only caller). It is
+// restored as a roll-up derived from the pipeline's per-step timings, gated on
+// the stats collector being attached so the default sort path is unaffected.
+
+/// The `=== Sort Phase Timing ===` block is gated on the pipeline stats
+/// collector being attached: emitted on a spilling sort under
+/// `FGUMI_PIPELINE_STATS=1`, and absent on the default sort path so profiling
+/// instrumentation stays opt-in and the default path keeps its zero-overhead
+/// behavior. Mirrors this file's `sort_stats_gates_*` present/absent tables.
+#[rstest]
+#[case::enabled(true, true)]
+#[case::disabled(false, false)]
+fn sort_phase_timing_is_gated_on_pipeline_stats(
+    #[case] with_pipeline_stats: bool,
+    #[case] expect_present: bool,
+) {
+    let stderr = if with_pipeline_stats {
+        sort_and_capture_logs_with_pipeline_stats(20_000, "1M", &[])
+    } else {
+        sort_spilling(&[])
+    };
+    assert_really_spilled(&stderr);
+
+    assert_eq!(
+        stderr.contains(PHASE_TIMING_HEADER),
+        expect_present,
+        "expected `{PHASE_TIMING_HEADER}` presence={expect_present} \
+         (with_pipeline_stats={with_pipeline_stats}); stderr:\n{stderr}"
+    );
+    // When present, assert the phases that must dominate a spilling coordinate
+    // sort report a NONZERO percentage — not merely that the label is printed.
+    // The block emits every label unconditionally (a zero-time phase still
+    // prints `0.000s 0.0%`), so a label-presence check would pass even if a
+    // classifier bug routed a phase's steps to the wrong bucket; parsing the
+    // percentage catches that. (Spill write is confirmed separately by
+    // `assert_really_spilled`, and can round to 0.0% on a fast run, so it is not
+    // asserted nonzero here.)
+    if expect_present {
+        for phase in ["in-memory sort", "k-way merge", "write output"] {
+            let pct = phase_timing_pct(&stderr, phase).unwrap_or_else(|| {
+                panic!("phase-timing block missing a parseable `{phase}` line; stderr:\n{stderr}")
+            });
+            assert!(
+                pct > 0.0,
+                "phase `{phase}` reported {pct}% on a spilling sort — a mis-bucketed classifier \
+                 arm would zero a phase like this; stderr:\n{stderr}"
+            );
+        }
+    }
+}
+
+/// `--sort-stats` alone (its own merge-diagnostic flag) must NOT trigger the
+/// phase-timing block — that block is gated on the pipeline stats collector,
+/// not on `--sort-stats`. Pins the two diagnostics as independently gated so a
+/// future change cannot silently couple them.
+#[test]
+fn sort_stats_flag_alone_does_not_emit_phase_timing() {
+    let stderr = sort_spilling(&["--sort-stats"]);
+    assert_really_spilled(&stderr);
+    assert!(
+        stderr.contains(MERGE_DIAG_SUBSTRING),
+        "the --sort-stats merge diagnostic should still fire; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(PHASE_TIMING_HEADER),
+        "--sort-stats alone must not emit the phase-timing block; stderr:\n{stderr}"
     );
 }
 
