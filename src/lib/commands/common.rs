@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "consensus")]
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::assigner::Strategy;
 #[cfg(feature = "consensus")]
@@ -1145,6 +1146,19 @@ pub struct SchedulerOptions {
     /// after 30s of sustained progress.
     #[arg(long = "deadlock-recover", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true, hide = true)]
     pub deadlock_recover: bool,
+
+    /// File stem for the four-file per-tick thread-telemetry TSVs
+    /// (`<stem>.ticks.{summary,edges,workers,steps}.tsv`). Setting this (or the
+    /// `FGUMI_PIPELINE_TELEMETRY_OUT` env var) enables telemetry; the default
+    /// stem when neither is set but telemetry is otherwise requested is
+    /// `pipeline-telemetry`.
+    #[arg(long = "pipeline-telemetry-out", hide = true)]
+    pub pipeline_telemetry_out: Option<std::path::PathBuf>,
+
+    /// Sample/emit cadence for thread telemetry, e.g. `2ms`, `500us`, `1s`
+    /// (default: `2ms`). Also settable via `FGUMI_PIPELINE_TELEMETRY_INTERVAL`.
+    #[arg(long = "pipeline-telemetry-interval", hide = true)]
+    pub pipeline_telemetry_interval: Option<String>,
 }
 
 impl SchedulerOptions {
@@ -1213,6 +1227,77 @@ impl SchedulerOptions {
     pub fn deadlock_recover_enabled(&self) -> bool {
         self.deadlock_recover
     }
+
+    /// Resolves the thread-telemetry configuration from `--pipeline-telemetry-out`
+    /// / `--pipeline-telemetry-interval`, with environment-variable overrides
+    /// (`FGUMI_PIPELINE_TELEMETRY_OUT`, `FGUMI_PIPELINE_TELEMETRY_INTERVAL`).
+    ///
+    /// Returns `None` (telemetry off — the zero-cost path) unless telemetry is
+    /// explicitly requested via a flag or an env var. Once requested, an unset
+    /// stem defaults to `pipeline-telemetry` and an unset interval defaults to
+    /// `2ms`. An invalid `--pipeline-telemetry-interval` / env value falls back
+    /// to the default interval rather than failing the run — telemetry is a
+    /// diagnostic aid, not something a malformed knob should abort a pipeline
+    /// over.
+    #[must_use]
+    pub fn telemetry_config(
+        &self,
+    ) -> Option<crate::pipeline::core::runtime::telemetry::TelemetryConfig> {
+        use crate::pipeline::core::runtime::telemetry::TelemetryConfig;
+
+        let env_out =
+            std::env::var_os("FGUMI_PIPELINE_TELEMETRY_OUT").map(std::path::PathBuf::from);
+        let stem = self.pipeline_telemetry_out.clone().or(env_out);
+
+        let env_interval = std::env::var("FGUMI_PIPELINE_TELEMETRY_INTERVAL").ok();
+        let interval_str = self.pipeline_telemetry_interval.clone().or(env_interval);
+
+        // Telemetry is requested iff either knob is set; an interval alone
+        // (with no stem) still turns it on, using the default stem.
+        if stem.is_none() && interval_str.is_none() {
+            return None;
+        }
+
+        const DEFAULT_STEM: &str = "pipeline-telemetry";
+        const DEFAULT_INTERVAL: Duration = Duration::from_millis(2);
+
+        let stem = stem.unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_STEM));
+        let interval = interval_str
+            .as_deref()
+            .map(|s| parse_telemetry_interval(s).unwrap_or(DEFAULT_INTERVAL))
+            .unwrap_or(DEFAULT_INTERVAL);
+
+        Some(TelemetryConfig { stem, interval })
+    }
+}
+
+/// Parse a `--pipeline-telemetry-interval` value: a non-negative integer
+/// magnitude followed by a `us`, `ms`, or `s` unit suffix (e.g. `500us`,
+/// `2ms`, `1s`). No other units are accepted.
+fn parse_telemetry_interval(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    let (magnitude, unit) = if let Some(stripped) = s.strip_suffix("us") {
+        (stripped, "us")
+    } else if let Some(stripped) = s.strip_suffix("ms") {
+        (stripped, "ms")
+    } else if let Some(stripped) = s.strip_suffix('s') {
+        (stripped, "s")
+    } else {
+        return Err(format!(
+            "invalid telemetry interval '{s}': expected a number followed by us/ms/s, e.g. '2ms'"
+        ));
+    };
+    let value: u64 = magnitude.parse().map_err(|_| {
+        format!(
+            "invalid telemetry interval '{s}': expected a number followed by us/ms/s, e.g. '2ms'"
+        )
+    })?;
+    Ok(match unit {
+        "us" => Duration::from_micros(value),
+        "ms" => Duration::from_millis(value),
+        "s" => Duration::from_secs(value),
+        _ => unreachable!("unit is one of us/ms/s by construction above"),
+    })
 }
 
 /// Resolve the instrumentation level from the `FGUMI_PIPELINE_TRACE` env value
@@ -2761,6 +2846,8 @@ mod tests {
             pipeline_trace_out: None,
             deadlock_timeout: 10,
             deadlock_recover: false,
+            pipeline_telemetry_out: None,
+            pipeline_telemetry_interval: None,
         };
         assert_eq!(opts.strategy(), SchedulerStrategy::FixedPriority);
     }
@@ -2775,6 +2862,8 @@ mod tests {
             pool_scheduler: PoolScheduler::Auto,
             deadlock_timeout: 10,
             deadlock_recover: false,
+            pipeline_telemetry_out: None,
+            pipeline_telemetry_interval: None,
         };
         assert!(opts.collect_stats());
     }
@@ -2789,6 +2878,8 @@ mod tests {
             deadlock_timeout: 30,
             pool_scheduler: PoolScheduler::Auto,
             deadlock_recover: false,
+            pipeline_telemetry_out: None,
+            pipeline_telemetry_interval: None,
         };
         assert_eq!(opts.deadlock_timeout_secs(), 30);
     }
@@ -2803,6 +2894,8 @@ mod tests {
             deadlock_timeout: 10,
             deadlock_recover: true,
             pool_scheduler: PoolScheduler::Auto,
+            pipeline_telemetry_out: None,
+            pipeline_telemetry_interval: None,
         };
         assert!(opts.deadlock_recover_enabled());
     }
@@ -2866,6 +2959,17 @@ mod tests {
         #[case] expected: InstrumentationLevel,
     ) {
         assert_eq!(resolve_instrumentation_level(env, flag), expected);
+    }
+
+    #[test]
+    fn telemetry_interval_parses_common_units() {
+        assert_eq!(parse_telemetry_interval("2ms").unwrap(), std::time::Duration::from_millis(2));
+        assert_eq!(
+            parse_telemetry_interval("500us").unwrap(),
+            std::time::Duration::from_micros(500)
+        );
+        assert_eq!(parse_telemetry_interval("1s").unwrap(), std::time::Duration::from_secs(1));
+        assert!(parse_telemetry_interval("banana").is_err());
     }
 
     // ========== Tests for QueueMemoryOptions ==========

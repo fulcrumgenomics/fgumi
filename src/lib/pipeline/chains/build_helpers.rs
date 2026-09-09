@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::commands::common::{QueueMemoryOptions, SchedulerOptions};
-use crate::pipeline::core::builder::{Pipeline, PipelineConfig};
+use crate::pipeline::core::builder::{InstrumentationLevel, Pipeline, PipelineConfig};
 use crate::pipeline::core::runtime::stats::PipelineStats;
 
 /// Truthiness of a boolean-ish environment variable: `true` iff `name` is set
@@ -78,6 +78,18 @@ pub(crate) fn build_pipeline_config_for_chain(
              timeline TSV (only `timeline` or `deep` do); the path is ignored",
             config.instrumentation
         );
+    }
+
+    // Per-tick thread/bandwidth telemetry (`--pipeline-telemetry-out` /
+    // `FGUMI_PIPELINE_TELEMETRY_OUT`). Telemetry needs registered edges (edges
+    // register only when instrumentation is on), so bump `Off` to `Summary` when
+    // telemetry is requested; an explicit `--pipeline-trace` level set above wins.
+    config.telemetry = scheduler.telemetry_config();
+    if config.telemetry.is_some() && config.instrumentation == InstrumentationLevel::Off {
+        config.instrumentation = InstrumentationLevel::Summary;
+    }
+    if config.telemetry.is_some() {
+        config.rss_probe = Some(std::sync::Arc::new(fgumi_sort::process_rss_bytes));
     }
 
     let user_wants_stats = scheduler.collect_stats();

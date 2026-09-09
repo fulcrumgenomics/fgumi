@@ -89,6 +89,14 @@ pub(crate) mod zspill_stream;
 /// `memory-debug` feature is enabled.
 #[cfg(feature = "memory-debug")]
 pub use memory_probe::print_mi_stats;
+/// Sample the current process's resident set size, in bytes.
+///
+/// Thin re-export of the internal RSS-probe FFI call (mimalloc on Linux,
+/// `mach2::task_info(TASK_VM_INFO)` on macOS), exposed unconditionally — unlike
+/// [`print_mi_stats`], this is not gated behind `memory-debug` — for the main
+/// `fgumi` crate's pipeline thread-telemetry sampler, which needs an RSS reading
+/// on every tick regardless of whether that feature is enabled.
+pub use memory_probe::process_rss_bytes;
 /// Background read-ahead record reader, re-exported for `fgumi compare bams`,
 /// which reads two inputs concurrently and needs each decode off the main thread.
 pub use read_ahead::RawReadAheadReader;
