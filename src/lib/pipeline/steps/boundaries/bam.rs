@@ -16,12 +16,22 @@ use crate::pipeline::core::held::HeldSlot;
 use crate::pipeline::core::outputs::OrderedBytesSingle;
 use crate::pipeline::core::queues::QueueSpec;
 use crate::pipeline::core::reorder::BranchOrdering;
-use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
+use crate::pipeline::core::step::{CounterSpec, Step, StepCtx, StepKind, StepOutcome, StepProfile};
 use crate::pipeline::steps::types::DecompressedBlock;
 
 /// Max inputs processed per `try_run` invocation. Amortizes the Serial
 /// mutex acquisition; matches legacy `bam.rs:2050+` (`MAX_BATCHES_PER_LOCK`).
 const MAX_BATCHES_PER_LOCK: usize = 8;
+
+/// Counter slot index: record boundaries found this call.
+const RECORDS: usize = 0;
+
+/// Number of records represented by a `BoundaryBatch`'s `offsets`: the vec
+/// holds `num_records + 1` entries (a trailing `buffer.len()` sentinel), or is
+/// empty when the batch itself carries no offsets at all.
+fn record_count(offsets: &[usize]) -> u64 {
+    offsets.len().saturating_sub(1) as u64
+}
 
 /// `Serial + ByItemOrdinal` boundary finder. Holds `BoundaryState` (which
 /// owns the cross-block carryover buffer + header-skip flag).
@@ -86,7 +96,34 @@ impl Step for FindBamBoundaries {
         }
     }
 
+    fn counters(&self) -> &'static [CounterSpec] {
+        const SPECS: &[CounterSpec] = &[CounterSpec::new("records", "records")];
+        SPECS
+    }
+
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        // Batch total for this call, accumulated across every input processed
+        // in the loop (and the final-flush path) below; bumped exactly once —
+        // right before returning — regardless of which of `try_run_inner`'s
+        // several exit paths fires.
+        let mut records_this_call: u64 = 0;
+        let outcome = self.try_run_inner(ctx, &mut records_this_call);
+        ctx.counters.add(RECORDS, records_this_call);
+        outcome
+    }
+}
+
+impl FindBamBoundaries {
+    /// Body of `Step::try_run`, factored out so the counter bump in the trait
+    /// method stays a single call regardless of which early-return path below
+    /// fires. `records_this_call` accumulates the batch total (record
+    /// boundaries found) for this call; the caller bumps `ctx.counters` with
+    /// the final tally after this returns.
+    fn try_run_inner(
+        &mut self,
+        ctx: &mut StepCtx<'_, Self>,
+        records_this_call: &mut u64,
+    ) -> io::Result<StepOutcome> {
         if let Some(unpushed) = self.held.take() {
             match ctx.outputs.retry(unpushed) {
                 Ok(()) => {}
@@ -111,6 +148,7 @@ impl Step for FindBamBoundaries {
             did_work = true;
 
             let boundary_batch = self.state.find_boundaries(&block.bytes)?;
+            *records_this_call += record_count(&boundary_batch.offsets);
             if boundary_batch.buffer.is_empty() {
                 // Input fully absorbed (header/leftover); try next input.
                 continue;
@@ -143,17 +181,20 @@ impl Step for FindBamBoundaries {
         if ctx.input.is_drained() {
             if !self.finalized {
                 self.finalized = true;
-                if let Some(boundary_batch) = self.state.finish()?
-                    && !boundary_batch.buffer.is_empty()
-                {
-                    let serial = self.next_output_serial;
-                    self.next_output_serial += 1;
-                    let out =
-                        DecompressedBlock { batch_serial: serial, bytes: boundary_batch.buffer };
-                    if let Err(unpushed) = ctx.outputs.push(out) {
-                        self.held.put(unpushed);
+                if let Some(boundary_batch) = self.state.finish()? {
+                    *records_this_call += record_count(&boundary_batch.offsets);
+                    if !boundary_batch.buffer.is_empty() {
+                        let serial = self.next_output_serial;
+                        self.next_output_serial += 1;
+                        let out = DecompressedBlock {
+                            batch_serial: serial,
+                            bytes: boundary_batch.buffer,
+                        };
+                        if let Err(unpushed) = ctx.outputs.push(out) {
+                            self.held.put(unpushed);
+                        }
+                        return Ok(StepOutcome::Progress);
                     }
-                    return Ok(StepOutcome::Progress);
                 }
             }
             return Ok(StepOutcome::Finished);

@@ -34,8 +34,13 @@ use fgumi_pipeline_core::{
     outputs::Single,
     queues::QueueSpec,
     reorder::BranchOrdering,
-    step::{Affinity, DetachedGroup, Step, StepCtx, StepKind, StepOutcome, StepProfile},
+    step::{
+        Affinity, CounterSpec, DetachedGroup, Step, StepCtx, StepKind, StepOutcome, StepProfile,
+    },
 };
+
+/// Counter slot index: bytes written to the spill file this call.
+const SPILL_BYTES_WRITTEN: usize = 0;
 
 /// The one spill file currently being written (open from its first block until
 /// its `is_last_in_file` block).
@@ -263,17 +268,30 @@ impl Step for SpillWrite {
         Affinity::Writer
     }
 
+    fn counters(&self) -> &'static [CounterSpec] {
+        const SPECS: &[CounterSpec] = &[CounterSpec::new("spill_bytes_written", "bytes")];
+        SPECS
+    }
+
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
         if !self.flush_held(ctx) {
             return Ok(StepOutcome::Contention);
         }
 
         if let Some(event) = ctx.input.pop() {
+            // One event per `try_run`, so this is already the batch total for
+            // this call. Only `Block` carries spill bytes; read its length
+            // before `process_event` consumes the event.
+            let spill_bytes = match &event {
+                SpillBlockEvent::Block { bytes, .. } => bytes.len() as u64,
+                SpillBlockEvent::Residual { .. } | SpillBlockEvent::AllAnnounced { .. } => 0,
+            };
             if let Some(out) = self.process_event(event)?
                 && let Err(unpushed) = ctx.outputs.push(out)
             {
                 self.held.put(unpushed);
             }
+            ctx.counters.add(SPILL_BYTES_WRITTEN, spill_bytes);
             return Ok(StepOutcome::Progress);
         }
 

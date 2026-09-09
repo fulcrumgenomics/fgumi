@@ -2290,3 +2290,171 @@ fn shuffled_bam_matches_the_oracle_through_the_arena_split() {
     // run (partial coalescing), otherwise the case no longer exercises it.
     assert!(runs >= 2, "arena/BAM shuffled input must form >=2 runs (got {runs})");
 }
+
+// ── Domain counters (T-BW2): ReadBlocks / FindBoundariesAndSort / SpillWrite /
+// SortMerge, driven together through the real arena-split chain ──────────────
+
+/// Serial sink that sleeps briefly per received `RecordBatch` before recording
+/// it — mirroring `fgumi_pipeline_core::tests::CountingSink`'s per-item
+/// `thread::sleep`. Every step under test here sits upstream of this sink and
+/// can burst through its own work well within the first sampler tick (see
+/// `source::read_bam::tests::try_run_bumps_blocks_and_bytes_read_counters` and
+/// `sink::write_bgzf::tests::try_run_bumps_bytes_written_counter` for the two
+/// distinct ways that bites a naive telemetry test); throttling the terminal
+/// sink keeps the run open long enough for the sampler to observe each
+/// upstream step's counter at its frozen final value.
+struct ThrottledVecSink {
+    received: Arc<Mutex<Vec<RecordBatch>>>,
+}
+
+impl Step for ThrottledVecSink {
+    type Input = RecordBatch;
+    type Outputs = ();
+
+    fn profile(&self) -> StepProfile {
+        StepProfile {
+            name: "ThrottledVecSink",
+            kind: StepKind::Serial,
+            sticky: false,
+            output_queues: vec![],
+            branch_ordering: vec![],
+        }
+    }
+
+    fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        match ctx.input.pop() {
+            Some(batch) => {
+                std::thread::sleep(std::time::Duration::from_micros(500));
+                self.received.lock().push(batch);
+                Ok(StepOutcome::Progress)
+            }
+            None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+            None => Ok(StepOutcome::NoProgress),
+        }
+    }
+}
+
+/// Drives the full arena-split chain (`BgzfBlockSource -> ReadBlocks ->
+/// InflateToArena -> FindBoundariesAndSort -> SpillGather -> SpillBlockCompress
+/// -> SpillWrite -> SortSpillDecompress -> SortMerge -> ThrottledVecSink`) with
+/// telemetry enabled and asserts four of its steps' T-BW2 domain counters land
+/// in the telemetry files with sane, bounded values: `ReadBlocks`
+/// (`blocks`/`bytes_read`), `FindBoundariesAndSort` (`records`), `SpillWrite`
+/// (`spill_bytes_written`), and `SortMerge` (`records`). A tiny `memory_limit`
+/// forces several sealed runs (several spill files), giving every one of these
+/// steps repeated, spread-out `try_run` calls rather than a single batch.
+#[test]
+fn arena_split_pipeline_bumps_read_blocks_boundaries_spill_and_merge_counters() {
+    use fgumi_pipeline_core::builder::{InstrumentationLevel, Pipeline, PipelineConfig};
+    use fgumi_pipeline_core::runtime::telemetry::TelemetryConfig;
+    use fgumi_sort::TmpDirAllocator;
+    use std::time::Duration;
+
+    const N_RECORDS: usize = 4_000;
+    let (header, records) = synthesize_sized_records(N_RECORDS, 0xB00C_0003, 40);
+    let n_ref = u32::try_from(header.reference_sequences().len()).expect("n_ref fits u32");
+
+    let blocks = bgzf_blocks_for(&records, n_ref, 4096);
+    let total_blocks = blocks.len() as u64;
+    let total_bytes: u64 = blocks.iter().map(|b| b.bytes.len() as u64).sum();
+
+    let memory_limit = 64 * 1024; // tiny ⇒ several sealed runs / spill files
+    let output_byte_limit = 4 * 1024 * 1024;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let alloc =
+        TmpDirAllocator::with_probe(vec![dir.path().to_path_buf()], Box::new(|_| Ok(u64::MAX)), 0)
+            .unwrap();
+    let temp_dirs = Arc::new(vec![dir]);
+    let codec = SpillCodec::Zstd;
+
+    let merge = SortMerge::<RecordBatchOutput>::with_target_batch_count(
+        SortOrder::Coordinate,
+        output_byte_limit,
+        256,
+    );
+    let received: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = ThrottledVecSink { received: Arc::clone(&received) };
+
+    let telemetry_dir =
+        std::env::temp_dir().join(format!("fgumi-tbw2-arena-split-{}", std::process::id()));
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let stem = telemetry_dir.join("run");
+
+    let builder = Pipeline::builder();
+    builder
+        .chain(BgzfBlockSource::new(blocks, output_byte_limit))
+        .chain(ReadBlocks::new(memory_limit, output_byte_limit))
+        .chain(InflateToArena::new(output_byte_limit))
+        .chain(FindBoundariesAndSort::new(CoordinateStrategy::new(n_ref), 1, output_byte_limit))
+        .chain(SpillGather::new(output_byte_limit))
+        .chain(SpillBlockCompress::new(codec, 3, output_byte_limit))
+        .chain(SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, output_byte_limit, temp_dirs))
+        .chain(SortSpillDecompress::new(output_byte_limit, SortDecompressTuning::default()))
+        .chain(merge)
+        .chain(sink)
+        .into_sink_marker();
+    let pipeline = builder.build().expect("pipeline builds");
+    pipeline
+        .run(PipelineConfig {
+            threads: 1,
+            instrumentation: InstrumentationLevel::Summary,
+            telemetry: Some(TelemetryConfig {
+                stem: stem.clone(),
+                interval: Duration::from_millis(1),
+            }),
+            ..Default::default()
+        })
+        .expect("pipeline runs to completion");
+
+    // Ground truth, independent of the sampled telemetry file.
+    let collected = std::mem::take(&mut *received.lock());
+    let total_out_records: usize = collected.iter().map(|b| b.iter_record_bytes().count()).sum();
+    assert_eq!(total_out_records, N_RECORDS, "every record reached the sink exactly once");
+
+    // Step indices, in declaration order: source=0, ReadBlocks=1,
+    // InflateToArena=2, FindBoundariesAndSort=3, SpillGather=4,
+    // SpillBlockCompress=5, SpillWrite=6, SortSpillDecompress=7, SortMerge=8,
+    // sink=9.
+    let counters = std::fs::read_to_string(telemetry_dir.join("run.ticks.counters.tsv")).unwrap();
+    let last_value_for = |step: &str, counter: &str| -> Option<u64> {
+        counters
+            .lines()
+            .skip(1)
+            .filter(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                f[2] == step && f[3] == counter
+            })
+            .last()
+            .map(|l| l.split('\t').nth(5).unwrap().parse::<u64>().unwrap())
+    };
+
+    let read_blocks_blocks =
+        last_value_for("1", "0").expect("ReadBlocks blocks counter recorded at least once");
+    let read_blocks_bytes =
+        last_value_for("1", "1").expect("ReadBlocks bytes_read counter recorded at least once");
+    assert!(
+        read_blocks_blocks > 0 && read_blocks_blocks <= total_blocks,
+        "read_blocks_blocks={read_blocks_blocks}"
+    );
+    assert!(
+        read_blocks_bytes > 0 && read_blocks_bytes <= total_bytes,
+        "read_blocks_bytes={read_blocks_bytes}"
+    );
+
+    let fbs_records =
+        last_value_for("3", "0").expect("FindBoundariesAndSort records counter recorded");
+    assert!(fbs_records > 0 && fbs_records <= N_RECORDS as u64, "fbs_records={fbs_records}");
+
+    let spill_bytes_written =
+        last_value_for("6", "0").expect("SpillWrite spill_bytes_written counter recorded");
+    assert!(spill_bytes_written > 0, "spill_bytes_written={spill_bytes_written}");
+
+    let merge_records = last_value_for("8", "0").expect("SortMerge records counter recorded");
+    assert!(
+        merge_records > 0 && merge_records <= N_RECORDS as u64,
+        "merge_records={merge_records}"
+    );
+
+    std::fs::remove_dir_all(&telemetry_dir).ok();
+}

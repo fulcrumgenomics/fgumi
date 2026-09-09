@@ -56,7 +56,7 @@ use crate::pipeline::core::item::{HeapSize, Ordered};
 use crate::pipeline::core::outputs::OrderedBytesSingle;
 use crate::pipeline::core::queues::QueueSpec;
 use crate::pipeline::core::reorder::BranchOrdering;
-use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
+use crate::pipeline::core::step::{CounterSpec, Step, StepCtx, StepKind, StepOutcome, StepProfile};
 use crate::pipeline::steps::types::DecodedRecordBatch;
 use fgumi_bam_io::Grouper;
 use fgumi_bam_io::MemoryEstimate;
@@ -64,6 +64,17 @@ use fgumi_bam_io::MemoryEstimate;
 /// Max input batches consumed per `try_run` invocation. Amortizes the
 /// `Serial` mutex acquisition; mirrors `GroupBam`'s `MAX_BATCHES_PER_LOCK`.
 const MAX_BATCHES_PER_LOCK: usize = 8;
+
+/// Counter slot index: records consumed this call.
+///
+/// NOTE: a `molecules` counter (distinct UMI/MI groups) is deliberately NOT
+/// wired here. `GroupByPosition` only forms *position* groups
+/// (`RawPositionGroup`) — the UMI-adjacency split into final MI/molecule
+/// groups happens downstream in `MiAssign`, which this step has no visibility
+/// into. Counting emitted `RawPositionGroup`s here would misrepresent them as
+/// molecules when a single position group can still split into several MI
+/// groups later. See T-BW2 report for the follow-up.
+const RECORDS: usize = 0;
 
 /// Default target batch count. Mirrors legacy's `template_batch_size: 500`
 /// adjusted for position-group granularity. Position grouping aggregates
@@ -241,7 +252,33 @@ impl Step for GroupByPosition {
         }
     }
 
+    fn counters(&self) -> &'static [CounterSpec] {
+        const SPECS: &[CounterSpec] = &[CounterSpec::new("records", "records")];
+        SPECS
+    }
+
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        // Batch total for this call, accumulated across every input batch
+        // consumed in the loop below; bumped exactly once regardless of which
+        // of `try_run_inner`'s several exit paths fires.
+        let mut records_this_call: u64 = 0;
+        let outcome = self.try_run_inner(ctx, &mut records_this_call);
+        ctx.counters.add(RECORDS, records_this_call);
+        outcome
+    }
+}
+
+impl GroupByPosition {
+    /// Body of `Step::try_run`, factored out so the counter bump in the trait
+    /// method stays a single call regardless of which early-return path below
+    /// fires. `records_this_call` accumulates the batch total (records
+    /// consumed) for this call; the caller bumps `ctx.counters` after this
+    /// returns.
+    fn try_run_inner(
+        &mut self,
+        ctx: &mut StepCtx<'_, Self>,
+        records_this_call: &mut u64,
+    ) -> io::Result<StepOutcome> {
         // 1. Drain held slot first.
         if let Some(unpushed) = self.held.take() {
             match ctx.outputs.retry(unpushed) {
@@ -269,6 +306,7 @@ impl Step for GroupByPosition {
             let Some(batch) = ctx.input.pop() else { break };
             did_work = true;
             let records = batch.into_records();
+            *records_this_call += records.len() as u64;
             let groups = self.grouper.add_records(records)?;
             self.accumulator.extend(groups);
             if self.accumulator.len() >= self.target_batch_count {
