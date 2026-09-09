@@ -323,20 +323,19 @@ pub fn cb_hasher() -> ahash::RandomState {
 ///
 /// A `NamedTempFile` is created `0600`, so persisting it verbatim would silently
 /// make merged output owner-only. To preserve the semantics of the pre-atomic-temp
-/// direct write (`File::create`), the `Temp` variant carries the mode the final
-/// file must end up with (see [`target_file_mode`]) and applies it before the
-/// rename.
+/// direct write (`File::create`), [`persist`](MergeOutputTarget::persist) re-stamps
+/// the temp to the mode the final file must carry — via the shared
+/// [`fgumi_bam_io::restamp_for_persist`] — before the rename.
 enum MergeOutputTarget {
     /// A regular-file output, staged in a same-directory temp. `dest` is the
     /// resolved final path the temp is atomically renamed onto (a symlinked
     /// output is followed to its real target, so the temp is staged next to —
-    /// and renamed onto — the linked file rather than the link itself). `mode`
-    /// is the Unix mode to stamp onto the temp before persisting (`None` on
-    /// non-Unix, where file modes are managed by the platform).
+    /// and renamed onto — the linked file rather than the link itself). The temp
+    /// is re-stamped to `dest`'s `File::create` mode at persist time (see
+    /// [`persist`](MergeOutputTarget::persist)).
     Temp {
         temp: tempfile::NamedTempFile,
         dest: PathBuf,
-        mode: Option<u32>,
     },
     Stdout(PathBuf),
 }
@@ -373,10 +372,7 @@ impl MergeOutputTarget {
             .suffix(".tmp")
             .tempfile_in(&dir)
             .with_context(|| format!("failed to create a merge temp file in {}", dir.display()))?;
-        // Resolve the final mode now (before any BGZF writer threads spawn) so the
-        // umask read below is single-threaded and cannot race a concurrent create.
-        let mode = target_file_mode(&dest);
-        Ok(Self::Temp { temp, dest, mode })
+        Ok(Self::Temp { temp, dest })
     }
 
     /// The path the merged BAM is written to.
@@ -391,20 +387,17 @@ impl MergeOutputTarget {
     /// for stdout), first stamping the resolved mode so the output is not left
     /// temp-private (`0600`). Consumes `self`, disarming the RAII auto-remove.
     fn persist(self) -> Result<()> {
-        if let Self::Temp { temp, dest, mode } = self {
-            if let Some(mode) = mode {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    temp.as_file()
-                        .set_permissions(std::fs::Permissions::from_mode(mode))
-                        .with_context(|| {
-                            format!("failed to set mode on merge temp for {}", dest.display())
-                        })?;
-                }
-                #[cfg(not(unix))]
-                let _ = mode;
-            }
+        if let Self::Temp { temp, dest } = self {
+            // Re-stamp the temp to the mode `File::create(dest)` would produce
+            // before the rename: `NamedTempFile` is `0600`, and `persist` keeps
+            // that mode, so merged output would otherwise be owner-only. The
+            // shared helper derives that mode by probing `File::create` once per
+            // process (cached) rather than mutating the process-wide umask, so it
+            // is safe under concurrent output creation regardless of when it
+            // first runs.
+            fgumi_bam_io::restamp_for_persist(temp.as_file(), &dest).with_context(|| {
+                format!("failed to set mode on merge temp for {}", dest.display())
+            })?;
             temp.persist(&dest).map_err(|e| e.error).with_context(|| {
                 format!("failed to finalize merged output at {}", dest.display())
             })?;
@@ -440,64 +433,6 @@ fn resolve_symlink_output(output: &Path) -> Result<PathBuf> {
         };
     }
     anyhow::bail!("too many levels of symbolic links while resolving output {}", output.display())
-}
-
-/// The mode the merged output file must carry, matching the pre-atomic-temp write
-/// path (`File::create`): an existing destination keeps its current mode; a new
-/// file gets `0o666 & !umask`. Returns `None` on non-Unix, where the temp's
-/// platform-managed permissions are left as-is.
-#[cfg(unix)]
-// The `not(unix)` sibling returns `None`, so the `Option` is load-bearing there.
-#[allow(clippy::unnecessary_wraps, reason = "non-unix sibling returns None")]
-fn target_file_mode(output: &Path) -> Option<u32> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = match std::fs::metadata(output) {
-        // Overwriting: `File::create` never changes an existing file's mode, so keep it.
-        Ok(meta) => meta.permissions().mode() & 0o777,
-        // New file: `File::create` opens `0o666`, then the kernel masks it with umask.
-        Err(_) => 0o666 & !process_umask(),
-    };
-    Some(mode)
-}
-
-#[cfg(not(unix))]
-fn target_file_mode(_output: &Path) -> Option<u32> {
-    None
-}
-
-/// Reads the process file-creation mask (`umask`) without leaving it changed.
-///
-/// `umask(2)` can only *set* the mask (returning the previous value), so reading it
-/// means setting it to `0` and immediately restoring it. That read-modify-restore is
-/// not atomic: two concurrent probes can interleave so the second reads the first's
-/// transient `0` and restores `0`, permanently clearing the process mask (and mis-
-/// computing every subsequent new-file mode). A process-global lock serializes the
-/// probes so each is atomic with respect to every other — needed because
-/// `fgumi_lib` is a library and callers may run merges concurrently in one process.
-#[cfg(unix)]
-fn process_umask() -> u32 {
-    use std::sync::Mutex;
-
-    // Serializes the non-atomic umask read-restore against other concurrent probes.
-    static UMASK_LOCK: Mutex<()> = Mutex::new(());
-    let _guard = UMASK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-
-    // SAFETY: `umask` has no preconditions and cannot fail; it is `unsafe` only
-    // because it is a raw libc binding. We restore the original mask on the very
-    // next call under `UMASK_LOCK`, so the process-wide umask is unchanged on return.
-    #[allow(unsafe_code)]
-    let previous = unsafe {
-        let previous = libc::umask(0);
-        libc::umask(previous);
-        previous
-    };
-    // `libc::mode_t` is `u16` on macOS (the conversion widens) and `u32` on Linux
-    // (the conversion is a no-op), so `useless_conversion` fires only on Linux.
-    #[allow(
-        clippy::useless_conversion,
-        reason = "libc::mode_t is u16 on macOS and u32 on Linux; the From keeps this portable"
-    )]
-    u32::from(previous)
 }
 
 /// Maps read group ID -> library ordinal for O(1) comparison.
@@ -6535,6 +6470,59 @@ mod tests {
     use rstest::rstest;
 
     // ========================================================================
+    // Merge output permissions
+    // ========================================================================
+
+    /// `MergeOutputTarget::persist` must re-stamp the temp to the mode a plain
+    /// `File::create(dest)` would produce, so merged output is never left with
+    /// `NamedTempFile`'s owner-only `0o600`. The mode-derivation itself is unit-
+    /// tested in `fgumi-bam-io`; this is the merge-level guard that the
+    /// `restamp_for_persist` call is actually wired into `persist` — without it,
+    /// dropping that call ships `0o600` and nothing in this crate fails.
+    ///
+    /// Two cases mirror `File::create` semantics: a new destination lands at
+    /// `0o666 & !umask` (compared against a live `File::create` reference so the
+    /// assertion tracks the runner's umask), and overwriting an existing file
+    /// keeps that file's mode.
+    #[cfg(unix)]
+    #[rstest]
+    #[case::new_dest(None)]
+    #[case::overwrite_existing(Some(0o640))]
+    fn merge_persist_restamps_output_to_file_create_mode(#[case] preexisting_mode: Option<u32>) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let dest = dir.path().join("merged.bam");
+
+        // The mode `File::create(dest)` would leave: an existing file's own mode
+        // on overwrite, else `0o666 & !umask` observed via a live reference.
+        let expected_mode = if let Some(mode) = preexisting_mode {
+            std::fs::File::create(&dest).expect("pre-create destination");
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(mode))
+                .expect("chmod destination");
+            mode
+        } else {
+            let reference = dir.path().join("reference");
+            std::fs::File::create(&reference).expect("create reference");
+            std::fs::metadata(&reference).expect("stat reference").permissions().mode() & 0o777
+        };
+
+        let target = MergeOutputTarget::create(&dest).expect("create merge target");
+        target.persist().expect("persist merge output");
+
+        let mode =
+            std::fs::metadata(&dest).expect("stat merged output").permissions().mode() & 0o777;
+        // Guard against the temp file's owner-only 0o600 leaking through -- but only when
+        // File::create's own mode differs from 0o600. Under a restrictive umask (e.g. 0o077)
+        // File::create legitimately yields 0o600, so this guard would otherwise fire on a
+        // correct result; the assert_eq below fully pins the mode in that case.
+        if expected_mode != 0o600 {
+            assert_ne!(mode, 0o600, "merged output must not inherit the temp's owner-only 0o600");
+        }
+        assert_eq!(mode, expected_mode, "persisted merge output must match File::create's mode");
+    }
+
+    // ========================================================================
     // Record-count invariant
     // ========================================================================
 
@@ -6868,47 +6856,7 @@ mod tests {
     }
 
     // ========================================================================
-    // process_umask concurrency
-    // ========================================================================
-
-    /// `process_umask` reads the mask via a non-atomic set-0-then-restore. Two
-    /// interleaved probes can leave the process mask permanently `0` (and every
-    /// probe observe the wrong value); `UMASK_LOCK` must serialize them. Read the
-    /// mask once, hammer it from many threads, and assert every probe — and the
-    /// final mask — matches the initial value. Without the lock this corrupts to
-    /// `0` reliably under contention. (Uses only `process_umask` so it introduces
-    /// no new `unsafe` site.)
-    #[cfg(unix)]
-    #[test]
-    fn test_process_umask_is_concurrency_safe() {
-        use std::thread;
-
-        let expected = process_umask();
-        let threads: Vec<_> = (0..8)
-            .map(|_| {
-                thread::spawn(move || {
-                    for _ in 0..2000 {
-                        assert_eq!(
-                            process_umask(),
-                            expected,
-                            "a concurrent probe observed a corrupted umask"
-                        );
-                    }
-                })
-            })
-            .collect();
-        for t in threads {
-            t.join().expect("umask probe thread panicked");
-        }
-        assert_eq!(
-            process_umask(),
-            expected,
-            "concurrent probes must leave the process umask unchanged"
-        );
-    }
-
-    // ========================================================================
-    // resolve_symlink_output / target_file_mode
+    // resolve_symlink_output
     // ========================================================================
 
     /// A non-symlink path — even one that does not exist yet — is returned
@@ -6946,29 +6894,6 @@ mod tests {
         std::os::unix::fs::symlink(&b, &a).unwrap();
         std::os::unix::fs::symlink(&a, &b).unwrap();
         assert!(resolve_symlink_output(&a).is_err());
-    }
-
-    /// Overwriting an existing destination keeps its current mode (matching
-    /// `File::create`, which never re-chmods an existing file).
-    #[cfg(unix)]
-    #[test]
-    fn test_target_file_mode_keeps_existing_file_mode() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("out.bam");
-        std::fs::write(&path, b"x").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        assert_eq!(target_file_mode(&path), Some(0o640));
-    }
-
-    /// A new destination gets `0o666 & !umask` — the mode `File::create` would
-    /// have produced — not the temp file's private `0600`.
-    #[cfg(unix)]
-    #[test]
-    fn test_target_file_mode_new_file_uses_umask() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("does-not-exist.bam");
-        assert_eq!(target_file_mode(&path), Some(0o666 & !process_umask()));
     }
 
     // ========================================================================

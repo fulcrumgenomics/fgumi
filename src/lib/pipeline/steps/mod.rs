@@ -38,6 +38,7 @@ pub mod extract;
 pub mod group;
 pub mod parse;
 pub mod process;
+pub mod roundtrip;
 pub mod serialize;
 pub mod serialize_processed;
 pub mod sink;
@@ -47,6 +48,7 @@ pub mod templates_to_records;
 pub mod tuning;
 pub mod types;
 
+pub use roundtrip::{RoundtripConfig, run_bam_roundtrip};
 pub use tuning::BamPipelineTuning;
 pub use types::{
     BamTemplateBatch, BgzfBlock, DecodedRecordBatch, DecompressedBlock, RecordBatch,
