@@ -120,6 +120,14 @@ fn runall_group_metrics_and_consensus_metrics_coexist_in_one_fused_run() {
 
 /// `--all-metrics` must never overwrite a metrics path the user set
 /// explicitly on a per-stage flag — it only fills in options still `None`.
+///
+/// Uses `--group::metrics` (the `metrics_prefix` field) rather than
+/// `--group::family-size-histogram`: `--all-metrics` only ever derives
+/// group's `metrics_prefix` (see the corrected fill-in and
+/// `all_metrics_fills_in_every_applicable_stage_present_in_the_chain`'s doc
+/// comment below), so `--group::family-size-histogram` is never a path
+/// `--all-metrics` would derive in the first place — asserting explicit-wins
+/// against it would be vacuous.
 #[test]
 fn all_metrics_never_overwrites_an_explicit_per_stage_flag() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -127,7 +135,7 @@ fn all_metrics_never_overwrites_an_explicit_per_stage_flag() {
     let bam_path = dir.path().join("in.bam");
     write_bam(&bam_path, &header, &[grouped_record("r1", 100, "AAAAAAAA")]);
 
-    let explicit_path = dir.path().join("explicit.family_sizes.txt");
+    let explicit_prefix = dir.path().join("explicit");
     let all_metrics_prefix = dir.path().join("all");
 
     run_fgumi(&[
@@ -142,16 +150,19 @@ fn all_metrics_never_overwrites_an_explicit_per_stage_flag() {
         "group",
         "--group::strategy",
         "adjacency",
-        "--group::family-size-histogram",
-        explicit_path.to_str().unwrap(),
+        "--group::metrics",
+        explicit_prefix.to_str().unwrap(),
         "--all-metrics",
         all_metrics_prefix.to_str().unwrap(),
     ]);
 
-    assert!(explicit_path.is_file(), "explicit flag's path must be used");
     assert!(
-        !dir.path().join("all.group.family_size_histogram.txt").exists(),
-        "the derived path must NOT also be written — explicit wins outright"
+        dir.path().join("explicit.family_sizes.txt").is_file(),
+        "explicit flag's prefix must be used"
+    );
+    assert!(
+        !dir.path().join("all.group.family_sizes.txt").exists(),
+        "the derived prefix must NOT also be written — explicit wins outright"
     );
 }
 
@@ -200,11 +211,19 @@ fn all_metrics_fills_in_every_applicable_stage_present_in_the_chain() {
         prefix.to_str().unwrap(),
     ]);
 
-    assert!(dir.path().join("all.group.family_size_histogram.txt").is_file());
-    assert!(dir.path().join("all.group.grouping_metrics.txt").is_file());
+    // `--all-metrics` derives ONLY group's `metrics_prefix` (`all.group`);
+    // its fan-out then writes the complete canonical group metric set —
+    // Task 1's three pinned filenames — with no collision.
     assert!(
         dir.path().join("all.group.family_sizes.txt").is_file(),
         "group's own --metrics prefix output"
+    );
+    assert!(dir.path().join("all.group.grouping_metrics.txt").is_file());
+    assert!(dir.path().join("all.group.position_group_sizes.txt").is_file());
+    assert!(
+        !dir.path().join("all.group.family_size_histogram.txt").exists(),
+        "--all-metrics must NOT separately derive --group::family-size-histogram: it would be a \
+         redundant near-duplicate of the metrics_prefix fan-out's family_sizes.txt"
     );
     assert!(dir.path().join("all.simplex.family_sizes.txt").is_file());
     assert!(dir.path().join("all.simplex.umi_counts.txt").is_file());

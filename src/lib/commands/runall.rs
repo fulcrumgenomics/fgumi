@@ -887,10 +887,17 @@ pub struct RunAll {
     pub filter_opts: crate::commands::filter::MultiFilterOptions,
 
     /// Convenience: fills in every applicable metrics-output option (group's
-    /// family-size-histogram/grouping-metrics/metrics, correct's metrics,
-    /// filter's stats, and each present consensus stage's metrics) for every
-    /// stage in this run, under `<PREFIX>.<stage>[.<suffix>]`, for any option
-    /// the user did not already set explicitly. Reject-stream flags
+    /// `--metrics` prefix, correct's metrics, filter's stats, and each
+    /// present consensus stage's metrics) for every stage in this run, under
+    /// `<PREFIX>.<stage>[.<suffix>]`, for any option the user did not already
+    /// set explicitly. For group specifically, only `--metrics` (the prefix)
+    /// is derived — its own fan-out already writes the complete canonical
+    /// set (`<PREFIX>.group.family_sizes.txt`,
+    /// `<PREFIX>.group.grouping_metrics.txt`,
+    /// `<PREFIX>.group.position_group_sizes.txt`); `--all-metrics` does not
+    /// separately derive `--group::family-size-histogram` or
+    /// `--group::grouping-metrics`, since doing so would collide with (or
+    /// near-duplicate) that same fan-out. Reject-stream flags
     /// (`--*::rejects`, `--rejects`) are never touched by this flag.
     #[arg(long = "all-metrics")]
     pub all_metrics: Option<PathBuf>,
@@ -1362,14 +1369,19 @@ impl RunAll {
                         effective_strategy,
                         effective_edits,
                     )?;
-                    if group_opts.family_size_histogram.is_none() {
-                        group_opts.family_size_histogram =
-                            self.derived_metrics_path("group", "family_size_histogram.txt");
-                    }
-                    if group_opts.grouping_metrics.is_none() {
-                        group_opts.grouping_metrics =
-                            self.derived_metrics_path("group", "grouping_metrics.txt");
-                    }
+                    // `--all-metrics` only derives `metrics_prefix` here, not
+                    // `family_size_histogram`/`grouping_metrics`: the prefix's
+                    // own fan-out (`write_metrics_for_chain`, group.rs) already
+                    // writes the complete canonical set —
+                    // `<prefix>.family_sizes.txt`, `<prefix>.grouping_metrics.txt`,
+                    // `<prefix>.position_group_sizes.txt` (Task 1's pinned
+                    // filenames). Deriving the other two as well would collide
+                    // with (`grouping_metrics.txt`) or near-duplicate
+                    // (`family_size_histogram.txt` vs. the prefix's
+                    // `family_sizes.txt`) that same output. Explicit
+                    // `--group::family-size-histogram` /
+                    // `--group::grouping-metrics` are untouched either way —
+                    // this only decides what `--all-metrics` derives.
                     if group_opts.metrics_prefix.is_none() {
                         group_opts.metrics_prefix = self.derived_metrics_prefix("group");
                     }
@@ -2341,7 +2353,12 @@ mod bag_tests {
     // `Stage::Duplex`, which the integration test cannot exercise safely.
 
     #[test]
-    fn all_metrics_fills_every_group_metrics_option() {
+    fn all_metrics_fills_only_group_metrics_prefix() {
+        // `--all-metrics` derives ONLY `metrics_prefix` for group —
+        // `family_size_histogram`/`grouping_metrics` are left `None` (fix
+        // round 1: deriving those too collided with, or near-duplicated,
+        // `metrics_prefix`'s own fan-out; see the `Stage::Group` arm's
+        // comment in `build_stage_options_bag`).
         let r = parse(&[
             "--start-from",
             "group",
@@ -2358,12 +2375,31 @@ mod bag_tests {
         ]);
         let bag = r.build_stage_options_bag(&[Stage::Group]).unwrap();
         let g = bag.group.unwrap();
-        assert_eq!(
-            g.family_size_histogram,
-            Some(PathBuf::from("all.group.family_size_histogram.txt"))
-        );
-        assert_eq!(g.grouping_metrics, Some(PathBuf::from("all.group.grouping_metrics.txt")));
+        assert_eq!(g.family_size_histogram, None);
+        assert_eq!(g.grouping_metrics, None);
         assert_eq!(g.metrics_prefix, Some(PathBuf::from("all.group")));
+    }
+
+    #[test]
+    fn all_metrics_never_overwrites_an_explicit_group_metrics_prefix() {
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+            "--group::metrics",
+            "explicit",
+            "--all-metrics",
+            "all",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Group]).unwrap();
+        assert_eq!(bag.group.unwrap().metrics_prefix, Some(PathBuf::from("explicit")));
     }
 
     #[test]
