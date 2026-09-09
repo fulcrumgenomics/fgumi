@@ -839,8 +839,13 @@ fn build_template_info_with_mi_and_name(
     let r2_ref = r2_tid as usize;
     let same_ref = r1_ref == r2_ref;
 
+    // `ref_name` is always R1's reference. Interval overlap uses R1's own range
+    // when R1 and R2 are on different chromosomes, matching fgbio
+    // CollectDuplexSeqMetrics: `if (rec.refIndex == rec.mateRefIndex)
+    // Bams.insertCoordinates(rec) else (rec.start, rec.end)`.
     let ref_name = header.reference_sequences().get_index(r1_ref).map(|(name, _)| name.to_string());
 
+    // None here implies a malformed mapped record (no CIGAR); skip defensively.
     let (s1, s2) =
         match (unclipped_five_prime_position_raw(r1), unclipped_five_prime_position_raw(r2)) {
             (Some(s1), Some(s2)) => (s1, s2),
@@ -864,11 +869,22 @@ fn build_template_info_with_mi_and_name(
         (r1_start, r1_end.unwrap_or(r1_start))
     };
 
+    // Template-level library (RG -> LB) and cell barcode (CB), taken from the primary
+    // R1, matching fgbio's ReadInfo(library, cellBarcode). Different libraries or cells
+    // at the same coordinate/strand form separate families (DXM3-02). The cell tag is
+    // hardcoded to CB, matching fgumi's opinionated group/dedup (no --cell-tag flag).
     let library = find_string_tag_in_record(r1.as_ref(), SamTag::RG)
         .map_or(0u16, |rg| library_index.get(LibraryIndex::hash_rg(rg)));
     let cell_barcode: Option<Box<[u8]>> =
         find_string_tag_in_record(r1.as_ref(), SamTag::CB).map(Box::from);
 
+    // Order the two mate positions so the earlier-mapping read comes first. The
+    // tie-break includes strand (positive sorts before negative, since Rust
+    // `false < true` and `strand == is_reverse`), matching fgumi's own group/dedup
+    // canonicalization (the `(ref, pos, strand)` key ordering) and
+    // fgbio's ReadInfo `r1Earlier` (GroupReadsByUmi.scala:105-111). Without the strand
+    // tie-break, the two strands of a duplex whose mates share an identical
+    // (ref, unclipped-5') canonicalize to different keys and fail to co-group.
     let (ref_index1, start1, strand1, ref_index2, start2, strand2) =
         if (r1_ref, s1, r1_strand) <= (r2_ref, s2, r2_strand) {
             (r1_ref, s1, r1_strand, r2_ref, s2, r2_strand)

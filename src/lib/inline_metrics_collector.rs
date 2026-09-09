@@ -8,9 +8,7 @@
 //! **Ported ahead of its caller.** Every item here is `pub(crate)`. Until
 //! Task 8's `Serial` collector step and Task 9's fused T1 accumulator wire
 //! this module in, nothing outside its own tests constructs a
-//! `ConsensusMetricsAccumulator`, so the whole module is dead code to the
-//! compiler. The `allow` below is scoped to this module and should be
-//! deleted once a caller lands (Task 8 or 9).
+//! `ConsensusMetricsAccumulator`.
 //!
 //! **Fix round 1 (post-Task-7 review):** the original per-slot design called
 //! `record_simplex_coordinate_group`/`record_duplex_coordinate_group` once
