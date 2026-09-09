@@ -135,6 +135,7 @@ fn step2_typed_dispatch_pairs_both_branches() {
     b_outputs.push(2).unwrap();
 
     let signal = PipelineSignal::new();
+    let no_counters = crate::runtime::contexts::StepCounters::disabled();
     // Drive the merge step twice — once per pair.
     let mut sum_step = sum_step;
     for _ in 0..2 {
@@ -142,6 +143,7 @@ fn step2_typed_dispatch_pairs_both_branches() {
             input: merge_input_any.as_ref(),
             outputs: merge_outputs_any.as_ref(),
             signal: &signal,
+            counters: &no_counters,
         };
         let outcome = sum_step.try_run_erased(&mut ctx).unwrap();
         assert_eq!(outcome, StepOutcome::Progress);
@@ -152,6 +154,7 @@ fn step2_typed_dispatch_pairs_both_branches() {
             input: merge_input_any.as_ref(),
             outputs: merge_outputs_any.as_ref(),
             signal: &signal,
+            counters: &no_counters,
         };
         let outcome = sum_step.try_run_erased(&mut ctx).unwrap();
         assert_eq!(outcome, StepOutcome::NoProgress);
@@ -264,11 +267,13 @@ fn step2_build_two_input_handles_accepts_one_producer_with_distinct_branches() {
     view.b.push(1).unwrap();
 
     let signal = PipelineSignal::new();
+    let no_counters = crate::runtime::contexts::StepCounters::disabled();
     let mut sum_step = sum_step;
     let mut ctx = ErasedStepCtx {
         input: merge_input_any.as_ref(),
         outputs: merge_outputs_any.as_ref(),
         signal: &signal,
+        counters: &no_counters,
     };
     assert_eq!(sum_step.try_run_erased(&mut ctx).unwrap(), StepOutcome::Progress);
     assert_eq!(
@@ -1238,4 +1243,380 @@ fn crate_docs_enumerate_every_runtime_dependency() {
         "crate docs in lib.rs enumerate the dependency graph but omit {undocumented:?}; \
          add them to the list or drop the claim"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T-BW1: per-step bandwidth telemetry — end-to-end mechanism proof.
+//
+// Drives a real `source → middle → sink` pipeline at `--threads 2` with
+// telemetry ON, where the `Parallel` middle step declares one domain counter
+// and bumps it once per item across BOTH of its worker clones. Asserts:
+//   1. the ONE shared per-`step_idx` counter aggregates both clones' bumps;
+//   2. `counters.tsv` + `counter_names.tsv` are written with the right rows;
+//   3. `edges.tsv` carries `d_pushed_bytes`/`d_popped_bytes` — numeric on the
+//      byte-bounded source→middle edge, empty on the count-bounded middle→sink
+//      edge;
+//   4. with telemetry OFF the same chain still drains and no counters file is
+//      written (byte-identical behaviour; the full suite proves the rest).
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod bandwidth_telemetry {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use parking_lot::Mutex;
+
+    use crate::builder::{InstrumentationLevel, PipelineBuilder, PipelineConfig};
+    use crate::item::HeapSize;
+    use crate::outputs::Single;
+    use crate::queues::QueueSpec;
+    use crate::reorder::BranchOrdering;
+    use crate::runtime::telemetry::TelemetryConfig;
+    use crate::step::{CounterSpec, Step, StepCtx, StepKind, StepOutcome, StepProfile};
+
+    /// A payload with real heap so the byte-bounded source→middle edge records
+    /// non-zero `pushed_bytes`/`popped_bytes` (a bare `u32` has `heap_size` 0).
+    struct Blob(#[allow(dead_code)] Vec<u8>);
+    impl HeapSize for Blob {
+        fn heap_size(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    /// Per-blob heap payload size; the byte edge should move `N * BLOB_BYTES`.
+    const BLOB_BYTES: usize = 16;
+
+    /// `Parallel` byte-bounded source emitting `N` `Blob`s (claim-and-hold so a
+    /// backpressured push retries the exact item rather than dropping it).
+    #[derive(Clone)]
+    struct ByteSource {
+        remaining: Arc<AtomicU32>,
+        held: bool,
+    }
+    impl Step for ByteSource {
+        type Input = ();
+        type Outputs = Single<Blob>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "ByteSource",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 20 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            if self.held {
+                return if ctx.outputs.push(Blob(vec![0u8; BLOB_BYTES])).is_ok() {
+                    self.held = false;
+                    Ok(StepOutcome::Progress)
+                } else {
+                    Ok(StepOutcome::NoProgress)
+                };
+            }
+            let n = self.remaining.load(Ordering::Acquire);
+            if n == 0 {
+                return Ok(StepOutcome::Finished);
+            }
+            if self
+                .remaining
+                .compare_exchange(n, n - 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                if ctx.outputs.push(Blob(vec![0u8; BLOB_BYTES])).is_err() {
+                    self.held = true;
+                }
+                Ok(StepOutcome::Progress)
+            } else {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// `Parallel` middle step declaring one `records` counter. Each item it
+    /// consumes bumps `ctx.counters.add(0, 1)` (the mechanism under test), a
+    /// shared oracle atomic, and its own per-clone tally — so the test can prove
+    /// two distinct clones both contributed to the ONE shared counter.
+    struct CountingMiddle {
+        oracle: Arc<AtomicU64>,
+        per_clone: Arc<Mutex<HashMap<usize, u64>>>,
+        next_id: Arc<AtomicUsize>,
+        clone_id: usize,
+        /// A produced `u32` whose push hit count-bounded backpressure; retried on
+        /// a later `try_run` so the item survives (the counter was already bumped
+        /// when the input was consumed, so a retry never double-counts).
+        pending_out: Option<u32>,
+    }
+    impl CountingMiddle {
+        fn new(oracle: Arc<AtomicU64>, per_clone: Arc<Mutex<HashMap<usize, u64>>>) -> Self {
+            let next_id = Arc::new(AtomicUsize::new(0));
+            let clone_id = next_id.fetch_add(1, Ordering::Relaxed);
+            Self { oracle, per_clone, next_id, clone_id, pending_out: None }
+        }
+    }
+    impl Step for CountingMiddle {
+        type Input = Blob;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "CountingMiddle",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 64 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn counters(&self) -> &'static [CounterSpec] {
+            const SPECS: &[CounterSpec] = &[CounterSpec::new("records", "records")];
+            SPECS
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            // Flush a previously-held output first (its counter bump already happened).
+            if let Some(v) = self.pending_out {
+                return if ctx.outputs.push(v).is_ok() {
+                    self.pending_out = None;
+                    Ok(StepOutcome::Progress)
+                } else {
+                    Ok(StepOutcome::NoProgress)
+                };
+            }
+            match ctx.input.pop() {
+                Some(_blob) => {
+                    // One batch bump per consumed item (batch == 1 here).
+                    ctx.counters.add(0, 1);
+                    self.oracle.fetch_add(1, Ordering::Relaxed);
+                    *self.per_clone.lock().entry(self.clone_id).or_insert(0) += 1;
+                    // Hold the produced item on backpressure; the bump above is
+                    // not repeated when the retry succeeds.
+                    if ctx.outputs.push(1).is_err() {
+                        self.pending_out = Some(1);
+                    }
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            // A fresh per-worker clone with a distinct id, sharing the oracle /
+            // tally / id-source — the same pattern production Parallel steps use.
+            let clone_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            Self {
+                oracle: Arc::clone(&self.oracle),
+                per_clone: Arc::clone(&self.per_clone),
+                next_id: Arc::clone(&self.next_id),
+                clone_id,
+                pending_out: None,
+            }
+        }
+    }
+
+    /// `Parallel` sink counting the `u32`s it receives.
+    #[derive(Clone)]
+    struct CountingSink {
+        received: Arc<AtomicU32>,
+    }
+    impl Step for CountingSink {
+        type Input = u32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "CountingSink",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(_) => {
+                    // A small per-item delay so the run spans many sampler ticks
+                    // (via CountBounded backpressure this throttles the middle
+                    // too), guaranteeing the sampler captures the counter climbing
+                    // rather than a single tick-0 read of 0.
+                    std::thread::sleep(Duration::from_micros(50));
+                    self.received.fetch_add(1, Ordering::Relaxed);
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    fn build_chain(
+        remaining: &Arc<AtomicU32>,
+        received: &Arc<AtomicU32>,
+        oracle: &Arc<AtomicU64>,
+        per_clone: &Arc<Mutex<HashMap<usize, u64>>>,
+    ) -> crate::builder::Pipeline {
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(ByteSource { remaining: Arc::clone(remaining), held: false })
+            .chain(CountingMiddle::new(Arc::clone(oracle), Arc::clone(per_clone)))
+            .chain(CountingSink { received: Arc::clone(received) })
+            .into_sink_marker();
+        builder.build().unwrap()
+    }
+
+    /// Parse the `counters.tsv` rows for one step index into `(d_value, value)`
+    /// pairs in file order.
+    fn counter_rows_for_step(tsv: &str, step: usize) -> Vec<(u64, u64)> {
+        tsv.lines()
+            .skip(1) // header
+            .filter_map(|line| {
+                let f: Vec<&str> = line.split('\t').collect();
+                (f.len() == 6 && f[2].parse::<usize>().ok() == Some(step))
+                    .then(|| (f[4].parse::<u64>().unwrap(), f[5].parse::<u64>().unwrap()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn counters_aggregate_across_clones_and_land_in_the_telemetry_files() {
+        const N: u32 = 400;
+        let dir = std::env::temp_dir().join(format!("fgumi-tbw1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("run");
+
+        let remaining = Arc::new(AtomicU32::new(N));
+        let received = Arc::new(AtomicU32::new(0));
+        let oracle = Arc::new(AtomicU64::new(0));
+        let per_clone = Arc::new(Mutex::new(HashMap::new()));
+        let pipeline = build_chain(&remaining, &received, &oracle, &per_clone);
+
+        let config = PipelineConfig {
+            threads: 2,
+            instrumentation: InstrumentationLevel::Summary,
+            telemetry: Some(TelemetryConfig {
+                stem: stem.clone(),
+                interval: Duration::from_millis(1),
+            }),
+            ..Default::default()
+        };
+        pipeline.run(config).expect("pipeline run");
+
+        // Every item flowed through, and `ctx.counters.add` was invoked N times.
+        assert_eq!(received.load(Ordering::Relaxed), N);
+        assert_eq!(oracle.load(Ordering::Relaxed), u64::from(N), "add() called once per item");
+
+        // (1) Two distinct Parallel clones each did work, and their tallies sum to
+        // N — so the ONE shared per-`step_idx` counter received both clones' bumps.
+        let per_clone = per_clone.lock();
+        let active: Vec<u64> = per_clone.values().copied().filter(|&c| c > 0).collect();
+        assert!(active.len() >= 2, "at least two worker clones bumped, got {active:?}");
+        assert_eq!(active.iter().sum::<u64>(), u64::from(N), "clone tallies sum to N");
+
+        let read = |suffix: &str| {
+            std::fs::read_to_string(dir.join(format!("run.ticks.{suffix}.tsv"))).unwrap()
+        };
+
+        // (2) counter_names.tsv names the middle step's (index 1) one counter,
+        // and no other step declares a counter.
+        let names = read("counter_names");
+        assert!(names.starts_with("step\tcounter\tname\tunit\n"), "names header: {names}");
+        let name_rows: Vec<&str> = names.lines().skip(1).collect();
+        assert_eq!(name_rows, vec!["1\t0\trecords\trecords"], "exactly the middle step's counter");
+
+        // (2) counters.tsv: only the middle step emits rows; values are monotonic,
+        // bounded by N, and the per-tick deltas telescope to the last cumulative
+        // value (proving they read the one shared atomic).
+        let counters = read("counters");
+        assert_eq!(
+            counters.lines().next().unwrap(),
+            "tick\tt_ms\tstep\tcounter\td_value\tvalue",
+            "counters header"
+        );
+        assert!(
+            counter_rows_for_step(&counters, 0).is_empty()
+                && counter_rows_for_step(&counters, 2).is_empty(),
+            "steps that declare no counter emit no rows"
+        );
+        let mid_rows = counter_rows_for_step(&counters, 1);
+        assert!(!mid_rows.is_empty(), "the middle step emitted counter rows");
+        let mut prev = 0u64;
+        let mut delta_sum = 0u64;
+        for (d, v) in &mid_rows {
+            assert!(*v >= prev, "cumulative value is monotonic non-decreasing");
+            assert!(*v <= u64::from(N), "value never exceeds the total work");
+            delta_sum += *d;
+            prev = *v;
+        }
+        assert!(prev > 0, "the shared counter recorded bumps");
+        assert_eq!(delta_sum, prev, "per-tick deltas telescope to the last cumulative value");
+
+        // (3) edges.tsv carries the two byte columns at the end. The byte-bounded
+        // source→middle edge reports numeric byte deltas; the count-bounded
+        // middle→sink edge reports empty (NA) byte fields.
+        let edges = read("edges");
+        let ehdr = edges.lines().next().unwrap();
+        assert!(
+            ehdr.ends_with("d_push_rej\td_pop_empty\td_pushed_bytes\td_popped_bytes"),
+            "byte columns appended at the end: {ehdr}"
+        );
+        let mut saw_byte_edge = false;
+        let mut saw_count_edge = false;
+        let mut total_pushed_bytes = 0u64;
+        for line in edges.lines().skip(1) {
+            let f: Vec<&str> = line.split('\t').collect();
+            let edge = f[2];
+            let d_pushed_bytes = f[f.len() - 2];
+            let d_popped_bytes = f[f.len() - 1];
+            if edge.starts_with("ByteSource__CountingMiddle") {
+                saw_byte_edge = true;
+                // Present (numeric), not the NA empty field.
+                total_pushed_bytes += d_pushed_bytes.parse::<u64>().expect("numeric pushed bytes");
+                assert!(d_popped_bytes.parse::<u64>().is_ok(), "numeric popped bytes");
+            } else if edge.starts_with("CountingMiddle__CountingSink") {
+                saw_count_edge = true;
+                assert_eq!(d_pushed_bytes, "", "count edge has empty (NA) pushed bytes");
+                assert_eq!(d_popped_bytes, "", "count edge has empty (NA) popped bytes");
+            }
+        }
+        assert!(saw_byte_edge, "the byte-bounded source→middle edge is present");
+        assert!(saw_count_edge, "the count-bounded middle→sink edge is present");
+        assert_eq!(
+            total_pushed_bytes,
+            u64::from(N) * BLOB_BYTES as u64,
+            "byte edge moved N * BLOB_BYTES of heap payload"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn telemetry_off_drains_and_writes_no_counters_file() {
+        const N: u32 = 200;
+        let dir = std::env::temp_dir().join(format!("fgumi-tbw1-off-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("run");
+
+        let remaining = Arc::new(AtomicU32::new(N));
+        let received = Arc::new(AtomicU32::new(0));
+        let oracle = Arc::new(AtomicU64::new(0));
+        let per_clone = Arc::new(Mutex::new(HashMap::new()));
+        let pipeline = build_chain(&remaining, &received, &oracle, &per_clone);
+
+        // Telemetry OFF (the default): counters are disabled, `ctx.counters.add`
+        // is a no-op, and no telemetry files are produced — but the chain still
+        // drains and the step bodies still run (they call `add` unconditionally).
+        pipeline.run(PipelineConfig { threads: 2, ..Default::default() }).expect("run");
+        assert_eq!(received.load(Ordering::Relaxed), N, "chain drains with telemetry off");
+        assert_eq!(oracle.load(Ordering::Relaxed), u64::from(N), "step bodies still ran");
+        assert!(
+            !dir.join("run.ticks.counters.tsv").exists(),
+            "no counters file when telemetry is off"
+        );
+        let _ = stem;
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

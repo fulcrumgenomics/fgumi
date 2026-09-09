@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use super::contexts::RegisteredEdge;
+use super::contexts::{RegisteredEdge, StepCounters};
 use super::metrics::{EdgeMetricsSnapshot, RawOccupancy};
 use super::telemetry::{EdgeSample, SummarySample, TelemetryWriters, WorkerBins, WorkerSample};
 use super::worker_state::{WorkerState, WorkerStateBoard};
@@ -76,6 +76,10 @@ pub struct TelemetryArgs<'a> {
     /// Worker index (row number in the `workers` TSV) -> `WorkerStateBoard`
     /// slot index.
     pub worker_slots: Vec<usize>,
+    /// The pipeline's per-step domain counters (`&contexts.step_counters`), one
+    /// entry per step index. The sampler reads each slot once per tick and emits
+    /// the per-tick delta + cumulative total to the `counters` TSV.
+    pub step_counters: &'a [StepCounters],
 }
 
 /// A zero-valued edge snapshot, used to seed the tick telemetry's per-edge
@@ -117,6 +121,10 @@ struct TelemetryState<'a> {
     d_serviced: Vec<u64>,
     last_read: Vec<(WorkerState, Option<crate::topology::StepIdx>)>,
     prev_edges: Vec<EdgeMetricsSnapshot>,
+    /// Previous tick's cumulative value per (step, counter), for computing the
+    /// per-tick `d_value` deltas. Seeded to 0 (like `prev_edges`) so tick 0's
+    /// delta is the total since run start, not since the first sampler tick.
+    prev_counters: Vec<Vec<u64>>,
     tick: u64,
     last_emit: Instant,
 }
@@ -128,7 +136,17 @@ impl<'a> TelemetryState<'a> {
         let d_serviced = vec![0u64; args.n_workers];
         let last_read = vec![(WorkerState::Idle, None); args.n_workers];
         let prev_edges = vec![zero_edge_snapshot(); edges.len()];
-        Self { args, bins, d_serviced, last_read, prev_edges, tick: 0, last_emit: Instant::now() }
+        let prev_counters = args.step_counters.iter().map(|sc| vec![0u64; sc.len()]).collect();
+        Self {
+            args,
+            bins,
+            d_serviced,
+            last_read,
+            prev_edges,
+            prev_counters,
+            tick: 0,
+            last_emit: Instant::now(),
+        }
     }
 
     /// Point-sample every worker slot's current `(state, step)` into its
@@ -188,6 +206,16 @@ impl<'a> TelemetryState<'a> {
             }
             let (depth_bytes, limit_bytes) =
                 depths.get(i).copied().flatten().map_or((None, None), |(o, l)| (Some(o), Some(l)));
+            // Byte deltas are NA (None) exactly when the edge has no byte
+            // accounting — i.e. a count/unbounded edge with no `depth_source`.
+            let (d_pushed_bytes, d_popped_bytes) = if e.depth_source.is_some() {
+                (
+                    Some(cur.pushed_bytes.saturating_sub(prev.pushed_bytes)),
+                    Some(cur.popped_bytes.saturating_sub(prev.popped_bytes)),
+                )
+            } else {
+                (None, None)
+            };
             edge_rows.push(EdgeSample {
                 edge: edge_column_prefix(e),
                 depth_bytes,
@@ -196,6 +224,8 @@ impl<'a> TelemetryState<'a> {
                 d_popped: cur.popped_items.saturating_sub(prev.popped_items),
                 d_push_rej: cur.push_rejections.saturating_sub(prev.push_rejections),
                 d_pop_empty: cur.pop_empties.saturating_sub(prev.pop_empties),
+                d_pushed_bytes,
+                d_popped_bytes,
             });
             self.prev_edges[i] = cur;
         }
@@ -228,6 +258,20 @@ impl<'a> TelemetryState<'a> {
             self.args.writers.write_worker_row(self.tick, t_ms, &sample);
             self.bins[w].reset();
             self.d_serviced[w] = 0;
+        }
+
+        // Domain counters: one row per (step, counter) whose cumulative `value`
+        // (read from the shared per-step atomic) and per-tick delta (`d_value`)
+        // are emitted. Ordered step asc then counter asc. Header-only file when
+        // no step declared a counter.
+        for (step, counters) in self.args.step_counters.iter().enumerate() {
+            for counter in 0..counters.len() {
+                let cur = counters.load(counter);
+                let prev = self.prev_counters[step][counter];
+                let d_value = cur.saturating_sub(prev);
+                self.args.writers.write_counter_row(self.tick, t_ms, step, counter, d_value, cur);
+                self.prev_counters[step][counter] = cur;
+            }
         }
         self.tick += 1;
     }
@@ -449,7 +493,9 @@ mod tests {
 
     use crate::item::HeapSize;
     use crate::queues::{BoundedQueueHandle, ByteBoundedQueue, ItemQueue};
+    use crate::runtime::contexts::StepCounters;
     use crate::runtime::metrics::EdgeMetrics;
+    use crate::step::CounterSpec;
     use crate::topology::{BranchIdx, StepIdx};
 
     #[derive(Debug)]
@@ -638,6 +684,9 @@ mod tests {
     fn sampler_emits_telemetry_files() {
         use crate::runtime::telemetry::TelemetryWriters;
         use crate::runtime::worker_state::{WorkerState, WorkerStateBoard};
+        // `const` so the inner slice is `'static` (a const-fn call is not
+        // auto-promoted to `'static` in an rvalue context).
+        const COUNTER_SPECS: &[&[CounterSpec]] = &[&[CounterSpec::new("records", "records")]];
         let m = EdgeMetrics::new();
         m.record_push(100);
         m.record_pop(40);
@@ -650,7 +699,11 @@ mod tests {
         let stem = dir.join("run");
         let board = WorkerStateBoard::new(1);
         board.stamp(0, WorkerState::Running, Some(StepIdx(0)));
-        let writers = TelemetryWriters::open(&stem, &["producer"], 1).unwrap();
+        // The producer step declares one counter, pre-bumped to 42 so the sampler
+        // reads a non-zero cumulative value on its first tick.
+        let step_counters = vec![StepCounters::new(1)];
+        step_counters[0].add(0, 42);
+        let writers = TelemetryWriters::open(&stem, &["producer"], 1, COUNTER_SPECS).unwrap();
         let tele = crate::runtime::sampler::TelemetryArgs {
             board: &board,
             n_workers: 1,
@@ -662,6 +715,7 @@ mod tests {
             source_edge_idxs: vec![0],
             sink_edge_idxs: vec![0],
             worker_slots: vec![0],
+            step_counters: &step_counters,
         };
         let stop = Arc::new(AtomicBool::new(false));
         let stop_c = Arc::clone(&stop);
@@ -690,7 +744,26 @@ mod tests {
         let summary = std::fs::read_to_string(dir.join("run.ticks.summary.tsv")).unwrap();
         assert!(summary.lines().count() >= 2, "header + >=1 data row");
         assert!(std::fs::metadata(dir.join("run.ticks.workers.tsv")).is_ok());
-        assert!(std::fs::metadata(dir.join("run.ticks.edges.tsv")).is_ok());
+        // Byte-bounded edge → numeric byte deltas at the row tail (never NA here).
+        let edges = std::fs::read_to_string(dir.join("run.ticks.edges.tsv")).unwrap();
+        assert!(
+            edges.lines().next().unwrap().ends_with("d_pushed_bytes\td_popped_bytes"),
+            "edges header carries the byte columns"
+        );
+        // Static counter-name file names the producer's counter.
+        let counter_names =
+            std::fs::read_to_string(dir.join("run.ticks.counter_names.tsv")).unwrap();
+        assert!(
+            counter_names.contains("0\t0\trecords\trecords"),
+            "counter_names names step 0's counter 0: {counter_names}"
+        );
+        // Per-tick counters file carries the pre-bumped cumulative value (42).
+        let counters = std::fs::read_to_string(dir.join("run.ticks.counters.tsv")).unwrap();
+        let last = counters.lines().last().unwrap();
+        let fields: Vec<&str> = last.split('\t').collect();
+        assert_eq!(fields[2], "0", "step index");
+        assert_eq!(fields[3], "0", "counter index");
+        assert_eq!(fields[5], "42", "cumulative value column reads the shared counter");
         std::fs::remove_dir_all(&dir).ok();
     }
 

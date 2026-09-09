@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::runtime::worker_state::WorkerState;
+use crate::step::CounterSpec;
 use crate::topology::StepIdx;
 
 /// Where + how often to emit the tick telemetry.
@@ -110,6 +111,11 @@ pub struct EdgeSample {
     pub d_popped: u64,
     pub d_push_rej: u64,
     pub d_pop_empty: u64,
+    /// Bytes pushed this tick. `None` (empty TSV field) for a count/unbounded
+    /// edge, which carries no byte accounting; `Some` for a byte-bounded edge.
+    pub d_pushed_bytes: Option<u64>,
+    /// Bytes popped this tick. `None`/`Some` on the same rule as `d_pushed_bytes`.
+    pub d_popped_bytes: Option<u64>,
 }
 
 /// One tick's sample for a single worker (current state/step + this-window fractions).
@@ -168,24 +174,46 @@ pub struct TelemetryWriters {
     summary: BufWriter<std::fs::File>,
     edges: BufWriter<std::fs::File>,
     workers: BufWriter<std::fs::File>,
+    counters: BufWriter<std::fs::File>,
     failed: bool,
 }
 
 impl TelemetryWriters {
-    /// Creates the four TSVs at `<stem>.ticks.{summary,edges,workers,steps}.tsv`,
-    /// writes the `steps` file once (`step_names` indexed 0..N), and writes the
-    /// header row of the other three. Returns `None` (after logging a warning) on
-    /// any create/write error.
+    /// Creates the six TSVs at
+    /// `<stem>.ticks.{summary,edges,workers,steps,counters,counter_names}.tsv`,
+    /// writes the two static files once (`steps` = `step_names` indexed 0..N;
+    /// `counter_names` = one `step, counter, name, unit` row per declared counter
+    /// from `step_counters`), and writes the header row of the four per-tick
+    /// files. `step_counters[s]` lists the counters step `s` declared, in slot
+    /// order. Returns `None` (after logging a warning) on any create/write error.
     #[must_use]
-    pub fn open(stem: &Path, step_names: &[&'static str], n_workers: usize) -> Option<Self> {
+    pub fn open(
+        stem: &Path,
+        step_names: &[&'static str],
+        n_workers: usize,
+        step_counters: &[&'static [CounterSpec]],
+    ) -> Option<Self> {
         let path = |suffix: &str| {
             let mut p = stem.as_os_str().to_os_string();
             p.push(format!(".ticks.{suffix}.tsv"));
             PathBuf::from(p)
         };
         let create = |suffix: &str| std::fs::File::create(path(suffix)).map(BufWriter::new);
-        let (Ok(mut summary), Ok(mut edges), Ok(mut workers), Ok(mut steps)) =
-            (create("summary"), create("edges"), create("workers"), create("steps"))
+        let (
+            Ok(mut summary),
+            Ok(mut edges),
+            Ok(mut workers),
+            Ok(mut steps),
+            Ok(mut counters),
+            Ok(mut counter_names),
+        ) = (
+            create("summary"),
+            create("edges"),
+            create("workers"),
+            create("steps"),
+            create("counters"),
+            create("counter_names"),
+        )
         else {
             log::warn!(
                 "pipeline-telemetry: cannot create one of the .ticks.*.tsv files at stem {}",
@@ -199,6 +227,14 @@ impl TelemetryWriters {
             let _ = writeln!(steps, "{i}\t{name}");
         }
         let _ = steps.flush();
+        // Static counter-names file, written once: one row per (step, counter).
+        let _ = writeln!(counter_names, "step\tcounter\tname\tunit");
+        for (step, specs) in step_counters.iter().enumerate() {
+            for (counter, spec) in specs.iter().enumerate() {
+                let _ = writeln!(counter_names, "{step}\t{counter}\t{}\t{}", spec.name, spec.unit);
+            }
+        }
+        let _ = counter_names.flush();
         // Headers.
         let ok_s = writeln!(
             summary,
@@ -207,7 +243,7 @@ impl TelemetryWriters {
         .is_ok();
         let ok_e = writeln!(
             edges,
-            "tick\tt_ms\tedge\tdepth_bytes\tlimit_bytes\td_pushed\td_popped\td_push_rej\td_pop_empty"
+            "tick\tt_ms\tedge\tdepth_bytes\tlimit_bytes\td_pushed\td_popped\td_push_rej\td_pop_empty\td_pushed_bytes\td_popped_bytes"
         )
         .is_ok();
         let mut whdr = String::from("tick\tt_ms\tworker\trole\tstate\tstep\td_serviced\tsamples");
@@ -216,12 +252,14 @@ impl TelemetryWriters {
         }
         whdr.push_str("\tf_idle\tf_waiting\tf_parked");
         let ok_w = writeln!(workers, "{whdr}").is_ok();
+        // Per-tick counters file (header-only when no step declared a counter).
+        let ok_c = writeln!(counters, "tick\tt_ms\tstep\tcounter\td_value\tvalue").is_ok();
         let _ = n_workers; // header shape is per-step; worker count only bounds rows.
-        if !(ok_s && ok_e && ok_w) {
+        if !(ok_s && ok_e && ok_w && ok_c) {
             log::warn!("pipeline-telemetry: failed writing a header; disabling telemetry files");
             return None;
         }
-        Some(Self { summary, edges, workers, failed: false })
+        Some(Self { summary, edges, workers, counters, failed: false })
     }
 
     /// Writes one row to the `summary` TSV.
@@ -246,7 +284,7 @@ impl TelemetryWriters {
             return;
         }
         let line = format!(
-            "{tick}\t{t_ms:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{tick}\t{t_ms:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             e.edge,
             opt(e.depth_bytes),
             opt(e.limit_bytes),
@@ -254,8 +292,28 @@ impl TelemetryWriters {
             e.d_popped,
             e.d_push_rej,
             e.d_pop_empty,
+            opt(e.d_pushed_bytes),
+            opt(e.d_popped_bytes),
         );
         self.write_edges_line(&line);
+    }
+
+    /// Writes one row to the `counters` TSV: the per-tick delta (`d_value`) and
+    /// cumulative total (`value`) of one step's one domain counter.
+    pub fn write_counter_row(
+        &mut self,
+        tick: u64,
+        t_ms: f64,
+        step: usize,
+        counter: usize,
+        d_value: u64,
+        value: u64,
+    ) {
+        if self.failed {
+            return;
+        }
+        let line = format!("{tick}\t{t_ms:.3}\t{step}\t{counter}\t{d_value}\t{value}");
+        self.write_counters_line(&line);
     }
 
     /// Writes one row to the `workers` TSV.
@@ -305,13 +363,20 @@ impl TelemetryWriters {
         }
     }
 
-    /// Flushes all three per-tick writers (the `steps` file is flushed once at
-    /// `open` and never written again).
+    fn write_counters_line(&mut self, line: &str) {
+        if writeln!(self.counters, "{line}").is_err() {
+            log::warn!("pipeline-telemetry: write failed; dropping further rows");
+            self.failed = true;
+        }
+    }
+
+    /// Flushes all four per-tick writers (the static `steps` / `counter_names`
+    /// files are flushed once at `open` and never written again).
     pub fn flush(&mut self) {
         if self.failed {
             return;
         }
-        for w in [&mut self.summary, &mut self.edges, &mut self.workers] {
+        for w in [&mut self.summary, &mut self.edges, &mut self.workers, &mut self.counters] {
             if w.flush().is_err() {
                 log::warn!("pipeline-telemetry: flush failed; buffered rows may be lost");
                 self.failed = true;
@@ -363,13 +428,19 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn writers_emit_four_files_with_headers_and_rows() {
         use std::io::Read;
+        // Step 1 ("sort") declares one counter; steps 0/2 declare none. A `const`
+        // so the inner `&[CounterSpec::new(..)]` slices are `'static` (a const-fn
+        // call is not auto-promoted to `'static` in an rvalue context).
+        const STEP_COUNTERS: &[&[CounterSpec]] =
+            &[&[], &[CounterSpec::new("records", "records")], &[]];
         let dir = std::env::temp_dir().join(format!("fgumi-tele-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let stem = dir.join("run");
-        let mut w =
-            TelemetryWriters::open(&stem, &["read", "sort", "write"], 2).expect("writers open");
+        let mut w = TelemetryWriters::open(&stem, &["read", "sort", "write"], 2, STEP_COUNTERS)
+            .expect("writers open");
         w.write_summary_row(
             0,
             0.5,
@@ -393,6 +464,8 @@ mod tests {
                 d_popped: 3,
                 d_push_rej: 0,
                 d_pop_empty: 1,
+                d_pushed_bytes: Some(500),
+                d_popped_bytes: Some(300),
             },
         );
         w.write_edge_row(
@@ -406,8 +479,12 @@ mod tests {
                 d_popped: 0,
                 d_push_rej: 0,
                 d_pop_empty: 0,
+                d_pushed_bytes: None,
+                d_popped_bytes: None,
             },
         );
+        // One counter row for step 1's counter 0 (delta 7, cumulative 7).
+        w.write_counter_row(0, 0.5, 1, 0, 7, 7);
         w.write_worker_row(
             0,
             0.5,
@@ -443,12 +520,31 @@ mod tests {
         assert!(summary.lines().next().unwrap()
             .starts_with("tick\tt_ms\tdt_ms\treads_in\treads_out\trss_bytes\tqueue_bytes_used\tqueue_bytes_budget"));
         let edges = read("edges");
-        // Byte edge has a numeric depth; count edge (None) emits empty fields → "\t\t".
-        assert!(edges.contains("read__sort#0b0\t10\t100\t5\t3\t0\t1"));
+        let edges_hdr = edges.lines().next().unwrap();
         assert!(
-            edges.contains("count__edge#1b0\t\t\t0\t0\t0\t0"),
-            "None depth/limit are empty fields"
+            edges_hdr.ends_with("d_pop_empty\td_pushed_bytes\td_popped_bytes"),
+            "byte columns are appended at the end: {edges_hdr}"
         );
+        // Byte edge has numeric depth AND numeric byte deltas at the row's tail.
+        assert!(edges.contains("read__sort#0b0\t10\t100\t5\t3\t0\t1\t500\t300"));
+        // Count edge (None) emits empty fields for depth/limit AND the byte deltas.
+        assert!(
+            edges.contains("count__edge#1b0\t\t\t0\t0\t0\t0\t\t"),
+            "None depth/limit/byte deltas are empty fields"
+        );
+        // Counter files: static names + per-tick values.
+        let counter_names = read("counter_names");
+        assert!(counter_names.starts_with("step\tcounter\tname\tunit\n"), "counter_names header");
+        assert!(
+            counter_names.contains("1\t0\trecords\trecords\n"),
+            "step 1's counter 0 is named: {counter_names}"
+        );
+        let counters = read("counters");
+        assert!(
+            counters.lines().next().unwrap() == "tick\tt_ms\tstep\tcounter\td_value\tvalue",
+            "counters header"
+        );
+        assert!(counters.contains("0\t0.500\t1\t0\t7\t7"), "counter row: {counters}");
         let workers = read("workers");
         let hdr = workers.lines().next().unwrap();
         assert!(

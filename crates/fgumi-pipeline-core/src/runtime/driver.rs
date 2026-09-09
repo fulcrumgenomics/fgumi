@@ -423,8 +423,12 @@ fn dispatch_one_step(
     state_slot: usize,
 ) -> Option<DispatchInfo> {
     let outputs_any: &(dyn Any + Send + Sync) = contexts.outputs[step_idx.0].as_ref();
-    let mut ctx =
-        ErasedStepCtx { input: contexts.inputs[step_idx.0].as_ref(), outputs: outputs_any, signal };
+    let mut ctx = ErasedStepCtx {
+        input: contexts.inputs[step_idx.0].as_ref(),
+        outputs: outputs_any,
+        signal,
+        counters: &contexts.step_counters[step_idx.0],
+    };
 
     // Time the dispatch only when stats collection is on. `Instant::now()`
     // is ~20-50ns on Apple Silicon, ~50-100ns on x86_64; gating on
@@ -563,6 +567,7 @@ mod tests {
             outputs: vec![],
             bounded_queues: vec![],
             edges: vec![],
+            step_counters: vec![],
         });
         let drain_counters: Vec<Arc<StepDrainCounter>> = vec![];
         let _ = ChainGraph::new();
@@ -759,6 +764,7 @@ mod tests {
             &steps,
             &graph,
             crate::builder::InstrumentationLevel::Off,
+            false,
         ));
         let mid = StepIdx(1);
         let counter = StepDrainCounter::new(N);
@@ -807,6 +813,7 @@ mod tests {
             &steps,
             &graph,
             crate::builder::InstrumentationLevel::Off,
+            false,
         ));
         let mid = StepIdx(1);
         let counter = StepDrainCounter::new(1);
@@ -882,6 +889,7 @@ mod tests {
             &steps,
             &graph,
             crate::builder::InstrumentationLevel::Off,
+            false,
         ));
 
         // Single worker; the source (idx 0) is its Exclusive sticky owner, the
@@ -944,6 +952,7 @@ mod tests {
             &steps,
             &graph,
             crate::builder::InstrumentationLevel::Off,
+            false,
         ));
 
         let mut entries: Vec<WorkerStepEntry> = vec![
@@ -1077,6 +1086,7 @@ mod tests {
             &steps,
             &graph,
             crate::builder::InstrumentationLevel::Off,
+            false,
         ));
 
         // Hand-built driver row: both steps Owned on the one driver thread.
@@ -1237,6 +1247,7 @@ mod tests {
             &steps,
             &graph,
             crate::builder::InstrumentationLevel::Off,
+            false,
         ));
 
         let mut entries: Vec<WorkerStepEntry> =
@@ -1335,6 +1346,7 @@ mod tests {
             &steps,
             &graph,
             crate::builder::InstrumentationLevel::Off,
+            false,
         ));
         let mid = StepIdx(0);
         let counter = StepDrainCounter::new(1);
@@ -1409,6 +1421,7 @@ mod tests {
             &steps,
             &graph,
             crate::builder::InstrumentationLevel::Off,
+            false,
         ));
         let counter = StepDrainCounter::new(1);
         let signal = PipelineSignal::new();
@@ -1444,6 +1457,7 @@ mod tests {
             &steps,
             &graph,
             crate::builder::InstrumentationLevel::Off,
+            false,
         ));
         let counter = StepDrainCounter::new(1);
         let signal = PipelineSignal::new();

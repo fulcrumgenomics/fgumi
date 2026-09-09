@@ -367,8 +367,10 @@ impl PipelineBuilder {
         // Input arity 0, not `register_step`'s default of 1: a source's input is
         // implicit, so the graph must reject any attempt to wire an edge INTO
         // it. See `append_source` for the failure the default lets through.
+        let counters = step.counters();
         let producer =
             inner.graph.register_step_with_input_arity(step.profile().name, S::Outputs::arity(), 0);
+        inner.graph.set_step_counters(producer, counters);
         inner.steps.push(Box::new(TypedStep::new(step)));
 
         Chain { builder: self, producer, branch: BranchIdx(0), _phantom: PhantomData }
@@ -409,8 +411,10 @@ impl PipelineBuilder {
         // `is_source()` branch and hands the step a dummy unit input handle —
         // so the wired edge's items are never popped. Registering arity 0 makes
         // the graph reject that edge at wire time instead.
+        let counters = step.counters();
         let producer =
             inner.graph.register_step_with_input_arity(step.profile().name, S::Outputs::arity(), 0);
+        inner.graph.set_step_counters(producer, counters);
         inner.steps.push(Box::new(TypedStep::new(step)));
         (producer, BranchIdx(0))
     }
@@ -427,8 +431,10 @@ impl PipelineBuilder {
         prev: (StepIdx, BranchIdx),
     ) -> (StepIdx, BranchIdx) {
         let mut inner = self.inner.borrow_mut();
+        let counters = step.counters();
         let consumer = inner.graph.register_step(step.profile().name, S::Outputs::arity());
         inner.graph.wire(prev.0, prev.1, consumer);
+        inner.graph.set_step_counters(consumer, counters);
         inner.steps.push(Box::new(TypedStep::new(step)));
         (consumer, BranchIdx(0))
     }
@@ -447,10 +453,12 @@ impl PipelineBuilder {
         prev_b: (StepIdx, BranchIdx),
     ) -> (StepIdx, BranchIdx) {
         let mut inner = self.inner.borrow_mut();
+        let counters = step.counters();
         let consumer =
             inner.graph.register_step_with_input_arity(step.profile().name, S::Outputs::arity(), 2);
         inner.graph.wire_to_slot(prev_a.0, prev_a.1, consumer, 0);
         inner.graph.wire_to_slot(prev_b.0, prev_b.1, consumer, 1);
+        inner.graph.set_step_counters(consumer, counters);
         inner.steps.push(Box::new(TypedStep2::new(step)));
         (consumer, BranchIdx(0))
     }
@@ -514,8 +522,10 @@ impl<'b, T: Send + HeapSize + 'static> Chain<'b, Single<T>> {
         S: Step<Input = T>,
     {
         let mut inner = self.builder.inner.borrow_mut();
+        let counters = step.counters();
         let consumer = inner.graph.register_step(step.profile().name, S::Outputs::arity());
         inner.graph.wire(self.producer, self.branch, consumer);
+        inner.graph.set_step_counters(consumer, counters);
         inner.steps.push(Box::new(TypedStep::new(step)));
 
         Chain {
@@ -539,8 +549,10 @@ impl<'b, T: Send + super::item::HeapSize + super::item::Ordered + 'static>
         S: Step<Input = T>,
     {
         let mut inner = self.builder.inner.borrow_mut();
+        let counters = step.counters();
         let consumer = inner.graph.register_step(step.profile().name, S::Outputs::arity());
         inner.graph.wire(self.producer, self.branch, consumer);
+        inner.graph.set_step_counters(consumer, counters);
         inner.steps.push(Box::new(TypedStep::new(step)));
 
         Chain {
@@ -795,10 +807,12 @@ impl<'b, A: Send + HeapSize + 'static, B: Send + HeapSize + 'static> MultiChain2
         let br1 = self.b1.branch;
 
         let mut inner = builder.inner.borrow_mut();
+        let counters = step.counters();
         let consumer =
             inner.graph.register_step_with_input_arity(step.profile().name, S::Outputs::arity(), 2);
         inner.graph.wire_to_slot(p0, br0, consumer, 0);
         inner.graph.wire_to_slot(p1, br1, consumer, 1);
+        inner.graph.set_step_counters(consumer, counters);
         inner.steps.push(Box::new(TypedStep2::new(step)));
 
         Chain { builder, producer: consumer, branch: BranchIdx(0), _phantom: PhantomData }
@@ -887,10 +901,12 @@ where
         let br1 = self.b1.branch;
 
         let mut inner = builder.inner.borrow_mut();
+        let counters = step.counters();
         let consumer =
             inner.graph.register_step_with_input_arity(step.profile().name, S::Outputs::arity(), 2);
         inner.graph.wire_to_slot(p0, br0, consumer, 0);
         inner.graph.wire_to_slot(p1, br1, consumer, 1);
+        inner.graph.set_step_counters(consumer, counters);
         inner.steps.push(Box::new(TypedStep2::new(step)));
 
         Chain { builder, producer: consumer, branch: BranchIdx(0), _phantom: PhantomData }
@@ -1150,8 +1166,17 @@ impl Pipeline {
         // with Serial+sticky+Affinity targeting). Indexed by worker id.
         let sticky_owners = assign_sticky_owners(&steps, &owners, n_threads);
 
-        // 2. Build per-step contexts (input + output handles).
-        let contexts = Arc::new(build_chain_contexts(&steps, &graph, config.instrumentation));
+        // 2. Build per-step contexts (input + output handles). Domain counters
+        // are allocated only when telemetry is on (`counters_enabled`), so the
+        // telemetry-off path keeps its byte-identical zero-allocation route —
+        // every `StepCounters` is `disabled()` and `ctx.counters.add(..)` is a
+        // no-op load+branch.
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            config.instrumentation,
+            config.telemetry.is_some(),
+        ));
 
         // 2-pre-monitor invariant: if the deadlock monitor will be armed, every
         // output transport must be ByteBounded so `in_flight_bytes` can see a
@@ -1346,10 +1371,16 @@ impl Pipeline {
                         // above — or detached-driver rows (e.g. sort's serial
                         // boundary/key-scan driver) would be stamped and never read.
                         let n_slots = n_threads + n_detached;
+                        // Per-step declared counters, for the static counter-name
+                        // file. `graph` outlives this call (borrowed here, before
+                        // the sampler spawn).
+                        let step_counter_specs: Vec<&'static [crate::step::CounterSpec]> =
+                            (0..graph.n_steps()).map(|i| graph.step_counters(StepIdx(i))).collect();
                         crate::runtime::telemetry::TelemetryWriters::open(
                             &tele.stem,
                             &step_names,
                             n_slots,
+                            &step_counter_specs,
                         )
                         .map(|writers| {
                             let (source_edge_idxs, sink_edge_idxs) =
@@ -1404,6 +1435,10 @@ impl Pipeline {
                                 source_edge_idxs,
                                 sink_edge_idxs,
                                 worker_slots,
+                                // The per-step counters live in the `ChainContexts`
+                                // Arc moved into this closure; borrow them for the
+                                // sampler's lifetime (local to the closure body).
+                                step_counters: &contexts_clone.step_counters,
                             };
                             crate::runtime::sampler::run_occupancy_sampler(
                                 &stop_clone,
@@ -4385,6 +4420,7 @@ mod tests {
             outputs: vec![],
             bounded_queues: vec![rq],
             edges: vec![],
+            step_counters: vec![],
         };
         // 200 (transport) + 300 (reorder stash).
         assert_eq!(in_flight_bytes(&contexts), 500);
@@ -4395,6 +4431,7 @@ mod tests {
             outputs: vec![],
             bounded_queues: vec![],
             edges: vec![],
+            step_counters: vec![],
         };
         assert_eq!(in_flight_bytes(&empty), 0);
     }

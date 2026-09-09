@@ -56,7 +56,7 @@ pub use queues::{ByteBoundedQueue, CountBoundedQueue, ItemQueue, QueueSpec, Unbo
 pub use reorder::{BranchOrdering, ReorderStage, Sequenced};
 pub use signal::{CancelHandle, PipelineError, PipelineSignal};
 pub use step::{
-    Affinity, DetachedGroup, InputHandle, OutputHandles, OutputsViewAny, Step, Step2, StepCtx,
-    StepCtx2, StepKind, StepOutcome, StepProfile,
+    Affinity, CounterSpec, DetachedGroup, InputHandle, OutputHandles, OutputsViewAny, Step, Step2,
+    StepCtx, StepCtx2, StepKind, StepOutcome, StepProfile,
 };
 pub use topology::{BranchIdx, ChainGraph, StepIdx};

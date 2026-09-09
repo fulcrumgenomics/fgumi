@@ -469,6 +469,7 @@ mod tests {
             outputs: vec![Box::new(()), det_outputs_any, Box::new(())],
             bounded_queues: vec![],
             edges: vec![],
+            step_counters: (0..3).map(|_| crate::runtime::StepCounters::disabled()).collect(),
         });
         (det, contexts, Arc::new(producer_outputs_any), det_output_consumer)
     }

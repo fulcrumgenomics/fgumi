@@ -271,8 +271,12 @@ pub fn run_fused_single_thread(
                 continue;
             }
             let outputs_any = contexts.outputs[i].as_ref();
-            let mut ctx =
-                ErasedStepCtx { input: contexts.inputs[i].as_ref(), outputs: outputs_any, signal };
+            let mut ctx = ErasedStepCtx {
+                input: contexts.inputs[i].as_ref(),
+                outputs: outputs_any,
+                signal,
+                counters: &contexts.step_counters[i],
+            };
 
             // Time the dispatch only when stats collection is on (mirrors
             // `dispatch_one_step`): `Instant::now()` is non-trivial on the hot

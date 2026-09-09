@@ -213,6 +213,32 @@ use std::io;
 
 use super::item::HeapSize;
 use super::outputs::StepOutputs;
+use crate::runtime::contexts::StepCounters;
+
+/// Static description of one domain counter a step declares.
+///
+/// A `CounterSpec` names a per-step quantity the step bumps at runtime (blocks,
+/// records, molecules, bytes read/written, …) and the unit that quantity is
+/// counted in. The specs a step returns from [`Step::counters`] /
+/// [`Step2::counters`] fix the layout of that step's runtime counter slots (one
+/// atomic per spec, in declaration order) and label the columns of the
+/// `<stem>.ticks.counter_names.tsv` telemetry file. Static (`&'static`) because
+/// the layout is fixed at chain-build time and shared by every per-worker clone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CounterSpec {
+    /// Column name for this counter (e.g. `"records"`, `"bytes_read"`).
+    pub name: &'static str,
+    /// Unit the counter is measured in (e.g. `"records"`, `"bytes"`).
+    pub unit: &'static str,
+}
+
+impl CounterSpec {
+    /// Construct a `CounterSpec` from its column name and unit.
+    #[must_use]
+    pub const fn new(name: &'static str, unit: &'static str) -> Self {
+        Self { name, unit }
+    }
+}
 
 /// Handle to this step's input queue.
 ///
@@ -325,6 +351,17 @@ pub trait Step: Send + Sized + 'static {
         DetachedGroup::PerStep
     }
 
+    /// Domain counters this step declares, in slot order. Defaults to `&[]` (the
+    /// step declares none). Override — like [`Self::affinity`] /
+    /// [`Self::detached_group`] — to opt into per-step bandwidth telemetry: each
+    /// returned [`CounterSpec`] gets one runtime atomic slot the step bumps via
+    /// `ctx.counters.add(slot, n)` (once per `try_run` with batch totals, never
+    /// per record). Read once at chain-build time; the returned slice fixes the
+    /// slot layout, so keep it a stable `&'static` in a fixed order.
+    fn counters(&self) -> &'static [CounterSpec] {
+        &[]
+    }
+
     /// Step body. Pop from `ctx.input`, push to `ctx.outputs`. Returns
     /// `Progress` / `NoProgress` / `Contention` / `Finished`. Errors propagate via `Err`.
     ///
@@ -364,6 +401,10 @@ pub trait Step: Send + Sized + 'static {
 pub struct StepCtx<'a, S: Step> {
     pub input: &'a dyn InputHandle<S::Input>,
     pub outputs: &'a OutputHandles<S::Outputs>,
+    /// Per-step domain counters (one atomic per [`Step::counters`] spec). Bump
+    /// via `ctx.counters.add(slot, n)`; a no-op (one load + branch) when
+    /// telemetry is off, so bumping unconditionally stays zero-cost off-path.
+    pub counters: &'a StepCounters,
 }
 
 /// Two-input variant of [`Step`]. Used by merge steps (zipper,
@@ -400,6 +441,11 @@ pub trait Step2: Send + Sized + 'static {
         DetachedGroup::PerStep
     }
 
+    /// Same semantics as [`Step::counters`]. Defaults to `&[]`.
+    fn counters(&self) -> &'static [CounterSpec] {
+        &[]
+    }
+
     /// Step body. Pop from `ctx.a` (input branch 0) and `ctx.b`
     /// (input branch 1), push to `ctx.outputs`.
     ///
@@ -434,6 +480,8 @@ pub struct StepCtx2<'a, S: Step2> {
     pub a: &'a dyn InputHandle<S::InputA>,
     pub b: &'a dyn InputHandle<S::InputB>,
     pub outputs: &'a OutputHandles<S::Outputs>,
+    /// Per-step domain counters — see [`StepCtx::counters`].
+    pub counters: &'a StepCounters,
 }
 
 #[cfg(test)]

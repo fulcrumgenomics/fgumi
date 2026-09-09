@@ -2,6 +2,8 @@
 //! `PipelineBuilder::build()` to assert all-outputs-wired and by the
 //! runtime to construct queue topology.
 
+use crate::step::CounterSpec;
+
 /// Static branch-index display names covering every branch up to [`crate::outputs::MAX_ARITY`].
 /// Output branch counts are bounded by `MAX_ARITY` at registration, so a valid
 /// branch index always maps to a name and the build-error message never prints a
@@ -46,6 +48,12 @@ pub struct ChainGraph {
     input_arities: Vec<usize>,
     /// Step names for error messages.
     step_names: Vec<&'static str>,
+    /// `step_counters[step]` — the domain counters that step declares (from
+    /// [`crate::step::Step::counters`]), for the telemetry counter-name file.
+    /// Defaults to `&[]` at registration; the builder sets the real specs via
+    /// [`Self::set_step_counters`] once the step is registered. Length tracks
+    /// `step_names` (one entry per registered step).
+    step_counters: Vec<&'static [CounterSpec]>,
 }
 
 impl ChainGraph {
@@ -76,6 +84,9 @@ impl ChainGraph {
         self.branch_counts.push(branch_count);
         self.input_arities.push(input_arity);
         self.step_names.push(name);
+        // Default to no declared counters; the builder overrides via
+        // `set_step_counters` right after registering the step.
+        self.step_counters.push(&[]);
         self.consumers.resize(self.consumers.len() + branch_count, None);
         self.consumer_input_slots.resize(self.consumer_input_slots.len() + branch_count, None);
         idx
@@ -195,6 +206,19 @@ impl ChainGraph {
     #[must_use]
     pub fn step_name(&self, step: StepIdx) -> &'static str {
         self.step_names[step.0]
+    }
+
+    /// Record the domain counters a step declares (from
+    /// [`crate::step::Step::counters`]), for the telemetry counter-name file.
+    /// Called by the builder immediately after registering the step.
+    pub fn set_step_counters(&mut self, step: StepIdx, counters: &'static [CounterSpec]) {
+        self.step_counters[step.0] = counters;
+    }
+
+    /// The domain counters declared by a step (empty if none / not set).
+    #[must_use]
+    pub fn step_counters(&self, step: StepIdx) -> &'static [CounterSpec] {
+        self.step_counters[step.0]
     }
 
     #[must_use]

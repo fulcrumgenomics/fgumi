@@ -29,9 +29,10 @@ use super::outputs::StepOutputs;
 use super::reorder::BranchOrdering;
 use super::signal::PipelineSignal;
 use super::step::{
-    Affinity, DetachedGroup, OutputHandles, OutputsViewAny, Step, StepCtx, StepKind, StepOutcome,
-    StepProfile,
+    Affinity, CounterSpec, DetachedGroup, OutputHandles, OutputsViewAny, Step, StepCtx, StepKind,
+    StepOutcome, StepProfile,
 };
+use crate::runtime::contexts::StepCounters;
 
 /// The branch orderings the framework actually *builds* for a single-input
 /// producer of the given [`StepKind`], given its declared profile orderings.
@@ -122,6 +123,14 @@ pub trait ErasedStep: Send + 'static {
     /// detached steps onto shared driver threads (the N+2 model). Only
     /// meaningful for `Detached` kinds.
     fn detached_group(&self) -> DetachedGroup;
+
+    /// Forward `Step::counters` / `Step2::counters` — the domain counters this
+    /// step declares. Read at chain-build time to size the step's shared
+    /// [`StepCounters`] slots and populate the telemetry counter-name file.
+    /// Defaults to `&[]` (adapters override to forward `inner.counters()`).
+    fn counters(&self) -> &'static [CounterSpec] {
+        &[]
+    }
 
     /// Dispatch `S::try_run` after downcasting queue handles.
     ///
@@ -256,6 +265,10 @@ pub struct ErasedStepCtx<'a> {
     pub outputs: &'a (dyn Any + Send + Sync),
     /// Shared signal (error/cancel). Workers consult; steps don't directly.
     pub signal: &'a Arc<PipelineSignal>,
+    /// This step's shared [`StepCounters`] (`&contexts.step_counters[step_idx]`).
+    /// The adapter forwards it into `StepCtx`/`StepCtx2` so the step body can
+    /// bump its declared counters.
+    pub counters: &'a StepCounters,
 }
 
 /// Adapter that wraps a concrete `Step` impl as an `ErasedStep`.
@@ -475,10 +488,15 @@ where
         self.inner.detached_group()
     }
 
+    fn counters(&self) -> &'static [CounterSpec] {
+        self.inner.counters()
+    }
+
     fn try_run_erased(&mut self, ctx: &mut ErasedStepCtx<'_>) -> io::Result<StepOutcome> {
+        let counters = ctx.counters;
         let input = self.resolve_input(ctx);
         let outputs = self.resolve_outputs(ctx);
-        let mut step_ctx = StepCtx { input, outputs };
+        let mut step_ctx = StepCtx { input, outputs, counters };
         self.inner.try_run(&mut step_ctx)
     }
 
@@ -742,10 +760,15 @@ impl<S: Step2> ErasedStep for TypedStep2<S> {
         self.inner.detached_group()
     }
 
+    fn counters(&self) -> &'static [CounterSpec] {
+        self.inner.counters()
+    }
+
     fn try_run_erased(&mut self, ctx: &mut ErasedStepCtx<'_>) -> io::Result<StepOutcome> {
+        let counters = ctx.counters;
         let inputs = self.resolve_inputs(ctx);
         let outputs = self.resolve_outputs(ctx);
-        let mut typed_ctx = StepCtx2::<S> { a: &inputs.a, b: &inputs.b, outputs };
+        let mut typed_ctx = StepCtx2::<S> { a: &inputs.a, b: &inputs.b, outputs, counters };
         self.inner.try_run(&mut typed_ctx)
     }
 
@@ -1059,10 +1082,12 @@ mod tests {
         let consumer_outputs: OutputHandles<Single<u32>> = OutputHandles::new(consumer_view);
 
         let signal = PipelineSignal::new();
+        let no_counters = crate::runtime::contexts::StepCounters::disabled();
         let mut ctx = ErasedStepCtx {
             input: input_any.as_ref(),
             outputs: &consumer_outputs as &(dyn Any + Send + Sync),
             signal: &signal,
+            counters: &no_counters,
         };
         let outcome = consumer.try_run_erased(&mut ctx).unwrap();
         assert_eq!(outcome, StepOutcome::Progress);
@@ -1092,10 +1117,12 @@ mod tests {
         let consumer_outputs: OutputHandles<Single<u32>> = OutputHandles::new(consumer_view);
 
         let signal = PipelineSignal::new();
+        let no_counters = crate::runtime::contexts::StepCounters::disabled();
         let mut ctx = ErasedStepCtx {
             input: input_any.as_ref(),
             outputs: &consumer_outputs as &(dyn Any + Send + Sync),
             signal: &signal,
+            counters: &no_counters,
         };
         // First dispatch populates the cache; the second must hit it — and both
         // its unconditional box-address assert and the debug-only downcast
@@ -1135,14 +1162,23 @@ mod tests {
         let outputs_any = &consumer_outputs as &(dyn Any + Send + Sync);
 
         let signal = PipelineSignal::new();
+        let no_counters = crate::runtime::contexts::StepCounters::disabled();
         // First dispatch populates the cache from `first_input`.
-        let mut ctx =
-            ErasedStepCtx { input: first_input.as_ref(), outputs: outputs_any, signal: &signal };
+        let mut ctx = ErasedStepCtx {
+            input: first_input.as_ref(),
+            outputs: outputs_any,
+            signal: &signal,
+            counters: &no_counters,
+        };
         assert_eq!(consumer.try_run_erased(&mut ctx).unwrap(), StepOutcome::Progress);
 
         // Same step, different input box — the invariant violation.
-        let mut wrong_ctx =
-            ErasedStepCtx { input: second_input.as_ref(), outputs: outputs_any, signal: &signal };
+        let mut wrong_ctx = ErasedStepCtx {
+            input: second_input.as_ref(),
+            outputs: outputs_any,
+            signal: &signal,
+            counters: &no_counters,
+        };
         let _ = consumer.try_run_erased(&mut wrong_ctx);
     }
 
@@ -1157,10 +1193,12 @@ mod tests {
         let consumer_outputs: OutputHandles<Single<u32>> = OutputHandles::new(consumer_view);
 
         let signal = PipelineSignal::new();
+        let no_counters = crate::runtime::contexts::StepCounters::disabled();
         let mut ctx = ErasedStepCtx {
             input: input_any.as_ref(),
             outputs: &consumer_outputs as &(dyn Any + Send + Sync),
             signal: &signal,
+            counters: &no_counters,
         };
         let outcome = consumer.try_run_erased(&mut ctx).unwrap();
         assert_eq!(outcome, StepOutcome::NoProgress);
@@ -1334,10 +1372,12 @@ mod tests {
         let splitter_outputs: OutputHandles<(u32, u32)> = OutputHandles::new(splitter_view);
 
         let signal = PipelineSignal::new();
+        let no_counters = crate::runtime::contexts::StepCounters::disabled();
         let mut ctx = ErasedStepCtx {
             input: input_any.as_ref(),
             outputs: &splitter_outputs as &(dyn Any + Send + Sync),
             signal: &signal,
+            counters: &no_counters,
         };
 
         let outcome = splitter.try_run_erased(&mut ctx).unwrap();
