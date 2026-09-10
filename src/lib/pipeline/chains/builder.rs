@@ -385,7 +385,7 @@ fn build_consensus_metrics_captures(
     metrics_prefix: &std::path::Path,
     intervals_path: Option<&std::path::PathBuf>,
     num_threads: usize,
-    new_accumulator: impl Fn() -> crate::inline_metrics_collector::ConsensusMetricsAccumulator
+    new_accumulator: impl Fn() -> crate::inline_metrics_collector::ConsensusMetricsSlot
     + Send
     + Sync
     + 'static,
@@ -3259,7 +3259,7 @@ impl<'a> ChainBuilder<'a> {
                 simplex.metrics.as_ref().unwrap(),
                 simplex.intervals.as_ref(),
                 num_threads,
-                crate::inline_metrics_collector::ConsensusMetricsAccumulator::new_simplex,
+                crate::inline_metrics_collector::ConsensusMetricsSlot::new_simplex,
             )?))
         } else if let Some(duplex) =
             self.spec.stage_opts.duplex.as_ref().filter(|d| d.metrics.is_some())
@@ -3268,7 +3268,7 @@ impl<'a> ChainBuilder<'a> {
                 duplex.metrics.as_ref().unwrap(),
                 duplex.intervals.as_ref(),
                 num_threads,
-                || crate::inline_metrics_collector::ConsensusMetricsAccumulator::new_duplex(false),
+                || crate::inline_metrics_collector::ConsensusMetricsSlot::new_duplex(false),
             )?))
         } else if let Some(codec) =
             self.spec.stage_opts.codec.as_ref().filter(|c| c.metrics.is_some())
@@ -3277,7 +3277,7 @@ impl<'a> ChainBuilder<'a> {
                 codec.metrics.as_ref().unwrap(),
                 codec.intervals.as_ref(),
                 num_threads,
-                || crate::inline_metrics_collector::ConsensusMetricsAccumulator::new_duplex(false),
+                || crate::inline_metrics_collector::ConsensusMetricsSlot::new_duplex(false),
             )?))
         } else {
             None
@@ -3669,6 +3669,7 @@ impl<'a> ChainBuilder<'a> {
                 crate::inline_metrics_collector::ConsensusMetricsFinalizeHook {
                     accumulators: Arc::clone(&existing.accumulator),
                     output_prefix: existing.output_prefix.clone(),
+                    intervals: existing.intervals.clone(),
                     thresholds: crate::inline_metrics_collector::MetricsThresholds::Simplex {
                         min_reads: simplex.min_reads,
                     },
@@ -4044,6 +4045,7 @@ impl<'a> ChainBuilder<'a> {
                 crate::inline_metrics_collector::ConsensusMetricsFinalizeHook {
                     accumulators: Arc::clone(&existing.accumulator),
                     output_prefix: existing.output_prefix.clone(),
+                    intervals: existing.intervals.clone(),
                     thresholds: crate::inline_metrics_collector::MetricsThresholds::Duplex {
                         min_ab_reads,
                         min_ba_reads,
@@ -4376,6 +4378,7 @@ impl<'a> ChainBuilder<'a> {
                 crate::inline_metrics_collector::ConsensusMetricsFinalizeHook {
                     accumulators: Arc::clone(&existing.accumulator),
                     output_prefix: existing.output_prefix.clone(),
+                    intervals: existing.intervals.clone(),
                     thresholds: crate::inline_metrics_collector::MetricsThresholds::Duplex {
                         min_ab_reads: min_reads,
                         min_ba_reads: min_reads,

@@ -233,7 +233,7 @@ impl ConsensusMetricsAccumulator {
 /// only** — T2 (standalone) has no equivalent captures type; its `Serial`
 /// collector step (Task 8) owns its accumulator directly.
 pub(crate) struct ConsensusMetricsCaptures {
-    pub(crate) accumulator: Arc<PerThreadAccumulator<ConsensusMetricsAccumulator>>,
+    pub(crate) accumulator: Arc<PerThreadAccumulator<ConsensusMetricsSlot>>,
     pub(crate) intervals: Vec<Interval>,
     pub(crate) output_prefix: PathBuf,
 }
@@ -255,25 +255,28 @@ pub(crate) enum MetricsThresholds {
 /// and calls these same writer functions from its own `on_finish` callback
 /// (Task 11), with no fold step (there is nothing to merge).
 pub(crate) struct ConsensusMetricsFinalizeHook {
-    pub(crate) accumulators: Arc<PerThreadAccumulator<ConsensusMetricsAccumulator>>,
+    pub(crate) accumulators: Arc<PerThreadAccumulator<ConsensusMetricsSlot>>,
     pub(crate) output_prefix: PathBuf,
+    pub(crate) intervals: Vec<Interval>,
     pub(crate) thresholds: MetricsThresholds,
 }
 
 impl FinalizeHook for ConsensusMetricsFinalizeHook {
     fn finalize(self: Box<Self>) -> anyhow::Result<()> {
-        let ConsensusMetricsFinalizeHook { accumulators, output_prefix, thresholds } = *self;
+        let ConsensusMetricsFinalizeHook { accumulators, output_prefix, intervals, thresholds } =
+            *self;
 
-        // `ConsensusMetricsAccumulator` has no mode-less `Default` (Task 7),
-        // so draining the sharded slots goes through `into_slots_with`
-        // (Task 6's Default-free constructor's sibling) rather than
-        // `into_slots`. The `init` closure only matters for the lossy
-        // fallback path (outstanding `Arc` holders, a caller bug) — pick the
-        // constructor matching this hook's own mode so the fallback's type
-        // checks out; its *values* are never read since that path replaces,
-        // rather than merges, an in-progress slot.
-        let init: fn() -> ConsensusMetricsAccumulator = match &thresholds {
-            MetricsThresholds::Simplex { .. } => ConsensusMetricsAccumulator::new_simplex,
+        // `ConsensusMetricsSlot` has no mode-less `Default` (its inner
+        // `ConsensusMetricsAccumulator` has none — Task 7), so draining the
+        // sharded slots goes through `into_slots_with` (Task 6's
+        // Default-free constructor's sibling) rather than `into_slots`. The
+        // `init` closure only matters for the lossy fallback path
+        // (outstanding `Arc` holders, a caller bug) — pick the constructor
+        // matching this hook's own mode so the fallback's type checks out;
+        // its *values* are never read since that path replaces, rather than
+        // merges, an in-progress slot.
+        let init: fn() -> ConsensusMetricsSlot = match &thresholds {
+            MetricsThresholds::Simplex { .. } => ConsensusMetricsSlot::new_simplex,
             MetricsThresholds::Duplex { .. } => duplex_fallback_init,
         };
 
@@ -286,12 +289,24 @@ impl FinalizeHook for ConsensusMetricsFinalizeHook {
             merged.merge(slot)?;
         }
 
+        // Fold each worker's deferred boundary runs back into stream order
+        // and close them into coordinate groups (`reassemble_boundary`,
+        // Task 1), then record each reassembled group into the merged
+        // accumulator. T1's fused path never defers any runs to the
+        // boundary (its tap always calls `record_coordinate_group`
+        // directly — see `group.rs`), so `boundary` is always empty here
+        // and this loop is a no-op, keeping T1's behavior unchanged.
+        let ConsensusMetricsSlot { mut acc, boundary } = merged;
+        for group in reassemble_boundary(boundary) {
+            acc.record_coordinate_group(&group, &intervals)?;
+        }
+
         match thresholds {
             MetricsThresholds::Simplex { min_reads } => {
-                write_simplex_metrics_files(&merged, &output_prefix, min_reads)
+                write_simplex_metrics_files(&acc, &output_prefix, min_reads)
             }
             MetricsThresholds::Duplex { min_ab_reads, min_ba_reads } => {
-                write_duplex_metrics_files(&merged, &output_prefix, min_ab_reads, min_ba_reads)
+                write_duplex_metrics_files(&acc, &output_prefix, min_ab_reads, min_ba_reads)
             }
         }
     }
@@ -301,8 +316,8 @@ impl FinalizeHook for ConsensusMetricsFinalizeHook {
 /// `Duplex` `into_slots_with` `init` argument — see the SAFETY-style comment
 /// at that call site for why the `duplex_umi_counts` value here (`false`)
 /// is inconsequential.
-fn duplex_fallback_init() -> ConsensusMetricsAccumulator {
-    ConsensusMetricsAccumulator::new_duplex(false)
+fn duplex_fallback_init() -> ConsensusMetricsSlot {
+    ConsensusMetricsSlot::new_duplex(false)
 }
 
 /// Writes the same three files the separate-pass `simplex-metrics` command
@@ -882,15 +897,15 @@ mod consensus_metrics_finalize_hook_tests {
 
     #[test]
     fn consensus_metrics_finalize_hook_merges_slots_and_writes() {
-        let accumulators =
-            PerThreadAccumulator::new_with(1, ConsensusMetricsAccumulator::new_simplex);
-        accumulators.with_slot(|acc| {
-            acc.record_coordinate_group(&[template("0", "chr1", 100, 1.0)], &[]).unwrap();
+        let accumulators = PerThreadAccumulator::new_with(1, ConsensusMetricsSlot::new_simplex);
+        accumulators.with_slot(|slot| {
+            slot.acc.record_coordinate_group(&[template("0", "chr1", 100, 1.0)], &[]).unwrap();
         });
 
         let hook = ConsensusMetricsFinalizeHook {
             accumulators,
             output_prefix: std::env::temp_dir().join("consensus_metrics_finalize_hook_test"),
+            intervals: Vec::new(),
             thresholds: MetricsThresholds::Simplex { min_reads: 1 },
         };
         Box::new(hook).finalize().expect("finalize succeeds");

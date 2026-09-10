@@ -304,8 +304,8 @@ pub(crate) fn build_group_process_step(
                         .map_err(io::Error::other)?;
                     consensus_metrics
                         .accumulator
-                        .with_slot(|acc| {
-                            acc.record_coordinate_group(&infos, &consensus_metrics.intervals)
+                        .with_slot(|slot| {
+                            slot.acc.record_coordinate_group(&infos, &consensus_metrics.intervals)
                         })
                         .map_err(io::Error::other)?;
                 }
