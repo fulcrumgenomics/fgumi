@@ -328,10 +328,13 @@ fn run_codec_consensus_batch(
 /// (`split_into_runs`) and classifies each run as an interior (whole,
 /// complete-within-this-batch) coordinate group or a batch-boundary run
 /// needing cross-batch reassembly (`classify_batch_runs`). Interior runs are
-/// recorded directly into this worker's `ConsensusMetricsSlot` under a single
-/// `with_slot` lock acquisition per batch; boundary runs are deferred onto the
-/// same slot for the finalize hook to reassemble (`reassemble_boundary`) once
-/// every worker has finished. This mirrors duplex's
+/// recorded directly into this worker's `ConsensusMetricsSlot` under one
+/// `with_slot` lock acquisition per batch; boundary runs are submitted to the
+/// shared `BoundaryReorder`, which closes coordinate groups incrementally as
+/// the batch-serial prefix becomes contiguous, and whichever groups that
+/// submission closes are recorded into this worker's slot under a second
+/// `with_slot` acquisition, taken after the reorder's own mutex is released
+/// (H3 design §6.3 — no lock-order cycle). This mirrors duplex's
 /// `run_duplex_consensus_batch_with_metrics`: metrics recording happens inline
 /// in the consensus worker body, so the step's Outputs shape is unchanged from
 /// the metrics-off variant. Delegates the unchanged consensus calling to
@@ -361,7 +364,20 @@ fn run_codec_consensus_batch_with_metrics(
             for (_key, templates) in interior {
                 slot.acc.record_coordinate_group(&templates, &qc.intervals)?;
             }
-            slot.boundary.extend(boundary);
+            Ok(())
+        })
+        .map_err(io::Error::other)?;
+    // `submit` takes/releases the reorder mutex here, before the second
+    // `with_slot` acquisition below — never nested — so there is no
+    // lock-order cycle. Submitted unconditionally, even when `boundary` is
+    // empty: batch serials are contiguous, and a batch with no metrics
+    // entries still occupies its serial slot (H3 design §6.3).
+    let closed = qc.reorder.submit(batch_serial, boundary);
+    qc.accumulator
+        .with_slot(|slot| -> anyhow::Result<()> {
+            for group in &closed {
+                slot.acc.record_coordinate_group(group, &qc.intervals)?;
+            }
             Ok(())
         })
         .map_err(io::Error::other)?;

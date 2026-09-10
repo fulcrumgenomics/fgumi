@@ -401,6 +401,7 @@ fn build_consensus_metrics_captures(
         ),
         intervals,
         output_prefix: metrics_prefix.to_path_buf(),
+        reorder: Arc::new(crate::inline_metrics_collector::BoundaryReorder::new()),
     })
 }
 
@@ -3633,6 +3634,7 @@ impl<'a> ChainBuilder<'a> {
                     accumulators: Arc::clone(&existing.accumulator),
                     output_prefix: existing.output_prefix.clone(),
                     intervals: existing.intervals.clone(),
+                    reorder: Arc::clone(&existing.reorder),
                     thresholds: crate::inline_metrics_collector::MetricsThresholds::Simplex {
                         min_reads: simplex.min_reads,
                     },
@@ -3656,6 +3658,7 @@ impl<'a> ChainBuilder<'a> {
                     accumulators: Arc::clone(&captures.accumulator),
                     output_prefix: captures.output_prefix.clone(),
                     intervals: captures.intervals.clone(),
+                    reorder: Arc::clone(&captures.reorder),
                     thresholds: crate::inline_metrics_collector::MetricsThresholds::Simplex {
                         min_reads: simplex.min_reads,
                     },
@@ -3987,6 +3990,7 @@ impl<'a> ChainBuilder<'a> {
                     accumulators: Arc::clone(&existing.accumulator),
                     output_prefix: existing.output_prefix.clone(),
                     intervals: existing.intervals.clone(),
+                    reorder: Arc::clone(&existing.reorder),
                     thresholds: crate::inline_metrics_collector::MetricsThresholds::Duplex {
                         min_ab_reads,
                         min_ba_reads,
@@ -4011,6 +4015,7 @@ impl<'a> ChainBuilder<'a> {
                     accumulators: Arc::clone(&captures.accumulator),
                     output_prefix: captures.output_prefix.clone(),
                     intervals: captures.intervals.clone(),
+                    reorder: Arc::clone(&captures.reorder),
                     thresholds: crate::inline_metrics_collector::MetricsThresholds::Duplex {
                         min_ab_reads,
                         min_ba_reads,
@@ -4372,6 +4377,7 @@ impl<'a> ChainBuilder<'a> {
                     accumulators: Arc::clone(&existing.accumulator),
                     output_prefix: existing.output_prefix.clone(),
                     intervals: existing.intervals.clone(),
+                    reorder: Arc::clone(&existing.reorder),
                     thresholds: crate::inline_metrics_collector::MetricsThresholds::Duplex {
                         min_ab_reads: min_reads,
                         min_ba_reads: min_reads,
@@ -4396,6 +4402,7 @@ impl<'a> ChainBuilder<'a> {
                     accumulators: Arc::clone(&captures.accumulator),
                     output_prefix: captures.output_prefix.clone(),
                     intervals: captures.intervals.clone(),
+                    reorder: Arc::clone(&captures.reorder),
                     thresholds: crate::inline_metrics_collector::MetricsThresholds::Duplex {
                         min_ab_reads: min_reads,
                         min_ba_reads: min_reads,

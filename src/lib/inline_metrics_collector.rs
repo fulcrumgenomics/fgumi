@@ -15,9 +15,12 @@
 //! groups are always complete and never split across a batch boundary; T2's
 //! producers split each batch's entries into same-key runs
 //! (`split_into_runs`/`classify_batch_runs`), record interior (fully-within-
-//! one-batch) runs directly, and defer the first/last run of each batch as a
-//! `BoundaryRun` for `reassemble_boundary` to fold back into stream order at
-//! finalize. The earlier `CoordinateGroupFragment`/`CoordinateGroupCollector`/
+//! one-batch) runs directly, and submit the first/last run of each batch as
+//! `BoundaryRun`s to a shared `BoundaryReorder`, which closes coordinate
+//! groups incrementally, as soon as the batch-serial prefix is contiguous,
+//! rather than buffering them until finalize (H3, spec
+//! `2026-09-09-incremental-per-key-metrics-design.md` §6). The earlier
+//! `CoordinateGroupFragment`/`CoordinateGroupCollector`/
 //! `MetricsCollectorStep` serial-collector design — a third output branch
 //! reordered and reduced, single-threaded, by a dedicated pipeline step after
 //! the fact — has been fully retired: every mode now records metrics inline
@@ -41,11 +44,19 @@
 //!
 //! **Parallel T2 consensus metrics primitives:** `RunKind`, `BoundaryRun`,
 //! `ConsensusMetricsSlot`, `split_into_runs`, `classify_batch_runs`, and
-//! `reassemble_boundary` are pure, fully-unit-tested order-free building
-//! blocks for the parallel-worker T2 wiring. `split_into_runs` and
+//! `BoundaryReorder` are pure, fully-unit-tested order-free building blocks
+//! for the parallel-worker T2 wiring. `split_into_runs` and
 //! `classify_batch_runs` are called directly by the standalone simplex,
-//! duplex, and codec producers' per-batch bodies; `reassemble_boundary` is
-//! called by `ConsensusMetricsFinalizeHook::finalize` for every mode.
+//! duplex, and codec producers' per-batch bodies, which then `submit` the
+//! resulting boundary runs to the shared `BoundaryReorder` and record
+//! whichever groups that submission closes. `reassemble_boundary` — the same
+//! closing rule, expressed as a one-shot batch reassembly rather than an
+//! incremental one — is retained purely as a from-scratch reference
+//! implementation the `boundary_reorder_tests` proptest checks
+//! `BoundaryReorder` against; it is no longer called from
+//! `ConsensusMetricsFinalizeHook::finalize`, which instead calls
+//! `BoundaryReorder::finish` to close the one group left open at end of
+//! stream.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -252,6 +263,12 @@ pub(crate) struct ConsensusMetricsCaptures {
     pub(crate) accumulator: Arc<PerThreadAccumulator<ConsensusMetricsSlot>>,
     pub(crate) intervals: Vec<Interval>,
     pub(crate) output_prefix: PathBuf,
+    /// Shared incremental boundary-run closer (§6.2/§6.3 of the H3 design).
+    /// T2's producers `submit` each batch's boundary runs here and record
+    /// whichever groups that submission closes; T1's fused tap never submits
+    /// (its coordinate groups are always complete), so its reorder stays
+    /// empty for the life of the run.
+    pub(crate) reorder: Arc<BoundaryReorder>,
 }
 
 /// Simplex needs one min-reads threshold; duplex and codec need two
@@ -266,24 +283,34 @@ pub(crate) enum MetricsThresholds {
 
 /// Finalize hook shared by T1 and T2 alike: merges every `PerThreadAccumulator`
 /// slot's `ConsensusMetricsSlot` into one — folding each worker's
-/// `ConsensusMetricsAccumulator` via `merge` and reassembling each worker's
-/// deferred `BoundaryRun`s via [`reassemble_boundary`] — then writes the same
-/// file set the separate-pass simplex-metrics/duplex-metrics commands write.
-/// T1's fused tap always calls `record_coordinate_group` directly (its
-/// coordinate groups are never split across a batch boundary), so its
-/// `boundary` list is always empty and the reassembly step is a no-op for
-/// that path — the same hook handles both cases uniformly.
+/// `ConsensusMetricsAccumulator` via `merge` — then closes the shared
+/// `reorder`'s final open coordinate group (if any) and writes the same file
+/// set the separate-pass simplex-metrics/duplex-metrics commands write. T1's
+/// fused tap always calls `record_coordinate_group` directly (its coordinate
+/// groups are never split across a batch boundary) and never calls
+/// `reorder.submit`, so `reorder.finish()` returns `None` for that path — the
+/// same hook handles both cases uniformly.
 pub(crate) struct ConsensusMetricsFinalizeHook {
     pub(crate) accumulators: Arc<PerThreadAccumulator<ConsensusMetricsSlot>>,
     pub(crate) output_prefix: PathBuf,
     pub(crate) intervals: Vec<Interval>,
     pub(crate) thresholds: MetricsThresholds,
+    /// The shared incremental boundary-run closer. Drained at finalize via
+    /// `reorder.finish()` to record the one final open coordinate group, if
+    /// any — every other boundary group was already closed and recorded
+    /// on a worker as batches completed (§6.3/§6.4).
+    pub(crate) reorder: Arc<BoundaryReorder>,
 }
 
 impl FinalizeHook for ConsensusMetricsFinalizeHook {
     fn finalize(self: Box<Self>) -> anyhow::Result<()> {
-        let ConsensusMetricsFinalizeHook { accumulators, output_prefix, intervals, thresholds } =
-            *self;
+        let ConsensusMetricsFinalizeHook {
+            accumulators,
+            output_prefix,
+            intervals,
+            thresholds,
+            reorder,
+        } = *self;
 
         // `ConsensusMetricsSlot` has no mode-less `Default` (its inner
         // `ConsensusMetricsAccumulator` has none — Task 7), so draining the
@@ -308,16 +335,18 @@ impl FinalizeHook for ConsensusMetricsFinalizeHook {
             merged.merge(slot)?;
         }
 
-        // Fold each worker's deferred boundary runs back into stream order
-        // and close them into coordinate groups (`reassemble_boundary`,
-        // Task 1), then record each reassembled group into the merged
-        // accumulator. T1's fused path never defers any runs to the
-        // boundary (its tap always calls `record_coordinate_group`
-        // directly — see `group.rs`), so `boundary` is always empty here
-        // and this loop is a no-op, keeping T1's behavior unchanged.
-        let ConsensusMetricsSlot { mut acc, boundary } = merged;
-        for group in reassemble_boundary(boundary) {
-            acc.record_coordinate_group(&group, &intervals)?;
+        // Every boundary group except (at most) one was already closed and
+        // recorded into a worker's slot incrementally, as batches completed
+        // (`BoundaryReorder::submit`, §6.3). `finish` drains the one
+        // remaining open group, if any, and errors if some batch serial was
+        // never submitted (a caller bug — see `finish`'s doc comment). T1's
+        // fused path never calls `submit` (its tap always calls
+        // `record_coordinate_group` directly — see `group.rs`), so its
+        // `reorder` stays empty and `finish()` returns `None`, keeping T1's
+        // behavior unchanged.
+        let ConsensusMetricsSlot { mut acc } = merged;
+        if let Some(open_group) = reorder.finish()? {
+            acc.record_coordinate_group(&open_group, &intervals)?;
         }
 
         match thresholds {
@@ -570,6 +599,12 @@ pub(crate) enum RunKind {
 /// reassembly because — unlike an interior run — it might continue into an
 /// adjacent batch's boundary run sharing the same key.
 pub(crate) struct BoundaryRun {
+    /// Redundant with the `serial` argument `BoundaryReorder::submit` is
+    /// called with (each `BoundaryRun` is only ever submitted alongside the
+    /// batch it came from), so production code never reads it back off the
+    /// struct — kept for the test-only `reassemble_boundary` reference
+    /// implementation, which groups a flat `Vec<BoundaryRun>` by serial.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) batch_serial: u64,
     pub(crate) kind: RunKind,
     pub(crate) key: ReadInfoKey,
@@ -695,14 +730,21 @@ impl BoundaryReorder {
         closed
     }
 
-    /// Consumes the reorder, returning the final open coordinate group (or
-    /// `None` if nothing was ever open). Errors if any batch serial was
-    /// never submitted: a non-empty `pending` at this point means at least
+    /// Drains the reorder, returning the final open coordinate group (or
+    /// `None` if nothing was ever open — or if called again after an earlier
+    /// call already took it). Errors if any batch serial was never
+    /// submitted: a non-empty `pending` at this point means at least
     /// one later serial's runs are still stuck behind a gap, which is a
     /// caller bug — every batch's boundary runs (even an empty `Vec`) must be
-    /// submitted, in order for `next_serial` to ever reach it.
-    pub(crate) fn finish(self) -> anyhow::Result<Option<Vec<TemplateInfo>>> {
-        let st = self.inner.into_inner();
+    /// submitted, in order for `next_serial` to ever reach it. Takes `&self`
+    /// (not `self`) because callers share this type behind an `Arc` (one per
+    /// T2 consensus stage, cloned into both its producers and its
+    /// `ConsensusMetricsFinalizeHook`); by the time `finalize` calls this,
+    /// every producer has already been dropped, so — unlike `submit`, which
+    /// may race across worker threads — nothing else can observe or mutate
+    /// the state this call drains.
+    pub(crate) fn finish(&self) -> anyhow::Result<Option<Vec<TemplateInfo>>> {
+        let mut st = self.inner.lock();
         if !st.pending.is_empty() {
             // `next_serial` is, by definition, the lowest serial not yet
             // applied — so if anything is still in `pending`, `next_serial`
@@ -716,7 +758,7 @@ impl BoundaryReorder {
                 st.pending.len(),
             );
         }
-        Ok(st.open.map(|(_, templates)| templates))
+        Ok(st.open.take().map(|(_, templates)| templates))
     }
 }
 
@@ -748,6 +790,15 @@ impl BoundaryReorderState {
 /// contiguous-serial contract is met — and appends `finish`'s final open
 /// group. Returns the reassembled groups in order. Interior runs were
 /// already recorded on the workers and are not present here.
+///
+/// No longer called from production code as of the H3 incremental wiring
+/// (`ConsensusMetricsFinalizeHook::finalize` now closes boundary groups on
+/// workers as batches complete, via `BoundaryReorder::submit`, and drains
+/// only the final open group via `BoundaryReorder::finish` at finalize) —
+/// retained as a from-scratch, one-shot reference implementation of the same
+/// closing rule that `boundary_reorder_tests` fuzzes `BoundaryReorder`
+/// against.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn reassemble_boundary(boundary: Vec<BoundaryRun>) -> Vec<Vec<TemplateInfo>> {
     let mut by_serial: BTreeMap<u64, Vec<BoundaryRun>> = BTreeMap::new();
     for run in boundary {
@@ -773,32 +824,27 @@ pub(crate) fn reassemble_boundary(boundary: Vec<BoundaryRun>) -> Vec<Vec<Templat
     groups
 }
 
-/// Per-worker slot for the parallel T2 consensus-metrics reduction: pairs an
-/// order-free `ConsensusMetricsAccumulator` (fed by each worker's interior
-/// runs, which need no cross-batch reassembly) with the worker's deferred
-/// boundary runs (which do). `merge` folds two slots' accumulators and
-/// concatenates their boundary runs — global ordering and group-closing is
-/// deferred to [`reassemble_boundary`] at finalize time, not done here.
+/// Per-worker slot for the parallel T2 consensus-metrics reduction: an
+/// order-free `ConsensusMetricsAccumulator`, fed by each worker's interior
+/// runs (never need cross-batch reassembly) and by whichever boundary groups
+/// the shared `BoundaryReorder` closes while this worker's batch submits
+/// (any worker's slot is a valid destination for a closed group — merges are
+/// commutative and associative, §6.1). `merge` folds two slots' accumulators.
 pub(crate) struct ConsensusMetricsSlot {
     pub(crate) acc: ConsensusMetricsAccumulator,
-    pub(crate) boundary: Vec<BoundaryRun>,
 }
 
 impl ConsensusMetricsSlot {
     pub(crate) fn new_simplex() -> Self {
-        Self { acc: ConsensusMetricsAccumulator::new_simplex(), boundary: Vec::new() }
+        Self { acc: ConsensusMetricsAccumulator::new_simplex() }
     }
 
     pub(crate) fn new_duplex(collect_duplex_umi_counts: bool) -> Self {
-        Self {
-            acc: ConsensusMetricsAccumulator::new_duplex(collect_duplex_umi_counts),
-            boundary: Vec::new(),
-        }
+        Self { acc: ConsensusMetricsAccumulator::new_duplex(collect_duplex_umi_counts) }
     }
 
-    pub(crate) fn merge(&mut self, mut other: Self) -> anyhow::Result<()> {
+    pub(crate) fn merge(&mut self, other: Self) -> anyhow::Result<()> {
         self.acc.merge(other.acc)?;
-        self.boundary.append(&mut other.boundary);
         Ok(())
     }
 }
@@ -958,6 +1004,7 @@ mod consensus_metrics_finalize_hook_tests {
             output_prefix: std::env::temp_dir().join("consensus_metrics_finalize_hook_test"),
             intervals: Vec::new(),
             thresholds: MetricsThresholds::Simplex { min_reads: 1 },
+            reorder: Arc::new(BoundaryReorder::new()),
         };
         Box::new(hook).finalize().expect("finalize succeeds");
     }
@@ -1399,26 +1446,13 @@ mod consensus_metrics_slot_tests {
     }
 
     #[test]
-    fn merge_folds_acc_and_concatenates_boundary() {
+    fn merge_folds_acc() {
         let mut a = ConsensusMetricsSlot::new_simplex();
         a.acc.record_coordinate_group(&[template("0", "chr1", 100, 1.0)], &[]).unwrap();
-        a.boundary.push(BoundaryRun {
-            batch_serial: 0,
-            kind: RunKind::Tail,
-            key: key(0, 200),
-            templates: vec![template("1", "chr1", 200, 1.0)],
-        });
         let mut b = ConsensusMetricsSlot::new_simplex();
         b.acc.record_coordinate_group(&[template("2", "chr1", 300, 1.0)], &[]).unwrap();
-        b.boundary.push(BoundaryRun {
-            batch_serial: 1,
-            kind: RunKind::Head,
-            key: key(0, 200),
-            templates: vec![template("3", "chr1", 200, 1.0)],
-        });
         a.merge(b).unwrap();
         assert_eq!(size1_cs(&a.acc), 2, "both recorded size-1 families present after merge");
-        assert_eq!(a.boundary.len(), 2, "boundary runs concatenated (ordered at finalize)");
     }
 }
 
