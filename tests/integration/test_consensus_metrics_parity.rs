@@ -1415,3 +1415,117 @@ fn codec_multi_key_batch_straddle_t2_matches_ground_truth() {
         );
     }
 }
+
+// ============================================================================
+// Task 1 (Finding B') regression guard: `pair_records_by_read_name`'s
+// insertion-ordered (`IndexMap`) pairing must preserve first-appearance (BAM)
+// order so T2's per-position UMI-consensus tie-break resolves identically to
+// the standalone `simplex-metrics` oracle. The oracle's own template builder
+// processes records straight off the BAM in file order (no re-pairing map at
+// all); T2's inline path re-pairs a `MiGroup`'s flat record list via
+// `pair_records_by_read_name` first. `SimpleConsensusCaller`'s near-tie rule
+// (`TieRule::FgbioCompat`, `fgumi-consensus/src/base_builder.rs`) is
+// deterministic only because "a molecule's reads are always accumulated in
+// one thread, in file order" — so if T2's re-pairing ever produces a
+// different order than the file itself, a genuine per-position vote tie can
+// resolve to a different winning base than the oracle, nondeterministically
+// from run to run (pre-fix: `HashMap`'s `RandomState` iteration order).
+//
+// The four templates below share one MI family ("0") but carry a GENUINE
+// 2-2 tie in their raw RX tag at UMI component 0 ("C","A","A","C", all at
+// identical simulated base quality) while sharing an identical component 1
+// ("TGCA", no tie). The MI tag is assigned directly on each record —
+// bypassing `fgumi group`, which at `-e 0` exact-match clustering could never
+// itself place two distinct RX values in one family — so both T2 and the
+// oracle read the exact same already-grouped BAM.
+// ============================================================================
+
+/// Builds one grouped-BAM family of 4 read pairs, all tagged MI `"0"`, whose
+/// RX tags tie 2-2 ("C","A","A","C") at UMI component 0 while sharing an
+/// identical component 1 ("TGCA"). Read names/RX values are listed in
+/// deliberately non-alphabetical order (C, A, A, C) — first-appearance
+/// pairing must reproduce exactly this emission order, not some incidental
+/// sorted order.
+fn tied_position_family_records() -> Vec<RawRecord> {
+    let specs = [("t0", "C-TGCA"), ("t1", "A-TGCA"), ("t2", "A-TGCA"), ("t3", "C-TGCA")];
+    specs
+        .iter()
+        .flat_map(|(name, umi)| {
+            let (r1, r2) = simplex_pair(name, umi, Some("0"), 100, 10);
+            [r1, r2]
+        })
+        .collect()
+}
+
+/// Runs the standalone `simplex-metrics` oracle directly on `grouped` (no
+/// `fgumi group` step — `grouped` already carries hand-assigned MI tags).
+fn tied_position_ground_truth(dir: &Path, grouped: &Path) -> PathBuf {
+    let prefix = dir.join("tied_ground_truth");
+    run_fgumi(&[
+        "simplex-metrics",
+        "-i",
+        grouped.to_str().unwrap(),
+        "-o",
+        prefix.to_str().unwrap(),
+        "--min-reads",
+        "1",
+    ]);
+    prefix
+}
+
+#[rstest]
+#[case::one_thread(1)]
+#[case::four_threads(4)]
+#[case::eight_threads(8)]
+fn simplex_umi_counts_tied_position_matches_oracle_across_threads(#[case] threads: usize) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let header = create_minimal_header("chr1", 10_000);
+    let grouped = dir.path().join("grouped.bam");
+    write_bam(&grouped, &header, &tied_position_family_records());
+
+    let ground_truth_prefix = tied_position_ground_truth(dir.path(), &grouped);
+    // Non-vacuity: the ground truth must actually resolve the tie into a
+    // called ("A" or "C") row, not silently no-call/skip it — otherwise this
+    // test would pass vacuously without ever exercising Finding B'.
+    let ground_truth_umi_counts =
+        std::fs::read_to_string(suffixed(&ground_truth_prefix, "umi_counts.txt"))
+            .expect("ground truth umi_counts.txt must exist");
+    assert!(
+        ground_truth_umi_counts.lines().count() >= 2,
+        "ground truth umi_counts.txt has no data rows — the tie fixture produced nothing to \
+         compare"
+    );
+
+    let tag = format!("t{threads}");
+    let standalone_prefix =
+        run_simplex_standalone(dir.path(), &grouped, &tag, Some(threads), 1, None);
+
+    assert_metrics_file_eq(
+        &standalone_prefix,
+        &ground_truth_prefix,
+        "umi_counts.txt",
+        &format!("tied-position T2 (--threads {threads}) vs oracle"),
+    );
+}
+
+/// Regression guard for repeated runs at the same thread count: two
+/// independent standalone invocations at `--threads 8` must produce
+/// byte-identical `umi_counts.txt` — i.e. the tie resolves the same way
+/// every run, not merely on whichever run happened to match the oracle.
+#[test]
+fn simplex_umi_counts_tied_position_is_stable_across_repeated_runs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let header = create_minimal_header("chr1", 10_000);
+    let grouped = dir.path().join("grouped.bam");
+    write_bam(&grouped, &header, &tied_position_family_records());
+
+    let run1 = run_simplex_standalone(dir.path(), &grouped, "rep1", Some(8), 1, None);
+    let run2 = run_simplex_standalone(dir.path(), &grouped, "rep2", Some(8), 1, None);
+
+    assert_metrics_file_eq(
+        &run1,
+        &run2,
+        "umi_counts.txt",
+        "tied-position T2 repeated run (--threads 8) must be stable run-to-run",
+    );
+}

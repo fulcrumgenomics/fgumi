@@ -47,7 +47,6 @@
 //! duplex, and codec producers' per-batch bodies; `reassemble_boundary` is
 //! called by `ConsensusMetricsFinalizeHook::finalize` for every mode.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -67,6 +66,7 @@ use fgumi_bam_io::LibraryIndex;
 use fgumi_metrics::duplex::DuplexMetricsCollector;
 use fgumi_metrics::simplex::SimplexMetricsCollector;
 use fgumi_raw_bam::{RawRecord, flags as raw_flags};
+use indexmap::IndexMap;
 
 /// Accumulator state for one consensus stage's inline metrics. Shared by T1
 /// and T2 alike: both wrap it (inside a [`ConsensusMetricsSlot`]) in a
@@ -442,13 +442,14 @@ pub(crate) fn write_duplex_metrics_files(
 
 /// Re-pairs one `MiGroup`'s flat record list into R1/R2 pairs by read name,
 /// applying the same paired/mapped/primary filter
-/// `process_templates_from_bam` uses. Records within one `MiGroup` all
-/// belong to the same UMI family (already clustered at essentially one
-/// physical position by upstream grouping), so pairing via an unordered
-/// `HashMap` does not risk interleaving templates from genuinely different
-/// `ReadInfoKey`s within a single `MiGroup`.
+/// `process_templates_from_bam` uses. Uses an insertion-ordered `IndexMap`
+/// keyed by read name, so the returned pairs come back in first-appearance
+/// order of each read name within `records` (i.e. BAM order) rather than
+/// hash-bucket order — matching the standalone `simplex-metrics`/
+/// `duplex-metrics` oracle's within-family read order, which is required for
+/// `umi_counts` parity at coordinate positions where UMI tags tie.
 fn pair_records_by_read_name(records: &[RawRecord]) -> Vec<(&RawRecord, &RawRecord)> {
-    let mut by_name: HashMap<Vec<u8>, (Option<&RawRecord>, Option<&RawRecord>)> = HashMap::new();
+    let mut by_name: IndexMap<Vec<u8>, (Option<&RawRecord>, Option<&RawRecord>)> = IndexMap::new();
     for record in records {
         let flags = record.flags();
         let qualifies = (flags & raw_flags::PAIRED) != 0
@@ -984,6 +985,24 @@ mod pair_and_push_tests {
         let records = [a1];
         let pairs = pair_records_by_read_name(&records);
         assert!(pairs.is_empty(), "an R1 with no matching R2 must be dropped");
+    }
+
+    #[test]
+    fn pair_records_by_read_name_preserves_first_appearance_order() {
+        let header = crate::commands::shared_metrics::tests::test_header();
+        // R1s appear in order c, a, b; R2s interleaved.
+        let (c1, c2) = raw_pair("c", "0", &header);
+        let (a1, a2) = raw_pair("a", "1", &header);
+        let (b1, b2) = raw_pair("b", "2", &header);
+        let records = [c1, a1, b1, c2, a2, b2]; // all R1s before their R2s → first-appearance = c,a,b
+        let pairs = pair_records_by_read_name(&records);
+        let names: Vec<&[u8]> =
+            pairs.iter().map(|(r1, _)| fgumi_raw_bam::read_name(r1.as_ref())).collect();
+        assert_eq!(
+            names,
+            vec![&b"c"[..], &b"a"[..], &b"b"[..]],
+            "pairs must come back in first-appearance order of R1, not HashMap order"
+        );
     }
 
     #[test]
