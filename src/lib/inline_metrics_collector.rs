@@ -25,6 +25,17 @@
 //! `DOWNSAMPLING_FRACTIONS`/`collectors`/`fraction_template_counts` arrays —
 //! matching how the separate-pass `simplex_metrics`/`duplex_metrics` commands
 //! call them (`simplex_metrics.rs:131-147`, `duplex_metrics.rs:176`).
+//!
+//! **Task 1 (parallel T2 consensus metrics) primitives, also ported ahead of
+//! their caller:** `RunKind`, `BoundaryRun`, `ConsensusMetricsSlot`,
+//! `split_into_runs`, `classify_batch_runs`, and `reassemble_boundary` are
+//! pure, fully-unit-tested order-free building blocks for a later task's
+//! parallel-worker wiring; nothing outside this module's own tests
+//! constructs or calls them yet, so they are dead code to the plain (non-test)
+//! `lib` compilation. The `allow` below is scoped to this module and should be
+//! deleted once that wiring task lands.
+
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -629,6 +640,126 @@ impl MetricsReducer for CoordinateGroupCollector {
     }
 }
 
+/// Which end (if either) of a batch's entry stream a boundary run sits on.
+/// Declared in this order so `as u8` gives `Head=0 < Whole=1 < Tail=2` — the
+/// ordering [`reassemble_boundary`] sorts on within one `batch_serial` so a
+/// `Tail` run always sorts after a `Head`/`Whole` run from the same batch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunKind {
+    Head,
+    Whole,
+    Tail,
+}
+
+/// One batch's first or last (or, if the batch produced a single run, only)
+/// run of contiguous same-`ReadInfoKey` entries, deferred for cross-batch
+/// reassembly because — unlike an interior run — it might continue into an
+/// adjacent batch's boundary run sharing the same key.
+pub(crate) struct BoundaryRun {
+    pub(crate) batch_serial: u64,
+    pub(crate) kind: RunKind,
+    pub(crate) key: ReadInfoKey,
+    pub(crate) templates: Vec<TemplateInfo>,
+}
+
+/// Splits a batch's entries (coordinate-sorted stream order) into maximal
+/// contiguous runs of equal `ReadInfoKey`, preserving order.
+pub(crate) fn split_into_runs(
+    entries: Vec<(TemplateInfo, ReadInfoKey)>,
+) -> Vec<(ReadInfoKey, Vec<TemplateInfo>)> {
+    let mut runs: Vec<(ReadInfoKey, Vec<TemplateInfo>)> = Vec::new();
+    for (info, key) in entries {
+        match runs.last_mut() {
+            Some((k, templates)) if *k == key => templates.push(info),
+            _ => runs.push((key, vec![info])),
+        }
+    }
+    runs
+}
+
+/// Classifies a batch's runs: the first is Head, the last is Tail, a single run
+/// is Whole (open on both ends); everything strictly between is interior (a
+/// complete coordinate group). Returns (interior runs, boundary runs).
+pub(crate) fn classify_batch_runs(
+    batch_serial: u64,
+    runs: Vec<(ReadInfoKey, Vec<TemplateInfo>)>,
+) -> (Vec<(ReadInfoKey, Vec<TemplateInfo>)>, Vec<BoundaryRun>) {
+    let n = runs.len();
+    let mut interior = Vec::new();
+    let mut boundary = Vec::new();
+    for (idx, (key, templates)) in runs.into_iter().enumerate() {
+        let kind = match idx {
+            _ if n == 1 => Some(RunKind::Whole),
+            0 => Some(RunKind::Head),
+            i if i == n - 1 => Some(RunKind::Tail),
+            _ => None,
+        };
+        match kind {
+            Some(kind) => boundary.push(BoundaryRun { batch_serial, kind, key, templates }),
+            None => interior.push((key, templates)),
+        }
+    }
+    (interior, boundary)
+}
+
+/// Restores global stream order over the deferred boundary runs and closes
+/// coordinate groups with the SAME rule the serial `CoordinateGroupCollector`
+/// used: a `Tail` always closes the open group and opens a new one; a
+/// `Head`/`Whole` extends the open group iff its key matches, else flushes and
+/// opens a new one. Returns the reassembled groups in order. Interior runs were
+/// already recorded on the workers and are not present here.
+pub(crate) fn reassemble_boundary(mut boundary: Vec<BoundaryRun>) -> Vec<Vec<TemplateInfo>> {
+    boundary.sort_by_key(|r| (r.batch_serial, r.kind as u8));
+    let mut groups: Vec<Vec<TemplateInfo>> = Vec::new();
+    let mut open: Option<(ReadInfoKey, Vec<TemplateInfo>)> = None;
+    for run in boundary {
+        let extends =
+            !matches!(run.kind, RunKind::Tail) && open.as_ref().is_some_and(|(k, _)| *k == run.key);
+        if extends {
+            open.as_mut().expect("checked Some").1.extend(run.templates);
+        } else {
+            if let Some((_, g)) = open.take() {
+                groups.push(g);
+            }
+            open = Some((run.key, run.templates));
+        }
+    }
+    if let Some((_, g)) = open.take() {
+        groups.push(g);
+    }
+    groups
+}
+
+/// Per-worker slot for the parallel T2 consensus-metrics reduction: pairs an
+/// order-free `ConsensusMetricsAccumulator` (fed by each worker's interior
+/// runs, which need no cross-batch reassembly) with the worker's deferred
+/// boundary runs (which do). `merge` folds two slots' accumulators and
+/// concatenates their boundary runs — global ordering and group-closing is
+/// deferred to [`reassemble_boundary`] at finalize time, not done here.
+pub(crate) struct ConsensusMetricsSlot {
+    pub(crate) acc: ConsensusMetricsAccumulator,
+    pub(crate) boundary: Vec<BoundaryRun>,
+}
+
+impl ConsensusMetricsSlot {
+    pub(crate) fn new_simplex() -> Self {
+        Self { acc: ConsensusMetricsAccumulator::new_simplex(), boundary: Vec::new() }
+    }
+
+    pub(crate) fn new_duplex(collect_duplex_umi_counts: bool) -> Self {
+        Self {
+            acc: ConsensusMetricsAccumulator::new_duplex(collect_duplex_umi_counts),
+            boundary: Vec::new(),
+        }
+    }
+
+    pub(crate) fn merge(&mut self, mut other: Self) -> anyhow::Result<()> {
+        self.acc.merge(other.acc)?;
+        self.boundary.append(&mut other.boundary);
+        Ok(())
+    }
+}
+
 /// Shared `#[cfg(test)]` fixtures, used by both `mod tests` (Task 7's
 /// `ConsensusMetricsAccumulator` tests) and `mod coordinate_group_collector_tests`
 /// below.
@@ -1176,5 +1307,161 @@ mod coordinate_group_collector_tests {
         let acc = acc.as_ref().unwrap();
         assert_eq!(size_1_family_count(acc), 2, "two distinct size-1 families, one per key");
         assert_eq!(size_2_family_count(acc), 0);
+    }
+}
+
+#[cfg(test)]
+mod run_split_tests {
+    use super::*;
+
+    fn entry(mi: &str, ref_index: usize, start: i32) -> (TemplateInfo, ReadInfoKey) {
+        (template(mi, "chr1", start, 1.0), key(ref_index, start))
+    }
+
+    #[test]
+    fn split_empty_is_empty() {
+        assert!(split_into_runs(vec![]).is_empty());
+    }
+
+    #[test]
+    fn split_groups_contiguous_keys_and_splits_on_change() {
+        // K1 K1 K2 K1 -> [K1 K1], [K2], [K1]
+        let runs = split_into_runs(vec![
+            entry("0", 0, 100),
+            entry("1", 0, 100),
+            entry("2", 1, 200),
+            entry("3", 0, 100),
+        ]);
+        assert_eq!(runs.iter().map(|(_, t)| t.len()).collect::<Vec<_>>(), vec![2, 1, 1]);
+        // `ReadInfoKey` has no `Debug` impl, so compare with `assert!` rather
+        // than `assert_eq!` (which requires `Debug` for its failure message).
+        assert!(runs[0].0 == key(0, 100));
+        assert!(runs[1].0 == key(1, 200));
+        assert!(runs[2].0 == key(0, 100));
+    }
+
+    #[test]
+    fn classify_single_run_is_whole_no_interior() {
+        let runs = split_into_runs(vec![entry("0", 0, 100), entry("1", 0, 100)]);
+        let (interior, boundary) = classify_batch_runs(7, runs);
+        assert!(interior.is_empty());
+        assert_eq!(boundary.len(), 1);
+        assert!(matches!(boundary[0].kind, RunKind::Whole));
+        assert_eq!(boundary[0].batch_serial, 7);
+    }
+
+    #[test]
+    fn classify_three_runs_head_interior_tail() {
+        let runs = split_into_runs(vec![
+            entry("0", 0, 100), // head (K@ref0,100)
+            entry("1", 1, 200), // interior (K@ref1,200)
+            entry("2", 2, 300), // tail (K@ref2,300)
+        ]);
+        let (interior, boundary) = classify_batch_runs(3, runs);
+        assert_eq!(interior.len(), 1);
+        // The middle entry ("1", ref_index=1, start=200) builds key(1, 200) via
+        // the `entry` fixture above — not key(2, 200); the brief's snippet used
+        // an illustrative placeholder here. `ReadInfoKey` has no `Debug` impl,
+        // so compare with `assert!` rather than `assert_eq!`.
+        assert!(interior[0].0 == key(1, 200)); // interior is the middle key
+        assert_eq!(boundary.len(), 2);
+        assert!(matches!(boundary[0].kind, RunKind::Head));
+        assert!(matches!(boundary[1].kind, RunKind::Tail));
+    }
+}
+
+#[cfg(test)]
+mod reassemble_boundary_tests {
+    use super::*;
+
+    fn run(batch: u64, kind: RunKind, k: ReadInfoKey, mis: &[&str]) -> BoundaryRun {
+        BoundaryRun {
+            batch_serial: batch,
+            kind,
+            key: k,
+            templates: mis.iter().map(|m| template(m, "chr1", 100, 1.0)).collect(),
+        }
+    }
+
+    #[test]
+    fn k1_k2_k1_in_one_batch_stays_two_groups() {
+        // one batch [Head K1, (interior K2 recorded elsewhere), Tail K1]
+        let groups = reassemble_boundary(vec![
+            run(0, RunKind::Head, key(0, 100), &["a"]),
+            run(0, RunKind::Tail, key(0, 100), &["b"]),
+        ]);
+        assert_eq!(
+            groups.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![1, 1],
+            "Tail must open a new group; the two K1 pieces are distinct groups"
+        );
+    }
+
+    #[test]
+    fn genuine_cross_batch_continuation_merges() {
+        // b0 tail K1 + b1 head K1 = ONE group
+        let groups = reassemble_boundary(vec![
+            run(0, RunKind::Tail, key(0, 100), &["a"]),
+            run(1, RunKind::Head, key(0, 100), &["b"]),
+        ]);
+        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn a_key_spanning_three_batches_is_one_group() {
+        let groups = reassemble_boundary(vec![
+            run(0, RunKind::Tail, key(0, 100), &["a"]),
+            run(1, RunKind::Whole, key(0, 100), &["b", "c"]),
+            run(2, RunKind::Head, key(0, 100), &["d"]),
+        ]);
+        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), vec![4]);
+    }
+
+    #[test]
+    fn distinct_keys_close_separately_and_order_is_restored_from_shuffle() {
+        // Deliberately out of order to prove the (batch_serial, kind) sort.
+        let groups = reassemble_boundary(vec![
+            run(1, RunKind::Head, key(1, 200), &["y"]),
+            run(0, RunKind::Tail, key(0, 100), &["x"]),
+        ]);
+        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 1]);
+    }
+}
+
+#[cfg(test)]
+mod consensus_metrics_slot_tests {
+    use super::*;
+
+    fn size1_cs(acc: &ConsensusMetricsAccumulator) -> usize {
+        let ConsensusMetricsAccumulator::Simplex { collectors, .. } = acc else { panic!() };
+        collectors[19]
+            .family_size_metrics()
+            .iter()
+            .filter(|m| m.family_size == 1)
+            .map(|m| m.cs_count)
+            .sum()
+    }
+
+    #[test]
+    fn merge_folds_acc_and_concatenates_boundary() {
+        let mut a = ConsensusMetricsSlot::new_simplex();
+        a.acc.record_coordinate_group(&[template("0", "chr1", 100, 1.0)], &[]).unwrap();
+        a.boundary.push(BoundaryRun {
+            batch_serial: 0,
+            kind: RunKind::Tail,
+            key: key(0, 200),
+            templates: vec![template("1", "chr1", 200, 1.0)],
+        });
+        let mut b = ConsensusMetricsSlot::new_simplex();
+        b.acc.record_coordinate_group(&[template("2", "chr1", 300, 1.0)], &[]).unwrap();
+        b.boundary.push(BoundaryRun {
+            batch_serial: 1,
+            kind: RunKind::Head,
+            key: key(0, 200),
+            templates: vec![template("3", "chr1", 200, 1.0)],
+        });
+        a.merge(b).unwrap();
+        assert_eq!(size1_cs(&a.acc), 2, "both recorded size-1 families present after merge");
+        assert_eq!(a.boundary.len(), 2, "boundary runs concatenated (ordered at finalize)");
     }
 }
