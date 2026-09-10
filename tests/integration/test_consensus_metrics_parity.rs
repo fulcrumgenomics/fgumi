@@ -1261,3 +1261,81 @@ fn multi_key_batch_straddle_t2_matches_ground_truth() {
         );
     }
 }
+
+// ============================================================================
+// Duplex analogs of the two parallel-T2 correctness anchors above (Task 4):
+// many single-strand `duplex_pair` families at one coordinate key spanning
+// three `GroupByMi` batches, and three distinct coordinate keys whose MI
+// counts straddle those batch boundaries. Same rationale as the simplex
+// cases: only the standalone T2 path re-derives coordinate-group boundaries
+// from a batched MI stream, so these compare T2 against the separate-pass
+// `duplex-metrics` ground truth only.
+// ============================================================================
+
+#[test]
+fn duplex_three_batch_multi_worker_t2_matches_ground_truth() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let header = create_minimal_header("chr1", 10_000);
+    let bam_path = dir.path().join("in.bam");
+
+    let mut records = Vec::new();
+    for f in 0..130 {
+        let umi = format!("{}-{}", indexed_umi(f), indexed_umi(f + 10_000));
+        let (r1, r2) = duplex_pair(&format!("f{f}"), &umi, 100, 10, 200, 10);
+        records.push(r1);
+        records.push(r2);
+    }
+    write_bam(&bam_path, &header, &records);
+
+    let min_reads = [1usize];
+    let (grouped, ground_truth_prefix) =
+        duplex_ground_truth(dir.path(), &bam_path, &min_reads, None);
+    let standalone_prefix =
+        run_duplex_standalone(dir.path(), &grouped, "3batch", Some(8), &min_reads, None);
+
+    for suffix in DUPLEX_SUFFIXES {
+        assert_metrics_file_eq(
+            &standalone_prefix,
+            &ground_truth_prefix,
+            suffix,
+            "duplex T2 (3-batch, 8 workers) vs ground truth",
+        );
+    }
+}
+
+#[test]
+fn duplex_multi_key_batch_straddle_t2_matches_ground_truth() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let header = create_minimal_header("chr1", 10_000);
+    let bam_path = dir.path().join("in.bam");
+
+    let mut records = Vec::new();
+    for k in 0..3 {
+        // Well-separated positions so each `k` forms its own coordinate group.
+        let r1_pos = 100 + i32::try_from(k).expect("k fits i32") * 2000;
+        let r2_pos = r1_pos + 100;
+        for f in 0..MULTI_KEY_FAMILIES_PER_KEY {
+            let idx = k * MULTI_KEY_FAMILIES_PER_KEY + f;
+            let umi = format!("{}-{}", indexed_umi(idx), indexed_umi(idx + 10_000));
+            let (r1, r2) = duplex_pair(&format!("k{k}f{f}"), &umi, r1_pos, 10, r2_pos, 10);
+            records.push(r1);
+            records.push(r2);
+        }
+    }
+    write_bam(&bam_path, &header, &records);
+
+    let min_reads = [1usize];
+    let (grouped, ground_truth_prefix) =
+        duplex_ground_truth(dir.path(), &bam_path, &min_reads, None);
+    let standalone_prefix =
+        run_duplex_standalone(dir.path(), &grouped, "multikey", Some(8), &min_reads, None);
+
+    for suffix in DUPLEX_SUFFIXES {
+        assert_metrics_file_eq(
+            &standalone_prefix,
+            &ground_truth_prefix,
+            suffix,
+            "duplex T2 (multi-key batch straddle, 8 workers) vs ground truth",
+        );
+    }
+}

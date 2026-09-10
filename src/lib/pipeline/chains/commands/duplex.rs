@@ -29,7 +29,7 @@ use crate::commands::common::MethylationRef;
 use crate::commands::consensus_runner::{ConsensusStatsOps, log_overlapping_stats};
 use crate::consensus_caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput};
 use crate::duplex_consensus_caller::DuplexConsensusCaller;
-use crate::inline_metrics_collector::{CoordinateGroupFragment, push_mi_group_entries};
+use crate::inline_metrics_collector::push_mi_group_entries;
 use crate::logging::OperationTimer;
 use crate::mi_group::MiGroup;
 use crate::overlapping_consensus::{
@@ -38,12 +38,11 @@ use crate::overlapping_consensus::{
 };
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::pipeline::chains::FinalizeHook;
-use crate::pipeline::core::outputs::{OrderedBytesTuple2, OrderedBytesTuple3};
+use crate::pipeline::core::outputs::OrderedBytesTuple2;
 use crate::pipeline::core::step::Step;
 use crate::pipeline::steps::group::mi::BatchedMiGroups;
 use crate::pipeline::steps::process::{
-    Process2Output, Process3Output, ProcessWithWorkerState, process_with_worker_state,
-    process2_with_worker_state, process3_with_worker_state,
+    Process2Output, ProcessWithWorkerState, process_with_worker_state, process2_with_worker_state,
 };
 use crate::pipeline::steps::types::DecompressedBlock;
 
@@ -246,6 +245,9 @@ pub(crate) struct DuplexConsensusCaptures {
     /// Threaded onto every `DuplexState`; read only by the metrics-on variants.
     pub(crate) header: Arc<noodles::sam::Header>,
     pub(crate) library_index: Arc<fgumi_bam_io::LibraryIndex>,
+    /// QC captures for the metrics-ON T2 path; `None` on metrics-off/T1
+    /// builds.
+    pub(crate) qc_metrics: Option<Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>>,
 }
 
 /// Per-worker init: build the `DuplexConsensusCaller` (+ optional overlapping
@@ -395,16 +397,31 @@ fn run_duplex_consensus_batch(
 }
 
 /// Metrics-on variant of the per-batch duplex body. Collects one
-/// `(TemplateInfo, ReadInfoKey)` entry per qualifying template across every
-/// family in the batch (before `run_duplex_consensus_batch` consumes the
-/// groups), then delegates the unchanged consensus calling. The metrics-off
-/// build calls `run_duplex_consensus_batch` directly (spec §7.1).
+/// `(TemplateInfo, ReadInfoKey)` entry per qualifying template across **every**
+/// family in the batch — done before `run_duplex_consensus_batch` consumes the
+/// groups, so families the `min_reads` threshold later rejects are still counted
+/// (matching the separate-pass `duplex-metrics` command) — then splits those
+/// entries into maximal same-key runs (`split_into_runs`) and classifies each
+/// run as an interior (whole, complete-within-this-batch) coordinate group or a
+/// batch-boundary run needing cross-batch reassembly (`classify_batch_runs`).
+/// Interior runs are recorded directly into this worker's `ConsensusMetricsSlot`
+/// under a single `with_slot` lock acquisition per batch; boundary runs are
+/// deferred onto the same slot for the finalize hook to reassemble
+/// (`reassemble_boundary`) once every worker has finished. This replaces the
+/// old 3-branch `CoordinateGroupFragment`/serial `MetricsCollectorStep` design:
+/// metrics recording now happens inline in the consensus worker body, so the
+/// step's Outputs shape is unchanged from the metrics-off variant. Delegates
+/// the unchanged consensus calling to `run_duplex_consensus_batch`. Selected
+/// at chain-build time only when this stage's `metrics` field is set
+/// (`add_duplex`); the metrics-off build calls `run_duplex_consensus_batch`
+/// directly, so there is no runtime metrics work on that path (spec §7.1).
 ///
 /// The family is recorded exactly as grouped, before the overlapping-consensus
 /// call inside `run_duplex_consensus_batch` — moot in practice, since
 /// `apply_overlapping_consensus` only rewrites SEQ/QUAL bytes in place and never
 /// touches record count, pairing, POS/CIGAR/MI/RX (so family-size/UMI metrics
 /// are unaffected either way), but ordered this way for clarity.
+#[allow(clippy::too_many_arguments)]
 fn run_duplex_consensus_batch_with_metrics(
     state: &mut DuplexState,
     item: BatchedMiGroups,
@@ -412,38 +429,49 @@ fn run_duplex_consensus_batch_with_metrics(
     overlapping_enabled: bool,
     accumulators: &Arc<PerThreadAccumulator<CollectedDuplexMetrics>>,
     progress: &Arc<AtomicU64>,
-) -> io::Result<(DecompressedBlock, Option<DecompressedBlock>, CoordinateGroupFragment)> {
+    qc: &Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>,
+) -> io::Result<(DecompressedBlock, Option<DecompressedBlock>)> {
     let batch_serial = item.batch_serial;
     let mut metrics_entries = Vec::new();
     for group in &item.groups {
         push_mi_group_entries(group, &state.header, &state.library_index, &mut metrics_entries)
             .map_err(|e| io::Error::other(format!("metrics conversion error: {e:#}")))?;
     }
-    let fragment = CoordinateGroupFragment { batch_serial, entries: metrics_entries };
+    let runs = crate::inline_metrics_collector::split_into_runs(metrics_entries);
+    let (interior, boundary) =
+        crate::inline_metrics_collector::classify_batch_runs(batch_serial, runs);
+    qc.accumulator
+        .with_slot(|slot| -> anyhow::Result<()> {
+            for (_key, templates) in interior {
+                slot.acc.record_coordinate_group(&templates, &qc.intervals)?;
+            }
+            slot.boundary.extend(boundary);
+            Ok(())
+        })
+        .map_err(io::Error::other)?;
 
-    let (consensus, rejects) = run_duplex_consensus_batch(
+    run_duplex_consensus_batch(
         state,
         item,
         track_rejects,
         overlapping_enabled,
         accumulators,
         progress,
-    )?;
-    Ok((consensus, rejects, fragment))
+    )
 }
 
-/// Build the 3-output `DuplexConsensus` step (BOTH `--rejects` and `--metrics`):
-/// branch 0 = consensus, branch 1 = rejects, branch 2 = the inline-metrics
-/// `CoordinateGroupFragment`.
+/// Build the 2-output `DuplexConsensus` step (used when BOTH `--rejects` and
+/// `--metrics` are set): branch 0 = consensus, branch 1 = rejects. Same
+/// Outputs shape as [`build_duplex_consensus_step_with_rejects`] — metrics
+/// are recorded inline into `cap.qc_metrics`'s per-thread accumulator rather
+/// than via an extra output branch. Parallel, `ByItemOrdinal`.
 ///
 /// `pub(crate)` — consumed only by `ChainBuilder::add_duplex`.
 pub(crate) fn build_duplex_consensus_step_with_rejects_and_metrics(
     limit_bytes: u64,
     cap: DuplexConsensusCaptures,
-) -> impl Step<
-    Input = BatchedMiGroups,
-    Outputs = OrderedBytesTuple3<DecompressedBlock, DecompressedBlock, CoordinateGroupFragment>,
-> {
+) -> impl Step<Input = BatchedMiGroups, Outputs = OrderedBytesTuple2<DecompressedBlock, DecompressedBlock>>
+{
     let DuplexConsensusCaptures {
         track_rejects,
         overlapping_enabled,
@@ -464,7 +492,10 @@ pub(crate) fn build_duplex_consensus_step_with_rejects_and_metrics(
         progress,
         header,
         library_index,
+        qc_metrics,
     } = cap;
+    let qc = qc_metrics
+        .expect("build_duplex_consensus_step_with_rejects_and_metrics requires qc_metrics");
 
     let init = make_duplex_consensus_init(
         read_name_prefix,
@@ -487,110 +518,117 @@ pub(crate) fn build_duplex_consensus_step_with_rejects_and_metrics(
     );
     let body = move |state: &mut DuplexState,
                      item: BatchedMiGroups|
-          -> io::Result<
-        Process3Output<DecompressedBlock, DecompressedBlock, CoordinateGroupFragment>,
-    > {
-        let (consensus, rejects, fragment) = run_duplex_consensus_batch_with_metrics(
+          -> io::Result<Process2Output<DecompressedBlock, DecompressedBlock>> {
+        let (consensus, rejects) = run_duplex_consensus_batch_with_metrics(
             state,
             item,
             track_rejects,
             overlapping_enabled,
             &accumulators,
             &progress,
+            &qc,
         )?;
+        // X5-001 dense-serial rule: emit a (zero-byte) rejects block on an
+        // all-clean batch so the rejects branch's reorder stage sees a dense
+        // serial sequence, exactly as the metrics-off rejects builder does.
         let rejects = rejects.unwrap_or(DecompressedBlock {
             batch_serial: consensus.batch_serial,
             bytes: Vec::new(),
         });
-        Ok(Process3Output::both3(consensus, rejects, fragment))
-    };
-
-    process3_with_worker_state::<
-        BatchedMiGroups,
-        DecompressedBlock,
-        DecompressedBlock,
-        CoordinateGroupFragment,
-        DuplexState,
-        _,
-        _,
-    >("DuplexConsensus", limit_bytes, limit_bytes, limit_bytes, init, body)
-}
-
-/// Build the 2-output `DuplexConsensus` step (used when `--metrics` is set but
-/// `--rejects` is not): branch 0 = consensus, branch 1 = the inline-metrics
-/// `CoordinateGroupFragment`.
-///
-/// `pub(crate)` — consumed only by `ChainBuilder::add_duplex`.
-pub(crate) fn build_duplex_consensus_step_metrics(
-    limit_bytes: u64,
-    cap: DuplexConsensusCaptures,
-) -> impl Step<
-    Input = BatchedMiGroups,
-    Outputs = OrderedBytesTuple2<DecompressedBlock, CoordinateGroupFragment>,
-> {
-    let DuplexConsensusCaptures {
-        track_rejects,
-        overlapping_enabled,
-        methylation_ref,
-        methylation_mode,
-        read_name_prefix,
-        read_group_id,
-        min_reads,
-        min_input_base_quality,
-        output_per_base_tags,
-        trim,
-        max_reads_per_strand,
-        error_rate_pre_umi,
-        error_rate_post_umi,
-        tie_rule,
-        cell_tag,
-        accumulators,
-        progress,
-        header,
-        library_index,
-    } = cap;
-
-    let init = make_duplex_consensus_init(
-        read_name_prefix,
-        read_group_id,
-        min_reads,
-        min_input_base_quality,
-        output_per_base_tags,
-        trim,
-        max_reads_per_strand,
-        cell_tag,
-        track_rejects,
-        error_rate_pre_umi,
-        error_rate_post_umi,
-        methylation_ref,
-        methylation_mode,
-        overlapping_enabled,
-        tie_rule,
-        header,
-        library_index,
-    );
-    let body = move |state: &mut DuplexState,
-                     item: BatchedMiGroups|
-          -> io::Result<Process2Output<DecompressedBlock, CoordinateGroupFragment>> {
-        let (consensus, _rejects, fragment) = run_duplex_consensus_batch_with_metrics(
-            state,
-            item,
-            track_rejects,
-            overlapping_enabled,
-            &accumulators,
-            &progress,
-        )?;
-        Ok(Process2Output::both(consensus, fragment))
+        Ok(Process2Output::both(consensus, rejects))
     };
 
     process2_with_worker_state::<
         BatchedMiGroups,
         DecompressedBlock,
-        CoordinateGroupFragment,
+        DecompressedBlock,
         DuplexState,
         _,
         _,
     >("DuplexConsensus", limit_bytes, limit_bytes, init, body)
+}
+
+/// Build the 1-output (kept-only) `DuplexConsensus` step (used when
+/// `--metrics` is set but `--rejects` is not): same Outputs shape as
+/// [`build_duplex_consensus_step_kept_only`] — metrics are recorded inline
+/// into `cap.qc_metrics`'s per-thread accumulator rather than via an extra
+/// output branch.
+///
+/// `pub(crate)` — consumed only by `ChainBuilder::add_duplex`.
+#[allow(clippy::type_complexity)]
+pub(crate) fn build_duplex_consensus_step_metrics(
+    limit_bytes: u64,
+    cap: DuplexConsensusCaptures,
+) -> ProcessWithWorkerState<
+    BatchedMiGroups,
+    DecompressedBlock,
+    impl Fn(&mut DuplexState, BatchedMiGroups) -> io::Result<DecompressedBlock> + Send + Sync + 'static,
+    DuplexState,
+    impl Fn() -> DuplexState + Send + Sync + 'static,
+> {
+    let DuplexConsensusCaptures {
+        track_rejects,
+        overlapping_enabled,
+        methylation_ref,
+        methylation_mode,
+        read_name_prefix,
+        read_group_id,
+        min_reads,
+        min_input_base_quality,
+        output_per_base_tags,
+        trim,
+        max_reads_per_strand,
+        error_rate_pre_umi,
+        error_rate_post_umi,
+        tie_rule,
+        cell_tag,
+        accumulators,
+        progress,
+        header,
+        library_index,
+        qc_metrics,
+    } = cap;
+    let qc = qc_metrics.expect("build_duplex_consensus_step_metrics requires qc_metrics");
+
+    let init = make_duplex_consensus_init(
+        read_name_prefix,
+        read_group_id,
+        min_reads,
+        min_input_base_quality,
+        output_per_base_tags,
+        trim,
+        max_reads_per_strand,
+        cell_tag,
+        track_rejects,
+        error_rate_pre_umi,
+        error_rate_post_umi,
+        methylation_ref,
+        methylation_mode,
+        overlapping_enabled,
+        tie_rule,
+        header,
+        library_index,
+    );
+    let body =
+        move |state: &mut DuplexState, item: BatchedMiGroups| -> io::Result<DecompressedBlock> {
+            let (consensus, _rejects) = run_duplex_consensus_batch_with_metrics(
+                state,
+                item,
+                track_rejects,
+                overlapping_enabled,
+                &accumulators,
+                &progress,
+                &qc,
+            )?;
+            Ok(consensus)
+        };
+
+    process_with_worker_state::<BatchedMiGroups, DecompressedBlock, _, DuplexState, _>(
+        "DuplexConsensus",
+        limit_bytes,
+        init,
+        body,
+    )
 }
 
 /// Build the 2-output `DuplexConsensus` step (used when `--rejects` is set):
@@ -622,6 +660,7 @@ pub(crate) fn build_duplex_consensus_step_with_rejects(
         progress,
         header,
         library_index,
+        qc_metrics: _,
     } = cap;
 
     let init = make_duplex_consensus_init(
@@ -716,6 +755,7 @@ pub(crate) fn build_duplex_consensus_step_kept_only(
         progress,
         header,
         library_index,
+        qc_metrics: _,
     } = cap;
 
     let init = make_duplex_consensus_init(

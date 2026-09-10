@@ -3966,6 +3966,61 @@ impl<'a> ChainBuilder<'a> {
         let header_arc = Arc::new(input_header.clone());
         let library_index_arc = Arc::new(fgumi_bam_io::LibraryIndex::from_header(&input_header));
 
+        // Inline consensus metrics wiring (Task 11) — see add_simplex for the
+        // T1/T2 split. Duplex thresholds: the BA (smaller-strand) threshold is
+        // `min_yx_reads_for`; the AB (larger-strand) threshold is the inline
+        // `min_reads.get(1).unwrap_or(last)` one-liner the caller uses (never
+        // raw `min_reads[1]`/`[2]`). `validate_min_reads` ran above, so both
+        // `.expect(...)`s are infallible here.
+        let last_min_read =
+            *duplex.min_reads.last().expect("validated non-empty by validate_min_reads");
+        let min_ab_reads = duplex.min_reads.get(1).copied().unwrap_or(last_min_read);
+        let min_ba_reads =
+            fgumi_consensus::DuplexConsensusCaller::min_yx_reads_for(&duplex.min_reads)
+                .expect("validated non-empty by validate_min_reads");
+
+        let t1_captures = self.consensus_metrics_captures.take();
+        if let Some(existing) = &t1_captures {
+            self.finalize.push(Box::new(
+                crate::inline_metrics_collector::ConsensusMetricsFinalizeHook {
+                    accumulators: Arc::clone(&existing.accumulator),
+                    output_prefix: existing.output_prefix.clone(),
+                    intervals: existing.intervals.clone(),
+                    thresholds: crate::inline_metrics_collector::MetricsThresholds::Duplex {
+                        min_ab_reads,
+                        min_ba_reads,
+                    },
+                },
+            ));
+        }
+        let metrics_on = t1_captures.is_none() && duplex.metrics.is_some();
+
+        // Build the T2 captures once (only when metrics_on); cloned into
+        // `consensus_cap.qc_metrics` below and shared with the
+        // `ConsensusMetricsFinalizeHook` registered here.
+        let t2_qc = if metrics_on {
+            let captures = Arc::new(build_consensus_metrics_captures(
+                duplex.metrics.as_ref().unwrap(),
+                duplex.intervals.as_ref(),
+                num_threads,
+                || crate::inline_metrics_collector::ConsensusMetricsSlot::new_duplex(false),
+            )?);
+            self.finalize.push(Box::new(
+                crate::inline_metrics_collector::ConsensusMetricsFinalizeHook {
+                    accumulators: Arc::clone(&captures.accumulator),
+                    output_prefix: captures.output_prefix.clone(),
+                    intervals: captures.intervals.clone(),
+                    thresholds: crate::inline_metrics_collector::MetricsThresholds::Duplex {
+                        min_ab_reads,
+                        min_ba_reads,
+                    },
+                },
+            ));
+            Some(captures)
+        } else {
+            None
+        };
+
         let consensus_cap = DuplexConsensusCaptures {
             track_rejects,
             overlapping_enabled,
@@ -3986,6 +4041,7 @@ impl<'a> ChainBuilder<'a> {
             progress: progress_records,
             header: header_arc,
             library_index: library_index_arc,
+            qc_metrics: t2_qc.clone(),
         };
 
         // ── Group-MI preamble: two paths depending on the incoming tail type ──
@@ -4029,60 +4085,13 @@ impl<'a> ChainBuilder<'a> {
             self.pipeline.append_step(group_mi_step, tail)
         };
 
-        // Inline consensus metrics wiring (Task 11) — see add_simplex for the
-        // T1/T2 split. Duplex thresholds: the BA (smaller-strand) threshold is
-        // `min_yx_reads_for`; the AB (larger-strand) threshold is the inline
-        // `min_reads.get(1).unwrap_or(last)` one-liner the caller uses (never
-        // raw `min_reads[1]`/`[2]`). `validate_min_reads` ran above, so both
-        // `.expect(...)`s are infallible here.
-        let last_min_read =
-            *duplex.min_reads.last().expect("validated non-empty by validate_min_reads");
-        let min_ab_reads = duplex.min_reads.get(1).copied().unwrap_or(last_min_read);
-        let min_ba_reads =
-            fgumi_consensus::DuplexConsensusCaller::min_yx_reads_for(&duplex.min_reads)
-                .expect("validated non-empty by validate_min_reads");
-
-        let t1_captures = self.consensus_metrics_captures.take();
-        if let Some(existing) = &t1_captures {
-            self.finalize.push(Box::new(
-                crate::inline_metrics_collector::ConsensusMetricsFinalizeHook {
-                    accumulators: Arc::clone(&existing.accumulator),
-                    output_prefix: existing.output_prefix.clone(),
-                    intervals: existing.intervals.clone(),
-                    thresholds: crate::inline_metrics_collector::MetricsThresholds::Duplex {
-                        min_ab_reads,
-                        min_ba_reads,
-                    },
-                },
-            ));
-        }
-        let metrics_on = t1_captures.is_none() && duplex.metrics.is_some();
-
-        let t2_collector = if metrics_on {
-            let intervals = match duplex.intervals.as_ref() {
-                Some(path) => crate::commands::shared_metrics::parse_intervals(path)?,
-                None => Vec::new(),
-            };
-            let output_prefix = duplex.metrics.as_ref().unwrap().clone();
-            Some(crate::inline_metrics_collector::CoordinateGroupCollector::new(
-                crate::inline_metrics_collector::ConsensusMetricsAccumulator::new_duplex(false),
-                intervals,
-                Box::new(move |merged| {
-                    crate::inline_metrics_collector::write_duplex_metrics_files(
-                        &merged,
-                        &output_prefix,
-                        min_ab_reads,
-                        min_ba_reads,
-                    )
-                }),
-            ))
-        } else {
-            None
-        };
-
-        // Wire the duplex consensus step: one of four monomorphized variants on
-        // the (rejects, metrics) axes; metrics-OFF variants are the existing,
-        // unmodified builders (spec §7.1).
+        // Wire the duplex consensus step. Selects one of four monomorphized
+        // variants on the (rejects, metrics) axes; the metrics-OFF variants are
+        // the existing, unmodified builders (spec §7.1 zero-overhead-when-off).
+        // The metrics-ON variants now have the SAME Outputs shape as their
+        // metrics-OFF siblings — metrics collection happens inside the
+        // consensus worker body, so no extra branch or collector step is
+        // wired here.
         let limit = self.tuning.per_step_byte_limit;
         let rejects_path = duplex.rejects_opts.rejects.as_deref();
         let consensus_branch0 = match (track_rejects, metrics_on) {
@@ -4101,20 +4110,11 @@ impl<'a> ChainBuilder<'a> {
                     build_duplex_consensus_step_with_rejects_and_metrics(limit, consensus_cap);
                 let pt = self.pipeline.append_step(step, tail);
                 self.wire_consensus_rejects_branch(pt, rejects_path, &input_header, "duplex")?;
-                self.pipeline.append_step(
-                    fgumi_pipeline_core::MetricsCollectorStep::new(t2_collector.unwrap()),
-                    (pt.0, BranchIdx(2)),
-                );
                 pt
             }
             (false, true) => {
                 let step = build_duplex_consensus_step_metrics(limit, consensus_cap);
-                let pt = self.pipeline.append_step(step, tail);
-                self.pipeline.append_step(
-                    fgumi_pipeline_core::MetricsCollectorStep::new(t2_collector.unwrap()),
-                    (pt.0, BranchIdx(1)),
-                );
-                pt
+                self.pipeline.append_step(step, tail)
             }
         };
         // Branch 0 = consensus DecompressedBlock. Intermediate appends
