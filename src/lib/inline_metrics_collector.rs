@@ -5,10 +5,12 @@
 //! during the existing streaming pass. See
 //! docs/superpowers/specs/2026-09-08-inline-consensus-metrics-design.md §3-§6.
 //!
-//! **Ported ahead of its caller.** Every item here is `pub(crate)`. Until
-//! Task 8's `Serial` collector step and Task 9's fused T1 accumulator wire
-//! this module in, nothing outside its own tests constructs a
-//! `ConsensusMetricsAccumulator`.
+//! Every item here is `pub(crate)`, consumed by the fused (T1) accumulator in
+//! `add_group` for all three modes and by the standalone (T2) simplex
+//! producer (`run_simplex_consensus_batch_with_metrics` in
+//! `pipeline/chains/commands/simplex.rs`); T2 duplex/codec still go through
+//! the older `CoordinateGroupFragment`/`CoordinateGroupCollector`/
+//! `MetricsCollectorStep` path pending their own migration.
 //!
 //! **Fix round 1 (post-Task-7 review):** the original per-slot design called
 //! `record_simplex_coordinate_group`/`record_duplex_coordinate_group` once
@@ -26,16 +28,13 @@
 //! matching how the separate-pass `simplex_metrics`/`duplex_metrics` commands
 //! call them (`simplex_metrics.rs:131-147`, `duplex_metrics.rs:176`).
 //!
-//! **Task 1 (parallel T2 consensus metrics) primitives, also ported ahead of
-//! their caller:** `RunKind`, `BoundaryRun`, `ConsensusMetricsSlot`,
-//! `split_into_runs`, `classify_batch_runs`, and `reassemble_boundary` are
-//! pure, fully-unit-tested order-free building blocks for a later task's
-//! parallel-worker wiring; nothing outside this module's own tests
-//! constructs or calls them yet, so they are dead code to the plain (non-test)
-//! `lib` compilation. The `allow` below is scoped to this module and should be
-//! deleted once that wiring task lands.
-
-#![allow(dead_code)]
+//! **Parallel T2 consensus metrics primitives:** `RunKind`, `BoundaryRun`,
+//! `ConsensusMetricsSlot`, `split_into_runs`, `classify_batch_runs`, and
+//! `reassemble_boundary` are pure, fully-unit-tested order-free building
+//! blocks for the parallel-worker T2 wiring. `split_into_runs` and
+//! `classify_batch_runs` are called directly by the standalone simplex
+//! producer's per-batch body; `reassemble_boundary` is called by
+//! `ConsensusMetricsFinalizeHook::finalize` for every mode.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

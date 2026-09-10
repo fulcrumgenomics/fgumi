@@ -1212,3 +1212,52 @@ fn three_batch_multi_worker_t2_matches_ground_truth() {
         );
     }
 }
+
+// ============================================================================
+// Multi-key batch-straddle case (parallel T2 producer, Task 3's own
+// correctness anchor): 3 DISTINCT coordinate keys, 40 MI families each (120
+// MI groups total). `GroupByMi`'s 50-MI-group batches (`target_batch_count`)
+// then split this stream into 3 batches (50 + 50 + 20) whose boundaries do
+// NOT align with the coordinate-key boundaries (every 40 groups) — so within
+// a single batch, `split_into_runs`/`classify_batch_runs` sees a Head run
+// (the tail of one key), one or more interior (complete) runs, and a Tail run
+// (the start of the next key), exercising all three run kinds within the same
+// batch as well as across batches. Only the standalone T2 path is exposed to
+// this hazard (see the 3-batch case above), so this compares T2 against
+// ground truth only.
+// ============================================================================
+
+const MULTI_KEY_FAMILIES_PER_KEY: usize = 40;
+
+#[test]
+fn multi_key_batch_straddle_t2_matches_ground_truth() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let header = create_minimal_header("chr1", 10_000);
+    let bam_path = dir.path().join("in.bam");
+
+    let mut records = Vec::new();
+    for k in 0..3 {
+        // Well-separated positions so each `k` forms its own coordinate group.
+        let r1_pos = 100 + i32::try_from(k).expect("k fits i32") * 2000;
+        for f in 0..MULTI_KEY_FAMILIES_PER_KEY {
+            let umi = indexed_umi(k * MULTI_KEY_FAMILIES_PER_KEY + f);
+            let (r1, r2) = simplex_pair(&format!("k{k}f{f}"), &umi, None, r1_pos, 10);
+            records.push(r1);
+            records.push(r2);
+        }
+    }
+    write_bam(&bam_path, &header, &records);
+
+    let (grouped, ground_truth_prefix) = simplex_ground_truth(dir.path(), &bam_path, 1, None);
+    let standalone_prefix =
+        run_simplex_standalone(dir.path(), &grouped, "multikey", Some(8), 1, None);
+
+    for suffix in SIMPLEX_SUFFIXES {
+        assert_metrics_file_eq(
+            &standalone_prefix,
+            &ground_truth_prefix,
+            suffix,
+            "T2 (multi-key batch straddle, 8 workers) vs ground truth",
+        );
+    }
+}

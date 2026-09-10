@@ -1,13 +1,17 @@
-//! Structural chain-shape tests for inline consensus metrics (Task 11, Part F4).
+//! Structural chain-shape tests for inline consensus metrics (Task 11, Part F4;
+//! inverted for the parallel T2 producer, Task 3).
 //!
 //! Spec §7.1's zero-overhead-when-off guarantee is a *chain-build-time* property:
 //! when a consensus stage's `--metrics` field is `None`, the built step graph
 //! must contain **no** `MetricsCollectorStep` (and no extra output branch /
-//! reorder stage feeding one); when it is `Some`, exactly one collector step is
-//! wired onto the extra branch. These tests assert that directly on the built
-//! `Pipeline`'s `dag()` rendering, rather than through a runtime proxy — the
-//! metrics-off path is literally a smaller step graph, built from the existing
-//! unmodified step-factory functions.
+//! reorder stage feeding one). As of Task 3, this now holds for `--metrics`
+//! `Some` too: the standalone (T2) simplex path records metrics inline in the
+//! consensus worker body via a per-thread `ConsensusMetricsSlot` accumulator
+//! instead of fanning out to a serial `MetricsCollectorStep`, so the metrics-on
+//! chain has the SAME step count/shape as metrics-off. These tests assert that
+//! directly on the built `Pipeline`'s `dag()` rendering, rather than through a
+//! runtime proxy — the metrics-on and metrics-off chains are literally the same
+//! step graph, built from the existing unmodified step-factory functions.
 //!
 //! (The black-box output-file companion check — that `--metrics` absent vs.
 //! present changes which files land on disk — lives with the parity suite in
@@ -89,39 +93,45 @@ fn metrics_off_chain_has_no_metrics_collector_step() {
 }
 
 #[test]
-fn metrics_on_chain_wires_exactly_one_metrics_collector_step() {
+fn metrics_on_chain_has_no_serial_collector_step() {
     let dir = TempDir::new().expect("temp dir");
     let prefix = dir.path().join("metrics_prefix");
     let dag = simplex_chain_dag(Some(prefix));
     // Count step-definition lines (`  [N] MetricsCollectorStep ...`), not raw
     // substring hits — `dag()` also names the step as the *consumer* on the
     // reorder branch feeding it (`.0: ... → MetricsCollectorStep`).
+    //
+    // Task 3 (parallel T2 consensus metrics) moved metrics recording inline
+    // into the consensus worker body (a per-thread `ConsensusMetricsSlot`
+    // accumulator), so the built chain no longer wires a serial
+    // `MetricsCollectorStep` at all, on or off.
     let collector_steps = dag
         .lines()
         .filter(|l| l.trim_start().starts_with('[') && l.contains("MetricsCollectorStep"))
         .count();
     assert_eq!(
-        collector_steps, 1,
-        "a --metrics-present simplex chain must wire exactly one MetricsCollectorStep step:\n{dag}"
+        collector_steps, 0,
+        "a --metrics-present simplex chain must wire zero MetricsCollectorStep steps — \
+         metrics are recorded inline in the consensus worker, not via a serial collector:\n{dag}"
     );
 }
 
 #[test]
-fn metrics_on_chain_adds_steps_over_metrics_off() {
+fn metrics_on_chain_has_same_step_count_as_off() {
     let dir = TempDir::new().expect("temp dir");
     let prefix = dir.path().join("metrics_prefix");
     let dag_off = simplex_chain_dag(None);
     let dag_on = simplex_chain_dag(Some(prefix));
 
-    // The metrics-on chain adds the extra CoordinateGroupFragment branch, its
-    // auto-inserted ReorderStage, and the terminal MetricsCollectorStep — so it
-    // has strictly more steps than the metrics-off chain. This is spec §7.1's
-    // "zero steps added when off" stated as a count.
+    // The stronger zero-overhead statement (Task 3): metrics collection now
+    // happens inside the existing consensus worker, adding no extra branch,
+    // no auto-inserted ReorderStage, and no terminal MetricsCollectorStep —
+    // so the metrics-on chain has the SAME step count as metrics-off.
     let steps_off = dag_off.lines().filter(|l| l.trim_start().starts_with('[')).count();
     let steps_on = dag_on.lines().filter(|l| l.trim_start().starts_with('[')).count();
-    assert!(
-        steps_on > steps_off,
-        "metrics-on chain ({steps_on} steps) must have more steps than metrics-off \
+    assert_eq!(
+        steps_on, steps_off,
+        "metrics-on chain ({steps_on} steps) must have the SAME step count as metrics-off \
          ({steps_off} steps)\n--- off ---\n{dag_off}\n--- on ---\n{dag_on}"
     );
 }
