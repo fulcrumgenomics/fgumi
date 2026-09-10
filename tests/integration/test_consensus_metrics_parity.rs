@@ -14,7 +14,7 @@
 //!   (`simplex`/`duplex`/`codec`) with `--metrics=<prefix>`, fed the *same*
 //!   grouped BAM ground truth used above — re-derives coordinate-group
 //!   boundaries itself via `ReadInfoKey`-equality (`split_into_runs`/
-//!   `classify_batch_runs`/`reassemble_boundary`), independently of
+//!   `classify_batch_runs`/`BoundaryReorder`), independently of
 //!   `GroupByPosition`.
 //!
 //! T1 and T2 share the underlying accumulation math (Tasks 5/7's reducer
@@ -1177,7 +1177,7 @@ fn codec_intervals(#[case] picard: bool) {
 // ============================================================================
 // The 3-batch/3-worker case: this task's own correctness anchor for the
 // standalone T2 path's cross-batch boundary-detection mechanism specifically
-// (`split_into_runs`/`classify_batch_runs`/`reassemble_boundary`). One
+// (`split_into_runs`/`classify_batch_runs`/`BoundaryReorder`). One
 // coordinate group with 130 distinct MIs — spanning 3 of `GroupByMi`'s
 // 50-MI-group batches (`DEFAULT_TARGET_BATCH_COUNT = 50`: 50 + 50 + 30) —
 // run at `--threads 8`. Only the *standalone* T2 path is exposed to this

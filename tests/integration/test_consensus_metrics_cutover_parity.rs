@@ -9,11 +9,13 @@
 //! chain/`Pipeline` builder regardless of thread count — metrics are
 //! recorded inline in each worker's consensus body via a per-thread
 //! `ConsensusMetricsSlot` (interior coordinate groups recorded directly;
-//! batch-edge runs deferred as `BoundaryRun`s and reassembled in stream
-//! order by `reassemble_boundary` at finalize) — so this is a pure
-//! worker-count determinism check: 1 worker vs. 8 workers must derive the
-//! identical coordinate-group boundaries and reducer totals for the
-//! standalone (T2) path and the fused (T1) adapter alike.
+//! batch-edge runs deferred as `BoundaryRun`s and closed incrementally by
+//! the shared `BoundaryReorder` as each batch's boundary runs are submitted,
+//! with only the final still-open group drained at finalize via
+//! `BoundaryReorder::finish`) — so this is a pure worker-count determinism
+//! check: 1 worker vs. 8 workers must derive the identical coordinate-group
+//! boundaries and reducer totals for the standalone (T2) path and the fused
+//! (T1) adapter alike.
 //!
 //! Uses a 60-distinct-MI single coordinate group so the run actually spans
 //! `GroupByMi`'s 50-MI-group batch boundary (`DEFAULT_TARGET_BATCH_COUNT`) —

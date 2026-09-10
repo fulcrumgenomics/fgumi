@@ -686,6 +686,18 @@ struct BoundaryReorderState {
     /// (0, 1, or 2 runs: `Whole` alone, or `Head` then `Tail`). An empty
     /// `Vec` is a legitimate entry: a batch with no metrics entries still
     /// occupies — and must still be submitted to advance past — its serial.
+    ///
+    /// Memory bound: `pending` is not locally byte-capped, but it cannot grow
+    /// with stream length. Each T2 consensus producer calls `submit` from
+    /// inside its per-batch closure, which the framework wires through
+    /// `process_with_worker_state` with a byte-bounded output branch
+    /// (`QueueSpec::ByteBounded`) ordered `BranchOrdering::ByItemOrdinal`: a
+    /// worker cannot pop a new input batch until its previous output has been
+    /// accepted downstream, and the downstream reorder holds every output
+    /// until the batch owning `next_serial` arrives. Workers therefore cannot
+    /// race arbitrarily far ahead of the serial holding the prefix closed, so
+    /// `pending` stays O(in-flight batches) = O(worker count x batch size) —
+    /// config-bounded, not O(stream). See spec section 6.4.
     pending: BTreeMap<u64, Vec<BoundaryRun>>,
     /// The one open coordinate group, same shape as the retired
     /// `reassemble_boundary` loop's local `open`.
@@ -782,44 +794,52 @@ impl BoundaryReorderState {
 }
 
 /// Restores global stream order over the deferred boundary runs and closes
-/// coordinate groups, via a fresh [`BoundaryReorder`]: groups `boundary` by
-/// `batch_serial` (preserving each serial's `(kind as u8)` order), submits
-/// every serial from 0 up to the highest one present — filling any gap left
-/// by a fully-empty batch (which contributes no boundary runs at all, see
-/// [`classify_batch_runs`]) with an empty submission so `BoundaryReorder`'s
-/// contiguous-serial contract is met — and appends `finish`'s final open
-/// group. Returns the reassembled groups in order. Interior runs were
-/// already recorded on the workers and are not present here.
+/// coordinate groups, independently of [`BoundaryReorder`]: sorts `boundary`
+/// by `(batch_serial, kind as u8)` — the same global order `BoundaryReorder`
+/// reconstructs incrementally via its `pending` map — then folds the closing
+/// rule over that single sorted pass. Returns the reassembled groups in
+/// order. Interior runs were already recorded on the workers and are not
+/// present here.
 ///
 /// No longer called from production code as of the H3 incremental wiring
 /// (`ConsensusMetricsFinalizeHook::finalize` now closes boundary groups on
 /// workers as batches complete, via `BoundaryReorder::submit`, and drains
 /// only the final open group via `BoundaryReorder::finish` at finalize) —
-/// retained as a from-scratch, one-shot reference implementation of the same
-/// closing rule that `boundary_reorder_tests` fuzzes `BoundaryReorder`
-/// against.
+/// retained, gated `#[cfg_attr(not(test), allow(dead_code))]`, purely for the
+/// `#[cfg(test)]` tests as a from-scratch, one-shot reference implementation
+/// of the same closing rule that `boundary_reorder_tests` fuzzes
+/// `BoundaryReorder` against. It does not call `BoundaryReorder::submit` or
+/// `finish` at all: an independent oracle re-deriving the closing rule from
+/// `BoundaryReorderState::apply`, not the incremental machinery driving
+/// itself.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn reassemble_boundary(boundary: Vec<BoundaryRun>) -> Vec<Vec<TemplateInfo>> {
-    let mut by_serial: BTreeMap<u64, Vec<BoundaryRun>> = BTreeMap::new();
+pub(crate) fn reassemble_boundary(mut boundary: Vec<BoundaryRun>) -> Vec<Vec<TemplateInfo>> {
+    // Restore global stream order — batch serial, then run kind within a batch
+    // (Head < Whole < Tail via `kind as u8`) — and fold the closing rule in a
+    // single pass, WITHOUT `BoundaryReorder`'s incremental submit/pending/drain
+    // machinery. This deliberately re-derives the same closing rule that
+    // `BoundaryReorderState::apply` implements, independently, so the proptest
+    // and example tests comparing `BoundaryReorder` (fed runs in arbitrary
+    // completion order) against this fold are checking the incremental,
+    // out-of-order path against a genuine oracle rather than against itself.
+    // Do NOT refactor the two to share `apply` — the duplication is the point.
+    boundary.sort_by_key(|run| (run.batch_serial, run.kind as u8));
+    let mut groups: Vec<Vec<TemplateInfo>> = Vec::new();
+    let mut open: Option<(ReadInfoKey, Vec<TemplateInfo>)> = None;
     for run in boundary {
-        by_serial.entry(run.batch_serial).or_default().push(run);
+        let extends =
+            !matches!(run.kind, RunKind::Tail) && open.as_ref().is_some_and(|(k, _)| *k == run.key);
+        if extends {
+            open.as_mut().expect("checked Some above").1.extend(run.templates);
+        } else {
+            if let Some((_, group)) = open.take() {
+                groups.push(group);
+            }
+            open = Some((run.key, run.templates));
+        }
     }
-    for runs in by_serial.values_mut() {
-        runs.sort_by_key(|r| r.kind as u8);
-    }
-
-    let Some(max_serial) = by_serial.keys().last().copied() else {
-        return Vec::new();
-    };
-
-    let reorder = BoundaryReorder::new();
-    let mut groups = Vec::new();
-    for serial in 0..=max_serial {
-        let runs = by_serial.remove(&serial).unwrap_or_default();
-        groups.extend(reorder.submit(serial, runs));
-    }
-    if let Some(open) = reorder.finish().expect("every serial 0..=max_serial was submitted above") {
-        groups.push(open);
+    if let Some((_, group)) = open {
+        groups.push(group);
     }
     groups
 }
@@ -830,6 +850,11 @@ pub(crate) fn reassemble_boundary(boundary: Vec<BoundaryRun>) -> Vec<Vec<Templat
 /// the shared `BoundaryReorder` closes while this worker's batch submits
 /// (any worker's slot is a valid destination for a closed group — merges are
 /// commutative and associative, §6.1). `merge` folds two slots' accumulators.
+/// The wrapper previously also carried the per-worker deferred boundary
+/// buffer, removed in the H3 cutover in favor of `BoundaryReorder`; it is
+/// retained as a single-field newtype for the per-worker slot seam — the
+/// home for any future per-worker state — keeping symmetry with the other
+/// `PerThreadAccumulator` slot types.
 pub(crate) struct ConsensusMetricsSlot {
     pub(crate) acc: ConsensusMetricsAccumulator,
 }
