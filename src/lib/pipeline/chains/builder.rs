@@ -1761,8 +1761,16 @@ impl<'a> ChainBuilder<'a> {
         // parallel inflate), or a terminal group/dedup/clip chain (set in
         // add_group/add_dedup/add_clip, so the serial grouping spine overlaps the
         // parallel decompress front). Production-bound chains keep the default
-        // upstream-first scheduler.
-        if self.use_drain_first_scheduler {
+        // upstream-first scheduler. The hidden `--pool-scheduler` override can
+        // force either direction for A/B benchmarking; warn when it does so a
+        // benchmark records that a non-default scheduler ran.
+        let pool_override = self.spec.scheduler.pool_scheduler();
+        if let Some(warning) =
+            pool_scheduler_override_warning(pool_override, self.use_drain_first_scheduler)
+        {
+            log::warn!("{warning}");
+        }
+        if resolve_use_drain_first(pool_override, self.use_drain_first_scheduler) {
             config = config.with_scheduler(std::sync::Arc::new(
                 crate::pipeline::core::runtime::DrainFirstScheduler,
             ));
@@ -5069,6 +5077,51 @@ fn grouping_stage_wants_drain_first(stage: Stage, position: StagePosition) -> bo
     )
 }
 
+/// Resolve the effective drain-first choice from the hidden `--pool-scheduler`
+/// override and the automatic per-chain decision.
+///
+/// `Auto` defers to `auto_wants_drain_first` (the value the `add_*` methods
+/// accumulated); the explicit variants force the choice regardless, so the
+/// drain-first vs upstream-first tuning can be A/B-benchmarked on any command
+/// from a single binary. Pure (no logging) so it can be unit tested; `build`
+/// emits the override warning at the call site.
+fn resolve_use_drain_first(
+    pool_override: crate::commands::common::PoolScheduler,
+    auto_wants_drain_first: bool,
+) -> bool {
+    use crate::commands::common::PoolScheduler;
+    match pool_override {
+        PoolScheduler::Auto => auto_wants_drain_first,
+        PoolScheduler::DrainFirst => true,
+        PoolScheduler::ChainOrder => false,
+    }
+}
+
+/// The warning `build` should log when the hidden `--pool-scheduler` override
+/// forces a dispatch direction *opposite* the automatic per-chain choice, or
+/// `None` when the override defers to (or already agrees with) that choice.
+///
+/// Pure (no logging) so the message selection is unit-testable; `build` logs the
+/// returned message at the call site, mirroring `resolve_use_drain_first`. The
+/// warning exists so a benchmark's log records that a non-default scheduler ran.
+fn pool_scheduler_override_warning(
+    pool_override: crate::commands::common::PoolScheduler,
+    auto_wants_drain_first: bool,
+) -> Option<&'static str> {
+    use crate::commands::common::PoolScheduler;
+    match pool_override {
+        PoolScheduler::DrainFirst if !auto_wants_drain_first => Some(
+            "--pool-scheduler drain-first: forcing downstream-first dispatch \
+             (diagnostic override of the automatic per-chain choice)",
+        ),
+        PoolScheduler::ChainOrder if auto_wants_drain_first => Some(
+            "--pool-scheduler chain-order: forcing upstream-first dispatch \
+             (diagnostic override of the automatic per-chain choice)",
+        ),
+        _ => None,
+    }
+}
+
 /// Uniform "reference dictionary not found" error, shared by the zipper source
 /// open (`open_source`) and `add_align`, so both dict-resolution sites report
 /// the same actionable message (which paths were tried + the `samtools dict`
@@ -5089,6 +5142,7 @@ fn dict_not_found_error(reference: &std::path::Path) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::common::PoolScheduler;
 
     /// A `ChainSpec` with the given stages and every other field at its
     /// simplest valid default. Mirrors `validate::tests::empty_spec` — kept as
@@ -5267,6 +5321,69 @@ mod tests {
             grouping_stage_wants_drain_first(stage, position),
             expected,
             "{stage:?} at {position:?}: drain-first opt-in mismatch"
+        );
+    }
+
+    /// Pin the hidden `--pool-scheduler` override resolution: `Auto` defers to
+    /// the automatic per-chain decision, while `DrainFirst`/`ChainOrder` force
+    /// their direction regardless of it. This is the A/B knob's whole contract,
+    /// and it is invisible to output-comparing tests (the scheduler never changes
+    /// records), so it is pinned directly against `resolve_use_drain_first`.
+    #[rstest::rstest]
+    #[case::auto_defers_to_true(PoolScheduler::Auto, true, true)]
+    #[case::auto_defers_to_false(PoolScheduler::Auto, false, false)]
+    #[case::force_drain_first_over_auto_off(PoolScheduler::DrainFirst, false, true)]
+    #[case::force_drain_first_over_auto_on(PoolScheduler::DrainFirst, true, true)]
+    #[case::force_chain_order_over_auto_on(PoolScheduler::ChainOrder, true, false)]
+    #[case::force_chain_order_over_auto_off(PoolScheduler::ChainOrder, false, false)]
+    fn resolve_use_drain_first_matrix(
+        #[case] pool_override: PoolScheduler,
+        #[case] auto_wants_drain_first: bool,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            resolve_use_drain_first(pool_override, auto_wants_drain_first),
+            expected,
+            "{pool_override:?} over auto={auto_wants_drain_first}: resolution mismatch"
+        );
+    }
+
+    /// Pin the override warning `build` logs: a warning is emitted only when the
+    /// `--pool-scheduler` override forces a direction *opposite* the automatic
+    /// per-chain choice (drain-first over an upstream-first auto, or chain-order
+    /// over a drain-first auto). `Auto`, and an override that already agrees with
+    /// the automatic choice, warn nothing — so a benchmark log flags only the
+    /// runs where the knob actually changed the scheduler.
+    #[rstest::rstest]
+    #[case::auto_never_warns_off(PoolScheduler::Auto, false, None)]
+    #[case::auto_never_warns_on(PoolScheduler::Auto, true, None)]
+    #[case::drain_first_forces_over_auto_off(
+        PoolScheduler::DrainFirst,
+        false,
+        Some(
+            "--pool-scheduler drain-first: forcing downstream-first dispatch \
+              (diagnostic override of the automatic per-chain choice)"
+        )
+    )]
+    #[case::drain_first_agrees_with_auto_on(PoolScheduler::DrainFirst, true, None)]
+    #[case::chain_order_forces_over_auto_on(
+        PoolScheduler::ChainOrder,
+        true,
+        Some(
+            "--pool-scheduler chain-order: forcing upstream-first dispatch \
+              (diagnostic override of the automatic per-chain choice)"
+        )
+    )]
+    #[case::chain_order_agrees_with_auto_off(PoolScheduler::ChainOrder, false, None)]
+    fn pool_scheduler_override_warning_matrix(
+        #[case] pool_override: PoolScheduler,
+        #[case] auto_wants_drain_first: bool,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(
+            pool_scheduler_override_warning(pool_override, auto_wants_drain_first),
+            expected,
+            "{pool_override:?} over auto={auto_wants_drain_first}: warning mismatch"
         );
     }
 
