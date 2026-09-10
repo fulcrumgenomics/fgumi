@@ -6,12 +6,14 @@
 //! `--threads` values and assert the metrics output is byte-for-byte
 //! identical. Unlike `copy-umi`'s serial-oracle-vs-chain-builder split,
 //! `simplex`/`duplex`/`codec` route every invocation through the same
-//! chain/`Pipeline` builder regardless of thread count (Task 8's
-//! `CoordinateGroupCollector` is wired in as a step, not a separate serial
-//! engine) — so this is a pure worker-count determinism check: 1 worker vs.
-//! 8 workers must derive the identical coordinate-group boundaries and
-//! reducer totals from Task 8's `CoordinateGroupCollector` (T2) and Task 11's
-//! T1 fused adapter alike.
+//! chain/`Pipeline` builder regardless of thread count — metrics are
+//! recorded inline in each worker's consensus body via a per-thread
+//! `ConsensusMetricsSlot` (interior coordinate groups recorded directly;
+//! batch-edge runs deferred as `BoundaryRun`s and reassembled in stream
+//! order by `reassemble_boundary` at finalize) — so this is a pure
+//! worker-count determinism check: 1 worker vs. 8 workers must derive the
+//! identical coordinate-group boundaries and reducer totals for the
+//! standalone (T2) path and the fused (T1) adapter alike.
 //!
 //! Uses a 60-distinct-MI single coordinate group so the run actually spans
 //! `GroupByMi`'s 50-MI-group batch boundary (`DEFAULT_TARGET_BATCH_COUNT`) —

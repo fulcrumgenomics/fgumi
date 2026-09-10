@@ -1,18 +1,27 @@
 //! Inline consensus-metrics accumulator: the per-worker state fed by the
-//! fused (T1, Task 9) and standalone (T2, Task 8) adapters to compute the
-//! same CS/SS/DS family-size, UMI, and downsampling-yield metrics the
-//! separate-pass simplex-metrics/duplex-metrics commands compute, inline,
-//! during the existing streaming pass. See
+//! fused (T1) and standalone (T2) adapters to compute the same CS/SS/DS
+//! family-size, UMI, and downsampling-yield metrics the separate-pass
+//! simplex-metrics/duplex-metrics commands compute, inline, during the
+//! existing streaming pass. See
 //! docs/superpowers/specs/2026-09-08-inline-consensus-metrics-design.md §3-§6.
 //!
 //! Every item here is `pub(crate)`, consumed by the fused (T1) accumulator in
 //! `add_group` for all three modes and by the standalone (T2) simplex,
 //! duplex, and codec producers (`run_{simplex,duplex,codec}_consensus_batch_with_metrics`
-//! in `pipeline/chains/commands/{simplex,duplex,codec}.rs`). The earlier
-//! `CoordinateGroupFragment`/`CoordinateGroupCollector`/`MetricsCollectorStep`
-//! serial-collector design (a third output branch reordered and reduced by a
-//! dedicated pipeline step) has been fully retired now that all three modes
-//! record metrics inline in the consensus worker body.
+//! in `pipeline/chains/commands/{simplex,duplex,codec}.rs`). Both paths now
+//! record metrics fully in parallel, sharded across worker threads via
+//! `PerThreadAccumulator<ConsensusMetricsSlot>`: T1's fused tap calls
+//! `record_coordinate_group` directly on each worker, since its coordinate
+//! groups are always complete and never split across a batch boundary; T2's
+//! producers split each batch's entries into same-key runs
+//! (`split_into_runs`/`classify_batch_runs`), record interior (fully-within-
+//! one-batch) runs directly, and defer the first/last run of each batch as a
+//! `BoundaryRun` for `reassemble_boundary` to fold back into stream order at
+//! finalize. The earlier `CoordinateGroupFragment`/`CoordinateGroupCollector`/
+//! `MetricsCollectorStep` serial-collector design — a third output branch
+//! reordered and reduced, single-threaded, by a dedicated pipeline step after
+//! the fact — has been fully retired: every mode now records metrics inline
+//! in the consensus worker body, in parallel with consensus calling itself.
 //!
 //! **Fix round 1 (post-Task-7 review):** the original per-slot design called
 //! `record_simplex_coordinate_group`/`record_duplex_coordinate_group` once
@@ -34,9 +43,9 @@
 //! `ConsensusMetricsSlot`, `split_into_runs`, `classify_batch_runs`, and
 //! `reassemble_boundary` are pure, fully-unit-tested order-free building
 //! blocks for the parallel-worker T2 wiring. `split_into_runs` and
-//! `classify_batch_runs` are called directly by the standalone simplex
-//! producer's per-batch body; `reassemble_boundary` is called by
-//! `ConsensusMetricsFinalizeHook::finalize` for every mode.
+//! `classify_batch_runs` are called directly by the standalone simplex,
+//! duplex, and codec producers' per-batch bodies; `reassemble_boundary` is
+//! called by `ConsensusMetricsFinalizeHook::finalize` for every mode.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -60,9 +69,9 @@ use fgumi_metrics::simplex::SimplexMetricsCollector;
 use fgumi_raw_bam::{RawRecord, flags as raw_flags};
 
 /// Accumulator state for one consensus stage's inline metrics. Shared by T1
-/// (wrapped in `PerThreadAccumulator`, N sharded instances folded via
-/// `merge()`) and T2 (a single un-sharded instance owned directly by the
-/// `Serial` collector step, Task 8 — `merge()` is never called on that path).
+/// and T2 alike: both wrap it (inside a [`ConsensusMetricsSlot`]) in a
+/// `PerThreadAccumulator`, N sharded instances (one per worker) folded via
+/// `merge()` in `ConsensusMetricsFinalizeHook::finalize`.
 ///
 /// One variant per mode, each holding a homogeneous 20-element array (one
 /// slot per `DOWNSAMPLING_FRACTIONS` entry) so the shared reducer functions
@@ -181,9 +190,10 @@ impl ConsensusMetricsAccumulator {
     }
 
     /// Folds `other` into `self` by zipping and merging the 20 per-fraction
-    /// collectors (and per-fraction template counts) pairwise. **T1 only** —
-    /// T2's `Serial` collector step (Task 8) owns exactly one instance and
-    /// never calls this.
+    /// collectors (and per-fraction template counts) pairwise. Called by both
+    /// T1 and T2's `ConsensusMetricsFinalizeHook::finalize` to fold every
+    /// worker's per-thread accumulator into one before writing the metrics
+    /// files.
     ///
     /// The `duplex_umi_counts` flag is left untouched — like
     /// `DuplexMetricsCollector::merge`'s `collect_duplex_umi_counts` field
@@ -227,11 +237,15 @@ impl ConsensusMetricsAccumulator {
     }
 }
 
-/// Bundles everything T1's (fused/runall) inline-metrics accumulator needs
-/// across its lifetime. Constructed once, by `add_group`, whenever a
-/// downstream consensus stage's `metrics` field is set — Task 11. **T1
-/// only** — T2 (standalone) has no equivalent captures type; its `Serial`
-/// collector step (Task 8) owns its accumulator directly.
+/// Bundles everything a consensus stage's inline-metrics accumulator needs
+/// across its lifetime. Shared by both paths: `add_group` constructs one for
+/// the fused (T1) case whenever a downstream consensus stage's `metrics`
+/// field is set, so `add_simplex`/`add_duplex`/`add_codec` reuse the SAME
+/// accumulator `Arc` the T1 tap closure already writes into; `add_simplex`/
+/// `add_duplex`/`add_codec` construct their own (via
+/// `build_consensus_metrics_captures`) for the standalone (T2) case, whose
+/// per-batch producers record into it directly via
+/// `split_into_runs`/`classify_batch_runs`.
 pub(crate) struct ConsensusMetricsCaptures {
     pub(crate) accumulator: Arc<PerThreadAccumulator<ConsensusMetricsSlot>>,
     pub(crate) intervals: Vec<Interval>,
@@ -248,12 +262,15 @@ pub(crate) enum MetricsThresholds {
     Duplex { min_ab_reads: usize, min_ba_reads: usize },
 }
 
-/// **T1 only.** Finalize hook: merges every `PerThreadAccumulator` slot's
-/// accumulator into one, then writes the same file set the separate-pass
-/// simplex-metrics/duplex-metrics commands write. T2 has no equivalent hook
-/// — its collector step (Task 8) owns one un-sharded accumulator directly
-/// and calls these same writer functions from its own `on_finish` callback
-/// (Task 11), with no fold step (there is nothing to merge).
+/// Finalize hook shared by T1 and T2 alike: merges every `PerThreadAccumulator`
+/// slot's `ConsensusMetricsSlot` into one — folding each worker's
+/// `ConsensusMetricsAccumulator` via `merge` and reassembling each worker's
+/// deferred `BoundaryRun`s via [`reassemble_boundary`] — then writes the same
+/// file set the separate-pass simplex-metrics/duplex-metrics commands write.
+/// T1's fused tap always calls `record_coordinate_group` directly (its
+/// coordinate groups are never split across a batch boundary), so its
+/// `boundary` list is always empty and the reassembly step is a no-op for
+/// that path — the same hook handles both cases uniformly.
 pub(crate) struct ConsensusMetricsFinalizeHook {
     pub(crate) accumulators: Arc<PerThreadAccumulator<ConsensusMetricsSlot>>,
     pub(crate) output_prefix: PathBuf,
@@ -1141,6 +1158,74 @@ mod reassemble_boundary_tests {
             run(0, RunKind::Tail, key(0, 100), &["x"]),
         ]);
         assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 1]);
+    }
+
+    /// Extracts each group's template MIs, in order, for content comparison
+    /// (`TemplateInfo` has no `PartialEq`/`Debug` impl, so groups can't be
+    /// `assert_eq!`'d directly — the `mi` field is a unique, human-readable
+    /// stand-in for full template identity).
+    fn group_mis(groups: &[Vec<TemplateInfo>]) -> Vec<Vec<&str>> {
+        groups.iter().map(|g| g.iter().map(|t| t.mi.as_str()).collect()).collect()
+    }
+
+    /// Sharper complement to
+    /// `distinct_keys_close_separately_and_order_is_restored_from_shuffle`:
+    /// that test only asserts group *sizes* match across a shuffle of two
+    /// non-merging runs. This test builds a single richer multiset of six
+    /// `BoundaryRun`s spanning four batches — one immediate-close `Whole`, an
+    /// unmatched `Head` that closes the prior group, a `Head` that DOES merge
+    /// into a same-key `Tail` from an earlier batch, and a `Whole` that
+    /// merges into a same-key `Tail` — in two completely different `Vec`
+    /// orders (forward-built vs. reversed), and asserts `reassemble_boundary`
+    /// returns byte-identical output (same group count, same per-group size,
+    /// same per-group membership in the same order) from both, not merely
+    /// same sizes. Because every run here has a distinct `(batch_serial,
+    /// kind)` pair, the `(batch_serial, kind)` sort key fully determines
+    /// processing order regardless of input order, which is exactly the
+    /// determinism `reassemble_boundary` must guarantee against
+    /// slot-merge/thread-scheduling-dependent collection order.
+    #[test]
+    fn two_full_orderings_of_the_same_boundary_runs_produce_identical_output() {
+        let build = || {
+            vec![
+                run(0, RunKind::Whole, key(0, 100), &["a"]),
+                run(1, RunKind::Head, key(1, 200), &["b1"]),
+                run(1, RunKind::Tail, key(2, 300), &["c1"]),
+                run(2, RunKind::Head, key(2, 300), &["c2"]),
+                run(2, RunKind::Tail, key(3, 400), &["d1"]),
+                run(3, RunKind::Whole, key(3, 400), &["d2"]),
+            ]
+        };
+
+        let forward = build();
+        let mut reversed = build();
+        reversed.reverse();
+        // Confirm the two input orderings are genuinely different, so a pass
+        // below is not vacuous.
+        assert_ne!(
+            forward.iter().map(|r| (r.batch_serial, r.kind as u8)).collect::<Vec<_>>(),
+            reversed.iter().map(|r| (r.batch_serial, r.kind as u8)).collect::<Vec<_>>(),
+        );
+
+        let groups_forward = reassemble_boundary(forward);
+        let groups_reversed = reassemble_boundary(reversed);
+
+        let expected = vec![vec!["a"], vec!["b1"], vec!["c1", "c2"], vec!["d1", "d2"]];
+        assert_eq!(
+            group_mis(&groups_forward),
+            expected,
+            "forward-ordered input must reassemble to the expected groups"
+        );
+        assert_eq!(
+            group_mis(&groups_reversed),
+            expected,
+            "reversed-ordered input must reassemble to the SAME expected groups"
+        );
+        assert_eq!(
+            group_mis(&groups_forward),
+            group_mis(&groups_reversed),
+            "reassembly must be independent of the collection order of the same boundary runs"
+        );
     }
 }
 
