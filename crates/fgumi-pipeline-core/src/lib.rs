@@ -24,7 +24,6 @@ pub mod header;
 pub mod held;
 pub mod item;
 pub mod liveness;
-pub mod metrics_collector;
 pub mod outputs;
 pub mod queues;
 pub mod reorder;
@@ -50,7 +49,6 @@ pub use header::{AlreadySetError, HeaderHandle};
 pub use held::HeldSlot;
 pub use item::{HeapSize, Ordered};
 pub use liveness::LivenessCounter;
-pub use metrics_collector::{MetricsCollectorStep, MetricsReducer};
 pub use outputs::{
     MAX_ARITY, OrderedBytesSingle, OrderedBytesTuple2, OrderedBytesTuple3, Single, StepOutputs,
 };

@@ -13,8 +13,9 @@
 //! - **T2 (standalone)**: the standalone unified consensus command
 //!   (`simplex`/`duplex`/`codec`) with `--metrics=<prefix>`, fed the *same*
 //!   grouped BAM ground truth used above — re-derives coordinate-group
-//!   boundaries itself via `ReadInfoKey`-equality in
-//!   `CoordinateGroupCollector` (Task 8), independently of `GroupByPosition`.
+//!   boundaries itself via `ReadInfoKey`-equality (`split_into_runs`/
+//!   `classify_batch_runs`/`reassemble_boundary`), independently of
+//!   `GroupByPosition`.
 //!
 //! T1 and T2 share the underlying accumulation math (Tasks 5/7's reducer
 //! functions), so any divergence from ground truth — or between T1 and T2 —
@@ -294,8 +295,9 @@ enum Shape {
     /// MIs, well under `GroupByMi::DEFAULT_TARGET_BATCH_COUNT` (50).
     ManyMis,
     /// One coordinate group whose MI count straddles the 50-MI batch
-    /// boundary `GroupByMi` (Task 8's `CoordinateGroupCollector`) packages
-    /// completed groups into.
+    /// boundary `GroupByMi` packages completed groups into (exercising the
+    /// standalone T2 path's `split_into_runs`/`classify_batch_runs`
+    /// batch-boundary handling).
     StraddleBatch,
 }
 
@@ -1174,8 +1176,8 @@ fn codec_intervals(#[case] picard: bool) {
 
 // ============================================================================
 // The 3-batch/3-worker case: this task's own correctness anchor for the
-// `CoordinateGroupCollector`'s boundary-detection mechanism specifically
-// (Task 8's `CoordinateGroupFragment`/`CoordinateGroupCollector`). One
+// standalone T2 path's cross-batch boundary-detection mechanism specifically
+// (`split_into_runs`/`classify_batch_runs`/`reassemble_boundary`). One
 // coordinate group with 130 distinct MIs — spanning 3 of `GroupByMi`'s
 // 50-MI-group batches (`DEFAULT_TARGET_BATCH_COUNT = 50`: 50 + 50 + 30) —
 // run at `--threads 8`. Only the *standalone* T2 path is exposed to this
@@ -1336,6 +1338,80 @@ fn duplex_multi_key_batch_straddle_t2_matches_ground_truth() {
             &ground_truth_prefix,
             suffix,
             "duplex T2 (multi-key batch straddle, 8 workers) vs ground truth",
+        );
+    }
+}
+
+// ============================================================================
+// Codec analogs of the two parallel-T2 correctness anchors above (Task 5):
+// many single-strand `duplex_pair` families at one coordinate key spanning
+// three `GroupByMi` batches, and three distinct coordinate keys whose MI
+// counts straddle those batch boundaries. Same rationale as the simplex/duplex
+// cases: only the standalone T2 path re-derives coordinate-group boundaries
+// from a batched MI stream, so these compare T2 against the separate-pass
+// `duplex-metrics` ground truth only (codec shares the duplex-shaped metrics
+// files, see `codec_ground_truth`/`DUPLEX_SUFFIXES` above).
+// ============================================================================
+
+#[test]
+fn codec_three_batch_multi_worker_t2_matches_ground_truth() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let header = create_minimal_header("chr1", 10_000);
+    let bam_path = dir.path().join("in.bam");
+
+    let mut records = Vec::new();
+    for f in 0..130 {
+        let umi = format!("{}-{}", indexed_umi(f), indexed_umi(f + 10_000));
+        let (r1, r2) = duplex_pair(&format!("f{f}"), &umi, 100, 10, 200, 10);
+        records.push(r1);
+        records.push(r2);
+    }
+    write_bam(&bam_path, &header, &records);
+
+    let (grouped, ground_truth_prefix) = codec_ground_truth(dir.path(), &bam_path, 1, None);
+    let standalone_prefix = run_codec_standalone(dir.path(), &grouped, "3batch", Some(8), 1, None);
+
+    for suffix in DUPLEX_SUFFIXES {
+        assert_metrics_file_eq(
+            &standalone_prefix,
+            &ground_truth_prefix,
+            suffix,
+            "codec T2 (3-batch, 8 workers) vs ground truth",
+        );
+    }
+}
+
+#[test]
+fn codec_multi_key_batch_straddle_t2_matches_ground_truth() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let header = create_minimal_header("chr1", 10_000);
+    let bam_path = dir.path().join("in.bam");
+
+    let mut records = Vec::new();
+    for k in 0..3 {
+        // Well-separated positions so each `k` forms its own coordinate group.
+        let r1_pos = 100 + i32::try_from(k).expect("k fits i32") * 2000;
+        let r2_pos = r1_pos + 100;
+        for f in 0..MULTI_KEY_FAMILIES_PER_KEY {
+            let idx = k * MULTI_KEY_FAMILIES_PER_KEY + f;
+            let umi = format!("{}-{}", indexed_umi(idx), indexed_umi(idx + 10_000));
+            let (r1, r2) = duplex_pair(&format!("k{k}f{f}"), &umi, r1_pos, 10, r2_pos, 10);
+            records.push(r1);
+            records.push(r2);
+        }
+    }
+    write_bam(&bam_path, &header, &records);
+
+    let (grouped, ground_truth_prefix) = codec_ground_truth(dir.path(), &bam_path, 1, None);
+    let standalone_prefix =
+        run_codec_standalone(dir.path(), &grouped, "multikey", Some(8), 1, None);
+
+    for suffix in DUPLEX_SUFFIXES {
+        assert_metrics_file_eq(
+            &standalone_prefix,
+            &ground_truth_prefix,
+            suffix,
+            "codec T2 (multi-key batch straddle, 8 workers) vs ground truth",
         );
     }
 }
