@@ -47,6 +47,7 @@
 //! duplex, and codec producers' per-batch bodies; `reassemble_boundary` is
 //! called by `ConsensusMetricsFinalizeHook::finalize` for every mode.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -67,6 +68,7 @@ use fgumi_metrics::duplex::DuplexMetricsCollector;
 use fgumi_metrics::simplex::SimplexMetricsCollector;
 use fgumi_raw_bam::{RawRecord, flags as raw_flags};
 use indexmap::IndexMap;
+use parking_lot::Mutex;
 
 /// Accumulator state for one consensus stage's inline metrics. Shared by T1
 /// and T2 alike: both wrap it (inside a [`ConsensusMetricsSlot`]) in a
@@ -614,30 +616,159 @@ pub(crate) fn classify_batch_runs(
     (interior, boundary)
 }
 
-/// Restores global stream order over the deferred boundary runs and closes
-/// coordinate groups with the SAME rule the retired serial collector used:
-/// a `Tail` always closes the open group and opens a new one; a
-/// `Head`/`Whole` extends the open group iff its key matches, else flushes and
-/// opens a new one. Returns the reassembled groups in order. Interior runs were
-/// already recorded on the workers and are not present here.
-pub(crate) fn reassemble_boundary(mut boundary: Vec<BoundaryRun>) -> Vec<Vec<TemplateInfo>> {
-    boundary.sort_by_key(|r| (r.batch_serial, r.kind as u8));
-    let mut groups: Vec<Vec<TemplateInfo>> = Vec::new();
-    let mut open: Option<(ReadInfoKey, Vec<TemplateInfo>)> = None;
-    for run in boundary {
-        let extends =
-            !matches!(run.kind, RunKind::Tail) && open.as_ref().is_some_and(|(k, _)| *k == run.key);
-        if extends {
-            open.as_mut().expect("checked Some").1.extend(run.templates);
-        } else {
-            if let Some((_, g)) = open.take() {
-                groups.push(g);
-            }
-            open = Some((run.key, run.templates));
+/// Incrementally closes boundary coordinate groups as the batch-serial prefix
+/// becomes contiguous, instead of buffering every boundary run until
+/// finalize. Applies the SAME closing rule the retired serial collector (and
+/// [`reassemble_boundary`], which is now expressed in terms of this type)
+/// used: a `Tail` always closes the open group and opens a new one; a
+/// `Head`/`Whole` extends the open group iff its key matches, else flushes
+/// and opens a new one.
+///
+/// Wired into `ConsensusMetricsCaptures` (one shared instance per T2
+/// producer invocation, alongside `accumulator`) in Task 3, so that a
+/// worker can record a closed group into its own accumulator slot as soon as
+/// it closes rather than at finalize. See design spec
+/// `docs/superpowers/specs/2026-09-09-incremental-per-key-metrics-design.md`
+/// §6.2/§6.3.
+///
+/// `submit` takes an internal mutex per call, so producers on different
+/// worker threads may submit their batches concurrently, in any completion
+/// order — the `BTreeMap` in [`BoundaryReorderState`] restores the
+/// batch-serial order that matters for closing groups correctly.
+pub(crate) struct BoundaryReorder {
+    inner: Mutex<BoundaryReorderState>,
+}
+
+/// [`BoundaryReorder`]'s mutex-guarded state.
+struct BoundaryReorderState {
+    /// Lowest batch serial not yet applied to `open`. Starts at 0; batch
+    /// serials are a contiguous ordinal assigned to every batch (including
+    /// ones with zero metrics entries), so this is exactly the count of
+    /// serials applied so far.
+    next_serial: u64,
+    /// Batches that completed ahead of `next_serial`, keyed by serial. Each
+    /// value is that batch's boundary runs, already in `(kind as u8)` order
+    /// (0, 1, or 2 runs: `Whole` alone, or `Head` then `Tail`). An empty
+    /// `Vec` is a legitimate entry: a batch with no metrics entries still
+    /// occupies — and must still be submitted to advance past — its serial.
+    pending: BTreeMap<u64, Vec<BoundaryRun>>,
+    /// The one open coordinate group, same shape as the retired
+    /// `reassemble_boundary` loop's local `open`.
+    open: Option<(ReadInfoKey, Vec<TemplateInfo>)>,
+}
+
+impl BoundaryReorder {
+    /// A fresh reorder: next expected serial is 0, nothing pending or open.
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Mutex::new(BoundaryReorderState {
+                next_serial: 0,
+                pending: BTreeMap::new(),
+                open: None,
+            }),
         }
     }
-    if let Some((_, g)) = open.take() {
-        groups.push(g);
+
+    /// Submits batch `serial`'s boundary `runs` (already in `(kind as u8)`
+    /// order), then applies every contiguous run of submitted serials
+    /// starting at the lowest not-yet-applied one, in ascending order.
+    /// Returns whichever coordinate groups that draining closed — empty if
+    /// `serial` left a gap before it (its runs are simply parked in
+    /// `pending` until the gap is filled) or if the applied runs never
+    /// closed a group. `runs` may legitimately be empty: a batch with no
+    /// metrics entries still occupies its serial slot and must still be
+    /// submitted so a later serial can drain past it.
+    pub(crate) fn submit(&self, serial: u64, runs: Vec<BoundaryRun>) -> Vec<Vec<TemplateInfo>> {
+        let mut st = self.inner.lock();
+        st.pending.insert(serial, runs);
+        let mut closed = Vec::new();
+        loop {
+            let next_serial = st.next_serial;
+            let Some(runs) = st.pending.remove(&next_serial) else {
+                break;
+            };
+            for run in runs {
+                st.apply(run, &mut closed);
+            }
+            st.next_serial += 1;
+        }
+        closed
+    }
+
+    /// Consumes the reorder, returning the final open coordinate group (or
+    /// `None` if nothing was ever open). Errors if any batch serial was
+    /// never submitted: a non-empty `pending` at this point means at least
+    /// one later serial's runs are still stuck behind a gap, which is a
+    /// caller bug — every batch's boundary runs (even an empty `Vec`) must be
+    /// submitted, in order for `next_serial` to ever reach it.
+    pub(crate) fn finish(self) -> anyhow::Result<Option<Vec<TemplateInfo>>> {
+        let st = self.inner.into_inner();
+        if !st.pending.is_empty() {
+            // `next_serial` is, by definition, the lowest serial not yet
+            // applied — so if anything is still in `pending`, `next_serial`
+            // itself is exactly the smallest serial that was never
+            // submitted (later serials in `pending` are merely stuck behind
+            // it, not themselves missing).
+            anyhow::bail!(
+                "BoundaryReorder::finish: batch serial {} was never submitted \
+                 ({} later batch(es) stuck behind it in `pending`)",
+                st.next_serial,
+                st.pending.len(),
+            );
+        }
+        Ok(st.open.map(|(_, templates)| templates))
+    }
+}
+
+impl BoundaryReorderState {
+    /// The closing rule, verbatim: a `Tail` always closes the open group and
+    /// opens a new one; a `Head`/`Whole` extends the open group iff its key
+    /// matches the open group's key, else flushes and opens a new one.
+    /// Identical to the retired `reassemble_boundary` loop body.
+    fn apply(&mut self, run: BoundaryRun, closed: &mut Vec<Vec<TemplateInfo>>) {
+        let extends = !matches!(run.kind, RunKind::Tail)
+            && self.open.as_ref().is_some_and(|(k, _)| *k == run.key);
+        if extends {
+            self.open.as_mut().expect("checked Some").1.extend(run.templates);
+        } else {
+            if let Some((_, g)) = self.open.take() {
+                closed.push(g);
+            }
+            self.open = Some((run.key, run.templates));
+        }
+    }
+}
+
+/// Restores global stream order over the deferred boundary runs and closes
+/// coordinate groups, via a fresh [`BoundaryReorder`]: groups `boundary` by
+/// `batch_serial` (preserving each serial's `(kind as u8)` order), submits
+/// every serial from 0 up to the highest one present — filling any gap left
+/// by a fully-empty batch (which contributes no boundary runs at all, see
+/// [`classify_batch_runs`]) with an empty submission so `BoundaryReorder`'s
+/// contiguous-serial contract is met — and appends `finish`'s final open
+/// group. Returns the reassembled groups in order. Interior runs were
+/// already recorded on the workers and are not present here.
+pub(crate) fn reassemble_boundary(boundary: Vec<BoundaryRun>) -> Vec<Vec<TemplateInfo>> {
+    let mut by_serial: BTreeMap<u64, Vec<BoundaryRun>> = BTreeMap::new();
+    for run in boundary {
+        by_serial.entry(run.batch_serial).or_default().push(run);
+    }
+    for runs in by_serial.values_mut() {
+        runs.sort_by_key(|r| r.kind as u8);
+    }
+
+    let Some(max_serial) = by_serial.keys().last().copied() else {
+        return Vec::new();
+    };
+
+    let reorder = BoundaryReorder::new();
+    let mut groups = Vec::new();
+    for serial in 0..=max_serial {
+        let runs = by_serial.remove(&serial).unwrap_or_default();
+        groups.extend(reorder.submit(serial, runs));
+    }
+    if let Some(open) = reorder.finish().expect("every serial 0..=max_serial was submitted above") {
+        groups.push(open);
     }
     groups
 }
@@ -709,6 +840,28 @@ pub(crate) fn key(ref_index: usize, start: i32) -> ReadInfoKey {
         strand2: true,
         library: 0,
         cell_barcode: None,
+    }
+}
+
+/// Extracts each group's template MIs, in order, for content comparison
+/// (`TemplateInfo` has no `PartialEq`/`Debug` impl, so groups can't be
+/// `assert_eq!`'d directly — the `mi` field is a unique, human-readable
+/// stand-in for full template identity). Shared by `reassemble_boundary_tests`
+/// and `boundary_reorder_tests`.
+#[cfg(test)]
+pub(crate) fn group_mis(groups: &[Vec<TemplateInfo>]) -> Vec<Vec<&str>> {
+    groups.iter().map(|g| g.iter().map(|t| t.mi.as_str()).collect()).collect()
+}
+
+/// Builds a `BoundaryRun` with one `template(m, "chr1", 100, 1.0)` per entry
+/// of `mis`. Shared by `reassemble_boundary_tests` and `boundary_reorder_tests`.
+#[cfg(test)]
+pub(crate) fn run(batch: u64, kind: RunKind, k: ReadInfoKey, mis: &[&str]) -> BoundaryRun {
+    BoundaryRun {
+        batch_serial: batch,
+        kind,
+        key: k,
+        templates: mis.iter().map(|m| template(m, "chr1", 100, 1.0)).collect(),
     }
 }
 
@@ -1126,15 +1279,6 @@ mod run_split_tests {
 mod reassemble_boundary_tests {
     use super::*;
 
-    fn run(batch: u64, kind: RunKind, k: ReadInfoKey, mis: &[&str]) -> BoundaryRun {
-        BoundaryRun {
-            batch_serial: batch,
-            kind,
-            key: k,
-            templates: mis.iter().map(|m| template(m, "chr1", 100, 1.0)).collect(),
-        }
-    }
-
     #[test]
     fn k1_k2_k1_in_one_batch_stays_two_groups() {
         // one batch [Head K1, (interior K2 recorded elsewhere), Tail K1]
@@ -1177,14 +1321,6 @@ mod reassemble_boundary_tests {
             run(0, RunKind::Tail, key(0, 100), &["x"]),
         ]);
         assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 1]);
-    }
-
-    /// Extracts each group's template MIs, in order, for content comparison
-    /// (`TemplateInfo` has no `PartialEq`/`Debug` impl, so groups can't be
-    /// `assert_eq!`'d directly — the `mi` field is a unique, human-readable
-    /// stand-in for full template identity).
-    fn group_mis(groups: &[Vec<TemplateInfo>]) -> Vec<Vec<&str>> {
-        groups.iter().map(|g| g.iter().map(|t| t.mi.as_str()).collect()).collect()
     }
 
     /// Sharper complement to
@@ -1283,5 +1419,288 @@ mod consensus_metrics_slot_tests {
         a.merge(b).unwrap();
         assert_eq!(size1_cs(&a.acc), 2, "both recorded size-1 families present after merge");
         assert_eq!(a.boundary.len(), 2, "boundary runs concatenated (ordered at finalize)");
+    }
+}
+
+#[cfg(test)]
+mod boundary_reorder_tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    #[test]
+    fn submit_in_serial_order_closes_groups_like_reassemble() {
+        // Same shape as `reassemble_boundary_tests::two_full_orderings_...`
+        // (minus its final Whole, so it also exercises `finish`'s open
+        // group): serial 0 opens+closes immediately, serial 1's Head closes
+        // it and its Tail opens a new group that serial 2's Head extends and
+        // whose Tail closes it, leaving `d1` open at `finish`.
+        let flat = || {
+            vec![
+                run(0, RunKind::Whole, key(0, 100), &["a"]),
+                run(1, RunKind::Head, key(1, 200), &["b1"]),
+                run(1, RunKind::Tail, key(2, 300), &["c1"]),
+                run(2, RunKind::Head, key(2, 300), &["c2"]),
+                run(2, RunKind::Tail, key(3, 400), &["d1"]),
+            ]
+        };
+        let reassembled = reassemble_boundary(flat());
+        let expected = group_mis(&reassembled);
+
+        let reorder = BoundaryReorder::new();
+        let mut closed = Vec::new();
+        closed.extend(reorder.submit(0, vec![run(0, RunKind::Whole, key(0, 100), &["a"])]));
+        closed.extend(reorder.submit(
+            1,
+            vec![
+                run(1, RunKind::Head, key(1, 200), &["b1"]),
+                run(1, RunKind::Tail, key(2, 300), &["c1"]),
+            ],
+        ));
+        closed.extend(reorder.submit(
+            2,
+            vec![
+                run(2, RunKind::Head, key(2, 300), &["c2"]),
+                run(2, RunKind::Tail, key(3, 400), &["d1"]),
+            ],
+        ));
+        if let Some(open) = reorder.finish().unwrap() {
+            closed.push(open);
+        }
+        assert_eq!(
+            group_mis(&closed),
+            expected,
+            "submitting serials in completion order 0,1,2 must match reassemble_boundary"
+        );
+    }
+
+    #[test]
+    fn submit_out_of_completion_order_is_identical() {
+        // Same three serials as `submit_in_serial_order_closes_groups_like_reassemble`,
+        // submitted in scrambled completion order 2, 0, 1 — the `BTreeMap`
+        // prefix-drain in `submit` must restore batch-serial order so the
+        // result is identical regardless of completion order.
+        let flat = || {
+            vec![
+                run(0, RunKind::Whole, key(0, 100), &["a"]),
+                run(1, RunKind::Head, key(1, 200), &["b1"]),
+                run(1, RunKind::Tail, key(2, 300), &["c1"]),
+                run(2, RunKind::Head, key(2, 300), &["c2"]),
+                run(2, RunKind::Tail, key(3, 400), &["d1"]),
+            ]
+        };
+        let reassembled = reassemble_boundary(flat());
+        let expected = group_mis(&reassembled);
+
+        let reorder = BoundaryReorder::new();
+        let mut closed = Vec::new();
+        closed.extend(reorder.submit(
+            2,
+            vec![
+                run(2, RunKind::Head, key(2, 300), &["c2"]),
+                run(2, RunKind::Tail, key(3, 400), &["d1"]),
+            ],
+        ));
+        closed.extend(reorder.submit(0, vec![run(0, RunKind::Whole, key(0, 100), &["a"])]));
+        closed.extend(reorder.submit(
+            1,
+            vec![
+                run(1, RunKind::Head, key(1, 200), &["b1"]),
+                run(1, RunKind::Tail, key(2, 300), &["c1"]),
+            ],
+        ));
+        if let Some(open) = reorder.finish().unwrap() {
+            closed.push(open);
+        }
+        assert_eq!(
+            group_mis(&closed),
+            expected,
+            "scrambled completion order (2, 0, 1) must reassemble identically to serial order"
+        );
+    }
+
+    #[test]
+    fn empty_serial_still_advances() {
+        // serial 0 opens a group; serial 1 is a completely empty batch (no
+        // boundary runs at all — `classify_batch_runs` on an empty run list
+        // pushes nothing); serial 2's Head must still see serial 0's group as
+        // open (proving the empty submission advanced `next_serial` instead
+        // of leaving serial 0 stuck in `pending`), extend it, then its Tail
+        // closes it and opens a new one left open at `finish`.
+        let reorder = BoundaryReorder::new();
+        let mut closed = Vec::new();
+        closed.extend(reorder.submit(0, vec![run(0, RunKind::Whole, key(0, 100), &["a"])]));
+        closed.extend(reorder.submit(1, vec![]));
+        closed.extend(reorder.submit(
+            2,
+            vec![
+                run(2, RunKind::Head, key(0, 100), &["b"]),
+                run(2, RunKind::Tail, key(1, 200), &["c"]),
+            ],
+        ));
+        let open = reorder.finish().unwrap();
+        if let Some(g) = open {
+            closed.push(g);
+        }
+        assert_eq!(
+            group_mis(&closed),
+            vec![vec!["a", "b"], vec!["c"]],
+            "the empty serial-1 submission must not block serial 2 from extending serial 0's group"
+        );
+    }
+
+    #[test]
+    fn finish_errors_on_a_missing_serial() {
+        // Serial 1 is never submitted at all (not even as an empty `Vec`),
+        // so serial 2's runs are stuck in `pending` forever; `finish` must
+        // report serial 1 as the gap, not merely fail generically.
+        let reorder = BoundaryReorder::new();
+        reorder.submit(0, vec![run(0, RunKind::Whole, key(0, 100), &["a"])]);
+        reorder.submit(2, vec![run(2, RunKind::Whole, key(1, 200), &["b"])]);
+        // `TemplateInfo` has no `Debug` impl (see `group_mis`'s doc comment),
+        // so `Result::unwrap_err` (which requires the `Ok` side to be
+        // `Debug`) isn't usable here — match instead.
+        let Err(err) = reorder.finish() else {
+            panic!("expected finish() to error on the missing serial");
+        };
+        assert!(
+            err.to_string().contains("serial 1"),
+            "error must name the missing serial (1), got: {err}"
+        );
+    }
+
+    /// One serial's boundary shape, used only to build proptest inputs.
+    /// `key_idx` is `(ref_index, start)` from a small pool so keys
+    /// deliberately recur across serials, exercising both merges (adjacent
+    /// runs sharing a key) and closes (adjacent runs with different keys).
+    #[derive(Clone, Debug)]
+    enum SerialSpec {
+        /// A fully-empty batch: no boundary runs at all.
+        Empty,
+        /// A batch that produced exactly one run (open on both ends).
+        Whole { key_idx: (usize, i32), n: usize },
+        /// A batch that produced 2+ runs: a `Head` and a `Tail` (any interior
+        /// runs are irrelevant here — they never become `BoundaryRun`s).
+        HeadTail { head_key: (usize, i32), head_n: usize, tail_key: (usize, i32), tail_n: usize },
+    }
+
+    /// A small pool of 6 `(ref_index, start)` pairs so generated keys
+    /// deliberately collide across serials.
+    fn key_idx_strategy() -> impl Strategy<Value = (usize, i32)> {
+        (0usize..2, 0i32..3)
+    }
+
+    fn serial_spec_strategy() -> impl Strategy<Value = SerialSpec> {
+        prop_oneof![
+            1 => Just(SerialSpec::Empty),
+            3 => (key_idx_strategy(), 1usize..3)
+                .prop_map(|(key_idx, n)| SerialSpec::Whole { key_idx, n }),
+            3 => (key_idx_strategy(), 1usize..3, key_idx_strategy(), 1usize..3).prop_map(
+                |(head_key, head_n, tail_key, tail_n)| SerialSpec::HeadTail {
+                    head_key,
+                    head_n,
+                    tail_key,
+                    tail_n
+                }
+            ),
+        ]
+    }
+
+    /// Materializes one serial's `SerialSpec` into its `BoundaryRun`s, with
+    /// template `mi`s deterministically unique per `(serial, run, template)`
+    /// so `group_mis` output unambiguously identifies membership. Pure and
+    /// idempotent: calling it twice for the same `(serial, spec)` yields two
+    /// independently-owned but content-identical run lists, which is exactly
+    /// what's needed to feed the same logical input to both
+    /// `reassemble_boundary` (the reference) and `BoundaryReorder` (under
+    /// test) without `BoundaryRun`/`TemplateInfo` needing `Clone`.
+    fn runs_for(serial: u64, spec: &SerialSpec) -> Vec<BoundaryRun> {
+        match spec {
+            SerialSpec::Empty => vec![],
+            SerialSpec::Whole { key_idx, n } => {
+                let mis: Vec<String> = (0..*n).map(|t| format!("s{serial}w{t}")).collect();
+                let mis: Vec<&str> = mis.iter().map(String::as_str).collect();
+                vec![run(serial, RunKind::Whole, key(key_idx.0, key_idx.1), &mis)]
+            }
+            SerialSpec::HeadTail { head_key, head_n, tail_key, tail_n } => {
+                let head_mis: Vec<String> =
+                    (0..*head_n).map(|t| format!("s{serial}h{t}")).collect();
+                let head_mis: Vec<&str> = head_mis.iter().map(String::as_str).collect();
+                let tail_mis: Vec<String> =
+                    (0..*tail_n).map(|t| format!("s{serial}t{t}")).collect();
+                let tail_mis: Vec<&str> = tail_mis.iter().map(String::as_str).collect();
+                vec![
+                    run(serial, RunKind::Head, key(head_key.0, head_key.1), &head_mis),
+                    run(serial, RunKind::Tail, key(tail_key.0, tail_key.1), &tail_mis),
+                ]
+            }
+        }
+    }
+
+    /// Deterministic Fisher-Yates shuffle driven by a small LCG seeded from
+    /// `seed`. Not cryptographic, not even statistically great — just a
+    /// dependency-free way to turn one `u64` proptest input into a varied,
+    /// reproducible-for-shrinking permutation of completion order. Generic
+    /// so it can shuffle `(serial, spec)` pairs directly rather than a
+    /// separate index list that would need casting back to `usize`.
+    fn shuffle_by_seed<T>(order: &mut [T], mut seed: u64) {
+        for i in (1..order.len()).rev() {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            // `i + 1 <= order.len()`, and `order` is a proptest-generated
+            // `Vec` (`1..12` elements, see `serial_spec_strategy` usage), so
+            // this modulus and the `usize` conversion below never approach
+            // truncation range in practice; `try_into` + `expect` keeps
+            // clippy's `cast_possible_truncation` satisfied without `as`.
+            let modulus = u64::try_from(i + 1).expect("small shuffle length");
+            let j: usize = ((seed >> 33) % modulus).try_into().expect("small shuffle index");
+            order.swap(i, j);
+        }
+    }
+
+    proptest::proptest! {
+        /// Fuzzes `BoundaryReorder` against `reassemble_boundary` (the
+        /// finalize-time reference implementation reassemble_boundary is
+        /// itself now expressed in terms of `BoundaryReorder`, but submitted
+        /// strictly in ascending serial order — see its own doc comment):
+        /// random per-serial boundary shapes (empty / `Whole` / `Head`+`Tail`,
+        /// with keys drawn from a small pool so they collide across serials),
+        /// submitted to `BoundaryReorder` in a random *completion* order, must
+        /// close the SAME groups, in the SAME order, with the SAME membership,
+        /// as `reassemble_boundary` over the same runs. This is the design's
+        /// core correctness claim (spec §7 item 2): completion order must not
+        /// matter.
+        #[test]
+        fn boundary_reorder_matches_reassemble_boundary_for_random_run_sequences(
+            specs in proptest::collection::vec(serial_spec_strategy(), 1..12),
+            seed in any::<u64>(),
+        ) {
+            // Pair each spec with its batch serial (its position) exactly
+            // once, so nothing downstream needs to convert a `u64` serial
+            // back into a `usize` index.
+            let annotated: Vec<(u64, SerialSpec)> = specs
+                .into_iter()
+                .enumerate()
+                .map(|(i, spec)| (u64::try_from(i).expect("small index"), spec))
+                .collect();
+
+            let flat: Vec<BoundaryRun> =
+                annotated.iter().flat_map(|(serial, spec)| runs_for(*serial, spec)).collect();
+            let reassembled = reassemble_boundary(flat);
+            let expected = group_mis(&reassembled);
+
+            let mut order = annotated;
+            shuffle_by_seed(&mut order, seed);
+
+            let reorder = BoundaryReorder::new();
+            let mut closed = Vec::new();
+            for (serial, spec) in &order {
+                closed.extend(reorder.submit(*serial, runs_for(*serial, spec)));
+            }
+            if let Some(open) = reorder.finish().unwrap() {
+                closed.push(open);
+            }
+
+            prop_assert_eq!(group_mis(&closed), expected);
+        }
     }
 }
