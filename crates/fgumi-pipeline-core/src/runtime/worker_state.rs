@@ -54,7 +54,7 @@ const STEP_MASK: u64 = 0xFFFF_FFFF;
 const NO_STEP: u64 = u32::MAX as u64;
 
 #[must_use]
-pub fn pack(state: WorkerState, step: Option<StepIdx>) -> u64 {
+fn pack(state: WorkerState, step: Option<StepIdx>) -> u64 {
     let s = match state {
         WorkerState::Running => 0u64,
         WorkerState::Idle => 1,
@@ -72,7 +72,7 @@ pub fn pack(state: WorkerState, step: Option<StepIdx>) -> u64 {
 }
 
 #[must_use]
-pub fn unpack(bits: u64) -> (WorkerState, Option<StepIdx>) {
+fn unpack(bits: u64) -> (WorkerState, Option<StepIdx>) {
     let state = match bits >> STATE_SHIFT {
         0 => WorkerState::Running,
         1 => WorkerState::Idle,

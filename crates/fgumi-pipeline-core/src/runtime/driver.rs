@@ -252,6 +252,16 @@ pub fn run_worker_loop(
             }
         }
     }
+
+    // The loop exits via several `break`s (signal done at the top, empty
+    // worklist, or the no-progress branch), and only the no-progress branch
+    // stamps `Parked` before sleeping — the others leave this slot at whatever
+    // the final `dispatch_one_step` wrote, which is `Running`. The board has no
+    // terminal state, so stamp `Parked` once on exit; otherwise the sampler
+    // keeps counting an exited worker's slot as a serviced (busy) `Running`.
+    if let Some(b) = board {
+        b.stamp(state_slot, crate::runtime::worker_state::WorkerState::Parked, None);
+    }
 }
 
 /// Result of one round-robin pass: whether any step did useful work (caller
@@ -587,6 +597,46 @@ mod tests {
             0,
         );
         // If we reach this line, the loop exited cleanly.
+    }
+
+    #[test]
+    fn run_worker_loop_stamps_parked_on_exit() {
+        // A worker whose slot was last stamped `Running` (mid-dispatch) must be
+        // re-stamped `Parked` once `run_worker_loop` returns; otherwise the
+        // sampler keeps counting the exited worker as a serviced (busy)
+        // `Running` slot. The loop here exits immediately via the top-of-loop
+        // `signal.is_done()` break, which never reaches the no-progress `Parked`
+        // stamp — so only the on-exit stamp can flip Running back to Parked.
+        use crate::runtime::worker_state::{WorkerState, WorkerStateBoard};
+        let signal = PipelineSignal::new();
+        let mut entries: Vec<WorkerStepEntry> = vec![];
+        let contexts = Arc::new(ChainContexts {
+            inputs: vec![],
+            outputs: vec![],
+            bounded_queues: vec![],
+            edges: vec![],
+            step_counters: vec![],
+        });
+        let drain_counters: Vec<Arc<StepDrainCounter>> = vec![];
+        let mut worker = WorkerCore::new(0, None, None);
+
+        let board = WorkerStateBoard::new(1);
+        board.stamp(0, WorkerState::Running, Some(StepIdx(0)));
+
+        signal.cancel();
+        run_worker_loop(
+            &mut worker,
+            &mut entries,
+            &contexts,
+            &drain_counters,
+            &signal,
+            None,
+            &crate::liveness::LivenessCounter::new(1),
+            &crate::runtime::scheduler::ChainOrderScheduler,
+            Some(&board),
+            0,
+        );
+        assert_eq!(board.read(0).0, WorkerState::Parked);
     }
 
     // ── Test steps for dispatch-level coverage ──────────────────────────────

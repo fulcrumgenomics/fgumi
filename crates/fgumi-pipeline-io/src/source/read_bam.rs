@@ -137,10 +137,16 @@ impl Step for ReadBgzfBlocks {
             return Ok(StepOutcome::Finished);
         }
 
-        // Batch total for this call: one bump per `try_run`, not per block.
-        let batch_bytes: u64 = raw_blocks.iter().map(|raw| raw.data.len() as u64).sum();
-        ctx.counters.add(BLOCKS, raw_blocks.len() as u64);
-        ctx.counters.add(BYTES_READ, batch_bytes);
+        // Batch totals for this call: one bump per `try_run`, not per block. Gate
+        // the whole thing on live counter slots so the `.sum()` pass is not run on
+        // the telemetry-off path — `add` alone is a no-op when disabled, but the
+        // fold over the batch is not, and the crate's zero-cost-off invariant
+        // requires no extra work when counters are absent.
+        if !ctx.counters.is_empty() {
+            let batch_bytes: u64 = raw_blocks.iter().map(|raw| raw.data.len() as u64).sum();
+            ctx.counters.add(BLOCKS, raw_blocks.len() as u64);
+            ctx.counters.add(BYTES_READ, batch_bytes);
+        }
 
         for raw in raw_blocks {
             let serial = self.next_serial;
@@ -596,8 +602,15 @@ mod tests {
         let blocks_final = last_value_for("0", "0").expect("blocks counter recorded at least once");
         let bytes_final =
             last_value_for("0", "1").expect("bytes_read counter recorded at least once");
-        assert!(blocks_final > 0 && blocks_final <= total_blocks, "blocks_final={blocks_final}");
-        assert!(bytes_final > 0 && bytes_final <= total_bytes, "bytes_final={bytes_final}");
+        // Exact oracle: `value` is cumulative, and the reader (step 0) drains every
+        // block up front and then freezes its counter for the rest of the run,
+        // which the downstream decode/sink phase re-samples over many later ticks —
+        // so the LAST recorded value is the true total, not a mid-climb sample. (An
+        // end-incrementing counter, e.g. a writer, could not use `==` here because
+        // the final increment can land after the last emitted tick; a source can.)
+        // A systematic under-count would now fail rather than pass a loose bound.
+        assert_eq!(blocks_final, total_blocks, "blocks_final={blocks_final}");
+        assert_eq!(bytes_final, total_bytes, "bytes_final={bytes_final}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

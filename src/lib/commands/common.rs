@@ -1147,8 +1147,10 @@ pub struct SchedulerOptions {
     #[arg(long = "deadlock-recover", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true, hide = true)]
     pub deadlock_recover: bool,
 
-    /// File stem for the four-file per-tick thread-telemetry TSVs
-    /// (`<stem>.ticks.{summary,edges,workers,steps}.tsv`). Setting this (or the
+    /// File stem for the per-tick thread-telemetry TSVs — six files,
+    /// `<stem>.ticks.{summary,edges,workers,steps,counters,counter_names}.tsv`
+    /// (`summary`/`edges`/`workers`/`counters` carry a row per tick;
+    /// `steps`/`counter_names` are written once). Setting this (or the
     /// `FGUMI_PIPELINE_TELEMETRY_OUT` env var) enables telemetry; the default
     /// stem when neither is set but telemetry is otherwise requested is
     /// `pipeline-telemetry`.
@@ -1229,8 +1231,11 @@ impl SchedulerOptions {
     }
 
     /// Resolves the thread-telemetry configuration from `--pipeline-telemetry-out`
-    /// / `--pipeline-telemetry-interval`, with environment-variable overrides
-    /// (`FGUMI_PIPELINE_TELEMETRY_OUT`, `FGUMI_PIPELINE_TELEMETRY_INTERVAL`).
+    /// / `--pipeline-telemetry-interval`, each falling back to its environment
+    /// variable (`FGUMI_PIPELINE_TELEMETRY_OUT`, `FGUMI_PIPELINE_TELEMETRY_INTERVAL`)
+    /// only when the corresponding CLI flag is unset. The CLI flag therefore
+    /// takes precedence over its env var; the env var is a fallback, not an
+    /// override.
     ///
     /// Returns `None` (telemetry off — the zero-cost path) unless telemetry is
     /// explicitly requested via a flag or an env var. Once requested, an unset
@@ -1243,42 +1248,61 @@ impl SchedulerOptions {
     pub fn telemetry_config(
         &self,
     ) -> Option<crate::pipeline::core::runtime::telemetry::TelemetryConfig> {
-        use crate::pipeline::core::runtime::telemetry::TelemetryConfig;
-
         let env_out =
             std::env::var_os("FGUMI_PIPELINE_TELEMETRY_OUT").map(std::path::PathBuf::from);
-        let stem = self.pipeline_telemetry_out.clone().or(env_out);
-
         let env_interval = std::env::var("FGUMI_PIPELINE_TELEMETRY_INTERVAL").ok();
-        let interval_str = self.pipeline_telemetry_interval.clone().or(env_interval);
-
-        // Telemetry is requested iff either knob is set; an interval alone
-        // (with no stem) still turns it on, using the default stem.
-        if stem.is_none() && interval_str.is_none() {
-            return None;
-        }
-
-        const DEFAULT_STEM: &str = "pipeline-telemetry";
-        const DEFAULT_INTERVAL: Duration = Duration::from_millis(2);
-
-        let stem = stem.unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_STEM));
-        let interval = interval_str
-            .as_deref()
-            .map(|s| {
-                parse_telemetry_interval(s).unwrap_or_else(|_| {
-                    // A typo'd cadence must not be silently mistaken for the
-                    // requested one: name the bad value and the fallback.
-                    log::warn!(
-                        "pipeline telemetry: could not parse interval {s:?}; \
-                         falling back to the {DEFAULT_INTERVAL:?} default"
-                    );
-                    DEFAULT_INTERVAL
-                })
-            })
-            .unwrap_or(DEFAULT_INTERVAL);
-
-        Some(TelemetryConfig { stem, interval })
+        resolve_telemetry_config(
+            self.pipeline_telemetry_out.clone(),
+            self.pipeline_telemetry_interval.clone(),
+            env_out,
+            env_interval,
+        )
     }
+}
+
+/// Pure resolver behind [`SchedulerOptions::telemetry_config`]: the CLI flag
+/// value (`flag_out` / `flag_interval`) takes precedence over the env value
+/// (`env_out` / `env_interval`), which is consulted only when the flag is
+/// `None`. Kept env-free so it can be unit-tested deterministically regardless
+/// of the ambient `FGUMI_PIPELINE_TELEMETRY_*`; the impure accessor above only
+/// reads the two env vars and forwards them here.
+fn resolve_telemetry_config(
+    flag_out: Option<std::path::PathBuf>,
+    flag_interval: Option<String>,
+    env_out: Option<std::path::PathBuf>,
+    env_interval: Option<String>,
+) -> Option<crate::pipeline::core::runtime::telemetry::TelemetryConfig> {
+    use crate::pipeline::core::runtime::telemetry::TelemetryConfig;
+
+    let stem = flag_out.or(env_out);
+    let interval_str = flag_interval.or(env_interval);
+
+    // Telemetry is requested iff either knob is set; an interval alone
+    // (with no stem) still turns it on, using the default stem.
+    if stem.is_none() && interval_str.is_none() {
+        return None;
+    }
+
+    const DEFAULT_STEM: &str = "pipeline-telemetry";
+    const DEFAULT_INTERVAL: Duration = Duration::from_millis(2);
+
+    let stem = stem.unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_STEM));
+    let interval = interval_str
+        .as_deref()
+        .map(|s| {
+            parse_telemetry_interval(s).unwrap_or_else(|_| {
+                // A typo'd cadence must not be silently mistaken for the
+                // requested one: name the bad value and the fallback.
+                log::warn!(
+                    "pipeline telemetry: could not parse interval {s:?}; \
+                     falling back to the {DEFAULT_INTERVAL:?} default"
+                );
+                DEFAULT_INTERVAL
+            })
+        })
+        .unwrap_or(DEFAULT_INTERVAL);
+
+    Some(TelemetryConfig { stem, interval })
 }
 
 /// Parse a `--pipeline-telemetry-interval` value: a non-negative integer
@@ -2980,6 +3004,88 @@ mod tests {
         );
         assert_eq!(parse_telemetry_interval("1s").unwrap(), std::time::Duration::from_secs(1));
         assert!(parse_telemetry_interval("banana").is_err());
+    }
+
+    // `telemetry_config` is the CLI gate that turns the parsed flags into a
+    // `TelemetryConfig` (or `None`). They exercise the pure `resolve_telemetry_config`
+    // with explicit `env_*` arguments so every case is deterministic regardless
+    // of the ambient `FGUMI_PIPELINE_TELEMETRY_*` — the impure `telemetry_config`
+    // accessor only reads those two env vars and forwards them here, so the
+    // precedence and defaulting logic is fully covered without touching the
+    // process environment (mutating it would be `unsafe` under edition 2024, and
+    // racy across the test binary's threads).
+    #[test]
+    fn telemetry_config_stem_and_interval_from_flags() {
+        // Flags set and env empty: flag values win.
+        let cfg = resolve_telemetry_config(
+            Some(std::path::PathBuf::from("mystem")),
+            Some("500us".to_string()),
+            None,
+            None,
+        )
+        .expect("a stem flag enables telemetry");
+        assert_eq!(cfg.stem, std::path::PathBuf::from("mystem"));
+        assert_eq!(cfg.interval, std::time::Duration::from_micros(500));
+    }
+
+    #[test]
+    fn telemetry_config_interval_alone_uses_default_stem() {
+        // Interval flag alone, no stem from either flag or env: telemetry turns
+        // on with the default stem. Passing `env_out: None` explicitly keeps the
+        // assertion independent of any ambient `FGUMI_PIPELINE_TELEMETRY_OUT`.
+        let cfg = resolve_telemetry_config(None, Some("2ms".to_string()), None, None)
+            .expect("an interval alone enables telemetry");
+        assert_eq!(cfg.stem, std::path::PathBuf::from("pipeline-telemetry"));
+        assert_eq!(cfg.interval, std::time::Duration::from_millis(2));
+    }
+
+    #[test]
+    fn telemetry_config_bad_interval_falls_back_to_default() {
+        // A typo'd cadence must not fail the run — it falls back to the 2ms default.
+        let cfg = resolve_telemetry_config(
+            Some(std::path::PathBuf::from("s")),
+            Some("banana".to_string()),
+            None,
+            None,
+        )
+        .expect("stem flag still enables telemetry");
+        assert_eq!(cfg.interval, std::time::Duration::from_millis(2));
+    }
+
+    #[test]
+    fn telemetry_config_flag_takes_precedence_over_env() {
+        // Both flag and env set: the flag wins (env is a fallback, not an override).
+        let cfg = resolve_telemetry_config(
+            Some(std::path::PathBuf::from("from_flag")),
+            Some("500us".to_string()),
+            Some(std::path::PathBuf::from("from_env")),
+            Some("9s".to_string()),
+        )
+        .expect("a stem flag enables telemetry");
+        assert_eq!(cfg.stem, std::path::PathBuf::from("from_flag"));
+        assert_eq!(cfg.interval, std::time::Duration::from_micros(500));
+    }
+
+    #[test]
+    fn telemetry_config_env_used_when_flag_unset() {
+        // Flags unset, env set: the env values are the fallback that enables
+        // telemetry and supplies the stem/interval.
+        let cfg = resolve_telemetry_config(
+            None,
+            None,
+            Some(std::path::PathBuf::from("from_env")),
+            Some("3ms".to_string()),
+        )
+        .expect("an env stem enables telemetry");
+        assert_eq!(cfg.stem, std::path::PathBuf::from("from_env"));
+        assert_eq!(cfg.interval, std::time::Duration::from_millis(3));
+    }
+
+    #[test]
+    fn telemetry_config_none_when_neither_flag_nor_env_set() {
+        // Neither knob set from either source: telemetry stays off (the
+        // zero-cost path).
+        assert!(resolve_telemetry_config(None, None, None, None).is_none());
     }
 
     // ========== Tests for QueueMemoryOptions ==========

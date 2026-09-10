@@ -187,9 +187,11 @@ pub struct PipelineConfig {
     /// sort chain, to overlap its serial boundary/key scan with the parallel
     /// inflate instead of starving it behind inflate on the shared pool.
     pub scheduler: Arc<dyn super::runtime::Scheduler>,
-    /// Where + how often to emit the four-file per-tick telemetry TSVs
-    /// (`<stem>.ticks.{summary,edges,workers,steps}.tsv`). `None` (the default)
-    /// keeps the zero-cost path: no [`WorkerStateBoard`](crate::runtime::WorkerStateBoard)
+    /// Where + how often to emit the per-tick telemetry TSVs — six files,
+    /// `<stem>.ticks.{summary,edges,workers,steps,counters,counter_names}.tsv`
+    /// (`summary`/`edges`/`workers`/`counters` per tick; `steps`/`counter_names`
+    /// written once). `None` (the default)
+    /// keeps the zero-cost path: no [`WorkerStateBoard`](crate::runtime::worker_state::WorkerStateBoard)
     /// is built and every worker/sampler is handed `None`. `Some(..)` sizes the
     /// board, stamps each worker/detached-driver thread, and drives the tick
     /// telemetry from the occupancy sampler.
@@ -317,8 +319,8 @@ impl PipelineConfig {
         self
     }
 
-    /// Builder-style helper to enable the four-file per-tick telemetry. `Some(..)`
-    /// sizes the [`WorkerStateBoard`](crate::runtime::WorkerStateBoard) and drives
+    /// Builder-style helper to enable the six-file per-tick telemetry. `Some(..)`
+    /// sizes the [`WorkerStateBoard`](crate::runtime::worker_state::WorkerStateBoard) and drives
     /// the tick telemetry from the occupancy sampler; the default (`None`) keeps
     /// the zero-cost path.
     #[must_use]
@@ -1132,9 +1134,19 @@ impl Pipeline {
         // carry each step's profiled byte bound, so `queue_memory_total` is
         // handed to `run_fused_single_thread` and applied to them there — the
         // fused contexts are built inside that call, not here.
-        // Instrumentation forces the scheduled path (see `should_fuse_single_thread`):
-        // the fused path has no per-edge metrics / occupancy sampler / verdict.
-        if should_fuse_single_thread(n_threads, config.instrumentation, &steps, &graph) {
+        // Instrumentation OR per-tick telemetry forces the scheduled path (see
+        // `should_fuse_single_thread`): the fused path has no per-edge metrics /
+        // occupancy sampler / worker-state board / verdict, so a fused run would
+        // silently emit zero telemetry files. Passing `config.telemetry.is_some()`
+        // enforces the telemetry⇒scheduled-path pairing in the engine, not just in
+        // the CLI helper that raises instrumentation alongside telemetry.
+        if should_fuse_single_thread(
+            n_threads,
+            config.instrumentation,
+            config.telemetry.is_some(),
+            &steps,
+            &graph,
+        ) {
             log::debug!(
                 "Using fused single-thread pipeline ({} steps, direct buffers)",
                 steps.len()
@@ -1379,7 +1391,6 @@ impl Pipeline {
                         crate::runtime::telemetry::TelemetryWriters::open(
                             &tele.stem,
                             &step_names,
-                            n_slots,
                             &step_counter_specs,
                         )
                         .map(|writers| {
@@ -4576,8 +4587,9 @@ mod tests {
         // Every emitted item reached the sink (correctness, not just timing).
         assert_eq!(*received.lock().unwrap(), N, "sink received every item");
 
-        // All four tick-telemetry TSVs exist.
-        for suffix in ["summary", "edges", "workers", "steps"] {
+        // All six tick-telemetry TSVs exist (the four per-tick files plus the two
+        // write-once files `steps` and `counter_names`).
+        for suffix in ["summary", "edges", "workers", "steps", "counters", "counter_names"] {
             let path = dir.join(format!("run.ticks.{suffix}.tsv"));
             assert!(std::fs::metadata(&path).is_ok(), "missing {}", path.display());
         }
@@ -4603,6 +4615,98 @@ mod tests {
             assert_eq!(role, "pool", "pool-worker row must be labeled pool, row: {row}");
         }
 
+        // Funnel: the summary TSV accounts for items flowing through, bounded by
+        // the known total N. `reads_in` is the source edge's cumulative pushed
+        // items, `reads_out` the sink edge's cumulative popped items; both climb
+        // over the run and the last emitted tick can precede the final drain, so
+        // the sound assertion is a bound (in (0, N]) plus the funnel invariant
+        // `reads_out <= reads_in` (the sink cannot pop more than the source
+        // pushed). Columns: tick,t_ms,dt_ms,reads_in,reads_out,...
+        let summary = std::fs::read_to_string(dir.join("run.ticks.summary.tsv")).unwrap();
+        let last = summary.lines().last().expect("summary has at least one data row");
+        let scols: Vec<&str> = last.split('\t').collect();
+        let reads_in: u64 = scols[3].parse().expect("reads_in column parses");
+        let reads_out: u64 = scols[4].parse().expect("reads_out column parses");
+        assert!(reads_in > 0 && reads_in <= u64::from(N), "reads_in in (0, N], row: {last}");
+        assert!(reads_out > 0 && reads_out <= reads_in, "reads_out in (0, reads_in], row: {last}");
+
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A chain with a Detached step, run with telemetry on, must sample the
+    // detached driver's own board slot with role == "detached". This is the
+    // role == "detached" counterpart to `run_emits_telemetry_for_two_workers`'s
+    // role == "pool" assertion, and it pins the detached-driver sampling fix
+    // (the off-pool sort spine is invisible in the telemetry without it — a
+    // regression here silently reverts detached threads to unsampled). It also
+    // exercises telemetry with `instrumentation` left at its `Off` default,
+    // covering the telemetry-without-instrumentation path on the scheduled route.
+    #[test]
+    fn telemetry_samples_detached_driver_role() {
+        use std::time::Duration;
+
+        use crate::runtime::telemetry::TelemetryConfig;
+
+        const N: u32 = 50_000;
+
+        let dir = std::env::temp_dir().join(format!(
+            "fgumi-run-tele-detached-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let stem = dir.join("run");
+
+        let remaining = Arc::new(AtomicU32::new(N));
+        let received = Arc::new(AtomicU32::new(0));
+        let sink = ParallelCountingSink::new(&received);
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(SharedCountingSource { remaining: Arc::clone(&remaining) })
+            .chain(DetachedPassThrough { held: None })
+            .chain(sink.clone())
+            .into_sink_marker();
+        let pipeline = builder.build().expect("pipeline build");
+
+        let mut cfg = PipelineConfig { threads: 2, ..Default::default() };
+        cfg.telemetry =
+            Some(TelemetryConfig { stem: stem.clone(), interval: Duration::from_millis(2) });
+        pipeline.run(cfg).expect("pipeline run");
+        assert_eq!(received.load(AtomicOrd::Relaxed), N, "sink received every item");
+
+        // Some sampled row must carry the detached-driver role (col 3).
+        let workers = std::fs::read_to_string(dir.join("run.ticks.workers.tsv")).unwrap();
+        let mut lines = workers.lines();
+        let header = lines.next().expect("workers header");
+        let cols: Vec<&str> = header.split('\t').collect();
+        assert_eq!(cols.get(3).copied(), Some("role"), "col 3 is role, header: {header}");
+        let roles: std::collections::BTreeSet<&str> =
+            lines.filter_map(|l| l.split('\t').nth(3)).collect();
+        assert!(
+            roles.contains("detached"),
+            "a detached-driver row must be sampled, roles={roles:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The `with_telemetry` / `with_rss_probe` builder helpers must actually
+    // populate the `PipelineConfig` fields the run path reads.
+    #[test]
+    fn with_telemetry_and_rss_probe_set_config_fields() {
+        use std::time::Duration;
+
+        use crate::runtime::telemetry::TelemetryConfig;
+
+        let cfg = PipelineConfig::default()
+            .with_telemetry(TelemetryConfig {
+                stem: std::path::PathBuf::from("s"),
+                interval: Duration::from_millis(2),
+            })
+            .with_rss_probe(Arc::new(|| Some(123)));
+        assert!(cfg.telemetry.is_some(), "with_telemetry sets the telemetry field");
+        assert_eq!(cfg.telemetry.as_ref().unwrap().stem, std::path::PathBuf::from("s"));
+        let probe = cfg.rss_probe.expect("with_rss_probe sets the probe");
+        assert_eq!(probe(), Some(123));
     }
 }

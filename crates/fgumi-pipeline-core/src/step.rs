@@ -213,6 +213,12 @@ use std::io;
 
 use super::item::HeapSize;
 use super::outputs::StepOutputs;
+// `StepCounters` is a leaf counter-handle (an `Option<Arc<[AtomicU64]>>` with no
+// runtime logic) that lives with its primary owner `ChainContexts` in
+// `runtime::contexts`; the ctx types below hold a `&StepCounters`. This one
+// reference back into `runtime` is deliberate — relocating the type here to avoid
+// it would be pure churn for a type whose construction and storage both live in
+// `runtime`.
 use crate::runtime::contexts::StepCounters;
 
 /// Static description of one domain counter a step declares.

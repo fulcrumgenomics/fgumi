@@ -130,15 +130,28 @@ pub fn is_fusible_chain(steps: &[Box<dyn ErasedStep>], graph: &ChainGraph) -> bo
 /// `NotEnoughThreads` where fusion previously ran it. No production chain does
 /// this (the sort chain has zero Exclusive steps), and the scheduled semantics
 /// are the correct ones for such a chain regardless.
+///
+/// Per-tick telemetry (`config.telemetry`) declines fusion for the same reason
+/// instrumentation does: the fused path spawns no occupancy sampler and stamps
+/// no `WorkerStateBoard`, so a fused run would silently write zero telemetry
+/// files. On the scheduled path the sampler/board/counters are gated on
+/// `config.telemetry.is_some()` independently of `instrumentation`, so a caller
+/// that sets `telemetry` without raising `instrumentation` still gets telemetry
+/// — but only if fusion is declined here. The CLI helper raises instrumentation
+/// alongside telemetry, but a direct pipeline-core API caller may not, so the
+/// `telemetry_on` gate enforces the pairing in the engine rather than relying on
+/// the wrapper.
 #[must_use]
 pub fn should_fuse_single_thread(
     n_threads: usize,
     instrumentation: InstrumentationLevel,
+    telemetry_on: bool,
     steps: &[Box<dyn ErasedStep>],
     graph: &ChainGraph,
 ) -> bool {
     n_threads == 1
         && !instrumentation.is_on()
+        && !telemetry_on
         && !has_detached_step(steps)
         && is_fusible_chain(steps, graph)
 }
@@ -708,25 +721,34 @@ mod tests {
         );
     }
 
-    // A fusible chain fuses ONLY when it is single-thread AND uninstrumented: the
-    // fused fast path skips the scheduled path's edge metrics / occupancy sampler
-    // / bottleneck verdict, so any instrumentation level (or ≥2 threads) must fall
-    // through to the scheduled path instead of silently dropping that output.
+    // A fusible chain fuses ONLY when it is single-thread AND uninstrumented AND
+    // has no per-tick telemetry requested: the fused fast path skips the scheduled
+    // path's edge metrics / occupancy sampler / bottleneck verdict, so any
+    // instrumentation level, ≥2 threads, or a telemetry request must fall through
+    // to the scheduled path instead of silently dropping that output. The
+    // `telemetry_on && instrumentation == Off` case is the one the CLI wrapper
+    // masks (it raises instrumentation alongside telemetry); this pins that a
+    // direct API caller who sets only telemetry still declines fusion.
     #[rstest]
-    #[case::off_single_thread(1, InstrumentationLevel::Off, true)]
-    #[case::summary_single_thread(1, InstrumentationLevel::Summary, false)]
-    #[case::timeline_single_thread(1, InstrumentationLevel::Timeline, false)]
-    #[case::deep_single_thread(1, InstrumentationLevel::Deep, false)]
-    #[case::off_multi_thread(2, InstrumentationLevel::Off, false)]
+    #[case::off_single_thread(1, InstrumentationLevel::Off, false, true)]
+    #[case::summary_single_thread(1, InstrumentationLevel::Summary, false, false)]
+    #[case::timeline_single_thread(1, InstrumentationLevel::Timeline, false, false)]
+    #[case::deep_single_thread(1, InstrumentationLevel::Deep, false, false)]
+    #[case::off_multi_thread(2, InstrumentationLevel::Off, false, false)]
+    #[case::telemetry_on_instrumentation_off(1, InstrumentationLevel::Off, true, false)]
     fn should_fuse_only_when_uninstrumented_single_thread(
         #[case] n_threads: usize,
         #[case] level: InstrumentationLevel,
+        #[case] telemetry_on: bool,
         #[case] expected: bool,
     ) {
         let out = Arc::new(Mutex::new(Vec::new()));
         let (steps, graph) = linear_chain(4, &out);
         assert!(is_fusible_chain(&steps, &graph), "linear chain is fusible");
-        assert_eq!(should_fuse_single_thread(n_threads, level, &steps, &graph), expected);
+        assert_eq!(
+            should_fuse_single_thread(n_threads, level, telemetry_on, &steps, &graph),
+            expected
+        );
     }
 
     // A chain that declares a `Detached` step is *structurally* fusible, but the
@@ -745,7 +767,7 @@ mod tests {
         assert!(is_fusible_chain(&steps, &graph), "a detached chain is still structurally fusible");
         // ...but the policy declines, even single-thread and uninstrumented.
         assert!(
-            !should_fuse_single_thread(1, InstrumentationLevel::Off, &steps, &graph),
+            !should_fuse_single_thread(1, InstrumentationLevel::Off, false, &steps, &graph),
             "a chain with a Detached step must not fuse (overlap must be preserved)"
         );
     }

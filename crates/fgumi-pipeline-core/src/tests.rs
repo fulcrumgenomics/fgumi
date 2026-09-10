@@ -1584,10 +1584,18 @@ mod bandwidth_telemetry {
         }
         assert!(saw_byte_edge, "the byte-bounded source→middle edge is present");
         assert!(saw_count_edge, "the count-bounded middle→sink edge is present");
-        assert_eq!(
-            total_pushed_bytes,
-            u64::from(N) * BLOB_BYTES as u64,
-            "byte edge moved N * BLOB_BYTES of heap payload"
+        // Bound, not equality: the summed per-tick `d_pushed_bytes` telescope to
+        // the byte edge's cumulative pushed_bytes AT THE LAST SAMPLED TICK.
+        // `run_occupancy_sampler` checks `stop` before each tick and emits no
+        // final tick after it, and `Pipeline::run` sets `stop` only once the
+        // workers finish — so the last edges.tsv row can precede the final pushes
+        // and the sum is `<=` the true total (matching the sibling counter check,
+        // which bounds by N rather than asserting exact equality).
+        assert!(total_pushed_bytes > 0, "the byte edge moved some payload");
+        assert!(
+            total_pushed_bytes <= u64::from(N) * BLOB_BYTES as u64,
+            "sampled pushed bytes never exceed the true total N * BLOB_BYTES; \
+             got {total_pushed_bytes}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

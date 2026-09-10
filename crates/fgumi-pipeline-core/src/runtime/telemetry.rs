@@ -1,5 +1,5 @@
 //! Periodic thread/edge/summary telemetry: config, per-worker sample binning,
-//! and the four-file TSV writer. Driven by the occupancy sampler (`sampler.rs`).
+//! and the six-file TSV writer. Driven by the occupancy sampler (`sampler.rs`).
 
 use std::fmt::Write as _;
 use std::io::{BufWriter, Write};
@@ -13,10 +13,45 @@ use crate::topology::StepIdx;
 /// Where + how often to emit the tick telemetry.
 #[derive(Debug, Clone)]
 pub struct TelemetryConfig {
-    /// File stem; the four TSVs are `<stem>.ticks.{summary,edges,workers,steps}.tsv`.
+    /// File stem; the six TSVs are
+    /// `<stem>.ticks.{summary,edges,workers,steps,counters,counter_names}.tsv`
+    /// (`summary`/`edges`/`workers`/`counters` carry a row per tick;
+    /// `steps`/`counter_names` are written once).
     pub stem: PathBuf,
     /// Emit/sample cadence.
     pub interval: Duration,
+}
+
+/// The six per-tick TSV suffixes, in the fixed order the writers create them:
+/// `<stem>.ticks.{summary,edges,workers,steps,counters,counter_names}.tsv`.
+/// Single source of truth shared by [`TelemetryWriters::open`] (which creates
+/// the files) and [`TelemetryConfig::ticks_paths`] (which the chain-build
+/// validator uses to reject a telemetry file colliding with the primary output
+/// — these paths are *derived* from the stem, so the command-layer
+/// output-collision check never sees them).
+pub const TICKS_SUFFIXES: [&str; 6] =
+    ["summary", "edges", "workers", "steps", "counters", "counter_names"];
+
+/// Derive one per-tick TSV path, `<stem>.ticks.<suffix>.tsv`. This appends to
+/// the stem as a filename *suffix*, not as a path component: a bare stem `run`
+/// yields `run.ticks.summary.tsv`, and a stem with directories keeps them.
+#[must_use]
+pub fn ticks_path(stem: &Path, suffix: &str) -> PathBuf {
+    let mut p = stem.as_os_str().to_os_string();
+    p.push(format!(".ticks.{suffix}.tsv"));
+    PathBuf::from(p)
+}
+
+impl TelemetryConfig {
+    /// The six `<stem>.ticks.*.tsv` files this config's telemetry would write,
+    /// derived from [`Self::stem`] via [`ticks_path`] over [`TICKS_SUFFIXES`].
+    /// Used by the chain-build validator to reject a telemetry file colliding
+    /// with the primary output / rejects / `.bai` sidecar before any writer
+    /// truncates a file.
+    #[must_use]
+    pub fn ticks_paths(&self) -> Vec<PathBuf> {
+        TICKS_SUFFIXES.iter().map(|suffix| ticks_path(&self.stem, suffix)).collect()
+    }
 }
 
 /// Fraction of an emit window a worker spent in each step / non-running state.
@@ -167,7 +202,7 @@ fn state_str(s: WorkerState) -> &'static str {
     }
 }
 
-/// Opens and writes rows to the four `<stem>.ticks.{summary,edges,workers,steps}.tsv`
+/// Opens and writes rows to the six `<stem>.ticks.{summary,edges,workers,steps,counters,counter_names}.tsv`
 /// files. Best-effort: any I/O error is logged once and further rows are silently
 /// dropped rather than panicking mid-run (mirrors `sampler.rs::TraceWriter`).
 pub struct TelemetryWriters {
@@ -178,6 +213,40 @@ pub struct TelemetryWriters {
     failed: bool,
 }
 
+/// Writes the two static metadata files (`steps`, `counter_names`) that map the
+/// numeric ids in the per-tick rows back to names: `steps` = `step_names`
+/// indexed `0..N`; `counter_names` = one `step, counter, name, unit` row per
+/// declared counter. Any write or flush error is propagated so [`TelemetryWriters::open`]
+/// can disable telemetry rather than emit rows whose ids lack a complete mapping.
+fn write_static_metadata<S: Write, C: Write>(
+    steps: &mut S,
+    counter_names: &mut C,
+    step_names: &[&'static str],
+    step_counters: &[&'static [CounterSpec]],
+) -> std::io::Result<()> {
+    // Static steps file: one row per step, in index order.
+    writeln!(steps, "step\tname")?;
+    for (i, name) in step_names.iter().enumerate() {
+        writeln!(steps, "{i}\t{name}")?;
+    }
+    steps.flush()?;
+    // Static counter-names file: one row per (step, counter).
+    writeln!(counter_names, "step\tcounter\tname\tunit")?;
+    for (step, specs) in step_counters.iter().enumerate() {
+        for (counter, spec) in specs.iter().enumerate() {
+            writeln!(counter_names, "{step}\t{counter}\t{}\t{}", spec.name, spec.unit)?;
+        }
+    }
+    counter_names.flush()
+}
+
+// Rows are written with `write!`/`writeln!` and literal tabs rather than through
+// the workspace `csv` crate. This is deliberate: the rows are emitted from the
+// occupancy sampler on its tick loop (default every 2ms) and the fields are all
+// numeric/`&'static str` with no embedded tabs, quotes, or newlines to escape, so
+// `csv::Writer`'s per-record quoting-and-buffering machinery would add cost and a
+// heap record buffer per tick for no correctness gain. The direct `write!` into
+// the already-`BufWriter`-backed file is the cheaper, equally-correct path here.
 impl TelemetryWriters {
     /// Creates the six TSVs at
     /// `<stem>.ticks.{summary,edges,workers,steps,counters,counter_names}.tsv`,
@@ -190,15 +259,10 @@ impl TelemetryWriters {
     pub fn open(
         stem: &Path,
         step_names: &[&'static str],
-        n_workers: usize,
         step_counters: &[&'static [CounterSpec]],
     ) -> Option<Self> {
-        let path = |suffix: &str| {
-            let mut p = stem.as_os_str().to_os_string();
-            p.push(format!(".ticks.{suffix}.tsv"));
-            PathBuf::from(p)
-        };
-        let create = |suffix: &str| std::fs::File::create(path(suffix)).map(BufWriter::new);
+        let create =
+            |suffix: &str| std::fs::File::create(ticks_path(stem, suffix)).map(BufWriter::new);
         let (
             Ok(mut summary),
             Ok(mut edges),
@@ -221,20 +285,18 @@ impl TelemetryWriters {
             );
             return None;
         };
-        // Static steps file, written once.
-        let _ = writeln!(steps, "step\tname");
-        for (i, name) in step_names.iter().enumerate() {
-            let _ = writeln!(steps, "{i}\t{name}");
+        // Static metadata files, written once. A failed static write would leave
+        // the sampler emitting rows whose numeric ids have no complete name
+        // mapping, so treat any error like a failed per-tick header below and
+        // disable telemetry rather than expose incomplete files.
+        if write_static_metadata(&mut steps, &mut counter_names, step_names, step_counters).is_err()
+        {
+            log::warn!(
+                "pipeline-telemetry: failed writing a static metadata file at stem {}; disabling telemetry files",
+                stem.display()
+            );
+            return None;
         }
-        let _ = steps.flush();
-        // Static counter-names file, written once: one row per (step, counter).
-        let _ = writeln!(counter_names, "step\tcounter\tname\tunit");
-        for (step, specs) in step_counters.iter().enumerate() {
-            for (counter, spec) in specs.iter().enumerate() {
-                let _ = writeln!(counter_names, "{step}\t{counter}\t{}\t{}", spec.name, spec.unit);
-            }
-        }
-        let _ = counter_names.flush();
         // Headers.
         let ok_s = writeln!(
             summary,
@@ -254,7 +316,6 @@ impl TelemetryWriters {
         let ok_w = writeln!(workers, "{whdr}").is_ok();
         // Per-tick counters file (header-only when no step declared a counter).
         let ok_c = writeln!(counters, "tick\tt_ms\tstep\tcounter\td_value\tvalue").is_ok();
-        let _ = n_workers; // header shape is per-step; worker count only bounds rows.
         if !(ok_s && ok_e && ok_w && ok_c) {
             log::warn!("pipeline-telemetry: failed writing a header; disabling telemetry files");
             return None;
@@ -439,7 +500,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fgumi-tele-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let stem = dir.join("run");
-        let mut w = TelemetryWriters::open(&stem, &["read", "sort", "write"], 2, STEP_COUNTERS)
+        let mut w = TelemetryWriters::open(&stem, &["read", "sort", "write"], STEP_COUNTERS)
             .expect("writers open");
         w.write_summary_row(
             0,
@@ -559,5 +620,94 @@ mod tests {
         assert!(row.contains("\tpool\trunning\t1\t3\t4\t0.2500\t0.7500\t0.0000"), "row: {row}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_static_metadata_propagates_write_and_flush_errors() {
+        const STEP_COUNTERS: &[&[CounterSpec]] = &[&[], &[CounterSpec::new("records", "records")]];
+
+        // A writer whose every write/flush fails, to exercise the error path a
+        // real file only hits on a full disk / I/O error.
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("boom"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("boom"))
+            }
+        }
+
+        // A writer that accepts every write but fails only on `flush`, so the
+        // `flush()?` calls (which `FailingWriter` never reaches, since it fails
+        // at the first `writeln!`) are exercised on their own.
+        struct FlushFailingWriter;
+        impl Write for FlushFailingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("flush boom"))
+            }
+        }
+
+        // Happy path: both files are in-memory buffers and every write succeeds.
+        let mut steps = Vec::<u8>::new();
+        let mut counter_names = Vec::<u8>::new();
+        assert!(
+            write_static_metadata(&mut steps, &mut counter_names, &["read", "sort"], STEP_COUNTERS)
+                .is_ok()
+        );
+        assert!(steps.starts_with(b"step\tname\n"));
+        assert!(counter_names.starts_with(b"step\tcounter\tname\tunit\n"));
+
+        // A failing `steps` writer propagates the error (so `open` returns None).
+        let mut counter_names = Vec::<u8>::new();
+        assert!(
+            write_static_metadata(
+                &mut FailingWriter,
+                &mut counter_names,
+                &["read", "sort"],
+                STEP_COUNTERS,
+            )
+            .is_err()
+        );
+
+        // A failing `counter_names` writer (steps OK) also propagates.
+        let mut steps = Vec::<u8>::new();
+        assert!(
+            write_static_metadata(
+                &mut steps,
+                &mut FailingWriter,
+                &["read", "sort"],
+                STEP_COUNTERS,
+            )
+            .is_err()
+        );
+
+        // A flush-only failure on `steps` propagates from the `steps.flush()?`.
+        let mut counter_names = Vec::<u8>::new();
+        assert!(
+            write_static_metadata(
+                &mut FlushFailingWriter,
+                &mut counter_names,
+                &["read", "sort"],
+                STEP_COUNTERS,
+            )
+            .is_err()
+        );
+
+        // A flush-only failure on `counter_names` (steps OK) propagates from the
+        // final `counter_names.flush()`.
+        let mut steps = Vec::<u8>::new();
+        assert!(
+            write_static_metadata(
+                &mut steps,
+                &mut FlushFailingWriter,
+                &["read", "sort"],
+                STEP_COUNTERS,
+            )
+            .is_err()
+        );
     }
 }

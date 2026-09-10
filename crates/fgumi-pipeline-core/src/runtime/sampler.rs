@@ -37,6 +37,15 @@ use super::worker_state::{WorkerState, WorkerStateBoard};
 /// multi-second run.
 pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_millis(2);
 
+/// Floor for the effective sampling interval. A zero (or near-zero) interval
+/// would turn the sampler's `while !stop { …; sleep(interval) }` loop into a hot
+/// spin that pegs a core and grows the `.ticks.*.tsv` files without bound. The
+/// floor is applied inside [`run_occupancy_sampler`] so it holds for EVERY
+/// caller — the CLI/env parse, and a direct library `TelemetryConfig` whose
+/// `interval` bypasses the CLI — making the busy-spin unreachable. 100µs is finer
+/// than the 2ms default yet bounded away from zero.
+pub const MIN_SAMPLE_INTERVAL: Duration = Duration::from_micros(100);
+
 /// Extra tick telemetry driven by the occupancy sampler loop, additive to the
 /// existing per-edge occupancy histogram + `pipeline-trace.tsv` timeline path
 /// (that path is untouched whether or not `tele` is passed).
@@ -65,7 +74,7 @@ pub struct TelemetryArgs<'a> {
     /// Total queue-byte budget for the summary row's `queue_bytes_budget`
     /// column, if known.
     pub queue_bytes_budget: Option<u64>,
-    /// Open TSV writers for the four `<stem>.ticks.*.tsv` files.
+    /// Open TSV writers for the six `<stem>.ticks.*.tsv` files.
     pub writers: TelemetryWriters,
     /// Indices into `edges` whose producer is a chain source; their
     /// (cumulative) `pushed_items` sum to the summary row's `reads_in`.
@@ -125,6 +134,12 @@ struct TelemetryState<'a> {
     /// per-tick `d_value` deltas. Seeded to 0 (like `prev_edges`) so tick 0's
     /// delta is the total since run start, not since the first sampler tick.
     prev_counters: Vec<Vec<u64>>,
+    /// Per-edge row buffer reused across ticks. The `edge` column prefix is
+    /// invariant for the run, so it is built once here (in `new`) and left
+    /// untouched by `emit`, which only overwrites the numeric fields — sparing
+    /// both the per-tick `Vec` allocation and the per-edge `String` format at
+    /// the 100 µs floor (~10k ticks/s).
+    edge_rows: Vec<EdgeSample>,
     tick: u64,
     last_emit: Instant,
 }
@@ -137,6 +152,23 @@ impl<'a> TelemetryState<'a> {
         let last_read = vec![(WorkerState::Idle, None); args.n_workers];
         let prev_edges = vec![zero_edge_snapshot(); edges.len()];
         let prev_counters = args.step_counters.iter().map(|sc| vec![0u64; sc.len()]).collect();
+        // The edge column prefix is invariant for the run, so build each row
+        // once with its prefix and zeroed numerics; `emit` overwrites only the
+        // numeric fields per tick and never re-formats the prefix.
+        let edge_rows = edges
+            .iter()
+            .map(|e| EdgeSample {
+                edge: edge_column_prefix(e),
+                depth_bytes: None,
+                limit_bytes: None,
+                d_pushed: 0,
+                d_popped: 0,
+                d_push_rej: 0,
+                d_pop_empty: 0,
+                d_pushed_bytes: None,
+                d_popped_bytes: None,
+            })
+            .collect();
         Self {
             args,
             bins,
@@ -144,6 +176,7 @@ impl<'a> TelemetryState<'a> {
             last_read,
             prev_edges,
             prev_counters,
+            edge_rows,
             tick: 0,
             last_emit: Instant::now(),
         }
@@ -180,13 +213,43 @@ impl<'a> TelemetryState<'a> {
     /// reused here rather than re-read, for the same reason the timeline
     /// writer reuses it (one edge read per tick, not one per consumer).
     fn emit(&mut self, edges: &[RegisteredEdge], depths: &[EdgeDepth], t_ms: f64) {
+        self.emit_summary_and_edges(edges, depths, t_ms);
+        self.emit_worker_states(t_ms);
+        self.emit_counters(t_ms);
+        self.tick += 1;
+    }
+
+    /// Terminal finalize for the shutdown path (see `run_occupancy_sampler`'s
+    /// final-sample guard). Emits the FINAL cumulative summary/edge/counter
+    /// values so edge and `StepCounters` activity during the last sleep window
+    /// is not dropped from the TSVs, WITHOUT sampling worker state or taking
+    /// another occupancy point — a final worker-state row (its per-window bins
+    /// reset and never re-sampled after the last tick) and a final occupancy
+    /// point would both bias those per-window distributions toward the drained
+    /// final state. The caller pairs this with skipping `record_depths`, the
+    /// timeline row, and `sample_workers`: only the monotonic totals are
+    /// finalized here, not the per-window distributions.
+    fn emit_terminal(&mut self, edges: &[RegisteredEdge], depths: &[EdgeDepth], t_ms: f64) {
+        self.emit_summary_and_edges(edges, depths, t_ms);
+        self.emit_counters(t_ms);
+        self.tick += 1;
+    }
+
+    /// Write the per-tick summary row plus one edge row per edge (delta metrics
+    /// and current depth), advancing the per-window edge snapshots. Shared by
+    /// the regular tick (`emit`) and the terminal finalize (`emit_terminal`).
+    fn emit_summary_and_edges(
+        &mut self,
+        edges: &[RegisteredEdge],
+        depths: &[EdgeDepth],
+        t_ms: f64,
+    ) {
         let dt_ms = self.last_emit.elapsed().as_secs_f64() * 1000.0;
         self.last_emit = Instant::now();
 
         let mut reads_in = 0u64;
         let mut reads_out = 0u64;
         let mut queue_bytes_used = 0u64;
-        let mut edge_rows: Vec<EdgeSample> = Vec::with_capacity(edges.len());
         for (i, e) in edges.iter().enumerate() {
             let cur = e.metrics.snapshot();
             let prev = self.prev_edges[i];
@@ -216,17 +279,17 @@ impl<'a> TelemetryState<'a> {
             } else {
                 (None, None)
             };
-            edge_rows.push(EdgeSample {
-                edge: edge_column_prefix(e),
-                depth_bytes,
-                limit_bytes,
-                d_pushed: cur.pushed_items.saturating_sub(prev.pushed_items),
-                d_popped: cur.popped_items.saturating_sub(prev.popped_items),
-                d_push_rej: cur.push_rejections.saturating_sub(prev.push_rejections),
-                d_pop_empty: cur.pop_empties.saturating_sub(prev.pop_empties),
-                d_pushed_bytes,
-                d_popped_bytes,
-            });
+            // Overwrite only the numeric fields of the reused row; `edge` holds
+            // the invariant prefix built once in `new`.
+            let row = &mut self.edge_rows[i];
+            row.depth_bytes = depth_bytes;
+            row.limit_bytes = limit_bytes;
+            row.d_pushed = cur.pushed_items.saturating_sub(prev.pushed_items);
+            row.d_popped = cur.popped_items.saturating_sub(prev.popped_items);
+            row.d_push_rej = cur.push_rejections.saturating_sub(prev.push_rejections);
+            row.d_pop_empty = cur.pop_empties.saturating_sub(prev.pop_empties);
+            row.d_pushed_bytes = d_pushed_bytes;
+            row.d_popped_bytes = d_popped_bytes;
             self.prev_edges[i] = cur;
         }
 
@@ -239,9 +302,16 @@ impl<'a> TelemetryState<'a> {
             queue_bytes_budget: self.args.queue_bytes_budget,
         };
         self.args.writers.write_summary_row(self.tick, t_ms, dt_ms, &summary);
-        for row in &edge_rows {
+        for row in &self.edge_rows {
             self.args.writers.write_edge_row(self.tick, t_ms, row);
         }
+    }
+
+    /// Write one worker-state row per worker from the accumulated per-window
+    /// occupancy bins, then reset those bins and the serviced counters for the
+    /// next window. Omitted from `emit_terminal` to avoid biasing the
+    /// worker-state distribution toward the drained final state.
+    fn emit_worker_states(&mut self, t_ms: f64) {
         for w in 0..self.args.n_workers {
             let (state, step) = self.last_read.get(w).copied().unwrap_or((WorkerState::Idle, None));
             let fractions = self.bins[w].fractions();
@@ -259,11 +329,14 @@ impl<'a> TelemetryState<'a> {
             self.bins[w].reset();
             self.d_serviced[w] = 0;
         }
+    }
 
-        // Domain counters: one row per (step, counter) whose cumulative `value`
-        // (read from the shared per-step atomic) and per-tick delta (`d_value`)
-        // are emitted. Ordered step asc then counter asc. Header-only file when
-        // no step declared a counter.
+    /// Emit domain counters: one row per (step, counter) whose cumulative
+    /// `value` (read from the shared per-step atomic) and per-tick delta
+    /// (`d_value`) are written. Ordered step asc then counter asc. Header-only
+    /// file when no step declared a counter. Shared by `emit` and
+    /// `emit_terminal` so the final cumulative totals are never dropped.
+    fn emit_counters(&mut self, t_ms: f64) {
         for (step, counters) in self.args.step_counters.iter().enumerate() {
             for counter in 0..counters.len() {
                 let cur = counters.load(counter);
@@ -273,7 +346,6 @@ impl<'a> TelemetryState<'a> {
                 self.prev_counters[step][counter] = cur;
             }
         }
-        self.tick += 1;
     }
 
     fn flush(mut self) {
@@ -288,7 +360,7 @@ impl<'a> TelemetryState<'a> {
 /// pushed/popped item counts — so the run's phase structure can be plotted.
 ///
 /// When `tele` is `Some`, ALSO drives the tick telemetry (`.ticks.*.tsv`)
-/// each tick, additively — see [`TelemetryState`]. This never disturbs the
+/// each tick, additively — see `TelemetryState`. This never disturbs the
 /// `read_depths` / `record_depths` / `TraceWriter` path above: both consumers
 /// share the same per-tick `read_depths` result.
 pub fn run_occupancy_sampler(
@@ -298,6 +370,10 @@ pub fn run_occupancy_sampler(
     trace_path: Option<PathBuf>,
     tele: Option<TelemetryArgs<'_>>,
 ) {
+    // Clamp to a floor so a zero/near-zero interval cannot busy-spin (see
+    // `MIN_SAMPLE_INTERVAL`); this covers direct-library callers too, not just the
+    // CLI parse.
+    let interval = interval.max(MIN_SAMPLE_INTERVAL);
     let mut trace = trace_path.and_then(|p| TraceWriter::open(&p, edges));
     let mut tele_state = tele.map(|args| TelemetryState::new(args, edges));
     let start = Instant::now();
@@ -315,13 +391,27 @@ pub fn run_occupancy_sampler(
             ts.emit(edges, &depths, t_ms);
         }
         sampled_in_loop = true;
-        std::thread::sleep(interval);
+        // Sleep the interval in bounded slices, re-checking `stop` between them,
+        // so a large interval does not delay shutdown by its full duration.
+        let mut remaining = interval;
+        let slice = Duration::from_millis(50);
+        while remaining > Duration::ZERO && !stop.load(Ordering::Relaxed) {
+            let nap = remaining.min(slice);
+            std::thread::sleep(nap);
+            remaining -= nap;
+        }
     }
-    // Guard the final sample: only take it when the loop never sampled (a run
-    // so short `stop` was already set before the first iteration). Sampling
-    // unconditionally here would add an extra occupancy point + timeline row
-    // (and, symmetrically, an extra telemetry tick) taken AFTER the pipeline
-    // already drained, biasing toward the empty final state.
+    // Shutdown sampling, in two mutually exclusive shapes:
+    //
+    // * The loop never sampled (a run so short `stop` was set before the first
+    //   iteration): take ONE full sample so the TSVs are not empty.
+    // * The loop did sample: DON'T take another full sample — an extra
+    //   occupancy point + timeline row + worker-state sample taken AFTER the
+    //   pipeline already drained would bias those per-window distributions
+    //   toward the empty final state. But edge metrics and `StepCounters` can
+    //   still advance during the final sleep, after the last regular tick
+    //   emitted, so finalize just those monotonic cumulative totals
+    //   (`emit_terminal`) — no occupancy point, timeline row, or worker sample.
     if !sampled_in_loop {
         let depths = read_depths(edges);
         record_depths(edges, &depths);
@@ -333,6 +423,13 @@ pub fn run_occupancy_sampler(
             let t_ms = start.elapsed().as_secs_f64() * 1000.0;
             ts.emit(edges, &depths, t_ms);
         }
+    } else if let Some(ts) = tele_state.as_mut() {
+        // `read_depths` (current depth for the final edge row) but NOT
+        // `record_depths` (histogram) — reading is accurate at drain, recording
+        // would bias the occupancy distribution.
+        let depths = read_depths(edges);
+        let t_ms = start.elapsed().as_secs_f64() * 1000.0;
+        ts.emit_terminal(edges, &depths, t_ms);
     }
     if let Some(mut t) = trace {
         t.flush();
@@ -703,7 +800,7 @@ mod tests {
         // reads a non-zero cumulative value on its first tick.
         let step_counters = vec![StepCounters::new(1)];
         step_counters[0].add(0, 42);
-        let writers = TelemetryWriters::open(&stem, &["producer"], 1, COUNTER_SPECS).unwrap();
+        let writers = TelemetryWriters::open(&stem, &["producer"], COUNTER_SPECS).unwrap();
         let tele = crate::runtime::sampler::TelemetryArgs {
             board: &board,
             n_workers: 1,
@@ -793,5 +890,82 @@ mod tests {
         // Columns: t_ms, <edge>.depth, <edge>.pushed, <edge>.popped.
         let depth = row.split('\t').nth(1).expect("depth column");
         assert_eq!(depth, "NA", "unsampled edge's depth column is NA, row: {row}");
+    }
+
+    #[test]
+    fn terminal_finalize_captures_post_last_tick_counter_updates() {
+        // Regression: work can advance `StepCounters` (and edge metrics) during
+        // the sampler's final sleep, AFTER the last regular tick has emitted.
+        // The shutdown path must finalize those cumulative totals
+        // (`emit_terminal`) so the counters TSV's last row reflects the
+        // post-update value — not the stale total from the last regular tick.
+        use crate::runtime::telemetry::TelemetryWriters;
+        use crate::runtime::worker_state::{WorkerState, WorkerStateBoard};
+        const COUNTER_SPECS: &[&[CounterSpec]] = &[&[CounterSpec::new("records", "records")]];
+        let m = EdgeMetrics::new();
+        let q = Arc::new(ByteBoundedQueue::<Heavy>::new(1000));
+        q.try_push(Heavy(vec![0; 300])).unwrap();
+        let edges =
+            vec![edge_over(Arc::clone(&m), Some(Arc::clone(&q) as Arc<dyn BoundedQueueHandle>))];
+        let dir =
+            std::env::temp_dir().join(format!("fgumi-sampler-terminal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("run");
+        let board = WorkerStateBoard::new(1);
+        board.stamp(0, WorkerState::Running, Some(StepIdx(0)));
+        // Counter starts at 42; the run bumps it by 58 → 100 during the final
+        // sleep, after the first (and only) regular tick has emitted 42.
+        let step_counters = vec![StepCounters::new(1)];
+        step_counters[0].add(0, 42);
+        let writers = TelemetryWriters::open(&stem, &["producer"], COUNTER_SPECS).unwrap();
+        let tele = crate::runtime::sampler::TelemetryArgs {
+            board: &board,
+            n_workers: 1,
+            n_pool: 1,
+            step_names: &["producer"],
+            rss_probe: None,
+            queue_bytes_budget: Some(1000),
+            writers,
+            source_edge_idxs: vec![0],
+            sink_edge_idxs: vec![0],
+            worker_slots: vec![0],
+            step_counters: &step_counters,
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_c = Arc::clone(&stop);
+        let edges_c = edges;
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(move || {
+                // A very large interval: the first tick fires immediately, then
+                // the sampler parks in its stop-checked sleep — so exactly one
+                // regular tick emits before the terminal finalize runs.
+                run_occupancy_sampler(
+                    &stop_c,
+                    &edges_c,
+                    Duration::from_secs(3600),
+                    None,
+                    Some(tele),
+                );
+            });
+            // Let the single regular tick emit (it fires within microseconds of
+            // thread start), THEN advance the shared counter during the final
+            // sleep window before signalling stop.
+            std::thread::sleep(Duration::from_millis(80));
+            step_counters[0].add(0, 58);
+            stop.store(true, Ordering::Relaxed);
+            handle.join().unwrap();
+        });
+        // The terminal finalize must have written a final counters row carrying
+        // the post-update cumulative total (100), not the last tick's 42.
+        let counters = std::fs::read_to_string(dir.join("run.ticks.counters.tsv")).unwrap();
+        let last = counters.lines().last().unwrap();
+        let fields: Vec<&str> = last.split('\t').collect();
+        assert_eq!(fields[2], "0", "step index");
+        assert_eq!(fields[3], "0", "counter index");
+        assert_eq!(
+            fields[5], "100",
+            "terminal row carries the post-final-sleep cumulative total: {counters}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
