@@ -3,15 +3,24 @@
 //!
 //! Spec §7.1's zero-overhead-when-off guarantee is a *chain-build-time* property:
 //! when a consensus stage's `--metrics` field is `None`, the built step graph
-//! must contain **no** `MetricsCollectorStep` (and no extra output branch /
-//! reorder stage feeding one). As of Task 3, this now holds for `--metrics`
-//! `Some` too: the standalone (T2) simplex path records metrics inline in the
-//! consensus worker body via a per-thread `ConsensusMetricsSlot` accumulator
-//! instead of fanning out to a serial `MetricsCollectorStep`, so the metrics-on
-//! chain has the SAME step count/shape as metrics-off. These tests assert that
-//! directly on the built `Pipeline`'s `dag()` rendering, rather than through a
-//! runtime proxy — the metrics-on and metrics-off chains are literally the same
-//! step graph, built from the existing unmodified step-factory functions.
+//! must not gain any extra step, output branch, or reorder stage over the
+//! metrics-off shape. As of Task 3, this now holds for `--metrics` `Some` too:
+//! the standalone (T2) simplex path records metrics inline in the consensus
+//! worker body via a per-thread `ConsensusMetricsSlot` accumulator instead of
+//! fanning out to a separate serial collector step, so the metrics-on chain has
+//! the SAME step count/shape as metrics-off. These tests assert that directly
+//! on the built `Pipeline`'s `dag()` rendering, rather than through a runtime
+//! proxy — the metrics-on and metrics-off chains are literally the same step
+//! graph, built from the existing unmodified step-factory functions.
+//!
+//! (An earlier revision of this file asserted the built DAG never rendered the
+//! string `"MetricsCollectorStep"` — the name of a now-deleted serial-collector
+//! step type from a prior design. Once that type was removed workspace-wide the
+//! assertion became vacuous: the string can no longer appear regardless of
+//! whether the chain is actually shaped correctly, since no code path emits it.
+//! The tests below assert on the DAG's actual step types/ordering instead, so
+//! they fail if the metrics-on chain ever again grows an extra step, whatever
+//! that step happens to be named.)
 //!
 //! (The black-box output-file companion check — that `--metrics` absent vs.
 //! present changes which files land on disk — lives with the parity suite in
@@ -83,36 +92,37 @@ fn simplex_chain_dag(metrics: Option<std::path::PathBuf>) -> String {
     build_for(spec).expect("build_for should accept a standalone Simplex chain").pipeline.dag()
 }
 
-#[test]
-fn metrics_off_chain_has_no_metrics_collector_step() {
-    let dag = simplex_chain_dag(None);
-    assert!(
-        !dag.contains("MetricsCollectorStep"),
-        "a --metrics-absent simplex chain must not wire any MetricsCollectorStep:\n{dag}"
-    );
+/// Extract the step *type name* token from each `dag()` step-definition line
+/// (`  [{idx}] {name:<24} {kind:?} sticky=... branches=...`), in step order.
+/// This deliberately ignores per-step numbering/queue/ordering detail and
+/// compares only the sequence of step types actually wired into the chain.
+fn dag_step_names(dag: &str) -> Vec<&str> {
+    dag.lines()
+        .filter(|l| l.trim_start().starts_with('['))
+        .map(|l| l.split_whitespace().nth(1).unwrap_or(""))
+        .collect()
 }
 
 #[test]
-fn metrics_on_chain_has_no_serial_collector_step() {
+fn metrics_on_chain_has_same_step_shape_as_off() {
     let dir = TempDir::new().expect("temp dir");
     let prefix = dir.path().join("metrics_prefix");
-    let dag = simplex_chain_dag(Some(prefix));
-    // Count step-definition lines (`  [N] MetricsCollectorStep ...`), not raw
-    // substring hits — `dag()` also names the step as the *consumer* on the
-    // reorder branch feeding it (`.0: ... → MetricsCollectorStep`).
-    //
-    // Task 3 (parallel T2 consensus metrics) moved metrics recording inline
-    // into the consensus worker body (a per-thread `ConsensusMetricsSlot`
-    // accumulator), so the built chain no longer wires a serial
-    // `MetricsCollectorStep` at all, on or off.
-    let collector_steps = dag
-        .lines()
-        .filter(|l| l.trim_start().starts_with('[') && l.contains("MetricsCollectorStep"))
-        .count();
+    let dag_off = simplex_chain_dag(None);
+    let dag_on = simplex_chain_dag(Some(prefix));
+
+    // Stronger than a bare step *count* match (see the test below): this
+    // compares the sequence of step *types*, in order, between the
+    // metrics-on and metrics-off chains. Metrics recording moved inline into
+    // the consensus worker body (a per-thread `ConsensusMetricsSlot`
+    // accumulator) rather than fanning out to a separate collector step, so
+    // toggling `--metrics` must not add, remove, or substitute any step —
+    // the two chains must wire the identical step-type sequence.
+    let names_off = dag_step_names(&dag_off);
+    let names_on = dag_step_names(&dag_on);
     assert_eq!(
-        collector_steps, 0,
-        "a --metrics-present simplex chain must wire zero MetricsCollectorStep steps — \
-         metrics are recorded inline in the consensus worker, not via a serial collector:\n{dag}"
+        names_on, names_off,
+        "metrics-on chain must wire the SAME step types in the SAME order as metrics-off \
+         (no extra or substituted step)\n--- off ---\n{dag_off}\n--- on ---\n{dag_on}"
     );
 }
 
@@ -123,10 +133,14 @@ fn metrics_on_chain_has_same_step_count_as_off() {
     let dag_off = simplex_chain_dag(None);
     let dag_on = simplex_chain_dag(Some(prefix));
 
-    // The stronger zero-overhead statement (Task 3): metrics collection now
-    // happens inside the existing consensus worker, adding no extra branch,
-    // no auto-inserted ReorderStage, and no terminal MetricsCollectorStep —
-    // so the metrics-on chain has the SAME step count as metrics-off.
+    // The headline zero-overhead statement (Task 3): metrics collection now
+    // happens inside the existing consensus worker, adding no extra branch and
+    // no auto-inserted reorder or collector step — so the metrics-on chain has
+    // the SAME step count as metrics-off. This is a weaker check than
+    // `metrics_on_chain_has_same_step_shape_as_off` above (a count match alone
+    // wouldn't catch a step *substitution*), kept because it is the simplest
+    // direct statement of the guarantee and fails independently of how `dag()`
+    // renders individual step names.
     let steps_off = dag_off.lines().filter(|l| l.trim_start().starts_with('[')).count();
     let steps_on = dag_on.lines().filter(|l| l.trim_start().starts_with('[')).count();
     assert_eq!(

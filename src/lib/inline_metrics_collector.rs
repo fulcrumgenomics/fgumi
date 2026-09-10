@@ -992,21 +992,107 @@ mod tests {
 mod consensus_metrics_finalize_hook_tests {
     use super::*;
 
+    /// Exercises both halves of `ConsensusMetricsFinalizeHook::finalize`'s
+    /// H3-era job, not just that it returns `Ok`:
+    ///
+    /// 1. **Slot merge** — two `PerThreadAccumulator` slots each get one
+    ///    interior group recorded directly (as T1's fused tap, or a T2
+    ///    producer's interior-run path, would), so `finalize` must fold both
+    ///    into one accumulator before writing.
+    /// 2. **`reorder.finish()`'s open-group recording** — the shared
+    ///    `BoundaryReorder` is driven across two batch serials whose runs
+    ///    share a key (`key(0, 100)`): serial 0's `Whole` run opens a group,
+    ///    serial 1's `Head` run (same key) extends it (the "Head/Whole
+    ///    extends the open group iff its key matches" rule), and nothing
+    ///    ever closes it — so it is still open when `finalize` calls
+    ///    `reorder.finish()`, which must return it and `finalize` must record
+    ///    it into the merged accumulator via `record_coordinate_group`. Both
+    ///    boundary templates share one `mi` ("boundary"), so this exercises
+    ///    the cross-serial merge landing in a single family of size 2 — a
+    ///    silently-dropped open group would instead leave it absent entirely.
+    ///
+    /// The two interior groups use distinct, single-template families (size
+    /// 1 each); the reorder-recorded group is a single two-template family
+    /// (size 2). Reading back `<prefix>.family_sizes.txt` after `finalize`
+    /// lets this test tell "recorded" from "silently dropped" for both paths.
     #[test]
     fn consensus_metrics_finalize_hook_merges_slots_and_writes() {
-        let accumulators = PerThreadAccumulator::new_with(1, ConsensusMetricsSlot::new_simplex);
-        accumulators.with_slot(|slot| {
-            slot.acc.record_coordinate_group(&[template("0", "chr1", 100, 1.0)], &[]).unwrap();
-        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output_prefix = dir.path().join("consensus_metrics_finalize_hook_test");
+
+        let accumulators = PerThreadAccumulator::new_with(2, ConsensusMetricsSlot::new_simplex);
+        // Record one interior group directly into each of the two slots —
+        // exercises the slot-merge path (`merged.merge(slot)?` in `finalize`).
+        accumulators.slots()[0]
+            .lock()
+            .acc
+            .record_coordinate_group(&[template("interior-a", "chr1", 100, 1.0)], &[])
+            .expect("records interior-a into slot 0");
+        accumulators.slots()[1]
+            .lock()
+            .acc
+            .record_coordinate_group(&[template("interior-b", "chr1", 500, 1.0)], &[])
+            .expect("records interior-b into slot 1");
+
+        // Drive the reorder across two serials so a group actually spans a
+        // batch boundary, rather than opening and closing within one serial.
+        let reorder = Arc::new(BoundaryReorder::new());
+        let closed_at_0 =
+            reorder.submit(0, vec![run(0, RunKind::Whole, key(0, 100), &["boundary"])]);
+        assert!(closed_at_0.is_empty(), "serial 0's Whole run only opens a group, closes nothing");
+        let closed_at_1 =
+            reorder.submit(1, vec![run(1, RunKind::Head, key(0, 100), &["boundary"])]);
+        assert!(
+            closed_at_1.is_empty(),
+            "serial 1's Head run shares serial 0's key, so it extends the open group \
+             instead of closing it — it must stay open for finalize's finish() to record"
+        );
 
         let hook = ConsensusMetricsFinalizeHook {
             accumulators,
-            output_prefix: std::env::temp_dir().join("consensus_metrics_finalize_hook_test"),
+            output_prefix: output_prefix.clone(),
             intervals: Vec::new(),
             thresholds: MetricsThresholds::Simplex { min_reads: 1 },
-            reorder: Arc::new(BoundaryReorder::new()),
+            reorder,
         };
         Box::new(hook).finalize().expect("finalize succeeds");
+
+        let family_sizes_path = with_extension(&output_prefix, "family_sizes.txt");
+        let content = std::fs::read_to_string(&family_sizes_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", family_sizes_path.display()));
+        let mut lines = content.lines();
+        let header = lines.next().expect("family_sizes.txt has a header line");
+        let family_size_col = header
+            .split('\t')
+            .position(|c| c == "family_size")
+            .expect("header has a family_size column");
+        let cs_count_col =
+            header.split('\t').position(|c| c == "cs_count").expect("header has a cs_count column");
+
+        let cs_count_for = |size: &str| -> usize {
+            lines
+                .clone()
+                .find_map(|l| {
+                    let fields: Vec<&str> = l.split('\t').collect();
+                    (fields.get(family_size_col) == Some(&size))
+                        .then(|| fields[cs_count_col].parse().expect("cs_count is a usize"))
+                })
+                .unwrap_or_else(|| panic!("no family_size={size} row in:\n{content}"))
+        };
+
+        assert_eq!(
+            cs_count_for("1"),
+            2,
+            "the two interior groups (slot 0's and slot 1's, distinct MIs) are each their \
+             own size-1 family — proves the slot merge folded both slots:\n{content}"
+        );
+        assert_eq!(
+            cs_count_for("2"),
+            1,
+            "the reorder's still-open cross-serial group (two same-MI templates from \
+             serial 0's Whole run + serial 1's Head extension) is one size-2 family — proves \
+             finalize's reorder.finish() call recorded the final open group:\n{content}"
+        );
     }
 }
 

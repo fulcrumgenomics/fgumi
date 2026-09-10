@@ -483,6 +483,12 @@ fn run_duplex_consensus_batch_with_metrics(
 /// than via an extra output branch. Parallel, `ByItemOrdinal`.
 ///
 /// `pub(crate)` — consumed only by `ChainBuilder::add_duplex`.
+///
+/// # Panics
+///
+/// Panics if `cap.qc_metrics` is `None`. Unreachable in practice: `ChainBuilder::add_duplex`
+/// selects this metrics-ON builder only when `--metrics` is set, in which case `qc_metrics`
+/// is always `Some`.
 pub(crate) fn build_duplex_consensus_step_with_rejects_and_metrics(
     limit_bytes: u64,
     cap: DuplexConsensusCaptures,
@@ -571,6 +577,12 @@ pub(crate) fn build_duplex_consensus_step_with_rejects_and_metrics(
 /// output branch.
 ///
 /// `pub(crate)` — consumed only by `ChainBuilder::add_duplex`.
+///
+/// # Panics
+///
+/// Panics if `cap.qc_metrics` is `None`. Unreachable in practice: `ChainBuilder::add_duplex`
+/// selects this metrics-ON builder only when `--metrics` is set, in which case `qc_metrics`
+/// is always `Some`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_duplex_consensus_step_metrics(
     limit_bytes: u64,
