@@ -1,20 +1,25 @@
 //! Convert BAM to FASTQ format.
 //!
-//! This tool reads a BAM file and outputs interleaved FASTQ to stdout for piping to aligners.
-//! Input should be queryname-sorted or template-coordinate sorted.
+//! Reads a BAM file and writes FASTQ, either interleaved to stdout (the default,
+//! for piping to `bwa mem -p`) or split into per-read files (`--out1`/`--out2`,
+//! plus optional `--out0`). Input should be queryname-sorted or
+//! template-coordinate sorted. The conversion runs on the typed-step pipeline.
 
-use crate::logging::OperationTimer;
+use crate::commands::common::{
+    CompressionOptions, MemoryLimit, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
+    reject_output_collisions,
+};
 use crate::sam::SamTag;
 use crate::validation::validate_input_exists;
 use anyhow::Result;
 use clap::Parser;
-use fgumi_bam_io::{create_raw_bam_reader, is_stdin_path, is_stdout_path};
+use fgumi_bam_io::{ReadStreams, is_stdin_path};
 use fgumi_raw_bam::{
     RawRecord, aux_data_slice, extract_sequence_into, find_string_tag, quality_scores_slice,
     read_name as raw_read_name,
 };
-use log::{info, warn};
-use std::io::{self, BufWriter, Write, stdout};
+use log::info;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::commands::command::Command;
@@ -54,18 +59,27 @@ static COMPLEMENT: [u8; 256] = {
     name = "fastq",
     about = "\x1b[38;5;72m[ALIGNMENT]\x1b[0m      \x1b[36mConvert BAM to FASTQ format\x1b[0m",
     long_about = r#"
-Convert a BAM file to interleaved FASTQ format.
+Convert a BAM file to FASTQ, either interleaved (the default, for `bwa mem -p`)
+or split into per-read files (--out1/--out2, plus optional --out0).
 
-Reads BAM records and outputs FASTQ to stdout for piping to aligners.
-Input should be queryname-sorted or template-coordinate sorted.
+Reads BAM records and, by default, writes interleaved FASTQ to stdout for piping
+to aligners. Input should be queryname-sorted or template-coordinate sorted. Any
+`.gz`/`.bgz` output path is written as BGZF (gzip-compatible, block-indexable);
+stdout is always plain text. The conversion runs on the typed-step pipeline, so
+`--threads` parallelizes both BAM decompression and BGZF output compression.
 
 EXAMPLES:
 
-  # Pipe to bwa mem for alignment
+  # Pipe interleaved FASTQ to bwa mem for alignment
   fgumi fastq -i unmapped.bam | bwa mem -t 16 -p -K 150000000 -Y ref.fa -
 
-  # With multi-threaded BAM decompression
-  fgumi fastq -i unmapped.bam -@ 4 | bwa mem -t 16 -p ref.fa -
+  # Paired split output to gzipped files (mirrors `samtools fastq -1/-2/-0`)
+  fgumi fastq -i unmapped.bam -@ 4 \
+    --out1 R1.fastq.gz --out2 R2.fastq.gz --out0 other.fastq.gz
+
+  # Embed the UMI (from the RX tag) in the read name, DRAGEN-ready
+  fgumi fastq -i extracted.bam --annotate-read-names \
+    --out1 R1.fastq.gz --out2 R2.fastq.gz --out0 /dev/null
 
   # Exclude secondary and supplementary alignments (default)
   fgumi fastq -i aligned.bam -F 0x900 | bwa mem ...
@@ -76,16 +90,17 @@ NOTES:
   matching `samtools fastq -N`. A QNAME that already carries a mate suffix
   (a re-imported BAM; the SAM spec forbids it) is not stripped, so the output
   would double it (`name/1/1`) -- same as samtools -N. Pass --no-read-suffix
-  to leave names untouched.
+  to leave names untouched. Paired split (--out1/--out2) mode always omits the
+  suffix, since the R1/R2 file already identifies the mate.
 
   Missing base qualities: a read with no stored quality (all 0xFF, the SAM
   no-quality sentinel) is emitted with a fixed Q33 ('B') per base, matching
   `samtools fastq` -- not Q93, which would falsely claim near-perfect quality.
 
-  Interleaved pairing: output is interleaved for `bwa mem -p`. If a template
-  contributes a lone mate (its pair is absent or dropped by --exclude-flags /
-  --require-flags), the R1/R2 stream desyncs; fgumi warns when the paired R1/R2
-  counts differ.
+  Interleaved pairing: for `bwa mem -p` the input must be queryname or
+  template-coordinate sorted with both mates present; a lone mate (its pair
+  absent or dropped by --exclude-flags / --require-flags) desyncs the R1/R2
+  stream. Prefer paired split (--out1/--out2) when mates may be missing.
 "#
 )]
 pub struct Fastq {
@@ -116,9 +131,10 @@ pub struct Fastq {
     #[arg(short = '@', short_alias = 't', long = "threads", default_value = "1")]
     pub threads: usize,
 
-    /// BWA -K parameter value (bases per batch). Sizes output buffer to match bwa's
-    /// batch size for optimal pipe throughput. Default matches common bwa mem usage.
-    #[arg(short = 'K', long = "bwa-chunk-size", default_value = "150000000")]
+    /// Deprecated and ignored: output batching is managed by the typed-step
+    /// pipeline (tune with `--max-memory`). Retained so existing `-K …`
+    /// invocations keep parsing; a non-default value logs a deprecation notice.
+    #[arg(short = 'K', long = "bwa-chunk-size", default_value_t = DEFAULT_BWA_CHUNK_SIZE, hide = true)]
     pub bwa_chunk_size: u64,
 
     /// Append the record's UMI to the read name, before any /1 or /2 suffix.
@@ -142,6 +158,33 @@ pub struct Fastq {
     /// expect `AAAA+CCCC`, so the stored `-` is rewritten to this value.
     #[arg(long = "umi-sep", default_value = "+")]
     pub umi_sep: String,
+
+    /// Write read 1 (R1) to this file instead of the interleaved stream; requires
+    /// `--out2`. A `.gz`/`.bgz` path is written as BGZF. Mirrors `samtools fastq -1`.
+    #[arg(short = '1', long = "out1", requires = "out2", conflicts_with = "output")]
+    pub out1: Option<PathBuf>,
+
+    /// Write read 2 (R2) to this file; requires `--out1`. A `.gz`/`.bgz` path is
+    /// written as BGZF. Mirrors `samtools fastq -2`.
+    #[arg(short = '2', long = "out2", requires = "out1", conflicts_with = "output")]
+    pub out2: Option<PathBuf>,
+
+    /// Write reads that are neither cleanly R1 nor R2 (single-end / ambiguous)
+    /// here; requires `--out1`. If omitted, such reads go to stdout, matching
+    /// `samtools fastq` without `-0`. A `.gz`/`.bgz` path is written as BGZF.
+    #[arg(short = '0', long = "out0", requires = "out1")]
+    pub out0: Option<PathBuf>,
+
+    /// Pipeline scheduler diagnostics (`--pipeline-stats`, deadlock detection).
+    #[command(flatten)]
+    pub scheduler: SchedulerOptions,
+
+    /// Pipeline queue-memory limits (`--max-memory`, …). The conversion runs on
+    /// the typed-step pipeline; these cap the in-flight queue memory. Defaults to
+    /// a lean fastq budget (see `FASTQ_DEFAULT_QUEUE_MEMORY_MB`); pass
+    /// `--max-memory` to override.
+    #[command(flatten)]
+    pub queue_memory: QueueMemoryOptions,
 }
 
 /// Parse flag values supporting both decimal and hex (0x) notation.
@@ -154,233 +197,229 @@ fn parse_flags(s: &str) -> Result<u16, String> {
 }
 
 impl Fastq {
-    /// Run the BAM-to-FASTQ conversion loop against the given writer.
-    ///
-    /// Extracted so `execute` can dispatch between stdout (the default piping
-    /// path) and a file (`--output`) without duplicating the conversion loop.
-    fn run_with_writer<W: Write>(&self, writer: &mut W) -> Result<()> {
-        use fgumi_raw_bam::flags as raw_flag_bits;
-        let timer = OperationTimer::new("Converting BAM to FASTQ");
+    /// Build the optional UMI-in-read-name annotation, validating the tag list
+    /// up front. Returns `None` when `--annotate-read-names` is off.
+    fn build_umi_header(&self) -> Result<Option<UmiNameAnnotation>> {
+        if self.annotate_read_names {
+            info!("UMI in read name: from tag(s) {}", self.umi_tag.join(","));
+            Ok(Some(UmiNameAnnotation::new(&self.umi_tag, &self.umi_name_delim, &self.umi_sep)?))
+        } else {
+            Ok(None)
+        }
+    }
 
+    /// Log the shared conversion configuration once at run start.
+    ///
+    /// Paired split output always omits the `/1` `/2` suffix (the R1/R2 file
+    /// already identifies the mate), so the suffix line reports the *effective*
+    /// behavior — not the raw `--no-read-suffix` flag, which paired mode ignores.
+    fn log_config(&self) {
         info!("Input: {}", self.input.display());
         info!("Threads: {}", self.threads);
         info!("Exclude flags: 0x{:X}", self.exclude_flags);
         info!("Require flags: 0x{:X}", self.require_flags);
-        info!("Read name suffix: {}", if self.no_suffix { "disabled" } else { "enabled" });
-        info!("BWA chunk size: {} bases", self.bwa_chunk_size);
-
-        let (mut reader, _header) = create_raw_bam_reader(&self.input, self.threads)?;
-
-        let mut total_records: u64 = 0;
-        let mut written_records: u64 = 0;
-        // Track paired R1/R2 balance to detect singletons that would desync the
-        // interleaved stream under `bwa mem -p` (FASTQ3-02).
-        let mut paired_r1_written: u64 = 0;
-        let mut paired_r2_written: u64 = 0;
-
-        // Batch tracking (mirrors bwa's logic)
-        let mut bases_this_batch: u64 = 0;
-        let mut records_this_batch: usize = 0;
-
-        // Reusable buffers to avoid per-record allocations
-        let mut buffers = FastqRecordBuffers::with_capacity(512);
-        let mut record = RawRecord::new();
-
-        // Resolve the UMI annotation config once, outside the per-record loop.
-        let umi_annotation = if self.annotate_read_names {
-            Some(UmiNameAnnotation::new(&self.umi_tag, &self.umi_name_delim, &self.umi_sep)?)
+        let suffix = if self.out1.is_some() {
+            "omitted (paired split)"
+        } else if self.no_suffix {
+            "disabled"
         } else {
-            None
+            "enabled"
         };
+        info!("Read name suffix: {suffix}");
+    }
 
-        loop {
-            let n = reader.read_record(&mut record)?;
-            if n == 0 {
-                break; // EOF
-            }
-            total_records += 1;
+    /// Build the per-stage [`FastqOptions`] — the single source of truth for the
+    /// flag filters, read-name suffix behavior, and UMI-in-read-name config the
+    /// encode step needs, shared by the interleaved and paired-split chain specs.
+    fn to_fastq_options(&self) -> Result<FastqOptions> {
+        Ok(FastqOptions {
+            exclude_flags: self.exclude_flags,
+            require_flags: self.require_flags,
+            no_suffix: self.no_suffix,
+            umi_header: self.build_umi_header()?,
+        })
+    }
 
-            let flags = record.flags();
+    /// Assemble the typed-step [`ChainSpec`] for a BAM → FASTQ conversion:
+    /// `SourceSpec::Bam` → `Stage::Fastq` → the given `sink`.
+    ///
+    /// [`ChainSpec`]: crate::pipeline::chains::ChainSpec
+    fn build_chain_spec(
+        &self,
+        sink: crate::pipeline::chains::SinkSpec,
+        command_line: &str,
+    ) -> Result<crate::pipeline::chains::ChainSpec> {
+        use crate::pipeline::chains::{ChainSpec, SourceSpec, Stage, StageOptionsBag};
 
-            // Filter by flags
-            if (flags & self.exclude_flags) != 0 {
-                continue;
-            }
-            if (flags & self.require_flags) != self.require_flags {
-                continue;
-            }
+        Ok(ChainSpec {
+            stages: vec![Stage::Fastq],
+            source: SourceSpec::Bam(self.input.clone()),
+            sink,
+            stage_opts: StageOptionsBag {
+                fastq: Some(self.to_fastq_options()?),
+                ..Default::default()
+            },
+            threading: ThreadingOptions::new(self.threads),
+            compression: CompressionOptions { compression_level: FASTQ_GZIP_LEVEL },
+            scheduler: self.scheduler.clone(),
+            queue_memory: self.resolve_queue_memory(),
+            async_reader: false,
+            // fastq exposes no read-stream knob; keep the plain sequential reader.
+            read_streams: ReadStreams::Fixed(1),
+            // Match the default CRC policy every other command uses: verify a file
+            // source, skip for stdin (which cannot be re-decoded to re-check).
+            verify_crc: !is_stdin_path(&self.input),
+            command_line: command_line.to_string(),
+        })
+    }
 
-            // Get sequence length for batch tracking
-            let seq_len = record.l_seq() as usize;
+    /// Assemble the [`ChainSpec`] for paired-split BAM → FASTQ:
+    /// `SourceSpec::Bam` → `Stage::Fastq` → `SinkSpec::FastqPaired`. Only the
+    /// sink differs from [`Self::build_chain_spec`]; every other field is shared.
+    ///
+    /// [`ChainSpec`]: crate::pipeline::chains::ChainSpec
+    fn build_paired_chain_spec(
+        &self,
+        command_line: &str,
+    ) -> Result<crate::pipeline::chains::ChainSpec> {
+        // clap `requires` guarantees out2 is present whenever out1 is, and
+        // execute() only calls this when out1.is_some().
+        let out1 = self.out1.clone().expect("out1 present in paired mode");
+        let out2 = self.out2.clone().expect("out2 present in paired mode");
+        let sink =
+            crate::pipeline::chains::SinkSpec::FastqPaired { out1, out2, out0: self.out0.clone() };
+        self.build_chain_spec(sink, command_line)
+    }
 
-            // Write FASTQ record
-            write_fastq_record(
-                &mut *writer,
-                &record,
-                flags,
-                self.no_suffix,
-                &mut buffers,
-                umi_annotation.as_ref(),
-            )?;
-            written_records += 1;
-            if (flags & raw_flag_bits::PAIRED) != 0 {
-                if (flags & raw_flag_bits::FIRST_SEGMENT) != 0 {
-                    paired_r1_written += 1;
-                }
-                if (flags & raw_flag_bits::LAST_SEGMENT) != 0 {
-                    paired_r2_written += 1;
-                }
-            }
+    /// Resolve the queue-memory options for the chain.
+    ///
+    /// FASTQ blocks are small and the chain is a short linear
+    /// source → encode → write pipeline, so the sort/consensus-sized default
+    /// (768 MiB *per thread*) is wildly oversized and would inflate RSS as
+    /// `--threads` scales. When the flags are left at that default, a lean fixed
+    /// total ([`FASTQ_DEFAULT_QUEUE_MEMORY_MB`]) is substituted; any explicit
+    /// `--max-memory` / `--memory-per-thread` override is honored untouched. (A
+    /// user who explicitly passes the default value is indistinguishable from not
+    /// passing it and gets the lean budget — harmless, since 768 MiB/thread is
+    /// never what a fastq conversion wants.)
+    ///
+    /// The "is it the default?" test compares against [`QueueMemoryOptions::default`]
+    /// rather than a hardcoded byte count, so it cannot silently stop firing if
+    /// that default is ever changed in `common.rs`.
+    fn resolve_queue_memory(&self) -> QueueMemoryOptions {
+        let mut qm = self.queue_memory.clone();
+        let default = QueueMemoryOptions::default();
+        let is_default = matches!(
+            (&qm.max_memory, &default.max_memory),
+            (MemoryLimit::Fixed(a), MemoryLimit::Fixed(b)) if a == b
+        ) && qm.memory_per_thread == default.memory_per_thread;
+        if is_default {
+            qm.max_memory =
+                MemoryLimit::Fixed(FASTQ_DEFAULT_QUEUE_MEMORY_MB as usize * 1024 * 1024);
+            qm.memory_per_thread = false;
+        }
+        qm
+    }
 
-            // Track batch progress
-            bases_this_batch += seq_len as u64;
-            records_this_batch += 1;
-
-            // Flush at batch boundary (like bwa: bases >= K AND record count is even)
-            if bases_this_batch >= self.bwa_chunk_size && records_this_batch.is_multiple_of(2) {
-                writer.flush()?;
-                bases_this_batch = 0;
-                records_this_batch = 0;
+    /// Reject a write target that resolves to the same file as the `--input`
+    /// BAM, which would clobber the file being read (mirrors `retag`/`copy_umi`).
+    ///
+    /// The input BAM always exists, so it canonicalises; any output that
+    /// canonicalises to the same path is rejected before a writer truncates it.
+    /// This also catches a symlinked or `./`-spelled output that resolves to the
+    /// input. Stdin input (`-`/`/dev/stdin`) has no filesystem entity to
+    /// canonicalise and cannot be clobbered, so the guard no-ops there.
+    ///
+    /// Output-vs-output collisions — two paths naming one destination, and the
+    /// stdout-multiplexing case — are handled separately by
+    /// [`reject_output_collisions`], which shares the same `(path, flag)` slice.
+    fn reject_write_aliasing_input(&self, outputs: &[(&Path, &str)]) -> Result<()> {
+        let Ok(input_canon) = std::fs::canonicalize(&self.input) else {
+            return Ok(());
+        };
+        for (path, flag) in outputs {
+            if std::fs::canonicalize(path).is_ok_and(|canon| canon == input_canon) {
+                anyhow::bail!(
+                    "{flag} '{}' is the same file as --input '{}'; choose a different path",
+                    path.display(),
+                    self.input.display()
+                );
             }
         }
-
-        // Final flush
-        writer.flush()?;
-
-        // FASTQ3-02: this is interleaved output. If the paired R1/R2 counts differ,
-        // at least one template contributed a lone mate (its pair was absent or
-        // dropped by `--exclude-flags`/`--require-flags`), which desyncs R1/R2 pairing
-        // for every subsequent read under `bwa mem -p`. Warn rather than fail —
-        // single-end input and deliberate mate filtering are legitimate uses.
-        //
-        // NOTE: this is a best-effort NET-count heuristic, not per-QNAME pairing. Two
-        // singletons that cancel — one template drops its R2, another drops its R1 —
-        // leave R1==R2 and are NOT detected here (a robust check would need per-read-name
-        // pairing, impractical for a streaming converter). So the absence of a warning
-        // does not guarantee a perfectly-synced interleaved stream.
-        if paired_r1_written != paired_r2_written {
-            // Net imbalance, a lower bound on the true singleton count: canceling
-            // singletons (one template drops its R2, another its R1) leave R1==R2
-            // and are not counted here (see NOTE above).
-            let net_imbalance = paired_r1_written.abs_diff(paired_r2_written);
-            warn!(
-                "Interleaved FASTQ paired-read counts differ (R1={paired_r1_written}, \
-                 R2={paired_r2_written}): net R1/R2 imbalance of {net_imbalance} (at least \
-                 {net_imbalance} singleton mate(s)) will desync R1/R2 pairing under \
-                 `bwa mem -p`. Ensure the input is queryname/template-coordinate sorted with \
-                 both mates present, or reconsider `--exclude-flags` (0x{:X}) / `--require-flags` \
-                 (0x{:X}).",
-                self.exclude_flags, self.require_flags
-            );
-        }
-
-        info!("Read {total_records} records, wrote {written_records} FASTQ records");
-        timer.log_completion(written_records);
         Ok(())
     }
-}
-
-/// Refuse an `--output` that would clobber the `--input` BAM.
-///
-/// `File::create(path)` truncates before the input is opened in
-/// `run_with_writer`, so an `--output` naming the same file silently destroys
-/// the input data. Lexical equality catches the obvious case; canonicalising
-/// both sides also catches `./in.bam` vs `in.bam`, symlinks, and absolute vs
-/// relative paths pointing at the same file.
-///
-/// # Errors
-///
-/// Returns an error if `output` and `input` name the same file, or if either
-/// path exists but cannot be canonicalised.
-fn reject_output_clobbering_input(input: &Path, output: Option<&PathBuf>) -> Result<()> {
-    let Some(output) = output else { return Ok(()) };
-
-    // Stdin has no filesystem entity to canonicalise -- `canonicalize("-")`
-    // fails with `NotFound` -- and cannot name the output file, so there is
-    // nothing to clobber. Without this the guard turns `--input -` into a
-    // confusing IO error whenever `--output` happens to already exist.
-    if is_stdin_path(input) {
-        return Ok(());
-    }
-
-    // Likewise stdout: `-` names a stream, not a file, so it cannot clobber the
-    // input — and a stray `-` file left in the working directory must not make
-    // this guard canonicalise something that is not the destination.
-    if is_stdout_path(output) {
-        return Ok(());
-    }
-
-    let same_path = output == input
-        || (output.exists() && std::fs::canonicalize(output)? == std::fs::canonicalize(input)?);
-    if same_path {
-        anyhow::bail!(
-            "--output {} must differ from --input {} (would truncate the input BAM)",
-            output.display(),
-            input.display()
-        );
-    }
-    Ok(())
 }
 
 impl Command for Fastq {
-    fn execute(&self, _command_line: &str) -> Result<()> {
+    fn execute(&self, command_line: &str) -> Result<()> {
         validate_input_exists(&self.input, "Input BAM")?;
-        reject_output_clobbering_input(&self.input, self.output.as_ref())?;
 
-        match &self.output {
-            // `-` and `/dev/stdout` name the stream that omitting `--output`
-            // already writes. Spelling it out is what makes this command follow
-            // the same `-` convention as the rest of the CLI; before, `-o -`
-            // created a regular file called `-`.
-            Some(path) if is_stdout_path(path) => self.write_to_stdout(),
-            // A `.gz`/`.bgz` output path must actually be compressed. Writing plain
-            // text under a `.gz` name produces a file every downstream tool rejects.
-            // BGZF is gzip-compatible, so `zcat`/`gzip -d` read it, and it stays
-            // block-indexable.
-            Some(path) if is_gzip_output_path(path) => {
-                let file = std::fs::File::create(path)?;
-                let mut writer = BgzfFastqWriter::new(file, BGZF_OUTPUT_COMPRESSION_LEVEL);
-                self.run_with_writer(&mut writer)?;
-                // Append the BGZF EOF marker so the stream is not seen as truncated.
-                writer.finish()?;
-                Ok(())
-            }
-            Some(path) => {
-                let file = std::fs::File::create(path)?;
-                let mut writer = BufWriter::with_capacity(FASTQ_BUF_CAPACITY, file);
-                self.run_with_writer(&mut writer)?;
-                // `BufWriter`'s `Drop` flushes but discards the error, so a failed
-                // final write — a full disk here — would leave a truncated FASTQ
-                // behind an exit code of zero. Flush explicitly to report it, as
-                // the `.gz` arm's `finish` already does.
-                writer.flush()?;
-                Ok(())
-            }
-            None => self.write_to_stdout(),
+        if self.bwa_chunk_size != DEFAULT_BWA_CHUNK_SIZE {
+            info!(
+                "--bwa-chunk-size ({}) is deprecated and ignored; output batching is now managed \
+                 by the pipeline (tune with --max-memory)",
+                self.bwa_chunk_size
+            );
         }
-    }
-}
 
-/// Output buffer size — 64MB, for efficient pipe throughput.
-const FASTQ_BUF_CAPACITY: usize = 64 * 1024 * 1024;
+        // Refuse to clobber the input BAM or route two streams to the same file
+        // before opening anything (a sink truncates its path on create). Only
+        // user-specified outputs are checked; the default interleaved stdout
+        // (`self.output == None`) names no file and is skipped. `reject_output_collisions`
+        // handles output-vs-output (including stdout multiplexing and `./`/symlink
+        // aliases, with `/dev/null` exempt); `reject_write_aliasing_input` handles
+        // output-vs-input.
+        let mut outputs: Vec<(&Path, &str)> = Vec::new();
+        if let Some(p) = &self.output {
+            outputs.push((p.as_path(), "--output"));
+        }
+        if let Some(p) = &self.out1 {
+            outputs.push((p.as_path(), "--out1"));
+        }
+        if let Some(p) = &self.out2 {
+            outputs.push((p.as_path(), "--out2"));
+        }
+        if let Some(p) = &self.out0 {
+            outputs.push((p.as_path(), "--out0"));
+        }
+        // Paired mode with no `--out0` routes "other" (single-end / ambiguous)
+        // reads to stdout (`SinkSpec::FastqPaired`), so register that implicit
+        // stdout target; otherwise `--out1 -` (or `--out2 -`) would multiplex
+        // onto the same stdout the "other" stream uses and slip past the guard.
+        if self.out1.is_some() && self.out0.is_none() {
+            outputs.push((Path::new("-"), "--out0 (default: stdout)"));
+        }
+        reject_output_collisions(&outputs)?;
+        self.reject_write_aliasing_input(&outputs)?;
 
-impl Fastq {
-    /// Writes uncompressed FASTQ to stdout.
-    ///
-    /// Uncompressed regardless of how stdout was asked for: this stream is meant
-    /// to be piped into an aligner, which wants plain FASTQ.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a record cannot be written, or if the final flush
-    /// fails — `EPIPE` when the aligner on the other end exits early. Dropping
-    /// the [`BufWriter`] would swallow that flush error and report success on a
-    /// truncated stream.
-    fn write_to_stdout(&self) -> Result<()> {
-        let mut writer = BufWriter::with_capacity(FASTQ_BUF_CAPACITY, stdout().lock());
-        self.run_with_writer(&mut writer)?;
-        writer.flush()?;
-        Ok(())
+        self.log_config();
+
+        // Paired split output (`-1`/`-2`, optionally `-0`) runs through the
+        // typed-step chain: BAM source → Stage::Fastq 3-way encode → three
+        // per-file raw writers (BGZF for `.gz`), all sharing one work-stealing
+        // pool. clap guarantees `--out1`/`--out2` come together and conflict with
+        // `--output`, so `out1.is_some()` is the paired-mode discriminant.
+        if let Some(out1) = &self.out1 {
+            let out2 = self.out2.as_ref().expect("out2 present in paired mode");
+            info!("R1 -> {}", out1.display());
+            info!("R2 -> {}", out2.display());
+            match &self.out0 {
+                Some(out0) => info!("other -> {}", out0.display()),
+                None => info!("other -> stdout"),
+            }
+            return crate::pipeline::chains::build_for(
+                self.build_paired_chain_spec(command_line)?,
+            )?
+            .run();
+        }
+
+        // Interleaved output runs through the same chain: BAM source →
+        // Stage::Fastq encode (pool-spread) → one raw writer (BGZF for `.gz`).
+        // `-` (or an omitted `--output`) writes to stdout.
+        let output = self.output.clone().unwrap_or_else(|| PathBuf::from("-"));
+        info!("Output -> {}", output.display());
+        let sink = crate::pipeline::chains::SinkSpec::Fastq(output);
+        crate::pipeline::chains::build_for(self.build_chain_spec(sink, command_line)?)?.run()
     }
 }
 
@@ -408,58 +447,28 @@ fn encode_quality_into(quals: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// BGZF compression level used for `.gz`/`.bgz` FASTQ output.
+/// Default `--bwa-chunk-size`; kept only so a non-default value can be detected
+/// and a deprecation notice logged. Output batching is managed by the pipeline
+/// now, so the value is otherwise ignored (see [`Fastq::execute`]).
+const DEFAULT_BWA_CHUNK_SIZE: u64 = 150_000_000;
+
+/// BGZF compression level for `.gz`/`.bgz`/`.bgzf` FASTQ output.
 ///
 /// 6 is the zlib/bgzip default: a middle trade-off between output size and CPU,
-/// appropriate for an intermediate file handed straight to an aligner.
-const BGZF_OUTPUT_COMPRESSION_LEVEL: u32 = 6;
+/// appropriate for an intermediate file handed straight to an aligner. Carried
+/// on the chain's [`CompressionOptions`] and applied by the sink's `BgzfCompress`
+/// step.
+const FASTQ_GZIP_LEVEL: u32 = 6;
 
-/// Returns `true` if `path` names a gzip-family output that must be compressed.
-fn is_gzip_output_path(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("gz") || e.eq_ignore_ascii_case("bgz"))
-}
-
-/// `io::Write` adapter that block-compresses FASTQ text as BGZF.
+/// Lean default total in-flight queue-memory budget (MiB) for `fgumi fastq` when
+/// the user leaves `--max-memory` at its per-thread default.
 ///
-/// BGZF is gzip-compatible, so any consumer that reads `.gz` reads this, while the
-/// output stays block-indexable. The BGZF EOF marker is appended on drop-free
-/// finalization (`finish`), which `Write::flush` alone must not do — flush can be
-/// called mid-stream.
-struct BgzfFastqWriter<W: Write> {
-    inner: W,
-    compressor: fgumi_bgzf::InlineBgzfCompressor,
-}
-
-impl<W: Write> BgzfFastqWriter<W> {
-    fn new(inner: W, compression_level: u32) -> Self {
-        Self { inner, compressor: fgumi_bgzf::InlineBgzfCompressor::new(compression_level) }
-    }
-
-    /// Flushes remaining buffered bytes and appends the BGZF EOF marker so the
-    /// stream is complete and tools do not report a truncated file.
-    fn finish(&mut self) -> io::Result<()> {
-        self.compressor.flush()?;
-        self.compressor.write_blocks_to(&mut self.inner)?;
-        self.inner.write_all(&fgumi_bgzf::BGZF_EOF)?;
-        self.inner.flush()
-    }
-}
-
-impl<W: Write> Write for BgzfFastqWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.compressor.write_all(buf)?;
-        // Drain any blocks the compressor completed so memory stays bounded.
-        self.compressor.write_blocks_to(&mut self.inner)?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.compressor.write_blocks_to(&mut self.inner)?;
-        self.inner.flush()
-    }
-}
+/// FASTQ blocks are small and the chain is a short linear
+/// source → encode → write pipeline, so the sort/consensus-sized default
+/// (768 MiB/thread) is wildly oversized; a modest fixed total keeps RSS flat as
+/// `--threads` scales while staying well above the pipeline's steady-state
+/// working set. See [`Fastq::resolve_queue_memory`].
+const FASTQ_DEFAULT_QUEUE_MEMORY_MB: u64 = 256;
 
 /// How to append a record's UMI to its read name.
 ///
@@ -637,17 +646,19 @@ pub(crate) fn classify_segment(flags: u16) -> Segment {
     }
 }
 
-/// Returns `true` if `path` should be written compressed (ends in
-/// `.gz`/`.bgz`/`.bgzf`).
+/// Returns `true` if `path` names a gzip-family output that must be written as
+/// BGZF — extension `gz`/`bgz`/`bgzf`, matched case-insensitively.
 ///
-/// KNOWN DIVERGENCE — reconcile in the fastq WIRING PR: this is case-SENSITIVE
-/// and also matches `.bgzf`, whereas the live standalone equivalent
-/// [`is_gzip_output_path`] is case-INSENSITIVE and matches only `gz`/`bgz`. The
-/// two decide the same thing ("is this output gzip-compressed?") and should be a
-/// single shared function once the fastq stage is wired onto the chain; they
-/// cannot diverge in observable behavior today because this path is dormant.
+/// The single gzip-detection function for `fgumi fastq`: it decides both the
+/// interleaved `-o` sink and each paired `-1`/`-2`/`-0` sink (through the chain
+/// builder's `wire_fastq_output`). Case-insensitive so `OUT.FQ.GZ` is still
+/// compressed rather than written as plain text under a `.GZ` name.
 pub(crate) fn path_is_gzip(path: &Path) -> bool {
-    matches!(path.extension().and_then(|e| e.to_str()), Some("gz" | "bgz" | "bgzf"))
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        e.eq_ignore_ascii_case("gz")
+            || e.eq_ignore_ascii_case("bgz")
+            || e.eq_ignore_ascii_case("bgzf")
+    })
 }
 
 // ==== ported from feat-runall for the chain builder (R2) ====
@@ -694,18 +705,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case::gz_lower("out.fq.gz", true)]
-    #[case::gz_upper("OUT.FQ.GZ", true)]
-    #[case::bgz("out.fq.bgz", true)]
-    #[case::plain_fq("out.fq", false)]
-    #[case::plain_fastq("out.fastq", false)]
-    #[case::no_extension("out", false)]
-    #[case::gz_in_stem("out.gz.fq", false)]
-    fn test_is_gzip_output_path(#[case] path: &str, #[case] expected: bool) {
-        assert_eq!(is_gzip_output_path(std::path::Path::new(path)), expected);
-    }
-
-    #[rstest]
     // Default delimiters reproduce `samtools fastq -U`: name:UMI, duplex `-` -> `+`.
     #[case::simplex_umi(Some(("RX", &b"ACGT"[..])), ":", "+", "read1:ACGT")]
     #[case::duplex_umi(Some(("RX", &b"ACGT-TTTT"[..])), ":", "+", "read1:ACGT+TTTT")]
@@ -741,39 +740,6 @@ mod tests {
     #[test]
     fn test_umi_name_annotation_rejects_empty_tag_list() {
         assert!(UmiNameAnnotation::new(&[], ":", "+").is_err());
-    }
-
-    /// The BGZF writer must emit a real, decompressible BGZF stream terminated by
-    /// the EOF marker — a plain-text file under a `.gz` name is exactly the bug
-    /// this path exists to prevent.
-    #[test]
-    fn test_bgzf_fastq_writer_round_trips() {
-        let payload = b"@read1\nACGT\n+\nIIII\n@read2\nTTTT\n+\nJJJJ\n";
-        let mut out: Vec<u8> = Vec::new();
-        {
-            let mut writer = BgzfFastqWriter::new(&mut out, BGZF_OUTPUT_COMPRESSION_LEVEL);
-            writer.write_all(payload).expect("write");
-            writer.finish().expect("finish");
-        }
-
-        // Real BGZF/gzip magic, not plain text.
-        assert_eq!(&out[..2], &[0x1f, 0x8b], "output must carry gzip magic");
-        assert_ne!(&out[..1], b"@", "output must not be plain FASTQ text");
-
-        // Terminated by the BGZF EOF marker so readers do not see a truncated file.
-        assert!(out.ends_with(&fgumi_bgzf::BGZF_EOF), "BGZF stream must end with the EOF marker");
-
-        // And it decompresses back to exactly what went in.
-        let mut cursor = std::io::Cursor::new(&out);
-        let blocks = fgumi_bgzf::read_raw_blocks(&mut cursor, 64).expect("read blocks");
-        let mut decompressor = libdeflater::Decompressor::new();
-        let mut decoded = Vec::new();
-        for block in &blocks {
-            decoded.extend_from_slice(
-                &fgumi_bgzf::decompress_block(block, &mut decompressor).expect("decompress block"),
-            );
-        }
-        assert_eq!(decoded, payload);
     }
 
     /// Write reverse complement of sequence bytes to a buffer (test helper).
@@ -944,56 +910,12 @@ mod tests {
         assert_eq!(output, vec![73, 63, 33]);
     }
 
-    /// Resolve a case-table path spec against `dir`. `-` and `/dev/stdin` are
-    /// returned verbatim; anything else names a file inside `dir`.
-    fn resolve_path(dir: &std::path::Path, spec: &str) -> PathBuf {
-        if spec == "-" || spec == "/dev/stdin" { PathBuf::from(spec) } else { dir.join(spec) }
-    }
-
-    /// The clobber guard must reject an `--output` that names the `--input`
-    /// file, and must exempt stdin: `canonicalize("-")` fails with `NotFound`,
-    /// so canonicalising a stdin input would turn `--input -` into a confusing
-    /// IO error the moment `--output` happens to already exist.
-    #[rstest]
-    #[case::stdin_dash_with_existing_output("-", "out.fq", true, true)]
-    #[case::stdin_dev_stdin_with_existing_output("/dev/stdin", "out.fq", true, true)]
-    #[case::stdin_dash_with_new_output("-", "out.fq", false, true)]
-    #[case::distinct_paths_output_exists("in.bam", "out.fq", true, true)]
-    #[case::distinct_paths_output_missing("in.bam", "out.fq", false, true)]
-    #[case::output_is_input("in.bam", "in.bam", true, false)]
-    fn test_reject_output_clobbering_input(
-        #[case] input: &str,
-        #[case] output: &str,
-        #[case] output_exists: bool,
-        #[case] accepted: bool,
-    ) {
-        let dir = tempfile::TempDir::new().expect("create temp dir");
-        std::fs::write(dir.path().join("in.bam"), b"not a real bam").expect("write input");
-
-        let input_path = resolve_path(dir.path(), input);
-        let output_path = resolve_path(dir.path(), output);
-        if output_exists && !output_path.exists() {
-            std::fs::write(&output_path, b"prior run").expect("write output");
-        }
-
-        let result = reject_output_clobbering_input(&input_path, Some(&output_path));
-        assert_eq!(
-            result.is_ok(),
-            accepted,
-            "unexpected verdict for --input {input} --output {output}: {result:?}"
-        );
-        if !accepted {
-            let err = result.expect_err("case expects rejection").to_string();
-            assert!(err.contains("must differ"), "unexpected error message: {err}");
-        }
-    }
-
-    /// No `--output` means FASTQ goes to stdout, so there is nothing to clobber.
-    #[test]
-    fn test_reject_output_clobbering_input_allows_no_output() {
-        reject_output_clobbering_input(&PathBuf::from("in.bam"), None)
-            .expect("stdout output has nothing to clobber");
-    }
+    // Output-vs-output collision detection is provided by the reused
+    // `reject_output_collisions` helper (tested in `common.rs`), and the
+    // output-vs-input clobber guard (`reject_write_aliasing_input`) is exercised
+    // end-to-end by the integration tests (`test_fastq_output_same_as_input_rejected`,
+    // `_symlink_to_input_rejected`, `_paired_duplicate_output_rejected`), so no
+    // unit test duplicates them here.
 
     #[test]
     fn test_quality_encoding_edge_cases() {
@@ -1061,17 +983,18 @@ mod tests {
         assert_eq!(opts.passes_filters(flags), expected);
     }
 
-    /// `path_is_gzip` matches `gz`/`bgz`/`bgzf`, case-sensitively. See the fn's
-    /// KNOWN DIVERGENCE note vs the live `is_gzip_output_path` (the uppercase
-    /// case below pins that divergence, to be reconciled at fastq wiring).
+    /// `path_is_gzip` matches `gz`/`bgz`/`bgzf` as the final extension,
+    /// case-insensitively (so `OUT.FQ.GZ` is still compressed), and does not
+    /// match `.gz` mid-stem.
     #[rstest]
     #[case::gz("out.fq.gz", true)]
+    #[case::gz_upper("OUT.FQ.GZ", true)]
     #[case::bgz("out.fq.bgz", true)]
     #[case::bgzf("out.fq.bgzf", true)]
+    #[case::bgzf_mixed_case("out.fq.BgzF", true)]
     #[case::plain_fq("out.fq", false)]
     #[case::no_extension("out", false)]
     #[case::gz_in_stem("out.gz.fq", false)]
-    #[case::uppercase_not_matched("OUT.FQ.GZ", false)]
     fn path_is_gzip_matches_gz_bgz_bgzf(#[case] path: &str, #[case] expected: bool) {
         assert_eq!(path_is_gzip(std::path::Path::new(path)), expected);
     }
