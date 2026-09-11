@@ -412,18 +412,48 @@ throughout" from "parallel phase followed by a serial tail". Note that `io_in`
 collapses to near zero once the input is in page cache — a low `io_in` means the
 run was CPU-bound *on that invocation*, not that the tool does little I/O.
 
-**2. In-tree phase timers — the primary attribution tool.** `fgumi sort` already
-carries `SortPhaseTimer` (`crates/fgumi-sort/src/external.rs`): per-phase `f64`
-accumulators, a `time()` helper wrapping each span, and a `log_summary()` that
-emits `=== Sort Phase Timing ===` at `info!` (read+decompress / in-memory sort /
-spill write / consolidation / k-way merge / write output, each with a percentage).
-Prior campaigns got full baseline phase attribution from this with **zero new
-code** — just `RUST_LOG=info`.
+**2. In-tree phase timers — the primary attribution tool.** `fgumi sort` reports
+a `=== Sort Phase Timing ===` per-phase cumulative busy-time breakdown
+(read+decompress / in-memory sort / spill write / consolidation / k-way merge /
+write output, each with a percentage). Percentages are cumulative per-step
+busy-time shares — steps may run concurrently — not wall-clock proportions.
+Standalone `fgumi sort` runs on the declarative pipeline chain, where each phase
+is a discrete step and the runtime already records every step's cumulative busy
+time; the breakdown is re-derived from that end-of-run stats snapshot
+(`SortPhaseTimingFinalizeHook`,
+`src/lib/pipeline/chains/commands/sort.rs`). Enable it with **`RUST_LOG=info` plus
+`FGUMI_PIPELINE_STATS=1`** — standalone `fgumi sort` does not accept
+`--pipeline-stats` (that flag exists only on commands that flatten it, e.g. the
+runall front-end, which honor it too). The phase-timing *report* is opt-in via
+`FGUMI_PIPELINE_STATS=1`; it does not itself add a collector, because the
+standalone sort path already attaches a `PipelineStats` collector for its
+default deadlock monitor (`deadlock_timeout: 10`). Other features may collect
+statistics regardless, so the report is what is gated, not stats collection:
 
-Mirror that pattern when optimizing any other command: the phases you would name
-in a design doc are exactly the phases worth timing, it works identically on
-macOS and Linux, and it cannot be defeated by inlining or missing symbols the way
-a sampling profiler can. Prefer adding a phase timer over fighting a profiler.
+```sh
+RUST_LOG=info FGUMI_PIPELINE_STATS=1 fgumi sort -i in.bam -o out.bam --order coordinate
+# ... logs the `=== Sort Phase Timing ===` block plus the full `Pipeline
+#     end-of-run stats:` per-step table it is rolled up from.
+```
+
+The percentages are shares of cumulative per-step *busy* time (the steps run
+concurrently on the pool), not of wall clock — read them for "which phase
+dominates the sort work", and pair with `tricorder`'s `mean_load` / `--trace`
+above for the wall-clock / core-utilisation picture. The block is emitted only
+for a standalone `fgumi sort` (a sole-sort chain, where the chain's phases are
+exactly the sort's); a fused pipeline such as `runall` does not print it, and
+SAM-input parse time (a source adapter, not a sort step) is not counted. The
+library-level
+`fgumi-sort` engine still carries its own always-on `SortPhaseTimer`
+(`crates/fgumi-sort/src/external.rs`, per-phase `f64` accumulators + a
+`time()`-wrapped `log_summary()`) for callers that drive `RawExternalSorter`
+directly rather than through the chain.
+
+Mirror the phase-timing pattern when optimizing any other command: the phases
+you would name in a design doc are exactly the phases worth timing, it works
+identically on macOS and Linux, and it cannot be defeated by inlining or missing
+symbols the way a sampling profiler can. Prefer a phase breakdown over fighting a
+profiler.
 
 **3. `perf record` / `perf stat` on Linux (EC2)** when per-function or
 per-instruction attribution is genuinely required. This is the reliable path for
