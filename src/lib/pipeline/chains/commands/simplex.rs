@@ -80,10 +80,11 @@ pub(crate) struct ConsensusState {
     pub(crate) overlapping: Option<OverlappingBasesConsensusCaller>,
     /// Input header + library index, threaded in for the inline-metrics T2
     /// path so the metrics-on batch body can build `TemplateInfo`s via
-    /// `push_mi_group_entries` (Task 11). Present on every worker regardless of
-    /// whether metrics are on — only the metrics-on batch body reads them.
-    pub(crate) header: Arc<noodles::sam::Header>,
-    pub(crate) library_index: Arc<fgumi_bam_io::LibraryIndex>,
+    /// `push_mi_group_entries` (Task 11). `Some` only on the metrics-on path —
+    /// the metrics-off default builds and retains neither — and only the
+    /// metrics-on batch body reads them.
+    pub(crate) header: Option<Arc<noodles::sam::Header>>,
+    pub(crate) library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
 }
 
 impl crate::pipeline::core::item::HeapSize for ConsensusState {}
@@ -216,10 +217,11 @@ pub(crate) struct SimplexConsensusCaptures {
     pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedSimplexMetrics>>,
     pub(crate) min_reads: usize,
     pub(crate) progress: Arc<AtomicU64>,
-    /// Threaded onto every `ConsensusState` (see that struct); the metrics-on
-    /// step variants read them, the metrics-off variants ignore them.
-    pub(crate) header: Arc<noodles::sam::Header>,
-    pub(crate) library_index: Arc<fgumi_bam_io::LibraryIndex>,
+    /// Threaded onto every `ConsensusState` (see that struct); `Some` only on
+    /// the metrics-on path, where the metrics-on step variants read them. The
+    /// metrics-off default builds and carries neither.
+    pub(crate) header: Option<Arc<noodles::sam::Header>>,
+    pub(crate) library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
     /// QC captures for the metrics-ON T2 path; `None` on metrics-off/T1
     /// builds.
     pub(crate) qc_metrics: Option<Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>>,
@@ -236,8 +238,8 @@ fn make_simplex_consensus_init(
     methylation_ref: MethylationRef,
     track_rejects: bool,
     overlapping_enabled: bool,
-    header: Arc<noodles::sam::Header>,
-    library_index: Arc<fgumi_bam_io::LibraryIndex>,
+    header: Option<Arc<noodles::sam::Header>>,
+    library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
 ) -> impl Fn() -> ConsensusState + Send + Sync + 'static {
     move || {
         let mut caller = VanillaUmiConsensusCaller::new_with_rejects_tracking(
@@ -260,8 +262,8 @@ fn make_simplex_consensus_init(
         ConsensusState {
             caller,
             overlapping,
-            header: Arc::clone(&header),
-            library_index: Arc::clone(&library_index),
+            header: header.clone(),
+            library_index: library_index.clone(),
         }
     }
 }
@@ -393,8 +395,13 @@ fn run_simplex_consensus_batch_with_metrics(
 ) -> io::Result<(DecompressedBlock, Option<DecompressedBlock>)> {
     let batch_serial = item.batch_serial;
     let mut metrics_entries = Vec::new();
+    // This body runs only on the metrics-on path (it requires `qc`), so the
+    // header/library index are always present here.
+    let header = state.header.as_ref().expect("metrics-on state carries the header");
+    let library_index =
+        state.library_index.as_ref().expect("metrics-on state carries the library index");
     for group in &item.groups {
-        push_mi_group_entries(group, &state.header, &state.library_index, &mut metrics_entries)
+        push_mi_group_entries(group, header, library_index, &mut metrics_entries)
             .map_err(|e| io::Error::other(format!("metrics conversion error: {e:#}")))?;
     }
     let runs = crate::inline_metrics_collector::split_into_runs(metrics_entries);

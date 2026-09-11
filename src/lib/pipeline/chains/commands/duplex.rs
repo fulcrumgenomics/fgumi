@@ -86,9 +86,10 @@ pub(crate) struct DuplexState {
     /// `(single_strand_allowed || has_both_strands_raw(..))` condition.
     pub(crate) single_strand_allowed: bool,
     /// Input header + library index for the inline-metrics T2 path (Task 11);
-    /// read only by the metrics-on batch body.
-    pub(crate) header: Arc<noodles::sam::Header>,
-    pub(crate) library_index: Arc<fgumi_bam_io::LibraryIndex>,
+    /// `Some` only on the metrics-on path and read only by the metrics-on batch
+    /// body — the metrics-off default builds and carries neither.
+    pub(crate) header: Option<Arc<noodles::sam::Header>>,
+    pub(crate) library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
 }
 
 impl crate::pipeline::core::item::HeapSize for DuplexState {}
@@ -242,9 +243,11 @@ pub(crate) struct DuplexConsensusCaptures {
     pub(crate) cell_tag: noodles::sam::alignment::record::data::field::Tag,
     pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedDuplexMetrics>>,
     pub(crate) progress: Arc<AtomicU64>,
-    /// Threaded onto every `DuplexState`; read only by the metrics-on variants.
-    pub(crate) header: Arc<noodles::sam::Header>,
-    pub(crate) library_index: Arc<fgumi_bam_io::LibraryIndex>,
+    /// Threaded onto every `DuplexState`; `Some` only on the metrics-on path,
+    /// where the metrics-on variants read them. The metrics-off default carries
+    /// neither.
+    pub(crate) header: Option<Arc<noodles::sam::Header>>,
+    pub(crate) library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
     /// QC captures for the metrics-ON T2 path; `None` on metrics-off/T1
     /// builds.
     pub(crate) qc_metrics: Option<Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>>,
@@ -275,8 +278,8 @@ fn make_duplex_consensus_init(
     methylation_mode: fgumi_consensus::MethylationMode,
     overlapping_enabled: bool,
     tie_rule: fgumi_consensus::TieRule,
-    header: Arc<noodles::sam::Header>,
-    library_index: Arc<fgumi_bam_io::LibraryIndex>,
+    header: Option<Arc<noodles::sam::Header>>,
+    library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
 ) -> impl Fn() -> DuplexState + Send + Sync + 'static {
     move || {
         let mut caller = DuplexConsensusCaller::new(
@@ -313,8 +316,8 @@ fn make_duplex_consensus_init(
             caller,
             overlapping,
             single_strand_allowed,
-            header: Arc::clone(&header),
-            library_index: Arc::clone(&library_index),
+            header: header.clone(),
+            library_index: library_index.clone(),
         }
     }
 }
@@ -436,8 +439,13 @@ fn run_duplex_consensus_batch_with_metrics(
 ) -> io::Result<(DecompressedBlock, Option<DecompressedBlock>)> {
     let batch_serial = item.batch_serial;
     let mut metrics_entries = Vec::new();
+    // This body runs only on the metrics-on path (it requires `qc`), so the
+    // header/library index are always present here.
+    let header = state.header.as_ref().expect("metrics-on state carries the header");
+    let library_index =
+        state.library_index.as_ref().expect("metrics-on state carries the library index");
     for group in &item.groups {
-        push_mi_group_entries(group, &state.header, &state.library_index, &mut metrics_entries)
+        push_mi_group_entries(group, header, library_index, &mut metrics_entries)
             .map_err(|e| io::Error::other(format!("metrics conversion error: {e:#}")))?;
     }
     let runs = crate::inline_metrics_collector::split_into_runs(metrics_entries);

@@ -368,6 +368,38 @@ fn duplex_fallback_init() -> ConsensusMetricsSlot {
     ConsensusMetricsSlot::new_duplex(false)
 }
 
+/// The canonical files `write_simplex_metrics_files` emits for `output_prefix`.
+///
+/// Kept in lockstep with that writer so callers that must know the outputs
+/// ahead of time — notably runall's `--output` collision guard — never drift
+/// from what is actually written.
+pub(crate) fn simplex_metrics_paths(output_prefix: &Path) -> Vec<PathBuf> {
+    ["family_sizes.txt", "umi_counts.txt", "simplex_yield_metrics.txt"]
+        .iter()
+        .map(|suffix| with_extension(output_prefix, suffix))
+        .collect()
+}
+
+/// The canonical files `write_duplex_metrics_files` may emit for `output_prefix`.
+///
+/// Includes `duplex_umi_counts.txt`, which that writer emits only when duplex
+/// UMI counts are enabled; the collision guard registers the superset so a
+/// colliding `--output` is rejected regardless of that runtime flag. Codec
+/// consensus reuses the duplex metrics writer (`MetricsThresholds::Duplex`), so
+/// it shares this set. Kept in lockstep with `write_duplex_metrics_files`.
+pub(crate) fn duplex_metrics_paths(output_prefix: &Path) -> Vec<PathBuf> {
+    [
+        "family_sizes.txt",
+        "duplex_family_sizes.txt",
+        "umi_counts.txt",
+        "duplex_umi_counts.txt",
+        "duplex_yield_metrics.txt",
+    ]
+    .iter()
+    .map(|suffix| with_extension(output_prefix, suffix))
+    .collect()
+}
+
 /// Writes the same three files the separate-pass `simplex-metrics` command
 /// writes (`simplex_metrics.rs`'s `execute()` tail): `<prefix>.family_sizes.txt`,
 /// `<prefix>.umi_counts.txt`, `<prefix>.simplex_yield_metrics.txt`. The 100%
@@ -569,11 +601,29 @@ pub(crate) fn coordinate_group_from_processed_position(
     header: &noodles::sam::Header,
     library_index: &LibraryIndex,
 ) -> Result<Vec<TemplateInfo>> {
+    // fgbio R1/R2 filter, mirroring the standalone T2 path
+    // (`pair_records_by_read_name`): paired, both mates mapped, primary.
+    // `Template::r1()`/`r2()` already drop secondary/supplementary records, but
+    // `build_template_info_with_mi` checks only reference ids and CIGAR — not
+    // the PAIRED/UNMAPPED/MATE_UNMAPPED flags. Without this guard, a primary
+    // pair with inconsistent flags would be counted by T1 (fused) yet excluded
+    // by T2, diverging the two metrics paths.
+    let mate_pair_qualifies = |r: &RawRecord| -> bool {
+        let f = r.flags();
+        (f & raw_flags::PAIRED) != 0
+            && (f & raw_flags::UNMAPPED) == 0
+            && (f & raw_flags::MATE_UNMAPPED) == 0
+            && (f & raw_flags::SECONDARY) == 0
+            && (f & raw_flags::SUPPLEMENTARY) == 0
+    };
     let mut infos = Vec::with_capacity(templates.len());
     for template in templates {
         let (Some(r1), Some(r2)) = (template.r1(), template.r2()) else {
             continue;
         };
+        if !mate_pair_qualifies(r1) || !mate_pair_qualifies(r2) {
+            continue;
+        }
         if let Some((info, _key)) =
             build_template_info_with_mi(r1, r2, header, library_index, template.mi.to_string())?
         {
@@ -1177,6 +1227,56 @@ mod coordinate_group_from_processed_position_tests {
             .expect("converts");
 
         assert!(infos.is_empty(), "a template missing R2 must be silently omitted");
+    }
+
+    /// Regression: a primary pair carrying an inconsistent flag (here
+    /// `MATE_UNMAPPED`) survives `Template::from_records` (which filters only
+    /// secondary/supplementary), so T1 must apply the same PAIRED/mapped
+    /// predicate the standalone T2 path (`pair_records_by_read_name`) uses and
+    /// omit it — otherwise T1 counts a template T2 excludes.
+    #[test]
+    fn coordinate_group_from_processed_position_omits_a_primary_pair_with_an_unmapped_mate() {
+        use fgumi_raw_bam::{SamBuilder as RawSamBuilder, testutil::encode_op};
+
+        let header = crate::commands::shared_metrics::tests::test_header();
+        let seq = vec![b'A'; 100];
+        let quals = vec![30u8; 100];
+        let cigar = encode_op(0, 100); // 100M
+
+        let build = |first: bool, pos: i32, mate_pos: i32| -> RawRecord {
+            let seg = if first { raw_flags::FIRST_SEGMENT } else { raw_flags::LAST_SEGMENT };
+            let mut b = RawSamBuilder::new();
+            // PAIRED + primary + this mate mapped, but MATE_UNMAPPED asserted —
+            // the exact inconsistency the T2 predicate rejects.
+            b.read_name(b"bad-mate")
+                .flags(raw_flags::PAIRED | seg | raw_flags::MATE_UNMAPPED)
+                .ref_id(0)
+                .pos(pos)
+                .mapq(60)
+                .cigar_ops(&[cigar])
+                .sequence(&seq)
+                .qualities(&quals)
+                .mate_ref_id(0)
+                .mate_pos(mate_pos);
+            b.add_string_tag(crate::sam::SamTag::RX, b"ACGT-TGCA");
+            let buf = fgumi_raw_bam::raw_record_to_record_buf(
+                &b.build(),
+                &noodles::sam::Header::default(),
+            )
+            .expect("decode");
+            fgumi_raw_bam::encode_record_buf_to_raw(&buf, &header).expect("encode")
+        };
+
+        let template = Template::from_records(vec![build(true, 99, 149), build(false, 149, 99)])
+            .expect("builds template");
+        let library_index = LibraryIndex::from_header(&header);
+        let infos = coordinate_group_from_processed_position(&[template], &header, &library_index)
+            .expect("converts");
+
+        assert!(
+            infos.is_empty(),
+            "a primary pair with MATE_UNMAPPED must be omitted to match the T2 path"
+        );
     }
 
     #[test]

@@ -148,8 +148,11 @@ pub(crate) fn build_group_process_step(
     filter_config: TemplateFilterConfig,
     accumulators: Arc<PerThreadAccumulator<GroupMetricsAccumulator>>,
     consensus_metrics: Option<Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>>,
-    header: Arc<noodles::sam::Header>,
-    library_index: Arc<fgumi_bam_io::LibraryIndex>,
+    // `Some` exactly when `consensus_metrics` is `Some` — both are built together
+    // in `add_group` only when a downstream consensus stage requested metrics.
+    // `None` on the default (metrics-off) path, so nothing is cloned or retained.
+    header: Option<Arc<noodles::sam::Header>>,
+    library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
 ) -> ProcessOrdered<
     BatchedRawPositionGroups,
     BatchedProcessedPositionGroups,
@@ -294,12 +297,18 @@ pub(crate) fn build_group_process_step(
                 // stage in this chain requested `--metrics`, record this
                 // position group's templates into the shared accumulator now,
                 // reusing the already-decoded `Template`s (no second BAM read).
-                if let Some(consensus_metrics) = &consensus_metrics {
+                // `header`/`library_index` are `Some` exactly when
+                // `consensus_metrics` is (built together in `add_group`), so the
+                // three-way match both drives the tap and unwraps the metrics
+                // header/library index without a separate expect.
+                if let (Some(consensus_metrics), Some(header), Some(library_index)) =
+                    (&consensus_metrics, &header, &library_index)
+                {
                     let infos =
                         crate::inline_metrics_collector::coordinate_group_from_processed_position(
                             &templates,
-                            &header,
-                            &library_index,
+                            header,
+                            library_index,
                         )
                         .map_err(io::Error::other)?;
                     consensus_metrics

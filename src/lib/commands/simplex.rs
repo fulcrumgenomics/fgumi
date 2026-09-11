@@ -530,6 +530,10 @@ mod tests {
             "em-seq",
             "--ref",
             "ref.fa",
+            "--metrics",
+            "mx",
+            "--intervals",
+            "iv.bed",
             "--allow-unmapped=true",
         ])
         .expect("parses");
@@ -564,6 +568,16 @@ mod tests {
         assert_eq!(opts.read_group.read_name_prefix, Some("pfx".to_string()));
         assert_eq!(opts.rejects_opts.rejects, Some(std::path::PathBuf::from("rej.bam")));
         assert_eq!(opts.stats_opts.stats, Some(std::path::PathBuf::from("stats.txt")));
+        assert_eq!(
+            opts.metrics,
+            Some(std::path::PathBuf::from("mx")),
+            "--metrics must reach the projection"
+        );
+        assert_eq!(
+            opts.intervals,
+            Some(std::path::PathBuf::from("iv.bed")),
+            "--intervals must reach the projection"
+        );
     }
 
     /// The projection must carry defaults faithfully too — a field hard-coded to
@@ -599,6 +613,8 @@ mod tests {
         assert_eq!(opts.stats_opts.stats, None);
         assert_eq!(opts.read_group.read_group_id, "A");
         assert_eq!(opts.read_group.read_name_prefix, None);
+        assert_eq!(opts.metrics, None, "--metrics default must be None, not hard-coded");
+        assert_eq!(opts.intervals, None, "--intervals default must be None, not hard-coded");
     }
 
     use crate::metrics::consensus::ConsensusKvMetric;

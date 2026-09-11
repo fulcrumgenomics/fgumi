@@ -3246,16 +3246,18 @@ impl<'a> ChainBuilder<'a> {
         // add_simplex/add_duplex/add_codec runs) so both the T1 tap closure in
         // build_group_process_step and that stage's FinalizeHook share one
         // accumulator Arc. `self.spec.stage_opts.{simplex,duplex,codec}` are
-        // themselves consensus-feature-gated, so the whole peek is gated; the
-        // header/library index are needed on both feature paths.
-        let header_arc = Arc::new(self.header.clone());
-        let library_index_arc = Arc::new(fgumi_bam_io::LibraryIndex::from_header(&self.header));
-
+        // themselves consensus-feature-gated, so the whole peek is gated. The
+        // header/library index are built below, only when metrics are on.
         #[cfg(feature = "consensus")]
         let consensus_metrics: Option<
             Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>,
-        > = if let Some(simplex) =
-            self.spec.stage_opts.simplex.as_ref().filter(|s| s.metrics.is_some())
+        > = if let Some(simplex) = self
+            .spec
+            .stages
+            .contains(&Stage::Simplex)
+            .then_some(self.spec.stage_opts.simplex.as_ref())
+            .flatten()
+            .filter(|s| s.metrics.is_some())
         {
             Some(Arc::new(build_consensus_metrics_captures(
                 simplex.metrics.as_ref().unwrap(),
@@ -3263,8 +3265,13 @@ impl<'a> ChainBuilder<'a> {
                 num_threads,
                 crate::inline_metrics_collector::ConsensusMetricsSlot::new_simplex,
             )?))
-        } else if let Some(duplex) =
-            self.spec.stage_opts.duplex.as_ref().filter(|d| d.metrics.is_some())
+        } else if let Some(duplex) = self
+            .spec
+            .stages
+            .contains(&Stage::Duplex)
+            .then_some(self.spec.stage_opts.duplex.as_ref())
+            .flatten()
+            .filter(|d| d.metrics.is_some())
         {
             Some(Arc::new(build_consensus_metrics_captures(
                 duplex.metrics.as_ref().unwrap(),
@@ -3272,8 +3279,13 @@ impl<'a> ChainBuilder<'a> {
                 num_threads,
                 || crate::inline_metrics_collector::ConsensusMetricsSlot::new_duplex(false),
             )?))
-        } else if let Some(codec) =
-            self.spec.stage_opts.codec.as_ref().filter(|c| c.metrics.is_some())
+        } else if let Some(codec) = self
+            .spec
+            .stages
+            .contains(&Stage::Codec)
+            .then_some(self.spec.stage_opts.codec.as_ref())
+            .flatten()
+            .filter(|c| c.metrics.is_some())
         {
             Some(Arc::new(build_consensus_metrics_captures(
                 codec.metrics.as_ref().unwrap(),
@@ -3290,6 +3302,20 @@ impl<'a> ChainBuilder<'a> {
         > = None;
 
         self.consensus_metrics_captures.clone_from(&consensus_metrics);
+
+        // Only `build_group_process_step`'s T1 metrics tap reads these, and that
+        // tap fires only when a downstream consensus stage requested metrics
+        // (i.e. `consensus_metrics` is `Some`). Build them solely in that case so
+        // a metrics-off chain (the default) pays neither the header clone nor the
+        // `LibraryIndex::from_header` construction, and retains neither.
+        let (header_arc, library_index_arc) = if consensus_metrics.is_some() {
+            (
+                Some(Arc::new(self.header.clone())),
+                Some(Arc::new(fgumi_bam_io::LibraryIndex::from_header(&self.header))),
+            )
+        } else {
+            (None, None)
+        };
 
         // ── Step factories (see chains::commands::group) ──────────────────
         let process_step = build_group_process_step(
@@ -3606,13 +3632,6 @@ impl<'a> ChainBuilder<'a> {
 
         // ── Step factories (see chains::commands::simplex) ────────────────
 
-        // The consensus step reads INPUT records (grouped by MI), so their ref
-        // IDs index into the input header — build the metrics header/library
-        // index from `input_header`, not the (now-replaced) consensus output
-        // `self.header`.
-        let header_arc = Arc::new(input_header.clone());
-        let library_index_arc = Arc::new(fgumi_bam_io::LibraryIndex::from_header(&input_header));
-
         // Inline consensus metrics wiring. Two independent paths:
         //  - T1 (fused): add_group already built the shared captures and its
         //    tap closure fills the accumulator. Register the FinalizeHook that
@@ -3629,7 +3648,7 @@ impl<'a> ChainBuilder<'a> {
         //    the metrics files.
         let t1_captures = self.consensus_metrics_captures.take();
         if let Some(existing) = &t1_captures {
-            self.finalize.push(Box::new(
+            self.finalize_on_success.push(Box::new(
                 crate::inline_metrics_collector::ConsensusMetricsFinalizeHook {
                     accumulators: Arc::clone(&existing.accumulator),
                     output_prefix: existing.output_prefix.clone(),
@@ -3643,6 +3662,21 @@ impl<'a> ChainBuilder<'a> {
         }
         let metrics_on = t1_captures.is_none() && simplex.metrics.is_some();
 
+        // The consensus step's worker state reads these ONLY on the metrics-ON
+        // path (the T2 in-worker recorder), so build them solely when
+        // `metrics_on`; the metrics-off default retains neither. The metrics
+        // header/library index come from `input_header` (the consensus step
+        // reads INPUT records grouped by MI, whose ref IDs index the input
+        // header), not the now-replaced consensus output `self.header`.
+        let (header_arc, library_index_arc) = if metrics_on {
+            (
+                Some(Arc::new(input_header.clone())),
+                Some(Arc::new(fgumi_bam_io::LibraryIndex::from_header(&input_header))),
+            )
+        } else {
+            (None, None)
+        };
+
         // Build the T2 captures once (only when metrics_on); cloned into
         // `consensus_cap.qc_metrics` below and shared with the
         // `ConsensusMetricsFinalizeHook` registered here.
@@ -3653,7 +3687,7 @@ impl<'a> ChainBuilder<'a> {
                 num_threads,
                 crate::inline_metrics_collector::ConsensusMetricsSlot::new_simplex,
             )?);
-            self.finalize.push(Box::new(
+            self.finalize_on_success.push(Box::new(
                 crate::inline_metrics_collector::ConsensusMetricsFinalizeHook {
                     accumulators: Arc::clone(&captures.accumulator),
                     output_prefix: captures.output_prefix.clone(),
@@ -3966,10 +4000,6 @@ impl<'a> ChainBuilder<'a> {
 
         // ── Step factories (see chains::commands::duplex) ────────────────────
 
-        // Metrics header/library index from the INPUT header (see add_simplex).
-        let header_arc = Arc::new(input_header.clone());
-        let library_index_arc = Arc::new(fgumi_bam_io::LibraryIndex::from_header(&input_header));
-
         // Inline consensus metrics wiring (Task 11) — see add_simplex for the
         // T1/T2 split. Duplex thresholds: the BA (smaller-strand) threshold is
         // `min_yx_reads_for`; the AB (larger-strand) threshold is the inline
@@ -3985,7 +4015,7 @@ impl<'a> ChainBuilder<'a> {
 
         let t1_captures = self.consensus_metrics_captures.take();
         if let Some(existing) = &t1_captures {
-            self.finalize.push(Box::new(
+            self.finalize_on_success.push(Box::new(
                 crate::inline_metrics_collector::ConsensusMetricsFinalizeHook {
                     accumulators: Arc::clone(&existing.accumulator),
                     output_prefix: existing.output_prefix.clone(),
@@ -4000,6 +4030,18 @@ impl<'a> ChainBuilder<'a> {
         }
         let metrics_on = t1_captures.is_none() && duplex.metrics.is_some();
 
+        // Metrics header/library index from the INPUT header (see add_simplex),
+        // built only on the metrics-on path so the metrics-off default retains
+        // neither.
+        let (header_arc, library_index_arc) = if metrics_on {
+            (
+                Some(Arc::new(input_header.clone())),
+                Some(Arc::new(fgumi_bam_io::LibraryIndex::from_header(&input_header))),
+            )
+        } else {
+            (None, None)
+        };
+
         // Build the T2 captures once (only when metrics_on); cloned into
         // `consensus_cap.qc_metrics` below and shared with the
         // `ConsensusMetricsFinalizeHook` registered here.
@@ -4010,7 +4052,7 @@ impl<'a> ChainBuilder<'a> {
                 num_threads,
                 || crate::inline_metrics_collector::ConsensusMetricsSlot::new_duplex(false),
             )?);
-            self.finalize.push(Box::new(
+            self.finalize_on_success.push(Box::new(
                 crate::inline_metrics_collector::ConsensusMetricsFinalizeHook {
                     accumulators: Arc::clone(&captures.accumulator),
                     output_prefix: captures.output_prefix.clone(),
@@ -4329,10 +4371,6 @@ impl<'a> ChainBuilder<'a> {
 
         // ── Step factories (see chains::commands::codec) ─────────────────────
 
-        // Metrics header/library index from the INPUT header (see add_simplex).
-        let header_arc = Arc::new(input_header.clone());
-        let library_index_arc = Arc::new(fgumi_bam_io::LibraryIndex::from_header(&input_header));
-
         // ── Group-MI preamble: two paths depending on the incoming tail type ──
         //
         // Path 1 (normal): tail is DecodedRecordBatch → prepend GroupByMi.
@@ -4372,7 +4410,7 @@ impl<'a> ChainBuilder<'a> {
 
         let t1_captures = self.consensus_metrics_captures.take();
         if let Some(existing) = &t1_captures {
-            self.finalize.push(Box::new(
+            self.finalize_on_success.push(Box::new(
                 crate::inline_metrics_collector::ConsensusMetricsFinalizeHook {
                     accumulators: Arc::clone(&existing.accumulator),
                     output_prefix: existing.output_prefix.clone(),
@@ -4387,6 +4425,18 @@ impl<'a> ChainBuilder<'a> {
         }
         let metrics_on = t1_captures.is_none() && codec.metrics.is_some();
 
+        // Metrics header/library index from the INPUT header (see add_simplex),
+        // built only on the metrics-on path so the metrics-off default retains
+        // neither.
+        let (header_arc, library_index_arc) = if metrics_on {
+            (
+                Some(Arc::new(input_header.clone())),
+                Some(Arc::new(fgumi_bam_io::LibraryIndex::from_header(&input_header))),
+            )
+        } else {
+            (None, None)
+        };
+
         // Build the T2 captures once (only when metrics_on); cloned into
         // `consensus_cap.qc_metrics` below and shared with the
         // `ConsensusMetricsFinalizeHook` registered here.
@@ -4397,7 +4447,7 @@ impl<'a> ChainBuilder<'a> {
                 num_threads,
                 || crate::inline_metrics_collector::ConsensusMetricsSlot::new_duplex(false),
             )?);
-            self.finalize.push(Box::new(
+            self.finalize_on_success.push(Box::new(
                 crate::inline_metrics_collector::ConsensusMetricsFinalizeHook {
                     accumulators: Arc::clone(&captures.accumulator),
                     output_prefix: captures.output_prefix.clone(),

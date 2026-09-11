@@ -46,6 +46,12 @@ fn assert_metrics_file_eq(a_prefix: &Path, b_prefix: &Path, suffix: &str, contex
         .unwrap_or_else(|e| panic!("{context}: missing {suffix} at {}: {e}", a_prefix.display()));
     let b = std::fs::read_to_string(suffixed(b_prefix, suffix))
         .unwrap_or_else(|e| panic!("{context}: missing {suffix} at {}: {e}", b_prefix.display()));
+    if suffix.ends_with("family_sizes.txt") {
+        assert!(
+            a.lines().count() >= 2,
+            "{context}: {suffix} has no data rows — the parity assertion would be vacuous"
+        );
+    }
     assert_eq!(a, b, "{context}: {suffix} differs across thread counts");
 }
 

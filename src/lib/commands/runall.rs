@@ -1808,6 +1808,19 @@ impl Command for RunAll {
                 write_targets.push((stats.as_path(), "--filter::stats"));
             }
         }
+
+        // Metrics outputs the chain will open as writers, alongside the BAM. A
+        // `--output` (or another registered path) landing on one of these would
+        // let the metrics writer and the BAM writer corrupt the same file, so
+        // register every *effective* metrics path (see `metrics_write_targets`).
+        // These are COMPUTED paths (a prefix fanned out), so the helper hands
+        // back owned `PathBuf`s: hold them in a local that outlives the borrows
+        // pushed into `write_targets` below — a later `write_targets` push could
+        // otherwise dangle a reference into a dropped temporary.
+        let metrics_targets = metrics_write_targets(&stage_opts);
+        for (path, label) in &metrics_targets {
+            write_targets.push((path.as_path(), *label));
+        }
         crate::commands::common::reject_output_collisions(&write_targets)?;
 
         let spec = ChainSpec {
@@ -1831,6 +1844,62 @@ impl Command for RunAll {
         log::info!("runall completed successfully");
         Ok(())
     }
+}
+
+/// The metrics output paths the derived chain will open as writers, for the
+/// `--output` collision guard (a `--output` that lands on one of these would let
+/// the metrics writer and the BAM writer corrupt the same file).
+///
+/// Mirrors the standalone commands' own guards (group's `execute`, the consensus
+/// metrics writers). Group's `--metrics` prefix and each consensus stage's
+/// `--metrics` prefix fan out to several canonical files, so these are COMPUTED
+/// paths returned as owned `PathBuf`s; consensus fan-outs reuse the writers' own
+/// path helpers (`{simplex,duplex}_metrics_paths`) so this never drifts from the
+/// files actually written. Codec shares the duplex file set.
+fn metrics_write_targets(
+    stage_opts: &crate::pipeline::chains::StageOptionsBag,
+) -> Vec<(PathBuf, &'static str)> {
+    let mut targets: Vec<(PathBuf, &'static str)> = Vec::new();
+    if let Some(metrics) = stage_opts.correct.as_ref().and_then(|c| c.metrics.as_ref()) {
+        targets.push((metrics.clone(), "--correct::metrics"));
+    }
+    if let Some(group) = stage_opts.group.as_ref() {
+        if let Some(path) = group.family_size_histogram.as_ref() {
+            targets.push((path.clone(), "--group::family-size-histogram"));
+        }
+        if let Some(path) = group.grouping_metrics.as_ref() {
+            targets.push((path.clone(), "--group::grouping-metrics"));
+        }
+        // The `--metrics` prefix fans out to the three canonical group files
+        // (see group's `write_metrics_for_chain` / `execute`).
+        if let Some(prefix) = group.metrics_prefix.as_ref() {
+            for suffix in ["family_sizes.txt", "grouping_metrics.txt", "position_group_sizes.txt"] {
+                targets.push((
+                    crate::commands::group::with_extension(prefix, suffix),
+                    "--group::metrics",
+                ));
+            }
+        }
+    }
+    #[cfg(feature = "consensus")]
+    {
+        if let Some(prefix) = stage_opts.simplex.as_ref().and_then(|o| o.metrics.as_ref()) {
+            for path in crate::inline_metrics_collector::simplex_metrics_paths(prefix) {
+                targets.push((path, "--simplex::metrics"));
+            }
+        }
+        if let Some(prefix) = stage_opts.duplex.as_ref().and_then(|o| o.metrics.as_ref()) {
+            for path in crate::inline_metrics_collector::duplex_metrics_paths(prefix) {
+                targets.push((path, "--duplex::metrics"));
+            }
+        }
+        if let Some(prefix) = stage_opts.codec.as_ref().and_then(|o| o.metrics.as_ref()) {
+            for path in crate::inline_metrics_collector::duplex_metrics_paths(prefix) {
+                targets.push((path, "--codec::metrics"));
+            }
+        }
+    }
+    targets
 }
 
 #[cfg(test)]
@@ -2480,6 +2549,180 @@ mod bag_tests {
         assert_eq!(
             r.build_stage_options_bag(&[Stage::Codec]).unwrap().codec.unwrap().metrics,
             Some(PathBuf::from("all.codec"))
+        );
+    }
+
+    // ── metrics_write_targets: the --output collision guard registers EVERY
+    //    effective metrics path (group + consensus prefix fan-outs, correct),
+    //    not just rejects/stats. A `--output` on any of these would let two
+    //    writers corrupt one file, so all must be visible to
+    //    `reject_output_collisions`.
+
+    /// Collect just the paths `metrics_write_targets` returns, as strings.
+    fn target_paths(bag: &crate::pipeline::chains::StageOptionsBag) -> Vec<String> {
+        metrics_write_targets(bag).into_iter().map(|(p, _)| p.display().to_string()).collect()
+    }
+
+    #[test]
+    fn metrics_write_targets_empty_when_no_metrics_requested() {
+        // A plain group run with no metrics flags registers no metrics targets.
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Group]).unwrap();
+        assert!(metrics_write_targets(&bag).is_empty());
+    }
+
+    #[test]
+    fn metrics_write_targets_registers_correct_metrics() {
+        let r = parse(&[
+            "--start-from",
+            "correct",
+            "--stop-after",
+            "correct",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--correct::min-distance",
+            "1",
+            "--correct::umis",
+            "AAAA",
+            "--all-metrics",
+            "all",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Correct]).unwrap();
+        assert_eq!(target_paths(&bag), vec!["all.correct.metrics.txt".to_string()]);
+    }
+
+    #[test]
+    fn metrics_write_targets_registers_the_group_prefix_fanout() {
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+            "--all-metrics",
+            "all",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Group]).unwrap();
+        // The `--metrics` prefix (`all.group`) fans out to all three canonical
+        // group files — each must be registered so `--output` cannot land on one.
+        assert_eq!(
+            target_paths(&bag),
+            vec![
+                "all.group.family_sizes.txt".to_string(),
+                "all.group.grouping_metrics.txt".to_string(),
+                "all.group.position_group_sizes.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn metrics_write_targets_registers_explicit_group_metrics_flags() {
+        // Explicit `--group::family-size-histogram` / `--group::grouping-metrics`
+        // are separate outputs from the `--metrics` prefix and must also register.
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+            "--group::family-size-histogram",
+            "fs.txt",
+            "--group::grouping-metrics",
+            "gm.txt",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Group]).unwrap();
+        assert_eq!(target_paths(&bag), vec!["fs.txt".to_string(), "gm.txt".to_string()]);
+    }
+
+    #[cfg(feature = "consensus")]
+    #[test]
+    fn metrics_write_targets_registers_the_simplex_prefix_fanout() {
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "paired",
+            "--consensus",
+            "simplex",
+            "--simplex::min-reads",
+            "1",
+            "--all-metrics",
+            "all",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Simplex]).unwrap();
+        assert_eq!(
+            target_paths(&bag),
+            vec![
+                "all.simplex.family_sizes.txt".to_string(),
+                "all.simplex.umi_counts.txt".to_string(),
+                "all.simplex.simplex_yield_metrics.txt".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(feature = "consensus")]
+    #[test]
+    fn metrics_write_targets_registers_the_duplex_prefix_fanout_superset() {
+        // Duplex (and codec, which shares the writer) fans out to the full set,
+        // including the conditional `duplex_umi_counts.txt` — the guard registers
+        // the superset so a colliding `--output` is rejected regardless.
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "paired",
+            "--consensus",
+            "duplex",
+            "--duplex::min-reads",
+            "1,1,0",
+            "--all-metrics",
+            "all",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Duplex]).unwrap();
+        assert_eq!(
+            target_paths(&bag),
+            vec![
+                "all.duplex.family_sizes.txt".to_string(),
+                "all.duplex.duplex_family_sizes.txt".to_string(),
+                "all.duplex.umi_counts.txt".to_string(),
+                "all.duplex.duplex_umi_counts.txt".to_string(),
+                "all.duplex.duplex_yield_metrics.txt".to_string(),
+            ]
         );
     }
 

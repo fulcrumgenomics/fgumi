@@ -550,19 +550,13 @@ impl DuplexMetricsCollector {
         );
 
         let cs_families: usize = family_size_metrics.iter().map(|m| m.cs_count).sum();
-        let ss_families: usize = duplex_family_size_metrics
-            .iter()
-            .map(|m| {
-                let mut count = 0;
-                if m.ab_size > 0 {
-                    count += 1;
-                }
-                if m.ba_size > 0 {
-                    count += 1;
-                }
-                count * m.count
-            })
-            .sum();
+        // SS families are recorded per full `mi` (see
+        // `record_duplex_coordinate_group`'s `ss_groups`), so derive the count
+        // from `ss_count` rather than from the base_umi-grouped duplex families.
+        // Two distinct `mi` sharing a base (an unsuffixed value and `/A`)
+        // collapse into a single duplex family but are two SS families — summing
+        // non-empty AB/BA strands per duplex family therefore under-counts them.
+        let ss_families: usize = family_size_metrics.iter().map(|m| m.ss_count).sum();
 
         DuplexYieldMetric {
             fraction,
@@ -604,38 +598,66 @@ impl DuplexMetricsCollector {
                 continue;
             }
             let size = m.family_size;
-            if size < min_ab + min_ba {
-                // Impossible to form a duplex with this family size
-                continue;
-            }
 
-            // Calculate P(A >= min_ab AND B >= min_ba) where A ~ Binomial(n=size, p=0.5)
-            // and B = size - A. Since B >= min_ba <=> A <= size - min_ba, this is:
-            //   P(min_ab <= A <= size - min_ba)
-            //   = CDF(size - min_ba) - CDF(min_ab - 1)
-            // (matching upper_bound = size - min_ba, lower_bound = min_ab below;
-            // the min_ab/min_ba roles are NOT interchangeable except by the
-            // p = 0.5 symmetry that makes A and size - A identically distributed).
-
-            // `Binomial::new(p, n)` only returns `Err` when `p` is NaN or
-            // outside `[0, 1]` (statrs 0.18 `BinomialError::ProbabilityInvalid`).
-            // With `p = 0.5` hardcoded the `Err` arm is statically unreachable;
-            // expect rather than silently skip so a future refactor that lets
-            // `p` become dynamic surfaces immediately instead of silently
-            // dropping families from the ideal-fraction calculation.
+            // A family of `size` reads splits A on one strand and B = size - A on
+            // the other, with A ~ Binomial(size, 0.5). `record_duplex_family`
+            // normalizes strand counts as (ab = max, ba = min), so a split at `a`
+            // reads qualifies exactly when
+            //   max(a, size - a) >= min_ab  AND  min(a, size - a) >= min_ba,
+            // counting BOTH orientations of a split (size 4 with thresholds 3/1
+            // admits both (3, 1) and (1, 3), not just the first).
+            //
+            // The qualifying `a` form at most two contiguous intervals, so sum
+            // their probability with `DiscreteCDF::cdf` differences instead of
+            // enumerating `size + 1` PMF calls per family — sizes up to tens of
+            // thousands otherwise cost billions of `pmf` calls at finalization:
+            //
+            //   * `min(a, size - a) >= min_ba`  ⟺  a ∈ [min_ba, size - min_ba]
+            //     (the "min" interval M);
+            //   * `max(a, size - a) >= min_ab`  ⟺  a >= min_ab OR a <= size - min_ab,
+            //     so within M the qualifying `a` are the union of the upper part
+            //     I1 = [min_ab, m_hi] and the lower part I2 = [m_lo, size - min_ab].
+            //
+            // P(S) = P(I1) + P(I2) - P(I1 ∩ I2) by inclusion-exclusion (the parts
+            // overlap when 2*min_ab <= size). All bounds are clamped with
+            // `checked_sub`/`max`/`min`, so arbitrarily large `usize` thresholds
+            // simply yield empty intervals that contribute 0 — matching the old
+            // subtraction-free comparisons — and cannot overflow.
+            //
+            // `Binomial::new(p, n)` only returns `Err` when `p` is NaN or outside
+            // `[0, 1]` (statrs 0.18 `BinomialError::ProbabilityInvalid`); with
+            // `p = 0.5` hardcoded the `Err` arm is statically unreachable, so
+            // expect rather than silently skip.
             let binomial = Binomial::new(0.5, size as u64)
                 .expect("p = 0.5 is always a valid probability for Binomial::new");
 
-            let upper_bound = size - min_ba;
-            let lower_bound = min_ab;
+            // Sum the PMF over the inclusive integer interval [lo, hi] via CDF
+            // differences (`cdf(k) = P(A <= k)`); empty when lo > hi.
+            let interval_prob = |lo: usize, hi: usize| -> f64 {
+                if lo > hi {
+                    return 0.0;
+                }
+                let upper = binomial.cdf(hi as u64);
+                let lower = if lo == 0 { 0.0 } else { binomial.cdf((lo - 1) as u64) };
+                upper - lower
+            };
 
-            let prob = if upper_bound >= lower_bound {
-                let p_upper = binomial.cdf(upper_bound as u64);
-                let p_lower =
-                    if lower_bound > 0 { binomial.cdf((lower_bound - 1) as u64) } else { 0.0 };
-                p_upper - p_lower
-            } else {
-                0.0
+            let prob = match size.checked_sub(min_ba) {
+                // M = [min_ba, size - min_ba], non-empty only when min_ba <= m_hi.
+                Some(m_hi) if min_ba <= m_hi => {
+                    let m_lo = min_ba;
+                    // I1: upper part, max = a >= min_ab.
+                    let (i1_lo, i1_hi) = (m_lo.max(min_ab), m_hi);
+                    // I2: lower part, max = size - a >= min_ab (a <= size - min_ab);
+                    // empty when min_ab > size.
+                    let (i2_lo, i2_hi) = match size.checked_sub(min_ab) {
+                        Some(cap) => (m_lo, m_hi.min(cap)),
+                        None => (1, 0),
+                    };
+                    interval_prob(i1_lo, i1_hi) + interval_prob(i2_lo, i2_hi)
+                        - interval_prob(i1_lo.max(i2_lo), i1_hi.min(i2_hi))
+                }
+                _ => 0.0,
             };
 
             ideal_duplexes += prob * (m.ds_count as f64);
@@ -1095,6 +1117,29 @@ mod tests {
         assert_eq!(metric.ds_duplexes, 1);
     }
 
+    /// Regression: `ss_families` must be derived from the per-`mi` SS
+    /// recording, not from the base_umi-grouped duplex families. Two distinct
+    /// `mi` sharing a base (an unsuffixed value and `/A`) are two SS families
+    /// but collapse into one duplex family (ab=2, ba=0). Summing non-empty
+    /// AB/BA strands per duplex family would report 1 — the correct count is 2.
+    #[test]
+    fn to_yield_metric_ss_families_counts_full_mi_groups_not_base_umi_groups() {
+        let mut collector = DuplexMetricsCollector::new(false);
+        // Two size-1 SS families (distinct `mi`, e.g. unsuffixed and `/A`).
+        collector.record_ss_family(1);
+        collector.record_ss_family(1);
+        // …which share a base_umi, so they form a single AB-only duplex family.
+        collector.record_ds_family(2);
+        collector.record_duplex_family(2, 0);
+
+        let metric = collector.to_yield_metric(1.0, 2, 1, 1);
+
+        assert_eq!(
+            metric.ss_families, 2,
+            "ss_families must count both full-mi SS groups, not the collapsed base_umi duplex family"
+        );
+    }
+
     /// Pins the binomial-CDF `ds_fraction_duplexes_ideal` math directly (the
     /// parity fixtures cannot, since `to_yield_metric` is only reachable via
     /// the separate-pass command). One DS family of size 4 with
@@ -1112,6 +1157,117 @@ mod tests {
             (metric.ds_fraction_duplexes_ideal - 0.875).abs() < 1e-9,
             "ideal duplex fraction must be the binomial CDF value 0.875, got {}",
             metric.ds_fraction_duplexes_ideal,
+        );
+    }
+
+    /// Regression: the family-size guard in
+    /// `calculate_ideal_duplex_fraction_per_size` must not overflow for large
+    /// `usize` thresholds. Written as `size < min_ab + min_ba` the addition
+    /// would debug-panic (release-wrap) at `usize::MAX` thresholds; the
+    /// subtraction-free guard skips every family without overflowing.
+    #[test]
+    fn to_yield_metric_ideal_fraction_does_not_overflow_on_large_thresholds() {
+        let mut collector = DuplexMetricsCollector::new(false);
+        collector.record_ds_family(4);
+
+        let metric = collector.to_yield_metric(1.0, 8, usize::MAX, usize::MAX);
+
+        assert!(
+            metric.ds_fraction_duplexes_ideal.abs() < 1e-12,
+            "families too small for the thresholds contribute 0 without overflowing the guard, got {}",
+            metric.ds_fraction_duplexes_ideal,
+        );
+    }
+
+    /// Regression: the ideal fraction must count BOTH strand orientations,
+    /// because `record_duplex_family` normalizes to (ab = max, ba = min). A
+    /// size-4 family with `min_ab = 3, min_ba = 1` admits both the (3, 1) and
+    /// (1, 3) splits — `P = pmf(1) + pmf(3) = 4/16 + 4/16 = 0.5`. A one-sided
+    /// window over A alone counts only (3, 1) and wrongly returns 0.25.
+    #[test]
+    fn to_yield_metric_ideal_fraction_counts_both_strand_orientations() {
+        let mut collector = DuplexMetricsCollector::new(false);
+        collector.record_ds_family(4);
+
+        let metric = collector.to_yield_metric(1.0, 8, 3, 1);
+
+        assert!(
+            (metric.ds_fraction_duplexes_ideal - 0.5).abs() < 1e-9,
+            "a size-4 family with 3/1 thresholds admits both (3,1) and (1,3): expected 0.5, got {}",
+            metric.ds_fraction_duplexes_ideal,
+        );
+    }
+
+    /// The `DiscreteCDF`-based ideal-fraction sum must equal the naive per-split
+    /// `pmf` enumeration it replaced, across family sizes and thresholds —
+    /// including the overflow edges (thresholds larger than the family size,
+    /// which must match no split and contribute 0) and the overlapping /
+    /// disjoint arrangements of the two qualifying sub-intervals.
+    #[rstest]
+    #[case::single_small(&[(4, 1)], 3, 1)]
+    #[case::mixed_sizes(&[(1, 3), (2, 5), (4, 2), (7, 1), (10, 4)], 3, 2)]
+    #[case::thresholds_zero(&[(0, 1), (3, 2), (6, 1)], 0, 0)]
+    #[case::min_ba_only(&[(5, 2), (8, 1)], 0, 3)]
+    #[case::min_ab_only(&[(5, 2), (8, 1)], 4, 0)]
+    #[case::overlapping_parts(&[(20, 3), (21, 1)], 5, 4)]
+    #[case::disjoint_parts(&[(10, 2)], 9, 1)]
+    #[case::min_ab_exceeds_size(&[(4, 3), (6, 2)], 100, 1)]
+    #[case::min_ba_exceeds_size(&[(4, 3), (6, 2)], 1, 100)]
+    #[case::both_exceed_size(&[(4, 1)], usize::MAX, usize::MAX)]
+    #[case::odd_and_even(&[(15, 2), (16, 3)], 6, 5)]
+    fn ideal_fraction_matches_naive_pmf_enumeration(
+        #[case] sizes_counts: &[(usize, usize)],
+        #[case] min_ab: usize,
+        #[case] min_ba: usize,
+    ) {
+        use statrs::distribution::Discrete;
+
+        // Naive reference: the exact per-split PMF sum the CDF form replaced.
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "mirrors the production caster; metric counts never exceed 2^53"
+        )]
+        fn naive(sizes_counts: &[(usize, usize)], min_ab: usize, min_ba: usize) -> f64 {
+            let total: usize = sizes_counts.iter().map(|&(_, c)| c).sum();
+            if total == 0 {
+                return 0.0;
+            }
+            let mut ideal = 0.0;
+            for &(size, count) in sizes_counts {
+                if count == 0 {
+                    continue;
+                }
+                let binomial = Binomial::new(0.5, size as u64).unwrap();
+                let prob: f64 = (0..=size)
+                    .filter(|&a| {
+                        let b = size - a;
+                        a.max(b) >= min_ab && a.min(b) >= min_ba
+                    })
+                    .map(|a| binomial.pmf(a as u64))
+                    .sum();
+                ideal += prob * (count as f64);
+            }
+            ideal / (total as f64)
+        }
+
+        let metrics: Vec<FamilySizeMetric> = sizes_counts
+            .iter()
+            .map(|&(size, count)| {
+                let mut m = FamilySizeMetric::new(size);
+                m.ds_count = count;
+                m
+            })
+            .collect();
+
+        let expected = naive(sizes_counts, min_ab, min_ba);
+        let actual = DuplexMetricsCollector::calculate_ideal_duplex_fraction_per_size(
+            &metrics, min_ab, min_ba,
+        );
+
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "CDF sum {actual} != naive PMF sum {expected} for \
+             sizes={sizes_counts:?} min_ab={min_ab} min_ba={min_ba}",
         );
     }
 

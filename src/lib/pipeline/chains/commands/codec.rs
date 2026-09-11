@@ -71,9 +71,10 @@ pub(crate) struct CollectedCodecMetrics {
 pub(crate) struct CodecState {
     pub(crate) caller: CodecConsensusCaller,
     /// Input header + library index for the inline-metrics T2 path (Task 11);
-    /// read only by the metrics-on batch body.
-    pub(crate) header: Arc<noodles::sam::Header>,
-    pub(crate) library_index: Arc<fgumi_bam_io::LibraryIndex>,
+    /// `Some` only on the metrics-on path and read only by the metrics-on batch
+    /// body — the metrics-off default builds and carries neither.
+    pub(crate) header: Option<Arc<noodles::sam::Header>>,
+    pub(crate) library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
 }
 
 impl crate::pipeline::core::item::HeapSize for CodecState {}
@@ -201,9 +202,11 @@ pub(crate) struct CodecConsensusCaptures {
     pub(crate) consensus_options: CodecConsensusOptions,
     pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedCodecMetrics>>,
     pub(crate) progress: Arc<AtomicU64>,
-    /// Threaded onto every `CodecState`; read only by the metrics-on variants.
-    pub(crate) header: Arc<noodles::sam::Header>,
-    pub(crate) library_index: Arc<fgumi_bam_io::LibraryIndex>,
+    /// Threaded onto every `CodecState`; `Some` only on the metrics-on path,
+    /// where the metrics-on variants read them. The metrics-off default carries
+    /// neither.
+    pub(crate) header: Option<Arc<noodles::sam::Header>>,
+    pub(crate) library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
     /// QC captures for the metrics-ON T2 path; `None` on metrics-off/T1
     /// builds.
     pub(crate) qc_metrics: Option<Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>>,
@@ -216,8 +219,8 @@ fn make_codec_consensus_init(
     read_group_id: String,
     consensus_options: CodecConsensusOptions,
     track_rejects: bool,
-    header: Arc<noodles::sam::Header>,
-    library_index: Arc<fgumi_bam_io::LibraryIndex>,
+    header: Option<Arc<noodles::sam::Header>>,
+    library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
 ) -> impl Fn() -> CodecState + Send + Sync + 'static {
     move || {
         let caller = CodecConsensusCaller::new_with_rejects_tracking(
@@ -226,11 +229,7 @@ fn make_codec_consensus_init(
             consensus_options.clone(),
             track_rejects,
         );
-        CodecState {
-            caller,
-            header: Arc::clone(&header),
-            library_index: Arc::clone(&library_index),
-        }
+        CodecState { caller, header: header.clone(), library_index: library_index.clone() }
     }
 }
 
@@ -352,8 +351,13 @@ fn run_codec_consensus_batch_with_metrics(
 ) -> io::Result<(DecompressedBlock, Option<DecompressedBlock>)> {
     let batch_serial = item.batch_serial;
     let mut metrics_entries = Vec::new();
+    // This body runs only on the metrics-on path (it requires `qc`), so the
+    // header/library index are always present here.
+    let header = state.header.as_ref().expect("metrics-on state carries the header");
+    let library_index =
+        state.library_index.as_ref().expect("metrics-on state carries the library index");
     for group in &item.groups {
-        push_mi_group_entries(group, &state.header, &state.library_index, &mut metrics_entries)
+        push_mi_group_entries(group, header, library_index, &mut metrics_entries)
             .map_err(|e| io::Error::other(format!("metrics conversion error: {e:#}")))?;
     }
     let runs = crate::inline_metrics_collector::split_into_runs(metrics_entries);
