@@ -299,11 +299,62 @@ pub fn assert_bam_sorted(bam: &std::path::Path, order: &str, key_types: Option<&
     );
 }
 
+/// Asserts two text files exist and are byte-for-byte identical, panicking
+/// with `label` and the offending path named on either a read error or a
+/// content mismatch.
+///
+/// This is the shared home for the `assert_eq!(read_to_string(a),
+/// read_to_string(b))` idiom that the cutover-parity tests (dedup, group,
+/// clip, retag, correct, …) each reimplemented inline. It intentionally does
+/// NOT guard for non-empty / data-bearing content: whether an output file
+/// must carry data rows is specific to the metric being compared, so any such
+/// check belongs with the individual caller that needs it, not in a general
+/// text-file comparison.
+pub fn assert_text_files_eq(actual: &std::path::Path, expected: &std::path::Path, label: &str) {
+    let a = std::fs::read_to_string(actual)
+        .unwrap_or_else(|e| panic!("{label}: reading actual {}: {e}", actual.display()));
+    let e = std::fs::read_to_string(expected)
+        .unwrap_or_else(|e| panic!("{label}: reading expected {}: {e}", expected.display()));
+    assert_eq!(a, e, "{label}: {} differs from {}", actual.display(), expected.display());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::helpers::bam_generator::to_record_buf;
     use fgumi_raw_bam::{SamBuilder, flags};
+
+    #[test]
+    fn assert_text_files_eq_passes_on_identical_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::write(&a, "col1\tcol2\n1\t2\n").expect("write a");
+        std::fs::write(&b, "col1\tcol2\n1\t2\n").expect("write b");
+        assert_text_files_eq(&a, &b, "identical files");
+    }
+
+    #[test]
+    #[should_panic(expected = "differs from")]
+    fn assert_text_files_eq_panics_on_divergent_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::write(&a, "1\n").expect("write a");
+        std::fs::write(&b, "2\n").expect("write b");
+        assert_text_files_eq(&a, &b, "divergent files");
+    }
+
+    #[test]
+    #[should_panic(expected = "reading actual")]
+    fn assert_text_files_eq_panics_naming_a_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_text_files_eq(
+            &dir.path().join("missing-actual"),
+            &dir.path().join("missing-expected"),
+            "missing file",
+        );
+    }
 
     /// Locks down the noodles behavior that `assert_rejects_header_matches_input`
     /// relies on: SO/GO/SS are accessible via the typed `Other` tag constants on

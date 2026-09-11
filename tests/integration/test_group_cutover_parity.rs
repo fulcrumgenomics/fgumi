@@ -40,6 +40,7 @@ use tempfile::TempDir;
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 
+use crate::helpers::assertions::assert_text_files_eq;
 use crate::helpers::bam_generator::{create_minimal_header, write_bam};
 use crate::helpers::read_bam_output;
 
@@ -534,11 +535,13 @@ fn cutover_matches_baseline_by_strategy(#[case] strategy: &str) {
             ("grouping_metrics", cur_grp, base_grp),
             ("position_group_sizes", cur_pos, base_pos),
         ] {
-            assert_eq!(
-                std::fs::read_to_string(&cur).unwrap_or_else(|e| panic!("current {label}: {e}")),
-                std::fs::read_to_string(&base).unwrap_or_else(|e| panic!("baseline {label}: {e}")),
-                "chain --metrics {label} TSV (--strategy {strategy}) diverges from the legacy \
-                 baseline"
+            assert_text_files_eq(
+                &cur,
+                &base,
+                &format!(
+                    "chain --metrics {label} TSV (--strategy {strategy}) diverges from the legacy \
+                     baseline"
+                ),
             );
         }
     } else {
