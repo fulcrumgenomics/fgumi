@@ -937,17 +937,18 @@ impl RunAll {
         })
     }
 
-    /// Returns the reference FASTA to thread into the consensus caller's
-    /// `#[arg(skip)]` `reference` slot, gated on `--methylation-mode` being
-    /// set: `Some(self.reference.clone())` when methylation mode is
-    /// requested, `None` otherwise (even if `--ref` was supplied — e.g. to
-    /// feed an upstream align stage in the same chain).
+    /// Returns the reference FASTA to thread into a methylation-consuming
+    /// stage's `reference` slot, gated on `--methylation-mode` being set:
+    /// `Some(self.reference.clone())` when methylation mode is requested,
+    /// `None` otherwise (even if `--ref` was supplied — e.g. to feed an
+    /// upstream align stage in the same chain).
     ///
     /// Called by [`Self::build_stage_options_bag`] to populate the
-    /// `#[arg(skip)]` `reference` slot on the Simplex/Duplex consensus
-    /// options structs.
+    /// `#[arg(skip)]` `reference` slot on the Simplex/Duplex consensus options
+    /// structs, and to override the Filter stage's `reference` when methylation
+    /// filtering is requested.
     #[must_use]
-    pub(crate) fn consensus_reference(&self) -> Option<PathBuf> {
+    pub(crate) fn methylation_reference(&self) -> Option<PathBuf> {
         if self.methylation_mode.is_some() { self.reference.clone() } else { None }
     }
 
@@ -1356,7 +1357,7 @@ impl RunAll {
                     opts.read_group.clone_from(&self.read_group);
                     opts.methylation_mode =
                         crate::commands::common::resolve_methylation_mode(self.methylation_mode);
-                    opts.reference = self.consensus_reference();
+                    opts.reference = self.methylation_reference();
                     bag.simplex = Some(opts);
                 }
 
@@ -1374,7 +1375,7 @@ impl RunAll {
                     opts.read_group.clone_from(&self.read_group);
                     opts.methylation_mode =
                         crate::commands::common::resolve_methylation_mode(self.methylation_mode);
-                    opts.reference = self.consensus_reference();
+                    opts.reference = self.methylation_reference();
                     bag.duplex = Some(opts);
                 }
 
@@ -1440,12 +1441,30 @@ impl RunAll {
                 }
 
                 Stage::Filter => {
-                    // The standalone filter chain builder reads `rejects` and
-                    // `stats` straight off the bag's FilterOptions, so
-                    // `--filter::rejects` / `--filter::stats` flow through
-                    // unchanged. No cross-stage rewiring is needed: filter is
-                    // always terminal in a runall chain.
-                    let filter_opts = self.filter_opts.clone().validate()?;
+                    // `--filter::rejects` / `--filter::stats` flow through the
+                    // projected FilterOptions unchanged. Filter is *also* a
+                    // methylation-consuming stage: `--filter::min-conversion-fraction`
+                    // reads the resolved `methylation_mode` (and the `reference`),
+                    // and `--filter::require-strand-methylation-agreement` reads the
+                    // `reference`; so thread the top-level cross-stage
+                    // `--methylation-mode` / `--ref` into the projected options
+                    // exactly as the Simplex/Duplex arms do. This must happen
+                    // before the chain builder runs `filter.validate_parameters()`
+                    // (builder.rs add_filter); otherwise the fused stage sees
+                    // `MethylationMode::Disabled` and rejects a legitimately-set
+                    // `--methylation-mode`. (The up-front guard above only lets
+                    // `--methylation-mode` reach here when a consuming option is
+                    // set, so this injection is never a dead write.)
+                    let mut filter_opts = self.filter_opts.clone().validate()?;
+                    filter_opts.methylation_mode =
+                        crate::commands::common::resolve_methylation_mode(self.methylation_mode);
+                    // `methylation_reference()` yields `Some(--ref)` only when
+                    // methylation is requested; leave the projected `--filter::ref`
+                    // untouched otherwise (it still feeds the mapped-read NM/UQ/MD
+                    // path when a user supplies it directly).
+                    if let Some(reference) = self.methylation_reference() {
+                        filter_opts.reference = Some(reference);
+                    }
                     bag.filter = Some(filter_opts);
                 }
 
@@ -1534,7 +1553,7 @@ impl Command for RunAll {
         let chain_reaches_consensus = stages.iter().any(|s| s.is_consensus());
         let chain_includes_align = stages.contains(&Stage::Align);
         // `--methylation-mode` on a simplex/duplex chain requires `--ref`: the
-        // consensus stage consumes the FASTA (via `consensus_reference()`), and
+        // consensus stage consumes the FASTA (via `methylation_reference()`), and
         // the standalone contract (`--methylation-mode` doc, "requires --ref")
         // demands it. Without this guard a non-align `group → simplex` run with
         // `--methylation-mode` but no `--ref` slips through (the dead-consensus
@@ -1553,10 +1572,21 @@ impl Command for RunAll {
         {
             bail!("--methylation-mode requires --ref to be set");
         }
-        if self.methylation_mode.is_some() && !chain_reaches_consensus && !chain_includes_align {
+        // Filter consumes `--methylation-mode` ONLY through
+        // `--filter::min-conversion-fraction` (the one filter option whose check
+        // reads the resolved `methylation_mode`; `--require-strand-methylation-agreement`
+        // and `--min-methylation-depth` use the reference/methylation tags but never
+        // the mode). So a filter chain keeps the flag live only when that option is
+        // set — otherwise `--methylation-mode` would be silently inert on the filter
+        // stage, which is exactly the silent-ignore this guard rejects.
+        let filter_consumes_methylation = stages.contains(&Stage::Filter)
+            && self.filter_opts.filter_min_conversion_fraction.is_some();
+        let chain_consumes_methylation = chain_reaches_consensus || filter_consumes_methylation;
+        if self.methylation_mode.is_some() && !chain_consumes_methylation && !chain_includes_align {
             bail!(
-                "--methylation-mode is only consumed by the consensus stage; \
-                 it is dead on a runall chain that stops before consensus"
+                "--methylation-mode is consumed only by the consensus stages and by \
+                 filter's --min-conversion-fraction; it is dead on a runall chain that \
+                 reaches neither"
             );
         }
 
@@ -1780,6 +1810,65 @@ mod execute_tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("--ref requires --methylation-mode"), "got: {e}");
+    }
+
+    #[test]
+    fn filter_methylation_with_conversion_fraction_passes_the_dead_flag_guard() {
+        // A filter self-pair with `--methylation-mode` AND a methylation-consuming
+        // option (`--filter::min-conversion-fraction`, the one filter option that
+        // reads the resolved mode) must NOT be rejected by the dead-flag guard —
+        // the flag is genuinely live. The run still errors (the input path does not
+        // exist), but it must get past the guard (audit A1 / HIGH). The needle is a
+        // substring of the CURRENT guard message, so reverting the guard fix (or the
+        // min-conversion-fraction narrowing) makes this assertion fail.
+        let e = run(&[
+            "--start-from",
+            "filter",
+            "--stop-after",
+            "filter",
+            "-i",
+            "in.bam",
+            "-o",
+            "o.bam",
+            "--filter::min-reads",
+            "1",
+            "--filter::min-conversion-fraction",
+            "0.5",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            "ref.fa",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(!e.contains("dead on a runall chain"), "guard wrongly fired: {e}");
+        assert!(!e.contains("requires --methylation-mode to be set"), "premature reject: {e}");
+    }
+
+    #[test]
+    fn bare_filter_methylation_is_rejected_as_inert() {
+        // Conversely, `--methylation-mode` on a filter chain with NO
+        // methylation-consuming option set is silently inert (filter reads the mode
+        // only via `--min-conversion-fraction`), so the guard MUST reject it up front
+        // rather than accept a no-op flag. Locks the guard against being widened too
+        // far — the exact regression the gauntlet caught in the first cut of this fix.
+        let e = run(&[
+            "--start-from",
+            "filter",
+            "--stop-after",
+            "filter",
+            "-i",
+            "in.bam",
+            "-o",
+            "o.bam",
+            "--filter::min-reads",
+            "1",
+            "--methylation-mode",
+            "em-seq",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("dead on a runall chain"), "guard should reject the inert flag: {e}");
     }
 
     #[test]
@@ -2009,6 +2098,87 @@ mod bag_tests {
         let g = bag.group.unwrap();
         assert_eq!(g.effective_strategy, Strategy::Adjacency);
         assert_eq!(g.effective_edits, 1);
+    }
+
+    #[test]
+    fn filter_receives_top_level_methylation_and_ref() {
+        // A fused chain that reaches filter must thread the top-level
+        // --methylation-mode / --ref into the filter stage exactly as the
+        // Simplex/Duplex arms do; otherwise the chain builder's
+        // `filter.validate_parameters()` sees MethylationMode::Disabled and
+        // rejects a legitimately-set --methylation-mode (audit A1 / HIGH).
+        let r = parse(&[
+            "--start-from",
+            "filter",
+            "--stop-after",
+            "filter",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--filter::min-reads",
+            "1",
+            "--filter::min-conversion-fraction",
+            "0.5",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            "ref.fa",
+        ]);
+        let f = r.build_stage_options_bag(&[Stage::Filter]).unwrap().filter.unwrap();
+        assert_eq!(f.methylation_mode, fgumi_consensus::MethylationMode::EmSeq);
+        assert_eq!(f.reference.as_deref(), Some(std::path::Path::new("ref.fa")));
+    }
+
+    #[test]
+    fn filter_without_methylation_leaves_mode_disabled() {
+        // Without --methylation-mode the injected mode stays Disabled and the
+        // top-level --ref is not forced onto the filter stage (methylation_reference
+        // returns None), so a non-methylation filter chain is unaffected.
+        let r = parse(&[
+            "--start-from",
+            "filter",
+            "--stop-after",
+            "filter",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--filter::min-reads",
+            "1",
+        ]);
+        let f = r.build_stage_options_bag(&[Stage::Filter]).unwrap().filter.unwrap();
+        assert_eq!(f.methylation_mode, fgumi_consensus::MethylationMode::Disabled);
+        assert_eq!(f.reference, None);
+    }
+
+    #[test]
+    fn filter_ref_flag_supplies_reference_when_no_top_level_ref() {
+        // When methylation is requested but only the projected `--filter::ref`
+        // is given (no top-level `--ref`), `methylation_reference()` returns None,
+        // so the injection leaves the projected reference in place rather than
+        // clobbering it — the alternative reference source stays usable.
+        let r = parse(&[
+            "--start-from",
+            "filter",
+            "--stop-after",
+            "filter",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--filter::min-reads",
+            "1",
+            "--filter::min-conversion-fraction",
+            "0.5",
+            "--filter::ref",
+            "filter_ref.fa",
+            "--methylation-mode",
+            "em-seq",
+        ]);
+        let f = r.build_stage_options_bag(&[Stage::Filter]).unwrap().filter.unwrap();
+        assert_eq!(f.methylation_mode, fgumi_consensus::MethylationMode::EmSeq);
+        assert_eq!(f.reference.as_deref(), Some(std::path::Path::new("filter_ref.fa")));
     }
 
     #[test]
