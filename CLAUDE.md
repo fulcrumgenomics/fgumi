@@ -334,9 +334,15 @@ their concrete types. That downcast sits on the per-item dispatch path: a
 The adapter resolves the handles once and caches them, which requires
 storing a reference whose real lifetime the struct cannot name.
 
-- **`crates/fgumi-pipeline-core/src/erased.rs`** — four `#[allow(unsafe_code)]`
-  sites, two on `TypedStep<S>` (`resolve_input`, `resolve_outputs`) and two on
-  `TypedStep2<S>` (`resolve_inputs`, `resolve_outputs`). Each is a
+- **`crates/fgumi-pipeline-core/src/erased.rs`** — six `#[allow(unsafe_code)]`
+  sites, two on `TypedStep<S>` (`resolve_input`, `resolve_outputs`), two on
+  `TypedStep2<S>` (`resolve_inputs`, `resolve_outputs`), and two on
+  `TypedStepK<S>` (`resolve_inputs`, `resolve_outputs`) — the homogeneous
+  K-input adapter, whose safety argument is identical to `TypedStep2` (the
+  `KInputHandles` box is owned by `ChainContexts` and outlives every adapter;
+  each dispatch passes the same box for a given `step_idx`; the unconditional
+  `assert_eq!(erased_addr(...))` guards reuse across two live `ChainContexts`).
+  Each is a
   `std::mem::transmute` that extends a `&'a Handle` to `&'static Handle` for
   storage in the cache slot, and narrows it back to `&'a` on read. No pointer
   is dereferenced through the `'static` form. SAFETY rests on three invariants
