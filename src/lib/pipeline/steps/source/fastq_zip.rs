@@ -192,6 +192,8 @@ pub fn zip_streams(
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     fn rec(name: &str, seq: &str) -> FastqRecord {
@@ -228,14 +230,25 @@ mod tests {
         assert_eq!(templates[1].records.len(), 3);
     }
 
-    #[test]
-    fn zip_streams_unequal_counts_out_of_sync() {
-        let s0 = vec![rec("read0/1", "AAAA"), rec("read1/1", "CC")];
-        let s1 = vec![rec("read0/2", "GGGG")];
+    /// The out-of-sync diagnostic must name WHICH stream ran short (issue #773),
+    /// not merely that a mismatch occurred: a reversed `(ended, before)`
+    /// direction is a silent regression that a "contains out of sync" check
+    /// would miss. Both branches of the direction conditional are covered.
+    #[rstest]
+    #[case::second_stream_short(2, 1, "R2 ended before R1")]
+    #[case::first_stream_short(1, 2, "R1 ended before R2")]
+    fn zip_streams_unequal_counts_names_the_short_stream(
+        #[case] n0: usize,
+        #[case] n1: usize,
+        #[case] expected: &str,
+    ) {
+        let s0: Vec<_> = (0..n0).map(|i| rec(&format!("read{i}/1"), "AAAA")).collect();
+        let s1: Vec<_> = (0..n1).map(|i| rec(&format!("read{i}/2"), "GGGG")).collect();
         let err = zip_streams(vec![s0, s1], 5).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("out of sync"), "got: {msg}");
         assert!(msg.contains("chunk_serial 5"), "got: {msg}");
+        assert!(msg.contains(expected), "expected {expected:?} in: {msg}");
     }
 
     #[test]
