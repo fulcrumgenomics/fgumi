@@ -204,7 +204,7 @@ fn append_unified_join(
 #[rstest]
 fn unified_fastq_chain_recovers_every_template_in_order(
     #[values(1, 8, 100)] n_records: usize,
-    // 1 → WrapRawFastq1; 2/3/4 → KInputHandles::Fixed{2,3,4}; 5 → Dyn(Vec).
+    // 1 → WrapRawFastq1; K >= 2 → ZipRawFastqK over KInputHandles.
     #[values(1, 2, 3, 4, 5)] n_streams: usize,
 ) {
     for threads in [1usize, n_streams + 2] {
@@ -362,7 +362,7 @@ fn append_bgzf_stream(
 fn bgzf_split_fastq_chain_matches_fused_output(
     #[values(4, 8)] threads: usize,
     #[values(1, 8, 100)] n_records: usize,
-    // 1 → WrapRawFastq1; 2/3/4 → KInputHandles::Fixed{2,3,4}; 5 → Dyn(Vec).
+    // 1 → WrapRawFastq1; K >= 2 → ZipRawFastqK over KInputHandles.
     #[values(1, 2, 3, 4, 5)] n_streams: usize,
 ) {
     let collected: Arc<Mutex<Vec<FastqTemplateBatch>>> = Arc::new(Mutex::new(Vec::new()));

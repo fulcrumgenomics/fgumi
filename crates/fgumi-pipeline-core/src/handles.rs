@@ -813,75 +813,47 @@ where
 // the type-erased box back to `&KInputHandles<T>` per dispatch and lends the K
 // handles as a slice into `StepCtxK::inputs`.
 //
-// Small-K arities (2/3/4 — the common FASTQ cases: paired, +index, dual-index)
-// are stored **inline** in a fixed-size array (no heap indirection on the
-// per-dispatch pop loop, monomorphized bounds elision) — the same
-// tuple-efficiency-for-small-K pattern the output tuples use. K > 4 falls back
-// to a heap `Vec`. Both variants present the same `&[BranchInputHandle<T>]`
-// slice to the adapter, so the dispatch path is arity-agnostic.
+// The handles are held in a plain `Vec`. An earlier revision stored small-K
+// arities (2/3/4) in inline `Fixed2/3/4` arrays, but the per-dispatch adapter
+// re-materializes a fresh `Vec<&dyn InputHandle<T>>` from `as_slice` on every
+// call (`TypedStepK::try_run_erased`), so the inline storage saved only a
+// single allocation per *chain build* — negligible — for real added
+// complexity. A single `Vec` is equivalent and simpler.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// K per-branch input handles for a homogeneous [`crate::step::StepK`]
 /// consumer. Built once at chain-build time (one [`BranchInputHandle<T>`] per
 /// wired producer branch, in slot order) and boxed type-erased into
 /// `ChainContexts.inputs[step_idx]`.
-pub enum KInputHandles<T: Send + HeapSize + 'static> {
-    /// 2 branches, inline.
-    Fixed2([BranchInputHandle<T>; 2]),
-    /// 3 branches, inline.
-    Fixed3([BranchInputHandle<T>; 3]),
-    /// 4 branches, inline.
-    Fixed4([BranchInputHandle<T>; 4]),
-    /// K > 4 branches, heap-allocated.
-    Dyn(Vec<BranchInputHandle<T>>),
-}
+///
+/// Opaque like its sibling [`TwoInputHandles`]: the inner `Vec` is `pub(crate)`
+/// and construction funnels through `Self::from_vec`, so external code cannot
+/// build a `KInputHandles` that bypasses the `>= 2` branch invariant a `StepK`
+/// requires.
+pub struct KInputHandles<T: Send + HeapSize + 'static>(pub(crate) Vec<BranchInputHandle<T>>);
 
 impl<T: Send + HeapSize + 'static> KInputHandles<T> {
     /// Build from exactly K per-branch handles (K == the consumer's
-    /// `input_count`), choosing the inline array variant for K ∈ {2,3,4} and
-    /// the heap `Vec` for K > 4. K < 2 is a wiring bug (a `StepK` consumer with
-    /// 0/1 inputs should be a `Step`), rejected here.
+    /// `input_count`). K < 2 is a wiring bug (a `StepK` consumer with 0/1 inputs
+    /// should be a `Step`), rejected here.
     ///
     /// # Panics
     ///
     /// Panics if `handles.len() < 2` — a `StepK` needs at least two branches
     /// (one input is [`crate::step::Step`], not `StepK`).
     pub(crate) fn from_vec(handles: Vec<BranchInputHandle<T>>) -> Self {
-        // `try_into` on a `Vec` of the exact length yields the fixed array with
-        // no copy of the elements (it moves the buffer); the macro keeps the
-        // three inline arms in lockstep so a new arity is one line.
-        macro_rules! try_fixed {
-            ($handles:expr, $( $variant:ident => $n:literal ),+ $(,)?) => {{
-                let h = $handles;
-                $(
-                    if h.len() == $n {
-                        let arr: [BranchInputHandle<T>; $n] = h
-                            .try_into()
-                            .unwrap_or_else(|_| unreachable!("length checked == {}", $n));
-                        return Self::$variant(arr);
-                    }
-                )+
-                h
-            }};
-        }
         assert!(
             handles.len() >= 2,
             "KInputHandles requires >= 2 branches (use Step/Step2 for fewer); got {}",
             handles.len()
         );
-        let handles = try_fixed!(handles, Fixed2 => 2, Fixed3 => 3, Fixed4 => 4);
-        Self::Dyn(handles)
+        Self(handles)
     }
 
-    /// Borrow the K handles as a slice, regardless of inline/heap storage.
-    /// The adapter maps this to `&[&dyn InputHandle<T>]` for `StepCtxK`.
+    /// Borrow the K handles as a slice. The adapter maps this to
+    /// `&[&dyn InputHandle<T>]` for `StepCtxK`.
     pub(crate) fn as_slice(&self) -> &[BranchInputHandle<T>] {
-        match self {
-            Self::Fixed2(a) => a,
-            Self::Fixed3(a) => a,
-            Self::Fixed4(a) => a,
-            Self::Dyn(v) => v,
-        }
+        &self.0
     }
 }
 
