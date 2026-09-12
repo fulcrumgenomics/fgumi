@@ -71,6 +71,28 @@ fn detect_compression_format(path: &Path) -> Result<CompressionFormat> {
     Ok(classify_compression_header(&header[..bytes_read]))
 }
 
+/// Whether `path` is a **regular, non-stdin, BGZF-compressed** FASTQ file — the
+/// only shape the chain's parallel block-decode front
+/// ([`ReadFastqBlocks`](crate::pipeline::steps::source::fastq_bgzf::ReadFastqBlocks)
+/// → [`FastqDecompress`](crate::pipeline::steps::source::fastq_bgzf::FastqDecompress)
+/// → [`FindFastqBoundaries`](crate::pipeline::steps::source::find_fastq_boundaries::FindFastqBoundaries))
+/// can consume.
+///
+/// The split path re-opens the raw file and frames it into BGZF blocks, so it
+/// needs (a) a reopenable path (not stdin) and (b) actual BGZF block framing
+/// (plain gzip is a single DEFLATE stream with no blocks to parallelize). Any
+/// I/O or classification failure returns `false` — the caller falls back to the
+/// fused [`ReadFastqInputs`](crate::pipeline::steps::source::read_fastq::ReadFastqInputs)
+/// path, which handles every format. This is a fast prefix read, already done
+/// once for the fused path's own format sniff.
+#[must_use]
+pub(crate) fn is_bgzf_fastq_file(path: &Path) -> bool {
+    if is_stdin_path(path) {
+        return false;
+    }
+    matches!(detect_compression_format(path), Ok(CompressionFormat::Bgzf))
+}
+
 /// Classify a FASTQ's compression from its leading bytes.
 ///
 /// Delegates to [`fgumi_bam_io::classify_input`], the classifier every fgumi

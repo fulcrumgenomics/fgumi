@@ -3,18 +3,21 @@
 //! - `read_bam` / `read_sam_chunks` — open a BAM/SAM input and emit blocks
 //!   or line-aligned chunks.
 //! - `read_fastq` — read raw FASTQ bytes, cut on whole-record boundaries.
-//! - `parse_fastq` / `parse_zip_fastq` — parse those bytes into records.
-//! - `pair_fastq` / `zip_fastq` — join per-stream chunks into templates.
+//! - `fastq_zip` / `parse_zip_fastq` — shared K-way zip primitives and the
+//!   parallel parse-and-zip step.
+//! - `zip_raw_fastq_k` — the K-input lockstep aligner (and the 1-input adapter)
+//!   that joins per-stream raw chunks for the parallel parse-and-zip step.
 
 #[cfg(test)]
 mod chain_tests;
-pub mod pair_fastq;
-pub mod parse_fastq;
+pub mod fastq_bgzf;
+pub mod fastq_zip;
+pub mod find_fastq_boundaries;
 pub mod parse_zip_fastq;
 pub mod read_bam;
 pub mod read_fastq;
 pub mod read_sam_chunks;
-pub mod zip_fastq;
+pub mod zip_raw_fastq_k;
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -60,8 +63,8 @@ fn open_bam_error(path: &std::path::Path, source: &anyhow::Error) -> io::Error {
 /// boundaries are located with the SIMD lexer (`find_record_offsets`) — a single
 /// vectorized pass over the chunk rather than a per-byte scalar scan.
 ///
-/// `step_name` appears in the truncation error so the two callers
-/// (`ParseFastqChunks` and `ParseAndZipFastq`) stay distinguishable in logs.
+/// `step_name` appears in the truncation error so the caller
+/// (`ParseAndZipFastqN`) is identifiable in logs.
 ///
 /// # Errors
 ///

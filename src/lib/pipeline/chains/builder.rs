@@ -84,8 +84,9 @@ pub(crate) enum PendingSource {
     /// form. `open_source` opens the decompressed readers and detects the quality
     /// encoding (so both live here, not in the path-only `SourceSpec`);
     /// `add_source` consumes the readers to build the FASTQ read preamble
-    /// (`ReadFastqInputs → … → ZipFastqRecords`). Read structures are read from
-    /// `self.spec.source` by `add_extract`, not carried here.
+    /// (per-stream reader → unified K-stream join
+    /// `ZipRawFastqK`/`WrapRawFastq1 → ParseAndZipFastqN`). Read structures are
+    /// read from `self.spec.source` by `add_extract`, not carried here.
     Fastq {
         /// Opened, decompressed FASTQ readers — one per stream (two for an
         /// interleaved source, already de-interleaved).
@@ -93,13 +94,28 @@ pub(crate) enum PendingSource {
         /// Quality encoding detected from the input heads; applied by
         /// `add_extract` (overrides the placeholder in `ExtractOptions`).
         encoding: crate::commands::extract::QualityEncoding,
-        /// When `true`, force the drift-bounded round-robin read topology
-        /// (`ReadFastqInputs::new → ParseFastqChunks → ZipFastqRecords`) even for
-        /// two streams. Set for an interleaved source: its two halves share one
-        /// physical stream and the de-interleaver caps how far they may diverge,
-        /// so the N==2 `PairRawFastq` topology (which lets R1 outrun R2) can
-        /// overrun that cap.
+        /// `true` for an interleaved source (its two halves are de-interleaved
+        /// from one physical stream, whose de-interleaver caps how far the two
+        /// may diverge). Historically this selected a drift-bounded round-robin
+        /// read topology, because the old N==2 `PairRawFastq` join let R1 outrun
+        /// R2 past that cap. The unified `ZipRawFastqK` join is lockstep (it
+        /// pulls only the streams missing from the front row), so it can never
+        /// let one half outrun the other — the interleaved case is now served by
+        /// the same unified path, and this flag no longer selects a distinct
+        /// topology. Retained as provenance for the interleaved source.
         force_round_robin: bool,
+        /// `Some(paths)` when **every** input stream is a reopenable,
+        /// non-stdin, BGZF-compressed file (and the source is not interleaved):
+        /// the per-stream raw file paths for the parallel block-decode front
+        /// (`ReadFastqBlocks → FastqDecompress → FindFastqBoundaries` → unified
+        /// K-stream join), which
+        /// re-opens each file raw and fans decode across the pool. `None`
+        /// (plain gzip, uncompressed, stdin, interleaved, or any detect
+        /// failure) keeps the fused single-per-stream `ReadFastqInputs` path,
+        /// which handles every format — plain gzip cannot be block-parallel
+        /// decoded (one continuous DEFLATE stream). Paths line up 1:1 with
+        /// `readers` by stream index.
+        bgzf_paths: Option<Vec<std::path::PathBuf>>,
     },
 }
 
@@ -220,10 +236,11 @@ pub(crate) enum ChainTailKind {
 
     /// The chain tail produces
     /// [`FastqTemplateBatch`]. Set by `add_source` on the `Fastqs` arm,
-    /// after `ReadFastqInputs → ZipFastqRecords`. The only consumer is
-    /// `add_extract`, which converts it to `BamTemplateBatch`.
+    /// after the unified K-stream FASTQ join
+    /// (`ZipRawFastqK`/`WrapRawFastq1 → ParseAndZipFastqN`). The only consumer
+    /// is `add_extract`, which converts it to `BamTemplateBatch`.
     ///
-    /// [`FastqTemplateBatch`]: crate::pipeline::steps::source::zip_fastq::FastqTemplateBatch
+    /// [`FastqTemplateBatch`]: crate::pipeline::steps::source::fastq_zip::FastqTemplateBatch
     FastqTemplateBatch,
 }
 
@@ -809,7 +826,145 @@ impl<'a> ChainBuilder<'a> {
             extract_opts.no_check_crc,
         )?;
         let header = crate::pipeline::chains::commands::extract::build_fastq_header(extract_opts)?;
-        Ok((header, PendingSource::Fastq { readers, encoding, force_round_robin: interleaved }))
+
+        // Parallel block-decode eligibility: only when NOT interleaved (the two
+        // halves share one physical stream, so there are no separate files to
+        // block-read) and EVERY input is a reopenable, non-stdin BGZF file.
+        // Plain gzip is a single DEFLATE stream — no blocks to parallelize — so a
+        // mixed or all-gzip set falls back to the fused readers, which handle
+        // every format. `readers` and `bgzf_paths` line up 1:1 by stream index.
+        let bgzf_paths = if !interleaved
+            && !inputs.is_empty()
+            && inputs.iter().all(|p| crate::commands::extract::is_bgzf_fastq_file(p))
+        {
+            Some(inputs.to_vec())
+        } else {
+            None
+        };
+
+        Ok((
+            header,
+            PendingSource::Fastq { readers, encoding, force_round_robin: interleaved, bgzf_paths },
+        ))
+    }
+
+    /// Build the parallel BGZF FASTQ decode front for `paths` (one reopenable,
+    /// non-stdin BGZF file per stream) and return the chain tail
+    /// (`FastqTemplateBatch`), matching the fused path's output contract.
+    ///
+    /// Per stream: `ReadFastqBlocks` (Serial, raw block read, pinned to a
+    /// distinct worker) → `FastqDecompress` (Parallel, pooled inflate) →
+    /// `FindFastqBoundaries` (Serial, 4-line record-seam framing, minting the
+    /// stream's OWN dense per-edge ordinal). The K per-stream tails then
+    /// converge on the unified join: `ZipRawFastqK → ParseAndZipFastqN` for
+    /// `K >= 2`, or `WrapRawFastq1 → ParseAndZipFastqN` for `K == 1`.
+    ///
+    /// Reached for ANY-K all-BGZF source (the eligibility gate in
+    /// `open_fastq_source` rejects only interleaved / non-BGZF / stdin inputs).
+    /// The raw files are opened fresh: the decoder-wrapped `readers` were
+    /// consumed only for encoding detection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a raw file cannot be opened.
+    fn build_bgzf_fastq_split(
+        &mut self,
+        paths: &[std::path::PathBuf],
+        num_threads: usize,
+        batch_records: usize,
+        byte_limit: u64,
+    ) -> Result<(
+        crate::pipeline::core::topology::StepIdx,
+        crate::pipeline::core::topology::BranchIdx,
+    )> {
+        use crate::pipeline::core::step::Affinity;
+        use crate::pipeline::steps::source::fastq_bgzf::{FastqDecompress, ReadFastqBlocks};
+        use crate::pipeline::steps::source::find_fastq_boundaries::FindFastqBoundaries;
+        use crate::pipeline::steps::source::read_fastq::FastqOrdinalSequence;
+
+        // CRC policy mirrors the BAM decode path: honor the command's
+        // --check-crc / --no-check-crc (falling back to verify).
+        let verify_crc = self.spec.verify_crc;
+
+        // Build one stream's 3-step split sub-chain, returning its tail
+        // (emitting FastqRawChunk). Each stream is its OWN edge into
+        // `ZipRawFastqK`/`WrapRawFastq1`, and each such edge is declared
+        // `ByItemOrdinal`, so each stream mints from its OWN
+        // `FastqOrdinalSequence` to keep that per-edge ordinal stream dense
+        // (0, 1, 2, …). Cross-stream row alignment is by `chunk_serial`, not by
+        // a shared ordinal. `stream_idx` is the global 0-based index; the reader
+        // is pinned to a distinct worker (correctness: two Serial sources on one
+        // worker race the source-drain path), clamped so a low `--threads` count
+        // never requests a non-existent worker.
+        let build_stream =
+            |this: &mut Self, path: &std::path::Path, stream_idx: usize| -> Result<_> {
+                let worker = (num_threads - 1).min(stream_idx);
+                let file = std::fs::File::open(path)
+                    .map_err(|e| anyhow!("open FASTQ {}: {e}", path.display()))?;
+                let reader: Box<dyn std::io::Read + Send> = Box::new(file);
+                let read_tail = this.pipeline.append_source(ReadFastqBlocks::new(
+                    reader,
+                    stream_idx,
+                    Affinity::Worker(worker),
+                    byte_limit,
+                ));
+                let decomp_tail = this
+                    .pipeline
+                    .append_step(FastqDecompress::new(byte_limit, verify_crc), read_tail);
+                Ok(this.pipeline.append_step(
+                    FindFastqBoundaries::new(
+                        stream_idx,
+                        batch_records,
+                        FastqOrdinalSequence::new(),
+                        byte_limit,
+                    ),
+                    decomp_tail,
+                ))
+            };
+
+        // Build the K per-stream decode sub-chains; collect their tails.
+        let mut tails = Vec::with_capacity(paths.len());
+        for (stream_idx, path) in paths.iter().enumerate() {
+            tails.push(build_stream(self, path, stream_idx)?);
+        }
+
+        let tail = self.append_unified_fastq_join(&tails, byte_limit);
+        Ok(tail)
+    }
+
+    /// Append the unified K-stream FASTQ join onto `tails` (one per stream, each
+    /// emitting `FastqRawChunk`) and return the tail emitting `FastqTemplateBatch`.
+    ///
+    /// `K >= 2`: `append_step_k(ZipRawFastqK::new(K, …), &tails)` (Serial
+    /// lockstep aligner, mints a dense ordinal) → `ParseAndZipFastqN` (Parallel
+    /// parse + template build, reordered by that ordinal).
+    /// `K == 1`: `WrapRawFastq1` (single-input adapter minting a dense ordinal) →
+    /// `ParseAndZipFastqN`. `ZipRawFastqK` rejects `k == 1`, so the lone-stream
+    /// case needs the single-input shim.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tails` is empty — every FASTQ source has at least one stream.
+    fn append_unified_fastq_join(
+        &mut self,
+        tails: &[(
+            crate::pipeline::core::topology::StepIdx,
+            crate::pipeline::core::topology::BranchIdx,
+        )],
+        byte_limit: u64,
+    ) -> (crate::pipeline::core::topology::StepIdx, crate::pipeline::core::topology::BranchIdx)
+    {
+        use crate::pipeline::steps::source::parse_zip_fastq::ParseAndZipFastqN;
+        use crate::pipeline::steps::source::zip_raw_fastq_k::{WrapRawFastq1, ZipRawFastqK};
+
+        let k = tails.len();
+        assert!(k >= 1, "append_unified_fastq_join: at least one stream required, got {k}");
+        let raw_tail = if k == 1 {
+            self.pipeline.append_step(WrapRawFastq1::new(byte_limit), tails[0])
+        } else {
+            self.pipeline.append_step_k(ZipRawFastqK::new(k, byte_limit), tails)
+        };
+        self.pipeline.append_step(ParseAndZipFastqN::new(byte_limit), raw_tail)
     }
 
     /// Add the input source step(s) to the pipeline.
@@ -829,9 +984,9 @@ impl<'a> ChainBuilder<'a> {
     ///   The reference path is stashed in `PendingSource::Paired` but is
     ///   consumed later by `add_zipper` (reference loading is deferred because
     ///   `restore_unconverted_bases` controls whether the FASTA is opened at all).
-    /// - `PendingSource::Fastq`: builds the FASTQ read preamble
-    ///   (`ReadFastqInputs → …`), with a stream-count-specific topology (1 / 2 /
-    ///   ≥3 streams).
+    /// - `PendingSource::Fastq`: builds the FASTQ read preamble — one
+    ///   per-stream reader/decode sub-chain feeding the unified K-stream join
+    ///   (`ZipRawFastqK`/`WrapRawFastq1 → ParseAndZipFastqN`) for any K.
     ///
     /// # Errors
     ///
@@ -997,15 +1152,11 @@ impl<'a> ChainBuilder<'a> {
                 self.current_tail = Some(unmapped_tail);
                 self.paired_tail = Some(mapped_tail);
             }
-            PendingSource::Fastq { readers, encoding: _, force_round_robin } => {
+            PendingSource::Fastq { readers, encoding: _, force_round_robin, bgzf_paths } => {
                 use crate::pipeline::core::step::Affinity;
-                use crate::pipeline::steps::source::pair_fastq::PairRawFastq;
-                use crate::pipeline::steps::source::parse_fastq::ParseFastqChunks;
-                use crate::pipeline::steps::source::parse_zip_fastq::ParseAndZipFastq;
                 use crate::pipeline::steps::source::read_fastq::{
                     FastqOrdinalSequence, ReadFastqInputs,
                 };
-                use crate::pipeline::steps::source::zip_fastq::ZipFastqRecords;
 
                 // Readers were opened by `open_source` — one per stream, or the
                 // de-interleaved R1/R2 pair for an interleaved source — using the
@@ -1013,8 +1164,6 @@ impl<'a> ChainBuilder<'a> {
                 // detection and optional async prefetch already applied. Consume
                 // them directly; the detected quality encoding is applied by
                 // `add_extract` via `self.fastq_encoding`.
-                let mut readers = readers;
-
                 let n_streams = readers.len();
                 // batch_record_count — same default as the legacy pipeline.
                 let batch_records = 400usize;
@@ -1024,26 +1173,29 @@ impl<'a> ChainBuilder<'a> {
                 let num_threads = self.spec.threading.num_threads().max(1);
 
                 // gzip decompression is the FASTQ bottleneck. The framework
-                // runs distinct `Serial` steps on distinct workers
-                // concurrently (Serial = per-step mutex, not global), so we
-                // instantiate one reader PER stream for the common paired-end
-                // (N == 2) case — both decompressors run at once. For N == 1 a
-                // single reader is trivially enough; for N >= 3 we fall back to
-                // a single all-streams round-robin reader.
+                // runs distinct `Serial` steps on distinct workers concurrently
+                // (Serial = per-step mutex, not global), so we instantiate one
+                // reader PER stream — each stream's gzip decoder then runs on
+                // its own worker at once.
                 //
-                // Topology by stream count (all arms produce a
+                // Unified topology for ALL K (all arms produce a
                 // `FastqTemplateBatch`-yielding tail):
-                //   N == 2: ReadFastqInputs×2 → PairRawFastq (Serial, cheap
-                //           chunk-level pairing + serial ordinal mint) →
-                //           ParseAndZipFastq (Parallel: parse both streams'
-                //           bytes AND build templates). This mirrors the legacy
-                //           pipeline's pair-then-parse order and moves the
-                //           expensive record-level template build into a
-                //           parallel step.
-                //   N != 2: ReadFastqInputs → ParseFastqChunks (Parallel parse)
-                //           → ZipFastqRecords (Serial record-level join). The
-                //           2-way `PairRawFastq` Step2 only handles two inputs,
-                //           so single- and ≥3-stream cases keep this structure.
+                //   per stream i: ReadFastqInputs::new_single(i) → FastqRawChunk
+                //   K >= 2: append_step_k(ZipRawFastqK(K)) — Serial lockstep
+                //           aligner, mints a dense ordinal — → ParseAndZipFastqN
+                //           (Parallel: parse every stream's bytes AND build
+                //           templates, reordered by that ordinal).
+                //   K == 1: WrapRawFastq1 (single-input adapter, mints a dense
+                //           ordinal) → ParseAndZipFastqN. `ZipRawFastqK` rejects
+                //           k == 1, so the lone stream needs the shim.
+                //
+                // `ZipRawFastqK` is lockstep (it pulls only the streams missing
+                // from the front row), so a fast stream cannot run ahead — which
+                // makes the same unified path safe for an interleaved
+                // (`force_round_robin`) source too: the de-interleaver's R1/R2
+                // lockstep cap is never overrun because the aligner never lets
+                // one half outrun the other. So `force_round_robin` no longer
+                // selects a distinct topology; it is intentionally unused here.
                 //
                 // Each per-stream reader is pinned to a DISTINCT worker via
                 // `Affinity::Worker`. Two `Serial` sources sharing a mutex
@@ -1054,81 +1206,43 @@ impl<'a> ChainBuilder<'a> {
                 // worker index is clamped to `num_threads - 1` so a low
                 // `--threads` count can never request a non-existent worker
                 // (which would deadlock).
-                let tail = match (n_streams, force_round_robin) {
-                    (1, _) => {
-                        let only = readers.pop().expect("n_streams == 1");
+                //
+                // Parallel BGZF block-decode front (bgzip'd files only, set by
+                // `open_fastq_source`). Each stream gets its own 3-step split —
+                // `ReadFastqBlocks` (Serial, raw block read, pinned to a distinct
+                // worker) → `FastqDecompress` (Parallel, decode fans across the
+                // whole pool) → `FindFastqBoundaries` (Serial, cut on 4-line
+                // record seams, mint the stream's own dense ordinal) — then the
+                // same `ZipRawFastqK`/`WrapRawFastq1` → `ParseAndZipFastqN`
+                // unified join. `readers` are dropped unused on this branch: the
+                // split re-opens each file raw (the readers were decoder-wrapped
+                // for encoding detection, which already happened). Plain gzip
+                // never reaches here (`bgzf_paths` is `None`), so the fused
+                // readers remain the only path for a format that cannot be
+                // block-parallel decoded.
+                let _ = force_round_robin; // lockstep aligner makes this safe for all K
+                let tail = if let Some(paths) = bgzf_paths {
+                    self.build_bgzf_fastq_split(&paths, num_threads, batch_records, byte_limit)?
+                } else {
+                    // Fused path: build one single-stream reader per stream, each
+                    // with its OWN FastqOrdinalSequence (each is its own edge into
+                    // the K-way join, and those edges are ByItemOrdinal so their
+                    // per-edge ordinals must be dense). Cross-stream row alignment
+                    // is by `chunk_serial`, not by a shared ordinal.
+                    let mut tails = Vec::with_capacity(n_streams);
+                    for (stream_idx, reader) in readers.into_iter().enumerate() {
+                        let worker = (num_threads - 1).min(stream_idx);
                         let read_step = ReadFastqInputs::new_single(
-                            only,
-                            0, // global_stream_idx
+                            reader,
+                            stream_idx,
                             FastqOrdinalSequence::new(),
-                            Affinity::Worker(0),
+                            Affinity::Worker(worker),
                             batch_records,
                             byte_limit,
                         );
-                        let tail = self.pipeline.append_source(read_step);
-                        let parse_tail =
-                            self.pipeline.append_step(ParseFastqChunks::new(byte_limit), tail);
-                        self.pipeline.append_step(ZipFastqRecords::new(1, byte_limit), parse_tail)
+                        tails.push(self.pipeline.append_source(read_step));
                     }
-                    (2, false) => {
-                        // Two concurrent single-stream readers (R1, R2) →
-                        // PairRawFastq (Step2) → ParseAndZipFastq.
-                        let r2_in = readers.pop().expect("n_streams == 2");
-                        let r1_in = readers.pop().expect("n_streams == 2");
-                        // R1 → worker 0; R2 → worker 1 when it exists
-                        // (clamped to worker 0 at --threads 1, where the two
-                        // readers necessarily serialize on the sole worker).
-                        let r2_worker = (num_threads - 1).min(1);
-                        // One shared ordinal sequence, cloned into both readers,
-                        // keeps the combined R1/R2 ordinal stream gap-free (the
-                        // reorder stage relies on a single monotonic counter).
-                        let ordinals = FastqOrdinalSequence::new();
-                        let r1_step = ReadFastqInputs::new_single(
-                            r1_in,
-                            0,
-                            ordinals.clone(),
-                            Affinity::Worker(0),
-                            batch_records,
-                            byte_limit,
-                        );
-                        let r2_step = ReadFastqInputs::new_single(
-                            r2_in,
-                            1,
-                            ordinals,
-                            Affinity::Worker(r2_worker),
-                            batch_records,
-                            byte_limit,
-                        );
-                        let r1_tail = self.pipeline.append_source(r1_step);
-                        let r2_tail = self.pipeline.append_source(r2_step);
-                        // `PairRawFastq` (Serial) does cheap chunk-level
-                        // pairing and mints the globally-unique ordinal that
-                        // `ParseAndZipFastq` (Parallel) reorders by. The latter
-                        // parses both streams' bytes and builds the templates,
-                        // so no separate `ZipFastqRecords` is appended for
-                        // N == 2.
-                        let pair_tail = self.pipeline.append_step2(
-                            PairRawFastq::new(byte_limit),
-                            r1_tail,
-                            r2_tail,
-                        );
-                        self.pipeline.append_step(ParseAndZipFastq::new(byte_limit), pair_tail)
-                    }
-                    _ => {
-                        // Round-robin fallback (N >= 3, or the two-stream
-                        // interleaved case where `force_round_robin` is set): one
-                        // all-streams reader (Affinity::Reader), serial decompress.
-                        // Reading one chunk per stream per cycle bounds how far the
-                        // streams diverge to `batch_records`, which the interleaved
-                        // de-interleaver's lockstep cap requires (the N==2
-                        // `PairRawFastq` path would let R1 outrun R2 past it).
-                        let read_step = ReadFastqInputs::new(readers, batch_records, byte_limit);
-                        let tail = self.pipeline.append_source(read_step);
-                        let parse_tail =
-                            self.pipeline.append_step(ParseFastqChunks::new(byte_limit), tail);
-                        self.pipeline
-                            .append_step(ZipFastqRecords::new(n_streams, byte_limit), parse_tail)
-                    }
+                    self.append_unified_fastq_join(&tails, byte_limit)
                 };
 
                 self.current_tail = Some(tail);
@@ -1892,7 +2006,7 @@ impl<'a> ChainBuilder<'a> {
     /// Extract-specific step sequence:
     ///
     /// ```text
-    /// (source: ReadFastqInputs → ZipFastqRecords)
+    /// (source: per-stream reader → ZipRawFastqK/WrapRawFastq1 → ParseAndZipFastqN)
     ///     ↓ FastqTemplateBatch
     /// ExtractStep (Parallel) — via build_extract_step
     ///     ↓ BamTemplateBatch
