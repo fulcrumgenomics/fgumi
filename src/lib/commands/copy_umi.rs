@@ -368,9 +368,8 @@ pub(crate) struct CopyUmiProcessCaptures {
 
 impl CopyUmiOptions {
     /// Build the per-thread metrics accumulators and progress counter shared by
-    /// the chain builder's process step and finalize hooks. The
-    /// `BamPipelineConfig` is not built here — the chain builder derives it from
-    /// its `ChainSpec`.
+    /// the chain builder's process step and finalize hooks. The pipeline config
+    /// is not built here — the chain builder derives it from its `ChainSpec`.
     pub(crate) fn setup_pipeline(&self, num_threads: usize) -> CopyUmiPipelineSetup {
         CopyUmiPipelineSetup {
             collected_metrics: PerThreadAccumulator::<CollectedCopyUmiMetrics>::new(num_threads),

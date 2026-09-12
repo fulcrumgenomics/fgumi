@@ -1,54 +1,27 @@
 //! Per-stage backpressure thresholds and the queue-memory-budget/high-water
 //! mark relationship.
 //!
-//! Moved out of `unified_pipeline::base` (C5/R6a) — the definitions are pure
-//! (a `u64` constant and a `fn(u64, u64) -> u64`) with no dependency on the
-//! `unified_pipeline` scheduler/queue machinery, so they relocate cleanly to
-//! the root crate's `pipeline` module. `unified_pipeline::base` keeps a
-//! `pub use` shim so its own internal call sites and the still-present legacy
-//! command paths keep resolving these names unchanged.
+//! Relocated to the root crate's `pipeline` module in C5/R6a — the definitions
+//! are pure (a `u64` constant and a `fn(u64, u64) -> u64`) with no dependency on
+//! the legacy multi-thread engine's scheduler/queue machinery (removed in
+//! R6/C6), so they live here cleanly.
 
 /// Default high-water mark for a reorder-buffered stage (512 MiB).
 ///
-/// This is the point at which one stage stops taking on new work and the
-/// scheduler starts prioritizing downstream steps (Process, Serialize,
-/// Compress, Write) so the stage can drain.
-///
-/// It is reached only through `ReorderBufferState::effective_limit`, so it
-/// applies to exactly three stages: Q2 and Q3 (whose counters span the queue
-/// and its reorder buffer both) and the post-Group write reorder buffer. The
-/// remaining queues — Q1, Q2b, Q4, Q6, Q7 — carry byte counters but no byte
-/// mark of their own; they are bounded by their slot count and by the
-/// pipeline-wide total gated at the Read step.
-///
-/// # Architecture — where the scheduler reads its drain signal
-///
-/// Only one of the three feeds the scheduler's `memory_high` / `memory_drained`
-/// pair, and the two pipelines pick different ones:
-/// - **BAM pipeline**: `q3_reorder_state`, the reorder buffer after Decode and
-///   before Group (`BamPipelineState::is_memory_high`)
-/// - **FASTQ pipeline**: `output.write_reorder_state`, the post-Compress write
-///   reorder buffer (`FastqStepContext::get_backpressure`)
-///
-/// For the BAM pipeline that placement is deliberate: memory is tracked before
-/// the exclusive Group step rather than after it, because tracking after Group
-/// releases the pre-Group buffer's bytes before knowing whether the post-Group
-/// queue can accept them, leaving data in an untracked intermediate buffer.
-///
-/// # Threshold behaviour
-///
-/// - When tracked memory >= the mark, `is_memory_high()` returns true: the
-///   producing step declines new work and the scheduler enters "drain mode"
-/// - When tracked memory < half the mark, `is_memory_drained()` returns true
-///   and the scheduler exits drain mode (hysteresis prevents thrashing)
+/// This is the point at which a producing stage stops taking on new work so it
+/// can drain: when a reorder buffer's tracked bytes reach the mark, the chain
+/// engine backs the producer off and prioritizes downstream steps (Process,
+/// Serialize, Compress, Write), then releases it once the buffer drains below
+/// half the mark (the hysteresis prevents thrashing).
 ///
 /// # Relationship to `--max-memory`
 ///
 /// This is a *per-stage trigger*, not the user's capacity budget; see
 /// [`stage_high_water_mark`] for why the two are separate and why a larger
-/// budget does not raise this. The budget's capacity role is enforced on the
-/// pipeline's total in-flight bytes at the Read step
-/// (`BamPipelineState::read_admission_allowed`).
+/// `--max-memory` does not raise it (a smaller one tightens it). The constant is
+/// resolved against the budget by [`stage_high_water_mark`] and handed to the
+/// chain engine's reorder buffers (`crates/fgumi-pipeline-core`); the
+/// whole-pipeline capacity role is enforced separately on total in-flight bytes.
 pub const BACKPRESSURE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 
 /// Default high-water mark for Q5, the processed queue (256 MiB).

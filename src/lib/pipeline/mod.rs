@@ -15,8 +15,8 @@
 //! - [`chains`]: declarative chain construction — `build_for`, `ChainBuilder`,
 //!   per-command step factories that assemble the steps into runnable pipelines.
 //!
-//! Commands are rewired onto `chains` one at a time; until a given command is
-//! rewired it still runs on `unified_pipeline`.
+//! Every command runs on `chains`; the legacy multi-thread engine was removed
+//! in R6/C6, so the declarative chain is the only execution path.
 
 /// The typed-step execution engine, extracted into the `fgumi-pipeline-core`
 /// crate so its lightweight dependency graph (no `noodles`-bam / sort /

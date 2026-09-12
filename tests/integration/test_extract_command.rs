@@ -847,7 +847,7 @@ fn test_parallel_parse_determinism() {
 }
 
 // ============================================================================
-// Unified Pipeline Path Tests
+// Chain Path Tests
 // ============================================================================
 
 /// Test BGZF+sync: multi-worker output matches single-worker content.
@@ -897,7 +897,7 @@ fn test_bgzf_sync_multithreaded_matches_single_threaded() {
     .expect("failed to parse extract args");
     cmd.execute("fgumi extract").expect("Failed to execute single-worker extract");
 
-    // Run multithreaded (BGZF+sync through unified pipeline)
+    // Run multithreaded (BGZF+sync through the chain)
     let output_threaded = tmp.path().join("output_mt.bam");
     let cmd = Extract::try_parse_from([
         "extract",
@@ -1414,7 +1414,7 @@ fn test_extract_bgzf_unequal_block_counts() {
 // ============================================================================
 
 /// `--compression-level 0` must produce a valid, readable BAM through both the
-/// single- and multi-threaded unified-pipeline paths. Byte-level correctness
+/// single- and multi-threaded chain paths. Byte-level correctness
 /// (stored vs DEFLATE blocks) is asserted by the `InlineBgzfCompressor` unit
 /// tests in `crates/fgumi-bgzf`.
 #[rstest]

@@ -1,8 +1,10 @@
 //! Batch weight trait for template-based batching.
 //!
-//! Moved out of `unified_pipeline::base` (C5/R6a) so `grouper`/`mi_group` can
-//! depend on it without going through the (now-legacy) `unified_pipeline`
-//! module. Stays in the root crate rather than `fgumi-bam-io`: its surviving
+//! Relocated to this neutral root module in C5/R6a so `grouper`/`mi_group` can
+//! depend on it directly (the legacy multi-thread engine it once lived in was
+//! removed in R6/C6).
+//!
+//! Stays in the root crate rather than `fgumi-bam-io`: its surviving
 //! implementations target foreign types (`noodles::sam::alignment::RecordBuf`,
 //! `fgumi_raw_bam::RawRecord`, `Vec<u8>`), which are only legal `impl`s while
 //! the trait itself is defined in this crate (orphan rule).

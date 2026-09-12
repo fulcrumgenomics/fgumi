@@ -1,6 +1,6 @@
 //! BGZF compression utilities for BAM output.
 //!
-//! This module provides inline BGZF compression for use with the unified pipeline.
+//! This module provides inline BGZF compression for use with the chain pipeline.
 //! Each worker thread compresses data inline using `InlineBgzfCompressor`, producing
 //! `CompressedBlock` instances that can be written directly to output.
 //!
@@ -52,7 +52,7 @@ pub struct CompressedBlock {
 }
 
 // ============================================================================
-// Inline BGZF Compressor (for unified pipeline)
+// Inline BGZF Compressor (for the chain pipeline)
 // ============================================================================
 
 /// Per-worker state for inline BGZF compression.

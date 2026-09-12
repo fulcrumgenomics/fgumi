@@ -1,4 +1,4 @@
-//! Sort typed-steps for the unified pipeline.
+//! Sort typed-steps for the declarative chain.
 
 /// `DetachedGroup::Shared` label for the sort's **coordination** driver thread:
 /// the serial phase-1 coordination steps (`ReadBlocks` admit, `FindBoundariesAndSort`

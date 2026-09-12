@@ -295,10 +295,10 @@ pub struct PipelineReaderOpts {
     /// [`FgumiBgzfReader`]), which skips CRC32 verification when this is `false`
     /// (the decompressed-size check always runs). Multi-threaded input
     /// (`threads > 1`) still uses noodles' multithreaded reader, which always
-    /// verifies; the multi-threaded unified pipeline instead gets its CRC policy
-    /// from `PipelineConfig::verify_crc` (set in `build_pipeline_config` in
-    /// `fgumi_lib`). Defaults to `true` (verify) — the safe, pre-existing
-    /// behavior.
+    /// verifies; the multi-threaded chain instead gets its CRC policy
+    /// from `ChainSpec::verify_crc` (resolved from `BamIoOptions::effective_check_crc`
+    /// and threaded through the chain builder in `fgumi_lib`). Defaults to `true`
+    /// (verify) — the safe, pre-existing behavior.
     pub verify_crc: bool,
     /// Concurrent positional-read policy for seekable regular-file inputs.
     ///
@@ -621,7 +621,7 @@ pub fn create_raw_bam_reader_with_opts<P: AsRef<Path>>(
 /// output, then must skip the header again to reach records. That second decode
 /// is what this factory provides: routing it through [`FgumiBgzfReader`] — rather
 /// than noodles' always-verify BGZF reader — makes `--no-check-crc` take effect
-/// on those fast paths too (#800), matching the `--threads N` unified pipeline
+/// on those fast paths too (#800), matching the `--threads N` chain
 /// (which already honors `PipelineConfig::verify_crc`).
 ///
 /// The input is decoded single-threaded: this is the fast path taken precisely
@@ -752,7 +752,7 @@ impl<R: Read> Read for ChainedReader<R> {
 ///
 /// This function is designed for commands that need to pass a reader to the pipeline.
 /// Unlike `create_bam_reader`, this returns a raw byte reader (not a BAM reader) that
-/// can be passed directly to `run_bam_pipeline_*_from_reader` functions.
+/// can be handed directly to the chain's BAM source stage.
 ///
 /// For files: Opens the file, reads the header, seeks back to start, returns the file.
 /// For stdin: Buffers all bytes read while parsing header, returns a chained reader

@@ -503,9 +503,7 @@ mod tests {
     //
     // fgumi has two independent single-record FASTQ validators:
     //
-    //   - `FastqRecord::from_slice` (this module) — used by `parse_fastq_records` and,
-    //     transitively, by the `unified_pipeline` FASTQ parser, whose
-    //     `parse_single_fastq_record` delegates to `from_slice`.
+    //   - `FastqRecord::from_slice` (this module) — used by `parse_fastq_records`.
     //   - `fgumi_simd_fastq::try_parse_single_record` — the fallible core behind the SIMD
     //     `parse_records` scan and the streaming `SimdFastqReader`.
     //

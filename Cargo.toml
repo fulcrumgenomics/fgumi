@@ -206,10 +206,11 @@ simulate = ["consensus"]
 profile-adjacency = []
 # Enable slow stress tests for concurrency testing
 stress-tests = []
-# Expose test-only helpers that are not part of the supported public API
-# (currently `unified_pipeline::run_bam_pipeline_with_grouper`, whose only
-# callers are integration tests). Enabled automatically for `cargo test` via
-# the self dev-dependency below; never enabled for a normal build.
+# Test-only feature (not part of the supported public API). Its former gated
+# helper (the legacy multi-thread engine's `run_bam_pipeline_with_grouper`) was
+# removed in R6/C6; retained as the self dev-dependency's feature hook. Enabled
+# automatically for `cargo test` via the self dev-dependency below; never
+# enabled for a normal build.
 test-utils = []
 
 [dev-dependencies]

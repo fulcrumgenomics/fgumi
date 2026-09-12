@@ -950,7 +950,7 @@ impl GroupReadsByUmi {
         // but not the CRC-verify status; emit it here so it is reported once.
         self.io.log_effective_check_crc();
 
-        // The chain engine does not carry the legacy unified-pipeline memory
+        // The chain engine does not carry the legacy memory
         // monitor, so the memory-debug knobs the retired non-chain path honored
         // have no effect here. Warn rather than silently no-op; FGUMI_PIPELINE_STATS
         // is the chain's equivalent stats hook.

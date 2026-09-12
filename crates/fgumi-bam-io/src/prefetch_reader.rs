@@ -12,7 +12,7 @@
 //! 128 KB by default. A plain `BufReader<File>` is synchronous: when its
 //! internal buffer drains, the next refill blocks in the kernel until pages
 //! arrive from disk. During that stall the calling thread is parked and
-//! cannot make progress on other work. In the fgumi unified pipeline, the
+//! cannot make progress on other work. In the fgumi chain pipeline, the
 //! reader thread is also a pipeline worker, so a blocked read translates
 //! directly into lost downstream throughput.
 //!

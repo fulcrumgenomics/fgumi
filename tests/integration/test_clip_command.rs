@@ -50,8 +50,8 @@ fn write_paired_bam_with_header(
 // ============================================================================
 // --check-crc / --no-check-crc on the chain (`--threads N`) path (#800)
 //
-// clip always decodes its input through the unified pipeline (the chain is its
-// only execution path). These prove that path honors the flag: `--no-check-crc`
+// clip always decodes its input through the chain (its only execution path).
+// These prove that path honors the flag: `--no-check-crc`
 // accepts a corrupted block, while the default and `--check-crc` reject it.
 // ============================================================================
 

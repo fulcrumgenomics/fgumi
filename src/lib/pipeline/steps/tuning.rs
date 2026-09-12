@@ -34,7 +34,7 @@ pub struct BamPipelineTuning {
 
 impl BamPipelineTuning {
     /// Auto-tuned defaults for `threads` worker threads, mirroring the legacy
-    /// `PipelineConfig::auto_tuned` from the now-deprecated unified pipeline.
+    /// `PipelineConfig::auto_tuned` from the now-removed legacy pipeline.
     /// Deliberately not an intra-doc link: that code is deleted once the
     /// commands migrate off it, and a link would break again then.
     #[must_use]

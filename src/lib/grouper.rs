@@ -153,10 +153,9 @@ use std::collections::VecDeque;
 ///
 /// ```ignore
 /// use fgumi_lib::grouper::TemplateGrouper;
-/// use fgumi_lib::unified_pipeline::Grouper;
 ///
 /// let grouper = TemplateGrouper::new(1000); // 1000 templates per batch
-/// // Use with run_bam_pipeline_with_grouper...
+/// // Batches templates for efficient parallel processing.
 /// ```
 pub struct TemplateGrouper {
     /// Number of templates per batch.

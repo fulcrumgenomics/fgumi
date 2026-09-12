@@ -1,6 +1,6 @@
 //! Cutover parity gate for the `dedup` command's legacy-path retirement (C4):
 //! `MarkDuplicates::execute` no longer has a no-`--threads` hand-rolled
-//! `unified_pipeline` engine — it *always* routes through the declarative chain
+//! legacy multi-thread engine — it *always* routes through the declarative chain
 //! builder (`execute_chain`). This test proves that cutover lost nothing
 //! user-observable in the duplicate-marking / UMI-family-assignment logic.
 //!
@@ -10,14 +10,14 @@
 //!    A no-`--threads` run now emits the chain-only "Pipeline `dedup` ran in"
 //!    line from `pipeline::chains::finalize`, and the per-step `Pipeline stats`
 //!    table — both come from the pipeline-core runtime, which the retired
-//!    `unified_pipeline` engine never used. This is the RED (pre-removal) /
+//!    legacy multi-thread engine never used. This is the RED (pre-removal) /
 //!    GREEN (post-removal) discriminator for the cutover.
 //!
 //! 2. **Output parity with the pre-removal legacy path**
 //!    (`cutover_matches_baseline_*`). The current build's `dedup` output — BAM
 //!    records (byte-identical, modulo the `@PG` line) and `--metrics` /
 //!    `--family-size-histogram` — must match the frozen legacy-path baseline
-//!    binary run with no `--threads` (its hand-rolled `unified_pipeline`
+//!    binary run with no `--threads` (its hand-rolled legacy multi-thread
 //!    engine). The baseline path comes from `FGUMI_BASELINE_BIN`; when unset
 //!    (or names a missing file) the case degrades to a self-consistency oracle
 //!    rather than skipping — the fallback discipline of
@@ -496,7 +496,7 @@ fn run_dedup(
 /// A no-`--threads` run now routes through the declarative chain, which logs
 /// "Pipeline `dedup` ran in" (from `pipeline::chains::finalize`) and the
 /// per-step `Pipeline stats` table (from the pipeline-core runtime). The
-/// retired `unified_pipeline` engine never printed either — a hand-rolled loop
+/// retired legacy multi-thread engine never printed either — a hand-rolled loop
 /// with no step-based runtime — so this is the RED (pre-removal) -> GREEN
 /// (post-removal) discriminator for the cutover.
 #[test]
@@ -512,7 +512,7 @@ fn dedup_no_threads_routes_through_chain() {
     assert!(
         stderr.contains("Pipeline `dedup` ran in"),
         "a no-`--threads` dedup must route through the chain (which logs the pipeline-core \
-         finalize line); the unified_pipeline engine is retired. stderr:\n{stderr}"
+         finalize line); the legacy multi-thread engine is retired. stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("Starting dedup"),
@@ -521,7 +521,7 @@ fn dedup_no_threads_routes_through_chain() {
 }
 
 /// Output parity of the post-cutover chain against the pre-removal legacy-path
-/// baseline binary (run with no `--threads`, i.e. its `unified_pipeline`
+/// baseline binary (run with no `--threads`, i.e. its legacy multi-thread
 /// engine), across UMI strategies — plus the always-available self-consistency
 /// oracle when no baseline is set.
 ///
