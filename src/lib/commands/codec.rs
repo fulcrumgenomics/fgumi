@@ -549,6 +549,18 @@ impl Command for Codec {
         // Validate the input exists (stdin paths are exempt — the reader
         // streams them in a single pass).
         self.io.validate()?;
+        // `--metrics <prefix>` derives the duplex metrics artifact set (codec
+        // reuses the duplex inline writer), written by
+        // `ConsensusMetricsFinalizeHook` AFTER the BAM sink. Those derived paths
+        // must join the collision check, else `--metrics result` + `-o
+        // result.family_sizes.txt` passes here and the metrics write clobbers the
+        // BAM. Reuses `duplex_metrics_paths` (the superset runall's collision
+        // guard also registers) so the two never drift. Kept in a local so
+        // `outputs` can borrow it.
+        let metrics_artifacts: Vec<std::path::PathBuf> = match &self.metrics {
+            Some(prefix) => crate::inline_metrics_collector::duplex_metrics_paths(prefix),
+            None => Vec::new(),
+        };
         let mut outputs: Vec<(&Path, &str)> = vec![(self.io.output.as_path(), "--output")];
         if let Some(path) = &self.rejects_opts.rejects {
             outputs.push((path.as_path(), "--rejects"));
@@ -556,6 +568,7 @@ impl Command for Codec {
         if let Some(path) = &self.stats_opts.stats {
             outputs.push((path.as_path(), "--stats"));
         }
+        outputs.extend(metrics_artifacts.iter().map(|p| (p.as_path(), "--metrics")));
         reject_output_collisions(&outputs)?;
 
         // The declarative chain is the only execution path: `execute` runs the
@@ -794,6 +807,27 @@ mod tests {
 
     fn create_test_codec() -> Codec {
         create_codec_with_paths(PathBuf::from("input.bam"), PathBuf::from("output.bam"))
+    }
+
+    #[test]
+    fn metrics_prefix_colliding_with_output_rejected() -> anyhow::Result<()> {
+        // Regression: `--metrics <prefix>` derives the duplex artifact set
+        // (codec reuses the duplex inline writer), written AFTER the BAM sink. A
+        // derived path equal to `--output` must be rejected at pre-flight before
+        // the metrics write clobbers the BAM. Input need only exist (the
+        // collision check runs right after `io.validate`).
+        let dir = tempfile::TempDir::new()?;
+        let input = dir.path().join("in.bam");
+        std::fs::write(&input, b"")?;
+        let output = dir.path().join("result.duplex_family_sizes.txt");
+        let mut cmd = create_codec_with_paths(input, output);
+        cmd.metrics = Some(dir.path().join("result"));
+        let err = cmd.execute("test").unwrap_err().to_string();
+        assert!(
+            err.contains("result.duplex_family_sizes.txt"),
+            "collision must name the clobbered path: {err}"
+        );
+        Ok(())
     }
 
     #[rstest]
