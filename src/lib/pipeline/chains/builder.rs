@@ -96,13 +96,15 @@ pub(crate) enum PendingSource {
         encoding: crate::commands::extract::QualityEncoding,
         /// `true` for an interleaved source (its two halves are de-interleaved
         /// from one physical stream, whose de-interleaver caps how far the two
-        /// may diverge). Historically this selected a drift-bounded round-robin
-        /// read topology, because the old N==2 `PairRawFastq` join let R1 outrun
-        /// R2 past that cap. The unified `ZipRawFastqK` join is lockstep (it
-        /// pulls only the streams missing from the front row), so it can never
-        /// let one half outrun the other — the interleaved case is now served by
-        /// the same unified path, and this flag no longer selects a distinct
-        /// topology. Retained as provenance for the interleaved source.
+        /// may diverge before erroring). Historically this selected a
+        /// drift-bounded round-robin read topology that bounded that divergence
+        /// to `batch_records` per cycle. The interleaved case is now served by
+        /// the same unified per-stream-reader path as every K; divergence is
+        /// bounded instead by each reader's own `ByteBounded` output-queue
+        /// backpressure (`per_step_byte_limit`), which stays well under the
+        /// de-interleaver's `MAX_PENDING_RECORDS` cap at the default limit. So
+        /// this flag no longer selects a distinct topology; retained as
+        /// provenance for the interleaved source.
         force_round_robin: bool,
         /// `Some(paths)` when **every** input stream is a reopenable,
         /// non-stdin, BGZF-compressed file (and the source is not interleaved):
@@ -885,6 +887,13 @@ impl<'a> ChainBuilder<'a> {
         // CRC policy mirrors the BAM decode path: honor the command's
         // --check-crc / --no-check-crc (falling back to verify).
         let verify_crc = self.spec.verify_crc;
+        // Honor --async-reader here too: the split re-opens each file raw, so
+        // (unlike the fused path, which wraps in `open_fastq_reader`) it must
+        // apply the prefetch wrap itself, or the flag would be a silent no-op
+        // for the common all-bgzip case. The prefetch reads raw compressed
+        // bytes — decode-agnostic — so wrapping the raw file before
+        // `read_raw_blocks` frames it is correct.
+        let async_reader = self.spec.async_reader;
 
         // Build one stream's 3-step split sub-chain, returning its tail
         // (emitting FastqRawChunk). Each stream is its OWN edge into
@@ -901,7 +910,14 @@ impl<'a> ChainBuilder<'a> {
                 let worker = (num_threads - 1).min(stream_idx);
                 let file = std::fs::File::open(path)
                     .map_err(|e| anyhow!("open FASTQ {}: {e}", path.display()))?;
-                let reader: Box<dyn std::io::Read + Send> = Box::new(file);
+                // Mirror `open_fastq_reader`'s async wrap (only a real `File`
+                // carries the kernel hints `PrefetchReader` issues).
+                let reader: Box<dyn std::io::Read + Send> = if async_reader {
+                    fgumi_bam_io::os_hints::advise_sequential(&file);
+                    Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file))
+                } else {
+                    Box::new(file)
+                };
                 let read_tail = this.pipeline.append_source(ReadFastqBlocks::new(
                     reader,
                     stream_idx,
@@ -1189,13 +1205,21 @@ impl<'a> ChainBuilder<'a> {
                 //           ordinal) → ParseAndZipFastqN. `ZipRawFastqK` rejects
                 //           k == 1, so the lone stream needs the shim.
                 //
-                // `ZipRawFastqK` is lockstep (it pulls only the streams missing
-                // from the front row), so a fast stream cannot run ahead — which
-                // makes the same unified path safe for an interleaved
-                // (`force_round_robin`) source too: the de-interleaver's R1/R2
-                // lockstep cap is never overrun because the aligner never lets
-                // one half outrun the other. So `force_round_robin` no longer
-                // selects a distinct topology; it is intentionally unused here.
+                // For an interleaved (`force_round_robin`) source the two logical
+                // streams are de-interleaved from one physical stream, whose
+                // `DeinterleaverCore` buffers whichever side is read ahead and
+                // errors past `MAX_PENDING_RECORDS`. The old round-robin reader
+                // bounded that drift to `batch_records` per cycle; the unified
+                // path bounds it instead through backpressure — each per-stream
+                // reader stalls once its OWN `ByteBounded` output queue
+                // (`per_step_byte_limit`, 4 MiB by default) fills, so one half
+                // can read at most ~one queue's worth of records ahead of the
+                // other, orders of magnitude below `MAX_PENDING_RECORDS`. (NB
+                // this bound is the reader's output-queue backpressure, NOT
+                // `ZipRawFastqK`'s lockstep pull — the join only orders its own
+                // output; it does not throttle an upstream reader.) So
+                // `force_round_robin` no longer selects a distinct topology; it
+                // is intentionally unused here.
                 //
                 // Each per-stream reader is pinned to a DISTINCT worker via
                 // `Affinity::Worker`. Two `Serial` sources sharing a mutex
@@ -1220,7 +1244,7 @@ impl<'a> ChainBuilder<'a> {
                 // never reaches here (`bgzf_paths` is `None`), so the fused
                 // readers remain the only path for a format that cannot be
                 // block-parallel decoded.
-                let _ = force_round_robin; // lockstep aligner makes this safe for all K
+                let _ = force_round_robin; // per-stream output-queue backpressure bounds drift for all K
                 let tail = if let Some(paths) = bgzf_paths {
                     self.build_bgzf_fastq_split(&paths, num_threads, batch_records, byte_limit)?
                 } else {
