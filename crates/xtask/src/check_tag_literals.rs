@@ -89,13 +89,10 @@ const PATH_SCOPED_ALLOWLIST: &[(&str, &[&[u8; 2]])] = &[
     // BGZF extra-subfield ID field — not a SAM aux tag.
     ("crates/fgumi-bgzf/src/writer.rs", &[b"BC"]),
     // ZipRawFastqK unit-test fixtures: `<stream-letter><serial-digit>` payload
-    // labels (b"a0", b"b0", b"c0", b"b1", b"c1", …) identifying which raw chunk
-    // came from which stream/serial — opaque test bytes, not SAM aux tags.
-    // (`a0`/`a1` are already covered by the global allowlist.)
-    (
-        "src/lib/pipeline/steps/source/zip_raw_fastq_k.rs",
-        &[b"b0", b"c0", b"b1", b"c1", b"b2", b"c2", b"d0", b"d1"],
-    ),
+    // labels identifying which raw chunk came from which stream/serial — opaque
+    // test bytes, not SAM aux tags. Only the literals actually present in the
+    // file are listed (`a0`/`a1` are already covered by the global allowlist).
+    ("src/lib/pipeline/steps/source/zip_raw_fastq_k.rs", &[b"b0", b"c0", b"b1", b"c1"]),
 ];
 
 /// Scan the entire workspace for bare 2-byte SAM-tag byte literals outside the allowlist.
