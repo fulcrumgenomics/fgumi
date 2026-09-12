@@ -4,10 +4,10 @@
 //! Sits at the convergence of K independent per-stream decode sub-chains (each
 //! `ReadFastqBlocks(i) → FastqDecompress → FindFastqBoundaries(i)` for bgzip
 //! input, or a single-stream `ReadFastqInputs` for gzip), each emitting
-//! [`FastqRawChunk`](super::read_fastq::FastqRawChunk) tagged with its
+//! [`FastqRawChunk`] tagged with its
 //! `chunk_serial`. `ZipRawFastqK` pulls one chunk from every stream for the
 //! current row (by `chunk_serial`), and once **all K** are present emits an
-//! [`NRawFastqBatch`](super::fastq_zip::NRawFastqBatch) carrying the K aligned
+//! [`NRawFastqBatch`] carrying the K aligned
 //! raw byte-chunks plus a freshly-minted dense `ordinal`. The expensive parse
 //! and template build then run in parallel in
 //! [`ParseAndZipFastqN`](super::parse_zip_fastq::ParseAndZipFastqN).
@@ -143,6 +143,26 @@ impl ZipRawFastqK {
     }
 }
 
+/// Build the fgbio-consistent "out of sync" error for a stuck front `row`:
+/// `short` is the (0-based) stream that ran short; the message names it and
+/// every stream that still held this row's chunk. For K == 2 this reads
+/// "R2 ended before R1"; for K > 2 it lists all present streams (e.g. "R2 ended
+/// before R1/R3") so the diagnostic stays informative beyond the 2-stream case.
+fn out_of_sync_error(serial: u64, short: usize, row: &[Option<Vec<u8>>]) -> io::Error {
+    let present: Vec<String> = row
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| slot.is_some())
+        .map(|(i, _)| format!("R{}", i + 1))
+        .collect();
+    io::Error::other(format!(
+        "FASTQ sources out of sync: R{} ended before {} at chunk_serial {serial} \
+         (those streams still had records)",
+        short + 1,
+        present.join("/"),
+    ))
+}
+
 impl StepK for ZipRawFastqK {
     type Input = FastqRawChunk;
     type Outputs = OrderedBytesSingle<NRawFastqBatch>;
@@ -245,16 +265,11 @@ impl StepK for ZipRawFastqK {
                 return Ok(StepOutcome::Progress);
             }
             if let Some((&serial, row)) = self.pending.iter().next() {
-                // Some stream ended early: name a missing stream and a present
-                // one, matching the fgbio-consistent "out of sync" wording.
+                // Some stream ended early: name the missing stream and every
+                // present one, matching the fgbio-consistent "out of sync"
+                // wording (informative for K > 2, not just an arbitrary pair).
                 let short = row.iter().position(Option::is_none).unwrap_or(0);
-                let present = row.iter().position(Option::is_some).map_or(usize::MAX, |p| p);
-                return Err(io::Error::other(format!(
-                    "FASTQ sources out of sync: R{} ended before R{} at chunk_serial {serial} \
-                     while other streams had more records",
-                    short + 1,
-                    present.wrapping_add(1),
-                )));
+                return Err(out_of_sync_error(serial, short, row));
             }
             return Ok(StepOutcome::Finished);
         }
@@ -277,13 +292,7 @@ impl StepK for ZipRawFastqK {
                 .enumerate()
                 .find_map(|(i, slot)| (slot.is_none() && ctx.inputs[i].is_drained()).then_some(i))
         {
-            let present = row.iter().position(Option::is_some).map_or(usize::MAX, |p| p);
-            return Err(io::Error::other(format!(
-                "FASTQ sources out of sync: R{} ended before R{} at chunk_serial {serial} \
-                 while other streams had more records",
-                short + 1,
-                present.wrapping_add(1),
-            )));
+            return Err(out_of_sync_error(serial, short, row));
         }
         Ok(StepOutcome::NoProgress)
     }
@@ -424,12 +433,13 @@ mod tests {
         s.buffer(chunk(0, 0, b"a-again"));
     }
 
-    /// A finalize with a partial front row (one stream ran short) reports the
-    /// fgbio-consistent "out of sync" desync rather than emitting or hanging.
-    /// (Drives `try_emit`/`pending` directly; the full drained-input path is
-    /// covered by the chain-level `mismatched_stream_lengths_*` test.)
+    /// An incomplete front row (one stream present, another still missing) does
+    /// not emit — the lockstep gate holds until every slot is filled. The actual
+    /// "out of sync" *error* on a drained short stream is covered by the
+    /// chain-level `mismatched_stream_lengths_*` test; this drives
+    /// `try_emit`/`pending` directly and asserts only the no-emit gate.
     #[test]
-    fn partial_front_row_is_out_of_sync() {
+    fn incomplete_front_row_does_not_emit() {
         let mut s = ZipRawFastqK::new(2, 1 << 20);
         // Stream 0 produced serial 0; stream 1 never did.
         s.buffer(chunk(0, 0, b"a0"));
@@ -464,13 +474,18 @@ mod tests {
         assert_eq!(p.branch_ordering, vec![BranchOrdering::None]);
     }
 
-    /// Wrapping preserves the chunk's `chunk_serial` and bytes into a
-    /// single-stream `NRawFastqBatch`, minting a fresh dense ordinal.
+    /// Pins the `NRawFastqBatch` SHAPE a wrap must produce — `chunk_serial` and
+    /// bytes preserved into `streams[0]`, a fresh dense ordinal minted — by
+    /// reproducing the field mapping. NB this does not drive `try_run` itself;
+    /// the production `try_run` path (ordinal mint + `chunk_serial` pass-through)
+    /// is exercised end-to-end by the chain-level `n_streams == 1` sweeps
+    /// (`unified_fastq_chain_recovers_every_template_in_order`,
+    /// `bgzf_split_fastq_chain_matches_fused_output`).
     #[test]
-    fn wrap_raw_fastq1_wraps_with_dense_ordinal() {
+    fn wrap_raw_fastq1_batch_shape_and_dense_ordinal() {
         let mut s = WrapRawFastq1::new(1 << 20);
-        // Simulate two successive wraps by driving `next_ordinal` the way
-        // `try_run` does (the StepCtx plumbing is exercised by integration tests).
+        // Reproduce the field mapping `try_run` performs (its StepCtx plumbing is
+        // exercised by the chain-level tests named above).
         let c0 = chunk(0, 3, b"row0");
         let ord0 = s.next_ordinal;
         s.next_ordinal += 1;

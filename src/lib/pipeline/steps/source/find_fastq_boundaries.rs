@@ -2,12 +2,12 @@
 //! parallel BGZF FASTQ decode split.
 //!
 //! The `Parallel` [`FastqDecompress`](super::fastq_bgzf::FastqDecompress) step
-//! emits [`FastqDecompressedBlock`](super::fastq_bgzf::FastqDecompressedBlock)s
+//! emits [`FastqDecompressedBlock`]s
 //! whose bytes end wherever the compressor cut the block — almost never on a
 //! FASTQ record (4-line) boundary. This step is the FASTQ analogue of
 //! `FindBamBoundaries`: it re-frames the concatenated decompressed stream into
 //! whole-record chunks and emits the existing
-//! [`FastqRawChunk`](super::read_fastq::FastqRawChunk) type, so everything
+//! [`FastqRawChunk`] type, so everything
 //! downstream (`ZipRawFastqK` / `WrapRawFastq1` / `ParseAndZipFastqN`) is
 //! unchanged.
 //!
@@ -31,7 +31,7 @@
 //! the reorder key for the parallel decompress; it is **not** the dense chunk
 //! ordinal the downstream reorder stage needs. So this step mints the emitted
 //! `FastqRawChunk.ordinal` from its own per-stream
-//! [`FastqOrdinalSequence`](super::read_fastq::FastqOrdinalSequence). Each
+//! [`FastqOrdinalSequence`]. Each
 //! stream is its own producer edge into `ZipRawFastqK`/`WrapRawFastq1`, and that
 //! edge is `ByItemOrdinal`, so its ordinals must be dense (`0, 1, 2, …`) on
 //! their own — hence a fresh sequence per stream, not one shared across
@@ -160,10 +160,13 @@ impl FindFastqBoundaries {
         }
         // offsets[batch_record_count] is one byte past the Nth complete record.
         let cut = self.offsets[self.batch_record_count];
-        let chunk: Vec<u8> = self.acc[..cut].to_vec();
-        // Retain the remainder (complete records beyond the cut + trailing
-        // partial) and rescan just that tail.
-        self.acc.drain(..cut);
+        // Split at the cut so the emitted (larger) chunk keeps `acc`'s buffer
+        // and only the (smaller) remainder is copied — vs a `to_vec()` of the
+        // chunk plus a `drain()` memmove of the remainder, which copies both.
+        let rest = self.acc.split_off(cut);
+        let chunk = std::mem::replace(&mut self.acc, rest);
+        // Rescan just the retained tail (complete records beyond the cut +
+        // trailing partial).
         self.rescan();
         Some(chunk)
     }
@@ -196,8 +199,9 @@ impl FindFastqBoundaries {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!(
-                    "FindFastqBoundaries: truncated FASTQ record at end of stream \
+                    "FindFastqBoundaries: truncated FASTQ record in R{} at end of stream \
                      ({} trailing byte(s) after the last complete record)",
+                    self.stream_idx + 1,
                     data.len() - last
                 ),
             ));
