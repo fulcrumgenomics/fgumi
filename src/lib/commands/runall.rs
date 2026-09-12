@@ -885,6 +885,22 @@ pub struct RunAll {
     /// `commands::filter` for the field list.
     #[command(flatten)]
     pub filter_opts: crate::commands::filter::MultiFilterOptions,
+
+    /// Convenience: fills in every applicable metrics-output option (group's
+    /// `--metrics` prefix, correct's metrics, filter's stats, and each
+    /// present consensus stage's metrics) for every stage in this run, under
+    /// `<PREFIX>.<stage>[.<suffix>]`, for any option the user did not already
+    /// set explicitly. For group specifically, only `--metrics` (the prefix)
+    /// is derived — its own fan-out already writes the complete canonical
+    /// set (`<PREFIX>.group.family_sizes.txt`,
+    /// `<PREFIX>.group.grouping_metrics.txt`,
+    /// `<PREFIX>.group.position_group_sizes.txt`); `--all-metrics` does not
+    /// separately derive `--group::family-size-histogram` or
+    /// `--group::grouping-metrics`, since doing so would collide with (or
+    /// near-duplicate) that same fan-out. Reject-stream flags
+    /// (`--*::rejects`, `--rejects`) are never touched by this flag.
+    #[arg(long = "all-metrics")]
+    pub all_metrics: Option<PathBuf>,
 }
 
 impl RunAll {
@@ -1152,6 +1168,24 @@ impl RunAll {
         Ok(())
     }
 
+    /// Returns the derived path for one stage's single-file metrics option
+    /// under `--all-metrics`, or `None` if `--all-metrics` was not set.
+    fn derived_metrics_path(&self, stage: &str, suffix: &str) -> Option<PathBuf> {
+        self.all_metrics.as_ref().map(|prefix| {
+            crate::commands::group::with_extension(prefix, &format!("{stage}.{suffix}"))
+        })
+    }
+
+    /// Returns the derived PREFIX (not a full filename) for one stage's
+    /// metrics option that is itself a prefix the stage's own writer fans
+    /// out from (group's `metrics_prefix`, and each consensus stage's
+    /// `metrics`).
+    fn derived_metrics_prefix(&self, stage: &str) -> Option<PathBuf> {
+        self.all_metrics
+            .as_ref()
+            .map(|prefix| crate::commands::group::with_extension(prefix, stage))
+    }
+
     /// Build the [`StageOptionsBag`](crate::pipeline::chains::StageOptionsBag)
     /// for the `ChainSpec` derived from the active stages in
     /// [`Self::derive_stages`].
@@ -1193,9 +1227,10 @@ impl RunAll {
     ///
     /// * **Group** — validates `MultiGroupOptions`, then computes
     ///   `effective_strategy` / `effective_edits` via
-    ///   [`crate::commands::group::GroupOptions::resolve_strategy_and_edits`]
-    ///   and clears the three histogram/metrics paths (anti-goal documented
-    ///   in the module-level doc).
+    ///   [`crate::commands::group::GroupOptions::resolve_strategy_and_edits`].
+    ///   The family-size-histogram / grouping-metrics / metrics-prefix outputs
+    ///   flow through unmodified, producing the same output as standalone
+    ///   `group` given the same flags.
     ///
     /// * **Simplex** / **Duplex** — validate the per-mode `Multi<X>`, then
     ///   populate the cross-cutting `#[arg(skip)]` fields
@@ -1239,6 +1274,9 @@ impl RunAll {
             match stage {
                 Stage::Correct => {
                     let mut opts = self.correct_opts.clone().validate()?;
+                    if opts.metrics.is_none() {
+                        opts.metrics = self.derived_metrics_path("correct", "metrics.txt");
+                    }
                     opts.rejects_path = if self.stop_after_stage() == RunAllStage::Correct {
                         // self-pair: honor top-level --rejects, falling back to --correct::rejects.
                         self.rejects_opts.rejects.clone().or(opts.rejects_path)
@@ -1315,8 +1353,9 @@ impl RunAll {
                     let mut group_opts = self.group_opts.clone().validate()?;
                     // Mirror GroupReadsByUmi::execute: compute
                     // effective_strategy / effective_edits via the shared
-                    // helper, then null the per-position metrics outputs
-                    // (anti-goal documented in the module-level doc comment).
+                    // helper. The family-size-histogram / grouping-metrics /
+                    // metrics-prefix outputs flow through unmodified, same as
+                    // standalone `group`.
                     let (effective_strategy, effective_edits) =
                         group_opts.resolve_strategy_and_edits();
                     group_opts.effective_strategy = effective_strategy;
@@ -1330,22 +1369,22 @@ impl RunAll {
                         effective_strategy,
                         effective_edits,
                     )?;
-                    // Forcing these to None is spec-mandated (runall does not
-                    // emit per-position group metrics in a fused run), but warn
-                    // so the dropped flags are not silent.
-                    if group_opts.family_size_histogram.is_some()
-                        || group_opts.grouping_metrics.is_some()
-                        || group_opts.metrics_prefix.is_some()
-                    {
-                        log::warn!(
-                            "--group::family-size-histogram / --group::grouping-metrics / \
-                             --group::metrics are ignored: runall does not emit per-position \
-                             group metrics in a fused run"
-                        );
+                    // `--all-metrics` only derives `metrics_prefix` here, not
+                    // `family_size_histogram`/`grouping_metrics`: the prefix's
+                    // own fan-out (`write_metrics_for_chain`, group.rs) already
+                    // writes the complete canonical set —
+                    // `<prefix>.family_sizes.txt`, `<prefix>.grouping_metrics.txt`,
+                    // `<prefix>.position_group_sizes.txt` (Task 1's pinned
+                    // filenames). Deriving the other two as well would collide
+                    // with (`grouping_metrics.txt`) or near-duplicate
+                    // (`family_size_histogram.txt` vs. the prefix's
+                    // `family_sizes.txt`) that same output. Explicit
+                    // `--group::family-size-histogram` /
+                    // `--group::grouping-metrics` are untouched either way —
+                    // this only decides what `--all-metrics` derives.
+                    if group_opts.metrics_prefix.is_none() {
+                        group_opts.metrics_prefix = self.derived_metrics_prefix("group");
                     }
-                    group_opts.family_size_histogram = None;
-                    group_opts.grouping_metrics = None;
-                    group_opts.metrics_prefix = None;
                     bag.group = Some(group_opts);
                 }
 
@@ -1358,6 +1397,9 @@ impl RunAll {
                     opts.methylation_mode =
                         crate::commands::common::resolve_methylation_mode(self.methylation_mode);
                     opts.reference = self.methylation_reference();
+                    if opts.metrics.is_none() {
+                        opts.metrics = self.derived_metrics_prefix("simplex");
+                    }
                     bag.simplex = Some(opts);
                 }
 
@@ -1376,6 +1418,9 @@ impl RunAll {
                     opts.methylation_mode =
                         crate::commands::common::resolve_methylation_mode(self.methylation_mode);
                     opts.reference = self.methylation_reference();
+                    if opts.metrics.is_none() {
+                        opts.metrics = self.derived_metrics_prefix("duplex");
+                    }
                     bag.duplex = Some(opts);
                 }
 
@@ -1399,6 +1444,9 @@ impl RunAll {
                     opts.rejects_opts.clone_from(&self.rejects_opts);
                     opts.stats_opts.clone_from(&self.stats_opts);
                     opts.read_group.clone_from(&self.read_group);
+                    if opts.metrics.is_none() {
+                        opts.metrics = self.derived_metrics_prefix("codec");
+                    }
                     bag.codec = Some(opts);
                 }
 
@@ -1464,6 +1512,11 @@ impl RunAll {
                     // path when a user supplies it directly).
                     if let Some(reference) = self.methylation_reference() {
                         filter_opts.reference = Some(reference);
+                    }
+                    // Derive the filter stats path from `--all-metrics <PREFIX>` when
+                    // `--filter::stats` was not set explicitly.
+                    if filter_opts.stats.is_none() {
+                        filter_opts.stats = self.derived_metrics_path("filter", "stats.txt");
                     }
                     bag.filter = Some(filter_opts);
                 }
@@ -1755,6 +1808,19 @@ impl Command for RunAll {
                 write_targets.push((stats.as_path(), "--filter::stats"));
             }
         }
+
+        // Metrics outputs the chain will open as writers, alongside the BAM. A
+        // `--output` (or another registered path) landing on one of these would
+        // let the metrics writer and the BAM writer corrupt the same file, so
+        // register every *effective* metrics path (see `metrics_write_targets`).
+        // These are COMPUTED paths (a prefix fanned out), so the helper hands
+        // back owned `PathBuf`s: hold them in a local that outlives the borrows
+        // pushed into `write_targets` below — a later `write_targets` push could
+        // otherwise dangle a reference into a dropped temporary.
+        let metrics_targets = metrics_write_targets(&stage_opts);
+        for (path, label) in &metrics_targets {
+            write_targets.push((path.as_path(), *label));
+        }
         crate::commands::common::reject_output_collisions(&write_targets)?;
 
         let spec = ChainSpec {
@@ -1778,6 +1844,62 @@ impl Command for RunAll {
         log::info!("runall completed successfully");
         Ok(())
     }
+}
+
+/// The metrics output paths the derived chain will open as writers, for the
+/// `--output` collision guard (a `--output` that lands on one of these would let
+/// the metrics writer and the BAM writer corrupt the same file).
+///
+/// Mirrors the standalone commands' own guards (group's `execute`, the consensus
+/// metrics writers). Group's `--metrics` prefix and each consensus stage's
+/// `--metrics` prefix fan out to several canonical files, so these are COMPUTED
+/// paths returned as owned `PathBuf`s; consensus fan-outs reuse the writers' own
+/// path helpers (`{simplex,duplex}_metrics_paths`) so this never drifts from the
+/// files actually written. Codec shares the duplex file set.
+fn metrics_write_targets(
+    stage_opts: &crate::pipeline::chains::StageOptionsBag,
+) -> Vec<(PathBuf, &'static str)> {
+    let mut targets: Vec<(PathBuf, &'static str)> = Vec::new();
+    if let Some(metrics) = stage_opts.correct.as_ref().and_then(|c| c.metrics.as_ref()) {
+        targets.push((metrics.clone(), "--correct::metrics"));
+    }
+    if let Some(group) = stage_opts.group.as_ref() {
+        if let Some(path) = group.family_size_histogram.as_ref() {
+            targets.push((path.clone(), "--group::family-size-histogram"));
+        }
+        if let Some(path) = group.grouping_metrics.as_ref() {
+            targets.push((path.clone(), "--group::grouping-metrics"));
+        }
+        // The `--metrics` prefix fans out to the three canonical group files
+        // (see group's `write_metrics_for_chain` / `execute`).
+        if let Some(prefix) = group.metrics_prefix.as_ref() {
+            for suffix in ["family_sizes.txt", "grouping_metrics.txt", "position_group_sizes.txt"] {
+                targets.push((
+                    crate::commands::group::with_extension(prefix, suffix),
+                    "--group::metrics",
+                ));
+            }
+        }
+    }
+    #[cfg(feature = "consensus")]
+    {
+        if let Some(prefix) = stage_opts.simplex.as_ref().and_then(|o| o.metrics.as_ref()) {
+            for path in crate::inline_metrics_collector::simplex_metrics_paths(prefix) {
+                targets.push((path, "--simplex::metrics"));
+            }
+        }
+        if let Some(prefix) = stage_opts.duplex.as_ref().and_then(|o| o.metrics.as_ref()) {
+            for path in crate::inline_metrics_collector::duplex_metrics_paths(prefix) {
+                targets.push((path, "--duplex::metrics"));
+            }
+        }
+        if let Some(prefix) = stage_opts.codec.as_ref().and_then(|o| o.metrics.as_ref()) {
+            for path in crate::inline_metrics_collector::duplex_metrics_paths(prefix) {
+                targets.push((path, "--codec::metrics"));
+            }
+        }
+    }
+    targets
 }
 
 #[cfg(test)]
@@ -2286,6 +2408,377 @@ mod bag_tests {
             let err = err.to_string();
             assert!(err.contains("requires building fgumi with the `consensus` feature"));
         }
+    }
+
+    // ── `--all-metrics` fill-in (Task 13) ──────────────────────────────────
+    //
+    // These exercise `build_stage_options_bag` directly rather than the full
+    // pipeline: no BAM I/O, no pipeline execution, so they cannot trip the
+    // pre-existing T1 inline-metrics-tap bug the integration-level
+    // `all_metrics_fills_in_every_applicable_stage_present_in_the_chain` test
+    // (`tests/integration/test_group_metrics_fused_parity.rs`) had to route
+    // around (see that test's doc comment) — they instead give direct,
+    // deterministic coverage of every stage arm's fill-in line, including
+    // `Stage::Duplex`, which the integration test cannot exercise safely.
+
+    #[test]
+    fn all_metrics_fills_only_group_metrics_prefix() {
+        // `--all-metrics` derives ONLY `metrics_prefix` for group —
+        // `family_size_histogram`/`grouping_metrics` are left `None` (fix
+        // round 1: deriving those too collided with, or near-duplicated,
+        // `metrics_prefix`'s own fan-out; see the `Stage::Group` arm's
+        // comment in `build_stage_options_bag`).
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+            "--all-metrics",
+            "all",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Group]).unwrap();
+        let g = bag.group.unwrap();
+        assert_eq!(g.family_size_histogram, None);
+        assert_eq!(g.grouping_metrics, None);
+        assert_eq!(g.metrics_prefix, Some(PathBuf::from("all.group")));
+    }
+
+    #[test]
+    fn all_metrics_never_overwrites_an_explicit_group_metrics_prefix() {
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+            "--group::metrics",
+            "explicit",
+            "--all-metrics",
+            "all",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Group]).unwrap();
+        assert_eq!(bag.group.unwrap().metrics_prefix, Some(PathBuf::from("explicit")));
+    }
+
+    #[test]
+    fn all_metrics_fills_correct_metrics() {
+        let r = parse(&[
+            "--start-from",
+            "correct",
+            "--stop-after",
+            "correct",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--correct::min-distance",
+            "1",
+            "--correct::umis",
+            "AAAA",
+            "--all-metrics",
+            "all",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Correct]).unwrap();
+        assert_eq!(bag.correct.unwrap().metrics, Some(PathBuf::from("all.correct.metrics.txt")));
+    }
+
+    #[test]
+    fn all_metrics_fills_filter_stats() {
+        let r = parse(&[
+            "--start-from",
+            "filter",
+            "--stop-after",
+            "filter",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--filter::min-reads",
+            "1",
+            "--all-metrics",
+            "all",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Filter]).unwrap();
+        assert_eq!(bag.filter.unwrap().stats, Some(PathBuf::from("all.filter.stats.txt")));
+    }
+
+    #[cfg(feature = "consensus")]
+    #[test]
+    fn all_metrics_fills_each_consensus_stages_metrics_prefix() {
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "paired",
+            "--consensus",
+            "duplex",
+            "--duplex::min-reads",
+            "1,1,0",
+            "--simplex::min-reads",
+            "1",
+            "--codec::min-reads",
+            "1",
+            "--all-metrics",
+            "all",
+        ]);
+        assert_eq!(
+            r.build_stage_options_bag(&[Stage::Simplex]).unwrap().simplex.unwrap().metrics,
+            Some(PathBuf::from("all.simplex"))
+        );
+        assert_eq!(
+            r.build_stage_options_bag(&[Stage::Duplex]).unwrap().duplex.unwrap().metrics,
+            Some(PathBuf::from("all.duplex"))
+        );
+        assert_eq!(
+            r.build_stage_options_bag(&[Stage::Codec]).unwrap().codec.unwrap().metrics,
+            Some(PathBuf::from("all.codec"))
+        );
+    }
+
+    // ── metrics_write_targets: the --output collision guard registers EVERY
+    //    effective metrics path (group + consensus prefix fan-outs, correct),
+    //    not just rejects/stats. A `--output` on any of these would let two
+    //    writers corrupt one file, so all must be visible to
+    //    `reject_output_collisions`.
+
+    /// Collect just the paths `metrics_write_targets` returns, as strings.
+    fn target_paths(bag: &crate::pipeline::chains::StageOptionsBag) -> Vec<String> {
+        metrics_write_targets(bag).into_iter().map(|(p, _)| p.display().to_string()).collect()
+    }
+
+    #[test]
+    fn metrics_write_targets_empty_when_no_metrics_requested() {
+        // A plain group run with no metrics flags registers no metrics targets.
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Group]).unwrap();
+        assert!(metrics_write_targets(&bag).is_empty());
+    }
+
+    #[test]
+    fn metrics_write_targets_registers_correct_metrics() {
+        let r = parse(&[
+            "--start-from",
+            "correct",
+            "--stop-after",
+            "correct",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--correct::min-distance",
+            "1",
+            "--correct::umis",
+            "AAAA",
+            "--all-metrics",
+            "all",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Correct]).unwrap();
+        assert_eq!(target_paths(&bag), vec!["all.correct.metrics.txt".to_string()]);
+    }
+
+    #[test]
+    fn metrics_write_targets_registers_the_group_prefix_fanout() {
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+            "--all-metrics",
+            "all",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Group]).unwrap();
+        // The `--metrics` prefix (`all.group`) fans out to all three canonical
+        // group files — each must be registered so `--output` cannot land on one.
+        assert_eq!(
+            target_paths(&bag),
+            vec![
+                "all.group.family_sizes.txt".to_string(),
+                "all.group.grouping_metrics.txt".to_string(),
+                "all.group.position_group_sizes.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn metrics_write_targets_registers_explicit_group_metrics_flags() {
+        // Explicit `--group::family-size-histogram` / `--group::grouping-metrics`
+        // are separate outputs from the `--metrics` prefix and must also register.
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "group",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "adjacency",
+            "--group::family-size-histogram",
+            "fs.txt",
+            "--group::grouping-metrics",
+            "gm.txt",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Group]).unwrap();
+        assert_eq!(target_paths(&bag), vec!["fs.txt".to_string(), "gm.txt".to_string()]);
+    }
+
+    #[cfg(feature = "consensus")]
+    #[test]
+    fn metrics_write_targets_registers_the_simplex_prefix_fanout() {
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "paired",
+            "--consensus",
+            "simplex",
+            "--simplex::min-reads",
+            "1",
+            "--all-metrics",
+            "all",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Simplex]).unwrap();
+        assert_eq!(
+            target_paths(&bag),
+            vec![
+                "all.simplex.family_sizes.txt".to_string(),
+                "all.simplex.umi_counts.txt".to_string(),
+                "all.simplex.simplex_yield_metrics.txt".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(feature = "consensus")]
+    #[test]
+    fn metrics_write_targets_registers_the_duplex_prefix_fanout_superset() {
+        // Duplex (and codec, which shares the writer) fans out to the full set,
+        // including the conditional `duplex_umi_counts.txt` — the guard registers
+        // the superset so a colliding `--output` is rejected regardless.
+        let r = parse(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--group::strategy",
+            "paired",
+            "--consensus",
+            "duplex",
+            "--duplex::min-reads",
+            "1,1,0",
+            "--all-metrics",
+            "all",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Duplex]).unwrap();
+        assert_eq!(
+            target_paths(&bag),
+            vec![
+                "all.duplex.family_sizes.txt".to_string(),
+                "all.duplex.duplex_family_sizes.txt".to_string(),
+                "all.duplex.umi_counts.txt".to_string(),
+                "all.duplex.duplex_umi_counts.txt".to_string(),
+                "all.duplex.duplex_yield_metrics.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn all_metrics_never_overwrites_an_explicit_correct_metrics_flag() {
+        let r = parse(&[
+            "--start-from",
+            "correct",
+            "--stop-after",
+            "correct",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--correct::min-distance",
+            "1",
+            "--correct::umis",
+            "AAAA",
+            "--correct::metrics",
+            "explicit.txt",
+            "--all-metrics",
+            "all",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Correct]).unwrap();
+        assert_eq!(bag.correct.unwrap().metrics, Some(PathBuf::from("explicit.txt")));
+    }
+
+    #[test]
+    fn all_metrics_leaves_a_stage_absent_from_the_chain_untouched() {
+        // `--all-metrics` is set and `--correct::*` is fully configured, but
+        // this call only asks for `Stage::Filter` — chain-scoped fill-in must
+        // not populate `bag.correct` at all (it is never even visited).
+        let r = parse(&[
+            "--start-from",
+            "correct",
+            "--stop-after",
+            "filter",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--correct::min-distance",
+            "1",
+            "--correct::umis",
+            "AAAA",
+            "--filter::min-reads",
+            "1",
+            "--all-metrics",
+            "all",
+        ]);
+        let bag = r.build_stage_options_bag(&[Stage::Filter]).unwrap();
+        assert!(
+            bag.correct.is_none(),
+            "a stage not passed to build_stage_options_bag is untouched"
+        );
+        assert_eq!(bag.filter.unwrap().stats, Some(PathBuf::from("all.filter.stats.txt")));
     }
 }
 

@@ -44,12 +44,16 @@ pub struct PerThreadAccumulator<A> {
     slots: Vec<Mutex<A>>,
 }
 
-impl<A: Default + Send> PerThreadAccumulator<A> {
-    /// Allocates `num_slots` default-initialized slots. `num_slots` is clamped
-    /// to at least 1; callers typically pass the pipeline's worker count.
+impl<A: Send> PerThreadAccumulator<A> {
+    /// Allocates `num_slots` slots, each initialized by calling `init`.
+    /// `num_slots` is clamped to at least 1; callers typically pass the
+    /// pipeline's worker count. Unlike [`Self::new`], this does not require
+    /// `A: Default` — use it for a type (like `ConsensusMetricsAccumulator`)
+    /// whose construction depends on runtime configuration (e.g. simplex vs.
+    /// duplex mode) rather than having one universal default value.
     #[must_use]
-    pub fn new(num_slots: usize) -> Arc<Self> {
-        let slots = (0..num_slots.max(1)).map(|_| Mutex::new(A::default())).collect();
+    pub fn new_with(num_slots: usize, init: impl Fn() -> A) -> Arc<Self> {
+        let slots = (0..num_slots.max(1)).map(|_| Mutex::new(init())).collect();
         Arc::new(Self { slots })
     }
 
@@ -75,6 +79,45 @@ impl<A: Default + Send> PerThreadAccumulator<A> {
     #[must_use]
     pub fn slots(&self) -> &[Mutex<A>] {
         &self.slots
+    }
+
+    /// Consumes the accumulator and yields each slot's inner value, without
+    /// requiring `A: Default` — the same relationship [`Self::new_with`] has
+    /// to [`PerThreadAccumulator::new`]. Use for a type (like
+    /// `ConsensusMetricsAccumulator`) whose construction depends on runtime
+    /// configuration rather than having one universal default value.
+    ///
+    /// Requires unique `Arc` ownership — i.e. the pipeline closures that held
+    /// clones have been dropped. Debug builds assert this invariant. If other
+    /// `Arc` holders remain in release builds, falls back to replacing each
+    /// slot with `init()`, which is lossy under concurrent use in exactly the
+    /// same way [`Self::into_slots`]'s `A::default()` fallback is: any
+    /// `with_slot` call racing from a surviving holder after the replacement
+    /// will land in the freshly re-initialized slot and be dropped when that
+    /// holder releases its `Arc`. Callers must quiesce all writers before
+    /// invoking.
+    pub fn into_slots_with(self: Arc<Self>, init: impl Fn() -> A) -> Vec<A> {
+        debug_assert_eq!(
+            Arc::strong_count(&self),
+            1,
+            "into_slots_with called with outstanding Arc holders; fallback is lossy under concurrent writes",
+        );
+        match Arc::try_unwrap(self) {
+            Ok(inner) => inner.slots.into_iter().map(Mutex::into_inner).collect(),
+            Err(arc) => {
+                arc.slots.iter().map(|m| std::mem::replace(&mut *m.lock(), init())).collect()
+            }
+        }
+    }
+}
+
+impl<A: Default + Send> PerThreadAccumulator<A> {
+    /// Allocates `num_slots` default-initialized slots. `num_slots` is clamped
+    /// to at least 1; callers typically pass the pipeline's worker count.
+    #[must_use]
+    pub fn new(num_slots: usize) -> Arc<Self> {
+        let slots = (0..num_slots.max(1)).map(|_| Mutex::new(A::default())).collect();
+        Arc::new(Self { slots })
     }
 
     /// Consumes the accumulator and yields each slot's inner value.
@@ -165,6 +208,18 @@ mod tests {
         assert_eq!(slots.iter().map(|c| c.0).sum::<u64>(), 7);
     }
 
+    /// `into_slots_with` is the `Default`-free sibling of `into_slots`
+    /// (mirroring `new_with`'s relationship to `new`) — proves it drains
+    /// every slot under unique ownership for a type with no `Default` impl.
+    #[test]
+    fn into_slots_with_drains_under_unique_ownership_without_default() {
+        let acc = PerThreadAccumulator::<NoDefault>::new_with(4, || NoDefault(0));
+        acc.with_slot(|c| c.0 = 7);
+        let slots = acc.into_slots_with(|| NoDefault(0));
+        assert_eq!(slots.len(), 4);
+        assert_eq!(slots.iter().map(|c| c.0).sum::<usize>(), 7);
+    }
+
     /// Regression guard for the clip `--metrics` chain path
     /// (`ClipMetricsFinalizeHook`): a reduction bug that summed only a *subset*
     /// of `PerThreadAccumulator` slots (e.g. an off-by-one `.take(n)`, or
@@ -228,5 +283,30 @@ mod tests {
         let expected_five_prime: usize = (1..=N_THREADS).sum();
         assert_eq!(merged.read_one.reads, N_THREADS);
         assert_eq!(merged.read_one.bases_clipped_five_prime, expected_five_prime);
+    }
+
+    /// A type with no `Default` impl, standing in for
+    /// `ConsensusMetricsAccumulator` (which cannot derive `Default` since
+    /// there's no mode-less default — it needs `new_simplex()`/`new_duplex(bool)`).
+    struct NoDefault(usize);
+
+    #[test]
+    fn new_with_constructs_slots_without_requiring_default() {
+        let acc = PerThreadAccumulator::<NoDefault>::new_with(3, || NoDefault(42));
+        assert_eq!(acc.slots().len(), 3);
+        acc.with_slot(|slot| assert_eq!(slot.0, 42));
+    }
+
+    #[test]
+    fn new_with_calls_init_once_per_slot_independently() {
+        // Each slot gets its OWN init() call, not a shared/cloned value —
+        // proves init is a factory, not a single-construct-then-copy.
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let acc = PerThreadAccumulator::<NoDefault>::new_with(4, || {
+            NoDefault(counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+        });
+        let mut values: Vec<usize> = acc.slots().iter().map(|m| m.lock().0).collect();
+        values.sort_unstable();
+        assert_eq!(values, vec![0, 1, 2, 3]);
     }
 }

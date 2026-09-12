@@ -8,7 +8,7 @@
 //! - Optional PDF plots via an embedded R script
 
 use crate::logging::OperationTimer;
-use crate::metrics::simplex::{SimplexMetricsCollector, SimplexYieldMetric};
+use crate::metrics::simplex::SimplexMetricsCollector;
 use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
 use crate::validation::validate_input_exists;
 use anyhow::Result;
@@ -18,8 +18,8 @@ use std::path::PathBuf;
 
 use super::command::Command;
 use super::shared_metrics::{
-    DOWNSAMPLING_FRACTIONS, TemplateInfo, compute_template_metadata, execute_r_script,
-    is_r_available, parse_intervals, process_templates_from_bam,
+    DOWNSAMPLING_FRACTIONS, execute_r_script, is_r_available, parse_intervals,
+    process_templates_from_bam, record_simplex_coordinate_group,
 };
 
 /// Embedded R script for PDF plot generation (bundled with binary).
@@ -133,7 +133,7 @@ impl Command for SimplexMetrics {
             &intervals,
             fractions.len(),
             |group, fraction_counts| {
-                Self::process_coordinate_group(
+                record_simplex_coordinate_group(
                     group,
                     fractions,
                     &mut collectors,
@@ -153,8 +153,7 @@ impl Command for SimplexMetrics {
         for ((&fraction, collector), &read_pairs) in
             fractions.iter().zip(collectors.iter()).zip(fraction_template_counts.iter())
         {
-            let yield_metric =
-                Self::generate_yield_metric(collector, fraction, read_pairs, self.min_reads);
+            let yield_metric = collector.to_yield_metric(fraction, read_pairs, self.min_reads);
             yield_metrics.push(yield_metric);
         }
 
@@ -215,159 +214,6 @@ impl Command for SimplexMetrics {
     }
 }
 
-impl SimplexMetrics {
-    /// Processes a single coordinate group for all downsampling fractions.
-    ///
-    /// For each fraction, filters templates by hash, records CS family size (the entire
-    /// group), groups by MI tag for SS families, and (at 100% only) collects UMI
-    /// observations via consensus calling per UMI position.
-    fn process_coordinate_group(
-        group: &[TemplateInfo],
-        fractions: &[f64],
-        collectors: &mut [SimplexMetricsCollector],
-        umi_consensus_caller: &mut SimpleUmiConsensusCaller,
-        fraction_template_counts: &mut [usize],
-    ) -> Result<()> {
-        use std::collections::HashMap;
-
-        if group.is_empty() {
-            return Ok(());
-        }
-
-        // Pre-compute metadata once for the entire group
-        let metadata = compute_template_metadata(group);
-
-        // SIMM3-01: simplex-metrics assumes single-strand (non-duplex) input. If a base
-        // UMI carries reads from BOTH the /A and /B strands, the input is duplex data:
-        // the per-base_umi RX consensus below would mix the two strands' swapped UMI
-        // orientations and produce garbage counts. Fail loud and point at duplex-metrics.
-        let mut base_umi_strands: HashMap<&str, (bool, bool)> = HashMap::new();
-        for m in &metadata {
-            let seen = base_umi_strands.entry(m.base_umi).or_default();
-            seen.0 |= m.is_a_strand;
-            seen.1 |= m.is_b_strand;
-            if seen.0 && seen.1 {
-                anyhow::bail!(
-                    "simplex-metrics received duplex-UMI data: base UMI '{}' has reads on \
-                     both the /A and /B strands. Run duplex-metrics for duplex data.",
-                    m.base_umi
-                );
-            }
-        }
-
-        let last_fraction_idx = fractions.len() - 1;
-
-        let mut ss_groups: HashMap<&str, usize> = HashMap::new();
-
-        for (idx, &fraction) in fractions.iter().enumerate() {
-            // Filter once per fraction
-            let downsampled: Vec<_> =
-                metadata.iter().filter(|m| m.template.hash_fraction <= fraction).collect();
-
-            if downsampled.is_empty() {
-                continue;
-            }
-
-            // CS family size
-            fraction_template_counts[idx] += downsampled.len();
-            collectors[idx].record_cs_family(downsampled.len());
-
-            // Group by MI tag for SS families
-            ss_groups.clear();
-            for m in &downsampled {
-                *ss_groups.entry(m.template.mi.as_str()).or_default() += 1;
-            }
-            for &ss_size in ss_groups.values() {
-                collectors[idx].record_ss_family(ss_size);
-            }
-
-            // UMI metrics only at the 100% fraction (last index)
-            if idx == last_fraction_idx {
-                // Group by base_umi (MI without strand suffix) and collect RX tags
-                let mut umi_groups: HashMap<&str, Vec<&str>> = HashMap::new();
-                for m in &downsampled {
-                    umi_groups.entry(m.base_umi).or_default().push(m.template.rx.as_str());
-                }
-
-                for rx_tags in umi_groups.values() {
-                    // For simplex: no strand-swapping. Split each RX by '-' for
-                    // multi-component UMIs and call consensus per position.
-                    let split_rx: Vec<Vec<&str>> =
-                        rx_tags.iter().map(|rx| rx.split('-').collect()).collect();
-                    let num_components = split_rx.first().map_or(0, Vec::len);
-
-                    for pos in 0..num_components {
-                        // Do NOT drop empty molecule-end halves (e.g. the trailing half
-                        // of `CCC-` or the leading half of `-GGG`). fgbio counts them,
-                        // recording the empty half as an empty-string UMI, so single-index
-                        // designs are not undercounted (SIM-01, mirroring DXM-01). A read
-                        // that simply has fewer components than `pos` contributes nothing
-                        // (its `parts.get(pos)` is `None`).
-                        let umis_at_pos: Vec<String> = split_rx
-                            .iter()
-                            .filter_map(|parts| parts.get(pos).map(|s| (*s).to_string()))
-                            .collect();
-
-                        if umis_at_pos.is_empty() {
-                            continue;
-                        }
-
-                        let (consensus, _had_errors) = umi_consensus_caller.consensus(&umis_at_pos);
-                        let raw_count = umis_at_pos.len();
-                        let error_count = umis_at_pos.iter().filter(|u| **u != consensus).count();
-                        collectors[idx].record_umi(&consensus, raw_count, error_count, true);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Generates a yield metric from a collector at a specific downsampling fraction.
-    ///
-    /// Computes summary statistics including CS and SS family counts, mean SS family size,
-    /// singleton fraction, and number of SS families meeting the minimum read threshold.
-    fn generate_yield_metric(
-        collector: &SimplexMetricsCollector,
-        fraction: f64,
-        read_pairs: usize,
-        min_reads: usize,
-    ) -> SimplexYieldMetric {
-        let family_size_metrics = collector.family_size_metrics();
-
-        let cs_families: usize = family_size_metrics.iter().map(|m| m.cs_count).sum();
-        let ss_families: usize = family_size_metrics.iter().map(|m| m.ss_count).sum();
-
-        // Total reads in SS families = sum(family_size * ss_count)
-        let total_ss_reads: usize =
-            family_size_metrics.iter().map(|m| m.family_size * m.ss_count).sum();
-        let mean_ss_family_size =
-            if ss_families > 0 { total_ss_reads as f64 / ss_families as f64 } else { 0.0 };
-
-        let ss_singletons: usize =
-            family_size_metrics.iter().find(|m| m.family_size == 1).map_or(0, |m| m.ss_count);
-        let ss_singleton_fraction =
-            if ss_families > 0 { ss_singletons as f64 / ss_families as f64 } else { 0.0 };
-
-        let ss_consensus_families: usize = family_size_metrics
-            .iter()
-            .filter(|m| m.family_size >= min_reads)
-            .map(|m| m.ss_count)
-            .sum();
-
-        SimplexYieldMetric {
-            fraction,
-            read_pairs,
-            cs_families,
-            ss_families,
-            mean_ss_family_size,
-            ss_singletons,
-            ss_singleton_fraction,
-            ss_consensus_families,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,7 +221,9 @@ mod tests {
         consensus_guard_record, ensure_not_consensus_record, is_consensus_guard_record,
     };
     use crate::metrics::shared::UmiMetric;
-    use crate::metrics::simplex::{SimplexFamilySizeMetric, SimplexMetricsCollector};
+    use crate::metrics::simplex::{
+        SimplexFamilySizeMetric, SimplexMetricsCollector, SimplexYieldMetric,
+    };
     use crate::sam::SamTag;
     use anyhow::Result;
     use fgoxide::io::DelimFile;
@@ -593,7 +441,7 @@ mod tests {
         collector.record_ss_family(3);
         collector.record_cs_family(6);
 
-        let metric = SimplexMetrics::generate_yield_metric(&collector, 1.0, 6, 2);
+        let metric = collector.to_yield_metric(1.0, 6, 2);
 
         assert_eq!(metric.cs_families, 1);
         assert_eq!(metric.ss_families, 3);
@@ -606,7 +454,7 @@ mod tests {
     #[test]
     fn test_generate_yield_metric_empty() {
         let collector = SimplexMetricsCollector::new();
-        let metric = SimplexMetrics::generate_yield_metric(&collector, 0.5, 0, 1);
+        let metric = collector.to_yield_metric(0.5, 0, 1);
 
         assert_eq!(metric.cs_families, 0);
         assert_eq!(metric.ss_families, 0);
@@ -622,7 +470,7 @@ mod tests {
         collector.record_ss_family(1);
         collector.record_ss_family(1);
 
-        let metric = SimplexMetrics::generate_yield_metric(&collector, 1.0, 3, 2);
+        let metric = collector.to_yield_metric(1.0, 3, 2);
 
         assert_eq!(metric.ss_families, 3);
         assert_eq!(metric.ss_singletons, 3);

@@ -242,6 +242,23 @@ pub struct Codec {
     #[arg(short = 'X', long = "max-duplex-disagreements")]
     pub max_duplex_disagreements: Option<usize>,
 
+    /// Optional prefix for inline consensus QC metrics — the same
+    /// duplex-shaped file set `duplex-metrics` writes (CS/SS/DS family
+    /// sizes, UMI counts, downsampling yield curve), since codec is
+    /// DS-capable and shares the `Duplex` inline-collector variant.
+    /// Computed inline with no second BAM read. As with `duplex --metrics`,
+    /// the inline path does not emit `<prefix>.duplex_umi_counts.txt` (the
+    /// tally `duplex-metrics` gates behind `--duplex-umi-counts`); run
+    /// `duplex-metrics` separately if you need that file.
+    #[arg(long = "metrics")]
+    pub metrics: Option<std::path::PathBuf>,
+
+    /// Optional interval file (BED or Picard interval list) restricting
+    /// which templates contribute to `--metrics` output. Ignored if
+    /// `--metrics` is not set.
+    #[arg(long = "intervals")]
+    pub intervals: Option<std::path::PathBuf>,
+
     /// Whether to process unmapped reads (the shared `--allow-unmapped` flag).
     #[command(flatten)]
     pub allow_unmapped: AllowUnmappedOptions,
@@ -351,6 +368,12 @@ pub struct CodecOptions {
     /// Maximum duplex disagreements.
     #[arg(short = 'X', long = "max-duplex-disagreements")]
     pub max_duplex_disagreements: Option<usize>,
+    /// Optional prefix for inline consensus QC metrics. See `Codec::metrics`.
+    #[arg(long = "metrics")]
+    pub metrics: Option<std::path::PathBuf>,
+    /// Optional interval file restricting `--metrics` output. See `Codec::intervals`.
+    #[arg(long = "intervals")]
+    pub intervals: Option<std::path::PathBuf>,
     /// Let fully-unmapped primary templates through the pre-group filter.
     ///
     /// Carried as the whole flattened sub-struct, like `io` / `rejects_opts` /
@@ -395,6 +418,8 @@ impl Default for CodecOptions {
             outer_bases_length: 5,
             max_duplex_disagreement_rate: 1.0,
             max_duplex_disagreements: None,
+            metrics: None,
+            intervals: None,
             allow_unmapped: AllowUnmappedOptions { enabled: false },
             io: BamIoOptions::default(),
             rejects_opts: RejectsOptions::default(),
@@ -425,6 +450,8 @@ impl Codec {
             outer_bases_length: self.outer_bases_length,
             max_duplex_disagreement_rate: self.max_duplex_disagreement_rate,
             max_duplex_disagreements: self.max_duplex_disagreements,
+            metrics: self.metrics.clone(),
+            intervals: self.intervals.clone(),
             allow_unmapped: self.allow_unmapped.clone(),
             io: self.io.clone(),
             rejects_opts: self.rejects_opts.clone(),
@@ -640,6 +667,10 @@ mod tests {
             "Z",
             "--read-name-prefix",
             "pfx",
+            "--metrics",
+            "mx",
+            "--intervals",
+            "iv.bed",
             "--allow-unmapped=true",
         ])
         .expect("parses");
@@ -674,6 +705,16 @@ mod tests {
         assert_eq!(opts.stats_opts.stats, Some(std::path::PathBuf::from("stats.txt")));
         assert_eq!(opts.read_group.read_group_id, "Z");
         assert_eq!(opts.read_group.read_name_prefix, Some("pfx".to_string()));
+        assert_eq!(
+            opts.metrics,
+            Some(std::path::PathBuf::from("mx")),
+            "--metrics must reach the projection"
+        );
+        assert_eq!(
+            opts.intervals,
+            Some(std::path::PathBuf::from("iv.bed")),
+            "--intervals must reach the projection"
+        );
     }
 
     /// The projection must carry defaults faithfully too — a field hard-coded to
@@ -706,6 +747,8 @@ mod tests {
         assert_eq!(opts.stats_opts.stats, None);
         assert_eq!(opts.read_group.read_group_id, "A");
         assert_eq!(opts.read_group.read_name_prefix, None);
+        assert_eq!(opts.metrics, None, "--metrics default must be None, not hard-coded");
+        assert_eq!(opts.intervals, None, "--intervals default must be None, not hard-coded");
     }
 
     use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -741,6 +784,8 @@ mod tests {
             outer_bases_length: 5,
             max_duplex_disagreement_rate: 1.0,
             max_duplex_disagreements: None,
+            metrics: None,
+            intervals: None,
             allow_unmapped: AllowUnmappedOptions { enabled: false },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),

@@ -15,7 +15,7 @@ use crate::{Metric, frac};
 /// Two kinds of families are described:
 /// - **CS** (Coordinate & Strand): families grouped by unclipped 5' genomic positions and strands
 /// - **SS** (Single Strand): single-strand families using UMIs, not linking opposing strands
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimplexFamilySizeMetric {
     /// The family size (number of read pairs grouped together)
     pub family_size: usize,
@@ -121,6 +121,7 @@ impl Metric for SimplexYieldMetric {
 /// Collector for simplex sequencing metrics.
 ///
 /// Tracks CS and SS family sizes and UMI frequencies.
+#[derive(Debug, Clone, Default)]
 pub struct SimplexMetricsCollector {
     /// CS family size counts: `family_size` -> count
     cs_family_sizes: HashMap<usize, usize>,
@@ -220,16 +221,70 @@ impl SimplexMetricsCollector {
     pub fn umi_metrics(&self) -> Vec<UmiMetric> {
         self.umi_counts.to_metrics()
     }
-}
 
-impl Default for SimplexMetricsCollector {
-    fn default() -> Self {
-        Self::new()
+    /// Merges `other`'s counts into `self`. Commutative and associative: an
+    /// integer `HashMap` sum per key, so the result is independent of how
+    /// many workers produced partial collectors or in what order they are
+    /// folded together.
+    pub fn merge(&mut self, other: Self) {
+        for (size, count) in other.cs_family_sizes {
+            *self.cs_family_sizes.entry(size).or_insert(0) += count;
+        }
+        for (size, count) in other.ss_family_sizes {
+            *self.ss_family_sizes.entry(size).or_insert(0) += count;
+        }
+        self.umi_counts.merge(other.umi_counts);
+    }
+
+    /// Builds the yield-metric row for this collector at one downsampling
+    /// fraction. `min_reads` is the family-size threshold a family must meet
+    /// to count toward `ss_consensus_families` — the separate-pass command
+    /// sources this from its own `--min-reads` flag; the inline path sources
+    /// it from the calling command's own `min_reads` option (Task 11), so
+    /// the two agree by construction rather than by convention.
+    #[must_use]
+    pub fn to_yield_metric(
+        &self,
+        fraction: f64,
+        read_pairs: usize,
+        min_reads: usize,
+    ) -> SimplexYieldMetric {
+        let family_size_metrics = self.family_size_metrics();
+
+        let cs_families: usize = family_size_metrics.iter().map(|m| m.cs_count).sum();
+        let ss_families: usize = family_size_metrics.iter().map(|m| m.ss_count).sum();
+
+        let total_ss_reads: usize =
+            family_size_metrics.iter().map(|m| m.family_size * m.ss_count).sum();
+        let mean_ss_family_size = frac(total_ss_reads, ss_families);
+
+        let ss_singletons: usize =
+            family_size_metrics.iter().find(|m| m.family_size == 1).map_or(0, |m| m.ss_count);
+        let ss_singleton_fraction = frac(ss_singletons, ss_families);
+
+        let ss_consensus_families: usize = family_size_metrics
+            .iter()
+            .filter(|m| m.family_size >= min_reads)
+            .map(|m| m.ss_count)
+            .sum();
+
+        SimplexYieldMetric {
+            fraction,
+            read_pairs,
+            cs_families,
+            ss_families,
+            mean_ss_family_size,
+            ss_singletons,
+            ss_singleton_fraction,
+            ss_consensus_families,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     // =========================================================================
@@ -351,6 +406,22 @@ mod tests {
     }
 
     #[test]
+    fn to_yield_metric_counts_ss_consensus_families_at_the_min_reads_threshold() {
+        let mut collector = SimplexMetricsCollector::new();
+        collector.record_cs_family(4);
+        collector.record_ss_family(1); // below min_reads=2, excluded
+        collector.record_ss_family(3); // at/above min_reads=2, included
+
+        let metric = collector.to_yield_metric(0.5, 100, 2);
+
+        assert!((metric.fraction - 0.5).abs() < f64::EPSILON);
+        assert_eq!(metric.read_pairs, 100);
+        assert_eq!(metric.cs_families, 1);
+        assert_eq!(metric.ss_families, 2);
+        assert_eq!(metric.ss_consensus_families, 1);
+    }
+
+    #[test]
     fn test_empty_collector() {
         let collector = SimplexMetricsCollector::new();
 
@@ -381,5 +452,121 @@ mod tests {
             metrics.iter().find(|m| m.umi == "CCCC").expect("CCCC UMI metric should be present");
         assert_eq!(cccc.raw_observations, 8);
         assert_eq!(cccc.unique_observations, 1);
+    }
+
+    // =========================================================================
+    // SimplexMetricsCollector::merge tests
+    // =========================================================================
+
+    #[rstest]
+    #[case::disjoint_sizes(vec![(1, 3)], vec![(2, 5)], vec![(1, 3), (2, 5)])]
+    #[case::overlapping_sizes(vec![(1, 3)], vec![(1, 2)], vec![(1, 5)])]
+    #[case::empty_other(vec![(1, 3)], vec![], vec![(1, 3)])]
+    fn merge_sums_cs_family_sizes_by_key(
+        #[case] a: Vec<(usize, usize)>,
+        #[case] b: Vec<(usize, usize)>,
+        #[case] expected: Vec<(usize, usize)>,
+    ) {
+        let mut left = SimplexMetricsCollector::new();
+        for (size, count) in a {
+            for _ in 0..count {
+                left.record_cs_family(size);
+            }
+        }
+        let mut right = SimplexMetricsCollector::new();
+        for (size, count) in b {
+            for _ in 0..count {
+                right.record_cs_family(size);
+            }
+        }
+
+        left.merge(right);
+
+        let mut got: Vec<(usize, usize)> = left.cs_family_sizes.into_iter().collect();
+        got.sort_unstable();
+        let mut expected = expected;
+        expected.sort_unstable();
+        assert_eq!(got, expected);
+    }
+
+    /// The `ss_family_sizes` sibling of `merge_sums_cs_family_sizes_by_key`:
+    /// `merge` folds `ss_family_sizes` with the same accumulate-onto-existing
+    /// loop, but the only other coverage (`merge_is_commutative`) records the
+    /// same ss size on both sides and asserts commutativity alone, which a
+    /// sum-vs-overwrite bug in the ss loop would still satisfy. This pins the
+    /// overlapping-key SUM directly.
+    #[test]
+    fn merge_sums_overlapping_ss_family_sizes() {
+        let mut left = SimplexMetricsCollector::new();
+        left.record_ss_family(1);
+        left.record_ss_family(1); // size 1 -> count 2
+        left.record_ss_family(3);
+        let mut right = SimplexMetricsCollector::new();
+        right.record_ss_family(1); // overlaps size 1
+        right.record_ss_family(5);
+
+        left.merge(right);
+
+        let mut got: Vec<(usize, usize)> =
+            left.ss_family_sizes.iter().map(|(k, v)| (*k, *v)).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![(1, 3), (3, 1), (5, 1)],
+            "overlapping ss size 1 must sum to 3, not overwrite",
+        );
+    }
+
+    #[test]
+    fn merge_is_commutative() {
+        let mut a1 = SimplexMetricsCollector::new();
+        a1.record_cs_family(3);
+        a1.record_ss_family(1);
+        a1.record_umi("AAA", 2, 0, true);
+
+        let mut b1 = SimplexMetricsCollector::new();
+        b1.record_cs_family(5);
+        b1.record_ss_family(1);
+        b1.record_umi("TTT", 1, 1, true);
+
+        let (a2, mut b2) = (a1.clone(), b1.clone());
+        a1.merge(b1);
+        b2.merge(a2);
+        assert_eq!(a1.family_size_metrics(), b2.family_size_metrics());
+    }
+
+    #[rstest]
+    #[case::two_shards(vec![vec![1, 2], vec![3]])]
+    #[case::three_shards(vec![vec![1], vec![2], vec![3]])]
+    #[case::one_shard_per_item(vec![vec![1], vec![2], vec![3]])]
+    #[case::single_shard(vec![vec![1, 2, 3]])]
+    fn merge_is_associative_regardless_of_shard_partitioning(#[case] shards: Vec<Vec<usize>>) {
+        // Partitioning the SAME fixed input (family sizes 1, 2, 3, one
+        // record each) into N shards in several arrangements, then folding
+        // all shards together pairwise, must always yield the identical
+        // final result — proving associativity, not just two-way
+        // commutativity (already covered above).
+        let mut shard_collectors: Vec<SimplexMetricsCollector> = shards
+            .iter()
+            .map(|sizes| {
+                let mut c = SimplexMetricsCollector::new();
+                for &size in sizes {
+                    c.record_cs_family(size);
+                }
+                c
+            })
+            .collect();
+
+        let mut folded = shard_collectors.remove(0);
+        for shard in shard_collectors {
+            folded.merge(shard);
+        }
+
+        let mut expected = SimplexMetricsCollector::new();
+        expected.record_cs_family(1);
+        expected.record_cs_family(2);
+        expected.record_cs_family(3);
+
+        assert_eq!(folded.family_size_metrics(), expected.family_size_metrics());
     }
 }

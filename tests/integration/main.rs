@@ -24,6 +24,12 @@ mod test_compare_mutation;
 #[cfg(feature = "consensus")]
 mod test_consensus_cutover_parity;
 mod test_consensus_downsampling;
+#[cfg(feature = "consensus")]
+mod test_consensus_metrics_chain_shape;
+#[cfg(feature = "consensus")]
+mod test_consensus_metrics_cutover_parity;
+#[cfg(feature = "consensus")]
+mod test_consensus_metrics_parity;
 mod test_copy_umi_command;
 mod test_copy_umi_cutover_parity;
 mod test_correct_command;
@@ -46,6 +52,8 @@ mod test_filter_cutover_parity;
 mod test_group_command;
 mod test_group_cutover_parity;
 mod test_group_determinism;
+#[cfg(feature = "consensus")]
+mod test_group_metrics_fused_parity;
 mod test_input_source_matrix;
 mod test_merge_command;
 mod test_retag_command;

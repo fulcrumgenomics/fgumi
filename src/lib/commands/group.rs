@@ -997,7 +997,7 @@ fn write_metrics<S: serde::Serialize>(
 }
 
 /// Build a path by appending `.{suffix}` to a prefix path.
-fn with_extension(prefix: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn with_extension(prefix: &Path, suffix: &str) -> PathBuf {
     let mut s = prefix.as_os_str().to_owned();
     s.push(".");
     s.push(suffix);
@@ -6432,5 +6432,36 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn write_metrics_for_chain_with_prefix_produces_the_three_fixed_suffixes() {
+        use crate::metrics::group::UmiGroupingMetrics;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prefix = dir.path().join("myrun");
+
+        let grouping_metrics = UmiGroupingMetrics::default();
+        let family_sizes: AHashMap<usize, u64> = [(1, 5), (2, 3)].into_iter().collect();
+        let position_group_sizes: AHashMap<usize, u64> = [(1, 5), (2, 3)].into_iter().collect();
+
+        write_metrics_for_chain(
+            &grouping_metrics,
+            &family_sizes,
+            &position_group_sizes,
+            None,
+            None,
+            Some(&prefix),
+        )
+        .expect("write_metrics_for_chain succeeds");
+
+        assert!(dir.path().join("myrun.family_sizes.txt").is_file());
+        assert!(dir.path().join("myrun.grouping_metrics.txt").is_file());
+        assert!(dir.path().join("myrun.position_group_sizes.txt").is_file());
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(entries.len(), 3, "expected exactly 3 files, got {entries:?}");
     }
 }

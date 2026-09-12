@@ -142,6 +142,7 @@ pub mod fastq_deinterleave;
 pub mod fastq_parse;
 pub mod grouper;
 pub(crate) mod hashing;
+pub(crate) mod inline_metrics_collector;
 pub mod logging;
 pub mod metrics;
 pub mod mi_group;

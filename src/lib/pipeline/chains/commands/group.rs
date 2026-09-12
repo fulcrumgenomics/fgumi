@@ -147,6 +147,12 @@ pub(crate) fn build_group_process_step(
     num_threads: usize,
     filter_config: TemplateFilterConfig,
     accumulators: Arc<PerThreadAccumulator<GroupMetricsAccumulator>>,
+    consensus_metrics: Option<Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>>,
+    // `Some` exactly when `consensus_metrics` is `Some` — both are built together
+    // in `add_group` only when a downstream consensus stage requested metrics.
+    // `None` on the default (metrics-off) path, so nothing is cloned or retained.
+    header: Option<Arc<noodles::sam::Header>>,
+    library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
 ) -> ProcessOrdered<
     BatchedRawPositionGroups,
     BatchedProcessedPositionGroups,
@@ -286,6 +292,32 @@ pub(crate) fn build_group_process_step(
                 accumulators.with_slot(|acc| {
                     acc.record_group(family_sizes.clone(), &filter_counts);
                 });
+
+                // T1 fused inline-metrics tap: when a downstream consensus
+                // stage in this chain requested `--metrics`, record this
+                // position group's templates into the shared accumulator now,
+                // reusing the already-decoded `Template`s (no second BAM read).
+                // `header`/`library_index` are `Some` exactly when
+                // `consensus_metrics` is (built together in `add_group`), so the
+                // three-way match both drives the tap and unwraps the metrics
+                // header/library index without a separate expect.
+                if let (Some(consensus_metrics), Some(header), Some(library_index)) =
+                    (&consensus_metrics, &header, &library_index)
+                {
+                    let infos =
+                        crate::inline_metrics_collector::coordinate_group_from_processed_position(
+                            &templates,
+                            header,
+                            library_index,
+                        )
+                        .map_err(io::Error::other)?;
+                    consensus_metrics
+                        .accumulator
+                        .with_slot(|slot| {
+                            slot.acc.record_coordinate_group(&infos, &consensus_metrics.intervals)
+                        })
+                        .map_err(io::Error::other)?;
+                }
 
                 processed_batch.push(ProcessedPositionGroup {
                     templates,

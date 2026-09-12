@@ -28,6 +28,7 @@ use crate::commands::consensus_runner::{ConsensusStatsOps, log_overlapping_stats
 use crate::consensus_caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason,
 };
+use crate::inline_metrics_collector::push_mi_group_entries;
 use crate::logging::OperationTimer;
 use crate::mi_group::MiGroup;
 use crate::overlapping_consensus::{
@@ -77,6 +78,13 @@ pub(crate) struct CollectedSimplexMetrics {
 pub(crate) struct ConsensusState {
     pub(crate) caller: VanillaUmiConsensusCaller,
     pub(crate) overlapping: Option<OverlappingBasesConsensusCaller>,
+    /// Input header + library index, threaded in for the inline-metrics T2
+    /// path so the metrics-on batch body can build `TemplateInfo`s via
+    /// `push_mi_group_entries` (Task 11). `Some` only on the metrics-on path —
+    /// the metrics-off default builds and retains neither — and only the
+    /// metrics-on batch body reads them.
+    pub(crate) header: Option<Arc<noodles::sam::Header>>,
+    pub(crate) library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
 }
 
 impl crate::pipeline::core::item::HeapSize for ConsensusState {}
@@ -209,11 +217,20 @@ pub(crate) struct SimplexConsensusCaptures {
     pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedSimplexMetrics>>,
     pub(crate) min_reads: usize,
     pub(crate) progress: Arc<AtomicU64>,
+    /// Threaded onto every `ConsensusState` (see that struct); `Some` only on
+    /// the metrics-on path, where the metrics-on step variants read them. The
+    /// metrics-off default builds and carries neither.
+    pub(crate) header: Option<Arc<noodles::sam::Header>>,
+    pub(crate) library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
+    /// QC captures for the metrics-ON T2 path; `None` on metrics-off/T1
+    /// builds.
+    pub(crate) qc_metrics: Option<Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>>,
 }
 
 /// Per-worker init: build the `VanillaUmiConsensusCaller` (+ optional
 /// overlapping caller) once, reused across batches. Shared by both step
 /// variants.
+#[allow(clippy::too_many_arguments)]
 fn make_simplex_consensus_init(
     read_name_prefix: String,
     read_group_id: String,
@@ -221,6 +238,8 @@ fn make_simplex_consensus_init(
     methylation_ref: MethylationRef,
     track_rejects: bool,
     overlapping_enabled: bool,
+    header: Option<Arc<noodles::sam::Header>>,
+    library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
 ) -> impl Fn() -> ConsensusState + Send + Sync + 'static {
     move || {
         let mut caller = VanillaUmiConsensusCaller::new_with_rejects_tracking(
@@ -240,7 +259,12 @@ fn make_simplex_consensus_init(
         } else {
             None
         };
-        ConsensusState { caller, overlapping }
+        ConsensusState {
+            caller,
+            overlapping,
+            header: header.clone(),
+            library_index: library_index.clone(),
+        }
     }
 }
 
@@ -336,6 +360,241 @@ fn run_simplex_consensus_batch(
     Ok((consensus, rejects))
 }
 
+/// Metrics-on variant of the per-batch simplex body. Collects one
+/// `(TemplateInfo, ReadInfoKey)` entry per qualifying template across **every**
+/// family in the batch — done before `run_simplex_consensus_batch` consumes the
+/// groups, so families the `min_reads` threshold later rejects are still counted
+/// (matching the separate-pass `simplex-metrics` command) — then splits those
+/// entries into maximal same-key runs (`split_into_runs`) and classifies each
+/// run as an interior (whole, complete-within-this-batch) coordinate group or a
+/// batch-boundary run needing cross-batch reassembly (`classify_batch_runs`).
+/// Interior runs are recorded directly into this worker's `ConsensusMetricsSlot`
+/// under one `with_slot` lock acquisition per batch; boundary runs are
+/// submitted to the shared `BoundaryReorder`, which closes coordinate groups
+/// incrementally as the batch-serial prefix becomes contiguous, and whichever
+/// groups that submission closes are recorded into this worker's slot under a
+/// second `with_slot` acquisition, taken after the reorder's own mutex is
+/// released (H3 design §6.3 — no lock-order cycle). This replaces the
+/// old 3-branch `CoordinateGroupFragment`/serial `MetricsCollectorStep` design:
+/// metrics recording now happens inline in the consensus worker body, so the
+/// step's Outputs shape is unchanged from the metrics-off variant. Delegates
+/// the unchanged consensus calling to `run_simplex_consensus_batch`. Selected
+/// at chain-build time only when this stage's `metrics` field is set
+/// (`add_simplex`); the metrics-off build calls `run_simplex_consensus_batch`
+/// directly, so there is no runtime metrics work on that path (spec §7.1).
+#[allow(clippy::too_many_arguments)]
+fn run_simplex_consensus_batch_with_metrics(
+    state: &mut ConsensusState,
+    item: BatchedMiGroups,
+    track_rejects: bool,
+    overlapping_enabled: bool,
+    min_reads: usize,
+    accumulators: &Arc<PerThreadAccumulator<CollectedSimplexMetrics>>,
+    progress: &Arc<AtomicU64>,
+    qc: &Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>,
+) -> io::Result<(DecompressedBlock, Option<DecompressedBlock>)> {
+    let batch_serial = item.batch_serial;
+    let mut metrics_entries = Vec::new();
+    // This body runs only on the metrics-on path (it requires `qc`), so the
+    // header/library index are always present here.
+    let header = state.header.as_ref().expect("metrics-on state carries the header");
+    let library_index =
+        state.library_index.as_ref().expect("metrics-on state carries the library index");
+    for group in &item.groups {
+        push_mi_group_entries(group, header, library_index, &mut metrics_entries)
+            .map_err(|e| io::Error::other(format!("metrics conversion error: {e:#}")))?;
+    }
+    let runs = crate::inline_metrics_collector::split_into_runs(metrics_entries);
+    let (interior, boundary) =
+        crate::inline_metrics_collector::classify_batch_runs(batch_serial, runs);
+    qc.accumulator
+        .with_slot(|slot| -> anyhow::Result<()> {
+            for (_key, templates) in interior {
+                slot.acc.record_coordinate_group(&templates, &qc.intervals)?;
+            }
+            Ok(())
+        })
+        .map_err(io::Error::other)?;
+    // `submit` takes/releases the reorder mutex here, before the second
+    // `with_slot` acquisition below — never nested — so there is no
+    // lock-order cycle. Submitted unconditionally, even when `boundary` is
+    // empty: batch serials are contiguous, and a batch with no metrics
+    // entries still occupies its serial slot (H3 design §6.3).
+    let closed = qc.reorder.submit(batch_serial, boundary);
+    qc.accumulator
+        .with_slot(|slot| -> anyhow::Result<()> {
+            for group in &closed {
+                slot.acc.record_coordinate_group(group, &qc.intervals)?;
+            }
+            Ok(())
+        })
+        .map_err(io::Error::other)?;
+
+    run_simplex_consensus_batch(
+        state,
+        item,
+        track_rejects,
+        overlapping_enabled,
+        min_reads,
+        accumulators,
+        progress,
+    )
+}
+
+/// Build the 2-output `SimplexConsensus` step (used when BOTH `--rejects` and
+/// `--metrics` are set): branch 0 = consensus, branch 1 = rejects. Same
+/// Outputs shape as [`build_simplex_consensus_step_with_rejects`] — metrics
+/// are recorded inline into `cap.qc_metrics`'s per-thread accumulator rather
+/// than via an extra output branch. Parallel, `ByItemOrdinal`.
+///
+/// `pub(crate)` — consumed only by `ChainBuilder::add_simplex`.
+///
+/// # Panics
+///
+/// Panics if `cap.qc_metrics` is `None`. Unreachable in practice: `ChainBuilder::add_simplex`
+/// selects this metrics-ON builder only when `--metrics` is set, in which case `qc_metrics`
+/// is always `Some`.
+pub(crate) fn build_simplex_consensus_step_with_rejects_and_metrics(
+    limit_bytes: u64,
+    cap: SimplexConsensusCaptures,
+) -> impl Step<Input = BatchedMiGroups, Outputs = OrderedBytesTuple2<DecompressedBlock, DecompressedBlock>>
+{
+    let SimplexConsensusCaptures {
+        track_rejects,
+        overlapping_enabled,
+        consensus_options,
+        read_name_prefix,
+        read_group_id,
+        methylation_ref,
+        accumulators,
+        min_reads,
+        progress,
+        header,
+        library_index,
+        qc_metrics,
+    } = cap;
+    let qc = qc_metrics
+        .expect("build_simplex_consensus_step_with_rejects_and_metrics requires qc_metrics");
+
+    let init = make_simplex_consensus_init(
+        read_name_prefix,
+        read_group_id,
+        consensus_options,
+        methylation_ref,
+        track_rejects,
+        overlapping_enabled,
+        header,
+        library_index,
+    );
+    let body = move |state: &mut ConsensusState,
+                     item: BatchedMiGroups|
+          -> io::Result<Process2Output<DecompressedBlock, DecompressedBlock>> {
+        let (consensus, rejects) = run_simplex_consensus_batch_with_metrics(
+            state,
+            item,
+            track_rejects,
+            overlapping_enabled,
+            min_reads,
+            &accumulators,
+            &progress,
+            &qc,
+        )?;
+        // X5-001 dense-serial rule: emit a (zero-byte) rejects block on an
+        // all-clean batch so the rejects branch's reorder stage sees a dense
+        // serial sequence, exactly as the metrics-off rejects builder does.
+        let rejects = rejects.unwrap_or(DecompressedBlock {
+            batch_serial: consensus.batch_serial,
+            bytes: Vec::new(),
+        });
+        Ok(Process2Output::both(consensus, rejects))
+    };
+
+    process2_with_worker_state::<
+        BatchedMiGroups,
+        DecompressedBlock,
+        DecompressedBlock,
+        ConsensusState,
+        _,
+        _,
+    >("SimplexConsensus", limit_bytes, limit_bytes, init, body)
+}
+
+/// Build the 1-output (kept-only) `SimplexConsensus` step (used when
+/// `--metrics` is set but `--rejects` is not): same Outputs shape as
+/// [`build_simplex_consensus_step_kept_only`] — metrics are recorded inline
+/// into `cap.qc_metrics`'s per-thread accumulator rather than via an extra
+/// output branch.
+///
+/// `pub(crate)` — consumed only by `ChainBuilder::add_simplex`.
+///
+/// # Panics
+///
+/// Panics if `cap.qc_metrics` is `None`. Unreachable in practice: `ChainBuilder::add_simplex`
+/// selects this metrics-ON builder only when `--metrics` is set, in which case `qc_metrics`
+/// is always `Some`.
+#[allow(clippy::type_complexity)]
+pub(crate) fn build_simplex_consensus_step_metrics(
+    limit_bytes: u64,
+    cap: SimplexConsensusCaptures,
+) -> ProcessWithWorkerState<
+    BatchedMiGroups,
+    DecompressedBlock,
+    impl Fn(&mut ConsensusState, BatchedMiGroups) -> io::Result<DecompressedBlock>
+    + Send
+    + Sync
+    + 'static,
+    ConsensusState,
+    impl Fn() -> ConsensusState + Send + Sync + 'static,
+> {
+    let SimplexConsensusCaptures {
+        track_rejects,
+        overlapping_enabled,
+        consensus_options,
+        read_name_prefix,
+        read_group_id,
+        methylation_ref,
+        accumulators,
+        min_reads,
+        progress,
+        header,
+        library_index,
+        qc_metrics,
+    } = cap;
+    let qc = qc_metrics.expect("build_simplex_consensus_step_metrics requires qc_metrics");
+
+    let init = make_simplex_consensus_init(
+        read_name_prefix,
+        read_group_id,
+        consensus_options,
+        methylation_ref,
+        track_rejects,
+        overlapping_enabled,
+        header,
+        library_index,
+    );
+    let body =
+        move |state: &mut ConsensusState, item: BatchedMiGroups| -> io::Result<DecompressedBlock> {
+            let (consensus, _rejects) = run_simplex_consensus_batch_with_metrics(
+                state,
+                item,
+                track_rejects,
+                overlapping_enabled,
+                min_reads,
+                &accumulators,
+                &progress,
+                &qc,
+            )?;
+            Ok(consensus)
+        };
+
+    process_with_worker_state::<BatchedMiGroups, DecompressedBlock, _, ConsensusState, _>(
+        "SimplexConsensus",
+        limit_bytes,
+        init,
+        body,
+    )
+}
+
 /// Build the 2-output `SimplexConsensus` step (used when `--rejects` is set):
 /// branch 0 carries the consensus `DecompressedBlock`, branch 1 carries the
 /// rejects `DecompressedBlock`. Parallel, `ByItemOrdinal`.
@@ -356,6 +615,9 @@ pub(crate) fn build_simplex_consensus_step_with_rejects(
         accumulators,
         min_reads,
         progress,
+        header,
+        library_index,
+        qc_metrics: _,
     } = cap;
 
     let init = make_simplex_consensus_init(
@@ -365,6 +627,8 @@ pub(crate) fn build_simplex_consensus_step_with_rejects(
         methylation_ref,
         track_rejects,
         overlapping_enabled,
+        header,
+        library_index,
     );
     let body = move |state: &mut ConsensusState,
                      item: BatchedMiGroups|
@@ -436,6 +700,9 @@ pub(crate) fn build_simplex_consensus_step_kept_only(
         accumulators,
         min_reads,
         progress,
+        header,
+        library_index,
+        qc_metrics: _,
     } = cap;
 
     let init = make_simplex_consensus_init(
@@ -445,6 +712,8 @@ pub(crate) fn build_simplex_consensus_step_kept_only(
         methylation_ref,
         track_rejects,
         overlapping_enabled,
+        header,
+        library_index,
     );
     let body =
         move |state: &mut ConsensusState, item: BatchedMiGroups| -> io::Result<DecompressedBlock> {
