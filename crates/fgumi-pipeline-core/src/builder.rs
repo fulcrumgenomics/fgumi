@@ -10,12 +10,12 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use super::erased::{ErasedStep, TypedStep, TypedStep2};
+use super::erased::{ErasedStep, TypedStep, TypedStep2, TypedStepK};
 use super::item::HeapSize;
 use super::outputs::{Single, StepOutputs};
 use super::runtime::stats::PipelineStats;
 use super::signal::{CancelHandle, PipelineSignal};
-use super::step::{Step, Step2};
+use super::step::{Step, Step2, StepK};
 use super::topology::{BranchIdx, ChainGraph, StepIdx};
 
 /// Errors from `PipelineBuilder::build()`.
@@ -462,6 +462,50 @@ impl PipelineBuilder {
         inner.graph.wire_to_slot(prev_b.0, prev_b.1, consumer, 1);
         inner.graph.set_step_counters(consumer, counters);
         inner.steps.push(Box::new(TypedStep2::new(step)));
+        (consumer, BranchIdx(0))
+    }
+
+    /// Append a homogeneous K-input [`StepK`] step, wiring `prevs[i]` into the
+    /// consumer's input slot `i` (in order). The K-input generalization of
+    /// [`Self::append_step2`] — used by the parent crate's `ChainBuilder` to
+    /// wire K per-stream FASTQ decode tails into a single lockstep zip.
+    ///
+    /// `prevs.len()` must equal `step.input_count()` (the arity the runtime
+    /// pulls); a mismatch is a wiring bug that surfaces as an unwired-slot
+    /// error at [`Self::build`] or an edge-count assert at chain-context build.
+    /// K must be >= 2 (K < 2 should be a [`Step`]).
+    ///
+    /// Returns `(StepIdx, BranchIdx(0))` for the newly registered step.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `prevs.len() != step.input_count()` or `prevs.len() < 2`.
+    pub fn append_step_k<S: StepK>(
+        &self,
+        step: S,
+        prevs: &[(StepIdx, BranchIdx)],
+    ) -> (StepIdx, BranchIdx) {
+        let arity = step.input_count();
+        assert!(arity >= 2, "append_step_k requires input_count >= 2, got {arity}");
+        assert_eq!(
+            prevs.len(),
+            arity,
+            "append_step_k: {} producer edges wired but step '{}' declares input_count {arity}",
+            prevs.len(),
+            step.profile().name,
+        );
+        let mut inner = self.inner.borrow_mut();
+        let counters = step.counters();
+        let consumer = inner.graph.register_step_with_input_arity(
+            step.profile().name,
+            S::Outputs::arity(),
+            arity,
+        );
+        for (slot, &(prev_producer, prev_branch)) in prevs.iter().enumerate() {
+            inner.graph.wire_to_slot(prev_producer, prev_branch, consumer, slot);
+        }
+        inner.graph.set_step_counters(consumer, counters);
+        inner.steps.push(Box::new(TypedStepK::new(step)));
         (consumer, BranchIdx(0))
     }
 
@@ -3431,6 +3475,239 @@ mod tests {
         got.sort_unstable();
         let expected: Vec<u32> = (1..=n).collect();
         assert_eq!(got, expected, "every emitted ordinal 1..={n} must arrive exactly once");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // StepK (homogeneous K-input) end-to-end run tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// An ordered `u32` payload for the `StepK` tests: a reorder `ordinal` plus
+    /// a `value` the K-way zip sums across branches.
+    #[derive(Clone, Copy, Debug)]
+    struct OrdU32 {
+        ordinal: u64,
+        value: u32,
+    }
+    impl crate::item::HeapSize for OrdU32 {}
+    impl crate::item::Ordered for OrdU32 {
+        fn ordinal(&self) -> u64 {
+            self.ordinal
+        }
+    }
+
+    /// Source emitting the ordinals `1..=count` in order on one branch, tagged
+    /// with a `stream_idx` carried in the value's high bits so the K-way zip can
+    /// assert per-branch identity. Here the value IS the ordinal (no tag) — the
+    /// zip sums across branches, and every branch emits the same `1..=count`, so
+    /// row `i` sums to `k * i`.
+    #[derive(Clone)]
+    struct CountUpSource {
+        remaining: Arc<AtomicU32>,
+        count: u32,
+    }
+    impl Step for CountUpSource {
+        type Input = ();
+        type Outputs = crate::outputs::OrderedBytesSingle<OrdU32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "CountUpSource",
+                // Serial (not Exclusive): Serial sources share the worker pool,
+                // so K sources do not each demand a dedicated worker. Mirrors the
+                // real per-stream FASTQ readers (Serial + Affinity), and lets the
+                // K=5 case run at threads=1.
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 16 }],
+                branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            let n = self.remaining.load(AtomicOrd::Acquire);
+            if n == 0 {
+                return Ok(StepOutcome::Finished);
+            }
+            // Emit ascending ordinals 0..count so `ByItemOrdinal` is contiguous.
+            let ordinal = u64::from(self.count - n);
+            self.remaining.store(n - 1, AtomicOrd::Release);
+            ctx.outputs
+                .push(OrdU32 { ordinal, value: self.count - n + 1 })
+                .map_err(|_| io::Error::other("push rejected"))?;
+            Ok(StepOutcome::Progress)
+        }
+    }
+
+    /// Homogeneous K-input lockstep sum: pull one item from EACH of the K input
+    /// branches for the current row, sum their values, emit. Reports `Finished`
+    /// only when every branch is drained. This is the framework-level analogue
+    /// of the FASTQ K-way zip.
+    struct SumK {
+        k: usize,
+        /// Per-branch buffer: the pulled-but-not-yet-completed item for the row.
+        pending: Vec<Option<u32>>,
+        next_ordinal: u64,
+    }
+    impl SumK {
+        fn new(k: usize) -> Self {
+            Self { k, pending: vec![None; k], next_ordinal: 0 }
+        }
+    }
+    impl crate::step::StepK for SumK {
+        type Input = OrdU32;
+        type Outputs = crate::outputs::OrderedBytesSingle<OrdU32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "SumK",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 16 }],
+                // FIFO: SumK mints its own dense ordinal; the downstream sink is
+                // Exclusive so arrival order is emission order.
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn input_count(&self) -> usize {
+            self.k
+        }
+        fn try_run(
+            &mut self,
+            ctx: &mut crate::step::StepCtxK<'_, Self>,
+        ) -> io::Result<StepOutcome> {
+            // Lockstep: fill every empty pending slot from its branch. Only pull
+            // a branch whose slot is empty (the one still missing from the row) —
+            // never re-pull a branch already present, so a fast branch cannot run
+            // ahead and desync the row.
+            let mut progressed = false;
+            for (i, slot) in self.pending.iter_mut().enumerate() {
+                if slot.is_none()
+                    && let Some(item) = ctx.inputs[i].pop()
+                {
+                    *slot = Some(item.value);
+                    progressed = true;
+                }
+            }
+            // Row complete when every slot is filled → sum + emit.
+            if self.pending.iter().all(Option::is_some) {
+                let sum: u32 = self.pending.iter_mut().map(|s| s.take().unwrap()).sum();
+                let ordinal = self.next_ordinal;
+                self.next_ordinal += 1;
+                ctx.outputs
+                    .push(OrdU32 { ordinal, value: sum })
+                    .map_err(|_| io::Error::other("push rejected"))?;
+                return Ok(StepOutcome::Progress);
+            }
+            if progressed {
+                return Ok(StepOutcome::Progress);
+            }
+            // No full row this call. If every branch is drained AND no partial
+            // row is buffered, we are done.
+            if ctx.inputs.iter().all(|h| h.is_drained()) {
+                if self.pending.iter().all(Option::is_none) {
+                    return Ok(StepOutcome::Finished);
+                }
+                // A partial row with some branches drained = unequal-length
+                // inputs. For this test the sources are equal-length, so this is
+                // unreachable; surface it rather than spin.
+                return Err(io::Error::other("SumK: inputs out of sync (unequal lengths)"));
+            }
+            Ok(StepOutcome::NoProgress)
+        }
+    }
+
+    /// Collecting sink over `OrdU32`, summing the values it receives.
+    #[derive(Clone)]
+    struct SumSink {
+        total: Arc<AtomicU32>,
+        count: Arc<AtomicU32>,
+    }
+    impl Step for SumSink {
+        type Input = OrdU32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "SumSink",
+                kind: StepKind::Exclusive,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(item) => {
+                    self.total.fetch_add(item.value, AtomicOrd::Relaxed);
+                    self.count.fetch_add(1, AtomicOrd::Relaxed);
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    /// A homogeneous `StepK` must drain K independent sources in lockstep and
+    /// produce the per-row sum, for K = 2, 3, 4 (inline `Fixed{N}` handle
+    /// storage) and K = 5 (the `Dyn(Vec)` fallback). Each of the K sources
+    /// emits `1..=M`, so the K-way sum of row `i` is `k * i` and the grand total
+    /// is `k * M * (M+1) / 2`. Runs at threads 1 and 4 so the K-input dispatch
+    /// is exercised on both the inline single-worker path and the multi-worker
+    /// scheduled path.
+    #[rstest]
+    fn step_k_lockstep_sum_drains_all_branches(
+        #[values(2, 3, 4, 5)] k: usize,
+        #[values(1, 4)] threads: usize,
+    ) {
+        const M: u32 = 20;
+        let total = Arc::new(AtomicU32::new(0));
+        let count = Arc::new(AtomicU32::new(0));
+
+        let builder = PipelineBuilder::new();
+        let source_tails: Vec<(StepIdx, BranchIdx)> = (0..k)
+            .map(|_| {
+                builder.append_source(CountUpSource {
+                    remaining: Arc::new(AtomicU32::new(M)),
+                    count: M,
+                })
+            })
+            .collect();
+        let zip = builder.append_step_k(SumK::new(k), &source_tails);
+        builder.append_step(SumSink { total: Arc::clone(&total), count: Arc::clone(&count) }, zip);
+
+        let pipeline = builder.build().expect("K sources + SumK + sink wire cleanly");
+        let result = pipeline.run(PipelineConfig { threads, ..Default::default() });
+        assert!(result.is_ok(), "K={k} t={threads} run failed: {:?}", result.err());
+
+        let k_u32 = u32::try_from(k).unwrap();
+        assert_eq!(count.load(AtomicOrd::Relaxed), M, "must emit exactly M rows");
+        assert_eq!(
+            total.load(AtomicOrd::Relaxed),
+            k_u32 * M * (M + 1) / 2,
+            "grand total = k * sum(1..=M) for K={k} t={threads}",
+        );
+    }
+
+    /// A `StepK` (`input_arity` >= 2) must NOT be fusible — the single-thread
+    /// fused driver follows one input stream per step, so a K-input merge blocks
+    /// fusion exactly like a `Step2`.
+    #[test]
+    fn step_k_blocks_fusion() {
+        use crate::runtime::is_fusible_chain;
+        let builder = PipelineBuilder::new();
+        let a = builder
+            .append_source(CountUpSource { remaining: Arc::new(AtomicU32::new(1)), count: 1 });
+        let b = builder
+            .append_source(CountUpSource { remaining: Arc::new(AtomicU32::new(1)), count: 1 });
+        let c = builder
+            .append_source(CountUpSource { remaining: Arc::new(AtomicU32::new(1)), count: 1 });
+        let zip = builder.append_step_k(SumK::new(3), &[a, b, c]);
+        builder.append_step(
+            SumSink { total: Arc::new(AtomicU32::new(0)), count: Arc::new(AtomicU32::new(0)) },
+            zip,
+        );
+        let pipeline = builder.build().expect("wires");
+        assert!(
+            !is_fusible_chain(&pipeline.steps, &pipeline.graph),
+            "a 3-input StepK merge must block fusion",
+        );
     }
 
     #[test]
