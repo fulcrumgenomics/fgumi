@@ -37,7 +37,9 @@ use crate::pipeline::chains::FinalizeHook;
 use crate::pipeline::steps::process::{
     Process2Ordered, ProcessOrdered, process_ordered, process2_ordered,
 };
-use crate::pipeline::steps::types::{BamTemplateBatch, DecodedRecordBatch, DecompressedBlock};
+use crate::pipeline::steps::types::{
+    BamTemplateBatch, DecodedRecordBatch, DecompressedBlock, RecordBatch,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FilterFinalizeHook
@@ -194,6 +196,38 @@ fn record_batch_metrics(
     });
 }
 
+/// Apply the single-record filter transform to one record and route it.
+///
+/// Runs [`process_record_raw_call`], writes the record framed to `kept` if it
+/// passes, else to `rejected` (or drops it when `rejected` is `None`), and
+/// returns `(pass, masked_contribution)` for the caller's batch tallies
+/// (`masked_contribution` is the record's fgbio "Total bases masked" share — 0
+/// unless it is a retained primary read).
+///
+/// This is the one per-record body shared by all four single-record filter step
+/// builders (decoded/raw × no-rejects/with-rejects), so the transform, the
+/// masked-bases accounting, and the keep/reject routing cannot drift between the
+/// owned `DecodedRecordBatch` path and the borrowed `RecordBatch` fast path.
+fn filter_one_record(
+    record: &mut RawRecord,
+    captures: &FilterProcessCaptures,
+    kept: &mut Vec<u8>,
+    rejected: Option<&mut Vec<u8>>,
+) -> io::Result<(bool, u64)> {
+    let (bases_masked, pass) =
+        process_record_raw_call(record, captures).map_err(io::Error::other)?;
+    // Match fgbio's "Total bases masked": count masked bases only in a retained
+    // primary read (0 for a rejected / secondary / supplementary read).
+    let masked_contribution =
+        retained_primary_masked_bases(std::slice::from_ref(&*record), &[bases_masked], pass);
+    if pass {
+        fgumi_raw_bam::write_framed_record(kept, record.as_ref())?;
+    } else if let Some(rejected) = rejected {
+        fgumi_raw_bam::write_framed_record(rejected, record.as_ref())?;
+    }
+    Ok((pass, masked_contribution))
+}
+
 /// Build the single-read, no-rejects filter step.
 ///
 /// `DecodedRecordBatch → DecompressedBlock`. Parallel, `ByItemOrdinal`.
@@ -223,22 +257,13 @@ pub(crate) fn build_filter_step_single_no_rejects(
 
             for decoded in records {
                 let mut record = decoded.into_raw_bytes();
-                let (bases_masked, pass) =
-                    process_record_raw_call(&mut record, &captures).map_err(io::Error::other)?;
-                // Match fgbio's "Total bases masked" tally:
-                // count masked bases only in a retained primary read (0 for a
-                // rejected read / secondary / supplementary), not the raw count.
-                bases_masked_total += retained_primary_masked_bases(
-                    std::slice::from_ref(&record),
-                    &[bases_masked],
-                    pass,
-                );
-
+                // No rejects: `None` drops rejected records.
+                let (pass, masked) =
+                    filter_one_record(&mut record, &captures, &mut kept_bytes, None)?;
                 if pass {
                     passed_count += 1;
-                    fgumi_raw_bam::write_framed_record(&mut kept_bytes, record.as_ref())?;
                 }
-                // No rejects: rejected records are simply dropped.
+                bases_masked_total += masked;
             }
 
             record_batch_metrics(
@@ -300,22 +325,150 @@ pub(crate) fn build_filter_step_single_with_rejects(
 
             for decoded in records {
                 let mut record = decoded.into_raw_bytes();
-                let (bases_masked, pass) = process_record_raw_call(&mut record, &captures)
-                    .map_err(io::Error::other)?;
-                // Match fgbio's "Total bases masked" tally:
-                // count masked bases only in a retained primary read (0 for a
-                // rejected read / secondary / supplementary), not the raw count.
-                bases_masked_total +=
-                    retained_primary_masked_bases(std::slice::from_ref(&record), &[bases_masked], pass);
-
-                let target = if pass {
+                let (pass, masked) = filter_one_record(
+                    &mut record,
+                    &captures,
+                    &mut kept_bytes,
+                    Some(&mut rejected_bytes),
+                )?;
+                if pass {
                     passed_count += 1;
-                    &mut kept_bytes
-                } else {
-                    &mut rejected_bytes
-                };
-                fgumi_raw_bam::write_framed_record(target, record.as_ref())?;
+                }
+                bases_masked_total += masked;
             }
+
+            record_batch_metrics(
+                &captures,
+                &accumulators,
+                records_count,
+                passed_count,
+                bases_masked_total,
+            );
+
+            Ok(Process2Output::both(
+                DecompressedBlock { batch_serial, bytes: kept_bytes },
+                DecompressedBlock { batch_serial, bytes: rejected_bytes },
+            ))
+        },
+    )
+}
+
+/// Build the single-read, no-rejects filter step on the decode-free fast path.
+///
+/// `RecordBatch → DecompressedBlock`. Identical behavior to
+/// [`build_filter_step_single_no_rejects`] — the same `process_record_raw_call`
+/// transform and metric tally — but it iterates borrowed record byte-ranges via
+/// [`for_each_raw_record`](crate::pipeline::chains::commands::for_each_raw_record)
+/// with one reused scratch `RawRecord`, skipping the per-record `DecodedRecord`
+/// allocation and the dead `GroupKey` of the `DecodedRecordBatch` decode path.
+///
+/// `pub(crate)` — consumed only by `ChainBuilder::add_filter` on a BAM source.
+pub(crate) fn build_filter_step_single_no_rejects_raw(
+    limit_bytes: u64,
+    captures: FilterProcessCaptures,
+    accumulators: Arc<PerThreadAccumulator<CollectedFilterMetrics>>,
+) -> ProcessOrdered<
+    RecordBatch,
+    DecompressedBlock,
+    impl Fn(RecordBatch) -> io::Result<DecompressedBlock> + Send + Sync + 'static,
+> {
+    process_ordered::<RecordBatch, DecompressedBlock, _>(
+        "FilterProcess",
+        limit_bytes,
+        move |item: RecordBatch| -> io::Result<DecompressedBlock> {
+            let batch_serial = item.batch_serial();
+            let records_count = item.len() as u64;
+            let mut kept_bytes: Vec<u8> = Vec::new();
+            let mut passed_count: u64 = 0;
+            let mut bases_masked_total: u64 = 0;
+            // One scratch buffer, reused across every record in this batch.
+            let mut scratch = RawRecord::new();
+
+            crate::pipeline::chains::commands::for_each_raw_record(
+                &item,
+                &mut scratch,
+                |record| {
+                    let (pass, masked) =
+                        filter_one_record(record, &captures, &mut kept_bytes, None)?;
+                    if pass {
+                        passed_count += 1;
+                    }
+                    bases_masked_total += masked;
+                    Ok(())
+                },
+            )?;
+
+            record_batch_metrics(
+                &captures,
+                &accumulators,
+                records_count,
+                passed_count,
+                bases_masked_total,
+            );
+
+            Ok(DecompressedBlock { batch_serial, bytes: kept_bytes })
+        },
+    )
+}
+
+/// Build the single-read, with-rejects filter step on the decode-free fast path.
+///
+/// `RecordBatch → (DecompressedBlock kept, DecompressedBlock rejects)`. Behavior
+/// identical to [`build_filter_step_single_with_rejects`]; iterates borrowed
+/// record byte-ranges with one reused scratch. Branch 0 = kept; branch 1 =
+/// rejected.
+///
+/// `pub(crate)` — consumed only by `ChainBuilder::add_filter` on a BAM source.
+#[allow(clippy::type_complexity)]
+pub(crate) fn build_filter_step_single_with_rejects_raw(
+    limit_bytes: u64,
+    captures: FilterProcessCaptures,
+    accumulators: Arc<PerThreadAccumulator<CollectedFilterMetrics>>,
+) -> Process2Ordered<
+    RecordBatch,
+    DecompressedBlock,
+    DecompressedBlock,
+    impl Fn(
+        RecordBatch,
+    ) -> io::Result<
+        crate::pipeline::steps::process::Process2Output<DecompressedBlock, DecompressedBlock>,
+    > + Send
+    + Sync
+    + 'static,
+> {
+    use crate::pipeline::steps::process::Process2Output;
+
+    process2_ordered::<RecordBatch, DecompressedBlock, DecompressedBlock, _>(
+        "FilterProcess",
+        limit_bytes,
+        limit_bytes,
+        move |item: RecordBatch|
+              -> io::Result<Process2Output<DecompressedBlock, DecompressedBlock>> {
+            let batch_serial = item.batch_serial();
+            let records_count = item.len() as u64;
+            let mut kept_bytes: Vec<u8> = Vec::new();
+            let mut rejected_bytes: Vec<u8> = Vec::new();
+            let mut passed_count: u64 = 0;
+            let mut bases_masked_total: u64 = 0;
+            let mut scratch = RawRecord::new();
+
+            crate::pipeline::chains::commands::for_each_raw_record(
+                &item,
+                &mut scratch,
+                |record| {
+                    let (pass, masked) = filter_one_record(
+                        record,
+                        &captures,
+                        &mut kept_bytes,
+                        Some(&mut rejected_bytes),
+                    )?;
+                    if pass {
+                        passed_count += 1;
+                    }
+                    bases_masked_total += masked;
+                    Ok(())
+                },
+            )?;
 
             record_batch_metrics(
                 &captures,

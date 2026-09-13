@@ -58,6 +58,22 @@ fn create_consensus_bam(path: &Path, records: Vec<RawRecord>) {
     create_consensus_bam_with_header(path, &header, records);
 }
 
+/// Create a consensus **SAM** (text) file with the same minimal header as
+/// [`create_consensus_bam`]. A SAM source routes the filter chain through the
+/// owned `DecodedRecordBatch` path rather than the BAM decode-free `RecordBatch`
+/// fast path, so this backs the decoded/raw parity test.
+fn create_consensus_sam(path: &Path, records: Vec<RawRecord>) {
+    let header = create_minimal_header("chr1", 10000);
+    let file = fs::File::create(path).expect("Failed to create SAM file");
+    let mut writer = noodles::sam::io::Writer::new(file);
+    writer.write_header(&header).expect("Failed to write SAM header");
+    for record in records {
+        writer
+            .write_alignment_record(&header, &to_record_buf(&record, &header))
+            .expect("Failed to write SAM record");
+    }
+}
+
 /// Two mapped-consensus records with CD/CE per-base tags that pass `filter`
 /// (`cons1` depth 10, `cons2` depth 5). Shared by the query-grouped writer and
 /// the coordinate-sorted guard test.
@@ -564,10 +580,27 @@ fn filter_run(input: &Path, output: &Path, ref_path: &Path, extra: &[&str]) {
 /// Read a BAM's records back as decoded `RecordBuf`s, for record-for-record
 /// comparison (order-sensitive, catches drops/dupes/reorders that a bare count
 /// would miss).
-fn read_filter_records(path: &Path) -> Vec<noodles::sam::alignment::RecordBuf> {
-    let mut reader = bam::io::Reader::new(fs::File::open(path).unwrap());
-    let header = reader.read_header().unwrap();
-    reader.record_bufs(&header).collect::<std::io::Result<Vec<_>>>().expect("read filter records")
+/// Assert two filter outputs (a single-worker run and a multi-threaded chain
+/// run) are equivalent at the SAM level: identical records AND identical
+/// normalized headers. Comparing records alone would miss a chain regression
+/// that dropped or changed a header record (`@HD`/`@SQ`/`@RG`/`@CO`);
+/// `read_bam_output` normalizes the `@PG` `CL` field that legitimately differs
+/// by `--threads` so that comparison does not false-positive. `ctx` labels the
+/// stream (e.g. `"kept"`, `"rejects"`) in the failure messages.
+fn assert_outputs_match(single_worker: &Path, chain: &Path, ctx: &str) {
+    let (single_worker_header, expected) = crate::helpers::read_bam_output(single_worker);
+    let (chain_header, actual) = crate::helpers::read_bam_output(chain);
+    // Non-vacuous: an empty expected stream would make `actual == expected`
+    // pass on two equally-broken (empty) outputs.
+    assert!(!expected.is_empty(), "single-worker {ctx} output must be non-empty");
+    assert_eq!(actual, expected, "{ctx} output must match record-for-record");
+    // Guard against a vacuous header comparison: if a regression dropped `@HD`
+    // on both paths, header equality could still hold on two broken headers.
+    assert!(single_worker_header.header().is_some(), "single-worker {ctx} output must declare @HD");
+    assert_eq!(
+        chain_header, single_worker_header,
+        "{ctx} output header must match the single-worker run (complete normalized header)"
+    );
 }
 
 /// Build `n` two-mate templates (R1/R2 sharing a read name, both mapped
@@ -872,21 +905,113 @@ fn test_filter_chain_rejects_bam_matches_single_worker() {
         &["--rejects", chain_rejects.to_str().unwrap(), "--threads", "4"],
     );
 
-    let expected_kept = read_filter_records(&single_worker_out);
-    let actual_kept = read_filter_records(&chain_out);
-    assert!(!expected_kept.is_empty(), "single-worker kept output must be non-empty");
-    assert_eq!(actual_kept, expected_kept, "kept output must match record-for-record");
+    // Compare records AND the complete normalized header for both streams.
+    assert_outputs_match(&single_worker_out, &chain_out, "kept");
+    assert_outputs_match(&single_worker_rejects, &chain_rejects, "rejects");
+}
 
-    let expected_rejects = read_filter_records(&single_worker_rejects);
-    let actual_rejects = read_filter_records(&chain_rejects);
-    assert!(
-        !expected_rejects.is_empty(),
-        "single-worker rejects output must be non-empty (guard against a vacuous pass)"
+/// The `--rejects` output matches record-for-record between the chain and
+/// single-worker runs in **single-record** mode (`--filter-by-template false`),
+/// which routes a BAM source through the decode-free `RecordBatch` fast path
+/// (`build_filter_step_single_with_rejects_raw`). Single-record mode keeps every
+/// R1 and drops only the failing R2s, so both the kept and rejected streams are
+/// non-vacuous. This is the end-to-end guard for the with-rejects fast path
+/// (the kept-only fast path is covered by the parameterized threads test).
+#[test]
+fn test_filter_chain_rejects_single_record_bam_matches_single_worker() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+    create_consensus_bam(&input_bam, build_mixed_depth_templates(8));
+
+    let single_worker_out = temp_dir.path().join("single_worker.bam");
+    let single_worker_rejects = temp_dir.path().join("single_worker.rejects.bam");
+    filter_run(
+        &input_bam,
+        &single_worker_out,
+        &ref_path,
+        &["--filter-by-template", "false", "--rejects", single_worker_rejects.to_str().unwrap()],
     );
-    assert_eq!(
-        actual_rejects, expected_rejects,
-        "rejects output must match record-for-record between chain and single-worker runs"
+
+    let chain_out = temp_dir.path().join("chain.bam");
+    let chain_rejects = temp_dir.path().join("chain.rejects.bam");
+    filter_run(
+        &input_bam,
+        &chain_out,
+        &ref_path,
+        &[
+            "--filter-by-template",
+            "false",
+            "--rejects",
+            chain_rejects.to_str().unwrap(),
+            "--threads",
+            "4",
+        ],
     );
+
+    // Compare records AND the complete normalized header for both streams.
+    assert_outputs_match(&single_worker_out, &chain_out, "kept");
+    assert_outputs_match(&single_worker_rejects, &chain_rejects, "rejects");
+}
+
+/// A SAM source routes single-record filter through the owned `DecodedRecordBatch`
+/// builders (`build_filter_step_single_no_rejects` / `_with_rejects`), not the BAM
+/// decode-free `RecordBatch` fast path (`on_fast_path` is false when the chain tail
+/// is `DecodedRecordBatch`). This drives that decoded path in both no-rejects and
+/// with-rejects single-record mode and guards that its output is deterministic
+/// across thread counts (single-worker vs a 4-thread chain), mirroring the BAM
+/// fast-path parity test.
+///
+/// The comparison keeps the input encoding constant (SAM on both sides): a
+/// BAM-vs-SAM comparison would spuriously differ because the SAM text round-trip
+/// normalizes integer aux tags to their minimal width (`cD:i:10` reparses as
+/// `Int8`, while the BAM source preserves the original `Int32`) — a source-encoding
+/// artifact upstream of the filter, not a filter difference.
+#[test]
+fn test_filter_single_record_sam_decoded_path_deterministic_across_threads() {
+    let temp_dir = TempDir::new().unwrap();
+    let ref_path = create_test_reference(temp_dir.path());
+    let input_sam = temp_dir.path().join("input.sam");
+    create_consensus_sam(&input_sam, build_mixed_depth_templates(8));
+
+    // --- no-rejects single-record mode: single-worker vs 4-thread chain ---
+    let sw_kept = temp_dir.path().join("sw.kept.bam");
+    let chain_kept = temp_dir.path().join("chain.kept.bam");
+    filter_run(&input_sam, &sw_kept, &ref_path, &["--filter-by-template", "false"]);
+    filter_run(
+        &input_sam,
+        &chain_kept,
+        &ref_path,
+        &["--filter-by-template", "false", "--threads", "4"],
+    );
+    assert_outputs_match(&sw_kept, &chain_kept, "SAM decoded kept");
+
+    // --- with-rejects single-record mode: single-worker vs 4-thread chain ---
+    let sw_kept2 = temp_dir.path().join("sw2.kept.bam");
+    let sw_rej = temp_dir.path().join("sw.rejects.bam");
+    let chain_kept2 = temp_dir.path().join("chain2.kept.bam");
+    let chain_rej = temp_dir.path().join("chain.rejects.bam");
+    filter_run(
+        &input_sam,
+        &sw_kept2,
+        &ref_path,
+        &["--filter-by-template", "false", "--rejects", sw_rej.to_str().unwrap()],
+    );
+    filter_run(
+        &input_sam,
+        &chain_kept2,
+        &ref_path,
+        &[
+            "--filter-by-template",
+            "false",
+            "--rejects",
+            chain_rej.to_str().unwrap(),
+            "--threads",
+            "4",
+        ],
+    );
+    assert_outputs_match(&sw_rej, &chain_rej, "SAM decoded rejects");
+    assert_outputs_match(&sw_kept2, &chain_kept2, "SAM decoded kept (with-rejects mode)");
 }
 
 /// The `--stats` file is byte-identical between the chain and single-worker runs.
@@ -997,8 +1122,8 @@ fn test_filter_chain_threads4_matches_single_threaded_multi_batch() {
     let chain_out = temp_dir.path().join("chain.bam");
     filter_run(&input_bam, &chain_out, &ref_path, &["--threads", "4"]);
 
-    let expected = read_filter_records(&single_worker_out);
-    let actual = read_filter_records(&chain_out);
+    let (single_worker_header, expected) = crate::helpers::read_bam_output(&single_worker_out);
+    let (chain_header, actual) = crate::helpers::read_bam_output(&chain_out);
     // 1200 paired templates, all passing -> all 2400 records kept on both paths.
     assert_eq!(
         expected.len(),
@@ -1009,6 +1134,13 @@ fn test_filter_chain_threads4_matches_single_threaded_multi_batch() {
         actual, expected,
         "chain (--threads 4) output must match the single-worker chain record-for-record \
          across GroupByQueryname input-batch carry-over and output-emit boundaries"
+    );
+    // Compare the complete normalized header too, so a chain regression that
+    // changed a header record (not just record order/content) is caught.
+    assert!(single_worker_header.header().is_some(), "single-worker output must declare @HD");
+    assert_eq!(
+        chain_header, single_worker_header,
+        "chain (--threads 4) output header must match the single-worker run (complete normalized header)"
     );
 }
 
