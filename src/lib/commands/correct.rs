@@ -838,80 +838,59 @@ impl CorrectUmis {
         }
     }
 
-    /// Extract and validate UMI from raw-byte records in a template.
+    /// Extract a template's UMI, trusting the primary read.
     ///
-    /// Returns `Ok(None)` if no records have a UMI, including when any record is
-    /// truncated (< 32 bytes), which is treated as missing UMI data.
+    /// Reads the UMI from the primary read only — the position cached during the
+    /// parallel decode step ([`cached_umi`](crate::template::Template::cached_umi))
+    /// when present, else a scan
+    /// of the primary read's aux data. This matches how `group` and `dedup`
+    /// resolve a template's UMI: all reads of a well-formed template share one
+    /// UMI by construction (`fgumi extract` sets it identically on both mates),
+    /// so the primary read is authoritative and no per-record cross-check is
+    /// needed. Using the cache lets the common paired-end template resolve its
+    /// UMI without scanning aux data at all.
+    ///
+    /// Returns `Ok(None)` when the template has no primary read, when the
+    /// primary read is truncated (< 32 bytes), or when it carries no UMI tag —
+    /// all treated as missing UMI data, not an error.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - Records have different UMIs
-    /// - Some records have UMIs and others don't
-    /// - UMI tag has non-string type
-    pub(crate) fn extract_and_validate_template_umi_raw(
-        raw_records: &[RawRecord],
+    /// Returns an error if the primary read's UMI tag is present with a
+    /// non-string (non-`Z`) type.
+    pub(crate) fn extract_template_umi(
+        template: &crate::template::Template,
         umi_tag: [u8; 2],
     ) -> anyhow::Result<Option<String>> {
         use fgumi_raw_bam;
 
-        if raw_records.is_empty() {
-            return Ok(None);
+        // Fast path: the value position cached on the primary read during decode.
+        if let Some(cached) = template.cached_umi() {
+            return Ok(Some(String::from_utf8_lossy(cached).into_owned()));
         }
 
-        // Guard against truncated records
-        if raw_records.iter().any(|r| r.len() < 32) {
+        // Fallback: scan the primary read's aux directly (templates built outside
+        // the decode path — e.g. tests — or when the cache was not populated).
+        let Some(primary) = template.r1().or_else(|| template.r2()) else {
+            return Ok(None);
+        };
+        if primary.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN {
             return Ok(None);
         }
-
-        let first_aux = fgumi_raw_bam::aux_data_slice(&raw_records[0]);
-        // Work with &[u8] slices to avoid per-record String allocation
-        let first_umi_bytes = fgumi_raw_bam::find_string_tag(first_aux, umi_tag);
-
-        // If tag exists but is not a Z-type string, return an error
-        if first_umi_bytes.is_none()
-            && let Some(tag_type) = fgumi_raw_bam::find_tag_type(first_aux, umi_tag)
-        {
+        let aux = fgumi_raw_bam::aux_data_slice(primary);
+        if let Some(bytes) = fgumi_raw_bam::find_string_tag(aux, umi_tag) {
+            Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
+        } else if let Some(tag_type) = fgumi_raw_bam::find_tag_type(aux, umi_tag) {
+            // The tag exists but is not a Z-type string — reject rather than
+            // silently treat it as missing.
             anyhow::bail!(
                 "UMI tag {:?} exists but has non-string type '{}', expected 'Z'",
                 std::str::from_utf8(&umi_tag).unwrap_or("??"),
                 tag_type as char,
-            );
+            )
+        } else {
+            Ok(None)
         }
-
-        for raw in &raw_records[1..] {
-            let aux = fgumi_raw_bam::aux_data_slice(raw);
-            let current_umi_bytes = fgumi_raw_bam::find_string_tag(aux, umi_tag);
-
-            // Mirror the first-record check: reject any record whose UMI tag
-            // exists with a non-string type instead of treating it as missing.
-            if current_umi_bytes.is_none()
-                && let Some(tag_type) = fgumi_raw_bam::find_tag_type(aux, umi_tag)
-            {
-                anyhow::bail!(
-                    "UMI tag {:?} exists but has non-string type '{}', expected 'Z'",
-                    std::str::from_utf8(&umi_tag).unwrap_or("??"),
-                    tag_type as char,
-                );
-            }
-
-            match (first_umi_bytes, current_umi_bytes) {
-                (Some(first), Some(current)) if first != current => {
-                    anyhow::bail!(
-                        "Template has mismatched UMIs: first={:?}, current={:?}",
-                        String::from_utf8_lossy(first),
-                        String::from_utf8_lossy(current)
-                    );
-                }
-                (Some(_), None) | (None, Some(_)) => {
-                    anyhow::bail!("Template has inconsistent UMI presence across records");
-                }
-                _ => {}
-            }
-        }
-
-        // Only allocate String once at the end
-        Ok(first_umi_bytes.map(|b| String::from_utf8_lossy(b).into_owned()))
     }
 
     /// Apply UMI correction to a raw BAM record.
@@ -3419,23 +3398,27 @@ mod tests {
     }
 
     // ========================================================================
-    // extract_and_validate_template_umi_raw tests
+    // extract_template_umi tests
     // ========================================================================
 
+    /// Build a template from raw records, as the grouper hands them to correct.
+    fn tmpl(records: Vec<RawRecord>) -> crate::template::Template {
+        crate::template::Template::from_records(records).expect("build template")
+    }
+
     #[test]
-    fn test_extract_and_validate_template_umi_raw_single_record() {
+    fn test_extract_template_umi_single_record() {
         let raw = make_raw_bam_for_correct(
             b"rea",
             fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
             b"AAAAAA",
         );
-        let result =
-            CorrectUmis::extract_and_validate_template_umi_raw(&[raw], *SamTag::RX).unwrap();
+        let result = CorrectUmis::extract_template_umi(&tmpl(vec![raw]), *SamTag::RX).unwrap();
         assert_eq!(result, Some("AAAAAA".to_string()));
     }
 
     #[test]
-    fn test_extract_and_validate_template_umi_raw_matching_pair() {
+    fn test_extract_template_umi_matching_pair() {
         let r1 = make_raw_bam_for_correct(
             b"rea",
             fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
@@ -3446,13 +3429,16 @@ mod tests {
             fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT,
             b"ACGTAC",
         );
-        let result =
-            CorrectUmis::extract_and_validate_template_umi_raw(&[r1, r2], *SamTag::RX).unwrap();
+        let result = CorrectUmis::extract_template_umi(&tmpl(vec![r1, r2]), *SamTag::RX).unwrap();
         assert_eq!(result, Some("ACGTAC".to_string()));
     }
 
+    /// Behaviour change (now matching `group`/`dedup`): the primary read is
+    /// authoritative, so a template whose reads carry *different* UMIs resolves
+    /// to the primary read's UMI rather than erroring. Well-formed templates
+    /// never reach this — both mates share one UMI by construction.
     #[test]
-    fn test_extract_and_validate_template_umi_raw_mismatch_errors() {
+    fn test_extract_template_umi_trusts_primary_on_mismatch() {
         let r1 = make_raw_bam_for_correct(
             b"rea",
             fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
@@ -3463,19 +3449,20 @@ mod tests {
             fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT,
             b"CCCCCC",
         );
-        let err =
-            CorrectUmis::extract_and_validate_template_umi_raw(&[r1, r2], *SamTag::RX).unwrap_err();
-        assert!(err.to_string().contains("mismatched UMIs"));
+        let result = CorrectUmis::extract_template_umi(&tmpl(vec![r1, r2]), *SamTag::RX).unwrap();
+        assert_eq!(result, Some("AAAAAA".to_string()), "resolves to the primary (R1) UMI");
     }
 
     #[test]
-    fn test_extract_and_validate_template_umi_raw_empty() {
-        let result = CorrectUmis::extract_and_validate_template_umi_raw(&[], *SamTag::RX).unwrap();
+    fn test_extract_template_umi_empty_template() {
+        let result =
+            CorrectUmis::extract_template_umi(&crate::template::Template::new(), *SamTag::RX)
+                .unwrap();
         assert!(result.is_none());
     }
 
     #[test]
-    fn test_extract_and_validate_template_umi_raw_no_umi_tag() {
+    fn test_extract_template_umi_no_umi_tag() {
         // Record with no UMI tag at all
         let mut raw_bytes = vec![0u8; 42]; // minimal record
         raw_bytes[8] = 4; // l_read_name
@@ -3485,8 +3472,7 @@ mod tests {
         raw_bytes[16..20].copy_from_slice(&4u32.to_le_bytes()); // l_seq = 4
         raw_bytes[32..36].copy_from_slice(b"rea\0");
         let raw = RawRecord::from(raw_bytes);
-        let result =
-            CorrectUmis::extract_and_validate_template_umi_raw(&[raw], *SamTag::RX).unwrap();
+        let result = CorrectUmis::extract_template_umi(&tmpl(vec![raw]), *SamTag::RX).unwrap();
         assert!(result.is_none());
     }
 
@@ -3535,25 +3521,24 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_and_validate_template_umi_raw_rejects_non_string_rx_on_first_record() {
-        // The first-record check has always rejected non-Z types; keep it covered.
+    fn test_extract_template_umi_rejects_non_string_rx_on_primary() {
+        // A non-Z RX on the primary read is still rejected.
         let raw = make_raw_bam_for_correct_with_int_rx(
             b"rea",
             fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
             42,
         );
-        let err =
-            CorrectUmis::extract_and_validate_template_umi_raw(&[raw], *SamTag::RX).unwrap_err();
+        let err = CorrectUmis::extract_template_umi(&tmpl(vec![raw]), *SamTag::RX).unwrap_err();
         assert!(
             err.to_string().contains("non-string type"),
             "expected non-string-type error, got: {err}"
         );
     }
 
+    /// Behaviour change: a non-Z RX on a *non-primary* read is ignored — only
+    /// the primary read is consulted — so the valid primary UMI is returned.
     #[test]
-    fn test_extract_and_validate_template_umi_raw_rejects_non_string_rx_on_second_record() {
-        // Regression: a non-Z RX on a *later* record was previously treated as
-        // missing and could fall through silently.
+    fn test_extract_template_umi_ignores_non_string_rx_on_non_primary() {
         let r1 = make_raw_bam_for_correct(
             b"rea",
             fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
@@ -3564,12 +3549,8 @@ mod tests {
             fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT,
             42,
         );
-        let err =
-            CorrectUmis::extract_and_validate_template_umi_raw(&[r1, r2], *SamTag::RX).unwrap_err();
-        assert!(
-            err.to_string().contains("non-string type"),
-            "expected non-string-type error on second record, got: {err}"
-        );
+        let result = CorrectUmis::extract_template_umi(&tmpl(vec![r1, r2]), *SamTag::RX).unwrap();
+        assert_eq!(result, Some("AAAAAA".to_string()));
     }
 
     // ========================================================================
