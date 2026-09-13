@@ -252,7 +252,7 @@ read2\t16\tchr1\t20\t60\t5M\t*\t0\t0\tTGCAT\t!!!!!\n";
     }
 
     fn key_config_for(header: &sam::Header) -> GroupKeyConfig {
-        let library_index = fgumi_bam_io::LibraryIndex::from_header(header);
+        let library_index = fgumi_bam_io::LibraryIndex::from_header(header).expect("builds");
         GroupKeyConfig::new_raw_no_cell(library_index)
     }
 
@@ -448,7 +448,7 @@ read2\t16\tchr1\t20\t60\t5M\t*\t0\t0\tTGCAT\t!!!!!\n";
     #[test]
     fn parse_sam_chunk_honors_name_hash_only() {
         let header = parse_header(SAM_TEXT);
-        let library_index = fgumi_bam_io::LibraryIndex::from_header(&header);
+        let library_index = fgumi_bam_io::LibraryIndex::from_header(&header).expect("builds");
         let key_config = GroupKeyConfig::name_hash_only(library_index);
 
         let chunk = sam_chunk_from_records(0);
@@ -512,7 +512,7 @@ read2\t16\tchr1\t20\t60\t5M\t*\t0\t0\tTGCAT\t!!!!!\n";
         use crate::sam::SamTag;
 
         let header = parse_header(SAM_TEXT);
-        let library_index = fgumi_bam_io::LibraryIndex::from_header(&header);
+        let library_index = fgumi_bam_io::LibraryIndex::from_header(&header).expect("builds");
         let key_config = GroupKeyConfig::new_raw_no_cell(library_index).with_umi_tag(*SamTag::RX);
 
         let line = "read1\t0\tchr1\t10\t60\t5M\t*\t0\t0\tACGTA\tIIIII\tRX:Z:ACGTACGT\n";

@@ -763,8 +763,9 @@ fn sam_chain_decodes_every_line_in_order(#[values(1, 4)] threads: usize) {
         })
         .collect();
 
-    let key_config =
-        GroupKeyConfig::new_raw_no_cell(fgumi_bam_io::LibraryIndex::from_header(&header));
+    let key_config = GroupKeyConfig::new_raw_no_cell(
+        fgumi_bam_io::LibraryIndex::from_header(&header).expect("builds"),
+    );
     let collected: Arc<Mutex<Vec<DecodedRecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_handle = Arc::clone(&collected);
     let builder = Pipeline::builder();

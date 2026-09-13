@@ -953,7 +953,7 @@ where
 
     // Library index (RG -> LB) for partitioning families by library, matching fgbio's
     // ReadInfo.library and fgumi's own group/dedup grouping.
-    let library_index = LibraryIndex::from_header(&header);
+    let library_index = LibraryIndex::from_header(&header)?;
 
     let template_iter = TemplateIterator::new(reader);
 
@@ -1220,7 +1220,7 @@ pub(crate) mod tests {
         let header = test_header();
         let r1 = fgumi_raw_bam::encode_record_buf_to_raw(&r1_buf, &header).expect("encode r1");
         let r2 = fgumi_raw_bam::encode_record_buf_to_raw(&r2_buf, &header).expect("encode r2");
-        let library_index = LibraryIndex::from_header(&header);
+        let library_index = LibraryIndex::from_header(&header).expect("builds");
 
         let (info, key) = build_template_info(&r1, &r2, &header, &library_index)
             .expect("build_template_info succeeds")
