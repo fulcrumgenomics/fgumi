@@ -99,11 +99,13 @@ impl LibraryIndex {
     /// Each unique library name gets a sequential index starting from 0.
     /// Index 0 is reserved for "unknown" library.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the header contains more than 65,535 distinct libraries.
-    #[must_use]
-    pub fn from_header(header: &Header) -> Self {
+    /// Returns an error if the header contains more than 65,535 distinct
+    /// libraries, since the per-library index is a `u16`.
+    pub fn from_header(header: &Header) -> anyhow::Result<Self> {
+        use std::collections::hash_map::Entry;
+
         let mut lookup = ahash::AHashMap::new();
         let mut names = vec![Arc::clone(&UNKNOWN_LIBRARY)]; // Index 0 = unknown
         let mut library_to_idx: ahash::AHashMap<Arc<str>, u16> = ahash::AHashMap::new();
@@ -116,20 +118,29 @@ impl LibraryIndex {
                 .get(&rg_tag::LIBRARY)
                 .map_or_else(|| Arc::clone(&UNKNOWN_LIBRARY), |s| Arc::from(s.to_string()));
 
-            // Get or create library index
-            let lib_idx = *library_to_idx.entry(library.clone()).or_insert_with(|| {
-                let idx: u16 =
-                    names.len().try_into().expect("too many distinct libraries for u16 index");
-                names.push(library);
-                idx
-            });
+            // Get or create library index. A fresh library takes the next `u16`
+            // slot; error rather than panic once the header exceeds the range.
+            let lib_idx = match library_to_idx.entry(library.clone()) {
+                Entry::Occupied(entry) => *entry.get(),
+                Entry::Vacant(entry) => {
+                    let idx: u16 = names.len().try_into().map_err(|_| {
+                        anyhow::anyhow!(
+                            "header has more than {} distinct libraries; \
+                             the library index is limited to a u16",
+                            u16::MAX
+                        )
+                    })?;
+                    names.push(library);
+                    *entry.insert(idx)
+                }
+            };
 
             // Hash the RG string and map to library index
             let rg_hash = Self::hash_rg(id.as_bytes());
             lookup.insert(rg_hash, lib_idx);
         }
 
-        Self { lookup, names, unknown_idx: 0 }
+        Ok(Self { lookup, names, unknown_idx: 0 })
     }
 
     /// Get the library index for a read group hash.
@@ -224,7 +235,7 @@ mod tests {
     /// one group in half.
     #[test]
     fn from_header_assigns_one_index_per_distinct_library() {
-        let index = LibraryIndex::from_header(&header_with_read_groups());
+        let index = LibraryIndex::from_header(&header_with_read_groups()).expect("builds");
 
         let idx1 = index.get(LibraryIndex::hash_rg(b"RG1"));
         let idx2 = index.get(LibraryIndex::hash_rg(b"RG2"));
@@ -244,7 +255,7 @@ mod tests {
     /// group together rather than each forming a singleton.
     #[test]
     fn from_header_maps_missing_library_and_unknown_read_group_to_index_zero() {
-        let index = LibraryIndex::from_header(&header_with_read_groups());
+        let index = LibraryIndex::from_header(&header_with_read_groups()).expect("builds");
 
         assert_eq!(index.get(LibraryIndex::hash_rg(b"RG4")), 0, "no LB field → unknown");
         assert_eq!(index.get(LibraryIndex::hash_rg(b"ABSENT")), 0, "unseen RG → unknown");
@@ -254,7 +265,7 @@ mod tests {
     /// Out-of-range indices fall back to "unknown" rather than panicking.
     #[test]
     fn library_name_saturates_to_unknown_for_an_out_of_range_index() {
-        let index = LibraryIndex::from_header(&header_with_read_groups());
+        let index = LibraryIndex::from_header(&header_with_read_groups()).expect("builds");
         assert_eq!(index.library_name(u16::MAX).as_ref(), "unknown");
     }
 
@@ -274,9 +285,61 @@ mod tests {
     /// An empty header yields an index that resolves everything to unknown.
     #[test]
     fn from_header_with_no_read_groups_resolves_everything_to_unknown() {
-        let index = LibraryIndex::from_header(&Header::default());
+        let index = LibraryIndex::from_header(&Header::default()).expect("builds");
         assert_eq!(index.get(LibraryIndex::hash_rg(b"RG1")), 0);
         assert!(build_library_lookup(&Header::default()).is_empty());
+    }
+
+    /// The per-library index is a `u16`, so a header carrying more than 65,535
+    /// distinct libraries cannot be represented. `from_header` must surface that
+    /// as an error the caller can propagate, not panic (previously a
+    /// `.try_into().expect(...)` crash).
+    #[test]
+    fn from_header_errors_when_distinct_libraries_exceed_u16() {
+        // u16::MAX distinct libraries fit (indices 1..=65535); one more overflows.
+        // Index 0 is reserved for "unknown", so the first over-range library is
+        // the (u16::MAX + 1)-th distinct one.
+        let distinct = usize::from(u16::MAX) + 1;
+        let mut header = Header::builder();
+        for i in 0..distinct {
+            let rg = Map::<ReadGroup>::builder()
+                .insert(rg_tag::LIBRARY, format!("lib{i}"))
+                .build()
+                .expect("read group builds");
+            header = header.add_read_group(bstr::BString::from(format!("RG{i}")), rg);
+        }
+
+        let err = LibraryIndex::from_header(&header.build())
+            .expect_err("more than u16::MAX distinct libraries must error");
+        assert!(
+            err.to_string().contains("distinct libraries"),
+            "error should name the distinct-library overflow, got: {err}"
+        );
+    }
+
+    /// Exactly `u16::MAX` distinct libraries is the boundary that still fits.
+    #[test]
+    fn from_header_accepts_u16_max_distinct_libraries() {
+        let distinct = usize::from(u16::MAX);
+        let mut header = Header::builder();
+        for i in 0..distinct {
+            let rg = Map::<ReadGroup>::builder()
+                .insert(rg_tag::LIBRARY, format!("lib{i}"))
+                .build()
+                .expect("read group builds");
+            header = header.add_read_group(bstr::BString::from(format!("RG{i}")), rg);
+        }
+
+        let index = LibraryIndex::from_header(&header.build())
+            .expect("u16::MAX distinct libraries must fit");
+        // The last read group added is the u16::MAX-th distinct library and must
+        // resolve to the highest valid index — this is the boundary the test pins.
+        assert_eq!(index.get(LibraryIndex::hash_rg(b"RG0")), 1, "first library gets index 1");
+        assert_eq!(
+            index.get(LibraryIndex::hash_rg(b"RG65534")),
+            u16::MAX,
+            "the u16::MAX-th distinct library resolves to the highest valid index"
+        );
     }
 
     /// `hash_bytes(None)` is the documented zero sentinel, and the typed wrappers

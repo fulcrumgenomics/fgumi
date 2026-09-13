@@ -648,7 +648,7 @@ mod tests {
                 .expect("read group builds");
             header = header.add_read_group(bstr::BString::from(id), rg);
         }
-        LibraryIndex::from_header(&header.build())
+        LibraryIndex::from_header(&header.build()).expect("builds")
     }
 
     /// Build one mapped mate of a pair carrying `RG`, `CB` and `MC`.
