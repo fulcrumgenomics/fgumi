@@ -487,6 +487,15 @@ pub fn validate_cross_stage_constraints(spec: &ChainSpec) -> Result<()> {
         }
     }
 
+    // Rule 7: a thread-telemetry file (`<stem>.ticks.*.tsv`, enabled by
+    // `--pipeline-telemetry-out` or its env var) must not collide with the
+    // primary output, a rejects branch, or the derived `.bai` sidecar. The six
+    // telemetry paths are *derived* from the stem, so — like the sidecar in
+    // Rule 3's `BamWithIndex` block — the command-layer output-collision check
+    // never saw them; two `File::create` calls on one path would clobber each
+    // other. Checked here, before any writer opens.
+    reject_telemetry_collisions(spec)?;
+
     Ok(())
 }
 
@@ -548,6 +557,57 @@ fn reject_index_sidecar_collisions(
     let mut targets: Vec<(&std::path::Path, &str)> =
         vec![(output_path, "--output"), (bai_path, "--write-index (.bai sidecar)")];
     targets.extend(rejects_paths.iter().map(|p| (*p, "--rejects")));
+    crate::commands::common::reject_output_collisions(&targets)
+}
+
+/// Reject a collision between any thread-telemetry TSV (`<stem>.ticks.*.tsv`)
+/// and the chain's other on-disk outputs — the primary sink, any rejects
+/// branch, and (for an indexed sink) the derived `.bai` sidecar.
+///
+/// The telemetry stem is resolved from `--pipeline-telemetry-out` / its env var
+/// exactly as the real telemetry setup resolves it, and the six file paths are
+/// *derived* from that stem. So the command-layer
+/// [`reject_output_collisions`](crate::commands::common::reject_output_collisions),
+/// which only sees CLI-passed paths, never inspects them — the same blind spot
+/// the `.bai` sidecar has. Two `File::create` calls (the BAM/rejects/FASTQ sink
+/// and `TelemetryWriters::open`) aimed at one path would truncate and corrupt
+/// each other. Telemetry-off is
+/// the zero-cost path: no config resolved, no check.
+fn reject_telemetry_collisions(spec: &ChainSpec) -> Result<()> {
+    use crate::pipeline::chains::SinkSpec;
+
+    let Some(cfg) = spec.scheduler.telemetry_config() else {
+        return Ok(());
+    };
+    // Owned locals the borrowed `targets` slice points into.
+    let tele_paths = cfg.ticks_paths();
+    let tele_labels: Vec<String> = crate::pipeline::core::runtime::telemetry::TICKS_SUFFIXES
+        .iter()
+        .map(|suffix| format!("--pipeline-telemetry-out (.ticks.{suffix}.tsv)"))
+        .collect();
+    let bai_sidecar = match &spec.sink {
+        SinkSpec::BamWithIndex(output) => Some(fgumi_bam_io::bai_sidecar_path(output)),
+        _ => None,
+    };
+
+    // The chain's non-telemetry write targets. `reject_output_collisions`
+    // itself skips stdout / null-device targets, so they need no pre-filter
+    // here — a telemetry TSV is always an on-disk file and cannot collide with
+    // stdout anyway.
+    let mut targets: Vec<(&std::path::Path, &str)> = vec![(spec.sink.path().as_path(), "--output")];
+    if let SinkSpec::FastqPaired { out2, out0, .. } = &spec.sink {
+        targets.push((out2.as_path(), "--output (read 2)"));
+        if let Some(out0) = out0 {
+            targets.push((out0.as_path(), "--output (read 0)"));
+        }
+    }
+    if let Some(bai) = &bai_sidecar {
+        targets.push((bai.as_path(), "--write-index (.bai sidecar)"));
+    }
+    targets.extend(spec_rejects_paths(spec).into_iter().map(|p| (p, "--rejects")));
+    for (path, label) in tele_paths.iter().zip(tele_labels.iter()) {
+        targets.push((path.as_path(), label.as_str()));
+    }
     crate::commands::common::reject_output_collisions(&targets)
 }
 
@@ -1243,6 +1303,47 @@ mod tests {
             Some(correct_opts_with_rejects(Some(PathBuf::from("rejects.bam"))));
         validate_cross_stage_constraints(&spec)
             .expect("a distinct rejects path must not collide with the derived .bai");
+    }
+
+    #[test]
+    fn telemetry_path_colliding_with_output_rejected() {
+        // `-o run.ticks.summary.tsv` + telemetry stem `run` derives the summary
+        // TSV onto the primary output: the BAM sink and `TelemetryWriters::open`
+        // would each `File::create` the same path and clobber each other.
+        let mut spec = empty_spec(vec![Stage::Sort]);
+        spec.sink = SinkSpec::Bam(PathBuf::from("run.ticks.summary.tsv"));
+        spec.scheduler.pipeline_telemetry_out = Some(PathBuf::from("run"));
+        let err = validate_cross_stage_constraints(&spec).unwrap_err();
+        assert!(
+            err.to_string().contains("run.ticks.summary.tsv"),
+            "collision error names the shared path: {err}"
+        );
+    }
+
+    #[test]
+    fn telemetry_path_colliding_with_rejects_rejected() {
+        // The derived telemetry path can also land on a rejects branch, not just
+        // the primary output. Correct's rejects file at `t.ticks.edges.tsv` +
+        // telemetry stem `t` collides on the edges TSV.
+        let mut spec = empty_spec(vec![Stage::Correct]);
+        spec.stage_opts.correct =
+            Some(correct_opts_with_rejects(Some(PathBuf::from("t.ticks.edges.tsv"))));
+        spec.scheduler.pipeline_telemetry_out = Some(PathBuf::from("t"));
+        let err = validate_cross_stage_constraints(&spec).unwrap_err();
+        assert!(
+            err.to_string().contains("t.ticks.edges.tsv"),
+            "collision error names the shared rejects path: {err}"
+        );
+    }
+
+    #[test]
+    fn telemetry_distinct_stem_accepted() {
+        // A telemetry stem that shares no derived path with the output is fine.
+        let mut spec = empty_spec(vec![Stage::Sort]);
+        spec.sink = SinkSpec::Bam(PathBuf::from("out.bam"));
+        spec.scheduler.pipeline_telemetry_out = Some(PathBuf::from("telem"));
+        validate_cross_stage_constraints(&spec)
+            .expect("a distinct telemetry stem must not collide with the output");
     }
 
     /// `CorrectOptions` carrying only the `rejects_path` under test; all other

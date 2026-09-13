@@ -1409,6 +1409,104 @@ fn test_extract_bgzf_unequal_block_counts() {
     }
 }
 
+/// Three BGZF FASTQ inputs must extract every record — the parallel BGZF decode
+/// split now handles ANY K via the unified `ZipRawFastqK → ParseAndZipFastqN`
+/// join (there is no longer a fused fallback for N>=3; that was the whole point
+/// of the K-input rewire). Regression for the review's N>=3 finding: the
+/// eligibility gate (`open_fastq_source`) once capped the split at 2 streams,
+/// and an earlier build silently decoded only stream 0 for 3+ all-BGZF streams.
+/// This asserts all three streams are read through the split.
+#[test]
+fn test_extract_three_bgzf_inputs_uses_split() {
+    use fgumi_lib::sam::SamTag;
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record_buf::data::field::Value;
+    fn borrow(v: &[(String, String, String)]) -> Vec<(&str, &str, &str)> {
+        v.iter().map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str())).collect()
+    }
+    let tmp = TempDir::new().unwrap();
+    let n = 20;
+    // Three streams: a UMI read, then two template reads. Same names across all.
+    let mk = |base: char| -> Vec<(String, String, String)> {
+        (0..n)
+            .map(|i| (format!("read{i:04}"), std::iter::repeat_n(base, 8).collect(), "I".repeat(8)))
+            .collect()
+    };
+    let s1 = mk('A');
+    let s2 = mk('C');
+    let s3 = mk('G');
+    let r1 = create_bgzf_fastq(&tmp, "r1.fq.bgz", &borrow(&s1));
+    let r2 = create_bgzf_fastq(&tmp, "r2.fq.bgz", &borrow(&s2));
+    let r3 = create_bgzf_fastq(&tmp, "r3.fq.bgz", &borrow(&s3));
+    let output = tmp.path().join("three.bam");
+
+    for threads in [1, 4] {
+        let cmd = Extract::try_parse_from([
+            "extract",
+            "--inputs",
+            r1.to_str().unwrap(),
+            r2.to_str().unwrap(),
+            r3.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--read-structures",
+            "8M",
+            "8T",
+            "8T",
+            "--sample",
+            "test",
+            "--library",
+            "test",
+            "--threads",
+            &threads.to_string(),
+        ])
+        .expect("failed to parse 3-input extract args");
+        cmd.execute("fgumi extract").unwrap_or_else(|e| {
+            panic!("3 BGZF inputs must extract via the parallel split at T{threads}: {e}")
+        });
+
+        // Two template reads per template × n templates = 2n emitted records.
+        // The point is that NO stream was silently dropped (the split bug would
+        // have produced a wrong count or a failure).
+        let records = read_bam_records(&output);
+        assert_eq!(
+            records.len(),
+            n * 2,
+            "all three streams must be read (2 template reads/template); got {} at T{threads}",
+            records.len()
+        );
+
+        // Count alone can't catch a cross-stream misassembly: all three streams
+        // share the SAME read names, so `zip_streams`' name-concordance check is
+        // no oracle here either. Pin record IDENTITY end-to-end through the CLI →
+        // BAM path — the `8M` UMI stream (A) must land in `RX`, and the two `8T`
+        // template streams (C, G) must land as the two segments' SEQ, in order.
+        // A split that dropped a stream or zipped the wrong stream into a segment
+        // passes the count assert but fails these.
+        let rx = |rec: &RecordBuf| -> Vec<u8> {
+            match rec.data().get(&Tag::from(SamTag::RX)) {
+                Some(Value::String(s)) => s.to_vec(),
+                other => panic!("expected a string RX tag, got {other:?} at T{threads}"),
+            }
+        };
+        // First template (read0000): segment 0 = C-stream, segment 1 = G-stream,
+        // UMI = A-stream, all 8 bases wide.
+        assert_eq!(
+            records[0].sequence().as_ref(),
+            b"CCCCCCCC",
+            "segment 0 SEQ must be the C (first 8T) stream at T{threads}"
+        );
+        assert_eq!(
+            records[1].sequence().as_ref(),
+            b"GGGGGGGG",
+            "segment 1 SEQ must be the G (second 8T) stream at T{threads}"
+        );
+        for rec in &records {
+            assert_eq!(rx(rec), b"AAAAAAAA", "RX must be the A (8M) UMI stream at T{threads}");
+        }
+    }
+}
+
 // ============================================================================
 // Compression Level Boundary Tests (issue #360)
 // ============================================================================

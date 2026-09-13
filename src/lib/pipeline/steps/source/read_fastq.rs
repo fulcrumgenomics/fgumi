@@ -1,7 +1,7 @@
 //! `ReadFastqInputs` source step: reads (and gzip-decompresses) raw FASTQ
 //! bytes from one or more `BufRead` streams in round-robin order and emits
 //! `FastqRawChunk` items. Parsing into `FastqRecord`s is deferred to the
-//! downstream `Parallel` `ParseFastqChunks` step so the decode/parse work
+//! downstream `Parallel` `ParseAndZipFastqN` step so the decode/parse work
 //! can fan out across worker threads rather than bottlenecking on the
 //! single reader thread.
 //!
@@ -11,25 +11,28 @@
 //! bottleneck, and a single reader serializing both streams cannot keep up.
 //! The framework runs distinct `Serial` steps on distinct workers
 //! concurrently (a `Serial` step holds a per-step mutex, not a global one),
-//! so the fix is to instantiate **one reader per stream** and pair their
-//! outputs 2-way (see `PairRawFastq`). Each per-stream reader is built with
+//! so the fix is to instantiate **one reader per stream** and join their
+//! outputs K-way (see [`ZipRawFastqK`]). Each per-stream reader is built with
 //! [`ReadFastqInputs::new_single`], is pinned to its **own** worker
-//! (`Affinity::Worker(0)` for R1, `Affinity::Worker(1)` for R2), and draws its
-//! chunks' `ordinal` from a [`FastqOrdinalSequence`] **shared by every reader
-//! on the branch**. That sharing is required, not incidental: handing each
-//! reader its own sequence makes them all mint `0, 1, 2, …` and collide, which
-//! does not fail loudly — it silently interleaves records in the downstream
-//! reorder buffer.
+//! (`Affinity::Worker(i)` for stream `i`), and draws its chunks' `ordinal` from
+//! its OWN [`FastqOrdinalSequence`]. Each reader is a distinct `ByItemOrdinal`
+//! producer edge into the K-way join, so its per-edge ordinal must be dense on
+//! its own; cross-stream row alignment is by `chunk_serial`, not by a shared
+//! ordinal. Handing all readers one shared sequence would make each edge sparse
+//! and stall its reorder stage.
 //!
 //! The distinct-worker pinning is load-bearing, not a tuning choice: a `Serial`
 //! source dispatched by more than one worker hits a `try_lock`-after-`Finished`
 //! race in the runtime's source-drain path, so concurrent per-stream readers
 //! must never use [`Affinity::None`]. See [`ReadFastqInputs::new_single`].
 //!
-//! The N≥3 fallback keeps the original single-reader, all-streams,
-//! round-robin model ([`ReadFastqInputs::new`], [`Affinity::Reader`]): a
-//! single worker-0-sticky thread drives all I/O reads, same as
-//! `ReadBgzfBlocks`.
+//! [`ReadFastqInputs::new`] ([`Affinity::Reader`]) retains the original
+//! single-reader, all-streams, round-robin model — a single worker-0-sticky
+//! thread driving all I/O reads, same as `ReadBgzfBlocks`. The unified K-way
+//! decode front no longer wires it (each stream gets its own `new_single`
+//! reader), but it is kept for callers that want an all-streams reader.
+//!
+//! [`ZipRawFastqK`]: super::zip_raw_fastq_k::ZipRawFastqK
 
 use std::collections::VecDeque;
 use std::io::{self, BufRead};
@@ -38,7 +41,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
-use crate::fastq_parse::FastqRecord;
 use crate::pipeline::core::Unpushed;
 use crate::pipeline::core::held::HeldSlot;
 use crate::pipeline::core::item::{HeapSize, Ordered};
@@ -52,30 +54,24 @@ use crate::pipeline::core::step::{Affinity, Step, StepCtx, StepKind, StepOutcome
 // a single stream.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The shared, monotonic ordinal sequence for FASTQ chunks.
+/// A monotonic ordinal sequence for one FASTQ producer edge's chunks.
 ///
-/// Every chunk emitted by every [`ReadFastqInputs`] instance feeding one
-/// `ParseFastqChunks` branch draws its ordinal from a single counter, so the
-/// sequence is both **globally unique** and **gap-free**.
+/// Every chunk emitted on one producer edge draws its ordinal from a single
+/// counter, so the sequence on that edge is both **unique** and **gap-free**
+/// (dense). In the per-stream (per-edge) K-way decode front each stream owns
+/// its OWN sequence — its edge into `ZipRawFastqK`/`WrapRawFastq1` is
+/// `ByItemOrdinal`, so that per-edge ordinal must be dense on its own;
+/// cross-stream alignment is by `chunk_serial`, not by a shared ordinal.
 ///
-/// Density is the load-bearing half, and it is why this is a shared counter
-/// rather than a per-stream arithmetic partition. The earlier scheme assigned
-/// `chunk_serial * n_streams_total + stream_idx`, giving each stream its own
-/// residue class. That is unique, but it is only dense when every stream
-/// produces the *same number of chunks* — a property of the input data, not
-/// something a reader can enforce. Mismatched FASTQ inputs (R1 longer than R2,
-/// e.g. a truncated download) leave a permanently unfilled ordinal, and
-/// `BranchOrdering::ByItemOrdinal` releases only in contiguous order, so the
-/// reorder stage waits forever on an ordinal no reader will ever mint. The
-/// symptom is a hang, not an error — and it masks the *correct* diagnostic,
-/// because `ZipFastqRecords` already reports "FASTQ sources out of sync" once
-/// the chunks actually reach it.
-///
-/// A per-instance counter cannot replace this: under `new_single` each reader
-/// owns one stream and cannot know how many cycles the other streams will run,
-/// so it cannot know how many ordinals to mint. Density is a global property,
-/// so it needs a globally-shared counter. This mirrors `PairRawFastq`, which
-/// already mints its ordinals from one serial counter.
+/// Density is the load-bearing half. `BranchOrdering::ByItemOrdinal` releases
+/// only in contiguous ordinal order, so a hole on an edge stalls its reorder
+/// stage forever — a silent hang, not an error. Drawing an edge's ordinals from
+/// its own single counter (rather than an arithmetic partition like
+/// `chunk_serial * n_streams + stream_idx`, which is only dense when every
+/// stream yields the same chunk count) makes each edge dense by construction.
+/// An unequal-length desync no longer strands an ordinal: each edge stays
+/// dense, and `ZipRawFastqK` reports "FASTQ sources out of sync" when the short
+/// stream drains with the front row still incomplete.
 ///
 /// The cost is one uncontended `fetch_add` per *chunk* (hundreds of KB of
 /// FASTQ), which is far below the noise floor of decompressing that chunk.
@@ -98,21 +94,21 @@ impl FastqOrdinalSequence {
 }
 
 /// A chunk of decompressed, whole-record-aligned raw FASTQ bytes emitted by
-/// [`ReadFastqInputs`] and consumed by `ParseFastqChunks`.
+/// [`ReadFastqInputs`] (or the BGZF `FindFastqBoundaries`) and consumed by the
+/// K-way aligner `ZipRawFastqK` / the 1-way adapter `WrapRawFastq1`.
 ///
-/// `ordinal` is a globally-unique, monotonically-increasing counter assigned
-/// once per emitted chunk (regardless of stream). It is the key the framework
-/// uses to reorder the `Parallel` `ParseFastqChunks` output — `stream_idx` and
-/// `chunk_serial` are NOT globally unique (two streams emit chunks with the
-/// same `chunk_serial`), so they must not be used as a reorder key. The
-/// `(stream_idx, chunk_serial)` pair is preserved purely so `ZipFastqRecords`
-/// can re-join the per-stream chunks.
+/// `ordinal` is a per-edge, monotonically-increasing counter assigned once per
+/// emitted chunk on this stream's edge. It is the key the framework uses to
+/// reorder that edge — `stream_idx` and `chunk_serial` are NOT unique across
+/// streams (two streams emit chunks with the same `chunk_serial`), so they must
+/// not be used as a reorder key. The `(stream_idx, chunk_serial)` pair is
+/// preserved so `ZipRawFastqK` can re-join the per-stream chunks by row.
 pub struct FastqRawChunk {
     /// Globally-unique monotonic ordinal, for the framework's reorder buffer.
     pub ordinal: u64,
     /// Index of the originating FASTQ stream (0-based).
     pub stream_idx: usize,
-    /// Per-stream round-robin cycle serial, for the `ZipFastqRecords` join.
+    /// Per-stream round-robin cycle serial, for the `ZipRawFastqK` join.
     pub chunk_serial: u64,
     /// Decompressed raw FASTQ bytes, aligned to whole records (4 lines each).
     ///
@@ -138,47 +134,6 @@ impl Ordered for FastqRawChunk {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FastqChunkBatch — one chunk of parsed records from a single FASTQ stream.
-// ─────────────────────────────────────────────────────────────────────────────
-
-pub struct FastqChunkBatch {
-    /// Globally-unique monotonic ordinal, propagated from the originating
-    /// [`FastqRawChunk`]. Used by the framework to reorder the output of the
-    /// `Parallel` `ParseFastqChunks` step. Distinct from `chunk_serial`,
-    /// which is only per-stream unique and is reused across streams.
-    pub ordinal: u64,
-    pub stream_idx: usize,
-    pub chunk_serial: u64,
-    pub records: Vec<FastqRecord>,
-    total_bytes: usize,
-}
-
-impl FastqChunkBatch {
-    #[must_use]
-    pub fn new(
-        ordinal: u64,
-        stream_idx: usize,
-        chunk_serial: u64,
-        records: Vec<FastqRecord>,
-        total_bytes: usize,
-    ) -> Self {
-        Self { ordinal, stream_idx, chunk_serial, records, total_bytes }
-    }
-}
-
-impl HeapSize for FastqChunkBatch {
-    fn heap_size(&self) -> usize {
-        self.total_bytes
-    }
-}
-
-impl Ordered for FastqChunkBatch {
-    fn ordinal(&self) -> u64 {
-        self.ordinal
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // FASTQ reading helper
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -192,7 +147,7 @@ impl Ordered for FastqChunkBatch {
 ///
 /// Decompression (when the underlying `BufRead` is a gzip decoder) happens
 /// here; FASTQ structure validation and `FastqRecord` parsing are deferred to
-/// `ParseFastqChunks`. The only structural check performed here is that each
+/// `ParseAndZipFastqN`. The only structural check performed here is that each
 /// record begins with `@`, so the round-robin reader fails fast on a malformed
 /// stream rather than emitting garbage to the parse workers.
 fn read_fastq_raw_bytes_from_bufread(
@@ -340,15 +295,16 @@ impl ReadFastqInputs {
     /// Single-stream reader: reads exactly one stream so multiple instances
     /// (e.g. one for R1, one for R2) can run concurrently on different
     /// workers. `global_stream_idx` is this stream's index in the full
-    /// pipeline, carried on each chunk so `ZipFastqRecords` can re-join the
+    /// pipeline, carried on each chunk so `ZipRawFastqK` can re-join the
     /// streams.
     ///
-    /// `ordinals` must be the **same** [`FastqOrdinalSequence`] for every
-    /// reader feeding one downstream branch — that shared counter is what
-    /// makes the combined ordinal stream gap-free when the streams differ in
-    /// length. Handing each reader its own sequence would make them all mint
-    /// `0, 1, 2, …` and collide, which does not fail loudly: it silently
-    /// interleaves records in the reorder buffer.
+    /// `ordinals` is this reader's OWN [`FastqOrdinalSequence`]. In the K-way
+    /// decode front each single-stream reader is its own producer edge into
+    /// `ZipRawFastqK`/`WrapRawFastq1`, and each such edge is `ByItemOrdinal`, so
+    /// its per-edge ordinal must be dense (`0, 1, 2, …`) on its own. Cross-stream
+    /// row alignment is by `chunk_serial`, not by a shared ordinal — so each
+    /// reader gets a fresh sequence, NOT one shared across streams (a shared
+    /// counter would make each edge's ordinals sparse and stall its reorder).
     ///
     /// `affinity` pins this reader to a specific worker. Each per-stream
     /// reader is given a **distinct** worker (e.g. `Affinity::Worker(0)` for
@@ -388,17 +344,14 @@ impl ReadFastqInputs {
         batch_record_count: usize,
         output_byte_limit: u64,
     ) -> Self {
-        // No ordinal-collision guard is needed here any more. The previous
-        // scheme derived ordinals from `(stream_idx, n_streams_total)`, so a
-        // reader wired with an index outside the declared total silently minted
-        // another reader's ordinals, and an unconditional assert stood here to
-        // catch it. Drawing from one shared counter makes uniqueness structural
-        // instead of arithmetic, so there is nothing left to assert.
-        //
-        // Worth noting which half of the invariant that assert covered: it
-        // guarded *uniqueness* only. Nothing guarded *density*, which is the
-        // half that actually broke — and its failure mode was a silent hang
-        // rather than a panic. See [`FastqOrdinalSequence`].
+        // Each reader draws its own edge's ordinals from the `ordinals`
+        // sequence it was handed. In the K-way front that is a fresh per-stream
+        // sequence (one edge per stream), so each edge's ordinals are dense on
+        // their own; in the legacy all-streams `new` reader it is a single
+        // private sequence over the round-robin output. Either way the sequence
+        // is per-edge, so there is no cross-reader collision to guard. Density
+        // (not uniqueness) is the load-bearing half — a sparse edge stalls its
+        // reorder into a silent hang. See [`FastqOrdinalSequence`].
         let n_streams = readers.len();
 
         Self {
@@ -485,7 +438,16 @@ impl Step for ReadFastqInputs {
                 }
 
                 let (data, records_read) =
-                    read_fastq_raw_bytes_from_bufread(reader.as_mut(), self.batch_record_count)?;
+                    read_fastq_raw_bytes_from_bufread(reader.as_mut(), self.batch_record_count)
+                        .map_err(|e| {
+                            // Attach the stream identity a bare parse/truncation
+                            // error lacks, so a malformed R2 in a multi-input run
+                            // names R2 rather than forcing the operator to guess.
+                            io::Error::new(
+                                e.kind(),
+                                format!("R{}: {e}", self.stream_idx_base + idx + 1),
+                            )
+                        })?;
 
                 if records_read == 0 {
                     self.exhausted[idx] = true;
@@ -596,15 +558,6 @@ mod tests {
     }
 
     #[test]
-    fn fastq_chunk_batch_heap_size_returns_total_bytes() {
-        // ordinal (7) and chunk_serial (5) are intentionally different to
-        // confirm `ordinal()` reports the unique ordinal, not chunk_serial.
-        let batch = FastqChunkBatch::new(7, 0, 5, vec![], 1234);
-        assert_eq!(batch.heap_size(), 1234);
-        assert_eq!(batch.ordinal(), 7);
-    }
-
-    #[test]
     fn fastq_raw_chunk_heap_size_and_ordinal() {
         let chunk =
             FastqRawChunk { ordinal: 3, stream_idx: 1, chunk_serial: 0, data: vec![0u8; 42] };
@@ -652,13 +605,10 @@ mod tests {
     }
 
     /// The per-stream constructor keeps `global_stream_idx` purely as chunk
-    /// metadata for `ZipFastqRecords` to re-join on.
+    /// metadata for `ZipRawFastqK` to re-join on.
     ///
-    /// This replaces a pair of tests that pinned an ordinal-collision guard
-    /// (`global_stream_idx` had to be `< n_streams_total`, else two readers
-    /// minted the same ordinal). Drawing ordinals from one shared sequence
-    /// makes that collision structurally impossible, so the guard and its
-    /// tests are gone rather than merely unused.
+    /// Each per-stream reader is its own producer edge with its own dense
+    /// ordinal sequence, so there is no cross-reader collision to guard.
     #[test]
     fn new_single_records_its_global_stream_index() {
         let reader: Box<dyn BufRead + Send> = Box::new(io::Cursor::new(Vec::<u8>::new()));

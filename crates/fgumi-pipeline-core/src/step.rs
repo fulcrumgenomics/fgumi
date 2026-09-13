@@ -213,6 +213,38 @@ use std::io;
 
 use super::item::HeapSize;
 use super::outputs::StepOutputs;
+// `StepCounters` is a leaf counter-handle (an `Option<Arc<[AtomicU64]>>` with no
+// runtime logic) that lives with its primary owner `ChainContexts` in
+// `runtime::contexts`; the ctx types below hold a `&StepCounters`. This one
+// reference back into `runtime` is deliberate — relocating the type here to avoid
+// it would be pure churn for a type whose construction and storage both live in
+// `runtime`.
+use crate::runtime::contexts::StepCounters;
+
+/// Static description of one domain counter a step declares.
+///
+/// A `CounterSpec` names a per-step quantity the step bumps at runtime (blocks,
+/// records, molecules, bytes read/written, …) and the unit that quantity is
+/// counted in. The specs a step returns from [`Step::counters`] /
+/// [`Step2::counters`] fix the layout of that step's runtime counter slots (one
+/// atomic per spec, in declaration order) and label the columns of the
+/// `<stem>.ticks.counter_names.tsv` telemetry file. Static (`&'static`) because
+/// the layout is fixed at chain-build time and shared by every per-worker clone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CounterSpec {
+    /// Column name for this counter (e.g. `"records"`, `"bytes_read"`).
+    pub name: &'static str,
+    /// Unit the counter is measured in (e.g. `"records"`, `"bytes"`).
+    pub unit: &'static str,
+}
+
+impl CounterSpec {
+    /// Construct a `CounterSpec` from its column name and unit.
+    #[must_use]
+    pub const fn new(name: &'static str, unit: &'static str) -> Self {
+        Self { name, unit }
+    }
+}
 
 /// Handle to this step's input queue.
 ///
@@ -325,6 +357,17 @@ pub trait Step: Send + Sized + 'static {
         DetachedGroup::PerStep
     }
 
+    /// Domain counters this step declares, in slot order. Defaults to `&[]` (the
+    /// step declares none). Override — like [`Self::affinity`] /
+    /// [`Self::detached_group`] — to opt into per-step bandwidth telemetry: each
+    /// returned [`CounterSpec`] gets one runtime atomic slot the step bumps via
+    /// `ctx.counters.add(slot, n)` (once per `try_run` with batch totals, never
+    /// per record). Read once at chain-build time; the returned slice fixes the
+    /// slot layout, so keep it a stable `&'static` in a fixed order.
+    fn counters(&self) -> &'static [CounterSpec] {
+        &[]
+    }
+
     /// Step body. Pop from `ctx.input`, push to `ctx.outputs`. Returns
     /// `Progress` / `NoProgress` / `Contention` / `Finished`. Errors propagate via `Err`.
     ///
@@ -364,6 +407,10 @@ pub trait Step: Send + Sized + 'static {
 pub struct StepCtx<'a, S: Step> {
     pub input: &'a dyn InputHandle<S::Input>,
     pub outputs: &'a OutputHandles<S::Outputs>,
+    /// Per-step domain counters (one atomic per [`Step::counters`] spec). Bump
+    /// via `ctx.counters.add(slot, n)`; a no-op (one load + branch) when
+    /// telemetry is off, so bumping unconditionally stays zero-cost off-path.
+    pub counters: &'a StepCounters,
 }
 
 /// Two-input variant of [`Step`]. Used by merge steps (zipper,
@@ -400,6 +447,11 @@ pub trait Step2: Send + Sized + 'static {
         DetachedGroup::PerStep
     }
 
+    /// Same semantics as [`Step::counters`]. Defaults to `&[]`.
+    fn counters(&self) -> &'static [CounterSpec] {
+        &[]
+    }
+
     /// Step body. Pop from `ctx.a` (input branch 0) and `ctx.b`
     /// (input branch 1), push to `ctx.outputs`.
     ///
@@ -434,6 +486,105 @@ pub struct StepCtx2<'a, S: Step2> {
     pub a: &'a dyn InputHandle<S::InputA>,
     pub b: &'a dyn InputHandle<S::InputB>,
     pub outputs: &'a OutputHandles<S::Outputs>,
+    /// Per-step domain counters — see [`StepCtx::counters`].
+    pub counters: &'a StepCounters,
+}
+
+/// K-input variant of [`Step`], for a step that consumes **K homogeneous**
+/// input streams — every input branch carries the same item type `Input`.
+///
+/// Sits alongside [`Step`] (1 input) and [`Step2`] (2 heterogeneous inputs).
+/// The homogeneity is the whole point: because all K branches share one type,
+/// the framework can present them as a single **slice** of input handles
+/// ([`StepCtxK::inputs`]) indexed by branch, and the per-branch handle storage
+/// ([`crate::handles::KInputHandles`]) is a plain array/`Vec` of one handle
+/// type — no per-branch associated types, no heterogeneous-tuple wrapper. A
+/// step that needs K *different* input types must use nested [`Step2`]s
+/// instead; this trait is exclusively for the K-of-one-type lockstep join
+/// (e.g. zipping K FASTQ streams whose chunks all decode to `FastqRawChunk`).
+///
+/// Arity is a runtime value ([`Self::input_count`]), not a type parameter, so a
+/// single `impl StepK` serves every K. The builder wires K producer branches
+/// via [`crate::builder::PipelineBuilder::append_step_k`]; the runtime pulls K
+/// input handles into a [`crate::handles::KInputHandles`] and lends them as a
+/// slice per dispatch.
+///
+/// **Scheduling.** Like [`Step2`], a `StepK` consumer has `input_arity > 1`, so
+/// it is never fused (the single-thread fused driver rejects multi-input steps)
+/// and its per-branch drain is the step's own responsibility: the step reports
+/// [`StepOutcome::Finished`] only once **every** input reports drained.
+pub trait StepK: Send + Sized + 'static {
+    /// The single item type carried by every one of the K input branches.
+    type Input: Send + HeapSize + 'static;
+    type Outputs: StepOutputs;
+
+    /// Static scheduling description. `output_queues` / `branch_ordering` size
+    /// to `Outputs::arity()` as usual; the *input* arity is reported separately
+    /// via [`Self::input_count`] (the profile has no input-arity field).
+    fn profile(&self) -> StepProfile;
+
+    /// The number of input branches K this step consumes. Fixed at construction
+    /// and reported to the builder so it wires exactly K producer edges, and to
+    /// the runtime so it pulls exactly K input handles. Must equal the number of
+    /// producer branches wired via `append_step_k`, and the length of
+    /// [`StepCtxK::inputs`] the step sees.
+    fn input_count(&self) -> usize;
+
+    /// Same semantics as [`Step::affinity`]. Defaults to `Affinity::None`.
+    fn affinity(&self) -> Affinity {
+        Affinity::None
+    }
+
+    /// Same semantics as [`Step::detached_group`]. Defaults to
+    /// [`DetachedGroup::PerStep`] (ignored unless the step is `Detached`).
+    fn detached_group(&self) -> DetachedGroup {
+        DetachedGroup::PerStep
+    }
+
+    /// Same semantics as [`Step::counters`]. Defaults to `&[]`.
+    fn counters(&self) -> &'static [CounterSpec] {
+        &[]
+    }
+
+    /// Step body. Pop from `ctx.inputs[i]` (branch `i`), push to `ctx.outputs`.
+    ///
+    /// # Errors
+    ///
+    /// Same handling as [`Step::try_run`].
+    fn try_run(&mut self, ctx: &mut StepCtxK<'_, Self>) -> io::Result<StepOutcome>;
+
+    /// Same semantics as [`Step::new_worker_copy`]. Default panics; a `StepK`
+    /// is `Serial`/`Exclusive` in every current use (a K-way lockstep join is
+    /// inherently serial on its ordering state), so the framework never clones
+    /// it. Override only if a `Parallel` `StepK` is ever introduced.
+    ///
+    /// # Panics
+    ///
+    /// Default impl panics with the step name + kind.
+    #[must_use]
+    fn new_worker_copy(&self) -> Self {
+        let p = self.profile();
+        panic!(
+            "StepK::new_worker_copy invoked on '{}' (kind = {:?}); \
+             only Parallel steps need to override this. A K-way join is \
+             Serial — the framework never clones it — so hitting this is a \
+             framework bug.",
+            p.name, p.kind
+        );
+    }
+}
+
+/// Context passed to [`StepK::try_run`]. Holds the K per-branch input handles
+/// as a single homogeneous slice, indexed by branch (`inputs[i]` is branch
+/// `i`, matching the wiring order in `append_step_k`).
+pub struct StepCtxK<'a, S: StepK> {
+    /// The K input handles, one per wired producer branch, in slot order.
+    /// `inputs.len() == S::input_count()`. Each is a non-blocking
+    /// [`InputHandle`] over the shared `S::Input` type.
+    pub inputs: &'a [&'a dyn InputHandle<S::Input>],
+    pub outputs: &'a OutputHandles<S::Outputs>,
+    /// Per-step domain counters — see [`StepCtx::counters`].
+    pub counters: &'a StepCounters,
 }
 
 #[cfg(test)]

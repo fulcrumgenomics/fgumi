@@ -18,7 +18,7 @@ use fgumi_pipeline_core::{
     outputs::OrderedBytesSingle,
     queues::QueueSpec,
     reorder::BranchOrdering,
-    step::{DetachedGroup, Step, StepCtx, StepKind, StepOutcome, StepProfile},
+    step::{CounterSpec, DetachedGroup, Step, StepCtx, StepKind, StepOutcome, StepProfile},
 };
 
 /// Default output batch size: 1024 records per emitted `RecordBatch`.
@@ -26,6 +26,9 @@ pub const DEFAULT_TARGET_BATCH_COUNT: usize = 1024;
 
 /// Max output batches emitted per `try_run` invocation in `Merging`.
 const MAX_DRAIN_BATCHES_PER_LOCK: usize = 8;
+
+/// `SortMerge` counter slot index: records merged/gathered this call.
+const RECORDS: usize = 0;
 
 /// Initial reservation for an output-batch byte buffer, before any batch has
 /// been emitted to size the next one from. Kept modest on purpose: most batches
@@ -753,10 +756,15 @@ impl<O: MergeOutput> SortMerge<O> {
         )
     }
 
+    /// `records_out` accumulates one per [`MergeStep::Produced`] — the caller
+    /// (`emit_batches_cooperative`, in turn `try_run`) sums this across every
+    /// `next_batch` call in a dispatch and bumps the `records` counter ONCE per
+    /// `try_run` with the batch total, rather than per record here.
+    ///
     /// # Panics
     ///
     /// Panics if `self.state` is not `Merging`.
-    fn next_batch(&mut self) -> io::Result<NextBatch<O::Item>> {
+    fn next_batch(&mut self, records_out: &mut u64) -> io::Result<NextBatch<O::Item>> {
         let target = self.target_batch_count;
         let byte_limit = self.output_byte_limit;
         let bytes_cap = usize::try_from(byte_limit).unwrap_or(usize::MAX);
@@ -787,6 +795,7 @@ impl<O: MergeOutput> SortMerge<O> {
             {
                 MergeStep::Produced(bytes) => {
                     builder.push_record_bytes(bytes)?;
+                    *records_out += 1;
                     let count_full = builder.len() >= target;
                     let bytes_full = (builder.total_bytes() as u64) >= byte_limit;
                     if count_full || bytes_full {
@@ -806,13 +815,20 @@ impl<O: MergeOutput> SortMerge<O> {
         }
     }
 
+    /// `records_out` accumulates the batch total of records merged this call;
+    /// see [`Self::next_batch`].
+    ///
     /// # Panics
     ///
     /// Panics if `self.state` is not `Merging`.
-    fn emit_batches_cooperative(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+    fn emit_batches_cooperative(
+        &mut self,
+        ctx: &mut StepCtx<'_, Self>,
+        records_out: &mut u64,
+    ) -> io::Result<StepOutcome> {
         let mut delivered = 0usize;
         loop {
-            match self.next_batch()? {
+            match self.next_batch(records_out)? {
                 NextBatch::Batch(batch) => {
                     if let Err(unpushed) = ctx.outputs.push(batch) {
                         self.dbg.output_full += 1;
@@ -904,10 +920,13 @@ impl<O: MergeOutput> SortMerge<O> {
     /// (k = 1) loser-tree merge of the same chunk — only the record SOURCE differs
     /// (a direct cursor instead of `driver.try_step()`).
     ///
+    /// `records_out` accumulates one per record gathered from the chunk; see
+    /// [`Self::next_batch`] for how the caller uses this.
+    ///
     /// # Panics
     ///
     /// Panics if `self.state` is not `FastPath`.
-    fn next_fast_batch(&mut self) -> io::Result<NextBatch<O::Item>> {
+    fn next_fast_batch(&mut self, records_out: &mut u64) -> io::Result<NextBatch<O::Item>> {
         let target = self.target_batch_count;
         let byte_limit = self.output_byte_limit;
         let bytes_cap = usize::try_from(byte_limit).unwrap_or(usize::MAX);
@@ -934,6 +953,7 @@ impl<O: MergeOutput> SortMerge<O> {
             }
             builder.push_record_bytes(chunk.record_bytes(*cursor))?;
             *cursor += 1;
+            *records_out += 1;
             let count_full = builder.len() >= target;
             let bytes_full = (builder.total_bytes() as u64) >= byte_limit;
             if count_full || bytes_full {
@@ -946,13 +966,20 @@ impl<O: MergeOutput> SortMerge<O> {
     /// [`emit_batches_cooperative`](Self::emit_batches_cooperative) but never
     /// `Stalled` (every record is already in memory).
     ///
+    /// `records_out` accumulates the batch total of records gathered this call;
+    /// see [`Self::next_batch`].
+    ///
     /// # Panics
     ///
     /// Panics if `self.state` is not `FastPath`.
-    fn emit_fast_batches(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+    fn emit_fast_batches(
+        &mut self,
+        ctx: &mut StepCtx<'_, Self>,
+        records_out: &mut u64,
+    ) -> io::Result<StepOutcome> {
         let mut delivered = 0usize;
         loop {
-            match self.next_fast_batch()? {
+            match self.next_fast_batch(records_out)? {
                 NextBatch::Batch(batch) => {
                     if let Err(unpushed) = ctx.outputs.push(batch) {
                         self.dbg.output_full += 1;
@@ -1096,6 +1123,11 @@ impl<O: MergeOutput> Step for SortMerge<O> {
         DetachedGroup::Shared(crate::sort::SORT_COORD_GROUP)
     }
 
+    fn counters(&self) -> &'static [CounterSpec] {
+        const SPECS: &[CounterSpec] = &[CounterSpec::new("records", "records")];
+        SPECS
+    }
+
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
         if !self.flush_held(ctx) {
             return Ok(StepOutcome::Contention);
@@ -1147,14 +1179,22 @@ impl<O: MergeOutput> Step for SortMerge<O> {
             self.transition_to_merging()?;
         }
 
-        match &self.state {
-            SortMergeState::Merging { .. } => self.emit_batches_cooperative(ctx),
-            SortMergeState::FastPath { .. } => self.emit_fast_batches(ctx),
+        // Batch total for this call: one bump per `try_run`, accumulated across
+        // however many `next_batch`/`next_fast_batch` calls the emit loop below
+        // makes (never a per-record bump).
+        let mut records_this_call: u64 = 0;
+        let outcome = match &self.state {
+            SortMergeState::Merging { .. } => {
+                self.emit_batches_cooperative(ctx, &mut records_this_call)
+            }
+            SortMergeState::FastPath { .. } => self.emit_fast_batches(ctx, &mut records_this_call),
             SortMergeState::Done => Ok(StepOutcome::Finished),
             SortMergeState::WaitingForSetup { .. } => {
                 unreachable!("Phase 1 must have left state non-WaitingForSetup")
             }
-        }
+        };
+        ctx.counters.add(RECORDS, records_this_call);
+        outcome
     }
 }
 

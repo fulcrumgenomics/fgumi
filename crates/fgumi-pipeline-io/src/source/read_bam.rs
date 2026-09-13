@@ -21,11 +21,16 @@ use fgumi_pipeline_core::{
     outputs::OrderedBytesSingle,
     queues::QueueSpec,
     reorder::BranchOrdering,
-    step::{Affinity, Step, StepCtx, StepKind, StepOutcome, StepProfile},
+    step::{Affinity, CounterSpec, Step, StepCtx, StepKind, StepOutcome, StepProfile},
 };
 
 /// Legacy default blocks-per-batch.
 pub const DEFAULT_BLOCKS_PER_BATCH: usize = 16;
+
+/// Counter slot index for BGZF blocks read from the fd this call.
+const BLOCKS: usize = 0;
+/// Counter slot index for compressed bytes read from the fd this call.
+const BYTES_READ: usize = 1;
 
 /// `Serial + sticky` source step that reads raw BGZF blocks from a file.
 ///
@@ -80,6 +85,12 @@ impl Step for ReadBgzfBlocks {
         Affinity::Reader
     }
 
+    fn counters(&self) -> &'static [CounterSpec] {
+        const SPECS: &[CounterSpec] =
+            &[CounterSpec::new("blocks", "blocks"), CounterSpec::new("bytes_read", "bytes")];
+        SPECS
+    }
+
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
         // 1. Drain the held slot first.
         if let Some(unpushed) = self.held.take() {
@@ -124,6 +135,17 @@ impl Step for ReadBgzfBlocks {
             // is drained rather than holding it for the rest of the run.
             self.reader = None;
             return Ok(StepOutcome::Finished);
+        }
+
+        // Batch totals for this call: one bump per `try_run`, not per block. Gate
+        // the whole thing on live counter slots so the `.sum()` pass is not run on
+        // the telemetry-off path — `add` alone is a no-op when disabled, but the
+        // fold over the batch is not, and the crate's zero-cost-off invariant
+        // requires no extra work when counters are absent.
+        if !ctx.counters.is_empty() {
+            let batch_bytes: u64 = raw_blocks.iter().map(|raw| raw.data.len() as u64).sum();
+            ctx.counters.add(BLOCKS, raw_blocks.len() as u64);
+            ctx.counters.add(BYTES_READ, batch_bytes);
         }
 
         for raw in raw_blocks {
@@ -460,6 +482,137 @@ mod tests {
         let blocks = drive(&path, DEFAULT_BLOCKS_PER_BATCH, 1);
         let concatenated: Vec<u8> = blocks.iter().flat_map(|b| b.bytes.clone()).collect();
         assert_eq!(concatenated, on_disk[..on_disk.len() - BGZF_EOF_LEN]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Domain counters (T-BW2)
+    // ---------------------------------------------------------------------
+
+    /// Sink that sleeps briefly per received block before recording it. A plain
+    /// in-memory `ReadBgzfBlocks -> BlockSink` run over a modest file completes
+    /// within a single sampler tick (observed: an un-throttled version of this
+    /// test recorded `blocks_final=0`), so — mirroring
+    /// `fgumi_pipeline_core::tests::CountingSink`'s per-item
+    /// `thread::sleep` — this sink deliberately slows the drain so the pipeline
+    /// spans several sampler ticks and the telemetry file can observe the
+    /// counter mid-climb, not just its (possibly still-zero) starting sample.
+    struct ThrottledBlockSink {
+        received: std::sync::Arc<parking_lot::Mutex<Vec<BgzfBlock>>>,
+    }
+
+    impl Step for ThrottledBlockSink {
+        type Input = BgzfBlock;
+        type Outputs = ();
+
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "ThrottledBlockSink",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(block) => {
+                    std::thread::sleep(std::time::Duration::from_micros(500));
+                    self.received.lock().push(block);
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    /// Drives `ReadBgzfBlocks` with telemetry enabled and asserts its `blocks` /
+    /// `bytes_read` counters land in the telemetry files with sane, bounded
+    /// values. `blocks_per_batch = 1` and a large-enough record count give the
+    /// source several BGZF blocks (several `try_run` calls); the downstream
+    /// `ThrottledBlockSink` throttles the drain so the 1ms sampler gets several
+    /// ticks before the pipeline finishes.
+    #[test]
+    fn try_run_bumps_blocks_and_bytes_read_counters() {
+        use fgumi_pipeline_core::builder::{InstrumentationLevel, Pipeline, PipelineConfig};
+        use fgumi_pipeline_core::runtime::telemetry::TelemetryConfig;
+        use std::time::Duration;
+
+        const RECORD_COUNT: usize = 20_000;
+        const BGZF_EOF_LEN: usize = 28;
+        let (path, on_disk) = temp_bam(RECORD_COUNT);
+        let expected_bytes = (on_disk.len() - BGZF_EOF_LEN) as u64;
+
+        let received = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (source, _hdr) =
+            read_bam(&path, PipelineReaderOpts::default(), 1, 1024 * 1024).unwrap();
+        let sink = ThrottledBlockSink { received: std::sync::Arc::clone(&received) };
+
+        let dir = std::env::temp_dir()
+            .join(format!("fgumi-tbw2-read-bgzf-blocks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("run");
+
+        let builder = Pipeline::builder();
+        builder.chain(source).chain(sink).into_sink_marker();
+        let pipeline = builder.build().unwrap();
+        pipeline
+            .run(PipelineConfig {
+                threads: 1,
+                instrumentation: InstrumentationLevel::Summary,
+                telemetry: Some(TelemetryConfig {
+                    stem: stem.clone(),
+                    interval: Duration::from_millis(1),
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Ground truth, reconstructed from what actually flowed through the
+        // pipeline — independent of the (sampled) telemetry file.
+        let blocks = std::mem::take(&mut *received.lock());
+        assert!(!blocks.is_empty(), "at least one block must have been emitted");
+        let total_blocks = blocks.len() as u64;
+        let total_bytes: u64 = blocks.iter().map(|b| b.bytes.len() as u64).sum();
+        assert_eq!(total_bytes, expected_bytes, "sanity: reconstructed total matches the file");
+
+        // `ReadBgzfBlocks` is step index 0 (the only source in this 2-step chain).
+        let names = std::fs::read_to_string(dir.join("run.ticks.counter_names.tsv")).unwrap();
+        let name_rows: Vec<&str> = names.lines().skip(1).filter(|l| l.starts_with("0\t")).collect();
+        assert_eq!(
+            name_rows,
+            vec!["0\t0\tblocks\tblocks", "0\t1\tbytes_read\tbytes"],
+            "ReadBgzfBlocks declares blocks + bytes_read, in slot order"
+        );
+
+        let counters = std::fs::read_to_string(dir.join("run.ticks.counters.tsv")).unwrap();
+        let last_value_for = |step: &str, counter: &str| -> Option<u64> {
+            counters
+                .lines()
+                .skip(1)
+                .filter(|l| {
+                    let f: Vec<&str> = l.split('\t').collect();
+                    f[2] == step && f[3] == counter
+                })
+                .last()
+                .map(|l| l.split('\t').nth(5).unwrap().parse::<u64>().unwrap())
+        };
+
+        let blocks_final = last_value_for("0", "0").expect("blocks counter recorded at least once");
+        let bytes_final =
+            last_value_for("0", "1").expect("bytes_read counter recorded at least once");
+        // Exact oracle: `value` is cumulative, and the reader (step 0) drains every
+        // block up front and then freezes its counter for the rest of the run,
+        // which the downstream decode/sink phase re-samples over many later ticks —
+        // so the LAST recorded value is the true total, not a mid-climb sample. (An
+        // end-incrementing counter, e.g. a writer, could not use `==` here because
+        // the final increment can land after the last emitted tick; a source can.)
+        // A systematic under-count would now fail rather than pass a loose bound.
+        assert_eq!(blocks_final, total_blocks, "blocks_final={blocks_final}");
+        assert_eq!(bytes_final, total_bytes, "bytes_final={bytes_final}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ---------------------------------------------------------------------

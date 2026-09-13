@@ -15,8 +15,13 @@ use parking_lot::Mutex;
 use crate::types::BgzfBlock;
 use fgumi_pipeline_core::{
     header::HeaderHandle,
-    step::{Affinity, DetachedGroup, Step, StepCtx, StepKind, StepOutcome, StepProfile},
+    step::{
+        Affinity, CounterSpec, DetachedGroup, Step, StepCtx, StepKind, StepOutcome, StepProfile,
+    },
 };
+
+/// Counter slot index: compressed bytes written to the fd this call.
+const BYTES_WRITTEN: usize = 0;
 
 /// `Serial + sticky` BAM sink (or `Detached` — see [`Self::with_detached`])
 /// that consumes pre-compressed `BgzfBlock`s.
@@ -299,6 +304,11 @@ impl Step for WriteBgzfFile {
         Affinity::Writer
     }
 
+    fn counters(&self) -> &'static [CounterSpec] {
+        const SPECS: &[CounterSpec] = &[CounterSpec::new("bytes_written", "bytes")];
+        SPECS
+    }
+
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
         let mut guard = self.state.lock();
         let Some(state) = guard.as_mut() else {
@@ -340,6 +350,9 @@ impl Step for WriteBgzfFile {
                 sink.bai.prune_below(sink.next_block_no);
             }
             state.out.write_all(&block.bytes)?;
+            // One item (one BgzfBlock) per `try_run`, so this is already the
+            // batch total for this call — no per-record loop involved.
+            ctx.counters.add(BYTES_WRITTEN, block.bytes.len() as u64);
             state.coffset += block.bytes.len() as u64;
             return Ok(StepOutcome::Progress);
         }
@@ -532,6 +545,194 @@ mod tests {
         // Both payload blocks reached disk.
         assert!(bytes.windows(16).any(|w| w == [0xAB; 16]), "first block written");
         assert!(bytes.windows(16).any(|w| w == [0xCD; 16]), "second block written");
+    }
+
+    /// Domain counter (T-BW2): drives `WriteBgzfFile` with telemetry enabled
+    /// and asserts its `bytes_written` counter lands in the telemetry files
+    /// with a sane, bounded value.
+    ///
+    /// A throttled relay sits directly upstream of `WriteBgzfFile` (rather
+    /// than throttling the source) and sleeps briefly before forwarding each
+    /// block — mirroring `fgumi_pipeline_core::tests::CountingSink`'s
+    /// per-item `thread::sleep`. This matters here specifically: an earlier
+    /// version of this test throttled only the *source*, and — because the
+    /// byte-bounded queue between source and sink is large enough to never
+    /// backpressure — the single worker thread ran the (unthrottled) source
+    /// to completion first and only then burned through every `WriteBgzfFile`
+    /// dispatch in a sub-millisecond tail burst, so the 1ms sampler observed
+    /// `bytes_written == 0` at every tick even though the file itself was
+    /// written correctly. Throttling the step feeding `WriteBgzfFile` directly
+    /// paces its OWN dispatches across the run, regardless of how the
+    /// upstream source is scheduled.
+    #[test]
+    #[allow(clippy::too_many_lines)] // inline test Steps (source/relay) + telemetry assertions
+    fn try_run_bumps_bytes_written_counter() {
+        use fgumi_pipeline_core::{
+            Unpushed,
+            builder::{InstrumentationLevel, Pipeline, PipelineConfig},
+            held::HeldSlot,
+            outputs::OrderedBytesSingle,
+            queues::QueueSpec,
+            reorder::BranchOrdering,
+            runtime::telemetry::TelemetryConfig,
+        };
+        use std::time::Duration;
+
+        /// Exclusive source draining a `Vec<BgzfBlock>`, one block per `try_run`.
+        struct BlockSource {
+            blocks: Vec<BgzfBlock>,
+            held: HeldSlot<Unpushed<BgzfBlock>>,
+        }
+        impl Step for BlockSource {
+            type Input = ();
+            type Outputs = OrderedBytesSingle<BgzfBlock>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "BlockSource",
+                    kind: StepKind::Exclusive,
+                    sticky: true,
+                    output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 20 }],
+                    branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+                }
+            }
+            fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                if let Some(unpushed) = self.held.take()
+                    && let Err(again) = ctx.outputs.retry(unpushed)
+                {
+                    self.held.put(again);
+                    return Ok(StepOutcome::Progress);
+                }
+                let Some(block) = self.blocks.pop() else {
+                    return Ok(StepOutcome::Finished);
+                };
+                if let Err(unpushed) = ctx.outputs.push(block) {
+                    self.held.put(unpushed);
+                }
+                Ok(StepOutcome::Progress)
+            }
+        }
+
+        /// Serial pass-through directly upstream of `WriteBgzfFile`: sleeps
+        /// briefly before forwarding each block, throttling `WriteBgzfFile`'s
+        /// own dispatch rate regardless of how the source is scheduled.
+        struct ThrottledRelay {
+            held: HeldSlot<Unpushed<BgzfBlock>>,
+        }
+        impl Step for ThrottledRelay {
+            type Input = BgzfBlock;
+            type Outputs = OrderedBytesSingle<BgzfBlock>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "ThrottledRelay",
+                    kind: StepKind::Serial,
+                    sticky: false,
+                    // Deliberately tiny (room for ~1 block): the scheduler's
+                    // drain-first round-robin keeps re-dispatching an upstream
+                    // step (restarting the walk from the top) as long as it
+                    // keeps returning `Progress`, so a generously-sized queue
+                    // here would let this relay (and the source before it) run
+                    // to completion in one uninterrupted burst, and
+                    // `WriteBgzfFile` would only get dispatched afterward — in
+                    // its own sub-millisecond burst, too fast for the sampler
+                    // to catch mid-climb (this is exactly what an earlier,
+                    // large-queue version of this test hit: `bytes_written`
+                    // read 0 at every tick despite the file being written
+                    // correctly). A near-single-item budget forces real
+                    // backpressure: this relay pushes one block, blocks until
+                    // `WriteBgzfFile` drains it, then sleeps again for the
+                    // next — interleaving the two steps' dispatches evenly
+                    // across the whole run.
+                    output_queues: vec![QueueSpec::ByteBounded { limit_bytes: BLOCK_LEN as u64 }],
+                    branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+                }
+            }
+            fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                if let Some(unpushed) = self.held.take()
+                    && let Err(again) = ctx.outputs.retry(unpushed)
+                {
+                    self.held.put(again);
+                    return Ok(StepOutcome::Contention);
+                }
+                match ctx.input.pop() {
+                    Some(block) => {
+                        std::thread::sleep(Duration::from_micros(300));
+                        if let Err(unpushed) = ctx.outputs.push(block) {
+                            self.held.put(unpushed);
+                        }
+                        Ok(StepOutcome::Progress)
+                    }
+                    None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                    None => Ok(StepOutcome::NoProgress),
+                }
+            }
+        }
+
+        const N_BLOCKS: usize = 50;
+        const BLOCK_LEN: usize = 64;
+
+        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let sink = WriteBgzfFile::new(&path, &empty_header(), 1).unwrap();
+
+        let mut blocks: Vec<BgzfBlock> = (0..N_BLOCKS as u64)
+            .map(|i| BgzfBlock {
+                batch_serial: i,
+                bytes: vec![0xABu8; BLOCK_LEN],
+                uncompressed_size: 0,
+                index: None,
+            })
+            .collect();
+        blocks.reverse(); // `pop()` drains the tail first, so ordinals come out dense.
+        let expected_bytes = (N_BLOCKS * BLOCK_LEN) as u64;
+        let source = BlockSource { blocks, held: HeldSlot::new() };
+        let relay = ThrottledRelay { held: HeldSlot::new() };
+
+        let dir =
+            std::env::temp_dir().join(format!("fgumi-tbw2-write-bgzf-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("run");
+
+        let builder = Pipeline::builder();
+        builder.chain(source).chain(relay).chain(sink).into_sink_marker();
+        let pipeline = builder.build().expect("pipeline builds");
+        pipeline
+            .run(PipelineConfig {
+                threads: 1,
+                instrumentation: InstrumentationLevel::Summary,
+                telemetry: Some(TelemetryConfig {
+                    stem: stem.clone(),
+                    interval: Duration::from_millis(1),
+                }),
+                ..Default::default()
+            })
+            .expect("pipeline runs to completion");
+
+        // `WriteBgzfFile` is step index 2 (source=0, relay=1, sink=2).
+        let names = std::fs::read_to_string(dir.join("run.ticks.counter_names.tsv")).unwrap();
+        let name_rows: Vec<&str> = names.lines().skip(1).filter(|l| l.starts_with("2\t")).collect();
+        assert_eq!(
+            name_rows,
+            vec!["2\t0\tbytes_written\tbytes"],
+            "WriteBgzfFile declares exactly one bytes_written counter"
+        );
+
+        let counters = std::fs::read_to_string(dir.join("run.ticks.counters.tsv")).unwrap();
+        let last_value = counters
+            .lines()
+            .skip(1)
+            .filter(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                f[2] == "2" && f[3] == "0"
+            })
+            .last()
+            .map(|l| l.split('\t').nth(5).unwrap().parse::<u64>().unwrap())
+            .expect("bytes_written counter recorded at least once");
+        assert!(last_value > 0 && last_value <= expected_bytes, "last_value={last_value}");
+
+        // Ground truth, independent of the sampled telemetry file.
+        let on_disk = std::fs::read(&path).unwrap();
+        assert!(on_disk.len() as u64 >= expected_bytes, "all blocks reached disk");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// L5 positive coverage for the inline-BAI join: drives a real 2-step

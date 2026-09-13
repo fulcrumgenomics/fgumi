@@ -39,11 +39,11 @@ pub use builder::{
     BuildError, Chain, DEFAULT_DEADLOCK_TIMEOUT_SECS, InstrumentationLevel, MultiChain2,
     MultiChain2Ordered, MultiChain3, MultiChain4, Pipeline, PipelineBuilder, PipelineConfig,
 };
-pub use erased::{ErasedStep, ErasedStepCtx, TypedStep, TypedStep2};
+pub use erased::{ErasedStep, ErasedStepCtx, TypedStep, TypedStep2, TypedStepK};
 pub use finalize::FinalizeHook;
 pub use handles::{
-    BranchInputHandle, HeldRetry, OutputQueueSet, Tuple2View, Tuple3View, Tuple4View,
-    TwoInputHandles, Unpushed,
+    BranchInputHandle, HeldRetry, KInputHandles, OutputQueueSet, Tuple2View, Tuple3View,
+    Tuple4View, TwoInputHandles, Unpushed,
 };
 pub use header::{AlreadySetError, HeaderHandle};
 pub use held::HeldSlot;
@@ -56,7 +56,7 @@ pub use queues::{ByteBoundedQueue, CountBoundedQueue, ItemQueue, QueueSpec, Unbo
 pub use reorder::{BranchOrdering, ReorderStage, Sequenced};
 pub use signal::{CancelHandle, PipelineError, PipelineSignal};
 pub use step::{
-    Affinity, DetachedGroup, InputHandle, OutputHandles, OutputsViewAny, Step, Step2, StepCtx,
-    StepCtx2, StepKind, StepOutcome, StepProfile,
+    Affinity, CounterSpec, DetachedGroup, InputHandle, OutputHandles, OutputsViewAny, Step, Step2,
+    StepCtx, StepCtx2, StepCtxK, StepK, StepKind, StepOutcome, StepProfile,
 };
 pub use topology::{BranchIdx, ChainGraph, StepIdx};

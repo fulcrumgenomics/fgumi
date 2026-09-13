@@ -806,6 +806,58 @@ where
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// K-input handle wrapper — held inside ChainContexts.inputs[step_idx] for a
+// homogeneous `StepK` consumer. Unlike `TwoInputHandles<A, B>` (two DISTINCT
+// types), every branch here carries the SAME type `T`, so the storage is a
+// plain array/`Vec` of one handle type. The `TypedStepK<S>` adapter downcasts
+// the type-erased box back to `&KInputHandles<T>` per dispatch and lends the K
+// handles as a slice into `StepCtxK::inputs`.
+//
+// The handles are held in a plain `Vec`. An earlier revision stored small-K
+// arities (2/3/4) in inline `Fixed2/3/4` arrays, but the per-dispatch adapter
+// re-materializes a fresh `Vec<&dyn InputHandle<T>>` from `as_slice` on every
+// call (`TypedStepK::try_run_erased`), so the inline storage saved only a
+// single allocation per *chain build* — negligible — for real added
+// complexity. A single `Vec` is equivalent and simpler.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// K per-branch input handles for a homogeneous [`crate::step::StepK`]
+/// consumer. Built once at chain-build time (one [`BranchInputHandle<T>`] per
+/// wired producer branch, in slot order) and boxed type-erased into
+/// `ChainContexts.inputs[step_idx]`.
+///
+/// Opaque like its sibling [`TwoInputHandles`]: the inner `Vec` is `pub(crate)`
+/// and construction funnels through `Self::from_vec`, so external code cannot
+/// build a `KInputHandles` that bypasses the `>= 2` branch invariant a `StepK`
+/// requires.
+pub struct KInputHandles<T: Send + HeapSize + 'static>(pub(crate) Vec<BranchInputHandle<T>>);
+
+impl<T: Send + HeapSize + 'static> KInputHandles<T> {
+    /// Build from exactly K per-branch handles (K == the consumer's
+    /// `input_count`). K < 2 is a wiring bug (a `StepK` consumer with 0/1 inputs
+    /// should be a `Step`), rejected here.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `handles.len() < 2` — a `StepK` needs at least two branches
+    /// (one input is [`crate::step::Step`], not `StepK`).
+    pub(crate) fn from_vec(handles: Vec<BranchInputHandle<T>>) -> Self {
+        assert!(
+            handles.len() >= 2,
+            "KInputHandles requires >= 2 branches (use Step/Step2 for fewer); got {}",
+            handles.len()
+        );
+        Self(handles)
+    }
+
+    /// Borrow the K handles as a slice. The adapter maps this to
+    /// `&[&dyn InputHandle<T>]` for `StepCtxK`.
+    pub(crate) fn as_slice(&self) -> &[BranchInputHandle<T>] {
+        &self.0
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Per-arity typed views — held inside OutputsViewAny.inner
 // ─────────────────────────────────────────────────────────────────────────────
 
