@@ -411,6 +411,17 @@ impl Command for Simplex {
     fn execute(&self, command_line: &str) -> Result<()> {
         // ---- reader-free pre-flight (runs on BOTH paths) ----
         self.io.validate()?;
+        // `--metrics <prefix>` derives `<prefix>.{family_sizes,umi_counts,
+        // simplex_yield_metrics}.txt`, written by `ConsensusMetricsFinalizeHook`
+        // AFTER the BAM sink. Those derived paths must join the collision check,
+        // else `--metrics result` + `-o result.family_sizes.txt` passes here and
+        // the metrics write later clobbers the BAM. Reuses the same
+        // `simplex_metrics_paths` derivation runall's collision guard uses, so
+        // the two never drift. Kept in a local so `outputs` can borrow it.
+        let metrics_artifacts: Vec<std::path::PathBuf> = match &self.metrics {
+            Some(prefix) => crate::inline_metrics_collector::simplex_metrics_paths(prefix),
+            None => Vec::new(),
+        };
         let mut outputs: Vec<(&Path, &str)> = vec![(self.io.output.as_path(), "--output")];
         if let Some(path) = &self.rejects_opts.rejects {
             outputs.push((path.as_path(), "--rejects"));
@@ -418,6 +429,7 @@ impl Command for Simplex {
         if let Some(path) = &self.stats_opts.stats {
             outputs.push((path.as_path(), "--stats"));
         }
+        outputs.extend(metrics_artifacts.iter().map(|p| (p.as_path(), "--metrics")));
         reject_output_collisions(&outputs)?;
 
         self.validate_read_bounds()?;
@@ -750,6 +762,28 @@ mod tests {
         let result = cmd.execute("test");
         assert!(result.is_err(), "simplex must reject non-template-coordinate input");
         assert!(result.unwrap_err().to_string().contains("template-coordinate"));
+        Ok(())
+    }
+
+    #[test]
+    fn metrics_prefix_colliding_with_output_rejected() -> Result<()> {
+        // Regression: `--metrics <prefix>` derives `<prefix>.family_sizes.txt`
+        // (etc.), written AFTER the BAM sink by `ConsensusMetricsFinalizeHook`.
+        // If a derived path equals `--output`, the metrics write later clobbers
+        // the BAM. The pre-flight must reject the collision up front. Input need
+        // only exist (the collision check runs right after `io.validate`, before
+        // any BAM parse).
+        let dir = tempfile::TempDir::new()?;
+        let input = dir.path().join("in.bam");
+        std::fs::write(&input, b"")?;
+        let output = dir.path().join("result.family_sizes.txt");
+        let mut cmd = create_simplex_with_paths(input, output);
+        cmd.metrics = Some(dir.path().join("result"));
+        let err = cmd.execute("test").unwrap_err().to_string();
+        assert!(
+            err.contains("result.family_sizes.txt"),
+            "collision must name the clobbered path: {err}"
+        );
         Ok(())
     }
 

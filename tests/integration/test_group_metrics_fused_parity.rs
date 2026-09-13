@@ -74,9 +74,10 @@ fn runall_group_family_size_histogram_matches_standalone_group(#[case] threads: 
         standalone_histogram.to_str().unwrap(),
     ]);
 
-    assert_eq!(
-        std::fs::read_to_string(&fused_histogram).expect("fused histogram exists"),
-        std::fs::read_to_string(&standalone_histogram).expect("standalone histogram exists"),
+    assert_files_eq(
+        &fused_histogram,
+        &standalone_histogram,
+        "group family-size histogram: fused vs standalone",
     );
 }
 
@@ -339,4 +340,342 @@ fn runall_group_to_codec_metrics_succeeds_on_paired_end_input() {
         dir.path().join("codec.duplex_yield_metrics.txt").is_file(),
         "duplex_yield_metrics.txt must exist"
     );
+}
+
+/// Assert two metrics files exist and are byte-for-byte identical, and that the
+/// comparison is non-vacuous.
+///
+/// Both sides of these comparisons come from the same `fgumi` binary, so an
+/// empty-vs-empty match would pass without pinning anything. Every metrics
+/// artifact compared through this helper is a line-oriented TSV whose first line
+/// is a header and whose data begins on the second line, so a file with fewer
+/// than two lines is header-only — the signature of a silently-broken input
+/// (e.g. single-end reads feeding the simplex metrics path, which counts paired
+/// templates only, leaving `simplex_yield_metrics` / `umi_counts` empty). Require
+/// at least one data row on *every* compared file so no degenerate fixture can
+/// make a comparison vacuous. (A bare "file is non-empty" check would be useless:
+/// every metrics writer emits a header regardless.)
+fn assert_files_eq(actual: &std::path::Path, expected: &std::path::Path, ctx: &str) {
+    let a = std::fs::read_to_string(actual)
+        .unwrap_or_else(|e| panic!("{ctx}: missing actual {}: {e}", actual.display()));
+    let e = std::fs::read_to_string(expected)
+        .unwrap_or_else(|e| panic!("{ctx}: missing expected {}: {e}", expected.display()));
+    assert!(
+        e.lines().count() >= 2,
+        "{ctx}: {} has no data rows — the comparison would be vacuous",
+        expected.display(),
+    );
+    assert_eq!(a, e, "{ctx}: {} diverges from {}", actual.display(), expected.display());
+}
+
+/// A small multi-family, multi-position input, so the group and consensus
+/// metrics files carry non-trivial content (family sizes 3, 2, 1 across two
+/// coordinate groups) rather than a single degenerate family. Uses real
+/// PAIRED templates: group metrics count families fine from single-end reads,
+/// but the SIMPLEX consensus metrics count paired templates only, so a
+/// single-end input would leave `<prefix>.simplex.*` empty and make the
+/// consensus half of the content comparisons vacuous.
+fn multi_family_records() -> Vec<RawRecord> {
+    let mut records = Vec::new();
+    for (name, pos, umi) in [
+        ("a1", 100, "AAAAAAAA"),
+        ("a2", 100, "AAAAAAAA"),
+        ("a3", 100, "AAAAAAAA"),
+        ("b1", 100, "CCCCCCCC"),
+        ("b2", 100, "CCCCCCCC"),
+        ("c1", 500, "GGGGGGGG"),
+    ] {
+        let (r1, r2) = paired_record(name, pos, umi);
+        records.push(r1);
+        records.push(r2);
+    }
+    records
+}
+
+/// `--all-metrics` must produce byte-identical metric files to setting the
+/// equivalent per-stage flags explicitly — the aggregator only fills the same
+/// options those flags set, so their *content* must match, not merely their
+/// existence. (The existing `all_metrics_fills_in_*` test asserts creation;
+/// this closes the content gap.) Covers group's full three-file set and
+/// simplex's three files including `simplex_yield_metrics.txt`.
+#[test]
+fn all_metrics_content_matches_explicit_per_stage_flags() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let header = create_minimal_header("chr1", 10_000);
+    let bam = dir.path().join("in.bam");
+    write_bam(&bam, &header, &multi_family_records());
+
+    // Run 1: one --all-metrics prefix fills every present stage's metrics.
+    let all = dir.path().join("all");
+    run_fgumi(&[
+        "runall",
+        "-i",
+        bam.to_str().unwrap(),
+        "-o",
+        dir.path().join("o1.bam").to_str().unwrap(),
+        "--start-from",
+        "group",
+        "--stop-after",
+        "consensus",
+        "--consensus",
+        "simplex",
+        "--group::strategy",
+        "adjacency",
+        "--simplex::min-reads",
+        "1",
+        "--all-metrics",
+        all.to_str().unwrap(),
+    ]);
+
+    // Run 2: the same pipeline, metrics requested via explicit per-stage flags.
+    let g = dir.path().join("g");
+    let s = dir.path().join("s");
+    run_fgumi(&[
+        "runall",
+        "-i",
+        bam.to_str().unwrap(),
+        "-o",
+        dir.path().join("o2.bam").to_str().unwrap(),
+        "--start-from",
+        "group",
+        "--stop-after",
+        "consensus",
+        "--consensus",
+        "simplex",
+        "--group::strategy",
+        "adjacency",
+        "--simplex::min-reads",
+        "1",
+        "--group::metrics",
+        g.to_str().unwrap(),
+        "--simplex::metrics",
+        s.to_str().unwrap(),
+    ]);
+
+    for suffix in ["family_sizes.txt", "grouping_metrics.txt", "position_group_sizes.txt"] {
+        assert_files_eq(
+            &dir.path().join(format!("all.group.{suffix}")),
+            &dir.path().join(format!("g.{suffix}")),
+            "--all-metrics group output vs explicit --group::metrics",
+        );
+    }
+    for suffix in ["family_sizes.txt", "simplex_yield_metrics.txt", "umi_counts.txt"] {
+        assert_files_eq(
+            &dir.path().join(format!("all.simplex.{suffix}")),
+            &dir.path().join(format!("s.{suffix}")),
+            "--all-metrics simplex output vs explicit --simplex::metrics",
+        );
+    }
+}
+
+/// Fused `runall --group::metrics <prefix>` must produce the same three-file
+/// group metric set (`family_sizes` / `grouping_metrics` /
+/// `position_group_sizes`) as standalone `fgumi group --metrics <prefix>`.
+/// The existing fused-vs-standalone parity test only compares the
+/// `--family-size-histogram` file; this closes the `--metrics`-prefix content
+/// gap, single- and multi-threaded.
+#[rstest]
+#[case::single_thread(1)]
+#[case::multi_thread(4)]
+fn runall_group_metrics_prefix_matches_standalone_group(#[case] threads: usize) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let header = create_minimal_header("chr1", 10_000);
+    let bam = dir.path().join("in.bam");
+    write_bam(&bam, &header, &multi_family_records());
+
+    let fused = dir.path().join("fused");
+    run_fgumi(&[
+        "runall",
+        "-i",
+        bam.to_str().unwrap(),
+        "-o",
+        dir.path().join("fused_out.bam").to_str().unwrap(),
+        "--start-from",
+        "group",
+        "--stop-after",
+        "group",
+        "--group::strategy",
+        "adjacency",
+        "--group::metrics",
+        fused.to_str().unwrap(),
+        "--threads",
+        &threads.to_string(),
+    ]);
+
+    let standalone = dir.path().join("standalone");
+    run_fgumi(&[
+        "group",
+        "-i",
+        bam.to_str().unwrap(),
+        "-o",
+        dir.path().join("standalone_out.bam").to_str().unwrap(),
+        "-s",
+        "adjacency",
+        "--metrics",
+        standalone.to_str().unwrap(),
+    ]);
+
+    for suffix in ["family_sizes.txt", "grouping_metrics.txt", "position_group_sizes.txt"] {
+        assert_files_eq(
+            &dir.path().join(format!("fused.{suffix}")),
+            &dir.path().join(format!("standalone.{suffix}")),
+            "fused --group::metrics vs standalone group --metrics",
+        );
+    }
+}
+
+/// An unmapped single-end read carrying an `RX` UMI — the shape the `correct`
+/// stage consumes (`--start-from correct`). The correction itself is
+/// incidental here; the point is that `--all-metrics` fills in and writes
+/// correct's metrics file when a correct stage is in the chain.
+fn unmapped_umi_record(name: &str, umi: &str) -> RawRecord {
+    let mut b = SamBuilder::new();
+    b.read_name(name.as_bytes())
+        .sequence(b"ACGTACGTAC")
+        .qualities(&[30; 10])
+        .flags(flags::UNMAPPED);
+    b.add_string_tag(fgumi_raw_bam::SamTag::RX, umi.as_bytes());
+    b.build()
+}
+
+/// `--all-metrics` must fill in and write the CORRECT stage's metrics when a
+/// correct stage is present, with content identical to an explicit
+/// `--correct::metrics`. Existing coverage only asserts correct's file is
+/// ABSENT when the stage is out of the chain (see
+/// `all_metrics_fills_in_every_applicable_stage_present_in_the_chain`); this
+/// is the positive case.
+#[test]
+fn all_metrics_fills_correct_metrics_when_correct_stage_present() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let header = create_minimal_header("chr1", 10_000);
+    let bam = dir.path().join("unmapped.bam");
+    write_bam(
+        &bam,
+        &header,
+        &[
+            unmapped_umi_record("r1", "AAAAAAAA"),
+            unmapped_umi_record("r2", "AAAAAAAT"),
+            unmapped_umi_record("r3", "CCCCCCCC"),
+        ],
+    );
+    let whitelist = dir.path().join("umis.txt");
+    std::fs::write(&whitelist, "AAAAAAAA\nCCCCCCCC\n").expect("write whitelist");
+
+    let all = dir.path().join("all");
+    run_fgumi(&[
+        "runall",
+        "-i",
+        bam.to_str().unwrap(),
+        "-o",
+        dir.path().join("o1.bam").to_str().unwrap(),
+        "--start-from",
+        "correct",
+        "--stop-after",
+        "correct",
+        "--correct::umi-files",
+        whitelist.to_str().unwrap(),
+        "--correct::max-mismatches",
+        "1",
+        "--correct::min-distance",
+        "1",
+        "--all-metrics",
+        all.to_str().unwrap(),
+    ]);
+    let all_correct = dir.path().join("all.correct.metrics.txt");
+    assert!(all_correct.is_file(), "--all-metrics must write correct's metrics file");
+
+    let explicit = dir.path().join("explicit.correct.txt");
+    run_fgumi(&[
+        "runall",
+        "-i",
+        bam.to_str().unwrap(),
+        "-o",
+        dir.path().join("o2.bam").to_str().unwrap(),
+        "--start-from",
+        "correct",
+        "--stop-after",
+        "correct",
+        "--correct::umi-files",
+        whitelist.to_str().unwrap(),
+        "--correct::max-mismatches",
+        "1",
+        "--correct::min-distance",
+        "1",
+        "--correct::metrics",
+        explicit.to_str().unwrap(),
+    ]);
+    assert_files_eq(
+        &all_correct,
+        &explicit,
+        "--all-metrics correct vs explicit --correct::metrics",
+    );
+}
+
+/// `--all-metrics` must fill in and write the FILTER stage's stats when a
+/// filter stage is present, with content identical to an explicit
+/// `--filter::stats`. The consensus BAM the filter stage needs is produced by
+/// a preliminary fused group -> simplex run.
+#[test]
+fn all_metrics_fills_filter_stats_when_filter_stage_present() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let header = create_minimal_header("chr1", 10_000);
+    let bam = dir.path().join("in.bam");
+    write_bam(&bam, &header, &multi_family_records());
+
+    // A consensus BAM to feed the filter-only chain.
+    let consensus = dir.path().join("consensus.bam");
+    run_fgumi(&[
+        "runall",
+        "-i",
+        bam.to_str().unwrap(),
+        "-o",
+        consensus.to_str().unwrap(),
+        "--start-from",
+        "group",
+        "--stop-after",
+        "consensus",
+        "--consensus",
+        "simplex",
+        "--group::strategy",
+        "adjacency",
+        "--simplex::min-reads",
+        "1",
+    ]);
+
+    let all = dir.path().join("all");
+    run_fgumi(&[
+        "runall",
+        "-i",
+        consensus.to_str().unwrap(),
+        "-o",
+        dir.path().join("f1.bam").to_str().unwrap(),
+        "--start-from",
+        "filter",
+        "--stop-after",
+        "filter",
+        "--filter::min-reads",
+        "1",
+        "--all-metrics",
+        all.to_str().unwrap(),
+    ]);
+    let all_stats = dir.path().join("all.filter.stats.txt");
+    assert!(all_stats.is_file(), "--all-metrics must write filter's stats file");
+
+    let explicit = dir.path().join("explicit.filter.txt");
+    run_fgumi(&[
+        "runall",
+        "-i",
+        consensus.to_str().unwrap(),
+        "-o",
+        dir.path().join("f2.bam").to_str().unwrap(),
+        "--start-from",
+        "filter",
+        "--stop-after",
+        "filter",
+        "--filter::min-reads",
+        "1",
+        "--filter::stats",
+        explicit.to_str().unwrap(),
+    ]);
+    assert_files_eq(&all_stats, &explicit, "--all-metrics filter vs explicit --filter::stats");
 }
