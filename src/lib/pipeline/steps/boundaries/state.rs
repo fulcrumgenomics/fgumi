@@ -103,6 +103,17 @@ pub struct BoundaryState {
     /// straddling run rather than silently corrupting output). Empty when no
     /// batch has been emitted yet.
     last_emitted_name: Vec<u8>,
+    /// Coalescing accumulator for [`BatchCut::Queryname`]: the bytes of all
+    /// complete, already-scanned records not yet emitted. New records are
+    /// appended here as they are scanned, so they are never re-scanned across
+    /// calls (the fix for the O(n^2) carry re-walk). Emitting splits this at a
+    /// queryname boundary and retains the trailing run. Unused in
+    /// [`BatchCut::Record`] mode.
+    qn_buffer: Vec<u8>,
+    /// Record-end offsets into [`Self::qn_buffer`], `num_records + 1` entries
+    /// with a leading `0`. Grows as records are scanned; split on emit. Unused
+    /// in `Record` mode.
+    qn_offsets: Vec<usize>,
 }
 
 impl BoundaryState {
@@ -117,6 +128,8 @@ impl BoundaryState {
             cut: BatchCut::Record,
             min_emit_bytes: 0,
             last_emitted_name: Vec::new(),
+            qn_buffer: Vec::new(),
+            qn_offsets: vec![0],
         }
     }
 
@@ -132,6 +145,8 @@ impl BoundaryState {
             cut: BatchCut::Record,
             min_emit_bytes: 0,
             last_emitted_name: Vec::new(),
+            qn_buffer: Vec::new(),
+            qn_offsets: vec![0],
         }
     }
 
@@ -269,94 +284,15 @@ impl BoundaryState {
         Ok(fgumi_raw_bam::read_name(body))
     }
 
-    /// Pull `cursor`/`offsets` back so the emitted batch is closed under
-    /// queryname: carry the trailing queryname run (honoring the coalescing
-    /// target), then self-check the emitted boundary. No-op unless the cut mode
-    /// is [`BatchCut::Queryname`]. Extracted from `find_boundaries` to keep that
-    /// function within the line budget; see the queryname-cut design.
+    /// Read the queryname of record `i` in the coalescing accumulator
+    /// `qn_buffer`, framed by `offsets` (absolute into `qn_buffer`). Thin
+    /// wrapper over [`Self::record_name_in`] with `records_start = 0`.
     ///
     /// # Errors
     ///
-    /// Returns `InvalidData` if a record is too short to hold its read name, or
-    /// if the closed-under-queryname self-check trips (a run straddled a batch).
-    fn apply_queryname_cut(
-        &mut self,
-        cursor: &mut usize,
-        start_cursor: usize,
-        offsets: &mut Vec<usize>,
-    ) -> io::Result<()> {
-        if self.cut != BatchCut::Queryname {
-            return Ok(());
-        }
-
-        let n_records = offsets.len() - 1;
-        // `j` = index of the first record of the trailing queryname run
-        // (the run to carry). 0 = carry everything (whole batch is one run,
-        // or coalescing says "not enough closed yet").
-        let mut j = 0usize;
-        if n_records >= 1 {
-            j = n_records - 1;
-            let mut cur_name = Self::record_name_in(&self.work_buffer, start_cursor, offsets, j)?;
-            while j > 0 {
-                let prev_name =
-                    Self::record_name_in(&self.work_buffer, start_cursor, offsets, j - 1)?;
-                if prev_name != cur_name {
-                    break;
-                }
-                j -= 1;
-                cur_name = prev_name;
-            }
-            // Coalescing: if the closed prefix (records 0..j) is smaller
-            // than the emit target, carry everything and wait for more
-            // input. `offsets[j]` is the prefix byte length. EOF flushes.
-            if self.min_emit_bytes > 0 && offsets[j] < self.min_emit_bytes {
-                j = 0;
-            }
-        }
-
-        if j == 0 {
-            // Nothing closed to emit: carry the whole record region plus any
-            // partial tail. Rewind cursor to the start of records so Step 4
-            // puts it all in `leftover`. (Next call re-walks the carry; a
-            // resume-past-scanned optimization is a follow-up.)
-            *cursor = start_cursor;
-            offsets.truncate(1);
-        } else {
-            // Emit records 0..j; carry j.. (whole trailing run) + partial
-            // tail. Truncating `offsets` to j+1 keeps the trailing sentinel
-            // == emitted buffer length and makes `record_count` count only
-            // the emitted records, so the carried run is counted once, when
-            // finally emitted (FindBamBoundaries derives `records` from
-            // `offsets.len()`).
-            *cursor = start_cursor + offsets[j];
-            offsets.truncate(j + 1);
-        }
-
-        // Self-check + carry the boundary name (only when >= 1 record is
-        // emitted). The first emitted record's name must differ from the
-        // previous emitted batch's last name, else a queryname run straddled
-        // a batch — the invariant `AssembleTemplates` relies on and cannot
-        // itself detect. One name compare per emitted batch, always on.
-        let n_emitted = offsets.len() - 1;
-        if n_emitted >= 1 {
-            let first_name = Self::record_name_in(&self.work_buffer, start_cursor, offsets, 0)?;
-            if !self.last_emitted_name.is_empty() && self.last_emitted_name == first_name {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "FindBamBoundaries: queryname cut invariant violated \
-                             (a run of read name {:?} straddled a batch boundary)",
-                        String::from_utf8_lossy(first_name),
-                    ),
-                ));
-            }
-            let last_name =
-                Self::record_name_in(&self.work_buffer, start_cursor, offsets, n_emitted - 1)?;
-            self.last_emitted_name.clear();
-            self.last_emitted_name.extend_from_slice(last_name);
-        }
-
-        Ok(())
+    /// `InvalidData` if the record body is too short to hold its read name.
+    fn qn_record_name<'a>(buf: &'a [u8], offsets: &[usize], i: usize) -> io::Result<&'a [u8]> {
+        Self::record_name_in(buf, 0, offsets, i)
     }
 
     /// Find record boundaries in decompressed data.
@@ -468,29 +404,16 @@ impl BoundaryState {
             offsets.push(cursor - start_cursor);
         }
 
-        // Step 3b: Queryname cut. The forward scan above cut on record
-        // boundaries; if this scanner must emit batches closed under queryname,
-        // pull the cursor back to the start of the trailing queryname run so
-        // that run carries forward whole (never straddling a batch). Also honor
-        // the coalescing target: keep carrying until the closed prefix is large
-        // enough to be worth emitting.
-        //
-        // `n_records = offsets.len() - 1` complete records live in
-        // `work_buffer[start_cursor .. cursor]`; record `i`'s body is
-        // `work_buffer[start_cursor + offsets[i] + 4 .. start_cursor + offsets[i+1]]`
-        // (the leading 4-byte `block_size` prefix skipped).
-        self.apply_queryname_cut(&mut cursor, start_cursor, &mut offsets)?;
-
-        // Remember this block's offset count to pre-size the next call.
-        self.prev_offsets_len = offsets.len();
-
-        // Step 4: Save leftover for next block (reuse allocation)
-        // Split work_buffer: [0..start_cursor | start_cursor..cursor | cursor..]
-        //                     header (discard) | records (output)    | leftover
-        // Bound the carry before retaining it: a corrupt `block_size` keeps the
-        // scan breaking at the same record forever, so without this the leftover
-        // grows to the size of the remaining input. `finish` would still catch
-        // the shortfall at EOF, but only after the memory was already spent.
+        // Step 4a: Split the incomplete trailing record into `leftover` for the
+        // next call. `offsets.last()` is the byte length of the complete-records
+        // region (relative to `start_cursor`); everything after `cursor` is the
+        // partial tail. Bound the carry before retaining it: a corrupt
+        // `block_size` keeps the scan breaking at the same record forever, so
+        // without this the leftover grows to the size of the remaining input.
+        // `finish` would still catch the shortfall at EOF, but only after the
+        // memory was already spent. (This bound is on the genuinely-incomplete
+        // tail only; the queryname coalescing carry lives in `qn_buffer` and is
+        // bounded by `min_emit_bytes`, not this backstop.)
         let carry_len = self.work_buffer.len() - cursor;
         if carry_len > MAX_CARRY_BYTES {
             return Err(io::Error::new(
@@ -504,8 +427,9 @@ impl BoundaryState {
         self.leftover.clear();
         self.leftover.extend_from_slice(&self.work_buffer[cursor..]);
 
-        // Extract the records buffer - this allocation is unavoidable as we return ownership
-        let buffer = self.work_buffer[start_cursor..cursor].to_vec();
+        // The complete-records region is `work_buffer[start_cursor..cursor]`,
+        // described by `offsets` (relative to `start_cursor`, leading `0`).
+        let records = &self.work_buffer[start_cursor..cursor];
 
         // Debug-only regression tripwire (NOT input validation): cross-check
         // each record's stored block_size prefix against the offset delta this
@@ -521,10 +445,10 @@ impl BoundaryState {
             let end = offsets[i + 1];
             if end > start + 4 {
                 let stored = u32::from_le_bytes([
-                    buffer[start],
-                    buffer[start + 1],
-                    buffer[start + 2],
-                    buffer[start + 3],
+                    records[start],
+                    records[start + 1],
+                    records[start + 2],
+                    records[start + 3],
                 ]) as usize;
                 let expected = end - start - 4;
                 debug_assert_eq!(
@@ -534,7 +458,116 @@ impl BoundaryState {
             }
         }
 
-        Ok(BoundaryBatch { buffer, offsets })
+        // Step 4b: emit.
+        if self.cut != BatchCut::Queryname {
+            // Record mode (default, unchanged): return this call's complete
+            // records directly. No cross-call accumulation.
+            self.prev_offsets_len = offsets.len();
+            let buffer = records.to_vec();
+            return Ok(BoundaryBatch { buffer, offsets });
+        }
+
+        // Queryname mode: append this call's complete records to the coalescing
+        // accumulator (they are never re-scanned), then decide the emit split on
+        // the accumulator without re-scanning already-scanned records. This is
+        // the O(1)-amortized-per-record path that replaces the old whole-carry
+        // re-walk.
+        let base = self.qn_buffer.len();
+        self.qn_buffer.extend_from_slice(records);
+        // `offsets[0]` is the leading 0 already present as the last entry of
+        // `qn_offsets` (a record-end sentinel); append the rest, shifted into
+        // `qn_buffer` coordinates.
+        for w in offsets.windows(2) {
+            self.qn_offsets.push(base + w[1]);
+        }
+        self.prev_offsets_len = offsets.len();
+
+        self.emit_queryname_batch()
+    }
+
+    /// Decide and perform the queryname emit split on the coalescing
+    /// accumulator (`qn_buffer` / `qn_offsets`). Walks back from the last record
+    /// to the start of the trailing queryname run (bounded by the run length,
+    /// not the accumulator size), applies the `min_emit_bytes` coalescing gate,
+    /// and — when a non-empty closed prefix is ready — returns it as a
+    /// `BoundaryBatch`, retaining the trailing run (and its offsets) for the
+    /// next emit. Returns an empty batch when nothing is closed yet (keep
+    /// accumulating). `force` (set by `finish` at EOF) emits the entire
+    /// accumulator regardless of the coalescing gate.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` if a record is too short to hold its read name, or if the
+    /// closed-under-queryname self-check trips (a run straddled a batch).
+    fn emit_queryname_batch(&mut self) -> io::Result<BoundaryBatch> {
+        self.emit_queryname_batch_inner(false)
+    }
+
+    fn emit_queryname_batch_inner(&mut self, force: bool) -> io::Result<BoundaryBatch> {
+        let n_records = self.qn_offsets.len() - 1;
+        if n_records == 0 {
+            return Ok(BoundaryBatch { buffer: Vec::new(), offsets: vec![0] });
+        }
+
+        // `j` = index of the first record of the trailing queryname run (the run
+        // to carry). 0 = the whole accumulator is one run (or coalescing says
+        // "not enough closed yet"): emit nothing unless forced.
+        let mut j = n_records - 1;
+        let mut cur_name = Self::qn_record_name(&self.qn_buffer, &self.qn_offsets, j)?;
+        while j > 0 {
+            let prev_name = Self::qn_record_name(&self.qn_buffer, &self.qn_offsets, j - 1)?;
+            if prev_name != cur_name {
+                break;
+            }
+            j -= 1;
+            cur_name = prev_name;
+        }
+
+        if force {
+            // EOF flush: emit everything (the trailing run is complete too).
+            j = n_records;
+        } else if self.min_emit_bytes > 0 && self.qn_offsets[j] < self.min_emit_bytes {
+            // Closed prefix below the coalescing target: keep accumulating.
+            j = 0;
+        }
+
+        if j == 0 {
+            // Nothing to emit yet.
+            return Ok(BoundaryBatch { buffer: Vec::new(), offsets: vec![0] });
+        }
+
+        // Emit records 0..j; retain j.. (the trailing run) for the next emit.
+        let split = self.qn_offsets[j];
+        let emit_offsets: Vec<usize> = self.qn_offsets[..=j].to_vec();
+
+        // Self-check + carry the boundary name. The first emitted record's name
+        // must differ from the previous emitted batch's last name, else a
+        // queryname run straddled a batch — the invariant `AssembleTemplates`
+        // relies on and cannot itself detect.
+        let first_name = Self::qn_record_name(&self.qn_buffer, &emit_offsets, 0)?;
+        if !self.last_emitted_name.is_empty() && self.last_emitted_name == first_name {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "FindBamBoundaries: queryname cut invariant violated \
+                         (a run of read name {:?} straddled a batch boundary)",
+                    String::from_utf8_lossy(first_name),
+                ),
+            ));
+        }
+        let last_name = Self::qn_record_name(&self.qn_buffer, &emit_offsets, j - 1)?;
+        self.last_emitted_name.clear();
+        self.last_emitted_name.extend_from_slice(last_name);
+
+        let buffer = self.qn_buffer[..split].to_vec();
+
+        // Retain the trailing run: shift its bytes to the front of `qn_buffer`
+        // and rebase its offsets to start at 0.
+        self.qn_buffer.drain(..split);
+        let retained: Vec<usize> = self.qn_offsets[j..].iter().map(|&o| o - split).collect();
+        self.qn_offsets = retained;
+
+        Ok(BoundaryBatch { buffer, offsets: emit_offsets })
     }
 
     /// Call at EOF to get any remaining leftover.
@@ -546,6 +579,29 @@ impl BoundaryState {
     ///
     /// Returns an I/O error if there are incomplete BAM records at EOF.
     pub fn finish(&mut self) -> io::Result<Option<BoundaryBatch>> {
+        // Queryname mode: complete records were scanned into the coalescing
+        // accumulator as they arrived, so only a genuinely-incomplete tail can
+        // remain in `leftover` — that is a truncated record at EOF (error).
+        // Flush whatever the coalescing gate held back in `qn_buffer` as the
+        // final batch.
+        if self.cut == BatchCut::Queryname {
+            if !self.leftover.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "Incomplete BAM record at EOF: {} trailing byte(s) cannot form a \
+                         complete record",
+                        self.leftover.len(),
+                    ),
+                ));
+            }
+            let batch = self.emit_queryname_batch_inner(true)?;
+            if batch.buffer.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(batch));
+        }
+
         if self.leftover.is_empty() {
             return Ok(None);
         }
@@ -1180,6 +1236,73 @@ mod tests {
         let mut state = BoundaryState::new_no_header().with_cut(BatchCut::Queryname, 0);
         let err = state.find_boundaries(&short_body).expect_err("must reject");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Concatenate the emitted record bytes across all batches (including the
+    /// `finish` flush) so a test can assert byte-identity against the input.
+    fn queryname_cut_bytes(input_blocks: &[Vec<u8>], min_emit_bytes: usize) -> Vec<u8> {
+        let mut state =
+            BoundaryState::new_no_header().with_cut(BatchCut::Queryname, min_emit_bytes);
+        let mut out = Vec::new();
+        for blk in input_blocks {
+            let batch = state.find_boundaries(blk).expect("cut ok");
+            out.extend_from_slice(&batch.buffer);
+        }
+        if let Some(batch) = state.finish().expect("finish ok") {
+            out.extend_from_slice(&batch.buffer);
+        }
+        out
+    }
+
+    /// Regression for the O(n^2) carry re-scan: feed many small blocks under a
+    /// coalescing target large enough that several blocks accumulate before an
+    /// emit, forcing repeated drain/rebase of the trailing run in the
+    /// accumulator. Asserts the emitted bytes are exactly the input bytes, in
+    /// order, and no queryname run straddles a batch. The old implementation
+    /// re-scanned the entire carry on every call (correct output but quadratic);
+    /// this proves the accumulator path stays correct across many emits.
+    #[test]
+    fn queryname_cut_many_blocks_coalesce_without_losing_bytes() {
+        // 60 templates, each a 2-record run (paired reads), one template per
+        // block — so runs never straddle a single block but coalescing must
+        // hold several blocks before each emit.
+        let mut blocks = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..60u32 {
+            let name = format!("read{i:04}");
+            let r0 = named_record(name.as_bytes());
+            let r1 = named_record(name.as_bytes());
+            expected.extend_from_slice(&r0);
+            expected.extend_from_slice(&r1);
+            blocks.push(qn_block(&[r0, r1]));
+        }
+        // Coalesce ~4 blocks per emit.
+        let one_block_len = blocks[0].len();
+        let bytes = queryname_cut_bytes(&blocks, one_block_len * 4);
+        assert_eq!(bytes, expected, "coalescing dropped or reordered bytes");
+
+        // And the batch structure is closed under queryname.
+        let batches = queryname_cut_names(&blocks, one_block_len * 4).expect("cut ok");
+        qn_no_straddle(&batches);
+        let flat = qn_flat(&batches);
+        assert_eq!(flat.len(), 120, "every record emitted exactly once");
+    }
+
+    /// A run that spans several coalesced blocks is still carried whole: the
+    /// accumulator must not emit a partial run at a coalescing boundary. Ten
+    /// blocks all one run, then a block that ends it.
+    #[test]
+    fn queryname_cut_long_run_spanning_many_blocks_carried_whole() {
+        let mut blocks: Vec<Vec<u8>> =
+            (0..10).map(|_| qn_block(&[named_record(b"same")])).collect();
+        blocks.push(qn_block(&[named_record(b"next")]));
+        // A small coalescing target that a single block already exceeds — the
+        // run must still be held until it ends, never split mid-run.
+        let batches = queryname_cut_names(&blocks, 1).expect("cut ok");
+        qn_no_straddle(&batches);
+        let flat = qn_flat(&batches);
+        assert_eq!(flat.iter().filter(|n| n.as_slice() == b"same").count(), 10);
+        assert_eq!(flat.iter().filter(|n| n.as_slice() == b"next").count(), 1);
     }
 
     /// A header that never completes before EOF leaves the partial header in
