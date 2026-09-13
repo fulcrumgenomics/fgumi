@@ -22,7 +22,7 @@ use crate::read_structure::ReadStructure;
 use crate::commands::extract::{ExtractOptions, make_raw_records_from_fastq_set};
 use crate::fastq::FastqSet;
 use crate::pipeline::steps::process::ProcessOrdered;
-use crate::pipeline::steps::source::zip_fastq::FastqTemplateBatch;
+use crate::pipeline::steps::source::fastq_zip::FastqTemplateBatch;
 use crate::pipeline::steps::types::BamTemplateBatch;
 use crate::template::Template;
 

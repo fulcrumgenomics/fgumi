@@ -13,9 +13,11 @@ pub mod sampler;
 pub mod scheduler;
 pub mod stats;
 pub mod storage;
+pub mod telemetry;
 pub mod worker_core;
+pub mod worker_state;
 
-pub use contexts::{ChainContexts, build_chain_contexts, build_chain_contexts_fused};
+pub use contexts::{ChainContexts, StepCounters, build_chain_contexts, build_chain_contexts_fused};
 pub use detached::{
     DetachedDriverGroup, build_driver_storage, extract_detached_steps, run_detached_driver,
 };

@@ -19,11 +19,79 @@
 
 use std::any::Any;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::erased::ErasedStep;
 use crate::handles::{BranchInputHandle, OutputQueueSet};
 use crate::item::HeapSize;
 use crate::topology::{BranchIdx, ChainGraph, StepIdx};
+
+/// Per-step domain counters: one shared atomic per counter the step declared
+/// via [`crate::step::Step::counters`].
+///
+/// There is exactly ONE `StepCounters` per `step_idx` (stored in
+/// [`ChainContexts::step_counters`]); the driver hands every dispatch of that
+/// step — including all `Parallel` per-worker clones — the SAME
+/// `&StepCounters`, so their bumps aggregate into one shared atomic with no
+/// per-clone slots and no summing pass. The backing `Arc<[AtomicU64]>` lets a
+/// step's internal helper thread clone the handle and bump it too.
+///
+/// **Telemetry-off parity.** When telemetry is off, [`Self::disabled`] holds no
+/// slots (no allocation), and [`Self::add`] is a single load + branch — so a
+/// step may bump unconditionally without paying for atomics off-path.
+pub struct StepCounters {
+    /// `Some` when telemetry is on (one atomic per declared counter); `None`
+    /// when disabled (no allocation, every `add` a no-op).
+    slots: Option<Arc<[AtomicU64]>>,
+}
+
+impl StepCounters {
+    /// A disabled counter set: no slots, no allocation, every [`Self::add`] a
+    /// no-op. Used on the telemetry-off path and at every ctx construction site
+    /// that has no live counters.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self { slots: None }
+    }
+
+    /// Allocate `n` zeroed counter slots (one per declared [`crate::step::CounterSpec`]).
+    #[must_use]
+    pub fn new(n: usize) -> Self {
+        let slots: Arc<[AtomicU64]> = (0..n).map(|_| AtomicU64::new(0)).collect();
+        Self { slots: Some(slots) }
+    }
+
+    /// Add `n` to counter slot `idx`. No-op when disabled or `idx` is out of
+    /// range. `Relaxed` because counters are a pure monotonic tally read by the
+    /// sampler thread — no ordering relative to other memory is required.
+    #[inline]
+    pub fn add(&self, idx: usize, n: u64) {
+        if let Some(slots) = self.slots.as_ref()
+            && let Some(slot) = slots.get(idx)
+        {
+            slot.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Number of counter slots (0 when disabled).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slots.as_ref().map_or(0, |s| s.len())
+    }
+
+    /// Whether this counter set has no slots (disabled, or declared zero counters).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Current cumulative value of counter slot `idx` (0 when disabled or out of
+    /// range). Read by the telemetry sampler once per tick.
+    #[must_use]
+    pub fn load(&self, idx: usize) -> u64 {
+        self.slots.as_ref().and_then(|s| s.get(idx)).map_or(0, |a| a.load(Ordering::Relaxed))
+    }
+}
 
 /// Per-step input + outputs handles. The worker loop hands these to
 /// `ErasedStepCtx` for each `try_run_erased` dispatch and to
@@ -47,6 +115,12 @@ pub struct ChainContexts {
     /// source. Empty when instrumentation is `Off`. Read by the occupancy
     /// sampler and the end-of-run edge report.
     pub edges: Vec<RegisteredEdge>,
+    /// `step_counters[step_idx]` — the ONE shared [`StepCounters`] for that step
+    /// (length always `n_steps`). Every dispatch of the step — all `Parallel`
+    /// clones included — is handed `&step_counters[step_idx.0]`, so their bumps
+    /// aggregate into one atomic. Each entry is [`StepCounters::disabled`] when
+    /// telemetry is off (no allocation), else `StepCounters::new(step.counters().len())`.
+    pub step_counters: Vec<StepCounters>,
 }
 
 /// One instrumented edge: its shared [`EdgeMetrics`](crate::runtime::metrics::EdgeMetrics)
@@ -109,13 +183,18 @@ pub struct RegisteredQueue {
 ///
 /// Panics if `graph.n_steps() != steps.len()` or if any non-source step
 /// has no producer (the builder's all-wired check should prevent this).
+/// `counters_enabled` allocates the per-step [`StepCounters`] atomics
+/// (`false` → every step gets [`StepCounters::disabled`], no allocation). Wired
+/// to `config.telemetry.is_some()` by `Pipeline::run` so the telemetry-off path
+/// allocates no counters.
 #[must_use]
 pub fn build_chain_contexts(
     steps: &[Box<dyn ErasedStep>],
     graph: &ChainGraph,
     level: crate::builder::InstrumentationLevel,
+    counters_enabled: bool,
 ) -> ChainContexts {
-    build_chain_contexts_inner(steps, graph, false, level)
+    build_chain_contexts_inner(steps, graph, false, level, counters_enabled)
 }
 
 /// Build the chain's per-step contexts with **direct** inter-step transports
@@ -137,8 +216,9 @@ pub fn build_chain_contexts_fused(
 ) -> ChainContexts {
     // Fusion is only chosen when instrumentation is off (see
     // `should_fuse_single_thread`), and the fused path registers no edges, so
-    // force `Off` regardless of the run's level.
-    build_chain_contexts_inner(steps, graph, true, crate::builder::InstrumentationLevel::Off)
+    // force `Off` regardless of the run's level. Fusion is also only chosen when
+    // telemetry is off, so counters are disabled here (no allocation).
+    build_chain_contexts_inner(steps, graph, true, crate::builder::InstrumentationLevel::Off, false)
 }
 
 /// Build the producer→consumer edge map (keyed by `(producer_step, branch)`)
@@ -162,7 +242,12 @@ fn build_consumer_map(
                 let (p, b) = find_producer(graph, StepIdx(consumer_idx));
                 m.insert((p.0, b.0), consumer_idx);
             }
-            2 => {
+            // Every multi-input consumer (Step2 with arity 2, StepK with arity
+            // >= 3) registers all its incoming edges the same way — one loop
+            // over the arity-K producer vec. Folding these into one arm is what
+            // keeps arity-3+ edges visible to instrumentation instead of being
+            // silently dropped by a `_ => {}` catch-all.
+            k if k >= 2 => {
                 for (p, b) in find_all_producers(graph, StepIdx(consumer_idx)) {
                     m.insert((p.0, b.0), consumer_idx);
                 }
@@ -173,11 +258,74 @@ fn build_consumer_map(
     m
 }
 
+/// Build the type-erased input handle for one consumer step, dispatching on its
+/// input shape: a source gets a drained unit handle; a homogeneous `StepK`
+/// (any K, including K == 2) gets a `KInputHandles<T>`; a heterogeneous `Step2`
+/// gets a `TwoInputHandles<A, B>`; a single-input step gets one handle.
+///
+/// Extracted from `build_chain_contexts_inner`'s Pass-2 loop so that pass stays
+/// within the per-function line budget; the dispatch logic is unchanged.
+fn build_one_input_handle(
+    step: &dyn ErasedStep,
+    graph: &ChainGraph,
+    consumer_idx: usize,
+    output_sets: &mut [OutputQueueSet],
+) -> Box<dyn Any + Send + Sync> {
+    if step.is_source() {
+        // Source step (Input = ()). A permanently-drained dummy unit handle —
+        // the worker loop never pops from it. Chains with multiple sources
+        // (e.g. K per-stream FASTQ readers, or zipper's mapped + unmapped
+        // subchains) all take this path; the runtime walks every source to
+        // Finished independently.
+        return dummy_unit_input_handle();
+    }
+    // A homogeneous `StepK` builds its inputs as a `KInputHandles<T>` regardless
+    // of arity — including K == 2, which shares `input_arity` with a
+    // heterogeneous `Step2` but needs the K builder, not `TwoInputHandles<A, B>`.
+    // Dispatch on `builds_k_inputs()` first so the arity-2 collision resolves.
+    if step.builds_k_inputs() {
+        let edges = find_all_producers(graph, StepIdx(consumer_idx));
+        let arity = step.input_arity();
+        assert_eq!(
+            edges.len(),
+            arity,
+            "StepK consumer {:?} expects {arity} input edges, found {}",
+            StepIdx(consumer_idx),
+            edges.len()
+        );
+        let slots: Vec<(usize, usize)> = edges.iter().map(|(p, b)| (p.0, b.0)).collect();
+        return step.build_k_input_handles(output_sets, &slots);
+    }
+    match step.input_arity() {
+        1 => {
+            let (producer_idx, branch_idx) = find_producer(graph, StepIdx(consumer_idx));
+            step.build_input_handle(&mut output_sets[producer_idx.0], branch_idx.0)
+        }
+        2 => {
+            let edges = find_all_producers(graph, StepIdx(consumer_idx));
+            assert_eq!(
+                edges.len(),
+                2,
+                "Step2 consumer {:?} expects 2 input edges, found {}",
+                StepIdx(consumer_idx),
+                edges.len()
+            );
+            let (p0, p0_branch) = edges[0];
+            let (p1, p1_branch) = edges[1];
+            step.build_two_input_handles(output_sets, p0.0, p0_branch.0, p1.0, p1_branch.0)
+        }
+        n => {
+            panic!("unsupported input_arity {n} for non-StepK step {:?}", StepIdx(consumer_idx))
+        }
+    }
+}
+
 fn build_chain_contexts_inner(
     steps: &[Box<dyn ErasedStep>],
     graph: &ChainGraph,
     direct: bool,
     level: crate::builder::InstrumentationLevel,
+    counters_enabled: bool,
 ) -> ChainContexts {
     assert_eq!(steps.len(), graph.n_steps(), "chain length mismatch");
 
@@ -252,42 +400,8 @@ fn build_chain_contexts_inner(
     // — one per consumer-input-slot — and wrap them in a
     // `TwoInputHandles<A, B>`.
     for (consumer_idx, step) in steps.iter().enumerate() {
-        let input_box = if step.is_source() {
-            // Source step (Input = ()). Build a permanently-drained
-            // dummy unit handle — the worker loop never pops from it.
-            // Chains with multiple sources (e.g. zipper's mapped +
-            // unmapped subchains converging at a Step2 merger) all
-            // share this code path; the runtime walks every source
-            // independently to Finished.
-            dummy_unit_input_handle()
-        } else {
-            match step.input_arity() {
-                1 => {
-                    let (producer_idx, branch_idx) = find_producer(graph, StepIdx(consumer_idx));
-                    step.build_input_handle(&mut output_sets[producer_idx.0], branch_idx.0)
-                }
-                2 => {
-                    let edges = find_all_producers(graph, StepIdx(consumer_idx));
-                    assert_eq!(
-                        edges.len(),
-                        2,
-                        "Step2 consumer {:?} expects 2 input edges, found {}",
-                        StepIdx(consumer_idx),
-                        edges.len()
-                    );
-                    let (p0, p0_branch) = edges[0];
-                    let (p1, p1_branch) = edges[1];
-                    step.build_two_input_handles(
-                        &mut output_sets,
-                        p0.0,
-                        p0_branch.0,
-                        p1.0,
-                        p1_branch.0,
-                    )
-                }
-                n => panic!("unsupported input_arity {n} for step {:?}", StepIdx(consumer_idx)),
-            }
-        };
+        let input_box =
+            build_one_input_handle(step.as_ref(), graph, consumer_idx, &mut output_sets);
         inputs.push(input_box);
     }
 
@@ -295,7 +409,16 @@ fn build_chain_contexts_inner(
     // exactly once via `build_input_handle`, leaving placeholder slots.
     drop(output_sets);
 
-    ChainContexts { inputs, outputs, bounded_queues, edges }
+    // One shared `StepCounters` per step (length == n_steps). Disabled (no
+    // allocation) when telemetry is off; otherwise sized to the step's declared
+    // counter count so every dispatch of the step shares one atomic per counter.
+    let step_counters: Vec<StepCounters> = if counters_enabled {
+        steps.iter().map(|s| StepCounters::new(s.counters().len())).collect()
+    } else {
+        steps.iter().map(|_| StepCounters::disabled()).collect()
+    };
+
+    ChainContexts { inputs, outputs, bounded_queues, edges, step_counters }
 }
 
 /// Construct a `BranchInputHandle<()>` that's already drained — for source
@@ -566,7 +689,8 @@ mod tests {
     #[case(4)]
     fn build_chain_contexts_linear(#[case] n: usize) {
         let (steps, graph) = linear_chain(n);
-        let ctx = build_chain_contexts(&steps, &graph, crate::builder::InstrumentationLevel::Off);
+        let ctx =
+            build_chain_contexts(&steps, &graph, crate::builder::InstrumentationLevel::Off, false);
         assert_linear_chain_invariants(&ctx, n);
     }
 
@@ -601,7 +725,7 @@ mod tests {
         use crate::builder::InstrumentationLevel as L;
         // Source → Middle → Sink: two producing edges, each with a consumer.
         let (steps, graph) = linear_chain(3);
-        let ctx = build_chain_contexts(&steps, &graph, L::Summary);
+        let ctx = build_chain_contexts(&steps, &graph, L::Summary, false);
         assert_eq!(ctx.edges.len(), 2, "every bounded producing edge is registered");
         // Identity, not just presence. Labelling each edge with its own consumer is
         // the whole job of `build_consumer_map`, and a count-plus-`is_some()` check
@@ -627,7 +751,7 @@ mod tests {
         }
         // Off → no edges registered (zero-overhead path).
         let (steps, graph) = linear_chain(3);
-        let off = build_chain_contexts(&steps, &graph, L::Off);
+        let off = build_chain_contexts(&steps, &graph, L::Off, false);
         assert!(off.edges.is_empty(), "level Off registers no edges");
     }
 
@@ -637,7 +761,7 @@ mod tests {
         #[test]
         fn build_chain_contexts_linear_invariants(n in 2usize..=8) {
             let (steps, graph) = linear_chain(n);
-            let ctx = build_chain_contexts(&steps, &graph, crate::builder::InstrumentationLevel::Off);
+            let ctx = build_chain_contexts(&steps, &graph, crate::builder::InstrumentationLevel::Off, false);
             assert_linear_chain_invariants(&ctx, n);
         }
     }

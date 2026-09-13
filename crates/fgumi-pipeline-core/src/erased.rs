@@ -29,9 +29,10 @@ use super::outputs::StepOutputs;
 use super::reorder::BranchOrdering;
 use super::signal::PipelineSignal;
 use super::step::{
-    Affinity, DetachedGroup, OutputHandles, OutputsViewAny, Step, StepCtx, StepKind, StepOutcome,
-    StepProfile,
+    Affinity, CounterSpec, DetachedGroup, OutputHandles, OutputsViewAny, Step, StepCtx, StepKind,
+    StepOutcome, StepProfile,
 };
+use crate::runtime::contexts::StepCounters;
 
 /// The branch orderings the framework actually *builds* for a single-input
 /// producer of the given [`StepKind`], given its declared profile orderings.
@@ -123,6 +124,14 @@ pub trait ErasedStep: Send + 'static {
     /// meaningful for `Detached` kinds.
     fn detached_group(&self) -> DetachedGroup;
 
+    /// Forward `Step::counters` / `Step2::counters` — the domain counters this
+    /// step declares. Read at chain-build time to size the step's shared
+    /// [`StepCounters`] slots and populate the telemetry counter-name file.
+    /// Defaults to `&[]` (adapters override to forward `inner.counters()`).
+    fn counters(&self) -> &'static [CounterSpec] {
+        &[]
+    }
+
     /// Dispatch `S::try_run` after downcasting queue handles.
     ///
     /// # Errors
@@ -153,6 +162,20 @@ pub trait ErasedStep: Send + 'static {
         1
     }
 
+    /// Whether this adapter builds its inputs as a homogeneous
+    /// [`crate::handles::KInputHandles<T>`] (via [`Self::build_k_input_handles`])
+    /// rather than a heterogeneous [`crate::handles::TwoInputHandles<A, B>`]
+    /// (via [`Self::build_two_input_handles`]).
+    ///
+    /// This disambiguates the two multi-input construction paths at
+    /// `input_arity() == 2`, where a two-input [`crate::step::Step2`] and a
+    /// homogeneous [`crate::step::StepK`] with K == 2 have the same arity but
+    /// need different builders. Default `false` (single-input `Step` and
+    /// `Step2` adapters); `TypedStepK` overrides to `true`.
+    fn builds_k_inputs(&self) -> bool {
+        false
+    }
+
     /// Take ownership of TWO consumer input handles from two
     /// upstream output queue sets, paired into a typed
     /// [`crate::handles::TwoInputHandles<A, B>`]
@@ -181,6 +204,37 @@ pub trait ErasedStep: Send + 'static {
              construction. This is a framework bug — chain-build code \
              should only dispatch arity-2 input construction to steps \
              that override `input_arity` to return 2.",
+            p.name, p.kind
+        );
+    }
+
+    /// Take ownership of K consumer input handles from K upstream output
+    /// queue sets, paired into a typed [`crate::handles::KInputHandles<T>`]
+    /// per the consumer's [`crate::step::StepK`] `Input` type.
+    ///
+    /// `edges[i] = (producer_idx, producer_branch)` feeds the consumer's input
+    /// slot `i`, in slot order (`edges.len() == input_arity()`). Unlike
+    /// [`Self::build_two_input_handles`], each edge is taken from a **distinct**
+    /// `producer_sets[producer_idx]` one at a time, so there is no simultaneous
+    /// disjoint-borrow problem — a plain sequential loop suffices.
+    ///
+    /// Default impl panics; only `TypedStepK<S>` overrides.
+    ///
+    /// # Panics
+    ///
+    /// Default impl always panics; K-input adapters override.
+    fn build_k_input_handles(
+        &self,
+        _producer_sets: &mut [OutputQueueSet],
+        _edges: &[(usize, usize)],
+    ) -> Box<dyn Any + Send + Sync> {
+        let p = self.profile();
+        panic!(
+            "build_k_input_handles called on '{}' (kind = {:?}); \
+             only StepK adapters (`TypedStepK`) support arity-K input \
+             construction. This is a framework bug — chain-build code should \
+             only dispatch arity-K input construction to steps whose \
+             `input_arity` is > 2.",
             p.name, p.kind
         );
     }
@@ -256,6 +310,10 @@ pub struct ErasedStepCtx<'a> {
     pub outputs: &'a (dyn Any + Send + Sync),
     /// Shared signal (error/cancel). Workers consult; steps don't directly.
     pub signal: &'a Arc<PipelineSignal>,
+    /// This step's shared [`StepCounters`] (`&contexts.step_counters[step_idx]`).
+    /// The adapter forwards it into `StepCtx`/`StepCtx2` so the step body can
+    /// bump its declared counters.
+    pub counters: &'a StepCounters,
 }
 
 /// Adapter that wraps a concrete `Step` impl as an `ErasedStep`.
@@ -475,10 +533,15 @@ where
         self.inner.detached_group()
     }
 
+    fn counters(&self) -> &'static [CounterSpec] {
+        self.inner.counters()
+    }
+
     fn try_run_erased(&mut self, ctx: &mut ErasedStepCtx<'_>) -> io::Result<StepOutcome> {
+        let counters = ctx.counters;
         let input = self.resolve_input(ctx);
         let outputs = self.resolve_outputs(ctx);
-        let mut step_ctx = StepCtx { input, outputs };
+        let mut step_ctx = StepCtx { input, outputs, counters };
         self.inner.try_run(&mut step_ctx)
     }
 
@@ -742,10 +805,15 @@ impl<S: Step2> ErasedStep for TypedStep2<S> {
         self.inner.detached_group()
     }
 
+    fn counters(&self) -> &'static [CounterSpec] {
+        self.inner.counters()
+    }
+
     fn try_run_erased(&mut self, ctx: &mut ErasedStepCtx<'_>) -> io::Result<StepOutcome> {
+        let counters = ctx.counters;
         let inputs = self.resolve_inputs(ctx);
         let outputs = self.resolve_outputs(ctx);
-        let mut typed_ctx = StepCtx2::<S> { a: &inputs.a, b: &inputs.b, outputs };
+        let mut typed_ctx = StepCtx2::<S> { a: &inputs.a, b: &inputs.b, outputs, counters };
         self.inner.try_run(&mut typed_ctx)
     }
 
@@ -883,6 +951,272 @@ impl<S: Step2> ErasedStep for TypedStep2<S> {
     fn is_source(&self) -> bool {
         // Step2 consumers are never sources by definition (they have
         // two non-unit input branches).
+        false
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TypedStepK<S> — adapter wrapping a homogeneous K-input `StepK` as an
+// `ErasedStep`. Same cached-handle pattern as `TypedStep` / `TypedStep2`: one
+// `&KInputHandles<S::Input>` cached after the first dispatch, plus the outputs
+// handle. Per dispatch it materializes the `&[&dyn InputHandle<T>]` slice
+// `StepCtxK` wants from the cached `KInputHandles` and lends it into the step.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use super::handles::KInputHandles;
+use super::step::{InputHandle, StepCtxK, StepK};
+
+/// Adapter wrapping a [`StepK`] impl as an [`ErasedStep`]. See the
+/// module-level cached-handle notes on [`TypedStep`]; the safety argument is
+/// identical (the `KInputHandles` box is owned by `ChainContexts`, which
+/// outlives every adapter, and each dispatch passes the same box for a given
+/// `step_idx`).
+pub struct TypedStepK<S: StepK> {
+    inner: S,
+    name: &'static str,
+    kind: StepKind,
+    sticky: bool,
+    cached_inputs: CachedHandle<KInputHandles<S::Input>>,
+    cached_outputs: CachedHandle<OutputHandles<S::Outputs>>,
+    _phantom: PhantomData<fn() -> S>,
+}
+
+impl<S: StepK> TypedStepK<S> {
+    pub fn new(step: S) -> Self {
+        let profile = step.profile();
+        let name = profile.name;
+        let kind = profile.kind;
+        let sticky = profile.sticky;
+        Self {
+            inner: step,
+            name,
+            kind,
+            sticky,
+            cached_inputs: None,
+            cached_outputs: None,
+            _phantom: PhantomData,
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn resolve_inputs<'a>(&mut self, ctx: &ErasedStepCtx<'a>) -> &'a KInputHandles<S::Input> {
+        if let Some((cached_addr, cached)) = self.cached_inputs {
+            // See `TypedStep::resolve_input` for why the address check is
+            // unconditional and the downcast re-check is debug-only.
+            assert_eq!(
+                erased_addr(ctx.input),
+                cached_addr,
+                "cached input handles do not match the dispatch context — a \
+                 TypedStepK was reused across two ChainContexts"
+            );
+            debug_assert!(
+                ctx.input
+                    .downcast_ref::<KInputHandles<S::Input>>()
+                    .is_some_and(|live| std::ptr::eq(live, cached)),
+                "cached input handles disagree with a fresh downcast of the same box"
+            );
+            // SAFETY: lifetime extension from `'static` (cache slot) back to
+            // `'a` (the dispatch context's lifetime). Same boxes/lifetimes
+            // story as `TypedStep2::resolve_inputs` — the box outlives every
+            // `TypedStepK<S>` instance (point-2/point-3 invariants on
+            // `TypedStep`).
+            return unsafe {
+                std::mem::transmute::<&KInputHandles<S::Input>, &'a KInputHandles<S::Input>>(cached)
+            };
+        }
+        let r: &'a KInputHandles<S::Input> = ctx
+            .input
+            .downcast_ref::<KInputHandles<S::Input>>()
+            .expect("input handles downcast failed — StepK chain topology invariant");
+        // SAFETY: lifetime extension `'a` → `'static` for storage; read back
+        // through `resolve_inputs` re-extends to a bounded `'a`. Same as
+        // `TypedStep2::resolve_inputs`.
+        let cached: &'static KInputHandles<S::Input> = unsafe {
+            std::mem::transmute::<&'a KInputHandles<S::Input>, &'static KInputHandles<S::Input>>(r)
+        };
+        self.cached_inputs = Some((erased_addr(ctx.input), cached));
+        r
+    }
+
+    #[allow(unsafe_code)]
+    fn resolve_outputs<'a>(&mut self, ctx: &ErasedStepCtx<'a>) -> &'a OutputHandles<S::Outputs> {
+        if let Some((cached_addr, cached)) = self.cached_outputs {
+            assert_eq!(
+                erased_addr(ctx.outputs),
+                cached_addr,
+                "cached outputs handle does not match the dispatch context — a \
+                 TypedStepK was reused across two ChainContexts"
+            );
+            debug_assert!(
+                ctx.outputs
+                    .downcast_ref::<OutputHandles<S::Outputs>>()
+                    .is_some_and(|live| std::ptr::eq(live, cached)),
+                "cached outputs handle disagrees with a fresh downcast of the same box"
+            );
+            // SAFETY: see `resolve_inputs`; same boxes/lifetimes story.
+            return unsafe {
+                std::mem::transmute::<&OutputHandles<S::Outputs>, &'a OutputHandles<S::Outputs>>(
+                    cached,
+                )
+            };
+        }
+        let r: &'a OutputHandles<S::Outputs> = ctx
+            .outputs
+            .downcast_ref::<OutputHandles<S::Outputs>>()
+            .expect("outputs handle downcast failed — StepK chain topology invariant");
+        // SAFETY: see `resolve_inputs`; same boxes/lifetimes story.
+        let cached: &'static OutputHandles<S::Outputs> = unsafe {
+            std::mem::transmute::<&'a OutputHandles<S::Outputs>, &'static OutputHandles<S::Outputs>>(
+                r,
+            )
+        };
+        self.cached_outputs = Some((erased_addr(ctx.outputs), cached));
+        r
+    }
+}
+
+impl<S: StepK> ErasedStep for TypedStepK<S> {
+    fn profile(&self) -> StepProfile {
+        self.inner.profile()
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn kind(&self) -> StepKind {
+        self.kind
+    }
+
+    fn sticky(&self) -> bool {
+        self.sticky
+    }
+
+    fn affinity(&self) -> Affinity {
+        self.inner.affinity()
+    }
+
+    fn detached_group(&self) -> DetachedGroup {
+        self.inner.detached_group()
+    }
+
+    fn counters(&self) -> &'static [CounterSpec] {
+        self.inner.counters()
+    }
+
+    fn try_run_erased(&mut self, ctx: &mut ErasedStepCtx<'_>) -> io::Result<StepOutcome> {
+        let counters = ctx.counters;
+        let inputs = self.resolve_inputs(ctx);
+        let outputs = self.resolve_outputs(ctx);
+        // Materialize the `&[&dyn InputHandle<T>]` slice per dispatch from the
+        // cached `KInputHandles`. This is a local `Vec` of K pointers (K ≤ ~4
+        // in practice), built fresh each call and dropped after `try_run` — it
+        // outlives `typed_ctx`, is not self-referential, and needs no transmute
+        // beyond the cached-handle one above. The K-pointer alloc is negligible
+        // against the per-dispatch pop/zip work; a small-array optimization is
+        // possible later if a profile ever shows it.
+        let refs: Vec<&dyn InputHandle<S::Input>> =
+            inputs.as_slice().iter().map(|h| h as &dyn InputHandle<S::Input>).collect();
+        let mut typed_ctx = StepCtxK::<S> { inputs: &refs, outputs, counters };
+        self.inner.try_run(&mut typed_ctx)
+    }
+
+    fn clone_boxed(&self) -> Box<dyn ErasedStep> {
+        Box::new(TypedStepK::new(self.inner.new_worker_copy()))
+    }
+
+    fn build_input_handle(
+        &self,
+        _producer_set: &mut OutputQueueSet,
+        _branch_idx: usize,
+    ) -> Box<dyn Any + Send + Sync> {
+        let p = self.profile();
+        panic!(
+            "build_input_handle called on StepK adapter '{}' (kind = {:?}); \
+             K-input steps build their inputs via build_k_input_handles. This \
+             is a framework bug — chain-build code should dispatch on \
+             input_arity().",
+            p.name, p.kind
+        );
+    }
+
+    fn input_arity(&self) -> usize {
+        self.inner.input_count()
+    }
+
+    fn builds_k_inputs(&self) -> bool {
+        true
+    }
+
+    fn build_k_input_handles(
+        &self,
+        producer_sets: &mut [OutputQueueSet],
+        edges: &[(usize, usize)],
+    ) -> Box<dyn Any + Send + Sync> {
+        // Each edge feeds a distinct consumer input slot and is taken from its
+        // own `producer_sets[producer_idx]` one at a time — a plain sequential
+        // loop, no simultaneous disjoint borrow (contrast `build_two_input_handles`,
+        // whose two-at-once take from a possibly-shared set needs `split_at_mut`).
+        // A repeated `(producer_idx, branch)` would be a duplicate wiring the
+        // topology layer already rejects, so distinctness is not re-checked here.
+        let handles: Vec<BranchInputHandle<S::Input>> = edges
+            .iter()
+            .map(|&(producer_idx, branch)| {
+                producer_sets[producer_idx].take_typed_input::<S::Input>(branch)
+            })
+            .collect();
+        Box::new(KInputHandles::<S::Input>::from_vec(handles))
+    }
+
+    fn build_output_set(
+        &self,
+        level: crate::builder::InstrumentationLevel,
+    ) -> (OutputQueueSet, OutputsViewAny) {
+        // Same reasoning as `TypedStep2::build_output_set`: a K-way merge
+        // interleaves K branches, so a `ByItemOrdinal` output that propagates an
+        // input ordinal could be pushed out of order even under serial
+        // execution — keep the reorder stage, do NOT apply the single-input
+        // collapse. (A `StepK` that mints its OWN dense sequential output
+        // ordinal, like the FASTQ zip, declares `BranchOrdering::None` in its
+        // profile and so opts out of a reorder stage entirely — that is a
+        // per-step profile choice, handled by `build_queues`, not a collapse
+        // rule here.)
+        let profile = self.inner.profile();
+        <S::Outputs as StepOutputs>::build_queues(
+            &profile.output_queues,
+            &profile.branch_ordering,
+            level,
+        )
+    }
+
+    fn build_fused_output_set(
+        &self,
+        _level: crate::builder::InstrumentationLevel,
+    ) -> (OutputQueueSet, OutputsViewAny) {
+        // `is_fusible_chain` rejects any step with `input_arity() > 1`, so a
+        // `StepK` (arity ≥ 2) never reaches the fused driver — same guard that
+        // covers `Step2`. Refuse rather than silently drop a merge's reorder.
+        panic!(
+            "build_fused_output_set called on StepK adapter '{}': a K-input \
+             merge is never fusible (input_arity > 1). This is a framework bug.",
+            self.name
+        );
+    }
+
+    fn wrap_outputs_view(&self, view: OutputsViewAny) -> Box<dyn Any + Send + Sync> {
+        let typed: OutputHandles<S::Outputs> = OutputHandles::<S::Outputs>::new(view);
+        Box::new(typed)
+    }
+
+    fn mark_outputs_drained(&self, outputs: &(dyn Any + Send + Sync)) {
+        let typed = outputs
+            .downcast_ref::<OutputHandles<S::Outputs>>()
+            .expect("mark_outputs_drained downcast failed — StepK chain topology invariant");
+        <S::Outputs as StepOutputs>::mark_all_drained(typed);
+    }
+
+    fn is_source(&self) -> bool {
+        // StepK consumers have K ≥ 2 non-unit input branches; never sources.
         false
     }
 }
@@ -1059,10 +1393,12 @@ mod tests {
         let consumer_outputs: OutputHandles<Single<u32>> = OutputHandles::new(consumer_view);
 
         let signal = PipelineSignal::new();
+        let no_counters = crate::runtime::contexts::StepCounters::disabled();
         let mut ctx = ErasedStepCtx {
             input: input_any.as_ref(),
             outputs: &consumer_outputs as &(dyn Any + Send + Sync),
             signal: &signal,
+            counters: &no_counters,
         };
         let outcome = consumer.try_run_erased(&mut ctx).unwrap();
         assert_eq!(outcome, StepOutcome::Progress);
@@ -1092,10 +1428,12 @@ mod tests {
         let consumer_outputs: OutputHandles<Single<u32>> = OutputHandles::new(consumer_view);
 
         let signal = PipelineSignal::new();
+        let no_counters = crate::runtime::contexts::StepCounters::disabled();
         let mut ctx = ErasedStepCtx {
             input: input_any.as_ref(),
             outputs: &consumer_outputs as &(dyn Any + Send + Sync),
             signal: &signal,
+            counters: &no_counters,
         };
         // First dispatch populates the cache; the second must hit it — and both
         // its unconditional box-address assert and the debug-only downcast
@@ -1135,14 +1473,23 @@ mod tests {
         let outputs_any = &consumer_outputs as &(dyn Any + Send + Sync);
 
         let signal = PipelineSignal::new();
+        let no_counters = crate::runtime::contexts::StepCounters::disabled();
         // First dispatch populates the cache from `first_input`.
-        let mut ctx =
-            ErasedStepCtx { input: first_input.as_ref(), outputs: outputs_any, signal: &signal };
+        let mut ctx = ErasedStepCtx {
+            input: first_input.as_ref(),
+            outputs: outputs_any,
+            signal: &signal,
+            counters: &no_counters,
+        };
         assert_eq!(consumer.try_run_erased(&mut ctx).unwrap(), StepOutcome::Progress);
 
         // Same step, different input box — the invariant violation.
-        let mut wrong_ctx =
-            ErasedStepCtx { input: second_input.as_ref(), outputs: outputs_any, signal: &signal };
+        let mut wrong_ctx = ErasedStepCtx {
+            input: second_input.as_ref(),
+            outputs: outputs_any,
+            signal: &signal,
+            counters: &no_counters,
+        };
         let _ = consumer.try_run_erased(&mut wrong_ctx);
     }
 
@@ -1157,10 +1504,12 @@ mod tests {
         let consumer_outputs: OutputHandles<Single<u32>> = OutputHandles::new(consumer_view);
 
         let signal = PipelineSignal::new();
+        let no_counters = crate::runtime::contexts::StepCounters::disabled();
         let mut ctx = ErasedStepCtx {
             input: input_any.as_ref(),
             outputs: &consumer_outputs as &(dyn Any + Send + Sync),
             signal: &signal,
+            counters: &no_counters,
         };
         let outcome = consumer.try_run_erased(&mut ctx).unwrap();
         assert_eq!(outcome, StepOutcome::NoProgress);
@@ -1334,10 +1683,12 @@ mod tests {
         let splitter_outputs: OutputHandles<(u32, u32)> = OutputHandles::new(splitter_view);
 
         let signal = PipelineSignal::new();
+        let no_counters = crate::runtime::contexts::StepCounters::disabled();
         let mut ctx = ErasedStepCtx {
             input: input_any.as_ref(),
             outputs: &splitter_outputs as &(dyn Any + Send + Sync),
             signal: &signal,
+            counters: &no_counters,
         };
 
         let outcome = splitter.try_run_erased(&mut ctx).unwrap();

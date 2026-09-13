@@ -48,7 +48,9 @@ use fgumi_pipeline_core::item::{HeapSize, Ordered};
 use fgumi_pipeline_core::outputs::{OrderedBytesSingle, Single};
 use fgumi_pipeline_core::queues::QueueSpec;
 use fgumi_pipeline_core::reorder::BranchOrdering;
-use fgumi_pipeline_core::step::{DetachedGroup, Step, StepCtx, StepKind, StepOutcome, StepProfile};
+use fgumi_pipeline_core::step::{
+    CounterSpec, DetachedGroup, Step, StepCtx, StepKind, StepOutcome, StepProfile,
+};
 use fgumi_pipeline_core::{HeldRetry, Unpushed};
 
 use crate::boundaries::bam_header_len;
@@ -95,6 +97,14 @@ const SCAN_PREFETCH_DISTANCE: usize = 2048;
 /// dwells on admit (fairness vs the group's other steps) and how far it runs
 /// ahead of the byte/count-bounded output queue (which backpressures early anyway).
 const ADMIT_BATCH: usize = 64;
+
+/// `ReadBlocks` counter slot index: BGZF blocks consumed from `ctx.input` this call.
+const READ_BLOCKS_BLOCKS: usize = 0;
+/// `ReadBlocks` counter slot index: compressed bytes consumed from `ctx.input` this call.
+const READ_BLOCKS_BYTES_READ: usize = 1;
+
+/// `FindBoundariesAndSort` counter slot index: record boundaries found this call.
+const FIND_BOUNDARIES_AND_SORT_RECORDS: usize = 0;
 
 /// Software-prefetch (read, into L1, temporal) the cache line containing `byte`.
 /// The `FindBoundariesAndSort` scan walks the run's arena cold (it was written by
@@ -427,12 +437,55 @@ impl Step for ReadBlocks {
         DetachedGroup::Shared(crate::sort::SORT_COORD_GROUP)
     }
 
-    // A single cohesive deferred-seal state machine: held-output retry, seal
-    // arming/execution, batched admit, and staged-emit drain are tightly coupled
-    // by `seal_pending` / `deferred_block` / `held` and are clearer read top to
-    // bottom than split across helpers that would each need the same state.
-    #[allow(clippy::too_many_lines)]
+    fn counters(&self) -> &'static [CounterSpec] {
+        const SPECS: &[CounterSpec] =
+            &[CounterSpec::new("blocks", "blocks"), CounterSpec::new("bytes_read", "bytes")];
+        SPECS
+    }
+
+    // `try_run` bumps the `blocks`/`bytes_read` counters exactly ONCE per call
+    // with the batch total (never per-record), after delegating the actual
+    // (long, multi-early-return) state machine to `try_run_inner` below.
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        let mut admitted_blocks: u64 = 0;
+        let mut admitted_bytes: u64 = 0;
+        let outcome = self.try_run_inner(ctx, &mut admitted_blocks, &mut admitted_bytes);
+        ctx.counters.add(READ_BLOCKS_BLOCKS, admitted_blocks);
+        ctx.counters.add(READ_BLOCKS_BYTES_READ, admitted_bytes);
+        outcome
+    }
+
+    fn new_worker_copy(&self) -> Self {
+        // Serial steps are never cloned by the framework; this is unreachable.
+        panic!("ReadBlocks is Serial — new_worker_copy should never be called")
+    }
+}
+
+impl ReadBlocks {
+    /// Body of [`Step::try_run`], factored out so the counter bump in the trait
+    /// method stays a single pair of calls regardless of which early-return path
+    /// below fires. `admitted_blocks`/`admitted_bytes` accumulate the batch total
+    /// for this call as blocks are popped from `ctx.input` (see step 5); the
+    /// caller bumps `ctx.counters` with the final tally after this returns.
+    ///
+    /// A single cohesive deferred-seal state machine: held-output retry, seal
+    /// arming/execution, batched admit, and staged-emit drain are tightly coupled
+    /// by `seal_pending` / `deferred_block` / `held` and are clearer read top to
+    /// bottom than split across helpers that would each need the same state —
+    /// hence the line count.
+    ///
+    /// Returns `io::Result` (rather than a bare `StepOutcome`) to stay
+    /// signature-symmetric with the `Step::try_run` it was extracted from, even
+    /// though no path here currently returns `Err` — a future error path (e.g. a
+    /// new `?`-fallible admit step) should be free to add one without having to
+    /// first change this function's return type.
+    #[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
+    fn try_run_inner(
+        &mut self,
+        ctx: &mut StepCtx<'_, Self>,
+        admitted_blocks: &mut u64,
+        admitted_bytes: &mut u64,
+    ) -> io::Result<StepOutcome> {
         // 1. Retry any held output first (backpressure path).
         if let Some(unpushed) = self.held.take() {
             match ctx.outputs.retry(unpushed) {
@@ -508,6 +561,12 @@ impl Step for ReadBlocks {
         let mut admitted_any = false;
         for _ in 0..ADMIT_BATCH {
             let Some(block) = ctx.input.pop() else { break };
+            // Count the block as consumed the moment it is popped — regardless
+            // of whether it is admitted immediately, deferred to a seal, or
+            // handed back on pool exhaustion below — since input consumption,
+            // not admission outcome, is what the counter tracks.
+            *admitted_blocks += 1;
+            *admitted_bytes += block.bytes.len() as u64;
             // A seal is armed from a previous block hitting the budget.  The
             // arrival of THIS block proves a following run exists, so it is safe
             // to seal the previous run as a disk spill (its straddler carry will
@@ -608,11 +667,6 @@ impl Step for ReadBlocks {
         }
 
         Ok(StepOutcome::Finished)
-    }
-
-    fn new_worker_copy(&self) -> Self {
-        // Serial steps are never cloned by the framework; this is unreachable.
-        panic!("ReadBlocks is Serial — new_worker_copy should never be called")
     }
 }
 
@@ -1176,6 +1230,11 @@ impl<S: ArenaSortStrategy> FindBoundariesAndSort<S> {
     /// CLAUDE.md §"Approved hot-path unsafe (parallel-inflate sort ingest,
     /// fgumi-pipeline-io)" for the full justification).
     ///
+    /// Returns the number of record boundaries found by this call's scan (the
+    /// `FindBoundariesAndSort` `records` counter's batch total) — zero when the
+    /// scan found no new complete record this call (e.g. still waiting on more
+    /// of a straddling record).
+    ///
     /// # Errors
     ///
     /// Returns an `io::Error` if:
@@ -1183,7 +1242,7 @@ impl<S: ArenaSortStrategy> FindBoundariesAndSort<S> {
     /// - A `block_size` value in the record stream overflows `u32`.
     /// - At seal: run 0's header never fully arrived, the carry exceeds `FRONT_REGION`,
     ///   or the final residual run ends mid-record (truncated BAM).
-    pub(crate) fn ingest_block(&mut self, block: &InflatedBlock) -> io::Result<()> {
+    pub(crate) fn ingest_block(&mut self, block: &InflatedBlock) -> io::Result<u64> {
         let block_end = block.offset + u64::from(block.len);
 
         if self.arena.is_none() {
@@ -1262,13 +1321,13 @@ impl<S: ArenaSortStrategy> FindBoundariesAndSort<S> {
 
         // Parse every record made complete by the bytes inflated so far, overlapping
         // the scan with the still-inflating tail of the run (Inflate‖Scan).
-        self.scan_available(&block.arena)?;
+        let run_records = self.scan_available(&block.arena)?;
 
         if block.is_last_of_run {
             self.seal_run(block.seals_to_spill, block.run_seq)?;
         }
 
-        Ok(())
+        Ok(run_records)
     }
 
     /// Parse every record that is fully present in `[scan_cursor, run_end)`, pushing
@@ -1286,10 +1345,14 @@ impl<S: ArenaSortStrategy> FindBoundariesAndSort<S> {
     /// inflated (`bam_header_len` returns `None`), the scan returns and retries on the
     /// next block.
     ///
+    /// Returns the number of record boundaries found by this call (0 when the
+    /// scan made no progress, e.g. waiting on more of a straddling record or the
+    /// BAM header).
+    ///
     /// # Errors
     ///
     /// Returns an `io::Error` on a `block_size` value that overflows `u32`.
-    fn scan_available(&mut self, arena: &PooledSegmentedBuf) -> io::Result<()> {
+    fn scan_available(&mut self, arena: &PooledSegmentedBuf) -> io::Result<u64> {
         let scan_start = self.scan_start;
         let scan_start_usize = usize::try_from(scan_start).expect("scan_start must fit in usize");
         let run_end_usize = usize::try_from(self.run_end).expect("run_end must fit in usize");
@@ -1311,7 +1374,7 @@ impl<S: ArenaSortStrategy> FindBoundariesAndSort<S> {
                     self.scan_cursor = scan_start + h as u64;
                     self.header_skipped = true;
                 }
-                None => return Ok(()),
+                None => return Ok(0),
             }
         }
 
@@ -1351,7 +1414,7 @@ impl<S: ArenaSortStrategy> FindBoundariesAndSort<S> {
         }
         self.scan_cursor = scan_start + cur as u64;
         self.total_records += run_records;
-        Ok(())
+        Ok(run_records)
     }
 
     /// Seal the current run: finalize the trailing carry, sort the refs accumulated
@@ -1566,6 +1629,11 @@ impl<S: ArenaSortStrategy> Step for FindBoundariesAndSort<S> {
         DetachedGroup::Shared(crate::sort::SORT_COORD_GROUP)
     }
 
+    fn counters(&self) -> &'static [CounterSpec] {
+        const SPECS: &[CounterSpec] = &[CounterSpec::new("records", "records")];
+        SPECS
+    }
+
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
         // Retry any held output first (backpressure path).
         if !self.flush_held(ctx) {
@@ -1584,7 +1652,10 @@ impl<S: ArenaSortStrategy> Step for FindBoundariesAndSort<S> {
 
         // Try to pop and ingest one InflatedBlock.
         if let Some(block) = ctx.input.pop() {
-            self.ingest_block(&block)?;
+            // Batch total for this call: one bump per `try_run`, from the scan's
+            // own record count rather than a per-record loop.
+            let n_records = self.ingest_block(&block)?;
+            ctx.counters.add(FIND_BOUNDARIES_AND_SORT_RECORDS, n_records);
             // If ingest_block sealed a run it may have staged events; drain them.
             if !self.pending.is_empty() {
                 return Ok(self.emit_pending(ctx));

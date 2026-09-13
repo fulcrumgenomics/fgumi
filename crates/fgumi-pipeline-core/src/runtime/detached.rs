@@ -322,6 +322,12 @@ pub fn build_driver_storage(
 /// end-of-stream signal). On a cancel before `Finished`, outputs are NOT closed
 /// (the run is tearing down; the recorded error/cancel is what propagates) —
 /// `run_worker_loop`'s top-of-loop `is_done` break upholds this.
+///
+/// `board` / `state_slot` — the per-thread state board for scheduling telemetry
+/// and this driver thread's slot in it; `None` (telemetry off) keeps stamping a
+/// no-op. Detached drivers take slots after the pool workers (`threads..`), so
+/// their slot never collides with a pool worker's.
+#[allow(clippy::too_many_arguments)] // one driver's worth of shared state plus the telemetry board/slot
 pub fn run_detached_driver(
     group: DetachedDriverGroup,
     contexts: &Arc<ChainContexts>,
@@ -329,6 +335,8 @@ pub fn run_detached_driver(
     signal: &Arc<PipelineSignal>,
     stats: Option<&Arc<PipelineStats>>,
     liveness: &crate::liveness::LivenessCounter,
+    board: Option<&crate::runtime::worker_state::WorkerStateBoard>,
+    state_slot: usize,
 ) {
     let primary = group.primary_step();
     let mut row = build_driver_storage(group.into_steps(), contexts.inputs.len());
@@ -342,6 +350,8 @@ pub fn run_detached_driver(
         stats,
         liveness,
         &DrainFirstScheduler,
+        board,
+        state_slot,
     );
 }
 
@@ -459,6 +469,7 @@ mod tests {
             outputs: vec![Box::new(()), det_outputs_any, Box::new(())],
             bounded_queues: vec![],
             edges: vec![],
+            step_counters: (0..3).map(|_| crate::runtime::StepCounters::disabled()).collect(),
         });
         (det, contexts, Arc::new(producer_outputs_any), det_output_consumer)
     }
@@ -483,6 +494,8 @@ mod tests {
             signal,
             None,
             &crate::liveness::LivenessCounter::new(1),
+            None,
+            0,
         );
     }
 

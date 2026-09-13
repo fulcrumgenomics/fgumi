@@ -278,3 +278,173 @@ fn all_announced_while_a_file_is_open_fails_closed() {
         Ok(_) => panic!("AllAnnounced while a spill file is open must error"),
     }
 }
+
+// ── Domain counter (T-BW2): spill_bytes_written, driven through a real pipeline ──
+
+/// `Exclusive` source draining a `Vec<SpillBlockEvent>`, one event per `try_run`.
+struct SpillEventSource {
+    events: Vec<SpillBlockEvent>,
+    held: HeldSlot<Unpushed<SpillBlockEvent>>,
+}
+
+impl Step for SpillEventSource {
+    type Input = ();
+    type Outputs = Single<SpillBlockEvent>;
+
+    fn profile(&self) -> StepProfile {
+        StepProfile {
+            name: "SpillEventSource",
+            kind: StepKind::Exclusive,
+            sticky: true,
+            output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 20 }],
+            branch_ordering: vec![BranchOrdering::None],
+        }
+    }
+
+    fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        if let Some(unpushed) = self.held.take()
+            && let Err(again) = ctx.outputs.retry(unpushed)
+        {
+            self.held.put(again);
+            return Ok(StepOutcome::Progress);
+        }
+        let Some(event) = self.events.pop() else {
+            return Ok(StepOutcome::Finished);
+        };
+        if let Err(unpushed) = ctx.outputs.push(event) {
+            self.held.put(unpushed);
+        }
+        Ok(StepOutcome::Progress)
+    }
+}
+
+/// Serial sink that sleeps briefly per received `SortPhase1Event` before
+/// recording it — mirroring `fgumi_pipeline_core::tests::CountingSink`'s
+/// per-item `thread::sleep`. `SpillWrite` (like `ReadBgzfBlocks` in
+/// `source::read_bam::tests::try_run_bumps_blocks_and_bytes_read_counters`) is
+/// the step under test and sits *upstream* of this sink, so it can burst
+/// through every spill file it writes well within the first sampler tick;
+/// throttling the terminal sink (rather than `SpillWrite` itself, which is
+/// production code) keeps the run — and the sampler's window onto it — open
+/// long enough to observe `SpillWrite`'s counter at its frozen final value.
+struct ThrottledEventSink {
+    received: Arc<Mutex<Vec<SortPhase1Event>>>,
+}
+
+impl Step for ThrottledEventSink {
+    type Input = SortPhase1Event;
+    type Outputs = ();
+
+    fn profile(&self) -> StepProfile {
+        StepProfile {
+            name: "ThrottledEventSink",
+            kind: StepKind::Serial,
+            sticky: false,
+            output_queues: vec![],
+            branch_ordering: vec![],
+        }
+    }
+
+    fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        match ctx.input.pop() {
+            Some(event) => {
+                std::thread::sleep(std::time::Duration::from_micros(300));
+                self.received.lock().push(event);
+                Ok(StepOutcome::Progress)
+            }
+            None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+            None => Ok(StepOutcome::NoProgress),
+        }
+    }
+}
+
+/// Drives `SpillEventSource -> SpillWrite -> ThrottledEventSink` with telemetry
+/// enabled and asserts `SpillWrite`'s `spill_bytes_written` counter lands in the
+/// telemetry files with a sane, bounded value: `N_FILES` single-block spill
+/// files, each producing exactly one `SpillReady` for the sink to (slowly)
+/// drain.
+#[test]
+fn try_run_bumps_spill_bytes_written_counter() {
+    use fgumi_pipeline_core::builder::{InstrumentationLevel, Pipeline, PipelineConfig};
+    use fgumi_pipeline_core::runtime::telemetry::TelemetryConfig;
+    use std::time::Duration;
+
+    const N_FILES: u32 = 30;
+    const RAW_LEN: usize = 32;
+    let codec = SpillCodec::Zstd;
+
+    let dir = TempDir::new().unwrap();
+    let alloc = TmpDirAllocator::new(vec![dir.path().to_path_buf()]).unwrap();
+    let writer = SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, 1 << 20, Arc::new(Vec::new()));
+
+    let mut compressed_lens: Vec<u64> = Vec::with_capacity(N_FILES as usize);
+    let mut events: Vec<SpillBlockEvent> = (0..N_FILES)
+        .map(|file_id| {
+            let fill = u8::try_from(file_id).expect("N_FILES fits in u8");
+            let compressed = compress(codec, &[fill; RAW_LEN]);
+            compressed_lens.push(compressed.len() as u64);
+            SpillBlockEvent::Block {
+                ordinal: u64::from(file_id),
+                file_id,
+                is_last_in_file: true,
+                records_ingested_so_far: u64::from(file_id) + 1,
+                bytes: compressed,
+            }
+        })
+        .collect();
+    events.reverse(); // `pop()` drains the tail first, so file_ids come out ascending.
+    let expected_bytes: u64 = compressed_lens.iter().sum();
+
+    let source = SpillEventSource { events, held: HeldSlot::new() };
+    let received: Arc<Mutex<Vec<SortPhase1Event>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = ThrottledEventSink { received: Arc::clone(&received) };
+
+    let telemetry_dir =
+        std::env::temp_dir().join(format!("fgumi-tbw2-spill-write-{}", std::process::id()));
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let stem = telemetry_dir.join("run");
+
+    let builder = Pipeline::builder();
+    builder.chain(source).chain(writer).chain(sink).into_sink_marker();
+    let pipeline = builder.build().expect("pipeline builds");
+    pipeline
+        .run(PipelineConfig {
+            threads: 1,
+            instrumentation: InstrumentationLevel::Summary,
+            telemetry: Some(TelemetryConfig {
+                stem: stem.clone(),
+                interval: Duration::from_millis(1),
+            }),
+            ..Default::default()
+        })
+        .expect("pipeline runs to completion");
+
+    // Ground truth, independent of the sampled telemetry file: one
+    // `SpillReady` per file reached the sink.
+    let collected = std::mem::take(&mut *received.lock());
+    assert_eq!(collected.len(), N_FILES as usize, "one SpillReady per spill file");
+
+    // `SpillWrite` is step index 1 (source=0, writer=1, sink=2).
+    let names = std::fs::read_to_string(telemetry_dir.join("run.ticks.counter_names.tsv")).unwrap();
+    let name_rows: Vec<&str> = names.lines().skip(1).filter(|l| l.starts_with("1\t")).collect();
+    assert_eq!(
+        name_rows,
+        vec!["1\t0\tspill_bytes_written\tbytes"],
+        "SpillWrite declares exactly one spill_bytes_written counter"
+    );
+
+    let counters = std::fs::read_to_string(telemetry_dir.join("run.ticks.counters.tsv")).unwrap();
+    let last_value = counters
+        .lines()
+        .skip(1)
+        .filter(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            f[2] == "1" && f[3] == "0"
+        })
+        .last()
+        .map(|l| l.split('\t').nth(5).unwrap().parse::<u64>().unwrap())
+        .expect("spill_bytes_written counter recorded at least once");
+    assert!(last_value > 0 && last_value <= expected_bytes, "last_value={last_value}");
+
+    std::fs::remove_dir_all(&telemetry_dir).ok();
+}

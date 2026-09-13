@@ -56,7 +56,7 @@ use crate::pipeline::core::item::{HeapSize, Ordered};
 use crate::pipeline::core::outputs::OrderedBytesSingle;
 use crate::pipeline::core::queues::QueueSpec;
 use crate::pipeline::core::reorder::BranchOrdering;
-use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
+use crate::pipeline::core::step::{CounterSpec, Step, StepCtx, StepKind, StepOutcome, StepProfile};
 use crate::pipeline::steps::types::DecodedRecordBatch;
 use fgumi_bam_io::Grouper;
 use fgumi_bam_io::MemoryEstimate;
@@ -64,6 +64,17 @@ use fgumi_bam_io::MemoryEstimate;
 /// Max input batches consumed per `try_run` invocation. Amortizes the
 /// `Serial` mutex acquisition; mirrors `GroupBam`'s `MAX_BATCHES_PER_LOCK`.
 const MAX_BATCHES_PER_LOCK: usize = 8;
+
+/// Counter slot index: records consumed this call.
+///
+/// NOTE: a `molecules` counter (distinct UMI/MI groups) is deliberately NOT
+/// wired here. `GroupByPosition` only forms *position* groups
+/// (`RawPositionGroup`) — the UMI-adjacency split into final MI/molecule
+/// groups happens downstream in `MiAssign`, which this step has no visibility
+/// into. Counting emitted `RawPositionGroup`s here would misrepresent them as
+/// molecules when a single position group can still split into several MI
+/// groups later. See T-BW2 report for the follow-up.
+const RECORDS: usize = 0;
 
 /// Default target batch count. Mirrors legacy's `template_batch_size: 500`
 /// adjusted for position-group granularity. Position grouping aggregates
@@ -241,7 +252,33 @@ impl Step for GroupByPosition {
         }
     }
 
+    fn counters(&self) -> &'static [CounterSpec] {
+        const SPECS: &[CounterSpec] = &[CounterSpec::new("records", "records")];
+        SPECS
+    }
+
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        // Batch total for this call, accumulated across every input batch
+        // consumed in the loop below; bumped exactly once regardless of which
+        // of `try_run_inner`'s several exit paths fires.
+        let mut records_this_call: u64 = 0;
+        let outcome = self.try_run_inner(ctx, &mut records_this_call);
+        ctx.counters.add(RECORDS, records_this_call);
+        outcome
+    }
+}
+
+impl GroupByPosition {
+    /// Body of `Step::try_run`, factored out so the counter bump in the trait
+    /// method stays a single call regardless of which early-return path below
+    /// fires. `records_this_call` accumulates the batch total (records
+    /// consumed) for this call; the caller bumps `ctx.counters` after this
+    /// returns.
+    fn try_run_inner(
+        &mut self,
+        ctx: &mut StepCtx<'_, Self>,
+        records_this_call: &mut u64,
+    ) -> io::Result<StepOutcome> {
         // 1. Drain held slot first.
         if let Some(unpushed) = self.held.take() {
             match ctx.outputs.retry(unpushed) {
@@ -269,6 +306,7 @@ impl Step for GroupByPosition {
             let Some(batch) = ctx.input.pop() else { break };
             did_work = true;
             let records = batch.into_records();
+            *records_this_call += records.len() as u64;
             let groups = self.grouper.add_records(records)?;
             self.accumulator.extend(groups);
             if self.accumulator.len() >= self.target_batch_count {
@@ -404,5 +442,212 @@ mod tests {
         let wrapped = BatchedRawPositionGroups::new(42, groups);
         assert_eq!(wrapped.ordinal(), 42);
         assert_eq!(wrapped.groups.len(), 1);
+    }
+
+    // ---------------------------------------------------------------------
+    // Domain counter (T-BW2): records, driven through a real pipeline
+    // ---------------------------------------------------------------------
+
+    /// Minimal single-end mapped primary record, distinguished only by
+    /// `qname`. Mirrors `pipeline::steps::chain_tests::single_end_record`.
+    fn single_end_record(qname: &[u8]) -> fgumi_raw_bam::RawRecord {
+        let mut b = fgumi_raw_bam::SamBuilder::new();
+        b.read_name(qname)
+            .flags(0)
+            .ref_id(0)
+            .pos(100)
+            .cigar_ops(&[4u32 << 4])
+            .sequence(b"ACGT")
+            .qualities(&[30u8; 4]);
+        b.build()
+    }
+
+    /// A single-end position key at `pos`. Mirrors
+    /// `pipeline::steps::chain_tests::position_key_at`.
+    fn position_key_at(pos: i32) -> fgumi_bam_io::GroupKey {
+        fgumi_bam_io::GroupKey { ref_id1: 0, pos1: pos, strand1: 0, ..Default::default() }
+    }
+
+    /// Wrap raw records (each paired with its pre-computed `GroupKey`) into a
+    /// `DecodedRecordBatch`. Mirrors
+    /// `pipeline::steps::chain_tests::decoded_batch_with_keys`.
+    fn decoded_batch_with_keys(
+        batch_serial: u64,
+        records: Vec<(fgumi_raw_bam::RawRecord, fgumi_bam_io::GroupKey)>,
+    ) -> DecodedRecordBatch {
+        DecodedRecordBatch::new(
+            batch_serial,
+            records
+                .into_iter()
+                .map(|(raw, key)| fgumi_bam_io::DecodedRecord::from_raw_bytes(raw, key))
+                .collect(),
+        )
+    }
+
+    /// `Exclusive` source draining a `Vec<DecodedRecordBatch>`, one batch per
+    /// `try_run`.
+    struct ReplaySource {
+        items: std::collections::VecDeque<DecodedRecordBatch>,
+        held: HeldSlot<Unpushed<DecodedRecordBatch>>,
+    }
+    impl Step for ReplaySource {
+        type Input = ();
+        type Outputs = OrderedBytesSingle<DecodedRecordBatch>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "ReplaySource",
+                kind: StepKind::Exclusive,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 20 }],
+                branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            if let Some(unpushed) = self.held.take() {
+                match ctx.outputs.retry(unpushed) {
+                    Ok(()) => {}
+                    Err(again) => {
+                        self.held.put(again);
+                        return Ok(StepOutcome::Progress);
+                    }
+                }
+            }
+            let Some(item) = self.items.pop_front() else { return Ok(StepOutcome::Finished) };
+            if let Err(unpushed) = ctx.outputs.push(item) {
+                self.held.put(unpushed);
+            }
+            Ok(StepOutcome::Progress)
+        }
+    }
+
+    /// Serial sink that sleeps briefly per received `BatchedRawPositionGroups`
+    /// before recording it — mirroring
+    /// `fgumi_pipeline_core::tests::CountingSink`'s per-item `thread::sleep`.
+    /// `GroupByPosition` is the step under test and sits upstream of this
+    /// sink, so it can burst through all its `try_run` calls well within the
+    /// first sampler tick (see
+    /// `fgumi_pipeline_io::source::read_bam::tests::try_run_bumps_blocks_and_bytes_read_counters`
+    /// for the same pattern applied to another upstream-of-the-sink counter);
+    /// throttling the terminal sink keeps the run open long enough for the
+    /// sampler to observe `GroupByPosition`'s counter at its frozen final
+    /// value.
+    struct ThrottledGroupSink {
+        received: std::sync::Arc<std::sync::Mutex<Vec<BatchedRawPositionGroups>>>,
+    }
+    impl Step for ThrottledGroupSink {
+        type Input = BatchedRawPositionGroups;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "ThrottledGroupSink",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(batch) => {
+                    std::thread::sleep(std::time::Duration::from_micros(300));
+                    self.received.lock().unwrap().push(batch);
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    /// Drives `ReplaySource -> GroupByPosition -> ThrottledGroupSink` with
+    /// telemetry enabled and asserts the `records` counter lands in the
+    /// telemetry files with the exact expected value: `N_RECORDS` single-end
+    /// mapped records across `N_POSITIONS` contiguous positions, split into
+    /// many small input batches (some straddling a position boundary) so
+    /// `GroupByPosition` sees many `try_run` calls. A small
+    /// `target_batch_count` forces several output batches, giving the
+    /// throttled sink several sleep opportunities.
+    #[test]
+    fn try_run_bumps_records_counter() {
+        use crate::pipeline::core::builder::{InstrumentationLevel, Pipeline, PipelineConfig};
+        use crate::pipeline::core::runtime::telemetry::TelemetryConfig;
+        use std::time::Duration;
+
+        const N_POSITIONS: usize = 50;
+        const RECORDS_PER_POSITION: usize = 4;
+        const N_RECORDS: usize = N_POSITIONS * RECORDS_PER_POSITION;
+        const RECORDS_PER_INPUT_BATCH: usize = 7; // deliberately not position-aligned
+
+        let records: Vec<(fgumi_raw_bam::RawRecord, fgumi_bam_io::GroupKey)> = (0..N_POSITIONS)
+            .flat_map(|p| {
+                let key = position_key_at(i32::try_from(100 + p * 10).expect("pos fits i32"));
+                (0..RECORDS_PER_POSITION)
+                    .map(move |r| (single_end_record(format!("p{p}_{r}").as_bytes()), key))
+            })
+            .collect();
+        assert_eq!(records.len(), N_RECORDS);
+
+        let batches: Vec<DecodedRecordBatch> = records
+            .chunks(RECORDS_PER_INPUT_BATCH)
+            .enumerate()
+            .map(|(i, chunk)| decoded_batch_with_keys(i as u64, chunk.to_vec()))
+            .collect();
+        assert!(batches.len() >= 20, "expected many small input batches, got {}", batches.len());
+
+        let source = ReplaySource { items: batches.into(), held: HeldSlot::new() };
+        let step = GroupByPosition::with_target_batch_count(1024 * 1024, 5);
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = ThrottledGroupSink { received: std::sync::Arc::clone(&received) };
+
+        let dir = std::env::temp_dir()
+            .join(format!("fgumi-tbw2-group-by-position-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let telemetry_stem = dir.join("run");
+
+        let builder = Pipeline::builder();
+        builder.chain(source).chain(step).chain(sink).into_sink_marker();
+        let pipeline = builder.build().expect("pipeline builds");
+        pipeline
+            .run(PipelineConfig {
+                threads: 1,
+                instrumentation: InstrumentationLevel::Summary,
+                telemetry: Some(TelemetryConfig {
+                    stem: telemetry_stem.clone(),
+                    interval: Duration::from_millis(1),
+                }),
+                ..Default::default()
+            })
+            .expect("pipeline runs to completion");
+
+        // Ground truth, independent of the sampled telemetry file: every
+        // consumed record must land in exactly one emitted group.
+        let collected = std::mem::take(&mut *received.lock().unwrap());
+        let total_out_records: usize =
+            collected.iter().flat_map(|b| &b.groups).map(|g| g.records.len()).sum();
+        assert_eq!(total_out_records, N_RECORDS, "every record reached the sink exactly once");
+
+        // `GroupByPosition` is step index 1 (source=0, step=1, sink=2).
+        let names = std::fs::read_to_string(dir.join("run.ticks.counter_names.tsv")).unwrap();
+        let name_rows: Vec<&str> = names.lines().skip(1).filter(|l| l.starts_with("1\t")).collect();
+        assert_eq!(
+            name_rows,
+            vec!["1\t0\trecords\trecords"],
+            "GroupByPosition declares exactly one records counter"
+        );
+
+        let counters = std::fs::read_to_string(dir.join("run.ticks.counters.tsv")).unwrap();
+        let last_value = counters
+            .lines()
+            .skip(1)
+            .filter(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                f[2] == "1" && f[3] == "0"
+            })
+            .last()
+            .map(|l| l.split('\t').nth(5).unwrap().parse::<u64>().unwrap())
+            .expect("records counter recorded at least once");
+        assert_eq!(last_value, N_RECORDS as u64, "records counter must equal the true total");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

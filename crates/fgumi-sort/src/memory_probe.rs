@@ -130,12 +130,17 @@ mod platform_ffi {
         Some(info.phys_footprint)
     }
 
+    /// Unsupported platform: RSS probing is unavailable here, so this always
+    /// returns `None`. (See the `macos` variant above for the metric rationale.)
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[must_use]
     pub fn process_rss_bytes() -> Option<u64> {
         None
     }
 
+    /// Linux: reads `VmRSS` from `/proc/self/status` (kibibytes) and returns it
+    /// in bytes. One short file read, no hot-path allocation beyond the status
+    /// string. Returns `None` if the field is absent or unparseable.
     #[cfg(target_os = "linux")]
     #[must_use]
     pub fn process_rss_bytes() -> Option<u64> {
