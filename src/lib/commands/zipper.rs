@@ -62,7 +62,7 @@ use fgumi_bam_io::{
     make_bgzf_reader,
 };
 use fgumi_raw_bam;
-use fgumi_raw_bam::{BAM_BASE_TO_ASCII, RawRecord, RawRecordView};
+use fgumi_raw_bam::{BAM_BASE_TO_ASCII, RawRecord, RawRecordView, TagBitset};
 use log::{debug, info};
 use noodles::core::Position;
 use noodles::sam::Header;
@@ -520,68 +520,6 @@ fn collect_mapped_indices(mapped: &Template, is_first_segment: bool) -> Vec<usiz
     indices
 }
 
-/// A membership set over two-byte SAM tag names, backed by a 256×256 bit table.
-///
-/// Replaces a `HashSet<String>` on the zipper hot path. `merge_raw` probes tag
-/// membership once per aux tag per mapped read; a `HashSet<String>` lookup there
-/// costs a `SipHash` of the tag name plus a UTF-8 conversion of the two raw tag
-/// bytes. A direct bit test on those two bytes removes both. Measured at ~23% of
-/// the per-record tag-copy loop on a consensus-config zipper (M3 Ultra), where
-/// the bitset also decisively beats a `HashSet<[u8; 2]>` (which still hashes).
-///
-/// All SAM tags are exactly two bytes, so only two-byte names are representable;
-/// any longer or shorter filter string can never equal a real tag and is dropped
-/// at construction — matching the pre-existing `tag_str.len() == 2` guard.
-///
-/// Membership is tested against the tag's **raw two bytes**. The prior code
-/// converted the bytes with `str::from_utf8(..).unwrap_or("")` before a
-/// `HashSet<String>` lookup; for spec-conforming tags (ASCII `[A-Za-z][A-Za-z0-9]`)
-/// the two are identical. They differ only for a non-UTF-8 tag byte pair (reachable
-/// only from a malformed BAM): the old path aliased it to the empty string and so
-/// could match an empty (`""`) filter, whereas here the raw bytes are matched
-/// directly and an empty filter — being length ≠ 2 — is never inserted. This is the
-/// intended behavior; do not reintroduce the UTF-8 conversion.
-#[derive(Debug, Clone)]
-struct TagBitset {
-    /// 256 × 256 = 65536 bits, one per possible `(byte0, byte1)` tag, packed into
-    /// 1024 `u64` words and indexed by `(byte0 << 8) | byte1`.
-    words: Box<[u64; 1024]>,
-}
-
-impl TagBitset {
-    fn new() -> Self {
-        Self { words: Box::new([0u64; 1024]) }
-    }
-
-    #[inline]
-    fn bit_index(tag: [u8; 2]) -> usize {
-        (usize::from(tag[0]) << 8) | usize::from(tag[1])
-    }
-
-    fn insert(&mut self, tag: [u8; 2]) {
-        let i = Self::bit_index(tag);
-        self.words[i >> 6] |= 1u64 << (i & 63);
-    }
-
-    #[inline]
-    fn contains(&self, tag: [u8; 2]) -> bool {
-        let i = Self::bit_index(tag);
-        (self.words[i >> 6] >> (i & 63)) & 1 != 0
-    }
-
-    /// Builds a bitset from tag-name strings, keeping only the two-byte names
-    /// (see the type doc).
-    fn from_names<'a>(names: impl IntoIterator<Item = &'a String>) -> Self {
-        let mut set = Self::new();
-        for name in names {
-            if let [b0, b1] = *name.as_bytes() {
-                set.insert([b0, b1]);
-            }
-        }
-        set
-    }
-}
-
 /// Precomputed tag lookups for `merge_raw`, built once per zipper run from the
 /// user's `TagInfo` and reused for every template. Building the bitsets once
 /// rather than per template is the entire reason this type exists.
@@ -592,30 +530,26 @@ impl TagBitset {
 /// paying the three-`TagBitset`-allocation cost on every template. Fields
 /// stay private — callers hold this opaquely.
 pub(crate) struct ZipperTags {
-    /// Two-byte tag names to remove from mapped reads (Step 2), pre-filtered to
-    /// exactly the two-byte names (mirrors the old `len() == 2` guard).
-    remove_list: Vec<[u8; 2]>,
-    /// Membership sets consulted while copying tags (Steps 3–4).
+    /// Membership sets consulted while removing (Step 2) and copying (Steps 3–4)
+    /// tags. `remove` is used both to drop the configured set from mapped reads
+    /// and to skip those keys when copying unmapped tags.
     remove: TagBitset,
     reverse: TagBitset,
     revcomp: TagBitset,
+    /// Whether the `remove` set has any members, cached once so the per-record
+    /// Step-2 rebuild can be skipped entirely when no tags are removed (the
+    /// common case) — matching the old no-op empty-`remove_list` loop.
+    has_remove: bool,
     /// Whether any reverse/revcomp transform is configured.
     has_transforms: bool,
 }
 
 impl ZipperTags {
     pub(crate) fn from_tag_info(tag_info: &TagInfo) -> Self {
-        let remove_list = tag_info
-            .remove
-            .iter()
-            .filter_map(|name| match *name.as_bytes() {
-                [b0, b1] => Some([b0, b1]),
-                _ => None,
-            })
-            .collect();
+        let remove = TagBitset::from_names(&tag_info.remove);
         Self {
-            remove_list,
-            remove: TagBitset::from_names(&tag_info.remove),
+            has_remove: !remove.is_empty(),
+            remove,
             reverse: TagBitset::from_names(&tag_info.reverse),
             revcomp: TagBitset::from_names(&tag_info.revcomp),
             has_transforms: tag_info.has_revs_or_revcomps(),
@@ -662,10 +596,20 @@ fn merge_raw_with(
     // Step 1: Fix mate info
     mapped.fix_mate_info()?;
 
-    // Step 2: Remove tags from mapped reads
-    for record in mapped.records_mut().iter_mut() {
-        for &tag_bytes in &tags.remove_list {
-            fgumi_raw_bam::remove_tag(record.as_mut_vec(), tag_bytes);
+    // Step 2: Remove the configured tag set from mapped reads. One single-pass
+    // aux rebuild per record (drop the remove-set, keep the rest) rather than a
+    // fresh O(aux) `remove_tag` scan per removed tag. Skipped entirely when no
+    // tags are configured for removal (the common case): rebuilding an aux only
+    // to re-emit it unchanged would cost an alloc + splice per record for
+    // nothing, whereas the old empty-`remove_list` loop was a no-op.
+    // NB: on a malformed aux, `rebuild_with` drops the unparseable tail (same
+    // tolerance as `AuxTagsIter`); the old per-tag `remove_tag` left it in
+    // place. This only affects out-of-spec records and is the fail-closed
+    // behaviour; valid records parse fully and are byte-identical.
+    if tags.has_remove {
+        for record in mapped.records_mut().iter_mut() {
+            fgumi_raw_bam::RawTagsEditor::from_vec(record.as_mut_vec())
+                .rebuild_with(&tags.remove, &[]);
         }
     }
 
@@ -679,85 +623,72 @@ fn merge_raw_with(
         // Use template's known indices instead of scanning all mapped records
         let mapped_indices = collect_mapped_indices(mapped, is_unpaired || is_first);
 
-        // Single pass to determine strand presence
-        let (has_pos, has_neg) = {
-            let rr = mapped.records();
-            let mut pos = false;
-            let mut neg = false;
-            for &i in &mapped_indices {
-                if (RawRecordView::new(&rr[i]).flags() & fgumi_raw_bam::flags::REVERSE) == 0 {
-                    pos = true;
-                } else {
-                    neg = true;
-                }
-                if pos && neg {
-                    break;
-                }
-            }
-            (pos, neg)
-        };
-
         // Collect unmapped tags once — avoids re-iterating `u.tags()` for every mapped record.
         let u_tags: Vec<fgumi_raw_bam::TagEntry<'_>> =
             RawRecordView::new(u).tags().iter().collect();
 
-        // Copy tags to positive strand reads
-        if has_pos {
+        // Pre-filter the copy set by the strand-independent conditions (skip the
+        // configured remove-set). `PG` is additionally skipped per record when
+        // the destination already carries a `PG`, so it is filtered below.
+        // `adds_no_pg` is the copy set for a destination that already has `PG`.
+        let adds_all: Vec<fgumi_raw_bam::TagEntry<'_>> =
+            u_tags.iter().copied().filter(|e| !tags.remove.contains(e.tag)).collect();
+        let adds_no_pg: Vec<fgumi_raw_bam::TagEntry<'_>> =
+            adds_all.iter().copied().filter(|e| e.tag != *SamTag::PG).collect();
+
+        // Nothing to copy from this unmapped read: skip the per-record rebuild
+        // (an alloc + splice that would only re-emit the aux unchanged). The QC
+        // flag transfer below still runs.
+        if adds_all.is_empty() {
+            let is_qc_fail = (u_flags & fgumi_raw_bam::flags::QC_FAIL) != 0;
             let rr = mapped.records_mut();
             for &i in &mapped_indices {
-                if (RawRecordView::new(&rr[i]).flags() & fgumi_raw_bam::flags::REVERSE) != 0 {
-                    continue;
-                }
-                let aux = fgumi_raw_bam::aux_data_slice(&rr[i]);
-                let has_pg = fgumi_raw_bam::find_tag_type(aux, SamTag::PG).is_some();
-
-                for entry in &u_tags {
-                    if entry.tag == *SamTag::PG && has_pg {
-                        continue;
-                    }
-                    if tags.remove.contains(entry.tag) {
-                        continue;
-                    }
-                    fgumi_raw_bam::remove_tag(rr[i].as_mut_vec(), entry.tag);
-                    append_raw_tag_entry(rr[i].as_mut_vec(), entry);
-                }
+                transfer_qc_flag(&mut rr[i], is_qc_fail);
             }
+            continue;
         }
 
-        // Copy tags to negative strand reads (with reverse/revcomp)
-        if has_neg {
-            let rr = mapped.records_mut();
-            for &i in &mapped_indices {
-                if (RawRecordView::new(&rr[i]).flags() & fgumi_raw_bam::flags::REVERSE) == 0 {
-                    continue;
-                }
-                let aux = fgumi_raw_bam::aux_data_slice(&rr[i]);
-                let has_pg = fgumi_raw_bam::find_tag_type(aux, SamTag::PG).is_some();
+        // Copy tags to each mapped record via one aux rebuild: drop the copied
+        // keys from the survivors (upsert) and append them, replacing the old
+        // per-tag `remove_tag`+`append` loop. Negative-strand reverse/revcomp
+        // then runs as a separate pass over the just-appended tags — behaviour
+        // identical to the interleaved form, since each transform locates its
+        // tag by key on the rebuilt aux.
+        let rr = mapped.records_mut();
+        for &i in &mapped_indices {
+            let is_reverse =
+                (RawRecordView::new(&rr[i]).flags() & fgumi_raw_bam::flags::REVERSE) != 0;
+            let has_pg =
+                fgumi_raw_bam::find_tag_type(fgumi_raw_bam::aux_data_slice(&rr[i]), SamTag::PG)
+                    .is_some();
+            let adds: &[fgumi_raw_bam::TagEntry<'_>] = if has_pg { &adds_no_pg } else { &adds_all };
 
-                // Aux offset is safe to cache here: `remove_tag` and `append_raw_tag_entry`
-                // only modify bytes within/after the aux region, so this offset stays valid.
+            fgumi_raw_bam::RawTagsEditor::from_vec(rr[i].as_mut_vec())
+                .rebuild_with(&[] as &[[u8; 2]], adds);
+
+            if is_reverse && has_transforms {
+                // Aux offset is stable across the transforms below: they only
+                // reorder bytes within a tag value, never change the aux length.
                 let aux_offset =
                     fgumi_raw_bam::aux_data_offset_from_record(&rr[i]).unwrap_or(rr[i].len());
-
-                for entry in &u_tags {
-                    if entry.tag == *SamTag::PG && has_pg {
+                for (idx, entry) in adds.iter().enumerate() {
+                    // `rebuild_with` deduped `adds` last-wins, so the rebuilt aux
+                    // holds one physical entry per key. Skip any add whose key
+                    // recurs later so the involutive reverse/revcomp is applied
+                    // exactly once (mirroring the dedup) — applying it twice on a
+                    // duplicate key would be a net no-op and diverge from the old
+                    // per-entry idiom.
+                    if adds[idx + 1..].iter().any(|b| b.tag == entry.tag) {
                         continue;
                     }
-                    if tags.remove.contains(entry.tag) {
-                        continue;
-                    }
-
-                    fgumi_raw_bam::remove_tag(rr[i].as_mut_vec(), entry.tag);
-                    append_raw_tag_entry(rr[i].as_mut_vec(), entry);
-
-                    if has_transforms && tags.reverse.contains(entry.tag) {
+                    if tags.reverse.contains(entry.tag) {
                         reverse_tag_in_place_raw_by_type(
                             &mut rr[i],
                             aux_offset,
                             entry.tag,
                             entry.type_byte,
                         );
-                    } else if has_transforms && tags.revcomp.contains(entry.tag) {
+                    } else if tags.revcomp.contains(entry.tag) {
                         revcomp_tag_in_place_raw_by_type(
                             &mut rr[i],
                             aux_offset,
@@ -773,13 +704,7 @@ fn merge_raw_with(
         let is_qc_fail = (u_flags & fgumi_raw_bam::flags::QC_FAIL) != 0;
         let rr = mapped.records_mut();
         for &i in &mapped_indices {
-            let mut f = RawRecordView::new(&rr[i]).flags();
-            if is_qc_fail {
-                f |= fgumi_raw_bam::flags::QC_FAIL;
-            } else {
-                f &= !fgumi_raw_bam::flags::QC_FAIL;
-            }
-            fgumi_raw_bam::set_flags(&mut rr[i], f);
+            transfer_qc_flag(&mut rr[i], is_qc_fail);
         }
     }
 
@@ -797,14 +722,16 @@ fn merge_raw_with(
     Ok(())
 }
 
-/// Appends a raw tag entry (tag + type byte + value bytes) to the destination record.
-///
-/// This is the raw-byte equivalent of `append_buf_value_raw` — it copies the already-encoded
-/// bytes directly without going through `BufValue` decoding/re-encoding. Thin wrapper over the
-/// shared [`fgumi_raw_bam::append_raw_tag`] primitive, preserving the entry's own tag identifier.
-#[inline]
-fn append_raw_tag_entry(dest: &mut Vec<u8>, entry: &fgumi_raw_bam::TagEntry<'_>) {
-    fgumi_raw_bam::append_raw_tag(dest, entry.tag, entry.type_byte, entry.value_bytes);
+/// Sets or clears the QC-fail flag on a mapped record to match its unmapped
+/// mate (Step 4). Shared by the tag-copy path and the no-tags-to-copy fast path.
+fn transfer_qc_flag(record: &mut RawRecord, is_qc_fail: bool) {
+    let mut f = RawRecordView::new(record).flags();
+    if is_qc_fail {
+        f |= fgumi_raw_bam::flags::QC_FAIL;
+    } else {
+        f &= !fgumi_raw_bam::flags::QC_FAIL;
+    }
+    fgumi_raw_bam::set_flags(record, f);
 }
 
 /// Applies the appropriate reverse operation for a tag in-place, dispatching on BAM type byte.
@@ -1860,6 +1787,7 @@ pub(crate) mod merge_step {
     mod tests {
         use super::*;
         use crate::pipeline::core::reorder::BranchOrdering;
+        use crate::sam::SamTag;
         use crate::umi::TagInfo;
         use noodles::sam::Header;
         use std::sync::Arc;
@@ -1975,6 +1903,66 @@ pub(crate) mod merge_step {
                     "XA must be removed (stale mapped copy + skipped on tag-copy)"
                 );
             }
+        }
+
+        /// The per-record `has_pg` branch in the tag-copy path: when the mapped
+        /// read already carries a `PG`, the unmapped read's `PG` must NOT copy
+        /// over it (the `adds_no_pg` set is used); when it does not, the unmapped
+        /// `PG` is copied in (the `adds_all` set). Every other test fixture
+        /// builds mapped reads without `PG`, so only the `adds_all` side ever
+        /// fired — this pins both.
+        #[test]
+        fn pg_already_on_mapped_read_blocks_the_unmapped_pg_copy() {
+            let step = ZipperMergeStep::new(make_cfg(false));
+
+            // Merge one mapped read (optionally pre-tagged with PG) against an
+            // unmapped read carrying PG:Z:unmapped-pg and XV:Z:keep; return the
+            // merged (PG, XV) values.
+            let merge = |mapped_pg: Option<&[u8]>| -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+                let mut mb = fgumi_raw_bam::SamBuilder::new();
+                mb.read_name(b"r").flags(0).sequence(b"ACGT").qualities(b"IIII");
+                if let Some(pg) = mapped_pg {
+                    mb.add_string_tag(*SamTag::PG, pg);
+                }
+                let mut mapped = Template::from_records(vec![mb.build()]).expect("mapped template");
+
+                let mut ub = fgumi_raw_bam::SamBuilder::new();
+                ub.read_name(b"r")
+                    .flags(fgumi_raw_bam::flags::UNMAPPED)
+                    .sequence(b"ACGT")
+                    .qualities(b"IIII")
+                    .add_string_tag(*SamTag::PG, b"unmapped-pg")
+                    .add_string_tag(*b"XV", b"keep");
+                let unmapped = Template::from_records(vec![ub.build()]).expect("unmapped template");
+
+                crate::commands::zipper::merge_one_template_with(
+                    &unmapped,
+                    &mut mapped,
+                    &step.tags,
+                    step.cfg.skip_tc_tags,
+                    step.cfg.reference.as_deref(),
+                    &step.cfg.output_header,
+                )
+                .expect("merge ok");
+
+                let rec = &mapped.records[0];
+                let aux = fgumi_raw_bam::fields::aux_data_slice(rec);
+                (
+                    fgumi_raw_bam::tags::find_string_tag(aux, *SamTag::PG).map(<[u8]>::to_vec),
+                    fgumi_raw_bam::tags::find_string_tag(aux, *b"XV").map(<[u8]>::to_vec),
+                )
+            };
+
+            // Mapped already has PG: it is preserved; the unmapped PG does not
+            // overwrite it, but the non-PG tag is still copied (adds_no_pg).
+            let (pg, xv) = merge(Some(b"mapped-pg"));
+            assert_eq!(pg.as_deref(), Some(&b"mapped-pg"[..]), "mapped PG kept (adds_no_pg)");
+            assert_eq!(xv.as_deref(), Some(&b"keep"[..]), "non-PG tag still copied");
+
+            // Mapped lacks PG: the unmapped PG is copied in (adds_all).
+            let (pg, xv) = merge(None);
+            assert_eq!(pg.as_deref(), Some(&b"unmapped-pg"[..]), "unmapped PG copied (adds_all)");
+            assert_eq!(xv.as_deref(), Some(&b"keep"[..]));
         }
     }
 }
@@ -2575,8 +2563,8 @@ mod tests {
         assert!(!one.contains([b'N', b'X']));
     }
 
-    /// `ZipperTags::from_tag_info` filters `remove_list` to two-byte names,
-    /// mirrors the three membership sets, and carries `has_transforms`.
+    /// `ZipperTags::from_tag_info` keeps only two-byte names in the `remove`
+    /// set, mirrors the three membership sets, and carries `has_transforms`.
     #[test]
     fn test_zipper_tags_from_tag_info() {
         let tag_info = TagInfo::new(
@@ -2586,9 +2574,10 @@ mod tests {
         );
         let tags = ZipperTags::from_tag_info(&tag_info);
 
-        // remove_list keeps only the two-byte name.
-        assert_eq!(tags.remove_list, vec![[b'N', b'M']]);
+        // The remove set keeps only the two-byte name; the 3+-byte "TOOLONG"
+        // can never be represented in the bitset and is dropped at construction.
         assert!(tags.remove.contains([b'N', b'M']));
+        assert!(!tags.remove.contains([b'T', b'O']));
 
         // reverse/revcomp mirror the expanded Consensus sets.
         for t in ["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq"] {
@@ -2604,7 +2593,7 @@ mod tests {
         // Empty TagInfo → no transforms.
         let empty = ZipperTags::from_tag_info(&TagInfo::new(vec![], vec![], vec![]));
         assert!(!empty.has_transforms);
-        assert!(empty.remove_list.is_empty());
+        assert!(!empty.remove.contains([b'N', b'M']));
     }
 
     #[test]
