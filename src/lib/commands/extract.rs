@@ -721,26 +721,35 @@ impl Extract {
         }
     }
 
-    /// Run extract on the declarative chain builder — the only execution path.
+    /// Hand-build the extract [`ChainSpec`] (FASTQ source → unmapped-BAM sink).
     ///
-    /// [`Command::execute`] always dispatches here, with or without `--threads`
-    /// (absent `--threads` runs the chain at a single worker). Hand-builds the
-    /// [`ChainSpec`] (rather than using [`ChainSpec::single_stage`], which is
+    /// Hand-built (rather than [`ChainSpec::single_stage`], which is
     /// BAM-in/BAM-out): the source is a FASTQ source —
     /// [`SourceSpec::InterleavedFastq`] for `--interleaved`, else
     /// [`SourceSpec::Fastqs`] — and the sink is a BAM. The chain opens its own
-    /// readers and detects the quality encoding in `ChainBuilder::open_source`;
-    /// `read_streams`/`verify_crc` are BAM-reader knobs and inert here (the FASTQ
-    /// source carries its CRC policy in [`ExtractOptions`]).
+    /// readers and detects the quality encoding in `ChainBuilder::open_source`.
+    ///
+    /// Split out from [`Self::execute_chain`] so the flag-derived spec fields —
+    /// notably the resolved CRC policy — can be unit-tested without running the
+    /// pipeline, mirroring `Sort::build_sort_chain_spec`.
+    ///
+    /// `read_streams` is a seekable-BAM knob and inert for a FASTQ source, but
+    /// `verify_crc` is NOT inert: the all-file BGZF parallel-decode split
+    /// (`ChainBuilder::build_bgzf_fastq_split` → `FastqDecompress`) reads it as
+    /// its per-block CRC32 policy. It is resolved here through the shared
+    /// [`resolve_check_crc`] so `--check-crc` / `--no-check-crc` reach that
+    /// decoder instead of it silently skipping verification.
     ///
     /// [`ChainSpec`]: crate::pipeline::chains::ChainSpec
     /// [`ChainSpec::single_stage`]: crate::pipeline::chains::ChainSpec::single_stage
     /// [`SourceSpec::Fastqs`]: crate::pipeline::chains::SourceSpec::Fastqs
     /// [`SourceSpec::InterleavedFastq`]: crate::pipeline::chains::SourceSpec::InterleavedFastq
-    fn execute_chain(&self, command_line: &str) -> Result<()> {
-        use crate::pipeline::chains::{
-            ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag, build_for,
-        };
+    /// [`resolve_check_crc`]: crate::commands::common::resolve_check_crc
+    fn build_extract_chain_spec(
+        &self,
+        command_line: &str,
+    ) -> Result<crate::pipeline::chains::ChainSpec> {
+        use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag};
 
         let read_structures = self.get_read_structures()?;
         let source = if self.interleaved {
@@ -752,7 +761,20 @@ impl Extract {
         let stage_opts =
             StageOptionsBag { extract: Some(self.to_extract_options()), ..Default::default() };
 
-        let spec = ChainSpec {
+        // `verify_crc` is consumed only by the all-file BGZF parallel-decode
+        // split; the fused reader path derives its own per-path policy directly
+        // from `check_crc`/`no_check_crc`. The split's eligibility gate
+        // guarantees every input is a non-stdin BGZF file, so
+        // `resolve_check_crc`'s stdin-trust branch never applies on that path —
+        // resolve against the first input (a real file whenever the split runs;
+        // the value is inert when the fused path handles the source).
+        let verify_crc = crate::commands::common::resolve_check_crc(
+            self.check_crc,
+            self.no_check_crc,
+            &self.inputs[0],
+        );
+
+        Ok(ChainSpec {
             stages: vec![Stage::Extract],
             source,
             sink: SinkSpec::Bam(self.output.clone()),
@@ -762,15 +784,19 @@ impl Extract {
             scheduler: self.scheduler_opts.clone(),
             queue_memory: self.queue_memory.clone(),
             async_reader: self.async_reader,
-            // Inert for a FASTQ source: `read_streams` is a seekable-BAM knob and
-            // `verify_crc` is the BAM BGZF-decode policy; the FASTQ source carries
-            // its own CRC policy in `ExtractOptions` (`check_crc`/`no_check_crc`).
             read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
-            verify_crc: false,
+            verify_crc,
             command_line: command_line.to_string(),
-        };
+        })
+    }
 
-        build_for(spec)?.run()
+    /// Run extract on the declarative chain builder — the only execution path.
+    ///
+    /// [`Command::execute`] always dispatches here, with or without `--threads`
+    /// (absent `--threads` runs the chain at a single worker). Builds the spec
+    /// via [`Self::build_extract_chain_spec`] and runs it.
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        crate::pipeline::chains::build_for(self.build_extract_chain_spec(command_line)?)?.run()
     }
 
     /// Get actual read structures (default to +T if none provided).
@@ -1903,9 +1929,15 @@ mod tests {
 
     /// A corrupted-CRC BGZF FASTQ must be rejected by default and with
     /// `--check-crc`, and read clean with `--no-check-crc` (#819). Parameterized
-    /// over threading so both BGZF decode paths are covered: single-threaded goes
-    /// through `open_fastq_reader`'s fgumi-bgzf arm, while `--threads N` decodes
-    /// the pure-BGZF input in the pipeline honoring `FastqPipelineConfig::verify_crc`.
+    /// over threading at both thread counts.
+    ///
+    /// NB: this small input is read in full during quality-encoding detection
+    /// (`sample_detection_quals`, which opens its own policy-honoring reader), so
+    /// the corrupted trailing block is caught there before the all-BGZF split
+    /// decoder runs. It therefore pins the command's end-to-end CRC behavior but
+    /// does NOT prove the split decoder itself honors the policy — that is
+    /// covered by `split_decoder_honors_check_crc_past_detection_window`, whose
+    /// corruption sits past the detection window.
     #[rstest]
     #[case::single_threaded(ThreadingOptions::none())]
     #[case::multi_threaded(ThreadingOptions::new(2))]
@@ -1947,6 +1979,83 @@ mod tests {
         let check_err = bgzf_crc_extract(input, out_check, threading, true, false)
             .execute("test")
             .expect_err("--check-crc must reject a corrupted BGZF FASTQ CRC32");
+        assert_crc_error_msg(&format!("{check_err:#}"));
+    }
+
+    /// `--check-crc` / `--no-check-crc` reach the extract `ChainSpec.verify_crc`
+    /// through the shared [`resolve_check_crc`] policy, so the all-file BGZF
+    /// parallel-decode split (`ChainBuilder::build_bgzf_fastq_split` →
+    /// `FastqDecompress`) honors the flags instead of silently skipping CRC
+    /// verification. The field was previously hardcoded `false`, disabling CRC
+    /// on that path regardless of the flags. Mirrors
+    /// `Sort::build_sort_chain_spec_resolves_verify_crc`.
+    #[rstest]
+    #[case::file_default_verifies(false, false, true)]
+    #[case::file_no_check_crc_skips(false, true, false)]
+    #[case::file_check_crc_verifies(true, false, true)]
+    fn build_extract_chain_spec_resolves_verify_crc(
+        #[case] check_crc: bool,
+        #[case] no_check_crc: bool,
+        #[case] expected: bool,
+    ) {
+        // A file path (never stdin) — the split's eligibility gate the field
+        // feeds only fires on real files, so the file-default policy applies.
+        let extract = bgzf_crc_extract(
+            PathBuf::from("in.fq.gz"),
+            PathBuf::from("out.bam"),
+            ThreadingOptions::none(),
+            check_crc,
+            no_check_crc,
+        );
+        let spec = extract
+            .build_extract_chain_spec("fgumi extract (test)")
+            .expect("spec build should succeed");
+        assert_eq!(spec.verify_crc, expected, "file input CRC policy on the FASTQ split");
+    }
+
+    /// End-to-end guard that the BGZF FASTQ split decoder itself honors the CRC
+    /// policy, not just that the spec carries it. `test_bgzf_fastq_honors_check_crc`
+    /// cannot prove this: its small input is fully read during quality-encoding
+    /// detection (`sample_detection_quals`, which opens its own policy-honoring
+    /// reader), so detection catches a corrupted trailing block before the split
+    /// decoder ever runs. Here the corruption sits far past the detection window
+    /// (`QUALITY_DETECTION_SAMPLE_SIZE` records / `BUFFER_SIZE` bytes), so only
+    /// the full split decode reaches it — isolating the decoder's own policy.
+    #[rstest]
+    #[case::single_threaded(ThreadingOptions::none())]
+    #[case::multi_threaded(ThreadingOptions::new(2))]
+    fn split_decoder_honors_check_crc_past_detection_window(#[case] threading: ThreadingOptions) {
+        // ~350k records * ~29 bytes ≈ 10 MiB uncompressed. Detection reads only
+        // ~1 MiB (BUFFER_SIZE) after sampling 400 records, so the corrupted last
+        // block is untouched by detection and reached only by the split decode.
+        const NUM_RECORDS: usize = 350_000;
+        let tmp = TempDir::new().expect("temp dir");
+        let input = create_bgzf_fastq(&tmp, "big.fq.gz", NUM_RECORDS);
+        corrupt_last_block_crc(&input);
+
+        // --no-check-crc: the split decoder skips the corrupted CRC32 and emits
+        // every record.
+        let out_ok = tmp.path().join("ok.bam");
+        bgzf_crc_extract(input.clone(), out_ok.clone(), threading.clone(), false, true)
+            .execute("test")
+            .expect("--no-check-crc must accept a corrupted trailing block on the split path");
+        assert_eq!(read_bam_records(&out_ok).len(), NUM_RECORDS, "all records extracted");
+
+        // Default (file => verify on): the split decoder rejects the corrupted
+        // trailing block. Before the fix, `verify_crc` was hardcoded `false` on
+        // the split, so this corruption was silently accepted.
+        let out_default = tmp.path().join("default.bam");
+        let default_err =
+            bgzf_crc_extract(input.clone(), out_default, threading.clone(), false, false)
+                .execute("test")
+                .expect_err("the split decoder must reject a corrupted CRC32 by default");
+        assert_crc_error_msg(&format!("{default_err:#}"));
+
+        // --check-crc: same rejection, explicitly requested.
+        let out_check = tmp.path().join("check.bam");
+        let check_err = bgzf_crc_extract(input, out_check, threading, true, false)
+            .execute("test")
+            .expect_err("the split decoder must reject a corrupted CRC32 under --check-crc");
         assert_crc_error_msg(&format!("{check_err:#}"));
     }
 
