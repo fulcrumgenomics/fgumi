@@ -83,6 +83,14 @@ pub struct DecodedRecordBatch {
     batch_serial: u64,
     records: Vec<DecodedRecord>,
     total_bytes: usize,
+    /// Whether every queryname run in this batch lies entirely within it (no
+    /// run shares a name with the last record of the previous batch or the
+    /// first of the next). Set by the queryname cutter via the decode step
+    /// (`with_closed_batches`); `false` by default. When `true`, a downstream
+    /// grouper can build templates per-batch with no cross-batch state. It is a
+    /// producer-side promise the consumer trusts but cannot itself verify — see
+    /// the parallel-queryname-grouping design.
+    closed_under_queryname: bool,
 }
 
 impl DecodedRecordBatch {
@@ -90,7 +98,21 @@ impl DecodedRecordBatch {
     pub fn new(batch_serial: u64, records: Vec<DecodedRecord>) -> Self {
         let total_bytes = records.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
             + container_bytes::<DecodedRecord>(records.capacity());
-        Self { batch_serial, records, total_bytes }
+        Self { batch_serial, records, total_bytes, closed_under_queryname: false }
+    }
+
+    /// Mark this batch closed under queryname (see the field docs). Called by a
+    /// decode step whose upstream cutter runs in `BatchCut::Queryname` mode.
+    #[must_use]
+    pub fn closed_under_queryname_marked(mut self, closed: bool) -> Self {
+        self.closed_under_queryname = closed;
+        self
+    }
+
+    /// Whether every queryname run lies entirely within this batch.
+    #[must_use]
+    pub fn closed_under_queryname(&self) -> bool {
+        self.closed_under_queryname
     }
 
     /// The batch's ordering serial.
