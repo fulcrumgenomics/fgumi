@@ -64,19 +64,61 @@ pub struct ReadSamState {
     /// drive the rejection path with a small cap instead of buffering a
     /// gigabyte; production callers get [`MAX_RECORD_BYTES`] via `new`.
     max_record_bytes: usize,
+    /// Batch cut mode. [`BatchCut::Record`] (default) splits at any line
+    /// boundary; [`BatchCut::Queryname`] carries the trailing partial queryname
+    /// run so every emitted chunk is closed under queryname (mirrors the BAM
+    /// `FindBamBoundaries` cut).
+    cut: crate::pipeline::steps::boundaries::state::BatchCut,
+    /// Coalescing target for `BatchCut::Queryname`: keep the closed prefix in
+    /// `leftover` until it reaches this many bytes before emitting. `0`
+    /// disables coalescing. Ignored for `Record`.
+    min_emit_bytes: usize,
+    /// QNAME of the last line in the most recently emitted chunk, under
+    /// `BatchCut::Queryname`. The next emitted chunk's first line must have a
+    /// different QNAME or the closed-under-queryname invariant is broken; the
+    /// self-check errors if not. Empty when nothing has been emitted yet.
+    last_emitted_qname: Vec<u8>,
 }
 
 impl ReadSamState {
     #[must_use]
     pub fn new(reader: Box<dyn BufRead + Send>) -> Self {
-        Self { reader, leftover: Vec::new(), eof: false, max_record_bytes: MAX_RECORD_BYTES }
+        Self {
+            reader,
+            leftover: Vec::new(),
+            eof: false,
+            max_record_bytes: MAX_RECORD_BYTES,
+            cut: crate::pipeline::steps::boundaries::state::BatchCut::Record,
+            min_emit_bytes: 0,
+            last_emitted_qname: Vec::new(),
+        }
+    }
+
+    /// Select the batch cut mode + coalescing target (see [`BatchCut`]).
+    #[must_use]
+    fn with_cut(
+        mut self,
+        cut: crate::pipeline::steps::boundaries::state::BatchCut,
+        min_emit_bytes: usize,
+    ) -> Self {
+        self.cut = cut;
+        self.min_emit_bytes = min_emit_bytes;
+        self
     }
 
     /// Construct with a custom newline-free span ceiling. Test-facing: it makes
     /// the `InvalidData` rejection reachable without a gigabyte of input.
     #[cfg(test)]
     fn with_max_record_bytes(reader: Box<dyn BufRead + Send>, max_record_bytes: usize) -> Self {
-        Self { reader, leftover: Vec::new(), eof: false, max_record_bytes }
+        Self {
+            reader,
+            leftover: Vec::new(),
+            eof: false,
+            max_record_bytes,
+            cut: crate::pipeline::steps::boundaries::state::BatchCut::Record,
+            min_emit_bytes: 0,
+            last_emitted_qname: Vec::new(),
+        }
     }
 
     /// Read the next chunk: append fresh bytes to `leftover`, split at the
@@ -131,66 +173,183 @@ impl ReadSamState {
         // span — exactly the input the ceiling below exists to reject, so the
         // rejection path was the slowest one. `scanned` marks how far the search
         // has already reached; everything before it is known newline-free.
-        let mut newline_at = memchr::memchr(b'\n', &self.leftover);
-        let mut scanned = if newline_at.is_some() { 0 } else { self.leftover.len() };
+        // In queryname mode, a chunk whose complete lines are all one open run
+        // closes nothing, so the cut carries everything and we must read MORE
+        // before we can emit. The read-loop break gate is `leftover.len() >=
+        // effective_target`, so once the cut carries everything we raise the
+        // target by `target_bytes` and loop, forcing another read (otherwise the
+        // gate stays satisfied by the already-buffered leftover and the reader
+        // never advances to EOF — an infinite loop). `Record` mode never carries
+        // a whole chunk, so `effective_target` stays at `target_bytes` there.
+        let mut effective_target = target_bytes;
+        loop {
+            let mut newline_at = memchr::memchr(b'\n', &self.leftover);
+            let mut scanned = if newline_at.is_some() { 0 } else { self.leftover.len() };
 
-        while !self.eof {
-            // Stop when we have enough bytes for the target AND at least
-            // one complete record sits in the buffer.
-            if self.leftover.len() >= target_bytes && newline_at.is_some() {
-                break;
-            }
-            let chunk = self.reader.fill_buf()?;
-            if chunk.is_empty() {
-                self.eof = true;
-                break;
-            }
-            let take = chunk.len();
-            self.leftover.extend_from_slice(&chunk[..take]);
-            self.reader.consume(take);
+            while !self.eof {
+                // Stop when we have enough bytes for the target AND at least
+                // one complete record sits in the buffer.
+                if self.leftover.len() >= effective_target && newline_at.is_some() {
+                    break;
+                }
+                let chunk = self.reader.fill_buf()?;
+                if chunk.is_empty() {
+                    self.eof = true;
+                    break;
+                }
+                let take = chunk.len();
+                self.leftover.extend_from_slice(&chunk[..take]);
+                self.reader.consume(take);
 
-            if newline_at.is_none() {
-                newline_at =
-                    memchr::memchr(b'\n', &self.leftover[scanned..]).map(|off| scanned + off);
                 if newline_at.is_none() {
-                    scanned = self.leftover.len();
+                    newline_at =
+                        memchr::memchr(b'\n', &self.leftover[scanned..]).map(|off| scanned + off);
+                    if newline_at.is_none() {
+                        scanned = self.leftover.len();
+                    }
+                }
+
+                // Guard against unbounded growth: if `leftover` exceeds the
+                // per-record ceiling while still containing no newline, the input
+                // is not newline-delimited SAM. Bail out instead of buffering the
+                // whole stream into memory. (Once a newline is present the loop
+                // breaks above, so this only fires on a genuinely newline-less span.)
+                if newline_at.is_none() && self.leftover.len() > self.max_record_bytes {
+                    let max = self.max_record_bytes;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "SAM record exceeds {max} bytes with no newline; \
+                         input does not appear to be newline-delimited SAM text"
+                        ),
+                    ));
                 }
             }
 
-            // Guard against unbounded growth: if `leftover` exceeds the
-            // per-record ceiling while still containing no newline, the input
-            // is not newline-delimited SAM. Bail out instead of buffering the
-            // whole stream into memory. (Once a newline is present the loop
-            // breaks above, so this only fires on a genuinely newline-less span.)
-            if newline_at.is_none() && self.leftover.len() > self.max_record_bytes {
-                let max = self.max_record_bytes;
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "SAM record exceeds {max} bytes with no newline; \
-                         input does not appear to be newline-delimited SAM text"
-                    ),
-                ));
+            if self.leftover.is_empty() {
+                // Reader is fully drained and nothing was held over.
+                return Ok(None);
             }
+
+            // At true EOF with leftover bytes: append a synthetic `\n` so the
+            // trailing partial line becomes a complete record. SAM tools
+            // traditionally accept files without a trailing newline.
+            if self.eof && !self.leftover.ends_with(b"\n") {
+                self.leftover.push(b'\n');
+            }
+
+            let (mut offsets, leftover_slice) = split_complete_lines(&self.leftover);
+            let mut split_at = self.leftover.len() - leftover_slice.len();
+
+            // Queryname cut: pull `split_at`/`offsets` back so the emitted chunk is
+            // closed under queryname — the trailing partial queryname run stays in
+            // `leftover` with the partial line, to be emitted once a differing
+            // QNAME proves the run ended (or at EOF). Mirrors the BAM cut.
+            if self.cut == crate::pipeline::steps::boundaries::state::BatchCut::Queryname {
+                self.apply_queryname_cut(&mut offsets, &mut split_at)?;
+                // Cut carried everything (nothing closed) and we are not at EOF:
+                // raise the target and read more so the reader advances toward a
+                // queryname boundary or EOF. Guaranteed to terminate — each pass
+                // either reads (draining toward EOF) or the growth reveals a
+                // boundary.
+                if split_at == 0 && !self.eof {
+                    effective_target = effective_target.saturating_add(target_bytes);
+                    continue;
+                }
+            }
+
+            let new_leftover = self.leftover.split_off(split_at);
+            let bytes = std::mem::replace(&mut self.leftover, new_leftover);
+            return Ok(Some((bytes, offsets)));
+        } // end outer loop
+    }
+
+    /// Pull `offsets`/`split_at` back so the emitted lines are closed under
+    /// queryname. `offsets` is the sentinel-form table for the complete lines
+    /// in `self.leftover[..split_at]`; on return it describes only the emitted
+    /// prefix, and `split_at` marks where `leftover` is cut (carry = the rest).
+    ///
+    /// Walks back from the last complete line while adjacent QNAMEs match, then
+    /// (if a coalescing target is set and the closed prefix is short, and we are
+    /// not at EOF) carries everything to accumulate more. Emits nothing (offsets
+    /// truncated to the leading sentinel, `split_at = 0`) when the whole chunk
+    /// is one open run — `read_next_chunk`'s caller loop keeps reading.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` if the closed-under-queryname self-check trips.
+    fn apply_queryname_cut(
+        &mut self,
+        offsets: &mut Vec<u32>,
+        split_at: &mut usize,
+    ) -> io::Result<()> {
+        let n_lines = offsets.len().saturating_sub(1);
+        if n_lines == 0 {
+            return Ok(());
+        }
+        // QNAME of line `i` (bytes before the first tab; the line includes its
+        // trailing `\n`). A tab-less line is treated as its own whole name.
+        let qname = |i: usize| -> &[u8] {
+            let mut line = &self.leftover[offsets[i] as usize..offsets[i + 1] as usize];
+            if line.last() == Some(&b'\n') {
+                line = &line[..line.len() - 1];
+            }
+            let end = memchr::memchr(b'\t', line).unwrap_or(line.len());
+            &line[..end]
+        };
+
+        // Choose how many leading lines to emit (`emit`): the closed prefix.
+        let emit = if self.eof {
+            // At EOF the trailing run is complete (nothing can extend it), so
+            // emit every complete line. This also prevents an infinite carry
+            // when the whole final stream is one QNAME (the backward walk would
+            // otherwise pick 0 and the caller would re-read the same leftover
+            // forever).
+            n_lines
+        } else {
+            // `j` = first line of the trailing (open) queryname run to carry.
+            let mut j = n_lines - 1;
+            while j > 0 && qname(j - 1) == qname(j) {
+                j -= 1;
+            }
+            // Coalescing: carry everything until the closed prefix is big enough.
+            if self.min_emit_bytes > 0 && (offsets[j] as usize) < self.min_emit_bytes {
+                0
+            } else {
+                j
+            }
+        };
+
+        if emit == 0 {
+            // Nothing closed to emit: carry all complete lines + the partial
+            // tail. `split_at = 0` leaves everything in `leftover`.
+            offsets.clear();
+            *split_at = 0;
+            return Ok(());
         }
 
-        if self.leftover.is_empty() {
-            // Reader is fully drained and nothing was held over.
-            return Ok(None);
+        // Self-check: the first emitted line's QNAME must differ from the
+        // previous emitted chunk's last QNAME (else a run straddled a chunk).
+        let first_q = qname(0).to_vec();
+        if !self.last_emitted_qname.is_empty() && self.last_emitted_qname == first_q {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ReadSamChunks: queryname cut invariant violated \
+                     (a run of QNAME {:?} straddled a chunk boundary)",
+                    String::from_utf8_lossy(&first_q),
+                ),
+            ));
         }
+        self.last_emitted_qname = qname(emit - 1).to_vec();
 
-        // At true EOF with leftover bytes: append a synthetic `\n` so the
-        // trailing partial line becomes a complete record. SAM tools
-        // traditionally accept files without a trailing newline.
-        if self.eof && !self.leftover.ends_with(b"\n") {
-            self.leftover.push(b'\n');
-        }
-
-        let (offsets, leftover_slice) = split_complete_lines(&self.leftover);
-        let split_at = self.leftover.len() - leftover_slice.len();
-        let new_leftover = self.leftover.split_off(split_at);
-        let bytes = std::mem::replace(&mut self.leftover, new_leftover);
-        Ok(Some((bytes, offsets)))
+        // Emit lines 0..emit; carry the rest. When `emit == n_lines` (EOF or a
+        // run boundary exactly at the last complete line) this keeps everything
+        // — `split_at`/`offsets` are already correct, and the truncate is a
+        // no-op.
+        *split_at = offsets[emit] as usize;
+        offsets.truncate(emit + 1);
+        Ok(())
     }
 
     /// Test-only accessor: length of the carryover buffer holding the
@@ -252,6 +411,40 @@ impl ReadSamChunks {
             finished: Arc::new(AtomicBool::new(false)),
         }
     }
+
+    /// Like [`Self::new`] but emits chunks closed under queryname (every
+    /// queryname run lies entirely within one chunk), coalescing the emitted
+    /// prefix to ~`min_emit_bytes`. Used when the first stage groups by
+    /// queryname so the downstream grouper can run as a parallel map. `Record`
+    /// callers use [`Self::new`] unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `target_chunk_bytes` exceeds `u32::MAX` (see [`Self::new`]).
+    #[must_use]
+    pub fn new_queryname_cut(
+        reader: Box<dyn BufRead + Send>,
+        target_chunk_bytes: usize,
+        output_byte_limit: u64,
+        min_emit_bytes: usize,
+    ) -> Self {
+        assert!(
+            u32::try_from(target_chunk_bytes).is_ok(),
+            "target_chunk_bytes ({target_chunk_bytes}) exceeds u32::MAX"
+        );
+        let state = ReadSamState::new(reader).with_cut(
+            crate::pipeline::steps::boundaries::state::BatchCut::Queryname,
+            min_emit_bytes,
+        );
+        Self {
+            state: Arc::new(Mutex::new(Some(state))),
+            next_serial: 0,
+            held: HeldSlot::new(),
+            target_chunk_bytes: target_chunk_bytes.max(1),
+            output_byte_limit,
+            finished: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 impl Step for ReadSamChunks {
@@ -299,6 +492,15 @@ impl Step for ReadSamChunks {
             self.finished.store(true, Ordering::Release);
             return Ok(StepOutcome::Finished);
         };
+
+        // Under the queryname cut, a chunk whose whole content was one open run
+        // is carried entirely to `leftover` and comes back with no complete
+        // lines. Don't mint a serial for it (that would leave a gap in the dense
+        // ordinal the downstream reorder needs) — report Progress; the reader
+        // advanced, so the next dispatch continues from the carried bytes.
+        if line_offsets.len() <= 1 {
+            return Ok(StepOutcome::Progress);
+        }
 
         let serial = self.next_serial;
         self.next_serial += 1;
@@ -621,5 +823,109 @@ mod tests {
             .expect("one complete record");
         assert_eq!(bytes, expected);
         assert_eq!(offsets, vec![0, u32::try_from(expected.len()).unwrap()]);
+    }
+
+    // -- Queryname cut (BatchCut::Queryname) --
+
+    /// One SAM line: `qname\t<rest>\n`. The rest is a fixed opaque field; only
+    /// the QNAME (bytes before the first tab) matters to the cut.
+    fn sam_line(qname: &str) -> Vec<u8> {
+        format!("{qname}\t0\t*\t0\t0\t*\t*\t0\t0\t*\t*\n").into_bytes()
+    }
+
+    /// Drive a queryname-cut `ReadSamState` over `input` (via a `Dribble` so the
+    /// read loop iterates) with the given chunk target, returning the QNAMEs of
+    /// every emitted line, grouped per emitted chunk.
+    fn qn_sam_chunks(input: Vec<u8>, target: usize, min_emit: usize) -> Vec<Vec<String>> {
+        let mut state = ReadSamState::new(Dribble::boxed(input, 17))
+            .with_cut(crate::pipeline::steps::boundaries::state::BatchCut::Queryname, min_emit);
+        let mut out: Vec<Vec<String>> = Vec::new();
+        loop {
+            match state.read_next_chunk(target).expect("read ok") {
+                None => break,
+                Some((bytes, offsets)) => {
+                    if offsets.len() <= 1 {
+                        continue; // absorbed (whole chunk one open run)
+                    }
+                    let mut names = Vec::new();
+                    for w in offsets.windows(2) {
+                        let mut line = &bytes[w[0] as usize..w[1] as usize];
+                        if line.last() == Some(&b'\n') {
+                            line = &line[..line.len() - 1];
+                        }
+                        let end = line.iter().position(|&b| b == b'\t').unwrap_or(line.len());
+                        names.push(String::from_utf8_lossy(&line[..end]).into_owned());
+                    }
+                    out.push(names);
+                }
+            }
+        }
+        out
+    }
+
+    fn qn_sam_flat(chunks: &[Vec<String>]) -> Vec<String> {
+        chunks.iter().flatten().cloned().collect()
+    }
+
+    fn qn_sam_no_straddle(chunks: &[Vec<String>]) {
+        for w in chunks.windows(2) {
+            assert_ne!(w[0].last(), w[1].first(), "a QNAME run straddled a chunk boundary");
+        }
+    }
+
+    #[test]
+    fn sam_queryname_cut_carries_a_run_across_chunks() {
+        let mut input = Vec::new();
+        for q in ["a", "a", "b", "b", "b", "c"] {
+            input.extend(sam_line(q));
+        }
+        // Small target so the reader emits several chunks mid-run.
+        let chunks = qn_sam_chunks(input, 40, 0);
+        qn_sam_no_straddle(&chunks);
+        assert_eq!(qn_sam_flat(&chunks), vec!["a", "a", "b", "b", "b", "c"],);
+    }
+
+    #[test]
+    fn sam_queryname_cut_single_run_whole_stream() {
+        let mut input = Vec::new();
+        for _ in 0..6 {
+            input.extend(sam_line("solo"));
+        }
+        // Every line is QNAME "solo": nothing closes until EOF, then all emit.
+        let chunks = qn_sam_chunks(input, 20, 0);
+        assert_eq!(qn_sam_flat(&chunks), vec!["solo"; 6]);
+    }
+
+    #[test]
+    fn sam_queryname_cut_coalesces_to_min_emit() {
+        let mut input = Vec::new();
+        for i in 0..10 {
+            input.extend(sam_line(&format!("q{i}")));
+        }
+        // Large min_emit holds everything until EOF: one emitted chunk.
+        let chunks = qn_sam_chunks(input, 20, 1 << 20);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 10);
+    }
+
+    #[test]
+    fn sam_queryname_cut_missing_trailing_newline_flushes_at_eof() {
+        let mut input = Vec::new();
+        input.extend(sam_line("a"));
+        input.extend(sam_line("a"));
+        input.extend(b"b\t0\t*\t0\t0\t*\t*\t0\t0\t*\t*"); // no trailing \n
+        let chunks = qn_sam_chunks(input, 30, 0);
+        qn_sam_no_straddle(&chunks);
+        assert_eq!(qn_sam_flat(&chunks), vec!["a", "a", "b"]);
+    }
+
+    #[test]
+    fn sam_queryname_cut_tabless_line_is_its_own_name() {
+        // A line with no tab is treated as a whole-line QNAME; adjacent
+        // identical tab-less lines group, distinct ones split.
+        let input = b"xx\nxx\nyy\n".to_vec();
+        let chunks = qn_sam_chunks(input, 4, 0);
+        qn_sam_no_straddle(&chunks);
+        assert_eq!(qn_sam_flat(&chunks), vec!["xx", "xx", "yy"]);
     }
 }
