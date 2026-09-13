@@ -477,7 +477,7 @@ mod tests {
                 .expect("read group builds");
             header = header.add_read_group(bstr::BString::from(id), rg);
         }
-        let lib = LibraryIndex::from_header(&header.build());
+        let lib = LibraryIndex::from_header(&header.build()).expect("builds");
         let cb = Some(Tag::from([b'C', b'B']));
 
         // Two paired templates, each R1+R2 sharing a name; the templates carry

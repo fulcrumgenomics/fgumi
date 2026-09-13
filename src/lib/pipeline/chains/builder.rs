@@ -875,7 +875,7 @@ impl<'a> ChainBuilder<'a> {
                 // GroupKeyConfig: used by DecodeRecords (BAM) and ParseSamChunk (SAM).
                 // Queryname-grouping first stages (correct) skip cell-barcode
                 // extraction — see `source_group_key_config`.
-                let group_key_config = self.source_group_key_config();
+                let group_key_config = self.source_group_key_config()?;
 
                 match input {
                     InputSource::Bam { reader, .. } => {
@@ -963,7 +963,7 @@ impl<'a> ChainBuilder<'a> {
                 }
 
                 // GroupKeyConfig used by DecodeRecords (BAM) and ParseSamChunk (SAM).
-                let group_key_config = self.bam_group_key_config();
+                let group_key_config = self.bam_group_key_config()?;
 
                 // ── Unmapped preamble: always BAM (guaranteed by open_source) ──
                 let unmapped_tail = match unmapped {
@@ -1171,11 +1171,11 @@ impl<'a> ChainBuilder<'a> {
     /// hoist a call above a `self.header = …` reassignment.
     ///
     /// [`GroupKeyConfig`]: fgumi_bam_io::GroupKeyConfig
-    fn bam_group_key_config(&self) -> fgumi_bam_io::GroupKeyConfig {
+    fn bam_group_key_config(&self) -> Result<fgumi_bam_io::GroupKeyConfig> {
         use crate::sam::SamTag;
         use noodles::sam::alignment::record::data::field::Tag;
         let cell_tag = Tag::from(SamTag::CB);
-        let library_index = fgumi_bam_io::LibraryIndex::from_header(&self.header);
+        let library_index = fgumi_bam_io::LibraryIndex::from_header(&self.header)?;
         let config = fgumi_bam_io::GroupKeyConfig::new(library_index, cell_tag);
         // When a Group or Dedup stage is in the chain, cache the UMI (RX) value
         // position during decode so the per-template UMI-assignment lookup
@@ -1200,9 +1200,9 @@ impl<'a> ChainBuilder<'a> {
         // `stages_want_umi_cache`, which stays a pure function of `stages` alone)
         // since only this call site has `self.spec.stage_opts` in scope.
         if umi_cache_enabled(&self.spec.stages, self.stage_no_umi()) {
-            config.with_umi_tag(*SamTag::RX)
+            Ok(config.with_umi_tag(*SamTag::RX))
         } else {
-            config
+            Ok(config)
         }
     }
 
@@ -1242,10 +1242,10 @@ impl<'a> ChainBuilder<'a> {
     /// `fgumi-bam-io`, and the `name_hash_only` branches in `DecodeRecords`
     /// and `parse_sam_chunk_into_decoded`, which call it without touching
     /// `library_index` at all), so resolving it from the header is pure waste
-    /// for these stages — and `LibraryIndex::from_header` panics on a header
-    /// with more than 65,535 distinct `@RG` libraries, a needless crash risk
-    /// this avoids.
-    fn source_group_key_config(&self) -> fgumi_bam_io::GroupKeyConfig {
+    /// for these stages — and `LibraryIndex::from_header` errors on a header
+    /// with more than 65,535 distinct `@RG` libraries, a needless failure this
+    /// avoids.
+    fn source_group_key_config(&self) -> Result<fgumi_bam_io::GroupKeyConfig> {
         match self.spec.stages.first() {
             Some(
                 Stage::Correct
@@ -1254,9 +1254,9 @@ impl<'a> ChainBuilder<'a> {
                 | Stage::Retag
                 | Stage::Filter
                 | Stage::Clip,
-            ) => {
-                fgumi_bam_io::GroupKeyConfig::name_hash_only(fgumi_bam_io::LibraryIndex::default())
-            }
+            ) => Ok(fgumi_bam_io::GroupKeyConfig::name_hash_only(
+                fgumi_bam_io::LibraryIndex::default(),
+            )),
             _ => self.bam_group_key_config(),
         }
     }
@@ -1286,23 +1286,25 @@ impl<'a> ChainBuilder<'a> {
             crate::pipeline::core::topology::BranchIdx,
         ),
         position: StagePosition,
-    ) -> (crate::pipeline::core::topology::StepIdx, crate::pipeline::core::topology::BranchIdx)
-    {
+    ) -> Result<(
+        crate::pipeline::core::topology::StepIdx,
+        crate::pipeline::core::topology::BranchIdx,
+    )> {
         match position {
             // terminal: tail is DecompressedBlock (serialized bytes) → SerializedBytes.
             StagePosition::Terminal => {
                 self.chain_tail_kind = ChainTailKind::SerializedBytes;
-                tail
+                Ok(tail)
             }
             StagePosition::Intermediate => {
                 use crate::pipeline::steps::parse::decode::DecodeRecords;
-                let group_key_config = self.bam_group_key_config();
+                let group_key_config = self.bam_group_key_config()?;
                 let tail = self.pipeline.append_step(
                     DecodeRecords::new(group_key_config, self.tuning.per_step_byte_limit),
                     tail,
                 );
                 self.chain_tail_kind = ChainTailKind::DecodedRecordBatch;
-                tail
+                Ok(tail)
             }
         }
     }
@@ -3071,7 +3073,7 @@ impl<'a> ChainBuilder<'a> {
                 )
                 .with_sort_stats(sort.sort_stats);
                 let merge_tail = self.pipeline.append_step(merge, decompress_tail);
-                let group_key_config = self.bam_group_key_config();
+                let group_key_config = self.bam_group_key_config()?;
                 let tail = self.pipeline.append_step(
                     DecodeFromRecords::new(group_key_config, self.tuning.per_step_byte_limit),
                     merge_tail,
@@ -3311,7 +3313,7 @@ impl<'a> ChainBuilder<'a> {
         let (header_arc, library_index_arc) = if consensus_metrics.is_some() {
             (
                 Some(Arc::new(self.header.clone())),
-                Some(Arc::new(fgumi_bam_io::LibraryIndex::from_header(&self.header))),
+                Some(Arc::new(fgumi_bam_io::LibraryIndex::from_header(&self.header)?)),
             )
         } else {
             (None, None)
@@ -3671,7 +3673,7 @@ impl<'a> ChainBuilder<'a> {
         let (header_arc, library_index_arc) = if metrics_on {
             (
                 Some(Arc::new(input_header.clone())),
-                Some(Arc::new(fgumi_bam_io::LibraryIndex::from_header(&input_header))),
+                Some(Arc::new(fgumi_bam_io::LibraryIndex::from_header(&input_header)?)),
             )
         } else {
             (None, None)
@@ -3783,7 +3785,7 @@ impl<'a> ChainBuilder<'a> {
         // Branch 0 = consensus DecompressedBlock. For an Intermediate consensus
         // stage finish_consensus_tail appends DecodeRecords; Terminal leaves the
         // DecompressedBlock for add_sink.
-        let tail = self.finish_consensus_tail(consensus_branch0, position);
+        let tail = self.finish_consensus_tail(consensus_branch0, position)?;
         self.current_tail = Some(tail);
 
         // Register the simplex finalize hook.
@@ -4036,7 +4038,7 @@ impl<'a> ChainBuilder<'a> {
         let (header_arc, library_index_arc) = if metrics_on {
             (
                 Some(Arc::new(input_header.clone())),
-                Some(Arc::new(fgumi_bam_io::LibraryIndex::from_header(&input_header))),
+                Some(Arc::new(fgumi_bam_io::LibraryIndex::from_header(&input_header)?)),
             )
         } else {
             (None, None)
@@ -4167,7 +4169,7 @@ impl<'a> ChainBuilder<'a> {
         };
         // Branch 0 = consensus DecompressedBlock. Intermediate appends
         // DecodeRecords; Terminal leaves the DecompressedBlock for add_sink.
-        let tail = self.finish_consensus_tail(consensus_branch0, position);
+        let tail = self.finish_consensus_tail(consensus_branch0, position)?;
         self.current_tail = Some(tail);
 
         // Register the duplex finalize hook.
@@ -4431,7 +4433,7 @@ impl<'a> ChainBuilder<'a> {
         let (header_arc, library_index_arc) = if metrics_on {
             (
                 Some(Arc::new(input_header.clone())),
-                Some(Arc::new(fgumi_bam_io::LibraryIndex::from_header(&input_header))),
+                Some(Arc::new(fgumi_bam_io::LibraryIndex::from_header(&input_header)?)),
             )
         } else {
             (None, None)
@@ -4510,7 +4512,7 @@ impl<'a> ChainBuilder<'a> {
         };
         // Branch 0 = consensus DecompressedBlock. Intermediate appends
         // DecodeRecords; Terminal leaves the DecompressedBlock for add_sink.
-        let tail = self.finish_consensus_tail(consensus_branch0, position);
+        let tail = self.finish_consensus_tail(consensus_branch0, position)?;
         self.current_tail = Some(tail);
 
         // Register the codec finalize hook.
@@ -5372,7 +5374,7 @@ impl<'a> ChainBuilder<'a> {
             // `dedup.duplication_ladder`, so `zip` yields `Some` exactly when the
             // flag is set — the invariant is now in the type, not an assert.
             duplication_ladder: dedup.duplication_ladder.clone().zip(ladder_recorder),
-            library_index: fgumi_bam_io::LibraryIndex::from_header(&self.header),
+            library_index: fgumi_bam_io::LibraryIndex::from_header(&self.header)?,
             sample: crate::commands::dedup::resolve_sample(&self.header, dedup.sample.as_deref()),
             timer,
         }));
@@ -5615,7 +5617,7 @@ mod tests {
     fn source_group_key_config_is_name_hash_only_for_filter_first_stage() {
         let spec = empty_spec(vec![Stage::Filter]);
         let builder = chain_builder_for_stages(&spec);
-        let config = builder.source_group_key_config();
+        let config = builder.source_group_key_config().expect("builds");
         assert!(
             config.name_hash_only,
             "Stage::Filter as the first stage must skip the discarded position/RG/CB key"
@@ -5633,7 +5635,7 @@ mod tests {
     fn source_group_key_config_is_name_hash_only_for_clip_first_stage() {
         let spec = empty_spec(vec![Stage::Clip]);
         let builder = chain_builder_for_stages(&spec);
-        let config = builder.source_group_key_config();
+        let config = builder.source_group_key_config().expect("builds");
         assert!(
             config.name_hash_only,
             "Stage::Clip as the first stage must skip the discarded position/RG/CB key"
@@ -5647,7 +5649,7 @@ mod tests {
     fn source_group_key_config_is_full_for_group_first_stage() {
         let spec = empty_spec(vec![Stage::Group]);
         let builder = chain_builder_for_stages(&spec);
-        let config = builder.source_group_key_config();
+        let config = builder.source_group_key_config().expect("builds");
         assert!(
             !config.name_hash_only,
             "Stage::Group as the first stage must compute the full position/RG/CB key"
@@ -5845,7 +5847,7 @@ mod tests {
         let mut spec = empty_spec(vec![Stage::Dedup]);
         spec.stage_opts.dedup = Some(dedup);
         let builder = chain_builder_for_stages(&spec);
-        assert_eq!(builder.bam_group_key_config().umi_tag, expected_umi_tag);
+        assert_eq!(builder.bam_group_key_config().expect("builds").umi_tag, expected_umi_tag);
     }
 
     /// `add_copy_umi` refuses an intermediate position: copy-umi is a terminal,

@@ -1201,7 +1201,7 @@ mod coordinate_group_from_processed_position_tests {
         let template1 = template_from_pair("t1", &header, "0");
         let template2 = template_from_pair("t2", &header, "1");
 
-        let library_index = LibraryIndex::from_header(&header);
+        let library_index = LibraryIndex::from_header(&header).expect("builds");
         let infos = coordinate_group_from_processed_position(
             &[template1, template2],
             &header,
@@ -1222,7 +1222,7 @@ mod coordinate_group_from_processed_position_tests {
         let r1 = fgumi_raw_bam::encode_record_buf_to_raw(&r1_buf, &header).expect("encode r1");
         let template = Template::from_records(vec![r1]).expect("builds R1-only template");
 
-        let library_index = LibraryIndex::from_header(&header);
+        let library_index = LibraryIndex::from_header(&header).expect("builds");
         let infos = coordinate_group_from_processed_position(&[template], &header, &library_index)
             .expect("converts");
 
@@ -1269,7 +1269,7 @@ mod coordinate_group_from_processed_position_tests {
 
         let template = Template::from_records(vec![build(true, 99, 149), build(false, 149, 99)])
             .expect("builds template");
-        let library_index = LibraryIndex::from_header(&header);
+        let library_index = LibraryIndex::from_header(&header).expect("builds");
         let infos = coordinate_group_from_processed_position(&[template], &header, &library_index)
             .expect("converts");
 
@@ -1282,7 +1282,7 @@ mod coordinate_group_from_processed_position_tests {
     #[test]
     fn coordinate_group_from_processed_position_handles_an_empty_group() {
         let header = crate::commands::shared_metrics::tests::test_header();
-        let library_index = LibraryIndex::from_header(&header);
+        let library_index = LibraryIndex::from_header(&header).expect("builds");
         let infos = coordinate_group_from_processed_position(&[], &header, &library_index)
             .expect("converts");
         assert!(infos.is_empty());
@@ -1353,7 +1353,7 @@ mod coordinate_group_from_processed_position_tests {
         // aux tag.
         template.mi = fgumi_umi::MoleculeId::PairedA(7);
 
-        let library_index = LibraryIndex::from_header(&header);
+        let library_index = LibraryIndex::from_header(&header).expect("builds");
         let infos = coordinate_group_from_processed_position(&[template], &header, &library_index)
             .expect("must succeed by reading Template.mi, not error on the absent MI aux tag");
 
@@ -1443,7 +1443,7 @@ mod pair_and_push_tests {
     #[test]
     fn push_mi_group_entries_converts_every_qualifying_pair() {
         let header = crate::commands::shared_metrics::tests::test_header();
-        let library_index = LibraryIndex::from_header(&header);
+        let library_index = LibraryIndex::from_header(&header).expect("builds");
         let (a1, a2) = raw_pair("a", "0", &header);
         let (b1, b2) = raw_pair("b", "1", &header);
         let group = MiGroup::new("0".to_string(), vec![a1, a2, b1, b2]);
@@ -1460,7 +1460,7 @@ mod pair_and_push_tests {
     #[test]
     fn push_mi_group_entries_appends_onto_a_non_empty_accumulator() {
         let header = crate::commands::shared_metrics::tests::test_header();
-        let library_index = LibraryIndex::from_header(&header);
+        let library_index = LibraryIndex::from_header(&header).expect("builds");
         let (a1, a2) = raw_pair("a", "0", &header);
         let group = MiGroup::new("0".to_string(), vec![a1, a2]);
 
