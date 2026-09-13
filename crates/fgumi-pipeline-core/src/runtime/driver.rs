@@ -30,6 +30,7 @@ use crate::erased::ErasedStepCtx;
 use crate::liveness::LivenessCounter;
 use crate::runtime::contexts::ChainContexts;
 use crate::runtime::drain::StepDrainCounter;
+use crate::runtime::event_count::PoolEventCount;
 use crate::runtime::live::LiveSteps;
 use crate::runtime::scheduler::{Scheduler, WalkDirection};
 use crate::runtime::stats::PipelineStats;
@@ -68,6 +69,11 @@ const STICKY_BURST_LIMIT: usize = 1024;
 /// `board` — optional per-thread state board for scheduling telemetry; `None`
 /// keeps the loop's stamping a no-op (telemetry-off parity).
 /// `state_slot` — this thread's slot in `board` (ignored when `board` is `None`).
+/// `parker` — the pool's event-count. `Some` only for pool workers when
+/// `n_threads > 1`; drives both the idle-branch park (instead of `sleep_backoff`)
+/// and the on-`Progress`/`Finished` notify that wakes parked peers. `None`
+/// (single-thread paths, and pinned workers — see the idle branch) keeps the
+/// existing `sleep_backoff` behaviour.
 #[allow(clippy::too_many_arguments)] // per-step shared state plus the liveness shard; a struct would only rename it
 #[allow(clippy::too_many_lines)] // the whole-pass sticky + round-robin + backoff discipline is documented inline; splitting it would scatter the invariant across functions
 pub fn run_worker_loop(
@@ -81,7 +87,20 @@ pub fn run_worker_loop(
     scheduler: &dyn Scheduler,
     board: Option<&WorkerStateBoard>,
     state_slot: usize,
+    parker: Option<&PoolEventCount>,
+    pinned: bool,
 ) {
+    // A pinned worker (the sole eligible dispatcher of an Exclusive/sticky step,
+    // or the affinity target of a Serial step) must NOT deep-park on the shared
+    // event-count: `notify_one` cannot target a specific worker, so a push meant
+    // to wake *this* worker's pinned step could wake a peer that `Skip`s it,
+    // leaving the pinned step's owner asleep to its timeout. Pinned workers keep
+    // `sleep_backoff`. Its step is also often driven by out-of-engine events
+    // (a reader's prefetch thread, the affinity-pinned grouper) that no push
+    // notifies anyway. `parker` is threaded to `None` for the idle branch here,
+    // while still being used for the on-Progress notify (a pinned worker's
+    // pushes must still wake parked peers).
+    let idle_parker = if pinned { None } else { parker };
     // Per-worker worklist of still-dispatchable steps, in chain order. A step
     // is removed when it returns `StepOutcome::Finished`; the worker exits once
     // the list is empty. Build-time `Skip` placeholders (Exclusive steps owned
@@ -156,6 +175,7 @@ pub fn run_worker_loop(
                     is_driver,
                     board,
                     state_slot,
+                    parker,
                 ) else {
                     break; // Skip
                 };
@@ -203,6 +223,7 @@ pub fn run_worker_loop(
                 is_driver,
                 board,
                 state_slot,
+                parker,
             );
             did_work |= outcome.did_work;
             if outcome.removed_sticky_owner {
@@ -233,7 +254,74 @@ pub fn run_worker_loop(
             worker.reset_backoff();
         } else if signal.is_done() {
             break;
+        } else if let Some(ec) = idle_parker {
+            // Event-count park (Layer 2): block instead of spin-poll when the
+            // whole pass found no work. The two-phase protocol closes the
+            // lost-wakeup race: arm (register + fence) → re-poll the real
+            // condition → block only if still empty.
+            if let Some(b) = board {
+                b.stamp(state_slot, crate::runtime::worker_state::WorkerState::Parked, None);
+            }
+            let sleep_start = stats.map(|_| Instant::now());
+
+            // Phase 1: arm. The fence in `prepare_wait` orders the waiter
+            // registration before the re-poll below, so a producer that
+            // publishes work after this point either sees us as a waiter (and
+            // bumps the generation) or we see its item on the re-poll.
+            let key = ec.prepare_wait();
+
+            // Phase 2: re-poll the *real* condition — one full dispatch pass.
+            // This is one pass per park episode (amortised over the block), not
+            // per iteration, so it is not the continuous polling Layer 2 removes.
+            let recheck = round_robin_dispatch(
+                entries,
+                &mut live,
+                worker.sticky_owner,
+                contexts,
+                drain_counters,
+                signal,
+                stats,
+                liveness,
+                worker.thread_id,
+                scheduler.walk(),
+                is_driver,
+                board,
+                state_slot,
+                parker,
+            );
+            if recheck.removed_sticky_owner {
+                sticky_live = false;
+            }
+
+            if recheck.did_work || signal.is_done() {
+                // Work appeared in the arm→wait window (or we are shutting
+                // down): do not block. Balance the arm and re-ramp fresh.
+                ec.cancel_wait(key);
+                worker.reset_backoff();
+            } else {
+                // Phase 3: block until the generation moves (a peer's notify),
+                // the deadline elapses (self-heal), or a spurious wake. Keep the
+                // exponential backoff as the wait *timeout* so a missed wakeup
+                // cannot hang longer than the cap, and the deadlock monitor
+                // still ticks. Re-poll on return regardless of outcome.
+                let deadline = worker.backoff_deadline();
+                let _ = ec.wait(key, deadline);
+                worker.increase_backoff();
+            }
+
+            if let (Some(stats), Some(ss)) = (stats, sleep_start) {
+                let ns = u64::try_from(ss.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                match worker.role() {
+                    WorkerRole::Pool => stats.record_worker_idle(worker.thread_id, ns),
+                    WorkerRole::Driver { primary_step } => {
+                        stats.record_detached_idle(primary_step, ns);
+                        stats.record_detached_park(primary_step);
+                    }
+                }
+            }
         } else {
+            // No parker (single-thread path or a pinned worker): keep the
+            // original exponential-backoff sleep.
             if let Some(b) = board {
                 b.stamp(state_slot, crate::runtime::worker_state::WorkerState::Parked, None);
             }
@@ -297,6 +385,7 @@ fn round_robin_dispatch(
     is_driver: bool,
     board: Option<&WorkerStateBoard>,
     state_slot: usize,
+    parker: Option<&PoolEventCount>,
 ) -> RoundRobinOutcome {
     let mut did_work = false;
     // Steps that finished this pass, removed from `live` after the walk. A
@@ -334,6 +423,7 @@ fn round_robin_dispatch(
             is_driver,
             board,
             state_slot,
+            parker,
         ) else {
             continue; // Skip (build-time placeholder; should not appear in `live`)
         };
@@ -431,6 +521,14 @@ fn dispatch_one_step(
     // slot in `board` (ignored when `board` is `None`).
     board: Option<&WorkerStateBoard>,
     state_slot: usize,
+    // The pool's event-count. On a `Progress` outcome (the step pushed or held
+    // an item — including a reorder must-accept stash) wake one parked peer; on
+    // `Finished` (an output edge just closed) wake all. `None` for single-thread
+    // paths. This is the notify seam: `Progress`/`Finished` are exactly the
+    // outcomes that can give a parked consumer new work, and using the outcome
+    // (rather than the `BranchOutputHandle::push` site) captures the stash-then-
+    // return-`Ok` reorder case without threading the parker through every queue.
+    parker: Option<&PoolEventCount>,
 ) -> Option<DispatchInfo> {
     let outputs_any: &(dyn Any + Send + Sync) = contexts.outputs[step_idx.0].as_ref();
     let mut ctx = ErasedStepCtx {
@@ -492,6 +590,22 @@ fn dispatch_one_step(
                     result: Ok(StepOutcome::Finished),
                     name: "<finished-serial-step>",
                 })
+            } else if step.is_locked() {
+                // Test-and-test-and-set: probe with a shared-mode load before
+                // attempting the lock. `parking_lot::Mutex::try_lock` is a
+                // `compare_exchange` on the lock word that writes (and so
+                // invalidates) the holder's cache line *even when it fails*. A
+                // surplus worker that `try_lock`s a `Serial + Affinity::None`
+                // step held by the productive worker steals that line on every
+                // idle pass, and that step is often the throughput ceiling
+                // (e.g. `GroupByQueryname` in `correct`). `is_locked()` is a
+                // plain relaxed load — no line-ownership transfer — so probing
+                // it first turns the common "held by a peer" case into a
+                // read-only `Contention` with no write to the holder's line.
+                Some(DispatchInfo {
+                    result: Ok(StepOutcome::Contention),
+                    name: "<contended-serial-step>",
+                })
             } else {
                 match step.try_lock() {
                     None => Some(DispatchInfo {
@@ -528,6 +642,20 @@ fn dispatch_one_step(
         && matches!(i.result, Ok(StepOutcome::Progress | StepOutcome::Finished))
     {
         liveness.bump(worker_slot);
+        // Notify seam: a productive dispatch may have given a parked consumer
+        // new work. `Progress` = "pushed or held an item" (incl. a reorder
+        // must-accept stash that unblocks an ordinal waiter) → wake one parked
+        // peer, which cascades (its own downstream push wakes the next).
+        // `Finished` closed an output edge (a parked consumer must observe
+        // end-of-stream, and a sink's `Finished` closes no edge but its peers
+        // may be waiting on the drain latch) → wake all. When nobody is parked,
+        // both are a single relaxed load (see `PoolEventCount`).
+        if let Some(ec) = parker {
+            match i.result {
+                Ok(StepOutcome::Finished) => ec.notify_all(),
+                _ => ec.notify_one(),
+            }
+        }
     }
 
     if let (Some(stats), Some(start)) = (stats, start) {
@@ -595,6 +723,8 @@ mod tests {
             &crate::runtime::scheduler::ChainOrderScheduler,
             None,
             0,
+            None,
+            false,
         );
         // If we reach this line, the loop exited cleanly.
     }
@@ -635,6 +765,8 @@ mod tests {
             &crate::runtime::scheduler::ChainOrderScheduler,
             Some(&board),
             0,
+            None,
+            false,
         );
         assert_eq!(board.read(0).0, WorkerState::Parked);
     }
@@ -843,6 +975,7 @@ mod tests {
                 false,
                 None,
                 0,
+                None,
             )
             .unwrap();
             assert!(matches!(info.result, Ok(StepOutcome::Finished)));
@@ -887,6 +1020,7 @@ mod tests {
             false,
             None,
             0,
+            None,
         )
         .unwrap();
         assert!(matches!(info1.result, Ok(StepOutcome::Finished)));
@@ -908,6 +1042,7 @@ mod tests {
             false,
             None,
             0,
+            None,
         )
         .unwrap();
         assert!(matches!(info2.result, Ok(StepOutcome::Finished)));
@@ -920,6 +1055,67 @@ mod tests {
             1,
             "the Serial step must NOT be re-run after the DrainGate latch is set"
         );
+    }
+
+    /// Layer 0 (test-and-test-and-set): when a `Serial` step's mutex is already
+    /// held (by the productive worker), a surplus worker's dispatch reports
+    /// `Contention` via the `is_locked()` probe and does NOT run the step. The
+    /// probe is a shared-mode load, so it never takes the lock word's write
+    /// path (`try_lock`'s `compare_exchange`) that would invalidate the
+    /// holder's cache line. We prove the observable contract: the step body is
+    /// not entered while the lock is held.
+    #[test]
+    fn serial_contention_probe_does_not_run_held_step() {
+        let (steps, graph, runs) = three_step_chain(StepKind::Serial);
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+            false,
+        ));
+        let mid = StepIdx(1);
+        let counter = StepDrainCounter::new(1);
+        let signal = PipelineSignal::new();
+
+        let shared = Arc::new(Mutex::new(steps.into_iter().nth(1).unwrap()));
+        let drain = Arc::new(DrainGate::default());
+
+        // Simulate the productive worker holding the step's mutex.
+        let held = Arc::clone(&shared);
+        let guard = held.lock();
+        assert!(shared.is_locked(), "precondition: the Serial mutex is held");
+
+        // A surplus worker dispatches the same step while it is held.
+        let mut entry =
+            WorkerStepEntry::Shared { step: Arc::clone(&shared), drain: Arc::clone(&drain) };
+        let info = dispatch_one_step(
+            &mut entry,
+            mid,
+            &contexts,
+            &counter,
+            &signal,
+            None,
+            &LivenessCounter::new(1),
+            0,
+            false,
+            None,
+            0,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(info.result, Ok(StepOutcome::Contention)),
+            "a held Serial step must report Contention to the surplus worker"
+        );
+        assert_eq!(info.name, "<contended-serial-step>", "the contended-step name is reported");
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            0,
+            "the Serial step body must NOT run while another worker holds its mutex"
+        );
+
+        drop(guard);
     }
 
     /// A sticky-owned source driven through `run_worker_loop` completes and the
@@ -966,6 +1162,8 @@ mod tests {
             &crate::runtime::scheduler::ChainOrderScheduler,
             None,
             0,
+            None,
+            false,
         );
     }
 
@@ -1031,6 +1229,8 @@ mod tests {
             &crate::runtime::scheduler::ChainOrderScheduler,
             None,
             0,
+            None,
+            false,
         );
 
         // The source must have been called EXACTLY twice: call 1 = idle in the
@@ -1176,6 +1376,8 @@ mod tests {
             &crate::runtime::scheduler::ChainOrderScheduler,
             None,
             0,
+            None,
+            false,
         );
         done.store(true, Ordering::SeqCst);
 
@@ -1337,6 +1539,8 @@ mod tests {
             &crate::runtime::scheduler::ChainOrderScheduler,
             None,
             0,
+            None,
+            false,
         );
         done.store(true, Ordering::SeqCst);
 
@@ -1418,6 +1622,7 @@ mod tests {
             true,
             None,
             0,
+            None,
         );
         let snap = stats.snapshot();
         assert!(
@@ -1447,6 +1652,7 @@ mod tests {
             false,
             None,
             0,
+            None,
         );
         assert!(
             stats_pool.snapshot().detached.is_empty(),
@@ -1489,6 +1695,7 @@ mod tests {
             false,
             Some(&board),
             0,
+            None,
         );
         assert_eq!(board.read(0), (WorkerState::Running, Some(StepIdx(0))));
     }
@@ -1524,6 +1731,7 @@ mod tests {
             false,
             None,
             0,
+            None,
         )
         .unwrap();
         assert!(matches!(info.result, Ok(StepOutcome::Finished)));

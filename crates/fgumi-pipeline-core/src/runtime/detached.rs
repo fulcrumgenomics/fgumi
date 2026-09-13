@@ -337,6 +337,12 @@ pub fn run_detached_driver(
     liveness: &crate::liveness::LivenessCounter,
     board: Option<&crate::runtime::worker_state::WorkerStateBoard>,
     state_slot: usize,
+    // The pool's event-count, so this driver's productive pushes wake parked
+    // pool workers (the notify seam in `dispatch_one_step`). Passed with
+    // `pinned = true` below so the driver itself keeps its `Park` backoff and
+    // never deep-parks on the shared event-count — it is a notifier, not a
+    // waiter (spec §5). `None` when the pool has no parker (`n_threads == 1`).
+    parker: Option<&crate::runtime::event_count::PoolEventCount>,
 ) {
     let primary = group.primary_step();
     let mut row = build_driver_storage(group.into_steps(), contexts.inputs.len());
@@ -352,6 +358,11 @@ pub fn run_detached_driver(
         &DrainFirstScheduler,
         board,
         state_slot,
+        parker,
+        // `pinned`: a detached driver is not a pool waiter. This routes its idle
+        // to the `Park` backoff (its existing behaviour) rather than the shared
+        // event-count wait, while still passing `parker` above for the notify.
+        true,
     );
 }
 
@@ -496,6 +507,7 @@ mod tests {
             &crate::liveness::LivenessCounter::new(1),
             None,
             0,
+            None,
         );
     }
 

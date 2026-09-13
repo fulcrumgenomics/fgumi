@@ -5,6 +5,7 @@ pub mod contexts;
 pub mod detached;
 pub mod drain;
 pub mod driver;
+pub mod event_count;
 pub mod fused;
 pub mod live;
 pub mod metrics;
@@ -23,6 +24,7 @@ pub use detached::{
 };
 pub use drain::StepDrainCounter;
 pub use driver::run_worker_loop;
+pub use event_count::{PoolEventCount, WaitKey, WaitOutcome};
 pub use fused::{is_fusible_chain, run_fused_single_thread, should_fuse_single_thread};
 pub use live::LiveSteps;
 pub use pool::{assign_exclusive_owners, assign_sticky_owners};
