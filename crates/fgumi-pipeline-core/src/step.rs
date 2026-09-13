@@ -490,6 +490,103 @@ pub struct StepCtx2<'a, S: Step2> {
     pub counters: &'a StepCounters,
 }
 
+/// K-input variant of [`Step`], for a step that consumes **K homogeneous**
+/// input streams — every input branch carries the same item type `Input`.
+///
+/// Sits alongside [`Step`] (1 input) and [`Step2`] (2 heterogeneous inputs).
+/// The homogeneity is the whole point: because all K branches share one type,
+/// the framework can present them as a single **slice** of input handles
+/// ([`StepCtxK::inputs`]) indexed by branch, and the per-branch handle storage
+/// ([`crate::handles::KInputHandles`]) is a plain array/`Vec` of one handle
+/// type — no per-branch associated types, no heterogeneous-tuple wrapper. A
+/// step that needs K *different* input types must use nested [`Step2`]s
+/// instead; this trait is exclusively for the K-of-one-type lockstep join
+/// (e.g. zipping K FASTQ streams whose chunks all decode to `FastqRawChunk`).
+///
+/// Arity is a runtime value ([`Self::input_count`]), not a type parameter, so a
+/// single `impl StepK` serves every K. The builder wires K producer branches
+/// via [`crate::builder::PipelineBuilder::append_step_k`]; the runtime pulls K
+/// input handles into a [`crate::handles::KInputHandles`] and lends them as a
+/// slice per dispatch.
+///
+/// **Scheduling.** Like [`Step2`], a `StepK` consumer has `input_arity > 1`, so
+/// it is never fused (the single-thread fused driver rejects multi-input steps)
+/// and its per-branch drain is the step's own responsibility: the step reports
+/// [`StepOutcome::Finished`] only once **every** input reports drained.
+pub trait StepK: Send + Sized + 'static {
+    /// The single item type carried by every one of the K input branches.
+    type Input: Send + HeapSize + 'static;
+    type Outputs: StepOutputs;
+
+    /// Static scheduling description. `output_queues` / `branch_ordering` size
+    /// to `Outputs::arity()` as usual; the *input* arity is reported separately
+    /// via [`Self::input_count`] (the profile has no input-arity field).
+    fn profile(&self) -> StepProfile;
+
+    /// The number of input branches K this step consumes. Fixed at construction
+    /// and reported to the builder so it wires exactly K producer edges, and to
+    /// the runtime so it pulls exactly K input handles. Must equal the number of
+    /// producer branches wired via `append_step_k`, and the length of
+    /// [`StepCtxK::inputs`] the step sees.
+    fn input_count(&self) -> usize;
+
+    /// Same semantics as [`Step::affinity`]. Defaults to `Affinity::None`.
+    fn affinity(&self) -> Affinity {
+        Affinity::None
+    }
+
+    /// Same semantics as [`Step::detached_group`]. Defaults to
+    /// [`DetachedGroup::PerStep`] (ignored unless the step is `Detached`).
+    fn detached_group(&self) -> DetachedGroup {
+        DetachedGroup::PerStep
+    }
+
+    /// Same semantics as [`Step::counters`]. Defaults to `&[]`.
+    fn counters(&self) -> &'static [CounterSpec] {
+        &[]
+    }
+
+    /// Step body. Pop from `ctx.inputs[i]` (branch `i`), push to `ctx.outputs`.
+    ///
+    /// # Errors
+    ///
+    /// Same handling as [`Step::try_run`].
+    fn try_run(&mut self, ctx: &mut StepCtxK<'_, Self>) -> io::Result<StepOutcome>;
+
+    /// Same semantics as [`Step::new_worker_copy`]. Default panics; a `StepK`
+    /// is `Serial`/`Exclusive` in every current use (a K-way lockstep join is
+    /// inherently serial on its ordering state), so the framework never clones
+    /// it. Override only if a `Parallel` `StepK` is ever introduced.
+    ///
+    /// # Panics
+    ///
+    /// Default impl panics with the step name + kind.
+    #[must_use]
+    fn new_worker_copy(&self) -> Self {
+        let p = self.profile();
+        panic!(
+            "StepK::new_worker_copy invoked on '{}' (kind = {:?}); \
+             only Parallel steps need to override this. A K-way join is \
+             Serial — the framework never clones it — so hitting this is a \
+             framework bug.",
+            p.name, p.kind
+        );
+    }
+}
+
+/// Context passed to [`StepK::try_run`]. Holds the K per-branch input handles
+/// as a single homogeneous slice, indexed by branch (`inputs[i]` is branch
+/// `i`, matching the wiring order in `append_step_k`).
+pub struct StepCtxK<'a, S: StepK> {
+    /// The K input handles, one per wired producer branch, in slot order.
+    /// `inputs.len() == S::input_count()`. Each is a non-blocking
+    /// [`InputHandle`] over the shared `S::Input` type.
+    pub inputs: &'a [&'a dyn InputHandle<S::Input>],
+    pub outputs: &'a OutputHandles<S::Outputs>,
+    /// Per-step domain counters — see [`StepCtx::counters`].
+    pub counters: &'a StepCounters,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
