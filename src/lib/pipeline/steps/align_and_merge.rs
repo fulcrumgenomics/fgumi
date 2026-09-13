@@ -708,7 +708,7 @@ fn writer_loop(
                     // pattern as the no-primary path below.
                     let msg = format!(
                         "align-and-merge writer: write_fastq_record for template '{name}': {e:#}",
-                        name = String::from_utf8_lossy(&template.name),
+                        name = String::from_utf8_lossy(template.name()),
                     );
                     shared.record_error(io::Error::other(msg.clone()));
                     return Err(io::Error::other(msg));
@@ -721,7 +721,7 @@ fn writer_loop(
                      SECONDARY/SUPPLEMENTARY). align-and-merge expects unmapped BAM input — did \
                      you pass a re-aligned BAM by mistake? Run `fgumi extract` first or pre-filter \
                      the input.",
-                    name = String::from_utf8_lossy(&template.name),
+                    name = String::from_utf8_lossy(template.name()),
                 );
                 shared.record_error(io::Error::other(msg.clone()));
                 return Err(io::Error::other(msg));
@@ -973,13 +973,13 @@ fn reader_loop_inner(
             // The compare is one byte-slice comparison per template (both names
             // are already in hand), negligible against the per-record merge_raw
             // it guards, so it stays on in release rather than as a debug_assert.
-            if token.unmapped.templates()[i].name != mapped.name {
+            if token.unmapped.templates()[i].name() != mapped.name() {
                 return Err(io::Error::other(format!(
                     "align-and-merge reader: queryname mismatch — unmapped[{i}]='{u}' but \
                      mapped='{m}'; the aligner emitted templates out of input order (does the \
                      aligner command preserve input order, e.g. bwa `-K`?)",
-                    u = String::from_utf8_lossy(&token.unmapped.templates()[i].name),
-                    m = String::from_utf8_lossy(&mapped.name),
+                    u = String::from_utf8_lossy(token.unmapped.templates()[i].name()),
+                    m = String::from_utf8_lossy(mapped.name()),
                 )));
             }
 
@@ -2491,13 +2491,13 @@ mod tests {
         let t1 = assemble_next_template(&mut peeked, &mut name_buf, || Ok(it.next()))
             .expect("t1 ok")
             .expect("t1 present");
-        assert_eq!(t1.name, b"readA");
+        assert_eq!(t1.name(), b"readA");
         assert_eq!(t1.read_count(), 2, "readA's R1+R2 group into one template");
 
         let t2 = assemble_next_template(&mut peeked, &mut name_buf, || Ok(it.next()))
             .expect("t2 ok")
             .expect("t2 present");
-        assert_eq!(t2.name, b"readB");
+        assert_eq!(t2.name(), b"readB");
         assert_eq!(t2.read_count(), 1, "readB is a solo template");
 
         assert!(

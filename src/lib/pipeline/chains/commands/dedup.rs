@@ -430,7 +430,7 @@ mod tests {
         let templates = local_ids
             .iter()
             .map(|&id| {
-                let mut template = Template::new(Vec::new());
+                let mut template = Template::new();
                 template.mi = MoleculeId::Single(id);
                 template
             })

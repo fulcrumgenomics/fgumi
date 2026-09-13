@@ -5637,7 +5637,6 @@ mod tests {
         let truncated_secondary = fgumi_raw_bam::RawRecord::from(vec![0u8; 16]);
 
         let template = Template {
-            name: b"rea".to_vec(),
             records: vec![valid_r1, valid_r2, truncated_secondary],
             r1: Some((0, 1)),
             r2: Some((1, 2)),
@@ -5680,7 +5679,6 @@ mod tests {
 
         // Direct field construction to skip from_records validation.
         let template = Template {
-            name: b"rea".to_vec(),
             records: vec![short_rec, valid_rec],
             r1: Some((0, 1)),
             r2: Some((1, 2)),

@@ -1715,7 +1715,7 @@ fn group_by_queryname_emits_contiguous_batches_ending_in_a_partial(#[values(1, 4
     let names: Vec<String> = emitted
         .iter()
         .flat_map(BamTemplateBatch::templates)
-        .map(|t| String::from_utf8_lossy(&t.name).into_owned())
+        .map(|t| String::from_utf8_lossy(t.name()).into_owned())
         .collect();
     let expected: Vec<String> = (0..N_TEMPLATES).map(|t| format!("q{t:05}")).collect();
     assert_eq!(
@@ -2349,7 +2349,7 @@ fn flatten_templates(batches: &[BamTemplateBatch]) -> Vec<(Vec<u8>, Vec<Vec<u8>>
     batches
         .iter()
         .flat_map(BamTemplateBatch::templates)
-        .map(|t| (t.name.clone(), t.records().iter().map(|r| r.as_ref().to_vec()).collect()))
+        .map(|t| (t.name().to_vec(), t.records().iter().map(|r| r.as_ref().to_vec()).collect()))
         .collect()
 }
 

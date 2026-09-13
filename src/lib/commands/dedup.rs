@@ -976,7 +976,7 @@ pub(crate) fn process_position_group(
     templates.sort_by(|a, b| {
         let a_idx = a.mi.to_vec_index();
         let b_idx = b.mi.to_vec_index();
-        a_idx.cmp(&b_idx).then_with(|| a.name.cmp(&b.name))
+        a_idx.cmp(&b_idx).then_with(|| a.name().cmp(b.name()))
     });
 
     // Group by MI and mark duplicates
@@ -2148,7 +2148,6 @@ mod tests {
         let unmapped_r1 = b.build();
         let truncated_r2 = RawRecord::from(vec![0u8; 16]); // < MIN_BAM_RECORD_LEN (32)
         let template = Template {
-            name: b"q1".to_vec(),
             records: vec![unmapped_r1, truncated_r2],
             r1: Some((0, 1)),
             r2: Some((1, 2)),
@@ -2194,7 +2193,6 @@ mod tests {
         let valid_r1 = b.build();
         let truncated_r2 = RawRecord::from(vec![0u8; 16]);
         let template = Template {
-            name: b"q1".to_vec(),
             records: vec![valid_r1, truncated_r2],
             r1: Some((0, 1)),
             r2: Some((1, 2)),
@@ -2251,7 +2249,6 @@ mod tests {
         let truncated_secondary = RawRecord::from(vec![0u8; 16]);
 
         let template = Template {
-            name: b"q1".to_vec(),
             records: vec![valid_r1, valid_r2, truncated_secondary],
             r1: Some((0, 1)),
             r2: Some((1, 2)),
@@ -2909,7 +2906,7 @@ mod tests {
         // Template with no primary reads (empty records list)
         let config = default_filter_config();
         let mut metrics = TemplateFilterCounts::new();
-        let template = Template::new(b"empty".to_vec());
+        let template = Template::new();
 
         assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.rejected_templates(TemplateFilterReason::NoPrimaryReads), 1);

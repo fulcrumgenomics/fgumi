@@ -34,7 +34,8 @@ use fgumi_bam_io::DecodedRecord;
 /// Run-length groups consecutive records by `key.name_hash` (with a read-name
 /// byte compare on hash-equal, matching `GroupByQueryname::process_record`'s
 /// collision guard), builds each run into a [`Template`] via
-/// [`Template::from_records`], and returns the templates plus the summed
+/// [`Template::from_records_trusted`] (each run is same-named by construction),
+/// and returns the templates plus the summed
 /// per-template [`Template::heap_size`] so the caller can build a
 /// [`BamTemplateBatch`] without a second walk.
 ///
@@ -44,8 +45,10 @@ use fgumi_bam_io::DecodedRecord;
 ///
 /// # Errors
 ///
-/// Propagates [`Template::from_records`] validation errors (truncated record,
-/// QNAME mismatch, multiple primary R1/R2).
+/// Propagates [`Template::from_records_trusted`] validation errors (truncated
+/// record, multiple primary R1/R2). The QNAME consistency of each run is
+/// established here by the run-length grouping, not re-verified in the
+/// constructor.
 pub(crate) fn assemble_closed(records: Vec<DecodedRecord>) -> io::Result<(Vec<Template>, usize)> {
     let mut templates: Vec<Template> = Vec::new();
     let mut total_heap: usize = 0;
@@ -62,7 +65,10 @@ pub(crate) fn assemble_closed(records: Vec<DecodedRecord>) -> io::Result<(Vec<Te
         if run.is_empty() {
             return Ok(());
         }
-        let t = Template::from_records(std::mem::take(run))
+        // Trusted constructor: every record in `run` is same-named by
+        // construction (grouped just above), so the cross-record QNAME
+        // re-verification in `from_records` is redundant work here.
+        let t = Template::from_records_trusted(std::mem::take(run))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         *total_heap += t.heap_size();
         templates.push(t);
@@ -200,6 +206,37 @@ mod tests {
         DecodedRecord::from_raw_bytes(raw, key)
     }
 
+    /// Like [`decoded`], but with an explicitly forced `name_hash`, so a test
+    /// can simulate a 64-bit `name_hash` collision between two byte-different
+    /// read names.
+    fn decoded_with_hash(name: &[u8], flag: u16, name_hash: u64) -> DecodedRecord {
+        let key = fgumi_bam_io::GroupKey { name_hash, ..fgumi_bam_io::GroupKey::default() };
+        DecodedRecord::from_raw_bytes(raw_named(name, flag), key)
+    }
+
+    /// Two adjacent records with different read names but a forced identical
+    /// `name_hash` must still split into separate templates. The run-boundary
+    /// *byte* compare (not the hash pre-check) is what separates them — and
+    /// since the grouper now builds with `from_records_trusted`, which skips the
+    /// cross-record QNAME re-verification, this byte compare is the SOLE guard
+    /// against a hash collision merging two differently-named reads into one
+    /// (silently mis-named) template. A regression to hash-only run detection
+    /// would merge them and this test would fail.
+    #[test]
+    fn assemble_closed_splits_on_name_hash_collision() {
+        let records = vec![
+            decoded_with_hash(b"aaa", R1, 0xDEAD_BEEF),
+            decoded_with_hash(b"bbb", R1, 0xDEAD_BEEF),
+        ];
+        let (templates, _) = assemble_closed(records).expect("assemble ok");
+        let names: Vec<&[u8]> = templates.iter().map(Template::name).collect();
+        assert_eq!(
+            names,
+            vec![b"aaa".as_slice(), b"bbb".as_slice()],
+            "same name_hash but different names must not merge into one template",
+        );
+    }
+
     /// `assemble_closed` groups consecutive same-name records into one template
     /// each and sums their heap size.
     #[test]
@@ -211,7 +248,7 @@ mod tests {
             decoded(b"read2", R2),
         ];
         let (templates, total) = assemble_closed(records).expect("assemble ok");
-        let names: Vec<&[u8]> = templates.iter().map(|t| t.name.as_slice()).collect();
+        let names: Vec<&[u8]> = templates.iter().map(Template::name).collect();
         assert_eq!(names, vec![b"read1".as_slice(), b"read2".as_slice()]);
         assert!(templates.iter().all(|t| t.records().len() == 2));
         let expect: usize = templates.iter().map(Template::heap_size).sum();
@@ -232,7 +269,7 @@ mod tests {
     fn assemble_closed_nonadjacent_names_are_separate() {
         let records = vec![decoded(b"x", R1), decoded(b"y", R1), decoded(b"x", R1)];
         let (templates, _) = assemble_closed(records).expect("assemble ok");
-        let names: Vec<&[u8]> = templates.iter().map(|t| t.name.as_slice()).collect();
+        let names: Vec<&[u8]> = templates.iter().map(Template::name).collect();
         assert_eq!(names, vec![b"x".as_slice(), b"y".as_slice(), b"x".as_slice()]);
     }
 

@@ -16,20 +16,18 @@
 //!
 //! # Usage
 //!
-//! Templates can be built incrementally using `Builder`, created from an iterator
-//! of records, or iterated over from a BAM file using `TemplateIterator`.
+//! A template is built from a run of same-named records with
+//! [`Template::from_records`], which verifies the shared name (a crate-internal
+//! `from_records_trusted` skips that check for callers that have already grouped
+//! by read name), or iterated over from a BAM file using `TemplateIterator`.
 //!
 //! # Examples
 //!
 //! ```rust,ignore
-//! // Build a template from records
-//! let mut builder = Builder::new();
-//! for record in records {
-//!     builder.push(record)?;
-//! }
-//! let template = builder.build()?;
+//! // Build a template from a run of same-named records.
+//! let template = Template::from_records(records)?;
 //!
-//! // Access primary reads
+//! // Access primary reads.
 //! if let Some(r1) = template.r1() {
 //!     // Process R1
 //! }
@@ -55,10 +53,12 @@ pub use fgumi_umi::MoleculeId;
 /// - Primary R1 and R2 reads
 /// - Supplementary alignments for R1 and R2
 /// - Secondary alignments for R1 and R2
+///
+/// The shared query name is not stored: it lives in the first record's bytes and
+/// is read on demand via [`Template::name`], avoiding a redundant per-template
+/// allocation (the name is a copy of bytes already held in `records[0]`).
 #[derive(Debug, Clone)]
 pub struct Template {
-    /// The query name (QNAME) shared by all records in this template
-    pub name: Vec<u8>,
     /// Raw BAM records (without `block_size` prefix).
     pub records: Vec<RawRecord>,
     /// Primary R1 read (first segment, non-secondary, non-supplementary)
@@ -86,16 +86,30 @@ pub struct Template {
 /// A batch of templates for parallel processing.
 pub type TemplateBatch = Vec<Template>;
 
+/// Whether [`Template::from_records_inner`] verifies that every record shares
+/// one QNAME (`Verify`) or trusts a caller that has already grouped by read
+/// name (`Trust`). See [`Template::from_records`] / [`Template::from_records_trusted`].
+#[derive(Debug, Clone, Copy)]
+enum QnameCheck {
+    /// Verify the cross-record QNAME consistency (the general constructor).
+    Verify,
+    /// Trust the caller's promise that the run is same-named (the grouper path).
+    Trust,
+}
+
+impl Default for Template {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Template {
-    /// Creates a new empty template with the given name.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The query name for this template
+    /// Creates a new empty template (no records). The query name is derived from
+    /// the records once they are added, so [`Template::name`] returns an empty
+    /// slice until the first record is pushed.
     #[must_use]
-    pub fn new(name: Vec<u8>) -> Self {
+    pub fn new() -> Self {
         Template {
-            name,
             records: Vec::new(),
             r1: None,
             r2: None,
@@ -109,20 +123,29 @@ impl Template {
     }
 
     /// True allocated heap footprint in bytes: summed record **capacities** plus
-    /// the `Vec<RawRecord>` container overhead plus the queryname allocation.
+    /// the `Vec<RawRecord>` container overhead.
     /// Used by the pipeline framework's `BamTemplateBatch` for byte-bounded queue
     /// budgeting, so the budget tracks real RSS. Accounting by logical `len()`
     /// under-counts over-allocated record buffers and ignores container overhead,
     /// which lets the pipeline buffer past its `--max-memory` budget and risk an
     /// OOM (this mirrors `DecodedRecordBatch`, which already sizes by capacity).
+    /// The query name is not counted separately: it is not a distinct allocation,
+    /// its bytes live inside `records[0]` and are already counted there.
     /// `MemoryEstimate::estimate_heap_size` delegates here so the two never
     /// diverge.
     #[must_use]
     pub fn heap_size(&self) -> usize {
-        let name_size = self.name.capacity();
-        let records_size = self.records.iter().map(RawRecord::capacity).sum::<usize>()
-            + self.records.capacity() * std::mem::size_of::<RawRecord>();
-        name_size + records_size
+        self.records.iter().map(RawRecord::capacity).sum::<usize>()
+            + self.records.capacity() * std::mem::size_of::<RawRecord>()
+    }
+
+    /// The query name (QNAME) shared by all records, read on demand from the
+    /// first record's bytes. Returns an empty slice for a template with no
+    /// records. All records in a template share this name by construction (see
+    /// [`Template::from_records`]), so the first record is authoritative.
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        self.records.first().map_or(&[], |r| fgumi_raw_bam::read_name(r.as_ref()))
     }
 
     /// Returns the primary R1 record if present.
@@ -178,17 +201,48 @@ impl Template {
     /// Builds a `Template` from raw BAM byte records, categorizing by flags.
     ///
     /// The records are categorized using `RawRecordView::flags()` to determine
-    /// R1/R2/supplementary/secondary status.
+    /// R1/R2/supplementary/secondary status. All records must share one QNAME;
+    /// this is verified before categorizing.
     ///
     /// # Errors
     ///
-    /// Returns an error if multiple primary R1s or R2s are found.
+    /// Returns an error if the records do not all share one QNAME, or if
+    /// multiple primary R1s or R2s are found.
+    pub fn from_records(raw_records: Vec<RawRecord>) -> Result<Self> {
+        Self::from_records_inner(raw_records, QnameCheck::Verify)
+    }
+
+    /// Builds a `Template` from raw BAM byte records that the caller already
+    /// knows share one QNAME, skipping the cross-record QNAME consistency check.
+    ///
+    /// This is the constructor for callers that have already grouped records by
+    /// read name — the queryname grouper (`assemble_closed` for the parallel
+    /// path, `GroupByQueryname::flush_current_template` for the serial one),
+    /// where every record in a run is same-named by construction. For any valid
+    /// same-named input it produces a template byte- and structure-identical to
+    /// [`Template::from_records`]; it differs only in trusting rather than
+    /// re-verifying the shared name, so it must not be given a mixed-name run.
+    /// Every other structural invariant (record truncation, at most one primary
+    /// R1/R2) is still enforced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a record is truncated, or if multiple primary R1s or
+    /// R2s are found.
+    pub(crate) fn from_records_trusted(raw_records: Vec<RawRecord>) -> Result<Self> {
+        Self::from_records_inner(raw_records, QnameCheck::Trust)
+    }
+
+    /// Shared implementation of [`Template::from_records`] (with `check ==
+    /// QnameCheck::Verify`) and [`Template::from_records_trusted`] (with `check
+    /// == QnameCheck::Trust`). The only behavioural difference is whether the
+    /// cross-record QNAME consistency check runs.
     #[allow(clippy::too_many_lines)]
-    pub fn from_records(mut raw_records: Vec<RawRecord>) -> Result<Self> {
+    fn from_records_inner(mut raw_records: Vec<RawRecord>, check: QnameCheck) -> Result<Self> {
         use fgumi_raw_bam;
 
         if raw_records.is_empty() {
-            bail!("No records given to Template::from_records");
+            bail!("Cannot build a Template from an empty record list");
         }
 
         // Guard against truncated records
@@ -209,14 +263,21 @@ impl Template {
             }
         }
 
-        // Extract name from first record
-        let name = fgumi_raw_bam::read_name(&raw_records[0]).to_vec();
+        // The shared query name, borrowed from the first record. Every error
+        // check below runs before any record is moved out of `raw_records`, so a
+        // borrow suffices here — the name is never copied into the template (it
+        // is read on demand via `Template::name` from `records[0]`).
+        let name = fgumi_raw_bam::read_name(&raw_records[0]);
 
-        // Verify all records share the same QNAME (matching Builder behavior).
-        // Done before the fast path so mismatched names cannot slip past into a Template.
-        for rec in raw_records.iter().skip(1) {
-            if fgumi_raw_bam::read_name(rec) != name.as_slice() {
-                bail!("Template name mismatch in from_records");
+        // Verify all records share the same QNAME. Done before the fast path so
+        // mismatched names cannot slip past into a Template. Skipped on the
+        // trusted path, where the caller (a queryname grouper) has already
+        // established that the run is same-named by construction.
+        if matches!(check, QnameCheck::Verify) {
+            for rec in raw_records.iter().skip(1) {
+                if fgumi_raw_bam::read_name(rec) != name {
+                    bail!("Template name mismatch in from_records");
+                }
             }
         }
 
@@ -240,7 +301,6 @@ impl Template {
                         raw_records.swap(0, 1);
                     }
                     return Ok(Template {
-                        name,
                         records: raw_records,
                         r1: Some((0, 1)),
                         r2: Some((1, 2)),
@@ -362,7 +422,6 @@ impl Template {
         };
 
         Ok(Template {
-            name,
             records: ordered,
             r1: r1_pair,
             r2: r2_pair,
@@ -1083,12 +1142,7 @@ mod tests {
     const FLAG_MATE_UNMAPPED: u16 = 0x8;
     #[test]
     fn heap_size_counts_capacity_and_matches_memory_estimate() {
-        // A queryname allocation with spare capacity: the byte budget must count
-        // the allocated capacity (real RSS), not the 5-byte logical length —
-        // otherwise the pipeline under-counts and can buffer past --max-memory.
-        let mut name = Vec::with_capacity(64);
-        name.extend_from_slice(b"read1");
-        let mut template = Template::new(name);
+        let mut template = Template::new();
 
         // Hold real records in a Vec with deliberately reserved spare capacity so
         // BOTH record terms of `heap_size` are exercised — the per-record byte
@@ -1120,33 +1174,27 @@ mod tests {
 
         // Exact component total re-derived in the test (NOT via
         // estimate_heap_size, which delegates to heap_size and is tautological).
-        // `heap_size` is exactly these three terms, so an exact equality catches a
-        // dropped record-buffer/Vec-backing term AND a capacity()→len() regression
-        // on the record buffers (which the spare capacity above makes observable).
+        // `heap_size` is exactly these two terms — the query name is NOT counted
+        // separately (its bytes live inside records[0]) — so an exact equality
+        // catches a dropped record-buffer/Vec-backing term AND a capacity()→len()
+        // regression on the record buffers (which the spare capacity makes observable).
         let record_bytes = template.records.iter().map(RawRecord::capacity).sum::<usize>();
         let vec_backing = template.records.capacity() * std::mem::size_of::<RawRecord>();
-        let expected_exact = template.name.capacity() + record_bytes + vec_backing;
+        let expected_exact = record_bytes + vec_backing;
         assert_eq!(
             template.heap_size(),
             expected_exact,
-            "heap_size must equal queryname ({}) + record buffers ({record_bytes}) + \
+            "heap_size must equal record buffers ({record_bytes}) + \
              Vec<RawRecord> backing ({vec_backing})",
-            template.name.capacity(),
         );
-        // The record terms must be non-trivial: real byte buffers and the reserved
-        // spare Vec slots both contribute, not just the queryname.
+        // Both record terms must be non-trivial: real byte buffers and the
+        // reserved spare Vec slots both contribute.
         assert!(record_bytes > 0, "records must carry real byte capacity");
         assert!(vec_backing > 0, "Vec<RawRecord> backing store must be counted");
         assert!(
             template.records.capacity() >= 8,
             "reserved spare Vec capacity must be retained ({} < 8)",
             template.records.capacity(),
-        );
-        // And the footprint reflects the allocated queryname capacity (>= 64).
-        assert!(
-            template.heap_size() >= 64,
-            "heap_size must count allocated capacity, got {}",
-            template.heap_size(),
         );
     }
 
@@ -1215,17 +1263,27 @@ mod tests {
     }
 
     #[test]
-    fn test_template_new() {
-        let template = Template::new(b"read1".to_vec());
-        assert_eq!(template.name, b"read1");
+    fn test_template_new_is_empty() {
+        let template = Template::new();
         assert_eq!(template.read_count(), 0);
+        assert_eq!(template.name(), b"", "an empty template has an empty name");
+    }
+
+    #[test]
+    fn name_derives_from_first_record() -> Result<()> {
+        let template = Template::from_records(vec![
+            create_test_raw(b"read1", FLAG_PAIRED | FLAG_READ1),
+            create_test_raw(b"read1", FLAG_PAIRED | FLAG_READ2),
+        ])?;
+        assert_eq!(template.name(), b"read1");
+        Ok(())
     }
 
     #[test]
     fn test_from_records_single_r1() -> Result<()> {
         let r1 = create_test_raw(b"read1", 0);
         let template = Template::from_records(vec![r1])?;
-        assert_eq!(template.name, b"read1");
+        assert_eq!(template.name(), b"read1");
         assert_eq!(template.read_count(), 1);
         assert!(template.r1().is_some());
         Ok(())
@@ -1281,6 +1339,63 @@ mod tests {
     fn test_from_records_error_empty() {
         let result = Template::from_records(vec![]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_records_trusted_error_empty() {
+        let result = Template::from_records_trusted(vec![]);
+        assert!(result.is_err());
+    }
+
+    /// `from_records_trusted` skips only the cross-record QNAME consistency
+    /// check; for valid, same-named input it must build a template byte- and
+    /// structure-identical to `from_records`. This is the parity that lets the
+    /// parallel grouper call the trusted constructor without changing output.
+    #[rstest]
+    #[case::single_end(&[(b"r".as_slice(), 0u16)])]
+    #[case::paired(&[(b"r".as_slice(), FLAG_PAIRED | FLAG_READ1), (b"r".as_slice(), FLAG_PAIRED | FLAG_READ2)])]
+    #[case::r2_before_r1(&[(b"r".as_slice(), FLAG_PAIRED | FLAG_READ2), (b"r".as_slice(), FLAG_PAIRED | FLAG_READ1)])]
+    #[case::with_supplementary(&[
+        (b"r".as_slice(), FLAG_PAIRED | FLAG_READ1),
+        (b"r".as_slice(), FLAG_PAIRED | FLAG_READ2),
+        (b"r".as_slice(), FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY),
+    ])]
+    #[case::with_secondary(&[
+        (b"r".as_slice(), FLAG_PAIRED | FLAG_READ1),
+        (b"r".as_slice(), FLAG_PAIRED | FLAG_READ2 | FLAG_SECONDARY),
+    ])]
+    fn from_records_trusted_matches_from_records(#[case] specs: &[(&[u8], u16)]) -> Result<()> {
+        let build = |specs: &[(&[u8], u16)]| -> Vec<RawRecord> {
+            specs.iter().map(|(n, f)| create_test_raw(n, *f)).collect()
+        };
+        let verified = Template::from_records(build(specs))?;
+        let trusted = Template::from_records_trusted(build(specs))?;
+
+        assert_eq!(trusted.name(), verified.name(), "name must match");
+        assert_eq!(trusted.records.len(), verified.records.len(), "record count must match");
+        for (t, v) in trusted.records.iter().zip(verified.records.iter()) {
+            assert_eq!(t.as_ref(), v.as_ref(), "record bytes must match after reordering");
+        }
+        assert_eq!(trusted.r1, verified.r1, "r1 categorization must match");
+        assert_eq!(trusted.r2, verified.r2, "r2 categorization must match");
+        assert_eq!(trusted.r1_supplementals, verified.r1_supplementals);
+        assert_eq!(trusted.r2_supplementals, verified.r2_supplementals);
+        assert_eq!(trusted.r1_secondaries, verified.r1_secondaries);
+        assert_eq!(trusted.r2_secondaries, verified.r2_secondaries);
+        Ok(())
+    }
+
+    /// `from_records_trusted` keeps every structural invariant enforced during
+    /// categorization — only the cross-record QNAME check is skipped — so a
+    /// second primary R1 is still rejected.
+    #[test]
+    fn from_records_trusted_still_rejects_multiple_primary_r1() {
+        let result = Template::from_records_trusted(vec![
+            create_test_raw(b"r", 0),
+            create_test_raw(b"r", 0),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Multiple non-secondary"));
     }
 
     #[test]

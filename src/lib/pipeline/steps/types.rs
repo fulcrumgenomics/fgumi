@@ -287,6 +287,19 @@ mod tests {
     // RecordBatchBuilder) moved with those types to the `fgumi-pipeline-io`
     // crate. Only the heavy-type tests remain below.
 
+    /// A template holding one real record, so `heap_size()` is non-zero. The
+    /// byte budget these tests exercise comes from the record buffers, not the
+    /// query name (which is no longer stored on the template).
+    fn template_with_record(name: &[u8]) -> Template {
+        use fgumi_raw_bam::{SamBuilder, flags};
+        let mut b = SamBuilder::new();
+        b.read_name(name)
+            .sequence(b"ACGT")
+            .qualities(&[30; 4])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+        Template::from_records(vec![b.build()]).expect("build template")
+    }
+
     #[test]
     fn template_batch_carries_serial() {
         let batch = BamTemplateBatch::new(42, vec![]);
@@ -339,7 +352,7 @@ mod tests {
         // Mirror of the DecodedRecordBatch contract: private fields, read via
         // accessors, consume via `into_parts` to move the templates out and
         // re-wrap through `new` (which recomputes the byte cache).
-        let t1 = crate::template::Template::new(b"read1".to_vec());
+        let t1 = template_with_record(b"read1");
         let expected_bytes = t1.heap_size() + std::mem::size_of::<crate::template::Template>();
         let batch = BamTemplateBatch::new(9, vec![t1]);
         assert_eq!(batch.batch_serial(), 9);
@@ -354,12 +367,12 @@ mod tests {
 
     #[test]
     fn template_batch_new_total_bytes_sums_heap_sizes() {
-        // Template::new(name) → heap_size() == name.len() (no records).
-        // Two templates with distinct known names; no RawRecord builders needed.
-        let t1 = crate::template::Template::new(b"read1".to_vec()); // 5 bytes
-        let t2 = crate::template::Template::new(b"read_two".to_vec()); // 8 bytes
+        // total_bytes must be the summed per-template heap_size plus the
+        // container term. Two record-bearing templates give non-zero heap_size.
+        let t1 = template_with_record(b"read1");
+        let t2 = template_with_record(b"read_two");
         let expected =
-            t1.heap_size() + t2.heap_size() + 2 * std::mem::size_of::<crate::template::Template>(); // 13 + container
+            t1.heap_size() + t2.heap_size() + 2 * std::mem::size_of::<crate::template::Template>();
         let batch = BamTemplateBatch::new(7, vec![t1, t2]);
         assert_eq!(batch.total_bytes, expected);
         assert_eq!(batch.heap_size(), expected); // HeapSize delegates to total_bytes
@@ -419,7 +432,7 @@ mod tests {
     /// Same contract for templates, through both constructors.
     #[test]
     fn template_batch_counts_reserved_container_capacity() {
-        let template = || crate::template::Template::new(b"read1".to_vec());
+        let template = || template_with_record(b"read1");
 
         let mut padded = Vec::with_capacity(64);
         padded.push(template());
