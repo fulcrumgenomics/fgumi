@@ -85,7 +85,10 @@ const PATH_SCOPED_ALLOWLIST: &[(&str, &[&[u8; 2]])] = &[
     // compat-proof tests in raw-bam: explicitly verify b"cd"/b"RX" still compile alongside
     // SamTag::CD_BASES / SamTag::RX, proving backward-compatible byte API still works.
     ("crates/fgumi-raw-bam/src/builder.rs", &[b"cd", b"RX"]),
-    ("crates/fgumi-raw-bam/src/tags.rs", &[b"RX"]),
+    // `BX` (a real SAM tag with no SamTag constant) is used in rebuild_with tests
+    // as an opaque key, proving the API handles arbitrary two-byte tags, not just
+    // those with constants.
+    ("crates/fgumi-raw-bam/src/tags.rs", &[b"RX", b"BX"]),
     // BGZF extra-subfield ID field — not a SAM aux tag.
     ("crates/fgumi-bgzf/src/writer.rs", &[b"BC"]),
     // ZipRawFastqK unit-test fixtures: `<stream-letter><serial-digit>` payload
