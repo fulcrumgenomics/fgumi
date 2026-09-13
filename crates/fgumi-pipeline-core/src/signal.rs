@@ -98,6 +98,17 @@ impl std::error::Error for PipelineError {
 pub struct PipelineSignal {
     state: AtomicU8,
     payload: OnceLock<PipelineError>,
+    /// Late-bound handle to the pool's event-count parker, set by
+    /// `Pipeline::run` before any worker spawns (only when `n_threads > 1`; the
+    /// single-thread paths leave it empty). On a terminal transition
+    /// (`cancel`/`record_error`) the signal wakes every parked worker so they
+    /// observe `is_done()` promptly instead of sleeping to their wait timeout.
+    ///
+    /// Held as a `Weak` to avoid an `Arc` cycle: the event-count does not need
+    /// to keep the signal alive, and the signal must not keep the event-count
+    /// alive past the run. Workers hold the strong `Arc` for the run's duration,
+    /// so the upgrade always succeeds while a worker could be parked.
+    event_count: OnceLock<std::sync::Weak<crate::runtime::event_count::PoolEventCount>>,
 }
 
 impl PipelineSignal {
@@ -130,6 +141,25 @@ impl PipelineSignal {
         self.state.load(AtomicOrdering::Relaxed) == STATE_CANCELLED
     }
 
+    /// Bind the pool's event-count parker so terminal transitions wake parked
+    /// workers. Called once by `Pipeline::run` before spawning workers, only
+    /// when `n_threads > 1`. Idempotent-ish: a second call is silently dropped
+    /// (`OnceLock::set`), which never happens in practice (one `run` per
+    /// signal). Stored as a `Weak` to avoid an `Arc` cycle.
+    pub(crate) fn bind_event_count(&self, ec: &Arc<crate::runtime::event_count::PoolEventCount>) {
+        let _ = self.event_count.set(Arc::downgrade(ec));
+    }
+
+    /// Wake every parked worker after a terminal transition, so they observe
+    /// `is_done()` rather than sleeping to their wait timeout. No-op when no
+    /// event-count is bound (single-thread paths) or it has already been
+    /// dropped (all workers joined — nobody to wake).
+    fn wake_parked_workers(&self) {
+        if let Some(ec) = self.event_count.get().and_then(std::sync::Weak::upgrade) {
+            ec.notify_all();
+        }
+    }
+
     /// First writer wins; later writers are silently dropped (the
     /// `compare_exchange` rejects the state transition and the
     /// `OnceLock::set` rejects the payload write).
@@ -151,6 +181,13 @@ impl PipelineSignal {
         {
             let _ = self.payload.set(err);
         }
+        // Wake any parked workers unconditionally: whether or not this call won
+        // the state CAS, the pipeline is now terminal and parked workers must
+        // observe `is_done()` rather than sleep to their wait timeout. A
+        // redundant `notify_all` (if a prior writer already woke them) is
+        // harmless. Sequenced AFTER the state store so a woken worker's
+        // `is_done()` re-check sees the terminal state.
+        self.wake_parked_workers();
     }
 
     /// First writer wins; later writers (including a `record_error` after
@@ -178,6 +215,9 @@ impl PipelineSignal {
         {
             let _ = self.payload.set(PipelineError::Cancelled);
         }
+        // See `record_error`: wake parked workers unconditionally after the
+        // terminal state store so they observe `is_done()` promptly.
+        self.wake_parked_workers();
     }
 
     /// Read the recorded error payload, if any.

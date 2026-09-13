@@ -6,7 +6,17 @@ use crate::topology::StepIdx;
 
 // Pool worker idle bounds: a pool worker is never unparked, so it sleeps and can
 // ramp to a coarse cap without hurting wake latency.
-const SLEEP_INITIAL_US: u64 = 1;
+//
+// The initial (also the post-progress reset floor) is 20µs, NOT 1µs. A surplus
+// worker in an oversubscribed pool makes the occasional lucky pop, which resets
+// its backoff; a 1µs floor then puts it back on the steep part of the ramp,
+// waking ~every microsecond to run a full empty poll pass (touching every shared
+// queue and probing every `Serial` step) — the churn Layer 0 targets. Wake
+// latency for a worker that just made progress is unaffected: it did work, so it
+// does not sleep at all this pass. The floor only blunts how fast an idle
+// surplus worker re-ramps after a stray success. 20µs is well below any step's
+// per-item service time yet coarse enough to stop the per-microsecond re-poll.
+const SLEEP_INITIAL_US: u64 = 20;
 const SLEEP_MAX_US: u64 = 50_000; // 50 milliseconds
 
 // Dedicated-driver idle bounds: a driver drives a small step subset off the pool
@@ -152,6 +162,15 @@ impl WorkerCore {
 
     pub fn increase_backoff(&mut self) {
         self.backoff_us = self.backoff_us.saturating_mul(2).min(self.policy().max_us());
+    }
+
+    /// The current backoff as a `Duration`, used as the event-count `wait`
+    /// timeout (the self-heal bound on a missed wakeup). Same ramp as
+    /// `sleep_backoff` would sleep, so a parked worker's timeout grows on
+    /// repeated idle just as the spin-sleep did.
+    #[must_use]
+    pub fn backoff_deadline(&self) -> Duration {
+        Duration::from_micros(self.backoff_us)
     }
 
     #[cfg(test)]
