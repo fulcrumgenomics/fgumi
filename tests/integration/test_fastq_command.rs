@@ -1316,3 +1316,43 @@ fn test_fastq_bwa_chunk_size_deprecated_but_accepted() {
         "--bwa-chunk-size must not affect output (it is ignored)"
     );
 }
+
+/// `fgumi fastq` honors the shared `--check-crc`/`--no-check-crc` policy so a
+/// trusted piped BAM file can skip the (otherwise per-record) CRC verification
+/// and hand those cycles to the aligner. Asserts the resolved policy for the
+/// three cases: default file input verifies; `--no-check-crc` forces off even
+/// for a file; `--check-crc` forces on.
+#[test]
+fn test_fastq_check_crc_flags_resolve_the_verify_policy() {
+    use fgumi_lib::commands::common::resolve_check_crc;
+
+    let base = ["fastq", "-i", "input.bam"];
+
+    let default = Fastq::try_parse_from(base).expect("parse default");
+    assert!(
+        resolve_check_crc(default.check_crc, default.no_check_crc, &default.input),
+        "a file input verifies CRC by default"
+    );
+
+    let mut no_crc = base.to_vec();
+    no_crc.push("--no-check-crc");
+    let no_crc = Fastq::try_parse_from(no_crc).expect("parse --no-check-crc");
+    assert!(
+        !resolve_check_crc(no_crc.check_crc, no_crc.no_check_crc, &no_crc.input),
+        "--no-check-crc forces verification off even for a file input"
+    );
+
+    let mut yes_crc = base.to_vec();
+    yes_crc.push("--check-crc");
+    let yes_crc = Fastq::try_parse_from(yes_crc).expect("parse --check-crc");
+    assert!(
+        resolve_check_crc(yes_crc.check_crc, yes_crc.no_check_crc, &yes_crc.input),
+        "--check-crc forces verification on"
+    );
+
+    // The two flags are mutually exclusive.
+    let mut both = base.to_vec();
+    both.push("--check-crc");
+    both.push("--no-check-crc");
+    assert!(Fastq::try_parse_from(both).is_err(), "--check-crc and --no-check-crc must conflict");
+}
