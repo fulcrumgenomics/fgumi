@@ -217,8 +217,8 @@ pub(crate) enum ChainTailKind {
     /// reads no key (see
     /// [`ChainBuilder::first_stage_uses_raw_record_fast_path`]); the source
     /// preamble ends in `ParseBamRecords` rather than `DecodeRecords`. Consumed
-    /// by the fast-path per-record transform steps (single-record `Filter`
-    /// today).
+    /// by the fast-path per-record transform steps (`CopyUmi` and single-record
+    /// `Filter` today).
     ///
     /// [`RecordBatch`]: crate::pipeline::steps::types::RecordBatch
     RecordBatch,
@@ -1638,8 +1638,8 @@ impl<'a> ChainBuilder<'a> {
     /// decode (`DecodeRecords`), skipping the per-record heap allocation and the
     /// dead key computation.
     ///
-    /// Only single-record `Filter` qualifies today (PRs for `CopyUmi`/`Retag`
-    /// extend this). `--filter-by-template` is excluded: it inserts a
+    /// `CopyUmi` and single-record `Filter` qualify today (a PR for `Retag`
+    /// extends this). `--filter-by-template` is excluded: it inserts a
     /// `GroupByQueryname` grouper that reads `name_hash`, so it must keep the
     /// `DecodedRecordBatch` tail. Consulted only inside the BAM arm of
     /// [`Self::add_source`]; SAM source always keeps the `DecodedRecordBatch`
@@ -1647,8 +1647,14 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// [`RecordBatch`]: crate::pipeline::steps::types::RecordBatch
     fn first_stage_uses_raw_record_fast_path(&self) -> bool {
-        matches!(self.spec.stages.first(), Some(Stage::Filter))
-            && self.spec.stage_opts.filter.as_ref().is_some_and(|f| !f.filter_by_template)
+        match self.spec.stages.first() {
+            // `CopyUmi` is unconditionally per-record (no template mode).
+            Some(Stage::CopyUmi) => true,
+            Some(Stage::Filter) => {
+                self.spec.stage_opts.filter.as_ref().is_some_and(|f| !f.filter_by_template)
+            }
+            _ => false,
+        }
     }
 
     /// Append the 4-step BAM decode preamble:
@@ -5140,6 +5146,7 @@ impl<'a> ChainBuilder<'a> {
         use crate::logging::OperationTimer;
         use crate::pipeline::chains::commands::copy_umi::{
             CopyUmiFinalizeHook, CopyUmiMetricsFinalizeHook, build_copy_umi_process_step,
+            build_copy_umi_process_step_raw,
         };
         use crate::validation::validate_file_exists;
         use fgumi_bam_io::is_stdin_path;
@@ -5152,13 +5159,17 @@ impl<'a> ChainBuilder<'a> {
             );
         }
 
-        // Copy-umi consumes a record stream, so it needs a DecodedRecordBatch
-        // tail (same requirement as filter/clip). Reject any other upstream tail.
-        if !matches!(self.chain_tail_kind, ChainTailKind::DecodedRecordBatch { .. }) {
+        // Copy-umi consumes a record stream: the owned `DecodedRecordBatch` (SAM
+        // source) or the borrowed `RecordBatch` decode-free fast path (BAM — see
+        // `first_stage_uses_raw_record_fast_path`). Reject any other upstream tail.
+        if !matches!(
+            self.chain_tail_kind,
+            ChainTailKind::DecodedRecordBatch { .. } | ChainTailKind::RecordBatch
+        ) {
             bail!(
-                "Stage::CopyUmi requires a record-stream input (DecodedRecordBatch), but the chain \
-                 tail is {:?}; copy-umi cannot follow a stage that emits grouped templates or \
-                 serialized bytes.",
+                "Stage::CopyUmi requires a record-stream input (DecodedRecordBatch or RecordBatch), \
+                 but the chain tail is {:?}; copy-umi cannot follow a stage that emits grouped \
+                 templates or serialized bytes.",
                 self.chain_tail_kind
             );
         }
@@ -5192,12 +5203,24 @@ impl<'a> ChainBuilder<'a> {
         let accumulators = Arc::clone(&setup.collected_metrics);
 
         let captures = copy_umi.process_captures(&setup)?;
-        let step = build_copy_umi_process_step(
-            self.tuning.per_step_byte_limit,
-            captures,
-            Arc::clone(&accumulators),
-        );
-        self.current_tail = Some(self.pipeline.append_step(step, tail));
+        // On the decode-free fast path the step consumes a borrowed `RecordBatch`;
+        // otherwise the owned `DecodedRecordBatch` (SAM source).
+        let process_tail = if self.chain_tail_kind == ChainTailKind::RecordBatch {
+            let step = build_copy_umi_process_step_raw(
+                self.tuning.per_step_byte_limit,
+                captures,
+                Arc::clone(&accumulators),
+            );
+            self.pipeline.append_step(step, tail)
+        } else {
+            let step = build_copy_umi_process_step(
+                self.tuning.per_step_byte_limit,
+                captures,
+                Arc::clone(&accumulators),
+            );
+            self.pipeline.append_step(step, tail)
+        };
+        self.current_tail = Some(process_tail);
 
         // Register the finalize hooks — BOTH on `finalize_on_success` (not the
         // always-run `finalize`): a bad record aborts the run before the pipeline
@@ -6093,6 +6116,16 @@ mod tests {
         let spec = empty_spec(vec![Stage::Group]);
         let builder = chain_builder_for_stages(&spec);
         assert!(!builder.first_stage_uses_raw_record_fast_path());
+    }
+
+    /// `CopyUmi` is a per-record transform that reads no `GroupKey`, so a BAM
+    /// source takes the decode-free `RecordBatch` fast path (no by-template mode
+    /// to exclude, unlike filter).
+    #[test]
+    fn first_stage_uses_raw_record_fast_path_true_for_copy_umi() {
+        let spec = empty_spec(vec![Stage::CopyUmi]);
+        let builder = chain_builder_for_stages(&spec);
+        assert!(builder.first_stage_uses_raw_record_fast_path());
     }
 
     /// `source_group_key_config` routes a chain-clip first stage to the cheap

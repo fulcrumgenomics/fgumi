@@ -13,15 +13,17 @@ use std::sync::atomic::Ordering;
 use anyhow::Result;
 use log::info;
 
+use fgumi_raw_bam::RawRecord;
+
 use crate::commands::copy_umi::{
-    CollectedCopyUmiMetrics, CopyUmiProcessCaptures, copy_umi_into_record,
+    CollectedCopyUmiMetrics, CopyUmiProcessCaptures, RecordOutcome, copy_umi_into_record,
     warn_and_log_copy_umi_summary, write_copy_umi_metrics,
 };
 use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::pipeline::chains::FinalizeHook;
 use crate::pipeline::steps::process::{ProcessOrdered, process_ordered};
-use crate::pipeline::steps::types::{DecodedRecordBatch, DecompressedBlock};
+use crate::pipeline::steps::types::{DecodedRecordBatch, DecompressedBlock, RecordBatch};
 
 /// Reduce the per-thread accumulators into a single set of totals. The pipeline
 /// is fully drained before any finalize hook runs, so every slot holds its final
@@ -98,13 +100,43 @@ fn record_batch_metrics(
     });
 }
 
+/// Apply the copy-UMI transform to one record and write it framed to `bytes`.
+///
+/// The single per-record body shared by the owned (`DecodedRecordBatch`) and
+/// borrowed (`RecordBatch`) copy-UMI builders, so the transform, error wrapping,
+/// and framing cannot drift between the decode path and the decode-free fast
+/// path. Returns the [`RecordOutcome`] for the caller's `rx_overwritten` /
+/// `names_trimmed` tallies.
+fn copy_umi_one_record(
+    record: &mut RawRecord,
+    captures: &CopyUmiProcessCaptures,
+    bytes: &mut Vec<u8>,
+) -> io::Result<RecordOutcome> {
+    let outcome = copy_umi_into_record(
+        record,
+        captures.field_delimiter,
+        captures.reverse_complement_prefixed,
+        captures.remove_umi,
+        captures.fail_if_tag_present,
+    )
+    // `{e:#}` (anyhow's alternate Display) joins the full cause chain into one
+    // string before crossing the `io::Error` boundary: `io::Error`'s own Display
+    // only ever shows its wrapped error's top-level Display, so a bare
+    // `io::Error::other(e)` would silently drop the inner cause (e.g. "Invalid
+    // UMI ... illegal character ...") once the pipeline reconstructs a step
+    // failure from this `io::Error`.
+    .map_err(|e| io::Error::other(format!("{e:#}")))?;
+    fgumi_raw_bam::write_framed_record(bytes, record.as_ref())?;
+    Ok(outcome)
+}
+
 /// Build the copy-umi process step (`DecodedRecordBatch → DecompressedBlock`).
 ///
 /// Parallel, `ByItemOrdinal`. Every record is kept (no filtering, no rejects);
-/// the read-name UMI is copied into `RX` in place. A bad/empty UMI (or an
-/// existing RX under `--fail-if-tag-present`) aborts the run, matching the
-/// pre-cutover pipeline `process_fn`. The error crosses an `io::Error`
-/// boundary (`map_err`) with its full `anyhow` cause chain flattened into the
+/// the read-name UMI is copied into `RX` in place (via [`copy_umi_one_record`]).
+/// A bad/empty UMI (or an existing RX under `--fail-if-tag-present`) aborts the
+/// run, matching the pre-cutover pipeline `process_fn`. The error crosses an
+/// `io::Error` boundary with its full `anyhow` cause chain flattened into the
 /// message via `{e:#}` first, so the pipeline's step-failure reconstruction
 /// (which reads only the `io::Error`'s top-level Display) still surfaces the
 /// inner cause, not just the outer "extracting UMI from read name" context.
@@ -135,29 +167,73 @@ pub(crate) fn build_copy_umi_process_step(
 
             for decoded in records {
                 let mut record = decoded.into_raw_bytes();
-                let outcome = copy_umi_into_record(
-                    &mut record,
-                    captures.field_delimiter,
-                    captures.reverse_complement_prefixed,
-                    captures.remove_umi,
-                    captures.fail_if_tag_present,
-                )
-                // `{e:#}` (anyhow's alternate Display) joins the full cause chain into
-                // one string before crossing the `io::Error` boundary: `io::Error`'s own
-                // Display only ever shows its wrapped error's top-level Display, so a
-                // bare `io::Error::other(e)` would silently drop the inner cause (e.g.
-                // "Invalid UMI ... illegal character ...") once the pipeline reconstructs
-                // a step failure from this `io::Error` — exactly the diagnostic the
-                // no-`--threads` path used to show before the chain became the only path.
-                .map_err(|e| io::Error::other(format!("{e:#}")))?;
+                let outcome = copy_umi_one_record(&mut record, &captures, &mut bytes)?;
                 if outcome.overwrote_rx {
                     rx_overwritten += 1;
                 }
                 if outcome.trimmed_name {
                     names_trimmed += 1;
                 }
-                fgumi_raw_bam::write_framed_record(&mut bytes, record.as_ref())?;
             }
+
+            record_batch_metrics(
+                &captures,
+                &accumulators,
+                total_records,
+                rx_overwritten,
+                names_trimmed,
+            );
+
+            Ok(DecompressedBlock { batch_serial, bytes })
+        },
+    )
+}
+
+/// Build the copy-UMI step on the decode-free `RecordBatch` fast path.
+///
+/// `RecordBatch → DecompressedBlock`. Behavior identical to
+/// [`build_copy_umi_process_step`] — same [`copy_umi_one_record`] per record —
+/// but iterates borrowed record byte-ranges via
+/// [`for_each_raw_record`](crate::pipeline::chains::commands::for_each_raw_record)
+/// with one reused scratch `RawRecord`, skipping the per-record `DecodedRecord`
+/// allocation and the dead `GroupKey` of the decode path.
+///
+/// `pub(crate)` — consumed only by `ChainBuilder::add_copy_umi` on a BAM source.
+#[allow(clippy::type_complexity)]
+pub(crate) fn build_copy_umi_process_step_raw(
+    limit_bytes: u64,
+    captures: CopyUmiProcessCaptures,
+    accumulators: Arc<PerThreadAccumulator<CollectedCopyUmiMetrics>>,
+) -> ProcessOrdered<
+    RecordBatch,
+    DecompressedBlock,
+    impl Fn(RecordBatch) -> io::Result<DecompressedBlock> + Send + Sync + 'static,
+> {
+    process_ordered::<RecordBatch, DecompressedBlock, _>(
+        "CopyUmiProcess",
+        limit_bytes,
+        move |item: RecordBatch| -> io::Result<DecompressedBlock> {
+            let batch_serial = item.batch_serial();
+            let total_records = item.len() as u64;
+            let mut bytes: Vec<u8> = Vec::new();
+            let mut rx_overwritten: u64 = 0;
+            let mut names_trimmed: u64 = 0;
+            let mut scratch = RawRecord::new();
+
+            crate::pipeline::chains::commands::for_each_raw_record(
+                &item,
+                &mut scratch,
+                |record| {
+                    let outcome = copy_umi_one_record(record, &captures, &mut bytes)?;
+                    if outcome.overwrote_rx {
+                        rx_overwritten += 1;
+                    }
+                    if outcome.trimmed_name {
+                        names_trimmed += 1;
+                    }
+                    Ok(())
+                },
+            )?;
 
             record_batch_metrics(
                 &captures,
