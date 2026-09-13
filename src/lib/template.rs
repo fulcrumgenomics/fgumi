@@ -220,23 +220,33 @@ impl Template {
     /// path, `GroupByQueryname::flush_current_template` for the serial one),
     /// where every record in a run is same-named by construction. For any valid
     /// same-named input it produces a template byte- and structure-identical to
-    /// [`Template::from_records`]; it differs only in trusting rather than
-    /// re-verifying the shared name, so it must not be given a mixed-name run.
-    /// Every other structural invariant (record truncation, at most one primary
-    /// R1/R2) is still enforced.
+    /// [`Template::from_records`].
+    ///
+    /// # Preconditions (trusted, not checked here)
+    ///
+    /// - The records share one QNAME — so it must not be given a mixed-name run.
+    /// - Each record is well-formed enough to read its fixed-offset fields and
+    ///   read name (`len >= MIN_BAM_RECORD_LEN` and the name region in bounds).
+    ///   The per-record truncation guard that [`Template::from_records`] runs is
+    ///   skipped here; the only callers are the queryname groupers, whose records
+    ///   come from `DecodeRecords`, which already enforces the identical check via
+    ///   `validate_record_for_decode`. Violating this can panic or misread rather
+    ///   than return an error.
+    ///
+    /// The at-most-one-primary-R1/R2 check *is* still enforced.
     ///
     /// # Errors
     ///
-    /// Returns an error if a record is truncated, or if multiple primary R1s or
-    /// R2s are found.
+    /// Returns an error if multiple primary R1s or R2s are found.
     pub(crate) fn from_records_trusted(raw_records: Vec<RawRecord>) -> Result<Self> {
         Self::from_records_inner(raw_records, QnameCheck::Trust)
     }
 
     /// Shared implementation of [`Template::from_records`] (with `check ==
     /// QnameCheck::Verify`) and [`Template::from_records_trusted`] (with `check
-    /// == QnameCheck::Trust`). The only behavioural difference is whether the
-    /// cross-record QNAME consistency check runs.
+    /// == QnameCheck::Trust`). On the trusted path both the per-record truncation
+    /// guard and the cross-record QNAME consistency check are skipped; everything
+    /// else (fast path, flag categorization, at-most-one-primary check) is shared.
     #[allow(clippy::too_many_lines)]
     fn from_records_inner(mut raw_records: Vec<RawRecord>, check: QnameCheck) -> Result<Self> {
         use fgumi_raw_bam;
@@ -245,21 +255,29 @@ impl Template {
             bail!("Cannot build a Template from an empty record list");
         }
 
-        // Guard against truncated records
-        for (i, r) in raw_records.iter().enumerate() {
-            if r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN {
-                bail!(
-                    "Raw BAM record {i} too short to parse ({} < {})",
-                    r.len(),
-                    fgumi_raw_bam::MIN_BAM_RECORD_LEN
-                );
-            }
-            let l_rn = r[8] as usize;
-            if r.len() < 32 + l_rn {
-                bail!(
-                    "Raw BAM record {i} truncated: l_read_name={l_rn} but only {} bytes after header",
-                    r.len() - 32
-                );
+        // Guard against truncated records before the fast path and the
+        // fixed-offset reads below (flags, read name) can index out of bounds.
+        // Skipped on the trusted path: its only callers are the queryname
+        // groupers, which are fed exclusively by `DecodeRecords`, and decode
+        // already runs the identical check on every record via
+        // `validate_record_for_decode` (`steps/parse/decode.rs`) — so re-running
+        // it here is redundant work on the grouping hot path.
+        if matches!(check, QnameCheck::Verify) {
+            for (i, r) in raw_records.iter().enumerate() {
+                if r.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN {
+                    bail!(
+                        "Raw BAM record {i} too short to parse ({} < {})",
+                        r.len(),
+                        fgumi_raw_bam::MIN_BAM_RECORD_LEN
+                    );
+                }
+                let l_rn = r[8] as usize;
+                if r.len() < 32 + l_rn {
+                    bail!(
+                        "Raw BAM record {i} truncated: l_read_name={l_rn} but only {} bytes after header",
+                        r.len() - 32
+                    );
+                }
             }
         }
 
