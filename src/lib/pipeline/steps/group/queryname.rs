@@ -62,6 +62,14 @@ pub struct GroupByQueryname {
     target_batch_count: usize,
     output_byte_limit: u64,
     name: &'static str,
+    /// Scheduling affinity for this `Serial` step. Default `Affinity::None`
+    /// (every worker may attempt it) preserves the behaviour of every chain
+    /// that does not opt in. A chain where this step is the throughput ceiling
+    /// (e.g. `correct`, whose parallel `correct` step is fed only by this
+    /// grouper) can pin it to a single worker via [`Self::with_affinity`] so
+    /// surplus workers `Skip` it entirely instead of probing its mutex every
+    /// idle pass (Layer 1 of the oversubscription fix).
+    affinity: crate::pipeline::core::step::Affinity,
 }
 
 impl GroupByQueryname {
@@ -84,7 +92,21 @@ impl GroupByQueryname {
             target_batch_count: target_batch_count.max(1),
             output_byte_limit,
             name: "GroupByQueryname",
+            affinity: crate::pipeline::core::step::Affinity::None,
         }
+    }
+
+    /// Pin this `Serial` grouper to a single worker (Layer 1 oversubscription
+    /// fix). With a non-`None` affinity the step is a build-time `Skip` on every
+    /// other worker, so no surplus worker ever probes or takes its mutex — use
+    /// when this grouper is a chain's throughput ceiling. The caller must pass a
+    /// worker index `< n_threads` (`Affinity::Worker(k)` with `k >= n_threads`
+    /// panics at run start); prefer a non-zero `k` so it does not share worker 0
+    /// with a sticky reader source.
+    #[must_use]
+    pub fn with_affinity(mut self, affinity: crate::pipeline::core::step::Affinity) -> Self {
+        self.affinity = affinity;
+        self
     }
 
     /// Flush the run-in-progress into the accumulator (if non-empty). The
@@ -168,6 +190,10 @@ impl Step for GroupByQueryname {
             output_queues: vec![QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit }],
             branch_ordering: vec![BranchOrdering::ByItemOrdinal],
         }
+    }
+
+    fn affinity(&self) -> crate::pipeline::core::step::Affinity {
+        self.affinity
     }
 
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {

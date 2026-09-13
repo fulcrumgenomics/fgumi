@@ -1178,6 +1178,32 @@ impl Pipeline {
         // with Serial+sticky+Affinity targeting). Indexed by worker id.
         let sticky_owners = assign_sticky_owners(&steps, &owners, n_threads);
 
+        // 1b. Compute which workers are "pinned" — the sole eligible dispatcher
+        // of some step: an Exclusive owner, a sticky owner, or the affinity
+        // target of a `Serial` step (including a non-sticky affinity like the
+        // `correct` chain's pinned `GroupByQueryname`). A pinned worker must NOT
+        // deep-park on the shared event-count: `notify_one` cannot target a
+        // specific worker, so a push meant to wake a pinned step's owner could
+        // wake a peer that `Skip`s it, leaving the owner asleep. Pinned workers
+        // keep the exponential-backoff sleep (they are ≤ a handful of N and were
+        // never the oversubscription problem). Computed while `steps` is still
+        // alive, before `build_worker_storage` consumes it.
+        let pinned_workers: Vec<bool> = {
+            let mut pinned = vec![false; n_threads];
+            for (w, p) in pinned.iter_mut().enumerate() {
+                *p = owners.contains(&Some(w)) || sticky_owners[w].is_some();
+            }
+            for step in &steps {
+                if step.kind() == crate::step::StepKind::Serial
+                    && let Some(target) = step.affinity().target_worker(n_threads)
+                    && target < n_threads
+                {
+                    pinned[target] = true;
+                }
+            }
+            pinned
+        };
+
         // 2. Build per-step contexts (input + output handles). Domain counters
         // are allocated only when telemetry is on (`counters_enabled`), so the
         // telemetry-off path keeps its byte-identical zero-allocation route —
@@ -1264,6 +1290,21 @@ impl Pipeline {
         let mut worker_entries = build_worker_storage(steps, &owners, n_threads);
 
         let signal_arc = Arc::clone(&signal);
+
+        // 4-0. Pool event-count parker (Layer 2 oversubscription fix). Only for
+        // the multi-worker path: with one worker there is no peer to notify and
+        // nothing to park behind. Bound to the signal *before* any worker spawns
+        // so a terminal transition (cancel/error) can wake every parked worker.
+        // The signal holds only a `Weak`, so this `Arc` (kept alive here for the
+        // whole run scope) is what keeps the parker live while workers could be
+        // parked.
+        let parker: Option<Arc<crate::runtime::event_count::PoolEventCount>> = if n_threads > 1 {
+            let ec = Arc::new(crate::runtime::event_count::PoolEventCount::new(n_threads));
+            signal_arc.bind_event_count(&ec);
+            Some(ec)
+        } else {
+            None
+        };
 
         // 4a. Optional deadlock-detection monitor. Spawns a watcher
         // thread that periodically samples the stats snapshot; if no
@@ -1498,6 +1539,7 @@ impl Pipeline {
                 let liveness_clone = Arc::clone(&liveness);
                 // Detached drivers take board slots after the pool workers.
                 let board_clone = worker_board.clone();
+                let parker_clone = parker.clone();
                 let state_slot = n_threads + driver_idx;
                 let thread_name = match group.label() {
                     DetachedGroup::Shared(label) => format!("fgumi-driver-{label}"),
@@ -1524,6 +1566,7 @@ impl Pipeline {
                                     &liveness_clone,
                                     board_clone.as_deref(),
                                     state_slot,
+                                    parker_clone.as_deref(),
                                 );
                             }))
                         {
@@ -1586,6 +1629,9 @@ impl Pipeline {
                     // the zero-cost path.
                     worker_board.as_deref(),
                     0,
+                    // n_threads == 1: no parker (nobody to notify / park behind).
+                    None,
+                    pinned_workers[0],
                 );
             })) {
                 signal_arc.cancel();
@@ -1610,6 +1656,8 @@ impl Pipeline {
                 // Pool worker `worker_id` takes board slot `worker_id` (telemetry
                 // on); `None` on the zero-cost path.
                 let board_clone = worker_board.clone();
+                let parker_clone = parker.clone();
+                let pinned = pinned_workers[worker_id];
 
                 let handle = thread::Builder::new()
                     .name(format!("fgumi-worker-{worker_id}"))
@@ -1639,6 +1687,8 @@ impl Pipeline {
                                     scheduler_clone.as_ref(),
                                     board_clone.as_deref(),
                                     worker_id,
+                                    parker_clone.as_deref(),
+                                    pinned,
                                 );
                             }))
                         {
