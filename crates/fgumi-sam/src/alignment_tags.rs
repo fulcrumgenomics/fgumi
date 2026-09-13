@@ -270,10 +270,9 @@ pub fn regenerate_alignment_tags_raw(
     }
     // For unmapped reads, remove alignment tags
     if RawRecordView::new(record).is_unmapped() {
-        let mut editor = RawTagsEditor::from_vec(record);
-        editor.remove(SamTag::NM);
-        editor.remove(SamTag::UQ);
-        editor.remove(SamTag::MD);
+        // Strip all three alignment tags in a single aux pass.
+        RawTagsEditor::from_vec(record)
+            .rebuild_with(&[SamTag::NM.into(), SamTag::UQ.into(), SamTag::MD.into()], &[]);
         return Ok(false);
     }
 
@@ -286,10 +285,9 @@ pub fn regenerate_alignment_tags_raw(
         // unmapped branch above and fgbio's `regenerateNmUqMdTags`. Failing
         // closed here means a downstream consumer sees no tag instead of a
         // wrong one.
-        let mut editor = RawTagsEditor::from_vec(record);
-        editor.remove(SamTag::NM);
-        editor.remove(SamTag::UQ);
-        editor.remove(SamTag::MD);
+        // Strip all three alignment tags in a single aux pass.
+        RawTagsEditor::from_vec(record)
+            .rebuild_with(&[SamTag::NM.into(), SamTag::UQ.into(), SamTag::MD.into()], &[]);
         return Ok(false);
     }
     let ref_seqs = header.reference_sequences();
