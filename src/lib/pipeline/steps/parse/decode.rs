@@ -47,7 +47,8 @@ use fgumi_bam_io::{DecodedRecord, GroupKeyConfig, key_for_mode};
 /// `RecordBatch` walked by [`DecodeFromRecords`]) accept any record whose
 /// `block_size` prefix is internally consistent — they do **not** enforce a
 /// per-record minimum body size (see `parse_records`' contract). Both
-/// [`name_hash_key`] and [`compute_group_key_from_raw`] then call
+/// [`name_hash_key`](fgumi_bam_io::name_hash_key) and
+/// [`compute_group_key_from_raw`](fgumi_bam_io::compute_group_key_from_raw) then call
 /// `fgumi_raw_bam::read_name`, which reads `raw[8]` (`l_read_name`, including
 /// the trailing NUL) and slices `raw[32..32 + l_read_name - 1]` with **no**
 /// bounds check; the full-key path additionally reads the 32-byte fixed header
