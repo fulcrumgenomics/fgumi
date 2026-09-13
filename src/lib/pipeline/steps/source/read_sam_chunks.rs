@@ -64,8 +64,8 @@ pub struct ReadSamState {
     /// drive the rejection path with a small cap instead of buffering a
     /// gigabyte; production callers get [`MAX_RECORD_BYTES`] via `new`.
     max_record_bytes: usize,
-    /// Batch cut mode. [`BatchCut::Record`] (default) splits at any line
-    /// boundary; [`BatchCut::Queryname`] carries the trailing partial queryname
+    /// Batch cut mode. [`BatchCut::Record`](crate::pipeline::steps::boundaries::state::BatchCut::Record) (default) splits at any line
+    /// boundary; [`BatchCut::Queryname`](crate::pipeline::steps::boundaries::state::BatchCut::Queryname) carries the trailing partial queryname
     /// run so every emitted chunk is closed under queryname (mirrors the BAM
     /// `FindBamBoundaries` cut).
     cut: crate::pipeline::steps::boundaries::state::BatchCut,
@@ -94,7 +94,7 @@ impl ReadSamState {
         }
     }
 
-    /// Select the batch cut mode + coalescing target (see [`BatchCut`]).
+    /// Select the batch cut mode + coalescing target (see [`BatchCut`](crate::pipeline::steps::boundaries::state::BatchCut)).
     #[must_use]
     fn with_cut(
         mut self,
