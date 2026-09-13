@@ -2146,7 +2146,20 @@ impl<'a> ChainBuilder<'a> {
         let tail = if self.chain_tail_kind == ChainTailKind::BamTemplateBatch {
             tail
         } else {
-            self.pipeline.append_step(GroupByQueryname::new(self.tuning.per_step_byte_limit), tail)
+            // Layer 1 (oversubscription): `GroupByQueryname` is the throughput
+            // ceiling of the `correct` chain — it is the sole `Serial` feeder of
+            // the parallel `correct` step. Left as `Affinity::None` it is probed
+            // by every one of N workers on every idle pass; pin it to a single
+            // worker so the surplus `Skip` it entirely. Worker 1 (not 0, which
+            // hosts the sticky reader source), clamped so `--threads 1` maps to
+            // worker 0 rather than requesting a non-existent worker (which would
+            // panic at run start).
+            use crate::pipeline::core::step::Affinity;
+            let pin = Affinity::Worker(1.min(num_threads.saturating_sub(1)));
+            self.pipeline.append_step(
+                GroupByQueryname::new(self.tuning.per_step_byte_limit).with_affinity(pin),
+                tail,
+            )
         };
 
         // Dispatch on rejects presence: either a 2-output or a 1-output step.
