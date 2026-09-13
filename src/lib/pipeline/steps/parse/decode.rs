@@ -38,7 +38,7 @@ use crate::pipeline::core::reorder::BranchOrdering;
 use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
 use crate::pipeline::steps::parse::bam::parse_records;
 use crate::pipeline::steps::types::{DecodedRecordBatch, DecompressedBlock, RecordBatch};
-use fgumi_bam_io::{DecodedRecord, GroupKeyConfig, compute_group_key_from_raw, name_hash_key};
+use fgumi_bam_io::{DecodedRecord, GroupKeyConfig, key_for_mode};
 
 /// Fail closed on a raw BAM record body too short for the unchecked field
 /// accessors used during group-key extraction.
@@ -224,7 +224,7 @@ impl Step for DecodeRecords {
         let records = parse_records(&bytes)?;
         let library_index: &Arc<_> = &self.key_config.library_index;
         let cell_tag = self.key_config.cell_tag;
-        let name_hash_only = self.key_config.name_hash_only;
+        let key_mode = self.key_config.key_mode;
         let umi_tag = self.key_config.umi_tag;
         let decoded: Vec<DecodedRecord> = records
             .into_iter()
@@ -233,13 +233,10 @@ impl Step for DecodeRecords {
                 // truncated/malformed body would otherwise panic in
                 // `read_name` (see `validate_record_for_decode`).
                 validate_record_for_decode(raw.as_ref())?;
-                // Queryname-grouping stages (e.g. correct) read only
-                // `key.name_hash`; skip the CIGAR position walk + aux-tag pass.
-                let key = if name_hash_only {
-                    name_hash_key(raw.as_ref())
-                } else {
-                    compute_group_key_from_raw(raw.as_ref(), library_index, cell_tag)
-                };
+                // Compute only as much key as the downstream stage reads:
+                // `None` (fastq) skips it entirely, `NameHashOnly` (correct)
+                // skips the CIGAR walk + aux pass, `Full` does everything.
+                let key = key_for_mode(key_mode, raw.as_ref(), library_index, cell_tag);
                 let mut decoded = DecodedRecord::from_raw_bytes(raw, key);
                 // Cache the UMI value position so the Group step's assignment
                 // pass can slice it without re-scanning aux data (#334).
@@ -349,7 +346,7 @@ impl Step for DecodeFromRecords {
 
         let library_index: &Arc<_> = &self.key_config.library_index;
         let cell_tag = self.key_config.cell_tag;
-        let name_hash_only = self.key_config.name_hash_only;
+        let key_mode = self.key_config.key_mode;
         let umi_tag = self.key_config.umi_tag;
         // `DecodedRecord` owns its bytes (via `RawRecord`), so we materialize
         // a heap-allocated copy here. The `RecordBatch`'s shared backing
@@ -361,14 +358,9 @@ impl Step for DecodeFromRecords {
                 // truncated/malformed body would otherwise panic in
                 // `read_name` (see `validate_record_for_decode`).
                 validate_record_for_decode(bytes)?;
-                // Mirror `DecodeRecords::try_run`: queryname-grouping stages
-                // (e.g. correct) read only `key.name_hash`, so skip the CIGAR
-                // position walk + aux-tag pass when `name_hash_only` is set.
-                let key = if name_hash_only {
-                    name_hash_key(bytes)
-                } else {
-                    compute_group_key_from_raw(bytes, library_index, cell_tag)
-                };
+                // Mirror `DecodeRecords::try_run`: compute only as much key as
+                // the downstream stage reads (see `KeyMode`).
+                let key = key_for_mode(key_mode, bytes, library_index, cell_tag);
                 let mut decoded = DecodedRecord::from_raw_bytes(
                     fgumi_raw_bam::RawRecord::from(bytes.to_vec()),
                     key,
@@ -400,6 +392,8 @@ impl Step for DecodeFromRecords {
 
 #[cfg(test)]
 mod tests {
+    use fgumi_bam_io::{compute_group_key_from_raw, name_hash_key};
+
     use super::*;
 
     #[test]
