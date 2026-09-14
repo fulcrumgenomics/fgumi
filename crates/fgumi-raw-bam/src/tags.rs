@@ -213,21 +213,6 @@ pub fn find_int_tag(aux_data: &[u8], tag: impl AsTagBytes) -> Option<i64> {
     extract_int_value(aux_data, p, val_type)
 }
 
-/// Borrow the `width` value bytes of the tag entry that starts at `p`.
-///
-/// The value begins at `p + 3`, after the two tag bytes and the type byte. Returns
-/// `None` if that range overflows `usize` or runs past the end of `aux_data`.
-///
-/// Every offset is computed with checked arithmetic because `p` reaches
-/// `extract_int_value` from the caller rather than from a `find_tag_position` scan:
-/// a position near `usize::MAX` would otherwise wrap and decode unrelated bytes.
-#[inline]
-fn tag_value_bytes(aux_data: &[u8], p: usize, width: usize) -> Option<&[u8]> {
-    let start = p.checked_add(3)?;
-    let end = start.checked_add(width)?;
-    aux_data.get(start..end)
-}
-
 /// Extract an integer value at position `p` with the given type byte.
 ///
 /// Shared by [`find_int_tag`] and `find_mi_tag`, and by callers that walk the
@@ -238,27 +223,31 @@ fn tag_value_bytes(aux_data: &[u8], p: usize, width: usize) -> Option<&[u8]> {
 /// do not lie wholly within `aux_data`.
 #[must_use]
 pub fn extract_int_value(aux_data: &[u8], p: usize, val_type: u8) -> Option<i64> {
-    match val_type {
-        b'c' => Some(i64::from(tag_value_bytes(aux_data, p, 1)?[0].cast_signed())),
-        b'C' => Some(i64::from(tag_value_bytes(aux_data, p, 1)?[0])),
-        b's' => {
-            let bytes = tag_value_bytes(aux_data, p, 2)?;
-            Some(i64::from(i16::from_le_bytes([bytes[0], bytes[1]])))
-        }
-        b'S' => {
-            let bytes = tag_value_bytes(aux_data, p, 2)?;
-            Some(i64::from(u16::from_le_bytes([bytes[0], bytes[1]])))
-        }
-        b'i' => {
-            let bytes = tag_value_bytes(aux_data, p, 4)?;
-            Some(i64::from(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])))
-        }
-        b'I' => {
-            let bytes = tag_value_bytes(aux_data, p, 4)?;
-            Some(i64::from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])))
-        }
-        _ => None,
-    }
+    // The value bytes start after the 2-byte tag id and 1-byte type at `p`.
+    // `checked_add` rejects a near-`usize::MAX` `p` (which can reach here from a
+    // caller rather than a `find_tag_position` scan) instead of wrapping.
+    decode_int_value(val_type, aux_data.get(p.checked_add(3)?..)?)
+}
+
+/// Decode an integer aux value from its raw value bytes (the bytes *after* the
+/// two-byte tag id and one-byte type), given the BAM type byte.
+///
+/// This is the decode ladder shared by [`extract_int_value`] (which slices the
+/// value out of a full aux block first) and by callers that already hold a tag's
+/// value bytes — e.g. from an [`AuxTagsIter`]/[`TagEntry`] walk — so they need
+/// not re-scan for the position. Returns `None` for a non-integer type byte or a
+/// value slice too short for the type's width.
+#[must_use]
+pub fn decode_int_value(val_type: u8, value_bytes: &[u8]) -> Option<i64> {
+    Some(match val_type {
+        b'c' => i64::from(value_bytes.first()?.cast_signed()),
+        b'C' => i64::from(*value_bytes.first()?),
+        b's' => i64::from(i16::from_le_bytes(value_bytes.get(0..2)?.try_into().ok()?)),
+        b'S' => i64::from(u16::from_le_bytes(value_bytes.get(0..2)?.try_into().ok()?)),
+        b'i' => i64::from(i32::from_le_bytes(value_bytes.get(0..4)?.try_into().ok()?)),
+        b'I' => i64::from(u32::from_le_bytes(value_bytes.get(0..4)?.try_into().ok()?)),
+        _ => return None,
+    })
 }
 
 /// Find MI (Molecular Identifier) tag in auxiliary data.
@@ -2774,6 +2763,35 @@ mod tests {
 
         let truncated = &exact[..exact.len() - 1];
         assert_eq!(extract_int_value(truncated, 0, type_byte), None);
+    }
+
+    /// `decode_int_value` decodes each integer type from bare value bytes (no
+    /// tag/type header), returns `None` for a non-integer type, and `None` when
+    /// the slice is one byte short of the type's width.
+    #[rstest]
+    #[case::signed_byte_neg(b'c', &[(-5i8).cast_unsigned()], Some(-5))]
+    #[case::unsigned_byte(b'C', &[200u8], Some(200))]
+    #[case::signed_short_neg(b's', &(-200i16).to_le_bytes(), Some(-200))]
+    #[case::unsigned_short(b'S', &50_000u16.to_le_bytes(), Some(50_000))]
+    #[case::signed_int(b'i', &(-100_000i32).to_le_bytes(), Some(-100_000))]
+    #[case::unsigned_int(b'I', &3_000_000_000u32.to_le_bytes(), Some(3_000_000_000))]
+    #[case::float_type_is_not_int(b'f', &1.0f32.to_le_bytes(), None)]
+    #[case::string_type_is_not_int(b'Z', b"5\x00", None)]
+    fn test_decode_int_value(
+        #[case] type_byte: u8,
+        #[case] value: &[u8],
+        #[case] expected: Option<i64>,
+    ) {
+        assert_eq!(decode_int_value(type_byte, value), expected);
+    }
+
+    #[rstest]
+    #[case::signed_byte(b'c', 1)]
+    #[case::signed_short(b's', 2)]
+    #[case::signed_int(b'i', 4)]
+    fn test_decode_int_value_short_slice_is_none(#[case] type_byte: u8, #[case] width: usize) {
+        let short = vec![0u8; width - 1];
+        assert_eq!(decode_int_value(type_byte, &short), None);
     }
 
     // --- Per-type find_int_tag tests ---
