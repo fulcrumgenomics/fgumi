@@ -1727,6 +1727,120 @@ impl RawRecordMut<'_> {
     }
 }
 
+/// A set membership test over two-byte SAM tag keys, used by
+/// [`RawTagsEditor::rebuild_with`] to decide which existing tags to drop.
+///
+/// Implemented for a plain `[[u8; 2]]` slice (cheap for the small fixed sets a
+/// caller like `regenerate_alignment_tags_raw` removes — `NM`/`UQ`/`MD`) and
+/// for [`TagBitset`] (O(1) probes for the large per-run sets a caller like
+/// `zipper` builds once and reuses).
+pub trait TagKeySet {
+    /// Returns `true` if `tag` is in the set.
+    fn contains_tag(&self, tag: [u8; 2]) -> bool;
+}
+
+impl TagKeySet for [[u8; 2]] {
+    #[inline]
+    fn contains_tag(&self, tag: [u8; 2]) -> bool {
+        self.contains(&tag)
+    }
+}
+
+impl<const N: usize> TagKeySet for [[u8; 2]; N] {
+    #[inline]
+    fn contains_tag(&self, tag: [u8; 2]) -> bool {
+        self.contains(&tag)
+    }
+}
+
+/// A membership set over two-byte SAM tag names, backed by a 256×256 bit table
+/// (65536 bits in 1024 `u64` words, indexed by `(byte0 << 8) | byte1`).
+///
+/// A direct bit test on the two raw tag bytes — no hashing, no UTF-8 conversion.
+/// Built once per run from the tag names a caller wants to match, then probed
+/// once per tag per record on a hot path (e.g. `zipper`'s tag-copy loop, where
+/// it measurably beats a `HashSet`). All SAM tags are exactly two bytes, so only
+/// two-byte names are representable; a longer or shorter name can never equal a
+/// real tag and is dropped at construction.
+///
+/// Membership is tested against the tag's **raw two bytes** — no UTF-8
+/// conversion. This is deliberate and differs from a `HashSet<String>` keyed on
+/// `str::from_utf8(bytes).unwrap_or("")`: that path aliased a non-UTF-8 tag pair
+/// (reachable only from a malformed BAM) to the empty string, so it could match
+/// an empty filter, whereas here the raw bytes are matched directly and a
+/// non-two-byte filter is never inserted. Do not reintroduce the UTF-8
+/// conversion.
+#[derive(Debug, Clone)]
+pub struct TagBitset {
+    words: Box<[u64; 1024]>,
+}
+
+impl TagBitset {
+    /// An empty set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { words: Box::new([0u64; 1024]) }
+    }
+
+    #[inline]
+    fn bit_index(tag: [u8; 2]) -> usize {
+        (usize::from(tag[0]) << 8) | usize::from(tag[1])
+    }
+
+    /// Insert a two-byte tag key.
+    #[inline]
+    pub fn insert(&mut self, tag: [u8; 2]) {
+        let i = Self::bit_index(tag);
+        self.words[i >> 6] |= 1u64 << (i & 63);
+    }
+
+    /// Returns `true` if the two-byte tag key is present.
+    #[inline]
+    #[must_use]
+    pub fn contains(&self, tag: [u8; 2]) -> bool {
+        let i = Self::bit_index(tag);
+        (self.words[i >> 6] >> (i & 63)) & 1 != 0
+    }
+
+    /// Returns `true` if no tag key is present (every bit clear). Cheap enough
+    /// to let a caller skip a per-record operation entirely when the set is
+    /// empty (e.g. `zipper` skipping its remove pass when no tags are removed).
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.words.iter().all(|&w| w == 0)
+    }
+
+    /// Build a set from tag names, keeping only the exactly-two-byte names (any
+    /// other length can never equal a real SAM tag and is skipped). Accepts any
+    /// string-like item (`&str`, `String`, `&String`, …) so callers holding a
+    /// `&[String]`, a `&[&str]`, or an iterator of either are not forced to
+    /// allocate.
+    #[must_use]
+    pub fn from_names<S: AsRef<str>>(names: impl IntoIterator<Item = S>) -> Self {
+        let mut set = Self::new();
+        for name in names {
+            if let [b0, b1] = *name.as_ref().as_bytes() {
+                set.insert([b0, b1]);
+            }
+        }
+        set
+    }
+}
+
+impl Default for TagBitset {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TagKeySet for TagBitset {
+    #[inline]
+    fn contains_tag(&self, tag: [u8; 2]) -> bool {
+        self.contains(tag)
+    }
+}
+
 /// Length-changing tag editor.
 ///
 /// Borrows a full BAM record byte buffer plus the cached aux offset (so update/
@@ -2086,6 +2200,76 @@ impl<'a> RawTagsEditor<'a> {
     #[inline]
     pub fn copy_from(&mut self, src: RawTagsView<'_>, skip: &[SamTag]) {
         copy_aux_tags(src.as_bytes(), self.record, skip);
+    }
+
+    /// Rebuild the aux block in a single pass: drop every existing tag whose
+    /// two-byte key is in `remove`, keep the rest in their original order, then
+    /// append `adds` (in slice order).
+    ///
+    /// Upsert semantics: an added tag whose key also exists among the survivors
+    /// is dropped from the survivors first, so the appended value wins with no
+    /// duplicate — matching the `remove_tag(tag); append(tag, ..)` idiom this
+    /// replaces. If `adds` itself carries the same key more than once, only the
+    /// last occurrence is emitted (again matching the idiom, where each
+    /// `remove_tag` wipes the prior append), so the output never contains a
+    /// duplicate key.
+    ///
+    /// Cost: a single walk of the aux with one allocation and one splice back,
+    /// versus N independent O(aux) `remove_tag` scans (each its own
+    /// `drain`/`extend` splice) for N per-tag operations. The per-survivor
+    /// `adds`-membership check makes the walk O(aux · |adds|) in the strict
+    /// sense, but `adds` is expected to be tiny (a handful of tags), so in
+    /// practice it is O(aux); the win over the old idiom is the collapsed
+    /// allocations and splices, not the asymptotic key-compare count.
+    ///
+    /// It does NOT reverse/revcomp: a caller transforming negative-strand tags
+    /// runs `reverse_*_in_place` as a separate pass over the rebuilt record.
+    ///
+    /// A record too short to hold a valid header (aux offset past the end) is
+    /// treated as having an empty aux block — `rebuild_with` then appends
+    /// `adds` only. A malformed entry mid-aux stops the walk (same tolerance as
+    /// [`AuxTagsIter`]); bytes past it are dropped.
+    pub fn rebuild_with<M: TagKeySet + ?Sized>(&mut self, remove: &M, adds: &[TagEntry<'_>]) {
+        let off = self.aux_offset.min(self.record.len());
+
+        // A key that will be (re)appended from `adds` is dropped from the
+        // survivors so the appended value wins with no duplicate. `adds` is
+        // tiny (a handful of tags), so a linear membership check per survivor is
+        // cheaper than allocating a second set.
+        let dropped_by_add = |tag: [u8; 2]| adds.iter().any(|a| a.tag == tag);
+
+        // Size the rebuilt aux from the current aux length plus the adds, so the
+        // buffer is allocated once.
+        let adds_len: usize = adds.iter().map(|a| 3 + a.value_bytes.len()).sum();
+        let mut new_aux = Vec::with_capacity((self.record.len() - off) + adds_len);
+
+        // Single pass over the existing aux: copy survivors verbatim.
+        for entry in &RawTagsView::new(&self.record[off..]) {
+            if remove.contains_tag(entry.tag) || dropped_by_add(entry.tag) {
+                continue;
+            }
+            new_aux.push(entry.tag[0]);
+            new_aux.push(entry.tag[1]);
+            new_aux.push(entry.type_byte);
+            new_aux.extend_from_slice(entry.value_bytes);
+        }
+
+        // Append the new entries in slice order. If a key appears more than once
+        // in `adds`, only its last occurrence is emitted, so the output carries
+        // no duplicate key — matching the `remove_tag(tag); append(tag, ..)`
+        // idiom, where each per-tag `remove_tag` wipes the prior append.
+        for (idx, a) in adds.iter().enumerate() {
+            if adds[idx + 1..].iter().any(|b| b.tag == a.tag) {
+                continue;
+            }
+            new_aux.push(a.tag[0]);
+            new_aux.push(a.tag[1]);
+            new_aux.push(a.type_byte);
+            new_aux.extend_from_slice(a.value_bytes);
+        }
+
+        // One splice back over the old aux region (off..end).
+        self.record.splice(off.., new_aux);
     }
 }
 
@@ -4722,5 +4906,249 @@ mod tests {
         assert_eq!(a_missing, None);
         assert_eq!(b_missing, None);
         assert_eq!(a_missing, find_string_tag_in_record(&rec_without_mi, SamTag::MI));
+    }
+
+    // ========================================================================
+    // RawTagsEditor::rebuild_with — single-pass aux rebuild
+    // ========================================================================
+
+    /// Build a record whose aux block is the concatenation of `entries`
+    /// (each already in on-disk `[tag0, tag1, type, value...]` form).
+    fn rec_with_aux(entries: &[&[u8]]) -> Vec<u8> {
+        let aux: Vec<u8> = entries.iter().flat_map(|e| e.iter().copied()).collect();
+        make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &aux)
+    }
+
+    /// The naive oracle: `remove_tag` for every key in `remove`, then
+    /// `remove_tag(add.tag); append_raw_tag(add)` for every add — the exact
+    /// per-tag loop `rebuild_with` replaces. Returns the full record bytes.
+    fn oracle_rebuild(base: &[u8], remove: &[[u8; 2]], adds: &[TagEntry<'_>]) -> Vec<u8> {
+        let mut rec = base.to_vec();
+        for &k in remove {
+            remove_tag(&mut rec, k);
+        }
+        for a in adds {
+            remove_tag(&mut rec, a.tag);
+            append_raw_tag(&mut rec, a.tag, a.type_byte, a.value_bytes);
+        }
+        rec
+    }
+
+    /// Collect the aux entries (tag, type, value bytes) of a record, in order.
+    fn aux_entries(rec: &[u8]) -> Vec<([u8; 2], u8, Vec<u8>)> {
+        RawTagsView::new(aux_data_slice(rec))
+            .iter()
+            .map(|e| (e.tag, e.type_byte, e.value_bytes.to_vec()))
+            .collect()
+    }
+
+    /// `SamTag` -> raw two-byte key, so tests use the tag constants (not bare
+    /// byte literals) for tag identifiers. `BX` has no `SamTag` constant and is
+    /// path-scoped-allowlisted in the tag-literal check as an opaque fixture.
+    fn key(t: SamTag) -> [u8; 2] {
+        t.into()
+    }
+    const BX: [u8; 2] = *b"BX";
+
+    #[test]
+    fn rebuild_with_drops_removed_tags_and_keeps_order() {
+        // Aux: RG(Z), NM(C=1B), MD(Z). Remove NM; keep RG, MD in order.
+        let mut rec = rec_with_aux(&[b"RGZg\x00", b"NMC\x05", b"MDZ10\x00"]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.rebuild_with(&[key(SamTag::NM)], &[]);
+        }
+        let got: Vec<[u8; 2]> = aux_entries(&rec).into_iter().map(|(t, _, _)| t).collect();
+        assert_eq!(got, vec![key(SamTag::RG), key(SamTag::MD)], "NM dropped; RG,MD kept in order");
+    }
+
+    #[test]
+    fn rebuild_with_appends_adds_verbatim_after_survivors() {
+        let mut rec = rec_with_aux(&[b"RGZg\x00"]);
+        let adds = [
+            TagEntry { tag: BX, type_byte: b'Z', value_bytes: b"ACGT\x00" },
+            TagEntry { tag: key(SamTag::NM), type_byte: b'C', value_bytes: &[7] },
+        ];
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.rebuild_with(&[] as &[[u8; 2]], &adds);
+        }
+        let got = aux_entries(&rec);
+        assert_eq!(got[0].0, key(SamTag::RG), "survivor first");
+        assert_eq!((got[1].0, got[1].1, got[1].2.as_slice()), (BX, b'Z', b"ACGT\x00".as_slice()));
+        assert_eq!(
+            (got[2].0, got[2].1, got[2].2.as_slice()),
+            (key(SamTag::NM), b'C', [7].as_slice())
+        );
+    }
+
+    #[test]
+    fn rebuild_with_upserts_an_added_key_that_already_exists() {
+        // NM exists as C=1; adding NM as i=999 must replace it (no duplicate),
+        // and the new value must appear appended (after other survivors).
+        let mut rec = rec_with_aux(&[b"NMC\x01", b"RGZg\x00"]);
+        let nm_i = {
+            let mut v = vec![b'N', b'M', b'i'];
+            v.extend_from_slice(&999i32.to_le_bytes());
+            v
+        };
+        let adds = [TagEntry { tag: key(SamTag::NM), type_byte: b'i', value_bytes: &nm_i[3..] }];
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.rebuild_with(&[] as &[[u8; 2]], &adds);
+        }
+        let entries = aux_entries(&rec);
+        let nm: Vec<_> = entries.iter().filter(|(t, _, _)| *t == key(SamTag::NM)).collect();
+        assert_eq!(nm.len(), 1, "exactly one NM after upsert");
+        assert_eq!(nm[0].1, b'i', "new NM type wins");
+        let v = RawTagsView::new(aux_data_slice(&rec)).find_int(SamTag::NM);
+        assert_eq!(v, Some(999));
+        // Survivor RG still present.
+        assert!(entries.iter().any(|(t, _, _)| *t == key(SamTag::RG)));
+    }
+
+    #[test]
+    fn rebuild_with_on_empty_aux_appends_only() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        let adds = [TagEntry { tag: key(SamTag::RG), type_byte: b'Z', value_bytes: b"g\x00" }];
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.rebuild_with(&[key(SamTag::NM)], &adds); // remove of an absent tag is a no-op
+        }
+        assert_eq!(
+            RawTagsView::new(aux_data_slice(&rec)).find_string(SamTag::RG),
+            Some(b"g".as_slice())
+        );
+    }
+
+    #[test]
+    fn rebuild_with_matches_the_naive_remove_append_oracle() {
+        // A representative mixed aux block: Z, C, Z, f.
+        let mut f_tag = vec![b'A', b'S', b'f'];
+        f_tag.extend_from_slice(&3.5f32.to_le_bytes());
+        let base = rec_with_aux(&[b"RGZgrp\x00", b"NMC\x03", b"MDZ50\x00", &f_tag]);
+
+        let bx = TagEntry { tag: BX, type_byte: b'Z', value_bytes: b"ACGTAC\x00" };
+        // RG is both removed and re-added — upsert should land it once, appended.
+        let rg = TagEntry { tag: key(SamTag::RG), type_byte: b'Z', value_bytes: b"newgrp\x00" };
+        let adds = [bx, rg];
+        let remove = [key(SamTag::NM)];
+
+        let expected = oracle_rebuild(&base, &remove, &adds);
+
+        let mut got = base.clone();
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut got);
+            ed.rebuild_with(&remove, &adds);
+        }
+        assert_eq!(
+            aux_entries(&got),
+            aux_entries(&expected),
+            "rebuild_with must produce the same aux entries as the naive remove+append loop"
+        );
+    }
+
+    #[test]
+    fn rebuild_with_readds_a_key_that_is_also_in_the_remove_set() {
+        // AS is both in `remove` and in `adds` (the normalize idiom: drop the
+        // old encoding, append the canonical one). The result must carry exactly
+        // one AS, with the added value — same as remove_tag(AS) then append(AS).
+        let mut rec = rec_with_aux(&[b"ASC\x05", b"RGZg\x00"]);
+        let as_add = TagEntry { tag: key(SamTag::AS), type_byte: b'c', value_bytes: &[5] };
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.rebuild_with(&[key(SamTag::AS)], &[as_add]);
+        }
+        let entries = aux_entries(&rec);
+        let as_count = entries.iter().filter(|(t, _, _)| *t == key(SamTag::AS)).count();
+        assert_eq!(as_count, 1, "exactly one AS after remove+readd");
+        assert_eq!(
+            entries.iter().find(|(t, _, _)| *t == key(SamTag::AS)).unwrap().1,
+            b'c',
+            "readded type"
+        );
+        assert!(entries.iter().any(|(t, _, _)| *t == key(SamTag::RG)), "RG survivor kept");
+    }
+
+    #[test]
+    fn rebuild_with_tagbitset_removes_the_configured_set() {
+        let mut set = TagBitset::new();
+        set.insert(key(SamTag::NM));
+        set.insert(key(SamTag::MD));
+        let mut rec = rec_with_aux(&[b"RGZg\x00", b"NMC\x05", b"MDZ10\x00"]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.rebuild_with(&set, &[]);
+        }
+        let got: Vec<[u8; 2]> = aux_entries(&rec).into_iter().map(|(t, _, _)| t).collect();
+        assert_eq!(got, vec![key(SamTag::RG)], "TagBitset set of NM and MD dropped");
+    }
+
+    #[test]
+    fn rebuild_with_dedups_duplicate_keys_within_adds_last_wins() {
+        // `adds` carries NM twice (C:1 then i:999). The naive idiom does
+        // `remove_tag(NM); append(NM:C:1); remove_tag(NM); append(NM:i:999)`,
+        // so only the last NM survives — rebuild_with must match that.
+        let mut rec = rec_with_aux(&[b"RGZg\x00"]);
+        let nm_i = 999i32.to_le_bytes();
+        let adds = [
+            TagEntry { tag: key(SamTag::NM), type_byte: b'C', value_bytes: &[1] },
+            TagEntry { tag: key(SamTag::NM), type_byte: b'i', value_bytes: &nm_i },
+        ];
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.rebuild_with(&[] as &[[u8; 2]], &adds);
+        }
+
+        let entries = aux_entries(&rec);
+        let nm: Vec<_> = entries.iter().filter(|(t, _, _)| *t == key(SamTag::NM)).collect();
+        assert_eq!(nm.len(), 1, "exactly one NM after dedup within adds");
+        assert_eq!(nm[0].1, b'i', "the last NM (i:999) wins");
+        assert_eq!(RawTagsView::new(aux_data_slice(&rec)).find_int(SamTag::NM), Some(999));
+        assert!(entries.iter().any(|(t, _, _)| *t == key(SamTag::RG)), "RG survivor kept");
+
+        // Byte-identical to the naive remove+append oracle for the same inputs.
+        let base = rec_with_aux(&[b"RGZg\x00"]);
+        let expected = oracle_rebuild(&base, &[], &adds);
+        assert_eq!(aux_entries(&rec), aux_entries(&expected));
+    }
+
+    #[test]
+    fn rebuild_with_clamps_an_aux_offset_past_the_end_of_a_truncated_record() {
+        // A 20-byte record whose header declares l_seq = 1000, so the computed
+        // aux offset (32 + l_read_name + n_cigar*4 + ceil(l_seq/2) + l_seq) lands
+        // far past the 20-byte buffer. `from_vec` caches that out-of-range offset;
+        // `rebuild_with` must clamp it to `record.len()` (the empty-aux path) and
+        // append `adds` without panicking or reading out of bounds.
+        let mut rec = vec![0u8; 20];
+        rec[8] = 1; // l_read_name (n_cigar at 12..14 = 0)
+        rec[16..20].copy_from_slice(&1000u32.to_le_bytes()); // l_seq
+        assert!(
+            aux_data_offset_from_record(&rec).unwrap() > rec.len(),
+            "test precondition: header must declare an out-of-range aux offset"
+        );
+
+        let adds = [TagEntry { tag: key(SamTag::RG), type_byte: b'Z', value_bytes: b"g\x00" }];
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.rebuild_with(&[] as &[[u8; 2]], &adds); // must not panic
+        }
+        // The appended entry lands verbatim at the clamped offset (== old len).
+        assert_eq!(rec.len(), 20 + 5, "RG:Z:g\\0 is 5 bytes, appended after the 20-byte header");
+        assert_eq!(&rec[20..], b"RGZg\x00");
+    }
+
+    #[test]
+    fn rebuild_with_stops_at_a_malformed_aux_entry() {
+        // Aux: RG(Z), then a truncated tag ("XN" with type 'i' but no value
+        // bytes) — the walk must stop at the malformed entry and drop it, per
+        // the documented AuxTagsIter tolerance, leaving only the RG survivor.
+        let mut rec = rec_with_aux(&[b"RGZg\x00", b"XNi"]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.rebuild_with(&[] as &[[u8; 2]], &[]);
+        }
+        let got: Vec<[u8; 2]> = aux_entries(&rec).into_iter().map(|(t, _, _)| t).collect();
+        assert_eq!(got, vec![key(SamTag::RG)], "walk stops at malformed entry; RG kept");
     }
 }
