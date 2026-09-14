@@ -34,6 +34,26 @@ use std::io;
 /// there would reject valid BAMs.
 const MAX_CARRY_BYTES: usize = 256 * 1024 * 1024;
 
+/// Ceiling on the bytes carried for a single *open queryname run* under
+/// [`BatchCut::Queryname`], enforced independently of `min_emit_bytes` and of
+/// [`MAX_CARRY_BYTES`].
+///
+/// The two existing bounds do not cover this source of growth. `min_emit_bytes`
+/// gates only the *closed* prefix, so it never bounds a run that has not closed.
+/// `MAX_CARRY_BYTES` bounds one *incomplete* trailing record; a queryname run is
+/// made of individually *complete* records, so it never trips that backstop.
+/// Without a dedicated cap a stream that never closes a run — every record
+/// sharing one read name, or a run of empty BAM names (`l_read_name == 1`) —
+/// grows `qn_buffer` until allocation fails.
+///
+/// A queryname run is the records sharing one name: a template's primary pair
+/// plus its secondary/supplementary alignments. Even a pathologically deep
+/// template is a few MB; 256 MiB is orders of magnitude above any real run and
+/// still bounds memory hard. It is a *separate* limit from `MAX_CARRY_BYTES`
+/// (whose value is justified for one incomplete record, not for a complete run)
+/// even though the two happen to share a value today.
+const MAX_QUERYNAME_RUN_BYTES: usize = 256 * 1024 * 1024;
+
 /// Where the boundary scanner is allowed to cut a batch.
 ///
 /// The scanner always cuts on *record* boundaries (never mid-record). This
@@ -114,6 +134,11 @@ pub struct BoundaryState {
     /// with a leading `0`. Grows as records are scanned; split on emit. Unused
     /// in `Record` mode.
     qn_offsets: Vec<usize>,
+    /// Ceiling on the bytes of a single open queryname run carried in
+    /// `qn_buffer` (see [`MAX_QUERYNAME_RUN_BYTES`]). A field rather than a bare
+    /// constant so tests can drive the rejection path with a small cap instead
+    /// of buffering 256 MiB; production callers get [`MAX_QUERYNAME_RUN_BYTES`].
+    max_queryname_run_bytes: usize,
 }
 
 impl BoundaryState {
@@ -130,6 +155,7 @@ impl BoundaryState {
             last_emitted_name: Vec::new(),
             qn_buffer: Vec::new(),
             qn_offsets: vec![0],
+            max_queryname_run_bytes: MAX_QUERYNAME_RUN_BYTES,
         }
     }
 
@@ -147,6 +173,7 @@ impl BoundaryState {
             last_emitted_name: Vec::new(),
             qn_buffer: Vec::new(),
             qn_offsets: vec![0],
+            max_queryname_run_bytes: MAX_QUERYNAME_RUN_BYTES,
         }
     }
 
@@ -157,6 +184,15 @@ impl BoundaryState {
     pub fn with_cut(mut self, cut: BatchCut, min_emit_bytes: usize) -> Self {
         self.cut = cut;
         self.min_emit_bytes = min_emit_bytes;
+        self
+    }
+
+    /// Override the open-queryname-run carry ceiling. Test-facing: it makes the
+    /// [`MAX_QUERYNAME_RUN_BYTES`] rejection reachable without buffering 256 MiB.
+    #[cfg(test)]
+    #[must_use]
+    fn with_max_queryname_run_bytes(mut self, max_queryname_run_bytes: usize) -> Self {
+        self.max_queryname_run_bytes = max_queryname_run_bytes;
         self
     }
 
@@ -412,8 +448,9 @@ impl BoundaryState {
         // without this the leftover grows to the size of the remaining input.
         // `finish` would still catch the shortfall at EOF, but only after the
         // memory was already spent. (This bound is on the genuinely-incomplete
-        // tail only; the queryname coalescing carry lives in `qn_buffer` and is
-        // bounded by `min_emit_bytes`, not this backstop.)
+        // tail only; the queryname coalescing carry lives in `qn_buffer`, and its
+        // trailing open run is bounded by `MAX_QUERYNAME_RUN_BYTES` — not this
+        // backstop, and not `min_emit_bytes`, which is only the coalescing target.)
         let carry_len = self.work_buffer.len() - cursor;
         if carry_len > MAX_CARRY_BYTES {
             return Err(io::Error::new(
@@ -522,6 +559,11 @@ impl BoundaryState {
             j -= 1;
             cur_name = prev_name;
         }
+        // First record of the trailing (open) queryname run, captured *before*
+        // the coalescing gate below rewrites `j` to 0. The cap must measure this
+        // run alone — measuring from the post-coalescing `j` would fold the
+        // closed, coalesced prefix into the count and could reject valid input.
+        let run_start = j;
 
         if force {
             // EOF flush: emit everything (the trailing run is complete too).
@@ -529,6 +571,29 @@ impl BoundaryState {
         } else if self.min_emit_bytes > 0 && self.qn_offsets[j] < self.min_emit_bytes {
             // Closed prefix below the coalescing target: keep accumulating.
             j = 0;
+        }
+
+        // Bound the trailing *open* queryname run (`qn_buffer[qn_offsets[run_start]..]`)
+        // — not the coalesced closed prefix before it, which `min_emit_bytes`
+        // already bounds. Neither `min_emit_bytes` nor the incomplete-tail
+        // `MAX_CARRY_BYTES` backstop bounds the open run, so a stream that never
+        // closes a run — every record one name, or empty read names — would grow
+        // `qn_buffer` without limit. Reject it as corrupt / not-queryname-grouped.
+        // Skipped at EOF: `force` emits the complete final run rather than
+        // carrying it, so there is nothing to bound.
+        if !force {
+            let run_len = self.qn_buffer.len() - self.qn_offsets[run_start];
+            if run_len > self.max_queryname_run_bytes {
+                let limit = self.max_queryname_run_bytes;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "FindBamBoundaries: an open queryname run has carried {run_len} \
+                         byte(s) (limit {limit}); the stream is not queryname-grouped or \
+                         its read names are corrupt",
+                    ),
+                ));
+            }
         }
 
         if j == 0 {
@@ -1235,6 +1300,67 @@ mod tests {
         let short_body = record(&[0u8; 16]);
         let mut state = BoundaryState::new_no_header().with_cut(BatchCut::Queryname, 0);
         let err = state.find_boundaries(&short_body).expect_err("must reject");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn queryname_cut_rejects_an_unbounded_open_run() {
+        // Every record shares one name, so the run never closes: `qn_buffer`
+        // would grow for the whole stream. With a small ceiling the cutter
+        // rejects it as `InvalidData` instead of buffering without bound.
+        let mut state = BoundaryState::new_no_header()
+            .with_cut(BatchCut::Queryname, 0)
+            .with_max_queryname_run_bytes(64);
+        let mut err = None;
+        for _ in 0..64 {
+            if let Err(e) = state.find_boundaries(&qn_block(&[named_record(b"same")])) {
+                err = Some(e);
+                break;
+            }
+        }
+        let err = err.expect("an unbounded open run must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("queryname run"), "got: {err}");
+    }
+
+    #[test]
+    fn queryname_cut_cap_measures_only_the_open_run_not_the_coalesced_prefix() {
+        // A large closed prefix (distinct names, held back by a big coalescing
+        // target) plus a small trailing open run: the whole accumulator exceeds
+        // the cap, but the open run alone is well under it. The cap must measure
+        // only the open run, so this valid queryname-grouped input is accepted.
+        let cap = 200;
+        let mut state = BoundaryState::new_no_header()
+            .with_cut(BatchCut::Queryname, 10_000) // coalescing holds the closed prefix
+            .with_max_queryname_run_bytes(cap);
+        // 8 distinct-name records (~39 bytes each => ~312 bytes) exceed `cap`,
+        // while every open run is a single ~39-byte record well under it.
+        let names: Vec<Vec<u8>> =
+            (0..8).map(|i| named_record(format!("q{i}").as_bytes())).collect();
+        let batch = state
+            .find_boundaries(&qn_block(&names))
+            .expect("must not reject: the open run is under the cap");
+        assert!(batch.offsets.len() <= 1, "coalescing holds everything: nothing emitted yet");
+        // EOF force-flush emits the whole run without applying the cap.
+        let flushed = state.finish().expect("finish ok").expect("a final batch");
+        assert_eq!(flushed.offsets.len() - 1, 8, "all 8 records flushed at EOF");
+    }
+
+    #[test]
+    fn queryname_cut_rejects_a_run_of_empty_read_names() {
+        // A run of empty BAM names (`l_read_name == 1`, just the NUL) also never
+        // closes; the same ceiling must bound it.
+        let mut state = BoundaryState::new_no_header()
+            .with_cut(BatchCut::Queryname, 0)
+            .with_max_queryname_run_bytes(64);
+        let mut err = None;
+        for _ in 0..64 {
+            if let Err(e) = state.find_boundaries(&qn_block(&[named_record(b"")])) {
+                err = Some(e);
+                break;
+            }
+        }
+        let err = err.expect("a run of empty read names must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
