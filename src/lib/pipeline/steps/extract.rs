@@ -285,7 +285,7 @@ mod tests {
         let records = make_raw_records_from_fastq_set(&combined, &opts).unwrap();
 
         let template = Template::from_records(records).unwrap();
-        assert_eq!(template.name, b"qname");
+        assert_eq!(template.name(), b"qname");
         assert_eq!(template.read_count(), 2);
         assert!(template.r1.is_some());
         assert!(template.r2.is_some());

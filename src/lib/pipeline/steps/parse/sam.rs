@@ -155,6 +155,9 @@ pub struct ParseSamChunk {
     key_config: GroupKeyConfig,
     held: HeldSlot<Unpushed<DecodedRecordBatch>>,
     output_byte_limit: u64,
+    /// See `DecodeRecords::closed_batches`: marks emitted batches closed under
+    /// queryname when the upstream `ReadSamChunks` runs the queryname cut.
+    closed_batches: bool,
 }
 
 impl ParseSamChunk {
@@ -164,7 +167,14 @@ impl ParseSamChunk {
         key_config: GroupKeyConfig,
         output_byte_limit: u64,
     ) -> Self {
-        Self { header, key_config, held: HeldSlot::new(), output_byte_limit }
+        Self { header, key_config, held: HeldSlot::new(), output_byte_limit, closed_batches: false }
+    }
+
+    /// See `DecodeRecords::with_closed_batches`.
+    #[must_use]
+    pub fn with_closed_batches(mut self, closed: bool) -> Self {
+        self.closed_batches = closed;
+        self
     }
 }
 
@@ -175,6 +185,7 @@ impl Clone for ParseSamChunk {
             key_config: self.key_config.clone(),
             held: HeldSlot::new(),
             output_byte_limit: self.output_byte_limit,
+            closed_batches: self.closed_batches,
         }
     }
 }
@@ -216,7 +227,8 @@ impl Step for ParseSamChunk {
             return Ok(StepOutcome::NoProgress);
         };
 
-        let batch = parse_sam_chunk_into_decoded(chunk, &self.header, &self.key_config)?;
+        let batch = parse_sam_chunk_into_decoded(chunk, &self.header, &self.key_config)?
+            .closed_under_queryname_marked(self.closed_batches);
 
         match ctx.outputs.push(batch) {
             Ok(()) => Ok(StepOutcome::Progress),

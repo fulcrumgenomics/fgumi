@@ -1062,7 +1062,7 @@ impl Zipper {
             }
 
             if let Some(ref mut mapped_template) = mapped_peek {
-                if mapped_template.name == unmapped_template.name {
+                if mapped_template.name() == unmapped_template.name() {
                     merge_raw_with(&unmapped_template, mapped_template, tags, self.skip_tc_tags)?;
                     if let Some(ref_reader) = reference {
                         // EM-seq: restore converted bases in-place on packed 4-bit nibbles.
@@ -1081,7 +1081,7 @@ impl Zipper {
                     debug!(
                         "Found unmapped read with no corresponding mapped \
                          read: {}",
-                        String::from_utf8_lossy(&unmapped_template.name)
+                        String::from_utf8_lossy(unmapped_template.name())
                     );
                     if self.exclude_missing_reads {
                         templates_not_in_mapped_bam += 1;
@@ -1098,7 +1098,7 @@ impl Zipper {
                 debug!(
                     "Found unmapped read with no corresponding mapped \
                      read: {}",
-                    String::from_utf8_lossy(&unmapped_template.name)
+                    String::from_utf8_lossy(unmapped_template.name())
                 );
                 if self.exclude_missing_reads {
                     templates_not_in_mapped_bam += 1;
@@ -1122,7 +1122,7 @@ impl Zipper {
                  unmapped and mapped reads have the same set of read names \
                  in the same order, and reads with the same name are \
                  consecutive (grouped) in each input.",
-                String::from_utf8_lossy(&remaining.name)
+                String::from_utf8_lossy(remaining.name())
             );
         }
         if let Some(remaining) = mapped_iter.next() {
@@ -1133,7 +1133,7 @@ impl Zipper {
                  unmapped and mapped reads have the same set of read names \
                  in the same order, and reads with the same name are \
                  consecutive (grouped) in each input.",
-                String::from_utf8_lossy(&remaining.name)
+                String::from_utf8_lossy(remaining.name())
             );
         }
 
@@ -1447,11 +1447,9 @@ pub(crate) mod merge_step {
                 return None;
             }
             self.cursor += 1;
-            // Replace the slot with an empty placeholder so the
-            // surrounding `Vec` can keep its length without the
-            // `Template: Default` bound (Template carries a
-            // `MoleculeId` enum that has no canonical default).
-            Some(std::mem::replace(&mut self.templates[i], Template::new(Vec::new())))
+            // Take the template out, leaving an empty placeholder so the
+            // surrounding `Vec` keeps its length.
+            Some(std::mem::take(&mut self.templates[i]))
         }
 
         fn is_exhausted(&self) -> bool {
@@ -1659,10 +1657,10 @@ pub(crate) mod merge_step {
                                         .pending_b
                                         .as_ref()
                                         .and_then(|pb| pb.current())
-                                        .map(|t| t.name.clone())
+                                        .map(|t| t.name().to_vec())
                                         .or_else(|| {
                                             ctx.b.pop().and_then(|batch| {
-                                                batch.templates().first().map(|t| t.name.clone())
+                                                batch.templates().first().map(|t| t.name().to_vec())
                                             })
                                         });
                                     if let Some(name) = leftover_b {
@@ -1718,10 +1716,10 @@ pub(crate) mod merge_step {
                     .as_ref()
                     .and_then(|pa| pa.current())
                     .expect("pending_a guaranteed non-exhausted above")
-                    .name
-                    .clone();
+                    .name()
+                    .to_vec();
                 let pb_name: Option<Vec<u8>> =
-                    self.pending_b.as_ref().and_then(|pb| pb.current()).map(|t| t.name.clone());
+                    self.pending_b.as_ref().and_then(|pb| pb.current()).map(|t| t.name().to_vec());
 
                 let mapped_drained = self.pending_b.is_none() && ctx.b.is_drained();
 

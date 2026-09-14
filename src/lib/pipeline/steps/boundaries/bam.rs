@@ -10,7 +10,7 @@
 
 use std::io;
 
-use super::state::BoundaryState;
+use super::state::{BatchCut, BoundaryState};
 use crate::pipeline::core::Unpushed;
 use crate::pipeline::core::held::HeldSlot;
 use crate::pipeline::core::outputs::OrderedBytesSingle;
@@ -79,6 +79,19 @@ impl FindBamBoundaries {
             finalized: false,
             output_byte_limit,
         }
+    }
+
+    /// Select the batch cut mode (default [`BatchCut::Record`]). With
+    /// [`BatchCut::Queryname`] every emitted `DecompressedBlock` is closed under
+    /// queryname (no run straddles a batch), so a downstream parallel grouper
+    /// needs no cross-batch state; `min_emit_bytes` coalesces the emitted blocks
+    /// to roughly that many bytes (0 = emit as soon as a run closes). Chainable
+    /// on either constructor. Used by the builder when the first stage groups by
+    /// queryname (`source_batch_cut`); every other chain keeps `Record`.
+    #[must_use]
+    pub fn with_cut(mut self, cut: BatchCut, min_emit_bytes: usize) -> Self {
+        self.state = self.state.with_cut(cut, min_emit_bytes);
+        self
     }
 }
 

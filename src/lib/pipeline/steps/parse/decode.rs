@@ -147,12 +147,24 @@ pub struct DecodeRecords {
     key_config: GroupKeyConfig,
     held: HeldSlot<Unpushed<DecodedRecordBatch>>,
     output_byte_limit: u64,
+    /// Marks emitted batches closed under queryname (set when the upstream
+    /// cutter runs in `BatchCut::Queryname`). `false` = today's behaviour.
+    closed_batches: bool,
 }
 
 impl DecodeRecords {
     #[must_use]
     pub fn new(key_config: GroupKeyConfig, output_byte_limit: u64) -> Self {
-        Self { key_config, held: HeldSlot::new(), output_byte_limit }
+        Self { key_config, held: HeldSlot::new(), output_byte_limit, closed_batches: false }
+    }
+
+    /// Mark emitted `DecodedRecordBatch`es closed under queryname. Set by the
+    /// builder when the upstream `FindBamBoundaries` runs the queryname cut, so
+    /// a downstream parallel grouper can trust the closure invariant.
+    #[must_use]
+    pub fn with_closed_batches(mut self, closed: bool) -> Self {
+        self.closed_batches = closed;
+        self
     }
 }
 
@@ -162,6 +174,7 @@ impl Clone for DecodeRecords {
             key_config: self.key_config.clone(),
             held: HeldSlot::new(),
             output_byte_limit: self.output_byte_limit,
+            closed_batches: self.closed_batches,
         }
     }
 }
@@ -237,7 +250,8 @@ impl Step for DecodeRecords {
             })
             .collect::<io::Result<Vec<_>>>()?;
 
-        let out = DecodedRecordBatch::new(batch_serial, decoded);
+        let out = DecodedRecordBatch::new(batch_serial, decoded)
+            .closed_under_queryname_marked(self.closed_batches);
         match ctx.outputs.push(out) {
             Ok(()) => Ok(StepOutcome::Progress),
             Err(unpushed) => {
@@ -266,12 +280,21 @@ pub struct DecodeFromRecords {
     key_config: GroupKeyConfig,
     held: HeldSlot<Unpushed<DecodedRecordBatch>>,
     output_byte_limit: u64,
+    /// See `DecodeRecords::closed_batches`.
+    closed_batches: bool,
 }
 
 impl DecodeFromRecords {
     #[must_use]
     pub fn new(key_config: GroupKeyConfig, output_byte_limit: u64) -> Self {
-        Self { key_config, held: HeldSlot::new(), output_byte_limit }
+        Self { key_config, held: HeldSlot::new(), output_byte_limit, closed_batches: false }
+    }
+
+    /// See `DecodeRecords::with_closed_batches`.
+    #[must_use]
+    pub fn with_closed_batches(mut self, closed: bool) -> Self {
+        self.closed_batches = closed;
+        self
     }
 }
 
@@ -281,6 +304,7 @@ impl Clone for DecodeFromRecords {
             key_config: self.key_config.clone(),
             held: HeldSlot::new(),
             output_byte_limit: self.output_byte_limit,
+            closed_batches: self.closed_batches,
         }
     }
 }
@@ -358,7 +382,8 @@ impl Step for DecodeFromRecords {
             })
             .collect::<io::Result<Vec<_>>>()?;
 
-        let out = DecodedRecordBatch::new(batch_serial, decoded);
+        let out = DecodedRecordBatch::new(batch_serial, decoded)
+            .closed_under_queryname_marked(self.closed_batches);
         match ctx.outputs.push(out) {
             Ok(()) => Ok(StepOutcome::Progress),
             Err(unpushed) => {

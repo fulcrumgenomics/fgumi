@@ -214,9 +214,9 @@ mod tests {
         // [block_size=8, 8 bytes][block_size=12, 12 bytes].
         let r1 = raw_of_len(8, 0xAA);
         let r2 = raw_of_len(12, 0xBB);
-        let mut t1 = Template::new(b"q1".to_vec());
+        let mut t1 = Template::new();
         t1.records.push(r1.clone());
-        let mut t2 = Template::new(b"q2".to_vec());
+        let mut t2 = Template::new();
         t2.records.push(r2.clone());
         let input = BamTemplateBatch::new(7, vec![t1, t2]);
 

@@ -257,7 +257,7 @@ impl ReadInfo {
         let record: &RawRecord = r1.or(r2).ok_or_else(|| {
             anyhow::anyhow!(
                 "Template '{}' has no records (empty template)",
-                String::from_utf8_lossy(&template.name)
+                String::from_utf8_lossy(template.name())
             )
         })?;
 

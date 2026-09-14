@@ -266,7 +266,7 @@ pub(crate) fn build_group_process_step(
                 templates.sort_by(|a, b| {
                     let a_idx = a.mi.to_vec_index();
                     let b_idx = b.mi.to_vec_index();
-                    a_idx.cmp(&b_idx).then_with(|| a.name.cmp(&b.name))
+                    a_idx.cmp(&b_idx).then_with(|| a.name().cmp(b.name()))
                 });
 
                 let mut family_sizes: AHashMap<usize, u64> = AHashMap::with_capacity(50);
@@ -438,7 +438,7 @@ mod tests {
         let templates = local_ids
             .iter()
             .map(|&id| {
-                let mut template = Template::new(Vec::new());
+                let mut template = Template::new();
                 template.mi = MoleculeId::Single(id);
                 template
             })

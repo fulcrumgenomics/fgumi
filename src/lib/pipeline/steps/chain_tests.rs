@@ -51,11 +51,14 @@ use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProf
 use crate::pipeline::steps::bgzf::compress::BgzfCompress;
 use crate::pipeline::steps::bgzf::decompress::BgzfDecompress;
 use crate::pipeline::steps::boundaries::bam::FindBamBoundaries;
+use crate::pipeline::steps::boundaries::state::BatchCut;
+use crate::pipeline::steps::group::assemble::AssembleTemplates;
 use crate::pipeline::steps::group::position::BatchedProcessedPositionGroups;
+use crate::pipeline::steps::group::queryname::GroupByQueryname;
 use crate::pipeline::steps::parse::bam::ParseBamRecords;
 use crate::pipeline::steps::parse::decode::{DecodeFromRecords, DecodeRecords};
 use crate::pipeline::steps::types::{
-    BgzfBlock, DecodedRecordBatch, DecompressedBlock, RecordBatch,
+    BamTemplateBatch, BgzfBlock, DecodedRecordBatch, DecompressedBlock, RecordBatch,
 };
 use crate::template::Template;
 
@@ -1712,7 +1715,7 @@ fn group_by_queryname_emits_contiguous_batches_ending_in_a_partial(#[values(1, 4
     let names: Vec<String> = emitted
         .iter()
         .flat_map(BamTemplateBatch::templates)
-        .map(|t| String::from_utf8_lossy(&t.name).into_owned())
+        .map(|t| String::from_utf8_lossy(t.name()).into_owned())
         .collect();
     let expected: Vec<String> = (0..N_TEMPLATES).map(|t| format!("q{t:05}")).collect();
     assert_eq!(
@@ -2308,4 +2311,138 @@ fn the_edge_budget_binds_on_the_multi_record_fixtures() {
         "fixture volume ({decompressed_bytes} B) must exceed the per-edge budget \
          ({EDGE_LIMIT_BYTES} B), else the byte-bounded edges never bind",
     );
+}
+
+// ============================================================================
+// Parallel queryname grouping: parity vs the serial GroupByQueryname
+// ============================================================================
+
+/// `n_templates` paired records: for each i, an R1 and an R2 both named
+/// `read{i}`, adjacent — so each queryname run is exactly two records and
+/// grouping actually groups (unlike `test_records`, whose names are all
+/// distinct singletons).
+fn paired_records(n_templates: usize) -> Vec<RawRecord> {
+    let mut out = Vec::with_capacity(n_templates * 2);
+    for i in 0..n_templates {
+        for &flag in &[
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT,
+        ] {
+            let mut b = SamBuilder::new();
+            b.read_name(format!("read{i}").as_bytes())
+                .flags(flag)
+                .ref_id(0)
+                .pos(i32::try_from(100 + i * 10).expect("pos fits i32"))
+                .cigar_ops(&[4u32 << 4])
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4]);
+            out.push(b.build());
+        }
+    }
+    out
+}
+
+/// Flatten a collected sequence of `BamTemplateBatch`es (in arrival = ordinal
+/// order) into `(name, [record bytes])` per template — the contractual output
+/// of a queryname grouper.
+fn flatten_templates(batches: &[BamTemplateBatch]) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+    batches
+        .iter()
+        .flat_map(BamTemplateBatch::templates)
+        .map(|t| (t.name().to_vec(), t.records().iter().map(|r| r.as_ref().to_vec()).collect()))
+        .collect()
+}
+
+/// The parallel path (queryname-cut source + `AssembleTemplates`) must produce
+/// byte-identical templates, in the same order, as the serial `GroupByQueryname`
+/// — across BGZF block boundaries (small `payload_bytes` so a template's two
+/// records straddle blocks), byte backpressure, and parallel workers.
+#[rstest]
+fn parallel_grouping_matches_serial_groupbyqueryname(
+    #[values(1, 4)] threads: usize,
+    #[values(1, 50, 300)] n_templates: usize,
+    #[values(64, 4096)] payload_bytes: usize,
+) {
+    let records = paired_records(n_templates);
+
+    // Serial path: FindBamBoundaries(Record) -> DecodeRecords -> GroupByQueryname.
+    let serial_out: Arc<Mutex<Vec<BamTemplateBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let sink = Arc::clone(&serial_out);
+        let builder = Pipeline::builder();
+        builder
+            .chain(ReplaySource::new(bgzf_blocks_for(&records, payload_bytes)))
+            .chain(BgzfDecompress::new(EDGE_LIMIT_BYTES))
+            .chain(FindBamBoundaries::new(EDGE_LIMIT_BYTES))
+            .chain(DecodeRecords::new(GroupKeyConfig::default(), EDGE_LIMIT_BYTES))
+            .chain(GroupByQueryname::new(EDGE_LIMIT_BYTES))
+            .chain(CollectSink { collected: sink })
+            .into_sink_marker();
+        builder
+            .build()
+            .expect("serial chain builds")
+            .run(PipelineConfig { threads, ..Default::default() })
+            .expect("serial chain runs");
+    }
+
+    // Parallel path: FindBamBoundaries(Queryname) -> DecodeRecords(closed) ->
+    // AssembleTemplates.
+    let par_out: Arc<Mutex<Vec<BamTemplateBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let sink = Arc::clone(&par_out);
+        let builder = Pipeline::builder();
+        builder
+            .chain(ReplaySource::new(bgzf_blocks_for(&records, payload_bytes)))
+            .chain(BgzfDecompress::new(EDGE_LIMIT_BYTES))
+            .chain(FindBamBoundaries::new(EDGE_LIMIT_BYTES).with_cut(BatchCut::Queryname, 0))
+            .chain(
+                DecodeRecords::new(GroupKeyConfig::default(), EDGE_LIMIT_BYTES)
+                    .with_closed_batches(true),
+            )
+            .chain(AssembleTemplates::new(EDGE_LIMIT_BYTES))
+            .chain(CollectSink { collected: sink })
+            .into_sink_marker();
+        builder
+            .build()
+            .expect("parallel chain builds")
+            .run(PipelineConfig { threads, ..Default::default() })
+            .expect("parallel chain runs");
+    }
+
+    let serial = flatten_templates(&serial_out.lock().expect("serial mutex"));
+    let parallel = flatten_templates(&par_out.lock().expect("parallel mutex"));
+
+    // Both paths must reproduce every template (name + ordered record bytes) in
+    // input order.
+    let expected: Vec<Vec<u8>> =
+        (0..n_templates).map(|i| format!("read{i}").into_bytes()).collect();
+    let serial_names: Vec<Vec<u8>> = serial.iter().map(|(n, _)| n.clone()).collect();
+    assert_eq!(serial_names, expected, "serial path template order");
+    assert_eq!(parallel, serial, "parallel path must byte-match the serial grouper");
+    assert!(parallel.iter().all(|(_, recs)| recs.len() == 2), "every template holds its R1+R2",);
+}
+
+/// `AssembleTemplates` fed by a NON-queryname-cut source (batches not marked
+/// closed) must fail closed — the run errors rather than silently splitting a
+/// straddling template.
+#[test]
+fn assemble_templates_fails_closed_on_unmarked_batches() {
+    let records = paired_records(50);
+    let sink: Arc<Mutex<Vec<BamTemplateBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let builder = Pipeline::builder();
+    builder
+        .chain(ReplaySource::new(bgzf_blocks_for(&records, 64)))
+        .chain(BgzfDecompress::new(EDGE_LIMIT_BYTES))
+        // Record-mode cut (default) + un-marked DecodeRecords: batches are NOT
+        // closed under queryname, so AssembleTemplates must reject them.
+        .chain(FindBamBoundaries::new(EDGE_LIMIT_BYTES))
+        .chain(DecodeRecords::new(GroupKeyConfig::default(), EDGE_LIMIT_BYTES))
+        .chain(AssembleTemplates::new(EDGE_LIMIT_BYTES))
+        .chain(CollectSink { collected: Arc::clone(&sink) })
+        .into_sink_marker();
+    let result = builder
+        .build()
+        .expect("chain builds")
+        .run(PipelineConfig { threads: 1, ..Default::default() });
+    assert!(result.is_err(), "AssembleTemplates must fail on batches not closed under queryname");
 }

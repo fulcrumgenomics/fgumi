@@ -198,7 +198,18 @@ pub(crate) enum ChainTailKind {
     /// `DecodeFromRecords`).
     ///
     /// [`DecodedRecordBatch`]: crate::pipeline::steps::types::DecodedRecordBatch
-    DecodedRecordBatch,
+    DecodedRecordBatch {
+        /// Whether every emitted batch is closed under queryname: no queryname
+        /// run straddles a batch boundary. Set by the source preamble when the
+        /// first stage groups by queryname (the [`BatchCut::Queryname`] cut in
+        /// `FindBamBoundaries` / `ReadSamChunks`), and by an intermediate
+        /// consensus stage (closed by construction: one block per batch, molecule
+        /// names never split). When `true`, the queryname grouper is the parallel
+        /// `AssembleTemplates` map; when `false`, the serial `GroupByQueryname`.
+        ///
+        /// [`BatchCut::Queryname`]: crate::pipeline::steps::boundaries::state::BatchCut::Queryname
+        closed_under_queryname: bool,
+    },
 
     /// The chain tail produces serialized BGZF-ready bytes
     /// ([`DecompressedBlock`]) after a Terminal serialize step
@@ -693,7 +704,7 @@ impl<'a> ChainBuilder<'a> {
             pending_header_transform: None,
             // Initialise to the default; add_source will set the correct kind
             // based on whether sort is the first intermediate stage.
-            chain_tail_kind: ChainTailKind::DecodedRecordBatch,
+            chain_tail_kind: ChainTailKind::DecodedRecordBatch { closed_under_queryname: false },
             // Pool-scheduled writer by default; add_sort opts the standalone
             // sort terminal into a Detached writer (lever 2).
             detached_writer: false,
@@ -1067,13 +1078,18 @@ impl<'a> ChainBuilder<'a> {
                             self.current_tail = Some(tail);
                             self.chain_tail_kind = ChainTailKind::BgzfBlockArena;
                         } else {
+                            let cut = self.source_batch_cut();
                             let tail = self.build_bam_decode_preamble(
                                 reader,
                                 self.header.clone(),
                                 group_key_config,
+                                cut,
                             );
                             self.current_tail = Some(tail);
-                            self.chain_tail_kind = ChainTailKind::DecodedRecordBatch;
+                            self.chain_tail_kind = ChainTailKind::DecodedRecordBatch {
+                                closed_under_queryname: cut
+                                    == crate::pipeline::steps::boundaries::state::BatchCut::Queryname,
+                            };
                         }
                     }
                     InputSource::Sam { reader: sam_reader, .. } => {
@@ -1089,13 +1105,18 @@ impl<'a> ChainBuilder<'a> {
                         // `sam: Required` for `sort` — so SAM-first is a binding
                         // contract, not an optional extra.
                         let buf = sam_reader.into_inner();
+                        let cut = self.source_batch_cut();
                         let tail = self.build_sam_parse_preamble(
                             buf,
                             self.header.clone(),
                             group_key_config,
+                            cut,
                         );
                         self.current_tail = Some(tail);
-                        self.chain_tail_kind = ChainTailKind::DecodedRecordBatch;
+                        self.chain_tail_kind = ChainTailKind::DecodedRecordBatch {
+                            closed_under_queryname: cut
+                                == crate::pipeline::steps::boundaries::state::BatchCut::Queryname,
+                        };
                     }
                 }
             }
@@ -1136,13 +1157,21 @@ impl<'a> ChainBuilder<'a> {
                 // GroupKeyConfig used by DecodeRecords (BAM) and ParseSamChunk (SAM).
                 let group_key_config = self.bam_group_key_config()?;
 
-                // ── Unmapped preamble: always BAM (guaranteed by open_source) ──
-                let unmapped_tail = match unmapped {
+                // Zipper groups both input chains by queryname before the merge,
+                // so both preambles use the queryname cut and their grouper is the
+                // parallel `AssembleTemplates` map. `append_queryname_grouper`
+                // reads `chain_tail_kind`, so mark it closed before each call.
+                let closed_tail =
+                    ChainTailKind::DecodedRecordBatch { closed_under_queryname: true };
+
+                // Unmapped preamble: always BAM (guaranteed by open_source).
+                let unmapped_decoded = match unmapped {
                     InputSource::Bam { reader, header: bam_header } => self
-                        .build_bam_decode_then_group_preamble(
+                        .build_bam_decode_preamble(
                             reader,
                             bam_header,
                             group_key_config.clone(),
+                            crate::pipeline::steps::boundaries::state::BatchCut::Queryname,
                         ),
                     InputSource::Sam { .. } => {
                         // Guarded in open_source; belt-and-suspenders.
@@ -1152,16 +1181,30 @@ impl<'a> ChainBuilder<'a> {
                         );
                     }
                 };
+                self.chain_tail_kind = closed_tail;
+                let unmapped_tail = self.append_queryname_grouper(unmapped_decoded);
 
-                // ── Mapped preamble: BAM or SAM ────────────────────────────────
-                let mapped_tail = match mapped {
+                // Mapped preamble: BAM or SAM.
+                let mapped_decoded = match mapped {
                     InputSource::Bam { reader, header: bam_header } => self
-                        .build_bam_decode_then_group_preamble(reader, bam_header, group_key_config),
+                        .build_bam_decode_preamble(
+                            reader,
+                            bam_header,
+                            group_key_config,
+                            crate::pipeline::steps::boundaries::state::BatchCut::Queryname,
+                        ),
                     InputSource::Sam { reader: rdr, header: hdr } => {
                         let buf = rdr.into_inner();
-                        self.build_sam_parse_then_group_preamble(buf, hdr, group_key_config)
+                        self.build_sam_parse_preamble(
+                            buf,
+                            hdr,
+                            group_key_config,
+                            crate::pipeline::steps::boundaries::state::BatchCut::Queryname,
+                        )
                     }
                 };
+                self.chain_tail_kind = closed_tail;
+                let mapped_tail = self.append_queryname_grouper(mapped_decoded);
 
                 // Store both tails. current_tail = unmapped; paired_tail = mapped.
                 // add_zipper will consume both via PipelineBuilder::append_step2.
@@ -1399,6 +1442,61 @@ impl<'a> ChainBuilder<'a> {
         }
     }
 
+    /// Select the source-preamble batch cut ([`BatchCut`]) for the first stage.
+    ///
+    /// Returns [`BatchCut::Queryname`] when the first stage feeds a queryname
+    /// grouper, so the cutter (`FindBamBoundaries` / `ReadSamChunks`) emits
+    /// batches closed under queryname and the downstream grouper runs as the
+    /// parallel [`AssembleTemplates`] map. Otherwise [`BatchCut::Record`], the
+    /// default (one BGZF block / SAM chunk per batch, split only at record
+    /// boundaries).
+    ///
+    /// Queryname-cut stages:
+    /// - `Correct` — always groups by queryname before the correct step.
+    /// - `Align` — always groups by queryname before the align-and-merge step.
+    /// - `Filter` in `--filter-by-template` mode — inserts a `GroupByQueryname`;
+    ///   the per-record filter mode does not, so it stays `Record`.
+    ///
+    /// Zipper's paired-BAM source is cut in `add_source`'s `Paired` arm directly
+    /// (both input chains group by queryname), not here — this helper only sees
+    /// the single-source path.
+    ///
+    /// Note this is deliberately narrower than [`Self::source_group_key_config`]:
+    /// `Sort`/`CopyUmi`/`Retag`/`Clip` use the cheap name-hash-only key but do
+    /// NOT group by queryname (sort computes its own keys, copy-umi/retag are
+    /// per-record, clip uses its own template grouper), so they keep the
+    /// `Record` cut.
+    ///
+    /// [`BatchCut`]: crate::pipeline::steps::boundaries::state::BatchCut
+    /// [`BatchCut::Queryname`]: crate::pipeline::steps::boundaries::state::BatchCut::Queryname
+    /// [`BatchCut::Record`]: crate::pipeline::steps::boundaries::state::BatchCut::Record
+    /// [`AssembleTemplates`]: crate::pipeline::steps::group::assemble::AssembleTemplates
+    fn source_batch_cut(&self) -> crate::pipeline::steps::boundaries::state::BatchCut {
+        use crate::pipeline::steps::boundaries::state::BatchCut;
+        match self.spec.stages.first() {
+            Some(Stage::Correct | Stage::Align) => BatchCut::Queryname,
+            Some(Stage::Filter) => {
+                let by_template =
+                    self.spec.stage_opts.filter.as_ref().is_some_and(|f| f.filter_by_template);
+                if by_template { BatchCut::Queryname } else { BatchCut::Record }
+            }
+            _ => BatchCut::Record,
+        }
+    }
+
+    /// Coalescing target (bytes) for a [`BatchCut::Queryname`] source: absorb up
+    /// to `blocks_per_batch` BGZF blocks (~64 KiB decompressed each) into one
+    /// emitted batch before cutting at the next queryname boundary. This gives
+    /// the `blocks_per_batch` tuning knob the batch geometry its name implies —
+    /// without it a 1:1 cut would emit batches ~`blocks_per_batch`× smaller than
+    /// the `Record` path. Shared by the BAM and SAM preambles.
+    ///
+    /// [`BatchCut::Queryname`]: crate::pipeline::steps::boundaries::state::BatchCut::Queryname
+    fn queryname_min_emit_bytes(&self) -> usize {
+        const DECOMPRESSED_BLOCK_BYTES: usize = 64 * 1024;
+        self.tuning.blocks_per_batch.saturating_mul(DECOMPRESSED_BLOCK_BYTES)
+    }
+
     /// Finish a consensus stage's chain tail.
     ///
     /// The consensus step emits a record-aligned [`DecompressedBlock`]. For a
@@ -1437,11 +1535,20 @@ impl<'a> ChainBuilder<'a> {
             StagePosition::Intermediate => {
                 use crate::pipeline::steps::parse::decode::DecodeRecords;
                 let group_key_config = self.bam_group_key_config()?;
+                // Consensus output is closed under queryname by construction: one
+                // block per batch, molecule names (`<prefix>:<MI>`) never split
+                // across blocks. Mark the decoded batches closed so a downstream
+                // queryname grouper (e.g. filter --filter-by-template) can run as
+                // the parallel `AssembleTemplates` map. The runtime flag must match
+                // the `chain_tail_kind` claim below or `AssembleTemplates` fails
+                // closed.
                 let tail = self.pipeline.append_step(
-                    DecodeRecords::new(group_key_config, self.tuning.per_step_byte_limit),
+                    DecodeRecords::new(group_key_config, self.tuning.per_step_byte_limit)
+                        .with_closed_batches(true),
                     tail,
                 );
-                self.chain_tail_kind = ChainTailKind::DecodedRecordBatch;
+                self.chain_tail_kind =
+                    ChainTailKind::DecodedRecordBatch { closed_under_queryname: true };
                 Ok(tail)
             }
         }
@@ -1489,17 +1596,33 @@ impl<'a> ChainBuilder<'a> {
 
     /// Append the 4-step BAM decode preamble:
     /// `ReadBgzfBlocks → BgzfDecompress → FindBamBoundaries → DecodeRecords`.
+    ///
+    /// `cut` selects the boundary policy: [`BatchCut::Record`] (one block per
+    /// batch, record-aligned) or [`BatchCut::Queryname`] (batches closed under
+    /// queryname, coalesced to [`Self::queryname_min_emit_bytes`]). Under the
+    /// queryname cut the emitted `DecodedRecordBatch` is marked closed
+    /// (`DecodeRecords::with_closed_batches`), which lets the downstream grouper
+    /// run as the parallel [`AssembleTemplates`] map. The caller is responsible
+    /// for setting `chain_tail_kind`'s `closed_under_queryname` flag to match.
+    ///
+    /// [`BatchCut::Record`]: crate::pipeline::steps::boundaries::state::BatchCut::Record
+    /// [`BatchCut::Queryname`]: crate::pipeline::steps::boundaries::state::BatchCut::Queryname
+    /// [`AssembleTemplates`]: crate::pipeline::steps::group::assemble::AssembleTemplates
     fn build_bam_decode_preamble(
         &mut self,
         reader: Box<dyn std::io::Read + Send>,
         header: Header,
         group_key_config: fgumi_bam_io::GroupKeyConfig,
+        cut: crate::pipeline::steps::boundaries::state::BatchCut,
     ) -> (crate::pipeline::core::topology::StepIdx, crate::pipeline::core::topology::BranchIdx)
     {
         use crate::pipeline::steps::bgzf::decompress::BgzfDecompress;
         use crate::pipeline::steps::boundaries::bam::FindBamBoundaries;
+        use crate::pipeline::steps::boundaries::state::BatchCut;
         use crate::pipeline::steps::parse::decode::DecodeRecords;
         use crate::pipeline::steps::source::read_bam::read_bam_from_reader;
+
+        let closed = cut == BatchCut::Queryname;
 
         let (read_step, _) = read_bam_from_reader(
             reader,
@@ -1515,65 +1638,100 @@ impl<'a> ChainBuilder<'a> {
             BgzfDecompress::new_with_crc(self.tuning.per_step_byte_limit, self.spec.verify_crc),
             tail,
         );
-        let tail = self
-            .pipeline
-            .append_step(FindBamBoundaries::new(self.tuning.per_step_byte_limit), tail);
+        let boundaries = FindBamBoundaries::new(self.tuning.per_step_byte_limit)
+            .with_cut(cut, self.queryname_min_emit_bytes());
+        let tail = self.pipeline.append_step(boundaries, tail);
         self.pipeline.append_step(
-            DecodeRecords::new(group_key_config, self.tuning.per_step_byte_limit),
+            DecodeRecords::new(group_key_config, self.tuning.per_step_byte_limit)
+                .with_closed_batches(closed),
             tail,
         )
     }
 
-    /// Append the BAM decode preamble followed by `GroupByQueryname`:
-    /// `ReadBgzfBlocks → BgzfDecompress → FindBamBoundaries → DecodeRecords → GroupByQueryname`.
-    fn build_bam_decode_then_group_preamble(
-        &mut self,
-        reader: Box<dyn std::io::Read + Send>,
-        header: Header,
-        group_key_config: fgumi_bam_io::GroupKeyConfig,
-    ) -> (crate::pipeline::core::topology::StepIdx, crate::pipeline::core::topology::BranchIdx)
-    {
-        use crate::pipeline::steps::group::queryname::GroupByQueryname;
-
-        let tail = self.build_bam_decode_preamble(reader, header, group_key_config);
-        self.pipeline.append_step(GroupByQueryname::new(self.tuning.per_step_byte_limit), tail)
-    }
-
     /// Append the 2-step SAM parse preamble:
     /// `ReadSamChunks → ParseSamChunk`.
+    ///
+    /// `cut` selects the boundary policy (see [`Self::build_bam_decode_preamble`]).
+    /// Under [`BatchCut::Queryname`] the chunker is
+    /// [`ReadSamChunks::new_queryname_cut`] and `ParseSamChunk` marks its output
+    /// closed.
+    ///
+    /// [`BatchCut::Queryname`]: crate::pipeline::steps::boundaries::state::BatchCut::Queryname
+    /// [`ReadSamChunks::new_queryname_cut`]: crate::pipeline::steps::source::read_sam_chunks::ReadSamChunks::new_queryname_cut
     fn build_sam_parse_preamble(
         &mut self,
         buf: Box<dyn std::io::BufRead + Send>,
         header: Header,
         group_key_config: fgumi_bam_io::GroupKeyConfig,
+        cut: crate::pipeline::steps::boundaries::state::BatchCut,
     ) -> (crate::pipeline::core::topology::StepIdx, crate::pipeline::core::topology::BranchIdx)
     {
+        use crate::pipeline::steps::boundaries::state::BatchCut;
         use crate::pipeline::steps::parse::sam::ParseSamChunk;
         use crate::pipeline::steps::source::read_sam_chunks::{
             DEFAULT_SAM_CHUNK_BYTES, ReadSamChunks,
         };
 
-        let read_step =
-            ReadSamChunks::new(buf, DEFAULT_SAM_CHUNK_BYTES, self.tuning.per_step_byte_limit);
+        let closed = cut == BatchCut::Queryname;
+        let read_step = if closed {
+            ReadSamChunks::new_queryname_cut(
+                buf,
+                DEFAULT_SAM_CHUNK_BYTES,
+                self.tuning.per_step_byte_limit,
+                self.queryname_min_emit_bytes(),
+            )
+        } else {
+            ReadSamChunks::new(buf, DEFAULT_SAM_CHUNK_BYTES, self.tuning.per_step_byte_limit)
+        };
         let parse_step =
-            ParseSamChunk::new(Arc::new(header), group_key_config, self.tuning.per_step_byte_limit);
+            ParseSamChunk::new(Arc::new(header), group_key_config, self.tuning.per_step_byte_limit)
+                .with_closed_batches(closed);
         let tail = self.pipeline.append_source(read_step);
         self.pipeline.append_step(parse_step, tail)
     }
 
-    /// Append the SAM parse preamble followed by `GroupByQueryname`:
-    /// `ReadSamChunks → ParseSamChunk → GroupByQueryname`.
-    fn build_sam_parse_then_group_preamble(
+    /// Append the queryname grouper for a `DecodedRecordBatch` tail, choosing the
+    /// implementation from the tail's closure flag:
+    ///
+    /// - closed under queryname → [`AssembleTemplates`] (a `Parallel` map, one
+    ///   `BamTemplateBatch` per input batch; no serial feeder);
+    /// - not closed → the serial [`GroupByQueryname`], pinned to a single worker
+    ///   (`Affinity::Worker(1)`, clamped for `--threads 1`) so the surplus
+    ///   workers skip probing it every idle pass (the Layer-1 oversubscription
+    ///   fix). Worker 1 avoids worker 0, which hosts the sticky reader source.
+    ///
+    /// Both emit `OrderedBytesSingle<BamTemplateBatch>`, so downstream wiring is
+    /// identical. The caller must have already set `chain_tail_kind` to a
+    /// `DecodedRecordBatch` variant; the returned tail is `BamTemplateBatch` and
+    /// the caller updates `chain_tail_kind` accordingly.
+    ///
+    /// [`AssembleTemplates`]: crate::pipeline::steps::group::assemble::AssembleTemplates
+    /// [`GroupByQueryname`]: crate::pipeline::steps::group::queryname::GroupByQueryname
+    fn append_queryname_grouper(
         &mut self,
-        buf: Box<dyn std::io::BufRead + Send>,
-        header: Header,
-        group_key_config: fgumi_bam_io::GroupKeyConfig,
+        tail: (
+            crate::pipeline::core::topology::StepIdx,
+            crate::pipeline::core::topology::BranchIdx,
+        ),
     ) -> (crate::pipeline::core::topology::StepIdx, crate::pipeline::core::topology::BranchIdx)
     {
-        use crate::pipeline::steps::group::queryname::GroupByQueryname;
-
-        let tail = self.build_sam_parse_preamble(buf, header, group_key_config);
-        self.pipeline.append_step(GroupByQueryname::new(self.tuning.per_step_byte_limit), tail)
+        let closed = matches!(
+            self.chain_tail_kind,
+            ChainTailKind::DecodedRecordBatch { closed_under_queryname: true }
+        );
+        if closed {
+            use crate::pipeline::steps::group::assemble::AssembleTemplates;
+            self.pipeline.append_step(AssembleTemplates::new(self.tuning.per_step_byte_limit), tail)
+        } else {
+            use crate::pipeline::core::step::Affinity;
+            use crate::pipeline::steps::group::queryname::GroupByQueryname;
+            let num_threads = self.spec.threading.num_threads();
+            let pin = Affinity::Worker(1.min(num_threads.saturating_sub(1)));
+            self.pipeline.append_step(
+                GroupByQueryname::new(self.tuning.per_step_byte_limit).with_affinity(pin),
+                tail,
+            )
+        }
     }
 
     /// Dispatch by `Stage` variant to the per-stage internal builder.
@@ -2205,7 +2363,6 @@ impl<'a> ChainBuilder<'a> {
         use crate::pipeline::steps::correct::{
             CorrectStepConfig, correct_step_kept_only, correct_step_with_rejects,
         };
-        use crate::pipeline::steps::group::queryname::GroupByQueryname;
         use crate::pipeline::steps::serialize::SerializeBamRecords;
         use log::info;
 
@@ -2277,29 +2434,22 @@ impl<'a> ChainBuilder<'a> {
         info!("{}", self.spec.threading.log_message());
         info!("Using pipeline with {num_threads} threads");
 
-        // Wire GroupByQueryname before the correct step — but only when the upstream
-        // stage emits DecodedRecordBatch (the normal source-preamble path). When
-        // `chain_tail_kind == BamTemplateBatch`, an upstream stage (e.g. Extract) has
-        // already grouped records into templates, which is exactly the input the
-        // correct step consumes. Skip GroupByQueryname in that case to avoid a
-        // DecodedRecordBatch→BamTemplateBatch type mismatch (mirrors `add_align`).
+        // Wire the queryname grouper before the correct step — but only when the
+        // upstream stage emits `DecodedRecordBatch` (the normal source-preamble
+        // path). When `chain_tail_kind == BamTemplateBatch`, an upstream stage
+        // (e.g. Extract) has already grouped records into templates, which is
+        // exactly the input the correct step consumes. Skip the grouper in that
+        // case to avoid a `DecodedRecordBatch → BamTemplateBatch` type mismatch
+        // (mirrors `add_align`).
+        //
+        // `append_queryname_grouper` picks the parallel `AssembleTemplates` map
+        // when the source cut left the batches closed under queryname, else the
+        // serial `GroupByQueryname` pinned to one worker (the Layer-1
+        // oversubscription fix).
         let tail = if self.chain_tail_kind == ChainTailKind::BamTemplateBatch {
             tail
         } else {
-            // Layer 1 (oversubscription): `GroupByQueryname` is the throughput
-            // ceiling of the `correct` chain — it is the sole `Serial` feeder of
-            // the parallel `correct` step. Left as `Affinity::None` it is probed
-            // by every one of N workers on every idle pass; pin it to a single
-            // worker so the surplus `Skip` it entirely. Worker 1 (not 0, which
-            // hosts the sticky reader source), clamped so `--threads 1` maps to
-            // worker 0 rather than requesting a non-existent worker (which would
-            // panic at run start).
-            use crate::pipeline::core::step::Affinity;
-            let pin = Affinity::Worker(1.min(num_threads.saturating_sub(1)));
-            self.pipeline.append_step(
-                GroupByQueryname::new(self.tuning.per_step_byte_limit).with_affinity(pin),
-                tail,
-            )
+            self.append_queryname_grouper(tail)
         };
 
         // Dispatch on rejects presence: either a 2-output or a 1-output step.
@@ -2463,7 +2613,6 @@ impl<'a> ChainBuilder<'a> {
         use crate::pipeline::chains::commands::align::AlignFinalizeHook;
         use crate::pipeline::core::header::HeaderHandle;
         use crate::pipeline::steps::align_and_merge::{AlignAndMergeConfig, AlignAndMergeStep};
-        use crate::pipeline::steps::group::queryname::GroupByQueryname;
         use crate::pipeline::steps::serialize::SerializeBamRecords;
         use crate::reference::find_dict_path;
         use crate::sam::check_sort;
@@ -2566,8 +2715,10 @@ impl<'a> ChainBuilder<'a> {
             tail
         } else {
             // Upstream is DecodedRecordBatch (source preamble). Group by queryname
-            // to produce BamTemplateBatch for AlignAndMergeStep.
-            self.pipeline.append_step(GroupByQueryname::new(self.tuning.per_step_byte_limit), tail)
+            // to produce BamTemplateBatch for AlignAndMergeStep — the parallel
+            // `AssembleTemplates` map when the source cut left batches closed
+            // under queryname, else the serial `GroupByQueryname`.
+            self.append_queryname_grouper(tail)
         };
         let aam_tail = self.pipeline.append_step(aam_step, align_input_tail);
 
@@ -3003,7 +3154,7 @@ impl<'a> ChainBuilder<'a> {
                 use crate::pipeline::steps::templates_to_records::TemplatesToRecordBatch;
                 self.pipeline
                     .append_step(TemplatesToRecordBatch::new(self.tuning.per_step_byte_limit), tail)
-            } else if self.chain_tail_kind == ChainTailKind::DecodedRecordBatch {
+            } else if matches!(self.chain_tail_kind, ChainTailKind::DecodedRecordBatch { .. }) {
                 use crate::pipeline::steps::decoded_to_records::DecodedRecordBatchToRecordBatch;
                 self.pipeline.append_step(
                     DecodedRecordBatchToRecordBatch::new(self.tuning.per_step_byte_limit),
@@ -3230,7 +3381,8 @@ impl<'a> ChainBuilder<'a> {
                     merge_tail,
                 );
                 self.current_tail = Some(tail);
-                self.chain_tail_kind = ChainTailKind::DecodedRecordBatch;
+                self.chain_tail_kind =
+                    ChainTailKind::DecodedRecordBatch { closed_under_queryname: false };
             }
 
             // Update self.header to reflect the sort order so downstream
@@ -4737,7 +4889,7 @@ impl<'a> ChainBuilder<'a> {
         // (e.g. an intermediate Group emits BatchedProcessedPositionGroups), the
         // type-erased pipeline would build but panic at dispatch — reject it here
         // with a clear error.
-        if self.chain_tail_kind != ChainTailKind::DecodedRecordBatch {
+        if !matches!(self.chain_tail_kind, ChainTailKind::DecodedRecordBatch { .. }) {
             bail!(
                 "Stage::Clip requires a record-stream input (DecodedRecordBatch), but the chain \
                  tail is {:?}; clip cannot follow a stage that emits grouped templates or \
@@ -4909,7 +5061,7 @@ impl<'a> ChainBuilder<'a> {
 
         // Copy-umi consumes a record stream, so it needs a DecodedRecordBatch
         // tail (same requirement as filter/clip). Reject any other upstream tail.
-        if self.chain_tail_kind != ChainTailKind::DecodedRecordBatch {
+        if !matches!(self.chain_tail_kind, ChainTailKind::DecodedRecordBatch { .. }) {
             bail!(
                 "Stage::CopyUmi requires a record-stream input (DecodedRecordBatch), but the chain \
                  tail is {:?}; copy-umi cannot follow a stage that emits grouped templates or \
@@ -5020,7 +5172,7 @@ impl<'a> ChainBuilder<'a> {
         // stage left a different tail type (e.g. an intermediate Group emits
         // BatchedProcessedPositionGroups), the type-erased pipeline would build but
         // panic at dispatch — reject it here.
-        if self.chain_tail_kind != ChainTailKind::DecodedRecordBatch {
+        if !matches!(self.chain_tail_kind, ChainTailKind::DecodedRecordBatch { .. }) {
             bail!(
                 "Stage::Filter requires a record-stream input (DecodedRecordBatch), but the chain \
                  tail is {:?}; filter cannot follow a stage that emits grouped templates or \
@@ -5113,13 +5265,11 @@ impl<'a> ChainBuilder<'a> {
         let filter_by_template = filter.filter_by_template;
         let track_rejects = filter.rejects.is_some();
 
-        // If template-aware, insert GroupByQueryname step before process.
-        let tail = if filter_by_template {
-            use crate::pipeline::steps::group::queryname::GroupByQueryname;
-            self.pipeline.append_step(GroupByQueryname::new(self.tuning.per_step_byte_limit), tail)
-        } else {
-            tail
-        };
+        // If template-aware, insert the queryname grouper before process — the
+        // parallel `AssembleTemplates` map when the source cut left batches closed
+        // under queryname (filter-by-template first stage), else the serial
+        // `GroupByQueryname`.
+        let tail = if filter_by_template { self.append_queryname_grouper(tail) } else { tail };
 
         // Select and append the process step (kept-only or kept+rejects).
         let process_tail = match (filter_by_template, track_rejects) {
@@ -5246,7 +5396,7 @@ impl<'a> ChainBuilder<'a> {
         }
 
         // retag consumes a record stream (DecodedRecordBatch), like filter/clip/dedup.
-        if self.chain_tail_kind != ChainTailKind::DecodedRecordBatch {
+        if !matches!(self.chain_tail_kind, ChainTailKind::DecodedRecordBatch { .. }) {
             bail!(
                 "Stage::Retag requires a record-stream input (DecodedRecordBatch), but the chain \
                  tail is {:?}; retag cannot follow a stage that emits grouped templates or \
@@ -5364,7 +5514,7 @@ impl<'a> ChainBuilder<'a> {
         // consumes a DecodedRecordBatch tail. Reject an incompatible upstream
         // tail (e.g. an intermediate Group's BatchedProcessedPositionGroups) here
         // rather than dispatch-panicking in the type-erased pipeline.
-        if self.chain_tail_kind != ChainTailKind::DecodedRecordBatch {
+        if !matches!(self.chain_tail_kind, ChainTailKind::DecodedRecordBatch { .. }) {
             bail!(
                 "Stage::Dedup requires a record-stream input (DecodedRecordBatch), but the chain \
                  tail is {:?}; dedup cannot follow a stage that emits grouped templates or \
@@ -5749,7 +5899,7 @@ mod tests {
             use_drain_first_scheduler: false,
             pending_header_handle: None,
             pending_header_transform: None,
-            chain_tail_kind: ChainTailKind::DecodedRecordBatch,
+            chain_tail_kind: ChainTailKind::DecodedRecordBatch { closed_under_queryname: false },
             detached_writer: false,
             fastq_encoding: None,
             consensus_metrics_captures: None,

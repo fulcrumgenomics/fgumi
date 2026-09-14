@@ -115,7 +115,10 @@ impl GroupByQueryname {
     fn flush_current_template(&mut self) -> io::Result<()> {
         if !self.current_records.is_empty() {
             let records = std::mem::take(&mut self.current_records);
-            let template = Template::from_records(records)
+            // Trusted constructor: `process_record` only appends to the run when
+            // the read name matches, so this run is same-named by construction
+            // and the QNAME re-verification in `from_records` is redundant.
+            let template = Template::from_records_trusted(records)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             self.accumulator.push(template);
             self.current_name_hash = None;
@@ -284,7 +287,7 @@ mod tests {
         let mut step = GroupByQueryname::with_target_batch_count(1 << 20, TARGET);
 
         // 150 completed templates, as one oversized grouping pass would leave.
-        step.accumulator = (0..150).map(|i| Template::new(format!("q{i}").into_bytes())).collect();
+        step.accumulator = (0..150).map(|_| Template::new()).collect();
 
         let first = step.drain_one_batch();
         assert_eq!(first.len(), TARGET, "a batch must never exceed the target");
@@ -313,7 +316,7 @@ mod tests {
             step.process_record(raw, name_hash).expect("process_record");
         }
         step.flush_current_template().expect("flush");
-        step.accumulator.iter().map(|t| (t.name.clone(), t.records().len())).collect()
+        step.accumulator.iter().map(|t| (t.name().to_vec(), t.records().len())).collect()
     }
 
     const R1: u16 = flags::PAIRED | flags::FIRST_SEGMENT;
@@ -325,6 +328,27 @@ mod tests {
         let records: Vec<(&[u8], u16)> = vec![(b"read1", R1), (b"read1", R2)];
         let groups = run_grouping(&mut step, &records);
         assert_eq!(groups, vec![(b"read1".to_vec(), 2)]);
+    }
+
+    /// Two adjacent records with different read names but a forced identical
+    /// `name_hash` must still form two templates. `process_record`'s
+    /// `current_name` byte compare is what separates them — and since the flush
+    /// now builds with `from_records_trusted` (no cross-record QNAME
+    /// re-verification), that byte compare is the SOLE guard against a hash
+    /// collision merging two differently-named reads into one template. A
+    /// regression to hash-only run detection would merge them and this fails.
+    #[test]
+    fn process_record_splits_on_name_hash_collision() {
+        let mut step = GroupByQueryname::new(1 << 20);
+        step.process_record(raw_named(b"aaa", R1), 0xDEAD_BEEF).expect("process_record");
+        step.process_record(raw_named(b"bbb", R1), 0xDEAD_BEEF).expect("process_record");
+        step.flush_current_template().expect("flush");
+        let names: Vec<Vec<u8>> = step.accumulator.iter().map(|t| t.name().to_vec()).collect();
+        assert_eq!(
+            names,
+            vec![b"aaa".to_vec(), b"bbb".to_vec()],
+            "same name_hash but different names must not merge into one template",
+        );
     }
 
     #[test]
