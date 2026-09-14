@@ -38,7 +38,7 @@ use rstest::rstest;
 use tempfile::TempDir;
 
 use crate::helpers::assertions::assert_text_files_eq;
-use crate::helpers::bam_generator::{create_minimal_header, write_bam};
+use crate::helpers::bam_generator::{create_minimal_header, transcode_bam_to_sam, write_bam};
 use crate::helpers::cutover::{baseline_bin, decompressed_records_without_pg};
 use crate::helpers::read_bam_output;
 use fgumi_lib::sam::SamTag;
@@ -220,6 +220,60 @@ fn cutover_matches_baseline(#[case] ops: &[&str], #[case] with_metrics: bool) {
         );
         assert_self_consistent(&current_out, current_metrics.as_deref(), ops);
     }
+}
+
+/// Raw/decoded path parity: a BAM source routes retag through the decode-free
+/// borrowed `RecordBatch` fast path (`build_retag_process_step_raw`), while an
+/// uncompressed SAM source routes it through the owned `DecodedRecordBatch`
+/// decode path (`build_retag_process_step`). Both share `retag_one_record` /
+/// `finalize_retag_batch`, so identical records must yield byte-identical output
+/// AND identical per-operation `--metrics` counts (`record_count`/progress is
+/// the metrics' denominator, so equal metrics imply equal progress). This runs the
+/// same corpus through both paths — a transcode of one BAM, so the records are
+/// identical — and asserts both, closing the cross-path count gap the BAM-only
+/// `cutover_matches_baseline` and the single-op source matrix leave open.
+#[test]
+fn retag_raw_and_decoded_paths_match() {
+    let dir = TempDir::new().expect("temp dir");
+    let bam_input = write_varied_input(dir.path());
+    let sam_input = dir.path().join("in.sam");
+    transcode_bam_to_sam(&bam_input, &sam_input);
+
+    let bin = Path::new(env!("CARGO_BIN_EXE_fgumi"));
+
+    // BAM source -> raw fast path.
+    let raw_out = dir.path().join("raw.bam");
+    let raw_tsv = dir.path().join("raw.tsv");
+    let raw = run_retag(bin, &bam_input, &raw_out, Some(&raw_tsv), PARITY_OPS);
+    assert!(
+        raw.status.success(),
+        "BAM-source (raw fast path) retag must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&raw.stderr)
+    );
+
+    // SAM source -> owned decoded path.
+    let decoded_out = dir.path().join("decoded.bam");
+    let decoded_tsv = dir.path().join("decoded.tsv");
+    let decoded = run_retag(bin, &sam_input, &decoded_out, Some(&decoded_tsv), PARITY_OPS);
+    assert!(
+        decoded.status.success(),
+        "SAM-source (decoded path) retag must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&decoded.stderr)
+    );
+
+    // Byte-identical output records (modulo the input-path-bearing @PG line).
+    assert_eq!(
+        decompressed_records_without_pg(&raw_out),
+        decompressed_records_without_pg(&decoded_out),
+        "retag raw (BAM source) and decoded (SAM source) paths must produce byte-identical records"
+    );
+    // Identical per-operation counts — the shared finalize hook must fold counts
+    // the same way on both paths.
+    assert_text_files_eq(
+        &raw_tsv,
+        &decoded_tsv,
+        "retag raw and decoded paths must produce identical per-operation --metrics counts",
+    );
 }
 
 /// Always-available oracle used when no baseline binary is set — it is the only
