@@ -136,11 +136,18 @@ mod tests {
         assert_eq!(p.branch_ordering, vec![BranchOrdering::ByItemOrdinal]);
     }
 
-    /// End-to-end of the step body's parse+zip: an `NRawFastqBatch` of two
-    /// aligned raw byte-chunks parses and zips into templates, and the batch's
-    /// `ordinal` is preserved verbatim as the output `batch_serial`. (The parse
-    /// and zip primitives themselves are unit-tested in `super::parse_fastq_chunk`
-    /// and `super::fastq_zip::zip_streams`; this pins the wiring in this step.)
+    /// Composes the primitives `ParseAndZipFastqN::try_run` chains — parse each
+    /// stream's chunk (`super::super::parse_fastq_chunk`), zip the per-stream
+    /// records into templates (`super::super::fastq_zip::zip_streams`), and carry
+    /// the input `ordinal` verbatim into the output batch's `batch_serial` — and
+    /// asserts the resulting templates and preserved ordinal.
+    ///
+    /// This is a primitive-level check: it does NOT construct `ParseAndZipFastqN`
+    /// or drive `try_run`, so it cannot detect step-level changes to stream
+    /// forwarding or ordinal propagation. That step wiring is exercised through
+    /// `Pipeline::run` by the chain tests
+    /// `unified_fastq_chain_recovers_every_template_in_order` and
+    /// `bgzf_split_mismatched_block_layouts_stay_in_lockstep`.
     #[test]
     fn parse_and_zip_two_streams_preserves_ordinal() {
         let mut data_a = record_bytes("read1/1", "ACGT");
