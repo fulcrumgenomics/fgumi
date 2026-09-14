@@ -209,15 +209,17 @@ fn run_batch(
     let mut kept_record_count: u64 = 0;
 
     for template in templates {
-        let mut records = template.into_records();
-        let num_records = records.len() as u64;
-
         // Every template counts once, whatever its outcome.
         local_metrics.templates_processed += 1;
 
-        let umi_opt =
-            correct::CorrectUmis::extract_and_validate_template_umi_raw(&records, cfg.umi_tag)
-                .map_err(io::Error::other)?;
+        // Resolve the UMI from the primary read (cache-first) before consuming
+        // the template into its records — `cached_umi` needs the assembled
+        // template.
+        let num_records = template.read_count() as u64;
+        let umi_opt = correct::CorrectUmis::extract_template_umi(&template, cfg.umi_tag)
+            .map_err(io::Error::other)?;
+
+        let mut records = template.into_records();
 
         let Some(umi) = umi_opt else {
             // No per-UMI credit here: fgbio counts a missing-UMI read only in
