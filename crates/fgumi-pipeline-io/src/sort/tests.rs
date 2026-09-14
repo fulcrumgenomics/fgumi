@@ -1775,6 +1775,203 @@ fn collect_merge_batches(
     Ok(std::mem::take(&mut *received.lock()))
 }
 
+/// Like [`collect_merge_batches`] but drives the terminal `SortMerge<BlockOutput>`
+/// fast path with an explicit `fast_path_threads` and a lowered parallel gate
+/// (`min_records`), returning each emitted block's `(batch_serial, framed bytes)`
+/// so a test can assert the parallel gather is byte-for-byte identical to the
+/// serial one. `threads == 1` (or a `min_records` above the record count) takes
+/// the serial gather; `threads > 1` with a low `min_records` takes the parallel
+/// gather.
+fn collect_fastpath_blocks(
+    events: Vec<crate::sort::protocol::SortPhase2Event>,
+    output_byte_limit: u64,
+    target_batch_count: usize,
+    fast_path_threads: usize,
+    min_records: usize,
+) -> Result<Vec<(u64, Vec<u8>)>> {
+    use crate::sort::merge::BlockOutput;
+    use crate::types::DecompressedBlock;
+
+    let received: Arc<Mutex<Vec<DecompressedBlock>>> = Arc::new(Mutex::new(Vec::new()));
+    let source = Phase2EventSource::new(events, output_byte_limit);
+    let merge = SortMerge::<BlockOutput>::with_target_batch_count(
+        SortOrder::Coordinate,
+        output_byte_limit,
+        target_batch_count,
+    )
+    .with_fast_path_threads(fast_path_threads)
+    .with_fast_path_min_records(min_records);
+    let sink = BlockSink { received: Arc::clone(&received), kind: StepKind::Serial };
+
+    let builder = Pipeline::builder();
+    builder.chain(source).chain(merge).chain(sink).into_sink_marker();
+    let pipeline = builder.build()?;
+    pipeline.run(PipelineConfig { threads: 4, ..Default::default() })?;
+
+    let blocks = std::mem::take(&mut *received.lock());
+    Ok(blocks.into_iter().map(|b| (b.batch_serial, b.bytes)).collect())
+}
+
+/// The terminal fast-path parallel gather must emit byte-for-byte the same
+/// blocks (same dense ordinals, same framed bytes, same boundaries) as the
+/// serial gather — the parallelism is a pure throughput change, never an output
+/// change. Exercised across the two block-closing regimes (count-cap and
+/// byte-cap) and a boundary case where the last block is partial.
+///
+/// The `backpressure` case deliberately drives `emit_fast_batches_parallel`'s
+/// reject/resume path: `SortMerge` wires `output_byte_limit` as BOTH the output
+/// queue's `ByteBounded` limit AND the block-closing byte cap, so a small
+/// `byte_limit` makes the queue fill after ~1 block while a full
+/// `fast_path_threads * FAST_PATH_BLOCKS_PER_WORKER_WINDOW`-block window is
+/// mid-drain — forcing `ctx.outputs.push` to reject deterministically and the
+/// `held` + `fast_pending` resume to carry the remainder to the next dispatch,
+/// across many windows. If the byte-identical / dense-ordinal assertions still
+/// hold under sustained mid-window rejection, the resume path preserves order.
+/// (`byte_capped` also trips this incidentally; `backpressure` pins it.)
+#[rstest]
+#[case::count_capped(2000, 300, 256, 1 << 30)] // many count-capped blocks + partial tail
+#[case::byte_capped(2000, 120, 1 << 20, 8 * 1024)] // byte cap trips before the count cap
+#[case::few_blocks(100, 64, 40, 1 << 30)] // small multi-block plan (40/40/20)
+#[case::uneven_tail(1023, 200, 512, 1 << 30)] // last block short of the count cap
+#[case::backpressure(5000, 128, 1 << 20, 4 * 1024)] // tiny queue: sustained mid-window reject/resume
+fn test_fastpath_parallel_matches_serial(
+    #[case] n_records: usize,
+    #[case] rec_size: usize,
+    #[case] target_batch_count: usize,
+    #[case] byte_limit: u64,
+) {
+    let (_header, records) = synthesize_sized_records(n_records, 42, rec_size);
+    let make_events = || {
+        vec![
+            coordinate_memory_chunk_event(records.clone()),
+            crate::sort::protocol::SortPhase2Event::AllAnnounced {
+                slot_count: 0,
+                memory_chunk_count: 1,
+                total_records: n_records as u64,
+            },
+        ]
+    };
+
+    // Serial gather: threads=1.
+    let serial = collect_fastpath_blocks(make_events(), byte_limit, target_batch_count, 1, 0)
+        .expect("serial fast path");
+    // Parallel gather: threads=4, min_records=0 forces the parallel path.
+    let parallel = collect_fastpath_blocks(make_events(), byte_limit, target_batch_count, 4, 0)
+        .expect("parallel fast path");
+
+    assert_eq!(
+        serial.len(),
+        parallel.len(),
+        "block count differs (serial {} vs parallel {})",
+        serial.len(),
+        parallel.len()
+    );
+    for (i, (s, p)) in serial.iter().zip(parallel.iter()).enumerate() {
+        assert_eq!(s.0, p.0, "block {i} ordinal differs: serial {} vs parallel {}", s.0, p.0);
+        assert_eq!(s.0, i as u64, "block {i} ordinal must be dense (== index)");
+        assert_eq!(
+            s.1,
+            p.1,
+            "block {i} framed bytes differ (serial {} bytes vs parallel {} bytes)",
+            s.1.len(),
+            p.1.len()
+        );
+    }
+}
+
+/// Like [`collect_fastpath_blocks`] but for the default `SortMerge<RecordBatchOutput>`
+/// (the intermediate-sort output feeding group/consensus), whose byte-cap plan
+/// relies on `FRAME_OVERHEAD_PER_RECORD = 0` rather than `BlockOutput`'s `4`.
+/// Returns each emitted batch's `(batch_serial, per-record bodies)` so a test
+/// can assert the parallel gather is byte-for-byte identical to the serial one —
+/// pinning both the dense ordinal and every block boundary (via the per-record
+/// body vector, not just the concatenated bytes).
+fn collect_fastpath_batches(
+    events: Vec<crate::sort::protocol::SortPhase2Event>,
+    output_byte_limit: u64,
+    target_batch_count: usize,
+    fast_path_threads: usize,
+    min_records: usize,
+) -> Result<Vec<(u64, Vec<Vec<u8>>)>> {
+    let received: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let source = Phase2EventSource::new(events, output_byte_limit);
+    let merge = SortMerge::<RecordBatchOutput>::with_target_batch_count(
+        SortOrder::Coordinate,
+        output_byte_limit,
+        target_batch_count,
+    )
+    .with_fast_path_threads(fast_path_threads)
+    .with_fast_path_min_records(min_records);
+    let sink = VecSink { received: Arc::clone(&received), kind: StepKind::Serial };
+
+    let builder = Pipeline::builder();
+    builder.chain(source).chain(merge).chain(sink).into_sink_marker();
+    let pipeline = builder.build()?;
+    pipeline.run(PipelineConfig { threads: 4, ..Default::default() })?;
+
+    let batches = std::mem::take(&mut *received.lock());
+    Ok(batches
+        .into_iter()
+        .map(|b| (b.batch_serial(), b.iter_record_bytes().map(<[u8]>::to_vec).collect()))
+        .collect())
+}
+
+/// Same parity contract as [`test_fastpath_parallel_matches_serial`] but for the
+/// `RecordBatchOutput` builder (`FRAME_OVERHEAD_PER_RECORD = 0`), covering the
+/// 0-overhead byte-cap plan the intermediate-sort branch now drives in parallel.
+/// The `backpressure` case pins the reject/resume path for this builder too —
+/// see the mechanism note on [`test_fastpath_parallel_matches_serial`].
+#[rstest]
+#[case::count_capped(2000, 300, 256, 1 << 30)] // many count-capped batches + partial tail
+#[case::byte_capped(2000, 120, 1 << 20, 8 * 1024)] // byte cap trips before the count cap
+#[case::few_batches(100, 64, 40, 1 << 30)] // small multi-block plan (40/40/20)
+#[case::uneven_tail(1023, 200, 512, 1 << 30)] // last batch short of the count cap
+#[case::backpressure(5000, 128, 1 << 20, 4 * 1024)] // tiny queue: sustained mid-window reject/resume
+fn test_fastpath_parallel_matches_serial_record_batches(
+    #[case] n_records: usize,
+    #[case] rec_size: usize,
+    #[case] target_batch_count: usize,
+    #[case] byte_limit: u64,
+) {
+    let (_header, records) = synthesize_sized_records(n_records, 42, rec_size);
+    let make_events = || {
+        vec![
+            coordinate_memory_chunk_event(records.clone()),
+            crate::sort::protocol::SortPhase2Event::AllAnnounced {
+                slot_count: 0,
+                memory_chunk_count: 1,
+                total_records: n_records as u64,
+            },
+        ]
+    };
+
+    // Serial gather: threads=1.
+    let serial = collect_fastpath_batches(make_events(), byte_limit, target_batch_count, 1, 0)
+        .expect("serial fast path");
+    // Parallel gather: threads=4, min_records=0 forces the parallel path.
+    let parallel = collect_fastpath_batches(make_events(), byte_limit, target_batch_count, 4, 0)
+        .expect("parallel fast path");
+
+    assert_eq!(
+        serial.len(),
+        parallel.len(),
+        "batch count differs (serial {} vs parallel {})",
+        serial.len(),
+        parallel.len()
+    );
+    for (i, (s, p)) in serial.iter().zip(parallel.iter()).enumerate() {
+        assert_eq!(s.0, p.0, "batch {i} ordinal differs: serial {} vs parallel {}", s.0, p.0);
+        assert_eq!(s.0, i as u64, "batch {i} ordinal must be dense (== index)");
+        assert_eq!(
+            s.1,
+            p.1,
+            "batch {i} record bodies/boundaries differ (serial {} records vs parallel {})",
+            s.1.len(),
+            p.1.len()
+        );
+    }
+}
+
 /// Wrap `records` as a single coordinate-sorted in-memory chunk event. All keys
 /// are `default()` (equal) — order does not matter for the buffer-sizing and
 /// duplicate-announcement assertions, only that the chunk merges cleanly.

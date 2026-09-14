@@ -2877,13 +2877,16 @@ impl<'a> ChainBuilder<'a> {
             // Per-phase worker counts default to --threads; runall forwards
             // --sort::sort-threads / --sort::merge-threads via SortOptions.
             // Phase 1 caps the streaming sort/spill worker pool; Phase 2 caps
-            // concurrent spill-decompression (the merge step itself is serial).
+            // concurrent spill-decompression (the k-way spill merge itself is
+            // serial; the in-memory fast-path gather is fanned across phase2).
             let num_phase1_threads = resolve_phase_threads(sort.sort_threads, num_threads);
             let num_phase2_threads = resolve_phase_threads(sort.merge_threads, num_threads);
             if sort.sort_threads.is_some() || sort.merge_threads.is_some() {
                 log::debug!(
                     "streaming sort: per-phase thread split (phase1={num_phase1_threads}, \
-                     phase2={num_phase2_threads}); phase2 caps decompress concurrency, merge is serial"
+                     phase2={num_phase2_threads}); phase2 caps decompress \
+                     concurrency and sizes the in-memory fast-path parallel \
+                     gather, while the k-way spill merge stays serial"
                 );
             }
             // Reuse the same helper as the standalone path so `--sort::memory-per-thread`
@@ -3174,7 +3177,15 @@ impl<'a> ChainBuilder<'a> {
                 // thread, dropping one pool step and one memcpy per record.
                 let mut merge =
                     SortMerge::<BlockOutput>::new(sort_order, self.tuning.per_step_byte_limit)
-                        .with_sort_stats(sort.sort_stats);
+                        .with_sort_stats(sort.sort_stats)
+                        // Fan the in-memory fast-path gather across the phase-2
+                        // (merge) thread budget: the single already-sorted chunk
+                        // is gathered into output blocks in parallel instead of
+                        // on the lone detached thread, removing the flat serial
+                        // gather that otherwise floors the in-memory sort's wall
+                        // clock. Bounded to `num_phase2_threads` so it never
+                        // oversubscribes past `--threads`.
+                        .with_fast_path_threads(num_phase2_threads);
                 if let Some(slot) = &sort_stats_slot {
                     merge = merge.with_stats_slot(Arc::clone(slot));
                 }
@@ -3222,7 +3233,12 @@ impl<'a> ChainBuilder<'a> {
                     sort_order,
                     self.tuning.per_step_byte_limit,
                 )
-                .with_sort_stats(sort.sort_stats);
+                .with_sort_stats(sort.sort_stats)
+                // Same parallel fast-path gather as the terminal branch (see
+                // there): a large in-memory intermediate sort feeding
+                // group/consensus gathers its single sorted chunk in parallel
+                // rather than serially on the detached thread.
+                .with_fast_path_threads(num_phase2_threads);
                 let merge_tail = self.pipeline.append_step(merge, decompress_tail);
                 let group_key_config = self.bam_group_key_config()?;
                 let tail = self.pipeline.append_step(

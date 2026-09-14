@@ -103,6 +103,18 @@ impl TemplateMemChunk {
         with_template_chunk!(self, c => c.record_bytes(i))
     }
 
+    /// The `i`th record's body length in bytes, WITHOUT touching the shared data
+    /// buffer (reads only the per-record `len` index). See
+    /// [`InMemoryChunk::record_len`](crate::InMemoryChunk::record_len).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i >= self.len()`.
+    #[must_use]
+    pub fn record_len(&self, i: usize) -> u32 {
+        with_template_chunk!(self, c => c.record_len(i))
+    }
+
     /// The chunk's minimum sort key (`key_at(0)`) as an owned [`RunBound`], or
     /// `None` if the chunk is empty. The variant matches this chunk's narrowed
     /// template lane. Records are pre-sorted, so this is `O(1)`.
