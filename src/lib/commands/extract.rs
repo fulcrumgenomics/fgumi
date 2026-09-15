@@ -306,12 +306,26 @@ impl QualDetectionStats {
 }
 
 impl QualityEncoding {
-    /// Convert quality scores to standard numeric format (Phred+33)
+    /// Convert quality scores to standard numeric format (Phred+33).
+    #[cfg(test)]
     fn to_standard_numeric(self, quals: &[u8]) -> Vec<u8> {
-        match self {
-            QualityEncoding::Standard => quals.iter().map(|&q| q.saturating_sub(33)).collect(),
-            QualityEncoding::Illumina => quals.iter().map(|&q| q.saturating_sub(64)).collect(),
-        }
+        let mut out = Vec::new();
+        self.to_standard_numeric_into(quals, &mut out);
+        out
+    }
+
+    /// Convert quality scores to standard numeric format (Phred+33), writing into
+    /// `out` (cleared first). Lets the per-record extract hot path reuse one
+    /// scratch buffer across records instead of allocating a fresh `Vec` per
+    /// record — same bytes, no per-record allocation.
+    fn to_standard_numeric_into(self, quals: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        out.reserve(quals.len());
+        let offset = match self {
+            QualityEncoding::Standard => 33u8,
+            QualityEncoding::Illumina => 64u8,
+        };
+        out.extend(quals.iter().map(|&q| q.saturating_sub(offset)));
     }
 
     /// Decide the encoding from pooled quality statistics using robust heuristics.
@@ -1579,7 +1593,7 @@ impl ExtractRunallOptions {
     }
 }
 
-/// Build raw BAM `RawRecord`s from an owned [`FastqSet`].
+/// Build raw BAM `RawRecord`s from an owned `FastqSet`.
 ///
 /// Thin wrapper over the borrowed-view core [`make_raw_records_from_view`] for
 /// the owned-`FastqSet` byte-parity unit test. The production pipeline
@@ -1609,9 +1623,9 @@ pub(crate) fn make_raw_records_from_fastq_set(
 
 /// Build raw BAM `RawRecord`s from a borrowed [`FastqSetView`] — the zero-copy
 /// extract record builder. Byte-for-byte identical to the owned
-/// [`make_raw_records_from_fastq_set`] (which delegates here); the only
-/// difference is that segment bases/qualities are read from borrowed `&[u8]`
-/// spans rather than owned `Vec<u8>` copies, so the per-read/per-segment
+/// `make_raw_records_from_fastq_set` (a test-only wrapper that delegates here);
+/// the only difference is that segment bases/qualities are read from borrowed
+/// `&[u8]` spans rather than owned `Vec<u8>` copies, so the per-read/per-segment
 /// `to_vec` allocations of the owned path are gone.
 ///
 /// This is the core extract logic: applies read structures (via the segments
@@ -1683,6 +1697,10 @@ pub(crate) fn make_raw_records_from_view(
     let num_templates = templates.len();
     let mut builder = UnmappedSamBuilder::new();
     let mut records = Vec::with_capacity(num_templates);
+    // Reused across records so the Phred+33 conversion does not allocate a fresh
+    // `Vec` per record (the builder copies these bytes into the record, so the
+    // scratch can be safely overwritten each iteration).
+    let mut numeric_quals: Vec<u8> = Vec::new();
 
     for (index, template) in templates.iter().enumerate() {
         // Compute flags for unmapped reads
@@ -1718,7 +1736,7 @@ pub(crate) fn make_raw_records_from_view(
         if template.seq.is_empty() {
             builder.try_build_record(final_read_name, flag, b"N", &[2u8])
         } else {
-            let numeric_quals = opts.quality_encoding.to_standard_numeric(template.quals);
+            opts.quality_encoding.to_standard_numeric_into(template.quals, &mut numeric_quals);
             builder.try_build_record(final_read_name, flag, template.seq, &numeric_quals)
         }
         .with_context(|| Extract::read_name_too_long_context(final_read_name))?;
