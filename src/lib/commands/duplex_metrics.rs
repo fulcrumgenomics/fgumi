@@ -6,6 +6,9 @@
 //! - Ideal duplex fraction calculation using proper binomial CDF
 //! - Optional interval filtering (BED or Picard interval list format) to restrict analysis to specific regions
 
+use crate::commands::common::{
+    CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
+};
 use crate::logging::OperationTimer;
 use crate::metrics::duplex::DuplexMetricsCollector;
 use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
@@ -23,6 +26,27 @@ use super::shared_metrics::{
 
 /// Embedded R script for PDF plot generation (bundled with binary)
 const R_SCRIPT: &str = include_str!("../../../resources/CollectDuplexSeqMetrics.R");
+
+/// Projected options the chain builder needs for the duplex-metrics stage.
+///
+/// A free-standing struct (mirrors `SimplexMetricsOptions`) carrying the fields
+/// `add_metrics` reads for the duplex mode: output prefix, the AB/BA yield
+/// thresholds, whether to collect per-duplex-UMI counts, and the optional
+/// intervals path. Threading/compression come from the
+/// [`crate::pipeline::chains::SingleStageContext`], so they are not carried here.
+#[derive(Debug, Clone)]
+pub struct DuplexMetricsOptions {
+    /// Output prefix for the metrics TSV files.
+    pub output: PathBuf,
+    /// Minimum AB reads to call a duplex (yield-metric threshold).
+    pub min_ab_reads: usize,
+    /// Minimum BA reads to call a duplex (yield-metric threshold).
+    pub min_ba_reads: usize,
+    /// Collect per-duplex-UMI counts (writes the extra `duplex_umi_counts.txt`).
+    pub duplex_umi_counts: bool,
+    /// Optional intervals file (BED or Picard interval-list) restricting analysis.
+    pub intervals: Option<PathBuf>,
+}
 
 /// Collects comprehensive QC metrics for duplex sequencing experiments
 #[derive(Parser, Debug)]
@@ -71,6 +95,8 @@ The following output files are produced:
 6. **<output>.duplex_qc.pdf**: (optional) a series of plots generated from the preceding metrics files for
                                visualization. This file is only produced if R is available with the required
                                packages (ggplot2 and scales). Use `--description` to customize plot titles.
+                               NOTE: the PDF (and `--description`) are not produced on the parallel
+                               `--threads` path, which writes only the metrics TSVs; omit `--threads` for the PDF.
 
 Within the metrics files the prefixes `CS`, `SS` and `DS` are used to mean:
 
@@ -111,18 +137,78 @@ pub struct DuplexMetrics {
     /// so plot titles differ unless this is set).
     #[arg(long = "description")]
     pub description: Option<String>,
+
+    /// Threading options. When `--threads N` is set, metrics collection runs on
+    /// the typed-step pipeline (parallel BGZF decode + MI-grouping + parallel
+    /// per-thread metric accumulation). Absent `--threads`, the original
+    /// single-pass streaming collector runs, producing byte-identical output.
+    #[command(flatten)]
+    pub threading: ThreadingOptions,
+
+    /// Scheduler and pipeline stats options (chain path only).
+    #[command(flatten)]
+    pub scheduler_opts: SchedulerOptions,
+
+    /// Pipeline queue memory options (chain path only).
+    #[command(flatten)]
+    pub queue_memory: QueueMemoryOptions,
+}
+
+impl DuplexMetrics {
+    /// Project the clap fields into [`DuplexMetricsOptions`] for the chain builder.
+    #[must_use]
+    pub fn to_duplex_metrics_options(&self) -> DuplexMetricsOptions {
+        DuplexMetricsOptions {
+            output: self.output.clone(),
+            min_ab_reads: self.min_ab_reads,
+            min_ba_reads: self.min_ba_reads,
+            duplex_umi_counts: self.duplex_umi_counts,
+            intervals: self.intervals.clone(),
+        }
+    }
+
+    /// Run duplex-metrics on the declarative chain builder: a single
+    /// `Stage::Metrics` chain with the duplex slot filled and a `SinkSpec::None`
+    /// (no BAM output). Selected when `--threads` is set; the metrics files are
+    /// written byte-identically to the serial path by the chain's finalize hook.
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        use crate::commands::common::BamIoOptions;
+        use crate::pipeline::chains::{ChainSpec, SingleStageContext, StageOptionsBag, build_for};
+
+        let io = BamIoOptions {
+            input: self.input.clone(),
+            output: PathBuf::from("/dev/null"),
+            ..Default::default()
+        };
+        let stage_opts = StageOptionsBag {
+            duplex_metrics: Some(self.to_duplex_metrics_options()),
+            ..Default::default()
+        };
+        // Metrics write no BAM, so compression is never used; a default keeps the
+        // uniform `SingleStageContext` shape without exposing an inert
+        // `--compression-level` flag on this command.
+        let compression = CompressionOptions::default();
+        let ctx = SingleStageContext {
+            io: &io,
+            threading: &self.threading,
+            compression: &compression,
+            scheduler: &self.scheduler_opts,
+            queue_memory: &self.queue_memory,
+            command_line,
+        };
+        let spec = ChainSpec::single_stage_metrics(stage_opts, &ctx);
+        build_for(spec)?.run()
+    }
 }
 
 impl Command for DuplexMetrics {
-    fn execute(&self, _command_line: &str) -> Result<()> {
+    fn execute(&self, command_line: &str) -> Result<()> {
         info!("DuplexMetrics");
         info!("  Input: {}", self.input.display());
         info!("  Output prefix: {}", self.output.display());
         info!("  Min AB reads: {}", self.min_ab_reads);
         info!("  Min BA reads: {}", self.min_ba_reads);
         info!("  Collect duplex UMI counts: {}", self.duplex_umi_counts);
-
-        let timer = OperationTimer::new("Computing duplex metrics");
 
         // Validate inputs
         validate_input_exists(&self.input, "input BAM")?;
@@ -140,6 +226,37 @@ impl Command for DuplexMetrics {
                 self.min_ba_reads
             );
         }
+
+        // With `--threads`, run the parallel typed-step chain (parallel decode +
+        // MI-grouping + per-thread metric accumulation). It writes the SAME TSV
+        // files byte-identically via the chain's finalize hook. The R/PDF step
+        // is not reproduced on the chain path (and R is chain-independent), so
+        // the chain emits the metrics TSVs only; the default (serial) path below
+        // keeps the PDF.
+        if self.threading.threads.is_some() {
+            // The parallel path writes the metrics TSVs only — it does not run the
+            // R/PDF plot step. Surface that (and the resulting `--description`
+            // no-op) so the flags read as inert rather than silently dropped,
+            // mirroring the `warn_unwired_pipeline_flags` diagnostics.
+            log::warn!(
+                "--threads runs metrics on the parallel pipeline, which writes the metrics \
+                 TSVs only and does not generate the *.duplex_qc.pdf plot; run without \
+                 --threads to produce the PDF"
+            );
+            if self.description.is_some() {
+                log::warn!(
+                    "--description customizes the PDF plot title only, so it is ignored on \
+                     the --threads path (no PDF is generated)"
+                );
+            }
+            return self.execute_chain(command_line);
+        }
+
+        // Serial path only: time the single-pass streaming collector. Placed after
+        // the `--threads` early return so the chain path is timed by the
+        // chain-level `StageTimingFinalizeHook`, not by a stray "Computing duplex
+        // metrics" line (mirrors the placement in `simplex_metrics.rs`).
+        let timer = OperationTimer::new("Computing duplex metrics");
 
         // Load intervals if provided
         let intervals = if let Some(intervals_path) = &self.intervals {
@@ -410,6 +527,101 @@ mod tests {
 
     // ==================== Test Cases ====================
 
+    /// The typed-step chain path (`--threads N`) must produce byte-identical
+    /// metrics TSVs to the original single-pass serial path (`--threads` absent)
+    /// for `duplex-metrics`, including the optional `duplex_umi_counts.txt`.
+    ///
+    /// Builds many distinct-coordinate duplex families (an AB and a BA strand
+    /// each, sharing a 2-segment RX / base MI so both strands co-group into one
+    /// duplex) with `--duplex-umi-counts` on, then diffs all five emitted TSVs
+    /// byte-for-byte between a serial run and a `--threads 4` run. This is the
+    /// end-to-end guard that the parallel per-thread accumulation +
+    /// `BoundaryReorder` merge reassembles the duplex metrics losslessly
+    /// regardless of how coordinate groups are sharded across workers.
+    #[test]
+    fn chain_threads_output_matches_serial() -> Result<()> {
+        // Deterministic 3-base ACGT UMI segment from an index, so families carry
+        // a spread of distinct UMIs (exercising umi_counts / duplex_umi_counts).
+        fn seg(n: usize) -> String {
+            const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+            (0..3).map(|i| BASES[(n >> (2 * i)) & 0b11] as char).collect()
+        }
+
+        // Each group is one palindromic-fragment duplex at a distinct coordinate
+        // (mirrors `test_duplex_strands_cogroup_when_mates_share_five_prime`):
+        //   AB strand: R1 fwd @hi, R2 rev @lo, MI ".../A"
+        //   BA strand: R1 rev @lo, R2 fwd @hi, MI ".../B" (RX segments swapped)
+        // Both strands' 5' ends coincide, so they co-group into one AB/BA duplex.
+        let mut records = Vec::new();
+        for g in 0..200usize {
+            let lo = 1 + (g as i32) * 200;
+            let hi = lo + 99;
+            let a = seg(g);
+            let b = seg(g * 7 + 1);
+            let base_mi = format!("{a}-{b}");
+            let (r1, r2) = build_test_pair(
+                &format!("g{g}_ab"),
+                0,
+                hi,
+                lo,
+                &base_mi,
+                &format!("{base_mi}/A"),
+                true,
+                false,
+            );
+            records.push(r1);
+            records.push(r2);
+            let (r1, r2) = build_test_pair(
+                &format!("g{g}_ba"),
+                0,
+                lo,
+                hi,
+                &format!("{b}-{a}"),
+                &format!("{base_mi}/B"),
+                false,
+                true,
+            );
+            records.push(r1);
+            records.push(r2);
+        }
+        let input = create_test_bam(records)?;
+        let dir = TempDir::new()?;
+
+        let run = |threads: Option<usize>, prefix: &str| -> Result<std::path::PathBuf> {
+            let out = dir.path().join(prefix);
+            let cmd = DuplexMetrics {
+                input: input.path().to_path_buf(),
+                output: out.clone(),
+                min_ab_reads: 1,
+                min_ba_reads: 1,
+                duplex_umi_counts: true,
+                intervals: None,
+                description: None,
+                threading: crate::commands::common::ThreadingOptions { threads },
+                scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+                queue_memory: crate::commands::common::QueueMemoryOptions::default(),
+            };
+            cmd.execute("test")?;
+            Ok(out)
+        };
+
+        let serial = run(None, "serial")?;
+        let chain = run(Some(4), "chain")?;
+
+        for suffix in [
+            "family_sizes.txt",
+            "duplex_family_sizes.txt",
+            "umi_counts.txt",
+            "duplex_umi_counts.txt",
+            "duplex_yield_metrics.txt",
+        ] {
+            let s = std::fs::read(format!("{}.{suffix}", serial.display()))?;
+            let c = std::fs::read(format!("{}.{suffix}", chain.display()))?;
+            assert_eq!(s, c, "{suffix} differs between the serial and --threads 4 chain paths");
+        }
+        Ok(())
+    }
+
     /// DXM3-06: `--min-ab-reads 0` is rejected (fgbio validates `minAbReads >= 1`);
     /// otherwise every tag family would be labeled a duplex.
     #[test]
@@ -425,6 +637,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
         let err = cmd.execute("test").expect_err("must reject --min-ab-reads 0");
         assert!(err.to_string().contains("min-ab-reads must be >= 1"), "unexpected: {err}");
@@ -460,6 +675,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -539,6 +757,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -585,6 +806,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -623,6 +847,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -664,6 +891,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -725,6 +955,9 @@ mod tests {
             duplex_umi_counts: true,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -786,6 +1019,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
 
         let err = cmd.execute("test").expect_err("malformed duplex UMI must be rejected");
@@ -830,6 +1066,9 @@ mod tests {
             duplex_umi_counts: true,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -891,6 +1130,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -995,6 +1237,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -1121,6 +1366,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -1214,6 +1462,9 @@ mod tests {
                 duplex_umi_counts: false,
                 intervals: None,
                 description: None,
+                threading: crate::commands::common::ThreadingOptions { threads: None },
+                scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+                queue_memory: crate::commands::common::QueueMemoryOptions::default(),
             };
 
             cmd.execute("test")?;
@@ -1241,6 +1492,9 @@ mod tests {
                 duplex_umi_counts: false,
                 intervals: None,
                 description: None,
+                threading: crate::commands::common::ThreadingOptions { threads: None },
+                scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+                queue_memory: crate::commands::common::QueueMemoryOptions::default(),
             };
 
             cmd.execute("test")?;
@@ -1268,6 +1522,9 @@ mod tests {
                 duplex_umi_counts: false,
                 intervals: None,
                 description: None,
+                threading: crate::commands::common::ThreadingOptions { threads: None },
+                scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+                queue_memory: crate::commands::common::QueueMemoryOptions::default(),
             };
 
             cmd.execute("test")?;
@@ -1392,6 +1649,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: Some(intervals_path),
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -1451,6 +1711,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -1687,6 +1950,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
 
         let result = cmd.execute("test");
@@ -1722,6 +1988,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
 
         assert_eq!(metrics.min_ab_reads, 1);
@@ -1741,6 +2010,9 @@ mod tests {
             duplex_umi_counts: true,
             intervals: Some(PathBuf::from("intervals.bed")),
             description: Some("Test Sample".to_string()),
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
 
         assert_eq!(metrics.min_ab_reads, 3);
@@ -1759,6 +2031,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
 
         // The validation happens in execute(), check during command construction would be ideal
@@ -1992,6 +2267,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: Some(intervals_path),
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -2078,6 +2356,9 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;

@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Add `--threads N` to `simplex-metrics` and `duplex-metrics`: metrics
+  collection runs on the typed-step pipeline (parallel BGZF decode + MI-grouping
+  + per-thread accumulation), producing byte-identical TSVs to the serial path.
+  The parallel path writes the metrics TSVs only — it does not generate the
+  `*_qc.pdf` plot (and `--description`, a plot-title-only option, is ignored on
+  that path); run without `--threads` to produce the PDF. Absent `--threads` the
+  original single-pass collector runs unchanged.
 - Expose the per-edge pipeline instrumentation ladder on the CLI: a hidden
   `--pipeline-trace <off|summary|timeline|deep>` (with `--pipeline-trace-out` for
   the per-tick timeline TSV) threaded through every chain-builder command, plus
