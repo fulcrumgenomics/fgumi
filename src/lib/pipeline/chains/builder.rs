@@ -1407,9 +1407,14 @@ impl<'a> ChainBuilder<'a> {
     /// *entirely* (it computes its own sort keys straight off the raw record
     /// bytes — see `DecodedRecordBatchToRecordBatch`); copy-umi/retag/
     /// single-record-mode filter are per-record transforms that never build
-    /// or consume a `GroupKey` at all. All of these therefore use
-    /// [`fgumi_bam_io::GroupKeyConfig::name_hash_only`] — the cheapest config —
-    /// skipping the CIGAR 5′-position walk and the RG/CB/MC aux-tag extraction
+    /// or consume a `GroupKey` at all; the terminal BAM→FASTQ encode (`fastq`)
+    /// reads only the raw record (name, flags, SEQ, QUAL, and — under
+    /// `--umi-header` — the UMI tag read straight off the record) and touches no
+    /// `GroupKey` field, not even `name_hash`. All of these except `fastq`
+    /// therefore use [`fgumi_bam_io::GroupKeyConfig::name_hash_only`]; `fastq`
+    /// uses the strictly-cheaper [`fgumi_bam_io::GroupKeyConfig::no_key`] (no key
+    /// at all — not even the name hash). Both skip the CIGAR 5′-position walk and
+    /// the RG/CB/MC aux-tag extraction
     /// pass entirely; for a SAM-first sort that pass runs once per record in
     /// `ParseSamChunk` and would otherwise be pure waste. This changes only the
     /// discarded key, never the record bytes, so output is unchanged.
@@ -1419,15 +1424,23 @@ impl<'a> ChainBuilder<'a> {
     /// through to [`Self::bam_group_key_config`].
     ///
     /// Every arm below uses a DEFAULT `LibraryIndex`, never `from_header`:
-    /// `name_hash_only` never reads `library_index` (see `name_hash_key` in
-    /// `fgumi-bam-io`, and the `name_hash_only` branches in `DecodeRecords`
-    /// and `parse_sam_chunk_into_decoded`, which call it without touching
+    /// neither `name_hash_only` nor `no_key` reads `library_index` (see
+    /// `name_hash_key` / `key_for_mode` in `fgumi-bam-io`, which the decode
+    /// consumers — `DecodeRecords`, `DecodeFromRecords`, and
+    /// `parse_sam_chunk_into_decoded` — invoke for those modes without touching
     /// `library_index` at all), so resolving it from the header is pure waste
     /// for these stages — and `LibraryIndex::from_header` errors on a header
     /// with more than 65,535 distinct `@RG` libraries, a needless failure this
     /// avoids.
     fn source_group_key_config(&self) -> Result<fgumi_bam_io::GroupKeyConfig> {
         match self.spec.stages.first() {
+            // The terminal BAM→FASTQ encode reads only the raw record and
+            // touches no `GroupKey` field (not even `name_hash`), so it computes
+            // no key at all — the cheapest decode. In the `fgumi fastq | aligner`
+            // pipe every CPU-second saved here goes to the aligner.
+            Some(Stage::Fastq) => {
+                Ok(fgumi_bam_io::GroupKeyConfig::no_key(fgumi_bam_io::LibraryIndex::default()))
+            }
             Some(
                 Stage::Correct
                 | Stage::Sort
@@ -1462,10 +1475,10 @@ impl<'a> ChainBuilder<'a> {
     /// the single-source path.
     ///
     /// Note this is deliberately narrower than [`Self::source_group_key_config`]:
-    /// `Sort`/`CopyUmi`/`Retag`/`Clip` use the cheap name-hash-only key but do
-    /// NOT group by queryname (sort computes its own keys, copy-umi/retag are
-    /// per-record, clip uses its own template grouper), so they keep the
-    /// `Record` cut.
+    /// `Sort`/`CopyUmi`/`Retag`/`Clip` use the cheap name-hash-only key and
+    /// `Fastq` computes no key at all, but none group by queryname (sort computes
+    /// its own keys, copy-umi/retag are per-record, clip uses its own template
+    /// grouper, fastq is a per-record encode), so they keep the `Record` cut.
     ///
     /// [`BatchCut`]: crate::pipeline::steps::boundaries::state::BatchCut
     /// [`BatchCut::Queryname`]: crate::pipeline::steps::boundaries::state::BatchCut::Queryname
@@ -5919,8 +5932,9 @@ mod tests {
         let spec = empty_spec(vec![Stage::Filter]);
         let builder = chain_builder_for_stages(&spec);
         let config = builder.source_group_key_config().expect("builds");
-        assert!(
-            config.name_hash_only,
+        assert_eq!(
+            config.key_mode,
+            fgumi_bam_io::KeyMode::NameHashOnly,
             "Stage::Filter as the first stage must skip the discarded position/RG/CB key"
         );
     }
@@ -5937,9 +5951,33 @@ mod tests {
         let spec = empty_spec(vec![Stage::Clip]);
         let builder = chain_builder_for_stages(&spec);
         let config = builder.source_group_key_config().expect("builds");
-        assert!(
-            config.name_hash_only,
+        assert_eq!(
+            config.key_mode,
+            fgumi_bam_io::KeyMode::NameHashOnly,
             "Stage::Clip as the first stage must skip the discarded position/RG/CB key"
+        );
+    }
+
+    /// The terminal BAM→FASTQ encode (`fastq`) reads only the raw record
+    /// (name/flags/SEQ/QUAL, and the UMI tag straight off the record under
+    /// `--umi-header`) and never touches a `GroupKey` field — not even
+    /// `name_hash` — so its source decode uses the no-key mode: it computes no
+    /// key at all, the cheapest decode. In the `fgumi fastq | aligner` pipe
+    /// every CPU-second saved here goes to the aligner.
+    #[test]
+    fn source_group_key_config_is_no_key_for_fastq_first_stage() {
+        let spec = empty_spec(vec![Stage::Fastq]);
+        let builder = chain_builder_for_stages(&spec);
+        let config = builder.source_group_key_config().expect("builds");
+        assert_eq!(
+            config.key_mode,
+            fgumi_bam_io::KeyMode::None,
+            "Stage::Fastq as the first stage must compute no GroupKey at all"
+        );
+        assert!(
+            config.umi_tag.is_none(),
+            "Stage::Fastq must not enable UMI-position caching (the encoder reads the tag \
+             straight off the record)"
         );
     }
 
@@ -5951,8 +5989,9 @@ mod tests {
         let spec = empty_spec(vec![Stage::Group]);
         let builder = chain_builder_for_stages(&spec);
         let config = builder.source_group_key_config().expect("builds");
-        assert!(
-            !config.name_hash_only,
+        assert_eq!(
+            config.key_mode,
+            fgumi_bam_io::KeyMode::Full,
             "Stage::Group as the first stage must compute the full position/RG/CB key"
         );
     }

@@ -25,7 +25,7 @@ use crate::pipeline::core::queues::QueueSpec;
 use crate::pipeline::core::reorder::BranchOrdering;
 use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
 use crate::pipeline::steps::types::{DecodedRecordBatch, SamChunk};
-use fgumi_bam_io::{DecodedRecord, GroupKeyConfig, compute_group_key_from_raw, name_hash_key};
+use fgumi_bam_io::{DecodedRecord, GroupKeyConfig, key_for_mode};
 
 /// Parse every line in `chunk` and produce a `DecodedRecordBatch` carrying
 /// the chunk's batch serial. SAM lines are encoded into BAM record body
@@ -48,7 +48,7 @@ pub fn parse_sam_chunk_into_decoded(
 
     let library_index = &key_config.library_index;
     let cell_tag = key_config.cell_tag;
-    let name_hash_only = key_config.name_hash_only;
+    let key_mode = key_config.key_mode;
 
     let mut sam_record = sam::Record::default();
     let mut encoder = bam::io::Writer::from(Vec::<u8>::with_capacity(4096));
@@ -116,14 +116,10 @@ pub fn parse_sam_chunk_into_decoded(
         // record here is far cheaper than that blowup and matches the BAM path's
         // right-sized records.
         let body_bytes = encoder.get_ref()[4..].to_vec();
-        // Match the BAM decode path (`DecodeFromRecords`): under
-        // `name_hash_only` the key is the name hash alone, so SAM- and
+        // Match the BAM decode path (`DecodeFromRecords`): compute only as much
+        // key as the downstream stage reads (see `KeyMode`) so SAM- and
         // BAM-ingested records group identically.
-        let key = if name_hash_only {
-            name_hash_key(&body_bytes)
-        } else {
-            compute_group_key_from_raw(&body_bytes, library_index, cell_tag)
-        };
+        let key = key_for_mode(key_mode, &body_bytes, library_index, cell_tag);
         let mut record = DecodedRecord::from_raw_bytes(body_bytes, key);
         // Parity with the BAM decode paths (`DecodeRecords` /
         // `DecodeFromRecords`): cache the UMI value position so the Group step's

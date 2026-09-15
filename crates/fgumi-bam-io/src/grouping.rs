@@ -351,18 +351,42 @@ pub struct GroupKeyConfig {
     pub library_index: Arc<LibraryIndex>,
     /// Tag used for cell barcode extraction. None skips cell extraction.
     pub cell_tag: Option<Tag>,
-    /// When `true`, the Decode step computes only the read-name hash and
-    /// leaves the rest of the [`GroupKey`] at its default. Use for stages
-    /// that group by queryname (e.g. `correct`) and read only
-    /// [`GroupKey::name_hash`] — it skips the CIGAR 5′-position walk and the
-    /// aux-tag (RG/CB/MC) extraction pass entirely. See [`name_hash_key`].
-    pub name_hash_only: bool,
+    /// How much of the [`GroupKey`] the Decode step computes per record. See
+    /// [`KeyMode`]: `Full` (position + RG/CB/MC + name hash), `NameHashOnly`
+    /// (name hash alone, for queryname grouping), or `None` (no key at all —
+    /// `GroupKey::default()`, for stages that never read the key, e.g. the
+    /// BAM→FASTQ encode).
+    pub key_mode: KeyMode,
     /// UMI tag (raw 2-byte form) whose value position should be cached on each
     /// [`DecodedRecord`] during decode. `None` disables caching — downstream
     /// code must fall back to scanning aux data. This is orthogonal to
-    /// `name_hash_only`: the UMI cache scan is gated solely on `umi_tag` being
-    /// set (in practice only the Group stage sets it).
+    /// `key_mode`: the UMI cache scan is gated solely on `umi_tag` being set
+    /// (in practice only the Group stage sets it).
     pub umi_tag: Option<[u8; 2]>,
+}
+
+/// How much of the [`GroupKey`] the Decode step computes for each record.
+///
+/// Each variant does strictly less work than the one above it (declaration
+/// order `Full` → `NameHashOnly` → `None`); a stage picks the cheapest level
+/// whose output it actually reads. Changing the level only
+/// changes the (discarded) key, never the record bytes, so output is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyMode {
+    /// Full key: the CIGAR 5′-position walk, the RG/CB/MC aux-tag extraction
+    /// pass, and the read-name hash. Needed by group/dedup/consensus.
+    #[default]
+    Full,
+    /// Read-name hash only; the rest of the [`GroupKey`] stays at default.
+    /// Skips the CIGAR walk and the aux-tag pass. For queryname-grouping stages
+    /// (e.g. `correct`) that read only [`GroupKey::name_hash`]. See
+    /// [`name_hash_key`].
+    NameHashOnly,
+    /// No key at all: the Decode step emits `GroupKey::default()` and computes
+    /// nothing. For stages that never read any `GroupKey` field — e.g. the
+    /// terminal BAM→FASTQ encode, which reads only the raw record. Skips even
+    /// the per-record name hash `NameHashOnly` still pays.
+    None,
 }
 
 impl GroupKeyConfig {
@@ -372,7 +396,7 @@ impl GroupKeyConfig {
         Self {
             library_index: Arc::new(library_index),
             cell_tag: Some(cell_tag),
-            name_hash_only: false,
+            key_mode: KeyMode::Full,
             umi_tag: None,
         }
     }
@@ -383,7 +407,7 @@ impl GroupKeyConfig {
         Self {
             library_index: Arc::new(library_index),
             cell_tag: None,
-            name_hash_only: false,
+            key_mode: KeyMode::Full,
             umi_tag: None,
         }
     }
@@ -399,7 +423,23 @@ impl GroupKeyConfig {
         Self {
             library_index: Arc::new(library_index),
             cell_tag: None,
-            name_hash_only: true,
+            key_mode: KeyMode::NameHashOnly,
+            umi_tag: None,
+        }
+    }
+
+    /// Create a `GroupKeyConfig` that computes no key at all: the Decode step
+    /// emits `GroupKey::default()` for every record. For stages that never read
+    /// any `GroupKey` field — e.g. the terminal BAM→FASTQ encode, which reads
+    /// only the raw record (name/flags/SEQ/QUAL, and the UMI tag straight off
+    /// the record). Cheapest of all: skips even the per-record name hash.
+    /// `library_index` is retained (unused) so the config shape is uniform.
+    #[must_use]
+    pub fn no_key(library_index: LibraryIndex) -> Self {
+        Self {
+            library_index: Arc::new(library_index),
+            cell_tag: None,
+            key_mode: KeyMode::None,
             umi_tag: None,
         }
     }
@@ -421,7 +461,7 @@ impl Default for GroupKeyConfig {
         Self {
             library_index: Arc::new(LibraryIndex::default()),
             cell_tag: Some(Tag::from([b'C', b'B'])), // Default cell barcode tag (CB)
-            name_hash_only: false,
+            key_mode: KeyMode::Full,
             umi_tag: None,
         }
     }
@@ -457,6 +497,30 @@ fn raw_name_hash(raw: &[u8]) -> u64 {
 #[must_use]
 pub fn name_hash_key(raw: &[u8]) -> GroupKey {
     GroupKey { name_hash: raw_name_hash(raw), ..GroupKey::default() }
+}
+
+/// Compute a record's [`GroupKey`] at the requested [`KeyMode`]: `None` →
+/// `GroupKey::default()` (no work), `NameHashOnly` → [`name_hash_key`], `Full`
+/// → [`compute_group_key_from_raw`]. The single place the three levels are
+/// mapped, so every decode consumer (BAM and SAM) stays in parity.
+///
+/// # Panics
+///
+/// For `NameHashOnly`/`Full`, panics if `raw` is not a validated BAM record
+/// payload (same contract as the underlying key functions). `None` never
+/// inspects `raw`.
+#[must_use]
+pub fn key_for_mode(
+    mode: KeyMode,
+    raw: &[u8],
+    library_index: &LibraryIndex,
+    cell_tag: Option<Tag>,
+) -> GroupKey {
+    match mode {
+        KeyMode::None => GroupKey::default(),
+        KeyMode::NameHashOnly => name_hash_key(raw),
+        KeyMode::Full => compute_group_key_from_raw(raw, library_index, cell_tag),
+    }
 }
 
 /// Compute a `GroupKey` directly from raw BAM bytes, matching `compute_group_key()` exactly.
@@ -1011,6 +1075,47 @@ mod tests {
                 "name_hash parity mismatch",
             );
         }
+    }
+
+    // ========================================================================
+    // key_for_mode dispatch
+    // ========================================================================
+
+    /// `key_for_mode` maps each [`KeyMode`] to the matching key function, and the
+    /// `None` arm returns `GroupKey::default()` without inspecting `raw` — the
+    /// documented contract that lets the fastq encode decode with no key at all.
+    #[test]
+    fn key_for_mode_dispatches_each_level() {
+        let lib = LibraryIndex::default();
+
+        // `None` must not touch `raw`: an empty (unvalidated) slice that would
+        // panic in `name_hash_key`/`compute_group_key_from_raw` is accepted here.
+        assert_eq!(
+            key_for_mode(KeyMode::None, &[], &lib, None),
+            GroupKey::default(),
+            "KeyMode::None must return the default key without reading raw",
+        );
+
+        let mut b = SamBuilder::new();
+        b.ref_id(0)
+            .pos(10)
+            .read_name(b"delta")
+            .cigar_ops(&[cigar_m(4)])
+            .sequence(b"ACGT")
+            .qualities(&[30; 4]);
+        let rec = b.build();
+        let raw = rec.as_ref();
+
+        assert_eq!(
+            key_for_mode(KeyMode::NameHashOnly, raw, &lib, None),
+            name_hash_key(raw),
+            "KeyMode::NameHashOnly must match name_hash_key",
+        );
+        assert_eq!(
+            key_for_mode(KeyMode::Full, raw, &lib, None),
+            compute_group_key_from_raw(raw, &lib, None),
+            "KeyMode::Full must match compute_group_key_from_raw",
+        );
     }
 
     // ========================================================================
