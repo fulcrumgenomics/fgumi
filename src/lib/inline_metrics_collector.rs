@@ -701,6 +701,62 @@ pub(crate) fn classify_batch_runs(
     (interior, boundary)
 }
 
+/// Record one batch of MI groups into the shared per-thread metrics accumulator.
+///
+/// The single home for the T2 metrics-recording body shared by the standalone
+/// [`MetricsSink`](crate::pipeline::steps::sink::metrics::MetricsSink) and the
+/// three consensus metrics-on batch runners
+/// (`run_{simplex,duplex,codec}_consensus_batch_with_metrics`). It collects one
+/// `(TemplateInfo, ReadInfoKey)` entry per qualifying template across the batch
+/// ([`push_mi_group_entries`]), splits them into maximal same-key runs
+/// ([`split_into_runs`]), records the interior (fully-within-one-batch) runs
+/// directly, and submits the batch-boundary runs to the shared
+/// [`BoundaryReorder`] — recording whatever groups that submission closes.
+///
+/// The two `with_slot` acquisitions never nest around the reorder mutex (the
+/// reorder is taken/released inside `submit`, between them), so there is no
+/// lock-order cycle. `submit` is called unconditionally, even when `boundary`
+/// is empty: batch serials are a contiguous ordinal and a batch with no metrics
+/// entries still occupies its serial slot (H3 design §6.3).
+///
+/// # Errors
+///
+/// Returns an error if a group cannot be converted to template entries, or if
+/// recording a coordinate group into the accumulator fails.
+pub(crate) fn record_batch_metrics(
+    qc: &ConsensusMetricsCaptures,
+    header: &noodles::sam::Header,
+    library_index: &LibraryIndex,
+    batch_serial: u64,
+    groups: &[MiGroup],
+) -> std::io::Result<()> {
+    let mut metrics_entries = Vec::new();
+    for group in groups {
+        push_mi_group_entries(group, header, library_index, &mut metrics_entries)
+            .map_err(|e| std::io::Error::other(format!("metrics conversion error: {e:#}")))?;
+    }
+    let runs = split_into_runs(metrics_entries);
+    let (interior, boundary) = classify_batch_runs(batch_serial, runs);
+    qc.accumulator
+        .with_slot(|slot| -> anyhow::Result<()> {
+            for (_key, templates) in interior {
+                slot.acc.record_coordinate_group(&templates, &qc.intervals)?;
+            }
+            Ok(())
+        })
+        .map_err(std::io::Error::other)?;
+    let closed = qc.reorder.submit(batch_serial, boundary);
+    qc.accumulator
+        .with_slot(|slot| -> anyhow::Result<()> {
+            for group in &closed {
+                slot.acc.record_coordinate_group(group, &qc.intervals)?;
+            }
+            Ok(())
+        })
+        .map_err(std::io::Error::other)?;
+    Ok(())
+}
+
 /// Incrementally closes boundary coordinate groups as the batch-serial prefix
 /// becomes contiguous, instead of buffering every boundary run until
 /// finalize. Applies the SAME closing rule the retired serial collector (and

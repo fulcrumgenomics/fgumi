@@ -29,7 +29,6 @@ use crate::commands::common::MethylationRef;
 use crate::commands::consensus_runner::{ConsensusStatsOps, log_overlapping_stats};
 use crate::consensus_caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput};
 use crate::duplex_consensus_caller::DuplexConsensusCaller;
-use crate::inline_metrics_collector::push_mi_group_entries;
 use crate::logging::OperationTimer;
 use crate::mi_group::MiGroup;
 use crate::overlapping_consensus::{
@@ -437,42 +436,20 @@ fn run_duplex_consensus_batch_with_metrics(
     progress: &Arc<AtomicU64>,
     qc: &Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>,
 ) -> io::Result<(DecompressedBlock, Option<DecompressedBlock>)> {
-    let batch_serial = item.batch_serial;
-    let mut metrics_entries = Vec::new();
     // This body runs only on the metrics-on path (it requires `qc`), so the
     // header/library index are always present here.
     let header = state.header.as_ref().expect("metrics-on state carries the header");
     let library_index =
         state.library_index.as_ref().expect("metrics-on state carries the library index");
-    for group in &item.groups {
-        push_mi_group_entries(group, header, library_index, &mut metrics_entries)
-            .map_err(|e| io::Error::other(format!("metrics conversion error: {e:#}")))?;
-    }
-    let runs = crate::inline_metrics_collector::split_into_runs(metrics_entries);
-    let (interior, boundary) =
-        crate::inline_metrics_collector::classify_batch_runs(batch_serial, runs);
-    qc.accumulator
-        .with_slot(|slot| -> anyhow::Result<()> {
-            for (_key, templates) in interior {
-                slot.acc.record_coordinate_group(&templates, &qc.intervals)?;
-            }
-            Ok(())
-        })
-        .map_err(io::Error::other)?;
-    // `submit` takes/releases the reorder mutex here, before the second
-    // `with_slot` acquisition below — never nested — so there is no
-    // lock-order cycle. Submitted unconditionally, even when `boundary` is
-    // empty: batch serials are contiguous, and a batch with no metrics
-    // entries still occupies its serial slot (H3 design §6.3).
-    let closed = qc.reorder.submit(batch_serial, boundary);
-    qc.accumulator
-        .with_slot(|slot| -> anyhow::Result<()> {
-            for group in &closed {
-                slot.acc.record_coordinate_group(group, &qc.intervals)?;
-            }
-            Ok(())
-        })
-        .map_err(io::Error::other)?;
+    // Interior/boundary recording is shared with the other consensus modes and
+    // the standalone `MetricsSink`; see `record_batch_metrics`.
+    crate::inline_metrics_collector::record_batch_metrics(
+        qc,
+        header,
+        library_index,
+        item.batch_serial,
+        &item.groups,
+    )?;
 
     run_duplex_consensus_batch(
         state,

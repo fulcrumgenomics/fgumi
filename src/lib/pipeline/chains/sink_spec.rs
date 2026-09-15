@@ -43,18 +43,47 @@ pub enum SinkSpec {
     /// terminal chain. The three streams are fanned out by the paired FASTQ
     /// encode step (a 3-output `Process3WithWorkerState`).
     FastqPaired { out1: PathBuf, out2: PathBuf, out0: Option<PathBuf> },
+    /// No output file. The terminal stage produces no BAM — it terminates the
+    /// chain itself with a `type Outputs = ()` sink step (e.g. the metrics
+    /// stage records into a per-thread accumulator and writes its own TSVs via
+    /// a finalize hook). `add_sink` is a no-op for this variant. Only valid on
+    /// a `Stage::Metrics`-terminal chain (enforced by a cross-stage validator
+    /// biconditional).
+    None,
 }
 
 impl SinkSpec {
     /// A representative output path for the sink, used for logging (and
     /// available to a caller's input-clobber guard). For [`SinkSpec::FastqPaired`]
     /// this is `out1`; the chains layer itself does not currently guard against
-    /// clobbering the input.
+    /// clobbering the input. Returns `None` for [`SinkSpec::None`] (no output
+    /// file at all).
     #[must_use]
-    pub fn path(&self) -> &PathBuf {
+    pub fn path(&self) -> Option<&PathBuf> {
         match self {
-            SinkSpec::Bam(p) | SinkSpec::BamWithIndex(p) | SinkSpec::Fastq(p) => p,
-            SinkSpec::FastqPaired { out1, .. } => out1,
+            SinkSpec::Bam(p) | SinkSpec::BamWithIndex(p) | SinkSpec::Fastq(p) => Some(p),
+            SinkSpec::FastqPaired { out1, .. } => Some(out1),
+            SinkSpec::None => None,
         }
+    }
+
+    /// The output path for a file-writing sink, for the BAM/FASTQ stage methods
+    /// that always run against a real output. Every stage that calls this pairs
+    /// with a file sink (`Bam`/`BamWithIndex`/`Fastq`/`FastqPaired`); only the
+    /// metrics stage uses [`SinkSpec::None`], and it never calls this. The
+    /// biconditional in `validate_cross_stage_constraints` guarantees a
+    /// `None` sink only ever appears with a `Stage::Metrics` terminal, so this
+    /// is unreachable for those callers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the sink is [`SinkSpec::None`] — a framework bug (a
+    /// file-output stage wired against a no-output sink).
+    #[must_use]
+    pub fn output_path(&self) -> &PathBuf {
+        self.path().expect(
+            "SinkSpec::output_path called on a SinkSpec::None sink; only the metrics stage \
+             uses a None sink and it never writes an output file",
+        )
     }
 }

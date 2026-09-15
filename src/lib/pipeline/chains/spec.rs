@@ -96,6 +96,36 @@ impl ChainSpec {
         }
     }
 
+    /// Build the spec for a metrics-only chain (`simplex-metrics` /
+    /// `duplex-metrics`): one `Stage::Metrics`, BAM in, and **no** output BAM
+    /// ([`SinkSpec::None`]). The stage records QC metrics into a per-thread
+    /// accumulator and writes its own TSV files via a finalize hook, so there is
+    /// nothing for `add_sink` to wire — the `SinkSpec::None` ↔ `Stage::Metrics`
+    /// biconditional in the cross-stage validator enforces the pairing.
+    ///
+    /// The caller fills the matching metrics slot in `stage_opts`
+    /// (`simplex_metrics` or `duplex_metrics`); `add_metrics` picks simplex vs
+    /// duplex from which slot is present. `ctx.io.output` is ignored (metrics
+    /// use their own `--output` prefix carried in the options), so this differs
+    /// from [`Self::single_stage`] only in the sink.
+    #[must_use]
+    pub fn single_stage_metrics(stage_opts: StageOptionsBag, ctx: &SingleStageContext<'_>) -> Self {
+        Self {
+            stages: vec![Stage::Metrics],
+            source: SourceSpec::Bam(ctx.io.input.clone()),
+            sink: SinkSpec::None,
+            stage_opts,
+            threading: ctx.threading.clone(),
+            compression: ctx.compression.clone(),
+            scheduler: ctx.scheduler.clone(),
+            queue_memory: ctx.queue_memory.clone(),
+            async_reader: ctx.io.async_reader,
+            read_streams: ReadStreams::Fixed(1),
+            verify_crc: ctx.io.effective_check_crc(),
+            command_line: ctx.command_line.to_string(),
+        }
+    }
+
     /// Whether this is the standalone sort chain (`[Stage::Sort]` only).
     ///
     /// Standalone sort no longer has a special build path — like every other
