@@ -4,8 +4,8 @@
 //! [`BamTemplateBatch`] (N `Template`s) by:
 //!
 //! 1. Applying read structures to each `FastqRecord` in the template,
-//!    yielding a combined [`FastqSet`].
-//! 2. Calling `make_raw_records_from_fastq_set` to produce
+//!    segmenting them zero-copy into a combined `FastqSetView`.
+//! 2. Calling `make_raw_records_from_view` to produce
 //!    `Vec<RawRecord>`.
 //! 3. Building a [`Template`] via
 //!    [`Template::from_records`].
@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::read_structure::ReadStructure;
 
-use crate::commands::extract::{ExtractOptions, make_raw_records_from_fastq_set};
-use crate::fastq::FastqSet;
+use crate::commands::extract::{ExtractOptions, make_raw_records_from_view};
+use crate::fastq::{FastqSegmentView, FastqSetView};
 use crate::pipeline::steps::process::ProcessOrdered;
 use crate::pipeline::steps::source::fastq_zip::FastqTemplateBatch;
 use crate::pipeline::steps::types::BamTemplateBatch;
@@ -30,8 +30,9 @@ use crate::template::Template;
 /// [`BamTemplateBatch`].
 ///
 /// Each input batch's `FastqTemplate`s are independently converted: read
-/// structures are applied, UMI/barcode tags are extracted via
-/// `make_raw_records_from_fastq_set`, and the resulting `RawRecord`s are
+/// structures are applied (segmenting the source records zero-copy into a
+/// `FastqSetView`), UMI/barcode tags are extracted via
+/// `make_raw_records_from_view`, and the resulting `RawRecord`s are
 /// assembled into `Template`s.
 ///
 /// The returned step preserves batch ordering (output ordinal ==
@@ -114,22 +115,39 @@ pub(crate) fn extract_batch(
             ));
         }
 
-        let mut fastq_sets: Vec<FastqSet> = Vec::with_capacity(fq_template.records.len());
+        // Zero-copy segmentation: build one borrowed `FastqSetView` over the
+        // source records' bases/qualities instead of allocating an owned
+        // `FastqSet` per stream and then `combine_readsets`'ing them. The
+        // combined header is the FIRST record's name (matching
+        // `FastqSet::combine_readsets`, which keeps the first set's header), and
+        // segments are appended in input order (R1 then R2, …) — byte-identical
+        // to the owned path, but with no per-segment `to_vec` and no intermediate
+        // per-stream `FastqSet` allocation.
+        let mut segments: Vec<FastqSegmentView<'_>> = Vec::new();
         for (record, rs) in fq_template.records.iter().zip(read_structures.iter()) {
-            let fastq_set = FastqSet::from_record_with_structure(
+            FastqSetView::segment_into(
                 record.name(),
                 record.sequence(),
                 record.quality(),
                 rs,
                 &[], // No skip reasons
+                &mut segments,
             )
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            fastq_sets.push(fastq_set);
         }
+        // `.first()` (with a descriptive `expect`) rather than `records[0]`: the
+        // count-equality guard above plus the non-empty `read_structures`
+        // (validated at CLI parse / `validate_template_count`) make this
+        // unreachable, but a labeled panic preserves the diagnostic the old
+        // `FastqSet::combine_readsets` empty-vec assert carried.
+        let header = fq_template
+            .records
+            .first()
+            .expect("ExtractStep: template has no records despite the count-equality check above")
+            .name();
+        let combined = FastqSetView { header, segments };
 
-        let combined = FastqSet::combine_readsets(fastq_sets);
-
-        let raw_records = make_raw_records_from_fastq_set(&combined, extract_opts)
+        let raw_records = make_raw_records_from_view(&combined, extract_opts)
             // Render the full anyhow context chain into the io::Error string (the
             // alternate `{:#}` form: "context: cause"). A bare
             // `io::Error::new(_, e)` Displays only the top context, dropping the
@@ -155,7 +173,9 @@ pub(crate) fn extract_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::extract::{ExtractOptions, QualityEncoding};
+    use crate::commands::extract::{
+        ExtractOptions, QualityEncoding, make_raw_records_from_fastq_set,
+    };
     use crate::fastq::FastqSet;
     use crate::sam::SamTag;
     use fgumi_raw_bam::fields::RawRecordView;
@@ -186,6 +206,172 @@ mod tests {
             check_crc: false,
             no_check_crc: false,
         }
+    }
+
+    /// Options exercising every optional tag branch, so the parity test below
+    /// covers CB/CY, BC/QT, RX/QX, `--single-tag`, and `--annotate-read-names`.
+    fn all_tags_opts() -> ExtractOptions {
+        ExtractOptions {
+            store_umi_quals: true,
+            store_cell_quals: true,
+            store_sample_barcode_qualities: true,
+            single_tag: Some("ZU".parse().expect("valid tag")),
+            annotate_read_names: true,
+            ..default_extract_opts()
+        }
+    }
+
+    /// The zero-copy view path (`make_raw_records_from_view`, used by the
+    /// pipeline `extract_batch`) must emit BYTE-IDENTICAL `RawRecord`s to the
+    /// owned path (`make_raw_records_from_fastq_set`, via `FastqSet` +
+    /// `combine_readsets`) — the refactor removes per-segment `to_vec` copies but
+    /// must not change a single output byte. Exercised across single-end,
+    /// paired-end, and a full-structure paired read with UMI + cell + sample
+    /// barcodes under the all-tags options.
+    #[rstest::rstest]
+    // (r1_structure, r1_seq, r1_qual, r2 (structure,seq,qual) or None, opts_all_tags)
+    #[case::single_end_template("10T", b"ACGTACGTAC".as_slice(), b"IIIIIIIIII".as_slice(), None, false)]
+    #[case::paired_template("5T", b"ACGTG".as_slice(), b"IIIII".as_slice(), Some(("5T", b"TGCAA".as_slice(), b"JJJJJ".as_slice())), false)]
+    #[case::umi_only("3M7T", b"AAACCCCCCC".as_slice(), b"IIIIIIIIII".as_slice(), None, true)]
+    #[case::full_structure_all_tags(
+        "3C2B4M8T", b"CCCBBUUUUTTTTTTTT".as_slice(), b"IIIIIIIIIIIIIIIII".as_slice(),
+        Some(("8T", b"GGGGGGGG".as_slice(), b"JJJJJJJJ".as_slice())), true
+    )]
+    fn view_path_matches_owned_path_byte_for_byte(
+        #[case] r1_rs: &str,
+        #[case] r1_seq: &[u8],
+        #[case] r1_qual: &[u8],
+        #[case] r2: Option<(&str, &[u8], &[u8])>,
+        #[case] all_tags: bool,
+    ) {
+        let opts = if all_tags { all_tags_opts() } else { default_extract_opts() };
+        // R1 and R2 carry DISTINCT names (both 8-field so UMI-from-name is inert
+        // unless enabled). The combined header must come from the FIRST record
+        // (R1): `combine_readsets` keeps the first set's header and `extract_batch`
+        // uses `records.first()`. Distinct names let the checks below detect a
+        // regression that sourced the header from the wrong record.
+        let r1_name = b"inst:1:fc:1:1:1:1:ACGT".as_slice();
+        let r2_name = b"inst:1:fc:1:1:1:1:TTTT".as_slice();
+
+        // ---- Owned path: FastqSet(s) + combine_readsets ----
+        let rs1 = r1_rs.parse::<ReadStructure>().unwrap();
+        let mut owned_sets = vec![
+            FastqSet::from_record_with_structure(r1_name, r1_seq, r1_qual, &rs1, &[]).unwrap(),
+        ];
+        if let Some((r2_rs, r2_seq, r2_qual)) = r2 {
+            let rs2 = r2_rs.parse::<ReadStructure>().unwrap();
+            owned_sets.push(
+                FastqSet::from_record_with_structure(r2_name, r2_seq, r2_qual, &rs2, &[]).unwrap(),
+            );
+        }
+        let owned = FastqSet::combine_readsets(owned_sets);
+        let owned_records = make_raw_records_from_fastq_set(&owned, &opts).unwrap();
+
+        // ---- View path: FastqSetView::segment_into over borrowed slices ----
+        // Header is the FIRST record's name, mirroring `extract_batch`.
+        let mut segments = Vec::new();
+        FastqSetView::segment_into(r1_name, r1_seq, r1_qual, &rs1, &[], &mut segments).unwrap();
+        if let Some((r2_rs, r2_seq, r2_qual)) = r2 {
+            let rs2 = r2_rs.parse::<ReadStructure>().unwrap();
+            FastqSetView::segment_into(r2_name, r2_seq, r2_qual, &rs2, &[], &mut segments).unwrap();
+        }
+        let view = FastqSetView { header: r1_name, segments };
+        let view_records = make_raw_records_from_view(&view, &opts).unwrap();
+
+        // Guard against a vacuous pass: a regression emitting zero records from
+        // both paths would otherwise satisfy the length + zip assertions trivially.
+        assert!(!owned_records.is_empty(), "expected at least one record");
+
+        // Byte-for-byte identical record bytes (and count).
+        assert_eq!(owned_records.len(), view_records.len(), "record count differs");
+        for (i, (o, v)) in owned_records.iter().zip(view_records.iter()).enumerate() {
+            assert_eq!(o.as_ref(), v.as_ref(), "record {i} bytes differ (view vs owned)");
+        }
+
+        // Pin that the header is sourced from R1, not R2: a view built with R2's
+        // (distinct) name must produce DIFFERENT bytes, proving the header
+        // participates in the output and that first-record-wins is what both
+        // paths do.
+        if r2.is_some() {
+            let mut alt_segments = Vec::new();
+            FastqSetView::segment_into(r2_name, r1_seq, r1_qual, &rs1, &[], &mut alt_segments)
+                .unwrap();
+            if let Some((r2_rs, r2_seq, r2_qual)) = r2 {
+                let rs2 = r2_rs.parse::<ReadStructure>().unwrap();
+                FastqSetView::segment_into(r2_name, r2_seq, r2_qual, &rs2, &[], &mut alt_segments)
+                    .unwrap();
+            }
+            let alt_view = FastqSetView { header: r2_name, segments: alt_segments };
+            let alt_records = make_raw_records_from_view(&alt_view, &opts).unwrap();
+            assert!(!alt_records.is_empty(), "expected at least one record");
+            assert_ne!(
+                alt_records[0].as_ref(),
+                owned_records[0].as_ref(),
+                "header did not affect output — first-record-wins is not pinned"
+            );
+        }
+    }
+
+    /// How a segmentation guard classified an input.
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    enum GuardOutcome {
+        /// Rejected with an error (length mismatch, over-long fixed, or too-few
+        /// bases without a `TooFewBases` skip).
+        Rejected,
+        /// Accepted-but-skipped: too few bases with `TooFewBases` in skip reasons
+        /// (owned path returns a `skip_reason`-tagged empty set; view path leaves
+        /// `out` unchanged).
+        Skipped,
+        /// Segmented normally into one or more segments.
+        Segmented,
+    }
+
+    /// `FastqSetView::segment_into` re-implements the same three input guards as
+    /// its owned sibling `FastqSet::from_record_with_structure` (length mismatch,
+    /// over-long fixed, and too-few-bases bail-vs-skip). The byte-parity test
+    /// above only feeds valid inputs, so this pins that the two siblings CLASSIFY
+    /// every error/skip input identically — a future edit to one guard cannot
+    /// silently diverge them (guard-set parity, the repo's key check for these
+    /// paired parsing entry points).
+    #[rstest::rstest]
+    // (structure, seq, qual, allow_too_few_skip, expected)
+    #[case::len_mismatch("5T", b"ACGTG".as_slice(), b"IIII".as_slice(), false, GuardOutcome::Rejected)]
+    #[case::over_long_fixed("5T", b"ACGTGT".as_slice(), b"IIIIII".as_slice(), false, GuardOutcome::Rejected)]
+    #[case::over_long_fixed_even_with_skip("5T", b"ACGTGT".as_slice(), b"IIIIII".as_slice(), true, GuardOutcome::Rejected)]
+    #[case::too_few_no_skip("10T", b"ACGT".as_slice(), b"IIII".as_slice(), false, GuardOutcome::Rejected)]
+    #[case::too_few_with_skip("10T", b"ACGT".as_slice(), b"IIII".as_slice(), true, GuardOutcome::Skipped)]
+    #[case::ok_exact("5T", b"ACGTG".as_slice(), b"IIIII".as_slice(), false, GuardOutcome::Segmented)]
+    fn segment_into_matches_owned_guard_classification(
+        #[case] structure: &str,
+        #[case] seq: &[u8],
+        #[case] qual: &[u8],
+        #[case] allow_too_few_skip: bool,
+        #[case] expected: GuardOutcome,
+    ) {
+        use crate::fastq::SkipReason;
+        let name = b"read1".as_slice();
+        let rs = structure.parse::<ReadStructure>().unwrap();
+        let skip: &[SkipReason] = if allow_too_few_skip { &[SkipReason::TooFewBases] } else { &[] };
+
+        // Owned sibling classification.
+        let owned_outcome = match FastqSet::from_record_with_structure(name, seq, qual, &rs, skip) {
+            Err(_) => GuardOutcome::Rejected,
+            Ok(set) if set.skip_reason.is_some() => GuardOutcome::Skipped,
+            Ok(_) => GuardOutcome::Segmented,
+        };
+
+        // Borrowed sibling classification. A valid structure always yields >=1
+        // segment, so an empty `out` after `Ok(())` is unambiguously a skip.
+        let mut out = Vec::new();
+        let view_outcome = match FastqSetView::segment_into(name, seq, qual, &rs, skip, &mut out) {
+            Err(_) => GuardOutcome::Rejected,
+            Ok(()) if out.is_empty() => GuardOutcome::Skipped,
+            Ok(()) => GuardOutcome::Segmented,
+        };
+
+        assert_eq!(owned_outcome, expected, "owned path misclassified");
+        assert_eq!(view_outcome, expected, "view path misclassified");
+        assert_eq!(owned_outcome, view_outcome, "owned and view guards diverged");
     }
 
     #[test]

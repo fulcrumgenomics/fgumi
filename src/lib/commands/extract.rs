@@ -21,8 +21,9 @@ use crate::commands::command::Command;
 use crate::commands::common::{
     CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
 };
-use crate::fastq::FastqSegment;
+#[cfg(test)]
 use crate::fastq::FastqSet;
+use crate::fastq::{FastqSegmentView, FastqSetView};
 use crate::fastq_deinterleave::deinterleave;
 use crate::fastq_parse::strip_read_suffix;
 use crate::sam::SamTag;
@@ -1578,7 +1579,40 @@ impl ExtractRunallOptions {
     }
 }
 
-/// Build raw BAM `RawRecord`s from a [`FastqSet`].
+/// Build raw BAM `RawRecord`s from an owned [`FastqSet`].
+///
+/// Thin wrapper over the borrowed-view core [`make_raw_records_from_view`] for
+/// the owned-`FastqSet` byte-parity unit test. The production pipeline
+/// (`extract_batch`) calls the view core directly with zero-copy segment views;
+/// routing the owned path through the same core is what lets the
+/// `view_path_matches_owned_path_byte_for_byte` test guarantee their output is
+/// byte-identical.
+///
+/// Retained for that test only (no production code calls it — `ReadSetIterator`
+/// yields a bare `FastqSet` and never builds records through this function), so
+/// it is `#[cfg(test)]`-gated to avoid a dead-code warning in production builds.
+///
+/// # Errors
+///
+/// Returns an error if the read set contains no template segments, or if a read
+/// name is 255 bytes or longer (via `try_build_record`).
+#[cfg(test)]
+pub(crate) fn make_raw_records_from_fastq_set(
+    read_set: &FastqSet,
+    opts: &ExtractOptions,
+) -> Result<Vec<fgumi_raw_bam::RawRecord>> {
+    // Delegate to the borrowed-view core so the owned path (this fn — the
+    // byte-parity test's owned oracle) and the pipeline's zero-copy path share
+    // one record builder and cannot diverge.
+    make_raw_records_from_view(&FastqSetView::from_owned(read_set), opts)
+}
+
+/// Build raw BAM `RawRecord`s from a borrowed [`FastqSetView`] — the zero-copy
+/// extract record builder. Byte-for-byte identical to the owned
+/// [`make_raw_records_from_fastq_set`] (which delegates here); the only
+/// difference is that segment bases/qualities are read from borrowed `&[u8]`
+/// spans rather than owned `Vec<u8>` copies, so the per-read/per-segment
+/// `to_vec` allocations of the owned path are gone.
 ///
 /// This is the core extract logic: applies read structures (via the segments
 /// already present in `read_set`), extracts UMI / cell-barcode / sample-barcode
@@ -1586,57 +1620,51 @@ impl ExtractRunallOptions {
 /// the result in a [`crate::template::Template`] for the typed-step pipeline.
 ///
 /// This is the single per-read FASTQ→`RawRecord` builder for extract: the chain
-/// is the only execution path, so there is no second copy to keep in sync (the
-/// legacy serial `make_raw_records` and the earlier `make_raw_records_static`
-/// were both removed with the single-threaded path). Its output is pinned by the
-/// `no_threads_matches_threaded*` integration tests, which assert byte-identical
-/// output across worker counts and pin the emitted tag values: the base case
-/// covers RX/RG, and `no_threads_matches_threaded_barcode_and_annotate_tags`
-/// covers the CB/CY, BC/QT, QX, `--single-tag`, and `--annotate-read-names`
-/// branches.
+/// is the only production execution path, and the owned `FastqSet` path routes
+/// through it too, so there is no second copy to keep in sync. Its output is
+/// pinned by the `no_threads_matches_threaded*` integration tests, which assert
+/// byte-identical output across worker counts and pin the emitted tag values:
+/// the base case covers RX/RG, and
+/// `no_threads_matches_threaded_barcode_and_annotate_tags` covers the CB/CY,
+/// BC/QT, QX, `--single-tag`, and `--annotate-read-names` branches.
 ///
 /// # Errors
 ///
-/// Returns an error if the read set contains no template segments, or if a read
-/// name is 255 bytes or longer (via `try_build_record`).
-pub(crate) fn make_raw_records_from_fastq_set(
-    read_set: &FastqSet,
+/// Returns an error if the view has no template segments, or if a read name is
+/// 255 bytes or longer (via `try_build_record`).
+pub(crate) fn make_raw_records_from_view(
+    read_set: &FastqSetView<'_>,
     opts: &ExtractOptions,
 ) -> Result<Vec<fgumi_raw_bam::RawRecord>> {
-    let templates: Vec<&FastqSegment> = read_set.template_segments().collect();
+    let templates: Vec<FastqSegmentView<'_>> = read_set.template_segments().collect();
 
-    let read_name = String::from_utf8_lossy(&read_set.header);
-    ensure!(!templates.is_empty(), "No template segments found for read: {read_name}");
+    ensure!(!templates.is_empty(), "No template segments found for read: {}", {
+        String::from_utf8_lossy(read_set.header)
+    });
 
     // Extract various barcode types as BString
-    let cell_barcode_bs = Extract::join_bytes_with_separator(
-        read_set.cell_barcode_segments().map(|s| s.seq.as_slice()),
-        b'-',
-    );
-    let cell_quals_bs = Extract::join_bytes_with_separator(
-        read_set.cell_barcode_segments().map(|s| s.quals.as_slice()),
-        b' ',
-    );
-    let sample_barcode_bs = Extract::join_bytes_with_separator(
-        read_set.sample_barcode_segments().map(|s| s.seq.as_slice()),
-        b'-',
-    );
+    let cell_barcode_bs =
+        Extract::join_bytes_with_separator(read_set.cell_barcode_segments().map(|s| s.seq), b'-');
+    let cell_quals_bs =
+        Extract::join_bytes_with_separator(read_set.cell_barcode_segments().map(|s| s.quals), b' ');
+    let sample_barcode_bs =
+        Extract::join_bytes_with_separator(read_set.sample_barcode_segments().map(|s| s.seq), b'-');
     let sample_quals_bs = Extract::join_bytes_with_separator(
-        read_set.sample_barcode_segments().map(|s| s.quals.as_slice()),
+        read_set.sample_barcode_segments().map(|s| s.quals),
         b' ',
     );
     let umi_bs = Extract::join_bytes_with_separator(
-        read_set.molecular_barcode_segments().map(|s| s.seq.as_slice()),
+        read_set.molecular_barcode_segments().map(|s| s.seq),
         b'-',
     );
     let umi_qual_bs = Extract::join_bytes_with_separator(
-        read_set.molecular_barcode_segments().map(|s| s.quals.as_slice()),
+        read_set.molecular_barcode_segments().map(|s| s.quals),
         b' ',
     );
 
     // Extract UMI from read name if requested
     let (read_name_bytes, umi_from_name) =
-        Extract::extract_read_name_and_umi(&read_set.header, opts.extract_umis_from_read_names)?;
+        Extract::extract_read_name_and_umi(read_set.header, opts.extract_umis_from_read_names)?;
 
     // Prepare final UMI
     let final_umi_bs: BString = match (umi_bs.is_empty(), &umi_from_name) {
@@ -1690,8 +1718,8 @@ pub(crate) fn make_raw_records_from_fastq_set(
         if template.seq.is_empty() {
             builder.try_build_record(final_read_name, flag, b"N", &[2u8])
         } else {
-            let numeric_quals = opts.quality_encoding.to_standard_numeric(&template.quals);
-            builder.try_build_record(final_read_name, flag, &template.seq, &numeric_quals)
+            let numeric_quals = opts.quality_encoding.to_standard_numeric(template.quals);
+            builder.try_build_record(final_read_name, flag, template.seq, &numeric_quals)
         }
         .with_context(|| Extract::read_name_too_long_context(final_read_name))?;
 
