@@ -1527,6 +1527,7 @@ impl RunAll {
                 | Stage::Downsample
                 | Stage::Fastq
                 | Stage::CopyUmi
+                | Stage::Metrics
                 | Stage::Retag => bail!(
                     "internal error: build_stage_options_bag encountered unexpected \
                      stage {stage:?} in a runall chain; this is a bug in derive_stages"

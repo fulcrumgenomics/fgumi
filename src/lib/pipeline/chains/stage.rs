@@ -33,6 +33,12 @@ pub enum Stage {
     Downsample,
     /// Terminal BAM → FASTQ encode (interleaved or paired split output).
     Fastq,
+    /// Terminal QC-metrics collection (`simplex-metrics` / `duplex-metrics`):
+    /// decode + MI-group + record family-size/UMI/yield metrics into a
+    /// per-thread accumulator, writing TSVs at finalize. Standalone-only (the
+    /// sole stage of its chain), simplex vs duplex selected by which metrics
+    /// options-bag slot is filled. Emits no BAM — pairs with `SinkSpec::None`.
+    Metrics,
 }
 
 impl Stage {
@@ -59,7 +65,7 @@ mod tests {
     /// enum rather than a hand-picked subset. A new variant that is not added
     /// here is still forced through the exhaustive `match`es in the
     /// `expected_*` helpers, which fail to compile until it is classified.
-    const ALL_STAGES: [Stage; 16] = [
+    const ALL_STAGES: [Stage; 17] = [
         Stage::Extract,
         Stage::CopyUmi,
         Stage::Correct,
@@ -76,6 +82,7 @@ mod tests {
         Stage::Retag,
         Stage::Downsample,
         Stage::Fastq,
+        Stage::Metrics,
     ];
 
     /// Expected `is_consensus` truth per variant, spelled out with an
@@ -96,7 +103,8 @@ mod tests {
             | Stage::Dedup
             | Stage::Retag
             | Stage::Downsample
-            | Stage::Fastq => false,
+            | Stage::Fastq
+            | Stage::Metrics => false,
         }
     }
 
@@ -118,7 +126,8 @@ mod tests {
             | Stage::Dedup
             | Stage::Retag
             | Stage::Downsample
-            | Stage::Fastq => false,
+            | Stage::Fastq
+            | Stage::Metrics => false,
         }
     }
 

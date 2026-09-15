@@ -14,6 +14,8 @@ pub use crate::commands::correct::CorrectOptions;
 pub use crate::commands::dedup::MarkDuplicates;
 #[cfg(feature = "consensus")]
 pub use crate::commands::duplex::DuplexOptions;
+#[cfg(feature = "consensus")]
+pub use crate::commands::duplex_metrics::DuplexMetricsOptions;
 pub use crate::commands::extract::ExtractOptions;
 pub use crate::commands::fastq::FastqOptions;
 pub use crate::commands::filter::FilterOptions;
@@ -21,6 +23,8 @@ pub use crate::commands::group::GroupOptions;
 pub use crate::commands::retag::RetagOptions;
 #[cfg(feature = "consensus")]
 pub use crate::commands::simplex::SimplexOptions;
+#[cfg(feature = "consensus")]
+pub use crate::commands::simplex_metrics::SimplexMetricsOptions;
 pub use crate::commands::sort::SortOptions;
 pub use crate::commands::zipper::ZipperOptions;
 
@@ -93,6 +97,19 @@ pub struct StageOptionsBag {
     /// knobs via `--simplex::*` through `MultiSimplexOptions`.
     #[cfg(feature = "consensus")]
     pub simplex: Option<SimplexOptions>,
+    /// Simplex-metrics options: the QC-only terminal stage (`Stage::Metrics`
+    /// with the simplex slot filled). Carries the output prefix, `--min-reads`,
+    /// and optional `--intervals`; no consensus calling. Duplex fills its own
+    /// slot instead — the metrics stage picks simplex vs duplex by which of the
+    /// two is `Some`.
+    #[cfg(feature = "consensus")]
+    pub simplex_metrics: Option<SimplexMetricsOptions>,
+    /// Duplex-metrics options: the QC-only terminal stage (`Stage::Metrics` with
+    /// the duplex slot filled). Carries the output prefix, AB/BA thresholds,
+    /// duplex-UMI-counts flag, and optional `--intervals`. Simplex fills its own
+    /// slot instead; the metrics stage picks duplex when this slot is `Some`.
+    #[cfg(feature = "consensus")]
+    pub duplex_metrics: Option<DuplexMetricsOptions>,
     /// Align (`AlignAndMerge`) options. Carries [`AlignerOptions`] +
     /// reference path + optional aligner-binary override.
     pub aligner: Option<AlignOptions>,

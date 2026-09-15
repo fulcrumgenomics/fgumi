@@ -51,6 +51,11 @@ fn stage_ord(stage: Stage) -> usize {
         // Terminal BAM→FASTQ export. Only ever appears as the sole stage of a
         // `fgumi fastq` chain, so its rank is nominal; place it last.
         Stage::Fastq => 9,
+        // Terminal QC-metrics collection. Standalone-only (the sole stage of a
+        // `simplex-metrics`/`duplex-metrics` chain), so its rank is nominal —
+        // `validate_stage_progression` rejects any multi-stage chain containing
+        // it before the ordering loop runs. Place it last.
+        Stage::Metrics => 10,
     }
 }
 
@@ -107,6 +112,20 @@ pub fn validate_stage_progression(spec: &ChainSpec) -> Result<()> {
         bail!(
             "Stage::CopyUmi is standalone-only: it must be the sole stage of a chain, \
              but got a {}-stage chain containing CopyUmi ({stages:?})",
+            stages.len(),
+        );
+    }
+
+    // Metrics is standalone-only for the same reason as Retag/CopyUmi: it is
+    // only ever the sole stage of a `simplex-metrics`/`duplex-metrics` chain
+    // (routed via `ChainSpec::single_stage_metrics`). It is a terminal QC sink
+    // that writes no BAM, so no stage can follow it and none needs to precede
+    // it. Reject any multi-stage chain containing it here, ahead of the ordering
+    // loop, so the message is precise.
+    if stages.len() > 1 && stages.contains(&Stage::Metrics) {
+        bail!(
+            "Stage::Metrics is standalone-only: it must be the sole stage of a chain, \
+             but got a {}-stage chain containing Metrics ({stages:?})",
             stages.len(),
         );
     }
@@ -231,6 +250,11 @@ pub fn validate_stage_opts_present(spec: &ChainSpec) -> Result<()> {
             Stage::Clip => bag.clip.is_some(),
             #[cfg(feature = "consensus")]
             Stage::Simplex => bag.simplex.is_some(),
+            // Metrics is satisfied by EITHER metrics slot: simplex-metrics fills
+            // `simplex_metrics`, duplex-metrics fills `duplex_metrics`. The
+            // add_metrics builder picks which by inspecting the same slots.
+            #[cfg(feature = "consensus")]
+            Stage::Metrics => bag.simplex_metrics.is_some() || bag.duplex_metrics.is_some(),
             // Without the `consensus` feature the consensus option-bag slots do
             // not exist, so this stage can never be satisfied. Bail with an
             // explicit feature-disabled error rather than returning `false`,
@@ -239,7 +263,7 @@ pub fn validate_stage_opts_present(spec: &ChainSpec) -> Result<()> {
             // do not exist. Unreachable in practice — the consensus CLI commands
             // are compiled out too — but the message is correct if reached.
             #[cfg(not(feature = "consensus"))]
-            Stage::Duplex | Stage::Codec | Stage::Simplex => {
+            Stage::Duplex | Stage::Codec | Stage::Simplex | Stage::Metrics => {
                 bail!("Stage {stage:?} requires building fgumi with the `consensus` feature");
             }
             Stage::Align => bag.aligner.is_some(),
@@ -284,6 +308,49 @@ pub fn validate_stage_opts_present(spec: &ChainSpec) -> Result<()> {
 /// input BAM header) — it cannot be determined from `spec.stages` alone,
 /// so it intentionally stays out of this validator.
 ///
+/// Enforce that the sink kind agrees with the terminal stage for the two
+/// non-BAM sink shapes:
+///
+/// - **Rule 5**: `SinkSpec::Fastq`/`FastqPaired` ⟺ terminal `Stage::Fastq`. A
+///   FASTQ sink pushes raw bytes with no BAM header, and `Stage::Fastq` emits
+///   FASTQ text, not serialized BAM records — pairing either with the other
+///   format's counterpart would silently write a corrupt file.
+/// - **Rule 5b**: `SinkSpec::None` ⟺ terminal `Stage::Metrics`. `Stage::Metrics`
+///   terminates the chain at its own `Outputs = ()` sink step and writes only
+///   TSVs (via a finalize hook), so `add_sink` must be a no-op; a file sink
+///   would append a `WriteBgzfFile` with no producer, and a `None` sink with any
+///   BAM/FASTQ-emitting terminal would silently drop that stage's output.
+///
+/// # Errors
+///
+/// Returns an error on the first violated biconditional.
+fn validate_sink_terminal_biconditionals(spec: &ChainSpec) -> Result<()> {
+    use crate::pipeline::chains::SinkSpec;
+
+    let sink_is_fastq = matches!(spec.sink, SinkSpec::Fastq(_) | SinkSpec::FastqPaired { .. });
+    let terminal_is_fastq = spec.stages.last() == Some(&Stage::Fastq);
+    if sink_is_fastq != terminal_is_fastq {
+        bail!(
+            "SinkSpec::Fastq requires Stage::Fastq as the terminal chain stage and vice versa; \
+             got sink={:?}, terminal stage={:?}",
+            spec.sink,
+            spec.stages.last()
+        );
+    }
+
+    let sink_is_none = matches!(spec.sink, SinkSpec::None);
+    let terminal_is_metrics = spec.stages.last() == Some(&Stage::Metrics);
+    if sink_is_none != terminal_is_metrics {
+        bail!(
+            "SinkSpec::None requires Stage::Metrics as the terminal chain stage and vice versa; \
+             got sink={:?}, terminal stage={:?}",
+            spec.sink,
+            spec.stages.last()
+        );
+    }
+    Ok(())
+}
+
 /// # Errors
 ///
 /// Returns an error on the first violated constraint.
@@ -448,14 +515,21 @@ pub fn validate_cross_stage_constraints(spec: &ChainSpec) -> Result<()> {
     // either with the other format's counterpart would silently write a
     // corrupt file (FASTQ text wrapped in a BAM header, or BAM bytes with no
     // header). Require the biconditional.
-    let sink_is_fastq = matches!(spec.sink, SinkSpec::Fastq(_) | SinkSpec::FastqPaired { .. });
-    let terminal_is_fastq = spec.stages.last() == Some(&Stage::Fastq);
-    if sink_is_fastq != terminal_is_fastq {
+    // Rules 5 / 5b: the sink kind and the terminal stage must agree for the two
+    // non-BAM sink shapes (FASTQ export, metrics-only). Extracted so this
+    // function stays under the line cap and the two biconditionals live together.
+    validate_sink_terminal_biconditionals(spec)?;
+
+    // Rule 5c: a `Stage::Metrics` chain fills exactly one metrics options slot.
+    // The two standalone commands each fill exactly one, and `add_metrics`'s
+    // `duplex`-first selection would silently ignore the simplex options if both
+    // were set — so reject a both-filled bag as a framework bug rather than let
+    // it resolve by precedence.
+    #[cfg(feature = "consensus")]
+    if spec.stage_opts.simplex_metrics.is_some() && spec.stage_opts.duplex_metrics.is_some() {
         bail!(
-            "SinkSpec::Fastq requires Stage::Fastq as the terminal chain stage and vice versa; \
-             got sink={:?}, terminal stage={:?}",
-            spec.sink,
-            spec.stages.last()
+            "Stage::Metrics has both simplex_metrics and duplex_metrics set in the \
+             StageOptionsBag; exactly one must be filled"
         );
     }
 
@@ -594,7 +668,12 @@ fn reject_telemetry_collisions(spec: &ChainSpec) -> Result<()> {
     // itself skips stdout / null-device targets, so they need no pre-filter
     // here — a telemetry TSV is always an on-disk file and cannot collide with
     // stdout anyway.
-    let mut targets: Vec<(&std::path::Path, &str)> = vec![(spec.sink.path().as_path(), "--output")];
+    let mut targets: Vec<(&std::path::Path, &str)> = Vec::new();
+    // A `SinkSpec::None` (metrics) chain writes no BAM; its TSV outputs are
+    // guarded by the command layer, not here.
+    if let Some(output) = spec.sink.path() {
+        targets.push((output.as_path(), "--output"));
+    }
     if let SinkSpec::FastqPaired { out2, out0, .. } = &spec.sink {
         targets.push((out2.as_path(), "--output (read 2)"));
         if let Some(out0) = out0 {
@@ -1227,6 +1306,75 @@ mod tests {
         assert!(matches!(spec.sink, SinkSpec::Bam(_)), "precondition: default sink is Bam");
         let err = validate_cross_stage_constraints(&spec).unwrap_err();
         assert!(err.to_string().contains("Stage::Fastq"), "got: {err}");
+    }
+
+    /// Metrics is standalone-only (mirrors Retag/CopyUmi): a multi-stage chain
+    /// containing `Stage::Metrics`, in either order, is rejected by
+    /// `validate_stage_progression` before the ordering loop.
+    #[rstest]
+    #[case::sort_then_metrics(vec![Stage::Sort, Stage::Metrics])]
+    #[case::metrics_then_sort(vec![Stage::Metrics, Stage::Sort])]
+    #[case::group_then_metrics(vec![Stage::Group, Stage::Metrics])]
+    fn metrics_multi_stage_rejected(#[case] stages: Vec<Stage>) {
+        let err = validate_stage_progression(&empty_spec(stages)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Metrics"), "expected Metrics in error, got: {msg}");
+        assert!(
+            msg.contains("standalone-only"),
+            "expected the standalone-only rejection, got: {msg}"
+        );
+    }
+
+    /// Rule 5b, both directions of the `SinkSpec::None` ⟺ terminal
+    /// `Stage::Metrics` biconditional. A `None` sink on a non-metrics terminal,
+    /// and a metrics terminal on a non-`None` sink, must each be rejected — a
+    /// mismatch would either append a `WriteBgzfFile` with no producer or
+    /// silently drop the terminal stage's output.
+    #[test]
+    fn cross_stage_none_sink_requires_metrics_terminal() {
+        // None sink with a non-metrics terminal (Group) → rejected.
+        let mut none_on_group = empty_spec(vec![Stage::Group]);
+        none_on_group.sink = SinkSpec::None;
+        let err = validate_sink_terminal_biconditionals(&none_on_group).unwrap_err();
+        assert!(err.to_string().contains("SinkSpec::None"), "got: {err}");
+
+        // Metrics terminal with a non-None sink (default Bam) → rejected.
+        let metrics_on_bam = empty_spec(vec![Stage::Metrics]);
+        assert!(matches!(metrics_on_bam.sink, SinkSpec::Bam(_)), "precondition: default Bam sink");
+        let err = validate_sink_terminal_biconditionals(&metrics_on_bam).unwrap_err();
+        assert!(err.to_string().contains("SinkSpec::None"), "got: {err}");
+
+        // The matched pair (None sink + Metrics terminal) is accepted.
+        let mut matched = empty_spec(vec![Stage::Metrics]);
+        matched.sink = SinkSpec::None;
+        assert!(validate_sink_terminal_biconditionals(&matched).is_ok());
+    }
+
+    /// Rule 5c: a metrics chain with BOTH options slots filled is rejected as a
+    /// framework bug — the two standalone commands each fill exactly one, and a
+    /// both-filled bag would otherwise resolve by silent `duplex`-first
+    /// precedence in `add_metrics`.
+    #[test]
+    #[cfg(feature = "consensus")]
+    fn cross_stage_metrics_rejects_both_slots_filled() {
+        use crate::commands::duplex_metrics::DuplexMetricsOptions;
+        use crate::commands::simplex_metrics::SimplexMetricsOptions;
+        let mut spec = empty_spec(vec![Stage::Metrics]);
+        spec.sink = SinkSpec::None;
+        spec.stage_opts.simplex_metrics =
+            Some(SimplexMetricsOptions { output: PathBuf::from("out"), min_reads: 1, intervals: None });
+        spec.stage_opts.duplex_metrics = Some(DuplexMetricsOptions {
+            output: PathBuf::from("out"),
+            min_ab_reads: 1,
+            min_ba_reads: 1,
+            duplex_umi_counts: false,
+            intervals: None,
+        });
+        let err = validate_cross_stage_constraints(&spec).unwrap_err();
+        assert!(
+            err.to_string().contains("both simplex_metrics and duplex_metrics"),
+            "got: {err}"
+        );
     }
 
     // --- Rule 3b: inline-index `.bai` sidecar collision ---
