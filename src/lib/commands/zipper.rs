@@ -615,6 +615,9 @@ fn merge_raw_with(
 
     // Steps 3–4: Copy tags from unmapped to mapped, transfer QC flags
     let has_transforms = tags.has_transforms;
+    // Reusable aux scratch buffer for the single-pass copy/normalize helpers,
+    // so those hot per-record rebuilds don't each allocate.
+    let mut merge_scratch: Vec<u8> = Vec::new();
     for u in unmapped.primary_reads() {
         let u_flags = RawRecordView::new(u).flags();
         let is_unpaired = (u_flags & fgumi_raw_bam::flags::PAIRED) == 0;
@@ -627,14 +630,13 @@ fn merge_raw_with(
         let u_tags: Vec<fgumi_raw_bam::TagEntry<'_>> =
             RawRecordView::new(u).tags().iter().collect();
 
-        // Pre-filter the copy set by the strand-independent conditions (skip the
-        // configured remove-set). `PG` is additionally skipped per record when
-        // the destination already carries a `PG`, so it is filtered below.
-        // `adds_no_pg` is the copy set for a destination that already has `PG`.
+        // The copy set: the unmapped read's tags minus the configured
+        // remove-set. `PG` precedence (drop the unmapped `PG` when the mapped
+        // read already has one) is resolved per record inside
+        // `copy_unmapped_tags_single_pass`, in the same walk that copies the
+        // tags — so there is no separate `has_pg` aux scan.
         let adds_all: Vec<fgumi_raw_bam::TagEntry<'_>> =
             u_tags.iter().copied().filter(|e| !tags.remove.contains(e.tag)).collect();
-        let adds_no_pg: Vec<fgumi_raw_bam::TagEntry<'_>> =
-            adds_all.iter().copied().filter(|e| e.tag != *SamTag::PG).collect();
 
         // Nothing to copy from this unmapped read: skip the per-record rebuild
         // (an alloc + splice that would only re-emit the aux unchanged). The QC
@@ -648,37 +650,42 @@ fn merge_raw_with(
             continue;
         }
 
-        // Copy tags to each mapped record via one aux rebuild: drop the copied
-        // keys from the survivors (upsert) and append them, replacing the old
-        // per-tag `remove_tag`+`append` loop. Negative-strand reverse/revcomp
-        // then runs as a separate pass over the just-appended tags — behaviour
-        // identical to the interleaved form, since each transform locates its
-        // tag by key on the rebuilt aux.
+        // Copy tags to each mapped record in one aux walk: drop the copied keys
+        // from the survivors (upsert), keep the mapped `PG`, and append the copy
+        // set. Negative-strand reverse/revcomp then runs as a separate pass over
+        // the just-appended tags — behaviour identical to the interleaved form,
+        // since each transform locates its tag by key on the rebuilt aux.
         let rr = mapped.records_mut();
         for &i in &mapped_indices {
             let is_reverse =
                 (RawRecordView::new(&rr[i]).flags() & fgumi_raw_bam::flags::REVERSE) != 0;
-            let has_pg =
-                fgumi_raw_bam::find_tag_type(fgumi_raw_bam::aux_data_slice(&rr[i]), SamTag::PG)
-                    .is_some();
-            let adds: &[fgumi_raw_bam::TagEntry<'_>] = if has_pg { &adds_no_pg } else { &adds_all };
 
-            fgumi_raw_bam::RawTagsEditor::from_vec(rr[i].as_mut_vec())
-                .rebuild_with(&[] as &[[u8; 2]], adds);
+            let saw_pg =
+                copy_unmapped_tags_single_pass(rr[i].as_mut_vec(), &adds_all, &mut merge_scratch);
 
             if is_reverse && has_transforms {
                 // Aux offset is stable across the transforms below: they only
                 // reorder bytes within a tag value, never change the aux length.
                 let aux_offset =
                     fgumi_raw_bam::aux_data_offset_from_record(&rr[i]).unwrap_or(rr[i].len());
-                for (idx, entry) in adds.iter().enumerate() {
-                    // `rebuild_with` deduped `adds` last-wins, so the rebuilt aux
-                    // holds one physical entry per key. Skip any add whose key
+                for (idx, entry) in adds_all.iter().enumerate() {
+                    // Transform only the tags actually copied from the unmapped
+                    // read. When the mapped read already carried `PG`, its own
+                    // `PG` survived and the unmapped `PG` was dropped on copy, so
+                    // that key is not part of the copied set — skip it, matching
+                    // the pre-refactor code, which iterated the PG-filtered add
+                    // set in that case (otherwise a `PG` in the reverse/revcomp
+                    // set would transform the mapped read's own `PG`).
+                    if saw_pg && entry.tag == *SamTag::PG {
+                        continue;
+                    }
+                    // The copy pass deduped `adds_all` last-wins, so the rebuilt
+                    // aux holds one physical entry per key. Skip any add whose key
                     // recurs later so the involutive reverse/revcomp is applied
                     // exactly once (mirroring the dedup) — applying it twice on a
                     // duplicate key would be a net no-op and diverge from the old
                     // per-entry idiom.
-                    if adds[idx + 1..].iter().any(|b| b.tag == entry.tag) {
+                    if adds_all[idx + 1..].iter().any(|b| b.tag == entry.tag) {
                         continue;
                     }
                     if tags.reverse.contains(entry.tag) {
@@ -708,10 +715,11 @@ fn merge_raw_with(
         }
     }
 
-    // Step 5: Normalize AS/XS tags
+    // Step 5: Normalize AS/XS tags to smallest-signed encoding in a single aux
+    // walk per record (replacing two `normalize_int_tag_to_smallest_signed`
+    // calls, i.e. four aux scans).
     for record in mapped.records_mut().iter_mut() {
-        fgumi_raw_bam::normalize_int_tag_to_smallest_signed(record.as_mut_vec(), SamTag::AS);
-        fgumi_raw_bam::normalize_int_tag_to_smallest_signed(record.as_mut_vec(), SamTag::XS);
+        normalize_as_xs_single_pass(record.as_mut_vec(), &mut merge_scratch);
     }
 
     // Step 6: Add tc (template coordinate) tags
@@ -732,6 +740,160 @@ fn transfer_qc_flag(record: &mut RawRecord, is_qc_fail: bool) {
         f &= !fgumi_raw_bam::flags::QC_FAIL;
     }
     fgumi_raw_bam::set_flags(record, f);
+}
+
+/// Appends one aux entry (2-byte tag, type byte, value bytes) to `buf` in
+/// on-disk order. Shared by the single-pass merge helpers below so the entry
+/// serialization lives in one place. (The generic survivor-copy/append machinery
+/// is `RawTagsEditor::rebuild_with`; these helpers cannot simply call it because
+/// each needs per-entry decisions inside the walk — PG precedence, AS/XS decode
+/// — and a caller-owned scratch buffer to avoid a per-record allocation.)
+#[inline]
+fn push_aux_entry(buf: &mut Vec<u8>, tag: [u8; 2], type_byte: u8, value_bytes: &[u8]) {
+    buf.push(tag[0]);
+    buf.push(tag[1]);
+    buf.push(type_byte);
+    buf.extend_from_slice(value_bytes);
+}
+
+/// Single-walk replacement for the zipper tag-copy step (Steps 3–4). Copies the
+/// mapped record's existing tags, appends `adds` (the unmapped read's tags,
+/// already filtered by the remove-set), and resolves `PG` precedence in the same
+/// pass — the mapped read's own `PG` is kept and the unmapped `PG` dropped — so
+/// no separate `has_pg` aux scan is needed. Returns whether the mapped record
+/// already carried a `PG` (so the caller can keep the reverse/revcomp transform
+/// off that surviving `PG`, matching the pre-refactor PG-filtered add set).
+///
+/// Upsert semantics match `rebuild_with`: an added key already present among the
+/// survivors is replaced by the appended value (last-wins within `adds`), except
+/// `PG`, where the survivor wins. `scratch` is reused across records to avoid a
+/// per-record allocation. Callers must have already applied the remove-set
+/// (Step 2) and must not call this with an empty `adds`.
+///
+/// Like [`fgumi_raw_bam::RawTagsEditor::rebuild_with`], the survivor walk stops
+/// at the first malformed aux entry and drops the unparseable tail (the same
+/// fail-closed tolerance as `AuxTagsIter`); a spec-conforming record is copied
+/// byte-for-byte.
+fn copy_unmapped_tags_single_pass(
+    record: &mut Vec<u8>,
+    adds: &[fgumi_raw_bam::TagEntry<'_>],
+    scratch: &mut Vec<u8>,
+) -> bool {
+    let pg = *SamTag::PG;
+    let off = fgumi_raw_bam::aux_data_offset_from_record(record)
+        .unwrap_or(record.len())
+        .min(record.len());
+    scratch.clear();
+
+    // Copy survivors, dropping any key that will be re-appended from `adds`
+    // (upsert), except `PG` — the mapped read's own `PG` is kept and its
+    // presence recorded so the unmapped `PG` is skipped on append.
+    let mut saw_pg = false;
+    for entry in &fgumi_raw_bam::RawTagsView::new(&record[off..]) {
+        if entry.tag == pg {
+            saw_pg = true;
+        } else if adds.iter().any(|a| a.tag == entry.tag) {
+            continue;
+        }
+        push_aux_entry(scratch, entry.tag, entry.type_byte, entry.value_bytes);
+    }
+    // Append `adds` (last-wins on a duplicate key), skipping the unmapped `PG`
+    // when the mapped read already carries one.
+    for (idx, a) in adds.iter().enumerate() {
+        if a.tag == pg && saw_pg {
+            continue;
+        }
+        if adds[idx + 1..].iter().any(|b| b.tag == a.tag) {
+            continue;
+        }
+        push_aux_entry(scratch, a.tag, a.type_byte, a.value_bytes);
+    }
+    record.truncate(off);
+    record.extend_from_slice(scratch);
+    saw_pg
+}
+
+/// Single-walk replacement for the two `normalize_int_tag_to_smallest_signed`
+/// calls (AS then XS) in Step 5. Walks the record's aux once, dropping `AS`/`XS`
+/// only when they are integer tags whose value fits `i32` (the case
+/// `normalize_int_tag_to_smallest_signed` rewrites), then re-appends them at the
+/// end in smallest-signed encoding, `AS` before `XS`. A non-integer or
+/// out-of-`i32`-range `AS`/`XS` is left in place, exactly as
+/// `normalize_int_tag_to_smallest_signed` does; and when neither `AS` nor `XS`
+/// needs re-encoding the record is left completely untouched (no rewrite),
+/// matching the old find-miss early return. `scratch` is reused across records.
+///
+/// For a spec-conforming record (each tag key at most once) this is
+/// byte-identical to the two sequential normalize calls. It differs only on an
+/// out-of-spec aux: a duplicate `AS`/`XS` collapses to a single **last-wins**
+/// entry — the last occurrence survives regardless of its type, and every
+/// earlier occurrence is dropped (so a mixed-type duplicate like `AS:i:7,AS:Z:x`
+/// yields one `AS:Z:x`, not two entries with the earlier integer winning). When
+/// a re-encode or a duplicate drop occurs, a malformed tail after the last kept
+/// entry is dropped (fail-closed, as in `rebuild_with`).
+fn normalize_as_xs_single_pass(record: &mut Vec<u8>, scratch: &mut Vec<u8>) {
+    let as_tag = *SamTag::AS;
+    let xs_tag = *SamTag::XS;
+    let off = fgumi_raw_bam::aux_data_offset_from_record(record)
+        .unwrap_or(record.len())
+        .min(record.len());
+    scratch.clear();
+
+    // Prescan for the index of the LAST occurrence of AS and of XS. Out-of-spec
+    // input can repeat a key; last-wins needs to know which occurrence survives
+    // before the copy walk decides what to drop.
+    let (mut as_last_idx, mut xs_last_idx): (Option<usize>, Option<usize>) = (None, None);
+    for (idx, entry) in fgumi_raw_bam::RawTagsView::new(&record[off..]).iter().enumerate() {
+        if entry.tag == as_tag {
+            as_last_idx = Some(idx);
+        } else if entry.tag == xs_tag {
+            xs_last_idx = Some(idx);
+        }
+    }
+
+    let mut as_norm: Option<i32> = None;
+    let mut xs_norm: Option<i32> = None;
+    // Set once the scratch will differ from the original: an AS/XS occurrence was
+    // dropped (a superseded duplicate) or normalized to smallest-signed.
+    let mut changed = false;
+    for (idx, entry) in fgumi_raw_bam::RawTagsView::new(&record[off..]).iter().enumerate() {
+        if entry.tag == as_tag || entry.tag == xs_tag {
+            let last_idx = if entry.tag == as_tag { as_last_idx } else { xs_last_idx };
+            // Drop every occurrence of the key except the last (last-wins).
+            if Some(idx) != last_idx {
+                changed = true;
+                continue;
+            }
+            let fit = fgumi_raw_bam::decode_int_value(entry.type_byte, entry.value_bytes)
+                .and_then(|v| i32::try_from(v).ok());
+            if let Some(v) = fit {
+                if entry.tag == as_tag {
+                    as_norm = Some(v);
+                } else {
+                    xs_norm = Some(v);
+                }
+                changed = true;
+                continue; // drop; re-appended normalized at the end
+            }
+            // Surviving occurrence is not an in-range integer: leave it in place
+            // (fall through to copy), preserving its position for a lone tag.
+        }
+        push_aux_entry(scratch, entry.tag, entry.type_byte, entry.value_bytes);
+    }
+    // Nothing changed: leave the record byte-for-byte untouched, matching the old
+    // normalize calls' find-miss early return (and preserving any trailing bytes
+    // the survivor walk would otherwise have dropped).
+    if !changed {
+        return;
+    }
+    if let Some(v) = as_norm {
+        fgumi_raw_bam::append_signed_int_tag(scratch, SamTag::AS, v);
+    }
+    if let Some(v) = xs_norm {
+        fgumi_raw_bam::append_signed_int_tag(scratch, SamTag::XS, v);
+    }
+    record.truncate(off);
+    record.extend_from_slice(scratch);
 }
 
 /// Applies the appropriate reverse operation for a tag in-place, dispatching on BAM type byte.
@@ -1991,6 +2153,174 @@ mod tests {
     fn to_record_buf(raw: RawRecord) -> RecordBuf {
         fgumi_raw_bam::raw_record_to_record_buf(&raw, &noodles::sam::Header::default())
             .expect("raw_record_to_record_buf failed")
+    }
+
+    // ===== direct unit tests for the single-pass merge helpers =====
+
+    /// Build a minimal mapped record (unpaired, mapped) carrying the given
+    /// string tags, and return its raw BAM bytes for the single-pass helpers.
+    fn raw_record_with_string_tags(tags: &[(SamTag, &[u8])]) -> Vec<u8> {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"r")
+            .flags(0)
+            .ref_id(0)
+            .pos(0)
+            .mapq(60)
+            .cigar_ops(&[encode_op(0, 4)])
+            .sequence(b"ACGT")
+            .qualities(&[30u8; 4]);
+        for (tag, val) in tags {
+            b.add_string_tag(*tag, val);
+        }
+        b.build().as_ref().to_vec()
+    }
+
+    /// The string value of `tag` in a raw record's aux, or `None`.
+    fn string_tag(record: &[u8], tag: SamTag) -> Option<Vec<u8>> {
+        let aux = fgumi_raw_bam::aux_data_slice(record);
+        fgumi_raw_bam::find_string_tag(aux, tag).map(<[u8]>::to_vec)
+    }
+
+    /// `copy_unmapped_tags_single_pass` upserts a key present on both the mapped
+    /// survivor and the unmapped copy set: the appended (unmapped) value wins and
+    /// there is exactly one copy — the byte-identity-critical collision path.
+    #[test]
+    fn copy_single_pass_upserts_a_key_on_both_survivor_and_adds() {
+        let mut rec = raw_record_with_string_tags(&[(SamTag::RX, b"OLD"), (SamTag::MI, b"mol1")]);
+        let adds = [fgumi_raw_bam::TagEntry {
+            tag: *SamTag::RX,
+            type_byte: b'Z',
+            value_bytes: b"NEW\x00",
+        }];
+        let mut scratch = Vec::new();
+
+        let saw_pg = copy_unmapped_tags_single_pass(&mut rec, &adds, &mut scratch);
+        assert!(!saw_pg, "no PG on the mapped read");
+        assert_eq!(
+            string_tag(&rec, SamTag::RX).as_deref(),
+            Some(&b"NEW"[..]),
+            "upserted value wins"
+        );
+        assert_eq!(
+            string_tag(&rec, SamTag::MI).as_deref(),
+            Some(&b"mol1"[..]),
+            "other survivor kept"
+        );
+        // Exactly one RX (survivor dropped, add appended once).
+        let n_rx = fgumi_raw_bam::RawTagsView::new(fgumi_raw_bam::aux_data_slice(&rec))
+            .iter()
+            .filter(|e| e.tag == *SamTag::RX)
+            .count();
+        assert_eq!(n_rx, 1, "exactly one RX after upsert");
+    }
+
+    /// PG precedence: the mapped read's own PG is kept, the unmapped PG is
+    /// dropped, and the helper reports `saw_pg = true` so the caller keeps the
+    /// reverse/revcomp transform off that surviving PG.
+    #[test]
+    fn copy_single_pass_keeps_mapped_pg_and_reports_saw_pg() {
+        let mut rec = raw_record_with_string_tags(&[(SamTag::PG, b"mapped-pg")]);
+        let adds = [
+            fgumi_raw_bam::TagEntry {
+                tag: *SamTag::PG,
+                type_byte: b'Z',
+                value_bytes: b"unmapped-pg\x00",
+            },
+            fgumi_raw_bam::TagEntry { tag: *SamTag::RX, type_byte: b'Z', value_bytes: b"AC\x00" },
+        ];
+        let mut scratch = Vec::new();
+
+        let saw_pg = copy_unmapped_tags_single_pass(&mut rec, &adds, &mut scratch);
+        assert!(saw_pg, "mapped read carried PG");
+        assert_eq!(
+            string_tag(&rec, SamTag::PG).as_deref(),
+            Some(&b"mapped-pg"[..]),
+            "mapped PG kept"
+        );
+        assert_eq!(string_tag(&rec, SamTag::RX).as_deref(), Some(&b"AC"[..]), "non-PG tag copied");
+    }
+
+    /// `normalize_as_xs_single_pass` re-encodes AS/XS to smallest-signed, appends
+    /// them AS-before-XS, and leaves a non-integer AS in place.
+    #[test]
+    fn normalize_single_pass_reencodes_and_orders_as_before_xs() {
+        // AS=77 (Int32) -> Int8; XS=200 (Int32) -> Int16.
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"r")
+            .flags(0)
+            .ref_id(0)
+            .pos(0)
+            .mapq(60)
+            .cigar_ops(&[encode_op(0, 4)])
+            .sequence(b"ACGT")
+            .qualities(&[30u8; 4]);
+        b.add_int_tag(SamTag::AS, 77);
+        b.add_int_tag(SamTag::XS, 200);
+        let mut rec = b.build().as_ref().to_vec();
+        let mut scratch = Vec::new();
+
+        normalize_as_xs_single_pass(&mut rec, &mut scratch);
+
+        let entries: Vec<[u8; 2]> =
+            fgumi_raw_bam::RawTagsView::new(fgumi_raw_bam::aux_data_slice(&rec))
+                .iter()
+                .map(|e| e.tag)
+                .collect();
+        let as_pos = entries.iter().position(|t| *t == *SamTag::AS).unwrap();
+        let xs_pos = entries.iter().position(|t| *t == *SamTag::XS).unwrap();
+        assert!(as_pos < xs_pos, "AS re-appended before XS");
+        let aux = fgumi_raw_bam::aux_data_slice(&rec);
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux, SamTag::AS), Some(77));
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux, SamTag::XS), Some(200));
+        // Smallest-signed types: AS -> 'c' (i8), XS -> 's' (i16).
+        assert_eq!(fgumi_raw_bam::find_tag_type(aux, SamTag::AS), Some(b'c'));
+        assert_eq!(fgumi_raw_bam::find_tag_type(aux, SamTag::XS), Some(b's'));
+    }
+
+    /// A record with no AS/XS is left byte-for-byte untouched (no rewrite),
+    /// matching the old normalize find-miss early return.
+    #[test]
+    fn normalize_single_pass_leaves_records_without_as_xs_untouched() {
+        let mut rec = raw_record_with_string_tags(&[(SamTag::RX, b"AC"), (SamTag::MI, b"mol1")]);
+        let before = rec.clone();
+        let mut scratch = Vec::new();
+        normalize_as_xs_single_pass(&mut rec, &mut scratch);
+        assert_eq!(rec, before, "record without AS/XS must be untouched");
+    }
+
+    /// Out-of-spec: a record with a duplicate `AS` whose occurrences differ in
+    /// type (`AS:i:7` then `AS:Z:x`). Last-wins must hold — the output carries
+    /// exactly one `AS`, equal to the LAST occurrence (`AS:Z:x`), never both and
+    /// never the earlier integer. The single-pass form previously copied the
+    /// trailing string AND re-appended the earlier normalized integer, emitting
+    /// two `AS` entries and letting the earlier value win.
+    #[test]
+    fn normalize_single_pass_duplicate_as_mixed_type_keeps_last_wins() {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"r")
+            .flags(0)
+            .ref_id(0)
+            .pos(0)
+            .mapq(60)
+            .cigar_ops(&[encode_op(0, 4)])
+            .sequence(b"ACGT")
+            .qualities(&[30u8; 4]);
+        b.add_int_tag(SamTag::AS, 7);
+        b.add_string_tag(SamTag::AS, b"x");
+        let mut rec = b.build().as_ref().to_vec();
+        let mut scratch = Vec::new();
+
+        normalize_as_xs_single_pass(&mut rec, &mut scratch);
+
+        let aux = fgumi_raw_bam::aux_data_slice(&rec);
+        let as_entries: Vec<(u8, Vec<u8>)> = fgumi_raw_bam::RawTagsView::new(aux)
+            .iter()
+            .filter(|e| e.tag == *SamTag::AS)
+            .map(|e| (e.type_byte, e.value_bytes.to_vec()))
+            .collect();
+        assert_eq!(as_entries.len(), 1, "exactly one AS entry (last-wins), got {as_entries:?}");
+        assert_eq!(as_entries[0].0, b'Z', "surviving AS is the trailing string occurrence");
+        assert_eq!(as_entries[0].1, b"x\x00", "surviving AS value is the last occurrence 'x'");
     }
 
     /// Extract `TemplateCoordinateInfo` from a raw BAM record's `tc` tag.
