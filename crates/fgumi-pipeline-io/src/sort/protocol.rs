@@ -82,6 +82,27 @@ impl MemoryChunkErased {
         }
     }
 
+    /// The `i`th record's body length in bytes, WITHOUT touching the shared
+    /// backing buffer (reads only the per-record `len` index).
+    ///
+    /// `SortMerge`'s parallel fast-path gather uses this to plan output-block
+    /// boundaries (a count/byte-cap split matching the serial path exactly) in a
+    /// cheap, cache-friendly scan that stays off the cold arena — the per-record
+    /// arena slice (a cache miss) is then paid only during the parallel gather.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i >= self.len()`.
+    #[must_use]
+    pub fn record_len(&self, i: usize) -> u32 {
+        match self {
+            Self::Coordinate(v) => v.record_len(i),
+            Self::QuerynameLex(v) => v.record_len(i),
+            Self::QuerynameNatural(v) => v.record_len(i),
+            Self::TemplateCoordinate(v) => v.record_len(i),
+        }
+    }
+
     /// The chunk's minimum sort key (`key_at(0)`) as an owned [`RunBound`], or
     /// `None` if the chunk is empty. Records are pre-sorted at seal, so this is
     /// `O(1)`. Used by the arena spill run-former to decide whether this chunk
