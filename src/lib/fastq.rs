@@ -61,6 +61,184 @@ pub struct FastqSegment {
     pub segment_type: SegmentType,
 }
 
+/// A borrowed view of a FASTQ segment: the same information as [`FastqSegment`],
+/// but the bases and qualities are `&[u8]` slices into the source record rather
+/// than owned `Vec<u8>` copies.
+///
+/// This is the zero-copy counterpart used by the extract pipeline hot path
+/// ([`FastqSetView`]). The owned [`FastqSegment`] is retained as the element of
+/// the owned [`FastqSet`] (which the public [`ReadSetIterator`] yields) and for
+/// tests. The byte-parity unit test routes the owned path through views (via
+/// the `#[cfg(test)]` `FastqSetView::from_owned` bridge) so both share one
+/// record-building core and cannot diverge.
+///
+/// Crate-internal: these view types back the extract record builder only and are
+/// not part of the published `fgumi_lib` API (unlike the owned `FastqSegment`).
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub(crate) struct FastqSegmentView<'a> {
+    /// The nucleotide bases of this segment (borrowed from the source record).
+    pub(crate) seq: &'a [u8],
+    /// The Phred-scaled quality scores (borrowed from the source record).
+    pub(crate) quals: &'a [u8],
+    /// The biological/functional type of this segment.
+    pub(crate) segment_type: SegmentType,
+}
+
+/// A borrowed view of a parsed FASTQ read: the header and per-segment bases /
+/// qualities are `&[u8]` slices into the source record(s), so segmenting a read
+/// costs only the small `Vec<FastqSegmentView>` of `(ptr, len, type)` — NOT a
+/// copy of the base/quality bytes.
+///
+/// This is the extract pipeline's hot-path replacement for the owned
+/// [`FastqSet`]: `extract_batch` builds one directly from each source
+/// [`FastqRecord`](crate::fastq_parse::FastqRecord)'s `sequence()`/`quality()`
+/// slices (segments from R1 and R2 pushed into one `segments` vec, replacing the
+/// owned `combine_readsets`), and the record builder consumes it. Because every
+/// consumer of the segments only ever reads them as `&[u8]`, the output is
+/// byte-for-byte identical to the owned path.
+#[derive(PartialEq, Eq, Debug, Clone)]
+pub(crate) struct FastqSetView<'a> {
+    /// The FASTQ header line (without '@' prefix), borrowed from the source.
+    pub(crate) header: &'a [u8],
+    /// Ordered list of borrowed segment views (possibly spanning multiple source
+    /// records, e.g. R1 + R2 appended in input order).
+    pub(crate) segments: Vec<FastqSegmentView<'a>>,
+}
+
+impl<'a> FastqSetView<'a> {
+    /// Segment one source read (`sequence`/`quality`, sharing `header`) against
+    /// `read_structure`, pushing one [`FastqSegmentView`] per segment into `out`
+    /// — zero-copy: each view borrows a span of `sequence`/`quality`.
+    ///
+    /// Applies the exact same length validation and span arithmetic as
+    /// [`FastqSet::from_record_with_structure`], so the segments produced are
+    /// byte-identical; only ownership differs (borrowed spans vs. `to_vec`
+    /// copies). This is the borrowed sibling of that owned constructor, and the
+    /// `view_path_matches_owned_path_byte_for_byte` parity test pins that their
+    /// happy-path and error/skip classifications stay in lock-step.
+    ///
+    /// `skip_reasons` mirrors the owned constructor's parameter for sibling
+    /// parity. On a `TooFewBases` skip, `out` is left unchanged (nothing is
+    /// pushed) and `Ok(())` is returned; unlike the owned path — whose returned
+    /// `FastqSet` records `skip_reason: Some(TooFewBases)` — [`FastqSetView`] has
+    /// no `skip_reason` field, so a caller that supplies a non-empty
+    /// `skip_reasons` detects a skip by observing that `out` did not grow. The
+    /// only current caller (`extract_batch`) passes `&[]`, so this branch is not
+    /// reached in the extract pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `sequence`/`quality` lengths differ, on an over-long
+    /// fully-fixed read, or on too few bases when `TooFewBases` is not in
+    /// `skip_reasons` — identical to
+    /// [`FastqSet::from_record_with_structure`].
+    pub(crate) fn segment_into(
+        header: &'a [u8],
+        sequence: &'a [u8],
+        quality: &'a [u8],
+        read_structure: &ReadStructure,
+        skip_reasons: &[SkipReason],
+        out: &mut Vec<FastqSegmentView<'a>>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            sequence.len() == quality.len(),
+            "Bases (len {}) and qualities (len {}) differ in length for read {}",
+            sequence.len(),
+            quality.len(),
+            String::from_utf8_lossy(header)
+        );
+
+        match read_structure.check_read_length(sequence.len()) {
+            LengthCheck::Ok => {}
+            LengthCheck::TooFew { need } => {
+                if skip_reasons.contains(&SkipReason::TooFewBases) {
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "Read {} had too few bases to demux {} vs. {} needed in read structure {}.",
+                    String::from_utf8_lossy(header),
+                    sequence.len(),
+                    need,
+                    read_structure
+                );
+            }
+            LengthCheck::OverLong { need } => {
+                anyhow::bail!(
+                    "Read {} length {} does not match fixed read structure length {} for {}.",
+                    String::from_utf8_lossy(header),
+                    sequence.len(),
+                    need,
+                    read_structure
+                );
+            }
+        }
+
+        out.reserve(read_structure.number_of_segments());
+        for (segment_index, read_segment) in read_structure.iter().enumerate() {
+            let (start, end) = read_structure.span_of(segment_index, sequence.len());
+            out.push(FastqSegmentView {
+                seq: &sequence[start..end],
+                quals: &quality[start..end],
+                segment_type: read_segment.kind,
+            });
+        }
+        Ok(())
+    }
+
+    /// Iterate the segment views of `kind`, in order (cheap: views are `Copy`).
+    pub(crate) fn segments_of(
+        &self,
+        kind: SegmentType,
+    ) -> impl Iterator<Item = FastqSegmentView<'a>> + '_ {
+        self.segments.iter().copied().filter(move |s| s.segment_type == kind)
+    }
+
+    /// Iterate template segment views.
+    pub(crate) fn template_segments(&self) -> impl Iterator<Item = FastqSegmentView<'a>> + '_ {
+        self.segments_of(SegmentType::Template)
+    }
+
+    /// Iterate sample-barcode segment views.
+    pub(crate) fn sample_barcode_segments(
+        &self,
+    ) -> impl Iterator<Item = FastqSegmentView<'a>> + '_ {
+        self.segments_of(SegmentType::SampleBarcode)
+    }
+
+    /// Iterate molecular-barcode (UMI) segment views.
+    pub(crate) fn molecular_barcode_segments(
+        &self,
+    ) -> impl Iterator<Item = FastqSegmentView<'a>> + '_ {
+        self.segments_of(SegmentType::MolecularBarcode)
+    }
+
+    /// Iterate cell-barcode segment views.
+    pub(crate) fn cell_barcode_segments(&self) -> impl Iterator<Item = FastqSegmentView<'a>> + '_ {
+        self.segments_of(SegmentType::CellularBarcode)
+    }
+
+    /// Build a borrowed view over an owned [`FastqSet`] (zero-copy — the views
+    /// borrow the set's segment `Vec`s). This bridges the `#[cfg(test)]`
+    /// owned-`FastqSet` record builder (`make_raw_records_from_fastq_set`)
+    /// through the same view core as the pipeline's zero-copy path, so the
+    /// byte-parity test cannot let the two diverge. Test-only: it has no
+    /// non-test caller, hence the `#[cfg(test)]` gate.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn from_owned(set: &'a FastqSet) -> Self {
+        let segments = set
+            .segments
+            .iter()
+            .map(|s| FastqSegmentView {
+                seq: s.seq.as_slice(),
+                quals: s.quals.as_slice(),
+                segment_type: s.segment_type,
+            })
+            .collect();
+        Self { header: set.header.as_slice(), segments }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // FastqSet and its impls
 ////////////////////////////////////////////////////////////////////////////////
