@@ -12,10 +12,10 @@ use crate::alignment_tags::regenerate_alignment_tags_raw;
 #[cfg(feature = "consensus")]
 use crate::consensus_filter::resolve_ref_bases_for_record;
 use crate::consensus_filter::{
-    FilterConfig, FilterResult, MethylationDepthThresholds, MethylationTags,
-    check_conversion_fraction_raw_with_ref_bases_and_tags, count_no_calls, filter_duplex_read,
-    filter_read, is_duplex_consensus, mask_bases, mask_duplex_bases,
-    mask_methylation_depth_duplex_raw_with_tags, mask_methylation_depth_simplex_raw_with_tags,
+    ConsensusScalarTags, FilterConfig, FilterResult, MethylationDepthThresholds, MethylationTags,
+    check_conversion_fraction_raw_with_ref_bases_and_tags, count_no_calls, filter_duplex_read_tags,
+    filter_read_tags, mask_bases, mask_duplex_bases, mask_methylation_depth_duplex_raw_with_tags,
+    mask_methylation_depth_simplex_raw_with_tags,
     mask_strand_methylation_agreement_raw_with_ref_bases_and_tags, mean_base_quality_full_length,
 };
 use crate::per_thread_accumulator::PerThreadAccumulator;
@@ -721,9 +721,15 @@ impl Filter {
             0.0
         };
 
+        // Classification needs the scalar consensus tags before masking picks a
+        // path. Masking only rewrites per-base *array* tags (aD_BASES etc.), not
+        // these scalar tags, but `regenerate_alignment_tags_raw` /
+        // `reverse_per_base_tags_raw` below can relayout aux — so the scalar
+        // tags used for the *filter decision* are re-extracted at that point;
+        // this extraction is used only for the pre-mask duplex/simplex split.
         let is_duplex = {
             let aux = fgumi_raw_bam::aux_data_slice(record);
-            is_duplex_consensus(aux)
+            ConsensusScalarTags::from_aux(aux).is_duplex()
         };
 
         let mut masked_count = if is_duplex {
@@ -805,14 +811,21 @@ impl Filter {
         }
 
         let mut pass = {
-            let aux = fgumi_raw_bam::aux_data_slice(record);
+            // Single aux walk for the read-level filter decision, taken after all
+            // record mutations above (masking / tag regeneration / per-base tag
+            // reversal). Replaces the ~9 per-tag `find_*` walks the previous
+            // `check_*_filters_raw(aux, ..)` did.
+            let scalar_tags = {
+                let aux = fgumi_raw_bam::aux_data_slice(record);
+                ConsensusScalarTags::from_aux(aux)
+            };
             if is_duplex {
                 let (cc_thresh, ab_thresh, ba_thresh) = config
                     .duplex_thresholds()
                     .ok_or_else(|| anyhow::anyhow!("No duplex thresholds configured"))?;
                 Self::check_duplex_filters_raw(
                     record,
-                    aux,
+                    &scalar_tags,
                     cc_thresh,
                     ab_thresh,
                     ba_thresh,
@@ -826,7 +839,7 @@ impl Filter {
                     .ok_or_else(|| anyhow::anyhow!("No thresholds configured"))?;
                 Self::check_filters_raw(
                     record,
-                    aux,
+                    &scalar_tags,
                     thresholds,
                     pre_mask_mean_qual,
                     min_mean_base_quality,
@@ -892,13 +905,13 @@ impl Filter {
     /// no-call fraction/count).
     fn check_filters_raw(
         bam: &[u8],
-        aux_data: &[u8],
+        scalar_tags: &ConsensusScalarTags,
         thresholds: &crate::consensus_filter::FilterThresholds,
         mean_qual: f64,
         min_mean_qual: Option<f64>,
         max_no_call_frac: f64,
     ) -> Result<bool> {
-        let filter_result = filter_read(aux_data, thresholds)?;
+        let filter_result = filter_read_tags(scalar_tags, thresholds)?;
         if filter_result != FilterResult::Pass {
             return Ok(false);
         }
@@ -912,7 +925,7 @@ impl Filter {
     #[allow(clippy::too_many_arguments)]
     fn check_duplex_filters_raw(
         bam: &[u8],
-        aux_data: &[u8],
+        scalar_tags: &ConsensusScalarTags,
         cc_thresholds: &crate::consensus_filter::FilterThresholds,
         ab_thresholds: &crate::consensus_filter::FilterThresholds,
         ba_thresholds: &crate::consensus_filter::FilterThresholds,
@@ -921,7 +934,7 @@ impl Filter {
         max_no_call_frac: f64,
     ) -> Result<bool> {
         let filter_result =
-            filter_duplex_read(aux_data, cc_thresholds, ab_thresholds, ba_thresholds)?;
+            filter_duplex_read_tags(scalar_tags, cc_thresholds, ab_thresholds, ba_thresholds)?;
         if filter_result != FilterResult::Pass {
             return Ok(false);
         }
@@ -4494,7 +4507,7 @@ mod tests {
         // Fraction mode: 2/10 = 0.2, threshold = 0.2 => should pass
         let result = Filter::check_filters_raw(
             &raw,
-            aux,
+            &ConsensusScalarTags::from_aux(aux),
             &thresholds,
             crate::consensus_filter::mean_base_quality_full_length(&raw),
             None,
@@ -4505,7 +4518,7 @@ mod tests {
         // Fraction mode: 2/10 = 0.2, threshold = 0.19 => should fail
         let result = Filter::check_filters_raw(
             &raw,
-            aux,
+            &ConsensusScalarTags::from_aux(aux),
             &thresholds,
             crate::consensus_filter::mean_base_quality_full_length(&raw),
             None,
@@ -4538,7 +4551,7 @@ mod tests {
         // Count mode: 3 Ns <= 5.0 threshold => should pass
         let result = Filter::check_filters_raw(
             &raw,
-            aux,
+            &ConsensusScalarTags::from_aux(aux),
             &thresholds,
             crate::consensus_filter::mean_base_quality_full_length(&raw),
             None,
@@ -4549,7 +4562,7 @@ mod tests {
         // Count mode: 3 Ns <= 3.0 threshold => should pass (boundary)
         let result = Filter::check_filters_raw(
             &raw,
-            aux,
+            &ConsensusScalarTags::from_aux(aux),
             &thresholds,
             crate::consensus_filter::mean_base_quality_full_length(&raw),
             None,
@@ -4582,7 +4595,7 @@ mod tests {
         // Count mode: 3 Ns > 2.0 threshold => should fail
         let result = Filter::check_filters_raw(
             &raw,
-            aux,
+            &ConsensusScalarTags::from_aux(aux),
             &thresholds,
             crate::consensus_filter::mean_base_quality_full_length(&raw),
             None,
@@ -4623,7 +4636,7 @@ mod tests {
         // Count mode: 3 Ns <= 5.0 threshold => should pass
         let result = Filter::check_duplex_filters_raw(
             &raw,
-            aux,
+            &ConsensusScalarTags::from_aux(aux),
             &thresholds,
             &thresholds,
             &thresholds,
@@ -4636,7 +4649,7 @@ mod tests {
         // Count mode: 3 Ns > 2.0 threshold => should fail
         let result = Filter::check_duplex_filters_raw(
             &raw,
-            aux,
+            &ConsensusScalarTags::from_aux(aux),
             &thresholds,
             &thresholds,
             &thresholds,

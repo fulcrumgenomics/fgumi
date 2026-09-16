@@ -515,6 +515,187 @@ pub fn is_consensus(aux_data: &[u8]) -> bool {
     is_simplex_consensus(aux_data) || is_duplex_consensus(aux_data)
 }
 
+/// The scalar consensus tags the read-level filter needs, collected in a
+/// **single** pass over a record's aux block.
+///
+/// The classification + filter path previously walked the aux block ~9 times
+/// per record (`is_duplex_consensus` reads aD+bD; `filter_read` reads cD+cE;
+/// `filter_duplex_read` re-reads cD+cE then aD/aM/bD/bM/aE/bE — with aD/bD
+/// scanned up to three times). Each `find_*_tag` restarts at offset 0, so the
+/// cost is `O(tags · aux_len)` per record. This struct collapses those into one
+/// `O(aux_len)` walk that decodes each target tag's value at its first occurrence
+/// — mirroring the existing single-pass
+/// [`fgumi_raw_bam::extract_aux_string_tags`] pattern.
+///
+/// Every value is decoded with the **same** primitives the per-tag `find_*`
+/// functions use (`extract_int_value` and the `f`-type layout), and the walk
+/// mirrors `find_tag_position`'s "resolve on the first occurrence of a tag id,
+/// regardless of its value type" semantics via the `seen` bitset:
+/// a tag is locked to its first entry even when that entry fails to decode, so a
+/// later duplicate cannot override it and a present-but-mistyped `aD`/`bD` still
+/// counts as *present* for [`is_duplex`](Self::is_duplex) exactly as
+/// `find_tag_type` / [`is_duplex_consensus`] treat it. The classification and
+/// threshold decisions are therefore identical to the per-tag path even on
+/// malformed aux; `consensus_scalar_tags_match_find` and
+/// `consensus_scalar_tags_match_find_malformed` pin that equivalence.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConsensusScalarTags {
+    /// `cD` raw-read depth (final consensus), decoded at its first occurrence.
+    cd: Option<i64>,
+    /// `cE` error rate (final consensus).
+    ce: Option<f32>,
+    /// `aD` AB raw-read depth (also drives duplex classification via `seen`).
+    ad: Option<i64>,
+    /// `aM` AB min-depth fallback when `aD` is absent.
+    am: Option<i64>,
+    /// `bD` BA raw-read depth (also drives duplex classification via `seen`).
+    bd: Option<i64>,
+    /// `bM` BA min-depth fallback when `bD` is absent.
+    bm: Option<i64>,
+    /// `aE` AB error rate.
+    ae: Option<f32>,
+    /// `bE` BA error rate.
+    be: Option<f32>,
+    /// Which target tags were *seen* (by tag id, at their first occurrence)
+    /// during the walk, independent of whether the value decoded. Mirrors
+    /// `find_tag_position`'s lock-on-first-occurrence: a set bit both stops a
+    /// later duplicate from overriding the slot and records tag *presence*
+    /// separately from a successful decode (so `is_duplex` matches
+    /// `find_tag_type`'s type-agnostic presence check).
+    seen: u8,
+}
+
+impl ConsensusScalarTags {
+    // `seen` bit per target tag, in the same order as the fields above.
+    const SEEN_CD: u8 = 1 << 0;
+    const SEEN_CE: u8 = 1 << 1;
+    const SEEN_AD: u8 = 1 << 2;
+    const SEEN_AM: u8 = 1 << 3;
+    const SEEN_BD: u8 = 1 << 4;
+    const SEEN_BM: u8 = 1 << 5;
+    const SEEN_AE: u8 = 1 << 6;
+    const SEEN_BE: u8 = 1 << 7;
+
+    /// Collect the scalar consensus tags from `aux_data` in one pass.
+    #[must_use]
+    pub fn from_aux(aux_data: &[u8]) -> Self {
+        let mut out = Self::default();
+        // Decode an `f`-type value at entry offset `p` (value bytes at `p + 3`),
+        // matching `find_float_tag`'s layout and its silent-skip on a short slice.
+        let float_at = |p: usize| -> Option<f32> {
+            aux_data.get(p + 3..p + 7).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+
+        let mut p = 0;
+        while p + 3 <= aux_data.len() {
+            let tag = [aux_data[p], aux_data[p + 1]];
+            let val_type = aux_data[p + 2];
+            // Resolve each tag on its FIRST occurrence by tag id, exactly like
+            // `find_tag_position`. The `seen` bit locks the slot even when the
+            // decode below yields `None` (unexpected value type), so a later
+            // duplicate cannot override it and presence is recorded independently
+            // of a successful decode — keeping the single-pass result identical to
+            // the per-tag `find_int_tag`/`find_float_tag`/`find_tag_type` path.
+            if tag == *SamTag::CD.as_tag_bytes() && out.seen & Self::SEEN_CD == 0 {
+                out.seen |= Self::SEEN_CD;
+                out.cd = bam_fields::extract_int_value(aux_data, p, val_type);
+            } else if tag == *SamTag::CE.as_tag_bytes() && out.seen & Self::SEEN_CE == 0 {
+                out.seen |= Self::SEEN_CE;
+                out.ce = if val_type == b'f' { float_at(p) } else { None };
+            } else if tag == *SamTag::AD.as_tag_bytes() && out.seen & Self::SEEN_AD == 0 {
+                out.seen |= Self::SEEN_AD;
+                out.ad = bam_fields::extract_int_value(aux_data, p, val_type);
+            } else if tag == *SamTag::AM.as_tag_bytes() && out.seen & Self::SEEN_AM == 0 {
+                out.seen |= Self::SEEN_AM;
+                out.am = bam_fields::extract_int_value(aux_data, p, val_type);
+            } else if tag == *SamTag::BD.as_tag_bytes() && out.seen & Self::SEEN_BD == 0 {
+                out.seen |= Self::SEEN_BD;
+                out.bd = bam_fields::extract_int_value(aux_data, p, val_type);
+            } else if tag == *SamTag::BM.as_tag_bytes() && out.seen & Self::SEEN_BM == 0 {
+                out.seen |= Self::SEEN_BM;
+                out.bm = bam_fields::extract_int_value(aux_data, p, val_type);
+            } else if tag == *SamTag::AE.as_tag_bytes() && out.seen & Self::SEEN_AE == 0 {
+                out.seen |= Self::SEEN_AE;
+                out.ae = if val_type == b'f' { float_at(p) } else { None };
+            } else if tag == *SamTag::BE.as_tag_bytes() && out.seen & Self::SEEN_BE == 0 {
+                out.seen |= Self::SEEN_BE;
+                out.be = if val_type == b'f' { float_at(p) } else { None };
+            }
+
+            match bam_fields::tag_value_size(val_type, &aux_data[p + 3..]) {
+                Some(size) => p += 3 + size,
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// Duplex classification: both `aD` and `bD` **present** (any value type),
+    /// matching [`is_duplex_consensus`], which requires both tiers' raw-read-count
+    /// tags via a `find_tag_type` presence check. Keyed off the `seen` bitset
+    /// rather than a successful integer decode, so a present-but-mistyped `aD`/`bD`
+    /// classifies as duplex exactly as the per-tag path does.
+    #[must_use]
+    pub fn is_duplex(&self) -> bool {
+        self.seen & Self::SEEN_AD != 0 && self.seen & Self::SEEN_BD != 0
+    }
+}
+
+/// Read-level simplex filter over pre-extracted scalar tags — the allocation-
+/// free equivalent of [`filter_read`] that reuses a single aux walk.
+///
+/// # Errors
+///
+/// Returns an error when the `cD`/`cE` consensus tags are absent (fgbio fails
+/// hard rather than silently keeping a non-consensus read).
+pub fn filter_read_tags(
+    tags: &ConsensusScalarTags,
+    thresholds: &FilterThresholds,
+) -> Result<FilterResult> {
+    anyhow::ensure!(
+        tags.cd.is_some() && tags.ce.is_some(),
+        "read does not appear to have consensus calling tags (cD/cE) present; \
+         FilterConsensusReads requires reads produced by consensus calling"
+    );
+    if let Some(depth) = tags.cd {
+        let min_reads = i64::try_from(thresholds.min_reads).unwrap_or(i64::MAX);
+        if depth < min_reads {
+            return Ok(FilterResult::InsufficientReads);
+        }
+    }
+    if let Some(error_rate) = tags.ce
+        && f64::from(error_rate) > thresholds.max_read_error_rate
+    {
+        return Ok(FilterResult::ExcessiveErrorRate);
+    }
+    Ok(FilterResult::Pass)
+}
+
+/// Read-level duplex filter over pre-extracted scalar tags — the allocation-
+/// free equivalent of [`filter_duplex_read`] that reuses a single aux walk.
+///
+/// # Errors
+///
+/// Returns an error when the `cD`/`cE` consensus tags are absent.
+pub fn filter_duplex_read_tags(
+    tags: &ConsensusScalarTags,
+    cc_thresholds: &FilterThresholds,
+    ab_thresholds: &FilterThresholds,
+    ba_thresholds: &FilterThresholds,
+) -> Result<FilterResult> {
+    let result = filter_read_tags(tags, cc_thresholds)?;
+    if result != FilterResult::Pass {
+        return Ok(result);
+    }
+
+    let ab_depth = tags.ad.or(tags.am);
+    let ba_depth = tags.bd.or(tags.bm);
+    let ab_error = tags.ae;
+    let ba_error = tags.be;
+
+    Ok(duplex_tier_result(ab_depth, ba_depth, ab_error, ba_error, ab_thresholds, ba_thresholds))
+}
+
 /// Filters a raw consensus read based on per-read tags (cD depth, cE error rate).
 ///
 /// # Errors
@@ -575,12 +756,25 @@ pub fn filter_duplex_read(
     let ab_error = bam_fields::find_float_tag(aux_data, SamTag::AE);
     let ba_error = bam_fields::find_float_tag(aux_data, SamTag::BE);
 
-    // Pick the "best" and "worst" value per metric, independently. `best`/
-    // `worst` are per-metric extremes across the two strands — NOT the
-    // biological AB/BA strand values. `ab_thresholds` is the stricter tier
-    // (checked against the best); `ba_thresholds` is the lenient tier
-    // (checked against the worst). Matches fgbio's `abMaxDepth` / `abError`
-    // semantics.
+    Ok(duplex_tier_result(ab_depth, ba_depth, ab_error, ba_error, ab_thresholds, ba_thresholds))
+}
+
+/// Shared AB/BA tier comparison for the duplex read-level filter.
+///
+/// Single source of truth for both [`filter_duplex_read`] (per-tag walks) and
+/// [`filter_duplex_read_tags`] (single-pass), so the two cannot drift. `best`/
+/// `worst` are per-metric extremes across the two strands — NOT biological
+/// AB/BA values. `ab_thresholds` is the stricter tier (checked against the
+/// best), `ba_thresholds` the lenient tier (checked against the worst). Matches
+/// fgbio's `abMaxDepth`/`abError` semantics.
+fn duplex_tier_result(
+    ab_depth: Option<i64>,
+    ba_depth: Option<i64>,
+    ab_error: Option<f32>,
+    ba_error: Option<f32>,
+    ab_thresholds: &FilterThresholds,
+    ba_thresholds: &FilterThresholds,
+) -> FilterResult {
     let (worst_depth, best_depth) = match (ab_depth, ba_depth) {
         (Some(a), Some(b)) => {
             if a < b {
@@ -591,7 +785,7 @@ pub fn filter_duplex_read(
         }
         (Some(a), None) => (0, a),
         (None, Some(b)) => (0, b),
-        (None, None) => return Ok(FilterResult::Pass),
+        (None, None) => return FilterResult::Pass,
     };
 
     let (best_error, worst_error) = match (ab_error, ba_error) {
@@ -614,10 +808,10 @@ pub fn filter_duplex_read(
         reason = "depth values are non-negative and fit in usize on all supported platforms"
     )]
     if (best_depth as usize) < ab_thresholds.min_reads {
-        return Ok(FilterResult::InsufficientReads);
+        return FilterResult::InsufficientReads;
     }
     if f64::from(best_error) > ab_thresholds.max_read_error_rate {
-        return Ok(FilterResult::ExcessiveErrorRate);
+        return FilterResult::ExcessiveErrorRate;
     }
 
     // Lenient BA tier: worst-per-metric value must still clear the threshold.
@@ -627,13 +821,13 @@ pub fn filter_duplex_read(
         reason = "depth values are non-negative and fit in usize on all supported platforms"
     )]
     if (worst_depth as usize) < ba_thresholds.min_reads {
-        return Ok(FilterResult::InsufficientReads);
+        return FilterResult::InsufficientReads;
     }
     if f64::from(worst_error) > ba_thresholds.max_read_error_rate {
-        return Ok(FilterResult::ExcessiveErrorRate);
+        return FilterResult::ExcessiveErrorRate;
     }
 
-    Ok(FilterResult::Pass)
+    FilterResult::Pass
 }
 
 /// Computes both no-call count and mean base quality in a single pass over raw BAM bytes.
@@ -1654,6 +1848,194 @@ mod tests {
         };
         let masked = mask_methylation_depth_simplex_raw(&mut raw, 5).unwrap();
         assert_eq!(masked, 0);
+    }
+
+    /// The single-pass `ConsensusScalarTags` + `_tags` filters must be
+    /// byte-identical to the per-tag `find_*` path (`is_duplex_consensus`,
+    /// `filter_read`, `filter_duplex_read`) across every tag combination — this
+    /// is the correctness contract that lets the hot path drop ~9 aux walks to 1.
+    #[test]
+    fn consensus_scalar_tags_match_find() {
+        // (cd, ce, ad, am, bd, bm, ae, be) as Option, covering: simplex-only,
+        // duplex full, duplex with aM/bM fallback, missing pairs, absent-cD, and
+        // out-of-order tag layouts.
+        type C = (
+            Option<i32>,
+            Option<f32>,
+            Option<i32>,
+            Option<i32>,
+            Option<i32>,
+            Option<i32>,
+            Option<f32>,
+            Option<f32>,
+        );
+        let cases: &[C] = &[
+            (Some(10), Some(0.01), None, None, None, None, None, None), // simplex
+            (Some(10), Some(0.01), Some(6), None, Some(4), None, Some(0.02), Some(0.03)), // duplex full
+            (Some(2), Some(0.5), Some(1), None, Some(1), None, Some(0.4), Some(0.4)), // low depth
+            (Some(10), Some(0.01), None, Some(5), None, Some(3), Some(0.0), Some(0.0)), // aM/bM fallback
+            (Some(10), Some(0.01), Some(6), None, None, None, Some(0.02), None), // only aD (simplex-classed)
+            (None, None, None, None, None, None, None, None), // non-consensus (cD/cE absent)
+            (Some(100), Some(0.0), Some(50), Some(9), Some(40), Some(7), Some(0.0), Some(0.001)), // both aD+aM present
+        ];
+
+        let cc =
+            FilterThresholds { min_reads: 3, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
+        let ab =
+            FilterThresholds { min_reads: 5, max_read_error_rate: 0.05, max_base_error_rate: 0.1 };
+        let ba =
+            FilterThresholds { min_reads: 2, max_read_error_rate: 0.2, max_base_error_rate: 0.1 };
+
+        for (i, &(cd, ce, ad, am, bd, bm, ae, be)) in cases.iter().enumerate() {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0).pos(0).mapq(60).cigar_ops(&[4 << 4]).sequence(b"ACGT").qualities(&[30; 4]);
+            // Interleave with an unrelated tag so the walk must step over a
+            // variable-width entry between targets.
+            b.add_int_tag(SamTag::NM, 3);
+            if let Some(v) = cd {
+                b.add_int_tag(SamTag::CD, v);
+            }
+            if let Some(v) = ce {
+                b.add_float_tag(SamTag::CE, v);
+            }
+            if let Some(v) = ad {
+                b.add_int_tag(SamTag::AD, v);
+            }
+            if let Some(v) = am {
+                b.add_int_tag(SamTag::AM, v);
+            }
+            if let Some(v) = bd {
+                b.add_int_tag(SamTag::BD, v);
+            }
+            if let Some(v) = bm {
+                b.add_int_tag(SamTag::BM, v);
+            }
+            if let Some(v) = ae {
+                b.add_float_tag(SamTag::AE, v);
+            }
+            if let Some(v) = be {
+                b.add_float_tag(SamTag::BE, v);
+            }
+            let rec = b.build();
+            let aux = fgumi_raw_bam::aux_data_slice(rec.as_ref());
+
+            let tags = ConsensusScalarTags::from_aux(aux);
+
+            // Classification parity.
+            assert_eq!(tags.is_duplex(), is_duplex_consensus(aux), "case {i}: is_duplex");
+
+            // Simplex filter parity (compare Ok/Err shape + value).
+            let want_s = filter_read(aux, &cc);
+            let got_s = filter_read_tags(&tags, &cc);
+            assert_eq!(want_s.is_err(), got_s.is_err(), "case {i}: filter_read err-shape");
+            if let (Ok(w), Ok(g)) = (&want_s, &got_s) {
+                assert_eq!(w, g, "case {i}: filter_read result");
+            }
+
+            // Duplex filter parity.
+            let want_d = filter_duplex_read(aux, &cc, &ab, &ba);
+            let got_d = filter_duplex_read_tags(&tags, &cc, &ab, &ba);
+            assert_eq!(want_d.is_err(), got_d.is_err(), "case {i}: filter_duplex err-shape");
+            if let (Ok(w), Ok(g)) = (&want_d, &got_d) {
+                assert_eq!(w, g, "case {i}: filter_duplex result");
+            }
+        }
+    }
+
+    /// A tag value paired with the BAM type it is written as, so a case table can
+    /// build deliberately mistyped or duplicated aux entries.
+    #[derive(Clone, Copy)]
+    enum ScalarTagVal {
+        Int(i32),
+        Float(f32),
+    }
+
+    /// The single-pass path must stay identical to the per-tag `find_*` path even
+    /// on **malformed** aux: a present-but-mistyped `aD`/`bD` (which
+    /// `is_duplex_consensus` still treats as present), and a duplicated tag whose
+    /// first occurrence fails to decode (which `find_tag_position` locks onto).
+    /// These are the exact inputs `consensus_scalar_tags_match_find` cannot build
+    /// — it only emits well-formed, single, correctly-typed tags — so they pin the
+    /// `seen`-bitset first-match/presence semantics against the reference path.
+    #[rstest]
+    // Duplicate `cD`: first `f`-typed (fails int decode), then a valid int. The
+    // per-tag path locks onto the first (undecodable) entry, so both `Err`.
+    #[case::dup_cd_bad_first(&[
+        (SamTag::CD, ScalarTagVal::Float(2.5)),
+        (SamTag::CD, ScalarTagVal::Int(10)),
+        (SamTag::CE, ScalarTagVal::Float(0.01)),
+    ])]
+    // Duplicate `cE`: first int-typed (not `f`), then a valid float.
+    #[case::dup_ce_bad_first(&[
+        (SamTag::CD, ScalarTagVal::Int(10)),
+        (SamTag::CE, ScalarTagVal::Int(99)),
+        (SamTag::CE, ScalarTagVal::Float(0.01)),
+    ])]
+    // `aD`/`bD` present but float-typed: presence -> duplex, but int decode fails.
+    #[case::float_typed_ad_bd(&[
+        (SamTag::CD, ScalarTagVal::Int(10)),
+        (SamTag::CE, ScalarTagVal::Float(0.01)),
+        (SamTag::AD, ScalarTagVal::Float(6.0)),
+        (SamTag::BD, ScalarTagVal::Float(4.0)),
+        (SamTag::AE, ScalarTagVal::Float(0.02)),
+        (SamTag::BE, ScalarTagVal::Float(0.03)),
+    ])]
+    // Only `aD` present and float-typed (simplex either way).
+    #[case::float_typed_ad_only(&[
+        (SamTag::CD, ScalarTagVal::Int(10)),
+        (SamTag::CE, ScalarTagVal::Float(0.01)),
+        (SamTag::AD, ScalarTagVal::Float(6.0)),
+    ])]
+    // Duplicate `aD`: first float-typed (fails int decode), then a valid int; the
+    // slot must stay locked to the first occurrence like `find_int_tag(AD)`.
+    #[case::dup_ad_bad_first(&[
+        (SamTag::CD, ScalarTagVal::Int(10)),
+        (SamTag::CE, ScalarTagVal::Float(0.01)),
+        (SamTag::AD, ScalarTagVal::Float(9.9)),
+        (SamTag::AD, ScalarTagVal::Int(6)),
+        (SamTag::BD, ScalarTagVal::Int(4)),
+        (SamTag::AE, ScalarTagVal::Float(0.02)),
+        (SamTag::BE, ScalarTagVal::Float(0.03)),
+    ])]
+    fn consensus_scalar_tags_match_find_malformed(#[case] tags: &[(SamTag, ScalarTagVal)]) {
+        let cc =
+            FilterThresholds { min_reads: 3, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
+        let ab =
+            FilterThresholds { min_reads: 5, max_read_error_rate: 0.05, max_base_error_rate: 0.1 };
+        let ba =
+            FilterThresholds { min_reads: 2, max_read_error_rate: 0.2, max_base_error_rate: 0.1 };
+
+        let mut b = RawSamBuilder::new();
+        b.ref_id(0).pos(0).mapq(60).cigar_ops(&[4 << 4]).sequence(b"ACGT").qualities(&[30; 4]);
+        for &(tag, val) in tags {
+            match val {
+                ScalarTagVal::Int(v) => b.add_int_tag(tag, v),
+                ScalarTagVal::Float(v) => b.add_float_tag(tag, v),
+            };
+        }
+        let rec = b.build();
+        let aux = fgumi_raw_bam::aux_data_slice(rec.as_ref());
+
+        let scalar = ConsensusScalarTags::from_aux(aux);
+
+        // Classification parity against the presence-based reference predicate.
+        assert_eq!(scalar.is_duplex(), is_duplex_consensus(aux), "is_duplex parity");
+
+        // Simplex read-level filter parity (Err-shape + Ok value).
+        let want_s = filter_read(aux, &cc);
+        let got_s = filter_read_tags(&scalar, &cc);
+        assert_eq!(want_s.is_err(), got_s.is_err(), "filter_read err-shape");
+        if let (Ok(w), Ok(g)) = (&want_s, &got_s) {
+            assert_eq!(w, g, "filter_read result");
+        }
+
+        // Duplex read-level filter parity.
+        let want_d = filter_duplex_read(aux, &cc, &ab, &ba);
+        let got_d = filter_duplex_read_tags(&scalar, &cc, &ab, &ba);
+        assert_eq!(want_d.is_err(), got_d.is_err(), "filter_duplex err-shape");
+        if let (Ok(w), Ok(g)) = (&want_d, &got_d) {
+            assert_eq!(w, g, "filter_duplex result");
+        }
     }
 
     #[test]
