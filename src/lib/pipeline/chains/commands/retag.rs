@@ -1,10 +1,13 @@
 //! Chain builder support for `Stage::Retag`.
 //!
-//! Holds the retag-specific finalize hooks and the process-step factory that
-//! `ChainBuilder::add_retag` imports. retag
-//! is a pure per-record transform (`DecodedRecordBatch → DecompressedBlock`, no
+//! Holds the retag-specific finalize hooks and the process-step factories that
+//! `ChainBuilder::add_retag` imports. retag is a pure per-record transform (no
 //! grouping preamble, no rejects), so it mirrors filter's
-//! `build_filter_step_single_no_rejects` shape.
+//! `build_filter_step_single_no_rejects` shape. Two builders share the per-record
+//! `retag_one_record` / per-batch `finalize_retag_batch` bodies: the owned
+//! `build_retag_process_step` (`DecodedRecordBatch → DecompressedBlock`, for a
+//! SAM source) and the borrowed decode-free `build_retag_process_step_raw`
+//! (`RecordBatch → DecompressedBlock`, for a BAM source).
 //!
 //! The per-operation counters (`Vec<OpCounts>`, positionally indexed by op), the
 //! per-record apply engine (`apply_op`), and the row-building
@@ -27,8 +30,10 @@ use crate::commands::retag::{
 use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::pipeline::chains::FinalizeHook;
+use fgumi_raw_bam::RawRecord;
+
 use crate::pipeline::steps::process::{ProcessOrdered, process_ordered};
-use crate::pipeline::steps::types::{DecodedRecordBatch, DecompressedBlock};
+use crate::pipeline::steps::types::{DecodedRecordBatch, DecompressedBlock, RecordBatch};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Finalize hooks
@@ -113,11 +118,31 @@ impl FinalizeHook for RetagMetricsFinalizeHook {
 // Process-step factory
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Apply every retag op to one record and write it framed to `bytes`, folding
+/// per-op counts into the batch-local `batch_counts` (positionally indexed by
+/// op, same length as `captures.operations`).
+///
+/// The single per-record body shared by the owned (`DecodedRecordBatch`) and
+/// borrowed (`RecordBatch`) retag builders, so the apply engine, counting, and
+/// framing cannot drift between the decode path and the decode-free fast path.
+fn retag_one_record(
+    record: &mut RawRecord,
+    captures: &RetagProcessCaptures,
+    batch_counts: &mut [OpCounts],
+    bytes: &mut Vec<u8>,
+) -> io::Result<()> {
+    for (op, op_counts) in captures.operations.iter().zip(batch_counts.iter_mut()) {
+        apply_op(record, *op, op_counts);
+    }
+    fgumi_raw_bam::write_framed_record(bytes, record.as_ref())?;
+    Ok(())
+}
+
 /// Build the retag process step: `DecodedRecordBatch → DecompressedBlock`,
 /// parallel, `ByItemOrdinal` (input order preserved). Applies every op to each
-/// record via the shared `apply_op`, folding per-op counts into this worker's
-/// accumulator slot, then serialises every record (retag keeps all records — no
-/// rejects, no filtering).
+/// record via the shared [`retag_one_record`], folding per-op counts into this
+/// worker's accumulator slot, then serialises every record (retag keeps all
+/// records — no rejects, no filtering).
 ///
 /// Returns the concrete `ProcessOrdered` (not `impl Step`) — the closure type is
 /// opaque-return and cannot name itself, matching the filter/dedup factories.
@@ -149,32 +174,85 @@ pub(crate) fn build_retag_process_step(
             let mut batch_counts = vec![OpCounts::default(); n_ops];
             for decoded in records {
                 let mut record = decoded.into_raw_bytes();
-                for (op, op_counts) in captures.operations.iter().zip(batch_counts.iter_mut()) {
-                    apply_op(&mut record, *op, op_counts);
-                }
-                fgumi_raw_bam::write_framed_record(&mut bytes, record.as_ref())?;
+                retag_one_record(&mut record, &captures, &mut batch_counts, &mut bytes)?;
             }
-            accumulators.with_slot(|slot: &mut Vec<OpCounts>| {
-                // Lazily size the slot to the operation count on first use
-                // (mirrors the pre-cutover run_threaded process closure).
-                if slot.is_empty() {
-                    slot.resize(n_ops, OpCounts::default());
-                }
-                for (agg, part) in slot.iter_mut().zip(batch_counts.iter()) {
-                    agg.records_applied += part.records_applied;
-                    agg.dst_overwritten += part.dst_overwritten;
-                    agg.src_missing += part.src_missing;
-                }
-            });
+            finalize_retag_batch(&accumulators, &captures, n_ops, &batch_counts, total_records);
 
-            // Heartbeat + record-count source for RetagFinalizeHook. A shared
-            // `Arc<AtomicU64>` rather than `ProgressTracker`: it doubles as the
-            // aggregate record count the finalize hook reads at drain, and is
-            // trivially shared across the parallel workers.
-            let prev = captures.progress.fetch_add(total_records, Ordering::Relaxed);
-            if (prev + total_records) / 1_000_000 > prev / 1_000_000 {
-                info!("Processed {} records", prev + total_records);
-            }
+            Ok(DecompressedBlock { batch_serial, bytes })
+        },
+    )
+}
+
+/// Fold a batch's per-op counts into the shared per-thread accumulator slot with
+/// a single lock, then bump the aggregate record-count / heartbeat. Shared by
+/// the owned and borrowed retag builders so the metric merge cannot drift.
+fn finalize_retag_batch(
+    accumulators: &PerThreadAccumulator<Vec<OpCounts>>,
+    captures: &RetagProcessCaptures,
+    n_ops: usize,
+    batch_counts: &[OpCounts],
+    total_records: u64,
+) {
+    accumulators.with_slot(|slot: &mut Vec<OpCounts>| {
+        // Lazily size the slot to the operation count on first use (mirrors the
+        // pre-cutover run_threaded process closure).
+        if slot.is_empty() {
+            slot.resize(n_ops, OpCounts::default());
+        }
+        for (agg, part) in slot.iter_mut().zip(batch_counts.iter()) {
+            agg.records_applied += part.records_applied;
+            agg.dst_overwritten += part.dst_overwritten;
+            agg.src_missing += part.src_missing;
+        }
+    });
+
+    // Heartbeat + record-count source for RetagFinalizeHook: a shared
+    // `Arc<AtomicU64>` that doubles as the aggregate record count the finalize
+    // hook reads at drain, trivially shared across the parallel workers.
+    let prev = captures.progress.fetch_add(total_records, Ordering::Relaxed);
+    if (prev + total_records) / 1_000_000 > prev / 1_000_000 {
+        info!("Processed {} records", prev + total_records);
+    }
+}
+
+/// Build the retag process step on the decode-free `RecordBatch` fast path.
+///
+/// `RecordBatch → DecompressedBlock`. Behavior identical to
+/// [`build_retag_process_step`] — same [`retag_one_record`] per record and
+/// [`finalize_retag_batch`] per batch — but iterates borrowed record byte-ranges
+/// via [`for_each_raw_record`](crate::pipeline::chains::commands::for_each_raw_record)
+/// with one reused scratch `RawRecord`, skipping the per-record `DecodedRecord`
+/// allocation and the dead `GroupKey` of the decode path.
+///
+/// `pub(crate)` — consumed only by `ChainBuilder::add_retag` on a BAM source.
+#[allow(clippy::type_complexity)]
+pub(crate) fn build_retag_process_step_raw(
+    limit_bytes: u64,
+    captures: RetagProcessCaptures,
+    accumulators: Arc<PerThreadAccumulator<Vec<OpCounts>>>,
+) -> ProcessOrdered<
+    RecordBatch,
+    DecompressedBlock,
+    impl Fn(RecordBatch) -> io::Result<DecompressedBlock> + Send + Sync + 'static,
+> {
+    let n_ops = captures.operations.len();
+    process_ordered::<RecordBatch, DecompressedBlock, _>(
+        "RetagProcess",
+        limit_bytes,
+        move |item: RecordBatch| -> io::Result<DecompressedBlock> {
+            let batch_serial = item.batch_serial();
+            let total_records = item.len() as u64;
+            let mut bytes: Vec<u8> = Vec::new();
+            let mut batch_counts = vec![OpCounts::default(); n_ops];
+            let mut scratch = RawRecord::new();
+
+            crate::pipeline::chains::commands::for_each_raw_record(
+                &item,
+                &mut scratch,
+                |record| retag_one_record(record, &captures, &mut batch_counts, &mut bytes),
+            )?;
+
+            finalize_retag_batch(&accumulators, &captures, n_ops, &batch_counts, total_records);
 
             Ok(DecompressedBlock { batch_serial, bytes })
         },

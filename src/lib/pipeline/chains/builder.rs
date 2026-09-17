@@ -217,8 +217,8 @@ pub(crate) enum ChainTailKind {
     /// reads no key (see
     /// [`ChainBuilder::first_stage_uses_raw_record_fast_path`]); the source
     /// preamble ends in `ParseBamRecords` rather than `DecodeRecords`. Consumed
-    /// by the fast-path per-record transform steps (`CopyUmi` and single-record
-    /// `Filter` today).
+    /// by the fast-path per-record transform steps (`Retag`, `CopyUmi`, and
+    /// single-record `Filter`).
     ///
     /// [`RecordBatch`]: crate::pipeline::steps::types::RecordBatch
     RecordBatch,
@@ -1638,18 +1638,18 @@ impl<'a> ChainBuilder<'a> {
     /// decode (`DecodeRecords`), skipping the per-record heap allocation and the
     /// dead key computation.
     ///
-    /// `CopyUmi` and single-record `Filter` qualify today (a PR for `Retag`
-    /// extends this). `--filter-by-template` is excluded: it inserts a
-    /// `GroupByQueryname` grouper that reads `name_hash`, so it must keep the
-    /// `DecodedRecordBatch` tail. Consulted only inside the BAM arm of
-    /// [`Self::add_source`]; SAM source always keeps the `DecodedRecordBatch`
-    /// path (its `ParseSamChunk` re-encode is a different, non-hot ingest).
+    /// `Retag`, `CopyUmi`, and single-record `Filter` qualify.
+    /// `--filter-by-template` is excluded: it inserts a `GroupByQueryname`
+    /// grouper that reads `name_hash`, so it must keep the `DecodedRecordBatch`
+    /// tail. Consulted only inside the BAM arm of [`Self::add_source`]; SAM
+    /// source always keeps the `DecodedRecordBatch` path (its `ParseSamChunk`
+    /// re-encode is a different, non-hot ingest).
     ///
     /// [`RecordBatch`]: crate::pipeline::steps::types::RecordBatch
     fn first_stage_uses_raw_record_fast_path(&self) -> bool {
         match self.spec.stages.first() {
-            // `CopyUmi` is unconditionally per-record (no template mode).
-            Some(Stage::CopyUmi) => true,
+            // `Retag` and `CopyUmi` are unconditionally per-record (no template mode).
+            Some(Stage::Retag | Stage::CopyUmi) => true,
             Some(Stage::Filter) => {
                 self.spec.stage_opts.filter.as_ref().is_some_and(|f| !f.filter_by_template)
             }
@@ -5539,8 +5539,11 @@ impl<'a> ChainBuilder<'a> {
     /// Retag-specific step: a single per-record `ProcessOrdered` transform.
     ///
     /// retag is a pure per-record tag rewriter (no grouping, no rejects), so this
-    /// mirrors `add_filter`'s `(false, false)` branch: consume the
-    /// `DecodedRecordBatch` tail, apply the ops, serialise every record. The
+    /// mirrors `add_filter`'s `(false, false)` branch: consume the record-stream
+    /// tail (owned `DecodedRecordBatch` for a SAM source, or the borrowed
+    /// `RecordBatch` decode-free fast path for a BAM source — see
+    /// `first_stage_uses_raw_record_fast_path`), apply the ops, serialise every
+    /// record. The
     /// `OperationTimer` + `Starting Retag` banner are constructed here (matching
     /// `add_filter`/`add_dedup` — the builder owns the banner, not the command's
     /// `execute_chain`), and the timer is moved into `RetagFinalizeHook`. Two
@@ -5556,6 +5559,7 @@ impl<'a> ChainBuilder<'a> {
         use crate::logging::OperationTimer;
         use crate::pipeline::chains::commands::retag::{
             RetagFinalizeHook, RetagMetricsFinalizeHook, build_retag_process_step,
+            build_retag_process_step_raw,
         };
         use crate::validation::validate_file_exists;
         use fgumi_bam_io::is_stdin_path;
@@ -5568,12 +5572,17 @@ impl<'a> ChainBuilder<'a> {
             );
         }
 
-        // retag consumes a record stream (DecodedRecordBatch), like filter/clip/dedup.
-        if !matches!(self.chain_tail_kind, ChainTailKind::DecodedRecordBatch { .. }) {
+        // retag consumes a record stream: the owned `DecodedRecordBatch` (SAM
+        // source) or the borrowed `RecordBatch` decode-free fast path (BAM — see
+        // `first_stage_uses_raw_record_fast_path`), like filter/copy-umi.
+        if !matches!(
+            self.chain_tail_kind,
+            ChainTailKind::DecodedRecordBatch { .. } | ChainTailKind::RecordBatch
+        ) {
             bail!(
-                "Stage::Retag requires a record-stream input (DecodedRecordBatch), but the chain \
-                 tail is {:?}; retag cannot follow a stage that emits grouped templates or \
-                 serialized bytes.",
+                "Stage::Retag requires a record-stream input (DecodedRecordBatch or RecordBatch), \
+                 but the chain tail is {:?}; retag cannot follow a stage that emits grouped \
+                 templates or serialized bytes.",
                 self.chain_tail_kind
             );
         }
@@ -5610,12 +5619,24 @@ impl<'a> ChainBuilder<'a> {
         let accumulators = Arc::clone(&setup.collected_metrics);
 
         let captures = retag.process_captures(&setup);
-        let step = build_retag_process_step(
-            self.tuning.per_step_byte_limit,
-            captures,
-            Arc::clone(&accumulators),
-        );
-        self.current_tail = Some(self.pipeline.append_step(step, tail));
+        // On the decode-free fast path the step consumes a borrowed `RecordBatch`;
+        // otherwise the owned `DecodedRecordBatch` (SAM source).
+        let process_tail = if self.chain_tail_kind == ChainTailKind::RecordBatch {
+            let step = build_retag_process_step_raw(
+                self.tuning.per_step_byte_limit,
+                captures,
+                Arc::clone(&accumulators),
+            );
+            self.pipeline.append_step(step, tail)
+        } else {
+            let step = build_retag_process_step(
+                self.tuning.per_step_byte_limit,
+                captures,
+                Arc::clone(&accumulators),
+            );
+            self.pipeline.append_step(step, tail)
+        };
+        self.current_tail = Some(process_tail);
 
         // Success-only: warn-on-zero + metrics TSV (a failed run publishes neither).
         self.finalize_on_success.push(Box::new(RetagMetricsFinalizeHook {
@@ -6144,6 +6165,15 @@ mod tests {
         assert!(builder.first_stage_uses_raw_record_fast_path());
     }
 
+    /// `Retag` is a per-record tag rewriter that reads no `GroupKey`, so a BAM
+    /// source takes the decode-free `RecordBatch` fast path.
+    #[test]
+    fn first_stage_uses_raw_record_fast_path_true_for_retag() {
+        let spec = empty_spec(vec![Stage::Retag]);
+        let builder = chain_builder_for_stages(&spec);
+        assert!(builder.first_stage_uses_raw_record_fast_path());
+    }
+
     /// `source_group_key_config` routes a chain-clip first stage to the cheap
     /// `name_hash_only` config too — clip's grouper (`GroupBam` /
     /// `TemplateGrouper::add_records`) reads only `decoded.key.name_hash`
@@ -6429,6 +6459,73 @@ mod tests {
         assert!(
             err.to_string().contains("requires a record-stream input"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// `add_retag`'s widened tail-kind guard still rejects a non-record-stream
+    /// tail: it accepts `DecodedRecordBatch`/`RecordBatch` but must bail on a
+    /// grouped-template tail rather than mis-wire the step onto an incompatible
+    /// input. Exercises the guard directly by seeding a `BamTemplateBatch` tail.
+    #[test]
+    fn add_retag_rejects_non_record_stream_tail() {
+        let spec = empty_spec(vec![Stage::Retag]);
+        let mut builder = chain_builder_for_stages(&spec);
+        builder.chain_tail_kind = ChainTailKind::BamTemplateBatch;
+        let err = builder
+            .add_retag(StagePosition::Terminal)
+            .expect_err("retag after a grouped-template tail must be rejected");
+        assert!(
+            err.to_string().contains("requires a record-stream input"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The positive complement to `add_retag_rejects_non_record_stream_tail`: a
+    /// `RecordBatch` tail (the decode-free BAM fast path) is *accepted* by
+    /// `add_retag`, which takes the `chain_tail_kind == RecordBatch` dispatch arm
+    /// and wires a process step onto it. Seeds a real `RecordBatch`-emitting
+    /// preamble as the tail (via `build_bam_record_batch_preamble`), a stdin
+    /// source so the input-existence check is skipped, and one retag op, then
+    /// asserts the call succeeds and advances the chain tail (a process step was
+    /// appended, rather than the guard bailing).
+    ///
+    /// Which of the two factories runs on that arm (the borrowed-record
+    /// `build_retag_process_step_raw` vs the owned-record
+    /// `build_retag_process_step`) is not observable from the type-erased graph
+    /// here: both register under the step name `"RetagProcess"`, and the
+    /// `RecordBatch`/`DecodedRecordBatch` input distinction is compile-time. That
+    /// a `RecordBatch` tail actually drives the `_raw` step at runtime is covered
+    /// by the `retag_raw_and_decoded_paths_match` integration test, whose
+    /// BAM-source (raw fast path) success assertion would fail on a downcast
+    /// panic if the decoded factory were mis-wired onto a `RecordBatch` tail.
+    #[test]
+    fn add_retag_accepts_record_batch_tail() {
+        use crate::commands::retag::{RetagOp, RetagOptions};
+        use std::path::PathBuf;
+
+        let mut spec = empty_spec(vec![Stage::Retag]);
+        // Stdin source: `add_retag` skips the input-file existence check.
+        spec.source = SourceSpec::Bam(PathBuf::from("-"));
+        spec.stage_opts.retag = Some(RetagOptions {
+            operations: vec!["RX::copy::BX".parse::<RetagOp>().expect("valid retag op")],
+            metrics: None,
+        });
+
+        let mut builder = chain_builder_for_stages(&spec);
+        // Seed a real borrowed-`RecordBatch` decode-free preamble as the tail;
+        // the reader is never read (the pipeline is built, not run).
+        let reader: Box<dyn std::io::Read + Send> = Box::new(std::io::empty());
+        let tail = builder.build_bam_record_batch_preamble(reader, Header::default());
+        builder.current_tail = Some(tail);
+        builder.chain_tail_kind = ChainTailKind::RecordBatch;
+
+        builder
+            .add_retag(StagePosition::Terminal)
+            .expect("retag must accept a RecordBatch (decode-free fast-path) tail");
+        assert_ne!(
+            builder.current_tail,
+            Some(tail),
+            "add_retag must append a process step onto the RecordBatch tail"
         );
     }
 
