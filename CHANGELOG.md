@@ -13,6 +13,7 @@ All notable changes to this project will be documented in this file.
   the flag. Off by default (zero overhead); `summary` adds the end-of-run edge
   table + bottleneck verdict, `timeline`/`deep` add the TSV and dwell/park
   latency. All flags are hidden from `--help` ([#937](https://github.com/fulcrumgenomics/fgumi/pull/937)).
+- Honor `--check-crc`/`--no-check-crc` on `fgumi fastq`, so a trusted intermediate BAM piped to an aligner can skip the input CRC32 verification and hand those cycles to the aligner. Default policy is unchanged (verify a file source, skip stdin) ([#960](https://github.com/fulcrumgenomics/fgumi/pull/960)).
 
 ## [0.7.0] - 2026-08-24
 

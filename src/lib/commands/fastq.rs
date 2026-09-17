@@ -7,13 +7,13 @@
 
 use crate::commands::common::{
     CompressionOptions, MemoryLimit, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    reject_output_collisions,
+    log_check_crc, reject_output_collisions, resolve_check_crc,
 };
 use crate::sam::SamTag;
 use crate::validation::validate_input_exists;
 use anyhow::Result;
 use clap::Parser;
-use fgumi_bam_io::{ReadStreams, is_stdin_path};
+use fgumi_bam_io::ReadStreams;
 use fgumi_raw_bam::{
     RawRecord, aux_data_slice, extract_sequence_into, find_string_tag, quality_scores_slice,
     read_name as raw_read_name,
@@ -103,10 +103,31 @@ NOTES:
   stream. Prefer paired split (--out1/--out2) when mates may be missing.
 "#
 )]
+#[allow(clippy::struct_excessive_bools)] // CLI flags: each bool is a distinct user-facing option
 pub struct Fastq {
     /// Input BAM file.
     #[arg(short = 'i', long = "input")]
     pub input: PathBuf,
+
+    /// Force CRC32 verification while decoding the input.
+    ///
+    /// Without either `--check-crc` or `--no-check-crc`, fgumi verifies a file
+    /// input and skips verification for stdin (a freshly-piped stream is
+    /// trusted). Pass `--check-crc` to force verification on. For the
+    /// `fgumi fastq | aligner` pipe over a trusted intermediate BAM file,
+    /// `--no-check-crc` skips the (otherwise per-record) CRC work so those
+    /// cycles go to the aligner instead. Mutually exclusive with
+    /// `--no-check-crc`.
+    #[arg(long = "check-crc", default_value_t = false, conflicts_with = "no_check_crc")]
+    pub check_crc: bool,
+
+    /// Skip CRC32 verification while decoding the input.
+    ///
+    /// Trades the CRC32 integrity check for faster decode. See `--check-crc`
+    /// for the default policy this overrides. Mutually exclusive with
+    /// `--check-crc`.
+    #[arg(long = "no-check-crc", default_value_t = false, conflicts_with = "check_crc")]
+    pub no_check_crc: bool,
 
     /// Output FASTQ file, or `-` / `/dev/stdout` for stdout. If omitted, the
     /// FASTQ stream is written to stdout (the default, intended for piping
@@ -215,6 +236,7 @@ impl Fastq {
     /// behavior — not the raw `--no-read-suffix` flag, which paired mode ignores.
     fn log_config(&self) {
         info!("Input: {}", self.input.display());
+        log_check_crc(self.check_crc, self.no_check_crc, &self.input);
         info!("Threads: {}", self.threads);
         info!("Exclude flags: 0x{:X}", self.exclude_flags);
         info!("Require flags: 0x{:X}", self.require_flags);
@@ -268,7 +290,7 @@ impl Fastq {
             read_streams: ReadStreams::Fixed(1),
             // Match the default CRC policy every other command uses: verify a file
             // source, skip for stdin (which cannot be re-decoded to re-check).
-            verify_crc: !is_stdin_path(&self.input),
+            verify_crc: resolve_check_crc(self.check_crc, self.no_check_crc, &self.input),
             command_line: command_line.to_string(),
         })
     }
@@ -740,6 +762,24 @@ mod tests {
     #[test]
     fn test_umi_name_annotation_rejects_empty_tag_list() {
         assert!(UmiNameAnnotation::new(&[], ":", "+").is_err());
+    }
+
+    /// The `--check-crc`/`--no-check-crc` flags must be threaded into the built
+    /// `ChainSpec.verify_crc` — asserting the actual spec (not a re-derivation of
+    /// `resolve_check_crc`) so a regression that stops honoring the flags at the
+    /// build site is caught. A file input verifies by default; the flags override.
+    #[rstest]
+    #[case::default_file(&["fastq", "-i", "input.bam"], true)]
+    #[case::no_check_crc(&["fastq", "-i", "input.bam", "--no-check-crc"], false)]
+    #[case::check_crc(&["fastq", "-i", "input.bam", "--check-crc"], true)]
+    fn test_check_crc_flags_thread_into_chain_spec(#[case] argv: &[&str], #[case] expected: bool) {
+        let fastq = Fastq::try_parse_from(argv).expect("parse fastq args");
+        let sink = crate::pipeline::chains::SinkSpec::Fastq(PathBuf::from("/dev/stdout"));
+        let spec = fastq.build_chain_spec(sink, "cmd").expect("build chain spec");
+        assert_eq!(
+            spec.verify_crc, expected,
+            "build_chain_spec must thread the resolved --check-crc policy into ChainSpec.verify_crc",
+        );
     }
 
     /// Write reverse complement of sequence bytes to a buffer (test helper).
