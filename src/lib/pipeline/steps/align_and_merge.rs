@@ -1068,6 +1068,10 @@ fn merge_zipper_batch(
     let mut merged: Vec<Template> = Vec::with_capacity(mapped.len());
     let mut total_records: u64 = 0;
     let mut total_bytes: usize = 0;
+    // One aux-rebuild scratch buffer reused across every template in this batch,
+    // mirroring the standalone `Zipper::run` path (its allocation is reused, not
+    // re-allocated per template).
+    let mut aux_scratch: Vec<u8> = Vec::new();
     for (mut mapped_template, unmapped_template) in mapped.into_iter().zip(unmapped.templates()) {
         merge_one_template_with(
             unmapped_template,
@@ -1076,6 +1080,7 @@ fn merge_zipper_batch(
             cfg.skip_tc_tags,
             cfg.reference.as_deref(),
             &cfg.partial_output_header,
+            &mut aux_scratch,
         )
         .map_err(|e| io::Error::other(format!("align-and-merge: {e:#}")))?;
 

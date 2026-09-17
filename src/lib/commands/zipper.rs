@@ -582,7 +582,14 @@ pub fn merge_raw(
     tag_info: &TagInfo,
     skip_tc_tags: bool,
 ) -> Result<()> {
-    merge_raw_with(unmapped, mapped, &ZipperTags::from_tag_info(tag_info), skip_tc_tags)
+    let mut aux_scratch = Vec::new();
+    merge_raw_with(
+        unmapped,
+        mapped,
+        &ZipperTags::from_tag_info(tag_info),
+        skip_tc_tags,
+        &mut aux_scratch,
+    )
 }
 
 /// Core of [`merge_raw`], operating on precomputed [`ZipperTags`] so the bitsets
@@ -592,6 +599,7 @@ fn merge_raw_with(
     mapped: &mut Template,
     tags: &ZipperTags,
     skip_tc_tags: bool,
+    aux_scratch: &mut Vec<u8>,
 ) -> Result<()> {
     // Step 1: Fix mate info
     mapped.fix_mate_info()?;
@@ -615,9 +623,23 @@ fn merge_raw_with(
 
     // Steps 3–4: Copy tags from unmapped to mapped, transfer QC flags
     let has_transforms = tags.has_transforms;
-    // Reusable aux scratch buffer for the single-pass copy/normalize helpers,
-    // so those hot per-record rebuilds don't each allocate.
-    let mut merge_scratch: Vec<u8> = Vec::new();
+    // AS/XS are normalized to the smallest signed width. For records that go
+    // through the Step-3 copy rebuild, this rides along on that single walk (no
+    // extra scan/memmove); records with no tags to copy are normalized in the
+    // `adds_all.is_empty()` branch below, and any mapped record that no unmapped
+    // primary selects is normalized by the Step-5 fallback. This replaces the old
+    // dedicated Step-5 pass over every record, which cost 4 aux scans + 2 memmoves
+    // per record.
+    let normalize_tags: [[u8; 2]; 2] = [SamTag::AS.into(), SamTag::XS.into()];
+
+    // Tracks, in all builds, which mapped records have already had AS/XS
+    // normalized (via the fused copy or the empty-copy-set branch). Any record
+    // left `false` is normalized by the Step-5 fallback, so a mapped record that
+    // `primary_reads() × collect_mapped_indices` does not reach — e.g. a
+    // supplementary/secondary whose segment has no primary, which
+    // `Template::from_records_inner` accepts — is never written with an
+    // un-normalized AS/XS in release builds.
+    let mut normalized = vec![false; mapped.records().len()];
     for u in unmapped.primary_reads() {
         let u_flags = RawRecordView::new(u).flags();
         let is_unpaired = (u_flags & fgumi_raw_bam::flags::PAIRED) == 0;
@@ -630,13 +652,14 @@ fn merge_raw_with(
         let u_tags: Vec<fgumi_raw_bam::TagEntry<'_>> =
             RawRecordView::new(u).tags().iter().collect();
 
-        // The copy set: the unmapped read's tags minus the configured
-        // remove-set. `PG` precedence (drop the unmapped `PG` when the mapped
-        // read already has one) is resolved per record inside
-        // `copy_unmapped_tags_single_pass`, in the same walk that copies the
-        // tags — so there is no separate `has_pg` aux scan.
+        // Pre-filter the copy set by the strand-independent conditions (skip the
+        // configured remove-set). `PG` is additionally skipped per record when the
+        // destination already carries a `PG`, so `adds_no_pg` is the copy set for a
+        // destination that already has `PG`.
         let adds_all: Vec<fgumi_raw_bam::TagEntry<'_>> =
             u_tags.iter().copied().filter(|e| !tags.remove.contains(e.tag)).collect();
+        let adds_no_pg: Vec<fgumi_raw_bam::TagEntry<'_>> =
+            adds_all.iter().copied().filter(|e| e.tag != *SamTag::PG).collect();
 
         // Nothing to copy from this unmapped read: skip the per-record rebuild
         // (an alloc + splice that would only re-emit the aux unchanged). The QC
@@ -646,46 +669,60 @@ fn merge_raw_with(
             let rr = mapped.records_mut();
             for &i in &mapped_indices {
                 transfer_qc_flag(&mut rr[i], is_qc_fail);
+                // No copyable tags, so the Step-3 rebuild (which folds AS/XS
+                // normalization) is skipped for these records — normalize them
+                // standalone here, preserving the old Step-5 behavior exactly
+                // (including its malformed-aux tolerance).
+                fgumi_raw_bam::normalize_int_tag_to_smallest_signed(rr[i].as_mut_vec(), SamTag::AS);
+                fgumi_raw_bam::normalize_int_tag_to_smallest_signed(rr[i].as_mut_vec(), SamTag::XS);
+                normalized[i] = true;
             }
             continue;
         }
 
-        // Copy tags to each mapped record in one aux walk: drop the copied keys
-        // from the survivors (upsert), keep the mapped `PG`, and append the copy
-        // set. Negative-strand reverse/revcomp then runs as a separate pass over
-        // the just-appended tags — behaviour identical to the interleaved form,
-        // since each transform locates its tag by key on the rebuilt aux.
+        // Copy tags to each mapped record via one aux rebuild: drop the copied
+        // keys from the survivors (upsert) and append them, folding the AS/XS
+        // smallest-signed normalization into the same walk. Negative-strand
+        // reverse/revcomp then runs as a separate pass over the just-appended
+        // tags — behaviour identical to the interleaved form, since each transform
+        // locates its tag by key on the rebuilt aux.
         let rr = mapped.records_mut();
         for &i in &mapped_indices {
             let is_reverse =
                 (RawRecordView::new(&rr[i]).flags() & fgumi_raw_bam::flags::REVERSE) != 0;
+            let has_pg =
+                fgumi_raw_bam::find_tag_type(fgumi_raw_bam::aux_data_slice(&rr[i]), SamTag::PG)
+                    .is_some();
+            let adds: &[fgumi_raw_bam::TagEntry<'_>] = if has_pg { &adds_no_pg } else { &adds_all };
 
-            let saw_pg =
-                copy_unmapped_tags_single_pass(rr[i].as_mut_vec(), &adds_all, &mut merge_scratch);
+            fgumi_raw_bam::RawTagsEditor::from_vec(rr[i].as_mut_vec()).rebuild_with_int_normalized(
+                &[] as &[[u8; 2]],
+                adds,
+                &normalize_tags,
+                aux_scratch,
+            );
+            normalized[i] = true;
 
             if is_reverse && has_transforms {
                 // Aux offset is stable across the transforms below: they only
                 // reorder bytes within a tag value, never change the aux length.
                 let aux_offset =
                     fgumi_raw_bam::aux_data_offset_from_record(&rr[i]).unwrap_or(rr[i].len());
-                for (idx, entry) in adds_all.iter().enumerate() {
-                    // Transform only the tags actually copied from the unmapped
-                    // read. When the mapped read already carried `PG`, its own
-                    // `PG` survived and the unmapped `PG` was dropped on copy, so
-                    // that key is not part of the copied set — skip it, matching
-                    // the pre-refactor code, which iterated the PG-filtered add
-                    // set in that case (otherwise a `PG` in the reverse/revcomp
-                    // set would transform the mapped read's own `PG`).
-                    if saw_pg && entry.tag == *SamTag::PG {
-                        continue;
-                    }
-                    // The copy pass deduped `adds_all` last-wins, so the rebuilt
-                    // aux holds one physical entry per key. Skip any add whose key
-                    // recurs later so the involutive reverse/revcomp is applied
-                    // exactly once (mirroring the dedup) — applying it twice on a
-                    // duplicate key would be a net no-op and diverge from the old
-                    // per-entry idiom.
-                    if adds_all[idx + 1..].iter().any(|b| b.tag == entry.tag) {
+                for (idx, entry) in adds.iter().enumerate() {
+                    // `adds` is already PG-filtered (`adds_no_pg`) when the mapped
+                    // read carried its own `PG`, so the unmapped `PG` was not copied
+                    // and must not be transformed — matching the pre-refactor code,
+                    // which iterated the PG-filtered add set in that case (otherwise
+                    // a `PG` in the reverse/revcomp set would transform the mapped
+                    // read's own `PG`).
+                    //
+                    // `rebuild_with_int_normalized` deduped `adds` last-wins, so the
+                    // rebuilt aux holds one physical entry per key. Skip any add
+                    // whose key recurs later so the involutive reverse/revcomp is
+                    // applied exactly once (mirroring the dedup) — applying it twice
+                    // on a duplicate key would be a net no-op and diverge from the
+                    // old per-entry idiom.
+                    if adds[idx + 1..].iter().any(|b| b.tag == entry.tag) {
                         continue;
                     }
                     if tags.reverse.contains(entry.tag) {
@@ -715,11 +752,20 @@ fn merge_raw_with(
         }
     }
 
-    // Step 5: Normalize AS/XS tags to smallest-signed encoding in a single aux
-    // walk per record (replacing two `normalize_int_tag_to_smallest_signed`
-    // calls, i.e. four aux scans).
-    for record in mapped.records_mut().iter_mut() {
-        normalize_as_xs_single_pass(record.as_mut_vec(), &mut merge_scratch);
+    // Step 5: AS/XS normalization happens inline above — folded into the Step-3
+    // copy rebuild for records with copyable tags, and done standalone in the
+    // `adds_all.is_empty()` branch for records without. Any mapped record neither
+    // branch reached is normalized here in a final pass, in all builds, so its
+    // AS/XS never ships un-normalized. That gap is real, not hypothetical:
+    // `Template::from_records_inner` accepts a supplementary/secondary record
+    // whose segment has no primary, and `primary_reads() × collect_mapped_indices`
+    // only visits segments an unmapped primary selects, so such a record is
+    // reached by neither branch above. In the common case every record is already
+    // `normalized`, so this is a cheap flag scan with no rebuilds.
+    for (i, record) in mapped.records_mut().iter_mut().enumerate() {
+        if !normalized[i] {
+            normalize_as_xs_single_pass(record.as_mut_vec(), aux_scratch);
+        }
     }
 
     // Step 6: Add tc (template coordinate) tags
@@ -743,74 +789,17 @@ fn transfer_qc_flag(record: &mut RawRecord, is_qc_fail: bool) {
 }
 
 /// Appends one aux entry (2-byte tag, type byte, value bytes) to `buf` in
-/// on-disk order. Shared by the single-pass merge helpers below so the entry
+/// on-disk order. Used by `normalize_as_xs_single_pass` below so the entry
 /// serialization lives in one place. (The generic survivor-copy/append machinery
-/// is `RawTagsEditor::rebuild_with`; these helpers cannot simply call it because
-/// each needs per-entry decisions inside the walk — PG precedence, AS/XS decode
-/// — and a caller-owned scratch buffer to avoid a per-record allocation.)
+/// is `RawTagsEditor::rebuild_with`; the helper cannot simply call it because it
+/// needs per-entry decisions inside the walk — the AS/XS decode — and a
+/// caller-owned scratch buffer to avoid a per-record allocation.)
 #[inline]
 fn push_aux_entry(buf: &mut Vec<u8>, tag: [u8; 2], type_byte: u8, value_bytes: &[u8]) {
     buf.push(tag[0]);
     buf.push(tag[1]);
     buf.push(type_byte);
     buf.extend_from_slice(value_bytes);
-}
-
-/// Single-walk replacement for the zipper tag-copy step (Steps 3–4). Copies the
-/// mapped record's existing tags, appends `adds` (the unmapped read's tags,
-/// already filtered by the remove-set), and resolves `PG` precedence in the same
-/// pass — the mapped read's own `PG` is kept and the unmapped `PG` dropped — so
-/// no separate `has_pg` aux scan is needed. Returns whether the mapped record
-/// already carried a `PG` (so the caller can keep the reverse/revcomp transform
-/// off that surviving `PG`, matching the pre-refactor PG-filtered add set).
-///
-/// Upsert semantics match `rebuild_with`: an added key already present among the
-/// survivors is replaced by the appended value (last-wins within `adds`), except
-/// `PG`, where the survivor wins. `scratch` is reused across records to avoid a
-/// per-record allocation. Callers must have already applied the remove-set
-/// (Step 2) and must not call this with an empty `adds`.
-///
-/// Like [`fgumi_raw_bam::RawTagsEditor::rebuild_with`], the survivor walk stops
-/// at the first malformed aux entry and drops the unparseable tail (the same
-/// fail-closed tolerance as `AuxTagsIter`); a spec-conforming record is copied
-/// byte-for-byte.
-fn copy_unmapped_tags_single_pass(
-    record: &mut Vec<u8>,
-    adds: &[fgumi_raw_bam::TagEntry<'_>],
-    scratch: &mut Vec<u8>,
-) -> bool {
-    let pg = *SamTag::PG;
-    let off = fgumi_raw_bam::aux_data_offset_from_record(record)
-        .unwrap_or(record.len())
-        .min(record.len());
-    scratch.clear();
-
-    // Copy survivors, dropping any key that will be re-appended from `adds`
-    // (upsert), except `PG` — the mapped read's own `PG` is kept and its
-    // presence recorded so the unmapped `PG` is skipped on append.
-    let mut saw_pg = false;
-    for entry in &fgumi_raw_bam::RawTagsView::new(&record[off..]) {
-        if entry.tag == pg {
-            saw_pg = true;
-        } else if adds.iter().any(|a| a.tag == entry.tag) {
-            continue;
-        }
-        push_aux_entry(scratch, entry.tag, entry.type_byte, entry.value_bytes);
-    }
-    // Append `adds` (last-wins on a duplicate key), skipping the unmapped `PG`
-    // when the mapped read already carries one.
-    for (idx, a) in adds.iter().enumerate() {
-        if a.tag == pg && saw_pg {
-            continue;
-        }
-        if adds[idx + 1..].iter().any(|b| b.tag == a.tag) {
-            continue;
-        }
-        push_aux_entry(scratch, a.tag, a.type_byte, a.value_bytes);
-    }
-    record.truncate(off);
-    record.extend_from_slice(scratch);
-    saw_pg
 }
 
 /// Single-walk replacement for the two `normalize_int_tag_to_smallest_signed`
@@ -1215,6 +1204,9 @@ impl Zipper {
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
         let mut mapped_peek: Option<Template> = None;
         let mut templates_not_in_mapped_bam: u64 = 0;
+        // Reusable aux-rebuild buffer, threaded into every per-record merge so its
+        // allocation is reused across all templates on this serial thread.
+        let mut aux_scratch: Vec<u8> = Vec::new();
 
         for unmapped_result in unmapped_iter {
             let unmapped_template = unmapped_result?;
@@ -1225,7 +1217,13 @@ impl Zipper {
 
             if let Some(ref mut mapped_template) = mapped_peek {
                 if mapped_template.name() == unmapped_template.name() {
-                    merge_raw_with(&unmapped_template, mapped_template, tags, self.skip_tc_tags)?;
+                    merge_raw_with(
+                        &unmapped_template,
+                        mapped_template,
+                        tags,
+                        self.skip_tc_tags,
+                        &mut aux_scratch,
+                    )?;
                     if let Some(ref_reader) = reference {
                         // EM-seq: restore converted bases in-place on packed 4-bit nibbles.
                         restore_unconverted_bases_in_raw_template(
@@ -1523,8 +1521,9 @@ pub(crate) fn merge_one_template_with(
     skip_tc_tags: bool,
     reference: Option<&ReferenceReader>,
     output_header: &Header,
+    aux_scratch: &mut Vec<u8>,
 ) -> Result<()> {
-    merge_raw_with(unmapped, mapped, tags, skip_tc_tags)?;
+    merge_raw_with(unmapped, mapped, tags, skip_tc_tags, aux_scratch)?;
     if let Some(ref_reader) = reference {
         restore_unconverted_bases_in_raw_template(mapped, ref_reader, output_header)?;
     }
@@ -1635,6 +1634,11 @@ pub(crate) mod merge_step {
         accumulator: Vec<Template>,
         next_ordinal: u64,
         held: HeldSlot<Unpushed<BamTemplateBatch>>,
+        /// Reusable aux-rebuild scratch buffer, held on the step so its
+        /// allocation is reused across every template `emit_merged` processes
+        /// (matching the standalone `Zipper::run` path), rather than allocated
+        /// fresh per template.
+        aux_scratch: Vec<u8>,
         name: &'static str,
     }
 
@@ -1661,6 +1665,7 @@ pub(crate) mod merge_step {
                 accumulator: Vec::with_capacity(target),
                 next_ordinal: 0,
                 held: HeldSlot::new(),
+                aux_scratch: Vec::new(),
                 name: "ZipperMerge",
             }
         }
@@ -1752,6 +1757,7 @@ pub(crate) mod merge_step {
                 self.cfg.skip_tc_tags,
                 self.cfg.reference.as_deref(),
                 &self.cfg.output_header,
+                &mut self.aux_scratch,
             )
             .map_err(|e| io::Error::other(format!("ZipperMergeStep: {e}")))?;
             Ok(self.push_template(mapped, ctx))
@@ -2043,6 +2049,7 @@ pub(crate) mod merge_step {
                     step.cfg.skip_tc_tags,
                     step.cfg.reference.as_deref(),
                     &step.cfg.output_header,
+                    &mut Vec::new(),
                 )
                 .expect("merge ok");
 
@@ -2102,6 +2109,7 @@ pub(crate) mod merge_step {
                     step.cfg.skip_tc_tags,
                     step.cfg.reference.as_deref(),
                     &step.cfg.output_header,
+                    &mut Vec::new(),
                 )
                 .expect("merge ok");
 
@@ -2173,71 +2181,6 @@ mod tests {
             b.add_string_tag(*tag, val);
         }
         b.build().as_ref().to_vec()
-    }
-
-    /// The string value of `tag` in a raw record's aux, or `None`.
-    fn string_tag(record: &[u8], tag: SamTag) -> Option<Vec<u8>> {
-        let aux = fgumi_raw_bam::aux_data_slice(record);
-        fgumi_raw_bam::find_string_tag(aux, tag).map(<[u8]>::to_vec)
-    }
-
-    /// `copy_unmapped_tags_single_pass` upserts a key present on both the mapped
-    /// survivor and the unmapped copy set: the appended (unmapped) value wins and
-    /// there is exactly one copy — the byte-identity-critical collision path.
-    #[test]
-    fn copy_single_pass_upserts_a_key_on_both_survivor_and_adds() {
-        let mut rec = raw_record_with_string_tags(&[(SamTag::RX, b"OLD"), (SamTag::MI, b"mol1")]);
-        let adds = [fgumi_raw_bam::TagEntry {
-            tag: *SamTag::RX,
-            type_byte: b'Z',
-            value_bytes: b"NEW\x00",
-        }];
-        let mut scratch = Vec::new();
-
-        let saw_pg = copy_unmapped_tags_single_pass(&mut rec, &adds, &mut scratch);
-        assert!(!saw_pg, "no PG on the mapped read");
-        assert_eq!(
-            string_tag(&rec, SamTag::RX).as_deref(),
-            Some(&b"NEW"[..]),
-            "upserted value wins"
-        );
-        assert_eq!(
-            string_tag(&rec, SamTag::MI).as_deref(),
-            Some(&b"mol1"[..]),
-            "other survivor kept"
-        );
-        // Exactly one RX (survivor dropped, add appended once).
-        let n_rx = fgumi_raw_bam::RawTagsView::new(fgumi_raw_bam::aux_data_slice(&rec))
-            .iter()
-            .filter(|e| e.tag == *SamTag::RX)
-            .count();
-        assert_eq!(n_rx, 1, "exactly one RX after upsert");
-    }
-
-    /// PG precedence: the mapped read's own PG is kept, the unmapped PG is
-    /// dropped, and the helper reports `saw_pg = true` so the caller keeps the
-    /// reverse/revcomp transform off that surviving PG.
-    #[test]
-    fn copy_single_pass_keeps_mapped_pg_and_reports_saw_pg() {
-        let mut rec = raw_record_with_string_tags(&[(SamTag::PG, b"mapped-pg")]);
-        let adds = [
-            fgumi_raw_bam::TagEntry {
-                tag: *SamTag::PG,
-                type_byte: b'Z',
-                value_bytes: b"unmapped-pg\x00",
-            },
-            fgumi_raw_bam::TagEntry { tag: *SamTag::RX, type_byte: b'Z', value_bytes: b"AC\x00" },
-        ];
-        let mut scratch = Vec::new();
-
-        let saw_pg = copy_unmapped_tags_single_pass(&mut rec, &adds, &mut scratch);
-        assert!(saw_pg, "mapped read carried PG");
-        assert_eq!(
-            string_tag(&rec, SamTag::PG).as_deref(),
-            Some(&b"mapped-pg"[..]),
-            "mapped PG kept"
-        );
-        assert_eq!(string_tag(&rec, SamTag::RX).as_deref(), Some(&b"AC"[..]), "non-PG tag copied");
     }
 
     /// `normalize_as_xs_single_pass` re-encodes AS/XS to smallest-signed, appends
@@ -4249,6 +4192,154 @@ mod tests {
         // XS=50 fits in i8, should be normalized to Int8
         let xs_val = records[0].data().get(&Tag::from(SamTag::XS)).unwrap();
         assert!(matches!(xs_val, BufValue::Int8(50)), "XS=50 should be Int8, got {xs_val:?}");
+
+        Ok(())
+    }
+
+    /// The `adds_all.is_empty()` branch (no copyable tags from the unmapped read)
+    /// must still normalize AS/XS standalone. Here the unmapped read's only tag
+    /// (RX) is in the remove set, so `adds_all` is empty and the fold-into-copy
+    /// path is skipped; without the standalone normalize the mapped record's
+    /// Int32 AS/XS would ship un-shrunk.
+    #[test]
+    fn as_xs_normalized_even_when_adds_all_is_empty() -> Result<()> {
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
+
+        let mut attrs = HashMap::new();
+        attrs.insert("RX", BufValue::from("ACGT".to_string()));
+        unmapped.add_frag_with_attrs("q1", None, true, &attrs);
+
+        let mapped_rec = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(0)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 100)])
+                .sequence(&b"A".repeat(100))
+                .qualities(&[30u8; 100]);
+            b.add_int_tag(SamTag::AS, 77);
+            b.add_int_tag(SamTag::XS, 50);
+            to_record_buf(b.build())
+        };
+        mapped.push_record(mapped_rec);
+
+        // Remove RX -> adds_all is empty -> the standalone-normalize branch runs.
+        let records = run_zipper(&unmapped, &mapped, vec!["RX".to_string()], vec![], vec![])?;
+        assert_eq!(records.len(), 1);
+
+        let as_val = records[0].data().get(&Tag::from(SamTag::AS)).unwrap();
+        assert!(
+            matches!(as_val, BufValue::Int8(77)),
+            "AS must be normalized to Int8 via the empty-adds branch, got {as_val:?}"
+        );
+        let xs_val = records[0].data().get(&Tag::from(SamTag::XS)).unwrap();
+        assert!(
+            matches!(xs_val, BufValue::Int8(50)),
+            "XS must be normalized to Int8 via the empty-adds branch, got {xs_val:?}"
+        );
+        Ok(())
+    }
+
+    /// Regression for the coverage gap: a mapped record whose segment no unmapped
+    /// primary selects — here a supplementary R2 in a template whose unmapped side
+    /// carries only an R1 primary — is reached by neither the fused-copy path nor
+    /// the empty-adds branch, so `primary_reads() × collect_mapped_indices` never
+    /// visits it. Its AS/XS must still be normalized to smallest-signed by the
+    /// Step-5 fallback, in all builds. Before the fallback, such a record shipped
+    /// with an un-normalized (wider) AS/XS in release and tripped a `debug_assert!`
+    /// in debug. AS=200 encodes `C` (u8) and XS=300 encodes `S` (u16) on input; the
+    /// fallback re-encodes both to signed `s` (i16), which stays wider than `c`
+    /// only because the values exceed i8 — the point is that the type is rewritten
+    /// at all, which cannot happen unless the fallback ran.
+    #[test]
+    fn as_xs_normalized_for_mapped_record_no_unmapped_primary_selects() -> Result<()> {
+        use crate::template::Template;
+
+        const FLAG_UNMAPPED: u16 = 0x4;
+
+        // Covered path: R1 primary, reached via the unmapped R1 primary below.
+        let primary_r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 4)])
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4]);
+            b.add_int_tag(SamTag::AS, 200);
+            b.add_int_tag(SamTag::XS, 300);
+            b.build()
+        };
+
+        // Uncovered path: a supplementary R2 with no R2 primary in the template.
+        // The unmapped side has only an R1 primary, so the R2 segment is never
+        // selected — this record depends entirely on the Step-5 fallback.
+        let supplementary_r2 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ2 | FLAG_SUPPLEMENTARY)
+                .ref_id(5)
+                .pos(4999)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 4)])
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4]);
+            b.add_int_tag(SamTag::AS, 200);
+            b.add_int_tag(SamTag::XS, 300);
+            b.build()
+        };
+
+        let mut template = Template::from_records(vec![primary_r1, supplementary_r2])?;
+
+        let unmapped_record = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1").flags(FLAG_PAIRED | FLAG_READ1 | FLAG_UNMAPPED);
+            b.add_string_tag(SamTag::RX, b"AAAA");
+            b.sequence(b"ACGT").qualities(&[30u8; 4]);
+            b.build()
+        };
+        let unmapped = Template::from_records(vec![unmapped_record])?;
+
+        let tag_info = TagInfo::new(vec![], vec![], vec![]);
+        merge_raw(&unmapped, &mut template, &tag_info, true)?;
+
+        // Every mapped record — including the supplementary R2 no unmapped primary
+        // selected — has AS/XS re-encoded to signed `s` with its value preserved.
+        for record in template.records() {
+            let aux = fgumi_raw_bam::aux_data_slice(record);
+            assert_eq!(
+                fgumi_raw_bam::find_int_tag(aux, SamTag::AS),
+                Some(200),
+                "AS value preserved on every mapped record"
+            );
+            assert_eq!(
+                fgumi_raw_bam::find_int_tag(aux, SamTag::XS),
+                Some(300),
+                "XS value preserved on every mapped record"
+            );
+            assert_eq!(
+                fgumi_raw_bam::find_tag_type(aux, SamTag::AS),
+                Some(b's'),
+                "AS re-encoded to smallest-signed on every mapped record"
+            );
+            assert_eq!(
+                fgumi_raw_bam::find_tag_type(aux, SamTag::XS),
+                Some(b's'),
+                "XS re-encoded to smallest-signed on every mapped record"
+            );
+        }
+
+        // Guard the premise: the supplementary R2 really is present (and really is
+        // the record no unmapped primary would have selected).
+        assert!(
+            template.records().iter().any(|r| r.is_supplementary()),
+            "template must retain the supplementary R2"
+        );
 
         Ok(())
     }
