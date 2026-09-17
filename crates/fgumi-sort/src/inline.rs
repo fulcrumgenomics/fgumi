@@ -140,6 +140,25 @@ impl<K> InMemoryChunk<K> {
         self.data.slice(*offset as usize, *len as usize)
     }
 
+    /// The `i`th record's body length in bytes, WITHOUT touching the shared
+    /// data buffer.
+    ///
+    /// Reads only the per-record `len` field held in this chunk's contiguous
+    /// `records` index — so a scan over `record_len` is cache-friendly and stays
+    /// off the (cold) arena, unlike [`record_bytes`](Self::record_bytes) which
+    /// slices the backing buffer. The parallel fast-path gather in
+    /// `fgumi-pipeline-io`'s `SortMerge` uses this to plan output-block
+    /// boundaries (a count/byte-cap split) up front without paying the arena
+    /// cache-miss cost per record.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i >= self.len()`.
+    #[must_use]
+    pub fn record_len(&self, i: usize) -> u32 {
+        self.records[i].2
+    }
+
     /// Borrow the `i`th record's sort key.
     ///
     /// `pub` for the same reason as [`record_bytes`](Self::record_bytes).
