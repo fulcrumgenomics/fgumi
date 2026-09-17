@@ -211,6 +211,18 @@ pub(crate) enum ChainTailKind {
         closed_under_queryname: bool,
     },
 
+    /// The chain tail produces a borrowed [`RecordBatch`] (a flat backing buffer
+    /// with record byte ranges, no per-record `DecodedRecord`/`GroupKey`). Set by
+    /// `add_source`'s BAM arm when the first stage is a per-record transform that
+    /// reads no key (see
+    /// [`ChainBuilder::first_stage_uses_raw_record_fast_path`]); the source
+    /// preamble ends in `ParseBamRecords` rather than `DecodeRecords`. Consumed
+    /// by the fast-path per-record transform steps (single-record `Filter`
+    /// today).
+    ///
+    /// [`RecordBatch`]: crate::pipeline::steps::types::RecordBatch
+    RecordBatch,
+
     /// The chain tail produces serialized BGZF-ready bytes
     /// ([`DecompressedBlock`]) after a Terminal serialize step
     /// (`SerializeBamRecords` / `SerializeGroups`, the terminal
@@ -1077,6 +1089,19 @@ impl<'a> ChainBuilder<'a> {
                             let tail = self.pipeline.append_source(read_step);
                             self.current_tail = Some(tail);
                             self.chain_tail_kind = ChainTailKind::BgzfBlockArena;
+                        } else if self.first_stage_uses_raw_record_fast_path() {
+                            // Decode-free fast path: the first stage is a
+                            // per-record transform that reads no `GroupKey`, so
+                            // end the preamble at `ParseBamRecords` (borrowed
+                            // `RecordBatch`) instead of `DecodeRecords`, skipping
+                            // the per-record `DecodedRecord` allocation and the
+                            // dead key computation. `group_key_config` is unused
+                            // here (no `DecodeRecords`).
+                            let _ = group_key_config;
+                            let tail =
+                                self.build_bam_record_batch_preamble(reader, self.header.clone());
+                            self.current_tail = Some(tail);
+                            self.chain_tail_kind = ChainTailKind::RecordBatch;
                         } else {
                             let cut = self.source_batch_cut();
                             let tail = self.build_bam_decode_preamble(
@@ -1607,6 +1632,25 @@ impl<'a> ChainBuilder<'a> {
         Ok(())
     }
 
+    /// Whether the first stage is a per-record transform that reads no
+    /// `GroupKey` field, so a BAM source can feed it the borrowed [`RecordBatch`]
+    /// fast path (`ParseBamRecords`) instead of the owned `DecodedRecordBatch`
+    /// decode (`DecodeRecords`), skipping the per-record heap allocation and the
+    /// dead key computation.
+    ///
+    /// Only single-record `Filter` qualifies today (PRs for `CopyUmi`/`Retag`
+    /// extend this). `--filter-by-template` is excluded: it inserts a
+    /// `GroupByQueryname` grouper that reads `name_hash`, so it must keep the
+    /// `DecodedRecordBatch` tail. Consulted only inside the BAM arm of
+    /// [`Self::add_source`]; SAM source always keeps the `DecodedRecordBatch`
+    /// path (its `ParseSamChunk` re-encode is a different, non-hot ingest).
+    ///
+    /// [`RecordBatch`]: crate::pipeline::steps::types::RecordBatch
+    fn first_stage_uses_raw_record_fast_path(&self) -> bool {
+        matches!(self.spec.stages.first(), Some(Stage::Filter))
+            && self.spec.stage_opts.filter.as_ref().is_some_and(|f| !f.filter_by_template)
+    }
+
     /// Append the 4-step BAM decode preamble:
     /// `ReadBgzfBlocks → BgzfDecompress → FindBamBoundaries → DecodeRecords`.
     ///
@@ -1659,6 +1703,42 @@ impl<'a> ChainBuilder<'a> {
                 .with_closed_batches(closed),
             tail,
         )
+    }
+
+    /// The decode-free BAM preamble for per-record-transform fast-path stages:
+    /// `ReadBgzfBlocks → BgzfDecompress → FindBamBoundaries → ParseBamRecords`,
+    /// yielding a borrowed [`RecordBatch`] tail (no per-record `DecodedRecord`
+    /// allocation, no `GroupKey`). Mirrors [`Self::build_bam_decode_preamble`]
+    /// but ends in `ParseBamRecords` instead of `DecodeRecords`; used only when
+    /// [`Self::first_stage_uses_raw_record_fast_path`] holds.
+    ///
+    /// [`RecordBatch`]: crate::pipeline::steps::types::RecordBatch
+    fn build_bam_record_batch_preamble(
+        &mut self,
+        reader: Box<dyn std::io::Read + Send>,
+        header: Header,
+    ) -> (crate::pipeline::core::topology::StepIdx, crate::pipeline::core::topology::BranchIdx)
+    {
+        use crate::pipeline::steps::bgzf::decompress::BgzfDecompress;
+        use crate::pipeline::steps::boundaries::bam::FindBamBoundaries;
+        use crate::pipeline::steps::parse::bam::ParseBamRecords;
+        use crate::pipeline::steps::source::read_bam::read_bam_from_reader;
+
+        let (read_step, _) = read_bam_from_reader(
+            reader,
+            header,
+            self.tuning.blocks_per_batch,
+            self.tuning.per_step_byte_limit,
+        );
+        let tail = self.pipeline.append_source(read_step);
+        let tail = self.pipeline.append_step(
+            BgzfDecompress::new_with_crc(self.tuning.per_step_byte_limit, self.spec.verify_crc),
+            tail,
+        );
+        let tail = self
+            .pipeline
+            .append_step(FindBamBoundaries::new(self.tuning.per_step_byte_limit), tail);
+        self.pipeline.append_step(ParseBamRecords::new(self.tuning.per_step_byte_limit), tail)
     }
 
     /// Append the 2-step SAM parse preamble:
@@ -5165,7 +5245,8 @@ impl<'a> ChainBuilder<'a> {
         use crate::logging::OperationTimer;
         use crate::pipeline::chains::commands::filter::{
             FilterFinalizeHook, FilterStatsFinalizeHook, build_filter_step_single_no_rejects,
-            build_filter_step_single_with_rejects, build_filter_step_template_no_rejects,
+            build_filter_step_single_no_rejects_raw, build_filter_step_single_with_rejects,
+            build_filter_step_single_with_rejects_raw, build_filter_step_template_no_rejects,
             build_filter_step_template_with_rejects,
         };
         use crate::validation::validate_file_exists;
@@ -5185,11 +5266,18 @@ impl<'a> ChainBuilder<'a> {
         // stage left a different tail type (e.g. an intermediate Group emits
         // BatchedProcessedPositionGroups), the type-erased pipeline would build but
         // panic at dispatch — reject it here.
-        if !matches!(self.chain_tail_kind, ChainTailKind::DecodedRecordBatch { .. }) {
+        // Filter consumes a record stream: the owned `DecodedRecordBatch` (SAM
+        // source, or `--filter-by-template`) or the borrowed `RecordBatch`
+        // decode-free fast path (BAM single-record filter — see
+        // `first_stage_uses_raw_record_fast_path`).
+        if !matches!(
+            self.chain_tail_kind,
+            ChainTailKind::DecodedRecordBatch { .. } | ChainTailKind::RecordBatch
+        ) {
             bail!(
-                "Stage::Filter requires a record-stream input (DecodedRecordBatch), but the chain \
-                 tail is {:?}; filter cannot follow a stage that emits grouped templates or \
-                 serialized bytes.",
+                "Stage::Filter requires a record-stream input (DecodedRecordBatch or RecordBatch), \
+                 but the chain tail is {:?}; filter cannot follow a stage that emits grouped \
+                 templates or serialized bytes.",
                 self.chain_tail_kind
             );
         }
@@ -5278,31 +5366,64 @@ impl<'a> ChainBuilder<'a> {
         let filter_by_template = filter.filter_by_template;
         let track_rejects = filter.rejects.is_some();
 
+        // The borrowed `RecordBatch` fast path is single-record only; the
+        // template grouper needs the owned `DecodedRecordBatch`.
+        // `first_stage_uses_raw_record_fast_path` already excludes
+        // `--filter-by-template`, so this pairing is unreachable — assert it
+        // rather than silently mis-wire a `GroupByQueryname` onto a RecordBatch.
+        let on_fast_path = self.chain_tail_kind == ChainTailKind::RecordBatch;
+        if on_fast_path && filter_by_template {
+            bail!(
+                "internal error: --filter-by-template reached the decode-free RecordBatch fast \
+                 path, which cannot feed the template grouper"
+            );
+        }
+
         // If template-aware, insert the queryname grouper before process — the
         // parallel `AssembleTemplates` map when the source cut left batches closed
         // under queryname (filter-by-template first stage), else the serial
         // `GroupByQueryname`.
         let tail = if filter_by_template { self.append_queryname_grouper(tail) } else { tail };
 
-        // Select and append the process step (kept-only or kept+rejects).
+        // Select and append the process step (kept-only or kept+rejects). On the
+        // decode-free fast path (`on_fast_path`) the single-record steps consume
+        // a borrowed `RecordBatch`; otherwise the owned `DecodedRecordBatch`.
         let process_tail = match (filter_by_template, track_rejects) {
             (false, false) => {
                 let captures = filter.process_captures(&setup, &self.header);
-                let step = build_filter_step_single_no_rejects(
-                    self.tuning.per_step_byte_limit,
-                    captures,
-                    Arc::clone(&accumulators),
-                );
-                self.pipeline.append_step(step, tail)
+                if on_fast_path {
+                    let step = build_filter_step_single_no_rejects_raw(
+                        self.tuning.per_step_byte_limit,
+                        captures,
+                        Arc::clone(&accumulators),
+                    );
+                    self.pipeline.append_step(step, tail)
+                } else {
+                    let step = build_filter_step_single_no_rejects(
+                        self.tuning.per_step_byte_limit,
+                        captures,
+                        Arc::clone(&accumulators),
+                    );
+                    self.pipeline.append_step(step, tail)
+                }
             }
             (false, true) => {
                 let captures = filter.process_captures(&setup, &self.header);
-                let step = build_filter_step_single_with_rejects(
-                    self.tuning.per_step_byte_limit,
-                    captures,
-                    Arc::clone(&accumulators),
-                );
-                self.pipeline.append_step(step, tail)
+                if on_fast_path {
+                    let step = build_filter_step_single_with_rejects_raw(
+                        self.tuning.per_step_byte_limit,
+                        captures,
+                        Arc::clone(&accumulators),
+                    );
+                    self.pipeline.append_step(step, tail)
+                } else {
+                    let step = build_filter_step_single_with_rejects(
+                        self.tuning.per_step_byte_limit,
+                        captures,
+                        Arc::clone(&accumulators),
+                    );
+                    self.pipeline.append_step(step, tail)
+                }
             }
             (true, false) => {
                 let captures = filter.process_captures(&setup, &self.header);
@@ -5937,6 +6058,41 @@ mod tests {
             fgumi_bam_io::KeyMode::NameHashOnly,
             "Stage::Filter as the first stage must skip the discarded position/RG/CB key"
         );
+    }
+
+    fn filter_opts(filter_by_template: bool) -> crate::commands::filter::FilterOptions {
+        crate::commands::filter::FilterOptions { filter_by_template, ..Default::default() }
+    }
+
+    /// A single-record `Filter` first stage (not `--filter-by-template`) reads no
+    /// `GroupKey` field, so a BAM source can feed it the borrowed `RecordBatch`
+    /// fast path instead of the owned `DecodedRecordBatch` decode.
+    #[test]
+    fn first_stage_uses_raw_record_fast_path_true_for_single_record_filter() {
+        let mut spec = empty_spec(vec![Stage::Filter]);
+        spec.stage_opts.filter = Some(filter_opts(false));
+        let builder = chain_builder_for_stages(&spec);
+        assert!(builder.first_stage_uses_raw_record_fast_path());
+    }
+
+    /// `--filter-by-template` inserts a `GroupByQueryname` grouper that reads
+    /// `name_hash`, so it must stay on the `DecodedRecordBatch` path — the fast
+    /// path would starve the grouper of the key it needs.
+    #[test]
+    fn first_stage_uses_raw_record_fast_path_false_for_filter_by_template() {
+        let mut spec = empty_spec(vec![Stage::Filter]);
+        spec.stage_opts.filter = Some(filter_opts(true));
+        let builder = chain_builder_for_stages(&spec);
+        assert!(!builder.first_stage_uses_raw_record_fast_path());
+    }
+
+    /// A first stage that genuinely needs the full key (e.g. `Group`) is never
+    /// routed to the fast path.
+    #[test]
+    fn first_stage_uses_raw_record_fast_path_false_for_group() {
+        let spec = empty_spec(vec![Stage::Group]);
+        let builder = chain_builder_for_stages(&spec);
+        assert!(!builder.first_stage_uses_raw_record_fast_path());
     }
 
     /// `source_group_key_config` routes a chain-clip first stage to the cheap
