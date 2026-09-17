@@ -1859,6 +1859,7 @@ impl<'a> ChainBuilder<'a> {
             Stage::Align => self.add_align(position),
             Stage::Extract => self.add_extract(position),
             Stage::Fastq => self.add_fastq(position),
+            Stage::Metrics => self.add_metrics(position),
             Stage::Downsample => {
                 Err(anyhow!("Stage::Downsample is out of scope — not on the typed-step pipeline"))
             }
@@ -1966,8 +1967,16 @@ impl<'a> ChainBuilder<'a> {
             return self.wire_fastq_output(tail, &out1);
         }
 
+        // A no-output chain (the metrics stage) terminates at its own
+        // `Outputs = ()` sink step, so there is nothing to wire here. The
+        // cross-stage validator guarantees `SinkSpec::None` only pairs with a
+        // `Stage::Metrics` terminal.
+        if matches!(self.spec.sink, SinkSpec::None) {
+            return Ok(());
+        }
+
         let tail = self.current_tail.expect("add_sink called before add_source");
-        let output_path = self.spec.sink.path();
+        let output_path = self.spec.sink.output_path();
 
         // `SinkSpec::BamWithIndex` selects the inline BAI indexer: `BgzfCompress`
         // emits a `BamIndexManifest` alongside each block it produces, and
@@ -2332,7 +2341,7 @@ impl<'a> ChainBuilder<'a> {
 
         let tail = self.current_tail.expect("add_extract called before add_source");
 
-        let output_path = self.spec.sink.path().clone();
+        let output_path = self.spec.sink.output_path().clone();
 
         let timer = OperationTimer::new("Extracting UMIs");
 
@@ -2485,7 +2494,7 @@ impl<'a> ChainBuilder<'a> {
 
         // Resolve source path for log messages only.
         let input_path = self.resolve_log_input_path();
-        let output_path = self.spec.sink.path().clone();
+        let output_path = self.spec.sink.output_path().clone();
 
         let timer = OperationTimer::new("Correcting UMIs (new pipeline)");
 
@@ -3459,7 +3468,7 @@ impl<'a> ChainBuilder<'a> {
                 // produced as part of the sink's own drained-finish, not by a
                 // post-pipeline re-read step queued from this branch.
                 if let Some(slot) = sort_stats_slot {
-                    let output_path = self.spec.sink.path().clone();
+                    let output_path = self.spec.sink.output_path().clone();
                     self.finalize_on_success.push(Box::new(
                         crate::pipeline::chains::commands::sort::SortSummaryFinalizeHook {
                             stats_slot: slot,
@@ -3587,7 +3596,7 @@ impl<'a> ChainBuilder<'a> {
 
         // Resolve source path for log messages only.
         let input_path = self.resolve_log_input_path();
-        let output_path = self.spec.sink.path().clone();
+        let output_path = self.spec.sink.output_path().clone();
 
         let timer = OperationTimer::new("Grouping reads by UMI");
 
@@ -3856,6 +3865,193 @@ impl<'a> ChainBuilder<'a> {
         bail!("fgumi was built without consensus support; rebuild with `--features consensus`")
     }
 
+    #[cfg(not(feature = "consensus"))]
+    #[allow(clippy::unused_self)]
+    fn add_metrics(&mut self, _position: StagePosition) -> Result<()> {
+        bail!("fgumi was built without consensus support; rebuild with `--features consensus`")
+    }
+
+    /// Metrics-only terminal stage (`simplex-metrics` / `duplex-metrics`):
+    ///
+    /// `GroupByMi` → [`MetricsSink`] (a `Parallel`, `Outputs = ()` sink).
+    ///
+    /// Reuses the parallel BAM decode + MI-grouping front end the consensus
+    /// stages use, then records each batch's coordinate-group metrics into a
+    /// per-thread [`ConsensusMetricsCaptures`] accumulator via the SAME
+    /// `push_mi_group_entries` → `split_into_runs` → `classify_batch_runs` →
+    /// `BoundaryReorder::submit` machinery as the consensus metrics-on path —
+    /// minus the consensus calling. No BAM is written (`SinkSpec::None`); the
+    /// registered [`ConsensusMetricsFinalizeHook`] merges the per-thread slots
+    /// and writes the byte-identical TSVs after the pipeline drains.
+    ///
+    /// Standalone-only and always terminal: `validate_stage_progression` rejects
+    /// any multi-stage chain containing `Stage::Metrics`, so the tail here is
+    /// always the source's `DecodedRecordBatch`. Simplex vs duplex is chosen by
+    /// which metrics options slot is filled (`simplex_metrics` vs
+    /// `duplex_metrics`); the two differ only in the accumulator mode, the yield
+    /// thresholds, and whether `GroupByMi` strips the `/A` `/B` strand suffix so
+    /// both strands of a duplex co-group.
+    ///
+    /// [`MetricsSink`]: crate::pipeline::steps::sink::metrics::MetricsSink
+    /// [`ConsensusMetricsCaptures`]: crate::inline_metrics_collector::ConsensusMetricsCaptures
+    /// [`ConsensusMetricsFinalizeHook`]: crate::inline_metrics_collector::ConsensusMetricsFinalizeHook
+    #[cfg(feature = "consensus")]
+    #[allow(clippy::items_after_statements)]
+    fn add_metrics(&mut self, position: StagePosition) -> Result<()> {
+        use crate::commands::common::{consensus_pregroup_keep_raw, warn_unwired_pipeline_flags};
+        use crate::inline_metrics_collector::{
+            ConsensusMetricsFinalizeHook, ConsensusMetricsSlot, MetricsThresholds,
+        };
+        use crate::pipeline::steps::group::mi::GroupByMi;
+        use crate::pipeline::steps::sink::metrics::MetricsSink;
+        use crate::sam::SamTag;
+        use fgumi_umi::extract_mi_base;
+        use log::info;
+
+        debug_assert_eq!(position, StagePosition::Terminal, "Stage::Metrics is always terminal");
+
+        // Per-mode parameters resolved from whichever metrics slot is filled.
+        // Simplex and duplex share everything else (front end, sink, finalize
+        // wiring); they differ only in these fields.
+        struct MetricsStageParams<'a> {
+            output: &'a std::path::Path,
+            intervals_path: Option<&'a std::path::PathBuf>,
+            new_slot: fn() -> ConsensusMetricsSlot,
+            thresholds: MetricsThresholds,
+            /// Strip the `/A` `/B` MI suffix so both duplex strands co-group.
+            strip_strand: bool,
+            banner: &'static str,
+        }
+
+        // At most one metrics slot is filled — the cross-stage validator rejects a
+        // both-filled bag before build, so the `duplex`-first selection below is
+        // unambiguous.
+        let params = if let Some(duplex) = self.spec.stage_opts.duplex_metrics.as_ref() {
+            MetricsStageParams {
+                output: &duplex.output,
+                intervals_path: duplex.intervals.as_ref(),
+                // Non-capturing, so each arm coerces to the same `fn` pointer.
+                new_slot: if duplex.duplex_umi_counts {
+                    || ConsensusMetricsSlot::new_duplex(true)
+                } else {
+                    || ConsensusMetricsSlot::new_duplex(false)
+                },
+                thresholds: MetricsThresholds::Duplex {
+                    min_ab_reads: duplex.min_ab_reads,
+                    min_ba_reads: duplex.min_ba_reads,
+                },
+                strip_strand: true,
+                banner: "DuplexMetrics",
+            }
+        } else if let Some(simplex) = self.spec.stage_opts.simplex_metrics.as_ref() {
+            MetricsStageParams {
+                output: &simplex.output,
+                intervals_path: simplex.intervals.as_ref(),
+                new_slot: ConsensusMetricsSlot::new_simplex,
+                thresholds: MetricsThresholds::Simplex { min_reads: simplex.min_reads },
+                strip_strand: false,
+                banner: "SimplexMetrics",
+            }
+        } else {
+            bail!(
+                "Stage::Metrics options missing from StageOptionsBag (simplex_metrics/duplex_metrics)"
+            );
+        };
+        let MetricsStageParams {
+            output,
+            intervals_path,
+            new_slot,
+            thresholds,
+            strip_strand,
+            banner,
+        } = params;
+
+        let input_path = self.resolve_log_input_path();
+
+        // NB: unlike the consensus stages, the metrics path does NOT enforce a
+        // template-coordinate sort-order header guard. The serial
+        // `process_templates_from_bam` path this replaces accepts any header and
+        // simply assumes the input is already consecutively grouped by
+        // coordinate/MI (exactly as `GroupByMi` does here) — so guarding the
+        // header would reject inputs the serial path accepts, breaking byte
+        // parity. Metrics is a lenient QC tool; mis-sorted input yields wrong
+        // counts, not corruption, matching the serial path's behavior.
+
+        info!("Starting {banner}");
+        info!("Input: {}", input_path.display());
+        info!("Output prefix: {}", output.display());
+
+        warn_unwired_pipeline_flags(&self.spec.scheduler);
+        let num_threads = self.spec.threading.num_threads();
+        info!("{}", self.spec.threading.log_message());
+        info!("Using pipeline with {num_threads} threads");
+
+        let tail = self.current_tail.expect("add_metrics called before add_source");
+
+        // Shared per-thread accumulator + boundary reorder + parsed intervals +
+        // output prefix. `build_consensus_metrics_captures` is the exact recipe
+        // the consensus T2 path uses.
+        let captures = Arc::new(build_consensus_metrics_captures(
+            output,
+            intervals_path,
+            num_threads,
+            new_slot,
+        )?);
+
+        // The metrics recorder reads INPUT records grouped by MI, whose ref ids
+        // index the input header — the same header the source decoded against.
+        let header_arc = Arc::new(self.header.clone());
+        let library_index_arc = Arc::new(fgumi_bam_io::LibraryIndex::from_header(&self.header)?);
+
+        // DecodedRecordBatch → GroupByMi → BatchedMiGroups. The metrics R1/R2
+        // filter (paired + both mapped + primary) matches
+        // `consensus_pregroup_keep_raw(_, false)`, and `pair_records_by_read_name`
+        // re-applies it, so pre-filtering here only trims work — it cannot change
+        // the counted set. Duplex strips the `/A` `/B` MI suffix so both strands
+        // of a molecule land in the same MI group (matching `add_duplex`); the
+        // grouping key the metrics recorder ultimately uses is the coordinate
+        // `ReadInfoKey`, which is identical across both strands regardless.
+        let mut group_mi_step = GroupByMi::new(*SamTag::MI, self.tuning.per_step_byte_limit)
+            .with_cell_tag(Some(*SamTag::CB))
+            .with_record_filter(move |raw| consensus_pregroup_keep_raw(raw, false));
+        if strip_strand {
+            group_mi_step = group_mi_step.with_mi_transform(|mi_bytes: &[u8]| {
+                extract_mi_base(&String::from_utf8_lossy(mi_bytes)).to_string()
+            });
+        }
+        let tail = self.pipeline.append_step(group_mi_step, tail);
+
+        // Terminal metrics sink: records into the per-thread accumulator and
+        // emits nothing. This terminates the chain (add_sink is a no-op for
+        // SinkSpec::None).
+        let sink = MetricsSink::new(
+            Arc::clone(&captures),
+            Arc::clone(&header_arc),
+            library_index_arc,
+            Arc::new(input_path.clone()),
+        );
+        let tail = self.pipeline.append_step(sink, tail);
+        self.current_tail = Some(tail);
+        self.chain_tail_kind = ChainTailKind::SerializedBytes;
+
+        // Write the TSVs only on a fully successful run (matches the consensus
+        // metrics path: a partial run must not publish metrics files). The hook
+        // merges the per-thread slots, closes the final open boundary group, and
+        // writes the byte-identical simplex/duplex TSVs.
+        self.finalize_on_success.push(Box::new(ConsensusMetricsFinalizeHook {
+            accumulators: Arc::clone(&captures.accumulator),
+            output_prefix: captures.output_prefix.clone(),
+            intervals: captures.intervals.clone(),
+            reorder: Arc::clone(&captures.reorder),
+            thresholds,
+        }));
+
+        // Pipeline wall time is logged by the chain-level `StageTimingFinalizeHook`
+        // that `build()` prepends, so no per-stage timer hook is needed here.
+
+        Ok(())
+    }
+
     /// Simplex-specific step sequence:
     ///
     /// `GroupByMi` →
@@ -3955,7 +4151,7 @@ impl<'a> ChainBuilder<'a> {
 
         let tail = self.current_tail.expect("add_simplex called before add_source");
 
-        let output_path = self.spec.sink.path().clone();
+        let output_path = self.spec.sink.output_path().clone();
 
         let timer = OperationTimer::new("Calling simplex consensus");
 
@@ -4335,7 +4531,7 @@ impl<'a> ChainBuilder<'a> {
 
         let tail = self.current_tail.expect("add_duplex called before add_source");
 
-        let output_path = self.spec.sink.path().clone();
+        let output_path = self.spec.sink.output_path().clone();
 
         let timer = OperationTimer::new("Calling duplex consensus");
 
@@ -4702,7 +4898,7 @@ impl<'a> ChainBuilder<'a> {
 
         let tail = self.current_tail.expect("add_codec called before add_source");
 
-        let output_path = self.spec.sink.path().clone();
+        let output_path = self.spec.sink.output_path().clone();
 
         let timer = OperationTimer::new("Calling CODEC consensus");
 
@@ -5024,7 +5220,7 @@ impl<'a> ChainBuilder<'a> {
 
         // Resolve source path for log messages only.
         let input_path = self.resolve_log_input_path();
-        let output_path = self.spec.sink.path().clone();
+        let output_path = self.spec.sink.output_path().clone();
 
         // Reference is always required for clip.
         crate::validation::validate_file_exists(&clip.reference, "Reference FASTA")?;
@@ -5205,7 +5401,7 @@ impl<'a> ChainBuilder<'a> {
         }
 
         let timer = OperationTimer::new("Copying UMIs from read names");
-        let output_path = self.spec.sink.path().clone();
+        let output_path = self.spec.sink.output_path().clone();
         info!("Starting copy-umi");
         info!("Input: {}", input_path.display());
         info!("Output: {}", output_path.display());
@@ -5361,7 +5557,7 @@ impl<'a> ChainBuilder<'a> {
         let timer = OperationTimer::new("Filtering consensus reads");
 
         // Resolve output path for log.
-        let output_path = self.spec.sink.path().clone();
+        let output_path = self.spec.sink.output_path().clone();
 
         info!("Starting Filter");
         info!("Input: {}", input_path.display());
@@ -5602,7 +5798,7 @@ impl<'a> ChainBuilder<'a> {
         }
 
         let timer = OperationTimer::new("Rewriting tags");
-        let output_path = self.spec.sink.path().clone();
+        let output_path = self.spec.sink.output_path().clone();
         info!("Starting Retag");
         info!("Input: {}", input_path.display());
         info!("Output: {}", output_path.display());
@@ -5742,7 +5938,7 @@ impl<'a> ChainBuilder<'a> {
 
         // Resolve source path for log messages only (mirrors `add_group`).
         let input_path = self.resolve_log_input_path();
-        let output_path = self.spec.sink.path().clone();
+        let output_path = self.spec.sink.output_path().clone();
 
         info!("Starting dedup");
         info!("Input: {}", input_path.display());

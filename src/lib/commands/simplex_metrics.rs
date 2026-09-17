@@ -7,6 +7,9 @@
 //! - UMI observation frequencies
 //! - Optional PDF plots via an embedded R script
 
+use crate::commands::common::{
+    CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
+};
 use crate::logging::OperationTimer;
 use crate::metrics::simplex::SimplexMetricsCollector;
 use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
@@ -21,6 +24,23 @@ use super::shared_metrics::{
     DOWNSAMPLING_FRACTIONS, execute_r_script, is_r_available, parse_intervals,
     process_templates_from_bam, record_simplex_coordinate_group,
 };
+
+/// Projected options the chain builder needs for the simplex-metrics stage.
+///
+/// A free-standing struct (mirrors `RetagOptions`/`FilterOptions`) carrying the
+/// three fields `add_metrics` reads: the output prefix, the `--min-reads`
+/// threshold, and the optional intervals path. Threading/compression come from
+/// the [`crate::pipeline::chains::SingleStageContext`], so they are not carried
+/// here.
+#[derive(Debug, Clone)]
+pub struct SimplexMetricsOptions {
+    /// Output prefix for the metrics TSV files.
+    pub output: PathBuf,
+    /// Minimum reads per SS family to count as a consensus family in yield metrics.
+    pub min_reads: usize,
+    /// Optional intervals file (BED or Picard interval-list) restricting analysis.
+    pub intervals: Option<PathBuf>,
+}
 
 /// Embedded R script for PDF plot generation (bundled with binary).
 const R_SCRIPT: &str = include_str!("../../../resources/CollectSimplexSeqMetrics.R");
@@ -57,6 +77,8 @@ The following output files are produced:
 4. **<output>.simplex_qc.pdf**: (optional) a series of plots generated from the preceding metrics files for
                                visualization. This file is only produced if R is available with the required
                                packages (ggplot2 and scales). Use `--description` to customize plot titles.
+                               NOTE: the PDF (and `--description`) are not produced on the parallel
+                               `--threads` path, which writes only the metrics TSVs; omit `--threads` for the PDF.
 
 Within the metrics files the prefixes `CS` and `SS` are used to mean:
 
@@ -87,16 +109,78 @@ pub struct SimplexMetrics {
     /// so plot titles differ unless this is set).
     #[arg(long = "description")]
     pub description: Option<String>,
+
+    /// Threading options. When `--threads N` is set, metrics collection runs on
+    /// the typed-step pipeline (parallel BGZF decode + MI-grouping + parallel
+    /// per-thread metric accumulation). Absent `--threads`, the original
+    /// single-pass streaming collector runs, producing byte-identical output.
+    #[command(flatten)]
+    pub threading: ThreadingOptions,
+
+    /// Scheduler and pipeline stats options (chain path only).
+    #[command(flatten)]
+    pub scheduler_opts: SchedulerOptions,
+
+    /// Pipeline queue memory options (chain path only).
+    #[command(flatten)]
+    pub queue_memory: QueueMemoryOptions,
+}
+
+impl SimplexMetrics {
+    /// Project the clap fields into [`SimplexMetricsOptions`] for the chain builder.
+    #[must_use]
+    pub fn to_simplex_metrics_options(&self) -> SimplexMetricsOptions {
+        SimplexMetricsOptions {
+            output: self.output.clone(),
+            min_reads: self.min_reads,
+            intervals: self.intervals.clone(),
+        }
+    }
+
+    /// Run simplex-metrics on the declarative chain builder: a single
+    /// `Stage::Metrics` chain with the simplex slot filled and a `SinkSpec::None`
+    /// (no BAM output). Selected when `--threads` is set; the metrics files are
+    /// written byte-identically to the serial path by the chain's finalize hook.
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        use crate::commands::common::BamIoOptions;
+        use crate::pipeline::chains::{ChainSpec, SingleStageContext, StageOptionsBag, build_for};
+
+        // The metrics chain reads only `io.input` (+ CRC/async-reader policy);
+        // `io.output` is ignored (metrics carry their own `--output` prefix in
+        // the stage options and the sink is `None`), so a dummy output keeps the
+        // shared `BamIoOptions`/`SingleStageContext` shape without a BAM write.
+        let io = BamIoOptions {
+            input: self.input.clone(),
+            output: PathBuf::from("/dev/null"),
+            ..Default::default()
+        };
+        let stage_opts = StageOptionsBag {
+            simplex_metrics: Some(self.to_simplex_metrics_options()),
+            ..Default::default()
+        };
+        // Metrics write no BAM, so compression is never used; a default keeps the
+        // uniform `SingleStageContext` shape without exposing an inert
+        // `--compression-level` flag on this command.
+        let compression = CompressionOptions::default();
+        let ctx = SingleStageContext {
+            io: &io,
+            threading: &self.threading,
+            compression: &compression,
+            scheduler: &self.scheduler_opts,
+            queue_memory: &self.queue_memory,
+            command_line,
+        };
+        let spec = ChainSpec::single_stage_metrics(stage_opts, &ctx);
+        build_for(spec)?.run()
+    }
 }
 
 impl Command for SimplexMetrics {
-    fn execute(&self, _command_line: &str) -> Result<()> {
+    fn execute(&self, command_line: &str) -> Result<()> {
         info!("SimplexMetrics");
         info!("  Input: {}", self.input.display());
         info!("  Output prefix: {}", self.output.display());
         info!("  Min reads: {}", self.min_reads);
-
-        let timer = OperationTimer::new("Computing simplex metrics");
 
         // Validate inputs
         validate_input_exists(&self.input, "input BAM")?;
@@ -106,6 +190,33 @@ impl Command for SimplexMetrics {
         if self.min_reads == 0 {
             anyhow::bail!("--min-reads must be >= 1 (got {})", self.min_reads);
         }
+
+        // With `--threads`, run the parallel typed-step chain (parallel decode +
+        // MI-grouping + per-thread metric accumulation). It writes the SAME TSV
+        // files (family_sizes/umi_counts/simplex_yield_metrics) byte-identically
+        // via the chain's finalize hook. The R/PDF step is chain-independent and
+        // not reproduced there yet, so the chain path emits the three metrics
+        // TSVs only (no PDF); the default (serial) path below keeps the PDF.
+        if self.threading.threads.is_some() {
+            // The parallel path writes the metrics TSVs only — it does not run the
+            // R/PDF plot step. Surface that (and the resulting `--description`
+            // no-op) so the flags read as inert rather than silently dropped,
+            // mirroring the `warn_unwired_pipeline_flags` diagnostics.
+            log::warn!(
+                "--threads runs metrics on the parallel pipeline, which writes the metrics \
+                 TSVs only and does not generate the *.simplex_qc.pdf plot; run without \
+                 --threads to produce the PDF"
+            );
+            if self.description.is_some() {
+                log::warn!(
+                    "--description customizes the PDF plot title only, so it is ignored on \
+                     the --threads path (no PDF is generated)"
+                );
+            }
+            return self.execute_chain(command_line);
+        }
+
+        let timer = OperationTimer::new("Computing simplex metrics");
 
         // Load intervals if provided
         let intervals = if let Some(intervals_path) = &self.intervals {
@@ -386,9 +497,129 @@ mod tests {
             min_reads: 0,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
         let err = cmd.execute("test").expect_err("must reject --min-reads 0");
         assert!(err.to_string().contains("min-reads must be >= 1"), "unexpected: {err}");
+        Ok(())
+    }
+
+    /// The typed-step chain path (`--threads N`) must produce byte-identical
+    /// metrics TSVs to the original single-pass serial path (`--threads` absent).
+    ///
+    /// Builds a BAM spanning many coordinate groups (distinct positions) with a
+    /// few MI families each, so a 4-worker run shards groups across workers and
+    /// exercises the `BoundaryReorder` cross-batch closing. Runs the command
+    /// serially and with `--threads 4` into separate output prefixes, then diffs
+    /// every emitted TSV byte-for-byte — the end-to-end guard that the parallel
+    /// per-thread accumulation + merge reassembles the metrics losslessly
+    /// regardless of how groups are partitioned across workers.
+    #[test]
+    fn chain_threads_output_matches_serial() -> Result<()> {
+        // Many small coordinate groups (distinct positions) with 1-3 templates
+        // across 1-2 MI families each, so a 4-worker run distributes groups. RX
+        // is drawn from a small pool so a coordinate group carries a MIX of
+        // distinct and tied UMIs — otherwise a constant RX makes umi_counts.txt
+        // parity blind to any within-family read reordering the chain path might
+        // introduce (which `pair_records_by_read_name` is written to preserve).
+        const RX_POOL: [&str; 4] = ["ACGT", "TGCA", "GGCC", "AATT"];
+        let mut records = Vec::new();
+        for g in 0..300i32 {
+            let pos1 = 100 + g * 10;
+            let pos2 = pos1 + 100;
+            for k in 0..=(g % 3) {
+                let mi = format!("{}/A", g * 2 + (k % 2));
+                #[allow(clippy::cast_sign_loss)]
+                let rx = RX_POOL[((g + k) as usize) % RX_POOL.len()];
+                let (r1, r2) = build_test_pair(&format!("g{g}_k{k}"), 0, pos1, pos2, rx, &mi);
+                records.push(r1);
+                records.push(r2);
+            }
+        }
+        let input = create_test_bam(records)?;
+        let dir = TempDir::new()?;
+
+        let run = |threads: Option<usize>, prefix: &str| -> Result<std::path::PathBuf> {
+            let out = dir.path().join(prefix);
+            let cmd = SimplexMetrics {
+                input: input.path().to_path_buf(),
+                output: out.clone(),
+                min_reads: 1,
+                intervals: None,
+                description: None,
+                threading: crate::commands::common::ThreadingOptions { threads },
+                scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+                queue_memory: crate::commands::common::QueueMemoryOptions::default(),
+            };
+            cmd.execute("test")?;
+            Ok(out)
+        };
+
+        let serial = run(None, "serial")?;
+        let chain = run(Some(4), "chain")?;
+
+        for suffix in ["family_sizes.txt", "umi_counts.txt", "simplex_yield_metrics.txt"] {
+            let s = std::fs::read(format!("{}.{suffix}", serial.display()))?;
+            let c = std::fs::read(format!("{}.{suffix}", chain.display()))?;
+            assert_eq!(s, c, "{suffix} differs between the serial and --threads 4 chain paths");
+        }
+        Ok(())
+    }
+
+    /// `--intervals` must be honored identically on the chain (`--threads`) path
+    /// and the serial path. Builds groups spanning a wide position range, writes a
+    /// BED covering only part of it (so some groups are excluded), and diffs the
+    /// TSVs between serial+intervals and `--threads 4`+intervals — the guard that
+    /// the intervals wiring on the parallel path filters the same groups, so a
+    /// broken chain-path wiring cannot silently produce unfiltered counts.
+    #[test]
+    fn chain_threads_intervals_match_serial() -> Result<()> {
+        let mut records = Vec::new();
+        for g in 0..120i32 {
+            let pos1 = 100 + g * 20;
+            let pos2 = pos1 + 100;
+            let mi = format!("{g}/A");
+            let (r1, r2) = build_test_pair(&format!("g{g}"), 0, pos1, pos2, "ACGT", &mi);
+            records.push(r1);
+            records.push(r2);
+        }
+        let input = create_test_bam(records)?;
+        let dir = TempDir::new()?;
+        // BED (0-based half-open) covering only chr1:0-1200, so groups whose
+        // coordinate is past ~1200 are excluded on both paths — the intervals
+        // must actually filter, not pass everything through.
+        let bed = dir.path().join("regions.bed");
+        std::fs::write(&bed, "chr1\t0\t1200\n")?;
+
+        let run = |threads: Option<usize>, prefix: &str| -> Result<std::path::PathBuf> {
+            let out = dir.path().join(prefix);
+            let cmd = SimplexMetrics {
+                input: input.path().to_path_buf(),
+                output: out.clone(),
+                min_reads: 1,
+                intervals: Some(bed.clone()),
+                description: None,
+                threading: crate::commands::common::ThreadingOptions { threads },
+                scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+                queue_memory: crate::commands::common::QueueMemoryOptions::default(),
+            };
+            cmd.execute("test")?;
+            Ok(out)
+        };
+
+        let serial = run(None, "serial")?;
+        let chain = run(Some(4), "chain")?;
+
+        for suffix in ["family_sizes.txt", "umi_counts.txt", "simplex_yield_metrics.txt"] {
+            let s = std::fs::read(format!("{}.{suffix}", serial.display()))?;
+            let c = std::fs::read(format!("{}.{suffix}", chain.display()))?;
+            assert_eq!(
+                s, c,
+                "{suffix} differs with --intervals between the serial and --threads 4 paths"
+            );
+        }
         Ok(())
     }
 
@@ -417,6 +648,9 @@ mod tests {
             min_reads: 1,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
         let message =
             cmd.execute("test").expect_err("duplex-UMI input must be rejected").to_string();
@@ -430,6 +664,42 @@ mod tests {
         assert!(
             message.contains("duplex-metrics"),
             "error should point at duplex-metrics: {message}"
+        );
+    }
+
+    /// SIMM3-01, chain path: the `--threads` typed-step path must reject
+    /// duplex-UMI input just like the serial path, and the duplex-UMI diagnostic
+    /// must survive the pipeline's `io::Error` wrapping. The rejection lives in
+    /// the shared `record_coordinate_group`, but the chain records inside a
+    /// worker and surfaces failures through `io::Error::other`, so this pins that
+    /// the error still propagates to the caller with the actionable wording.
+    #[test]
+    fn chain_path_rejects_duplex_input() {
+        let mut records = Vec::new();
+        let (r1, r2) = build_test_pair_stranded("q1", 0, 100, 200, "AAA-TTT", "1/A", false);
+        records.push(r1);
+        records.push(r2);
+        let (r1, r2) = build_test_pair_stranded("q2", 0, 200, 100, "TTT-AAA", "1/B", true);
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records).expect("write test bam");
+        let output_dir = TempDir::new().expect("tempdir");
+        let cmd = SimplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output_dir.path().join("output"),
+            min_reads: 1,
+            intervals: None,
+            description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: Some(4) },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
+        };
+        let message =
+            cmd.execute("test").expect_err("duplex-UMI input must be rejected").to_string();
+        assert!(
+            message.contains("duplex-UMI data"),
+            "chain error should name duplex-UMI data: {message}"
         );
     }
 
@@ -510,6 +780,9 @@ mod tests {
             min_reads: 1,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -578,6 +851,9 @@ mod tests {
             min_reads: 1,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -626,6 +902,9 @@ mod tests {
             min_reads: 1,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -650,6 +929,9 @@ mod tests {
             min_reads: 1,
             intervals: None,
             description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
         };
         assert_eq!(cmd.min_reads, 1);
     }
@@ -689,6 +971,76 @@ mod tests {
         if let Err(e) = result {
             assert!(e.to_string().contains("consensus"), "unexpected error: {e}");
         }
+    }
+
+    /// The `--threads` chain path must reject a consensus BAM just like the serial
+    /// path — the guard is folded into `MetricsSink` (not a pre-flight re-open, to
+    /// preserve stdin/pipe inputs). Builds a mapped, paired-primary pair carrying
+    /// the simplex consensus `cD` depth tag (so it survives the pregroup filter and
+    /// reaches the sink guard), runs `--threads 4`, and asserts the consensus-BAM
+    /// error surfaces through the pipeline's `io::Error` wrapping.
+    #[test]
+    fn chain_path_rejects_consensus_bam() -> Result<()> {
+        // A mapped, paired-primary pair with RX/MI and the simplex consensus `cD`
+        // tag. `to_record_buf` round-trips it through the BAM writer/reader so the
+        // chain sees the tag on the raw record.
+        fn consensus_pair(name: &str) -> (sam::alignment::RecordBuf, sam::alignment::RecordBuf) {
+            let seq = vec![b'A'; 100];
+            let quals = vec![30u8; 100];
+            let cigar = encode_op(0, 100);
+            let mut b1 = RawSamBuilder::new();
+            b1.read_name(name.as_bytes())
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[cigar])
+                .sequence(&seq)
+                .qualities(&quals)
+                .mate_ref_id(0)
+                .mate_pos(199);
+            b1.add_string_tag(SamTag::RX, b"ACGT");
+            b1.add_string_tag(SamTag::MI, b"1");
+            b1.add_int_tag(SamTag::CD, 5);
+            let mut b2 = RawSamBuilder::new();
+            b2.read_name(name.as_bytes())
+                .flags(flags::PAIRED | flags::LAST_SEGMENT)
+                .ref_id(0)
+                .pos(199)
+                .mapq(60)
+                .cigar_ops(&[cigar])
+                .sequence(&seq)
+                .qualities(&quals)
+                .mate_ref_id(0)
+                .mate_pos(99);
+            b2.add_string_tag(SamTag::RX, b"ACGT");
+            b2.add_string_tag(SamTag::MI, b"1");
+            b2.add_int_tag(SamTag::CD, 5);
+            (to_record_buf(b1.build()), to_record_buf(b2.build()))
+        }
+
+        let (r1, r2) = consensus_pair("c1");
+        let input = create_test_bam(vec![r1, r2])?;
+        let output_dir = TempDir::new()?;
+        let cmd = SimplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output_dir.path().join("output"),
+            min_reads: 1,
+            intervals: None,
+            description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: Some(4) },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
+        };
+        let message = cmd
+            .execute("test")
+            .expect_err("consensus BAM must be rejected on the chain path")
+            .to_string();
+        assert!(
+            message.contains("appears to contain consensus sequences"),
+            "chain error should reject the consensus BAM: {message}"
+        );
+        Ok(())
     }
 
     /// Builds one record with `record_flags` and no consensus tags.
