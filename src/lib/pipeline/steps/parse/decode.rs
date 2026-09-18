@@ -38,7 +38,7 @@ use crate::pipeline::core::reorder::BranchOrdering;
 use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
 use crate::pipeline::steps::parse::bam::parse_records;
 use crate::pipeline::steps::types::{DecodedRecordBatch, DecompressedBlock, RecordBatch};
-use fgumi_bam_io::{DecodedRecord, GroupKeyConfig, key_for_mode};
+use fgumi_bam_io::{DecodedRecord, GroupKeyConfig, key_and_umi_for_mode};
 
 /// Fail closed on a raw BAM record body too short for the unchecked field
 /// accessors used during group-key extraction.
@@ -140,6 +140,31 @@ pub(crate) fn cache_umi_position(decoded: &mut DecodedRecord, umi_tag: [u8; 2]) 
     decoded.set_cached_umi(value_offset, value_len);
 }
 
+/// Apply the UMI value position to a freshly built `DecodedRecord`.
+///
+/// `umi_pos` is the record-relative `(offset, len)` captured *in-line* by
+/// [`fgumi_bam_io::key_and_umi_for_mode`] during the group-key aux scan (the
+/// common `KeyMode::Full` path), which avoids a second aux pass. When it is
+/// `None` — the record was keyed via a path that did not read aux data
+/// (`KeyMode::None`/`NameHashOnly`, or a name-only key fallback) — fall back to a
+/// standalone [`cache_umi_position`] scan so the #334 cache is still populated,
+/// matching prior behaviour.
+#[inline]
+pub(crate) fn apply_cached_umi(
+    decoded: &mut DecodedRecord,
+    umi_pos: Option<(u32, u16)>,
+    umi_tag: Option<[u8; 2]>,
+) {
+    match umi_pos {
+        Some((offset, len)) => decoded.set_cached_umi(offset, len),
+        None => {
+            if let Some(umi_tag) = umi_tag {
+                cache_umi_position(decoded, umi_tag);
+            }
+        }
+    }
+}
+
 /// `Parallel + ByItemOrdinal` parse + decode. `DecompressedBlock →
 /// DecodedRecordBatch`.
 pub struct DecodeRecords {
@@ -237,13 +262,14 @@ impl Step for DecodeRecords {
                 // Compute only as much key as the downstream stage reads:
                 // `None` (fastq) skips it entirely, `NameHashOnly` (correct)
                 // skips the CIGAR walk + aux pass, `Full` does everything.
-                let key = key_for_mode(key_mode, raw.as_ref(), library_index, cell_tag);
+                // Cache the UMI value position (for the Group step's assignment
+                // pass, #334) in the SAME aux scan that builds the key, so a
+                // `KeyMode::Full` record is not walked a second time (folded via
+                // `key_and_umi_for_mode`).
+                let (key, umi_pos) =
+                    key_and_umi_for_mode(key_mode, raw.as_ref(), library_index, cell_tag, umi_tag);
                 let mut decoded = DecodedRecord::from_raw_bytes(raw, key);
-                // Cache the UMI value position so the Group step's assignment
-                // pass can slice it without re-scanning aux data (#334).
-                if let Some(umi_tag) = umi_tag {
-                    cache_umi_position(&mut decoded, umi_tag);
-                }
+                apply_cached_umi(&mut decoded, umi_pos, umi_tag);
                 Ok(decoded)
             })
             .collect::<io::Result<Vec<_>>>()?;
@@ -361,16 +387,15 @@ impl Step for DecodeFromRecords {
                 validate_record_for_decode(bytes)?;
                 // Mirror `DecodeRecords::try_run`: compute only as much key as
                 // the downstream stage reads (see `KeyMode`).
-                let key = key_for_mode(key_mode, bytes, library_index, cell_tag);
+                // Fold the UMI-position cache (#334) into the key's aux scan, as
+                // in `DecodeRecords::try_run`.
+                let (key, umi_pos) =
+                    key_and_umi_for_mode(key_mode, bytes, library_index, cell_tag, umi_tag);
                 let mut decoded = DecodedRecord::from_raw_bytes(
                     fgumi_raw_bam::RawRecord::from(bytes.to_vec()),
                     key,
                 );
-                // Cache the UMI value position so the Group step's assignment
-                // pass can slice it without re-scanning aux data (#334).
-                if let Some(umi_tag) = umi_tag {
-                    cache_umi_position(&mut decoded, umi_tag);
-                }
+                apply_cached_umi(&mut decoded, umi_pos, umi_tag);
                 Ok(decoded)
             })
             .collect::<io::Result<Vec<_>>>()?;
@@ -687,6 +712,38 @@ mod tests {
 
         assert!(decoded.cached_umi().is_none());
         assert_eq!(decoded.cached_umi_position().0, DecodedRecord::UMI_OFFSET_UNCACHED);
+    }
+
+    /// `apply_cached_umi`'s fallback branch: when the folded key scan returns
+    /// `umi_pos == None` (e.g. a `KeyMode::NameHashOnly` decode, where the fold
+    /// never reads aux data) but the record still carries the UMI tag, the helper
+    /// must recover the cache via the standalone `cache_umi_position` scan — this
+    /// is the entire UMI cache for the `correct` command. With `umi_tag == None`
+    /// it must leave the cache unset. Neither the folded `Some` path nor the
+    /// standalone scan alone exercises this dispatch.
+    #[test]
+    fn apply_cached_umi_falls_back_to_standalone_scan_on_none() {
+        use crate::sam::SamTag;
+        use fgumi_bam_io::GroupKey;
+        use fgumi_raw_bam::{SamBuilder, flags};
+
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGT")
+            .qualities(&[30u8; 4])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+        b.add_string_tag(SamTag::RX, b"ACGTACGT");
+        let raw = b.build();
+
+        // umi_pos = None (folded scan didn't capture) + tag present → fall back.
+        let mut decoded = DecodedRecord::from_raw_bytes(raw.clone(), GroupKey::default());
+        apply_cached_umi(&mut decoded, None, Some(*SamTag::RX));
+        assert_eq!(decoded.cached_umi().expect("fallback cached the UMI"), b"ACGTACGT");
+
+        // umi_pos = None + umi_tag = None → cache stays unset.
+        let mut decoded_no_tag = DecodedRecord::from_raw_bytes(raw, GroupKey::default());
+        apply_cached_umi(&mut decoded_no_tag, None, None);
+        assert!(decoded_no_tag.cached_umi().is_none());
     }
 
     /// A malformed record whose header inflates the derived aux offset past the

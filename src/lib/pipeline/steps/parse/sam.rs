@@ -25,7 +25,7 @@ use crate::pipeline::core::queues::QueueSpec;
 use crate::pipeline::core::reorder::BranchOrdering;
 use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
 use crate::pipeline::steps::types::{DecodedRecordBatch, SamChunk};
-use fgumi_bam_io::{DecodedRecord, GroupKeyConfig, key_for_mode};
+use fgumi_bam_io::{DecodedRecord, GroupKeyConfig, key_and_umi_for_mode};
 
 /// Parse every line in `chunk` and produce a `DecodedRecordBatch` carrying
 /// the chunk's batch serial. SAM lines are encoded into BAM record body
@@ -118,18 +118,18 @@ pub fn parse_sam_chunk_into_decoded(
         let body_bytes = encoder.get_ref()[4..].to_vec();
         // Match the BAM decode path (`DecodeFromRecords`): compute only as much
         // key as the downstream stage reads (see `KeyMode`) so SAM- and
-        // BAM-ingested records group identically.
-        let key = key_for_mode(key_mode, &body_bytes, library_index, cell_tag);
+        // BAM-ingested records group identically. Parity also requires caching
+        // the UMI value position (#334); fold it into the key's aux scan, as the
+        // BAM paths do, so a SAM-ingested record is not walked a second time.
+        let (key, umi_pos) = key_and_umi_for_mode(
+            key_mode,
+            &body_bytes,
+            library_index,
+            cell_tag,
+            key_config.umi_tag,
+        );
         let mut record = DecodedRecord::from_raw_bytes(body_bytes, key);
-        // Parity with the BAM decode paths (`DecodeRecords` /
-        // `DecodeFromRecords`): cache the UMI value position so the Group step's
-        // assignment pass can slice it without re-scanning aux data (issue #334).
-        // Both paths converge on `DecodedRecordBatch`, so without this a
-        // SAM-ingested record would cost an extra aux scan per template that an
-        // otherwise identical BAM-ingested record does not.
-        if let Some(umi_tag) = key_config.umi_tag {
-            super::decode::cache_umi_position(&mut record, umi_tag);
-        }
+        super::decode::apply_cached_umi(&mut record, umi_pos, key_config.umi_tag);
         decoded.push(record);
     }
 

@@ -516,10 +516,39 @@ pub fn key_for_mode(
     library_index: &LibraryIndex,
     cell_tag: Option<Tag>,
 ) -> GroupKey {
+    key_and_umi_for_mode(mode, raw, library_index, cell_tag, None).0
+}
+
+/// Like [`key_for_mode`], but also captures the UMI tag's value position in the
+/// same aux-data scan that builds the key (only `KeyMode::Full` reads aux data).
+///
+/// Returns the key plus the record-relative `(offset, len)` of the UMI value
+/// bytes when `umi_tag` is set and found during the key's aux scan; `None`
+/// otherwise (UMI not requested, tag absent, or a key mode / degenerate path
+/// that does not read aux data). For `None`, callers that need the UMI cached
+/// fall back to a standalone, crate-external scan (`cache_umi_position` in the
+/// pipeline decode step), preserving behaviour while avoiding a second aux pass
+/// on the common `Full` path. See `compute_group_key_and_umi_from_raw` for the
+/// exact tag-resolution semantics (which match how this scan already resolves
+/// RG/cell/MC, not the standalone scan's, on spec-violating duplicate tags).
+///
+/// # Panics
+///
+/// For `NameHashOnly`/`Full`, panics if `raw` is not a validated BAM record
+/// payload (same contract as [`key_for_mode`] and the underlying key functions).
+/// `None` never inspects `raw`.
+#[must_use]
+pub fn key_and_umi_for_mode(
+    mode: KeyMode,
+    raw: &[u8],
+    library_index: &LibraryIndex,
+    cell_tag: Option<Tag>,
+    umi_tag: Option<[u8; 2]>,
+) -> (GroupKey, Option<(u32, u16)>) {
     match mode {
-        KeyMode::None => GroupKey::default(),
-        KeyMode::NameHashOnly => name_hash_key(raw),
-        KeyMode::Full => compute_group_key_from_raw(raw, library_index, cell_tag),
+        KeyMode::None => (GroupKey::default(), None),
+        KeyMode::NameHashOnly => (name_hash_key(raw), None),
+        KeyMode::Full => compute_group_key_and_umi_from_raw(raw, library_index, cell_tag, umi_tag),
     }
 }
 
@@ -538,6 +567,80 @@ pub fn compute_group_key_from_raw(
     library_index: &LibraryIndex,
     cell_tag: Option<noodles::sam::alignment::record::data::field::Tag>,
 ) -> GroupKey {
+    compute_group_key_and_umi_from_raw(raw, library_index, cell_tag, None).0
+}
+
+/// Return the aux-data offset (via [`fgumi_raw_bam::aux_data_offset_from_record`])
+/// alongside the aux-data slice, sharing the single header decode. Mirrors
+/// [`fgumi_raw_bam::aux_data_slice`]'s bounds guard so the two agree on when aux
+/// data is absent (truncated / out-of-range records yield `(None, &[])`).
+#[inline]
+fn aux_slice_with_offset(raw: &[u8]) -> (Option<usize>, &[u8]) {
+    match fgumi_raw_bam::aux_data_offset_from_record(raw) {
+        Some(offset) if offset <= raw.len() => (Some(offset), &raw[offset..]),
+        _ => (None, &[]),
+    }
+}
+
+/// Convert an aux-relative UMI value position (as returned by
+/// [`fgumi_raw_bam::extract_aux_string_tags`]) into the record-relative
+/// `(offset, len)` expected by [`crate::DecodedRecord::set_cached_umi`]. Uses the
+/// same offset arithmetic and width guards (`u32`-narrow the aux offset,
+/// `checked_add` the aux-relative offset) as the standalone `cache_umi_position`
+/// scan, so a folded capture yields the same cached position for any spec-legal
+/// record. The *tag lookup* upstream of this conversion is
+/// `extract_aux_string_tags`, whose duplicate/mistyped-tag semantics differ from
+/// the standalone scan's — see `compute_group_key_and_umi_from_raw`.
+#[inline]
+fn record_relative_umi(
+    aux_offset: Option<usize>,
+    umi_position: Option<(u32, u16)>,
+) -> Option<(u32, u16)> {
+    let (aux_rel_off, len) = umi_position?;
+    let base = u32::try_from(aux_offset?).ok()?;
+    let offset = base.checked_add(aux_rel_off)?;
+    Some((offset, len))
+}
+
+/// Like [`compute_group_key_from_raw`], but also captures the UMI tag's value
+/// position in the SAME aux-data scan used to build the key, avoiding a second
+/// pass over aux data during decode.
+///
+/// Returns the key plus the record-relative `(offset, len)` of the UMI value
+/// bytes (excluding the trailing NUL) when `umi_tag` is set and the record is
+/// keyed via a path that scans aux data (primary reads, and secondary /
+/// supplementary reads carrying a `tc` tag). Returns `None` for the UMI position
+/// when `umi_tag` is `None`, the tag is absent, or the key falls back to a
+/// name-only path that never reads aux data — callers cache the UMI via a
+/// standalone scan (`cache_umi_position`) in those cases.
+///
+/// # Tag-resolution semantics
+///
+/// The UMI is resolved by the SAME [`fgumi_raw_bam::extract_aux_string_tags`]
+/// pass that resolves RG/cell/MC for the key, so the cached UMI is consistent
+/// with the key's own tag resolution. For **spec-legal** records — each aux tag
+/// present at most once (SAM §1.5) — this yields the identical position the
+/// standalone `find_string_tag_position` scan (used by the `cache_umi_position`
+/// fallback) would. The two deliberately differ only on **malformed** records
+/// with a duplicated or type-shadowed UMI tag: `extract_aux_string_tags` skips a
+/// non-`Z` entry and takes a later `Z` copy, whereas `find_tag_position` resolves
+/// the first id match and rejects it if non-`Z`. This is the exact,
+/// already-accepted divergence documented for the `MC` tag on `validate_mc_tag`
+/// (see `src/lib/grouper.rs`) — the relaxation makes the cached value agree with
+/// the value the grouping key actually uses, rather than losing it.
+///
+/// # Panics
+///
+/// Panics if `raw` is not a validated BAM record payload (as produced by the BAM
+/// reader / raw-record pipeline). Callers must not pass arbitrary external bytes;
+/// raw-field accessors will panic on malformed or truncated input.
+#[must_use]
+pub(crate) fn compute_group_key_and_umi_from_raw(
+    raw: &[u8],
+    library_index: &LibraryIndex,
+    cell_tag: Option<noodles::sam::alignment::record::data::field::Tag>,
+    umi_tag: Option<[u8; 2]>,
+) -> (GroupKey, Option<(u32, u16)>) {
     // Extract name hash (match noodles path: empty name → None → hash 0)
     let name_hash = raw_name_hash(raw);
 
@@ -553,28 +656,33 @@ pub fn compute_group_key_from_raw(
         // UNKNOWN position that relies on the read sorting adjacent to its
         // primary. Library/cell are extracted the same way as primaries so the
         // position key matches (they share their template's RG/CB).
-        let aux_data = fgumi_raw_bam::aux_data_slice(raw);
+        let (aux_offset, aux_data) = aux_slice_with_offset(raw);
         if let Some([tid1, pos1, neg1, tid2, pos2, neg2]) =
             fgumi_raw_bam::read_tc_template_coordinate(aux_data)
         {
             let cell_tag_bytes = cell_tag.map_or([0u8; 2], |t| [t.as_ref()[0], t.as_ref()[1]]);
-            let aux_tags = fgumi_raw_bam::extract_aux_string_tags(aux_data, cell_tag_bytes, None);
+            let aux_tags =
+                fgumi_raw_bam::extract_aux_string_tags(aux_data, cell_tag_bytes, umi_tag);
             let library_idx =
                 aux_tags.rg.map_or(0, |rg| library_index.get(LibraryIndex::hash_rg(rg)));
             let cell_hash = aux_tags.cell.map_or(0, |cb| LibraryIndex::hash_cell_barcode(Some(cb)));
-            return GroupKey::paired(
-                tid1,
-                pos1,
-                u8::from(neg1 != 0),
-                tid2,
-                pos2,
-                u8::from(neg2 != 0),
-                library_idx,
-                cell_hash,
-                name_hash,
+            let umi = record_relative_umi(aux_offset, aux_tags.umi_position);
+            return (
+                GroupKey::paired(
+                    tid1,
+                    pos1,
+                    u8::from(neg1 != 0),
+                    tid2,
+                    pos2,
+                    u8::from(neg2 != 0),
+                    library_idx,
+                    cell_hash,
+                    name_hash,
+                ),
+                umi,
             );
         }
-        return GroupKey { name_hash, ..GroupKey::default() };
+        return (GroupKey { name_hash, ..GroupKey::default() }, None);
     }
 
     // Own position (1-based, matching noodles) — zero-allocation CIGAR iteration
@@ -588,16 +696,18 @@ pub fn compute_group_key_from_raw(
     // ref/strand/library/cell would collide on `i32::MAX` (`position_key`
     // excludes `name_hash`). Matches the secondary/supplementary fallback above.
     if own_pos == i32::MAX {
-        return GroupKey { name_hash, ..GroupKey::default() };
+        return (GroupKey { name_hash, ..GroupKey::default() }, None);
     }
 
     let own_ref_id = fgumi_raw_bam::ref_id(raw);
     let strand = u8::from(reverse);
 
-    // Single-pass aux tag extraction (RG, cell barcode, MC)
-    let aux_data = fgumi_raw_bam::aux_data_slice(raw);
+    // Single-pass aux tag extraction (RG, cell barcode, MC, and — when requested
+    // — the UMI value position, folded into this one scan that builds the key).
+    let (aux_offset, aux_data) = aux_slice_with_offset(raw);
     let cell_tag_bytes = cell_tag.map_or([0u8; 2], |t| [t.as_ref()[0], t.as_ref()[1]]);
-    let aux_tags = fgumi_raw_bam::extract_aux_string_tags(aux_data, cell_tag_bytes, None);
+    let aux_tags = fgumi_raw_bam::extract_aux_string_tags(aux_data, cell_tag_bytes, umi_tag);
+    let umi = record_relative_umi(aux_offset, aux_tags.umi_position);
 
     let library_idx = if let Some(rg) = aux_tags.rg {
         let rg_hash = LibraryIndex::hash_rg(rg);
@@ -612,7 +722,10 @@ pub fn compute_group_key_from_raw(
     // Check if paired
     let is_paired = (flg & fgumi_raw_bam::flags::PAIRED) != 0;
     if !is_paired {
-        return GroupKey::single(own_ref_id, own_pos, strand, library_idx, cell_hash, name_hash);
+        return (
+            GroupKey::single(own_ref_id, own_pos, strand, library_idx, cell_hash, name_hash),
+            umi,
+        );
     }
 
     // Mate info — guard against MATE_UNMAPPED (matching noodles path)
@@ -631,7 +744,7 @@ pub fn compute_group_key_from_raw(
             .map(|mc| fgumi_raw_bam::mate_unclipped_5prime_1based(raw_mate_pos, mate_reverse, mc))
     };
 
-    match mate_pos_result {
+    let key = match mate_pos_result {
         Some(mp) => GroupKey::paired(
             own_ref_id,
             own_pos,
@@ -647,7 +760,8 @@ pub fn compute_group_key_from_raw(
             // No MC tag — fall back to single-end behavior
             GroupKey::single(own_ref_id, own_pos, strand, library_idx, cell_hash, name_hash)
         }
-    }
+    };
+    (key, umi)
 }
 
 /// Groups a stream of in-order [`DecodedRecord`]s into completed groups.
@@ -693,6 +807,7 @@ mod tests {
     use fgumi_raw_bam::SamBuilder;
     use fgumi_raw_bam::SamTag;
     use fgumi_raw_bam::flags;
+    use rstest::rstest;
 
     // ========================================================================
     // compute_group_key_from_raw — primary (fully-populated) path
@@ -1029,6 +1144,131 @@ mod tests {
             LibraryIndex::hash_name(Some(b"pair_no_mc")),
         );
         assert_eq!(key, expected);
+    }
+
+    // ========================================================================
+    // compute_group_key_and_umi_from_raw: in-line UMI capture parity
+    // ========================================================================
+
+    /// The record-relative UMI position a standalone `find_string_tag_position`
+    /// scan would produce — i.e. exactly what the old two-pass
+    /// `cache_umi_position` cached — for cross-checking the folded capture.
+    fn standalone_umi_position(raw: &[u8], tag: [u8; 2]) -> Option<(u32, u16)> {
+        let aux_offset = fgumi_raw_bam::aux_data_offset_from_record(raw)?;
+        let aux = raw.get(aux_offset..)?;
+        let (rel_off, len) = fgumi_raw_bam::find_string_tag_position(aux, tag)?;
+        Some((u32::try_from(aux_offset).ok()? + rel_off, len))
+    }
+
+    #[rstest]
+    // Primary paired read with RX + MC: the common consensus/group/dedup shape.
+    #[case::paired_with_rx(
+        flags::PAIRED,
+        true,
+        Some(&b"ACGTACGT"[..]),
+    )]
+    // Primary single-end read carrying RX.
+    #[case::single_with_rx(0, false, Some(&b"TTGGCCAA"[..]))]
+    // Primary read with no RX tag: capture must be `None` and fall through to
+    // the standalone scan (which also finds nothing).
+    #[case::primary_without_rx(flags::PAIRED, true, None)]
+    fn compute_group_key_and_umi_captures_umi_matching_standalone_scan(
+        #[case] flag: u16,
+        #[case] add_mc: bool,
+        #[case] umi: Option<&[u8]>,
+    ) {
+        let lib = LibraryIndex::default();
+        let mut b = SamBuilder::new();
+        b.ref_id(0)
+            .pos(1000)
+            .flags(flag)
+            .read_name(b"rec")
+            .cigar_ops(&[cigar_m(50)])
+            .sequence(b"ACGT")
+            .qualities(&[30, 30, 30, 30]);
+        if flag & flags::PAIRED != 0 {
+            b.mate_ref_id(0).mate_pos(1200);
+        }
+        // RG is present in every real grouping input; include it so the scan
+        // has to walk past a leading tag before reaching RX.
+        b.add_string_tag(SamTag::RG, b"RG1");
+        if add_mc {
+            b.add_string_tag(SamTag::MC, b"50M");
+        }
+        if let Some(u) = umi {
+            b.add_string_tag(SamTag::RX, u);
+        }
+        let rec = b.build();
+
+        let (key, umi_pos) =
+            compute_group_key_and_umi_from_raw(rec.as_ref(), &lib, None, Some(*SamTag::RX));
+
+        // The key is identical to the non-UMI-capturing entry point.
+        assert_eq!(key, compute_group_key_from_raw(rec.as_ref(), &lib, None));
+        // The captured position is byte-for-byte what the old standalone scan
+        // (`cache_umi_position` → `find_string_tag_position`) would have cached.
+        assert_eq!(umi_pos, standalone_umi_position(rec.as_ref(), *SamTag::RX));
+        // And, when a UMI is present, it slices back to the original bytes.
+        if let Some(expected) = umi {
+            let (off, len) = umi_pos.expect("UMI captured");
+            let (off, len) = (off as usize, len as usize);
+            assert_eq!(&rec.as_ref()[off..off + len], expected);
+        } else {
+            assert_eq!(umi_pos, None);
+        }
+    }
+
+    #[test]
+    fn compute_group_key_and_umi_returns_none_when_umi_tag_not_requested() {
+        let lib = LibraryIndex::default();
+        let mut b = SamBuilder::new();
+        b.ref_id(0)
+            .pos(1000)
+            .flags(0)
+            .read_name(b"rec")
+            .cigar_ops(&[cigar_m(50)])
+            .sequence(b"ACGT")
+            .qualities(&[30, 30, 30, 30]);
+        b.add_string_tag(SamTag::RX, b"ACGTACGT");
+        let rec = b.build();
+
+        // `umi_tag = None` must never capture a position even though RX is present.
+        let (_key, umi_pos) = compute_group_key_and_umi_from_raw(rec.as_ref(), &lib, None, None);
+        assert_eq!(umi_pos, None);
+    }
+
+    /// The `tc`-stamped secondary/supplementary branch also folds the UMI capture
+    /// into its aux scan (grouping.rs, the secondary branch), a path the primary
+    /// `#[case]`s above do not exercise. Assert the captured position matches the
+    /// standalone scan and slices back to the RX bytes.
+    #[rstest]
+    #[case::secondary(flags::PAIRED | flags::SECONDARY)]
+    #[case::supplementary(flags::PAIRED | flags::SUPPLEMENTARY)]
+    fn compute_group_key_and_umi_captures_umi_on_the_tc_secondary_path(#[case] flag: u16) {
+        let lib = library_index_with_two_groups();
+        let mut b = SamBuilder::new();
+        b.ref_id(0)
+            .pos(5000)
+            .flags(flag)
+            .read_name(b"sec_with_tc")
+            .cigar_ops(&[cigar_m(50)])
+            .sequence(b"ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .add_string_tag(SamTag::RG, b"RG1")
+            .add_array_i32(SamTag::TC, &[0, 1001, 0, 0, 1249, 1])
+            .add_string_tag(SamTag::RX, b"GGTTCCAA");
+        let rec = b.build();
+
+        let (key, umi_pos) =
+            compute_group_key_and_umi_from_raw(rec.as_ref(), &lib, None, Some(*SamTag::RX));
+
+        // Key is unchanged from the non-UMI-capturing entry point (still keyed on tc).
+        assert_eq!(key, compute_group_key_from_raw(rec.as_ref(), &lib, None));
+        // The folded capture equals the standalone scan and slices to the RX bytes.
+        assert_eq!(umi_pos, standalone_umi_position(rec.as_ref(), *SamTag::RX));
+        let (off, len) = umi_pos.expect("UMI captured on the tc-secondary path");
+        let (off, len) = (off as usize, len as usize);
+        assert_eq!(&rec.as_ref()[off..off + len], b"GGTTCCAA");
     }
 
     // ========================================================================
