@@ -2939,8 +2939,11 @@ impl<'a> ChainBuilder<'a> {
             other => bail!("Stage::Zipper requires SourceSpec::PairedBams, got {other:?}"),
         };
 
-        // Apply the thread floor: zipper needs ≥ 4 workers (2 Exclusive source
-        // readers + 1 Exclusive write step + at least 1 Serial worker).
+        // Give the zipper chain at least 4 workers. This is a performance floor,
+        // not a hard requirement — the chain runs at 1-3 workers too, but the
+        // per-template merge fan-out only pays with enough of them (measured on a
+        // 32-core box: a floored 4-worker pool beats a genuine 1/2/3-worker chain,
+        // and a 1-worker chain loses to the serial process_raw path outright).
         let raw_threads = self.spec.threading.num_threads();
         let num_threads = raw_threads.max(4);
 
