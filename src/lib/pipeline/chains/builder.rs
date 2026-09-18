@@ -524,7 +524,7 @@ pub struct ChainBuilder<'a> {
     /// [`PendingSource::Paired`]: `current_tail` holds the unmapped
     /// source chain tail and `paired_tail` holds the mapped source
     /// chain tail. `add_zipper` consumes both to build
-    /// `ZipperMergeStep` via `PipelineBuilder::append_step2`.
+    /// `ZipperZipStep` via `PipelineBuilder::append_step2`.
     /// `None` for all single-source stages.
     paired_tail: Option<(
         crate::pipeline::core::topology::StepIdx,
@@ -1016,7 +1016,7 @@ impl<'a> ChainBuilder<'a> {
     /// - `PendingSource::Paired`: Builds both source preambles for zipper's
     ///   dual-input path. `current_tail` = unmapped chain tail;
     ///   `paired_tail` = mapped chain tail. No standard single-output tail is
-    ///   set — `add_zipper` consumes both tails to assemble `ZipperMergeStep`.
+    ///   set — `add_zipper` consumes both tails to assemble `ZipperZipStep`.
     ///   Note that both preamble chains end at `GroupByQueryname` so their
     ///   output type is `OrderedBytesSingle<BamTemplateBatch>`, matching
     ///   `ZipperMergeStep: Step2<InputA = BamTemplateBatch, InputB = BamTemplateBatch>`.
@@ -1148,7 +1148,7 @@ impl<'a> ChainBuilder<'a> {
             PendingSource::Paired { mapped: boxed_mapped, unmapped: boxed_unmapped, reference } => {
                 // Zipper's two-input preamble. Both chains end at GroupByQueryname
                 // so their output type is OrderedBytesSingle<BamTemplateBatch>,
-                // matching ZipperMergeStep's InputA / InputB.
+                // matching ZipperZipStep's InputA / InputB.
                 //
                 // The reference path is carried in PendingSource::Paired but
                 // add_zipper reads it directly from self.spec.source, which is
@@ -2878,7 +2878,7 @@ impl<'a> ChainBuilder<'a> {
     /// unmapped source chain tail and `paired_tail` to the mapped
     /// source chain tail. Both chains end at `GroupByQueryname`, so
     /// their output type is `OrderedBytesSingle<BamTemplateBatch>`,
-    /// matching `ZipperMergeStep: Step2<InputA = BamTemplateBatch,
+    /// matching `ZipperZipStep: Step2<InputA = BamTemplateBatch,
     /// InputB = BamTemplateBatch>`.
     ///
     /// Appends `ZipperMergeStep` (via `PipelineBuilder::append_step2`
@@ -2987,7 +2987,7 @@ impl<'a> ChainBuilder<'a> {
         let merge_tail = self.pipeline.append_step(ZipperMerge::new(merge_cfg), zip_tail);
 
         // Gate SerializeBamRecords on Terminal position. For Intermediate
-        // (e.g., zipper → sort → ...), the chain tail stays at ZipperMergeStep's
+        // (e.g., zipper → sort → ...), the chain tail stays at ZipperMerge's
         // BamTemplateBatch output, ready for the next stage to consume.
         if position == StagePosition::Terminal {
             let tail = self.pipeline.append_step(
@@ -3000,7 +3000,7 @@ impl<'a> ChainBuilder<'a> {
             self.chain_tail_kind = ChainTailKind::SerializedBytes;
         } else {
             self.current_tail = Some(merge_tail);
-            // Intermediate: ZipperMergeStep emits BamTemplateBatch so the
+            // Intermediate: ZipperMerge emits BamTemplateBatch so the
             // next stage (typically add_sort) prepends TemplatesToRecordBatch.
             self.chain_tail_kind = ChainTailKind::BamTemplateBatch;
         }

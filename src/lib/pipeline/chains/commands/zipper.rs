@@ -65,13 +65,13 @@ pub(crate) struct ZipperMergeCaptures {
     pub(crate) records_emitted: Arc<AtomicU64>,
 }
 
-/// Build a [`ZipperMergeStep`] from the supplied captures.
+/// Build the [`ZipperMergeConfig`] from the supplied captures.
 ///
 /// Logs tag-manipulation summary lines, loads the reference FASTA if
-/// `--restore-unconverted-bases` is set, constructs the
-/// [`ZipperMergeConfig`], and returns the configured step.
+/// `--restore-unconverted-bases` is set, and constructs the
+/// [`ZipperMergeConfig`] shared by the `ZipperZipStep` (pairing) and
+/// `ZipperMerge` (per-template merge) steps that `add_zipper` wires up.
 ///
-/// [`ZipperMergeStep`]: merge_step::ZipperMergeStep
 /// [`ZipperMergeConfig`]: merge_step::ZipperMergeConfig
 pub(crate) fn build_zipper_merge_config(
     caps: ZipperMergeCaptures,
