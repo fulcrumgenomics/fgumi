@@ -4,6 +4,120 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-18
+
+### Bug Fixes
+
+- Fall back to a name-only group key on an unreadable aux offset ([#880](https://github.com/fulcrumgenomics/fgumi/pull/880))
+- Thread --max-memory into the pipeline queue budget ([#888](https://github.com/fulcrumgenomics/fgumi/pull/888))
+- Resolve --max-temp-files once and bake it into the chain spec ([#891](https://github.com/fulcrumgenomics/fgumi/pull/891))
+- Filter secondary/supplementary reads by flag, not UNKNOWN_REF ([#903](https://github.com/fulcrumgenomics/fgumi/pull/903))
+- Group by molecule by default, add --per-strand opt-out ([#904](https://github.com/fulcrumgenomics/fgumi/pull/904)) ([#906](https://github.com/fulcrumgenomics/fgumi/pull/906))
+- Restore chain-path diagnostic parity (dedup index-threshold banner, copy_umi unwired-flags warning, pair_fastq docstring) ([#914](https://github.com/fulcrumgenomics/fgumi/pull/914))
+- Log the missing/wrong-length-UMI banner at error level on the chain path ([#912](https://github.com/fulcrumgenomics/fgumi/pull/912))
+- Error on --min-corrected with empty input on the legacy paths (parity with the chain/fgbio) ([#919](https://github.com/fulcrumgenomics/fgumi/pull/919))
+- Write --metrics only on success on the chain path (match clip/retag) ([#921](https://github.com/fulcrumgenomics/fgumi/pull/921))
+- Consult the UMI-position cache by assigning UMI groups before clearing duplicate flags ([#918](https://github.com/fulcrumgenomics/fgumi/pull/918))
+- Wire --methylation-mode/--ref into the fused filter stage ([#944](https://github.com/fulcrumgenomics/fgumi/pull/944))
+- Restore the === Sort Phase Timing === per-phase diagnostic ([#945](https://github.com/fulcrumgenomics/fgumi/pull/945))
+- Return an error instead of panicking on >65,535 libraries ([#956](https://github.com/fulcrumgenomics/fgumi/pull/956))
+- Honor --check-crc/--no-check-crc on the BGZF FASTQ split decode ([#959](https://github.com/fulcrumgenomics/fgumi/pull/959))
+
+### Documentation
+
+- Add NanoSeq (Duplex-Seq) pipeline guide ([#910](https://github.com/fulcrumgenomics/fgumi/pull/910))
+- Remove in-tree design docs and gitignore docs/design/ ([#934](https://github.com/fulcrumgenomics/fgumi/pull/934))
+- Document fgumi runall and add Reference guide pages ([#938](https://github.com/fulcrumgenomics/fgumi/pull/938))
+
+### Features
+
+- Add --threads and route through the unified pipeline ([#871](https://github.com/fulcrumgenomics/fgumi/pull/871))
+- Accept interleaved FASTQ input via --interleaved ([#874](https://github.com/fulcrumgenomics/fgumi/pull/874))
+- Typed-step pipeline foundation ([#870](https://github.com/fulcrumgenomics/fgumi/pull/870))
+- Warn when an explicit memory budget crowds the host ([#867](https://github.com/fulcrumgenomics/fgumi/pull/867))
+- Declarative chain-builder layer + group --threads pilot ([#872](https://github.com/fulcrumgenomics/fgumi/pull/872))
+- Wire dedup --threads onto the declarative chain builder ([#876](https://github.com/fulcrumgenomics/fgumi/pull/876))
+- Add command to copy the read-name UMI into the RX tag ([#873](https://github.com/fulcrumgenomics/fgumi/pull/873))
+- Inline BAI indexer on the arena sink ([#883](https://github.com/fulcrumgenomics/fgumi/pull/883))
+- Route the sort command onto the declarative chain builder ([#885](https://github.com/fulcrumgenomics/fgumi/pull/885))
+- Restore --read-streams on the arena chain via a concurrent scatter reader ([#889](https://github.com/fulcrumgenomics/fgumi/pull/889))
+- Route the correct command onto the declarative chain builder ([#893](https://github.com/fulcrumgenomics/fgumi/pull/893))
+- Route the filter command onto the declarative chain builder ([#892](https://github.com/fulcrumgenomics/fgumi/pull/892))
+- Route the simplex command onto the declarative chain builder ([#894](https://github.com/fulcrumgenomics/fgumi/pull/894))
+- Route the clip command onto the declarative chain builder ([#897](https://github.com/fulcrumgenomics/fgumi/pull/897))
+- Route the codec command onto the declarative chain builder ([#895](https://github.com/fulcrumgenomics/fgumi/pull/895))
+- Route the duplex command onto the declarative chain builder ([#896](https://github.com/fulcrumgenomics/fgumi/pull/896))
+- Route the retag command onto the declarative chain builder ([#898](https://github.com/fulcrumgenomics/fgumi/pull/898))
+- Route the copy-umi command onto the declarative chain builder ([#899](https://github.com/fulcrumgenomics/fgumi/pull/899))
+- Route the extract command onto the declarative chain builder ([#900](https://github.com/fulcrumgenomics/fgumi/pull/900))
+- Add opt-in --verify for strict template-coordinate order ([#909](https://github.com/fulcrumgenomics/fgumi/pull/909))
+- Thread --sort-stats diagnostics through the chain ([#913](https://github.com/fulcrumgenomics/fgumi/pull/913))
+- Give stage option structs a clap::Args surface for runall (PR A) ([#907](https://github.com/fulcrumgenomics/fgumi/pull/907))
+- Fused multi-stage `fgumi runall` command ([#911](https://github.com/fulcrumgenomics/fgumi/pull/911))
+- Produce --metrics on the multi-threaded chain path ([#915](https://github.com/fulcrumgenomics/fgumi/pull/915))
+- Add --check-crc / --no-check-crc with the file-vs-stdin default ([#933](https://github.com/fulcrumgenomics/fgumi/pull/933))
+- Add the aligner replay subcommand ([#935](https://github.com/fulcrumgenomics/fgumi/pull/935))
+- Add the bam-roundtrip subcommand ([#936](https://github.com/fulcrumgenomics/fgumi/pull/936))
+- Wire --pipeline-trace through the chain builder ([#937](https://github.com/fulcrumgenomics/fgumi/pull/937))
+- Add hidden --pool-scheduler override for A/B benchmarking ([#942](https://github.com/fulcrumgenomics/fgumi/pull/942))
+- Run BAM→FASTQ on the typed-step chain and add paired split output ([#939](https://github.com/fulcrumgenomics/fgumi/pull/939))
+- Expose --block-batch and --file-granularity as hidden flags ([#943](https://github.com/fulcrumgenomics/fgumi/pull/943))
+- Compute consensus QC metrics inline in fused runall and standalone consensus ([#948](https://github.com/fulcrumgenomics/fgumi/pull/948))
+- Thread-utilization and per-step bandwidth telemetry for the chain-builder engine ([#951](https://github.com/fulcrumgenomics/fgumi/pull/951))
+- Park idle pool workers to fix the thread-oversubscription cliff ([#955](https://github.com/fulcrumgenomics/fgumi/pull/955))
+- Add --threads to simplex-metrics and duplex-metrics ([#968](https://github.com/fulcrumgenomics/fgumi/pull/968))
+
+### Miscellaneous Tasks
+
+- Mark the BGZF CRC verification policy as intentional ([#932](https://github.com/fulcrumgenomics/fgumi/pull/932))
+
+### Performance
+
+- Use fixed-seed ahash on hot per-item maps to remove RandomState global-counter contention ([#865](https://github.com/fulcrumgenomics/fgumi/pull/865))
+- Skip per-record group-key computation for key-agnostic groupers ([#875](https://github.com/fulcrumgenomics/fgumi/pull/875))
+- Build the merge tag bitsets once per batch, not per template ([#917](https://github.com/fulcrumgenomics/fgumi/pull/917))
+- Skip the discarded group key on the chain filter path ([#916](https://github.com/fulcrumgenomics/fgumi/pull/916))
+- Use DrainFirstScheduler for terminal grouping chains ([#941](https://github.com/fulcrumgenomics/fgumi/pull/941))
+- Single-pass aux-tag rebuild (RawTagsEditor::rebuild_with) for zipper merge and NM/UQ/MD strip ([#962](https://github.com/fulcrumgenomics/fgumi/pull/962))
+- Parallel queryname grouping for the correct/align/filter chains ([#957](https://github.com/fulcrumgenomics/fgumi/pull/957))
+- Resolve the template UMI from the primary read ([#958](https://github.com/fulcrumgenomics/fgumi/pull/958))
+- Fold per-record PG/AS/XS aux scans into single-pass walks ([#964](https://github.com/fulcrumgenomics/fgumi/pull/964))
+- Drop the discarded decode key and add skippable input CRC ([#960](https://github.com/fulcrumgenomics/fgumi/pull/960))
+- Decode-free BAM fast path for single-record filter ([#961](https://github.com/fulcrumgenomics/fgumi/pull/961))
+- Decode-free BAM fast path for copy-umi ([#963](https://github.com/fulcrumgenomics/fgumi/pull/963))
+- Parallel gather for the in-memory sort fast path ([#966](https://github.com/fulcrumgenomics/fgumi/pull/966))
+- Reduce per-record allocation (zero-copy segment views + reused Phred scratch) ([#967](https://github.com/fulcrumgenomics/fgumi/pull/967))
+- Decode-free BAM fast path for retag ([#965](https://github.com/fulcrumgenomics/fgumi/pull/965))
+- Single-pass scalar consensus-tag extraction ([#969](https://github.com/fulcrumgenomics/fgumi/pull/969))
+- Reduce serial-merge CPU and allocations at 1-2 threads ([#971](https://github.com/fulcrumgenomics/fgumi/pull/971))
+- Gated multi-base fast path for simplex consensus ([#973](https://github.com/fulcrumgenomics/fgumi/pull/973))
+- Scale the per-template merge past ~4.5 cores at 4+ threads ([#975](https://github.com/fulcrumgenomics/fgumi/pull/975))
+- Fold UMI-position cache into the group-key aux scan ([#976](https://github.com/fulcrumgenomics/fgumi/pull/976))
+
+### Refactor
+
+- Delete the CLI's throwaway sorter construction ([#890](https://github.com/fulcrumgenomics/fgumi/pull/890))
+- Retire the legacy single-threaded path; the chain is the only path ([#920](https://github.com/fulcrumgenomics/fgumi/pull/920))
+- Retire the legacy single-threaded path; the chain is the only path ([#922](https://github.com/fulcrumgenomics/fgumi/pull/922))
+- Retire the legacy single-threaded path; the chain is the only path ([#923](https://github.com/fulcrumgenomics/fgumi/pull/923))
+- Retire the legacy single-threaded path; the chain is the only path ([#924](https://github.com/fulcrumgenomics/fgumi/pull/924))
+- Retire the legacy single-threaded path; the chain is the only path ([#925](https://github.com/fulcrumgenomics/fgumi/pull/925))
+- [**breaking**] Collapse simplex/duplex/codec into a single consensus feature and retire the legacy single-threaded paths ([#926](https://github.com/fulcrumgenomics/fgumi/pull/926))
+- Retire the legacy single-threaded path; the chain is the only path ([#927](https://github.com/fulcrumgenomics/fgumi/pull/927))
+- Retire the legacy single-threaded paths; the chain is the only path ([#928](https://github.com/fulcrumgenomics/fgumi/pull/928))
+- Relocate reusable types out of unified_pipeline (R6a) ([#929](https://github.com/fulcrumgenomics/fgumi/pull/929))
+- [**breaking**] Remove the legacy unified_pipeline engine ([#947](https://github.com/fulcrumgenomics/fgumi/pull/947))
+
+### Testing
+
+- Speed up the slow-test tail without weakening invariants ([#881](https://github.com/fulcrumgenomics/fgumi/pull/881))
+- Pin TLEN + pair orientation against htsjdk across a broad matrix ([#905](https://github.com/fulcrumgenomics/fgumi/pull/905))
+- Fix inconsistent mate-strand flags in duplicate-group fixtures ([#908](https://github.com/fulcrumgenomics/fgumi/pull/908))
+- Consolidate the byte-identity file-compare idiom into a shared helper ([#950](https://github.com/fulcrumgenomics/fgumi/pull/950))
+- Close --all-metrics and group-metrics integration coverage gaps ([#949](https://github.com/fulcrumgenomics/fgumi/pull/949))
+
+<!-- generated by git-cliff -->
+
 ### Features
 
 - Add `--threads N` to `simplex-metrics` and `duplex-metrics`: metrics
