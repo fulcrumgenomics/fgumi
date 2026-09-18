@@ -614,7 +614,8 @@ impl Template {
             let r2_is_unmapped = (r2_flags & fgumi_raw_bam::flags::UNMAPPED) != 0;
             let r2_end = insert_size_end(&rr[r2_i]);
             let r2_mapq = fgumi_raw_bam::mapq(&rr[r2_i]);
-            let r2_cigar_str = fgumi_raw_bam::cigar_to_string_from_raw(&rr[r2_i]);
+            let mut r2_cigar = Vec::new();
+            fgumi_raw_bam::cigar_to_bytes_into(&mut r2_cigar, &rr[r2_i]);
             let r2_as =
                 fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[r2_i]), SamTag::AS);
 
@@ -634,12 +635,8 @@ impl Template {
                     let mq_val = if r2_mapq == 255 { 255 } else { i32::from(r2_mapq) };
                     fgumi_raw_bam::update_int_tag(rec.as_mut_vec(), SamTag::MQ, mq_val);
 
-                    if !r2_cigar_str.is_empty() && r2_cigar_str != "*" && !r2_is_unmapped {
-                        fgumi_raw_bam::update_string_tag(
-                            rec.as_mut_vec(),
-                            SamTag::MC,
-                            r2_cigar_str.as_bytes(),
-                        );
+                    if !r2_cigar.is_empty() && r2_cigar.as_slice() != b"*" && !r2_is_unmapped {
+                        fgumi_raw_bam::update_string_tag(rec.as_mut_vec(), SamTag::MC, &r2_cigar);
                     } else {
                         fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MC);
                     }
@@ -664,7 +661,8 @@ impl Template {
             let r1_is_unmapped = (r1_flags & fgumi_raw_bam::flags::UNMAPPED) != 0;
             let r1_end = insert_size_end(&rr[r1_i]);
             let r1_mapq = fgumi_raw_bam::mapq(&rr[r1_i]);
-            let r1_cigar_str = fgumi_raw_bam::cigar_to_string_from_raw(&rr[r1_i]);
+            let mut r1_cigar = Vec::new();
+            fgumi_raw_bam::cigar_to_bytes_into(&mut r1_cigar, &rr[r1_i]);
             let r1_as =
                 fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[r1_i]), SamTag::AS);
 
@@ -681,12 +679,8 @@ impl Template {
                     let mq_val = if r1_mapq == 255 { 255 } else { i32::from(r1_mapq) };
                     fgumi_raw_bam::update_int_tag(rec.as_mut_vec(), SamTag::MQ, mq_val);
 
-                    if !r1_cigar_str.is_empty() && r1_cigar_str != "*" && !r1_is_unmapped {
-                        fgumi_raw_bam::update_string_tag(
-                            rec.as_mut_vec(),
-                            SamTag::MC,
-                            r1_cigar_str.as_bytes(),
-                        );
+                    if !r1_cigar.is_empty() && r1_cigar.as_slice() != b"*" && !r1_is_unmapped {
+                        fgumi_raw_bam::update_string_tag(rec.as_mut_vec(), SamTag::MC, &r1_cigar);
                     } else {
                         fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MC);
                     }
@@ -716,7 +710,8 @@ impl Template {
         let r2_is_reverse =
             (RawRecordView::new(&rr[r2_i]).flags() & fgumi_raw_bam::flags::REVERSE) != 0;
         let r2_mapq = fgumi_raw_bam::mapq(&rr[r2_i]);
-        let r2_cigar_str = fgumi_raw_bam::cigar_to_string_from_raw(&rr[r2_i]);
+        let mut r2_cigar = Vec::new();
+        fgumi_raw_bam::cigar_to_bytes_into(&mut r2_cigar, &rr[r2_i]);
 
         // Get R1's info for R2
         let r1_ref_id = fgumi_raw_bam::ref_id(&rr[r1_i]);
@@ -724,7 +719,8 @@ impl Template {
         let r1_is_reverse =
             (RawRecordView::new(&rr[r1_i]).flags() & fgumi_raw_bam::flags::REVERSE) != 0;
         let r1_mapq = fgumi_raw_bam::mapq(&rr[r1_i]);
-        let r1_cigar_str = fgumi_raw_bam::cigar_to_string_from_raw(&rr[r1_i]);
+        let mut r1_cigar = Vec::new();
+        fgumi_raw_bam::cigar_to_bytes_into(&mut r1_cigar, &rr[r1_i]);
 
         // Compute insert size before mutating
         let insert_size = compute_insert_size_raw(&rr[r1_i], &rr[r2_i]);
@@ -737,12 +733,8 @@ impl Template {
         set_mate_flags(&mut rr[r1_i], r2_is_reverse, false);
         let r2_mq_val = if r2_mapq == 255 { 255 } else { i32::from(r2_mapq) };
         fgumi_raw_bam::update_int_tag(rr[r1_i].as_mut_vec(), SamTag::MQ, r2_mq_val);
-        if !r2_cigar_str.is_empty() && r2_cigar_str != "*" {
-            fgumi_raw_bam::update_string_tag(
-                rr[r1_i].as_mut_vec(),
-                SamTag::MC,
-                r2_cigar_str.as_bytes(),
-            );
+        if !r2_cigar.is_empty() && r2_cigar.as_slice() != b"*" {
+            fgumi_raw_bam::update_string_tag(rr[r1_i].as_mut_vec(), SamTag::MC, &r2_cigar);
         } else {
             fgumi_raw_bam::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MC);
         }
@@ -753,12 +745,8 @@ impl Template {
         set_mate_flags(&mut rr[r2_i], r1_is_reverse, false);
         let r1_mq_val = if r1_mapq == 255 { 255 } else { i32::from(r1_mapq) };
         fgumi_raw_bam::update_int_tag(rr[r2_i].as_mut_vec(), SamTag::MQ, r1_mq_val);
-        if !r1_cigar_str.is_empty() && r1_cigar_str != "*" {
-            fgumi_raw_bam::update_string_tag(
-                rr[r2_i].as_mut_vec(),
-                SamTag::MC,
-                r1_cigar_str.as_bytes(),
-            );
+        if !r1_cigar.is_empty() && r1_cigar.as_slice() != b"*" {
+            fgumi_raw_bam::update_string_tag(rr[r2_i].as_mut_vec(), SamTag::MC, &r1_cigar);
         } else {
             fgumi_raw_bam::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MC);
         }
@@ -817,7 +805,8 @@ impl Template {
         let mapped_flags = RawRecordView::new(&rr[mapped_i]).flags();
         let mapped_is_reverse = (mapped_flags & fgumi_raw_bam::flags::REVERSE) != 0;
         let mapped_mapq = fgumi_raw_bam::mapq(&rr[mapped_i]);
-        let mapped_cigar_str = fgumi_raw_bam::cigar_to_string_from_raw(&rr[mapped_i]);
+        let mut mapped_cigar = Vec::new();
+        fgumi_raw_bam::cigar_to_bytes_into(&mut mapped_cigar, &rr[mapped_i]);
 
         let unmapped_is_reverse =
             (RawRecordView::new(&rr[unmapped_i]).flags() & fgumi_raw_bam::flags::REVERSE) != 0;
@@ -842,11 +831,11 @@ impl Template {
         set_mate_flags(&mut rr[unmapped_i], mapped_is_reverse, false);
         let mq_val = if mapped_mapq == 255 { 255 } else { i32::from(mapped_mapq) };
         fgumi_raw_bam::update_int_tag(rr[unmapped_i].as_mut_vec(), SamTag::MQ, mq_val);
-        if !mapped_cigar_str.is_empty() && mapped_cigar_str != "*" {
+        if !mapped_cigar.is_empty() && mapped_cigar.as_slice() != b"*" {
             fgumi_raw_bam::update_string_tag(
                 rr[unmapped_i].as_mut_vec(),
                 SamTag::MC,
-                mapped_cigar_str.as_bytes(),
+                &mapped_cigar,
             );
         } else {
             fgumi_raw_bam::remove_tag(rr[unmapped_i].as_mut_vec(), SamTag::MC);

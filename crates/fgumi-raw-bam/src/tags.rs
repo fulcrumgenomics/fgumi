@@ -250,6 +250,29 @@ pub fn decode_int_value(val_type: u8, value_bytes: &[u8]) -> Option<i64> {
     })
 }
 
+/// Decode an integer aux value directly from its type byte and value bytes.
+///
+/// The value-bytes form of [`extract_int_value`], for callers that already hold
+/// a tag entry's `(type_byte, value_bytes)` (e.g. from an [`AuxTagsIter`] walk)
+/// and want the decoded integer without re-deriving the position. Returns `None`
+/// for a non-integer type byte, or if `value_bytes` is too short for the type.
+#[must_use]
+fn int_from_value_bytes(val_type: u8, value_bytes: &[u8]) -> Option<i64> {
+    match val_type {
+        b'c' => value_bytes.first().map(|&b| i64::from(b.cast_signed())),
+        b'C' => value_bytes.first().map(|&b| i64::from(b)),
+        b's' => value_bytes.get(..2).map(|b| i64::from(i16::from_le_bytes([b[0], b[1]]))),
+        b'S' => value_bytes.get(..2).map(|b| i64::from(u16::from_le_bytes([b[0], b[1]]))),
+        b'i' => {
+            value_bytes.get(..4).map(|b| i64::from(i32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+        }
+        b'I' => {
+            value_bytes.get(..4).map(|b| i64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+        }
+        _ => None,
+    }
+}
+
 /// Find MI (Molecular Identifier) tag in auxiliary data.
 ///
 /// Returns the value as `(integer_value, is_A_suffix)`.
@@ -2259,6 +2282,171 @@ impl<'a> RawTagsEditor<'a> {
 
         // One splice back over the old aux region (off..end).
         self.record.splice(off.., new_aux);
+    }
+
+    /// Like [`Self::rebuild_with`], but during the same single walk it also normalizes
+    /// each integer tag in `normalize` to the smallest *signed* width that fits
+    /// (i8 → i16 → i32, matching fgbio's `to_smallest_signed_int`), relocating it
+    /// to the tail of the rebuilt aux — reproducing byte-for-byte what
+    /// `rebuild_with(remove, adds)` followed by
+    /// `normalize_int_tag_to_smallest_signed(t)` for each `t` in `normalize`
+    /// produces today, but without the extra `find_tag_position` scans and
+    /// `Vec::drain` memmoves that the separate per-tag normalization pass costs.
+    pub fn rebuild_with_int_normalized<M: TagKeySet + ?Sized>(
+        &mut self,
+        remove: &M,
+        adds: &[TagEntry<'_>],
+        normalize: &[[u8; 2]],
+        scratch: &mut Vec<u8>,
+    ) {
+        /// Upper bound on `normalize.len()` so the captured-values array lives on
+        /// the stack (no per-record allocation). zipper passes 2 (AS, XS); the
+        /// cap is generous. Overflow degrades gracefully to a heap `Vec`.
+        const INLINE_NORMALIZE: usize = 8;
+
+        // Nothing to normalize: identical to `rebuild_with`.
+        if normalize.is_empty() {
+            self.rebuild_with(remove, adds);
+            return;
+        }
+
+        // Duplicate keys in `normalize` fall back to the literal sequential
+        // oracle. With a repeated key, `normalize_int_tag_to_smallest_signed`
+        // peels off and relocates the FIRST remaining occurrence on each call,
+        // so N occurrences of a key normalize N distinct aux entries — which the
+        // single-pass fast path (one capture slot per distinct key) cannot
+        // reproduce. A `normalize` list with repeated keys is degenerate and
+        // never happens on the hot path (zipper passes [AS, XS]), so paying the
+        // extra scans there keeps the fast path simple and provably correct.
+        if normalize.iter().enumerate().any(|(i, tag)| normalize[i + 1..].contains(tag)) {
+            self.rebuild_with(remove, adds);
+            for &tag in normalize {
+                normalize_int_tag_to_smallest_signed(self.record, tag);
+            }
+            return;
+        }
+
+        let off = self.aux_offset.min(self.record.len());
+        let dropped_by_add = |tag: [u8; 2]| adds.iter().any(|a| a.tag == tag);
+
+        // For each `normalize` tag, the i32 value to relocate-and-normalize at the
+        // tail, or `None` to leave it untouched. Seeded from `adds` (an added tag
+        // wins the upsert, so it is the value that gets normalized — matching
+        // Step 3 running before Step 5 today); the survivor walk below fills in
+        // the value for a tag that `adds` does not carry. A tag whose winning
+        // value is not an integer, or does not fit i32, is NOT captured here —
+        // it stays verbatim wherever it already sits, exactly as
+        // `normalize_int_tag_to_smallest_signed`'s early-return leaves it.
+        //
+        // Held in a small stack array for the common case (≤ INLINE_NORMALIZE
+        // tags), spilling to the heap only if a caller passes more.
+        let mut captured_inline = [None::<i32>; INLINE_NORMALIZE];
+        let mut captured_spill: Vec<Option<i32>> = if normalize.len() > INLINE_NORMALIZE {
+            vec![None; normalize.len()]
+        } else {
+            Vec::new()
+        };
+        let captured: &mut [Option<i32>] = if normalize.len() > INLINE_NORMALIZE {
+            &mut captured_spill
+        } else {
+            &mut captured_inline[..normalize.len()]
+        };
+        for (i, &t) in normalize.iter().enumerate() {
+            captured[i] = adds
+                .iter()
+                .rev()
+                .find(|a| a.tag == t)
+                .and_then(|a| int_from_value_bytes(a.type_byte, a.value_bytes))
+                .and_then(|v| i32::try_from(v).ok());
+        }
+
+        // Tracks the FIRST survivor occurrence of each normalize tag, so a
+        // duplicate-key aux (out of BAM spec but not impossible) matches the
+        // sequential oracle exactly: `find_int_tag`/`remove_tag` act on the first
+        // key match only, so only the first occurrence is captured/relocated and
+        // any later duplicate is passed through verbatim — including the case
+        // where the first occurrence is non-integer (which must then leave a
+        // later integer duplicate untouched, not capture it). One flag per tag,
+        // sized to `normalize.len()` (inline for the common case, spilling to the
+        // heap alongside `captured` when a caller passes more than the cap) so the
+        // seen-state scales to any list length rather than silently dropping
+        // entries past a fixed bitmask width.
+        let mut seen_inline = [false; INLINE_NORMALIZE];
+        let mut seen_spill: Vec<bool> = if normalize.len() > INLINE_NORMALIZE {
+            vec![false; normalize.len()]
+        } else {
+            Vec::new()
+        };
+        let seen: &mut [bool] = if normalize.len() > INLINE_NORMALIZE {
+            &mut seen_spill
+        } else {
+            &mut seen_inline[..normalize.len()]
+        };
+
+        // Build the rebuilt aux into the caller's reusable scratch buffer (its
+        // allocation is reused across records on the serial merge thread), then
+        // splice it back via `drain` so the scratch keeps its capacity.
+        scratch.clear();
+        let adds_len: usize = adds.iter().map(|a| 3 + a.value_bytes.len()).sum();
+        scratch.reserve((self.record.len() - off) + adds_len);
+
+        // Single pass over the existing aux: copy survivors, capturing any
+        // normalize tag that is the upsert winner and re-encodable to i32.
+        for entry in &RawTagsView::new(&self.record[off..]) {
+            if remove.contains_tag(entry.tag) || dropped_by_add(entry.tag) {
+                continue;
+            }
+            // A normalize tag reaching here is the winner (`adds` does not carry
+            // it, else it was dropped above). Only the FIRST occurrence is
+            // considered (first-key-match semantics of `find_int_tag`): capture
+            // and drop it iff it is an integer that fits i32; otherwise, and for
+            // every later duplicate occurrence, leave it verbatim in place.
+            if let Some(i) = normalize.iter().position(|&n| n == entry.tag)
+                && !seen[i]
+            {
+                seen[i] = true;
+                if let Some(v) = int_from_value_bytes(entry.type_byte, entry.value_bytes)
+                    .and_then(|v| i32::try_from(v).ok())
+                {
+                    captured[i] = Some(v);
+                    continue;
+                }
+            }
+            scratch.push(entry.tag[0]);
+            scratch.push(entry.tag[1]);
+            scratch.push(entry.type_byte);
+            scratch.extend_from_slice(entry.value_bytes);
+        }
+
+        // Append the adds (dedup last-wins, as `rebuild_with`), skipping any add
+        // that is being relocated as a normalized tag (captured from `adds`).
+        for (idx, a) in adds.iter().enumerate() {
+            if adds[idx + 1..].iter().any(|b| b.tag == a.tag) {
+                continue;
+            }
+            let relocated =
+                normalize.iter().position(|&n| n == a.tag).is_some_and(|i| captured[i].is_some());
+            if relocated {
+                continue;
+            }
+            scratch.push(a.tag[0]);
+            scratch.push(a.tag[1]);
+            scratch.push(a.type_byte);
+            scratch.extend_from_slice(a.value_bytes);
+        }
+
+        // Append the normalized tags at the tail, in `normalize` order, using the
+        // same smallest-signed encoder the sequential normalize pass used — so
+        // the tail bytes and order are byte-identical to today. `normalize` has
+        // distinct keys here (a duplicate-key list took the sequential fallback
+        // above), so each captured slot maps to a unique tag emitted once.
+        for (i, &t) in normalize.iter().enumerate() {
+            if let Some(v) = captured[i] {
+                append_signed_int_tag(scratch, t, v);
+            }
+        }
+
+        self.record.splice(off.., scratch.drain(..));
     }
 }
 
@@ -5168,5 +5356,415 @@ mod tests {
         }
         let got: Vec<[u8; 2]> = aux_entries(&rec).into_iter().map(|(t, _, _)| t).collect();
         assert_eq!(got, vec![key(SamTag::RG)], "walk stops at malformed entry; RG kept");
+    }
+
+    // ========================================================================
+    // RawTagsEditor::rebuild_with_int_normalized — fold AS/XS int normalization
+    // into the single rebuild walk. Its contract is defined by an oracle: it
+    // must produce byte-identical output to `rebuild_with(remove, adds)` followed
+    // by `normalize_int_tag_to_smallest_signed(t)` for each `t` in `normalize`.
+    // ========================================================================
+
+    /// Build raw entry bytes `[tag0, tag1, type, value...]`.
+    fn ent(tag: [u8; 2], ty: u8, val: &[u8]) -> Vec<u8> {
+        let mut v = vec![tag[0], tag[1], ty];
+        v.extend_from_slice(val);
+        v
+    }
+
+    fn as_xs() -> [[u8; 2]; 2] {
+        [key(SamTag::AS), key(SamTag::XS)]
+    }
+
+    /// Today's behavior, the oracle: `rebuild_with`, then normalize each tag in order.
+    fn oracle_rebuild_then_normalize(
+        base: &[u8],
+        remove: &[[u8; 2]],
+        adds: &[TagEntry<'_>],
+        normalize: &[[u8; 2]],
+    ) -> Vec<u8> {
+        let mut rec = base.to_vec();
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.rebuild_with(remove, adds);
+        }
+        for &t in normalize {
+            normalize_int_tag_to_smallest_signed(&mut rec, t);
+        }
+        rec
+    }
+
+    fn folded_rebuild_normalize(
+        base: &[u8],
+        remove: &[[u8; 2]],
+        adds: &[TagEntry<'_>],
+        normalize: &[[u8; 2]],
+    ) -> Vec<u8> {
+        let mut rec = base.to_vec();
+        {
+            let mut scratch = Vec::new();
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.rebuild_with_int_normalized(remove, adds, normalize, &mut scratch);
+        }
+        rec
+    }
+
+    fn assert_folded_matches_oracle(
+        base: &[u8],
+        remove: &[[u8; 2]],
+        adds: &[TagEntry<'_>],
+        normalize: &[[u8; 2]],
+        label: &str,
+    ) {
+        let expected = oracle_rebuild_then_normalize(base, remove, adds, normalize);
+        let got = folded_rebuild_normalize(base, remove, adds, normalize);
+        assert_eq!(
+            aux_entries(&got),
+            aux_entries(&expected),
+            "{label}: folded aux entries must equal the rebuild+normalize oracle"
+        );
+        assert_eq!(
+            got, expected,
+            "{label}: folded record bytes must be byte-identical to the oracle"
+        );
+    }
+
+    #[test]
+    fn folded_normalize_common_i32_as_xs() {
+        // bwa-mem3 shape: AS:i:139 and XS:i:0 (int32), interleaved with other
+        // tags, plus a copied-in BX. Both must end normalized (AS->i16, XS->i8)
+        // and relocated to the tail, after the BX add.
+        let as_i = ent(key(SamTag::AS), b'i', &139i32.to_le_bytes());
+        let xs_i = ent(key(SamTag::XS), b'i', &0i32.to_le_bytes());
+        let base = rec_with_aux(&[b"RGZg\x00", &as_i, b"NMC\x02", &xs_i]);
+        let bx = TagEntry { tag: BX, type_byte: b'Z', value_bytes: b"ACGT\x00" };
+        assert_folded_matches_oracle(&base, &[] as &[[u8; 2]], &[bx], &as_xs(), "common i32 AS/XS");
+    }
+
+    #[test]
+    fn folded_normalize_only_as_present() {
+        let as_i = ent(key(SamTag::AS), b'i', &200i32.to_le_bytes());
+        let base = rec_with_aux(&[b"RGZg\x00", &as_i]);
+        assert_folded_matches_oracle(&base, &[] as &[[u8; 2]], &[], &as_xs(), "only AS present");
+    }
+
+    #[test]
+    fn folded_normalize_both_absent_is_noop() {
+        let base = rec_with_aux(&[b"RGZg\x00", b"NMC\x02"]);
+        assert_folded_matches_oracle(&base, &[] as &[[u8; 2]], &[], &as_xs(), "AS/XS absent");
+    }
+
+    #[test]
+    fn folded_normalize_as_already_smallest_width() {
+        // AS already 'c' (fits i8). The oracle still remove+re-appends it (moving
+        // it to the tail as 'c'); the folded pass must reproduce that relocation.
+        let as_c = ent(key(SamTag::AS), b'c', &[5]);
+        let base = rec_with_aux(&[&as_c, b"RGZg\x00"]);
+        assert_folded_matches_oracle(&base, &[] as &[[u8; 2]], &[], &as_xs(), "AS already i8");
+    }
+
+    #[test]
+    fn folded_normalize_non_int_as_left_in_place() {
+        // AS is a Z-string, not an integer: normalize is a no-op, so AS must stay
+        // verbatim at its original position (NOT relocated).
+        let as_z = ent(key(SamTag::AS), b'Z', b"hello\x00");
+        let base = rec_with_aux(&[&as_z, b"RGZg\x00"]);
+        assert_folded_matches_oracle(
+            &base,
+            &[] as &[[u8; 2]],
+            &[],
+            &as_xs(),
+            "non-int AS left in place",
+        );
+    }
+
+    #[test]
+    fn folded_normalize_value_exceeds_i32_left_in_place() {
+        // AS:I (u32) with a value above i32::MAX: normalize early-returns without
+        // touching it, so AS stays verbatim in place.
+        let as_big = ent(key(SamTag::AS), b'I', &3_000_000_000u32.to_le_bytes());
+        let base = rec_with_aux(&[&as_big, b"RGZg\x00"]);
+        assert_folded_matches_oracle(
+            &base,
+            &[] as &[[u8; 2]],
+            &[],
+            &as_xs(),
+            "AS value exceeds i32",
+        );
+    }
+
+    #[test]
+    fn folded_normalize_as_supplied_via_adds_upsert() {
+        // A survivor AS:i:139 is upserted by an adds AS:i:200; normalization must
+        // apply to the winning (post-upsert) value.
+        let as_i = ent(key(SamTag::AS), b'i', &139i32.to_le_bytes());
+        let base = rec_with_aux(&[&as_i, b"RGZg\x00"]);
+        let as_add =
+            TagEntry { tag: key(SamTag::AS), type_byte: b'i', value_bytes: &200i32.to_le_bytes() };
+        assert_folded_matches_oracle(
+            &base,
+            &[] as &[[u8; 2]],
+            &[as_add],
+            &as_xs(),
+            "AS supplied via adds",
+        );
+    }
+
+    #[test]
+    fn folded_normalize_with_remove_and_copy_set() {
+        // Full merge_raw_with shape: a remove-set, a copied BX, AS/XS to normalize.
+        let as_i = ent(key(SamTag::AS), b'i', &1000i32.to_le_bytes());
+        let xs_i = ent(key(SamTag::XS), b'i', &50i32.to_le_bytes());
+        let base = rec_with_aux(&[b"RGZg\x00", b"NMC\x03", &as_i, b"MDZ50\x00", &xs_i]);
+        let bx = TagEntry { tag: BX, type_byte: b'Z', value_bytes: b"ACGTAC\x00" };
+        assert_folded_matches_oracle(
+            &base,
+            &[key(SamTag::NM)],
+            &[bx],
+            &as_xs(),
+            "remove + copy + normalize",
+        );
+    }
+
+    #[test]
+    fn folded_normalize_empty_aux_with_adds() {
+        let base = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        let bx = TagEntry { tag: BX, type_byte: b'Z', value_bytes: b"AC\x00" };
+        assert_folded_matches_oracle(&base, &[] as &[[u8; 2]], &[bx], &as_xs(), "empty aux + adds");
+    }
+
+    /// A random integer aux value in any of the six BAM int encodings — including
+    /// `i`/`I` values above `i32::MAX`, which exercise the "left in place" path.
+    fn arb_int_bytes() -> impl proptest::strategy::Strategy<Value = (u8, Vec<u8>)> {
+        use proptest::prelude::*;
+        prop_oneof![
+            any::<i8>().prop_map(|v| (b'c', vec![v.cast_unsigned()])),
+            any::<u8>().prop_map(|v| (b'C', vec![v])),
+            any::<i16>().prop_map(|v| (b's', v.to_le_bytes().to_vec())),
+            any::<u16>().prop_map(|v| (b'S', v.to_le_bytes().to_vec())),
+            any::<i32>().prop_map(|v| (b'i', v.to_le_bytes().to_vec())),
+            any::<u32>().prop_map(|v| (b'I', v.to_le_bytes().to_vec())),
+        ]
+    }
+
+    proptest::proptest! {
+        /// The folded pass must be byte-identical to `rebuild_with` + sequential
+        /// `normalize_int_tag_to_smallest_signed(AS)`/`(XS)` for arbitrary AS/XS
+        /// encodings, presence, an optional AS upsert, a copied BX, and a removed NM.
+        #[test]
+        fn folded_normalize_matches_oracle_prop(
+            as_present in proptest::prelude::any::<bool>(),
+            as_enc in arb_int_bytes(),
+            xs_present in proptest::prelude::any::<bool>(),
+            xs_enc in arb_int_bytes(),
+            add_bx in proptest::prelude::any::<bool>(),
+            add_as in proptest::option::of(proptest::prelude::any::<i32>()),
+            remove_nm in proptest::prelude::any::<bool>(),
+        ) {
+            let mut entries: Vec<Vec<u8>> = vec![ent(key(SamTag::RG), b'Z', b"g\x00")];
+            if as_present { entries.push(ent(key(SamTag::AS), as_enc.0, &as_enc.1)); }
+            entries.push(ent(key(SamTag::NM), b'C', &[3]));
+            entries.push(ent(key(SamTag::MD), b'Z', b"50\x00"));
+            if xs_present { entries.push(ent(key(SamTag::XS), xs_enc.0, &xs_enc.1)); }
+            let refs: Vec<&[u8]> = entries.iter().map(Vec::as_slice).collect();
+            let base = rec_with_aux(&refs);
+
+            let as_add_bytes = add_as.map(i32::to_le_bytes);
+            let mut adds: Vec<TagEntry<'_>> = Vec::new();
+            if add_bx {
+                adds.push(TagEntry { tag: BX, type_byte: b'Z', value_bytes: b"AC\x00" });
+            }
+            if let Some(ref b) = as_add_bytes {
+                adds.push(TagEntry { tag: key(SamTag::AS), type_byte: b'i', value_bytes: b });
+            }
+            let remove: Vec<[u8; 2]> = if remove_nm { vec![key(SamTag::NM)] } else { vec![] };
+
+            let expected = oracle_rebuild_then_normalize(&base, &remove, &adds, &as_xs());
+            let got = folded_rebuild_normalize(&base, &remove, &adds, &as_xs());
+            proptest::prop_assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn folded_normalize_empty_normalize_list_equals_rebuild_with() {
+        // The empty-`normalize` fast path must be identical to plain `rebuild_with`.
+        let base = rec_with_aux(&[b"RGZg\x00", b"NMC\x02"]);
+        let bx = TagEntry { tag: BX, type_byte: b'Z', value_bytes: b"AC\x00" };
+        let mut got = base.clone();
+        {
+            let mut sc = Vec::new();
+            let mut ed = RawTagsEditor::from_vec(&mut got);
+            ed.rebuild_with_int_normalized(&[] as &[[u8; 2]], &[bx], &[], &mut sc);
+        }
+        let mut expected = base.clone();
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut expected);
+            ed.rebuild_with(&[] as &[[u8; 2]], &[bx]);
+        }
+        assert_eq!(got, expected, "empty normalize must equal rebuild_with");
+    }
+
+    #[test]
+    fn folded_normalize_spills_to_heap_beyond_inline_cap() {
+        // Exercise the heap-spill branch: pass more normalize tags than the
+        // inline stack array holds (> INLINE_NORMALIZE = 8). Tag keys are built
+        // programmatically (`Zx`) to avoid literal-tag churn; each is an int tag
+        // wide enough that normalization actually shrinks it, so the spill
+        // indexing is genuinely exercised, not a no-op.
+        let n: u8 = 12; // > INLINE_NORMALIZE
+        let keys: Vec<[u8; 2]> = (0..n).map(|i| [b'Z', b'0' + i]).collect();
+        let entries: Vec<Vec<u8>> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ent(*k, b'i', &(300 + i32::try_from(i).unwrap()).to_le_bytes()))
+            .collect();
+        let refs: Vec<&[u8]> = entries.iter().map(Vec::as_slice).collect();
+        let base = rec_with_aux(&refs);
+        // Oracle: rebuild_with(no-op) then normalize each key sequentially.
+        let expected = oracle_rebuild_then_normalize(&base, &[] as &[[u8; 2]], &[], &keys);
+        let got = folded_rebuild_normalize(&base, &[] as &[[u8; 2]], &[], &keys);
+        assert_eq!(
+            aux_entries(&got),
+            aux_entries(&expected),
+            "heap-spill normalize path must match the sequential oracle"
+        );
+        assert_eq!(got, expected, "heap-spill normalize path must be byte-identical");
+    }
+
+    #[test]
+    fn folded_normalize_scales_past_former_bitmask_width() {
+        // Regression: the seen-state that tracks each normalize tag's first
+        // survivor occurrence was a u64 bitmask capped at 64 entries — a debug
+        // panic and, in release, a silent failure to capture (leaving entries at
+        // indices >= 64 unnormalized, diverging from the sequential oracle). Pass
+        // more than 64 distinct int tags (each wide enough that normalization
+        // shrinks it) so the tags beyond the old cap are genuinely normalized.
+        let n: u16 = 70; // > former 64-bit cap and > INLINE_NORMALIZE
+        let keys: Vec<[u8; 2]> = (0..n).map(|i| [b'Z', 32 + u8::try_from(i).unwrap()]).collect();
+        let entries: Vec<Vec<u8>> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ent(*k, b'i', &(300 + i32::try_from(i).unwrap()).to_le_bytes()))
+            .collect();
+        let refs: Vec<&[u8]> = entries.iter().map(Vec::as_slice).collect();
+        let base = rec_with_aux(&refs);
+        let expected = oracle_rebuild_then_normalize(&base, &[] as &[[u8; 2]], &[], &keys);
+        let got = folded_rebuild_normalize(&base, &[] as &[[u8; 2]], &[], &keys);
+        assert_eq!(
+            aux_entries(&got),
+            aux_entries(&expected),
+            "normalize list beyond 64 entries must match the sequential oracle"
+        );
+        assert_eq!(got, expected, "normalize list beyond 64 entries must be byte-identical");
+    }
+
+    #[test]
+    fn folded_normalize_repeated_normalize_key_matches_sequential_oracle() {
+        // A `normalize` list with a repeated key ([AS, XS, AS]) is degenerate, so
+        // the folded path falls back to the literal sequential oracle. Assert the
+        // fallback reproduces it for both a survivor-sourced value (AS in the aux)
+        // and an adds-sourced value (AS supplied via adds).
+        let normalize = [key(SamTag::AS), key(SamTag::XS), key(SamTag::AS)];
+
+        // Survivor-sourced: AS/XS live in the aux.
+        let as_i = ent(key(SamTag::AS), b'i', &139i32.to_le_bytes());
+        let xs_i = ent(key(SamTag::XS), b'i', &0i32.to_le_bytes());
+        let base = rec_with_aux(&[b"RGZg\x00", &as_i, &xs_i]);
+        assert_folded_matches_oracle(
+            &base,
+            &[] as &[[u8; 2]],
+            &[],
+            &normalize,
+            "repeated AS in normalize, survivor value",
+        );
+
+        // Adds-sourced: AS supplied via adds (upsert winner).
+        let base2 = rec_with_aux(&[b"RGZg\x00", &xs_i]);
+        let as_add =
+            TagEntry { tag: key(SamTag::AS), type_byte: b'i', value_bytes: &139i32.to_le_bytes() };
+        assert_folded_matches_oracle(
+            &base2,
+            &[] as &[[u8; 2]],
+            &[as_add],
+            &normalize,
+            "repeated AS in normalize, adds value",
+        );
+    }
+
+    #[test]
+    fn folded_normalize_repeated_key_with_duplicate_aux_entries_normalizes_both() {
+        // Doubly-degenerate: TWO integer AS entries in the aux AND a repeated key
+        // in `normalize` ([AS, AS]). The sequential oracle calls
+        // normalize_int_tag_to_smallest_signed(AS) twice; each call peels off and
+        // relocates the first remaining AS, so BOTH aux entries are normalized and
+        // moved to the tail (AS=300 fits i16, AS=50 fits i8). The single-pass fast
+        // path captures only the first occurrence per key, so this MUST take the
+        // sequential fallback — assert byte parity with the oracle.
+        let as1 = ent(key(SamTag::AS), b'i', &300i32.to_le_bytes());
+        let as2 = ent(key(SamTag::AS), b'i', &50i32.to_le_bytes());
+        let base = rec_with_aux(&[&as1, b"RGZg\x00", &as2]);
+        assert_folded_matches_oracle(
+            &base,
+            &[] as &[[u8; 2]],
+            &[],
+            &[key(SamTag::AS), key(SamTag::AS)],
+            "duplicate AS aux entries with repeated AS normalize key",
+        );
+    }
+
+    #[test]
+    fn folded_normalize_duplicate_key_both_int_keeps_first_match_semantics() {
+        // Degenerate (out-of-BAM-spec) aux with AS twice. The oracle
+        // (find_int_tag/remove_tag = first key match) normalizes the FIRST AS and
+        // relocates it to the tail, leaving the second AS verbatim in place. The
+        // folded path must reproduce that exactly.
+        let as1 = ent(key(SamTag::AS), b'i', &300i32.to_le_bytes());
+        let as2 = ent(key(SamTag::AS), b'i', &50i32.to_le_bytes());
+        let base = rec_with_aux(&[&as1, b"RGZg\x00", &as2]);
+        assert_folded_matches_oracle(
+            &base,
+            &[] as &[[u8; 2]],
+            &[],
+            &as_xs(),
+            "duplicate AS, both int",
+        );
+    }
+
+    #[test]
+    fn folded_normalize_duplicate_key_non_int_first_left_verbatim() {
+        // Doubly-degenerate: AS appears twice, the first occurrence non-integer.
+        // find_int_tag matches the first key (non-int) and returns None, so the
+        // oracle normalizes nothing and leaves BOTH entries verbatim — the folded
+        // path must NOT reach past the non-int first occurrence to the int second.
+        let as_z = ent(key(SamTag::AS), b'Z', b"x\x00");
+        let as_i = ent(key(SamTag::AS), b'i', &50i32.to_le_bytes());
+        let base = rec_with_aux(&[&as_z, &as_i, b"RGZg\x00"]);
+        assert_folded_matches_oracle(
+            &base,
+            &[] as &[[u8; 2]],
+            &[],
+            &as_xs(),
+            "duplicate AS, non-int first",
+        );
+    }
+
+    #[test]
+    fn folded_normalize_adds_supplies_non_int_and_overflow_tags() {
+        // `adds` carries AS as a non-integer and XS as a u32 above i32::MAX: both
+        // are non-normalizable, so each must be appended verbatim (not relocated),
+        // matching rebuild_with + a no-op normalize.
+        let base = rec_with_aux(&[b"RGZg\x00"]);
+        let xs_big = 3_000_000_000u32.to_le_bytes();
+        let adds = [
+            TagEntry { tag: key(SamTag::AS), type_byte: b'Z', value_bytes: b"hi\x00" },
+            TagEntry { tag: key(SamTag::XS), type_byte: b'I', value_bytes: &xs_big },
+        ];
+        assert_folded_matches_oracle(
+            &base,
+            &[] as &[[u8; 2]],
+            &adds,
+            &as_xs(),
+            "adds non-int/overflow",
+        );
     }
 }

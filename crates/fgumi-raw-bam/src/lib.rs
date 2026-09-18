@@ -78,6 +78,7 @@ pub use cigar::{
     CigarOp,
     alignment_end_from_raw,
     alignment_start_from_raw,
+    cigar_to_bytes_into,
     cigar_to_string_from_raw,
     clip_cigar_ops_raw,
     consumes_query,

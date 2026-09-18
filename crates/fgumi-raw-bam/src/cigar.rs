@@ -128,6 +128,59 @@ pub fn cigar_to_string_from_raw(bam: &[u8]) -> String {
     result
 }
 
+/// Write a SAM-style CIGAR (from a raw BAM record) into `out`, byte-for-byte
+/// identical to [`cigar_to_string_from_raw`] but allocation-free: `out` is
+/// cleared and reused, the op lengths are formatted in place (no per-op
+/// `to_string`), and the CIGAR ops are read without the intermediate
+/// `get_cigar_ops` `Vec`. `out` ends empty for a record with no CIGAR.
+///
+/// The saving over `cigar_to_string_from_raw` is per call: it drops the
+/// intermediate `get_cigar_ops` `Vec<u32>` and the per-op `u32::to_string()`
+/// heap allocation (one `String` per CIGAR op), formatting each length directly
+/// into `out`. Callers that stringify a mate's CIGAR per record (e.g.
+/// `Template::fix_mate_info` setting the `MC` tag) get that per-call reduction
+/// today; a caller that additionally hoists `out` across records reuses the one
+/// allocation as well, but that cross-record reuse is not required for the win.
+///
+/// # Panics
+///
+/// Panics if a CIGAR operation has an invalid type (>= 9), matching
+/// [`cigar_to_string_from_raw`].
+pub fn cigar_to_bytes_into(out: &mut Vec<u8>, bam: &[u8]) {
+    out.clear();
+    let l_read_name = l_read_name(bam) as usize;
+    let n_cigar_op = n_cigar_op(bam) as usize;
+    if n_cigar_op == 0 {
+        return;
+    }
+    let cigar_start = 32 + l_read_name;
+    let cigar_end = cigar_start + n_cigar_op * 4;
+    if cigar_end > bam.len() {
+        return;
+    }
+    // A u32 op length is at most 10 decimal digits.
+    let mut digits = [0u8; 10];
+    for c in bam[cigar_start..cigar_end].chunks_exact(4) {
+        let op = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        let op_len = op >> 4;
+        let op_type = (op & 0xF) as usize;
+        assert!(op_type < CIGAR_OP_CHARS.len(), "invalid CIGAR op type: {op_type}");
+        if op_len == 0 {
+            out.push(b'0');
+        } else {
+            let mut n = op_len;
+            let mut i = digits.len();
+            while n > 0 {
+                i -= 1;
+                digits[i] = b'0' + (n % 10) as u8;
+                n /= 10;
+            }
+            out.extend_from_slice(&digits[i..]);
+        }
+        out.push(CIGAR_OP_CHARS[op_type]);
+    }
+}
+
 /// Calculate reference-consuming length from CIGAR operations.
 ///
 /// This is the sum of M/D/N/=/X operations, which represents how many
@@ -2566,6 +2619,53 @@ mod tests {
     fn test_cigar_to_string_no_cigar() {
         let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
         assert_eq!(cigar_to_string_from_raw(&rec), "");
+    }
+
+    #[test]
+    fn cigar_to_bytes_into_matches_string_variant() {
+        // Oracle: the alloc-free byte writer must produce exactly the bytes of
+        // the allocating String variant, across shapes incl. multi-digit lengths.
+        let cases: [&[u32]; 7] = [
+            &[encode_op(0, 100)],                                                    // 100M
+            &[encode_op(4, 5), encode_op(0, 50), encode_op(1, 3), encode_op(0, 42)], // 5S50M3I42M
+            &[],                                                                     // empty
+            &[encode_op(0, 1), encode_op(2, 9), encode_op(0, 1_234_567)],            // multi-digit
+            &[encode_op(5, 12), encode_op(7, 3), encode_op(8, 4)],                   // H,=,X
+            &[encode_op(0, 0)], // zero-length op (op_len==0 branch)
+            &[encode_op(0, 0), encode_op(4, 5)], // zero-length op followed by a non-zero op
+        ];
+        let mut buf = vec![0xEE_u8; 3]; // pre-dirtied to prove it's cleared
+        for ops in cases {
+            let rec = make_bam_bytes(0, 0, 0, b"r1", ops, 100, -1, -1, &[]);
+            cigar_to_bytes_into(&mut buf, &rec);
+            assert_eq!(
+                buf.as_slice(),
+                cigar_to_string_from_raw(&rec).as_bytes(),
+                "cigar_to_bytes_into must equal cigar_to_string_from_raw for ops {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cigar_to_bytes_into_fails_closed_on_truncated_cigar() {
+        // A record whose header claims CIGAR ops but whose bytes are cut off
+        // mid-CIGAR (cigar_end > bam.len()) must fail closed to empty — matching
+        // cigar_to_string_from_raw (both guard via the same cigar_end bound).
+        let rec =
+            make_bam_bytes(0, 0, 0, b"r1", &[encode_op(0, 100), encode_op(4, 8)], 100, -1, -1, &[]);
+        // CIGAR lives mid-record; cut the buffer partway through it so
+        // cigar_end (cigar_start + 2*4) exceeds the truncated length. Header
+        // fields (l_read_name, n_cigar_op) stay intact in the first 32 bytes.
+        let cigar_start = 32 + l_read_name(&rec) as usize;
+        let truncated = &rec[..cigar_start + 4]; // only 1 of 2 CIGAR ops present
+        let mut buf = vec![0xEE_u8; 5]; // pre-dirtied to prove it's cleared
+        cigar_to_bytes_into(&mut buf, truncated);
+        assert!(buf.is_empty(), "truncated CIGAR must yield empty (fail-closed)");
+        assert_eq!(
+            buf.as_slice(),
+            cigar_to_string_from_raw(truncated).as_bytes(),
+            "truncated-CIGAR fail-closed behavior must match the string variant"
+        );
     }
 
     #[cfg(feature = "noodles")]
