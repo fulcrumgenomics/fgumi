@@ -974,7 +974,10 @@ fn templates_to_records_flattens_every_record_including_split_alignments(
 /// worker, so the runtime requires ≥3 threads; 4 and 8 both clear that floor and
 /// exercise the parallel `ZipperMerge` fan-out across workers.
 #[rstest]
-fn zipper_split_matches_zippermergestep_bytes(#[values(4, 8)] threads: usize) {
+fn zipper_split_matches_zippermergestep_bytes(
+    #[values(4, 8)] threads: usize,
+    #[values(false, true)] exclude_missing: bool,
+) {
     use std::sync::atomic::AtomicU64;
 
     use noodles::sam::Header;
@@ -987,12 +990,14 @@ fn zipper_split_matches_zippermergestep_bytes(#[values(4, 8)] threads: usize) {
     const BATCH: usize = 4;
 
     // A fresh config each call: the counters are `Arc`s, so the oracle and the
-    // split must not share them. `exclude_missing_reads=false` so missing mates
-    // are emitted as unmapped-only (the interleaving the split must preserve).
+    // split must not share them. Parameterized on `exclude_missing`: false emits
+    // the missing mates as unmapped-only (the interleaving the split must
+    // preserve); true drops them and bumps `missing_count` — the ZipperZipStep
+    // exclude branch this case exercises.
     let make_cfg = || ZipperMergeConfig {
         tag_info: Arc::new(crate::umi::TagInfo::new(vec![], vec![], vec![])),
         skip_tc_tags: true,
-        exclude_missing_reads: false,
+        exclude_missing_reads: exclude_missing,
         reference: None,
         output_header: Arc::new(Header::default()),
         missing_count: Arc::new(AtomicU64::new(0)),
@@ -1061,12 +1066,15 @@ fn zipper_split_matches_zippermergestep_bytes(#[values(4, 8)] threads: usize) {
 
     // Oracle: the shipped single ZipperMergeStep.
     let oracle: Arc<Mutex<Vec<BamTemplateBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let oracle_missing: Arc<AtomicU64>;
     {
         let (unmapped, mapped) = build_inputs();
+        let oracle_cfg = make_cfg();
+        oracle_missing = Arc::clone(&oracle_cfg.missing_count);
         let builder = Pipeline::builder();
         let a = builder.append_source(ReplaySource::new(unmapped));
         let b = builder.append_source(ReplaySource::new(mapped));
-        let merge = builder.append_step2(ZipperMergeStep::new(make_cfg()), a, b);
+        let merge = builder.append_step2(ZipperMergeStep::new(oracle_cfg), a, b);
         builder.append_step(CollectSink { collected: Arc::clone(&oracle) }, merge);
         let pipeline = builder.build().expect("oracle chain builds");
         pipeline.run(PipelineConfig { threads, ..Default::default() }).expect("oracle runs");
@@ -1074,9 +1082,11 @@ fn zipper_split_matches_zippermergestep_bytes(#[values(4, 8)] threads: usize) {
 
     // Split: ZipperZipStep (pairing) → ZipperMerge (merge).
     let split: Arc<Mutex<Vec<BamTemplateBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let split_missing: Arc<AtomicU64>;
     {
         let (unmapped, mapped) = build_inputs();
         let cfg = make_cfg();
+        split_missing = Arc::clone(&cfg.missing_count);
         let builder = Pipeline::builder();
         let a = builder.append_source(ReplaySource::new(unmapped));
         let b = builder.append_source(ReplaySource::new(mapped));
@@ -1106,6 +1116,21 @@ fn zipper_split_matches_zippermergestep_bytes(#[values(4, 8)] threads: usize) {
              split {got:02x?}, oracle {want:02x?}",
         );
     }
+
+    // Missing-mate accounting must match the oracle: with exclude_missing the
+    // every-5th unmapped-only reads are dropped and counted (12 of 60); without
+    // it, none are excluded.
+    let expected_missing = if exclude_missing { (N_TEMPLATES / 5) as u64 } else { 0 };
+    assert_eq!(
+        oracle_missing.load(AtomicOrdering::Relaxed),
+        expected_missing,
+        "oracle missing_count",
+    );
+    assert_eq!(
+        split_missing.load(AtomicOrdering::Relaxed),
+        expected_missing,
+        "split missing_count must match the oracle",
+    );
 }
 
 /// `ReplaySource → GroupByMi` drives the MI grouper through the framework.
