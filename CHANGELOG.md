@@ -22,6 +22,14 @@ All notable changes to this project will be documented in this file.
   latency. All flags are hidden from `--help` ([#937](https://github.com/fulcrumgenomics/fgumi/pull/937)).
 - Honor `--check-crc`/`--no-check-crc` on `fgumi fastq`, so a trusted intermediate BAM piped to an aligner can skip the input CRC32 verification and hand those cycles to the aligner. Default policy is unchanged (verify a file source, skip stdin) ([#960](https://github.com/fulcrumgenomics/fgumi/pull/960)).
 
+### Performance
+
+- Add a gated multi-base fast path to the consensus base caller, replacing the full
+  log-sum-exp for positions with two or more observed bases with a cheaper max-factored
+  posterior. Gated to return the same Phred as the full calculation and to defer to it
+  near a bracket boundary, so output is byte-identical; measured ~7% off the single-thread
+  simplex consensus step ([#973](https://github.com/fulcrumgenomics/fgumi/pull/973)).
+
 ## [0.7.0] - 2026-08-24
 
 ### Bug Fixes
