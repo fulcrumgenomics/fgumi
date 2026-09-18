@@ -160,7 +160,9 @@ pub struct Zipper {
     #[arg(long, value_delimiter = ',')]
     pub tags_to_revcomp: Vec<String>,
 
-    /// Buffer size for template channel (default: 50000)
+    /// Buffer size for the template channel used by the `process_raw` path
+    /// (default: 50000). Not used by the `--threads >= 4` chain path, which
+    /// bounds its inter-stage memory by byte budget instead.
     #[arg(short = 'b', long, default_value = "50000")]
     pub buffer: usize,
 
@@ -671,10 +673,10 @@ fn merge_raw_with(
                 transfer_qc_flag(&mut rr[i], is_qc_fail);
                 // No copyable tags, so the Step-3 rebuild (which folds AS/XS
                 // normalization) is skipped for these records — normalize them
-                // standalone here, preserving the old Step-5 behavior exactly
-                // (including its malformed-aux tolerance).
-                fgumi_raw_bam::normalize_int_tag_to_smallest_signed(rr[i].as_mut_vec(), SamTag::AS);
-                fgumi_raw_bam::normalize_int_tag_to_smallest_signed(rr[i].as_mut_vec(), SamTag::XS);
+                // standalone here via the same single-pass helper the Step-5
+                // fallback uses, so both no-copy paths share identical duplicate
+                // and malformed-aux handling.
+                normalize_as_xs_single_pass(rr[i].as_mut_vec(), aux_scratch);
                 normalized[i] = true;
             }
             continue;
@@ -1179,6 +1181,63 @@ impl Zipper {
         })
     }
 
+    /// Run standalone zipper on the declarative pipeline chain (issue #972).
+    ///
+    /// Used for `--threads >= 4`: routing the per-template merge through the
+    /// Parallel `ZipperMerge` step fans it out across the work-stealing pool,
+    /// instead of the single serial merge in [`Self::process_raw`]. Produces the
+    /// same output header and record stream as `process_raw`
+    /// (`chain_path_matches_process_raw` decodes both outputs and compares the
+    /// merged records; `execute` normalizes the `@HD` line on the `process_raw`
+    /// path so the headers agree too). Everything — the merged header, `@PG`
+    /// injection, tuning, the `ZipperZipStep → ZipperMerge → serialize → compress
+    /// → write` steps, and the ≥4-thread pool floor — is assembled inside
+    /// `build_for`/`add_zipper`; this only projects the command's fields into a
+    /// single-stage [`ChainSpec`](crate::pipeline::chains::ChainSpec) (a `PairedBams`-shaped spec, which
+    /// `ChainSpec::single_stage` does not cover, so the fields are set here).
+    ///
+    /// Requires regular-file inputs: the `PairedBams` source opens by path, so
+    /// stdin/FIFO inputs stay on the streaming `process_raw` path (see `execute`).
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        use crate::commands::common::{
+            CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
+            resolve_check_crc,
+        };
+        use crate::pipeline::chains::{
+            ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag, build_for,
+        };
+
+        let spec = ChainSpec {
+            stages: vec![Stage::Zipper],
+            source: SourceSpec::PairedBams {
+                unmapped: self.unmapped.clone(),
+                mapped: self.input.clone(),
+                reference: self.reference.clone(),
+            },
+            sink: SinkSpec::Bam(self.output.clone()),
+            stage_opts: StageOptionsBag {
+                zipper: Some(self.to_zipper_options()),
+                ..Default::default()
+            },
+            threading: ThreadingOptions { threads: Some(self.threads) },
+            // Match process_raw's writer level so the two paths are byte-comparable.
+            compression: CompressionOptions {
+                compression_level: self.resolved_compression_level(),
+            },
+            // Sibling chain commands use a 10s deadlock monitor (Default is off).
+            scheduler: SchedulerOptions { deadlock_timeout: 10, ..Default::default() },
+            queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
+            read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
+            // Zipper has no --check-crc flag; use the shared default policy
+            // (verify file input, trust stdin). The chain path is gated on
+            // regular-file inputs, so this resolves to "verify".
+            verify_crc: resolve_check_crc(false, false, &self.input),
+            command_line: command_line.to_string(),
+        };
+        build_for(spec)?.run()
+    }
+
     /// Process templates using raw-byte merge path with BGZF compression.
     ///
     /// Thread count is controlled by `self.threads` (1 = single-threaded).
@@ -1380,6 +1439,17 @@ impl Command for Zipper {
             )
         })?;
 
+        // High thread counts: route through the declarative pipeline chain so the
+        // per-template merge fans out across workers (issue #972). Gated at `>= 4`,
+        // not `> 2`: the zipper chain floors its pool to 4 workers (`add_zipper`),
+        // so routing a `--threads 3` request through it would run 4 threads and
+        // break the "--threads N caps at N" contract — 1..=3 stay on process_raw,
+        // which honors the exact count. The PairedBams source opens inputs by
+        // path, so a stdin/FIFO input (either side) also keeps process_raw.
+        if self.threads >= 4 && is_regular_file(&self.unmapped) && is_regular_file(&self.input) {
+            return self.execute_chain(command_line);
+        }
+
         let (unmapped_raw_reader, unmapped_header) = create_raw_bam_reader(&self.unmapped, 1)?;
 
         // Read mapped input — format is detected from content, never from the
@@ -1415,6 +1485,12 @@ impl Command for Zipper {
         check_sort(&mapped_header, &self.input, "mapped");
 
         let output_header = build_output_header(&unmapped_header, &mapped_header, &dict_path)?;
+
+        // Normalize the @HD line (fgbio parity) before @PG, matching the order
+        // `ChainBuilder::new` uses for the chain path — so the serial process_raw
+        // output header is byte-identical to the chain path's regardless of
+        // --threads (issue #972).
+        let output_header = crate::commands::common::ensure_hd_record(output_header)?;
 
         // Add @PG record with PP chaining
         let output_header = crate::commands::common::add_pg_record(output_header, command_line)?;
@@ -1505,7 +1581,7 @@ pub const NEW_PIPELINE_START_LOG: &str = "Starting zipper (new pipeline)";
 /// bisulfite path.
 ///
 /// Both callers that merge many templates against the same `TagInfo` —
-/// `ZipperMergeStep::emit_merged` (typed-step zipper) and
+/// `ZipperMerge` (the Parallel zipper-chain merge step) and
 /// `AlignAndMergeStep::merge_zipper_batch` (AAM dispatcher) — build the
 /// `ZipperTags` once, outside their per-template loop, and hold it on the
 /// step for the step's whole lifetime rather than rebuilding it (three
@@ -1540,10 +1616,13 @@ pub(crate) mod merge_step {
 
     use crate::pipeline::core::Unpushed;
     use crate::pipeline::core::held::HeldSlot;
+    use crate::pipeline::core::item::{HeapSize, Ordered};
     use crate::pipeline::core::outputs::OrderedBytesSingle;
     use crate::pipeline::core::queues::QueueSpec;
     use crate::pipeline::core::reorder::BranchOrdering;
-    use crate::pipeline::core::step::{Step2, StepCtx2, StepKind, StepOutcome, StepProfile};
+    use crate::pipeline::core::step::{
+        Step, Step2, StepCtx, StepCtx2, StepKind, StepOutcome, StepProfile,
+    };
     use crate::pipeline::steps::types::BamTemplateBatch;
     use crate::reference::ReferenceReader;
     use crate::template::Template;
@@ -1621,6 +1700,12 @@ pub(crate) mod merge_step {
     /// `Serial + ByItemOrdinal` Step2 merger that pairs unmapped
     /// (`InputA`) and mapped (`InputB`) templates by queryname order
     /// and emits merged [`BamTemplateBatch`]es.
+    ///
+    /// Superseded in production by the [`ZipperZipStep`] + [`ZipperMerge`] split
+    /// (issue #972), which fans the per-template merge out across workers.
+    /// Retained under `#[cfg(test)]` as the byte-identity oracle the split is
+    /// verified against (`chain_tests::zipper_split_matches_zippermergestep_bytes`).
+    #[cfg(test)]
     pub struct ZipperMergeStep {
         cfg: ZipperMergeConfig,
         /// Precomputed tag-merge bitsets, built once in [`ZipperMergeStep::new`]
@@ -1642,6 +1727,7 @@ pub(crate) mod merge_step {
         name: &'static str,
     }
 
+    #[cfg(test)]
     impl ZipperMergeStep {
         #[must_use]
         pub fn new(mut cfg: ZipperMergeConfig) -> Self {
@@ -1764,6 +1850,7 @@ pub(crate) mod merge_step {
         }
     }
 
+    #[cfg(test)]
     impl Step2 for ZipperMergeStep {
         type InputA = BamTemplateBatch;
         type InputB = BamTemplateBatch;
@@ -1946,6 +2033,444 @@ pub(crate) mod merge_step {
             }
 
             Ok(if did_work { StepOutcome::Progress } else { StepOutcome::NoProgress })
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Split: ZipperZipStep (Serial pairing) + ZipperMerge (Parallel merge)
+    //
+    // `ZipperMergeStep` above does pairing AND the per-template merge in one
+    // Serial step, so merge throughput is single-core. Issue #972 splits it: the
+    // cheap ordered pairing stays Serial (`ZipperZipStep`, emitting `ZippedBatch`
+    // pairs) while the expensive per-template transform fans out across workers
+    // (`ZipperMerge`, Parallel). Both reuse the *same* `merge_one_template_with`
+    // body the single step uses, so output is byte-identical (proven against
+    // `ZipperMergeStep` as an oracle in `chain_tests.rs`).
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// One entry in a [`ZippedBatch`]: either a matched (unmapped, mapped) pair
+    /// awaiting the per-template merge, or an unmapped read that had no mapped
+    /// mate and is emitted as-is — interleaved in queryname order exactly where
+    /// `ZipperMergeStep` would have emitted it.
+    #[derive(Debug)]
+    enum ZipItem {
+        Pair { unmapped: Template, mapped: Template },
+        UnmappedOnly { unmapped: Template },
+    }
+
+    impl ZipItem {
+        fn heap_size(&self) -> usize {
+            match self {
+                ZipItem::Pair { unmapped, mapped } => unmapped.heap_size() + mapped.heap_size(),
+                ZipItem::UnmappedOnly { unmapped } => unmapped.heap_size(),
+            }
+        }
+    }
+
+    /// A batch of pre-paired templates produced by [`ZipperZipStep`] and consumed
+    /// by [`ZipperMerge`]. `serial` is the batch ordinal, carried through the
+    /// parallel merge onto `BamTemplateBatch::batch_serial` so the framework's
+    /// `ByItemOrdinal` reorder restores serial output order across workers.
+    #[derive(Debug)]
+    pub(crate) struct ZippedBatch {
+        serial: u64,
+        items: Vec<ZipItem>,
+    }
+
+    impl HeapSize for ZippedBatch {
+        fn heap_size(&self) -> usize {
+            self.items.iter().map(ZipItem::heap_size).sum()
+        }
+    }
+
+    impl Ordered for ZippedBatch {
+        fn ordinal(&self) -> u64 {
+            self.serial
+        }
+    }
+
+    /// `Serial + ByItemOrdinal` Step2 that pairs unmapped (`InputA`) and mapped
+    /// (`InputB`) templates by queryname order and emits [`ZippedBatch`]es —
+    /// **without** merging. This is the pairing half of `ZipperMergeStep`: the
+    /// identical `pending_a`/`pending_b` lock-step advance, the eager
+    /// missing-mate / leftover-mapped fail-closed error, the
+    /// `exclude_missing_reads` decision, and the ordinal mint + batching. The
+    /// per-template merge is deferred to [`ZipperMerge`].
+    pub(crate) struct ZipperZipStep {
+        cfg: ZipperMergeConfig,
+        pending_a: Option<PendingBatch>,
+        pending_b: Option<PendingBatch>,
+        accumulator: Vec<ZipItem>,
+        next_ordinal: u64,
+        held: HeldSlot<Unpushed<ZippedBatch>>,
+        name: &'static str,
+    }
+
+    impl ZipperZipStep {
+        #[must_use]
+        pub fn new(mut cfg: ZipperMergeConfig) -> Self {
+            // Clamp identically to `ZipperMergeStep::new`: a `target_batch_count`
+            // of 0 makes the `accumulator.len() >= target_batch_count` checks
+            // true on an empty accumulator and livelocks emitting empty batches.
+            cfg.target_batch_count = cfg.target_batch_count.max(1);
+            let target = cfg.target_batch_count;
+            Self {
+                cfg,
+                pending_a: None,
+                pending_b: None,
+                accumulator: Vec::with_capacity(target),
+                next_ordinal: 0,
+                held: HeldSlot::new(),
+                name: "ZipperZip",
+            }
+        }
+
+        /// Push one item into the accumulator and emit a batch if the target
+        /// count is reached. The item count equals the emitted-template count
+        /// (each item becomes exactly one output template downstream), so this
+        /// batches identically to `ZipperMergeStep::push_template`.
+        fn push_item(
+            &mut self,
+            item: ZipItem,
+            ctx: &mut StepCtx2<'_, Self>,
+        ) -> Option<StepOutcome> {
+            self.accumulator.push(item);
+            if self.accumulator.len() >= self.cfg.target_batch_count {
+                Some(self.emit_batch(ctx))
+            } else {
+                None
+            }
+        }
+
+        /// Both inputs drained: flush the final partial accumulator (if any) and
+        /// report `Finished`.
+        fn finish_accumulator(&mut self, ctx: &mut StepCtx2<'_, Self>) -> StepOutcome {
+            if self.accumulator.is_empty() {
+                return StepOutcome::Finished;
+            }
+            self.emit_batch(ctx)
+        }
+
+        /// Package the accumulator into a [`ZippedBatch`] and emit. On rejection,
+        /// hold; retry on the next `try_run`.
+        fn emit_batch(&mut self, ctx: &mut StepCtx2<'_, Self>) -> StepOutcome {
+            let serial = self.next_ordinal;
+            self.next_ordinal += 1;
+            let items = std::mem::replace(
+                &mut self.accumulator,
+                Vec::with_capacity(self.cfg.target_batch_count),
+            );
+            let out = ZippedBatch { serial, items };
+            if let Err(unpushed) = ctx.outputs.push(out) {
+                self.held.put(unpushed);
+            }
+            StepOutcome::Progress
+        }
+
+        /// Record a matched (unmapped, mapped) pair for downstream merge.
+        fn emit_pair(
+            &mut self,
+            unmapped: Template,
+            mapped: Template,
+            ctx: &mut StepCtx2<'_, Self>,
+        ) -> Option<StepOutcome> {
+            self.push_item(ZipItem::Pair { unmapped, mapped }, ctx)
+        }
+
+        /// Handle an unmapped template with no mapped mate: drop it (counting it)
+        /// when `exclude_missing_reads`, else record it for downstream emit.
+        fn emit_unmapped_only(
+            &mut self,
+            unmapped: Template,
+            ctx: &mut StepCtx2<'_, Self>,
+        ) -> Option<StepOutcome> {
+            if self.cfg.exclude_missing_reads {
+                self.cfg.missing_count.fetch_add(1, Ordering::Relaxed);
+                None
+            } else {
+                self.push_item(ZipItem::UnmappedOnly { unmapped }, ctx)
+            }
+        }
+    }
+
+    impl Step2 for ZipperZipStep {
+        type InputA = BamTemplateBatch;
+        type InputB = BamTemplateBatch;
+        type Outputs = OrderedBytesSingle<ZippedBatch>;
+
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: self.name,
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded {
+                    limit_bytes: self.cfg.output_byte_limit,
+                }],
+                branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+            }
+        }
+
+        fn try_run(&mut self, ctx: &mut StepCtx2<'_, Self>) -> io::Result<StepOutcome> {
+            // 1. Drain held output slot first.
+            if let Some(unpushed) = self.held.take() {
+                match ctx.outputs.retry(unpushed) {
+                    Ok(()) => {}
+                    Err(again) => {
+                        self.held.put(again);
+                        return Ok(StepOutcome::Contention);
+                    }
+                }
+            }
+
+            // 2. If the accumulator is already full, emit before pulling more.
+            if self.accumulator.len() >= self.cfg.target_batch_count {
+                return Ok(self.emit_batch(ctx));
+            }
+
+            let mut did_work = false;
+
+            // 3. Process up to `MAX_TEMPLATES_PER_CALL` templates per try_run.
+            for _ in 0..MAX_TEMPLATES_PER_CALL {
+                // Ensure pending_a has a non-exhausted current template.
+                loop {
+                    match self.pending_a.as_ref() {
+                        Some(pa) if !pa.is_exhausted() => break,
+                        Some(_) => self.pending_a = None,
+                        None => {
+                            if let Some(b) = ctx.a.pop() {
+                                self.pending_a = Some(PendingBatch::new(b));
+                            } else {
+                                // Unmapped queue empty. If A is fully drained,
+                                // surface any leftover mapped read now (the
+                                // both-drained completion below only fires once B
+                                // drains, but B may still hold records here).
+                                if ctx.a.is_drained() {
+                                    let leftover_b = self
+                                        .pending_b
+                                        .as_ref()
+                                        .and_then(|pb| pb.current())
+                                        .map(|t| t.name().to_vec())
+                                        .or_else(|| {
+                                            ctx.b.pop().and_then(|batch| {
+                                                batch.templates().first().map(|t| t.name().to_vec())
+                                            })
+                                        });
+                                    if let Some(name) = leftover_b {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            format!(
+                                                "Error: processed all unmapped reads but there are mapped reads remaining. \
+                                                 Found template '{}'. Please ensure the unmapped and mapped reads have the \
+                                                 same set of read names in the same order, and reads with the same name \
+                                                 are consecutive (grouped) in each input.",
+                                                String::from_utf8_lossy(&name)
+                                            ),
+                                        ));
+                                    }
+                                    if ctx.b.is_drained() {
+                                        return Ok(self.finish_accumulator(ctx));
+                                    }
+                                }
+                                return Ok(if did_work {
+                                    StepOutcome::Progress
+                                } else {
+                                    StepOutcome::NoProgress
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Ensure pending_b has a non-exhausted current template (or None
+                // if its queue is currently empty).
+                loop {
+                    match self.pending_b.as_ref() {
+                        Some(pb) if !pb.is_exhausted() => break,
+                        Some(_) => self.pending_b = None,
+                        None => match ctx.b.pop() {
+                            Some(b) => self.pending_b = Some(PendingBatch::new(b)),
+                            None => break,
+                        },
+                    }
+                }
+
+                // Peek both currents.
+                let pa_name: Vec<u8> = self
+                    .pending_a
+                    .as_ref()
+                    .and_then(|pa| pa.current())
+                    .expect("pending_a guaranteed non-exhausted above")
+                    .name()
+                    .to_vec();
+                let pb_name: Option<Vec<u8>> =
+                    self.pending_b.as_ref().and_then(|pb| pb.current()).map(|t| t.name().to_vec());
+
+                let mapped_drained = self.pending_b.is_none() && ctx.b.is_drained();
+
+                let outcome = match pb_name {
+                    Some(ref n) if n == &pa_name => {
+                        // Match → pair.
+                        let unmapped = self.pending_a.as_mut().unwrap().take_current().unwrap();
+                        let mapped = self.pending_b.as_mut().unwrap().take_current().unwrap();
+                        self.emit_pair(unmapped, mapped, ctx)
+                    }
+                    Some(_) => {
+                        // Mismatch: mapped BAM is a subsequence, so this unmapped
+                        // read is missing from it — emit unmapped-only, advance
+                        // only A (name-equality only, no sort-order compare).
+                        let unmapped = self.pending_a.as_mut().unwrap().take_current().unwrap();
+                        self.emit_unmapped_only(unmapped, ctx)
+                    }
+                    None if mapped_drained => {
+                        // No more mapped will ever arrive.
+                        let unmapped = self.pending_a.as_mut().unwrap().take_current().unwrap();
+                        self.emit_unmapped_only(unmapped, ctx)
+                    }
+                    None => {
+                        // No mapped right now, but ctx.b not drained — wait.
+                        return Ok(if did_work {
+                            StepOutcome::Progress
+                        } else {
+                            StepOutcome::NoProgress
+                        });
+                    }
+                };
+
+                did_work = true;
+
+                if let Some(stepwise) = outcome {
+                    debug_assert_eq!(stepwise, StepOutcome::Progress);
+                    return Ok(StepOutcome::Progress);
+                }
+            }
+
+            Ok(if did_work { StepOutcome::Progress } else { StepOutcome::NoProgress })
+        }
+    }
+
+    /// `Parallel + ByItemOrdinal` step that runs the per-template merge over the
+    /// [`ZippedBatch`]es emitted by [`ZipperZipStep`], fanning the work across the
+    /// work-stealing pool. `Pair` items go through the shared
+    /// [`super::merge_one_template_with`] body (identical to `ZipperMergeStep`);
+    /// `UnmappedOnly` items are encoded as-is. The input `serial` is carried onto
+    /// the emitted `BamTemplateBatch` so `ByItemOrdinal` restores serial order.
+    pub(crate) struct ZipperMerge {
+        cfg: ZipperMergeConfig,
+        /// Precomputed tag-merge bitsets, shared across worker copies and reused
+        /// for every template (built once from `cfg.tag_info`, immutable).
+        tags: Arc<super::ZipperTags>,
+        /// Reusable aux-rebuild scratch buffer, per worker copy.
+        aux_scratch: Vec<u8>,
+        held: HeldSlot<Unpushed<BamTemplateBatch>>,
+    }
+
+    impl ZipperMerge {
+        #[must_use]
+        pub fn new(cfg: ZipperMergeConfig) -> Self {
+            let tags = Arc::new(super::ZipperTags::from_tag_info(&cfg.tag_info));
+            Self { cfg, tags, aux_scratch: Vec::new(), held: HeldSlot::new() }
+        }
+    }
+
+    impl Clone for ZipperMerge {
+        fn clone(&self) -> Self {
+            // A per-worker copy shares the immutable tags/config but starts with
+            // an empty held slot and its own scratch buffer.
+            Self {
+                cfg: self.cfg.clone(),
+                tags: Arc::clone(&self.tags),
+                aux_scratch: Vec::new(),
+                held: HeldSlot::new(),
+            }
+        }
+    }
+
+    impl Step for ZipperMerge {
+        type Input = ZippedBatch;
+        type Outputs = OrderedBytesSingle<BamTemplateBatch>;
+
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "ZipperMerge",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded {
+                    limit_bytes: self.cfg.output_byte_limit,
+                }],
+                branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+            }
+        }
+
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            // 1. Flush any held output first. A Parallel step returns `Contention`
+            //    (not `NoProgress`) when it still holds an item it couldn't push,
+            //    so a drained input can't cause the framework to drop it.
+            if let Some(unpushed) = self.held.take() {
+                match ctx.outputs.retry(unpushed) {
+                    Ok(()) => {}
+                    Err(again) => {
+                        self.held.put(again);
+                        return Ok(StepOutcome::Contention);
+                    }
+                }
+            }
+
+            // 2. Pop one pre-paired batch.
+            let Some(ZippedBatch { serial, items }) = ctx.input.pop() else {
+                if ctx.input.is_drained() {
+                    return Ok(StepOutcome::Finished);
+                }
+                return Ok(StepOutcome::NoProgress);
+            };
+
+            // 3. Resolve each item into an output template, in order.
+            let mut templates: Vec<Template> = Vec::with_capacity(items.len());
+            let mut total_records: u64 = 0;
+            for item in items {
+                let template = match item {
+                    ZipItem::Pair { unmapped, mut mapped } => {
+                        super::merge_one_template_with(
+                            &unmapped,
+                            &mut mapped,
+                            &self.tags,
+                            self.cfg.skip_tc_tags,
+                            self.cfg.reference.as_deref(),
+                            &self.cfg.output_header,
+                            &mut self.aux_scratch,
+                        )
+                        .map_err(|e| io::Error::other(format!("ZipperMerge: {e}")))?;
+                        mapped
+                    }
+                    ZipItem::UnmappedOnly { unmapped } => {
+                        let records = super::encode_unmapped_template_records(
+                            &unmapped,
+                            &self.cfg.output_header,
+                        )
+                        .map_err(|e| {
+                            io::Error::other(format!("encode_unmapped_template_records: {e}"))
+                        })?;
+                        Template::from_records(records).map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("Template::from_records for unmapped-only: {e}"),
+                            )
+                        })?
+                    }
+                };
+                total_records += template.read_count() as u64;
+                templates.push(template);
+            }
+            self.cfg.records_emitted.fetch_add(total_records, Ordering::Relaxed);
+
+            match ctx.outputs.push(BamTemplateBatch::new(serial, templates)) {
+                Ok(()) => {}
+                Err(unpushed) => self.held.put(unpushed),
+            }
+            Ok(StepOutcome::Progress)
+        }
+
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
         }
     }
 
@@ -2359,6 +2884,11 @@ mod tests {
         let mut reader = noodles::bam::io::reader::Builder.build_from_path(path)?;
         let header = reader.read_header()?;
         Ok(reader.record_bufs(&header).collect::<std::io::Result<Vec<_>>>()?)
+    }
+
+    fn read_bam_header(path: &std::path::Path) -> Result<noodles::sam::Header> {
+        let mut reader = noodles::bam::io::reader::Builder.build_from_path(path)?;
+        Ok(reader.read_header()?)
     }
 
     /// The output-aware compression default: streams get 0 (uncompressed, since
@@ -3300,10 +3830,11 @@ mod tests {
         unmapped.write(&unmapped_path)?;
         mapped.write_sam(&mapped_path)?;
 
-        // threads 0 and 1 exercise the inline fast path; 2 exercises the
-        // channel-backed path with real producer threads.
+        // threads 0 and 1 exercise the inline fast path; 2 the channel-backed
+        // process_raw path; 4 and 8 route through the declarative chain
+        // (`--threads > 2`), which must match the process_raw output byte-for-byte.
         let mut per_thread_records = Vec::new();
-        for threads in [0usize, 1, 2] {
+        for threads in [0usize, 1, 2, 4, 8] {
             let output_path = dir.path().join(format!("output.t{threads}.bam"));
             let zipper = Zipper {
                 input: mapped_path.clone(),
@@ -3334,6 +3865,91 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    /// `--threads >= 4` routes standalone zipper through the declarative pipeline
+    /// chain (`ZipperZipStep → ZipperMerge → serialize → compress → write`) so the
+    /// per-template merge fans out across workers, instead of the serial
+    /// `process_raw` merge (issue #972). The chain path must produce the same
+    /// output header and record stream as `process_raw`. The fixture includes
+    /// reads missing from the mapped side, run under both `exclude_missing`
+    /// settings, so the unmapped-only / exclude branch is exercised end-to-end
+    /// through both code paths; both `@HD`-bearing headers must also agree.
+    #[rstest]
+    fn chain_path_matches_process_raw(#[values(false, true)] exclude_missing: bool) -> Result<()> {
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
+        for i in 0..12 {
+            let name = format!("q{i:02}");
+            let mut attrs = HashMap::new();
+            attrs.insert("RX", BufValue::from(format!("ACG{i}")));
+            attrs.insert("xy", BufValue::from(1000 + i as i32));
+            unmapped.add_pair_with_attrs(&name, None, None, true, true, &attrs);
+
+            // Every 4th read is absent from the mapped BAM, so the missing-mate /
+            // exclude path runs through both process_raw and the chain.
+            if i % 4 != 0 {
+                let mut mapped_attrs = HashMap::new();
+                mapped_attrs.insert("PG", BufValue::from(MAPPED_PG_ID.to_string()));
+                mapped_attrs.insert("AS", BufValue::from(77i32));
+                mapped.add_pair_with_attrs(
+                    &name,
+                    Some(100 + i * 100),
+                    Some(200 + i * 100),
+                    true,
+                    true,
+                    &mapped_attrs,
+                );
+            }
+        }
+
+        let dir = TempDir::new()?;
+        let unmapped_path = dir.path().join("unmapped.bam");
+        let mapped_path = dir.path().join("mapped.sam");
+        let dict_path = create_ref_dict(&dir, "chr1", REFERENCE_LENGTH)?;
+        unmapped.write(&unmapped_path)?;
+        mapped.write_sam(&mapped_path)?;
+
+        let make = |threads: usize, output: &Path| Zipper {
+            input: mapped_path.clone(),
+            unmapped: unmapped_path.clone(),
+            reference: dict_path.clone(),
+            output: output.to_path_buf(),
+            tags_to_remove: vec![],
+            tags_to_reverse: vec![],
+            tags_to_revcomp: vec![],
+            buffer: 5000,
+            threads,
+            compression_level: Some(1),
+            bwa_chunk_size: 150_000_000,
+            exclude_missing_reads: exclude_missing,
+            skip_tc_tags: false,
+            restore_unconverted_bases: false,
+        };
+
+        // Baseline: the serial process_raw path (threads=1).
+        let base_out = dir.path().join("base.bam");
+        make(1, &base_out).execute("test")?;
+        let baseline = read_bam_records(&base_out)?;
+        let base_header = read_bam_header(&base_out)?;
+
+        // The chain path: threads=4 routes through `execute` -> the gate -> the chain.
+        let chain_out = dir.path().join("chain.bam");
+        make(4, &chain_out).execute("test")?;
+        let chain = read_bam_records(&chain_out)?;
+        let chain_header = read_bam_header(&chain_out)?;
+
+        assert!(!baseline.is_empty(), "fixture produced no records");
+        assert_eq!(chain, baseline, "chain-path records diverged from process_raw");
+        // Both paths normalize the @HD line, so the header agrees regardless of
+        // --threads — the header parity the byte-identity claim rests on.
+        assert!(base_header.header().is_some(), "process_raw output is missing its @HD record");
+        assert_eq!(
+            base_header.header(),
+            chain_header.header(),
+            "chain-path @HD header diverged from process_raw",
+        );
         Ok(())
     }
 

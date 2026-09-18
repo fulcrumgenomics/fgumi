@@ -524,7 +524,7 @@ pub struct ChainBuilder<'a> {
     /// [`PendingSource::Paired`]: `current_tail` holds the unmapped
     /// source chain tail and `paired_tail` holds the mapped source
     /// chain tail. `add_zipper` consumes both to build
-    /// `ZipperMergeStep` via `PipelineBuilder::append_step2`.
+    /// `ZipperZipStep` via `PipelineBuilder::append_step2`.
     /// `None` for all single-source stages.
     paired_tail: Option<(
         crate::pipeline::core::topology::StepIdx,
@@ -1016,10 +1016,10 @@ impl<'a> ChainBuilder<'a> {
     /// - `PendingSource::Paired`: Builds both source preambles for zipper's
     ///   dual-input path. `current_tail` = unmapped chain tail;
     ///   `paired_tail` = mapped chain tail. No standard single-output tail is
-    ///   set — `add_zipper` consumes both tails to assemble `ZipperMergeStep`.
+    ///   set — `add_zipper` consumes both tails to assemble `ZipperZipStep`.
     ///   Note that both preamble chains end at `GroupByQueryname` so their
     ///   output type is `OrderedBytesSingle<BamTemplateBatch>`, matching
-    ///   `ZipperMergeStep: Step2<InputA = BamTemplateBatch, InputB = BamTemplateBatch>`.
+    ///   `ZipperZipStep: Step2<InputA = BamTemplateBatch, InputB = BamTemplateBatch>`.
     ///   The reference path is stashed in `PendingSource::Paired` but is
     ///   consumed later by `add_zipper` (reference loading is deferred because
     ///   `restore_unconverted_bases` controls whether the FASTA is opened at all).
@@ -1148,7 +1148,7 @@ impl<'a> ChainBuilder<'a> {
             PendingSource::Paired { mapped: boxed_mapped, unmapped: boxed_unmapped, reference } => {
                 // Zipper's two-input preamble. Both chains end at GroupByQueryname
                 // so their output type is OrderedBytesSingle<BamTemplateBatch>,
-                // matching ZipperMergeStep's InputA / InputB.
+                // matching ZipperZipStep's InputA / InputB.
                 //
                 // The reference path is carried in PendingSource::Paired but
                 // add_zipper reads it directly from self.spec.source, which is
@@ -2878,18 +2878,21 @@ impl<'a> ChainBuilder<'a> {
     /// unmapped source chain tail and `paired_tail` to the mapped
     /// source chain tail. Both chains end at `GroupByQueryname`, so
     /// their output type is `OrderedBytesSingle<BamTemplateBatch>`,
-    /// matching `ZipperMergeStep: Step2<InputA = BamTemplateBatch,
+    /// matching `ZipperZipStep: Step2<InputA = BamTemplateBatch,
     /// InputB = BamTemplateBatch>`.
     ///
-    /// Appends `ZipperMergeStep` (via `PipelineBuilder::append_step2`
-    /// which wires the two tails into input slots 0 and 1), then — for
-    /// `Terminal` — appends `SerializeBamRecords` so the chain tail is
-    /// `DecompressedBlock` ready for `BgzfCompress → WriteBgzfFile`.
+    /// Appends `ZipperZipStep` (via `PipelineBuilder::append_step2`, which wires
+    /// the two tails into input slots 0 and 1) followed by the Parallel
+    /// `ZipperMerge`, then — for `Terminal` — appends `SerializeBamRecords` so
+    /// the chain tail is `DecompressedBlock` ready for `BgzfCompress →
+    /// WriteBgzfFile`.
     ///
-    /// Applies the thread floor: zipper requires at least 4 worker
-    /// threads (`≥ 3 Exclusive steps + 1`); `override_pipeline_threads`
-    /// is set to `spec.threading.num_threads().max(4)` so that
-    /// `build()` forwards the correct value to `PipelineConfig::threads`.
+    /// Applies the thread floor: the zipper chain runs on at least 4 workers.
+    /// This is a performance floor, not a hard requirement — the chain runs at
+    /// 1-3 workers too, but the merge fan-out only pays with enough of them.
+    /// `override_pipeline_threads` is set to
+    /// `spec.threading.num_threads().max(4)` so `build()` forwards it to
+    /// `PipelineConfig::threads`.
     ///
     /// Registers a [`ZipperFinalizeHook`] for the missing-reads summary,
     /// "zipper completed successfully" log, and `timer.log_completion`.
@@ -2908,9 +2911,10 @@ impl<'a> ChainBuilder<'a> {
     fn add_zipper(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::warn_unwired_pipeline_flags;
         use crate::commands::zipper::NEW_PIPELINE_START_LOG;
+        use crate::commands::zipper::merge_step::{ZipperMerge, ZipperZipStep};
         use crate::logging::OperationTimer;
         use crate::pipeline::chains::commands::zipper::{
-            ZipperFinalizeHook, ZipperMergeCaptures, build_zipper_merge_step,
+            ZipperFinalizeHook, ZipperMergeCaptures, build_zipper_merge_config,
         };
         use crate::pipeline::steps::serialize::SerializeBamRecords;
         use log::info;
@@ -2938,8 +2942,11 @@ impl<'a> ChainBuilder<'a> {
             other => bail!("Stage::Zipper requires SourceSpec::PairedBams, got {other:?}"),
         };
 
-        // Apply the thread floor: zipper needs ≥ 4 workers (2 Exclusive source
-        // readers + 1 Exclusive write step + at least 1 Serial worker).
+        // Give the zipper chain at least 4 workers. This is a performance floor,
+        // not a hard requirement — the chain runs at 1-3 workers too, but the
+        // per-template merge fan-out only pays with enough of them (measured on a
+        // 32-core box: a floored 4-worker pool beats a genuine 1/2/3-worker chain,
+        // and a 1-worker chain loses to the serial process_raw path outright).
         let raw_threads = self.spec.threading.num_threads();
         let num_threads = raw_threads.max(4);
 
@@ -2961,7 +2968,7 @@ impl<'a> ChainBuilder<'a> {
         let missing_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let records_emitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        let merge_step = build_zipper_merge_step(ZipperMergeCaptures {
+        let merge_cfg = build_zipper_merge_config(ZipperMergeCaptures {
             zipper_opts: zipper_opts.clone(),
             output_header: Arc::new(self.header.clone()),
             reference_path,
@@ -2970,11 +2977,20 @@ impl<'a> ChainBuilder<'a> {
             records_emitted: Arc::clone(&records_emitted),
         })?;
 
-        // Wire both source chains into ZipperMergeStep via the 2-input append.
-        let merge_tail = self.pipeline.append_step2(merge_step, unmapped_tail, mapped_tail);
+        // Split zipper-merge: a Serial ZipperZipStep pairs the unmapped/mapped
+        // streams into ZippedBatches, then a Parallel ZipperMerge runs the
+        // per-template merge across workers (issue #972). Byte-identical to the
+        // former single ZipperMergeStep (proven in chain_tests), but the merge
+        // fans out instead of being pinned to one core.
+        let zip_tail = self.pipeline.append_step2(
+            ZipperZipStep::new(merge_cfg.clone()),
+            unmapped_tail,
+            mapped_tail,
+        );
+        let merge_tail = self.pipeline.append_step(ZipperMerge::new(merge_cfg), zip_tail);
 
         // Gate SerializeBamRecords on Terminal position. For Intermediate
-        // (e.g., zipper → sort → ...), the chain tail stays at ZipperMergeStep's
+        // (e.g., zipper → sort → ...), the chain tail stays at ZipperMerge's
         // BamTemplateBatch output, ready for the next stage to consume.
         if position == StagePosition::Terminal {
             let tail = self.pipeline.append_step(
@@ -2987,7 +3003,7 @@ impl<'a> ChainBuilder<'a> {
             self.chain_tail_kind = ChainTailKind::SerializedBytes;
         } else {
             self.current_tail = Some(merge_tail);
-            // Intermediate: ZipperMergeStep emits BamTemplateBatch so the
+            // Intermediate: ZipperMerge emits BamTemplateBatch so the
             // next stage (typically add_sort) prepends TemplatesToRecordBatch.
             self.chain_tail_kind = ChainTailKind::BamTemplateBatch;
         }

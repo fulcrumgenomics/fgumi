@@ -7,7 +7,7 @@
 //!
 //! In Phase 3a T3a.12 the bulk of the chain-construction logic moved into
 //! `ChainBuilder::add_zipper` and the step-construction details were
-//! extracted into `build_zipper_merge_step`.
+//! extracted into `build_zipper_merge_config`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,10 +52,10 @@ impl FinalizeHook for ZipperFinalizeHook {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// build_zipper_merge_step factory
+// build_zipper_merge_config factory
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Captures for [`build_zipper_merge_step`] construction.
+/// Captures for [`build_zipper_merge_config`] construction.
 pub(crate) struct ZipperMergeCaptures {
     pub(crate) zipper_opts: ZipperOptions,
     pub(crate) output_header: Arc<noodles::sam::Header>,
@@ -65,17 +65,17 @@ pub(crate) struct ZipperMergeCaptures {
     pub(crate) records_emitted: Arc<AtomicU64>,
 }
 
-/// Build a [`ZipperMergeStep`] from the supplied captures.
+/// Build the [`ZipperMergeConfig`] from the supplied captures.
 ///
 /// Logs tag-manipulation summary lines, loads the reference FASTA if
-/// `--restore-unconverted-bases` is set, constructs the
-/// [`ZipperMergeConfig`], and returns the configured step.
+/// `--restore-unconverted-bases` is set, and constructs the
+/// [`ZipperMergeConfig`] shared by the `ZipperZipStep` (pairing) and
+/// `ZipperMerge` (per-template merge) steps that `add_zipper` wires up.
 ///
-/// [`ZipperMergeStep`]: merge_step::ZipperMergeStep
 /// [`ZipperMergeConfig`]: merge_step::ZipperMergeConfig
-pub(crate) fn build_zipper_merge_step(
+pub(crate) fn build_zipper_merge_config(
     caps: ZipperMergeCaptures,
-) -> Result<merge_step::ZipperMergeStep> {
+) -> Result<merge_step::ZipperMergeConfig> {
     use crate::umi::TagInfo;
 
     let ZipperMergeCaptures {
@@ -120,5 +120,5 @@ pub(crate) fn build_zipper_merge_step(
         target_batch_count: tuning.template_batch_size,
         output_byte_limit: tuning.per_step_byte_limit,
     };
-    Ok(merge_step::ZipperMergeStep::new(cfg))
+    Ok(cfg)
 }

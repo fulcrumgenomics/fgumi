@@ -956,6 +956,437 @@ fn templates_to_records_flattens_every_record_including_split_alignments(
     }
 }
 
+/// The zipper-merge split (`ZipperZipStep` → `ZipperMerge`) must be byte-identical
+/// to the original single `ZipperMergeStep` it replaces.
+///
+/// `ZipperMergeStep` (Serial Step2) does pairing **and** merge in one step. Issue
+/// #972 splits it into a Serial `ZipperZipStep` (pairing → `ZippedBatch`) and a
+/// Parallel `ZipperMerge` (the per-template merge, reusing the same
+/// `merge_one_template_with` body), so the merge can fan out at high threads.
+/// This drives identical paired inputs — including reads missing from the mapped
+/// side, which emit unmapped-only, interleaved in queryname order — through both
+/// the original step and the split, and asserts the flattened output record
+/// stream is byte-for-byte identical. `ZipperMergeStep` is the oracle: the split
+/// is correct iff it reproduces the shipped step exactly.
+///
+/// Thread counts are both ≥4: a two-source chain has three `Exclusive` steps
+/// (the two `ReplaySource` roots + the `CollectSink`) that cannot share one
+/// worker, so the runtime requires ≥3 threads; 4 and 8 both clear that floor and
+/// exercise the parallel `ZipperMerge` fan-out across workers.
+#[rstest]
+fn zipper_split_matches_zippermergestep_bytes(
+    #[values(4, 8)] threads: usize,
+    #[values(false, true)] exclude_missing: bool,
+) {
+    use std::sync::atomic::AtomicU64;
+
+    use noodles::sam::Header;
+
+    use crate::commands::zipper::merge_step::{
+        ZipperMerge, ZipperMergeConfig, ZipperMergeStep, ZipperZipStep,
+    };
+
+    const N_TEMPLATES: usize = 60;
+    const BATCH: usize = 4;
+
+    // A fresh config each call: the counters are `Arc`s, so the oracle and the
+    // split must not share them. Parameterized on `exclude_missing`: false emits
+    // the missing mates as unmapped-only (the interleaving the split must
+    // preserve); true drops them and bumps `missing_count` — the ZipperZipStep
+    // exclude branch this case exercises.
+    let make_cfg = || ZipperMergeConfig {
+        tag_info: Arc::new(crate::umi::TagInfo::new(vec![], vec![], vec![])),
+        skip_tc_tags: true,
+        exclude_missing_reads: exclude_missing,
+        reference: None,
+        output_header: Arc::new(Header::default()),
+        missing_count: Arc::new(AtomicU64::new(0)),
+        records_emitted: Arc::new(AtomicU64::new(0)),
+        target_batch_count: BATCH,
+        output_byte_limit: 16 * 1024,
+    };
+
+    // Build the two input streams fresh (Template is not Clone, and each run
+    // consumes its inputs). Unmapped carries every read (with an RX tag the
+    // mapped half lacks); mapped is a subsequence missing every 5th read, so
+    // those emit unmapped-only. Same queryname order in both, as the pairing
+    // contract requires.
+    let batchify = |templates: Vec<Template>| -> Vec<BamTemplateBatch> {
+        let mut out = Vec::new();
+        let mut cur = Vec::new();
+        let mut serial = 0u64;
+        for t in templates {
+            cur.push(t);
+            if cur.len() == BATCH {
+                out.push(BamTemplateBatch::new(serial, std::mem::take(&mut cur)));
+                serial += 1;
+            }
+        }
+        if !cur.is_empty() {
+            out.push(BamTemplateBatch::new(serial, cur));
+        }
+        out
+    };
+    let build_inputs = || -> (Vec<BamTemplateBatch>, Vec<BamTemplateBatch>) {
+        let mut unmapped: Vec<Template> = Vec::new();
+        let mut mapped: Vec<Template> = Vec::new();
+        for i in 0..N_TEMPLATES {
+            let name = format!("q{i:04}");
+            let mut ub = SamBuilder::new();
+            ub.read_name(name.as_bytes())
+                .flags(fgumi_raw_bam::flags::UNMAPPED)
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4])
+                .add_string_tag(*crate::sam::SamTag::RX, b"ACGT");
+            unmapped.push(Template::from_records(vec![ub.build()]).expect("unmapped template"));
+
+            if i % 5 != 0 {
+                let mut mb = SamBuilder::new();
+                mb.read_name(name.as_bytes())
+                    .flags(fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT)
+                    .ref_id(0)
+                    .pos(i32::try_from(i).expect("pos fits i32"))
+                    .cigar_ops(&[4u32 << 4])
+                    .sequence(b"ACGT")
+                    .qualities(&[30u8; 4]);
+                mapped.push(Template::from_records(vec![mb.build()]).expect("mapped template"));
+            }
+        }
+        (batchify(unmapped), batchify(mapped))
+    };
+
+    // Flatten a collected sink's batches into an in-order record byte stream.
+    let flatten = |batches: &[BamTemplateBatch]| -> Vec<Vec<u8>> {
+        batches
+            .iter()
+            .flat_map(|b| b.templates().iter())
+            .flat_map(|t| t.records.iter().map(|r| r.as_ref().to_vec()))
+            .collect()
+    };
+
+    // Oracle: the shipped single ZipperMergeStep.
+    let oracle: Arc<Mutex<Vec<BamTemplateBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let oracle_missing: Arc<AtomicU64>;
+    let oracle_emitted: Arc<AtomicU64>;
+    {
+        let (unmapped, mapped) = build_inputs();
+        let oracle_cfg = make_cfg();
+        oracle_missing = Arc::clone(&oracle_cfg.missing_count);
+        oracle_emitted = Arc::clone(&oracle_cfg.records_emitted);
+        let builder = Pipeline::builder();
+        let a = builder.append_source(ReplaySource::new(unmapped));
+        let b = builder.append_source(ReplaySource::new(mapped));
+        let merge = builder.append_step2(ZipperMergeStep::new(oracle_cfg), a, b);
+        builder.append_step(CollectSink { collected: Arc::clone(&oracle) }, merge);
+        let pipeline = builder.build().expect("oracle chain builds");
+        pipeline.run(PipelineConfig { threads, ..Default::default() }).expect("oracle runs");
+    }
+
+    // Split: ZipperZipStep (pairing) → ZipperMerge (merge).
+    let split: Arc<Mutex<Vec<BamTemplateBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let split_missing: Arc<AtomicU64>;
+    let split_emitted: Arc<AtomicU64>;
+    {
+        let (unmapped, mapped) = build_inputs();
+        let cfg = make_cfg();
+        split_missing = Arc::clone(&cfg.missing_count);
+        split_emitted = Arc::clone(&cfg.records_emitted);
+        let builder = Pipeline::builder();
+        let a = builder.append_source(ReplaySource::new(unmapped));
+        let b = builder.append_source(ReplaySource::new(mapped));
+        let zip = builder.append_step2(ZipperZipStep::new(cfg.clone()), a, b);
+        let merge = builder.append_step(ZipperMerge::new(cfg), zip);
+        builder.append_step(CollectSink { collected: Arc::clone(&split) }, merge);
+        let pipeline = builder.build().expect("split chain builds");
+        pipeline.run(PipelineConfig { threads, ..Default::default() }).expect("split runs");
+    }
+
+    let oracle_records = flatten(&oracle.lock().expect("oracle mutex"));
+    let split_records = flatten(&split.lock().expect("split mutex"));
+
+    assert!(!oracle_records.is_empty(), "fixture produced no records — vacuous test");
+    assert_eq!(
+        split_records.len(),
+        oracle_records.len(),
+        "split emitted {} records, oracle emitted {}",
+        split_records.len(),
+        oracle_records.len(),
+    );
+    if let Some((i, (got, want))) =
+        split_records.iter().zip(&oracle_records).enumerate().find(|(_, (g, w))| g != w)
+    {
+        panic!(
+            "record {i} differs between split and ZipperMergeStep: \
+             split {got:02x?}, oracle {want:02x?}",
+        );
+    }
+
+    // Missing-mate accounting must match the oracle: with exclude_missing the
+    // every-5th unmapped-only reads are dropped and counted (12 of 60); without
+    // it, none are excluded.
+    let expected_missing = if exclude_missing { (N_TEMPLATES / 5) as u64 } else { 0 };
+    assert_eq!(
+        oracle_missing.load(AtomicOrdering::Relaxed),
+        expected_missing,
+        "oracle missing_count",
+    );
+    assert_eq!(
+        split_missing.load(AtomicOrdering::Relaxed),
+        expected_missing,
+        "split missing_count must match the oracle",
+    );
+
+    // records_emitted is a user-visible throughput count: it must match the
+    // oracle and equal the number of records actually emitted.
+    let oracle_emitted = oracle_emitted.load(AtomicOrdering::Relaxed);
+    assert_eq!(
+        split_emitted.load(AtomicOrdering::Relaxed),
+        oracle_emitted,
+        "split records_emitted must match the oracle",
+    );
+    assert_eq!(
+        oracle_emitted,
+        oracle_records.len() as u64,
+        "records_emitted must equal the emitted record count",
+    );
+}
+
+// ============================================================================
+// Zipper split (ZipperZipStep → ZipperMerge) edge-path coverage
+//
+// `zipper_split_matches_zippermergestep_bytes` above drives only the
+// well-ordered happy path. These exercise the paths it structurally cannot
+// reach: the leftover-mapped error, the held-slot retry under backpressure, and
+// the no-copyable-tags merge branch.
+// ============================================================================
+
+/// Fresh split-step config with independent `Arc` counters per run.
+fn zipper_split_cfg(
+    exclude_missing_reads: bool,
+    target_batch_count: usize,
+    output_byte_limit: u64,
+) -> crate::commands::zipper::merge_step::ZipperMergeConfig {
+    use noodles::sam::Header;
+
+    crate::commands::zipper::merge_step::ZipperMergeConfig {
+        tag_info: Arc::new(crate::umi::TagInfo::new(vec![], vec![], vec![])),
+        skip_tc_tags: true,
+        exclude_missing_reads,
+        reference: None,
+        output_header: Arc::new(Header::default()),
+        missing_count: Arc::new(AtomicU64::new(0)),
+        records_emitted: Arc::new(AtomicU64::new(0)),
+        target_batch_count,
+        output_byte_limit,
+    }
+}
+
+/// One-record unmapped template. `with_rx` attaches an `RX` tag (tag-copy merge
+/// path); omitting it leaves the template tag-less (no-copyable-tags branch).
+fn zipper_unmapped_template(name: &str, with_rx: bool) -> Template {
+    let mut b = SamBuilder::new();
+    b.read_name(name.as_bytes())
+        .flags(fgumi_raw_bam::flags::UNMAPPED)
+        .sequence(b"ACGT")
+        .qualities(&[30u8; 4]);
+    if with_rx {
+        b.add_string_tag(*crate::sam::SamTag::RX, b"ACGT");
+    }
+    Template::from_records(vec![b.build()]).expect("unmapped template")
+}
+
+/// One-record mapped template aligned at `pos`.
+fn zipper_mapped_template(name: &str, pos: usize) -> Template {
+    let mut b = SamBuilder::new();
+    b.read_name(name.as_bytes())
+        .flags(fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT)
+        .ref_id(0)
+        .pos(i32::try_from(pos).expect("pos fits i32"))
+        .cigar_ops(&[4u32 << 4])
+        .sequence(b"ACGT")
+        .qualities(&[30u8; 4]);
+    Template::from_records(vec![b.build()]).expect("mapped template")
+}
+
+/// Pack templates into `BamTemplateBatch`es of `batch` each, minting serials.
+fn zipper_batchify(templates: Vec<Template>, batch: usize) -> Vec<BamTemplateBatch> {
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    let mut serial = 0u64;
+    for t in templates {
+        cur.push(t);
+        if cur.len() == batch {
+            out.push(BamTemplateBatch::new(serial, std::mem::take(&mut cur)));
+            serial += 1;
+        }
+    }
+    if !cur.is_empty() {
+        out.push(BamTemplateBatch::new(serial, cur));
+    }
+    out
+}
+
+/// The pairing contract requires the mapped BAM to be a subsequence of the
+/// unmapped stream. When the unmapped input drains while mapped reads remain,
+/// `ZipperZipStep` must fail with a clear, name-bearing error rather than drop
+/// the leftovers — the `ctx.a.is_drained()` leftover-detection path the
+/// well-ordered byte-parity fixture never reaches.
+#[rstest]
+fn zipper_split_errors_on_leftover_mapped_reads(#[values(4, 8)] threads: usize) {
+    use crate::commands::zipper::merge_step::{ZipperMerge, ZipperZipStep};
+
+    let cfg = zipper_split_cfg(false, 4, 16 * 1024);
+
+    // Unmapped drains after q0,q1; mapped still holds q2 with no unmapped mate.
+    let unmapped = zipper_batchify(
+        vec![zipper_unmapped_template("q0", true), zipper_unmapped_template("q1", true)],
+        4,
+    );
+    let mapped = zipper_batchify(
+        vec![
+            zipper_mapped_template("q0", 0),
+            zipper_mapped_template("q1", 1),
+            zipper_mapped_template("q2", 2),
+        ],
+        4,
+    );
+
+    let sink: Arc<Mutex<Vec<BamTemplateBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let builder = Pipeline::builder();
+    let a = builder.append_source(ReplaySource::new(unmapped));
+    let b = builder.append_source(ReplaySource::new(mapped));
+    let zip = builder.append_step2(ZipperZipStep::new(cfg.clone()), a, b);
+    let merge = builder.append_step(ZipperMerge::new(cfg), zip);
+    builder.append_step(CollectSink { collected: Arc::clone(&sink) }, merge);
+    let pipeline = builder.build().expect("chain builds");
+
+    let err = pipeline
+        .run(PipelineConfig { threads, ..Default::default() })
+        .expect_err("leftover mapped read must fail the pipeline");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("mapped reads remaining") && msg.contains("q2"),
+        "expected leftover-mapped error naming q2, got: {msg}",
+    );
+}
+
+/// Backpressure guard: with the byte-bounded output queues sized below one
+/// emitted batch and the terminal sink stalling, both split steps must park
+/// rejected pushes in their held slots and retry — `ZipperZipStep::emit_batch` /
+/// `try_run` and `ZipperMerge::try_run` — without losing or reordering a record.
+/// A sink that drained every tick would empty the queue between pushes and never
+/// take these paths.
+#[rstest]
+fn zipper_split_survives_backpressure_held_retry(#[values(4, 8)] threads: usize) {
+    use crate::commands::zipper::merge_step::{ZipperMerge, ZipperZipStep};
+
+    const N: usize = 40;
+    let cfg = zipper_split_cfg(false, 4, 64); // queue smaller than one batch
+    let records_emitted = Arc::clone(&cfg.records_emitted);
+
+    let unmapped = zipper_batchify(
+        (0..N).map(|i| zipper_unmapped_template(&format!("q{i:04}"), true)).collect(),
+        4,
+    );
+    let mapped = zipper_batchify(
+        (0..N).map(|i| zipper_mapped_template(&format!("q{i:04}"), i)).collect(),
+        4,
+    );
+
+    let sink: Arc<Mutex<Vec<BamTemplateBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let builder = Pipeline::builder();
+    let a = builder.append_source(ReplaySource::new(unmapped));
+    let b = builder.append_source(ReplaySource::new(mapped));
+    let zip = builder.append_step2(ZipperZipStep::new(cfg.clone()), a, b);
+    let merge = builder.append_step(ZipperMerge::new(cfg), zip);
+    builder.append_step(
+        StallingCollectSink { collected: Arc::clone(&sink), remaining_stalls: 16 },
+        merge,
+    );
+    let pipeline = builder.build().expect("chain builds");
+    pipeline
+        .run(PipelineConfig { threads, ..Default::default() })
+        .expect("chain runs under backpressure");
+
+    let count: usize = sink.lock().expect("sink mutex").iter().map(|b| b.templates().len()).sum();
+    assert_eq!(count, N, "every paired template must survive backpressure");
+    assert_eq!(
+        records_emitted.load(AtomicOrdering::Relaxed),
+        N as u64,
+        "records_emitted under backpressure",
+    );
+}
+
+/// The no-copyable-tags branch of `merge_raw_with`: a paired unmapped read with
+/// no tags to copy skips the aux rebuild and normalizes AS/XS standalone. The
+/// byte-parity fixture always attaches `RX`, so this branch is reached only here.
+#[rstest]
+fn zipper_split_merges_pairs_without_copyable_tags(#[values(4, 8)] threads: usize) {
+    use crate::commands::zipper::merge_step::{ZipperMerge, ZipperZipStep};
+
+    const N: usize = 12;
+    let cfg = zipper_split_cfg(false, 4, 16 * 1024);
+    let records_emitted = Arc::clone(&cfg.records_emitted);
+
+    let unmapped = zipper_batchify(
+        (0..N).map(|i| zipper_unmapped_template(&format!("q{i:04}"), false)).collect(),
+        4,
+    );
+    let mapped = zipper_batchify(
+        (0..N).map(|i| zipper_mapped_template(&format!("q{i:04}"), i)).collect(),
+        4,
+    );
+
+    let sink: Arc<Mutex<Vec<BamTemplateBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let builder = Pipeline::builder();
+    let a = builder.append_source(ReplaySource::new(unmapped));
+    let b = builder.append_source(ReplaySource::new(mapped));
+    let zip = builder.append_step2(ZipperZipStep::new(cfg.clone()), a, b);
+    let merge = builder.append_step(ZipperMerge::new(cfg), zip);
+    builder.append_step(CollectSink { collected: Arc::clone(&sink) }, merge);
+    let pipeline = builder.build().expect("chain builds");
+    pipeline.run(PipelineConfig { threads, ..Default::default() }).expect("chain runs");
+
+    let count: usize = sink.lock().expect("sink mutex").iter().map(|b| b.templates().len()).sum();
+    assert_eq!(count, N, "every tag-less pair must merge and emit");
+    assert_eq!(records_emitted.load(AtomicOrdering::Relaxed), N as u64, "records_emitted");
+}
+
+/// Trailing unmapped-only reads: when the mapped input drains before the
+/// unmapped one, the remaining unmapped reads have no possible mate and must be
+/// emitted unmapped-only (`exclude_missing_reads = false`) — the
+/// `None if mapped_drained` arm of `ZipperZipStep::try_run`. The byte-parity
+/// fixture ends on a paired read, so this arm is reached only here.
+#[rstest]
+fn zipper_split_emits_trailing_unmapped_only_after_mapped_drains(#[values(4, 8)] threads: usize) {
+    use crate::commands::zipper::merge_step::{ZipperMerge, ZipperZipStep};
+
+    let cfg = zipper_split_cfg(false, 4, 16 * 1024);
+    let records_emitted = Arc::clone(&cfg.records_emitted);
+
+    // Mapped drains after q0; q1,q2,q3 are trailing unmapped-only reads.
+    let unmapped = zipper_batchify(
+        (0..4).map(|i| zipper_unmapped_template(&format!("q{i}"), true)).collect(),
+        4,
+    );
+    let mapped = zipper_batchify(vec![zipper_mapped_template("q0", 0)], 4);
+
+    let sink: Arc<Mutex<Vec<BamTemplateBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let builder = Pipeline::builder();
+    let a = builder.append_source(ReplaySource::new(unmapped));
+    let b = builder.append_source(ReplaySource::new(mapped));
+    let zip = builder.append_step2(ZipperZipStep::new(cfg.clone()), a, b);
+    let merge = builder.append_step(ZipperMerge::new(cfg), zip);
+    builder.append_step(CollectSink { collected: Arc::clone(&sink) }, merge);
+    let pipeline = builder.build().expect("chain builds");
+    pipeline.run(PipelineConfig { threads, ..Default::default() }).expect("chain runs");
+
+    // All four unmapped reads are emitted: q0 paired, q1..q3 unmapped-only.
+    let count: usize = sink.lock().expect("sink mutex").iter().map(|b| b.templates().len()).sum();
+    assert_eq!(count, 4, "one paired + three trailing unmapped-only reads must all emit");
+    assert_eq!(records_emitted.load(AtomicOrdering::Relaxed), 4, "records_emitted");
+}
+
 /// `ReplaySource → GroupByMi` drives the MI grouper through the framework.
 ///
 /// Its unit tests all call `process_record` / `flush_current_group` directly,
