@@ -33,7 +33,7 @@ pub use format::{FORMAT_PREFIX_LEN, InputFormat, classify_input};
 pub use fs_mode::restamp_for_persist;
 pub use grouping::{
     DecodedRecord, GroupKey, GroupKeyConfig, Grouper, KeyMode, compute_group_key_from_raw,
-    key_for_mode, name_hash_key,
+    key_and_umi_for_mode, key_for_mode, name_hash_key,
 };
 pub use library::{LibraryIndex, LibraryLookup, build_library_lookup, unknown_library};
 pub use mem_estimate::MemoryEstimate;
