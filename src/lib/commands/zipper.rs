@@ -673,10 +673,10 @@ fn merge_raw_with(
                 transfer_qc_flag(&mut rr[i], is_qc_fail);
                 // No copyable tags, so the Step-3 rebuild (which folds AS/XS
                 // normalization) is skipped for these records — normalize them
-                // standalone here, preserving the old Step-5 behavior exactly
-                // (including its malformed-aux tolerance).
-                fgumi_raw_bam::normalize_int_tag_to_smallest_signed(rr[i].as_mut_vec(), SamTag::AS);
-                fgumi_raw_bam::normalize_int_tag_to_smallest_signed(rr[i].as_mut_vec(), SamTag::XS);
+                // standalone here via the same single-pass helper the Step-5
+                // fallback uses, so both no-copy paths share identical duplicate
+                // and malformed-aux handling.
+                normalize_as_xs_single_pass(rr[i].as_mut_vec(), aux_scratch);
                 normalized[i] = true;
             }
             continue;
