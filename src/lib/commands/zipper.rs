@@ -1193,7 +1193,7 @@ impl Zipper {
     /// injection, tuning, the `ZipperZipStep → ZipperMerge → serialize → compress
     /// → write` steps, and the ≥4-thread pool floor — is assembled inside
     /// `build_for`/`add_zipper`; this only projects the command's fields into a
-    /// single-stage [`ChainSpec`] (a `PairedBams`-shaped spec, which
+    /// single-stage [`ChainSpec`](crate::pipeline::chains::ChainSpec) (a `PairedBams`-shaped spec, which
     /// `ChainSpec::single_stage` does not cover, so the fields are set here).
     ///
     /// Requires regular-file inputs: the `PairedBams` source opens by path, so
@@ -2091,7 +2091,7 @@ pub(crate) mod merge_step {
 
     /// `Serial + ByItemOrdinal` Step2 that pairs unmapped (`InputA`) and mapped
     /// (`InputB`) templates by queryname order and emits [`ZippedBatch`]es —
-    /// **without** merging. This is the pairing half of [`ZipperMergeStep`]: the
+    /// **without** merging. This is the pairing half of `ZipperMergeStep`: the
     /// identical `pending_a`/`pending_b` lock-step advance, the eager
     /// missing-mate / leftover-mapped fail-closed error, the
     /// `exclude_missing_reads` decision, and the ordinal mint + batching. The

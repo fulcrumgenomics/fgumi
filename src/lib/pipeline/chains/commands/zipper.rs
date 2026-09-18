@@ -7,7 +7,7 @@
 //!
 //! In Phase 3a T3a.12 the bulk of the chain-construction logic moved into
 //! `ChainBuilder::add_zipper` and the step-construction details were
-//! extracted into `build_zipper_merge_step`.
+//! extracted into `build_zipper_merge_config`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,10 +52,10 @@ impl FinalizeHook for ZipperFinalizeHook {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// build_zipper_merge_step factory
+// build_zipper_merge_config factory
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Captures for [`build_zipper_merge_step`] construction.
+/// Captures for [`build_zipper_merge_config`] construction.
 pub(crate) struct ZipperMergeCaptures {
     pub(crate) zipper_opts: ZipperOptions,
     pub(crate) output_header: Arc<noodles::sam::Header>,
