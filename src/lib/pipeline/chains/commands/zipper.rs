@@ -73,9 +73,9 @@ pub(crate) struct ZipperMergeCaptures {
 ///
 /// [`ZipperMergeStep`]: merge_step::ZipperMergeStep
 /// [`ZipperMergeConfig`]: merge_step::ZipperMergeConfig
-pub(crate) fn build_zipper_merge_step(
+pub(crate) fn build_zipper_merge_config(
     caps: ZipperMergeCaptures,
-) -> Result<merge_step::ZipperMergeStep> {
+) -> Result<merge_step::ZipperMergeConfig> {
     use crate::umi::TagInfo;
 
     let ZipperMergeCaptures {
@@ -120,5 +120,5 @@ pub(crate) fn build_zipper_merge_step(
         target_batch_count: tuning.template_batch_size,
         output_byte_limit: tuning.per_step_byte_limit,
     };
-    Ok(merge_step::ZipperMergeStep::new(cfg))
+    Ok(cfg)
 }

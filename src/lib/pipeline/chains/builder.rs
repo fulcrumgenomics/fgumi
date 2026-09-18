@@ -2908,9 +2908,10 @@ impl<'a> ChainBuilder<'a> {
     fn add_zipper(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::warn_unwired_pipeline_flags;
         use crate::commands::zipper::NEW_PIPELINE_START_LOG;
+        use crate::commands::zipper::merge_step::{ZipperMerge, ZipperZipStep};
         use crate::logging::OperationTimer;
         use crate::pipeline::chains::commands::zipper::{
-            ZipperFinalizeHook, ZipperMergeCaptures, build_zipper_merge_step,
+            ZipperFinalizeHook, ZipperMergeCaptures, build_zipper_merge_config,
         };
         use crate::pipeline::steps::serialize::SerializeBamRecords;
         use log::info;
@@ -2961,7 +2962,7 @@ impl<'a> ChainBuilder<'a> {
         let missing_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let records_emitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        let merge_step = build_zipper_merge_step(ZipperMergeCaptures {
+        let merge_cfg = build_zipper_merge_config(ZipperMergeCaptures {
             zipper_opts: zipper_opts.clone(),
             output_header: Arc::new(self.header.clone()),
             reference_path,
@@ -2970,8 +2971,17 @@ impl<'a> ChainBuilder<'a> {
             records_emitted: Arc::clone(&records_emitted),
         })?;
 
-        // Wire both source chains into ZipperMergeStep via the 2-input append.
-        let merge_tail = self.pipeline.append_step2(merge_step, unmapped_tail, mapped_tail);
+        // Split zipper-merge: a Serial ZipperZipStep pairs the unmapped/mapped
+        // streams into ZippedBatches, then a Parallel ZipperMerge runs the
+        // per-template merge across workers (issue #972). Byte-identical to the
+        // former single ZipperMergeStep (proven in chain_tests), but the merge
+        // fans out instead of being pinned to one core.
+        let zip_tail = self.pipeline.append_step2(
+            ZipperZipStep::new(merge_cfg.clone()),
+            unmapped_tail,
+            mapped_tail,
+        );
+        let merge_tail = self.pipeline.append_step(ZipperMerge::new(merge_cfg), zip_tail);
 
         // Gate SerializeBamRecords on Terminal position. For Intermediate
         // (e.g., zipper → sort → ...), the chain tail stays at ZipperMergeStep's
