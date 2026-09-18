@@ -1179,6 +1179,59 @@ impl Zipper {
         })
     }
 
+    /// Run standalone zipper on the declarative pipeline chain (issue #972).
+    ///
+    /// Used for `--threads > 2`: routing the per-template merge through the
+    /// Parallel `ZipperMerge` step fans it out across the work-stealing pool,
+    /// instead of the single serial merge in [`Self::process_raw`]. Byte-identical
+    /// to `process_raw` (verified by `chain_path_matches_process_raw`). Everything
+    /// — the merged header, `@PG` injection, tuning, the `ZipperZipStep →
+    /// ZipperMerge → serialize → compress → write` steps, and the ≥4-thread pool
+    /// floor — is assembled inside `build_for`/`add_zipper`; this only projects
+    /// the command's fields into a single-stage [`ChainSpec`].
+    ///
+    /// Requires regular-file inputs: the `PairedBams` source opens by path, so
+    /// stdin/FIFO inputs stay on the streaming `process_raw` path (see `execute`).
+    fn execute_chain(&self, command_line: &str) -> Result<()> {
+        use crate::commands::common::{
+            CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
+            resolve_check_crc,
+        };
+        use crate::pipeline::chains::{
+            ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag, build_for,
+        };
+
+        let spec = ChainSpec {
+            stages: vec![Stage::Zipper],
+            source: SourceSpec::PairedBams {
+                unmapped: self.unmapped.clone(),
+                mapped: self.input.clone(),
+                reference: self.reference.clone(),
+            },
+            sink: SinkSpec::Bam(self.output.clone()),
+            stage_opts: StageOptionsBag {
+                zipper: Some(self.to_zipper_options()),
+                ..Default::default()
+            },
+            threading: ThreadingOptions { threads: Some(self.threads) },
+            // Match process_raw's writer level so the two paths are byte-comparable.
+            compression: CompressionOptions {
+                compression_level: self.resolved_compression_level(),
+            },
+            // Sibling chain commands use a 10s deadlock monitor (Default is off).
+            scheduler: SchedulerOptions { deadlock_timeout: 10, ..Default::default() },
+            queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
+            read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
+            // Zipper has no --check-crc flag; use the shared default policy
+            // (verify file input, trust stdin). The chain path is gated on
+            // regular-file inputs, so this resolves to "verify".
+            verify_crc: resolve_check_crc(false, false, &self.input),
+            command_line: command_line.to_string(),
+        };
+        build_for(spec)?.run()
+    }
+
     /// Process templates using raw-byte merge path with BGZF compression.
     ///
     /// Thread count is controlled by `self.threads` (1 = single-threaded).
@@ -1379,6 +1432,14 @@ impl Command for Zipper {
                 self.reference.with_extension("dict").display()
             )
         })?;
+
+        // High thread counts: route through the declarative pipeline chain so the
+        // per-template merge fans out across workers (issue #972). The PairedBams
+        // source opens inputs by path, so a stdin/FIFO input (either side) keeps
+        // the streaming process_raw path at any thread count.
+        if self.threads > 2 && is_regular_file(&self.unmapped) && is_regular_file(&self.input) {
+            return self.execute_chain(command_line);
+        }
 
         let (unmapped_raw_reader, unmapped_header) = create_raw_bam_reader(&self.unmapped, 1)?;
 
@@ -3749,10 +3810,11 @@ mod tests {
         unmapped.write(&unmapped_path)?;
         mapped.write_sam(&mapped_path)?;
 
-        // threads 0 and 1 exercise the inline fast path; 2 exercises the
-        // channel-backed path with real producer threads.
+        // threads 0 and 1 exercise the inline fast path; 2 the channel-backed
+        // process_raw path; 4 and 8 route through the declarative chain
+        // (`--threads > 2`), which must match the process_raw output byte-for-byte.
         let mut per_thread_records = Vec::new();
-        for threads in [0usize, 1, 2] {
+        for threads in [0usize, 1, 2, 4, 8] {
             let output_path = dir.path().join(format!("output.t{threads}.bam"));
             let zipper = Zipper {
                 input: mapped_path.clone(),
@@ -3783,6 +3845,75 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    /// `--threads > 2` routes standalone zipper through the declarative pipeline
+    /// chain (`ZipperZipStep → ZipperMerge → serialize → compress → write`) so
+    /// the per-template merge fans out across workers, instead of the serial
+    /// `process_raw` merge (issue #972). That chain path must be byte-identical
+    /// to `process_raw`. Runs the same fixture through `process_raw` (threads=1)
+    /// and the chain (`execute_chain`) and asserts the decoded records match.
+    #[test]
+    fn chain_path_matches_process_raw() -> Result<()> {
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
+        for i in 0..10 {
+            let name = format!("q{i}");
+            let mut attrs = HashMap::new();
+            attrs.insert("RX", BufValue::from(format!("ACG{i}")));
+            attrs.insert("xy", BufValue::from(1000 + i as i32));
+            unmapped.add_pair_with_attrs(&name, None, None, true, true, &attrs);
+
+            let mut mapped_attrs = HashMap::new();
+            mapped_attrs.insert("PG", BufValue::from(MAPPED_PG_ID.to_string()));
+            mapped_attrs.insert("AS", BufValue::from(77i32));
+            mapped.add_pair_with_attrs(
+                &name,
+                Some(100 + i * 100),
+                Some(200 + i * 100),
+                true,
+                true,
+                &mapped_attrs,
+            );
+        }
+
+        let dir = TempDir::new()?;
+        let unmapped_path = dir.path().join("unmapped.bam");
+        let mapped_path = dir.path().join("mapped.sam");
+        let dict_path = create_ref_dict(&dir, "chr1", REFERENCE_LENGTH)?;
+        unmapped.write(&unmapped_path)?;
+        mapped.write_sam(&mapped_path)?;
+
+        let make = |threads: usize, output: &Path| Zipper {
+            input: mapped_path.clone(),
+            unmapped: unmapped_path.clone(),
+            reference: dict_path.clone(),
+            output: output.to_path_buf(),
+            tags_to_remove: vec![],
+            tags_to_reverse: vec![],
+            tags_to_revcomp: vec![],
+            buffer: 5000,
+            threads,
+            compression_level: Some(1),
+            bwa_chunk_size: 150_000_000,
+            exclude_missing_reads: false,
+            skip_tc_tags: false,
+            restore_unconverted_bases: false,
+        };
+
+        // Baseline: the serial process_raw path.
+        let base_out = dir.path().join("base.bam");
+        make(1, &base_out).execute("test")?;
+        let baseline = read_bam_records(&base_out)?;
+
+        // The chain path (4 threads → the max(4) floor).
+        let chain_out = dir.path().join("chain.bam");
+        make(4, &chain_out).execute_chain("test")?;
+        let chain = read_bam_records(&chain_out)?;
+
+        assert_eq!(baseline.len(), 20, "fixture should yield 20 records");
+        assert_eq!(chain, baseline, "chain-path output diverged from process_raw");
         Ok(())
     }
 
