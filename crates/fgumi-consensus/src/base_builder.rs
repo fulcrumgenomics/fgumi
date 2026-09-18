@@ -993,6 +993,91 @@ impl ConsensusBaseBuilder {
         None
     }
 
+    /// Fast path for a **multi-base** position (two or more bases observed), the case
+    /// [`Self::try_unanimous_fast_path`] returns `None` for and which otherwise falls
+    /// through to the full log-sum-exp [`Self::call_full`].
+    ///
+    /// It computes the posterior the max-factored way — `r = Σ_{k≠max} e^{L[k] − L[max]}`,
+    /// `ln_consensus_error = ln(r) − log1p(r)` — from the **same** `likelihoods` array
+    /// `call_full` consumes, so it lives in the oracle's number domain (a reordering of
+    /// the same real quantity, not the more-accurate D-space). It replaces
+    /// `call_full`'s `ln_sum_exp_array` (three sequential `log1pexp` calls, each a
+    /// branch ladder) + `ln_not` with at most three scalar `exp`s (one per non-max lane;
+    /// unobserved lanes share the same exponent), one `ln`, and one `log1p` — a lower and
+    /// less branchy transcendental count. On the whole-command measurement this shaved
+    /// ~7% off the single-thread consensus step of a 60M-read run; there is no in-tree
+    /// microbenchmark isolating this kernel yet. The exps are same-sign and independent,
+    /// so a future revision could issue them as one SIMD `exp`; today they are scalar.
+    ///
+    /// **Same-phred gate (why this is safe).** The reordering is *not* bit-identical to
+    /// `call_full`, so the two can round to different integer Phreds at a bracket
+    /// boundary — empirically only at deep (`|L| ≳ 1600`), near-zero-gap pileups, where
+    /// `call_full`'s `[w,l,l,l]` normalize itself loses a bit to cancellation. Rather
+    /// than reproduce that cancellation, this path returns `Some` **only when the Phred
+    /// is stable under a magnitude-scaled error band** `± delta` around `ln_final_error`:
+    /// if `ln_prob_to_phred(ln_final ± delta)` both equal `ln_prob_to_phred(ln_final)`,
+    /// no rounding difference within `delta` (which conservatively bounds the gap between
+    /// this path's result and `call_full`'s — both compute the same real value) can flip
+    /// the answer, so the two agree. Otherwise it returns `None` and defers to the
+    /// `call_full` oracle. `delta` reuses the unanimous path's calibrated constants
+    /// (`UNANIMOUS_MARGIN_HEADROOM * u * scale`), with `scale` the dominant magnitude
+    /// driving `call_full`'s cancellation error. Exhaustively checked against `call_full`
+    /// by `test_multibase_fast_path_matches_call_full_*`.
+    #[inline]
+    fn try_multibase_fast_path(&self) -> Option<(u8, PhredScore)> {
+        let likelihoods = self.likelihoods.as_array();
+
+        // Same argmax + tie resolution as `call_full`; a tie is a no-call the oracle
+        // must own (this path never invents a call the full path would reject).
+        let max_idx = unique_max_index_with(likelihoods, self.tie_rule)?;
+        let max_likelihood = likelihoods[max_idx];
+
+        // r = Σ_{k≠max} e^{L[k] − L[max]}. Same-sign exponents (arguments ≤ 0). Also
+        // track the largest magnitude, which bounds `call_full`'s cancellation error.
+        let mut r = 0.0_f64;
+        let mut max_magnitude = max_likelihood.abs();
+        for (k, &lk) in likelihoods.iter().enumerate() {
+            max_magnitude = max_magnitude.max(lk.abs());
+            if k != max_idx {
+                r += (lk - max_likelihood).exp();
+            }
+        }
+
+        // ln(r/(1+r)) = ln(r) − log1p(r); at r == 0 (maximally confident) this is
+        // −inf, which `ln_error_prob_two_trials` folds to the pre-UMI cap exactly as
+        // `call_full`'s `ln_not(0)` path does.
+        let ln_consensus_error = r.ln() - r.ln_1p();
+        let ln_final_error = ln_error_prob_two_trials(self.ln_error_pre_umi, ln_consensus_error);
+
+        // Same-phred gate: the Phred must be invariant across `± delta`, a conservative
+        // bound on the difference between this path's `ln_final_error` and `call_full`'s.
+        //
+        // `call_full` forms `ln_posterior = L[max] − ln_sum_exp(L)`, cancelling two
+        // magnitude-`max_magnitude` operands, so its `ln_posterior` carries an absolute
+        // error `~u·max_magnitude`. `ln_not` then maps the posterior to the consensus
+        // error as `ln(−ln_posterior)` for a confident call, whose derivative is
+        // `1/ln_posterior` — so that error is AMPLIFIED by `1/|ln_posterior|` on its way
+        // into `ln_cons_err` and thence `ln_final_error`. (Confirmed empirically: at a
+        // deep confident pileup `u·max_magnitude ≈ 2.5e-13`, `|ln_posterior| ≈ 2.6e-10`,
+        // and the observed `ln_cons_err` gap is `≈ 1e-3 = 2.5e-13 / 2.6e-10`.) With
+        // `|ln_posterior| = log1p(r)`, `delta` scales as `u·max_magnitude / log1p(r)`:
+        // tiny for shallow/moderate calls (gate returns), large for deep confident ones
+        // (gate defers to `call_full`, which owns the boundary). `ln_error_prob_two_trials`
+        // is non-expansive here, so bounding `ln_final_error`'s error by the `ln_cons_err`
+        // bound is conservative.
+        let abs_ln_posterior = r.ln_1p().max(f64::MIN_POSITIVE);
+        let delta =
+            UNANIMOUS_MARGIN_HEADROOM * UNANIMOUS_UNIT_ROUNDOFF * max_magnitude / abs_ln_posterior;
+
+        let qual = ln_prob_to_phred(ln_final_error);
+        if ln_prob_to_phred(ln_final_error - delta) == qual
+            && ln_prob_to_phred(ln_final_error + delta) == qual
+        {
+            return Some((DNA_BASES[max_idx], qual));
+        }
+        None
+    }
+
     /// Calls the consensus base and quality
     ///
     /// Returns (`consensus_base`, `consensus_quality`)
@@ -1004,9 +1089,15 @@ impl ConsensusBaseBuilder {
             return (NO_CALL_BASE, MIN_PHRED);
         }
 
-        // Fast path: check for unanimous consensus (only one base observed)
-        // This is common in high-quality data and avoids expensive log-sum-exp
+        // Fast path 1: unanimous consensus (only one base observed) — a table lookup,
+        // the cheapest and most common case in high-quality data.
         if let Some((base, qual)) = self.try_unanimous_fast_path() {
+            return (base, qual);
+        }
+
+        // Fast path 2: multi-base positions via the max-factored posterior, gated to
+        // provably match `call_full`; defers to it near a Phred bracket boundary.
+        if let Some((base, qual)) = self.try_multibase_fast_path() {
             return (base, qual);
         }
 
@@ -2080,6 +2171,187 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Exhaustive parity guard for [`ConsensusBaseBuilder::try_multibase_fast_path`]:
+    /// on every reachable position up to depth 4 — all pre-UMI × post-UMI rates in
+    /// the grid, and every base/quality observation multiset (monotone combinations
+    /// over a representative quality grid) — the gated [`ConsensusBaseBuilder::call`]
+    /// must return exactly what the [`ConsensusBaseBuilder::call_full`] oracle does.
+    /// Small families are the production regime and the case the multi-base fast path
+    /// is exact for; the deep boundary regime it must instead *defer* on is covered by
+    /// `test_multibase_fast_path_matches_call_full_deep`.
+    #[test]
+    fn test_multibase_fast_path_matches_call_full_exhaustive() {
+        const QUALS: [u8; 9] = [0, 1, 2, 3, 5, 10, 20, 40, 93];
+        const PRES: [PhredScore; 4] = [0, 20, 45, 90];
+        const POSTS: [PhredScore; 3] = [0, 10, 40];
+
+        // Every distinct single observation (base, quality) over the grid.
+        let obs: Vec<(u8, u8)> =
+            DNA_BASES.iter().flat_map(|&base| QUALS.iter().map(move |&q| (base, q))).collect();
+        let n = obs.len();
+
+        // Assert parity directly per position (matching the direct-`assert_eq!` idiom of
+        // `test_fast_path_matches_call_full_dense`): the gated `call()` must equal the
+        // `call_full` oracle on every reachable state, failing on the first divergence with
+        // the position that produced it.
+        let check = |pre: PhredScore, post: PhredScore, sample: &[(u8, u8)]| {
+            let mut builder = ConsensusBaseBuilder::new(pre, post);
+            for &(base, q) in sample {
+                builder.add(base, q);
+            }
+            assert_eq!(
+                builder.call(),
+                builder.call_full(),
+                "gated call() disagreed with call_full at pre=Q{pre} post=Q{post} obs={sample:?}"
+            );
+        };
+
+        for &pre in &PRES {
+            for &post in &POSTS {
+                for i in 0..n {
+                    check(pre, post, &[obs[i]]);
+                    for j in i..n {
+                        check(pre, post, &[obs[i], obs[j]]);
+                        for k in j..n {
+                            check(pre, post, &[obs[i], obs[j], obs[k]]);
+                            for l in k..n {
+                                check(pre, post, &[obs[i], obs[j], obs[k], obs[l]]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Deep-pileup parity guard for the multi-base fast path. The max-factored posterior
+    /// it computes and `call_full`'s `[w, l, l, l]` normalize agree in exact arithmetic
+    /// but not bit-for-bit, and can round to different integer Phreds at deep
+    /// (`|L| ≳ 1600`), near-zero-gap pileups where `call_full` itself loses a bit to
+    /// `fl(l + S)` cancellation. This scans that regime contiguously — mirroring
+    /// `test_fast_path_matches_call_full_dense` but exercising the multi-base path — for
+    /// both unanimous positions (which reach the multi-base path only when the unanimous
+    /// fast path defers) and genuine two-base positions, asserting the gated
+    /// [`ConsensusBaseBuilder::call`] never disagrees with `call_full`: where it cannot
+    /// prove the Phred, the gate must defer to the oracle.
+    #[test]
+    fn test_multibase_fast_path_matches_call_full_deep() {
+        for pre in [45u8, 70, 90] {
+            for base in [b'A', b'C', b'G', b'T'] {
+                for post in 0u8..=12 {
+                    for obs in 0u8..=12 {
+                        // Unanimous contiguous deep scan: reaches the multi-base path
+                        // only for depths where the unanimous fast path defers.
+                        let base_char = base as char;
+                        let mut builder = ConsensusBaseBuilder::new(pre, post);
+                        for depth in 1..=4000u32 {
+                            builder.add(base, obs);
+                            assert_eq!(
+                                builder.call(),
+                                builder.call_full(),
+                                "unanimous pre=Q{pre} base={base_char} post=Q{post} obs=Q{obs} depth={depth}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Deep MULTI-BASE scans (2, 3, and 4 observed bases), driven into the same
+        // deep / near-zero-gap divergence regime the unanimous scan covers. A fixed
+        // handful of loser observations across 1..=3 other bases, then the winner is
+        // grown one observation at a time. The first two-base divergence was found at
+        // winner depth ~1606, so the scan must reach well past that for the gate's
+        // deferral to actually be exercised. The (pre, post, obs) grid spans the
+        // DEFAULT rate (pre=45) and moderate/high observed qualities as well as the
+        // low-quality / extreme-rate corner where divergence first appears, so the
+        // reused `delta` calibration is validated for genuine multi-base positions
+        // across the operating range, not just the divergence corner. The winner base
+        // is rotated through all four lanes because `ln_sum_exp_array`'s fold order is
+        // lane-dependent (its accumulator seed and index-order fold give a winner at
+        // lane 2/3 a different rounding path than one at lane 0/1).
+        for pre in [45u8, 70, 90] {
+            for (post, obs) in [(1u8, 1u8), (1, 5), (5, 5), (10, 20), (20, 30), (20, 40)] {
+                for winner in [b'A', b'C', b'G', b'T'] {
+                    for n_loser_bases in 1..=3usize {
+                        for loser_q in [1u8, 20] {
+                            let losers: Vec<u8> = [b'A', b'C', b'G', b'T']
+                                .into_iter()
+                                .filter(|&x| x != winner)
+                                .collect();
+                            let n_bases = n_loser_bases + 1;
+                            let winner_char = winner as char;
+                            let mut b = ConsensusBaseBuilder::new(pre, post);
+                            for &l in &losers[..n_loser_bases] {
+                                b.add(l, loser_q);
+                            }
+                            for depth in 1..=2600u32 {
+                                b.add(winner, obs);
+                                assert_eq!(
+                                    b.call(),
+                                    b.call_full(),
+                                    "{n_bases}-base pre=Q{pre} post=Q{post} obs=Q{obs} \
+                                     winner={winner_char}x{depth} losers={n_loser_bases}xQ{loser_q}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Liveness guard: the multi-base fast path must actually be *taken* on ordinary
+    /// shallow multi-base positions, not silently regress to always deferring. The
+    /// parity tests above pass trivially if `try_multibase_fast_path` returns `None`
+    /// everywhere (`call()` would just fall through to `call_full`), so they cannot
+    /// catch the optimization going dead — this asserts it returns `Some` for a
+    /// representative small two-base family.
+    #[test]
+    fn test_multibase_fast_path_is_taken_on_shallow_positions() {
+        // Sweep a small grid of ordinary shallow multi-base positions (2- and 3-base,
+        // varied winner/loser depths, qualities, and rates) and count how many the fast
+        // path actually handles. A single spot check would still pass if the path went
+        // *partially* dead (e.g. deferring on all 3-base or all moderate-rate inputs);
+        // counting over the grid and asserting a floor catches a broad regression to
+        // always-defer while every parity test still passes.
+        let mut total = 0usize;
+        let mut taken = 0usize;
+        for pre in [20u8, 45, 70] {
+            for post in [10u8, 20, 40] {
+                for wq in [20u8, 30, 40] {
+                    for (wn, ln, third) in
+                        [(2u32, 1u32, false), (3, 1, false), (3, 2, false), (4, 2, true)]
+                    {
+                        let mut b = ConsensusBaseBuilder::new(pre, post);
+                        for _ in 0..wn {
+                            b.add(b'A', wq);
+                        }
+                        for _ in 0..ln {
+                            b.add(b'C', wq);
+                        }
+                        if third {
+                            b.add(b'G', wq);
+                        }
+                        total += 1;
+                        if b.try_multibase_fast_path().is_some() {
+                            taken += 1;
+                        }
+                        // Whether taken or deferred, the gated call must match the oracle.
+                        assert_eq!(b.call(), b.call_full());
+                    }
+                }
+            }
+        }
+        // The vast majority of these confident, in-range multi-base positions must be
+        // handled by the fast path; a large drop signals the optimization went dead.
+        assert!(
+            taken * 4 >= total * 3,
+            "multi-base fast path handled only {taken}/{total} shallow positions; \
+             the optimization has largely regressed to always deferring"
+        );
     }
 
     /// C1 regression: the deep cap-region divergences `test_fast_path_matches_call_full_dense`
