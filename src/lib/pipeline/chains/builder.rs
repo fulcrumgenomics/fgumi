@@ -1019,7 +1019,7 @@ impl<'a> ChainBuilder<'a> {
     ///   set — `add_zipper` consumes both tails to assemble `ZipperZipStep`.
     ///   Note that both preamble chains end at `GroupByQueryname` so their
     ///   output type is `OrderedBytesSingle<BamTemplateBatch>`, matching
-    ///   `ZipperMergeStep: Step2<InputA = BamTemplateBatch, InputB = BamTemplateBatch>`.
+    ///   `ZipperZipStep: Step2<InputA = BamTemplateBatch, InputB = BamTemplateBatch>`.
     ///   The reference path is stashed in `PendingSource::Paired` but is
     ///   consumed later by `add_zipper` (reference loading is deferred because
     ///   `restore_unconverted_bases` controls whether the FASTA is opened at all).
@@ -2881,15 +2881,18 @@ impl<'a> ChainBuilder<'a> {
     /// matching `ZipperZipStep: Step2<InputA = BamTemplateBatch,
     /// InputB = BamTemplateBatch>`.
     ///
-    /// Appends `ZipperMergeStep` (via `PipelineBuilder::append_step2`
-    /// which wires the two tails into input slots 0 and 1), then — for
-    /// `Terminal` — appends `SerializeBamRecords` so the chain tail is
-    /// `DecompressedBlock` ready for `BgzfCompress → WriteBgzfFile`.
+    /// Appends `ZipperZipStep` (via `PipelineBuilder::append_step2`, which wires
+    /// the two tails into input slots 0 and 1) followed by the Parallel
+    /// `ZipperMerge`, then — for `Terminal` — appends `SerializeBamRecords` so
+    /// the chain tail is `DecompressedBlock` ready for `BgzfCompress →
+    /// WriteBgzfFile`.
     ///
-    /// Applies the thread floor: zipper requires at least 4 worker
-    /// threads (`≥ 3 Exclusive steps + 1`); `override_pipeline_threads`
-    /// is set to `spec.threading.num_threads().max(4)` so that
-    /// `build()` forwards the correct value to `PipelineConfig::threads`.
+    /// Applies the thread floor: the zipper chain runs on at least 4 workers.
+    /// This is a performance floor, not a hard requirement — the chain runs at
+    /// 1-3 workers too, but the merge fan-out only pays with enough of them.
+    /// `override_pipeline_threads` is set to
+    /// `spec.threading.num_threads().max(4)` so `build()` forwards it to
+    /// `PipelineConfig::threads`.
     ///
     /// Registers a [`ZipperFinalizeHook`] for the missing-reads summary,
     /// "zipper completed successfully" log, and `timer.log_completion`.

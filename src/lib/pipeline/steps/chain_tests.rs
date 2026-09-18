@@ -1067,10 +1067,12 @@ fn zipper_split_matches_zippermergestep_bytes(
     // Oracle: the shipped single ZipperMergeStep.
     let oracle: Arc<Mutex<Vec<BamTemplateBatch>>> = Arc::new(Mutex::new(Vec::new()));
     let oracle_missing: Arc<AtomicU64>;
+    let oracle_emitted: Arc<AtomicU64>;
     {
         let (unmapped, mapped) = build_inputs();
         let oracle_cfg = make_cfg();
         oracle_missing = Arc::clone(&oracle_cfg.missing_count);
+        oracle_emitted = Arc::clone(&oracle_cfg.records_emitted);
         let builder = Pipeline::builder();
         let a = builder.append_source(ReplaySource::new(unmapped));
         let b = builder.append_source(ReplaySource::new(mapped));
@@ -1083,10 +1085,12 @@ fn zipper_split_matches_zippermergestep_bytes(
     // Split: ZipperZipStep (pairing) → ZipperMerge (merge).
     let split: Arc<Mutex<Vec<BamTemplateBatch>>> = Arc::new(Mutex::new(Vec::new()));
     let split_missing: Arc<AtomicU64>;
+    let split_emitted: Arc<AtomicU64>;
     {
         let (unmapped, mapped) = build_inputs();
         let cfg = make_cfg();
         split_missing = Arc::clone(&cfg.missing_count);
+        split_emitted = Arc::clone(&cfg.records_emitted);
         let builder = Pipeline::builder();
         let a = builder.append_source(ReplaySource::new(unmapped));
         let b = builder.append_source(ReplaySource::new(mapped));
@@ -1130,6 +1134,20 @@ fn zipper_split_matches_zippermergestep_bytes(
         split_missing.load(AtomicOrdering::Relaxed),
         expected_missing,
         "split missing_count must match the oracle",
+    );
+
+    // records_emitted is a user-visible throughput count: it must match the
+    // oracle and equal the number of records actually emitted.
+    let oracle_emitted = oracle_emitted.load(AtomicOrdering::Relaxed);
+    assert_eq!(
+        split_emitted.load(AtomicOrdering::Relaxed),
+        oracle_emitted,
+        "split records_emitted must match the oracle",
+    );
+    assert_eq!(
+        oracle_emitted,
+        oracle_records.len() as u64,
+        "records_emitted must equal the emitted record count",
     );
 }
 

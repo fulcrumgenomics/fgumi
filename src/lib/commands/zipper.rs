@@ -160,7 +160,9 @@ pub struct Zipper {
     #[arg(long, value_delimiter = ',')]
     pub tags_to_revcomp: Vec<String>,
 
-    /// Buffer size for template channel (default: 50000)
+    /// Buffer size for the template channel used by the `process_raw` path
+    /// (default: 50000). Not used by the `--threads >= 4` chain path, which
+    /// bounds its inter-stage memory by byte budget instead.
     #[arg(short = 'b', long, default_value = "50000")]
     pub buffer: usize,
 
@@ -1181,14 +1183,18 @@ impl Zipper {
 
     /// Run standalone zipper on the declarative pipeline chain (issue #972).
     ///
-    /// Used for `--threads > 2`: routing the per-template merge through the
+    /// Used for `--threads >= 4`: routing the per-template merge through the
     /// Parallel `ZipperMerge` step fans it out across the work-stealing pool,
-    /// instead of the single serial merge in [`Self::process_raw`]. Byte-identical
-    /// to `process_raw` (verified by `chain_path_matches_process_raw`). Everything
-    /// — the merged header, `@PG` injection, tuning, the `ZipperZipStep →
-    /// ZipperMerge → serialize → compress → write` steps, and the ≥4-thread pool
-    /// floor — is assembled inside `build_for`/`add_zipper`; this only projects
-    /// the command's fields into a single-stage [`ChainSpec`].
+    /// instead of the single serial merge in [`Self::process_raw`]. Produces the
+    /// same output header and record stream as `process_raw`
+    /// (`chain_path_matches_process_raw` decodes both outputs and compares the
+    /// merged records; `execute` normalizes the `@HD` line on the `process_raw`
+    /// path so the headers agree too). Everything — the merged header, `@PG`
+    /// injection, tuning, the `ZipperZipStep → ZipperMerge → serialize → compress
+    /// → write` steps, and the ≥4-thread pool floor — is assembled inside
+    /// `build_for`/`add_zipper`; this only projects the command's fields into a
+    /// single-stage [`ChainSpec`] (a `PairedBams`-shaped spec, which
+    /// `ChainSpec::single_stage` does not cover, so the fields are set here).
     ///
     /// Requires regular-file inputs: the `PairedBams` source opens by path, so
     /// stdin/FIFO inputs stay on the streaming `process_raw` path (see `execute`).
@@ -1434,10 +1440,13 @@ impl Command for Zipper {
         })?;
 
         // High thread counts: route through the declarative pipeline chain so the
-        // per-template merge fans out across workers (issue #972). The PairedBams
-        // source opens inputs by path, so a stdin/FIFO input (either side) keeps
-        // the streaming process_raw path at any thread count.
-        if self.threads > 2 && is_regular_file(&self.unmapped) && is_regular_file(&self.input) {
+        // per-template merge fans out across workers (issue #972). Gated at `>= 4`,
+        // not `> 2`: the zipper chain floors its pool to 4 workers (`add_zipper`),
+        // so routing a `--threads 3` request through it would run 4 threads and
+        // break the "--threads N caps at N" contract — 1..=3 stay on process_raw,
+        // which honors the exact count. The PairedBams source opens inputs by
+        // path, so a stdin/FIFO input (either side) also keeps process_raw.
+        if self.threads >= 4 && is_regular_file(&self.unmapped) && is_regular_file(&self.input) {
             return self.execute_chain(command_line);
         }
 
@@ -1476,6 +1485,12 @@ impl Command for Zipper {
         check_sort(&mapped_header, &self.input, "mapped");
 
         let output_header = build_output_header(&unmapped_header, &mapped_header, &dict_path)?;
+
+        // Normalize the @HD line (fgbio parity) before @PG, matching the order
+        // `ChainBuilder::new` uses for the chain path — so the serial process_raw
+        // output header is byte-identical to the chain path's regardless of
+        // --threads (issue #972).
+        let output_header = crate::commands::common::ensure_hd_record(output_header)?;
 
         // Add @PG record with PP chaining
         let output_header = crate::commands::common::add_pg_record(output_header, command_line)?;
@@ -1566,7 +1581,7 @@ pub const NEW_PIPELINE_START_LOG: &str = "Starting zipper (new pipeline)";
 /// bisulfite path.
 ///
 /// Both callers that merge many templates against the same `TagInfo` —
-/// `ZipperMergeStep::emit_merged` (typed-step zipper) and
+/// `ZipperMerge` (the Parallel zipper-chain merge step) and
 /// `AlignAndMergeStep::merge_zipper_batch` (AAM dispatcher) — build the
 /// `ZipperTags` once, outside their per-template loop, and hold it on the
 /// step for the step's whole lifetime rather than rebuilding it (three
@@ -2038,7 +2053,7 @@ pub(crate) mod merge_step {
     /// mate and is emitted as-is — interleaved in queryname order exactly where
     /// `ZipperMergeStep` would have emitted it.
     #[derive(Debug)]
-    pub(crate) enum ZipItem {
+    enum ZipItem {
         Pair { unmapped: Template, mapped: Template },
         UnmappedOnly { unmapped: Template },
     }
@@ -2869,6 +2884,11 @@ mod tests {
         let mut reader = noodles::bam::io::reader::Builder.build_from_path(path)?;
         let header = reader.read_header()?;
         Ok(reader.record_bufs(&header).collect::<std::io::Result<Vec<_>>>()?)
+    }
+
+    fn read_bam_header(path: &std::path::Path) -> Result<noodles::sam::Header> {
+        let mut reader = noodles::bam::io::reader::Builder.build_from_path(path)?;
+        Ok(reader.read_header()?)
     }
 
     /// The output-aware compression default: streams get 0 (uncompressed, since
@@ -3848,34 +3868,40 @@ mod tests {
         Ok(())
     }
 
-    /// `--threads > 2` routes standalone zipper through the declarative pipeline
-    /// chain (`ZipperZipStep → ZipperMerge → serialize → compress → write`) so
-    /// the per-template merge fans out across workers, instead of the serial
-    /// `process_raw` merge (issue #972). That chain path must be byte-identical
-    /// to `process_raw`. Runs the same fixture through `process_raw` (threads=1)
-    /// and the chain (`execute_chain`) and asserts the decoded records match.
-    #[test]
-    fn chain_path_matches_process_raw() -> Result<()> {
+    /// `--threads >= 4` routes standalone zipper through the declarative pipeline
+    /// chain (`ZipperZipStep → ZipperMerge → serialize → compress → write`) so the
+    /// per-template merge fans out across workers, instead of the serial
+    /// `process_raw` merge (issue #972). The chain path must produce the same
+    /// output header and record stream as `process_raw`. The fixture includes
+    /// reads missing from the mapped side, run under both `exclude_missing`
+    /// settings, so the unmapped-only / exclude branch is exercised end-to-end
+    /// through both code paths; both `@HD`-bearing headers must also agree.
+    #[rstest]
+    fn chain_path_matches_process_raw(#[values(false, true)] exclude_missing: bool) -> Result<()> {
         let mut unmapped = FgSamBuilder::new_unmapped();
         let mut mapped = FgSamBuilder::new_mapped();
-        for i in 0..10 {
-            let name = format!("q{i}");
+        for i in 0..12 {
+            let name = format!("q{i:02}");
             let mut attrs = HashMap::new();
             attrs.insert("RX", BufValue::from(format!("ACG{i}")));
             attrs.insert("xy", BufValue::from(1000 + i as i32));
             unmapped.add_pair_with_attrs(&name, None, None, true, true, &attrs);
 
-            let mut mapped_attrs = HashMap::new();
-            mapped_attrs.insert("PG", BufValue::from(MAPPED_PG_ID.to_string()));
-            mapped_attrs.insert("AS", BufValue::from(77i32));
-            mapped.add_pair_with_attrs(
-                &name,
-                Some(100 + i * 100),
-                Some(200 + i * 100),
-                true,
-                true,
-                &mapped_attrs,
-            );
+            // Every 4th read is absent from the mapped BAM, so the missing-mate /
+            // exclude path runs through both process_raw and the chain.
+            if i % 4 != 0 {
+                let mut mapped_attrs = HashMap::new();
+                mapped_attrs.insert("PG", BufValue::from(MAPPED_PG_ID.to_string()));
+                mapped_attrs.insert("AS", BufValue::from(77i32));
+                mapped.add_pair_with_attrs(
+                    &name,
+                    Some(100 + i * 100),
+                    Some(200 + i * 100),
+                    true,
+                    true,
+                    &mapped_attrs,
+                );
+            }
         }
 
         let dir = TempDir::new()?;
@@ -3897,23 +3923,33 @@ mod tests {
             threads,
             compression_level: Some(1),
             bwa_chunk_size: 150_000_000,
-            exclude_missing_reads: false,
+            exclude_missing_reads: exclude_missing,
             skip_tc_tags: false,
             restore_unconverted_bases: false,
         };
 
-        // Baseline: the serial process_raw path.
+        // Baseline: the serial process_raw path (threads=1).
         let base_out = dir.path().join("base.bam");
         make(1, &base_out).execute("test")?;
         let baseline = read_bam_records(&base_out)?;
+        let base_header = read_bam_header(&base_out)?;
 
-        // The chain path (4 threads → the max(4) floor).
+        // The chain path: threads=4 routes through `execute` -> the gate -> the chain.
         let chain_out = dir.path().join("chain.bam");
-        make(4, &chain_out).execute_chain("test")?;
+        make(4, &chain_out).execute("test")?;
         let chain = read_bam_records(&chain_out)?;
+        let chain_header = read_bam_header(&chain_out)?;
 
-        assert_eq!(baseline.len(), 20, "fixture should yield 20 records");
-        assert_eq!(chain, baseline, "chain-path output diverged from process_raw");
+        assert!(!baseline.is_empty(), "fixture produced no records");
+        assert_eq!(chain, baseline, "chain-path records diverged from process_raw");
+        // Both paths normalize the @HD line, so the header agrees regardless of
+        // --threads — the header parity the byte-identity claim rests on.
+        assert!(base_header.header().is_some(), "process_raw output is missing its @HD record");
+        assert_eq!(
+            base_header.header(),
+            chain_header.header(),
+            "chain-path @HD header diverged from process_raw",
+        );
         Ok(())
     }
 
