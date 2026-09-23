@@ -353,9 +353,14 @@ impl crate::ProcessingMetrics for DeduplicationMetrics {
 }
 
 /// Serializable row for the `--duplication-ladder` sampled duplication
-/// saturation curve: "after `templates_seen` templates processed (in
-/// coordinate order) for this library, what cumulative fraction were
-/// duplicates".
+/// ladder: "after `templates_seen` templates processed (in coordinate order)
+/// for this library, what cumulative fraction were duplicates".
+///
+/// This is not a saturation curve. A template's duplicate status is decided
+/// by the other templates at its own position, so the fraction after N
+/// templates is the duplicate rate of the genome covered so far, not the rate
+/// a library sequenced to N templates would show. Changes along the ladder
+/// reflect regions with different duplicate rates.
 ///
 /// One row per (library, snapshot) — a library gets a row each time its
 /// cumulative `templates_seen` crosses a multiple of `--ladder-interval`,
@@ -376,10 +381,9 @@ pub struct DuplicationLadderMetrics {
     /// `templates_seen` on the first snapshot.
     pub window_templates: u64,
     /// Marginal duplicate fraction over just this window's templates
-    /// (`window_duplicate_templates / window_templates`). Often the more legible
-    /// view of the saturation curve than the cumulative `duplicate_fraction`,
-    /// since it isolates each depth band instead of averaging over all prior
-    /// ones. Mirrors dupblaster's per-window complexity columns.
+    /// (`window_duplicate_templates / window_templates`). Often more legible than
+    /// the cumulative `duplicate_fraction`, since it isolates each window
+    /// instead of averaging over all prior ones. Mirrors dupblaster's per-window complexity columns.
     #[serde(with = "crate::float")]
     pub window_duplicate_fraction: f64,
 }

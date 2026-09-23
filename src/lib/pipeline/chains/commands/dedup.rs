@@ -148,7 +148,7 @@ impl FinalizeHook for DedupFinalizeHook {
             write_family_size_histogram(&final_family_sizes, path)?;
         }
 
-        // Write the duplication-saturation ladder if requested. Accessed through
+        // Write the duplication ladder if requested. Accessed through
         // the lock (not `Arc::try_unwrap`): the serial MI-assign step holds a
         // clone of this `Arc` that may still be alive here.
         if let Some((path, recorder)) = duplication_ladder {
@@ -268,7 +268,7 @@ pub(crate) fn build_process_step(
 /// monotonically increasing MI offsets to each batch.
 ///
 /// When `ladder_recorder` is `Some`, this step also records the
-/// `--duplication-ladder` saturation curve — per position group, in this
+/// `--duplication-ladder` — per position group, in this
 /// serial/coordinate-order seam, **not** in the parallel serialize step.
 /// `MiAssign` is `Serial` + `ByItemOrdinal`, so batches reach this closure in
 /// input-record order and the groups within a batch are in coordinate order —
