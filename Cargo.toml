@@ -91,6 +91,8 @@ rustix = { version = "1.1", default-features = false, features = ["std"] }
 rayon = "1.10"
 rstest = "0.26"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+syn = { version = "3", features = ["full"] }
 statrs = "0.18"
 # Held at 0.38 because sysinfo >=0.39 requires rustc 1.95 > our MSRV (rust-toolchain.toml pins
 # 1.93). Centralized so `fgumi` and `fgumi-cli-common` cannot drift onto different versions and
@@ -221,6 +223,9 @@ test-utils = []
 fgumi = { path = ".", features = ["test-utils"] }
 rstest = { workspace = true }
 proptest = { workspace = true }
+serde_json = { workspace = true }
+syn = { workspace = true }
+quote = { workspace = true }
 criterion = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["test-utils", "noodles"] }
 # "bgzf" is needed by test_sort_cutover_parity.rs, which decompresses a sort

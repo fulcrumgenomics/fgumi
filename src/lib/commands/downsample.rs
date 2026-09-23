@@ -20,8 +20,6 @@ use log::info;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::collections::{BTreeMap, HashSet};
-use std::fs::File;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::commands::command::Command;
@@ -332,14 +330,22 @@ impl Command for Downsample {
     }
 }
 
+/// One row of the `--histogram-kept` / `--histogram-rejected` family size histogram.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DownsampleHistogramMetric {
+    /// Family size (number of templates in the family).
+    pub family_size: usize,
+    /// Number of families of this size.
+    pub count: u64,
+}
+
 /// Write family size histogram in fgbio-compatible TSV format.
 fn write_histogram(histogram: &BTreeMap<usize, u64>, path: &PathBuf) -> Result<()> {
-    let mut file = File::create(path)?;
-    writeln!(file, "family_size\tcount")?;
-    for (size, count) in histogram {
-        writeln!(file, "{size}\t{count}")?;
-    }
-    Ok(())
+    let rows: Vec<DownsampleHistogramMetric> = histogram
+        .iter()
+        .map(|(&family_size, &count)| DownsampleHistogramMetric { family_size, count })
+        .collect();
+    crate::metrics::writer::write_metrics(path, &rows, "family size histogram")
 }
 
 /// Wrap a [`RawBamReader`] as a streaming iterator of [`RawRecord`]s.
@@ -729,10 +735,18 @@ mod tests {
 
         let contents =
             std::fs::read_to_string(temp_file.path()).expect("failed to read histogram file");
-        assert!(contents.contains("family_size\tcount"));
-        assert!(contents.contains("1\t10"));
-        assert!(contents.contains("2\t20"));
-        assert!(contents.contains("5\t5"));
+        assert_eq!(contents, "family_size\tcount\n1\t10\n2\t20\n5\t5\n");
+    }
+
+    /// An empty histogram is a header-only file, never a 0-byte one.
+    #[test]
+    fn test_write_histogram_empty_is_header_only() {
+        let temp_file = tempfile::NamedTempFile::new().expect("failed to create temp file");
+        write_histogram(&BTreeMap::new(), &temp_file.path().to_path_buf())
+            .expect("write_histogram should succeed");
+        let contents =
+            std::fs::read_to_string(temp_file.path()).expect("failed to read histogram file");
+        assert_eq!(contents, "family_size\tcount\n");
     }
 
     #[test]
