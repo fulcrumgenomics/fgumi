@@ -21,6 +21,28 @@ All notable changes to this project will be documented in this file.
   table + bottleneck verdict, `timeline`/`deep` add the TSV and dwell/park
   latency. All flags are hidden from `--help` ([#937](https://github.com/fulcrumgenomics/fgumi/pull/937)).
 - Honor `--check-crc`/`--no-check-crc` on `fgumi fastq`, so a trusted intermediate BAM piped to an aligner can skip the input CRC32 verification and hand those cycles to the aligner. Default policy is unchanged (verify a file source, skip stdin) ([#960](https://github.com/fulcrumgenomics/fgumi/pull/960)).
+- Publish `crates/fgumi-metrics/metric_columns.json`, the ordered column contract for
+  every metric file fgumi emits (keyed `<namespace>.<file>`), for downstream report
+  tooling. A test fails if it drifts from the metric structs, or if a serialized struct
+  is neither listed in it nor explicitly allowlisted.
+
+### Bug Fixes
+
+- **BREAKING:** `fgumi filter --stats` now writes a headered one-row metrics TSV
+  (`total_reads`, `passed_reads`, `failed_reads`, `pass_rate`) like every other fgumi
+  metrics file, instead of a headerless two-column key/value file. Field names and
+  values are unchanged, but `pass_rate` is now written at full precision rather than
+  rounded to four decimals. Parsers of the old layout must be updated.
+- `fgumi group` (`--family-size-histogram`, and the `--metrics` family and position-group
+  size histograms), `fgumi dedup` (`--family-size-histogram`, `--duplication-ladder`) and
+  `fgumi review` (`<output>.txt`) now write a header row when there is nothing to report,
+  instead of a 0-byte file that fgbio's `Metric.read` rejects.
+- Every metrics output now writes a `.gz` path gzip-compressed, works with `/dev/stdout`,
+  FIFOs and process substitution (appending, so `--metrics /dev/stdout >> run.log` keeps
+  the log's earlier contents), and writes through a symlinked path. Outputs that went
+  through the shared atomic metrics writer previously wrote plain text under a `.gz`
+  name (unreadable by fgumi's own reader), failed on non-regular files, and replaced
+  symlinks with regular files.
 
 ### Performance
 
