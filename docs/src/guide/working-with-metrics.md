@@ -19,12 +19,15 @@ See the [Metrics Reference](../metrics/index.md) for field-level documentation o
 
 ## File Formats
 
-Most metrics files are tab-separated values (TSV) with a header row. There are two formats:
+Most metrics files are tab-separated values (TSV) with a header row. There are two formats.
+In both, the header row is always written, so a metrics file with nothing to report (for
+example an empty family-size histogram) contains just its header. A metrics path ending in
+`.gz` is written gzip-compressed.
 
 ### Horizontal TSV (Most Commands)
 
 A header row followed by a single data row. Used by `dedup`, `duplex-metrics`,
-`simplex-metrics`, and `group`.
+`simplex-metrics`, `group`, and `filter`.
 
 ```text
 filtered_templates	filtered_low_mapping_quality	…	total_templates	unique_templates	duplicate_templates	duplicate_rate
@@ -66,15 +69,18 @@ duplex_disagreement_rate	0.000500	Rate of top/bottom strand disagreement within 
 `duplex_disagreement_rate` is `duplex_disagreement_base_count / consensus_duplex_bases_emitted`,
 and is 0 when no duplex bases were emitted.
 
-### Filter Stats (Special Case)
+### Filter Stats
 
-The `filter --stats` output uses a two-column key-value format **without a header row**:
+The `filter --stats` output is a standard one-row metrics TSV with a header row:
 
 ```text
-total_reads	10000
-passed_reads	8542
-pass_rate	0.8542
+total_reads	passed_reads	failed_reads	pass_rate
+10000	8542	1458	0.8542
 ```
+
+`pass_rate` is `passed_reads / total_reads`, and is 0 when no reads were examined.
+fgumi 0.7.0 and earlier wrote a headerless two-column key/value layout with `pass_rate`
+rounded to four decimals; parsers of that older format must be updated.
 
 ## Group Metrics
 
@@ -159,8 +165,9 @@ consensus_stats = pd.read_csv("simplex_stats.txt", sep="\t")
 # Access metrics by key:
 # consensus_stats[consensus_stats["key"] == "consensus_reads_emitted"]["value"]
 
-# Read filter stats (no header)
-filter_stats = pd.read_csv("filter_stats.txt", sep="\t", header=None, names=["key", "value"])
+# Read filter stats (one headered row)
+filter_stats = pd.read_csv("filter_stats.txt", sep="\t")
+# filter_stats.loc[0, "pass_rate"]
 ```
 
 ### R
@@ -172,8 +179,9 @@ dedup_metrics <- read.table("dedup_metrics.txt", header=TRUE, sep="\t")
 # Read vertical KV format
 consensus_stats <- read.table("simplex_stats.txt", header=TRUE, sep="\t")
 
-# Read filter stats (no header)
-filter_stats <- read.table("filter_stats.txt", header=FALSE, sep="\t", col.names=c("key", "value"))
+# Read filter stats (one headered row)
+filter_stats <- read.table("filter_stats.txt", header=TRUE, sep="\t")
+# filter_stats$pass_rate
 ```
 
 ## Comparing Metrics

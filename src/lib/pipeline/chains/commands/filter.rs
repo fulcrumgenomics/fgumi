@@ -118,24 +118,18 @@ impl FinalizeHook for FilterStatsFinalizeHook {
 // Shared helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Write filtering statistics to a file.
+/// Write filtering statistics as a one-row fgbio-`Metric` TSV
+/// (`total_reads<TAB>passed_reads<TAB>failed_reads<TAB>pass_rate` + one data row).
 pub(crate) fn write_filter_stats(
     path: &std::path::Path,
     total: u64,
     passed: u64,
     failed: u64,
 ) -> Result<()> {
-    use std::fs::File;
-    use std::io::Write;
+    use crate::metrics::{FilterStatsMetrics, write_metrics_auto};
 
-    let mut file = File::create(path)?;
-    writeln!(file, "total_reads\t{total}")?;
-    writeln!(file, "passed_reads\t{passed}")?;
-    writeln!(file, "failed_reads\t{failed}")?;
-    #[allow(clippy::cast_precision_loss)]
-    let pass_rate = if total > 0 { passed as f64 / total as f64 } else { 0.0 };
-    writeln!(file, "pass_rate\t{pass_rate:.4}")?;
-    Ok(())
+    let metric = FilterStatsMetrics::from_counts(total, passed, failed);
+    write_metrics_auto(path, std::slice::from_ref(&metric))
 }
 
 /// Thin wrapper that calls `Filter::process_record_raw` with captures,
@@ -662,4 +656,29 @@ pub(crate) fn build_filter_step_template_with_rejects(
             ))
         },
     )
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::write_filter_stats;
+
+    #[test]
+    fn write_filter_stats_emits_headered_metric_tsv() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_filter_stats(tmp.path(), 1000, 950, 50).unwrap();
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let mut lines = content.lines();
+        assert_eq!(lines.next().unwrap(), "total_reads\tpassed_reads\tfailed_reads\tpass_rate");
+        assert_eq!(lines.next().unwrap(), "1000\t950\t50\t0.95");
+        assert!(lines.next().is_none(), "expected exactly a header + one data row");
+    }
+
+    #[test]
+    fn write_filter_stats_zero_total_is_zero_pass_rate() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_filter_stats(tmp.path(), 0, 0, 0).unwrap();
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let data = content.lines().nth(1).unwrap();
+        assert_eq!(data, "0\t0\t0\t0");
+    }
 }
