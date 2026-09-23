@@ -381,6 +381,11 @@ fn step2_end_to_end_pipeline_pairs_two_sources_through_runtime() {
             if self.pending_b.is_none() {
                 self.pending_b = ctx.b.pop();
             }
+            // Read the drained state ONCE. A producer can mark its queue drained
+            // between two reads, so a guard that re-read it could see "not
+            // drained" in the `Finished` arm and "drained" in the panic arm, and
+            // panic with nothing buffered.
+            let both_drained = ctx.a.is_drained() && ctx.b.is_drained();
             match (self.pending_a, self.pending_b) {
                 (Some(a), Some(b)) => {
                     self.pending_a = None;
@@ -391,19 +396,13 @@ fn step2_end_to_end_pipeline_pairs_two_sources_through_runtime() {
                     Ok(StepOutcome::Progress)
                 }
                 // Both inputs drained AND nothing buffered: genuinely done.
-                _ if ctx.a.is_drained()
-                    && ctx.b.is_drained()
-                    && self.pending_a.is_none()
-                    && self.pending_b.is_none() =>
-                {
-                    Ok(StepOutcome::Finished)
-                }
+                (None, None) if both_drained => Ok(StepOutcome::Finished),
                 // Both inputs drained but one branch item is still buffered —
                 // the two branches emitted different counts. Reporting
                 // `Finished` here would silently drop that item, exactly the
                 // data loss the `PairSummer` doc warns step authors about, so
                 // fail loudly instead of modelling the bug.
-                _ if ctx.a.is_drained() && ctx.b.is_drained() => {
+                _ if both_drained => {
                     panic!("PairSummer: unpaired item left buffered after both branches drained")
                 }
                 _ => Ok(StepOutcome::NoProgress),
@@ -911,6 +910,9 @@ fn multi_chain2_ordered_pairs_two_byte_bounded_sources() {
             if self.pending_b.is_none() {
                 self.pending_b = ctx.b.pop();
             }
+            // Read once, as in `PairSummer`: re-reading in each guard races the
+            // producers' `mark_drained`.
+            let both_drained = ctx.a.is_drained() && ctx.b.is_drained();
             match (self.pending_a.as_ref(), self.pending_b.as_ref()) {
                 (Some(_), Some(_)) => {
                     let a = self.pending_a.take().unwrap();
@@ -928,17 +930,12 @@ fn multi_chain2_ordered_pairs_two_byte_bounded_sources() {
                         }
                     }
                 }
-                // Same completion guard as `PairSummer`: both inputs drained and
-                // neither branch item buffered. (`held` is always `None` here —
-                // the flush-first block above returns when it is `Some`.)
-                _ if ctx.a.is_drained()
-                    && ctx.b.is_drained()
-                    && self.pending_a.is_none()
-                    && self.pending_b.is_none() =>
-                {
-                    Ok(StepOutcome::Finished)
-                }
-                _ if ctx.a.is_drained() && ctx.b.is_drained() => {
+                // Same completion guard as `PairSummer`, over the same single
+                // drained-state read: both inputs drained and neither branch item
+                // buffered. (`held` is always `None` here — the flush-first block
+                // above returns when it is `Some`.)
+                (None, None) if both_drained => Ok(StepOutcome::Finished),
+                _ if both_drained => {
                     panic!(
                         "OrderedPairSummer: unpaired item left buffered after both branches drained"
                     )
