@@ -10,7 +10,7 @@ use serde::Serialize;
 ///
 /// Each row contains information about the variant site (repeated for each
 /// consensus read) and specific information about that consensus read.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ConsensusVariantReviewInfo {
     // Variant site information (same for all reads at this position)
     /// Chromosome/contig name

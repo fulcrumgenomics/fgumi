@@ -24,6 +24,7 @@ use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use crate::batch_weight::BatchWeight;
 use crate::grouper::{RawPositionGroup, build_templates_from_records};
 use crate::metrics::group::FamilySizeMetrics;
+use crate::metrics::writer::write_metrics;
 use crate::metrics::{DeduplicationCounts, DeduplicationMetrics, DuplicationLadderMetrics};
 use crate::metrics::{TemplateFilterCounts, TemplateFilterReason};
 use crate::read_info::LibraryIndex;
@@ -34,9 +35,8 @@ use crate::template_filter::{
     template_is_fully_unmapped,
 };
 use ahash::AHashMap;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
-use fgoxide::io::DelimFile;
 use fgumi_bam_io::MemoryEstimate;
 use fgumi_umi::IndexThreshold;
 
@@ -1470,10 +1470,7 @@ pub(crate) fn write_dedup_metrics(
     }
     rows.push(total_row);
 
-    DelimFile::default()
-        .write_tsv(path, rows)
-        .with_context(|| format!("Failed to write dedup metrics: {}", path.display()))?;
-    Ok(())
+    write_metrics(path, &rows, "dedup")
 }
 
 pub(crate) fn write_family_size_histogram(
@@ -1481,10 +1478,7 @@ pub(crate) fn write_family_size_histogram(
     path: &PathBuf,
 ) -> Result<()> {
     let metrics = FamilySizeMetrics::from_size_counts(family_sizes.iter().map(|(&s, &c)| (s, c)));
-    DelimFile::default()
-        .write_tsv(path, metrics)
-        .with_context(|| format!("Failed to write family size histogram: {}", path.display()))?;
-    Ok(())
+    write_metrics(path, &metrics, "family size histogram")
 }
 
 /// Log the "Filtered out N templates before marking" diagnostic, if any were
@@ -1530,10 +1524,7 @@ pub(crate) fn write_duplication_ladder(
         .collect();
     rows.sort_by(|a, b| a.library.cmp(&b.library).then(a.templates_seen.cmp(&b.templates_seen)));
 
-    DelimFile::default()
-        .write_tsv(path, rows)
-        .with_context(|| format!("Failed to write duplication ladder: {}", path.display()))?;
-    Ok(())
+    write_metrics(path, &rows, "duplication ladder")
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -3093,6 +3084,35 @@ mod tests {
         let row: Vec<&str> = text.lines().nth(1).expect("data row").split('\t').collect();
         let index = header.iter().position(|&c| c == "duplicate_rate").expect("column");
         assert_eq!(row.get(index).copied(), Some("1"));
+        Ok(())
+    }
+
+    /// An empty `--family-size-histogram` must still carry its header row: a 0-byte
+    /// file is rejected by fgbio's `Metric.read` ("No header found") and by any
+    /// header-keyed parser.
+    #[test]
+    fn test_family_size_histogram_empty_is_header_only() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("dedup.family_sizes.txt");
+        write_family_size_histogram(&AHashMap::new(), &path)?;
+        let text = std::fs::read_to_string(&path)?;
+        assert_eq!(text, "family_size\tcount\tfraction\tfraction_gt_or_eq_family_size\n");
+        Ok(())
+    }
+
+    /// An empty `--duplication-ladder` (no snapshots recorded) must still carry its
+    /// header row, for the same reason as the family-size histogram.
+    #[test]
+    fn test_duplication_ladder_empty_is_header_only() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("dedup.ladder.txt");
+        let recorder = DuplicationLadderRecorder::new(1000);
+        write_duplication_ladder(&recorder, &LibraryIndex::default(), &path)?;
+        let text = std::fs::read_to_string(&path)?;
+        assert_eq!(
+            text,
+            "library\ttemplates_seen\tduplicate_fraction\twindow_templates\twindow_duplicate_fraction\n"
+        );
         Ok(())
     }
 
