@@ -570,3 +570,36 @@ mod tests {
         assert_eq!(folded.family_size_metrics(), expected.family_size_metrics());
     }
 }
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+    use crate::writer::assert_roundtrip_stable;
+
+    #[test]
+    fn simplex_family_size_metric_round_trips() {
+        assert_roundtrip_stable(&[SimplexFamilySizeMetric {
+            family_size: 3,
+            cs_count: 5,
+            cs_fraction: 1.0 / 3.0,
+            cs_fraction_gt_or_eq_size: 0.75,
+            ss_count: 2,
+            ss_fraction: f64::NAN,
+            ss_fraction_gt_or_eq_size: 1.0,
+        }]);
+    }
+
+    #[test]
+    fn simplex_yield_metric_round_trips() {
+        assert_roundtrip_stable(&[SimplexYieldMetric {
+            fraction: 0.25,
+            read_pairs: 1000,
+            cs_families: 400,
+            ss_families: 300,
+            mean_ss_family_size: 10.0 / 3.0,
+            ss_singletons: 12,
+            ss_singleton_fraction: f64::INFINITY,
+            ss_consensus_families: 250,
+        }]);
+    }
+}

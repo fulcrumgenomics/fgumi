@@ -153,6 +153,33 @@ pub fn read_metrics_auto<P: AsRef<Path>, T: Metric>(path: P) -> Result<Vec<T>> {
     read_metrics(path, T::metric_name())
 }
 
+/// Test-only guard: writing `rows`, reading them back, and writing them again
+/// must produce byte-identical output, so every value survives a trip through the
+/// metrics TSV reader (a field the reader drops, zeroes or truncates re-serializes
+/// differently). No `PartialEq` is needed on the struct.
+///
+/// Pass rows with non-default values (non-zero counts, fractional and non-finite
+/// floats, `Some` options): an all-default row can only prove that zeros survive.
+/// This does not check which *tokens* are written (e.g. `Infinity` vs `inf`); the
+/// workspace float-encoding contract test guards that.
+#[cfg(test)]
+pub(crate) fn assert_roundtrip_stable<T: Metric>(rows: &[T]) {
+    use tempfile::NamedTempFile;
+
+    let first = NamedTempFile::new().expect("temp file");
+    write_metrics_auto(first.path(), rows).expect("write first");
+    let back: Vec<T> = read_metrics_auto(first.path()).expect("read back");
+    let second = NamedTempFile::new().expect("temp file");
+    write_metrics_auto(second.path(), &back).expect("write second");
+
+    assert_eq!(
+        std::fs::read_to_string(first.path()).expect("read first"),
+        std::fs::read_to_string(second.path()).expect("read second"),
+        "round-trip not stable for metric {}",
+        T::metric_name(),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

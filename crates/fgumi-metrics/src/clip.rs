@@ -729,3 +729,63 @@ mod tests {
         assert_eq!(ClippingMetrics::metric_name(), "clipping");
     }
 }
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+    use crate::writer::{assert_roundtrip_stable, read_metrics_auto, write_metrics_auto};
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn clipping_metrics_round_trips_all_read_types_in_order() {
+        // Every count column gets a distinct non-zero value (offset per row), so a dropped
+        // or zeroed column re-serializes differently.
+        let rows: Vec<ClippingMetrics> = [
+            ReadType::Fragment,
+            ReadType::ReadOne,
+            ReadType::ReadTwo,
+            ReadType::Pair,
+            ReadType::All,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, read_type)| {
+            let base = 100 * (i + 1);
+            ClippingMetrics {
+                read_type,
+                reads: base + 1,
+                reads_unmapped: base + 2,
+                reads_clipped_pre: base + 3,
+                reads_clipped_post: base + 4,
+                reads_clipped_five_prime: base + 5,
+                reads_clipped_three_prime: base + 6,
+                reads_clipped_overlapping: base + 7,
+                reads_clipped_extending: base + 8,
+                bases: base + 9,
+                bases_clipped_pre: base + 10,
+                bases_clipped_post: base + 11,
+                bases_clipped_five_prime: base + 12,
+                bases_clipped_three_prime: base + 13,
+                bases_clipped_overlapping: base + 14,
+                bases_clipped_extending: base + 15,
+            }
+        })
+        .collect();
+        assert_roundtrip_stable(&rows);
+
+        let tmp = NamedTempFile::new().unwrap();
+        write_metrics_auto(tmp.path(), &rows).unwrap();
+        let back: Vec<ClippingMetrics> = read_metrics_auto(tmp.path()).unwrap();
+        let read_types: Vec<ReadType> = back.iter().map(|m| m.read_type).collect();
+        assert_eq!(
+            read_types,
+            vec![
+                ReadType::Fragment,
+                ReadType::ReadOne,
+                ReadType::ReadTwo,
+                ReadType::Pair,
+                ReadType::All
+            ]
+        );
+    }
+}
