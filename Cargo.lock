@@ -878,9 +878,11 @@ name = "fgumi-metrics"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "csv",
  "fgoxide",
  "fgumi-raw-bam",
  "fgumi-sam",
+ "flate2",
  "noodles",
  "proptest",
  "rstest",

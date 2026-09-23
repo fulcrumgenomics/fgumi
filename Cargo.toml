@@ -54,6 +54,7 @@ criterion = { version = "0.8", features = ["html_reports"] }
 crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
 crossbeam-utils = "0.8.21"
+csv = "1.1"
 fgoxide = "0.6.0"
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 libdeflater = "1.22"
@@ -146,7 +147,7 @@ serde = { workspace = true }
 itertools = "0.14.0"
 indexmap = "2"
 rand = { workspace = true }
-csv = "1.1"
+csv = { workspace = true }
 memchr = { workspace = true }
 statrs = { workspace = true }
 bytesize = { workspace = true }
