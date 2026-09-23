@@ -14,6 +14,7 @@ pub mod consensus;
 pub mod correct;
 pub mod dedup;
 pub mod duplex;
+pub mod filter_stats;
 pub mod float;
 pub mod group;
 pub mod library_size;
@@ -106,6 +107,7 @@ pub use duplex::{
     DuplexFamilySizeMetric, DuplexMetricsCollector, DuplexUmiMetric, DuplexYieldMetric,
     FamilySizeMetric,
 };
+pub use filter_stats::FilterStatsMetrics;
 pub use group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
 pub use rejection::{RejectionReason, format_count};
 pub use shared::UmiMetric;
