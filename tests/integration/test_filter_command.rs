@@ -9,6 +9,8 @@ use clap::Parser;
 use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::filter::Filter;
 use fgumi_lib::sam::SamTag;
+use fgumi_metrics::filter_stats::FilterStatsMetrics;
+use fgumi_metrics::writer::read_metrics_auto;
 use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -1050,11 +1052,10 @@ fn test_filter_chain_stats_file_matches_single_worker() {
     assert!(single_worker_content.contains("total_reads"), "stats should contain total_reads");
     // Non-vacuous: the stats must record that filtering actually rejected reads,
     // or a pass-through regression on both paths would still byte-match.
-    let failed = single_worker_content
-        .lines()
-        .find_map(|l| l.strip_prefix("failed_reads\t"))
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .expect("stats file must report failed_reads");
+    let stats: Vec<FilterStatsMetrics> = read_metrics_auto(&single_worker_stats)
+        .expect("stats file must parse as FilterStatsMetrics");
+    assert_eq!(stats.len(), 1, "stats must hold exactly one row:\n{single_worker_content}");
+    let failed = stats[0].failed_reads;
     assert!(failed > 0, "filtering must reject at least one read; stats:\n{single_worker_content}");
     assert_eq!(
         single_worker_content, chain_content,

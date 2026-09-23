@@ -6,6 +6,7 @@
 //! - [`consensus`] - Consensus calling metrics (shared by simplex/duplex/codec)
 //! - [`duplex`] - Duplex sequencing QC metrics
 //! - [`correct`] - UMI correction metrics
+//! - [`filter_stats`] - Consensus-read filter pass/fail statistics
 //! - [`writer`] - Metrics file I/O utilities
 //!
 //! # Traits
@@ -22,6 +23,7 @@ pub use fgumi_metrics::consensus;
 pub use fgumi_metrics::correct;
 pub use fgumi_metrics::dedup;
 pub use fgumi_metrics::duplex;
+pub use fgumi_metrics::filter_stats;
 pub use fgumi_metrics::group;
 pub use fgumi_metrics::shared;
 pub use fgumi_metrics::simplex;
@@ -37,6 +39,7 @@ pub use duplex::{
     DuplexFamilySizeMetric, DuplexMetricsCollector, DuplexUmiMetric, DuplexYieldMetric,
     FamilySizeMetric,
 };
+pub use filter_stats::FilterStatsMetrics;
 pub use group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
 pub use shared::UmiMetric;
 pub use template_filter::{TemplateFilterCounts, TemplateFilterReason};

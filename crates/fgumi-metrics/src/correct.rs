@@ -219,3 +219,38 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+    use crate::writer::{assert_roundtrip_stable, read_metrics_auto, write_metrics_auto};
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn umi_correction_metrics_round_trips() {
+        // Distinct non-zero counts and fractional floats, so a dropped or zeroed column
+        // re-serializes differently.
+        assert_roundtrip_stable(&[UmiCorrectionMetrics {
+            umi: "ACGT".to_string(),
+            total_matches: 15,
+            perfect_matches: 8,
+            one_mismatch_matches: 4,
+            two_mismatch_matches: 2,
+            other_matches: 1,
+            fraction_of_matches: 1.0 / 3.0,
+            representation: 2.0 / 7.0,
+        }]);
+    }
+
+    #[test]
+    fn umi_correction_metrics_round_trips_non_finite_floats() {
+        let mut m = UmiCorrectionMetrics::new("ACGT".to_string());
+        m.representation = f64::INFINITY;
+        m.fraction_of_matches = f64::NAN;
+        let tmp = NamedTempFile::new().unwrap();
+        write_metrics_auto(tmp.path(), std::slice::from_ref(&m)).unwrap();
+        let back: Vec<UmiCorrectionMetrics> = read_metrics_auto(tmp.path()).unwrap();
+        assert!(back[0].representation.is_infinite() && back[0].representation > 0.0);
+        assert!(back[0].fraction_of_matches.is_nan());
+    }
+}

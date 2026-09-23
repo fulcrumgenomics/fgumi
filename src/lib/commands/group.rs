@@ -14,9 +14,8 @@ use crate::umi::parallel_assigner::{
     ParallelPairedAssigner,
 };
 use ahash::AHashMap;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
-use fgoxide::io::DelimFile;
 use fgumi_umi::IndexThreshold;
 use log::{info, warn};
 use std::path::{Path, PathBuf};
@@ -983,15 +982,14 @@ impl GroupReadsByUmi {
     }
 }
 
-/// Write metrics to a TSV file and log the output path.
-fn write_metrics<S: serde::Serialize>(
+/// Write metrics to a TSV file via the shared metrics writer (header always written,
+/// atomic, compression by extension) and log the output path.
+fn write_metrics<S: serde::Serialize + Default>(
     path: &Path,
-    data: impl IntoIterator<Item = S>,
+    data: &[S],
     label: &str,
 ) -> Result<()> {
-    DelimFile::default()
-        .write_tsv(path, data)
-        .with_context(|| format!("Failed to write {label}: {}", path.display()))?;
+    crate::metrics::writer::write_metrics(path, data, label)?;
     info!("Wrote {label} to {}", path.display());
     Ok(())
 }
@@ -1063,6 +1061,36 @@ mod tests {
     // chain builder (`pipeline::chains::commands::group`) imports these itself.
     use crate::sam::SamTag;
     use crate::template_filter::{TemplateFilterConfig, filter_template};
+    use fgoxide::io::DelimFile;
+
+    /// With nothing grouped, both histograms (via the individual flag and the `--metrics`
+    /// prefix) must still carry their header row: a 0-byte file is rejected by fgbio's
+    /// `Metric.read` ("No header found") and by any header-keyed parser.
+    #[test]
+    fn test_write_metrics_for_chain_empty_histograms_are_header_only() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("out");
+        let histogram = dir.path().join("hist.txt");
+        write_metrics_for_chain(
+            &crate::metrics::group::UmiGroupingMetrics::default(),
+            &AHashMap::new(),
+            &AHashMap::new(),
+            Some(&histogram),
+            None,
+            Some(&prefix),
+        )?;
+        let family_header = "family_size\tcount\tfraction\tfraction_gt_or_eq_family_size\n";
+        let position_header =
+            "position_group_size\tcount\tfraction\tfraction_gt_or_eq_position_group_size\n";
+        for (path, header) in [
+            (histogram, family_header),
+            (with_extension(&prefix, "family_sizes.txt"), family_header),
+            (with_extension(&prefix, "position_group_sizes.txt"), position_header),
+        ] {
+            assert_eq!(std::fs::read_to_string(&path)?, header, "{}", path.display());
+        }
+        Ok(())
+    }
 
     /// The `--no-umi` and identity-implies-zero-edits rules, pinned as a table.
     ///

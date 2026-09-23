@@ -273,3 +273,21 @@ mod tests {
         assert!(metrics.is_empty());
     }
 }
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+    use crate::writer::assert_roundtrip_stable;
+
+    #[test]
+    fn umi_metric_round_trips() {
+        assert_roundtrip_stable(&[UmiMetric {
+            umi: "ACGT".to_string(),
+            raw_observations: 17,
+            raw_observations_with_errors: 2,
+            unique_observations: 5,
+            fraction_raw_observations: 1.0 / 3.0,
+            fraction_unique_observations: f64::NAN,
+        }]);
+    }
+}

@@ -1314,3 +1314,63 @@ mod tests {
         assert_eq!(got, expected);
     }
 }
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+    use crate::writer::assert_roundtrip_stable;
+
+    #[test]
+    fn family_size_metric_round_trips() {
+        assert_roundtrip_stable(&[FamilySizeMetric {
+            family_size: 4,
+            cs_count: 6,
+            cs_fraction: 1.0 / 3.0,
+            cs_fraction_gt_or_eq_size: 0.5,
+            ss_count: 3,
+            ss_fraction: 0.125,
+            ss_fraction_gt_or_eq_size: f64::NAN,
+            ds_count: 2,
+            ds_fraction: 2.0 / 7.0,
+            ds_fraction_gt_or_eq_size: 1.0,
+        }]);
+    }
+
+    #[test]
+    fn duplex_family_size_metric_round_trips() {
+        assert_roundtrip_stable(&[DuplexFamilySizeMetric {
+            ab_size: 3,
+            ba_size: 2,
+            count: 9,
+            fraction: 1.0 / 3.0,
+            fraction_gt_or_eq_size: f64::INFINITY,
+        }]);
+    }
+
+    #[test]
+    fn duplex_yield_metric_round_trips() {
+        assert_roundtrip_stable(&[DuplexYieldMetric {
+            fraction: 0.5,
+            read_pairs: 2000,
+            cs_families: 800,
+            ss_families: 700,
+            ds_families: 300,
+            ds_duplexes: 120,
+            ds_fraction_duplexes: 0.4,
+            ds_fraction_duplexes_ideal: f64::NAN,
+        }]);
+    }
+
+    #[test]
+    fn duplex_umi_metric_round_trips() {
+        assert_roundtrip_stable(&[DuplexUmiMetric {
+            umi: "ACGT-TTGA".to_string(),
+            raw_observations: 17,
+            raw_observations_with_errors: 2,
+            unique_observations: 5,
+            fraction_raw_observations: 1.0 / 3.0,
+            fraction_unique_observations: 0.2,
+            fraction_unique_observations_expected: f64::INFINITY,
+        }]);
+    }
+}

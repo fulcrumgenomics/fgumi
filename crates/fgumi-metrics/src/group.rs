@@ -472,3 +472,36 @@ mod tests {
         assert!(metrics.is_empty());
     }
 }
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+    use crate::writer::assert_roundtrip_stable;
+
+    #[test]
+    fn umi_grouping_metrics_round_trips() {
+        assert_roundtrip_stable(&[UmiGroupingMetrics {
+            accepted_records: 90,
+            discarded_non_pf: 1,
+            discarded_poor_alignment: 2,
+            discarded_ns_in_umi: 3,
+            discarded_umi_too_short: 4,
+            ..UmiGroupingMetrics::default()
+        }]);
+    }
+
+    #[test]
+    fn family_size_metrics_round_trips() {
+        assert_roundtrip_stable(&FamilySizeMetrics::from_size_counts([(1usize, 10u64), (3, 5)]));
+    }
+
+    #[test]
+    fn position_group_size_metrics_round_trips() {
+        assert_roundtrip_stable(&[PositionGroupSizeMetrics {
+            position_group_size: 3,
+            count: 7,
+            fraction: 1.0 / 3.0,
+            fraction_gt_or_eq_position_group_size: f64::INFINITY,
+        }]);
+    }
+}

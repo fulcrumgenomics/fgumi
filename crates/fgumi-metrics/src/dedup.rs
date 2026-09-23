@@ -690,3 +690,43 @@ mod tests {
         assert!(empty.window_duplicate_fraction.abs() < 1e-9);
     }
 }
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+    use crate::writer::assert_roundtrip_stable;
+
+    #[test]
+    fn deduplication_metrics_round_trips_multi_row() {
+        let library = DeduplicationMetrics {
+            sample: "sample".to_string(),
+            library: "lib1".to_string(),
+            total_templates: 30,
+            unique_templates: 20,
+            duplicate_templates: 10,
+            duplicate_rate: 1.0 / 3.0,
+            total_reads: 60,
+            percent_duplication: f64::NAN,
+            estimated_library_size: Some(1234),
+            ..DeduplicationMetrics::default()
+        };
+        let all = DeduplicationMetrics {
+            library: "All Reads".to_string(),
+            estimated_library_size: None,
+            duplicate_rate: 0.5,
+            ..library.clone()
+        };
+        assert_roundtrip_stable(&[library, all]);
+    }
+
+    #[test]
+    fn duplication_ladder_metrics_round_trips() {
+        assert_roundtrip_stable(&[DuplicationLadderMetrics {
+            library: "lib1".to_string(),
+            templates_seen: 1000,
+            duplicate_fraction: 1.0 / 3.0,
+            window_templates: 100,
+            window_duplicate_fraction: f64::INFINITY,
+        }]);
+    }
+}

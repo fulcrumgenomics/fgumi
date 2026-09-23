@@ -1072,3 +1072,33 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+    use fgoxide::io::DelimFile;
+    use tempfile::NamedTempFile;
+
+    // `ConsensusKvMetric` is written directly via `DelimFile` (not `write_metrics_auto`)
+    // and is always emitted non-empty, so it does not implement `Metric`/`Default`.
+    // The round-trip guard therefore uses `DelimFile` directly and checks
+    // write -> read -> write byte-idempotency.
+    #[test]
+    fn consensus_kv_metric_round_trips() {
+        let rows = vec![
+            ConsensusKvMetric::new("consensus_reads_emitted", "42".to_string(), "reads emitted"),
+            ConsensusKvMetric::new("raw_reads", "100".to_string(), "raw reads seen"),
+        ];
+        let first = NamedTempFile::new().unwrap();
+        DelimFile::default().write_tsv(first.path(), &rows).unwrap();
+        let back: Vec<ConsensusKvMetric> = DelimFile::default().read_tsv(first.path()).unwrap();
+        let second = NamedTempFile::new().unwrap();
+        DelimFile::default().write_tsv(second.path(), &back).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(first.path()).unwrap(),
+            std::fs::read_to_string(second.path()).unwrap(),
+        );
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].key, "consensus_reads_emitted");
+    }
+}

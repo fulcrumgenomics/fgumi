@@ -5,6 +5,7 @@
 //! BAM files and a detailed TSV report.
 
 use crate::logging::OperationTimer;
+use crate::metrics::write_metrics;
 use crate::reference::find_dict_path;
 use crate::sam::SamTag;
 use crate::umi::extract_mi_base;
@@ -139,9 +140,6 @@ MAF gating) are matched exactly.
 - **CLI / output surface (REV3-12):** the N-ignoring flag is `--ignore-ns` (`-N`)
   rather than fgbio's `--ignore-ns-in-consensus-reads`; fgumi always writes
   `.bam.bai` sidecars for the output BAMs.
-- **Empty result output (REV3-15):** when every variant is filtered out, fgumi
-  writes an empty `<output>.txt` while fgbio writes a header-only file. This
-  matches fgumi's metrics-writer behavior across all commands.
 "#
 )]
 pub struct Review {
@@ -1144,14 +1142,9 @@ impl Review {
             all_metrics.extend(variant_rows.into_iter().map(|(_, info)| info));
         }
 
-        // Write TSV
-        let mut writer = csv::WriterBuilder::new().delimiter(b'\t').from_path(&review_path)?;
-
-        for metric in all_metrics {
-            writer.serialize(&metric)?;
-        }
-
-        writer.flush()?;
+        // The shared metrics writer replaces the file atomically and writes a header-only
+        // file when every variant was filtered out, as fgbio does.
+        write_metrics(&review_path, &all_metrics, "review")?;
         info!("Wrote review metrics to {}", review_path.display());
         Ok(())
     }
@@ -2058,7 +2051,9 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
 
         assert!(con_out.exists());
         assert!(raw_out.exists());
-        assert!(txt_out.exists());
+        // Header-only, like every other metrics output (and fgbio), not a 0-byte file.
+        let txt = std::fs::read_to_string(&txt_out).expect("failed to read review txt");
+        assert_eq!(txt, format!("{}\n", ConsensusVariantReviewInfo::tsv_header()));
 
         // Verify BAMs are empty
         let mut con_reader = bam::io::indexed_reader::Builder::default()
@@ -2112,9 +2107,12 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
         // Verify output files exist and are empty
         let con_out = output_path.with_extension("consensus.bam");
         let raw_out = output_path.with_extension("grouped.bam");
+        let txt_out = output_path.with_extension("txt");
 
         assert!(con_out.exists());
         assert!(raw_out.exists());
+        let txt = std::fs::read_to_string(&txt_out).expect("failed to read review txt");
+        assert_eq!(txt, format!("{}\n", ConsensusVariantReviewInfo::tsv_header()));
 
         // Verify BAMs are empty
         let mut con_reader = bam::io::indexed_reader::Builder::default()
@@ -2889,14 +2887,8 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:99,1\n",
 chr1\t10\t.\tA\tAT\t.\tPASS\t.\n",
         );
         let (out, rows) = run_review_over_test_bams(&temp_dir, vcf, None, 0.05);
-        // The insertion is dropped, so there are no data rows. fgumi writes an empty
-        // file when there is nothing to report (REV3-15), so accept 0 lines (empty)
-        // or 1 line (header only) — the key signal is the empty `.consensus.bam`.
-        assert!(
-            rows.len() <= 1,
-            "insertion-only input must yield no data rows, got {}",
-            rows.len()
-        );
+        // The insertion is dropped, so the review file is header-only (no data rows).
+        assert_eq!(rows.len(), 1, "insertion-only input must yield only the header: {rows:?}");
         let names = test_utils::consensus_bam_read_names(&out.with_extension("consensus.bam"));
         assert!(
             names.is_empty(),

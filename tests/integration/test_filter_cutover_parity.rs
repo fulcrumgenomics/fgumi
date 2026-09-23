@@ -16,8 +16,10 @@
 //! 2. **Output parity with the pre-removal serial path**
 //!    (`cutover_matches_baseline`). The current build's `filter` output — kept
 //!    records and (when written) the rejects BAM (both byte-identical modulo the
-//!    `@PG` line) and the `--stats` TSV — must match the frozen owned-serial
-//!    baseline binary. The baseline path comes from `FGUMI_BASELINE_BIN`; when it
+//!    `@PG` line) and the `--stats` counts — must match the frozen owned-serial
+//!    baseline binary. `--stats` is compared by value, not byte-for-byte, because
+//!    its layout changed intentionally after 0.7.0 (headerless key/value rows to a
+//!    headered one-row TSV) and a pre-change baseline writes the old layout. The baseline path comes from `FGUMI_BASELINE_BIN`; when it
 //!    is unset (or names a missing file) the case degrades to a self-consistency
 //!    oracle (min-reads filtering, base masking, and NM regeneration asserted
 //!    directly) rather than skipping — the exact fallback discipline of
@@ -44,6 +46,8 @@ use tempfile::TempDir;
 use crate::helpers::bam_generator::{create_minimal_header, create_test_reference, write_bam};
 use crate::helpers::read_bam_output;
 use fgumi_lib::sam::SamTag;
+use fgumi_metrics::filter_stats::FilterStatsMetrics;
+use fgumi_metrics::writer::read_metrics_auto;
 
 /// Resolves the saved pre-removal serial baseline binary to compare against.
 ///
@@ -270,8 +274,8 @@ fn filter_no_threads_routes_through_chain() {
 
 /// Output parity of the post-cutover chain against the pre-removal serial
 /// baseline binary, across `filter-by-template` modes and the `--rejects` /
-/// `--stats` outputs — plus the always-available self-consistency oracle when no
-/// baseline is set.
+/// `--stats` outputs (`--stats` by value, since its layout changed after 0.7.0) —
+/// plus the always-available self-consistency oracle when no baseline is set.
 ///
 /// `#[case]` args: a label, `filter_by_template`, `with_rejects`, `with_stats`.
 #[rstest]
@@ -344,10 +348,21 @@ fn cutover_matches_baseline(
             );
         }
         if with_stats {
+            // The `--stats` layout changed intentionally (headerless key/value rows ->
+            // headered one-row TSV), so a pre-change baseline cannot match byte-for-byte.
+            // Compare the counts exactly and `pass_rate` within the old 4-decimal rounding.
+            let current = parse_filter_stats(&current_stats);
+            let baseline = parse_filter_stats(&baseline_stats);
             assert_eq!(
-                std::fs::read_to_string(&current_stats).expect("current stats"),
-                std::fs::read_to_string(&baseline_stats).expect("baseline stats"),
-                "chain --stats TSV diverges from the serial baseline binary"
+                (current.total_reads, current.passed_reads, current.failed_reads),
+                (baseline.total_reads, baseline.passed_reads, baseline.failed_reads),
+                "chain --stats counts diverge from the serial baseline binary"
+            );
+            assert!(
+                (current.pass_rate - baseline.pass_rate).abs() <= 5e-5,
+                "chain --stats pass_rate {} diverges from the baseline's {}",
+                current.pass_rate,
+                baseline.pass_rate
             );
         }
     } else {
@@ -444,37 +459,60 @@ fn assert_self_consistent(
     }
 
     if let Some(stats_path) = stats {
+        // Read the one-row `FilterStatsMetrics` TSV back through the metrics reader and
+        // compare each count exactly (a substring match would accept `60` for `6`).
         let tsv = std::fs::read_to_string(stats_path).expect("read stats");
-        // Parse the `key<TAB>value` rows and compare each field's value *exactly*.
-        // A substring match (`contains("total_reads\t6")`) would also accept a
-        // wrong `total_reads\t60`, so the count must be pinned to the precise
-        // value, not merely a prefix of it.
-        let fields = parse_stats_fields(&tsv);
-        for (name, expected) in
-            [("total_reads", total), ("passed_reads", passed), ("failed_reads", failed)]
-        {
-            let value = fields
-                .get(name)
-                .unwrap_or_else(|| panic!("stats missing `{name}` row; got:\n{tsv}"));
-            assert_eq!(value, &expected.to_string(), "stats `{name}` value mismatch; got:\n{tsv}");
+        let rows: Vec<FilterStatsMetrics> = read_metrics_auto(stats_path)
+            .unwrap_or_else(|e| panic!("parse stats: {e}; got:\n{tsv}"));
+        assert_eq!(rows.len(), 1, "stats must hold exactly one row; got:\n{tsv}");
+        let stats = &rows[0];
+        for (name, actual, expected) in [
+            ("total_reads", stats.total_reads, total as u64),
+            ("passed_reads", stats.passed_reads, passed as u64),
+            ("failed_reads", stats.failed_reads, failed as u64),
+        ] {
+            assert_eq!(actual, expected, "stats `{name}` value mismatch; got:\n{tsv}");
         }
     }
 }
 
-/// Parse a `key<TAB>value` stats TSV (as written by `filter --stats`) into a map
-/// of field name to its raw value string, so each field can be compared exactly
-/// rather than by substring. A non-empty row without a tab is malformed and fails
-/// loudly with the offending line.
-fn parse_stats_fields(tsv: &str) -> std::collections::HashMap<String, String> {
-    tsv.lines()
+/// Parses a `filter --stats` file in either layout: the current headered one-row
+/// `FilterStatsMetrics` TSV, or the legacy headerless `key<TAB>value` rows written by
+/// fgumi 0.7.0 and earlier (which a pre-change `FGUMI_BASELINE_BIN` still emits).
+/// Panics with the file content on a missing key or unparseable value.
+fn parse_filter_stats(path: &Path) -> FilterStatsMetrics {
+    let tsv = std::fs::read_to_string(path).expect("read stats");
+    if tsv.starts_with("total_reads\tpassed_reads") {
+        let rows: Vec<FilterStatsMetrics> =
+            read_metrics_auto(path).unwrap_or_else(|e| panic!("parse stats: {e}; got:\n{tsv}"));
+        assert_eq!(rows.len(), 1, "stats must hold exactly one row; got:\n{tsv}");
+        return rows[0].clone();
+    }
+    let fields: std::collections::HashMap<&str, &str> = tsv
+        .lines()
         .filter(|line| !line.is_empty())
         .map(|line| {
-            line.split_once('\t').map_or_else(
-                || panic!("malformed stats row (no tab): {line:?}"),
-                |(key, value)| (key.to_string(), value.to_string()),
-            )
+            line.split_once('\t')
+                .unwrap_or_else(|| panic!("malformed legacy stats row (no tab): {line:?}"))
         })
-        .collect()
+        .collect();
+    let field = |key: &str| -> &str {
+        fields
+            .get(key)
+            .copied()
+            .unwrap_or_else(|| panic!("legacy stats missing `{key}`; got:\n{tsv}"))
+    };
+    let count = |key: &str| -> u64 {
+        field(key).parse().unwrap_or_else(|e| panic!("legacy stats `{key}`: {e}; got:\n{tsv}"))
+    };
+    FilterStatsMetrics {
+        total_reads: count("total_reads"),
+        passed_reads: count("passed_reads"),
+        failed_reads: count("failed_reads"),
+        pass_rate: field("pass_rate")
+            .parse()
+            .unwrap_or_else(|e| panic!("legacy stats `pass_rate`: {e}; got:\n{tsv}")),
+    }
 }
 
 /// The read name of a parsed `RecordBuf`.
