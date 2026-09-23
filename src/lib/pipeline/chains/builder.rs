@@ -6027,7 +6027,7 @@ impl<'a> ChainBuilder<'a> {
             dedup.include_unmapped,
             accumulators_for_process,
         );
-        // Duplication-saturation ladder recorder (`--duplication-ladder`).
+        // Duplication ladder recorder (`--duplication-ladder`).
         // `Some` only when the flag is set; shared (via `Arc`) between the serial
         // MI-assign step, which accumulates it in coordinate order, and the
         // finalize hook, which writes it. `None` means the MI-assign step does

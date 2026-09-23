@@ -256,7 +256,7 @@ pub(crate) struct CollectedDedupCounts {
 }
 
 //////////////////////////////////////////////////////////////////////////////
-// Duplication saturation ladder (--duplication-ladder)
+// Duplication ladder (--duplication-ladder)
 //////////////////////////////////////////////////////////////////////////////
 
 /// Per-library cumulative counters and emitted snapshot rows backing
@@ -264,8 +264,8 @@ pub(crate) struct CollectedDedupCounts {
 ///
 /// # Ordering
 ///
-/// A saturation curve plots "after N templates processed, in coordinate
-/// order, what cumulative fraction were duplicates" — so [`Self::record`]
+/// The ladder records "after N templates processed, in coordinate order, what
+/// cumulative fraction were duplicates" — so [`Self::record`]
 /// MUST be called in strict serial/coordinate order, one call per position
 /// group. It is wired into the chain's `MiAssignDedup` step (see
 /// `pipeline::chains::commands::dedup::build_mi_assign_step`), which the
@@ -291,7 +291,7 @@ pub(crate) struct DuplicationLadderRecorder {
     rows: Vec<(u16, u64, u64, u64, u64)>,
 }
 
-/// Running cumulative state for one library's saturation ladder.
+/// Running cumulative state for one library's duplication ladder.
 #[derive(Default)]
 struct LadderLibraryState {
     /// Cumulative templates seen so far for this library.
@@ -1221,10 +1221,12 @@ pub struct MarkDuplicates {
     #[arg(short = 'H', long = "family-size-histogram")]
     pub family_size_histogram: Option<PathBuf>,
 
-    /// Path to write the sampled duplication saturation ladder: per-library
-    /// cumulative duplicate fraction vs. templates seen (in coordinate
-    /// order), snapshotted every `--ladder-interval` templates. Off by
-    /// default (no recorder is built, so no added work).
+    /// Path to write the sampled duplication ladder: per-library cumulative
+    /// duplicate fraction vs. templates seen (in coordinate order),
+    /// snapshotted every `--ladder-interval` templates. Because templates are
+    /// counted in coordinate order, this shows how the duplicate rate varies
+    /// along the genome; it is not a saturation curve. Off by default (no
+    /// recorder is built, so no added work).
     #[arg(long = "duplication-ladder")]
     pub duplication_ladder: Option<PathBuf>,
 
