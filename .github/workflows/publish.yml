@@ -41,7 +41,80 @@ jobs:
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Detect release
+        id: release
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          # Publish only when this push is a release: the merge of a release-plz
+          # release PR, which bumps the lockstep workspace version. Every other
+          # push to main carries the already-released version with unreleased
+          # code, and must not publish anything -- a crate added since the last
+          # release waits for the next one, when it goes out with everything
+          # else.
+          #
+          # Compare against the pre-push commit (`github.event.before`), not
+          # HEAD^, so a push of several commits is judged as a whole. Re-running
+          # a failed release run reuses the same event, so a partial publish can
+          # still be resumed.
+          root_version() {
+            git show "$1:Cargo.toml" | sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p'
+          }
+          NEW_VERSION=$(root_version HEAD)
+          if [ -z "$NEW_VERSION" ]; then
+            echo "ERROR: could not read [workspace.package] version from Cargo.toml at HEAD."
+            exit 1
+          fi
+          OLD_VERSION=$(root_version "$BEFORE_SHA" 2>/dev/null || true)
+          if [ -z "$OLD_VERSION" ]; then
+            # The pre-push commit is unreadable (e.g. a force-push). Err toward
+            # not publishing: a missed release can be redone, an upload cannot.
+            echo "::warning::could not read the version at $BEFORE_SHA; not publishing"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Workspace version: $OLD_VERSION -> $NEW_VERSION"
+          # Require an increase, not just a change: a push that reverts the
+          # version (e.g. 0.8.0 -> 0.7.0) would otherwise publish any crate
+          # added since the old release at that old version. Compare by SemVer
+          # precedence, as Cargo does -- `sort -V` ranks 0.8.0-rc.1 above 0.8.0
+          # and would skip the final release. An unparseable version fails the
+          # step rather than guessing.
+          ORDER=$(python3 - "$OLD_VERSION" "$NEW_VERSION" <<'EOF'
+          import sys
+
+          def precedence(version):
+              # Build metadata (+...) does not affect precedence.
+              core, _, pre = version.split("+", 1)[0].partition("-")
+              nums = tuple(int(n) for n in core.split("."))
+              if len(nums) != 3:
+                  raise ValueError(f"not a SemVer version: {version!r}")
+              if not pre:
+                  return (nums, 1, ())
+              # Numeric identifiers rank below alphanumeric ones; a shorter
+              # identifier list ranks below a longer one sharing its prefix.
+              ids = tuple((0, int(i), "") if i.isdigit() else (1, 0, i) for i in pre.split("."))
+              return (nums, 0, ids)
+
+          old, new = (precedence(v) for v in sys.argv[1:3])
+          print("increased" if new > old else "unchanged" if new == old else "decreased")
+          EOF
+          )
+          if [ "$ORDER" = "unchanged" ]; then
+            echo "Version unchanged -- not a release, nothing to publish"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          elif [ "$ORDER" = "decreased" ]; then
+            echo "::warning::workspace version went down ($OLD_VERSION -> $NEW_VERSION); not publishing"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          elif [ "$ORDER" = "increased" ]; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ERROR: unexpected version comparison result: '$ORDER'"
+            exit 1
+          fi
       - name: Verify lockstep workspace versions
+        if: steps.release.outputs.is_release == 'true'
         run: |
           set -euo pipefail
           WORKSPACE_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r \
@@ -57,18 +130,16 @@ jobs:
           echo "All workspace crates at v$WORKSPACE_VERSION"
       - name: Publish workspace crates in dependency order
         id: publish
+        if: steps.release.outputs.is_release == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
 
           # All workspace crates share a single version (lockstep), so the root
-          # crate's version is the target version for every crate. Whether there
-          # is anything to publish is decided per crate in the loop below, not
-          # here: a crate added to the workspace after the current version was
-          # released is absent from crates.io even though the root crate is
-          # already at that version, so an early exit keyed on `fgumi` alone
-          # would silently skip it forever.
+          # crate's version is the target version for every crate. Crates already
+          # at that version are skipped per crate below, so re-running a release
+          # that failed partway resumes it instead of re-uploading.
           VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r \
             '.packages[] | select(.name == "fgumi") | .version')
 
@@ -102,8 +173,8 @@ jobs:
           # "already uploaded", and because this loop runs under `set -e` every
           # crate after it is never published. That is the partial-release this
           # workflow exists to avoid, and a published version cannot be deleted,
-          # only yanked. A 404 (never-published crate, e.g. one added since the
-          # last release) correctly means "publish it".
+          # only yanked. A 404 (not yet published at this version, including a
+          # crate added since the last release) correctly means "publish it".
           PUBLISHED_ANY=false
           for crate in "${CRATES[@]}"; do
             # Retry the probe: it is an idempotent read, and both failure modes
