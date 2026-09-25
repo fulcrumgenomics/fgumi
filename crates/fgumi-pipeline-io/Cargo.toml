@@ -43,7 +43,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 fgumi-raw-bam = { workspace = true, features = ["noodles", "test-utils"] }
 fgumi-sort = { workspace = true, features = ["test-utils"] }
 noodles = { workspace = true, features = ["bam", "sam"] }
-rstest = "0.26"
+rstest = "0.27"
 proptest = "1.10"
 criterion = { version = "0.8", features = ["html_reports"] }
 
