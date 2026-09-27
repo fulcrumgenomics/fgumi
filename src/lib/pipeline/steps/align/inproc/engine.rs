@@ -1,9 +1,9 @@
 //! The alignment engine adapter: the *single* module that names [`bwa_mem3_rs`].
 //!
 //! The scheduling steps of the in-process backend
-//! (`AlignSeedExtendStep`,
-//! `CohortPeStatStep`,
-//! `AlignPairEmitStep`) drive bwa-mem3's
+//! ([`AlignSeedExtendStep`](super::seed_extend::AlignSeedExtendStep),
+//! [`CohortPeStatStep`](super::pestat::CohortPeStatStep),
+//! [`AlignPairEmitStep`](super::pair_emit::AlignPairEmitStep)) drive bwa-mem3's
 //! three-phase `seed_extend -> infer_cohort -> pair_emit` pipeline. They do so
 //! through the [`AlignEngine`] trait rather than calling `bwa_mem3_rs` directly,
 //! for two reasons:
@@ -12,10 +12,12 @@
 //!    deterministic, allocation-only stand-in that lets the scheduling/ordering
 //!    tests exercise the real pipeline steps at many thread counts
 //!    and sub-batch sizes without loading a bwa-mem3 index or compiling any C++.
-//! 2. **One seam.** Every mention of `bwa_mem3_rs` types the steps need
-//!    ([`RecordSink`], [`RecordOrigin`], [`IdBases`]) is re-exported from here, so
-//!    the rest of the `inproc` module tree is written against this module, not the
-//!    binding crate.
+//! 2. **One seam.** Every `bwa_mem3_rs` name the rest of the `inproc` module
+//!    tree needs is re-exported from here: the types the steps pass
+//!    ([`RecordSink`], [`RecordOrigin`], [`IdBases`]), the index and options the
+//!    backend loads ([`BwaIndex`], [`MemOpts`]), and the linked [`version`] and
+//!    [`shm`] staging probe. The rest of the tree is written against this module,
+//!    not the binding crate.
 //!
 //! The real implementation, [`BwaMem3Engine`], is a thin wrapper over
 //! `bwa_mem3_rs`'s [`ResidentCohort`]: one per `-K` cohort keeps every sub-batch's
@@ -26,7 +28,7 @@
 //! adds no `unsafe`.
 //!
 //! The engine trait and both impls are consumed by the in-process backend's
-//! steps (`seed_extend`, `pestat`, `pair_emit`) and
+//! steps ([`super::seed_extend`], [`super::pestat`], [`super::pair_emit`]) and
 //! this module's tests.
 
 use std::io;
@@ -35,19 +37,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bwa_mem3_rs::{
-    BwaIndex, MemOpts, MemPeStat, PeOrientation, ReadPair as BwaReadPair, ResidentCohort,
-    ResidentRange, SingleRead as BwaSingleRead,
+    MemPeStat, PeOrientation, ReadPair as BwaReadPair, ResidentCohort, ResidentRange,
+    SingleRead as BwaSingleRead,
 };
 
 use super::gate::CohortLease;
 
 // Re-exports for the rest of the `inproc` module tree: these are the only
-// `bwa_mem3_rs` names the scheduling steps reference, and they go through here so
-// `engine.rs` stays the sole module that names the binding crate.
-// `RecordOrigin` is first used outside tests by the pair/emit step added in the
-// following change.
-#[allow(unused_imports)]
-pub(crate) use bwa_mem3_rs::{IdBases, RecordOrigin, RecordSink};
+// `bwa_mem3_rs` names it references, and they go through here so `engine.rs`
+// stays the sole module that names the binding crate.
+pub(crate) use bwa_mem3_rs::{BwaIndex, IdBases, MemOpts, RecordOrigin, RecordSink, shm, version};
 
 // ---------------------------------------------------------------------------
 // Borrowed input batch (fgumi side)
@@ -111,7 +110,7 @@ pub(crate) struct EngineBatch<'a> {
 pub(crate) trait AlignEngine: Send + Sync + 'static {
     /// Per-worker scratch, reused across calls. `Send`, not
     /// `Sync`: exactly one lives on each pool worker. `'static` because it is
-    /// owned by the `'static` `AlignSeedExtendStep` /
+    /// owned by the `'static` [`AlignSeedExtendStep`](super::seed_extend) /
     /// pair-emit steps.
     type Scratch: Send + 'static;
     /// One cohort's resident alignment state, shared by all its sub-batches.
@@ -431,7 +430,7 @@ pub(crate) mod fake {
     //! **minimal-valid packed-BAM record body** per read through the sink tagged
     //! with its origin, so a scheduling test can assert records come back grouped
     //! by origin in input order — and, crucially for
-    //! `AlignPairEmitStep`, so
+    //! [`AlignPairEmitStep`](super::super::pair_emit), so
     //! [`Template::from_records`](crate::template::Template::from_records) can
     //! actually parse and group them and expose a `read_name()`/`flags()` for the
     //! name-match guard. Every read of a pair `i` gets the same synthetic name

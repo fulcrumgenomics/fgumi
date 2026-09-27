@@ -218,9 +218,9 @@ simulate = ["consensus"]
 profile-adjacency = []
 # Enable slow stress tests for concurrency testing
 stress-tests = []
-# In-process bwa-mem3 aligner backend for `fgumi runall` (its steps and the
-# `bwa-mem3-inproc` preset build on this). Off by default: it pulls the
-# optional `bwa-mem3-rs` dependency, which compiles the vendored bwa-mem3 C++ (C++17 toolchain
+# In-process bwa-mem3 aligner for `fgumi runall` (`--aligner::preset
+# bwa-mem3-inproc`). Off by default: it pulls the optional `bwa-mem3-rs`
+# dependency, which compiles the vendored bwa-mem3 C++ (C++17 toolchain
 # required) and links it statically. Default builds stay pure Rust with no C
 # toolchain. The in-process backend code is `#[cfg(feature = "aligner-bwa-mem3")]`
 # confined to `pipeline::steps::align::inproc`.
