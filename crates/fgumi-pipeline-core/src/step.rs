@@ -184,6 +184,12 @@ pub struct StepProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepOutcome {
     /// Step did useful work (pushed an item or held one for later).
+    ///
+    /// Only a *new* hold counts: a retry of an already-held item that is still
+    /// rejected moved nothing, so report it as `NoProgress` (or `Contention`).
+    /// The round-robin walk restarts after a non-sticky step's `Progress`, so a
+    /// step that keeps reporting it while stuck is revisited forever and the
+    /// consumer that would drain its output is never reached.
     Progress,
     /// Step had nothing to do this call (input empty, no held work).
     NoProgress,

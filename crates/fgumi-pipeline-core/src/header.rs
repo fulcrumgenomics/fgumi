@@ -3,7 +3,7 @@
 //! `HeaderHandle` lets a downstream sink open its output file before the
 //! full output header is known, and consume the header at first record
 //! time once an upstream step has produced it. The primary motivating
-//! consumer is the writer downstream of `AlignAndMergeStep`: the
+//! consumer is the writer downstream of the align stage: the
 //! aligner's `@PG` (and any `@RG`/`@CO` lines it adds) are runtime
 //! contributions that aren't available at `Pipeline::build` time.
 //!
