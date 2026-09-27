@@ -74,6 +74,31 @@ pub struct AlignerProcess {
     stderr_thread: Option<JoinHandle<Vec<String>>>,
 }
 
+/// The mimalloc option environment variables (`MIMALLOC_PURGE_DELAY` and its
+/// legacy name) a user can set to choose the purge delay themselves.
+const MIMALLOC_PURGE_ENV: [&str; 2] = ["MIMALLOC_PURGE_DELAY", "MIMALLOC_RESET_DELAY"];
+
+/// Whether the user set mimalloc's purge delay in the environment.
+pub(crate) fn user_set_mimalloc_purge() -> bool {
+    names_set_mimalloc_purge(std::env::vars_os().map(|(name, _)| name))
+}
+
+/// Whether `names` (environment variable names) include either
+/// [`MIMALLOC_PURGE_ENV`] name. The comparison ignores ASCII case because
+/// mimalloc's own lookup does, so `mimalloc_purge_delay=250` is the user's
+/// choice too. Any value counts, including one mimalloc cannot parse: that one
+/// is mimalloc's to reject, not ours to replace.
+fn names_set_mimalloc_purge<I, S>(names: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    names.into_iter().any(|name| {
+        let name = name.as_ref();
+        MIMALLOC_PURGE_ENV.iter().any(|option| name.eq_ignore_ascii_case(option))
+    })
+}
+
 impl AlignerProcess {
     /// Spawn an aligner subprocess with the given shell command.
     ///
@@ -97,13 +122,24 @@ impl AlignerProcess {
     /// configuring `Stdio::piped()`, which should never happen in
     /// practice.
     pub fn spawn(command: &str, ring_size: usize) -> Result<Self> {
-        let mut child = Command::new("/bin/bash")
-            .args(["-c", command])
+        let mut cmd = Command::new("/bin/bash");
+        cmd.args(["-c", command])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("failed to spawn aligner command: {command}"))?;
+            .stderr(Stdio::piped());
+        // bwa-mem3 links mimalloc, whose default purge decommits freed pages
+        // after 1 s and costs the aligner page faults on every batch: never
+        // purging measured -0.5% wall on the bwa-mem3 CLI alone. A user-set
+        // value (either name, any case) is inherited unchanged; aligners
+        // without mimalloc ignore the variable. The variable reaches every
+        // process in the shell command, so with `--aligner::command` any
+        // mimalloc-linked tool in the user's pipeline also keeps its freed
+        // pages (higher RSS); set `MIMALLOC_PURGE_DELAY` to opt out.
+        if !user_set_mimalloc_purge() {
+            cmd.env("MIMALLOC_PURGE_DELAY", "-1");
+        }
+        let mut child =
+            cmd.spawn().with_context(|| format!("failed to spawn aligner command: {command}"))?;
 
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
@@ -441,9 +477,13 @@ impl AlignerPreset {
 
     /// Build the aligner shell command for this preset.
     ///
-    /// The command reads FASTQ from `/dev/stdin` and writes SAM to
+    /// The command reads FASTQ from `/dev/stdin` and writes its alignments to
     /// stdout, allowing it to be connected to fgumi's pipeline via
-    /// stdin/stdout pipes.
+    /// stdin/stdout pipes. `bwa-mem3` writes uncompressed BAM (`--bam=0`):
+    /// fgumi's single reader thread then takes records zero-copy instead of
+    /// parsing SAM text, which at 32 threads kept bwa-mem3 blocked on its
+    /// output for most of the run (a fused extract → correct → align ran 36%
+    /// faster). `bwa` has no BAM output and writes SAM.
     ///
     /// # Arguments
     ///
@@ -472,7 +512,11 @@ impl AlignerPreset {
             None => self.binary_name().to_string(),
         };
         let ref_str = reference.display();
-        format!("{binary} mem -p -K {chunk_size} -t {threads} {ref_str} /dev/stdin")
+        let output = match self {
+            Self::BwaMem3 => " --bam=0",
+            Self::Bwa => "",
+        };
+        format!("{binary} mem{output} -p -K {chunk_size} -t {threads} {ref_str} /dev/stdin")
     }
 
     /// Validate that the aligner binary and required index files are present.
@@ -597,7 +641,7 @@ pub fn substitute_template(template: &str, reference: &Path, threads: usize) -> 
         bail!(
             "--aligner::command template does not contain `{{ref}}`; \
              the aligner needs a reference path. Example: \
-             \"bwa-mem3 mem -p -K 150000000 -t {{threads}} {{ref}} /dev/stdin\""
+             \"bwa-mem3 mem --bam=0 -p -K 150000000 -t {{threads}} {{ref}} /dev/stdin\""
         );
     }
     // Single left-to-right pass so injected text is never re-scanned. Two
@@ -952,6 +996,22 @@ mod tests {
 
     use super::*;
 
+    #[rstest]
+    #[case::current_name(&["MIMALLOC_PURGE_DELAY"], true)]
+    #[case::legacy_name(&["MIMALLOC_RESET_DELAY"], true)]
+    #[case::lowercase(&["mimalloc_purge_delay"], true)]
+    #[case::mixed_case_legacy(&["Mimalloc_Reset_Delay"], true)]
+    #[case::among_others(&["PATH", "HOME", "mimalloc_purge_delay"], true)]
+    #[case::unset(&["PATH", "HOME"], false)]
+    #[case::other_mimalloc_option(&["MIMALLOC_VERBOSE", "MIMALLOC_ARENA_EAGER_COMMIT"], false)]
+    #[case::prefix_only(&["MIMALLOC_PURGE_DELAY_MS", "X_MIMALLOC_PURGE_DELAY"], false)]
+    fn names_set_mimalloc_purge_matches_like_mimalloc(
+        #[case] names: &[&str],
+        #[case] expected: bool,
+    ) {
+        assert_eq!(names_set_mimalloc_purge(names), expected);
+    }
+
     /// A non-UTF-8 stderr line must NOT halt the relay: draining has to
     /// continue to EOF, otherwise the aligner blocks once its stderr pipe fills
     /// (~64 KiB) and the whole align pipeline deadlocks. Regression test for the
@@ -1083,7 +1143,7 @@ mod tests {
         AlignerPreset::BwaMem3,
         4,
         5_000_000,
-        "bwa-mem3 mem -p -K 5000000 -t 4 /ref/genome.fa /dev/stdin"
+        "bwa-mem3 mem --bam=0 -p -K 5000000 -t 4 /ref/genome.fa /dev/stdin"
     )]
     fn preset_build_command_default_binary(
         #[case] preset: AlignerPreset,
@@ -1248,6 +1308,26 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("index file not found"), "expected index error, got: {msg}");
         assert!(msg.contains("bwa-mem3 index"), "expected fix-it hint, got: {msg}");
+    }
+
+    /// A preset that passes validation resolves to the subprocess backend with
+    /// bwa's mid-pair split accepted: both presets run `mem -p -K`.
+    #[rstest]
+    #[case::bwa_mem3(AlignerPreset::BwaMem3)]
+    #[case::bwa(AlignerPreset::Bwa)]
+    fn resolve_preset_accepts_mid_pair_split(#[case] preset: AlignerPreset) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        for ext in preset.index_extensions() {
+            std::fs::write(append_extension(&ref_path, ext), b"x").unwrap();
+        }
+        let bin = make_existing_binary(tmp.path());
+        let opts = AlignerOptions { preset: Some(preset), ..AlignerOptions::default() };
+        let resolved = opts.resolve(&ref_path, 4, Some(&bin)).unwrap();
+        let ResolvedBackend::Subprocess { command, accept_mid_pair_split } = resolved.backend;
+        assert!(accept_mid_pair_split, "preset mode must accept bwa's mid-pair split");
+        assert!(command.starts_with(&bin.display().to_string()), "got: {command}");
     }
 
     /// `validate` errors out on a nonexistent `--aligner-bin` override path.

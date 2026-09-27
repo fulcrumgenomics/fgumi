@@ -17,7 +17,8 @@
 //!
 //! This module holds the trait, its wiring context/result types, the
 //! backend-agnostic `ZipperBatch`, the subprocess backend's `InFlightGate`
-//! byte-budget gate, the mid-pair split helper, and the header helpers (`validate_sq_consistency`,
+//! byte-budget gate, the mimalloc purge-delay setter called at wiring, the
+//! mid-pair split helper, and the header helpers (`validate_sq_consistency`,
 //! `merge_aligner_header`).
 
 pub(crate) mod merge;
@@ -408,6 +409,24 @@ pub(crate) fn split_pair_into_singles(template: Template) -> io::Result<(Templat
     Ok((to_template(first)?, to_template(second)?))
 }
 
+/// Keep mimalloc from returning freed pages to the OS, unless the user set the
+/// purge delay. The align stage frees and reallocates large per-batch buffers
+/// (FASTQ out, BAM in, merge), and mimalloc's default purge (decommit after 1 s)
+/// turns that reuse into hundreds of thousands of page faults.
+///
+/// The setting is process-wide and is never restored, so it covers every stage
+/// of the `runall` process, not just align: fgumi-sort's `force_mi_collect()`
+/// stops returning memory to the OS too. Measured end to end (extract through
+/// simplex consensus, 1M pairs, 32 threads) it is still faster with it,
+/// including when sort spills: wall -4%, CPU -2.5%, page faults ~700k to under
+/// 40k, for ~0.4 GB more peak RSS. Set `MIMALLOC_PURGE_DELAY` to opt out.
+pub(crate) fn retain_freed_memory_unless_user_set() {
+    if !crate::aligner::user_set_mimalloc_purge() {
+        fgumi_sort::retain_freed_memory();
+    }
+    log::debug!("align: mimalloc purge delay {} ms", fgumi_sort::mi_purge_delay_ms());
+}
+
 /// Merge aligner-emitted header lines into the partial output header.
 ///
 /// The aligner contributes:
@@ -478,6 +497,41 @@ pub(crate) fn merge_aligner_header(partial: &Header, aligner: &Header) -> Header
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a template of exactly two records is split: any other count is out
+    /// of contract and errors, naming the template and its record count.
+    #[rstest::rstest]
+    #[case::one_record(&[fgumi_raw_bam::flags::UNMAPPED], 1)]
+    #[case::pair_with_supplementary(
+        &[
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED
+                | fgumi_raw_bam::flags::FIRST_SEGMENT
+                | fgumi_raw_bam::flags::SUPPLEMENTARY,
+        ],
+        3
+    )]
+    fn split_pair_into_singles_rejects_other_than_two_records(
+        #[case] flags: &[u16],
+        #[case] n: usize,
+    ) {
+        let records = flags
+            .iter()
+            .map(|&f| {
+                let mut b = fgumi_raw_bam::SamBuilder::new();
+                b.read_name(b"q1").flags(f).sequence(b"ACGT").qualities(b"IIII");
+                b.build()
+            })
+            .collect();
+        let template = Template::from_records(records).expect("template");
+        let err = split_pair_into_singles(template).expect_err("must not split").to_string();
+        assert!(
+            err.contains("cannot split template 'q1'")
+                && err.contains(&format!("carries {n} records")),
+            "got: {err}"
+        );
+    }
 
     /// A `ZipperBatch` sits in a byte-bounded queue, so its `heap_size` must
     /// count both halves' `Vec` backing store, as `BamTemplateBatch` already

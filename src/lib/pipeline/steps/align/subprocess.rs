@@ -1462,6 +1462,10 @@ impl AlignBackend for SubprocessBackend {
         input: (StepIdx, BranchIdx),
         ctx: &AlignWiringCtx,
     ) -> anyhow::Result<AlignWired> {
+        // fgumi's side of the subprocess route churns the same per-batch
+        // buffers (FASTQ out, BAM in, merge); the aligner child gets the same
+        // setting through its environment (see `AlignerProcess::spawn`).
+        super::retain_freed_memory_unless_user_set();
         let step = SubprocessAlignStep::new(
             SubprocessConfig {
                 partial_output_header: Arc::clone(&ctx.partial_output_header),
@@ -2020,5 +2024,93 @@ mod tests {
                 .is_none(),
             "stream is exhausted after the last template"
         );
+    }
+
+    /// Write a BAM (empty header) holding one record per `(qname, flags)` to
+    /// `path`: the staged output of a fake aligner.
+    fn write_bam_fixture(path: &std::path::Path, records: &[(&[u8], u16)]) {
+        use fgumi_bgzf::{BGZF_EOF, InlineBgzfCompressor};
+        use std::fs::File;
+
+        let mut bytes = Vec::new();
+        fgumi_bam_io::write_bam_header(&mut bytes, &Header::default()).expect("write_bam_header");
+        for &(qname, flags) in records {
+            fgumi_raw_bam::write_raw_record(&mut bytes, &make_record(qname, flags))
+                .expect("write record");
+        }
+        let mut c = InlineBgzfCompressor::new(1);
+        c.write_all(&bytes).expect("compress");
+        c.flush().expect("flush");
+        let mut f = File::create(path).expect("create fixture");
+        c.write_blocks_to(&mut f).expect("write compressed blocks");
+        f.write_all(&BGZF_EOF).expect("write BGZF EOF");
+    }
+
+    /// Write a SAM (`@HD` only) holding one unmapped `ACGT` record per
+    /// `(qname, flags)` to `path`: the staged output of a fake aligner.
+    fn write_sam_fixture(path: &std::path::Path, records: &[(&[u8], u16)]) {
+        let mut text = b"@HD\tVN:1.6\n".to_vec();
+        for &(qname, flags) in records {
+            let qname = String::from_utf8_lossy(qname);
+            writeln!(text, "{qname}\t{flags}\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII").expect("format");
+        }
+        std::fs::write(path, text).expect("write sam fixture");
+    }
+
+    /// End to end through `reader_loop_inner` for both aligner output formats: a
+    /// pair the aligner split mid-pair (two unpaired primaries under one name)
+    /// zips as two single-read mapped templates against its unmapped template
+    /// split to match, a single-end template passes through, and an empty batch
+    /// still yields an (empty) `ZipperBatch` to keep serials contiguous.
+    #[rstest::rstest]
+    fn reader_loop_zips_a_mid_pair_split_from_aligner_output(#[values(false, true)] sam: bool) {
+        use fgumi_raw_bam::flags::UNMAPPED;
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc::sync_channel;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let aligned: [(&[u8], u16); 3] =
+            [(b"pe1", UNMAPPED), (b"pe1", UNMAPPED | REVERSE), (b"se1", UNMAPPED)];
+        let fixture = tmp.path().join(if sam { "out.sam" } else { "out.bam" });
+        if sam {
+            write_sam_fixture(&fixture, &aligned);
+        } else {
+            write_bam_fixture(&fixture, &aligned);
+        }
+        let mut cat = Command::new("cat")
+            .arg(&fixture)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn cat");
+        let stdout = cat.stdout.take().expect("cat stdout");
+
+        let (token_tx, token_rx) = channel::<BatchToken>();
+        let (out_tx, out_rx) = sync_channel::<ZipperBatch>(4);
+        let empty = BamTemplateBatch::new(0, Vec::new());
+        token_tx.send(BatchToken { unmapped: empty, n_templates: 0, serial: 0 }).unwrap();
+        let single = Template::from_records(vec![make_record(b"se1", UNMAPPED)]).unwrap();
+        let unmapped = BamTemplateBatch::new(1, vec![make_paired_primary_template(b"pe1"), single]);
+        token_tx.send(BatchToken { unmapped, n_templates: 2, serial: 1 }).unwrap();
+        drop(token_tx);
+
+        let cfg = make_test_cfg();
+        reader_loop_inner(token_rx, &out_tx, stdout, &cfg, &InFlightGate::new(u64::MAX))
+            .expect("reader_loop_inner");
+        drop(out_tx);
+        let _ = cat.wait();
+
+        let batches: Vec<ZipperBatch> = out_rx.iter().collect();
+        assert_eq!(batches.iter().map(|b| b.serial).collect::<Vec<_>>(), vec![0, 1]);
+        assert!(batches[0].mapped.is_empty() && batches[0].unmapped.templates().is_empty());
+        let shape = |ts: &[Template]| {
+            ts.iter().map(|t| (t.name().to_vec(), t.read_count())).collect::<Vec<_>>()
+        };
+        let expected = vec![(b"pe1".to_vec(), 1), (b"pe1".to_vec(), 1), (b"se1".to_vec(), 1)];
+        assert_eq!(shape(&batches[1].mapped), expected, "mapped side");
+        assert_eq!(shape(batches[1].unmapped.templates()), expected, "unmapped side");
+        for half in &batches[1].unmapped.templates()[..2] {
+            assert_eq!(half.records()[0].flags() & PAIRED, 0, "split half is unpaired");
+        }
     }
 }

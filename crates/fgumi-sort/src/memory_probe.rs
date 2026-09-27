@@ -45,7 +45,9 @@ use log::{Level, debug, log_enabled};
 #[allow(unused_imports)]
 // consumed by main fgumi via the crate-root re-export
 pub use platform_ffi::print_mi_stats;
-pub use platform_ffi::{force_mi_collect, process_rss_bytes};
+pub use platform_ffi::{
+    force_mi_collect, mi_purge_delay_ms, process_rss_bytes, retain_freed_memory,
+};
 
 /// Log target for the memory probe.
 ///
@@ -71,6 +73,33 @@ mod platform_ffi {
         unsafe {
             libmimalloc_sys::mi_collect(true);
         }
+    }
+
+    /// mimalloc's `mi_option_purge_delay`. `libmimalloc-sys` does not export it
+    /// as a constant, so this is its position in `mi_option_t`, which is 15 in
+    /// both the v2 and v3 `mimalloc.h` enums (deprecated slots keep their
+    /// places). `mi_purge_delay_ms_matches_mimalloc_default` pins it against the
+    /// linked mimalloc v3's default of 1000 ms.
+    const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+
+    /// Stop mimalloc returning freed pages to the OS (`purge_delay = -1`), so a
+    /// page that is freed and soon reused is not decommitted and faulted back
+    /// in. Trades a higher peak RSS for fewer page faults and less system time.
+    pub fn retain_freed_memory() {
+        // SAFETY: mi_option_set only stores the option value in mimalloc's
+        // option table; mimalloc reads it on each purge, so setting it after
+        // start-up is supported, and the option index is fixed (see above).
+        unsafe {
+            libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, -1);
+        }
+    }
+
+    /// mimalloc's current purge delay in milliseconds (`-1`: never purge).
+    #[must_use]
+    pub fn mi_purge_delay_ms() -> i64 {
+        // SAFETY: mi_option_get only reads mimalloc's option table.
+        #[allow(clippy::useless_conversion)] // `c_long` is `i32` on Windows
+        i64::from(unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) })
     }
 
     /// Print mimalloc allocator statistics to stderr via the default output handler.
@@ -532,6 +561,23 @@ impl Default for MergeProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins [`platform_ffi`]'s purge-delay option index: the linked mimalloc v3
+    /// defaults `mi_option_purge_delay` to 1000 ms (v2 used 10 ms), and retaining
+    /// freed memory sets it to -1. Skipped when the environment overrides it.
+    #[test]
+    fn mi_purge_delay_ms_matches_mimalloc_default() {
+        // mimalloc matches its option names case-insensitively.
+        if std::env::vars_os().any(|(name, _)| {
+            name.eq_ignore_ascii_case("MIMALLOC_PURGE_DELAY")
+                || name.eq_ignore_ascii_case("MIMALLOC_RESET_DELAY")
+        }) {
+            return;
+        }
+        assert_eq!(mi_purge_delay_ms(), 1000);
+        retain_freed_memory();
+        assert_eq!(mi_purge_delay_ms(), -1);
+    }
 
     #[test]
     fn test_fmt_bytes_units() {
