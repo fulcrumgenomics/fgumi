@@ -17,7 +17,7 @@
 //!
 //! This module holds the trait, its wiring context/result types, the
 //! backend-agnostic `ZipperBatch`, the subprocess backend's `InFlightGate`
-//! byte-budget gate, and the header helpers (`validate_sq_consistency`,
+//! byte-budget gate, the mid-pair split helper, and the header helpers (`validate_sq_consistency`,
 //! `merge_aligner_header`).
 
 pub(crate) mod merge;
@@ -297,8 +297,12 @@ pub(crate) trait AlignBackend: Send + 'static {
 /// `aligner` module does not depend on the pipeline's align stage.
 pub(crate) fn backend_for(resolved: ResolvedAligner) -> Box<dyn AlignBackend> {
     match resolved.backend {
-        ResolvedBackend::Subprocess { command } => {
-            Box::new(subprocess::SubprocessBackend { command, chunk_size: resolved.chunk_size })
+        ResolvedBackend::Subprocess { command, accept_mid_pair_split } => {
+            Box::new(subprocess::SubprocessBackend {
+                command,
+                chunk_size: resolved.chunk_size,
+                accept_mid_pair_split,
+            })
         }
     }
 }
@@ -352,6 +356,56 @@ pub(crate) fn validate_sq_consistency(partial: &Header, aligner: &Header) -> io:
     }
 
     Ok(())
+}
+
+/// The pairing bits [`split_pair_into_singles`] clears on each half's unmapped
+/// record: everything that marks it as one segment of a pair. `QC_FAIL`,
+/// `REVERSE` and the rest are kept.
+const SPLIT_HALF_CLEARED_FLAGS: u16 = fgumi_raw_bam::flags::PAIRED
+    | fgumi_raw_bam::flags::PROPER_PAIR
+    | fgumi_raw_bam::flags::MATE_UNMAPPED
+    | fgumi_raw_bam::flags::MATE_REVERSE
+    | fgumi_raw_bam::flags::FIRST_SEGMENT
+    | fgumi_raw_bam::flags::LAST_SEGMENT;
+
+/// Split a two-primary-read template into two single-record templates, in record
+/// order: bwa's mid-pair split. With mixed SE/PE input a `-K`
+/// chunk boundary can fall between a pair's two reads, and bwa then aligns them as
+/// two unpaired reads. The pair's unmapped template is split the same way so each
+/// half zips with its own read's alignment. Errors if the template carries records
+/// beyond its two primaries (secondaries make the split ambiguous — out of
+/// contract for valid unmapped input).
+///
+/// Each half's record has its pairing bits ([`SPLIT_HALF_CLEARED_FLAGS`]) cleared,
+/// so it is an unpaired read like the aligner's record for it. The zipper merge
+/// picks the mapped segment to copy tags and the QC-fail flag onto from the
+/// *unmapped* record's `PAIRED`/`FIRST_SEGMENT` bits; left set, the second half
+/// (still `PAIRED | LAST_SEGMENT`) would look for a mapped R2, find none (the
+/// aligner emitted it unpaired, which files as R1), and silently copy nothing.
+/// The merged record's own flags come from the aligner, so clearing these bits
+/// on the unmapped side changes nothing else in the output.
+pub(crate) fn split_pair_into_singles(template: Template) -> io::Result<(Template, Template)> {
+    // Reject anything but exactly two primaries before consuming the template,
+    // so the error path reads `template.name()` by reference and the success
+    // path never allocates a name copy.
+    if template.records().len() != 2 {
+        return Err(io::Error::other(format!(
+            "align-and-merge: cannot split template '{name}' across a mid-pair -K chunk \
+             boundary: it carries {n} records, not exactly two primaries (secondary/supplementary \
+             records are out of contract for mixed single/paired input).",
+            name = String::from_utf8_lossy(template.name()),
+            n = template.records().len(),
+        )));
+    }
+    let mut records = template.into_records();
+    let second = records.pop().expect("len checked == 2");
+    let first = records.pop().expect("len checked == 2");
+    let to_template = |mut record: fgumi_raw_bam::RawRecord| {
+        record.set_flags(record.flags() & !SPLIT_HALF_CLEARED_FLAGS);
+        Template::from_records(vec![record])
+            .map_err(|e| io::Error::other(format!("align-and-merge: split-half template: {e:#}")))
+    };
+    Ok((to_template(first)?, to_template(second)?))
 }
 
 /// Merge aligner-emitted header lines into the partial output header.

@@ -83,7 +83,7 @@ use crate::pipeline::steps::align::merge::MergeAlignedStep;
 use crate::pipeline::steps::align::{
     AlignBackend, AlignWired, AlignWiringCtx, ConsumerGoneGuard, InFlightGate, ZipperBatch,
     in_flight_budget_for_chunk_size, is_primary_for_alignment, merge_aligner_header,
-    no_primary_records_message, validate_sq_consistency,
+    no_primary_records_message, split_pair_into_singles, validate_sq_consistency,
 };
 use crate::pipeline::steps::types::BamTemplateBatch;
 use crate::template::Template;
@@ -156,6 +156,13 @@ pub(crate) struct SubprocessConfig {
     /// unmapped reads in RAM (issue #382). Derive it from the aligner's
     /// `-K` chunk size via [`in_flight_budget_for_chunk_size`].
     pub(crate) in_flight_unmapped_budget: u64,
+
+    /// Whether a same-queryname output group with two unpaired primaries is
+    /// accepted as bwa's mid-pair split (see [`AlignedGroup::MidPairSplit`]).
+    /// Set only for the subprocess presets (`mem -p -K`); otherwise the group
+    /// fails `Template::from_records`'s "multiple primaries" check, as it did
+    /// before the split was recognized.
+    pub(crate) accept_mid_pair_split: bool,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -580,8 +587,10 @@ fn reader_loop_inner(
             .read_header()
             .map_err(|e| io::Error::other(format!("aligner BAM header: {e}")))?;
         let bgzf = bam_reader.into_inner();
-        let stream =
-            TemplateStream::Bam(BamTemplateStream::new(fgumi_raw_bam::RawBamReader::new(bgzf)));
+        let stream = TemplateStream::Bam(BamTemplateStream::new(
+            fgumi_raw_bam::RawBamReader::new(bgzf),
+            cfg.accept_mid_pair_split,
+        ));
         (stream, aligner_header)
     } else {
         let buffered = BufReader::with_capacity(STDOUT_READER_BUF_BYTES, stdout);
@@ -590,7 +599,11 @@ fn reader_loop_inner(
             .read_header()
             .map_err(|e| io::Error::other(format!("aligner SAM header: {e}")))?;
         let header_arc = Arc::new(aligner_header.clone());
-        let stream = TemplateStream::Sam(SamTemplateStream::new(sam_reader, header_arc));
+        let stream = TemplateStream::Sam(SamTemplateStream::new(
+            sam_reader,
+            header_arc,
+            cfg.accept_mid_pair_split,
+        ));
         (stream, aligner_header)
     };
 
@@ -656,6 +669,9 @@ fn reader_loop_inner(
         }
 
         let mut mapped_templates: Vec<Template> = Vec::with_capacity(token.n_templates);
+        // Unmapped-template indices bwa split mid-pair; their unmapped halves are
+        // split to match after the loop (rare: needs mixed single/paired input).
+        let mut split_indices: Vec<usize> = Vec::new();
 
         for i in 0..token.n_templates {
             let mapped = template_stream.next_template()?;
@@ -690,14 +706,22 @@ fn reader_loop_inner(
                 )));
             }
 
-            mapped_templates.push(mapped);
+            match mapped {
+                AlignedGroup::Template(t) => mapped_templates.push(t),
+                AlignedGroup::MidPairSplit(first, second) => {
+                    mapped_templates.push(first);
+                    mapped_templates.push(second);
+                    split_indices.push(i);
+                }
+            }
         }
 
-        let zb = ZipperBatch {
-            serial: token.serial,
-            mapped: mapped_templates,
-            unmapped: token.unmapped,
+        let unmapped = if split_indices.is_empty() {
+            token.unmapped
+        } else {
+            split_unmapped_pairs(token.unmapped, &split_indices)?
         };
+        let zb = ZipperBatch { serial: token.serial, mapped: mapped_templates, unmapped };
         if out_tx.send(zb).is_err() {
             // Downstream gone — bail. The dispatcher will observe
             // out_rx disconnected on its next try_run.
@@ -731,6 +755,28 @@ fn reader_loop_inner(
     }
 
     Ok(())
+}
+
+/// Rebuild `unmapped` with each template at `split_indices` (ascending) split
+/// into its two single-read halves, matching the aligner's mid-pair split so the
+/// mapped and unmapped halves still zip one-to-one.
+fn split_unmapped_pairs(
+    unmapped: BamTemplateBatch,
+    split_indices: &[usize],
+) -> io::Result<BamTemplateBatch> {
+    let (serial, templates) = unmapped.into_parts();
+    let mut out = Vec::with_capacity(templates.len() + split_indices.len());
+    let mut splits = split_indices.iter().peekable();
+    for (i, template) in templates.into_iter().enumerate() {
+        if splits.next_if_eq(&&i).is_some() {
+            let (first, second) = split_pair_into_singles(template)?;
+            out.push(first);
+            out.push(second);
+        } else {
+            out.push(template);
+        }
+    }
+    Ok(BamTemplateBatch::new(serial, out))
 }
 
 /// Peek the leading bytes of `stdout` to classify the aligner's output
@@ -803,7 +849,7 @@ enum TemplateStream {
 }
 
 impl TemplateStream {
-    fn next_template(&mut self) -> io::Result<Option<Template>> {
+    fn next_template(&mut self) -> io::Result<Option<AlignedGroup>> {
         match self {
             Self::Bam(s) => s.next_template(),
             Self::Sam(s) => s.next_template(),
@@ -834,19 +880,62 @@ impl TemplateStream {
     }
 }
 
-/// Group consecutive same-queryname records from `read` into one [`Template`].
+/// One group of consecutive same-queryname records from the aligner.
+enum AlignedGroup {
+    /// The template's alignments (the usual case).
+    Template(Template),
+    /// bwa's mid-pair split: with mixed single/paired input a `-K` chunk
+    /// boundary fell between a pair's two reads, so bwa aligned them as two
+    /// unpaired reads and emitted them back to back under the pair's name —
+    /// the first read's records, then the second's. The reader splits the
+    /// pair's unmapped template the same way (see [`split_pair_into_singles`]).
+    /// Produced only when [`SubprocessConfig::accept_mid_pair_split`] is set
+    /// (the subprocess presets).
+    MidPairSplit(Template, Template),
+}
+
+impl AlignedGroup {
+    /// The group's queryname.
+    fn name(&self) -> &[u8] {
+        match self {
+            Self::Template(t) | Self::MidPairSplit(t, _) => t.name(),
+        }
+    }
+}
+
+/// Where a same-queryname record group splits if it is bwa's mid-pair split:
+/// no record is flagged paired and there are exactly two primaries, in which
+/// case the second read's records start at the second primary. `None` for any
+/// other group.
+fn mid_pair_split_point(records: &[fgumi_raw_bam::RawRecord]) -> Option<usize> {
+    use fgumi_raw_bam::flags::{PAIRED, SECONDARY, SUPPLEMENTARY};
+    if records.iter().any(|r| r.flags() & PAIRED != 0) {
+        return None;
+    }
+    let mut primaries =
+        records.iter().enumerate().filter(|(_, r)| r.flags() & (SECONDARY | SUPPLEMENTARY) == 0);
+    let (first, second) = (primaries.next(), primaries.next());
+    match (first, second, primaries.next()) {
+        (Some(_), Some((split_at, _)), None) => Some(split_at),
+        _ => None,
+    }
+}
+
+/// Group consecutive same-queryname records from `read` into one [`AlignedGroup`].
 ///
 /// Shared by [`BamTemplateStream`] and [`SamTemplateStream`]: only the
 /// per-record read primitive differs (zero-copy BAM read vs SAM decode+encode),
 /// so it is injected as the `read` closure. `peeked` carries the first record of
 /// the *next* template (read one past this template's boundary) across calls,
-/// and `name_buf` is a reusable queryname buffer. Returns `Ok(None)` at end of
-/// stream.
+/// and `name_buf` is a reusable queryname buffer. A group is returned as
+/// [`AlignedGroup::MidPairSplit`] only when `accept_mid_pair_split` is set.
+/// Returns `Ok(None)` at end of stream.
 fn assemble_next_template(
     peeked: &mut Option<fgumi_raw_bam::RawRecord>,
     name_buf: &mut Vec<u8>,
+    accept_mid_pair_split: bool,
     mut read: impl FnMut() -> io::Result<Option<fgumi_raw_bam::RawRecord>>,
-) -> io::Result<Option<Template>> {
+) -> io::Result<Option<AlignedGroup>> {
     let mut records: Vec<fgumi_raw_bam::RawRecord> = Vec::with_capacity(2);
 
     if let Some(first) = peeked.take() {
@@ -872,13 +961,22 @@ fn assemble_next_template(
 
     // Build the owned queryname only on the error path — the success path (every
     // template but a malformed-record edge case) is the hot loop.
-    let template = Template::from_records(records).map_err(|e| {
-        io::Error::other(format!(
-            "Template::from_records for aligner-emitted queryname '{name}': {e}",
-            name = String::from_utf8_lossy(name_buf),
-        ))
-    })?;
-    Ok(Some(template))
+    let build = |records| {
+        Template::from_records(records).map_err(|e| {
+            io::Error::other(format!(
+                "Template::from_records for aligner-emitted queryname '{name}': {e}",
+                name = String::from_utf8_lossy(name_buf),
+            ))
+        })
+    };
+    // Without `accept_mid_pair_split`, a two-unpaired-primary group falls
+    // through to `build`, whose "multiple primaries" error is the loud failure
+    // an aligner that never pairs (a free-form `--aligner::command`) needs.
+    if let Some(split_at) = mid_pair_split_point(&records).filter(|_| accept_mid_pair_split) {
+        let second = records.split_off(split_at);
+        return Ok(Some(AlignedGroup::MidPairSplit(build(records)?, build(second)?)));
+    }
+    Ok(Some(AlignedGroup::Template(build(records)?)))
 }
 
 struct BamTemplateStream {
@@ -889,27 +987,35 @@ struct BamTemplateStream {
     /// `next_template` call; avoids ~one `Vec<u8>` allocation
     /// per template (~40 bytes typical) on hot loops.
     name_buf: Vec<u8>,
+    /// See [`SubprocessConfig::accept_mid_pair_split`].
+    accept_mid_pair_split: bool,
 }
 
 impl BamTemplateStream {
-    fn new(reader: AlignerBamReader) -> Self {
+    fn new(reader: AlignerBamReader, accept_mid_pair_split: bool) -> Self {
         Self {
             reader,
             scratch: fgumi_raw_bam::RawRecord::new(),
             peeked: None,
             name_buf: Vec::with_capacity(64),
+            accept_mid_pair_split,
         }
     }
 
-    fn next_template(&mut self) -> io::Result<Option<Template>> {
+    fn next_template(&mut self) -> io::Result<Option<AlignedGroup>> {
         // Disjoint field capture (Rust 2021+): the closure borrows
         // `reader`/`scratch` while `peeked`/`name_buf` pass as sibling args, so
         // there's no whole-`self` aliasing conflict. `scratch` is reused across
         // reads, so we clone it out.
-        assemble_next_template(&mut self.peeked, &mut self.name_buf, || {
-            let n = self.reader.read_record(&mut self.scratch)?;
-            Ok(if n == 0 { None } else { Some(self.scratch.clone()) })
-        })
+        assemble_next_template(
+            &mut self.peeked,
+            &mut self.name_buf,
+            self.accept_mid_pair_split,
+            || {
+                let n = self.reader.read_record(&mut self.scratch)?;
+                Ok(if n == 0 { None } else { Some(self.scratch.clone()) })
+            },
+        )
     }
 
     fn probe_trailing(&mut self) -> io::Result<bool> {
@@ -933,16 +1039,19 @@ struct SamTemplateStream {
     /// template's last record.
     peeked: Option<fgumi_raw_bam::RawRecord>,
     name_buf: Vec<u8>,
+    /// See [`SubprocessConfig::accept_mid_pair_split`].
+    accept_mid_pair_split: bool,
 }
 
 impl SamTemplateStream {
-    fn new(reader: AlignerSamReader, header: Arc<Header>) -> Self {
+    fn new(reader: AlignerSamReader, header: Arc<Header>, accept_mid_pair_split: bool) -> Self {
         Self {
             reader,
             header,
             scratch: noodles::sam::alignment::RecordBuf::default(),
             peeked: None,
             name_buf: Vec::with_capacity(64),
+            accept_mid_pair_split,
         }
     }
 
@@ -962,23 +1071,28 @@ impl SamTemplateStream {
         Ok(Some(raw))
     }
 
-    fn next_template(&mut self) -> io::Result<Option<Template>> {
+    fn next_template(&mut self) -> io::Result<Option<AlignedGroup>> {
         // Disjoint field capture (see BAM sibling): the closure borrows
         // `reader`/`header`/`scratch` while `peeked`/`name_buf` pass as sibling
         // args. The read primitive is inlined here rather than calling
         // `read_next_raw` (which would borrow all of `self` and conflict with
         // the `&mut self.peeked`/`&mut self.name_buf` args); `read_next_raw`
         // remains as the primitive for `probe_trailing`.
-        assemble_next_template(&mut self.peeked, &mut self.name_buf, || {
-            let n = self.reader.read_record_buf(&self.header, &mut self.scratch)?;
-            if n == 0 {
-                Ok(None)
-            } else {
-                fgumi_raw_bam::encode_record_buf_to_raw(&self.scratch, &self.header)
-                    .map(Some)
-                    .map_err(|e| io::Error::other(format!("encode_record_buf_to_raw: {e}")))
-            }
-        })
+        assemble_next_template(
+            &mut self.peeked,
+            &mut self.name_buf,
+            self.accept_mid_pair_split,
+            || {
+                let n = self.reader.read_record_buf(&self.header, &mut self.scratch)?;
+                if n == 0 {
+                    Ok(None)
+                } else {
+                    fgumi_raw_bam::encode_record_buf_to_raw(&self.scratch, &self.header)
+                        .map(Some)
+                        .map_err(|e| io::Error::other(format!("encode_record_buf_to_raw: {e}")))
+                }
+            },
+        )
     }
 
     fn probe_trailing(&mut self) -> io::Result<bool> {
@@ -1321,6 +1435,8 @@ pub(crate) struct SubprocessBackend {
     /// The aligner's `-K` chunk size (bases), used to derive the in-flight
     /// byte budget.
     pub(crate) chunk_size: u64,
+    /// See [`SubprocessConfig::accept_mid_pair_split`].
+    pub(crate) accept_mid_pair_split: bool,
 }
 
 impl SubprocessBackend {
@@ -1352,6 +1468,7 @@ impl AlignBackend for SubprocessBackend {
                 header_handle: ctx.header_handle.clone(),
                 output_byte_limit: ctx.per_step_byte_limit,
                 in_flight_unmapped_budget: in_flight_budget_for_chunk_size(self.chunk_size),
+                accept_mid_pair_split: self.accept_mid_pair_split,
             },
             &self.command,
         )
@@ -1373,7 +1490,7 @@ impl AlignBackend for SubprocessBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fgumi_raw_bam::flags::{FIRST_SEGMENT, LAST_SEGMENT, PAIRED};
+    use fgumi_raw_bam::flags::{FIRST_SEGMENT, LAST_SEGMENT, PAIRED, REVERSE, SUPPLEMENTARY};
 
     fn make_test_cfg() -> SubprocessConfig {
         SubprocessConfig {
@@ -1381,6 +1498,7 @@ mod tests {
             header_handle: HeaderHandle::new(),
             output_byte_limit: 1024 * 1024,
             in_flight_unmapped_budget: in_flight_budget_for_chunk_size(150_000_000),
+            accept_mid_pair_split: true,
         }
     }
 
@@ -1744,6 +1862,128 @@ mod tests {
         assert!(result.is_ok(), "SAM-text header should resolve handle to Ok: {:?}", result.err(),);
     }
 
+    /// How one group of same-queryname aligner records should assemble: one
+    /// template of `n` records, or bwa's mid-pair split into two halves.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Assembled {
+        One(usize),
+        Split(usize, usize),
+    }
+
+    /// A group of same-name records assembles as one template unless it is bwa's
+    /// mid-pair split: two primaries and no record flagged paired, which happens
+    /// when a `-K` chunk boundary falls between a pair's reads. A split is cut at
+    /// the second primary, so each half keeps its own supplementaries.
+    #[rstest::rstest]
+    #[case::proper_pair(&[PAIRED | FIRST_SEGMENT, PAIRED | LAST_SEGMENT], Assembled::One(2))]
+    #[case::single_with_supplementary(&[0, SUPPLEMENTARY], Assembled::One(2))]
+    #[case::mid_pair_split(&[0, REVERSE], Assembled::Split(1, 1))]
+    #[case::mid_pair_split_with_supplementaries(
+        &[0, SUPPLEMENTARY, REVERSE, SUPPLEMENTARY],
+        Assembled::Split(2, 2)
+    )]
+    #[case::mid_pair_split_first_half_supplementary(&[0, SUPPLEMENTARY, REVERSE], Assembled::Split(2, 1))]
+    fn assemble_next_template_recognizes_a_mid_pair_split(
+        #[case] flags: &[u16],
+        #[case] expected: Assembled,
+    ) {
+        let recs: Vec<_> = flags.iter().map(|&f| make_record(b"pe10", f)).collect();
+        let mut it = recs.into_iter();
+        let mut peeked: Option<fgumi_raw_bam::RawRecord> = None;
+        let mut name_buf: Vec<u8> = Vec::new();
+        let group = assemble_next_template(&mut peeked, &mut name_buf, true, || Ok(it.next()))
+            .expect("group ok")
+            .expect("group present");
+        assert_eq!(group.name(), b"pe10");
+        let assembled = match group {
+            AlignedGroup::Template(t) => Assembled::One(t.records().len()),
+            AlignedGroup::MidPairSplit(a, b) => {
+                Assembled::Split(a.records().len(), b.records().len())
+            }
+        };
+        assert_eq!(assembled, expected);
+    }
+
+    /// `mid_pair_split_point` fires only for bwa's mid-pair split shape — no
+    /// record flagged paired and exactly two primaries — and splits at the
+    /// second primary.
+    #[rstest::rstest]
+    #[case::proper_pair(&[PAIRED | FIRST_SEGMENT, PAIRED | LAST_SEGMENT], None)]
+    #[case::one_mate_paired(&[PAIRED | FIRST_SEGMENT, 0], None)]
+    #[case::two_unpaired_primaries(&[0, REVERSE], Some(1))]
+    #[case::supplementary_between(&[0, SUPPLEMENTARY, REVERSE], Some(2))]
+    #[case::three_unpaired_primaries(&[0, 0, REVERSE], None)]
+    #[case::single_with_supplementary(&[0, SUPPLEMENTARY], None)]
+    fn mid_pair_split_point_matches_only_two_unpaired_primaries(
+        #[case] flags: &[u16],
+        #[case] expected: Option<usize>,
+    ) {
+        let recs: Vec<_> = flags.iter().map(|&f| make_record(b"pe10", f)).collect();
+        assert_eq!(mid_pair_split_point(&recs), expected);
+    }
+
+    /// Without `accept_mid_pair_split` (a free-form `--aligner::command`), two
+    /// unpaired primaries under one name are not reinterpreted as a split: the
+    /// group fails `Template::from_records` loudly, naming the queryname,
+    /// instead of silently splitting a pair an aligner never paired.
+    #[test]
+    fn two_unpaired_primaries_error_when_the_split_is_not_accepted() {
+        let recs = vec![make_record(b"pe10", 0), make_record(b"pe10", REVERSE)];
+        let mut it = recs.into_iter();
+        let mut peeked: Option<fgumi_raw_bam::RawRecord> = None;
+        let mut name_buf: Vec<u8> = Vec::new();
+        let Err(err) = assemble_next_template(&mut peeked, &mut name_buf, false, || Ok(it.next()))
+        else {
+            panic!("two unpaired primaries must error when the split is not accepted");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Template::from_records for aligner-emitted queryname 'pe10'"),
+            "error names the queryname: {msg}"
+        );
+    }
+
+    /// `split_unmapped_pairs` splits exactly the templates at `split_indices`,
+    /// in place and in order, so the unmapped halves line up one-to-one with the
+    /// aligner's split output; untouched templates pass through unchanged.
+    #[test]
+    fn split_unmapped_pairs_splits_only_the_listed_templates_in_order() {
+        use crate::pipeline::core::item::Ordered;
+        let single = |name: &[u8]| {
+            Template::from_records(vec![make_record(name, fgumi_raw_bam::flags::UNMAPPED)])
+                .expect("single")
+        };
+        let pair = |name: &[u8]| {
+            Template::from_records(vec![
+                make_record(name, PAIRED | FIRST_SEGMENT | fgumi_raw_bam::flags::UNMAPPED),
+                make_record(name, PAIRED | LAST_SEGMENT | fgumi_raw_bam::flags::UNMAPPED),
+            ])
+            .expect("pair")
+        };
+        let batch = BamTemplateBatch::new(7, vec![single(b"se1"), pair(b"pe2"), pair(b"pe3")]);
+        let out = split_unmapped_pairs(batch, &[1]).expect("split ok");
+        assert_eq!(out.ordinal(), 7, "the batch serial is preserved");
+        let shape: Vec<(Vec<u8>, usize)> =
+            out.templates().iter().map(|t| (t.name().to_vec(), t.records().len())).collect();
+        assert_eq!(
+            shape,
+            vec![
+                (b"se1".to_vec(), 1),
+                (b"pe2".to_vec(), 1),
+                (b"pe2".to_vec(), 1),
+                (b"pe3".to_vec(), 2),
+            ],
+            "only pe2 is split, into two single-record halves, in place"
+        );
+        for half in &out.templates()[1..3] {
+            assert_eq!(
+                half.records()[0].flags() & (PAIRED | FIRST_SEGMENT | LAST_SEGMENT),
+                0,
+                "each split half is an unpaired read"
+            );
+        }
+    }
+
     /// The shared queryname-grouping state machine (delegated to by both
     /// `BamTemplateStream` and `SamTemplateStream`) must group consecutive
     /// same-queryname records into one `Template` and stash the first record of
@@ -1760,20 +2000,22 @@ mod tests {
         let mut peeked: Option<fgumi_raw_bam::RawRecord> = None;
         let mut name_buf: Vec<u8> = Vec::new();
 
-        let t1 = assemble_next_template(&mut peeked, &mut name_buf, || Ok(it.next()))
+        let t1 = assemble_next_template(&mut peeked, &mut name_buf, true, || Ok(it.next()))
             .expect("t1 ok")
             .expect("t1 present");
+        let AlignedGroup::Template(t1) = t1 else { panic!("t1 is not a mid-pair split") };
         assert_eq!(t1.name(), b"readA");
         assert_eq!(t1.read_count(), 2, "readA's R1+R2 group into one template");
 
-        let t2 = assemble_next_template(&mut peeked, &mut name_buf, || Ok(it.next()))
+        let t2 = assemble_next_template(&mut peeked, &mut name_buf, true, || Ok(it.next()))
             .expect("t2 ok")
             .expect("t2 present");
+        let AlignedGroup::Template(t2) = t2 else { panic!("t2 is not a mid-pair split") };
         assert_eq!(t2.name(), b"readB");
         assert_eq!(t2.read_count(), 1, "readB is a solo template");
 
         assert!(
-            assemble_next_template(&mut peeked, &mut name_buf, || Ok(it.next()))
+            assemble_next_template(&mut peeked, &mut name_buf, true, || Ok(it.next()))
                 .expect("t3 ok")
                 .is_none(),
             "stream is exhausted after the last template"

@@ -707,7 +707,17 @@ impl Default for AlignerOptions {
 pub(crate) enum ResolvedBackend {
     /// `--aligner::preset` or `--aligner::command`: the shell command to spawn
     /// via [`AlignerProcess::spawn`] (already substituted and validated).
-    Subprocess { command: String },
+    Subprocess {
+        command: String,
+        /// Whether the aligner's output may carry bwa's mid-pair split (a
+        /// pair aligned as two unpaired reads because a `-K` chunk cut fell
+        /// between them). `true` only for the presets, which run `mem -p -K`
+        /// and so produce exactly that shape; a free-form `--aligner::command`
+        /// gets the loud "multiple primaries" error instead, because the same
+        /// shape from an aligner that never pairs would otherwise split every
+        /// pair silently.
+        accept_mid_pair_split: bool,
+    },
 }
 
 /// Result of [`AlignerOptions::resolve`] — a ready-to-construct aligner
@@ -751,6 +761,10 @@ pub(crate) enum ResolvedAlignerMode {
     Command,
 }
 
+/// The largest `--aligner::chunk-size` a preset accepts: `i32::MAX`, since bwa
+/// and bwa-mem3 parse `-K` with `atoi` into an `int`.
+const MAX_PRESET_CHUNK_SIZE: u64 = 2_147_483_647;
+
 impl AlignerOptions {
     /// Validate the option combination and produce a [`ResolvedAligner`]
     /// ready for the align stage's `backend_for` to construct.
@@ -766,6 +780,7 @@ impl AlignerOptions {
     ///
     /// # Errors
     ///
+    /// - `--aligner::chunk-size` is zero, or exceeds `i32::MAX` with a preset.
     /// - Neither `--aligner::preset` nor `--aligner::command` was set.
     /// - Both were set (mutual exclusion violation).
     /// - Command mode + a preset-only flag (`--aligner-bin` or
@@ -787,6 +802,17 @@ impl AlignerOptions {
             bail!(
                 "--aligner::chunk-size must be greater than 0 (got 0); it sets the \
                  aligner's -K batch size and the pipeline's in-flight unmapped budget"
+            );
+        }
+        // Every preset hands the chunk size to bwa's `-K`, which bwa and
+        // bwa-mem3 parse with `atoi` into an `int`: a larger value overflows
+        // there instead of reaching the aligner as given. Command mode sets its
+        // own `-K` (this flag only sizes its in-flight budget), so it is exempt.
+        if self.preset.is_some() && self.chunk_size > MAX_PRESET_CHUNK_SIZE {
+            bail!(
+                "--aligner::chunk-size must be at most {MAX_PRESET_CHUNK_SIZE} (got {}) with \
+                 --aligner::preset: bwa parses -K as a 32-bit int",
+                self.chunk_size
             );
         }
         match (self.preset, self.command) {
@@ -811,7 +837,10 @@ impl AlignerOptions {
                 let command =
                     preset.build_command(reference, threads, self.chunk_size, aligner_bin);
                 Ok(ResolvedAligner {
-                    backend: ResolvedBackend::Subprocess { command },
+                    // Both presets run `mem -p -K`, whose smart pairing splits
+                    // a pair across a chunk cut (bwa and bwa-mem3 share
+                    // `bseq_read`'s even-count cut and `bseq_classify`).
+                    backend: ResolvedBackend::Subprocess { command, accept_mid_pair_split: true },
                     chunk_size: self.chunk_size,
                     threads: Some(threads),
                     mode: ResolvedAlignerMode::Preset(preset),
@@ -846,7 +875,7 @@ impl AlignerOptions {
                 // hardcode any thread count).
                 let command = substitute_template(&template, reference, top_threads)?;
                 Ok(ResolvedAligner {
-                    backend: ResolvedBackend::Subprocess { command },
+                    backend: ResolvedBackend::Subprocess { command, accept_mid_pair_split: false },
                     chunk_size: self.chunk_size,
                     threads: None,
                     mode: ResolvedAlignerMode::Command,
@@ -1149,7 +1178,8 @@ mod tests {
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
         };
         let resolved = opts.resolve(&ref_path, 4, None).unwrap();
-        let ResolvedBackend::Subprocess { command } = resolved.backend;
+        let ResolvedBackend::Subprocess { command, accept_mid_pair_split } = resolved.backend;
+        assert!(!accept_mid_pair_split, "command mode must not accept bwa's mid-pair split");
         assert!(command.contains(&ref_path.display().to_string()));
         assert!(command.contains("-t 4"));
         assert!(matches!(resolved.mode, ResolvedAlignerMode::Command));
@@ -1325,6 +1355,40 @@ mod tests {
         let template = "bwa-mem3 mem -t {threads} {ref} /dev/stdin";
         let result = substitute_template(template, reference, 8).unwrap();
         assert_eq!(result, "bwa-mem3 mem -t 8 /data/{threads}/genome.fa /dev/stdin");
+    }
+
+    /// `resolve` caps a preset's `--aligner::chunk-size` at `i32::MAX`, since bwa
+    /// and bwa-mem3 parse `-K` with `atoi` into an `int`; the check runs before
+    /// preset validation, so the reference needs no index.
+    #[rstest]
+    #[case::bwa_mem3(AlignerPreset::BwaMem3, 2_147_483_648)]
+    #[case::bwa(AlignerPreset::Bwa, 4_294_967_296)]
+    fn resolve_rejects_preset_chunk_size_past_i32(
+        #[case] preset: AlignerPreset,
+        #[case] chunk_size: u64,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        let opts = AlignerOptions { preset: Some(preset), chunk_size, ..AlignerOptions::default() };
+        let err = opts.resolve(&ref_path, 4, None).unwrap_err().to_string();
+        let needle = format!("--aligner::chunk-size must be at most 2147483647 (got {chunk_size})");
+        assert!(err.contains(&needle), "got: {err}");
+    }
+
+    /// Command mode sets its own `-K`, so a chunk size past `i32::MAX` (which
+    /// only sizes its in-flight budget) is accepted.
+    #[test]
+    fn resolve_accepts_command_mode_chunk_size_past_i32() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        let opts = AlignerOptions {
+            command: Some("bwa-mem3 mem -t {threads} {ref} /dev/stdin".to_string()),
+            chunk_size: 2_147_483_648,
+            ..AlignerOptions::default()
+        };
+        assert!(opts.resolve(&ref_path, 4, None).is_ok());
     }
 
     /// `resolve` rejects `--aligner::chunk-size 0` (would reach the aligner as

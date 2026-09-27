@@ -299,6 +299,74 @@ mod tests {
         );
     }
 
+    /// A pair split across a mid-pair `-K` cut zips each half with the aligner's
+    /// unpaired record for that read. Both halves (and the second read's
+    /// supplementary) must receive their own unmapped read's tags, and the
+    /// second read's QC-fail flag must transfer. Before the split halves'
+    /// pairing bits were cleared, the second half (still `PAIRED |
+    /// LAST_SEGMENT`) looked for a mapped R2, found none, and silently copied
+    /// nothing.
+    #[test]
+    fn split_pair_halves_receive_their_own_tags_and_qc_flag() {
+        use fgumi_raw_bam::flags::{
+            FIRST_SEGMENT, LAST_SEGMENT, MATE_UNMAPPED, PAIRED, QC_FAIL, REVERSE, SUPPLEMENTARY,
+            UNMAPPED,
+        };
+        let cfg = make_test_cfg();
+        let tags = ZipperTags::from_tag_info(&cfg.tag_info);
+        let r1 = make_record_with_string_tag(
+            b"pe10",
+            PAIRED | FIRST_SEGMENT | UNMAPPED | MATE_UNMAPPED,
+            crate::sam::SamTag::RX,
+            b"AAAA",
+        );
+        let r2 = make_record_with_string_tag(
+            b"pe10",
+            PAIRED | LAST_SEGMENT | UNMAPPED | MATE_UNMAPPED | QC_FAIL,
+            crate::sam::SamTag::RX,
+            b"CCCC",
+        );
+        let pair = Template::from_records(vec![r1, r2]).expect("unmapped pair");
+        let (first, second) =
+            crate::pipeline::steps::align::split_pair_into_singles(pair).expect("split");
+        let flags_of = |t: &Template| t.records()[0].flags();
+        assert_eq!(flags_of(&first), UNMAPPED, "first half keeps only non-pairing bits");
+        assert_eq!(flags_of(&second), UNMAPPED | QC_FAIL, "second half keeps QC_FAIL");
+
+        // The aligner emitted both reads unpaired; the second has a supplementary.
+        let mapped_first =
+            Template::from_records(vec![make_record(b"pe10", 0)]).expect("mapped first half");
+        let mapped_second = Template::from_records(vec![
+            make_record(b"pe10", REVERSE),
+            make_record(b"pe10", SUPPLEMENTARY),
+        ])
+        .expect("mapped second half");
+
+        let zb = ZipperBatch {
+            serial: 0,
+            mapped: vec![mapped_first, mapped_second],
+            unmapped: BamTemplateBatch::new(0, vec![first, second]),
+        };
+        let out = merge_zipper_batch(zb, &cfg, &tags).expect("merge ok");
+
+        let rx_of = |rec: &fgumi_raw_bam::RawRecord| {
+            fgumi_raw_bam::tags::find_string_tag(
+                fgumi_raw_bam::fields::aux_data_slice(rec),
+                crate::sam::SamTag::RX,
+            )
+            .map(<[u8]>::to_vec)
+        };
+        let first_out = &out.templates()[0].records;
+        let second_out = &out.templates()[1].records;
+        assert_eq!(rx_of(&first_out[0]), Some(b"AAAA".to_vec()), "first half gets R1's RX");
+        assert_eq!(second_out.len(), 2, "second half keeps its supplementary");
+        for rec in second_out {
+            assert_eq!(rx_of(rec), Some(b"CCCC".to_vec()), "second half gets R2's RX");
+            assert_ne!(rec.flags() & QC_FAIL, 0, "second half gets R2's QC-fail flag");
+        }
+        assert_eq!(first_out[0].flags() & QC_FAIL, 0, "first half's QC-pass status is unchanged");
+    }
+
     /// A `ZipperBatch` whose mapped and unmapped halves differ in length is a
     /// structural invariant violation: `merge_zipper_batch` must hard-error
     /// (release-safe) rather than let `zip` silently truncate to the shorter
