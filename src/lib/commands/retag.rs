@@ -1,4 +1,4 @@
-//! Rewrite SAM aux tags: copy, move, or delete a tag by name.
+//! Rewrite SAM aux tags: copy, move, or delete a tag by name, or pair two UMI tags.
 //!
 //! `fgumi` is intentionally opinionated about tag names — it consumes and produces
 //! a fixed set (`RX`, `MI`, ...) rather than exposing per-tool options to override
@@ -14,6 +14,11 @@
 //!   bytes) into `DST`; `SRC` stays; an existing `DST` is overwritten.
 //! - `SRC::move::DST` — sugar for `SRC::copy::DST` then `SRC::delete`.
 //! - `SRC::delete` — drop `SRC`.
+//! - `OWN,MATE::pair::DST` — join two string tags holding this read's UMI (`OWN`)
+//!   and its mate's UMI (`MATE`) into `DST` as `R1-R2`: `OWN-MATE` on every record
+//!   except the second read of a pair, which gets `MATE-OWN`, so both mates carry the
+//!   identical paired UMI.
+//!   Sources stay; a record missing either source skips the operation.
 //!
 //! Because operations apply in order they compose, e.g. `RX::copy::BX RX::copy::CB
 //! RX::delete` fans one tag out to two and drops the original. A record missing
@@ -32,7 +37,7 @@ use std::sync::atomic::AtomicU64;
 
 use anyhow::{Result, bail, ensure};
 use clap::Parser;
-use fgumi_raw_bam::{RawRecord, append_raw_tag, remove_tag};
+use fgumi_raw_bam::{RawRecord, RawTagsView, TagValue, append_raw_tag, remove_tag};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::command::Command;
@@ -52,24 +57,34 @@ pub enum RetagOp {
     Move { src: SamTag, dst: SamTag },
     /// Delete `src`.
     Delete { src: SamTag },
+    /// Join the record's own UMI (`own`) and its mate's UMI (`mate`) into `dst` as
+    /// `R1-R2`: `own-mate` on every record except the second read of a pair (paired and
+    /// not first-of-pair), which gets `mate-own`, so both mates of a template carry the
+    /// identical paired UMI.
+    Pair { own: SamTag, mate: SamTag, dst: SamTag },
 }
 
 impl RetagOp {
-    /// The operation keyword (`"copy"`, `"move"`, or `"delete"`), for metrics and logging.
+    /// The operation keyword (`"copy"`, `"move"`, `"delete"`, or `"pair"`), for metrics and
+    /// logging.
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {
             RetagOp::Copy { .. } => "copy",
             RetagOp::Move { .. } => "move",
             RetagOp::Delete { .. } => "delete",
+            RetagOp::Pair { .. } => "pair",
         }
     }
 
-    /// The source tag the operation reads (and, for `delete`, removes).
+    /// The source tags the operation reads (and, for `delete`, removes), in command-line order.
     #[must_use]
-    pub fn src(&self) -> SamTag {
+    pub(crate) fn sources(self) -> Vec<SamTag> {
         match self {
-            RetagOp::Copy { src, .. } | RetagOp::Move { src, .. } | RetagOp::Delete { src } => *src,
+            RetagOp::Copy { src, .. } | RetagOp::Move { src, .. } | RetagOp::Delete { src } => {
+                vec![src]
+            }
+            RetagOp::Pair { own, mate, .. } => vec![own, mate],
         }
     }
 }
@@ -81,6 +96,7 @@ impl fmt::Display for RetagOp {
             RetagOp::Copy { src, dst } => write!(f, "{src}::copy::{dst}"),
             RetagOp::Move { src, dst } => write!(f, "{src}::move::{dst}"),
             RetagOp::Delete { src } => write!(f, "{src}::delete"),
+            RetagOp::Pair { own, mate, dst } => write!(f, "{own},{mate}::pair::{dst}"),
         }
     }
 }
@@ -93,15 +109,37 @@ fn parse_tag(field: &str) -> Result<SamTag> {
 impl FromStr for RetagOp {
     type Err = anyhow::Error;
 
-    /// Parse one operation from `SRC::copy::DST`, `SRC::move::DST`, or `SRC::delete`.
+    /// Parse one operation from `SRC::copy::DST`, `SRC::move::DST`, `SRC::delete`, or
+    /// `OWN,MATE::pair::DST`.
     ///
     /// The `::` separator splits the fields; each `SRC`/`DST` is validated against
     /// the SAM aux-tag pattern via [`SamTag`]. Self-referential `copy`/`move`
     /// (`X::copy::X`, `X::move::X`) are rejected: the first is a no-op typo, the
-    /// second silently deletes `X`.
+    /// second silently deletes `X`. `pair` takes exactly two distinct sources, neither
+    /// of which may be the destination; only `pair` accepts a comma-separated source list.
     fn from_str(s: &str) -> Result<Self> {
         let fields: Vec<&str> = s.split("::").collect();
         match fields.as_slice() {
+            [sources, "pair", dst] => {
+                let [own, mate] = sources.split(',').collect::<Vec<_>>()[..] else {
+                    bail!(
+                        "'pair' takes exactly two comma-separated source tags, OWN,MATE; got: {s:?}"
+                    )
+                };
+                let (own, mate, dst) = (parse_tag(own)?, parse_tag(mate)?, parse_tag(dst)?);
+                ensure!(own != mate, "'{s}' names the same source tag twice");
+                ensure!(
+                    dst != own && dst != mate,
+                    "'{s}': the destination must differ from both source tags"
+                );
+                Ok(RetagOp::Pair { own, mate, dst })
+            }
+            [_, "pair", ..] => {
+                bail!("'pair' takes the form 'OWN,MATE::pair::DST'; got: {s:?}")
+            }
+            [src, ..] if src.contains(',') => {
+                bail!("only 'pair' accepts a comma-separated source list, got: {s:?}")
+            }
             [src, "delete"] => Ok(RetagOp::Delete { src: parse_tag(src)? }),
             [src, "copy", dst] => {
                 let (src, dst) = (parse_tag(src)?, parse_tag(dst)?);
@@ -124,11 +162,13 @@ impl FromStr for RetagOp {
                 bail!("'delete' takes no destination tag; use 'SRC::delete', got: {s:?}")
             }
             [_, op, _] => bail!(
-                "unknown operation {op:?}; expected 'copy' or 'move' in 'SRC::op::DST', got: {s:?}"
+                "unknown operation {op:?}; expected 'copy', 'move', or 'pair' in 'SRC::op::DST', \
+                 got: {s:?}"
             ),
             _ => bail!(
                 "could not parse retag operation {s:?}; \
-                 expected 'SRC::copy::DST', 'SRC::move::DST', or 'SRC::delete'"
+                 expected 'SRC::copy::DST', 'SRC::move::DST', 'SRC::delete', or \
+                 'OWN,MATE::pair::DST'"
             ),
         }
     }
@@ -137,15 +177,15 @@ impl FromStr for RetagOp {
 /// Per-operation application counts, accumulated across all records.
 ///
 /// One [`OpCounts`] tracks a single [`RetagOp`]. `records_applied` counts records
-/// where the source tag was present (so the operation did something);
-/// `src_missing` counts records where it was absent (the operation was skipped);
-/// `dst_overwritten` counts `copy`/`move` records whose destination already held a
-/// value that was replaced (always `0` for `delete`).
+/// where the source tag(s) were present (so the operation did something);
+/// `src_missing` counts records where a source was absent (the operation was skipped);
+/// `dst_overwritten` counts `copy`/`move`/`pair` records whose destination already held
+/// a value that was replaced (always `0` for `delete`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct OpCounts {
     /// Records where the source tag was present and the operation was applied.
     pub records_applied: u64,
-    /// Records (copy/move) where an existing destination value was overwritten.
+    /// Records (copy/move/pair) where an existing destination value was overwritten.
     pub dst_overwritten: u64,
     /// Records where the source tag was absent, so the operation was skipped.
     pub src_missing: u64,
@@ -180,12 +220,75 @@ fn copy_tag(record: &mut RawRecord, src: SamTag, dst: SamTag, counts: &mut OpCou
     true
 }
 
+/// Read a string (`Z`) tag's value, without its NUL terminator.
+///
+/// Returns `Ok(None)` when the tag is absent and an error when it is present with any
+/// other type, since joining a non-string value is a configuration error rather than
+/// missing data.
+fn string_value<'a>(
+    tags: &RawTagsView<'a>,
+    t: SamTag,
+    read_name: &[u8],
+) -> Result<Option<&'a [u8]>> {
+    match tags.get(t) {
+        None => Ok(None),
+        Some(TagValue::String(value)) => Ok(Some(value)),
+        Some(other) => bail!(
+            "retag 'pair' requires string (Z) source tags, but tag '{t}' on read '{}' is {other:?}",
+            String::from_utf8_lossy(read_name)
+        ),
+    }
+}
+
+/// Join `own` and `mate` into `dst` as `R1-R2`, overwriting any existing `dst`.
+///
+/// The second read of a pair (paired and not first-of-pair — the same rule
+/// `fgumi group` uses to pick a template's R1) gets `mate-own`; every other record
+/// (R1, fragments) gets `own-mate`, so both mates of a template carry the same
+/// R1-first paired UMI that `fgumi extract` would have written. A record missing
+/// either source is left unchanged and counted in `src_missing` — no partial join is
+/// ever written.
+fn pair_tags(
+    record: &mut RawRecord,
+    own: SamTag,
+    mate: SamTag,
+    dst: SamTag,
+    counts: &mut OpCounts,
+) -> Result<()> {
+    let is_r2 = record.is_paired() && !record.is_first_segment();
+    // Build the joined value while the tags are borrowed; the record is mutated below.
+    let joined = {
+        let tags = record.tags();
+        let own_value = string_value(&tags, own, record.read_name())?;
+        let mate_value = string_value(&tags, mate, record.read_name())?;
+        let (Some(own_value), Some(mate_value)) = (own_value, mate_value) else {
+            counts.src_missing += 1;
+            return Ok(());
+        };
+        let (first, second) = if is_r2 { (mate_value, own_value) } else { (own_value, mate_value) };
+        [first, b"-", second, b"\0"].concat()
+    };
+
+    if record.tags().contains(dst) {
+        remove_tag(record.as_mut_vec(), dst);
+        counts.dst_overwritten += 1;
+    }
+    append_raw_tag(record.as_mut_vec(), dst, b'Z', &joined);
+    counts.records_applied += 1;
+    Ok(())
+}
+
 /// Apply a single [`RetagOp`] to one record, updating its [`OpCounts`] in place.
 ///
 /// Operations are pure per-record edits: `copy` adds `dst` and keeps `src`, `move`
-/// additionally drops `src`, and `delete` drops `src`. A record missing the source
-/// tag is left unchanged and counted in `src_missing`.
-pub(crate) fn apply_op(record: &mut RawRecord, op: RetagOp, counts: &mut OpCounts) {
+/// additionally drops `src`, `delete` drops `src`, and `pair` joins two string tags
+/// into `dst`. A record missing a source tag is left unchanged and counted in
+/// `src_missing`.
+///
+/// # Errors
+///
+/// Returns an error if a `pair` source tag is present but is not a string (`Z`) tag.
+pub(crate) fn apply_op(record: &mut RawRecord, op: RetagOp, counts: &mut OpCounts) -> Result<()> {
     match op {
         RetagOp::Copy { src, dst } => {
             copy_tag(record, src, dst, counts);
@@ -205,7 +308,9 @@ pub(crate) fn apply_op(record: &mut RawRecord, op: RetagOp, counts: &mut OpCount
                 counts.src_missing += 1;
             }
         }
+        RetagOp::Pair { own, mate, dst } => pair_tags(record, own, mate, dst, counts)?,
     }
+    Ok(())
 }
 
 /// One metrics row per operation, written to the optional `--metrics` TSV.
@@ -213,11 +318,11 @@ pub(crate) fn apply_op(record: &mut RawRecord, op: RetagOp, counts: &mut OpCount
 pub struct RetagMetric {
     /// The operation as written on the command line, e.g. `RX::copy::BX`.
     pub operation: String,
-    /// The operation keyword: `copy`, `move`, or `delete`.
+    /// The operation keyword: `copy`, `move`, `delete`, or `pair`.
     pub kind: String,
     /// Records where the source tag was present and the operation was applied.
     pub records_applied: u64,
-    /// Records (copy/move) where an existing destination value was overwritten.
+    /// Records (copy/move/pair) where an existing destination value was overwritten.
     pub dst_overwritten: u64,
     /// Records where the source tag was absent, so the operation was skipped.
     pub src_missing: u64,
@@ -291,11 +396,11 @@ impl RetagOptions {
     }
 }
 
-/// Rewrite SAM aux tags by copying, moving, or deleting them by name.
+/// Rewrite SAM aux tags by copying, moving, or deleting them by name, or pairing two UMI tags.
 #[derive(Debug, Parser)]
 #[command(
     name = "retag",
-    about = "\x1b[38;5;166m[UTILITIES]\x1b[0m      \x1b[36mRewrite SAM tags (copy/move/delete)\x1b[0m",
+    about = "\x1b[38;5;166m[UTILITIES]\x1b[0m      \x1b[36mRewrite SAM tags (copy/move/delete/pair)\x1b[0m",
     long_about = r#"
 Rewrite SAM auxiliary tags from one name to another.
 
@@ -311,6 +416,12 @@ Operations are positional and applied left-to-right, per record:
                    an existing DST is overwritten
   SRC::move::DST   sugar for SRC::copy::DST then SRC::delete
   SRC::delete      drop SRC
+  OWN,MATE::pair::DST
+                   join two string tags into DST as the R1-first paired UMI: OWN-MATE on
+                   every record except the second read of a pair (paired, not first of
+                   pair), which gets MATE-OWN, so both mates carry the same value; sources
+                   stay; an existing DST is overwritten; a record missing either source
+                   skips the operation
 
 Because operations apply in order, they compose:
 
@@ -320,12 +431,17 @@ Because operations apply in order, they compose:
   # chain through
   fgumi retag -i in.bam -o out.bam RX::move::BX BX::move::CB
 
+  # build a paired (duplex) RX from per-read NanoSeq barcode tags, then drop them
+  fgumi retag -i in.bam -o out.bam rb,mb::pair::RX rb::delete mb::delete
+
 Each SRC/DST is validated against the SAM aux-tag pattern [A-Za-z][A-Za-z0-9]. A record
 missing SRC simply skips that operation. Output is written in the same order as the input.
 
 With --metrics, one row per operation is written (operation, kind, records_applied,
 dst_overwritten, src_missing). A warning is logged for any operation that matched zero
-records, which catches tag typos.
+records, which catches tag typos. A pair source that is present but not a string (Z) tag
+is an error that stops the run; any output written up to that point is incomplete and
+should be discarded.
 "#
 )]
 pub struct Retag {
@@ -334,7 +450,7 @@ pub struct Retag {
     pub io: BamIoOptions,
 
     /// Tag-rewrite operations, applied left-to-right per record:
-    /// `SRC::copy::DST`, `SRC::move::DST`, or `SRC::delete`.
+    /// `SRC::copy::DST`, `SRC::move::DST`, `SRC::delete`, or `OWN,MATE::pair::DST`.
     #[arg(value_name = "SRC::op::DST", required = true, num_args = 1..)]
     pub operations: Vec<RetagOp>,
 
@@ -487,7 +603,7 @@ impl Command for Retag {
 mod tests {
     use super::*;
     use fgumi_bam_io::{create_raw_bam_reader_with_opts, create_raw_bam_writer};
-    use fgumi_raw_bam::{RawTagsView, SamBuilder, aux_data_slice};
+    use fgumi_raw_bam::{RawTagsView, SamBuilder, aux_data_slice, flags};
     use noodles::sam::Header;
     use rstest::rstest;
 
@@ -536,7 +652,7 @@ mod tests {
     /// Apply one op to a record starting from zeroed counts; return the counts.
     fn apply_one(record: &mut RawRecord, op: RetagOp) -> OpCounts {
         let mut counts = OpCounts::default();
-        apply_op(record, op, &mut counts);
+        apply_op(record, op, &mut counts).expect("apply op");
         counts
     }
 
@@ -545,6 +661,7 @@ mod tests {
     #[case::move_("RX::move::BX", RetagOp::Move { src: tag("RX"), dst: tag("BX") })]
     #[case::delete("RX::delete", RetagOp::Delete { src: tag("RX") })]
     #[case::lowercase_local_tag("ob::move::RX", RetagOp::Move { src: tag("ob"), dst: tag("RX") })]
+    #[case::pair("rb,mb::pair::RX", RetagOp::Pair { own: tag("rb"), mate: tag("mb"), dst: tag("RX") })]
     fn parses_valid_operations(#[case] input: &str, #[case] expected: RetagOp) {
         assert_eq!(input.parse::<RetagOp>().expect("should parse"), expected);
     }
@@ -564,12 +681,57 @@ mod tests {
         assert!(input.parse::<RetagOp>().is_err(), "expected {input:?} to be rejected");
     }
 
-    #[test]
-    fn kind_and_src_report_the_operation() {
-        assert_eq!("RX::copy::BX".parse::<RetagOp>().unwrap().kind(), "copy");
-        assert_eq!("RX::move::BX".parse::<RetagOp>().unwrap().kind(), "move");
-        assert_eq!("RX::delete".parse::<RetagOp>().unwrap().kind(), "delete");
-        assert_eq!("RX::delete".parse::<RetagOp>().unwrap().src(), tag("RX"));
+    /// Each malformed `pair` / source-list input is rejected by the branch that
+    /// diagnoses it, so the message names the actual mistake.
+    #[rstest]
+    #[case::pair_one_source("rb::pair::RX", "exactly two comma-separated source tags")]
+    #[case::pair_three_sources("rb,mb,xb::pair::RX", "exactly two comma-separated source tags")]
+    #[case::pair_empty_mate("rb,::pair::RX", "invalid retag tag \"\"")]
+    #[case::pair_same_sources("rb,rb::pair::RX", "names the same source tag twice")]
+    #[case::pair_dst_is_own("rb,mb::pair::rb", "destination must differ from both source tags")]
+    #[case::pair_dst_is_mate("rb,mb::pair::mb", "destination must differ from both source tags")]
+    #[case::pair_missing_dst("rb,mb::pair", "'pair' takes the form 'OWN,MATE::pair::DST'")]
+    #[case::pair_extra_field("rb,mb::pair::RX::BX", "'pair' takes the form 'OWN,MATE::pair::DST'")]
+    #[case::pair_bad_source_tag("rb,m::pair::RX", "invalid retag tag \"m\"")]
+    #[case::copy_source_list(
+        "rb,mb::copy::RX",
+        "only 'pair' accepts a comma-separated source list"
+    )]
+    #[case::move_source_list(
+        "rb,mb::move::RX",
+        "only 'pair' accepts a comma-separated source list"
+    )]
+    #[case::delete_source_list(
+        "rb,mb::delete",
+        "only 'pair' accepts a comma-separated source list"
+    )]
+    fn rejects_malformed_pair_and_source_lists(#[case] input: &str, #[case] expected: &str) {
+        let err = input.parse::<RetagOp>().expect_err("should be rejected");
+        assert!(err.to_string().contains(expected), "{input:?}: unexpected error: {err}");
+    }
+
+    #[rstest]
+    #[case::copy("RX::copy::BX", "copy", vec![tag("RX")])]
+    #[case::move_("RX::move::BX", "move", vec![tag("RX")])]
+    #[case::delete("RX::delete", "delete", vec![tag("RX")])]
+    #[case::pair("rb,mb::pair::RX", "pair", vec![tag("rb"), tag("mb")])]
+    fn kind_and_sources_report_the_operation(
+        #[case] input: &str,
+        #[case] expected_kind: &str,
+        #[case] expected_sources: Vec<SamTag>,
+    ) {
+        let op = input.parse::<RetagOp>().expect("should parse");
+        assert_eq!(op.kind(), expected_kind);
+        assert_eq!(op.sources(), expected_sources);
+    }
+
+    #[rstest]
+    #[case::copy("RX::copy::BX")]
+    #[case::move_("RX::move::BX")]
+    #[case::delete("RX::delete")]
+    #[case::pair("rb,mb::pair::RX")]
+    fn display_round_trips_the_operation(#[case] input: &str) {
+        assert_eq!(input.parse::<RetagOp>().expect("should parse").to_string(), input);
     }
 
     // ── apply engine ───────────────────────────────────────────────────────
@@ -589,7 +751,7 @@ mod tests {
     fn apply_all(record: &mut RawRecord, ops: &[RetagOp]) -> Vec<OpCounts> {
         let mut counts = vec![OpCounts::default(); ops.len()];
         for (op, c) in ops.iter().zip(counts.iter_mut()) {
-            apply_op(record, *op, c);
+            apply_op(record, *op, c).expect("apply op");
         }
         counts
     }
@@ -718,6 +880,127 @@ mod tests {
         assert!(!record.tags().contains(tag("RX")));
         assert!(!record.tags().contains(tag("BX")));
         assert_eq!(record.tags().find_string(tag("CB")), Some(b"ACGT".as_ref()));
+    }
+
+    // ── pair ───────────────────────────────────────────────────────────────
+
+    /// Build a record with the given flags and optional `rb`/`mb` string tags.
+    fn nanoseq_record(flags: u16, own: Option<&[u8]>, mate: Option<&[u8]>) -> RawRecord {
+        let mut b = SamBuilder::new();
+        b.read_name(b"r1").flags(flags);
+        if let Some(v) = own {
+            b.add_string_tag(tag("rb"), v);
+        }
+        if let Some(v) = mate {
+            b.add_string_tag(tag("mb"), v);
+        }
+        b.build()
+    }
+
+    const R1: u16 = flags::PAIRED | flags::FIRST_SEGMENT;
+    const R2: u16 = flags::PAIRED | flags::LAST_SEGMENT;
+
+    #[rstest]
+    #[case::r1_own_then_mate(R1, b"GTT", b"CTA", b"GTT-CTA")]
+    #[case::r2_mate_then_own(R2, b"CTA", b"GTT", b"GTT-CTA")]
+    #[case::r1_secondary(R1 | flags::SECONDARY, b"GTT", b"CTA", b"GTT-CTA")]
+    #[case::r2_supplementary(R2 | flags::SUPPLEMENTARY, b"CTA", b"GTT", b"GTT-CTA")]
+    #[case::fragment_own_then_mate(0, b"GTT", b"CTA", b"GTT-CTA")]
+    // Degenerate flags follow `fgumi group`'s R1 rule (`!paired || first_of_pair`).
+    #[case::unpaired_with_last_segment_is_r1(flags::LAST_SEGMENT, b"GTT", b"CTA", b"GTT-CTA")]
+    #[case::paired_without_segment_bits_is_r2(flags::PAIRED, b"CTA", b"GTT", b"GTT-CTA")]
+    #[case::both_segment_bits_is_r1(R1 | flags::LAST_SEGMENT, b"GTT", b"CTA", b"GTT-CTA")]
+    #[case::empty_own_is_kept(R1, b"", b"CTA", b"-CTA")]
+    fn pair_joins_umis_in_r1_then_r2_order(
+        #[case] flags: u16,
+        #[case] own: &[u8],
+        #[case] mate: &[u8],
+        #[case] expected: &[u8],
+    ) {
+        let mut record = nanoseq_record(flags, Some(own), Some(mate));
+        let counts = apply_one(&mut record, "rb,mb::pair::RX".parse().unwrap());
+
+        assert_eq!(record.tags().find_string(tag("RX")), Some(expected));
+        assert_eq!(record.tags().find_string(tag("rb")), Some(own), "own source kept");
+        assert_eq!(record.tags().find_string(tag("mb")), Some(mate), "mate source kept");
+        assert_eq!(counts, OpCounts { records_applied: 1, dst_overwritten: 0, src_missing: 0 });
+    }
+
+    #[rstest]
+    #[case::missing_own(None, Some(b"CTA".as_slice()))]
+    #[case::missing_mate(Some(b"GTT".as_slice()), None)]
+    #[case::missing_both(None, None)]
+    fn pair_skips_a_record_missing_either_source(
+        #[case] own: Option<&[u8]>,
+        #[case] mate: Option<&[u8]>,
+    ) {
+        let mut record = nanoseq_record(R1, own, mate);
+        let counts = apply_one(&mut record, "rb,mb::pair::RX".parse().unwrap());
+
+        assert!(!record.tags().contains(tag("RX")), "no partial join written");
+        assert_eq!(counts, OpCounts { records_applied: 0, dst_overwritten: 0, src_missing: 1 });
+    }
+
+    #[test]
+    fn pair_overwrites_an_existing_destination() {
+        let mut b = SamBuilder::new();
+        b.read_name(b"r1")
+            .flags(R1)
+            .add_string_tag(tag("rb"), b"GTT")
+            .add_string_tag(tag("mb"), b"CTA")
+            .add_string_tag(tag("RX"), b"OLD");
+        let mut record = b.build();
+
+        let counts = apply_one(&mut record, "rb,mb::pair::RX".parse().unwrap());
+
+        assert_eq!(record.tags().find_string(tag("RX")), Some(b"GTT-CTA".as_ref()));
+        assert_eq!(counts, OpCounts { records_applied: 1, dst_overwritten: 1, src_missing: 0 });
+    }
+
+    /// A non-string source is an error, even when the other source is absent — it is a
+    /// configuration mistake, not missing data.
+    #[rstest]
+    #[case::non_string_mate(Some(b"GTT".as_slice()), true, "tag 'mb'")]
+    #[case::non_string_own_mate_missing(None, false, "tag 'rb'")]
+    fn pair_rejects_a_non_string_source(
+        #[case] own_string: Option<&[u8]>,
+        #[case] mate_is_int: bool,
+        #[case] expected_tag: &str,
+    ) {
+        let mut b = SamBuilder::new();
+        b.read_name(b"r1").flags(R1);
+        match own_string {
+            Some(v) => b.add_string_tag(tag("rb"), v),
+            None => b.add_int_tag(tag("rb"), 7),
+        };
+        if mate_is_int {
+            b.add_int_tag(tag("mb"), 7);
+        }
+        let mut record = b.build();
+
+        let mut counts = OpCounts::default();
+        let err = apply_op(&mut record, "rb,mb::pair::RX".parse().unwrap(), &mut counts)
+            .expect_err("a non-Z source must be an error");
+        let msg = err.to_string();
+        assert!(msg.contains("requires string (Z) source tags"), "unexpected error: {msg}");
+        assert!(msg.contains(expected_tag), "error names the offending tag: {msg}");
+        assert!(msg.contains("Int(7)"), "error reports the offending value's type: {msg}");
+        assert!(!record.tags().contains(tag("RX")), "nothing written on error");
+        assert_eq!(counts, OpCounts::default(), "an error is not counted as src_missing");
+    }
+
+    #[test]
+    fn pair_then_delete_leaves_only_the_destination() {
+        let ops: Vec<RetagOp> = ["rb,mb::pair::RX", "rb::delete", "mb::delete"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let mut record = nanoseq_record(R2, Some(b"CTA"), Some(b"GTT"));
+        apply_all(&mut record, &ops);
+
+        assert!(!record.tags().contains(tag("rb")));
+        assert!(!record.tags().contains(tag("mb")));
+        assert_eq!(record.tags().find_string(tag("RX")), Some(b"GTT-CTA".as_ref()));
     }
 
     // ── end-to-end: real BAM round-trip through the Retag command ────────────

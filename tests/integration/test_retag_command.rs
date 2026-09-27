@@ -293,3 +293,89 @@ fn multi_batch_consistent_across_worker_counts() {
         "multi-batch summed metrics must match across worker counts"
     );
 }
+
+// ── pair: NanoSeq own/mate barcode tags → one R1-first paired RX ────────────
+
+/// A mapped mate of a NanoSeq-style template: `rb` holds this read's barcode and
+/// `mb` its mate's (the tags a shared `NanoSeq` CRAM carries after `extract_tags.py`).
+fn nanoseq_mate(name: &str, flags: u16, rb: &str, mb: &str) -> RawRecord {
+    let mut b = SamBuilder::new();
+    b.read_name(name.as_bytes())
+        .sequence(b"ACGT")
+        .qualities(&[30; 4])
+        .flags(flags)
+        .ref_id(0)
+        .pos(99)
+        .mapq(60)
+        .cigar_ops(&[4 << 4])
+        .add_string_tag("rb".parse::<SamTag>().unwrap(), rb.as_bytes())
+        .add_string_tag("mb".parse::<SamTag>().unwrap(), mb.as_bytes());
+    b.build()
+}
+
+#[rstest]
+#[case::single_worker(None)]
+#[case::threads_2(Some(2))]
+fn pair_writes_the_same_r1_first_rx_on_both_mates(#[case] threads: Option<usize>) {
+    use fgumi_raw_bam::flags::{FIRST_SEGMENT, LAST_SEGMENT, PAIRED};
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record_buf::data::field::Value;
+
+    let dir = TempDir::new().unwrap();
+    // The two mates from fulcrumgenomics/fgumi#984: R1 rb=GTT/mb=CTA, R2 rb=CTA/mb=GTT.
+    let input = write_input(
+        dir.path(),
+        "in.bam",
+        &[
+            nanoseq_mate("t1", PAIRED | LAST_SEGMENT, "CTA", "GTT"),
+            nanoseq_mate("t1", PAIRED | FIRST_SEGMENT, "GTT", "CTA"),
+        ],
+    );
+    let output = dir.path().join("out.bam");
+    let metrics = dir.path().join("retag.tsv");
+
+    run_retag(
+        &input,
+        &output,
+        threads,
+        &["rb,mb::pair::RX", "rb::delete", "mb::delete"],
+        Some(&metrics),
+    )
+    .expect("retag run");
+
+    let (_, records) = read_bam_output(&output);
+    assert_eq!(records.len(), 2);
+    for record in &records {
+        let data = record.data();
+        let tag = |s: &str| Tag::from(s.parse::<SamTag>().unwrap());
+        assert_eq!(data.get(&Tag::from(SamTag::RX)), Some(&Value::String("GTT-CTA".into())));
+        assert!(data.get(&tag("rb")).is_none(), "rb deleted");
+        assert!(data.get(&tag("mb")).is_none(), "mb deleted");
+    }
+
+    // TSV columns: operation, kind, records_applied, dst_overwritten, src_missing.
+    let tsv = std::fs::read_to_string(&metrics).unwrap();
+    assert!(tsv.lines().any(|l| l == "rb,mb::pair::RX\tpair\t2\t0\t0"), "pair row:\n{tsv}");
+}
+
+#[rstest]
+#[case::single_worker(None)]
+#[case::threads_2(Some(2))]
+fn pair_fails_on_a_non_string_source(#[case] threads: Option<usize>) {
+    let dir = TempDir::new().unwrap();
+    let mut b = SamBuilder::new();
+    b.read_name(b"read1")
+        .sequence(b"ACGT")
+        .qualities(&[30; 4])
+        .flags(0)
+        .add_string_tag("rb".parse::<SamTag>().unwrap(), b"GTT")
+        .add_int_tag("mb".parse::<SamTag>().unwrap(), 7);
+    let input = write_input(dir.path(), "in.bam", &[b.build()]);
+    let output = dir.path().join("out.bam");
+
+    let err = run_retag(&input, &output, threads, &["rb,mb::pair::RX"], None)
+        .expect_err("a non-string pair source must fail the run");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("requires string (Z) source tags"), "unexpected error: {msg}");
+    assert!(msg.contains("tag 'mb' on read 'read1'"), "error names the tag and read: {msg}");
+}

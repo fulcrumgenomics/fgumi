@@ -130,6 +130,34 @@ higher on each strand) if you want **only** true duplex molecules.
 fgumi duplex-metrics --input grouped.bam --output my_sample
 ```
 
+## Starting from Shared NanoSeq CRAMs
+
+Published NanoSeq data (for example, from the Sanger pipeline) is often shared as aligned CRAMs
+rather than FASTQs. In these files the barcode and skipped bases have already been trimmed from
+each read, and the barcodes are carried in per-read tags instead of `RX`:
+
+- `rb` — this read's 3&nbsp;bp barcode.
+- `mb` — its mate's 3&nbsp;bp barcode.
+
+Rather than converting back to FASTQ and re-running extraction and alignment, `fgumi retag` can
+build the paired `RX` directly. The `pair` operation writes `rb-mb` on R1 and `mb-rb` on R2, so
+both mates carry the same R1-first barcode pair that `fgumi extract` would have produced:
+
+```bash
+# fgumi reads BAM, so decode the CRAM first (use the reference it was aligned to)
+samtools view -b -@ 8 -T hs37d5.fa -o shared.bam shared.cram
+
+fgumi retag --input shared.bam --output retagged.bam rb,mb::pair::RX rb::delete mb::delete
+fgumi sort --input retagged.bam --output sorted.bam --order template-coordinate --threads 16
+fgumi group --input sorted.bam --output grouped.bam --strategy paired --edits 0 --threads 16
+fgumi duplex --input grouped.bam --output consensus.bam --min-reads 1,1,0
+```
+
+Use the full CRAM, in which PCR duplicates are marked but kept, not a deduplicated one: the
+duplicates are the reads that make up each molecule's family, so a deduplicated file leaves every
+family with a single read and nothing to call a consensus from. The reads must also carry the
+mate-cigar (`MC`) tag, which `group` requires.
+
 ## Interpreting the Duplex Metrics
 
 `duplex-metrics` writes `<prefix>.duplex_yield_metrics.txt`, whose last row (100% of the data)
