@@ -86,7 +86,8 @@ jobs:
   #     upstream* (fg-labs/bwa-mem3-rs's own `e2e` job does that, to diff
   #     against this crate's output byte-for-byte); `cc` enforces no such floor
   #     on the sys crate itself, and this job never builds the reference CLI
-  #     binary.
+  #     binary. The real-index / real-binary parity matrix runs in the
+  #     `e2e-parity` job below.
   aligner-ffi:
     strategy:
       fail-fast: false
@@ -130,6 +131,156 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --no-deps -p fgumi --document-private-items --features aligner-bwa-mem3 --locked
+
+  # End-to-end byte-parity acceptance gate: the in-process bwa-mem3
+  # backend's merged BAM must be byte-identical to the subprocess `bwa-mem3`
+  # preset's, save the `@PG CL` field. Parity is only defined against the SAME
+  # bwa-mem3 version the crate vendors, so this job builds the reference CLI
+  # binary from the vendored commit (the pixi/bioconda binary a dev box carries
+  # is a different version and would diverge spuriously — which is exactly why
+  # `tests/align_inproc_parity.rs` skips unless handed a matching binary). This
+  # is the heavier sibling of `aligner-ffi` (which only builds the feature and
+  # runs its unit tests, no reference binary): it additionally needs clang-19
+  # (the vendored bwa-mem3 Makefile's compiler floor), libdeflate, samtools, and
+  # a built PhiX-scale index, so it is a separate job. Mirrors fg-labs/
+  # bwa-mem3-rs's own `e2e` job pattern (the proven approach).
+  #
+  # Matrix covers both architectures the feature compiles on, each pinned to the
+  # SIMD tier both the reference binary (`make arch=<bwa_arch>`) and the linked
+  # in-process kernels (bwa-mem3-sys's cc build) must share for byte-parity —
+  # avx2 on x86, arm64/NEON on arm. fg-labs/bwa-mem3#513 retired the pre-AVX2
+  # x86 tiers, so avx2 is the x86 floor.
+  e2e-parity:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            bwa_arch: avx2
+          - os: ubuntu-24.04-arm
+            bwa_arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build deps + samtools
+        # build-essential + zlib1g-dev: bwa-mem3-sys's cc build (the in-process
+        # kernels). libdeflate-dev: the vendored bwa-mem3 Makefile links it when
+        # building the reference CLI from upstream (unlike the pruned sys-crate
+        # snapshot). samtools: builds the smoke-test index's `.fai`/`.dict`.
+        # autoconf/automake: the upstream Makefile's submodule builds.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential zlib1g-dev libdeflate-dev \
+            samtools autoconf automake
+      - name: Install clang-19 (verified LLVM apt repo)
+        # The vendored bwa-mem3 Makefile requires clang >= 19 / gcc >= 15 (the
+        # runner ships an older gcc), and clang's -fopenmp (libsais LIBSAIS_OPENMP)
+        # needs libomp. Install from apt.llvm.org via a pinned repo whose signing
+        # key is fingerprint-verified before use — NOT `llvm.sh | sudo bash` — so
+        # a tampered mirror or installer cannot run code as root (CWE-494).
+        # Mirrors fg-labs/bwa-mem3-rs's e2e job and fg-labs/bwa-mem3's release.yml.
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          codename="${VERSION_CODENAME:-$(lsb_release -cs)}"
+          expected_fpr="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
+          got_fpr="$(gpg --show-keys --with-colons --with-fingerprint /tmp/llvm-snapshot.gpg.key | awk -F: '/^fpr:/ {print $10; exit}')"
+          if [ "$got_fpr" != "$expected_fpr" ]; then
+            echo "FATAL: LLVM archive key fingerprint mismatch: got '$got_fpr', expected '$expected_fpr'" >&2
+            exit 1
+          fi
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo gpg --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg /tmp/llvm-snapshot.gpg.key
+          echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-19 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-19.list
+          sudo apt-get update
+          sudo apt-get install -y clang-19 libomp-19-dev
+          clang++-19 --version | head -1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Install nextest
+        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.85.12
+        with:
+          tool: nextest
+      - name: Build reference bwa-mem3 from upstream at the vendored COMMIT
+        # Byte-parity is only defined against the exact bwa-mem3 the crate
+        # vendors. This SHA is the full 40-hex of the vendored `51ceed7`, fixed
+        # by the `bwa-mem3-rs` 0.3.0 Cargo pin (its
+        # bwa-mem3-sys/vendor/COMMIT). If the Cargo pin is bumped, update this to
+        # match; the check below fails fast on a mismatch rather than letting it
+        # surface as spurious parity divergence. The clone is not at the release
+        # tag, so this binary reports `@PG VN` with a `-<sha>` suffix; the parity
+        # test strips it.
+        run: |
+          set -euo pipefail
+          sha="51ceed7531e1d843dd2dd743ad95931c385873ca"
+          # Resolve the locked bwa-mem3-sys checkout (cargo metadata fetches the
+          # git dep) and compare its vendor/COMMIT against `sha`.
+          sys_manifest="$(cargo metadata --format-version 1 --locked --features aligner-bwa-mem3 \
+            | python3 -c 'import json, sys; print(next(p["manifest_path"] for p in json.load(sys.stdin)["packages"] if p["name"] == "bwa-mem3-sys"))')"
+          vendored="$(tr -d '[:space:]' < "$(dirname "$sys_manifest")/vendor/COMMIT")"
+          if [ "$vendored" != "$sha" ]; then
+            echo "FATAL: bwa-mem3-sys vendors bwa-mem3 '$vendored' but this step builds '$sha'; update sha to match the Cargo pin" >&2
+            exit 1
+          fi
+          # Blobless + depth-1 fetch of just the vendored SHA — avoids pulling the
+          # full upstream commit graph. The vendored sys-crate snapshot is pruned
+          # (no ext/htslib, ext/libsais, ext/mimalloc), which the Makefile needs,
+          # so clone fresh at the same SHA with all submodules.
+          git init /tmp/bwa-mem3
+          git -C /tmp/bwa-mem3 remote add origin https://github.com/fg-labs/bwa-mem3.git
+          git -C /tmp/bwa-mem3 fetch --filter=blob:none --no-tags --depth=1 origin "$sha"
+          git -C /tmp/bwa-mem3 checkout FETCH_HEAD
+          git -C /tmp/bwa-mem3 submodule update --init --recursive --depth 1
+          make -C /tmp/bwa-mem3 arch=${{ matrix.bwa_arch }} CXX=clang++-19 CC=clang-19 -j"$(nproc)" all
+          echo "BWA_MEM3_BIN=/tmp/bwa-mem3/bwa-mem3" >> "$GITHUB_ENV"
+          # Also put it on PATH, so anything resolving a bare `bwa-mem3` gets the
+          # vendored-commit binary rather than none.
+          echo "/tmp/bwa-mem3" >> "$GITHUB_PATH"
+      - name: Build a PhiX-scale reference + index with the reference binary
+        # For the in-process engine smoke unit test, which loads a prebuilt index
+        # from FGUMI_BWA_MEM3_TEST_REF. (The two parity suites build and index
+        # their own fixture reference with BWA_MEM3_BIN.) Build the bwa-mem3
+        # index WITH THE REFERENCE BINARY, so the in-process backend, which links
+        # the same commit, loads it.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/fgumi-parity-ref
+          ref=/tmp/fgumi-parity-ref/ref.fa
+          python3 -c "import random; random.seed(42); print('>ref'); print(''.join(random.choice('ACGT') for _ in range(20000)))" > "$ref"
+          "$BWA_MEM3_BIN" index "$ref"
+          samtools faidx "$ref"
+          samtools dict "$ref" -o /tmp/fgumi-parity-ref/ref.dict
+          echo "FGUMI_BWA_MEM3_TEST_REF=$ref" >> "$GITHUB_ENV"
+      - name: Backend byte-parity + determinism matrix
+        # FGUMI_BWA_MEM3_REQUIRE_TOOLS makes a missing binary or index fail rather
+        # than skip, so this job cannot silently degrade into a no-op — the whole
+        # reason it exists is to actually run the gate. Runs BOTH parity suites:
+        # align_inproc_parity (in-process vs subprocess byte-parity) and
+        # align_subprocess_split_parity (the subprocess align/merge guard). Both
+        # take the reference binary from BWA_MEM3_BIN, set by the build step above.
+        env:
+          FGUMI_BWA_MEM3_REQUIRE_TOOLS: "1"
+        run: |
+          cargo nextest run --features aligner-bwa-mem3 -p fgumi --locked \
+            --test align_inproc_parity --test align_subprocess_split_parity --no-fail-fast
+      - name: In-process engine smoke test against a real index
+        # The only unit test that drives the real BwaMem3Engine. It loads the
+        # index built above from FGUMI_BWA_MEM3_TEST_REF; with
+        # FGUMI_BWA_MEM3_REQUIRE_TOOLS set, a missing index fails instead of
+        # skipping.
+        env:
+          FGUMI_BWA_MEM3_REQUIRE_TOOLS: "1"
+        run: |
+          cargo nextest run --features aligner-bwa-mem3 -p fgumi --locked --lib \
+            -E 'test(bwa_mem3_engine_smoke_pair_emit)'
 
   # `merge_slots.rs` swaps `std::sync` for `loom::sync` under `--cfg loom`, and
   # `tests/loom_merge_slots.rs` is `#![cfg(loom)]`. Neither is built by any other
@@ -462,6 +613,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # `--all-features` below now also enables `aligner-bwa-mem3`, which pulls
+      # in `bwa-mem3-sys`'s C++ build (see the `aligner-ffi` job's comment for
+      # why this is the minimal dep set — no libclang/clang-19 needed here).
+      - name: Install build deps (C++17 toolchain for bwa-mem3-sys)
+        run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - name: Set up compilation cache (sccache)
