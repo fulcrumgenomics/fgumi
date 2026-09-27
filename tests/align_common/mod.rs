@@ -1,8 +1,8 @@
-//! Fixture + BAM-comparison helpers for the bwa-mem3 align-stage parity suites
-//! (`align_subprocess_split_parity.rs`).
+//! Fixture + BAM-comparison helpers shared by the bwa-mem3 align-stage parity
+//! suites (`align_inproc_parity.rs`, `align_subprocess_split_parity.rs`).
 //!
-//! Included as `mod align_common;` (a directory module, so cargo does not build
-//! it as a test target of its own). A suite may use only a subset of the
+//! Included by both as `mod align_common;` (a directory module, so cargo does not
+//! build it as a test target of its own). Each suite uses a subset of the
 //! helpers, hence the module-wide `dead_code` allow.
 //!
 //! The fixture is built to exercise real alignment behaviour rather than only
