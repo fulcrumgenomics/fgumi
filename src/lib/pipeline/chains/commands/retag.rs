@@ -93,10 +93,7 @@ impl FinalizeHook for RetagMetricsFinalizeHook {
         // source tag.
         for (op, op_counts) in operations.iter().zip(&counts) {
             if op_counts.records_applied == 0 {
-                warn!(
-                    "operation '{op}' matched zero records: no record carried the source tag '{}'",
-                    op.src()
-                );
+                warn!("{}", zero_match_warning(*op));
             }
         }
 
@@ -112,6 +109,18 @@ impl FinalizeHook for RetagMetricsFinalizeHook {
 
         Ok(())
     }
+}
+
+/// The warning logged for an operation that matched zero records — the usual sign of a
+/// mistyped source tag. Single-source wording is pinned verbatim by the cutover parity
+/// test; a multi-source op (`pair`) names every source it needed.
+fn zero_match_warning(op: RetagOp) -> String {
+    let sources: Vec<String> = op.sources().iter().map(ToString::to_string).collect();
+    let noun = if sources.len() == 1 { "the source tag" } else { "all of the source tags" };
+    format!(
+        "operation '{op}' matched zero records: no record carried {noun} '{}'",
+        sources.join(",")
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -132,7 +141,7 @@ fn retag_one_record(
     bytes: &mut Vec<u8>,
 ) -> io::Result<()> {
     for (op, op_counts) in captures.operations.iter().zip(batch_counts.iter_mut()) {
-        apply_op(record, *op, op_counts);
+        apply_op(record, *op, op_counts).map_err(io::Error::other)?;
     }
     fgumi_raw_bam::write_framed_record(bytes, record.as_ref())?;
     Ok(())
@@ -257,4 +266,25 @@ pub(crate) fn build_retag_process_step_raw(
             Ok(DecompressedBlock { batch_serial, bytes })
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::single_source(
+        "ZZ::delete",
+        "operation 'ZZ::delete' matched zero records: no record carried the source tag 'ZZ'"
+    )]
+    #[case::pair(
+        "rb,mb::pair::RX",
+        "operation 'rb,mb::pair::RX' matched zero records: \
+         no record carried all of the source tags 'rb,mb'"
+    )]
+    fn zero_match_warning_names_every_source(#[case] op: &str, #[case] expected: &str) {
+        let op: RetagOp = op.parse().expect("valid op");
+        assert_eq!(zero_match_warning(op), expected);
+    }
 }

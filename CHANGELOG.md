@@ -25,6 +25,13 @@ All notable changes to this project will be documented in this file.
   every metric file fgumi emits (keyed `<namespace>.<file>`), for downstream report
   tooling. A test fails if it drifts from the metric structs, or if a serialized struct
   is neither listed in it nor explicitly allowlisted.
+- Add a `pair` operation to `fgumi retag`: `OWN,MATE::pair::DST` joins a read's own
+  UMI tag and its mate's UMI tag into the R1-first paired UMI (`OWN-MATE` on R1,
+  `MATE-OWN` on R2), so both mates carry the same value `fgumi group --strategy paired`
+  expects. This lets shared NanoSeq CRAMs, which carry per-read `rb`/`mb` barcode tags
+  instead of `RX`, go straight to grouping and duplex consensus without re-extracting
+  from FASTQ (`fgumi retag rb,mb::pair::RX`). `RetagOp` gains a `Pair` variant and its
+  public `src()` accessor is removed.
 
 ### Bug Fixes
 
