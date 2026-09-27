@@ -1,10 +1,16 @@
-//! `AlignAndMergeStep` — typed `Step` that wraps an aligner
-//! subprocess and pairs aligner output with original unmapped tags.
+//! `SubprocessAlignStep` — the subprocess align backend.
 //!
-//! Supersedes a former hand-rolled orchestrator that drained aligner
-//! stdout to a tempfile and then re-opened the input BAM via
-//! `Zipper::execute`. This Step instead streams template-by-template
-//! with no tempfile bridge.
+//! A `Serial` typed `Step` that wraps an aligner subprocess and pairs aligner
+//! output with the original unmapped tags, emitting a `ZipperBatch` stream for
+//! the shared `MergeAlignedStep` to merge.
+//!
+//! This is the former `AlignAndMergeStep` with its inline `merge_zipper_batch`
+//! call removed: instead of merging on the dispatching worker, `try_run` now
+//! pushes the raw `ZipperBatch` to an
+//! `OrderedBytesSingle<ZipperBatch>` output. The reader still releases the
+//! in-flight gate at token consumption, so the memory profile is unchanged. The
+//! writer/reader threads, the byte-budget gate, header handling, and
+//! finalize/Drop teardown are unchanged from the pre-split step.
 //!
 //! ## Shape
 //!
@@ -12,44 +18,29 @@
 //!  upstream (BamTemplateBatch)
 //!     │
 //!     ▼
-//!  ┌──────────────── AlignAndMergeStep ─────────────────┐
-//!  │  Owns:                                              │
-//!  │    • AlignerProcess (subprocess + stderr ring)      │
-//!  │    • stdin-writer thread (FASTQ → aligner stdin)    │
-//!  │    • stdout-reader thread (SAM/BAM parse only —     │
-//!  │      no merge; emits ZipperBatch for try_run)       │
-//!  │    • Three bounded channels (in_chan, token_chan,   │
-//!  │      out_chan) and a shared error slot              │
-//!  │                                                     │
-//!  │  Step::try_run (Serial; any worker can dispatch):   │
-//!  │    upstream → in_chan → (writer) → aligner stdin    │
-//!  │    aligner stdout → (reader) → out_chan ──┐         │
-//!  │                                            ▼         │
-//!  │                              merge_zipper_batch      │
-//!  │                              (merge_raw + bisulfite) │
-//!  │                                            │         │
-//!  │                                            ▼         │
-//!  │                                       downstream     │
+//!  ┌──────────────── SubprocessAlignStep ────────────────┐
+//!  │  Owns:                                               │
+//!  │    • AlignerProcess (subprocess + stderr ring)       │
+//!  │    • stdin-writer thread (FASTQ → aligner stdin)     │
+//!  │    • stdout-reader thread (SAM/BAM parse; emits      │
+//!  │      ZipperBatch)                                    │
+//!  │    • Three channels (in_chan, token_chan, out_chan)  │
+//!  │      and a shared error slot                         │
+//!  │                                                      │
+//!  │  Step::try_run (Serial; any worker can dispatch):    │
+//!  │    upstream → in_chan → (writer) → aligner stdin     │
+//!  │    aligner stdout → (reader) → out_chan → push       │
+//!  │                              ZipperBatch downstream   │
 //!  └──────────────────────────────────────────────────────┘
 //! ```
 //!
 //! Why `Serial` instead of `Exclusive`: `Exclusive` pinned dispatch to
 //! one worker, which meant any other step's blocking work on that
 //! worker (e.g. a held-slot flush spin-retrying on a full downstream)
-//! could starve AAM and deadlock the pipeline.
-//! `Serial` lets any free worker dispatch AAM; the framework mutex
+//! could starve this step and deadlock the pipeline.
+//! `Serial` lets any free worker dispatch it; the framework mutex
 //! preserves the "one dispatcher at a time" invariant that
-//! `in_tx`/`out_rx`/`held_*` require. See
-//! `docs/design/aam-bridge-refactor.md` for the full diagnosis.
-//!
-//! Why merge happens in `try_run`, not on the reader: the reader is
-//! the sole consumer of bwa's stdout, and `merge_raw` per template
-//! is CPU-heavy (especially with bisulfite restore). Doing the merge
-//! on the reader makes bwa stall on stdout flush when merge is the
-//! bottleneck. Emitting raw `ZipperBatch` (paired mapped + unmapped)
-//! and merging in `try_run` keeps the reader I/O-bound and lets
-//! whichever worker dispatches AAM amortize merge across the same
-//! `OUT_CHAN_DEPTH` of in-flight batches.
+//! `in_tx`/`out_rx`/`held_*` require.
 //!
 //! ## `BatchToken` / `ZipperBatch` protocol (index-based pairing)
 //!
@@ -59,265 +50,69 @@
 //! serial }` through `token_chan` to the reader thread. The reader
 //! pops one token at a time, reads exactly `n_templates` templates
 //! from aligner stdout, packages them into a `ZipperBatch { serial,
-//! mapped, unmapped }`, and sends that on `out_chan`. `try_run`
-//! pops `ZipperBatch`es and calls `merge_zipper_batch` (which runs
-//! `merge_raw` + optional bisulfite restore per template-pair) to
-//! produce the merged `BamTemplateBatch` pushed downstream.
+//! mapped, unmapped }`, and sends that on `out_chan`.
+//! `try_run` pops `ZipperBatch`es and pushes them to the shared merge step.
 //!
 //! This relies on the aligner preserving input record order (bwa-mem
 //! and bwa-mem3 do this when `-K` chunk size is set, which our presets
 //! require). A per-template queryname-equality check — always on, not a
 //! debug assertion — rejects out-of-order aligner output with a loud
 //! error rather than silently mismerging tags onto the wrong reads.
-//!
-//! AAM further requires the aligner to emit **exactly one alignment
-//! group per input read**; the count guards in the reader error if it
-//! emits fewer or more. This is a deliberate narrowing of the sibling
-//! `ZipperMergeStep`'s contract, which tolerates missing mapped reads
-//! via its `exclude_missing_reads` flag: AAM targets order- and
-//! count-preserving aligners (bwa-mem/bwa-mem3) and treats a dropped or
-//! extra read as an error, not a silently-skipped template.
-//!
-//! ## Header propagation
-//!
-//! The reader thread's first action (before any record) is to parse
-//! the aligner's emitted SAM header, merge it with the
-//! construction-time partial header (dict-derived `@SQ` + unmapped
-//! `@HD`/`@CO`/`@RG`/`@PG` + fgumi's own `@PG`), and resolve the
-//! supplied [`HeaderHandle`]. The downstream `WriteBgzfFile`
-//! (constructed via `new_with_handle`) polls the handle and proceeds
-//! once it's resolved.
-//!
-//! ## Lifecycle
-//!
-//! - `new` spawns the subprocess + both daemon threads + sets up
-//!   channels.
-//! - `try_run` is dispatcher-driven, non-blocking, with two `HeldSlot`s
-//!   (`held_in` for upstream→`in_chan` backpressure, `held_out` for
-//!   merged-batch→downstream backpressure). It runs three phases across
-//!   re-dispatches: ingest (pump `ctx.input` → `in_tx` while merging the
-//!   aligner's output), close-stdin (once `ctx.input` is drained and
-//!   `held_in` is flushed, drop `in_tx` → aligner stdin EOF), and drain
-//!   (pump the aligner's tail through `out_rx` until the reader has exited
-//!   and the receiver is empty, then `finalize`). Returning
-//!   `StepOutcome::Finished` only at the end of the drain phase means the
-//!   final flush yields and is re-dispatched rather than blocking the worker.
-//! - `finalize` joins both daemons (which cannot block — the reader has
-//!   exited and the receiver is drained), waits the subprocess, and surfaces
-//!   the stderr ring on non-zero exit in order (aligner → reader → writer).
-//! - `Drop` is the resource-cleanup backstop on error paths — the clean
-//!   `finalize` is never reached when any step returns `Err` (the
-//!   framework signals teardown via `PipelineSignal::is_done`).
-//!
-//! ## Output formats
-//!
-//! The reader auto-detects BGZF by validating the aligner's leading
-//! bytes against the shared [`fgumi_bgzf::is_bgzf_header`] classifier:
-//! * BGZF → noodles BAM reader, zero-copy per-record via
-//!   [`fgumi_raw_bam::RawBamReader`].
-//! * Anything else → noodles SAM text reader, one
-//!   `RecordBuf → RawRecord` encode per record via
-//!   [`fgumi_raw_bam::encode_record_buf_to_raw`].
-//!
-//! BAM is the higher-throughput path because there's no encode
-//! cost; aligners that can emit BAM (e.g. via a `samtools view -bu -`
-//! pipe in the user's command) avoid the SAM encode entirely.
 
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::process::ChildStdout;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::thread::{self, JoinHandle};
 
+use anyhow::anyhow;
 use noodles::sam::Header;
 use parking_lot::Mutex;
 
 use crate::aligner::AlignerProcess;
 use crate::commands::fastq::{FastqRecordBuffers, write_fastq_record};
-use crate::commands::zipper::{ZipperTags, merge_one_template_with};
+use crate::pipeline::core::builder::PipelineBuilder;
 use crate::pipeline::core::header::HeaderHandle;
-use crate::pipeline::core::item::{HeapSize, Ordered};
+use crate::pipeline::core::item::HeapSize;
+use crate::pipeline::core::topology::{BranchIdx, StepIdx};
 use crate::pipeline::core::{
     BranchOrdering, HeldSlot, OrderedBytesSingle, QueueSpec, Step, StepCtx, StepKind, StepOutcome,
     StepProfile, Unpushed,
 };
+use crate::pipeline::steps::align::merge::MergeAlignedStep;
+use crate::pipeline::steps::align::{
+    AlignBackend, AlignWired, AlignWiringCtx, ConsumerGoneGuard, InFlightGate, ZipperBatch,
+    in_flight_budget_for_chunk_size, is_primary_for_alignment, merge_aligner_header,
+    no_primary_records_message, validate_sq_consistency,
+};
 use crate::pipeline::steps::types::BamTemplateBatch;
-use crate::reference::ReferenceReader;
 use crate::template::Template;
-use crate::umi::TagInfo;
 
 /// Number of aligner stderr lines retained for failure diagnostics.
-/// Same value the former hand-rolled orchestrator used.
 const ALIGNER_STDERR_RING_SIZE: usize = 50;
-
-/// Flag bits filtered from records written as FASTQ to the aligner.
-/// `0x900` = `SECONDARY | SUPPLEMENTARY`. Same rationale as the former
-/// hand-rolled orchestrator: if a previously-aligned BAM is passed by
-/// mistake, dropping these prevents duplicate FASTQ emissions for the
-/// same template.
-const FASTQ_WRITER_EXCLUDE_FLAGS: u16 =
-    fgumi_raw_bam::flags::SECONDARY | fgumi_raw_bam::flags::SUPPLEMENTARY;
 
 /// Bound for `in_chan` (dispatcher → writer thread). Two batches in
 /// flight match bwa's `kt_pipeline` `p_nt=2` double-buffer: one batch
-/// being aligned, one queued. See the design doc
-/// `align-and-merge-as-step.md` for the derivation from bwa-mem2's
-/// `fastmap.cpp`.
+/// being aligned, one queued.
 ///
 /// Note: the writer→reader **token** channel is intentionally
 /// unbounded (`std::sync::mpsc::channel()`), NOT bounded by this
 /// constant. See the comment at the `token_chan` construction site
-/// in [`AlignAndMergeStep::new`] for the deadlock rationale: bwa's
+/// in [`SubprocessAlignStep::new`] for the deadlock rationale: bwa's
 /// `-K` flag lets it buffer many input batches before emitting any
 /// output, so the writer must be able to keep pushing tokens past
-/// the reader without blocking — otherwise the writer is stuck on
-/// `token_tx.send` and never closes bwa's stdin, and bwa never
-/// flushes. Backpressure on the writer-side flow is enforced
-/// naturally by the OS pipe buffer (~64 KiB on macOS) plus bwa's
-/// `-K`-bounded internal buffer, both of which throttle the
-/// FASTQ-write path well before the token channel ever fills up.
+/// the reader without blocking. Backpressure on the writer-side flow is
+/// enforced by the OS pipe buffer plus bwa's `-K`-bounded internal buffer.
 const IN_CHAN_DEPTH: usize = 2;
 
 /// Bound for `out_chan` (reader thread → dispatcher). Two batches lets
-/// the reader stay one ahead while the dispatcher pumps the previous
-/// out to downstream; backpressure cascades back when downstream
-/// stalls.
+/// the reader stay one ahead while the dispatcher pushes the previous
+/// one downstream; backpressure cascades back when downstream stalls.
 const OUT_CHAN_DEPTH: usize = 2;
 
-/// Estimated in-flight bytes per aligner-input base, used to derive the
-/// in-flight-unmapped byte budget from the aligner's `-K` chunk size.
-/// One base costs ~1 byte of sequence + ~1 byte of quality held in the
-/// unmapped `RawRecord`, plus read-name / tag overhead — 3 is a
-/// deliberately generous estimate so the budget never under-shoots the
-/// aligner's real buffering (under-shooting risks a writer stall).
-const IN_FLIGHT_BYTES_PER_BASE: u64 = 3;
-
-/// Multiplier over a single `-K` chunk for the in-flight budget. bwa's
-/// `kt_pipeline` double-buffers (`p_nt=2`: one chunk aligning, one
-/// queued), so the aligner can hold ~2 chunks before emitting; 4× adds
-/// slack for the FASTQ-write buffer and pipeline jitter so the writer
-/// never blocks before the aligner has a full chunk to emit (which
-/// would deadlock — see `InFlightGate`).
-const IN_FLIGHT_CHUNK_MULTIPLIER: u64 = 4;
-
-/// Floor for the in-flight-unmapped budget. Keeps the budget workable
-/// for small `-K` values (custom aligner commands, tests) where the
-/// `-K`-derived value would be tiny, and covers aligners whose internal
-/// buffering exceeds their nominal `-K`.
-const IN_FLIGHT_MIN_BUDGET: u64 = 512 * 1024 * 1024;
-
-/// Derive the in-flight-unmapped byte budget for AAM from the aligner's
-/// `-K` chunk size (bases per batch). The budget bounds the otherwise
-/// unbounded writer→reader token backlog: the writer blocks once the
-/// in-flight unmapped bytes reach this, so a fast-draining aligner can't
-/// accumulate the whole input's unmapped reads in RAM (issue #382).
-///
-/// Sized `≥` the aligner's real buffering so a **streaming** aligner
-/// (one that emits output after ≤ `-K` bases — every real aligner)
-/// always has a full chunk to emit before the writer blocks, so the
-/// block is transient, not a deadlock. A non-streaming aligner (one that
-/// reads all stdin before emitting) is out of contract: it would stall
-/// the writer here rather than OOM. For the default `-K` of 150M bases
-/// this is ~1.8 GiB.
-#[must_use]
-pub fn in_flight_budget_for_chunk_size(chunk_size_bases: u64) -> u64 {
-    chunk_size_bases
-        .saturating_mul(IN_FLIGHT_BYTES_PER_BASE)
-        .saturating_mul(IN_FLIGHT_CHUNK_MULTIPLIER)
-        .max(IN_FLIGHT_MIN_BUDGET)
-}
-
-/// Byte-budget gate bounding AAM's in-flight unmapped reads (the
-/// writer→reader token backlog). The writer [`acquire`](InFlightGate::acquire)s
-/// before feeding a batch to the aligner and the reader
-/// [`release`](InFlightGate::release)s when it consumes the matching
-/// token, so resident in-flight unmapped bytes stay near `budget`.
-///
-/// Deadlock-safety: the gate blocks the writer only while in-flight is at
-/// budget AND non-empty — a single oversized batch always passes when the
-/// gate is empty. Because the budget is sized `≥` a streaming aligner's
-/// `-K` buffering (see [`in_flight_budget_for_chunk_size`]), the aligner
-/// always has a full chunk to emit before the writer blocks, so the
-/// reader drains and the block lifts. If the reader exits (EOF or error),
-/// it latches `consumer_gone` so a blocked writer wakes and bails rather
-/// than hanging.
-struct InFlightGate {
-    budget: u64,
-    inner: Mutex<GateInner>,
-    cond: parking_lot::Condvar,
-}
-
-struct GateInner {
-    in_flight: u64,
-    consumer_gone: bool,
-}
-
-impl InFlightGate {
-    fn new(budget: u64) -> Self {
-        Self {
-            budget,
-            inner: Mutex::new(GateInner { in_flight: 0, consumer_gone: false }),
-            cond: parking_lot::Condvar::new(),
-        }
-    }
-
-    /// Reserve `n` in-flight bytes, blocking while the gate is full and
-    /// non-empty. Returns `false` if the consumer (reader) has gone — the
-    /// caller (writer) should then stop.
-    fn acquire(&self, n: u64) -> bool {
-        let mut g = self.inner.lock();
-        // Block while non-empty AND this reservation would exceed budget.
-        // The `in_flight != 0` guard lets a single oversized batch through
-        // when the gate is empty (it can't be split, so holding it is
-        // unavoidable) — without it the writer would deadlock on a batch
-        // larger than the whole budget.
-        while !g.consumer_gone && g.in_flight != 0 && g.in_flight.saturating_add(n) > self.budget {
-            self.cond.wait(&mut g);
-        }
-        if g.consumer_gone {
-            return false;
-        }
-        g.in_flight = g.in_flight.saturating_add(n);
-        true
-    }
-
-    /// Release `n` in-flight bytes (reader consumed a token) and wake the
-    /// writer if it is blocked.
-    fn release(&self, n: u64) {
-        let mut g = self.inner.lock();
-        g.in_flight = g.in_flight.saturating_sub(n);
-        drop(g);
-        self.cond.notify_all();
-    }
-
-    /// Latch that the consumer (reader) has exited, so a blocked writer
-    /// wakes and bails instead of hanging forever.
-    fn mark_consumer_gone(&self) {
-        let mut g = self.inner.lock();
-        g.consumer_gone = true;
-        drop(g);
-        self.cond.notify_all();
-    }
-}
-
-/// RAII guard that latches consumer-gone on drop — on normal return, on an
-/// error return, AND on a panic unwinding out of `reader_loop`. Without the
-/// guard the panic path would skip `mark_consumer_gone`, leaving a writer
-/// parked in `gate.acquire` blocked forever and `Drop`'s `writer_thread.join()`
-/// hung with it.
-struct ConsumerGoneGuard<'a>(&'a InFlightGate);
-
-impl Drop for ConsumerGoneGuard<'_> {
-    fn drop(&mut self) {
-        self.0.mark_consumer_gone();
-    }
-}
-
-/// FASTQ-writer [`BufWriter`] capacity. 1 MiB matches the former
-/// hand-rolled orchestrator's choice: bigger than the OS pipe buffer
-/// (~64 KiB) so we amortize `write` syscalls, but not so large that we
-/// delay the aligner's first chunk perceptibly.
+/// FASTQ-writer [`BufWriter`] capacity. 1 MiB: bigger than the OS pipe buffer
+/// (~64 KiB) so we amortize `write` syscalls, but not so large that we delay the
+/// aligner's first chunk perceptibly.
 const FASTQ_WRITER_BUF_BYTES: usize = 1 << 20;
 
 /// Stdout-side [`BufReader`] capacity for the aligner pipe. 64 KiB
@@ -334,71 +129,33 @@ pub(crate) const ERR_ALIGNER_EXITED_BEFORE_OUTPUT: &str = "exited before emittin
 // Configuration
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Immutable, Arc-friendly configuration shared by [`AlignAndMergeStep`].
+/// Immutable, Arc-friendly configuration for [`SubprocessAlignStep`].
 ///
-/// One `Arc` clone of the inner is made per spawned thread; the cost is
-/// negligible compared to the data flowing through.
+/// One `Arc`-cheap clone of the inner is made per spawned thread.
 #[derive(Clone)]
-pub struct AlignAndMergeConfig {
-    /// Tag-merge rules (remove / reverse / revcomp) plumbed to
-    /// `merge_raw`.
-    pub tag_info: Arc<TagInfo>,
-
-    /// Whether to skip TC (template-coordinate) tag handling. Mirrors
-    /// `ZipperMergeConfig::skip_tc_tags`.
-    pub skip_tc_tags: bool,
-
-    /// Optional reference reader used by
-    /// `restore_unconverted_bases_in_raw_template` (bisulfite path).
-    /// `None` for normal alignment.
-    pub reference: Option<Arc<ReferenceReader>>,
-
+pub(crate) struct SubprocessConfig {
     /// Partial output header built at construction time
-    /// (dict-derived `@SQ` + unmapped-derived
-    /// `@HD`/`@CO`/`@RG`/`@PG` + fgumi's own `@PG`). The reader
-    /// thread merges the aligner's emitted `@PG`/`@CO`/`@RG` lines
-    /// into this and resolves `header_handle`.
-    pub partial_output_header: Arc<Header>,
+    /// (dict-derived `@SQ` + unmapped-derived `@HD`/`@CO`/`@RG`/`@PG` +
+    /// fgumi's own `@PG`). The reader thread merges the aligner's emitted
+    /// `@PG`/`@CO`/`@RG` lines into this and resolves `header_handle`.
+    pub(crate) partial_output_header: Arc<Header>,
 
     /// One-shot handle the reader thread resolves with the merged
     /// header. The downstream `WriteBgzfFile` (constructed via
     /// `new_with_handle`) polls this.
-    pub header_handle: HeaderHandle,
-
-    /// Counter for records emitted to downstream. Exposed back to the
-    /// caller after `Pipeline::run` returns so summary logging can
-    /// report a real throughput number.
-    pub records_emitted: Arc<AtomicU64>,
+    pub(crate) header_handle: HeaderHandle,
 
     /// Byte limit for the **downstream** output queue
-    /// (`OrderedBytesSingle` `ByteBounded`) that AAM pushes merged
-    /// `BamTemplateBatch`es onto.
-    ///
-    /// AAM also has an *internal* `out_chan` (`SyncSender<ZipperBatch>`,
-    /// depth `OUT_CHAN_DEPTH = 2`) carrying the reader-to-`try_run`
-    /// hand-off. Because `ZipperBatch` carries both `mapped` and
-    /// `unmapped` halves (paired template Vecs), its per-item heap
-    /// is roughly **2×** the per-item heap of the old design's
-    /// `BamTemplateBatch` (which only carried merged templates).
-    /// Combined with `held_out` the worst-case in-flight footprint
-    /// is ≈ 3 × 2 × `batch_bytes`.
-    ///
-    /// For default 1000-template batches this is ~600 KB, negligible.
-    /// For production CODEC pipelines with multi-MB batches it can
-    /// approach ~1.5 GB additional in-flight; if memory is tight,
-    /// drop `OUT_CHAN_DEPTH` to 1 (one rebuild) — the reader
-    /// throughput cost is paid only when bwa stalls on stdout for
-    /// one batch worth of time, which is rare on production hardware.
-    /// This field gates the downstream queue, not the internal one.
-    pub output_byte_limit: u64,
+    /// (`OrderedBytesSingle<ZipperBatch>` `ByteBounded`) this step pushes onto.
+    pub(crate) output_byte_limit: u64,
 
-    /// Byte budget for AAM's **internal** in-flight unmapped reads (the
+    /// Byte budget for the **internal** in-flight unmapped reads (the
     /// writer→reader token backlog). The writer blocks once in-flight
     /// unmapped bytes reach this, bounding the otherwise-unbounded backlog
     /// so a fast-draining aligner can't accumulate the whole input's
     /// unmapped reads in RAM (issue #382). Derive it from the aligner's
     /// `-K` chunk size via [`in_flight_budget_for_chunk_size`].
-    pub in_flight_unmapped_budget: u64,
+    pub(crate) in_flight_unmapped_budget: u64,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -411,7 +168,7 @@ pub struct AlignAndMergeConfig {
 /// The writer pushes one `BatchToken` after writing all FASTQ records
 /// for an input batch. The reader pops one token, reads exactly
 /// `n_templates` templates from the aligner's stdout, and emits one
-/// `ZipperBatch { mapped, unmapped, serial }` for `try_run` to merge.
+/// `ZipperBatch { mapped, unmapped, serial }`.
 struct BatchToken {
     unmapped: BamTemplateBatch,
     n_templates: usize,
@@ -420,35 +177,6 @@ struct BatchToken {
     /// `BamTemplateBatch::batch_serial` so downstream's
     /// `ByItemOrdinal` consumer sees a monotonic sequence.
     serial: u64,
-}
-
-/// Reader-thread → `try_run` intermediate. Aligner-parsed but
-/// pre-merge templates paired with their original unmapped halves.
-/// Merging (`merge_raw` + optional bisulfite restore) happens later
-/// on whatever worker dispatches AAM; the reader stays I/O-bound.
-#[derive(Debug)]
-struct ZipperBatch {
-    serial: u64,
-    mapped: Vec<Template>,
-    unmapped: BamTemplateBatch,
-}
-
-impl HeapSize for ZipperBatch {
-    fn heap_size(&self) -> usize {
-        // Matches `BamTemplateBatch::total_bytes` semantics: sum of
-        // `Template::heap_size` only; no `Vec`-allocation overhead.
-        // `Template` carries only an inherent `heap_size` method (not
-        // a `HeapSize` trait impl) to keep `template.rs` framework-agnostic,
-        // so the sum is hand-rolled here.
-        let mapped_heap: usize = self.mapped.iter().map(Template::heap_size).sum();
-        mapped_heap + self.unmapped.heap_size()
-    }
-}
-
-impl Ordered for ZipperBatch {
-    fn ordinal(&self) -> u64 {
-        self.serial
-    }
 }
 
 /// Shared state visible to both threads and `try_run`. Used to
@@ -486,21 +214,12 @@ impl SharedState {
 // ──────────────────────────────────────────────────────────────────────────
 
 /// `Serial` Step that wraps an aligner subprocess + two internal
-/// threads + the inline `merge_raw` of tags from unmapped templates
-/// onto the aligned mapped templates.
+/// threads and emits [`ZipperBatch`]es for the shared merge step.
 ///
 /// See module doc for design rationale (including why `Serial`, not
 /// `Exclusive`).
-pub struct AlignAndMergeStep {
-    cfg: AlignAndMergeConfig,
-
-    /// Precomputed tag-merge bitsets, built once in [`AlignAndMergeStep::new`]
-    /// from `cfg.tag_info` and reused for every template across every batch
-    /// this step ever merges — `cfg.tag_info` is immutable for the step's
-    /// whole lifetime, so there is no reason to rebuild `ZipperTags` (three
-    /// `TagBitset` allocations) per batch, let alone per template. Passed
-    /// into `merge_zipper_batch` at each call site.
-    tags: Arc<ZipperTags>,
+pub(crate) struct SubprocessAlignStep {
+    cfg: SubprocessConfig,
 
     /// Owned aligner subprocess. Taken out in `finalize` (or `Drop` on the
     /// error path) for `wait()`.
@@ -512,9 +231,7 @@ pub struct AlignAndMergeStep {
     in_tx: Option<SyncSender<BamTemplateBatch>>,
 
     /// Receiver side of `out_chan`. The reader thread sends raw
-    /// (pre-merge) `ZipperBatch`es here; `try_run` does the per-
-    /// template `merge_raw` + bisulfite restore, then pushes a
-    /// merged `BamTemplateBatch` to `ctx.outputs`.
+    /// `ZipperBatch`es here; `try_run` pushes them downstream.
     out_rx: Option<Receiver<ZipperBatch>>,
 
     writer_thread: Option<JoinHandle<io::Result<()>>>,
@@ -526,15 +243,15 @@ pub struct AlignAndMergeStep {
     /// couldn't be `try_send`'d to `in_chan` (writer thread is slow).
     held_in: HeldSlot<BamTemplateBatch>,
 
-    /// Held slot for an `Unpushed<BamTemplateBatch>` we received from
+    /// Held slot for an `Unpushed<ZipperBatch>` we received from
     /// the reader but couldn't `push` to `ctx.outputs` (downstream
     /// backpressure).
-    held_out: HeldSlot<Unpushed<BamTemplateBatch>>,
+    held_out: HeldSlot<Unpushed<ZipperBatch>>,
 
     name: &'static str,
 }
 
-impl AlignAndMergeStep {
+impl SubprocessAlignStep {
     /// Spawn the aligner subprocess + the two I/O threads and return
     /// a ready-to-dispatch Step.
     ///
@@ -545,15 +262,9 @@ impl AlignAndMergeStep {
     /// - the aligner doesn't provide stdin/stdout pipes (should be
     ///   impossible given `Stdio::piped()` is used by `AlignerProcess`),
     /// - either I/O thread spawn fails.
-    pub fn new(cfg: AlignAndMergeConfig, aligner_command: &str) -> io::Result<Self> {
-        // Built once for the step's whole lifetime — `cfg.tag_info` never
-        // changes after construction, so every batch this step ever merges
-        // reuses the same bitsets rather than rebuilding them. See the
-        // `tags` field doc.
-        let tags = Arc::new(ZipperTags::from_tag_info(&cfg.tag_info));
-
+    pub(crate) fn new(cfg: SubprocessConfig, aligner_command: &str) -> io::Result<Self> {
         let mut aligner = AlignerProcess::spawn(aligner_command, ALIGNER_STDERR_RING_SIZE)
-            .map_err(|e| io::Error::other(format!("AlignAndMergeStep::new: spawn: {e:#}")))?;
+            .map_err(|e| io::Error::other(format!("SubprocessAlignStep::new: spawn: {e:#}")))?;
 
         let aligner_stdin = aligner
             .take_stdin()
@@ -591,7 +302,7 @@ impl AlignAndMergeStep {
                 .spawn(move || writer_loop(in_rx, token_tx, aligner_stdin, shared, &gate))
                 .map_err(|e| {
                     io::Error::other(format!(
-                        "AlignAndMergeStep::new: failed to spawn writer thread: {e}"
+                        "SubprocessAlignStep::new: failed to spawn writer thread: {e}"
                     ))
                 })?
         };
@@ -613,14 +324,13 @@ impl AlignAndMergeStep {
                 })
                 .map_err(|e| {
                     io::Error::other(format!(
-                        "AlignAndMergeStep::new: failed to spawn reader thread: {e}"
+                        "SubprocessAlignStep::new: failed to spawn reader thread: {e}"
                     ))
                 })?
         };
 
         Ok(Self {
             cfg,
-            tags,
             aligner: Some(aligner),
             in_tx: Some(in_tx),
             out_rx: Some(out_rx),
@@ -629,7 +339,7 @@ impl AlignAndMergeStep {
             shared,
             held_in: HeldSlot::new(),
             held_out: HeldSlot::new(),
-            name: "AlignAndMerge",
+            name: "SubprocessAlign",
         })
     }
 }
@@ -680,7 +390,7 @@ fn writer_loop(
         // aligner output; if we counted it, the reader would expect
         // one more mapped template than the aligner emits and
         // surface a misleading "aligner emitted fewer alignments"
-        // error. AAM's expected input is an unmapped BAM (from
+        // error. Expected input is an unmapped BAM (from
         // `fgumi extract`), which has no secondaries — a
         // fully-filtered template here means the user passed a
         // re-aligned BAM by mistake. Error out loudly with the
@@ -690,7 +400,8 @@ fn writer_loop(
             let mut wrote_any = false;
             for record in &template.records {
                 let flags = record.flags();
-                if (flags & FASTQ_WRITER_EXCLUDE_FLAGS) != 0 {
+                // Align primary reads only (skip SECONDARY/SUPPLEMENTARY).
+                if !is_primary_for_alignment(flags) {
                     continue;
                 }
                 if let Err(e) = write_fastq_record(
@@ -717,11 +428,8 @@ fn writer_loop(
             }
             if !wrote_any {
                 let msg = format!(
-                    "align-and-merge writer: template '{name}' has no primary records (all flagged \
-                     SECONDARY/SUPPLEMENTARY). align-and-merge expects unmapped BAM input — did \
-                     you pass a re-aligned BAM by mistake? Run `fgumi extract` first or pre-filter \
-                     the input.",
-                    name = String::from_utf8_lossy(template.name()),
+                    "align-and-merge writer: {}",
+                    no_primary_records_message(template.name())
                 );
                 shared.record_error(io::Error::other(msg.clone()));
                 return Err(io::Error::other(msg));
@@ -781,10 +489,9 @@ fn writer_loop(
 
 /// Parse the aligner's stdout, pair each emitted template with its
 /// corresponding unmapped via the token channel, and emit
-/// `ZipperBatch` to `out_tx`. Merging (`merge_raw` and any bisulfite
-/// restore) happens in `AlignAndMergeStep::try_run`, run by whatever
-/// worker the framework dispatches; the reader stays I/O-bound so
-/// bwa's stdout never stalls behind CPU-heavy merge work.
+/// `ZipperBatch` to `out_tx`. Merging happens on the shared
+/// `MergeAlignedStep`; the reader stays I/O-bound so bwa's stdout never
+/// stalls behind CPU-heavy merge work.
 ///
 /// First action is to read the aligner's SAM/BAM header, merge with
 /// the partial header, and resolve `cfg.header_handle`. Once that
@@ -798,7 +505,7 @@ fn reader_loop(
     token_rx: Receiver<BatchToken>,
     out_tx: SyncSender<ZipperBatch>,
     aligner_stdout: ChildStdout,
-    cfg: AlignAndMergeConfig,
+    cfg: SubprocessConfig,
     shared: Arc<SharedState>,
     gate: &InFlightGate,
 ) -> io::Result<()> {
@@ -831,7 +538,7 @@ fn reader_loop_inner(
     token_rx: Receiver<BatchToken>,
     out_tx: &SyncSender<ZipperBatch>,
     aligner_stdout: ChildStdout,
-    cfg: &AlignAndMergeConfig,
+    cfg: &SubprocessConfig,
     gate: &InFlightGate,
 ) -> io::Result<()> {
     // 1. Peek 4 bytes to detect BGZF (BAM) vs SAM text. Returns the
@@ -847,7 +554,7 @@ fn reader_loop_inner(
         // doesn't misleadingly point at SAM/BAM format conversion.
         let marker = ERR_ALIGNER_EXITED_BEFORE_OUTPUT;
         return Err(io::Error::other(format!(
-            "AlignAndMergeStep: aligner {marker}. Likely causes: subprocess \
+            "SubprocessAlignStep: aligner {marker}. Likely causes: subprocess \
              startup error (missing binary, missing index files), aligner \
              argument error, or the aligner segfaulted before reading FASTQ. \
              Check the aligner's stderr above for the specific failure."
@@ -903,14 +610,14 @@ fn reader_loop_inner(
     //    the dict-derived canonical reference list.
     let merged = merge_aligner_header(&cfg.partial_output_header, &aligner_header);
     // The handle should be unresolved at this point in production —
-    // AAM is the sole producer. A pre-set handle indicates either a
+    // this step is the sole producer. A pre-set handle indicates either a
     // test (where `from_header` was used) or a wiring bug. We log
     // the latter case at warn level so it surfaces in CI / prod
     // pipelines while letting tests proceed unchanged. The merged
     // header is dropped in either case; the existing value wins.
     if cfg.header_handle.set(merged).is_err() {
         log::warn!(
-            "AlignAndMergeStep: HeaderHandle was already resolved before the aligner \
+            "SubprocessAlignStep: HeaderHandle was already resolved before the aligner \
              emitted its header — aligner @PG/@RG/@CO contributions will not appear \
              in the output. This is expected in tests using HeaderHandle::from_header \
              but indicates a wiring bug in production."
@@ -926,7 +633,7 @@ fn reader_loop_inner(
         // release them against the in-flight budget so a writer blocked in
         // `gate.acquire` can resume. The bytes still live briefly in the
         // `ZipperBatch` flowing through the depth-bounded `out_chan` +
-        // `held_out` + merge, which is separately bounded — so releasing
+        // `held_out`, which is separately bounded — so releasing
         // here is what keeps the *unbounded* token backlog near budget.
         gate.release(token.unmapped.heap_size() as u64);
 
@@ -1026,73 +733,6 @@ fn reader_loop_inner(
     Ok(())
 }
 
-/// Merge one `ZipperBatch` into a `BamTemplateBatch`. Takes the caller's
-/// precomputed `tags` (built once for the whole `AlignAndMergeStep`, since
-/// `cfg.tag_info` is immutable for the step's lifetime — see
-/// `AlignAndMergeStep::new`) and, per template, runs `merge_one_template_with`
-/// (`merge_raw_with` plus optional bisulfite restore); folds record-count and
-/// heap-size accounting into the same single pass so the resulting
-/// `BamTemplateBatch` doesn't re-walk the templates to compute `total_bytes`.
-///
-/// **Single-threaded by construction.** This runs synchronously on
-/// whichever worker dispatches AAM (Serial); merge throughput is
-/// effectively single-core. If profiling reveals merge as a
-/// bottleneck (most likely on bisulfite workloads where
-/// `restore_unconverted_bases_in_raw_template` does meaningful
-/// per-record CPU), the right move is to extract a `Parallel`
-/// `MergeAligned` step that consumes `ZipperBatch` from a multi-
-/// consumer queue and emits `BamTemplateBatch`. The `ZipperBatch`
-/// intermediate is shaped for that promotion — no fixture/test
-/// refactor required at the call site. See
-/// `docs/design/aam-bridge-refactor.md` §8 (out-of-scope follow-ups).
-fn merge_zipper_batch(
-    zb: ZipperBatch,
-    cfg: &AlignAndMergeConfig,
-    tags: &ZipperTags,
-) -> io::Result<BamTemplateBatch> {
-    let ZipperBatch { serial, mapped, unmapped } = zb;
-    // Release-safe guard (not a debug_assert): a violated length invariant would
-    // otherwise make the `zip` below silently truncate to the shorter side,
-    // dropping templates with no error. Fail loudly instead — mirroring
-    // `extract_batch`'s record-count guard. (A bare debug_assert would also
-    // shadow this Err path from CI's debug-build tests.)
-    if mapped.len() != unmapped.templates().len() {
-        return Err(io::Error::other(format!(
-            "align-and-merge: ZipperBatch invariant violated — {} mapped vs {} unmapped \
-             templates; refusing to zip mismatched halves",
-            mapped.len(),
-            unmapped.templates().len(),
-        )));
-    }
-
-    let mut merged: Vec<Template> = Vec::with_capacity(mapped.len());
-    let mut total_records: u64 = 0;
-    let mut total_bytes: usize = 0;
-    // One aux-rebuild scratch buffer reused across every template in this batch,
-    // mirroring the standalone `Zipper::run` path (its allocation is reused, not
-    // re-allocated per template).
-    let mut aux_scratch: Vec<u8> = Vec::new();
-    for (mut mapped_template, unmapped_template) in mapped.into_iter().zip(unmapped.templates()) {
-        merge_one_template_with(
-            unmapped_template,
-            &mut mapped_template,
-            tags,
-            cfg.skip_tc_tags,
-            cfg.reference.as_deref(),
-            &cfg.partial_output_header,
-            &mut aux_scratch,
-        )
-        .map_err(|e| io::Error::other(format!("align-and-merge: {e:#}")))?;
-
-        total_records += mapped_template.records.len() as u64;
-        total_bytes += mapped_template.heap_size();
-        merged.push(mapped_template);
-    }
-
-    cfg.records_emitted.fetch_add(total_records, Ordering::Relaxed);
-    Ok(BamTemplateBatch::from_parts(serial, merged, total_bytes))
-}
-
 /// Peek the leading bytes of `stdout` to classify the aligner's output
 /// format. Returns `(is_bgzf, peek_filled, chained_reader)` where:
 /// - `is_bgzf` is true iff the peeked prefix is a valid BGZF block
@@ -1157,14 +797,6 @@ type AlignerSamReader = noodles::sam::io::Reader<BufReader<Box<dyn Read + Send>>
 /// * SAM: `sam::io::Reader::read_record_buf(&Header, &mut RecordBuf)`
 ///   followed by [`fgumi_raw_bam::encode_record_buf_to_raw`] to bring
 ///   the record into the same `RawRecord` representation as BAM.
-///   The SAM path costs one `RecordBuf` → `RawRecord` encode per
-///   record (vs zero-copy on BAM); aligners emitting BAM are
-///   preferred for high-throughput workloads.
-///
-/// The prior caller-threaded `(scratch, peeked)` API is gone —
-/// centralising the state inside this enum makes the
-/// "forgot-to-thread-peeked-and-lost-a-record" footgun
-/// syntactically impossible.
 enum TemplateStream {
     Bam(BamTemplateStream),
     Sam(SamTemplateStream),
@@ -1209,9 +841,7 @@ impl TemplateStream {
 /// so it is injected as the `read` closure. `peeked` carries the first record of
 /// the *next* template (read one past this template's boundary) across calls,
 /// and `name_buf` is a reusable queryname buffer. Returns `Ok(None)` at end of
-/// stream. Centralizing this here makes the "forgot to stash the peeked record
-/// and lost a template boundary" footgun impossible to reintroduce in only one
-/// of the two variants.
+/// stream.
 fn assemble_next_template(
     peeked: &mut Option<fgumi_raw_bam::RawRecord>,
     name_buf: &mut Vec<u8>,
@@ -1275,9 +905,7 @@ impl BamTemplateStream {
         // Disjoint field capture (Rust 2021+): the closure borrows
         // `reader`/`scratch` while `peeked`/`name_buf` pass as sibling args, so
         // there's no whole-`self` aliasing conflict. `scratch` is reused across
-        // reads, so we clone it out — a `RawRecord` free-list to avoid the clone
-        // is a deferred micro-opt (S5a1-007); at 10k–100k records/sec the clones
-        // are cheap.
+        // reads, so we clone it out.
         assemble_next_template(&mut self.peeked, &mut self.name_buf, || {
             let n = self.reader.read_record(&mut self.scratch)?;
             Ok(if n == 0 { None } else { Some(self.scratch.clone()) })
@@ -1358,131 +986,13 @@ impl SamTemplateStream {
     }
 }
 
-/// Compare the aligner's emitted `@SQ` table to the partial output
-/// header's. The partial header's `@SQ` came from the reference dict
-/// at construction time; the aligner's `@SQ` comes from whatever
-/// FASTA the aligner was indexed against. If they don't match, the
-/// aligner's per-record `tid` integers index into a different
-/// `@SQ` ordering and the merged BAM would silently have corrupt
-/// reference IDs.
-///
-/// Comparison is name + length only (M5/UR/AS/SP are dict-specific
-/// fields the aligner doesn't propagate, so we don't require them).
-fn validate_sq_consistency(partial: &Header, aligner: &Header) -> io::Result<()> {
-    let partial_refs = partial.reference_sequences();
-    let aligner_refs = aligner.reference_sequences();
-
-    if partial_refs.len() != aligner_refs.len() {
-        return Err(io::Error::other(format!(
-            "align-and-merge: aligner @SQcount ({}) does not match reference dict @SQ count ({}). \
-             The aligner was indexed against a different FASTA than the supplied --ref. \
-             Re-index or fix the --ref path.",
-            aligner_refs.len(),
-            partial_refs.len(),
-        )));
-    }
-
-    for (idx, ((p_name, p_map), (a_name, a_map))) in
-        partial_refs.iter().zip(aligner_refs.iter()).enumerate()
-    {
-        if p_name != a_name {
-            return Err(io::Error::other(format!(
-                "align-and-merge: aligner @SQname mismatch at position {idx}: dict='{dict_name}' \
-                 aligner='{aln_name}'. The aligner was indexed against a different \
-                 FASTA than the supplied --ref.",
-                dict_name = String::from_utf8_lossy(p_name),
-                aln_name = String::from_utf8_lossy(a_name),
-            )));
-        }
-        if p_map.length() != a_map.length() {
-            return Err(io::Error::other(format!(
-                "align-and-merge: aligner @SQlength mismatch for '{name}': dict={dict_len} \
-                 aligner={aln_len}. The aligner was indexed against a different \
-                 FASTA than the supplied --ref.",
-                name = String::from_utf8_lossy(p_name),
-                dict_len = p_map.length(),
-                aln_len = a_map.length(),
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-/// Merge aligner-emitted header lines into the partial output header.
-///
-/// The aligner contributes:
-/// - `@PG` lines (with bwa version, command line, etc.) — appended.
-///   On duplicate ID, the partial's existing PG wins (the aligner's
-///   PG with that ID is dropped). **Limitation:** this does not
-///   maintain the BAM spec's `@PG.PP` chain when the aligner adds
-///   its own PG to a chain that already has one with the same ID
-///   (rare in practice — bwa's PG ID is "bwa", which won't be in
-///   `fgumi extract`'s unmapped BAM output). Maintaining a proper
-///   PP chain requires constructing fresh IDs and threading the
-///   PP pointer; deferred to a follow-up commit if real-world data
-///   surfaces a collision.
-/// - `@RG` lines (if `-R` was passed to the aligner) — appended;
-///   partial's existing RG wins on duplicate ID.
-/// - `@CO` comment lines — concatenated (partial first, then
-///   aligner).
-///
-/// The aligner's `@SQ` lines are deliberately discarded:
-/// [`validate_sq_consistency`] runs first to ensure the two `@SQ`
-/// tables agree, after which the partial's (dict-derived) version
-/// is authoritative.
-fn merge_aligner_header(partial: &Header, aligner: &Header) -> Header {
-    use bstr::BString;
-
-    let mut builder = Header::builder();
-
-    if let Some(hd) = partial.header() {
-        builder = builder.set_header(hd.clone());
-    }
-
-    for (name, map) in partial.reference_sequences() {
-        builder = builder.add_reference_sequence(name.clone(), map.clone());
-    }
-
-    let mut rg_seen: std::collections::HashSet<BString> = std::collections::HashSet::new();
-    for (id, rg) in partial.read_groups() {
-        builder = builder.add_read_group(id.clone(), rg.clone());
-        rg_seen.insert(id.clone());
-    }
-    for (id, rg) in aligner.read_groups() {
-        if !rg_seen.contains(id) {
-            builder = builder.add_read_group(id.clone(), rg.clone());
-        }
-    }
-
-    let mut pg_seen: std::collections::HashSet<BString> = std::collections::HashSet::new();
-    for (id, pg) in partial.programs().as_ref() {
-        builder = builder.add_program(id.clone(), pg.clone());
-        pg_seen.insert(id.clone());
-    }
-    for (id, pg) in aligner.programs().as_ref() {
-        if !pg_seen.contains(id) {
-            builder = builder.add_program(id.clone(), pg.clone());
-        }
-    }
-
-    for c in partial.comments() {
-        builder = builder.add_comment(c.clone());
-    }
-    for c in aligner.comments() {
-        builder = builder.add_comment(c.clone());
-    }
-
-    builder.build()
-}
-
 // ──────────────────────────────────────────────────────────────────────────
 // Step impl
 // ──────────────────────────────────────────────────────────────────────────
 
-impl Step for AlignAndMergeStep {
+impl Step for SubprocessAlignStep {
     type Input = BamTemplateBatch;
-    type Outputs = OrderedBytesSingle<BamTemplateBatch>;
+    type Outputs = OrderedBytesSingle<ZipperBatch>;
 
     fn profile(&self) -> StepProfile {
         StepProfile {
@@ -1492,11 +1002,15 @@ impl Step for AlignAndMergeStep {
             // framework's mutex enforces it. `Exclusive` would pin
             // dispatch to one worker, which lets any blocking call
             // on that worker (e.g. another step's held-slot flush
-            // spin) starve AAM.
+            // spin) starve this step.
             kind: StepKind::Serial,
             sticky: false,
             output_queues: vec![QueueSpec::ByteBounded { limit_bytes: self.cfg.output_byte_limit }],
-            branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+            // FIFO: the Serial step emits `ZipperBatch`es in dense serial order,
+            // and the downstream (Parallel) `MergeAlignedStep` restores input
+            // order from each batch's serial via its own `ByItemOrdinal` output,
+            // so no reorder is needed on this edge.
+            branch_ordering: vec![BranchOrdering::None],
         }
     }
 
@@ -1522,10 +1036,8 @@ impl Step for AlignAndMergeStep {
 
         // 2. Drain held output slot first. Backpressure cases below
         //    return `NoProgress` (not `Contention`): `Contention` is
-        //    reserved by the framework (see `core/step.rs:10-12`) for
-        //    Serial-step mutex contention, not for full output
-        //    queues. Using the wrong variant skews dispatcher stats
-        //    and can change scheduling.
+        //    reserved by the framework for Serial-step mutex contention,
+        //    not for full output queues.
         if let Some(unpushed) = self.held_out.take() {
             match ctx.outputs.retry(unpushed) {
                 Ok(()) => did_work = true,
@@ -1536,10 +1048,9 @@ impl Step for AlignAndMergeStep {
             }
         }
 
-        // 3. Pull `ZipperBatch`es from the reader, merge per-template,
-        //    push merged `BamTemplateBatch` to `ctx.outputs`. The loop exits
-        //    (without returning) on `Empty`/`Disconnected`. This is the
-        //    steady-state pump; it does NOT by itself guarantee `out_rx` is
+        // 3. Pull `ZipperBatch`es from the reader and push them downstream. The
+        //    loop exits (without returning) on `Empty`/`Disconnected`. This is
+        //    the steady-state pump; it does NOT by itself guarantee `out_rx` is
         //    empty at completion (the reader could buffer a final batch after
         //    this loop's last `try_recv` saw `Empty`). The completion gate
         //    below re-drains `out_rx` after observing `reader.is_finished()`
@@ -1550,8 +1061,7 @@ impl Step for AlignAndMergeStep {
             // (reader done — if it errored, the slot is set and the next pass
             // surfaces it). Either way the receiver is drained for this call.
             while let Ok(zb) = out_rx.try_recv() {
-                let merged = merge_zipper_batch(zb, &self.cfg, &self.tags)?;
-                match ctx.outputs.push(merged) {
+                match ctx.outputs.push(zb) {
                     Ok(()) => did_work = true,
                     Err(unpushed) => {
                         self.held_out.put(unpushed);
@@ -1562,11 +1072,10 @@ impl Step for AlignAndMergeStep {
         }
 
         // 4. Ingest phase: while `in_tx` is open, feed the aligner. Held_out
-        //    has priority over held_in deliberately (see ZipperMergeStep
-        //    precedent): downstream backpressure must propagate upstream before
-        //    we accept more input, otherwise the internal in_chan grows
-        //    unbounded. The `in_tx` borrow is scoped to the feed so it ends
-        //    before 4c may `take()` it.
+        //    has priority over held_in deliberately: downstream backpressure
+        //    must propagate upstream before we accept more input, otherwise the
+        //    internal in_chan grows unbounded. The `in_tx` borrow is scoped to
+        //    the feed so it ends before 4c may `take()` it.
         let mut close_stdin = false;
         if let Some(in_tx) = self.in_tx.as_ref() {
             let input_drained = ctx.input.is_drained();
@@ -1646,13 +1155,12 @@ impl Step for AlignAndMergeStep {
             // flipping true. A finished reader has dropped its `out_tx`, so
             // drain `out_rx` to completion NOW (it yields any remaining batches
             // then `Disconnected`) before joining — otherwise that final batch
-            // would be lost when `finalize` drops the receiver. If a merged
-            // batch can't be pushed, park it in `held_out` and re-dispatch.
+            // would be lost when `finalize` drops the receiver. If a batch
+            // can't be pushed, park it in `held_out` and re-dispatch.
             {
                 let out_rx = self.out_rx.as_ref().expect("out_rx Some (checked above)");
                 while let Ok(zb) = out_rx.try_recv() {
-                    let merged = merge_zipper_batch(zb, &self.cfg, &self.tags)?;
-                    if let Err(unpushed) = ctx.outputs.push(merged) {
+                    if let Err(unpushed) = ctx.outputs.push(zb) {
                         self.held_out.put(unpushed);
                         return Ok(StepOutcome::Progress);
                     }
@@ -1665,7 +1173,7 @@ impl Step for AlignAndMergeStep {
     }
 }
 
-impl AlignAndMergeStep {
+impl SubprocessAlignStep {
     /// Completion barrier, reached from `try_run` once the reader has exited,
     /// `out_rx` is empty, and `held_out` is empty (so no aligner output can be
     /// lost). Joins the writer + reader daemons, waits for the aligner
@@ -1726,7 +1234,7 @@ impl AlignAndMergeStep {
     }
 }
 
-impl Drop for AlignAndMergeStep {
+impl Drop for SubprocessAlignStep {
     /// Best-effort resource cleanup for error paths that bypass the clean
     /// `try_run` completion (`finalize`). The framework's `PipelineSignal`
     /// records the first step error and other workers stop on their next loop
@@ -1735,18 +1243,11 @@ impl Drop for AlignAndMergeStep {
     ///
     /// **This is also the cancel-response path.** When
     /// `PipelineSignal::cancel` fires, workers exit at their next
-    /// loop iteration, `Pipeline::run` returns, the `AlignAndMergeStep`
+    /// loop iteration, `Pipeline::run` returns, the step's
     /// `Arc` refcount hits zero, and `Drop` runs. `aligner.kill()`
     /// here SIGKILLs bwa; its pipes close immediately so the reader
     /// thread's stdout `read` unblocks within microseconds and the
-    /// daemon cascade completes. Total cancel latency is bounded by:
-    /// (one worker-loop iteration to observe `is_done`) + (longest
-    /// in-flight `try_run` wall — single-digit ms for AAM's merge
-    /// step) + (Drop+join, ≤ µs). Routing `is_done` through `try_run`
-    /// to kill earlier would shave ~ms but requires either a
-    /// framework change (`StepCtx` exposing `signal`) or threading
-    /// the signal through construction; not worth it for the
-    /// observable cancel response we ship today.
+    /// daemon cascade completes.
     ///
     /// Order is **disconnect-channels-then-kill-then-join** — the
     /// opposite of the clean `finalize` path. Two distinct blocking points
@@ -1781,7 +1282,7 @@ impl Drop for AlignAndMergeStep {
         // fail with an error instead of hanging. Idempotent: if the header was
         // already resolved on the normal path, `poison` returns `Err` (ignored).
         let _ = self.cfg.header_handle.poison(io::Error::other(
-            "AlignAndMergeStep dropped before resolving the output header",
+            "SubprocessAlignStep dropped before resolving the output header",
         ));
 
         drop(self.in_tx.take());
@@ -1808,105 +1309,79 @@ impl Drop for AlignAndMergeStep {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Tests
+// Backend
 // ──────────────────────────────────────────────────────────────────────────
+
+/// The subprocess align backend: wires a [`SubprocessAlignStep`] after the
+/// queryname-grouped input, then the shared `Parallel` [`MergeAlignedStep`]
+/// that zips its `ZipperBatch` stream, and returns the merged tail.
+pub(crate) struct SubprocessBackend {
+    /// The resolved aligner shell command (e.g. `bwa-mem3 mem -p -K … <ref> …`).
+    pub(crate) command: String,
+    /// The aligner's `-K` chunk size (bases), used to derive the in-flight
+    /// byte budget.
+    pub(crate) chunk_size: u64,
+}
+
+impl SubprocessBackend {
+    /// Minimum pool workers this backend needs for steady-state progress. The
+    /// subprocess step spawns two daemon threads (FASTQ writer + SAM/BAM
+    /// reader) plus the aligner subprocess, so 4 framework workers are the
+    /// floor: source preamble, dispatch, downstream, plus a spare.
+    pub(crate) const MIN_WORKERS: usize = 4;
+    /// Whether this backend prefers the chain builder's drain-first scheduler.
+    /// `false`: the subprocess align path keeps its pre-split scheduling
+    /// behavior.
+    pub(crate) const PREFERS_DRAIN_FIRST: bool = false;
+}
+
+impl AlignBackend for SubprocessBackend {
+    fn describe(&self) -> String {
+        format!("subprocess aligner: {}", self.command)
+    }
+
+    fn wire(
+        self: Box<Self>,
+        pipeline: &PipelineBuilder,
+        input: (StepIdx, BranchIdx),
+        ctx: &AlignWiringCtx,
+    ) -> anyhow::Result<AlignWired> {
+        let step = SubprocessAlignStep::new(
+            SubprocessConfig {
+                partial_output_header: Arc::clone(&ctx.partial_output_header),
+                header_handle: ctx.header_handle.clone(),
+                output_byte_limit: ctx.per_step_byte_limit,
+                in_flight_unmapped_budget: in_flight_budget_for_chunk_size(self.chunk_size),
+            },
+            &self.command,
+        )
+        .map_err(|e| anyhow!("SubprocessAlignStep::new: {e:#}"))?;
+
+        let zipper_tail = pipeline.append_step(step, input);
+        // The shared merge step zips the aligner's records with the unmapped
+        // halves.
+        let tail = pipeline
+            .append_step(MergeAlignedStep::from_shared(Arc::clone(&ctx.merge)), zipper_tail);
+        Ok(AlignWired {
+            tail,
+            min_workers: Self::MIN_WORKERS,
+            prefers_drain_first: Self::PREFERS_DRAIN_FIRST,
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fgumi_raw_bam::flags::{FIRST_SEGMENT, LAST_SEGMENT, PAIRED};
 
-    fn make_test_cfg() -> AlignAndMergeConfig {
-        AlignAndMergeConfig {
-            tag_info: Arc::new(TagInfo::new(vec![], vec![], vec![])),
-            skip_tc_tags: true,
-            reference: None,
+    fn make_test_cfg() -> SubprocessConfig {
+        SubprocessConfig {
             partial_output_header: Arc::new(Header::default()),
             header_handle: HeaderHandle::new(),
-            records_emitted: Arc::new(AtomicU64::new(0)),
             output_byte_limit: 1024 * 1024,
             in_flight_unmapped_budget: in_flight_budget_for_chunk_size(150_000_000),
         }
-    }
-
-    #[test]
-    fn in_flight_budget_derivation() {
-        // Default -K (150M bases) → 4 × 150M × 3 = 1.8 GiB.
-        assert_eq!(in_flight_budget_for_chunk_size(150_000_000), 4 * 150_000_000 * 3);
-        // Small / zero -K floors at IN_FLIGHT_MIN_BUDGET.
-        assert_eq!(in_flight_budget_for_chunk_size(0), IN_FLIGHT_MIN_BUDGET);
-        assert_eq!(in_flight_budget_for_chunk_size(1_000_000), IN_FLIGHT_MIN_BUDGET);
-    }
-
-    #[test]
-    fn consumer_gone_latched_even_when_reader_scope_panics() {
-        // A panic unwinding out of the reader scope must still latch
-        // consumer-gone via `ConsumerGoneGuard`, so a writer parked in
-        // `acquire` bails (returns false) instead of blocking forever. Without
-        // the guard the panic would skip `mark_consumer_gone`, deadlocking the
-        // writer and the `writer_thread.join()` in `Drop`.
-        let gate = InFlightGate::new(1024);
-        assert!(gate.acquire(10), "acquire succeeds before the consumer is gone");
-
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _consumer_gone = ConsumerGoneGuard(&gate);
-            panic!("simulated reader_loop panic");
-        }));
-        assert!(panicked.is_err(), "the panic must propagate out of the guarded scope");
-
-        // The guard's `Drop` latched consumer-gone during unwind, so a
-        // subsequent writer reservation bails instead of blocking.
-        assert!(!gate.acquire(10), "a writer must bail once the reader scope has panicked");
-    }
-
-    #[test]
-    fn in_flight_gate_oversized_single_batch_passes_when_empty() {
-        // A batch larger than the whole budget must still pass when the gate
-        // is empty — it can't be split, so holding it is unavoidable, and
-        // blocking would deadlock.
-        let gate = InFlightGate::new(100);
-        assert!(gate.acquire(1000), "oversized batch must pass when gate empty");
-    }
-
-    #[test]
-    fn in_flight_gate_blocks_until_release() {
-        use std::time::Duration;
-        let gate = Arc::new(InFlightGate::new(100));
-        assert!(gate.acquire(100), "first acquire fills the budget");
-
-        let g2 = Arc::clone(&gate);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let h = std::thread::spawn(move || {
-            // in_flight is 100 (full, non-empty) → this blocks until release.
-            assert!(g2.acquire(50));
-            tx.send(()).unwrap();
-        });
-        // Still blocked.
-        assert!(
-            rx.recv_timeout(Duration::from_millis(150)).is_err(),
-            "second acquire must block while the gate is full"
-        );
-        gate.release(100);
-        rx.recv_timeout(Duration::from_secs(5)).expect("acquire must unblock after release");
-        h.join().unwrap();
-    }
-
-    #[test]
-    fn in_flight_gate_consumer_gone_unblocks_and_bails() {
-        use std::time::Duration;
-        let gate = Arc::new(InFlightGate::new(100));
-        assert!(gate.acquire(100), "fill the budget");
-
-        let g2 = Arc::clone(&gate);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let h = std::thread::spawn(move || {
-            let ok = g2.acquire(50); // blocks (full) until consumer-gone
-            tx.send(ok).unwrap();
-        });
-        assert!(rx.recv_timeout(Duration::from_millis(150)).is_err(), "must be blocked");
-        gate.mark_consumer_gone();
-        let ok = rx.recv_timeout(Duration::from_secs(5)).expect("must wake on consumer-gone");
-        assert!(!ok, "acquire must return false once the consumer is gone");
-        h.join().unwrap();
     }
 
     /// `bash -c 'true'` is a stand-in for a subprocess that exits
@@ -1918,30 +1393,24 @@ mod tests {
         // The aligner exits before any FASTQ is written. The reader
         // thread will fail to find BGZF magic at stdout EOF, which
         // we expect — we just verify spawn + Drop.
-        // Spawn must succeed (the pipes are wired by `AlignerProcess`), and
-        // the returned step is dropped at end of scope, exercising the `Drop`
-        // teardown path. `true` exits immediately; the reader will later fail
-        // to find BGZF magic, which is fine — this test only covers spawn+Drop.
-        let step = AlignAndMergeStep::new(cfg, "true").expect("spawn true");
+        let step = SubprocessAlignStep::new(cfg, "true").expect("spawn true");
         let _ = step;
     }
 
     #[test]
-    fn profile_advertises_serial_nonsticky_byordinal() {
-        // v2.2 refactor: AAM was `Exclusive`+`sticky` (which caused
-        // the worker-affinity hang); is now `Serial`+`!sticky` so any
-        // free worker can dispatch when an owner is stuck elsewhere.
-        // See docs/design/aam-bridge-refactor.md §0.
+    fn profile_advertises_serial_nonsticky_fifo() {
+        // Serial + !sticky so any free worker can dispatch when an owner is
+        // stuck elsewhere; the `ZipperBatch` output is FIFO (`None`) because the
+        // downstream Parallel `MergeAlignedStep` restores order via its own
+        // `ByItemOrdinal` output.
         let cfg = make_test_cfg();
-        let step = AlignAndMergeStep::new(cfg, "cat").expect("spawn cat");
+        let step = SubprocessAlignStep::new(cfg, "cat").expect("spawn cat");
         let p = step.profile();
-        assert_eq!(p.name, "AlignAndMerge");
+        assert_eq!(p.name, "SubprocessAlign");
         assert_eq!(p.kind, StepKind::Serial);
-        assert!(!p.sticky, "post-v2.2: non-sticky so any free worker can dispatch");
-        assert_eq!(p.branch_ordering, vec![BranchOrdering::ByItemOrdinal]);
+        assert!(!p.sticky, "non-sticky so any free worker can dispatch");
+        assert_eq!(p.branch_ordering, vec![BranchOrdering::None]);
         assert_eq!(p.output_queues.len(), 1);
-        // Don't strictly assert the exact QueueSpec variant to avoid
-        // brittle coupling to the framework's internal layout.
     }
 
     #[test]
@@ -1951,7 +1420,7 @@ mod tests {
         let cfg = make_test_cfg();
         let start = std::time::Instant::now();
         {
-            let _step = AlignAndMergeStep::new(cfg, "sleep 60").expect("spawn sleep");
+            let _step = SubprocessAlignStep::new(cfg, "sleep 60").expect("spawn sleep");
         } // Drop runs here.
         let elapsed = start.elapsed();
         // AlignerProcess::kill waits up to 1s; thread joins should
@@ -1967,24 +1436,15 @@ mod tests {
         // When the subprocess emits nothing, the reader can't find BGZF
         // magic, returns Err, and *poisons* the header handle rather than
         // resolving it — so a downstream writer blocked on the handle fails
-        // instead of hanging. This test pins that poison behavior.
-        //
-        // (The happy path — handle resolved to Ok from a real header — is
-        // covered by `header_handle_resolves_to_ok_when_aligner_emits_valid_bam`
-        // / `..._emits_sam_text`; the more precise empty-stdout marker is
-        // pinned by `empty_stdout_surfaces_aligner_exited_before_emitting`.)
+        // instead of hanging.
         let cfg = make_test_cfg();
         let handle = cfg.header_handle.clone();
 
         // `true` exits immediately — no stdout. Reader sees empty
         // stdout, peek finds 0 bytes, is_bgzf=false → Err →
         // handle.poison.
-        let step = AlignAndMergeStep::new(cfg, "true").expect("spawn true");
+        let step = SubprocessAlignStep::new(cfg, "true").expect("spawn true");
 
-        // Drive the step a few times to let the reader thread run
-        // and propagate. The exact threading interleaving means we
-        // can't be deterministic — but we can give it a generous
-        // window.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !handle.is_set() && std::time::Instant::now() < deadline {
             thread::yield_now();
@@ -1996,8 +1456,6 @@ mod tests {
         // path when stdout is empty/non-BGZF).
         assert!(result.is_err(), "expected handle to be poisoned on empty stdout");
 
-        // Subprocess + threads tear down at end-of-scope when
-        // `step` is dropped.
         let _ = step;
     }
 
@@ -2011,7 +1469,7 @@ mod tests {
     }
 
     /// Build a Template whose every record is filtered by
-    /// `FASTQ_WRITER_EXCLUDE_FLAGS`. AAM's writer should reject this
+    /// `FASTQ_WRITER_EXCLUDE_FLAGS`. The writer should reject this
     /// input loudly so the user sees the "expected unmapped input"
     /// guidance rather than a misleading "aligner emitted fewer
     /// alignments" downstream error.
@@ -2025,7 +1483,6 @@ mod tests {
     /// primary alignments) — the shape `writer_loop` expects from a
     /// realistic unmapped BAM (`fgumi extract` output).
     fn make_paired_primary_template(qname: &[u8]) -> Template {
-        use fgumi_raw_bam::flags::{FIRST_SEGMENT, LAST_SEGMENT, PAIRED};
         let r1 = make_record(qname, PAIRED | FIRST_SEGMENT);
         let r2 = make_record(qname, PAIRED | LAST_SEGMENT);
         Template::from_records(vec![r1, r2]).expect("paired primary template")
@@ -2049,7 +1506,7 @@ mod tests {
 
         let (in_tx, in_rx) = sync_channel::<BamTemplateBatch>(1);
         // Unbounded token channel mirrors production (see comment at
-        // the `token_chan` construction site in `AlignAndMergeStep::new`).
+        // the `token_chan` construction site in `SubprocessAlignStep::new`).
         let (token_tx, _token_rx) = channel::<BatchToken>();
         let shared = Arc::new(SharedState::new());
 
@@ -2076,36 +1533,14 @@ mod tests {
         let slot_err = shared.take_error().expect("error_slot populated");
         assert!(slot_err.to_string().contains("no primary records"));
 
-        // `cat` self-exits once `writer_loop` drops its BufWriter
-        // (and the wrapped `ChildStdin`) at function return —
-        // closing the pipe makes `cat` see stdin EOF. The explicit
-        // kill+wait below is belt-and-braces in case `writer_loop`
-        // bailed before dropping (e.g. on an unexpected panic).
         let _ = cat.kill();
         let _ = cat.wait();
     }
 
     /// Regression for the AAM deadlock fixed in commit `069c265`.
     ///
-    /// **Setup**: feed `writer_loop` more batches than the old
-    /// `IN_CHAN_DEPTH=2` token-channel bound would have allowed,
-    /// while keeping the reader side parked — `token_rx` is held
-    /// but never receives. With the old bounded `token_chan`, the
-    /// writer would block on its third `token_tx.send(...)` inside
-    /// the `while let Ok(batch) = in_rx.recv()` body and never
-    /// exit, causing `writer_loop` to hang here.
-    ///
     /// **Invariant**: `token_chan` is unbounded; the writer must
     /// drain `in_rx` regardless of whether anyone is recv'ing tokens.
-    /// The test runs `writer_loop` on a worker thread with a 30 s
-    /// join timeout — a regression that re-introduces the bound
-    /// shows up as a `join` timeout (test failure), not as silent
-    /// flakiness.
-    ///
-    /// `cat > /dev/null` plays the role of bwa: it absorbs the
-    /// FASTQ writes without emitting anything. With the unbounded
-    /// `token_chan` the writer pushes 16 tokens and then exits
-    /// cleanly when `in_tx` is dropped.
     #[test]
     fn writer_loop_does_not_deadlock_when_reader_does_not_drain_tokens() {
         use std::process::{Command, Stdio};
@@ -2114,9 +1549,7 @@ mod tests {
 
         // `cat > /dev/null` consumes our FASTQ writes silently —
         // standing in for an aligner that buffers stdin without
-        // emitting anything on stdout (the exact condition that
-        // triggered the production deadlock on bwa with
-        // `-K 150000000` and a small input).
+        // emitting anything on stdout.
         let mut cat = Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -2127,17 +1560,11 @@ mod tests {
 
         // Match production: in_chan small + bounded (mirrors
         // `IN_CHAN_DEPTH = 2`); token channel unbounded.
-        // Pre-fix this would have deadlocked at batch 3; use 16 so a
-        // partial regression (e.g. someone bumping the bound to 8 or
-        // 16 without making it unbounded) is also caught.
         let n_batches: usize = 16;
         let (in_tx, in_rx) = sync_channel::<BamTemplateBatch>(2);
         let (token_tx, token_rx) = channel::<BatchToken>();
         let shared = Arc::new(SharedState::new());
 
-        // Drive the writer on a worker thread so the test can apply a
-        // join timeout — a deadlock surfaces as a timeout rather than
-        // hanging the test runner.
         let shared_for_worker = Arc::clone(&shared);
         // Non-engaging budget: this test deliberately never drains tokens, so
         // size the in-flight gate so it can't block — the assertion under test
@@ -2153,14 +1580,6 @@ mod tests {
             })
             .expect("spawn writer worker");
 
-        // Pump N batches of one paired template each from a separate
-        // producer thread. If the writer deadlocks on
-        // `token_tx.send` (the failure mode this test guards), the
-        // bounded `in_chan` (depth 2) will also fill up and block
-        // this producer — but the main test thread stays responsive
-        // and surfaces the timeout below. Pushing the sends in-line
-        // on the main thread would let the same `in_chan`-full
-        // condition wedge the test runner itself.
         let producer_handle = std::thread::Builder::new()
             .name("producer-deadlock-test".into())
             .spawn(move || {
@@ -2173,12 +1592,6 @@ mod tests {
                         return Err::<(), String>("in_rx closed before producer finished".into());
                     }
                 }
-                // Closing `in_tx` flips `in_rx.recv()` to `Err` after
-                // the last buffered batch is consumed. The writer must
-                // observe that and exit; with the old bounded
-                // `token_chan`, the writer would be stuck on
-                // `token_tx.send` for batch 3+ and never get back to
-                // the `recv` site.
                 drop(in_tx);
                 Ok(())
             })
@@ -2225,63 +1638,6 @@ mod tests {
         let _ = cat.wait();
     }
 
-    fn make_sq_header(refs: &[(&str, usize)]) -> Header {
-        use noodles::sam::header::record::value::Map;
-        use noodles::sam::header::record::value::map::ReferenceSequence;
-        let mut b = Header::builder();
-        for (name, length) in refs {
-            let map: Map<ReferenceSequence> = Map::<ReferenceSequence>::new(
-                std::num::NonZeroUsize::new(*length).expect("nonzero ref length"),
-            );
-            b = b.add_reference_sequence(bstr::BString::from(*name), map);
-        }
-        b.build()
-    }
-
-    #[test]
-    fn validate_sq_consistency_accepts_matching_refs() {
-        let partial = make_sq_header(&[("chr1", 1000), ("chr2", 2000)]);
-        let aligner = make_sq_header(&[("chr1", 1000), ("chr2", 2000)]);
-        validate_sq_consistency(&partial, &aligner).expect("matching refs are ok");
-    }
-
-    #[test]
-    fn validate_sq_consistency_rejects_count_mismatch() {
-        let partial = make_sq_header(&[("chr1", 1000), ("chr2", 2000)]);
-        let aligner = make_sq_header(&[("chr1", 1000)]);
-        let err =
-            validate_sq_consistency(&partial, &aligner).expect_err("count mismatch must reject");
-        let msg = err.to_string();
-        assert!(msg.contains("@SQ count") && msg.contains("does not match"));
-    }
-
-    #[test]
-    fn validate_sq_consistency_rejects_length_mismatch() {
-        let partial = make_sq_header(&[("chr1", 1000)]);
-        let aligner = make_sq_header(&[("chr1", 999)]);
-        let err =
-            validate_sq_consistency(&partial, &aligner).expect_err("length mismatch must reject");
-        let msg = err.to_string();
-        assert!(msg.contains("length mismatch") && msg.contains("chr1"));
-    }
-
-    #[test]
-    fn validate_sq_consistency_rejects_name_mismatch() {
-        // Two refs so the position-index reporting can be exercised
-        // (round-1 had a format-args bug that put the dict name in
-        // the position slot; a single-ref test wouldn't have caught
-        // it).
-        let partial = make_sq_header(&[("chr1", 1000), ("chr2", 1000)]);
-        let aligner = make_sq_header(&[("chr1", 1000), ("chrZ", 1000)]);
-        let err =
-            validate_sq_consistency(&partial, &aligner).expect_err("name mismatch must reject");
-        let msg = err.to_string();
-        assert!(msg.contains("name mismatch"));
-        assert!(msg.contains("position 1"), "position index in message: {msg}");
-        assert!(msg.contains("dict='chr2'"), "dict name in message: {msg}");
-        assert!(msg.contains("aligner='chrZ'"), "aligner name in message: {msg}");
-    }
-
     /// Build a minimal valid header-only BAM file at `path`. Used as
     /// the output of a fake-aligner shell command so the reader can
     /// exercise its real-BAM code path (header parse + `@SQ`
@@ -2316,15 +1672,10 @@ mod tests {
         // Fake-aligner: emit the pre-staged header-only BAM bytes
         // and exit. The test never pushes FASTQ input, so the
         // aligner doesn't need to consume stdin — `cat <file>`
-        // emits the file's bytes and exits when it's done. The
-        // writer thread sits in `in_rx.recv()` until the step is
-        // dropped at the end of the test.
+        // emits the file's bytes and exits when it's done.
         let cmd = format!("cat {}", fixture.display());
-        let step = AlignAndMergeStep::new(cfg, &cmd).expect("spawn fake aligner");
+        let step = SubprocessAlignStep::new(cfg, &cmd).expect("spawn fake aligner");
 
-        // Wait up to 5s for the reader thread to parse the header
-        // and resolve the handle. The shell command takes a moment
-        // to start.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !handle.is_set() && std::time::Instant::now() < deadline {
             thread::sleep(std::time::Duration::from_millis(20));
@@ -2333,8 +1684,6 @@ mod tests {
         let result = handle.try_get().expect("set");
         assert!(result.is_ok(), "header should resolve to Ok, not poison: {:?}", result.err());
 
-        // Subprocess + threads tear down at end-of-scope when
-        // `step` is dropped.
         let _ = step;
     }
 
@@ -2347,7 +1696,7 @@ mod tests {
         // actionable errors).
         let cfg = make_test_cfg();
         let handle = cfg.header_handle.clone();
-        let _step = AlignAndMergeStep::new(cfg, "true").expect("spawn true");
+        let _step = SubprocessAlignStep::new(cfg, "true").expect("spawn true");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !handle.is_set() && std::time::Instant::now() < deadline {
@@ -2363,9 +1712,6 @@ mod tests {
     }
 
     /// Build a minimal valid SAM-text fixture (header only) at `path`.
-    /// Used as the output of a fake-aligner shell command so the
-    /// reader can exercise the SAM-text code path through
-    /// `peek_aligner_format` → `SamTemplateStream`.
     fn write_minimal_header_only_sam(path: &std::path::Path) {
         use std::fs::File;
         let mut f = File::create(path).expect("create sam fixture");
@@ -2387,7 +1733,7 @@ mod tests {
         let handle = cfg.header_handle.clone();
 
         let cmd = format!("cat {}", fixture.display());
-        let _step = AlignAndMergeStep::new(cfg, &cmd).expect("spawn fake SAM aligner");
+        let _step = SubprocessAlignStep::new(cfg, &cmd).expect("spawn fake SAM aligner");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !handle.is_set() && std::time::Instant::now() < deadline {
@@ -2398,92 +1744,13 @@ mod tests {
         assert!(result.is_ok(), "SAM-text header should resolve handle to Ok: {:?}", result.err(),);
     }
 
-    /// `merge_aligner_header` must keep the *partial* header's `@PG` on a
-    /// duplicate ID (the aligner's PG with that ID is dropped, not merged)
-    /// while still appending aligner PGs whose IDs are unique to the
-    /// aligner. This pins the dedup behavior documented on the function.
-    #[test]
-    fn merge_aligner_header_keeps_partial_pg_on_duplicate_id() {
-        use bstr::BString;
-        use noodles::sam::header::record::value::Map;
-        use noodles::sam::header::record::value::map::Program;
-        use noodles::sam::header::record::value::map::program::tag as pg_tag;
-
-        // Helper: build a @PG map carrying a distinguishing PN field so we
-        // can tell the partial's PG apart from the aligner's.
-        let program_with_name = |name: &str| -> Map<Program> {
-            Map::<Program>::builder().insert(pg_tag::NAME, name).build().expect("valid @PG")
-        };
-
-        // Partial header: a "dup" PG (PN=partial) plus a partial-only PG.
-        let partial = Header::builder()
-            .add_program(BString::from("dup"), program_with_name("partial"))
-            .add_program(BString::from("onlypartial"), program_with_name("partial"))
-            .build();
-
-        // Aligner header: a "dup" PG (PN=aligner, must be dropped) plus a
-        // unique "bwa" PG (must be appended).
-        let aligner = Header::builder()
-            .add_program(BString::from("dup"), program_with_name("aligner"))
-            .add_program(BString::from("bwa"), program_with_name("aligner"))
-            .build();
-
-        let merged = merge_aligner_header(&partial, &aligner);
-        let programs = merged.programs();
-        let programs = programs.as_ref();
-
-        // Exactly three PGs survive: dup (partial's), onlypartial, bwa.
-        assert_eq!(programs.len(), 3, "expected dup + onlypartial + bwa");
-
-        // Read back the PN field for a given @PG ID.
-        let pn_of = |id: &str| -> Option<String> {
-            programs
-                .get(&BString::from(id))
-                .and_then(|pg| pg.other_fields().get(&pg_tag::NAME).map(ToString::to_string))
-        };
-
-        // The duplicate-ID PG is the PARTIAL's (PN=partial), not the
-        // aligner's — the aligner's same-ID PG was dropped.
-        assert_eq!(
-            pn_of("dup").as_deref(),
-            Some("partial"),
-            "duplicate @PG ID must retain the partial's PG, not the aligner's"
-        );
-        // The partial-only PG is preserved.
-        assert_eq!(pn_of("onlypartial").as_deref(), Some("partial"));
-        // The aligner-unique PG is appended.
-        assert_eq!(
-            pn_of("bwa").as_deref(),
-            Some("aligner"),
-            "aligner @PG with a non-duplicate ID must be appended"
-        );
-    }
-
-    /// Build a single-record `RawRecord` carrying one string tag.
-    fn make_record_with_string_tag(
-        qname: &[u8],
-        flags: u16,
-        tag: crate::sam::SamTag,
-        value: &[u8],
-    ) -> fgumi_raw_bam::RawRecord {
-        let mut b = fgumi_raw_bam::SamBuilder::new();
-        b.read_name(qname)
-            .flags(flags)
-            .sequence(b"ACGT")
-            .qualities(b"IIII")
-            .add_string_tag(tag, value);
-        b.build()
-    }
-
     /// The shared queryname-grouping state machine (delegated to by both
     /// `BamTemplateStream` and `SamTemplateStream`) must group consecutive
     /// same-queryname records into one `Template` and stash the first record of
-    /// the *next* template across calls — the core reader contract that had no
-    /// record-level coverage. A mock `read` closure feeds canned records:
-    /// readA (R1+R2), then readB (single), then EOF.
+    /// the *next* template across calls. A mock `read` closure feeds canned
+    /// records: readA (R1+R2), then readB (single), then EOF.
     #[test]
     fn assemble_next_template_groups_consecutive_querynames() {
-        use fgumi_raw_bam::flags::{FIRST_SEGMENT, LAST_SEGMENT, PAIRED};
         let recs = vec![
             make_record(b"readA", PAIRED | FIRST_SEGMENT),
             make_record(b"readA", PAIRED | LAST_SEGMENT),
@@ -2511,150 +1778,5 @@ mod tests {
                 .is_none(),
             "stream is exhausted after the last template"
         );
-    }
-
-    /// `merge_zipper_batch` transfers the unmapped half's tags onto the paired
-    /// mapped template, preserves the batch serial, and bumps `records_emitted`
-    /// by the emitted record count — the core merge contract, previously only
-    /// exercised through header-only fixtures.
-    #[test]
-    fn merge_zipper_batch_transfers_unmapped_tags_and_counts_records() {
-        let cfg = make_test_cfg();
-        let tags = ZipperTags::from_tag_info(&cfg.tag_info);
-        // Unmapped half carries RX; the mapped half (aligner output) does not.
-        let unmapped_rec = make_record_with_string_tag(
-            b"readA",
-            fgumi_raw_bam::flags::UNMAPPED,
-            crate::sam::SamTag::RX,
-            b"ACGT",
-        );
-        let unmapped = Template::from_records(vec![unmapped_rec]).expect("unmapped template");
-        let mapped =
-            Template::from_records(vec![make_record(b"readA", 0)]).expect("mapped template");
-
-        let zb = ZipperBatch {
-            serial: 5,
-            mapped: vec![mapped],
-            unmapped: BamTemplateBatch::new(5, vec![unmapped]),
-        };
-        let out = merge_zipper_batch(zb, &cfg, &tags).expect("merge ok");
-
-        assert_eq!(out.ordinal(), 5, "batch serial is preserved through the merge");
-        assert_eq!(out.templates().len(), 1, "one merged template out");
-        assert_eq!(
-            cfg.records_emitted.load(Ordering::Relaxed),
-            1,
-            "records_emitted bumped by merged record count, not template count"
-        );
-        // The RX tag from the unmapped half must land on the merged mapped record.
-        let merged_rec = &out.templates()[0].records[0];
-        let aux = fgumi_raw_bam::fields::aux_data_slice(merged_rec);
-        assert_eq!(
-            fgumi_raw_bam::tags::find_string_tag(aux, crate::sam::SamTag::RX),
-            Some(&b"ACGT"[..]),
-            "the unmapped RX tag must transfer onto the correct mapped record"
-        );
-    }
-
-    /// A `ZipperBatch` whose mapped and unmapped halves differ in length is a
-    /// structural invariant violation: `merge_zipper_batch` must hard-error
-    /// (release-safe) rather than let `zip` silently truncate to the shorter
-    /// side and drop templates.
-    #[test]
-    fn merge_zipper_batch_errors_on_length_mismatch() {
-        let cfg = make_test_cfg();
-        let tags = ZipperTags::from_tag_info(&cfg.tag_info);
-        let mapped = Template::from_records(vec![make_record(b"readA", 0)]).expect("mapped");
-        // One mapped template, zero unmapped -> lengths differ.
-        let zb = ZipperBatch {
-            serial: 0,
-            mapped: vec![mapped],
-            unmapped: BamTemplateBatch::new(0, Vec::new()),
-        };
-        let err = merge_zipper_batch(zb, &cfg, &tags)
-            .expect_err("length mismatch must error, not truncate");
-        assert!(
-            err.to_string().contains("ZipperBatch invariant violated"),
-            "error must name the invariant: {err}"
-        );
-    }
-
-    /// Regression guard for hoisting the `ZipperTags` bitset build out of the
-    /// per-template merge loop: `merge_zipper_batch` takes the tags as a
-    /// caller-supplied `&ZipperTags` (built once for the whole step — see
-    /// `AlignAndMergeStep::new` — and reused across every batch). A
-    /// non-trivial `TagInfo` (one remove + one reverse + one revcomp tag) is
-    /// applied across THREE templates in a single batch; every template's
-    /// negative-strand read must get the same remove/reverse/revcomp
-    /// treatment, not just the first one merged. A bug that reused the tag
-    /// lookups incorrectly across templates would only show up past the
-    /// first iteration, which is exactly what this test is sized to catch.
-    #[test]
-    fn merge_zipper_batch_applies_transforms_to_every_template() {
-        let mut cfg = make_test_cfg();
-        cfg.tag_info = Arc::new(TagInfo::new(
-            vec!["XA".to_string()],
-            vec!["XV".to_string()],
-            vec!["XC".to_string()],
-        ));
-        let tags = ZipperTags::from_tag_info(&cfg.tag_info);
-
-        let names: [&[u8]; 3] = [b"readA", b"readB", b"readC"];
-        let mut mapped_templates = Vec::new();
-        let mut unmapped_templates = Vec::new();
-        for name in names {
-            // Mapped (aligner) record: negative strand, single unpaired read,
-            // carrying a stale XA tag that must be removed on merge.
-            let mut mb = fgumi_raw_bam::SamBuilder::new();
-            mb.read_name(name)
-                .flags(fgumi_raw_bam::flags::REVERSE)
-                .sequence(b"ACGT")
-                .qualities(b"IIII")
-                .add_string_tag(*b"XA", b"stale");
-            let mapped_rec = mb.build();
-            mapped_templates
-                .push(Template::from_records(vec![mapped_rec]).expect("mapped template"));
-
-            // Unmapped record carries the tags to remove/reverse/revcomp.
-            let mut ub = fgumi_raw_bam::SamBuilder::new();
-            ub.read_name(name)
-                .flags(fgumi_raw_bam::flags::UNMAPPED)
-                .sequence(b"ACGT")
-                .qualities(b"IIII")
-                .add_string_tag(*b"XV", b"abcde")
-                .add_string_tag(*b"XC", b"AGAGG")
-                .add_string_tag(*b"XA", b"drop-me");
-            let unmapped_rec = ub.build();
-            unmapped_templates
-                .push(Template::from_records(vec![unmapped_rec]).expect("unmapped template"));
-        }
-
-        let zb = ZipperBatch {
-            serial: 0,
-            mapped: mapped_templates,
-            unmapped: BamTemplateBatch::new(0, unmapped_templates),
-        };
-        let out = merge_zipper_batch(zb, &cfg, &tags).expect("merge ok");
-
-        assert_eq!(out.templates().len(), 3, "all three templates survive the merge");
-        for (i, template) in out.templates().iter().enumerate() {
-            let rec = &template.records[0];
-            let aux = fgumi_raw_bam::fields::aux_data_slice(rec);
-
-            assert_eq!(
-                fgumi_raw_bam::tags::find_string_tag(aux, *b"XV"),
-                Some(&b"edcba"[..]),
-                "template {i}: XV must be reversed on the negative-strand read"
-            );
-            assert_eq!(
-                fgumi_raw_bam::tags::find_string_tag(aux, *b"XC"),
-                Some(&b"CCTCT"[..]),
-                "template {i}: XC must be reverse-complemented on the negative-strand read"
-            );
-            assert!(
-                fgumi_raw_bam::tags::find_string_tag(aux, *b"XA").is_none(),
-                "template {i}: XA must be removed (stale mapped copy + skipped on tag-copy)"
-            );
-        }
     }
 }

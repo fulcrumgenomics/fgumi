@@ -527,7 +527,7 @@ fn collect_mapped_indices(mapped: &Template, is_first_segment: bool) -> Vec<usiz
 /// rather than per template is the entire reason this type exists.
 ///
 /// `pub(crate)` so callers that merge many templates per `TagInfo` (e.g.
-/// `AlignAndMergeStep` and `ZipperMergeStep`) can build one `ZipperTags` for
+/// the align stage's zipper merge and `ZipperMergeStep`) can build one `ZipperTags` for
 /// the whole step and drive [`merge_one_template_with`] directly, instead of
 /// paying the three-`TagBitset`-allocation cost on every template. Fields
 /// stay private — callers hold this opaquely.
@@ -1582,7 +1582,7 @@ pub const NEW_PIPELINE_START_LOG: &str = "Starting zipper (new pipeline)";
 ///
 /// Both callers that merge many templates against the same `TagInfo` —
 /// `ZipperMerge` (the Parallel zipper-chain merge step) and
-/// `AlignAndMergeStep::merge_zipper_batch` (AAM dispatcher) — build the
+/// `align::merge::merge_zipper_batch` (the align stage's merge) — build the
 /// `ZipperTags` once, outside their per-template loop, and hold it on the
 /// step for the step's whole lifetime rather than rebuilding it (three
 /// `TagBitset` allocations) on every call.

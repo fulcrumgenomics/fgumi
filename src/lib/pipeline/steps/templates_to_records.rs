@@ -1,7 +1,7 @@
 //! `TemplatesToRecordBatch` adapter step.
 //!
 //! Bridges the queryname-template view (`BamTemplateBatch`,
-//! emitted by `AlignAndMergeStep` and `ZipperMergeStep`) to the
+//! emitted by the align stage's zipper merge and `ZipperMergeStep`) to the
 //! flat-record view (`RecordBatch`, consumed by the sort ingest
 //! (`SortBuffer`), `DecodeRecords`, etc.). Flattens each `Template`'s records into
 //! a single `RecordBatch` carrying the input batch's serial
