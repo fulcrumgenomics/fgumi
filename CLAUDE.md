@@ -39,6 +39,7 @@ cargo bench
 - `compare` - Enable compare subcommand (developer tools)
 - `simulate` - Enable simulate command for test data generation
 - `profile-adjacency` - Enable profiling output for adjacency UMI assigner
+- `aligner-bwa-mem3` - Opt-in in-process bwa-mem3 aligner backend for `runall` (cohort math, engine abstraction; the backend itself is still being wired in); off by default, and compiling it requires a C++17 toolchain (see `Cargo.toml`'s `bwa-mem3-rs` dependency)
 
 Build with features: `cargo build --release --features compare,simulate`
 
@@ -132,6 +133,11 @@ Uses `mimalloc` as global allocator for performance.
 `#![deny(unsafe_code)]` is set at the crate root of every workspace member. Targeted
 `#[allow(unsafe_code)]` blocks are permitted only at the documented sites listed below;
 any new `unsafe` block requires updating this section with a written justification.
+
+Enabling the optional `aligner-bwa-mem3` feature links `bwa-mem3-sys`/`bwa-mem3-rs`
+(vendored C++ plus its Rust FFI bindings), which contain their own `unsafe` outside
+this workspace's `deny(unsafe_code)`; fgumi's own crates carry no new `unsafe` for it
+and remain `#![deny(unsafe_code)]` regardless of the feature.
 
 ### Approved non-stdlib FFI exceptions
 

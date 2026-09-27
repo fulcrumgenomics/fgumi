@@ -181,6 +181,14 @@ mach2 = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true }
 
+# In-process bwa-mem3 aligner backend (feature `aligner-bwa-mem3`). Gated on the
+# only two architectures whose vendored C++ SIMD tiers build (`x86_64`/`aarch64`);
+# enabling the feature elsewhere hits a `compile_error!` in
+# `pipeline::steps::align`. 0.3.0 is the first
+# release with the three-phase (`seed_extend` / `infer_cohort` / `pair_emit`) API.
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
+bwa-mem3-rs = { version = "0.3.0", optional = true }
+
 [features]
 default = ["consensus"]
 # Single umbrella feature for all consensus calling (simplex + duplex + codec).
@@ -210,6 +218,19 @@ simulate = ["consensus"]
 profile-adjacency = []
 # Enable slow stress tests for concurrency testing
 stress-tests = []
+# In-process bwa-mem3 aligner backend for `fgumi runall` (its steps and the
+# `bwa-mem3-inproc` preset build on this). Off by default: it pulls the
+# optional `bwa-mem3-rs` dependency, which compiles the vendored bwa-mem3 C++ (C++17 toolchain
+# required) and links it statically. Default builds stay pure Rust with no C
+# toolchain. The in-process backend code is `#[cfg(feature = "aligner-bwa-mem3")]`
+# confined to `pipeline::steps::align::inproc`.
+#
+# `mimalloc/override` makes the global mimalloc also interpose the C `malloc`/
+# `free`, so the linked bwa-mem3 C++ uses mimalloc instead of the system
+# allocator (whose per-thread arena contention regresses multithreaded
+# alignment). Scoped to this feature because it is the only build that links the
+# C++ aligner; a pure-Rust fgumi build gains nothing from the C interpose.
+aligner-bwa-mem3 = ["dep:bwa-mem3-rs", "mimalloc/override"]
 # Test-only feature (not part of the supported public API). Its former gated
 # helper (the legacy multi-thread engine's `run_bam_pipeline_with_grouper`) was
 # removed in R6/C6; retained as the self dev-dependency's feature hook. Enabled
