@@ -2720,7 +2720,7 @@ impl<'a> ChainBuilder<'a> {
         use crate::logging::OperationTimer;
         use crate::pipeline::chains::commands::align::AlignFinalizeHook;
         use crate::pipeline::core::header::HeaderHandle;
-        use crate::pipeline::steps::align_and_merge::{AlignAndMergeConfig, AlignAndMergeStep};
+        use crate::pipeline::steps::align::subprocess::{AlignAndMergeConfig, AlignAndMergeStep};
         use crate::pipeline::steps::serialize::SerializeBamRecords;
         use crate::reference::find_dict_path;
         use crate::sam::check_sort;
@@ -2802,7 +2802,7 @@ impl<'a> ChainBuilder<'a> {
             // chunk size so a fast-draining aligner can't accumulate the
             // whole input's unmapped reads in RAM (issue #382).
             in_flight_unmapped_budget:
-                crate::pipeline::steps::align_and_merge::in_flight_budget_for_chunk_size(
+                crate::pipeline::steps::align::subprocess::in_flight_budget_for_chunk_size(
                     resolved.chunk_size,
                 ),
         };

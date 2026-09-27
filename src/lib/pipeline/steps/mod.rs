@@ -27,7 +27,7 @@
 //! `coalesce.rs` (a `CoalesceBytes` byte-batching step with no caller anywhere,
 //! upstream included) is *not* ported — it would be dead code.
 
-pub mod align_and_merge;
+pub mod align;
 pub mod bgzf;
 pub mod boundaries;
 #[cfg(test)]

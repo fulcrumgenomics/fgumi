@@ -17,7 +17,7 @@
 //!   placeholders.
 //!
 //! Used by the `AlignAndMergeStep` in
-//! `src/lib/pipeline/steps/align_and_merge.rs`. This module is the
+//! `src/lib/pipeline/steps/align/subprocess.rs`. This module is the
 //! framework-agnostic subprocess primitive; the typed `Step` impl that owns the
 //! I/O threads lives in that step module.
 
