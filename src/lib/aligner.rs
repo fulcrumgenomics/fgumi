@@ -418,18 +418,27 @@ fn relay_stderr(stderr: impl std::io::Read, ring_size: usize) -> Vec<String> {
 
 /// Preset aligner configurations with command-building and index validation.
 ///
-/// Two presets at landing — `bwa-mem3` (the project's primary aligner)
-/// and `bwa` (legacy reference). Methylation-aware presets (e.g.
-/// `bwameth`, `bwa-mem3 --methylation-mode em-seq`) are a follow-up;
-/// EM-seq users today route through `--aligner::command "..."`
+/// Three presets at landing — `bwa-mem3` (the project's primary
+/// subprocess aligner), `bwa` (legacy reference), and `bwa-mem3-inproc`
+/// (bwa-mem3 linked directly into fgumi, gated by the `aligner-bwa-mem3`
+/// build feature; see `AlignerOptions::resolve`). Methylation-aware
+/// presets (e.g. `bwameth`, `bwa-mem3 --methylation-mode em-seq`) are a
+/// follow-up; EM-seq users today route through `--aligner::command "..."`
 /// (free-form mode) instead of a preset.
 ///
-/// The CLI value for each variant matches the on-disk binary name
-/// (`bwa`, `bwa-mem3`). Variant identifiers (`Bwa`, `BwaMem3`) are
+/// The CLI value for each subprocess variant matches the on-disk binary
+/// name (`bwa`, `bwa-mem3`). Variant identifiers (`Bwa`, `BwaMem3`) are
 /// chosen so `rename_all = "kebab-case"` round-trips through the
 /// identifier ↔ binary-name mapping without divergence: `Bwa` ↔
 /// `"bwa"`, `BwaMem3` ↔ `"bwa-mem3"`. `Display` emits the same
 /// strings so error messages match what the user typed.
+///
+/// `BwaMem3InProc` exists in every build regardless of the
+/// `aligner-bwa-mem3` feature — so `--help` lists it and clap accepts
+/// the value everywhere — and only `resolve` gates whether it can
+/// actually be used, so the feature-off error names the precise fix
+/// (`--features aligner-bwa-mem3`) instead of clap rejecting an
+/// unrecognized value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[clap(rename_all = "kebab-case")]
 pub enum AlignerPreset {
@@ -437,6 +446,16 @@ pub enum AlignerPreset {
     Bwa,
     /// BWA-MEM3 aligner (`bwa-mem3 mem`). CLI value: `bwa-mem3`.
     BwaMem3,
+    /// BWA-MEM3 linked in-process (no subprocess, no shell command). CLI
+    /// value: `bwa-mem3-inproc`. Requires fgumi built with the
+    /// `aligner-bwa-mem3` feature; see `AlignerOptions::resolve`.
+    ///
+    /// `#[value(name = ...)]` overrides the derived `rename_all =
+    /// "kebab-case"` value: `heck`'s kebab-case splits `Mem3In` at the
+    /// digit→uppercase boundary too, so the derived value would be
+    /// `bwa-mem3-in-proc`, not `bwa-mem3-inproc`.
+    #[value(name = "bwa-mem3-inproc")]
+    BwaMem3InProc,
 }
 
 impl std::fmt::Display for AlignerPreset {
@@ -454,6 +473,31 @@ impl AlignerPreset {
         match self {
             Self::Bwa => "bwa",
             Self::BwaMem3 => "bwa-mem3",
+            Self::BwaMem3InProc => "bwa-mem3-inproc",
+        }
+    }
+
+    /// Whether this preset needs external-binary discovery (`which` on
+    /// `PATH`, or a `--aligner-bin` override). `false` only for
+    /// [`Self::BwaMem3InProc`], which links bwa-mem3 directly into the
+    /// fgumi process and has no separate executable to find; `validate`
+    /// skips the binary-discovery step for it but still requires the
+    /// index files.
+    #[must_use]
+    pub(crate) fn requires_binary(self) -> bool {
+        !matches!(self, Self::BwaMem3InProc)
+    }
+
+    /// Binary name to suggest in an index-missing fix-it hint. Always the
+    /// real `bwa-mem3` executable — [`Self::BwaMem3InProc`] links bwa-mem3
+    /// in-process for alignment, but the index itself is still built with
+    /// the standalone `bwa-mem3 index` command, not a nonexistent
+    /// `bwa-mem3-inproc` binary.
+    #[must_use]
+    fn index_binary_hint(self) -> &'static str {
+        match self {
+            Self::BwaMem3InProc => "bwa-mem3",
+            other => other.binary_name(),
         }
     }
 
@@ -464,14 +508,15 @@ impl AlignerPreset {
         match self {
             // BWA classic: amb / ann / bwt / pac / sa
             Self::Bwa => &[".amb", ".ann", ".bwt", ".pac", ".sa"],
-            // BWA-MEM3: amb / ann / bwt.2bit.64 / pac. `bwa-mem3 0.4.0+` pac-fetches
-            // the reference from `.pac` on demand and no longer writes `.0123` by
+            // BWA-MEM3 (subprocess and in-process share the same on-disk index):
+            // amb / ann / bwt.2bit.64 / pac. `bwa-mem3 0.4.0+` pac-fetches the
+            // reference from `.pac` on demand and no longer writes `.0123` by
             // default (fg-labs/bwa-mem3#177); `.0123` is now opt-in via `index
             // --emit-unpacked-ref` and `mem` ignores any present, so requiring it
             // here rejects a valid 0.4.0 index. `.bwt.2bit.64` is the canonical
             // index sentinel. Indexes built by older bwa-mem3 still carry these
             // four files, so dropping `.0123` is backward-compatible.
-            Self::BwaMem3 => &[".amb", ".ann", ".bwt.2bit.64", ".pac"],
+            Self::BwaMem3 | Self::BwaMem3InProc => &[".amb", ".ann", ".bwt.2bit.64", ".pac"],
         }
     }
 
@@ -513,7 +558,7 @@ impl AlignerPreset {
         };
         let ref_str = reference.display();
         let output = match self {
-            Self::BwaMem3 => " --bam=0",
+            Self::BwaMem3 | Self::BwaMem3InProc => " --bam=0",
             Self::Bwa => "",
         };
         format!("{binary} mem{output} -p -K {chunk_size} -t {threads} {ref_str} /dev/stdin")
@@ -528,11 +573,16 @@ impl AlignerPreset {
     /// 2. The reference path does not contain shell-unsafe characters
     ///    (preset mode hands the path through `/bin/bash -c`, so a
     ///    path like `/data/my refs/genome.fa` would be word-split into
-    ///    two arguments).
+    ///    two arguments). Presets where `Self::requires_binary` is
+    ///    `false` ([`Self::BwaMem3InProc`]) never build a shell command,
+    ///    so they reject only control characters, which would corrupt
+    ///    the `@PG CL:` header line the path is written into.
     /// 3. The aligner binary is reachable: `--aligner-bin` override
     ///    path (must be an existing file), else `which::which("<binary_name>")`
     ///    on `PATH`. `--aligner-bin` paths are also checked for
-    ///    shell-unsafe characters.
+    ///    shell-unsafe characters. Skipped entirely for presets where
+    ///    `Self::requires_binary` is `false` ([`Self::BwaMem3InProc`]
+    ///    links bwa-mem3 in-process, so there is no binary to find).
     /// 4. All expected index file(s) exist alongside the reference.
     ///
     /// # Errors
@@ -554,49 +604,59 @@ impl AlignerPreset {
 
         // 2. Reference path shell-safety (preset mode argv flows through
         //    /bin/bash -c, so paths with spaces, quotes, or shell metas
-        //    silently break).
-        check_shell_safe_path(reference, "--ref")?;
+        //    silently break). The in-process backend loads the index
+        //    through the library, so only the `@PG CL:` line constrains it.
+        if self.requires_binary() {
+            check_shell_safe_path(reference, "--ref")?;
+        } else {
+            check_header_safe_path(reference, "--ref")?;
+        }
 
-        // 3. Binary discovery.
-        match binary_override {
-            Some(path) => {
-                check_shell_safe_path(path, "--aligner-bin")?;
-                if !path.is_file() {
-                    bail!(
-                        "--aligner-bin path is not a regular file: {} \
-                         (preset `{binary_name}` requires the binary)",
-                        path.display()
-                    );
-                }
-                // Verify executability up front so the failure stays
-                // actionable here, instead of being deferred until
-                // `/bin/bash -c` tries to exec the path.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mode = std::fs::metadata(path)
-                        .with_context(|| {
-                            format!("reading metadata for --aligner-bin path: {}", path.display())
-                        })?
-                        .permissions()
-                        .mode();
-                    if mode & 0o111 == 0 {
+        // 3. Binary discovery — skipped for presets that don't need one.
+        if self.requires_binary() {
+            match binary_override {
+                Some(path) => {
+                    check_shell_safe_path(path, "--aligner-bin")?;
+                    if !path.is_file() {
                         bail!(
-                            "--aligner-bin path is not executable: {} \
-                             (preset `{binary_name}` requires an executable binary; \
-                             `chmod +x` it or pass a different path)",
+                            "--aligner-bin path is not a regular file: {} \
+                             (preset `{binary_name}` requires the binary)",
                             path.display()
                         );
                     }
+                    // Verify executability up front so the failure stays
+                    // actionable here, instead of being deferred until
+                    // `/bin/bash -c` tries to exec the path.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mode = std::fs::metadata(path)
+                            .with_context(|| {
+                                format!(
+                                    "reading metadata for --aligner-bin path: {}",
+                                    path.display()
+                                )
+                            })?
+                            .permissions()
+                            .mode();
+                        if mode & 0o111 == 0 {
+                            bail!(
+                                "--aligner-bin path is not executable: {} \
+                                 (preset `{binary_name}` requires an executable binary; \
+                                 `chmod +x` it or pass a different path)",
+                                path.display()
+                            );
+                        }
+                    }
                 }
-            }
-            None => {
-                which::which(binary_name).with_context(|| {
-                    format!(
-                        "aligner binary `{binary_name}` not found on PATH \
-                         (preset `{binary_name}`; pass --aligner-bin <path> to override)"
-                    )
-                })?;
+                None => {
+                    which::which(binary_name).with_context(|| {
+                        format!(
+                            "aligner binary `{binary_name}` not found on PATH \
+                             (preset `{binary_name}`; pass --aligner-bin <path> to override)"
+                        )
+                    })?;
+                }
             }
         }
 
@@ -605,8 +665,9 @@ impl AlignerPreset {
             let index_path = append_extension(reference, ext);
             if !index_path.is_file() {
                 bail!(
-                    "required index file not found: {} (run `{binary_name} index {}`)",
+                    "required index file not found: {} (run `{} index {}`)",
                     index_path.display(),
+                    self.index_binary_hint(),
                     reference.display()
                 );
             }
@@ -685,6 +746,24 @@ pub fn substitute_template(template: &str, reference: &Path, threads: usize) -> 
 /// flight fit in a few GB of RAM.
 pub const DEFAULT_ALIGNER_CHUNK_SIZE: u64 = 150_000_000;
 
+/// Default sub-batch size, in templates, for the in-process bwa-mem3
+/// backend's internal batching. Only meaningful with
+/// `--aligner::preset bwa-mem3-inproc`; see
+/// `AlignerOptions::sub_batch_templates` and
+/// [`ResolvedBackend::InProcessBwaMem3`].
+///
+/// One sub-batch of pairs fills exactly one of bwa-mem3's `BATCH_SIZE` read
+/// batches ([`bwa_mem3_rs::kernel_batch_size`]: 1024 reads on aarch64, 512
+/// elsewhere), so every seed, extension and mate-rescue kernel call in the
+/// shim runs on a full batch, as the `bwa-mem3` CLI's own workers do. A
+/// half-filled batch costs ~1.2% CPU on Graviton4. Larger sub-batches gain
+/// nothing and leave fewer work items to balance across the pool at high
+/// thread counts.
+#[cfg(feature = "aligner-bwa-mem3")]
+pub(crate) fn default_sub_batch_templates() -> usize {
+    bwa_mem3_rs::kernel_batch_size() / 2
+}
+
 /// Per-stage aligner tuning knobs.
 ///
 /// Annotated with `#[multi_options("aligner", "Aligner Options")]` so
@@ -705,6 +784,10 @@ pub const DEFAULT_ALIGNER_CHUNK_SIZE: u64 = 150_000_000;
 ///   can't represent "all cores" as a const default).
 /// - `chunk_size` — `u64` with a const default; drives the `-K` flag
 ///   in preset mode and the Step-1 batch size in both modes.
+/// - `sub_batch_templates` — `Option<usize>`, hidden from `--help`.
+///   Only meaningful with `--aligner::preset bwa-mem3-inproc`;
+///   `Self::resolve` rejects it with any other preset or with command
+///   mode, and defaults it from `default_sub_batch_templates` when unset.
 #[multi_options("aligner", "Aligner Options")]
 #[derive(Args, Debug, Clone)]
 pub struct AlignerOptions {
@@ -730,6 +813,14 @@ pub struct AlignerOptions {
     /// Step-1 batch size in both modes).
     #[arg(long = "chunk-size", default_value_t = DEFAULT_ALIGNER_CHUNK_SIZE)]
     pub chunk_size: u64,
+
+    /// Sub-batch size, in templates, for the in-process bwa-mem3
+    /// backend's internal batching. Hidden from `--help` — only valid
+    /// with `--aligner::preset bwa-mem3-inproc`; `Self::resolve` rejects
+    /// it for every other preset or for command mode, and caps it at
+    /// `MAX_SUB_BATCH_TEMPLATES`. `None` uses `default_sub_batch_templates()`.
+    #[arg(long = "sub-batch-templates", hide = true)]
+    pub sub_batch_templates: Option<usize>,
 }
 
 /// Hand-rolled `Default` impl. **Must** match each field's clap
@@ -742,26 +833,46 @@ pub struct AlignerOptions {
 /// the antidote.
 impl Default for AlignerOptions {
     fn default() -> Self {
-        Self { preset: None, command: None, threads: None, chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE }
+        Self {
+            preset: None,
+            command: None,
+            threads: None,
+            chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
+            sub_batch_templates: None,
+        }
     }
 }
 
-/// The alignment backend a [`ResolvedAligner`] will run.
+/// The alignment backend a [`ResolvedAligner`] will run: an external
+/// aligner subprocess reached via a shell command, or — behind the
+/// `aligner-bwa-mem3` build feature — bwa-mem3 linked directly into the
+/// fgumi process.
+///
+/// Exists in every build regardless of the feature (so [`AlignerOptions::resolve`]
+/// can emit the feature-off error uniformly before constructing anything, and
+/// the align stage's `backend_for` has one match with no `#[cfg]` on the enum
+/// itself).
 #[derive(Debug, Clone)]
 pub(crate) enum ResolvedBackend {
-    /// `--aligner::preset` or `--aligner::command`: the shell command to spawn
-    /// via [`AlignerProcess::spawn`] (already substituted and validated).
+    /// `--aligner::preset` (subprocess presets) or `--aligner::command`:
+    /// the shell command to spawn via [`AlignerProcess::spawn`].
     Subprocess {
         command: String,
         /// Whether the aligner's output may carry bwa's mid-pair split (a
         /// pair aligned as two unpaired reads because a `-K` chunk cut fell
-        /// between them). `true` only for the presets, which run `mem -p -K`
-        /// and so produce exactly that shape; a free-form `--aligner::command`
-        /// gets the loud "multiple primaries" error instead, because the same
-        /// shape from an aligner that never pairs would otherwise split every
-        /// pair silently.
+        /// between them). `true` only for the subprocess presets, which run
+        /// `mem -p -K` and so produce exactly that shape; a free-form
+        /// `--aligner::command` gets the loud "multiple primaries" error
+        /// instead, because the same shape from an aligner that never pairs
+        /// would otherwise split every pair silently.
         accept_mid_pair_split: bool,
     },
+    /// `--aligner::preset bwa-mem3-inproc`. Constructed only when
+    /// `resolve` runs under the `aligner-bwa-mem3` feature (it bails
+    /// before reaching this arm otherwise), but the variant itself is
+    /// unconditional — see the enum-level doc.
+    #[allow(dead_code)] // constructed only with the feature; matched everywhere
+    InProcessBwaMem3 { reference: PathBuf, sub_batch_templates: usize },
 }
 
 /// Result of [`AlignerOptions::resolve`] — a ready-to-construct aligner
@@ -784,7 +895,8 @@ pub(crate) struct ResolvedAligner {
     /// resident unmapped backlog stays proportional to one aligner chunk.
     pub chunk_size: u64,
     /// Resolved thread count (default-substituted for preset mode;
-    /// `None` if command mode let the user hardcode their own).
+    /// `None` if command mode let the user hardcode their own, or if
+    /// the in-process backend shares runall's single thread budget).
     pub threads: Option<usize>,
     /// Which mode produced this — preset (with which preset) or
     /// command. Used in info-logging.
@@ -804,6 +916,13 @@ pub(crate) enum ResolvedAlignerMode {
     /// `--aligner::command "..."`.
     Command,
 }
+
+/// The largest `--aligner::sub-batch-templates` the in-process backend accepts.
+/// Each sub-batch pre-sizes a `Vec` of this many templates (about 13 MB at the
+/// cap) and counts its pairs and single-end reads in `u32`s. The cap is 128 to
+/// 256 times the default (`default_sub_batch_templates`, 512 or 256), far past
+/// any size that helps throughput.
+const MAX_SUB_BATCH_TEMPLATES: usize = 1 << 16;
 
 /// The largest `--aligner::chunk-size` a preset accepts: `i32::MAX`, since bwa
 /// and bwa-mem3 parse `-K` with `atoi` into an `int`.
@@ -827,9 +946,17 @@ impl AlignerOptions {
     /// - `--aligner::chunk-size` is zero, or exceeds `i32::MAX` with a preset.
     /// - Neither `--aligner::preset` nor `--aligner::command` was set.
     /// - Both were set (mutual exclusion violation).
+    /// - `--aligner::sub-batch-templates` set with any preset other than
+    ///   `bwa-mem3-inproc`, or with command mode; or set to zero or more than
+    ///   `MAX_SUB_BATCH_TEMPLATES`.
     /// - Command mode + a preset-only flag (`--aligner-bin` or
     ///   `--aligner::threads`).
     /// - Command mode template missing `{ref}`.
+    /// - `--aligner::preset bwa-mem3-inproc` + `--aligner::threads` or
+    ///   `--aligner-bin` (the in-process backend has no subprocess and
+    ///   shares runall's thread budget).
+    /// - `--aligner::preset bwa-mem3-inproc` built without the
+    ///   `aligner-bwa-mem3` feature.
     /// - Preset-mode index files / binary missing (delegated to
     ///   [`AlignerPreset::validate`]).
     pub(crate) fn resolve(
@@ -850,13 +977,29 @@ impl AlignerOptions {
         }
         // Every preset hands the chunk size to bwa's `-K`, which bwa and
         // bwa-mem3 parse with `atoi` into an `int`: a larger value overflows
-        // there instead of reaching the aligner as given. Command mode sets its
-        // own `-K` (this flag only sizes its in-flight budget), so it is exempt.
+        // there, so the subprocess preset would fall back to thread-scaled
+        // batching while the in-process cutter used the exact value — the two
+        // backends would cut cohorts differently. Command mode sets its own
+        // `-K` (this flag only sizes its in-flight budget), so it is exempt.
         if self.preset.is_some() && self.chunk_size > MAX_PRESET_CHUNK_SIZE {
             bail!(
                 "--aligner::chunk-size must be at most {MAX_PRESET_CHUNK_SIZE} (got {}) with \
                  --aligner::preset: bwa parses -K as a 32-bit int",
                 self.chunk_size
+            );
+        }
+        // `--aligner::sub-batch-templates` is a hidden, in-process-only knob.
+        // Reject it early (before the preset/command dispatch below) so it is
+        // rejected uniformly regardless of mode, and regardless of whether
+        // this binary was built with `aligner-bwa-mem3`.
+        if self.sub_batch_templates.is_some()
+            && !matches!(self.preset, Some(AlignerPreset::BwaMem3InProc))
+        {
+            bail!(
+                "--aligner::sub-batch-templates is only valid with --aligner::preset \
+                 bwa-mem3-inproc; it configures the in-process backend's internal \
+                 batching and has no effect on the subprocess aligner or \
+                 --aligner::command"
             );
         }
         match (self.preset, self.command) {
@@ -867,6 +1010,13 @@ impl AlignerOptions {
             (Some(_), Some(_)) => bail!(
                 "--aligner::preset and --aligner::command are mutually exclusive; \
                  pass only one"
+            ),
+            (Some(AlignerPreset::BwaMem3InProc), None) => resolve_inproc(
+                reference,
+                self.threads,
+                aligner_bin,
+                self.sub_batch_templates,
+                self.chunk_size,
             ),
             (Some(preset), None) => {
                 // Preset mode: validate indexes + binary, build argv.
@@ -881,9 +1031,10 @@ impl AlignerOptions {
                 let command =
                     preset.build_command(reference, threads, self.chunk_size, aligner_bin);
                 Ok(ResolvedAligner {
-                    // Both presets run `mem -p -K`, whose smart pairing splits
-                    // a pair across a chunk cut (bwa and bwa-mem3 share
-                    // `bseq_read`'s even-count cut and `bseq_classify`).
+                    // Both subprocess presets run `mem -p -K`, whose smart
+                    // pairing splits a pair across a chunk cut (bwa and
+                    // bwa-mem3 share `bseq_read`'s even-count cut and
+                    // `bseq_classify`).
                     backend: ResolvedBackend::Subprocess { command, accept_mid_pair_split: true },
                     chunk_size: self.chunk_size,
                     threads: Some(threads),
@@ -926,6 +1077,82 @@ impl AlignerOptions {
                 })
             }
         }
+    }
+}
+
+/// Resolve `--aligner::preset bwa-mem3-inproc` into a [`ResolvedAligner`].
+/// Split out of [`AlignerOptions::resolve`] (which dispatches to this
+/// function for that one preset) to keep `resolve` under clippy's
+/// line-count ceiling; see `resolve`'s doc comment for the full error
+/// contract this preset participates in.
+///
+/// The flag-misuse checks (`threads`, `aligner_bin`, a zero or oversized
+/// `sub_batch_templates`) run BEFORE the feature-off bail so a caller
+/// passing both a bad flag and running a feature-off binary sees the
+/// flag-specific error rather than the generic "rebuild fgumi" one — and
+/// so these checks (and their error text) are exercised identically
+/// whether or not this binary was built with `aligner-bwa-mem3`.
+///
+/// `reference` and `chunk_size` are read only inside the
+/// `#[cfg(feature = "aligner-bwa-mem3")]` arm below, so a feature-off
+/// build never references them; the `cfg_attr` below covers that build
+/// instead of underscore-prefixing names that ARE used once the feature
+/// is on.
+#[cfg_attr(not(feature = "aligner-bwa-mem3"), allow(unused_variables))]
+fn resolve_inproc(
+    reference: &Path,
+    threads: Option<usize>,
+    aligner_bin: Option<&Path>,
+    sub_batch_templates: Option<usize>,
+    chunk_size: u64,
+) -> Result<ResolvedAligner> {
+    if threads.is_some() {
+        bail!(
+            "--aligner::threads is not valid with --aligner::preset \
+             bwa-mem3-inproc: the in-process aligner has a single \
+             budget with the rest of runall (set --threads instead)"
+        );
+    }
+    if aligner_bin.is_some() {
+        bail!(
+            "--aligner-bin is not valid with --aligner::preset \
+             bwa-mem3-inproc: the in-process backend links bwa-mem3 \
+             directly, so there is no binary to override"
+        );
+    }
+    if sub_batch_templates == Some(0) {
+        bail!("--aligner::sub-batch-templates must be greater than 0 (got 0)");
+    }
+    if let Some(n) = sub_batch_templates
+        && n > MAX_SUB_BATCH_TEMPLATES
+    {
+        bail!("--aligner::sub-batch-templates must be at most {MAX_SUB_BATCH_TEMPLATES} (got {n})");
+    }
+
+    #[cfg(not(feature = "aligner-bwa-mem3"))]
+    {
+        bail!(
+            "--aligner::preset bwa-mem3-inproc requires fgumi built with \
+             `--features aligner-bwa-mem3`; this binary was built without \
+             it (use --aligner::preset bwa-mem3 for the subprocess aligner)"
+        )
+    }
+
+    #[cfg(feature = "aligner-bwa-mem3")]
+    {
+        // Binary discovery is skipped for this preset (`requires_binary()`
+        // is false); index files are still required.
+        AlignerPreset::BwaMem3InProc.validate(reference, None)?;
+        let sub_batch_templates = sub_batch_templates.unwrap_or_else(default_sub_batch_templates);
+        Ok(ResolvedAligner {
+            backend: ResolvedBackend::InProcessBwaMem3 {
+                reference: reference.to_path_buf(),
+                sub_batch_templates,
+            },
+            chunk_size,
+            threads: None,
+            mode: ResolvedAlignerMode::Preset(AlignerPreset::BwaMem3InProc),
+        })
     }
 }
 
@@ -984,6 +1211,20 @@ fn check_shell_safe_path(path: &Path, flag_label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject a path containing a control character (tab, newline, ...): the
+/// in-process backend writes the reference path into the `@PG CL:` header
+/// line, where a tab would start a new field and a newline a new record.
+fn check_header_safe_path(path: &Path, flag_label: &str) -> Result<()> {
+    if let Some(ch) = path.to_string_lossy().chars().find(|c| c.is_control()) {
+        bail!(
+            "{flag_label} path {:?} contains a control character ({ch:?}), which \
+             cannot be written into the output's @PG CL: header line",
+            path.display().to_string()
+        );
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1010,6 +1251,16 @@ mod tests {
         #[case] expected: bool,
     ) {
         assert_eq!(names_set_mimalloc_purge(names), expected);
+    }
+
+    /// A sub-batch of pairs must fill exactly one bwa-mem3 kernel batch: two
+    /// reads per template, `BATCH_SIZE` reads per kernel call.
+    #[cfg(feature = "aligner-bwa-mem3")]
+    #[test]
+    fn default_sub_batch_fills_one_kernel_batch() {
+        assert_eq!(2 * default_sub_batch_templates(), bwa_mem3_rs::kernel_batch_size());
+        let expected = if cfg!(target_arch = "aarch64") { 512 } else { 256 };
+        assert_eq!(default_sub_batch_templates(), expected);
     }
 
     /// A non-UTF-8 stderr line must NOT halt the relay: draining has to
@@ -1236,10 +1487,12 @@ mod tests {
             command: Some("bwa-mem3 mem -p -K 1000 -t {threads} {ref} /dev/stdin".to_string()),
             threads: None,
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
+            sub_batch_templates: None,
         };
         let resolved = opts.resolve(&ref_path, 4, None).unwrap();
-        let ResolvedBackend::Subprocess { command, accept_mid_pair_split } = resolved.backend;
-        assert!(!accept_mid_pair_split, "command mode must not accept bwa's mid-pair split");
+        let ResolvedBackend::Subprocess { command, .. } = resolved.backend else {
+            panic!("command mode must resolve to ResolvedBackend::Subprocess");
+        };
         assert!(command.contains(&ref_path.display().to_string()));
         assert!(command.contains("-t 4"));
         assert!(matches!(resolved.mode, ResolvedAlignerMode::Command));
@@ -1258,6 +1511,7 @@ mod tests {
             command: Some("bwa-mem3 mem {ref} /dev/stdin".to_string()),
             threads: None,
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
+            sub_batch_templates: None,
         };
         let err = opts.resolve(&ref_path, 4, Some(&bin)).unwrap_err();
         let msg = err.to_string();
@@ -1274,6 +1528,170 @@ mod tests {
         let err = opts.resolve(&ref_path, 4, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("requires one of"), "got: {msg}");
+    }
+
+    /// Test-only helper for the `bwa-mem3-inproc` resolve-error table below.
+    /// Parses a preset name plus a flat list of `--flag value` pairs into an
+    /// `AlignerOptions`, then resolves it against a freshly created (empty,
+    /// unindexed) reference FASTA. This is deliberately NOT a general CLI
+    /// parser — it only understands the handful of flags the in-process
+    /// resolve-error cases exercise (`--aligner::threads`, `--aligner-bin`,
+    /// `--aligner::sub-batch-templates`, `--aligner::chunk-size`); anything
+    /// else panics loudly so a typo in a case's `extra` list fails fast
+    /// instead of silently no-op'ing.
+    fn resolve_from_args(preset: &str, extra: &[&str]) -> Result<ResolvedAligner> {
+        use clap::ValueEnum;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+
+        let mut opts = AlignerOptions {
+            preset: Some(
+                AlignerPreset::from_str(preset, false)
+                    .unwrap_or_else(|e| panic!("resolve_from_args: bad preset {preset:?}: {e}")),
+            ),
+            ..AlignerOptions::default()
+        };
+        let mut aligner_bin: Option<PathBuf> = None;
+
+        let mut iter = extra.iter().copied();
+        while let Some(flag) = iter.next() {
+            let value = iter
+                .next()
+                .unwrap_or_else(|| panic!("resolve_from_args: flag {flag} is missing a value"));
+            match flag {
+                "--aligner::threads" => {
+                    opts.threads = Some(
+                        value
+                            .parse()
+                            .unwrap_or_else(|e| panic!("resolve_from_args: bad threads: {e}")),
+                    );
+                }
+                "--aligner-bin" => aligner_bin = Some(PathBuf::from(value)),
+                "--aligner::chunk-size" => {
+                    opts.chunk_size = value
+                        .parse()
+                        .unwrap_or_else(|e| panic!("resolve_from_args: bad chunk-size: {e}"));
+                }
+                "--aligner::sub-batch-templates" => {
+                    opts.sub_batch_templates = Some(value.parse().unwrap_or_else(|e| {
+                        panic!("resolve_from_args: bad sub-batch-templates: {e}")
+                    }));
+                }
+                other => panic!("resolve_from_args: unrecognized flag {other}"),
+            }
+        }
+
+        opts.resolve(&ref_path, 4, aligner_bin.as_deref())
+    }
+
+    /// `resolve` for `--aligner::preset bwa-mem3-inproc`: the
+    /// preset-specific flag rejections (`--aligner::threads`,
+    /// `--aligner-bin`, a zero or oversized `--aligner::sub-batch-templates`) fire with
+    /// their own needle regardless of whether this binary was built with
+    /// `aligner-bwa-mem3` — see the ordering rationale in `resolve` itself.
+    ///
+    /// The feature-OFF-only "names the feature" case lives in its own
+    /// `#[cfg(not(feature = "aligner-bwa-mem3"))]` test
+    /// (`resolve_inproc_feature_off_names_feature` below), NOT in this
+    /// table: under the feature, `resolve_inproc` skips the feature bail
+    /// entirely and falls through to `validate`'s index-missing error
+    /// instead, so asserting the feature-off needle here would fail under
+    /// `cargo nextest run --features aligner-bwa-mem3` (confirmed by
+    /// running it).
+    #[rstest]
+    #[case::inproc_rejects_threads(
+        "bwa-mem3-inproc",
+        &["--aligner::threads", "8"],
+        "single budget"
+    )]
+    #[case::inproc_rejects_bin(
+        "bwa-mem3-inproc",
+        &["--aligner-bin", "/x"],
+        "no binary to override"
+    )]
+    #[case::inproc_rejects_zero_sub_batch_templates(
+        "bwa-mem3-inproc",
+        &["--aligner::sub-batch-templates", "0"],
+        "--aligner::sub-batch-templates must be greater than 0"
+    )]
+    #[case::inproc_rejects_sub_batch_templates_past_cap(
+        "bwa-mem3-inproc",
+        &["--aligner::sub-batch-templates", "65537"],
+        "--aligner::sub-batch-templates must be at most 65536 (got 65537)"
+    )]
+    #[case::sub_batch_templates_rejected_with_subprocess_preset(
+        "bwa-mem3",
+        &["--aligner::sub-batch-templates", "10"],
+        "only valid with --aligner::preset bwa-mem3-inproc"
+    )]
+    #[case::inproc_rejects_chunk_size_past_i32(
+        "bwa-mem3-inproc",
+        &["--aligner::chunk-size", "2147483648"],
+        "--aligner::chunk-size must be at most 2147483647 (got 2147483648)"
+    )]
+    #[case::bwa_mem3_rejects_chunk_size_past_i32(
+        "bwa-mem3",
+        &["--aligner::chunk-size", "2147483648"],
+        "--aligner::chunk-size must be at most 2147483647 (got 2147483648)"
+    )]
+    #[case::bwa_rejects_chunk_size_past_i32(
+        "bwa",
+        &["--aligner::chunk-size", "4294967296"],
+        "--aligner::chunk-size must be at most 2147483647 (got 4294967296)"
+    )]
+    fn resolve_inproc_errors(#[case] preset: &str, #[case] extra: &[&str], #[case] needle: &str) {
+        let err = resolve_from_args(preset, extra).unwrap_err().to_string();
+        assert!(err.contains(needle), "got: {err}");
+    }
+
+    /// `resolve` for `--aligner::preset bwa-mem3-inproc` under a
+    /// feature-OFF build: names the exact rebuild fix. Gated
+    /// `#[cfg(not(feature = "aligner-bwa-mem3"))]` because under the
+    /// feature, `resolve_inproc` never reaches this bail — it falls
+    /// through to `validate` instead (see
+    /// `resolve_inproc_skips_binary_discovery` below for the feature-on
+    /// counterpart). Split out of `resolve_inproc_errors` per code review:
+    /// an earlier, ungated version of this case passed only by accident of
+    /// which feature set `cargo ci-test` happens to build with, and would
+    /// fail under the `aligner-ffi` CI job (which builds with the feature).
+    #[test]
+    #[cfg(not(feature = "aligner-bwa-mem3"))]
+    fn resolve_inproc_feature_off_names_feature() {
+        let err = resolve_from_args("bwa-mem3-inproc", &[]).unwrap_err().to_string();
+        assert!(
+            err.contains("requires fgumi built with `--features aligner-bwa-mem3`"),
+            "got: {err}"
+        );
+    }
+
+    /// Under `aligner-bwa-mem3`, `bwa-mem3-inproc` skips binary discovery
+    /// entirely (`AlignerPreset::requires_binary()` is `false` for it): with
+    /// the reference's index files present, `resolve` must succeed even
+    /// though there is no `bwa-mem3-inproc` executable anywhere on `PATH`
+    /// to find — proving `validate` never calls `which::which` for this
+    /// preset. If `requires_binary()` regressed to `true`, this would fail
+    /// with "aligner binary `bwa-mem3-inproc` not found on PATH", not with
+    /// a compile error, so this test is the only thing that would catch
+    /// that regression.
+    #[test]
+    #[cfg(feature = "aligner-bwa-mem3")]
+    fn resolve_inproc_skips_binary_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        for ext in AlignerPreset::BwaMem3InProc.index_extensions() {
+            std::fs::write(append_extension(&ref_path, ext), b"x").unwrap();
+        }
+        let opts =
+            AlignerOptions { preset: Some(AlignerPreset::BwaMem3InProc), ..Default::default() };
+        let resolved = opts.resolve(&ref_path, 4, None).unwrap();
+        assert!(
+            matches!(resolved.backend, ResolvedBackend::InProcessBwaMem3 { .. }),
+            "got: {:?}",
+            resolved.backend
+        );
     }
 
     /// Helper: create a known-existing binary path for tests that
@@ -1325,9 +1743,77 @@ mod tests {
         let bin = make_existing_binary(tmp.path());
         let opts = AlignerOptions { preset: Some(preset), ..AlignerOptions::default() };
         let resolved = opts.resolve(&ref_path, 4, Some(&bin)).unwrap();
-        let ResolvedBackend::Subprocess { command, accept_mid_pair_split } = resolved.backend;
+        let ResolvedBackend::Subprocess { command, accept_mid_pair_split } = resolved.backend
+        else {
+            panic!("a subprocess preset must resolve to ResolvedBackend::Subprocess");
+        };
         assert!(accept_mid_pair_split, "preset mode must accept bwa's mid-pair split");
         assert!(command.starts_with(&bin.display().to_string()), "got: {command}");
+    }
+
+    /// The in-process preset links bwa-mem3, so `validate` never looks for a
+    /// binary, but its index is still built by the standalone tool: the
+    /// missing-index hint names `bwa-mem3 index`, not `bwa-mem3-inproc index`.
+    #[test]
+    fn test_validate_inproc_missing_index_hints_standalone_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        let msg = AlignerPreset::BwaMem3InProc.validate(&ref_path, None).unwrap_err().to_string();
+        assert!(msg.contains("(run `bwa-mem3 index "), "got: {msg}");
+    }
+
+    /// The in-process preset never builds a shell command, so a reference path
+    /// with a space validates for it while the subprocess presets reject it; a
+    /// control character, which would corrupt the `@PG CL:` line, is rejected
+    /// by every preset.
+    #[rstest]
+    #[case::inproc_space(AlignerPreset::BwaMem3InProc, "my ref.fa", None)]
+    #[case::bwa_mem3_space(AlignerPreset::BwaMem3, "my ref.fa", Some("shell-unsafe character"))]
+    #[case::bwa_space(AlignerPreset::Bwa, "my ref.fa", Some("shell-unsafe character"))]
+    #[case::inproc_tab(AlignerPreset::BwaMem3InProc, "my\tref.fa", Some("control character"))]
+    #[case::bwa_mem3_tab(AlignerPreset::BwaMem3, "my\tref.fa", Some("shell-unsafe character"))]
+    fn test_validate_reference_path_safety(
+        #[case] preset: AlignerPreset,
+        #[case] file_name: &str,
+        #[case] needle: Option<&str>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join(file_name);
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        for ext in preset.index_extensions() {
+            std::fs::write(append_extension(&ref_path, ext), b"x").unwrap();
+        }
+        let bin = make_existing_binary(tmp.path());
+        let bin = preset.requires_binary().then_some(bin.as_path());
+        let result = preset.validate(&ref_path, bin);
+        match needle {
+            None => result.unwrap(),
+            Some(needle) => {
+                let msg = result.unwrap_err().to_string();
+                assert!(msg.contains(needle), "got: {msg}");
+            }
+        }
+    }
+
+    /// Without `--aligner-bin`, `validate` looks the preset's binary up on
+    /// `PATH`: absent, it fails naming the binary and the override flag;
+    /// present, it gets as far as the (missing) index files.
+    #[test]
+    fn test_validate_looks_up_binary_on_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        let msg = AlignerPreset::BwaMem3.validate(&ref_path, None).unwrap_err().to_string();
+        if which::which("bwa-mem3").is_ok() {
+            assert!(msg.contains("index file not found"), "got: {msg}");
+        } else {
+            assert!(
+                msg.contains("aligner binary `bwa-mem3` not found on PATH")
+                    && msg.contains("--aligner-bin"),
+                "got: {msg}"
+            );
+        }
     }
 
     /// `validate` errors out on a nonexistent `--aligner-bin` override path.
@@ -1437,25 +1923,6 @@ mod tests {
         assert_eq!(result, "bwa-mem3 mem -t 8 /data/{threads}/genome.fa /dev/stdin");
     }
 
-    /// `resolve` caps a preset's `--aligner::chunk-size` at `i32::MAX`, since bwa
-    /// and bwa-mem3 parse `-K` with `atoi` into an `int`; the check runs before
-    /// preset validation, so the reference needs no index.
-    #[rstest]
-    #[case::bwa_mem3(AlignerPreset::BwaMem3, 2_147_483_648)]
-    #[case::bwa(AlignerPreset::Bwa, 4_294_967_296)]
-    fn resolve_rejects_preset_chunk_size_past_i32(
-        #[case] preset: AlignerPreset,
-        #[case] chunk_size: u64,
-    ) {
-        let tmp = tempfile::tempdir().unwrap();
-        let ref_path = tmp.path().join("ref.fa");
-        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
-        let opts = AlignerOptions { preset: Some(preset), chunk_size, ..AlignerOptions::default() };
-        let err = opts.resolve(&ref_path, 4, None).unwrap_err().to_string();
-        let needle = format!("--aligner::chunk-size must be at most 2147483647 (got {chunk_size})");
-        assert!(err.contains(&needle), "got: {err}");
-    }
-
     /// Command mode sets its own `-K`, so a chunk size past `i32::MAX` (which
     /// only sizes its in-flight budget) is accepted.
     #[test]
@@ -1468,7 +1935,8 @@ mod tests {
             chunk_size: 2_147_483_648,
             ..AlignerOptions::default()
         };
-        assert!(opts.resolve(&ref_path, 4, None).is_ok());
+        let resolved = opts.resolve(&ref_path, 4, None).unwrap();
+        assert_eq!(resolved.chunk_size, 2_147_483_648);
     }
 
     /// `resolve` rejects `--aligner::chunk-size 0` (would reach the aligner as
@@ -1483,6 +1951,7 @@ mod tests {
             command: Some("bwa-mem3 mem {ref} /dev/stdin".to_string()),
             threads: None,
             chunk_size: 0,
+            sub_batch_templates: None,
         };
         let err = opts.resolve(&ref_path, 4, None).unwrap_err();
         assert!(err.to_string().contains("--aligner::chunk-size must be greater than 0"));
@@ -1506,6 +1975,7 @@ mod tests {
             command: None,
             threads: Some(0),
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
+            sub_batch_templates: None,
         };
         let err = opts.resolve(&ref_path, 4, Some(&bin)).unwrap_err();
         assert!(err.to_string().contains("--aligner::threads must be greater than 0"));

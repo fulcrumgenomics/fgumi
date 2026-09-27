@@ -407,7 +407,8 @@ fn writer_loop(
             let mut wrote_any = false;
             for record in &template.records {
                 let flags = record.flags();
-                // Align primary reads only (skip SECONDARY/SUPPLEMENTARY).
+                // Shared with the in-process prepare step so both backends select
+                // byte-identical primary reads (skip SECONDARY/SUPPLEMENTARY).
                 if !is_primary_for_alignment(flags) {
                     continue;
                 }
@@ -434,6 +435,9 @@ fn writer_loop(
                 wrote_any = true;
             }
             if !wrote_any {
+                // Shared with the in-process prepare step via
+                // `no_primary_records_message` so the two backends' hard-error
+                // wording cannot drift; the "writer:" prefix stays subprocess-local.
                 let msg = format!(
                     "align-and-merge writer: {}",
                     no_primary_records_message(template.name())
@@ -887,8 +891,8 @@ enum AlignedGroup {
     /// bwa's mid-pair split: with mixed single/paired input a `-K` chunk
     /// boundary fell between a pair's two reads, so bwa aligned them as two
     /// unpaired reads and emitted them back to back under the pair's name —
-    /// the first read's records, then the second's. The reader splits the
-    /// pair's unmapped template the same way (see [`split_pair_into_singles`]).
+    /// the first read's records, then the second's. The in-process backend
+    /// splits such a pair the same way (see [`split_pair_into_singles`]).
     /// Produced only when [`SubprocessConfig::accept_mid_pair_split`] is set
     /// (the subprocess presets).
     MidPairSplit(Template, Template),
@@ -1487,6 +1491,7 @@ impl AlignBackend for SubprocessBackend {
             tail,
             min_workers: Self::MIN_WORKERS,
             prefers_drain_first: Self::PREFERS_DRAIN_FIRST,
+            refill: None,
         })
     }
 }
