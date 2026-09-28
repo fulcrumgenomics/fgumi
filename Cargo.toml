@@ -103,7 +103,7 @@ tempfile = "3.3.0"
 thiserror = "2"
 trybuild = "1.0"
 which = "8"
-wide = "1.5"
+wide = "1.7"
 
 [package]
 name = "fgumi"

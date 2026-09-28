@@ -80,7 +80,7 @@ pub fn is_base_n(bam: &[u8], seq_off: usize, position: usize) -> bool {
 
 /// BAM nibble (0–15) → ASCII base, as a SIMD lookup table.
 ///
-/// Used by `decode_chunk_32` via `swizzle_relaxed` (portable `pshufb`).
+/// Used by `decode_chunk_32` via `shuffle` (portable `pshufb`).
 const NIBBLE_ASCII_LUT: u8x16 = u8x16::new([
     b'=', b'A', b'C', b'M', b'G', b'R', b'S', b'V', b'T', b'W', b'Y', b'H', b'K', b'D', b'B', b'N',
 ]);
@@ -115,8 +115,8 @@ fn decode_chunk_32(packed: &[u8], packed_off: usize, out: &mut [u8], out_off: us
     let hi_nibbles: u8x16 = cast::<u16x8, u8x16>(shifted) & u8x16::new([0x0F; 16]);
 
     // Parallel table lookup: nibble (0..15) → ASCII base.
-    let hi_ascii = NIBBLE_ASCII_LUT.swizzle_relaxed(hi_nibbles);
-    let lo_ascii = NIBBLE_ASCII_LUT.swizzle_relaxed(lo_nibbles);
+    let hi_ascii = NIBBLE_ASCII_LUT.shuffle(hi_nibbles);
+    let lo_ascii = NIBBLE_ASCII_LUT.shuffle(lo_nibbles);
 
     // Output order: [hi(b0), lo(b0), hi(b1), lo(b1), ..., hi(b15), lo(b15)].
     // u8x16::unpack_low(a, b)  → [a[0], b[0], a[1], b[1], ..., a[7], b[7]]
