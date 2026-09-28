@@ -2305,6 +2305,41 @@ mod bag_tests {
         RunAll::try_parse_from(std::iter::once("runall").chain(args.iter().copied())).unwrap()
     }
 
+    /// The per-stage forms of the consensus flags fgbio's duplex / CODEC callers
+    /// cannot honor are gone from `runall` too, so they fail to parse instead
+    /// of being accepted and ignored; `--duplex::trim` and the simplex forms
+    /// remain.
+    #[rstest::rstest]
+    #[case::duplex_min_consensus_base_quality("--duplex::min-consensus-base-quality", false)]
+    #[case::codec_min_consensus_base_quality("--codec::min-consensus-base-quality", false)]
+    #[case::codec_trim("--codec::trim", false)]
+    #[case::duplex_trim("--duplex::trim", true)]
+    #[case::simplex_trim("--simplex::trim", true)]
+    #[case::simplex_min_consensus_base_quality("--simplex::min-consensus-base-quality", true)]
+    fn consensus_flags_parse_only_where_honored(#[case] flag: &str, #[case] parses: bool) {
+        let value = if flag.ends_with("trim") { "true" } else { "30" };
+        let args = [
+            "runall",
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            flag,
+            value,
+        ];
+        match RunAll::try_parse_from(args) {
+            Ok(_) => assert!(parses, "{flag} must be rejected"),
+            Err(err) => {
+                assert!(!parses, "{flag} must parse: {err}");
+                assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{err}");
+            }
+        }
+    }
+
     #[test]
     fn sort_order_is_forced_template_coordinate() {
         let r = parse(&[

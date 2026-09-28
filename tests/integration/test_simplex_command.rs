@@ -10,6 +10,9 @@ use clap::Parser;
 use fgumi_dna::reverse_complement;
 use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::simplex::Simplex;
+use fgumi_lib::pipeline::chains::{
+    ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
+};
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::flags as raw_flags;
 use noodles::bam;
@@ -91,6 +94,53 @@ fn test_simplex_command_basic_consensus() {
         count += 1;
     }
     assert!(count > 0, "Should have produced consensus reads");
+}
+
+/// Drives `add_simplex` directly via `ChainSpec::single_stage(Stage::Simplex, ..)`,
+/// bypassing `Simplex::execute`'s pre-flight, so this fails unless the chain
+/// builder itself enforces the `--min-consensus-base-quality` range (`runall`
+/// never calls `Simplex::execute`).
+#[rstest]
+#[case::below_min_phred(1)]
+#[case::above_max_phred(94)]
+fn test_add_simplex_rejects_out_of_range_min_consensus_base_quality(#[case] floor: u8) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let family = create_umi_family("ACGT", 3, "fam1", "ACGTACGT", 30);
+    create_grouped_bam(&input_bam, vec![("1", family)]);
+
+    let cmd = Simplex::try_parse_from([
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+    ])
+    .expect("failed to parse simplex args");
+    let mut simplex_opts = cmd.to_simplex_options();
+    simplex_opts.min_consensus_base_quality = floor;
+
+    let ctx = SingleStageContext {
+        io: &cmd.io,
+        threading: &cmd.threading,
+        compression: &cmd.compression,
+        scheduler: &cmd.scheduler_opts,
+        queue_memory: &cmd.queue_memory,
+        command_line: "test",
+    };
+    let stage_opts = StageOptionsBag { simplex: Some(simplex_opts), ..Default::default() };
+    let spec = ChainSpec::single_stage(Stage::Simplex, stage_opts, &ctx);
+
+    let err = build_for(spec)
+        .and_then(fgumi_lib::pipeline::chains::BuiltPipeline::run)
+        .expect_err("add_simplex must reject an out-of-range consensus base-quality floor");
+    assert!(
+        err.to_string().contains(&format!("min-consensus-base-quality ({floor})")),
+        "unexpected error: {err:#}"
+    );
 }
 
 /// Test simplex command with statistics output.

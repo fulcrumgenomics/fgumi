@@ -18,8 +18,8 @@ use std::path::Path;
 use super::command::Command;
 use super::common::{
     AllowUnmappedOptions, BamIoOptions, CompressionOptions, ConsensusCallingOptions,
-    OverlappingConsensusOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions,
-    SchedulerOptions, StatsOptions, ThreadingOptions, reject_output_collisions,
+    OverlappingConsensusOptions, QualityTrimOptions, QueueMemoryOptions, ReadGroupOptions,
+    RejectsOptions, SchedulerOptions, StatsOptions, ThreadingOptions, reject_output_collisions,
 };
 use crate::duplex_consensus_caller::DuplexConsensusCaller;
 use crate::sam::SamTag;
@@ -103,6 +103,10 @@ pub struct Duplex {
     /// Consensus calling options
     #[command(flatten)]
     pub consensus: ConsensusCallingOptions,
+
+    /// Quality trimming of raw reads
+    #[command(flatten)]
+    pub quality_trim: QualityTrimOptions,
 
     /// Overlapping consensus options
     #[command(flatten)]
@@ -199,7 +203,7 @@ pub struct Duplex {
 /// `#[command(flatten)]` sub-structs: the chain builder wants one bag per
 /// stage, not a re-run of the CLI's grouping. Each `#[arg]` below is copied
 /// verbatim from the corresponding field on [`ConsensusCallingOptions`] /
-/// [`OverlappingConsensusOptions`].
+/// [`QualityTrimOptions`] / [`OverlappingConsensusOptions`].
 ///
 /// `tie_rule` is `#[arg(skip)]`: on the standalone command it is resolved from
 /// `TieRuleArg` (a hidden, cross-tool equivalency-testing knob), and
@@ -244,9 +248,6 @@ pub struct DuplexOptions {
     /// Trim consensus reads.
     #[arg(long = "trim", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub trim: bool,
-    /// Minimum consensus base quality.
-    #[arg(long = "min-consensus-base-quality", default_value = "2")]
-    pub min_consensus_base_quality: u8,
     /// How to resolve a near-tie between the two most likely consensus bases.
     #[arg(skip)]
     pub tie_rule: fgumi_consensus::TieRule,
@@ -302,8 +303,7 @@ impl Default for DuplexOptions {
             error_rate_post_umi: consensus.error_rate_post_umi,
             min_input_base_quality: consensus.min_input_base_quality,
             output_per_base_tags: consensus.output_per_base_tags,
-            trim: consensus.trim,
-            min_consensus_base_quality: consensus.min_consensus_base_quality,
+            trim: QualityTrimOptions::default().trim,
             tie_rule: consensus.tie_rule.into(),
             consensus_call_overlapping_bases: overlapping.consensus_call_overlapping_bases,
             min_reads: vec![1],
@@ -330,8 +330,7 @@ impl Duplex {
             error_rate_post_umi: self.consensus.error_rate_post_umi,
             min_input_base_quality: self.consensus.min_input_base_quality,
             output_per_base_tags: self.consensus.output_per_base_tags,
-            trim: self.consensus.trim,
-            min_consensus_base_quality: self.consensus.min_consensus_base_quality,
+            trim: self.quality_trim.trim,
             tie_rule: self.consensus.tie_rule.into(),
             consensus_call_overlapping_bases: self.overlapping.consensus_call_overlapping_bases,
             min_reads: self.min_reads.clone(),
@@ -363,8 +362,6 @@ impl DuplexOptions {
             error_rate_post_umi: self.error_rate_post_umi,
             min_input_base_quality: self.min_input_base_quality,
             output_per_base_tags: self.output_per_base_tags,
-            trim: self.trim,
-            min_consensus_base_quality: self.min_consensus_base_quality,
             tie_rule: self.tie_rule.into(),
         }
     }
@@ -441,8 +438,8 @@ impl Command for Duplex {
     /// # use fgumi_lib::commands::command::Command;
     /// # use fgumi_lib::commands::common::{
     /// #     AllowUnmappedOptions, BamIoOptions, CompressionOptions, ConsensusCallingOptions,
-    /// #     OverlappingConsensusOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions,
-    /// #     SchedulerOptions, StatsOptions, ThreadingOptions,
+    /// #     OverlappingConsensusOptions, QualityTrimOptions, QueueMemoryOptions, ReadGroupOptions,
+    /// #     RejectsOptions, SchedulerOptions, StatsOptions, ThreadingOptions,
     /// # };
     /// # use std::path::{Path, PathBuf};
     /// let duplex = Duplex {
@@ -463,6 +460,7 @@ impl Command for Duplex {
     ///         output_per_base_tags: false,
     ///         ..ConsensusCallingOptions::default()
     ///     },
+    ///     quality_trim: QualityTrimOptions::default(),
     ///     overlapping: OverlappingConsensusOptions::default(),
     ///     threading: ThreadingOptions::none(),
     ///     compression: CompressionOptions::default(),
@@ -658,8 +656,6 @@ mod tests {
             "18",
             "--output-per-base-tags=false",
             "--trim=true",
-            "--min-consensus-base-quality",
-            "21",
             "--tie-rule",
             "ulp-relative",
             "--consensus-call-overlapping-bases=false",
@@ -694,7 +690,6 @@ mod tests {
         assert_eq!(opts.min_input_base_quality, 18);
         assert!(!opts.output_per_base_tags, "an explicit false must not be lost");
         assert!(opts.trim);
-        assert_eq!(opts.min_consensus_base_quality, 21);
         assert_eq!(
             opts.tie_rule,
             fgumi_consensus::TieRule::UlpRelative,
@@ -743,7 +738,6 @@ mod tests {
         assert_eq!(opts.min_input_base_quality, 10);
         assert!(opts.output_per_base_tags);
         assert!(!opts.trim);
-        assert_eq!(opts.min_consensus_base_quality, 2);
         assert_eq!(opts.tie_rule, fgumi_consensus::TieRule::FgbioCompat);
         assert!(opts.consensus_call_overlapping_bases);
         assert_eq!(opts.min_reads, vec![1]);
@@ -813,9 +807,9 @@ mod tests {
             },
             consensus: ConsensusCallingOptions {
                 output_per_base_tags: false,
-                min_consensus_base_quality: 0,
                 ..ConsensusCallingOptions::default()
             },
+            quality_trim: QualityTrimOptions::default(),
             overlapping: OverlappingConsensusOptions::default(),
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
@@ -1161,7 +1155,7 @@ mod tests {
         assert_eq!(duplex.min_reads, vec![1]);
         assert_eq!(duplex.consensus.min_input_base_quality, 10);
         assert!(duplex.threading.is_single_threaded());
-        assert!(!duplex.consensus.trim);
+        assert!(!duplex.quality_trim.trim);
     }
 
     #[test]
@@ -1204,11 +1198,34 @@ mod tests {
     fn test_trim_and_downsample_options() {
         let mut duplex =
             create_duplex_with_paths(PathBuf::from("test.bam"), PathBuf::from("output.bam"));
-        duplex.consensus.trim = true;
+        duplex.quality_trim.trim = true;
         duplex.max_reads_per_strand = Some(100);
 
-        assert!(duplex.consensus.trim);
+        assert!(duplex.quality_trim.trim);
         assert_eq!(duplex.max_reads_per_strand, Some(100));
+    }
+
+    /// `duplex` does not take `--min-consensus-base-quality`: fgbio's
+    /// `CallDuplexConsensusReads` has no such flag and its caller hardcodes the
+    /// `MIN_PHRED` floor, so fgumi used to accept it and then ignore it. It must
+    /// now fail to parse, while `--trim` (which fgbio duplex honors) still parses.
+    #[test]
+    fn duplex_rejects_min_consensus_base_quality_but_takes_trim() {
+        let err = Duplex::try_parse_from([
+            "duplex",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--min-consensus-base-quality",
+            "30",
+        ])
+        .expect_err("duplex must reject --min-consensus-base-quality");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{err}");
+
+        let cmd = Duplex::try_parse_from(["duplex", "-i", "in.bam", "-o", "out.bam", "--trim"])
+            .expect("duplex still takes --trim");
+        assert!(cmd.quality_trim.trim);
     }
 
     // ========================================================================
@@ -2007,7 +2024,6 @@ mod tests {
         assert_eq!(multi.min_input_base_quality, base.min_input_base_quality);
         assert_eq!(multi.output_per_base_tags, base.output_per_base_tags);
         assert_eq!(multi.trim, base.trim);
-        assert_eq!(multi.min_consensus_base_quality, base.min_consensus_base_quality);
         assert_eq!(multi.tie_rule, base.tie_rule);
         assert_eq!(multi.consensus_call_overlapping_bases, base.consensus_call_overlapping_bases);
         assert_eq!(multi.min_reads, base.min_reads);
@@ -2050,7 +2066,6 @@ mod tests {
         assert_eq!(d.min_input_base_quality, parsed.min_input_base_quality);
         assert_eq!(d.output_per_base_tags, parsed.output_per_base_tags);
         assert_eq!(d.trim, parsed.trim);
-        assert_eq!(d.min_consensus_base_quality, parsed.min_consensus_base_quality);
         assert_eq!(d.consensus_call_overlapping_bases, parsed.consensus_call_overlapping_bases);
         assert_eq!(d.min_reads, parsed.min_reads);
         // Chain-engine skip field: no `--duplex::tie-rule` CLI flag exists to

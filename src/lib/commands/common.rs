@@ -885,6 +885,13 @@ impl StatsOptions {
 }
 
 /// Common options for consensus calling (simplex, duplex, codec).
+///
+/// Only options every consensus caller honors live here. Quality trimming
+/// ([`QualityTrimOptions`]) is flattened by simplex and duplex only, and the
+/// consensus base-quality floor ([`MinConsensusBaseQualityOptions`]) by simplex
+/// only — matching fgbio, whose duplex caller hardcodes the floor and whose
+/// CODEC caller exposes neither. A flag a caller cannot honor is therefore a
+/// parse error on that command rather than a silent no-op.
 #[derive(Debug, Clone, Args)]
 pub struct ConsensusCallingOptions {
     /// Phred-scaled error rate prior to UMI integration
@@ -904,17 +911,6 @@ pub struct ConsensusCallingOptions {
     /// fgbio emits unconditionally.
     #[arg(short = 'B', long = "output-per-base-tags", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub output_per_base_tags: bool,
-
-    /// Quality-trim reads before consensus calling (removes low-quality bases from ends)
-    #[arg(long = "trim", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
-    pub trim: bool,
-
-    /// Minimum consensus base quality (output consensus bases below this are masked to N). The
-    /// default (2) matches fgbio, which hardcodes the consensus base-quality minimum to `MIN_PHRED`
-    /// (2) and defers further masking to `fgumi filter` / fgbio `FilterConsensusReads`; exposing
-    /// this as a flag is an fgumi superset.
-    #[arg(long = "min-consensus-base-quality", default_value = "2")]
-    pub min_consensus_base_quality: u8,
 
     /// How to resolve a near-tie between the two most likely consensus bases.
     ///
@@ -938,8 +934,6 @@ impl Default for ConsensusCallingOptions {
             error_rate_post_umi: 40,
             min_input_base_quality: 10,
             output_per_base_tags: true,
-            trim: false,
-            min_consensus_base_quality: 2,
             tie_rule: TieRuleArg::FgbioCompat,
         }
     }
@@ -958,7 +952,6 @@ impl ConsensusCallingOptions {
     ///
     /// Returns an error if:
     /// - Any Phred quality value exceeds `MAX_PHRED` (93)
-    /// - `min_consensus_base_quality` is less than 2 (`MIN_PHRED`)
     pub fn validate(&self) -> anyhow::Result<()> {
         use anyhow::bail;
 
@@ -983,20 +976,59 @@ impl ConsensusCallingOptions {
                 Self::MAX_PHRED
             );
         }
-        if self.min_consensus_base_quality < 2 {
-            bail!(
-                "min-consensus-base-quality ({}) must be at least 2 (MIN_PHRED)",
-                self.min_consensus_base_quality
-            );
-        }
-        if self.min_consensus_base_quality > Self::MAX_PHRED {
-            bail!(
-                "min-consensus-base-quality ({}) exceeds maximum Phred score ({})",
-                self.min_consensus_base_quality,
-                Self::MAX_PHRED
-            );
-        }
+        Ok(())
+    }
+}
 
+/// Quality trimming of raw reads before consensus calling. Flattened by
+/// `simplex` and `duplex`, whose fgbio counterparts honor `--trim`; `codec` does
+/// not flatten it, because fgbio's CODEC caller never quality-trims.
+#[derive(Debug, Clone, Default, Args)]
+pub struct QualityTrimOptions {
+    /// Quality-trim reads before consensus calling (removes low-quality bases from ends)
+    #[arg(long = "trim", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub trim: bool,
+}
+
+/// The consensus base-quality floor. Flattened by `simplex` only, where fgumi's
+/// caller honors it (an fgumi superset: fgbio hardcodes the floor everywhere).
+/// fgumi's duplex and CODEC callers hardcode it to `MIN_PHRED` like fgbio's, so
+/// those commands do not expose a knob they would ignore.
+#[derive(Debug, Clone, Args)]
+pub struct MinConsensusBaseQualityOptions {
+    /// Minimum consensus base quality (output consensus bases below this are masked to N). The
+    /// default (2) matches fgbio, which hardcodes the consensus base-quality minimum to `MIN_PHRED`
+    /// (2) and defers further masking to `fgumi filter` / fgbio `FilterConsensusReads`; exposing
+    /// this as a flag is an fgumi superset.
+    #[arg(long = "min-consensus-base-quality", default_value = "2")]
+    pub min_consensus_base_quality: u8,
+}
+
+impl Default for MinConsensusBaseQualityOptions {
+    fn default() -> Self {
+        Self { min_consensus_base_quality: 2 }
+    }
+}
+
+impl MinConsensusBaseQualityOptions {
+    /// Validates the floor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the floor is below 2 (`MIN_PHRED`) or above
+    /// `MAX_PHRED` (93).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let max = ConsensusCallingOptions::MAX_PHRED;
+        anyhow::ensure!(
+            self.min_consensus_base_quality >= 2,
+            "min-consensus-base-quality ({}) must be at least 2 (MIN_PHRED)",
+            self.min_consensus_base_quality
+        );
+        anyhow::ensure!(
+            self.min_consensus_base_quality <= max,
+            "min-consensus-base-quality ({}) exceeds maximum Phred score ({max})",
+            self.min_consensus_base_quality
+        );
         Ok(())
     }
 }
@@ -2959,8 +2991,6 @@ mod tests {
             error_rate_post_umi: 40,
             min_input_base_quality: 10,
             output_per_base_tags: true,
-            trim: false,
-            min_consensus_base_quality: 13,
             tie_rule: TieRuleArg::default(),
         };
         assert!(opts.validate().is_ok());
@@ -2986,23 +3016,22 @@ mod tests {
         assert!(err.to_string().contains("error-rate-post-umi"));
     }
 
-    #[test]
-    fn test_consensus_calling_options_validate_min_consensus_too_low() {
-        let opts = ConsensusCallingOptions {
-            min_consensus_base_quality: 1, // Below MIN_PHRED
-            ..ConsensusCallingOptions::default()
-        };
-        let err = opts.validate().unwrap_err();
-        assert!(err.to_string().contains("min-consensus-base-quality"));
-    }
-
-    #[test]
-    fn test_consensus_calling_options_validate_min_consensus_at_min() {
-        let opts = ConsensusCallingOptions {
-            min_consensus_base_quality: 2, // Exactly MIN_PHRED
-            ..ConsensusCallingOptions::default()
-        };
-        assert!(opts.validate().is_ok());
+    /// The consensus base-quality floor's validator accepts exactly
+    /// `MIN_PHRED..=MAX_PHRED` (moved unchanged from `ConsensusCallingOptions`).
+    #[rstest::rstest]
+    #[case::below_min_phred(1, false)]
+    #[case::at_min_phred(2, true)]
+    #[case::at_max_phred(93, true)]
+    #[case::above_max_phred(94, false)]
+    fn test_min_consensus_base_quality_bounds(#[case] floor: u8, #[case] ok: bool) {
+        let opts = MinConsensusBaseQualityOptions { min_consensus_base_quality: floor };
+        match opts.validate() {
+            Ok(()) => assert!(ok, "{floor} must be rejected"),
+            Err(err) => {
+                assert!(!ok, "{floor} must be accepted: {err}");
+                assert!(err.to_string().contains("min-consensus-base-quality"), "{err}");
+            }
+        }
     }
 
     // ========== Tests for SchedulerOptions ==========
@@ -3514,6 +3543,8 @@ mod tests {
         #[command(flatten)]
         consensus: ConsensusCallingOptions,
         #[command(flatten)]
+        quality_trim: QualityTrimOptions,
+        #[command(flatten)]
         overlapping: OverlappingConsensusOptions,
         #[command(flatten)]
         queue_memory: QueueMemoryOptions,
@@ -3609,7 +3640,7 @@ mod tests {
     #[case(&["test", "--trim=false"], false)]
     fn test_trim_parsing(#[case] args: &[&str], #[case] expected: bool) {
         let cmd = TestBoolFlags::try_parse_from(args).expect("valid CLI args should parse");
-        assert_eq!(cmd.consensus.trim, expected);
+        assert_eq!(cmd.quality_trim.trim, expected);
     }
 
     #[rstest]
@@ -3768,7 +3799,7 @@ mod tests {
     #[case(&["test", "--trim", "0"], false)]
     fn test_extended_bool_values_in_cli(#[case] args: &[&str], #[case] expected: bool) {
         let cmd = TestBoolFlags::try_parse_from(args).expect("valid CLI args should parse");
-        assert_eq!(cmd.consensus.trim, expected);
+        assert_eq!(cmd.quality_trim.trim, expected);
     }
 
     #[rstest]
