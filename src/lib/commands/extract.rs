@@ -133,27 +133,13 @@ pub(crate) fn open_fastq_reader(
     // CRC-verification policy, resolved per input path: an explicit flag wins,
     // otherwise verify a file and trust (skip) stdin. Only consulted for the
     // single-threaded BGZF path below.
-    let verify_crc = if check_crc {
-        true
-    } else if no_check_crc {
-        false
-    } else {
-        !is_stdin_path(path)
-    };
+    let verify_crc = crate::commands::common::resolve_check_crc(check_crc, no_check_crc, path);
     // Mirror the BAM path's `CRC verify:` line (see `RunOptions::log_effective_check_crc`)
     // so the effective policy — including the default-off-for-stdin skip, a change from
     // fgumi's previous always-verify default — is visible in every run's log rather than a
     // silent decision. Emitted below only for BGZF input, the only format that carries a
     // per-block CRC32 to verify or skip.
-    let crc_reason = if check_crc {
-        " (--check-crc)"
-    } else if no_check_crc {
-        " (--no-check-crc)"
-    } else if is_stdin_path(path) {
-        " (trusted stdin)"
-    } else {
-        ""
-    };
+    let crc_reason = crate::commands::common::check_crc_reason(check_crc, no_check_crc, path);
 
     // stdin cannot be sniffed by path and then re-opened — the bytes read to
     // classify it are gone. Peek them off the stream and chain them back in
@@ -744,22 +730,14 @@ impl Extract {
     /// [`SourceSpec::Fastqs`] — and the sink is a BAM. The chain opens its own
     /// readers and detects the quality encoding in `ChainBuilder::open_source`.
     ///
-    /// Split out from [`Self::execute_chain`] so the flag-derived spec fields —
-    /// notably the resolved CRC policy — can be unit-tested without running the
-    /// pipeline, mirroring `Sort::build_sort_chain_spec`.
-    ///
-    /// `read_streams` is a seekable-BAM knob and inert for a FASTQ source, but
-    /// `verify_crc` is NOT inert: the all-file BGZF parallel-decode split
-    /// (`ChainBuilder::build_bgzf_fastq_split` → `FastqDecompress`) reads it as
-    /// its per-block CRC32 policy. It is resolved here through the shared
-    /// [`resolve_check_crc`] so `--check-crc` / `--no-check-crc` reach that
-    /// decoder instead of it silently skipping verification.
+    /// `read_streams` and `verify_crc` are inert for a FASTQ source: the CRC
+    /// policy reaches both FASTQ decode fronts through the extract options'
+    /// `check_crc`/`no_check_crc` (see `ChainSpec::verify_crc`).
     ///
     /// [`ChainSpec`]: crate::pipeline::chains::ChainSpec
     /// [`ChainSpec::single_stage`]: crate::pipeline::chains::ChainSpec::single_stage
     /// [`SourceSpec::Fastqs`]: crate::pipeline::chains::SourceSpec::Fastqs
     /// [`SourceSpec::InterleavedFastq`]: crate::pipeline::chains::SourceSpec::InterleavedFastq
-    /// [`resolve_check_crc`]: crate::commands::common::resolve_check_crc
     fn build_extract_chain_spec(
         &self,
         command_line: &str,
@@ -776,19 +754,6 @@ impl Extract {
         let stage_opts =
             StageOptionsBag { extract: Some(self.to_extract_options()), ..Default::default() };
 
-        // `verify_crc` is consumed only by the all-file BGZF parallel-decode
-        // split; the fused reader path derives its own per-path policy directly
-        // from `check_crc`/`no_check_crc`. The split's eligibility gate
-        // guarantees every input is a non-stdin BGZF file, so
-        // `resolve_check_crc`'s stdin-trust branch never applies on that path —
-        // resolve against the first input (a real file whenever the split runs;
-        // the value is inert when the fused path handles the source).
-        let verify_crc = crate::commands::common::resolve_check_crc(
-            self.check_crc,
-            self.no_check_crc,
-            &self.inputs[0],
-        );
-
         Ok(ChainSpec {
             stages: vec![Stage::Extract],
             source,
@@ -800,7 +765,9 @@ impl Extract {
             queue_memory: self.queue_memory.clone(),
             async_reader: self.async_reader,
             read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
-            verify_crc,
+            // Inert for a FASTQ source: both decode fronts resolve the CRC
+            // policy from `stage_opts.extract` (see `ChainSpec::verify_crc`).
+            verify_crc: true,
             command_line: command_line.to_string(),
         })
     }
@@ -2026,37 +1993,6 @@ mod tests {
             .execute("test")
             .expect_err("--check-crc must reject a corrupted BGZF FASTQ CRC32");
         assert_crc_error_msg(&format!("{check_err:#}"));
-    }
-
-    /// `--check-crc` / `--no-check-crc` reach the extract `ChainSpec.verify_crc`
-    /// through the shared [`resolve_check_crc`] policy, so the all-file BGZF
-    /// parallel-decode split (`ChainBuilder::build_bgzf_fastq_split` →
-    /// `FastqDecompress`) honors the flags instead of silently skipping CRC
-    /// verification. The field was previously hardcoded `false`, disabling CRC
-    /// on that path regardless of the flags. Mirrors
-    /// `Sort::build_sort_chain_spec_resolves_verify_crc`.
-    #[rstest]
-    #[case::file_default_verifies(false, false, true)]
-    #[case::file_no_check_crc_skips(false, true, false)]
-    #[case::file_check_crc_verifies(true, false, true)]
-    fn build_extract_chain_spec_resolves_verify_crc(
-        #[case] check_crc: bool,
-        #[case] no_check_crc: bool,
-        #[case] expected: bool,
-    ) {
-        // A file path (never stdin) — the split's eligibility gate the field
-        // feeds only fires on real files, so the file-default policy applies.
-        let extract = bgzf_crc_extract(
-            PathBuf::from("in.fq.gz"),
-            PathBuf::from("out.bam"),
-            ThreadingOptions::none(),
-            check_crc,
-            no_check_crc,
-        );
-        let spec = extract
-            .build_extract_chain_spec("fgumi extract (test)")
-            .expect("spec build should succeed");
-        assert_eq!(spec.verify_crc, expected, "file input CRC policy on the FASTQ split");
     }
 
     /// End-to-end guard that the BGZF FASTQ split decoder itself honors the CRC

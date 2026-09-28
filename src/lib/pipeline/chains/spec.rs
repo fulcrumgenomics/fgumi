@@ -42,8 +42,11 @@ pub struct ChainSpec {
     /// chain reproduces the non-chain path's CRC behavior. Honored on both BAM
     /// decode fronts: the `BgzfDecompress` step and the sort arena front's
     /// `InflateToArena` (the only path standalone `fgumi sort` takes). Inert for
-    /// the SAM source (no BGZF) and for the FASTQ source (which carries its own
-    /// policy).
+    /// the SAM source (no BGZF) and for FASTQ sources: both FASTQ decode fronts —
+    /// the fused readers (`ChainBuilder::open_fastq_source`) and the all-file
+    /// BGZF split (`ChainBuilder::build_bgzf_fastq_split`) — resolve their policy
+    /// from the extract options' `check_crc`/`no_check_crc`, so a FASTQ command
+    /// cannot leave the split out of sync with the flags it parsed.
     pub verify_crc: bool,
     /// For `@PG` line injection into the output header.
     pub command_line: String,
