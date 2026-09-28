@@ -625,6 +625,11 @@ pub struct ChainBuilder<'a> {
     /// Default `false`.
     detached_writer: bool,
 
+    /// Spill-run accounting of the standalone sort (runs written, consolidations,
+    /// merge fan-in), shared by `add_sort`'s `SpillWrite` with the sort summary
+    /// and the `=== Sort Phase Timing ===` roll-up. `None` for every other chain.
+    sort_spill_stats: Option<std::sync::Arc<crate::pipeline::steps::sort::SpillRunStats>>,
+
     /// Quality encoding detected by `open_source` for a FASTQ source, pulled out
     /// of [`PendingSource::Fastq`] in `new()`. `add_extract` overrides the
     /// placeholder `ExtractOptions::quality_encoding` with this so the chain
@@ -720,6 +725,7 @@ impl<'a> ChainBuilder<'a> {
             // Pool-scheduled writer by default; add_sort opts the standalone
             // sort terminal into a Detached writer (lever 2).
             detached_writer: false,
+            sort_spill_stats: None,
             fastq_encoding,
             consensus_metrics_captures: None,
         })
@@ -2260,6 +2266,7 @@ impl<'a> ChainBuilder<'a> {
                 self.finalize.push(Box::new(
                     crate::pipeline::chains::commands::sort::SortPhaseTimingFinalizeHook {
                         stats: std::sync::Arc::clone(&s),
+                        spill_stats: self.sort_spill_stats.clone(),
                     },
                 ));
             }
@@ -3123,7 +3130,7 @@ impl<'a> ChainBuilder<'a> {
             use crate::pipeline::steps::parse::decode::DecodeFromRecords;
             use crate::pipeline::steps::sort::{
                 BlockOutput, RecordBatchOutput, SortBuffer, SortDecompressTuning, SortMerge,
-                SortSpillDecompress, SpillBlockCompress, SpillGather, SpillWrite,
+                SortSpillDecompress, SpillBlockCompress, SpillGather, SpillRunStats, SpillWrite,
             };
             use fgumi_sort::{RawExternalSorter, SortOrder};
 
@@ -3426,7 +3433,17 @@ impl<'a> ChainBuilder<'a> {
                 // just-sorted chunk into blocks while the pool inflates/compresses.
                 let serialize = SpillGather::new(byte_limit);
                 let compress = SpillBlockCompress::new(temp_codec, temp_compression, byte_limit);
-                let write = SpillWrite::new(alloc, temp_codec, byte_limit, temp_dirs);
+                // `--max-temp-files` bounds the live spill runs: `SpillWrite`
+                // consolidates runs (at the spill compression level) whenever the
+                // limit would be exceeded, so the merge never opens more files than
+                // the resolved limit allows.
+                let spill_stats = Arc::new(SpillRunStats::default());
+                if is_standalone_sort {
+                    self.sort_spill_stats = Some(Arc::clone(&spill_stats));
+                }
+                let write = SpillWrite::new(alloc, temp_codec, byte_limit, temp_dirs)
+                    .with_max_temp_files(resolved_max_temp_files, temp_compression)
+                    .with_stats(spill_stats);
                 // Lever 2, Phase-1 analogue: on the standalone-sort terminal,
                 // detach the spill writer onto its own dedicated thread as well,
                 // so the single serial spill-write stream stops occupying a pool
@@ -3464,6 +3481,9 @@ impl<'a> ChainBuilder<'a> {
                 if let Some(slot) = &sort_stats_slot {
                     merge = merge.with_stats_slot(Arc::clone(slot));
                 }
+                if let Some(spill_stats) = &self.sort_spill_stats {
+                    merge = merge.with_spill_stats(Arc::clone(spill_stats));
+                }
                 let merge_tail = self.pipeline.append_step(merge, decompress_tail);
                 self.current_tail = Some(merge_tail);
                 // tail is DecompressedBlock (serialized bytes) directly from
@@ -3488,6 +3508,7 @@ impl<'a> ChainBuilder<'a> {
                     self.finalize_on_success.push(Box::new(
                         crate::pipeline::chains::commands::sort::SortSummaryFinalizeHook {
                             stats_slot: slot,
+                            spill_stats: self.sort_spill_stats.clone(),
                             output_path,
                             timer: crate::logging::OperationTimer::new("Sorting BAM"),
                         },
@@ -6307,6 +6328,7 @@ mod tests {
             pending_header_transform: None,
             chain_tail_kind: ChainTailKind::DecodedRecordBatch { closed_under_queryname: false },
             detached_writer: false,
+            sort_spill_stats: None,
             fastq_encoding: None,
             consensus_metrics_captures: None,
         }

@@ -19,6 +19,7 @@ pub mod arena_ingest;
 pub mod compress_spill;
 pub mod merge;
 pub mod protocol;
+pub(crate) mod run_stack;
 pub mod sort_buffer;
 pub mod spill_block_compress;
 pub mod spill_decompress;
@@ -35,7 +36,7 @@ pub use sort_buffer::SortBuffer;
 pub use spill_block_compress::SpillBlockCompress;
 pub use spill_decompress::{SortDecompressTuning, SortSpillDecompress};
 pub use spill_gather::SpillGather;
-pub use spill_write::SpillWrite;
+pub use spill_write::{SpillRunStats, SpillWrite};
 
 #[cfg(test)]
 pub mod tests;

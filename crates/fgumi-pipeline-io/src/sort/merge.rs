@@ -736,6 +736,10 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// reaches `Done`. The standalone-sort summary finalize hook reads it to
     /// log records processed/written and the spill-chunk count.
     stats_slot: Option<Arc<parking_lot::Mutex<Option<fgumi_sort::SortStats>>>>,
+    /// Spill-run accounting from `SpillWrite`, so the summary's `runs_written`
+    /// counts the runs the spill phase wrote rather than the (possibly fewer,
+    /// after consolidation) runs this merge read.
+    spill_stats: Option<Arc<crate::sort::SpillRunStats>>,
     /// Whether to log the `--sort-stats` merge-loop performance diagnostic
     /// (`Sort merge diag: ...`: stalls/contention/backpressure counters). Off
     /// by default -- it is instrumentation for performance investigations, not
@@ -744,8 +748,8 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// Total records ingested, captured at the merge transition (the summary's
     /// "records processed").
     processed: u64,
-    /// Number of spill files, captured at the merge transition (the summary's
-    /// "temporary chunks"). Zero for a fully in-memory sort.
+    /// Spill runs read by the final merge (after any consolidation), captured at
+    /// the merge transition. Zero for a fully in-memory sort.
     chunk_count: usize,
     /// INSTRUMENTATION (lever-2 merge-stall diagnosis; `RUST_LOG=info` at Done).
     /// `SortMerge` runs on a single dedicated `Detached` thread (one instance,
@@ -831,6 +835,7 @@ impl<O: MergeOutput> SortMerge<O> {
             target_batch_count: target_batch_count.max(1),
             output_byte_limit,
             stats_slot: None,
+            spill_stats: None,
             sort_stats: false,
             processed: 0,
             chunk_count: 0,
@@ -877,6 +882,15 @@ impl<O: MergeOutput> SortMerge<O> {
         slot: Arc<parking_lot::Mutex<Option<fgumi_sort::SortStats>>>,
     ) -> Self {
         self.stats_slot = Some(slot);
+        self
+    }
+
+    /// Report `SortStats::runs_written` from `SpillWrite`'s accounting (runs the
+    /// spill phase wrote) instead of this merge's source count, which is smaller
+    /// whenever `--max-temp-files` consolidated runs.
+    #[must_use]
+    pub fn with_spill_stats(mut self, spill_stats: Arc<crate::sort::SpillRunStats>) -> Self {
+        self.spill_stats = Some(spill_stats);
         self
     }
 
@@ -1097,7 +1111,9 @@ impl<O: MergeOutput> SortMerge<O> {
                         *slot.lock() = Some(fgumi_sort::SortStats {
                             total_records: self.processed,
                             output_records: merged,
-                            runs_written: self.chunk_count,
+                            runs_written: self.spill_stats.as_ref().map_or(self.chunk_count, |s| {
+                                usize::try_from(s.runs_written()).unwrap_or(usize::MAX)
+                            }),
                         });
                     }
                     self.state = SortMergeState::Done;

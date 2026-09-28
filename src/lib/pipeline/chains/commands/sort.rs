@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::logging::OperationTimer;
+use crate::pipeline::steps::sort::SpillRunStats;
 use anyhow::Result;
 use log::info;
 use parking_lot::Mutex;
@@ -41,19 +42,34 @@ use crate::pipeline::core::runtime::stats::{PipelineStats, StatsSnapshot};
 /// `runall` path leaves the slot unset and gets no summary block.
 pub(crate) struct SortSummaryFinalizeHook {
     pub(crate) stats_slot: Arc<Mutex<Option<fgumi_sort::SortStats>>>,
+    /// Spill-run accounting from `SpillWrite`: runs written, consolidations and
+    /// the final merge's fan-in. `None` when the chain has no spill writer.
+    pub(crate) spill_stats: Option<Arc<SpillRunStats>>,
     pub(crate) output_path: PathBuf,
     pub(crate) timer: OperationTimer,
 }
 
 impl FinalizeHook for SortSummaryFinalizeHook {
     fn finalize(self: Box<Self>) -> Result<()> {
-        let SortSummaryFinalizeHook { stats_slot, output_path, timer } = *self;
+        let SortSummaryFinalizeHook { stats_slot, spill_stats, output_path, timer } = *self;
         let stats = stats_slot.lock().take().unwrap_or_default();
         info!("=== Summary ===");
         info!("Records processed: {}", stats.total_records);
         info!("Records written: {}", stats.output_records);
         if stats.runs_written > 0 {
             info!("Spill runs: {}", stats.runs_written);
+        }
+        // Printed for every spilling sort; it equals `Spill runs:` unless
+        // `--max-temp-files` consolidated runs.
+        if let Some(spill) = spill_stats.as_ref().filter(|s| s.runs_written() > 0) {
+            if spill.consolidations() > 0 {
+                info!(
+                    "Consolidations: {} ({:.1}s)",
+                    spill.consolidations(),
+                    spill.consolidation_secs()
+                );
+            }
+            info!("Merge sources: {}", spill.merge_sources());
         }
         info!("Output: {}", output_path.display());
         timer.log_completion(stats.total_records);
@@ -149,8 +165,11 @@ impl SortPhase {
             "SpillGather" | "SpillBlockCompress" | "SpillWrite" | "CompressSpill" => {
                 Some(SortPhase::SpillWrite)
             }
-            "SortSpillDecompress" => Some(SortPhase::Consolidation),
-            "SortMerge" => Some(SortPhase::KWayMerge),
+            // `SortSpillDecompress` is Phase-2 read-ahead of the final merge's
+            // sources, not consolidation; consolidation runs inside `SpillWrite`
+            // and is split out of the spill-write bucket by
+            // `summarize_sort_phases`.
+            "SortSpillDecompress" | "SortMerge" => Some(SortPhase::KWayMerge),
             "BgzfCompress" | "WriteBgzfFile" => Some(SortPhase::WriteOutput),
             _ => None,
         }
@@ -167,13 +186,18 @@ impl SortPhase {
 /// re-counts that same time under the "N + 2" pool-vs-detached reporting split,
 /// so it is deliberately NOT added here (doing so would double-count the
 /// writer).
-fn summarize_sort_phases(snapshot: &StatsSnapshot) -> [u64; 6] {
+fn summarize_sort_phases(snapshot: &StatsSnapshot, consolidation_ns: u64) -> [u64; 6] {
     let mut phase_ns = [0u64; 6];
     for (name, stats) in &snapshot.steps {
         if let Some(phase) = SortPhase::from_step_name(name) {
             phase_ns[phase as usize] = phase_ns[phase as usize].saturating_add(stats.total_run_ns);
         }
     }
+    // Consolidation runs inside `SpillWrite`'s `try_run`, so its time is part of
+    // that step's busy time; move it to its own bucket.
+    let moved = consolidation_ns.min(phase_ns[SortPhase::SpillWrite as usize]);
+    phase_ns[SortPhase::SpillWrite as usize] -= moved;
+    phase_ns[SortPhase::Consolidation as usize] += moved;
     phase_ns
 }
 
@@ -210,8 +234,10 @@ fn format_sort_phase_timing(phase_ns: &[u64; 6]) -> Option<Vec<String>> {
 /// Log the `=== Sort Phase Timing ===` block for a stats snapshot, when any
 /// sort phase did work. Split out from [`SortPhaseTimingFinalizeHook`] so the
 /// roll-up + rendering can be unit-tested against a hand-built snapshot.
-fn log_sort_phase_timing(snapshot: &StatsSnapshot) {
-    if let Some(lines) = format_sort_phase_timing(&summarize_sort_phases(snapshot)) {
+fn log_sort_phase_timing(snapshot: &StatsSnapshot, consolidation_ns: u64) {
+    if let Some(lines) =
+        format_sort_phase_timing(&summarize_sort_phases(snapshot, consolidation_ns))
+    {
         for line in lines {
             info!("{line}");
         }
@@ -227,11 +253,15 @@ fn log_sort_phase_timing(snapshot: &StatsSnapshot) {
 /// per-phase breakdown re-derived from the end-of-run stats snapshot.
 pub(crate) struct SortPhaseTimingFinalizeHook {
     pub(crate) stats: Arc<PipelineStats>,
+    /// Consolidation time to split out of the `SpillWrite` bucket; `None` when
+    /// the chain has no spill writer.
+    pub(crate) spill_stats: Option<Arc<SpillRunStats>>,
 }
 
 impl FinalizeHook for SortPhaseTimingFinalizeHook {
     fn finalize(self: Box<Self>) -> Result<()> {
-        log_sort_phase_timing(&self.stats.snapshot());
+        let consolidation_ns = self.spill_stats.as_ref().map_or(0, |s| s.consolidation_nanos());
+        log_sort_phase_timing(&self.stats.snapshot(), consolidation_ns);
         Ok(())
     }
 }
@@ -263,6 +293,7 @@ mod tests {
                 runs_written: 3,
                 ..Default::default()
             }))),
+            spill_stats: None,
             output_path: PathBuf::from("out.bam"),
             timer: OperationTimer::new("Sort"),
         };
@@ -277,6 +308,40 @@ mod tests {
             !logs.iter().any(|line| line.contains("Temporary runs:")),
             "must not emit the old 'Temporary runs:' wording; got: {logs:?}"
         );
+    }
+
+    /// With a spill writer attached the summary reports the consolidations it took
+    /// to honor `--max-temp-files` and the merge fan-in beside the runs written.
+    #[test]
+    fn sort_summary_reports_spill_consolidation() {
+        let _session = capture_logs();
+
+        let spill = Arc::new(SpillRunStats::default());
+        for _ in 0..5 {
+            spill.record_run_written();
+        }
+        spill.record_consolidation(std::time::Duration::from_millis(1500));
+        spill.record_consolidation(std::time::Duration::from_millis(500));
+        spill.set_merge_sources(3);
+        let hook = SortSummaryFinalizeHook {
+            stats_slot: Arc::new(Mutex::new(Some(fgumi_sort::SortStats {
+                // `SortMerge` reports the runs written, from the same spill stats.
+                runs_written: 5,
+                ..Default::default()
+            }))),
+            spill_stats: Some(spill),
+            output_path: PathBuf::from("out.bam"),
+            timer: OperationTimer::new("Sort"),
+        };
+        Box::new(hook).finalize().expect("finalize must succeed");
+
+        let logs = captured();
+        for expected in ["Spill runs: 5", "Consolidations: 2 (2.0s)", "Merge sources: 3"] {
+            assert!(
+                logs.iter().any(|line| line.contains(expected)),
+                "expected a '{expected}' log line; got: {logs:?}"
+            );
+        }
     }
 
     // ── Sort phase timing (`=== Sort Phase Timing ===`) ──────────────────────
@@ -318,19 +383,30 @@ mod tests {
             ("FindBoundariesAndSort", 400), // in-memory sort = 400
             ("SpillGather", 10),
             ("SpillBlockCompress", 20),
-            ("SpillWrite", 30),          // spill write = 60
-            ("SortSpillDecompress", 50), // consolidation = 50
-            ("SortMerge", 500),          // k-way merge = 500
+            ("SpillWrite", 30),          // spill write = 60, less consolidation
+            ("SortSpillDecompress", 50), // merge-source read-ahead: k-way merge
+            ("SortMerge", 500),          // k-way merge = 550
             ("BgzfCompress", 5),
             ("WriteBgzfFile", 15), // write output = 20
         ]);
-        let phase_ns = summarize_sort_phases(&snap);
+        // 25ns of `SpillWrite`'s busy time was spent consolidating runs.
+        let phase_ns = summarize_sort_phases(&snap, 25);
         assert_eq!(phase_ns[SortPhase::ReadDecompress as usize], 300);
         assert_eq!(phase_ns[SortPhase::InMemorySort as usize], 400);
-        assert_eq!(phase_ns[SortPhase::SpillWrite as usize], 60);
-        assert_eq!(phase_ns[SortPhase::Consolidation as usize], 50);
-        assert_eq!(phase_ns[SortPhase::KWayMerge as usize], 500);
+        assert_eq!(phase_ns[SortPhase::SpillWrite as usize], 35);
+        assert_eq!(phase_ns[SortPhase::Consolidation as usize], 25);
+        assert_eq!(phase_ns[SortPhase::KWayMerge as usize], 550);
         assert_eq!(phase_ns[SortPhase::WriteOutput as usize], 20);
+    }
+
+    /// Consolidation time can never exceed the spill-write bucket it is carved
+    /// out of (the counter and the step timer are sampled independently), so an
+    /// over-report is clamped instead of underflowing.
+    #[test]
+    fn summarize_clamps_consolidation_to_the_spill_write_bucket() {
+        let phase_ns = summarize_sort_phases(&snapshot_with_steps(vec![("SpillWrite", 10)]), 99);
+        assert_eq!(phase_ns[SortPhase::SpillWrite as usize], 0);
+        assert_eq!(phase_ns[SortPhase::Consolidation as usize], 10);
     }
 
     /// The `SortBuffer` ingest step (the SAM/RecordBatch arena front) buckets
@@ -338,7 +414,7 @@ mod tests {
     /// `FindBoundariesAndSort` does not.
     #[test]
     fn summarize_maps_sort_buffer_ingest_to_in_memory_sort() {
-        let phase_ns = summarize_sort_phases(&snapshot_with_steps(vec![("SortBuffer", 42)]));
+        let phase_ns = summarize_sort_phases(&snapshot_with_steps(vec![("SortBuffer", 42)]), 0);
         assert_eq!(phase_ns[SortPhase::InMemorySort as usize], 42);
         assert_eq!(phase_ns.iter().sum::<u64>(), 42);
     }
@@ -347,12 +423,15 @@ mod tests {
     fn summarize_ignores_non_sort_steps() {
         // Adapter / other-stage step names (e.g. a fused sort→group chain) must
         // not land in any sort phase bucket.
-        let phase_ns = summarize_sort_phases(&snapshot_with_steps(vec![
-            ("SortMerge", 100),
-            ("DecodeFromRecords", 999),
-            ("GroupBam", 999),
-            ("TemplatesToRecordBatch", 999),
-        ]));
+        let phase_ns = summarize_sort_phases(
+            &snapshot_with_steps(vec![
+                ("SortMerge", 100),
+                ("DecodeFromRecords", 999),
+                ("GroupBam", 999),
+                ("TemplatesToRecordBatch", 999),
+            ]),
+            0,
+        );
         assert_eq!(phase_ns[SortPhase::KWayMerge as usize], 100);
         assert_eq!(
             phase_ns.iter().sum::<u64>(),
@@ -372,7 +451,7 @@ mod tests {
             detached: vec![(0, "WriteBgzfFile", 999_999, 0, 0)],
             edges: Vec::new(),
         };
-        let phase_ns = summarize_sort_phases(&snap);
+        let phase_ns = summarize_sort_phases(&snap, 0);
         assert_eq!(
             phase_ns[SortPhase::WriteOutput as usize],
             100,
@@ -395,7 +474,7 @@ mod tests {
     #[case::spill_block_compress("SpillBlockCompress", SortPhase::SpillWrite)]
     #[case::spill_write("SpillWrite", SortPhase::SpillWrite)]
     #[case::compress_spill("CompressSpill", SortPhase::SpillWrite)]
-    #[case::spill_decompress("SortSpillDecompress", SortPhase::Consolidation)]
+    #[case::spill_decompress("SortSpillDecompress", SortPhase::KWayMerge)]
     #[case::merge("SortMerge", SortPhase::KWayMerge)]
     #[case::bgzf_compress("BgzfCompress", SortPhase::WriteOutput)]
     #[case::write_file("WriteBgzfFile", SortPhase::WriteOutput)]
@@ -445,10 +524,10 @@ mod tests {
     #[test]
     fn log_sort_phase_timing_emits_the_block_for_a_populated_snapshot() {
         let _session = capture_logs();
-        log_sort_phase_timing(&snapshot_with_steps(vec![
-            ("SortMerge", 500_000_000),
-            ("WriteBgzfFile", 500_000_000),
-        ]));
+        log_sort_phase_timing(
+            &snapshot_with_steps(vec![("SortMerge", 500_000_000), ("WriteBgzfFile", 500_000_000)]),
+            0,
+        );
         let logs = captured();
         assert!(
             logs.iter().any(|l| l.contains("=== Sort Phase Timing ===")),
@@ -461,7 +540,7 @@ mod tests {
     #[test]
     fn log_sort_phase_timing_is_silent_for_an_empty_snapshot() {
         let _session = capture_logs();
-        log_sort_phase_timing(&snapshot_with_steps(vec![]));
+        log_sort_phase_timing(&snapshot_with_steps(vec![]), 0);
         assert!(
             !captured().iter().any(|l| l.contains("Sort Phase Timing")),
             "no block should be logged when no sort work was recorded"

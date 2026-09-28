@@ -71,6 +71,7 @@ impl SpillBlockCompress {
             SpillBlockEvent::Block {
                 ordinal,
                 file_id,
+                key_kind,
                 is_last_in_file,
                 records_ingested_so_far,
                 bytes,
@@ -84,6 +85,7 @@ impl SpillBlockCompress {
                 Ok(SpillBlockEvent::Block {
                     ordinal,
                     file_id,
+                    key_kind,
                     is_last_in_file,
                     records_ingested_so_far,
                     bytes: compressed,

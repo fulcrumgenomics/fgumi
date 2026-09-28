@@ -62,7 +62,7 @@ use std::collections::VecDeque;
 use std::io;
 
 use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;
-use fgumi_sort::{RunBound, frame_keyed_record_into};
+use fgumi_sort::{RunBound, SpillKeyKind, frame_keyed_record_into};
 use log::info;
 
 use crate::sort::protocol::{MemoryChunkErased, SortChunkEvent, SpillBlockEvent};
@@ -173,6 +173,7 @@ struct ActiveSpill {
 struct HeldBlock {
     bytes: Vec<u8>,
     file_id: u32,
+    key_kind: SpillKeyKind,
     records_ingested_so_far: u64,
 }
 
@@ -267,6 +268,7 @@ impl SpillGather {
         self.pending.push_back(SpillBlockEvent::Block {
             ordinal,
             file_id: hb.file_id,
+            key_kind: hb.key_kind,
             is_last_in_file: is_last,
             records_ingested_so_far: hb.records_ingested_so_far,
             bytes: hb.bytes,
@@ -360,9 +362,10 @@ impl SpillGather {
                 let len = active.chunk.len();
                 let mut bytes = Vec::with_capacity(block_size + 1024);
                 let next = frame_one_block(&active.chunk, active.next_idx, block_size, &mut bytes)?;
-                (bytes, next, next >= len, active.file_id, active.records_ingested_so_far)
+                let key_kind = active.chunk.key_kind();
+                (bytes, next, next >= len, active.file_id, key_kind, active.records_ingested_so_far)
             };
-            let (bytes, next_idx, is_last, file_id, records_ingested_so_far) = framed;
+            let (bytes, next_idx, is_last, file_id, key_kind, records_ingested_so_far) = framed;
             if is_last {
                 // Withhold the run's final block: it is closed lazily once we know
                 // whether the next chunk extends this run (see `stage_event` /
@@ -370,7 +373,12 @@ impl SpillGather {
                 // before this chunk was staged, so nothing is being overwritten —
                 // `HeldSlot::put` hard-asserts that invariant (overwriting would
                 // silently drop a whole spill block, i.e. lose records).
-                self.held_last_block.put(HeldBlock { bytes, file_id, records_ingested_so_far });
+                self.held_last_block.put(HeldBlock {
+                    bytes,
+                    file_id,
+                    key_kind,
+                    records_ingested_so_far,
+                });
                 self.active = None;
                 return Ok(());
             }
@@ -378,6 +386,7 @@ impl SpillGather {
             self.pending.push_back(SpillBlockEvent::Block {
                 ordinal,
                 file_id,
+                key_kind,
                 is_last_in_file: false,
                 records_ingested_so_far,
                 bytes,

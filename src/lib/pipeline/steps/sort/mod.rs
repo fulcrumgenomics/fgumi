@@ -3,7 +3,7 @@
 pub use fgumi_pipeline_io::sort::{
     BlockOutput, CompressSpill, MergeBatchBuilder, MergeOutput, RecordBatchOutput,
     SORT_COORD_GROUP, SORT_IO_GROUP, SortBuffer, SortDecompressTuning, SortMerge,
-    SortSpillDecompress, SpillBlockCompress, SpillGather, SpillWrite, protocol,
+    SortSpillDecompress, SpillBlockCompress, SpillGather, SpillRunStats, SpillWrite, protocol,
 };
 
 pub mod compress_spill {

@@ -5964,7 +5964,7 @@ fn slot_try_load_block(
 /// (key extracted from the body), else `K::SERIALIZED_SIZE`. Variable-length
 /// non-embedded keys are unsupported on the slot path (none exist in
 /// production — every slot-path key is embedded).
-fn slot_key_size<K: RawSortKey>() -> Result<usize> {
+pub(crate) fn slot_key_size<K: RawSortKey>() -> Result<usize> {
     if K::EMBEDDED_IN_RECORD {
         Ok(0)
     } else {
@@ -5976,7 +5976,10 @@ fn slot_key_size<K: RawSortKey>() -> Result<usize> {
 
 /// Parse a sort key from `bytes`: extracted from the body for embedded keys, or
 /// deserialized from the `key_size`-byte prefix for non-embedded keys.
-fn slot_parse_key<K: RawSortKey + Default + 'static>(key_bytes: &[u8], body: &[u8]) -> Result<K> {
+pub(crate) fn slot_parse_key<K: RawSortKey + Default + 'static>(
+    key_bytes: &[u8],
+    body: &[u8],
+) -> Result<K> {
     if K::EMBEDDED_IN_RECORD {
         // An embedded key is read out of the body, so an empty body cannot
         // carry one. Every extractor indexes straight into the slice
