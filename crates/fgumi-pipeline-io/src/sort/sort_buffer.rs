@@ -34,8 +34,9 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use fgumi_bam_io::ProgressTracker;
+use fgumi_raw_bam::SamTag;
 use fgumi_sort::{
-    PooledSegmentedBuf, QuerynameComparator, RawExternalSorter, RawQuerynameKey,
+    KeyTypesSpec, PooledSegmentedBuf, QuerynameComparator, RawExternalSorter, RawQuerynameKey,
     RawQuerynameLexKey, SegmentedBuf, SortOrder, TemplateArenaAccumulator,
 };
 use noodles::sam::Header;
@@ -121,6 +122,39 @@ impl<S: ArenaSortStrategy> ArenaAccum<S> {
     }
 }
 
+/// Everything a [`SortBuffer`] reads to provision its arena sorter — and
+/// nothing else, so a caller cannot set a knob here that the buffer ignores
+/// (the failure mode of configuring it through a whole [`RawExternalSorter`]).
+#[derive(Debug, Clone, Copy)]
+pub struct SortBufferConfig {
+    /// The order to sort into.
+    pub sort_order: SortOrder,
+    /// In-memory budget, in bytes, before a sorted run is emitted.
+    pub memory_limit: usize,
+    /// Phase-1 (in-memory sort) worker count.
+    pub sort_threads: usize,
+    /// Cell barcode tag for template-coordinate order.
+    pub cell_tag: Option<SamTag>,
+    /// Template-coordinate key-lane spec.
+    pub key_types: KeyTypesSpec,
+}
+
+impl SortBufferConfig {
+    /// The subset of `sorter`'s configuration a [`SortBuffer`] reads.
+    #[must_use]
+    pub fn from_sorter(sorter: &RawExternalSorter) -> Self {
+        Self {
+            sort_order: sorter.sort_order(),
+            memory_limit: sorter.memory_limit_bytes(),
+            // Phase-1 count honors the `--sort-threads` override (falls back to
+            // `--threads`); `num_threads()` would drop the override silently.
+            sort_threads: sorter.phase1_threads(),
+            cell_tag: sorter.cell_tag_value(),
+            key_types: sorter.key_types_spec(),
+        }
+    }
+}
+
 /// Order-erased record-input arena sorter. Each variant pairs an [`ArenaAccum`]
 /// with the concrete [`ArenaSortStrategy`] for its order, so `SortBuffer` drives
 /// the same per-order sort engine as the block-input `FindBoundariesAndSort`.
@@ -132,15 +166,12 @@ enum ChunkSorter {
 }
 
 impl ChunkSorter {
-    /// Build the arena sorter matching `sorter.sort_order()`, provisioning each
+    /// Build the arena sorter matching `config.sort_order`, provisioning each
     /// order's strategy exactly as the block-input arena front does.
-    #[allow(clippy::needless_pass_by_value)] // by-value keeps the caller's move-in; only read here
-    fn from_sorter(sorter: RawExternalSorter, header: &Header) -> Result<Self> {
-        let memory_limit = sorter.memory_limit_bytes();
-        // Phase-1 count honors the `--sort-threads` override (falls back to
-        // `--threads`); `num_threads()` would drop the override silently.
-        let sort_threads = sorter.phase1_threads();
-        Ok(match sorter.sort_order() {
+    fn new(config: SortBufferConfig, header: &Header) -> Result<Self> {
+        let SortBufferConfig { sort_order, memory_limit, sort_threads, cell_tag, key_types } =
+            config;
+        Ok(match sort_order {
             SortOrder::Coordinate => {
                 let n_ref = u32::try_from(header.reference_sequences().len())
                     .map_err(|_| anyhow!("reference sequence count overflows u32"))?;
@@ -151,11 +182,7 @@ impl ChunkSorter {
                 ))
             }
             SortOrder::TemplateCoordinate => {
-                let acc = TemplateArenaAccumulator::from_header(
-                    header,
-                    sorter.cell_tag_value(),
-                    sorter.key_types_spec(),
-                );
+                let acc = TemplateArenaAccumulator::from_header(header, cell_tag, key_types);
                 Self::Template(ArenaAccum::new(
                     TemplateStrategy::new(acc),
                     memory_limit,
@@ -333,12 +360,24 @@ impl SortBuffer {
     /// a `u32` (the coordinate key's reference field). That conversion is the
     /// only fallible step: the template path's `TemplateArenaAccumulator::from_header`
     /// is infallible here.
+    #[allow(clippy::needless_pass_by_value)] // by-value keeps the caller's move-in; only read here
     pub fn from_sorter(
         sorter: RawExternalSorter,
         header: &Header,
         output_byte_limit: u64,
     ) -> Result<Self> {
-        let chunk_sorter = ChunkSorter::from_sorter(sorter, header)?;
+        Self::new(SortBufferConfig::from_sorter(&sorter), header, output_byte_limit)
+    }
+
+    /// Build a `SortBuffer` from exactly the configuration it reads (see
+    /// [`SortBufferConfig`]), writing sorted chunks bounded by
+    /// `output_byte_limit` bytes.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_sorter`].
+    pub fn new(config: SortBufferConfig, header: &Header, output_byte_limit: u64) -> Result<Self> {
+        let chunk_sorter = ChunkSorter::new(config, header)?;
         Ok(Self {
             sorter: Some(chunk_sorter),
             pending: VecDeque::new(),
@@ -583,7 +622,8 @@ mod tests {
             .memory_limit(memory_limit)
             .threads(1)
             .key_types(KeyTypesSpec::None);
-        ChunkSorter::from_sorter(sorter, &Header::default()).expect("build template chunk sorter")
+        ChunkSorter::new(SortBufferConfig::from_sorter(&sorter), &Header::default())
+            .expect("build template chunk sorter")
     }
 
     /// A push failure must stop ingest at the offending record and leave the

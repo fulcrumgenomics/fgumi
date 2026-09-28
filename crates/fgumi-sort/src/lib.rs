@@ -240,7 +240,8 @@ pub use codec::SpillCodec;
 pub use external::MemorySources;
 pub use external::{
     KeyTypesSpec, LibraryLookup, MergeDriver, MergeDriverDyn, MergeStep, RawExternalSorter,
-    ReadStreams, cb_hasher, extract_template_key_inline, format_thread_counts, open_spill_slot,
+    ReadStreams, cb_hasher, create_sort_temp_dirs, extract_template_key_inline,
+    format_thread_counts, open_spill_slot,
 };
 pub use fd_limit::{
     FALLBACK_MAX_TEMP_FILES, fits_nofile_budget, resolve_temp_file_limit, soft_nofile,

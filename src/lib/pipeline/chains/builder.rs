@@ -3132,7 +3132,7 @@ impl<'a> ChainBuilder<'a> {
                 BlockOutput, RecordBatchOutput, SortBuffer, SortDecompressTuning, SortMerge,
                 SortSpillDecompress, SpillBlockCompress, SpillGather, SpillRunStats, SpillWrite,
             };
-            use fgumi_sort::{RawExternalSorter, SortOrder};
+            use fgumi_sort::SortOrder;
 
             // `auto` is honorable only for a sole-`[Sort]` chain (standalone
             // sort): it owns the whole budget. In a fused chain sort shares the
@@ -3187,45 +3187,34 @@ impl<'a> ChainBuilder<'a> {
             // applied conditionally rather than hardcoded.
             let sort_order: SortOrder = sort.order.into();
             let cell_tag = crate::commands::sort::parse_cell_tag(sort.order)?;
-            // Honor the requested spill codec (`SortSpillDecompress` handles both
-            // BGZF and zstd). Standalone sort may request `bgzf` to pair with
-            // `--temp-compression 0` (uncompressed spill); runall leaves it at
-            // the zstd default. Omitting this previously forced the sorter's
-            // default codec, breaking the uncompressed-bgzf spill path.
-            let mut sorter = RawExternalSorter::new(sort_order)
-                .memory_limit(total_memory)
-                .threads(num_threads.max(1))
-                .sort_threads(num_phase1_threads)
-                .merge_threads(num_phase2_threads)
-                .output_compression(1)
-                .temp_compression(sort.temp_compression)
-                .spill_codec(sort.temp_codec);
-            if let Some(ct) = cell_tag {
-                sorter = sorter.cell_tag(ct);
-            }
-            // Honor `--key-types` (template-coordinate only): the arena template
-            // accumulator (`TemplateArenaAccumulator`) provisions the dropped-lane
-            // variant from this and validates that dropped lanes are constant.
-            // Previously the streaming production path ignored it entirely.
-            if let Some(kt) = sort.key_types {
-                sorter = sorter.key_types(kt);
-            }
+            // What the record-input `SortBuffer` reads — exactly its inputs, so
+            // no knob can be set here and silently ignored (the chain once
+            // configured it through a whole `RawExternalSorter`, whose
+            // `max_temp_files` it never read back: #991). Everything else comes
+            // straight from `sort` / the locals above: the spill codec and
+            // compression, the Phase-2 thread count, `--max-temp-files`, and the
+            // output compression (from `spec.compression` via the sink).
+            // `--key-types` (template-coordinate only) provisions the arena
+            // accumulator's dropped-lane variant, which validates that dropped
+            // lanes are constant.
+            let buffer_config = fgumi_pipeline_io::sort::SortBufferConfig {
+                sort_order,
+                memory_limit: total_memory,
+                sort_threads: num_phase1_threads,
+                cell_tag,
+                key_types: sort.key_types.unwrap_or_default(),
+            };
 
-            if !sort.tmp_dirs.is_empty() {
-                sorter = sorter.temp_dirs(sort.tmp_dirs.clone());
-            }
-
-            // Thread `--max-temp-files` through: `Auto` resolves against the host
+            // Resolve `--max-temp-files`: `Auto` resolves against the host
             // `RLIMIT_NOFILE` (one snapshot), matching the standalone
-            // `Sort::resolved_max_temp_files`. Without this the chain used the
-            // engine's portable fallback and silently ignored the CLI value.
+            // `Sort::resolved_max_temp_files`. The `SpillWrite` step enforces it
+            // (`with_max_temp_files` below) on every Phase-1 head.
             let resolved_max_temp_files = match sort.max_temp_files {
                 crate::commands::common::MaxTempFiles::Auto => {
                     fgumi_sort::temp_file_limit_from_nofile(fgumi_sort::soft_nofile())
                 }
                 crate::commands::common::MaxTempFiles::Fixed(n) => n,
             };
-            sorter = sorter.max_temp_files(resolved_max_temp_files);
 
             // NOTE: the legacy `build_sort_step` clamped the sorter's *initial*
             // in-memory capacity (768 MiB/thread) for standalone `--max-memory
@@ -3313,8 +3302,7 @@ impl<'a> ChainBuilder<'a> {
             // emits `SortPhase1Event`, so `SortSpillDecompress`/`SortMerge` are
             // identical downstream regardless of order.
             let phase1_tail = {
-                let (temp_dirs, alloc) = sorter
-                    .create_spill_dirs()
+                let (temp_dirs, alloc) = fgumi_sort::create_sort_temp_dirs(&sort.tmp_dirs)
                     .map_err(|e| anyhow!("create spill temp dirs: {e}"))?;
                 let temp_codec = sort.temp_codec;
                 let temp_compression = sort.temp_compression;
@@ -3337,10 +3325,6 @@ impl<'a> ChainBuilder<'a> {
                     use fgumi_sort::{QuerynameComparator, RawQuerynameKey, RawQuerynameLexKey};
                     let n_ref = u32::try_from(self.header.reference_sequences().len())
                         .map_err(|_| anyhow!("reference sequence count overflows u32"))?;
-                    // sorter is not consumed by this branch; the spill dirs/alloc it
-                    // owns were already taken above (create_spill_dirs). Drop it to
-                    // silence the unused-variable warning.
-                    drop(sorter);
                     // `total_memory` is the full in-memory budget (--max-memory ×
                     // threads). ReadBlocks sizes its arena segment to hold one
                     // full-budget run, so data that fits the budget sorts entirely
@@ -3422,8 +3406,8 @@ impl<'a> ChainBuilder<'a> {
                     self.use_drain_first_scheduler = true;
                     out
                 } else {
-                    let sort_buffer = SortBuffer::from_sorter(sorter, &self.header, byte_limit)
-                        .map_err(|e| anyhow!("SortBuffer::from_sorter: {e}"))?
+                    let sort_buffer = SortBuffer::new(buffer_config, &self.header, byte_limit)
+                        .map_err(|e| anyhow!("SortBuffer::new: {e}"))?
                         .with_affinity(affinity);
                     self.pipeline.append_step(sort_buffer, tail)
                 };
