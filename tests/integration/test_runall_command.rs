@@ -2084,6 +2084,145 @@ fn extract_honors_no_check_crc_on_bgzf_fastq() {
     );
 }
 
+/// `runall --start-from extract` over one FASTQ at `fastq` with `extra` flags;
+/// returns the output path and the run's stderr.
+fn run_extract_self_pair(
+    dir: &Path,
+    fastq: &Path,
+    name: &str,
+    extra: &[&str],
+) -> (PathBuf, String) {
+    let out = dir.join(format!("{name}.bam"));
+    let mut args = vec![
+        "runall",
+        "--start-from",
+        "extract",
+        "--stop-after",
+        "extract",
+        "--extract::inputs",
+        p(fastq),
+        "--extract::read-structures",
+        "+T",
+        "--extract::sample",
+        "s1",
+        "--extract::library",
+        "lib1",
+        "-o",
+        p(&out),
+    ];
+    args.extend_from_slice(extra);
+    let output = run_ok(args, &format!("runall extract ({name})"));
+    (out, String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+/// Both FASTQ decode fronts must honor both async-reader flags. The BGZF split
+/// read only the top-level `--async-reader` and the fused readers only
+/// `--extract::async-reader`, so each flag was a silent no-op on the other
+/// path. Pinned through each path's own prefetch log line, plus record
+/// identity with the flag off.
+#[rstest::rstest]
+#[case::split_per_stage_flag(true, "--extract::async-reader", "enabled on the BGZF split")]
+#[case::split_top_level_flag(true, "--async-reader", "enabled on the BGZF split")]
+#[case::fused_per_stage_flag(false, "--extract::async-reader", "enabled: spawning")]
+#[case::fused_top_level_flag(false, "--async-reader", "enabled: spawning")]
+fn extract_async_reader_flags_reach_both_fastq_paths(
+    #[case] bgzf: bool,
+    #[case] flag: &str,
+    #[case] log_needle: &str,
+) {
+    let tmp = TempDir::new().unwrap();
+    let fastq = tmp.path().join("reads.fq.gz");
+    let records: Vec<(String, String, String)> = (0..200)
+        .map(|i| (format!("q{i}"), "ACGTACGTAC".to_string(), "IIIIIIIIII".to_string()))
+        .collect();
+    if bgzf {
+        let mut text = Vec::new();
+        for (n, s, q) in &records {
+            writeln!(text, "@{n}\n{s}\n+\n{q}").unwrap();
+        }
+        crate::helpers::fastq::write_bgzf_fastq(&fastq, &text);
+    } else {
+        let slices: Vec<(&str, &str, &str)> =
+            records.iter().map(|(n, s, q)| (n.as_str(), s.as_str(), q.as_str())).collect();
+        write_gzip_fastq(&fastq, &slices);
+    }
+
+    let (plain, plain_log) = run_extract_self_pair(tmp.path(), &fastq, "plain", &[]);
+    assert!(
+        !plain_log.contains("async FASTQ reader enabled"),
+        "no flag, no prefetch:\n{plain_log}"
+    );
+    let (prefetched, log) = run_extract_self_pair(tmp.path(), &fastq, "prefetched", &[flag]);
+    // Exactly one prefetch per input (one input here): `contains` alone would
+    // pass if some other reader spawned the thread, or if it spawned twice.
+    assert_eq!(
+        log.matches(&format!("async FASTQ reader {log_needle}")).count(),
+        1,
+        "{flag} must reach the {} path, once per input:\n{log}",
+        if bgzf { "BGZF split" } else { "fused reader" }
+    );
+    if bgzf {
+        // On the split, the encoding-detection readers are dropped unread, so
+        // they must not spawn a prefetch thread of their own.
+        assert!(
+            !log.contains("async FASTQ reader enabled: spawning"),
+            "the split must be the only prefetch on BGZF input:\n{log}"
+        );
+    }
+    assert_bams_record_equivalent_nonempty(&prefetched, &plain);
+}
+
+/// `runall --async-reader` now reaches a FASTQ read from stdin too (through the
+/// stdin prefetch wrap), and the records match the same file read directly.
+#[test]
+fn extract_async_reader_prefetches_stdin_fastq() {
+    let tmp = TempDir::new().unwrap();
+    let fastq = tmp.path().join("reads.fq.gz");
+    let records: Vec<(String, String, String)> = (0..200)
+        .map(|i| (format!("q{i}"), "ACGTACGTAC".to_string(), "IIIIIIIIII".to_string()))
+        .collect();
+    let slices: Vec<(&str, &str, &str)> =
+        records.iter().map(|(n, s, q)| (n.as_str(), s.as_str(), q.as_str())).collect();
+    write_gzip_fastq(&fastq, &slices);
+    let (from_file, _) = run_extract_self_pair(tmp.path(), &fastq, "from_file", &[]);
+
+    let from_stdin = tmp.path().join("from_stdin.bam");
+    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "runall",
+            "--start-from",
+            "extract",
+            "--stop-after",
+            "extract",
+            "--extract::inputs",
+            "-",
+            "--extract::read-structures",
+            "+T",
+            "--extract::sample",
+            "s1",
+            "--extract::library",
+            "lib1",
+            "--async-reader",
+            "-o",
+            p(&from_stdin),
+        ])
+        .stdin(std::fs::File::open(&fastq).unwrap())
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "runall from stdin failed:\n{log}");
+    assert!(
+        log.contains("async FASTQ reader enabled: spawning fgumi-prefetch thread for stdin"),
+        "--async-reader must reach the stdin FASTQ reader:\n{log}"
+    );
+    assert_eq!(
+        log.matches("async FASTQ reader enabled").count(),
+        1,
+        "stdin must be the only prefetch:\n{log}"
+    );
+    assert_bams_record_equivalent_nonempty(&from_stdin, &from_file);
+}
+
 /// A BAM-source start without `-i` must still be told `--input` is missing,
 /// not be misrouted into FASTQ-source (extract) option handling.
 #[test]

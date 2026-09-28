@@ -122,6 +122,10 @@ pub(crate) enum PendingSource {
         /// `open_fastq_source` from the same extract options the fused readers
         /// use, so the two FASTQ decode fronts cannot disagree.
         split_verify_crc: bool,
+        /// Whether the BGZF split wraps each re-opened file in an async
+        /// prefetch reader — the extract options' `async_reader`, which the
+        /// fused readers also honor.
+        split_async_reader: bool,
     },
 }
 
@@ -852,22 +856,14 @@ impl<'a> ChainBuilder<'a> {
             spec.stage_opts.extract.as_ref().ok_or_else(|| {
                 anyhow!("a FASTQ source requires extract options in StageOptionsBag")
             })?;
-        let (readers, encoding) = crate::commands::extract::detect_encoding_and_open_fastq_readers(
-            inputs,
-            interleaved,
-            spec.threading.num_threads(),
-            extract_opts.async_reader,
-            extract_opts.check_crc,
-            extract_opts.no_check_crc,
-        )?;
-        let header = crate::pipeline::chains::commands::extract::build_fastq_header(extract_opts)?;
-
         // Parallel block-decode eligibility: only when NOT interleaved (the two
         // halves share one physical stream, so there are no separate files to
         // block-read) and EVERY input is a reopenable, non-stdin BGZF file.
         // Plain gzip is a single DEFLATE stream — no blocks to parallelize — so a
         // mixed or all-gzip set falls back to the fused readers, which handle
         // every format. `readers` and `bgzf_paths` line up 1:1 by stream index.
+        // Decided before the readers open (it only sniffs the files) so the
+        // split case can skip their prefetch wrap below.
         let bgzf_paths = if !interleaved
             && !inputs.is_empty()
             && inputs.iter().all(|p| crate::commands::extract::is_bgzf_fastq_file(p))
@@ -876,6 +872,20 @@ impl<'a> ChainBuilder<'a> {
         } else {
             None
         };
+        // On the split the fused readers only serve encoding detection and are
+        // then dropped; the split re-opens each file and applies its own
+        // prefetch (`split_async_reader`). Wrapping them too would spawn a
+        // second, unread prefetch thread per file.
+        let (readers, encoding) = crate::commands::extract::detect_encoding_and_open_fastq_readers(
+            inputs,
+            interleaved,
+            spec.threading.num_threads(),
+            extract_opts.async_reader && bgzf_paths.is_none(),
+            extract_opts.check_crc,
+            extract_opts.no_check_crc,
+        )?;
+        let header = crate::pipeline::chains::commands::extract::build_fastq_header(extract_opts)?;
+
         // The split's CRC policy, from the same extract options the fused
         // readers above used — NOT `spec.verify_crc`, which is the BAM/SAM
         // source's knob (a command that left it hardcoded, as runall did, made
@@ -899,6 +909,7 @@ impl<'a> ChainBuilder<'a> {
                 force_round_robin: interleaved,
                 bgzf_paths,
                 split_verify_crc,
+                split_async_reader: extract_opts.async_reader,
             },
         ))
     }
@@ -926,6 +937,7 @@ impl<'a> ChainBuilder<'a> {
         &mut self,
         paths: &[std::path::PathBuf],
         verify_crc: bool,
+        async_reader: bool,
         num_threads: usize,
         batch_records: usize,
         byte_limit: u64,
@@ -942,10 +954,12 @@ impl<'a> ChainBuilder<'a> {
         // Honor --async-reader here too: the split re-opens each file raw, so
         // (unlike the fused path, which wraps in `open_fastq_reader`) it must
         // apply the prefetch wrap itself, or the flag would be a silent no-op
-        // for the common all-bgzip case. The prefetch reads raw compressed
-        // bytes — decode-agnostic — so wrapping the raw file before
-        // `read_raw_blocks` frames it is correct.
-        let async_reader = self.spec.async_reader;
+        // for the common all-bgzip case. `async_reader` comes from the extract
+        // options (see `split_async_reader`), as the fused path's does —
+        // `spec.async_reader` is the BAM/SAM source's knob, and a command that
+        // set only one of the two left the other FASTQ path ignoring it. The
+        // prefetch reads raw compressed bytes — decode-agnostic — so wrapping
+        // the raw file before `read_raw_blocks` frames it is correct.
 
         // Build one stream's 3-step split sub-chain, returning its tail
         // (emitting FastqRawChunk). Each stream is its OWN edge into
@@ -966,6 +980,11 @@ impl<'a> ChainBuilder<'a> {
                 // carries the kernel hints `PrefetchReader` issues).
                 let reader: Box<dyn std::io::Read + Send> = if async_reader {
                     fgumi_bam_io::os_hints::advise_sequential(&file);
+                    log::info!(
+                        "async FASTQ reader enabled on the BGZF split: spawning fgumi-prefetch \
+                         thread for {}",
+                        path.display()
+                    );
                     Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::from_file(file))
                 } else {
                     Box::new(file)
@@ -1271,6 +1290,7 @@ impl<'a> ChainBuilder<'a> {
                 force_round_robin,
                 bgzf_paths,
                 split_verify_crc,
+                split_async_reader,
             } => {
                 use crate::pipeline::core::step::Affinity;
                 use crate::pipeline::steps::source::read_fastq::{
@@ -1352,6 +1372,7 @@ impl<'a> ChainBuilder<'a> {
                     self.build_bgzf_fastq_split(
                         &paths,
                         split_verify_crc,
+                        split_async_reader,
                         num_threads,
                         batch_records,
                         byte_limit,
