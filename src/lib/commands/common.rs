@@ -778,6 +778,96 @@ fn resolve_output_identity(path: &Path) -> (PathBuf, Option<&std::ffi::OsStr>) {
     (resolved, path.file_name())
 }
 
+/// Whether `a` and `b` name the same file.
+///
+/// Prefers filesystem identity when both paths exist: `std::fs::metadata`
+/// follows symlinks, so this collapses symlink aliases onto their target, and
+/// unlike a canonical-path comparison it detects hard links (same dev+inode,
+/// different path). Falls back to canonical-path comparison, then to the
+/// canonical-parent-plus-file-name identity, when either file does not exist
+/// yet, so differently spelled paths to one future file still match.
+pub(crate) fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return ma.dev() == mb.dev() && ma.ino() == mb.ino();
+        }
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        // A path that does not exist yet has no canonical form; compare the
+        // identity `reject_output_collisions` uses (canonical parent + file
+        // name), so `r.bam` and `./r.bam` still name the same file.
+        _ => resolve_output_identity(a) == resolve_output_identity(b),
+    }
+}
+
+/// Reject any write target that is the same file as one of the command's
+/// inputs, which would truncate the file being read.
+///
+/// Identity is [`paths_refer_to_same_file`] (dev+inode on unix), so symlinks,
+/// hard links and `./`/`..` spellings are all caught. Only an existing output
+/// can alias an existing input, so a not-yet-created target is left for the
+/// writer. A stdin input (`-` or `/dev/stdin`) is compared against what fd 0
+/// actually is — the redirected file under `-i - < in.bam` — and a stdout or
+/// null-device output is skipped (it names no file to clobber). Each path
+/// carries the flag label that named it, so the error points at the two
+/// offending options. Use it alongside [`reject_output_collisions`], which
+/// handles output-vs-output.
+///
+/// # Errors
+///
+/// Returns an error naming both flags if any output aliases any input.
+pub(crate) fn reject_writes_aliasing_inputs(
+    inputs: &[(&Path, &str)],
+    outputs: &[(&Path, &str)],
+) -> anyhow::Result<()> {
+    for &(input, input_flag) in inputs {
+        for &(path, flag) in outputs {
+            if is_stdout_path(path) || is_null_device(path) || std::fs::metadata(path).is_err() {
+                continue;
+            }
+            let aliases = if fgumi_bam_io::is_stdin_path(input) {
+                stdin_is_file(path)
+            } else {
+                std::fs::metadata(input).is_ok() && paths_refer_to_same_file(input, path)
+            };
+            if aliases {
+                anyhow::bail!(
+                    "{flag} '{}' is the same file as {input_flag} '{}'; choose a different path",
+                    path.display(),
+                    input.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether this process's stdin is the existing file at `path`, by fstat of a
+/// duplicate of fd 0 (a path such as `/dev/stdin` does not resolve to the
+/// redirected file on every platform).
+#[cfg(unix)]
+fn stdin_is_file(path: &Path) -> bool {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
+    let Ok(fd) = std::io::stdin().as_fd().try_clone_to_owned() else {
+        return false;
+    };
+    match (std::fs::File::from(fd).metadata(), std::fs::metadata(path)) {
+        (Ok(stdin), Ok(file)) => stdin.dev() == file.dev() && stdin.ino() == file.ino(),
+        _ => false,
+    }
+}
+
+/// Non-unix platforms have no portable fd identity; a stdin input is not
+/// checked there.
+#[cfg(not(unix))]
+fn stdin_is_file(_path: &Path) -> bool {
+    false
+}
+
 /// Options for writing statistics to a file.
 #[derive(Debug, Clone, Default, Args)]
 pub struct StatsOptions {
@@ -2265,6 +2355,60 @@ pub(crate) mod test_log_capture {
 mod tests {
     use super::*;
     use crate::pipeline::core::builder::InstrumentationLevel;
+
+    /// A write target aliasing an input — directly, through `./`, a symlink or a
+    /// hard link — is refused naming both flags; a distinct or not-yet-existing
+    /// target, a stdin input and a null-device output all pass.
+    #[test]
+    fn reject_writes_aliasing_inputs_catches_aliases_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.bam");
+        std::fs::write(&input, b"x").unwrap();
+        let other = dir.path().join("other.bam");
+        std::fs::write(&other, b"y").unwrap();
+        let dotted = dir.path().join(".").join("in.bam");
+        #[allow(unused_mut)]
+        let mut aliases = vec![input.clone(), dotted];
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.bam");
+            std::os::unix::fs::symlink(&input, &link).unwrap();
+            aliases.push(link);
+            // A hard link has its own canonical path; only dev+inode sees it.
+            let hard = dir.path().join("hard.bam");
+            std::fs::hard_link(&input, &hard).unwrap();
+            aliases.push(hard);
+        }
+        let inputs = [(input.as_path(), "--input")];
+
+        for alias in &aliases {
+            let alias = alias.as_path();
+            let err = reject_writes_aliasing_inputs(&inputs, &[(alias, "--rejects")])
+                .expect_err("an aliasing write target must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with("--rejects '") && msg.contains("is the same file as --input '"),
+                "error must name both flags: {msg}"
+            );
+        }
+        let missing = dir.path().join("new.bam");
+        reject_writes_aliasing_inputs(&inputs, &[(other.as_path(), "--output")]).unwrap();
+        reject_writes_aliasing_inputs(&inputs, &[(missing.as_path(), "--output")]).unwrap();
+        reject_writes_aliasing_inputs(
+            &[(Path::new("-"), "--input")],
+            &[(Path::new("-"), "--output")],
+        )
+        .unwrap();
+        reject_writes_aliasing_inputs(&inputs, &[(Path::new("/dev/null"), "--rejects")]).unwrap();
+        // The null device is one file on both sides, so only the null-device
+        // skip lets a `/dev/null` input run with a `/dev/null` output.
+        #[cfg(unix)]
+        reject_writes_aliasing_inputs(
+            &[(Path::new("/dev/null"), "--input")],
+            &[(Path::new("/dev/null"), "--output")],
+        )
+        .unwrap();
+    }
 
     /// `effective_check_crc` truth table (dupblaster policy): an explicit flag
     /// always wins; with neither flag given, the policy falls back to

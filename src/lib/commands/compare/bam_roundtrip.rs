@@ -14,6 +14,7 @@
 //! reordered while still passing this count check. Phase 4's `--preset correct`
 //! is the original design's full equivalence gate.
 
+use crate::commands::common::paths_refer_to_same_file;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -132,36 +133,6 @@ impl Command for CompareBamRoundtrip {
         }
         log::info!("bam-roundtrip: PASS — {input_n} records round-tripped");
         Ok(())
-    }
-}
-
-/// Returns `true` if `a` and `b` resolve to the same on-disk file.
-///
-/// When both files already exist, compares filesystem identity (device + inode
-/// on Unix) so that *hard links* to the same file are caught as well as symlinks
-/// — a hard link shares the input's inode but has a distinct canonical path that
-/// path comparison alone would miss, letting `--output` overwrite the input BAM
-/// mid-run. Falls back to canonical-path comparison, then to a literal path
-/// comparison, when either file does not exist yet (e.g. a fresh `--output`
-/// whose parent cannot be resolved) so an exact-string match is still rejected.
-fn paths_refer_to_same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
-    // Prefer filesystem identity when both paths exist: `std::fs::metadata`
-    // follows symlinks, so this also collapses symlink aliases onto their target,
-    // and unlike a canonical-path compare it detects hard links (same dev+inode,
-    // different path).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
-            return ma.dev() == mb.dev() && ma.ino() == mb.ino();
-        }
-    }
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(ca), Ok(cb)) => ca == cb,
-        // If either side can't be canonicalized (e.g. `b` doesn't exist yet),
-        // fall back to a direct comparison so an exact-string match is still
-        // rejected.
-        _ => a == b,
     }
 }
 

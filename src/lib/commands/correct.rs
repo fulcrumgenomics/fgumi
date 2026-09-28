@@ -665,6 +665,11 @@ impl Command for CorrectUmis {
             outputs.push((path.as_path(), "--metrics"));
         }
         reject_output_collisions(&outputs)?;
+        // A write target aliasing an input — the BAM or a UMI whitelist —
+        // would truncate the file being read.
+        let mut inputs: Vec<(&Path, &str)> = vec![(self.io.input.as_path(), "--input")];
+        inputs.extend(self.umi_files.iter().map(|p| (p.as_path(), "--umi-files")));
+        crate::commands::common::reject_writes_aliasing_inputs(&inputs, &outputs)?;
 
         // The declarative chain builder is the only execution path. `execute`
         // does the reader-free pre-flight above and then always dispatches:

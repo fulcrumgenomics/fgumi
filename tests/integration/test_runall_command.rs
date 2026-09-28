@@ -38,6 +38,7 @@ use tempfile::TempDir;
 use crate::helpers::bam_generator::{
     create_minimal_header, create_test_reference, create_umi_family_at_pos, write_bam,
 };
+use crate::helpers::cutover::decompressed_records_without_pg;
 use crate::helpers::read_bam_output;
 use crate::helpers::{aligner_binary, build_aligner_index, write_gzip_fastq};
 
@@ -1189,6 +1190,805 @@ fn extract_to_correct_with_rejects_matches_staged_chain() {
 
     assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
     assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
+}
+
+/// Writes a `fgumi simulate aligner` replay BAM standing in for the aligner on
+/// an `extract→correct→align` chain over `(r1, r2)`: the standalone
+/// `extract | correct` kept output, which is exactly the template stream the
+/// fused chain feeds its aligner, in the same order. Its records stay unmapped
+/// (valid aligner output), and the header gains the reference's `@SQ` so
+/// `AlignAndMerge`'s dict check passes. This keeps the fused-chain tests
+/// hermetic: no real aligner, so they run in CI.
+#[cfg(feature = "simulate")]
+fn write_correct_replay_bam(dir: &Path, r1: &Path, r2: &Path, reference_len: usize) -> PathBuf {
+    use noodles::sam::alignment::io::Write as _;
+    use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+
+    let extracted = dir.join("replay_extracted.bam");
+    let kept = dir.join("replay_kept.bam");
+    run_ok(
+        [
+            "extract",
+            "--inputs",
+            p(r1),
+            p(r2),
+            "--read-structures",
+            "4M+T",
+            "4M+T",
+            "--sample",
+            "s1",
+            "--library",
+            "lib1",
+            "-o",
+            p(&extracted),
+        ],
+        "replay fixture: extract",
+    );
+    run_ok(
+        [
+            "correct",
+            "-i",
+            p(&extracted),
+            "-o",
+            p(&kept),
+            "--umis",
+            "AAAA",
+            "--umis",
+            "CCCC",
+            "--min-distance",
+            "1",
+        ],
+        "replay fixture: correct",
+    );
+
+    let (mut header, records) = read_bam_output(&kept);
+    header.reference_sequences_mut().insert(
+        bstr::BString::from("chr1"),
+        Map::<ReferenceSequence>::new(std::num::NonZeroUsize::new(reference_len).unwrap()),
+    );
+    let replay = dir.join("replay.bam");
+    let mut writer = noodles::bam::io::Writer::new(std::fs::File::create(&replay).unwrap());
+    writer.write_header(&header).unwrap();
+    for record in &records {
+        writer.write_alignment_record(&header, record).unwrap();
+    }
+    writer.try_finish().unwrap();
+    replay
+}
+
+/// The shared fixture for the fused `correct` rejects tests: a 4000 bp
+/// reference plus a duplex FASTQ pair whose second molecule carries UMIs
+/// (`GGGG`/`TTTT`) four mismatches from every whitelist entry (`AAAA`, `CCCC`),
+/// so its reads are genuinely rejected. Returns `(reference, r1, r2, aligner
+/// command)`, the last replaying [`write_correct_replay_bam`].
+#[cfg(feature = "simulate")]
+fn correct_rejects_fixture(dir: &Path) -> (PathBuf, PathBuf, PathBuf, String) {
+    const REFERENCE_LEN: usize = 4000;
+    let (reference, sequence) = write_unique_reference(dir, REFERENCE_LEN);
+    let molecules = [(500usize, "AAAA", "CCCC"), (2000usize, "GGGG", "TTTT")];
+    let (r1, r2) = write_duplex_umi_fastq(dir, &sequence, &molecules);
+    let replay = write_correct_replay_bam(dir, &r1, &r2, REFERENCE_LEN);
+    let aligner_cmd = format!(
+        "{} simulate aligner --replay-bam {} {{ref}}",
+        env!("CARGO_BIN_EXE_fgumi"),
+        replay.display()
+    );
+    (reference, r1, r2, aligner_cmd)
+}
+
+/// `runall --start-from extract` args through `--stop-after <stop_after>` over
+/// the [`correct_rejects_fixture`] inputs, with the whitelist wired so the
+/// chain includes `correct`. Callers append rejects flags and `-o`.
+#[cfg(feature = "simulate")]
+fn correct_chain_args<'a>(
+    stop_after: &'a str,
+    fixture: &'a (PathBuf, PathBuf, PathBuf, String),
+) -> Vec<&'a str> {
+    let (reference, r1, r2, aligner_cmd) = fixture;
+    let mut args = vec![
+        "runall",
+        "--start-from",
+        "extract",
+        "--stop-after",
+        stop_after,
+        "--extract::inputs",
+        p(r1),
+        p(r2),
+        "--extract::read-structures",
+        "4M+T",
+        "4M+T",
+        "--extract::sample",
+        "s1",
+        "--extract::library",
+        "lib1",
+        "--correct::umis",
+        "AAAA",
+        "--correct::umis",
+        "CCCC",
+        "--correct::min-distance",
+        "1",
+    ];
+    if stop_after != "correct" {
+        args.extend(["--ref", p(reference), "--aligner::command", aligner_cmd]);
+    }
+    args
+}
+
+/// Names of every record in `path`, in file order.
+#[cfg(feature = "simulate")]
+fn record_names(path: &Path) -> Vec<String> {
+    let (_, records) = read_bam_output(path);
+    records.iter().map(|r| r.name().map(ToString::to_string).unwrap_or_default()).collect()
+}
+
+/// `--correct::rejects` on a chain that runs past `correct` (here
+/// `extract→zipper`, so correct feeds the fused Align stage) must write the
+/// same UMI rejects as the `extract→correct` self-pair. It used to be dropped
+/// silently: the run logged the rejected count, exited 0, and wrote no file.
+/// Hermetic via the [`write_correct_replay_bam`] replay aligner.
+#[cfg(feature = "simulate")]
+#[test]
+fn extract_to_zipper_writes_correct_rejects_like_self_pair() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = correct_rejects_fixture(tmp.path());
+
+    let run = |stop_after: &str, out: &Path, rejects: &Path| {
+        let mut args = correct_chain_args(stop_after, &fixture);
+        args.extend(["--correct::rejects", p(rejects), "-o", p(out)]);
+        run_ok(args, &format!("runall extract->{stop_after} --correct::rejects"));
+    };
+
+    let self_pair_rejects = tmp.path().join("self_pair_rejects.bam");
+    run("correct", &tmp.path().join("self_pair.bam"), &self_pair_rejects);
+    let chained_rejects = tmp.path().join("chained_rejects.bam");
+    let chained_out = tmp.path().join("chained.bam");
+    run("zipper", &chained_out, &chained_rejects);
+
+    assert!(
+        chained_rejects.exists(),
+        "--correct::rejects was dropped on the extract->zipper chain: {}",
+        chained_rejects.display()
+    );
+    // Molecule 1 (2 strands x 2 read-pairs x 2 records) is exactly what is rejected.
+    let rejected = record_names(&self_pair_rejects);
+    assert_eq!(rejected.len(), 8, "expected molecule 1's 8 records to be rejected: {rejected:?}");
+    assert!(
+        rejected.iter().all(|n| n.starts_with("mol1_")),
+        "only molecule 1 may be rejected: {rejected:?}"
+    );
+    assert_eq!(
+        decompressed_records_without_pg(&chained_rejects),
+        decompressed_records_without_pg(&self_pair_rejects),
+        "chained correct's rejects must match the self-pair's byte for byte (@PG aside)"
+    );
+    // Kept and rejects must partition the input: molecule 0's templates all
+    // reach the chained output and none of molecule 1's leak into it.
+    let kept = record_names(&chained_out);
+    assert!(
+        kept.iter().all(|n| n.starts_with("mol0_")),
+        "rejected molecule 1 leaked into the chained output: {kept:?}"
+    );
+    assert_eq!(kept.len(), 8, "every molecule-0 record must reach the chained output: {kept:?}");
+}
+
+/// A chained correct that reaches no consensus stage leaves the top-level
+/// `--rejects` unconsumed; the run must say so and point at the per-stage flag
+/// that captures UMI rejects.
+#[cfg(feature = "simulate")]
+#[test]
+fn chained_correct_top_level_rejects_warns_wired_nowhere() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = correct_rejects_fixture(tmp.path());
+    let rejects = tmp.path().join("rejects.bam");
+    let out = tmp.path().join("out.bam");
+    let mut args = correct_chain_args("zipper", &fixture);
+    args.extend(["--rejects", p(&rejects), "-o", p(&out)]);
+    let output = run_ok(args, "runall extract->zipper --rejects");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "--rejects is wired nowhere on this runall chain (it is consumed only by a correct \
+             self-pair or a consensus stage). Use --correct::rejects to capture UMI rejects."
+        ),
+        "expected the wired-nowhere warning with the --correct::rejects hint, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("collects only the consensus stage's rejects"),
+        "no consensus stage runs, so the consensus-rejects warning must not fire:\n{stderr}"
+    );
+    assert!(!rejects.exists(), "nothing consumes --rejects here, so no file may be written");
+}
+
+/// On a correct self-pair given both flags, the top-level `--rejects` wins; a
+/// different `--correct::rejects` is dead and must be reported, not dropped.
+#[cfg(feature = "simulate")]
+#[test]
+fn self_pair_both_rejects_flags_warns_and_writes_top_level_only() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = correct_rejects_fixture(tmp.path());
+    let top = tmp.path().join("top_rejects.bam");
+    let per_stage = tmp.path().join("per_stage_rejects.bam");
+    let out = tmp.path().join("out.bam");
+    let mut args = correct_chain_args("correct", &fixture);
+    args.extend(["--rejects", p(&top), "--correct::rejects", p(&per_stage), "-o", p(&out)]);
+    let output = run_ok(args, "runall extract->correct with both rejects flags");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is ignored: on a correct self-pair the top-level --rejects"),
+        "expected the ignored --correct::rejects warning, got:\n{stderr}"
+    );
+    assert!(!per_stage.exists(), "the ignored --correct::rejects must not be written");
+    assert!(
+        !stderr.contains("--rejects is wired nowhere"),
+        "a self-pair consumes --rejects, so it is not dead:\n{stderr}"
+    );
+    let rejected = record_names(&top);
+    assert_eq!(rejected.len(), 8, "the top-level --rejects must collect molecule 1: {rejected:?}");
+    assert!(
+        rejected.iter().all(|n| n.starts_with("mol1_")),
+        "only molecule 1 may be rejected: {rejected:?}"
+    );
+    let kept = record_names(&out);
+    assert!(
+        kept.len() == 8 && kept.iter().all(|n| n.starts_with("mol0_")),
+        "the kept output must be exactly molecule 0: {kept:?}"
+    );
+}
+
+/// Both rejects flags naming one file — even spelled differently, before the
+/// file exists — are not a conflict on a self-pair, so there is nothing to
+/// warn about.
+#[cfg(feature = "simulate")]
+#[rstest::rstest]
+#[case::same_spelling(false)]
+#[case::dot_slash_spelling(true)]
+fn self_pair_same_rejects_file_on_both_flags_does_not_warn(#[case] dot_slash: bool) {
+    let tmp = TempDir::new().unwrap();
+    let fixture = correct_rejects_fixture(tmp.path());
+    let rejects = tmp.path().join("rejects.bam");
+    let spelled =
+        if dot_slash { tmp.path().join(".").join("rejects.bam") } else { rejects.clone() };
+    let out = tmp.path().join("out.bam");
+    let mut args = correct_chain_args("correct", &fixture);
+    args.extend(["--rejects", p(&rejects), "--correct::rejects", p(&spelled), "-o", p(&out)]);
+    let output = run_ok(args, "runall extract->correct with one rejects file on both flags");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("is ignored"), "one file on both flags is not ignored:\n{stderr}");
+    assert_eq!(record_names(&rejects).len(), 8, "molecule 1 must be rejected");
+}
+
+/// `--start-from correct` on a chain past correct (from an extracted BAM)
+/// writes the same UMI rejects as the correct self-pair on that BAM.
+#[cfg(feature = "simulate")]
+#[test]
+fn correct_start_to_zipper_writes_correct_rejects_like_self_pair() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = correct_rejects_fixture(tmp.path());
+    // `write_correct_replay_bam` leaves the standalone extract output here.
+    let extracted = tmp.path().join("replay_extracted.bam");
+    let (reference, _, _, aligner_cmd) = &fixture;
+    let run = |stop_after: &str, name: &str| -> PathBuf {
+        let rejects = tmp.path().join(format!("{name}_rejects.bam"));
+        let out = tmp.path().join(format!("{name}.bam"));
+        let mut args = vec![
+            "runall",
+            "--start-from",
+            "correct",
+            "--stop-after",
+            stop_after,
+            "-i",
+            p(&extracted),
+            "--correct::umis",
+            "AAAA",
+            "--correct::umis",
+            "CCCC",
+            "--correct::min-distance",
+            "1",
+            "--correct::rejects",
+            p(&rejects),
+            "-o",
+            p(&out),
+        ];
+        if stop_after != "correct" {
+            args.extend(["--ref", p(reference), "--aligner::command", aligner_cmd]);
+        }
+        run_ok(args, &format!("runall correct->{stop_after}"));
+        rejects
+    };
+    let self_pair = run("correct", "self_pair");
+    let chained = run("zipper", "chained");
+    let rejected = record_names(&self_pair);
+    assert!(
+        rejected.len() == 8 && rejected.iter().all(|n| n.starts_with("mol1_")),
+        "the self-pair must reject exactly molecule 1: {rejected:?}"
+    );
+    assert_eq!(
+        decompressed_records_without_pg(&chained),
+        decompressed_records_without_pg(&self_pair),
+        "chained correct's rejects must match the self-pair's"
+    );
+}
+
+/// A consensus-reaching chained correct with only the top-level `--rejects`
+/// must warn that UMI rejects go uncaptured; adding `--correct::rejects`
+/// captures them, so the warning must go away. The warning is emitted before
+/// the chain runs, so a bogus aligner command is enough.
+#[cfg(feature = "consensus")]
+#[test]
+fn chained_consensus_rejects_warning_is_gated_on_correct_rejects() {
+    let tmp = TempDir::new().unwrap();
+    let input = unsorted_bam(tmp.path());
+    let (reference, _) = write_unique_reference(tmp.path(), 2000);
+    let consensus_rejects = tmp.path().join("consensus_rejects.bam");
+    let umi_rejects = tmp.path().join("umi_rejects.bam");
+    let out = tmp.path().join("out.bam");
+    let base = [
+        "runall",
+        "--start-from",
+        "correct",
+        "--stop-after",
+        "consensus",
+        "--consensus",
+        "simplex",
+        "-i",
+        p(&input),
+        "-o",
+        p(&out),
+        "--correct::umis",
+        "ACGT",
+        "--correct::min-distance",
+        "1",
+        "--rejects",
+        p(&consensus_rejects),
+        "--ref",
+        p(&reference),
+        "--aligner::command",
+        "not-a-real-aligner mem {ref} /dev/stdin",
+        "--group::strategy",
+        "adjacency",
+        "--simplex::min-reads",
+        "1",
+    ];
+    let warning = "collects only the consensus stage's rejects, not correct's UMI rejects";
+
+    let without = fgumi(base);
+    let stderr = String::from_utf8_lossy(&without.stderr);
+    assert!(stderr.contains(warning), "expected the uncaptured-UMI-rejects warning:\n{stderr}");
+
+    let with = fgumi(base.iter().copied().chain(["--correct::rejects", p(&umi_rejects)]));
+    let stderr = String::from_utf8_lossy(&with.stderr);
+    assert!(
+        stderr.contains("not-a-real-aligner"),
+        "the run must reach the aligner, past every warning, for the absence to mean anything:\n{stderr}"
+    );
+    assert!(!stderr.contains(warning), "--correct::rejects is set, so no warning:\n{stderr}");
+}
+
+/// On a chained run that reaches consensus, `--correct::rejects` and the
+/// top-level `--rejects` are two different writers (correct's UMI rejects vs
+/// the consensus stage's rejects), so one path given to both must be refused,
+/// naming both flags. Needs no real aligner: the collision guard runs before
+/// the chain is built, and command mode never resolves the aligner binary.
+#[cfg(feature = "consensus")]
+#[test]
+fn chained_correct_rejects_collides_with_consensus_rejects() {
+    let tmp = TempDir::new().unwrap();
+    let input = unsorted_bam(tmp.path());
+    let (reference, _) = write_unique_reference(tmp.path(), 2000);
+    let rejects = tmp.path().join("rejects.bam");
+    assert_rejected_with(
+        [
+            "runall",
+            "--start-from",
+            "correct",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "-i",
+            p(&input),
+            "-o",
+            p(&tmp.path().join("out.bam")),
+            "--correct::umis",
+            "ACGT",
+            "--correct::min-distance",
+            "1",
+            "--correct::rejects",
+            p(&rejects),
+            "--rejects",
+            p(&rejects),
+            "--ref",
+            p(&reference),
+            "--aligner::command",
+            "not-a-real-aligner mem {ref} /dev/stdin",
+            "--group::strategy",
+            "adjacency",
+            "--simplex::min-reads",
+            "1",
+        ],
+        "--correct::rejects and --rejects both write to",
+        "chained --correct::rejects colliding with consensus --rejects",
+    );
+}
+
+/// A rejects path that aliases `--input` would truncate the BAM being read;
+/// runall must refuse it up front and leave the input intact.
+#[test]
+fn correct_rejects_aliasing_input_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    let input = unsorted_bam(tmp.path());
+    let before = std::fs::read(&input).unwrap();
+    assert_rejected_with(
+        [
+            "runall",
+            "--start-from",
+            "correct",
+            "--stop-after",
+            "correct",
+            "-i",
+            p(&input),
+            "-o",
+            p(&tmp.path().join("out.bam")),
+            "--correct::umis",
+            "ACGT",
+            "--correct::min-distance",
+            "1",
+            "--correct::rejects",
+            p(&input),
+        ],
+        &format!("--correct::rejects '{}' is the same file as --input", input.display()),
+        "--correct::rejects aliasing --input",
+    );
+    assert_eq!(std::fs::read(&input).unwrap(), before, "the input BAM must be left untouched");
+}
+
+/// Runs `args`, expecting a refusal whose stderr names `needle`, and checks
+/// that `victim` — the file the refused write would have truncated — is intact.
+fn assert_alias_refused(args: &[&str], needle: &str, victim: &Path) {
+    let before = std::fs::read(victim).unwrap();
+    assert_rejected_with(args, needle, needle);
+    assert_eq!(
+        std::fs::read(victim).unwrap(),
+        before,
+        "{} must be left untouched",
+        victim.display()
+    );
+}
+
+/// Every file runall reads is guarded against a write target that aliases it,
+/// not only `--input`: an extract FASTQ, the zipper `--unmapped` BAM, and a
+/// `-o` spelled as the input.
+#[test]
+fn write_targets_aliasing_other_inputs_are_refused() {
+    let tmp = TempDir::new().unwrap();
+    let input = unsorted_bam(tmp.path());
+    assert_alias_refused(
+        &[
+            "runall",
+            "--start-from",
+            "sort",
+            "--stop-after",
+            "sort",
+            "-i",
+            p(&input),
+            "-o",
+            p(&input),
+        ],
+        &format!("--output '{}' is the same file as --input", input.display()),
+        &input,
+    );
+
+    let (r1, _) = write_extract_correct_fastqs(tmp.path());
+    assert_alias_refused(
+        &[
+            "runall",
+            "--start-from",
+            "extract",
+            "--stop-after",
+            "extract",
+            "--extract::inputs",
+            p(&r1),
+            "--extract::read-structures",
+            "4M+T",
+            "--extract::sample",
+            "s1",
+            "--extract::library",
+            "lib1",
+            "-o",
+            p(&r1),
+        ],
+        &format!("--output '{}' is the same file as --extract::inputs", r1.display()),
+        &r1,
+    );
+
+    let (reference, _) = write_unique_reference(tmp.path(), 2000);
+    let unmapped = tmp.path().join("unmapped.bam");
+    std::fs::copy(&input, &unmapped).unwrap();
+    assert_alias_refused(
+        &[
+            "runall",
+            "--start-from",
+            "zipper",
+            "--stop-after",
+            "zipper",
+            "-i",
+            p(&input),
+            "--unmapped",
+            p(&unmapped),
+            "--ref",
+            p(&reference),
+            "-o",
+            p(&unmapped),
+        ],
+        &format!("--output '{}' is the same file as --unmapped", unmapped.display()),
+        &unmapped,
+    );
+    // The mapped side of a zipper start is `--input`.
+    assert_alias_refused(
+        &[
+            "runall",
+            "--start-from",
+            "zipper",
+            "--stop-after",
+            "zipper",
+            "-i",
+            p(&input),
+            "--unmapped",
+            p(&unmapped),
+            "--ref",
+            p(&reference),
+            "-o",
+            p(&input),
+        ],
+        &format!("--output '{}' is the same file as --input", input.display()),
+        &input,
+    );
+    // The filter stage's own reference.
+    assert_alias_refused(
+        &[
+            "runall",
+            "--start-from",
+            "filter",
+            "--stop-after",
+            "filter",
+            "-i",
+            p(&input),
+            "--filter::min-reads",
+            "1",
+            "--filter::ref",
+            p(&reference),
+            "-o",
+            p(&reference),
+        ],
+        &format!("--output '{}' is the same file as --filter::ref", reference.display()),
+        &reference,
+    );
+}
+
+/// A consensus metrics interval list is a read-only input like any other.
+#[cfg(feature = "consensus")]
+#[test]
+fn write_target_aliasing_consensus_intervals_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    let input = grouped_bam(tmp.path(), "adjacency", "iv");
+    let intervals = tmp.path().join("targets.bed");
+    std::fs::write(&intervals, "chr1\t0\t1000\n").unwrap();
+    let metrics = tmp.path().join("m");
+    assert_alias_refused(
+        &[
+            "runall",
+            "--start-from",
+            "consensus",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "-i",
+            p(&input),
+            "--simplex::min-reads",
+            "1",
+            "--simplex::metrics",
+            p(&metrics),
+            "--simplex::intervals",
+            p(&intervals),
+            "-o",
+            p(&intervals),
+        ],
+        &format!("--output '{}' is the same file as --simplex::intervals", intervals.display()),
+        &intervals,
+    );
+}
+
+/// `-i -` with an unrelated, already-existing output is not an alias: the
+/// stdin identity check must not refuse a legitimate run.
+#[cfg(unix)]
+#[test]
+fn stdin_input_with_an_unrelated_existing_output_is_accepted() {
+    let tmp = TempDir::new().unwrap();
+    let input = unsorted_bam(tmp.path());
+    let out = tmp.path().join("existing_out.bam");
+    std::fs::write(&out, b"stale").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args(["runall", "--start-from", "sort", "--stop-after", "sort", "-i", "-", "-o", p(&out)])
+        .stdin(std::fs::File::open(&input).unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "an unrelated existing output must be accepted:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_, records) = read_bam_output(&out);
+    let (_, input_records) = read_bam_output(&input);
+    assert_eq!(
+        records.len(),
+        input_records.len(),
+        "the sorted output must hold every input record"
+    );
+}
+
+/// The dead top-level `--rejects` hint names `--filter::rejects` only when
+/// filter runs and that flag is unset.
+#[rstest::rstest]
+#[case::filter_chain_hints(&["--start-from", "filter", "--stop-after", "filter"], false, true)]
+#[case::filter_rejects_already_set(&["--start-from", "filter", "--stop-after", "filter"], true, false)]
+#[case::no_filter_no_hint(&["--start-from", "sort", "--stop-after", "sort"], false, false)]
+fn dead_rejects_hint_names_filter_rejects_only_when_useful(
+    #[case] chain: &[&str],
+    #[case] filter_rejects: bool,
+    #[case] expect_hint: bool,
+) {
+    let tmp = TempDir::new().unwrap();
+    let input = unsorted_bam(tmp.path());
+    let rejects = tmp.path().join("rejects.bam");
+    let filter_rejects_path = tmp.path().join("filter_rejects.bam");
+    let out = tmp.path().join("out.bam");
+    let mut args = vec!["runall"];
+    args.extend_from_slice(chain);
+    args.extend(["-i", p(&input), "-o", p(&out), "--rejects", p(&rejects)]);
+    if chain.contains(&"filter") {
+        args.extend(["--filter::min-reads", "1"]);
+    }
+    if filter_rejects {
+        args.extend(["--filter::rejects", p(&filter_rejects_path)]);
+    }
+    let stderr = String::from_utf8_lossy(&fgumi(&args).stderr).into_owned();
+    assert!(stderr.contains("--rejects is wired nowhere on this runall chain"), "{stderr}");
+    assert_eq!(
+        stderr.contains("Use --filter::rejects to capture filter rejects."),
+        expect_hint,
+        "hint presence must match the chain:\n{stderr}"
+    );
+}
+
+/// The per-stage read-only files are guarded too: a rejects path aliasing the
+/// UMI whitelist, and an output aliasing the `--ref` FASTA the aligner reads.
+#[cfg(feature = "simulate")]
+#[test]
+fn write_targets_aliasing_umi_files_or_ref_are_refused() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = correct_rejects_fixture(tmp.path());
+    let whitelist = tmp.path().join("umis.txt");
+    std::fs::write(&whitelist, "AAAA\nCCCC\n").unwrap();
+    let out = tmp.path().join("out.bam");
+
+    let mut args = correct_chain_args("correct", &fixture);
+    args.extend(["--correct::umi-files", p(&whitelist), "--correct::rejects", p(&whitelist)]);
+    args.extend(["-o", p(&out)]);
+    assert_alias_refused(
+        &args,
+        &format!(
+            "--correct::rejects '{}' is the same file as --correct::umi-files",
+            whitelist.display()
+        ),
+        &whitelist,
+    );
+
+    let reference = fixture.0.clone();
+    let mut args = correct_chain_args("zipper", &fixture);
+    args.extend(["-o", p(&reference)]);
+    assert_alias_refused(
+        &args,
+        &format!("--output '{}' is the same file as --ref", reference.display()),
+        &reference,
+    );
+}
+
+/// `-i -` reading a redirected file is guarded against writing that same file:
+/// the guard compares against whatever stdin actually is.
+#[cfg(unix)]
+#[test]
+fn write_target_aliasing_redirected_stdin_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    let input = unsorted_bam(tmp.path());
+    let before = std::fs::read(&input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "runall",
+            "--start-from",
+            "sort",
+            "--stop-after",
+            "sort",
+            "-i",
+            "-",
+            "-o",
+            p(&input),
+        ])
+        .stdin(std::fs::File::open(&input).unwrap())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "-o aliasing the redirected stdin must be refused");
+    assert!(
+        stderr.contains(&format!("--output '{}' is the same file as --input '-'", input.display())),
+        "expected the aliasing error, got:\n{stderr}"
+    );
+    assert_eq!(std::fs::read(&input).unwrap(), before, "the input BAM must be left untouched");
+}
+
+/// The dead `--stats` hint names `--filter::stats` only when filter runs and
+/// that flag is unset.
+#[rstest::rstest]
+#[case::filter_chain_hints(&["--start-from", "filter", "--stop-after", "filter"], false, true)]
+#[case::filter_stats_already_set(&["--start-from", "filter", "--stop-after", "filter"], true, false)]
+#[case::no_filter_no_hint(&["--start-from", "sort", "--stop-after", "sort"], false, false)]
+fn dead_stats_hint_names_filter_stats_only_when_useful(
+    #[case] chain: &[&str],
+    #[case] filter_stats: bool,
+    #[case] expect_hint: bool,
+) {
+    let tmp = TempDir::new().unwrap();
+    let input = unsorted_bam(tmp.path());
+    let stats = tmp.path().join("stats.txt");
+    let filter_stats_path = tmp.path().join("filter_stats.txt");
+    let out = tmp.path().join("out.bam");
+    let mut args = vec!["runall"];
+    args.extend_from_slice(chain);
+    args.extend(["-i", p(&input), "-o", p(&out), "--stats", p(&stats)]);
+    if chain.contains(&"filter") {
+        args.extend(["--filter::min-reads", "1"]);
+    }
+    if filter_stats {
+        args.extend(["--filter::stats", p(&filter_stats_path)]);
+    }
+    let stderr = String::from_utf8_lossy(&fgumi(&args).stderr).into_owned();
+    assert!(stderr.contains("--stats is consumed only by the consensus stage"), "{stderr}");
+    assert_eq!(
+        stderr.contains("Use --filter::stats to capture filter statistics."),
+        expect_hint,
+        "hint presence must match the chain:\n{stderr}"
+    );
+}
+
+/// `--correct::rejects` on a chain with no correct stage is dead; the run
+/// still succeeds, but must say so rather than silently write nothing.
+#[test]
+fn correct_rejects_without_correct_stage_warns() {
+    let tmp = TempDir::new().unwrap();
+    let input = unsorted_bam(tmp.path());
+    let rejects = tmp.path().join("rejects.bam");
+    let output = run_ok(
+        [
+            "runall",
+            "--start-from",
+            "sort",
+            "--stop-after",
+            "sort",
+            "-i",
+            p(&input),
+            "-o",
+            p(&tmp.path().join("out.bam")),
+            "--correct::rejects",
+            p(&rejects),
+        ],
+        "runall sort with a dead --correct::rejects",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--correct::rejects is wired nowhere"),
+        "expected the dead-flag warning, got:\n{stderr}"
+    );
+    assert!(!rejects.exists(), "no correct stage ran, so no rejects file may be written");
 }
 
 // ══════════════════════════ Extract→Extract (interleaved, no aligner) ══════════════════════════
