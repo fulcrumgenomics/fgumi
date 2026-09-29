@@ -50,7 +50,7 @@ impl Stage {
     }
 
     /// Returns `true` if this stage produces `BamTemplateBatch` from
-    /// an external source (AAM subprocess or zipper merge).
+    /// an external source (the align stage's aligner or zipper merge).
     #[must_use]
     pub fn is_template_producer(self) -> bool {
         matches!(self, Stage::Align | Stage::Zipper)

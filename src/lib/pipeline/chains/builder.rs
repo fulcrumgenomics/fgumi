@@ -579,9 +579,9 @@ pub struct ChainBuilder<'a> {
     /// `HeaderHandle` stashed by [`Self::add_align`] for consumption by
     /// [`Self::add_sink`].
     ///
-    /// `AlignAndMergeStep` resolves the final merged header at runtime
-    /// (after the aligner emits its own `@PG`/`@RG`/`@CO` lines). The
-    /// downstream [`WriteBgzfFile`] must therefore be constructed with
+    /// The align backend resolves the final merged header at runtime (after
+    /// the aligner emits its own `@PG`/`@RG`/`@CO` lines). The downstream
+    /// [`WriteBgzfFile`] must therefore be constructed with
     /// [`WriteBgzfFile::new_with_handle`], which blocks until the handle
     /// is resolved before writing the BAM header bytes.
     ///
@@ -2458,7 +2458,7 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// For [`StagePosition::Intermediate`], `SerializeBamRecords` is **not**
     /// appended: the chain tail is left as `BamTemplateBatch` so the next stage
-    /// (`add_align` → `AlignAndMergeStep`) can consume the correct step's kept
+    /// (`add_align` → the align backend) can consume the correct step's kept
     /// output (branch 0) directly; `add_align` skips `GroupByQueryname` on an
     /// incoming `BamTemplateBatch`. This is the correct→align fused path.
     ///
@@ -2520,7 +2520,7 @@ impl<'a> ChainBuilder<'a> {
         // (the `--start-from correct --stop-after ≥ zipper` fused chain).
         // In that case we skip `SerializeBamRecords` and leave the tail at
         // the correct step's `BamTemplateBatch` output (branch 0) so
-        // `add_align` can wire `GroupByQueryname → AlignAndMergeStep` next.
+        // `add_align` can wire the align backend directly next.
 
         let correct_opts = self
             .spec
@@ -2654,8 +2654,8 @@ impl<'a> ChainBuilder<'a> {
             self.chain_tail_kind = ChainTailKind::SerializedBytes;
         } else {
             // Intermediate: leave the tail as BamTemplateBatch so the next
-            // stage (add_align → GroupByQueryname → AlignAndMergeStep) can
-            // consume it directly.
+            // stage (add_align → the align backend, skipping GroupByQueryname)
+            // can consume it directly.
             self.current_tail = Some(process_tail);
             self.chain_tail_kind = ChainTailKind::BamTemplateBatch;
         }
@@ -2686,15 +2686,16 @@ impl<'a> ChainBuilder<'a> {
         Ok(())
     }
 
-    /// AlignAndMerge-specific step sequence (subprocess source):
+    /// AlignAndMerge-specific step sequence:
     ///
     /// ```text
     /// (source preamble: ReadBgzfBlocks → BgzfDecompress → FindBamBoundaries → DecodeRecords)
     ///     ↓
-    /// GroupByQueryname  ← appended here
+    /// GroupByQueryname  ← appended here (skipped when the upstream tail is BamTemplateBatch)
     ///     ↓
-    /// AlignAndMergeStep ← appended here (spawns aligner subprocess)
-    ///     ↓
+    /// <AlignBackend::wire steps> ← appended here: `SubprocessAlignStep`
+    ///     ↓                          (spawns the aligner subprocess) followed by
+    ///     ↓                          the shared `MergeAlignedStep`
     /// (Terminal) SerializeBamRecords  ← appended only when Terminal
     ///     ↓
     /// (next stage consumes BamTemplateBatch — Intermediate only)
@@ -2703,8 +2704,8 @@ impl<'a> ChainBuilder<'a> {
     /// Both [`StagePosition::Terminal`] and [`StagePosition::Intermediate`]
     /// are supported:
     ///
-    /// - **Terminal** — `SerializeBamRecords` is appended after the AAM step
-    ///   so the chain tail is `DecompressedBlock` ready for
+    /// - **Terminal** — `SerializeBamRecords` is appended after the merged
+    ///   align output so the chain tail is `DecompressedBlock` ready for
     ///   `BgzfCompress → WriteBgzfFile`. This is the `--stop-after zipper`
     ///   path when `--start-from align-and-merge`: the merged BAM is
     ///   written directly to the output file.
@@ -2714,16 +2715,16 @@ impl<'a> ChainBuilder<'a> {
     /// ## Header handling
     ///
     /// The aligner contributes `@PG`/`@RG`/`@CO` lines to the output
-    /// BAM header at runtime (not at chain-construction time). The
-    /// `AlignAndMergeStep` resolves a [`HeaderHandle`] once the aligner
-    /// emits its SAM/BAM header; the downstream [`WriteBgzfFile`]
-    /// (added by [`Self::add_sink`]) blocks on the handle before
-    /// writing any record bytes.
+    /// BAM header at runtime (not at chain-construction time). The align
+    /// backend resolves a [`HeaderHandle`] with the merged header once the
+    /// aligner emits its SAM/BAM header. The downstream
+    /// [`WriteBgzfFile`] (added by [`Self::add_sink`]) blocks on the handle
+    /// before writing any record bytes.
     ///
     /// To prepare the correct partial header (dict-derived `@SQ` +
-    /// unmapped-BAM headers + fgumi `@PG`) for `AlignAndMergeConfig`,
-    /// `add_align` calls [`build_output_header`] with the current
-    /// `self.header` (which was built from the unmapped BAM by
+    /// unmapped-BAM headers + fgumi `@PG`) for the backend and the shared
+    /// `MergeConfig`, `add_align` calls [`build_output_header`] with the
+    /// current `self.header` (which was built from the unmapped BAM by
     /// `ChainBuilder::new`) and the reference FASTA's `.dict` path.
     /// The result replaces `self.header` so downstream stages and
     /// `add_sink` see the dict-derived `@SQ` table.
@@ -2733,24 +2734,18 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// ## Thread floor
     ///
-    /// AAM spawns two daemon threads (FASTQ writer + SAM/BAM reader) plus
-    /// the aligner subprocess. The pipeline needs at least 4 framework
-    /// workers for steady-state progress:
-    ///
-    /// - 1 worker to drive the source preamble
-    /// - 1 worker dispatching `AlignAndMergeStep` (Serial)
-    /// - 1+ workers for any downstream Parallel steps
-    /// - 1 spare for progress / bookkeeping
-    ///
-    /// `override_pipeline_threads` is raised to `threads.max(4)` so
-    /// `build()` forwards the correct value to `PipelineConfig::threads`.
+    /// The backend reports its worker floor in `AlignWired::min_workers`, and
+    /// `fold_align_wired_scheduling` raises `override_pipeline_threads` to
+    /// `num_threads.max(min_workers)` so `build()` forwards the correct value
+    /// to `PipelineConfig::threads`. The subprocess backend needs 4 (it spawns
+    /// two daemon threads plus the aligner subprocess).
     ///
     /// ## Errors
     ///
     /// Returns errors if:
     /// - align options are missing from the spec bag,
     /// - the reference `.dict` file cannot be found,
-    /// - `AlignAndMergeStep::new` fails to spawn the aligner subprocess.
+    /// - `SubprocessAlignStep::new` fails to spawn the aligner subprocess.
     ///
     /// [`HeaderHandle`]: crate::pipeline::core::header::HeaderHandle
     /// [`WriteBgzfFile`]: crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile
@@ -2762,7 +2757,8 @@ impl<'a> ChainBuilder<'a> {
         use crate::logging::OperationTimer;
         use crate::pipeline::chains::commands::align::AlignFinalizeHook;
         use crate::pipeline::core::header::HeaderHandle;
-        use crate::pipeline::steps::align_and_merge::{AlignAndMergeConfig, AlignAndMergeStep};
+        use crate::pipeline::steps::align::merge::MergeConfig;
+        use crate::pipeline::steps::align::{AlignBackend, AlignWiringCtx, backend_for};
         use crate::pipeline::steps::serialize::SerializeBamRecords;
         use crate::reference::find_dict_path;
         use crate::sam::check_sort;
@@ -2790,7 +2786,6 @@ impl<'a> ChainBuilder<'a> {
             "AlignAndMerge: mode = {:?}, chunk_size = {}, threads = {:?}",
             resolved.mode, resolved.chunk_size, resolved.threads,
         );
-        info!("AlignAndMerge command: {}", resolved.command);
 
         // Validate the unmapped BAM source has queryname sort order — but only
         // when Align reads directly from the chain source (a file). When an
@@ -2832,45 +2827,50 @@ impl<'a> ChainBuilder<'a> {
         let header_handle = HeaderHandle::new();
         let records_emitted = std::sync::Arc::new(AtomicU64::new(0));
 
-        let aam_cfg = AlignAndMergeConfig {
-            tag_info: std::sync::Arc::new(TagInfo::new(Vec::new(), Vec::new(), Vec::new())),
-            skip_tc_tags: false,
-            reference: None,
-            partial_output_header: std::sync::Arc::clone(&partial_header),
-            header_handle: header_handle.clone(),
-            records_emitted: std::sync::Arc::clone(&records_emitted),
-            output_byte_limit: self.tuning.per_step_byte_limit,
-            // Bound AAM's in-flight unmapped backlog to the aligner's `-K`
-            // chunk size so a fast-draining aligner can't accumulate the
-            // whole input's unmapped reads in RAM (issue #382).
-            in_flight_unmapped_budget:
-                crate::pipeline::steps::align_and_merge::in_flight_budget_for_chunk_size(
-                    resolved.chunk_size,
-                ),
-        };
-
-        let aam_step = AlignAndMergeStep::new(aam_cfg, &resolved.command)
-            .map_err(|e| anyhow!("AlignAndMergeStep::new: {e:#}"))?;
-
         let tail = self.current_tail.expect("add_align called before add_source");
 
-        // Wire GroupByQueryname before the AAM step — but only when the upstream
-        // stage emits DecodedRecordBatch (the normal source preamble path).
-        // When `chain_tail_kind == BamTemplateBatch`, an upstream stage (e.g.
-        // Correct) has already grouped records into BamTemplateBatch, which is
-        // exactly the input type AlignAndMergeStep expects. Skip GroupByQueryname
-        // in that case to avoid a DecodedRecordBatch→BamTemplateBatch type mismatch.
+        // Wire GroupByQueryname before the align backend — but only when the
+        // upstream stage emits DecodedRecordBatch (the normal source preamble
+        // path). When `chain_tail_kind == BamTemplateBatch`, an upstream stage
+        // (e.g. Correct) has already grouped records into BamTemplateBatch, which
+        // is exactly the input type the align backend expects. Skip
+        // GroupByQueryname in that case to avoid a
+        // DecodedRecordBatch→BamTemplateBatch type mismatch.
         let align_input_tail = if self.chain_tail_kind == ChainTailKind::BamTemplateBatch {
-            // Upstream is already BamTemplateBatch — wire AAM directly.
+            // Upstream is already BamTemplateBatch — wire the backend directly.
             tail
         } else {
             // Upstream is DecodedRecordBatch (source preamble). Group by queryname
-            // to produce BamTemplateBatch for AlignAndMergeStep — the parallel
+            // to produce BamTemplateBatch for the align backend — the parallel
             // `AssembleTemplates` map when the source cut left batches closed
             // under queryname, else the serial `GroupByQueryname`.
             self.append_queryname_grouper(tail)
         };
-        let aam_tail = self.pipeline.append_step(aam_step, align_input_tail);
+
+        // Construct the align backend `resolve` selected behind the
+        // `AlignBackend` trait, wire its steps after the grouped input, and
+        // obtain the merged `BamTemplateBatch` tail plus the scheduling facts to
+        // fold in.
+        let backend: Box<dyn AlignBackend> = backend_for(resolved);
+        info!("AlignAndMerge backend: {}", backend.describe());
+        // The zipper merge every aligned template goes through, run by the
+        // backend (the subprocess backend's shared `Parallel` merge step).
+        let merge_config = std::sync::Arc::new(MergeConfig {
+            tag_info: std::sync::Arc::new(TagInfo::new(Vec::new(), Vec::new(), Vec::new())),
+            skip_tc_tags: false,
+            reference: None,
+            partial_output_header: std::sync::Arc::clone(&partial_header),
+            records_emitted: std::sync::Arc::clone(&records_emitted),
+            output_byte_limit: self.tuning.per_step_byte_limit,
+        });
+        let wiring_ctx = AlignWiringCtx {
+            partial_output_header: std::sync::Arc::clone(&partial_header),
+            header_handle: header_handle.clone(),
+            per_step_byte_limit: self.tuning.per_step_byte_limit,
+            merge: merge_config,
+        };
+        let wired = backend.wire(&self.pipeline, align_input_tail, &wiring_ctx)?;
+        let aam_tail = wired.tail;
 
         if position == StagePosition::Terminal {
             // Terminal: append SerializeBamRecords so the chain tail is
@@ -2896,14 +2896,21 @@ impl<'a> ChainBuilder<'a> {
         self.pending_header_transform = None;
         self.pending_header_handle = Some(header_handle);
 
-        // AAM spawns two daemon threads + aligner subprocess; 4 workers
-        // minimum for steady-state progress.
-        let effective = num_threads.max(4);
-        if let Some(prev) = self.override_pipeline_threads {
-            self.override_pipeline_threads = Some(prev.max(effective));
-        } else {
-            self.override_pipeline_threads = Some(effective);
-        }
+        // Raise the pool floor to the backend's `min_workers` (the subprocess
+        // backend needs 4: it spawns two daemon threads + the aligner subprocess,
+        // so 4 framework workers are the floor for steady-state progress) — and
+        // fold its scheduler preference into the automatic decision. Only ever set the flag true (mirrors the
+        // grouping stages); the subprocess backend leaves it false, preserving
+        // today's behavior. See `fold_align_wired_scheduling`'s doc comment for
+        // the full rationale (it is unit-tested there without needing a real
+        // backend).
+        fold_align_wired_scheduling(
+            num_threads,
+            wired.min_workers,
+            wired.prefers_drain_first,
+            &mut self.override_pipeline_threads,
+            &mut self.use_drain_first_scheduler,
+        );
 
         let timer = OperationTimer::new("AlignAndMerge");
         // Success-only: the hook logs "pipeline completed successfully" and
@@ -6243,6 +6250,40 @@ fn grouping_stage_wants_drain_first(stage: Stage, position: StagePosition) -> bo
     )
 }
 
+/// Folds an align backend's wiring result (`AlignWired::min_workers`,
+/// `AlignWired::prefers_drain_first`) into the chain-wide
+/// thread floor and the accumulated drain-first flag.
+///
+/// `num_threads.max(wired_min_workers)` raises the floor to whichever is
+/// larger, and never lowers a floor a previous stage already raised (mirrors
+/// `add_sort`/`add_zipper`'s existing "max, don't overwrite" thread-override
+/// discipline). `wired_prefers_drain_first` only ever sets the flag `true`,
+/// never clears it — a previous stage's opt-in survives a later stage that
+/// itself does not need drain-first, matching `grouping_stage_wants_drain_first`.
+///
+/// The subprocess backend's floor of 4 forces `n_threads >= 4` for any align
+/// chain, which forecloses `crate::pipeline::core::runtime::fused::
+/// should_fuse_single_thread`'s `n_threads == 1` precondition regardless of the
+/// user's `--threads` request; a backend with a floor of 1 would not.
+///
+/// Extracted as a free function, taking primitives rather than `&AlignWired`,
+/// so the fold is unit-testable without constructing a real align backend
+/// (`AlignBackend::wire()` needs a spawnable aligner subprocess).
+fn fold_align_wired_scheduling(
+    num_threads: usize,
+    wired_min_workers: usize,
+    wired_prefers_drain_first: bool,
+    override_pipeline_threads: &mut Option<usize>,
+    use_drain_first_scheduler: &mut bool,
+) {
+    let effective = num_threads.max(wired_min_workers);
+    *override_pipeline_threads =
+        Some(override_pipeline_threads.map_or(effective, |prev| prev.max(effective)));
+    if wired_prefers_drain_first {
+        *use_drain_first_scheduler = true;
+    }
+}
+
 /// Resolve the effective drain-first choice from the hidden `--pool-scheduler`
 /// override and the automatic per-chain decision.
 ///
@@ -6309,6 +6350,7 @@ fn dict_not_found_error(reference: &std::path::Path) -> anyhow::Error {
 mod tests {
     use super::*;
     use crate::commands::common::PoolScheduler;
+    use crate::pipeline::steps::align::subprocess::SubprocessBackend;
 
     /// A `ChainSpec` with the given stages and every other field at its
     /// simplest valid default. Mirrors `validate::tests::empty_spec` — kept as
@@ -6570,6 +6612,90 @@ mod tests {
             expected,
             "{stage:?} at {position:?}: drain-first opt-in mismatch"
         );
+    }
+
+    /// Pin `fold_align_wired_scheduling`. The `subprocess_*` cases read
+    /// `SubprocessBackend::MIN_WORKERS` / `PREFERS_DRAIN_FIRST` directly, so a
+    /// change to those constants is seen here; the `floor_1_*` cases cover a
+    /// backend reporting a floor of 1 that prefers drain-first, which leaves the
+    /// resolved floor at the requested thread count. None needs a real aligner
+    /// subprocess (`AlignBackend::wire()` does, so it cannot run in this unit
+    /// test).
+    #[rstest::rstest]
+    #[case::floor_1_at_requested_threads_1_keeps_the_floor_at_1(
+        1,
+        1,
+        true,
+        None,
+        false,
+        Some(1),
+        true
+    )]
+    #[case::floor_1_at_requested_threads_8_raises_the_floor_to_8(
+        8,
+        1,
+        true,
+        None,
+        false,
+        Some(8),
+        true
+    )]
+    #[case::subprocess_at_requested_threads_1_forces_the_floor_to_4(
+        1,
+        SubprocessBackend::MIN_WORKERS,
+        SubprocessBackend::PREFERS_DRAIN_FIRST,
+        None,
+        false,
+        Some(4),
+        false
+    )]
+    #[case::subprocess_never_lowers_a_higher_existing_floor(
+        1,
+        SubprocessBackend::MIN_WORKERS,
+        SubprocessBackend::PREFERS_DRAIN_FIRST,
+        Some(6),
+        false,
+        Some(6),
+        false
+    )]
+    #[case::higher_min_workers_raises_a_lower_existing_floor(
+        1,
+        8,
+        true,
+        Some(4),
+        false,
+        Some(8),
+        true
+    )]
+    #[case::drain_first_is_sticky_once_set_by_an_earlier_stage(
+        4,
+        SubprocessBackend::MIN_WORKERS,
+        SubprocessBackend::PREFERS_DRAIN_FIRST,
+        None,
+        true,
+        Some(4),
+        true
+    )]
+    fn fold_align_wired_scheduling_matrix(
+        #[case] num_threads: usize,
+        #[case] wired_min_workers: usize,
+        #[case] wired_prefers_drain_first: bool,
+        #[case] initial_override: Option<usize>,
+        #[case] initial_drain_first: bool,
+        #[case] expected_override: Option<usize>,
+        #[case] expected_drain_first: bool,
+    ) {
+        let mut override_pipeline_threads = initial_override;
+        let mut use_drain_first_scheduler = initial_drain_first;
+        fold_align_wired_scheduling(
+            num_threads,
+            wired_min_workers,
+            wired_prefers_drain_first,
+            &mut override_pipeline_threads,
+            &mut use_drain_first_scheduler,
+        );
+        assert_eq!(override_pipeline_threads, expected_override, "thread floor mismatch");
+        assert_eq!(use_drain_first_scheduler, expected_drain_first, "drain-first flag mismatch");
     }
 
     /// Pin the hidden `--pool-scheduler` override resolution: `Auto` defers to

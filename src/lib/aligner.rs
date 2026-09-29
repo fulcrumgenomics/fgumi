@@ -16,8 +16,8 @@
 //!   [`substitute_template`] helper fills the `{ref}` / `{threads}`
 //!   placeholders.
 //!
-//! Used by the `AlignAndMergeStep` in
-//! `src/lib/pipeline/steps/align_and_merge.rs`. This module is the
+//! Used by the subprocess align backend's `SubprocessAlignStep` in
+//! `src/lib/pipeline/steps/align/subprocess.rs`. This module is the
 //! framework-agnostic subprocess primitive; the typed `Step` impl that owns the
 //! I/O threads lives in that step module.
 
@@ -702,23 +702,31 @@ impl Default for AlignerOptions {
     }
 }
 
-/// Result of [`AlignerOptions::resolve`] — a ready-to-spawn aligner
-/// invocation plus the parameters the downstream chain needs.
+/// The alignment backend a [`ResolvedAligner`] will run.
+#[derive(Debug, Clone)]
+pub(crate) enum ResolvedBackend {
+    /// `--aligner::preset` or `--aligner::command`: the shell command to spawn
+    /// via [`AlignerProcess::spawn`] (already substituted and validated).
+    Subprocess { command: String },
+}
+
+/// Result of [`AlignerOptions::resolve`] — a ready-to-construct aligner
+/// backend plus the parameters the downstream chain needs.
 ///
 /// `pub(crate)` because only the runall AAM dispatch consumes it;
 /// promote to `pub` if a cross-crate caller materializes.
 ///
 /// Every field is read when the chain builder wires the AAM stage
-/// (`chains/builder.rs`): `command` seeds `AlignAndMergeStep`, `chunk_size`
-/// derives the step's `in_flight_unmapped_budget` (via
-/// `in_flight_budget_for_chunk_size`), and `mode`/`threads` are info-logged.
+/// (`chains/builder.rs`): `backend` seeds the align step via
+/// the align stage's `backend_for`, `chunk_size` derives the step's
+/// `in_flight_unmapped_budget` (via `in_flight_budget_for_chunk_size`), and
+/// `mode`/`threads` are info-logged.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedAligner {
-    /// The shell command to spawn (already substituted and validated).
-    /// Passed directly to [`AlignerProcess::spawn`].
-    pub command: String,
+    /// The backend to construct (by the align stage's `backend_for`).
+    pub backend: ResolvedBackend,
     /// The aligner's `-K` chunk size, in bases. The chain builder converts
-    /// it into `AlignAndMergeStep`'s `in_flight_unmapped_budget` so the
+    /// it into the align backend's in-flight byte budget so the
     /// resident unmapped backlog stays proportional to one aligner chunk.
     pub chunk_size: u64,
     /// Resolved thread count (default-substituted for preset mode;
@@ -745,7 +753,7 @@ pub(crate) enum ResolvedAlignerMode {
 
 impl AlignerOptions {
     /// Validate the option combination and produce a [`ResolvedAligner`]
-    /// ready for [`AlignerProcess::spawn`].
+    /// ready for the align stage's `backend_for` to construct.
     ///
     /// # Arguments
     ///
@@ -803,7 +811,7 @@ impl AlignerOptions {
                 let command =
                     preset.build_command(reference, threads, self.chunk_size, aligner_bin);
                 Ok(ResolvedAligner {
-                    command,
+                    backend: ResolvedBackend::Subprocess { command },
                     chunk_size: self.chunk_size,
                     threads: Some(threads),
                     mode: ResolvedAlignerMode::Preset(preset),
@@ -838,7 +846,7 @@ impl AlignerOptions {
                 // hardcode any thread count).
                 let command = substitute_template(&template, reference, top_threads)?;
                 Ok(ResolvedAligner {
-                    command,
+                    backend: ResolvedBackend::Subprocess { command },
                     chunk_size: self.chunk_size,
                     threads: None,
                     mode: ResolvedAlignerMode::Command,
@@ -1005,7 +1013,7 @@ mod tests {
     /// `kill()` reports `true` when the child is reaped within the deadline.
     /// A plain `sleep` responds to SIGKILL immediately, so the bounded kill
     /// reaps it well inside the 1s window — and a `true` return is what lets
-    /// `AlignAndMergeStep::Drop` safely issue its follow-up `wait()` without
+    /// `SubprocessAlignStep::drop` safely issue its follow-up `wait()` without
     /// risking a teardown hang.
     #[test]
     fn test_kill_reports_reaped_for_killable_child() {
@@ -1141,8 +1149,9 @@ mod tests {
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
         };
         let resolved = opts.resolve(&ref_path, 4, None).unwrap();
-        assert!(resolved.command.contains(&ref_path.display().to_string()));
-        assert!(resolved.command.contains("-t 4"));
+        let ResolvedBackend::Subprocess { command } = resolved.backend;
+        assert!(command.contains(&ref_path.display().to_string()));
+        assert!(command.contains("-t 4"));
         assert!(matches!(resolved.mode, ResolvedAlignerMode::Command));
     }
 

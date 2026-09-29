@@ -49,7 +49,7 @@ pub use fgumi_pipeline_io::types::{
 /// Takes the `Vec`'s `capacity()` rather than a borrow of the `Vec` itself, so
 /// the reserved-slot count is explicit at every call site and the helper cannot
 /// silently degrade to `len()` through a slice deref.
-fn container_bytes<T>(capacity: usize) -> usize {
+pub(crate) fn container_bytes<T>(capacity: usize) -> usize {
     capacity * std::mem::size_of::<T>()
 }
 
@@ -188,7 +188,7 @@ impl BamTemplateBatch {
     /// Construct from a pre-computed `total_bytes`, skipping the
     /// per-template `heap_size` walk inside `new`. Use when the
     /// caller already summed `heap_size` in a prior pass (e.g.,
-    /// the AAM merge loop, which folds heap accounting into the
+    /// the align stage's `merge_zipper_batch`, which folds heap accounting into the
     /// same loop that builds the `Vec<Template>`).
     #[must_use]
     pub fn from_parts(batch_serial: u64, templates: Vec<Template>, total_bytes: usize) -> Self {
@@ -382,7 +382,7 @@ mod tests {
     #[test]
     fn template_batch_from_parts_trusts_caller_total_bytes() {
         // from_parts must NOT re-walk the templates — it trusts the caller's
-        // summed `heap_size` (e.g. the AAM merge loop, which folds heap
+        // summed `heap_size` (e.g. the align stage's `merge_zipper_batch`, which folds heap
         // accounting into its own loop). It still adds the container term,
         // which the caller has no way to know.
         let batch = BamTemplateBatch::from_parts(99, vec![], 12345);
