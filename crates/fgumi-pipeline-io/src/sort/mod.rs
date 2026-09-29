@@ -32,7 +32,7 @@ pub use arena_ingest::{
 };
 pub use compress_spill::CompressSpill;
 pub use merge::{BlockOutput, MergeBatchBuilder, MergeOutput, RecordBatchOutput, SortMerge};
-pub use sort_buffer::SortBuffer;
+pub use sort_buffer::{SortBuffer, SortBufferConfig};
 pub use spill_block_compress::SpillBlockCompress;
 pub use spill_decompress::{SortDecompressTuning, SortSpillDecompress};
 pub use spill_gather::SpillGather;

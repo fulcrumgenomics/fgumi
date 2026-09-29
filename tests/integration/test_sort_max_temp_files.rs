@@ -17,7 +17,7 @@ use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use rstest::rstest;
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::{create_minimal_header, write_bam};
+use crate::helpers::bam_generator::{create_minimal_header, transcode_bam_to_sam, write_bam};
 use crate::helpers::cutover::decompressed_records_without_pg;
 
 /// A limit far above any run count these fixtures produce, so it never binds.
@@ -250,5 +250,47 @@ fn consolidation_in_a_fused_runall_chain_preserves_the_output() {
     assert!(
         decompressed_records_without_pg(&bounded) == decompressed_records_without_pg(&reference),
         "consolidating inside runall changed the sort -> group output"
+    );
+}
+
+/// The uncompressed-BGZF spill path (`--temp-codec bgzf --temp-compression 0`)
+/// must produce the same records as the default zstd spill path, on both
+/// Phase-1 fronts: the BAM arena front and the record-input `SortBuffer` front
+/// (reached from a SAM input). The chain reads the spill codec and level
+/// straight from the sort options, so this pins that wiring end to end; the
+/// codec pairing once regressed when it was set on an unread carrier instead.
+#[rstest]
+fn uncompressed_bgzf_spills_match_the_default_codec(
+    #[values("coordinate", "template-coordinate")] order: &str,
+    #[values(false, true)] sam_input: bool,
+) {
+    let tmp = TempDir::new().unwrap();
+    let bam = write_fixture(tmp.path(), 4_000);
+    let input = if sam_input {
+        let sam = tmp.path().join("unsorted.sam");
+        transcode_bam_to_sam(&bam, &sam);
+        sam
+    } else {
+        bam
+    };
+    let (default_out, default_log) =
+        sort(&input, tmp.path(), "default", order, "2", UNBOUNDED, &[]);
+    let (bgzf_out, bgzf_log) = sort(
+        &input,
+        tmp.path(),
+        "bgzf",
+        order,
+        "2",
+        UNBOUNDED,
+        &["--temp-codec", "bgzf", "--temp-compression", "0"],
+    );
+    for log in [&default_log, &bgzf_log] {
+        let runs = logged_count(log, "Spill runs:").expect("the fixture must spill");
+        assert!(runs > 1, "the fixture must spill more than one run:\n{log}");
+    }
+    assert_eq!(
+        decompressed_records_without_pg(&bgzf_out),
+        decompressed_records_without_pg(&default_out),
+        "uncompressed-BGZF spills must not change the sorted records ({order}, sam={sam_input})"
     );
 }

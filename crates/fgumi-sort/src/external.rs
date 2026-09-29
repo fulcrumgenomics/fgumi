@@ -5304,25 +5304,40 @@ impl RawExternalSorter {
     /// When `temp_dirs` is empty, a single subdirectory is created under the
     /// system default temp location.
     fn create_temp_dirs(&self) -> Result<(Vec<TempDir>, TmpDirAllocator)> {
-        use super::create_temp_dir;
-
-        if self.temp_dirs.is_empty() {
-            let td = create_temp_dir(None)?;
-            let base = td.path().to_path_buf();
-            let alloc = TmpDirAllocator::new(vec![base])?;
-            return Ok((vec![td], alloc));
-        }
-
-        let mut handles = Vec::with_capacity(self.temp_dirs.len());
-        let mut subdirs = Vec::with_capacity(self.temp_dirs.len());
-        for base in &self.temp_dirs {
-            let td = create_temp_dir(Some(base))?;
-            subdirs.push(td.path().to_path_buf());
-            handles.push(td);
-        }
-        let alloc = TmpDirAllocator::new(subdirs)?;
-        Ok((handles, alloc))
+        create_sort_temp_dirs(&self.temp_dirs)
     }
+}
+
+/// Create one fresh sort-run temp subdirectory under each of `temp_dirs`
+/// (or a single one under the system temp location when it is empty) and an
+/// allocator over them. The returned [`TempDir`] handles own the subdirs, which
+/// are removed on drop; the allocator hands out their paths for spill-file
+/// placement. This is what [`RawExternalSorter::create_spill_dirs`] does for its
+/// configured directories, available without building a sorter.
+///
+/// # Errors
+///
+/// Returns an error if a temp directory cannot be created or has insufficient
+/// free space.
+pub fn create_sort_temp_dirs(temp_dirs: &[PathBuf]) -> Result<(Vec<TempDir>, TmpDirAllocator)> {
+    use super::create_temp_dir;
+
+    if temp_dirs.is_empty() {
+        let td = create_temp_dir(None)?;
+        let base = td.path().to_path_buf();
+        let alloc = TmpDirAllocator::new(vec![base])?;
+        return Ok((vec![td], alloc));
+    }
+
+    let mut handles = Vec::with_capacity(temp_dirs.len());
+    let mut subdirs = Vec::with_capacity(temp_dirs.len());
+    for base in temp_dirs {
+        let td = create_temp_dir(Some(base))?;
+        subdirs.push(td.path().to_path_buf());
+        handles.push(td);
+    }
+    let alloc = TmpDirAllocator::new(subdirs)?;
+    Ok((handles, alloc))
 }
 
 /// Extract a packed `TemplateKey` directly from BAM record bytes.
