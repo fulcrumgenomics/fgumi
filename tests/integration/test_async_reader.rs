@@ -495,7 +495,7 @@ fn run_simplex(
         "--min-reads".into(),
         "1".into(),
         "--min-consensus-base-quality".into(),
-        "0".into(),
+        "2".into(),
         "--compression-level".into(),
         "1".into(),
     ];

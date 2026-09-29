@@ -198,12 +198,6 @@ pub struct CodecConsensusOptions {
     /// Whether to produce per-base tags (ad, ae, bd, be, etc.)
     pub produce_per_base_tags: bool,
 
-    /// Whether to quality-trim reads before consensus calling
-    pub trim: bool,
-
-    /// Minimum consensus base quality (output bases below this are masked to N)
-    pub min_consensus_base_quality: PhredScore,
-
     /// How near-ties between the two greatest base likelihoods are resolved.
     ///
     /// Forwarded to the single-strand caller; see [`TieRule`].
@@ -227,8 +221,6 @@ impl Default for CodecConsensusOptions {
             max_duplex_disagreement_rate: 1.0,
             cell_tag: None,
             produce_per_base_tags: false,
-            trim: false,
-            min_consensus_base_quality: 0,
             tie_rule: TieRule::default(),
         }
     }

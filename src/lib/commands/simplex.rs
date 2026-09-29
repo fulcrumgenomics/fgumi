@@ -18,8 +18,9 @@ use std::path::Path;
 use crate::commands::command::Command;
 use crate::commands::common::{
     AllowUnmappedOptions, BamIoOptions, CompressionOptions, ConsensusCallingOptions,
-    OverlappingConsensusOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions,
-    SchedulerOptions, StatsOptions, ThreadingOptions, reject_output_collisions,
+    MinConsensusBaseQualityOptions, OverlappingConsensusOptions, QualityTrimOptions,
+    QueueMemoryOptions, ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions,
+    ThreadingOptions, reject_output_collisions,
 };
 // Used only by unit tests that read back the `--stats` TSV.
 #[cfg(test)]
@@ -112,6 +113,14 @@ pub struct Simplex {
     #[command(flatten)]
     pub consensus: ConsensusCallingOptions,
 
+    /// Quality trimming of raw reads
+    #[command(flatten)]
+    pub quality_trim: QualityTrimOptions,
+
+    /// Consensus base-quality floor
+    #[command(flatten)]
+    pub min_consensus_quality: MinConsensusBaseQualityOptions,
+
     /// Overlapping bases consensus options
     #[command(flatten)]
     pub overlapping: OverlappingConsensusOptions,
@@ -199,6 +208,7 @@ pub struct Simplex {
 /// `#[command(flatten)]` sub-structs: the chain builder wants one bag per
 /// stage, not a re-run of the CLI's grouping. Each `#[arg]` below is copied
 /// verbatim from the corresponding field on [`ConsensusCallingOptions`] /
+/// [`QualityTrimOptions`] / [`MinConsensusBaseQualityOptions`] /
 /// [`OverlappingConsensusOptions`].
 ///
 /// `min_reads` has no `default_value` on the standalone command (fgbio's
@@ -312,8 +322,9 @@ impl Default for SimplexOptions {
             error_rate_post_umi: consensus.error_rate_post_umi,
             min_input_base_quality: consensus.min_input_base_quality,
             output_per_base_tags: consensus.output_per_base_tags,
-            trim: consensus.trim,
-            min_consensus_base_quality: consensus.min_consensus_base_quality,
+            trim: QualityTrimOptions::default().trim,
+            min_consensus_base_quality: MinConsensusBaseQualityOptions::default()
+                .min_consensus_base_quality,
             tie_rule: consensus.tie_rule.into(),
             consensus_call_overlapping_bases: overlapping.consensus_call_overlapping_bases,
             min_reads: 1,
@@ -340,8 +351,8 @@ impl Simplex {
             error_rate_post_umi: self.consensus.error_rate_post_umi,
             min_input_base_quality: self.consensus.min_input_base_quality,
             output_per_base_tags: self.consensus.output_per_base_tags,
-            trim: self.consensus.trim,
-            min_consensus_base_quality: self.consensus.min_consensus_base_quality,
+            trim: self.quality_trim.trim,
+            min_consensus_base_quality: self.min_consensus_quality.min_consensus_base_quality,
             tie_rule: self.consensus.tie_rule.into(),
             consensus_call_overlapping_bases: self.overlapping.consensus_call_overlapping_bases,
             min_reads: self.min_reads,
@@ -373,8 +384,6 @@ impl SimplexOptions {
             error_rate_post_umi: self.error_rate_post_umi,
             min_input_base_quality: self.min_input_base_quality,
             output_per_base_tags: self.output_per_base_tags,
-            trim: self.trim,
-            min_consensus_base_quality: self.min_consensus_base_quality,
             tie_rule: self.tie_rule.into(),
         }
     }
@@ -388,13 +397,16 @@ impl SimplexOptions {
         }
     }
 
-    /// Validate the `--min-reads` / `--max-reads` range.
+    /// Validate the `--min-reads` / `--max-reads` range and the
+    /// `--min-consensus-base-quality` floor.
     ///
     /// `min_reads` must be `>= 1` (a value of 0 admits empty groups) and, when
-    /// `max_reads` is set, it must be `>= min_reads`. Shared by the standalone
-    /// `Simplex::execute` and the chain builder's `add_simplex` so `runall`
-    /// rejects the same degenerate configurations the standalone command does.
-    pub(crate) fn validate_read_bounds(&self) -> Result<()> {
+    /// `max_reads` is set, it must be `>= min_reads`. The floor must lie in
+    /// `2..=93` (see [`MinConsensusBaseQualityOptions::validate`]). Shared by the
+    /// standalone `Simplex::execute` and the chain builder's `add_simplex` so
+    /// `runall` rejects the same degenerate configurations the standalone
+    /// command does.
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.min_reads == 0 {
             bail!("--min-reads must be >= 1 (a value of 0 admits empty groups)");
         }
@@ -403,7 +415,10 @@ impl SimplexOptions {
         {
             bail!("--max-reads ({}) must be >= --min-reads ({})", max, self.min_reads);
         }
-        Ok(())
+        MinConsensusBaseQualityOptions {
+            min_consensus_base_quality: self.min_consensus_base_quality,
+        }
+        .validate()
     }
 }
 
@@ -432,7 +447,7 @@ impl Command for Simplex {
         outputs.extend(metrics_artifacts.iter().map(|p| (p.as_path(), "--metrics")));
         reject_output_collisions(&outputs)?;
 
-        self.validate_read_bounds()?;
+        self.validate_options()?;
 
         if self.reference.is_some() && self.methylation_mode.is_none() {
             bail!("--ref requires --methylation-mode to be set");
@@ -452,7 +467,8 @@ impl Command for Simplex {
     }
 }
 impl Simplex {
-    /// Validates the `--min-reads` / `--max-reads` family-size bounds.
+    /// Validates the `--min-reads` / `--max-reads` family-size bounds and the
+    /// `--min-consensus-base-quality` floor.
     ///
     /// `--min-reads 0` is rejected because it admits empty groups, silently turning
     /// the minimum-family-size filter into a no-op (the `raw_records.len() < min_reads`
@@ -460,9 +476,10 @@ impl Simplex {
     ///
     /// # Errors
     ///
-    /// Returns an error if `min_reads` is 0, or if `max_reads` is below `min_reads`.
-    fn validate_read_bounds(&self) -> Result<()> {
-        self.to_simplex_options().validate_read_bounds()
+    /// Returns an error if `min_reads` is 0, if `max_reads` is below `min_reads`,
+    /// or if the consensus base-quality floor is outside `2..=93`.
+    fn validate_options(&self) -> Result<()> {
+        self.to_simplex_options().validate()
     }
 
     /// Run the simplex stage on the declarative chain builder — the only
@@ -663,10 +680,31 @@ mod tests {
         simplex.min_reads = min_reads;
         simplex.max_reads = max_reads;
         assert_eq!(
-            simplex.validate_read_bounds().is_ok(),
+            simplex.validate_options().is_ok(),
             expected_ok,
             "unexpected result for min_reads={min_reads} max_reads={max_reads:?}"
         );
+    }
+
+    #[rstest]
+    #[case::zero_rejected(0, false)]
+    #[case::one_rejected(1, false)]
+    #[case::min_phred(2, true)]
+    #[case::typical(30, true)]
+    #[case::max_phred(93, true)]
+    #[case::above_max_phred_rejected(94, false)]
+    #[case::far_above_max_phred_rejected(200, false)]
+    fn test_validate_min_consensus_base_quality(#[case] floor: u8, #[case] expected_ok: bool) {
+        let mut simplex = create_test_simplex();
+        simplex.min_consensus_quality.min_consensus_base_quality = floor;
+        let result = simplex.validate_options();
+        assert_eq!(result.is_ok(), expected_ok, "unexpected result for floor={floor}");
+        if let Err(err) = result {
+            assert!(
+                err.to_string().contains("min-consensus-base-quality"),
+                "unexpected error: {err:#}"
+            );
+        }
     }
 
     /// Creates a Simplex command with the given input/output paths and default parameters.
@@ -684,9 +722,10 @@ mod tests {
             read_group: ReadGroupOptions::default(),
             consensus: ConsensusCallingOptions {
                 output_per_base_tags: false,
-                min_consensus_base_quality: 0,
                 ..ConsensusCallingOptions::default()
             },
+            quality_trim: QualityTrimOptions::default(),
+            min_consensus_quality: MinConsensusBaseQualityOptions::default(),
             overlapping: OverlappingConsensusOptions { consensus_call_overlapping_bases: false },
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
@@ -1572,7 +1611,7 @@ mod tests {
         builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
-        cmd.consensus.trim = true;
+        cmd.quality_trim.trim = true;
 
         cmd.execute("test")?;
 
@@ -1597,7 +1636,7 @@ mod tests {
         builder.set_template_coordinate_sort_order().write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
-        cmd.consensus.min_consensus_base_quality = 30;
+        cmd.min_consensus_quality.min_consensus_base_quality = 30;
 
         cmd.execute("test")?;
 

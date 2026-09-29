@@ -4201,11 +4201,12 @@ impl<'a> ChainBuilder<'a> {
         }
 
         // V5 fix: runall never calls Simplex::execute, so mirror its
-        // --min-reads / --max-reads range check here. Without this, runall
-        // silently accepts degenerate configs (`--simplex::min-reads 0`,
-        // `--simplex::max-reads < --simplex::min-reads`) the standalone command
+        // --min-reads / --max-reads range and --min-consensus-base-quality
+        // floor checks here. Without this, runall silently accepts degenerate
+        // configs (`--simplex::min-reads 0`, `--simplex::max-reads <
+        // --simplex::min-reads`, a floor outside 2..=93) the standalone command
         // rejects, breaking the "same as standalone" contract.
-        simplex.validate_read_bounds()?;
+        simplex.validate()?;
 
         // Resolve source path for log messages and the sort-order guard below.
         let input_path = self.resolve_log_input_path();
@@ -4625,7 +4626,7 @@ impl<'a> ChainBuilder<'a> {
         info!("Min reads: {:?}", duplex.min_reads);
         info!("Min base quality: {}", consensus.min_input_base_quality);
         info!("Output per-base tags: {}", consensus.output_per_base_tags);
-        info!("Trim reads: {}", consensus.trim);
+        info!("Trim reads: {}", duplex.trim);
         info!("Max reads per strand: {:?}", duplex.max_reads_per_strand);
         info!("Consensus call overlapping bases: {}", overlapping.consensus_call_overlapping_bases);
 
@@ -5000,10 +5001,6 @@ impl<'a> ChainBuilder<'a> {
         let num_threads = self.spec.threading.num_threads();
         info!("Worker threads: {num_threads}");
         info!("Reader threads: {num_threads}");
-        if consensus.trim {
-            info!("Quality trimming enabled");
-        }
-
         info!("Processing reads and calling consensus (streaming)...");
         info!("Reading input");
 

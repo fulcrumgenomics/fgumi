@@ -290,7 +290,7 @@ pub struct Codec {
 /// `#[command(flatten)]` sub-structs: the chain builder wants one bag per
 /// stage, not a re-run of the CLI's grouping. Each `#[arg]` below is copied
 /// verbatim from the corresponding field on [`ConsensusCallingOptions`] (the
-/// 6 consensus scalars) or [`Codec`] itself (the codec-specific fields).
+/// shared consensus scalars) or [`Codec`] itself (the codec-specific fields).
 /// Unlike [`crate::commands::duplex::DuplexOptions`] /
 /// [`crate::commands::simplex::SimplexOptions`], CODEC has no
 /// `OverlappingConsensusOptions`, no `consensus_call_overlapping_bases`, no
@@ -331,12 +331,6 @@ pub struct CodecOptions {
     /// Emit per-base consensus tags.
     #[arg(short = 'B', long = "output-per-base-tags", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub output_per_base_tags: bool,
-    /// Trim consensus reads.
-    #[arg(long = "trim", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
-    pub trim: bool,
-    /// Minimum consensus base quality.
-    #[arg(long = "min-consensus-base-quality", default_value = "2")]
-    pub min_consensus_base_quality: u8,
     /// How to resolve a near-tie between the two most likely consensus bases.
     #[arg(skip)]
     pub tie_rule: fgumi_consensus::TieRule,
@@ -406,8 +400,6 @@ impl Default for CodecOptions {
             error_rate_post_umi: consensus.error_rate_post_umi,
             min_input_base_quality: consensus.min_input_base_quality,
             output_per_base_tags: consensus.output_per_base_tags,
-            trim: consensus.trim,
-            min_consensus_base_quality: consensus.min_consensus_base_quality,
             tie_rule: consensus.tie_rule.into(),
             min_reads: 1,
             max_reads: None,
@@ -438,8 +430,6 @@ impl Codec {
             error_rate_post_umi: self.consensus.error_rate_post_umi,
             min_input_base_quality: self.consensus.min_input_base_quality,
             output_per_base_tags: self.consensus.output_per_base_tags,
-            trim: self.consensus.trim,
-            min_consensus_base_quality: self.consensus.min_consensus_base_quality,
             tie_rule: self.consensus.tie_rule.into(),
             min_reads: self.min_reads,
             max_reads: self.max_reads,
@@ -535,8 +525,6 @@ impl CodecOptions {
             error_rate_post_umi: self.error_rate_post_umi,
             min_input_base_quality: self.min_input_base_quality,
             output_per_base_tags: self.output_per_base_tags,
-            trim: self.trim,
-            min_consensus_base_quality: self.min_consensus_base_quality,
             tie_rule: self.tie_rule.into(),
         }
     }
@@ -650,9 +638,6 @@ mod tests {
             "--min-input-base-quality",
             "16",
             "--output-per-base-tags=false",
-            "--trim=true",
-            "--min-consensus-base-quality",
-            "23",
             "--tie-rule",
             "ulp-relative",
             "--min-reads",
@@ -694,8 +679,6 @@ mod tests {
         assert_eq!(opts.error_rate_post_umi, 37);
         assert_eq!(opts.min_input_base_quality, 16);
         assert!(!opts.output_per_base_tags, "an explicit false must not be lost");
-        assert!(opts.trim);
-        assert_eq!(opts.min_consensus_base_quality, 23);
         assert_eq!(
             opts.tie_rule,
             fgumi_consensus::TieRule::UlpRelative,
@@ -743,8 +726,6 @@ mod tests {
         assert_eq!(opts.error_rate_post_umi, 40);
         assert_eq!(opts.min_input_base_quality, 10);
         assert!(opts.output_per_base_tags);
-        assert!(!opts.trim);
-        assert_eq!(opts.min_consensus_base_quality, 2);
         assert_eq!(opts.tie_rule, fgumi_consensus::TieRule::FgbioCompat);
         assert_eq!(opts.min_reads, 1);
         assert_eq!(opts.max_reads, None);
@@ -783,7 +764,6 @@ mod tests {
             read_group: ReadGroupOptions::default(),
             consensus: ConsensusCallingOptions {
                 output_per_base_tags: false,
-                min_consensus_base_quality: 0,
                 ..ConsensusCallingOptions::default()
             },
             threading: ThreadingOptions::none(),
@@ -1492,32 +1472,18 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_codec_execute_with_trim() -> Result<()> {
-        let dir = TempDir::new()?;
-        let input_path = dir.path().join("input.bam");
-        let output_path = dir.path().join("output.bam");
-
-        let mut records = Vec::new();
-        // Create reads with low quality at ends
-        let quals = [5, 5, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 5, 5, 5, 5]; // Low quality at ends
-        let (r1, r2) = create_codec_fr_pair_overlapping("UMI001", 100, 105, 20, &quals);
-        records.push(r1);
-        records.push(r2);
-
-        write_codec_bam(&input_path, records)?;
-
-        let mut cmd = create_codec_with_paths(input_path, output_path.clone());
-        cmd.read_group.read_name_prefix = Some("codec".to_string());
-        cmd.outer_bases_length = 0;
-        cmd.consensus.trim = true; // Enable trimming
-
-        cmd.execute("test")?;
-
-        // Should complete successfully (may or may not produce output depending on overlap after trim)
-        assert!(output_path.exists());
-
-        Ok(())
+    /// `codec` does not take `--trim` or `--min-consensus-base-quality`: fgbio's
+    /// `CallCodecConsensusReads` exposes neither and its caller hardcodes no
+    /// trimming and the `MIN_PHRED` floor, so fgumi used to accept both and then
+    /// ignore them. They must now fail to parse rather than silently no-op.
+    #[rstest]
+    #[case::trim(&["--trim"])]
+    #[case::trim_true(&["--trim=true"])]
+    #[case::min_consensus_base_quality(&["--min-consensus-base-quality", "30"])]
+    fn codec_rejects_flags_it_cannot_honor(#[case] flag: &[&str]) {
+        let args = ["codec", "-i", "in.bam", "-o", "out.bam"].iter().chain(flag).copied();
+        let err = Codec::try_parse_from(args).expect_err("codec must reject the flag");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{err}");
     }
 
     // Note: Overlapping consensus tests removed - CODEC does not support overlapping consensus

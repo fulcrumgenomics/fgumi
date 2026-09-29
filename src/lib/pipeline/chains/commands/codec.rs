@@ -180,8 +180,6 @@ pub(crate) fn codec_consensus_options(
         legacy_overlap_window: codec.legacy_overlap_window,
         cell_tag: Some(cell_tag),
         produce_per_base_tags: consensus.output_per_base_tags,
-        trim: consensus.trim,
-        min_consensus_base_quality: consensus.min_consensus_base_quality,
         // `codec.tie_rule` is already the resolved `TieRule` on `CodecOptions`.
         tie_rule: codec.tie_rule,
     }
@@ -646,9 +644,6 @@ mod tests {
             "--min-input-base-quality",
             "16",
             "--output-per-base-tags=false",
-            "--trim=true",
-            "--min-consensus-base-quality",
-            "23",
             "--tie-rule",
             "ulp-relative",
             "--min-reads",
@@ -690,8 +685,6 @@ mod tests {
         assert!(opts.legacy_overlap_window, "--legacy-overlap-window must reach the mapping");
         assert_eq!(opts.cell_tag, Some(cell_tag));
         assert!(!opts.produce_per_base_tags, "an explicit false must not be lost");
-        assert!(opts.trim);
-        assert_eq!(opts.min_consensus_base_quality, 23);
         assert_eq!(
             opts.tie_rule,
             fgumi_consensus::TieRule::UlpRelative,
