@@ -585,10 +585,6 @@ pub struct Extract {
     #[arg(long, short = 's')]
     single_tag: Option<SamTag>,
 
-    /// Tag containing adapter clipping position to adjust (e.g. 'XT' from `MarkIlluminaAdapters`)
-    #[arg(long)]
-    clipping_attribute: Option<SamTag>,
-
     /// Read group ID to use in the file header
     #[arg(long, default_value = "A")]
     read_group_id: String,
@@ -692,8 +688,6 @@ impl Extract {
     /// [`ExtractOptions::quality_encoding`]). Every other field maps directly
     /// from the identically-named CLI flag; `platform` (CLI default `"illumina"`)
     /// becomes `Some(..)` so `build_fastq_header` always emits `@RG PL:`.
-    /// `clipping_attribute` is intentionally dropped — it does not apply to FASTQ
-    /// input (there is no existing clipping to adjust).
     #[must_use]
     pub fn to_extract_options(&self) -> ExtractOptions {
         ExtractOptions {
@@ -871,9 +865,6 @@ impl Extract {
                  (RX, QX, CB, CY, BC, QT, RG): {tag}"
             );
         }
-
-        // Note: clipping_attribute doesn't apply to FASTQ input (no existing clipping to adjust)
-        // It's accepted for compatibility but has no effect in FASTQ→BAM mode
 
         Ok(())
     }
@@ -1405,10 +1396,6 @@ pub struct ExtractRunallOptions {
     #[arg(long = "single-tag")]
     pub single_tag: Option<SamTag>,
 
-    /// Tag containing adapter clipping position to adjust (e.g. 'XT' from `MarkIlluminaAdapters`)
-    #[arg(long = "clipping-attribute")]
-    pub clipping_attribute: Option<SamTag>,
-
     /// Wrap FASTQ inputs in a userspace async prefetch reader. Dedicates one
     /// OS thread per input stream to issue reads ahead of decompression/parsing.
     /// Hidden experimental flag.
@@ -1472,7 +1459,6 @@ impl Default for ExtractRunallOptions {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             async_reader: false,
             check_crc: false,
             no_check_crc: false,
@@ -1485,9 +1471,8 @@ impl ExtractRunallOptions {
     ///
     /// Verbatim-logic copy of [`Extract::to_extract_options`]: `quality_encoding`
     /// is the [`QualityEncoding::Standard`] placeholder (the chain FASTQ source
-    /// overrides it while opening its readers), `platform` becomes `Some(..)`, and
-    /// `clipping_attribute` is intentionally dropped — it does not apply to FASTQ
-    /// input. The `inputs`/`read_structures`/`interleaved` source fields are not
+    /// overrides it while opening its readers) and `platform` becomes `Some(..)`.
+    /// The `inputs`/`read_structures`/`interleaved` source fields are not
     /// part of this projection (PR B builds the FASTQ source from them).
     #[must_use]
     pub fn to_extract_options(&self) -> ExtractOptions {
@@ -1916,7 +1901,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "foo".to_string(),
             library: "bar".to_string(),
@@ -2128,7 +2112,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "foo".to_string(),
             library: "bar".to_string(),
@@ -2186,7 +2169,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "pip".to_string(),
             library: "pop".to_string(),
@@ -2248,7 +2230,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "pip".to_string(),
             library: "pop".to_string(),
@@ -2300,7 +2281,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -2361,7 +2341,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -2415,7 +2394,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -2476,7 +2454,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -2534,7 +2511,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -2599,7 +2575,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -2649,7 +2624,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "MyRG".to_string(),
             sample: "foo".to_string(),
             library: "bar".to_string(),
@@ -2722,7 +2696,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -2791,7 +2764,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -2847,7 +2819,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -2896,7 +2867,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -2952,7 +2922,6 @@ mod tests {
             extract_umis_from_read_names: true,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -3009,7 +2978,6 @@ mod tests {
             extract_umis_from_read_names: true,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -3222,7 +3190,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -3276,7 +3243,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -3342,7 +3308,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -3502,7 +3467,6 @@ mod tests {
             extract_umis_from_read_names: true,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -3559,7 +3523,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -3610,7 +3573,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -3658,7 +3620,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -3704,7 +3665,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -3750,7 +3710,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: true, // Enable read name annotation
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -3804,7 +3763,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: true, // Enable read name annotation
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -3857,7 +3815,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: Some("ZU".parse().expect("valid tag")), // Use single tag
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -3914,7 +3871,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: Some(SamTag::RX), // Same as umi_tag
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -3960,7 +3916,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: true, // Both features enabled
             single_tag: Some("ZU".parse().expect("valid tag")),
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -4020,7 +3975,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -4075,7 +4029,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -4214,7 +4167,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -4429,7 +4381,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -4496,7 +4447,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -4554,7 +4504,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -4627,7 +4576,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -4692,7 +4640,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -4751,7 +4698,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -4803,7 +4749,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "sample".to_string(),
             library: "library".to_string(),
@@ -4936,7 +4881,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -4993,7 +4937,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "RG1".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -5058,7 +5001,6 @@ mod tests {
             extract_umis_from_read_names,
             annotate_read_names: false,
             single_tag: None,
-            clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
             library: "l".to_string(),
@@ -5488,7 +5430,6 @@ mod tests {
             extract_umis_from_read_names: false,
             annotate_read_names: true,
             single_tag: Some(SamTag::MI),
-            clipping_attribute: None,
             read_group_id: "RGX".to_string(),
             sample: "SAMP".to_string(),
             library: "LIBR".to_string(),
@@ -5674,6 +5615,52 @@ mod tests {
         assert!(opts.validate().is_err());
     }
 
+    /// `--clipping-attribute` adjusts a clipping position that exists only on
+    /// BAM input, and extract reads FASTQ only, so the flag was parsed and then
+    /// ignored. It is gone from both `fgumi extract` and runall's
+    /// `--extract::` form: passing it fails to parse instead of being a no-op.
+    #[test]
+    fn clipping_attribute_is_an_unknown_argument() {
+        /// Asserts `err` is clap's unknown-argument error naming `flag` itself,
+        /// so a drifted sibling flag in the argv cannot satisfy the test.
+        fn assert_unknown(err: &clap::Error, flag: &str) {
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{err}");
+            assert!(
+                matches!(
+                    err.get(clap::error::ContextKind::InvalidArg),
+                    Some(clap::error::ContextValue::String(s)) if s == flag
+                ),
+                "expected {flag} to be the unknown argument: {err}"
+            );
+        }
+
+        let mut args = vec![
+            "extract",
+            "--inputs",
+            "r1.fq",
+            "--read-structures",
+            "+T",
+            "--sample",
+            "s1",
+            "--library",
+            "lib1",
+            "--output",
+            "out.bam",
+        ];
+        Extract::try_parse_from(&args).expect("the base extract argv must parse");
+        args.extend(["--clipping-attribute", "XT"]);
+        let err =
+            Extract::try_parse_from(&args).expect_err("extract must reject --clipping-attribute");
+        assert_unknown(&err, "--clipping-attribute");
+
+        let mut args = minimal_runall_args();
+        PrefixedExtract::try_parse_from(&args).expect("the base runall argv must parse");
+        args.extend(["--extract::clipping-attribute", "XT"]);
+        let err = PrefixedExtract::try_parse_from(&args)
+            .expect_err("runall must reject --extract::clipping-attribute");
+        assert_unknown(&err, "--extract::clipping-attribute");
+    }
+
     /// `--check-crc` with `--no-check-crc` is rejected by `validate()`.
     #[test]
     fn extract_runall_options_check_crc_conflicts_with_no_check_crc() {
@@ -5714,7 +5701,6 @@ mod tests {
         assert!(!defaults.extract_umis_from_read_names);
         assert!(!defaults.annotate_read_names);
         assert_eq!(defaults.single_tag, None);
-        assert_eq!(defaults.clipping_attribute, None);
         assert!(!defaults.async_reader);
         assert!(!defaults.check_crc);
         assert!(!defaults.no_check_crc);
