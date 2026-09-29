@@ -246,28 +246,6 @@ pub(crate) fn copy_umi_into_record(
     Ok(RecordOutcome { overwrote_rx, trimmed_name })
 }
 
-impl CopyUmi {
-    /// Reject a write target that resolves to the same file as the input, which
-    /// would clobber the BAM being read (mirrors `retag`/`merge`).
-    fn reject_write_aliasing_input(&self) -> Result<()> {
-        let Ok(input_canon) = std::fs::canonicalize(&self.io.input) else {
-            return Ok(());
-        };
-        let write_targets = std::iter::once((self.io.output.as_path(), "--output"))
-            .chain(self.metrics.as_deref().map(|m| (m, "--metrics")));
-        for (path, flag) in write_targets {
-            if std::fs::canonicalize(path).is_ok_and(|canon| canon == input_canon) {
-                bail!(
-                    "{flag} '{}' is the same file as --input '{}'; choose a different path",
-                    path.display(),
-                    self.io.input.display()
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
 /// Validate that the read-name field delimiter is a single ASCII byte.
 ///
 /// The sole delimiter validator, called by both `execute()`'s reader-free
@@ -407,7 +385,10 @@ impl Command for CopyUmi {
             outputs.push((path.as_path(), "--metrics"));
         }
         reject_output_collisions(&outputs)?;
-        self.reject_write_aliasing_input()?;
+        crate::commands::common::reject_writes_aliasing_inputs(
+            &[(self.io.input.as_path(), "--input")],
+            &outputs,
+        )?;
 
         self.execute_chain(command_line)
     }

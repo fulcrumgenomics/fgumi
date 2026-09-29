@@ -1286,3 +1286,68 @@ fn test_correct_chain_synthesizes_hd_for_headerless_input(#[case] threads: usize
         "multi-worker (--threads {threads}) must synthesize the same @HD as the single-worker run for headerless input",
     );
 }
+
+/// An `--output`, `--rejects` or `--metrics` path aliasing `--input` would
+/// truncate the BAM being read; standalone `correct` must refuse it before any
+/// writer opens and leave the input intact.
+#[rstest]
+#[case::output("-o")]
+#[case::rejects("--rejects")]
+#[case::metrics("--metrics")]
+fn test_correct_refuses_write_target_aliasing_input(#[case] flag: &str) {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.bam");
+    let header = create_minimal_header("chr1", 10_000);
+    let records = create_umi_family("ACGT", 3, "fam", "ACGTACGTACGT", 30);
+    crate::helpers::bam_generator::write_bam(&input, &header, &records);
+    let before = fs::read(&input).unwrap();
+    let out = tmp.path().join("out.bam");
+
+    let mut args = vec!["correct", "-i", input.to_str().unwrap(), "--umis", "ACGT"];
+    args.extend(["--min-distance", "1"]);
+    if flag != "-o" {
+        args.extend(["-o", out.to_str().unwrap()]);
+    }
+    args.extend([flag, input.to_str().unwrap()]);
+    let output =
+        std::process::Command::new(env!("CARGO_BIN_EXE_fgumi")).args(&args).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{flag} aliasing --input must be refused");
+    let label = if flag == "-o" { "--output" } else { flag };
+    assert!(
+        stderr.contains(&format!("{label} '{}' is the same file as --input", input.display())),
+        "expected the aliasing error naming {label}, got:\n{stderr}"
+    );
+    assert_eq!(fs::read(&input).unwrap(), before, "the input BAM must be left untouched");
+}
+
+/// A rejects path aliasing a `--umi-files` whitelist would overwrite it; the
+/// guard covers every file correct reads, not just the BAM.
+#[test]
+fn test_correct_refuses_rejects_aliasing_umi_file() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.bam");
+    let header = create_minimal_header("chr1", 10_000);
+    crate::helpers::bam_generator::write_bam(
+        &input,
+        &header,
+        &create_umi_family("ACGT", 3, "fam", "ACGTACGTACGT", 30),
+    );
+    let umis = tmp.path().join("umis.txt");
+    fs::write(&umis, "ACGT\n").unwrap();
+    let before = fs::read(&umis).unwrap();
+    let out = tmp.path().join("out.bam");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args(["correct", "-i", input.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .args(["--umi-files", umis.to_str().unwrap(), "--min-distance", "1"])
+        .args(["--rejects", umis.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "--rejects aliasing --umi-files must be refused");
+    assert!(
+        stderr.contains(&format!("--rejects '{}' is the same file as --umi-files", umis.display())),
+        "expected the aliasing error, got:\n{stderr}"
+    );
+    assert_eq!(fs::read(&umis).unwrap(), before, "the whitelist must be left untouched");
+}

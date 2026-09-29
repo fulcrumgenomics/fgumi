@@ -488,30 +488,6 @@ impl Retag {
     pub fn to_retag_options(&self) -> RetagOptions {
         RetagOptions { operations: self.operations.clone(), metrics: self.metrics.clone() }
     }
-
-    /// Reject a `--output`/`--metrics` path that resolves to the same file as
-    /// `--input`, which would clobber the BAM being read.
-    ///
-    /// Paths are compared after [`std::fs::canonicalize`] resolves symlinks and
-    /// `.`/`..`. A write target that does not exist yet cannot alias an existing
-    /// input, so an unresolvable target is left for the writer to create.
-    fn reject_write_aliasing_input(&self) -> Result<()> {
-        let Ok(input_canon) = std::fs::canonicalize(&self.io.input) else {
-            return Ok(());
-        };
-        let write_targets = std::iter::once((self.io.output.as_path(), "--output"))
-            .chain(self.metrics.as_deref().map(|m| (m, "--metrics")));
-        for (path, flag) in write_targets {
-            if std::fs::canonicalize(path).is_ok_and(|canon| canon == input_canon) {
-                bail!(
-                    "{flag} '{}' is the same file as --input '{}'; choose a different path",
-                    path.display(),
-                    self.io.input.display()
-                );
-            }
-        }
-        Ok(())
-    }
 }
 
 impl Retag {
@@ -585,10 +561,13 @@ impl Command for Retag {
             outputs.push((path.as_path(), "--metrics"));
         }
         reject_output_collisions(&outputs)?;
-        // A write target that aliases the input would clobber the file being read.
-        // Reject it up front, resolving symlinks/`.`/`..` via canonicalize, before any
-        // reader or writer opens (matching `merge`'s output-vs-input guard).
-        self.reject_write_aliasing_input()?;
+        // A write target that is the same file as the input (by dev+inode, so
+        // symlinks, hard links and a redirected stdin count) would clobber the
+        // file being read. Reject it up front, before any reader or writer opens.
+        crate::commands::common::reject_writes_aliasing_inputs(
+            &[(self.io.input.as_path(), "--input")],
+            &outputs,
+        )?;
         // The declarative chain is the only execution path. It emits its own CRC
         // log, `Starting Retag` banner + `OperationTimer`, and the
         // summary/warn/metrics finalize hooks inside `ChainBuilder::add_retag`

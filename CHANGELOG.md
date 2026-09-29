@@ -35,6 +35,9 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
+- Honor `--correct::rejects` on a `fgumi runall` chain that runs past `correct` (e.g. `--start-from extract --stop-after zipper`). The fused chain silently dropped it, so the run logged the rejected count and exited 0 but wrote no rejects file. The top-level `--rejects` still does not capture UMI rejects there: it is the consensus stage's rejects file when the chain reaches one, and unused otherwise ([#995](https://github.com/fulcrumgenomics/fgumi/pull/995)).
+- `fgumi runall` now warns about every output flag the chain will not honor instead of dropping it silently: a `--correct::rejects` on a chain with no correct stage, or overridden by `--rejects` on a correct self-pair, and a top-level `--rejects` / `--stats` nothing consumes. Its hints name a per-stage flag (`--correct::rejects`, `--filter::rejects`, `--filter::stats`) only for a stage the chain runs and a flag not already set (`--all-metrics` counts as setting `--filter::stats`) ([#995](https://github.com/fulcrumgenomics/fgumi/pull/995)).
+- Refuse an output, rejects or metrics path that is the same file as an input, on `fgumi runall` (source BAM/FASTQs, `--unmapped`, `--ref`, `--filter::ref`, `--correct::umi-files`, the consensus `--*::intervals`) and `fgumi correct` (`--input`, `--umi-files`), which could otherwise truncate a file they were reading. The check compares dev+inode, so hard links and a redirected stdin (`-i - < in.bam`) are caught, and it is shared with `copy-umi`, `retag` and `fastq`, whose own copies it replaces ([#995](https://github.com/fulcrumgenomics/fgumi/pull/995)).
 - **BREAKING:** `fgumi filter --stats` now writes a headered one-row metrics TSV
   (`total_reads`, `passed_reads`, `failed_reads`, `pass_rate`) like every other fgumi
   metrics file, instead of a headerless two-column key/value file. Field names and

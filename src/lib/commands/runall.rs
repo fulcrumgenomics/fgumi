@@ -1176,6 +1176,130 @@ impl RunAll {
         })
     }
 
+    /// Warn about output flags this chain will not honor: a top-level
+    /// `--stats` / `--rejects` nothing consumes, or one that leaves correct's
+    /// UMI rejects uncaptured, and a `--correct::rejects` that no correct stage
+    /// reads or that the top-level `--rejects` overrides. Warn (not bail),
+    /// matching the A7 convention: the run is valid, just missing an output the
+    /// user expected on the wrong flag. Hints name a per-stage flag only for a
+    /// stage this chain runs and a flag the user has not already set.
+    fn warn_dead_output_flags(
+        &self,
+        stages: &[crate::pipeline::chains::Stage],
+        chain_reaches_consensus: bool,
+    ) {
+        use crate::pipeline::chains::Stage;
+
+        // Surface a warning if --rejects is set on a chained correct run that
+        // reaches consensus while --correct::rejects is not. There the top-level
+        // --rejects is the consensus stage's rejects file, so correct's UMI
+        // rejects would go uncaptured (see `correct_rejects_source`). A chain
+        // that reaches no consensus is covered by the A7 warning below.
+        if stages.contains(&Stage::Correct)
+            && chain_reaches_consensus
+            && self.rejects_opts.rejects.is_some()
+            && self.correct_opts.correct_rejects_path.is_none()
+        {
+            log::warn!(
+                "--rejects with --start-from {} --stop-after {} collects only the consensus \
+             stage's rejects, not correct's UMI rejects. Use --correct::rejects to capture \
+             UMI rejects.",
+                self.start_from,
+                self.stop_after_stage()
+            );
+        }
+
+        // A7: warn on top-level --stats / --rejects that the derived chain
+        // never consumes, so a silently-dead flag does not mislead. Top-level
+        // --stats is cloned only into consensus stages; top-level --rejects is
+        // wired only into a correct self-pair or a consensus stage. Point the
+        // user at the per-stage flag that would capture what they wanted, but
+        // only for a stage this chain runs and a flag they have not already set.
+        // Use warn (not bail) — the run is still valid, just missing the output
+        // the user expected on the wrong flag.
+        let has_filter = stages.contains(&Stage::Filter);
+        if self.stats_opts.stats.is_some() && !chain_reaches_consensus {
+            // `--all-metrics` derives the filter stats path, so it counts as set.
+            let hint = if has_filter
+                && self.filter_opts.filter_stats.is_none()
+                && self.all_metrics.is_none()
+            {
+                " Use --filter::stats to capture filter statistics."
+            } else {
+                ""
+            };
+            log::warn!(
+                "--stats is consumed only by the consensus stage; it is dead on a runall chain \
+             that reaches no consensus stage.{hint}"
+            );
+        }
+        if self.rejects_opts.rejects.is_some()
+            && !chain_reaches_consensus
+            && self.stop_after_stage() != RunAllStage::Correct
+        {
+            let mut hints = Vec::new();
+            if stages.contains(&Stage::Correct) && self.correct_opts.correct_rejects_path.is_none()
+            {
+                hints.push("--correct::rejects to capture UMI rejects");
+            }
+            if has_filter && self.filter_opts.filter_rejects.is_none() {
+                hints.push("--filter::rejects to capture filter rejects");
+            }
+            let hint = if hints.is_empty() {
+                String::new()
+            } else {
+                format!(" Use {}.", hints.join(" or "))
+            };
+            log::warn!(
+                "--rejects is wired nowhere on this runall chain (it is consumed only by a correct \
+             self-pair or a consensus stage).{hint}"
+            );
+        }
+        // Same silent-dead shape for the per-stage flag: `--correct::rejects`
+        // is read only by a correct stage, which this chain may not include
+        // (a later --start-from, or an extract chain without --correct::umis /
+        // --correct::umi-files).
+        if self.correct_opts.correct_rejects_path.is_some() && !stages.contains(&Stage::Correct) {
+            log::warn!(
+                "--correct::rejects is wired nowhere on this runall chain: it includes no correct \
+             stage, so no UMI rejects file will be written."
+            );
+        }
+        // On a correct self-pair the top-level --rejects takes precedence, so a
+        // different --correct::rejects alongside it is dead too.
+        if self.stop_after_stage() == RunAllStage::Correct
+            && let (Some(top), Some(per_stage)) =
+                (&self.rejects_opts.rejects, &self.correct_opts.correct_rejects_path)
+            && !crate::commands::common::paths_refer_to_same_file(top, per_stage)
+        {
+            log::warn!(
+                "--correct::rejects {} is ignored: on a correct self-pair the top-level \
+             --rejects {} takes precedence.",
+                per_stage.display(),
+                top.display()
+            );
+        }
+    }
+
+    /// The rejects file the correct stage opens, paired with the flag that
+    /// supplied it — the single source for both the options bag and the
+    /// output-collision guard's label.
+    ///
+    /// A correct self-pair (`--stop-after correct`) prefers the top-level
+    /// `--rejects`, falling back to `--correct::rejects`. A chained correct
+    /// reads only `--correct::rejects`: on such a chain the top-level
+    /// `--rejects` belongs to the consensus stage, and routing it into correct
+    /// too would open two writers on one file. `add_correct` wires the 2-output
+    /// rejects step at either stage position, so both cases capture UMI rejects.
+    fn correct_rejects_source(&self) -> Option<(PathBuf, &'static str)> {
+        if self.stop_after_stage() == RunAllStage::Correct
+            && let Some(path) = &self.rejects_opts.rejects
+        {
+            return Some((path.clone(), "--rejects"));
+        }
+        self.correct_opts.correct_rejects_path.clone().map(|path| (path, "--correct::rejects"))
+    }
+
     /// Returns the derived PREFIX (not a full filename) for one stage's
     /// metrics option that is itself a prefix the stage's own writer fans
     /// out from (group's `metrics_prefix`, and each consensus stage's
@@ -1201,10 +1325,10 @@ impl RunAll {
     ///   `rejects_path`:
     ///   - Self-pair (`--stop-after correct`): honors the top-level
     ///     `--rejects`, falling back to `--correct::rejects`.
-    ///   - Cross-stage (correct feeds AAM): `rejects_path` = `None` (the
-    ///     fused chain uses the kept-only correct step; UMI rejects are
-    ///     discarded — `RunAll::execute` emits a warning when `--rejects` is
-    ///     set on a chained correct run).
+    ///   - Cross-stage (correct feeds AAM): honors `--correct::rejects` only.
+    ///
+    ///   See [`Self::correct_rejects_source`], which both this arm and the
+    ///   output-collision guard read.
     ///
     /// * **Align** — constructs
     ///   [`AlignOptions`](crate::pipeline::chains::options_bag::AlignOptions)
@@ -1277,13 +1401,7 @@ impl RunAll {
                     if opts.metrics.is_none() {
                         opts.metrics = self.derived_metrics_path("correct", "metrics.txt");
                     }
-                    opts.rejects_path = if self.stop_after_stage() == RunAllStage::Correct {
-                        // self-pair: honor top-level --rejects, falling back to --correct::rejects.
-                        self.rejects_opts.rejects.clone().or(opts.rejects_path)
-                    } else {
-                        // fused kept-only correct discards UMI rejects (see execute() warn)
-                        None
-                    };
+                    opts.rejects_path = self.correct_rejects_source().map(|(path, _)| path);
                     bag.correct = Some(opts);
                 }
 
@@ -1687,49 +1805,7 @@ impl Command for RunAll {
             log::info!("Strategy: {:?}, edits: {}", group_opts.strategy, group_opts.edits);
         }
 
-        // Surface a warning if --rejects is set with --start-from
-        // extract/correct and a chained --stop-after. The fused chain uses
-        // the kept-only correct step (no UMI-rejects branch), so the rejects
-        // file collects only downstream rejects (post-consensus / etc.), not
-        // correct's UMI rejects. Users who need UMI rejects should stage a
-        // `fgumi correct --rejects` step separately.
-        if matches!(self.start_from, RunAllStage::Extract | RunAllStage::Correct)
-            && self.stop_after_stage() != RunAllStage::Correct
-            && stages.contains(&Stage::Correct)
-            && self.rejects_opts.rejects.is_some()
-        {
-            log::warn!(
-                "--rejects with --start-from {} --stop-after {} discards correct's UMI rejects \
-                 (the fused chain has no UMI-rejects branch). The rejects file will collect only \
-                 downstream rejects. Use a separate `fgumi correct --rejects` step if you need \
-                 UMI rejects captured.",
-                self.start_from,
-                self.stop_after_stage()
-            );
-        }
-
-        // A7: warn on top-level --stats / --rejects that the derived chain
-        // never consumes, so a silently-dead flag does not mislead. Top-level
-        // --stats is cloned only into consensus stages; top-level --rejects is
-        // wired only into a correct self-pair or a consensus stage. Filter reads
-        // its own --filter::stats / --filter::rejects, so point the user there.
-        // Use warn (not bail) — the run is still valid, just missing the output
-        // the user expected on the wrong flag.
-        if self.stats_opts.stats.is_some() && !chain_reaches_consensus {
-            log::warn!(
-                "--stats is consumed only by the consensus stage; it is dead on a runall chain \
-                 that reaches no consensus stage. Use --filter::stats to capture filter statistics."
-            );
-        }
-        if self.rejects_opts.rejects.is_some()
-            && !chain_reaches_consensus
-            && !stages.contains(&Stage::Correct)
-        {
-            log::warn!(
-                "--rejects is wired nowhere on this runall chain (it is consumed only by a correct \
-                 self-pair or a consensus stage). Use --filter::rejects to capture filter rejects."
-            );
-        }
+        self.warn_dead_output_flags(&stages, chain_reaches_consensus);
 
         // Validate the input BAM exists, once every earlier guard (stage
         // ordering, --ref/--methylation-mode, align pre-flight) has already
@@ -1761,20 +1837,17 @@ impl Command for RunAll {
         // common.rs). Enumerate only the writer paths the bag actually wired —
         // reading them off the populated `stage_opts` so the guard fires on the
         // exact paths the chain will open. `--input`/`--unmapped` are read-only
-        // and exempt; stdin/`-`/`/dev/null` are handled inside the guard.
+        // and exempt here (the input-aliasing guard below covers them);
+        // stdin/`-`/`/dev/null` are handled inside the guard.
         let mut write_targets: Vec<(&std::path::Path, &str)> =
             vec![(self.output.as_path(), "--output")];
-        if let Some(rejects) = stage_opts.correct.as_ref().and_then(|c| c.rejects_path.as_ref()) {
-            // Name the flag that actually supplied this path: the correct
-            // self-pair prefers top-level `--rejects`, falling back to
-            // `--correct::rejects` (see the Stage::Correct arm), so the
-            // collision message points at the flag the user really typed.
-            let label = if self.rejects_opts.rejects.is_some() {
-                "--rejects"
-            } else {
-                "--correct::rejects"
-            };
-            write_targets.push((rejects.as_path(), label));
+        // Name the flag that actually supplied correct's rejects path (see
+        // `correct_rejects_source`), so the collision message points at the flag
+        // the user really typed. Held in a local that outlives the borrow.
+        let correct_rejects =
+            stages.contains(&Stage::Correct).then(|| self.correct_rejects_source()).flatten();
+        if let Some((path, label)) = &correct_rejects {
+            write_targets.push((path.as_path(), label));
         }
         #[cfg(feature = "consensus")]
         {
@@ -1823,6 +1896,11 @@ impl Command for RunAll {
             write_targets.push((path.as_path(), *label));
         }
         crate::commands::common::reject_output_collisions(&write_targets)?;
+        // A write target aliasing any file the chain reads would truncate it
+        // before (or while) it is read — including a rejects path, which the
+        // chain opens before the source drains.
+        let read_targets = read_targets(&source, &stage_opts, self.reference.as_deref());
+        crate::commands::common::reject_writes_aliasing_inputs(&read_targets, &write_targets)?;
 
         let spec = ChainSpec {
             stages,
@@ -1845,6 +1923,52 @@ impl Command for RunAll {
         log::info!("runall completed successfully");
         Ok(())
     }
+}
+
+/// Every file the derived chain reads, each labelled with the flag that named
+/// it, for the write-vs-input aliasing guard. The source files come off the
+/// built `source`, so this cannot drift from what the chain opens; the rest are
+/// the per-stage read-only files the bag wired: the reference(s), the UMI
+/// whitelists and the consensus metrics interval lists.
+fn read_targets<'a>(
+    source: &'a crate::pipeline::chains::SourceSpec,
+    stage_opts: &'a crate::pipeline::chains::StageOptionsBag,
+    reference: Option<&'a std::path::Path>,
+) -> Vec<(&'a std::path::Path, &'static str)> {
+    use crate::pipeline::chains::SourceSpec;
+
+    let mut targets: Vec<(&std::path::Path, &'static str)> = match source {
+        SourceSpec::Bam(path) | SourceSpec::Sam(path) => vec![(path.as_path(), "--input")],
+        SourceSpec::PairedBams { unmapped, mapped, reference: _ } => {
+            vec![(mapped.as_path(), "--input"), (unmapped.as_path(), "--unmapped")]
+        }
+        SourceSpec::Fastqs { paths, .. } => {
+            paths.iter().map(|path| (path.as_path(), "--extract::inputs")).collect()
+        }
+        SourceSpec::InterleavedFastq { path, .. } => vec![(path.as_path(), "--extract::inputs")],
+    };
+    if let Some(reference) = reference {
+        targets.push((reference, "--ref"));
+    }
+    if let Some(filter_ref) = stage_opts.filter.as_ref().and_then(|f| f.reference.as_deref())
+        && Some(filter_ref) != reference
+    {
+        targets.push((filter_ref, "--filter::ref"));
+    }
+    if let Some(correct) = stage_opts.correct.as_ref() {
+        targets.extend(correct.umi_files.iter().map(|p| (p.as_path(), "--correct::umi-files")));
+    }
+    #[cfg(feature = "consensus")]
+    for (intervals, label) in [
+        (stage_opts.simplex.as_ref().and_then(|o| o.intervals.as_ref()), "--simplex::intervals"),
+        (stage_opts.duplex.as_ref().and_then(|o| o.intervals.as_ref()), "--duplex::intervals"),
+        (stage_opts.codec.as_ref().and_then(|o| o.intervals.as_ref()), "--codec::intervals"),
+    ] {
+        if let Some(path) = intervals {
+            targets.push((path.as_path(), label));
+        }
+    }
+    targets
 }
 
 /// The metrics output paths the derived chain will open as writers, for the
@@ -2492,6 +2616,75 @@ mod bag_tests {
         ]);
         let bag = r.build_stage_options_bag(&[Stage::Correct]).unwrap();
         assert_eq!(bag.correct.unwrap().metrics, Some(PathBuf::from("all.correct.metrics.txt")));
+    }
+
+    /// Build the correct bag for `--start-from correct --stop-after <stop>`
+    /// with the given optional top-level `--rejects` and `--correct::rejects`,
+    /// returning the `rejects_path` the chain's correct step will open.
+    fn correct_rejects_path(
+        stop: &str,
+        top_level: Option<&str>,
+        per_stage: Option<&str>,
+    ) -> Option<PathBuf> {
+        let mut args = vec![
+            "--start-from",
+            "correct",
+            "--stop-after",
+            stop,
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--correct::min-distance",
+            "1",
+            "--correct::umis",
+            "AAAA",
+        ];
+        if let Some(path) = top_level {
+            args.extend(["--rejects", path]);
+        }
+        if let Some(path) = per_stage {
+            args.extend(["--correct::rejects", path]);
+        }
+        let r = parse(&args);
+        r.build_stage_options_bag(&[Stage::Correct]).unwrap().correct.unwrap().rejects_path
+    }
+
+    /// A chained correct (here feeding align/zipper) must honor
+    /// `--correct::rejects`: the fused chain wires the same 2-output rejects
+    /// step the self-pair does, so dropping it silently lost a requested file.
+    #[test]
+    fn chained_correct_honors_per_stage_rejects() {
+        assert_eq!(
+            correct_rejects_path("zipper", None, Some("umi_rejects.bam")),
+            Some(PathBuf::from("umi_rejects.bam"))
+        );
+    }
+
+    /// On a chained run the top-level `--rejects` belongs to the consensus
+    /// stage, so it must not be routed into correct (two writers on one file),
+    /// with or without a `--correct::rejects` alongside it.
+    #[test]
+    fn chained_correct_ignores_top_level_rejects() {
+        assert_eq!(correct_rejects_path("zipper", Some("rejects.bam"), None), None);
+        assert_eq!(
+            correct_rejects_path("zipper", Some("rejects.bam"), Some("umi_rejects.bam")),
+            Some(PathBuf::from("umi_rejects.bam"))
+        );
+    }
+
+    /// The self-pair keeps its documented precedence: top-level `--rejects`
+    /// first, falling back to `--correct::rejects`.
+    #[test]
+    fn self_pair_correct_prefers_top_level_rejects() {
+        assert_eq!(
+            correct_rejects_path("correct", Some("rejects.bam"), Some("umi_rejects.bam")),
+            Some(PathBuf::from("rejects.bam"))
+        );
+        assert_eq!(
+            correct_rejects_path("correct", None, Some("umi_rejects.bam")),
+            Some(PathBuf::from("umi_rejects.bam"))
+        );
     }
 
     #[test]

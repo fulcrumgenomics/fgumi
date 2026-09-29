@@ -342,34 +342,6 @@ impl Fastq {
         }
         qm
     }
-
-    /// Reject a write target that resolves to the same file as the `--input`
-    /// BAM, which would clobber the file being read (mirrors `retag`/`copy_umi`).
-    ///
-    /// The input BAM always exists, so it canonicalises; any output that
-    /// canonicalises to the same path is rejected before a writer truncates it.
-    /// This also catches a symlinked or `./`-spelled output that resolves to the
-    /// input. Stdin input (`-`/`/dev/stdin`) has no filesystem entity to
-    /// canonicalise and cannot be clobbered, so the guard no-ops there.
-    ///
-    /// Output-vs-output collisions — two paths naming one destination, and the
-    /// stdout-multiplexing case — are handled separately by
-    /// [`reject_output_collisions`], which shares the same `(path, flag)` slice.
-    fn reject_write_aliasing_input(&self, outputs: &[(&Path, &str)]) -> Result<()> {
-        let Ok(input_canon) = std::fs::canonicalize(&self.input) else {
-            return Ok(());
-        };
-        for (path, flag) in outputs {
-            if std::fs::canonicalize(path).is_ok_and(|canon| canon == input_canon) {
-                anyhow::bail!(
-                    "{flag} '{}' is the same file as --input '{}'; choose a different path",
-                    path.display(),
-                    self.input.display()
-                );
-            }
-        }
-        Ok(())
-    }
 }
 
 impl Command for Fastq {
@@ -389,7 +361,7 @@ impl Command for Fastq {
         // user-specified outputs are checked; the default interleaved stdout
         // (`self.output == None`) names no file and is skipped. `reject_output_collisions`
         // handles output-vs-output (including stdout multiplexing and `./`/symlink
-        // aliases, with `/dev/null` exempt); `reject_write_aliasing_input` handles
+        // aliases, with `/dev/null` exempt); `reject_writes_aliasing_inputs` handles
         // output-vs-input.
         let mut outputs: Vec<(&Path, &str)> = Vec::new();
         if let Some(p) = &self.output {
@@ -412,7 +384,10 @@ impl Command for Fastq {
             outputs.push((Path::new("-"), "--out0 (default: stdout)"));
         }
         reject_output_collisions(&outputs)?;
-        self.reject_write_aliasing_input(&outputs)?;
+        crate::commands::common::reject_writes_aliasing_inputs(
+            &[(self.input.as_path(), "--input")],
+            &outputs,
+        )?;
 
         self.log_config();
 
@@ -952,7 +927,7 @@ mod tests {
 
     // Output-vs-output collision detection is provided by the reused
     // `reject_output_collisions` helper (tested in `common.rs`), and the
-    // output-vs-input clobber guard (`reject_write_aliasing_input`) is exercised
+    // output-vs-input clobber guard (`reject_writes_aliasing_inputs`) is exercised
     // end-to-end by the integration tests (`test_fastq_output_same_as_input_rejected`,
     // `_symlink_to_input_rejected`, `_paired_duplicate_output_rejected`), so no
     // unit test duplicates them here.
