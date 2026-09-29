@@ -1999,12 +1999,21 @@ fn correct_rejects_without_correct_stage_warns() {
 /// logged `CRC verify: off`. The default (file ⇒ verify) must still reject.
 #[test]
 fn extract_honors_no_check_crc_on_bgzf_fastq() {
-    const NUM_RECORDS: usize = 350_000;
+    // Quality-encoding detection samples through a 1 MiB buffer, so the
+    // corrupted last block must sit well past the first MiB of decompressed
+    // FASTQ for only the split decoder to reach it. Size the fixture by bytes
+    // (4x that buffer) with long reads, keeping the record count, and so the
+    // debug-build runtime, small.
+    const MIN_FASTQ_BYTES: usize = 4 * 1024 * 1024;
     let tmp = TempDir::new().unwrap();
     let fastq = tmp.path().join("reads.fq.gz");
+    let bases = "ACGT".repeat(38);
+    let quals = "I".repeat(bases.len());
     let mut records = Vec::new();
-    for i in 0..NUM_RECORDS {
-        writeln!(records, "@q{i}\nACGTACGTAC\n+\nIIIIIIIIII").unwrap();
+    let mut num_records = 0;
+    while records.len() < MIN_FASTQ_BYTES {
+        writeln!(records, "@q{num_records}\n{bases}\n+\n{quals}").unwrap();
+        num_records += 1;
     }
     write_bgzf_fastq_with_corrupt_last_crc(&fastq, &records);
 
@@ -2056,7 +2065,7 @@ fn extract_honors_no_check_crc_on_bgzf_fastq() {
         "standalone extract --no-check-crc",
     );
     let (_, records) = read_bam_output(&skipped);
-    assert_eq!(records.len(), NUM_RECORDS, "every record must be extracted");
+    assert_eq!(records.len(), num_records, "every record must be extracted");
     // The standalone oracle runs the same decoder, so also pin identity and
     // order against the fixture itself — including the corrupted last block.
     for (i, record) in records.iter().enumerate() {
