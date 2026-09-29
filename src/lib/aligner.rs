@@ -746,6 +746,19 @@ pub fn substitute_template(template: &str, reference: &Path, threads: usize) -> 
 /// flight fit in a few GB of RAM.
 pub const DEFAULT_ALIGNER_CHUNK_SIZE: u64 = 150_000_000;
 
+/// `--aligner::dedup-reads`: whether the in-process bwa-mem3 backend skips
+/// seeding exact duplicate read pairs, copying each one's alignment from one
+/// copy (its representative) in its `-K` cohort (bwa-mem3's `--dedup-reads`
+/// memo). Output is byte-identical either way; `on` saves the seeding work on
+/// PCR-duplicate-rich input (UMI and amplicon libraries).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DedupReads {
+    /// Seed each distinct read pair once per cohort (the default).
+    On,
+    /// Seed every read pair.
+    Off,
+}
+
 /// Default sub-batch size, in templates, for the in-process bwa-mem3
 /// backend's internal batching. Only meaningful with
 /// `--aligner::preset bwa-mem3-inproc`; see
@@ -788,6 +801,8 @@ pub(crate) fn default_sub_batch_templates() -> usize {
 ///   Only meaningful with `--aligner::preset bwa-mem3-inproc`;
 ///   `Self::resolve` rejects it with any other preset or with command
 ///   mode, and defaults it from `default_sub_batch_templates` when unset.
+/// - `dedup_reads` — `Option<DedupReads>`, likewise in-process only; `None`
+///   means `on`.
 #[multi_options("aligner", "Aligner Options")]
 #[derive(Args, Debug, Clone)]
 pub struct AlignerOptions {
@@ -821,6 +836,14 @@ pub struct AlignerOptions {
     /// `MAX_SUB_BATCH_TEMPLATES`. `None` uses `default_sub_batch_templates()`.
     #[arg(long = "sub-batch-templates", hide = true)]
     pub sub_batch_templates: Option<usize>,
+
+    /// Skip seeding exact duplicate read pairs (same bases in both mates) and
+    /// copy their alignment from one copy in the cohort, as bwa-mem3's
+    /// `--dedup-reads` does. Output is byte-identical either way; `on` is faster
+    /// on PCR-duplicate-rich input. Only valid with `--aligner::preset
+    /// bwa-mem3-inproc`. [default: on]
+    #[arg(long = "dedup-reads", value_enum)]
+    pub dedup_reads: Option<DedupReads>,
 }
 
 /// Hand-rolled `Default` impl. **Must** match each field's clap
@@ -839,6 +862,7 @@ impl Default for AlignerOptions {
             threads: None,
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
             sub_batch_templates: None,
+            dedup_reads: None,
         }
     }
 }
@@ -872,7 +896,12 @@ pub(crate) enum ResolvedBackend {
     /// before reaching this arm otherwise), but the variant itself is
     /// unconditional — see the enum-level doc.
     #[allow(dead_code)] // constructed only with the feature; matched everywhere
-    InProcessBwaMem3 { reference: PathBuf, sub_batch_templates: usize },
+    InProcessBwaMem3 {
+        reference: PathBuf,
+        sub_batch_templates: usize,
+        /// `--aligner::dedup-reads` resolved (`on` unless set to `off`).
+        dedup_reads: bool,
+    },
 }
 
 /// Result of [`AlignerOptions::resolve`] — a ready-to-construct aligner
@@ -949,6 +978,8 @@ impl AlignerOptions {
     /// - `--aligner::sub-batch-templates` set with any preset other than
     ///   `bwa-mem3-inproc`, or with command mode; or set to zero or more than
     ///   `MAX_SUB_BATCH_TEMPLATES`.
+    /// - `--aligner::dedup-reads` set with any preset other than
+    ///   `bwa-mem3-inproc`, or with command mode.
     /// - Command mode + a preset-only flag (`--aligner-bin` or
     ///   `--aligner::threads`).
     /// - Command mode template missing `{ref}`.
@@ -1002,6 +1033,18 @@ impl AlignerOptions {
                  --aligner::command"
             );
         }
+        // Likewise `--aligner::dedup-reads`: it configures the in-process
+        // backend's read-pair memo. A subprocess bwa-mem3 runs its own
+        // `--dedup-reads` default, which `--aligner::command` can set.
+        if self.dedup_reads.is_some() && !matches!(self.preset, Some(AlignerPreset::BwaMem3InProc))
+        {
+            bail!(
+                "--aligner::dedup-reads is only valid with --aligner::preset \
+                 bwa-mem3-inproc; it configures the in-process backend's read-pair \
+                 memo (a subprocess bwa-mem3 applies its own --dedup-reads, which \
+                 --aligner::command can set)"
+            );
+        }
         match (self.preset, self.command) {
             (None, None) => bail!(
                 "--start-from align requires one of `--aligner::preset` \
@@ -1016,6 +1059,7 @@ impl AlignerOptions {
                 self.threads,
                 aligner_bin,
                 self.sub_batch_templates,
+                self.dedup_reads,
                 self.chunk_size,
             ),
             (Some(preset), None) => {
@@ -1104,6 +1148,7 @@ fn resolve_inproc(
     threads: Option<usize>,
     aligner_bin: Option<&Path>,
     sub_batch_templates: Option<usize>,
+    dedup_reads: Option<DedupReads>,
     chunk_size: u64,
 ) -> Result<ResolvedAligner> {
     if threads.is_some() {
@@ -1148,6 +1193,7 @@ fn resolve_inproc(
             backend: ResolvedBackend::InProcessBwaMem3 {
                 reference: reference.to_path_buf(),
                 sub_batch_templates,
+                dedup_reads: dedup_reads != Some(DedupReads::Off),
             },
             chunk_size,
             threads: None,
@@ -1488,6 +1534,7 @@ mod tests {
             threads: None,
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
             sub_batch_templates: None,
+            dedup_reads: None,
         };
         let resolved = opts.resolve(&ref_path, 4, None).unwrap();
         let ResolvedBackend::Subprocess { command, .. } = resolved.backend else {
@@ -1512,6 +1559,7 @@ mod tests {
             threads: None,
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
             sub_batch_templates: None,
+            dedup_reads: None,
         };
         let err = opts.resolve(&ref_path, 4, Some(&bin)).unwrap_err();
         let msg = err.to_string();
@@ -1579,6 +1627,13 @@ mod tests {
                         panic!("resolve_from_args: bad sub-batch-templates: {e}")
                     }));
                 }
+                "--aligner::dedup-reads" => {
+                    use clap::ValueEnum;
+                    opts.dedup_reads = Some(
+                        DedupReads::from_str(value, false)
+                            .unwrap_or_else(|e| panic!("resolve_from_args: bad dedup-reads: {e}")),
+                    );
+                }
                 other => panic!("resolve_from_args: unrecognized flag {other}"),
             }
         }
@@ -1620,6 +1675,11 @@ mod tests {
         "bwa-mem3-inproc",
         &["--aligner::sub-batch-templates", "65537"],
         "--aligner::sub-batch-templates must be at most 65536 (got 65537)"
+    )]
+    #[case::dedup_reads_rejected_with_subprocess_preset(
+        "bwa-mem3",
+        &["--aligner::dedup-reads", "off"],
+        "--aligner::dedup-reads is only valid with --aligner::preset bwa-mem3-inproc"
     )]
     #[case::sub_batch_templates_rejected_with_subprocess_preset(
         "bwa-mem3",
@@ -1692,6 +1752,54 @@ mod tests {
             "got: {:?}",
             resolved.backend
         );
+    }
+
+    /// `--aligner::dedup-reads` with command mode is rejected like the other
+    /// in-process-only knobs.
+    #[test]
+    fn resolve_command_mode_rejects_dedup_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        let opts = AlignerOptions {
+            command: Some("bwa-mem3 mem -t {threads} {ref} /dev/stdin".to_string()),
+            dedup_reads: Some(DedupReads::Off),
+            ..AlignerOptions::default()
+        };
+        let err = opts.resolve(&ref_path, 4, None).unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "--aligner::dedup-reads is only valid with --aligner::preset bwa-mem3-inproc"
+            ),
+            "got: {err}"
+        );
+    }
+
+    /// Under `aligner-bwa-mem3`, `--aligner::dedup-reads` resolves to on unless
+    /// set to `off`.
+    #[rstest]
+    #[case::default_is_on(&[], true)]
+    #[case::on(&["--aligner::dedup-reads", "on"], true)]
+    #[case::off(&["--aligner::dedup-reads", "off"], false)]
+    #[cfg(feature = "aligner-bwa-mem3")]
+    fn resolve_inproc_dedup_reads(#[case] extra: &[&str], #[case] expected: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        for ext in AlignerPreset::BwaMem3InProc.index_extensions() {
+            std::fs::write(append_extension(&ref_path, ext), b"x").unwrap();
+        }
+        let mut opts =
+            AlignerOptions { preset: Some(AlignerPreset::BwaMem3InProc), ..Default::default() };
+        if let [_, value] = extra {
+            use clap::ValueEnum;
+            opts.dedup_reads = Some(DedupReads::from_str(value, false).unwrap());
+        }
+        let resolved = opts.resolve(&ref_path, 4, None).unwrap();
+        let ResolvedBackend::InProcessBwaMem3 { dedup_reads, .. } = resolved.backend else {
+            panic!("bwa-mem3-inproc must resolve to ResolvedBackend::InProcessBwaMem3");
+        };
+        assert_eq!(dedup_reads, expected);
     }
 
     /// Helper: create a known-existing binary path for tests that
@@ -1952,6 +2060,7 @@ mod tests {
             threads: None,
             chunk_size: 0,
             sub_batch_templates: None,
+            dedup_reads: None,
         };
         let err = opts.resolve(&ref_path, 4, None).unwrap_err();
         assert!(err.to_string().contains("--aligner::chunk-size must be greater than 0"));
@@ -1976,6 +2085,7 @@ mod tests {
             threads: Some(0),
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
             sub_batch_templates: None,
+            dedup_reads: None,
         };
         let err = opts.resolve(&ref_path, 4, Some(&bin)).unwrap_err();
         assert!(err.to_string().contains("--aligner::threads must be greater than 0"));

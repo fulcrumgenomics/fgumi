@@ -68,6 +68,9 @@ pub(crate) struct InProcessBwaMem3Backend {
     /// `--aligner::sub-batch-templates` override), passed to
     /// [`AlignPrepareStep`].
     pub(crate) sub_batch_templates: usize,
+    /// `--aligner::dedup-reads`: skip seeding exact duplicate read pairs (see
+    /// [`BwaMem3Engine`]).
+    pub(crate) dedup_reads: bool,
     /// The aligner's `-K` chunk size in bases, driving [`AlignPrepareStep`]'s
     /// cohort cutter and gate, and the synthesized `@PG CL`.
     pub(crate) chunk_size: u64,
@@ -126,10 +129,12 @@ impl InProcessBwaMem3Backend {
 impl AlignBackend for InProcessBwaMem3Backend {
     fn describe(&self) -> String {
         format!(
-            "in-process bwa-mem3 (bwa-mem3-rs {version}, sub-batch {sub}, -K {chunk})",
+            "in-process bwa-mem3 (bwa-mem3-rs {version}, sub-batch {sub}, -K {chunk}, \
+             dedup-reads {dedup})",
             version = engine::version(),
             sub = self.sub_batch_templates,
             chunk = self.chunk_size,
+            dedup = if self.dedup_reads { "on" } else { "off" },
         )
     }
 
@@ -191,7 +196,7 @@ impl AlignBackend for InProcessBwaMem3Backend {
             )
         })?;
 
-        let engine = Arc::new(BwaMem3Engine::new(idx, opts));
+        let engine = Arc::new(BwaMem3Engine::new(idx, opts, self.dedup_reads));
 
         // Append the four in-process steps: Prepare (Serial) → SeedExtend
         // (Parallel) → PeStat (Serial) → PairEmit (Parallel). The Prepare step

@@ -27,18 +27,25 @@
 //! corresponding `ResidentCohort` call. That API is entirely safe, so this module
 //! adds no `unsafe`.
 //!
+//! With `--aligner::dedup-reads` (the default), each cohort also carries a
+//! [`PairMemo`]: `seed_extend` marks each pair range's exact duplicates as it
+//! reserves the range and seeds only the rest (`seed_extend_with_reps`), and the
+//! cohort barrier copies their alignment regions (`resolve_memo`) before the
+//! insert-size model, bwa-mem3's `--dedup-reads` memo. Output is byte-identical
+//! to seeding every pair.
+//!
 //! The engine trait and both impls are consumed by the in-process backend's
 //! steps ([`super::seed_extend`], [`super::pestat`], [`super::pair_emit`]) and
 //! this module's tests.
 
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use bwa_mem3_rs::{
-    MemPeStat, PeOrientation, ReadPair as BwaReadPair, ResidentCohort, ResidentRange,
-    SingleRead as BwaSingleRead,
+    AlignScratch, MemPeStat, MemoStats, PairMemo, PeOrientation, ReadPair as BwaReadPair,
+    ResidentCohort, ResidentRange, SingleRead as BwaSingleRead,
 };
 
 use super::gate::CohortLease;
@@ -227,6 +234,20 @@ pub(crate) fn cohort_of<'l, E: AlignEngine>(
 pub(crate) struct BwaMem3Engine {
     idx: Arc<BwaIndex>,
     opts: Arc<MemOpts>,
+    /// `--aligner::dedup-reads`: give each cohort a [`PairMemo`] (never under
+    /// `--meth`, where bwa-mem3-rs refuses duplicate marks).
+    dedup_reads: bool,
+    /// Scratch for the cohort barrier's `resolve_memo`, which re-aligns any
+    /// duplicate whose bases differ from its hash match. The barrier is a
+    /// `Serial` step, so one lazily created scratch serves every cohort.
+    barrier_scratch: Mutex<Option<AlignScratch>>,
+    /// The memo's work summed over every cohort, for [`Self::memo_stats`] and
+    /// the end-of-run log line.
+    memo_pairs: AtomicU64,
+    memo_dup_pairs: AtomicU64,
+    memo_copied: AtomicU64,
+    memo_fallback_aligned: AtomicU64,
+    resolve_memo_ns: AtomicU64,
     /// Wall time (ns) spent *inside* the three `bwa_mem3_rs` FFI calls, summed
     /// across every pool worker (the engine is shared behind an `Arc`, so these
     /// are atomics). The pipeline stats table already reports each *step's* total
@@ -254,10 +275,18 @@ fn elapsed_ns(start: Instant) -> u64 {
 impl BwaMem3Engine {
     /// Wrap a loaded index and built options. Both are shared (`Arc`) so worker
     /// copies of the steps clone the handles, not the data.
-    pub(crate) fn new(idx: Arc<BwaIndex>, opts: Arc<MemOpts>) -> Self {
+    pub(crate) fn new(idx: Arc<BwaIndex>, opts: Arc<MemOpts>, dedup_reads: bool) -> Self {
+        let dedup_reads = dedup_reads && !opts.meth();
         Self {
             idx,
             opts,
+            dedup_reads,
+            barrier_scratch: Mutex::new(None),
+            memo_pairs: AtomicU64::new(0),
+            memo_dup_pairs: AtomicU64::new(0),
+            memo_copied: AtomicU64::new(0),
+            memo_fallback_aligned: AtomicU64::new(0),
+            resolve_memo_ns: AtomicU64::new(0),
             seed_extend_ns: AtomicU64::new(0),
             seed_extend_calls: AtomicU64::new(0),
             infer_cohort_ns: AtomicU64::new(0),
@@ -268,8 +297,37 @@ impl BwaMem3Engine {
     }
 }
 
+impl BwaMem3Engine {
+    /// The read-pair memo's work so far, summed over every cohort.
+    pub(crate) fn memo_stats(&self) -> MemoStats {
+        MemoStats {
+            dup_pairs: self.memo_dup_pairs.load(Ordering::Relaxed),
+            copied: self.memo_copied.load(Ordering::Relaxed),
+            fallback_aligned: self.memo_fallback_aligned.load(Ordering::Relaxed),
+        }
+    }
+}
+
 impl Drop for BwaMem3Engine {
     fn drop(&mut self) {
+        let pairs = self.memo_pairs.load(Ordering::Relaxed);
+        if self.dedup_reads && pairs > 0 {
+            let stats = self.memo_stats();
+            // Precision loss is irrelevant for a human-readable percentage.
+            #[allow(clippy::cast_precision_loss)]
+            let pct = 100.0 * stats.dup_pairs as f64 / pairs as f64;
+            #[allow(clippy::cast_precision_loss)]
+            let resolve_secs = self.resolve_memo_ns.load(Ordering::Relaxed) as f64 / 1e9;
+            log::info!(
+                "in-process bwa-mem3 read-pair memo: {dup} duplicate pairs of {pairs} \
+                 ({pct:.1}%) within their -K cohort were not seeded: {copied} copied, \
+                 {fallback} re-aligned (bases differed from their hash match); \
+                 resolve {resolve_secs:.3}s",
+                dup = stats.dup_pairs,
+                copied = stats.copied,
+                fallback = stats.fallback_aligned,
+            );
+        }
         let se_ns = self.seed_extend_ns.load(Ordering::Relaxed);
         let ic_ns = self.infer_cohort_ns.load(Ordering::Relaxed);
         let pe_ns = self.pair_emit_ns.load(Ordering::Relaxed);
@@ -295,6 +353,18 @@ impl Drop for BwaMem3Engine {
     }
 }
 
+/// A [`BwaMem3Engine`] cohort: bwa-mem3-rs's resident state plus, with
+/// `--aligner::dedup-reads`, the memo that marks its duplicate pairs.
+pub(crate) struct BwaCohort {
+    resident: ResidentCohort,
+    /// Marks each pair range as `seed_extend` reserves it. The lock covers the
+    /// reserve too, so ranges are marked in reservation order, as [`PairMemo`]
+    /// requires. Sub-batches reserve in whatever order the pool runs them, so
+    /// which copy of a pair is seeded varies from run to run; the output does
+    /// not, because a duplicate gets exactly the regions it would compute.
+    memo: Option<Mutex<PairMemo>>,
+}
+
 /// A [`BwaMem3Engine`] sub-batch's share of its [`ResidentCohort`]: its pairs'
 /// range and its singles' range, each absent when the sub-batch has none.
 pub(crate) struct BwaRanges {
@@ -304,7 +374,7 @@ pub(crate) struct BwaRanges {
 
 impl AlignEngine for BwaMem3Engine {
     type Scratch = bwa_mem3_rs::AlignScratch;
-    type Cohort = ResidentCohort;
+    type Cohort = BwaCohort;
     type Ranges = BwaRanges;
     type PeStat = MemPeStat;
 
@@ -313,7 +383,10 @@ impl AlignEngine for BwaMem3Engine {
     }
 
     fn new_cohort(&self) -> anyhow::Result<Self::Cohort> {
-        Ok(ResidentCohort::new(self.opts.meth())?)
+        Ok(BwaCohort {
+            resident: ResidentCohort::new(self.opts.meth())?,
+            memo: self.dedup_reads.then(|| Mutex::new(PairMemo::new())),
+        })
     }
 
     fn seed_extend(
@@ -327,7 +400,6 @@ impl AlignEngine for BwaMem3Engine {
         // `write_*`; the views here copy no sequence bytes.
         let mut ranges = BwaRanges { pairs: None, singles: None };
         if !batch.pairs.is_empty() {
-            let mut range = cohort.reserve_pairs(batch.pairs.len())?;
             // One batch write takes the cohort's range lock once, not per read.
             // These borrowed views are rebuilt per call (one small allocation per
             // sub-batch, not per read): they borrow this sub-batch's arena, so
@@ -346,19 +418,38 @@ impl AlignEngine for BwaMem3Engine {
                     qual_r2: p.r2.qual,
                 })
                 .collect();
-            cohort.write_pairs(&mut range, &pairs)?;
-            cohort.seed_extend(&self.idx, &self.opts, scratch, &mut range)?;
+            let (mut range, reps) = match &cohort.memo {
+                Some(memo) => {
+                    // A panicking holder cannot leave the memo half-marked
+                    // (`mark_range` only errors), so recover a poisoned lock.
+                    let mut memo = memo.lock().unwrap_or_else(PoisonError::into_inner);
+                    let range = cohort.resident.reserve_pairs(pairs.len())?;
+                    let reps = memo.mark_range(&range, &pairs)?;
+                    (range, Some(reps))
+                }
+                None => (cohort.resident.reserve_pairs(pairs.len())?, None),
+            };
+            cohort.resident.write_pairs(&mut range, &pairs)?;
+            match reps {
+                Some(reps) => {
+                    cohort
+                        .resident
+                        .seed_extend_with_reps(&self.idx, &self.opts, scratch, &mut range, &reps)?;
+                    self.memo_pairs.fetch_add(pairs.len() as u64, Ordering::Relaxed);
+                }
+                None => cohort.resident.seed_extend(&self.idx, &self.opts, scratch, &mut range)?,
+            }
             ranges.pairs = Some(range);
         }
         if !batch.singles.is_empty() {
-            let mut range = cohort.reserve_singles(batch.singles.len())?;
+            let mut range = cohort.resident.reserve_singles(batch.singles.len())?;
             let reads: Vec<BwaSingleRead<'_>> = batch
                 .singles
                 .iter()
                 .map(|r| BwaSingleRead { name: r.name, seq: r.seq, qual: r.qual })
                 .collect();
-            cohort.write_singles(&mut range, &reads)?;
-            cohort.seed_extend(&self.idx, &self.opts, scratch, &mut range)?;
+            cohort.resident.write_singles(&mut range, &reads)?;
+            cohort.resident.seed_extend(&self.idx, &self.opts, scratch, &mut range)?;
             ranges.singles = Some(range);
         }
         self.seed_extend_ns.fetch_add(elapsed_ns(t), Ordering::Relaxed);
@@ -367,8 +458,23 @@ impl AlignEngine for BwaMem3Engine {
     }
 
     fn infer_cohort(&self, cohort: &Self::Cohort) -> anyhow::Result<Self::PeStat> {
+        if cohort.memo.is_some() {
+            // Every sub-batch is extended by now: give the duplicates their
+            // regions before the model reads them.
+            let t = Instant::now();
+            let mut scratch = self.barrier_scratch.lock().unwrap_or_else(PoisonError::into_inner);
+            if scratch.is_none() {
+                *scratch = Some(AlignScratch::new()?);
+            }
+            let scratch = scratch.as_mut().expect("the barrier scratch was just created");
+            let stats = cohort.resident.resolve_memo(&self.idx, &self.opts, scratch)?;
+            self.memo_dup_pairs.fetch_add(stats.dup_pairs, Ordering::Relaxed);
+            self.memo_copied.fetch_add(stats.copied, Ordering::Relaxed);
+            self.memo_fallback_aligned.fetch_add(stats.fallback_aligned, Ordering::Relaxed);
+            self.resolve_memo_ns.fetch_add(elapsed_ns(t), Ordering::Relaxed);
+        }
         let t = Instant::now();
-        let pestat = cohort.infer_cohort(&self.idx, &self.opts)?;
+        let pestat = cohort.resident.infer_cohort(&self.idx, &self.opts)?;
         self.infer_cohort_ns.fetch_add(elapsed_ns(t), Ordering::Relaxed);
         self.infer_cohort_calls.fetch_add(1, Ordering::Relaxed);
         Ok(pestat)
@@ -389,7 +495,7 @@ impl AlignEngine for BwaMem3Engine {
         // `pair_emit` produced.
         let BwaRanges { pairs, singles } = ranges;
         for mut range in [pairs, singles].into_iter().flatten() {
-            cohort.pair_emit(
+            cohort.resident.pair_emit(
                 &self.idx, &self.opts, scratch, &mut range, pestat, ids, 0, &mut *sink,
             )?;
         }
@@ -699,7 +805,7 @@ mod tests {
         let idx = Arc::new(bwa_mem3_rs::BwaIndex::load(&prefix).expect("load index"));
         let mut opts = bwa_mem3_rs::MemOpts::new().expect("opts");
         opts.set_pe(true);
-        let engine = BwaMem3Engine::new(idx, Arc::new(opts));
+        let engine = BwaMem3Engine::new(idx, Arc::new(opts), false);
 
         let mut scratch = engine.new_scratch().expect("scratch");
 
@@ -730,5 +836,100 @@ mod tests {
             sink.records.iter().all(|(origin, _)| *origin == RecordOrigin::Pair(0)),
             "every record is tagged with the one pair's origin"
         );
+    }
+
+    /// With `dedup_reads`, the real engine seeds each distinct pair of a cohort
+    /// once and copies it to its duplicates, and the records are byte-identical
+    /// to seeding every pair. Duplicates carry their own name and QUAL, and land
+    /// both in their representative's sub-batch and in a later one. Requires
+    /// `FGUMI_BWA_MEM3_TEST_REF`, like the smoke test above.
+    #[test]
+    fn bwa_mem3_engine_dedup_reads_matches_seeding_every_pair() {
+        use std::sync::Arc;
+
+        use super::BwaMem3Engine;
+
+        let Ok(prefix) = std::env::var("FGUMI_BWA_MEM3_TEST_REF") else {
+            assert!(
+                std::env::var_os("FGUMI_BWA_MEM3_REQUIRE_TOOLS").is_none(),
+                "FGUMI_BWA_MEM3_REQUIRE_TOOLS is set but FGUMI_BWA_MEM3_TEST_REF (a bwa-mem3 \
+                 index prefix) is not"
+            );
+            eprintln!("skipping: FGUMI_BWA_MEM3_TEST_REF not set");
+            return;
+        };
+        // Reads cut from the reference itself, so they map (the index prefix is
+        // its FASTA).
+        let fasta = std::fs::read_to_string(&prefix).expect("read the test reference FASTA");
+        let genome: Vec<u8> =
+            fasta.lines().filter(|l| !l.starts_with('>')).flat_map(|l| l.trim().bytes()).collect();
+        let revcomp = |s: &[u8]| -> Vec<u8> {
+            s.iter()
+                .rev()
+                .map(|b| match b {
+                    b'A' => b'T',
+                    b'C' => b'G',
+                    b'G' => b'C',
+                    b'T' => b'A',
+                    _ => b'N',
+                })
+                .collect()
+        };
+        // Six distinct pairs, then copies of pairs 0, 2 and 5 (0 twice).
+        let distinct: Vec<(Vec<u8>, Vec<u8>)> = (0..6)
+            .map(|i| {
+                let p = 100 + i * 1500;
+                (genome[p..p + 100].to_vec(), revcomp(&genome[p + 250..p + 350]))
+            })
+            .collect();
+        let order = [0usize, 1, 2, 3, 4, 5, 0, 2, 5, 0];
+        let names: Vec<Vec<u8>> = (0..order.len()).map(|i| format!("q{i}").into_bytes()).collect();
+        let quals: Vec<Vec<u8>> =
+            (0..order.len()).map(|i| vec![b'#' + u8::try_from(i).unwrap(); 100]).collect();
+        let pairs: Vec<EnginePair<'_>> = order
+            .iter()
+            .enumerate()
+            .map(|(i, &d)| EnginePair {
+                r1: EngineRead::new(&names[i], &distinct[d].0, Some(&quals[i])),
+                r2: EngineRead::new(&names[i], &distinct[d].1, Some(&quals[i])),
+            })
+            .collect();
+
+        let run = |dedup: bool| {
+            let idx = Arc::new(bwa_mem3_rs::BwaIndex::load(&prefix).expect("load index"));
+            let mut opts = bwa_mem3_rs::MemOpts::new().expect("opts");
+            opts.set_pe(true);
+            let engine = BwaMem3Engine::new(idx, Arc::new(opts), dedup);
+            let mut scratch = engine.new_scratch().expect("scratch");
+            let cohort = engine.new_cohort().expect("cohort");
+            // Two sub-batches of one cohort: pairs 0..6 and 6..10.
+            let ranges: Vec<_> = [&pairs[..6], &pairs[6..]]
+                .into_iter()
+                .map(|chunk| {
+                    let batch = EngineBatch { pairs: chunk, singles: &[] };
+                    engine.seed_extend(&mut scratch, &cohort, batch).expect("seed_extend")
+                })
+                .collect();
+            let pestat = engine.infer_cohort(&cohort).expect("infer_cohort");
+            let mut records = Vec::new();
+            for (k, regs) in ranges.into_iter().enumerate() {
+                let ids = IdBases { first_single_id: 0, first_pair_id: (k * 6) as u64 };
+                let mut sink = RecordVec::default();
+                engine
+                    .pair_emit(&mut scratch, &cohort, regs, Some(&pestat), ids, &mut sink)
+                    .expect("pair_emit");
+                records.push(sink.records);
+            }
+            (records, engine.memo_stats())
+        };
+        let (off, off_stats) = run(false);
+        let (on, on_stats) = run(true);
+        assert_eq!(off_stats, bwa_mem3_rs::MemoStats::default(), "dedup off runs no memo");
+        assert_eq!(
+            on_stats,
+            bwa_mem3_rs::MemoStats { dup_pairs: 4, copied: 4, fallback_aligned: 0 },
+            "the four copies were copied"
+        );
+        assert!(on == off, "dedup-reads changed the records");
     }
 }
