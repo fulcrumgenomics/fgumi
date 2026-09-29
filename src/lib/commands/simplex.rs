@@ -397,8 +397,9 @@ impl SimplexOptions {
         }
     }
 
-    /// Validate the `--min-reads` / `--max-reads` range and the
-    /// `--min-consensus-base-quality` floor.
+    /// Validate the shared consensus Phred bounds
+    /// ([`ConsensusCallingOptions::validate`]), the `--min-reads` /
+    /// `--max-reads` range, and the `--min-consensus-base-quality` floor.
     ///
     /// `min_reads` must be `>= 1` (a value of 0 admits empty groups) and, when
     /// `max_reads` is set, it must be `>= min_reads`. The floor must lie in
@@ -407,6 +408,7 @@ impl SimplexOptions {
     /// `runall` rejects the same degenerate configurations the standalone
     /// command does.
     pub(crate) fn validate(&self) -> Result<()> {
+        self.consensus().validate()?;
         if self.min_reads == 0 {
             bail!("--min-reads must be >= 1 (a value of 0 admits empty groups)");
         }
@@ -476,7 +478,8 @@ impl Simplex {
     ///
     /// # Errors
     ///
-    /// Returns an error if `min_reads` is 0, if `max_reads` is below `min_reads`,
+    /// Returns an error if an error rate or `--min-input-base-quality` exceeds
+    /// `MAX_PHRED` (93), if `min_reads` is 0, if `max_reads` is below `min_reads`,
     /// or if the consensus base-quality floor is outside `2..=93`.
     fn validate_options(&self) -> Result<()> {
         self.to_simplex_options().validate()
@@ -704,6 +707,30 @@ mod tests {
                 err.to_string().contains("min-consensus-base-quality"),
                 "unexpected error: {err:#}"
             );
+        }
+    }
+
+    /// The shared consensus Phred bounds (`ConsensusCallingOptions::validate`) are
+    /// enforced by the same validator both the standalone command and `add_simplex`
+    /// run, so an out-of-range value fails before any I/O.
+    #[rstest]
+    #[case::error_rate_pre_umi_at_max(|c: &mut ConsensusCallingOptions| c.error_rate_pre_umi = 93, None)]
+    #[case::error_rate_pre_umi_above_max(|c: &mut ConsensusCallingOptions| c.error_rate_pre_umi = 94, Some("error-rate-pre-umi (94)"))]
+    #[case::error_rate_post_umi_above_max(|c: &mut ConsensusCallingOptions| c.error_rate_post_umi = 94, Some("error-rate-post-umi (94)"))]
+    #[case::min_input_base_quality_at_max(|c: &mut ConsensusCallingOptions| c.min_input_base_quality = 93, None)]
+    #[case::min_input_base_quality_above_max(|c: &mut ConsensusCallingOptions| c.min_input_base_quality = 94, Some("min-input-base-quality (94)"))]
+    fn test_validate_consensus_phred_bounds(
+        #[case] mutate: fn(&mut ConsensusCallingOptions),
+        #[case] expected_err: Option<&str>,
+    ) {
+        let mut simplex = create_test_simplex();
+        mutate(&mut simplex.consensus);
+        match (simplex.validate_options(), expected_err) {
+            (Ok(()), None) => {}
+            (Err(err), Some(msg)) => {
+                assert!(err.to_string().contains(msg), "expected {msg:?}, got: {err:#}");
+            }
+            (result, expected) => panic!("expected {expected:?}, got {result:?}"),
         }
     }
 

@@ -1860,6 +1860,18 @@ fn test_add_codec_rejects_out_of_range_disagreement_rate_bypassing_cli_validate(
     |o: &mut CodecOptions| o.outer_bases_qual = Some(200),
     "outer-bases-qual (200) exceeds maximum Phred score"
 )]
+#[case::error_rate_pre_umi_above_max_phred(
+    |o: &mut CodecOptions| o.error_rate_pre_umi = 94,
+    "error-rate-pre-umi (94) exceeds maximum Phred score"
+)]
+#[case::error_rate_post_umi_above_max_phred(
+    |o: &mut CodecOptions| o.error_rate_post_umi = 94,
+    "error-rate-post-umi (94) exceeds maximum Phred score"
+)]
+#[case::min_input_base_quality_above_max_phred(
+    |o: &mut CodecOptions| o.min_input_base_quality = 94,
+    "min-input-base-quality (94) exceeds maximum Phred score"
+)]
 fn test_codec_options_validate_rejects_invalid(
     #[case] mutate: fn(&mut CodecOptions),
     #[case] expected_msg: &str,

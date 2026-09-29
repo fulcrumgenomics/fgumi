@@ -380,15 +380,18 @@ impl DuplexOptions {
     /// `--min-reads` ordering rule (each value no larger than the one before it),
     /// and a `--max-reads-per-strand` of at least one. A rate of Q0 corresponds
     /// to `P(error) = 1` (nonsensical as a prior) and a cap of 0 empties every
-    /// strand, so no molecule can produce a consensus (a silent empty BAM).
+    /// strand, so no molecule can produce a consensus (a silent empty BAM). Also
+    /// applies the shared consensus Phred upper bounds
+    /// ([`ConsensusCallingOptions::validate`]).
     ///
     /// Shared by `Duplex::validate` (the standalone CLI path) and the runall
     /// duplex arm, so both reject the same degenerate configs from one guard.
     ///
     /// # Errors
     ///
-    /// Returns `Err` if either error rate is 0, if `--min-reads` violates the
-    /// ordering rule, or if `--max-reads-per-strand` is `Some(0)`.
+    /// Returns `Err` if either error rate is 0, if an error rate or
+    /// `--min-input-base-quality` exceeds `MAX_PHRED` (93), if `--min-reads`
+    /// violates the ordering rule, or if `--max-reads-per-strand` is `Some(0)`.
     pub fn validate_numeric(&self) -> Result<()> {
         if self.error_rate_pre_umi == 0 {
             bail!("error-rate-pre-umi must be > 0");
@@ -396,6 +399,7 @@ impl DuplexOptions {
         if self.error_rate_post_umi == 0 {
             bail!("error-rate-post-umi must be > 0");
         }
+        self.consensus().validate()?;
         DuplexConsensusCaller::validate_min_reads(&self.min_reads)?;
         if self.max_reads_per_strand == Some(0) {
             bail!("--max-reads-per-strand must be >= 1");
@@ -1047,6 +1051,31 @@ mod tests {
         duplex.consensus.error_rate_pre_umi = pre_umi;
         duplex.consensus.error_rate_post_umi = post_umi;
         assert_eq!(duplex.validate().is_ok(), expect_ok);
+    }
+
+    /// The shared consensus Phred bounds (`ConsensusCallingOptions::validate`) are
+    /// enforced via `DuplexOptions::validate_numeric`, which both the standalone
+    /// command and runall's duplex arm run.
+    #[rstest]
+    #[case::error_rate_pre_umi_at_max(|c: &mut ConsensusCallingOptions| c.error_rate_pre_umi = 93, None)]
+    #[case::error_rate_pre_umi_above_max(|c: &mut ConsensusCallingOptions| c.error_rate_pre_umi = 94, Some("error-rate-pre-umi (94)"))]
+    #[case::error_rate_post_umi_above_max(|c: &mut ConsensusCallingOptions| c.error_rate_post_umi = 94, Some("error-rate-post-umi (94)"))]
+    #[case::min_input_base_quality_at_max(|c: &mut ConsensusCallingOptions| c.min_input_base_quality = 93, None)]
+    #[case::min_input_base_quality_above_max(|c: &mut ConsensusCallingOptions| c.min_input_base_quality = 94, Some("min-input-base-quality (94)"))]
+    fn test_validate_consensus_phred_bounds(
+        #[case] mutate: fn(&mut ConsensusCallingOptions),
+        #[case] expected_err: Option<&str>,
+    ) {
+        let mut duplex =
+            create_duplex_with_paths(PathBuf::from("test.bam"), PathBuf::from("output.bam"));
+        mutate(&mut duplex.consensus);
+        match (duplex.validate(), expected_err) {
+            (Ok(()), None) => {}
+            (Err(err), Some(msg)) => {
+                assert!(err.to_string().contains(msg), "expected {msg:?}, got: {err:#}");
+            }
+            (result, expected) => panic!("expected {expected:?}, got {result:?}"),
+        }
     }
 
     /// `validate()` applies exactly the rule fgbio does to `--min-reads`: no lower bound,

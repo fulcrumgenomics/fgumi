@@ -7,7 +7,10 @@
 
 use clap::Parser;
 use fgumi_lib::commands::command::Command;
-use fgumi_lib::commands::duplex::Duplex;
+use fgumi_lib::commands::duplex::{Duplex, DuplexOptions};
+use fgumi_lib::pipeline::chains::{
+    ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
+};
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, RawRecordView, SamBuilder, flags};
 use noodles::bam;
@@ -1142,6 +1145,60 @@ fn test_duplex_rejects_out_of_order_min_reads_before_writing_output(
          {} was left behind",
         output_bam.display()
     );
+}
+
+/// Drives `add_duplex` directly via `ChainSpec::single_stage(Stage::Duplex, ..)`,
+/// bypassing `Duplex::execute`'s top-level `validate()`, so it fails if the chain
+/// builder stops running the full `DuplexOptions::validate_numeric` guard (it once
+/// checked only `--min-reads`, letting an out-of-range Phred value reach the
+/// per-worker caller).
+#[rstest]
+#[case::error_rate_pre_umi_zero(|o: &mut DuplexOptions| o.error_rate_pre_umi = 0, "error-rate-pre-umi must be > 0")]
+#[case::error_rate_pre_umi_above_max(|o: &mut DuplexOptions| o.error_rate_pre_umi = 94, "error-rate-pre-umi (94)")]
+#[case::error_rate_post_umi_above_max(|o: &mut DuplexOptions| o.error_rate_post_umi = 94, "error-rate-post-umi (94)")]
+#[case::min_input_base_quality_above_max(|o: &mut DuplexOptions| o.min_input_base_quality = 94, "min-input-base-quality (94)")]
+#[case::max_reads_per_strand_zero(|o: &mut DuplexOptions| o.max_reads_per_strand = Some(0), "--max-reads-per-strand must be >= 1")]
+#[case::min_reads_out_of_order(|o: &mut DuplexOptions| o.min_reads = vec![1, 2, 3], "min-reads values must be specified high to low")]
+fn test_add_duplex_rejects_invalid_numeric_options_bypassing_cli_validate(
+    #[case] mutate: fn(&mut DuplexOptions),
+    #[case] expected_msg: &str,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    create_duplex_bam(&input_bam, vec![create_duplex_molecule("1", "ACGTACGT", 30, 100, 3)]);
+
+    let cmd = Duplex::try_parse_from([
+        "duplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+    ])
+    .expect("failed to parse duplex args");
+
+    let mut duplex_opts = cmd.to_duplex_options();
+    mutate(&mut duplex_opts);
+
+    let ctx = SingleStageContext {
+        io: &cmd.io,
+        threading: &cmd.threading,
+        compression: &cmd.compression,
+        scheduler: &cmd.scheduler_opts,
+        queue_memory: &cmd.queue_memory,
+        command_line: "test",
+    };
+    let stage_opts = StageOptionsBag { duplex: Some(duplex_opts), ..Default::default() };
+    let spec = ChainSpec::single_stage(Stage::Duplex, stage_opts, &ctx);
+
+    let err = build_for(spec).and_then(fgumi_lib::pipeline::chains::BuiltPipeline::run).expect_err(
+        "add_duplex must reject an invalid numeric option itself, even when \
+         Duplex::execute's top-level validate() is bypassed entirely",
+    );
+    assert!(err.to_string().contains(expected_msg), "expected {expected_msg:?}, got: {err:#}");
+    assert!(!output_bam.exists(), "the builder must reject before creating the output BAM");
 }
 
 /// Reverse complement, for deriving the source-molecule orientation of a reverse-strand read.
