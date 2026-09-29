@@ -767,3 +767,167 @@ fn align_to_sort_chain_builds_and_runs_or_validates() {
         assert_chain_spec_validates(&spec);
     }
 }
+
+// ─────────────────────────── rejects files on a failed build ───────────────────────────
+
+/// A stage's rejects BAM must not be created when a *later* stage fails to
+/// build. The writer used to be opened (and its header written) while its own
+/// stage was being added, so a build that then failed on a downstream stage
+/// left a header-only rejects file behind — indistinguishable from a real run
+/// that rejected nothing. Here simplex writes rejects and the filter after it
+/// fails to build on a missing reference.
+#[cfg(feature = "consensus")]
+#[test]
+fn consensus_rejects_file_not_created_when_a_later_stage_fails_to_build() {
+    use fgumi_lib::commands::common::RejectsOptions;
+
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+    let records = create_grouped_family("ACGT", "1", 3, "fam", "ACGTACGTACGT", 30);
+    let input = tmp.path().join("grouped.bam");
+    write_bam(&input, &header, &records);
+
+    let rejects = tmp.path().join("rejects.bam");
+    let out = tmp.path().join("filtered.bam");
+    let simplex = SimplexOptions {
+        min_reads: 1,
+        rejects_opts: RejectsOptions { rejects: Some(rejects.clone()) },
+        ..SimplexOptions::default()
+    };
+    let filter = FilterOptions {
+        min_reads: vec![1],
+        reference: Some(tmp.path().join("missing.fa")),
+        ..FilterOptions::default()
+    };
+    let bag =
+        StageOptionsBag { simplex: Some(simplex), filter: Some(filter), ..Default::default() };
+    let spec = base_chain_spec(
+        vec![Stage::Simplex, Stage::Filter],
+        SourceSpec::Bam(input),
+        SinkSpec::Bam(out.clone()),
+        bag,
+    );
+
+    let err = build_for(spec).err().expect("filter with a missing reference must fail to build");
+    assert!(err.to_string().contains("Reference FASTA"), "unexpected build error: {err:#}");
+    assert!(!rejects.exists(), "a failed build must not leave the simplex rejects file behind");
+    assert!(!out.exists(), "a failed build must not create the output");
+}
+
+/// As above for `correct`'s UMI rejects: correct writes rejects, and the Align
+/// stage after it fails to build because its reference does not exist.
+#[test]
+fn correct_rejects_file_not_created_when_a_later_stage_fails_to_build() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("unmapped.bam");
+    write_unmapped_umi_bam(&input, "ACGT", 4);
+
+    let rejects = tmp.path().join("rejects.bam");
+    let out = tmp.path().join("aligned.bam");
+    let correct = CorrectOptions {
+        umis: vec!["ACGT".into(), "TGCA".into()],
+        min_distance_diff: 1,
+        rejects_path: Some(rejects.clone()),
+        ..CorrectOptions::default()
+    };
+    let align = AlignOptions {
+        aligner: AlignerOptions {
+            command: Some("bwa mem {ref} /dev/stdin".into()),
+            ..AlignerOptions::default()
+        },
+        reference: tmp.path().join("missing.fa"),
+        aligner_bin: None,
+    };
+    let bag =
+        StageOptionsBag { correct: Some(correct), aligner: Some(align), ..Default::default() };
+    let spec = base_chain_spec(
+        vec![Stage::Correct, Stage::Align],
+        SourceSpec::Bam(input),
+        SinkSpec::Bam(out.clone()),
+        bag,
+    );
+
+    let err = build_for(spec).err().expect("align with a missing reference must fail to build");
+    // Pin that the failure came from the Align stage, after correct queued
+    // its rejects — an earlier failure would make this test vacuous.
+    assert!(
+        format!("{err:#}").contains("Reference dictionary file not found"),
+        "unexpected build error: {err:#}"
+    );
+    assert!(!rejects.exists(), "a failed build must not leave the correct rejects file behind");
+    assert!(!out.exists(), "a failed build must not create the output");
+}
+
+/// A simplex chain writing rejects, over `tmp`'s grouped input, with the given
+/// rejects and output paths.
+#[cfg(feature = "consensus")]
+fn simplex_rejects_spec(tmp: &Path, rejects: &Path, out: &Path) -> ChainSpec {
+    use fgumi_lib::commands::common::RejectsOptions;
+
+    let header = create_minimal_header("chr1", 10000);
+    let records = create_grouped_family("ACGT", "1", 3, "fam", "ACGTACGTACGT", 30);
+    let input = tmp.join("grouped.bam");
+    write_bam(&input, &header, &records);
+    let simplex = SimplexOptions {
+        min_reads: 1,
+        rejects_opts: RejectsOptions { rejects: Some(rejects.to_path_buf()) },
+        ..SimplexOptions::default()
+    };
+    let bag = StageOptionsBag { simplex: Some(simplex), ..Default::default() };
+    base_chain_spec(
+        vec![Stage::Simplex],
+        SourceSpec::Bam(input),
+        SinkSpec::Bam(out.to_path_buf()),
+        bag,
+    )
+}
+
+/// Every stage builds, but the main output cannot be created (its directory
+/// does not exist — nothing validates that earlier): the build fails in the
+/// sink, and the rejects file must not be left behind.
+#[cfg(feature = "consensus")]
+#[test]
+fn rejects_file_not_left_when_the_main_output_cannot_be_created() {
+    let tmp = TempDir::new().unwrap();
+    let rejects = tmp.path().join("rejects.bam");
+    let out = tmp.path().join("no_such_dir").join("out.bam");
+    let err = build_for(simplex_rejects_spec(tmp.path(), &rejects, &out))
+        .err()
+        .expect("an output under a missing directory must fail to build");
+    assert!(format!("{err:#}").contains("out.bam"), "unexpected build error: {err:#}");
+    assert!(!rejects.exists(), "a failed build must not leave the rejects file behind");
+}
+
+/// The rejects file cannot be created: the build fails naming the stage and
+/// the path, and the main output — created earlier in the build — is removed.
+#[cfg(feature = "consensus")]
+#[test]
+fn main_output_not_left_when_a_rejects_file_cannot_be_created() {
+    let tmp = TempDir::new().unwrap();
+    let rejects = tmp.path().join("no_such_dir").join("rejects.bam");
+    let out = tmp.path().join("out.bam");
+    let err = build_for(simplex_rejects_spec(tmp.path(), &rejects, &out))
+        .err()
+        .expect("rejects under a missing directory must fail to build");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains(&format!("creating simplex rejects BAM {}", rejects.display())),
+        "the error must name the stage and the rejects path: {message}"
+    );
+    assert!(!out.exists(), "a failed build must not leave the main output behind");
+}
+
+/// A build that succeeds keeps both outputs, and running it fills them.
+#[cfg(feature = "consensus")]
+#[test]
+fn successful_build_keeps_the_rejects_and_main_output() {
+    let tmp = TempDir::new().unwrap();
+    let rejects = tmp.path().join("rejects.bam");
+    let out = tmp.path().join("out.bam");
+    let built = build_for(simplex_rejects_spec(tmp.path(), &rejects, &out)).expect("build");
+    assert!(rejects.exists() && out.exists(), "a successful build creates both outputs");
+    built.run().expect("run");
+    let (_, records) = read_bam_output(&out);
+    assert!(!records.is_empty(), "the consensus output must hold records");
+    read_bam_output(&rejects); // a complete, readable BAM (EOF written)
+}

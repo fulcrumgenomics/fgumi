@@ -6,6 +6,7 @@
 
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
 
 use fgumi_bam_io::{BaiBuilder, open_output_writer, write_bai_index};
 use fgumi_bgzf::{BGZF_EOF, BGZF_MAX_BLOCK_SIZE, InlineBgzfCompressor};
@@ -26,7 +27,9 @@ const BYTES_WRITTEN: usize = 0;
 /// `Serial + sticky` BAM sink (or `Detached` — see [`Self::with_detached`])
 /// that consumes pre-compressed `BgzfBlock`s.
 pub struct WriteBgzfFile {
-    state: Mutex<Option<WriterState>>,
+    /// Shared with the [`DeferredOpen`] of a sink built by [`Self::deferred`],
+    /// which moves it from `Unopened` to `Open`.
+    state: Arc<Mutex<SinkState>>,
     name: &'static str,
     /// When `Some`, advertise `StepKind::Detached` so the framework drives this
     /// sink on its own dedicated driver thread (off the work-stealing pool) in the
@@ -35,6 +38,41 @@ pub struct WriteBgzfFile {
     /// this generic sink carries no chain-specific grouping. `None` (the default)
     /// keeps the pool-scheduled writer that every other chain uses.
     detached_group: Option<DetachedGroup>,
+}
+
+/// Lifecycle of the sink's output.
+// One per sink, the same footprint as the `Option<WriterState>` it replaced;
+// boxing `Open` would only add an indirection to every block write.
+#[allow(clippy::large_enum_variant)]
+enum SinkState {
+    /// Built by [`WriteBgzfFile::deferred`]; the file does not exist until
+    /// [`DeferredOpen::open`] runs.
+    Unopened,
+    /// The file is open and its header written (or pending on a handle).
+    Open(WriterState),
+    /// The stream was finished (EOF written) or abandoned.
+    Closed,
+}
+
+impl SinkState {
+    /// The open writer, if any.
+    fn as_mut(&mut self) -> Option<&mut WriterState> {
+        match self {
+            Self::Open(state) => Some(state),
+            Self::Unopened | Self::Closed => None,
+        }
+    }
+
+    /// Take the open writer, leaving the sink `Closed`.
+    fn take(&mut self) -> Option<WriterState> {
+        match std::mem::replace(self, Self::Closed) {
+            Self::Open(state) => Some(state),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
 }
 
 struct WriterState {
@@ -98,7 +136,34 @@ impl WriteBgzfFile {
         header: &Header,
         compression_level: u32,
     ) -> io::Result<Self> {
-        let sink = open_output_writer(path.as_ref())
+        let state = Self::open_eager(path.as_ref(), header, compression_level)?;
+        Ok(Self::with_state(SinkState::Open(state)))
+    }
+
+    /// Build the sink without touching `path`: the file is created, and the
+    /// header written, only when the returned [`DeferredOpen`] is opened.
+    ///
+    /// Lets a caller that assembles several steps before any of them can fail
+    /// (e.g. a chain builder adding a rejects sink mid-build) create no file
+    /// until the whole assembly has succeeded. Running the sink before its
+    /// `DeferredOpen` is opened is an error, never a silent no-op; dropping an
+    /// unopened `DeferredOpen` leaves nothing on disk. Inline BAI indexing
+    /// ([`Self::with_bai_index`]) is not supported on a deferred sink.
+    #[must_use]
+    pub fn deferred(path: PathBuf, header: Header, compression_level: u32) -> (Self, DeferredOpen) {
+        let sink = Self::with_state(SinkState::Unopened);
+        let open =
+            DeferredOpen { state: Arc::downgrade(&sink.state), path, header, compression_level };
+        (sink, open)
+    }
+
+    fn with_state(state: SinkState) -> Self {
+        Self { state: Arc::new(Mutex::new(state)), name: "WriteBgzfFile", detached_group: None }
+    }
+
+    /// Open `path` and write the BGZF-compressed BAM header.
+    fn open_eager(path: &Path, header: &Header, compression_level: u32) -> io::Result<WriterState> {
+        let sink = open_output_writer(path)
             // `{e:#}` (alternate) so the anyhow source chain — the underlying OS
             // error, e.g. permission denied / ENOENT — survives, not just the
             // generic path-context line.
@@ -121,11 +186,7 @@ impl WriteBgzfFile {
         let coffset = header_blocks.len() as u64;
         out.write_all(&header_blocks)?;
 
-        Ok(Self {
-            state: Mutex::new(Some(WriterState { out, pending_header: None, coffset, bai: None })),
-            name: "WriteBgzfFile",
-            detached_group: None,
-        })
+        Ok(WriterState { out, pending_header: None, coffset, bai: None })
     }
 
     /// Run this sink on a dedicated `StepKind::Detached` driver thread (in the
@@ -180,12 +241,15 @@ impl WriteBgzfFile {
     /// # Panics
     ///
     /// Panics if `state.pending_header` is `Some` (i.e. this was built via
-    /// [`Self::new_with_handle`]).
+    /// [`Self::new_with_handle`]), or if the sink was built by
+    /// [`Self::deferred`]: inline indexing is unsupported on a deferred sink.
     #[must_use]
     pub fn with_bai_index(self, sidecar_path: PathBuf, num_refs: usize) -> Self {
         {
             let mut guard = self.state.lock();
-            let state = guard.as_mut().expect("state present");
+            let state = guard
+                .as_mut()
+                .expect("with_bai_index requires an open sink: not supported on a deferred sink");
             assert!(
                 state.pending_header.is_none(),
                 "with_bai_index requires the eager-header constructor (deferred-header inline indexing is unsupported)"
@@ -222,16 +286,12 @@ impl WriteBgzfFile {
             // generic path-context line.
             .map_err(|e| io::Error::other(format!("open_output_writer: {e:#}")))?;
         let out = BufWriter::with_capacity(256 * 1024, sink);
-        Ok(Self {
-            state: Mutex::new(Some(WriterState {
-                out,
-                pending_header: Some(PendingHeader { handle, compression_level, transform }),
-                coffset: 0,
-                bai: None,
-            })),
-            name: "WriteBgzfFile",
-            detached_group: None,
-        })
+        Ok(Self::with_state(SinkState::Open(WriterState {
+            out,
+            pending_header: Some(PendingHeader { handle, compression_level, transform }),
+            coffset: 0,
+            bai: None,
+        })))
     }
 
     fn try_write_pending_header(state: &mut WriterState) -> io::Result<bool> {
@@ -273,6 +333,42 @@ impl WriteBgzfFile {
     }
 }
 
+/// The pending file creation of a sink built by [`WriteBgzfFile::deferred`].
+pub struct DeferredOpen {
+    /// Weak so that opening after the sink was dropped creates no file.
+    state: Weak<Mutex<SinkState>>,
+    path: PathBuf,
+    header: Header,
+    compression_level: u32,
+}
+
+impl DeferredOpen {
+    /// The path [`Self::open`] will create.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Create the file and write its BAM header, readying the sink to run.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors from path open or header write, or an error without
+    /// touching the path if the sink has already been dropped (nothing could
+    /// ever write to or finish the file).
+    pub fn open(self) -> io::Result<()> {
+        let Some(state) = self.state.upgrade() else {
+            return Err(io::Error::other(format!(
+                "cannot open {}: its WriteBgzfFile sink was dropped",
+                self.path.display()
+            )));
+        };
+        let writer = WriteBgzfFile::open_eager(&self.path, &self.header, self.compression_level)?;
+        *state.lock() = SinkState::Open(writer);
+        Ok(())
+    }
+}
+
 impl Step for WriteBgzfFile {
     type Input = BgzfBlock;
     type Outputs = ();
@@ -311,8 +407,14 @@ impl Step for WriteBgzfFile {
 
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
         let mut guard = self.state.lock();
-        let Some(state) = guard.as_mut() else {
-            return Ok(StepOutcome::Finished);
+        let state = match &mut *guard {
+            SinkState::Open(state) => state,
+            SinkState::Closed => return Ok(StepOutcome::Finished),
+            SinkState::Unopened => {
+                return Err(io::Error::other(
+                    "WriteBgzfFile: run before its DeferredOpen was opened",
+                ));
+            }
         };
 
         let header_ready = Self::try_write_pending_header(state)?;
@@ -456,6 +558,91 @@ mod tests {
         assert_eq!(&bytes[0..2], &[0x1f, 0x8b], "BGZF/gzip magic at start");
         let tail = &bytes[bytes.len() - 28..];
         assert_eq!(tail, &BGZF_EOF, "file ends with BGZF EOF marker");
+    }
+
+    /// A deferred sink touches the filesystem only when its `DeferredOpen` is
+    /// opened: building it — and dropping both halves unopened, as a failed
+    /// chain build does — must leave no file behind.
+    #[test]
+    fn deferred_creates_no_file_until_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rejects.bam");
+        let (sink, open) = WriteBgzfFile::deferred(path.clone(), empty_header(), 1);
+        assert_eq!(open.path(), path.as_path());
+        assert!(!path.exists(), "deferred() must not create the file");
+        drop(open);
+        drop(sink);
+        assert!(!path.exists(), "dropping an unopened deferred sink must not create the file");
+    }
+
+    /// Opening a deferred sink creates the file with its BAM header, exactly as
+    /// the eager constructor would.
+    #[test]
+    fn deferred_open_writes_the_same_header_as_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let eager_path = dir.path().join("eager.bam");
+        let deferred_path = dir.path().join("deferred.bam");
+        drop(WriteBgzfFile::new(&eager_path, &empty_header(), 1).unwrap());
+        let (sink, open) = WriteBgzfFile::deferred(deferred_path.clone(), empty_header(), 1);
+        open.open().unwrap();
+        assert!(sink.state.lock().as_mut().is_some(), "an opened sink holds an open writer");
+        drop(sink);
+        assert_eq!(std::fs::read(&deferred_path).unwrap(), std::fs::read(&eager_path).unwrap());
+    }
+
+    /// Opening a `DeferredOpen` whose sink was already dropped must fail
+    /// without creating the file: nothing would ever finish it.
+    #[test]
+    fn deferred_open_after_sink_dropped_creates_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rejects.bam");
+        let (sink, open) = WriteBgzfFile::deferred(path.clone(), empty_header(), 1);
+        drop(sink);
+        let err = open.open().expect_err("the sink is gone");
+        assert!(err.to_string().contains("sink was dropped"), "{err}");
+        assert!(!path.exists());
+    }
+
+    /// Running a deferred sink whose `DeferredOpen` was never opened is an
+    /// error — not a silent `Finished` that would drop every input block.
+    #[test]
+    fn deferred_sink_run_before_open_is_an_error() {
+        use fgumi_pipeline_core::builder::{Pipeline, PipelineConfig};
+        use fgumi_pipeline_core::outputs::OrderedBytesSingle;
+        use fgumi_pipeline_core::queues::QueueSpec;
+        use fgumi_pipeline_core::reorder::BranchOrdering;
+
+        /// Exclusive source that emits nothing.
+        struct EmptySource;
+        impl Step for EmptySource {
+            type Input = ();
+            type Outputs = OrderedBytesSingle<BgzfBlock>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "EmptySource",
+                    kind: StepKind::Exclusive,
+                    sticky: true,
+                    output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 20 }],
+                    branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+                }
+            }
+            fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(StepOutcome::Finished)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rejects.bam");
+        let (sink, _open) = WriteBgzfFile::deferred(path.clone(), empty_header(), 1);
+        let builder = Pipeline::builder();
+        builder.chain(EmptySource).chain(sink).into_sink_marker();
+        let err = builder
+            .build()
+            .expect("pipeline builds")
+            .run(PipelineConfig { threads: 1, ..Default::default() })
+            .expect_err("an unopened deferred sink must fail the run");
+        assert!(format!("{err:#}").contains("before its DeferredOpen was opened"), "{err:#}");
+        assert!(!path.exists());
     }
 
     /// Positive coverage for the drained-finish branch of `try_run`, driven

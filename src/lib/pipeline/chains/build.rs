@@ -9,7 +9,13 @@
 //!      where `position` is `Terminal` for the last stage and `Intermediate` for all
 //!      earlier ones.
 //!   5. Calls `add_sink`.
-//!   6. Calls `build()` to produce the [`BuiltPipeline`].
+//!   6. Calls `build()` to produce the [`BuiltPipeline`]; its last step creates
+//!      the rejects files the stages queued.
+//!
+//! Output files are created only when the build gets that far: rejects files
+//! are deferred to the end of `build()`, and if any step fails, every output
+//! file the build already created (the main output, any rejects) is removed
+//! before the error is returned, so a failed build leaves nothing behind.
 //!
 //! Every chain — including the sole-`[Stage::Sort]` standalone sort — runs
 //! through this uniform `add_source` → stages → `add_sink` topology on the
@@ -51,6 +57,8 @@ use crate::pipeline::chains::{
 /// chain.add_sink()?
 /// chain.build()
 /// ```
+///
+/// No output file survives a build that returns `Err` (see the module docs).
 ///
 /// Each `add_<stage>` method reads its options from `spec.stage_opts` and pushes
 /// the appropriate typed-step sequence onto the pipeline builder. The position
