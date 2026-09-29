@@ -256,7 +256,7 @@ pub struct Zipper {
 /// command still fills [`Zipper`]'s own fields and projects them through
 /// [`Zipper::to_zipper_options`]; that path is untouched.
 #[fgumi_cli_macros::multi_options("zipper", "Zipper Options")]
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, Clone, Default, clap::Args)]
 pub struct ZipperOptions {
     /// Tags to remove from mapped reads before copying unmapped tags.
     #[arg(long, value_delimiter = ',')]
@@ -267,13 +267,6 @@ pub struct ZipperOptions {
     /// Tags to reverse complement for reads mapped to the negative strand.
     #[arg(long, value_delimiter = ',')]
     pub tags_to_revcomp: Vec<String>,
-    /// Buffer size for the template channel.
-    #[arg(short = 'b', long, default_value = "50000")]
-    pub buffer: usize,
-    /// Accepted for backward compatibility; has no effect. Carried so the
-    /// projection stays total — see [`Zipper::bwa_chunk_size`].
-    #[arg(short = 'K', long = "bwa-chunk-size", default_value = "150000000", hide = true)]
-    pub bwa_chunk_size: u64,
     /// Drop unmapped-BAM reads absent from the aligned BAM.
     #[arg(
         long = "exclude-missing-reads",
@@ -313,21 +306,6 @@ pub struct ZipperOptions {
     pub restore_unconverted_bases: bool,
 }
 
-impl Default for ZipperOptions {
-    fn default() -> Self {
-        Self {
-            tags_to_remove: Vec::new(),
-            tags_to_reverse: Vec::new(),
-            tags_to_revcomp: Vec::new(),
-            buffer: 50_000,
-            bwa_chunk_size: 150_000_000,
-            exclude_missing_reads: false,
-            skip_tc_tags: false,
-            restore_unconverted_bases: false,
-        }
-    }
-}
-
 impl Zipper {
     /// Project the parsed CLI flags into [`ZipperOptions`].
     #[must_use]
@@ -336,8 +314,6 @@ impl Zipper {
             tags_to_remove: self.tags_to_remove.clone(),
             tags_to_reverse: self.tags_to_reverse.clone(),
             tags_to_revcomp: self.tags_to_revcomp.clone(),
-            buffer: self.buffer,
-            bwa_chunk_size: self.bwa_chunk_size,
             exclude_missing_reads: self.exclude_missing_reads,
             skip_tc_tags: self.skip_tc_tags,
             restore_unconverted_bases: self.restore_unconverted_bases,
@@ -5680,8 +5656,6 @@ mod tests {
         assert_eq!(opts.tags_to_remove, vec!["RX".to_string(), "MI".to_string()]);
         assert_eq!(opts.tags_to_reverse, vec!["QX".to_string()]);
         assert_eq!(opts.tags_to_revcomp, vec!["OX".to_string(), "ZA".to_string()]);
-        assert_eq!(opts.buffer, 1234);
-        assert_eq!(opts.bwa_chunk_size, 4242);
         assert!(opts.exclude_missing_reads);
         assert!(opts.skip_tc_tags);
         assert!(opts.restore_unconverted_bases);
@@ -5700,8 +5674,6 @@ mod tests {
         assert!(opts.tags_to_remove.is_empty());
         assert!(opts.tags_to_reverse.is_empty());
         assert!(opts.tags_to_revcomp.is_empty());
-        assert_eq!(opts.buffer, 50_000);
-        assert_eq!(opts.bwa_chunk_size, 150_000_000);
         assert!(!opts.exclude_missing_reads);
         assert!(!opts.skip_tc_tags);
         assert!(!opts.restore_unconverted_bases);
@@ -6151,8 +6123,6 @@ mod tests {
         .to_zipper_options();
         let multi =
             PrefixedZipper::try_parse_from(["x"]).expect("parses").opts.validate().expect("valid");
-        assert_eq!(multi.buffer, base.buffer);
-        assert_eq!(multi.bwa_chunk_size, base.bwa_chunk_size);
         assert_eq!(multi.exclude_missing_reads, base.exclude_missing_reads);
         assert_eq!(multi.skip_tc_tags, base.skip_tc_tags);
         assert_eq!(multi.restore_unconverted_bases, base.restore_unconverted_bases);
@@ -6166,17 +6136,44 @@ mod tests {
     /// A prefixed flag must round-trip through `MultiZipperOptions::validate`.
     #[test]
     fn multi_zipper_options_round_trips_a_supplied_flag() {
-        let multi = PrefixedZipper::try_parse_from(["x", "--zipper::buffer", "99"])
+        let multi =
+            PrefixedZipper::try_parse_from(["x", "--zipper::exclude-missing-reads", "true"])
+                .expect("parses")
+                .opts
+                .validate()
+                .expect("valid");
+        assert!(multi.exclude_missing_reads);
+
+        // A value-taking, comma-delimited field round-trips too.
+        let multi = PrefixedZipper::try_parse_from(["x", "--zipper::tags-to-remove", "RX,MI"])
             .expect("parses")
             .opts
             .validate()
             .expect("valid");
-        assert_eq!(multi.buffer, 99);
+        assert_eq!(multi.tags_to_remove, vec!["RX".to_string(), "MI".to_string()]);
     }
 
-    /// Guards the hand-written `impl Default for ZipperOptions` against
-    /// drifting from the standalone `zipper` command's
-    /// `#[arg(default_value...)]` literals.
+    /// `--zipper::buffer` and `--zipper::bwa-chunk-size` are gone from
+    /// `runall`: the chain zipper has no template channel to size and no chunk
+    /// knob, so both were accepted and ignored. They must now fail to parse. The
+    /// standalone `zipper --buffer`, which sizes its non-chain channels, and the
+    /// hidden back-compat `zipper -K`, stay.
+    #[test]
+    fn prefixed_zipper_dead_flags_are_rejected() {
+        for flag in ["--zipper::buffer", "--zipper::bwa-chunk-size"] {
+            let err = PrefixedZipper::try_parse_from(["x", flag, "99"])
+                .expect_err("the flag must be rejected");
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{flag}: {err}");
+        }
+        let cmd = Zipper::try_parse_from([
+            "zipper", "-i", "in.bam", "-u", "u.bam", "-r", "ref.fa", "--buffer", "99",
+        ])
+        .expect("standalone zipper still takes --buffer");
+        assert_eq!(cmd.buffer, 99);
+    }
+
+    /// Guards the derived `Default for ZipperOptions` against drifting from the
+    /// standalone `zipper` command's `#[arg(default_value...)]` literals.
     #[test]
     fn zipper_options_default_matches_cli_defaults() {
         // NB: zipper's reference flag is --reference (short -r), NOT --ref.
@@ -6194,8 +6191,6 @@ mod tests {
         .expect("parses")
         .to_zipper_options();
         let d = ZipperOptions::default();
-        assert_eq!(d.buffer, parsed.buffer);
-        assert_eq!(d.bwa_chunk_size, parsed.bwa_chunk_size);
         assert_eq!(d.exclude_missing_reads, parsed.exclude_missing_reads);
         assert_eq!(d.skip_tc_tags, parsed.skip_tc_tags);
         assert_eq!(d.restore_unconverted_bases, parsed.restore_unconverted_bases);
