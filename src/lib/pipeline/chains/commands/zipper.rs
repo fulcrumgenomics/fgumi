@@ -15,11 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Result;
 use log::info;
 
-use crate::commands::zipper::{ZipperOptions, merge_step};
+use crate::commands::zipper::{ZipperMergeRules, ZipperOptions, merge_step};
 use crate::logging::OperationTimer;
 use crate::pipeline::chains::FinalizeHook;
 use crate::pipeline::steps::tuning::BamPipelineTuning;
-use crate::reference::ReferenceReader;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ZipperFinalizeHook
@@ -76,8 +75,6 @@ pub(crate) struct ZipperMergeCaptures {
 pub(crate) fn build_zipper_merge_config(
     caps: ZipperMergeCaptures,
 ) -> Result<merge_step::ZipperMergeConfig> {
-    use crate::umi::TagInfo;
-
     let ZipperMergeCaptures {
         zipper_opts,
         output_header,
@@ -87,31 +84,12 @@ pub(crate) fn build_zipper_merge_config(
         records_emitted,
     } = caps;
 
-    let tag_info = TagInfo::new(
-        zipper_opts.tags_to_remove.clone(),
-        zipper_opts.tags_to_reverse.clone(),
-        zipper_opts.tags_to_revcomp.clone(),
-    );
-    if !tag_info.remove.is_empty() {
-        info!("Tags for removal: {:?}", tag_info.remove);
-    }
-    if !tag_info.reverse.is_empty() {
-        info!("Tags being reversed: {:?}", tag_info.reverse);
-    }
-    if !tag_info.revcomp.is_empty() {
-        info!("Tags being reverse complemented: {:?}", tag_info.revcomp);
-    }
-
-    let reference = if zipper_opts.restore_unconverted_bases {
-        info!("Loading reference FASTA for unconverted base restoration");
-        Some(Arc::new(ReferenceReader::new(&reference_path)?))
-    } else {
-        None
-    };
+    let ZipperMergeRules { tag_info, skip_tc_tags, reference } =
+        zipper_opts.merge_rules(&reference_path)?;
 
     let cfg = merge_step::ZipperMergeConfig {
-        tag_info: Arc::new(tag_info),
-        skip_tc_tags: zipper_opts.skip_tc_tags,
+        tag_info,
+        skip_tc_tags,
         exclude_missing_reads: zipper_opts.exclude_missing_reads,
         reference,
         output_header,

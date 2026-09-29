@@ -306,6 +306,59 @@ pub struct ZipperOptions {
     pub restore_unconverted_bases: bool,
 }
 
+/// The per-template merge rules a zipper option set selects.
+///
+/// Every zipper merge resolves them through [`ZipperOptions::merge_rules`]:
+/// standalone `fgumi zipper` on both its serial and chain paths, and runall's
+/// fused align-and-merge (`ChainBuilder::add_align`), so the merges cannot
+/// drift apart.
+pub(crate) struct ZipperMergeRules {
+    /// Tags to remove / reverse / reverse-complement on the merged records.
+    pub(crate) tag_info: std::sync::Arc<TagInfo>,
+    /// Whether to skip adding `tc` tags to secondary/supplementary records.
+    pub(crate) skip_tc_tags: bool,
+    /// The reference for `--restore-unconverted-bases`; `None` when it is off.
+    pub(crate) reference: Option<std::sync::Arc<ReferenceReader>>,
+}
+
+impl ZipperOptions {
+    /// Resolve the [`ZipperMergeRules`] these options select, logging the tag
+    /// manipulations and loading `reference_path` only when
+    /// `--restore-unconverted-bases` is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reference FASTA cannot be opened.
+    pub(crate) fn merge_rules(&self, reference_path: &Path) -> Result<ZipperMergeRules> {
+        let tag_info = TagInfo::new(
+            self.tags_to_remove.clone(),
+            self.tags_to_reverse.clone(),
+            self.tags_to_revcomp.clone(),
+        );
+        if !tag_info.remove.is_empty() {
+            info!("Tags for removal: {:?}", tag_info.remove);
+        }
+        if !tag_info.reverse.is_empty() {
+            info!("Tags being reversed: {:?}", tag_info.reverse);
+        }
+        if !tag_info.revcomp.is_empty() {
+            info!("Tags being reverse complemented: {:?}", tag_info.revcomp);
+        }
+
+        let reference = if self.restore_unconverted_bases {
+            info!("Loading reference FASTA for unconverted base restoration");
+            Some(std::sync::Arc::new(ReferenceReader::new(reference_path)?))
+        } else {
+            None
+        };
+        Ok(ZipperMergeRules {
+            tag_info: std::sync::Arc::new(tag_info),
+            skip_tc_tags: self.skip_tc_tags,
+            reference,
+        })
+    }
+}
+
 impl Zipper {
     /// Project the parsed CLI flags into [`ZipperOptions`].
     #[must_use]
@@ -1223,7 +1276,7 @@ impl Zipper {
         mut mapped_iter: M,
         output_header: &Header,
         tags: &ZipperTags,
-        reference: Option<&ReferenceReader>,
+        rules: &ZipperMergeRules,
     ) -> Result<u64>
     where
         U: Iterator<Item = Result<Template>>,
@@ -1256,10 +1309,10 @@ impl Zipper {
                         &unmapped_template,
                         mapped_template,
                         tags,
-                        self.skip_tc_tags,
+                        rules.skip_tc_tags,
                         &mut aux_scratch,
                     )?;
-                    if let Some(ref_reader) = reference {
+                    if let Some(ref_reader) = rules.reference.as_deref() {
                         // EM-seq: restore converted bases in-place on packed 4-bit nibbles.
                         restore_unconverted_bases_in_raw_template(
                             mapped_template,
@@ -1471,33 +1524,13 @@ impl Command for Zipper {
         // Add @PG record with PP chaining
         let output_header = crate::commands::common::add_pg_record(output_header, command_line)?;
 
-        let tag_info = TagInfo::new(
-            self.tags_to_remove.clone(),
-            self.tags_to_reverse.clone(),
-            self.tags_to_revcomp.clone(),
-        );
-
-        if !tag_info.remove.is_empty() {
-            info!("Tags for removal: {:?}", tag_info.remove);
-        }
-        if !tag_info.reverse.is_empty() {
-            info!("Tags being reversed: {:?}", tag_info.reverse);
-        }
-        if !tag_info.revcomp.is_empty() {
-            info!("Tags being reverse complemented: {:?}", tag_info.revcomp);
-        }
-
-        // Load reference FASTA if restoring unconverted bases
-        let reference = if self.restore_unconverted_bases {
-            info!("Loading reference FASTA for unconverted base restoration");
-            Some(ReferenceReader::new(&self.reference)?)
-        } else {
-            None
-        };
+        // Tag rules and the optional restore reference, resolved the same way
+        // for every zipper merge (see `ZipperOptions::merge_rules`).
+        let rules = self.to_zipper_options().merge_rules(&self.reference)?;
 
         // Build the tag lookups once for the whole run; `process_raw` reuses them
         // for every template on either scheduling path.
-        let tags = ZipperTags::from_tag_info(&tag_info);
+        let tags = ZipperTags::from_tag_info(&rules.tag_info);
 
         // zipper is a lightweight streaming step (`aligner | fgumi zipper |
         // fgumi sort`), so it must honour `--threads` and not oversubscribe
@@ -1510,7 +1543,7 @@ impl Command for Zipper {
         let total_records = if self.threads <= 1 {
             let unmapped_iter = TemplateIterator::new(unmapped_raw_reader);
             let mapped_iter = TemplateIterator::new(mapped_reader);
-            self.process_raw(unmapped_iter, mapped_iter, &output_header, &tags, reference.as_ref())?
+            self.process_raw(unmapped_iter, mapped_iter, &output_header, &tags, &rules)?
         } else {
             let (unmapped_tx, unmapped_rx) =
                 std::sync::mpsc::sync_channel::<Result<Template>>(self.buffer);
@@ -1534,7 +1567,7 @@ impl Command for Zipper {
             });
             let mapped_iter = std::iter::from_fn(move || mapped_rx.recv().ok());
 
-            self.process_raw(unmapped_iter, mapped_iter, &output_header, &tags, reference.as_ref())?
+            self.process_raw(unmapped_iter, mapped_iter, &output_header, &tags, &rules)?
         };
 
         info!("zipper completed successfully");

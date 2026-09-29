@@ -73,6 +73,9 @@ pub struct AlignOptions {
 pub struct StageOptionsBag {
     pub copy_umi: Option<CopyUmiOptions>,
     pub correct: Option<CorrectOptions>,
+    /// Zipper stage options. Also read by `Stage::Align`, whose fused
+    /// align-and-merge takes its merge rules (`tags_to_*`, `skip_tc_tags`,
+    /// `restore_unconverted_bases`) from here; the two stages never share a chain.
     pub zipper: Option<ZipperOptions>,
     pub sort: Option<SortOptions>,
     pub group: Option<GroupOptions>,

@@ -1199,9 +1199,15 @@ fn extract_to_correct_with_rejects_matches_staged_chain() {
 /// fused chain feeds its aligner, in the same order. Its records stay unmapped
 /// (valid aligner output), and the header gains the reference's `@SQ` so
 /// `AlignAndMerge`'s dict check passes. This keeps the fused-chain tests
-/// hermetic: no real aligner, so they run in CI.
+/// hermetic: no real aligner, so they run in CI. Returns `(kept, replay)`,
+/// `kept` being that `extract | correct` output.
 #[cfg(feature = "simulate")]
-fn write_correct_replay_bam(dir: &Path, r1: &Path, r2: &Path, reference_len: usize) -> PathBuf {
+fn write_correct_replay_bam(
+    dir: &Path,
+    r1: &Path,
+    r2: &Path,
+    reference_len: usize,
+) -> (PathBuf, PathBuf) {
     use noodles::sam::alignment::io::Write as _;
     use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
 
@@ -1254,7 +1260,7 @@ fn write_correct_replay_bam(dir: &Path, r1: &Path, r2: &Path, reference_len: usi
         writer.write_alignment_record(&header, record).unwrap();
     }
     writer.try_finish().unwrap();
-    replay
+    (kept, replay)
 }
 
 /// The shared fixture for the fused `correct` rejects tests: a 4000 bp
@@ -1268,7 +1274,7 @@ fn correct_rejects_fixture(dir: &Path) -> (PathBuf, PathBuf, PathBuf, String) {
     let (reference, sequence) = write_unique_reference(dir, REFERENCE_LEN);
     let molecules = [(500usize, "AAAA", "CCCC"), (2000usize, "GGGG", "TTTT")];
     let (r1, r2) = write_duplex_umi_fastq(dir, &sequence, &molecules);
-    let replay = write_correct_replay_bam(dir, &r1, &r2, REFERENCE_LEN);
+    let (_, replay) = write_correct_replay_bam(dir, &r1, &r2, REFERENCE_LEN);
     let aligner_cmd = format!(
         "{} simulate aligner --replay-bam {} {{ref}}",
         env!("CARGO_BIN_EXE_fgumi"),
@@ -1370,6 +1376,252 @@ fn extract_to_zipper_writes_correct_rejects_like_self_pair() {
         "rejected molecule 1 leaked into the chained output: {kept:?}"
     );
     assert_eq!(kept.len(), 8, "every molecule-0 record must reach the chained output: {kept:?}");
+}
+
+/// Writes a *mapped* replay BAM for an `extract→correct→align` chain over
+/// `(r1, r2)`, plus the standalone `extract | correct` kept BAM it pairs with.
+///
+/// Every template becomes R1 forward at `100 + 40·t`, R2 reverse at `2000 +
+/// 40·t`, and a supplementary copy of R1 at `3000`, each with SEQ copied from
+/// `sequence` so the replay is valid aligner output. R1 additionally carries
+/// `YD:Z:f` with every reference `C` converted to `T`, the bwameth top-strand
+/// shape `--restore-unconverted-bases` reverses. This gives every
+/// `--zipper::*` merge rule something to change: tags on a reverse-strand read
+/// for reverse/revcomp, a supplementary read for `tc`, and converted bases for
+/// the restore. Returns `(kept, replay)`.
+#[cfg(feature = "simulate")]
+fn write_mapped_replay_bam(dir: &Path, r1: &Path, r2: &Path, sequence: &str) -> (PathBuf, PathBuf) {
+    use noodles::core::Position;
+    use noodles::sam::alignment::io::Write as _;
+    use noodles::sam::alignment::record::Flags;
+    use noodles::sam::alignment::record::cigar::op::{Kind, Op};
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record_buf::data::field::Value;
+    use noodles::sam::alignment::record_buf::{Cigar, Sequence};
+    use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+
+    // Reuse the unmapped-replay fixture's kept BAM: it is exactly the stream
+    // the fused chain hands its aligner.
+    let (kept, _) = write_correct_replay_bam(dir, r1, r2, sequence.len());
+
+    let (mut header, records) = read_bam_output(&kept);
+    header.reference_sequences_mut().insert(
+        bstr::BString::from("chr1"),
+        Map::<ReferenceSequence>::new(std::num::NonZeroUsize::new(sequence.len()).unwrap()),
+    );
+
+    let place = |record: &noodles::sam::alignment::RecordBuf,
+                 pos: usize,
+                 mate_pos: usize,
+                 flags: Flags,
+                 convert: bool| {
+        let mut out = record.clone();
+        let len = record.sequence().len();
+        let mut bases = sequence.as_bytes()[pos - 1..pos - 1 + len].to_vec();
+        if convert {
+            for b in &mut bases {
+                if *b == b'C' {
+                    *b = b'T';
+                }
+            }
+            out.data_mut().insert(Tag::new(b'Y', b'D'), Value::String("f".into()));
+        }
+        *out.flags_mut() = flags;
+        *out.reference_sequence_id_mut() = Some(0);
+        *out.alignment_start_mut() = Position::new(pos);
+        *out.cigar_mut() = Cigar::from(vec![Op::new(Kind::Match, len)]);
+        *out.mapping_quality_mut() = noodles::sam::alignment::record::MappingQuality::new(60);
+        *out.sequence_mut() = Sequence::from(bases);
+        *out.mate_reference_sequence_id_mut() = Some(0);
+        *out.mate_alignment_start_mut() = Position::new(mate_pos);
+        out
+    };
+
+    let replay = dir.join("mapped_replay.bam");
+    let mut writer = noodles::bam::io::Writer::new(std::fs::File::create(&replay).unwrap());
+    writer.write_header(&header).unwrap();
+    for (t, pair) in records.chunks(2).enumerate() {
+        let [first, second] = pair else { panic!("kept BAM must hold R1/R2 pairs") };
+        let r1_pos = 100 + 40 * t;
+        let r2_pos = 2000 + 40 * t;
+        let paired = Flags::SEGMENTED | Flags::PROPERLY_SEGMENTED;
+        let r1_flags = paired | Flags::FIRST_SEGMENT | Flags::MATE_REVERSE_COMPLEMENTED;
+        let r2_flags = paired | Flags::LAST_SEGMENT | Flags::REVERSE_COMPLEMENTED;
+        let out_r1 = place(first, r1_pos, r2_pos, r1_flags, true);
+        let out_r2 = place(second, r2_pos, r1_pos, r2_flags, false);
+        let out_supp = place(first, 3000, r2_pos, r1_flags | Flags::SUPPLEMENTARY, false);
+        for record in [&out_r1, &out_r2, &out_supp] {
+            writer.write_alignment_record(&header, record).unwrap();
+        }
+    }
+    writer.try_finish().unwrap();
+    (kept, replay)
+}
+
+/// The fixture for the fused-merge `--zipper::*` tests: a 4000 bp reference, a
+/// two-molecule duplex FASTQ pair, and the [`write_mapped_replay_bam`] kept and
+/// replay BAMs over it.
+#[cfg(feature = "simulate")]
+struct MappedReplay {
+    reference: PathBuf,
+    kept: PathBuf,
+    replay: PathBuf,
+    /// `(reference, r1, r2, aligner command)` for [`correct_chain_args`].
+    chain: (PathBuf, PathBuf, PathBuf, String),
+}
+
+#[cfg(feature = "simulate")]
+impl MappedReplay {
+    fn new(dir: &Path) -> Self {
+        const REFERENCE_LEN: usize = 4000;
+        let (reference, sequence) = write_unique_reference(dir, REFERENCE_LEN);
+        let (r1, r2) = write_duplex_umi_fastq(
+            dir,
+            &sequence,
+            &[(500, "AAAA", "CCCC"), (2000, "GGGG", "TTTT")],
+        );
+        let (kept, replay) = write_mapped_replay_bam(dir, &r1, &r2, &sequence);
+        let aligner_cmd = format!(
+            "{} simulate aligner --replay-bam {} {{ref}}",
+            env!("CARGO_BIN_EXE_fgumi"),
+            replay.display()
+        );
+        Self { chain: (reference.clone(), r1, r2, aligner_cmd), reference, kept, replay }
+    }
+
+    /// Runs the fused chain ending at zipper, starting from `extract` (through
+    /// correct) or, when `start_from_align`, from the kept unmapped BAM, with
+    /// `flags` given their `--zipper::` prefix. Returns stderr.
+    fn run_chain(&self, start_from_align: bool, out: &Path, flags: &[&str]) -> String {
+        let prefixed: Vec<String> = flags
+            .iter()
+            .map(|a| {
+                a.strip_prefix("--").map_or_else(|| (*a).to_string(), |f| format!("--zipper::{f}"))
+            })
+            .collect();
+        let (reference, _, _, aligner_cmd) = &self.chain;
+        let mut args = if start_from_align {
+            vec![
+                "runall",
+                "--start-from",
+                "align",
+                "--stop-after",
+                "zipper",
+                "-i",
+                p(&self.kept),
+                "--ref",
+                p(reference),
+                "--aligner::command",
+                aligner_cmd,
+            ]
+        } else {
+            correct_chain_args("zipper", &self.chain)
+        };
+        args.extend(prefixed.iter().map(String::as_str));
+        args.extend(["-o", p(out)]);
+        let output =
+            run_ok(args, &format!("runall ->zipper (align start: {start_from_align}) {flags:?}"));
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    /// Standalone `fgumi zipper` over the same replay (aligner output) and kept
+    /// (unmapped) BAMs — the oracle for the fused merge.
+    fn run_standalone(&self, out: &Path, flags: &[&str]) {
+        let mut args = vec![
+            "zipper",
+            "-i",
+            p(&self.replay),
+            "-u",
+            p(&self.kept),
+            "-r",
+            p(&self.reference),
+            "-o",
+            p(out),
+        ];
+        args.extend_from_slice(flags);
+        run_ok(args, &format!("standalone zipper {flags:?}"));
+    }
+}
+
+/// Every `--zipper::*` merge rule must apply on a chain that aligns — from
+/// `extract` (correct feeding the fused Align stage) and from `align` (an
+/// unmapped BAM) — exactly as standalone `fgumi zipper` applies it to the same
+/// aligner output. The fused merge used to be built with empty tag rules,
+/// `tc` tags always on and no unconverted-base restore, so each flag was
+/// parsed and dropped. A no-flag baseline must already match standalone
+/// zipper, so a mismatch is the flag, not the fixture; and each flag must
+/// change the output, so no case can pass vacuously.
+#[cfg(feature = "simulate")]
+#[rstest::rstest]
+#[case::tags_to_remove(&["--tags-to-remove", "RX"])]
+#[case::tags_to_reverse(&["--tags-to-reverse", "RX"])]
+#[case::tags_to_revcomp(&["--tags-to-revcomp", "RX"])]
+#[case::skip_tc_tags(&["--skip-tc-tags"])]
+#[case::restore_unconverted_bases(&["--restore-unconverted-bases"])]
+fn fused_chain_honors_zipper_merge_flags(
+    #[case] flags: &[&str],
+    #[values(false, true)] start_from_align: bool,
+) {
+    let tmp = TempDir::new().unwrap();
+    let fixture = MappedReplay::new(tmp.path());
+
+    let chain_default = tmp.path().join("chain_default.bam");
+    fixture.run_chain(start_from_align, &chain_default, &[]);
+    let chain_flagged = tmp.path().join("chain_flagged.bam");
+    fixture.run_chain(start_from_align, &chain_flagged, flags);
+    let oracle_default = tmp.path().join("oracle_default.bam");
+    fixture.run_standalone(&oracle_default, &[]);
+    let oracle = tmp.path().join("oracle.bam");
+    fixture.run_standalone(&oracle, flags);
+
+    assert_bams_record_equivalent_nonempty(&chain_default, &oracle_default);
+    assert_bams_record_equivalent_nonempty(&chain_flagged, &oracle);
+    let (_, default_records) = read_bam_output(&chain_default);
+    let (_, flagged_records) = read_bam_output(&chain_flagged);
+    assert_ne!(
+        default_records, flagged_records,
+        "{flags:?} must change the fused chain's output on this fixture"
+    );
+}
+
+/// `--zipper::exclude-missing-reads` has nothing to act on in a fused align
+/// stage (a template the aligner drops fails the run). The run must say so —
+/// and only when the flag is set — and its output must be record-identical to
+/// the same chain without it.
+#[cfg(feature = "simulate")]
+#[test]
+fn fused_chain_warns_exclude_missing_reads_is_inert() {
+    const WARNING: &str = "--zipper::exclude-missing-reads has no effect on a fused align stage";
+    let tmp = TempDir::new().unwrap();
+    let fixture = MappedReplay::new(tmp.path());
+
+    let without = tmp.path().join("without.bam");
+    let stderr = fixture.run_chain(false, &without, &[]);
+    assert!(!stderr.contains(WARNING), "the warning must not fire without the flag:\n{stderr}");
+
+    let with = tmp.path().join("with.bam");
+    let stderr = fixture.run_chain(false, &with, &["--exclude-missing-reads"]);
+    assert!(stderr.contains(WARNING), "expected the inert-flag warning, got:\n{stderr}");
+    assert_bams_record_equivalent_nonempty(&with, &without);
+}
+
+/// `--zipper::restore-unconverted-bases` is for re-aligned consensus reads; on
+/// raw reads from `--start-from extract` it erases the conversions before any
+/// consensus has recorded them, so the run must warn there — and not on
+/// `--start-from align`, its documented re-alignment use.
+#[cfg(feature = "simulate")]
+#[test]
+fn restore_unconverted_bases_warns_only_before_consensus() {
+    const WARNING: &str =
+        "--zipper::restore-unconverted-bases rewrites converted bases on raw reads";
+    let tmp = TempDir::new().unwrap();
+    let fixture = MappedReplay::new(tmp.path());
+    let flags = ["--restore-unconverted-bases"];
+
+    let stderr = fixture.run_chain(false, &tmp.path().join("extract.bam"), &flags);
+    assert!(stderr.contains(WARNING), "expected the raw-read restore warning, got:\n{stderr}");
+    let stderr = fixture.run_chain(true, &tmp.path().join("align.bam"), &flags);
+    assert!(!stderr.contains(WARNING), "--start-from align must not warn:\n{stderr}");
 }
 
 /// A chained correct that reaches no consensus stage leaves the top-level
