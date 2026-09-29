@@ -1,12 +1,15 @@
-//! Unit tests for `SpillWrite::process_event` (the `StepCtx`-free core): per-file
-//! demux, codec magic/trailer bracketing, finalization on `is_last_in_file`, and
-//! event mapping. Byte-exact readback of the assembled file is gated end-to-end
-//! by the full-sort parity test (the production reader is crate-private to
-//! `fgumi-sort`).
+//! Unit tests for `SpillWrite`'s `StepCtx`-free core: per-file demux, codec
+//! magic/trailer bracketing, runs held closed until `AllAnnounced`, bounded
+//! consolidation of runs under `--max-temp-files`, and event mapping.
+//! Byte-exact readback of a merged sort is gated end-to-end by the sort
+//! command's consolidation parity tests.
 
 use super::*;
 use crate::sort::protocol::MemoryChunkErased;
-use fgumi_sort::{InMemoryChunk, RawCoordinateKey, SpillBlockCompressor};
+use fgumi_sort::{
+    InMemoryChunk, RawCoordinateKey, RawSortKey, SpillBlockCompressor, TemplateKey,
+    frame_keyed_record_into,
+};
 use rstest::rstest;
 use tempfile::TempDir;
 
@@ -28,52 +31,276 @@ fn block(codec: SpillCodec, file_id: u32, is_last: bool, raw: &[u8]) -> SpillBlo
     SpillBlockEvent::Block {
         ordinal: 0,
         file_id,
+        key_kind: SpillKeyKind::Coordinate,
         is_last_in_file: is_last,
         records_ingested_so_far: 42,
         bytes: compress(codec, raw),
     }
 }
 
+fn announced(slot_count: u32, memory_chunk_count: u32, total_records: u64) -> SpillBlockEvent {
+    SpillBlockEvent::AllAnnounced { ordinal: 0, slot_count, memory_chunk_count, total_records }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn template_key(primary: u64) -> TemplateKey {
+    TemplateKey::new(
+        0,
+        primary as i32,
+        false,
+        i32::MAX,
+        i32::MAX,
+        false,
+        0,
+        0,
+        (0, false),
+        0,
+        false,
+    )
+}
+
+/// A single-block spill run of real keyed records (template-coordinate, so the
+/// key is a prefix and any body will do), as `SpillGather` + `SpillBlockCompress`
+/// would deliver it. Each body is [`run_body`]`(file_id, key)`, unique across
+/// runs even where keys repeat.
+fn keyed_run(codec: SpillCodec, file_id: u32, keys: std::ops::Range<u64>) -> SpillBlockEvent {
+    let mut raw = Vec::new();
+    for k in keys {
+        frame_keyed_record_into(&mut raw, &template_key(k), &run_body(file_id, k)).unwrap();
+    }
+    SpillBlockEvent::Block {
+        ordinal: 0,
+        file_id,
+        key_kind: SpillKeyKind::TemplateK40,
+        is_last_in_file: true,
+        records_ingested_so_far: u64::from(file_id) + 1,
+        bytes: compress(codec, &raw),
+    }
+}
+
+/// The body [`keyed_run`] gives the record keyed `key` in run `file_id`.
+fn run_body(file_id: u32, key: u64) -> Vec<u8> {
+    [file_id.to_le_bytes().as_slice(), key.to_le_bytes().as_slice()].concat()
+}
+
+/// Drive any in-flight consolidation (and the ones it chains into) to the end,
+/// returning how many records it rewrote.
+fn finish_consolidation(w: &mut SpillWrite) -> u64 {
+    let mut rewritten = 0;
+    while w.active.is_some() {
+        rewritten += w.advance_consolidation(7, u64::MAX).unwrap();
+    }
+    rewritten
+}
+
 #[rstest]
 #[case(SpillCodec::Zstd)]
 #[case(SpillCodec::Bgzf)]
-fn non_last_block_opens_file_emits_nothing_last_block_emits_spill_ready(#[case] codec: SpillCodec) {
+fn a_closed_run_is_announced_only_at_all_announced(#[case] codec: SpillCodec) {
     let (mut w, dir) = make_writer(codec);
     // First (non-last) block: file opens, no event.
-    let out = w.process_event(block(codec, 5, false, &[1u8; 32])).unwrap();
-    assert!(out.is_none(), "non-last block emits no event ({codec:?})");
+    w.process_event(block(codec, 5, false, &[1u8; 32])).unwrap();
     assert!(w.current.is_some(), "file must be open after first block ({codec:?})");
 
-    // Last block: trailer written, slot opened, SpillReady emitted.
-    let out = w.process_event(block(codec, 5, true, &[2u8; 32])).unwrap();
-    let Some(SortPhase1Event::SpillReady { slot, path, records_ingested_so_far }) = out else {
+    // Last block: the file is finished and closed, but no slot is opened yet —
+    // the merge cannot start before `AllAnnounced`, and an early slot would hold
+    // a descriptor and read-ahead for the rest of the sort.
+    w.process_event(block(codec, 5, true, &[2u8; 32])).unwrap();
+    assert!(w.current.is_none(), "file closed after last block ({codec:?})");
+    assert!(w.outbox.is_empty(), "no event until AllAnnounced ({codec:?})");
+
+    w.process_event(announced(1, 0, 42)).unwrap();
+    let Some(SortPhase1Event::SpillReady { slot, path, records_ingested_so_far }) =
+        w.outbox.pop_front()
+    else {
         panic!("expected SpillReady ({codec:?})");
     };
-    assert!(w.current.is_none(), "file closed after last block ({codec:?})");
     assert_eq!(slot.file_id, 5, "slot file_id == logical seq ({codec:?})");
     assert_eq!(records_ingested_so_far, 42);
-    assert!(path.exists(), "spill file exists ({codec:?})");
     assert!(path.starts_with(dir.path()), "spill file under temp dir ({codec:?})");
     assert_eq!(slot.codec, codec, "codec detected from written magic ({codec:?})");
+    assert!(matches!(
+        w.outbox.pop_front(),
+        Some(SortPhase1Event::AllAnnounced {
+            slot_count: 1,
+            memory_chunk_count: 0,
+            total_records: 42
+        })
+    ));
+    assert!(w.outbox.is_empty());
 }
 
 #[test]
-fn distinct_file_ids_produce_distinct_files() {
+fn runs_are_announced_in_file_id_order_with_distinct_files() {
     let codec = SpillCodec::Zstd;
     let (mut w, _dir) = make_writer(codec);
-    // File 0 (single block), then file 1 (single block) — contiguous per file.
-    let r0 = w.process_event(block(codec, 0, true, &[7u8; 16])).unwrap().unwrap();
-    let r1 = w.process_event(block(codec, 1, true, &[8u8; 16])).unwrap().unwrap();
-    let (
-        SortPhase1Event::SpillReady { path: p0, slot: s0, .. },
-        SortPhase1Event::SpillReady { path: p1, slot: s1, .. },
-    ) = (r0, r1)
-    else {
-        panic!("expected two SpillReady events");
-    };
-    assert_ne!(p0, p1, "distinct file_ids must yield distinct paths");
-    assert_eq!(s0.file_id, 0);
-    assert_eq!(s1.file_id, 1);
+    for file_id in [0, 1, 4] {
+        w.process_event(block(codec, file_id, true, &[7u8; 16])).unwrap();
+    }
+    w.process_event(announced(3, 0, 3)).unwrap();
+    let mut ids = Vec::new();
+    let mut paths = Vec::new();
+    while let Some(event) = w.outbox.pop_front() {
+        match event {
+            SortPhase1Event::SpillReady { slot, path, .. } => {
+                ids.push(slot.file_id);
+                paths.push(path);
+            }
+            SortPhase1Event::AllAnnounced { slot_count, .. } => assert_eq!(slot_count, 3),
+            SortPhase1Event::MemoryChunk { .. } => panic!("no memory chunk was sent"),
+        }
+    }
+    assert_eq!(ids, vec![0, 1, 4]);
+    paths.dedup();
+    assert_eq!(paths.len(), 3, "distinct file_ids must yield distinct paths");
+}
+
+#[test]
+fn an_announced_run_count_that_disagrees_with_the_runs_written_fails_closed() {
+    let codec = SpillCodec::Zstd;
+    let (mut w, _dir) = make_writer(codec);
+    w.process_event(block(codec, 0, true, &[7u8; 16])).unwrap();
+    // Upstream claims two runs; only one was written — a run was lost.
+    match w.process_event(announced(2, 0, 2)) {
+        Err(err) => assert!(err.to_string().contains("announced 2"), "got: {err}"),
+        Ok(()) => panic!("a run-count mismatch must fail closed"),
+    }
+}
+
+#[test]
+fn runs_with_different_key_types_fail_closed() {
+    let codec = SpillCodec::Zstd;
+    let (mut w, _dir) = make_writer(codec);
+    w.process_event(block(codec, 0, true, &[7u8; 16])).unwrap();
+    // A second run keyed differently could not be consolidated with the first.
+    match w.process_event(keyed_run(codec, 1, 0..3)) {
+        Err(err) => assert!(err.to_string().contains("keyed"), "got: {err}"),
+        Ok(()) => panic!("mixed key types must fail closed"),
+    }
+}
+
+#[rstest]
+#[case::zstd(SpillCodec::Zstd)]
+#[case::bgzf(SpillCodec::Bgzf)]
+fn consolidation_keeps_live_runs_under_the_limit_and_preserves_every_record(
+    #[case] codec: SpillCodec,
+) {
+    const LIMIT: usize = 4;
+    const RUNS: u32 = 25;
+    const PER_RUN: u64 = 10;
+    let (w, dir) = make_writer(codec);
+    let mut w = w.with_max_temp_files(LIMIT, 1);
+    for file_id in 0..RUNS {
+        // Overlapping key ranges, so merges genuinely interleave runs.
+        let start = u64::from(file_id) * 3;
+        w.process_event(keyed_run(codec, file_id, start..start + PER_RUN)).unwrap();
+        finish_consolidation(&mut w);
+        assert!(
+            w.runs.runs().len() < LIMIT,
+            "live runs {} after run {file_id}",
+            w.runs.runs().len()
+        );
+    }
+    assert!(w.stats.consolidations() > 0, "25 runs under a limit of 4 must consolidate");
+    assert_eq!(w.stats.runs_written(), u64::from(RUNS));
+
+    w.process_event(announced(RUNS, 0, 99)).unwrap();
+    let mut slots = Vec::new();
+    while let Some(event) = w.outbox.pop_front() {
+        match event {
+            SortPhase1Event::SpillReady { slot, path, .. } => slots.push((slot.file_id, path)),
+            SortPhase1Event::AllAnnounced { slot_count, .. } => {
+                assert_eq!(slot_count as usize, slots.len());
+            }
+            SortPhase1Event::MemoryChunk { .. } => panic!("no memory chunk was sent"),
+        }
+    }
+    assert!(slots.len() < LIMIT, "{} merge sources exceed the limit", slots.len());
+    assert_eq!(w.stats.merge_sources(), slots.len() as u64);
+    assert!(slots.windows(2).all(|p| p[0].0 < p[1].0), "slots in file_id order: {slots:?}");
+
+    // Every record survives exactly once across the surviving runs, and each
+    // run is sorted.
+    let mut dec = fgumi_sort::SpillBlockDecompressor::new();
+    let mut survivors: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for (_, path) in &slots {
+        let bytes = std::fs::read(path).unwrap();
+        let body = if codec == SpillCodec::Zstd { &bytes[4..] } else { &bytes[..] };
+        let raw: Vec<u8> = dec.read_blocks(&mut &body[..], codec, 4096).unwrap().concat();
+        let mut at = 0;
+        let mut previous: Option<Vec<u8>> = None;
+        while at < raw.len() {
+            let key = raw[at..at + 40].to_vec();
+            let len = u32::from_le_bytes(raw[at + 40..at + 44].try_into().unwrap()) as usize;
+            survivors.push((key.clone(), raw[at + 44..at + 44 + len].to_vec()));
+            at += 44 + len;
+            if let Some(p) = &previous {
+                let (a, b) = (
+                    TemplateKey::read_from(&mut &p[..]).unwrap(),
+                    TemplateKey::read_from(&mut &key[..]).unwrap(),
+                );
+                assert!(a <= b, "run {path:?} is out of order");
+            }
+            previous = Some(key);
+        }
+    }
+    // Identity, not just a count: a dropped record plus a duplicated one would
+    // keep the total and still fail here.
+    let mut expected: Vec<(Vec<u8>, Vec<u8>)> = (0..RUNS)
+        .flat_map(|file_id| {
+            let start = u64::from(file_id) * 3;
+            (start..start + PER_RUN).map(move |k| {
+                let mut key = Vec::new();
+                template_key(k).write_to(&mut key).unwrap();
+                (key, run_body(file_id, k))
+            })
+        })
+        .collect();
+    expected.sort_by(|a, b| a.1.cmp(&b.1));
+    survivors.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(survivors, expected, "records lost, duplicated or altered by consolidation");
+    // Consolidated inputs are removed; only the surviving runs remain on disk.
+    let on_disk = std::fs::read_dir(dir.path()).unwrap().count();
+    assert_eq!(on_disk, slots.len(), "consolidated inputs must be deleted");
+}
+
+/// Runs are held until `AllAnnounced`; an input that drains without it would
+/// otherwise finish "successfully" having delivered none of them.
+#[test]
+fn draining_with_unannounced_runs_fails_closed() {
+    let codec = SpillCodec::Zstd;
+    let (mut w, _dir) = make_writer(codec);
+    w.ensure_runs_announced().expect("a writer that closed no runs has nothing to strand");
+    w.process_event(keyed_run(codec, 0, 0..3)).unwrap();
+    let err = w.ensure_runs_announced().expect_err("a closed, unannounced run must fail");
+    assert!(err.to_string().contains("never announced"), "got: {err}");
+
+    w.process_event(announced(1, 0, 3)).unwrap();
+    w.ensure_runs_announced().expect("announced runs are not stranded");
+}
+
+/// Everything after `AllAnnounced` would land in a run stack nobody reads.
+#[test]
+fn an_event_after_all_announced_fails_closed() {
+    let codec = SpillCodec::Zstd;
+    let (mut w, _dir) = make_writer(codec);
+    w.process_event(announced(0, 0, 0)).unwrap();
+    match w.process_event(keyed_run(codec, 0, 0..3)) {
+        Err(err) => assert!(err.to_string().contains("after AllAnnounced"), "got: {err}"),
+        Ok(()) => panic!("a block after AllAnnounced must fail closed"),
+    }
+}
+
+#[test]
+fn a_limit_below_two_never_consolidates() {
+    let codec = SpillCodec::Zstd;
+    let (w, _dir) = make_writer(codec);
+    let mut w = w.with_max_temp_files(1, 1);
+    for file_id in 0..10 {
+        w.process_event(keyed_run(codec, file_id, 0..3)).unwrap();
+        assert!(w.active.is_none());
+    }
+    assert_eq!(w.runs.runs().len(), 10);
 }
 
 #[test]
@@ -83,7 +310,6 @@ fn block_for_wrong_file_id_while_open_errors() {
     // Open file 0 with a non-last block, then feed a block for file 1 — a
     // contiguity violation that must fail loud, not silently corrupt file 0.
     w.process_event(block(codec, 0, false, &[1u8; 16])).unwrap();
-    // `SortPhase1Event` is not `Debug`, so match instead of `unwrap_err`.
     match w.process_event(block(codec, 1, false, &[2u8; 16])) {
         Err(err) => {
             assert!(
@@ -91,7 +317,7 @@ fn block_for_wrong_file_id_while_open_errors() {
                 "expected contiguity error, got: {err}"
             );
         }
-        Ok(_) => panic!("a block for a different open file_id must error"),
+        Ok(()) => panic!("a block for a different open file_id must error"),
     }
 }
 
@@ -114,7 +340,7 @@ fn residual_while_file_open_errors() {
         Err(err) => {
             assert!(err.to_string().contains("still open"), "expected open-file error, got: {err}");
         }
-        Ok(_) => panic!("residual while a spill file is open must error"),
+        Ok(()) => panic!("residual while a spill file is open must error"),
     }
 }
 
@@ -141,27 +367,22 @@ fn residual_maps_to_memory_chunk_and_announced_passes_through() {
         RawCoordinateKey { sort_key: 1 },
         vec![9u8; 8],
     )]));
-    let out = w
-        .process_event(SpillBlockEvent::Residual { ordinal: 0, chunk, records_ingested_so_far: 3 })
+    w.process_event(SpillBlockEvent::Residual { ordinal: 0, chunk, records_ingested_so_far: 3 })
         .unwrap();
-    let Some(SortPhase1Event::MemoryChunk { chunk, records_ingested_so_far }) = out else {
+    let Some(SortPhase1Event::MemoryChunk { chunk, records_ingested_so_far }) =
+        w.outbox.pop_front()
+    else {
         panic!("expected MemoryChunk");
     };
     assert_eq!(records_ingested_so_far, 3);
     assert_eq!(Arc::strong_count(&chunk), 1, "residual chunk wrapped in a fresh unique Arc");
 
-    let out = w
-        .process_event(SpillBlockEvent::AllAnnounced {
-            ordinal: 1,
-            slot_count: 4,
-            memory_chunk_count: 1,
-            total_records: 500,
-        })
-        .unwrap();
+    // No spill runs: `AllAnnounced` passes straight through with zero slots.
+    w.process_event(announced(0, 1, 500)).unwrap();
     assert!(matches!(
-        out,
+        w.outbox.pop_front(),
         Some(SortPhase1Event::AllAnnounced {
-            slot_count: 4,
+            slot_count: 0,
             memory_chunk_count: 1,
             total_records: 500,
         })
@@ -224,8 +445,8 @@ fn ensure_no_open_file_passes_when_idle_and_fails_while_a_file_is_open() {
     w.ensure_no_open_file("Residual").expect("idle writer has no open file");
 
     // Opening a file without its is_last block leaves it dangling.
-    let out = w.process_event(block(SpillCodec::Zstd, 3, false, &[7u8; 16])).unwrap();
-    assert!(out.is_none());
+    w.process_event(block(SpillCodec::Zstd, 3, false, &[7u8; 16])).unwrap();
+    assert!(w.outbox.is_empty());
     assert!(w.current.is_some());
 
     let err = w.ensure_no_open_file("AllAnnounced").expect_err("dangling file must fail closed");
@@ -238,14 +459,14 @@ fn ensure_no_open_file_passes_when_idle_and_fails_while_a_file_is_open() {
 fn open_file_refuses_to_reuse_an_existing_path() {
     let (w, dir) = make_writer(SpillCodec::Zstd);
     // First open succeeds and creates the file on disk.
-    let opened = w.open_file(9).expect("first open succeeds");
+    let opened = w.open_file(9, SpillKeyKind::Coordinate).expect("first open succeeds");
     drop(opened);
     assert!(dir.path().join("chunk_0009.keyed").exists(), "spill file is created eagerly");
 
     // A reused file_id must fail closed rather than truncate the existing file:
     // silently overwriting a spill would drop records from the merge.
     // `OpenSpill` is not `Debug`, so match instead of using `expect_err`.
-    match w.open_file(9) {
+    match w.open_file(9, SpillKeyKind::Coordinate) {
         Ok(_) => panic!("reusing a file_id must fail"),
         Err(e) => assert_eq!(e.kind(), io::ErrorKind::AlreadyExists),
     }
@@ -275,7 +496,7 @@ fn all_announced_while_a_file_is_open_fails_closed() {
             assert!(msg.contains("still open"), "error names the cause: {msg}");
             assert!(msg.contains("file_id 0"), "error names the open file: {msg}");
         }
-        Ok(_) => panic!("AllAnnounced while a spill file is open must error"),
+        Ok(()) => panic!("AllAnnounced while a spill file is open must error"),
     }
 }
 
@@ -361,8 +582,8 @@ impl Step for ThrottledEventSink {
 /// Drives `SpillEventSource -> SpillWrite -> ThrottledEventSink` with telemetry
 /// enabled and asserts `SpillWrite`'s `spill_bytes_written` counter lands in the
 /// telemetry files with a sane, bounded value: `N_FILES` single-block spill
-/// files, each producing exactly one `SpillReady` for the sink to (slowly)
-/// drain.
+/// files, each producing exactly one `SpillReady` (at `AllAnnounced`) for the
+/// sink to (slowly) drain.
 #[test]
 fn try_run_bumps_spill_bytes_written_counter() {
     use fgumi_pipeline_core::builder::{InstrumentationLevel, Pipeline, PipelineConfig};
@@ -386,12 +607,19 @@ fn try_run_bumps_spill_bytes_written_counter() {
             SpillBlockEvent::Block {
                 ordinal: u64::from(file_id),
                 file_id,
+                key_kind: SpillKeyKind::Coordinate,
                 is_last_in_file: true,
                 records_ingested_so_far: u64::from(file_id) + 1,
                 bytes: compressed,
             }
         })
         .collect();
+    events.push(SpillBlockEvent::AllAnnounced {
+        ordinal: u64::from(N_FILES),
+        slot_count: N_FILES,
+        memory_chunk_count: 0,
+        total_records: u64::from(N_FILES),
+    });
     events.reverse(); // `pop()` drains the tail first, so file_ids come out ascending.
     let expected_bytes: u64 = compressed_lens.iter().sum();
 
@@ -420,17 +648,17 @@ fn try_run_bumps_spill_bytes_written_counter() {
         .expect("pipeline runs to completion");
 
     // Ground truth, independent of the sampled telemetry file: one
-    // `SpillReady` per file reached the sink.
+    // `SpillReady` per file, then `AllAnnounced`, reached the sink.
     let collected = std::mem::take(&mut *received.lock());
-    assert_eq!(collected.len(), N_FILES as usize, "one SpillReady per spill file");
+    assert_eq!(collected.len(), N_FILES as usize + 1, "one SpillReady per spill file");
 
     // `SpillWrite` is step index 1 (source=0, writer=1, sink=2).
     let names = std::fs::read_to_string(telemetry_dir.join("run.ticks.counter_names.tsv")).unwrap();
     let name_rows: Vec<&str> = names.lines().skip(1).filter(|l| l.starts_with("1\t")).collect();
     assert_eq!(
         name_rows,
-        vec!["1\t0\tspill_bytes_written\tbytes"],
-        "SpillWrite declares exactly one spill_bytes_written counter"
+        vec!["1\t0\tspill_bytes_written\tbytes", "1\t1\tconsolidation_records\trecords"],
+        "SpillWrite declares its spill-bytes and consolidation counters"
     );
 
     let counters = std::fs::read_to_string(telemetry_dir.join("run.ticks.counters.tsv")).unwrap();

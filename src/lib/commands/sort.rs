@@ -399,14 +399,15 @@ pub struct Sort {
     #[arg(long = "temp-codec", default_value = "zstd")]
     pub temp_codec: fgumi_sort::SpillCodec,
 
-    /// Maximum number of temporary spill files kept before the oldest are
-    /// consolidated into a single run.
+    /// Maximum number of live temporary spill runs; adjacent runs are merged
+    /// when the limit is reached.
     ///
-    /// Large inputs spill many sorted runs to disk. When the number of runs
-    /// reaches this limit, the oldest are merged together in a single pass so
-    /// the final k-way merge opens fewer files at once. That merge is the only
-    /// reason the limit exists: it opens every remaining run at once, so the
-    /// limit bounds how many file descriptors the sort needs.
+    /// Large inputs spill many sorted runs to disk. When the number of live
+    /// runs reaches this limit, adjacent runs are merged together — the
+    /// smallest first — until the count is back under it, so the final k-way
+    /// merge opens fewer files at once. That merge is the only reason the limit
+    /// exists: it opens every remaining run at once, so the limit bounds how
+    /// many file descriptors the sort needs. Output is unchanged either way.
     ///
     /// Consolidation rewrites data that is already sorted, so it is pure
     /// overhead whenever the descriptor budget could have carried the runs.
@@ -666,14 +667,15 @@ pub struct SortOptions {
     #[arg(long = "temp-codec", default_value = "zstd")]
     pub temp_codec: fgumi_sort::SpillCodec,
 
-    /// Maximum number of temporary spill files kept before the oldest are
-    /// consolidated into a single run.
+    /// Maximum number of live temporary spill runs; adjacent runs are merged
+    /// when the limit is reached.
     ///
-    /// Large inputs spill many sorted runs to disk. When the number of runs
-    /// reaches this limit, the oldest are merged together in a single pass so
-    /// the final k-way merge opens fewer files at once. That merge is the only
-    /// reason the limit exists: it opens every remaining run at once, so the
-    /// limit bounds how many file descriptors the sort needs.
+    /// Large inputs spill many sorted runs to disk. When the number of live
+    /// runs reaches this limit, adjacent runs are merged together — the
+    /// smallest first — until the count is back under it, so the final k-way
+    /// merge opens fewer files at once. That merge is the only reason the limit
+    /// exists: it opens every remaining run at once, so the limit bounds how
+    /// many file descriptors the sort needs. Output is unchanged either way.
     ///
     /// Consolidation rewrites data that is already sorted, so it is pure
     /// overhead whenever the descriptor budget could have carried the runs.

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use fgumi_sort::{
     InMemoryChunk, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RunBound, SortMergeSlot,
-    TemplateMemChunk,
+    SpillKeyKind, TemplateMemChunk,
 };
 
 use fgumi_pipeline_core::item::HeapSize;
@@ -45,6 +45,20 @@ pub enum MemoryChunkErased {
 }
 
 impl MemoryChunkErased {
+    /// The sort key type this chunk's records are keyed (and spilled) with.
+    #[must_use]
+    pub fn key_kind(&self) -> SpillKeyKind {
+        match self {
+            Self::Coordinate(_) => SpillKeyKind::Coordinate,
+            Self::QuerynameLex(_) => SpillKeyKind::QuerynameLex,
+            Self::QuerynameNatural(_) => SpillKeyKind::QuerynameNatural,
+            Self::TemplateCoordinate(TemplateMemChunk::K24(_)) => SpillKeyKind::TemplateK24,
+            Self::TemplateCoordinate(TemplateMemChunk::Cb32(_)) => SpillKeyKind::TemplateCb32,
+            Self::TemplateCoordinate(TemplateMemChunk::Tert32(_)) => SpillKeyKind::TemplateTert32,
+            Self::TemplateCoordinate(TemplateMemChunk::K40(_)) => SpillKeyKind::TemplateK40,
+        }
+    }
+
     /// Number of records in this chunk.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -232,6 +246,10 @@ pub enum SpillBlockEvent {
     Block {
         ordinal: u64,
         file_id: u32,
+        /// The sort key type the block's records were framed with. Constant
+        /// across a run; `SpillWrite` needs it to consolidate runs, because the
+        /// template-coordinate key width is only chosen at runtime.
+        key_kind: SpillKeyKind,
         is_last_in_file: bool,
         records_ingested_so_far: u64,
         bytes: Vec<u8>,
@@ -346,6 +364,49 @@ mod tests {
 
     /// Build the arena-backed coordinate chunk the `Coordinate` variant carries,
     /// from raw record payloads (keys are `default()`; irrelevant to these tests).
+    /// Each chunk variant names the key type its records are framed with — the
+    /// width consolidation decodes them at. The 32-byte template lanes share a
+    /// size, so a swapped arm would decode silently wrong rather than fail.
+    #[test]
+    fn key_kind_names_the_key_type_of_every_chunk_variant() {
+        fn one<K: fgumi_sort::RawSortKey + Default>() -> InMemoryChunk<K> {
+            InMemoryChunk::from_owned_records(vec![(K::default(), vec![0u8; 8])])
+        }
+        let cases = [
+            (MemoryChunkErased::Coordinate(one()), SpillKeyKind::Coordinate),
+            (MemoryChunkErased::QuerynameLex(one()), SpillKeyKind::QuerynameLex),
+            (MemoryChunkErased::QuerynameNatural(one()), SpillKeyKind::QuerynameNatural),
+            (
+                MemoryChunkErased::TemplateCoordinate(TemplateMemChunk::K24(one::<
+                    fgumi_sort::TemplateKey24,
+                >())),
+                SpillKeyKind::TemplateK24,
+            ),
+            (
+                MemoryChunkErased::TemplateCoordinate(TemplateMemChunk::Cb32(one::<
+                    fgumi_sort::CbKey32,
+                >())),
+                SpillKeyKind::TemplateCb32,
+            ),
+            (
+                MemoryChunkErased::TemplateCoordinate(TemplateMemChunk::Tert32(one::<
+                    fgumi_sort::TertKey32,
+                >(
+                ))),
+                SpillKeyKind::TemplateTert32,
+            ),
+            (
+                MemoryChunkErased::TemplateCoordinate(TemplateMemChunk::K40(one::<
+                    fgumi_sort::TemplateKey,
+                >())),
+                SpillKeyKind::TemplateK40,
+            ),
+        ];
+        for (chunk, expected) in cases {
+            assert_eq!(chunk.key_kind(), expected);
+        }
+    }
+
     fn coord(payloads: Vec<Vec<u8>>) -> InMemoryChunk<RawCoordinateKey> {
         InMemoryChunk::from_owned_records(
             payloads.into_iter().map(|b| (RawCoordinateKey::default(), b)).collect(),
@@ -515,6 +576,7 @@ mod tests {
         let block = SpillBlockEvent::Block {
             ordinal: 3,
             file_id: 0,
+            key_kind: SpillKeyKind::Coordinate,
             is_last_in_file: false,
             records_ingested_so_far: 0,
             bytes: vec![0u8; 4],
@@ -555,6 +617,7 @@ mod tests {
         let small = SpillBlockEvent::Block {
             ordinal: 0,
             file_id: 0,
+            key_kind: SpillKeyKind::Coordinate,
             is_last_in_file: false,
             records_ingested_so_far: 0,
             bytes: Vec::with_capacity(64),
@@ -562,6 +625,7 @@ mod tests {
         let large = SpillBlockEvent::Block {
             ordinal: 0,
             file_id: 0,
+            key_kind: SpillKeyKind::Coordinate,
             is_last_in_file: false,
             records_ingested_so_far: 0,
             bytes: Vec::with_capacity(4096),

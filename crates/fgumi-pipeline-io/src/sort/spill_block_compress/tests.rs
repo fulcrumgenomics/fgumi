@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::sort::protocol::MemoryChunkErased;
-use fgumi_sort::{InMemoryChunk, RawCoordinateKey, SpillBlockDecompressor};
+use fgumi_sort::{InMemoryChunk, RawCoordinateKey, SpillBlockDecompressor, SpillKeyKind};
 use rstest::rstest;
 
 fn raw_block(
@@ -15,6 +15,7 @@ fn raw_block(
     SpillBlockEvent::Block {
         ordinal,
         file_id,
+        key_kind: SpillKeyKind::TemplateK24,
         is_last_in_file: is_last,
         records_ingested_so_far,
         bytes,
@@ -31,6 +32,7 @@ fn block_payload_is_compressed_and_routing_preserved(#[case] codec: SpillCodec) 
     let SpillBlockEvent::Block {
         ordinal,
         file_id,
+        key_kind,
         is_last_in_file,
         records_ingested_so_far,
         bytes,
@@ -40,6 +42,7 @@ fn block_payload_is_compressed_and_routing_preserved(#[case] codec: SpillCodec) 
     };
     assert_eq!(ordinal, 7, "ordinal must be preserved ({codec:?})");
     assert_eq!(file_id, 2, "file_id must be preserved ({codec:?})");
+    assert_eq!(key_kind, SpillKeyKind::TemplateK24, "key_kind must be preserved ({codec:?})");
     assert!(is_last_in_file, "is_last must be preserved ({codec:?})");
     assert_eq!(
         records_ingested_so_far, 123,

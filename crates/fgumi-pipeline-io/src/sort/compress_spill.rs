@@ -8,6 +8,12 @@
 //! `SortWorkerPool` compress path) and forwards the result as the existing
 //! [`SortPhase1Event`], so `SortSpillDecompress` / `SortMerge` are unchanged.
 //!
+//! **This step does not honor `--max-temp-files`.** It opens a merge slot per
+//! spill as it is written, with no bound on the run count, which is the
+//! behavior fgumi#991 removed from the production spill path. `add_sort` wires
+//! `SpillGather` → `SpillBlockCompress` → `SpillWrite` instead, which bounds the
+//! live runs; do not re-wire this step without adding the same bound.
+//!
 //! # Why a `Parallel` step is safe here
 //!
 //! `SortMerge` collects setup events and gates on **counts** (`slot_count` /

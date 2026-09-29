@@ -67,6 +67,9 @@ pub mod ref_sort;
 // Per-order run boundary key for the arena spill run-former (extend-vs-new-run
 // decision). Surfaced via the re-export below.
 pub(crate) mod run_bound;
+// Cooperative consolidation of arena spill runs (`--max-temp-files`). Surfaced
+// via the re-export below.
+pub(crate) mod run_consolidate;
 pub mod segmented_buf;
 pub mod template_arena;
 // Block-granular spill compression kernel for the block-parallel spill steps
@@ -112,7 +115,8 @@ pub struct SortStats {
     pub total_records: u64,
     /// Records written to output.
     pub output_records: u64,
-    /// Number of spill *runs* written.
+    /// Number of spill *runs* written, before any `--max-temp-files`
+    /// consolidation merged some of them together.
     ///
     /// A run is one temp file, built from one or more sorted chunks: consecutive
     /// chunks that are already in order extend the open run rather than each
@@ -260,6 +264,9 @@ pub use ref_sort::{
     coordinate_chunk_from_arena_refs, coordinate_chunk_from_refs, queryname_chunk_from_arena_refs,
 };
 pub use run_bound::{RunBound, format_run_formation};
+pub use run_consolidate::{
+    RunMergeProgress, RunMergeSpec, RunMergerDyn, SpillKeyKind, new_run_merger,
+};
 pub use segmented_buf::SegmentedBuf;
 pub use spill_block::{SpillBlockCompressor, frame_keyed_record_into, spill_magic, spill_trailer};
 pub use spill_block_reader::SpillBlockDecompressor;

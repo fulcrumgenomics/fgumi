@@ -73,6 +73,7 @@ mod test_simulate_aligner;
 mod test_simulate_sort;
 mod test_sort_correctness;
 mod test_sort_cutover_parity;
+mod test_sort_max_temp_files;
 mod test_sort_pipeline_trace;
 mod test_sort_stats_diagnostics;
 mod test_sort_thread_logging;

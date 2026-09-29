@@ -35,6 +35,16 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
+- `fgumi sort --max-temp-files` is enforced again. Since sort moved onto the
+  chain pipeline the limit was logged but ignored: every spilled run stayed open
+  until one merge across all of them, so a sort spilling more runs than
+  `ulimit -n` failed with "Too many open files". Runs are now consolidated when
+  the live count reaches the limit, merging adjacent runs smallest-first, and
+  output is byte-identical to an unbounded sort. The sort summary adds
+  `Consolidations:` and `Merge sources:` lines. For library users,
+  `SpillBlockEvent::Block` gains a `key_kind` field and `SpillWrite` now announces
+  its runs at `AllAnnounced` rather than as each one closes
+  ([#991](https://github.com/fulcrumgenomics/fgumi/issues/991)).
 - Honor `--correct::rejects` on a `fgumi runall` chain that runs past `correct` (e.g. `--start-from extract --stop-after zipper`). The fused chain silently dropped it, so the run logged the rejected count and exited 0 but wrote no rejects file. The top-level `--rejects` still does not capture UMI rejects there: it is the consensus stage's rejects file when the chain reaches one, and unused otherwise ([#995](https://github.com/fulcrumgenomics/fgumi/pull/995)).
 - `fgumi runall` now warns about every output flag the chain will not honor instead of dropping it silently: a `--correct::rejects` on a chain with no correct stage, or overridden by `--rejects` on a correct self-pair, and a top-level `--rejects` / `--stats` nothing consumes. Its hints name a per-stage flag (`--correct::rejects`, `--filter::rejects`, `--filter::stats`) only for a stage the chain runs and a flag not already set (`--all-metrics` counts as setting `--filter::stats`) ([#995](https://github.com/fulcrumgenomics/fgumi/pull/995)).
 - Refuse an output, rejects or metrics path that is the same file as an input, on `fgumi runall` (source BAM/FASTQs, `--unmapped`, `--ref`, `--filter::ref`, `--correct::umi-files`, the consensus `--*::intervals`) and `fgumi correct` (`--input`, `--umi-files`), which could otherwise truncate a file they were reading. The check compares dev+inode, so hard links and a redirected stdin (`-i - < in.bam`) are caught, and it is shared with `copy-umi`, `retag` and `fastq`, whose own copies it replaces ([#995](https://github.com/fulcrumgenomics/fgumi/pull/995)).
