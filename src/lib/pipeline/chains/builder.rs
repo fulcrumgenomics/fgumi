@@ -118,6 +118,10 @@ pub(crate) enum PendingSource {
         /// decoded (one continuous DEFLATE stream). Paths line up 1:1 with
         /// `readers` by stream index.
         bgzf_paths: Option<Vec<std::path::PathBuf>>,
+        /// CRC32 policy for the BGZF split (`bgzf_paths`), resolved in
+        /// `open_fastq_source` from the same extract options the fused readers
+        /// use, so the two FASTQ decode fronts cannot disagree.
+        split_verify_crc: bool,
     },
 }
 
@@ -872,10 +876,30 @@ impl<'a> ChainBuilder<'a> {
         } else {
             None
         };
+        // The split's CRC policy, from the same extract options the fused
+        // readers above used — NOT `spec.verify_crc`, which is the BAM/SAM
+        // source's knob (a command that left it hardcoded, as runall did, made
+        // the split ignore `--no-check-crc`). The eligibility gate guarantees
+        // every split path is a non-stdin BGZF file, so the first input's
+        // resolution (flag, else verify-a-file) holds for every stream; the
+        // value is unused when `bgzf_paths` is `None`.
+        let split_verify_crc = inputs.first().is_some_and(|first| {
+            crate::commands::common::resolve_check_crc(
+                extract_opts.check_crc,
+                extract_opts.no_check_crc,
+                first,
+            )
+        });
 
         Ok((
             header,
-            PendingSource::Fastq { readers, encoding, force_round_robin: interleaved, bgzf_paths },
+            PendingSource::Fastq {
+                readers,
+                encoding,
+                force_round_robin: interleaved,
+                bgzf_paths,
+                split_verify_crc,
+            },
         ))
     }
 
@@ -901,6 +925,7 @@ impl<'a> ChainBuilder<'a> {
     fn build_bgzf_fastq_split(
         &mut self,
         paths: &[std::path::PathBuf],
+        verify_crc: bool,
         num_threads: usize,
         batch_records: usize,
         byte_limit: u64,
@@ -913,9 +938,7 @@ impl<'a> ChainBuilder<'a> {
         use crate::pipeline::steps::source::find_fastq_boundaries::FindFastqBoundaries;
         use crate::pipeline::steps::source::read_fastq::FastqOrdinalSequence;
 
-        // CRC policy mirrors the BAM decode path: honor the command's
-        // --check-crc / --no-check-crc (falling back to verify).
-        let verify_crc = self.spec.verify_crc;
+        // `verify_crc` is resolved by `open_fastq_source` (see `split_verify_crc`).
         // Honor --async-reader here too: the split re-opens each file raw, so
         // (unlike the fused path, which wraps in `open_fastq_reader`) it must
         // apply the prefetch wrap itself, or the flag would be a silent no-op
@@ -1242,7 +1265,13 @@ impl<'a> ChainBuilder<'a> {
                 self.current_tail = Some(unmapped_tail);
                 self.paired_tail = Some(mapped_tail);
             }
-            PendingSource::Fastq { readers, encoding: _, force_round_robin, bgzf_paths } => {
+            PendingSource::Fastq {
+                readers,
+                encoding: _,
+                force_round_robin,
+                bgzf_paths,
+                split_verify_crc,
+            } => {
                 use crate::pipeline::core::step::Affinity;
                 use crate::pipeline::steps::source::read_fastq::{
                     FastqOrdinalSequence, ReadFastqInputs,
@@ -1320,7 +1349,13 @@ impl<'a> ChainBuilder<'a> {
                 // block-parallel decoded.
                 let _ = force_round_robin; // per-stream output-queue backpressure bounds drift for all K
                 let tail = if let Some(paths) = bgzf_paths {
-                    self.build_bgzf_fastq_split(&paths, num_threads, batch_records, byte_limit)?
+                    self.build_bgzf_fastq_split(
+                        &paths,
+                        split_verify_crc,
+                        num_threads,
+                        batch_records,
+                        byte_limit,
+                    )?
                 } else {
                     // Fused path: build one single-stream reader per stream, each
                     // with its OWN FastqOrdinalSequence (each is its own edge into

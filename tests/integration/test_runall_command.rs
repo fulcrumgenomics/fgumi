@@ -39,6 +39,7 @@ use crate::helpers::bam_generator::{
     create_minimal_header, create_test_reference, create_umi_family_at_pos, write_bam,
 };
 use crate::helpers::cutover::decompressed_records_without_pg;
+use crate::helpers::fastq::write_bgzf_fastq_with_corrupt_last_crc;
 use crate::helpers::read_bam_output;
 use crate::helpers::{aligner_binary, build_aligner_index, write_gzip_fastq};
 
@@ -1989,6 +1990,118 @@ fn correct_rejects_without_correct_stage_warns() {
         "expected the dead-flag warning, got:\n{stderr}"
     );
     assert!(!rejects.exists(), "no correct stage ran, so no rejects file may be written");
+}
+
+/// `runall --start-from extract` must honor `--extract::no-check-crc` on an
+/// all-BGZF FASTQ file input, as standalone `fgumi extract --no-check-crc`
+/// does. The chain's `verify_crc` was hardcoded `true` for a FASTQ source, so
+/// the BGZF split decoder aborted with a CRC mismatch even while the run
+/// logged `CRC verify: off`. The default (file ⇒ verify) must still reject.
+#[test]
+fn extract_honors_no_check_crc_on_bgzf_fastq() {
+    const NUM_RECORDS: usize = 350_000;
+    let tmp = TempDir::new().unwrap();
+    let fastq = tmp.path().join("reads.fq.gz");
+    let mut records = Vec::new();
+    for i in 0..NUM_RECORDS {
+        writeln!(records, "@q{i}\nACGTACGTAC\n+\nIIIIIIIIII").unwrap();
+    }
+    write_bgzf_fastq_with_corrupt_last_crc(&fastq, &records);
+
+    let runall = |out: &Path, extra: &[&str]| {
+        let mut args = vec![
+            "runall",
+            "--start-from",
+            "extract",
+            "--stop-after",
+            "extract",
+            "--extract::inputs",
+            p(&fastq),
+            "--extract::read-structures",
+            "+T",
+            "--extract::sample",
+            "s1",
+            "--extract::library",
+            "lib1",
+            "-o",
+            p(out),
+        ];
+        args.extend_from_slice(extra);
+        fgumi(args)
+    };
+
+    let skipped = tmp.path().join("skipped.bam");
+    let output = runall(&skipped, &["--extract::no-check-crc"]);
+    assert!(
+        output.status.success(),
+        "--extract::no-check-crc must accept a corrupted BGZF CRC32: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let standalone = tmp.path().join("standalone.bam");
+    run_ok(
+        [
+            "extract",
+            "--inputs",
+            p(&fastq),
+            "--read-structures",
+            "+T",
+            "--sample",
+            "s1",
+            "--library",
+            "lib1",
+            "--no-check-crc",
+            "-o",
+            p(&standalone),
+        ],
+        "standalone extract --no-check-crc",
+    );
+    let (_, records) = read_bam_output(&skipped);
+    assert_eq!(records.len(), NUM_RECORDS, "every record must be extracted");
+    // The standalone oracle runs the same decoder, so also pin identity and
+    // order against the fixture itself — including the corrupted last block.
+    for (i, record) in records.iter().enumerate() {
+        let name = record.name().map(ToString::to_string).unwrap_or_default();
+        assert_eq!(name, format!("q{i}"), "record {i} name/order");
+    }
+    assert_bams_record_equivalent_nonempty(&skipped, &standalone);
+
+    let verified = tmp.path().join("verified.bam");
+    let output = runall(&verified, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(!output.status.success(), "the default must reject a corrupted BGZF CRC32");
+    // Match the mismatch error itself: a bare "crc" would also match the
+    // run's own `CRC verify: on` log line and pass on any unrelated failure.
+    assert!(
+        stderr.contains("crc32 mismatch") || stderr.contains("checksum mismatch"),
+        "the default must fail on the CRC mismatch, not some other error: {stderr}"
+    );
+    // The corruption sits past quality-encoding detection's window, so only the
+    // BGZF split decoder can reach it — pin that it is the step enforcing the
+    // default, not some earlier reader.
+    assert!(
+        stderr.contains("step \"fastqdecompress\" failed"),
+        "the BGZF split decoder must be what rejects the corruption: {stderr}"
+    );
+}
+
+/// A BAM-source start without `-i` must still be told `--input` is missing,
+/// not be misrouted into FASTQ-source (extract) option handling.
+#[test]
+fn bam_start_without_input_reports_missing_input() {
+    let tmp = TempDir::new().unwrap();
+    assert_rejected_with(
+        [
+            "runall",
+            "--start-from",
+            "sort",
+            "--stop-after",
+            "sort",
+            "-o",
+            p(&tmp.path().join("out.bam")),
+        ],
+        "--input is required with --start-from sort",
+        "runall --start-from sort without -i",
+    );
 }
 
 // ══════════════════════════ Extract→Extract (interleaved, no aligner) ══════════════════════════

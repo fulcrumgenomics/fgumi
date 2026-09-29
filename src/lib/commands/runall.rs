@@ -1824,7 +1824,9 @@ impl Command for RunAll {
         // literal before that borrow is done with.
         let verify_crc = match &self.input {
             Some(p) => BamIoOptions::new(p, &self.output).effective_check_crc(),
-            // FASTQ source ignores verify_crc; value is inert.
+            // FASTQ source: inert. Both FASTQ decode fronts resolve their CRC
+            // policy from `--extract::check-crc` / `--extract::no-check-crc`
+            // (see `ChainBuilder::open_fastq_source` / `build_bgzf_fastq_split`).
             None => true,
         };
         let source = self.derive_source_spec()?;
