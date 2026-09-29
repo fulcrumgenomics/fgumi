@@ -28,7 +28,9 @@ pub use event_count::{PoolEventCount, WaitKey, WaitOutcome};
 pub use fused::{is_fusible_chain, run_fused_single_thread, should_fuse_single_thread};
 pub use live::LiveSteps;
 pub use pool::{assign_exclusive_owners, assign_sticky_owners};
-pub use scheduler::{ChainOrderScheduler, DrainFirstScheduler, Scheduler, WalkDirection};
+pub use scheduler::{
+    ChainOrderScheduler, DrainFirstScheduler, RefillDrainScheduler, Scheduler, WalkDirection,
+};
 pub use stats::{PipelineStats, StatsSnapshot, StepStatsSnapshot};
 pub use storage::{WorkerStepEntry, build_worker_storage};
 pub use worker_core::{BackoffPolicy, WorkerCore, WorkerRole};

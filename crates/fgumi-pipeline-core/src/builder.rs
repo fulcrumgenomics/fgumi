@@ -1259,6 +1259,7 @@ impl Pipeline {
             config.instrumentation,
             config.telemetry.is_some(),
         ));
+        scheduler.bind(&contexts.bounded_queues);
 
         // 2-pre-monitor invariant: if the deadlock monitor will be armed, every
         // output transport must be ByteBounded so `in_flight_bytes` can see a
