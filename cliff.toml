@@ -23,6 +23,9 @@ body = """
     ### {{ group | upper_first }}
     {% for commit in commits %}
         - {% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message | upper_first }}\
+        {% if commit.breaking and commit.breaking_description != commit.message %}
+          {{ commit.breaking_description | trim | replace(from="\n", to=" ") | indent(prefix="  - ", first=true) }}\
+        {% endif %}\
     {% endfor %}
 {% endfor %}\n
 """

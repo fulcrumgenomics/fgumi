@@ -103,6 +103,19 @@ Use conventional commits format: `<type>[(scope)][!]: <description>`
 
 Types: `feat`, `fix`, `build`, `chore`, `ci`, `config`, `docs`, `example`, `perf`, `refactor`, `style`, `test`
 
+### Changelog
+
+Do not edit `CHANGELOG.md` (or any crate's `CHANGELOG.md`) in a PR. release-plz generates
+the changelogs from conventional commit messages via git-cliff (`cliff.toml`) when it opens
+the release PR. Hand-written `[Unreleased]` entries conflict across concurrent PRs and are
+duplicated below the generated section at release.
+
+The squash-commit subject is the changelog line, so write it for users; commit bodies are not
+rendered. For a breaking change, add a `!` after the type/scope and end the message with a
+one-paragraph `BREAKING CHANGE:` footer; its text is rendered under the entry as the
+migration note. Do not start a wrapped footer line with a token followed by `:` or ` #`
+(e.g. `` `Foo::bar` `` or `--x::y`): git-cliff parses it as a new footer and truncates the note.
+
 ### Branch Naming
 `<issue-number>/<user>/<type>-<description>` (e.g., `42/jdidion/fix-fibonacci-calculation`)
 
