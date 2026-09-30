@@ -17,7 +17,8 @@
 //!
 //! This module holds the trait, its wiring context/result types, the
 //! backend-agnostic `ZipperBatch`, the subprocess backend's `InFlightGate`
-//! byte-budget gate, and the header helpers (`validate_sq_consistency`,
+//! byte-budget gate, the mimalloc purge-delay setter called at wiring, the
+//! mid-pair split helper, and the header helpers (`validate_sq_consistency`,
 //! `merge_aligner_header`).
 
 pub(crate) mod merge;
@@ -297,8 +298,12 @@ pub(crate) trait AlignBackend: Send + 'static {
 /// `aligner` module does not depend on the pipeline's align stage.
 pub(crate) fn backend_for(resolved: ResolvedAligner) -> Box<dyn AlignBackend> {
     match resolved.backend {
-        ResolvedBackend::Subprocess { command } => {
-            Box::new(subprocess::SubprocessBackend { command, chunk_size: resolved.chunk_size })
+        ResolvedBackend::Subprocess { command, accept_mid_pair_split } => {
+            Box::new(subprocess::SubprocessBackend {
+                command,
+                chunk_size: resolved.chunk_size,
+                accept_mid_pair_split,
+            })
         }
     }
 }
@@ -352,6 +357,74 @@ pub(crate) fn validate_sq_consistency(partial: &Header, aligner: &Header) -> io:
     }
 
     Ok(())
+}
+
+/// The pairing bits [`split_pair_into_singles`] clears on each half's unmapped
+/// record: everything that marks it as one segment of a pair. `QC_FAIL`,
+/// `REVERSE` and the rest are kept.
+const SPLIT_HALF_CLEARED_FLAGS: u16 = fgumi_raw_bam::flags::PAIRED
+    | fgumi_raw_bam::flags::PROPER_PAIR
+    | fgumi_raw_bam::flags::MATE_UNMAPPED
+    | fgumi_raw_bam::flags::MATE_REVERSE
+    | fgumi_raw_bam::flags::FIRST_SEGMENT
+    | fgumi_raw_bam::flags::LAST_SEGMENT;
+
+/// Split a two-primary-read template into two single-record templates, in record
+/// order: bwa's mid-pair split. With mixed SE/PE input a `-K`
+/// chunk boundary can fall between a pair's two reads, and bwa then aligns them as
+/// two unpaired reads. The pair's unmapped template is split the same way so each
+/// half zips with its own read's alignment. Errors if the template carries records
+/// beyond its two primaries (secondaries make the split ambiguous — out of
+/// contract for valid unmapped input).
+///
+/// Each half's record has its pairing bits ([`SPLIT_HALF_CLEARED_FLAGS`]) cleared,
+/// so it is an unpaired read like the aligner's record for it. The zipper merge
+/// picks the mapped segment to copy tags and the QC-fail flag onto from the
+/// *unmapped* record's `PAIRED`/`FIRST_SEGMENT` bits; left set, the second half
+/// (still `PAIRED | LAST_SEGMENT`) would look for a mapped R2, find none (the
+/// aligner emitted it unpaired, which files as R1), and silently copy nothing.
+/// The merged record's own flags come from the aligner, so clearing these bits
+/// on the unmapped side changes nothing else in the output.
+pub(crate) fn split_pair_into_singles(template: Template) -> io::Result<(Template, Template)> {
+    // Reject anything but exactly two primaries before consuming the template,
+    // so the error path reads `template.name()` by reference and the success
+    // path never allocates a name copy.
+    if template.records().len() != 2 {
+        return Err(io::Error::other(format!(
+            "align-and-merge: cannot split template '{name}' across a mid-pair -K chunk \
+             boundary: it carries {n} records, not exactly two primaries (secondary/supplementary \
+             records are out of contract for mixed single/paired input).",
+            name = String::from_utf8_lossy(template.name()),
+            n = template.records().len(),
+        )));
+    }
+    let mut records = template.into_records();
+    let second = records.pop().expect("len checked == 2");
+    let first = records.pop().expect("len checked == 2");
+    let to_template = |mut record: fgumi_raw_bam::RawRecord| {
+        record.set_flags(record.flags() & !SPLIT_HALF_CLEARED_FLAGS);
+        Template::from_records(vec![record])
+            .map_err(|e| io::Error::other(format!("align-and-merge: split-half template: {e:#}")))
+    };
+    Ok((to_template(first)?, to_template(second)?))
+}
+
+/// Keep mimalloc from returning freed pages to the OS, unless the user set the
+/// purge delay. The align stage frees and reallocates large per-batch buffers
+/// (FASTQ out, BAM in, merge), and mimalloc's default purge (decommit after 1 s)
+/// turns that reuse into hundreds of thousands of page faults.
+///
+/// The setting is process-wide and is never restored, so it covers every stage
+/// of the `runall` process, not just align: fgumi-sort's `force_mi_collect()`
+/// stops returning memory to the OS too. Measured end to end (extract through
+/// simplex consensus, 1M pairs, 32 threads) it is still faster with it,
+/// including when sort spills: wall -4%, CPU -2.5%, page faults ~700k to under
+/// 40k, for ~0.4 GB more peak RSS. Set `MIMALLOC_PURGE_DELAY` to opt out.
+pub(crate) fn retain_freed_memory_unless_user_set() {
+    if !crate::aligner::user_set_mimalloc_purge() {
+        fgumi_sort::retain_freed_memory();
+    }
+    log::debug!("align: mimalloc purge delay {} ms", fgumi_sort::mi_purge_delay_ms());
 }
 
 /// Merge aligner-emitted header lines into the partial output header.
@@ -424,6 +497,41 @@ pub(crate) fn merge_aligner_header(partial: &Header, aligner: &Header) -> Header
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a template of exactly two records is split: any other count is out
+    /// of contract and errors, naming the template and its record count.
+    #[rstest::rstest]
+    #[case::one_record(&[fgumi_raw_bam::flags::UNMAPPED], 1)]
+    #[case::pair_with_supplementary(
+        &[
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT,
+            fgumi_raw_bam::flags::PAIRED
+                | fgumi_raw_bam::flags::FIRST_SEGMENT
+                | fgumi_raw_bam::flags::SUPPLEMENTARY,
+        ],
+        3
+    )]
+    fn split_pair_into_singles_rejects_other_than_two_records(
+        #[case] flags: &[u16],
+        #[case] n: usize,
+    ) {
+        let records = flags
+            .iter()
+            .map(|&f| {
+                let mut b = fgumi_raw_bam::SamBuilder::new();
+                b.read_name(b"q1").flags(f).sequence(b"ACGT").qualities(b"IIII");
+                b.build()
+            })
+            .collect();
+        let template = Template::from_records(records).expect("template");
+        let err = split_pair_into_singles(template).expect_err("must not split").to_string();
+        assert!(
+            err.contains("cannot split template 'q1'")
+                && err.contains(&format!("carries {n} records")),
+            "got: {err}"
+        );
+    }
 
     /// A `ZipperBatch` sits in a byte-bounded queue, so its `heap_size` must
     /// count both halves' `Vec` backing store, as `BamTemplateBatch` already

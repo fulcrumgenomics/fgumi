@@ -151,10 +151,25 @@ any new `unsafe` block requires updating this section with a written justificati
 The following external FFI calls are approved because they back core infrastructure:
 
 - **`libmimalloc_sys`** (`crates/fgumi-sort/src/memory_probe.rs`) — mimalloc is the configured
-  global allocator. The FFI wrappers (`force_mi_collect`, `process_rss_bytes`, and the
-  `memory-debug`-gated `print_mi_stats` calling `mi_stats_print_out`) are isolated to
-  a single `#[allow(unsafe_code)]` sub-module. mimalloc synchronizes these calls
-  internally, so they are safe to invoke concurrently.
+  global allocator. The FFI wrappers (`force_mi_collect`, `process_rss_bytes`, the
+  `memory-debug`-gated `print_mi_stats` calling `mi_stats_print_out`, and
+  `retain_freed_memory` / `mi_purge_delay_ms` calling `mi_option_set` /
+  `mi_option_get`) are isolated to a single `#[allow(unsafe_code)]` sub-module.
+  mimalloc synchronizes these calls internally, so they are safe to invoke
+  concurrently. `retain_freed_memory` sets mimalloc's purge delay to -1 (never
+  return freed pages to the OS); the align stage calls it at wiring (via
+  `retain_freed_memory_unless_user_set`) unless `MIMALLOC_PURGE_DELAY` is set,
+  because its per-batch buffer churn otherwise costs hundreds of thousands of page
+  faults. The setting is process-wide and never restored, so it also turns
+  fgumi-sort's `force_mi_collect()` into a no-op for later `runall` stages; measured
+  end to end (extract through consensus, 1M pairs, 32 threads) it is still ~4%
+  faster, sort spills included, for ~0.4 GB more peak RSS.
+  The subprocess route also passes `MIMALLOC_PURGE_DELAY=-1` to the aligner child
+  through its environment, which needs no FFI. A safe alternative does not exist:
+  mimalloc reads its environment only at process start, and `libmimalloc-sys`
+  exports no safe setter.
+  The option index (15) is not exported as a constant; a unit test pins it against
+  the linked mimalloc v3's 1000 ms default.
 - **`mach2`** (`crates/fgumi-sort/src/memory_probe.rs`, macOS only) — `task_info(TASK_VM_INFO)`
   is the only way to read `phys_footprint` (the RSS metric mimalloc reports accurately).
   Isolated to the same sub-module as the mimalloc FFI.
