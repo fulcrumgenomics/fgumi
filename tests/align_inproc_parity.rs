@@ -181,21 +181,21 @@ enum Leg<'a> {
     /// Subprocess `bwa-mem3` preset, using the reference binary via
     /// `--aligner-bin`.
     Subprocess { reference_bin: &'a str },
-    /// In-process `bwa-mem3-inproc` preset with the given sub-batch size.
-    InProcess { sub_batch_templates: usize },
+    /// In-process `bwa-mem3-inproc` preset with the given sub-batch size, and
+    /// `--aligner::dedup-reads <dedup>` when set (else its default, `on`).
+    InProcess { sub_batch_templates: usize, dedup: Option<&'a str> },
 }
 
-/// Run `runall --start-from align --stop-after zipper` for one leg of `case`,
-/// writing `out`, and return the decoded merged BAM. Panics on a non-zero exit
-/// so a broken run never masquerades as a parity result.
-fn run_leg(
+/// The `runall --start-from align --stop-after zipper` command for one leg of
+/// `case`, writing `out`.
+fn leg_command(
     case: &Case,
     out: &Path,
     leg: Leg<'_>,
     threads: usize,
     chunk: Chunk,
     scheduler: Scheduler,
-) -> Bam {
+) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fgumi"));
     cmd.arg("runall")
         .args(["--start-from", "align"])
@@ -218,14 +218,49 @@ fn run_leg(
             cmd.args(["--aligner::preset", "bwa-mem3"]);
             cmd.arg("--aligner-bin").arg(reference_bin);
         }
-        Leg::InProcess { sub_batch_templates } => {
+        Leg::InProcess { sub_batch_templates, dedup } => {
             cmd.args(["--aligner::preset", "bwa-mem3-inproc"]);
             cmd.args(["--aligner::sub-batch-templates", &sub_batch_templates.to_string()]);
+            if let Some(dedup) = dedup {
+                cmd.args(["--aligner::dedup-reads", dedup]);
+            }
         }
     }
-    let status = cmd.status().expect("run `fgumi runall`");
-    assert!(status.success(), "`fgumi runall` ({leg:?}) failed with status {status}");
-    read_bam(out)
+    cmd
+}
+
+/// Run one leg (see [`leg_command`]) and return the decoded merged BAM. Panics
+/// on a non-zero exit so a broken run never masquerades as a parity result.
+fn run_leg(
+    case: &Case,
+    out: &Path,
+    leg: Leg<'_>,
+    threads: usize,
+    chunk: Chunk,
+    scheduler: Scheduler,
+) -> Bam {
+    run_leg_logged(case, out, leg, threads, chunk, scheduler).0
+}
+
+/// [`run_leg`], also returning the run's stderr (its log).
+fn run_leg_logged(
+    case: &Case,
+    out: &Path,
+    leg: Leg<'_>,
+    threads: usize,
+    chunk: Chunk,
+    scheduler: Scheduler,
+) -> (Bam, String) {
+    let output = leg_command(case, out, leg, threads, chunk, scheduler)
+        .output()
+        .expect("run `fgumi runall`");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "`fgumi runall` ({leg:?}) failed with status {}:\n{stderr}",
+        output.status
+    );
+    (read_bam(out), stderr)
 }
 
 /// Normalize for a cross-backend comparison (tag order ignored).
@@ -319,7 +354,7 @@ fn inproc_matches_subprocess(
     let inproc = run_leg(
         &case,
         &case.out("inproc.bam"),
-        Leg::InProcess { sub_batch_templates },
+        Leg::InProcess { sub_batch_templates, dedup: None },
         threads,
         chunk,
         scheduler,
@@ -348,6 +383,105 @@ fn inproc_matches_subprocess(
 }
 
 // ---------------------------------------------------------------------------
+// Duplicate read pairs (--aligner::dedup-reads)
+// ---------------------------------------------------------------------------
+
+impl Case {
+    /// [`Case::new`] over paired input where about four in nine templates
+    /// recur (every third, plus every ninth): each copy has its own name, lands both near its original and in later
+    /// cohorts, and some recur twice, the shape of a PCR-duplicate-rich UMI
+    /// library.
+    fn with_duplicates(bin: &str) -> Self {
+        let dir = TempDir::new().expect("create temp dir");
+        let fixture = write_fixture_reference(dir.path(), bin);
+        let base = simulate_templates(&fixture.seq, Input::Paired, N_TEMPLATES);
+        let mut templates = Vec::with_capacity(base.len() * 3 / 2);
+        // `t`'s reads, RX and flags under `name`.
+        let named = |t: &Template, name: String| Template {
+            name,
+            reads: t.reads.clone(),
+            paired: t.paired,
+            rx: t.rx.clone(),
+            qc_fail: t.qc_fail,
+        };
+        for (i, t) in base.iter().enumerate() {
+            templates.push(named(t, t.name.clone()));
+            if i % 3 == 1 {
+                let dup = &base[i - 1];
+                templates.push(named(dup, format!("{}_dup1", dup.name)));
+            }
+            if i % 9 == 8 {
+                let dup = &base[i / 2];
+                templates.push(named(dup, format!("{}_dup2", dup.name)));
+            }
+        }
+        let unmapped = dir.path().join("unmapped.bam");
+        write_unmapped_bam(&unmapped, &templates);
+        Self { reference: fixture.fasta, unmapped, templates, dir }
+    }
+}
+
+/// On a duplicate-rich input, the in-process backend with
+/// `--aligner::dedup-reads` on or off is byte-identical to the subprocess
+/// preset, and with it on the memo actually copied duplicates (its end-of-run
+/// log line reports them).
+#[rstest]
+#[case::base(1, 256, Chunk::One, Scheduler::DrainFirst)]
+#[case::threads16_sb7_many(16, 7, Chunk::Many, Scheduler::Auto)]
+#[case::threads4_sb64_several(4, 64, Chunk::Several, Scheduler::ChainOrder)]
+fn inproc_dedup_reads_matches_subprocess_on_duplicates(
+    #[case] threads: usize,
+    #[case] sub_batch_templates: usize,
+    #[case] chunk: Chunk,
+    #[case] scheduler: Scheduler,
+    #[values("on", "off")] dedup: &str,
+) {
+    let label = format!(
+        "inproc_dedup_reads_matches_subprocess_on_duplicates[t{threads} sb{sub_batch_templates} \
+         {chunk:?} {} dedup-{dedup}]",
+        scheduler.label()
+    );
+    let reference_bin = bin_or_skip!(label);
+    let case = Case::with_duplicates(&reference_bin);
+    let subprocess = run_leg(
+        &case,
+        &case.out("subprocess.bam"),
+        Leg::Subprocess { reference_bin: &reference_bin },
+        threads,
+        chunk,
+        scheduler,
+    );
+    let (inproc, log) = run_leg_logged(
+        &case,
+        &case.out("inproc.bam"),
+        Leg::InProcess { sub_batch_templates, dedup: Some(dedup) },
+        threads,
+        chunk,
+        scheduler,
+    );
+    let memo_line = log.lines().find(|l| l.contains("read-pair memo"));
+    match dedup {
+        "on" => {
+            let line = memo_line.unwrap_or_else(|| panic!("{label}: no memo line in:\n{log}"));
+            let dup_pairs: u64 = line
+                .split_once("memo: ")
+                .and_then(|(_, rest)| rest.split_once(" duplicate pairs"))
+                .and_then(|(n, _)| n.parse().ok())
+                .unwrap_or_else(|| panic!("{label}: unparseable memo line: {line}"));
+            assert!(dup_pairs > 0, "{label}: the memo found no duplicates: {line}");
+        }
+        _ => assert!(memo_line.is_none(), "{label}: memo ran with dedup-reads off"),
+    }
+    assert_reads_preserved(&inproc, &case.templates, &format!("{label} in-process"));
+    assert_tags_transferred(&inproc, &case.templates, &format!("{label} in-process"));
+    assert_same_bam(
+        &for_parity(&subprocess),
+        &for_parity(&inproc),
+        &format!("{label}: in-process diverged from the subprocess bwa-mem3 preset"),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Determinism
 // ---------------------------------------------------------------------------
 
@@ -367,7 +501,7 @@ fn inproc_is_deterministic(
     let bin = bin_or_skip!(label);
     let case = Case::new(&bin, input);
 
-    let leg = Leg::InProcess { sub_batch_templates: 64 };
+    let leg = Leg::InProcess { sub_batch_templates: 64, dedup: None };
     let first = run_leg(&case, &case.out("first.bam"), leg, 4, Chunk::Several, scheduler);
     let second = run_leg(&case, &case.out("second.bam"), leg, 4, Chunk::Several, scheduler);
     assert_fixture_coverage(&first, &label);
@@ -395,7 +529,7 @@ fn inproc_is_thread_invariant(
     let bin = bin_or_skip!(label);
     let case = Case::new(&bin, input);
 
-    let leg = Leg::InProcess { sub_batch_templates: 7 };
+    let leg = Leg::InProcess { sub_batch_templates: 7, dedup: None };
     let one = run_leg(&case, &case.out("t1.bam"), leg, 1, Chunk::Many, scheduler);
     let sixteen = run_leg(&case, &case.out("t16.bam"), leg, 16, Chunk::Many, scheduler);
     assert_fixture_coverage(&one, &label);
