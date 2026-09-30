@@ -4558,12 +4558,15 @@ impl<'a> ChainBuilder<'a> {
             bail!("--ref requires --methylation-mode to be set");
         }
 
-        // Validate min_reads UP FRONT (mirrors Duplex::execute's CLI
-        // pre-flight). The per-worker init closure builds DuplexConsensusCaller with
-        // `.expect()`, so an invalid ordering (e.g. `--duplex::min-reads 1 5`)
-        // would otherwise panic inside a worker thread — likely wedging the
-        // pipeline — instead of surfacing a clean error here before it is built.
-        fgumi_consensus::DuplexConsensusCaller::validate_min_reads(&duplex.min_reads)?;
+        // Validate the numeric options UP FRONT via the same
+        // `DuplexOptions::validate_numeric` Duplex::execute's CLI pre-flight runs,
+        // so `add_duplex` is self-guarding for a caller that builds a
+        // `StageOptionsBag` directly. The per-worker init closure builds
+        // DuplexConsensusCaller with `.expect()`, so an invalid `--min-reads`
+        // ordering (e.g. `--duplex::min-reads 1 5`) would otherwise panic inside a
+        // worker thread — likely wedging the pipeline — and an out-of-range Phred
+        // value would reach the caller unchecked.
+        duplex.validate_numeric()?;
 
         // Resolve source path for log messages and the sort-order guard below.
         let input_path = self.resolve_log_input_path();
@@ -4684,8 +4687,8 @@ impl<'a> ChainBuilder<'a> {
         // T1/T2 split. Duplex thresholds: the BA (smaller-strand) threshold is
         // `min_yx_reads_for`; the AB (larger-strand) threshold is the inline
         // `min_reads.get(1).unwrap_or(last)` one-liner the caller uses (never
-        // raw `min_reads[1]`/`[2]`). `validate_min_reads` ran above, so both
-        // `.expect(...)`s are infallible here.
+        // raw `min_reads[1]`/`[2]`). `validate_numeric` (which runs
+        // `validate_min_reads`) ran above, so both `.expect(...)`s are infallible here.
         let last_min_read =
             *duplex.min_reads.last().expect("validated non-empty by validate_min_reads");
         let min_ab_reads = duplex.min_reads.get(1).copied().unwrap_or(last_min_read);

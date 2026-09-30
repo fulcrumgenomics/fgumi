@@ -465,6 +465,8 @@ impl CodecOptions {
         if self.error_rate_post_umi == 0 {
             bail!("error-rate-post-umi must be > 0");
         }
+        // Validate the shared Phred upper bounds (error rates, min input quality).
+        self.consensus().validate()?;
 
         // Validate min/max reads.
         if self.min_reads == 0 {

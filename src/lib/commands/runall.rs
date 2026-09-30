@@ -1524,11 +1524,10 @@ impl RunAll {
                 #[cfg(feature = "consensus")]
                 Stage::Duplex => {
                     let mut opts = self.duplex_opts.clone().validate()?;
-                    // `add_duplex` (builder.rs) does not validate numeric bounds
-                    // the way `add_simplex`/codec do, so run the same guards the
-                    // standalone `fgumi duplex` applies (DuplexOptions::validate_numeric,
-                    // extracted from duplex.rs Duplex::validate) — otherwise runall
-                    // accepts degenerate configs that yield a silent empty BAM.
+                    // Pre-flight the same guards the standalone `fgumi duplex` and
+                    // `add_duplex` (builder.rs) apply (DuplexOptions::validate_numeric),
+                    // so a degenerate config fails while the bag is assembled, before
+                    // `build_for` sets up any earlier stage of the chain.
                     opts.validate_numeric()?;
                     opts.rejects_opts.clone_from(&self.rejects_opts);
                     opts.stats_opts.clone_from(&self.stats_opts);
