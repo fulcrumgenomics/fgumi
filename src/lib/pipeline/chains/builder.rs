@@ -597,6 +597,12 @@ pub struct ChainBuilder<'a> {
     /// [`WriteBgzfFile::new_with_handle`]: crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile::new_with_handle
     pending_header_handle: Option<crate::pipeline::core::header::HeaderHandle>,
 
+    /// Rejects sinks added mid-build whose files are not created yet, each with
+    /// the stage that owns it. Opened by [`Self::open_deferred_outputs`] as the
+    /// last step of [`Self::build`], so a stage that fails to build creates no
+    /// rejects file.
+    deferred_outputs: Vec<(&'static str, crate::pipeline::steps::sink::write_bgzf::DeferredOpen)>,
+
     /// When an aligner `HeaderHandle` is pending, this accumulates the header
     /// changes made by later stages that *modify* the header (sort-order rewrite,
     /// clip) so they are re-applied to the aligner's runtime-resolved header at
@@ -658,6 +664,57 @@ pub struct ChainBuilder<'a> {
     // set by add_group (Task 11); read by add_simplex/add_duplex/add_codec (Task 11)
     consensus_metrics_captures:
         Option<Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>>,
+
+    /// Every output file this build has created. Removed if the builder is
+    /// dropped before [`Self::build`] succeeds, so a failed build leaves no
+    /// header-only output behind. Declared last so it drops after `pipeline`,
+    /// whose sinks flush their buffered header bytes on drop.
+    created_outputs: CreatedOutputs,
+}
+
+/// The output files a chain build has created, removed on drop unless the
+/// build succeeded ([`Self::keep`]).
+///
+/// Only regular files are removed: stdout, FIFOs and devices are never
+/// touched, and `-` is never recorded. A file the build created by truncating
+/// an existing one is removed too — the truncation already destroyed it.
+#[derive(Default)]
+struct CreatedOutputs {
+    paths: Vec<std::path::PathBuf>,
+    keep: bool,
+}
+
+impl CreatedOutputs {
+    /// Record that the build created `path`.
+    fn record(&mut self, path: &std::path::Path) {
+        if !fgumi_bam_io::is_stdout_path(path) {
+            self.paths.push(path.to_path_buf());
+        }
+    }
+
+    /// The build succeeded: leave every recorded file in place.
+    fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for CreatedOutputs {
+    fn drop(&mut self) {
+        if self.keep {
+            return;
+        }
+        for path in &self.paths {
+            if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file()) {
+                match std::fs::remove_file(path) {
+                    Ok(()) => log::debug!("removed {} after a failed chain build", path.display()),
+                    Err(e) => log::warn!(
+                        "could not remove {} after a failed chain build: {e}",
+                        path.display()
+                    ),
+                }
+            }
+        }
+    }
 }
 
 impl<'a> ChainBuilder<'a> {
@@ -726,6 +783,7 @@ impl<'a> ChainBuilder<'a> {
             override_pipeline_threads: None,
             use_drain_first_scheduler: false,
             pending_header_handle: None,
+            deferred_outputs: Vec::new(),
             pending_header_transform: None,
             // Initialise to the default; add_source will set the correct kind
             // based on whether sort is the first intermediate stage.
@@ -734,6 +792,7 @@ impl<'a> ChainBuilder<'a> {
             // sort terminal into a Detached writer (lever 2).
             detached_writer: false,
             sort_spill_stats: None,
+            created_outputs: CreatedOutputs::default(),
             fastq_encoding,
             consensus_metrics_captures: None,
         })
@@ -1666,20 +1725,23 @@ impl<'a> ChainBuilder<'a> {
     /// (built inline by the caller) differs.
     #[cfg(feature = "consensus")]
     fn wire_consensus_rejects_branch(
-        &self,
+        &mut self,
         consensus_pt: (StepIdx, BranchIdx),
         rejects_path: Option<&std::path::Path>,
         input_header: &Header,
-        label: &str,
+        label: &'static str,
     ) -> Result<()> {
         use crate::pipeline::steps::bgzf::compress::BgzfCompress;
         use crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile;
 
         let rejects_path = rejects_path
             .ok_or_else(|| anyhow!("rejects path unexpectedly None when track_rejects is set"))?;
-        let rejects_write =
-            WriteBgzfFile::new(rejects_path, input_header, self.tuning.compression_level)
-                .map_err(|e| anyhow!("WriteBgzfFile ({label} rejects): {e}"))?;
+        let (rejects_write, open) = WriteBgzfFile::deferred(
+            rejects_path.to_path_buf(),
+            input_header.clone(),
+            self.tuning.compression_level,
+        );
+        self.defer_output(label, open);
 
         let rejects_branch = (consensus_pt.0, BranchIdx(1));
         let rejects_compress_tail = self.pipeline.append_step(
@@ -1991,6 +2053,39 @@ impl<'a> ChainBuilder<'a> {
         Ok(())
     }
 
+    /// Queue a rejects sink's file creation for [`Self::open_deferred_outputs`].
+    /// `stage` names the stage in the error if the file cannot be created.
+    fn defer_output(
+        &mut self,
+        stage: &'static str,
+        open: crate::pipeline::steps::sink::write_bgzf::DeferredOpen,
+    ) {
+        self.deferred_outputs.push((stage, open));
+    }
+
+    /// Create every rejects file queued while stages were added, recording
+    /// each in `created_outputs` so a later failure removes it along with the
+    /// main output.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first file that cannot be created, naming its stage and path.
+    ///
+    /// Takes the two fields rather than `&mut self` because [`Self::build`]
+    /// calls it after moving `pipeline` out of the builder.
+    fn open_deferred_outputs(
+        deferred: &mut Vec<(&'static str, crate::pipeline::steps::sink::write_bgzf::DeferredOpen)>,
+        created: &mut CreatedOutputs,
+    ) -> Result<()> {
+        for (stage, open) in std::mem::take(deferred) {
+            let path = open.path().to_path_buf();
+            open.open()
+                .map_err(|e| anyhow!("creating {stage} rejects BAM {}: {e}", path.display()))?;
+            created.record(&path);
+        }
+        Ok(())
+    }
+
     /// Add the output sink step(s) to the pipeline.
     ///
     /// Appends `BgzfCompress` + `WriteBgzfFile`. Reads `spec.sink` for the
@@ -2105,6 +2200,7 @@ impl<'a> ChainBuilder<'a> {
             WriteBgzfFile::new(output_path, &self.header, self.tuning.compression_level)
                 .map_err(|e| anyhow!("WriteBgzfFile::new: {e}"))?
         };
+        self.created_outputs.record(output_path);
         // `want_index` is only ever true on the eager-header branch above (the
         // `ensure!` on `pending_header_handle` guarantees it), so
         // `with_bai_index`'s eager-header requirement always holds here.
@@ -2172,6 +2268,7 @@ impl<'a> ChainBuilder<'a> {
                 .map_err(|e| anyhow!("WriteRawFile: {e}"))?;
             self.pipeline.append_step(writer, tail);
         }
+        self.created_outputs.record(path);
         Ok(())
     }
 
@@ -2345,6 +2442,11 @@ impl<'a> ChainBuilder<'a> {
         // Box<dyn FinalizeHook> is not Clone, so we prepend by inserting at 0.
         // The timing hook fires first (before per-stage hooks like DedupFinalize).
         self.finalize.insert(0, Box::new(StageTimingFinalizeHook::new_with_label(chain_label)));
+
+        // Every fallible construction step is done: only now create the
+        // rejects files, then keep everything this build created.
+        Self::open_deferred_outputs(&mut self.deferred_outputs, &mut self.created_outputs)?;
+        self.created_outputs.keep();
 
         Ok(BuiltPipeline {
             pipeline,
@@ -2635,9 +2737,12 @@ impl<'a> ChainBuilder<'a> {
             // PR #332 contract: rejects carry the INPUT header verbatim (raw-input
             // records, input order). For correct, `self.header` IS the input header.
             let rejects_header = self.header.clone();
-            let rejects_write =
-                WriteBgzfFile::new(rejects_path, &rejects_header, self.tuning.compression_level)
-                    .map_err(|e| anyhow!("WriteBgzfFile (rejects): {e}"))?;
+            let (rejects_write, open) = WriteBgzfFile::deferred(
+                rejects_path.clone(),
+                rejects_header,
+                self.tuning.compression_level,
+            );
+            self.defer_output("correct", open);
 
             let step = correct_step_with_rejects(cfg);
             let pt = self.pipeline.append_step(step, tail);
@@ -5803,9 +5908,12 @@ impl<'a> ChainBuilder<'a> {
                 self.tuning.per_step_byte_limit,
                 false,
             );
-            let rejects_writer =
-                WriteBgzfFile::new(rejects_path, &self.header, self.tuning.compression_level)
-                    .map_err(|e| anyhow!("WriteBgzfFile (rejects)::new: {e}"))?;
+            let (rejects_writer, open) = WriteBgzfFile::deferred(
+                rejects_path.clone(),
+                self.header.clone(),
+                self.tuning.compression_level,
+            );
+            self.defer_output("filter", open);
 
             // Branch 1 of process_tail is the rejects output.
             let rejects_branch = (process_tail.0, BranchIdx(1));
@@ -6431,10 +6539,12 @@ mod tests {
             override_pipeline_threads: None,
             use_drain_first_scheduler: false,
             pending_header_handle: None,
+            deferred_outputs: Vec::new(),
             pending_header_transform: None,
             chain_tail_kind: ChainTailKind::DecodedRecordBatch { closed_under_queryname: false },
             detached_writer: false,
             sort_spill_stats: None,
+            created_outputs: CreatedOutputs::default(),
             fastq_encoding: None,
             consensus_metrics_captures: None,
         }
