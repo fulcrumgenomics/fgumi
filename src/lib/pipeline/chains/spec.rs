@@ -29,6 +29,8 @@ pub struct ChainSpec {
     pub queue_memory: QueueMemoryOptions,
     /// When true, the BAM/SAM source is opened with a userspace async
     /// prefetch reader (`--async-reader`), overlapping disk I/O with compute.
+    /// Inert for FASTQ sources: both FASTQ decode fronts read the extract
+    /// options' `async_reader` instead (see [`Self::verify_crc`]).
     pub async_reader: bool,
     /// Concurrent positional-read policy for a seekable file source. `Fixed(1)`
     /// (the default every command but `sort` uses) is the plain

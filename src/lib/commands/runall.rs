@@ -1600,7 +1600,11 @@ impl RunAll {
                             i + 1
                         );
                     }
-                    let extract_options = opts.to_extract_options();
+                    let mut extract_options = opts.to_extract_options();
+                    // The top-level `--async-reader` ("wrap the input") covers a
+                    // FASTQ input too: merge it with `--extract::async-reader`,
+                    // which both FASTQ decode fronts read.
+                    extract_options.async_reader |= self.async_reader;
                     extract_options.validate()?; // reserved-tag + store-umi-quals
                     bag.extract = Some(extract_options);
                 }

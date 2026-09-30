@@ -154,6 +154,18 @@ fn run_extract(
     threads: Option<usize>,
     async_reader: bool,
 ) -> PathBuf {
+    run_extract_logged(tmp, r1, r2, output_name, threads, async_reader).0
+}
+
+/// [`run_extract`], also returning the run's stderr.
+fn run_extract_logged(
+    tmp: &TempDir,
+    r1: &Path,
+    r2: &Path,
+    output_name: &str,
+    threads: Option<usize>,
+    async_reader: bool,
+) -> (PathBuf, String) {
     let output = tmp.path().join(output_name);
     let mut args = vec![
         "extract".to_string(),
@@ -180,12 +192,16 @@ fn run_extract(
         args.push("--async-reader".into());
     }
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+    let result = Command::new(env!("CARGO_BIN_EXE_fgumi"))
         .args(&args)
-        .status()
+        .output()
         .expect("Failed to execute extract command");
-    assert!(status.success(), "Extract command failed (async_reader={async_reader})");
-    output
+    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+    assert!(
+        result.status.success(),
+        "Extract command failed (async_reader={async_reader}):\n{stderr}"
+    );
+    (output, stderr)
 }
 
 /// Create a test BAM with UMI families for grouping.
@@ -246,6 +262,33 @@ fn test_extract_bgzf_async_reader_single_threaded() {
     let baseline = run_extract(&tmp, &r1, &r2, "baseline.bam", None, false);
     let async_out = run_extract(&tmp, &r1, &r2, "async.bam", None, true);
     assert_bam_records_equal(&baseline, &async_out);
+}
+
+/// On all-BGZF input the split decoder does the reading, so standalone
+/// `extract --async-reader` must prefetch there (and only there): output
+/// equality alone would pass even if the flag never reached the split.
+#[test]
+fn test_extract_bgzf_async_reader_reaches_the_split() {
+    let tmp = TempDir::new().unwrap();
+    let (r1_recs, r2_recs) = paired_end_records();
+    let r1 = create_bgzf_fastq(&tmp, "r1.fq.bgz", &r1_recs);
+    let r2 = create_bgzf_fastq(&tmp, "r2.fq.bgz", &r2_recs);
+
+    let (_, plain_log) = run_extract_logged(&tmp, &r1, &r2, "plain.bam", Some(4), false);
+    assert!(
+        !plain_log.contains("async FASTQ reader enabled"),
+        "no flag, no prefetch:\n{plain_log}"
+    );
+    let (_, log) = run_extract_logged(&tmp, &r1, &r2, "async.bam", Some(4), true);
+    assert_eq!(
+        log.matches("async FASTQ reader enabled on the BGZF split").count(),
+        2,
+        "one split prefetch per input:\n{log}"
+    );
+    assert!(
+        !log.contains("async FASTQ reader enabled: spawning"),
+        "the discarded detection readers must not prefetch:\n{log}"
+    );
 }
 
 #[test]

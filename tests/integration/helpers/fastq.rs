@@ -23,12 +23,7 @@ pub fn write_gzip_fastq(path: &Path, records: &[(&str, &str, &str)]) {
 /// records to span several blocks, so the corruption can sit past any reader's
 /// sampling window.
 pub fn write_bgzf_fastq_with_corrupt_last_crc(path: &Path, fastq: &[u8]) {
-    let mut bytes = Vec::new();
-    {
-        let mut writer = noodles::bgzf::io::Writer::new(&mut bytes);
-        writer.write_all(fastq).expect("write bgzf fastq");
-        writer.finish().expect("finish bgzf fastq");
-    }
+    let mut bytes = bgzf_compress(fastq);
     let blocks = {
         let mut cursor: &[u8] = &bytes;
         fgumi_bgzf::read_raw_blocks(&mut cursor, 1_000_000).expect("read bgzf blocks")
@@ -39,4 +34,20 @@ pub fn write_bgzf_fastq_with_corrupt_last_crc(path: &Path, fastq: &[u8]) {
     let data_end: usize = blocks.iter().map(fgumi_bgzf::RawBgzfBlock::len).sum();
     bytes[data_end - fgumi_bgzf::BGZF_FOOTER_SIZE] ^= 0x01;
     fs::write(path, bytes).expect("write corrupted bgzf fastq");
+}
+
+/// Write `fastq` (raw FASTQ text) BGZF-compressed to `path`.
+pub fn write_bgzf_fastq(path: &Path, fastq: &[u8]) {
+    fs::write(path, bgzf_compress(fastq)).expect("write bgzf fastq");
+}
+
+/// BGZF-compress `data` in memory.
+fn bgzf_compress(data: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut writer = noodles::bgzf::io::Writer::new(&mut bytes);
+        writer.write_all(data).expect("write bgzf");
+        writer.finish().expect("finish bgzf");
+    }
+    bytes
 }
