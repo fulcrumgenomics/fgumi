@@ -2707,6 +2707,28 @@ impl<'a> ChainBuilder<'a> {
         Ok(())
     }
 
+    /// The zipper merge rules for `add_align`'s fused align-and-merge.
+    ///
+    /// They come from the bag's zipper options, which runall fills from
+    /// `--zipper::*` on every chain that aligns (Align and Zipper never share a
+    /// chain); a spec without them merges with the defaults, as standalone
+    /// zipper does with no flags. `exclude_missing_reads` has nothing to act on
+    /// here — a template the aligner drops fails the run — so it only warns.
+    fn fused_merge_rules(
+        &self,
+        reference: &std::path::Path,
+    ) -> Result<crate::commands::zipper::ZipperMergeRules> {
+        let zipper_opts = self.spec.stage_opts.zipper.clone().unwrap_or_default();
+        if zipper_opts.exclude_missing_reads {
+            log::warn!(
+                "--zipper::exclude-missing-reads has no effect on a fused align stage: every \
+                 template sent to the aligner must come back, or the run fails, so no read can \
+                 be missing"
+            );
+        }
+        zipper_opts.merge_rules(reference)
+    }
+
     /// AlignAndMerge-specific step sequence:
     ///
     /// ```text
@@ -2774,6 +2796,7 @@ impl<'a> ChainBuilder<'a> {
     fn add_align(&mut self, position: StagePosition) -> Result<()> {
         use std::sync::atomic::AtomicU64;
 
+        use crate::commands::zipper::ZipperMergeRules;
         use crate::commands::zipper::build_output_header;
         use crate::logging::OperationTimer;
         use crate::pipeline::chains::commands::align::AlignFinalizeHook;
@@ -2783,7 +2806,6 @@ impl<'a> ChainBuilder<'a> {
         use crate::pipeline::steps::serialize::SerializeBamRecords;
         use crate::reference::find_dict_path;
         use crate::sam::check_sort;
-        use crate::umi::TagInfo;
         use log::info;
 
         let align_opts = self
@@ -2876,10 +2898,12 @@ impl<'a> ChainBuilder<'a> {
         info!("AlignAndMerge backend: {}", backend.describe());
         // The zipper merge every aligned template goes through, run by the
         // backend (the subprocess backend's shared `Parallel` merge step).
+        let ZipperMergeRules { tag_info, skip_tc_tags, reference } =
+            self.fused_merge_rules(&align_opts.reference)?;
         let merge_config = std::sync::Arc::new(MergeConfig {
-            tag_info: std::sync::Arc::new(TagInfo::new(Vec::new(), Vec::new(), Vec::new())),
-            skip_tc_tags: false,
-            reference: None,
+            tag_info,
+            skip_tc_tags,
+            reference,
             partial_output_header: std::sync::Arc::clone(&partial_header),
             records_emitted: std::sync::Arc::clone(&records_emitted),
             output_byte_limit: self.tuning.per_step_byte_limit,
