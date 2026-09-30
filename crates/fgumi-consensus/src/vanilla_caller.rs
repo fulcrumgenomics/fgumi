@@ -15,7 +15,7 @@ use crate::phred::{
 };
 use crate::simple_umi::consensus_umis;
 use anyhow::{Context, Result, anyhow, bail};
-use fgumi_dna::dna::reverse_complement;
+use fgumi_dna::dna::{complement_base, reverse_complement};
 use fgumi_raw_bam::hash::fgbio_read_name_rank;
 use fgumi_raw_bam::{RawRecord, RawRecordView, UnmappedSamBuilder, flags};
 use fgumi_sam::SamTag;
@@ -142,7 +142,8 @@ pub(crate) struct SourceRead {
     pub(crate) ref_id: i32,
     /// 0-based alignment start from the original record (for methylation annotation)
     pub(crate) alignment_start: i64,
-    /// Original (pre-reversal) simplified CIGAR (for reverse-strand ref position mapping)
+    /// The record's CIGAR as aligned (not reversed, not simplified: clips kept), for mapping
+    /// query positions to the reference (methylation annotation)
     pub(crate) original_cigar: SimplifiedCigar,
     /// fgbio-compatible rank of the record's read name, from
     /// [`fgumi_raw_bam::hash::fgbio_read_name_rank`].
@@ -661,8 +662,9 @@ impl VanillaUmiConsensusCaller {
         bases.truncate(final_len);
         quals.truncate(final_len);
 
-        let original_cigar = cigar_utils::simplify_cigar(read.cigar());
-        let mut simplified_cigar = original_cigar.clone();
+        let original_cigar: SimplifiedCigar =
+            read.cigar().as_ref().iter().map(|op| (op.kind(), op.len())).collect();
+        let mut simplified_cigar = cigar_utils::simplify_cigar(read.cigar());
         if is_negative_strand {
             simplified_cigar = Self::reverse_simplified_cigar(&simplified_cigar);
         }
@@ -796,50 +798,65 @@ impl VanillaUmiConsensusCaller {
             return (None, source_reads);
         };
 
-        // Use the longest source read as the mapping anchor so that ref_positions
-        // covers the full consensus length (consensus_len <= max source read length).
-        // All reads share the same alignment pattern after filtering, so the longest
-        // read's CIGAR is a superset of any shorter read's positions.
-        let anchor_idx = source_reads
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, sr)| sr.bases.len())
-            .map(|(idx, _)| idx);
-        let Some(anchor_idx) = anchor_idx else {
+        // Every read of a family has the same read type and orientation. Its consensus offsets
+        // map to the same reference positions in every read (the family shares one simplified
+        // CIGAR and unclipped start), but which offsets are aligned rather than soft-clipped
+        // differs between reads. So map each read through its own CIGAR as aligned: an offset's
+        // reference position comes from any read that aligns it, and a read is counted only
+        // where it is aligned. The result does not depend on read order.
+        let Some(first) = source_reads.first() else {
             return (None, source_reads);
         };
-        let anchor = &source_reads[anchor_idx];
-        if anchor.ref_id < 0 || anchor.alignment_start < 0 {
+        if first.ref_id < 0 || first.alignment_start < 0 {
             return (None, source_reads);
         }
-        let Some(ref_name) = ref_names.get(usize::try_from(anchor.ref_id).unwrap_or(usize::MAX))
+        let Some(ref_name) = ref_names.get(usize::try_from(first.ref_id).unwrap_or(usize::MAX))
         else {
             return (None, source_reads);
         };
+        let pattern = methylation::ConversionPattern::from_read_flags(first.flags);
+        let is_reverse = first.flags & flags::REVERSE != 0;
 
-        let is_top = methylation::is_top_strand(anchor.flags);
+        let consensus_len = source_reads.iter().map(|sr| sr.bases.len()).max().unwrap_or(0);
+        let mut ref_positions: Vec<Option<i64>> = vec![None; consensus_len];
+        let mut read_aligned: Vec<Vec<bool>> = Vec::with_capacity(source_reads.len());
+        for sr in &source_reads {
+            // The query is trimmed to the read's own (possibly trimmed) length by indexing.
+            let positions = methylation::query_to_ref_positions(
+                &sr.original_cigar,
+                sr.alignment_start,
+                sr.flags & flags::REVERSE != 0,
+            );
+            let mut aligned = vec![false; sr.bases.len()];
+            for (i, pos) in positions.iter().take(sr.bases.len()).enumerate() {
+                if let Some(pos) = pos {
+                    aligned[i] = true;
+                    ref_positions[i].get_or_insert(*pos);
+                }
+            }
+            read_aligned.push(aligned);
+        }
 
-        let ref_positions = methylation::query_to_ref_positions(
-            &anchor.simplified_cigar,
-            anchor.alignment_start,
-            anchor.flags & flags::REVERSE != 0,
-            &anchor.original_cigar,
-        );
-
-        let ref_bases =
+        // Source read bases are in read orientation (reverse-aligned reads were reverse
+        // complemented), so the reference bases must be too.
+        let mut ref_bases =
             methylation::fetch_ref_bases_at_positions(&ref_positions, ref_name, reference.as_ref());
+        if is_reverse {
+            ref_bases.iter_mut().flatten().for_each(|b| *b = complement_base(*b));
+        }
 
         // Annotate methylation to count conversions (before normalization)
         let annotation = methylation::annotate_simplex_methylation(
-            &source_reads[anchor_idx].bases,
+            consensus_len,
             &source_reads,
             &ref_bases,
-            is_top,
+            pattern,
+            &read_aligned,
         );
 
         // Normalize source read bases: at ref-C positions, replace converted bases
         // with unconverted form so consensus scoring treats them as agreement
-        let (unconverted_base, converted_base) = if is_top { (b'C', b'T') } else { (b'G', b'A') };
+        let (_, unconverted_base, converted_base) = pattern.bases();
         for sr in &mut source_reads {
             for (i, ev) in annotation.evidence.iter().enumerate() {
                 if ev.is_ref_c && i < sr.bases.len() {
@@ -1164,8 +1181,8 @@ impl VanillaUmiConsensusCaller {
 
         // Get simplified CIGAR from raw ops
         let cigar_ops = bam_fields::get_cigar_ops(raw);
-        let original_cigar = bam_fields::simplify_cigar_from_raw(&cigar_ops);
-        let mut simplified_cigar = original_cigar.clone();
+        let original_cigar = bam_fields::cigar_from_raw(&cigar_ops);
+        let mut simplified_cigar = bam_fields::simplify_cigar_from_raw(&cigar_ops);
 
         if is_negative_strand {
             simplified_cigar = Self::reverse_simplified_cigar(&simplified_cigar);
@@ -6253,5 +6270,228 @@ mod tests {
             assert_eq!(taps_p, 85);
             assert_eq!(u16::from(em_p) + u16::from(taps_p), 255);
         }
+    }
+
+    // ========================================================================
+    // Methylation evidence in read orientation (all read types x orientations)
+    // ========================================================================
+
+    /// Reference window used by the orientation tests, placed at 0-based position 99.
+    ///
+    /// `CCCAAAAGGT`: top-strand cytosines at window offsets 0-2 and bottom-strand
+    /// cytosines (reference `G`) at offsets 7-8. The window is not a reverse-complement
+    /// palindrome, so forward and reverse reads see different read-orientation contexts.
+    const ORIENTATION_WINDOW: &[u8] = b"CCCAAAAGGT";
+
+    fn orientation_reference() -> Vec<u8> {
+        let mut ref_seq = vec![b'N'; 99];
+        ref_seq.extend_from_slice(ORIENTATION_WINDOW);
+        ref_seq.extend_from_slice(&[b'N'; 20]);
+        ref_seq
+    }
+
+    /// Builds one EM-seq read covering the orientation window with a `10M` alignment.
+    ///
+    /// `genomic_seq` is the BAM SEQ (forward-reference orientation) and `read_flags` the
+    /// full SAM flag. Paired reads get their mate placed on the same span.
+    fn orientation_read(name: &str, genomic_seq: &[u8], read_flags: u16) -> RawRecord {
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .ref_id(0)
+            .pos(99)
+            .flags(read_flags)
+            .sequence(genomic_seq)
+            .qualities(&[30u8; 10])
+            .cigar_ops(&[encode_op(0, genomic_seq.len())])
+            .add_string_tag(SamTag::MI, b"UMI1");
+        if read_flags & flags::PAIRED != 0 {
+            b.mate_ref_id(0).mate_pos(99);
+        }
+        b.build()
+    }
+
+    /// Returns `(cu, ct)` for the single consensus record whose flags match `want_r2`.
+    fn cu_ct_for(records: &[ParsedBamRecord], want_r2: bool) -> (Vec<i16>, Vec<i16>) {
+        let rec = records
+            .iter()
+            .find(|r| (r.flag & flags::LAST_SEGMENT != 0) == want_r2)
+            .expect("consensus record of the requested read type");
+        (
+            rec.get_i16_array_tag(SamTag::CU).expect("cu tag"),
+            rec.get_i16_array_tag(SamTag::CT).expect("ct tag"),
+        )
+    }
+
+    /// Fragment reads: read orientation equals the original strand, so conversions are
+    /// C->T at read-orientation reference `C` whichever way the read aligned.
+    ///
+    /// - forward (from the top strand): informative at window offsets 0,1,2.
+    /// - reverse (from the bottom strand): read orientation is `ACCTTTTGGG`
+    ///   (reverse complement of the window), informative at offsets 1,2.
+    ///
+    /// `genomic_seq` is what the aligner stores for three identical, fully converted
+    /// (unmethylated) reads; expected counts are in read (consensus) orientation.
+    #[rstest]
+    #[case::fragment_forward_top_strand(
+        b"TTTAAAAGGT", 0,
+        [3, 3, 3, 0, 0, 0, 0, 0, 0, 0]
+    )]
+    #[case::fragment_reverse_bottom_strand(
+        b"CCCAAAAAAT", flags::REVERSE,
+        [0, 3, 3, 0, 0, 0, 0, 0, 0, 0]
+    )]
+    fn test_em_seq_fragment_evidence_in_read_orientation(
+        #[case] genomic_seq: &[u8],
+        #[case] read_flags: u16,
+        #[case] expected_ct: [i16; 10],
+    ) {
+        let mut caller = create_em_seq_caller(&orientation_reference());
+        let reads =
+            (0..3).map(|i| orientation_read(&format!("r{i}"), genomic_seq, read_flags)).collect();
+
+        let output = consensus_reads_from_raw(&mut caller, reads).unwrap();
+        let records = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(records.len(), 1);
+        let (cu, ct) = cu_ct_for(&records, false);
+
+        assert_eq!(ct, expected_ct.to_vec(), "converted counts");
+        assert_eq!(cu, vec![0i16; 10], "no unconverted evidence in fully converted reads");
+    }
+
+    /// Paired reads: R1 shows C->T and R2 shows G->A in read orientation.
+    ///
+    /// - Top-strand template (R1 forward, R2 reverse): both mates' genomic SEQ is the
+    ///   converted top strand `TTTAAAAGGT`. R1 is informative at offsets 0,1,2; R2's read
+    ///   orientation is `ACCTTTTAAA` and it is informative at offsets 7,8,9.
+    /// - Bottom-strand template (R1 reverse, R2 forward): both mates' genomic SEQ is
+    ///   `CCCAAAAAAT` (bottom-strand cytosines at reference G converted). R1's read
+    ///   orientation is `ATTTTTTGGG`, informative at offsets 1,2; R2 is forward and
+    ///   informative at offsets 7,8.
+    #[rstest]
+    #[case::top_strand_template(
+        b"TTTAAAAGGT",
+        flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE,
+        flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE,
+        [3, 3, 3, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 3, 3, 3]
+    )]
+    #[case::bottom_strand_template(
+        b"CCCAAAAAAT",
+        flags::PAIRED | flags::FIRST_SEGMENT | flags::REVERSE,
+        flags::PAIRED | flags::LAST_SEGMENT | flags::MATE_REVERSE,
+        [0, 3, 3, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 3, 3, 0]
+    )]
+    fn test_em_seq_paired_evidence_in_read_orientation(
+        #[case] genomic_seq: &[u8],
+        #[case] r1_flags: u16,
+        #[case] r2_flags: u16,
+        #[case] expected_r1_ct: [i16; 10],
+        #[case] expected_r2_ct: [i16; 10],
+    ) {
+        let mut caller = create_em_seq_caller(&orientation_reference());
+        let mut reads = Vec::new();
+        for i in 0..3 {
+            reads.push(orientation_read(&format!("t{i}"), genomic_seq, r1_flags));
+            reads.push(orientation_read(&format!("t{i}"), genomic_seq, r2_flags));
+        }
+
+        let output = consensus_reads_from_raw(&mut caller, reads).unwrap();
+        let records = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(records.len(), 2);
+        let (r1_cu, r1_ct) = cu_ct_for(&records, false);
+        let (r2_cu, r2_ct) = cu_ct_for(&records, true);
+
+        assert_eq!(r1_ct, expected_r1_ct.to_vec(), "R1 converted counts");
+        assert_eq!(r2_ct, expected_r2_ct.to_vec(), "R2 converted counts");
+        assert_eq!(r1_cu, vec![0i16; 10], "R1 has no unconverted evidence");
+        assert_eq!(r2_cu, vec![0i16; 10], "R2 has no unconverted evidence");
+    }
+
+    /// Soft-clipped fragment reads: clipped bases have no reference position, so evidence stays
+    /// on the aligned bases. Forward reads align `TTTAAAAG` (converted top strand) to window
+    /// offsets 0-7; reverse reads align `CCCAAAAA` (reference `G` at offset 7 converted on the
+    /// bottom strand), which in read orientation sits after the clip on the right, or at the
+    /// start when the clip is on the left in genomic orientation.
+    #[rstest]
+    #[case::forward_leading_clip(b"GGTTTAAAAG", 0, &[(4, 2), (0, 8)], [0, 0, 3, 3, 3, 0, 0, 0, 0, 0])]
+    #[case::forward_trailing_clip(b"TTTAAAAGGG", 0, &[(0, 8), (4, 2)], [3, 3, 3, 0, 0, 0, 0, 0, 0, 0])]
+    #[case::reverse_leading_clip(
+        b"TTCCCAAAAA", flags::REVERSE, &[(4, 2), (0, 8)], [3, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    )]
+    #[case::reverse_trailing_clip(
+        b"CCCAAAAATT", flags::REVERSE, &[(0, 8), (4, 2)], [0, 0, 3, 0, 0, 0, 0, 0, 0, 0]
+    )]
+    fn test_em_seq_soft_clipped_evidence_in_read_orientation(
+        #[case] genomic_seq: &[u8],
+        #[case] read_flags: u16,
+        #[case] cigar: &[(u32, usize)],
+        #[case] expected_ct: [i16; 10],
+    ) {
+        let mut caller = create_em_seq_caller(&orientation_reference());
+        let ops: Vec<u32> = cigar.iter().map(|&(op, len)| encode_op(op, len)).collect();
+        let reads = (0..3)
+            .map(|i| {
+                SamBuilder::new()
+                    .read_name(format!("r{i}").as_bytes())
+                    .ref_id(0)
+                    .pos(99)
+                    .flags(read_flags)
+                    .sequence(genomic_seq)
+                    .qualities(&[30u8; 10])
+                    .cigar_ops(&ops)
+                    .add_string_tag(SamTag::MI, b"UMI1")
+                    .build()
+            })
+            .collect();
+
+        let output = consensus_reads_from_raw(&mut caller, reads).unwrap();
+        let records = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(records.len(), 1);
+        let (cu, ct) = cu_ct_for(&records, false);
+
+        assert_eq!(ct, expected_ct.to_vec(), "converted counts");
+        assert_eq!(cu, vec![0i16; 10], "no unconverted evidence in fully converted reads");
+    }
+
+    /// A family whose reads are clipped differently (two `10M` reads at 99 and one `2S8M` read at
+    /// 101: the same simplified CIGAR and unclipped start). Each read is counted only where it is
+    /// aligned, whatever the input order: window offsets 0 and 1 are the clipped read's soft clip,
+    /// so only the two full reads count there.
+    #[rstest]
+    #[case::clipped_first(&[true, false, false])]
+    #[case::clipped_last(&[false, false, true])]
+    #[case::clipped_middle(&[false, true, false])]
+    fn test_em_seq_family_with_mixed_clipping_is_order_independent(#[case] clipped: &[bool]) {
+        let mut caller = create_em_seq_caller(&orientation_reference());
+        let reads = clipped
+            .iter()
+            .enumerate()
+            .map(|(i, &is_clipped)| {
+                let (pos, ops) = if is_clipped {
+                    (101, vec![encode_op(4, 2), encode_op(0, 8)])
+                } else {
+                    (99, vec![encode_op(0, 10)])
+                };
+                SamBuilder::new()
+                    .read_name(format!("r{i}").as_bytes())
+                    .ref_id(0)
+                    .pos(pos)
+                    .flags(0)
+                    .sequence(b"TTTAAAAGGT")
+                    .qualities(&[30u8; 10])
+                    .cigar_ops(&ops)
+                    .add_string_tag(SamTag::MI, b"UMI1")
+                    .build()
+            })
+            .collect();
+
+        let output = consensus_reads_from_raw(&mut caller, reads).unwrap();
+        let records = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(records.len(), 1);
+        let (cu, ct) = cu_ct_for(&records, false);
+
+        assert_eq!(ct, vec![2, 2, 3, 0, 0, 0, 0, 0, 0, 0], "converted counts");
+        assert_eq!(cu, vec![0i16; 10], "no unconverted evidence in fully converted reads");
     }
 }

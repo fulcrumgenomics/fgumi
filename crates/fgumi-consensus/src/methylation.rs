@@ -100,118 +100,122 @@ pub fn is_cpg_context(ref_seq: &[u8], pos: usize, is_top_strand: bool) -> bool {
     }
 }
 
-/// Maps each query position to a reference position using a simplified CIGAR.
+/// Maps each query position, in read (sequencing) order, to a reference position.
 ///
-/// For forward-strand reads, walks from `alignment_start` forward.
-/// For reverse-strand reads (where CIGAR and bases have been reversed in
-/// `create_source_read`), we reconstruct the original reference span and
-/// map positions from the rightmost position backward.
+/// `cigar` is the CIGAR as aligned, with its clips (a soft-clipped base has no reference
+/// position, a hard clip is not in the query). For a forward read the query is walked from
+/// `alignment_start`; for a reverse-aligned read, whose bases are in read orientation (reverse
+/// complemented), the CIGAR is walked from its last operation and the reference from the
+/// alignment end backward.
 ///
-/// Returns `Vec<Option<i64>>` where `None` = insertion (no ref base).
+/// Returns `Vec<Option<i64>>` where `None` = insertion or soft clip (no ref base).
 #[must_use]
 #[expect(
     clippy::cast_possible_wrap,
     reason = "CIGAR lengths are small enough that usize→i64 won't wrap"
 )]
 pub fn query_to_ref_positions(
-    simplified_cigar: &[(Kind, usize)],
+    cigar: &[(Kind, usize)],
     alignment_start: i64,
     is_reverse: bool,
-    original_cigar: &[(Kind, usize)],
 ) -> Vec<Option<i64>> {
-    // Calculate total query length from the (possibly reversed) cigar
     let query_len: usize =
-        simplified_cigar.iter().filter(|(k, _)| k.consumes_read()).map(|(_, len)| *len).sum();
-
+        cigar.iter().filter(|(k, _)| k.consumes_read()).map(|(_, len)| *len).sum();
     let mut positions = Vec::with_capacity(query_len);
 
-    if is_reverse {
-        // For reverse strand: the CIGAR has been reversed in create_source_read.
-        // We need to compute the alignment end from the *original* cigar, then
-        // walk the reversed cigar mapping positions from right to left in reference space.
-        let ref_span: i64 = original_cigar
-            .iter()
-            .filter(|(k, _)| k.consumes_reference())
-            .map(|(_, len)| *len as i64)
-            .sum();
-        let alignment_end = alignment_start + ref_span - 1; // 0-based inclusive end
+    let (mut ref_pos, step): (i64, i64) = if is_reverse {
+        let ref_span: i64 =
+            cigar.iter().filter(|(k, _)| k.consumes_reference()).map(|(_, len)| *len as i64).sum();
+        (alignment_start + ref_span - 1, -1) // 0-based inclusive end
+    } else {
+        (alignment_start, 1)
+    };
 
-        let mut ref_pos = alignment_end;
-        for &(kind, len) in simplified_cigar {
-            match kind {
-                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                    for _ in 0..len {
-                        positions.push(Some(ref_pos));
-                        ref_pos -= 1;
-                    }
-                }
-                Kind::Insertion | Kind::SoftClip => {
-                    for _ in 0..len {
-                        positions.push(None);
-                    }
-                }
-                Kind::Deletion | Kind::Skip => {
-                    ref_pos -= len as i64;
-                }
-                _ => {}
+    let mut walk = |kind: Kind, len: usize| match kind {
+        Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+            for _ in 0..len {
+                positions.push(Some(ref_pos));
+                ref_pos += step;
             }
         }
+        Kind::Insertion | Kind::SoftClip => positions.extend(std::iter::repeat_n(None, len)),
+        Kind::Deletion | Kind::Skip => ref_pos += step * len as i64,
+        _ => {}
+    };
+    if is_reverse {
+        for &(kind, len) in cigar.iter().rev() {
+            walk(kind, len);
+        }
     } else {
-        // Forward strand: walk from alignment_start forward
-        let mut ref_pos = alignment_start;
-        for &(kind, len) in simplified_cigar {
-            match kind {
-                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                    for _ in 0..len {
-                        positions.push(Some(ref_pos));
-                        ref_pos += 1;
-                    }
-                }
-                Kind::Insertion | Kind::SoftClip => {
-                    for _ in 0..len {
-                        positions.push(None);
-                    }
-                }
-                Kind::Deletion | Kind::Skip => {
-                    ref_pos += len as i64;
-                }
-                _ => {}
-            }
+        for &(kind, len) in cigar {
+            walk(kind, len);
         }
     }
 
     positions
 }
 
+/// How a read displays enzymatic/bisulfite conversions in its read (sequencing) orientation.
+///
+/// In a directional library, R1 (and unpaired reads) is the original strand's own sequence,
+/// so conversions appear as C→T at read-orientation reference `C`. R2 is the copy
+/// complementary to the original strand, so conversions appear as G→A at read-orientation
+/// reference `G`. This holds whichever genomic strand the molecule came from and whichever
+/// way the read aligned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversionPattern {
+    /// Conversions appear as C→T (R1 and unpaired reads).
+    CToT,
+    /// Conversions appear as G→A (R2 reads).
+    GToA,
+}
+
+impl ConversionPattern {
+    /// Returns the pattern for a read with the given SAM flags.
+    #[must_use]
+    pub fn from_read_flags(read_flags: u16) -> Self {
+        if read_flags & flags::LAST_SEGMENT == 0 { Self::CToT } else { Self::GToA }
+    }
+
+    /// Returns `(reference base, unconverted base, converted base)` in read orientation.
+    #[must_use]
+    pub const fn bases(self) -> (u8, u8, u8) {
+        match self {
+            Self::CToT => (b'C', b'C', b'T'),
+            Self::GToA => (b'G', b'G', b'A'),
+        }
+    }
+}
+
 /// Annotates simplex consensus methylation from source reads and reference.
 ///
-/// For each consensus position that aligns to a reference cytosine (top strand)
-/// or reference guanine (bottom strand, after RC), counts source reads showing
-/// unconverted vs converted bases. Does not modify the consensus bases.
+/// For each consensus position whose read-orientation reference base is the pattern's
+/// reference base (`C` for C→T, `G` for G→A), counts source reads showing the unconverted
+/// vs converted base. Does not modify the consensus bases.
 ///
 /// # Arguments
-/// * `consensus_bases` - Consensus bases (used for length/position mapping)
-/// * `source_reads` - Source reads used to build this consensus
-/// * `ref_bases_at_positions` - Reference bases at aligned positions (`None` for insertions)
-/// * `is_top_strand` - Whether this consensus represents the top (forward) strand
+/// * `consensus_len` - Length of the consensus (the longest source read)
+/// * `source_reads` - Source reads used to build this consensus, in read orientation
+/// * `ref_bases_read_orientation` - Reference base at each consensus position, in read
+///   orientation (complemented for reverse-aligned reads); `None` for insertions
+/// * `pattern` - How the source reads display conversions
+/// * `read_aligned` - For each source read, whether each of its bases is aligned to the
+///   reference (not soft-clipped or inserted); at informative positions a read is counted only
+///   where it is aligned, so its clipped bases never count at a reference position
 pub(crate) fn annotate_simplex_methylation(
-    consensus_bases: &[u8],
+    consensus_len: usize,
     source_reads: &[SourceRead],
-    ref_bases_at_positions: &[Option<u8>],
-    is_top_strand: bool,
+    ref_bases_read_orientation: &[Option<u8>],
+    pattern: ConversionPattern,
+    read_aligned: &[Vec<bool>],
 ) -> MethylationAnnotation {
-    let len = consensus_bases.len();
-    let mut evidence = vec![MethylationEvidence::default(); len];
+    let mut evidence = vec![MethylationEvidence::default(); consensus_len];
 
-    // Determine which reference base indicates a C position and what conversion looks like
-    // Top strand: ref=C, unconverted=C, converted=T
-    // Bottom strand (after RC): ref=G (complement of C), unconverted=G, converted=A
-    let (ref_target, unconverted_base, converted_base) =
-        if is_top_strand { (b'C', b'C', b'T') } else { (b'G', b'G', b'A') };
+    let (ref_target, unconverted_base, converted_base) = pattern.bases();
 
     for (i, ev) in evidence.iter_mut().enumerate() {
-        // Check if this position aligns to a reference C/G
-        let ref_base = ref_bases_at_positions.get(i).and_then(|b| *b);
+        // Check if this position aligns to the pattern's reference base
+        let ref_base = ref_bases_read_orientation.get(i).and_then(|b| *b);
         let Some(rb) = ref_base else { continue };
         let rb_upper = rb.to_ascii_uppercase();
         if rb_upper != ref_target {
@@ -221,8 +225,11 @@ pub(crate) fn annotate_simplex_methylation(
         ev.is_ref_c = true;
 
         // Count unconverted vs converted in source reads
-        for sr in source_reads {
+        for (r, sr) in source_reads.iter().enumerate() {
             if i >= sr.bases.len() {
+                continue;
+            }
+            if read_aligned.get(r).is_none_or(|a| a.get(i) != Some(&true)) {
                 continue;
             }
             let base = sr.bases[i].to_ascii_uppercase();
@@ -461,7 +468,7 @@ pub(crate) mod tests {
     fn test_query_to_ref_positions_all_matches() {
         // 10M cigar, forward strand
         let cigar = vec![(Kind::Match, 10)];
-        let positions = query_to_ref_positions(&cigar, 100, false, &cigar);
+        let positions = query_to_ref_positions(&cigar, 100, false);
         assert_eq!(positions.len(), 10);
         for (i, pos) in positions.iter().enumerate() {
             assert_eq!(*pos, Some(100 + i as i64));
@@ -472,7 +479,7 @@ pub(crate) mod tests {
     fn test_query_to_ref_positions_with_insertion() {
         // 5M2I3M
         let cigar = vec![(Kind::Match, 5), (Kind::Insertion, 2), (Kind::Match, 3)];
-        let positions = query_to_ref_positions(&cigar, 100, false, &cigar);
+        let positions = query_to_ref_positions(&cigar, 100, false);
         assert_eq!(positions.len(), 10);
         // First 5: ref 100-104
         for i in 0..5 {
@@ -491,7 +498,7 @@ pub(crate) mod tests {
     fn test_query_to_ref_positions_with_deletion() {
         // 5M2D5M
         let cigar = vec![(Kind::Match, 5), (Kind::Deletion, 2), (Kind::Match, 5)];
-        let positions = query_to_ref_positions(&cigar, 100, false, &cigar);
+        let positions = query_to_ref_positions(&cigar, 100, false);
         assert_eq!(positions.len(), 10);
         for i in 0..5 {
             assert_eq!(positions[i], Some(100 + i as i64));
@@ -504,12 +511,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_query_to_ref_positions_reverse_strand() {
-        // Original cigar: 10M at position 100
-        // After reversal in create_source_read: cigar is still 10M (symmetric)
-        // Reverse strand should map positions from alignment_end backward
-        let original_cigar = vec![(Kind::Match, 10)];
-        let reversed_cigar = vec![(Kind::Match, 10)]; // Same since 10M reversed is 10M
-        let positions = query_to_ref_positions(&reversed_cigar, 100, true, &original_cigar);
+        // 10M at position 100, reverse strand: read order maps from the alignment end backward
+        let cigar = vec![(Kind::Match, 10)];
+        let positions = query_to_ref_positions(&cigar, 100, true);
         assert_eq!(positions.len(), 10);
         // Should map from 109 down to 100
         for i in 0..10 {
@@ -526,10 +530,11 @@ pub(crate) mod tests {
         let ref_bases = vec![Some(b'A'), Some(b'C'), Some(b'G'), Some(b'T')];
 
         let annot = annotate_simplex_methylation(
-            &consensus,
+            consensus.len(),
             &[sr1, sr2],
             &ref_bases,
-            true, // top strand
+            ConversionPattern::CToT,
+            &all_aligned(),
         );
 
         // Position 1 (ref=C): both reads show C → methylated, count=2
@@ -548,7 +553,13 @@ pub(crate) mod tests {
         let sr2 = make_test_source_read(b"ATGT", 0);
         let ref_bases = vec![Some(b'A'), Some(b'C'), Some(b'G'), Some(b'T')];
 
-        let annot = annotate_simplex_methylation(&consensus, &[sr1, sr2], &ref_bases, true);
+        let annot = annotate_simplex_methylation(
+            consensus.len(),
+            &[sr1, sr2],
+            &ref_bases,
+            ConversionPattern::CToT,
+            &all_aligned(),
+        );
 
         assert!(annot.evidence[1].is_ref_c);
         assert_eq!(annot.evidence[1].unconverted_count, 0);
@@ -566,7 +577,13 @@ pub(crate) mod tests {
         let sr2 = make_test_source_read(b"ATGT", 0); // T at pos 1
         let ref_bases = vec![Some(b'A'), Some(b'C'), Some(b'G'), Some(b'T')];
 
-        let annot = annotate_simplex_methylation(&consensus, &[sr1, sr2], &ref_bases, true);
+        let annot = annotate_simplex_methylation(
+            consensus.len(),
+            &[sr1, sr2],
+            &ref_bases,
+            ConversionPattern::CToT,
+            &all_aligned(),
+        );
 
         assert!(annot.evidence[1].is_ref_c);
         assert_eq!(annot.evidence[1].unconverted_count, 1);
@@ -580,7 +597,13 @@ pub(crate) mod tests {
         let sr1 = make_test_source_read(b"AGGT", 0);
         let ref_bases = vec![Some(b'A'), Some(b'G'), Some(b'G'), Some(b'T')];
 
-        let annot = annotate_simplex_methylation(&consensus, &[sr1], &ref_bases, true);
+        let annot = annotate_simplex_methylation(
+            consensus.len(),
+            &[sr1],
+            &ref_bases,
+            ConversionPattern::CToT,
+            &all_aligned(),
+        );
 
         for ev in &annot.evidence {
             assert!(!ev.is_ref_c);
@@ -595,10 +618,11 @@ pub(crate) mod tests {
         let ref_bases = vec![Some(b'T'), Some(b'G'), Some(b'C'), Some(b'A')]; // at reversed positions
 
         let annot = annotate_simplex_methylation(
-            &consensus,
+            consensus.len(),
             &[sr1],
             &ref_bases,
-            false, // bottom strand
+            ConversionPattern::GToA,
+            &all_aligned(),
         );
 
         // Position 1: ref=G → eligible for bottom-strand methylation
@@ -923,6 +947,11 @@ pub(crate) mod tests {
     }
 
     /// Helper to create a `SourceRead` for testing.
+    /// Every base of up to eight test reads is aligned.
+    fn all_aligned() -> Vec<Vec<bool>> {
+        vec![vec![true; 64]; 8]
+    }
+
     fn make_test_source_read(bases: &[u8], flg: u16) -> SourceRead {
         SourceRead {
             original_idx: 0,

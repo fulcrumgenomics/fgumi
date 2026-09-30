@@ -552,7 +552,7 @@ impl CodecConsensusCaller {
         let astart = i64::from(view.pos());
         let original_cigar = {
             let ops = bam_fields::get_cigar_ops(raw);
-            bam_fields::simplify_cigar_from_raw(&ops)
+            bam_fields::cigar_from_raw(&ops)
         };
 
         SourceRead {
