@@ -1,5 +1,6 @@
 //! `MergeAlignedStep` — the shared, `Parallel` consumer of an align backend's
-//! `ZipperBatch` stream.
+//! `ZipperBatch` stream (the subprocess backend's; the
+//! in-process backend calls `merge_zipper_batch` in its own pair/emit step).
 //!
 //! Each `ZipperBatch` carries both halves of a batch (aligner-emitted `mapped`
 //! templates positionally paired with the original `unmapped` templates) plus a

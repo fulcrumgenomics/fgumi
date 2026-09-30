@@ -435,12 +435,38 @@ const MISSING_QUALITY_ASCII: u8 = b'B';
 /// [`MISSING_QUALITY_ASCII`] rather than the misleading Q93 that
 /// `QUAL_TO_ASCII[0xFF]` would produce. A partially-`0xFF` string is left to the
 /// per-byte mapping (a genuinely malformed record, not the "no quality" sentinel).
-fn encode_quality_into(quals: &[u8], out: &mut Vec<u8>) {
+pub(crate) fn encode_quality_into(quals: &[u8], out: &mut Vec<u8>) {
     out.clear();
     if !quals.is_empty() && quals.iter().all(|&q| q == 0xFF) {
         out.resize(quals.len(), MISSING_QUALITY_ASCII);
     } else {
         out.extend(quals.iter().map(|&s| QUAL_TO_ASCII[s as usize]));
+    }
+}
+
+/// Decode `record`'s SEQ and QUAL into `seq`/`qual` exactly as they are
+/// written to FASTQ: ASCII bases and Phred+33 quality, with SEQ
+/// reverse-complemented (through this module's FASTQ-validity [`COMPLEMENT`],
+/// which folds any non-IUPAC byte to `N`) and QUAL reversed when `flags` carries
+/// `REVERSE`. Both buffers are cleared first and reuse their capacity.
+///
+/// The single definition of the aligner-input bytes: the subprocess route
+/// writes them to FASTQ ([`write_fastq_record`]) and the in-process route feeds
+/// them straight to bwa-mem3, so the two backends cannot drift apart.
+pub(crate) fn decode_fastq_seq_qual(
+    record: &RawRecord,
+    flags: u16,
+    seq: &mut Vec<u8>,
+    qual: &mut Vec<u8>,
+) {
+    extract_sequence_into(record, seq);
+    encode_quality_into(quality_scores_slice(record), qual);
+    if (flags & fgumi_raw_bam::flags::REVERSE) != 0 {
+        seq.reverse();
+        for base in seq.iter_mut() {
+            *base = COMPLEMENT[*base as usize];
+        }
+        qual.reverse();
     }
 }
 
@@ -581,21 +607,9 @@ pub(crate) fn write_fastq_record<W: Write>(
         b"" // Single-end or both flags set
     };
 
-    // Decode sequence from 4-bit BAM encoding to ASCII bases (reuses the scratch buffer).
-    extract_sequence_into(record, &mut buffers.seq);
-
-    // Copy quality bytes and transform to Phred+33 ASCII (absent quality → default)
-    encode_quality_into(quality_scores_slice(record), &mut buffers.qual);
-
-    if (flags & flag_bits::REVERSE) != 0 {
-        // Reverse complement sequence in place using lookup table
-        buffers.seq.reverse();
-        for base in buffers.seq.iter_mut() {
-            *base = COMPLEMENT[*base as usize];
-        }
-        // Reverse quality in place
-        buffers.qual.reverse();
-    }
+    // Decode SEQ/QUAL (reverse-complemented for a REVERSE record) into the
+    // reusable scratch buffers.
+    decode_fastq_seq_qual(record, flags, &mut buffers.seq, &mut buffers.qual);
 
     // Write all parts. The UMI goes between the name and the /1 /2 suffix, matching
     // `samtools fastq -U`.

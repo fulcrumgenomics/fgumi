@@ -6,20 +6,21 @@
 //! `merge::merge_zipper_batch`.
 //!
 //! What produces the aligned half is a *backend*, behind the `AlignBackend`
-//! trait. The subprocess backend is a `Serial` `subprocess::SubprocessAlignStep`
+//! trait: the subprocess backend (a `Serial` `subprocess::SubprocessAlignStep`
 //! wrapping an aligner subprocess, followed by the `Parallel`
-//! `merge::MergeAlignedStep` that merges its `ZipperBatch` stream. The trait's
-//! `wire` appends the backend's steps after a queryname-grouped
-//! `BamTemplateBatch` tail and returns its merged `BamTemplateBatch` tail plus
-//! the scheduling facts the chain builder needs (`AlignWired`). The merge itself
-//! is common code. `backend_for` builds the backend a resolved `--aligner::*`
-//! selection names.
+//! `merge::MergeAlignedStep` that merges its `ZipperBatch` stream), or the
+//! in-process bwa-mem3 subgraph, whose pair/emit step merges each sub-batch
+//! itself as soon as it is emitted. The trait's `wire` appends the backend's
+//! steps after a queryname-grouped `BamTemplateBatch` tail and returns its
+//! merged `BamTemplateBatch` tail plus the scheduling facts the chain builder
+//! needs (`AlignWired`). The merge itself is common code. `backend_for`
+//! builds the backend a resolved `--aligner::*` selection names.
 //!
 //! This module holds the trait, its wiring context/result types, the
 //! backend-agnostic `ZipperBatch`, the subprocess backend's `InFlightGate`
-//! byte-budget gate, the mimalloc purge-delay setter called at wiring, the
-//! mid-pair split helper, and the header helpers (`validate_sq_consistency`,
-//! `merge_aligner_header`).
+//! byte-budget gate, the mimalloc purge-delay setter both backends call at
+//! wiring, and the header helpers (`validate_sq_consistency`,
+//! `merge_aligner_header`) shared by both backends.
 
 #[cfg(feature = "aligner-bwa-mem3")]
 pub(crate) mod inproc;
@@ -51,21 +52,25 @@ use crate::template::Template;
 /// `SECONDARY | SUPPLEMENTARY` (`0x900`): if a previously-aligned BAM is passed
 /// by mistake, dropping these prevents duplicate reads for the same template.
 ///
-/// This is the single source of truth for which reads an align backend feeds
-/// the aligner (the subprocess FASTQ writer, [`subprocess`], reads it).
+/// This is the single source of truth shared by BOTH align backends — the
+/// subprocess FASTQ writer ([`subprocess`]) and the in-process prepare step
+/// (`inproc::prepare`) — so the two select byte-identical reads and cannot
+/// drift.
 pub(crate) const FASTQ_WRITER_EXCLUDE_FLAGS: u16 =
     fgumi_raw_bam::flags::SECONDARY | fgumi_raw_bam::flags::SUPPLEMENTARY;
 
 /// Whether a record with these `flags` is a *primary* read to align — i.e. not
-/// SECONDARY/SUPPLEMENTARY. A backend walks a template's records in record
-/// order and feeds the aligner exactly the records this returns `true` for.
+/// SECONDARY/SUPPLEMENTARY. Both backends walk a template's records in record
+/// order and keep exactly the records this returns `true` for, so the reads fed
+/// to the aligner (and the `-K` byte accounting over them) are identical.
 #[must_use]
 pub(crate) fn is_primary_for_alignment(flags: u16) -> bool {
     (flags & FASTQ_WRITER_EXCLUDE_FLAGS) == 0
 }
 
-/// The body of the "template has no primary records" hard error. A template
-/// whose every record is SECONDARY/SUPPLEMENTARY
+/// The shared body of the "template has no primary records" hard error, so the
+/// subprocess writer and the in-process prepare step word it identically and
+/// cannot drift. A template whose every record is SECONDARY/SUPPLEMENTARY
 /// produces zero aligner input; align-and-merge expects unmapped BAM input
 /// (from `fgumi extract`), which has no secondaries, so this means a re-aligned
 /// BAM was passed by mistake (the subprocess writer's `!wrote_any` guard in
@@ -213,7 +218,7 @@ impl Drop for ConsumerGoneGuard<'_> {
 /// halves — the backend-agnostic edge every align backend produces, and the
 /// input to [`merge::merge_zipper_batch`] (`merge_raw` + optional bisulfite
 /// restore). The subprocess backend hands it to the shared
-/// [`merge::MergeAlignedStep`].
+/// [`merge::MergeAlignedStep`]; the in-process pair/emit step merges it itself.
 #[derive(Debug)]
 pub(crate) struct ZipperBatch {
     pub(crate) serial: u64,
@@ -243,8 +248,10 @@ impl Ordered for ZipperBatch {
 /// What `add_align` needs to wire any align backend. Built once by the chain
 /// builder and passed to [`AlignBackend::wire`].
 ///
-/// Carries the output header and its handle, the per-step queue byte limit, and
-/// the shared zipper-merge config.
+/// Carries the output header and its handle, the per-step queue byte limit, the
+/// pool's thread budget, and the shared zipper-merge config. The thread budget
+/// is read only by the in-process backend, so it is `allow(dead_code)` in
+/// feature-off builds.
 pub(crate) struct AlignWiringCtx {
     /// Partial output header (dict `@SQ` + unmapped `@HD`/`@CO`/`@RG`/`@PG` +
     /// fgumi `@PG`) the backend validates the aligner's `@SQ` against and merges
@@ -255,8 +262,16 @@ pub(crate) struct AlignWiringCtx {
     pub(crate) header_handle: HeaderHandle,
     /// Byte limit for the backend's output queue (`ChainTuning::per_step_byte_limit`).
     pub(crate) per_step_byte_limit: u64,
+    /// Pool worker count (`spec.threading.num_threads()`) — the single thread
+    /// budget. The in-process backend loads the index with this many threads and
+    /// sizes its seed/extend output queue for this many in-flight worker clones;
+    /// the subprocess backend ignores it (its parallelism is the aligner
+    /// subprocess's own `-t`), so it is unread in a feature-off build.
+    #[cfg_attr(not(feature = "aligner-bwa-mem3"), allow(dead_code))]
+    pub(crate) num_threads: usize,
     /// The zipper merge every aligned template goes through: the subprocess
-    /// backend runs it in the shared [`merge::MergeAlignedStep`] it appends.
+    /// backend runs it in the shared [`merge::MergeAlignedStep`] it appends, the
+    /// in-process pair/emit step inline.
     pub(crate) merge: Arc<merge::MergeConfig>,
 }
 
@@ -270,6 +285,20 @@ pub(crate) struct AlignWired {
     pub(crate) min_workers: usize,
     /// Whether the chain builder should prefer drain-first dispatch.
     pub(crate) prefers_drain_first: bool,
+    /// When set and drain-first is chosen automatically, the chain uses
+    /// [`RefillDrainScheduler`](crate::pipeline::core::runtime::RefillDrainScheduler)
+    /// on this hint.
+    pub(crate) refill: Option<RefillHint>,
+}
+
+/// A backend's input-refill hint: while `signal` is raised and the queue
+/// `feed` (a producer step and output branch) holds less than `cap_bytes`, the
+/// steps up to and including the producer should be walked upstream-first.
+#[derive(Clone)]
+pub(crate) struct RefillHint {
+    pub(crate) signal: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) feed: (StepIdx, BranchIdx),
+    pub(crate) cap_bytes: u64,
 }
 
 /// A pluggable align backend: appends its steps after a queryname-grouped
@@ -299,9 +328,9 @@ pub(crate) trait AlignBackend: Send + 'static {
 ///
 /// Called once by the chain builder (`chains/builder.rs::add_align`) after
 /// [`AlignerOptions::resolve`](crate::aligner::AlignerOptions::resolve) has
-/// validated the option combination. It only packages already-validated
-/// fields, so it is infallible; spawn failures surface later, inside
-/// [`AlignBackend::wire`].
+/// validated the option combination. Both arms only package already-validated
+/// fields, so this is infallible: the in-process backend loads its index later,
+/// inside [`AlignBackend::wire`], which is where that failure surfaces.
 ///
 /// Lives here rather than on `ResolvedAligner` so the framework-agnostic
 /// `aligner` module does not depend on the pipeline's align stage.
@@ -313,6 +342,27 @@ pub(crate) fn backend_for(resolved: ResolvedAligner) -> Box<dyn AlignBackend> {
                 chunk_size: resolved.chunk_size,
                 accept_mid_pair_split,
             })
+        }
+        #[cfg(feature = "aligner-bwa-mem3")]
+        ResolvedBackend::InProcessBwaMem3 { reference, sub_batch_templates, dedup_reads } => {
+            // The index is loaded (once) and the header synthesized/resolved
+            // inside `AlignBackend::wire`, not here — this only packages the
+            // resolved parameters. `chunk_size` drives the cohort cutter/gate and
+            // the synthesized `@PG CL`.
+            Box::new(inproc::InProcessBwaMem3Backend {
+                reference,
+                sub_batch_templates,
+                dedup_reads,
+                chunk_size: resolved.chunk_size,
+            })
+        }
+        #[cfg(not(feature = "aligner-bwa-mem3"))]
+        ResolvedBackend::InProcessBwaMem3 { .. } => {
+            unreachable!(
+                "AlignerOptions::resolve bails for AlignerPreset::BwaMem3InProc \
+                 when the `aligner-bwa-mem3` feature is off, so this variant \
+                 cannot be constructed in a feature-off build"
+            )
         }
     }
 }
@@ -381,10 +431,10 @@ const SPLIT_HALF_CLEARED_FLAGS: u16 = fgumi_raw_bam::flags::PAIRED
 /// Split a two-primary-read template into two single-record templates, in record
 /// order: bwa's mid-pair split. With mixed SE/PE input a `-K`
 /// chunk boundary can fall between a pair's two reads, and bwa then aligns them as
-/// two unpaired reads. The pair's unmapped template is split the same way so each
-/// half zips with its own read's alignment. Errors if the template carries records
-/// beyond its two primaries (secondaries make the split ambiguous — out of
-/// contract for valid unmapped input).
+/// two unpaired reads. Both backends split the pair's unmapped template the same
+/// way so each half zips with its own read's alignment. Errors if the template
+/// carries records beyond its two primaries (secondaries make the split ambiguous —
+/// out of contract for the valid unmapped input the parity claim covers).
 ///
 /// Each half's record has its pairing bits ([`SPLIT_HALF_CLEARED_FLAGS`]) cleared,
 /// so it is an unpaired read like the aligner's record for it. The zipper merge
@@ -420,15 +470,16 @@ pub(crate) fn split_pair_into_singles(template: Template) -> io::Result<(Templat
 
 /// Keep mimalloc from returning freed pages to the OS, unless the user set the
 /// purge delay. The align stage frees and reallocates large per-batch buffers
-/// (FASTQ out, BAM in, merge), and mimalloc's default purge (decommit after 1 s)
-/// turns that reuse into hundreds of thousands of page faults.
+/// on every pool thread, and mimalloc's default purge (decommit after 1 s)
+/// turns that reuse into millions of page faults.
 ///
 /// The setting is process-wide and is never restored, so it covers every stage
 /// of the `runall` process, not just align: fgumi-sort's `force_mi_collect()`
 /// stops returning memory to the OS too. Measured end to end (extract through
 /// simplex consensus, 1M pairs, 32 threads) it is still faster with it,
-/// including when sort spills: wall -4%, CPU -2.5%, page faults ~700k to under
-/// 40k, for ~0.4 GB more peak RSS. Set `MIMALLOC_PURGE_DELAY` to opt out.
+/// including when sort spills: wall -3 to -4%, CPU -2 to -3%, page faults
+/// ~700k to under 40k, for up to ~2 GB (~12%) more peak RSS in-process and
+/// ~0.4 GB on the subprocess route. Set `MIMALLOC_PURGE_DELAY` to opt out.
 pub(crate) fn retain_freed_memory_unless_user_set() {
     if !crate::aligner::user_set_mimalloc_purge() {
         fgumi_sort::retain_freed_memory();

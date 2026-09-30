@@ -39,7 +39,7 @@ cargo bench
 - `compare` - Enable compare subcommand (developer tools)
 - `simulate` - Enable simulate command for test data generation
 - `profile-adjacency` - Enable profiling output for adjacency UMI assigner
-- `aligner-bwa-mem3` - Opt-in in-process bwa-mem3 aligner backend for `runall` (cohort math, engine abstraction; the backend itself is still being wired in); off by default, and compiling it requires a C++17 toolchain (see `Cargo.toml`'s `bwa-mem3-rs` dependency)
+- `aligner-bwa-mem3` - Opt-in in-process bwa-mem3 aligner for `runall` (`--aligner::preset bwa-mem3-inproc`); off by default, and compiling it requires a C++17 toolchain (see `Cargo.toml`'s `bwa-mem3-rs` dependency)
 
 Build with features: `cargo build --release --features compare,simulate`
 
@@ -163,13 +163,13 @@ The following external FFI calls are approved because they back core infrastruct
   `mi_option_get`) are isolated to a single `#[allow(unsafe_code)]` sub-module.
   mimalloc synchronizes these calls internally, so they are safe to invoke
   concurrently. `retain_freed_memory` sets mimalloc's purge delay to -1 (never
-  return freed pages to the OS); the align stage calls it at wiring (via
+  return freed pages to the OS); both align backends call it at wiring (via
   `retain_freed_memory_unless_user_set`) unless `MIMALLOC_PURGE_DELAY` is set,
-  because its per-batch buffer churn otherwise costs hundreds of thousands of page
-  faults. The setting is process-wide and never restored, so it also turns
-  fgumi-sort's `force_mi_collect()` into a no-op for later `runall` stages; measured
-  end to end (extract through consensus, 1M pairs, 32 threads) it is still ~4%
-  faster, sort spills included, for ~0.4 GB more peak RSS.
+  because their per-batch buffer churn otherwise costs millions of page faults. The
+  setting is process-wide and never restored, so it also turns fgumi-sort's
+  `force_mi_collect()` into a no-op for later `runall` stages; measured end to end
+  (extract through consensus, 1M pairs, 32 threads) it is still 3-4% faster, sort
+  spills included, for up to ~2 GB more peak RSS in-process (~0.4 GB subprocess).
   The subprocess route also passes `MIMALLOC_PURGE_DELAY=-1` to the aligner child
   through its environment, which needs no FFI. A safe alternative does not exist:
   mimalloc reads its environment only at process start, and `libmimalloc-sys`

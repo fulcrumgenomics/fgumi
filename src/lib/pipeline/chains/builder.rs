@@ -579,12 +579,16 @@ pub struct ChainBuilder<'a> {
     /// drain-first even though its group is Intermediate, because the flag is
     /// only ever set, never cleared.
     use_drain_first_scheduler: bool,
+    /// An align backend's input-refill hint: when drain-first is chosen
+    /// automatically, the chain uses `RefillDrainScheduler` on it instead.
+    align_refill: Option<crate::pipeline::steps::align::RefillHint>,
 
     /// `HeaderHandle` stashed by [`Self::add_align`] for consumption by
     /// [`Self::add_sink`].
     ///
-    /// The align backend resolves the final merged header at runtime (after
-    /// the aligner emits its own `@PG`/`@RG`/`@CO` lines). The downstream
+    /// The align backend resolves the final merged header (the subprocess
+    /// backend at runtime, after the aligner emits its own `@PG`/`@RG`/`@CO`
+    /// lines; the in-process backend at wire time). The downstream
     /// [`WriteBgzfFile`] must therefore be constructed with
     /// [`WriteBgzfFile::new_with_handle`], which blocks until the handle
     /// is resolved before writing the BAM header bytes.
@@ -782,6 +786,7 @@ impl<'a> ChainBuilder<'a> {
             paired_tail: None,
             override_pipeline_threads: None,
             use_drain_first_scheduler: false,
+            align_refill: None,
             pending_header_handle: None,
             deferred_outputs: Vec::new(),
             pending_header_transform: None,
@@ -2381,11 +2386,29 @@ impl<'a> ChainBuilder<'a> {
         {
             log::warn!("{warning}");
         }
-        if resolve_use_drain_first(pool_override, self.use_drain_first_scheduler) {
-            config = config.with_scheduler(std::sync::Arc::new(
-                crate::pipeline::core::runtime::DrainFirstScheduler,
-            ));
-        }
+        // An explicit `--pool-scheduler drain-first` keeps the pure policy for
+        // A/B runs; the automatic choice refines it with the backend's refill
+        // signal when there is one.
+        let choice = choose_pool_scheduler(
+            pool_override,
+            self.use_drain_first_scheduler,
+            self.align_refill.is_some(),
+        );
+        config = match (choice, self.align_refill.clone()) {
+            (PoolSchedulerChoice::RefillDrain, Some(hint)) => config.with_scheduler(
+                std::sync::Arc::new(crate::pipeline::core::runtime::RefillDrainScheduler::new(
+                    hint.signal,
+                    hint.feed.0,
+                    hint.feed.1,
+                    hint.cap_bytes,
+                )),
+            ),
+            (PoolSchedulerChoice::DrainFirst | PoolSchedulerChoice::RefillDrain, _) => config
+                .with_scheduler(std::sync::Arc::new(
+                    crate::pipeline::core::runtime::DrainFirstScheduler,
+                )),
+            (PoolSchedulerChoice::ChainOrder, _) => config,
+        };
         // DIAGNOSTIC: the stats `Arc` already exists whenever the deadlock
         // monitor is on (default), so allow `FGUMI_PIPELINE_STATS=1` to dump the
         // per-step timing report even on paths (e.g. standalone `fgumi sort`)
@@ -2843,7 +2866,9 @@ impl<'a> ChainBuilder<'a> {
     ///     ↓
     /// <AlignBackend::wire steps> ← appended here: `SubprocessAlignStep`
     ///     ↓                          (spawns the aligner subprocess) followed by
-    ///     ↓                          the shared `MergeAlignedStep`
+    ///     ↓                          the shared `MergeAlignedStep`, or the
+    ///     ↓                          in-process bwa-mem3 steps (which merge in
+    ///     ↓                          pair/emit)
     /// (Terminal) SerializeBamRecords  ← appended only when Terminal
     ///     ↓
     /// (next stage consumes BamTemplateBatch — Intermediate only)
@@ -2863,9 +2888,10 @@ impl<'a> ChainBuilder<'a> {
     /// ## Header handling
     ///
     /// The aligner contributes `@PG`/`@RG`/`@CO` lines to the output
-    /// BAM header at runtime (not at chain-construction time). The align
-    /// backend resolves a [`HeaderHandle`] with the merged header once the
-    /// aligner emits its SAM/BAM header. The downstream
+    /// BAM header. The align backend resolves a [`HeaderHandle`] with the
+    /// merged header — the subprocess backend at runtime, once the aligner
+    /// emits its SAM/BAM header; the in-process backend at wire time, from a
+    /// header synthesized from the index contigs. The downstream
     /// [`WriteBgzfFile`] (added by [`Self::add_sink`]) blocks on the handle
     /// before writing any record bytes.
     ///
@@ -2886,14 +2912,18 @@ impl<'a> ChainBuilder<'a> {
     /// `fold_align_wired_scheduling` raises `override_pipeline_threads` to
     /// `num_threads.max(min_workers)` so `build()` forwards the correct value
     /// to `PipelineConfig::threads`. The subprocess backend needs 4 (it spawns
-    /// two daemon threads plus the aligner subprocess).
+    /// two daemon threads plus the aligner subprocess); the in-process
+    /// bwa-mem3 backend needs 1, which keeps `--threads 1` eligible for the
+    /// fused single-thread runtime.
     ///
     /// ## Errors
     ///
     /// Returns errors if:
     /// - align options are missing from the spec bag,
     /// - the reference `.dict` file cannot be found,
-    /// - `SubprocessAlignStep::new` fails to spawn the aligner subprocess.
+    /// - `SubprocessAlignStep::new` fails to spawn the aligner subprocess,
+    /// - the in-process backend fails to load the bwa-mem3 index, or its
+    ///   synthesized `@SQ` table disagrees with the reference dict.
     ///
     /// [`HeaderHandle`]: crate::pipeline::core::header::HeaderHandle
     /// [`WriteBgzfFile`]: crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile
@@ -2995,14 +3025,16 @@ impl<'a> ChainBuilder<'a> {
             self.append_queryname_grouper(tail)
         };
 
-        // Construct the align backend `resolve` selected behind the
+        // Construct the align backend `resolve` selected (subprocess, or —
+        // behind `aligner-bwa-mem3` — in-process bwa-mem3) behind the
         // `AlignBackend` trait, wire its steps after the grouped input, and
         // obtain the merged `BamTemplateBatch` tail plus the scheduling facts to
         // fold in.
         let backend: Box<dyn AlignBackend> = backend_for(resolved);
         info!("AlignAndMerge backend: {}", backend.describe());
         // The zipper merge every aligned template goes through, run by the
-        // backend (the subprocess backend's shared `Parallel` merge step).
+        // backend (the subprocess backend's shared `Parallel` merge step, or the
+        // in-process pair/emit step).
         let ZipperMergeRules { tag_info, skip_tc_tags, reference } =
             self.fused_merge_rules(&align_opts.reference)?;
         let merge_config = std::sync::Arc::new(MergeConfig {
@@ -3017,6 +3049,7 @@ impl<'a> ChainBuilder<'a> {
             partial_output_header: std::sync::Arc::clone(&partial_header),
             header_handle: header_handle.clone(),
             per_step_byte_limit: self.tuning.per_step_byte_limit,
+            num_threads,
             merge: merge_config,
         };
         let wired = backend.wire(&self.pipeline, align_input_tail, &wiring_ctx)?;
@@ -3048,8 +3081,12 @@ impl<'a> ChainBuilder<'a> {
 
         // Raise the pool floor to the backend's `min_workers` (the subprocess
         // backend needs 4: it spawns two daemon threads + the aligner subprocess,
-        // so 4 framework workers are the floor for steady-state progress) — and
-        // fold its scheduler preference into the automatic decision. Only ever set the flag true (mirrors the
+        // so 4 framework workers are the floor for steady-state progress; the
+        // in-process bwa-mem3 backend needs only 1, which is what keeps
+        // `--threads 1` eligible for the fused/inline path —
+        // `crate::pipeline::core::runtime::fused::should_fuse_single_thread`'s
+        // `n_threads == 1` precondition) — and fold its scheduler preference
+        // into the automatic decision. Only ever set the flag true (mirrors the
         // grouping stages); the subprocess backend leaves it false, preserving
         // today's behavior. See `fold_align_wired_scheduling`'s doc comment for
         // the full rationale (it is unit-tested there without needing a real
@@ -3061,6 +3098,9 @@ impl<'a> ChainBuilder<'a> {
             &mut self.override_pipeline_threads,
             &mut self.use_drain_first_scheduler,
         );
+        if wired.refill.is_some() {
+            self.align_refill = wired.refill;
+        }
 
         let timer = OperationTimer::new("AlignAndMerge");
         // Success-only: the hook logs "pipeline completed successfully" and
@@ -6401,11 +6441,16 @@ fn grouping_stage_wants_drain_first(stage: Stage, position: StagePosition) -> bo
 /// The subprocess backend's floor of 4 forces `n_threads >= 4` for any align
 /// chain, which forecloses `crate::pipeline::core::runtime::fused::
 /// should_fuse_single_thread`'s `n_threads == 1` precondition regardless of the
-/// user's `--threads` request; a backend with a floor of 1 would not.
+/// user's `--threads` request. The in-process bwa-mem3 backend's floor of 1
+/// does not, which is what keeps `--threads 1` eligible for the fused/inline
+/// path (the chain still needs `is_fusible_chain` to hold over its concrete
+/// steps to actually fuse; that is exercised with a real backend by the
+/// env-gated `--threads 1` cases in `tests/align_inproc_parity.rs`, not here).
 ///
 /// Extracted as a free function, taking primitives rather than `&AlignWired`,
-/// so the fold is unit-testable without constructing a real align backend
-/// (`AlignBackend::wire()` needs a spawnable aligner subprocess).
+/// so the fold is unit-testable without constructing a real align backend:
+/// `AlignBackend::wire()` needs either a spawnable aligner subprocess or, for
+/// the in-process backend, a loaded bwa-mem3 index.
 fn fold_align_wired_scheduling(
     num_threads: usize,
     wired_min_workers: usize,
@@ -6438,6 +6483,38 @@ fn resolve_use_drain_first(
         PoolScheduler::Auto => auto_wants_drain_first,
         PoolScheduler::DrainFirst => true,
         PoolScheduler::ChainOrder => false,
+    }
+}
+
+/// The pool scheduler `build` installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolSchedulerChoice {
+    /// The runtime's default upstream-first dispatch.
+    ChainOrder,
+    /// Pure downstream-first dispatch (`DrainFirstScheduler`).
+    DrainFirst,
+    /// Downstream-first dispatch refined by the align backend's refill signal
+    /// (`RefillDrainScheduler`).
+    RefillDrain,
+}
+
+/// Select the pool scheduler from the `--pool-scheduler` override, the
+/// accumulated automatic drain-first choice, and whether an align backend
+/// supplied a refill hint. The refill-aware scheduler is used only when
+/// drain-first was chosen *automatically* (`Auto`); an explicit
+/// `--pool-scheduler drain-first` keeps the pure `DrainFirstScheduler` so A/B
+/// runs compare the plain policy. Pure so it can be unit tested.
+fn choose_pool_scheduler(
+    pool_override: crate::commands::common::PoolScheduler,
+    auto_wants_drain_first: bool,
+    has_align_refill: bool,
+) -> PoolSchedulerChoice {
+    if !resolve_use_drain_first(pool_override, auto_wants_drain_first) {
+        PoolSchedulerChoice::ChainOrder
+    } else if has_align_refill && pool_override == crate::commands::common::PoolScheduler::Auto {
+        PoolSchedulerChoice::RefillDrain
+    } else {
+        PoolSchedulerChoice::DrainFirst
     }
 }
 
@@ -6538,6 +6615,7 @@ mod tests {
             paired_tail: None,
             override_pipeline_threads: None,
             use_drain_first_scheduler: false,
+            align_refill: None,
             pending_header_handle: None,
             deferred_outputs: Vec::new(),
             pending_header_transform: None,
@@ -6753,15 +6831,27 @@ mod tests {
         );
     }
 
-    /// Pin `fold_align_wired_scheduling`. The `subprocess_*` cases read
-    /// `SubprocessBackend::MIN_WORKERS` / `PREFERS_DRAIN_FIRST` directly, so a
-    /// change to those constants is seen here; the `floor_1_*` cases cover a
-    /// backend reporting a floor of 1 that prefers drain-first, which leaves the
-    /// resolved floor at the requested thread count. None needs a real aligner
-    /// subprocess (`AlignBackend::wire()` does, so it cannot run in this unit
-    /// test).
+    /// Pin `fold_align_wired_scheduling` against the values the two align
+    /// backends report (`AlignWired::min_workers`/`prefers_drain_first`). The
+    /// `subprocess_*` cases read `SubprocessBackend::MIN_WORKERS` /
+    /// `PREFERS_DRAIN_FIRST` directly, so a change to those constants is seen
+    /// here. The `in_process_*` cases use the literals `1`/`true`, because
+    /// `InProcessBwaMem3Backend` does not exist in the default feature-off build
+    /// this module compiles in; its constants are pinned to those same values,
+    /// feature-gated, in `inproc::tests`. Neither needs a real aligner
+    /// subprocess or a loaded bwa-mem3 index (`AlignBackend::wire()` needs one
+    /// or the other, so it cannot run in this unit test).
+    ///
+    /// The `in_process_*` cases double as the `--threads 1` fusion smoke: a
+    /// `min_workers` of 1 leaves the resolved floor at 1 (satisfying
+    /// `should_fuse_single_thread`'s `n_threads == 1` precondition,
+    /// `crate::pipeline::core::runtime::fused`), while `subprocess_*` shows its
+    /// floor of 4 always forecloses that path regardless of the requested thread
+    /// count. Actually building the fused chain end-to-end needs a real backend
+    /// (see above), so that is exercised by the env-gated real-index tests
+    /// instead, not here.
     #[rstest::rstest]
-    #[case::floor_1_at_requested_threads_1_keeps_the_floor_at_1(
+    #[case::in_process_at_requested_threads_1_keeps_the_floor_at_1(
         1,
         1,
         true,
@@ -6770,7 +6860,7 @@ mod tests {
         Some(1),
         true
     )]
-    #[case::floor_1_at_requested_threads_8_raises_the_floor_to_8(
+    #[case::in_process_at_requested_threads_8_raises_the_floor_to_8(
         8,
         1,
         true,
@@ -6858,6 +6948,60 @@ mod tests {
             resolve_use_drain_first(pool_override, auto_wants_drain_first),
             expected,
             "{pool_override:?} over auto={auto_wants_drain_first}: resolution mismatch"
+        );
+    }
+
+    /// Pin `choose_pool_scheduler`: an align refill hint upgrades an
+    /// *automatic* drain-first choice to `RefillDrain`, while an explicit
+    /// `--pool-scheduler drain-first` keeps the pure `DrainFirst` policy, and a
+    /// hint never overrides an upstream-first (`ChainOrder`) resolution.
+    #[rstest::rstest]
+    #[case::auto_with_refill_picks_refill_drain(
+        PoolScheduler::Auto,
+        true,
+        true,
+        PoolSchedulerChoice::RefillDrain
+    )]
+    #[case::auto_without_refill_picks_drain_first(
+        PoolScheduler::Auto,
+        true,
+        false,
+        PoolSchedulerChoice::DrainFirst
+    )]
+    #[case::explicit_drain_first_ignores_refill(
+        PoolScheduler::DrainFirst,
+        true,
+        true,
+        PoolSchedulerChoice::DrainFirst
+    )]
+    #[case::explicit_drain_first_over_auto_off_ignores_refill(
+        PoolScheduler::DrainFirst,
+        false,
+        true,
+        PoolSchedulerChoice::DrainFirst
+    )]
+    #[case::auto_off_with_refill_stays_chain_order(
+        PoolScheduler::Auto,
+        false,
+        true,
+        PoolSchedulerChoice::ChainOrder
+    )]
+    #[case::explicit_chain_order_ignores_refill(
+        PoolScheduler::ChainOrder,
+        true,
+        true,
+        PoolSchedulerChoice::ChainOrder
+    )]
+    fn choose_pool_scheduler_matrix(
+        #[case] pool_override: PoolScheduler,
+        #[case] auto_wants_drain_first: bool,
+        #[case] has_align_refill: bool,
+        #[case] expected: PoolSchedulerChoice,
+    ) {
+        assert_eq!(
+            choose_pool_scheduler(pool_override, auto_wants_drain_first, has_align_refill),
+            expected,
+            "{pool_override:?} over auto={auto_wants_drain_first}, refill={has_align_refill}"
         );
     }
 

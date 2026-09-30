@@ -187,7 +187,7 @@ nix = { workspace = true }
 # `pipeline::steps::align`. 0.3.0 is the first
 # release with the three-phase (`seed_extend` / `infer_cohort` / `pair_emit`) API.
 [target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
-bwa-mem3-rs = { version = "0.3.0", optional = true }
+bwa-mem3-rs = { version = "0.3.1", optional = true }
 
 [features]
 default = ["consensus"]
@@ -218,9 +218,9 @@ simulate = ["consensus"]
 profile-adjacency = []
 # Enable slow stress tests for concurrency testing
 stress-tests = []
-# In-process bwa-mem3 aligner backend for `fgumi runall` (its steps and the
-# `bwa-mem3-inproc` preset build on this). Off by default: it pulls the
-# optional `bwa-mem3-rs` dependency, which compiles the vendored bwa-mem3 C++ (C++17 toolchain
+# In-process bwa-mem3 aligner for `fgumi runall` (`--aligner::preset
+# bwa-mem3-inproc`). Off by default: it pulls the optional `bwa-mem3-rs`
+# dependency, which compiles the vendored bwa-mem3 C++ (C++17 toolchain
 # required) and links it statically. Default builds stay pure Rust with no C
 # toolchain. The in-process backend code is `#[cfg(feature = "aligner-bwa-mem3")]`
 # confined to `pipeline::steps::align::inproc`.

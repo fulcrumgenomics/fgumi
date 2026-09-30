@@ -23,8 +23,8 @@ use crate::pipeline::chains::FinalizeHook;
 /// `timer.log_completion` so the per-stage wall-time line appears in
 /// the log.
 pub(crate) struct AlignFinalizeHook {
-    /// Counter atomically incremented by `merge::merge_zipper_batch` as
-    /// merged `BamTemplateBatch`es go downstream.
+    /// Counter atomically incremented by `merge::merge_zipper_batch` (for
+    /// both align backends) as merged `BamTemplateBatch`es go downstream.
     pub(crate) records_emitted: Arc<AtomicU64>,
     pub(crate) timer: OperationTimer,
 }

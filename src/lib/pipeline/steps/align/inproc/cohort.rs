@@ -89,7 +89,7 @@ impl CohortCutter {
     /// so the next `push_read` opens a fresh cohort.
     ///
     /// This per-read granularity is what lets the caller
-    /// (`AlignPrepareStep`) observe a
+    /// ([`AlignPrepareStep`](super::prepare::AlignPrepareStep)) observe a
     /// **mid-pair cut**: feeding a pair's two reads individually, a `true` after
     /// the *first* read means the cohort boundary falls between the pair's reads,
     /// and bwa then classifies them as two separate singles in adjacent cohorts.
@@ -260,7 +260,7 @@ impl HeapSize for AlignWork {
 /// [`AlignWork`] after seeding + SE-extension: adds the sub-batch's share of its
 /// cohort's resident state ([`AlignEngine::Ranges`]; the reads and alignment
 /// regions themselves stay in the cohort). Produced by
-/// `AlignSeedExtendStep` and consumed
+/// [`AlignSeedExtendStep`](super::seed_extend::AlignSeedExtendStep) and consumed
 /// by `CohortPeStatStep`.
 ///
 /// Generic over the engine so the parallel seed/extend step and its tests share
@@ -286,7 +286,7 @@ impl<E: AlignEngine> HeapSize for ExtendedWork<E> {
 /// A sub-batch past the cohort barrier, ready to pair + emit: carries the
 /// cohort `pestat` (`None` only when the sub-batch has no pairs) and the
 /// computed id bases. Produced by
-/// `CohortPeStatStep`; consumed by
+/// [`CohortPeStatStep`](super::pestat::CohortPeStatStep); consumed by
 /// `AlignPairEmitStep`.
 ///
 /// Generic over the engine for the same reason as [`ExtendedWork`]: production
