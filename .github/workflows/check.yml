@@ -61,6 +61,76 @@ jobs:
       - name: Clippy check
         run: cargo ci-lint
 
+  # Builds and tests the optional in-process bwa-mem3 aligner backend (feature
+  # `aligner-bwa-mem3`, off by default). This is the one feature that pulls a
+  # C++ toolchain into the build (the vendored bwa-mem3 kernels via
+  # `bwa-mem3-sys`'s `cc`-driven build.rs), so it gets its own job rather than
+  # folding into `test`/`lint`: those two stay C-toolchain-free, matching every
+  # other job's fast/portable assumption.
+  #
+  # Matrix covers both architectures the feature compiles on (the dependency is
+  # gated in Cargo.toml to `x86_64`/`aarch64` — see the `bwa-mem3-rs` entry).
+  # `ubuntu-24.04-arm` is a real (not emulated) arm64 GitHub-hosted runner, so
+  # this exercises the NEON build path, not just the x86_64 SIMD-tier ladder.
+  #
+  # Toolchain deps are deliberately minimal: `build-essential` (a C++17-capable
+  # g++) and `zlib1g-dev` (the crate links `z`) are everything `bwa-mem3-sys`'s
+  # build.rs actually needs for a normal build — mirrors fg-labs/bwa-mem3-rs's
+  # own `build`/`lint` jobs. Two toolchain pieces this job deliberately does
+  # NOT install:
+  #   - `libclang-dev`: bindgen only runs under the sys crate's own
+  #     `regenerate-bindings` feature (gated in its build.rs), which this job
+  #     never enables — the committed bindings are used as-is.
+  #   - clang-19 / libomp: bwa-mem3's Makefile compiler floor (clang >= 19 /
+  #     gcc >= 15) applies to building the vendored bwa-mem3 CLI *from
+  #     upstream* (fg-labs/bwa-mem3-rs's own `e2e` job does that, to diff
+  #     against this crate's output byte-for-byte); `cc` enforces no such floor
+  #     on the sys crate itself, and this job never builds the reference CLI
+  #     binary.
+  aligner-ffi:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build deps (C++17 toolchain for bwa-mem3-sys)
+        run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Install nextest
+        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.85.12
+        with:
+          tool: nextest
+      - name: Unit tests (aligner-bwa-mem3)
+        run: cargo nextest run --features aligner-bwa-mem3 -p fgumi --locked
+      - name: Clippy (aligner-bwa-mem3, pedantic)
+        # Lints compare,simulate,profile-adjacency,aligner-bwa-mem3 together:
+        # the first three are already part of every default dev/test build's
+        # assumed surface (`cargo ci-lint` compiles them), so linting them
+        # together with the aligner feature catches any interaction between the
+        # two rather than linting the aligner feature in isolation.
+        run: |
+          cargo clippy --workspace --all-targets \
+            --features compare,simulate,profile-adjacency,aligner-bwa-mem3 --locked \
+            -- -D warnings -W clippy::pedantic
+      - name: Rustdoc (aligner-bwa-mem3, -D warnings)
+        # `cargo ci-doc` (the `docs` job) does not enable `aligner-bwa-mem3`, so
+        # the feature-gated in-process backend's docs are rendered only here.
+        # Clippy does not report broken intra-doc links; rustdoc does.
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps -p fgumi --document-private-items --features aligner-bwa-mem3 --locked
+
   # `merge_slots.rs` swaps `std::sync` for `loom::sync` under `--cfg loom`, and
   # `tests/loom_merge_slots.rs` is `#![cfg(loom)]`. Neither is built by any other
   # job, so without this one a broken model — or a `cfg(loom)` build that stopped

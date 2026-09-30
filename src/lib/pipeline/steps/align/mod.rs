@@ -21,6 +21,15 @@
 //! mid-pair split helper, and the header helpers (`validate_sq_consistency`,
 //! `merge_aligner_header`).
 
+#[cfg(feature = "aligner-bwa-mem3")]
+pub(crate) mod inproc;
+// `bwa-mem3-rs` is a target-gated dependency, so on any other architecture the
+// feature would enable `inproc` without the crate it links; reject it clearly.
+#[cfg(all(
+    feature = "aligner-bwa-mem3",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+compile_error!("feature `aligner-bwa-mem3` is supported only on x86_64 and aarch64");
 pub(crate) mod merge;
 pub(crate) mod subprocess;
 
