@@ -926,6 +926,148 @@ pub fn join_writer_result<T, E: std::fmt::Display>(
     writer_result
 }
 
+/// Converts a read's bases and qualities from read (sequencing) orientation to the reference
+/// orientation BAM stores: reverse-complemented and reversed for a reverse-strand record,
+/// unchanged (borrowed) otherwise.
+pub(super) fn to_reference_orientation<'a>(
+    seq: &'a [u8],
+    quals: &'a [u8],
+    is_reverse: bool,
+) -> (std::borrow::Cow<'a, [u8]>, std::borrow::Cow<'a, [u8]>) {
+    use std::borrow::Cow;
+    if is_reverse {
+        let quals: Vec<u8> = quals.iter().rev().copied().collect();
+        (Cow::Owned(crate::dna::reverse_complement(seq)), Cow::Owned(quals))
+    } else {
+        (Cow::Borrowed(seq), Cow::Borrowed(quals))
+    }
+}
+
+/// BAM-encoded CIGAR of a simulated mapped read of `read_len` bases whose first `aligned_len`
+/// bases (in read orientation) come from the template and the rest is read-through padding,
+/// as when the insert is shorter than the read. The padding sits at the read's 3' end, which
+/// is the right end of a forward record and the left end of a reverse one, and is soft-clipped
+/// so the aligned bases match the reference at the record's position.
+pub(super) fn read_through_cigar(
+    read_len: usize,
+    aligned_len: usize,
+    is_reverse: bool,
+) -> Vec<u32> {
+    // BAM CIGAR encoding: (length << 4) | op_code; 0 = M (alignment match), 4 = S (soft clip).
+    let op =
+        |len: usize, code: u32| (u32::try_from(len).expect("read length fits u32") << 4) | code;
+    let aligned_len = aligned_len.min(read_len);
+    let clipped = read_len - aligned_len;
+    match (clipped, is_reverse) {
+        (0, _) => vec![op(aligned_len, 0)],
+        (_, false) => vec![op(aligned_len, 0), op(clipped, 4)],
+        (_, true) => vec![op(clipped, 4), op(aligned_len, 0)],
+    }
+}
+
+/// Renders BAM-encoded CIGAR ops (as produced by [`read_through_cigar`]) as a SAM CIGAR string.
+pub(super) fn cigar_string(ops: &[u32]) -> String {
+    use std::fmt::Write;
+    ops.iter().fold(String::new(), |mut cigar, op| {
+        let code = if op & 0xF == 4 { 'S' } else { 'M' };
+        write!(cigar, "{}{code}", op >> 4).expect("write to String is infallible");
+        cigar
+    })
+}
+
+/// Test fixtures shared by the `simulate` generators.
+#[cfg(test)]
+pub(super) mod test_support {
+    use std::io::Write;
+
+    /// A 2 kb single-contig (`chr1`) reference whose reverse complement differs from itself,
+    /// so a reverse-strand record carrying reverse-complemented SEQ cannot match it by accident
+    /// (unlike `ACGT` repeats, which are their own reverse complement). Returns the FASTA and
+    /// the contig bases.
+    pub(in crate::commands::simulate) fn asymmetric_reference() -> (tempfile::NamedTempFile, Vec<u8>)
+    {
+        let mut state: u32 = 0x1234_5678;
+        let bases: Vec<u8> = (0..2000)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                b"ACGT"[(state >> 30) as usize]
+            })
+            .collect();
+        let mut fasta = tempfile::NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&bases).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+        (fasta, bases)
+    }
+
+    /// Asserts each mate's `MC` tag names the other mate's actual CIGAR.
+    pub(in crate::commands::simulate) fn assert_mate_cigars_agree(
+        r1: &noodles::sam::alignment::RecordBuf,
+        r2: &noodles::sam::alignment::RecordBuf,
+    ) {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        let cigar = |r: &noodles::sam::alignment::RecordBuf| {
+            r.cigar().as_ref().iter().fold(String::new(), |mut cigar, op| {
+                let code = match op.kind() {
+                    Kind::Match => 'M',
+                    Kind::SoftClip => 'S',
+                    kind => panic!("unexpected CIGAR op {kind:?} in a simulated record"),
+                };
+                cigar.push_str(&op.len().to_string());
+                cigar.push(code);
+                cigar
+            })
+        };
+        let mc = |r: &noodles::sam::alignment::RecordBuf| match r.data().get(&Tag::MATE_CIGAR) {
+            Some(Value::String(s)) => String::from_utf8_lossy(s.as_ref()).into_owned(),
+            other => panic!("MC must be a string, got {other:?}"),
+        };
+        assert_eq!(mc(r1), cigar(r2), "R1's MC must be R2's CIGAR");
+        assert_eq!(mc(r2), cigar(r1), "R2's MC must be R1's CIGAR");
+    }
+
+    /// Asserts that a mapped simulated record's SEQ equals the reference over its aligned
+    /// (`M`) bases, whatever its strand; soft-clipped bases (read-through padding) are skipped.
+    /// Returns `(is_reverse, soft_clipped_bases)`.
+    pub(in crate::commands::simulate) fn assert_seq_matches_reference(
+        record: &noodles::sam::alignment::RecordBuf,
+        reference: &[u8],
+    ) -> (bool, usize) {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
+        let mut ref_pos = usize::from(record.alignment_start().expect("mapped record")) - 1;
+        let mut read_pos = 0;
+        let mut clipped = 0;
+        let (mut aligned_seq, mut aligned_ref) = (Vec::new(), Vec::new());
+        for op in record.cigar().as_ref() {
+            match op.kind() {
+                Kind::Match => {
+                    aligned_seq.extend_from_slice(&seq[read_pos..read_pos + op.len()]);
+                    aligned_ref.extend_from_slice(&reference[ref_pos..ref_pos + op.len()]);
+                    read_pos += op.len();
+                    ref_pos += op.len();
+                }
+                Kind::SoftClip => {
+                    read_pos += op.len();
+                    clipped += op.len();
+                }
+                kind => panic!("unexpected CIGAR op {kind:?} in a simulated record"),
+            }
+        }
+        assert_eq!(read_pos, seq.len(), "CIGAR must cover SEQ");
+        assert_eq!(
+            String::from_utf8_lossy(&aligned_seq),
+            String::from_utf8_lossy(&aligned_ref),
+            "aligned SEQ must be in reference orientation (reverse = {})",
+            record.flags().is_reverse_complemented()
+        );
+        (record.flags().is_reverse_complemented(), clipped)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

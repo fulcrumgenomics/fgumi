@@ -683,6 +683,17 @@ fn build_consensus_record(
     let chrom_idx_i32 = i32::try_from(chrom_idx).expect("chrom_idx fits i32");
     let local_pos_i32 = i32::try_from(local_pos).expect("local_pos fits i32");
 
+    // `seq`/`quals` are in read orientation; BAM stores SEQ/QUAL of a reverse-strand record in
+    // reference orientation.
+    let (stored_seq, stored_quals) =
+        super::common::to_reference_orientation(seq, quals, is_reverse);
+    // Per-base arrays are stored co-oriented with SEQ, as a re-aligned consensus carries them
+    // after `zipper --tags-to-reverse` and `fgumi filter` reads them by default. MM/ML index the
+    // sequenced read, so they stay in read orientation.
+    let oriented = |values: &[i16]| -> Vec<i16> {
+        if is_reverse { values.iter().rev().copied().collect() } else { values.to_vec() }
+    };
+
     let mut b = SamBuilder::new();
     b.read_name(name.as_bytes())
         .flags(flags)
@@ -694,8 +705,8 @@ fn build_consensus_record(
         .mate_pos(local_pos_i32) // R1 and R2 at same position
         .template_length(0)
         .cigar_ops(&cigar_ops)
-        .sequence(seq)
-        .qualities(quals);
+        .sequence(&stored_seq)
+        .qualities(&stored_quals);
 
     // `fgumi filter` masks bases using the PER-BASE depth/error arrays and reads
     // the read-level error tags (cE / aE / bE) as FLOAT rates — exactly what
@@ -771,17 +782,18 @@ fn build_consensus_record(
             .add_int_tag(SamTag::BM, bm)
             .add_float_tag(SamTag::AE, error_rate(&ae_bases, &ad_bases))
             .add_float_tag(SamTag::BE, error_rate(&be_bases, &bd_bases));
-        b.add_array_i16(SamTag::AD_BASES, &ad_bases)
-            .add_array_i16(SamTag::AE_BASES, &ae_bases)
-            .add_array_i16(SamTag::BD_BASES, &bd_bases)
-            .add_array_i16(SamTag::BE_BASES, &be_bases);
+        b.add_array_i16(SamTag::AD_BASES, &oriented(&ad_bases))
+            .add_array_i16(SamTag::AE_BASES, &oriented(&ae_bases))
+            .add_array_i16(SamTag::BD_BASES, &oriented(&bd_bases))
+            .add_array_i16(SamTag::BE_BASES, &oriented(&be_bases));
     } else {
         // Simplex: combined summary + the per-base arrays `mask_bases` reads.
         let (cd_bases, ce_bases) = per_base_arrays(cd, cm, ce);
         b.add_int_tag(SamTag::CD, cd)
             .add_int_tag(SamTag::CM, cm)
             .add_float_tag(SamTag::CE, error_rate(&ce_bases, &cd_bases));
-        b.add_array_i16(SamTag::CD_BASES, &cd_bases).add_array_i16(SamTag::CE_BASES, &ce_bases);
+        b.add_array_i16(SamTag::CD_BASES, &oriented(&cd_bases))
+            .add_array_i16(SamTag::CE_BASES, &oriented(&ce_bases));
     }
 
     // Add methylation tags if enabled.
@@ -789,7 +801,7 @@ fn build_consensus_record(
         // cu/ct tags (unconverted/converted counts per position).
         let cu: Vec<i16> = meth.annotation.unconverted_counts();
         let ct: Vec<i16> = meth.annotation.converted_counts();
-        b.add_array_i16(SamTag::CU, &cu).add_array_i16(SamTag::CT, &ct);
+        b.add_array_i16(SamTag::CU, &oriented(&cu)).add_array_i16(SamTag::CT, &oriented(&ct));
 
         // MM/ML tags (SAM spec methylation tags).
         if let Some((mm, ml)) =
@@ -804,10 +816,10 @@ fn build_consensus_record(
             let at: Vec<i16> = ab.converted_counts();
             let bu: Vec<i16> = ba.unconverted_counts();
             let bt: Vec<i16> = ba.converted_counts();
-            b.add_array_i16(SamTag::AU, &au)
-                .add_array_i16(SamTag::AT, &at)
-                .add_array_i16(SamTag::BU, &bu)
-                .add_array_i16(SamTag::BT, &bt);
+            b.add_array_i16(SamTag::AU, &oriented(&au))
+                .add_array_i16(SamTag::AT, &oriented(&at))
+                .add_array_i16(SamTag::BU, &oriented(&bu))
+                .add_array_i16(SamTag::BT, &oriented(&bt));
 
             // Per-strand MM tags (am/bm).
             if let Some(am) = fgumi_consensus::methylation::build_mm_tag_no_ml(
@@ -1864,7 +1876,10 @@ mod tests {
     }
 
     #[test]
-    fn test_r2_methylation_cu_ct_tags_are_reversed() {
+    /// The reverse mate is built from the reverse-complemented read and reversed annotation (as
+    /// `generate_consensus_pair` does); stored in reference orientation, its `cu`/`ct` arrays
+    /// line up with SEQ and so equal the forward mate's.
+    fn test_r2_methylation_cu_ct_tags_are_stored_in_reference_orientation() {
         use noodles::sam::alignment::record::data::field::Tag;
         use noodles::sam::alignment::record_buf::data::field::Value;
         use noodles::sam::alignment::record_buf::data::field::value::Array;
@@ -1945,20 +1960,95 @@ mod tests {
             other => panic!("Expected Int16 array for ct tag on R2, got {other:?}"),
         };
 
-        // R2's cu/ct should be the reverse of R1's cu/ct
-        let mut r1_cu_rev = r1_cu.clone();
-        r1_cu_rev.reverse();
-        assert_eq!(
-            r2_cu, r1_cu_rev,
-            "R2 cu tag should be reversed relative to R1: R1={r1_cu:?}, R2={r2_cu:?}"
-        );
+        // Both mates cover the same bases; in reference orientation their counts agree.
+        assert_eq!(r2_cu, r1_cu, "R2 cu must be in reference orientation: R1={r1_cu:?}");
+        assert_eq!(r2_ct, r1_ct, "R2 ct must be in reference orientation: R1={r1_ct:?}");
+    }
 
-        let mut r1_ct_rev = r1_ct.clone();
-        r1_ct_rev.reverse();
-        assert_eq!(
-            r2_ct, r1_ct_rev,
-            "R2 ct tag should be reversed relative to R1: R1={r1_ct:?}, R2={r2_ct:?}"
-        );
+    /// Per-base arrays of a reverse-strand record are stored in reference orientation, co-
+    /// oriented with SEQ (as `zipper --tags-to-reverse Consensus` leaves a re-aligned consensus
+    /// and `fgumi filter` expects by default): each array is the reverse of the same record
+    /// built forward.
+    #[rstest::rstest]
+    #[case::simplex(None)]
+    #[case::duplex(Some((6, 4, 3, 2, 2, 1)))]
+    fn test_reverse_record_per_base_arrays_follow_seq(
+        #[case] duplex_tags: Option<(i32, i32, i32, i32, i32, i32)>,
+    ) {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+
+        let seq = b"CGATCA";
+        let quals = vec![40; seq.len()];
+        let evidence = |u: u32, t: u32| MethylationEvidence {
+            is_ref_c: u + t > 0,
+            unconverted_count: u,
+            converted_count: t,
+        };
+        let annotation = MethylationAnnotation {
+            evidence: vec![
+                evidence(9, 1),
+                evidence(0, 0),
+                evidence(0, 0),
+                evidence(0, 0),
+                evidence(2, 7),
+                evidence(0, 0),
+            ],
+        };
+        let meth = MethylationData {
+            annotation: annotation.clone(),
+            ab_annotation: duplex_tags.map(|_| annotation.clone()),
+            ba_annotation: duplex_tags.map(|_| annotation.clone()),
+        };
+        let build = |is_reverse: bool| {
+            to_record_buf(&build_consensus_record(
+                "test/1",
+                seq,
+                &quals,
+                true,
+                is_reverse,
+                0,
+                100,
+                5,
+                3,
+                2,
+                duplex_tags,
+                Some(&meth),
+                MethylationMode::EmSeq,
+            ))
+        };
+        let (forward, reverse) = (build(false), build(true));
+
+        let per_base = |r: &noodles::sam::alignment::RecordBuf, tag: SamTag| match r
+            .data()
+            .get(&Tag::from(*tag))
+        {
+            Some(Value::Array(Array::Int16(arr))) => Some(arr.clone()),
+            None => None,
+            other => panic!("expected an i16 array for {tag:?}, got {other:?}"),
+        };
+        let tags: &[SamTag] = if duplex_tags.is_some() {
+            &[
+                SamTag::AD_BASES,
+                SamTag::AE_BASES,
+                SamTag::BD_BASES,
+                SamTag::BE_BASES,
+                SamTag::CU,
+                SamTag::CT,
+                SamTag::AU,
+                SamTag::AT,
+                SamTag::BU,
+                SamTag::BT,
+            ]
+        } else {
+            &[SamTag::CD_BASES, SamTag::CE_BASES, SamTag::CU, SamTag::CT]
+        };
+        for &tag in tags {
+            let mut expected = per_base(&forward, tag).unwrap_or_else(|| panic!("{tag:?} set"));
+            expected.reverse();
+            assert_eq!(per_base(&reverse, tag), Some(expected), "{tag:?}");
+        }
     }
 
     /// Build `GenerationParams` over a small synthetic reference, duplex-configurable.
@@ -2000,6 +2090,30 @@ mod tests {
         writeln!(fasta).unwrap();
         fasta.flush().unwrap();
         fasta
+    }
+
+    /// Every consensus record's SEQ is in reference orientation, so it matches the reference
+    /// at its position on both strands, for simplex and duplex consensus.
+    #[rstest::rstest]
+    #[case::simplex(false)]
+    #[case::duplex(true)]
+    fn test_records_seq_matches_reference_on_both_strands(#[case] duplex: bool) {
+        use crate::commands::simulate::common::test_support::{
+            assert_seq_matches_reference, asymmetric_reference,
+        };
+        let (fasta, reference) = asymmetric_reference();
+        let params = strand_test_params(&fasta, duplex);
+        let strand_bias = StrandBiasModel::new(5.0, 5.0);
+
+        let mut strands_seen = [false; 2];
+        for seed in 0..16u64 {
+            let pair = generate_consensus_pair(0, seed, &params, &strand_bias);
+            for raw in [&pair.r1_record, &pair.r2_record] {
+                let (reverse, _) = assert_seq_matches_reference(&to_record_buf(raw), &reference);
+                strands_seen[usize::from(reverse)] = true;
+            }
+        }
+        assert_eq!(strands_seen, [true, true], "both strands must be exercised");
     }
 
     /// Duplex strand minimum depths must sum to the combined minimum, and each

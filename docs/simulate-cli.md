@@ -15,7 +15,7 @@ Generate synthetic sequencing data for testing and benchmarking the fgumi pipeli
 | `fgumi simulate correct-reads` | Unmapped BAM + includelist | Input for `correct` | Not used |
 | `fgumi simulate aligner` | Replays a pre-captured aligned BAM to stdout | Fake aligner for `runall --aligner::command` | Not used |
 
-**Note:** The data-generating simulate subcommands (all except `correct-reads` and `aligner`) require `--reference` / `-r` pointing to a reference FASTA file. Positions are sampled from real chromosomes, template sequences are extracted from the reference, and BAM headers contain actual contig names and lengths. Read orientations are a 50/50 mix of F1R2 and R1F2 (strand coin flip per molecule).
+**Note:** The data-generating simulate subcommands (all except `correct-reads` and `aligner`) require `--reference` / `-r` pointing to a reference FASTA file. Positions are sampled from real chromosomes, template sequences are extracted from the reference, and BAM headers contain actual contig names and lengths. Read orientations are a 50/50 mix of F1R2 and R1F2 (strand coin flip per molecule). Mapped records follow the BAM convention: a reverse-strand record stores SEQ reverse-complemented and QUAL reversed relative to the sequenced read, so SEQ matches the reference at the record's position. When an insert is shorter than the read, the read-through bases past it are soft-clipped at the read's 3' end.
 
 ---
 
@@ -404,6 +404,8 @@ fgumi simulate consensus-reads \
 | `--methylation-depth-mean` | FLOAT | 5.0 | Mean depth for methylation count sampling (cu + ct per position) |
 
 ### Output Tags (Simplex)
+
+Per-base arrays (`cd`/`ce`, `ad`/`ae`/`bd`/`be`, `cu`/`ct`, `au`/`at`/`bu`/`bt`) are stored co-oriented with SEQ, reversed on reverse-strand records, as `fgumi filter` expects by default (no `--reverse-per-base-tags`). `MM`/`ML` index the sequenced read, per the SAM spec.
 
 | Tag | Type | Description |
 |-----|------|-------------|

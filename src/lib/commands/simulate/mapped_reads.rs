@@ -560,8 +560,9 @@ fn generate_molecule_reads(
         let r2_quals_raw = params.quality_model.generate_qualities(params.read_length, &mut rng);
         let r2_quals = params.quality_bias.apply_to_vec(&r2_quals_raw, true);
 
-        // Mate cigar is based on the mate's read length (same for both reads)
-        let mate_cigar = format!("{}M", params.read_length);
+        // Both mates align `min(read_length, insert)` template bases; the rest is read-through
+        // padding (see `read_through_cigar`).
+        let aligned_len = params.read_length.min(template.len());
 
         // Assign to R1/R2 based on strand coin flip.
         // tlen sign convention: positive for the leftmost read, negative for the
@@ -590,7 +591,7 @@ fn generate_molecule_reads(
             r2_pos,
             r1_tlen,
             &umi_str,
-            &mate_cigar,
+            aligned_len,
             params.mapq,
         );
 
@@ -607,7 +608,7 @@ fn generate_molecule_reads(
             r1_pos,
             -r1_tlen,
             &umi_str,
-            &mate_cigar,
+            aligned_len,
             params.mapq,
         );
 
@@ -684,6 +685,10 @@ fn build_unmapped_record(
     b.build()
 }
 
+/// Builds one mapped record of a simulated pair.
+///
+/// `seq` and `quals` are in read (sequencing) orientation; for a reverse-strand record they are
+/// stored reverse-complemented and reversed, as BAM requires, so SEQ matches the reference.
 #[allow(clippy::too_many_arguments)]
 fn build_record(
     name: &str,
@@ -697,9 +702,11 @@ fn build_record(
     mate_pos: usize,
     tlen: i32,
     umi: &str,
-    mate_cigar: &str,
+    aligned_len: usize,
     mate_mapq: u8,
 ) -> RawRecord {
+    let (seq, quals) = super::common::to_reference_orientation(seq, quals, is_reverse);
+    let (seq, quals) = (seq.as_ref(), quals.as_ref());
     // Build flags: PAIRED + PROPER_PAIR + (FIRST_SEGMENT or LAST_SEGMENT) + reverse-strand bits.
     // Simulated pairs are generated as proper paired alignments (both mates mapped with
     // expected orientation/insert), so we set PROPER_PAIR (0x2) explicitly — downstream
@@ -713,14 +720,19 @@ fn build_record(
         | reverse_flag
         | mate_reverse_flag;
 
-    // Single CIGAR op: {seq.len()}M (match). All simulated alignments are gap-free.
-    let n = u32::try_from(seq.len()).expect("sequence length fits u32");
-    // BAM CIGAR encoding: (length << 4) | op_code. op_code 0 = M (alignment match).
-    let cigar_op = n << 4;
+    // Read-through padding past a short insert is soft-clipped; both mates have the same read
+    // length and aligned length, and opposite orientations.
+    let cigar_ops = super::common::read_through_cigar(seq.len(), aligned_len, is_reverse);
+    let mate_cigar = super::common::cigar_string(&super::common::read_through_cigar(
+        seq.len(),
+        aligned_len,
+        !is_reverse,
+    ));
+    let aligned = u32::try_from(aligned_len.min(seq.len())).expect("aligned length fits u32");
 
-    // Pre-compute bin for the alignment range.
+    // Pre-compute bin for the aligned reference range.
     let alignment_start_1based = u32::try_from(pos + 1).expect("alignment start fits u32");
-    let alignment_end_1based = alignment_start_1based + n.saturating_sub(1);
+    let alignment_end_1based = alignment_start_1based + aligned.saturating_sub(1);
     let bin = region_to_bin(Some(alignment_start_1based), Some(alignment_end_1based));
 
     let ref_id_i32 = i32::try_from(ref_id).expect("ref_id fits i32");
@@ -737,7 +749,7 @@ fn build_record(
         .mate_ref_id(ref_id_i32)
         .mate_pos(mate_pos_i32)
         .template_length(tlen)
-        .cigar_ops(&[cigar_op])
+        .cigar_ops(&cigar_ops)
         .sequence(seq)
         .qualities(quals)
         .add_string_tag(SamTag::RX, umi.as_bytes())
@@ -895,7 +907,7 @@ mod tests {
             200,
             150,
             "AAAAAAAA",
-            "4M",
+            4,
             60,
         );
         let record = to_record_buf(&raw);
@@ -928,7 +940,7 @@ mod tests {
             100,
             -150,
             "AAAAAAAA",
-            "4M",
+            4,
             60,
         );
         let record = to_record_buf(&raw);
@@ -947,7 +959,7 @@ mod tests {
         let seq = b"ACGTACGT";
         let quals = vec![30; 8];
         let raw =
-            build_record("read", seq, &quals, 0, 1000, 60, true, false, 1100, 200, "AAA", "8M", 60);
+            build_record("read", seq, &quals, 0, 1000, 60, true, false, 1100, 200, "AAA", 8, 60);
         let record = to_record_buf(&raw);
 
         // Position should be 1-based in BAM
@@ -970,7 +982,7 @@ mod tests {
         // Note: mapq 255 is treated as "unavailable" by noodles, so skip it
         for mapq in [0, 30, 60] {
             let raw = build_record(
-                "read", seq, &quals, 0, 100, mapq, true, false, 200, 100, "AAA", "4M", mapq,
+                "read", seq, &quals, 0, 100, mapq, true, false, 200, 100, "AAA", 4, mapq,
             );
             let record = to_record_buf(&raw);
             assert_eq!(
@@ -985,7 +997,7 @@ mod tests {
         let seq = b"ACGTACGT";
         let quals = vec![10, 20, 30, 40, 30, 20, 10, 5];
         let raw =
-            build_record("read", seq, &quals, 0, 100, 60, true, false, 200, 100, "AAA", "8M", 60);
+            build_record("read", seq, &quals, 0, 100, 60, true, false, 200, 100, "AAA", 8, 60);
         let record = to_record_buf(&raw);
 
         let record_quals: Vec<u8> = record.quality_scores().iter().collect();
@@ -999,7 +1011,7 @@ mod tests {
 
         for ref_id in [0, 1, 5] {
             let raw = build_record(
-                "read", seq, &quals, ref_id, 100, 60, true, false, 200, 100, "AAA", "4M", 60,
+                "read", seq, &quals, ref_id, 100, 60, true, false, 200, 100, "AAA", 4, 60,
             );
             let record = to_record_buf(&raw);
             assert_eq!(record.reference_sequence_id(), Some(ref_id));
@@ -1012,7 +1024,7 @@ mod tests {
         let seq = b"ACGT";
         let quals = vec![30; 4];
         let raw =
-            build_record("read", seq, &quals, 0, 200, 60, false, true, 100, -150, "AAA", "4M", 60);
+            build_record("read", seq, &quals, 0, 200, 60, false, true, 100, -150, "AAA", 4, 60);
         let record = to_record_buf(&raw);
 
         assert_eq!(record.template_length(), -150);
@@ -1042,6 +1054,93 @@ mod tests {
                 assert_eq!(b, b'T', "position {i}: non-CpG C should convert");
             }
         }
+    }
+
+    /// Every mapped record's SEQ is in reference orientation, so it matches the reference at
+    /// its position on both strands (BAM stores reverse-strand reads reverse-complemented
+    /// relative to how they were sequenced).
+    ///
+    /// Inserts shorter than the read are read through into random padding at the read's 3'
+    /// end, which is soft-clipped so the aligned bases still match.
+    #[rstest::rstest]
+    #[case::long_insert(false)]
+    #[case::short_insert(true)]
+    fn test_records_seq_matches_reference_on_both_strands(#[case] short_insert: bool) {
+        use crate::commands::simulate::common::test_support::{
+            assert_mate_cigars_agree, assert_seq_matches_reference, asymmetric_reference,
+        };
+        let (fasta, reference) = asymmetric_reference();
+        let ref_genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let params = GenerationParams {
+            read_length: 50,
+            umi_length: 8,
+            mapq: 60,
+            min_family_size: 2,
+            quality_model: crate::simulate::PositionQualityModel::new(
+                10, 25, 37, 100, 0.08, 2, 0.0,
+            ),
+            quality_bias: crate::simulate::ReadPairQualityBias::new(0),
+            family_dist: crate::simulate::FamilySizeDistribution::log_normal(3.0, 1.0),
+            insert_model: if short_insert {
+                crate::simulate::InsertSizeModel::new(40.0, 5.0, 30, 45)
+            } else {
+                crate::simulate::InsertSizeModel::new(100.0, 10.0, 80, 120)
+            },
+            methylation: MethylationConfig {
+                mode: fgumi_consensus::MethylationMode::Disabled,
+                cpg_methylation_rate: 0.75,
+                conversion_rate: 0.98,
+            },
+            error_rate: 0.0,
+        };
+
+        let mut strands_seen = [false; 2];
+        let mut clipped_seen = false;
+        for seed in 0..16u64 {
+            let (pairs, _chrom, _pos) =
+                generate_molecule_reads(0, seed, 0, 500, false, &params, &ref_genome);
+            for (r1, r2, ..) in &pairs {
+                assert_mate_cigars_agree(&to_record_buf(r1), &to_record_buf(r2));
+                for raw in [r1, r2] {
+                    let (reverse, clipped) =
+                        assert_seq_matches_reference(&to_record_buf(raw), &reference);
+                    strands_seen[usize::from(reverse)] = true;
+                    clipped_seen |= clipped > 0;
+                }
+            }
+        }
+        assert_eq!(strands_seen, [true, true], "both strands must be exercised");
+        assert_eq!(clipped_seen, short_insert, "read-through padding is soft-clipped");
+    }
+
+    /// QUAL follows SEQ: a reverse-strand record stores the qualities of its read-orientation
+    /// bases reversed, so each quality stays with its base.
+    #[rstest::rstest]
+    #[case::forward(false, b"AACG", &[1, 2, 3, 4])]
+    #[case::reverse(true, b"CGTT", &[4, 3, 2, 1])]
+    fn test_build_record_stores_reference_orientation(
+        #[case] is_reverse: bool,
+        #[case] expected_seq: &[u8],
+        #[case] expected_quals: &[u8],
+    ) {
+        let raw = build_record(
+            "read",
+            b"AACG",
+            &[1, 2, 3, 4],
+            0,
+            100,
+            60,
+            true,
+            is_reverse,
+            200,
+            150,
+            "AAA",
+            4,
+            60,
+        );
+        let record = to_record_buf(&raw);
+        assert_eq!(record.sequence().as_ref(), expected_seq);
+        assert_eq!(record.quality_scores().as_ref(), expected_quals);
     }
 
     #[test]
