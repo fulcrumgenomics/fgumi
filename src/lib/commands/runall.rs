@@ -1141,9 +1141,9 @@ impl RunAll {
         if self.methylation_mode.is_some() {
             bail!(
                 "--methylation-mode is not yet supported for runall chains that include \
-                 align. For EM-seq today, use `--aligner::command \"bwameth.py ...\"` (or \
-                 `bwa-mem3 --methylation-mode em-seq ...`) in command mode and apply \
-                 methylation downstream as a separate step."
+                 align. For EM-seq today, use `--aligner::command \"bwa-mem3 mem --meth ...\"` \
+                 (or bwameth.py) in command mode and apply methylation downstream as a \
+                 separate step."
             );
         }
         // The downstream zipper-merge step needs a `.dict` file alongside
@@ -1631,9 +1631,10 @@ impl RunAll {
                     // before the chain builder runs `filter.validate_parameters()`
                     // (builder.rs add_filter); otherwise the fused stage sees
                     // `MethylationMode::Disabled` and rejects a legitimately-set
-                    // `--methylation-mode`. (The up-front guard above only lets
-                    // `--methylation-mode` reach here when a consuming option is
-                    // set, so this injection is never a dead write.)
+                    // `--methylation-mode`. (On a filter self-pair the up-front guard
+                    // only lets `--methylation-mode` reach here when a methylation
+                    // option is set; after a consensus stage it rejects those options,
+                    // so there the injected mode and reference go unused.)
                     let mut filter_opts = self.filter_opts.clone().validate()?;
                     filter_opts.methylation_mode =
                         crate::commands::common::resolve_methylation_mode(self.methylation_mode);
@@ -1757,21 +1758,58 @@ impl Command for RunAll {
         {
             bail!("--methylation-mode requires --ref to be set");
         }
-        // Filter consumes `--methylation-mode` ONLY through
-        // `--filter::min-conversion-fraction` (the one filter option whose check
-        // reads the resolved `methylation_mode`; `--require-strand-methylation-agreement`
-        // and `--min-methylation-depth` use the reference/methylation tags but never
-        // the mode). So a filter chain keeps the flag live only when that option is
-        // set — otherwise `--methylation-mode` would be silently inert on the filter
-        // stage, which is exactly the silent-ignore this guard rejects.
+        // Filter consumes `--methylation-mode` through its methylation filters.
+        // `--filter::min-conversion-fraction` reads the resolved mode. The depth and agreement
+        // masks read only the reference, which `--methylation-mode` supplies to filter from the
+        // top-level `--ref` (see `methylation_reference`); with only `--filter::ref` the flag
+        // does nothing for them. A filter chain keeps the flag live only in those cases —
+        // otherwise `--methylation-mode` would be silently inert on the filter stage, which is
+        // exactly the silent-ignore this guard rejects.
+        let filter = &self.filter_opts;
+        let filter_masks_set = !filter.filter_min_methylation_depth.is_empty()
+            || filter.filter_require_strand_methylation_agreement;
         let filter_consumes_methylation = stages.contains(&Stage::Filter)
-            && self.filter_opts.filter_min_conversion_fraction.is_some();
+            && (filter.filter_min_conversion_fraction.is_some()
+                || (filter_masks_set && self.reference.is_some()));
+        // A consensus caller writes cu/ct only with --methylation-mode, so after a consensus
+        // stage without it filter's methylation options would find no counts on any record and
+        // check nothing. (A chain starting at filter may read records that already carry them.)
+        if stages.contains(&Stage::Filter)
+            && chain_reaches_consensus
+            && self.methylation_mode.is_none()
+            && (filter_masks_set || filter.filter_min_conversion_fraction.is_some())
+        {
+            bail!(
+                "filter's methylation options (--filter::min-conversion-fraction, \
+                 --filter::min-methylation-depth, --filter::require-strand-methylation-agreement) \
+                 need cu/ct methylation counts, which only the simplex and duplex callers write, \
+                 with --methylation-mode; set --methylation-mode and --ref"
+            );
+        }
+        // runall cannot re-align between the consensus caller and filter (filter follows the
+        // caller directly), so after a consensus stage filter reads unaligned records. Duplex
+        // records carry their methylation sites in their own SEQ (the molecule's sequence) and
+        // are filtered unaligned, but a single-strand consensus's sites come from the
+        // reference, so on its unaligned records the methylation filters check nothing.
+        if filter_consumes_methylation
+            && chain_reaches_consensus
+            && !stages.contains(&Stage::Duplex)
+        {
+            bail!(
+                "filter's methylation options (--filter::min-conversion-fraction, \
+                 --filter::min-methylation-depth, --filter::require-strand-methylation-agreement) \
+                 need single-strand consensus records aligned to the reference, but on this chain \
+                 filter reads the consensus caller's unaligned output; re-align the consensus \
+                 reads, then run `runall --start-from filter` or `fgumi filter` on the aligned BAM"
+            );
+        }
         let chain_consumes_methylation = chain_reaches_consensus || filter_consumes_methylation;
         if self.methylation_mode.is_some() && !chain_consumes_methylation && !chain_includes_align {
             bail!(
                 "--methylation-mode is consumed only by the consensus stages and by \
-                 filter's --min-conversion-fraction; it is dead on a runall chain that \
-                 reaches neither"
+                 filter's methylation filters (--min-conversion-fraction, \
+                 --min-methylation-depth, --require-strand-methylation-agreement); it is \
+                 dead on a runall chain that reaches neither"
             );
         }
 
@@ -2074,16 +2112,15 @@ mod execute_tests {
         assert!(e.contains("--ref requires --methylation-mode"), "got: {e}");
     }
 
-    #[test]
-    fn filter_methylation_with_conversion_fraction_passes_the_dead_flag_guard() {
-        // A filter self-pair with `--methylation-mode` AND a methylation-consuming
-        // option (`--filter::min-conversion-fraction`, the one filter option that
-        // reads the resolved mode) must NOT be rejected by the dead-flag guard —
-        // the flag is genuinely live. The run still errors (the input path does not
-        // exist), but it must get past the guard (audit A1 / HIGH). The needle is a
-        // substring of the CURRENT guard message, so reverting the guard fix (or the
-        // min-conversion-fraction narrowing) makes this assertion fail.
-        let e = run(&[
+    /// With only `--filter::ref` supplying the reference, the depth and agreement masks never
+    /// read `--methylation-mode`, so the dead-flag guard must reject it.
+    #[rstest::rstest]
+    #[case::min_methylation_depth(&["--filter::min-methylation-depth", "3"])]
+    #[case::require_strand_methylation_agreement(&[
+        "--filter::require-strand-methylation-agreement"
+    ])]
+    fn filter_mask_with_only_filter_ref_rejects_methylation_mode(#[case] option: &[&str]) {
+        let mut args = vec![
             "--start-from",
             "filter",
             "--stop-after",
@@ -2094,24 +2131,149 @@ mod execute_tests {
             "o.bam",
             "--filter::min-reads",
             "1",
-            "--filter::min-conversion-fraction",
-            "0.5",
+            "--filter::ref",
+            "filter_ref.fa",
+            "--methylation-mode",
+            "em-seq",
+        ];
+        args.extend_from_slice(option);
+        let e = run(&args).unwrap_err().to_string();
+        assert!(e.contains("dead on a runall chain"), "guard must fire: {e}");
+    }
+
+    /// A filter self-pair with `--methylation-mode` AND a methylation filter option must NOT
+    /// be rejected by the dead-flag guard: each option needs the reference, which runall
+    /// passes to filter only with `--methylation-mode`, and `--min-conversion-fraction` also
+    /// reads the mode. The run still errors (the input path does not exist), but it must get
+    /// past the guard (audit A1 / HIGH). The needle is a substring of the CURRENT guard
+    /// message, so narrowing the guard back to one option makes this assertion fail.
+    #[rstest::rstest]
+    #[case::min_conversion_fraction(&["--filter::min-conversion-fraction", "0.5"])]
+    #[case::min_methylation_depth(&["--filter::min-methylation-depth", "3"])]
+    #[case::require_strand_methylation_agreement(&[
+        "--filter::require-strand-methylation-agreement"
+    ])]
+    fn filter_methylation_option_passes_the_dead_flag_guard(#[case] option: &[&str]) {
+        let mut args = vec![
+            "--start-from",
+            "filter",
+            "--stop-after",
+            "filter",
+            "-i",
+            "in.bam",
+            "-o",
+            "o.bam",
+            "--filter::min-reads",
+            "1",
             "--methylation-mode",
             "em-seq",
             "--ref",
             "ref.fa",
-        ])
-        .unwrap_err()
-        .to_string();
+        ];
+        args.extend_from_slice(option);
+        let e = run(&args).unwrap_err().to_string();
         assert!(!e.contains("dead on a runall chain"), "guard wrongly fired: {e}");
         assert!(!e.contains("requires --methylation-mode to be set"), "premature reject: {e}");
+
+        // The run above stops at the missing input, so check filter's options directly: the
+        // reference reaches filter and its parameters validate.
+        let mut parse_args = vec!["runall"];
+        parse_args.extend_from_slice(&args);
+        let r = RunAll::try_parse_from(parse_args).expect("valid args");
+        let f = r
+            .build_stage_options_bag(&[crate::pipeline::chains::Stage::Filter])
+            .unwrap()
+            .filter
+            .unwrap();
+        assert_eq!(f.reference.as_deref(), Some(std::path::Path::new("ref.fa")));
+        f.validate_parameters().expect("filter's methylation options validate");
+    }
+
+    /// After a consensus stage filter reads the caller's unaligned output (runall cannot
+    /// re-align in between). A single-strand consensus's methylation sites come from the
+    /// reference, so after simplex the methylation options could check nothing: rejected. A
+    /// duplex record's sites are in its own SEQ, so after duplex they are accepted (this run then
+    /// stops at the missing input).
+    #[rstest::rstest]
+    #[case::conversion_fraction_after_simplex("simplex", &["--filter::min-conversion-fraction", "0.5"], true)]
+    #[case::depth_after_simplex("simplex", &["--filter::min-methylation-depth", "3"], true)]
+    #[case::agreement_after_simplex("simplex", &["--filter::require-strand-methylation-agreement"], true)]
+    #[case::conversion_fraction_after_duplex("duplex", &["--filter::min-conversion-fraction", "0.5"], false)]
+    #[case::depth_after_duplex("duplex", &["--filter::min-methylation-depth", "3"], false)]
+    #[case::agreement_after_duplex("duplex", &["--filter::require-strand-methylation-agreement"], false)]
+    fn filter_methylation_option_after_consensus(
+        #[case] consensus: &str,
+        #[case] option: &[&str],
+        #[case] rejected: bool,
+    ) {
+        let strategy = if consensus == "duplex" { "paired" } else { "adjacency" };
+        let mut args = vec![
+            "--start-from",
+            "group",
+            "--stop-after",
+            "filter",
+            "--consensus",
+            consensus,
+            "--group::strategy",
+            strategy,
+            "-i",
+            "in.bam",
+            "-o",
+            "o.bam",
+            "--filter::min-reads",
+            "1",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            "ref.fa",
+        ];
+        args.extend_from_slice(option);
+        let e = run(&args).unwrap_err().to_string();
+        assert_eq!(
+            e.contains("need single-strand consensus records aligned to the reference"),
+            rejected,
+            "got: {e}"
+        );
+    }
+
+    /// A consensus caller writes `cu`/`ct` only with `--methylation-mode`, so on a chain where
+    /// filter follows a consensus stage without it, filter's methylation options would find no
+    /// counts on any record and do nothing: rejected up front.
+    #[rstest::rstest]
+    #[case::depth_after_duplex("duplex", &["--filter::min-methylation-depth", "3"])]
+    #[case::agreement_after_duplex("duplex", &["--filter::require-strand-methylation-agreement"])]
+    #[case::conversion_fraction_after_duplex("duplex", &["--filter::min-conversion-fraction", "0.5"])]
+    #[case::depth_after_simplex("simplex", &["--filter::min-methylation-depth", "3"])]
+    fn filter_methylation_option_after_consensus_without_methylation_mode(
+        #[case] consensus: &str,
+        #[case] option: &[&str],
+    ) {
+        let strategy = if consensus == "duplex" { "paired" } else { "adjacency" };
+        let mut args = vec![
+            "--start-from",
+            "group",
+            "--stop-after",
+            "filter",
+            "--consensus",
+            consensus,
+            "--group::strategy",
+            strategy,
+            "-i",
+            "in.bam",
+            "-o",
+            "o.bam",
+            "--filter::min-reads",
+            "1",
+        ];
+        args.extend_from_slice(option);
+        let e = run(&args).unwrap_err().to_string();
+        assert!(e.contains("need cu/ct methylation counts"), "got: {e}");
     }
 
     #[test]
     fn bare_filter_methylation_is_rejected_as_inert() {
         // Conversely, `--methylation-mode` on a filter chain with NO
-        // methylation-consuming option set is silently inert (filter reads the mode
-        // only via `--min-conversion-fraction`), so the guard MUST reject it up front
+        // methylation filter option set is silently inert, so the guard MUST reject it up front
         // rather than accept a no-op flag. Locks the guard against being widened too
         // far — the exact regression the gauntlet caught in the first cut of this fix.
         let e = run(&[
