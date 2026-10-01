@@ -1623,8 +1623,9 @@ impl RunAll {
                     // projected FilterOptions unchanged. Filter is *also* a
                     // methylation-consuming stage: `--filter::min-conversion-fraction`
                     // reads the resolved `methylation_mode` (and the `reference`),
-                    // and `--filter::require-strand-methylation-agreement` reads the
-                    // `reference`; so thread the top-level cross-stage
+                    // and `--filter::require-strand-methylation-agreement` /
+                    // `--filter::min-methylation-depth` read the `reference`; so
+                    // thread the top-level cross-stage
                     // `--methylation-mode` / `--ref` into the projected options
                     // exactly as the Simplex/Duplex arms do. This must happen
                     // before the chain builder runs `filter.validate_parameters()`

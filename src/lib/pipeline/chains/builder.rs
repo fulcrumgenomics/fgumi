@@ -5974,6 +5974,7 @@ impl<'a> ChainBuilder<'a> {
             accumulators,
             has_rejects: track_rejects,
             timer,
+            methylation_skips: Arc::clone(&setup.methylation_skips),
         }));
 
         Ok(())

@@ -878,6 +878,9 @@ fn group_to_simplex_to_filter_matches_staged_chain() {
 /// staged equivalent where standalone simplex and filter each receive
 /// `--methylation-mode em-seq --ref`; `--min-conversion-fraction 0.0` exercises the
 /// threaded flags (validation requires them) while keeping the output non-empty.
+/// The consensus is unmapped, which the methylation filters cannot evaluate, so both
+/// chains skip them on every record (covered by
+/// `consensus_to_filter_with_methylation_skips_unmapped`).
 /// Reuses the same `grouped_bam` + `create_test_reference` fixture as
 /// `simplex_self_pair_with_methylation_mode_matches_standalone`, which is known to
 /// produce methylation-tagged consensus records.
@@ -955,6 +958,51 @@ fn consensus_to_filter_with_methylation_matches_staged_chain() {
 
     assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
     assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
+}
+
+/// The methylation filters need aligned records to find informative positions. A fused
+/// consensus->filter chain's consensus is unmapped, so every record is left unfiltered by
+/// them, and the run must say so with the count at the end rather than fail or stay silent.
+#[cfg(feature = "consensus")]
+#[test]
+fn consensus_to_filter_with_methylation_skips_unmapped() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = grouped_bam(tmp.path(), "identity", "filter_methylation_unmapped");
+    let reference = create_test_reference(tmp.path());
+    let out = tmp.path().join("runall.bam");
+
+    let output = run_ok(
+        [
+            "runall",
+            "--start-from",
+            "consensus",
+            "--stop-after",
+            "filter",
+            "--consensus",
+            "simplex",
+            "-i",
+            p(&fixture),
+            "-o",
+            p(&out),
+            "--simplex::min-reads",
+            "1",
+            "--filter::min-reads",
+            "1",
+            "--filter::min-conversion-fraction",
+            "0.0",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            p(&reference),
+        ],
+        "runall consensus(simplex)->filter+methylation on unmapped consensus",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (_, records) = read_bam_output(&out);
+    let expected =
+        format!("none of the {} records were checked by the methylation filters", records.len());
+    assert!(!records.is_empty(), "the unmapped consensus must be kept");
+    assert!(stderr.contains(&expected), "expected {expected:?} in stderr, got:\n{stderr}");
 }
 
 // ══════════════════════════ Extract→Correct (no aligner) ══════════════════════════

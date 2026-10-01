@@ -12,11 +12,12 @@ use crate::alignment_tags::regenerate_alignment_tags_raw_with_scoring;
 #[cfg(feature = "consensus")]
 use crate::consensus_filter::resolve_ref_bases_for_record;
 use crate::consensus_filter::{
-    ConsensusScalarTags, FilterConfig, FilterResult, MethylationDepthThresholds, MethylationTags,
-    check_conversion_fraction_raw_with_ref_bases_and_tags, count_no_calls, filter_duplex_read_tags,
-    filter_read_tags, mask_bases, mask_duplex_bases, mask_methylation_depth_duplex_raw_with_tags,
-    mask_methylation_depth_simplex_raw_with_tags,
-    mask_strand_methylation_agreement_raw_with_ref_bases_and_tags, mean_base_quality_full_length,
+    ConsensusScalarTags, FilterConfig, FilterResult, MethylationDepthThresholds,
+    MethylationSiteMasks, MethylationSites, MethylationTags,
+    check_conversion_fraction_raw_with_ref_bases_and_tags, count_no_calls,
+    drop_masked_modifications_raw, drop_modifications_at_raw, filter_duplex_read_tags,
+    filter_read_tags, mask_bases, mask_duplex_bases, mask_methylation_sites_raw,
+    mean_base_quality_full_length,
 };
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::reference::ReferenceReader;
@@ -169,15 +170,23 @@ pub struct Filter {
     #[arg(short = 's', long = "require-single-strand-agreement", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub require_single_strand_agreement: bool,
 
-    /// Minimum methylation depth (cu+ct) to keep a base call (EM-Seq/TAPs).
-    /// For duplex: provide 1-3 values for [duplex, AB consensus, BA consensus]
+    #[allow(clippy::doc_markdown)]
+    /// Minimum methylation depth (cu+ct) at methylation sites (EM-Seq/TAPs). Single-strand
+    /// consensus: sites are aligned reference C/G read by the record's strand, and those below
+    /// the first value are masked to N (needs aligned records; unmapped ones are left
+    /// unfiltered and counted). Duplex: sites are C/G in the record's own SEQ, aligned or not,
+    /// and 1-3 values [total, better strand, worse strand] apply: both calls of a CpG are
+    /// dropped from MM/ML unless their summed depth >= total, the better half >= better and the
+    /// worse half >= worse (on a single-strand duplex record the absent strand's half counts as
+    /// 0; use 0 for worse to keep them). Other duplex calls must reach the second value.
+    /// Per-base tags must be in genomic orientation.
     #[arg(long = "min-methylation-depth", value_delimiter = ',')]
     pub min_methylation_depth: Vec<usize>,
 
     #[allow(clippy::doc_markdown)]
     /// Require strand methylation agreement at CpG sites for duplex consensus (EM-Seq/TAPs).
-    /// Masks both positions of a CpG dinucleotide when top and bottom strands disagree on
-    /// methylation status. Requires --ref.
+    /// Drops the calls of both halves of a CpG from MM/ML when the strands calling its C and
+    /// its G disagree on methylation status (majority of cu vs ct at each).
     #[arg(long = "require-strand-methylation-agreement", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub require_strand_methylation_agreement: bool,
 
@@ -185,7 +194,7 @@ pub struct Filter {
     /// Minimum bisulfite/enzymatic conversion fraction at non-CpG cytosines.
     /// For EM-Seq: checks converted/total >= threshold (high conversion = good).
     /// For TAPs: checks unconverted/total >= threshold (low conversion = good).
-    /// Requires --ref and --methylation-mode. Uses cu/ct tags.
+    /// Requires --methylation-mode. Uses cu/ct tags.
     #[arg(long = "min-conversion-fraction")]
     pub min_conversion_fraction: Option<f64>,
 
@@ -277,7 +286,7 @@ pub struct FilterOptions {
     /// Require both single-strand consensuses to agree.
     #[arg(short = 's', long = "require-single-strand-agreement", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub require_single_strand_agreement: bool,
-    /// Minimum methylation depth, per tier.
+    /// Minimum methylation depth at methylation sites: [total, better strand, worse strand].
     #[arg(long = "min-methylation-depth", value_delimiter = ',')]
     pub min_methylation_depth: Vec<usize>,
     /// Require both strands to agree on methylation.
@@ -369,6 +378,9 @@ pub(crate) struct FilterPipelineSetup {
     pub(crate) reference: Option<Arc<ReferenceReader>>,
     pub(crate) collected_metrics: Arc<PerThreadAccumulator<CollectedFilterMetrics>>,
     pub(crate) progress_counter: Arc<AtomicU64>,
+    /// Unmapped records left unfiltered by the methylation filters, reported at the end of
+    /// the run.
+    pub(crate) methylation_skips: Arc<MethylationFilterSkips>,
 }
 
 /// Captures needed by the process closure, extracted from `Filter` and `FilterPipelineSetup`.
@@ -387,6 +399,8 @@ pub(crate) struct FilterProcessCaptures {
     pub(crate) ref_names: Arc<Vec<String>>,
     pub(crate) progress: Arc<AtomicU64>,
     pub(crate) header: Header,
+    /// Where to count unmapped records the methylation filters skip.
+    pub(crate) methylation_skips: Arc<MethylationFilterSkips>,
 }
 
 impl Command for Filter {
@@ -488,8 +502,15 @@ impl FilterOptions {
 
         let collected_metrics = PerThreadAccumulator::<CollectedFilterMetrics>::new(num_threads);
         let progress_counter = Arc::new(AtomicU64::new(0));
+        let methylation_skips = Arc::new(MethylationFilterSkips::default());
 
-        Ok(FilterPipelineSetup { config, reference, collected_metrics, progress_counter })
+        Ok(FilterPipelineSetup {
+            config,
+            reference,
+            collected_metrics,
+            progress_counter,
+            methylation_skips,
+        })
     }
 
     /// Build the process closure captures from these options and the setup.
@@ -522,6 +543,7 @@ impl FilterOptions {
             ref_names: Arc::new(ref_names),
             progress: Arc::clone(&setup.progress_counter),
             header: header.clone(),
+            methylation_skips: Arc::clone(&setup.methylation_skips),
         }
     }
 
@@ -627,38 +649,30 @@ impl FilterOptions {
             );
         }
 
-        // Validate min-methylation-depth ordering (same as min-reads: CC >= AB >= BA)
+        // Validate min-methylation-depth ordering (as min-reads: total >= better >= worse)
         if self.min_methylation_depth.len() >= 2 {
-            let cc = self.min_methylation_depth[0];
-            let ab = self.min_methylation_depth[1];
-            if ab > cc {
+            let total = self.min_methylation_depth[0];
+            let best = self.min_methylation_depth[1];
+            if best > total {
                 bail!(
-                    "min-methylation-depth values must be specified high to low (duplex >= AB), got {cc} < {ab}"
+                    "min-methylation-depth values must be specified high to low (total >= better strand), got {total} < {best}"
                 );
             }
         }
         if self.min_methylation_depth.len() == 3 {
-            let ab = self.min_methylation_depth[1];
-            let ba = self.min_methylation_depth[2];
-            if ba > ab {
+            let best = self.min_methylation_depth[1];
+            let worst = self.min_methylation_depth[2];
+            if worst > best {
                 bail!(
-                    "min-methylation-depth values must be specified high to low (AB >= BA), got {ab} < {ba}"
+                    "min-methylation-depth values must be specified high to low (better strand >= worse strand), got {best} < {worst}"
                 );
             }
-        }
-
-        // Validate require-strand-methylation-agreement requires --ref
-        if self.require_strand_methylation_agreement && self.reference.is_none() {
-            bail!("--require-strand-methylation-agreement requires --ref to identify CpG sites");
         }
 
         // Validate min-conversion-fraction
         if let Some(frac) = self.min_conversion_fraction {
             if !(0.0..=1.0).contains(&frac) {
                 bail!("--min-conversion-fraction must be between 0.0 and 1.0, got {frac}");
-            }
-            if self.reference.is_none() {
-                bail!("--min-conversion-fraction requires --ref to identify non-CpG cytosines");
             }
             // `methylation_mode` is resolved on `FilterOptions`; `Disabled` is
             // exactly the "flag not provided" case (see `resolve_methylation_mode`).
@@ -669,6 +683,33 @@ impl FilterOptions {
 
         Ok(())
     }
+}
+
+/// Records the methylation filters could not evaluate, or whose modification tags they had to
+/// remove, reported at the end of the run.
+#[derive(Debug, Default)]
+pub(crate) struct MethylationFilterSkips {
+    /// Unmapped single-strand records: their informative positions come from the reference, so
+    /// none could be found. (Duplex records need no reference.)
+    pub(crate) unaligned: AtomicU64,
+    /// Single-strand records seen with `--require-strand-methylation-agreement`, which compares
+    /// the two strands of a duplex record and so cannot apply to them.
+    pub(crate) simplex_agreement: AtomicU64,
+    /// Records without `cu`/`ct` (not called with `--methylation-mode`), so nothing to test.
+    pub(crate) no_counts: AtomicU64,
+    /// Records whose `cu`/`ct` do not match SEQ in length (SEQ was hard-clipped after the
+    /// counts were written), so no position could be tested.
+    pub(crate) length_mismatch: AtomicU64,
+    /// Records whose `MM`/`ML`/`am`/`bm` could not be updated to match SEQ and were removed.
+    pub(crate) tags_removed: AtomicU64,
+    /// Methylation calls dropped from `MM`/`ML` (duplex records), and the records that lost any.
+    pub(crate) dropped_calls: AtomicU64,
+    pub(crate) records_with_dropped_calls: AtomicU64,
+    /// Reverse-mapped records the methylation filters evaluated without
+    /// `--reverse-per-base-tags`: their `cu`/`ct` are read by SEQ position in reference
+    /// orientation, so unless they were already reversed they are evaluated at the wrong
+    /// positions. (Unaligned consensus output has no reverse-mapped records.)
+    pub(crate) unreversed_reverse_strand: AtomicU64,
 }
 
 impl Filter {
@@ -692,6 +733,7 @@ impl Filter {
         min_conversion_fraction: Option<f64>,
         methylation_mode: fgumi_consensus::MethylationMode,
         ref_names: &[String],
+        methylation_skips: &MethylationFilterSkips,
     ) -> Result<(u64, bool)> {
         // `ref_names` is only consumed by the `consensus`-gated ref-base resolver below.
         #[cfg(not(feature = "consensus"))]
@@ -739,6 +781,17 @@ impl Filter {
         // SEQ is the molecule's sequence and is scored literally (as `clip` does).
         let scoring = fgumi_consensus::filter::conversion_scoring_for_record(record);
 
+        // Masking a base that MM/ML (or am/bm) track invalidates their skip counts, so keep
+        // SEQ as it was before masking to rewrite them afterwards. The duplex methylation filters
+        // also read it: a duplex record's methylation sites and `CpG`s come from its SEQ.
+        let duplex_methylation_filters = is_duplex
+            && (methylation_depth_thresholds.is_some()
+                || require_strand_methylation_agreement
+                || min_conversion_fraction.is_some());
+        let pre_mask_seq = (duplex_methylation_filters
+            || fgumi_consensus::filter::has_modification_tags(record))
+        .then(|| RawRecordView::new(record).sequence_vec());
+
         let mut masked_count = if is_duplex {
             let (cc_thresh, ab_thresh, ba_thresh) = config
                 .duplex_thresholds()
@@ -765,36 +818,20 @@ impl Filter {
         let methylation_tags =
             if needs_methylation_tags { Some(MethylationTags::from_record(record)) } else { None };
 
-        // Methylation depth masking (EM-Seq)
-        if let Some(thresholds) = methylation_depth_thresholds {
-            let tags =
-                methylation_tags.as_ref().expect("methylation_tags set when thresholds present");
-            masked_count += if is_duplex {
-                mask_methylation_depth_duplex_raw_with_tags(record, thresholds, tags)?
-            } else {
-                mask_methylation_depth_simplex_raw_with_tags(record, thresholds.duplex, tags)?
-            };
-        }
-
-        // Resolve reference bases once for all reference-dependent filters.
-        // The resolver lives in the `consensus`-gated `methylation` module, so the
-        // reference-dependent methylation filters below are only available when
-        // `consensus` is enabled. Without `consensus` we skip the lookup entirely.
+        // A single-strand record's informative positions and `CpG`s come from the reference
+        // (a converted `T` could be a variant), so resolve its reference bases once for all
+        // methylation filters; a duplex record's come from its own SEQ (the molecule's
+        // sequence), aligned or not. The resolver lives in the `consensus`-gated `methylation`
+        // module, so without `consensus` these filters are unavailable.
         #[cfg(feature = "consensus")]
-        let ref_base_map = {
-            let needs_ref_bases = (require_strand_methylation_agreement && is_duplex)
-                || min_conversion_fraction.is_some();
-            if needs_ref_bases {
-                reference.and_then(|r| resolve_ref_bases_for_record(record, r, ref_names))
-            } else {
-                None
-            }
+        let ref_base_map = if needs_methylation_tags && !is_duplex {
+            reference.and_then(|r| resolve_ref_bases_for_record(record, r, ref_names))
+        } else {
+            None
         };
         #[cfg(not(feature = "consensus"))]
-        let ref_base_map: Option<Vec<Option<u8>>> = {
-            if (require_strand_methylation_agreement && is_duplex)
-                || min_conversion_fraction.is_some()
-            {
+        let ref_base_map: Option<Vec<Option<crate::consensus_filter::RefBase>>> = {
+            if needs_methylation_tags {
                 bail!(
                     "reference-dependent methylation filters require building fgumi with the `consensus` feature"
                 );
@@ -802,15 +839,79 @@ impl Filter {
             None
         };
 
-        // Strand methylation agreement masking (EM-Seq, duplex only)
-        if require_strand_methylation_agreement && is_duplex {
-            masked_count += mask_strand_methylation_agreement_raw_with_ref_bases_and_tags(
-                record,
-                ref_base_map.as_deref(),
-                methylation_tags
-                    .as_ref()
-                    .expect("methylation_tags set when strand agreement enabled"),
-            )?;
+        // Records the methylation filters cannot evaluate are left unfiltered by them and
+        // counted (an aligned BAM always carries some unmapped records).
+        let count = |counter: &std::sync::atomic::AtomicU64| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        let l_seq = RawRecordView::new(record).l_seq() as usize;
+        let methylation_tags = match methylation_tags {
+            Some(tags) if tags.cu.is_none() && tags.ct.is_none() => {
+                count(&methylation_skips.no_counts);
+                None
+            }
+            Some(tags) if !tags.fits(l_seq) => {
+                count(&methylation_skips.length_mismatch);
+                None
+            }
+            Some(_) if !is_duplex && ref_base_map.is_none() => {
+                count(&methylation_skips.unaligned);
+                None
+            }
+            tags => tags,
+        };
+        // Strand agreement compares the two strands of a duplex record; it cannot apply here.
+        if require_strand_methylation_agreement && !is_duplex {
+            count(&methylation_skips.simplex_agreement);
+        }
+        if methylation_tags.is_some() && !reverse_tags && RawRecordView::new(record).is_reverse() {
+            count(&methylation_skips.unreversed_reverse_strand);
+        }
+
+        // A duplex record's methylation sites come from its SEQ before masking; a single-strand
+        // record's from the reference (resolved above; one without it was skipped).
+        let sites = if is_duplex {
+            Some(MethylationSites::Sequence(pre_mask_seq.as_deref()))
+        } else {
+            ref_base_map.as_deref().map(MethylationSites::Reference)
+        };
+
+        // Methylation depth and strand agreement masking (EM-Seq/TAPs)
+        let site_masks = MethylationSiteMasks {
+            depth: methylation_depth_thresholds.cloned(),
+            require_strand_agreement: require_strand_methylation_agreement && is_duplex,
+        };
+        let mut dropped_calls = Vec::new();
+        if let Some(tags) = &methylation_tags
+            && let Some(sites) = sites
+            && (site_masks.depth.is_some() || site_masks.require_strand_agreement)
+        {
+            let outcome = mask_methylation_sites_raw(record, sites, &site_masks, tags)?;
+            masked_count += outcome.masked;
+            // The counts no longer report a call filter rejected.
+            let mut rejected = outcome.masked_sites;
+            rejected.extend_from_slice(&outcome.dropped_calls);
+            fgumi_consensus::filter::zero_methylation_counts_at_raw(record.as_mut_vec(), &rejected);
+            dropped_calls = outcome.dropped_calls;
+            if !dropped_calls.is_empty() {
+                methylation_skips
+                    .dropped_calls
+                    .fetch_add(dropped_calls.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                count(&methylation_skips.records_with_dropped_calls);
+            }
+        }
+
+        // Keep MM/ML/am/bm consistent with SEQ: drop the entries of masked bases and, on duplex
+        // records, the dropped calls (SEQ unchanged).
+        let mut tags_removed = false;
+        if let Some(pre_mask_seq) = &pre_mask_seq
+            && masked_count > 0
+        {
+            tags_removed |= drop_masked_modifications_raw(record.as_mut_vec(), pre_mask_seq);
+        }
+        tags_removed |= drop_modifications_at_raw(record.as_mut_vec(), &dropped_calls);
+        if tags_removed {
+            count(&methylation_skips.tags_removed);
         }
 
         if let Some(reference) = reference {
@@ -863,13 +964,13 @@ impl Filter {
         // Conversion fraction filter (EM-Seq/TAPs read-level)
         if pass
             && let Some(min_frac) = min_conversion_fraction
+            && let Some(tags) = &methylation_tags
+            && let Some(sites) = sites
             && !check_conversion_fraction_raw_with_ref_bases_and_tags(
                 record,
                 min_frac,
-                ref_base_map.as_deref(),
-                methylation_tags
-                    .as_ref()
-                    .expect("methylation_tags set when conversion fraction enabled"),
+                sites,
+                tags,
                 methylation_mode,
             )
         {
@@ -1457,16 +1558,22 @@ mod tests {
         assert!(cmd.validate_parameters().is_err());
     }
 
-    #[test]
-    fn test_validate_strand_agreement_requires_ref() {
+    /// The methylation filters need no `--ref` up front: duplex records are evaluated from
+    /// their own SEQ, and single-strand records without reference bases are skipped and counted.
+    #[rstest]
+    #[case::min_methylation_depth(|cmd: &mut Filter| cmd.min_methylation_depth = vec![3])]
+    #[case::strand_agreement(|cmd: &mut Filter| cmd.require_strand_methylation_agreement = true)]
+    #[case::conversion_fraction(|cmd: &mut Filter| cmd.min_conversion_fraction = Some(0.9))]
+    fn test_validate_methylation_filters_need_no_ref(#[case] set: fn(&mut Filter)) {
         let mut cmd = create_filter_with_paths(
             PathBuf::from("input.bam"),
             PathBuf::from("output.bam"),
             PathBuf::from("ref.fa"),
         );
         cmd.reference = None;
-        cmd.require_strand_methylation_agreement = true;
-        assert!(cmd.validate_parameters().is_err());
+        cmd.methylation_mode = Some(crate::commands::common::MethylationModeArg::EmSeq);
+        set(&mut cmd);
+        cmd.validate_parameters().expect("valid without --ref");
     }
 
     #[test]
@@ -1477,18 +1584,6 @@ mod tests {
             PathBuf::from("ref.fa"),
         );
         cmd.min_conversion_fraction = Some(1.5); // Out of range
-        assert!(cmd.validate_parameters().is_err());
-    }
-
-    #[test]
-    fn test_validate_conversion_fraction_requires_ref() {
-        let mut cmd = create_filter_with_paths(
-            PathBuf::from("input.bam"),
-            PathBuf::from("output.bam"),
-            PathBuf::from("ref.fa"),
-        );
-        cmd.reference = None;
-        cmd.min_conversion_fraction = Some(0.9);
         assert!(cmd.validate_parameters().is_err());
     }
 
@@ -4710,6 +4805,7 @@ mod tests {
             None,  // no min conversion fraction
             fgumi_consensus::MethylationMode::Disabled,
             &[], // no ref names
+            &MethylationFilterSkips::default(),
         )?;
 
         assert_eq!(bases_masked, 0, "No bases should be masked with good tags");
@@ -4753,6 +4849,7 @@ mod tests {
             None,  // no min conversion fraction
             fgumi_consensus::MethylationMode::Disabled,
             &[], // no ref names
+            &MethylationFilterSkips::default(),
         );
 
         assert!(result.is_err(), "Should fail for mapped reads without reference");
@@ -4876,6 +4973,7 @@ mod tests {
             None,  // no min conversion fraction
             methylation_mode,
             &["chr1".to_string()],
+            &MethylationFilterSkips::default(),
         )?;
 
         let aux = aux_data_slice(&raw);
@@ -4885,6 +4983,662 @@ mod tests {
             fgumi_raw_bam::find_string_tag(aux, SamTag::MD),
             Some(b"1C0G2C1T0".as_slice()),
             "MD is SAM-literal"
+        );
+        Ok(())
+    }
+
+    /// Runs `process_record_raw` with `--min-methylation-depth 1` on an R1 simplex record
+    /// over reference `ACGTACGT` (reads `ACGTACGT`, no methylation evidence).
+    fn run_methylation_depth_on_record(
+        unmapped: bool,
+        methylation_skips: &MethylationFilterSkips,
+    ) -> Result<(u64, Vec<u8>)> {
+        let dir = TempDir::new()?;
+        let ref_path = dir.path().join("ref.fa");
+        std::fs::write(&ref_path, format!(">chr1\n{}\n", "ACGT".repeat(250)))?;
+        let reference = ReferenceReader::new(&ref_path)?;
+
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"r1").sequence(b"ACGTACGT").qualities(&[30; 8]);
+            if unmapped {
+                b.flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::UNMAPPED);
+            } else {
+                b.flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                    .ref_id(0)
+                    .pos(0)
+                    .mapq(60)
+                    .cigar_ops(&[8 << 4]); // 8M
+            }
+            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.0_f32);
+            b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
+            b.add_array_i16(SamTag::CU, &[0; 8]).add_array_i16(SamTag::CT, &[0; 8]);
+            b.build()
+        };
+        let config = FilterConfig::new(&[1], &[1.0], &[1.0], None, None, 1.0);
+
+        let (masked, _) = Filter::process_record_raw(
+            &mut raw,
+            &config,
+            Some(&reference),
+            &test_bam_header(),
+            false, // no tag reversal
+            None,  // no min base quality
+            false, // no single-strand agreement
+            None,  // no min mean base quality
+            1.0,   // max no-call fraction
+            Some(&MethylationDepthThresholds::from_values(&[1])),
+            false, // no strand methylation agreement
+            None,  // no min conversion fraction
+            fgumi_consensus::MethylationMode::EmSeq,
+            &["chr1".to_string()],
+            methylation_skips,
+        )?;
+        Ok((masked, RawRecordView::new(&raw).sequence_vec()))
+    }
+
+    /// `--min-methylation-depth` resolves the reference itself (not only when agreement or
+    /// conversion fraction is on) and masks only informative positions: the two reference Cs.
+    #[test]
+    fn test_process_record_raw_methylation_depth_masks_informative_positions() -> Result<()> {
+        let skips = MethylationFilterSkips::default();
+        let (masked, seq) = run_methylation_depth_on_record(false, &skips)?;
+        assert_eq!(masked, 2);
+        assert_eq!(seq, b"ANGTANGT");
+        Ok(())
+    }
+
+    /// Methylation filters need the alignment to find informative positions, so an unmapped
+    /// record (an aligned BAM always has some) is left unchanged by them and counted; a mapped
+    /// record is not counted.
+    #[test]
+    fn test_process_record_raw_methylation_filters_skip_unmapped() -> Result<()> {
+        let skips = MethylationFilterSkips::default();
+        run_methylation_depth_on_record(false, &skips)?;
+        assert_eq!(
+            skips.unaligned.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "mapped is not skipped"
+        );
+
+        let (masked, seq) = run_methylation_depth_on_record(true, &skips)?;
+        assert_eq!(masked, 0);
+        assert_eq!(seq, b"ACGTACGT");
+        assert_eq!(skips.unaligned.load(std::sync::atomic::Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    /// The methylation filters read cu/ct by SEQ position in reference orientation: a
+    /// reverse-mapped record they evaluate without --reverse-per-base-tags is counted (filter
+    /// warns at the end of the run), and nothing else is: a forward or unmapped record, or one
+    /// whose tags were reversed here.
+    #[rstest]
+    #[case::forward(0, false, 0)]
+    #[case::reverse_unreversed(flags::REVERSE, false, 1)]
+    #[case::reverse_reversed(flags::REVERSE, true, 0)]
+    #[case::unmapped(flags::UNMAPPED, false, 0)]
+    fn test_process_record_raw_counts_unreversed_reverse_strand(
+        #[case] extra_flags: u16,
+        #[case] reverse_tags: bool,
+        #[case] expected: u64,
+    ) -> Result<()> {
+        let dir = TempDir::new()?;
+        let ref_path = dir.path().join("ref.fa");
+        std::fs::write(&ref_path, format!(">chr1\n{}\n", "ACGT".repeat(250)))?;
+        let reference = ReferenceReader::new(&ref_path)?;
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"r1")
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | extra_flags)
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8]);
+            if extra_flags & flags::UNMAPPED == 0 {
+                b.ref_id(0).pos(0).mapq(60).cigar_ops(&[8 << 4]);
+            }
+            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.0_f32);
+            b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
+            b.add_array_i16(SamTag::CU, &[0; 8]).add_array_i16(SamTag::CT, &[0; 8]);
+            b.build()
+        };
+        let skips = MethylationFilterSkips::default();
+        Filter::process_record_raw(
+            &mut raw,
+            &FilterConfig::new(&[1], &[1.0], &[1.0], None, None, 1.0),
+            Some(&reference),
+            &test_bam_header(),
+            reverse_tags,
+            None,  // no min base quality
+            false, // no single-strand agreement
+            None,  // no min mean base quality
+            1.0,   // max no-call fraction
+            Some(&MethylationDepthThresholds::from_values(&[1])),
+            false, // no strand methylation agreement
+            None,  // no min conversion fraction
+            fgumi_consensus::MethylationMode::EmSeq,
+            &["chr1".to_string()],
+            &skips,
+        )?;
+        assert_eq!(
+            skips.unreversed_reverse_strand.load(std::sync::atomic::Ordering::Relaxed),
+            expected
+        );
+        Ok(())
+    }
+
+    /// On a duplex record a failing `CpG` drops its calls from MM/ML and leaves SEQ (the
+    /// molecule's sequence) alone. Reference `ACGTACGT`: `CpG` at 1-2 (depth 1 + 1, fails
+    /// 4,2,1) and 5-6 (3 + 3, passes); MM lists the C and G of both.
+    #[test]
+    fn test_process_record_raw_duplex_depth_drops_calls_not_bases() -> Result<()> {
+        let dir = TempDir::new()?;
+        let ref_path = dir.path().join("ref.fa");
+        std::fs::write(&ref_path, format!(">chr1\n{}\n", "ACGT".repeat(250)))?;
+        let reference = ReferenceReader::new(&ref_path)?;
+
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"r1")
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                .ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]) // 8M
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8]);
+            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.0_f32);
+            b.add_int_tag(SamTag::AD, 5)
+                .add_int_tag(SamTag::BD, 5)
+                .add_int_tag(SamTag::AM, 5)
+                .add_int_tag(SamTag::BM, 5)
+                .add_float_tag(SamTag::AE, 0.0_f32)
+                .add_float_tag(SamTag::BE, 0.0_f32);
+            b.add_array_u16(SamTag::AD_BASES, &[5; 8])
+                .add_array_u16(SamTag::BD_BASES, &[5; 8])
+                .add_array_u16(SamTag::AE_BASES, &[0; 8])
+                .add_array_u16(SamTag::BE_BASES, &[0; 8]);
+            let cu = [0, 1, 0, 0, 0, 3, 0, 0];
+            let ct = [0, 0, 1, 0, 0, 0, 3, 0];
+            b.add_array_i16(SamTag::CU, &cu).add_array_i16(SamTag::CT, &ct);
+            b.add_array_i16(SamTag::AU, &cu).add_array_i16(SamTag::AT, &[0; 8]);
+            b.add_array_i16(SamTag::BU, &[0; 8]).add_array_i16(SamTag::BT, &ct);
+            b.add_string_tag(SamTag::MM, b"C+m?,0,0;G-m?,0,0;")
+                .add_array_u8(SamTag::ML, &[255, 255, 0, 0]);
+            b.build()
+        };
+        let config = FilterConfig::new(&[1], &[1.0], &[1.0], None, None, 1.0);
+
+        Filter::process_record_raw(
+            &mut raw,
+            &config,
+            Some(&reference),
+            &test_bam_header(),
+            false, // no tag reversal
+            None,  // no min base quality
+            false, // no single-strand agreement
+            None,  // no min mean base quality
+            1.0,   // max no-call fraction
+            Some(&MethylationDepthThresholds::from_values(&[4, 2, 1])),
+            false, // no strand methylation agreement
+            None,  // no min conversion fraction
+            fgumi_consensus::MethylationMode::EmSeq,
+            &["chr1".to_string()],
+            &MethylationFilterSkips::default(),
+        )?;
+
+        let aux = aux_data_slice(&raw);
+        assert_eq!(RawRecordView::new(&raw).sequence_vec(), b"ACGTACGT", "SEQ unchanged");
+        assert_eq!(fgumi_raw_bam::find_string_tag(aux, SamTag::MM), Some(&b"C+m?,1;G-m?,1;"[..]));
+        assert_eq!(
+            fgumi_raw_bam::find_array_tag(aux, SamTag::ML).map(|a| a.data.to_vec()),
+            Some(vec![255, 0])
+        );
+        Ok(())
+    }
+
+    /// A duplex record for the process-path tests: R1 over `seq` (default `ACGTACGT`; reference
+    /// `ACGT` repeats) with two-strand consensus tags, the given qualities and `cu`/`ct`, and
+    /// `MM`/`ML` listing the C at 1 and 5 then the G at 2 and 6. Unmapped records carry no
+    /// alignment. A `reverse` record is reverse-mapped, its per-base tags in read orientation,
+    /// and is filtered with `--reverse-per-base-tags` (`ACGTACGT` is its own reverse
+    /// complement, so MM indexes the same bases). `mn` adds an `MN` tag.
+    struct DuplexProcessCase<'a> {
+        seq: &'a [u8],
+        quals: [u8; 8],
+        cu: Option<&'a [i16]>,
+        ct: &'a [i16],
+        ml: [u8; 4],
+        mn: Option<i32>,
+        unmapped: bool,
+        reverse: bool,
+        min_base_quality: Option<u8>,
+        depth: Option<&'a [usize]>,
+        agreement: bool,
+        min_conversion_fraction: Option<f64>,
+    }
+
+    impl Default for DuplexProcessCase<'_> {
+        fn default() -> Self {
+            Self {
+                seq: b"ACGTACGT",
+                quals: [30; 8],
+                cu: Some(&[0; 8]),
+                ct: &[0; 8],
+                ml: [0; 4],
+                mn: None,
+                unmapped: false,
+                reverse: false,
+                min_base_quality: None,
+                depth: None,
+                agreement: false,
+                min_conversion_fraction: None,
+            }
+        }
+    }
+
+    fn run_duplex_process(
+        case: &DuplexProcessCase<'_>,
+        skips: &MethylationFilterSkips,
+    ) -> Result<RawRecord> {
+        run_duplex_process_with_pass(case, skips).map(|(raw, _)| raw)
+    }
+
+    fn run_duplex_process_with_pass(
+        case: &DuplexProcessCase<'_>,
+        skips: &MethylationFilterSkips,
+    ) -> Result<(RawRecord, bool)> {
+        let dir = TempDir::new()?;
+        let ref_path = dir.path().join("ref.fa");
+        std::fs::write(&ref_path, format!(">chr1\n{}\n", "ACGT".repeat(250)))?;
+        let reference = ReferenceReader::new(&ref_path)?;
+
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"r1").sequence(case.seq).qualities(&case.quals);
+            if case.unmapped {
+                b.flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::UNMAPPED);
+            } else {
+                let reverse = if case.reverse { flags::REVERSE } else { 0 };
+                b.flags(flags::PAIRED | flags::FIRST_SEGMENT | reverse)
+                    .ref_id(0)
+                    .pos(0)
+                    .mapq(60)
+                    .cigar_ops(&[8 << 4]); // 8M
+            }
+            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.0_f32);
+            b.add_int_tag(SamTag::AD, 5)
+                .add_int_tag(SamTag::BD, 5)
+                .add_int_tag(SamTag::AM, 5)
+                .add_int_tag(SamTag::BM, 5)
+                .add_float_tag(SamTag::AE, 0.0_f32)
+                .add_float_tag(SamTag::BE, 0.0_f32);
+            b.add_array_u16(SamTag::AD_BASES, &[5; 8])
+                .add_array_u16(SamTag::BD_BASES, &[5; 8])
+                .add_array_u16(SamTag::AE_BASES, &[0; 8])
+                .add_array_u16(SamTag::BE_BASES, &[0; 8]);
+            if let Some(cu) = case.cu {
+                b.add_array_i16(SamTag::CU, cu).add_array_i16(SamTag::CT, case.ct);
+            }
+            b.add_array_i16(SamTag::AU, &[0; 8])
+                .add_array_i16(SamTag::AT, &[0; 8])
+                .add_array_i16(SamTag::BU, &[0; 8])
+                .add_array_i16(SamTag::BT, &[0; 8]);
+            b.add_string_tag(SamTag::MM, b"C+m?,0,0;G-m?,0,0;").add_array_u8(SamTag::ML, &case.ml);
+            if let Some(mn) = case.mn {
+                b.add_int_tag(SamTag::MN, mn);
+            }
+            b.build()
+        };
+        let config = FilterConfig::new(&[1], &[1.0], &[1.0], None, None, 1.0);
+        let thresholds = case.depth.map(MethylationDepthThresholds::from_values);
+
+        let (_, pass) = Filter::process_record_raw(
+            &mut raw,
+            &config,
+            (!case.unmapped).then_some(&reference),
+            &test_bam_header(),
+            case.reverse,
+            case.min_base_quality,
+            false, // no single-strand agreement
+            None,  // no min mean base quality
+            1.0,   // max no-call fraction
+            thresholds.as_ref(),
+            case.agreement,
+            case.min_conversion_fraction,
+            fgumi_consensus::MethylationMode::EmSeq,
+            &["chr1".to_string()],
+            skips,
+        )?;
+        Ok((raw, pass))
+    }
+
+    /// The `i16` values of a count tag.
+    fn counts(raw: &RawRecord, tag: SamTag) -> Vec<i16> {
+        let array = fgumi_raw_bam::find_array_tag(aux_data_slice(raw), tag).expect("count tag");
+        array.data.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect()
+    }
+
+    /// A reverse-mapped duplex record filtered with `--reverse-per-base-tags`: the counts are
+    /// reversed to reference orientation, the `CpG` at 1-2 (genomic) fails 4,2,1 and loses its
+    /// calls, which in MM's read orientation are the second C and the second G; SEQ is
+    /// unchanged and the dropped sites' counts are zeroed.
+    #[test]
+    fn test_process_record_raw_reverse_duplex_with_reversed_tags() -> Result<()> {
+        // Read orientation: depth 3 at the CpG at 1-2, 1 at the CpG at 5-6 (genomic 2-1).
+        let case = DuplexProcessCase {
+            cu: Some(&[0, 3, 3, 0, 0, 1, 1, 0]),
+            ml: [10, 20, 30, 40],
+            reverse: true,
+            depth: Some(&[4, 2, 1]),
+            ..DuplexProcessCase::default()
+        };
+        let skips = MethylationFilterSkips::default();
+        let raw = run_duplex_process(&case, &skips)?;
+
+        assert_eq!(RawRecordView::new(&raw).sequence_vec(), b"ACGTACGT", "SEQ unchanged");
+        let (mm, ml) = mm_ml(&raw);
+        assert_eq!(mm.as_deref(), Some("C+m?,0;G-m?,0;"));
+        assert_eq!(ml, Some(vec![10, 30]));
+        assert_eq!(counts(&raw, SamTag::CU), vec![0, 0, 0, 0, 0, 3, 3, 0], "reference orientation");
+        assert_eq!(skips.dropped_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(skips.records_with_dropped_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(skips.unreversed_reverse_strand.load(std::sync::atomic::Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    /// A duplex record whose `MN` no longer matches SEQ (hard-clipped since the tags were
+    /// written) cannot have a dropped call edited out: MM/ML/MN are removed and counted.
+    #[test]
+    fn test_process_record_raw_counts_removed_modification_tags() -> Result<()> {
+        let case = DuplexProcessCase {
+            cu: Some(&[0, 1, 1, 0, 0, 3, 3, 0]),
+            mn: Some(10),
+            depth: Some(&[4, 2, 1]),
+            ..DuplexProcessCase::default()
+        };
+        let skips = MethylationFilterSkips::default();
+        let raw = run_duplex_process(&case, &skips)?;
+
+        assert_eq!(mm_ml(&raw), (None, None), "MM/ML removed");
+        assert!(fgumi_raw_bam::find_int_tag(aux_data_slice(&raw), SamTag::MN).is_none());
+        assert_eq!(skips.tags_removed.load(std::sync::atomic::Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    /// `--min-conversion-fraction` on a duplex record reads its non-CpG cytosines from SEQ:
+    /// `CAGTCGCA` has non-CpG C at 0 and 6 and non-CpG G at 2; two of the three are converted
+    /// (0.67 < 0.9). With an `N` after the C at 6 its context is unknown and it is not counted,
+    /// leaving 2 of 2.
+    #[rstest]
+    #[case::fails(b"CAGTCGCA", false)]
+    #[case::unknown_context_excluded(b"CAGTCGCN", true)]
+    fn test_process_record_raw_duplex_conversion_fraction(
+        #[case] seq: &[u8],
+        #[case] expected_pass: bool,
+    ) -> Result<()> {
+        let case = DuplexProcessCase {
+            seq,
+            cu: Some(&[0, 0, 0, 0, 10, 10, 10, 0]),
+            ct: &[10, 0, 10, 0, 0, 0, 0, 0],
+            unmapped: true,
+            min_conversion_fraction: Some(0.9),
+            ..DuplexProcessCase::default()
+        };
+        let skips = MethylationFilterSkips::default();
+        let (_, pass) = run_duplex_process_with_pass(&case, &skips)?;
+        assert_eq!(pass, expected_pass);
+        Ok(())
+    }
+
+    /// `--min-conversion-fraction` on an aligned simplex record reads its non-CpG cytosines
+    /// from the reference (`ACAT` repeats: C at 1 and 5, neither followed by G).
+    #[rstest]
+    #[case::unconverted(b"ACATACAT", &[0, 3, 0, 0, 0, 3, 0, 0], &[0; 8], false)]
+    #[case::converted(b"ATATATAT", &[0; 8], &[0, 3, 0, 0, 0, 3, 0, 0], true)]
+    fn test_process_record_raw_simplex_conversion_fraction(
+        #[case] seq: &[u8],
+        #[case] cu: &[i16],
+        #[case] ct: &[i16],
+        #[case] expected_pass: bool,
+    ) -> Result<()> {
+        let dir = TempDir::new()?;
+        let ref_path = dir.path().join("ref.fa");
+        std::fs::write(&ref_path, format!(">chr1\n{}\n", "ACAT".repeat(250)))?;
+        let reference = ReferenceReader::new(&ref_path)?;
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"r1")
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                .ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[8 << 4])
+                .sequence(seq)
+                .qualities(&[30; 8]);
+            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.0_f32);
+            b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
+            b.add_array_i16(SamTag::CU, cu).add_array_i16(SamTag::CT, ct);
+            b.build()
+        };
+        let skips = MethylationFilterSkips::default();
+        let (_, pass) = Filter::process_record_raw(
+            &mut raw,
+            &FilterConfig::new(&[1], &[1.0], &[1.0], None, None, 1.0),
+            Some(&reference),
+            &test_bam_header(),
+            false, // no tag reversal
+            None,  // no min base quality
+            false, // no single-strand agreement
+            None,  // no min mean base quality
+            1.0,   // max no-call fraction
+            None,  // no methylation depth
+            false, // no strand methylation agreement
+            Some(0.9),
+            fgumi_consensus::MethylationMode::EmSeq,
+            &["chr1".to_string()],
+            &skips,
+        )?;
+        assert_eq!(pass, expected_pass);
+        Ok(())
+    }
+
+    fn mm_ml(raw: &RawRecord) -> (Option<String>, Option<Vec<u8>>) {
+        let aux = aux_data_slice(raw);
+        (
+            fgumi_raw_bam::find_string_tag(aux, SamTag::MM)
+                .map(|v| String::from_utf8(v.to_vec()).expect("UTF-8")),
+            fgumi_raw_bam::find_array_tag(aux, SamTag::ML).map(|a| a.data.to_vec()),
+        )
+    }
+
+    /// `--require-strand-methylation-agreement` through the process path: the `CpG` at 1-2
+    /// disagrees (C methylated, G not) and loses both calls; the one at 5-6 agrees and keeps them.
+    #[test]
+    fn test_process_record_raw_duplex_strand_agreement() -> Result<()> {
+        let case = DuplexProcessCase {
+            cu: Some(&[0, 3, 0, 0, 0, 3, 3, 0]),
+            ct: &[0, 0, 3, 0, 0, 0, 0, 0],
+            ml: [255, 255, 0, 255],
+            agreement: true,
+            ..DuplexProcessCase::default()
+        };
+        let raw = run_duplex_process(&case, &MethylationFilterSkips::default())?;
+        assert_eq!(RawRecordView::new(&raw).sequence_vec(), b"ACGTACGT", "SEQ unchanged");
+        assert_eq!(mm_ml(&raw), (Some("C+m?,1;G-m?,1;".to_string()), Some(vec![255, 255])));
+        Ok(())
+    }
+
+    /// Base-quality masking runs before the duplex methylation sites are found, and must not
+    /// break a `CpG`: the C at 1 is masked to `N` for low quality, yet its pair is still judged
+    /// from the pre-mask SEQ (C 3 + G 1 passes 4,2,1, where the G alone would fail 2). Its own
+    /// MM entry goes with the masked base.
+    #[test]
+    fn test_process_record_raw_duplex_pairs_use_pre_mask_seq() -> Result<()> {
+        let case = DuplexProcessCase {
+            quals: [30, 5, 30, 30, 30, 30, 30, 30],
+            cu: Some(&[0, 3, 1, 0, 0, 3, 3, 0]),
+            ml: [255, 255, 255, 255],
+            min_base_quality: Some(10),
+            depth: Some(&[4, 2, 1]),
+            ..DuplexProcessCase::default()
+        };
+        let raw = run_duplex_process(&case, &MethylationFilterSkips::default())?;
+        assert_eq!(RawRecordView::new(&raw).sequence_vec(), b"ANGTACGT");
+        assert_eq!(mm_ml(&raw), (Some("C+m?,0;G-m?,0,0;".to_string()), Some(vec![255, 255, 255])));
+        Ok(())
+    }
+
+    /// Duplex methylation filters need no alignment: an unmapped duplex record is filtered
+    /// (the `CpG` at 1-2, depth 1 + 1, fails 4,2,1) and not counted as skipped.
+    #[test]
+    fn test_process_record_raw_filters_unaligned_duplex() -> Result<()> {
+        let case = DuplexProcessCase {
+            cu: Some(&[0, 1, 1, 0, 0, 3, 3, 0]),
+            ml: [255, 255, 255, 255],
+            unmapped: true,
+            depth: Some(&[4, 2, 1]),
+            ..DuplexProcessCase::default()
+        };
+        let skips = MethylationFilterSkips::default();
+        let raw = run_duplex_process(&case, &skips)?;
+        assert_eq!(mm_ml(&raw), (Some("C+m?,1;G-m?,1;".to_string()), Some(vec![255, 255])));
+        assert_eq!(skips.unaligned.load(std::sync::atomic::Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    /// Records the methylation filters cannot evaluate are left alone and counted: no `cu`/`ct`,
+    /// or `cu`/`ct` that do not match SEQ in length (SEQ hard-clipped later).
+    #[rstest]
+    #[case::no_counts(None, &[0; 8], "no_counts")]
+    #[case::length_mismatch(Some(&[1i16; 6][..]), &[0; 6], "length_mismatch")]
+    fn test_process_record_raw_counts_unevaluable_records(
+        #[case] cu: Option<&'static [i16]>,
+        #[case] ct: &'static [i16],
+        #[case] counter: &str,
+    ) -> Result<()> {
+        let case = DuplexProcessCase {
+            cu,
+            ct,
+            ml: [255, 255, 255, 255],
+            depth: Some(&[100]),
+            ..DuplexProcessCase::default()
+        };
+        let skips = MethylationFilterSkips::default();
+        let raw = run_duplex_process(&case, &skips)?;
+        assert_eq!(
+            mm_ml(&raw),
+            (Some("C+m?,0,0;G-m?,0,0;".to_string()), Some(vec![255, 255, 255, 255])),
+            "calls kept"
+        );
+        let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+        let counts = [
+            ("no_counts", load(&skips.no_counts)),
+            ("length_mismatch", load(&skips.length_mismatch)),
+        ];
+        for (name, value) in counts {
+            assert_eq!(value, u64::from(name == counter), "{name}");
+        }
+        Ok(())
+    }
+
+    /// `--require-strand-methylation-agreement` cannot apply to a single-strand record; each
+    /// one seen is counted.
+    #[test]
+    fn test_process_record_raw_counts_simplex_agreement() -> Result<()> {
+        let dir = TempDir::new()?;
+        let ref_path = dir.path().join("ref.fa");
+        std::fs::write(&ref_path, format!(">chr1\n{}\n", "ACGT".repeat(250)))?;
+        let reference = ReferenceReader::new(&ref_path)?;
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"r1")
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                .ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[8 << 4])
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8]);
+            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.0_f32);
+            b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
+            b.add_array_i16(SamTag::CU, &[0; 8]).add_array_i16(SamTag::CT, &[0; 8]);
+            b.build()
+        };
+        let config = FilterConfig::new(&[1], &[1.0], &[1.0], None, None, 1.0);
+        let skips = MethylationFilterSkips::default();
+        Filter::process_record_raw(
+            &mut raw,
+            &config,
+            Some(&reference),
+            &test_bam_header(),
+            false,
+            None,
+            false,
+            None,
+            1.0,
+            None,
+            true, // strand methylation agreement
+            None,
+            fgumi_consensus::MethylationMode::EmSeq,
+            &["chr1".to_string()],
+            &skips,
+        )?;
+        assert_eq!(skips.simplex_agreement.load(std::sync::atomic::Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    /// MM/ML (as on a duplex consensus, or any record that carries them) list the tracked Cs;
+    /// masking one must drop its entry. An R1 forward record over `ACGTACGT` tracks the Cs at 1 and 5; depth masking
+    /// removes the one without evidence (1), leaving the C at 5 as the first tracked base.
+    #[test]
+    fn test_process_record_raw_masking_rewrites_mm_ml() -> Result<()> {
+        let dir = TempDir::new()?;
+        let ref_path = dir.path().join("ref.fa");
+        std::fs::write(&ref_path, format!(">chr1\n{}\n", "ACGT".repeat(250)))?;
+        let reference = ReferenceReader::new(&ref_path)?;
+
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"r1")
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                .ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]) // 8M
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8]);
+            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.0_f32);
+            b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
+            b.add_array_i16(SamTag::CU, &[0, 0, 0, 0, 0, 3, 0, 0])
+                .add_array_i16(SamTag::CT, &[0; 8]);
+            b.add_string_tag(SamTag::MM, b"C+m?,0,0;").add_array_u8(SamTag::ML, &[0, 255]);
+            b.build()
+        };
+        let config = FilterConfig::new(&[1], &[1.0], &[1.0], None, None, 1.0);
+
+        Filter::process_record_raw(
+            &mut raw,
+            &config,
+            Some(&reference),
+            &test_bam_header(),
+            false, // no tag reversal
+            None,  // no min base quality
+            false, // no single-strand agreement
+            None,  // no min mean base quality
+            1.0,   // max no-call fraction
+            Some(&MethylationDepthThresholds::from_values(&[1])),
+            false, // no strand methylation agreement
+            None,  // no min conversion fraction
+            fgumi_consensus::MethylationMode::EmSeq,
+            &["chr1".to_string()],
+            &MethylationFilterSkips::default(),
+        )?;
+
+        let aux = aux_data_slice(&raw);
+        assert_eq!(RawRecordView::new(&raw).sequence_vec(), b"ANGTACGT");
+        assert_eq!(fgumi_raw_bam::find_string_tag(aux, SamTag::MM), Some(&b"C+m?,0;"[..]));
+        assert_eq!(
+            fgumi_raw_bam::find_array_tag(aux, SamTag::ML).map(|a| a.data.to_vec()),
+            Some(vec![255])
         );
         Ok(())
     }
