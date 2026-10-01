@@ -520,22 +520,6 @@ pub trait RefBaseProvider {
     }
 }
 
-/// Determines whether a `SourceRead` was originally on the top (forward) strand.
-///
-/// In EM-Seq, the "top strand" is the forward strand of the original molecule.
-/// For paired-end reads:
-/// - R1 forward (not reverse) = top strand
-/// - R1 reverse = bottom strand
-/// - R2 follows mate orientation (opposite of R1)
-#[must_use]
-pub fn is_top_strand(source_read_flags: u16) -> bool {
-    let is_reverse = source_read_flags & flags::REVERSE != 0;
-    let is_r2 = source_read_flags & flags::LAST_SEGMENT != 0;
-    // Top strand: R1 forward or R2 reverse
-    // Bottom strand: R1 reverse or R2 forward
-    is_reverse == is_r2
-}
-
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::needless_range_loop)]
 pub(crate) mod tests {
@@ -893,18 +877,6 @@ pub(crate) mod tests {
         let result = build_mm_tag_no_ml(&consensus, &annotation, crate::MethylationMode::EmSeq);
         assert!(result.is_some());
         assert_eq!(result.unwrap(), "C+m?,0;");
-    }
-
-    #[test]
-    fn test_is_top_strand() {
-        // R1 forward = top strand
-        assert!(is_top_strand(flags::PAIRED | flags::FIRST_SEGMENT));
-        // R1 reverse = bottom strand
-        assert!(!is_top_strand(flags::PAIRED | flags::FIRST_SEGMENT | flags::REVERSE));
-        // R2 forward = bottom strand
-        assert!(!is_top_strand(flags::PAIRED | flags::LAST_SEGMENT));
-        // R2 reverse = top strand
-        assert!(is_top_strand(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE));
     }
 
     #[test]

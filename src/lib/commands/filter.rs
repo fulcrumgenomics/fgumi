@@ -8,7 +8,7 @@
 //! 2. **Read-level filtering**: Entire reads are filtered if they fail thresholds
 //!    (min reads, max read error rate, max no-calls, min mean quality)
 
-use crate::alignment_tags::regenerate_alignment_tags_raw;
+use crate::alignment_tags::regenerate_alignment_tags_raw_with_scoring;
 #[cfg(feature = "consensus")]
 use crate::consensus_filter::resolve_ref_bases_for_record;
 use crate::consensus_filter::{
@@ -102,6 +102,9 @@ pub struct Filter {
 
     /// Reference FASTA file for NM/UQ/MD tag regeneration.
     /// If not provided, alignment tag regeneration (NM/UQ/MD) is skipped.
+    /// On a simplex methylation consensus (one carrying cu/ct), NM/UQ do not count the
+    /// conversion of the read's original strand, as a bisulfite-aware aligner does
+    /// (directional libraries assumed); MD always lists every difference.
     #[arg(short = 'r', long = "ref")]
     pub reference: Option<PathBuf>,
 
@@ -723,7 +726,7 @@ impl Filter {
 
         // Classification needs the scalar consensus tags before masking picks a
         // path. Masking only rewrites per-base *array* tags (aD_BASES etc.), not
-        // these scalar tags, but `regenerate_alignment_tags_raw` /
+        // these scalar tags, but `regenerate_alignment_tags_raw_with_scoring` /
         // `reverse_per_base_tags_raw` below can relayout aux — so the scalar
         // tags used for the *filter decision* are re-extracted at that point;
         // this extraction is used only for the pre-mask duplex/simplex split.
@@ -731,6 +734,10 @@ impl Filter {
             let aux = fgumi_raw_bam::aux_data_slice(record);
             ConsensusScalarTags::from_aux(aux).is_duplex()
         };
+        // A simplex methylation consensus keeps the converted bases in SEQ, so regenerated
+        // NM/UQ hide the conversions as the bisulfite-aware aligner did; a duplex consensus's
+        // SEQ is the molecule's sequence and is scored literally (as `clip` does).
+        let scoring = fgumi_consensus::filter::conversion_scoring_for_record(record);
 
         let mut masked_count = if is_duplex {
             let (cc_thresh, ab_thresh, ba_thresh) = config
@@ -807,7 +814,12 @@ impl Filter {
         }
 
         if let Some(reference) = reference {
-            regenerate_alignment_tags_raw(record.as_mut_vec(), header, reference)?;
+            regenerate_alignment_tags_raw_with_scoring(
+                record.as_mut_vec(),
+                header,
+                reference,
+                scoring,
+            )?;
         }
 
         let mut pass = {
@@ -4750,6 +4762,130 @@ mod tests {
             "Error should mention --ref requirement, got: {err_msg}"
         );
 
+        Ok(())
+    }
+
+    /// Which consensus record `test_process_record_raw_alignment_tags_follow_the_record` builds.
+    #[derive(Clone, Copy, Debug)]
+    enum ScoredRecord {
+        /// Simplex methylation consensus: converted SEQ with `cu`/`ct`.
+        SimplexMethylation,
+        /// Simplex consensus without methylation counts.
+        SimplexPlain,
+        /// Duplex methylation consensus (`aD` + `bD`): SEQ is the molecule's sequence.
+        DuplexMethylation,
+    }
+
+    /// Regenerated NM/UQ follow the record, not `--methylation-mode`: a simplex methylation
+    /// consensus (`cu` present, no `aD`/`bD`) keeps converted SEQ, so the conversions of the
+    /// read's original strand are not counted, as the bisulfite-aware aligner did; any other
+    /// record is SAM-literal. MD is always SAM-literal. An R1 forward read of reference
+    /// `ACGTACGT` reading `ATATATGA` carries C→T at 2 and 6 (hidden), G→A at 3 and T→A at 8
+    /// (counted). Qualities are 30..=37.
+    #[rstest]
+    #[case::simplex_methylation_hides(
+        ScoredRecord::SimplexMethylation,
+        fgumi_consensus::MethylationMode::EmSeq,
+        2,
+        32 + 37
+    )]
+    #[case::simplex_methylation_hides_without_mode(
+        ScoredRecord::SimplexMethylation,
+        fgumi_consensus::MethylationMode::Disabled,
+        2,
+        32 + 37
+    )]
+    #[case::simplex_methylation_hides_taps(
+        ScoredRecord::SimplexMethylation,
+        fgumi_consensus::MethylationMode::Taps,
+        2,
+        32 + 37
+    )]
+    #[case::simplex_plain_is_literal(
+        ScoredRecord::SimplexPlain,
+        fgumi_consensus::MethylationMode::EmSeq,
+        4,
+        31 + 32 + 35 + 37
+    )]
+    #[case::duplex_is_literal(
+        ScoredRecord::DuplexMethylation,
+        fgumi_consensus::MethylationMode::EmSeq,
+        4,
+        31 + 32 + 35 + 37
+    )]
+    fn test_process_record_raw_alignment_tags_follow_the_record(
+        #[case] kind: ScoredRecord,
+        #[case] methylation_mode: fgumi_consensus::MethylationMode,
+        #[case] expected_nm: i64,
+        #[case] expected_uq: i64,
+    ) -> Result<()> {
+        let dir = TempDir::new()?;
+        let ref_path = dir.path().join("ref.fa");
+        std::fs::write(&ref_path, format!(">chr1\n{}\n", "ACGT".repeat(250)))?;
+        let reference = ReferenceReader::new(&ref_path)?;
+
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"r1_fwd")
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                .ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]) // 8M
+                .sequence(b"ATATATGA")
+                .qualities(&[30, 31, 32, 33, 34, 35, 36, 37]);
+            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.0_f32);
+            match kind {
+                ScoredRecord::SimplexPlain | ScoredRecord::SimplexMethylation => {
+                    b.add_array_u16(SamTag::CD_BASES, &[10; 8])
+                        .add_array_u16(SamTag::CE_BASES, &[0; 8]);
+                }
+                ScoredRecord::DuplexMethylation => {
+                    b.add_int_tag(SamTag::AD, 5)
+                        .add_int_tag(SamTag::BD, 5)
+                        .add_int_tag(SamTag::AM, 5)
+                        .add_int_tag(SamTag::BM, 5)
+                        .add_float_tag(SamTag::AE, 0.0_f32)
+                        .add_float_tag(SamTag::BE, 0.0_f32);
+                    b.add_array_u16(SamTag::AD_BASES, &[5; 8])
+                        .add_array_u16(SamTag::BD_BASES, &[5; 8])
+                        .add_array_u16(SamTag::AE_BASES, &[0; 8])
+                        .add_array_u16(SamTag::BE_BASES, &[0; 8]);
+                }
+            }
+            if !matches!(kind, ScoredRecord::SimplexPlain) {
+                b.add_array_i16(SamTag::CU, &[0, 0, 0, 0, 0, 0, 0, 0])
+                    .add_array_i16(SamTag::CT, &[0, 10, 0, 0, 0, 10, 0, 0]);
+            }
+            b.build()
+        };
+        let config = FilterConfig::new(&[1], &[1.0], &[1.0], None, None, 1.0);
+
+        Filter::process_record_raw(
+            &mut raw,
+            &config,
+            Some(&reference),
+            &test_bam_header(),
+            false, // no tag reversal
+            None,  // no min base quality
+            false, // no single-strand agreement
+            None,  // no min mean base quality
+            1.0,   // max no-call fraction
+            None,  // no methylation depth thresholds
+            false, // no strand methylation agreement
+            None,  // no min conversion fraction
+            methylation_mode,
+            &["chr1".to_string()],
+        )?;
+
+        let aux = aux_data_slice(&raw);
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux, SamTag::NM), Some(expected_nm), "NM");
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux, SamTag::UQ), Some(expected_uq), "UQ");
+        assert_eq!(
+            fgumi_raw_bam::find_string_tag(aux, SamTag::MD),
+            Some(b"1C0G2C1T0".as_slice()),
+            "MD is SAM-literal"
+        );
         Ok(())
     }
 

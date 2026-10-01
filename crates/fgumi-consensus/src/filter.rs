@@ -483,6 +483,27 @@ impl MethylationTags {
     }
 }
 
+/// The NM/UQ scoring that matches a consensus record's SEQ convention.
+///
+/// [`ConversionScoring::Hidden`](fgumi_sam::alignment_tags::ConversionScoring::Hidden) for a simplex methylation consensus: it carries `cu` (the
+/// per-base methylation counts) and is not a duplex consensus ([`is_duplex_consensus`]), and its
+/// SEQ keeps the converted bases, as a bisulfite-aware aligner scored them.
+/// [`ConversionScoring::Literal`](fgumi_sam::alignment_tags::ConversionScoring::Literal) otherwise, including a duplex consensus, whose SEQ is the
+/// molecule's sequence, and any non-methylation record. `filter` and `clip` both use it, so NM
+/// means the same whichever of them wrote it.
+#[must_use]
+pub fn conversion_scoring_for_record(
+    record: &[u8],
+) -> fgumi_sam::alignment_tags::ConversionScoring {
+    use fgumi_sam::alignment_tags::ConversionScoring;
+    let aux = bam_fields::aux_data_slice(record);
+    if bam_fields::find_tag_type(aux, SamTag::CU).is_some() && !is_duplex_consensus(aux) {
+        ConversionScoring::Hidden
+    } else {
+        ConversionScoring::Literal
+    }
+}
+
 /// Detects if a raw BAM record is a duplex consensus.
 ///
 /// Matches fgbio `Umis.isFgbioDuplexConsensus` (`Umis.scala:144`), which requires **both**
@@ -1537,6 +1558,42 @@ mod tests {
     use super::*;
     use fgumi_raw_bam::SamBuilder as RawSamBuilder;
     use rstest::rstest;
+
+    /// Conversions are hidden from NM/UQ only on a simplex methylation consensus (`cu`, no
+    /// duplex `aD`/`bD` pair); a duplex consensus or a non-methylation record is literal.
+    #[rstest]
+    #[case::simplex_methylation(true, false, false, true)]
+    #[case::duplex_methylation(true, true, true, false)]
+    #[case::non_methylation(false, false, false, false)]
+    #[case::ad_only_is_not_duplex(true, true, false, true)]
+    fn test_conversion_scoring_for_record(
+        #[case] with_cu: bool,
+        #[case] with_ad: bool,
+        #[case] with_bd: bool,
+        #[case] hidden: bool,
+    ) {
+        use fgumi_sam::alignment_tags::ConversionScoring;
+        let mut b = RawSamBuilder::new();
+        b.flags(0)
+            .ref_id(0)
+            .pos(0)
+            .mapq(60)
+            .cigar_ops(&[4 << 4])
+            .sequence(b"ACGT")
+            .qualities(&[30; 4]);
+        if with_cu {
+            b.add_array_i16(SamTag::CU, &[0; 4]);
+        }
+        if with_ad {
+            b.add_int_tag(SamTag::AD, 3);
+        }
+        if with_bd {
+            b.add_int_tag(SamTag::BD, 2);
+        }
+        let record = b.build();
+        let expected = if hidden { ConversionScoring::Hidden } else { ConversionScoring::Literal };
+        assert_eq!(conversion_scoring_for_record(record.as_ref()), expected);
+    }
 
     #[test]
     fn test_filter_result_to_rejection_reason() {

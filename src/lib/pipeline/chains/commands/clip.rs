@@ -257,7 +257,7 @@ fn clip_templates_in_batch(
     reference: &ReferenceReader,
     mut metrics: Option<&mut ClippingMetricsCollection>,
 ) -> io::Result<(u64, u64, u64, u64)> {
-    use crate::alignment_tags::regenerate_alignment_tags_raw;
+    use crate::alignment_tags::regenerate_alignment_tags_raw_with_scoring;
 
     let mut local_templates: u64 = 0;
     let mut local_overlap_clipped: u64 = 0;
@@ -293,10 +293,18 @@ fn clip_templates_in_batch(
             local_extend_clipped += 1;
         }
 
-        // Regenerate alignment tags for every record (always done to match fgbio).
+        // Regenerate alignment tags for every record (always done to match fgbio). NM/UQ follow
+        // the record's SEQ convention, as in `filter`: a simplex methylation consensus keeps the
+        // converted bases, so their conversions are not counted.
         for record in records.iter_mut() {
-            regenerate_alignment_tags_raw(record.as_mut_vec(), header, reference)
-                .map_err(io::Error::other)?;
+            let scoring = fgumi_consensus::filter::conversion_scoring_for_record(record);
+            regenerate_alignment_tags_raw_with_scoring(
+                record.as_mut_vec(),
+                header,
+                reference,
+                scoring,
+            )
+            .map_err(io::Error::other)?;
         }
 
         local_record_count += records.len() as u64;
