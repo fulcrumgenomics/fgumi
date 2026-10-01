@@ -162,7 +162,7 @@ const CHANNEL_CAPACITY: usize = 1_000;
 
 impl Command for ConsensusReads {
     fn execute(&self, command_line: &str) -> Result<()> {
-        let methylation = self.methylation.resolve();
+        let methylation = self.methylation.resolve(self.seed);
         self.methylation.validate()?;
         if methylation.mode.is_enabled()
             && (!self.methylation_depth_mean.is_finite() || self.methylation_depth_mean <= 0.0)
@@ -181,9 +181,8 @@ impl Command for ConsensusReads {
         info!("  Depth range: {}-{}", self.min_depth, self.max_depth);
         info!("  Threads: {}", self.threads);
         if methylation.mode.is_enabled() {
-            info!("  Methylation mode: {:?}", methylation.mode);
+            methylation.log_settings();
             info!("  Methylation depth mean: {}", self.methylation_depth_mean);
-            info!("  CpG methylation rate: {}", methylation.cpg_methylation_rate);
         }
 
         // Load reference genome
@@ -1692,6 +1691,8 @@ mod tests {
                 methylation_mode: Some(crate::commands::common::MethylationModeArg::EmSeq),
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
+                hemimethylation_rate: 0.0,
+                failure_rate: 0.0,
             },
             methylation_depth_mean: 0.0,
             reference: PathBuf::from("dummy.fa"),
@@ -1728,6 +1729,8 @@ mod tests {
                 methylation_mode: Some(crate::commands::common::MethylationModeArg::EmSeq),
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
+                hemimethylation_rate: 0.0,
+                failure_rate: 0.0,
             },
             methylation_depth_mean: -1.0,
             reference: PathBuf::from("dummy.fa"),
@@ -1759,6 +1762,8 @@ mod tests {
                 methylation_mode: Some(crate::commands::common::MethylationModeArg::EmSeq),
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
+                hemimethylation_rate: 0.0,
+                failure_rate: 0.0,
             },
             methylation_depth_mean: f64::NAN,
             reference: PathBuf::from("dummy.fa"),
@@ -1800,6 +1805,8 @@ mod tests {
                 methylation_mode: None,
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
+                hemimethylation_rate: 0.0,
+                failure_rate: 0.0,
             },
             methylation_depth_mean: 0.0,
             reference: fasta.path().to_path_buf(),

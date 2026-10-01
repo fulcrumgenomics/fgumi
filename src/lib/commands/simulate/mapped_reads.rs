@@ -10,7 +10,7 @@ use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, PositionDistArgs,
     QualityArgs, RecordSink, ReferenceArgs, ReferenceGenome, SimulationCommon, SortResourceArgs,
-    apply_methylation_conversion, body_error_rng, build_sort_order_header_map,
+    TemplateLocus, body_error_rng, build_sort_order_header_map, convert_molecule_strand,
     generate_random_sequence, into_record_stream, introduce_errors_inplace, pad_sequence,
     validate_rate,
 };
@@ -126,7 +126,7 @@ struct GenerationParams {
 impl Command for MappedReads {
     fn execute(&self, command_line: &str) -> Result<()> {
         // Validate methylation args
-        let methylation = self.methylation.resolve();
+        let methylation = self.methylation.resolve(self.common.seed);
         self.methylation.validate()?;
 
         validate_rate(self.unmapped_fraction, "unmapped-fraction")?;
@@ -140,9 +140,7 @@ impl Command for MappedReads {
         info!("  UMI length: {}", self.common.umi_length);
         info!("  Threads: {}", self.threads);
         if methylation.mode.is_enabled() {
-            info!("  Methylation mode: {:?}", methylation.mode);
-            info!("  CpG methylation rate: {}", methylation.cpg_methylation_rate);
-            info!("  Conversion rate: {}", methylation.conversion_rate);
+            methylation.log_settings();
         }
 
         // Load reference genome
@@ -498,6 +496,17 @@ fn generate_molecule_reads(
     let chrom_idx = eff_chrom_idx;
     let local_pos = eff_local_pos;
 
+    // Chemistry acts once on the molecule's original strand (directional library): every read
+    // of the family is a PCR copy of it and both mates are cut from it.
+    let converted_template = shared_template.as_deref().map(|template| {
+        let locus = TemplateLocus {
+            chrom_idx: Some(chrom_idx),
+            contig: ref_genome.contig(chrom_idx),
+            start: local_pos,
+        };
+        convert_molecule_strand(template, locus, is_top_strand, &params.methylation, &mut rng)
+    });
+
     let mut pairs = Vec::with_capacity(family_size);
 
     for read_idx in 0..family_size {
@@ -506,24 +515,23 @@ fn generate_molecule_reads(
         // Use shared reference template or generate random per-read.
         // Avoid cloning the shared template — only borrow it.
         let random_template;
-        let template: &[u8] = if let Some(ref shared) = shared_template {
-            shared
+        let template: &[u8] = if let Some(ref converted) = converted_template {
+            converted
         } else {
-            random_template = generate_random_sequence(insert_size, &mut rng);
+            let random = generate_random_sequence(insert_size, &mut rng);
+            random_template = convert_molecule_strand(
+                &random,
+                TemplateLocus::standalone(&random),
+                is_top_strand,
+                &params.methylation,
+                &mut rng,
+            );
             &random_template
         };
 
-        // Compute forward-read sequence (from start of template, top strand)
+        // Forward-read sequence: the start of the (converted) template.
         let fwd_end = params.read_length.min(template.len());
-        let mut fwd_seq: Vec<u8> = template[..fwd_end].to_vec();
-        apply_methylation_conversion(
-            &mut fwd_seq,
-            template,
-            0,
-            true, // top strand
-            &params.methylation,
-            &mut rng,
-        );
+        let fwd_seq: Vec<u8> = template[..fwd_end].to_vec();
         let mut fwd_seq = pad_sequence(fwd_seq, params.read_length, &mut rng);
         // Inject body sequencing errors (SIMU3-01). Injected from a dedicated per-mate RNG
         // (`body_error_rng`) rather than the molecule RNG, so enabling `--error-rate` changes only
@@ -535,20 +543,10 @@ fn generate_molecule_reads(
             introduce_errors_inplace(&mut fwd_seq, params.error_rate, &mut err_rng);
         }
 
-        // Compute reverse-read sequence (from end of template, bottom strand,
-        // reverse complemented)
+        // Reverse-read sequence: the end of the (converted) template, reverse-complemented.
         let rev_start = insert_size.saturating_sub(params.read_length);
         let rev_end = params.read_length.min(template.len().saturating_sub(rev_start));
-        let mut rev_template: Vec<u8> = template[rev_start..rev_start + rev_end].to_vec();
-        apply_methylation_conversion(
-            &mut rev_template,
-            template,
-            rev_start,
-            false, // bottom strand
-            &params.methylation,
-            &mut rng,
-        );
-        let rev_seq = reverse_complement(&rev_template);
+        let rev_seq = reverse_complement(&template[rev_start..rev_start + rev_end]);
         let mut rev_seq = pad_sequence(rev_seq, params.read_length, &mut rng);
         if params.error_rate > 0.0 {
             let mut err_rng = body_error_rng(&read_name, false);
@@ -1034,26 +1032,93 @@ mod tests {
     // Methylation tests
     // ========================================================================
 
+    /// Directional library physics: both mates of a pair come from the molecule's one
+    /// converted original strand, converted once so every read of the family is identical.
+    /// In genomic orientation a top-strand molecule shows only C→T on both mates and a
+    /// bottom-strand molecule only G→A.
     #[test]
-    fn test_emseq_mapped_reads_conversion() {
-        // Template with non-CpG Cs that should convert C->T in EM-Seq
-        let template = b"CACACACACACACACAC".to_vec(); // no CpG dinucleotides
-        let config = MethylationConfig {
-            mode: fgumi_consensus::MethylationMode::EmSeq,
-            cpg_methylation_rate: 0.75,
-            conversion_rate: 1.0,
+    fn test_methylation_mates_share_one_converted_strand() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut contig_rng = create_rng(Some(99));
+        let contig: Vec<u8> = (0..4000).map(|_| b"ACGT"[contig_rng.random_range(0..4)]).collect();
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&contig).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+        let ref_genome = ReferenceGenome::load(fasta.path()).unwrap();
+
+        let params = GenerationParams {
+            read_length: 50,
+            umi_length: 8,
+            mapq: 60,
+            min_family_size: 4,
+            quality_model: crate::simulate::PositionQualityModel::new(
+                10, 25, 37, 100, 0.08, 2, 0.0,
+            ),
+            quality_bias: crate::simulate::ReadPairQualityBias::new(0),
+            family_dist: crate::simulate::FamilySizeDistribution::log_normal(8.0, 1.0),
+            // Shorter than two read lengths, so the mates overlap.
+            insert_model: crate::simulate::InsertSizeModel::new(70.0, 5.0, 60, 80),
+            methylation: MethylationConfig {
+                mode: fgumi_consensus::MethylationMode::EmSeq,
+                cpg_methylation_rate: 0.5,
+                conversion_rate: 0.5,
+                table_seed: 5,
+                ..MethylationConfig::default()
+            },
+            error_rate: 0.0,
         };
 
-        let mut r1 = template[..8].to_vec();
-        let mut rng = create_rng(Some(42));
-        apply_methylation_conversion(&mut r1, &template, 0, true, &config, &mut rng);
-
-        // All non-CpG Cs should convert to T
-        for (i, &b) in r1.iter().enumerate() {
-            if template[i] == b'C' {
-                assert_eq!(b, b'T', "position {i}: non-CpG C should convert");
+        let mut strands_seen = std::collections::BTreeSet::new();
+        // Strands on which at least one conversion was seen.
+        let mut converted = std::collections::BTreeSet::new();
+        let mut overlapped = 0usize;
+        for seed in 0..10u64 {
+            let (pairs, _chrom, _pos) =
+                generate_molecule_reads(0, seed, 0, 1000, false, &params, &ref_genome);
+            let first = (to_record_buf(&pairs[0].0), to_record_buf(&pairs[0].1));
+            for (r1, r2, _name, _umi, is_top_strand) in &pairs {
+                let (r1, r2) = (to_record_buf(r1), to_record_buf(r2));
+                let allowed = if *is_top_strand { (b'C', b'T') } else { (b'G', b'A') };
+                for mate in [&r1, &r2] {
+                    let bases = mate.sequence().as_ref();
+                    let start = mate.alignment_start().unwrap().get() - 1;
+                    let subs: std::collections::BTreeSet<(u8, u8)> = bases
+                        .iter()
+                        .zip(&contig[start..])
+                        .filter(|(b, c)| b != c)
+                        .map(|(&b, &c)| (c, b))
+                        .collect();
+                    assert!(
+                        subs.iter().all(|&sub| sub == allowed),
+                        "top={is_top_strand}: mate shows {subs:?}, expected only {allowed:?}"
+                    );
+                    if subs.contains(&allowed) {
+                        converted.insert(*is_top_strand);
+                    }
+                }
+                // Both mates are cut from one converted copy, so where they overlap they show
+                // the same bases (two separate conversions would differ at some cytosine).
+                let start = |m: &noodles::sam::alignment::RecordBuf| {
+                    m.alignment_start().expect("mapped").get() - 1
+                };
+                let (s1, s2) = (start(&r1), start(&r2));
+                let (q1, q2) = (r1.sequence().as_ref(), r2.sequence().as_ref());
+                for pos in s1.max(s2)..(s1 + q1.len()).min(s2 + q2.len()) {
+                    assert_eq!(q1[pos - s1], q2[pos - s2], "mates differ at {pos}");
+                    overlapped += 1;
+                }
+                assert_eq!(r1.sequence(), first.0.sequence(), "family R1 differs");
+                assert_eq!(r2.sequence(), first.1.sequence(), "family R2 differs");
+                strands_seen.insert(*is_top_strand);
             }
         }
+        assert_eq!(strands_seen.len(), 2, "both strands exercised");
+        assert_eq!(converted.len(), 2, "a conversion must be seen on both strands");
+        assert!(overlapped > 0, "mates must overlap");
     }
 
     /// Every mapped record's SEQ is in reference orientation, so it matches the reference at
@@ -1090,6 +1155,9 @@ mod tests {
                 mode: fgumi_consensus::MethylationMode::Disabled,
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
+                hemimethylation_rate: 0.0,
+                failure_rate: 0.0,
+                table_seed: 0,
             },
             error_rate: 0.0,
         };
@@ -1172,6 +1240,7 @@ mod tests {
                 mode: fgumi_consensus::MethylationMode::Disabled,
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
+                ..MethylationConfig::default()
             },
             error_rate: 0.0,
         };
@@ -1219,6 +1288,7 @@ mod tests {
                 mode: fgumi_consensus::MethylationMode::Disabled,
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
+                ..MethylationConfig::default()
             },
             error_rate,
         };
@@ -1304,6 +1374,7 @@ mod tests {
                 mode: fgumi_consensus::MethylationMode::Disabled,
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
+                ..MethylationConfig::default()
             },
             error_rate: 0.0,
         };
@@ -1361,6 +1432,7 @@ mod tests {
                 mode: fgumi_consensus::MethylationMode::Disabled,
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
+                ..MethylationConfig::default()
             },
             error_rate: 0.0,
         };
@@ -1409,6 +1481,7 @@ mod tests {
                 mode: fgumi_consensus::MethylationMode::Disabled,
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
+                ..MethylationConfig::default()
             },
             error_rate: 0.0,
         }

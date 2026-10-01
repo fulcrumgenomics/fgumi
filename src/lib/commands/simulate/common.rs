@@ -228,6 +228,11 @@ impl StrandBiasArgs {
 }
 
 /// Methylation simulation options shared across simulate subcommands.
+///
+/// Models a directional EM-seq/TAPs library as `holodeck simulate`/`methylate` do: each
+/// `CpG` has a methylation state fixed for the run per strand (non-`CpG` cytosines are
+/// unmethylated), and chemistry converts each original strand of a molecule once, so all
+/// reads of a family and both mates of a pair share it.
 #[derive(Args, Debug, Clone)]
 pub struct MethylationArgs {
     /// Methylation chemistry mode. When set, enables methylation-aware base
@@ -236,33 +241,52 @@ pub struct MethylationArgs {
     #[arg(long = "methylation-mode", value_enum)]
     pub methylation_mode: Option<MethylationModeArg>,
 
-    /// Fraction of `CpG` cytosines that are methylated [0.0-1.0].
-    /// Methylated `CpG`s are protected from conversion in EM-Seq and are
+    /// Fraction of `CpG`s that are methylated [0.0-1.0], drawn once per `CpG` for the run
+    /// (from --seed). Methylated `CpG`s are protected from conversion in EM-Seq and are
     /// targets for conversion in TAPs.
     #[arg(long = "cpg-methylation-rate", default_value = "0.75")]
     pub cpg_methylation_rate: f64,
 
+    /// Probability that a methylated `CpG` is methylated on one strand only [0.0-1.0].
+    #[arg(long = "hemimethylation-rate", default_value = "0.01")]
+    pub hemimethylation_rate: f64,
+
     /// Enzymatic conversion efficiency for target cytosines [0.0-1.0].
     /// In EM-Seq, this is the probability that an unmethylated C is converted to T.
     /// In TAPs, this is the probability that a methylated C is converted to T.
-    #[arg(long = "conversion-rate", default_value = "0.98")]
+    #[arg(
+        long = "methylation-conversion-rate",
+        alias = "conversion-rate",
+        default_value = "0.999"
+    )]
     pub conversion_rate: f64,
+
+    /// Fraction of molecule strands whose conversion fails as a whole [0.0-1.0]; a failed
+    /// strand converts at 1 - conversion rate, keeping almost all its cytosines.
+    #[arg(long = "methylation-failure-rate", default_value = "0.01")]
+    pub failure_rate: f64,
 }
 
 impl MethylationArgs {
-    /// Resolves the optional CLI arg to a [`MethylationConfig`].
-    pub fn resolve(&self) -> MethylationConfig {
+    /// Resolves the optional CLI arg to a [`MethylationConfig`]. The fixed per-`CpG`
+    /// methylation state is seeded from `seed` (the run's `--seed`), or randomly when unset.
+    pub fn resolve(&self, seed: Option<u64>) -> MethylationConfig {
         MethylationConfig {
             mode: crate::commands::common::resolve_methylation_mode(self.methylation_mode),
             cpg_methylation_rate: self.cpg_methylation_rate,
             conversion_rate: self.conversion_rate,
+            hemimethylation_rate: self.hemimethylation_rate,
+            failure_rate: self.failure_rate,
+            table_seed: seed.unwrap_or_else(rand::random),
         }
     }
 
     /// Validates that rate parameters are in [0.0, 1.0] and finite.
     pub fn validate(&self) -> anyhow::Result<()> {
         validate_rate(self.cpg_methylation_rate, "cpg-methylation-rate")?;
-        validate_rate(self.conversion_rate, "conversion-rate")?;
+        validate_rate(self.hemimethylation_rate, "hemimethylation-rate")?;
+        validate_rate(self.conversion_rate, "methylation-conversion-rate")?;
+        validate_rate(self.failure_rate, "methylation-failure-rate")?;
         Ok(())
     }
 }
@@ -276,6 +300,28 @@ pub struct MethylationConfig {
     pub cpg_methylation_rate: f64,
     /// Enzymatic conversion efficiency.
     pub conversion_rate: f64,
+    /// Probability that a methylated `CpG` is methylated on one strand only.
+    pub hemimethylation_rate: f64,
+    /// Fraction of molecule strands whose conversion fails as a whole.
+    pub failure_rate: f64,
+    /// Seed of the run's fixed per-`CpG` methylation state.
+    pub table_seed: u64,
+}
+
+/// A noise-free test baseline: no hemimethylation, no conversion failures and a fixed table
+/// seed, unlike the CLI defaults (see [`MethylationArgs`]).
+#[cfg(test)]
+impl Default for MethylationConfig {
+    fn default() -> Self {
+        Self {
+            mode: MethylationMode::Disabled,
+            cpg_methylation_rate: 0.75,
+            conversion_rate: 0.999,
+            hemimethylation_rate: 0.0,
+            failure_rate: 0.0,
+            table_seed: 0,
+        }
+    }
 }
 
 /// Validates that a rate is a finite value in [0.0, 1.0].
@@ -352,6 +398,11 @@ impl ReferenceGenome {
     /// Returns the chromosome name at the given index.
     pub fn name(&self, chrom_idx: usize) -> &str {
         &self.names[chrom_idx]
+    }
+
+    /// Returns the whole (uppercased) sequence of the chromosome at the given index.
+    pub fn contig(&self, chrom_idx: usize) -> &[u8] {
+        &self.sequences[chrom_idx]
     }
 
     /// Sample a random position and return (`chrom_idx`, position, sequence).
@@ -823,76 +874,131 @@ pub(super) fn pad_sequence(mut seq: Vec<u8>, target_len: usize, rng: &mut impl R
     seq
 }
 
-/// Apply methylation conversion to a read sequence in-place.
-///
-/// For each position in `read_seq` that aligns to a reference C (top strand) or G
-/// (bottom strand), determines the `CpG` context and applies stochastic conversion
-/// based on the methylation mode and rates.
-pub(super) fn apply_methylation_conversion(
-    read_seq: &mut [u8],
-    ref_seq: &[u8],
-    ref_offset: usize,
-    is_top_strand: bool,
-    config: &MethylationConfig,
-    rng: &mut impl Rng,
-) {
-    if !config.mode.is_enabled() {
-        return;
-    }
+/// Where a template sits in the reference, for looking up `CpG` context and methylation state.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TemplateLocus<'a> {
+    /// Index of the contig, or `None` for a template not drawn from the reference.
+    pub chrom_idx: Option<usize>,
+    /// The whole contig (or the template itself when not drawn from the reference).
+    pub contig: &'a [u8],
+    /// 0-based offset of the template's first base in `contig`.
+    pub start: usize,
+}
 
-    for (i, base) in read_seq.iter_mut().enumerate() {
-        let ref_pos = ref_offset + i;
-        if ref_pos >= ref_seq.len() {
-            break;
-        }
-
-        let ref_base = ref_seq[ref_pos].to_ascii_uppercase();
-
-        if is_top_strand && ref_base == b'C' {
-            let cpg = is_cpg_context(ref_seq, ref_pos, true);
-            if is_conversion_target(config.mode, cpg, config.cpg_methylation_rate, rng)
-                && rng.random::<f64>() < config.conversion_rate
-            {
-                *base = b'T';
-            }
-        } else if !is_top_strand && ref_base == b'G' {
-            let cpg = is_cpg_context(ref_seq, ref_pos, false);
-            if is_conversion_target(config.mode, cpg, config.cpg_methylation_rate, rng)
-                && rng.random::<f64>() < config.conversion_rate
-            {
-                *base = b'A';
-            }
-        }
+impl<'a> TemplateLocus<'a> {
+    /// A template not drawn from the reference: its own bases are the context.
+    pub fn standalone(template: &'a [u8]) -> Self {
+        Self { chrom_idx: None, contig: template, start: 0 }
     }
 }
 
-/// Determines whether a cytosine at this position is a conversion target.
+/// Converts one strand of a molecule, returning the converted template in genomic orientation.
 ///
-/// Returns true if the base should be converted (subject to `conversion_rate`).
+/// Models a directional EM-seq/bisulfite/TAPs library as `holodeck` does: chemistry acts once
+/// on the original strand the molecule's reads derive from, so every read of a family (PCR
+/// copies of that strand) shares the result, and both mates of a pair are cut from it. The
+/// top strand's convertible cytosines are reference `C` (converted to `T`); the bottom
+/// strand's are reference `G` (converted to `A` in genomic orientation).
 ///
-/// - EM-Seq converts **unmethylated** C: non-`CpG` always, `CpG` when not methylated
-/// - TAPs converts **methylated** C: `CpG` when methylated, non-`CpG` never
-fn is_conversion_target(
-    mode: MethylationMode,
-    is_cpg: bool,
-    cpg_methylation_rate: f64,
+/// Whether a cytosine converts depends on its methylation state, fixed for the run per `CpG`
+/// per strand ([`MethylationConfig::is_methylated`]; non-`CpG` cytosines are unmethylated), and
+/// on the chemistry: EM-seq converts unmethylated cytosines, TAPs methylated ones, each with
+/// probability `conversion_rate`. A molecule strand drawn as a conversion failure (probability
+/// `failure_rate`) converts at `1 - conversion_rate` instead. Returns the template unchanged,
+/// without drawing from `rng`, when methylation is disabled.
+pub(super) fn convert_molecule_strand(
+    template: &[u8],
+    locus: TemplateLocus<'_>,
+    is_top_strand: bool,
+    config: &MethylationConfig,
     rng: &mut impl Rng,
-) -> bool {
-    if is_cpg {
-        let methylated = rng.random::<f64>() < cpg_methylation_rate;
-        match mode {
-            MethylationMode::EmSeq => !methylated, // convert unmethylated
-            MethylationMode::Taps => methylated,   // convert methylated
-            MethylationMode::Disabled => false,
+) -> Vec<u8> {
+    let mut converted = template.to_vec();
+    if !config.mode.is_enabled() {
+        return converted;
+    }
+    let failed = config.failure_rate > 0.0 && rng.random::<f64>() < config.failure_rate;
+    let rate = if failed { 1.0 - config.conversion_rate } else { config.conversion_rate };
+    let (target, converted_base) = if is_top_strand { (b'C', b'T') } else { (b'G', b'A') };
+    for (i, base) in converted.iter_mut().enumerate() {
+        if *base != target {
+            continue;
         }
-    } else {
-        // Non-CpG cytosines are unmethylated
-        match mode {
-            MethylationMode::EmSeq => true, // unmethylated = target
-            MethylationMode::Taps => false, // unmethylated = not a target
+        let methylated = config.is_methylated(locus, locus.start + i, is_top_strand);
+        let should_convert = match config.mode {
+            MethylationMode::EmSeq => !methylated,
+            MethylationMode::Taps => methylated,
             MethylationMode::Disabled => false,
+        };
+        if should_convert && rng.random::<f64>() < rate {
+            *base = converted_base;
         }
     }
+    converted
+}
+
+impl MethylationConfig {
+    /// Logs the methylation model's settings.
+    pub(super) fn log_settings(&self) {
+        log::info!("  Methylation mode: {:?}", self.mode);
+        log::info!("  CpG methylation rate: {}", self.cpg_methylation_rate);
+        log::info!("  Hemimethylation rate: {}", self.hemimethylation_rate);
+        log::info!("  Conversion rate: {}", self.conversion_rate);
+        log::info!("  Conversion failure rate: {}", self.failure_rate);
+        log::info!("  Methylation table seed: {}", self.table_seed);
+    }
+
+    /// Whether the cytosine at `pos` of `locus.contig` on the given strand is methylated: the
+    /// `C` of a `CpG` on the top strand, the `G` on the bottom strand. Non-`CpG` cytosines are
+    /// unmethylated. A `CpG` is methylated with probability `cpg_methylation_rate`, on both
+    /// strands unless hemimethylated (probability `hemimethylation_rate`, one strand chosen at
+    /// random). The draws are a pure function of `table_seed`, the contig and the `CpG`, so the
+    /// state is fixed for the run.
+    pub(super) fn is_methylated(
+        &self,
+        locus: TemplateLocus<'_>,
+        pos: usize,
+        is_top_strand: bool,
+    ) -> bool {
+        if !is_cpg_context(locus.contig, pos, is_top_strand) {
+            return false;
+        }
+        let cpg = if is_top_strand { pos } else { pos - 1 };
+        // A template not drawn from the reference is keyed by its own bases, so two random
+        // templates do not share one methylation pattern; the top bit keeps the key apart from
+        // contig indices.
+        let chrom = locus.chrom_idx.map_or_else(
+            || locus.contig.iter().fold(0, |h, &b| splitmix64(h ^ u64::from(b))) | 1 << 63,
+            |c| c as u64,
+        );
+        let draw = |salt: u64| {
+            // Hash the position before mixing in the salt: `cpg ^ salt` would alias the draw for
+            // one salt at one CpG onto another salt's draw at a nearby CpG.
+            let h = splitmix64(
+                self.table_seed ^ splitmix64(chrom ^ splitmix64(splitmix64(cpg as u64) ^ salt)),
+            );
+            #[expect(clippy::cast_precision_loss, reason = "53-bit uniform in [0, 1)")]
+            let u = (h >> 11) as f64 / (1u64 << 53) as f64;
+            u
+        };
+        if draw(0) >= self.cpg_methylation_rate {
+            return false;
+        }
+        if draw(1) < self.hemimethylation_rate {
+            // Hemimethylated: methylated on one strand only.
+            let methylated_top = draw(2) < 0.5;
+            return methylated_top == is_top_strand;
+        }
+        true
+    }
+}
+
+/// `SplitMix64` finalizer: a fast, well-mixed 64-bit hash.
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// Join the writer thread, then decide which of the two failures to report.
@@ -1671,15 +1777,60 @@ mod tests {
     // MethylationArgs tests
     // ========================================================================
 
+    /// Parses `MethylationArgs` alone from `args`.
+    fn parse_methylation_args(args: &[&str]) -> MethylationArgs {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            methylation: MethylationArgs,
+        }
+        let mut argv = vec!["cli"];
+        argv.extend_from_slice(args);
+        <Cli as clap::Parser>::try_parse_from(argv).expect("valid args").methylation
+    }
+
+    /// Defaults match `holodeck simulate`/`methylate`: conversion 0.999, failure 0.01,
+    /// hemimethylation 0.01.
     #[test]
-    fn test_methylation_args_defaults() {
-        let args = MethylationArgs {
-            methylation_mode: None,
-            cpg_methylation_rate: 0.75,
-            conversion_rate: 0.98,
-        };
+    fn test_methylation_args_holodeck_defaults() {
+        let config = parse_methylation_args(&["--methylation-mode", "em-seq"]).resolve(Some(7));
+        assert!((config.conversion_rate - 0.999).abs() < f64::EPSILON);
+        assert!((config.failure_rate - 0.01).abs() < f64::EPSILON);
+        assert!((config.hemimethylation_rate - 0.01).abs() < f64::EPSILON);
+        assert!((config.cpg_methylation_rate - 0.75).abs() < f64::EPSILON);
+        assert_eq!(config.table_seed, 7, "the methylation state follows --seed");
+    }
+
+    /// `--methylation-conversion-rate` is the holodeck name; `--conversion-rate` stays an alias.
+    #[rstest]
+    #[case::holodeck_name("--methylation-conversion-rate")]
+    #[case::legacy_alias("--conversion-rate")]
+    fn test_methylation_args_conversion_rate_names(#[case] flag: &str) {
+        let args = parse_methylation_args(&[flag, "0.9"]);
+        assert!((args.resolve(None).conversion_rate - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[rstest]
+    #[case::failure("--methylation-failure-rate")]
+    #[case::hemimethylation("--hemimethylation-rate")]
+    fn test_methylation_args_validate_new_rates(#[case] flag: &str) {
+        assert!(parse_methylation_args(&[flag, "0.5"]).validate().is_ok());
+        assert!(parse_methylation_args(&[flag, "1.5"]).validate().is_err());
+    }
+
+    #[test]
+    fn test_methylation_args_cli_defaults() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            methylation: MethylationArgs,
+        }
+        let args = <Cli as clap::Parser>::try_parse_from(["simulate"]).unwrap().methylation;
+        assert!(args.methylation_mode.is_none());
         assert!((args.cpg_methylation_rate - 0.75).abs() < f64::EPSILON);
-        assert!((args.conversion_rate - 0.98).abs() < f64::EPSILON);
+        assert!((args.hemimethylation_rate - 0.01).abs() < f64::EPSILON);
+        assert!((args.conversion_rate - 0.999).abs() < f64::EPSILON);
+        assert!((args.failure_rate - 0.01).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1688,8 +1839,10 @@ mod tests {
             methylation_mode: None,
             cpg_methylation_rate: 0.75,
             conversion_rate: 0.98,
+            hemimethylation_rate: 0.0,
+            failure_rate: 0.0,
         };
-        assert_eq!(args.resolve().mode, MethylationMode::Disabled);
+        assert_eq!(args.resolve(None).mode, MethylationMode::Disabled);
     }
 
     #[test]
@@ -1698,8 +1851,10 @@ mod tests {
             methylation_mode: Some(MethylationModeArg::EmSeq),
             cpg_methylation_rate: 0.75,
             conversion_rate: 0.98,
+            hemimethylation_rate: 0.0,
+            failure_rate: 0.0,
         };
-        let config = args.resolve();
+        let config = args.resolve(None);
         assert_eq!(config.mode, MethylationMode::EmSeq);
         assert!((config.cpg_methylation_rate - 0.75).abs() < f64::EPSILON);
         assert!((config.conversion_rate - 0.98).abs() < f64::EPSILON);
@@ -1711,8 +1866,10 @@ mod tests {
             methylation_mode: Some(MethylationModeArg::Taps),
             cpg_methylation_rate: 0.75,
             conversion_rate: 0.98,
+            hemimethylation_rate: 0.0,
+            failure_rate: 0.0,
         };
-        assert_eq!(args.resolve().mode, MethylationMode::Taps);
+        assert_eq!(args.resolve(None).mode, MethylationMode::Taps);
     }
 
     #[test]
@@ -1722,6 +1879,8 @@ mod tests {
                 methylation_mode: None,
                 cpg_methylation_rate: rate,
                 conversion_rate: rate,
+                hemimethylation_rate: 0.0,
+                failure_rate: 0.0,
             };
             assert!(args.validate().is_ok(), "rate {rate} should be valid");
         }
@@ -1738,6 +1897,8 @@ mod tests {
             methylation_mode: None,
             cpg_methylation_rate: rate,
             conversion_rate: 0.98,
+            hemimethylation_rate: 0.0,
+            failure_rate: 0.0,
         };
         assert!(args.validate().is_err(), "cpg rate {rate} should be invalid");
     }
@@ -1752,30 +1913,239 @@ mod tests {
             methylation_mode: None,
             cpg_methylation_rate: 0.75,
             conversion_rate: rate,
+            hemimethylation_rate: 0.0,
+            failure_rate: 0.0,
         };
         assert!(args.validate().is_err(), "conversion rate {rate} should be invalid");
     }
 
     // ========================================================================
-    // apply_methylation_conversion tests
+    // convert_molecule_strand tests
     // ========================================================================
 
-    /// Helper to apply conversion with deterministic rates.
-    #[allow(clippy::too_many_arguments)]
+    /// A template of `n` repeats of `ACGT` (`CpG`s at 1-2, 5-6, ...), its own locus.
+    fn cpg_template(n: usize) -> Vec<u8> {
+        b"ACGT".repeat(n)
+    }
+
+    fn emseq(cpg_rate: f64, hemi_rate: f64, table_seed: u64) -> MethylationConfig {
+        MethylationConfig {
+            mode: MethylationMode::EmSeq,
+            cpg_methylation_rate: cpg_rate,
+            conversion_rate: 1.0,
+            hemimethylation_rate: hemi_rate,
+            failure_rate: 0.0,
+            table_seed,
+        }
+    }
+
+    /// Methylation is a property of the genome, not of a read: converting the same locus
+    /// twice, with different chemistry draws, gives the same calls when conversion is perfect.
+    #[test]
+    fn test_convert_methylation_state_is_fixed_per_cpg() {
+        let template = cpg_template(64);
+        let config = emseq(0.5, 0.0, 7);
+        let locus = TemplateLocus::standalone(&template);
+        let first =
+            convert_molecule_strand(&template, locus, true, &config, &mut create_rng(Some(1)));
+        let second =
+            convert_molecule_strand(&template, locus, true, &config, &mut create_rng(Some(2)));
+        assert_eq!(first, second);
+        assert_ne!(first, template, "some CpGs should be unmethylated (converted)");
+        assert!(
+            (0..64).any(|k| first[4 * k + 1] == b'C'),
+            "some CpGs should be methylated (protected)"
+        );
+    }
+
+    /// Without hemimethylation a `CpG` is methylated on both strands or neither: the top
+    /// strand keeps its C exactly where the bottom strand keeps the G of the same `CpG`.
+    #[test]
+    fn test_convert_methylation_is_symmetric_without_hemimethylation() {
+        let template = cpg_template(64);
+        let config = emseq(0.5, 0.0, 11);
+        let locus = TemplateLocus::standalone(&template);
+        let top =
+            convert_molecule_strand(&template, locus, true, &config, &mut create_rng(Some(3)));
+        let bottom =
+            convert_molecule_strand(&template, locus, false, &config, &mut create_rng(Some(4)));
+        for k in 0..64 {
+            assert_eq!(top[4 * k + 1] == b'C', bottom[4 * k + 2] == b'G', "CpG {k}");
+        }
+    }
+
+    /// With every methylated `CpG` hemimethylated, exactly one strand of each keeps its base.
+    #[test]
+    fn test_convert_hemimethylation_drops_one_strand() {
+        let template = cpg_template(64);
+        let config = emseq(1.0, 1.0, 13);
+        let locus = TemplateLocus::standalone(&template);
+        let top =
+            convert_molecule_strand(&template, locus, true, &config, &mut create_rng(Some(5)));
+        let bottom =
+            convert_molecule_strand(&template, locus, false, &config, &mut create_rng(Some(6)));
+        for k in 0..64 {
+            assert_ne!(top[4 * k + 1] == b'C', bottom[4 * k + 2] == b'G', "CpG {k}");
+        }
+    }
+
+    /// Two templates not drawn from the reference get their own methylation states, even with
+    /// `CpG`s at the same offsets.
+    #[test]
+    fn test_convert_standalone_templates_do_not_share_methylation() {
+        let a_template = cpg_template(64);
+        let mut b_template = a_template.clone();
+        b_template[0] = b'T';
+        let config = emseq(0.5, 0.0, 3);
+        let convert = |template: &[u8]| {
+            convert_molecule_strand(
+                template,
+                TemplateLocus::standalone(template),
+                true,
+                &config,
+                &mut create_rng(Some(9)),
+            )
+        };
+        let (a, b) = (convert(&a_template), convert(&b_template));
+        // The `CpG` cytosines sit at offsets 1, 5, 9, ... in both templates.
+        assert!((1..a.len()).step_by(4).any(|i| a[i] != b[i]));
+    }
+
+    /// The fixed state comes from the run's table seed.
+    #[test]
+    fn test_convert_methylation_state_depends_on_table_seed() {
+        let template = cpg_template(64);
+        let locus = TemplateLocus::standalone(&template);
+        let a = convert_molecule_strand(
+            &template,
+            locus,
+            true,
+            &emseq(0.5, 0.0, 1),
+            &mut create_rng(Some(9)),
+        );
+        let b = convert_molecule_strand(
+            &template,
+            locus,
+            true,
+            &emseq(0.5, 0.0, 2),
+            &mut create_rng(Some(9)),
+        );
+        assert_ne!(a, b);
+    }
+
+    /// A failed molecule strand converts at `1 - conversion_rate`: with perfect chemistry,
+    /// not at all.
+    #[test]
+    fn test_convert_failed_molecule_keeps_its_cytosines() {
+        let template = b"ACCTACCTACCT".to_vec();
+        let config = MethylationConfig { failure_rate: 1.0, ..emseq(0.0, 0.0, 1) };
+        let converted = convert_molecule_strand(
+            &template,
+            TemplateLocus::standalone(&template),
+            true,
+            &config,
+            &mut create_rng(Some(1)),
+        );
+        assert_eq!(converted, template);
+    }
+
+    /// Draws for different purposes at nearby `CpG`s are independent: with every methylated
+    /// `CpG` hemimethylated, which strand carries the mark must not follow the neighbouring
+    /// `CpG`'s methylation state (it would if the salt aliased one position onto another).
+    #[test]
+    fn test_hemimethylated_strand_is_independent_of_neighbour() {
+        let contig = b"CG".repeat(4000);
+        let locus = TemplateLocus { chrom_idx: Some(0), contig: &contig, start: 0 };
+        let config = MethylationConfig {
+            mode: fgumi_consensus::MethylationMode::EmSeq,
+            cpg_methylation_rate: 0.5,
+            conversion_rate: 1.0,
+            hemimethylation_rate: 1.0,
+            failure_rate: 0.0,
+            table_seed: 7,
+        };
+        let methylated_any = |p: usize| {
+            config.is_methylated(locus, p, true) || config.is_methylated(locus, p + 1, false)
+        };
+        let (mut same, mut total) = (0usize, 0usize);
+        for p in (0..contig.len() - 4).step_by(4) {
+            if methylated_any(p) {
+                total += 1;
+                if config.is_methylated(locus, p, true) == methylated_any(p + 2) {
+                    same += 1;
+                }
+            }
+        }
+        assert!(total > 500, "enough methylated CpGs: {total}");
+        #[expect(clippy::cast_precision_loss, reason = "small test counts")]
+        let fraction = same as f64 / total as f64;
+        assert!(fraction < 0.65, "strand choice follows the neighbour: {same}/{total}");
+    }
+
+    /// `CpG` context comes from the contig, not the template: a template ending in the C of
+    /// a `CpG` whose G lies just past it still treats that C as `CpG` (methylated, protected).
+    #[test]
+    fn test_convert_cpg_context_uses_contig() {
+        let contig = b"AACGAA";
+        let template = &contig[..3]; // "AAC"
+        let locus = TemplateLocus { chrom_idx: Some(0), contig, start: 0 };
+        let converted = convert_molecule_strand(
+            template,
+            locus,
+            true,
+            &emseq(1.0, 0.0, 1),
+            &mut create_rng(Some(1)),
+        );
+        assert_eq!(converted, b"AAC");
+    }
+
+    /// Disabled methylation returns the template and draws nothing from the RNG, so runs
+    /// without methylation are unchanged.
+    #[test]
+    fn test_convert_disabled_is_identity_without_rng_draws() {
+        let template = cpg_template(8);
+        let mut rng = create_rng(Some(1));
+        let converted = convert_molecule_strand(
+            &template,
+            TemplateLocus::standalone(&template),
+            true,
+            &MethylationConfig::default(),
+            &mut rng,
+        );
+        assert_eq!(converted, template);
+        assert_eq!(rng.random::<u64>(), create_rng(Some(1)).random::<u64>());
+    }
+
+    // ========================================================================
+    // convert_molecule_strand chemistry tests
+    // ========================================================================
+
+    /// Helper: `template` converted as one molecule strand (its own locus), no failures or
+    /// hemimethylation.
     fn convert(
-        seq: &mut [u8],
-        ref_seq: &[u8],
-        ref_offset: usize,
+        template: &[u8],
         is_top: bool,
         mode: MethylationMode,
         cpg_rate: f64,
         conv_rate: f64,
         seed: u64,
-    ) {
-        let config =
-            MethylationConfig { mode, cpg_methylation_rate: cpg_rate, conversion_rate: conv_rate };
+    ) -> Vec<u8> {
+        // The seed drives both the fixed methylation state and the chemistry draws.
+        let config = MethylationConfig {
+            mode,
+            cpg_methylation_rate: cpg_rate,
+            conversion_rate: conv_rate,
+            table_seed: seed,
+            ..MethylationConfig::default()
+        };
         let mut rng = create_rng(Some(seed));
-        apply_methylation_conversion(seq, ref_seq, ref_offset, is_top, &config, &mut rng);
+        convert_molecule_strand(
+            template,
+            TemplateLocus::standalone(template),
+            is_top,
+            &config,
+            &mut rng,
+        )
     }
 
     #[test]
@@ -1783,8 +2153,7 @@ mod tests {
         // EM-Seq: methylated CpG = protected, should NOT convert
         // cpg_methylation_rate=1.0 means all CpGs are methylated
         let ref_seq = b"ACGTACGT";
-        let mut read = ref_seq.to_vec();
-        convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 1.0, 1.0, 42);
+        let read = convert(ref_seq, true, MethylationMode::EmSeq, 1.0, 1.0, 42);
         // CpG Cs (at positions 1 and 5) should stay as C (methylated = protected in EM-Seq)
         assert_eq!(read[1], b'C', "CpG C should be protected when methylated");
         assert_eq!(read[5], b'C', "CpG C should be protected when methylated");
@@ -1795,8 +2164,7 @@ mod tests {
         // EM-Seq: unmethylated CpG = target, should convert C->T
         // cpg_methylation_rate=0.0 means all CpGs are unmethylated
         let ref_seq = b"ACGTACGT";
-        let mut read = ref_seq.to_vec();
-        convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.0, 1.0, 42);
+        let read = convert(ref_seq, true, MethylationMode::EmSeq, 0.0, 1.0, 42);
         // CpG Cs should convert to T
         assert_eq!(read[1], b'T', "unmethylated CpG C should convert to T");
         assert_eq!(read[5], b'T', "unmethylated CpG C should convert to T");
@@ -1807,8 +2175,7 @@ mod tests {
         // Non-CpG Cs are unmethylated, always targets in EM-Seq
         // ref = "ACCTA" -> C at pos 1 (non-CpG, followed by C), C at pos 2 (non-CpG, followed by T)
         let ref_seq = b"ACCTA";
-        let mut read = ref_seq.to_vec();
-        convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.75, 1.0, 42);
+        let read = convert(ref_seq, true, MethylationMode::EmSeq, 0.75, 1.0, 42);
         assert_eq!(read[1], b'T', "non-CpG C should convert to T in EM-Seq");
         assert_eq!(read[2], b'T', "non-CpG C should convert to T in EM-Seq");
     }
@@ -1817,8 +2184,7 @@ mod tests {
     fn test_taps_cpg_all_methylated_full_conversion() {
         // TAPs: methylated CpG = target, should convert C->T
         let ref_seq = b"ACGTACGT";
-        let mut read = ref_seq.to_vec();
-        convert(&mut read, ref_seq, 0, true, MethylationMode::Taps, 1.0, 1.0, 42);
+        let read = convert(ref_seq, true, MethylationMode::Taps, 1.0, 1.0, 42);
         assert_eq!(read[1], b'T', "methylated CpG C should convert in TAPs");
         assert_eq!(read[5], b'T', "methylated CpG C should convert in TAPs");
     }
@@ -1827,8 +2193,7 @@ mod tests {
     fn test_taps_cpg_all_unmethylated_no_conversion() {
         // TAPs: unmethylated CpG = not a target, should stay as C
         let ref_seq = b"ACGTACGT";
-        let mut read = ref_seq.to_vec();
-        convert(&mut read, ref_seq, 0, true, MethylationMode::Taps, 0.0, 1.0, 42);
+        let read = convert(ref_seq, true, MethylationMode::Taps, 0.0, 1.0, 42);
         assert_eq!(read[1], b'C', "unmethylated CpG C should not convert in TAPs");
         assert_eq!(read[5], b'C', "unmethylated CpG C should not convert in TAPs");
     }
@@ -1837,8 +2202,7 @@ mod tests {
     fn test_taps_non_cpg_c_never_converts() {
         // Non-CpG Cs are unmethylated, never targets in TAPs
         let ref_seq = b"ACCTA";
-        let mut read = ref_seq.to_vec();
-        convert(&mut read, ref_seq, 0, true, MethylationMode::Taps, 0.75, 1.0, 42);
+        let read = convert(ref_seq, true, MethylationMode::Taps, 0.75, 1.0, 42);
         assert_eq!(read[1], b'C', "non-CpG C should not convert in TAPs");
         assert_eq!(read[2], b'C', "non-CpG C should not convert in TAPs");
     }
@@ -1848,8 +2212,7 @@ mod tests {
         // Bottom strand: G at CpG context = unmethylated target in EM-Seq
         // ref = "ACGT" -> G at pos 2, preceded by C -> CpG context
         let ref_seq = b"ACGT";
-        let mut read = ref_seq.to_vec();
-        convert(&mut read, ref_seq, 0, false, MethylationMode::EmSeq, 0.0, 1.0, 42);
+        let read = convert(ref_seq, false, MethylationMode::EmSeq, 0.0, 1.0, 42);
         assert_eq!(read[2], b'A', "bottom strand unmethylated CpG G should convert to A");
     }
 
@@ -1857,16 +2220,14 @@ mod tests {
     fn test_bottom_strand_taps_converts_g_to_a() {
         // Bottom strand: G at CpG context = methylated target in TAPs
         let ref_seq = b"ACGT";
-        let mut read = ref_seq.to_vec();
-        convert(&mut read, ref_seq, 0, false, MethylationMode::Taps, 1.0, 1.0, 42);
+        let read = convert(ref_seq, false, MethylationMode::Taps, 1.0, 1.0, 42);
         assert_eq!(read[2], b'A', "bottom strand methylated CpG G should convert to A in TAPs");
     }
 
     #[test]
     fn test_non_target_bases_unchanged_top_strand() {
         let ref_seq = b"AGTAGT";
-        let mut read = ref_seq.to_vec();
-        convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.0, 1.0, 42);
+        let read = convert(ref_seq, true, MethylationMode::EmSeq, 0.0, 1.0, 42);
         // No Cs in this sequence, nothing should change
         assert_eq!(read, b"AGTAGT");
     }
@@ -1874,8 +2235,7 @@ mod tests {
     #[test]
     fn test_non_target_bases_unchanged_bottom_strand() {
         let ref_seq = b"ACTACT";
-        let mut read = ref_seq.to_vec();
-        convert(&mut read, ref_seq, 0, false, MethylationMode::EmSeq, 0.0, 1.0, 42);
+        let read = convert(ref_seq, false, MethylationMode::EmSeq, 0.0, 1.0, 42);
         // No Gs in this sequence, nothing should change on bottom strand
         assert_eq!(read, b"ACTACT");
     }
@@ -1883,35 +2243,38 @@ mod tests {
     #[test]
     fn test_disabled_mode_no_conversion() {
         let ref_seq = b"ACGTACGT";
-        let mut read = ref_seq.to_vec();
-        convert(&mut read, ref_seq, 0, true, MethylationMode::Disabled, 0.0, 1.0, 42);
+        let read = convert(ref_seq, true, MethylationMode::Disabled, 0.0, 1.0, 42);
         assert_eq!(read, ref_seq, "Disabled mode should not modify any bases");
     }
 
     #[test]
     fn test_empty_sequence() {
         let ref_seq = b"";
-        let mut read: Vec<u8> = vec![];
-        convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.75, 0.98, 42);
+        let read = convert(ref_seq, true, MethylationMode::EmSeq, 0.75, 0.98, 42);
         assert!(read.is_empty());
     }
 
     #[test]
     fn test_ref_offset_nonzero() {
-        // Read starts at offset 2 in the reference
-        let ref_seq = b"AACGTAA";
-        //                  ^ offset 2 = C, CpG context
-        let mut read = b"CGT".to_vec();
-        convert(&mut read, ref_seq, 2, true, MethylationMode::EmSeq, 0.0, 1.0, 42);
-        assert_eq!(read[0], b'T', "C at ref_offset=2 (CpG) should convert");
+        // The template starts at offset 2 of the contig; its C at contig offset 2 is a CpG C.
+        let contig = b"AACGTAA";
+        let config = MethylationConfig {
+            mode: MethylationMode::EmSeq,
+            cpg_methylation_rate: 0.0,
+            conversion_rate: 1.0,
+            ..MethylationConfig::default()
+        };
+        let locus = TemplateLocus { chrom_idx: Some(0), contig, start: 2 };
+        let read =
+            convert_molecule_strand(&contig[2..5], locus, true, &config, &mut create_rng(Some(42)));
+        assert_eq!(read, b"TGT", "unmethylated CpG C at contig offset 2 should convert");
     }
 
     #[test]
     fn test_conversion_rate_zero_no_conversion() {
         // Even with unmethylated non-CpG C, conversion_rate=0 means no conversion
         let ref_seq = b"ACCTA";
-        let mut read = ref_seq.to_vec();
-        convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.0, 0.0, 42);
+        let read = convert(ref_seq, true, MethylationMode::EmSeq, 0.0, 0.0, 42);
         assert_eq!(read[1], b'C', "conversion_rate=0 should prevent conversion");
         assert_eq!(read[2], b'C', "conversion_rate=0 should prevent conversion");
     }
@@ -1923,8 +2286,7 @@ mod tests {
         let mut converted_count = 0;
         let trials = 10_000;
         for seed in 0..trials {
-            let mut read = ref_seq.to_vec();
-            convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.5, 1.0, seed);
+            let read = convert(ref_seq, true, MethylationMode::EmSeq, 0.5, 1.0, seed);
             if read[0] == b'T' {
                 converted_count += 1;
             }
@@ -1944,8 +2306,7 @@ mod tests {
         let mut converted_count = 0;
         let trials = 10_000;
         for seed in 0..trials {
-            let mut read = ref_seq.to_vec();
-            convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.75, 0.5, seed);
+            let read = convert(ref_seq, true, MethylationMode::EmSeq, 0.75, 0.5, seed);
             if read[1] == b'T' {
                 converted_count += 1;
             }
@@ -1960,8 +2321,7 @@ mod tests {
     #[test]
     fn test_conversion_rate_zero_leaves_bases_unchanged() {
         let ref_seq = b"CACACACACACACACAC"; // non-CpG Cs
-        let mut read = ref_seq.to_vec();
-        convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.0, 0.0, 42);
+        let read = convert(ref_seq, true, MethylationMode::EmSeq, 0.0, 0.0, 42);
         assert_eq!(read, ref_seq, "conversion_rate=0 should leave all bases unchanged");
     }
 
@@ -1969,8 +2329,7 @@ mod tests {
     fn test_conversion_rate_one_converts_all_targets() {
         // EM-Seq, cpg_methylation_rate=0 means all CpGs unmethylated -> all Cs are targets
         let ref_seq = b"CACACACACACACACAC"; // all non-CpG Cs
-        let mut read = ref_seq.to_vec();
-        convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.0, 1.0, 42);
+        let read = convert(ref_seq, true, MethylationMode::EmSeq, 0.0, 1.0, 42);
         for (i, &b) in read.iter().enumerate() {
             if ref_seq[i] == b'C' {
                 assert_eq!(b, b'T', "position {i}: C should be converted with rate=1.0");
@@ -1983,8 +2342,7 @@ mod tests {
     #[test]
     fn test_disabled_mode_never_converts() {
         let ref_seq = b"CACGTCACGTCACGT";
-        let mut read = ref_seq.to_vec();
-        convert(&mut read, ref_seq, 0, true, MethylationMode::Disabled, 0.75, 1.0, 42);
+        let read = convert(ref_seq, true, MethylationMode::Disabled, 0.75, 1.0, 42);
         assert_eq!(read, ref_seq, "Disabled mode should never modify bases");
     }
 

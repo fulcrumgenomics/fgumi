@@ -392,6 +392,59 @@ fn test_simulate_grouped_reads_deterministic() {
     );
 }
 
+/// The fixed per-`CpG` methylation state is seeded from `--seed`, so two methylation runs with
+/// the same seed are identical for every simulate command that writes a BAM (a command that
+/// drew the state from an unseeded RNG would differ between runs).
+#[test]
+fn test_simulate_methylation_deterministic() {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let reference = create_test_reference(tmp.path());
+    for command in ["grouped-reads", "mapped-reads", "consensus-reads"] {
+        let run = |n: usize| {
+            let bam = tmp.path().join(format!("{command}{n}.bam"));
+            let truth = tmp.path().join(format!("{command}{n}.tsv"));
+            let mut args: Vec<OsString> = [
+                "simulate",
+                command,
+                "--methylation-mode",
+                "em-seq",
+                "--seed",
+                "42",
+                "--threads",
+                "1",
+                "--reference",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+            args.extend([reference.clone().into(), "-o".into(), bam.clone().into()]);
+            if command == "consensus-reads" {
+                args.extend(["--num-reads".into(), "100".into()]);
+            } else {
+                args.extend([
+                    "--truth".into(),
+                    truth.into(),
+                    "--num-molecules".into(),
+                    "50".into(),
+                ]);
+            }
+            let output = fgumi(&args);
+            assert!(
+                output.status.success(),
+                "simulate {command} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            bam
+        };
+        let (bam1, bam2) = (run(1), run(2));
+        assert_bams_record_byte_identical(
+            &bam1,
+            &bam2,
+            &format!("simulate {command} --methylation-mode with one seed must be reproducible"),
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Simplex pipeline: grouped-reads -> simplex -> deterministic output
 // ---------------------------------------------------------------------------
