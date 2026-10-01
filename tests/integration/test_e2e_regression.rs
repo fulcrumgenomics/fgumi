@@ -714,17 +714,18 @@ fn test_e2e_methylation_pipeline() {
     .execute("fgumi simplex")
     .expect("simplex failed");
 
-    // Verify the simplex output actually carries methylation emission.
-    // The simplex BAM should contain at least one consensus record with the
-    // MM/ML methylation tag pair and the cu/ct TAPS-specific count arrays.
+    // Verify the simplex output carries methylation as observed bases plus cu/ct counts,
+    // with no MM/ML.
     assert_simplex_has_methylation_tags(&simplex);
 }
 
-/// Assert that a simplex BAM contains non-empty MM/ML and cu/ct tags on at
-/// least one record.
+/// Assert that a simplex BAM carries cu/ct on its records and no MM/ML, and that SEQ keeps
+/// the observed bases: wherever every read of the family showed the conversion (`ct > 0`,
+/// `cu == 0`), SEQ holds the converted base rather than a restored `C`/`G`.
 ///
 /// MM is a string tag (hex 'MM'), ML is a byte-array tag (hex 'ML').
-/// cu and ct are i16-array tags added by the EM-Seq/TAPS methylation caller.
+/// cu and ct are i16-array tags added by the EM-Seq/TAPS methylation caller, in read
+/// orientation like SEQ of these unmapped consensus records.
 #[allow(clippy::similar_names)] // MM/ML and cu/ct are the natural tag names.
 fn assert_simplex_has_methylation_tags(bam_path: &Path) {
     let file = File::open(bam_path).expect("failed to open simplex BAM");
@@ -741,10 +742,32 @@ fn assert_simplex_has_methylation_tags(bam_path: &Path) {
     let mut with_ml = 0usize;
     let mut with_cu = 0usize;
     let mut with_ct = 0usize;
+    let mut converted_sites = 0usize;
     for result in reader.records() {
         let record = result.expect("failed to read simplex record");
         let data = record.data();
         total += 1;
+        let counts = |tag| match data.get(&tag) {
+            Some(Ok(noodles::sam::alignment::record::data::field::Value::Array(
+                noodles::sam::alignment::record::data::field::value::Array::Int16(values),
+            ))) => values.iter().collect::<std::io::Result<Vec<i16>>>().ok(),
+            _ => None,
+        };
+        if let (Some(cu), Some(ct)) = (counts(cu_tag), counts(ct_tag)) {
+            let seq: Vec<u8> = record.sequence().iter().collect();
+            for (i, base) in seq.iter().enumerate() {
+                if ct[i] > 0 && cu[i] == 0 {
+                    converted_sites += 1;
+                    // R1/fragment records convert C->T, R2 records G->A (read orientation).
+                    let expected = if record.flags().is_last_segment() { b'A' } else { b'T' };
+                    assert_eq!(
+                        char::from(*base),
+                        char::from(expected),
+                        "position {i}: SEQ must keep the converted base"
+                    );
+                }
+            }
+        }
         if data.get(&mm_tag).is_some() {
             with_mm += 1;
         }
@@ -760,8 +783,9 @@ fn assert_simplex_has_methylation_tags(bam_path: &Path) {
     }
 
     assert!(total > 0, "Simplex BAM should contain at least one record");
-    assert!(with_mm > 0, "Expected at least one record with an MM tag; got {total} records");
-    assert!(with_ml > 0, "Expected at least one record with an ML tag; got {total} records");
+    assert_eq!(with_mm, 0, "simplex SEQ is converted, so no record carries MM");
+    assert_eq!(with_ml, 0, "simplex SEQ is converted, so no record carries ML");
+    assert!(converted_sites > 0, "Expected fully converted sites to check SEQ against");
     assert!(with_cu > 0, "Expected at least one record with a cu tag; got {total} records");
     assert!(with_ct > 0, "Expected at least one record with a ct tag; got {total} records");
 }

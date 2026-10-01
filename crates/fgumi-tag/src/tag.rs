@@ -131,6 +131,9 @@ impl SamTag {
     pub const MM: SamTag = SamTag::new(b'M', b'M');
     /// Per-base modification probabilities, paired with `MM` (SAM spec).
     pub const ML: SamTag = SamTag::new(b'M', b'L');
+    /// Length of SEQ when `MM`/`ML` were computed, so consumers can detect stale
+    /// modification data (SAM spec).
+    pub const MN: SamTag = SamTag::new(b'M', b'N');
     /// Phred-likelihood that the segment is incorrect (SAM spec).
     pub const UQ: SamTag = SamTag::new(b'U', b'Q');
     /// Original base quality scores, before recalibration (SAM spec).
@@ -451,6 +454,7 @@ mod tests {
     fn test_sam_spec_extension_constants() {
         assert_eq!(*SamTag::MM, [b'M', b'M']);
         assert_eq!(*SamTag::ML, [b'M', b'L']);
+        assert_eq!(*SamTag::MN, [b'M', b'N']);
         assert_eq!(*SamTag::UQ, [b'U', b'Q']);
         assert_eq!(*SamTag::OQ, [b'O', b'Q']);
     }

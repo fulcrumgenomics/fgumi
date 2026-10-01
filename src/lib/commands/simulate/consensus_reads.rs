@@ -798,6 +798,11 @@ fn build_consensus_record(
 
     // Add methylation tags if enabled.
     if let Some(meth) = methylation {
+        let strand_pattern = if is_top_strand {
+            fgumi_consensus::methylation::ConversionPattern::CToT
+        } else {
+            fgumi_consensus::methylation::ConversionPattern::GToA
+        };
         // cu/ct tags (unconverted/converted counts per position).
         let cu: Vec<i16> = meth.annotation.unconverted_counts();
         let ct: Vec<i16> = meth.annotation.converted_counts();
@@ -805,7 +810,7 @@ fn build_consensus_record(
 
         // MM/ML tags (SAM spec methylation tags).
         if let Some((mm, ml)) =
-            build_mm_ml_tags(seq, &meth.annotation, is_top_strand, methylation_mode)
+            build_mm_ml_tags(seq, &meth.annotation, strand_pattern, methylation_mode)
         {
             b.add_string_tag(SamTag::MM, mm.as_bytes()).add_array_u8(SamTag::ML, &ml);
         }
@@ -825,7 +830,7 @@ fn build_consensus_record(
             if let Some(am) = fgumi_consensus::methylation::build_mm_tag_no_ml(
                 seq,
                 ab,
-                is_top_strand,
+                strand_pattern,
                 methylation_mode,
             ) {
                 b.add_string_tag(SamTag::AM_BASES, am.as_bytes());
@@ -833,7 +838,7 @@ fn build_consensus_record(
             if let Some(bm) = fgumi_consensus::methylation::build_mm_tag_no_ml(
                 seq,
                 ba,
-                is_top_strand,
+                strand_pattern,
                 methylation_mode,
             ) {
                 b.add_string_tag(SamTag::BM_BASES, bm.as_bytes());

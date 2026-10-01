@@ -1340,6 +1340,11 @@ impl DuplexConsensusCaller {
             // When is_ba_only is true, the BA consensus was stored in ab_consensus
             // (no AB strand existed), so per-strand tags must use bottom-strand orientation.
             let is_top_strand = !consensus.is_ba_only;
+            let strand_pattern = if is_top_strand {
+                crate::methylation::ConversionPattern::CToT
+            } else {
+                crate::methylation::ConversionPattern::GToA
+            };
 
             // Per-strand methylation tags
             if let Some(ab_annot) = &consensus.ab_consensus.methylation {
@@ -1352,7 +1357,7 @@ impl DuplexConsensusCaller {
                 if let Some(mm_val) = crate::methylation::build_mm_tag_no_ml(
                     &consensus.ab_consensus.bases,
                     ab_annot,
-                    is_top_strand,
+                    strand_pattern,
                     methylation_mode,
                 ) {
                     builder.append_string_tag(mm_tag, mm_val.as_bytes());
@@ -1369,7 +1374,7 @@ impl DuplexConsensusCaller {
                 if let Some(bm) = crate::methylation::build_mm_tag_no_ml(
                     &ba.bases,
                     ba_annot,
-                    false,
+                    crate::methylation::ConversionPattern::GToA,
                     methylation_mode,
                 ) {
                     builder.append_string_tag(SamTag::BM_BASES, bm.as_bytes());
@@ -1385,7 +1390,7 @@ impl DuplexConsensusCaller {
             if let Some((mm, ml)) = crate::methylation::build_mm_ml_tags(
                 &consensus.bases,
                 combined_annot,
-                is_top_strand,
+                strand_pattern,
                 methylation_mode,
             ) {
                 builder.append_string_tag(SamTag::MM, mm.as_bytes());
