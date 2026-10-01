@@ -962,7 +962,7 @@ fn templates_to_records_flattens_every_record_including_split_alignments(
 /// `ZipperMergeStep` (Serial Step2) does pairing **and** merge in one step. Issue
 /// #972 splits it into a Serial `ZipperZipStep` (pairing → `ZippedBatch`) and a
 /// Parallel `ZipperMerge` (the per-template merge, reusing the same
-/// `merge_one_template_with` body), so the merge can fan out at high threads.
+/// `merge_raw_with` body), so the merge can fan out at high threads.
 /// This drives identical paired inputs — including reads missing from the mapped
 /// side, which emit unmapped-only, interleaved in queryname order — through both
 /// the original step and the split, and asserts the flattened output record
@@ -998,7 +998,6 @@ fn zipper_split_matches_zippermergestep_bytes(
         tag_info: Arc::new(crate::umi::TagInfo::new(vec![], vec![], vec![])),
         skip_tc_tags: true,
         exclude_missing_reads: exclude_missing,
-        reference: None,
         output_header: Arc::new(Header::default()),
         missing_count: Arc::new(AtomicU64::new(0)),
         records_emitted: Arc::new(AtomicU64::new(0)),
@@ -1172,7 +1171,6 @@ fn zipper_split_cfg(
         tag_info: Arc::new(crate::umi::TagInfo::new(vec![], vec![], vec![])),
         skip_tc_tags: true,
         exclude_missing_reads,
-        reference: None,
         output_header: Arc::new(Header::default()),
         missing_count: Arc::new(AtomicU64::new(0)),
         records_emitted: Arc::new(AtomicU64::new(0)),

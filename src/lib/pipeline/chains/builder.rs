@@ -1132,9 +1132,8 @@ impl<'a> ChainBuilder<'a> {
     ///   Note that both preamble chains end at `GroupByQueryname` so their
     ///   output type is `OrderedBytesSingle<BamTemplateBatch>`, matching
     ///   `ZipperZipStep: Step2<InputA = BamTemplateBatch, InputB = BamTemplateBatch>`.
-    ///   The reference path is stashed in `PendingSource::Paired` but is
-    ///   consumed later by `add_zipper` (reference loading is deferred because
-    ///   `restore_unconverted_bases` controls whether the FASTA is opened at all).
+    ///   The reference path is stashed in `PendingSource::Paired`; the merge
+    ///   itself never opens the FASTA.
     /// - `PendingSource::Fastq`: builds the FASTQ read preamble — one
     ///   per-stream reader/decode sub-chain feeding the unified K-stream join
     ///   (`ZipRawFastqK`/`WrapRawFastq1 → ParseAndZipFastqN`) for any K.
@@ -2842,10 +2841,7 @@ impl<'a> ChainBuilder<'a> {
     /// chain); a spec without them merges with the defaults, as standalone
     /// zipper does with no flags. `exclude_missing_reads` has nothing to act on
     /// here — a template the aligner drops fails the run — so it only warns.
-    fn fused_merge_rules(
-        &self,
-        reference: &std::path::Path,
-    ) -> Result<crate::commands::zipper::ZipperMergeRules> {
+    fn fused_merge_rules(&self) -> Result<crate::commands::zipper::ZipperMergeRules> {
         let zipper_opts = self.spec.stage_opts.zipper.clone().unwrap_or_default();
         if zipper_opts.exclude_missing_reads {
             log::warn!(
@@ -2854,7 +2850,7 @@ impl<'a> ChainBuilder<'a> {
                  be missing"
             );
         }
-        zipper_opts.merge_rules(reference)
+        zipper_opts.merge_rules()
     }
 
     /// AlignAndMerge-specific step sequence:
@@ -3035,13 +3031,10 @@ impl<'a> ChainBuilder<'a> {
         // The zipper merge every aligned template goes through, run by the
         // backend (the subprocess backend's shared `Parallel` merge step, or the
         // in-process pair/emit step).
-        let ZipperMergeRules { tag_info, skip_tc_tags, reference } =
-            self.fused_merge_rules(&align_opts.reference)?;
+        let ZipperMergeRules { tag_info, skip_tc_tags } = self.fused_merge_rules()?;
         let merge_config = std::sync::Arc::new(MergeConfig {
             tag_info,
             skip_tc_tags,
-            reference,
-            partial_output_header: std::sync::Arc::clone(&partial_header),
             records_emitted: std::sync::Arc::clone(&records_emitted),
             output_byte_limit: self.tuning.per_step_byte_limit,
         });
@@ -3174,12 +3167,11 @@ impl<'a> ChainBuilder<'a> {
             .take()
             .ok_or_else(|| anyhow!("add_zipper: paired_tail missing — spec must be PairedBams"))?;
 
-        // Resolve the reference path from the spec (the reference is always
-        // SourceSpec::PairedBams for zipper — validated by the cross-stage validator).
-        let reference_path = match &self.spec.source {
-            SourceSpec::PairedBams { reference, .. } => reference.clone(),
-            other => bail!("Stage::Zipper requires SourceSpec::PairedBams, got {other:?}"),
-        };
+        // The source is always SourceSpec::PairedBams for zipper — validated by the
+        // cross-stage validator.
+        if !matches!(&self.spec.source, SourceSpec::PairedBams { .. }) {
+            bail!("Stage::Zipper requires SourceSpec::PairedBams, got {:?}", self.spec.source);
+        }
 
         // Give the zipper chain at least 4 workers. This is a performance floor,
         // not a hard requirement — the chain runs at 1-3 workers too, but the
@@ -3210,7 +3202,6 @@ impl<'a> ChainBuilder<'a> {
         let merge_cfg = build_zipper_merge_config(ZipperMergeCaptures {
             zipper_opts: zipper_opts.clone(),
             output_header: Arc::new(self.header.clone()),
-            reference_path,
             tuning: floored_tuning,
             missing_count: Arc::clone(&missing_count),
             records_emitted: Arc::clone(&records_emitted),

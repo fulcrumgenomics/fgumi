@@ -48,13 +48,12 @@
 //! - `merge_raw()`: Core function that transfers metadata between templates using raw bytes
 use crate::commands::command::Command;
 use crate::logging::OperationTimer;
-use crate::reference::{ReferenceReader, find_dict_path};
+use crate::reference::find_dict_path;
 use crate::sam::{SamTag, TemplateCoordinateInfo, check_sort};
 use crate::template::{Template, TemplateIterator};
 use crate::umi::TagInfo;
 use crate::validation::{validate_file_exists, validate_input_exists};
-use anyhow::{Context, Result, ensure};
-use bstr::ByteSlice;
+use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::{
@@ -62,9 +61,8 @@ use fgumi_bam_io::{
     make_bgzf_reader,
 };
 use fgumi_raw_bam;
-use fgumi_raw_bam::{BAM_BASE_TO_ASCII, RawRecord, RawRecordView, TagBitset};
+use fgumi_raw_bam::{RawRecord, RawRecordView, TagBitset};
 use log::{debug, info};
-use noodles::core::Position;
 use noodles::sam::Header;
 use std::collections::HashSet;
 use std::io::{BufReader, Read};
@@ -222,17 +220,9 @@ pub struct Zipper {
     #[arg(long = "skip-tc-tags", alias = "skip-pa-tags", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub skip_tc_tags: bool,
 
-    /// Restore unconverted bases in EM-seq consensus reads after bwameth re-alignment.
-    ///
-    /// In EM-seq, unmethylated cytosines are converted to thymine (top strand) or
-    /// adenine (bottom strand). After bwameth re-alignment, this flag replaces converted
-    /// bases back to their unconverted reference form at reference C (top strand) or
-    /// reference G (bottom strand) positions. Uses the bwameth `YD` tag to determine
-    /// the bisulfite strand.
-    ///
-    /// This produces a final BAM where the sequence shows the original (unconverted) bases,
-    /// while methylation state is preserved in MM/ML tags and cu/ct count tags.
-    #[arg(long = "restore-unconverted-bases", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    /// Removed; kept hidden only so that passing it fails with a pointer to the methylation
+    /// guide rather than clap's bare "unexpected argument".
+    #[arg(long = "restore-unconverted-bases", hide = true, value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub restore_unconverted_bases: bool,
 }
 
@@ -292,9 +282,11 @@ pub struct ZipperOptions {
         hide_possible_values = true
     )]
     pub skip_tc_tags: bool,
-    /// Restore unconverted bases in EM-seq consensus reads.
+    /// Removed; kept hidden so that passing it fails with a pointer to the methylation guide
+    /// (see `ZipperOptions::merge_rules`).
     #[arg(
         long = "restore-unconverted-bases",
+        hide = true,
         value_name = "true|false",
         default_value = "false",
         num_args = 0..=1,
@@ -305,6 +297,13 @@ pub struct ZipperOptions {
     )]
     pub restore_unconverted_bases: bool,
 }
+
+/// Error for the removed `--restore-unconverted-bases` flag, which v0.7.0 and earlier accepted.
+pub(crate) const RESTORE_UNCONVERTED_BASES_REMOVED: &str = "--restore-unconverted-bases was removed; drop it from the command. Duplex methylation consensus \
+     SEQ is already the molecule's unconverted sequence (with MM/ML), and simplex SEQ keeps the \
+     converted bases that bisulfite-aware aligners (bwa-mem3 mem --meth) and SEQ-based \
+     methylation callers expect, so no restore is needed. See \"Consensus SEQ by Caller\" in the \
+     methylation guide (docs/src/guide/methylation.md)";
 
 /// The per-template merge rules a zipper option set selects.
 ///
@@ -317,19 +316,19 @@ pub(crate) struct ZipperMergeRules {
     pub(crate) tag_info: std::sync::Arc<TagInfo>,
     /// Whether to skip adding `tc` tags to secondary/supplementary records.
     pub(crate) skip_tc_tags: bool,
-    /// The reference for `--restore-unconverted-bases`; `None` when it is off.
-    pub(crate) reference: Option<std::sync::Arc<ReferenceReader>>,
 }
 
 impl ZipperOptions {
     /// Resolve the [`ZipperMergeRules`] these options select, logging the tag
-    /// manipulations and loading `reference_path` only when
-    /// `--restore-unconverted-bases` is set.
+    /// manipulations.
     ///
     /// # Errors
     ///
-    /// Returns an error if the reference FASTA cannot be opened.
-    pub(crate) fn merge_rules(&self, reference_path: &Path) -> Result<ZipperMergeRules> {
+    /// Returns an error if the removed `--restore-unconverted-bases` was passed.
+    pub(crate) fn merge_rules(&self) -> Result<ZipperMergeRules> {
+        if self.restore_unconverted_bases {
+            bail!(RESTORE_UNCONVERTED_BASES_REMOVED);
+        }
         let tag_info = TagInfo::new(
             self.tags_to_remove.clone(),
             self.tags_to_reverse.clone(),
@@ -345,16 +344,9 @@ impl ZipperOptions {
             info!("Tags being reverse complemented: {:?}", tag_info.revcomp);
         }
 
-        let reference = if self.restore_unconverted_bases {
-            info!("Loading reference FASTA for unconverted base restoration");
-            Some(std::sync::Arc::new(ReferenceReader::new(reference_path)?))
-        } else {
-            None
-        };
         Ok(ZipperMergeRules {
             tag_info: std::sync::Arc::new(tag_info),
             skip_tc_tags: self.skip_tc_tags,
-            reference,
         })
     }
 }
@@ -557,7 +549,7 @@ fn collect_mapped_indices(mapped: &Template, is_first_segment: bool) -> Vec<usiz
 ///
 /// `pub(crate)` so callers that merge many templates per `TagInfo` (e.g.
 /// the align stage's zipper merge and `ZipperMergeStep`) can build one `ZipperTags` for
-/// the whole step and drive [`merge_one_template_with`] directly, instead of
+/// the whole step and drive [`merge_raw_with`] directly, instead of
 /// paying the three-`TagBitset`-allocation cost on every template. Fields
 /// stay private — callers hold this opaquely.
 pub(crate) struct ZipperTags {
@@ -625,7 +617,15 @@ pub fn merge_raw(
 
 /// Core of [`merge_raw`], operating on precomputed [`ZipperTags`] so the bitsets
 /// are built once per run rather than once per template.
-fn merge_raw_with(
+///
+/// Both callers that merge many templates against the same `TagInfo` —
+/// `ZipperMerge` (the Parallel zipper-chain merge step) and
+/// `align::merge::merge_zipper_batch` (the align stage's merge) — build the
+/// `ZipperTags` once, outside their per-template loop, and hold it on the
+/// step for the step's whole lifetime rather than rebuilding it (three
+/// `TagBitset` allocations) on every call. Returned errors are bare — callers
+/// add their own context at the call site.
+pub(crate) fn merge_raw_with(
     unmapped: &Template,
     mapped: &mut Template,
     tags: &ZipperTags,
@@ -972,167 +972,6 @@ fn encode_unmapped_template_records(
     Ok(template.records().to_vec())
 }
 
-/// YD value for the forward (top) bisulfite strand.
-const YD_FORWARD: &[u8] = b"f";
-/// YD value for the reverse (bottom) bisulfite strand.
-const YD_REVERSE: &[u8] = b"r";
-
-/// Restore unconverted bases in EM-seq reads after bwameth re-alignment, operating
-/// directly on raw BAM bytes.
-///
-/// For each mapped record in the template, walks the CIGAR alignment and replaces
-/// converted bases back to their unconverted reference form in-place:
-/// - Top strand (`YD:Z:f`): at reference-C positions, T→C
-/// - Bottom strand (`YD:Z:r`): at reference-G positions, A→G
-///
-/// Skips unmapped reads and reads without a `YD` tag.
-fn restore_unconverted_bases_in_raw_template(
-    template: &mut Template,
-    reference: &ReferenceReader,
-    header: &Header,
-) -> Result<()> {
-    for rec in template.records_mut().iter_mut() {
-        restore_unconverted_bases_in_raw_record(rec, reference, header)?;
-    }
-    Ok(())
-}
-
-/// Restore unconverted bases in a single EM-seq record after bwameth re-alignment,
-/// operating directly on raw BAM bytes.
-///
-/// Edits the packed 4-bit nibbles in place via [`RawRecord::set_base`], avoiding
-/// a decode-mutate-reencode round-trip through `RecordBuf`.
-fn restore_unconverted_bases_in_raw_record(
-    rec: &mut RawRecord,
-    reference: &ReferenceReader,
-    header: &Header,
-) -> Result<()> {
-    // Skip unmapped reads
-    if rec.is_unmapped() {
-        return Ok(());
-    }
-
-    // Get the bisulfite strand from the bwameth YD tag
-    let yd_bytes = rec.tags().find_string(SamTag::YD).map(|s| s.to_vec());
-    let is_top = match yd_bytes.as_deref() {
-        Some(s) if s == YD_FORWARD => true,
-        Some(s) if s == YD_REVERSE => false,
-        _ => return Ok(()), // No YD tag or unexpected value; skip
-    };
-
-    // Get reference contig name
-    let raw_ref_id = rec.ref_id();
-    if raw_ref_id < 0 {
-        return Ok(());
-    }
-    let ref_id_usize = raw_ref_id as usize;
-    let (ref_name, _) = header
-        .reference_sequences()
-        .get_index(ref_id_usize)
-        .context("reference sequence ID not found in header")?;
-    let ref_name: &str = ref_name.to_str().context("reference sequence name is not valid UTF-8")?;
-
-    // Get alignment start (1-based); pos() is 0-based
-    let alignment_start = match rec.alignment_start_1based() {
-        Some(pos) => pos,
-        None => return Ok(()),
-    };
-
-    // Compute reference span from CIGAR
-    let ref_span = rec.reference_length();
-    if ref_span <= 0 {
-        return Ok(());
-    }
-    let ref_span = ref_span as usize;
-
-    // Fetch the entire aligned reference region at once.
-    let ref_start = Position::try_from(alignment_start)?;
-    let ref_end = Position::try_from(alignment_start + ref_span - 1)?;
-    let ref_bases = reference.fetch_slice(ref_name, ref_start, ref_end)?;
-
-    // Determine replacement parameters; SEQ is reverse-complemented when 0x10 is set.
-    let is_reverse = rec.is_reverse();
-    let (ref_target, converted_base, unconverted_base) = match (is_top, is_reverse) {
-        (true, false) | (false, true) => (b'C', b'T', b'C'),
-        (true, true) | (false, false) => (b'G', b'A', b'G'),
-    };
-    let ref_target_lower = ref_target.to_ascii_lowercase();
-    let converted_base_lower = converted_base.to_ascii_lowercase();
-
-    // Fast path: if no candidate reference base appears in the aligned span, skip.
-    if memchr::memchr2(ref_target, ref_target_lower, ref_bases).is_none() {
-        return Ok(());
-    }
-
-    // Collect CIGAR ops up front so we can interleave immutable reads (get_base)
-    // and mutable writes (set_base) without fighting the borrow checker.
-    let cigar_ops = rec.cigar_ops_vec();
-    let l_seq = rec.l_seq() as usize;
-
-    let mut changed = false;
-    let mut read_pos: usize = 0;
-    let mut ref_offset: usize = 0; // 0-based offset into ref_bases
-
-    for op in &cigar_ops {
-        let op_type = op & 0xF;
-        let len = (op >> 4) as usize;
-
-        // op_type constants (BAM CIGAR encoding):
-        //   0 = M (Match/Mismatch)
-        //   1 = I (Insertion)
-        //   2 = D (Deletion)
-        //   3 = N (Skip / reference skip)
-        //   4 = S (SoftClip)
-        //   5 = H (HardClip)
-        //   6 = P (Pad)
-        //   7 = = (SequenceMatch)
-        //   8 = X (SequenceMismatch)
-        match op_type {
-            0 | 7 | 8 => {
-                // Consumes both query and reference
-                for i in 0..len {
-                    if ref_offset + i >= ref_bases.len() {
-                        break;
-                    }
-                    let rb = ref_bases[ref_offset + i];
-                    if (rb == ref_target || rb == ref_target_lower) && read_pos + i < l_seq {
-                        let raw_code = rec.get_base(read_pos + i);
-                        let sb = BAM_BASE_TO_ASCII[raw_code as usize];
-                        if sb == converted_base || sb == converted_base_lower {
-                            rec.set_base(read_pos + i, unconverted_base);
-                            changed = true;
-                        }
-                    }
-                }
-                read_pos += len;
-                ref_offset += len;
-            }
-            1 | 4 => {
-                // Consumes query only (Insertion, SoftClip)
-                read_pos += len;
-            }
-            2 | 3 => {
-                // Consumes reference only (Deletion, Skip)
-                ref_offset += len;
-            }
-            5 | 6 => {
-                // HardClip, Pad — consumes neither
-            }
-            _ => {}
-        }
-    }
-
-    if changed {
-        // NM/MD tags are now stale since SEQ changed; remove them so downstream
-        // tools don't trust incorrect mismatch counts.
-        let mut ed = rec.tags_editor();
-        ed.remove(SamTag::NM);
-        ed.remove(SamTag::MD);
-    }
-
-    Ok(())
-}
-
 impl Zipper {
     /// Build the mapped reader from an already-opened stream, detecting BAM vs SAM
     /// from the leading bytes.
@@ -1312,14 +1151,6 @@ impl Zipper {
                         rules.skip_tc_tags,
                         &mut aux_scratch,
                     )?;
-                    if let Some(ref_reader) = rules.reference.as_deref() {
-                        // EM-seq: restore converted bases in-place on packed 4-bit nibbles.
-                        restore_unconverted_bases_in_raw_template(
-                            mapped_template,
-                            ref_reader,
-                            output_header,
-                        )?;
-                    }
                     for rec in mapped_template.records() {
                         writer.write_raw_record(rec)?;
                         progress.log_if_needed(1);
@@ -1441,6 +1272,10 @@ impl Command for Zipper {
     /// - Input files have different sets of read names
     /// - I/O errors occur during reading or writing
     fn execute(&self, command_line: &str) -> Result<()> {
+        // Fail before any input is opened (stdin/FIFO headers would otherwise be consumed).
+        if self.restore_unconverted_bases {
+            bail!(RESTORE_UNCONVERTED_BASES_REMOVED);
+        }
         info!("Starting zipper");
 
         let timer = OperationTimer::new("Zipping BAMs");
@@ -1524,9 +1359,9 @@ impl Command for Zipper {
         // Add @PG record with PP chaining
         let output_header = crate::commands::common::add_pg_record(output_header, command_line)?;
 
-        // Tag rules and the optional restore reference, resolved the same way
-        // for every zipper merge (see `ZipperOptions::merge_rules`).
-        let rules = self.to_zipper_options().merge_rules(&self.reference)?;
+        // Tag rules, resolved the same way for every zipper merge (see
+        // `ZipperOptions::merge_rules`).
+        let rules = self.to_zipper_options().merge_rules()?;
 
         // Build the tag lookups once for the whole run; `process_raw` reuses them
         // for every template on either scheduling path.
@@ -1584,37 +1419,6 @@ impl Command for Zipper {
 /// with the log site and cannot drift.
 pub const NEW_PIPELINE_START_LOG: &str = "Starting zipper (new pipeline)";
 
-/// Apply the full zipper merge body to a single (unmapped, mapped) template
-/// pair, given precomputed [`ZipperTags`]. Runs `merge_raw_with`, then (when
-/// `reference` is `Some`) `restore_unconverted_bases_in_raw_template` for the
-/// bisulfite path.
-///
-/// Both callers that merge many templates against the same `TagInfo` —
-/// `ZipperMerge` (the Parallel zipper-chain merge step) and
-/// `align::merge::merge_zipper_batch` (the align stage's merge) — build the
-/// `ZipperTags` once, outside their per-template loop, and hold it on the
-/// step for the step's whole lifetime rather than rebuilding it (three
-/// `TagBitset` allocations) on every call.
-///
-/// Returned errors are bare — callers add their own context (e.g. the
-/// caller's step name) via `.map_err`/`?` at the call site so the surfaced
-/// error is attributable to the dispatching context.
-pub(crate) fn merge_one_template_with(
-    unmapped: &Template,
-    mapped: &mut Template,
-    tags: &ZipperTags,
-    skip_tc_tags: bool,
-    reference: Option<&ReferenceReader>,
-    output_header: &Header,
-    aux_scratch: &mut Vec<u8>,
-) -> Result<()> {
-    merge_raw_with(unmapped, mapped, tags, skip_tc_tags, aux_scratch)?;
-    if let Some(ref_reader) = reference {
-        restore_unconverted_bases_in_raw_template(mapped, ref_reader, output_header)?;
-    }
-    Ok(())
-}
-
 // ── ported from feat-runall for the chain builder (R2): the Step2 merge step ──
 pub(crate) mod merge_step {
     use std::io;
@@ -1633,7 +1437,7 @@ pub(crate) mod merge_step {
         Step, Step2, StepCtx, StepCtx2, StepKind, StepOutcome, StepProfile,
     };
     use crate::pipeline::steps::types::BamTemplateBatch;
-    use crate::reference::ReferenceReader;
+
     use crate::template::Template;
     use crate::umi::TagInfo;
 
@@ -1654,7 +1458,6 @@ pub(crate) mod merge_step {
         pub tag_info: Arc<TagInfo>,
         pub skip_tc_tags: bool,
         pub exclude_missing_reads: bool,
-        pub reference: Option<Arc<ReferenceReader>>,
         pub output_header: Arc<Header>,
         /// Counter for unmapped templates that had no mapped match.
         /// Exposed back to the command after `Pipeline::run` so the
@@ -1845,13 +1648,11 @@ pub(crate) mod merge_step {
             mut mapped: Template,
             ctx: &mut StepCtx2<'_, Self>,
         ) -> io::Result<Option<StepOutcome>> {
-            super::merge_one_template_with(
+            super::merge_raw_with(
                 &unmapped,
                 &mut mapped,
                 &self.tags,
                 self.cfg.skip_tc_tags,
-                self.cfg.reference.as_deref(),
-                &self.cfg.output_header,
                 &mut self.aux_scratch,
             )
             .map_err(|e| io::Error::other(format!("ZipperMergeStep: {e}")))?;
@@ -2052,7 +1853,7 @@ pub(crate) mod merge_step {
     // Serial step, so merge throughput is single-core. Issue #972 splits it: the
     // cheap ordered pairing stays Serial (`ZipperZipStep`, emitting `ZippedBatch`
     // pairs) while the expensive per-template transform fans out across workers
-    // (`ZipperMerge`, Parallel). Both reuse the *same* `merge_one_template_with`
+    // (`ZipperMerge`, Parallel). Both reuse the *same* `merge_raw_with`
     // body the single step uses, so output is byte-identical (proven against
     // `ZipperMergeStep` as an oracle in `chain_tests.rs`).
     // ──────────────────────────────────────────────────────────────────────
@@ -2360,7 +2161,7 @@ pub(crate) mod merge_step {
     /// `Parallel + ByItemOrdinal` step that runs the per-template merge over the
     /// [`ZippedBatch`]es emitted by [`ZipperZipStep`], fanning the work across the
     /// work-stealing pool. `Pair` items go through the shared
-    /// [`super::merge_one_template_with`] body (identical to `ZipperMergeStep`);
+    /// [`super::merge_raw_with`] body (identical to `ZipperMergeStep`);
     /// `UnmappedOnly` items are encoded as-is. The input `serial` is carried onto
     /// the emitted `BamTemplateBatch` so `ByItemOrdinal` restores serial order.
     pub(crate) struct ZipperMerge {
@@ -2438,13 +2239,11 @@ pub(crate) mod merge_step {
             for item in items {
                 let template = match item {
                     ZipItem::Pair { unmapped, mut mapped } => {
-                        super::merge_one_template_with(
+                        super::merge_raw_with(
                             &unmapped,
                             &mut mapped,
                             &self.tags,
                             self.cfg.skip_tc_tags,
-                            self.cfg.reference.as_deref(),
-                            &self.cfg.output_header,
                             &mut self.aux_scratch,
                         )
                         .map_err(|e| io::Error::other(format!("ZipperMerge: {e}")))?;
@@ -2497,7 +2296,6 @@ pub(crate) mod merge_step {
                 tag_info: Arc::new(TagInfo::new(vec![], vec![], vec![])),
                 skip_tc_tags: true,
                 exclude_missing_reads: exclude,
-                reference: None,
                 output_header: Arc::new(Header::default()),
                 missing_count: Arc::new(AtomicU64::new(0)),
                 records_emitted: Arc::new(AtomicU64::new(0)),
@@ -2536,7 +2334,7 @@ pub(crate) mod merge_step {
         /// once (`self.tags`) and `emit_merged` reuses that same cached value
         /// for every matched (unmapped, mapped) pair the step ever merges,
         /// instead of rebuilding it per template. This drives the exact
-        /// cached `step.tags` through `merge_one_template_with` — what
+        /// cached `step.tags` through `merge_raw_with` — what
         /// `emit_merged` calls — across THREE (unmapped, mapped) pairs under
         /// a non-trivial remove/reverse/revcomp `TagInfo`, and asserts each
         /// pair independently gets the correct treatment. A bug that
@@ -2576,13 +2374,11 @@ pub(crate) mod merge_step {
                     .add_string_tag(*b"XA", b"drop-me");
                 let unmapped = Template::from_records(vec![ub.build()]).expect("unmapped template");
 
-                crate::commands::zipper::merge_one_template_with(
+                crate::commands::zipper::merge_raw_with(
                     &unmapped,
                     &mut mapped,
                     &step.tags,
                     step.cfg.skip_tc_tags,
-                    step.cfg.reference.as_deref(),
-                    &step.cfg.output_header,
                     &mut Vec::new(),
                 )
                 .expect("merge ok");
@@ -2636,13 +2432,11 @@ pub(crate) mod merge_step {
                     .add_string_tag(*b"XV", b"keep");
                 let unmapped = Template::from_records(vec![ub.build()]).expect("unmapped template");
 
-                crate::commands::zipper::merge_one_template_with(
+                crate::commands::zipper::merge_raw_with(
                     &unmapped,
                     &mut mapped,
                     &step.tags,
                     step.cfg.skip_tc_tags,
-                    step.cfg.reference.as_deref(),
-                    &step.cfg.output_header,
                     &mut Vec::new(),
                 )
                 .expect("merge ok");
@@ -5680,7 +5474,6 @@ mod tests {
             "4242",
             "--exclude-missing-reads=true",
             "--skip-tc-tags=true",
-            "--restore-unconverted-bases=true",
         ])
         .expect("failed to parse Zipper arguments");
 
@@ -5691,7 +5484,6 @@ mod tests {
         assert_eq!(opts.tags_to_revcomp, vec!["OX".to_string(), "ZA".to_string()]);
         assert!(opts.exclude_missing_reads);
         assert!(opts.skip_tc_tags);
-        assert!(opts.restore_unconverted_bases);
     }
 
     /// The projection must also carry defaults faithfully — a field hard-coded
@@ -5820,308 +5612,82 @@ mod tests {
         );
     }
 
+    /// `--restore-unconverted-bases` (v0.7.0 and earlier) was removed. It stays parseable but
+    /// hidden, so that passing it, standalone or as `runall`'s `--zipper::` form, fails with a
+    /// pointer to the methylation guide instead of clap's bare "unexpected argument".
     #[rstest]
-    // --restore-unconverted-bases (default false)
-    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam"], false)]
-    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--restore-unconverted-bases"], true)]
-    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--restore-unconverted-bases", "true"], true)]
-    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--restore-unconverted-bases", "false"], false)]
-    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--restore-unconverted-bases=true"], true)]
-    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--restore-unconverted-bases=false"], false)]
-    fn test_restore_unconverted_bases_parsing(#[case] args: &[&str], #[case] expected: bool) {
-        let cmd = Zipper::try_parse_from(args).expect("failed to parse Zipper arguments");
-        assert_eq!(cmd.restore_unconverted_bases, expected);
+    #[case::flag(&["--restore-unconverted-bases"])]
+    #[case::explicit_true(&["--restore-unconverted-bases=true"])]
+    fn test_restore_unconverted_bases_is_removed(#[case] flag: &[&str]) {
+        let mut args = vec!["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam"];
+        args.extend_from_slice(flag);
+        let cmd = Zipper::try_parse_from(args).expect("the removed flag still parses");
+        let err = cmd.to_zipper_options().merge_rules().err().expect("must be rejected");
+        assert_eq!(err.to_string(), RESTORE_UNCONVERTED_BASES_REMOVED);
+
+        let arg = Zipper::command()
+            .get_arguments()
+            .find(|a| a.get_long() == Some("restore-unconverted-bases"))
+            .cloned()
+            .expect("the removed flag is still registered");
+        assert!(arg.is_hide_set(), "the flag must be hidden");
     }
 
-    /// Helper: decode the sequence from a `RawRecord` to ASCII bytes.
-    fn raw_sequence(rec: &RawRecord) -> Vec<u8> {
-        rec.view().sequence_vec()
-    }
-
-    /// Helper: check that a tag is absent in a `RawRecord`'s aux data.
-    fn raw_tag_absent(rec: &RawRecord, tag: [u8; 2]) -> bool {
-        fgumi_raw_bam::find_string_tag_in_record(rec.as_ref(), tag).is_none()
-            && fgumi_raw_bam::find_tag_type(fgumi_raw_bam::aux_data_slice(rec.as_ref()), tag)
-                .is_none()
-    }
-
-    /// Raw-byte mirror of `test_restore_unconverted_bases_top_strand`.
+    /// The `runall` form of the removed flag is rejected the same way.
     #[test]
-    fn test_raw_restore_unconverted_bases_top_strand() -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
+    fn test_prefixed_restore_unconverted_bases_is_removed() {
+        let opts = PrefixedZipper::try_parse_from(["x", "--zipper::restore-unconverted-bases"])
+            .expect("the removed flag still parses")
+            .opts
+            .validate()
+            .expect("valid");
+        let err = opts.merge_rules().err().expect("must be rejected");
+        assert_eq!(err.to_string(), RESTORE_UNCONVERTED_BASES_REMOVED);
 
-        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
-
-        let mut raw = {
-            let mut b = RawSamBuilder::new();
-            b.read_name(b"q1")
-                .flags(FLAG_PAIRED | FLAG_READ1)
-                .ref_id(0)
-                .pos(0)
-                .mapq(60)
-                .cigar_ops(&[encode_op(0, 8)])
-                .sequence(b"ATGTATGT")
-                .qualities(&[30u8; 8]);
-            b.add_string_tag(SamTag::YD, b"f");
-            b.build()
-        };
-        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
-        assert_eq!(raw_sequence(&raw), b"ACGTACGT");
-        Ok(())
+        let arg = PrefixedZipper::command()
+            .get_arguments()
+            .find(|a| a.get_long() == Some("zipper::restore-unconverted-bases"))
+            .cloned()
+            .expect("the removed flag is still registered");
+        assert!(arg.is_hide_set(), "the flag must be hidden");
     }
 
-    /// Raw-byte mirror of `test_restore_unconverted_bases_bottom_strand`.
+    /// Standalone zipper rejects the removed flag before it opens any input: the inputs here
+    /// do not exist, so any later check would fail with a different error.
     #[test]
-    fn test_raw_restore_unconverted_bases_bottom_strand() -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
-
-        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
-
-        let mut raw = {
-            let mut b = RawSamBuilder::new();
-            b.read_name(b"q1")
-                .flags(FLAG_PAIRED | FLAG_READ2)
-                .ref_id(0)
-                .pos(0)
-                .mapq(60)
-                .cigar_ops(&[encode_op(0, 8)])
-                .sequence(b"ACATACAT")
-                .qualities(&[30u8; 8]);
-            b.add_string_tag(SamTag::YD, b"r");
-            b.build()
-        };
-        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
-        assert_eq!(raw_sequence(&raw), b"ACGTACGT");
-        Ok(())
+    fn test_restore_unconverted_bases_rejected_before_inputs() {
+        let cmd = Zipper::try_parse_from([
+            "zipper",
+            "-i",
+            "missing.bam",
+            "-u",
+            "missing-unmapped.bam",
+            "-r",
+            "missing.fa",
+            "-o",
+            "out.bam",
+            "--restore-unconverted-bases",
+        ])
+        .expect("the removed flag still parses");
+        let err = cmd.execute("test").expect_err("must be rejected");
+        assert_eq!(err.to_string(), RESTORE_UNCONVERTED_BASES_REMOVED);
     }
 
-    /// Raw-byte mirror of `test_restore_unconverted_bases_with_indels`.
+    /// `--restore-unconverted-bases=false` is a no-op and still accepted.
     #[test]
-    fn test_raw_restore_unconverted_bases_with_indels() -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
-
-        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
-
-        let mut raw = {
-            let mut b = RawSamBuilder::new();
-            b.read_name(b"q1")
-                .flags(FLAG_PAIRED | FLAG_READ1)
-                .ref_id(0)
-                .pos(0)
-                .mapq(60)
-                .cigar_ops(&[
-                    encode_op(0, 2),
-                    encode_op(1, 1),
-                    encode_op(0, 2),
-                    encode_op(2, 1),
-                    encode_op(0, 3),
-                ])
-                .sequence(b"TTNATTGT")
-                .qualities(&[30u8; 8]);
-            b.add_string_tag(SamTag::YD, b"f");
-            b.build()
-        };
-        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
-        assert_eq!(raw_sequence(&raw), b"TCNATCGT");
-        Ok(())
-    }
-
-    /// Raw-byte mirror of `test_restore_unconverted_bases_skips_unmapped`.
-    #[test]
-    fn test_raw_restore_unconverted_bases_skips_unmapped() -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
-
-        let fasta = create_test_fasta(&[("chr1", "CCCCCCCC")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:8\n".parse().unwrap();
-
-        let mut raw = {
-            let mut b = RawSamBuilder::new();
-            b.read_name(b"q1").flags(flags::UNMAPPED).sequence(b"TTTTTTTT").qualities(&[30u8; 8]);
-            b.add_string_tag(SamTag::YD, b"f");
-            b.build()
-        };
-        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
-        assert_eq!(raw_sequence(&raw), b"TTTTTTTT");
-        Ok(())
-    }
-
-    /// Raw-byte mirror of `test_restore_unconverted_bases_skips_no_yd_tag`.
-    #[test]
-    fn test_raw_restore_unconverted_bases_skips_no_yd_tag() -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
-
-        let fasta = create_test_fasta(&[("chr1", "CCCCCCCC")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:8\n".parse().unwrap();
-
-        let mut raw = {
-            let mut b = RawSamBuilder::new();
-            b.read_name(b"q1")
-                .flags(FLAG_PAIRED | FLAG_READ1)
-                .ref_id(0)
-                .pos(0)
-                .mapq(60)
-                .cigar_ops(&[encode_op(0, 8)])
-                .sequence(b"TTTTTTTT")
-                .qualities(&[30u8; 8]);
-            b.build()
-        };
-        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
-        assert_eq!(raw_sequence(&raw), b"TTTTTTTT");
-        Ok(())
-    }
-
-    /// Raw-byte mirror of `test_restore_unconverted_bases_preserves_already_unconverted`.
-    #[test]
-    fn test_raw_restore_unconverted_bases_preserves_already_unconverted() -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
-
-        let fasta = create_test_fasta(&[("chr1", "CCCCCCCC")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:8\n".parse().unwrap();
-
-        let mut raw = {
-            let mut b = RawSamBuilder::new();
-            b.read_name(b"q1")
-                .flags(FLAG_PAIRED | FLAG_READ1)
-                .ref_id(0)
-                .pos(0)
-                .mapq(60)
-                .cigar_ops(&[encode_op(0, 8)])
-                .sequence(b"CTCACTGC")
-                .qualities(&[30u8; 8]);
-            b.add_string_tag(SamTag::YD, b"f");
-            b.build()
-        };
-        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
-        assert_eq!(raw_sequence(&raw), b"CCCACCGC");
-        Ok(())
-    }
-
-    /// Raw-byte mirror of `test_restore_unconverted_bases_no_target_in_span`.
-    /// When no base changes are made, NM and MD tags must be preserved.
-    #[test]
-    fn test_raw_restore_unconverted_bases_no_target_in_span() -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
-
-        let fasta = create_test_fasta(&[("chr1", "ATGTATGT")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:8\n".parse().unwrap();
-
-        let mut raw = {
-            let mut b = RawSamBuilder::new();
-            b.read_name(b"q1")
-                .flags(FLAG_PAIRED | FLAG_READ1)
-                .ref_id(0)
-                .pos(0)
-                .mapq(60)
-                .cigar_ops(&[encode_op(0, 8)])
-                .sequence(b"ATGTATGT")
-                .qualities(&[30u8; 8]);
-            b.add_string_tag(SamTag::YD, b"f");
-            b.add_int_tag(SamTag::NM, 0);
-            b.add_string_tag(SamTag::MD, b"8");
-            b.build()
-        };
-        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
-        assert_eq!(raw_sequence(&raw), b"ATGTATGT");
-        // No SEQ change => NM/MD must remain present.
-        assert!(!raw_tag_absent(&raw, *SamTag::NM), "NM should remain when no bases were changed");
-        assert!(!raw_tag_absent(&raw, *SamTag::MD), "MD should remain when no bases were changed");
-        Ok(())
-    }
-
-    /// Raw-byte mirror of `test_restore_unconverted_bases_top_strand_reverse`.
-    #[test]
-    fn test_raw_restore_unconverted_bases_top_strand_reverse() -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
-
-        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
-
-        let mut raw = {
-            let mut b = RawSamBuilder::new();
-            b.read_name(b"q1")
-                .flags(FLAG_PAIRED | FLAG_READ1 | FLAG_REVERSE)
-                .ref_id(0)
-                .pos(0)
-                .mapq(60)
-                .cigar_ops(&[encode_op(0, 8)])
-                .sequence(b"ACATACGT")
-                .qualities(&[30u8; 8]);
-            b.add_string_tag(SamTag::YD, b"f");
-            b.build()
-        };
-        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
-        assert_eq!(raw_sequence(&raw), b"ACGTACGT");
-        Ok(())
-    }
-
-    /// Raw-byte mirror of `test_restore_unconverted_bases_bottom_strand_reverse`.
-    #[test]
-    fn test_raw_restore_unconverted_bases_bottom_strand_reverse() -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
-
-        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
-
-        let mut raw = {
-            let mut b = RawSamBuilder::new();
-            b.read_name(b"q1")
-                .flags(FLAG_PAIRED | FLAG_READ2 | FLAG_REVERSE)
-                .ref_id(0)
-                .pos(0)
-                .mapq(60)
-                .cigar_ops(&[encode_op(0, 8)])
-                .sequence(b"ATGTACGT")
-                .qualities(&[30u8; 8]);
-            b.add_string_tag(SamTag::YD, b"r");
-            b.build()
-        };
-        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
-        assert_eq!(raw_sequence(&raw), b"ACGTACGT");
-        Ok(())
-    }
-
-    /// When SEQ changes are made, NM and MD tags must be removed.
-    #[test]
-    fn test_raw_restore_removes_nm_md_when_bases_changed() -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
-
-        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
-
-        let mut raw = {
-            let mut b = RawSamBuilder::new();
-            b.read_name(b"q1")
-                .flags(FLAG_PAIRED | FLAG_READ1)
-                .ref_id(0)
-                .pos(0)
-                .mapq(60)
-                .cigar_ops(&[encode_op(0, 8)])
-                .sequence(b"ATGTATGT")
-                .qualities(&[30u8; 8]);
-            b.add_string_tag(SamTag::YD, b"f");
-            b.add_int_tag(SamTag::NM, 2);
-            b.add_string_tag(SamTag::MD, b"1T3T2");
-            b.build()
-        };
-        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
-        // SEQ changed (T→C at ref-C positions) so NM/MD must be gone.
-        assert_eq!(raw_sequence(&raw), b"ACGTACGT");
-        assert!(raw_tag_absent(&raw, *SamTag::NM), "NM should be removed when bases were changed");
-        assert!(raw_tag_absent(&raw, *SamTag::MD), "MD should be removed when bases were changed");
-        Ok(())
+    fn test_restore_unconverted_bases_false_is_accepted() {
+        let cmd = Zipper::try_parse_from([
+            "zipper",
+            "-u",
+            "u.bam",
+            "-r",
+            "ref.fa",
+            "-o",
+            "out.bam",
+            "--restore-unconverted-bases=false",
+        ])
+        .expect("parses");
+        assert!(cmd.to_zipper_options().merge_rules().is_ok());
     }
 
     // ─────────────────────────────────────────────────────────────────────

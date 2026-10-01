@@ -41,7 +41,6 @@ Phase 2: Grouped BAM → Filtered Consensus
 |------|--------|------|
 | Alignment | `bwameth` (bisulfite-aware) | `bwa mem` (standard) |
 | Consensus | `--methylation-mode em-seq --ref` | `--methylation-mode taps --ref` |
-| Re-alignment zipper | `--restore-unconverted-bases` | (no additional flags) |
 | Filter | `--methylation-mode em-seq` | `--methylation-mode taps` |
 
 ---
@@ -170,13 +169,13 @@ fgumi duplex \
 
 Consensus reads are unmapped and must be re-aligned.
 
-**EM-Seq** — use `--restore-unconverted-bases` so that bases normalized during consensus (T→C at ref-C positions) are restored before bisulfite-aware re-alignment:
+**EM-Seq** — simplex consensus SEQ keeps the converted bases, so it re-aligns with a bisulfite-aware aligner as is:
 
 ```bash
 fgumi fastq --input consensus.bam --no-read-suffix \
   | bwameth.py --reference ref.fa --threads 16 --interleaved /dev/stdin \
   | samtools view -b \
-  | fgumi zipper --unmapped consensus.bam --reference ref.fa --restore-unconverted-bases --output consensus.mapped.bam
+  | fgumi zipper --unmapped consensus.bam --reference ref.fa --output consensus.mapped.bam
 ```
 
 **TAPs:**

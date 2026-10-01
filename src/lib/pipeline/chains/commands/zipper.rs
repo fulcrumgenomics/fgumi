@@ -58,7 +58,6 @@ impl FinalizeHook for ZipperFinalizeHook {
 pub(crate) struct ZipperMergeCaptures {
     pub(crate) zipper_opts: ZipperOptions,
     pub(crate) output_header: Arc<noodles::sam::Header>,
-    pub(crate) reference_path: std::path::PathBuf,
     pub(crate) tuning: BamPipelineTuning,
     pub(crate) missing_count: Arc<AtomicU64>,
     pub(crate) records_emitted: Arc<AtomicU64>,
@@ -66,8 +65,7 @@ pub(crate) struct ZipperMergeCaptures {
 
 /// Build the [`ZipperMergeConfig`] from the supplied captures.
 ///
-/// Logs tag-manipulation summary lines, loads the reference FASTA if
-/// `--restore-unconverted-bases` is set, and constructs the
+/// Logs tag-manipulation summary lines and constructs the
 /// [`ZipperMergeConfig`] shared by the `ZipperZipStep` (pairing) and
 /// `ZipperMerge` (per-template merge) steps that `add_zipper` wires up.
 ///
@@ -75,23 +73,15 @@ pub(crate) struct ZipperMergeCaptures {
 pub(crate) fn build_zipper_merge_config(
     caps: ZipperMergeCaptures,
 ) -> Result<merge_step::ZipperMergeConfig> {
-    let ZipperMergeCaptures {
-        zipper_opts,
-        output_header,
-        reference_path,
-        tuning,
-        missing_count,
-        records_emitted,
-    } = caps;
+    let ZipperMergeCaptures { zipper_opts, output_header, tuning, missing_count, records_emitted } =
+        caps;
 
-    let ZipperMergeRules { tag_info, skip_tc_tags, reference } =
-        zipper_opts.merge_rules(&reference_path)?;
+    let ZipperMergeRules { tag_info, skip_tc_tags } = zipper_opts.merge_rules()?;
 
     let cfg = merge_step::ZipperMergeConfig {
         tag_info,
         skip_tc_tags,
         exclude_missing_reads: zipper_opts.exclude_missing_reads,
-        reference,
         output_header,
         missing_count,
         records_emitted,

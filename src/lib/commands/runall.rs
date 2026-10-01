@@ -756,7 +756,7 @@ pub struct RunAll {
     /// `#[multi_options]` on `ZipperOptions` in `commands::zipper`).
     /// With `--start-from zipper` they configure the zipper stage; on any
     /// chain that aligns (`--start-from extract`, `correct` or `align`), the
-    /// merge rules (`tags-to-*`, `skip-tc-tags`, `restore-unconverted-bases`)
+    /// merge rules (`tags-to-*`, `skip-tc-tags`)
     /// configure the fused align-and-merge. Ignored on any other chain.
     #[command(flatten)]
     pub zipper_opts: crate::commands::zipper::MultiZipperOptions,
@@ -1426,21 +1426,6 @@ impl RunAll {
                     // merge rules apply to it too; Align and Zipper never share
                     // a chain, so the bag's zipper slot is free to carry them.
                     let zipper = self.zipper_opts.clone().validate()?;
-                    // Restoring converted bases is for re-aligned *consensus*
-                    // reads, whose methylation state already lives in MM/ML
-                    // tags. On raw reads from extract/correct it erases the
-                    // only record of that state before consensus can call it.
-                    if zipper.restore_unconverted_bases
-                        && matches!(self.start_from, RunAllStage::Extract | RunAllStage::Correct)
-                    {
-                        log::warn!(
-                            "--zipper::restore-unconverted-bases rewrites converted bases on raw \
-                             reads from --start-from {}, before any consensus has recorded their \
-                             methylation state; it is meant for re-aligning consensus reads \
-                             (--start-from align)",
-                            self.start_from
-                        );
-                    }
                     bag.zipper = Some(zipper);
                 }
 

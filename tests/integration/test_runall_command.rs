@@ -1383,20 +1383,16 @@ fn extract_to_zipper_writes_correct_rejects_like_self_pair() {
 ///
 /// Every template becomes R1 forward at `100 + 40·t`, R2 reverse at `2000 +
 /// 40·t`, and a supplementary copy of R1 at `3000`, each with SEQ copied from
-/// `sequence` so the replay is valid aligner output. R1 additionally carries
-/// `YD:Z:f` with every reference `C` converted to `T`, the bwameth top-strand
-/// shape `--restore-unconverted-bases` reverses. This gives every
+/// `sequence` so the replay is valid aligner output. This gives every
 /// `--zipper::*` merge rule something to change: tags on a reverse-strand read
-/// for reverse/revcomp, a supplementary read for `tc`, and converted bases for
-/// the restore. Returns `(kept, replay)`.
+/// for reverse/revcomp and a supplementary read for `tc`. Returns
+/// `(kept, replay)`.
 #[cfg(feature = "simulate")]
 fn write_mapped_replay_bam(dir: &Path, r1: &Path, r2: &Path, sequence: &str) -> (PathBuf, PathBuf) {
     use noodles::core::Position;
     use noodles::sam::alignment::io::Write as _;
     use noodles::sam::alignment::record::Flags;
     use noodles::sam::alignment::record::cigar::op::{Kind, Op};
-    use noodles::sam::alignment::record::data::field::Tag;
-    use noodles::sam::alignment::record_buf::data::field::Value;
     use noodles::sam::alignment::record_buf::{Cigar, Sequence};
     use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
 
@@ -1410,32 +1406,21 @@ fn write_mapped_replay_bam(dir: &Path, r1: &Path, r2: &Path, sequence: &str) -> 
         Map::<ReferenceSequence>::new(std::num::NonZeroUsize::new(sequence.len()).unwrap()),
     );
 
-    let place = |record: &noodles::sam::alignment::RecordBuf,
-                 pos: usize,
-                 mate_pos: usize,
-                 flags: Flags,
-                 convert: bool| {
-        let mut out = record.clone();
-        let len = record.sequence().len();
-        let mut bases = sequence.as_bytes()[pos - 1..pos - 1 + len].to_vec();
-        if convert {
-            for b in &mut bases {
-                if *b == b'C' {
-                    *b = b'T';
-                }
-            }
-            out.data_mut().insert(Tag::new(b'Y', b'D'), Value::String("f".into()));
-        }
-        *out.flags_mut() = flags;
-        *out.reference_sequence_id_mut() = Some(0);
-        *out.alignment_start_mut() = Position::new(pos);
-        *out.cigar_mut() = Cigar::from(vec![Op::new(Kind::Match, len)]);
-        *out.mapping_quality_mut() = noodles::sam::alignment::record::MappingQuality::new(60);
-        *out.sequence_mut() = Sequence::from(bases);
-        *out.mate_reference_sequence_id_mut() = Some(0);
-        *out.mate_alignment_start_mut() = Position::new(mate_pos);
-        out
-    };
+    let place =
+        |record: &noodles::sam::alignment::RecordBuf, pos: usize, mate_pos: usize, flags: Flags| {
+            let mut out = record.clone();
+            let len = record.sequence().len();
+            let bases = sequence.as_bytes()[pos - 1..pos - 1 + len].to_vec();
+            *out.flags_mut() = flags;
+            *out.reference_sequence_id_mut() = Some(0);
+            *out.alignment_start_mut() = Position::new(pos);
+            *out.cigar_mut() = Cigar::from(vec![Op::new(Kind::Match, len)]);
+            *out.mapping_quality_mut() = noodles::sam::alignment::record::MappingQuality::new(60);
+            *out.sequence_mut() = Sequence::from(bases);
+            *out.mate_reference_sequence_id_mut() = Some(0);
+            *out.mate_alignment_start_mut() = Position::new(mate_pos);
+            out
+        };
 
     let replay = dir.join("mapped_replay.bam");
     let mut writer = noodles::bam::io::Writer::new(std::fs::File::create(&replay).unwrap());
@@ -1447,9 +1432,9 @@ fn write_mapped_replay_bam(dir: &Path, r1: &Path, r2: &Path, sequence: &str) -> 
         let paired = Flags::SEGMENTED | Flags::PROPERLY_SEGMENTED;
         let r1_flags = paired | Flags::FIRST_SEGMENT | Flags::MATE_REVERSE_COMPLEMENTED;
         let r2_flags = paired | Flags::LAST_SEGMENT | Flags::REVERSE_COMPLEMENTED;
-        let out_r1 = place(first, r1_pos, r2_pos, r1_flags, true);
-        let out_r2 = place(second, r2_pos, r1_pos, r2_flags, false);
-        let out_supp = place(first, 3000, r2_pos, r1_flags | Flags::SUPPLEMENTARY, false);
+        let out_r1 = place(first, r1_pos, r2_pos, r1_flags);
+        let out_r2 = place(second, r2_pos, r1_pos, r2_flags);
+        let out_supp = place(first, 3000, r2_pos, r1_flags | Flags::SUPPLEMENTARY);
         for record in [&out_r1, &out_r2, &out_supp] {
             writer.write_alignment_record(&header, record).unwrap();
         }
@@ -1493,6 +1478,16 @@ impl MappedReplay {
     /// correct) or, when `start_from_align`, from the kept unmapped BAM, with
     /// `flags` given their `--zipper::` prefix. Returns stderr.
     fn run_chain(&self, start_from_align: bool, out: &Path, flags: &[&str]) -> String {
+        let output = run_ok(
+            self.chain_args(start_from_align, out, flags),
+            &format!("runall ->zipper (align start: {start_from_align}) {flags:?}"),
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    /// The `runall` arguments for [`Self::run_chain`], with `flags` given in their
+    /// standalone-zipper spelling and prefixed with `--zipper::` here.
+    fn chain_args(&self, start_from_align: bool, out: &Path, flags: &[&str]) -> Vec<String> {
         let prefixed: Vec<String> = flags
             .iter()
             .map(|a| {
@@ -1519,9 +1514,7 @@ impl MappedReplay {
         };
         args.extend(prefixed.iter().map(String::as_str));
         args.extend(["-o", p(out)]);
-        let output =
-            run_ok(args, &format!("runall ->zipper (align start: {start_from_align}) {flags:?}"));
-        String::from_utf8_lossy(&output.stderr).into_owned()
+        args.into_iter().map(str::to_string).collect()
     }
 
     /// Standalone `fgumi zipper` over the same replay (aligner output) and kept
@@ -1547,7 +1540,7 @@ impl MappedReplay {
 /// `extract` (correct feeding the fused Align stage) and from `align` (an
 /// unmapped BAM) — exactly as standalone `fgumi zipper` applies it to the same
 /// aligner output. The fused merge used to be built with empty tag rules,
-/// `tc` tags always on and no unconverted-base restore, so each flag was
+/// `tc` tags always on, so each flag was
 /// parsed and dropped. A no-flag baseline must already match standalone
 /// zipper, so a mismatch is the flag, not the fixture; and each flag must
 /// change the output, so no case can pass vacuously.
@@ -1557,7 +1550,6 @@ impl MappedReplay {
 #[case::tags_to_reverse(&["--tags-to-reverse", "RX"])]
 #[case::tags_to_revcomp(&["--tags-to-revcomp", "RX"])]
 #[case::skip_tc_tags(&["--skip-tc-tags"])]
-#[case::restore_unconverted_bases(&["--restore-unconverted-bases"])]
 fn fused_chain_honors_zipper_merge_flags(
     #[case] flags: &[&str],
     #[values(false, true)] start_from_align: bool,
@@ -1605,23 +1597,20 @@ fn fused_chain_warns_exclude_missing_reads_is_inert() {
     assert_bams_record_equivalent_nonempty(&with, &without);
 }
 
-/// `--zipper::restore-unconverted-bases` is for re-aligned consensus reads; on
-/// raw reads from `--start-from extract` it erases the conversions before any
-/// consensus has recorded them, so the run must warn there — and not on
-/// `--start-from align`, its documented re-alignment use.
+/// `--zipper::restore-unconverted-bases` (v0.7.0 and earlier) was removed: a chain that
+/// aligns, from `extract` or from `align`, must reject it with a pointer to the methylation
+/// guide rather than run.
 #[cfg(feature = "simulate")]
-#[test]
-fn restore_unconverted_bases_warns_only_before_consensus() {
-    const WARNING: &str =
-        "--zipper::restore-unconverted-bases rewrites converted bases on raw reads";
+#[rstest::rstest]
+fn restore_unconverted_bases_is_rejected(#[values(false, true)] start_from_align: bool) {
     let tmp = TempDir::new().unwrap();
     let fixture = MappedReplay::new(tmp.path());
-    let flags = ["--restore-unconverted-bases"];
-
-    let stderr = fixture.run_chain(false, &tmp.path().join("extract.bam"), &flags);
-    assert!(stderr.contains(WARNING), "expected the raw-read restore warning, got:\n{stderr}");
-    let stderr = fixture.run_chain(true, &tmp.path().join("align.bam"), &flags);
-    assert!(!stderr.contains(WARNING), "--start-from align must not warn:\n{stderr}");
+    let out = tmp.path().join("out.bam");
+    assert_rejected_with(
+        fixture.chain_args(start_from_align, &out, &["--restore-unconverted-bases"]),
+        "--restore-unconverted-bases was removed",
+        &format!("runall ->zipper (align start: {start_from_align})"),
+    );
 }
 
 /// A chained correct that reaches no consensus stage leaves the top-level
