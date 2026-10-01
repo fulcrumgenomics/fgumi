@@ -396,6 +396,11 @@ pub struct VanillaUmiConsensusCaller {
     /// Reference sequence names indexed by `ref_id` (for mapping `ref_id` → contig name).
     ref_names: Option<std::sync::Arc<Vec<String>>>,
 
+    /// Whether methylation annotation counts the pattern's bases at every position rather than
+    /// only where the reference marks the position informative. Set by the duplex caller, which
+    /// decides two-strand calls from the molecule (see [`Self::set_methylation_count_all_positions`]).
+    methylation_count_all_positions: bool,
+
     /// Reusable buffer holding the read name of the consensus record being built.
     read_name_buf: Vec<u8>,
 }
@@ -455,6 +460,7 @@ impl VanillaUmiConsensusCaller {
             bam_builder: UnmappedSamBuilder::new(),
             reference: None,
             ref_names: None,
+            methylation_count_all_positions: false,
             read_name_buf: Vec::new(),
         }
     }
@@ -517,6 +523,14 @@ impl VanillaUmiConsensusCaller {
     ) {
         self.reference = Some(reference);
         self.ref_names = Some(ref_names);
+    }
+
+    /// Makes methylation annotation count the pattern's unconverted/converted bases at every
+    /// position, keeping the reference-informative flag only as a marker. The duplex caller
+    /// uses this: a two-strand duplex decides its calls from the molecule (the other strand
+    /// confirms the base), and a single-strand duplex record gates the counts by the flag.
+    pub(crate) fn set_methylation_count_all_positions(&mut self, count_all_positions: bool) {
+        self.methylation_count_all_positions = count_all_positions;
     }
 
     /// Returns the rejected reads
@@ -717,7 +731,7 @@ impl VanillaUmiConsensusCaller {
         // the per-strand consensus cap below. Source bases are never rewritten: a C/T split
         // within a single-strand family is an error like any other and must be scored as one.
         let methylation = if self.options.methylation_mode.is_enabled() {
-            self.annotate_methylation(&source_reads).map(|(annotation, _)| annotation)
+            self.annotate_methylation(&source_reads)
         } else {
             None
         };
@@ -779,16 +793,13 @@ impl VanillaUmiConsensusCaller {
 
     /// Counts methylation evidence (unconverted vs converted bases) at informative positions.
     ///
-    /// Returns the annotation together with the read type's [`ConversionPattern`], or `None`
-    /// when no reference is configured or the reads are unmapped. The source reads are not
+    /// Returns `None` when no reference is configured or the reads are unmapped. The
+    /// annotation records the read type's conversion pattern. The source reads are not
     /// modified.
-    ///
-    /// [`ConversionPattern`]: crate::methylation::ConversionPattern
     fn annotate_methylation(
         &self,
         source_reads: &[SourceRead],
-    ) -> Option<(crate::methylation::MethylationAnnotation, crate::methylation::ConversionPattern)>
-    {
+    ) -> Option<crate::methylation::MethylationAnnotation> {
         use crate::methylation;
 
         let reference = self.reference.as_ref()?;
@@ -842,9 +853,10 @@ impl VanillaUmiConsensusCaller {
             &ref_bases,
             pattern,
             &read_aligned,
+            self.methylation_count_all_positions,
         );
 
-        Some((annotation, pattern))
+        Some(annotation)
     }
 
     /// Filters reads to remove secondary/supplementary alignments.
@@ -1614,8 +1626,7 @@ impl VanillaUmiConsensusCaller {
             self.create_consensus_from_source_reads(&filtered_source_reads)?;
 
         // Truncate methylation annotation to consensus length
-        let methylation =
-            methylation.map(|(annotation, pattern)| (annotation.truncate(bases.len()), pattern));
+        let methylation = methylation.map(|annotation| annotation.truncate(bases.len()));
 
         // Get raw records for tag extraction
         let original_raws: Vec<&[u8]> = filtered_source_reads
@@ -1632,7 +1643,7 @@ impl VanillaUmiConsensusCaller {
             &quals,
             &depths,
             &errors,
-            methylation.as_ref().map(|(annotation, pattern)| (annotation, *pattern)),
+            methylation.as_ref(),
         )?;
 
         Ok((true, surviving_count, surviving_reads))
@@ -1767,10 +1778,7 @@ impl VanillaUmiConsensusCaller {
         quals: &[u8],
         depths: &[u16],
         errors: &[u16],
-        methylation: Option<(
-            &crate::methylation::MethylationAnnotation,
-            crate::methylation::ConversionPattern,
-        )>,
+        methylation: Option<&crate::methylation::MethylationAnnotation>,
     ) -> Result<()> {
         write_consensus_read_name(&mut self.read_name_buf, &self.read_name_prefix, umi);
 
@@ -1848,7 +1856,7 @@ impl VanillaUmiConsensusCaller {
 
         // Methylation counts (EM-Seq/TAPs). SEQ keeps the observed bases, so MM/ML (which can
         // only describe bases present in SEQ) are not emitted.
-        if let Some((annot, _pattern)) = methylation {
+        if let Some(annot) = methylation {
             // Dense count tags
             let cu = annot.unconverted_counts();
             let ct = annot.converted_counts();

@@ -16,7 +16,7 @@ use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::create_raw_bam_writer;
 use fgumi_consensus::MethylationMode;
 use fgumi_consensus::methylation::{
-    MethylationAnnotation, MethylationEvidence, build_mm_ml_tags, is_cpg_context,
+    ConversionPattern, MethylationAnnotation, MethylationEvidence, build_mm_ml_tags, is_cpg_context,
 };
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
 use log::info;
@@ -513,11 +513,14 @@ fn generate_methylation_annotation(
 
     for i in 0..seq.len() {
         let base = seq[i].to_ascii_uppercase();
-        let is_ref_c = base == b'C';
+        let informative = base == b'C';
 
-        if !is_ref_c {
-            let zero_ev =
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 };
+        if !informative {
+            let zero_ev = MethylationEvidence {
+                informative: false,
+                unconverted_count: 0,
+                converted_count: 0,
+            };
             evidence.push(zero_ev.clone());
             if let Some(ref mut ab) = ab_evidence {
                 ab.push(zero_ev.clone());
@@ -580,7 +583,7 @@ fn generate_methylation_annotation(
         };
 
         let ev = MethylationEvidence {
-            is_ref_c: true,
+            informative: true,
             unconverted_count: unconverted,
             converted_count: converted,
         };
@@ -595,14 +598,14 @@ fn generate_methylation_annotation(
 
             if let Some(ref mut ab) = ab_evidence {
                 ab.push(MethylationEvidence {
-                    is_ref_c: true,
+                    informative: true,
                     unconverted_count: ab_unconverted,
                     converted_count: ab_converted,
                 });
             }
             if let Some(ref mut ba) = ba_evidence {
                 ba.push(MethylationEvidence {
-                    is_ref_c: true,
+                    informative: true,
                     unconverted_count: ba_unconverted,
                     converted_count: ba_converted,
                 });
@@ -612,10 +615,12 @@ fn generate_methylation_annotation(
         evidence.push(ev);
     }
 
+    // Evidence is recorded at `C` positions of `seq`, i.e. a C->T (R1-type) annotation.
+    let pattern = ConversionPattern::CToT;
     MethylationData {
-        annotation: MethylationAnnotation { evidence },
-        ab_annotation: ab_evidence.map(|e| MethylationAnnotation { evidence: e }),
-        ba_annotation: ba_evidence.map(|e| MethylationAnnotation { evidence: e }),
+        annotation: MethylationAnnotation { evidence, pattern },
+        ab_annotation: ab_evidence.map(|e| MethylationAnnotation { evidence: e, pattern }),
+        ba_annotation: ba_evidence.map(|e| MethylationAnnotation { evidence: e, pattern }),
     }
 }
 
@@ -651,8 +656,6 @@ fn build_consensus_record(
     methylation: Option<&MethylationData>,
     methylation_mode: MethylationMode,
 ) -> RawRecord {
-    let is_top_strand = !is_reverse;
-
     // Build flags: PAIRED + PROPER_PAIR + (FIRST_SEGMENT or LAST_SEGMENT) + reverse-strand bits.
     // Consensus records are simulated proper paired alignments; downstream tools commonly
     // filter on the 0x2 bit, so set it explicitly.
@@ -798,20 +801,13 @@ fn build_consensus_record(
 
     // Add methylation tags if enabled.
     if let Some(meth) = methylation {
-        let strand_pattern = if is_top_strand {
-            fgumi_consensus::methylation::ConversionPattern::CToT
-        } else {
-            fgumi_consensus::methylation::ConversionPattern::GToA
-        };
         // cu/ct tags (unconverted/converted counts per position).
         let cu: Vec<i16> = meth.annotation.unconverted_counts();
         let ct: Vec<i16> = meth.annotation.converted_counts();
         b.add_array_i16(SamTag::CU, &oriented(&cu)).add_array_i16(SamTag::CT, &oriented(&ct));
 
         // MM/ML tags (SAM spec methylation tags).
-        if let Some((mm, ml)) =
-            build_mm_ml_tags(seq, &meth.annotation, strand_pattern, methylation_mode)
-        {
+        if let Some((mm, ml)) = build_mm_ml_tags(seq, &meth.annotation, methylation_mode) {
             b.add_string_tag(SamTag::MM, mm.as_bytes()).add_array_u8(SamTag::ML, &ml);
         }
 
@@ -827,20 +823,14 @@ fn build_consensus_record(
                 .add_array_i16(SamTag::BT, &oriented(&bt));
 
             // Per-strand MM tags (am/bm).
-            if let Some(am) = fgumi_consensus::methylation::build_mm_tag_no_ml(
-                seq,
-                ab,
-                strand_pattern,
-                methylation_mode,
-            ) {
+            if let Some(am) =
+                fgumi_consensus::methylation::build_mm_tag_no_ml(seq, ab, methylation_mode)
+            {
                 b.add_string_tag(SamTag::AM_BASES, am.as_bytes());
             }
-            if let Some(bm) = fgumi_consensus::methylation::build_mm_tag_no_ml(
-                seq,
-                ba,
-                strand_pattern,
-                methylation_mode,
-            ) {
+            if let Some(bm) =
+                fgumi_consensus::methylation::build_mm_tag_no_ml(seq, ba, methylation_mode)
+            {
                 b.add_string_tag(SamTag::BM_BASES, bm.as_bytes());
             }
         }
@@ -1505,18 +1495,18 @@ mod tests {
         );
 
         // Position 0 is C in CpG context -> methylated in EM-Seq -> mostly unconverted
-        assert!(data.annotation.evidence[0].is_ref_c);
+        assert!(data.annotation.evidence[0].informative);
         assert!(data.annotation.evidence[0].unconverted_count > 0);
 
         // Position 4 is C but not CpG -> unmethylated in EM-Seq -> mostly converted
-        assert!(data.annotation.evidence[4].is_ref_c);
+        assert!(data.annotation.evidence[4].informative);
         assert!(
             data.annotation.evidence[4].converted_count
                 >= data.annotation.evidence[4].unconverted_count
         );
 
         // Position 1 is G -> not a ref C
-        assert!(!data.annotation.evidence[1].is_ref_c);
+        assert!(!data.annotation.evidence[1].informative);
 
         // cu/ct should have correct lengths
         let cu = data.annotation.unconverted_counts();
@@ -1542,14 +1532,14 @@ mod tests {
         );
 
         // Position 0 is C in CpG -> methylated in TAPs -> mostly converted (target)
-        assert!(data.annotation.evidence[0].is_ref_c);
+        assert!(data.annotation.evidence[0].informative);
         assert!(
             data.annotation.evidence[0].converted_count
                 >= data.annotation.evidence[0].unconverted_count
         );
 
         // Position 4 is C not CpG -> unmethylated in TAPs -> mostly unconverted (not a target)
-        assert!(data.annotation.evidence[4].is_ref_c);
+        assert!(data.annotation.evidence[4].informative);
         assert!(
             data.annotation.evidence[4].unconverted_count
                 >= data.annotation.evidence[4].converted_count
@@ -1822,19 +1812,28 @@ mod tests {
     #[test]
     fn test_methylation_annotation_reverse() {
         let annotation = MethylationAnnotation {
+            pattern: ConversionPattern::CToT,
             evidence: vec![
-                MethylationEvidence { is_ref_c: true, unconverted_count: 10, converted_count: 2 },
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 },
-                MethylationEvidence { is_ref_c: true, unconverted_count: 3, converted_count: 7 },
+                MethylationEvidence {
+                    informative: true,
+                    unconverted_count: 10,
+                    converted_count: 2,
+                },
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                },
+                MethylationEvidence { informative: true, unconverted_count: 3, converted_count: 7 },
             ],
         };
         let reversed = annotation.reverse();
         assert_eq!(reversed.evidence.len(), 3);
-        assert!(reversed.evidence[0].is_ref_c);
+        assert!(reversed.evidence[0].informative);
         assert_eq!(reversed.evidence[0].unconverted_count, 3);
         assert_eq!(reversed.evidence[0].converted_count, 7);
-        assert!(!reversed.evidence[1].is_ref_c);
-        assert!(reversed.evidence[2].is_ref_c);
+        assert!(!reversed.evidence[1].informative);
+        assert!(reversed.evidence[2].informative);
         assert_eq!(reversed.evidence[2].unconverted_count, 10);
         assert_eq!(reversed.evidence[2].converted_count, 2);
     }
@@ -1842,41 +1841,60 @@ mod tests {
     #[test]
     fn test_methylation_data_reverse() {
         let annotation = MethylationAnnotation {
+            pattern: ConversionPattern::CToT,
             evidence: vec![
-                MethylationEvidence { is_ref_c: true, unconverted_count: 10, converted_count: 2 },
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 },
+                MethylationEvidence {
+                    informative: true,
+                    unconverted_count: 10,
+                    converted_count: 2,
+                },
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                },
             ],
         };
         let ab = MethylationAnnotation {
+            pattern: ConversionPattern::CToT,
             evidence: vec![
-                MethylationEvidence { is_ref_c: true, unconverted_count: 6, converted_count: 1 },
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 },
+                MethylationEvidence { informative: true, unconverted_count: 6, converted_count: 1 },
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                },
             ],
         };
         let ba = MethylationAnnotation {
+            pattern: ConversionPattern::CToT,
             evidence: vec![
-                MethylationEvidence { is_ref_c: true, unconverted_count: 4, converted_count: 1 },
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 },
+                MethylationEvidence { informative: true, unconverted_count: 4, converted_count: 1 },
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                },
             ],
         };
         let data = MethylationData { annotation, ab_annotation: Some(ab), ba_annotation: Some(ba) };
         let reversed = data.reverse();
 
         // Main annotation reversed
-        assert!(!reversed.annotation.evidence[0].is_ref_c);
-        assert!(reversed.annotation.evidence[1].is_ref_c);
+        assert!(!reversed.annotation.evidence[0].informative);
+        assert!(reversed.annotation.evidence[1].informative);
         assert_eq!(reversed.annotation.evidence[1].unconverted_count, 10);
 
         // AB reversed
         let ab_rev = reversed.ab_annotation.unwrap();
-        assert!(!ab_rev.evidence[0].is_ref_c);
-        assert!(ab_rev.evidence[1].is_ref_c);
+        assert!(!ab_rev.evidence[0].informative);
+        assert!(ab_rev.evidence[1].informative);
         assert_eq!(ab_rev.evidence[1].unconverted_count, 6);
 
         // BA reversed
         let ba_rev = reversed.ba_annotation.unwrap();
-        assert!(!ba_rev.evidence[0].is_ref_c);
-        assert!(ba_rev.evidence[1].is_ref_c);
+        assert!(!ba_rev.evidence[0].informative);
+        assert!(ba_rev.evidence[1].informative);
         assert_eq!(ba_rev.evidence[1].unconverted_count, 4);
     }
 
@@ -1896,11 +1914,28 @@ mod tests {
 
         // Build methylation annotation with distinct counts at each position
         let annotation = MethylationAnnotation {
+            pattern: ConversionPattern::CToT,
             evidence: vec![
-                MethylationEvidence { is_ref_c: true, unconverted_count: 10, converted_count: 2 },
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 },
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 },
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 },
+                MethylationEvidence {
+                    informative: true,
+                    unconverted_count: 10,
+                    converted_count: 2,
+                },
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                },
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                },
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                },
             ],
         };
         let meth = MethylationData { annotation, ab_annotation: None, ba_annotation: None };
@@ -1987,7 +2022,7 @@ mod tests {
         let seq = b"CGATCA";
         let quals = vec![40; seq.len()];
         let evidence = |u: u32, t: u32| MethylationEvidence {
-            is_ref_c: u + t > 0,
+            informative: u + t > 0,
             unconverted_count: u,
             converted_count: t,
         };
@@ -2000,6 +2035,7 @@ mod tests {
                 evidence(2, 7),
                 evidence(0, 0),
             ],
+            pattern: fgumi_consensus::methylation::ConversionPattern::CToT,
         };
         let meth = MethylationData {
             annotation: annotation.clone(),

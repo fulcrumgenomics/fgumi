@@ -20,18 +20,21 @@ use crate::vanilla_caller::SourceRead;
 use fgumi_raw_bam::flags;
 use noodles::sam::alignment::record::cigar::op::Kind;
 
-/// Per-base methylation evidence at a single consensus position.
+/// Per-base methylation evidence at a single consensus position, in read orientation.
+///
+/// The bases counted follow the annotation's [`ConversionPattern`]: `C`/`T` for C→T reads
+/// (R1 and unpaired), `G`/`A` for G→A reads (R2).
 #[derive(Debug, Clone, Default)]
 pub struct MethylationEvidence {
-    /// Whether this position is a reference cytosine (eligible for methylation call).
-    /// For top-strand reads: ref=C. For bottom-strand reads (after RC): ref=G.
-    pub is_ref_c: bool,
-    /// Number of reads showing C (unconverted) at this ref-C position.
-    /// For bottom strand (after RC): number showing G (complement of unconverted C).
+    /// Whether this position carries a methylation call for the annotated strand. For a
+    /// single-strand consensus the read-orientation reference base is the pattern's target
+    /// (`C` for C→T reads, `G` for G→A reads); in a two-strand duplex consensus the other
+    /// strand confirms the molecule's base there, whatever the reference.
+    pub informative: bool,
+    /// Number of reads showing the unconverted base (`C` for C→T reads, `G` for G→A reads).
     /// Stored as u32 to avoid overflow at high coverage; clamped to i16 on output.
     pub unconverted_count: u32,
-    /// Number of reads showing T (converted) at this ref-C position.
-    /// For bottom strand (after RC): number showing A (complement of converted T).
+    /// Number of reads showing the converted base (`T` for C→T reads, `A` for G→A reads).
     /// Stored as u32 to avoid overflow at high coverage; clamped to i16 on output.
     pub converted_count: u32,
 }
@@ -41,6 +44,9 @@ pub struct MethylationEvidence {
 pub struct MethylationAnnotation {
     /// Per-base methylation evidence (same length as consensus read).
     pub evidence: Vec<MethylationEvidence>,
+    /// How the annotated read displays conversions; defines which read-orientation
+    /// reference base marks an informative position and which base MM/ML track.
+    pub pattern: ConversionPattern,
 }
 
 impl MethylationAnnotation {
@@ -64,7 +70,10 @@ impl MethylationAnnotation {
     /// Returns a truncated copy of this annotation with only the first `len` positions.
     #[must_use]
     pub fn truncate(&self, len: usize) -> Self {
-        Self { evidence: self.evidence[..len.min(self.evidence.len())].to_vec() }
+        Self {
+            evidence: self.evidence[..len.min(self.evidence.len())].to_vec(),
+            pattern: self.pattern,
+        }
     }
 
     /// Returns a copy of this annotation with the evidence vector reversed.
@@ -75,7 +84,7 @@ impl MethylationAnnotation {
     pub fn reverse(&self) -> Self {
         let mut rev = self.evidence.clone();
         rev.reverse();
-        Self { evidence: rev }
+        Self { evidence: rev, pattern: self.pattern }
     }
 }
 
@@ -189,9 +198,11 @@ impl ConversionPattern {
 
 /// Annotates simplex consensus methylation from source reads and reference.
 ///
-/// For each consensus position whose read-orientation reference base is the pattern's
-/// reference base (`C` for C→T, `G` for G→A), counts source reads showing the unconverted
-/// vs converted base. Does not modify the consensus bases.
+/// Marks each consensus position whose read-orientation reference base is the pattern's
+/// reference base (`C` for C→T, `G` for G→A) as informative and counts source reads showing
+/// the unconverted vs converted base there. With `count_all_positions` the bases are counted
+/// at every position (the duplex caller decides its own calls from the molecule) and the flag
+/// only marks the reference-informative positions. Does not modify the consensus bases.
 ///
 /// # Arguments
 /// * `consensus_len` - Length of the consensus (the longest source read)
@@ -202,34 +213,35 @@ impl ConversionPattern {
 /// * `read_aligned` - For each source read, whether each of its bases is aligned to the
 ///   reference (not soft-clipped or inserted); at informative positions a read is counted only
 ///   where it is aligned, so its clipped bases never count at a reference position
+/// * `count_all_positions` - Count at every position, not only informative ones (every base
+///   of every read: the duplex caller decides its calls from the molecule)
 pub(crate) fn annotate_simplex_methylation(
     consensus_len: usize,
     source_reads: &[SourceRead],
     ref_bases_read_orientation: &[Option<u8>],
     pattern: ConversionPattern,
     read_aligned: &[Vec<bool>],
+    count_all_positions: bool,
 ) -> MethylationAnnotation {
     let mut evidence = vec![MethylationEvidence::default(); consensus_len];
 
     let (ref_target, unconverted_base, converted_base) = pattern.bases();
 
     for (i, ev) in evidence.iter_mut().enumerate() {
-        // Check if this position aligns to the pattern's reference base
-        let ref_base = ref_bases_read_orientation.get(i).and_then(|b| *b);
-        let Some(rb) = ref_base else { continue };
-        let rb_upper = rb.to_ascii_uppercase();
-        if rb_upper != ref_target {
+        ev.informative = ref_bases_read_orientation
+            .get(i)
+            .and_then(|b| *b)
+            .is_some_and(|rb| rb.to_ascii_uppercase() == ref_target);
+        if !ev.informative && !count_all_positions {
             continue;
         }
-
-        ev.is_ref_c = true;
 
         // Count unconverted vs converted in source reads
         for (r, sr) in source_reads.iter().enumerate() {
             if i >= sr.bases.len() {
                 continue;
             }
-            if read_aligned.get(r).is_none_or(|a| a.get(i) != Some(&true)) {
+            if !count_all_positions && read_aligned.get(r).is_none_or(|a| a.get(i) != Some(&true)) {
                 continue;
             }
             let base = sr.bases[i].to_ascii_uppercase();
@@ -244,31 +256,39 @@ pub(crate) fn annotate_simplex_methylation(
         // C/T split within a family (one converted strand) is scored as an error.
     }
 
-    MethylationAnnotation { evidence }
+    MethylationAnnotation { evidence, pattern }
+}
+
+/// Zeroes the counts at positions the annotation does not mark informative, so counts are
+/// present only at its calls. A single-strand duplex record calls like a simplex consensus:
+/// its annotation was counted at every position and is gated by the reference here.
+pub(crate) fn gate_to_informative(annotation: &mut MethylationAnnotation) {
+    for ev in annotation.evidence.iter_mut().filter(|ev| !ev.informative) {
+        *ev = MethylationEvidence::default();
+    }
 }
 
 /// Restores the unconverted base at informative positions of an emitted consensus.
 ///
-/// Used for the reference SEQ convention: at each position the annotation marks as
-/// informative, a converted base (`T` for C→T, `A` for G→A) is replaced by the unconverted
-/// base (`C` / `G`). Every other base, including no-calls, is left unchanged.
+/// Used to emit a duplex consensus as the molecule's sequence: at each position the annotation
+/// marks as informative, a converted base (`T` for C→T, `A` for G→A) is replaced by the
+/// unconverted base (`C` / `G`). Every other base, including no-calls, is left unchanged.
 ///
 /// # Panics
 ///
 /// Panics if `consensus_bases` and `annotation.evidence` have different lengths.
-pub fn restore_unconverted_bases(
+pub(crate) fn restore_unconverted_bases(
     consensus_bases: &mut [u8],
     annotation: &MethylationAnnotation,
-    pattern: ConversionPattern,
 ) {
     assert_eq!(
         consensus_bases.len(),
         annotation.evidence.len(),
         "consensus_bases and annotation.evidence must have the same length"
     );
-    let (_, unconverted_base, converted_base) = pattern.bases();
+    let (_, unconverted_base, converted_base) = annotation.pattern.bases();
     for (base, ev) in consensus_bases.iter_mut().zip(&annotation.evidence) {
-        if ev.is_ref_c && base.eq_ignore_ascii_case(&converted_base) {
+        if ev.informative && base.eq_ignore_ascii_case(&converted_base) {
             *base = unconverted_base;
         }
     }
@@ -280,7 +300,8 @@ pub fn restore_unconverted_bases(
 /// tracked type in SEQ. ML companion array: one probability per listed base, encoded as
 /// `floor(256 p)` capped at 255 (the value `N` stands for `[N/256, (N+1)/256)`).
 ///
-/// The tracked base and strand follow the read's [`ConversionPattern`], in read orientation:
+/// The tracked base and strand follow the annotation's [`ConversionPattern`], in read
+/// orientation:
 /// C→T reads track `C` with `C+m` (5mC on the same strand as SEQ); G→A reads track `G` with
 /// `G-m` (5mC on the strand opposite SEQ). The `?` flag states that tracked bases not listed
 /// have unknown status (no evidence, not informative, or masked), rather than asserting
@@ -299,7 +320,6 @@ pub fn restore_unconverted_bases(
 pub fn build_mm_ml_tags(
     consensus_bases: &[u8],
     annotation: &MethylationAnnotation,
-    pattern: ConversionPattern,
     methylation_mode: crate::MethylationMode,
 ) -> Option<(String, Vec<u8>)> {
     assert_eq!(
@@ -308,7 +328,7 @@ pub fn build_mm_ml_tags(
         "consensus_bases and annotation.evidence must have the same length"
     );
 
-    let (track_base, _, _) = pattern.bases();
+    let (track_base, _, _) = annotation.pattern.bases();
 
     let mut skips = Vec::new();
     let mut probs = Vec::new();
@@ -320,7 +340,7 @@ pub fn build_mm_ml_tags(
         }
 
         let total = u64::from(ev.unconverted_count) + u64::from(ev.converted_count);
-        if ev.is_ref_c && total > 0 {
+        if ev.informative && total > 0 {
             // EM-Seq: methylation prob = unconverted/total (C = methylated, stayed as C)
             // TAPs:   methylation prob = converted/total  (T = methylated, converted from C)
             let numerator = match methylation_mode {
@@ -344,7 +364,7 @@ pub fn build_mm_ml_tags(
         return None;
     }
 
-    let (base_char, strand_marker) = match pattern {
+    let (base_char, strand_marker) = match annotation.pattern {
         ConversionPattern::CToT => ('C', '+'),
         ConversionPattern::GToA => ('G', '-'),
     };
@@ -358,6 +378,94 @@ pub fn build_mm_ml_tags(
     Some((mm, probs))
 }
 
+/// The methylation tags of one strand of a duplex record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrandMethylationTags {
+    /// The strand's calls in MM format (`am`/`bm`), if it has any.
+    pub mm: Option<String>,
+    /// Unconverted counts (`au`/`bu`).
+    pub unconverted: Vec<i16>,
+    /// Converted counts (`at`/`bt`).
+    pub converted: Vec<i16>,
+}
+
+/// A duplex record's SEQ and methylation tags, as the duplex caller writes them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplexMethylationTags {
+    /// SEQ: the molecule's sequence, each strand's calls restored to the unconverted base.
+    pub seq: Vec<u8>,
+    /// Per strand, in the order the annotations were given.
+    pub strands: Vec<StrandMethylationTags>,
+    /// Combined `MM`/`ML` (one group per strand with calls, C→T first), if any strand has calls.
+    pub mm_ml: Option<(String, Vec<u8>)>,
+    /// Combined unconverted counts (`cu`): the strands' counts summed.
+    pub unconverted: Vec<i16>,
+    /// Combined converted counts (`ct`).
+    pub converted: Vec<i16>,
+}
+
+/// Builds a duplex record's SEQ and methylation tags from its consensus `bases` and the
+/// annotations of its strands (one, for a single-strand record), all in read orientation.
+///
+/// Shared by the duplex caller and `simulate consensus-reads`, so simulated duplex records are
+/// written exactly as the caller writes them.
+#[must_use]
+pub fn duplex_methylation_tags(
+    bases: &[u8],
+    strands: &[&MethylationAnnotation],
+    methylation_mode: crate::MethylationMode,
+) -> DuplexMethylationTags {
+    let mut seq = bases.to_vec();
+    for annotation in strands {
+        restore_unconverted_bases(&mut seq, annotation);
+    }
+    // Each strand's MM/ML, built once: its MM is the strand's `am`/`bm`, and the strands'
+    // groups, C→T strand first, make the combined MM/ML.
+    let strand_mm_ml: Vec<Option<(String, Vec<u8>)>> = strands
+        .iter()
+        .map(|annotation| build_mm_ml_tags(&seq, annotation, methylation_mode))
+        .collect();
+    let mut order: Vec<usize> = (0..strands.len()).collect();
+    order.sort_by_key(|&k| strands[k].pattern != ConversionPattern::CToT);
+    let mut mm = String::new();
+    let mut ml = Vec::new();
+    for k in order {
+        if let Some((strand_mm, strand_ml)) = &strand_mm_ml[k] {
+            mm.push_str(strand_mm);
+            ml.extend_from_slice(strand_ml);
+        }
+    }
+    let mm_ml = (!mm.is_empty()).then_some((mm, ml));
+    let strand_tags = strands
+        .iter()
+        .zip(strand_mm_ml)
+        .map(|(annotation, mm_ml)| StrandMethylationTags {
+            mm: mm_ml.map(|(mm, _)| mm),
+            unconverted: annotation.unconverted_counts(),
+            converted: annotation.converted_counts(),
+        })
+        .collect();
+    let sum = |count: fn(&MethylationEvidence) -> u32| -> Vec<i16> {
+        (0..bases.len())
+            .map(|i| {
+                let total: u32 = strands
+                    .iter()
+                    .filter_map(|a| a.evidence.get(i))
+                    .map(count)
+                    .fold(0, u32::saturating_add);
+                i16::try_from(total).unwrap_or(i16::MAX)
+            })
+            .collect()
+    };
+    DuplexMethylationTags {
+        unconverted: sum(|e| e.unconverted_count),
+        converted: sum(|e| e.converted_count),
+        seq,
+        strands: strand_tags,
+        mm_ml,
+    }
+}
+
 /// Builds an MM-format tag string without ML companion (for per-strand am/bm tags).
 ///
 /// Same format as `build_mm_ml_tags` but returns only the MM:Z string.
@@ -365,10 +473,9 @@ pub fn build_mm_ml_tags(
 pub fn build_mm_tag_no_ml(
     consensus_bases: &[u8],
     annotation: &MethylationAnnotation,
-    pattern: ConversionPattern,
     methylation_mode: crate::MethylationMode,
 ) -> Option<String> {
-    build_mm_ml_tags(consensus_bases, annotation, pattern, methylation_mode).map(|(mm, _)| mm)
+    build_mm_ml_tags(consensus_bases, annotation, methylation_mode).map(|(mm, _)| mm)
 }
 
 /// Fetches reference bases for aligned positions.
@@ -427,35 +534,6 @@ pub fn is_top_strand(source_read_flags: u16) -> bool {
     // Top strand: R1 forward or R2 reverse
     // Bottom strand: R1 reverse or R2 forward
     is_reverse == is_r2
-}
-
-/// Combines two strand methylation annotations into a duplex annotation.
-///
-/// Sums unconverted and converted counts from both strands at each position.
-#[must_use]
-pub fn combine_methylation_annotations(
-    ab: &MethylationAnnotation,
-    ba: &MethylationAnnotation,
-    len: usize,
-) -> MethylationAnnotation {
-    let mut evidence = Vec::with_capacity(len);
-    for i in 0..len {
-        let ab_ev = ab.evidence.get(i);
-        let ba_ev = ba.evidence.get(i);
-        let is_ref_c = ab_ev.is_some_and(|e| e.is_ref_c) || ba_ev.is_some_and(|e| e.is_ref_c);
-        let unconverted = ab_ev
-            .map_or(0, |e| e.unconverted_count)
-            .saturating_add(ba_ev.map_or(0, |e| e.unconverted_count));
-        let converted = ab_ev
-            .map_or(0, |e| e.converted_count)
-            .saturating_add(ba_ev.map_or(0, |e| e.converted_count));
-        evidence.push(MethylationEvidence {
-            is_ref_c,
-            unconverted_count: unconverted,
-            converted_count: converted,
-        });
-    }
-    MethylationAnnotation { evidence }
 }
 
 #[cfg(test)]
@@ -560,10 +638,11 @@ pub(crate) mod tests {
             &ref_bases,
             ConversionPattern::CToT,
             &all_aligned(),
+            false,
         );
 
         // Position 1 (ref=C): both reads show C → methylated, count=2
-        assert!(annot.evidence[1].is_ref_c);
+        assert!(annot.evidence[1].informative);
         assert_eq!(annot.evidence[1].unconverted_count, 2);
         assert_eq!(annot.evidence[1].converted_count, 0);
         // Consensus base should remain C
@@ -584,13 +663,14 @@ pub(crate) mod tests {
             &ref_bases,
             ConversionPattern::CToT,
             &all_aligned(),
+            false,
         );
 
-        assert!(annot.evidence[1].is_ref_c);
+        assert!(annot.evidence[1].informative);
         assert_eq!(annot.evidence[1].unconverted_count, 0);
         assert_eq!(annot.evidence[1].converted_count, 2);
-        // Consensus base is NOT replaced — methylation state is tracked in cu/ct tags and MM/ML,
-        // and base replacement would interfere with bwameth re-alignment
+        // Consensus base is NOT replaced: a simplex consensus keeps the observed bases (what a
+        // bisulfite-aware aligner expects), with the methylation evidence in cu/ct
         assert_eq!(consensus[1], b'T');
     }
 
@@ -608,9 +688,10 @@ pub(crate) mod tests {
             &ref_bases,
             ConversionPattern::CToT,
             &all_aligned(),
+            false,
         );
 
-        assert!(annot.evidence[1].is_ref_c);
+        assert!(annot.evidence[1].informative);
         assert_eq!(annot.evidence[1].unconverted_count, 1);
         assert_eq!(annot.evidence[1].converted_count, 1);
     }
@@ -628,18 +709,56 @@ pub(crate) mod tests {
             &ref_bases,
             ConversionPattern::CToT,
             &all_aligned(),
+            false,
         );
 
         for ev in &annot.evidence {
-            assert!(!ev.is_ref_c);
+            assert!(!ev.informative);
         }
     }
 
+    /// With `count_all_positions` the pattern's bases are counted everywhere (the duplex
+    /// caller decides its own calls), while `informative` still marks only the reference `C`;
+    /// gating then keeps the counts at the informative positions alone.
     #[test]
-    fn test_annotate_simplex_reverse_strand() {
-        // Bottom strand: ref=G (complement of C), unconverted=G, converted=A
-        let consensus = b"CAGT".to_vec(); // A at pos 1 = converted on bottom strand
-        let sr1 = make_test_source_read(b"CAGT", flags::REVERSE);
+    fn test_annotate_counts_all_positions_and_gates() {
+        // Read-orientation reference `ACTA`: only offset 1 is a reference C. The reads show a
+        // C at offset 0 (a molecule C the reference lacks) and T at offsets 1 and 2.
+        let consensus = b"CTTA".to_vec();
+        let reads = [make_test_source_read(b"CTTA", 0), make_test_source_read(b"CTTA", 0)];
+        let ref_bases = vec![Some(b'A'), Some(b'C'), Some(b'T'), Some(b'A')];
+
+        let annot = annotate_simplex_methylation(
+            consensus.len(),
+            &reads,
+            &ref_bases,
+            ConversionPattern::CToT,
+            &all_aligned(),
+            true,
+        );
+        let summary: Vec<(bool, u32, u32)> = annot
+            .evidence
+            .iter()
+            .map(|e| (e.informative, e.unconverted_count, e.converted_count))
+            .collect();
+        assert_eq!(summary, vec![(false, 2, 0), (true, 0, 2), (false, 0, 2), (false, 0, 0)]);
+
+        let mut gated_annot = annot.clone();
+        gate_to_informative(&mut gated_annot);
+        let gated: Vec<(bool, u32, u32)> = gated_annot
+            .evidence
+            .iter()
+            .map(|e| (e.informative, e.unconverted_count, e.converted_count))
+            .collect();
+        assert_eq!(gated, vec![(false, 0, 0), (true, 0, 2), (false, 0, 0), (false, 0, 0)]);
+    }
+
+    #[test]
+    fn test_annotate_simplex_g_to_a_read() {
+        // A G->A (R2-type) read: informative at read-orientation reference G, unconverted G,
+        // converted A.
+        let consensus = b"CAGT".to_vec(); // A at pos 1 = converted
+        let sr1 = make_test_source_read(b"CAGT", flags::PAIRED | flags::LAST_SEGMENT);
         let ref_bases = vec![Some(b'T'), Some(b'G'), Some(b'C'), Some(b'A')]; // at reversed positions
 
         let annot = annotate_simplex_methylation(
@@ -648,13 +767,14 @@ pub(crate) mod tests {
             &ref_bases,
             ConversionPattern::GToA,
             &all_aligned(),
+            false,
         );
 
-        // Position 1: ref=G → eligible for bottom-strand methylation
-        assert!(annot.evidence[1].is_ref_c);
+        // Position 1: ref=G → informative for a G->A read
+        assert!(annot.evidence[1].informative);
         assert_eq!(annot.evidence[1].unconverted_count, 0); // A, not G
-        assert_eq!(annot.evidence[1].converted_count, 1); // A = converted on bottom strand
-        // Consensus base is NOT replaced — methylation state is tracked in cu/ct tags and MM/ML
+        assert_eq!(annot.evidence[1].converted_count, 1); // A = converted
+        // Consensus base is NOT replaced: the observed base is kept
         assert_eq!(consensus[1], b'A');
     }
 
@@ -662,22 +782,34 @@ pub(crate) mod tests {
     fn test_build_mm_ml_tags_basic() {
         let consensus = b"ACGCAC".to_vec();
         let annotation = MethylationAnnotation {
+            pattern: ConversionPattern::CToT,
             evidence: vec![
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 }, // A
-                MethylationEvidence { is_ref_c: true, unconverted_count: 3, converted_count: 0 }, // C - methylated
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 }, // G
-                MethylationEvidence { is_ref_c: true, unconverted_count: 0, converted_count: 3 }, // C - unmethylated
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 }, // A
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 }, // C - not ref-C
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                }, // A
+                MethylationEvidence { informative: true, unconverted_count: 3, converted_count: 0 }, // C - methylated
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                }, // G
+                MethylationEvidence { informative: true, unconverted_count: 0, converted_count: 3 }, // C - unmethylated
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                }, // A
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                }, // C - not ref-C
             ],
         };
 
-        let result = build_mm_ml_tags(
-            &consensus,
-            &annotation,
-            ConversionPattern::CToT,
-            crate::MethylationMode::EmSeq,
-        );
+        let result = build_mm_ml_tags(&consensus, &annotation, crate::MethylationMode::EmSeq);
         assert!(result.is_some());
         let (mm, ml) = result.unwrap();
         // Two C bases that are ref-C: skip 0 to first, skip 0 to second
@@ -704,14 +836,14 @@ pub(crate) mod tests {
         #[case] expected: u8,
     ) {
         let annotation = MethylationAnnotation {
+            pattern: ConversionPattern::CToT,
             evidence: vec![MethylationEvidence {
-                is_ref_c: true,
+                informative: true,
                 unconverted_count,
                 converted_count,
             }],
         };
-        let (_, ml) =
-            build_mm_ml_tags(b"C", &annotation, ConversionPattern::CToT, mode).expect("a call");
+        let (_, ml) = build_mm_ml_tags(b"C", &annotation, mode).expect("a call");
         assert_eq!(ml, vec![expected]);
     }
 
@@ -720,6 +852,7 @@ pub(crate) mod tests {
         // No ref-C positions at all
         let consensus = b"AGGT".to_vec();
         let annotation = MethylationAnnotation {
+            pattern: ConversionPattern::CToT,
             evidence: vec![
                 MethylationEvidence::default(),
                 MethylationEvidence::default(),
@@ -728,12 +861,7 @@ pub(crate) mod tests {
             ],
         };
 
-        let result = build_mm_ml_tags(
-            &consensus,
-            &annotation,
-            ConversionPattern::CToT,
-            crate::MethylationMode::EmSeq,
-        );
+        let result = build_mm_ml_tags(&consensus, &annotation, crate::MethylationMode::EmSeq);
         assert!(result.is_none());
     }
 
@@ -741,20 +869,28 @@ pub(crate) mod tests {
     fn test_build_mm_tag_no_ml() {
         let consensus = b"ACGT".to_vec();
         let annotation = MethylationAnnotation {
+            pattern: ConversionPattern::CToT,
             evidence: vec![
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 },
-                MethylationEvidence { is_ref_c: true, unconverted_count: 2, converted_count: 1 },
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 },
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 },
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                },
+                MethylationEvidence { informative: true, unconverted_count: 2, converted_count: 1 },
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                },
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                },
             ],
         };
 
-        let result = build_mm_tag_no_ml(
-            &consensus,
-            &annotation,
-            ConversionPattern::CToT,
-            crate::MethylationMode::EmSeq,
-        );
+        let result = build_mm_tag_no_ml(&consensus, &annotation, crate::MethylationMode::EmSeq);
         assert!(result.is_some());
         assert_eq!(result.unwrap(), "C+m?,0;");
     }
@@ -772,24 +908,32 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_combine_methylation_annotations() {
+    fn test_duplex_methylation_tags_sum_the_strands() {
         let ab = MethylationAnnotation {
+            pattern: ConversionPattern::CToT,
             evidence: vec![
-                MethylationEvidence { is_ref_c: true, unconverted_count: 2, converted_count: 1 },
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 },
+                MethylationEvidence { informative: true, unconverted_count: 2, converted_count: 1 },
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                },
             ],
         };
         let ba = MethylationAnnotation {
+            pattern: ConversionPattern::GToA,
             evidence: vec![
-                MethylationEvidence { is_ref_c: true, unconverted_count: 1, converted_count: 2 },
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 },
+                MethylationEvidence { informative: true, unconverted_count: 1, converted_count: 2 },
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                },
             ],
         };
-        let combined = combine_methylation_annotations(&ab, &ba, 2);
-        assert!(combined.evidence[0].is_ref_c);
-        assert_eq!(combined.evidence[0].unconverted_count, 3);
-        assert_eq!(combined.evidence[0].converted_count, 3);
-        assert!(!combined.evidence[1].is_ref_c);
+        let tags = duplex_methylation_tags(b"CA", &[&ab, &ba], crate::MethylationMode::EmSeq);
+        assert_eq!(tags.unconverted, vec![3, 0], "cu is the strands' unconverted counts summed");
+        assert_eq!(tags.converted, vec![3, 0], "ct is the strands' converted counts summed");
     }
 
     #[test]
@@ -828,22 +972,30 @@ pub(crate) mod tests {
         // Consensus: CCACC — three C bases, but only positions 0 and 3 are ref-C
         let consensus = b"CCACC".to_vec();
         let annotation = MethylationAnnotation {
+            pattern: ConversionPattern::CToT,
             evidence: vec![
-                MethylationEvidence { is_ref_c: true, unconverted_count: 5, converted_count: 0 }, // C at 0: ref-C, methylated
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 }, // C at 1: NOT ref-C
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 }, // A at 2
-                MethylationEvidence { is_ref_c: true, unconverted_count: 0, converted_count: 5 }, // C at 3: ref-C, unmethylated
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 }, // C at 4: NOT ref-C
+                MethylationEvidence { informative: true, unconverted_count: 5, converted_count: 0 }, // C at 0: ref-C, methylated
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                }, // C at 1: NOT ref-C
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                }, // A at 2
+                MethylationEvidence { informative: true, unconverted_count: 0, converted_count: 5 }, // C at 3: ref-C, unmethylated
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                }, // C at 4: NOT ref-C
             ],
         };
 
-        let (mm, ml) = build_mm_ml_tags(
-            &consensus,
-            &annotation,
-            ConversionPattern::CToT,
-            crate::MethylationMode::EmSeq,
-        )
-        .unwrap();
+        let (mm, ml) =
+            build_mm_ml_tags(&consensus, &annotation, crate::MethylationMode::EmSeq).unwrap();
         // First ref-C is the 1st C (skip 0), second ref-C is the 4th C (skip 1 non-ref C + skip 1 more)
         // Walking: C at 0 (ref-C, skip=0), C at 1 (not ref-C, skip++), C at 3 (ref-C, skip=1), C at 4 (not ref-C)
         assert_eq!(mm, "C+m?,0,1;");
@@ -855,23 +1007,35 @@ pub(crate) mod tests {
         // Bottom-strand consensus has G bases at methylation sites
         let consensus = b"AGCGAG".to_vec();
         let annotation = MethylationAnnotation {
+            pattern: ConversionPattern::GToA,
             evidence: vec![
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 }, // A
-                MethylationEvidence { is_ref_c: true, unconverted_count: 3, converted_count: 0 }, // G - methylated
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 }, // C
-                MethylationEvidence { is_ref_c: true, unconverted_count: 0, converted_count: 3 }, // G - unmethylated
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 }, // A
-                MethylationEvidence { is_ref_c: false, unconverted_count: 0, converted_count: 0 }, // G - not ref-C
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                }, // A
+                MethylationEvidence { informative: true, unconverted_count: 3, converted_count: 0 }, // G - methylated
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                }, // C
+                MethylationEvidence { informative: true, unconverted_count: 0, converted_count: 3 }, // G - unmethylated
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                }, // A
+                MethylationEvidence {
+                    informative: false,
+                    unconverted_count: 0,
+                    converted_count: 0,
+                }, // G - not ref-C
             ],
         };
 
-        let (mm, ml) = build_mm_ml_tags(
-            &consensus,
-            &annotation,
-            ConversionPattern::GToA,
-            crate::MethylationMode::EmSeq,
-        )
-        .expect("should have tags");
+        let (mm, ml) = build_mm_ml_tags(&consensus, &annotation, crate::MethylationMode::EmSeq)
+            .expect("should have tags");
         // Per SAM spec: opposite-strand 5mC uses G-m (minus = opposite strand of SEQ)
         assert_eq!(mm, "G-m?,0,0;");
         assert_eq!(ml.len(), 2);
@@ -882,18 +1046,21 @@ pub(crate) mod tests {
     #[test]
     fn test_methylation_counters_saturate() {
         let annotation = MethylationAnnotation {
+            pattern: ConversionPattern::CToT,
             evidence: vec![MethylationEvidence {
-                is_ref_c: true,
+                informative: true,
                 unconverted_count: u32::MAX,
                 converted_count: u32::MAX,
             }],
         };
-        let ab = &annotation;
-        let ba = &annotation;
-        let combined = combine_methylation_annotations(ab, ba, 1);
-        // Should saturate at u32::MAX, not wrap or panic
-        assert_eq!(combined.evidence[0].unconverted_count, u32::MAX);
-        assert_eq!(combined.evidence[0].converted_count, u32::MAX);
+        let tags = duplex_methylation_tags(
+            b"C",
+            &[&annotation, &annotation],
+            crate::MethylationMode::EmSeq,
+        );
+        // The sum saturates rather than wrapping or panicking, and clamps to the tag's i16.
+        assert_eq!(tags.unconverted, vec![i16::MAX]);
+        assert_eq!(tags.converted, vec![i16::MAX]);
     }
 
     #[test]
@@ -901,21 +1068,17 @@ pub(crate) mod tests {
         // All converted (T) at ref-C → TAPs prob = converted/total = 255
         let bases = vec![b'C'; 5]; // consensus restored to C
         let annotation = MethylationAnnotation {
+            pattern: ConversionPattern::CToT,
             evidence: vec![
                 MethylationEvidence {
-                    is_ref_c: true,
+                    informative: true,
                     unconverted_count: 0,
                     converted_count: 3
                 };
                 5
             ],
         };
-        let result = build_mm_ml_tags(
-            &bases,
-            &annotation,
-            ConversionPattern::CToT,
-            crate::MethylationMode::Taps,
-        );
+        let result = build_mm_ml_tags(&bases, &annotation, crate::MethylationMode::Taps);
         let (mm, ml) = result.unwrap();
         assert!(mm.starts_with("C+m"));
         assert_eq!(ml, vec![255u8; 5]);
@@ -926,21 +1089,17 @@ pub(crate) mod tests {
         // All unconverted (C) at ref-C → TAPs prob = converted/total = 0/3 = 0
         let bases = vec![b'C'; 5];
         let annotation = MethylationAnnotation {
+            pattern: ConversionPattern::CToT,
             evidence: vec![
                 MethylationEvidence {
-                    is_ref_c: true,
+                    informative: true,
                     unconverted_count: 3,
                     converted_count: 0
                 };
                 5
             ],
         };
-        let result = build_mm_ml_tags(
-            &bases,
-            &annotation,
-            ConversionPattern::CToT,
-            crate::MethylationMode::Taps,
-        );
+        let result = build_mm_ml_tags(&bases, &annotation, crate::MethylationMode::Taps);
         let (_, ml) = result.unwrap();
         assert_eq!(ml, vec![0u8; 5]);
     }
@@ -950,21 +1109,17 @@ pub(crate) mod tests {
         // Verify EM-seq behavior is unchanged: unconverted/total
         let bases = vec![b'C'; 5];
         let annotation = MethylationAnnotation {
+            pattern: ConversionPattern::CToT,
             evidence: vec![
                 MethylationEvidence {
-                    is_ref_c: true,
+                    informative: true,
                     unconverted_count: 3,
                     converted_count: 0
                 };
                 5
             ],
         };
-        let result = build_mm_ml_tags(
-            &bases,
-            &annotation,
-            ConversionPattern::CToT,
-            crate::MethylationMode::EmSeq,
-        );
+        let result = build_mm_ml_tags(&bases, &annotation, crate::MethylationMode::EmSeq);
         let (_, ml) = result.unwrap();
         assert_eq!(ml, vec![255u8; 5]); // EM-seq: 3/3 unconverted = 255
     }

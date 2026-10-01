@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
-use log::info;
+use log::{info, warn};
 
 use crate::commands::common::MethylationRef;
 use crate::commands::consensus_runner::{ConsensusStatsOps, log_overlapping_stats};
@@ -280,6 +280,16 @@ fn make_duplex_consensus_init(
     header: Option<Arc<noodles::sam::Header>>,
     library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
 ) -> impl Fn() -> DuplexState + Send + Sync + 'static {
+    if methylation_mode.is_enabled()
+        && DuplexConsensusCaller::allows_single_strand_consensus(&min_reads)
+    {
+        warn!(
+            "--min-reads allows single-strand duplex consensus reads (bD = 0) with \
+             --methylation-mode: their SEQ is restored from one strand with no other strand \
+             to confirm the genotype, so a C>T mutation at an informative site reads as an \
+             unconverted C. Exclude records with bD = 0 when calling variants."
+        );
+    }
     move || {
         let mut caller = DuplexConsensusCaller::new(
             read_name_prefix.clone(),

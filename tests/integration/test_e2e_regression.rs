@@ -9,6 +9,7 @@ use clap::Parser;
 use fgumi_lib::commands::command::Command as FgumiCommand;
 use fgumi_lib::commands::compare::{CompareBams, CompareMismatch, compare_headers};
 use fgumi_lib::commands::dedup::MarkDuplicates;
+use fgumi_lib::commands::duplex::Duplex;
 use fgumi_lib::commands::extract::Extract;
 use fgumi_lib::commands::filter::Filter;
 use fgumi_lib::commands::group::GroupReadsByUmi;
@@ -717,6 +718,161 @@ fn test_e2e_methylation_pipeline() {
     // Verify the simplex output carries methylation as observed bases plus cu/ct counts,
     // with no MM/ML.
     assert_simplex_has_methylation_tags(&simplex);
+}
+
+/// Checks one duplex methylation record (see `test_e2e_duplex_methylation_pipeline`) and returns
+/// whether it carries MM, whether MM lists both strands' groups, and how many calls it checked.
+fn check_duplex_methylation_record(record: &bam::Record) -> (bool, bool, usize) {
+    let mut checked_sites = 0;
+    let mut both_groups = false;
+    let data = record.data();
+    let seq: Vec<u8> = record.sequence().iter().collect();
+    let counts = |tag: SamTag| match data.get(&tag.to_noodles_tag()) {
+        Some(Ok(noodles::sam::alignment::record::data::field::Value::Array(
+            noodles::sam::alignment::record::data::field::value::Array::Int16(values),
+        ))) => values.iter().collect::<std::io::Result<Vec<i16>>>().ok(),
+        _ => None,
+    };
+    // Each strand's calls sit on its own restored base, in read orientation: the AB strand
+    // reads C->T on R1 records and G->A on R2 records, so its calls are at `C` on R1 and `G`
+    // on R2; the BA strand's at the complementary base.
+    let is_r2 = record.flags().is_last_segment();
+    let (ab_base, ba_base) = if is_r2 { (b'G', b'C') } else { (b'C', b'G') };
+    let strand_counts = |u: SamTag, t: SamTag| {
+        let (u, t) = (counts(u).expect("strand u"), counts(t).expect("strand t"));
+        u.iter().zip(&t).map(|(a, b)| a + b).collect::<Vec<i16>>()
+    };
+    let ab = strand_counts(SamTag::AU, SamTag::AT);
+    let ba = strand_counts(SamTag::BU, SamTag::BT);
+    for (i, &base) in seq.iter().enumerate() {
+        for (depth, expected, strand) in [(ab[i], ab_base, "AB"), (ba[i], ba_base, "BA")] {
+            if depth > 0 {
+                checked_sites += 1;
+                assert_eq!(
+                    char::from(base),
+                    char::from(expected),
+                    "position {i}: SEQ at an {strand} call is that strand's restored base"
+                );
+            }
+        }
+    }
+    let string = |tag: SamTag| match data.get(&tag.to_noodles_tag()) {
+        Some(Ok(noodles::sam::alignment::record::data::field::Value::String(s))) => {
+            Some(s.to_string())
+        }
+        _ => None,
+    };
+    // The number of calls an MM-format tag lists, over all its groups.
+    let entries = |mm: &str| -> usize {
+        mm.split(';').filter(|g| !g.is_empty()).map(|g| g.split(',').count() - 1).sum()
+    };
+    let mm = string(SamTag::MM);
+    if let Some(mm) = &mm {
+        if let (Some(c), Some(g)) = (mm.find("C+m?"), mm.find("G-m?")) {
+            assert!(c < g, "C+m? must precede G-m?: {mm}");
+            both_groups = true;
+        }
+        // MM lists exactly the strands' calls, ML has one probability per listed call, and the
+        // per-strand am/bm together list the same calls (both present when MM has both groups).
+        assert_eq!(entries(mm), checked_sites, "MM lists every call: {mm}");
+        let ml_len = match data.get(&SamTag::ML.to_noodles_tag()) {
+            Some(Ok(noodles::sam::alignment::record::data::field::Value::Array(
+                noodles::sam::alignment::record::data::field::value::Array::UInt8(values),
+            ))) => values.len(),
+            other => panic!("ML must be a B:C array alongside MM, got {other:?}"),
+        };
+        assert_eq!(ml_len, entries(mm), "one ML probability per MM call: {mm}");
+        let (am, bm) = (string(SamTag::AM_BASES), string(SamTag::BM_BASES));
+        if both_groups {
+            assert!(am.is_some() && bm.is_some(), "am and bm present with both groups: {mm}");
+        }
+        let per_strand = am.as_deref().map_or(0, entries) + bm.as_deref().map_or(0, entries);
+        assert_eq!(per_strand, entries(mm), "am + bm list the same calls as MM: {mm}");
+        let mn = match data.get(&SamTag::MN.to_noodles_tag()) {
+            Some(Ok(value)) => value.as_int(),
+            _ => None,
+        };
+        assert_eq!(mn, Some(i64::try_from(seq.len()).unwrap()), "MN = SEQ length");
+    }
+    (mm.is_some(), both_groups, checked_sites)
+}
+
+/// Duplex methylation end to end: simulated duplex families -> `duplex --methylation-mode`.
+/// SEQ is the molecule's sequence (no converted base where a strand made a call), MM lists
+/// `C+m?` before `G-m?`, and MN is the SEQ length.
+#[test]
+fn test_e2e_duplex_methylation_pipeline() {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let ref_path = tmp.path().join("ref.fa");
+    let mut f = std::fs::File::create(&ref_path).expect("failed to create ref FASTA");
+    writeln!(f, ">chr1").unwrap();
+    f.write_all(&b"ACGTCCGG".repeat(1250)).unwrap();
+    writeln!(f).unwrap();
+    f.flush().unwrap();
+
+    let grouped = tmp.path().join("grouped.bam");
+    let truth = tmp.path().join("truth.tsv");
+    GroupedReads::try_parse_from([
+        OsStr::new("grouped-reads"),
+        OsStr::new("-o"),
+        grouped.as_os_str(),
+        OsStr::new("--truth"),
+        truth.as_os_str(),
+        OsStr::new("--reference"),
+        ref_path.as_os_str(),
+        OsStr::new("--num-molecules"),
+        OsStr::new("50"),
+        OsStr::new("--seed"),
+        OsStr::new("42"),
+        OsStr::new("--read-length"),
+        OsStr::new("100"),
+        OsStr::new("--umi-length"),
+        OsStr::new("6"),
+        OsStr::new("--min-family-size"),
+        OsStr::new("3"),
+        OsStr::new("--duplex"),
+        OsStr::new("--methylation-mode"),
+        OsStr::new("em-seq"),
+    ])
+    .expect("failed to parse grouped-reads args")
+    .execute("fgumi simulate grouped-reads")
+    .expect("simulate grouped-reads failed");
+
+    let duplex = tmp.path().join("duplex.bam");
+    Duplex::try_parse_from([
+        OsStr::new("duplex"),
+        OsStr::new("-i"),
+        grouped.as_os_str(),
+        OsStr::new("-o"),
+        duplex.as_os_str(),
+        OsStr::new("--threads"),
+        OsStr::new("1"),
+        OsStr::new("--min-reads"),
+        OsStr::new("1"),
+        OsStr::new("--methylation-mode"),
+        OsStr::new("em-seq"),
+        OsStr::new("--ref"),
+        ref_path.as_os_str(),
+    ])
+    .expect("failed to parse duplex args")
+    .execute("fgumi duplex")
+    .expect("duplex failed");
+
+    let mut reader = bam::io::Reader::new(File::open(&duplex).expect("open duplex BAM"));
+    reader.read_header().expect("read header");
+    let (mut total, mut with_mm, mut with_both_groups, mut checked_sites) = (0usize, 0, 0, 0);
+    for result in reader.records() {
+        let record = result.expect("duplex record");
+        let (has_mm, both_groups, sites) = check_duplex_methylation_record(&record);
+        total += 1;
+        with_mm += usize::from(has_mm);
+        with_both_groups += usize::from(both_groups);
+        checked_sites += sites;
+    }
+    assert!(total > 0, "duplex must emit records");
+    assert!(with_mm > 0, "duplex methylation records carry MM");
+    assert!(with_both_groups > 0, "some record lists both strands' groups, C+m? first");
+    assert!(checked_sites > 0, "expected methylation sites to check SEQ against");
 }
 
 /// Assert that a simplex BAM carries cu/ct on its records and no MM/ML, and that SEQ keeps

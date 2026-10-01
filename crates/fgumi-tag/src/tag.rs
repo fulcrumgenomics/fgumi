@@ -242,14 +242,18 @@ impl SamTag {
 
     /// Per-base methylation-modification string for the AB single-strand consensus (`am`, `Z`).
     ///
-    /// Stores an MM-format annotation (e.g. `C+m,5,12,0;`) for the top strand.
+    /// Stores the AB strand's calls in MM format, by the read type of the AB strand's reads in
+    /// this record: `C+m?,…;` where they are C→T reads (R1 or fragment records), `G-m?,…;`
+    /// where they are G→A reads (R2 records).
     /// Uses the `_BASES` suffix to disambiguate from per-read [`SamTag::AM`]
     /// (bytes `aM`, min depth scalar), which shares the Rust identifier stem.
     pub const AM_BASES: SamTag = SamTag::new(b'a', b'm');
 
     /// Per-base methylation-modification string for the BA single-strand consensus (`bm`, `Z`).
     ///
-    /// Stores an MM-format annotation (e.g. `G-m,...`) for the bottom strand.
+    /// Stores the BA strand's calls in MM format, by the read type of the BA strand's reads in
+    /// this record: `G-m?,…;` where they are G→A reads (R1 or fragment records), `C+m?,…;`
+    /// where they are C→T reads (R2 records).
     /// Uses the `_BASES` suffix to disambiguate from per-read [`SamTag::BM`]
     /// (bytes `bM`, min depth scalar), which shares the Rust identifier stem.
     pub const BM_BASES: SamTag = SamTag::new(b'b', b'm');
