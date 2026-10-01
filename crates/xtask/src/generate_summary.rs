@@ -73,7 +73,15 @@ pub fn generate(
             ("Duplex Consensus Calling", "guide/duplex-consensus-calling.md"),
         ],
     );
-    push_group(&mut md, docs_src, "Methylation", &[("Pipeline Guide", "guide/methylation.md")]);
+    push_group(
+        &mut md,
+        docs_src,
+        "Methylation",
+        &[
+            ("Concepts", "guide/methylation-concepts.md"),
+            ("Pipeline Guide", "guide/methylation.md"),
+        ],
+    );
     push_group(
         &mut md,
         docs_src,

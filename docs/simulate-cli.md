@@ -89,8 +89,14 @@ fgumi simulate fastq-reads \
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--methylation-mode` | `em-seq` or `taps` | (disabled) | Methylation chemistry mode; disabled by default |
-| `--cpg-methylation-rate` | FLOAT | 0.75 | Fraction of CpG cytosines that are methylated [0.0-1.0] |
-| `--conversion-rate` | FLOAT | 0.98 | Enzymatic conversion efficiency for target cytosines [0.0-1.0] |
+| `--cpg-methylation-rate` | FLOAT | 0.75 | Fraction of CpGs that are methylated [0.0-1.0], fixed per CpG for the run (from `--seed`) |
+| `--hemimethylation-rate` | FLOAT | 0.01 | Probability that a methylated CpG is methylated on one strand only [0.0-1.0] |
+| `--methylation-conversion-rate` | FLOAT | 0.999 | Conversion efficiency for target cytosines [0.0-1.0]; `--conversion-rate` is an alias |
+| `--methylation-failure-rate` | FLOAT | 0.01 | Fraction of molecule strands whose conversion fails as a whole (they convert at 1 - conversion rate) [0.0-1.0] |
+
+The library is directional, as in `holodeck simulate`: chemistry converts each original strand of a molecule once (top strand C→T, bottom strand G→A in reference orientation), every read of a strand family is a copy of that converted strand, and both mates of a pair are cut from it. Non-CpG cytosines are unmethylated.
+
+The per-CpG methylation state is fixed for the run from `--seed`; without `--seed` it is drawn at random and logged as the methylation table seed. Earlier releases used a conversion rate of 0.98 and no hemimethylation or conversion failures, so the same `--seed` now gives different methylation output.
 
 ### Truth File Format
 
@@ -399,9 +405,13 @@ fgumi simulate consensus-reads \
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--methylation-mode` | `em-seq` or `taps` | (disabled) | Methylation chemistry mode; disabled by default |
-| `--cpg-methylation-rate` | FLOAT | 0.75 | Fraction of CpG cytosines that are methylated [0.0-1.0] |
-| `--conversion-rate` | FLOAT | 0.98 | Enzymatic conversion efficiency for target cytosines [0.0-1.0] |
+| `--cpg-methylation-rate` | FLOAT | 0.75 | Fraction of CpGs that are methylated [0.0-1.0], fixed per CpG for the run (from `--seed`) |
+| `--hemimethylation-rate` | FLOAT | 0.01 | Probability that a methylated CpG is methylated on one strand only [0.0-1.0] |
+| `--methylation-conversion-rate` | FLOAT | 0.999 | Conversion efficiency for target cytosines [0.0-1.0]; `--conversion-rate` is an alias |
+| `--methylation-failure-rate` | FLOAT | 0.01 | Fraction of molecule strands whose conversion fails as a whole (they convert at 1 - conversion rate) [0.0-1.0] |
 | `--methylation-depth-mean` | FLOAT | 5.0 | Mean depth for methylation count sampling (cu + ct per position) |
+
+With `--methylation-mode`, records carry `cu`/`ct` counts at their read type's informative positions (R1 at reference C, R2 at reference G, in read orientation), all unconverted or all converted per position since a family is one converted strand. Duplex records add `au`/`at` (the record's own strand) and `bu`/`bt` (the other strand, at the complementary base). As the consensus callers do, simplex records keep the converted bases in SEQ with no `MM`/`ML`, and duplex records are the molecule's sequence (informative positions restored) with `MM`/`ML`/`MN` and `am`/`bm`.
 
 ### Output Tags (Simplex)
 
