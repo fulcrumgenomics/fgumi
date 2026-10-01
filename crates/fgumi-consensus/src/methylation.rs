@@ -75,17 +75,6 @@ impl MethylationAnnotation {
             pattern: self.pattern,
         }
     }
-
-    /// Returns a copy of this annotation with the evidence vector reversed.
-    ///
-    /// Used when building R2 records: the sequence is reverse-complemented, so
-    /// the per-position methylation evidence must be reversed to match.
-    #[must_use]
-    pub fn reverse(&self) -> Self {
-        let mut rev = self.evidence.clone();
-        rev.reverse();
-        Self { evidence: rev, pattern: self.pattern }
-    }
 }
 
 /// Determines if a position in the reference is in a `CpG` dinucleotide context.

@@ -3,7 +3,8 @@
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::{
-    MethylationArgs, ReferenceGenome, StrandBiasArgs, join_writer_result,
+    MethylationArgs, MethylationConfig, ReferenceGenome, StrandBiasArgs, TemplateLocus,
+    convert_molecule_strand, join_writer_result,
 };
 use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
@@ -15,9 +16,7 @@ use crossbeam_channel::bounded;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::create_raw_bam_writer;
 use fgumi_consensus::MethylationMode;
-use fgumi_consensus::methylation::{
-    ConversionPattern, MethylationAnnotation, MethylationEvidence, build_mm_ml_tags, is_cpg_context,
-};
+use fgumi_consensus::methylation::{ConversionPattern, MethylationAnnotation, MethylationEvidence};
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
 use log::info;
 use noodles::sam::header::Header;
@@ -145,14 +144,10 @@ struct GenerationParams {
     error_rate_stddev: f64,
     duplex: bool,
     consensus_quality: u8,
-    /// Methylation mode (Disabled if not set).
-    methylation_mode: MethylationMode,
+    /// Methylation model (mode `Disabled` if not set).
+    methylation: MethylationConfig,
     /// Distribution for methylation count sampling.
     methylation_depth_dist: LogNormal<f64>,
-    /// `CpG` methylation rate.
-    cpg_methylation_rate: f64,
-    /// Enzymatic conversion rate for target cytosines.
-    conversion_rate: f64,
     /// Loaded reference genome for sampling template sequences.
     ref_genome: Arc<ReferenceGenome>,
 }
@@ -218,7 +213,7 @@ impl Command for ConsensusReads {
             error_rate_stddev: self.error_rate_stddev,
             duplex: self.duplex,
             consensus_quality: self.consensus_quality,
-            methylation_mode: methylation.mode,
+            methylation,
             methylation_depth_dist: if methylation.mode.is_enabled() {
                 create_depth_distribution(
                     self.methylation_depth_mean,
@@ -228,8 +223,6 @@ impl Command for ConsensusReads {
                 // Unused when methylation is disabled; use safe defaults
                 create_depth_distribution(5.0, 2.5)
             },
-            cpg_methylation_rate: methylation.cpg_methylation_rate,
-            conversion_rate: methylation.conversion_rate,
             ref_genome: Arc::clone(&ref_genome),
         });
 
@@ -392,39 +385,40 @@ fn generate_consensus_pair(
         (0, 0, 0, 0, 0, 0)
     };
 
-    // Generate methylation annotation if enabled
-    let methylation = if params.methylation_mode.is_enabled() {
-        Some(generate_methylation_annotation(
-            &seq,
-            params.methylation_mode,
-            params.cpg_methylation_rate,
-            params.conversion_rate,
-            &params.methylation_depth_dist,
-            params.duplex,
-            &mut rng,
-        ))
-    } else {
-        None
-    };
-
-    // Coin flip for strand orientation
+    // Coin flip for strand orientation: R1 reads the molecule's top strand forward, or its
+    // bottom strand reverse.
     let is_top_strand: bool = rng.random();
     let r1_is_reverse = !is_top_strand;
 
-    // Compute methylation per read: the forward read gets the original annotation,
-    // the reverse read gets the reversed annotation. Which read is forward depends
-    // on the strand coin flip.
-    let reverse_methylation = methylation.as_ref().map(|m| m.reverse());
-    let (r1_methylation, r2_methylation) = if r1_is_reverse {
-        // R1F2: R1 is reverse, R2 is forward
-        (reverse_methylation.as_ref(), methylation.as_ref())
-    } else {
-        // F1R2: R1 is forward, R2 is reverse
-        (methylation.as_ref(), reverse_methylation.as_ref())
+    // Methylation: one conversion per original strand of the molecule, as the consensus
+    // callers see it (see `simulate_molecule_methylation`).
+    let molecule = params.methylation.mode.is_enabled().then(|| {
+        let locus = TemplateLocus {
+            chrom_idx: Some(chrom_idx),
+            contig: params.ref_genome.contig(chrom_idx),
+            start: local_pos,
+        };
+        simulate_molecule_methylation(
+            &seq,
+            locus,
+            is_top_strand,
+            params.duplex,
+            &params.methylation,
+            &params.methylation_depth_dist,
+            &mut rng,
+        )
+    });
+    let record_bases = |is_r2: bool, is_reverse: bool| match &molecule {
+        Some(molecule) => {
+            let (bases, methylation) = molecule.record(is_r2, is_reverse);
+            (bases, Some(methylation))
+        }
+        None if is_reverse => (reverse_complement(&seq), None),
+        None => (seq.clone(), None),
     };
 
     // Build R1 record
-    let r1_seq = if is_top_strand { seq.clone() } else { reverse_complement(&seq) };
+    let (r1_seq, r1_methylation) = record_bases(false, r1_is_reverse);
     let r1_record = build_consensus_record(
         &format!("{read_name}/1"),
         &r1_seq,
@@ -437,12 +431,12 @@ fn generate_consensus_pair(
         cm,
         ce,
         if params.duplex { Some((ad, bd, am, bm, ae, be)) } else { None },
-        r1_methylation,
-        params.methylation_mode,
+        r1_methylation.as_ref(),
+        params.methylation.mode,
     );
 
     // Build R2 record (opposite strand orientation)
-    let r2_seq = if is_top_strand { reverse_complement(&seq) } else { seq.clone() };
+    let (r2_seq, r2_methylation) = record_bases(true, !r1_is_reverse);
     let r2_record = build_consensus_record(
         &format!("{read_name}/2"),
         &r2_seq,
@@ -455,8 +449,8 @@ fn generate_consensus_pair(
         cm,
         ce,
         if params.duplex { Some((ad, bd, am, bm, ae, be)) } else { None },
-        r2_methylation,
-        params.methylation_mode,
+        r2_methylation.as_ref(),
+        params.methylation.mode,
     );
 
     let chrom_name = params.ref_genome.name(chrom_idx).to_string();
@@ -472,154 +466,91 @@ fn generate_consensus_pair(
     }
 }
 
-/// Generated methylation data for a consensus read.
+/// Methylation of one consensus record, in its read orientation.
 struct MethylationData {
-    /// Combined annotation (both strands merged for simplex, or total for duplex).
-    annotation: MethylationAnnotation,
-    /// AB strand annotation (duplex only).
-    ab_annotation: Option<MethylationAnnotation>,
-    /// BA strand annotation (duplex only).
-    ba_annotation: Option<MethylationAnnotation>,
+    /// Evidence of the strand family of the record's own read type (the AB strand of a
+    /// duplex), informative at `C` for R1 and `G` for R2.
+    ab: MethylationAnnotation,
+    /// Duplex only: evidence of the other strand (BA), at the complementary base.
+    ba: Option<MethylationAnnotation>,
 }
 
-impl MethylationData {
-    /// Returns a copy with all annotations reversed.
-    ///
-    /// Used for R2 records where the sequence is reverse-complemented:
-    /// the per-position methylation evidence must be reversed to match.
-    fn reverse(&self) -> Self {
-        Self {
-            annotation: self.annotation.reverse(),
-            ab_annotation: self.ab_annotation.as_ref().map(MethylationAnnotation::reverse),
-            ba_annotation: self.ba_annotation.as_ref().map(MethylationAnnotation::reverse),
-        }
-    }
+/// Methylation of one consensus molecule over the read span, in genomic orientation.
+struct MoleculeMethylation {
+    /// The span as the records show it: each strand's cytosines after its conversion.
+    converted: Vec<u8>,
+    /// Evidence of the strand R1 reads (AB), at its cytosines.
+    ab: Vec<MethylationEvidence>,
+    /// Duplex only: evidence of the other strand (BA), at its cytosines.
+    ba: Option<Vec<MethylationEvidence>>,
 }
 
-/// Generate methylation annotation for a consensus sequence.
-fn generate_methylation_annotation(
-    seq: &[u8],
-    mode: MethylationMode,
-    cpg_methylation_rate: f64,
-    conversion_rate: f64,
-    methylation_depth_dist: &LogNormal<f64>,
+/// Simulates the methylation evidence a consensus caller would record for one molecule.
+///
+/// Each original strand is converted once (`convert_molecule_strand`): every read of its
+/// family is a PCR copy of it, so at each of that strand's cytosines all `depth` reads show
+/// the same base and the counts are either all unconverted or all converted. The top strand's
+/// cytosines are reference `C`, the bottom strand's reference `G` (genomic orientation). A
+/// simplex consensus has the strand R1 reads (`r1_strand_is_top`); a duplex consensus has both.
+fn simulate_molecule_methylation(
+    span: &[u8],
+    locus: TemplateLocus<'_>,
+    r1_strand_is_top: bool,
     duplex: bool,
+    config: &MethylationConfig,
+    depth_dist: &LogNormal<f64>,
     rng: &mut impl Rng,
-) -> MethylationData {
-    let mut evidence = Vec::with_capacity(seq.len());
-    let mut ab_evidence = if duplex { Some(Vec::with_capacity(seq.len())) } else { None };
-    let mut ba_evidence = if duplex { Some(Vec::with_capacity(seq.len())) } else { None };
-
-    for i in 0..seq.len() {
-        let base = seq[i].to_ascii_uppercase();
-        let informative = base == b'C';
-
-        if !informative {
-            let zero_ev = MethylationEvidence {
-                informative: false,
-                unconverted_count: 0,
-                converted_count: 0,
-            };
-            evidence.push(zero_ev.clone());
-            if let Some(ref mut ab) = ab_evidence {
-                ab.push(zero_ev.clone());
-            }
-            if let Some(ref mut ba) = ba_evidence {
-                ba.push(zero_ev);
-            }
-            continue;
-        }
-
-        // This is a C position - determine if CpG
-        let cpg = is_cpg_context(seq, i, true);
-
-        // Determine methylation probability
-        let methylated_prob = if cpg { cpg_methylation_rate } else { 0.0 };
-
-        // Sample total depth for this position
-        let total_depth = sample_depth(methylation_depth_dist, 1, 100, rng) as u32;
-
-        // Sample how many reads show the "unconverted" (methylated in EM-Seq) signal
-        let methylated = rng.random::<f64>() < methylated_prob;
-
-        // In EM-Seq: unconverted = methylated (protected), converted = unmethylated
-        // In TAPs: unconverted = unmethylated, converted = methylated
-        //
-        // The conversion_rate controls what fraction of targeted bases are converted.
-        // For the "mostly converted" branch: converted ~= total * conversion_rate
-        // For the "mostly unconverted" branch: unconverted ~= total * conversion_rate
-        // (i.e., conversion_rate reflects the efficiency of the chemistry)
-        let (unconverted, converted) = match mode {
-            MethylationMode::EmSeq => {
-                if cpg && methylated {
-                    // Methylated CpG in EM-Seq: mostly unconverted (protected)
-                    let converted_count =
-                        (total_depth as f64 * (1.0 - conversion_rate)).round() as u32;
-                    (total_depth - converted_count, converted_count)
-                } else {
-                    // Unmethylated (non-CpG or unmethylated CpG): mostly converted
-                    let unconverted_count =
-                        (total_depth as f64 * (1.0 - conversion_rate)).round() as u32;
-                    (unconverted_count, total_depth - unconverted_count)
+) -> MoleculeMethylation {
+    let mut converted = span.to_vec();
+    let mut strand_evidence = |is_top: bool, rng: &mut _| -> Vec<MethylationEvidence> {
+        let strand_bases = convert_molecule_strand(span, locus, is_top, config, rng);
+        let cytosine = if is_top { b'C' } else { b'G' };
+        span.iter()
+            .zip(&strand_bases)
+            .enumerate()
+            .map(|(i, (&reference, &base))| {
+                if reference != cytosine {
+                    return MethylationEvidence::default();
                 }
-            }
-            MethylationMode::Taps => {
-                if cpg && methylated {
-                    // Methylated CpG in TAPs: mostly converted (target)
-                    let unconverted_count =
-                        (total_depth as f64 * (1.0 - conversion_rate)).round() as u32;
-                    (unconverted_count, total_depth - unconverted_count)
-                } else {
-                    // Unmethylated: mostly unconverted (not a target). The minority
-                    // leakage (at most `1 - conversion_rate` fraction) is the number
-                    // of spuriously converted reads.
-                    let leaked_converted =
-                        (total_depth as f64 * (1.0 - conversion_rate)).round() as u32;
-                    (total_depth - leaked_converted, leaked_converted)
-                }
-            }
-            MethylationMode::Disabled => (0, 0),
+                converted[i] = base;
+                let depth = sample_depth(depth_dist, 1, 100, rng) as u32;
+                let (unconverted_count, converted_count) =
+                    if base == reference { (depth, 0) } else { (0, depth) };
+                MethylationEvidence { informative: true, unconverted_count, converted_count }
+            })
+            .collect()
+    };
+    let ab = strand_evidence(r1_strand_is_top, rng);
+    let ba = duplex.then(|| strand_evidence(!r1_strand_is_top, rng));
+    MoleculeMethylation { converted, ab, ba }
+}
+
+impl MoleculeMethylation {
+    /// The converted bases and methylation of one record of this molecule, in its read
+    /// orientation.
+    ///
+    /// The AB strand's cytosines appear as `C` in R1's read orientation and `G` in R2's (R2
+    /// is the copy complementary to the original strand); a duplex record's BA strand the
+    /// other way round. A simplex record keeps these bases; a duplex record's SEQ is restored
+    /// to the molecule's sequence when it is written (as the duplex caller writes it).
+    fn record(&self, is_r2: bool, is_reverse: bool) -> (Vec<u8>, MethylationData) {
+        let (own, other) = if is_r2 {
+            (ConversionPattern::GToA, ConversionPattern::CToT)
+        } else {
+            (ConversionPattern::CToT, ConversionPattern::GToA)
         };
-
-        let ev = MethylationEvidence {
-            informative: true,
-            unconverted_count: unconverted,
-            converted_count: converted,
+        let orient = |evidence: &[MethylationEvidence], pattern| {
+            let mut evidence = evidence.to_vec();
+            if is_reverse {
+                evidence.reverse();
+            }
+            MethylationAnnotation { evidence, pattern }
         };
-
-        if duplex {
-            // Split counts between AB and BA strands
-            let ab_frac = rng.random_range(30..=70) as f64 / 100.0;
-            let ab_unconverted = (unconverted as f64 * ab_frac).round() as u32;
-            let ab_converted = (converted as f64 * ab_frac).round() as u32;
-            let ba_unconverted = unconverted - ab_unconverted;
-            let ba_converted = converted - ab_converted;
-
-            if let Some(ref mut ab) = ab_evidence {
-                ab.push(MethylationEvidence {
-                    informative: true,
-                    unconverted_count: ab_unconverted,
-                    converted_count: ab_converted,
-                });
-            }
-            if let Some(ref mut ba) = ba_evidence {
-                ba.push(MethylationEvidence {
-                    informative: true,
-                    unconverted_count: ba_unconverted,
-                    converted_count: ba_converted,
-                });
-            }
-        }
-
-        evidence.push(ev);
-    }
-
-    // Evidence is recorded at `C` positions of `seq`, i.e. a C->T (R1-type) annotation.
-    let pattern = ConversionPattern::CToT;
-    MethylationData {
-        annotation: MethylationAnnotation { evidence, pattern },
-        ab_annotation: ab_evidence.map(|e| MethylationAnnotation { evidence: e, pattern }),
-        ba_annotation: ba_evidence.map(|e| MethylationAnnotation { evidence: e, pattern }),
+        let ab = orient(&self.ab, own);
+        let ba = self.ba.as_deref().map(|ba| orient(ba, other));
+        let bases =
+            if is_reverse { reverse_complement(&self.converted) } else { self.converted.clone() };
+        (bases, MethylationData { ab, ba })
     }
 }
 
@@ -685,13 +616,26 @@ fn build_consensus_record(
     let chrom_idx_i32 = i32::try_from(chrom_idx).expect("chrom_idx fits i32");
     let local_pos_i32 = i32::try_from(local_pos).expect("local_pos fits i32");
 
+    // A duplex methylation record is written as the duplex caller writes it, by the same code:
+    // SEQ restored to the molecule's sequence, with MM/ML/MN, am/bm and the counts.
+    let duplex_methylation = methylation.and_then(|meth| {
+        meth.ba.as_ref().map(|ba| {
+            fgumi_consensus::methylation::duplex_methylation_tags(
+                seq,
+                &[&meth.ab, ba],
+                methylation_mode,
+            )
+        })
+    });
+    let seq: &[u8] = duplex_methylation.as_ref().map_or(seq, |tags| &tags.seq);
+
     // `seq`/`quals` are in read orientation; BAM stores SEQ/QUAL of a reverse-strand record in
     // reference orientation.
     let (stored_seq, stored_quals) =
         super::common::to_reference_orientation(seq, quals, is_reverse);
-    // Per-base arrays are stored co-oriented with SEQ, as a re-aligned consensus carries them
-    // after `zipper --tags-to-reverse` and `fgumi filter` reads them by default. MM/ML index the
-    // sequenced read, so they stay in read orientation.
+    // Per-base arrays are stored co-oriented with SEQ (reversed on reverse-strand records), the
+    // orientation `fgumi filter` reads by default: a simulated BAM is filtered without
+    // `--reverse-per-base-tags`. MM/ML index the sequenced read, so they stay in read orientation.
     let oriented = |values: &[i16]| -> Vec<i16> {
         if is_reverse { values.iter().rev().copied().collect() } else { values.to_vec() }
     };
@@ -798,41 +742,30 @@ fn build_consensus_record(
             .add_array_i16(SamTag::CE_BASES, &oriented(&ce_bases));
     }
 
-    // Add methylation tags if enabled.
-    if let Some(meth) = methylation {
-        // cu/ct tags (unconverted/converted counts per position).
-        let cu: Vec<i16> = meth.annotation.unconverted_counts();
-        let ct: Vec<i16> = meth.annotation.converted_counts();
-        b.add_array_i16(SamTag::CU, &oriented(&cu)).add_array_i16(SamTag::CT, &oriented(&ct));
-
-        // MM/ML tags (SAM spec methylation tags).
-        if let Some((mm, ml)) = build_mm_ml_tags(seq, &meth.annotation, methylation_mode) {
-            b.add_string_tag(SamTag::MM, mm.as_bytes()).add_array_u8(SamTag::ML, &ml);
-        }
-
-        // Duplex per-strand tags.
-        if let (Some(ab), Some(ba)) = (&meth.ab_annotation, &meth.ba_annotation) {
-            let au: Vec<i16> = ab.unconverted_counts();
-            let at: Vec<i16> = ab.converted_counts();
-            let bu: Vec<i16> = ba.unconverted_counts();
-            let bt: Vec<i16> = ba.converted_counts();
-            b.add_array_i16(SamTag::AU, &oriented(&au))
-                .add_array_i16(SamTag::AT, &oriented(&at))
-                .add_array_i16(SamTag::BU, &oriented(&bu))
-                .add_array_i16(SamTag::BT, &oriented(&bt));
-
-            // Per-strand MM tags (am/bm).
-            if let Some(am) =
-                fgumi_consensus::methylation::build_mm_tag_no_ml(seq, ab, methylation_mode)
-            {
-                b.add_string_tag(SamTag::AM_BASES, am.as_bytes());
+    // Methylation tags, as the consensus callers write them. Simplex: the counts only. Duplex:
+    // the per-strand calls and counts, the combined MM/ML/MN and counts (see above).
+    if let Some(tags) = &duplex_methylation {
+        for ((mm_tag, u_tag, t_tag), strand) in
+            [(SamTag::AM_BASES, SamTag::AU, SamTag::AT), (SamTag::BM_BASES, SamTag::BU, SamTag::BT)]
+                .into_iter()
+                .zip(&tags.strands)
+        {
+            if let Some(mm) = &strand.mm {
+                b.add_string_tag(mm_tag, mm.as_bytes());
             }
-            if let Some(bm) =
-                fgumi_consensus::methylation::build_mm_tag_no_ml(seq, ba, methylation_mode)
-            {
-                b.add_string_tag(SamTag::BM_BASES, bm.as_bytes());
-            }
+            b.add_array_i16(u_tag, &oriented(&strand.unconverted))
+                .add_array_i16(t_tag, &oriented(&strand.converted));
         }
+        if let Some((mm, ml)) = &tags.mm_ml {
+            b.add_string_tag(SamTag::MM, mm.as_bytes())
+                .add_array_u8(SamTag::ML, ml)
+                .add_int_tag(SamTag::MN, i32::try_from(seq.len()).unwrap_or(i32::MAX));
+        }
+        b.add_array_i16(SamTag::CU, &oriented(&tags.unconverted))
+            .add_array_i16(SamTag::CT, &oriented(&tags.converted));
+    } else if let Some(meth) = methylation {
+        b.add_array_i16(SamTag::CU, &oriented(&meth.ab.unconverted_counts()))
+            .add_array_i16(SamTag::CT, &oriented(&meth.ab.converted_counts()));
     }
 
     b.build()
@@ -843,6 +776,7 @@ mod tests {
     use super::*;
     use crate::commands::simulate::common::generate_random_sequence;
     use crate::simulate::create_rng;
+    use fgumi_raw_bam::RawRecordView;
     use rstest::rstest;
 
     /// Decode a raw BAM record into a noodles `RecordBuf` for higher-level test
@@ -850,6 +784,269 @@ mod tests {
     fn to_record_buf(raw: &RawRecord) -> noodles::sam::alignment::RecordBuf {
         fgumi_raw_bam::raw_record_to_record_buf(raw, &noodles::sam::Header::default())
             .expect("raw_record_to_record_buf failed in test")
+    }
+
+    /// A record's methylation-relevant content, in read orientation.
+    struct ReadView {
+        is_r2: bool,
+        seq: Vec<u8>,
+        reference: Vec<u8>,
+        counts: [Option<Vec<i16>>; 6], // cu, ct, au, at, bu, bt
+        mm: Option<String>,
+        ml: Option<Vec<u8>>,
+        mn: Option<i64>,
+        am: Option<String>,
+        bm: Option<String>,
+    }
+
+    /// Decodes `raw` against `contig` into read orientation. A reverse record stores SEQ and
+    /// the per-base count arrays in reference orientation, so both are flipped back here.
+    fn read_view(raw: &RawRecord, contig: &[u8]) -> ReadView {
+        let view = RawRecordView::new(raw.as_ref());
+        let stored = view.sequence_vec();
+        let start = usize::try_from(view.pos()).unwrap();
+        let genomic_reference = &contig[start..start + stored.len()];
+        let is_reverse = view.is_reverse();
+        let (seq, reference) = if is_reverse {
+            (reverse_complement(&stored), reverse_complement(genomic_reference))
+        } else {
+            (stored, genomic_reference.to_vec())
+        };
+        let aux = fgumi_raw_bam::aux_data_slice(raw.as_ref());
+        let array = |tag: SamTag| {
+            fgumi_raw_bam::find_array_tag(aux, tag).map(|a| {
+                let mut values: Vec<i16> =
+                    fgumi_raw_bam::array_tag_to_vec_u16(&a).into_iter().map(|v| v as i16).collect();
+                if is_reverse {
+                    values.reverse();
+                }
+                values
+            })
+        };
+        let string = |tag: SamTag| {
+            fgumi_raw_bam::find_string_tag(aux, tag).map(|v| String::from_utf8(v.to_vec()).unwrap())
+        };
+        ReadView {
+            is_r2: view.flags() & raw_flags::LAST_SEGMENT != 0,
+            seq,
+            reference,
+            counts: [
+                array(SamTag::CU),
+                array(SamTag::CT),
+                array(SamTag::AU),
+                array(SamTag::AT),
+                array(SamTag::BU),
+                array(SamTag::BT),
+            ],
+            mm: string(SamTag::MM),
+            ml: fgumi_raw_bam::find_array_tag(aux, SamTag::ML).map(|a| a.data.to_vec()),
+            mn: fgumi_raw_bam::find_int_tag(aux, SamTag::MN),
+            am: string(SamTag::AM_BASES),
+            bm: string(SamTag::BM_BASES),
+        }
+    }
+
+    /// EM-seq parameters over a random 4 kb contig; returns the params and the contig.
+    fn methylation_params(
+        mode: MethylationMode,
+        duplex: bool,
+    ) -> (Arc<GenerationParams>, Vec<u8>, tempfile::NamedTempFile) {
+        use std::io::Write as IoWrite;
+        let mut contig_rng = create_rng(Some(99));
+        let contig: Vec<u8> = (0..4000).map(|_| b"ACGT"[contig_rng.random_range(0..4)]).collect();
+        let mut fasta = tempfile::NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&contig).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+        let params = Arc::new(GenerationParams {
+            read_length: 60,
+            min_depth: 1,
+            max_depth: 10,
+            depth_mean: 5.0,
+            depth_stddev: 2.0,
+            error_rate_mean: 0.01,
+            error_rate_stddev: 0.005,
+            duplex,
+            consensus_quality: 40,
+            methylation: MethylationConfig {
+                mode,
+                cpg_methylation_rate: 0.5,
+                conversion_rate: 1.0,
+                hemimethylation_rate: 0.0,
+                failure_rate: 0.0,
+                table_seed: 3,
+            },
+            methylation_depth_dist: create_depth_distribution(5.0, 2.5),
+            ref_genome: Arc::new(ReferenceGenome::load(fasta.path()).unwrap()),
+        });
+        (params, contig, fasta)
+    }
+
+    /// Checks one record (read orientation) against what the consensus callers emit.
+    #[allow(clippy::too_many_lines)]
+    fn assert_matches_caller_output(read: &ReadView, duplex: bool, mode: MethylationMode) {
+        let len = read.seq.len();
+        let [cu, ct, au, at, bu, bt] = &read.counts;
+        let (cu, ct) = (cu.as_ref().expect("cu"), ct.as_ref().expect("ct"));
+        // The record's own read type is informative at C (R1) / G (R2) in read orientation;
+        // a duplex record also carries the other strand at the complementary base.
+        let (own, other) = if read.is_r2 { (b'G', b'C') } else { (b'C', b'G') };
+        let converted_base = |base: u8| if base == b'C' { b'T' } else { b'A' };
+        for i in 0..len {
+            let reference = read.reference[i];
+            let informative = reference == own || (duplex && reference == other);
+            let depth = cu[i] + ct[i];
+            assert_eq!(depth > 0, informative, "position {i}: evidence only at informative bases");
+            if informative {
+                assert!(cu[i] == 0 || ct[i] == 0, "position {i}: a family is one converted strand");
+            }
+            // Simplex keeps the converted bases; duplex is the molecule's sequence.
+            let expected_base =
+                if !duplex && ct[i] > 0 { converted_base(reference) } else { reference };
+            assert_eq!(read.seq[i], expected_base, "position {i}: SEQ");
+        }
+        if duplex {
+            let (au, at, bu, bt) = (
+                au.as_ref().unwrap(),
+                at.as_ref().unwrap(),
+                bu.as_ref().unwrap(),
+                bt.as_ref().unwrap(),
+            );
+            for i in 0..len {
+                assert_eq!(
+                    au[i] + at[i] > 0,
+                    read.reference[i] == own,
+                    "position {i}: AB at own class"
+                );
+                assert_eq!(
+                    bu[i] + bt[i] > 0,
+                    read.reference[i] == other,
+                    "position {i}: BA at other class"
+                );
+                assert_eq!(
+                    (cu[i], ct[i]),
+                    (au[i] + bu[i], at[i] + bt[i]),
+                    "position {i}: cu/ct sums"
+                );
+            }
+        } else {
+            assert!(au.is_none() && bu.is_none(), "simplex records carry no per-strand counts");
+        }
+        if duplex {
+            let mm = read.mm.as_deref().expect("duplex MM");
+            assert_eq!(read.mn, Some(i64::try_from(len).unwrap()), "MN");
+            assert!(mm.starts_with("C+m?") && mm.contains(";G-m?"), "duplex MM: {mm}");
+            assert_mm_ml_match_counts(read, mm, mode);
+            // am/bm: one group per strand, by the read type of that strand's reads here (AB is
+            // the record's own type), listing exactly the strand's sites with evidence.
+            let [_, _, au, at, bu, bt] = &read.counts;
+            let strand_sites = |u: &Option<Vec<i16>>, t: &Option<Vec<i16>>| -> Vec<usize> {
+                let (u, t) = (u.as_ref().unwrap(), t.as_ref().unwrap());
+                (0..len).filter(|&i| u[i] + t[i] > 0).collect()
+            };
+            let (am_header, bm_header) =
+                if read.is_r2 { ("G-m?", "C+m?") } else { ("C+m?", "G-m?") };
+            for (tag, value, header, sites) in [
+                ("am", &read.am, am_header, strand_sites(au, at)),
+                ("bm", &read.bm, bm_header, strand_sites(bu, bt)),
+            ] {
+                let value = value.as_deref().unwrap_or_else(|| panic!("duplex {tag}"));
+                assert_eq!(
+                    decode_single_group(value, &read.seq),
+                    (header.to_string(), sites),
+                    "{tag}: {value}"
+                );
+            }
+        } else {
+            assert!(read.mm.is_none() && read.mn.is_none(), "no MM/MN on simplex");
+            assert!(read.am.is_none() && read.bm.is_none(), "no am/bm on simplex");
+        }
+    }
+
+    /// Decodes a one-group MM-format string against SEQ into its header and listed positions.
+    fn decode_single_group(mm: &str, seq: &[u8]) -> (String, Vec<usize>) {
+        let group = mm.strip_suffix(';').expect("terminated group");
+        assert!(!group.contains(';'), "one group: {mm}");
+        let mut fields = group.split(',');
+        let header = fields.next().unwrap().to_string();
+        let base = header.as_bytes()[0];
+        let tracked: Vec<usize> = (0..seq.len()).filter(|&i| seq[i] == base).collect();
+        let mut ordinal = 0;
+        let positions = fields
+            .map(|skip| {
+                ordinal += skip.parse::<usize>().unwrap();
+                let pos = tracked[ordinal];
+                ordinal += 1;
+                pos
+            })
+            .collect();
+        (header, positions)
+    }
+
+    /// Decodes MM against SEQ and checks it lists exactly the tracked bases with evidence, each
+    /// with the probability the counts imply: a family is one converted strand, so a site is
+    /// all unconverted (EM-seq 255, TAPs 0) or all converted (EM-seq 0, TAPs 255).
+    fn assert_mm_ml_match_counts(read: &ReadView, mm: &str, mode: MethylationMode) {
+        let [cu, ct, ..] = &read.counts;
+        let (cu, ct) = (cu.as_ref().unwrap(), ct.as_ref().unwrap());
+        let ml = read.ml.as_ref().expect("duplex ML");
+        let mut ml_values = ml.iter();
+        for group in mm.trim_end_matches(';').split(';') {
+            let mut fields = group.split(',');
+            let base = fields.next().unwrap().as_bytes()[0];
+            let tracked: Vec<usize> =
+                (0..read.seq.len()).filter(|&i| read.seq[i] == base).collect();
+            let mut listed = Vec::new();
+            let mut ordinal = 0usize;
+            for skip in fields {
+                ordinal += skip.parse::<usize>().unwrap();
+                listed.push(tracked[ordinal]);
+                ordinal += 1;
+            }
+            let with_evidence: Vec<usize> =
+                tracked.iter().copied().filter(|&i| cu[i] + ct[i] > 0).collect();
+            assert_eq!(listed, with_evidence, "MM lists exactly the {} sites with evidence", base);
+            for &i in &listed {
+                let methylated = match mode {
+                    MethylationMode::Taps => ct[i] > 0,
+                    _ => cu[i] > 0,
+                };
+                let expected = if methylated { 255 } else { 0 };
+                assert_eq!(ml_values.next(), Some(&expected), "ML at {i}");
+            }
+        }
+        assert!(ml_values.next().is_none(), "ML has no extra values");
+    }
+
+    /// Simulated consensus records carry what `simplex`/`duplex` emit after this model: simplex
+    /// SEQ with converted bases and no MM/ML, duplex SEQ as the molecule's sequence with
+    /// MM/ML/MN, evidence only at the read type's informative base, family-coherent counts,
+    /// and, for duplex, AB and BA counts at disjoint, complementary bases.
+    #[rstest]
+    #[case::simplex(MethylationMode::EmSeq, false)]
+    #[case::duplex(MethylationMode::EmSeq, true)]
+    #[case::taps_simplex(MethylationMode::Taps, false)]
+    #[case::taps_duplex(MethylationMode::Taps, true)]
+    fn test_methylation_records_match_caller_output(
+        #[case] mode: MethylationMode,
+        #[case] duplex: bool,
+    ) {
+        let (params, contig, _fasta) = methylation_params(mode, duplex);
+        let strand_bias = StrandBiasModel::new(5.0, 5.0);
+        let mut orientations = std::collections::BTreeSet::new();
+        for seed in 0..20u64 {
+            let pair = generate_consensus_pair(0, seed, &params, &strand_bias);
+            let r1 = read_view(&pair.r1_record, &contig);
+            let r2 = read_view(&pair.r2_record, &contig);
+            assert_matches_caller_output(&r1, duplex, mode);
+            assert_matches_caller_output(&r2, duplex, mode);
+            let mut r1_cu = r1.counts[0].clone().unwrap();
+            r1_cu.reverse();
+            assert_eq!(Some(r1_cu), r2.counts[0], "both mates read one molecule: mirrored counts");
+            orientations.insert(pair.is_top_strand);
+        }
+        assert_eq!(orientations.len(), 2, "both strands exercised");
     }
 
     #[test]
@@ -1472,176 +1669,6 @@ mod tests {
         }
     }
 
-    fn test_methylation_depth_dist() -> LogNormal<f64> {
-        create_depth_distribution(5.0, 2.5)
-    }
-
-    #[test]
-    fn test_generate_methylation_annotation_emseq() {
-        // Sequence with CpG sites: positions 0(C),1(G) is CpG; position 4(C),5(A) is non-CpG
-        let seq = b"CGAACAAT";
-        let mut rng = create_rng(Some(42));
-        let dist = test_methylation_depth_dist();
-
-        let data = generate_methylation_annotation(
-            seq,
-            MethylationMode::EmSeq,
-            1.0, // all CpG methylated
-            0.98,
-            &dist,
-            false,
-            &mut rng,
-        );
-
-        // Position 0 is C in CpG context -> methylated in EM-Seq -> mostly unconverted
-        assert!(data.annotation.evidence[0].informative);
-        assert!(data.annotation.evidence[0].unconverted_count > 0);
-
-        // Position 4 is C but not CpG -> unmethylated in EM-Seq -> mostly converted
-        assert!(data.annotation.evidence[4].informative);
-        assert!(
-            data.annotation.evidence[4].converted_count
-                >= data.annotation.evidence[4].unconverted_count
-        );
-
-        // Position 1 is G -> not a ref C
-        assert!(!data.annotation.evidence[1].informative);
-
-        // cu/ct should have correct lengths
-        let cu = data.annotation.unconverted_counts();
-        let ct = data.annotation.converted_counts();
-        assert_eq!(cu.len(), seq.len());
-        assert_eq!(ct.len(), seq.len());
-    }
-
-    #[test]
-    fn test_generate_methylation_annotation_taps() {
-        let seq = b"CGAACAAT";
-        let mut rng = create_rng(Some(42));
-        let dist = test_methylation_depth_dist();
-
-        let data = generate_methylation_annotation(
-            seq,
-            MethylationMode::Taps,
-            1.0, // all CpG methylated
-            0.98,
-            &dist,
-            false,
-            &mut rng,
-        );
-
-        // Position 0 is C in CpG -> methylated in TAPs -> mostly converted (target)
-        assert!(data.annotation.evidence[0].informative);
-        assert!(
-            data.annotation.evidence[0].converted_count
-                >= data.annotation.evidence[0].unconverted_count
-        );
-
-        // Position 4 is C not CpG -> unmethylated in TAPs -> mostly unconverted (not a target)
-        assert!(data.annotation.evidence[4].informative);
-        assert!(
-            data.annotation.evidence[4].unconverted_count
-                >= data.annotation.evidence[4].converted_count
-        );
-    }
-
-    #[test]
-    fn test_build_consensus_record_with_methylation() {
-        let seq = b"CGAACGAT";
-        let quals = vec![40; 8];
-        let mut rng = create_rng(Some(42));
-        let dist = test_methylation_depth_dist();
-
-        let meth = generate_methylation_annotation(
-            seq,
-            MethylationMode::EmSeq,
-            0.75,
-            0.98,
-            &dist,
-            false,
-            &mut rng,
-        );
-
-        let raw = build_consensus_record(
-            "test/1",
-            seq,
-            &quals,
-            true,  // is_first
-            false, // is_reverse
-            0,     // chrom_idx
-            100,   // local_pos
-            5,
-            3,
-            1,
-            None,
-            Some(&meth),
-            MethylationMode::EmSeq,
-        );
-        let record = to_record_buf(&raw);
-
-        // Verify methylation tags are present
-        assert!(record.name().is_some());
-        let cu: Vec<i16> = meth.annotation.unconverted_counts();
-        let ct: Vec<i16> = meth.annotation.converted_counts();
-        assert_eq!(cu.len(), seq.len());
-        assert_eq!(ct.len(), seq.len());
-
-        // Verify at C positions cu+ct > 0
-        for (i, &b) in seq.iter().enumerate() {
-            if b == b'C' {
-                assert!(cu[i] + ct[i] > 0, "position {i}: C should have non-zero cu+ct");
-            } else {
-                assert_eq!(cu[i], 0, "position {i}: non-C should have cu=0");
-                assert_eq!(ct[i], 0, "position {i}: non-C should have ct=0");
-            }
-        }
-    }
-
-    #[test]
-    fn test_build_consensus_record_duplex_with_methylation() {
-        let seq = b"CGAACGAT";
-        let quals = vec![40; 8];
-        let mut rng = create_rng(Some(42));
-        let dist = test_methylation_depth_dist();
-
-        let meth = generate_methylation_annotation(
-            seq,
-            MethylationMode::EmSeq,
-            0.75,
-            0.98,
-            &dist,
-            true, // duplex
-            &mut rng,
-        );
-
-        // Verify duplex methylation data was generated
-        let ab = meth.ab_annotation.as_ref().expect("AB annotation should be present");
-        let ba = meth.ba_annotation.as_ref().expect("BA annotation should be present");
-
-        // Verify per-strand counts have correct lengths
-        assert_eq!(ab.unconverted_counts().len(), seq.len());
-        assert_eq!(ba.converted_counts().len(), seq.len());
-
-        let raw = build_consensus_record(
-            "test/1",
-            seq,
-            &quals,
-            true,  // is_first
-            false, // is_reverse
-            0,     // chrom_idx
-            100,   // local_pos
-            10,
-            5,
-            2,
-            Some((6, 4, 3, 2, 1, 1)),
-            Some(&meth),
-            MethylationMode::EmSeq,
-        );
-        let record = to_record_buf(&raw);
-
-        assert!(record.name().is_some());
-    }
-
     #[test]
     fn test_no_methylation_tags_when_disabled() {
         let seq = b"CGAACGAT";
@@ -1772,6 +1799,56 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// End to end, MM/ML follow the caller being simulated: none on simplex records (converted
+    /// SEQ), present on duplex records (the molecule's sequence).
+    #[rstest]
+    #[case::simplex(false)]
+    #[case::duplex(true)]
+    fn test_methylation_mm_follows_the_caller(#[case] duplex: bool) {
+        use std::io::Write as IoWrite;
+        let mut fasta = tempfile::NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        let mut contig_rng = create_rng(Some(7));
+        let contig: Vec<u8> = (0..2000).map(|_| b"ACGT"[contig_rng.random_range(0..4)]).collect();
+        fasta.write_all(&contig).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let output = dir.path().join("out.bam");
+
+        let args = vec![
+            "consensus-reads".to_string(),
+            "-o".to_string(),
+            output.display().to_string(),
+            "-r".to_string(),
+            fasta.path().display().to_string(),
+            "-n".to_string(),
+            "5".to_string(),
+            "-l".to_string(),
+            "40".to_string(),
+            "--seed".to_string(),
+            "1".to_string(),
+            "--methylation-mode".to_string(),
+            "em-seq".to_string(),
+            format!("--duplex={duplex}"),
+        ];
+        let cmd = ConsensusReads::try_parse_from(&args).expect("valid args");
+        cmd.execute("test").expect("simulation succeeds");
+        let mut reader = noodles::bam::io::reader::Builder.build_from_path(&output).unwrap();
+        let header = reader.read_header().unwrap();
+        let mm_tag = SamTag::MM.to_noodles_tag();
+        let mut records = 0;
+        for record in reader.records() {
+            let record = record.unwrap();
+            let buf =
+                noodles::sam::alignment::RecordBuf::try_from_alignment_record(&header, &record)
+                    .unwrap();
+            assert_eq!(buf.data().get(&mm_tag).is_some(), duplex);
+            records += 1;
+        }
+        assert_eq!(records, 10, "five pairs written");
+    }
+
     #[test]
     fn test_methylation_depth_mean_validation_accepts_when_disabled() {
         use std::io::Write as IoWrite;
@@ -1816,206 +1893,9 @@ mod tests {
         assert!(result.is_ok(), "disabled methylation should not validate depth mean");
     }
 
-    #[test]
-    fn test_methylation_annotation_reverse() {
-        let annotation = MethylationAnnotation {
-            pattern: ConversionPattern::CToT,
-            evidence: vec![
-                MethylationEvidence {
-                    informative: true,
-                    unconverted_count: 10,
-                    converted_count: 2,
-                },
-                MethylationEvidence {
-                    informative: false,
-                    unconverted_count: 0,
-                    converted_count: 0,
-                },
-                MethylationEvidence { informative: true, unconverted_count: 3, converted_count: 7 },
-            ],
-        };
-        let reversed = annotation.reverse();
-        assert_eq!(reversed.evidence.len(), 3);
-        assert!(reversed.evidence[0].informative);
-        assert_eq!(reversed.evidence[0].unconverted_count, 3);
-        assert_eq!(reversed.evidence[0].converted_count, 7);
-        assert!(!reversed.evidence[1].informative);
-        assert!(reversed.evidence[2].informative);
-        assert_eq!(reversed.evidence[2].unconverted_count, 10);
-        assert_eq!(reversed.evidence[2].converted_count, 2);
-    }
-
-    #[test]
-    fn test_methylation_data_reverse() {
-        let annotation = MethylationAnnotation {
-            pattern: ConversionPattern::CToT,
-            evidence: vec![
-                MethylationEvidence {
-                    informative: true,
-                    unconverted_count: 10,
-                    converted_count: 2,
-                },
-                MethylationEvidence {
-                    informative: false,
-                    unconverted_count: 0,
-                    converted_count: 0,
-                },
-            ],
-        };
-        let ab = MethylationAnnotation {
-            pattern: ConversionPattern::CToT,
-            evidence: vec![
-                MethylationEvidence { informative: true, unconverted_count: 6, converted_count: 1 },
-                MethylationEvidence {
-                    informative: false,
-                    unconverted_count: 0,
-                    converted_count: 0,
-                },
-            ],
-        };
-        let ba = MethylationAnnotation {
-            pattern: ConversionPattern::CToT,
-            evidence: vec![
-                MethylationEvidence { informative: true, unconverted_count: 4, converted_count: 1 },
-                MethylationEvidence {
-                    informative: false,
-                    unconverted_count: 0,
-                    converted_count: 0,
-                },
-            ],
-        };
-        let data = MethylationData { annotation, ab_annotation: Some(ab), ba_annotation: Some(ba) };
-        let reversed = data.reverse();
-
-        // Main annotation reversed
-        assert!(!reversed.annotation.evidence[0].informative);
-        assert!(reversed.annotation.evidence[1].informative);
-        assert_eq!(reversed.annotation.evidence[1].unconverted_count, 10);
-
-        // AB reversed
-        let ab_rev = reversed.ab_annotation.unwrap();
-        assert!(!ab_rev.evidence[0].informative);
-        assert!(ab_rev.evidence[1].informative);
-        assert_eq!(ab_rev.evidence[1].unconverted_count, 6);
-
-        // BA reversed
-        let ba_rev = reversed.ba_annotation.unwrap();
-        assert!(!ba_rev.evidence[0].informative);
-        assert!(ba_rev.evidence[1].informative);
-        assert_eq!(ba_rev.evidence[1].unconverted_count, 4);
-    }
-
-    #[test]
-    /// The reverse mate is built from the reverse-complemented read and reversed annotation (as
-    /// `generate_consensus_pair` does); stored in reference orientation, its `cu`/`ct` arrays
-    /// line up with SEQ and so equal the forward mate's.
-    fn test_r2_methylation_cu_ct_tags_are_stored_in_reference_orientation() {
-        use noodles::sam::alignment::record::data::field::Tag;
-        use noodles::sam::alignment::record_buf::data::field::Value;
-        use noodles::sam::alignment::record_buf::data::field::value::Array;
-
-        // Create a sequence with C positions at known offsets:
-        // "CGAT" has C at pos 0 (CpG context) and nothing else
-        let seq = b"CGAT";
-        let quals = vec![40; 4];
-
-        // Build methylation annotation with distinct counts at each position
-        let annotation = MethylationAnnotation {
-            pattern: ConversionPattern::CToT,
-            evidence: vec![
-                MethylationEvidence {
-                    informative: true,
-                    unconverted_count: 10,
-                    converted_count: 2,
-                },
-                MethylationEvidence {
-                    informative: false,
-                    unconverted_count: 0,
-                    converted_count: 0,
-                },
-                MethylationEvidence {
-                    informative: false,
-                    unconverted_count: 0,
-                    converted_count: 0,
-                },
-                MethylationEvidence {
-                    informative: false,
-                    unconverted_count: 0,
-                    converted_count: 0,
-                },
-            ],
-        };
-        let meth = MethylationData { annotation, ab_annotation: None, ba_annotation: None };
-
-        // Build R1 record (uses original methylation)
-        let r1_raw = build_consensus_record(
-            "test/1",
-            seq,
-            &quals,
-            true,  // is_first
-            false, // is_reverse
-            0,     // chrom_idx
-            100,   // local_pos
-            5,
-            3,
-            1,
-            None,
-            Some(&meth),
-            MethylationMode::EmSeq,
-        );
-        let r1 = to_record_buf(&r1_raw);
-
-        // Build R2 record with reversed methylation (as generate_consensus_pair does)
-        let r2_seq = reverse_complement(seq);
-        let r2_meth = meth.reverse();
-        let r2_raw = build_consensus_record(
-            "test/2",
-            &r2_seq,
-            &quals,
-            false, // is_first
-            true,  // is_reverse
-            0,     // chrom_idx
-            100,   // local_pos
-            5,
-            3,
-            1,
-            None,
-            Some(&r2_meth),
-            MethylationMode::EmSeq,
-        );
-        let r2 = to_record_buf(&r2_raw);
-
-        // Extract cu tags from both records
-        let cu_tag = Tag::from([b'c', b'u']);
-        let ct_tag = Tag::from([b'c', b't']);
-
-        let r1_cu = match r1.data().get(&cu_tag) {
-            Some(Value::Array(Array::Int16(arr))) => arr.clone(),
-            other => panic!("Expected Int16 array for cu tag on R1, got {other:?}"),
-        };
-        let r1_ct = match r1.data().get(&ct_tag) {
-            Some(Value::Array(Array::Int16(arr))) => arr.clone(),
-            other => panic!("Expected Int16 array for ct tag on R1, got {other:?}"),
-        };
-
-        let r2_cu = match r2.data().get(&cu_tag) {
-            Some(Value::Array(Array::Int16(arr))) => arr.clone(),
-            other => panic!("Expected Int16 array for cu tag on R2, got {other:?}"),
-        };
-        let r2_ct = match r2.data().get(&ct_tag) {
-            Some(Value::Array(Array::Int16(arr))) => arr.clone(),
-            other => panic!("Expected Int16 array for ct tag on R2, got {other:?}"),
-        };
-
-        // Both mates cover the same bases; in reference orientation their counts agree.
-        assert_eq!(r2_cu, r1_cu, "R2 cu must be in reference orientation: R1={r1_cu:?}");
-        assert_eq!(r2_ct, r1_ct, "R2 ct must be in reference orientation: R1={r1_ct:?}");
-    }
-
     /// Per-base arrays of a reverse-strand record are stored in reference orientation, co-
-    /// oriented with SEQ (as `zipper --tags-to-reverse Consensus` leaves a re-aligned consensus
-    /// and `fgumi filter` expects by default): each array is the reverse of the same record
-    /// built forward.
+    /// oriented with SEQ (as `fgumi filter` expects by default, without
+    /// `--reverse-per-base-tags`): each array is the reverse of the same record built forward.
     #[rstest::rstest]
     #[case::simplex(None)]
     #[case::duplex(Some((6, 4, 3, 2, 2, 1)))]
@@ -2045,9 +1925,11 @@ mod tests {
             pattern: fgumi_consensus::methylation::ConversionPattern::CToT,
         };
         let meth = MethylationData {
-            annotation: annotation.clone(),
-            ab_annotation: duplex_tags.map(|_| annotation.clone()),
-            ba_annotation: duplex_tags.map(|_| annotation.clone()),
+            ab: annotation.clone(),
+            ba: duplex_tags.map(|_| MethylationAnnotation {
+                pattern: fgumi_consensus::methylation::ConversionPattern::GToA,
+                ..annotation.clone()
+            }),
         };
         let build = |is_reverse: bool| {
             to_record_buf(&build_consensus_record(
@@ -2122,10 +2004,8 @@ mod tests {
             error_rate_stddev: 0.01,
             duplex,
             consensus_quality: 40,
-            methylation_mode: MethylationMode::Disabled,
+            methylation: MethylationConfig::default(),
             methylation_depth_dist: create_depth_distribution(5.0, 2.5),
-            cpg_methylation_rate: 0.75,
-            conversion_rate: 0.98,
             ref_genome,
         })
     }
@@ -2319,10 +2199,8 @@ mod tests {
             error_rate_stddev: 0.005,
             duplex: false,
             consensus_quality: 40,
-            methylation_mode: MethylationMode::Disabled,
+            methylation: MethylationConfig::default(),
             methylation_depth_dist: create_depth_distribution(5.0, 2.5),
-            cpg_methylation_rate: 0.75,
-            conversion_rate: 0.98,
             ref_genome: Arc::clone(&ref_genome),
         });
         let strand_bias = StrandBiasModel::new(5.0, 5.0);
