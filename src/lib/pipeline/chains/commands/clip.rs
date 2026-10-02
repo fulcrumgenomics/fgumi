@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
-use log::info;
+use log::{info, warn};
 
 use crate::clipper::RawRecordClipper;
 use crate::commands::clip::ClipParams;
@@ -41,6 +41,8 @@ pub(crate) struct ClipAtomicMetrics {
     pub(crate) total_templates: AtomicU64,
     pub(crate) overlap_clipped: AtomicU64,
     pub(crate) extend_clipped: AtomicU64,
+    /// Records whose modification tags clipping could not keep in step and removed.
+    pub(crate) modification_tags_removed: AtomicU64,
 }
 
 impl Default for ClipAtomicMetrics {
@@ -49,6 +51,7 @@ impl Default for ClipAtomicMetrics {
             total_templates: AtomicU64::new(0),
             overlap_clipped: AtomicU64::new(0),
             extend_clipped: AtomicU64::new(0),
+            modification_tags_removed: AtomicU64::new(0),
         }
     }
 }
@@ -75,11 +78,18 @@ impl FinalizeHook for ClipFinalizeHook {
         let total_templates = metrics.total_templates.load(Ordering::Relaxed);
         let total_overlap_clipped = metrics.overlap_clipped.load(Ordering::Relaxed);
         let total_extend_clipped = metrics.extend_clipped.load(Ordering::Relaxed);
+        let modification_tags_removed = metrics.modification_tags_removed.load(Ordering::Relaxed);
         let records_written = progress_counter.load(Ordering::Relaxed);
 
         info!("Total templates processed: {total_templates}");
         info!("Templates with overlap clipping: {total_overlap_clipped}");
         info!("Templates with mate extension clipping: {total_extend_clipped}");
+        if modification_tags_removed > 0 {
+            warn!(
+                "MM/ML/am/bm were removed from {modification_tags_removed} records whose \
+                 modification tags could not be updated to match the clipped SEQ"
+            );
+        }
         info!("Done!");
 
         timer.log_completion(records_written);
@@ -195,33 +205,41 @@ pub(crate) fn build_clip_process_step(
             // `PerThreadAccumulator` slot so `clip_template` collects detailed
             // per-read base-clip counts; otherwise pass `None` and stay on the
             // fast, collection-free path.
-            let (local_templates, local_overlap_clipped, local_extend_clipped, local_record_count) =
-                if let Some(accumulator) = &cap.metrics_accumulator {
-                    accumulator.with_slot(|slot| {
-                        clip_templates_in_batch(
-                            &mut templates,
-                            &cap.params,
-                            &clipper,
-                            &cap.header,
-                            &cap.reference,
-                            Some(slot),
-                        )
-                    })?
-                } else {
+            let BatchCounts {
+                templates: local_templates,
+                overlap_clipped: local_overlap_clipped,
+                extend_clipped: local_extend_clipped,
+                modification_tags_removed: local_modification_tags_removed,
+                records: local_record_count,
+            } = if let Some(accumulator) = &cap.metrics_accumulator {
+                accumulator.with_slot(|slot| {
                     clip_templates_in_batch(
                         &mut templates,
                         &cap.params,
                         &clipper,
                         &cap.header,
                         &cap.reference,
-                        None,
-                    )?
-                };
+                        Some(slot),
+                    )
+                })?
+            } else {
+                clip_templates_in_batch(
+                    &mut templates,
+                    &cap.params,
+                    &clipper,
+                    &cap.header,
+                    &cap.reference,
+                    None,
+                )?
+            };
 
             // Aggregate metrics (relaxed atomics, lock-free).
             cap.metrics.total_templates.fetch_add(local_templates, Ordering::Relaxed);
             cap.metrics.overlap_clipped.fetch_add(local_overlap_clipped, Ordering::Relaxed);
             cap.metrics.extend_clipped.fetch_add(local_extend_clipped, Ordering::Relaxed);
+            cap.metrics
+                .modification_tags_removed
+                .fetch_add(local_modification_tags_removed, Ordering::Relaxed);
 
             // Progress logging (record granularity matches legacy).
             let prev = cap.progress.fetch_add(local_record_count, Ordering::Relaxed);
@@ -246,9 +264,8 @@ pub(crate) fn build_clip_process_step(
 /// (the calling worker's `PerThreadAccumulator` slot) accumulates across the
 /// whole batch.
 ///
-/// Returns `(templates, overlap_clipped, extend_clipped, records)` counts for
-/// the batch, for the caller to fold into the chain's atomic summary counters
-/// and progress tracker.
+/// Returns the batch's [`BatchCounts`], for the caller to fold into the chain's
+/// atomic summary counters and progress tracker.
 fn clip_templates_in_batch(
     templates: &mut [crate::template::Template],
     params: &ClipParams,
@@ -256,16 +273,13 @@ fn clip_templates_in_batch(
     header: &noodles::sam::Header,
     reference: &ReferenceReader,
     mut metrics: Option<&mut ClippingMetricsCollection>,
-) -> io::Result<(u64, u64, u64, u64)> {
+) -> io::Result<BatchCounts> {
     use crate::alignment_tags::regenerate_alignment_tags_raw_with_scoring;
 
-    let mut local_templates: u64 = 0;
-    let mut local_overlap_clipped: u64 = 0;
-    let mut local_extend_clipped: u64 = 0;
-    let mut local_record_count: u64 = 0;
+    let mut counts = BatchCounts::default();
 
     for template in templates.iter_mut() {
-        local_templates += 1;
+        counts.templates += 1;
         // Mutate the template's records in place. The earlier
         // version of this closure cloned `template.name` and
         // re-allocated a fresh `Template` per template — that
@@ -283,15 +297,12 @@ fn clip_templates_in_batch(
         // caller passed a `--metrics` accumulator slot, detailed per-read base-clip
         // counts are collected here too; otherwise `metrics` is `None` and only the
         // returned per-template flags feed the atomic counters.
-        let (overlap_clipped, extend_clipped) = params
+        let outcome = params
             .clip_template(records, clipper, metrics.as_deref_mut())
             .map_err(io::Error::other)?;
-        if overlap_clipped {
-            local_overlap_clipped += 1;
-        }
-        if extend_clipped {
-            local_extend_clipped += 1;
-        }
+        counts.overlap_clipped += u64::from(outcome.overlap_clipped);
+        counts.extend_clipped += u64::from(outcome.extend_clipped);
+        counts.modification_tags_removed += outcome.modification_tags_removed;
 
         // Regenerate alignment tags for every record (always done to match fgbio). NM/UQ follow
         // the record's SEQ convention, as in `filter`: a simplex methylation consensus keeps the
@@ -307,10 +318,20 @@ fn clip_templates_in_batch(
             .map_err(io::Error::other)?;
         }
 
-        local_record_count += records.len() as u64;
+        counts.records += records.len() as u64;
     }
 
-    Ok((local_templates, local_overlap_clipped, local_extend_clipped, local_record_count))
+    Ok(counts)
+}
+
+/// Per-batch counts from [`clip_templates_in_batch`].
+#[derive(Debug, Default)]
+struct BatchCounts {
+    templates: u64,
+    overlap_clipped: u64,
+    extend_clipped: u64,
+    modification_tags_removed: u64,
+    records: u64,
 }
 
 /// Build the `SerializeBamRecords` step for clip: parallel, `ByItemOrdinal`.

@@ -12,6 +12,21 @@ const TAGS_TO_REVERSE_COMPLEMENT: [fgumi_raw_bam::SamTag; 2] =
 
 /// Quality-oriented aux tags that are reversed (with `QUAL`) when a read is
 /// reverse-complemented, mirroring htsjdk `SAMRecord.TAGS_TO_REVERSE`.
+/// Base modification tags. `MM`/`am`/`bm` strings and the `ML` array are not per-base, so
+/// `--auto-clip-attributes` must not slice them even when their length happens to equal the
+/// read's; the `clip` command keeps them in step with the clipped SEQ itself.
+const MODIFICATION_TAGS: [fgumi_raw_bam::SamTag; 4] = [
+    fgumi_raw_bam::SamTag::MM,
+    fgumi_raw_bam::SamTag::ML,
+    fgumi_raw_bam::SamTag::AM_BASES,
+    fgumi_raw_bam::SamTag::BM_BASES,
+];
+
+/// Whether `tag` is one of [`MODIFICATION_TAGS`].
+fn is_modification_tag(tag: [u8; 2]) -> bool {
+    MODIFICATION_TAGS.iter().any(|t| **t == tag)
+}
+
 const TAGS_TO_REVERSE: [fgumi_raw_bam::SamTag; 2] =
     [fgumi_raw_bam::SamTag::OQ, fgumi_raw_bam::SamTag::U2];
 
@@ -94,6 +109,9 @@ impl RawRecordClipper {
 
         for entry in view.iter_typed() {
             let (tag, value) = entry;
+            if is_modification_tag(tag) {
+                continue;
+            }
             match value {
                 TagValue::String(s) => {
                     if s.len() == old_length {
@@ -1044,6 +1062,9 @@ impl RawRecordClipper {
 
             for (tag, value) in view.iter_typed() {
                 use fgumi_raw_bam::TagValue;
+                if is_modification_tag(tag) {
+                    continue;
+                }
                 match value {
                     TagValue::String(s) => {
                         if s.len() == old_seq_len {

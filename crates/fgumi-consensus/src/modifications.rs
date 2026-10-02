@@ -176,6 +176,96 @@ pub fn drop_masked_modifications_raw(record: &mut Vec<u8>, pre_mask_seq: &[u8]) 
     })
 }
 
+/// Keeps `MM`/`ML`, `MN` and the per-strand `am`/`bm` consistent with SEQ after clipping.
+///
+/// Clipping can mask bases to `N` (`soft-with-mask`), remove bases from the ends of SEQ (hard
+/// clipping), and, when it unmaps a reverse-mapped read, reverse-complement SEQ. The tags index
+/// SEQ in original read orientation, so both sequences are first put in that orientation:
+/// `pre_clip_seq` (SEQ as stored before clipping) by `pre_clip_reverse` (the record's reverse
+/// flag then), and SEQ now by the record's reverse flag now. `removed_start` is the number of
+/// bases removed from the start of the stored pre-clip SEQ, or `None` when it is not known, in
+/// which case a shorter SEQ cannot be placed.
+///
+/// SEQ must be a window of the pre-clip SEQ, apart from bases masked to `N`. The calls outside
+/// the window or on a masked base are dropped and the skips recomputed over the bases that
+/// remain (a group on base `N` counts every base of the window), and `MN`, when present, is set
+/// to the new length. All the tags are removed instead when they did not fit SEQ before
+/// clipping (`MN` differs from its length) or SEQ is not such a window; a tag that cannot be
+/// edited (see [`drop_masked_modifications_raw`]) is removed alone. A record whose SEQ is `*`
+/// before and after is left alone. Returns whether any tag was removed.
+pub fn trim_clipped_modifications_raw(
+    record: &mut Vec<u8>,
+    pre_clip_seq: &[u8],
+    pre_clip_reverse: bool,
+    removed_start: Option<usize>,
+) -> bool {
+    if !has_modification_tags(record) {
+        return false;
+    }
+    let view = RawRecordView::new(record);
+    let post_reverse = view.is_reverse();
+    let post_clip_seq = view.sequence_vec();
+    if pre_clip_seq.is_empty() && post_clip_seq.is_empty() {
+        return false;
+    }
+    let mn = bam_fields::find_int_tag(bam_fields::aux_data_slice(record), SamTag::MN);
+    if mn.is_some_and(|mn| usize::try_from(mn).ok() != Some(pre_clip_seq.len())) {
+        return remove_modification_tags(record);
+    }
+    if pre_clip_reverse == post_reverse && post_clip_seq == pre_clip_seq {
+        return false;
+    }
+    let in_read_orientation = |seq: &[u8], reverse: bool| {
+        if reverse { fgumi_dna::dna::reverse_complement(seq) } else { seq.to_vec() }
+    };
+    let before = in_read_orientation(pre_clip_seq, pre_clip_reverse);
+    let after = in_read_orientation(&post_clip_seq, post_reverse);
+    // Where the window starts in `before`. Bases removed from the start of a reverse-mapped
+    // read's stored SEQ are removed from the end of the read.
+    let lo = if after.len() == before.len() {
+        Some(0)
+    } else {
+        removed_start.filter(|_| pre_clip_reverse == post_reverse).and_then(|start| {
+            if pre_clip_reverse {
+                before.len().checked_sub(start)?.checked_sub(after.len())
+            } else {
+                Some(start)
+            }
+        })
+    };
+    let window = lo.and_then(|lo| Some(lo..lo.checked_add(after.len())?));
+    let fits = window.as_ref().and_then(|w| before.get(w.clone())).is_some_and(|kept| {
+        kept.iter().zip(&after).all(|(&b, &a)| a == b || a.eq_ignore_ascii_case(&b'N'))
+    });
+    let Some(window) = window.filter(|_| fits) else {
+        return remove_modification_tags(record);
+    };
+    if after == before {
+        return false;
+    }
+    let removed = edit_modification_tags_raw(record, |tag, ml| {
+        rewrite_modifications(
+            tag,
+            ml,
+            &before,
+            |base, pos| {
+                window.contains(&pos) && (base == b'N' || after[pos - window.start] == base)
+            },
+            |_| true,
+        )
+    });
+    if after.len() != before.len()
+        && bam_fields::find_int_tag(bam_fields::aux_data_slice(record), SamTag::MN).is_some()
+    {
+        // `MN` is a 32-bit signed tag; a SEQ too long for it cannot be described.
+        let Ok(l_seq) = i32::try_from(after.len()) else {
+            return remove_modification_tags(record);
+        };
+        bam_fields::RawTagsEditor::from_vec(record).update_int(SamTag::MN, l_seq);
+    }
+    removed
+}
+
 /// Drops the methylation calls at `positions` (genomic orientation) from `MM`/`ML` and the
 /// per-strand `am`/`bm`, leaving SEQ unchanged.
 ///
