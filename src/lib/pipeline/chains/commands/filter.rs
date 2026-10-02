@@ -158,8 +158,9 @@ fn methylation_skip_warnings(
     if unreversed > 0 {
         warnings.push(format!(
             "the methylation filters read cu/ct by SEQ position in reference orientation, but \
-             --reverse-per-base-tags is not set: unless cu/ct were already reversed, they were \
-             evaluated at the wrong positions on {unreversed} reverse-mapped records"
+             --reverse-per-base-tags is not set: unless cu/ct were already reversed (for example \
+             by zipper --tags-to-reverse Consensus), they were evaluated at the wrong positions on \
+             {unreversed} reverse-mapped records"
         ));
     }
     let dropped_calls = skips.dropped_calls.load(Ordering::Relaxed);

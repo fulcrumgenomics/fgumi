@@ -42,7 +42,8 @@ pub fn reverse_per_base_tags_raw(record: &mut [u8]) -> Result<bool> {
         return Ok(true);
     }
 
-    // Tags to reverse: cd, ce, ad, ae, bd, be, aq, bq
+    // Tags to reverse: cd, ce, ad, ae, bd, be, aq, bq, and the methylation counts cu, ct, au, at,
+    // bu, bt
     // These may be B-type arrays or Z-type strings (aq, bq are Phred+33 strings)
     for tag in per_base::tags_to_reverse() {
         // Check tag type to determine reversal method
@@ -85,35 +86,27 @@ mod tests {
     /// Cross-path guard for the two per-base tag-transform lists (a drift between them was the
     /// root cause of ZIP-01/02).
     ///
-    /// - `fgumi_umi::TagSets::CONSENSUS_*` (used by `zipper`'s `--tags-to-reverse/revcomp
-    ///   Consensus` expansion) mirrors **fgbio's** `ConsensusTags.PerBase` sets exactly — 8
-    ///   reverse (`cd ce ad ae bd be aq bq`), 2 revcomp (`ac bc`) — for fgbio `ZipperBams` parity.
-    /// - `per_base::tags_to_reverse{,_complement}()` (used by this raw reversal path, e.g. from
-    ///   `filter`) is a fgumi **superset**: it additionally reverses the CODEC/bisulfite
-    ///   conversion tags (`cu ct au at bu bt`), which fgbio's `Consensus` set does not include.
+    /// - `fgumi_umi::TagSets::CONSENSUS_*` is used by `zipper`'s `--tags-to-reverse/revcomp
+    ///   Consensus` expansion: **fgbio's** `ConsensusTags.PerBase` sets (8 reverse, 2 revcomp),
+    ///   plus the methylation counts (`cu ct au at bu bt`) in the reverse set.
+    /// - `per_base::tags_to_reverse{,_complement}()` is used by this raw reversal path (e.g. from
+    ///   `filter --reverse-per-base-tags`).
     ///
-    /// So the invariant is a **subset**, not equality: every tag in the zipper Consensus set must
-    /// be a recognized fgumi per-base tag (catches a bogus/typo'd addition), while `per_base` may
-    /// grow. The exact fgbio set is pinned separately by the `fgumi-umi` `TagSets` unit tests.
+    /// The two must name the same tags, so that zipper and filter reverse the same tags. The
+    /// fgbio prefix is pinned separately by the `fgumi-umi` `TagSets` unit tests.
     #[test]
-    fn test_zipper_consensus_tagset_is_subset_of_canonical_per_base() {
+    fn test_zipper_consensus_tagset_matches_canonical_per_base() {
         use std::collections::BTreeSet;
         let canon_rev: BTreeSet<String> =
             per_base::tags_to_reverse().iter().map(ToString::to_string).collect();
-        for t in fgumi_umi::TagSets::CONSENSUS_REVERSE {
-            assert!(
-                canon_rev.contains(*t),
-                "zipper Consensus reverse tag `{t}` unknown to per_base"
-            );
-        }
+        let zipper_rev: BTreeSet<String> =
+            fgumi_umi::TagSets::CONSENSUS_REVERSE.iter().map(ToString::to_string).collect();
+        assert_eq!(zipper_rev, canon_rev, "zipper Consensus reverse set differs from per_base");
         let canon_rc: BTreeSet<String> =
             per_base::tags_to_reverse_complement().iter().map(ToString::to_string).collect();
-        for t in fgumi_umi::TagSets::CONSENSUS_REVCOMP {
-            assert!(
-                canon_rc.contains(*t),
-                "zipper Consensus revcomp tag `{t}` unknown to per_base"
-            );
-        }
+        let zipper_rc: BTreeSet<String> =
+            fgumi_umi::TagSets::CONSENSUS_REVCOMP.iter().map(ToString::to_string).collect();
+        assert_eq!(zipper_rc, canon_rc, "zipper Consensus revcomp set differs from per_base");
 
         // No tag may be in BOTH lists: a per-base tag is either reversed (depth/
         // error/qual arrays) or reverse-complemented (base arrays), never both.
@@ -168,6 +161,27 @@ mod tests {
         let aux = fgumi_raw_bam::aux_data_slice(&raw);
         let s = fgumi_raw_bam::find_string_tag(aux, SamTag::AQ).expect("aq tag should exist");
         assert_eq!(s, b"GHII");
+    }
+
+    /// filter's reversal reverses the methylation counts exactly as zipper's
+    /// `--tags-to-reverse Consensus` does (`commands::zipper::tests::test_consensus_tag_set`
+    /// expects the same `cu` output), so either may be used.
+    #[test]
+    fn test_reverse_per_base_tags_raw_methylation_counts() {
+        let mut b = RawSamBuilder::new();
+        b.sequence(b"ACGTA").qualities(&[30; 5]).flags(raw_flags::REVERSE);
+        b.add_array_i16(SamTag::CU, &[0, 1, 0, 0, 5]).add_array_i16(SamTag::CT, &[2, 0, 0, 3, 0]);
+        let mut raw: Vec<u8> = b.build().as_ref().to_vec();
+
+        assert!(reverse_per_base_tags_raw(&mut raw).expect("reverse_per_base_tags_raw succeeds"));
+
+        let aux = fgumi_raw_bam::aux_data_slice(&raw);
+        let values = |tag| -> Vec<i16> {
+            let array = fgumi_raw_bam::find_array_tag(aux, tag).expect("array tag present");
+            array.data.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect()
+        };
+        assert_eq!(values(SamTag::CU), vec![5, 0, 0, 1, 0]);
+        assert_eq!(values(SamTag::CT), vec![0, 3, 0, 0, 2]);
     }
 
     #[rstest]

@@ -173,11 +173,11 @@ fgumi fastq --input consensus.bam \
   | fgumi zipper --unmapped consensus.bam --reference ref.fa --output consensus.mapped.bam
 ```
 
-Leave the reversal of per-base tags to `filter --reverse-per-base-tags` (Step 7). Zipper's `--tags-to-reverse Consensus` set does not include the methylation counts (`cu`/`ct`/`au`/`at`/`bu`/`bt`), so reversing there instead would leave those counts backwards on reverse-strand reads. Do not reverse in both: the depth and error tags in zipper's set would then be reversed twice.
+Reverse the per-base tags of reverse-strand reads exactly once: either here, with zipper's `--tags-to-reverse Consensus --tags-to-revcomp Consensus`, or in Step 7 with `filter --reverse-per-base-tags`, which handles the same tags, including the methylation counts (`cu`/`ct`/`au`/`at`/`bu`/`bt`). The commands on this page use filter. Do not do both, or every per-base tag is reversed twice and points at the wrong positions. If you reverse in zipper, filter still prints its end-of-run warning about reverse-mapped reads checked without `--reverse-per-base-tags`, because it cannot tell that zipper already reversed them; on that route the warning is expected and can be ignored.
 
 ### Step 7: Filtering
 
-**Simplex** methylation filters find cytosines from the reference, so they need aligned reads: filter after re-alignment, with `--ref` and `--reverse-per-base-tags`. An aligned BAM always contains some unmapped reads; the methylation filters leave unmapped simplex reads unchecked and report how many there were at the end of the run. **Duplex** reads carry their cytosines in their own sequence, so the filters work on them aligned or not.
+**Simplex** methylation filters find cytosines from the reference, so they need aligned reads: filter after re-alignment, with `--ref` and `--reverse-per-base-tags` (omit it if zipper already reversed the per-base tags in Step 6). An aligned BAM always contains some unmapped reads; the methylation filters leave unmapped simplex reads unchecked and report how many there were at the end of the run. **Duplex** reads carry their cytosines in their own sequence, so the filters work on them aligned or not.
 
 **Simplex:**
 
@@ -264,7 +264,7 @@ When the UMIs come from a fixed set (for example a synthesized pool of known seq
 
 ### Output Tags
 
-Per-base arrays are in read orientation on the unaligned consensus; after re-alignment, `filter --reverse-per-base-tags` puts them in reference orientation.
+Per-base arrays are in read orientation on the unaligned consensus; after re-alignment, `filter --reverse-per-base-tags` (or zipper's `--tags-to-reverse Consensus --tags-to-revcomp Consensus`) puts them in reference orientation.
 
 **Simplex:**
 
@@ -372,7 +372,7 @@ With `--ref`, `filter` (and `clip`) recompute `NM`, `UQ` and `MD` from the read'
 
 ### Recommended Parameters
 
-Both run `filter` on the re-aligned consensus reads (Steps 6 and 7).
+Both run `filter` on the re-aligned consensus reads (Steps 6 and 7). Drop `--reverse-per-base-tags` if zipper already reversed the per-base tags.
 
 **Simplex (moderate stringency):**
 
