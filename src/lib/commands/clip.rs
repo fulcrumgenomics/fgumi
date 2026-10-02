@@ -108,7 +108,8 @@ pub struct Clip {
     #[arg(short = 'H', long = "upgrade-clipping", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub upgrade_clipping: bool,
 
-    /// Automatically clip extended attributes that match read length
+    /// Automatically clip extended attributes that match read length (base modification tags
+    /// MM/ML/am/bm are kept in step with the clipped read separately)
     #[arg(short = 'a', long = "auto-clip-attributes", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub auto_clip_attributes: bool,
 
@@ -137,6 +138,35 @@ pub struct Clip {
 // ============================================================================
 // Types for 7-step pipeline processing
 // ============================================================================
+
+/// Length of the record's leading hard clip (0 if its CIGAR does not start with `H`).
+fn leading_hard_clip(record: &RawRecord) -> usize {
+    record
+        .cigar_ops_typed()
+        .take_while(|op| op.kind() == fgumi_raw_bam::CigarKind::HardClip)
+        .map(|op| op.len() as usize)
+        .sum()
+}
+
+/// What [`ClipParams::clip_template`] did to one template.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ClipTemplateOutcome {
+    /// Overlap clipping removed bases from the pair.
+    pub(crate) overlap_clipped: bool,
+    /// Mate-extension clipping removed bases from the pair.
+    pub(crate) extend_clipped: bool,
+    /// Records whose modification tags (`MM`/`ML`/`MN`/`am`/`bm`) could not be kept in step
+    /// with the clipped SEQ and were removed.
+    pub(crate) modification_tags_removed: u64,
+}
+
+/// A record's state before clipping, kept to bring its modification tags in step afterwards.
+struct PreClip {
+    seq: Vec<u8>,
+    reverse: bool,
+    unmapped: bool,
+    leading_hard_clip: usize,
+}
 
 /// Per-template clipping configuration, decoupled from `&Clip`.
 ///
@@ -199,11 +229,13 @@ impl ClipParams {
     /// `PerThreadAccumulator` slot when `--metrics` is set and `None` otherwise, relying
     /// solely on the returned per-template flags for its atomic summary counters.
     ///
-    /// In `soft-with-mask` mode the masked bases' methylation calls are dropped from `MM`/`ML`
-    /// (and `am`/`bm`), so the modification tags keep describing SEQ.
+    /// The clipped bases' methylation calls are dropped from `MM`/`ML` (and `am`/`bm`), whether
+    /// `soft-with-mask` masked them or hard clipping removed them, so the modification tags keep
+    /// describing SEQ; after hard clipping `MN`, when present, is the new SEQ length. Tags that
+    /// cannot be kept in step are removed and counted in the returned outcome.
     ///
-    /// Returns `(overlap_clipped, extend_clipped)`: whether overlap and/or mate-extension
-    /// clipping removed any bases from the pair. A lone fragment returns `(false, false)`, as do
+    /// Returns, as a [`ClipTemplateOutcome`], whether overlap and/or mate-extension clipping
+    /// removed any bases from the pair. A lone fragment reports neither, as do
     /// the non-clipping shapes fgbio also passes through untouched — a lone primary R2 (no R1) and
     /// an empty / all-secondary-and-supplementary template.
     ///
@@ -215,36 +247,49 @@ impl ClipParams {
         records: &mut [RawRecord],
         clipper: &RawRecordClipper,
         metrics: Option<&mut ClippingMetricsCollection>,
-    ) -> Result<(bool, bool)> {
-        // `soft-with-mask` clipping rewrites the clipped bases to N, so snapshot SEQ (and the
-        // reverse/unmapped flags) of every record with modification tags and afterwards drop the
-        // calls on masked bases, keeping MM/ML consistent with SEQ. Clipping a read completely
-        // unmaps it instead, reverse-complementing a reverse read's SEQ into the read
-        // orientation MM/ML already use and masking nothing, so those tags are left alone.
-        let flags = |record: &RawRecord| {
-            let view = RawRecordView::new(record);
-            (view.is_reverse(), view.is_unmapped())
-        };
-        let pre_clip: Vec<_> = records
+    ) -> Result<ClipTemplateOutcome> {
+        // `soft-with-mask` clipping rewrites the clipped bases to N, hard clipping removes them,
+        // and unmapping a reverse-mapped read reverse-complements SEQ, so snapshot every record
+        // with modification tags and afterwards bring MM/ML in step with the clipped SEQ.
+        let pre_clip: Vec<Option<PreClip>> = records
             .iter()
             .map(|record| {
-                fgumi_consensus::filter::has_modification_tags(record)
-                    .then(|| (RawRecordView::new(record).sequence_vec(), flags(record)))
+                fgumi_consensus::filter::has_modification_tags(record).then(|| {
+                    let view = RawRecordView::new(record);
+                    PreClip {
+                        seq: view.sequence_vec(),
+                        reverse: view.is_reverse(),
+                        unmapped: view.is_unmapped(),
+                        leading_hard_clip: leading_hard_clip(record),
+                    }
+                })
             })
             .collect();
-        let outcome = self.clip_template_records(records, clipper, metrics)?;
+        let (overlap_clipped, extend_clipped) =
+            self.clip_template_records(records, clipper, metrics)?;
+        let mut modification_tags_removed = 0;
         for (record, pre_clip) in records.iter_mut().zip(&pre_clip) {
-            if let Some((pre_clip_seq, pre_clip_flags)) = pre_clip
-                && flags(record) == *pre_clip_flags
-                && RawRecordView::new(record).l_seq() as usize == pre_clip_seq.len()
-            {
-                fgumi_consensus::filter::drop_masked_modifications_raw(
-                    record.as_mut_vec(),
-                    pre_clip_seq,
-                );
+            let Some(pre_clip) = pre_clip else { continue };
+            let view = RawRecordView::new(record);
+            // Bases removed from the start of SEQ show up as added leading hard clip, unless
+            // clipping then unmapped the read and cleared its CIGAR: that offset is unknown.
+            let removed_start = if view.l_seq() as usize == pre_clip.seq.len() {
+                Some(0)
+            } else if view.is_unmapped() && !pre_clip.unmapped {
+                None
+            } else {
+                leading_hard_clip(record).checked_sub(pre_clip.leading_hard_clip)
+            };
+            if fgumi_consensus::filter::trim_clipped_modifications_raw(
+                record.as_mut_vec(),
+                &pre_clip.seq,
+                pre_clip.reverse,
+                removed_start,
+            ) {
+                modification_tags_removed += 1;
             }
         }
-        Ok(outcome)
+        Ok(ClipTemplateOutcome { overlap_clipped, extend_clipped, modification_tags_removed })
     }
 
     /// Upgrades and clips one template's records; see [`Self::clip_template`].
@@ -2891,6 +2936,157 @@ mod tests {
         assert_eq!(metrics.fragment.bases_clipped_three_prime, 2);
         // Remaining aligned bases: 20 - 3 - 2 = 15
         assert_eq!(metrics.fragment.bases, 15);
+    }
+
+    /// Hard clipping removes bases from SEQ, so the calls on them are dropped from `MM`/`ML`, the
+    /// skips are recomputed over the remaining bases, and `MN` becomes the new SEQ length. `MM`
+    /// indexes SEQ in original read orientation: on a reverse-mapped read the 5' bases are the
+    /// end of SEQ as stored.
+    #[rstest]
+    #[case::forward(false, b"CACGTCAACG", b"C+m?,0,0,0;", &[10, 20, 30], b"CGTCAACG", b"C+m?,0,0;", &[20, 30])]
+    #[case::reverse(true, b"CACGTCAACG", b"C+m?,0,0;", &[10, 20], b"CACGTCAA", b"C+m?,0;", &[20])]
+    fn test_clip_template_hard_clipping_trims_modification_tags(
+        #[case] reverse: bool,
+        #[case] seq: &[u8],
+        #[case] mm: &[u8],
+        #[case] ml: &[u8],
+        #[case] expected_seq: &[u8],
+        #[case] expected_mm: &[u8],
+        #[case] expected_ml: &[u8],
+    ) {
+        let clipper = RawRecordClipper::new(ClippingMode::Hard);
+        let mut records = vec![
+            fgumi_raw_bam::SamBuilder::new()
+                .sequence(seq)
+                .qualities(&[30; 10])
+                .cigar_ops(&[10u32 << 4]) // 10M
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .flags(if reverse { fgumi_raw_bam::flags::REVERSE } else { 0 })
+                .add_string_tag(SamTag::MM, mm)
+                .add_array_u8(SamTag::ML, ml)
+                .add_int_tag(SamTag::MN, 10)
+                .build(),
+        ];
+
+        ClipParams::from_clip(&make_clip(2, 0, 0, 0))
+            .clip_template(&mut records, &clipper, None)
+            .expect("clip_template should succeed");
+
+        let record = &records[0];
+        assert_eq!(RawRecordView::new(record).sequence_vec(), expected_seq);
+        let aux = fgumi_raw_bam::aux_data_slice(record);
+        assert_eq!(fgumi_raw_bam::find_string_tag(aux, SamTag::MM), Some(expected_mm));
+        assert_eq!(
+            fgumi_raw_bam::find_array_tag(aux, SamTag::ML).map(|a| a.data.to_vec()).as_deref(),
+            Some(expected_ml)
+        );
+        let expected_len = i64::try_from(expected_seq.len()).expect("short fixture");
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux, SamTag::MN), Some(expected_len));
+    }
+
+    /// One `clip_template` modification-tag case: the input record, the clipping, and the tags
+    /// expected afterwards.
+    struct ClipModCase {
+        flags: u16,
+        cigar: &'static [u32],
+        seq: &'static [u8],
+        mm: &'static str,
+        ml: &'static [u8],
+        five_prime: usize,
+        three_prime: usize,
+        upgrade_clipping: bool,
+        auto_clip_attributes: bool,
+        expected: ExpectedClipTags,
+    }
+
+    /// Expected SEQ, `MM`, `ML` and `MN` after clipping (`None` when the tags were removed).
+    type ExpectedClipTags =
+        (&'static [u8], Option<&'static str>, Option<&'static [u8]>, Option<i64>);
+
+    const M10: &[u32] = &[10 << 4];
+
+    /// Hard clipping keeps `MM`/`ML` in step with SEQ across the clipper's paths: an existing
+    /// leading hard clip, upgraded soft clips, auto-clipped attributes, and reads that clipping
+    /// unmaps. When clipping removes bases and then unmaps the read, the CIGAR no longer says
+    /// where they came from, so the tags are removed rather than misplaced.
+    #[rstest]
+    #[case::existing_leading_hard_clip(ClipModCase {
+        flags: 0, cigar: &[(3 << 4) | 5, 10 << 4], seq: b"CACGTCAACG", mm: "C+m?,0,0,0;",
+        ml: &[10, 20, 30], five_prime: 5, three_prime: 0, upgrade_clipping: false,
+        auto_clip_attributes: false,
+        expected: (b"CGTCAACG", Some("C+m?,0,0;"), Some(&[20, 30][..]), Some(8)),
+    })]
+    #[case::upgraded_soft_clip(ClipModCase {
+        flags: 0, cigar: &[(2 << 4) | 4, 8 << 4], seq: b"CACGTCAACG", mm: "C+m?,0,0,0;",
+        ml: &[10, 20, 30], five_prime: 0, three_prime: 0, upgrade_clipping: true,
+        auto_clip_attributes: false,
+        expected: (b"CGTCAACG", Some("C+m?,0,0;"), Some(&[20, 30][..]), Some(8)),
+    })]
+    #[case::auto_clip_attributes_leave_mm_alone(ClipModCase {
+        flags: 0, cigar: &[9 << 4], seq: b"CACGTCAAC", mm: "C+m?,0,0;", ml: &[10, 20],
+        five_prime: 2, three_prime: 0, upgrade_clipping: false, auto_clip_attributes: true,
+        expected: (b"CGTCAAC", Some("C+m?,0;"), Some(&[20][..]), Some(7)),
+    })]
+    #[case::reverse_read_unmapped(ClipModCase {
+        flags: fgumi_raw_bam::flags::REVERSE, cigar: M10, seq: b"CACGTCAACG", mm: "C+m?,0,0;",
+        ml: &[10, 20], five_prime: 10, three_prime: 0, upgrade_clipping: false,
+        auto_clip_attributes: false,
+        expected: (b"CGTTGACGTG", Some("C+m?,0,0;"), Some(&[10, 20][..]), Some(10)),
+    })]
+    #[case::hard_clipped_then_unmapped(ClipModCase {
+        flags: 0, cigar: M10, seq: b"CACACACACA", mm: "C+m?,0,0,0,0,0;", ml: &[1, 2, 3, 4, 5],
+        five_prime: 2, three_prime: 10, upgrade_clipping: false, auto_clip_attributes: false,
+        expected: (b"CACACACA", None, None, None),
+    })]
+    #[case::leading_hard_clip_then_unmapped(ClipModCase {
+        flags: 0, cigar: &[(5 << 4) | 5, 10 << 4], seq: b"CACGTCAACG", mm: "C+m?,0,0,0;",
+        ml: &[10, 20, 30], five_prime: 15, three_prime: 0, upgrade_clipping: false,
+        auto_clip_attributes: false,
+        expected: (b"CACGTCAACG", Some("C+m?,0,0,0;"), Some(&[10, 20, 30][..]), Some(10)),
+    })]
+    fn test_clip_template_modification_tags_across_clipper_paths(#[case] case: ClipModCase) {
+        let clipper =
+            RawRecordClipper::with_auto_clip(ClippingMode::Hard, case.auto_clip_attributes);
+        let mn = i32::try_from(case.seq.len()).expect("short fixture");
+        let mut records = vec![
+            fgumi_raw_bam::SamBuilder::new()
+                .sequence(case.seq)
+                .qualities(&vec![30; case.seq.len()])
+                .cigar_ops(case.cigar)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .flags(case.flags)
+                .add_string_tag(SamTag::MM, case.mm.as_bytes())
+                .add_array_u8(SamTag::ML, case.ml)
+                .add_int_tag(SamTag::MN, mn)
+                .build(),
+        ];
+        let mut clip = make_clip(case.five_prime, case.three_prime, 0, 0);
+        clip.upgrade_clipping = case.upgrade_clipping;
+
+        let outcome = ClipParams::from_clip(&clip)
+            .clip_template(&mut records, &clipper, None)
+            .expect("clip_template should succeed");
+
+        let (want_seq, want_mm, want_ml, want_mn) = case.expected;
+        let record = &records[0];
+        assert_eq!(RawRecordView::new(record).sequence_vec(), want_seq, "SEQ");
+        let aux = fgumi_raw_bam::aux_data_slice(record);
+        assert_eq!(
+            fgumi_raw_bam::find_string_tag(aux, SamTag::MM),
+            want_mm.map(str::as_bytes),
+            "MM"
+        );
+        assert_eq!(
+            fgumi_raw_bam::find_array_tag(aux, SamTag::ML).map(|a| a.data.to_vec()).as_deref(),
+            want_ml,
+            "ML"
+        );
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux, SamTag::MN), want_mn, "MN");
+        assert_eq!(outcome.modification_tags_removed, u64::from(want_mm.is_none()), "removed");
     }
 
     /// Clipping a read completely unmaps it, which reverse-complements a reverse-mapped read's

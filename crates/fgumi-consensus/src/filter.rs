@@ -15,6 +15,7 @@ use fgumi_raw_bam::{AsTagBytes, RawRecord, RawRecordView, SamTag};
 
 pub use crate::modifications::{
     drop_masked_modifications_raw, drop_modifications_at_raw, has_modification_tags,
+    trim_clipped_modifications_raw,
 };
 
 /// Expands a 1-3 element slice to a 3-element array, filling missing values from the last.
@@ -2762,6 +2763,132 @@ mod tests {
         for tag in [SamTag::MM, SamTag::ML, SamTag::MN] {
             assert!(bam_fields::find_tag_type(aux, tag).is_none(), "{tag:?} removed");
         }
+    }
+
+    // -- trim_clipped_modifications_raw tests --
+
+    /// One `trim_clipped_modifications_raw` case: the record before and after clipping, and the
+    /// tags expected afterwards.
+    struct TrimCase {
+        pre_seq: &'static [u8],
+        pre_reverse: bool,
+        post_seq: &'static [u8],
+        post_flags: u16,
+        removed_start: Option<usize>,
+        mm: &'static str,
+        ml: &'static [u8],
+        mn: Option<i32>,
+        /// Expected `MM` (and `am`, written with the same value), `ML`, `MN`, and whether any tag
+        /// was removed.
+        expected: (Option<&'static str>, Option<&'static [u8]>, Option<i64>, bool),
+    }
+
+    /// A forward read `CACGTCAACG` (C at 0, 2, 5, 8) clipped to `post_seq`.
+    fn forward_trim(
+        post_seq: &'static [u8],
+        removed_start: Option<usize>,
+        mm: &'static str,
+        ml: &'static [u8],
+        mn: Option<i32>,
+        expected: (Option<&'static str>, Option<&'static [u8]>, Option<i64>, bool),
+    ) -> TrimCase {
+        TrimCase {
+            pre_seq: b"CACGTCAACG",
+            pre_reverse: false,
+            post_seq,
+            post_flags: R1_FWD,
+            removed_start,
+            mm,
+            ml,
+            mn,
+            expected,
+        }
+    }
+
+    /// Clipping removes bases from the ends of SEQ (or, unmapping a reverse read,
+    /// reverse-complements it): the calls outside the kept window are dropped, the skips are
+    /// recomputed over the window, and `MN` becomes the new length. Tags that cannot be placed
+    /// are removed.
+    #[rstest]
+    #[case::trimmed_start(forward_trim(b"CGTCAACG", Some(2), "C+m?,0,0,0;", &[10, 20, 30], Some(10), (Some("C+m?,0,0;"), Some(&[20, 30][..]), Some(8), false)))]
+    #[case::trimmed_both_ends(forward_trim(b"CGTCAA", Some(2), "C+m?,0,0,0;", &[10, 20, 30], Some(10), (Some("C+m?,0,0;"), Some(&[20, 30][..]), Some(6), false)))]
+    #[case::call_in_trimmed_tail(forward_trim(b"CGTCAA", Some(2), "C+m?,2,0;", &[10, 20], Some(10), (Some("C+m?,1;"), Some(&[10][..]), Some(6), false)))]
+    #[case::without_mn(forward_trim(b"CGTCAACG", Some(2), "C+m?,0,0,0;", &[10, 20, 30], None, (Some("C+m?,0,0;"), Some(&[20, 30][..]), None, false)))]
+    #[case::group_on_n(forward_trim(b"CGTCAACG", Some(2), "N+n?,0,0,0;", &[10, 20, 30], Some(10), (Some("N+n?,0;"), Some(&[30][..]), Some(8), false)))]
+    #[case::masked_not_trimmed(forward_trim(b"NNCGTCAACG", Some(0), "C+m?,0,0,0;", &[10, 20, 30], Some(10), (Some("C+m?,0,0;"), Some(&[20, 30][..]), Some(10), false)))]
+    #[case::unknown_offset(forward_trim(b"CGTCAACG", None, "C+m?,0,0,0;", &[10, 20, 30], Some(10), (None, None, None, true)))]
+    #[case::stale_before_clipping(forward_trim(b"CGTCAACG", Some(2), "C+m?,0,0,0;", &[10, 20, 30], Some(12), (None, None, None, true)))]
+    #[case::not_a_window_of_the_old_seq(forward_trim(b"CGTCAACC", Some(2), "C+m?,0,0,0;", &[10, 20, 30], Some(10), (None, None, None, true)))]
+    // Unmapping a reverse read reverse-complements SEQ into read orientation, where MM already
+    // pointed: nothing changes. `CACGTCAACG` reverse reads `CGTTGACGTG` (C at 0 and 6).
+    #[case::reverse_read_unmapped(TrimCase {
+        pre_seq: b"CACGTCAACG",
+        pre_reverse: true,
+        post_seq: b"CGTTGACGTG",
+        post_flags: flags::UNMAPPED,
+        removed_start: Some(0),
+        mm: "C+m?,0,0;",
+        ml: &[10, 20],
+        mn: Some(10),
+        expected: (Some("C+m?,0,0;"), Some(&[10, 20][..]), Some(10), false),
+    })]
+    // Hard clipping 4 bases from the start of a reverse read's stored SEQ removes the last 4
+    // bases of the read: `CGTTGA` keeps the C at 0 and drops the call on the C at 6.
+    #[case::reverse_read_trimmed(TrimCase {
+        pre_seq: b"CACGTCAACG",
+        pre_reverse: true,
+        post_seq: b"TCAACG",
+        post_flags: R1_REV,
+        removed_start: Some(4),
+        mm: "C+m?,0,0;",
+        ml: &[10, 20],
+        mn: Some(10),
+        expected: (Some("C+m?,0;"), Some(&[10][..]), Some(6), false),
+    })]
+    // A record without SEQ (`*`) is left alone, as htslib accepts `MM` there.
+    #[case::no_seq(TrimCase {
+        pre_seq: b"",
+        pre_reverse: false,
+        post_seq: b"",
+        post_flags: R1_FWD | flags::SECONDARY,
+        removed_start: Some(3),
+        mm: "C+m?,0;",
+        ml: &[10],
+        mn: None,
+        expected: (Some("C+m?,0;"), Some(&[10][..]), None, false),
+    })]
+    fn test_trim_clipped_modifications_raw(#[case] case: TrimCase) {
+        let mut b = RawSamBuilder::new();
+        b.flags(case.post_flags).ref_id(0).pos(0).mapq(60).sequence(case.post_seq);
+        if !case.post_seq.is_empty() && case.post_flags & flags::UNMAPPED == 0 {
+            b.cigar_ops(&[u32::try_from(case.post_seq.len()).expect("short fixture") << 4])
+                .qualities(&vec![30; case.post_seq.len()]);
+        } else if !case.post_seq.is_empty() {
+            b.qualities(&vec![30; case.post_seq.len()]);
+        }
+        b.add_string_tag(SamTag::MM, case.mm.as_bytes())
+            .add_array_u8(SamTag::ML, case.ml)
+            .add_string_tag(SamTag::AM_BASES, case.mm.as_bytes());
+        if let Some(mn) = case.mn {
+            b.add_int_tag(SamTag::MN, mn);
+        }
+        let mut record = b.build().as_ref().to_vec();
+
+        let removed = trim_clipped_modifications_raw(
+            &mut record,
+            case.pre_seq,
+            case.pre_reverse,
+            case.removed_start,
+        );
+
+        let aux = bam_fields::aux_data_slice(&record);
+        let ml = bam_fields::find_array_tag(aux, SamTag::ML).map(|a| a.data.to_vec());
+        let (want_mm, want_ml, want_mn, want_removed) = case.expected;
+        assert_eq!(string_tag(&record, SamTag::MM).as_deref(), want_mm, "MM");
+        assert_eq!(ml.as_deref(), want_ml, "ML");
+        assert_eq!(string_tag(&record, SamTag::AM_BASES).as_deref(), want_mm, "am");
+        assert_eq!(bam_fields::find_int_tag(aux, SamTag::MN), want_mn, "MN");
+        assert_eq!(removed, want_removed, "removed");
     }
 
     // -- check_conversion_fraction_raw tests --
