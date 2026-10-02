@@ -198,12 +198,20 @@ pub struct TagSets;
 impl TagSets {
     /// Consensus per-base tags that should be **reversed** on negative-strand reads.
     ///
-    /// Mirrors fgbio `ConsensusTags.PerBase.TagsToReverse`: the per-base
-    /// depth/error/quality arrays — `cd`,`ce` (consensus), `ad`,`ae` (top strand),
-    /// `bd`,`be` (bottom strand), and `aq`,`bq` (per-strand quals). These are
-    /// position-indexed arrays, so they must be reversed (not reverse-complemented)
-    /// when the read maps to the negative strand.
-    pub const CONSENSUS_REVERSE: &[&str] = &["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq"];
+    /// fgbio `ConsensusTags.PerBase.TagsToReverse` — the per-base depth/error/quality arrays
+    /// `cd`,`ce` (consensus), `ad`,`ae` (top strand), `bd`,`be` (bottom strand), and `aq`,`bq`
+    /// (per-strand quals) — followed by fgumi's per-base methylation counts `cu`,`ct`
+    /// (consensus), `au`,`at` (top strand) and `bu`,`bt` (bottom strand), which fgbio does not
+    /// write. These are position-indexed arrays, so they must be reversed (not
+    /// reverse-complemented) when the read maps to the negative strand.
+    ///
+    /// This must name the same tags as `fgumi_tag::SamTag::PER_BASE_TAGS_TO_REVERSE`, which
+    /// `filter --reverse-per-base-tags` uses (this crate does not depend on `fgumi-tag`);
+    /// `test_zipper_consensus_tagset_matches_canonical_per_base` in the `fgumi` crate enforces
+    /// it. [`CONSENSUS_REVCOMP`](Self::CONSENSUS_REVCOMP) likewise matches
+    /// `PER_BASE_TAGS_TO_REVCOMP`.
+    pub const CONSENSUS_REVERSE: &[&str] =
+        &["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq", "cu", "ct", "au", "at", "bu", "bt"];
 
     /// Consensus per-base **base** tags that should be **reverse-complemented** on
     /// negative-strand reads.
@@ -381,9 +389,12 @@ mod tests {
 
     #[test]
     fn test_consensus_reverse_returns_correct_tags() {
-        // fgbio ConsensusTags.PerBase.TagsToReverse = {cd, ce, ad, ae, bd, be, aq, bq}
-        assert_eq!(TagSets::CONSENSUS_REVERSE.len(), 8);
-        assert_eq!(TagSets::CONSENSUS_REVERSE, &["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq"]);
+        // fgbio ConsensusTags.PerBase.TagsToReverse = {cd, ce, ad, ae, bd, be, aq, bq}, then the
+        // methylation counts fgbio does not write.
+        assert_eq!(
+            TagSets::CONSENSUS_REVERSE,
+            &["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq", "cu", "ct", "au", "at", "bu", "bt"]
+        );
     }
 
     /// Programmatic fgbio baseline for the per-base consensus tag sets, so the
@@ -395,9 +406,10 @@ mod tests {
     /// `src/main/scala/com/fulcrumgenomics/umi/ConsensusTags.scala`, `object PerBase`,
     /// verified against fgbio main). If fgbio adds, removes, or reorders a per-base tag, update
     /// the named symbols below and this test catches any resulting drift in the production
-    /// constants. The intentional divergence from fgumi's *superset* `per_base` lists — which
-    /// additionally cover the CODEC conversion tags — is asserted separately by
-    /// `test_zipper_consensus_tagset_is_subset_of_canonical_per_base` in `src/lib/tag_reversal.rs`.
+    /// constants. The reverse set starts with fgbio's tags and appends the methylation counts,
+    /// which fgbio does not write; that it matches fgumi's `per_base` lists is asserted
+    /// separately by `test_zipper_consensus_tagset_matches_canonical_per_base` in
+    /// `src/lib/tag_reversal.rs`.
     #[test]
     fn test_consensus_tag_sets_match_fgbio_perbase_baseline() {
         // fgbio ConsensusTags.PerBase named symbol -> 2-char SAM tag.
@@ -428,9 +440,14 @@ mod tests {
         let fgbio_tags_to_reverse_complement = [ab_consensus_bases, ba_consensus_bases];
 
         assert_eq!(
-            TagSets::CONSENSUS_REVERSE,
+            &TagSets::CONSENSUS_REVERSE[..fgbio_tags_to_reverse.len()],
             &fgbio_tags_to_reverse,
             "CONSENSUS_REVERSE drifted from fgbio ConsensusTags.PerBase.TagsToReverse",
+        );
+        assert_eq!(
+            &TagSets::CONSENSUS_REVERSE[fgbio_tags_to_reverse.len()..],
+            &["cu", "ct", "au", "at", "bu", "bt"],
+            "CONSENSUS_REVERSE must end with the methylation counts",
         );
         assert_eq!(
             TagSets::CONSENSUS_REVCOMP,
@@ -558,8 +575,10 @@ mod tests {
     #[test]
     fn test_taginfo_new_with_consensus_reverse() {
         let tag_info = TagInfo::new(vec![], vec!["Consensus".to_string()], vec![]);
-        assert_eq!(tag_info.reverse.len(), 8);
-        for t in ["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq"] {
+        assert_eq!(tag_info.reverse.len(), 14);
+        for t in
+            ["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq", "cu", "ct", "au", "at", "bu", "bt"]
+        {
             assert!(tag_info.reverse.contains(t), "missing reverse tag {t}");
         }
     }
@@ -582,9 +601,12 @@ mod tests {
         // Remove set
         assert_eq!(tag_info.remove.len(), 1);
         assert!(tag_info.remove.contains("AS"));
-        // Reverse set should have the 8 Consensus tags + BQ
-        assert_eq!(tag_info.reverse.len(), 9);
-        for t in ["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq", "BQ"] {
+        // Reverse set should have the 14 Consensus tags + BQ
+        assert_eq!(tag_info.reverse.len(), 15);
+        for t in [
+            "cd", "ce", "ad", "ae", "bd", "be", "aq", "bq", "cu", "ct", "au", "at", "bu", "bt",
+            "BQ",
+        ] {
             assert!(tag_info.reverse.contains(t), "missing reverse tag {t}");
         }
         // Revcomp set should have the 2 Consensus base tags + E2
@@ -615,7 +637,7 @@ mod tests {
             vec!["Consensus".to_string(), "Consensus".to_string()],
         );
         // Should not duplicate consensus tags
-        assert_eq!(tag_info.reverse.len(), 8);
+        assert_eq!(tag_info.reverse.len(), 14);
         assert_eq!(tag_info.revcomp.len(), 2);
     }
 

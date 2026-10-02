@@ -92,7 +92,9 @@ Output is written in the same order as the input. To emit coordinate-sorted outp
 The --reverse-per-base-tags option controls whether per-base tags should be reversed before being used on reads
 marked as being mapped to the negative strand. This is necessary if the reads have been mapped and the
 bases/quals reversed but the consensus tags have not. If true, the tags written to the output BAM will be
-reversed where necessary in order to line up with the bases and quals.
+reversed where necessary in order to line up with the bases and quals. It reverses the same tags as
+fgumi zipper --tags-to-reverse Consensus --tags-to-revcomp Consensus, so reverse in one of the two only:
+reversing in both restores the original, wrong orientation.
 "#
 )]
 #[allow(clippy::struct_excessive_bools)]

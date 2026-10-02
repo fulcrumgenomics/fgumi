@@ -97,10 +97,12 @@ You can specify which tags to manipulate for reads mapped to the negative strand
 - --tags-to-revcomp: Reverse complements sequence tags (e.g., AGAGG becomes CCTCT)
 
 Named tag sets like "Consensus" are automatically expanded to their constituent per-base tags
-(matching fgbio's ConsensusTags):
-- --tags-to-reverse Consensus:  cd ce ad ae bd be aq bq  (per-base depth/error/quality arrays; reversed)
+(fgbio's ConsensusTags, plus fgumi's methylation counts):
+- --tags-to-reverse Consensus:  cd ce ad ae bd be aq bq cu ct au at bu bt  (per-base depth/error/quality arrays and methylation counts; reversed)
 - --tags-to-revcomp Consensus:  ac bc  (per-base consensus base arrays; reverse-complemented)
 Per-read scalar tags (aD bD cD, aM bM cM, aE bE cE) are never reversed or reverse-complemented.
+fgumi filter --reverse-per-base-tags reverses the same per-base tags, so do not also pass it after
+reversing them here: reversing twice restores the original, wrong orientation.
 
 Tag lists are comma-delimited in fgumi (e.g. `--tags-to-reverse cd,ce,ad`), whereas fgbio's
 `ZipperBams` takes space-separated values. Tags that are not present, or whose type does not
@@ -2943,6 +2945,8 @@ mod tests {
         attrs.insert("bc", BufValue::from("AAAGC".to_string()));
         // ad is a per-base depth array -> reversed on neg strand.
         attrs.insert("ad", BufValue::from(vec![3i16, 3, 4, 4, 2]));
+        // cu is a per-base methylation count array -> reversed on neg strand.
+        attrs.insert("cu", BufValue::from(vec![0i16, 1, 0, 0, 5]));
         // aD is a per-READ scalar depth -> in NO transform set, must be left unchanged.
         attrs.insert("aD", BufValue::from(42i32));
         unmapped.add_frag_with_attrs("q1", None, true, &attrs);
@@ -2997,6 +3001,13 @@ mod tests {
                     assert_eq!(*vals, vec![2i16, 4, 4, 3, 3]);
                 }
 
+                match rec.data().get(&Tag::new(b'c', b'u')) {
+                    Some(BufValue::Array(
+                        noodles::sam::alignment::record_buf::data::field::value::Array::Int16(vals),
+                    )) => assert_eq!(*vals, vec![5i16, 0, 0, 1, 0]),
+                    other => panic!("expected a reversed cu array, got {other:?}"),
+                }
+
                 // Per-read scalar aD is in no transform set -> unchanged even on neg strand.
                 if let Some(BufValue::Int32(v)) = rec.data().get(&Tag::new(b'a', b'D')) {
                     assert_eq!(*v, 42);
@@ -3016,6 +3027,13 @@ mod tests {
                 )) = rec.data().get(&Tag::new(b'a', b'd'))
                 {
                     assert_eq!(*vals, vec![3i16, 3, 4, 4, 2]);
+                }
+
+                match rec.data().get(&Tag::new(b'c', b'u')) {
+                    Some(BufValue::Array(
+                        noodles::sam::alignment::record_buf::data::field::value::Array::Int16(vals),
+                    )) => assert_eq!(*vals, vec![0i16, 1, 0, 0, 5]),
+                    other => panic!("expected an unchanged cu array, got {other:?}"),
                 }
             }
         }
@@ -3094,10 +3112,14 @@ mod tests {
         let tag_info =
             TagInfo::new(vec![], vec!["Consensus".to_string()], vec!["Consensus".to_string()]);
 
-        // "Consensus" reverse set = fgbio TagsToReverse {cd, ce, ad, ae, bd, be, aq, bq}
-        for t in ["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq"] {
-            assert!(tag_info.reverse.contains(t), "missing reverse tag {t}");
-        }
+        // "Consensus" reverse set = fgbio TagsToReverse {cd, ce, ad, ae, bd, be, aq, bq} plus the
+        // methylation counts {cu, ct, au, at, bu, bt}, and nothing else
+        let expected: std::collections::HashSet<String> =
+            ["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq", "cu", "ct", "au", "at", "bu", "bt"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        assert_eq!(tag_info.reverse, expected);
         // "Consensus" revcomp set = fgbio TagsToReverseComplement {ac, bc} (per-base base arrays);
         // per-read scalars aD/bD/cD must NOT be present.
         for t in ["ac", "bc"] {
@@ -3184,7 +3206,7 @@ mod tests {
         assert!(!tags.remove.contains([b'T', b'O']));
 
         // reverse/revcomp mirror the expanded Consensus sets.
-        for t in ["cd", "ce", "ad", "ae", "bd", "be", "aq", "bq"] {
+        for t in fgumi_umi::TagSets::CONSENSUS_REVERSE {
             let b = t.as_bytes();
             assert!(tags.reverse.contains([b[0], b[1]]), "missing reverse {t}");
         }
