@@ -124,13 +124,15 @@ impl SamTag {
     /// Adapter clipping position (e.g. from Picard `MarkIlluminaAdapters`).
     pub const XT: SamTag = SamTag::new(b'X', b'T');
     /// Bisulfite strand (written by `bwameth` and related tools): `Z:f` for the
-    /// forward/top strand, `Z:r` for the reverse/bottom strand. Used by `fgumi
-    /// zipper --restore-unconverted-bases` to decide which bases to restore.
+    /// forward/top strand, `Z:r` for the reverse/bottom strand.
     pub const YD: SamTag = SamTag::new(b'Y', b'D');
     /// Base modification calls, e.g. `MM:Z:C+m,5,12,0;` (SAM spec, "Base modifications").
     pub const MM: SamTag = SamTag::new(b'M', b'M');
     /// Per-base modification probabilities, paired with `MM` (SAM spec).
     pub const ML: SamTag = SamTag::new(b'M', b'L');
+    /// Length of SEQ when `MM`/`ML` were computed, so consumers can detect stale
+    /// modification data (SAM spec).
+    pub const MN: SamTag = SamTag::new(b'M', b'N');
     /// Phred-likelihood that the segment is incorrect (SAM spec).
     pub const UQ: SamTag = SamTag::new(b'U', b'Q');
     /// Original base quality scores, before recalibration (SAM spec).
@@ -239,14 +241,18 @@ impl SamTag {
 
     /// Per-base methylation-modification string for the AB single-strand consensus (`am`, `Z`).
     ///
-    /// Stores an MM-format annotation (e.g. `C+m,5,12,0;`) for the top strand.
+    /// Stores the AB strand's calls in MM format, by the read type of the AB strand's reads in
+    /// this record: `C+m?,…;` where they are C→T reads (R1 or fragment records), `G-m?,…;`
+    /// where they are G→A reads (R2 records).
     /// Uses the `_BASES` suffix to disambiguate from per-read [`SamTag::AM`]
     /// (bytes `aM`, min depth scalar), which shares the Rust identifier stem.
     pub const AM_BASES: SamTag = SamTag::new(b'a', b'm');
 
     /// Per-base methylation-modification string for the BA single-strand consensus (`bm`, `Z`).
     ///
-    /// Stores an MM-format annotation (e.g. `G-m,...`) for the bottom strand.
+    /// Stores the BA strand's calls in MM format, by the read type of the BA strand's reads in
+    /// this record: `G-m?,…;` where they are G→A reads (R1 or fragment records), `C+m?,…;`
+    /// where they are C→T reads (R2 records).
     /// Uses the `_BASES` suffix to disambiguate from per-read [`SamTag::BM`]
     /// (bytes `bM`, min depth scalar), which shares the Rust identifier stem.
     pub const BM_BASES: SamTag = SamTag::new(b'b', b'm');
@@ -451,6 +457,7 @@ mod tests {
     fn test_sam_spec_extension_constants() {
         assert_eq!(*SamTag::MM, [b'M', b'M']);
         assert_eq!(*SamTag::ML, [b'M', b'L']);
+        assert_eq!(*SamTag::MN, [b'M', b'N']);
         assert_eq!(*SamTag::UQ, [b'U', b'Q']);
         assert_eq!(*SamTag::OQ, [b'O', b'Q']);
     }

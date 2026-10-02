@@ -869,29 +869,243 @@ fn group_to_simplex_to_filter_matches_staged_chain() {
     assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
 }
 
-/// Audit A1: the fused filter stage must thread the top-level `--methylation-mode`
-/// / `--ref` into filter's methylation-aware options — `--filter::min-conversion-fraction`
-/// requires BOTH to be set. Before the wiring fix, the fused stage saw
-/// `MethylationMode::Disabled` and rejected the legitimately-set flag ("requires
-/// --methylation-mode to be set"), so the methylation filters were unreachable
-/// through runall. Compares the fused consensus(simplex)->filter chain against the
-/// staged equivalent where standalone simplex and filter each receive
-/// `--methylation-mode em-seq --ref`; `--min-conversion-fraction 0.0` exercises the
-/// threaded flags (validation requires them) while keeping the output non-empty.
-/// Reuses the same `grouped_bam` + `create_test_reference` fixture as
-/// `simplex_self_pair_with_methylation_mode_matches_standalone`, which is known to
-/// produce methylation-tagged consensus records.
-#[cfg(feature = "consensus")]
+/// Audit A1: the filter stage must thread the top-level `--methylation-mode` / `--ref` into
+/// filter's methylation-aware options. Compares a runall filter self-pair against standalone
+/// filter on aligned simplex methylation consensus reads (`simulate consensus-reads`), where
+/// `--min-methylation-depth` masks informative positions below the threshold, so a dropped or
+/// mis-threaded option changes the output: both runs must match each other and must mask more
+/// bases than the same filter without the option.
+#[cfg(feature = "simulate")]
 #[test]
-fn consensus_to_filter_with_methylation_matches_staged_chain() {
+fn filter_with_methylation_matches_standalone() {
     let tmp = TempDir::new().unwrap();
-    let fixture = grouped_bam(tmp.path(), "identity", "filter_methylation");
     let reference = create_test_reference(tmp.path());
+    let consensus = tmp.path().join("consensus.bam");
     let runall_out = tmp.path().join("runall.bam");
-    let staged_simplex = tmp.path().join("staged_simplex.bam");
     let staged_out = tmp.path().join("staged.bam");
+    let baseline_out = tmp.path().join("baseline.bam");
 
     run_ok(
+        [
+            "simulate",
+            "consensus-reads",
+            "-o",
+            p(&consensus),
+            "-r",
+            p(&reference),
+            "--num-reads",
+            "100",
+            "--read-length",
+            "50",
+            "--seed",
+            "7",
+            "--methylation-mode",
+            "em-seq",
+        ],
+        "simulate consensus-reads",
+    );
+    let unsorted = consensus.with_extension("unsorted.bam");
+    std::fs::rename(&consensus, &unsorted).unwrap();
+    run_ok(
+        ["sort", "-i", p(&unsorted), "-o", p(&consensus), "--order", "queryname"],
+        "queryname sort",
+    );
+    let filter_args = ["--min-reads", "1", "--max-no-call-fraction", "0.9"];
+    let mut runall_args = vec![
+        "runall",
+        "--start-from",
+        "filter",
+        "--stop-after",
+        "filter",
+        "-i",
+        p(&consensus),
+        "-o",
+        p(&runall_out),
+        "--filter::min-methylation-depth",
+        "6",
+        "--methylation-mode",
+        "em-seq",
+        "--ref",
+        p(&reference),
+    ];
+    let prefixed: Vec<String> = filter_args
+        .iter()
+        .map(|a| {
+            a.strip_prefix("--").map_or_else(|| (*a).to_string(), |f| format!("--filter::{f}"))
+        })
+        .collect();
+    runall_args.extend(prefixed.iter().map(String::as_str));
+    run_ok(runall_args, "runall filter+methylation");
+    let mut staged_args = vec![
+        "filter",
+        "-i",
+        p(&consensus),
+        "-o",
+        p(&staged_out),
+        "--min-methylation-depth",
+        "6",
+        "--methylation-mode",
+        "em-seq",
+        "--ref",
+        p(&reference),
+    ];
+    staged_args.extend(filter_args);
+    run_ok(staged_args, "standalone filter+methylation");
+    let mut baseline_args =
+        vec!["filter", "-i", p(&consensus), "-o", p(&baseline_out), "--ref", p(&reference)];
+    baseline_args.extend(filter_args);
+    run_ok(baseline_args, "standalone filter without methylation options");
+
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
+    let no_calls = |path: &Path| {
+        let (_, records) = read_bam_output(path);
+        records
+            .iter()
+            .map(|r| memchr::memchr_iter(b'N', r.sequence().as_ref()).count())
+            .sum::<usize>()
+    };
+    assert!(
+        no_calls(&runall_out) > no_calls(&baseline_out),
+        "--min-methylation-depth must mask bases on aligned methylation reads"
+    );
+}
+
+/// The number of `ML` entries (methylation calls) over a BAM's records, and each record's SEQ.
+#[cfg(feature = "simulate")]
+fn ml_entries_and_seqs(path: &Path) -> (usize, Vec<Vec<u8>>) {
+    use fgumi_lib::sam::SamTag;
+    use noodles::sam::alignment::record_buf::data::field::{Value, value::Array};
+    let (_, records) = read_bam_output(path);
+    let ml_tag = SamTag::ML.to_noodles_tag();
+    let ml_entries = records
+        .iter()
+        .filter_map(|r| match r.data().get(&ml_tag) {
+            Some(Value::Array(Array::UInt8(v))) => Some(v.len()),
+            _ => None,
+        })
+        .sum();
+    let seqs = records.iter().map(|r| r.sequence().as_ref().to_vec()).collect();
+    (ml_entries, seqs)
+}
+
+/// Duplex consensus records carry their methylation sites in their own SEQ, so filter's
+/// methylation options work on them unaligned, right after the duplex stage: a runall
+/// duplex->filter chain matches standalone duplex then filter, and the depth filter drops calls
+/// (fewer ML entries than without it) while keeping every record's SEQ.
+#[cfg(feature = "simulate")]
+#[test]
+fn duplex_to_filter_with_methylation_matches_standalone() {
+    let tmp = TempDir::new().unwrap();
+    let reference = create_test_reference(tmp.path());
+    let grouped = tmp.path().join("grouped.bam");
+    let truth = tmp.path().join("truth.tsv");
+    let consensus = tmp.path().join("consensus.bam");
+    let runall_out = tmp.path().join("runall.bam");
+    let staged_out = tmp.path().join("staged.bam");
+    let baseline_out = tmp.path().join("baseline.bam");
+
+    run_ok(
+        [
+            "simulate",
+            "grouped-reads",
+            "-o",
+            p(&grouped),
+            "--truth",
+            p(&truth),
+            "--reference",
+            p(&reference),
+            "--num-molecules",
+            "50",
+            "--seed",
+            "3",
+            "--duplex",
+            "--methylation-mode",
+            "em-seq",
+        ],
+        "simulate grouped-reads --duplex",
+    );
+    run_ok(
+        [
+            "runall",
+            "--start-from",
+            "consensus",
+            "--stop-after",
+            "filter",
+            "--consensus",
+            "duplex",
+            "-i",
+            p(&grouped),
+            "-o",
+            p(&runall_out),
+            "--duplex::min-reads",
+            "1",
+            "--filter::min-reads",
+            "1",
+            "--filter::min-methylation-depth",
+            "8,4,2",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            p(&reference),
+        ],
+        "runall duplex->filter+methylation",
+    );
+    run_ok(
+        [
+            "duplex",
+            "-i",
+            p(&grouped),
+            "-o",
+            p(&consensus),
+            "--min-reads",
+            "1",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            p(&reference),
+        ],
+        "standalone duplex",
+    );
+    run_ok(
+        [
+            "filter",
+            "-i",
+            p(&consensus),
+            "-o",
+            p(&staged_out),
+            "--min-reads",
+            "1",
+            "--min-methylation-depth",
+            "8,4,2",
+        ],
+        "standalone filter+methylation",
+    );
+    run_ok(
+        ["filter", "-i", p(&consensus), "-o", p(&baseline_out), "--min-reads", "1"],
+        "standalone filter without methylation options",
+    );
+
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    let (filtered_calls, filtered_seqs) = ml_entries_and_seqs(&staged_out);
+    let (all_calls, all_seqs) = ml_entries_and_seqs(&baseline_out);
+    assert!(all_calls > 0, "the duplex consensus carries methylation calls");
+    assert!(filtered_calls < all_calls, "--min-methylation-depth drops calls");
+    assert_eq!(filtered_seqs, all_seqs, "duplex SEQ is left alone");
+}
+
+/// runall cannot re-align between the consensus caller and filter, so on a consensus->filter
+/// chain filter reads unaligned records, on which its methylation options can check nothing.
+/// The chain is rejected up front rather than run as a no-op.
+#[cfg(feature = "consensus")]
+#[test]
+fn consensus_to_filter_with_methylation_is_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = grouped_bam(tmp.path(), "identity", "filter_methylation_unmapped");
+    let reference = create_test_reference(tmp.path());
+    let out = tmp.path().join("runall.bam");
+
+    assert_rejected_with(
         [
             "runall",
             "--start-from",
@@ -903,7 +1117,7 @@ fn consensus_to_filter_with_methylation_matches_staged_chain() {
             "-i",
             p(&fixture),
             "-o",
-            p(&runall_out),
+            p(&out),
             "--simplex::min-reads",
             "1",
             "--filter::min-reads",
@@ -915,46 +1129,9 @@ fn consensus_to_filter_with_methylation_matches_staged_chain() {
             "--ref",
             p(&reference),
         ],
+        "need single-strand consensus records aligned to the reference",
         "runall consensus(simplex)->filter+methylation",
     );
-
-    run_ok(
-        [
-            "simplex",
-            "-i",
-            p(&fixture),
-            "-o",
-            p(&staged_simplex),
-            "--min-reads",
-            "1",
-            "--methylation-mode",
-            "em-seq",
-            "--ref",
-            p(&reference),
-        ],
-        "staged simplex+methylation",
-    );
-    run_ok(
-        [
-            "filter",
-            "-i",
-            p(&staged_simplex),
-            "-o",
-            p(&staged_out),
-            "--min-reads",
-            "1",
-            "--min-conversion-fraction",
-            "0.0",
-            "--methylation-mode",
-            "em-seq",
-            "--ref",
-            p(&reference),
-        ],
-        "staged filter+methylation",
-    );
-
-    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
-    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
 }
 
 // ══════════════════════════ Extract→Correct (no aligner) ══════════════════════════
@@ -1383,20 +1560,16 @@ fn extract_to_zipper_writes_correct_rejects_like_self_pair() {
 ///
 /// Every template becomes R1 forward at `100 + 40·t`, R2 reverse at `2000 +
 /// 40·t`, and a supplementary copy of R1 at `3000`, each with SEQ copied from
-/// `sequence` so the replay is valid aligner output. R1 additionally carries
-/// `YD:Z:f` with every reference `C` converted to `T`, the bwameth top-strand
-/// shape `--restore-unconverted-bases` reverses. This gives every
+/// `sequence` so the replay is valid aligner output. This gives every
 /// `--zipper::*` merge rule something to change: tags on a reverse-strand read
-/// for reverse/revcomp, a supplementary read for `tc`, and converted bases for
-/// the restore. Returns `(kept, replay)`.
+/// for reverse/revcomp and a supplementary read for `tc`. Returns
+/// `(kept, replay)`.
 #[cfg(feature = "simulate")]
 fn write_mapped_replay_bam(dir: &Path, r1: &Path, r2: &Path, sequence: &str) -> (PathBuf, PathBuf) {
     use noodles::core::Position;
     use noodles::sam::alignment::io::Write as _;
     use noodles::sam::alignment::record::Flags;
     use noodles::sam::alignment::record::cigar::op::{Kind, Op};
-    use noodles::sam::alignment::record::data::field::Tag;
-    use noodles::sam::alignment::record_buf::data::field::Value;
     use noodles::sam::alignment::record_buf::{Cigar, Sequence};
     use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
 
@@ -1410,32 +1583,21 @@ fn write_mapped_replay_bam(dir: &Path, r1: &Path, r2: &Path, sequence: &str) -> 
         Map::<ReferenceSequence>::new(std::num::NonZeroUsize::new(sequence.len()).unwrap()),
     );
 
-    let place = |record: &noodles::sam::alignment::RecordBuf,
-                 pos: usize,
-                 mate_pos: usize,
-                 flags: Flags,
-                 convert: bool| {
-        let mut out = record.clone();
-        let len = record.sequence().len();
-        let mut bases = sequence.as_bytes()[pos - 1..pos - 1 + len].to_vec();
-        if convert {
-            for b in &mut bases {
-                if *b == b'C' {
-                    *b = b'T';
-                }
-            }
-            out.data_mut().insert(Tag::new(b'Y', b'D'), Value::String("f".into()));
-        }
-        *out.flags_mut() = flags;
-        *out.reference_sequence_id_mut() = Some(0);
-        *out.alignment_start_mut() = Position::new(pos);
-        *out.cigar_mut() = Cigar::from(vec![Op::new(Kind::Match, len)]);
-        *out.mapping_quality_mut() = noodles::sam::alignment::record::MappingQuality::new(60);
-        *out.sequence_mut() = Sequence::from(bases);
-        *out.mate_reference_sequence_id_mut() = Some(0);
-        *out.mate_alignment_start_mut() = Position::new(mate_pos);
-        out
-    };
+    let place =
+        |record: &noodles::sam::alignment::RecordBuf, pos: usize, mate_pos: usize, flags: Flags| {
+            let mut out = record.clone();
+            let len = record.sequence().len();
+            let bases = sequence.as_bytes()[pos - 1..pos - 1 + len].to_vec();
+            *out.flags_mut() = flags;
+            *out.reference_sequence_id_mut() = Some(0);
+            *out.alignment_start_mut() = Position::new(pos);
+            *out.cigar_mut() = Cigar::from(vec![Op::new(Kind::Match, len)]);
+            *out.mapping_quality_mut() = noodles::sam::alignment::record::MappingQuality::new(60);
+            *out.sequence_mut() = Sequence::from(bases);
+            *out.mate_reference_sequence_id_mut() = Some(0);
+            *out.mate_alignment_start_mut() = Position::new(mate_pos);
+            out
+        };
 
     let replay = dir.join("mapped_replay.bam");
     let mut writer = noodles::bam::io::Writer::new(std::fs::File::create(&replay).unwrap());
@@ -1447,9 +1609,9 @@ fn write_mapped_replay_bam(dir: &Path, r1: &Path, r2: &Path, sequence: &str) -> 
         let paired = Flags::SEGMENTED | Flags::PROPERLY_SEGMENTED;
         let r1_flags = paired | Flags::FIRST_SEGMENT | Flags::MATE_REVERSE_COMPLEMENTED;
         let r2_flags = paired | Flags::LAST_SEGMENT | Flags::REVERSE_COMPLEMENTED;
-        let out_r1 = place(first, r1_pos, r2_pos, r1_flags, true);
-        let out_r2 = place(second, r2_pos, r1_pos, r2_flags, false);
-        let out_supp = place(first, 3000, r2_pos, r1_flags | Flags::SUPPLEMENTARY, false);
+        let out_r1 = place(first, r1_pos, r2_pos, r1_flags);
+        let out_r2 = place(second, r2_pos, r1_pos, r2_flags);
+        let out_supp = place(first, 3000, r2_pos, r1_flags | Flags::SUPPLEMENTARY);
         for record in [&out_r1, &out_r2, &out_supp] {
             writer.write_alignment_record(&header, record).unwrap();
         }
@@ -1493,6 +1655,16 @@ impl MappedReplay {
     /// correct) or, when `start_from_align`, from the kept unmapped BAM, with
     /// `flags` given their `--zipper::` prefix. Returns stderr.
     fn run_chain(&self, start_from_align: bool, out: &Path, flags: &[&str]) -> String {
+        let output = run_ok(
+            self.chain_args(start_from_align, out, flags),
+            &format!("runall ->zipper (align start: {start_from_align}) {flags:?}"),
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    /// The `runall` arguments for [`Self::run_chain`], with `flags` given in their
+    /// standalone-zipper spelling and prefixed with `--zipper::` here.
+    fn chain_args(&self, start_from_align: bool, out: &Path, flags: &[&str]) -> Vec<String> {
         let prefixed: Vec<String> = flags
             .iter()
             .map(|a| {
@@ -1519,9 +1691,7 @@ impl MappedReplay {
         };
         args.extend(prefixed.iter().map(String::as_str));
         args.extend(["-o", p(out)]);
-        let output =
-            run_ok(args, &format!("runall ->zipper (align start: {start_from_align}) {flags:?}"));
-        String::from_utf8_lossy(&output.stderr).into_owned()
+        args.into_iter().map(str::to_string).collect()
     }
 
     /// Standalone `fgumi zipper` over the same replay (aligner output) and kept
@@ -1547,7 +1717,7 @@ impl MappedReplay {
 /// `extract` (correct feeding the fused Align stage) and from `align` (an
 /// unmapped BAM) — exactly as standalone `fgumi zipper` applies it to the same
 /// aligner output. The fused merge used to be built with empty tag rules,
-/// `tc` tags always on and no unconverted-base restore, so each flag was
+/// `tc` tags always on, so each flag was
 /// parsed and dropped. A no-flag baseline must already match standalone
 /// zipper, so a mismatch is the flag, not the fixture; and each flag must
 /// change the output, so no case can pass vacuously.
@@ -1557,7 +1727,6 @@ impl MappedReplay {
 #[case::tags_to_reverse(&["--tags-to-reverse", "RX"])]
 #[case::tags_to_revcomp(&["--tags-to-revcomp", "RX"])]
 #[case::skip_tc_tags(&["--skip-tc-tags"])]
-#[case::restore_unconverted_bases(&["--restore-unconverted-bases"])]
 fn fused_chain_honors_zipper_merge_flags(
     #[case] flags: &[&str],
     #[values(false, true)] start_from_align: bool,
@@ -1605,23 +1774,20 @@ fn fused_chain_warns_exclude_missing_reads_is_inert() {
     assert_bams_record_equivalent_nonempty(&with, &without);
 }
 
-/// `--zipper::restore-unconverted-bases` is for re-aligned consensus reads; on
-/// raw reads from `--start-from extract` it erases the conversions before any
-/// consensus has recorded them, so the run must warn there — and not on
-/// `--start-from align`, its documented re-alignment use.
+/// `--zipper::restore-unconverted-bases` (v0.7.0 and earlier) was removed: a chain that
+/// aligns, from `extract` or from `align`, must reject it with a pointer to the methylation
+/// guide rather than run.
 #[cfg(feature = "simulate")]
-#[test]
-fn restore_unconverted_bases_warns_only_before_consensus() {
-    const WARNING: &str =
-        "--zipper::restore-unconverted-bases rewrites converted bases on raw reads";
+#[rstest::rstest]
+fn restore_unconverted_bases_is_rejected(#[values(false, true)] start_from_align: bool) {
     let tmp = TempDir::new().unwrap();
     let fixture = MappedReplay::new(tmp.path());
-    let flags = ["--restore-unconverted-bases"];
-
-    let stderr = fixture.run_chain(false, &tmp.path().join("extract.bam"), &flags);
-    assert!(stderr.contains(WARNING), "expected the raw-read restore warning, got:\n{stderr}");
-    let stderr = fixture.run_chain(true, &tmp.path().join("align.bam"), &flags);
-    assert!(!stderr.contains(WARNING), "--start-from align must not warn:\n{stderr}");
+    let out = tmp.path().join("out.bam");
+    assert_rejected_with(
+        fixture.chain_args(start_from_align, &out, &["--restore-unconverted-bases"]),
+        "--restore-unconverted-bases was removed",
+        &format!("runall ->zipper (align start: {start_from_align})"),
+    );
 }
 
 /// A chained correct that reaches no consensus stage leaves the top-level

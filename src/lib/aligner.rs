@@ -422,7 +422,7 @@ fn relay_stderr(stderr: impl std::io::Read, ring_size: usize) -> Vec<String> {
 /// subprocess aligner), `bwa` (legacy reference), and `bwa-mem3-inproc`
 /// (bwa-mem3 linked directly into fgumi, gated by the `aligner-bwa-mem3`
 /// build feature; see `AlignerOptions::resolve`). Methylation-aware
-/// presets (e.g. `bwameth`, `bwa-mem3 --methylation-mode em-seq`) are a
+/// presets (e.g. `bwameth`, `bwa-mem3 mem --meth`) are a
 /// follow-up; EM-seq users today route through `--aligner::command "..."`
 /// (free-form mode) instead of a preset.
 ///

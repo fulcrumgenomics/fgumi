@@ -175,7 +175,8 @@ pub struct Duplex {
 
     /// Methylation-aware consensus calling mode.
     /// EM-Seq: C→T at ref-C = unmethylated (enzymatic conversion); TAPs: C→T at ref-C = methylated.
-    /// Emits MM/ML methylation tags and cu/ct per-base count tags on consensus reads.
+    /// Consensus SEQ is the molecule's unconverted sequence, with per-strand MM/ML
+    /// methylation tags and cu/ct per-base count tags; re-align with a standard aligner.
     /// Requires --ref.
     #[arg(long = "methylation-mode", value_enum)]
     pub methylation_mode: Option<crate::commands::common::MethylationModeArg>,

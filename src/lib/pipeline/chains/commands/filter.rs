@@ -27,7 +27,7 @@ use std::sync::atomic::Ordering;
 use ahash::AHashMap;
 use anyhow::Result;
 use fgumi_raw_bam::RawRecord;
-use log::info;
+use log::{info, warn};
 
 use crate::commands::filter::{CollectedFilterMetrics, Filter, FilterProcessCaptures};
 use crate::consensus_filter::retained_primary_masked_bases;
@@ -57,11 +57,13 @@ pub(crate) struct FilterFinalizeHook {
     pub(crate) accumulators: Arc<PerThreadAccumulator<CollectedFilterMetrics>>,
     pub(crate) has_rejects: bool,
     pub(crate) timer: OperationTimer,
+    /// Records the methylation filters could not evaluate.
+    pub(crate) methylation_skips: Arc<crate::commands::filter::MethylationFilterSkips>,
 }
 
 impl FinalizeHook for FilterFinalizeHook {
     fn finalize(self: Box<Self>) -> Result<()> {
-        let FilterFinalizeHook { accumulators, has_rejects, timer } = *self;
+        let FilterFinalizeHook { accumulators, has_rejects, timer, methylation_skips } = *self;
 
         let mut total_reads = 0u64;
         let mut passed_reads = 0u64;
@@ -80,11 +82,102 @@ impl FinalizeHook for FilterFinalizeHook {
             info!("Wrote {failed_reads} rejected records to rejects file");
         }
         info!("Total bases masked: {total_bases_masked}");
+        for warning in methylation_skip_warnings(total_reads, &methylation_skips) {
+            warn!("{warning}");
+        }
 
         timer.log_completion(total_reads);
 
         Ok(())
     }
+}
+
+/// The end-of-run warnings for records the methylation filters could not evaluate, or whose
+/// modification tags they removed.
+fn methylation_skip_warnings(
+    total_reads: u64,
+    skips: &crate::commands::filter::MethylationFilterSkips,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let unaligned = skips.unaligned.load(Ordering::Relaxed);
+    let no_counts = skips.no_counts.load(Ordering::Relaxed);
+    let length_mismatch = skips.length_mismatch.load(Ordering::Relaxed);
+    // The skip causes are exclusive per record: together they may cover every record without
+    // any one of them doing so, and then the methylation filters also checked nothing.
+    let skipped = unaligned + no_counts + length_mismatch;
+    let single_cause = [unaligned, no_counts, length_mismatch].contains(&total_reads);
+    if skipped > 0 && skipped == total_reads && !single_cause {
+        warnings.push(format!(
+            "none of the {total_reads} records were checked by the methylation filters (see the \
+             reasons below)"
+        ));
+    }
+    // A skip that hit every record means the methylation filters checked nothing at all.
+    let mut skip_warning = |count: u64, every: &str, some: String| {
+        if count > 0 && count == total_reads {
+            warnings.push(format!(
+                "none of the {count} records were checked by the methylation filters: {every}"
+            ));
+        } else if count > 0 {
+            warnings.push(some);
+        }
+    };
+    skip_warning(
+        unaligned,
+        "single-strand records need records aligned to the reference, and every record was \
+         unmapped; filter after alignment",
+        format!(
+            "{unaligned} unmapped single-strand records were not checked by the methylation \
+             filters"
+        ),
+    );
+    skip_warning(
+        no_counts,
+        "no record carries cu/ct methylation counts; call consensus with --methylation-mode",
+        format!(
+            "{no_counts} records without cu/ct methylation counts were not checked by the \
+             methylation filters"
+        ),
+    );
+    skip_warning(
+        length_mismatch,
+        "no record's cu/ct match its SEQ in length (SEQ hard-clipped after consensus calling?)",
+        format!(
+            "{length_mismatch} records whose cu/ct do not match SEQ in length (SEQ hard-clipped \
+             after consensus calling?) were not checked by the methylation filters"
+        ),
+    );
+    let simplex_agreement = skips.simplex_agreement.load(Ordering::Relaxed);
+    if simplex_agreement > 0 {
+        warnings.push(format!(
+            "--require-strand-methylation-agreement applies to duplex consensus records only; it \
+             was not applied to {simplex_agreement} single-strand records"
+        ));
+    }
+    let unreversed = skips.unreversed_reverse_strand.load(Ordering::Relaxed);
+    if unreversed > 0 {
+        warnings.push(format!(
+            "the methylation filters read cu/ct by SEQ position in reference orientation, but \
+             --reverse-per-base-tags is not set: unless cu/ct were already reversed, they were \
+             evaluated at the wrong positions on {unreversed} reverse-mapped records"
+        ));
+    }
+    let dropped_calls = skips.dropped_calls.load(Ordering::Relaxed);
+    if dropped_calls > 0 {
+        let records = skips.records_with_dropped_calls.load(Ordering::Relaxed);
+        warnings.push(format!(
+            "the methylation filters dropped {dropped_calls} methylation calls from MM/ML on \
+             {records} duplex records (SEQ unchanged)"
+        ));
+    }
+    let tags_removed = skips.tags_removed.load(Ordering::Relaxed);
+    if tags_removed > 0 {
+        warnings.push(format!(
+            "MM/ML/am/bm were removed from {tags_removed} records whose modification tags could \
+             not be updated to match SEQ"
+        ));
+    }
+    warnings
 }
 
 /// Success-only finalize hook that writes the `--filter::stats` file. Registered
@@ -153,6 +246,7 @@ pub(crate) fn process_record_raw_call(
         captures.min_conversion_fraction,
         captures.methylation_mode,
         &captures.ref_names,
+        &captures.methylation_skips,
     )
 }
 
@@ -680,5 +774,64 @@ mod stats_tests {
         let content = std::fs::read_to_string(tmp.path()).unwrap();
         let data = content.lines().nth(1).unwrap();
         assert_eq!(data, "0\t0\t0\t0");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    /// The end-of-run warnings name what was skipped (or removed), and say so plainly when every
+    /// record was skipped: that run checked nothing.
+    #[rstest::rstest]
+    #[case::none(10, [0, 0, 0, 0, 0, 0, 0, 0], &[])]
+    #[case::some_unaligned(10, [3, 0, 0, 0, 0, 0, 0, 0], &["3 unmapped single-strand records"])]
+    #[case::all_unaligned(10, [10, 0, 0, 0, 0, 0, 0, 0], &["none of the 10 records were checked"])]
+    #[case::simplex_agreement(10, [0, 4, 0, 0, 0, 0, 0, 0], &["not applied to 4 single-strand records"])]
+    #[case::some_no_counts(10, [0, 0, 2, 0, 0, 0, 0, 0], &["2 records without cu/ct"])]
+    #[case::all_no_counts(10, [0, 0, 10, 0, 0, 0, 0, 0], &["no record carries cu/ct"])]
+    #[case::length_mismatch(10, [0, 0, 0, 5, 0, 0, 0, 0], &["5 records whose cu/ct do not match SEQ"])]
+    #[case::tags_removed(10, [0, 0, 0, 0, 7, 0, 0, 0], &["removed from 7 records"])]
+    #[case::all_skipped_split_causes(
+        10,
+        [4, 0, 3, 3, 0, 0, 0, 0],
+        &[
+            "none of the 10 records were checked by the methylation filters (see the reasons below)",
+            "4 unmapped single-strand records",
+            "3 records without cu/ct",
+            "3 records whose cu/ct do not match SEQ",
+        ]
+    )]
+    #[case::unreversed(10, [0, 0, 0, 0, 0, 6, 0, 0], &["wrong positions on 6 reverse-mapped records"])]
+    #[case::dropped_calls(10, [0, 0, 0, 0, 0, 0, 5, 2], &["dropped 5 methylation calls from MM/ML on 2 duplex records"])]
+    fn test_methylation_skip_warnings(
+        #[case] total: u64,
+        #[case] counts: [u64; 8],
+        #[case] expected: &[&str],
+    ) {
+        let skips = crate::commands::filter::MethylationFilterSkips::default();
+        let [
+            unaligned,
+            simplex_agreement,
+            no_counts,
+            length_mismatch,
+            tags_removed,
+            unreversed,
+            dropped_calls,
+            records_with_dropped_calls,
+        ] = counts;
+        skips.unaligned.store(unaligned, Ordering::Relaxed);
+        skips.simplex_agreement.store(simplex_agreement, Ordering::Relaxed);
+        skips.no_counts.store(no_counts, Ordering::Relaxed);
+        skips.length_mismatch.store(length_mismatch, Ordering::Relaxed);
+        skips.tags_removed.store(tags_removed, Ordering::Relaxed);
+        skips.unreversed_reverse_strand.store(unreversed, Ordering::Relaxed);
+        skips.dropped_calls.store(dropped_calls, Ordering::Relaxed);
+        skips.records_with_dropped_calls.store(records_with_dropped_calls, Ordering::Relaxed);
+        let warnings = super::methylation_skip_warnings(total, &skips);
+        assert_eq!(warnings.len(), expected.len(), "{warnings:?}");
+        for (warning, needle) in warnings.iter().zip(expected) {
+            assert!(warning.contains(needle), "{warning:?} lacks {needle:?}");
+        }
     }
 }

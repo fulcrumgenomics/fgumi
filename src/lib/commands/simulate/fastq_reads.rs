@@ -3,7 +3,7 @@
 use crate::commands::command::Command;
 use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, QualityArgs,
-    ReferenceGenome, SimulationCommon, apply_methylation_conversion, body_error_rng,
+    ReferenceGenome, SimulationCommon, TemplateLocus, body_error_rng, convert_molecule_strand,
     generate_random_sequence, introduce_errors_inplace, join_writer_result,
 };
 use crate::simulate::{FastqWriter, create_rng};
@@ -214,7 +214,7 @@ impl Command for FastqReads {
         };
 
         // Validate methylation args
-        let methylation = self.methylation.resolve();
+        let methylation = self.methylation.resolve(self.common.seed);
         self.methylation.validate()?;
 
         info!("Generating FASTQ reads");
@@ -231,9 +231,7 @@ impl Command for FastqReads {
         info!("  Threads: {}", self.threads);
         info!("  Reference: {}", self.reference.display());
         if methylation.mode.is_enabled() {
-            info!("  Methylation mode: {:?}", methylation.mode);
-            info!("  CpG methylation rate: {}", methylation.cpg_methylation_rate);
-            info!("  Conversion rate: {}", methylation.conversion_rate);
+            methylation.log_settings();
         }
 
         crate::commands::simulate::common::validate_rate(self.error_rate, "error-rate")?;
@@ -414,6 +412,23 @@ fn generate_molecule_reads(
     let r2_start = template.len().saturating_sub(template_len);
     let r2_end = template.len();
 
+    // Chemistry acts once per original strand of the molecule (directional library): every
+    // read of a strand family is a PCR copy of that converted strand, and both mates of a pair
+    // are cut from it. The top strand (A reads) converts C→T, the bottom (B reads) G→A in
+    // genomic orientation.
+    let locus = TemplateLocus {
+        chrom_idx: Some(chrom_idx),
+        contig: reference.contig(chrom_idx),
+        start: pos,
+    };
+    let converted_top =
+        convert_molecule_strand(&template, locus, true, &params.methylation, &mut rng);
+    let converted_bottom = if params.duplex {
+        convert_molecule_strand(&template, locus, false, &params.methylation, &mut rng)
+    } else {
+        template.clone()
+    };
+
     // Reusable buffers for sequence building
     let mut r1_seq_buf = Vec::with_capacity(params.read_length);
     let mut r2_seq_buf = Vec::with_capacity(params.read_length);
@@ -455,71 +470,22 @@ fn generate_molecule_reads(
         r2_seq_buf.clear();
 
         if strand == "A" {
-            // A strand: standard forward orientation
-            // R1 reads the top strand (forward) — apply C→T conversion
+            // A strand (top): R1 reads the template start forward, R2 the template end
+            // reverse-complemented.
             r1_seq_buf.extend_from_slice(r1_umi);
-            let r1_template_end = template_len.min(template.len());
-            let mut r1_template = template[..r1_template_end].to_vec();
-            apply_methylation_conversion(
-                &mut r1_template,
-                &template,
-                0,
-                true, // top strand
-                &params.methylation,
-                &mut rng,
-            );
-            r1_seq_buf.extend_from_slice(&r1_template);
-
-            // R2 reads the bottom strand (reverse) — apply G→A conversion, then RC
+            r1_seq_buf.extend_from_slice(&converted_top[..template_len.min(converted_top.len())]);
             r2_seq_buf.extend_from_slice(r2_umi);
-            let mut r2_template = template[r2_start..r2_end].to_vec();
-            apply_methylation_conversion(
-                &mut r2_template,
-                &template,
-                r2_start,
-                false, // bottom strand
-                &params.methylation,
-                &mut rng,
-            );
-            reverse_complement_into(&r2_template, &mut r2_seq_buf);
+            reverse_complement_into(&converted_top[r2_start..r2_end], &mut r2_seq_buf);
         } else {
-            // B strand: comes from the complementary DNA strand of the same molecule
-            // For duplex sequencing, A and B strand reads should align to the SAME positions
-            // but with opposite orientations (A=FR, B=RF).
-            //
-            // A strand: R1 at template START (forward), R2 at template END (reverse)
-            // B strand: R1 at template END (reverse), R2 at template START (forward)
-            //
-            // This means:
-            // - B R1 covers the same region as A R2 (template end), sequenced from revcomp
-            // - B R2 covers the same region as A R1 (template start), sequenced forward
-
-            // B R1 reads the bottom strand (template end, reverse) — apply G→A, then RC
+            // B strand (bottom): the complementary DNA strand of the same molecule. For duplex
+            // sequencing A and B reads align to the SAME positions with opposite orientations
+            // (A=FR, B=RF): B R1 covers the template end, reverse-complemented, and B R2 the
+            // template start, forward.
             r1_seq_buf.extend_from_slice(r1_umi);
-            let mut r1_template = template[r2_start..r2_end].to_vec();
-            apply_methylation_conversion(
-                &mut r1_template,
-                &template,
-                r2_start,
-                false, // bottom strand
-                &params.methylation,
-                &mut rng,
-            );
-            reverse_complement_into(&r1_template, &mut r1_seq_buf);
-
-            // B R2 reads the top strand (template start, forward) — apply C→T
+            reverse_complement_into(&converted_bottom[r2_start..r2_end], &mut r1_seq_buf);
             r2_seq_buf.extend_from_slice(r2_umi);
-            let r1_template_end = template_len.min(template.len());
-            let mut r2_template = template[..r1_template_end].to_vec();
-            apply_methylation_conversion(
-                &mut r2_template,
-                &template,
-                0,
-                true, // top strand
-                &params.methylation,
-                &mut rng,
-            );
-            r2_seq_buf.extend_from_slice(&r2_template);
+            r2_seq_buf
+                .extend_from_slice(&converted_bottom[..template_len.min(converted_bottom.len())]);
         }
 
         // Introduce UMI errors directly into buffer
@@ -1033,6 +999,7 @@ mod tests {
                 mode: fgumi_consensus::MethylationMode::Disabled,
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
+                ..MethylationConfig::default()
             },
             error_rate: 0.0,
         };
@@ -1111,6 +1078,7 @@ mod tests {
                 mode: fgumi_consensus::MethylationMode::Disabled,
                 cpg_methylation_rate: 0.75,
                 conversion_rate: 0.98,
+                ..MethylationConfig::default()
             },
             error_rate,
         };
@@ -1183,85 +1151,126 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_emseq_fastq_reads_converts_non_cpg_c() {
-        // With EM-Seq, non-CpG C should be converted to T (on top strand R1)
-        // Use a reference that has a known pattern: all C's with no adjacent G
-        // Template: "CACACACACA..." (no CpG dinucleotides)
-        use crate::commands::simulate::common::apply_methylation_conversion;
-
-        let template = b"CACACACACACACACACACAC".to_vec();
-        let mut r1 = template.clone();
-        let mut rng = create_rng(Some(42));
-
-        let config = MethylationConfig {
-            mode: fgumi_consensus::MethylationMode::EmSeq,
-            cpg_methylation_rate: 0.75,
-            conversion_rate: 1.0,
-        };
-        apply_methylation_conversion(&mut r1, &template, 0, true, &config, &mut rng);
-
-        // All C's should be converted to T (non-CpG in EM-Seq)
-        for (i, &b) in r1.iter().enumerate() {
-            if template[i] == b'C' {
-                assert_eq!(b, b'T', "position {i}: non-CpG C should be converted to T in EM-Seq");
-            } else {
-                assert_eq!(b, template[i], "position {i}: A should remain unchanged");
-            }
-        }
+    /// Substitutions `(reference, read)` between `read` and `contig` at `offset`.
+    fn substitutions(
+        contig: &[u8],
+        offset: usize,
+        read: &[u8],
+    ) -> std::collections::BTreeSet<(u8, u8)> {
+        read.iter()
+            .zip(&contig[offset..offset + read.len()])
+            .filter(|(r, c)| r != c)
+            .map(|(&r, &c)| (c, r))
+            .collect()
     }
 
+    /// Directional library physics: both mates of a pair come from one converted original
+    /// strand, converted once per molecule strand so every read of a strand family is
+    /// identical. In genomic orientation a top-strand (A) family shows only C→T on both mates
+    /// and a bottom-strand (B) family only G→A.
     #[test]
-    fn test_taps_fastq_reads_preserves_non_cpg_c() {
-        // With TAPs, non-CpG C should NOT be converted
-        use crate::commands::simulate::common::apply_methylation_conversion;
+    fn test_methylation_mates_share_one_converted_strand() {
+        use std::collections::HashMap;
+        use std::io::Write as IoWrite;
+        use tempfile::NamedTempFile;
 
-        let template = b"CACACACACACACACACACAC".to_vec();
-        let mut r1 = template.clone();
-        let mut rng = create_rng(Some(42));
+        let mut contig_rng = create_rng(Some(99));
+        let contig: Vec<u8> = (0..4000).map(|_| b"ACGT"[contig_rng.random_range(0..4)]).collect();
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&contig).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+        let ref_genome = ReferenceGenome::load(fasta.path()).unwrap();
 
-        let config = MethylationConfig {
-            mode: fgumi_consensus::MethylationMode::Taps,
-            cpg_methylation_rate: 0.75,
-            conversion_rate: 1.0,
+        let params = GenerationParams {
+            umi_length: 5,
+            read_length: 50,
+            min_family_size: 4,
+            r2_quality_offset: 0,
+            duplex: true,
+            includelist: None,
+            methylation: MethylationConfig {
+                mode: fgumi_consensus::MethylationMode::EmSeq,
+                cpg_methylation_rate: 0.5,
+                conversion_rate: 0.5,
+                table_seed: 5,
+                ..MethylationConfig::default()
+            },
+            error_rate: 0.0,
         };
-        apply_methylation_conversion(&mut r1, &template, 0, true, &config, &mut rng);
+        let quality_model =
+            crate::simulate::PositionQualityModel::new(10, 25, 37, 100, 0.08, 2, 2.0);
+        let quality_bias = crate::simulate::ReadPairQualityBias::new(0);
+        let family_dist = crate::simulate::FamilySizeDistribution::log_normal(8.0, 1.0);
+        // Shorter than two read lengths, so the mates overlap.
+        let (min_insert, max_insert) = (60, 80);
+        let insert_model = crate::simulate::InsertSizeModel::new(70.0, 5.0, min_insert, max_insert);
 
-        // No changes — non-CpG C is not a target in TAPs
-        assert_eq!(r1, template);
-    }
-
-    #[test]
-    fn test_reads_in_same_family_differ_with_methylation() {
-        // Each read independently samples conversion, so two reads from
-        // the same molecule should (usually) differ when rates are partial
-        use crate::commands::simulate::common::apply_methylation_conversion;
-
-        // Template with CpG sites
-        let template = b"ACGTCGATCGACGTCGATCG".to_vec();
-        let mut different_count = 0;
-
-        let config = MethylationConfig {
-            mode: fgumi_consensus::MethylationMode::EmSeq,
-            cpg_methylation_rate: 0.5,
-            conversion_rate: 0.5,
-        };
-
-        for seed in 0..50u64 {
-            let mut r1_a = template.clone();
-            let mut r1_b = template.clone();
-            let mut rng_a = create_rng(Some(seed * 2));
-            let mut rng_b = create_rng(Some(seed * 2 + 1));
-
-            apply_methylation_conversion(&mut r1_a, &template, 0, true, &config, &mut rng_a);
-            apply_methylation_conversion(&mut r1_b, &template, 0, true, &config, &mut rng_b);
-
-            if r1_a != r1_b {
-                different_count += 1;
+        let mut strands_seen = std::collections::BTreeSet::new();
+        // Strands on which at least one conversion was seen.
+        let mut converted = std::collections::BTreeSet::new();
+        let mut overlapped = 0usize;
+        for seed in 0..10u64 {
+            let records = generate_molecule_reads(
+                0,
+                seed,
+                &params,
+                &quality_model,
+                &quality_bias,
+                &family_dist,
+                &insert_model,
+                &ref_genome,
+            );
+            let mut bodies: HashMap<&str, (Vec<u8>, Vec<u8>)> = HashMap::new();
+            for record in &records {
+                let r1_body = record.r1_seq[params.umi_length..].to_vec();
+                let r2_body = record.r2_seq[params.umi_length..].to_vec();
+                let (forward, reverse, allowed) = if record.strand == "A" {
+                    (&r1_body, &r2_body, (b'C', b'T'))
+                } else {
+                    (&r2_body, &r1_body, (b'G', b'A'))
+                };
+                let forward_subs = substitutions(&contig, record.pos, forward);
+                assert!(
+                    forward_subs.iter().all(|&sub| sub == allowed),
+                    "strand {} forward mate shows other substitutions",
+                    record.strand
+                );
+                if forward_subs.contains(&allowed) {
+                    converted.insert(record.strand);
+                }
+                // The reverse mate ends where the template ends: find its genomic offset, then
+                // require the same bases as the forward mate where they overlap (two separate
+                // conversions would differ at some cytosine).
+                let reverse_genomic = fgumi_dna::dna::reverse_complement(reverse);
+                let last_offset = record.pos + max_insert - params.umi_length - reverse.len();
+                let offset = (record.pos..=last_offset)
+                    .find(|&offset| {
+                        substitutions(&contig, offset, &reverse_genomic)
+                            .iter()
+                            .all(|&sub| sub == allowed)
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("strand {} reverse mate is not from the template", record.strand)
+                    });
+                for pos in offset..record.pos + forward.len() {
+                    assert_eq!(
+                        forward[pos - record.pos],
+                        reverse_genomic[pos - offset],
+                        "strand {} mates differ at {pos}",
+                        record.strand
+                    );
+                    overlapped += 1;
+                }
+                let family =
+                    bodies.entry(record.strand).or_insert((r1_body.clone(), r2_body.clone()));
+                assert_eq!((&family.0, &family.1), (&r1_body, &r2_body), "family reads differ");
+                strands_seen.insert(record.strand);
             }
         }
-
-        // With 50% CpG methylation rate, most pairs should differ
-        assert!(different_count > 10, "Expected most read pairs to differ, got {different_count}");
+        assert_eq!(strands_seen.len(), 2, "both strands exercised");
+        assert_eq!(converted.len(), 2, "a conversion must be seen on both strands");
+        assert!(overlapped > 0, "mates must overlap");
     }
 }

@@ -5,8 +5,7 @@
 //! Each `ZipperBatch` carries both halves of a batch (aligner-emitted `mapped`
 //! templates positionally paired with the original `unmapped` templates) plus a
 //! dense serial, so the merge is per-template and needs no cross-batch state:
-//! `merge_one_template_with` (`merge_raw_with` plus optional bisulfite restore)
-//! is run for each pair, folding record-count and heap-size accounting into the
+//! `merge_raw_with` is run for each pair, folding record-count and heap-size accounting into the
 //! same pass. That independence is why this step is `Parallel` with an
 //! `OrderedBytesSingle<BamTemplateBatch>` + `BranchOrdering::ByItemOrdinal`
 //! output: workers merge batches concurrently and the framework restores input
@@ -21,9 +20,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use noodles::sam::Header;
-
-use crate::commands::zipper::{ZipperTags, merge_one_template_with};
+use crate::commands::zipper::{ZipperTags, merge_raw_with};
 use crate::pipeline::core::Unpushed;
 use crate::pipeline::core::held::HeldSlot;
 use crate::pipeline::core::outputs::OrderedBytesSingle;
@@ -32,7 +29,6 @@ use crate::pipeline::core::reorder::BranchOrdering;
 use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
 use crate::pipeline::steps::align::ZipperBatch;
 use crate::pipeline::steps::types::BamTemplateBatch;
-use crate::reference::ReferenceReader;
 use crate::template::Template;
 use crate::umi::TagInfo;
 
@@ -47,15 +43,6 @@ pub(crate) struct MergeConfig {
     /// Whether to skip TC (template-coordinate) tag handling. Mirrors
     /// `ZipperMergeConfig::skip_tc_tags`.
     pub(crate) skip_tc_tags: bool,
-
-    /// Optional reference reader used by
-    /// `restore_unconverted_bases_in_raw_template` (bisulfite path).
-    /// `None` for normal alignment.
-    pub(crate) reference: Option<Arc<ReferenceReader>>,
-
-    /// Partial output header (dict-derived `@SQ` + unmapped-derived
-    /// `@HD`/`@CO`/`@RG`/`@PG` + fgumi `@PG`) used by `merge_one_template_with`.
-    pub(crate) partial_output_header: Arc<Header>,
 
     /// Counter for records emitted downstream. Exposed back to the caller after
     /// `Pipeline::run` returns so summary logging can report a real throughput
@@ -148,8 +135,7 @@ impl Step for MergeAlignedStep {
 
 /// Merge one `ZipperBatch` into a `BamTemplateBatch`. Takes the caller's
 /// precomputed `tags` (built once for the whole step, since `cfg.tag_info` is
-/// immutable) and, per template, runs `merge_one_template_with`
-/// (`merge_raw_with` plus optional bisulfite restore); folds record-count and
+/// immutable) and, per template, runs `merge_raw_with`; folds record-count and
 /// heap-size accounting into the same single pass so the resulting
 /// `BamTemplateBatch` doesn't re-walk the templates to compute `total_bytes`.
 pub(crate) fn merge_zipper_batch(
@@ -180,13 +166,11 @@ pub(crate) fn merge_zipper_batch(
     // re-allocated per template) — see fgumi #971.
     let mut aux_scratch: Vec<u8> = Vec::new();
     for (mut mapped_template, unmapped_template) in mapped.into_iter().zip(unmapped.templates()) {
-        merge_one_template_with(
+        merge_raw_with(
             unmapped_template,
             &mut mapped_template,
             tags,
             cfg.skip_tc_tags,
-            cfg.reference.as_deref(),
-            &cfg.partial_output_header,
             &mut aux_scratch,
         )
         .map_err(|e| io::Error::other(format!("align-and-merge: {e:#}")))?;
@@ -209,8 +193,6 @@ mod tests {
         MergeConfig {
             tag_info: Arc::new(TagInfo::new(vec![], vec![], vec![])),
             skip_tc_tags: true,
-            reference: None,
-            partial_output_header: Arc::new(Header::default()),
             records_emitted: Arc::new(AtomicU64::new(0)),
             output_byte_limit: 1024 * 1024,
         }

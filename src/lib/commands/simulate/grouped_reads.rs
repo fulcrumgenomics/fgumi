@@ -10,8 +10,9 @@ use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, PositionDistArgs,
     QualityArgs, RecordSink, ReferenceArgs, ReferenceGenome, SimulationCommon, SortResourceArgs,
-    StrandBiasArgs, apply_methylation_conversion, body_error_rng, build_sort_order_header_map,
-    generate_random_sequence, into_record_stream, introduce_errors_inplace, pad_sequence,
+    StrandBiasArgs, TemplateLocus, body_error_rng, build_sort_order_header_map,
+    convert_molecule_strand, generate_random_sequence, into_record_stream,
+    introduce_errors_inplace, pad_sequence,
 };
 use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
@@ -126,7 +127,7 @@ struct GenerationParams {
 impl Command for GroupedReads {
     fn execute(&self, command_line: &str) -> Result<()> {
         // Validate methylation args
-        let methylation = self.methylation.resolve();
+        let methylation = self.methylation.resolve(self.common.seed);
         self.methylation.validate()?;
 
         info!("Generating grouped reads");
@@ -138,9 +139,7 @@ impl Command for GroupedReads {
         info!("  UMI length: {}", self.common.umi_length);
         info!("  Threads: {}", self.threads);
         if methylation.mode.is_enabled() {
-            info!("  Methylation mode: {:?}", methylation.mode);
-            info!("  CpG methylation rate: {}", methylation.cpg_methylation_rate);
-            info!("  Conversion rate: {}", methylation.conversion_rate);
+            methylation.log_settings();
         }
 
         crate::commands::simulate::common::validate_rate(self.error_rate, "error-rate")?;
@@ -701,6 +700,20 @@ fn generate_molecule_reads(
     let chrom_idx = eff_chrom_idx;
     let local_pos = eff_local_pos;
 
+    // Chemistry acts once on each original strand of the molecule (directional library): every
+    // read of a strand family is a PCR copy of that converted strand, and both mates of a pair
+    // are cut from it.
+    let locus = TemplateLocus {
+        chrom_idx: Some(chrom_idx),
+        contig: ref_genome.contig(chrom_idx),
+        start: local_pos,
+    };
+    let convert_strand = |is_top: bool, rng: &mut _| {
+        shared_template.as_deref().map(|template| {
+            convert_molecule_strand(template, locus, is_top, &params.methylation, rng)
+        })
+    };
+
     let mut pairs = Vec::new();
 
     if params.duplex {
@@ -714,6 +727,8 @@ fn generate_molecule_reads(
 
         // A reads: orientation follows the coin flip
         let a_is_top = is_top_strand;
+        let a_template = convert_strand(a_is_top, &mut rng);
+        let b_template = convert_strand(!is_top_strand, &mut rng);
         for read_idx in 0..a_count {
             let read_name = format!("mol{mol_id:08}_readA{read_idx:04}");
             let mi_tag = format!("{mol_id}/A");
@@ -732,7 +747,7 @@ fn generate_molecule_reads(
                 &params.quality_bias,
                 &params.methylation,
                 params.error_rate,
-                shared_template.as_deref(),
+                a_template.as_deref(),
                 &mut rng,
             );
 
@@ -767,7 +782,7 @@ fn generate_molecule_reads(
                 &params.quality_bias,
                 &params.methylation,
                 params.error_rate,
-                shared_template.as_deref(),
+                b_template.as_deref(),
                 &mut rng,
             );
 
@@ -784,6 +799,7 @@ fn generate_molecule_reads(
     } else {
         // Simplex mode - all reads get same MI tag
         let mi_tag = mol_id.to_string();
+        let template = convert_strand(is_top_strand, &mut rng);
 
         for read_idx in 0..family_size {
             let read_name = format!("mol{mol_id:08}_read{read_idx:04}");
@@ -802,7 +818,7 @@ fn generate_molecule_reads(
                 &params.quality_bias,
                 &params.methylation,
                 params.error_rate,
-                shared_template.as_deref(),
+                template.as_deref(),
                 &mut rng,
             );
 
@@ -839,27 +855,26 @@ fn generate_read_pair_records(
     shared_template: Option<&[u8]>,
     rng: &mut impl Rng,
 ) -> (RawRecord, RawRecord) {
-    // Use shared reference template or generate random per-read.
-    // Avoid copying the shared template — only borrow it.
+    // Use the molecule's shared (already converted) template, or generate and convert a random
+    // one per read. Avoid copying the shared template — only borrow it.
     let random_template;
     let template: &[u8] = if let Some(shared) = shared_template {
         shared
     } else {
-        random_template = generate_random_sequence(insert_size, rng);
+        let random = generate_random_sequence(insert_size, rng);
+        random_template = convert_molecule_strand(
+            &random,
+            TemplateLocus::standalone(&random),
+            is_top_strand,
+            methylation,
+            rng,
+        );
         &random_template
     };
 
-    // Compute forward-read sequence (from start of template, top strand)
+    // Forward-read sequence: the start of the (converted) template.
     let fwd_end = read_length.min(template.len());
-    let mut fwd_seq: Vec<u8> = template[..fwd_end].to_vec();
-    apply_methylation_conversion(
-        &mut fwd_seq,
-        template,
-        0,
-        true, // top strand
-        methylation,
-        rng,
-    );
+    let fwd_seq: Vec<u8> = template[..fwd_end].to_vec();
     let mut fwd_seq = pad_sequence(fwd_seq, read_length, rng);
     // Inject body sequencing errors (SIMU3-01) from a dedicated per-mate RNG (`body_error_rng`)
     // rather than the molecule RNG, so enabling `--error-rate` changes only the read bodies and
@@ -871,19 +886,10 @@ fn generate_read_pair_records(
         introduce_errors_inplace(&mut fwd_seq, error_rate, &mut err_rng);
     }
 
-    // Compute reverse-read sequence (from end of template, bottom strand, revcomped)
+    // Reverse-read sequence: the end of the (converted) template, reverse-complemented.
     let rev_start = insert_size.saturating_sub(read_length);
     let rev_end = read_length.min(template.len().saturating_sub(rev_start));
-    let mut rev_template: Vec<u8> = template[rev_start..rev_start + rev_end].to_vec();
-    apply_methylation_conversion(
-        &mut rev_template,
-        template,
-        rev_start,
-        false, // bottom strand
-        methylation,
-        rng,
-    );
-    let rev_seq = reverse_complement(&rev_template);
+    let rev_seq = reverse_complement(&template[rev_start..rev_start + rev_end]);
     let mut rev_seq = pad_sequence(rev_seq, read_length, rng);
     if error_rate > 0.0 {
         let mut err_rng = body_error_rng(read_name, false);
@@ -1034,6 +1040,9 @@ mod tests {
         mode: fgumi_consensus::MethylationMode::Disabled,
         cpg_methylation_rate: 0.75,
         conversion_rate: 0.98,
+        hemimethylation_rate: 0.0,
+        failure_rate: 0.0,
+        table_seed: 0,
     };
 
     /// Decode a raw BAM record into a noodles `RecordBuf` for higher-level test
@@ -1129,6 +1138,98 @@ mod tests {
         let record = to_record_buf(&raw);
         assert_eq!(record.sequence().as_ref(), expected_seq);
         assert_eq!(record.quality_scores().as_ref(), expected_quals);
+    }
+
+    /// Directional library physics for duplex families: each strand family (A, B) is PCR
+    /// copies of one converted original strand, converted once, with both mates cut from it.
+    /// In genomic orientation a top-strand family shows only C→T on both mates and a
+    /// bottom-strand family only G→A.
+    #[test]
+    fn test_methylation_mates_share_one_converted_strand() {
+        use std::collections::HashMap;
+        use std::io::Write as IoWrite;
+        use tempfile::NamedTempFile;
+
+        let mut contig_rng = create_rng(Some(99));
+        let contig: Vec<u8> = (0..4000).map(|_| b"ACGT"[contig_rng.random_range(0..4)]).collect();
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&contig).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+        let ref_genome = ReferenceGenome::load(fasta.path()).unwrap();
+
+        let params = GenerationParams {
+            read_length: 50,
+            umi_length: 8,
+            mapq: 60,
+            duplex: true,
+            min_family_size: 6,
+            quality_model: PositionQualityModel::default(),
+            quality_bias: ReadPairQualityBias::default(),
+            family_dist: FamilySizeDistribution::log_normal(10.0, 1.0),
+            // Shorter than two read lengths, so the mates overlap.
+            insert_model: InsertSizeModel::new(70.0, 5.0, 60, 80),
+            strand_bias_model: StrandBiasModel::no_bias(),
+            methylation: MethylationConfig {
+                mode: fgumi_consensus::MethylationMode::EmSeq,
+                cpg_methylation_rate: 0.5,
+                conversion_rate: 0.5,
+                hemimethylation_rate: 0.0,
+                failure_rate: 0.0,
+                table_seed: 5,
+            },
+            error_rate: 0.0,
+        };
+
+        let mut strands_seen = std::collections::BTreeSet::new();
+        // Strands on which at least one conversion was seen.
+        let mut converted = std::collections::BTreeSet::new();
+        let mut overlapped = 0usize;
+        for seed in 0..10u64 {
+            let (pairs, _chrom, _pos) =
+                generate_molecule_reads(0, seed, 0, 1000, &params, &ref_genome);
+            let mut families: HashMap<String, (Vec<u8>, Vec<u8>)> = HashMap::new();
+            for (r1, r2, _name, _umi, mi, is_top_strand, _insert) in &pairs {
+                let (r1, r2) = (to_record_buf(r1), to_record_buf(r2));
+                let allowed = if *is_top_strand { (b'C', b'T') } else { (b'G', b'A') };
+                for mate in [&r1, &r2] {
+                    let bases = mate.sequence().as_ref();
+                    let start = mate.alignment_start().unwrap().get() - 1;
+                    let subs: std::collections::BTreeSet<(u8, u8)> = bases
+                        .iter()
+                        .zip(&contig[start..])
+                        .filter(|(b, c)| b != c)
+                        .map(|(&b, &c)| (c, b))
+                        .collect();
+                    assert!(
+                        subs.iter().all(|&sub| sub == allowed),
+                        "{mi} top={is_top_strand}: mate shows {subs:?}, expected only {allowed:?}"
+                    );
+                    if subs.contains(&allowed) {
+                        converted.insert(*is_top_strand);
+                    }
+                }
+                // Both mates are cut from one converted copy, so where they overlap they show
+                // the same bases (two separate conversions would differ at some cytosine).
+                let start = |m: &noodles::sam::alignment::RecordBuf| {
+                    m.alignment_start().expect("mapped").get() - 1
+                };
+                let (s1, s2) = (start(&r1), start(&r2));
+                let (q1, q2) = (r1.sequence().as_ref(), r2.sequence().as_ref());
+                for pos in s1.max(s2)..(s1 + q1.len()).min(s2 + q2.len()) {
+                    assert_eq!(q1[pos - s1], q2[pos - s2], "mates differ at {pos}");
+                    overlapped += 1;
+                }
+                let bodies = (r1.sequence().as_ref().to_vec(), r2.sequence().as_ref().to_vec());
+                let family = families.entry(mi.clone()).or_insert_with(|| bodies.clone());
+                assert_eq!(*family, bodies, "{mi}: family reads differ");
+                strands_seen.insert(*is_top_strand);
+            }
+        }
+        assert_eq!(strands_seen.len(), 2, "both strands exercised");
+        assert_eq!(converted.len(), 2, "a conversion must be seen on both strands");
+        assert!(overlapped > 0, "mates must overlap");
     }
 
     #[test]
@@ -1689,148 +1790,6 @@ mod tests {
 
     // ========================================================================
     // Methylation tests
-    // ========================================================================
-
-    #[test]
-    fn test_emseq_grouped_reads_strand_conversion() {
-        // Top strand: R1=top (C->T), R2=bottom (G->A then RC)
-        // Template: non-CpG Cs at known positions
-        let template = b"CACACACACACACACAC"; // no CpG
-        let config = MethylationConfig {
-            mode: fgumi_consensus::MethylationMode::EmSeq,
-            cpg_methylation_rate: 0.75,
-            conversion_rate: 1.0,
-        };
-
-        let quality_model = PositionQualityModel::default();
-        let quality_bias = ReadPairQualityBias::default();
-        let mut rng = create_rng(Some(42));
-
-        let (r1_raw, _r2_raw) = generate_read_pair_records(
-            "test_meth",
-            "AAAAAAAA",
-            "1/A",
-            0, // chrom_idx
-            0, // local_pos
-            template.len(),
-            template.len(),
-            60,
-            true, // is_top_strand
-            &quality_model,
-            &quality_bias,
-            &config,
-            0.0,
-            Some(template),
-            &mut rng,
-        );
-        let r1 = to_record_buf(&r1_raw);
-
-        // R1 (top strand, forward) should have C->T conversions at non-CpG C positions
-        let r1_seq: Vec<u8> = r1.sequence().as_ref().to_vec();
-        for (i, &b) in template.iter().enumerate() {
-            if i >= r1_seq.len() {
-                break;
-            }
-            if b == b'C' {
-                assert_eq!(r1_seq[i], b'T', "R1 position {i}: non-CpG C should convert to T");
-            }
-        }
-    }
-
-    #[test]
-    fn test_bottom_strand_flips_conversion_orientation() {
-        // Bottom strand: R1 gets reverse-complemented sequence from end of template
-        // Top strand: R1 gets forward sequence from start of template
-        // Template needs both C and G (non-CpG) so both strands have convertible bases
-        let template = b"CATAGATAGATAGATA"; // has C and G, no CpG dinucleotides
-        let emseq_config = MethylationConfig {
-            mode: fgumi_consensus::MethylationMode::EmSeq,
-            cpg_methylation_rate: 0.75,
-            conversion_rate: 1.0,
-        };
-        let disabled_config = DISABLED_METHYLATION;
-
-        let quality_model = PositionQualityModel::default();
-        let quality_bias = ReadPairQualityBias::default();
-
-        // Generate top strand pair (F1R2)
-        let mut rng_a = create_rng(Some(42));
-        let (r1_a_raw, _) = generate_read_pair_records(
-            "test",
-            "AAAAAAAA",
-            "1/A",
-            0, // chrom_idx
-            0, // local_pos
-            template.len(),
-            template.len(),
-            60,
-            true, // is_top_strand
-            &quality_model,
-            &quality_bias,
-            &emseq_config,
-            0.0,
-            Some(template),
-            &mut rng_a,
-        );
-
-        // Generate bottom strand pair with disabled methylation to check it differs
-        let mut rng_b = create_rng(Some(42));
-        let (r1_b_no_meth_raw, _) = generate_read_pair_records(
-            "test",
-            "AAAAAAAA",
-            "1/B",
-            0, // chrom_idx
-            0, // local_pos
-            template.len(),
-            template.len(),
-            60,
-            false, // is_top_strand (bottom strand)
-            &quality_model,
-            &quality_bias,
-            &disabled_config,
-            0.0,
-            Some(template),
-            &mut rng_b,
-        );
-
-        // Generate bottom strand pair with EM-Seq
-        let mut rng_b2 = create_rng(Some(42));
-        let (r1_b_meth_raw, _) = generate_read_pair_records(
-            "test",
-            "AAAAAAAA",
-            "1/B",
-            0, // chrom_idx
-            0, // local_pos
-            template.len(),
-            template.len(),
-            60,
-            false, // is_top_strand (bottom strand)
-            &quality_model,
-            &quality_bias,
-            &emseq_config,
-            0.0,
-            Some(template),
-            &mut rng_b2,
-        );
-
-        // Top strand R1 (forward, top) should differ from bottom strand R1 (reverse, revcomped)
-        let r1_a_seq: Vec<u8> = to_record_buf(&r1_a_raw).sequence().as_ref().to_vec();
-        let r1_b_seq: Vec<u8> = to_record_buf(&r1_b_meth_raw).sequence().as_ref().to_vec();
-        // Bottom strand R1 is reverse-complemented from end of template with bottom-strand
-        // methylation, so conversion pattern should differ from top strand R1
-        assert_ne!(r1_a_seq, r1_b_seq, "Top and bottom strand R1 should differ");
-
-        // Bottom strand with methylation should differ from bottom strand without
-        let r1_b_no_meth_seq: Vec<u8> =
-            to_record_buf(&r1_b_no_meth_raw).sequence().as_ref().to_vec();
-        assert_ne!(
-            r1_b_seq, r1_b_no_meth_seq,
-            "Bottom strand with/without methylation should differ"
-        );
-    }
-
-    // ========================================================================
-    // Real reference coordinate tests
     // ========================================================================
 
     #[test]

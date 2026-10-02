@@ -421,9 +421,9 @@ pub fn consensus_pregroup_keep_raw(raw: &[u8], allow_unmapped: bool) -> bool {
 #[derive(Debug, Clone, Default, Args)]
 pub struct EmSeqOptions {
     /// Enable EM-Seq (enzymatic methyl-seq) methylation-aware consensus calling.
-    /// Requires --ref. C→T conversions at reference cytosine positions are treated
-    /// as bisulfite/enzymatic conversion, and cu/ct per-base count tags
-    /// and MM/ML methylation tags are emitted on consensus reads.
+    /// Requires --ref. Consensus reads carry per-base cu/ct counts of the unconverted and
+    /// converted bases at their methylation sites; a simplex consensus keeps the observed
+    /// (converted) bases, and a duplex consensus is the molecule's sequence with MM/ML.
     #[arg(long = "em-seq", default_value_t = false, requires = "reference")]
     pub em_seq: bool,
 

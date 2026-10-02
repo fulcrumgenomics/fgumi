@@ -24,6 +24,14 @@ Definitions of the terms and tags used throughout this guide.
 
 **Pre-UMI / post-UMI error rate.** The consensus model splits sequencing error into errors that occur *before* the UMI is integrated into the molecule (`--error-rate-pre-umi`) and *after* (`--error-rate-post-umi`). See [Consensus Calling](consensus-calling.md).
 
+**CpG.** A C followed by a G. Each CpG site has one cytosine on each strand, methylated independently. See [Methylation Concepts](methylation-concepts.md).
+
+**Informative position.** A position where a read can show methylation. For simplex, reference C for Read 1 (C→T) and reference G for Read 2 (G→A), in read orientation, for a directional library; for duplex, the molecule's confirmed C or G.
+
+**Hemimethylation.** A CpG methylated on one strand only.
+
+**Reference-anchored / molecule-based.** Simplex methylation calls find cytosines from the reference; two-strand duplex calls find them from the molecule's own two strands.
+
 ## Strand labels
 
 **`/A` and `/B`.** Suffixes on the `MI` tag that `fgumi group --strategy paired` assigns to the two single-strand sub-families of one duplex molecule (e.g. `1/A` and `1/B`). The `/A` sub-family is the read pair whose read 1 5′ end comes at or before read 2's, ignoring soft-clipping and reference strand. See [Tracking Reads](tracking-reads.md).
@@ -40,5 +48,7 @@ Definitions of the terms and tags used throughout this guide.
 | `MI` | `group` | Molecule ID assigning each read to a UMI family; carries `/A`·`/B` suffixes under the `paired` strategy. |
 | `CB` | upstream | Cell barcode for single-cell data; reads are partitioned by `CB` before grouping, sorting, and deduplication. Not corrected by fgumi. |
 | `tc` | `zipper` | Template-coordinate sort key added to secondary/supplementary reads so they sort and deduplicate correctly. (Releases before 0.2.0 wrote this under the name `pa`, since renamed to avoid a clash with bwa-mem's `pa:f` score tag.) |
+
+With `--methylation-mode`, consensus callers also add methylation tags: `cu`/`ct` (reads showing the unconverted / converted base at each informative position), the per-strand `au`/`at`/`bu`/`bt` on duplex, and on duplex the SAM-spec `MM`/`ML`/`MN` plus per-strand `am`/`bm`. A duplex record with `bD` = 0 was built from one strand only. See [Methylation Pipeline Guide](methylation.md#output-tags).
 
 Consensus callers add a family of per-read and per-base tags (`cD`, `cM`, `cE`, `cd`, `ce`, and the `a*`/`b*` single-strand variants for duplex). See [Tracking Reads](tracking-reads.md) for the full scheme.

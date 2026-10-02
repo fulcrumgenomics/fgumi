@@ -1,3 +1,16 @@
+/// Converts raw BAM u32 CIGAR ops to `(Kind, length)` pairs, keeping every operation as it is
+/// (clips included). Reserved op codes (9-15) are skipped.
+#[must_use]
+pub fn cigar_from_raw(
+    cigar_ops: &[u32],
+) -> Vec<(noodles::sam::alignment::record::cigar::op::Kind, usize)> {
+    cigar_ops
+        .iter()
+        .filter(|&&raw_op| raw_op & 0xF <= 8)
+        .map(|&raw_op| (crate::cigar::cigar_op_kind(raw_op), (raw_op >> 4) as usize))
+        .collect()
+}
+
 /// Simplify CIGAR operations from raw BAM u32 ops.
 ///
 /// Same logic as `cigar_utils::simplify_cigar` but operates on raw BAM CIGAR
@@ -12,26 +25,9 @@ pub fn simplify_cigar_from_raw(
 ) -> Vec<(noodles::sam::alignment::record::cigar::op::Kind, usize)> {
     use noodles::sam::alignment::record::cigar::op::Kind;
 
-    let mut simplified = Vec::new();
+    let mut simplified: Vec<(Kind, usize)> = Vec::new();
 
-    for &raw_op in cigar_ops {
-        let op_len = (raw_op >> 4) as usize;
-        let op_type = raw_op & 0xF;
-
-        // Map BAM CIGAR op to Kind
-        let kind = match op_type {
-            0 => Kind::Match,
-            1 => Kind::Insertion,
-            2 => Kind::Deletion,
-            3 => Kind::Skip,
-            4 => Kind::SoftClip,
-            5 => Kind::HardClip,
-            6 => Kind::Pad,
-            7 => Kind::SequenceMatch,
-            8 => Kind::SequenceMismatch,
-            _ => continue,
-        };
-
+    for (kind, op_len) in cigar_from_raw(cigar_ops) {
         // Simplify: convert S, =, X, H to M
         let new_kind = match kind {
             Kind::SoftClip | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::HardClip => {
@@ -290,6 +286,39 @@ mod tests {
     // ========================================================================
     // simplify_cigar_from_raw tests
     // ========================================================================
+
+    #[test]
+    fn test_cigar_from_raw_keeps_every_op() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        let cigar = &[
+            encode_op(5, 2),  // 2H
+            encode_op(4, 3),  // 3S
+            encode_op(7, 4),  // 4=
+            encode_op(8, 1),  // 1X
+            encode_op(1, 2),  // 2I
+            encode_op(2, 1),  // 1D
+            encode_op(3, 5),  // 5N
+            encode_op(6, 1),  // 1P
+            encode_op(0, 6),  // 6M
+            encode_op(4, 3),  // 3S
+            encode_op(15, 9), // unknown op code: skipped
+        ];
+        assert_eq!(
+            cigar_from_raw(cigar),
+            vec![
+                (Kind::HardClip, 2),
+                (Kind::SoftClip, 3),
+                (Kind::SequenceMatch, 4),
+                (Kind::SequenceMismatch, 1),
+                (Kind::Insertion, 2),
+                (Kind::Deletion, 1),
+                (Kind::Skip, 5),
+                (Kind::Pad, 1),
+                (Kind::Match, 6),
+                (Kind::SoftClip, 3),
+            ]
+        );
+    }
 
     #[test]
     fn test_simplify_cigar_from_raw_basic() {

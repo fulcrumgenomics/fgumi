@@ -205,6 +205,7 @@ use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, RejectionReason, clamp_combined_error_to_fgbio_short,
     clamp_per_base_to_fgbio_short, consensus_read_name_too_long_context, write_consensus_read_name,
 };
+use crate::methylation::ConversionPattern;
 use crate::phred::MAX_PHRED;
 use crate::phred::{MIN_PHRED, PhredScore};
 use crate::simple_umi::consensus_umis;
@@ -257,9 +258,6 @@ pub struct DuplexConsensusRead {
 
     /// BA strand single-strand consensus (optional - may be absent for SS-only molecules)
     pub ba_consensus: Option<VanillaConsensusRead>,
-
-    /// Combined duplex methylation annotation (only populated when methylation mode is enabled)
-    pub methylation: Option<crate::methylation::MethylationAnnotation>,
 
     /// True when only the BA strand contributed (the BA consensus is stored in `ab_consensus`).
     /// Used to emit methylation tags with the correct strand orientation.
@@ -332,6 +330,32 @@ pub struct DuplexConsensusCaller {
     rejected_reads: Vec<Vec<u8>>,
     /// Whether to track rejected reads
     track_rejects: bool,
+}
+
+/// A strand consensus's bases in the duplex SEQ convention: in methylation mode its calls
+/// (positions the other strand confirmed, or a single-strand record's reference-informative
+/// positions) are restored to the unconverted base, as the duplex SEQ is.
+fn methylation_strand_bases(strand: &VanillaConsensusRead) -> std::borrow::Cow<'_, [u8]> {
+    match &strand.methylation {
+        Some(annotation) => {
+            let mut bases = strand.bases.clone();
+            crate::methylation::restore_unconverted_bases(&mut bases, annotation);
+            std::borrow::Cow::Owned(bases)
+        }
+        _ => std::borrow::Cow::Borrowed(&strand.bases),
+    }
+}
+
+/// A methylation call at one position of a two-strand duplex (see
+/// [`DuplexConsensusCaller::molecule_call`]).
+#[derive(Debug, Clone, Copy)]
+struct MoleculeCall {
+    /// The informative input's conversion pattern.
+    pattern: ConversionPattern,
+    /// The informative input's base (unconverted or converted).
+    call: u8,
+    /// The molecule's base confirmed by the other input (`C` or `G`).
+    confirmed: u8,
 }
 
 #[expect(
@@ -533,6 +557,8 @@ impl DuplexConsensusCaller {
     ) {
         self.ss_caller.options.methylation_mode = methylation_mode;
         self.ss_caller.set_reference(reference, ref_names);
+        // Two-strand calls are decided from the molecule, so the strands count everywhere.
+        self.ss_caller.set_methylation_count_all_positions(true);
     }
 
     /// Returns the rejected reads as raw BAM bytes
@@ -892,24 +918,39 @@ impl DuplexConsensusCaller {
         source_base != NO_CALL && consensus_base != NO_CALL && source_base != consensus_base
     }
 
-    /// Returns true if two bases represent a C/T conversion pair (or G/A on reverse strand).
-    /// In EM-Seq, unmethylated C→T conversion creates C vs T disagreements at ref-C positions.
-    #[inline]
-    fn is_conversion_pair(base1: u8, base2: u8) -> bool {
-        matches!(
-            (base1.to_ascii_uppercase(), base2.to_ascii_uppercase()),
-            (b'C', b'T') | (b'T', b'C') | (b'G', b'A') | (b'A', b'G')
-        )
+    /// A single-strand consensus used alone as a duplex record, with its methylation counts
+    /// gated to the reference-informative positions (there is no second strand to confirm the
+    /// molecule, so it calls like simplex).
+    fn gated_single_strand(consensus: &VanillaConsensusRead) -> VanillaConsensusRead {
+        let mut gated = consensus.clone();
+        if let Some(annotation) = gated.methylation.as_mut() {
+            crate::methylation::gate_to_informative(annotation);
+        }
+        gated
     }
 
-    /// Returns the unconverted base from a conversion pair.
-    /// C/T → C, G/A → G (the reference/unconverted base).
-    #[inline]
-    fn unconverted_base(base1: u8, base2: u8) -> u8 {
-        match (base1.to_ascii_uppercase(), base2.to_ascii_uppercase()) {
-            (b'C', b'T') | (b'T', b'C') => b'C',
-            (b'G', b'A') | (b'A', b'G') => b'G',
-            _ => base1, // fallback, shouldn't happen after is_conversion_pair check
+    /// The methylation call at one position of a two-strand duplex, if any.
+    ///
+    /// `ct_base`/`ga_base` are the C→T and G→A inputs' bases there (same read orientation).
+    /// The G→A input cannot convert a cytosine of the molecule's C→T-read strand, so where it
+    /// shows `C` it confirms that the molecule has `C` and the C→T input carries the call;
+    /// likewise the C→T input confirms a `G` for the G→A input. A valid call is the informative
+    /// input's unconverted or converted base. Both confirmations at once (a C/G conflict), an
+    /// invalid base, or no confirmation is no call.
+    fn molecule_call(ct_base: u8, ga_base: u8) -> Option<MoleculeCall> {
+        let (ct, ga) = (ct_base.to_ascii_uppercase(), ga_base.to_ascii_uppercase());
+        match (ga == b'C', ct == b'G') {
+            (true, false) if matches!(ct, b'C' | b'T') => Some(MoleculeCall {
+                pattern: ConversionPattern::CToT,
+                call: ct_base,
+                confirmed: b'C',
+            }),
+            (false, true) if matches!(ga, b'G' | b'A') => Some(MoleculeCall {
+                pattern: ConversionPattern::GToA,
+                call: ga_base,
+                confirmed: b'G',
+            }),
+            _ => None,
         }
     }
 
@@ -948,28 +989,27 @@ impl DuplexConsensusCaller {
 
         match (ab_filtered, ba_filtered) {
             (Some(a), None) => {
-                // Only AB strand - use it directly
+                // Only AB strand - use it directly. With no second strand to confirm the
+                // molecule it calls like simplex: counts only at reference-informative positions.
                 Some(DuplexConsensusRead {
                     id: a.id.clone(),
                     bases: a.bases.clone(),
                     quals: a.quals.clone(),
                     errors: a.errors.clone(),
-                    ab_consensus: a.clone(),
+                    ab_consensus: Self::gated_single_strand(a),
                     ba_consensus: None,
-                    methylation: a.methylation.clone(),
                     is_ba_only: false,
                 })
             }
             (None, Some(b)) => {
-                // Only BA strand - use it directly
+                // Only BA strand - use it directly, gated as above.
                 Some(DuplexConsensusRead {
                     id: b.id.clone(),
                     bases: b.bases.clone(),
                     quals: b.quals.clone(),
                     errors: b.errors.clone(),
-                    ab_consensus: b.clone(),
+                    ab_consensus: Self::gated_single_strand(b),
                     ba_consensus: None,
-                    methylation: b.methylation.clone(),
                     is_ba_only: true,
                 })
             }
@@ -979,6 +1019,18 @@ impl DuplexConsensusCaller {
                 let mut bases = Vec::with_capacity(len);
                 let mut quals = Vec::with_capacity(len);
                 let mut errors = Vec::with_capacity(len);
+                // Per-strand methylation evidence, kept below only at methylation calls. The
+                // C→T and G→A inputs are told apart by pattern (in the duplex R2 record the
+                // C→T input is the BA strand); without both there is no confirming strand, so
+                // no calls.
+                let mut a_meth = a.methylation.as_ref().map(|m| m.truncate(len));
+                let mut b_meth = b.methylation.as_ref().map(|m| m.truncate(len));
+                let ct_input_is_a = match (&a_meth, &b_meth) {
+                    (Some(first), Some(second)) if first.pattern != second.pattern => {
+                        Some(first.pattern == ConversionPattern::CToT)
+                    }
+                    _ => None,
+                };
 
                 for i in 0..len {
                     let a_base = a.bases[i];
@@ -986,25 +1038,53 @@ impl DuplexConsensusCaller {
                     let a_qual = i32::from(a.quals[i]);
                     let b_qual = i32::from(b.quals[i]);
 
-                    // Check for EM-Seq conversion artifact: at a ref-C position,
-                    // one strand shows T (converted) and the other shows C (unconverted).
-                    // This is expected bisulfite/enzymatic conversion, not a real error.
-                    // Call the unconverted base (C) and sum qualities (treat as agreement).
-                    let is_ref_c = a
-                        .methylation
-                        .as_ref()
-                        .is_some_and(|m| m.evidence.get(i).is_some_and(|ev| ev.is_ref_c))
-                        || b.methylation
-                            .as_ref()
-                            .is_some_and(|m| m.evidence.get(i).is_some_and(|ev| ev.is_ref_c));
-                    let is_conversion_artifact =
-                        a_base != b_base && is_ref_c && Self::is_conversion_pair(a_base, b_base);
+                    // At a methylation call only the informative input keeps its counts; every
+                    // other position keeps none.
+                    let informative_call = ct_input_is_a.and_then(|ct_is_a| {
+                        let (ct_base, ga_base) =
+                            if ct_is_a { (a_base, b_base) } else { (b_base, a_base) };
+                        Self::molecule_call(ct_base, ga_base)
+                    });
+                    // Whether the reference has the cytosine the call is at (read before the
+                    // evidence is rewritten below).
+                    let reference_has_cytosine = informative_call.is_some_and(|c| {
+                        [a_meth.as_ref(), b_meth.as_ref()]
+                            .into_iter()
+                            .flatten()
+                            .any(|m| m.pattern == c.pattern && m.evidence[i].informative)
+                    });
+                    for meth in [a_meth.as_mut(), b_meth.as_mut()].into_iter().flatten() {
+                        let ev = &mut meth.evidence[i];
+                        if informative_call.is_some_and(|c| c.pattern == meth.pattern) {
+                            ev.informative = true;
+                        } else {
+                            *ev = crate::methylation::MethylationEvidence::default();
+                        }
+                    }
 
                     // Calculate raw consensus base and quality (fgbio algorithm)
-                    let (raw_base, raw_qual) = if is_conversion_artifact {
-                        // Conversion artifact: call unconverted base, sum qualities
-                        let unconverted = Self::unconverted_base(a_base, b_base);
-                        (unconverted, Self::cap_quality(a_qual + b_qual))
+                    // A call is agreement on the molecule's base: the confirmed base, with the
+                    // summed quality. Where the informative strand shows the converted base and
+                    // the reference has no cytosine there, the pair is either an unmethylated
+                    // cytosine the reference lacks or a T:A (A:T) pair with one error on the
+                    // confirming strand, and only the confirming strand supports the cytosine:
+                    // the base takes that strand's quality alone.
+                    let (raw_base, raw_qual) = if let Some(c) = informative_call {
+                        let (_, _, converted) = c.pattern.bases();
+                        let confirming_qual = if (c.pattern == ConversionPattern::CToT)
+                            == (ct_input_is_a == Some(true))
+                        {
+                            b_qual
+                        } else {
+                            a_qual
+                        };
+                        let qual =
+                            if c.call.eq_ignore_ascii_case(&converted) && !reference_has_cytosine {
+                                Self::cap_quality(confirming_qual)
+                            } else {
+                                Self::cap_quality(a_qual + b_qual)
+                            };
+                        (c.confirmed, qual)
                     } else if a_base == b_base {
                         // Agreement: sum qualities (capped)
                         (a_base, Self::cap_quality(a_qual + b_qual))
@@ -1029,10 +1109,31 @@ impl DuplexConsensusCaller {
                     bases.push(final_base);
                     quals.push(final_qual);
 
-                    // Calculate errors — conversion artifacts are not counted
-                    let error_count = if is_conversion_artifact {
-                        // Conversion artifacts: treat as agreement, no errors
-                        0u16
+                    let error_count = if let Some(c) = informative_call {
+                        // Each source read is compared with what its own strand should show:
+                        // the call on the informative strand, the confirmed base on the other.
+                        if let Some(source_reads) = source_reads {
+                            let num_errors = source_reads
+                                .iter()
+                                .filter(|sr| {
+                                    let expected = if ConversionPattern::from_read_flags(sr.flags)
+                                        == c.pattern
+                                    {
+                                        c.call
+                                    } else {
+                                        c.confirmed
+                                    };
+                                    sr.bases.len() > i && Self::is_error(sr.bases[i], expected)
+                                })
+                                .count();
+                            clamp_combined_error_to_fgbio_short(
+                                i64::try_from(num_errors).unwrap_or(i64::MAX),
+                            )
+                        } else {
+                            clamp_combined_error_to_fgbio_short(
+                                i64::from(a.errors[i]) + i64::from(b.errors[i]),
+                            )
+                        }
                     } else if let Some(source_reads) = source_reads {
                         // Exact method: count disagreements with source reads
                         let mut num_errors = 0i32;
@@ -1070,7 +1171,7 @@ impl DuplexConsensusCaller {
                     depths: a.depths[..len].to_vec(),
                     errors: a.errors[..len].to_vec(),
                     source_reads: None,
-                    methylation: a.methylation.as_ref().map(|m| m.truncate(len)),
+                    methylation: a_meth,
                 };
 
                 let ba_truncated = VanillaConsensusRead {
@@ -1080,16 +1181,7 @@ impl DuplexConsensusCaller {
                     depths: b.depths[..len].to_vec(),
                     errors: b.errors[..len].to_vec(),
                     source_reads: None,
-                    methylation: b.methylation.as_ref().map(|m| m.truncate(len)),
-                };
-
-                // Combine methylation from both strands if present
-                let methylation = match (&a.methylation, &b.methylation) {
-                    (Some(ab_meth), Some(ba_meth)) => Some(
-                        crate::methylation::combine_methylation_annotations(ab_meth, ba_meth, len),
-                    ),
-                    (Some(m), None) | (None, Some(m)) => Some(m.truncate(len)),
-                    (None, None) => None,
+                    methylation: b_meth,
                 };
 
                 Some(DuplexConsensusRead {
@@ -1099,7 +1191,6 @@ impl DuplexConsensusCaller {
                     errors,
                     ab_consensus: ab_truncated,
                     ba_consensus: Some(ba_truncated),
-                    methylation,
                     is_ba_only: false,
                 })
             }
@@ -1173,11 +1264,32 @@ impl DuplexConsensusCaller {
 
         // Build the record (name, flags, bases, quals)
         write_consensus_read_name(read_name_buf, read_name_prefix, umi);
+        // Per-strand methylation annotations (restored into SEQ and listed in MM/ML).
+        let strand_annotations: Vec<&crate::methylation::MethylationAnnotation> = [
+            consensus.ab_consensus.methylation.as_ref(),
+            consensus.ba_consensus.as_ref().and_then(|ba| ba.methylation.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        // A duplex consensus establishes the molecule's genotype (a C>T mutation shows on both
+        // strands and carries no methylation evidence), so SEQ is the molecule's sequence and
+        // methylation is carried by MM/ML. A two-strand record already holds the confirmed base
+        // at each call; a single-strand record has its calls restored to the unconverted base.
+        let molecule_seq = !strand_annotations.is_empty();
+        let methylation_tags = molecule_seq.then(|| {
+            crate::methylation::duplex_methylation_tags(
+                &consensus.bases,
+                &strand_annotations,
+                methylation_mode,
+            )
+        });
+        let emitted_bases: &[u8] = methylation_tags.as_ref().map_or(&consensus.bases, |t| &t.seq);
         // The UMI is input-derived, so an over-long name is bad data rather than
         // a bug; propagate instead of panicking mid-write, naming the offending read so the
         // failing molecule is findable in a batch run.
         builder
-            .try_build_record(read_name_buf, flag, &consensus.bases, &consensus.quals)
+            .try_build_record(read_name_buf, flag, emitted_bases, &consensus.quals)
             .with_context(|| consensus_read_name_too_long_context(read_name_buf))?;
 
         // 1. MI tag (string)
@@ -1195,6 +1307,9 @@ impl DuplexConsensusCaller {
         // Calculate AB strand metrics
         let ab = &consensus.ab_consensus;
         let ba_opt = consensus.ba_consensus.as_ref();
+        // Per-strand bases (`ac`/`bc`) follow the SEQ convention: in methylation mode each
+        // strand's calls are restored (`methylation_strand_bases`), so a strand that saw a
+        // conversion agrees with the strand that confirms the molecule's base.
 
         // Clamp each per-base depth to fgbio's `Short` ceiling before max/min, so the
         // scalar aD/aM match fgbio (which derives them from its capped `Array[Short]`).
@@ -1218,7 +1333,7 @@ impl DuplexConsensusCaller {
 
         // 5. Per-base AB tags if requested
         if produce_per_base_tags {
-            builder.append_string_tag(SamTag::AC, &ab.bases);
+            builder.append_string_tag(SamTag::AC, &methylation_strand_bases(ab));
 
             let ab_depths_i16: Vec<i16> =
                 ab.depths.iter().map(|&d| i16::try_from(d).unwrap_or(i16::MAX)).collect();
@@ -1259,7 +1374,7 @@ impl DuplexConsensusCaller {
 
         // 7. Per-base BA tags if requested and BA strand exists
         if produce_per_base_tags && let Some(ba) = ba_opt {
-            builder.append_string_tag(SamTag::BC_BASES, &ba.bases);
+            builder.append_string_tag(SamTag::BC_BASES, &methylation_strand_bases(ba));
 
             let ba_depths_i16: Vec<i16> =
                 ba.depths.iter().map(|&d| i16::try_from(d).unwrap_or(i16::MAX)).collect();
@@ -1335,66 +1450,38 @@ impl DuplexConsensusCaller {
             builder.append_string_tag(SamTag::RX, consensus_umi.as_bytes());
         }
 
-        // 9b. Methylation tags (EM-Seq/TAPs)
-        if let Some(combined_annot) = &consensus.methylation {
+        // 9b. Methylation tags (EM-Seq/TAPs). Counts are always written; MM/ML (and the per-strand
+        // am/bm) describe modifications of bases present in SEQ, so they are written against the
+        // emitted (restored) bases.
+        if let Some(tags) = &methylation_tags {
             // When is_ba_only is true, the BA consensus was stored in ab_consensus
-            // (no AB strand existed), so per-strand tags must use bottom-strand orientation.
-            let is_top_strand = !consensus.is_ba_only;
-
-            // Per-strand methylation tags
-            if let Some(ab_annot) = &consensus.ab_consensus.methylation {
-                // Use correct strand tags: am/au/at for top strand, bm/bu/bt for bottom strand
-                let (mm_tag, u_tag, t_tag): (SamTag, SamTag, SamTag) = if is_top_strand {
-                    (SamTag::AM_BASES, SamTag::AU, SamTag::AT)
-                } else {
-                    (SamTag::BM_BASES, SamTag::BU, SamTag::BT)
-                };
-                if let Some(mm_val) = crate::methylation::build_mm_tag_no_ml(
-                    &consensus.ab_consensus.bases,
-                    ab_annot,
-                    is_top_strand,
-                    methylation_mode,
-                ) {
-                    builder.append_string_tag(mm_tag, mm_val.as_bytes());
-                }
-                let u_counts = ab_annot.unconverted_counts();
-                let t_counts = ab_annot.converted_counts();
-                builder.append_i16_array_tag(u_tag, &u_counts);
-                builder.append_i16_array_tag(t_tag, &t_counts);
-            }
-
-            if let Some(ba) = &consensus.ba_consensus
-                && let Some(ba_annot) = &ba.methylation
+            // (no AB strand existed), so its per-strand tags are the bottom-strand ones.
+            let ab_tags = if consensus.is_ba_only {
+                (SamTag::BM_BASES, SamTag::BU, SamTag::BT)
+            } else {
+                (SamTag::AM_BASES, SamTag::AU, SamTag::AT)
+            };
+            // `tags.strands` follows `strand_annotations`: the AB consensus, then the BA one.
+            for ((mm_tag, u_tag, t_tag), strand) in
+                [ab_tags, (SamTag::BM_BASES, SamTag::BU, SamTag::BT)].into_iter().zip(&tags.strands)
             {
-                if let Some(bm) = crate::methylation::build_mm_tag_no_ml(
-                    &ba.bases,
-                    ba_annot,
-                    false,
-                    methylation_mode,
-                ) {
-                    builder.append_string_tag(SamTag::BM_BASES, bm.as_bytes());
+                if let Some(mm) = &strand.mm {
+                    builder.append_string_tag(mm_tag, mm.as_bytes());
                 }
-                let bu = ba_annot.unconverted_counts();
-                let bt = ba_annot.converted_counts();
-                builder.append_i16_array_tag(SamTag::BU, &bu);
-                builder.append_i16_array_tag(SamTag::BT, &bt);
+                builder.append_i16_array_tag(u_tag, &strand.unconverted);
+                builder.append_i16_array_tag(t_tag, &strand.converted);
             }
 
-            // Combined duplex methylation tags (MM/ML/cu/ct)
-            // Use top strand (AB) orientation for MM tag format
-            if let Some((mm, ml)) = crate::methylation::build_mm_ml_tags(
-                &consensus.bases,
-                combined_annot,
-                is_top_strand,
-                methylation_mode,
-            ) {
+            // Combined MM/ML: one modification group per strand that carries calls.
+            if let Some((mm, ml)) = &tags.mm_ml {
                 builder.append_string_tag(SamTag::MM, mm.as_bytes());
-                builder.append_u8_array_tag(SamTag::ML, &ml);
+                builder.append_u8_array_tag(SamTag::ML, ml);
+                let seq_len =
+                    i32::try_from(emitted_bases.len()).expect("consensus length fits in i32");
+                builder.append_int_tag(SamTag::MN, seq_len);
             }
-            let cu = combined_annot.unconverted_counts();
-            let ct = combined_annot.converted_counts();
-            builder.append_i16_array_tag(SamTag::CU, &cu);
-            builder.append_i16_array_tag(SamTag::CT, &ct);
+            builder.append_i16_array_tag(SamTag::CU, &tags.unconverted);
+            builder.append_i16_array_tag(SamTag::CT, &tags.converted);
         }
 
         // 10. Write to output
@@ -5154,7 +5241,6 @@ mod tests {
             errors: vec![0, 0, 0, 0],
             ab_consensus,
             ba_consensus: Some(ba_consensus),
-            methylation: None,
             is_ba_only: false,
         };
 
@@ -5183,7 +5269,6 @@ mod tests {
             errors: vec![0, 0, 0, 0],
             ab_consensus,
             ba_consensus: None,
-            methylation: None,
             is_ba_only: false,
         };
 
@@ -5222,7 +5307,6 @@ mod tests {
             errors: vec![0, 0, 0, 0],
             ab_consensus,
             ba_consensus: Some(ba_consensus),
-            methylation: None,
             is_ba_only: false,
         };
 
@@ -5250,7 +5334,6 @@ mod tests {
             errors: vec![0, 0, 0, 0],
             ab_consensus,
             ba_consensus: None,
-            methylation: None,
             is_ba_only: false,
         };
 
@@ -5593,7 +5676,6 @@ mod tests {
             errors: vec![0, 0, 0, 0],
             ab_consensus: ab_consensus.clone(),
             ba_consensus: Some(ba_consensus),
-            methylation: None,
             is_ba_only: false,
         };
 
@@ -5612,7 +5694,6 @@ mod tests {
             errors: vec![0, 0, 0, 0],
             ab_consensus,
             ba_consensus: None,
-            methylation: None,
             is_ba_only: false,
         };
 
@@ -5651,7 +5732,6 @@ mod tests {
             errors: vec![0, 0, 0, 0],
             ab_consensus,
             ba_consensus: None,
-            methylation: None,
             is_ba_only: false,
         };
 
@@ -5708,7 +5788,6 @@ mod tests {
             errors: vec![0, 0, 0, 0],
             ab_consensus,
             ba_consensus: None,
-            methylation: None,
             is_ba_only: false,
         };
 
@@ -5842,7 +5921,6 @@ mod tests {
             errors: vec![0, 1, 0, 1],
             ab_consensus: ab_consensus.clone(),
             ba_consensus: None, // BA is None
-            methylation: None,
             is_ba_only: false,
         };
 
@@ -5918,7 +5996,6 @@ mod tests {
             errors: vec![0, 0, 0, 0],
             ab_consensus,
             ba_consensus: Some(ba_consensus),
-            methylation: None,
             is_ba_only: false,
         };
 
@@ -5991,7 +6068,6 @@ mod tests {
             errors: vec![40_000, 0, 0, 0], // duplex per-base error above the ceiling
             ab_consensus,
             ba_consensus: Some(ba_consensus),
-            methylation: None,
             is_ba_only: false,
         };
 
@@ -6102,7 +6178,6 @@ mod tests {
             errors: vec![1, 1, 1, 2],
             ab_consensus: ab_consensus.clone(),
             ba_consensus: Some(ba_consensus),
-            methylation: None,
             is_ba_only: false,
         };
 
@@ -6164,7 +6239,6 @@ mod tests {
             errors: vec![0, 0, 0, 0],
             ab_consensus: ab_consensus.clone(),
             ba_consensus: None,
-            methylation: None,
             is_ba_only: false,
         };
 
@@ -6572,7 +6646,6 @@ mod tests {
             errors: vec![0, 0, 0],
             ab_consensus: ab,
             ba_consensus: Some(ba),
-            methylation: None,
             is_ba_only: false,
         };
 
@@ -6611,7 +6684,6 @@ mod tests {
             errors: vec![0],
             ab_consensus: ab,
             ba_consensus: None,
-            methylation: None,
             is_ba_only: false,
         };
 
@@ -6719,11 +6791,12 @@ mod tests {
 
     // ==================== EM-Seq duplex methylation tests ====================
 
-    /// Helper to create a `VanillaConsensusRead` with methylation annotation.
+    /// Helper to create a `VanillaConsensusRead` with a methylation annotation.
     fn make_ss_consensus_with_methylation(
         bases: Vec<u8>,
         quals: Vec<u8>,
         depths: Vec<u16>,
+        pattern: crate::methylation::ConversionPattern,
         evidence: Vec<crate::methylation::MethylationEvidence>,
     ) -> VanillaConsensusRead {
         VanillaConsensusRead {
@@ -6733,172 +6806,196 @@ mod tests {
             depths,
             errors: vec![0; evidence.len()],
             source_reads: None,
-            methylation: Some(crate::methylation::MethylationAnnotation { evidence }),
+            methylation: Some(crate::methylation::MethylationAnnotation { evidence, pattern }),
         }
     }
 
-    #[test]
-    fn test_duplex_em_seq_unmethylated_no_penalty() {
-        // At a ref-C position:
-        // AB (top strand) shows T (converted), BA (bottom strand, after RC) shows C (unconverted)
-        // This is a conversion artifact — should call C and sum qualities (not penalize)
-        let ab = make_ss_consensus_with_methylation(
-            vec![b'T'], // AB sees T (converted)
-            vec![30],
-            vec![5],
-            vec![crate::methylation::MethylationEvidence {
-                is_ref_c: true,
-                unconverted_count: 0,
-                converted_count: 5,
-            }],
-        );
-        let ba = make_ss_consensus_with_methylation(
-            vec![b'C'], // BA sees C (unconverted, after RC of bottom strand)
-            vec![25],
-            vec![3],
-            vec![crate::methylation::MethylationEvidence {
-                is_ref_c: true,
-                unconverted_count: 3,
-                converted_count: 0,
-            }],
-        );
-
-        let result = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None);
-        let duplex = result.expect("Should produce duplex consensus");
-
-        // Should call C (unconverted base), not T
-        assert_eq!(duplex.bases[0], b'C');
-        // Quality should be summed (30 + 25 = 55), not penalized
-        assert_eq!(duplex.quals[0], 55);
-        // Combined methylation should be present
-        let meth = duplex.methylation.as_ref().expect("Should have methylation");
-        assert!(meth.evidence[0].is_ref_c);
-        // Combined counts: 3 unconverted + 0 unconverted = 3, 0 converted + 5 converted = 5
-        assert_eq!(meth.evidence[0].unconverted_count, 3);
-        assert_eq!(meth.evidence[0].converted_count, 5);
+    /// Evidence at a single position: `(informative, unconverted, converted)`.
+    fn evidence_at(
+        (informative, unconverted, converted): (bool, u32, u32),
+    ) -> crate::methylation::MethylationEvidence {
+        crate::methylation::MethylationEvidence {
+            informative,
+            unconverted_count: unconverted,
+            converted_count: converted,
+        }
     }
 
-    #[test]
-    fn test_duplex_em_seq_methylated_agreement() {
-        // At a ref-C position, both strands show C (methylated) — normal agreement
-        let ab = make_ss_consensus_with_methylation(
-            vec![b'C'],
-            vec![30],
-            vec![5],
-            vec![crate::methylation::MethylationEvidence {
-                is_ref_c: true,
-                unconverted_count: 5,
-                converted_count: 0,
-            }],
-        );
-        let ba = make_ss_consensus_with_methylation(
-            vec![b'C'],
-            vec![25],
-            vec![3],
-            vec![crate::methylation::MethylationEvidence {
-                is_ref_c: true,
-                unconverted_count: 3,
-                converted_count: 0,
-            }],
-        );
+    use crate::methylation::ConversionPattern::{CToT, GToA};
 
-        let result = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None);
-        let duplex = result.expect("Should produce duplex consensus");
-
-        assert_eq!(duplex.bases[0], b'C');
-        // Normal agreement: quality summed
-        assert_eq!(duplex.quals[0], 55);
-        let meth = duplex.methylation.as_ref().expect("Should have methylation");
-        assert_eq!(meth.evidence[0].unconverted_count, 8); // 5 + 3
-        assert_eq!(meth.evidence[0].converted_count, 0);
+    /// One single-strand input to a duplex methylation case: its base and evidence.
+    struct StrandInput {
+        base: u8,
+        evidence: (bool, u32, u32),
     }
 
-    #[test]
-    fn test_duplex_em_seq_bottom_strand_conversion_artifact() {
-        // Bottom strand: ref=G (complement of C on bottom strand)
-        // AB shows G (unconverted), BA shows A (converted after RC)
-        // This is a conversion artifact on the bottom strand.
-        // AB (top strand) does not see this as a ref-C position.
-        // BA (bottom strand) sees it as ref-C (is_ref_c=true).
-        let ab = make_ss_consensus_with_methylation(
-            vec![b'G'],
+    /// Expected duplex call at the single position.
+    struct DuplexCall {
+        base: u8,
+        qual: u8,
+        errors: u16,
+        evidence: (bool, u32, u32),
+    }
+
+    const fn strand(base: u8, evidence: (bool, u32, u32)) -> StrandInput {
+        StrandInput { base, evidence }
+    }
+
+    const fn call(base: u8, qual: u8, errors: u16, evidence: (bool, u32, u32)) -> DuplexCall {
+        DuplexCall { base, qual, errors, evidence }
+    }
+
+    /// At a molecule cytosine only one of the two single-strand consensuses carries the call:
+    /// the C->T (R1-type) input where the molecule has `C`, the G->A (R2-type) input where it
+    /// has `G` (both in read orientation). The other input reads the complementary original
+    /// strand, whose base there cannot convert, so it shows the molecule's base and confirms
+    /// it: the C->T input is informative where the G->A input shows `C`, the G->A input where
+    /// the C->T input shows `G`, whatever the reference says. A valid call is the unconverted
+    /// or converted base on the informative input; the duplex base is the confirmed base with
+    /// summed quality (the confirming input's quality alone where the call is the converted base
+    /// and the reference has no cytosine), and only the informative input keeps its counts there.
+    /// Everywhere else ordinary duplex rules apply and no input keeps methylation counts.
+    ///
+    /// `a` is the first (AB) input, `b` the second (BA) input, both one base long: `a` has
+    /// quality 30 and 5 reads, `b` quality 25 and 3 reads, and neither has errors, so the
+    /// approximate duplex error count is 0 on agreement and the losing input's depth on
+    /// disagreement. Evidence is `(informative, unconverted, converted)`; the inputs' own flags
+    /// are the reference's and do not decide a two-strand call.
+    #[rstest]
+    #[case::x_unmethylated_c_site(CToT, strand(b'T', (true, 0, 5)), strand(b'C', (false, 0, 0)), call(b'C', 55, 0, (true, 0, 5)))]
+    #[case::x_methylated_c_site(CToT, strand(b'C', (true, 5, 0)), strand(b'C', (false, 0, 0)), call(b'C', 55, 0, (true, 5, 0)))]
+    #[case::x_unmethylated_g_site(CToT, strand(b'G', (false, 0, 0)), strand(b'A', (true, 0, 3)), call(b'G', 55, 0, (true, 0, 3)))]
+    #[case::x_methylated_g_site(CToT, strand(b'G', (false, 0, 0)), strand(b'G', (true, 3, 0)), call(b'G', 55, 0, (true, 3, 0)))]
+    #[case::y_unmethylated_g_site(GToA, strand(b'A', (true, 0, 5)), strand(b'G', (false, 0, 0)), call(b'G', 55, 0, (true, 0, 5)))]
+    #[case::y_unmethylated_c_site(GToA, strand(b'C', (false, 0, 0)), strand(b'T', (true, 0, 3)), call(b'C', 55, 0, (true, 0, 3)))]
+    #[case::molecule_c_not_in_reference(CToT, strand(b'T', (false, 0, 5)), strand(b'C', (false, 0, 0)), call(b'C', 25, 0, (true, 0, 5)))]
+    #[case::methylated_molecule_c_not_in_reference(CToT, strand(b'C', (false, 5, 0)), strand(b'C', (false, 0, 0)), call(b'C', 55, 0, (true, 5, 0)))]
+    #[case::molecule_g_not_in_reference(GToA, strand(b'A', (false, 0, 5)), strand(b'G', (false, 0, 0)), call(b'G', 25, 0, (true, 0, 5)))]
+    #[case::molecule_c_not_in_reference_confirmed_by_first(GToA, strand(b'C', (false, 0, 0)), strand(b'T', (false, 0, 3)), call(b'C', 30, 0, (true, 0, 3)))]
+    #[case::other_strand_counts_cleared(CToT, strand(b'T', (true, 0, 5)), strand(b'C', (false, 1, 1)), call(b'C', 55, 0, (true, 0, 5)))]
+    #[case::c_to_t_variant(CToT, strand(b'T', (true, 0, 5)), strand(b'T', (false, 0, 0)), call(b'T', 55, 0, (false, 0, 0)))]
+    #[case::strand_disagreement(CToT, strand(b'T', (true, 0, 5)), strand(b'A', (false, 0, 0)), call(b'T', 5, 3, (false, 0, 0)))]
+    #[case::third_base_at_c_site(CToT, strand(b'A', (true, 0, 0)), strand(b'C', (false, 0, 0)), call(b'A', 5, 3, (false, 0, 0)))]
+    #[case::c_g_conflict(CToT, strand(b'G', (false, 2, 0)), strand(b'C', (false, 0, 0)), call(b'G', 5, 3, (false, 0, 0)))]
+    fn test_duplex_methylation_calls_the_informative_strand(
+        #[case] a_pattern: crate::methylation::ConversionPattern,
+        #[case] a_input: StrandInput,
+        #[case] b_input: StrandInput,
+        #[case] expected: DuplexCall,
+    ) {
+        let b_pattern = if a_pattern == CToT { GToA } else { CToT };
+        let a = make_ss_consensus_with_methylation(
+            vec![a_input.base],
             vec![30],
             vec![5],
-            vec![crate::methylation::MethylationEvidence {
-                is_ref_c: false,
-                unconverted_count: 0,
-                converted_count: 0,
-            }],
+            a_pattern,
+            vec![evidence_at(a_input.evidence)],
         );
-        let ba = make_ss_consensus_with_methylation(
-            vec![b'A'],
+        let b = make_ss_consensus_with_methylation(
+            vec![b_input.base],
             vec![25],
             vec![3],
-            vec![crate::methylation::MethylationEvidence {
-                is_ref_c: true,
-                unconverted_count: 0,
-                converted_count: 3,
-            }],
+            b_pattern,
+            vec![evidence_at(b_input.evidence)],
         );
 
-        let result = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None);
-        let duplex = result.expect("Should produce duplex consensus");
+        let duplex = DuplexConsensusCaller::duplex_consensus(Some(&a), Some(&b), None)
+            .expect("duplex consensus");
 
-        // Should call G (unconverted), not A
-        assert_eq!(duplex.bases[0], b'G');
-        // Quality summed (conversion artifact path)
-        assert_eq!(duplex.quals[0], 55);
-        // Conversion artifacts should not be counted as duplex errors
+        assert_eq!(char::from(duplex.bases[0]), char::from(expected.base), "duplex base");
+        assert_eq!(duplex.quals[0], expected.qual, "duplex quality");
+        assert_eq!(duplex.errors[0], expected.errors, "approximate duplex error count");
+        // The record's cu/ct are the strands' counts summed; a call is informative on one strand.
+        let strands: Vec<_> = [&duplex.ab_consensus, duplex.ba_consensus.as_ref().unwrap()]
+            .iter()
+            .map(|c| c.methylation.as_ref().unwrap().evidence[0].clone())
+            .collect();
+        let combined = (
+            strands.iter().any(|e| e.informative),
+            strands.iter().map(|e| e.unconverted_count).sum::<u32>(),
+            strands.iter().map(|e| e.converted_count).sum::<u32>(),
+        );
+        assert_eq!(combined, expected.evidence, "combined evidence");
+        assert!(
+            strands.iter().filter(|e| e.unconverted_count + e.converted_count > 0).count() <= 1,
+            "at most one strand keeps counts at a position"
+        );
+    }
+
+    /// A no-call in either input masks the duplex base, as in fgbio.
+    #[test]
+    fn test_duplex_methylation_no_call_masks() {
+        let a = make_ss_consensus_with_methylation(
+            vec![b'T'],
+            vec![30],
+            vec![5],
+            CToT,
+            vec![evidence_at((true, 0, 5))],
+        );
+        let b = make_ss_consensus_with_methylation(
+            vec![b'N'],
+            vec![25],
+            vec![3],
+            GToA,
+            vec![evidence_at((false, 0, 0))],
+        );
+
+        let duplex = DuplexConsensusCaller::duplex_consensus(Some(&a), Some(&b), None).unwrap();
+
+        assert_eq!(duplex.bases[0], b'N');
+        assert_eq!(duplex.quals[0], MIN_PHRED);
+    }
+
+    /// With source reads, the informative strand's reads are compared with the call and the
+    /// other strand's reads with the confirmed base, so an unmethylated site has no errors.
+    #[test]
+    fn test_duplex_methylation_errors_use_each_strands_expectation() {
+        let source_read = |base: u8, flags: u16| SourceRead {
+            original_idx: 0,
+            bases: vec![base],
+            quals: vec![30],
+            simplified_cigar: vec![(noodles::sam::alignment::record::cigar::op::Kind::Match, 1)],
+            flags,
+            ref_id: 0,
+            alignment_start: 0,
+            original_cigar: vec![(noodles::sam::alignment::record::cigar::op::Kind::Match, 1)],
+            name_hash: 0,
+        };
+        let r1 = flags::PAIRED | flags::FIRST_SEGMENT;
+        let r2 = flags::PAIRED | flags::LAST_SEGMENT;
+        // AB-R1 reads show the conversion (T); BA-R2 reads show the reference base (C).
+        let mut sources: Vec<SourceRead> = (0..5).map(|_| source_read(b'T', r1)).collect();
+        sources.extend((0..3).map(|_| source_read(b'C', r2)));
+        let a = make_ss_consensus_with_methylation(
+            vec![b'T'],
+            vec![30],
+            vec![5],
+            CToT,
+            vec![evidence_at((true, 0, 5))],
+        );
+        let b = make_ss_consensus_with_methylation(
+            vec![b'C'],
+            vec![25],
+            vec![3],
+            GToA,
+            vec![evidence_at((false, 0, 0))],
+        );
+
+        let duplex =
+            DuplexConsensusCaller::duplex_consensus(Some(&a), Some(&b), Some(&sources)).unwrap();
+
+        assert_eq!(duplex.bases[0], b'C', "the confirmed molecule base");
         assert_eq!(duplex.errors[0], 0);
-    }
 
-    #[test]
-    fn test_duplex_em_seq_mixed_positions() {
-        // Multi-position test: pos0=ref-C unmethylated (artifact), pos1=non-ref-C (normal)
-        let ab = make_ss_consensus_with_methylation(
-            vec![b'T', b'A'],
-            vec![30, 30],
-            vec![5, 5],
-            vec![
-                crate::methylation::MethylationEvidence {
-                    is_ref_c: true,
-                    unconverted_count: 0,
-                    converted_count: 5,
-                },
-                crate::methylation::MethylationEvidence {
-                    is_ref_c: false,
-                    unconverted_count: 0,
-                    converted_count: 0,
-                },
-            ],
-        );
-        let ba = make_ss_consensus_with_methylation(
-            vec![b'C', b'A'],
-            vec![25, 25],
-            vec![3, 3],
-            vec![
-                crate::methylation::MethylationEvidence {
-                    is_ref_c: true,
-                    unconverted_count: 3,
-                    converted_count: 0,
-                },
-                crate::methylation::MethylationEvidence {
-                    is_ref_c: false,
-                    unconverted_count: 0,
-                    converted_count: 0,
-                },
-            ],
-        );
-
-        let result = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None);
-        let duplex = result.expect("Should produce duplex consensus");
-
-        // Position 0: conversion artifact → C, summed quality
+        // Each source read is an error only against its own strand's expectation: an AB-R1
+        // read showing C (expected the call, T) and a BA-R2 read showing T (expected the
+        // reference, C) are errors; neither would be under a single expected base.
+        sources.push(source_read(b'C', r1));
+        sources.push(source_read(b'T', r2));
+        let duplex =
+            DuplexConsensusCaller::duplex_consensus(Some(&a), Some(&b), Some(&sources)).unwrap();
         assert_eq!(duplex.bases[0], b'C');
-        assert_eq!(duplex.quals[0], 55);
-        // Position 1: normal agreement → A, summed quality
-        assert_eq!(duplex.bases[1], b'A');
-        assert_eq!(duplex.quals[1], 55);
+        assert_eq!(duplex.errors[0], 2);
     }
 
     #[test]
@@ -6930,82 +7027,41 @@ mod tests {
         assert_eq!(duplex.bases[0], b'T');
         // Quality = abs(30 - 25) = 5
         assert_eq!(duplex.quals[0], 5);
-        assert!(duplex.methylation.is_none());
+        assert!(duplex.ab_consensus.methylation.is_none());
+        assert!(duplex.ba_consensus.as_ref().unwrap().methylation.is_none());
     }
 
-    #[test]
-    fn test_duplex_em_seq_tag_emission() {
-        // Test that duplex_read_into emits all methylation tags correctly.
-        //
-        // Layout: 4 positions: [C, G, A, C]
-        //   pos 0: ref-C for top strand (AB tracks it)
-        //   pos 1: ref-G for bottom strand (BA tracks it)
-        //   pos 2: non-ref-C/G (no methylation)
-        //   pos 3: ref-C for top strand (AB tracks it)
-        //
-        // AB (top strand): C at ref-C positions (0, 3), non-informative at ref-G (1)
-        // BA (bottom strand after RC): G at ref-G position (1), non-informative at ref-C (0, 3)
+    /// Duplex X record over a C-site (offset 0, unmethylated on the C->T strand) and a
+    /// G-site (offset 1, methylated on the G->A strand). SEQ is the molecule's sequence (the
+    /// converted T at offset 0 is restored to C) and MM lists `C+m?` (C->T strand) then
+    /// `G-m?` (G->A strand), with MN equal to the SEQ length.
+    ///
+    /// Under TAPs a converted base means methylated, so ML is inverted while SEQ and MM are the
+    /// same.
+    #[rstest]
+    #[case::em_seq(crate::MethylationMode::EmSeq, [0u8, 255])]
+    #[case::taps(crate::MethylationMode::Taps, [255u8, 0])]
+    fn test_duplex_methylation_tag_emission(
+        #[case] mode: crate::MethylationMode,
+        #[case] expected_ml: [u8; 2],
+    ) {
         let ab = make_ss_consensus_with_methylation(
-            vec![b'C', b'G', b'A', b'C'],
-            vec![30, 30, 30, 30],
-            vec![5, 5, 5, 5],
-            vec![
-                crate::methylation::MethylationEvidence {
-                    is_ref_c: true,
-                    unconverted_count: 5,
-                    converted_count: 0,
-                },
-                crate::methylation::MethylationEvidence {
-                    is_ref_c: false, // ref-G, not informative for top strand
-                    unconverted_count: 0,
-                    converted_count: 0,
-                },
-                crate::methylation::MethylationEvidence {
-                    is_ref_c: false,
-                    unconverted_count: 0,
-                    converted_count: 0,
-                },
-                crate::methylation::MethylationEvidence {
-                    is_ref_c: true,
-                    unconverted_count: 1,
-                    converted_count: 4,
-                },
-            ],
+            vec![b'T', b'G'],
+            vec![30, 30],
+            vec![5, 5],
+            CToT,
+            vec![evidence_at((true, 0, 5)), evidence_at((false, 0, 0))],
         );
         let ba = make_ss_consensus_with_methylation(
-            vec![b'C', b'G', b'A', b'C'],
-            vec![25, 25, 25, 25],
-            vec![3, 3, 3, 3],
-            vec![
-                crate::methylation::MethylationEvidence {
-                    is_ref_c: false, // ref-C, not informative for bottom strand
-                    unconverted_count: 0,
-                    converted_count: 0,
-                },
-                crate::methylation::MethylationEvidence {
-                    is_ref_c: true, // ref-G, informative for bottom strand
-                    unconverted_count: 3,
-                    converted_count: 0,
-                },
-                crate::methylation::MethylationEvidence {
-                    is_ref_c: false,
-                    unconverted_count: 0,
-                    converted_count: 0,
-                },
-                crate::methylation::MethylationEvidence {
-                    is_ref_c: false,
-                    unconverted_count: 0,
-                    converted_count: 0,
-                },
-            ],
+            vec![b'C', b'G'],
+            vec![25, 25],
+            vec![3, 3],
+            GToA,
+            vec![evidence_at((false, 0, 0)), evidence_at((true, 3, 0))],
         );
-
-        // Build duplex — AB and BA agree at all positions
-        let duplex_result = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None);
-        let duplex = duplex_result.expect("Should produce duplex consensus");
+        let duplex = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None).unwrap();
 
         let mut builder = UnmappedSamBuilder::new();
-
         let mut read_name_buf = Vec::new();
         let mut output = ConsensusOutput::default();
         DuplexConsensusCaller::duplex_read_into(
@@ -7013,69 +7069,379 @@ mod tests {
             &mut read_name_buf,
             &mut output,
             &duplex,
-            ReadType::Fragment,
+            ReadType::R1,
             "UMI123",
             &[],
             &[],
             false,
             "consensus",
             "RG1",
-            false,
+            true,
+            mode,
+            None,
+            None,
+        )
+        .unwrap();
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let rec = &records[0];
+
+        assert_eq!(String::from_utf8_lossy(&rec.bases), "CG", "SEQ");
+        let string_tag =
+            |tag: SamTag| rec.get_string_tag(tag).map(|v| String::from_utf8_lossy(&v).into_owned());
+        assert_eq!(string_tag(SamTag::MM).as_deref(), Some("C+m?,0;G-m?,0;"), "MM");
+        assert_eq!(rec.get_u8_array_tag(SamTag::ML), Some(expected_ml.to_vec()), "ML");
+        assert_eq!(string_tag(SamTag::AM_BASES).as_deref(), Some("C+m?,0;"), "am");
+        assert_eq!(string_tag(SamTag::BM_BASES).as_deref(), Some("G-m?,0;"), "bm");
+        assert_eq!(rec.get_int_tag(SamTag::MN), Some(2), "MN");
+        // Counts are always written.
+        assert_eq!(rec.get_i16_array_tag(SamTag::CU), Some(vec![0, 3]), "cu");
+        assert_eq!(rec.get_i16_array_tag(SamTag::CT), Some(vec![5, 0]), "ct");
+        assert_eq!(rec.get_i16_array_tag(SamTag::AT), Some(vec![5, 0]), "at");
+        assert_eq!(rec.get_i16_array_tag(SamTag::BU), Some(vec![0, 3]), "bu");
+    }
+
+    /// Per-strand consensus bases (`ac`/`bc`) follow the duplex SEQ convention: each strand's
+    /// confirmed informative positions are restored, so a strand that saw a conversion agrees
+    /// with the strand that confirms the reference base. Otherwise
+    /// `filter --require-single-strand-agreement` would mask every unmethylated site.
+    #[test]
+    fn test_duplex_methylation_per_strand_bases_agree_at_conversions() {
+        // Offset 0: unmethylated C on the C->T strand (AB reads T, BA confirms C).
+        // Offset 1: methylated G-site on the G->A strand (both read G).
+        let ab = make_ss_consensus_with_methylation(
+            vec![b'T', b'G'],
+            vec![30, 30],
+            vec![5, 5],
+            CToT,
+            vec![evidence_at((true, 0, 5)), evidence_at((false, 0, 0))],
+        );
+        let ba = make_ss_consensus_with_methylation(
+            vec![b'C', b'G'],
+            vec![25, 25],
+            vec![3, 3],
+            GToA,
+            vec![evidence_at((false, 0, 0)), evidence_at((true, 3, 0))],
+        );
+        let duplex = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None).unwrap();
+
+        let mut builder = UnmappedSamBuilder::new();
+        let mut read_name_buf = Vec::new();
+        let mut output = ConsensusOutput::default();
+        DuplexConsensusCaller::duplex_read_into(
+            &mut builder,
+            &mut read_name_buf,
+            &mut output,
+            &duplex,
+            ReadType::R1,
+            "UMI123",
+            &[],
+            &[],
+            true, // per-base tags
+            "consensus",
+            "RG1",
+            true,
             crate::MethylationMode::EmSeq,
             None,
             None,
         )
         .unwrap();
+        let rec = &ParsedBamRecord::parse_all(&output.data)[0];
+        assert_eq!(rec.get_string_tag(SamTag::AC).as_deref(), Some(&b"CG"[..]), "ac");
+        assert_eq!(rec.get_string_tag(SamTag::BC_BASES).as_deref(), Some(&b"CG"[..]), "bc");
 
+        // Single-strand agreement keeps both sites.
+        let mut raw = output.data[4..].to_vec();
+        let thresholds = crate::FilterThresholds {
+            min_reads: 1,
+            max_read_error_rate: 1.0,
+            max_base_error_rate: 1.0,
+        };
+        let masked = crate::filter::mask_duplex_bases(
+            &mut raw,
+            &thresholds,
+            &thresholds,
+            &thresholds,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(masked, 0, "a confirmed conversion is strand agreement");
+    }
+
+    /// A single-strand (AB-only) duplex record has no second strand to confirm the molecule, so
+    /// it calls like simplex: only the reference-informative positions keep counts (offset 1 is
+    /// a `T` the reference does not mark, and its counts are dropped). It follows the duplex
+    /// output convention: SEQ is restored at those positions and MM/ML describe it, with
+    /// `bD = 0` marking that no second strand confirmed the genotype.
+    #[test]
+    fn test_duplex_single_strand_methylation_restores_seq() {
+        let ab = make_ss_consensus_with_methylation(
+            vec![b'T', b'T'],
+            vec![30, 30],
+            vec![5, 5],
+            CToT,
+            vec![evidence_at((true, 0, 5)), evidence_at((false, 0, 4))],
+        );
+        let duplex = DuplexConsensusCaller::duplex_consensus(Some(&ab), None, None).unwrap();
+
+        let mut builder = UnmappedSamBuilder::new();
+        let mut read_name_buf = Vec::new();
+        let mut output = ConsensusOutput::default();
+        DuplexConsensusCaller::duplex_read_into(
+            &mut builder,
+            &mut read_name_buf,
+            &mut output,
+            &duplex,
+            ReadType::R1,
+            "UMI123",
+            &[],
+            &[],
+            false,
+            "consensus",
+            "RG1",
+            true,
+            crate::MethylationMode::EmSeq,
+            None,
+            None,
+        )
+        .unwrap();
+        let rec = &ParsedBamRecord::parse_all(&output.data)[0];
+        let string_tag =
+            |tag: SamTag| rec.get_string_tag(tag).map(|v| String::from_utf8_lossy(&v).into_owned());
+
+        assert_eq!(String::from_utf8_lossy(&rec.bases), "CT", "SEQ");
+        assert_eq!(string_tag(SamTag::MM).as_deref(), Some("C+m?,0;"), "MM");
+        assert_eq!(rec.get_u8_array_tag(SamTag::ML), Some(vec![0]), "ML");
+        assert_eq!(rec.get_int_tag(SamTag::MN), Some(2), "MN");
+        assert_eq!(string_tag(SamTag::AM_BASES).as_deref(), Some("C+m?,0;"), "am");
+        assert_eq!(string_tag(SamTag::BM_BASES), None, "bm");
+        assert_eq!(rec.get_i16_array_tag(SamTag::AT), Some(vec![5, 0]), "at");
+        assert_eq!(rec.get_i16_array_tag(SamTag::CT), Some(vec![5, 0]), "ct");
+        assert_eq!(rec.get_int_tag(SamTag::BD), Some(0), "bD");
+    }
+
+    /// A BA-only duplex record (the BA consensus stored in `ab_consensus`) is restored from
+    /// that strand and reports it on the bottom-strand tags: `bm`/`bu`/`bt`, no `am`/`au`/`at`.
+    #[test]
+    fn test_duplex_ba_only_methylation_restores_seq() {
+        // Offset 1: an unmethylated G-site on the G->A strand, read as the converted A.
+        let ba = make_ss_consensus_with_methylation(
+            vec![b'A', b'A'],
+            vec![30, 30],
+            vec![5, 5],
+            GToA,
+            vec![evidence_at((false, 0, 0)), evidence_at((true, 0, 5))],
+        );
+        let duplex = DuplexConsensusCaller::duplex_consensus(None, Some(&ba), None).unwrap();
+        assert!(duplex.is_ba_only, "the BA-only shape the caller emits");
+
+        let mut builder = UnmappedSamBuilder::new();
+        let mut read_name_buf = Vec::new();
+        let mut output = ConsensusOutput::default();
+        DuplexConsensusCaller::duplex_read_into(
+            &mut builder,
+            &mut read_name_buf,
+            &mut output,
+            &duplex,
+            ReadType::R1,
+            "UMI123",
+            &[],
+            &[],
+            false,
+            "consensus",
+            "RG1",
+            true,
+            crate::MethylationMode::EmSeq,
+            None,
+            None,
+        )
+        .unwrap();
+        let rec = &ParsedBamRecord::parse_all(&output.data)[0];
+        let string_tag =
+            |tag: SamTag| rec.get_string_tag(tag).map(|v| String::from_utf8_lossy(&v).into_owned());
+
+        assert_eq!(String::from_utf8_lossy(&rec.bases), "AG", "SEQ restored at the G-site");
+        assert_eq!(string_tag(SamTag::MM).as_deref(), Some("G-m?,0;"), "MM");
+        assert_eq!(rec.get_u8_array_tag(SamTag::ML), Some(vec![0]), "ML");
+        assert_eq!(string_tag(SamTag::BM_BASES).as_deref(), Some("G-m?,0;"), "bm");
+        assert_eq!(string_tag(SamTag::AM_BASES), None, "am");
+        assert_eq!(rec.get_i16_array_tag(SamTag::BT), Some(vec![0, 5]), "bt");
+        assert_eq!(rec.get_i16_array_tag(SamTag::AT), None, "at");
+        assert_eq!(rec.get_int_tag(SamTag::BD), Some(0), "bD");
+    }
+
+    /// Positions one strand cannot confirm are never restored. The AB strand is longer than
+    /// the BA strand, so the record is truncated to the shorter one; at offset 0 the AB
+    /// consensus is a no-call over split evidence while BA shows `C`, so the duplex base is `N`,
+    /// the site is no call (its counts are cleared), and MM skips it. Offset 1 is a confirmed
+    /// conversion and is restored.
+    #[test]
+    fn test_duplex_methylation_one_strand_no_call_is_not_restored() {
+        let ab = make_ss_consensus_with_methylation(
+            vec![b'N', b'T', b'A'],
+            vec![MIN_PHRED, 30, 30],
+            vec![2, 5, 5],
+            CToT,
+            vec![evidence_at((true, 1, 1)), evidence_at((true, 0, 5)), evidence_at((false, 0, 0))],
+        );
+        let ba = make_ss_consensus_with_methylation(
+            vec![b'C', b'C'],
+            vec![25, 25],
+            vec![3, 3],
+            GToA,
+            vec![evidence_at((false, 0, 0)), evidence_at((false, 0, 0))],
+        );
+        let duplex = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None).unwrap();
+
+        let mut builder = UnmappedSamBuilder::new();
+        let mut read_name_buf = Vec::new();
+        let mut output = ConsensusOutput::default();
+        DuplexConsensusCaller::duplex_read_into(
+            &mut builder,
+            &mut read_name_buf,
+            &mut output,
+            &duplex,
+            ReadType::R1,
+            "UMI123",
+            &[],
+            &[],
+            false,
+            "consensus",
+            "RG1",
+            true,
+            crate::MethylationMode::EmSeq,
+            None,
+            None,
+        )
+        .unwrap();
+        let rec = &ParsedBamRecord::parse_all(&output.data)[0];
+
+        assert_eq!(String::from_utf8_lossy(&rec.bases), "NC", "SEQ");
+        assert_eq!(
+            rec.get_string_tag(SamTag::MM).map(|v| String::from_utf8_lossy(&v).into_owned()),
+            Some("C+m?,0;".to_string()),
+            "MM"
+        );
+        assert_eq!(rec.get_u8_array_tag(SamTag::ML), Some(vec![0]), "ML");
+        assert_eq!(rec.get_int_tag(SamTag::MN), Some(2), "MN");
+        assert_eq!(rec.get_i16_array_tag(SamTag::AU), Some(vec![0, 0]), "au");
+        assert_eq!(rec.get_i16_array_tag(SamTag::AT), Some(vec![0, 5]), "at");
+    }
+
+    /// A full duplex molecule through the caller: the top strand (`/A`, R1 forward) and the
+    /// bottom strand (`/B`, R1 reverse), three read pairs each, all unmethylated over the
+    /// window `CCCAAAAGGT` (top-strand C at offsets 0-2, bottom-strand C at reference G 7-8).
+    ///
+    /// Duplex R1 combines AB-R1 (forward, `TTTAAAAGGT`) with BA-R2 (forward, `CCCAAAAAAT`):
+    /// AB-R1 carries the call at offsets 0-2, BA-R2 at 7-8. Duplex R2 combines AB-R2 with
+    /// BA-R1, both reverse-aligned (read orientation `ACCTTTTAAA` and `ATTTTTTGGG`): AB-R2
+    /// carries the call at 7-9, BA-R1 at 1-2. Each record's SEQ is the molecule's sequence in
+    /// read orientation (`CCCAAAAGGT` and its reverse complement `ACCTTTTGGG`), with every
+    /// informative site listed as unmethylated in MM/ML.
+    #[test]
+    fn test_duplex_em_seq_full_molecule_calls_each_strand() -> Result<()> {
+        use crate::methylation::tests::TestRef;
+        use std::sync::Arc;
+
+        let mut ref_seq = vec![b'N'; 99];
+        ref_seq.extend_from_slice(b"CCCAAAAGGT");
+        ref_seq.extend_from_slice(&[b'N'; 20]);
+
+        let mut caller = DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            vec![1, 1, 1],
+            0,
+            false,
+            false,
+            None,
+            None,
+            false,
+            45,
+            40,
+        )?;
+        caller.set_reference(
+            Arc::new(TestRef::new(&[("chr1", &ref_seq)])),
+            Arc::new(vec!["chr1".to_string()]),
+            crate::MethylationMode::EmSeq,
+        );
+
+        let mut b = SamBuilder::new();
+        let mut read = |name: &[u8], mi: &[u8], read_flags: u16, seq: &[u8]| {
+            b.clear();
+            b.ref_id(0)
+                .pos(99)
+                .flags(read_flags)
+                .mate_ref_id(0)
+                .mate_pos(99)
+                .read_name(name)
+                .cigar_ops(&[encode_op(0, 10)])
+                .sequence(seq)
+                .qualities(&[30u8; 10]);
+            b.add_string_tag(SamTag::MI, mi);
+            b.add_string_tag(SamTag::RG, b"A");
+            b.build()
+        };
+        let top = b"TTTAAAAGGT"; // converted top strand, genomic orientation
+        let bottom = b"CCCAAAAAAT"; // converted bottom strand, genomic orientation
+        let mut reads = Vec::new();
+        for i in 0..3_u8 {
+            let a_name = [b'a', i];
+            let b_name = [b'b', i];
+            reads.push(read(
+                &a_name,
+                b"foo/A",
+                flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE,
+                top,
+            ));
+            reads.push(read(
+                &a_name,
+                b"foo/A",
+                flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE,
+                top,
+            ));
+            reads.push(read(
+                &b_name,
+                b"foo/B",
+                flags::PAIRED | flags::FIRST_SEGMENT | flags::REVERSE,
+                bottom,
+            ));
+            reads.push(read(
+                &b_name,
+                b"foo/B",
+                flags::PAIRED | flags::LAST_SEGMENT | flags::MATE_REVERSE,
+                bottom,
+            ));
+        }
+
+        let output = caller.consensus_reads(reads)?;
         let records = ParsedBamRecord::parse_all(&output.data);
-        assert_eq!(records.len(), 1);
-        let rec = &records[0];
+        assert_eq!(records.len(), 2);
+        let r1 = records.iter().find(|r| r.flag & flags::FIRST_SEGMENT != 0).unwrap();
+        let r2 = records.iter().find(|r| r.flag & flags::LAST_SEGMENT != 0).unwrap();
 
-        // Combined MM tag (C+m format, tracks C bases in duplex: pos 0 and 3)
-        let mm = rec.get_string_tag(SamTag::MM).expect("Should have MM tag");
-        assert!(mm.starts_with(b"C+m"), "MM should start with C+m");
-
-        // ML tag: probabilities for 2 ref-C positions (0 and 3)
-        let ml = rec.get_u8_array_tag(SamTag::ML).expect("Should have ML tag");
-        assert_eq!(ml.len(), 2);
-
-        // Combined cu/ct tags (length = 4)
-        let cu = rec.get_i16_array_tag(SamTag::CU).expect("Should have cu tag");
-        let ct = rec.get_i16_array_tag(SamTag::CT).expect("Should have ct tag");
-        assert_eq!(cu.len(), 4);
-        assert_eq!(ct.len(), 4);
-        // Pos 0: AB(5,0) + BA(0,0) = (5, 0)
-        assert_eq!(cu[0], 5);
-        assert_eq!(ct[0], 0);
-        // Pos 1: AB(0,0) + BA(3,0) = (3, 0)
-        assert_eq!(cu[1], 3);
-        assert_eq!(ct[1], 0);
-        // Pos 2: no ref-C
-        assert_eq!(cu[2], 0);
-        assert_eq!(ct[2], 0);
-        // Pos 3: AB(1,4) + BA(0,0) = (1, 4)
-        assert_eq!(cu[3], 1);
-        assert_eq!(ct[3], 4);
-
-        // Per-strand AB tags
-        let au = rec.get_i16_array_tag(SamTag::AU).expect("Should have au tag");
-        let at_tag = rec.get_i16_array_tag(SamTag::AT).expect("Should have at tag");
-        assert_eq!(au[0], 5); // pos 0 unconverted
-        assert_eq!(at_tag[0], 0); // pos 0 converted
-
-        // Per-strand BA tags
-        let bu = rec.get_i16_array_tag(SamTag::BU).expect("Should have bu tag");
-        let bt = rec.get_i16_array_tag(SamTag::BT).expect("Should have bt tag");
-        assert_eq!(bu[1], 3); // pos 1 unconverted (ref-G for bottom strand)
-        assert_eq!(bt[1], 0);
-
-        // am tag (C+m format for AB top strand)
-        let am = rec.get_string_tag(SamTag::AM_BASES).expect("Should have am tag");
-        assert!(am.starts_with(b"C+m"), "am should start with C+m");
-
-        // bm tag (G-m format for BA bottom strand, minus = opposite strand per SAM spec)
-        let bm = rec.get_string_tag(SamTag::BM_BASES).expect("Should have bm tag");
-        assert!(bm.starts_with(b"G-m"), "bm should start with G-m");
+        assert_eq!(String::from_utf8_lossy(&r1.bases), "CCCAAAAGGT", "duplex R1 SEQ");
+        assert_eq!(String::from_utf8_lossy(&r2.bases), "ACCTTTTGGG", "duplex R2 SEQ");
+        let mm = |r: &ParsedBamRecord| {
+            r.get_string_tag(SamTag::MM).map(|v| String::from_utf8_lossy(&v).into_owned())
+        };
+        assert_eq!(mm(r1).as_deref(), Some("C+m?,0,0,0;G-m?,0,0;"), "duplex R1 MM");
+        assert_eq!(mm(r2).as_deref(), Some("C+m?,0,0;G-m?,0,0,0;"), "duplex R2 MM");
+        assert_eq!(r1.get_u8_array_tag(SamTag::ML), Some(vec![0; 5]), "duplex R1 ML");
+        assert_eq!(r2.get_u8_array_tag(SamTag::ML), Some(vec![0; 5]), "duplex R2 ML");
+        assert_eq!(r1.get_int_tag(SamTag::MN), Some(10), "duplex R1 MN");
+        assert_eq!(r2.get_int_tag(SamTag::MN), Some(10), "duplex R2 MN");
+        assert_eq!(
+            r1.get_i16_array_tag(SamTag::CT),
+            Some(vec![3, 3, 3, 0, 0, 0, 0, 3, 3, 0]),
+            "duplex R1 converted counts"
+        );
+        assert_eq!(
+            r2.get_i16_array_tag(SamTag::CT),
+            Some(vec![0, 3, 3, 0, 0, 0, 0, 3, 3, 3]),
+            "duplex R2 converted counts"
+        );
+        Ok(())
     }
 
     /// Regression test: when a UMI group has only B-strand reads (no A-strand) with

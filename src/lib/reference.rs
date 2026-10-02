@@ -281,8 +281,7 @@ impl ReferenceReader {
     /// in-memory sequence — same lookup semantics, no allocation.
     ///
     /// Prefer this over [`Self::fetch`] in hot loops (e.g., per-record reference
-    /// access in `fgumi zipper`'s `--restore-unconverted-bases` path) where
-    /// allocating a fresh `Vec<u8>` per call adds up to gigabytes of churn.
+    /// access) where allocating a fresh `Vec<u8>` per call adds up to gigabytes of churn.
     ///
     /// # Errors
     ///

@@ -180,8 +180,9 @@ pub struct Simplex {
 
     /// Methylation-aware consensus calling mode.
     /// EM-Seq: C→T at ref-C = unmethylated (enzymatic conversion); TAPs: C→T at ref-C = methylated.
-    /// Emits MM/ML methylation tags and cu/ct per-base count tags on consensus reads.
-    /// Requires --ref.
+    /// Consensus SEQ keeps the observed (converted) bases, with cu/ct per-base count tags;
+    /// re-align EM-Seq consensus with a bisulfite-aware aligner and TAPs consensus with a
+    /// standard aligner. Requires --ref.
     #[arg(long = "methylation-mode", value_enum)]
     pub methylation_mode: Option<crate::commands::common::MethylationModeArg>,
 

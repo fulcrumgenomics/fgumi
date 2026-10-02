@@ -755,6 +755,75 @@ fn test_clip_command_basic() {
     assert_eq!(count, 2, "Should have both reads in output");
 }
 
+/// clip regenerates NM/UQ by the record's SEQ convention, as filter does: a simplex methylation
+/// consensus (`cu`, no `aD`/`bD`) keeps its converted bases, so the conversions of its strand
+/// are not counted, while a duplex consensus (the molecule's sequence) is scored literally. MD
+/// lists every difference either way. R1 forward over reference `ACGTACGT` shows `ATGTATGT`
+/// (two C->T conversions); R2 reverse matches the reference.
+#[rstest]
+#[case::simplex_methylation(false, 0)]
+#[case::duplex_methylation(true, 2)]
+fn test_clip_scores_nm_by_consensus_convention(#[case] duplex: bool, #[case] expected_nm: i64) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    let record = |seq: &[u8], segment: u16, mate_reverse: bool| {
+        let mut b = SamBuilder::new();
+        let orientation = if mate_reverse { flags::MATE_REVERSE } else { flags::REVERSE };
+        b.read_name(b"read1")
+            .sequence(seq)
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | segment | orientation)
+            .ref_id(0)
+            .pos(96)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(96)
+            .template_length(0);
+        b.add_array_i16(SamTag::CU, &[0; 8]).add_array_i16(SamTag::CT, &[0, 3, 0, 0, 0, 3, 0, 0]);
+        if duplex {
+            b.add_int_tag(SamTag::AD, 3).add_int_tag(SamTag::BD, 3);
+        }
+        b.build()
+    };
+    let r1 = record(b"ATGTATGT", flags::FIRST_SEGMENT, true);
+    let r2 = record(b"ACGTACGT", flags::LAST_SEGMENT, false);
+    create_paired_bam(&input_bam, vec![(r1, r2)]);
+
+    let cmd = Clip::try_parse_from([
+        "clip",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--reference",
+        ref_path.to_str().unwrap(),
+        // clip needs one clipping option; clip R2 only, so R1's alignment is unchanged.
+        "--read-two-five-prime",
+        "1",
+    ])
+    .expect("failed to parse clip args");
+    cmd.execute("fgumi clip").expect("Clip command failed");
+
+    let records = read_output_record_bufs(&output_bam);
+    let r1 = records.iter().find(|r| r.flags().is_first_segment()).expect("R1");
+    let int_tag = |tag: SamTag| {
+        r1.data()
+            .get(&tag.to_noodles_tag())
+            .and_then(noodles::sam::alignment::record_buf::data::field::Value::as_int)
+            .expect("integer tag")
+    };
+    assert_eq!(int_tag(SamTag::NM), expected_nm, "NM");
+    let md = match r1.data().get(&SamTag::MD.to_noodles_tag()) {
+        Some(noodles::sam::alignment::record_buf::data::field::Value::String(md)) => md.to_string(),
+        other => panic!("MD missing: {other:?}"),
+    };
+    assert_eq!(md, "1C3C2", "MD is SAM-literal");
+}
+
 /// Build a query-grouped BAM of `count` overlapping paired templates. Each
 /// template is an 8M R1 at pos 99 and an 8M reverse R2 at pos 103 (mates overlap
 /// in [103,106]), so `--clip-overlapping-reads` plus fixed-end clipping both do

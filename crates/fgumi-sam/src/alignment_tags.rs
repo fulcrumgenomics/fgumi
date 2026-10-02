@@ -42,6 +42,10 @@ pub fn uq_tag() -> Tag {
 /// For unmapped reads, the tags are removed (set to null) to match fgbio behavior.
 /// For mapped reads, the tags are recalculated based on the alignment and reference.
 ///
+/// Every base differing from the reference counts ([`ConversionScoring::Literal`]); this
+/// record-level form has no methylation-aware scoring. Use
+/// [`regenerate_alignment_tags_raw_with_scoring`] to hide conversions from NM/UQ.
+///
 /// # Arguments
 /// * `record` - The record to regenerate tags for (modified in place)
 /// * `header` - SAM header (needed to resolve reference sequence names)
@@ -235,6 +239,49 @@ pub fn regenerate_alignment_tags(
 
 use fgumi_raw_bam::{self, RawRecordView, RawTagsEditor};
 
+/// How methylation conversions (EM-seq / bisulfite / TAPs) are scored when regenerating
+/// NM and UQ. MD is always SAM-literal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConversionScoring {
+    /// Every base differing from the reference is a mismatch (SAM-literal).
+    Literal,
+    /// A base showing the conversion of the read's original strand is not counted in NM/UQ,
+    /// so a well-converted read does not look divergent. Assumes a directional library:
+    /// OT-derived reads (R1 or fragment forward, R2 reverse) hide `ref C × read T`; OB-derived
+    /// reads (R1 or fragment reverse, R2 forward) hide `ref G × read A`, all in genomic
+    /// orientation. The opposite direction, other substitutions, `N` and indels still count.
+    /// MD still lists every hidden base, so CIGAR + SEQ + MD reconstruct the reference.
+    Hidden,
+}
+
+/// Whether a read of a directional bisulfite/EM-seq/TAPs library derives from the original top
+/// strand (OT): R1 (or a fragment) aligned forward, or R2 aligned reverse.
+///
+/// R1/fragment reads carry the original strand's own sequence and R2 reads its complement, so a
+/// read is OT-derived exactly when it is R2 aligned reverse or R1/fragment aligned forward. Its
+/// conversions then show as `C`→`T` in genomic orientation; OB-derived reads show `G`→`A`.
+#[must_use]
+pub fn is_top_strand(flags: u16) -> bool {
+    let is_last_segment = flags & fgumi_raw_bam::flags::LAST_SEGMENT != 0;
+    let is_reverse = flags & fgumi_raw_bam::flags::REVERSE != 0;
+    is_last_segment == is_reverse
+}
+
+/// Returns the `(reference, read)` base pair hidden by `scoring` for a record with `flags`, in
+/// genomic orientation, or `None` when every difference counts.
+fn hidden_conversion(scoring: ConversionScoring, flags: u16) -> Option<(u8, u8)> {
+    match scoring {
+        ConversionScoring::Literal => None,
+        ConversionScoring::Hidden => {
+            if is_top_strand(flags) {
+                Some((b'C', b'T'))
+            } else {
+                Some((b'G', b'A'))
+            }
+        }
+    }
+}
+
 /// Regenerates NM, UQ, and MD tags for a raw BAM record after base masking.
 ///
 /// For unmapped reads, the tags are removed. For mapped reads, the tags are
@@ -245,21 +292,44 @@ use fgumi_raw_bam::{self, RawRecordView, RawTagsEditor};
 /// Returns `Ok(true)` if tags were regenerated, `Ok(false)` if they were removed
 /// (an unmapped read, or a mapped read with no reference id).
 ///
+/// Every base differing from the reference counts ([`ConversionScoring::Literal`]); see
+/// [`regenerate_alignment_tags_raw_with_scoring`] to hide methylation conversions from NM/UQ.
+///
 /// # Errors
 ///
 /// Returns an error if the record is too short, the reference sequence ID is not found
 /// in the header, the alignment start is invalid, or the CIGAR operations reference
 /// beyond the available sequence or reference data.
+pub fn regenerate_alignment_tags_raw(
+    record: &mut Vec<u8>,
+    header: &Header,
+    reference: &impl ReferenceProvider,
+) -> Result<bool> {
+    regenerate_alignment_tags_raw_with_scoring(
+        record,
+        header,
+        reference,
+        ConversionScoring::Literal,
+    )
+}
+
+/// Regenerates NM, UQ, and MD tags for a raw BAM record, scoring methylation conversions in
+/// NM/UQ per `scoring` (MD is always SAM-literal). Otherwise identical to [`regenerate_alignment_tags_raw`].
+///
+/// # Errors
+///
+/// See [`regenerate_alignment_tags_raw`].
 #[allow(
     clippy::too_many_lines,
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap
 )]
-pub fn regenerate_alignment_tags_raw(
+pub fn regenerate_alignment_tags_raw_with_scoring(
     record: &mut Vec<u8>,
     header: &Header,
     reference: &impl ReferenceProvider,
+    scoring: ConversionScoring,
 ) -> Result<bool> {
     if record.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN {
         anyhow::bail!(
@@ -332,6 +402,8 @@ pub fn regenerate_alignment_tags_raw(
         anyhow::bail!("Truncated BAM record: seq/qual extends past record end");
     }
 
+    let hidden = hidden_conversion(scoring, RawRecordView::new(record).flags());
+
     // Calculate NM, UQ, MD
     let mut nm: i32 = 0;
     let mut uq: u32 = 0;
@@ -367,9 +439,12 @@ pub fn regenerate_alignment_tags_raw(
                         match_count = 0;
                         md_string.push(ref_base as char);
                     } else if !seq_base.eq_ignore_ascii_case(&ref_base) {
-                        // Mismatch
-                        nm += 1;
-                        uq += u32::from(qual_score);
+                        // Mismatch. MD always lists it so that SEQ + CIGAR + MD reconstruct the
+                        // reference; NM/UQ skip a hidden conversion.
+                        if hidden != Some((ref_base.to_ascii_uppercase(), seq_base)) {
+                            nm += 1;
+                            uq += u32::from(qual_score);
+                        }
                         write!(md_string, "{match_count}").expect("write to String is infallible");
                         match_count = 0;
                         md_string.push(ref_base as char);
@@ -1064,6 +1139,133 @@ mod tests {
             Some("1C2")
         );
 
+        Ok(())
+    }
+
+    /// How a test record's segment and strand flags are set.
+    #[derive(Clone, Copy, Debug)]
+    enum ReadType {
+        Fragment,
+        R1,
+        R2,
+    }
+
+    /// Hidden conversions follow the original strand a read derives from: OT-type reads
+    /// (R1-fwd, R2-rev, fragment-fwd) hide `ref C × seq T`, OB-type reads (R1-rev, R2-fwd,
+    /// fragment-rev) hide `ref G × seq A`. Everything else (the opposite direction, other
+    /// substitutions, `N`) stays a mismatch. MD is SAM-literal in every case: it lists every
+    /// difference, hidden or not, so SEQ + CIGAR + MD reconstruct the reference. Reference
+    /// `ACGTACGT`, read `ATATATGA`: C→T at 2 and 6, G→A at 3, T→A at 8. Qualities are 10..=17
+    /// so UQ identifies which bases counted.
+    #[rstest::rstest]
+    #[case::literal_ignores_read_type(
+        ReadType::R1,
+        false,
+        ConversionScoring::Literal,
+        "ATATATGA",
+        4,
+        55,
+        "1C0G2C1T0"
+    )]
+    #[case::fragment_fwd_hides_c_to_t(
+        ReadType::Fragment,
+        false,
+        ConversionScoring::Hidden,
+        "ATATATGA",
+        2,
+        29,
+        "1C0G2C1T0"
+    )]
+    #[case::fragment_rev_hides_g_to_a(
+        ReadType::Fragment,
+        true,
+        ConversionScoring::Hidden,
+        "ATATATGA",
+        3,
+        43,
+        "1C0G2C1T0"
+    )]
+    #[case::r1_fwd_hides_c_to_t(
+        ReadType::R1,
+        false,
+        ConversionScoring::Hidden,
+        "ATATATGA",
+        2,
+        29,
+        "1C0G2C1T0"
+    )]
+    #[case::r1_rev_hides_g_to_a(
+        ReadType::R1,
+        true,
+        ConversionScoring::Hidden,
+        "ATATATGA",
+        3,
+        43,
+        "1C0G2C1T0"
+    )]
+    #[case::r2_fwd_hides_g_to_a(
+        ReadType::R2,
+        false,
+        ConversionScoring::Hidden,
+        "ATATATGA",
+        3,
+        43,
+        "1C0G2C1T0"
+    )]
+    #[case::r2_rev_hides_c_to_t(
+        ReadType::R2,
+        true,
+        ConversionScoring::Hidden,
+        "ATATATGA",
+        2,
+        29,
+        "1C0G2C1T0"
+    )]
+    #[case::masked_base_at_ref_c_still_counts(
+        ReadType::R1,
+        false,
+        ConversionScoring::Hidden,
+        "ANGTACGT",
+        1,
+        11,
+        "1C6"
+    )]
+    fn test_regenerate_alignment_tags_raw_conversion_scoring(
+        #[case] read_type: ReadType,
+        #[case] reverse: bool,
+        #[case] scoring: ConversionScoring,
+        #[case] seq: &str,
+        #[case] expected_nm: i64,
+        #[case] expected_uq: i64,
+        #[case] expected_md: &str,
+    ) -> Result<()> {
+        let (_fasta, reference) = create_test_reference()?;
+        let header = create_test_header();
+        let builder = RecordBuilder::new()
+            .sequence(seq)
+            .qualities(&[10, 11, 12, 13, 14, 15, 16, 17])
+            .cigar("8M")
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .reverse_complement(reverse);
+        let builder = match read_type {
+            ReadType::Fragment => builder,
+            ReadType::R1 => builder.first_segment(true),
+            ReadType::R2 => builder.first_segment(false),
+        };
+        let mut raw = encode_record_buf_to_raw(&header, &builder.build())?;
+
+        regenerate_alignment_tags_raw_with_scoring(&mut raw, &header, &reference, scoring)?;
+
+        let aux = fgumi_raw_bam::aux_data_slice(&raw);
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux, SamTag::NM), Some(expected_nm), "NM");
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux, SamTag::UQ), Some(expected_uq), "UQ");
+        assert_eq!(
+            fgumi_raw_bam::find_string_tag(aux, SamTag::MD)
+                .map(|s| std::str::from_utf8(s).expect("MD tag should be valid UTF-8")),
+            Some(expected_md),
+            "MD"
+        );
         Ok(())
     }
 
