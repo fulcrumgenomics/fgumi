@@ -90,34 +90,23 @@ fn umi_for_read_impl(umi: &str, is_r1_earlier: bool, assigner: &dyn UmiAssigner)
             );
         }
 
-        // ParallelPairedAssigner handles canonicalization internally in assign(),
-        // so just return the raw uppercase UMI without A/B prefixes.
-        if assigner.as_any().downcast_ref::<ParallelPairedAssigner>().is_some() {
-            return Ok(umi.to_uppercase());
-        }
-
-        let Some(paired) = assigner.as_any().downcast_ref::<PairedUmiAssigner>() else {
+        // Both paired assigners get the same orientation-prefixed key, so the strand (/A vs
+        // /B) follows which read is genomically earlier, not the order the UMI bases sort in.
+        let any = assigner.as_any();
+        let (lower, higher) = if let Some(paired) = any.downcast_ref::<PairedUmiAssigner>() {
+            (paired.lower_read_umi_prefix(), paired.higher_read_umi_prefix())
+        } else if let Some(paired) = any.downcast_ref::<ParallelPairedAssigner>() {
+            (paired.lower_read_umi_prefix(), paired.higher_read_umi_prefix())
+        } else {
             bail!("Expected PairedUmiAssigner or ParallelPairedAssigner")
         };
 
         // When R1 is earlier: lower_prefix:part0-higher_prefix:part1
         // When R2 is earlier: higher_prefix:part0-lower_prefix:part1
         let result = if is_r1_earlier {
-            format!(
-                "{}:{}-{}:{}",
-                paired.lower_read_umi_prefix(),
-                parts[0],
-                paired.higher_read_umi_prefix(),
-                parts[1]
-            )
+            format!("{lower}:{}-{higher}:{}", parts[0], parts[1])
         } else {
-            format!(
-                "{}:{}-{}:{}",
-                paired.higher_read_umi_prefix(),
-                parts[0],
-                paired.lower_read_umi_prefix(),
-                parts[1]
-            )
+            format!("{higher}:{}-{lower}:{}", parts[0], parts[1])
         };
 
         Ok(result)
@@ -4168,6 +4157,75 @@ mod tests {
         Ok(())
     }
 
+    /// The paired strategy must label strands by read orientation on both the sequential
+    /// and the parallel assigner: a template whose R1 is the genomically earlier read is
+    /// `/A`, the other strand of the same molecule is `/B` (fgbio's contract). The UMI
+    /// spelling must not decide it, so this uses a molecule whose top-strand UMI sorts after
+    /// its reverse (`TTTT-AAAA`) and one whose halves are identical (`ACGT-ACGT`), where the
+    /// two strands' UMIs are the same string.
+    #[rstest]
+    #[case::sequential(false)]
+    #[case::parallel(true)]
+    fn test_paired_strand_follows_read_orientation(#[case] parallel: bool) -> Result<()> {
+        let mut records = Vec::new();
+        // (name, r1_pos, r2_pos, umi, r1_reverse); each molecule has both strands.
+        let templates = [
+            ("desc_top", 100, 300, "TTTT-AAAA", false),
+            ("desc_bottom", 300, 100, "AAAA-TTTT", true),
+            ("pal_top", 1100, 1300, "ACGT-ACGT", false),
+            ("pal_bottom", 1300, 1100, "ACGT-ACGT", true),
+        ];
+        for (name, r1_pos, r2_pos, umi, r1_reverse) in templates {
+            let (r1, r2) = build_duplex_pair(name, 0, r1_pos, r2_pos, umi, r1_reverse);
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+        let mut cmd = GroupReadsByUmi {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
+            },
+            ..test_group_cmd(Strategy::Paired, 1)
+        };
+        if parallel {
+            cmd.threading = ThreadingOptions::new(4);
+            cmd.parallel_group_min_templates = Some(ParallelMinTemplates::Fixed(1));
+        }
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 8, "Should have all 8 records");
+        let mut strands_by_base: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut wrong_strand = Vec::new();
+        for record in &output_records {
+            let name = record.name().map(|n| n.to_string()).unwrap_or_default();
+            let mi = get_mi_tags(std::slice::from_ref(record)).pop().expect("MI tag");
+            let (base, strand) = mi.split_once('/').expect("paired MI has a strand suffix");
+            let expected = if name.ends_with("_top") { "A" } else { "B" };
+            if strand != expected {
+                wrong_strand.push(format!("{name}: {mi} (expected /{expected})"));
+            }
+            strands_by_base.entry(base.to_string()).or_default().push(strand.to_string());
+        }
+        assert!(wrong_strand.is_empty(), "strand not set by read orientation: {wrong_strand:?}");
+        assert_eq!(strands_by_base.len(), 2, "two molecules expected: {strands_by_base:?}");
+        for strands in strands_by_base.values() {
+            assert!(
+                strands.contains(&"A".to_string()) && strands.contains(&"B".to_string()),
+                "each molecule must have both strands: {strands_by_base:?}"
+            );
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn test_paired_assigner_pairs_overlapping_duplex_strands() -> Result<()> {
         // Regression test for the paired-strategy strand-pairing bug on
@@ -6272,6 +6330,84 @@ mod tests {
         // With adjacency and edits=1, both UMIs should be grouped together
         let unique_groups = count_unique_mi_tags(&output_records);
         assert_eq!(unique_groups, 1, "UMIs within 1 edit should be in same group");
+
+        Ok(())
+    }
+
+    /// `--allow-unmapped` with `--threads > 1` sends every group to the parallel assigner. For
+    /// the paired strategy it must group exactly like the sequential assigner: unmapped mates
+    /// have no genomic order, so the keys `AAAA-TTTT` and `TTTT-AAAA` get the same prefix
+    /// order and are two molecules on both paths, and identical halves stay one.
+    #[test]
+    fn test_allow_unmapped_paired_parallel_matches_sequential() -> Result<()> {
+        let run = |threading: ThreadingOptions| -> Result<Vec<(String, String)>> {
+            let mut records = Vec::new();
+            for (name, umi) in [
+                ("ab", "AAAA-TTTT"),
+                ("ba", "TTTT-AAAA"),
+                ("pal_1", "ACGT-ACGT"),
+                ("pal_2", "ACGT-ACGT"),
+            ] {
+                let (r1, r2) = build_unmapped_test_pair(name, umi);
+                records.push(r1);
+                records.push(r2);
+            }
+            let input = create_template_coordinate_sorted_test_bam(records)?;
+            let paths = TestPaths::new()?;
+            let cmd = GroupReadsByUmi {
+                io: BamIoOptions {
+                    input: input.path().to_path_buf(),
+                    output: paths.output.clone(),
+                    async_reader: false,
+                    check_crc: false,
+                    no_check_crc: false,
+                },
+                allow_unmapped: true,
+                threading,
+                ..test_group_cmd(Strategy::Paired, 1)
+            };
+            cmd.execute("test")?;
+            let records = read_bam_records(&paths.output)?;
+            let mut named: Vec<(String, String)> = records
+                .iter()
+                .map(|r| {
+                    let name = r.name().map(|n| n.to_string()).unwrap_or_default();
+                    let mi = get_mi_tags(std::slice::from_ref(r)).pop().unwrap_or_default();
+                    (name, mi)
+                })
+                .collect();
+            named.sort();
+            Ok(named)
+        };
+
+        let sequential = run(ThreadingOptions::none())?;
+        let parallel = run(ThreadingOptions::new(4))?;
+        assert_eq!(sequential.len(), 8);
+
+        // Compare up to molecule-id relabeling: same partition and the same /A-/B suffixes.
+        let shape = |named: &[(String, String)]| -> Vec<(String, String)> {
+            let mut base_rank: Vec<String> = Vec::new();
+            named
+                .iter()
+                .map(|(name, mi)| {
+                    let (base, strand) = mi.split_once('/').unwrap_or((mi, ""));
+                    let rank = base_rank.iter().position(|b| b == base).unwrap_or_else(|| {
+                        base_rank.push(base.to_string());
+                        base_rank.len() - 1
+                    });
+                    (name.clone(), format!("{rank}/{strand}"))
+                })
+                .collect()
+        };
+        assert_eq!(shape(&sequential), shape(&parallel), "seq={sequential:?} par={parallel:?}");
+
+        // Spot-check the expected grouping: the swapped-halves keys are distinct molecules,
+        // and the two identical-halves templates share one family.
+        let mi_of = |name: &str| {
+            sequential.iter().find(|(n, _)| n == name).map(|(_, mi)| mi.clone()).unwrap()
+        };
+        assert_ne!(mi_of("ab").split('/').next(), mi_of("ba").split('/').next());
+        assert_eq!(mi_of("pal_1"), mi_of("pal_2"));
 
         Ok(())
     }
