@@ -445,10 +445,11 @@ fn positional_hamming(a: &str, b: &str) -> usize {
 /// O(n^2) because its N-gram / BK-tree index declines any UMI with a non-`ACGT` byte
 /// (`NgramIndex::new` / `BkTree::from_umis` return `None`), and every paired canonical form
 /// carries a `-`, so the sequential paired assigner never indexes and always falls to its
-/// reverse-aware linear scan. Only pools with at least one asymmetric-halves UMI take this path;
-/// note the `has_asymmetric_halves` gate is an `any()`, so a single asymmetric form routes the
-/// whole pool here (asymmetric dual UMIs are uncommon — most kits use symmetric halves, which
-/// keep the sub-quadratic `BitEnc` neighbour-generation path).
+/// reverse-aware linear scan. Only pools with at least one asymmetric-halves UMI take this path,
+/// plus orientation-prefixed pools whose prefixes do not rule out reverse matches (never the
+/// case for the keys `group` builds); the asymmetric gate is an `any()`, so a single asymmetric
+/// form routes the whole pool here (asymmetric dual UMIs are uncommon — most kits use
+/// symmetric halves, which keep the sub-quadratic `BitEnc` neighbour-generation path).
 #[must_use]
 fn discover_paired_edges_dash_aware(
     canon: &[&str],
@@ -914,12 +915,13 @@ impl UmiAssigner for ParallelAdjacencyAssigner {
 }
 
 /// The reverse-spelling representation the paired strand pass consumes, tagging which
-/// edge-discovery branch ran for a pool: `BitEnc` reverses for the symmetric fast path,
-/// dash-delimited `String` reverses for the asymmetric dash-aware path (#586). Both index
-/// parallel to the pool's sorted canonical forms.
+/// strand routine runs for a pool: `BitEnc` reverses for unprefixed symmetric-halves pools,
+/// full-string reverses (compared position-for-position, prefixes and dash included) for
+/// asymmetric-halves pools (#586) and for orientation-prefixed pools. Both index parallel to
+/// the pool's sorted canonical forms.
 enum ReverseForms {
-    Symmetric(Vec<BitEnc>),
-    Asymmetric(Vec<String>),
+    Encoded(Vec<BitEnc>),
+    Spelled(Vec<String>),
 }
 
 /// Parallel UMI assigner for Paired (duplex) strategy.
@@ -929,11 +931,18 @@ enum ReverseForms {
 /// ends of the original molecule. Reads from opposite strands have reversed
 /// UMI pairs: "AAAA-CCCC" and "CCCC-AAAA" represent the same molecule.
 ///
+/// `group` passes orientation-prefixed keys (`aa:AAAA-bb:CCCC`, see
+/// [`lower_read_umi_prefix`](Self::lower_read_umi_prefix)), exactly as it does for the
+/// sequential assigner, so the `/A` strand is the one whose R1 is the genomically earlier
+/// read. Unprefixed keys are also accepted and grouped as before.
+///
 /// Produces identical results to `PairedUmiAssigner` in `assigner.rs`.
 pub struct ParallelPairedAssigner {
     max_mismatches: u32,
     pool: rayon::ThreadPool,
     counter: MoleculeIdCounter,
+    lower_prefix: String,
+    higher_prefix: String,
 }
 
 impl ParallelPairedAssigner {
@@ -951,7 +960,28 @@ impl ParallelPairedAssigner {
             .num_threads(threads)
             .build()
             .expect("Failed to build rayon thread pool");
-        Self { max_mismatches, pool, counter: MoleculeIdCounter::default() }
+        // Same prefixes as the sequential `PairedUmiAssigner`: one longer than the edit
+        // threshold, so an `a`-prefixed half can never match a `b`-prefixed one.
+        let prefix_len = max_mismatches as usize + 1;
+        Self {
+            max_mismatches,
+            pool,
+            counter: MoleculeIdCounter::default(),
+            lower_prefix: "a".repeat(prefix_len),
+            higher_prefix: "b".repeat(prefix_len),
+        }
+    }
+
+    /// Prefix `group` adds to the UMI half read from the genomically earlier read of a pair.
+    #[must_use]
+    pub fn lower_read_umi_prefix(&self) -> &str {
+        &self.lower_prefix
+    }
+
+    /// Prefix `group` adds to the UMI half read from the genomically later read of a pair.
+    #[must_use]
+    pub fn higher_read_umi_prefix(&self) -> &str {
+        &self.higher_prefix
     }
 
     /// Reverse a paired UMI: "AAAA-CCCC" -> "CCCC-AAAA"
@@ -975,6 +1005,43 @@ impl ParallelPairedAssigner {
     /// Check if a UMI matches the canonical form (vs its reverse).
     fn matches_canonical(umi: &str, canonical: &str) -> bool {
         umi.to_uppercase() == canonical
+    }
+
+    /// Split one half of a paired key into its orientation prefix (the text before the last
+    /// `:`, empty when unprefixed) and its UMI sequence. DNA never contains `:`.
+    fn split_orientation_prefix(half: &str) -> (&str, &str) {
+        half.rsplit_once(':').unwrap_or(("", half))
+    }
+
+    /// The UMI bases of a paired key with any orientation prefixes removed:
+    /// `"AA:ACGT-BB:TTTT"` -> `"ACGT-TTTT"`. Unprefixed keys are returned unchanged.
+    fn strip_orientation_prefixes(umi: &str) -> String {
+        let (first, second) = umi.split_once('-').expect("validated paired UMI");
+        let (_, first) = Self::split_orientation_prefix(first);
+        let (_, second) = Self::split_orientation_prefix(second);
+        format!("{first}-{second}")
+    }
+
+    /// Whether every canonical key carries the same pair of equal-length orientation prefixes
+    /// that differ in more than `max_mismatches` positions (as `group` builds them).
+    ///
+    /// Then a key's reverse (halves, and so prefixes, swapped) differs from EVERY canonical
+    /// key in more than `max_mismatches` prefix positions, so the reverse half of
+    /// `matches_paired` can never fire, and two canonical keys are within threshold exactly
+    /// when their prefix-stripped bases are. That is what lets the `BitEnc` fast path group a
+    /// prefixed pool with forward edges only.
+    fn prefixes_block_reverse_matches(canonicals: &[&str], max_mismatches: u32) -> bool {
+        let Some(&first) = canonicals.first() else { return true };
+        let (lower, higher) = Self::orientation_prefixes(first);
+        lower.len() == higher.len()
+            && positional_hamming(lower, higher) > max_mismatches as usize
+            && canonicals.iter().all(|umi| Self::orientation_prefixes(umi) == (lower, higher))
+    }
+
+    /// The orientation prefixes of a paired key's two halves (empty when unprefixed).
+    fn orientation_prefixes(umi: &str) -> (&str, &str) {
+        let (first, second) = umi.split_once('-').expect("validated paired UMI");
+        (Self::split_orientation_prefix(first).0, Self::split_orientation_prefix(second).0)
     }
 }
 
@@ -1005,12 +1072,28 @@ impl ParallelPairedAssigner {
             *canonical_counts.entry(canonical).or_insert(0) += 1;
         }
 
+        // `group` sends orientation-prefixed keys (`aa:ACGT-bb:TTTT`, see
+        // `lower_read_umi_prefix`): the prefix records which read each half came from, so the
+        // canonical spelling is always the one whose R1 is the earlier read, and the strand
+        // follows read orientation rather than the order the UMI bases sort in. The prefixes
+        // take part in every comparison (as in the sequential assigner, which compares the
+        // full keys); only the 2-bit encoding, which cannot hold them, uses the bare bases.
+        // One prefixed key marks the whole pool: a pool mixing prefixed and plain keys (never
+        // built by `group`) has no common prefix pair, so it takes the exact full-string route
+        // below.
+        let oriented = raw_umis.iter().any(|umi| umi.contains(':'));
+
         // Build sorted list with BitEnc encoding (using canonical forms)
         let mut sorted_umis: Vec<(String, usize, BitEnc)> = canonical_counts
             .iter()
             .filter_map(|(umi, &count)| {
-                // For paired UMIs, encode without the dash
-                BitEnc::from_umi_str(umi).map(|enc| (umi.clone(), count, enc))
+                // For paired UMIs, encode without the dash (and without orientation prefixes)
+                let encoded = if oriented {
+                    BitEnc::from_umi_str(&Self::strip_orientation_prefixes(umi))
+                } else {
+                    BitEnc::from_umi_str(umi)
+                };
+                encoded.map(|enc| (umi.clone(), count, enc))
             })
             .collect();
 
@@ -1051,8 +1134,19 @@ impl ParallelPairedAssigner {
         // `sorted_umis`: the encodable canonical forms that actually feed edge discovery.
         let has_asymmetric_halves = sorted_umis.iter().any(|(umi, _, _)| {
             let (left, right) = umi.split_once('-').expect("validated paired UMI");
-            left.len() != right.len()
+            Self::split_orientation_prefix(left).1.len()
+                != Self::split_orientation_prefix(right).1.len()
         });
+
+        // A prefixed pool takes the `BitEnc` fast path only when its prefixes rule out every
+        // reverse-orientation match (always the case for `group`'s prefixes); otherwise it is
+        // grouped on the full prefixed strings like an asymmetric pool, which reproduces the
+        // sequential relation exactly for any prefixes.
+        let compare_full_strings = has_asymmetric_halves
+            || (oriented && {
+                let canon: Vec<&str> = sorted_umis.iter().map(|(umi, _, _)| umi.as_str()).collect();
+                !Self::prefixes_block_reverse_matches(&canon, self.max_mismatches)
+            });
 
         // Phase 1: Parallel edge discovery (using configured thread pool).
         //
@@ -1065,15 +1159,20 @@ impl ParallelPairedAssigner {
         // one is reversed (GRP3-01). So we union the forward edges with a
         // reverse-orientation edge pass.
         //
+        // Three branches. The full-string branch (asymmetric halves, or prefixes that do not
+        // rule out reverse matches) compares the dash-delimited keys position-for-position and
+        // emits directed `(parent, child)` edges. The prefixed fast path emits forward edges on
+        // the prefix-stripped bases only, since its prefixes rule out every reverse match. The
+        // unprefixed fast path unions forward and reverse `BitEnc` edges. Both fast paths
+        // emit undirected `(i, j)` (`i < j`) pairs; the adjacency construction below
+        // reciprocates only those (see `directed`).
+        //
         // The strand pass and the palindrome test below need the reverse spelling of each
-        // canonical form. The symmetric path carries it as a `BitEnc` (`reverse_encs`); the
-        // asymmetric path carries it as the dash-delimited `String` (`reverse_strs`). Exactly
-        // one is populated, selecting which strand routine runs after the BFS.
-        // `edges` are directed `(parent, child)` pairs for the asymmetric branch and
-        // undirected `(i, j)` (`i < j`) pairs for the symmetric branch; the adjacency
-        // construction below reciprocates only the undirected case (see `directed`).
+        // canonical form: a `BitEnc` (`reverse_encs`) on the unprefixed fast path, the full
+        // `String` (`reverse_strs`) otherwise. Exactly one is populated, selecting which
+        // strand routine runs after the BFS.
         let max_mismatches = self.max_mismatches;
-        let (edges, reverse_forms): (Vec<(usize, usize)>, ReverseForms) = if has_asymmetric_halves {
+        let (edges, reverse_forms): (Vec<(usize, usize)>, ReverseForms) = if compare_full_strings {
             let canon: Vec<&str> = sorted_umis.iter().map(|(umi, _, _)| umi.as_str()).collect();
             let reverse_strs: Vec<String> = sorted_umis
                 .iter()
@@ -1083,7 +1182,18 @@ impl ParallelPairedAssigner {
                 let reverse_refs: Vec<&str> = reverse_strs.iter().map(String::as_str).collect();
                 discover_paired_edges_dash_aware(&canon, &reverse_refs, max_mismatches)
             });
-            (edges, ReverseForms::Asymmetric(reverse_strs))
+            (edges, ReverseForms::Spelled(reverse_strs))
+        } else if oriented {
+            // Prefixed keys whose prefixes block every reverse match: forward edges on the
+            // prefix-stripped bases are the whole relation. Strands are still decided on the
+            // full prefixed strings, as the sequential assigner does.
+            let reverse_strs: Vec<String> = sorted_umis
+                .iter()
+                .map(|(umi, _, _)| Self::reverse_paired(umi).unwrap_or_else(|| umi.clone()))
+                .collect();
+            let edges =
+                self.pool.install(|| discover_edges_parallel_k(&unique_umis, max_mismatches));
+            (edges, ReverseForms::Spelled(reverse_strs))
         } else {
             // Encode the REVERSE of each canonical form (halves swapped) alongside it, so
             // the reverse-orientation edge pass and the strand assignment can both use it.
@@ -1105,7 +1215,7 @@ impl ParallelPairedAssigner {
                 set.extend(reverse);
                 set.into_iter().collect::<Vec<_>>()
             });
-            (edges, ReverseForms::Symmetric(reverse_encs))
+            (edges, ReverseForms::Encoded(reverse_encs))
         };
 
         // Build adjacency list. `edges` is an `AHashSet` whose iteration order is seeded
@@ -1118,9 +1228,9 @@ impl ParallelPairedAssigner {
         // construction to pin a deterministic neighbor order (ascending index == count
         // descending, then UMI string, matching the sorted order the BFS processes roots in).
         //
-        // Directedness differs by branch. The symmetric `BitEnc` relation is symmetric, so the
-        // graph is undirected (both `i->j` and `j->i`); the BFS reaches every member of a
-        // component regardless. The asymmetric dash-aware relation is DIRECTED as
+        // Directedness differs by branch. Both `BitEnc` fast paths use a symmetric relation, so
+        // the graph is undirected (both `i->j` and `j->i`); the BFS reaches every member of a
+        // component regardless. The full-string relation is DIRECTED as
         // `matches_paired(parent, child)`, which is NOT symmetric across differing split points
         // (a halves-swapped reverse of the parent is tested, not of the child), and
         // `discover_paired_edges_dash_aware` emits every matching ordered pair `(i, j)` with `i`
@@ -1134,7 +1244,7 @@ impl ParallelPairedAssigner {
         // count-gate below and on processing roots in index (count-descending) order: together
         // they reproduce the sequential assigner's directed BFS, which absorbs each child exactly
         // once from the first parent that reaches it and never re-parents an assigned node.
-        let directed = has_asymmetric_halves;
+        let directed = compare_full_strings;
         let mut adj_list: Vec<Vec<usize>> = vec![Vec::new(); unique_umis.len()];
         for (i, j) in edges {
             adj_list[i].push(j);
@@ -1185,14 +1295,14 @@ impl ParallelPairedAssigner {
             }
         }
 
-        // Strand relative to each cluster's root, dash-aware for the asymmetric branch and
-        // `BitEnc`-based for the symmetric fast path. `reverse_forms` records which branch
-        // built `edges`, so the strand routine matches it.
+        // Strand relative to each cluster's root: on the full keys (prefixes and dash included)
+        // for the full-string branch and the prefixed fast path, `BitEnc`-based for the
+        // unprefixed fast path. `reverse_forms` records which one applies.
         let canonical_strand = match &reverse_forms {
-            ReverseForms::Symmetric(reverse_encs) => {
+            ReverseForms::Encoded(reverse_encs) => {
                 paired_canonical_strands(&unique_umis, reverse_encs, &mol_ids, &cluster_root)
             }
-            ReverseForms::Asymmetric(reverse_strs) => {
+            ReverseForms::Spelled(reverse_strs) => {
                 let canon: Vec<&str> = sorted_umis.iter().map(|(umi, _, _)| umi.as_str()).collect();
                 let reverse_refs: Vec<&str> = reverse_strs.iter().map(String::as_str).collect();
                 paired_canonical_strands_dash_aware(&canon, &reverse_refs, &mol_ids, &cluster_root)
@@ -2291,6 +2401,87 @@ mod tests {
         );
     }
 
+    /// `group` sends the paired assigners orientation-prefixed keys: each half carries a
+    /// prefix naming whether it came from the genomically earlier (`aa:`) or later (`bb:`)
+    /// read, so a molecule's two strands are `aa:X-bb:Y` (R1 earlier) and `bb:Y-aa:X`
+    /// (R1 later). The parallel assigner must group these exactly like the sequential one,
+    /// including the absolute `/A` (`aa:` first) vs `/B` labels -- whatever order the UMI
+    /// bases sort in, and even when both halves are identical so the unprefixed spellings of
+    /// the two strands would be the same string.
+    #[rstest]
+    #[case::identical_halves(&["aa:ACGT-bb:ACGT", "bb:ACGT-aa:ACGT", "aa:ACGT-bb:ACGT"])]
+    #[case::halves_sort_descending(&["aa:TTTT-bb:AAAA", "bb:AAAA-aa:TTTT"])]
+    #[case::adjacency_chain(&[
+        "aa:AAAA-bb:CCCC", "aa:AAAA-bb:CCCC", "aa:AAAA-bb:CCCC", "aa:AAAA-bb:CCCC",
+        "aa:AAAT-bb:CCCC", "aa:AAAT-bb:CCCC", "aa:AATT-bb:CCCC", "bb:CCCC-aa:AATT",
+    ])]
+    #[case::invalid_umis(&["aa:ACGT-bb:TTTT", "aa:ACGN-bb:TTTT", "bb:TTTT-aa:ACGN"])]
+    #[case::asymmetric_halves(&["aa:AC-bb:GTA", "bb:GTA-aa:AC", "aa:ACG-bb:TA"])]
+    #[case::mixed_case(&["aa:acgt-bb:TTTT", "bb:tttt-aa:ACGT"])]
+    fn test_parallel_paired_prefixed_keys_match_sequential(#[case] umis: &[&str]) {
+        let umis: Vec<Umi> = umis.iter().map(|s| (*s).to_string()).collect();
+        let sequential = crate::umi::PairedUmiAssigner::new(1).assign(&umis);
+        for threads in [2usize, 4] {
+            let parallel = ParallelPairedAssigner::new(1, threads).assign(&umis);
+            assert!(
+                assignments_equivalent(&sequential, &parallel),
+                "threads={threads}\n  umis:       {umis:?}\n  sequential: {sequential:?}\n  \
+                 parallel:   {parallel:?}"
+            );
+        }
+    }
+
+    /// Prefixed pools whose prefixes do NOT rule out reverse matches must still group exactly
+    /// like the sequential assigner, which compares the full keys. With one-character prefixes
+    /// and two edits, `A:CCCC-B:AAAA` is two mismatches (just the prefixes) from the reverse of
+    /// `A:AAAA-B:CCCC`, so the sequential assigner pulls it into that molecule as the other
+    /// strand; a forward-only fast path would split it off. A pool mixing prefixed and plain
+    /// keys (never produced by `group`) has no common prefix pair and takes the same exact route.
+    #[rstest]
+    #[case::prefixes_within_threshold(
+        2,
+        &["A:AAAA-B:CCCC", "A:AAAA-B:CCCC", "A:AAAA-B:CCCC", "A:CCCC-B:AAAA"]
+    )]
+    #[case::prefixed_and_plain(1, &["aa:ACGT-bb:TTTT", "aa:ACGT-bb:TTTT", "ACGT-TTTT", "TTTT-ACGT"])]
+    fn test_parallel_paired_prefixed_full_string_fallback_matches_sequential(
+        #[case] edits: u32,
+        #[case] umis: &[&str],
+    ) {
+        let umis: Vec<Umi> = umis.iter().map(|s| (*s).to_string()).collect();
+        let sequential = crate::umi::PairedUmiAssigner::new(edits).assign(&umis);
+        let parallel = ParallelPairedAssigner::new(edits, 2).assign(&umis);
+        assert!(
+            assignments_equivalent(&sequential, &parallel),
+            "umis: {umis:?}\n  sequential: {sequential:?}\n  parallel:   {parallel:?}"
+        );
+    }
+
+    /// With orientation-prefixed keys the strand is the read orientation: the key whose
+    /// earlier-read (`aa:`) half comes first is `/A`, its other strand `/B`, and both share one
+    /// molecule -- also when the two halves are identical.
+    #[test]
+    fn test_parallel_paired_prefixed_identical_halves_split_strands() {
+        let umis: Vec<Umi> = vec!["aa:ACGT-bb:ACGT".to_string(), "bb:ACGT-aa:ACGT".to_string()];
+        let ids = ParallelPairedAssigner::new(1, 2).assign(&umis);
+        match (ids[0], ids[1]) {
+            (MoleculeId::PairedA(a), MoleculeId::PairedB(b)) => assert_eq!(a, b, "{ids:?}"),
+            _ => panic!("expected one molecule with /A then /B, got {ids:?}"),
+        }
+    }
+
+    /// The prefixes `group` builds for the parallel paired assigner match the sequential one's,
+    /// so both assigners see identical keys for the same reads.
+    #[rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(3)]
+    fn test_parallel_paired_prefixes_match_sequential(#[case] edits: u32) {
+        let parallel = ParallelPairedAssigner::new(edits, 2);
+        let sequential = crate::umi::PairedUmiAssigner::new(edits);
+        assert_eq!(parallel.lower_read_umi_prefix(), sequential.lower_read_umi_prefix());
+        assert_eq!(parallel.higher_read_umi_prefix(), sequential.higher_read_umi_prefix());
+    }
+
     /// A paired UMI's `-` split point is dropped by `BitEnc::from_umi_str`, so two
     /// DISTINCT canonical forms with the same concatenated bases but different split
     /// points encode to the same `BitEnc`. This is only possible with ASYMMETRIC halves
@@ -2876,6 +3067,59 @@ mod tests {
             }
         }
 
+        /// Add `group`'s orientation prefixes to each key of an unprefixed pool. `r1_earlier[i]`
+        /// says whether key `i`'s first half came from the genomically earlier read; it is
+        /// drawn independently of the spelling so both strands of a molecule, identical halves,
+        /// and swapped-UMI molecules all occur. Prefix length is `max_mismatches + 1`, as
+        /// `group` builds it.
+        fn prefix_pool(umis: &[String], r1_earlier: &[bool], max_mismatches: u32) -> Vec<String> {
+            let len = max_mismatches as usize + 1;
+            let (lower, higher) = ("a".repeat(len), "b".repeat(len));
+            umis.iter()
+                .enumerate()
+                .map(|(i, umi)| {
+                    let (first, second) = umi.split_once('-').expect("paired UMI");
+                    let (p1, p2) = if r1_earlier[i % r1_earlier.len()] {
+                        (&lower, &higher)
+                    } else {
+                        (&higher, &lower)
+                    };
+                    format!("{p1}:{first}-{p2}:{second}")
+                })
+                .collect()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(300))]
+            /// Parallel-vs-sequential PAIRED parity on the orientation-prefixed keys `group`
+            /// actually sends: same base molecules, same strand partition, and the same
+            /// absolute `/A` `/B` label on every read, at every thread count.
+            #[test]
+            fn prop_parallel_paired_prefixed_matches_sequential(
+                molecules in prop::collection::vec(
+                    (prop::collection::vec(0u8..4, 4), prop::collection::vec(0u8..4, 4)),
+                    1..=5,
+                ),
+                reads in prop::collection::vec(
+                    (0usize..5, any::<bool>(), prop::option::of(0usize..8)),
+                    1..=24,
+                ),
+                r1_earlier in prop::collection::vec(any::<bool>(), 1..=24),
+                max_mismatches in 1u32..=2,
+            ) {
+                let umis = prefix_pool(&build_pool(&molecules, &reads), &r1_earlier, max_mismatches);
+                let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches).assign(&umis);
+                for threads in [1usize, 4, 16] {
+                    let parallel = ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis);
+                    prop_assert!(
+                        assignments_equivalent(&sequential, &parallel),
+                        "prefixed: max_mismatches={max_mismatches} threads={threads}\n  \
+                         umis={umis:?}\n  seq={sequential:?}\n  par={parallel:?}"
+                    );
+                }
+            }
+        }
+
         /// Build an ASYMMETRIC-halves pool: every UMI shares one total base length (so the
         /// sequential assigner's uniform-length guard admits the pool) but the split point
         /// varies per molecule, so `L-R` spellings collide under the dash-blind `BitEnc`
@@ -2963,6 +3207,38 @@ mod tests {
                         "asymmetric same-thread nondeterminism: max_mismatches={max_mismatches} \
                          threads={threads}\n  umis={umis:?}\n  run1={parallel:?}\n  \
                          run2={parallel_again:?}"
+                    );
+                }
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(300))]
+            /// As `prop_parallel_paired_prefixed_matches_sequential`, on ASYMMETRIC-halves pools
+            /// (the dash-aware branch), with exact `/A` `/B` labels.
+            #[test]
+            fn prop_parallel_paired_prefixed_asymmetric_matches_sequential(
+                total_bases in 3usize..=8,
+                molecules in prop::collection::vec(
+                    (prop::collection::vec(0u8..4, 1..=8), 0u8..=255),
+                    1..=5,
+                ),
+                reads in prop::collection::vec(
+                    (0usize..5, any::<bool>(), prop::option::of(0usize..8)),
+                    1..=24,
+                ),
+                r1_earlier in prop::collection::vec(any::<bool>(), 1..=24),
+                max_mismatches in 1u32..=2,
+            ) {
+                let pool = build_pool_asymmetric(total_bases, &molecules, &reads);
+                let umis = prefix_pool(&pool, &r1_earlier, max_mismatches);
+                let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches).assign(&umis);
+                for threads in [1usize, 4, 16] {
+                    let parallel = ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis);
+                    prop_assert!(
+                        assignments_equivalent(&sequential, &parallel),
+                        "prefixed asymmetric: max_mismatches={max_mismatches} threads={threads}\n  \
+                         umis={umis:?}\n  seq={sequential:?}\n  par={parallel:?}"
                     );
                 }
             }

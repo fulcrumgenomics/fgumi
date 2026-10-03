@@ -396,15 +396,16 @@ reviews:
         assigners in `crates/fgumi-umi`: treat any change to grouping or
         assignment as output-changing, require parity coverage against the
         sequential path, and check the lock-free union-find and partition-merge
-        concurrency. CRITICAL CONTRACT — the two sides take DIFFERENT key
-        formats, and conflating them has produced wrong fixes on both: the
-        SEQUENTIAL `PairedUmiAssigner` receives orientation-PREFIXED string keys
-        (`aa:ACGT-bb:TTTT`) built in `src/lib/commands/group.rs`, so those keys
-        are deliberately string-based and are NOT `BitEnc`-encodable; the
-        PARALLEL assigner receives CLEAN uppercase UMIs from a different call
-        site in the same file, so whole-string `BitEnc` encoding is correct
-        there. Verify which side a diff touches before proposing an encoding or
-        filtering change. The `simulate` module is the source of test data for
+        concurrency. CRITICAL CONTRACT — both paired assigners, SEQUENTIAL
+        `PairedUmiAssigner` and PARALLEL `ParallelPairedAssigner`, receive the
+        same orientation-PREFIXED string keys (`aa:ACGT-bb:TTTT`) built in
+        `src/lib/commands/group.rs`; the prefix records which read each half
+        came from and is what makes `/A` follow read orientation. Those keys
+        are NOT `BitEnc`-encodable as a whole: the parallel assigner encodes
+        only the prefix-stripped bases and must keep the prefixes in every
+        comparison and strand decision. Unprefixed keys reach the paired
+        assigners only from unit tests. Do not propose dropping the prefixes
+        or encoding the whole key. The `simulate` module is the source of test data for
         much of the suite, so a bug here silently weakens every test consuming
         it: scrutinize its float math (family-size, insert-size, quality,
         strand-bias distributions) for bias, off-by-one, and mis-seeded RNG, and
