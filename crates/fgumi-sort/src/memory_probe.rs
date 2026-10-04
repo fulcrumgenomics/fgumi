@@ -49,6 +49,18 @@ pub use platform_ffi::{
     force_mi_collect, mi_purge_delay_ms, process_rss_bytes, retain_freed_memory,
 };
 
+/// mimalloc purge delay, in milliseconds, that [`retain_freed_memory`] sets.
+///
+/// mimalloc's default (1000 ms) decommits a freed page after a second, so the
+/// align stage's per-batch buffers, which are freed and reallocated well within
+/// that, fault back in on every batch. Never purging (`-1`) avoids those faults
+/// but also never returns any freed page to the OS: in a fused `runall`, each
+/// sort spill's freed memory then stays resident, and peak RSS grows by roughly
+/// the sort's memory budget. Sixty seconds keeps the batch-to-batch reuse
+/// resident (page faults close to never purging, against 25x or more at the
+/// default) while memory that sits idle across a spill cycle is still returned.
+pub const RETAINED_PURGE_DELAY_MS: i32 = 60_000;
+
 /// Log target for the memory probe.
 ///
 /// Intentionally retained as `fgumi_lib::sort::memory_probe` (the pre-extraction
@@ -82,15 +94,20 @@ mod platform_ffi {
     /// linked mimalloc v3's default of 1000 ms.
     const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
 
-    /// Stop mimalloc returning freed pages to the OS (`purge_delay = -1`), so a
-    /// page that is freed and soon reused is not decommitted and faulted back
-    /// in. Trades a higher peak RSS for fewer page faults and less system time.
+    /// Delay mimalloc returning freed pages to the OS by
+    /// [`RETAINED_PURGE_DELAY_MS`](super::RETAINED_PURGE_DELAY_MS), so a page
+    /// that is freed and soon reused is not decommitted and faulted back in.
+    /// Trades a somewhat higher peak RSS for fewer page faults and less system
+    /// time.
     pub fn retain_freed_memory() {
         // SAFETY: mi_option_set only stores the option value in mimalloc's
         // option table; mimalloc reads it on each purge, so setting it after
         // start-up is supported, and the option index is fixed (see above).
         unsafe {
-            libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, -1);
+            libmimalloc_sys::mi_option_set(
+                MI_OPTION_PURGE_DELAY,
+                std::ffi::c_long::from(super::RETAINED_PURGE_DELAY_MS),
+            );
         }
     }
 
@@ -564,7 +581,8 @@ mod tests {
 
     /// Pins [`platform_ffi`]'s purge-delay option index: the linked mimalloc v3
     /// defaults `mi_option_purge_delay` to 1000 ms (v2 used 10 ms), and retaining
-    /// freed memory sets it to -1. Skipped when the environment overrides it.
+    /// freed memory sets it to [`RETAINED_PURGE_DELAY_MS`] (a bounded delay, not
+    /// `-1`'s never-purge). Skipped when the environment overrides it.
     #[test]
     fn mi_purge_delay_ms_matches_mimalloc_default() {
         // mimalloc matches its option names case-insensitively.
@@ -576,7 +594,7 @@ mod tests {
         }
         assert_eq!(mi_purge_delay_ms(), 1000);
         retain_freed_memory();
-        assert_eq!(mi_purge_delay_ms(), -1);
+        assert_eq!(mi_purge_delay_ms(), i64::from(RETAINED_PURGE_DELAY_MS));
     }
 
     #[test]
