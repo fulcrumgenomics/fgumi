@@ -755,12 +755,7 @@ impl RawRecordClipper {
         record: &mut fgumi_raw_bam::RawRecord,
         clip_length: usize,
     ) -> usize {
-        let ops = record.cigar_ops_vec();
-        let existing_clipping: usize = ops
-            .iter()
-            .take_while(|&&op| matches!(op & 0xF, 4 | 5))
-            .map(|&op| (op >> 4) as usize)
-            .sum();
+        let existing_clipping = Self::clipping_at_end_raw(&record.cigar_ops_vec(), true);
 
         if clip_length > existing_clipping && !Self::lacks_seq_raw(record) {
             self.clip_start_of_alignment(record, clip_length - existing_clipping)
@@ -776,13 +771,7 @@ impl RawRecordClipper {
         record: &mut fgumi_raw_bam::RawRecord,
         clip_length: usize,
     ) -> usize {
-        let ops = record.cigar_ops_vec();
-        let existing_clipping: usize = ops
-            .iter()
-            .rev()
-            .take_while(|&&op| matches!(op & 0xF, 4 | 5))
-            .map(|&op| (op >> 4) as usize)
-            .sum();
+        let existing_clipping = Self::clipping_at_end_raw(&record.cigar_ops_vec(), false);
 
         if clip_length > existing_clipping && !Self::lacks_seq_raw(record) {
             self.clip_end_of_alignment(record, clip_length - existing_clipping)
@@ -1002,7 +991,7 @@ impl RawRecordClipper {
         }
 
         // SoftWithMask: mask existing soft-clipped bases at both ends via upgrade_clipping_raw,
-        // leaving the CIGAR intact (see the typed upgrade_all_clipping for rationale).
+        // leaving the CIGAR intact, as fgbio `upgradeAllClipping` does via `clip{Start,End}OfRead`.
         if self.mode == ClippingMode::SoftWithMask {
             if leading_soft > 0 {
                 self.upgrade_clipping_raw(record, leading_hard + leading_soft, true);
@@ -3491,7 +3480,8 @@ mod tests {
     fn test_clip_overlapping_reads_normalizes_by_strand_typed(
         #[case] fwd_start: usize,
         #[case] rev_start: usize,
-        #[values(ClippingMode::Soft, ClippingMode::Hard)] mode: ClippingMode,
+        #[values(ClippingMode::Soft, ClippingMode::SoftWithMask, ClippingMode::Hard)]
+        mode: ClippingMode,
     ) {
         let clipper = RawClipperOnBuf::new(mode);
         let seq = "A".repeat(100);
@@ -3530,7 +3520,8 @@ mod tests {
     fn test_clip_overlapping_reads_normalizes_by_strand_raw(
         #[case] fwd_start: usize,
         #[case] rev_start: usize,
-        #[values(ClippingMode::Soft, ClippingMode::Hard)] mode: ClippingMode,
+        #[values(ClippingMode::Soft, ClippingMode::SoftWithMask, ClippingMode::Hard)]
+        mode: ClippingMode,
     ) {
         use fgumi_raw_bam::encode_record_buf_to_raw;
         use noodles::sam::header::record::value::Map;

@@ -301,8 +301,10 @@ impl ClipParams {
     ) -> Result<(bool, bool)> {
         // Upgrade existing clipping on *every* read of the template first — including
         // secondary/supplementary alignments — matching fgbio ClipBam (ClipBam.scala:123) before
-        // clipping the primary pair. The per-read `clip_pair`/`clip_fragment` helpers deliberately
-        // do NOT upgrade, so this pre-pass is the sole upgrade site for both threading paths.
+        // clipping the primary pair. The per-read `clip_pair`/`clip_fragment` helpers do not run
+        // this whole-read upgrade, so this pre-pass is its sole site for both threading paths.
+        // (Those helpers still upgrade existing clipping at the specific end they clip, as fgbio's
+        // `clip{5,3}PrimeEndOfRead` and `clipOverlappingReads` do, regardless of this flag.)
         if self.upgrade_clipping {
             for record in records.iter_mut() {
                 clipper.upgrade_all_clipping_raw(record)?;
