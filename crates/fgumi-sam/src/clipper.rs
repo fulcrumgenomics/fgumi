@@ -27,6 +27,38 @@ fn is_modification_tag(tag: [u8; 2]) -> bool {
     MODIFICATION_TAGS.iter().any(|t| **t == tag)
 }
 
+/// SAM tags whose values are never per-base, so `--auto-clip-attributes` must not slice them even
+/// when their length happens to equal the read's.
+const NON_PER_BASE_TAGS: [fgumi_raw_bam::SamTag; 22] = [
+    fgumi_raw_bam::SamTag::RG,
+    fgumi_raw_bam::SamTag::new(b'L', b'B'),
+    fgumi_raw_bam::SamTag::new(b'P', b'U'),
+    fgumi_raw_bam::SamTag::PG,
+    fgumi_raw_bam::SamTag::new(b'C', b'O'),
+    fgumi_raw_bam::SamTag::MI,
+    fgumi_raw_bam::SamTag::BC,
+    fgumi_raw_bam::SamTag::QT,
+    fgumi_raw_bam::SamTag::RX,
+    fgumi_raw_bam::SamTag::QX,
+    fgumi_raw_bam::SamTag::OX,
+    fgumi_raw_bam::SamTag::BZ,
+    fgumi_raw_bam::SamTag::CB,
+    fgumi_raw_bam::SamTag::new(b'C', b'R'),
+    fgumi_raw_bam::SamTag::CY,
+    fgumi_raw_bam::SamTag::new(b'U', b'B'),
+    fgumi_raw_bam::SamTag::new(b'U', b'R'),
+    fgumi_raw_bam::SamTag::new(b'U', b'Y'),
+    fgumi_raw_bam::SamTag::MC,
+    fgumi_raw_bam::SamTag::new(b'S', b'A'),
+    fgumi_raw_bam::SamTag::new(b'O', b'A'),
+    fgumi_raw_bam::SamTag::new(b'O', b'C'),
+];
+
+/// Whether `--auto-clip-attributes` must leave `tag` untouched whatever its length.
+fn is_never_auto_clipped(tag: [u8; 2]) -> bool {
+    is_modification_tag(tag) || NON_PER_BASE_TAGS.iter().any(|t| **t == tag)
+}
+
 const TAGS_TO_REVERSE: [fgumi_raw_bam::SamTag; 2] =
     [fgumi_raw_bam::SamTag::OQ, fgumi_raw_bam::SamTag::U2];
 
@@ -109,7 +141,7 @@ impl RawRecordClipper {
 
         for entry in view.iter_typed() {
             let (tag, value) = entry;
-            if is_modification_tag(tag) {
+            if is_never_auto_clipped(tag) {
                 continue;
             }
             match value {
@@ -1062,7 +1094,7 @@ impl RawRecordClipper {
 
             for (tag, value) in view.iter_typed() {
                 use fgumi_raw_bam::TagValue;
-                if is_modification_tag(tag) {
+                if is_never_auto_clipped(tag) {
                     continue;
                 }
                 match value {
@@ -2386,6 +2418,38 @@ mod tests {
         if let Some(Value::String(s)) = record.data().get(&tag) {
             let bytes: &[u8] = s.as_ref();
             assert_eq!(bytes, b"0123456789");
+        }
+    }
+
+    #[test]
+    fn test_auto_clip_attributes_skips_non_per_base_tags() {
+        use noodles::sam::alignment::record::data::field::Tag;
+
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
+        let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
+        for tag in NON_PER_BASE_TAGS {
+            record.data_mut().insert(Tag::from(*tag), Value::from("0123456789"));
+        }
+        let per_base = Tag::from([b'X', b'B']);
+        record.data_mut().insert(per_base, Value::from("0123456789"));
+
+        assert_eq!(clipper.clip_start_of_alignment(&mut record, 3), 3);
+
+        for tag in NON_PER_BASE_TAGS {
+            match record.data().get(&Tag::from(*tag)) {
+                Some(Value::String(s)) => {
+                    let bytes: &[u8] = s.as_ref();
+                    assert_eq!(bytes, b"0123456789", "tag {tag:?} was clipped");
+                }
+                other => panic!("tag {tag:?} missing or retyped: {other:?}"),
+            }
+        }
+        match record.data().get(&per_base) {
+            Some(Value::String(s)) => {
+                let bytes: &[u8] = s.as_ref();
+                assert_eq!(bytes, b"3456789");
+            }
+            other => panic!("tag XB missing or retyped: {other:?}"),
         }
     }
 
