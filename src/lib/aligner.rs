@@ -128,15 +128,16 @@ impl AlignerProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // bwa-mem3 links mimalloc, whose default purge decommits freed pages
-        // after 1 s and costs the aligner page faults on every batch: never
-        // purging measured -0.5% wall on the bwa-mem3 CLI alone. A user-set
-        // value (either name, any case) is inherited unchanged; aligners
-        // without mimalloc ignore the variable. The variable reaches every
-        // process in the shell command, so with `--aligner::command` any
-        // mimalloc-linked tool in the user's pipeline also keeps its freed
-        // pages (higher RSS); set `MIMALLOC_PURGE_DELAY` to opt out.
+        // after 1 s and costs the aligner page faults on every batch, so the
+        // child gets the same bounded delay as fgumi itself
+        // (`fgumi_sort::RETAINED_PURGE_DELAY_MS`). A user-set value (either
+        // name, any case) is inherited unchanged; aligners without mimalloc
+        // ignore the variable. The variable reaches every process in the shell
+        // command, so with `--aligner::command` any mimalloc-linked tool in the
+        // user's pipeline also delays returning freed pages; set
+        // `MIMALLOC_PURGE_DELAY` to choose otherwise.
         if !user_set_mimalloc_purge() {
-            cmd.env("MIMALLOC_PURGE_DELAY", "-1");
+            cmd.env("MIMALLOC_PURGE_DELAY", fgumi_sort::RETAINED_PURGE_DELAY_MS.to_string());
         }
         let mut child =
             cmd.spawn().with_context(|| format!("failed to spawn aligner command: {command}"))?;
@@ -1346,6 +1347,25 @@ mod tests {
         let mut output = String::new();
         stdout.read_to_string(&mut output).expect("should read stdout");
         assert_eq!(output.trim(), "hello");
+
+        proc.wait().expect("process should exit successfully");
+    }
+
+    /// The aligner child inherits fgumi's bounded mimalloc purge delay, not
+    /// mimalloc's 1 s default and not a never-purge `-1`. Skipped when the
+    /// environment already sets the delay, which the child then inherits as is.
+    #[test]
+    fn test_spawn_passes_bounded_purge_delay_to_child() {
+        if user_set_mimalloc_purge() {
+            return;
+        }
+        let mut proc = AlignerProcess::spawn("printf %s \"${MIMALLOC_PURGE_DELAY-unset}\"", 10)
+            .expect("spawn should succeed");
+        let mut stdout = proc.take_stdout().expect("stdout should be available");
+
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).expect("should read stdout");
+        assert_eq!(output, fgumi_sort::RETAINED_PURGE_DELAY_MS.to_string());
 
         proc.wait().expect("process should exit successfully");
     }

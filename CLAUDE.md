@@ -162,16 +162,19 @@ The following external FFI calls are approved because they back core infrastruct
   `retain_freed_memory` / `mi_purge_delay_ms` calling `mi_option_set` /
   `mi_option_get`) are isolated to a single `#[allow(unsafe_code)]` sub-module.
   mimalloc synchronizes these calls internally, so they are safe to invoke
-  concurrently. `retain_freed_memory` sets mimalloc's purge delay to -1 (never
-  return freed pages to the OS); both align backends call it at wiring (via
+  concurrently. `retain_freed_memory` sets mimalloc's purge delay to
+  `RETAINED_PURGE_DELAY_MS` (60 s); both align backends call it at wiring (via
   `retain_freed_memory_unless_user_set`) unless `MIMALLOC_PURGE_DELAY` is set,
-  because their per-batch buffer churn otherwise costs millions of page faults. The
-  setting is process-wide and never restored, so it also turns fgumi-sort's
-  `force_mi_collect()` into a no-op for later `runall` stages; measured end to end
-  (extract through consensus, 1M pairs, 32 threads) it is still 3-4% faster, sort
-  spills included, for up to ~2 GB more peak RSS in-process (~0.4 GB subprocess).
-  The subprocess route also passes `MIMALLOC_PURGE_DELAY=-1` to the aligner child
-  through its environment, which needs no FFI. A safe alternative does not exist:
+  because their per-batch buffer churn otherwise costs millions of page faults at
+  mimalloc's 1 s default. The setting is process-wide and never restored. It is
+  deliberately bounded, not -1 (never purge): under -1 every page a later stage
+  frees stays resident (mimalloc does not even mark it purgeable, so
+  `force_mi_collect()` cannot release it), and a fused sort's freed spill memory
+  then adds roughly the sort's budget to peak RSS (+5.5 GB on 30M pairs). 60 s
+  matches -1 on wall time, CPU and page faults (3M pairs, 32 threads) while
+  returning most of that memory. The subprocess route also passes the same delay to
+  the aligner child through `MIMALLOC_PURGE_DELAY`, which needs no FFI. A safe
+  alternative does not exist:
   mimalloc reads its environment only at process start, and `libmimalloc-sys`
   exports no safe setter.
   The option index (15) is not exported as a constant; a unit test pins it against

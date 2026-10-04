@@ -468,18 +468,23 @@ pub(crate) fn split_pair_into_singles(template: Template) -> io::Result<(Templat
     Ok((to_template(first)?, to_template(second)?))
 }
 
-/// Keep mimalloc from returning freed pages to the OS, unless the user set the
-/// purge delay. The align stage frees and reallocates large per-batch buffers
-/// on every pool thread, and mimalloc's default purge (decommit after 1 s)
-/// turns that reuse into millions of page faults.
+/// Delay mimalloc returning freed pages to the OS (by
+/// [`fgumi_sort::RETAINED_PURGE_DELAY_MS`]), unless the user set the purge
+/// delay. The align stage frees and reallocates large per-batch buffers on
+/// every pool thread, and mimalloc's default purge (decommit after 1 s) turns
+/// that reuse into millions of page faults.
 ///
 /// The setting is process-wide and is never restored, so it covers every stage
-/// of the `runall` process, not just align: fgumi-sort's `force_mi_collect()`
-/// stops returning memory to the OS too. Measured end to end (extract through
-/// simplex consensus, 1M pairs, 32 threads) it is still faster with it,
-/// including when sort spills: wall -3 to -4%, CPU -2 to -3%, page faults
-/// ~700k to under 40k, for up to ~2 GB (~12%) more peak RSS in-process and
-/// ~0.4 GB on the subprocess route. Set `MIMALLOC_PURGE_DELAY` to opt out.
+/// of the `runall` process, not just align. The delay is bounded rather than
+/// never-purge on purpose: with `-1`, memory a fused sort frees at each spill
+/// is never returned, and peak RSS grows by roughly the sort's memory budget
+/// (+5.5 GB in-process on 30M pairs, enough to exceed a 30 GB limit). Measured
+/// on 3M pairs at 32 threads (extract through simplex consensus, subprocess and
+/// in-process aligners, with and without a spilling sort), the 60 s delay
+/// matches never-purging on wall time, CPU and page faults (~30k vs ~750k at
+/// mimalloc's default, which is ~3% slower); on 30M pairs it gives back most of
+/// never-purging's extra memory (fgumi 13.4 GB vs 17.6 GB, 11.6 GB at the
+/// default). Set `MIMALLOC_PURGE_DELAY` to choose otherwise.
 pub(crate) fn retain_freed_memory_unless_user_set() {
     if !crate::aligner::user_set_mimalloc_purge() {
         fgumi_sort::retain_freed_memory();
