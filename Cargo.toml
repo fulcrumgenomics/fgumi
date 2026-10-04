@@ -187,7 +187,7 @@ nix = { workspace = true }
 # `pipeline::steps::align`. 0.3.0 is the first
 # release with the three-phase (`seed_extend` / `infer_cohort` / `pair_emit`) API.
 [target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
-bwa-mem3-rs = { version = "0.3.1", optional = true }
+bwa-mem3-rs = { version = "0.4.2", optional = true }
 
 [features]
 default = ["consensus"]
