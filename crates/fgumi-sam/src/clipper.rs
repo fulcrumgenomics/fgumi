@@ -2602,10 +2602,11 @@ mod tests {
         clipper.clip_start_of_alignment(&mut record, 3);
 
         // Attribute should remain unchanged in Soft mode
-        if let Some(Value::String(s)) = record.data().get(&tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, b"0123456789");
-        }
+        let Some(Value::String(s)) = record.data().get(&tag) else {
+            panic!("tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, b"0123456789");
     }
 
     #[test]
@@ -2623,10 +2624,11 @@ mod tests {
         clipper.clip_start_of_alignment(&mut record, 3);
 
         // Attribute should remain unchanged when auto-clip is disabled
-        if let Some(Value::String(s)) = record.data().get(&tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, b"0123456789");
-        }
+        let Some(Value::String(s)) = record.data().get(&tag) else {
+            panic!("tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, b"0123456789");
     }
 
     #[test]
@@ -2648,16 +2650,18 @@ mod tests {
         clipper.clip_start_of_alignment(&mut record, 3);
 
         // Check tag1 was clipped
-        if let Some(Value::String(s)) = record.data().get(&tag1) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, b"3456789");
-        }
+        let Some(Value::String(s)) = record.data().get(&tag1) else {
+            panic!("tag1 missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, b"3456789");
 
         // Check tag2 was NOT clipped
-        if let Some(Value::String(s)) = record.data().get(&tag2) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, b"01234");
-        }
+        let Some(Value::String(s)) = record.data().get(&tag2) else {
+            panic!("tag2 missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, b"01234");
     }
 
     // ===================================================================
@@ -2935,10 +2939,11 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In Soft mode with auto=false, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
     }
 
     #[test]
@@ -2956,10 +2961,11 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In Soft mode, even with auto=true, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
     }
 
     #[test]
@@ -2977,10 +2983,11 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In SoftWithMask mode with auto=false, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
     }
 
     #[test]
@@ -2998,10 +3005,11 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In SoftWithMask mode, even with auto=true, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
     }
 
     #[test]
@@ -3023,14 +3031,16 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In Hard mode with auto=false, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
-        if let Some(Value::Array(Array::Int32(arr))) = record.data().get(&a2_tag) {
-            let vec: Vec<i32> = arr.clone();
-            assert_eq!(vec, (1..=20).collect::<Vec<i32>>());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
+        let Some(Value::Array(Array::Int32(arr))) = record.data().get(&a2_tag) else {
+            panic!("a2_tag missing or of unexpected type");
+        };
+        let vec: Vec<i32> = arr.clone();
+        assert_eq!(vec, (1..=20).collect::<Vec<i32>>());
     }
 
     #[test]
@@ -3056,24 +3066,28 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In Hard mode with auto=true, attributes matching read length should be clipped
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            // "ABABABABABABABABABAB" -> remove first 5 -> "BABABABABABABAB"
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "BABABABABABABAB".as_bytes());
-        }
-        if let Some(Value::Array(Array::Int32(arr))) = record.data().get(&a2_tag) {
-            let vec: Vec<i32> = arr.clone();
-            assert_eq!(vec, (6..=20).collect::<Vec<i32>>());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        // "ABABABABABABABABABAB" -> remove first 5 -> "BABABABABABABAB"
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "BABABABABABABAB".as_bytes());
+        let Some(Value::Array(Array::Int32(arr))) = record.data().get(&a2_tag) else {
+            panic!("a2_tag missing or of unexpected type");
+        };
+        let vec: Vec<i32> = arr.clone();
+        assert_eq!(vec, (6..=20).collect::<Vec<i32>>());
         // B1 and B2 should NOT be modified (length doesn't match)
-        if let Some(Value::String(s)) = record.data().get(&b1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "A".repeat(10).as_bytes());
-        }
-        if let Some(Value::Array(Array::Int32(arr))) = record.data().get(&b2_tag) {
-            let vec: Vec<i32> = arr.clone();
-            assert_eq!(vec, (1..=10).collect::<Vec<i32>>());
-        }
+        let Some(Value::String(s)) = record.data().get(&b1_tag) else {
+            panic!("b1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "A".repeat(10).as_bytes());
+        let Some(Value::Array(Array::Int32(arr))) = record.data().get(&b2_tag) else {
+            panic!("b2_tag missing or of unexpected type");
+        };
+        let vec: Vec<i32> = arr.clone();
+        assert_eq!(vec, (1..=10).collect::<Vec<i32>>());
     }
 
     #[test]
@@ -3091,10 +3105,11 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In Soft mode with auto=false, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
     }
 
     #[test]
@@ -3112,10 +3127,11 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In Soft mode, even with auto=true, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
     }
 
     #[test]
@@ -3133,10 +3149,11 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In SoftWithMask mode with auto=false, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
     }
 
     #[test]
@@ -3154,10 +3171,11 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In SoftWithMask mode, even with auto=true, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
     }
 
     #[test]
@@ -3179,14 +3197,16 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In Hard mode with auto=false, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
-        if let Some(Value::Array(Array::Int32(arr))) = record.data().get(&a2_tag) {
-            let vec: Vec<i32> = arr.clone();
-            assert_eq!(vec, (1..=20).collect::<Vec<i32>>());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
+        let Some(Value::Array(Array::Int32(arr))) = record.data().get(&a2_tag) else {
+            panic!("a2_tag missing or of unexpected type");
+        };
+        let vec: Vec<i32> = arr.clone();
+        assert_eq!(vec, (1..=20).collect::<Vec<i32>>());
     }
 
     #[test]
@@ -3212,24 +3232,28 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In Hard mode with auto=true, attributes matching read length should be clipped
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            // "ABABABABABABABABABAB" -> remove last 5 -> "ABABABABABABABA"
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "ABABABABABABABA".as_bytes());
-        }
-        if let Some(Value::Array(Array::Int32(arr))) = record.data().get(&a2_tag) {
-            let vec: Vec<i32> = arr.clone();
-            assert_eq!(vec, (1..=15).collect::<Vec<i32>>());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        // "ABABABABABABABABABAB" -> remove last 5 -> "ABABABABABABABA"
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "ABABABABABABABA".as_bytes());
+        let Some(Value::Array(Array::Int32(arr))) = record.data().get(&a2_tag) else {
+            panic!("a2_tag missing or of unexpected type");
+        };
+        let vec: Vec<i32> = arr.clone();
+        assert_eq!(vec, (1..=15).collect::<Vec<i32>>());
         // B1 and B2 should NOT be modified (length doesn't match)
-        if let Some(Value::String(s)) = record.data().get(&b1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "A".repeat(10).as_bytes());
-        }
-        if let Some(Value::Array(Array::Int32(arr))) = record.data().get(&b2_tag) {
-            let vec: Vec<i32> = arr.clone();
-            assert_eq!(vec, (1..=10).collect::<Vec<i32>>());
-        }
+        let Some(Value::String(s)) = record.data().get(&b1_tag) else {
+            panic!("b1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "A".repeat(10).as_bytes());
+        let Some(Value::Array(Array::Int32(arr))) = record.data().get(&b2_tag) else {
+            panic!("b2_tag missing or of unexpected type");
+        };
+        let vec: Vec<i32> = arr.clone();
+        assert_eq!(vec, (1..=10).collect::<Vec<i32>>());
     }
 
     // ===================================================================
@@ -3259,10 +3283,11 @@ mod tests {
         assert_eq!(no_auto.sequence().len(), 35);
 
         // Attributes should NOT be modified without auto-clip
-        if let Some(Value::String(s)) = no_auto.data().get(&az_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "12345678901234567890123456789012345678901234567890".as_bytes());
-        }
+        let Some(Value::String(s)) = no_auto.data().get(&az_tag) else {
+            panic!("az_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "12345678901234567890123456789012345678901234567890".as_bytes());
 
         // Test with auto-clip
         let clipper_auto = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
@@ -3281,10 +3306,11 @@ mod tests {
         assert_eq!(with_auto.sequence().len(), 35);
 
         // Attributes SHOULD be modified with auto-clip (remove first 5 and last 10)
-        if let Some(Value::String(s)) = with_auto.data().get(&az_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "67890123456789012345678901234567890".as_bytes());
-        }
+        let Some(Value::String(s)) = with_auto.data().get(&az_tag) else {
+            panic!("az_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "67890123456789012345678901234567890".as_bytes());
     }
 
     /// The soft→hard upgrade path (`upgrade_all_clipping`) must also clip a
@@ -3341,10 +3367,11 @@ mod tests {
         assert_eq!(no_auto.sequence().len(), 35);
 
         // Attributes should NOT be modified without auto-clip
-        if let Some(Value::String(s)) = no_auto.data().get(&az_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "12345678901234567890123456789012345678901234567890".as_bytes());
-        }
+        let Some(Value::String(s)) = no_auto.data().get(&az_tag) else {
+            panic!("az_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "12345678901234567890123456789012345678901234567890".as_bytes());
 
         // Test with auto-clip
         let clipper_auto = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
@@ -3363,10 +3390,11 @@ mod tests {
         assert_eq!(with_auto.sequence().len(), 35);
 
         // Attributes SHOULD be modified with auto-clip
-        if let Some(Value::String(s)) = with_auto.data().get(&az_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "67890123456789012345678901234567890".as_bytes());
-        }
+        let Some(Value::String(s)) = with_auto.data().get(&az_tag) else {
+            panic!("az_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "67890123456789012345678901234567890".as_bytes());
     }
 
     #[test]
