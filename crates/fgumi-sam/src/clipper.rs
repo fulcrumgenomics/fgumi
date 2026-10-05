@@ -27,9 +27,9 @@ fn is_modification_tag(tag: [u8; 2]) -> bool {
     MODIFICATION_TAGS.iter().any(|t| **t == tag)
 }
 
-/// SAM tags whose values are never per-base, so `--auto-clip-attributes` must not slice them even
-/// when their length happens to equal the read's.
-const NON_PER_BASE_TAGS: [fgumi_raw_bam::SamTag; 22] = [
+/// SAM tags whose values are not this read's per-base data, so `--auto-clip-attributes` must not
+/// slice them even when their length happens to equal the read's.
+const NON_PER_BASE_TAGS: [fgumi_raw_bam::SamTag; 30] = [
     fgumi_raw_bam::SamTag::RG,
     fgumi_raw_bam::SamTag::new(b'L', b'B'),
     fgumi_raw_bam::SamTag::new(b'P', b'U'),
@@ -52,6 +52,14 @@ const NON_PER_BASE_TAGS: [fgumi_raw_bam::SamTag; 22] = [
     fgumi_raw_bam::SamTag::new(b'S', b'A'),
     fgumi_raw_bam::SamTag::new(b'O', b'A'),
     fgumi_raw_bam::SamTag::new(b'O', b'C'),
+    fgumi_raw_bam::SamTag::new(b'C', b'C'),
+    fgumi_raw_bam::SamTag::new(b'C', b'T'),
+    fgumi_raw_bam::SamTag::new(b'F', b'S'),
+    fgumi_raw_bam::SamTag::new(b'P', b'T'),
+    fgumi_raw_bam::SamTag::new(b'R', b'2'),
+    fgumi_raw_bam::SamTag::new(b'Q', b'2'),
+    fgumi_raw_bam::SamTag::new(b'F', b'Z'),
+    fgumi_raw_bam::SamTag::OB,
 ];
 
 /// Whether `--auto-clip-attributes` must leave `tag` untouched whatever its length.
@@ -2425,18 +2433,29 @@ mod tests {
     fn test_auto_clip_attributes_skips_non_per_base_tags() {
         use noodles::sam::alignment::record::data::field::Tag;
 
+        let expected: [[u8; 2]; 30] = [
+            *b"RG", *b"LB", *b"PU", *b"PG", *b"CO", *b"MI", *b"BC", *b"QT", *b"RX", *b"QX", *b"OX",
+            *b"BZ", *b"CB", *b"CR", *b"CY", *b"UB", *b"UR", *b"UY", *b"MC", *b"SA", *b"OA", *b"OC",
+            *b"CC", *b"CT", *b"FS", *b"PT", *b"R2", *b"Q2", *b"FZ", *b"ob",
+        ];
+        let mut actual: Vec<[u8; 2]> = NON_PER_BASE_TAGS.iter().map(|t| **t).collect();
+        let mut wanted = expected.to_vec();
+        actual.sort_unstable();
+        wanted.sort_unstable();
+        assert_eq!(actual, wanted);
+
         let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
         let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
-        for tag in NON_PER_BASE_TAGS {
-            record.data_mut().insert(Tag::from(*tag), Value::from("0123456789"));
+        for tag in expected {
+            record.data_mut().insert(Tag::from(tag), Value::from("0123456789"));
         }
         let per_base = Tag::from([b'X', b'B']);
         record.data_mut().insert(per_base, Value::from("0123456789"));
 
         assert_eq!(clipper.clip_start_of_alignment(&mut record, 3), 3);
 
-        for tag in NON_PER_BASE_TAGS {
-            match record.data().get(&Tag::from(*tag)) {
+        for tag in expected {
+            match record.data().get(&Tag::from(tag)) {
                 Some(Value::String(s)) => {
                     let bytes: &[u8] = s.as_ref();
                     assert_eq!(bytes, b"0123456789", "tag {tag:?} was clipped");
