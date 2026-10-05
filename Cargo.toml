@@ -99,7 +99,7 @@ statrs = "0.18"
 # 1.93). Centralized so `fgumi` and `fgumi-cli-common` cannot drift onto different versions and
 # silently raise the effective MSRV.
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
-tempfile = "3.3.0"
+tempfile = "3.4.0"
 thiserror = "2"
 trybuild = "1.0"
 which = "8"

@@ -13,12 +13,11 @@ use crate::validation::validate_file_exists;
 use crate::variant_review::{
     BaseCounts, ConsensusVariantReviewInfo, Variant, format_insert_string, read_number_suffix,
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
-use fgumi_bam_io::ProgressTracker;
 use fgumi_raw_bam::{
-    BAM_BASE_TO_ASCII, CigarKind, IndexedRawBamReader, RawBamReader, RawRecord,
-    find_string_tag_in_record, write_raw_record,
+    BAM_BASE_TO_ASCII, CigarKind, IndexedRawBamReader, RawRecord, find_string_tag_in_record,
+    write_raw_record,
 };
 use log::info;
 use std::collections::HashSet;
@@ -32,11 +31,16 @@ use super::command::Command;
 /// Mirrors fgbio `ReviewConsensusVariants.toMi`: a record that reaches this
 /// point is expected to carry an `MI` tag, and it is an error if it does not
 /// (fgbio throws `IllegalStateException`; `ReviewConsensusVariantsTest.scala:166`).
-fn to_mi(record: &RawRecord) -> Result<String> {
+/// Borrows from the record so the per-read MI checks allocate nothing.
+fn to_mi(record: &RawRecord) -> Result<&str> {
     match find_string_tag_in_record(record, SamTag::MI) {
-        Some(mi_bytes) => Ok(extract_mi_base(std::str::from_utf8(mi_bytes)?).to_string()),
+        Some(mi_bytes) => Ok(extract_mi_base(std::str::from_utf8(mi_bytes)?)),
         None => {
-            bail!("{} did not have a value for tag MI", String::from_utf8_lossy(record.read_name()))
+            bail!(
+                "{} did not have a value for tag MI; review needs the MI tag that fgumi group \
+                 and the consensus callers write",
+                String::from_utf8_lossy(record.read_name())
+            )
         }
     }
 }
@@ -87,14 +91,16 @@ fn format_genotype_string(
 Extracts data to make reviewing of variant calls from consensus reads easier.
 
 Creates a list of variant sites from the input VCF (SNPs only) or IntervalList then extracts all
-the consensus reads that do not contain a reference allele at the variant sites, and all raw reads
-that contributed to those consensus reads. This will include consensus reads that carry the
-alternate allele, a third allele, a no-call or a spanning deletion at the variant site.
+the consensus reads that do not contain a reference allele at the variant sites, and the raw reads
+overlapping the variant sites that contributed to those consensus reads. This will include consensus
+reads that carry the alternate allele, a third allele, a no-call or a spanning deletion at the
+variant site.
 
 Reads are correlated between consensus and grouped BAMs using a molecule ID stored in an optional
 attribute, `MI` by default. In order to support paired molecule IDs where two or more molecule IDs
 are related (e.g. see the Paired assignment strategy in `group`) the molecule ID is truncated at
-the last `/` if present (e.g. `1/A => 1` and `2 => 2`).
+the last `/` if present (e.g. `1/A => 1` and `2 => 2`). Every consensus read that is extracted, and
+every raw read that overlaps a variant site, must carry the molecule ID; a missing one is an error.
 
 Both input BAMs must be coordinate sorted and indexed.
 
@@ -102,7 +108,9 @@ Both input BAMs must be coordinate sorted and indexed.
 
 A pair of output BAMs are created:
 - **<output>.consensus.bam**: Contains the relevant consensus reads from the consensus BAM
-- **<output>.grouped.bam**: Contains the relevant raw reads from the grouped BAM
+- **<output>.grouped.bam**: Contains the raw reads from the grouped BAM that overlap a variant site
+  and share a molecule ID with an extracted consensus read (mates that overlap no variant site are
+  not included)
 
 Each suffix is appended to the whole `--output` prefix, including any dots it contains, so
 `--output out.v1` writes `out.v1.consensus.bam`, `out.v1.grouped.bam` and `out.v1.txt`. A trailing
@@ -232,19 +240,30 @@ impl Command for Review {
             Self::order_variants_by_dictionary(variants, &header)?
         };
 
+        let consensus_out_path = self.output_path("consensus.bam")?;
+        let grouped_out_path = self.output_path("grouped.bam")?;
+
         // Extract consensus reads with variants
         info!("Extracting consensus reads with variants...");
-        let mi_set = self.extract_consensus_reads(&variants, command_line)?;
+        let (mi_set, consensus_staged) =
+            self.extract_consensus_reads(&variants, &consensus_out_path, command_line)?;
         info!("Found {} unique molecular identifiers", mi_set.len());
 
         // Extract grouped reads matching those MIs
         info!("Extracting grouped reads...");
-        self.extract_grouped_reads(&mi_set, command_line)?;
+        let grouped_staged =
+            self.extract_grouped_reads(&variants, &mi_set, &grouped_out_path, command_line)?;
+
+        // Both BAMs are complete: move them into place. An error in either extraction
+        // returns above, dropping (deleting) the staged files, so a failed run never
+        // leaves a truncated BAM at an output path. The renames and index writes below
+        // are not atomic as a set: a failure part-way can leave a new BAM beside an
+        // older run's grouped BAM or index.
+        consensus_staged.persist(&consensus_out_path)?;
+        grouped_staged.persist(&grouped_out_path)?;
 
         // Create BAM indexes for output files
         info!("Creating BAM indexes...");
-        let consensus_out_path = self.output_path("consensus.bam")?;
-        let grouped_out_path = self.output_path("grouped.bam")?;
 
         // Both paths are built with a `.bam` suffix above, so the sidecar naming
         // is unchanged here; going through the shared helper keeps every writer
@@ -811,6 +830,79 @@ impl Review {
         }
     }
 
+    /// Builds the single-base query region for `variant` (fgbio's `Variant` is a
+    /// one-base `Locatable`).
+    fn variant_region(variant: &Variant) -> Result<noodles::core::Region> {
+        let pos = noodles::core::Position::try_from(variant.pos as usize)?;
+        Ok(noodles::core::Region::new(variant.chrom.as_str(), pos..=pos))
+    }
+
+    /// Writes the reads of `input` that overlap any variant and that `keep` accepts to a
+    /// staged BAM beside `output`, the shared body of fgbio's
+    /// `consensusIn.query(variants).filter(..)` and `groupedIn.query(variants).filter(..)`.
+    ///
+    /// A single multi-interval query (one point region per variant) merges the regions'
+    /// BAI chunks and scans them once, so each overlapping read is visited exactly once
+    /// and in coordinate order, and the output is coordinate-sorted by construction.
+    /// `make_keep` receives the output header (input header plus `@HD`/`@PG`) and returns
+    /// the per-read filter.
+    ///
+    /// The BAM is written to a temporary file in `output`'s directory and returned
+    /// finished; the caller renames it to `output` with `persist`. Dropping it instead
+    /// (on any error) deletes it, so no partial BAM is left at `output`.
+    fn extract_variant_reads<K>(
+        input: &Path,
+        output: &Path,
+        variants: &[Variant],
+        command_line: &str,
+        make_keep: impl FnOnce(&noodles::sam::Header) -> K,
+    ) -> Result<tempfile::NamedTempFile>
+    where
+        K: FnMut(&RawRecord) -> Result<bool>,
+    {
+        use noodles::bam;
+
+        let index = Self::read_bam_index(input)?;
+        let mut reader = IndexedRawBamReader::from_path(input, index)?;
+        let header = reader.read_header()?;
+
+        // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio).
+        let header = crate::commands::common::ensure_hd_record(header)?;
+
+        // Add @PG record with PP chaining
+        let header = crate::commands::common::add_pg_record(header, command_line)?;
+
+        // Stage beside the output so the final rename stays on one filesystem. The file
+        // is created with the default `0o666 & !umask` mode, not `NamedTempFile`'s
+        // owner-only `0o600`, so the renamed BAM has the mode a direct write would give.
+        let dir = output.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let staged = tempfile::Builder::new()
+            .prefix(".fgumi-review-")
+            .suffix(".bam.tmp")
+            .make_in(dir, |path| {
+                std::fs::OpenOptions::new().write(true).create_new(true).open(path)
+            })
+            .with_context(|| format!("creating a staging file for {}", output.display()))?;
+        let mut writer = bam::io::Writer::new(staged.as_file().try_clone()?);
+        writer.write_header(&header)?;
+
+        let regions = variants.iter().map(Self::variant_region).collect::<Result<Vec<_>>>()?;
+        let mut keep = make_keep(&header);
+        for result in reader.query_intervals(&header, &regions)? {
+            let record = result?;
+            if keep(&record).with_context(|| format!("reviewing reads from {}", input.display()))? {
+                write_raw_record(writer.get_mut(), &record)?;
+            }
+        }
+
+        // Finish by value: `try_finish` would leave the BGZF writer live, and its `Drop`
+        // would append a second EOF block. A failed final flush is an error here rather
+        // than a truncated BAM.
+        let file = writer.into_inner().finish()?;
+        file.sync_all()?;
+        Ok(staged)
+    }
+
     /// Extracts consensus reads containing non-reference bases at variant positions.
     ///
     /// Queries the consensus BAM for reads overlapping each variant position. Filters reads
@@ -820,188 +912,140 @@ impl Review {
     /// # Arguments
     ///
     /// * `variants` - Slice of variant positions to check
+    /// * `output` - Final `.consensus.bam` path; the BAM is staged beside it
     ///
     /// # Returns
     ///
-    /// A `HashSet` of molecular identifier base strings (MI tags with strand suffix removed).
+    /// A `HashSet` of molecular identifier base strings (MI tags with strand suffix
+    /// removed), and the finished BAM, staged by [`extract_variant_reads`] for the caller
+    /// to `persist` to `output`.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - Consensus BAM cannot be opened or queried
-    /// - Output BAM cannot be created
-    /// - Record processing fails
+    /// - Output BAM cannot be created or written
+    /// - Record processing fails, including a non-reference read with no `MI` tag
+    ///
+    /// [`extract_variant_reads`]: Self::extract_variant_reads
     fn extract_consensus_reads(
         &self,
         variants: &[Variant],
+        output: &Path,
         command_line: &str,
-    ) -> Result<HashSet<String>> {
-        use noodles::bam;
+    ) -> Result<(HashSet<String>, tempfile::NamedTempFile)> {
         use std::collections::HashMap;
 
-        let index = Self::read_bam_index(&self.consensus_bam)?;
-        let mut reader = IndexedRawBamReader::from_path(&self.consensus_bam, index)?;
-        let header = reader.read_header()?;
-
-        // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio).
-        let header = crate::commands::common::ensure_hd_record(header)?;
-
-        // Add @PG record with PP chaining
-        let header = crate::commands::common::add_pg_record(header, command_line)?;
-
-        // Create output BAM
-        let consensus_out_path = self.output_path("consensus.bam")?;
-        let mut writer = bam::io::writer::Builder.build_from_path(&consensus_out_path)?;
-        writer.write_header(&header)?;
-
         let mut mi_set = HashSet::new();
-
-        // Issue a single multi-interval query, one point region per variant. Mirroring
-        // fgbio's single `consensusIn.query(variants)`, `query_intervals` merges the
-        // regions' BAI chunks and scans them once, so every overlapping consensus read
-        // is visited exactly once and in coordinate order. We can therefore filter and
-        // stream straight to the writer — no buffering, de-duplication, or final sort is
-        // required, and the emitted `.consensus.bam` (indexed in `execute` via
-        // `bam::fs::index`) is coordinate-sorted by construction.
-        let regions = variants
-            .iter()
-            .map(|variant| -> Result<noodles::core::Region> {
-                let pos = noodles::core::Position::try_from(variant.pos as usize)?;
-                Ok(noodles::core::Region::new(variant.chrom.as_str(), pos..=pos))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // Group variants by reference ID so each read is only tested against variants on
-        // its own contig — `has_non_reference_base` matches on position, not contig.
-        let ref_id_by_name: HashMap<String, i32> = header
-            .reference_sequences()
-            .keys()
-            .enumerate()
-            .map(|(idx, name)| (String::from_utf8_lossy(name).into_owned(), idx as i32))
-            .collect();
-        let mut variants_by_ref_id: HashMap<i32, Vec<&Variant>> = HashMap::new();
-        for variant in variants {
-            if let Some(&ref_id) = ref_id_by_name.get(&variant.chrom) {
-                variants_by_ref_id.entry(ref_id).or_default().push(variant);
-            }
-        }
-        // Sort each reference's variants by position so a read only has to test the
-        // variants inside its aligned span, found by binary search below, rather than
-        // every variant on the contig.
-        for ref_variants in variants_by_ref_id.values_mut() {
-            ref_variants.sort_by_key(|variant| variant.pos);
-        }
-
-        for result in reader.query_intervals(&header, &regions)? {
-            let record = result?;
-
-            let Some(overlapping) = variants_by_ref_id.get(&record.ref_id()) else {
-                continue; // read on a reference with no reviewed variant
-            };
-
-            // Only variants within the read's aligned span can be non-reference in it
-            // (`has_non_reference_base` returns false outside `[start, end]`). Restrict
-            // the scan to that position range via binary search on the sorted variants.
-            let (Some(start), Some(end)) =
-                (record.alignment_start_1based(), record.alignment_end_1based())
-            else {
-                continue; // unmapped / no aligned span cannot be non-reference at a variant
-            };
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let (start, end) = (start as i32, end as i32);
-            let lo = overlapping.partition_point(|variant| variant.pos < start);
-            let hi = overlapping.partition_point(|variant| variant.pos <= end);
-
-            // fgbio's `nonReferenceAtAnyVariant`: keep the read if it is non-reference at
-            // any variant it overlaps. The single ordered scan already guarantees each
-            // read is seen once and in coordinate order, so we write it in place.
-            let mut non_reference = false;
-            for &variant in &overlapping[lo..hi] {
-                if self.has_non_reference_base(&record, variant)? {
-                    non_reference = true;
-                    break;
+        let staged = Self::extract_variant_reads(
+            &self.consensus_bam,
+            output,
+            variants,
+            command_line,
+            |header| {
+                // Group variants by reference ID so each read is only tested against
+                // variants on its own contig — `has_non_reference_base` matches on
+                // position, not contig.
+                let ref_id_by_name: HashMap<String, i32> = header
+                    .reference_sequences()
+                    .keys()
+                    .enumerate()
+                    .map(|(idx, name)| (String::from_utf8_lossy(name).into_owned(), idx as i32))
+                    .collect();
+                let mut variants_by_ref_id: HashMap<i32, Vec<&Variant>> = HashMap::new();
+                for variant in variants {
+                    if let Some(&ref_id) = ref_id_by_name.get(&variant.chrom) {
+                        variants_by_ref_id.entry(ref_id).or_default().push(variant);
+                    }
                 }
-            }
-            if non_reference {
-                // fgbio records `toMi(rec)` for every non-reference consensus read,
-                // erroring if the MI tag is absent (ReviewConsensusVariantsTest.scala:166).
-                mi_set.insert(to_mi(&record)?);
-                write_raw_record(writer.get_mut(), &record)?;
-            }
-        }
+                // Sort each reference's variants by position so a read only has to test
+                // the variants inside its aligned span, found by binary search below,
+                // rather than every variant on the contig.
+                for ref_variants in variants_by_ref_id.values_mut() {
+                    ref_variants.sort_by_key(|variant| variant.pos);
+                }
 
-        Ok(mi_set)
+                let mi_set = &mut mi_set;
+                move |record: &RawRecord| {
+                    let Some(overlapping) = variants_by_ref_id.get(&record.ref_id()) else {
+                        return Ok(false); // read on a reference with no reviewed variant
+                    };
+
+                    // Only variants within the read's aligned span can be non-reference
+                    // in it (`has_non_reference_base` returns false outside
+                    // `[start, end]`). Restrict the scan to that position range via
+                    // binary search on the sorted variants.
+                    let (Some(start), Some(end)) =
+                        (record.alignment_start_1based(), record.alignment_end_1based())
+                    else {
+                        return Ok(false); // no aligned span: not non-reference at a variant
+                    };
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    let (start, end) = (start as i32, end as i32);
+                    let lo = overlapping.partition_point(|variant| variant.pos < start);
+                    let hi = overlapping.partition_point(|variant| variant.pos <= end);
+
+                    // fgbio's `nonReferenceAtAnyVariant`: keep the read if it is
+                    // non-reference at any variant it overlaps.
+                    let mut non_reference = false;
+                    for &variant in &overlapping[lo..hi] {
+                        if self.has_non_reference_base(record, variant)? {
+                            non_reference = true;
+                            break;
+                        }
+                    }
+                    if non_reference {
+                        // fgbio records `toMi(rec)` for every non-reference consensus
+                        // read, erroring if the MI tag is absent
+                        // (ReviewConsensusVariantsTest.scala:166).
+                        mi_set.insert(to_mi(record)?.to_owned());
+                    }
+                    Ok(non_reference)
+                }
+            },
+        )?;
+        Ok((mi_set, staged))
     }
 
-    /// Extracts grouped raw reads matching molecular identifiers from consensus reads.
+    /// Extracts the grouped raw reads that overlap a variant and came from a reviewed
+    /// consensus molecule.
     ///
-    /// Reads through the grouped BAM file sequentially, extracting all reads whose MI tags
-    /// match the provided set of molecular identifiers. These are the raw reads that
-    /// contributed to the consensus reads with variants.
+    /// Mirrors fgbio's `groupedIn.query(variants).filter(rec => sources.contains(toMi(rec)))`:
+    /// each grouped read overlapping a variant is visited once and kept when its MI base
+    /// is in `mi_set`. Mates and other reads of the molecule that overlap no variant are
+    /// not written.
     ///
     /// # Arguments
     ///
+    /// * `variants` - Slice of variant positions to query
     /// * `mi_set` - Set of molecular identifiers to match
+    /// * `output` - Final `.grouped.bam` path; the BAM is staged beside it
     ///
     /// # Returns
     ///
-    /// `Ok(())` on success.
+    /// The finished BAM, staged by [`extract_variant_reads`] for the caller to `persist` to
+    /// `output`.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Grouped BAM cannot be opened or read
+    /// - Grouped BAM or its index cannot be opened or queried
     /// - Output BAM cannot be created or written
-    fn extract_grouped_reads(&self, mi_set: &HashSet<String>, command_line: &str) -> Result<()> {
-        use noodles::bam;
-
-        // Use a plain (non-indexed) reader for the sequential scan; raw-byte mode avoids
-        // the noodles decode/encode round-trip on every record.
-        let mut bam_reader = bam::io::reader::Builder.build_from_path(&self.grouped_bam)?;
-        let header = bam_reader.read_header()?;
-
-        // Synthesize @HD VN:1.6 SO:unsorted when the input lacks one (match fgbio).
-        let header = crate::commands::common::ensure_hd_record(header)?;
-
-        // Add @PG record with PP chaining (must happen before we consume the reader below)
-        let header = crate::commands::common::add_pg_record(header, command_line)?;
-
-        let grouped_out_path = self.output_path("grouped.bam")?;
-        let mut writer = bam::io::writer::Builder.build_from_path(&grouped_out_path)?;
-        writer.write_header(&header)?;
-
-        // Extract the inner BGZF reader and wrap in RawBamReader for zero-copy record iteration.
-        let mut raw_reader = RawBamReader::new(bam_reader.into_inner());
-        let mut raw_rec = RawRecord::new();
-
-        // Read through entire grouped BAM and extract matching reads
-        let progress = ProgressTracker::new("Processed grouped reads").with_interval(1_000_000);
-        loop {
-            let bytes_read = raw_reader.read_record(&mut raw_rec)?;
-            if bytes_read == 0 {
-                break; // EOF
-            }
-            progress.log_if_needed(1);
-
-            // Extract MI tag directly from raw bytes; no RecordBuf decode needed.
-            // Unlike fgbio's `query(variants)` (which only touches variant-overlapping
-            // reads and errors via `toMi` on a missing MI), this is a full sequential
-            // scan of the grouped BAM, so a missing MI is skipped rather than an error:
-            // an MI-less read cannot be in `mi_set` and erroring here would be stricter
-            // than fgbio for reads that don't overlap any variant. Variant-overlapping
-            // grouped reads are still MI-guarded in `generate_review_file` via `to_mi`.
-            if let Some(mi_bytes) = find_string_tag_in_record(&raw_rec, SamTag::MI) {
-                let mi = std::str::from_utf8(mi_bytes)?;
-                let mi_base = extract_mi_base(mi);
-
-                if mi_set.contains(mi_base) {
-                    write_raw_record(writer.get_mut(), &raw_rec)?;
-                }
-            }
-        }
-
-        progress.log_final();
-        Ok(())
+    /// - A grouped read overlapping a variant has no `MI` tag (fgbio's `toMi` throws)
+    ///
+    /// [`extract_variant_reads`]: Self::extract_variant_reads
+    fn extract_grouped_reads(
+        &self,
+        variants: &[Variant],
+        mi_set: &HashSet<String>,
+        output: &Path,
+        command_line: &str,
+    ) -> Result<tempfile::NamedTempFile> {
+        Self::extract_variant_reads(&self.grouped_bam, output, variants, command_line, |_| {
+            // fgbio calls `toMi` on every variant-overlapping grouped read, so a missing
+            // MI is an error here, not a skip.
+            |record: &RawRecord| Ok(mi_set.contains(to_mi(record)?))
+        })
     }
 
     /// Generates the detailed review TSV file with per-variant and per-read information.
@@ -1043,13 +1087,18 @@ impl Review {
         // Process each variant
         for variant in variants {
             // Query consensus BAM for this position
-            let start = noodles::core::Position::try_from(variant.pos as usize)?;
-            let region = noodles::core::Region::new(variant.chrom.as_str(), start..=start);
+            let region = Self::variant_region(variant)?;
 
-            // Collect all consensus reads at this position
+            // Collect the consensus reads at this position. fgbio builds the counts and
+            // rows from a `SamLocusIterator`, which skips every read flagged unmapped
+            // (htsjdk `AbstractLocusIterator`), including one placed at the locus that
+            // still carries a CIGAR; skip those here too.
             let mut consensus_reads: Vec<RawRecord> = Vec::new();
             for result in consensus_reader.query(&consensus_header, &region)? {
-                consensus_reads.push(result?);
+                let record = result?;
+                if !record.is_unmapped() {
+                    consensus_reads.push(record);
+                }
             }
 
             // Build consensus-level base counts, deduplicated by distinct read name
@@ -1102,7 +1151,7 @@ impl Review {
 
                 // Source molecule id for this consensus read (fgbio calls
                 // `toMi(rec)`, which errors when the MI tag is absent).
-                let mi_base = to_mi(&record)?;
+                let mi_base = to_mi(&record)?.to_owned();
 
                 // Format consensus read name with /1 or /2 suffix. fgbio's
                 // `readNumberSuffix` uses `/2` only for paired second-of-pair reads;
@@ -1126,9 +1175,6 @@ impl Review {
                 let raw_counts = {
                     use std::collections::HashSet;
 
-                    let start = noodles::core::Position::try_from(variant.pos as usize)?;
-                    let region = noodles::core::Region::new(variant.chrom.as_str(), start..=start);
-
                     let mut counts = BaseCounts::default();
                     let mut seen_reads = HashSet::new();
                     // Reuse the suffix appended to `consensus_read_name` above rather
@@ -1138,18 +1184,16 @@ impl Review {
                     for result in grouped_reader.query(&grouped_header, &region)? {
                         let rec = result?;
 
-                        // Source molecule id for this grouped read. Skip a read that
-                        // lacks an MI tag rather than erroring (mirroring
-                        // `extract_grouped_reads`): fgbio pileups the already
-                        // MI-filtered `.grouped.bam`, so its `toMi` never fails here.
-                        // An MI-less read can never match the consensus MI, so
-                        // skipping yields counts identical to fgbio while not aborting
-                        // the whole review on a single stray untagged read.
-                        let Some(mi_bytes) = find_string_tag_in_record(&rec, SamTag::MI) else {
+                        // fgbio's raw counts come from a `SamLocusIterator` too, which
+                        // skips unmapped reads, so a placed unmapped mate is not counted.
+                        if rec.is_unmapped() {
                             continue;
-                        };
-                        let read_mi_base = extract_mi_base(std::str::from_utf8(mi_bytes)?);
-                        if read_mi_base != mi_base.as_str() {
+                        }
+
+                        // Source molecule id for this grouped read (fgbio's `toMi`).
+                        // `extract_grouped_reads` has already rejected any MI-less read
+                        // overlapping a variant, so this cannot fail on a valid run.
+                        if to_mi(&rec)? != mi_base {
                             continue;
                         }
 
@@ -1588,6 +1632,205 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
                 .qualities(&vec![45u8; bases.len()]);
             b.add_string_tag(SamTag::MI, mi.as_bytes());
             to_record_buf(b.build())
+        }
+
+        /// Create a single unpaired mapped read that carries NO `MI` tag.
+        #[allow(clippy::cast_possible_truncation)]
+        pub fn create_single_read_without_mi(
+            name: &str,
+            chrom_idx: usize,
+            start: i32,
+            bases: &[u8],
+        ) -> RecordBuf {
+            let cigar_ops = [encode_op(0, bases.len())];
+            let mut b = RawSamBuilder::new();
+            b.read_name(name.as_bytes())
+                .flags(0) // unpaired, mapped
+                .ref_id(chrom_idx as i32)
+                .pos(start - 1)
+                .mapq(60)
+                .cigar_ops(&cigar_ops)
+                .sequence(bases)
+                .qualities(&vec![45u8; bases.len()]);
+            to_record_buf(b.build())
+        }
+
+        /// Create a single unpaired read placed at `start` with `flags` and `cigar`,
+        /// carrying `mi` when given. Covers records the other helpers cannot build: an
+        /// unmapped read placed at a position that keeps a CIGAR, and a mapped read with
+        /// a zero-length reference span.
+        #[allow(clippy::cast_possible_truncation)]
+        pub fn create_placed_read(
+            name: &str,
+            chrom_idx: usize,
+            start: i32,
+            flags: u16,
+            cigar: &str,
+            bases: &[u8],
+            mi: Option<&str>,
+        ) -> RecordBuf {
+            let mut b = RawSamBuilder::new();
+            b.read_name(name.as_bytes())
+                .flags(flags)
+                .ref_id(chrom_idx as i32)
+                .pos(start - 1)
+                .cigar_ops(&parse_cigar_to_ops(cigar))
+                .sequence(bases)
+                .qualities(&vec![45u8; bases.len()]);
+            if let Some(mi) = mi {
+                b.add_string_tag(SamTag::MI, mi.as_bytes());
+            }
+            to_record_buf(b.build())
+        }
+
+        /// Create a read pair whose R1 is mapped at `start` (all-`M` CIGAR) and whose R2
+        /// is unmapped but placed at R1's position, both carrying `mi`. R2 carries the
+        /// same all-`M` CIGAR as R1 when `mate_cigar` is set, and no CIGAR otherwise.
+        #[allow(clippy::cast_possible_truncation)]
+        pub fn create_pair_with_placed_unmapped_mate(
+            name: &str,
+            chrom_idx: usize,
+            start: i32,
+            bases: &[u8],
+            mi: &str,
+            mate_cigar: bool,
+        ) -> (RecordBuf, RecordBuf) {
+            let cigar_ops = [encode_op(0, bases.len())];
+            let mut b1 = RawSamBuilder::new();
+            b1.read_name(name.as_bytes())
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_UNMAPPED)
+                .ref_id(chrom_idx as i32)
+                .pos(start - 1)
+                .mapq(60)
+                .cigar_ops(&cigar_ops)
+                .sequence(bases)
+                .qualities(&vec![45u8; bases.len()])
+                .mate_ref_id(chrom_idx as i32)
+                .mate_pos(start - 1);
+            b1.add_string_tag(SamTag::MI, mi.as_bytes());
+
+            let mut b2 = RawSamBuilder::new();
+            b2.read_name(name.as_bytes())
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::UNMAPPED)
+                .ref_id(chrom_idx as i32)
+                .pos(start - 1)
+                .cigar_ops(if mate_cigar { &cigar_ops } else { &[] })
+                .sequence(bases)
+                .qualities(&vec![45u8; bases.len()])
+                .mate_ref_id(chrom_idx as i32)
+                .mate_pos(start - 1);
+            b2.add_string_tag(SamTag::MI, mi.as_bytes());
+
+            (to_record_buf(b1.build()), to_record_buf(b2.build()))
+        }
+
+        /// Create a fully unmapped read pair (no reference or position) carrying `mi`.
+        pub fn create_unmapped_pair(name: &str, mi: &str) -> (RecordBuf, RecordBuf) {
+            let make = |segment: u16, strand: u16| {
+                let mut b = RawSamBuilder::new();
+                b.read_name(name.as_bytes())
+                    .flags(
+                        flags::PAIRED | flags::UNMAPPED | flags::MATE_UNMAPPED | segment | strand,
+                    )
+                    .sequence(b"ACGTACGTAC")
+                    .qualities(&[45u8; 10]);
+                b.add_string_tag(SamTag::MI, mi.as_bytes());
+                to_record_buf(b.build())
+            };
+            (
+                make(flags::FIRST_SEGMENT, flags::MATE_REVERSE),
+                make(flags::LAST_SEGMENT, flags::REVERSE),
+            )
+        }
+
+        /// Build the `(grouped, consensus)` BAM pair from fgbio's
+        /// `ReviewConsensusVariantsTest` fixture, verbatim: reads A-H at the four variant
+        /// loci (chr1:10/20/30, chr2:20), including the `G` pair that overlaps chr1:30
+        /// but is reference there, and the fully unmapped `X1`/`X` pairs at the end of the
+        /// grouped BAM.
+        pub fn create_fgbio_fixture_bams(dir: &TempDir) -> (PathBuf, PathBuf) {
+            let a10 = b"AAAAAAAAAA".as_slice();
+            // (name, chrom, start1, start2, cigar1, mi, bases1, bases2)
+            type PairSpec = (
+                &'static str,
+                usize,
+                i32,
+                i32,
+                Option<&'static str>,
+                &'static str,
+                &'static [u8],
+                &'static [u8],
+            );
+            let spec: [PairSpec; 8] = [
+                ("A", 0, 6, 50, None, "A", b"AAAATAAAAN", a10),
+                ("B", 0, 16, 50, None, "B", b"AAAACAAAAA", a10),
+                ("C", 0, 17, 50, None, "C", a10, a10),
+                ("D", 0, 25, 60, Some("4M4D6M"), "D", a10, a10),
+                ("E", 0, 26, 60, None, "E", b"AAAANAAAAA", a10),
+                ("F", 0, 27, 60, None, "F", b"AAAGAAAAAA", a10),
+                ("G", 0, 28, 60, None, "G", b"AAAAAAAGAA", a10),
+                ("H", 1, 15, 19, None, "H", b"CCCCCTCCCC", b"CTCCCCCCCC"),
+            ];
+            let mut consensus = Vec::new();
+            let mut grouped = Vec::new();
+            for (name, chrom, start1, start2, cigar1, mi, bases1, bases2) in spec {
+                let (r1, r2) =
+                    create_read_pair(name, chrom, start1, start2, bases1, bases2, mi, cigar1);
+                consensus.extend([r1, r2]);
+                // Raw reads are named `<consensus>1`; `A` also has a second raw read pair
+                // `A2` whose R1 differs from the consensus at the last base.
+                let raw_bases1: &[u8] = if name == "A" { b"AAAATAAAAA" } else { bases1 };
+                let (r1, r2) = create_read_pair(
+                    &format!("{name}1"),
+                    chrom,
+                    start1,
+                    start2,
+                    raw_bases1,
+                    bases2,
+                    mi,
+                    cigar1,
+                );
+                grouped.extend([r1, r2]);
+            }
+            let (r1, r2) = create_read_pair("A2", 0, 6, 50, b"AAAATAAAAG", a10, "A", None);
+            grouped.extend([r1, r2]);
+            for name in ["X1", "X"] {
+                let (r1, r2) = create_unmapped_pair(name, "X");
+                grouped.extend([r1, r2]);
+            }
+
+            let grouped_path = dir.path().join("raw.bam");
+            let consensus_path = dir.path().join("consensus.bam");
+            // `X` exists only in the grouped BAM (fgbio adds both unmapped pairs to `raw`).
+            write_indexed_bam(&grouped_path, &grouped);
+            write_indexed_bam(&consensus_path, &consensus);
+            (grouped_path, consensus_path)
+        }
+
+        /// Collect fgbio-style read ids (`name`, plus `/1` or `/2` for paired reads),
+        /// sorted, from any BAM.
+        pub fn bam_read_ids(path: &std::path::Path) -> Vec<String> {
+            use noodles::bam;
+            let mut reader =
+                bam::io::reader::Builder.build_from_path(path).expect("open bam for read ids");
+            let header = reader.read_header().expect("read header");
+            let mut ids: Vec<String> = reader
+                .record_bufs(&header)
+                .map(|result| {
+                    let record = result.expect("read record");
+                    let name =
+                        String::from_utf8_lossy(record.name().expect("name").as_ref()).to_string();
+                    let flags = record.flags();
+                    let suffix = match (flags.is_segmented(), flags.is_first_segment()) {
+                        (false, _) => "",
+                        (true, true) => "/1",
+                        (true, false) => "/2",
+                    };
+                    format!("{name}{suffix}")
+                })
+                .collect();
+            ids.sort();
+            ids
         }
 
         /// Write `records` to a coordinate-sorted, indexed BAM at `path`.
@@ -2517,17 +2760,21 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
         );
     }
 
+    /// Ports `ReviewConsensusVariantsTest.scala:227` ("extract the right reads given a set
+    /// of loci"), using fgbio's fixture verbatim (including the `G` pair, which overlaps
+    /// chr1:30 but is reference there, and the unmapped `X1`/`X` pairs). fgbio writes only
+    /// grouped reads that *overlap a variant locus* and whose MI is in the review set, so
+    /// the mates that sit off every locus (`A1/2`, `A2/2`, `B1/2`, `D1/2`, `E1/2`, `F1/2`)
+    /// must not appear in `.grouped.bam`.
     #[test]
-    fn test_extracts_correct_reads_for_variants() {
-        use noodles::bam;
-
+    fn test_review_grouped_bam_contains_only_reads_overlapping_variants() {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let ref_path = test_utils::create_test_reference(&temp_dir);
-        let (raw_path, consensus_path) = test_utils::create_test_bams(&temp_dir);
+        let (raw_path, consensus_path) = test_utils::create_fgbio_fixture_bams(&temp_dir);
         let vcf_path = test_utils::create_test_vcf(&temp_dir);
-        let output_path = temp_dir.path().join("output");
+        let output_path = temp_dir.path().join("review_consensus_out");
 
-        let review = Review {
+        Review {
             input: vcf_path,
             consensus_bam: consensus_path,
             grouped_bam: raw_path,
@@ -2536,74 +2783,291 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
             sample: Some("tumor".to_string()),
             ignore_ns: false,
             maf: 0.05,
-        };
+        }
+        .execute("test")
+        .expect("execute should succeed");
 
+        // `bam_read_ids` sorts, matching fgbio's `contain theSameElementsAs`.
+        assert_eq!(
+            test_utils::bam_read_ids(&test_utils::suffixed(&output_path, "grouped.bam")),
+            vec!["A1/1", "A2/1", "B1/1", "D1/1", "E1/1", "F1/1", "H1/1", "H1/2"]
+        );
+        assert_eq!(
+            test_utils::bam_read_ids(&test_utils::suffixed(&output_path, "consensus.bam")),
+            vec!["A/1", "B/1", "D/1", "E/1", "F/1", "H/1", "H/2"]
+        );
+
+        // The metrics don't contain reads with spanning deletions, so `D/1` is present in
+        // the consensus BAM above and absent here (fgbio test comment, `:250`).
+        let rows = test_utils::read_review_rows(&test_utils::suffixed(&output_path, "txt"));
+        let mut metric_reads: Vec<&str> =
+            rows[1..].iter().map(|r| r[COL_CONSENSUS_READ].as_str()).collect();
+        metric_reads.sort_unstable();
+        assert_eq!(metric_reads, vec!["A/1", "B/1", "E/1", "F/1", "H/1", "H/2"]);
+    }
+
+    /// Builds a `Review` for a single chr1:10 `A>T` variant over a one-read consensus BAM
+    /// (`CON`, MI `A`, `T` at chr1:10, spanning chr1:6-15) and a grouped BAM holding
+    /// `grouped`. The output prefix is `<temp_dir>/output`.
+    fn review_with_one_variant(
+        temp_dir: &TempDir,
+        grouped: &[noodles::sam::alignment::RecordBuf],
+    ) -> Review {
+        let consensus = test_utils::create_single_read("CON", 0, 6, b"AAAATAAAAA", None, "A");
+        review_with_one_variant_and_consensus(temp_dir, &[consensus], grouped)
+    }
+
+    /// As [`review_with_one_variant`], with the consensus BAM holding `consensus`.
+    fn review_with_one_variant_and_consensus(
+        temp_dir: &TempDir,
+        consensus: &[noodles::sam::alignment::RecordBuf],
+        grouped: &[noodles::sam::alignment::RecordBuf],
+    ) -> Review {
+        let ref_path = test_utils::create_test_reference(temp_dir);
+        let consensus_path = temp_dir.path().join("consensus.bam");
+        let grouped_path = temp_dir.path().join("grouped.bam");
+        test_utils::write_indexed_bam(&consensus_path, consensus);
+        test_utils::write_indexed_bam(&grouped_path, grouped);
+
+        let vcf = write_file(
+            temp_dir,
+            "one.vcf",
+            "##fileformat=VCFv4.2\n\
+##contig=<ID=chr1,length=100>\n\
+##contig=<ID=chr2,length=100>\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+chr1\t10\t.\tA\tT\t.\tPASS\t.\n",
+        );
+        Review {
+            input: vcf,
+            consensus_bam: consensus_path,
+            grouped_bam: grouped_path,
+            reference: ref_path,
+            output: temp_dir.path().join("output"),
+            sample: None,
+            ignore_ns: false,
+            maf: 0.05,
+        }
+    }
+
+    /// The grouped reads for the MI-less tests: `RAW1` (MI `A`, chr1:6-15, `T` at the
+    /// chr1:10 variant) plus `NOMI`, which has no `MI` tag and starts at `nomi_start`.
+    fn grouped_reads_with_mi_less_read(nomi_start: i32) -> Vec<noodles::sam::alignment::RecordBuf> {
+        let bases = b"AAAATAAAAA";
+        vec![
+            test_utils::create_single_read("RAW1", 0, 6, bases, None, "A"),
+            test_utils::create_single_read_without_mi("NOMI", 0, nomi_start, bases),
+        ]
+    }
+
+    /// A grouped read that overlaps a variant locus but has no `MI` tag is an error, not a
+    /// silent skip. fgbio applies `toMi` (`ReviewConsensusVariants.scala:88`) to every read
+    /// from `groupedIn.query(variants)` (`ReviewConsensusVariants.scala:206`), throwing
+    /// `IllegalStateException("<name> did not have a value for tag MI")`. fgbio has no test
+    /// for this path; the message is copied from `toMi`.
+    ///
+    /// The grouped-read extraction is called directly as well as through `execute`: the
+    /// review-file raw-count loop raises the same message for the same read, so an
+    /// `execute`-only assertion would stay green if the extraction went back to skipping.
+    #[test]
+    fn test_review_errors_on_variant_overlapping_grouped_read_without_mi() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        // `NOMI` spans chr1:8-17, which covers the variant at chr1:10.
+        let review = review_with_one_variant(&temp_dir, &grouped_reads_with_mi_less_read(8));
+
+        let expected = format!(
+            "reviewing reads from {}: NOMI did not have a value for tag MI; review needs the MI \
+             tag that fgumi group and the consensus callers write",
+            review.grouped_bam.display()
+        );
+        let variants = [Variant::new("chr1".to_string(), 10, 'A')];
+        let mi_set = HashSet::from(["A".to_string()]);
+        let err = review
+            .extract_grouped_reads(
+                &variants,
+                &mi_set,
+                &test_utils::suffixed(&review.output, "grouped.bam"),
+                "test",
+            )
+            .expect_err("grouped-read extraction must reject the MI-less read");
+        assert_eq!(format!("{err:#}"), expected);
+
+        let err = review.execute("test").expect_err("review must reject the MI-less read");
+        assert_eq!(format!("{err:#}"), expected);
+    }
+
+    /// A failed run leaves no BAM at either output path, and no staging file behind: the
+    /// grouped extraction fails on an MI-less read after `RAW1` has been written and after
+    /// the consensus BAM is complete, so writing in place would leave a truncated
+    /// `.grouped.bam` that still ends in a BGZF EOF block, beside a `.consensus.bam`.
+    #[test]
+    fn test_review_failure_leaves_no_output_bams() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        // `NOMI` sorts after `RAW1` (chr1:6), so `RAW1` is written before the error.
+        let review = review_with_one_variant(&temp_dir, &grouped_reads_with_mi_less_read(8));
+        let mut before: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .expect("read dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        before.sort();
+
+        review.execute("test").expect_err("review must reject the MI-less read");
+
+        let mut after: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .expect("read dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        after.sort();
+        assert_eq!(after, before, "a failed run must not add files to the output directory");
+    }
+
+    /// A mapped grouped read with a zero-length reference span (here CIGAR `10S`) placed at
+    /// the variant is not returned by fgbio's `groupedIn.query(variants)`: htsjdk's
+    /// `compareIntervalToRecord` gives it alignment end `start - 1`, which misses a point
+    /// query at `start`. fgbio therefore never calls `toMi` on it, so an MI-less one is not
+    /// an error and is not written.
+    #[test]
+    fn test_review_skips_mapped_zero_span_grouped_read_at_a_variant() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let grouped = [
+            test_utils::create_single_read("RAW1", 0, 6, b"AAAATAAAAA", None, "A"),
+            test_utils::create_placed_read("ZERO", 0, 10, 0, "10S", b"TAAAAAAAAA", None),
+        ];
+        let review = review_with_one_variant(&temp_dir, &grouped);
+        review.execute("test").expect("a zero-span read is never inspected");
+        assert_eq!(
+            test_utils::bam_read_ids(&test_utils::suffixed(&review.output, "grouped.bam")),
+            vec!["RAW1"]
+        );
+    }
+
+    /// Each output BAM ends with exactly one 28-byte BGZF EOF block: finishing the BGZF
+    /// writer with `try_finish` and then dropping it would append a second.
+    #[test]
+    fn test_review_output_bams_end_with_one_eof_block() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let grouped = [test_utils::create_single_read("RAW1", 0, 6, b"AAAATAAAAA", None, "A")];
+        let review = review_with_one_variant(&temp_dir, &grouped);
         review.execute("test").expect("execute should succeed");
 
-        // Verify output files exist
-        let con_out = test_utils::suffixed(&output_path, "consensus.bam");
-        let raw_out = test_utils::suffixed(&output_path, "grouped.bam");
-        let txt_out = test_utils::suffixed(&output_path, "txt");
-
-        assert!(con_out.exists());
-        assert!(raw_out.exists());
-        assert!(txt_out.exists());
-
-        // Read consensus BAM and verify read names
-        let mut con_reader = bam::io::indexed_reader::Builder::default()
-            .build_from_path(&con_out)
-            .expect("failed to open indexed BAM");
-        let con_header = con_reader.read_header().expect("failed to read BAM header");
-
-        let mut consensus_reads = Vec::new();
-        let mut con_record = noodles::sam::alignment::RecordBuf::default();
-        while con_reader
-            .read_record_buf(&con_header, &mut con_record)
-            .expect("failed to read BAM record")
-            > 0
-        {
-            let name = String::from_utf8_lossy(
-                con_record.name().expect("record should have name").as_ref(),
-            )
-            .to_string();
-            consensus_reads.push(name);
+        let eof = fgumi_bgzf::BGZF_EOF.as_slice();
+        for suffix in ["consensus.bam", "grouped.bam"] {
+            let bytes =
+                std::fs::read(test_utils::suffixed(&review.output, suffix)).expect("read bam");
+            let (body, tail) = bytes.split_at(bytes.len() - eof.len());
+            assert_eq!(tail, eof, "{suffix} must end with a BGZF EOF block");
+            assert!(!body.ends_with(eof), "{suffix} must end with exactly one BGZF EOF block");
         }
+    }
 
-        // Should contain reads A, B, D, E, F, H (first and second of pair)
-        // Note: Based on Scala test, we expect specific reads
-        assert!(consensus_reads.contains(&"A".to_string()));
-        assert!(consensus_reads.contains(&"B".to_string()));
-        assert!(consensus_reads.contains(&"E".to_string()));
-        assert!(consensus_reads.contains(&"F".to_string()));
-        assert!(consensus_reads.contains(&"H".to_string()));
+    /// Counterpart to the test above: fgbio only calls `toMi` on grouped reads returned by
+    /// `query(variants)` (`ReviewConsensusVariants.scala:206`), so an MI-less grouped read
+    /// that overlaps no variant is never inspected. It must neither error nor be written to
+    /// `.grouped.bam`.
+    #[test]
+    fn test_review_ignores_grouped_read_without_mi_that_overlaps_no_variant() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        // `NOMI` spans chr1:60-69, which overlaps no variant.
+        let review = review_with_one_variant(&temp_dir, &grouped_reads_with_mi_less_read(60));
+        review
+            .execute("test")
+            .expect("an MI-less grouped read off every variant locus must not error");
+        assert_eq!(
+            test_utils::bam_read_ids(&test_utils::suffixed(&review.output, "grouped.bam")),
+            vec!["RAW1"]
+        );
+    }
 
-        // Read raw BAM and verify read names
-        let mut raw_reader = bam::io::indexed_reader::Builder::default()
-            .build_from_path(&raw_out)
-            .expect("failed to open indexed BAM");
-        let raw_header = raw_reader.read_header().expect("failed to read BAM header");
+    /// An unmapped mate placed at its mapped mate's position is a one-base read at that
+    /// position for the grouped query, as in htsjdk, whose
+    /// `BAMQueryMultipleIntervalsIteratorFilter.compareIntervalToRecord` sets such a
+    /// read's alignment end to its alignment start. fgbio writes
+    /// `groupedIn.query(variants)` reads with a reviewed MI
+    /// (`ReviewConsensusVariants.scala:206`), so `RAWP/2`, placed on the chr1:10 variant,
+    /// is written, and `OFFP/2`, placed at chr1:6, is not, even though its 10M CIGAR
+    /// would reach chr1:10 if it were honored. fgbio has no test for this
+    /// path.
+    #[test]
+    fn test_review_grouped_bam_includes_placed_unmapped_mate_only_at_a_variant() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let (on_r1, on_r2) = test_utils::create_pair_with_placed_unmapped_mate(
+            "RAWP",
+            0,
+            10,
+            b"TAAAAAAAAA",
+            "A",
+            false,
+        );
+        // `OFFP/2` keeps a 10M CIGAR, which would reach chr1:10 if it were honored.
+        let (off_r1, off_r2) = test_utils::create_pair_with_placed_unmapped_mate(
+            "OFFP",
+            0,
+            6,
+            b"AAAATAAAAA",
+            "A",
+            true,
+        );
+        let review = review_with_one_variant(&temp_dir, &[off_r1, off_r2, on_r1, on_r2]);
+        review.execute("test").expect("execute should succeed");
+        assert_eq!(
+            test_utils::bam_read_ids(&test_utils::suffixed(&review.output, "grouped.bam")),
+            vec!["OFFP/1", "RAWP/1", "RAWP/2"]
+        );
+    }
 
-        let mut raw_reads = Vec::new();
-        let mut raw_record = noodles::sam::alignment::RecordBuf::default();
-        while raw_reader
-            .read_record_buf(&raw_header, &mut raw_record)
-            .expect("failed to read BAM record")
-            > 0
-        {
-            let name = String::from_utf8_lossy(
-                raw_record.name().expect("record should have name").as_ref(),
-            )
-            .to_string();
-            raw_reads.push(name);
-        }
+    /// Unmapped reads placed at the variant that still carry a CIGAR are not counted and get
+    /// no row. fgbio builds the review file from `SamLocusIterator`, and htsjdk's
+    /// `AbstractLocusIterator` skips every read flagged unmapped. `UNMCON` (consensus, MI
+    /// `B`) and `UNMRAW` (grouped, MI `A`) are placed at chr1:10 with a 10M CIGAR and a `T`
+    /// there, so walking their CIGARs would add a spurious `UNMCON/1` row and count `T`
+    /// twice in both the consensus and the raw columns. `UNMRAW` is still written to
+    /// `.grouped.bam`, as fgbio's `groupedIn.query(variants)` returns it.
+    #[test]
+    fn test_review_file_skips_placed_unmapped_reads_with_a_cigar() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let bases = b"TAAAAAAAAA";
+        let consensus = [
+            test_utils::create_single_read("CON", 0, 6, b"AAAATAAAAA", None, "A"),
+            test_utils::create_placed_read(
+                "UNMCON",
+                0,
+                10,
+                fgumi_raw_bam::flags::UNMAPPED,
+                "10M",
+                bases,
+                Some("B"),
+            ),
+        ];
+        let grouped = [
+            test_utils::create_single_read("RAW1", 0, 6, b"AAAATAAAAA", None, "A"),
+            test_utils::create_placed_read(
+                "UNMRAW",
+                0,
+                10,
+                fgumi_raw_bam::flags::UNMAPPED,
+                "10M",
+                bases,
+                Some("A"),
+            ),
+        ];
+        let review = review_with_one_variant_and_consensus(&temp_dir, &consensus, &grouped);
+        review.execute("test").expect("execute should succeed");
 
-        // Should contain A1, A2, B1, D1, E1, F1, H1
-        assert!(raw_reads.contains(&"A1".to_string()));
-        assert!(raw_reads.contains(&"A2".to_string()));
-        assert!(raw_reads.contains(&"B1".to_string()));
-        assert!(raw_reads.contains(&"E1".to_string()));
-        assert!(raw_reads.contains(&"F1".to_string()));
-        assert!(raw_reads.contains(&"H1".to_string()));
+        assert_eq!(
+            test_utils::bam_read_ids(&test_utils::suffixed(&review.output, "consensus.bam")),
+            vec!["CON"]
+        );
+        assert_eq!(
+            test_utils::bam_read_ids(&test_utils::suffixed(&review.output, "grouped.bam")),
+            vec!["RAW1", "UNMRAW"]
+        );
+        let rows = test_utils::read_review_rows(&test_utils::suffixed(&review.output, "txt"));
+        let expected: Vec<String> = ["chr1", "10", "A", "NA", "PASS", "0", "0", "0", "1", "0"]
+            .into_iter()
+            .chain(["CON/1", "NA", "T", "45", "0", "0", "0", "1", "0"])
+            .map(str::to_string)
+            .collect();
+        assert_eq!(rows[1..], [expected]);
     }
 
     #[test]
@@ -3384,6 +3848,11 @@ chr1\t30\t.\tA\tG\t.\tPASS\t.\n",
         assert_eq!(
             span_count, 1,
             "multi-locus read must be written once, got {span_count}: {names:?}"
+        );
+        // The grouped extraction's single multi-interval query also writes it once.
+        assert_eq!(
+            test_utils::bam_read_ids(&test_utils::suffixed(&output_path, "grouped.bam")),
+            ["SPAN"]
         );
     }
 

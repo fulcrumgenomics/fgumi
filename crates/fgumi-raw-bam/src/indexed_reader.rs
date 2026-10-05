@@ -148,6 +148,11 @@ impl<R: Read + Seek> IndexedRawBamReader<R> {
     /// the query region; records that fall entirely outside the region (but
     /// in the same BGZF chunk) are silently skipped.
     ///
+    /// Overlap follows htsjdk's `SamReader.query` rather than noodles': a record
+    /// flagged unmapped but placed at a position (e.g. at its mapped mate) covers
+    /// only that position, whatever CIGAR it carries, and a mapped record with a
+    /// zero-length reference span never overlaps a single-position region.
+    ///
     /// # Arguments
     ///
     /// * `header` — SAM header obtained from [`Self::read_header`]; used to
@@ -198,7 +203,9 @@ impl<R: Read + Seek> IndexedRawBamReader<R> {
     ///
     /// `regions` may overlap, be unsorted, and span multiple reference
     /// sequences; the output ordering and single-visit guarantee hold
-    /// regardless.
+    /// regardless. A record overlaps a region by the same rule as in
+    /// [`query`](Self::query), including for unmapped records placed at a
+    /// position and mapped records with a zero-length reference span.
     ///
     /// # Arguments
     ///
@@ -325,11 +332,11 @@ impl<R: Read + Seek> Iterator for RawMultiQueryIter<'_, R> {
                     // fixed-offset field: `record_span_1based` fails closed on a
                     // record shorter than the 32-byte core, so a corrupt BGZF block
                     // declaring a tiny nonzero size cannot reach the `ref_id`/`pos`
-                    // slice reads below and panic. Returns `Ok(None)` for unmapped
-                    // records (no reference span, cannot overlap).
+                    // slice reads below and panic. Returns `Ok(None)` for unplaced
+                    // records (negative `pos`), which cannot overlap.
                     let (rec_start, rec_end) = match record_span_1based(&self.record) {
                         Ok(Some(span)) => span,
-                        Ok(None) => continue, // no reference span (unmapped) cannot overlap
+                        Ok(None) => continue, // unplaced: cannot overlap
                         Err(e) => return Some(Err(e)), // malformed record: fail closed
                     };
 
@@ -351,7 +358,7 @@ impl<R: Read + Seek> Iterator for RawMultiQueryIter<'_, R> {
                     // O(log intervals) rather than every queried interval per record.
                     let idx = intervals.partition_point(|iv| interval_end(iv) < rec_start);
                     let overlaps =
-                        intervals.get(idx).is_some_and(|iv| interval_start(iv) <= rec_end);
+                        intervals.get(idx).is_some_and(|iv| span_overlaps(rec_start, rec_end, iv));
                     if overlaps {
                         return Some(Ok(self.record.clone()));
                     }
@@ -452,15 +459,24 @@ fn merge_intervals(mut intervals: Vec<Interval>) -> Vec<Interval> {
 
 // ─── overlap test ───────────────────────────────────────────────────────────
 
-/// Compute a mapped record's 1-based inclusive reference span `[start, end]`.
+/// Compute a record's 1-based inclusive reference footprint `[start, end]` for the
+/// overlap test, following htsjdk's
+/// `BAMQueryMultipleIntervalsIteratorFilter.compareIntervalToRecord` (and therefore
+/// fgbio's `SamSource.query`):
+///
+/// - a mapped record spans `[start, start + ref_len - 1]`, its CIGAR reference span.
+///   With a zero-length reference span (no CIGAR, or only `S`/`I`/`H`/`P` ops) that is
+///   the empty `[start, start - 1]`, so the record overlaps an interval only if the
+///   interval includes both `start - 1` and `start` — never a point query. noodles'
+///   `query` and htslib (`bam_endpos`) instead treat such a record as one base;
+/// - a record flagged unmapped but placed at a position (e.g. at its mapped mate)
+///   spans its single start position whatever CIGAR it carries, where noodles would
+///   use the CIGAR span.
 ///
 /// Returns:
-/// - `Ok(Some((start, end)))` for a mapped record with a valid reference span. A
-///   record with a zero-length reference span (unmapped mate placed at a position,
-///   or no CIGAR) is treated as covering its single start position, so its span
-///   equals `intersects_region`'s single-position fallback.
-/// - `Ok(None)` when the record has no reference position (unmapped, or a negative
-///   `pos`) and therefore cannot overlap any queried interval.
+/// - `Ok(Some((start, end)))` for a placed record (non-negative `pos`), as above.
+/// - `Ok(None)` for an unplaced record (negative `pos`), which cannot overlap any
+///   queried interval.
 /// - `Err(..)` when the record is malformed — shorter than the fixed core or its
 ///   declared CIGAR extends past the record buffer. Rather than silently treating a
 ///   truncated record as a point alignment at its start, the span cannot be trusted,
@@ -479,74 +495,40 @@ fn record_span_1based(record: &RawRecord) -> anyhow::Result<Option<(usize, usize
 
     let p = pos(bytes);
     if p < 0 {
-        return Ok(None); // unmapped / no position cannot overlap a region
+        return Ok(None); // unplaced: no position, cannot overlap a region
     }
     #[allow(clippy::cast_sign_loss)] // guarded by `p >= 0` check above
     let start_1based = p as usize + 1;
 
     #[allow(clippy::cast_sign_loss)] // reference_length_from_raw_bam_checked returns non-negative
     let ref_len = ref_len_raw as usize;
-    let end_1based = if ref_len == 0 { start_1based } else { start_1based + ref_len - 1 };
+    // `start_1based >= 1`, so a zero-length span yields `start - 1` without underflow.
+    let end_1based = if record.is_unmapped() { start_1based } else { start_1based + ref_len - 1 };
     Ok(Some((start_1based, end_1based)))
 }
 
-/// Returns `true` if `record` overlaps `(ref_id, interval)`.
-///
-/// Mirrors noodles' `query::intersects` but operates on raw BAM bytes so
-/// no decoding to `Record` is needed.
+/// Returns `true` if the record footprint `[start, end]` (from [`record_span_1based`])
+/// overlaps `interval`: the interval must not end before `start` nor begin after `end`.
+fn span_overlaps(start: usize, end: usize, interval: &Interval) -> bool {
+    interval_start(interval) <= end && start <= interval_end(interval)
+}
+
+/// Returns `true` if `record` overlaps `(ref_id, interval)`, using the footprint rule
+/// of [`record_span_1based`], and operating on raw BAM bytes so no decoding to
+/// `Record` is needed.
 fn intersects_region(
     record: &RawRecord,
     ref_id: usize,
     interval: Interval,
 ) -> anyhow::Result<bool> {
-    use crate::cigar::reference_length_from_raw_bam_checked;
-    use crate::fields::{pos, ref_id as raw_ref_id};
-    use noodles::core::Position;
-
-    let bytes: &[u8] = record;
-    // Validate the record's structure (fixed core + read-name + CIGAR all within
-    // bounds) before trusting any field; a truncated/malformed record fails closed
-    // instead of being mistaken for a point alignment at its start.
-    let ref_len_raw = reference_length_from_raw_bam_checked(bytes).context(
-        "malformed BAM record: truncated, or declared CIGAR/read-name length \
-             exceeds record buffer",
-    )?;
-
-    // Reference-sequence ID check.
-    let record_ref_id = raw_ref_id(bytes);
-    if record_ref_id < 0 {
-        return Ok(false); // unmapped
-    }
-    if usize::try_from(record_ref_id).ok() != Some(ref_id) {
+    // Validates the record (failing closed when malformed) before any field is read.
+    let Some((start, end)) = record_span_1based(record)? else {
         return Ok(false);
+    };
+    if usize::try_from(crate::fields::ref_id(record)).ok() != Some(ref_id) {
+        return Ok(false); // unplaced (negative ref id) or on another reference
     }
-
-    // Position: 0-based in BAM, convert to 1-based for noodles Interval.
-    let p = pos(bytes);
-    if p < 0 {
-        return Ok(false);
-    }
-    #[allow(clippy::cast_sign_loss)] // guarded by `p >= 0` check above
-    let start_1based = p as usize + 1;
-
-    // Alignment end: start_1based + ref_length - 1
-    #[allow(clippy::cast_sign_loss)] // reference_length_from_raw_bam_checked returns non-negative
-    let ref_len = ref_len_raw as usize;
-    if ref_len == 0 {
-        // Unmapped or no CIGAR; treat as single-position
-        let start_pos =
-            Position::try_from(start_1based).context("converting alignment start to Position")?;
-        let record_interval = Interval::from(start_pos..=start_pos);
-        return Ok(interval.intersects(record_interval));
-    }
-    let end_1based = start_1based + ref_len - 1;
-
-    let start_pos =
-        Position::try_from(start_1based).context("converting alignment start to Position")?;
-    let end_pos = Position::try_from(end_1based).context("converting alignment end to Position")?;
-
-    let record_interval = Interval::from(start_pos..=end_pos);
-    Ok(interval.intersects(record_interval))
+    Ok(span_overlaps(start, end, &interval))
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────────
@@ -672,6 +654,53 @@ mod tests {
         let bytes = make_bam_bytes(0, 100, 0, b"rea", &[(10 << 4)], 10, -1, -1, &[]);
         let record = RawRecord::from(bytes);
         assert_eq!(record_span_1based(&record).expect("span"), Some((101, 110)));
+    }
+
+    /// A record's overlap footprint follows htsjdk's `compareIntervalToRecord`: the CIGAR
+    /// span for a mapped record (empty, `end = start - 1`, when that span has zero
+    /// length), and the single start position for a record flagged unmapped but placed
+    /// at a position, whatever CIGAR it carries.
+    #[rstest]
+    #[case::mapped_10m(0, &[10 << 4], Some((101, 110)))]
+    #[case::mapped_no_cigar(0, &[], Some((101, 100)))]
+    #[case::mapped_soft_clip_only(0, &[(10 << 4) | 4], Some((101, 100)))]
+    #[case::placed_unmapped_10m(0x4, &[10 << 4], Some((101, 101)))]
+    #[case::placed_unmapped_no_cigar(0x4, &[], Some((101, 101)))]
+    fn record_span_1based_follows_htsjdk_footprint(
+        #[case] flag: u16,
+        #[case] cigar: &[u32],
+        #[case] expected: Option<(usize, usize)>,
+    ) {
+        // pos=100 (0-based) -> 101 (1-based).
+        let bytes = make_bam_bytes(0, 100, flag, b"rea", cigar, 10, -1, -1, &[]);
+        assert_eq!(record_span_1based(&RawRecord::from(bytes)).expect("span"), expected);
+    }
+
+    /// `intersects_region` applies the `record_span_1based` footprint with htsjdk's
+    /// comparison: a mapped zero-span record at 101 misses every interval that does not
+    /// include both 100 and 101 (in particular the point query `[101, 101]`), and a
+    /// placed unmapped record with a 10M CIGAR covers only 101.
+    #[rstest]
+    #[case::mapped_zero_span_point(0, &[], 101, 101, false)]
+    #[case::mapped_zero_span_from_start(0, &[], 101, 105, false)]
+    #[case::mapped_zero_span_ending_at_start(0, &[], 95, 101, true)]
+    #[case::mapped_zero_span_before_start(0, &[], 95, 100, false)]
+    #[case::placed_unmapped_10m_at_start(0x4, &[10 << 4], 101, 101, true)]
+    #[case::placed_unmapped_10m_inside_cigar(0x4, &[10 << 4], 105, 105, false)]
+    #[case::mapped_10m_inside_cigar(0, &[10 << 4], 105, 105, true)]
+    fn intersects_region_follows_htsjdk_footprint(
+        #[case] flag: u16,
+        #[case] cigar: &[u32],
+        #[case] query_start: usize,
+        #[case] query_end: usize,
+        #[case] expected: bool,
+    ) {
+        let bytes = make_bam_bytes(0, 100, flag, b"rea", cigar, 10, -1, -1, &[]);
+        let interval = make_interval(query_start, query_end);
+        let record = RawRecord::from(bytes);
+        assert_eq!(intersects_region(&record, 0, interval).expect("intersects"), expected);
+        // A record on another reference never overlaps.
+        assert!(!intersects_region(&record, 1, interval).expect("intersects"));
     }
 
     /// A record whose declared CIGAR overruns its buffer must fail closed rather
@@ -912,6 +941,58 @@ mod tests {
         // 0-based positions of the four overlapping records (91,100,196,200 → -1).
         let expected: BTreeSet<i32> = [90, 99, 195, 199].into_iter().collect();
         assert_eq!(got, expected, "boundary overlap set mismatch");
+    }
+
+    /// Both query paths apply htsjdk's footprint through the indexed scan: at the point
+    /// region chr1:105, a mapped 10M read from 101 and an unmapped read placed at 105 are
+    /// returned, while an unmapped read placed at 101 with a 10M CIGAR (CIGAR ignored)
+    /// and a mapped read at 105 with no CIGAR (zero-length span) are not.
+    #[test]
+    fn query_paths_follow_htsjdk_footprint() {
+        use crate::SamBuilder;
+        use noodles::core::Region;
+
+        let record = |name: &[u8], pos_1based: i32, flags: u16, cigar: &[u32]| {
+            let mut b = SamBuilder::new();
+            b.read_name(name)
+                .ref_id(0)
+                .pos(pos_1based - 1)
+                .cigar_ops(cigar)
+                .sequence(&[b'A'; 10])
+                .qualities(&[30u8; 10])
+                .flags(flags);
+            crate::noodles_compat::raw_records_to_record_bufs(&[b.build().as_ref().to_vec()])
+                .expect("decode record")
+                .pop()
+                .expect("one record")
+        };
+        let m10 = [encode_op(0, 10)];
+        let header = make_header(&[("chr1", 1000)]);
+        let records = [
+            record(b"mapped", 101, 0, &m10),
+            record(b"unmapped_cigar", 101, crate::flags::UNMAPPED, &m10),
+            record(b"mapped_no_cigar", 105, 0, &[]),
+            record(b"unmapped_placed", 105, crate::flags::UNMAPPED, &[]),
+        ];
+        let (bam, index) = build_and_index(&header, &records);
+        let mut reader = IndexedRawBamReader::new(Cursor::new(bam), index);
+        let hdr = reader.read_header().expect("header");
+        let region: Region = "chr1:105-105".parse().expect("region");
+        let names = |iter: &mut dyn Iterator<Item = anyhow::Result<RawRecord>>| {
+            iter.map(|r| String::from_utf8_lossy(r.expect("record ok").read_name()).into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let expected = vec!["mapped".to_string(), "unmapped_placed".to_string()];
+        assert_eq!(names(&mut reader.query(&hdr, &region).expect("query")), expected);
+        assert_eq!(
+            names(
+                &mut reader
+                    .query_intervals(&hdr, std::slice::from_ref(&region))
+                    .expect("query_intervals")
+            ),
+            expected
+        );
     }
 
     /// `query_intervals` with no regions yields nothing.
