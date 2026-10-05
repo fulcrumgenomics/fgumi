@@ -516,13 +516,23 @@ fn unique_max_index(likelihoods: &[LogProbability; DNA_BASE_COUNT]) -> Option<us
 }
 
 /// Resolve the unique maximum under *rule*.
+///
+/// Under [`TieRule::FgbioCompat`] a `-inf` maximum is a no-call, as it is under
+/// [`TieRule::UlpRelative`]. [`fgbio_unique_max_index`] stays an exact port and selects it, but
+/// fgbio never reaches a call there from a real pileup: a `-inf` maximum means every lane is
+/// `NaN` or `-inf`, and with any `NaN` lane fgbio's `LogProbability.or` throws before its
+/// `maxWithIndex` runs (`ConsensusCaller.scala:157`). An all-`-inf` array, which fgbio calls,
+/// cannot arise once a base is added: the error lanes stay finite. fgumi would otherwise call
+/// whichever base was added last (the one lane still `-inf` rather than `NaN`), which depends
+/// on read order. Every `call` path selects through here, so they all no-call it.
 fn unique_max_index_with(
     likelihoods: &[LogProbability; DNA_BASE_COUNT],
     rule: TieRule,
 ) -> Option<usize> {
     match rule {
         TieRule::UlpRelative => unique_max_index(likelihoods),
-        TieRule::FgbioCompat => fgbio_unique_max_index(likelihoods),
+        TieRule::FgbioCompat => fgbio_unique_max_index(likelihoods)
+            .filter(|&index| likelihoods[index] != f64::NEG_INFINITY),
     }
 }
 
@@ -1691,6 +1701,95 @@ mod tests {
             with_q0_conflict.1, 44,
             "a Q0 conflicting base must leave the quality at fgbio's Q44, not inflate it"
         );
+    }
+
+    /// Pins the Kahan behaviour fgumi shares with fgbio: once a `−∞` term lands in a lane, its
+    /// compensation becomes `(−∞ − sum) − −∞ = NaN`, and the next add turns the lane itself
+    /// into `NaN`. fgbio's `kahanAdd` (`ConsensusCaller.scala:128-133`, added in fgbio #1120,
+    /// e2ccac9) does exactly the same arithmetic, so this is parity, not a defect to fix.
+    ///
+    /// A `−∞` term needs a Q0 on either side of the two-trial error: a post-UMI error rate of
+    /// Q0, or an observation at Q0 (reachable with `--min-input-base-quality 0`). Either way
+    /// `ln_error_prob_two_trials` returns the dominant `ln(1) = 0` (as fgbio's
+    /// `probabilityOfErrorTwoTrials` does at `NumericTypes.scala:226`), so the adjusted
+    /// probability of a correct base is `ln(0) = −∞`. This test uses the post-UMI route.
+    #[test]
+    fn test_kahan_neg_inf_term_turns_lane_nan_on_next_add() {
+        let mut builder = ConsensusBaseBuilder::new(45, 0);
+
+        builder.add(b'A', 30);
+        let lanes = *builder.likelihoods.as_array();
+        assert_eq!(
+            lanes[0].to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            "the A lane takes the −∞ correct term"
+        );
+        assert!(lanes[1..].iter().all(|l| l.is_finite()), "other lanes stay finite: {lanes:?}");
+
+        builder.add(b'C', 30);
+        let lanes = *builder.likelihoods.as_array();
+        assert!(lanes[0].is_nan(), "the A lane's NaN compensation poisons it: {lanes:?}");
+        assert_eq!(
+            lanes[1].to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            "the C lane takes the −∞ correct term"
+        );
+        assert!(lanes[2..].iter().all(|l| l.is_finite()), "G and T stay finite: {lanes:?}");
+    }
+
+    /// A Q0 on either side of the two-trial error (post-UMI rate Q0 with Q30 observations, or a
+    /// Q40 post-UMI rate with Q0 observations) gives every observation a `−∞` correct term, so
+    /// observations `A`, `C` and `G` leave lanes `[NaN, NaN, −∞, finite]` (see
+    /// `test_kahan_neg_inf_term_turns_lane_nan_on_next_add`). `T` is the unique non-`NaN`
+    /// maximum, the normalizer is `NaN`, and so is the final error probability. fgbio calls this
+    /// `(T, Q2)`: `PhredScore.cap(PhredScore.fromLogProbability(p))` (`ConsensusCaller.scala:173`)
+    /// maps `NaN` to 0 and caps it to `MinValue`. fgumi returned `(T, Q0)` before
+    /// `ln_prob_to_phred` guarded `NaN`. The add order does not matter: whichever base comes
+    /// last leaves `−∞` rather than `NaN` in its lane, and the result is the same. Both tie
+    /// rules skip `NaN` lanes and agree here.
+    #[rstest]
+    fn test_degenerate_pileup_calls_min_phred_like_fgbio(
+        #[values((0, 30), (40, 0))] rates: (PhredScore, PhredScore),
+        #[values([b'A', b'C', b'G'], [b'G', b'C', b'A'], [b'C', b'G', b'A'])] bases: [u8; 3],
+        #[values(TieRule::FgbioCompat, TieRule::UlpRelative)] rule: TieRule,
+    ) {
+        let (post_umi, obs_qual) = rates;
+        let mut builder = ConsensusBaseBuilder::new(45, post_umi).with_tie_rule(rule);
+        for base in bases {
+            builder.add(base, obs_qual);
+        }
+        assert_eq!(builder.call(), (b'T', 2));
+        assert_eq!(builder.call_full(), (b'T', 2));
+    }
+
+    /// All four bases observed with a `−∞` correct term leave three lanes `NaN` and one `−∞`:
+    /// the lane of whichever base was added last, which never gets the next add that would
+    /// turn it `NaN`. fgbio throws `NoSuchElementException` here, because `LogProbability.or`
+    /// seeds its sum with `MathUtil.minWithIndex`, which finds no lane that is neither `NaN`
+    /// nor `−∞`, so there is no parity answer. Both tie rules no-call it rather than call the
+    /// lone `−∞` lane, which would make the base depend on read order.
+    #[rstest]
+    fn test_all_four_bases_with_neg_inf_correct_term_no_calls(
+        #[values((0, 30), (40, 0))] rates: (PhredScore, PhredScore),
+        #[values(*b"ACGT", *b"TGCA", *b"ATGC", *b"CATG", *b"GTAC")] bases: [u8; 4],
+        #[values(TieRule::FgbioCompat, TieRule::UlpRelative)] rule: TieRule,
+    ) {
+        let (post_umi, obs_qual) = rates;
+        let mut builder = ConsensusBaseBuilder::new(45, post_umi).with_tie_rule(rule);
+        for base in bases {
+            builder.add(base, obs_qual);
+        }
+        let last = usize::from(BASE_TO_INDEX[usize::from(bases[3])]);
+        let lanes = *builder.likelihoods.as_array();
+        for (index, lane) in lanes.iter().enumerate() {
+            if index == last {
+                assert_eq!(lane.to_bits(), f64::NEG_INFINITY.to_bits(), "lane {index}: {lanes:?}");
+            } else {
+                assert!(lane.is_nan(), "lane {index} is NaN: {lanes:?}");
+            }
+        }
+        assert_eq!(builder.call(), (NO_CALL_BASE, MIN_PHRED));
+        assert_eq!(builder.call_full(), (NO_CALL_BASE, MIN_PHRED));
     }
 
     // Port of fgbio test: "support calling multiple pileups from the same builder"

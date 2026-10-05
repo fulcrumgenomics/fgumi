@@ -104,7 +104,8 @@ pub fn phred_to_ln_correct_prob(phred: PhredScore) -> LogProbability {
 /// Q = -10 * log10(P) = -10 * ln(P) / ln(10)
 ///
 /// Uses floor(value + precision) matching fgbio's PhredScore.fromLogProbability.
-/// The result is clamped to the valid Phred score range [2, 93].
+/// The result is clamped to the valid Phred score range [2, 93]. A `NaN` input returns
+/// [`MIN_PHRED`] (Q2), as fgbio's consensus caller does by capping `fromLogProbability(NaN)`.
 ///
 /// # Examples
 /// ```
@@ -130,6 +131,12 @@ pub fn ln_prob_to_phred(ln_prob: LogProbability) -> PhredScore {
     // else Math.floor(-10.0 * (lnProbError/ Ln10) + Precision).toByte
     if ln_prob < MAX_PHRED_AS_LN_ERROR {
         return MAX_PHRED;
+    }
+    // `NaN` survives `clamp` and then casts to 0, below `MIN_PHRED`. fgbio's caller applies
+    // `PhredScore.cap(PhredScore.fromLogProbability(p))` (ConsensusCaller.scala:173), where
+    // `Math.floor(NaN).toByte` is 0 and `cap` raises it to `MinValue`, so `NaN` yields Q2.
+    if ln_prob.is_nan() {
+        return MIN_PHRED;
     }
     let phred = (-10.0 * ln_prob / LN_10 + PHRED_PRECISION).floor();
     #[expect(
@@ -340,6 +347,11 @@ pub fn ln_sum_exp(ln_a: LogProbability, ln_b: LogProbability) -> LogProbability 
 /// log-probabilities (posteriors). Uses the log-sum-exp trick for numerical
 /// stability across all values.
 ///
+/// Returns `−∞` for an empty array or one whose lanes are all `−∞`, as fgbio's
+/// `LogProbability.or` does. Returns `NaN` whenever any lane is `NaN`. fgbio also yields `NaN`
+/// there, except when every lane is `NaN` or `−∞`: its `MathUtil.minWithIndex` then finds no
+/// lane to seed the sum with and throws `NoSuchElementException`.
+///
 /// # Examples
 /// ```
 /// use fgumi_consensus::phred::ln_sum_exp_array;
@@ -374,7 +386,12 @@ pub fn ln_sum_exp_array(values: &[LogProbability]) -> LogProbability {
             min_value = *value;
         }
     }
-    let mut sum = min_value;
+    // Seed from the lane itself, not from `min_value`. When no lane compares below the
+    // `f64::INFINITY` starting value (every lane `NaN` or `+∞`), `min_index` stays 0 and
+    // `min_value` is still that starting value; seeding from it would drop a `NaN` at lane 0
+    // and return a plausible-looking `+∞`. Every other lane is folded below, and `ln_sum_exp`
+    // propagates any `NaN` it meets.
+    let mut sum = values[min_index];
     for (i, value) in values.iter().enumerate() {
         if i != min_index {
             sum = ln_sum_exp(sum, *value);
@@ -473,6 +490,35 @@ mod tests {
     fn test_ln_sum_exp_array_all_neg_inf_is_neg_inf(#[case] values: &[f64]) {
         let result = ln_sum_exp_array(values);
         assert!(result.is_infinite() && result < 0.0, "expected −∞, got {result}");
+    }
+
+    /// Pins that an array with a `NaN` lane and no finite lane sums to `NaN`, never the
+    /// `f64::INFINITY` starting value of the minimum search.
+    ///
+    /// The `NaN`/`-inf` rows port fgbio `MathUtilTest.scala:91` ("MathUtil.maxWithIndex should
+    /// throw exceptions on invalid inputs", whose `[NaN]` row at :93 actually calls
+    /// `minWithIndex`) and `MathUtilTest.scala:54` ("MathUtil.minWithIndex should throw
+    /// exceptions on invalid inputs", `[-inf, NaN]` row at :57). fgbio's
+    /// `LogProbability.or(Array)` (`NumericTypes.scala:167`) seeds its sum with `minWithIndex`,
+    /// which skips `NaN` and `-inf` lanes and throws `NoSuchElementException` when nothing is
+    /// left; fgumi returns `NaN` for these inputs instead. The `[NaN, +inf]` row is not from
+    /// fgbio: there `minWithIndex` seeds with the `+inf` lane and `or(+inf, NaN)` yields `NaN`.
+    ///
+    /// Only `[NaN]` and `[NaN, +inf]` returned `+inf` before the fix, because the `NaN` sat in
+    /// the lane the minimum search defaulted to and was never folded. In the other rows a
+    /// `NaN` reaches `ln_sum_exp`, which already passed it through, so they are pinned here as
+    /// regression guards. The empty and `[-inf]` rows (`MathUtilTest.scala:55-56`) never reach
+    /// `minWithIndex` through `or`, whose all-`-inf` guard returns `-inf`;
+    /// `test_ln_sum_exp_array_all_neg_inf_is_neg_inf` pins that.
+    #[rstest]
+    #[case::single_nan(&[f64::NAN])]
+    #[case::all_nan(&[f64::NAN, f64::NAN])]
+    #[case::neg_inf_then_nan(&[f64::NEG_INFINITY, f64::NAN])]
+    #[case::nan_then_neg_inf(&[f64::NAN, f64::NEG_INFINITY])]
+    #[case::nan_then_pos_inf(&[f64::NAN, f64::INFINITY])]
+    fn test_ln_sum_exp_array_with_nan_and_no_finite_lane_is_nan(#[case] values: &[f64]) {
+        let result = ln_sum_exp_array(values);
+        assert!(result.is_nan(), "expected NaN, got {result} for {values:?}");
     }
 
     #[test]
@@ -773,6 +819,22 @@ mod tests {
         // Very low error should clamp to MAX_PHRED
         let very_low_error = 1e-15_f64.ln();
         assert_eq!(ln_prob_to_phred(very_low_error), MAX_PHRED);
+    }
+
+    /// Pins that a `NaN` error probability maps to the minimum clamp, `MIN_PHRED` (Q2), not Q0.
+    ///
+    /// fgbio's consensus caller computes `PhredScore.cap(PhredScore.fromLogProbability(p))`
+    /// (`ConsensusCaller.scala:173`). For `NaN`, `fromLogProbability` (`NumericTypes.scala:83`)
+    /// fails the `< MaxValueAsLogDouble` test and returns `Math.floor(NaN).toByte`, which is 0,
+    /// and `cap` (`NumericTypes.scala:69`) raises that to `MinValue` = 2. Before the guard,
+    /// fgumi's `clamp` passed `NaN` through and the `as u8` cast turned it into 0, below the
+    /// documented `[MIN_PHRED, MAX_PHRED]` range.
+    #[rstest]
+    #[case::nan(f64::NAN)]
+    #[case::negative_nan(-f64::NAN)]
+    fn test_ln_prob_to_phred_nan_is_min_phred(#[case] ln_prob: f64) {
+        assert_eq!(ln_prob_to_phred(ln_prob), 2);
+        assert_eq!(ln_prob_to_phred(ln_prob), MIN_PHRED);
     }
 
     #[test]
