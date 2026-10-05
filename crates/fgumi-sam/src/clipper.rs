@@ -31,10 +31,10 @@ fn is_modification_tag(tag: [u8; 2]) -> bool {
 /// slice them even when their length happens to equal the read's.
 const NON_PER_BASE_TAGS: [fgumi_raw_bam::SamTag; 30] = [
     fgumi_raw_bam::SamTag::RG,
-    fgumi_raw_bam::SamTag::new(b'L', b'B'),
-    fgumi_raw_bam::SamTag::new(b'P', b'U'),
+    fgumi_raw_bam::SamTag::LB,
+    fgumi_raw_bam::SamTag::PU,
     fgumi_raw_bam::SamTag::PG,
-    fgumi_raw_bam::SamTag::new(b'C', b'O'),
+    fgumi_raw_bam::SamTag::CO,
     fgumi_raw_bam::SamTag::MI,
     fgumi_raw_bam::SamTag::BC,
     fgumi_raw_bam::SamTag::QT,
@@ -43,22 +43,22 @@ const NON_PER_BASE_TAGS: [fgumi_raw_bam::SamTag; 30] = [
     fgumi_raw_bam::SamTag::OX,
     fgumi_raw_bam::SamTag::BZ,
     fgumi_raw_bam::SamTag::CB,
-    fgumi_raw_bam::SamTag::new(b'C', b'R'),
+    fgumi_raw_bam::SamTag::CR,
     fgumi_raw_bam::SamTag::CY,
-    fgumi_raw_bam::SamTag::new(b'U', b'B'),
-    fgumi_raw_bam::SamTag::new(b'U', b'R'),
-    fgumi_raw_bam::SamTag::new(b'U', b'Y'),
+    fgumi_raw_bam::SamTag::UB,
+    fgumi_raw_bam::SamTag::UR,
+    fgumi_raw_bam::SamTag::UY,
     fgumi_raw_bam::SamTag::MC,
-    fgumi_raw_bam::SamTag::new(b'S', b'A'),
-    fgumi_raw_bam::SamTag::new(b'O', b'A'),
-    fgumi_raw_bam::SamTag::new(b'O', b'C'),
-    fgumi_raw_bam::SamTag::new(b'C', b'C'),
-    fgumi_raw_bam::SamTag::new(b'C', b'T'),
-    fgumi_raw_bam::SamTag::new(b'F', b'S'),
-    fgumi_raw_bam::SamTag::new(b'P', b'T'),
-    fgumi_raw_bam::SamTag::new(b'R', b'2'),
-    fgumi_raw_bam::SamTag::new(b'Q', b'2'),
-    fgumi_raw_bam::SamTag::new(b'F', b'Z'),
+    fgumi_raw_bam::SamTag::SA,
+    fgumi_raw_bam::SamTag::OA,
+    fgumi_raw_bam::SamTag::OC,
+    fgumi_raw_bam::SamTag::CC,
+    fgumi_raw_bam::SamTag::CT_ANNOTATION,
+    fgumi_raw_bam::SamTag::FS,
+    fgumi_raw_bam::SamTag::PT,
+    fgumi_raw_bam::SamTag::R2,
+    fgumi_raw_bam::SamTag::Q2,
+    fgumi_raw_bam::SamTag::FZ,
     fgumi_raw_bam::SamTag::OB,
 ];
 
@@ -2433,13 +2433,42 @@ mod tests {
     fn test_auto_clip_attributes_skips_non_per_base_tags() {
         use noodles::sam::alignment::record::data::field::Tag;
 
-        let expected: [[u8; 2]; 30] = [
-            *b"RG", *b"LB", *b"PU", *b"PG", *b"CO", *b"MI", *b"BC", *b"QT", *b"RX", *b"QX", *b"OX",
-            *b"BZ", *b"CB", *b"CR", *b"CY", *b"UB", *b"UR", *b"UY", *b"MC", *b"SA", *b"OA", *b"OC",
-            *b"CC", *b"CT", *b"FS", *b"PT", *b"R2", *b"Q2", *b"FZ", *b"ob",
+        use fgumi_raw_bam::SamTag;
+
+        let expected: [SamTag; 30] = [
+            SamTag::RG,
+            SamTag::LB,
+            SamTag::PU,
+            SamTag::PG,
+            SamTag::CO,
+            SamTag::MI,
+            SamTag::BC,
+            SamTag::QT,
+            SamTag::RX,
+            SamTag::QX,
+            SamTag::OX,
+            SamTag::BZ,
+            SamTag::CB,
+            SamTag::CR,
+            SamTag::CY,
+            SamTag::UB,
+            SamTag::UR,
+            SamTag::UY,
+            SamTag::MC,
+            SamTag::SA,
+            SamTag::OA,
+            SamTag::OC,
+            SamTag::CC,
+            SamTag::CT_ANNOTATION,
+            SamTag::FS,
+            SamTag::PT,
+            SamTag::R2,
+            SamTag::Q2,
+            SamTag::FZ,
+            SamTag::OB,
         ];
         let mut actual: Vec<[u8; 2]> = NON_PER_BASE_TAGS.iter().map(|t| **t).collect();
-        let mut wanted = expected.to_vec();
+        let mut wanted: Vec<[u8; 2]> = expected.iter().map(|t| **t).collect();
         actual.sort_unstable();
         wanted.sort_unstable();
         assert_eq!(actual, wanted);
@@ -2447,7 +2476,7 @@ mod tests {
         let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
         let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
         for tag in expected {
-            record.data_mut().insert(Tag::from(tag), Value::from("0123456789"));
+            record.data_mut().insert(Tag::from(*tag), Value::from("0123456789"));
         }
         let per_base = Tag::from([b'X', b'B']);
         record.data_mut().insert(per_base, Value::from("0123456789"));
@@ -2455,7 +2484,7 @@ mod tests {
         assert_eq!(clipper.clip_start_of_alignment(&mut record, 3), 3);
 
         for tag in expected {
-            match record.data().get(&Tag::from(tag)) {
+            match record.data().get(&Tag::from(*tag)) {
                 Some(Value::String(s)) => {
                     let bytes: &[u8] = s.as_ref();
                     assert_eq!(bytes, b"0123456789", "tag {tag:?} was clipped");

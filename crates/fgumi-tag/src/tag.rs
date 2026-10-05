@@ -121,6 +121,43 @@ impl SamTag {
     pub const XS: SamTag = SamTag::new(b'X', b'S');
     /// Program record identifier (SAM spec).
     pub const PG: SamTag = SamTag::new(b'P', b'G');
+    /// Library (SAM spec).
+    pub const LB: SamTag = SamTag::new(b'L', b'B');
+    /// Platform unit (SAM spec).
+    pub const PU: SamTag = SamTag::new(b'P', b'U');
+    /// Free-text comment (SAM spec).
+    pub const CO: SamTag = SamTag::new(b'C', b'O');
+    /// Cell barcode bases, uncorrected (SAM spec).
+    pub const CR: SamTag = SamTag::new(b'C', b'R');
+    /// Molecular barcode sequence, error-corrected (SAM spec).
+    pub const UB: SamTag = SamTag::new(b'U', b'B');
+    /// Molecular barcode sequence, uncorrected (SAM spec).
+    pub const UR: SamTag = SamTag::new(b'U', b'R');
+    /// Molecular barcode quality scores (SAM spec).
+    pub const UY: SamTag = SamTag::new(b'U', b'Y');
+    /// Other canonical alignments in a chimeric alignment (SAM spec).
+    pub const SA: SamTag = SamTag::new(b'S', b'A');
+    /// Original alignment (SAM spec).
+    pub const OA: SamTag = SamTag::new(b'O', b'A');
+    /// Original CIGAR, deprecated in favour of `OA` (SAM spec).
+    pub const OC: SamTag = SamTag::new(b'O', b'C');
+    /// Reference name of the next hit (SAM spec).
+    pub const CC: SamTag = SamTag::new(b'C', b'C');
+    /// Complete read annotation, `CT` (SAM spec).
+    ///
+    /// Note: the Rust identifier uses a descriptive suffix to avoid a name
+    /// collision with [`SamTag::CT`], the fgumi-local per-base `ct` count.
+    pub const CT_ANNOTATION: SamTag = SamTag::new(b'C', b'T');
+    /// Segment suffix (SAM spec).
+    pub const FS: SamTag = SamTag::new(b'F', b'S');
+    /// Annotations for parts of the padded read sequence (SAM spec).
+    pub const PT: SamTag = SamTag::new(b'P', b'T');
+    /// Sequence of the mate or next segment in the template (SAM spec).
+    pub const R2: SamTag = SamTag::new(b'R', b'2');
+    /// Phred qualities of the mate or next segment sequence in `R2` (SAM spec).
+    pub const Q2: SamTag = SamTag::new(b'Q', b'2');
+    /// Flow signal intensities, `B:S` array (SAM spec).
+    pub const FZ: SamTag = SamTag::new(b'F', b'Z');
     /// Adapter clipping position (e.g. from Picard `MarkIlluminaAdapters`).
     pub const XT: SamTag = SamTag::new(b'X', b'T');
     /// Bisulfite strand (written by `bwameth` and related tools): `Z:f` for the
