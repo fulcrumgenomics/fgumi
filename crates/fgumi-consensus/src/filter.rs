@@ -369,20 +369,31 @@ impl FilterResult {
         }
     }
 }
+/// Whether `record` is a primary read of its template (neither secondary nor supplementary):
+/// one of the R1/R2 reads fgbio's `Template` holds and `FilterConsensusReads` decides a template
+/// on. The one definition of a primary read for the template filter and its masked-base tally.
+#[must_use]
+pub fn is_primary_read(record: &RawRecord) -> bool {
+    !record.is_secondary() && !record.is_supplementary()
+}
+
 /// Checks whether all primary raw records in a template pass their filters.
 ///
-/// A template passes if it has at least one primary read and all primary reads pass.
+/// A template passes if it has at least one primary read and all primary reads pass. Every
+/// primary read must have an entry in `pass_map`; a primary read without one fails the template.
+#[deprecated(
+    note = "evaluates from a pass map of every record; fgbio's FilterConsensusReads (and fgumi \
+            filter) instead stop at the first primary read that fails and never evaluate the \
+            rest, so a primary read missing from a short-circuited pass map would fail the \
+            template here"
+)]
 #[must_use]
 pub fn template_passes(raw_records: &[RawRecord], pass_map: &AHashMap<usize, bool>) -> bool {
     let mut has_primary = false;
     let mut all_primary_pass = true;
 
     for (idx, record) in raw_records.iter().enumerate() {
-        let flags = RawRecordView::new(record).flags();
-        let is_primary = (flags & bam_fields::flags::SECONDARY) == 0
-            && (flags & bam_fields::flags::SUPPLEMENTARY) == 0;
-
-        if is_primary {
+        if is_primary_read(record) {
             has_primary = true;
             if let Some(&passes) = pass_map.get(&idx) {
                 if !passes {
@@ -410,9 +421,9 @@ pub fn template_passes(raw_records: &[RawRecord], pass_map: &AHashMap<usize, boo
 /// never added to the tally ("Masked X of Y bases in retained primary consensus reads").
 ///
 /// `masked_by_record[i]` is the number of bases masked in `raw_records[i]`; the slices are
-/// parallel and must be the same length. `template_pass` is the result of
-/// [`template_passes`] for this template (for the per-record streaming path, a single-read
-/// "template" whose pass value is the record's own filter result).
+/// parallel and must be the same length. `template_pass` is whether the template is kept (for
+/// the per-record streaming path, a single-read "template" whose pass value is the record's own
+/// filter result).
 ///
 /// # Panics
 ///
@@ -437,11 +448,7 @@ pub fn retained_primary_masked_bases(
     raw_records
         .iter()
         .zip(masked_by_record)
-        .filter(|(record, _)| {
-            let flags = RawRecordView::new(record).flags();
-            (flags & bam_fields::flags::SECONDARY) == 0
-                && (flags & bam_fields::flags::SUPPLEMENTARY) == 0
-        })
+        .filter(|(record, _)| is_primary_read(record))
         .map(|(_, &masked)| masked)
         .sum()
 }

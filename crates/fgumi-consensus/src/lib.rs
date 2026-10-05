@@ -72,6 +72,7 @@ impl MethylationMode {
 // Re-export commonly used items
 pub use base_builder::{ConsensusBaseBuilder, TieRule};
 pub use caller::{ConsensusCaller, calculate_error_rate, log_consensus_statistics};
+#[allow(deprecated)] // `template_passes` stays re-exported for existing callers.
 pub use filter::{
     ConsensusType, FilterConfig, FilterResult, FilterThresholds, compute_read_stats,
     count_no_calls, filter_duplex_read, filter_read, is_consensus, is_duplex_consensus,

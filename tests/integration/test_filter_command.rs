@@ -251,11 +251,10 @@ fn test_filter_rejects_headerless_input() {
     assert!(msg.contains("queryname sorted or query grouped"), "unexpected error message: {msg}");
 }
 
-/// Test filter command with reads that fail due to low per-base depth.
+/// Test filter command with a read that fails due to low depth.
 ///
-/// The filter masks bases where the per-base depth (cd tag) is below --min-reads.
-/// If enough bases are masked, the no-call fraction exceeds the threshold and the
-/// read is rejected.
+/// The read's consensus depth (cD tag) is below --min-reads, so the read-level check
+/// rejects it before any base is masked.
 #[test]
 fn test_filter_command_rejects_low_depth() {
     let temp_dir = TempDir::new().unwrap();
@@ -279,7 +278,7 @@ fn test_filter_command_rejects_low_depth() {
         b.build()
     };
 
-    // Low-depth read: per-base depth 1 (all below min-reads=3), all bases masked
+    // Low-depth read: depth 1 (below min-reads=3), rejected before masking
     let low_depth = {
         let mut b = RawSamBuilder::new();
         b.read_name(b"low_depth")
@@ -322,10 +321,19 @@ fn test_filter_command_rejects_low_depth() {
     let output_count = reader.records().count();
     assert_eq!(output_count, 1, "Only the good read should pass filtering");
 
-    let mut reject_reader = bam::io::Reader::new(fs::File::open(&rejects_bam).unwrap());
-    let _header = reject_reader.read_header().unwrap();
-    let reject_count = reject_reader.records().count();
-    assert_eq!(reject_count, 1, "The low-depth read should be rejected");
+    assert_rejects_are_input_records(&input_bam, &rejects_bam, "low_depth");
+}
+
+/// Asserts `rejects` holds exactly the record of `input` named `name`, as it was read: the read
+/// fails the read-level check, so it is rejected before any base is masked (it was written as
+/// `NNNNNNNN` when masking came first).
+fn assert_rejects_are_input_records(input: &Path, rejects: &Path, name: &str) {
+    let (_, input_records) = crate::helpers::read_bam_output(input);
+    let (_, rejected) = crate::helpers::read_bam_output(rejects);
+    let expected: Vec<_> =
+        input_records.into_iter().filter(|r| r.name().is_some_and(|n| *n == *name)).collect();
+    assert_eq!(expected.len(), 1, "input must hold one {name} record");
+    assert_eq!(rejected, expected, "--rejects must hold {name} exactly as it was read");
 }
 
 /// Test filter command with statistics output.
@@ -450,7 +458,7 @@ fn test_filter_command_no_ref_with_rejects() {
         b.build()
     };
 
-    // Low-depth unmapped read: per-base depth 1 (below min-reads=3), all bases masked
+    // Low-depth unmapped read: depth 1 (below min-reads=3), rejected before masking
     let low_depth = {
         let mut b = RawSamBuilder::new();
         b.read_name(b"low_depth").flags(flags::UNMAPPED).sequence(b"ACGTACGT").qualities(&[35; 8]);
@@ -487,10 +495,7 @@ fn test_filter_command_no_ref_with_rejects() {
     assert_eq!(output_count, 1, "Only the good read should pass filtering");
 
     // Verify the low-depth read was rejected
-    let mut reject_reader = bam::io::Reader::new(fs::File::open(&rejects_bam).unwrap());
-    let _header = reject_reader.read_header().unwrap();
-    let reject_count = reject_reader.records().count();
-    assert_eq!(reject_count, 1, "The low-depth read should be rejected");
+    assert_rejects_are_input_records(&input_bam, &rejects_bam, "low_depth");
 }
 
 /// Test that filter command without --ref fails when given mapped reads.
@@ -555,9 +560,8 @@ fn test_filter_command_no_ref_mapped_reads_fails() {
 /// Run `filter` on `input` writing `output`, with `extra` args appended
 /// (e.g. `--threads`, `--rejects`, `--stats`, `--filter-by-template`). Always
 /// passes `--ref` (mapped fixtures need it for tag regeneration) and
-/// `--min-reads 3` -- deliberately *not* overriding `--max-no-call-fraction`
-/// (default 0.2), so a fully-masked low-depth read is actually rejected rather
-/// than passed through. Asserts the run succeeds.
+/// `--min-reads 3`, so a low-depth read is rejected by the read-level check
+/// (before any masking). Asserts the run succeeds.
 fn filter_run(input: &Path, output: &Path, ref_path: &Path, extra: &[&str]) {
     let mut args = vec![
         "filter",
@@ -608,8 +612,8 @@ fn assert_outputs_match(single_worker: &Path, chain: &Path, ctx: &str) {
 /// Build `n` two-mate templates (R1/R2 sharing a read name, both mapped
 /// primaries). Even-indexed templates have both mates at passing depth
 /// (`cD 10 >= --min-reads 3`); odd-indexed templates have a passing R1 but a
-/// failing (`cD 1`, fully masked) R2. This is what makes both filter step
-/// factories do genuinely non-trivial, non-vacuous work:
+/// failing (`cD 1 < --min-reads 3`, rejected unmasked) R2. This is what makes
+/// both filter step factories do genuinely non-trivial, non-vacuous work:
 /// - filter-by-template mode drops the *whole* odd template (fgbio's
 ///   "all primaries must pass" rule), so both mates of an odd template are
 ///   rejected even though R1 alone would have passed;

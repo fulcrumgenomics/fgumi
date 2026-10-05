@@ -12,6 +12,7 @@ pub use fgumi_consensus::duplex_caller;
 pub use fgumi_consensus::vanilla_caller;
 
 // Re-export commonly used items
+#[allow(deprecated)] // `template_passes` stays re-exported for existing callers.
 pub use fgumi_consensus::{
     AgreementStrategy, ConsensusBaseBuilder, ConsensusCaller, ConsensusSequence, ConsensusType,
     CorrectionStats, DisagreementStrategy, FilterConfig, FilterResult, FilterThresholds,
