@@ -160,6 +160,28 @@ impl SamTag {
     pub const FZ: SamTag = SamTag::new(b'F', b'Z');
     /// CIGAR of an alignment with more than 65,535 operations, `B:I` array (SAM spec).
     pub const CG: SamTag = SamTag::new(b'C', b'G');
+    /// Alternative hits, `Z` string (written by `bwa` / `bwa-mem3`).
+    pub const XA: SamTag = SamTag::new(b'X', b'A');
+    /// Difference string against the reference, `cs:Z` (written by `minimap2 --cs`).
+    pub const CS: SamTag = SamTag::new(b'c', b's');
+    /// Intron motifs, `jM:B:c` array (written by STAR).
+    pub const JM: SamTag = SamTag::new(b'j', b'M');
+    /// Intron start and end coordinates, `jI:B:i` array (written by STAR).
+    pub const JI: SamTag = SamTag::new(b'j', b'I');
+    /// Gene IDs, `Z` string (written by `STARsolo` and Cell Ranger).
+    pub const GX: SamTag = SamTag::new(b'G', b'X');
+    /// Gene names, `Z` string (written by `STARsolo` and Cell Ranger).
+    pub const GN: SamTag = SamTag::new(b'G', b'N');
+    /// Linked-read barcode, `Z` string (written by 10x Genomics Long Ranger).
+    pub const BX: SamTag = SamTag::new(b'B', b'X');
+    /// Basecaller move table, `mv:B:c` array (written by Oxford Nanopore `dorado`).
+    pub const MV: SamTag = SamTag::new(b'm', b'v');
+    /// Parent read ID of a split read, `pi:Z` (written by Oxford Nanopore `dorado`).
+    pub const PI: SamTag = SamTag::new(b'p', b'i');
+    /// Read start time, `st:Z` (written by Oxford Nanopore `dorado`).
+    pub const ST: SamTag = SamTag::new(b's', b't');
+    /// Source signal file name, `fn:Z` (written by Oxford Nanopore `dorado`).
+    pub const FN: SamTag = SamTag::new(b'f', b'n');
     /// Adapter clipping position (e.g. from Picard `MarkIlluminaAdapters`).
     pub const XT: SamTag = SamTag::new(b'X', b'T');
     /// Bisulfite strand (written by `bwameth` and related tools): `Z:f` for the
