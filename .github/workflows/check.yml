@@ -211,16 +211,16 @@ jobs:
           tool: nextest
       - name: Build reference bwa-mem3 from upstream at the vendored COMMIT
         # Byte-parity is only defined against the exact bwa-mem3 the crate
-        # vendors. This SHA is the full 40-hex of the vendored `51ceed7`, fixed
-        # by the `bwa-mem3-rs` 0.3.0 Cargo pin (its
+        # vendors. This SHA is the full 40-hex of the vendored v0.14.0 release
+        # (`5c1d5e39`), fixed by the `bwa-mem3-rs` 0.4.2 Cargo pin (its
         # bwa-mem3-sys/vendor/COMMIT). If the Cargo pin is bumped, update this to
         # match; the check below fails fast on a mismatch rather than letting it
-        # surface as spurious parity divergence. The clone is not at the release
-        # tag, so this binary reports `@PG VN` with a `-<sha>` suffix; the parity
-        # test strips it.
+        # surface as spurious parity divergence. The fetch is tagless
+        # (`--no-tags`), so this binary may report `@PG VN` with a `-<sha>`
+        # suffix; the parity test strips it.
         run: |
           set -euo pipefail
-          sha="51ceed7531e1d843dd2dd743ad95931c385873ca"
+          sha="5c1d5e39e0b05fe3cf960ed0dc6086af59b3e870"
           # Resolve the locked bwa-mem3-sys checkout (cargo metadata fetches the
           # git dep) and compare its vendor/COMMIT against `sha`.
           sys_manifest="$(cargo metadata --format-version 1 --locked --features aligner-bwa-mem3 \

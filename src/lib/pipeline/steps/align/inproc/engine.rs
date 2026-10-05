@@ -54,6 +54,8 @@ use super::gate::CohortLease;
 // `bwa_mem3_rs` names it references, and they go through here so `engine.rs`
 // stays the sole module that names the binding crate.
 pub(crate) use bwa_mem3_rs::{BwaIndex, IdBases, MemOpts, RecordOrigin, RecordSink, shm, version};
+#[cfg(test)]
+pub(crate) use bwa_mem3_rs::{MethChem, MethScoring, MethSeedPrune};
 
 // ---------------------------------------------------------------------------
 // Borrowed input batch (fgumi side)

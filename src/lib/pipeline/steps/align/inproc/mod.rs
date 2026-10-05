@@ -36,7 +36,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use engine::{BwaIndex, MemOpts};
+use fgumi_consensus::MethylationMode;
 
+use crate::aligner::{BWA_MEM3_METH_INDEX_SUFFIX, bwa_mem3_meth_flag};
 use crate::pipeline::core::builder::PipelineBuilder;
 use crate::pipeline::core::step::StepOutcome;
 use crate::pipeline::core::topology::{BranchIdx, StepIdx};
@@ -74,6 +76,11 @@ pub(crate) struct InProcessBwaMem3Backend {
     /// The aligner's `-K` chunk size in bases, driving [`AlignPrepareStep`]'s
     /// cohort cutter and gate, and the synthesized `@PG CL`.
     pub(crate) chunk_size: u64,
+    /// The chemistry to align for (`--methylation-mode`). Under EM-seq the
+    /// backend loads the `bwa-mem3 index --meth` dual index and aligns as
+    /// `bwa-mem3 mem --meth` does; TAPS aligns plain (see
+    /// [`bwa_mem3_meth_flag`]).
+    pub(crate) methylation: MethylationMode,
 }
 
 /// What one `flush` of a `Serial` step's staged output did, so `try_run` can
@@ -130,11 +137,13 @@ impl AlignBackend for InProcessBwaMem3Backend {
     fn describe(&self) -> String {
         format!(
             "in-process bwa-mem3 (bwa-mem3-rs {version}, sub-batch {sub}, -K {chunk}, \
-             dedup-reads {dedup})",
+             dedup-reads {dedup}{meth})",
             version = engine::version(),
             sub = self.sub_batch_templates,
             chunk = self.chunk_size,
             dedup = if self.dedup_reads { "on" } else { "off" },
+            meth =
+                bwa_mem3_meth_flag(self.methylation).map(|f| format!(", {f}")).unwrap_or_default(),
         )
     }
 
@@ -152,15 +161,17 @@ impl AlignBackend for InProcessBwaMem3Backend {
         // Load the index once, synchronously, on the shared thread budget. Log
         // wall time and whether a staged shm segment was attached. A staged
         // segment means bwa-mem3 attached to it instead of reading from disk; the
-        // probe is best-effort (failure => assume disk).
-        let shm_attached = engine::shm::is_staged(&self.reference).unwrap_or(false);
+        // probe is best-effort (failure => assume disk). It checks the prefix
+        // the FM-index loads from, which under EM-seq is the `.meth` seed index.
+        let prefix = index_prefix(&self.reference, self.methylation);
+        let shm_attached = engine::shm::is_staged(&prefix).unwrap_or(false);
         let load_start = Instant::now();
-        let idx = BwaIndex::load_with_threads(&self.reference, ctx.num_threads)?;
+        let idx = load_index(&self.reference, self.methylation, ctx.num_threads)?;
         let idx = Arc::new(idx);
         log::info!(
-            "in-process bwa-mem3: loaded index '{reference}' in {elapsed:.2?} \
+            "in-process bwa-mem3: loaded index '{prefix}' in {elapsed:.2?} \
              ({source}, {n_contigs} contigs, {threads} load threads)",
-            reference = self.reference.display(),
+            prefix = prefix.display(),
             elapsed = load_start.elapsed(),
             source = if shm_attached { "attached shared-memory segment" } else { "read from disk" },
             n_contigs = idx.n_contigs(),
@@ -169,9 +180,7 @@ impl AlignBackend for InProcessBwaMem3Backend {
 
         // Build the shared, read-only options once. `set_pe(true)` documents the
         // paired-end intent (the engine sets/clears `MEM_F_PE` per group).
-        let mut opts = MemOpts::new()?;
-        opts.set_pe(true);
-        let opts = Arc::new(opts);
+        let opts = Arc::new(build_opts(self.methylation)?);
 
         // Synthesize the aligner header from the index contigs and resolve the
         // shared output header at WIRE time, following the subprocess order:
@@ -186,6 +195,7 @@ impl AlignBackend for InProcessBwaMem3Backend {
             sidecar.as_ref(),
             self.chunk_size,
             &self.reference,
+            self.methylation,
         );
         validate_sq_consistency(&ctx.partial_output_header, &synth)?;
         let merged = merge_aligner_header(&ctx.partial_output_header, &synth);
@@ -249,11 +259,56 @@ impl AlignBackend for InProcessBwaMem3Backend {
     }
 }
 
+/// The prefix the in-process backend loads its FM-index from: `<reference>`,
+/// or when `methylation` aligns bisulfite-aware (EM-seq, per
+/// [`bwa_mem3_meth_flag`]) the converted seed index `<reference>.meth`.
+fn index_prefix(reference: &std::path::Path, methylation: MethylationMode) -> std::path::PathBuf {
+    let mut prefix = reference.as_os_str().to_owned();
+    if bwa_mem3_meth_flag(methylation).is_some() {
+        prefix.push(BWA_MEM3_METH_INDEX_SUFFIX);
+    }
+    prefix.into()
+}
+
+/// Load the index the in-process backend aligns against: the plain bwa-mem3
+/// index, or when `methylation` aligns bisulfite-aware (EM-seq, per
+/// [`bwa_mem3_meth_flag`]) the `bwa-mem3 index --meth` dual index — the
+/// converted seed index `<reference>.meth` plus the original `<reference>`
+/// that alignment, pairing and output coordinates use. Either way the FM-index
+/// loads with `num_threads` threads, as `bwa-mem3 mem -t` loads it.
+fn load_index(
+    reference: &std::path::Path,
+    methylation: MethylationMode,
+    num_threads: usize,
+) -> anyhow::Result<BwaIndex> {
+    if bwa_mem3_meth_flag(methylation).is_some() {
+        let seed = index_prefix(reference, methylation);
+        Ok(BwaIndex::load_meth_with_threads(&seed, reference, num_threads)?)
+    } else {
+        Ok(BwaIndex::load_with_threads(reference, num_threads)?)
+    }
+}
+
+/// The options every in-process alignment shares: paired-end, and when
+/// `methylation` aligns bisulfite-aware (EM-seq, per [`bwa_mem3_meth_flag`])
+/// what `bwa-mem3 mem --meth` sets. EM-seq is bwa-mem3's default chemistry, so
+/// there is none to set.
+fn build_opts(methylation: MethylationMode) -> anyhow::Result<MemOpts> {
+    let mut opts = MemOpts::new()?;
+    opts.set_pe(true);
+    if bwa_mem3_meth_flag(methylation).is_some() {
+        opts.set_meth(true).apply_meth_defaults();
+    }
+    Ok(opts)
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
 
-    use super::{FlushOutcome, InProcessBwaMem3Backend};
+    use fgumi_consensus::MethylationMode;
+
+    use super::{FlushOutcome, InProcessBwaMem3Backend, build_opts, engine};
     use crate::pipeline::core::step::StepOutcome;
 
     /// Only a flush that moved or newly held work reports `Progress`; re-failing
@@ -293,5 +348,42 @@ mod tests {
         let prefers_drain_first: bool =
             std::hint::black_box(InProcessBwaMem3Backend::PREFERS_DRAIN_FIRST);
         assert!(prefers_drain_first);
+    }
+
+    /// The FM-index loads from `<reference>.meth` only when the chemistry
+    /// aligns bisulfite-aware (EM-seq); the shm probe checks the same prefix.
+    #[rstest]
+    #[case::disabled(MethylationMode::Disabled, "/refs/ref.fa")]
+    #[case::emseq(MethylationMode::EmSeq, "/refs/ref.fa.meth")]
+    #[case::taps(MethylationMode::Taps, "/refs/ref.fa")]
+    fn index_prefix_is_the_seed_index_under_emseq(
+        #[case] methylation: MethylationMode,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            super::index_prefix(std::path::Path::new("/refs/ref.fa"), methylation),
+            std::path::PathBuf::from(expected)
+        );
+    }
+
+    /// Disabled and TAPS align with plain bwa-mem3 options.
+    #[rstest]
+    #[case::disabled(MethylationMode::Disabled)]
+    #[case::taps(MethylationMode::Taps)]
+    fn build_opts_is_plain_bwa_mem3_unless_emseq(#[case] methylation: MethylationMode) {
+        let opts = build_opts(methylation).unwrap();
+        assert!(!opts.meth());
+    }
+
+    /// The in-process EM-seq options must match what the subprocess preset's
+    /// `bwa-mem3 mem --meth` sets, or the two backends would diverge.
+    #[test]
+    fn build_opts_applies_the_cli_meth_defaults_for_emseq() {
+        let opts = build_opts(MethylationMode::EmSeq).unwrap();
+        assert!(opts.meth());
+        assert_eq!(opts.meth_chem().unwrap(), engine::MethChem::EmSeq);
+        assert_eq!(opts.meth_scoring().unwrap(), engine::MethScoring::Collapsed);
+        assert_eq!(opts.meth_seed_prune().unwrap(), engine::MethSeedPrune::Spec30);
+        assert_eq!(opts.minimum_score(), 40, "bwameth -T 40");
     }
 }
