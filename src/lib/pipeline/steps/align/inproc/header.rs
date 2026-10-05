@@ -31,11 +31,18 @@ use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::program::tag as pg_tag;
 use noodles::sam::header::record::value::map::{Program, ReferenceSequence};
 
+use fgumi_consensus::MethylationMode;
+
 use super::engine;
+use crate::aligner::bwa_mem3_meth_flag;
 
 /// The `@PG ID` of the synthesized bwa-mem3 program line, mirroring the CLI's
 /// `@PG\tID:bwa-mem3` (`main.cpp:243`).
 const BWA_MEM3_PG_ID: &str = "bwa-mem3";
+
+/// The `@PG ID` bwa-mem3 adds under `--meth` (`meth_bam.cpp`, beside its own
+/// `@PG`), with `PN` the same and `VN` its version plus `-meth`.
+const BWA_MEM3_METH_PG_ID: &str = "bwa-mem3-meth";
 
 /// The candidate sidecar paths bwa-mem3 tries for index `prefix`, in order:
 /// `<prefix>.hdr`, then `<baseprefix>.dict`, where `baseprefix` drops a trailing
@@ -105,7 +112,9 @@ pub(crate) fn load_index_header_sidecar(prefix: &Path) -> io::Result<Option<Head
 
 /// Synthesize the aligner-emitted header from the index's `contigs`, the
 /// index header `sidecar`'s `@RG`/`@PG`/`@CO` lines (see
-/// [`load_index_header_sidecar`]), and one `@PG ID:bwa-mem3` line.
+/// [`load_index_header_sidecar`]), one `@PG ID:bwa-mem3` line, and when
+/// `methylation` aligns bisulfite-aware (EM-seq, per [`bwa_mem3_meth_flag`])
+/// the `@PG ID:bwa-mem3-meth` line `bwa-mem3 mem --meth` adds.
 ///
 /// Takes the contigs as `(name, length)` pairs — an iterator, not the whole
 /// [`BwaIndex`](engine::BwaIndex) — so it is unit-testable with a hand-built
@@ -129,6 +138,7 @@ pub(crate) fn synthesize_aligner_header<'a, C>(
     sidecar: Option<&Header>,
     chunk_size: u64,
     reference: &Path,
+    methylation: MethylationMode,
 ) -> Header
 where
     C: IntoIterator<Item = (&'a str, i64)>,
@@ -162,8 +172,9 @@ where
     // Honest in-process command line: describes the invocation shape
     // (`mem -p -K <K>` against the reference) and that it ran in-process via
     // bwa-mem3-rs, rather than forging the subprocess `bwa-mem3 mem ... /dev/stdin`.
+    let meth = bwa_mem3_meth_flag(methylation).map(|flag| format!(" {flag}")).unwrap_or_default();
     let command_line = format!(
-        "bwa-mem3 mem -p -K {chunk_size} {reference} (in-process via bwa-mem3-rs {version})",
+        "bwa-mem3 mem{meth} -p -K {chunk_size} {reference} (in-process via bwa-mem3-rs {version})",
         reference = reference.display(),
     );
     let program = Map::<Program>::builder()
@@ -173,6 +184,21 @@ where
         .build()
         .expect("synthesized @PG map is valid");
     builder = builder.add_program(bstr::BString::from(BWA_MEM3_PG_ID), program);
+
+    // `bwa-mem3 mem --meth` writes a second `@PG` for the bisulfite writer; the
+    // subprocess preset's header carries it, so the in-process one must too.
+    if let Some(flag) = bwa_mem3_meth_flag(methylation) {
+        let meth_program = Map::<Program>::builder()
+            .insert(pg_tag::NAME, BWA_MEM3_METH_PG_ID)
+            .insert(pg_tag::VERSION, format!("{version}-meth"))
+            .insert(
+                pg_tag::COMMAND_LINE,
+                format!("bwa-mem3 mem {flag} (in-process via bwa-mem3-rs)"),
+            )
+            .build()
+            .expect("synthesized @PG map is valid");
+        builder = builder.add_program(bstr::BString::from(BWA_MEM3_METH_PG_ID), meth_program);
+    }
 
     builder.build()
 }
@@ -212,8 +238,13 @@ mod tests {
     #[test]
     fn synthesize_builds_sq_from_contigs_and_one_bwa_mem3_pg() {
         let contigs = vec![("chr1", 1000i64), ("chr2", 2000i64)];
-        let synth =
-            synthesize_aligner_header(contigs, None, 150_000_000, Path::new("/refs/genome.fa"));
+        let synth = synthesize_aligner_header(
+            contigs,
+            None,
+            150_000_000,
+            Path::new("/refs/genome.fa"),
+            MethylationMode::Disabled,
+        );
 
         // @SQ built from the contigs, in order, name + length.
         let sq: Vec<(String, usize)> = synth
@@ -248,6 +279,7 @@ mod tests {
             None,
             150_000_000,
             Path::new("/refs/genome.fa"),
+            MethylationMode::Disabled,
         );
         validate_sq_consistency(&partial, &synth).expect("matching @SQ validates");
         let merged = merge_aligner_header(&partial, &synth);
@@ -278,6 +310,7 @@ mod tests {
             None,
             150_000_000,
             Path::new("/refs/other.fa"),
+            MethylationMode::Disabled,
         );
         let err = validate_sq_consistency(&partial, &synth)
             .expect_err("a length mismatch must reject at wire time");
@@ -354,6 +387,7 @@ mod tests {
             sidecar.as_ref(),
             150_000_000,
             &prefix,
+            MethylationMode::Disabled,
         );
         let merged = merge_aligner_header(&partial_header(&[("chr1", 1000)]), &synth);
 
@@ -365,5 +399,41 @@ mod tests {
             merged.programs().as_ref().keys().map(ToString::to_string).collect();
         assert_eq!(pg_ids, vec!["picard".to_string(), "bwa-mem3".to_string()]);
         assert_eq!(merged.comments(), [bstr::BString::from("built by picard")]);
+    }
+
+    /// Under `--methylation-mode em-seq` the header gains bwa-mem3's `--meth`
+    /// `@PG` after its own, and the bwa-mem3 `CL` carries `--meth`.
+    #[test]
+    fn emseq_adds_the_bwa_mem3_meth_program() {
+        let synth = synthesize_aligner_header(
+            vec![("chr1", 1000i64)],
+            None,
+            1000,
+            Path::new("/refs/genome.fa"),
+            MethylationMode::EmSeq,
+        );
+        let ids: Vec<String> = synth.programs().as_ref().keys().map(ToString::to_string).collect();
+        assert_eq!(ids, ["bwa-mem3", "bwa-mem3-meth"]);
+        let (_, _, bwa_cl) = pg_fields(&synth, "bwa-mem3").expect("bwa-mem3 @PG");
+        assert!(bwa_cl.starts_with("bwa-mem3 mem --meth -p -K 1000"), "got: {bwa_cl}");
+        let (name, version, _) = pg_fields(&synth, "bwa-mem3-meth").expect("bwa-mem3-meth @PG");
+        assert_eq!(name, "bwa-mem3-meth");
+        assert_eq!(version, format!("{}-meth", engine::version()));
+    }
+
+    /// TAPS aligns plain, so its header is the plain one: no `--meth` in the
+    /// `CL` and no `bwa-mem3-meth` `@PG`.
+    #[test]
+    fn taps_header_is_plain() {
+        let synth = |methylation| {
+            synthesize_aligner_header(
+                vec![("chr1", 1000i64)],
+                None,
+                1000,
+                Path::new("/refs/genome.fa"),
+                methylation,
+            )
+        };
+        assert_eq!(synth(MethylationMode::Taps), synth(MethylationMode::Disabled));
     }
 }

@@ -344,7 +344,12 @@ pub(crate) fn backend_for(resolved: ResolvedAligner) -> Box<dyn AlignBackend> {
             })
         }
         #[cfg(feature = "aligner-bwa-mem3")]
-        ResolvedBackend::InProcessBwaMem3 { reference, sub_batch_templates, dedup_reads } => {
+        ResolvedBackend::InProcessBwaMem3 {
+            reference,
+            sub_batch_templates,
+            dedup_reads,
+            methylation,
+        } => {
             // The index is loaded (once) and the header synthesized/resolved
             // inside `AlignBackend::wire`, not here — this only packages the
             // resolved parameters. `chunk_size` drives the cohort cutter/gate and
@@ -354,6 +359,7 @@ pub(crate) fn backend_for(resolved: ResolvedAligner) -> Box<dyn AlignBackend> {
                 sub_batch_templates,
                 dedup_reads,
                 chunk_size: resolved.chunk_size,
+                methylation,
             })
         }
         #[cfg(not(feature = "aligner-bwa-mem3"))]

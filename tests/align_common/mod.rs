@@ -508,9 +508,9 @@ pub struct NormBam {
 ///
 /// 1. the `CL:` field of every `@PG` header line (the command line differs
 ///    between presets and records a per-run output path);
-/// 2. a git dev suffix on `@PG` `VN:` (see [`without_git_suffix`]): a CLI built
-///    from a git checkout reports e.g. `0.12.0-ea58288`, the vendored build
-///    `0.12.0`; the release version is still compared;
+/// 2. a git dev suffix on `@PG` `VN:` (see [`normalized_pg_version`]): a CLI
+///    built from a git checkout reports e.g. `0.12.0-ea58288`, the vendored
+///    build `0.12.0`; the release version is still compared;
 /// 3. with [`TagOrder::Sort`], the order of each record's optional tags.
 ///
 /// Everything else — the rest of the header, the reference list, every core
@@ -526,11 +526,11 @@ pub fn normalize(bam: &Bam, order: TagOrder) -> NormBam {
             }
             line.split('\t')
                 .filter(|f| !f.starts_with("CL:"))
-                // `without_git_suffix` returns a prefix of `vn`, so keep that
-                // much of the field after the `VN:` tag.
                 .map(|f| {
-                    f.strip_prefix("VN:")
-                        .map_or(f, |vn| &f[.."VN:".len() + without_git_suffix(vn).len()])
+                    f.strip_prefix("VN:").map_or_else(
+                        || f.to_owned(),
+                        |vn| format!("VN:{}", normalized_pg_version(vn)),
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\t")
@@ -555,6 +555,17 @@ pub fn normalize(bam: &Bam, order: TagOrder) -> NormBam {
         })
         .collect();
     NormBam { header, refs: bam.refs.clone(), records }
+}
+
+/// A `@PG` `VN:` value without its git dev suffix (see [`without_git_suffix`]).
+/// `bwa-mem3 mem --meth` writes a second `@PG` whose version is its own plus
+/// `-meth` (e.g. `0.14.0-5c1d5e3-meth` from a git checkout), so the suffix is
+/// stripped from before that `-meth` and the `-meth` kept.
+pub fn normalized_pg_version(vn: &str) -> String {
+    match vn.strip_suffix("-meth") {
+        Some(base) => format!("{}-meth", without_git_suffix(base)),
+        None => without_git_suffix(vn).to_owned(),
+    }
 }
 
 /// `version` without the git dev suffix bwa-mem3's `scripts/version.sh` appends

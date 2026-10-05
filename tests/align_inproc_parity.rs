@@ -56,8 +56,8 @@ use std::process::Command;
 use align_common::{
     Bam, Input, NormBam, TagOrder, Template, assert_fixture_coverage, assert_reads_preserved,
     assert_same_bam, assert_tags_transferred, bwa_mem3_bin_from_env, mid_pair_chunk, normalize,
-    read_bam, simulate_templates, split_names, tools_required, without_git_suffix,
-    write_fixture_reference, write_unmapped_bam,
+    normalized_pg_version, read_bam, simulate_templates, split_names, tools_required,
+    without_git_suffix, write_fixture_reference, write_unmapped_bam,
 };
 use rstest::rstest;
 use tempfile::TempDir;
@@ -91,6 +91,8 @@ struct Case {
     reference: std::path::PathBuf,
     unmapped: std::path::PathBuf,
     templates: Vec<Template>,
+    /// `runall --methylation-mode` for both legs, or `None`.
+    methylation: Option<&'static str>,
 }
 
 impl Case {
@@ -100,7 +102,7 @@ impl Case {
         let templates = simulate_templates(&fixture.seq, input, N_TEMPLATES);
         let unmapped = dir.path().join("unmapped.bam");
         write_unmapped_bam(&unmapped, &templates);
-        Self { reference: fixture.fasta, unmapped, templates, dir }
+        Self { reference: fixture.fasta, unmapped, templates, dir, methylation: None }
     }
 
     fn out(&self, file: &str) -> std::path::PathBuf {
@@ -213,6 +215,9 @@ fn leg_command(
     if let Some(k) = chunk.value(&case.templates) {
         cmd.args(["--aligner::chunk-size", &k.to_string()]);
     }
+    if let Some(mode) = case.methylation {
+        cmd.args(["--methylation-mode", mode]);
+    }
     match leg {
         Leg::Subprocess { reference_bin } => {
             cmd.args(["--aligner::preset", "bwa-mem3"]);
@@ -277,6 +282,22 @@ fn for_parity(bam: &Bam) -> NormBam {
 #[case::prerelease_kept("1.0.0-rc1", "1.0.0-rc1")]
 fn without_git_suffix_strips_only_the_dev_suffix(#[case] version: &str, #[case] expected: &str) {
     assert_eq!(without_git_suffix(version), expected);
+}
+
+/// The `--meth` `@PG` version (`<version>-meth`) loses the git dev suffix from
+/// before its `-meth`, so a CLI built from a git checkout compares equal to
+/// the vendored build.
+#[rstest]
+#[case::release("0.14.0", "0.14.0")]
+#[case::dev("0.14.0-5c1d5e3", "0.14.0")]
+#[case::meth_release("0.14.0-meth", "0.14.0-meth")]
+#[case::meth_dev("0.14.0-5c1d5e3-meth", "0.14.0-meth")]
+#[case::meth_dev_dirty("0.14.0-5c1d5e3-dirty-meth", "0.14.0-meth")]
+fn normalized_pg_version_strips_the_dev_suffix_before_meth(
+    #[case] version: &str,
+    #[case] expected: &str,
+) {
+    assert_eq!(normalized_pg_version(version), expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -417,7 +438,7 @@ impl Case {
         }
         let unmapped = dir.path().join("unmapped.bam");
         write_unmapped_bam(&unmapped, &templates);
-        Self { reference: fixture.fasta, unmapped, templates, dir }
+        Self { reference: fixture.fasta, unmapped, templates, dir, methylation: None }
     }
 }
 
@@ -537,5 +558,120 @@ fn inproc_is_thread_invariant(
         &normalize(&one, TagOrder::Keep),
         &normalize(&sixteen, TagOrder::Keep),
         &format!("{label}: --threads 16 diverged from --threads 1"),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bisulfite-aware alignment (--methylation-mode)
+// ---------------------------------------------------------------------------
+
+impl Case {
+    /// [`Case::new`] over directional EM-seq reads, with the
+    /// `bwa-mem3 index --meth` dual index built beside the fixture's plain one.
+    ///
+    /// Each read is converted in its own orientation, as a directional library
+    /// is: R1 (and a single-end read) C→T, R2 G→A, at every cytosine outside a
+    /// `CpG` (EM-seq leaves methylated `CpG` cytosines unconverted).
+    fn with_emseq(bin: &str) -> Self {
+        let dir = TempDir::new().expect("create temp dir");
+        let fixture = write_fixture_reference(dir.path(), bin);
+        let status = Command::new(bin)
+            .args(["index", "--meth"])
+            .arg(&fixture.fasta)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run `bwa-mem3 index --meth`");
+        assert!(status.success(), "`bwa-mem3 index --meth` failed with status {status}");
+
+        let mut templates = simulate_templates(&fixture.seq, Input::Mixed, N_TEMPLATES);
+        for t in &mut templates {
+            for (i, read) in t.reads.iter_mut().enumerate() {
+                // R2 reads the complementary strand, so its conversions are G→A.
+                let r2 = t.paired && i == 1;
+                *read = emseq_convert(read, r2);
+            }
+        }
+        let unmapped = dir.path().join("unmapped.bam");
+        write_unmapped_bam(&unmapped, &templates);
+        Self { reference: fixture.fasta, unmapped, templates, dir, methylation: Some("em-seq") }
+    }
+}
+
+/// Convert one read as sequenced. For an R1 (`r2 == false`) a C converts to T;
+/// for an R2 the read is the reverse complement of the converted strand, so a
+/// G converts to A. A `CpG` stays unconverted, tested in the read's own
+/// orientation: C followed by G for an R1, G preceded by C for an R2.
+fn emseq_convert(read: &[u8], r2: bool) -> Vec<u8> {
+    let (from, to) = if r2 { (b'G', b'A') } else { (b'C', b'T') };
+    (0..read.len())
+        .map(|i| {
+            let cpg =
+                if r2 { i > 0 && read[i - 1] == b'C' } else { read.get(i + 1) == Some(&b'G') };
+            if read[i] == from && !cpg { to } else { read[i] }
+        })
+        .collect()
+}
+
+/// How many primary records carry bwa-mem3's `--meth` strand tag `XG:Z`.
+fn meth_tagged(bam: &Bam) -> usize {
+    let xg = fgumi_raw_bam::SamTag::new(b'X', b'G');
+    bam.records
+        .iter()
+        .filter(|b| align_common::is_primary(b) && align_common::string_tag(b, xg).is_some())
+        .count()
+}
+
+/// Under `runall --methylation-mode em-seq`, the in-process backend aligns
+/// bisulfite-aware exactly as the subprocess preset's `bwa-mem3 mem --meth`
+/// does, record for record. (TAPS aligns plain, which the parity tests above
+/// already cover; on an align-only chain runall rejects it as dead.)
+#[rstest]
+#[case::base(1, 256, Chunk::One, Scheduler::DrainFirst)]
+#[case::threads4_sb7_many(4, 7, Chunk::Many, Scheduler::Auto)]
+#[case::threads4_sb64_several(4, 64, Chunk::Several, Scheduler::ChainOrder)]
+fn inproc_matches_subprocess_under_emseq(
+    #[case] threads: usize,
+    #[case] sub_batch_templates: usize,
+    #[case] chunk: Chunk,
+    #[case] scheduler: Scheduler,
+) {
+    let label = format!(
+        "inproc_matches_subprocess_under_emseq[t{threads} sb{sub_batch_templates} {chunk:?} {}]",
+        scheduler.label()
+    );
+    let reference_bin = bin_or_skip!(label);
+    let case = Case::with_emseq(&reference_bin);
+
+    let subprocess = run_leg(
+        &case,
+        &case.out("subprocess.bam"),
+        Leg::Subprocess { reference_bin: &reference_bin },
+        threads,
+        chunk,
+        scheduler,
+    );
+    let inproc = run_leg(
+        &case,
+        &case.out("inproc.bam"),
+        Leg::InProcess { sub_batch_templates, dedup: None },
+        threads,
+        chunk,
+        scheduler,
+    );
+
+    // Both legs really aligned with --meth: it alone writes XG:Z.
+    for (leg, bam) in [("subprocess", &subprocess), ("in-process", &inproc)] {
+        assert!(meth_tagged(bam) > 0, "{label}: the {leg} leg wrote no XG:Z, so it ignored --meth");
+    }
+    assert_tags_transferred(&subprocess, &case.templates, &format!("{label} subprocess"));
+    assert_tags_transferred(&inproc, &case.templates, &format!("{label} in-process"));
+    // --meth reports the original read, not the converted one it seeded with.
+    assert_reads_preserved(&subprocess, &case.templates, &format!("{label} subprocess"));
+    assert_reads_preserved(&inproc, &case.templates, &format!("{label} in-process"));
+    assert_same_bam(
+        &for_parity(&subprocess),
+        &for_parity(&inproc),
+        &format!("{label}: in-process diverged from the subprocess bwa-mem3 --meth preset"),
     );
 }

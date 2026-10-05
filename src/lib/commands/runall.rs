@@ -671,7 +671,10 @@ pub struct RunAll {
     #[command(flatten)]
     pub queue_memory: QueueMemoryOptions,
 
-    /// Methylation-aware consensus calling mode (requires --ref).
+    /// Methylation chemistry (requires --ref). Drives methylation-aware
+    /// consensus calling. With `em-seq` on a chain that includes align, the
+    /// bwa-mem3 presets also align bisulfite-aware (`bwa-mem3 mem --meth`,
+    /// against a `bwa-mem3 index --meth` index); `taps` aligns plain.
     #[arg(long = "methylation-mode", value_enum)]
     pub methylation_mode: Option<crate::commands::common::MethylationModeArg>,
 
@@ -1120,13 +1123,13 @@ impl RunAll {
     /// # Errors
     ///
     /// - `--ref` not set (the aligner needs a reference path).
-    /// - `--methylation-mode` combined with an align-bearing chain (not yet
-    ///   supported; see the error message for the EM-seq workaround).
     /// - No sequence-dictionary file (`.dict`) found next to `--ref`.
     /// - `--aligner::preset` and `--aligner::command` both unset, or both
     ///   set, or a preset-only flag paired with command mode, or preset-mode
-    ///   index files missing, or a command-mode template missing `{ref}`
-    ///   (delegated to [`crate::aligner::AlignerOptions::resolve`]).
+    ///   index files missing, or a command-mode template missing `{ref}`, or
+    ///   `--methylation-mode em-seq` with the `bwa` preset or without the
+    ///   `bwa-mem3 index --meth` files (delegated to
+    ///   [`crate::aligner::AlignerOptions::resolve`]).
     pub(crate) fn validate_align_and_merge(&self) -> Result<()> {
         let reference = self.reference.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
@@ -1134,18 +1137,6 @@ impl RunAll {
                  reference FASTA with its index files alongside)"
             )
         })?;
-        // `--methylation-mode` drives the *consensus* stage (which AAM never
-        // reaches alone) and would also conflict with the aligner's
-        // reference handling. Reject explicitly rather than silently ignore;
-        // methylation-aware AAM presets are a follow-up PR per the design doc.
-        if self.methylation_mode.is_some() {
-            bail!(
-                "--methylation-mode is not yet supported for runall chains that include \
-                 align. For EM-seq today, use `--aligner::command \"bwa-mem3 mem --meth ...\"` \
-                 (or bwameth.py) in command mode and apply methylation downstream as a \
-                 separate step."
-            );
-        }
         // The downstream zipper-merge step needs a `.dict` file alongside
         // the reference FASTA (used to populate the output BAM header).
         // Validate up front so a missing `.dict` fails before the aligner
@@ -1163,12 +1154,24 @@ impl RunAll {
         let top_threads = self.threading.num_threads();
         // `resolve` consumes the options struct; we clone so the validator
         // can be called multiple times if needed.
-        let _resolved = self.aligner_opts.clone().validate()?.resolve(
-            reference,
-            top_threads,
-            self.aligner_bin.as_deref(),
-        )?;
+        let _resolved =
+            self.aligner_options()?.resolve(reference, top_threads, self.aligner_bin.as_deref())?;
         Ok(())
+    }
+
+    /// The validated `--aligner::*` options, carrying `--methylation-mode` so,
+    /// under EM-seq, a preset aligns bisulfite-aware (bwa-mem3 `--meth`) for
+    /// the methylation consensus callers downstream. Both the up-front validation and the
+    /// stage bag go through here, so they resolve the same aligner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `--aligner::*` options fail validation.
+    fn aligner_options(&self) -> Result<crate::aligner::AlignerOptions> {
+        let mut aligner = self.aligner_opts.clone().validate()?;
+        aligner.methylation_mode =
+            crate::commands::common::resolve_methylation_mode(self.methylation_mode);
+        Ok(aligner)
     }
 
     /// Returns the derived path for one stage's single-file metrics option
@@ -1415,7 +1418,7 @@ impl RunAll {
                              reference FASTA with its index files alongside)"
                         )
                     })?;
-                    let aligner = self.aligner_opts.clone().validate()?;
+                    let aligner = self.aligner_options()?;
                     bag.aligner = Some(AlignOptions {
                         aligner,
                         reference,
@@ -1727,15 +1730,15 @@ impl Command for RunAll {
         }
 
         // Symmetric guard for the *other* flag: in runall, `--methylation-mode`
-        // is wired only into the simplex/duplex consensus stages (see the
+        // is wired into the simplex/duplex consensus stages (see the
         // `simplex_opts`/`duplex_opts` bag population in
-        // `build_stage_options_bag`; codec and align reject it with their own
-        // messages). On a chain that reaches no consensus stage (e.g.
-        // `group → group`, `correct → sort`) it is dead — silently ignored —
-        // so reject it rather than mislead. Align chains are exempt here:
-        // `validate_align_and_merge` (run just below for any chain containing
-        // `Stage::Align`) owns the align-specific EM-seq message, which is
-        // more actionable than this generic one.
+        // `build_stage_options_bag`; codec rejects it with its own message),
+        // filter's methylation filters, and, for EM-seq, a preset align
+        // (bisulfite-aware alignment; see `align_consumes_methylation` below).
+        // On a chain that reaches none of those (e.g. `group → group`,
+        // `correct → sort`, or a TAPS or command-mode align that stops before
+        // consensus) it is dead — silently ignored — so reject it rather than
+        // mislead.
         let chain_reaches_consensus = stages.iter().any(|s| s.is_consensus());
         let chain_includes_align = stages.contains(&Stage::Align);
         // `--methylation-mode` on a simplex/duplex chain requires `--ref`: the
@@ -1803,13 +1806,24 @@ impl Command for RunAll {
                  reads, then run `runall --start-from filter` or `fgumi filter` on the aligned BAM"
             );
         }
-        let chain_consumes_methylation = chain_reaches_consensus || filter_consumes_methylation;
-        if self.methylation_mode.is_some() && !chain_consumes_methylation && !chain_includes_align {
+        // A preset align consumes EM-seq too: it aligns bisulfite-aware
+        // (bwa-mem3 --meth). TAPS aligns plain, and `--aligner::command` runs
+        // its own command with its own flags, so neither consumes it.
+        let align_consumes_methylation = chain_includes_align
+            && self.aligner_opts.aligner_preset.is_some()
+            && matches!(
+                self.methylation_mode,
+                Some(crate::commands::common::MethylationModeArg::EmSeq)
+            );
+        let chain_consumes_methylation =
+            chain_reaches_consensus || filter_consumes_methylation || align_consumes_methylation;
+        if self.methylation_mode.is_some() && !chain_consumes_methylation {
             bail!(
-                "--methylation-mode is consumed only by the consensus stages and by \
-                 filter's methylation filters (--min-conversion-fraction, \
-                 --min-methylation-depth, --require-strand-methylation-agreement); it is \
-                 dead on a runall chain that reaches neither"
+                "--methylation-mode is consumed only by the consensus stages, filter's \
+                 methylation filters (--min-conversion-fraction, --min-methylation-depth, \
+                 --require-strand-methylation-agreement), and, for em-seq, a preset align \
+                 (--aligner::preset, which aligns bisulfite-aware); it is dead on a runall chain \
+                 that reaches none of them"
             );
         }
 
@@ -2293,6 +2307,58 @@ mod execute_tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("dead on a runall chain"), "guard should reject the inert flag: {e}");
+    }
+
+    /// On a chain that aligns but reaches neither consensus nor filter, a preset
+    /// align consumes `--methylation-mode em-seq` (it aligns with bwa-mem3
+    /// `--meth`), so the dead-flag guard lets it through and the run fails
+    /// later, at the missing `.dict`. TAPS aligns plain, and a command-mode
+    /// align never reads the mode (the command picks its own flags), so there
+    /// the flag is dead.
+    #[rstest::rstest]
+    #[case::emseq_preset_aligns_bisulfite_aware(
+        &["--aligner::preset", "bwa-mem3"],
+        "em-seq",
+        "no sequence-dictionary file"
+    )]
+    #[case::emseq_inproc_preset_aligns_bisulfite_aware(
+        &["--aligner::preset", "bwa-mem3-inproc"],
+        "em-seq",
+        "no sequence-dictionary file"
+    )]
+    #[case::taps_preset_aligns_plain(&["--aligner::preset", "bwa-mem3"], "taps", "dead on a runall chain")]
+    #[case::taps_inproc_preset_aligns_plain(
+        &["--aligner::preset", "bwa-mem3-inproc"],
+        "taps",
+        "dead on a runall chain"
+    )]
+    #[case::emseq_command_mode_ignores_it(
+        &["--aligner::command", "bwa-mem3 mem --meth -p {ref} /dev/stdin"],
+        "em-seq",
+        "dead on a runall chain"
+    )]
+    fn align_chain_consumes_methylation_mode_for_emseq_presets_only(
+        #[case] aligner: &[&str],
+        #[case] mode: &str,
+        #[case] expected: &str,
+    ) {
+        let mut args = vec![
+            "--start-from",
+            "align",
+            "--stop-after",
+            "sort",
+            "-i",
+            "in.bam",
+            "-o",
+            "o.bam",
+            "--ref",
+            "ref.fa",
+            "--methylation-mode",
+            mode,
+        ];
+        args.extend_from_slice(aligner);
+        let e = run(&args).unwrap_err().to_string();
+        assert!(e.contains(expected), "expected {expected:?}; got: {e}");
     }
 
     #[test]
