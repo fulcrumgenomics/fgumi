@@ -158,6 +158,8 @@ impl SamTag {
     pub const Q2: SamTag = SamTag::new(b'Q', b'2');
     /// Flow signal intensities, `B:S` array (SAM spec).
     pub const FZ: SamTag = SamTag::new(b'F', b'Z');
+    /// CIGAR of an alignment with more than 65,535 operations, `B:I` array (SAM spec).
+    pub const CG: SamTag = SamTag::new(b'C', b'G');
     /// Adapter clipping position (e.g. from Picard `MarkIlluminaAdapters`).
     pub const XT: SamTag = SamTag::new(b'X', b'T');
     /// Bisulfite strand (written by `bwameth` and related tools): `Z:f` for the

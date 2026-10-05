@@ -109,8 +109,8 @@ pub struct Clip {
     pub upgrade_clipping: bool,
 
     /// Automatically clip extended attributes that match read length (base modification tags
-    /// MM/ML/am/bm are kept in step with the clipped read separately; tags that are not per-base
-    /// data for the read, such as RG, MI, RX and the mate's R2/Q2, are never clipped)
+    /// MM/ML/am/bm are kept in step with the clipped read separately; listed tags that are not
+    /// per-base data for the read, such as RG, are never clipped)
     #[arg(short = 'a', long = "auto-clip-attributes", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub auto_clip_attributes: bool,
 
