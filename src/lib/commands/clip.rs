@@ -301,8 +301,10 @@ impl ClipParams {
     ) -> Result<(bool, bool)> {
         // Upgrade existing clipping on *every* read of the template first — including
         // secondary/supplementary alignments — matching fgbio ClipBam (ClipBam.scala:123) before
-        // clipping the primary pair. The per-read `clip_pair`/`clip_fragment` helpers deliberately
-        // do NOT upgrade, so this pre-pass is the sole upgrade site for both threading paths.
+        // clipping the primary pair. The per-read `clip_pair`/`clip_fragment` helpers do not run
+        // this whole-read upgrade, so this pre-pass is its sole site for both threading paths.
+        // (Those helpers still upgrade existing clipping at the specific end they clip, as fgbio's
+        // `clip{5,3}PrimeEndOfRead` and `clipOverlappingReads` do, regardless of this flag.)
         if self.upgrade_clipping {
             for record in records.iter_mut() {
                 clipper.upgrade_all_clipping_raw(record)?;
@@ -3502,5 +3504,808 @@ mod tests {
             has_flag(&r1, raw_flags::MATE_REVERSE),
             "mapped r1 mate-reverse must reflect unmapped r2's actual REVERSE flag"
         );
+    }
+
+    /// Ports of fgbio `ClipBamTest` (fgbio commit `e51a661`) that fgumi's own `clip` tests above
+    /// either did not cover or covered more weakly (different inputs, missing assertions).
+    /// Inputs and expected values are copied verbatim from the fgbio tests; each test cites its
+    /// source as `ClipBamTest.scala:<line>`, and any fixture deviation is explained there.
+    ///
+    /// fgbio's `clipper.clipPair(r1, r2)` cases run [`ClipParams::clip_pair`] with a `Hard`
+    /// clipper (fgbio `ClipBam`'s default mode); its `.execute()` cases run [`Clip::execute`]
+    /// end to end.
+    mod fgbio_clip_bam_tests {
+        use super::*;
+        use crate::metrics::clip::{ClippingMetrics, ReadType};
+        use crate::sam::builder::PairBuilder;
+        use fgumi_raw_bam::{encode_record_buf_to_raw, raw_record_to_record_buf};
+        use noodles::sam::alignment::RecordBuf;
+        use noodles::sam::alignment::record::cigar::Op;
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value;
+
+        /// Length of fgbio's `chr1` test reference, which is all `A`.
+        const REFERENCE_LENGTH: usize = 5000;
+
+        /// Writes fgbio's test reference (`chr1`: 5000 `A`s) plus its `.fai`; `NM`/`UQ`/`MD`
+        /// expectations in these tests are computed against it.
+        fn write_all_a_reference(dir: &TempDir) -> PathBuf {
+            let path = dir.path().join("ref.fa");
+            std::fs::write(&path, format!(">chr1\n{}\n", "A".repeat(REFERENCE_LENGTH)))
+                .expect("write reference");
+            std::fs::write(
+                dir.path().join("ref.fa.fai"),
+                format!(
+                    "chr1\t{REFERENCE_LENGTH}\t6\t{REFERENCE_LENGTH}\t{}\n",
+                    REFERENCE_LENGTH + 1
+                ),
+            )
+            .expect("write reference index");
+            path
+        }
+
+        /// fgbio `new SamBuilder(readLength).addPair(...)`: builds an FR pair (by default) of
+        /// all-`A` reads of `read_length` bases, letting `configure` set positions, strands and
+        /// CIGARs, and encodes both reads as [`RawRecord`]s.
+        fn fgbio_pair(
+            read_length: usize,
+            configure: impl for<'a> FnOnce(PairBuilder<'a>) -> PairBuilder<'a>,
+        ) -> (RawRecord, RawRecord) {
+            let mut builder = SamBuilder::new();
+            let bases = "A".repeat(read_length);
+            let pair = builder.add_pair().name("q").bases1(&bases).bases2(&bases);
+            let (r1, r2) = configure(pair).build();
+            let header = builder.header.clone();
+            (
+                encode_record_buf_to_raw(&r1, &header).expect("encode r1"),
+                encode_record_buf_to_raw(&r2, &header).expect("encode r2"),
+            )
+        }
+
+        /// fgbio `clipper.clipPair(r1, r2)`: runs the per-template clipping that `clip`'s
+        /// options configure on one pair, in fgbio `ClipBam`'s default `Hard` mode.
+        fn clip_pair_hard(clip: &Clip, r1: &mut RawRecord, r2: &mut RawRecord) {
+            ClipParams::from_clip(clip)
+                .clip_pair(&RawRecordClipper::new(ClippingMode::Hard), r1, r2, None)
+                .expect("clip_pair should succeed");
+        }
+
+        /// A `Clip` with only `--clip-overlapping-reads` (and no fixed clipping) enabled.
+        fn overlap_only() -> Clip {
+            let mut clip = make_clip(0, 0, 0, 0);
+            clip.clip_overlapping_reads = true;
+            clip
+        }
+
+        /// 1-based alignment start of a mapped raw record, as fgbio's `rec.start`.
+        fn start(rec: &RawRecord) -> usize {
+            rec.alignment_start_1based().expect("record should be mapped")
+        }
+
+        /// 1-based inclusive alignment end of a mapped raw record, as fgbio's `rec.end`.
+        fn end(rec: &RawRecord) -> usize {
+            rec.alignment_end_1based().expect("record should be mapped")
+        }
+
+        /// fgbio `StartAndEnd.checkClipping`: asserts `rec` lost exactly `five_prime` aligned
+        /// bases at its 5' end and `three_prime` at its 3' end relative to `prior` `(start,
+        /// end)`, accounting for strand.
+        fn assert_clipped_by(
+            prior: (usize, usize),
+            rec: &RawRecord,
+            five_prime: usize,
+            three_prime: usize,
+            label: &str,
+        ) {
+            let (prior_start, prior_end) = prior;
+            let expected = if rec.is_reverse() {
+                (prior_start + three_prime, prior_end - five_prime)
+            } else {
+                (prior_start + five_prime, prior_end - three_prime)
+            };
+            assert_eq!((start(rec), end(rec)), expected, "{label} (start, end)");
+        }
+
+        /// `ClipBamTest.scala:86` "not clip reads where either read is unaligned".
+        #[test]
+        fn clip_pair_does_not_clip_when_a_read_is_unaligned() {
+            let (mut r1, mut r2) = fgbio_pair(50, |p| p.start1(100).unmapped2());
+            let expected = r1.cigar_to_string();
+            clip_pair_hard(&overlap_only(), &mut r1, &mut r2);
+            assert_eq!(r1.cigar_to_string(), expected);
+        }
+
+        /// `ClipBamTest.scala:95` "not clip reads that are on different chromosomes".
+        #[test]
+        fn clip_pair_does_not_clip_reads_on_different_chromosomes() {
+            let (mut r1, mut r2) = fgbio_pair(50, |p| p.start1(100).start2(100).contig2(1));
+            let expected = (r1.cigar_to_string(), r2.cigar_to_string());
+            clip_pair_hard(&overlap_only(), &mut r1, &mut r2);
+            assert_eq!((r1.cigar_to_string(), r2.cigar_to_string()), expected);
+        }
+
+        /// `ClipBamTest.scala:108` "not clip reads that are abutting but not overlapped".
+        #[test]
+        fn clip_pair_does_not_clip_abutting_reads() {
+            let (mut r1, mut r2) = fgbio_pair(50, |p| p.start1(100).start2(150));
+            let expected = (r1.cigar_to_string(), r2.cigar_to_string());
+            clip_pair_hard(&overlap_only(), &mut r1, &mut r2);
+            assert_eq!((r1.cigar_to_string(), r2.cigar_to_string()), expected);
+        }
+
+        /// `ClipBamTest.scala:119` "not clip non-FR reads".
+        #[test]
+        fn clip_pair_does_not_clip_non_fr_reads() {
+            let (mut r1, mut r2) =
+                fgbio_pair(50, |p| p.start1(100).start2(100).strand2(Strand::Plus));
+            let expected = (r1.cigar_to_string(), r2.cigar_to_string());
+            clip_pair_hard(&overlap_only(), &mut r1, &mut r2);
+            assert_eq!((r1.cigar_to_string(), r2.cigar_to_string()), expected);
+        }
+
+        /// `ClipBamTest.scala:130` "clip reads that are fully overlapped".
+        #[test]
+        fn clip_pair_hard_clips_fully_overlapped_reads() {
+            let (mut r1, mut r2) = fgbio_pair(50, |p| p.start1(100).start2(100));
+            clip_pair_hard(&overlap_only(), &mut r1, &mut r2);
+            assert_eq!(r1.cigar_to_string(), "25M25H");
+            assert_eq!(r2.cigar_to_string(), "25H25M");
+        }
+
+        /// `ClipBamTest.scala:160` "handle reads that contain deletions".
+        #[test]
+        fn clip_pair_removes_overlap_of_reads_with_deletions() {
+            let (mut r1, mut r2) =
+                fgbio_pair(50, |p| p.start1(100).start2(130).cigar1("40M2D10M").cigar2("10M2D40M"));
+            assert!(end(&r1) >= start(&r2), "fixture should overlap");
+            clip_pair_hard(&overlap_only(), &mut r1, &mut r2);
+            assert!(end(&r1) < start(&r2), "r1.end={} r2.start={}", end(&r1), start(&r2));
+        }
+
+        /// `ClipBamTest.scala:170` "clip a fixed amount on the ends of the reads with reads that
+        /// do not overlap".
+        #[test]
+        fn clip_pair_fixed_clipping_without_overlap() {
+            let (mut r1, mut r2) = fgbio_pair(50, |p| p.start1(100).start2(150));
+            let (prior1, prior2) = ((start(&r1), end(&r1)), (start(&r2), end(&r2)));
+            assert_eq!(end(&r1), start(&r2) - 1);
+            clip_pair_hard(&make_clip(1, 2, 3, 4), &mut r1, &mut r2);
+            assert_clipped_by(prior1, &r1, 1, 2, "r1");
+            assert_clipped_by(prior2, &r2, 3, 4, "r2");
+        }
+
+        /// `ClipBamTest.scala:182` "clip a fixed amount on the ends of the reads with reads with
+        /// clipping present": existing hard clipping counts toward the fixed amounts.
+        ///
+        /// Deviation: fgbio sets `4H46M` / `44M6H` on 50-base reads, so its SEQ is longer than
+        /// the CIGAR's query length. fgumi encodes records to raw BAM, which rejects that, so
+        /// the reads here carry 46 / 44 bases to match their CIGARs. The expected clipping is
+        /// unchanged.
+        #[test]
+        fn clip_pair_fixed_clipping_counts_existing_hard_clips() {
+            let (mut r1, mut r2) = fgbio_pair(50, |p| {
+                p.start1(104)
+                    .start2(150)
+                    .cigar1("4H46M")
+                    .bases1(&"A".repeat(46))
+                    .cigar2("44M6H")
+                    .bases2(&"A".repeat(44))
+            });
+            let (prior1, prior2) = ((start(&r1), end(&r1)), (start(&r2), end(&r2)));
+            assert_eq!(end(&r1), start(&r2) - 1);
+            clip_pair_hard(&make_clip(5, 2, 3, 4), &mut r1, &mut r2);
+            // R1: one more 5' base (4H already counts toward 5), two 3' bases.
+            assert_clipped_by(prior1, &r1, 1, 2, "r1");
+            // R2: no more 5' bases (6H already exceeds 3), four 3' bases.
+            assert_clipped_by(prior2, &r2, 0, 4, "r2");
+        }
+
+        /// `ClipBamTest.scala:201` "clip a fixed amount on the ends of the reads then clip
+        /// overlapping reads": fixed clipping is applied first, then the remaining overlap.
+        #[test]
+        fn clip_pair_fixed_clipping_then_overlap_clipping() {
+            let (mut r1, mut r2) = fgbio_pair(50, |p| p.start1(100).start2(146));
+            let (prior1, prior2) = ((start(&r1), end(&r1)), (start(&r2), end(&r2)));
+            assert_eq!(end(&r1), start(&r2) + 3, "four bases overlap");
+            let mut clip = make_clip(0, 1, 0, 1);
+            clip.clip_overlapping_reads = true;
+            clip_pair_hard(&clip, &mut r1, &mut r2);
+            assert_eq!(end(&r1), start(&r2) - 1);
+            assert_clipped_by(prior1, &r1, 0, 2, "r1");
+            assert_clipped_by(prior2, &r2, 0, 2, "r2");
+        }
+
+        /// `ClipBamTest.scala:216` "clip a fixed amount on the ends of the reads in
+        /// $strand1/$strand2", for all four strand combinations.
+        #[rstest]
+        #[case::plus_plus(Strand::Plus, Strand::Plus)]
+        #[case::plus_minus(Strand::Plus, Strand::Minus)]
+        #[case::minus_plus(Strand::Minus, Strand::Plus)]
+        #[case::minus_minus(Strand::Minus, Strand::Minus)]
+        fn clip_pair_fixed_clipping_is_strand_aware(
+            #[case] strand1: Strand,
+            #[case] strand2: Strand,
+        ) {
+            let (mut r1, mut r2) =
+                fgbio_pair(50, |p| p.start1(100).start2(150).strand1(strand1).strand2(strand2));
+            let (prior1, prior2) = ((start(&r1), end(&r1)), (start(&r2), end(&r2)));
+            assert_eq!(end(&r1), start(&r2) - 1);
+            clip_pair_hard(&make_clip(1, 2, 3, 4), &mut r1, &mut r2);
+            assert_clipped_by(prior1, &r1, 1, 2, "r1");
+            assert_clipped_by(prior2, &r2, 3, 4, "r2");
+        }
+
+        /// All 15 counters of a [`ClippingMetrics`], in fgbio's column order.
+        fn metric_values(m: &ClippingMetrics) -> [usize; 15] {
+            [
+                m.reads,
+                m.reads_unmapped,
+                m.reads_clipped_pre,
+                m.reads_clipped_post,
+                m.reads_clipped_five_prime,
+                m.reads_clipped_three_prime,
+                m.reads_clipped_overlapping,
+                m.reads_clipped_extending,
+                m.bases,
+                m.bases_clipped_pre,
+                m.bases_clipped_post,
+                m.bases_clipped_five_prime,
+                m.bases_clipped_three_prime,
+                m.bases_clipped_overlapping,
+                m.bases_clipped_extending,
+            ]
+        }
+
+        /// A [`ClippingMetrics`] whose 15 counters are `first, first + 1, ..., first + 14`, as
+        /// in fgbio's `ClippingMetrics(readType, 1, 2, 3, ...)` fixtures.
+        fn metrics_counting_up_from(read_type: ReadType, first: usize) -> ClippingMetrics {
+            let mut m = ClippingMetrics::new(read_type);
+            let fields = [
+                &mut m.reads,
+                &mut m.reads_unmapped,
+                &mut m.reads_clipped_pre,
+                &mut m.reads_clipped_post,
+                &mut m.reads_clipped_five_prime,
+                &mut m.reads_clipped_three_prime,
+                &mut m.reads_clipped_overlapping,
+                &mut m.reads_clipped_extending,
+                &mut m.bases,
+                &mut m.bases_clipped_pre,
+                &mut m.bases_clipped_post,
+                &mut m.bases_clipped_five_prime,
+                &mut m.bases_clipped_three_prime,
+                &mut m.bases_clipped_overlapping,
+                &mut m.bases_clipped_extending,
+            ];
+            for (offset, field) in fields.into_iter().enumerate() {
+                *field = first + offset;
+            }
+            m
+        }
+
+        /// `ClipBamTest.scala:230` "add two metrics" (`ClippingMetrics.add`): every counter is
+        /// summed, and the sum differs from each input in every field. fgbio builds `readOne`
+        /// with `ReadType.ReadTwo`; that is kept.
+        #[test]
+        fn clipping_metrics_add_sums_every_field() {
+            let fragment = metrics_counting_up_from(ReadType::Fragment, 1);
+            let read_one = metrics_counting_up_from(ReadType::ReadTwo, 2);
+            let read_two = metrics_counting_up_from(ReadType::ReadTwo, 3);
+            let mut added = ClippingMetrics::new(ReadType::All);
+            added.add(&fragment);
+            added.add(&read_one);
+            added.add(&read_two);
+
+            assert_eq!(added.read_type, ReadType::All);
+            assert_eq!(
+                metric_values(&added),
+                [6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48]
+            );
+            assert_ne!(added.read_type, fragment.read_type);
+            for (field, (sum, input)) in
+                metric_values(&added).into_iter().zip(metric_values(&fragment)).enumerate()
+            {
+                assert_ne!(sum, input, "field {field} should differ from the fragment input");
+            }
+        }
+
+        /// The `(NM, UQ, MD)` htsjdk's `calculateMdAndNmTags` / `sumQualitiesOfMismatches` give
+        /// `rec` against fgbio's all-`A` reference. Supports only the CIGAR operators these
+        /// fixtures use.
+        fn expected_nm_uq_md(rec: &RecordBuf) -> (i64, i64, String) {
+            use std::fmt::Write as _;
+            let bases: &[u8] = rec.sequence().as_ref();
+            let quals: &[u8] = rec.quality_scores().as_ref();
+            let (mut offset, mut nm, mut uq, mut matches) = (0usize, 0i64, 0i64, 0usize);
+            let mut md = String::new();
+            for op in rec.cigar().as_ref() {
+                match op.kind() {
+                    Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                        for _ in 0..op.len() {
+                            if bases[offset].eq_ignore_ascii_case(&b'A') {
+                                matches += 1;
+                            } else {
+                                nm += 1;
+                                uq += i64::from(quals[offset]);
+                                write!(md, "{matches}A").expect("write to String");
+                                matches = 0;
+                            }
+                            offset += 1;
+                        }
+                    }
+                    Kind::Insertion | Kind::SoftClip => offset += op.len(),
+                    Kind::HardClip => {}
+                    kind => panic!("unsupported CIGAR operator in fixture: {kind:?}"),
+                }
+            }
+            write!(md, "{matches}").expect("write to String");
+            (nm, uq, md)
+        }
+
+        /// Sets `NM`, `UQ` and `MD` on `rec` to their correct values, as fgbio's fixtures do
+        /// before running `ClipBam`.
+        fn set_nm_uq_md(rec: &mut RecordBuf) {
+            let (nm, uq, md) = expected_nm_uq_md(rec);
+            let data = rec.data_mut();
+            data.insert(
+                Tag::from(SamTag::NM),
+                Value::from(i32::try_from(nm).expect("NM fits i32")),
+            );
+            data.insert(
+                Tag::from(SamTag::UQ),
+                Value::from(i32::try_from(uq).expect("UQ fits i32")),
+            );
+            data.insert(Tag::from(SamTag::MD), Value::from(md.as_str()));
+        }
+
+        /// Asserts `rec` carries `NM`, `UQ` and `MD` equal to [`expected_nm_uq_md`].
+        fn assert_nm_uq_md_recomputed(rec: &RecordBuf) {
+            let (nm, uq, md) = expected_nm_uq_md(rec);
+            let int_tag = |tag: SamTag| {
+                rec.data()
+                    .get(&Tag::from(tag))
+                    .and_then(Value::as_int)
+                    .unwrap_or_else(|| panic!("{tag:?} missing or not an integer"))
+            };
+            let md_tag = match rec.data().get(&Tag::from(SamTag::MD)) {
+                Some(Value::String(s)) => s.to_string(),
+                other => panic!("MD missing or not a string: {other:?}"),
+            };
+            let label = cigar_string(rec);
+            assert_eq!((int_tag(SamTag::NM), int_tag(SamTag::UQ), md_tag), (nm, uq, md), "{label}");
+        }
+
+        /// The 50-base all-`A` read fgbio's NM/UQ/MD fixtures use, with a single `C` at
+        /// `mismatch_at`.
+        fn all_a_with_mismatch(mismatch_at: usize) -> String {
+            let mut bases = vec![b'A'; 50];
+            bases[mismatch_at] = b'C';
+            String::from_utf8(bases).expect("ASCII bases")
+        }
+
+        /// The first 12 values of Java's `new Random(1).nextInt(50)`: the mismatch positions
+        /// fgbio's NM/UQ/MD fixtures draw, in the order its `SamBuilder` yields the reads.
+        const FGBIO_MISMATCH_POSITIONS: [usize; 12] = [35, 38, 47, 13, 4, 4, 34, 6, 28, 48, 19, 23];
+
+        /// A `Clip` reading `input` and writing `output` (with `metrics`) against `reference`,
+        /// in `mode`, with all clipping disabled; callers enable what their case needs.
+        fn end_to_end_clip(
+            input: PathBuf,
+            output: PathBuf,
+            reference: PathBuf,
+            metrics: PathBuf,
+            mode: ClippingMode,
+        ) -> Clip {
+            let mut clip = make_clip(0, 0, 0, 0);
+            clip.io.input = input;
+            clip.io.output = output;
+            clip.reference = reference;
+            clip.metrics = Some(metrics);
+            clip.clipping_mode = mode;
+            clip
+        }
+
+        /// Reads `clip`'s metrics file back.
+        fn read_clipping_metrics(path: &std::path::Path) -> Vec<ClippingMetrics> {
+            crate::metrics::read_metrics(path, "clipping").expect("read clipping metrics")
+        }
+
+        /// The first and last CIGAR operations of a mapped record.
+        fn first_and_last_ops(rec: &RecordBuf) -> (Op, Op) {
+            let ops = rec.cigar().as_ref();
+            (*ops.first().expect("non-empty CIGAR"), *ops.last().expect("non-empty CIGAR"))
+        }
+
+        /// `ClipBamTest.scala:245` "clip overlapping reads, update mate info, and reset NM, UQ &
+        /// MD": six pairs overlapping by 10, 8, 6, 4, 2 and 0 bases, with fixed 5' clipping (R1
+        /// 2, R2 3) and overlap clipping in `Hard` mode. Checks clipping, coordinate order, mate
+        /// info (`MC`), recomputed `NM`/`UQ`/`MD`, and every metrics row.
+        #[test]
+        fn clip_execute_pairs_updates_mate_info_tags_and_metrics() {
+            let dir = TempDir::new().expect("temp dir");
+            let reference = write_all_a_reference(&dir);
+            let mut source = SamBuilder::with_single_ref("chr1", REFERENCE_LENGTH);
+            let mut input = SamBuilder::with_single_ref("chr1", REFERENCE_LENGTH);
+            input.set_queryname_sort_order();
+            let starts = [(100, 140), (200, 242), (300, 344), (400, 446), (500, 548), (600, 650)];
+            for (i, (start1, start2)) in starts.into_iter().enumerate() {
+                let (mut r1, mut r2) = source
+                    .add_pair()
+                    .name(&format!("q{}", i + 1))
+                    .bases1(&all_a_with_mismatch(FGBIO_MISMATCH_POSITIONS[2 * i]))
+                    .bases2(&all_a_with_mismatch(FGBIO_MISMATCH_POSITIONS[2 * i + 1]))
+                    .start1(start1)
+                    .start2(start2)
+                    .build();
+                set_nm_uq_md(&mut r1);
+                set_nm_uq_md(&mut r2);
+                input.push_record(r1);
+                input.push_record(r2);
+            }
+            let (input_path, output, metrics) =
+                (dir.path().join("in.bam"), dir.path().join("out.bam"), dir.path().join("m.txt"));
+            input.write(&input_path).expect("write input");
+            let mut clip = end_to_end_clip(
+                input_path,
+                output.clone(),
+                reference,
+                metrics.clone(),
+                ClippingMode::Hard,
+            );
+            clip.read_one_five_prime = 2;
+            clip.read_two_five_prime = 3;
+            clip.clip_overlapping_reads = true;
+            clip.execute("test").expect("clip should succeed");
+
+            let clipped = read_bam_records(&output).expect("read output");
+            assert_eq!(clipped.len(), 12);
+            let is_hard = |op: Op| op.kind() == Kind::HardClip;
+            let is_hard_of = |op: Op, len: usize| is_hard(op) && op.len() == len;
+            let (minus, plus): (Vec<_>, Vec<_>) =
+                clipped.iter().partition(|r| r.flags().is_reverse_complemented());
+            let count = |recs: &[&RecordBuf], pred: &dyn Fn((Op, Op)) -> bool| {
+                recs.iter().filter(|r| pred(first_and_last_ops(r))).count()
+            };
+            // Overlap clipping hit every pair but q6.
+            assert_eq!(count(&minus, &|(first, _)| is_hard(first)), 5);
+            assert_eq!(count(&plus, &|(_, last)| is_hard(last)), 5);
+            // Fixed 5' clipping hit every read.
+            assert_eq!(count(&minus, &|(_, last)| is_hard_of(last, 3)), 6);
+            assert_eq!(count(&plus, &|(first, _)| is_hard_of(first, 2)), 6);
+
+            for pair in clipped.windows(2) {
+                assert!(pair[0].alignment_start() <= pair[1].alignment_start(), "coordinate order");
+            }
+            let mut templates: std::collections::BTreeMap<_, Vec<&RecordBuf>> =
+                std::collections::BTreeMap::new();
+            for rec in &clipped {
+                templates.entry(rec.name()).or_default().push(rec);
+            }
+            assert_eq!(templates.len(), 6);
+            for template in templates.values() {
+                let [lhs, rhs] = template.as_slice() else {
+                    panic!("expected a pair, got {template:?}")
+                };
+                for (a, b) in [(lhs, rhs), (rhs, lhs)] {
+                    assert_eq!(a.mate_alignment_start(), b.alignment_start(), "mate start");
+                    assert_eq!(
+                        a.flags().is_mate_reverse_complemented(),
+                        b.flags().is_reverse_complemented(),
+                        "mate strand"
+                    );
+                    match a.data().get(&Tag::from(SamTag::MC)) {
+                        Some(Value::String(mc)) => assert_eq!(mc.to_string(), cigar_string(b)),
+                        other => panic!("MC missing or not a string: {other:?}"),
+                    }
+                }
+            }
+            for rec in &clipped {
+                assert_nm_uq_md_recomputed(rec);
+            }
+
+            let rows = read_clipping_metrics(&metrics);
+            let row = |read_type: ReadType| {
+                let row = rows.iter().find(|m| m.read_type == read_type);
+                metric_values(row.unwrap_or_else(|| panic!("no {read_type:?} row")))
+            };
+            // Columns: reads, unmapped, clipped pre/post/5'/3'/overlapping/extending, bases,
+            // bases clipped pre/post/5'/3'/overlapping/extending.
+            let read_one = [6, 0, 0, 6, 6, 0, 5, 0, 273, 0, 27, 12, 0, 15, 0];
+            let read_two = [6, 0, 0, 6, 6, 0, 5, 0, 267, 0, 33, 18, 0, 15, 0];
+            let pair: [usize; 15] = std::array::from_fn(|i| read_one[i] + read_two[i]);
+            assert_eq!(rows.len(), 5);
+            assert_eq!(row(ReadType::Fragment), [0; 15], "Fragment");
+            assert_eq!(row(ReadType::ReadOne), read_one, "ReadOne");
+            assert_eq!(row(ReadType::ReadTwo), read_two, "ReadTwo");
+            assert_eq!(row(ReadType::Pair), pair, "Pair");
+            assert_eq!(row(ReadType::All), pair, "All");
+        }
+
+        /// `ClipBamTest.scala:351` "clip fragment reads, and reset NM, UQ & MD": three fragments
+        /// with R1 fixed clipping (5' 2, 3' 10); R2 clipping and overlap clipping do not apply to
+        /// fragments, and the `40S10M` fragment is clipped away entirely and unmapped.
+        #[test]
+        fn clip_execute_fragments_resets_tags_and_metrics() {
+            let dir = TempDir::new().expect("temp dir");
+            let reference = write_all_a_reference(&dir);
+            let mut source = SamBuilder::with_single_ref("chr1", REFERENCE_LENGTH);
+            let mut input = SamBuilder::with_single_ref("chr1", REFERENCE_LENGTH);
+            input.set_queryname_sort_order();
+            let fragments = [
+                (100, Strand::Plus, "50M"),
+                (200, Strand::Minus, "50M"),
+                (300, Strand::Plus, "40S10M"),
+            ];
+            for (i, (start, strand, cigar)) in fragments.into_iter().enumerate() {
+                let mut rec = source
+                    .add_frag()
+                    .name(&format!("f{}", i + 1))
+                    .bases(&all_a_with_mismatch(FGBIO_MISMATCH_POSITIONS[i]))
+                    .start(start)
+                    .strand(strand)
+                    .cigar(cigar)
+                    .build();
+                set_nm_uq_md(&mut rec);
+                input.push_record(rec);
+            }
+            let (input_path, output, metrics) =
+                (dir.path().join("in.bam"), dir.path().join("out.bam"), dir.path().join("m.txt"));
+            input.write(&input_path).expect("write input");
+            let mut clip = end_to_end_clip(
+                input_path,
+                output.clone(),
+                reference,
+                metrics.clone(),
+                ClippingMode::Hard,
+            );
+            (clip.read_one_five_prime, clip.read_one_three_prime) = (2, 10);
+            (clip.read_two_five_prime, clip.read_two_three_prime) = (5, 5);
+            clip.clip_overlapping_reads = true;
+            clip.execute("test").expect("clip should succeed");
+
+            let clipped = read_bam_records(&output).expect("read output");
+            assert_eq!(clipped.len(), 3);
+            let mapped: Vec<_> = clipped.iter().filter(|r| !r.flags().is_unmapped()).collect();
+            let is_2h = |op: Op| op.kind() == Kind::HardClip && op.len() == 2;
+            let minus_5p_clipped = mapped
+                .iter()
+                .filter(|r| r.flags().is_reverse_complemented() && is_2h(first_and_last_ops(r).1))
+                .count();
+            let plus_5p_clipped = mapped
+                .iter()
+                .filter(|r| !r.flags().is_reverse_complemented() && is_2h(first_and_last_ops(r).0))
+                .count();
+            assert_eq!((minus_5p_clipped, plus_5p_clipped), (1, 1));
+            for pair in clipped.windows(2) {
+                let (lhs, rhs) = (&pair[0], &pair[1]);
+                if !lhs.flags().is_unmapped() && !rhs.flags().is_unmapped() {
+                    assert!(lhs.alignment_start() <= rhs.alignment_start(), "coordinate order");
+                } else if lhs.flags().is_unmapped() {
+                    assert!(rhs.flags().is_unmapped(), "unmapped reads sort last");
+                }
+            }
+            for rec in &mapped {
+                assert_nm_uq_md_recomputed(rec);
+            }
+
+            let rows = read_clipping_metrics(&metrics);
+            // Columns as in `clip_execute_pairs_updates_mate_info_tags_and_metrics`.
+            let fragment = [3, 1, 1, 3, 2, 3, 0, 0, 76, 40, 74, 4, 30, 0, 0];
+            assert_eq!(rows.len(), 5);
+            for row in &rows {
+                let expected = match row.read_type {
+                    ReadType::Fragment | ReadType::All => fragment,
+                    ReadType::ReadOne | ReadType::ReadTwo | ReadType::Pair => [0; 15],
+                };
+                assert_eq!(metric_values(row), expected, "{:?}", row.read_type);
+            }
+        }
+
+        /// fgbio's `--upgrade-clipping` fixture: two 50 bp fragments, `q1` (`+`, start 100) and
+        /// `q2` (`-`, start 200), each clipped 10 bases at the 5' end and 4 at the 3' end in
+        /// `prior` mode (with auto-clip attributes). With `reclip_in_prior_mode`, each is then
+        /// clipped again (5' 5, 3' 2), which must be a no-op, as in fgbio's upgrade cases.
+        /// Returns the fragments as written to `clip`'s input, and `clip`'s output in `mode`.
+        fn run_upgrade_clipping(
+            prior: ClippingMode,
+            mode: ClippingMode,
+            reclip_in_prior_mode: bool,
+        ) -> (Vec<RecordBuf>, Vec<RecordBuf>) {
+            let dir = TempDir::new().expect("temp dir");
+            let reference = write_all_a_reference(&dir);
+            let mut source = SamBuilder::with_single_ref("chr1", REFERENCE_LENGTH);
+            let mut input = SamBuilder::with_single_ref("chr1", REFERENCE_LENGTH);
+            input.set_queryname_sort_order();
+            let quals: Vec<u8> = (0..50u8).map(|i| 10 + i % 30).collect();
+            let fragments = [
+                ("q1", "ACGTTGCAAC".repeat(5), 100, Strand::Plus),
+                ("q2", "TTGACCAGTA".repeat(5), 200, Strand::Minus),
+            ];
+            let header = source.header.clone();
+            let clipper = RawRecordClipper::with_auto_clip(prior, true);
+            for (name, bases, start, strand) in fragments {
+                let frag = source
+                    .add_frag()
+                    .name(name)
+                    .bases(&bases)
+                    .quals(&quals)
+                    .start(start)
+                    .strand(strand)
+                    .build();
+                let mut raw = encode_record_buf_to_raw(&frag, &header).expect("encode");
+                assert_eq!(clipper.clip_5_prime_end_of_read_raw(&mut raw, 10), 10);
+                assert_eq!(clipper.clip_3_prime_end_of_read_raw(&mut raw, 4), 4);
+                if reclip_in_prior_mode {
+                    assert_eq!(clipper.clip_5_prime_end_of_read_raw(&mut raw, 5), 0);
+                    assert_eq!(clipper.clip_3_prime_end_of_read_raw(&mut raw, 2), 0);
+                }
+                input.push_record(raw_record_to_record_buf(&raw, &header).expect("decode"));
+            }
+            let (input_path, output) = (dir.path().join("in.bam"), dir.path().join("out.bam"));
+            input.write(&input_path).expect("write input");
+            let mut clip = end_to_end_clip(
+                input_path,
+                output.clone(),
+                reference,
+                dir.path().join("m.txt"),
+                mode,
+            );
+            clip.upgrade_clipping = true;
+            clip.execute("test").expect("clip should succeed");
+            let clipped = read_bam_records(&output).expect("read output");
+            assert_eq!(clipped.len(), 2);
+            (input.records().to_vec(), clipped)
+        }
+
+        /// fgbio's `maskBases`/`maskQuals`: `values` with its first `leading` and last
+        /// `trailing` entries replaced by `fill`.
+        fn masked(values: &[u8], leading: usize, trailing: usize, fill: u8) -> Vec<u8> {
+            let mut out = values.to_vec();
+            let len = out.len();
+            out[..leading].fill(fill);
+            out[len - trailing..].fill(fill);
+            out
+        }
+
+        /// Asserts `clipped` is `prior` with its clipping in `expected` mode, per fgbio's
+        /// upgrade expectations: `q1` (`+`) carries 10 5' / 4 3' clipped bases (`10?36M4?`),
+        /// `q2` (`-`) the mirror (`4?36M10?`). `prior_mode` says whether `prior`'s bases were
+        /// already hard-clipped away.
+        fn assert_clipping_in_mode(
+            prior_mode: ClippingMode,
+            expected: ClippingMode,
+            prior: &[RecordBuf],
+            clipped: &[RecordBuf],
+        ) {
+            let seq = |r: &RecordBuf| r.sequence().as_ref().to_vec();
+            let qual = |r: &RecordBuf| r.quality_scores().as_ref().to_vec();
+            for (prior, clipped, (leading, trailing)) in
+                [(&prior[0], &clipped[0], (10, 4)), (&prior[1], &clipped[1], (4, 10))]
+            {
+                let op = if expected == ClippingMode::Hard { 'H' } else { 'S' };
+                assert_eq!(cigar_string(clipped), format!("{leading}{op}36M{trailing}{op}"));
+                let (want_seq, want_qual) = match expected {
+                    ClippingMode::Soft => (seq(prior), qual(prior)),
+                    ClippingMode::SoftWithMask => (
+                        masked(&seq(prior), leading, trailing, b'N'),
+                        masked(&qual(prior), leading, trailing, fgumi_dna::MIN_PHRED),
+                    ),
+                    ClippingMode::Hard if prior_mode == ClippingMode::Hard => {
+                        (seq(prior), qual(prior))
+                    }
+                    ClippingMode::Hard => (
+                        seq(prior)[leading..50 - trailing].to_vec(),
+                        qual(prior)[leading..50 - trailing].to_vec(),
+                    ),
+                };
+                assert_eq!(
+                    seq(clipped),
+                    want_seq,
+                    "bases of {cigar}",
+                    cigar = cigar_string(clipped)
+                );
+                assert_eq!(
+                    qual(clipped),
+                    want_qual,
+                    "quals of {cigar}",
+                    cigar = cigar_string(clipped)
+                );
+            }
+        }
+
+        /// `ClipBamTest.scala:428` "upgrade existing clipping from $prior to $mode with
+        /// --upgrade-clipping".
+        #[rstest]
+        #[case::soft_to_soft_with_mask(ClippingMode::Soft, ClippingMode::SoftWithMask)]
+        #[case::soft_to_hard(ClippingMode::Soft, ClippingMode::Hard)]
+        #[case::soft_with_mask_to_hard(ClippingMode::SoftWithMask, ClippingMode::Hard)]
+        fn clip_execute_upgrades_existing_clipping(
+            #[case] prior: ClippingMode,
+            #[case] mode: ClippingMode,
+        ) {
+            let (input, clipped) = run_upgrade_clipping(prior, mode, true);
+            assert_clipping_in_mode(prior, mode, &input, &clipped);
+        }
+
+        /// `ClipBamTest.scala:473` "not upgrade existing clipping from $prior to $mode with
+        /// --upgrade-clipping": clipping already at or above `mode` is left as it was.
+        #[rstest]
+        #[case::soft_to_soft(ClippingMode::Soft, ClippingMode::Soft)]
+        #[case::soft_with_mask_to_soft(ClippingMode::SoftWithMask, ClippingMode::Soft)]
+        #[case::soft_with_mask_to_soft_with_mask(
+            ClippingMode::SoftWithMask,
+            ClippingMode::SoftWithMask
+        )]
+        #[case::hard_to_hard(ClippingMode::Hard, ClippingMode::Hard)]
+        #[case::hard_to_soft_with_mask(ClippingMode::Hard, ClippingMode::SoftWithMask)]
+        #[case::hard_to_soft(ClippingMode::Hard, ClippingMode::Soft)]
+        fn clip_execute_does_not_downgrade_existing_clipping(
+            #[case] prior: ClippingMode,
+            #[case] mode: ClippingMode,
+        ) {
+            let (input, clipped) = run_upgrade_clipping(prior, mode, false);
+            assert_clipping_in_mode(prior, prior, &input, &clipped);
+        }
+
+        /// `ClipBamTest.scala:518` "clip FR reads that extend past the mate".
+        #[test]
+        fn clip_pair_clips_reads_extending_past_mate() {
+            let (mut r1, mut r2) = fgbio_pair(50, |p| p.start1(100).start2(90));
+            assert_eq!((end(&r1), end(&r2)), (149, 139));
+            let mut clip = make_clip(0, 0, 0, 0);
+            clip.clip_extending_past_mate = true;
+            clip_pair_hard(&clip, &mut r1, &mut r2);
+            assert_eq!(start(&r1), start(&r2));
+            assert_eq!(end(&r1), end(&r2));
+        }
+
+        /// A `Clip` with fixed clipping `(r1 5', r1 3', r2 5', r2 3')`, past-mate clipping, and
+        /// optionally overlap clipping.
+        fn past_mate_clip(fixed: [usize; 4], clip_overlapping: bool) -> Clip {
+            let mut clip = make_clip(fixed[0], fixed[1], fixed[2], fixed[3]);
+            clip.clip_extending_past_mate = true;
+            clip.clip_overlapping_reads = clip_overlapping;
+            clip
+        }
+
+        /// fgbio's past-mate cases: an FR pair of `read_length` reads at `starts`, whose prior
+        /// ends must be `prior_ends`, clipped by `clip`, giving `(r1 start, r1 end, r2 start, r2
+        /// end)`.
+        #[rstest]
+        // ClipBamTest.scala:530 "clip FR reads that extend past their mate and remove overlap"
+        #[case::past_mate_and_overlap(100, (100, 90), (199, 189), past_mate_clip([0, 0, 0, 0], true), (100, 144, 145, 189))]
+        // ClipBamTest.scala:551 "clip FR reads that extend past their mate with asymmetrical five prime hard clipping"
+        #[case::asymmetric_five_prime(200, (100, 90), (299, 289), past_mate_clip([10, 0, 50, 0], false), (110, 239, 110, 239))]
+        // ClipBamTest.scala:574 "clip FR reads that extend past their mate with some irrelevant three prime clipping and removal of overlap"
+        #[case::three_prime_and_overlap(200, (100, 90), (299, 289), past_mate_clip([0, 0, 0, 50], true), (100, 194, 195, 289))]
+        // ClipBamTest.scala:597 "clip FR reads that extend past their mate, overlap, and have clipping on the 3-prime side of one and the 5-prime side of another"
+        #[case::overlap_with_mixed_fixed(200, (140, 90), (339, 289), past_mate_clip([25, 0, 0, 175], true), (165, 264, 265, 289))]
+        fn clip_pair_past_mate_with_fixed_and_overlap_clipping(
+            #[case] read_length: usize,
+            #[case] starts: (usize, usize),
+            #[case] prior_ends: (usize, usize),
+            #[case] clip: Clip,
+            #[case] expected: (usize, usize, usize, usize),
+        ) {
+            let (mut r1, mut r2) = fgbio_pair(read_length, |p| p.start1(starts.0).start2(starts.1));
+            assert_eq!((end(&r1), end(&r2)), prior_ends);
+            clip_pair_hard(&clip, &mut r1, &mut r2);
+            assert_eq!((start(&r1), end(&r1), start(&r2), end(&r2)), expected);
+        }
+
+        /// `ClipBamTest.scala:621` "unmap reads when the hard clipping length requested is
+        /// greater than the length of the reads". fgbio's `UnmappedStart` (0) corresponds to BAM
+        /// `POS` -1 with no alignment start or end.
+        #[test]
+        fn clip_pair_unmaps_reads_when_clipping_exceeds_read_length() {
+            let (mut r1, mut r2) = fgbio_pair(100, |p| p.start1(100).start2(300));
+            assert_eq!((end(&r1), end(&r2)), (199, 399));
+            clip_pair_hard(&past_mate_clip([101, 0, 101, 0], true), &mut r1, &mut r2);
+            assert_eq!((r1.is_unmapped(), r2.is_unmapped()), (true, true));
+            assert_eq!((r1.pos(), r2.pos()), (-1, -1));
+            assert_eq!((r1.alignment_start_1based(), r2.alignment_start_1based()), (None, None));
+            assert_eq!((r1.alignment_end_1based(), r2.alignment_end_1based()), (None, None));
+        }
     }
 }

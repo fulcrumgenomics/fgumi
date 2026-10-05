@@ -755,12 +755,7 @@ impl RawRecordClipper {
         record: &mut fgumi_raw_bam::RawRecord,
         clip_length: usize,
     ) -> usize {
-        let ops = record.cigar_ops_vec();
-        let existing_clipping: usize = ops
-            .iter()
-            .take_while(|&&op| matches!(op & 0xF, 4 | 5))
-            .map(|&op| (op >> 4) as usize)
-            .sum();
+        let existing_clipping = Self::clipping_at_end_raw(&record.cigar_ops_vec(), true);
 
         if clip_length > existing_clipping && !Self::lacks_seq_raw(record) {
             self.clip_start_of_alignment(record, clip_length - existing_clipping)
@@ -776,13 +771,7 @@ impl RawRecordClipper {
         record: &mut fgumi_raw_bam::RawRecord,
         clip_length: usize,
     ) -> usize {
-        let ops = record.cigar_ops_vec();
-        let existing_clipping: usize = ops
-            .iter()
-            .rev()
-            .take_while(|&&op| matches!(op & 0xF, 4 | 5))
-            .map(|&op| (op >> 4) as usize)
-            .sum();
+        let existing_clipping = Self::clipping_at_end_raw(&record.cigar_ops_vec(), false);
 
         if clip_length > existing_clipping && !Self::lacks_seq_raw(record) {
             self.clip_end_of_alignment(record, clip_length - existing_clipping)
@@ -1002,7 +991,7 @@ impl RawRecordClipper {
         }
 
         // SoftWithMask: mask existing soft-clipped bases at both ends via upgrade_clipping_raw,
-        // leaving the CIGAR intact (see the typed upgrade_all_clipping for rationale).
+        // leaving the CIGAR intact, as fgbio `upgradeAllClipping` does via `clip{Start,End}OfRead`.
         if self.mode == ClippingMode::SoftWithMask {
             if leading_soft > 0 {
                 self.upgrade_clipping_raw(record, leading_hard + leading_soft, true);
@@ -1384,6 +1373,30 @@ mod clip_test_adapter {
 
         pub(super) fn clip_end_of_read(&self, r: &mut RecordBuf, n: usize) -> usize {
             self.on_one(r, |c, raw| c.clip_end_of_read_raw(raw, n))
+        }
+
+        /// Round-trips [`RawRecordClipper::clip_5_prime_end_of_read_raw`] through `RecordBuf`.
+        pub(super) fn clip_5_prime_end_of_read(&self, r: &mut RecordBuf, n: usize) -> usize {
+            self.on_one(r, |c, raw| c.clip_5_prime_end_of_read_raw(raw, n))
+        }
+
+        /// Round-trips [`RawRecordClipper::clip_3_prime_end_of_read_raw`] through `RecordBuf`.
+        pub(super) fn clip_3_prime_end_of_read(&self, r: &mut RecordBuf, n: usize) -> usize {
+            self.on_one(r, |c, raw| c.clip_3_prime_end_of_read_raw(raw, n))
+        }
+
+        /// Round-trips [`RawRecordClipper::clip_extending_past_mate_ends`] through `RecordBuf`.
+        pub(super) fn clip_extending_past_mate_ends(
+            &self,
+            r1: &mut RecordBuf,
+            r2: &mut RecordBuf,
+        ) -> (usize, usize) {
+            let mut raw1 = to_raw(r1);
+            let mut raw2 = to_raw(r2);
+            let ret = self.inner.clip_extending_past_mate_ends(&mut raw1, &mut raw2);
+            *r1 = to_buf(&raw1);
+            *r2 = to_buf(&raw2);
+            ret
         }
 
         pub(super) fn clip_overlapping_reads(
@@ -2589,10 +2602,11 @@ mod tests {
         clipper.clip_start_of_alignment(&mut record, 3);
 
         // Attribute should remain unchanged in Soft mode
-        if let Some(Value::String(s)) = record.data().get(&tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, b"0123456789");
-        }
+        let Some(Value::String(s)) = record.data().get(&tag) else {
+            panic!("tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, b"0123456789");
     }
 
     #[test]
@@ -2610,10 +2624,11 @@ mod tests {
         clipper.clip_start_of_alignment(&mut record, 3);
 
         // Attribute should remain unchanged when auto-clip is disabled
-        if let Some(Value::String(s)) = record.data().get(&tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, b"0123456789");
-        }
+        let Some(Value::String(s)) = record.data().get(&tag) else {
+            panic!("tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, b"0123456789");
     }
 
     #[test]
@@ -2635,16 +2650,18 @@ mod tests {
         clipper.clip_start_of_alignment(&mut record, 3);
 
         // Check tag1 was clipped
-        if let Some(Value::String(s)) = record.data().get(&tag1) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, b"3456789");
-        }
+        let Some(Value::String(s)) = record.data().get(&tag1) else {
+            panic!("tag1 missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, b"3456789");
 
         // Check tag2 was NOT clipped
-        if let Some(Value::String(s)) = record.data().get(&tag2) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, b"01234");
-        }
+        let Some(Value::String(s)) = record.data().get(&tag2) else {
+            panic!("tag2 missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, b"01234");
     }
 
     // ===================================================================
@@ -2922,10 +2939,11 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In Soft mode with auto=false, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
     }
 
     #[test]
@@ -2943,10 +2961,11 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In Soft mode, even with auto=true, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
     }
 
     #[test]
@@ -2964,10 +2983,11 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In SoftWithMask mode with auto=false, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
     }
 
     #[test]
@@ -2985,10 +3005,11 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In SoftWithMask mode, even with auto=true, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
     }
 
     #[test]
@@ -3010,14 +3031,16 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In Hard mode with auto=false, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
-        if let Some(Value::Array(Array::Int32(arr))) = record.data().get(&a2_tag) {
-            let vec: Vec<i32> = arr.clone();
-            assert_eq!(vec, (1..=20).collect::<Vec<i32>>());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
+        let Some(Value::Array(Array::Int32(arr))) = record.data().get(&a2_tag) else {
+            panic!("a2_tag missing or of unexpected type");
+        };
+        let vec: Vec<i32> = arr.clone();
+        assert_eq!(vec, (1..=20).collect::<Vec<i32>>());
     }
 
     #[test]
@@ -3043,24 +3066,28 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In Hard mode with auto=true, attributes matching read length should be clipped
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            // "ABABABABABABABABABAB" -> remove first 5 -> "BABABABABABABAB"
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "BABABABABABABAB".as_bytes());
-        }
-        if let Some(Value::Array(Array::Int32(arr))) = record.data().get(&a2_tag) {
-            let vec: Vec<i32> = arr.clone();
-            assert_eq!(vec, (6..=20).collect::<Vec<i32>>());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        // "ABABABABABABABABABAB" -> remove first 5 -> "BABABABABABABAB"
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "BABABABABABABAB".as_bytes());
+        let Some(Value::Array(Array::Int32(arr))) = record.data().get(&a2_tag) else {
+            panic!("a2_tag missing or of unexpected type");
+        };
+        let vec: Vec<i32> = arr.clone();
+        assert_eq!(vec, (6..=20).collect::<Vec<i32>>());
         // B1 and B2 should NOT be modified (length doesn't match)
-        if let Some(Value::String(s)) = record.data().get(&b1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "A".repeat(10).as_bytes());
-        }
-        if let Some(Value::Array(Array::Int32(arr))) = record.data().get(&b2_tag) {
-            let vec: Vec<i32> = arr.clone();
-            assert_eq!(vec, (1..=10).collect::<Vec<i32>>());
-        }
+        let Some(Value::String(s)) = record.data().get(&b1_tag) else {
+            panic!("b1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "A".repeat(10).as_bytes());
+        let Some(Value::Array(Array::Int32(arr))) = record.data().get(&b2_tag) else {
+            panic!("b2_tag missing or of unexpected type");
+        };
+        let vec: Vec<i32> = arr.clone();
+        assert_eq!(vec, (1..=10).collect::<Vec<i32>>());
     }
 
     #[test]
@@ -3078,10 +3105,11 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In Soft mode with auto=false, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
     }
 
     #[test]
@@ -3099,10 +3127,11 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In Soft mode, even with auto=true, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
     }
 
     #[test]
@@ -3120,10 +3149,11 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In SoftWithMask mode with auto=false, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
     }
 
     #[test]
@@ -3141,10 +3171,11 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In SoftWithMask mode, even with auto=true, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
     }
 
     #[test]
@@ -3166,14 +3197,16 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In Hard mode with auto=false, attributes should NOT be modified
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "AB".repeat(10).as_bytes());
-        }
-        if let Some(Value::Array(Array::Int32(arr))) = record.data().get(&a2_tag) {
-            let vec: Vec<i32> = arr.clone();
-            assert_eq!(vec, (1..=20).collect::<Vec<i32>>());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "AB".repeat(10).as_bytes());
+        let Some(Value::Array(Array::Int32(arr))) = record.data().get(&a2_tag) else {
+            panic!("a2_tag missing or of unexpected type");
+        };
+        let vec: Vec<i32> = arr.clone();
+        assert_eq!(vec, (1..=20).collect::<Vec<i32>>());
     }
 
     #[test]
@@ -3199,24 +3232,28 @@ mod tests {
         assert_eq!(clipped, 5);
 
         // In Hard mode with auto=true, attributes matching read length should be clipped
-        if let Some(Value::String(s)) = record.data().get(&a1_tag) {
-            // "ABABABABABABABABABAB" -> remove last 5 -> "ABABABABABABABA"
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "ABABABABABABABA".as_bytes());
-        }
-        if let Some(Value::Array(Array::Int32(arr))) = record.data().get(&a2_tag) {
-            let vec: Vec<i32> = arr.clone();
-            assert_eq!(vec, (1..=15).collect::<Vec<i32>>());
-        }
+        let Some(Value::String(s)) = record.data().get(&a1_tag) else {
+            panic!("a1_tag missing or of unexpected type");
+        };
+        // "ABABABABABABABABABAB" -> remove last 5 -> "ABABABABABABABA"
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "ABABABABABABABA".as_bytes());
+        let Some(Value::Array(Array::Int32(arr))) = record.data().get(&a2_tag) else {
+            panic!("a2_tag missing or of unexpected type");
+        };
+        let vec: Vec<i32> = arr.clone();
+        assert_eq!(vec, (1..=15).collect::<Vec<i32>>());
         // B1 and B2 should NOT be modified (length doesn't match)
-        if let Some(Value::String(s)) = record.data().get(&b1_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "A".repeat(10).as_bytes());
-        }
-        if let Some(Value::Array(Array::Int32(arr))) = record.data().get(&b2_tag) {
-            let vec: Vec<i32> = arr.clone();
-            assert_eq!(vec, (1..=10).collect::<Vec<i32>>());
-        }
+        let Some(Value::String(s)) = record.data().get(&b1_tag) else {
+            panic!("b1_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "A".repeat(10).as_bytes());
+        let Some(Value::Array(Array::Int32(arr))) = record.data().get(&b2_tag) else {
+            panic!("b2_tag missing or of unexpected type");
+        };
+        let vec: Vec<i32> = arr.clone();
+        assert_eq!(vec, (1..=10).collect::<Vec<i32>>());
     }
 
     // ===================================================================
@@ -3246,10 +3283,11 @@ mod tests {
         assert_eq!(no_auto.sequence().len(), 35);
 
         // Attributes should NOT be modified without auto-clip
-        if let Some(Value::String(s)) = no_auto.data().get(&az_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "12345678901234567890123456789012345678901234567890".as_bytes());
-        }
+        let Some(Value::String(s)) = no_auto.data().get(&az_tag) else {
+            panic!("az_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "12345678901234567890123456789012345678901234567890".as_bytes());
 
         // Test with auto-clip
         let clipper_auto = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
@@ -3268,10 +3306,11 @@ mod tests {
         assert_eq!(with_auto.sequence().len(), 35);
 
         // Attributes SHOULD be modified with auto-clip (remove first 5 and last 10)
-        if let Some(Value::String(s)) = with_auto.data().get(&az_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "67890123456789012345678901234567890".as_bytes());
-        }
+        let Some(Value::String(s)) = with_auto.data().get(&az_tag) else {
+            panic!("az_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "67890123456789012345678901234567890".as_bytes());
     }
 
     /// The soft→hard upgrade path (`upgrade_all_clipping`) must also clip a
@@ -3328,10 +3367,11 @@ mod tests {
         assert_eq!(no_auto.sequence().len(), 35);
 
         // Attributes should NOT be modified without auto-clip
-        if let Some(Value::String(s)) = no_auto.data().get(&az_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "12345678901234567890123456789012345678901234567890".as_bytes());
-        }
+        let Some(Value::String(s)) = no_auto.data().get(&az_tag) else {
+            panic!("az_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "12345678901234567890123456789012345678901234567890".as_bytes());
 
         // Test with auto-clip
         let clipper_auto = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
@@ -3350,10 +3390,11 @@ mod tests {
         assert_eq!(with_auto.sequence().len(), 35);
 
         // Attributes SHOULD be modified with auto-clip
-        if let Some(Value::String(s)) = with_auto.data().get(&az_tag) {
-            let bytes: &[u8] = s.as_ref();
-            assert_eq!(bytes, "67890123456789012345678901234567890".as_bytes());
-        }
+        let Some(Value::String(s)) = with_auto.data().get(&az_tag) else {
+            panic!("az_tag missing or of unexpected type");
+        };
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, "67890123456789012345678901234567890".as_bytes());
     }
 
     #[test]
@@ -3491,7 +3532,8 @@ mod tests {
     fn test_clip_overlapping_reads_normalizes_by_strand_typed(
         #[case] fwd_start: usize,
         #[case] rev_start: usize,
-        #[values(ClippingMode::Soft, ClippingMode::Hard)] mode: ClippingMode,
+        #[values(ClippingMode::Soft, ClippingMode::SoftWithMask, ClippingMode::Hard)]
+        mode: ClippingMode,
     ) {
         let clipper = RawClipperOnBuf::new(mode);
         let seq = "A".repeat(100);
@@ -3530,7 +3572,8 @@ mod tests {
     fn test_clip_overlapping_reads_normalizes_by_strand_raw(
         #[case] fwd_start: usize,
         #[case] rev_start: usize,
-        #[values(ClippingMode::Soft, ClippingMode::Hard)] mode: ClippingMode,
+        #[values(ClippingMode::Soft, ClippingMode::SoftWithMask, ClippingMode::Hard)]
+        mode: ClippingMode,
     ) {
         use fgumi_raw_bam::encode_record_buf_to_raw;
         use noodles::sam::header::record::value::Map;
@@ -4805,6 +4848,533 @@ mod tests {
             "generator exercises read-through too rarely: only {nonzero}/{total} pairs clipped \
              nonzero — the past-mate properties risk passing vacuously"
         );
+    }
+
+    /// Ports of fgbio `SamRecordClipperTest` (fgbio commit `e51a661`) that fgumi's own clipper
+    /// tests above either did not cover or covered more weakly (different inputs, missing
+    /// assertions). Inputs and expected values are copied verbatim from the fgbio tests; each
+    /// test cites its source as `SamRecordClipperTest.scala:<line>`.
+    ///
+    /// fgbio's `r(start, cigar, strand, attrs)` fragment helper is [`fragment`] here, and its
+    /// `pair(...)` helper is the enclosing module's [`fr_pair`]. Clipping goes through the
+    /// [`RawClipperOnBuf`] façade, so every case exercises the live [`RawRecordClipper`].
+    mod fgbio_sam_record_clipper_tests {
+        use super::*;
+        use ClippingMode::{Hard, Soft, SoftWithMask};
+        use Strand::{Minus, Plus};
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+
+        /// The 50-character `az` attribute fgbio attaches to a 50-base read in its
+        /// auto-clip-attribute tests.
+        const AZ_50: &str = "12345678901234567890123456789012345678901234567890";
+
+        /// fgbio `r(start, cigar, strand)`: a mapped fragment whose read length is the CIGAR's
+        /// query length. Bases cycle `ACGT` and qualities vary per base, so the tests that compare
+        /// bases/qualities before and after clipping can tell which bases were kept.
+        fn fragment(start: usize, cigar: &str, strand: Strand) -> RecordBuf {
+            let len = cigar_query_len(cigar);
+            let bases: String = (0..len).map(|i| char::from(b"ACGT"[i % 4])).collect();
+            let quals: Vec<u8> =
+                (0..len).map(|i| u8::try_from(10 + i % 40).expect("quality fits in u8")).collect();
+            RecordBuilder::mapped_read()
+                .sequence(&bases)
+                .qualities(&quals)
+                .cigar(cigar)
+                .alignment_start(start)
+                .reverse_complement(strand.is_reverse())
+                .build()
+        }
+
+        /// fgbio `r(start, cigar, attrs=Map("az" -> az))`: a forward-strand [`fragment`] that
+        /// carries a string `az` attribute.
+        fn fragment_with_az(start: usize, cigar: &str, az: &str) -> RecordBuf {
+            let mut rec = fragment(start, cigar, Plus);
+            rec.data_mut().insert(tag("az"), Value::from(az));
+            rec
+        }
+
+        /// 1-based alignment start, as fgbio's `rec.start`.
+        fn alignment_start(rec: &RecordBuf) -> Option<usize> {
+            rec.alignment_start().map(usize::from)
+        }
+
+        /// 1-based inclusive alignment end, as fgbio's `rec.end`.
+        fn alignment_end(rec: &RecordBuf) -> Option<usize> {
+            rec.alignment_end().map(usize::from)
+        }
+
+        /// The record's CIGAR rendered as a SAM string, as fgbio's `rec.cigar.toString`.
+        fn cigar_string(rec: &RecordBuf) -> String {
+            format_cigar(&rec.cigar())
+        }
+
+        /// The record's bases, as fgbio's `rec.bases`.
+        fn bases(rec: &RecordBuf) -> Vec<u8> {
+            rec.sequence().as_ref().to_vec()
+        }
+
+        /// The record's base qualities, as fgbio's `rec.quals`.
+        fn quals(rec: &RecordBuf) -> Vec<u8> {
+            rec.quality_scores().as_ref().to_vec()
+        }
+
+        /// The noodles [`Tag`] for a two-character tag name such as `"az"`. The fgbio fixtures
+        /// use opaque attribute names that have no `SamTag` constant.
+        fn tag(name: &str) -> Tag {
+            let &[first, second] = name.as_bytes() else {
+                panic!("tag name must be two characters: {name:?}")
+            };
+            Tag::new(first, second)
+        }
+
+        /// Reads a `Z` string tag, panicking if it is absent or of another type.
+        fn string_tag(rec: &RecordBuf, name: &str) -> String {
+            match rec.data().get(&tag(name)) {
+                Some(Value::String(s)) => String::from_utf8(s.to_vec()).expect("UTF-8 tag value"),
+                other => panic!("tag {name}: expected a string, got {other:?}"),
+            }
+        }
+
+        /// Reads a `B:i` (Int32) array tag, panicking if it is absent or of another type.
+        fn int32_array_tag(rec: &RecordBuf, name: &str) -> Vec<i32> {
+            match rec.data().get(&tag(name)) {
+                Some(Value::Array(Array::Int32(values))) => values.clone(),
+                other => panic!("tag {name}: expected a B:i array, got {other:?}"),
+            }
+        }
+
+        // ------------------------------------------------------------ clipStartOfAlignment
+
+        /// `SamRecordClipperTest.scala:128` "mask bases and qualities when the clipping mode is
+        /// `SoftWithMask`".
+        #[test]
+        fn clip_start_of_alignment_soft_with_mask_masks_clipped_bases() {
+            let mut rec = fragment(10, "50M", Plus);
+            assert_eq!(
+                RawClipperOnBuf::new(SoftWithMask).clip_start_of_alignment(&mut rec, 10),
+                10
+            );
+            assert_eq!(alignment_start(&rec), Some(20));
+            assert_eq!(cigar_string(&rec), "10S40M");
+            assert_eq!(bases(&rec)[..10], [NO_CALL_BASE; 10]);
+            assert_eq!(quals(&rec)[..10], [MIN_PHRED; 10]);
+        }
+
+        /// `SamRecordClipperTest.scala:137` "mask bases and qualities when the clipping mode is
+        /// `SoftWithMask`, including existing soft-clips".
+        #[test]
+        fn clip_start_of_alignment_soft_with_mask_masks_existing_soft_clips() {
+            let mut rec = fragment(10, "10S40M", Plus);
+            assert_eq!(
+                RawClipperOnBuf::new(SoftWithMask).clip_start_of_alignment(&mut rec, 10),
+                10
+            );
+            assert_eq!(alignment_start(&rec), Some(20));
+            assert_eq!(cigar_string(&rec), "20S30M");
+            assert_eq!(bases(&rec)[..20], [NO_CALL_BASE; 20]);
+            assert_eq!(quals(&rec)[..20], [MIN_PHRED; 20]);
+        }
+
+        /// `SamRecordClipperTest.scala:146` "hard clip 10 bases".
+        #[test]
+        fn clip_start_of_alignment_hard_removes_clipped_bases() {
+            let mut rec = fragment(10, "50M", Plus);
+            let (prior_bases, prior_quals) = (bases(&rec), quals(&rec));
+            assert_eq!(RawClipperOnBuf::new(Hard).clip_start_of_alignment(&mut rec, 10), 10);
+            assert_eq!(alignment_start(&rec), Some(20));
+            assert_eq!(cigar_string(&rec), "10H40M");
+            assert_eq!(bases(&rec), prior_bases[10..]);
+            assert_eq!(quals(&rec), prior_quals[10..]);
+        }
+
+        /// A 20M fragment carrying fgbio's auto-trim fixture: `A1`/`A2` are per-base (length
+        /// 20) and so eligible for trimming; `B1`/`B2` (length 10) are not.
+        fn auto_trim_fragment() -> RecordBuf {
+            let mut rec = fragment(10, "20M", Plus);
+            let data = rec.data_mut();
+            data.insert(tag("A1"), Value::from("AB".repeat(10)));
+            data.insert(tag("A2"), Value::from((1..=20).collect::<Vec<i32>>()));
+            data.insert(tag("B1"), Value::from("A".repeat(10)));
+            data.insert(tag("B2"), Value::from((1..=10).collect::<Vec<i32>>()));
+            rec
+        }
+
+        /// `SamRecordClipperTest.scala:175` "correctly handle auto-trimming of attribute with
+        /// auto=$auto and mode=$mode" (`clipStartOfAlignment`). Per-base attributes are trimmed
+        /// only when hard clipping with auto-clip enabled; the others are never touched.
+        #[rstest]
+        fn clip_start_of_alignment_auto_trims_per_base_attributes(
+            #[values(Soft, SoftWithMask, Hard)] mode: ClippingMode,
+            #[values(true, false)] auto: bool,
+        ) {
+            let mut rec = auto_trim_fragment();
+            let cut = mode == Hard && auto;
+            let clipper = RawClipperOnBuf::with_auto_clip(mode, auto);
+            assert_eq!(clipper.clip_start_of_alignment(&mut rec, 5), 5);
+            let expected_a1 = if cut { "BABABABABABABAB".to_string() } else { "AB".repeat(10) };
+            assert_eq!(string_tag(&rec, "A1"), expected_a1);
+            let a2_from = if cut { 6 } else { 1 };
+            assert_eq!(int32_array_tag(&rec, "A2"), (a2_from..=20).collect::<Vec<i32>>());
+            assert_eq!(string_tag(&rec, "B1"), "A".repeat(10));
+            assert_eq!(int32_array_tag(&rec, "B2"), (1..=10).collect::<Vec<i32>>());
+        }
+
+        // -------------------------------------------------------------- clipEndOfAlignment
+
+        /// `SamRecordClipperTest.scala:319` "correctly handle auto-trimming of attribute with
+        /// auto=$auto and mode=$mode" (`clipEndOfAlignment`).
+        #[rstest]
+        fn clip_end_of_alignment_auto_trims_per_base_attributes(
+            #[values(Soft, SoftWithMask, Hard)] mode: ClippingMode,
+            #[values(true, false)] auto: bool,
+        ) {
+            let mut rec = auto_trim_fragment();
+            let cut = mode == Hard && auto;
+            let clipper = RawClipperOnBuf::with_auto_clip(mode, auto);
+            assert_eq!(clipper.clip_end_of_alignment(&mut rec, 5), 5);
+            let expected_a1 = if cut { "ABABABABABABABA".to_string() } else { "AB".repeat(10) };
+            assert_eq!(string_tag(&rec, "A1"), expected_a1);
+            let a2_to = if cut { 15 } else { 20 };
+            assert_eq!(int32_array_tag(&rec, "A2"), (1..=a2_to).collect::<Vec<i32>>());
+            assert_eq!(string_tag(&rec, "B1"), "A".repeat(10));
+            assert_eq!(int32_array_tag(&rec, "B2"), (1..=10).collect::<Vec<i32>>());
+        }
+
+        // ------------------------------------------------- clip{Start,End}OfRead and 5'/3'
+
+        /// `SamRecordClipperTest.scala:340` "expand existing clipping" (`clipStartOfRead`):
+        /// existing soft or hard clipping counts toward the requested 10 bases.
+        #[rstest]
+        #[case::unclipped("50M", 10, "10S40M")]
+        #[case::partly_soft_clipped("5S45M", 5, "10S40M")]
+        #[case::already_soft_clipped("20S30M", 0, "20S30M")]
+        #[case::already_hard_clipped("20H30M", 0, "20H30M")]
+        fn clip_start_of_read_expands_existing_clipping(
+            #[case] cigar: &str,
+            #[case] expected_clipped: usize,
+            #[case] expected_cigar: &str,
+        ) {
+            let mut rec = fragment(10, cigar, Plus);
+            assert_eq!(
+                RawClipperOnBuf::new(Soft).clip_start_of_read(&mut rec, 10),
+                expected_clipped
+            );
+            assert_eq!(cigar_string(&rec), expected_cigar);
+        }
+
+        /// `SamRecordClipperTest.scala:358` "convert soft-clipping to hard clipping or masked
+        /// clipping" (`clipStartOfRead`).
+        #[test]
+        fn clip_start_of_read_converts_soft_clipping_to_hard_or_masked() {
+            let mut hard = fragment_with_az(10, "2H8S40M", &AZ_50[2..]);
+            let mut mask = fragment_with_az(10, "10S40M", AZ_50);
+            RawClipperOnBuf::with_auto_clip(Hard, true).clip_start_of_read(&mut hard, 5);
+            RawClipperOnBuf::with_auto_clip(SoftWithMask, true).clip_start_of_read(&mut mask, 5);
+
+            assert_eq!(cigar_string(&hard), "5H5S40M");
+            assert_eq!(bases(&hard).len(), 45);
+            assert_eq!(string_tag(&hard, "az"), "678901234567890123456789012345678901234567890");
+
+            assert_eq!(cigar_string(&mask), "10S40M");
+            assert_eq!(bases(&mask)[..5], *b"NNNNN");
+            assert_eq!(string_tag(&mask, "az"), AZ_50);
+        }
+
+        /// `SamRecordClipperTest.scala:373` "expand existing clipping" (`clipEndOfRead`).
+        #[rstest]
+        #[case::unclipped("50M", 10, "40M10S")]
+        #[case::partly_soft_clipped("45M5S", 5, "40M10S")]
+        #[case::already_soft_clipped("30M20S", 0, "30M20S")]
+        #[case::already_hard_clipped("30M20H", 0, "30M20H")]
+        fn clip_end_of_read_expands_existing_clipping(
+            #[case] cigar: &str,
+            #[case] expected_clipped: usize,
+            #[case] expected_cigar: &str,
+        ) {
+            let mut rec = fragment(10, cigar, Plus);
+            assert_eq!(RawClipperOnBuf::new(Soft).clip_end_of_read(&mut rec, 10), expected_clipped);
+            assert_eq!(cigar_string(&rec), expected_cigar);
+        }
+
+        /// `SamRecordClipperTest.scala:391` "convert soft-clipping to hard clipping or masked
+        /// clipping" (`clipEndOfRead`).
+        #[test]
+        fn clip_end_of_read_converts_soft_clipping_to_hard_or_masked() {
+            let mut hard = fragment_with_az(10, "40M10S", AZ_50);
+            let mut mask = fragment_with_az(10, "40M10S", AZ_50);
+            RawClipperOnBuf::with_auto_clip(Hard, true).clip_end_of_read(&mut hard, 5);
+            RawClipperOnBuf::with_auto_clip(SoftWithMask, true).clip_end_of_read(&mut mask, 5);
+
+            assert_eq!(cigar_string(&hard), "40M5S5H");
+            assert_eq!(bases(&hard).len(), 45);
+            assert_eq!(string_tag(&hard, "az"), "123456789012345678901234567890123456789012345");
+
+            assert_eq!(cigar_string(&mask), "40M10S");
+            assert_eq!(bases(&mask)[45..], *b"NNNNN");
+            assert_eq!(string_tag(&mask, "az"), AZ_50);
+        }
+
+        /// `SamRecordClipperTest.scala:442` "expand existing clipping at the 5' end"
+        /// (`clip5PrimeEndOfRead`): the 5' end is the leading end on `+` and trailing on `-`.
+        #[rstest]
+        #[case::plus_unclipped("50M", Plus, 10, "10S40M")]
+        #[case::plus_already_clipped("10S40M", Plus, 0, "10S40M")]
+        #[case::minus_unclipped("50M", Minus, 10, "40M10S")]
+        #[case::minus_already_clipped("40M10S", Minus, 0, "40M10S")]
+        fn clip_5_prime_end_of_read_expands_existing_clipping(
+            #[case] cigar: &str,
+            #[case] strand: Strand,
+            #[case] expected_clipped: usize,
+            #[case] expected_cigar: &str,
+        ) {
+            let mut rec = fragment(10, cigar, strand);
+            let clipped = RawClipperOnBuf::new(Soft).clip_5_prime_end_of_read(&mut rec, 10);
+            assert_eq!(clipped, expected_clipped);
+            assert_eq!(cigar_string(&rec), expected_cigar);
+        }
+
+        /// `SamRecordClipperTest.scala:460` "convert soft-clipping to hard clipping or masked
+        /// clipping" (`clip5PrimeEndOfRead`).
+        #[test]
+        fn clip_5_prime_end_of_read_converts_soft_clipping_to_hard_or_masked() {
+            let mut hard = fragment_with_az(10, "10S40M", AZ_50);
+            let mut mask = fragment_with_az(10, "10S40M", AZ_50);
+            RawClipperOnBuf::with_auto_clip(Hard, true).clip_5_prime_end_of_read(&mut hard, 5);
+            RawClipperOnBuf::with_auto_clip(SoftWithMask, true)
+                .clip_5_prime_end_of_read(&mut mask, 5);
+
+            assert_eq!(cigar_string(&hard), "5H5S40M");
+            assert_eq!(bases(&hard).len(), 45);
+            assert_eq!(string_tag(&hard, "az"), "678901234567890123456789012345678901234567890");
+
+            assert_eq!(cigar_string(&mask), "10S40M");
+            assert_eq!(bases(&mask)[..5], *b"NNNNN");
+            assert_eq!(string_tag(&mask, "az"), AZ_50);
+        }
+
+        /// `SamRecordClipperTest.scala:475` "expand existing clipping at the 3' end"
+        /// (`clip3PrimeEndOfRead`): the 3' end is the trailing end on `+` and leading on `-`.
+        #[rstest]
+        #[case::minus_unclipped("50M", Minus, 10, "10S40M")]
+        #[case::minus_already_clipped("10S40M", Minus, 0, "10S40M")]
+        #[case::plus_unclipped("50M", Plus, 10, "40M10S")]
+        #[case::plus_already_clipped("40M10S", Plus, 0, "40M10S")]
+        fn clip_3_prime_end_of_read_expands_existing_clipping(
+            #[case] cigar: &str,
+            #[case] strand: Strand,
+            #[case] expected_clipped: usize,
+            #[case] expected_cigar: &str,
+        ) {
+            let mut rec = fragment(10, cigar, strand);
+            let clipped = RawClipperOnBuf::new(Soft).clip_3_prime_end_of_read(&mut rec, 10);
+            assert_eq!(clipped, expected_clipped);
+            assert_eq!(cigar_string(&rec), expected_cigar);
+        }
+
+        /// `SamRecordClipperTest.scala:493` "convert soft-clipping to hard clipping or masked
+        /// clipping" (`clip3PrimeEndOfRead`).
+        #[test]
+        fn clip_3_prime_end_of_read_converts_soft_clipping_to_hard_or_masked() {
+            let mut hard = fragment_with_az(10, "40M10S", AZ_50);
+            let mut mask = fragment_with_az(10, "40M10S", AZ_50);
+            RawClipperOnBuf::with_auto_clip(Hard, true).clip_3_prime_end_of_read(&mut hard, 5);
+            RawClipperOnBuf::with_auto_clip(SoftWithMask, true)
+                .clip_3_prime_end_of_read(&mut mask, 5);
+
+            assert_eq!(cigar_string(&hard), "40M5S5H");
+            assert_eq!(bases(&hard).len(), 45);
+            assert_eq!(string_tag(&hard, "az"), "123456789012345678901234567890123456789012345");
+
+            assert_eq!(cigar_string(&mask), "40M10S");
+            assert_eq!(bases(&mask)[45..], *b"NNNNN");
+            assert_eq!(string_tag(&mask, "az"), AZ_50);
+        }
+
+        // -------------------------------------------------------------- upgradeAllClipping
+
+        /// `SamRecordClipperTest.scala:538` "not convert reads that have no soft-clipping":
+        /// CIGAR, bases and the `az` attribute are all left untouched.
+        #[rstest]
+        #[case::no_clipping("55M")]
+        #[case::hard_clipping_only("5H55M10H")]
+        fn upgrade_all_clipping_leaves_reads_without_soft_clips_unchanged(#[case] cigar: &str) {
+            let mut rec = fragment_with_az(10, cigar, AZ_50);
+            let upgraded = RawClipperOnBuf::new(Hard)
+                .upgrade_all_clipping(&mut rec)
+                .expect("upgrade_all_clipping should succeed");
+            assert_eq!(upgraded, (0, 0));
+            assert_eq!(cigar_string(&rec), cigar);
+            assert_eq!(bases(&rec).len(), 55);
+            assert_eq!(string_tag(&rec, "az"), AZ_50);
+        }
+
+        // ------------------------------------------------------------ clipOverlappingReads
+
+        /// fgbio `clipOverlappingReads` cases, each a `pair(start1, cigar1, Plus, start2,
+        /// cigar2, Minus)`. Expected read/mate tuples are `(start, end, cigar)`; an end of
+        /// `None` means the fgbio test does not assert it.
+        #[rstest]
+        // SamRecordClipperTest.scala:561 "not clip if the reads are not overlapping"
+        #[case::abutting_not_overlapping(Soft, (1, "100M"), (101, "100M"), (0, 0), (1, None, "100M"), (101, None, "100M"))]
+        // SamRecordClipperTest.scala:601 "clip reads that overlap with soft-clipping on the forward read after the midpoint"
+        #[case::forward_soft_clip_after_midpoint(Hard, (1, "95M5S"), (50, "100M"), (20, 26), (1, Some(75), "75M25H"), (76, None, "26H74M"))]
+        // SamRecordClipperTest.scala:611 "clip reads that overlap with soft-clipping on the reverse read before the midpoint"
+        #[case::reverse_soft_clip_before_midpoint(Hard, (1, "100M"), (55, "5S95M"), (25, 21), (1, Some(75), "75M25H"), (76, None, "26H74M"))]
+        // SamRecordClipperTest.scala:621 "clip reads that overlap 1 bp directly in the middle of the pair"
+        #[case::one_bp_overlap_at_midpoint(Hard, (1, "99M1S"), (99, "1S99M"), (0, 1), (1, Some(99), "99M1H"), (100, None, "2H98M"))]
+        // SamRecordClipperTest.scala:633 "clip reads that overlap in the first half of the pair, not over the middle"
+        #[case::overlap_in_first_half(Hard, (1, "95M5S"), (90, "20S80M"), (6, 0), (1, Some(89), "89M11H"), (90, None, "20H80M"))]
+        // SamRecordClipperTest.scala:645 "clip reads that overlap in the second half of the pair, not over the middle"
+        #[case::overlap_in_second_half(Hard, (1, "80M20S"), (70, "5S95M"), (0, 11), (1, Some(80), "80M20H"), (81, None, "16H84M"))]
+        // SamRecordClipperTest.scala:685 "clip reads that overlap with one end having a deletion with mismatching cigars"
+        #[case::one_end_deletion_mismatching_cigars(Soft, (1, "100M"), (50, "10M10D80M10D10M"), (15, 26), (1, Some(85), "85M15S"), (86, None, "26S64M10D10M"))]
+        // SamRecordClipperTest.scala:695 "clip reads that fully overlap with both ends having deletions"
+        #[case::full_overlap_both_deletions(Soft, (1, "50M10D50M"), (1, "50M10D50M"), (50, 50), (1, Some(50), "50M50S"), (61, None, "50S50M"))]
+        // SamRecordClipperTest.scala:738 "clip reads that extend past each other with one read having deletions"
+        #[case::extend_past_one_read_deletions(Soft, (50, "100M"), (1, "10M10D80M10D10M"), (64, 75), (50, Some(85), "36M64S"), (86, Some(120), "75S15M10D10M"))]
+        // SamRecordClipperTest.scala:750 "clip reads that extend past each other with both read having deletions"
+        #[case::extend_past_both_reads_deletions(Soft, (50, "50M10D50M"), (1, "10M10D80M10D10M"), (64, 75), (50, Some(85), "36M64S"), (86, Some(120), "75S15M10D10M"))]
+        fn clip_overlapping_reads_matches_fgbio(
+            #[case] mode: ClippingMode,
+            #[case] read: (usize, &str),
+            #[case] mate: (usize, &str),
+            #[case] expected_clipped: (usize, usize),
+            #[case] expected_read: (usize, Option<usize>, &str),
+            #[case] expected_mate: (usize, Option<usize>, &str),
+        ) {
+            let (mut rec, mut mate_rec) = fr_pair((read.1, read.0, Plus), (mate.1, mate.0, Minus));
+            let clipped =
+                RawClipperOnBuf::new(mode).clip_overlapping_reads(&mut rec, &mut mate_rec);
+            assert_eq!(clipped, expected_clipped);
+            for (label, actual, (start, end, cigar)) in
+                [("read", &rec, expected_read), ("mate", &mate_rec, expected_mate)]
+            {
+                assert_eq!(alignment_start(actual), Some(start), "{label} start");
+                assert_eq!(cigar_string(actual), cigar, "{label} cigar");
+                if let Some(end) = end {
+                    assert_eq!(alignment_end(actual), Some(end), "{label} end");
+                }
+            }
+        }
+
+        // ------------------------------------------------------- clipExtendingPastMateEnds
+
+        /// `SamRecordClipperTest.scala:771` "not clip reads that do not extend past each other",
+        /// run for both strand orders as fgbio does.
+        #[rstest]
+        #[case::plus_minus(Plus, Minus)]
+        #[case::minus_plus(Minus, Plus)]
+        fn clip_extending_past_mate_ends_does_not_clip_coincident_reads(
+            #[case] read_strand: Strand,
+            #[case] mate_strand: Strand,
+        ) {
+            let (mut rec, mut mate) = fr_pair(("100M", 1, read_strand), ("100M", 1, mate_strand));
+            let clipped =
+                RawClipperOnBuf::new(Soft).clip_extending_past_mate_ends(&mut rec, &mut mate);
+            assert_eq!(clipped, (0, 0));
+            assert_eq!((alignment_start(&rec), cigar_string(&rec)), (Some(1), "100M".to_string()));
+            assert_eq!(
+                (alignment_start(&mate), cigar_string(&mate)),
+                (Some(1), "100M".to_string())
+            );
+        }
+
+        /// fgbio `clipExtendingPastMateEnds` cases, each a `pair(start1, cigar1, Plus, start2,
+        /// cigar2, Minus)`. Expected read/mate tuples are `(start, cigar)`.
+        #[rstest]
+        // SamRecordClipperTest.scala:782 "clip reads that extend one base past their mate's start"
+        #[case::extend_one_base(Soft, (2, "100M"), (1, "100M"), (1, 1), (2, "99M1S"), (2, "1S99M"))]
+        // SamRecordClipperTest.scala:791 "clip reads that extend two bases past their mate's start"
+        #[case::extend_two_bases(Soft, (3, "100M"), (1, "100M"), (2, 2), (3, "98M2S"), (3, "2S98M"))]
+        // SamRecordClipperTest.scala:800 "clip reads that where both ends extends their mate's start"
+        #[case::both_ends_extend(Soft, (51, "100M"), (1, "100M"), (50, 50), (51, "50M50S"), (51, "50S50M"))]
+        // SamRecordClipperTest.scala:809 "clip reads that where only one end extends their mate's start"
+        #[case::only_one_end_extends(Soft, (1, "100M"), (1, "50S50M"), (50, 0), (1, "50M50S"), (1, "50S50M"))]
+        // SamRecordClipperTest.scala:818 "clip reads where only one end extends their mate's start that has insertions"
+        #[case::only_one_end_extends_with_insertion(Soft, (1, "40M10I50M"), (1, "50S50M"), (40, 0), (1, "40M10I10M40S"), (1, "50S50M"))]
+        // SamRecordClipperTest.scala:827 "clip the forward read when it ends before the mate's start but soft-clipped bases extend past"
+        #[case::soft_clip_extends_past(Hard, (20, "30M20S"), (20, "10S40M"), (0, 0), (20, "30M10S10H"), (20, "10H40M"))]
+        // SamRecordClipperTest.scala:836 "... soft-clipped bases extend past while there is a deletion"
+        #[case::soft_clip_extends_past_with_deletion(Hard, (20, "15M1D15M20S"), (20, "10S15M1D25M"), (0, 0), (20, "15M1D15M10S10H"), (20, "10H15M1D25M"))]
+        // SamRecordClipperTest.scala:845 "... soft-clipped bases extend past while there is an insertion"
+        #[case::soft_clip_extends_past_with_insertion(Hard, (20, "15M1I15M20S"), (20, "10S15M1I25M"), (0, 0), (20, "15M1I15M10S10H"), (20, "10H15M1I25M"))]
+        // SamRecordClipperTest.scala:854 "clip the reverse read when it ends before the mate's start but soft-clipped bases extend past"
+        #[case::reverse_soft_clip_extends_past(Hard, (20, "40M10S"), (30, "20S30M"), (0, 0), (20, "40M10H"), (30, "10H10S30M"))]
+        // SamRecordClipperTest.scala:863 "not clip when the read pairs are mapped +/- with start(R1) > end(R2) but do not overlap"
+        #[case::disjoint_outward_facing(Soft, (1000, "100M"), (1, "100M"), (0, 0), (1000, "100M"), (1, "100M"))]
+        // SamRecordClipperTest.scala:872 "not clip when the reads do not extend past each other with insertions"
+        #[case::coincident_with_insertions(Soft, (1, "40M20I40M"), (1, "40M20I40M"), (0, 0), (1, "40M20I40M"), (1, "40M20I40M"))]
+        fn clip_extending_past_mate_ends_matches_fgbio(
+            #[case] mode: ClippingMode,
+            #[case] read: (usize, &str),
+            #[case] mate: (usize, &str),
+            #[case] expected_clipped: (usize, usize),
+            #[case] expected_read: (usize, &str),
+            #[case] expected_mate: (usize, &str),
+        ) {
+            let (mut rec, mut mate_rec) = fr_pair((read.1, read.0, Plus), (mate.1, mate.0, Minus));
+            let clipped =
+                RawClipperOnBuf::new(mode).clip_extending_past_mate_ends(&mut rec, &mut mate_rec);
+            assert_eq!(clipped, expected_clipped);
+            assert_eq!(
+                (alignment_start(&rec), cigar_string(&rec)),
+                (Some(expected_read.0), expected_read.1.to_string()),
+                "read (start, cigar)"
+            );
+            assert_eq!(
+                (alignment_start(&mate_rec), cigar_string(&mate_rec)),
+                (Some(expected_mate.0), expected_mate.1.to_string()),
+                "mate (start, cigar)"
+            );
+        }
+
+        // ------------------------------------------------------- numBasesExtendingPastMate
+
+        /// fgbio's `numBasesExtendingPastMate` reads the mate's unclipped start/end from the
+        /// `MC` tag; fgumi's equivalent is the MC-based
+        /// [`fgumi_raw_bam::num_bases_extending_past_mate_raw`].
+        fn num_bases_extending_past_mate(rec: &RecordBuf) -> usize {
+            fgumi_raw_bam::num_bases_extending_past_mate_raw(to_raw(rec).as_ref())
+        }
+
+        /// `SamRecordClipperTest.scala:881` "return zero when reads do not extend past the end
+        /// or are not FR pairs". Each case is `(start, cigar, strand)` for read one and two.
+        #[rstest]
+        #[case::fr_r1_more_soft_clipped((100, "20S80M", Plus), (200, "10S90M", Minus))]
+        #[case::fr_r2_more_soft_clipped((100, "10S90M", Plus), (200, "20S80M", Minus))]
+        #[case::forward_forward((100, "10S90M", Plus), (100, "20S80M", Plus))]
+        #[case::reverse_reverse((100, "10S90M", Minus), (100, "20S80M", Minus))]
+        fn num_bases_extending_past_mate_is_zero_when_not_extending_or_not_fr(
+            #[case] read_one: (usize, &str, Strand),
+            #[case] read_two: (usize, &str, Strand),
+        ) {
+            let (r1, r2) =
+                fr_pair((read_one.1, read_one.0, read_one.2), (read_two.1, read_two.0, read_two.2));
+            assert_eq!(num_bases_extending_past_mate(&r1), 0, "read one");
+            assert_eq!(num_bases_extending_past_mate(&r2), 0, "read two");
+        }
+
+        /// `SamRecordClipperTest.scala:904` "return a return a positive value when reads extend
+        /// past its mate". Each case is an FR pair `(start, cigar)` for read one (`+`) and read
+        /// two (`-`), with the expected count for each read.
+        #[rstest]
+        #[case::both_extend_fifty((100, "100M"), (50, "100M"), (50, 50))]
+        #[case::same_unclipped_ends((100, "50S50M"), (100, "50S50M"), (0, 0))]
+        #[case::same_aligned_ends((100, "50M50S"), (100, "50M50S"), (0, 0))]
+        #[case::read_one_inside_read_two((100, "50S50M"), (100, "30S70M"), (0, 0))]
+        #[case::read_one_past_read_two((100, "30S70M"), (100, "50S50M"), (20, 20))]
+        fn num_bases_extending_past_mate_counts_bases_past_the_mate(
+            #[case] read_one: (usize, &str),
+            #[case] read_two: (usize, &str),
+            #[case] expected: (usize, usize),
+        ) {
+            let (r1, r2) = fr_pair((read_one.1, read_one.0, Plus), (read_two.1, read_two.0, Minus));
+            assert_eq!(
+                (num_bases_extending_past_mate(&r1), num_bases_extending_past_mate(&r2)),
+                expected
+            );
+        }
     }
 }
 
