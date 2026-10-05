@@ -31,6 +31,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use fgumi_cli_macros::multi_options;
+use fgumi_consensus::MethylationMode;
 
 // ============================================================================
 // AlignerProcess
@@ -128,15 +129,16 @@ impl AlignerProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // bwa-mem3 links mimalloc, whose default purge decommits freed pages
-        // after 1 s and costs the aligner page faults on every batch: never
-        // purging measured -0.5% wall on the bwa-mem3 CLI alone. A user-set
-        // value (either name, any case) is inherited unchanged; aligners
-        // without mimalloc ignore the variable. The variable reaches every
-        // process in the shell command, so with `--aligner::command` any
-        // mimalloc-linked tool in the user's pipeline also keeps its freed
-        // pages (higher RSS); set `MIMALLOC_PURGE_DELAY` to opt out.
+        // after 1 s and costs the aligner page faults on every batch, so the
+        // child gets the same bounded delay as fgumi itself
+        // (`fgumi_sort::RETAINED_PURGE_DELAY_MS`). A user-set value (either
+        // name, any case) is inherited unchanged; aligners without mimalloc
+        // ignore the variable. The variable reaches every process in the shell
+        // command, so with `--aligner::command` any mimalloc-linked tool in the
+        // user's pipeline also delays returning freed pages; set
+        // `MIMALLOC_PURGE_DELAY` to choose otherwise.
         if !user_set_mimalloc_purge() {
-            cmd.env("MIMALLOC_PURGE_DELAY", "-1");
+            cmd.env("MIMALLOC_PURGE_DELAY", fgumi_sort::RETAINED_PURGE_DELAY_MS.to_string());
         }
         let mut child =
             cmd.spawn().with_context(|| format!("failed to spawn aligner command: {command}"))?;
@@ -421,10 +423,11 @@ fn relay_stderr(stderr: impl std::io::Read, ring_size: usize) -> Vec<String> {
 /// Three presets at landing — `bwa-mem3` (the project's primary
 /// subprocess aligner), `bwa` (legacy reference), and `bwa-mem3-inproc`
 /// (bwa-mem3 linked directly into fgumi, gated by the `aligner-bwa-mem3`
-/// build feature; see `AlignerOptions::resolve`). Methylation-aware
-/// presets (e.g. `bwameth`, `bwa-mem3 mem --meth`) are a
-/// follow-up; EM-seq users today route through `--aligner::command "..."`
-/// (free-form mode) instead of a preset.
+/// build feature; see `AlignerOptions::resolve`). Under runall's
+/// `--methylation-mode em-seq`, both bwa-mem3 presets align bisulfite-aware
+/// with `bwa-mem3 mem --meth` (see [`AlignerPreset::validate_methylation`]);
+/// other bisulfite aligners (e.g. bwameth) go through `--aligner::command`.
+/// TAPS reads align with the plain presets.
 ///
 /// The CLI value for each subprocess variant matches the on-disk binary
 /// name (`bwa`, `bwa-mem3`). Variant identifiers (`Bwa`, `BwaMem3`) are
@@ -539,6 +542,10 @@ impl AlignerPreset {
     ///   When `Some`, replaces the preset's default binary name; when
     ///   `None`, the bare binary name is used and the shell resolves it
     ///   via `PATH`.
+    /// * `methylation` - The chemistry from `--methylation-mode`. EM-seq adds
+    ///   bwa-mem3's `--meth` (see [`bwa_mem3_meth_flag`]), so it must not reach
+    ///   `bwa`, which has no bisulfite mode ([`Self::validate_methylation`]
+    ///   rejects that combination first).
     // `pub(crate)`, not `pub`: this interpolates `reference` / `binary_override`
     // into a string later run via `/bin/bash -c`, and it does not itself validate
     // those paths — it trusts that `validate` (which runs `check_shell_safe_path`)
@@ -551,6 +558,7 @@ impl AlignerPreset {
         threads: usize,
         chunk_size: u64,
         binary_override: Option<&Path>,
+        methylation: MethylationMode,
     ) -> String {
         let binary = match binary_override {
             Some(path) => path.display().to_string(),
@@ -561,7 +569,9 @@ impl AlignerPreset {
             Self::BwaMem3 | Self::BwaMem3InProc => " --bam=0",
             Self::Bwa => "",
         };
-        format!("{binary} mem{output} -p -K {chunk_size} -t {threads} {ref_str} /dev/stdin")
+        let meth =
+            bwa_mem3_meth_flag(methylation).map(|flag| format!(" {flag}")).unwrap_or_default();
+        format!("{binary} mem{output}{meth} -p -K {chunk_size} -t {threads} {ref_str} /dev/stdin")
     }
 
     /// Validate that the aligner binary and required index files are present.
@@ -674,6 +684,76 @@ impl AlignerPreset {
         }
 
         Ok(())
+    }
+
+    /// Validate that this preset can align for `methylation` (`--methylation-mode`).
+    ///
+    /// EM-seq reads must be aligned conversion-aware: every unmethylated C reads
+    /// as T, so a plain aligner scores most cytosines as mismatches, heavily
+    /// converted reads map worse, and the methylation calls are biased.
+    /// bwa-mem3's `--meth` aligns them against a dual index built by
+    /// `bwa-mem3 index --meth` — the converted seed index `<ref>.meth.*` beside
+    /// the original `<ref>.*` — so this checks for the `.meth` files on top of
+    /// [`Self::validate`]'s, and rejects `bwa`, which has no bisulfite mode.
+    ///
+    /// A no-op for [`MethylationMode::Disabled`] and [`MethylationMode::Taps`]:
+    /// TAPS converts only the (rare) methylated cytosines, so its reads align
+    /// with a standard aligner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, under EM-seq, if the preset is `bwa` or a `.meth`
+    /// index file is missing.
+    pub fn validate_methylation(
+        self,
+        reference: &Path,
+        methylation: MethylationMode,
+    ) -> Result<()> {
+        if bwa_mem3_meth_flag(methylation).is_none() {
+            return Ok(());
+        }
+        if self == Self::Bwa {
+            bail!(
+                "--methylation-mode em-seq needs a bisulfite-aware aligner, and `bwa` has \
+                 none; use --aligner::preset bwa-mem3 or bwa-mem3-inproc (which align with \
+                 bwa-mem3's --meth), or --aligner::command"
+            );
+        }
+        let seed_prefix = append_extension(reference, BWA_MEM3_METH_INDEX_SUFFIX);
+        for ext in self.index_extensions() {
+            let index_path = append_extension(&seed_prefix, ext);
+            if !index_path.is_file() {
+                bail!(
+                    "required bisulfite index file not found: {} (--methylation-mode em-seq \
+                     aligns with bwa-mem3 --meth, which needs the dual index; run `{} index \
+                     --meth {}`)",
+                    index_path.display(),
+                    self.index_binary_hint(),
+                    reference.display()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The suffix bwa-mem3 appends to the reference for the converted seed index
+/// of a `bwa-mem3 index --meth` dual index (`<ref>.meth.bwt.2bit.64`, ...).
+pub(crate) const BWA_MEM3_METH_INDEX_SUFFIX: &str = ".meth";
+
+/// bwa-mem3's `mem` flag for `methylation`: `--meth` (bisulfite-aware
+/// alignment, EM-seq chemistry) for EM-seq, `None` otherwise. This is the one
+/// place that decides whether a chemistry aligns bisulfite-aware; the index
+/// check, the in-process options and the `@PG` record all follow it.
+///
+/// TAPS gets `None`: it converts only methylated cytosines, a few percent of
+/// them, so its reads look like the reference and align best with a standard
+/// aligner, as the methylation guide recommends.
+#[must_use]
+pub(crate) fn bwa_mem3_meth_flag(methylation: MethylationMode) -> Option<&'static str> {
+    match methylation {
+        MethylationMode::EmSeq => Some("--meth"),
+        MethylationMode::Disabled | MethylationMode::Taps => None,
     }
 }
 
@@ -844,6 +924,13 @@ pub struct AlignerOptions {
     /// bwa-mem3-inproc`. [default: on]
     #[arg(long = "dedup-reads", value_enum)]
     pub dedup_reads: Option<DedupReads>,
+
+    /// The chemistry to align for. `#[arg(skip)]`: it is runall's top-level
+    /// `--methylation-mode`, which runall copies here so the align stage and
+    /// the consensus callers it feeds agree. Under EM-seq a preset aligns with
+    /// bwa-mem3's `--meth`; TAPS aligns plain.
+    #[arg(skip)]
+    pub methylation_mode: MethylationMode,
 }
 
 /// Hand-rolled `Default` impl. **Must** match each field's clap
@@ -863,6 +950,7 @@ impl Default for AlignerOptions {
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
             sub_batch_templates: None,
             dedup_reads: None,
+            methylation_mode: MethylationMode::Disabled,
         }
     }
 }
@@ -901,6 +989,9 @@ pub(crate) enum ResolvedBackend {
         sub_batch_templates: usize,
         /// `--aligner::dedup-reads` resolved (`on` unless set to `off`).
         dedup_reads: bool,
+        /// The bisulfite chemistry to align for (`--methylation-mode`), or
+        /// [`MethylationMode::Disabled`].
+        methylation: MethylationMode,
     },
 }
 
@@ -990,6 +1081,10 @@ impl AlignerOptions {
     ///   `aligner-bwa-mem3` feature.
     /// - Preset-mode index files / binary missing (delegated to
     ///   [`AlignerPreset::validate`]).
+    /// - `methylation_mode` EM-seq with the `bwa` preset, or with a bwa-mem3
+    ///   preset whose `bwa-mem3 index --meth` files are missing (delegated to
+    ///   [`AlignerPreset::validate_methylation`]). Command mode is not checked:
+    ///   the command picks its own (bisulfite-aware) aligner and flags.
     pub(crate) fn resolve(
         self,
         reference: &Path,
@@ -1061,10 +1156,12 @@ impl AlignerOptions {
                 self.sub_batch_templates,
                 self.dedup_reads,
                 self.chunk_size,
+                self.methylation_mode,
             ),
             (Some(preset), None) => {
                 // Preset mode: validate indexes + binary, build argv.
                 preset.validate(reference, aligner_bin)?;
+                preset.validate_methylation(reference, self.methylation_mode)?;
                 // An explicit `--aligner::threads 0` would reach the aligner as
                 // `-t 0`. `None` means "default to runall's --threads" (not
                 // zero), so only reject an explicit zero.
@@ -1072,8 +1169,13 @@ impl AlignerOptions {
                     bail!("--aligner::threads must be greater than 0 (got 0)");
                 }
                 let threads = self.threads.unwrap_or(top_threads);
-                let command =
-                    preset.build_command(reference, threads, self.chunk_size, aligner_bin);
+                let command = preset.build_command(
+                    reference,
+                    threads,
+                    self.chunk_size,
+                    aligner_bin,
+                    self.methylation_mode,
+                );
                 Ok(ResolvedAligner {
                     // Both subprocess presets run `mem -p -K`, whose smart
                     // pairing splits a pair across a chunk cut (bwa and
@@ -1150,6 +1252,7 @@ fn resolve_inproc(
     sub_batch_templates: Option<usize>,
     dedup_reads: Option<DedupReads>,
     chunk_size: u64,
+    methylation: MethylationMode,
 ) -> Result<ResolvedAligner> {
     if threads.is_some() {
         bail!(
@@ -1188,12 +1291,14 @@ fn resolve_inproc(
         // Binary discovery is skipped for this preset (`requires_binary()`
         // is false); index files are still required.
         AlignerPreset::BwaMem3InProc.validate(reference, None)?;
+        AlignerPreset::BwaMem3InProc.validate_methylation(reference, methylation)?;
         let sub_batch_templates = sub_batch_templates.unwrap_or_else(default_sub_batch_templates);
         Ok(ResolvedAligner {
             backend: ResolvedBackend::InProcessBwaMem3 {
                 reference: reference.to_path_buf(),
                 sub_batch_templates,
                 dedup_reads: dedup_reads != Some(DedupReads::Off),
+                methylation,
             },
             chunk_size,
             threads: None,
@@ -1350,6 +1455,25 @@ mod tests {
         proc.wait().expect("process should exit successfully");
     }
 
+    /// The aligner child inherits fgumi's bounded mimalloc purge delay, not
+    /// mimalloc's 1 s default and not a never-purge `-1`. Skipped when the
+    /// environment already sets the delay, which the child then inherits as is.
+    #[test]
+    fn test_spawn_passes_bounded_purge_delay_to_child() {
+        if user_set_mimalloc_purge() {
+            return;
+        }
+        let mut proc = AlignerProcess::spawn("printf %s \"${MIMALLOC_PURGE_DELAY-unset}\"", 10)
+            .expect("spawn should succeed");
+        let mut stdout = proc.take_stdout().expect("stdout should be available");
+
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).expect("should read stdout");
+        assert_eq!(output, fgumi_sort::RETAINED_PURGE_DELAY_MS.to_string());
+
+        proc.wait().expect("process should exit successfully");
+    }
+
     /// Spawn a command that writes to both stdout and stderr; verify the stderr
     /// relay does not corrupt or interleave into stdout. The stderr ring itself
     /// is pinned by `test_nonzero_exit_surfaces_stderr`, since `wait()` discards
@@ -1449,7 +1573,8 @@ mod tests {
         #[case] expected: &str,
     ) {
         let reference = Path::new("/ref/genome.fa");
-        let cmd = preset.build_command(reference, threads, chunk_size, None);
+        let cmd =
+            preset.build_command(reference, threads, chunk_size, None, MethylationMode::Disabled);
         assert_eq!(cmd, expected);
     }
 
@@ -1458,8 +1583,13 @@ mod tests {
     fn test_build_command_with_binary_override() {
         let reference = Path::new("/data/hg38.fa");
         let override_path = PathBuf::from("/opt/bwa-mem3-2.2.1/bwa-mem3");
-        let cmd =
-            AlignerPreset::BwaMem3.build_command(reference, 16, 100_000, Some(&override_path));
+        let cmd = AlignerPreset::BwaMem3.build_command(
+            reference,
+            16,
+            100_000,
+            Some(&override_path),
+            MethylationMode::Disabled,
+        );
         assert!(cmd.contains("/opt/bwa-mem3-2.2.1/bwa-mem3"), "override binary not in cmd: {cmd}");
         assert!(!cmd.starts_with("bwa-mem3 "), "bare name should not appear: {cmd}");
     }
@@ -1535,6 +1665,7 @@ mod tests {
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
             sub_batch_templates: None,
             dedup_reads: None,
+            methylation_mode: MethylationMode::Disabled,
         };
         let resolved = opts.resolve(&ref_path, 4, None).unwrap();
         let ResolvedBackend::Subprocess { command, .. } = resolved.backend else {
@@ -1560,6 +1691,7 @@ mod tests {
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
             sub_batch_templates: None,
             dedup_reads: None,
+            methylation_mode: MethylationMode::Disabled,
         };
         let err = opts.resolve(&ref_path, 4, Some(&bin)).unwrap_err();
         let msg = err.to_string();
@@ -2061,6 +2193,7 @@ mod tests {
             chunk_size: 0,
             sub_batch_templates: None,
             dedup_reads: None,
+            methylation_mode: MethylationMode::Disabled,
         };
         let err = opts.resolve(&ref_path, 4, None).unwrap_err();
         assert!(err.to_string().contains("--aligner::chunk-size must be greater than 0"));
@@ -2086,6 +2219,7 @@ mod tests {
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
             sub_batch_templates: None,
             dedup_reads: None,
+            methylation_mode: MethylationMode::Disabled,
         };
         let err = opts.resolve(&ref_path, 4, Some(&bin)).unwrap_err();
         assert!(err.to_string().contains("--aligner::threads must be greater than 0"));
@@ -2145,5 +2279,149 @@ mod tests {
         let data = b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n".to_vec();
         let ring = relay_stderr(std::io::Cursor::new(data), 3);
         assert_eq!(ring, vec!["l8".to_string(), "l9".to_string(), "l10".to_string()]);
+    }
+
+    // ------------------------------------------------------------------
+    // --methylation-mode (bisulfite-aware alignment)
+    // ------------------------------------------------------------------
+
+    /// A reference whose plain bwa-mem3 index files exist, plus the
+    /// `bwa-mem3 index --meth` files when `with_meth_index`.
+    fn reference_with_index(dir: &Path, with_meth_index: bool) -> PathBuf {
+        let ref_path = dir.join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        let seed = append_extension(&ref_path, BWA_MEM3_METH_INDEX_SUFFIX);
+        for ext in AlignerPreset::BwaMem3.index_extensions() {
+            std::fs::write(append_extension(&ref_path, ext), b"x").unwrap();
+            if with_meth_index {
+                std::fs::write(append_extension(&seed, ext), b"x").unwrap();
+            }
+        }
+        ref_path
+    }
+
+    #[rstest]
+    #[case::disabled(MethylationMode::Disabled, "bwa-mem3 mem --bam=0 -p -K 1000")]
+    #[case::emseq(MethylationMode::EmSeq, "bwa-mem3 mem --bam=0 --meth -p -K 1000")]
+    #[case::taps_aligns_plain(MethylationMode::Taps, "bwa-mem3 mem --bam=0 -p -K 1000")]
+    fn build_command_adds_meth_for_emseq_only(
+        #[case] methylation: MethylationMode,
+        #[case] expected_prefix: &str,
+    ) {
+        let cmd = AlignerPreset::BwaMem3.build_command(
+            Path::new("/refs/ref.fa"),
+            4,
+            1000,
+            None,
+            methylation,
+        );
+        assert!(cmd.starts_with(expected_prefix), "got: {cmd}");
+    }
+
+    /// Only EM-seq aligns bisulfite-aware, so disabled and TAPS need neither a
+    /// `.meth` index nor a bwa-mem3 preset.
+    #[rstest]
+    fn validate_methylation_is_a_no_op_unless_emseq(
+        #[values(AlignerPreset::Bwa, AlignerPreset::BwaMem3, AlignerPreset::BwaMem3InProc)]
+        preset: AlignerPreset,
+        #[values(MethylationMode::Disabled, MethylationMode::Taps)] methylation: MethylationMode,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = reference_with_index(tmp.path(), false);
+        preset.validate_methylation(&ref_path, methylation).unwrap();
+    }
+
+    #[test]
+    fn validate_methylation_rejects_bwa() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = reference_with_index(tmp.path(), true);
+        let err = AlignerPreset::Bwa
+            .validate_methylation(&ref_path, MethylationMode::EmSeq)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`bwa` has none"), "got: {err}");
+    }
+
+    #[rstest]
+    #[case::subprocess(AlignerPreset::BwaMem3)]
+    #[case::inproc(AlignerPreset::BwaMem3InProc)]
+    fn validate_methylation_requires_the_meth_dual_index(#[case] preset: AlignerPreset) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = reference_with_index(tmp.path(), false);
+        let err =
+            preset.validate_methylation(&ref_path, MethylationMode::EmSeq).unwrap_err().to_string();
+        assert!(err.contains("ref.fa.meth."), "names the missing .meth file; got: {err}");
+        assert!(err.contains("bwa-mem3 index --meth"), "gives the fix; got: {err}");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = reference_with_index(tmp.path(), true);
+        preset.validate_methylation(&ref_path, MethylationMode::EmSeq).unwrap();
+    }
+
+    /// The subprocess preset carries `--methylation-mode` into its command:
+    /// `--meth` for EM-seq, nothing for TAPS (which also needs no `.meth`
+    /// index).
+    #[rstest]
+    #[case::emseq(MethylationMode::EmSeq, true, true)]
+    #[case::taps(MethylationMode::Taps, false, false)]
+    fn resolve_preset_aligns_bisulfite_aware_for_emseq_only(
+        #[case] methylation: MethylationMode,
+        #[case] with_meth_index: bool,
+        #[case] expect_meth: bool,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = reference_with_index(tmp.path(), with_meth_index);
+        let bin = make_existing_binary(tmp.path());
+        let opts = AlignerOptions {
+            preset: Some(AlignerPreset::BwaMem3),
+            methylation_mode: methylation,
+            ..AlignerOptions::default()
+        };
+        let resolved = opts.resolve(&ref_path, 4, Some(&bin)).unwrap();
+        let ResolvedBackend::Subprocess { command, .. } = resolved.backend else {
+            panic!("the bwa-mem3 preset resolves to a subprocess");
+        };
+        assert_eq!(command.contains(" --meth"), expect_meth, "got: {command}");
+    }
+
+    /// `bwa` cannot align bisulfite reads, so `--methylation-mode em-seq` rejects it at
+    /// resolve time rather than emitting an unconverted alignment.
+    #[test]
+    fn resolve_rejects_bwa_under_methylation_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        for ext in AlignerPreset::Bwa.index_extensions() {
+            std::fs::write(append_extension(&ref_path, ext), b"x").unwrap();
+        }
+        let bin = make_existing_binary(tmp.path());
+        let opts = AlignerOptions {
+            preset: Some(AlignerPreset::Bwa),
+            methylation_mode: MethylationMode::EmSeq,
+            ..AlignerOptions::default()
+        };
+        let err = opts.resolve(&ref_path, 4, Some(&bin)).unwrap_err().to_string();
+        assert!(err.contains("`bwa` has none"), "got: {err}");
+    }
+
+    #[test]
+    #[cfg(feature = "aligner-bwa-mem3")]
+    fn resolve_inproc_carries_methylation_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = reference_with_index(tmp.path(), true);
+        let opts = AlignerOptions {
+            preset: Some(AlignerPreset::BwaMem3InProc),
+            methylation_mode: MethylationMode::EmSeq,
+            ..AlignerOptions::default()
+        };
+        let resolved = opts.resolve(&ref_path, 4, None).unwrap();
+        assert!(
+            matches!(
+                resolved.backend,
+                ResolvedBackend::InProcessBwaMem3 { methylation: MethylationMode::EmSeq, .. }
+            ),
+            "got: {:?}",
+            resolved.backend
+        );
     }
 }

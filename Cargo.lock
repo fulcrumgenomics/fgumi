@@ -283,9 +283,9 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bwa-mem3-rs"
-version = "0.3.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c45749eab02a16565bada4cbee974dd8443d876570a0dcc85df5c51aefbb008c"
+checksum = "2d0ebdc6227f567f255a9eb55f8c011c76977ed4a2f53589ab10e01b57a4d6a5"
 dependencies = [
  "bwa-mem3-sys",
  "libc",
@@ -294,9 +294,9 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-sys"
-version = "0.3.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa7059c19781ed81763e800137b4eac0a403db0a1f903349e543fc36b7578bf0"
+checksum = "67332fa4329765478d8971c2c6c5087583283ded4c28f27e46ecc669642fb8e9"
 dependencies = [
  "cc",
  "libc",
@@ -2635,7 +2635,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys",

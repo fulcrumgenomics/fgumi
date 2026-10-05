@@ -104,7 +104,7 @@ pub use memory_probe::process_rss_bytes;
 /// Tune mimalloc to keep freed pages instead of returning them to the OS, and
 /// read the setting back. Re-exported for the in-process aligner, which frees
 /// and reallocates large per-batch buffers on every pool thread.
-pub use memory_probe::{mi_purge_delay_ms, retain_freed_memory};
+pub use memory_probe::{RETAINED_PURGE_DELAY_MS, mi_purge_delay_ms, retain_freed_memory};
 /// Background read-ahead record reader, re-exported for `fgumi compare bams`,
 /// which reads two inputs concurrently and needs each decode off the main thread.
 pub use read_ahead::RawReadAheadReader;
