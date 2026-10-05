@@ -370,12 +370,15 @@ impl RawRecordClipper {
             }
             ClippingMode::Hard => {
                 if bases_to_remove > 0 {
+                    // Clamp to the stored SEQ, as the end-of-alignment sibling does, so a SEQ
+                    // shorter than the CIGAR's query length cannot be sliced past its end.
                     let seq = record.sequence_vec();
                     let qual = record.quality_scores().to_vec();
-                    let new_seq = seq[bases_to_remove..].to_vec();
-                    let new_qual = qual[bases_to_remove..].to_vec();
+                    let removed = bases_to_remove.min(seq.len());
+                    let new_seq = seq[removed..].to_vec();
+                    let new_qual = qual[removed..].to_vec();
                     record.set_sequence_and_qualities(&new_seq, &new_qual);
-                    self.clip_extended_attributes_raw(record, bases_to_remove, true);
+                    self.clip_extended_attributes_raw(record, removed, true);
                 }
             }
         }
@@ -626,8 +629,8 @@ impl RawRecordClipper {
         }
 
         // Normalize by strand so the positive-strand read is treated as r1 and the
-        // negative-strand read as r2 (see the typed `clip_overlapping_reads` for the
-        // rationale; mirrors fgbio `SamRecordClipper.clipOverlappingReads:305`).
+        // negative-strand read as r2, so the clip lands on each read's mate-facing 3' end
+        // regardless of argument order (mirrors fgbio `SamRecordClipper.clipOverlappingReads:305`).
         let swapped = r1.flags() & fgumi_raw_bam::flags::REVERSE != 0;
         let (r1, r2) = if swapped { (r2, r1) } else { (r1, r2) };
 
@@ -674,18 +677,14 @@ impl RawRecordClipper {
             0
         };
 
-        let clipped_r1 =
-            if r1_bases_to_clip > 0 { self.clip_end_of_alignment(r1, r1_bases_to_clip) } else { 0 };
-        let clipped_r2 = if r2_bases_to_clip > 0 {
-            self.clip_start_of_alignment(r2, r2_bases_to_clip)
-        } else {
-            0
-        };
-
-        if matches!(self.mode, ClippingMode::Hard) {
-            let _ = self.upgrade_all_clipping_raw(r1);
-            let _ = self.upgrade_all_clipping_raw(r2);
-        }
+        // Clip each read's mate-facing 3' end to its existing clipping plus the overlap, as fgbio
+        // does via `clip3PrimeEndOfRead` (SamRecordClipper.scala:321-322). When a read has no
+        // overlap bases to clip, this still upgrades (hard mode) or masks (soft-with-mask mode)
+        // the existing soft clip at that end; the soft clip at the far 5' end is left untouched.
+        let r1_existing = Self::clipping_at_end_raw(&r1_ops, false);
+        let r2_existing = Self::clipping_at_end_raw(&r2_ops, true);
+        let clipped_r1 = self.clip_end_of_read_raw(r1, r1_existing + r1_bases_to_clip);
+        let clipped_r2 = self.clip_start_of_read_raw(r2, r2_existing + r2_bases_to_clip);
 
         // Map clip counts back to the caller's original (r1, r2) argument order.
         if swapped { (clipped_r2, clipped_r1) } else { (clipped_r1, clipped_r2) }
@@ -732,6 +731,24 @@ impl RawRecordClipper {
         }
     }
 
+    /// Total existing clipping (soft and hard) at the start or end of a raw CIGAR.
+    fn clipping_at_end_raw(ops: &[u32], from_start: bool) -> usize {
+        let is_clip = |op: &&u32| matches!(**op & 0xF, 4 | 5);
+        let len = |op: &u32| (op >> 4) as usize;
+        if from_start {
+            ops.iter().take_while(is_clip).map(len).sum()
+        } else {
+            ops.iter().rev().take_while(is_clip).map(len).sum()
+        }
+    }
+
+    /// True for a mapped record whose SEQ is `*` (`l_seq` 0). `clip_{start,end}_of_alignment`
+    /// leave such a record unchanged, so the read-end helpers fall back to upgrading the existing
+    /// clipping at that end rather than leaving its soft clip in place.
+    fn lacks_seq_raw(record: &fgumi_raw_bam::RawRecord) -> bool {
+        record.l_seq() == 0 && record.flags() & fgumi_raw_bam::flags::UNMAPPED == 0
+    }
+
     /// Ensures at least `clip_length` bases are clipped at the start of the read.
     pub fn clip_start_of_read_raw(
         &self,
@@ -745,7 +762,7 @@ impl RawRecordClipper {
             .map(|&op| (op >> 4) as usize)
             .sum();
 
-        if clip_length > existing_clipping {
+        if clip_length > existing_clipping && !Self::lacks_seq_raw(record) {
             self.clip_start_of_alignment(record, clip_length - existing_clipping)
         } else {
             self.upgrade_clipping_raw(record, clip_length, true);
@@ -767,7 +784,7 @@ impl RawRecordClipper {
             .map(|&op| (op >> 4) as usize)
             .sum();
 
-        if clip_length > existing_clipping {
+        if clip_length > existing_clipping && !Self::lacks_seq_raw(record) {
             self.clip_end_of_alignment(record, clip_length - existing_clipping)
         } else {
             self.upgrade_clipping_raw(record, clip_length, false);
@@ -885,31 +902,32 @@ impl RawRecordClipper {
                 if from_start { new_ops } else { new_ops.iter().copied().rev().collect() };
             record.set_cigar_ops(&final_ops);
 
-            // Update sequence and quals
+            // Update sequence and quals. Clamp to the stored SEQ so a record whose SEQ is `*`
+            // (l_seq 0) still has its CIGAR upgraded instead of panicking on the slice.
             let seq = record.sequence_vec();
             let qual = record.quality_scores().to_vec();
+            let removed = length_to_upgrade.min(seq.len());
             if from_start {
-                let new_seq = seq[length_to_upgrade..].to_vec();
-                let new_qual = qual[length_to_upgrade..].to_vec();
+                let new_seq = seq[removed..].to_vec();
+                let new_qual = qual[removed..].to_vec();
                 record.set_sequence_and_qualities(&new_seq, &new_qual);
             } else {
-                let new_len = seq.len().saturating_sub(length_to_upgrade);
+                let new_len = seq.len() - removed;
                 let new_seq = seq[..new_len].to_vec();
                 let new_qual = qual[..new_len].to_vec();
                 record.set_sequence_and_qualities(&new_seq, &new_qual);
             }
-            self.clip_extended_attributes_raw(record, length_to_upgrade, from_start);
+            self.clip_extended_attributes_raw(record, removed, from_start);
         } else if self.mode == ClippingMode::SoftWithMask {
             // SoftWithMask: mask the upgraded soft-clipped bases to N/min-quality without
-            // altering the CIGAR (see the typed `upgrade_clipping` for rationale).
+            // altering the CIGAR, as fgbio `upgradeClipping` does. Clamp to the stored SEQ so a
+            // record whose SEQ is `*` (l_seq 0) masks nothing instead of panicking.
             let mut new_seq = record.sequence_vec();
             let mut new_qual = record.quality_scores().to_vec();
             let seq_len = new_seq.len();
-            let (mask_start, mask_end) = if from_start {
-                (0, length_to_upgrade)
-            } else {
-                (seq_len - length_to_upgrade, seq_len)
-            };
+            let to_mask = length_to_upgrade.min(seq_len);
+            let (mask_start, mask_end) =
+                if from_start { (0, to_mask) } else { (seq_len - to_mask, seq_len) };
             for i in mask_start..mask_end {
                 new_seq[i] = fgumi_dna::NO_CALL_BASE;
                 new_qual[i] = fgumi_dna::MIN_PHRED;
@@ -1054,7 +1072,12 @@ impl RawRecordClipper {
         record.set_cigar_ops(&new_cigar_ops);
 
         if self.auto_clip_attributes && (leading_soft > 0 || trailing_soft > 0) {
-            // Collect tags matching old length, then update them
+            // Collect tags matching old length, then update them. Keep exactly the SEQ range
+            // retained above (it starts after the leading soft clip and is clamped to the stored
+            // SEQ), so per-base tags still match `l_seq` even when SEQ is `*` or shorter than the
+            // CIGAR's query length.
+            let keep_start = leading_soft.min(old_seq_len);
+            let keep_end = keep_start + new_sequence.len();
             let aux = fgumi_raw_bam::aux_data_slice(record.as_ref()).to_vec();
             let view = fgumi_raw_bam::RawTagsView::new(&aux);
             let mut string_updates: Vec<([u8; 2], Vec<u8>)> = Vec::new();
@@ -1068,15 +1091,13 @@ impl RawRecordClipper {
                 match value {
                     TagValue::String(s) => {
                         if s.len() == old_seq_len {
-                            let start = leading_soft;
-                            let end = old_seq_len - trailing_soft;
-                            string_updates.push((tag, s[start..end].to_vec()));
+                            string_updates.push((tag, s[keep_start..keep_end].to_vec()));
                         }
                     }
                     TagValue::Array(arr) => {
                         if arr.count == old_seq_len {
-                            let start = leading_soft * arr.elem_size;
-                            let end = (old_seq_len - trailing_soft) * arr.elem_size;
+                            let start = keep_start * arr.elem_size;
+                            let end = keep_end * arr.elem_size;
                             array_updates.push((tag, arr.elem_type, arr.data[start..end].to_vec()));
                         }
                     }
@@ -1881,6 +1902,212 @@ mod tests {
             diff <= 2,
             "Clipping should be roughly equal, but got {clipped_r1} vs {clipped_r2}"
         );
+    }
+
+    #[test]
+    fn test_clip_overlapping_reads_hard_keeps_soft_clips_away_from_the_overlap() {
+        let clipper = RawClipperOnBuf::new(ClippingMode::Hard);
+
+        // Only the overlap is hard-clipped; soft clips at the far ends stay soft, as in fgbio.
+        let mut r1 = create_paired_record("5S95M", "ACGT", 1000, false, true, 1050, "90M5S");
+        let mut r2 = create_paired_record("90M5S", "ACGT", 1050, true, false, 1000, "5S95M");
+
+        let (clipped_r1, clipped_r2) = clipper.clip_overlapping_reads(&mut r1, &mut r2);
+
+        assert_eq!((clipped_r1, clipped_r2), (25, 20));
+        assert_eq!(format_cigar(&r1.cigar()), "5S70M25H");
+        assert_eq!(format_cigar(&r2.cigar()), "20H70M5S");
+        assert_eq!(r1.sequence().len(), 75);
+        assert_eq!(r2.sequence().len(), 75);
+    }
+
+    /// fgbio `clipOverlappingReads` (SamRecordClipper.scala:321-322) routes each read through
+    /// `clip3PrimeEndOfRead`, so a read with zero overlap bases to clip still has the existing
+    /// soft clip at its mate-facing 3' end upgraded (hard) or masked (soft-with-mask), while the
+    /// soft clip at its far 5' end is left alone. Here the midpoint clamps to r1's alignment end
+    /// (1089), so r1 gets zero overlap bases clipped and r2 gets 40.
+    #[rstest]
+    #[case::soft(ClippingMode::Soft, "5S90M10S", "40S100M5S", 0)]
+    #[case::soft_with_mask(ClippingMode::SoftWithMask, "5S90M10S", "40S100M5S", 10)]
+    #[case::hard(ClippingMode::Hard, "5S90M10H", "40H100M5S", 0)]
+    fn test_clip_overlapping_reads_upgrades_mate_facing_soft_clip_of_unclipped_read(
+        #[case] mode: ClippingMode,
+        #[case] expected_r1: &str,
+        #[case] expected_r2: &str,
+        #[case] r1_masked_tail: usize,
+        #[values(false, true)] reverse_first: bool,
+    ) {
+        let clipper = RawClipperOnBuf::new(mode);
+        let mut r1 = create_paired_record("5S90M10S", "", 1000, false, true, 1050, "140M5S");
+        let mut r2 = create_paired_record("140M5S", "", 1050, true, false, 1000, "5S90M10S");
+
+        let (clipped_r1, clipped_r2) = if reverse_first {
+            let (c2, c1) = clipper.clip_overlapping_reads(&mut r2, &mut r1);
+            (c1, c2)
+        } else {
+            clipper.clip_overlapping_reads(&mut r1, &mut r2)
+        };
+
+        assert_eq!((clipped_r1, clipped_r2), (0, 40));
+        assert_eq!(format_cigar(&r1.cigar()), expected_r1);
+        assert_eq!(format_cigar(&r2.cigar()), expected_r2);
+
+        // r1: only the mate-facing 3' soft clip is masked; the 5' soft clip and aligned bases
+        // are untouched.
+        let r1_seq: &[u8] = r1.sequence().as_ref();
+        let r1_quals: &[u8] = r1.quality_scores().as_ref();
+        assert_eq!(r1_seq.len(), cigar_query_len(expected_r1));
+        let unmasked = r1_seq.len() - r1_masked_tail;
+        assert!(r1_seq[..unmasked].iter().all(|&b| b != NO_CALL_BASE), "r1 head masked");
+        assert!(r1_seq[unmasked..].iter().all(|&b| b == NO_CALL_BASE), "r1 tail not masked");
+        assert!(r1_quals[unmasked..].iter().all(|&q| q == MIN_PHRED), "r1 tail quals not min");
+
+        // r2: the far-end (trailing) soft clip is never upgraded or masked.
+        let r2_seq: &[u8] = r2.sequence().as_ref();
+        assert_eq!(r2_seq.len(), cigar_query_len(expected_r2));
+        assert!(r2_seq[r2_seq.len() - 5..].iter().all(|&b| b != NO_CALL_BASE), "r2 tail masked");
+    }
+
+    /// A record whose SEQ is `*` (`l_seq` 0) but whose CIGAR has a soft clip at the end being
+    /// clipped must not panic: hard mode still upgrades that soft clip in the CIGAR, and
+    /// soft-with-mask masks nothing. The alignment itself is not clipped, because
+    /// `clip_{start,end}_of_alignment` leave a record without SEQ unchanged. Covers the overlap
+    /// path with zero (r2) and positive (r1) overlap bases to clip, and the read-end and
+    /// upgrade-all helpers that share `upgrade_clipping_raw`, both within and beyond the existing
+    /// clipping.
+    #[rstest]
+    #[case::hard(ClippingMode::Hard, "5H60M", "140M10H", "5H90M10H")]
+    #[case::soft_with_mask(ClippingMode::SoftWithMask, "5S60M", "140M10S", "5S90M10S")]
+    fn test_upgrade_clipping_with_empty_seq_does_not_panic(
+        #[case] mode: ClippingMode,
+        #[case] expected_overlap_r2: &str,
+        #[case] expected_overlap_r1: &str,
+        #[case] expected_upgraded: &str,
+    ) {
+        use super::clip_test_adapter::to_buf;
+
+        let clipper = RawRecordClipper::new(mode);
+        let mut r1 = to_raw(&create_paired_record("150M", "", 1000, false, true, 1100, "5S60M"));
+        let mut r2 = to_raw(&create_paired_record("5S60M", "", 1100, true, false, 1000, "150M"));
+        r2.set_sequence_and_qualities(&[], &[]);
+        let (_, clipped_r2) = clipper.clip_overlapping_reads(&mut r1, &mut r2);
+        assert_eq!(clipped_r2, 0);
+        assert_eq!(r2.l_seq(), 0);
+        assert_eq!(format_cigar(&to_buf(&r2).cigar()), expected_overlap_r2);
+
+        // r1 overlaps r2 by 40 reference bases past the midpoint (1099), so it has positive
+        // overlap to clip; without SEQ only its mate-facing soft clip changes.
+        let mut r1 = to_raw(&create_paired_record("140M10S", "", 1000, false, true, 1100, "100M"));
+        let mut r2 = to_raw(&create_paired_record("100M", "", 1100, true, false, 1000, "140M10S"));
+        r1.set_sequence_and_qualities(&[], &[]);
+        let (clipped_r1, _) = clipper.clip_overlapping_reads(&mut r1, &mut r2);
+        assert_eq!(clipped_r1, 0);
+        assert_eq!(r1.l_seq(), 0);
+        assert_eq!(format_cigar(&to_buf(&r1).cigar()), expected_overlap_r1);
+
+        let empty_seq_record = || {
+            let mut rec = to_raw(&create_test_record("5S90M10S", "", 1000));
+            rec.set_sequence_and_qualities(&[], &[]);
+            rec
+        };
+        let mut rec = empty_seq_record();
+        clipper.clip_start_of_read_raw(&mut rec, 5);
+        clipper.clip_end_of_read_raw(&mut rec, 10);
+        assert_eq!(format_cigar(&to_buf(&rec).cigar()), expected_upgraded);
+        let mut rec = empty_seq_record();
+        assert_eq!(clipper.clip_start_of_read_raw(&mut rec, 8), 0);
+        assert_eq!(clipper.clip_end_of_read_raw(&mut rec, 15), 0);
+        assert_eq!(format_cigar(&to_buf(&rec).cigar()), expected_upgraded);
+        let mut rec = empty_seq_record();
+        clipper.upgrade_all_clipping_raw(&mut rec).expect("upgrade_all_clipping_raw");
+        assert_eq!(format_cigar(&to_buf(&rec).cigar()), expected_upgraded);
+    }
+
+    /// With `--auto-clip-attributes`, a record whose SEQ is `*` (`l_seq` 0) carries per-base
+    /// tags of length 0 that match its SEQ length. Hard-mode `upgrade_all_clipping_raw` must still
+    /// upgrade the CIGAR without slicing those tags past their end.
+    #[test]
+    fn test_upgrade_all_clipping_empty_seq_with_auto_clip_attributes() {
+        use super::clip_test_adapter::to_buf;
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+
+        let string_tag = Tag::from([b'a', b'z']);
+        let array_tag = Tag::from([b'b', b'z']);
+        let mut buf = create_test_record("5S90M10S", "", 1000);
+        buf.data_mut().insert(string_tag, Value::from(""));
+        buf.data_mut().insert(array_tag, Value::Array(Array::UInt8(Vec::new())));
+        let mut rec = to_raw(&buf);
+        rec.set_sequence_and_qualities(&[], &[]);
+
+        let clipper = RawRecordClipper::with_auto_clip(ClippingMode::Hard, true);
+        let upgraded =
+            clipper.upgrade_all_clipping_raw(&mut rec).expect("upgrade_all_clipping_raw");
+
+        assert_eq!(upgraded, (5, 10));
+        let out = to_buf(&rec);
+        assert_eq!(format_cigar(&out.cigar()), "5H90M10H");
+        assert_eq!(rec.l_seq(), 0);
+        let Some(Value::String(s)) = out.data().get(&string_tag) else {
+            panic!("az missing or of unexpected type");
+        };
+        assert!(s.is_empty());
+        let Some(Value::Array(Array::UInt8(arr))) = out.data().get(&array_tag) else {
+            panic!("bz missing or of unexpected type");
+        };
+        assert!(arr.is_empty());
+    }
+
+    /// With `--auto-clip-attributes`, a SEQ shorter than the CIGAR's query length keeps only the
+    /// bases the upgraded CIGAR still covers; per-base tags matching the old SEQ length must be
+    /// trimmed to the same range so they still match `l_seq`.
+    #[test]
+    fn test_upgrade_all_clipping_short_seq_keeps_tags_in_step_with_seq() {
+        use super::clip_test_adapter::to_buf;
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+
+        let string_tag = Tag::from([b'a', b'z']);
+        let array_tag = Tag::from([b'b', b'z']);
+        let mut buf = create_test_record("5S90M10S", "", 1000);
+        buf.data_mut().insert(string_tag, Value::from("ABCDEFGH"));
+        buf.data_mut().insert(array_tag, Value::Array(Array::UInt8((0..8).collect())));
+        let mut rec = to_raw(&buf);
+        rec.set_sequence_and_qualities(b"ACGTACGT", &[30; 8]);
+
+        let clipper = RawRecordClipper::with_auto_clip(ClippingMode::Hard, true);
+        clipper.upgrade_all_clipping_raw(&mut rec).expect("upgrade_all_clipping_raw");
+
+        let out = to_buf(&rec);
+        assert_eq!(format_cigar(&out.cigar()), "5H90M10H");
+        let seq: &[u8] = out.sequence().as_ref();
+        assert_eq!(seq, b"CGT");
+        let Some(Value::String(s)) = out.data().get(&string_tag) else {
+            panic!("az missing or of unexpected type");
+        };
+        let s: &[u8] = s.as_ref();
+        assert_eq!(s, b"FGH");
+        let Some(Value::Array(Array::UInt8(arr))) = out.data().get(&array_tag) else {
+            panic!("bz missing or of unexpected type");
+        };
+        assert_eq!(arr, &vec![5, 6, 7]);
+    }
+
+    /// A hard clip at the start of an alignment whose stored SEQ is shorter than the CIGAR's query
+    /// length must not slice SEQ past its end, matching the saturating end-of-alignment sibling.
+    #[test]
+    fn test_clip_start_of_alignment_hard_with_short_seq_does_not_panic() {
+        use super::clip_test_adapter::to_buf;
+
+        let mut rec = to_raw(&create_test_record("5S45M", "", 1000));
+        rec.set_sequence_and_qualities(b"ACG", &[30, 30, 30]);
+
+        let clipped =
+            RawRecordClipper::new(ClippingMode::Hard).clip_start_of_alignment(&mut rec, 10);
+
+        assert_eq!(clipped, 10);
+        assert_eq!(format_cigar(&to_buf(&rec).cigar()), "15H35M");
+        assert_eq!(rec.l_seq(), 0);
     }
 
     #[test]
