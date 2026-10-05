@@ -803,6 +803,35 @@ pub(crate) fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Build an output path by appending `.{suffix}` to the full prefix path.
+///
+/// Unlike [`Path::with_extension`], the prefix is kept intact even when its last component
+/// contains dots (`out.v1` → `out.v1.family_sizes.txt`). Trailing path separators (and a
+/// trailing `.` component) are dropped first, so `out/` → `out.family_sizes.txt` rather than
+/// a hidden `out/.family_sizes.txt`; this matches fgbio, whose `Path` normalization drops
+/// trailing separators. The rest of the prefix is kept verbatim.
+///
+/// # Errors
+///
+/// Returns an error if, after that trimming, the prefix does not end in a file name (`.`,
+/// `./`, `..`, `out/..`, `/` or an empty prefix): appending to it would write dot-named
+/// files such as `./.txt` or `/.txt` rather than files the prefix names.
+pub(crate) fn append_suffix(prefix: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
+    // `Components::as_path` trims trailing separators and `.` components only.
+    let trimmed = prefix.components();
+    if !matches!(trimmed.clone().next_back(), Some(std::path::Component::Normal(_))) {
+        anyhow::bail!(
+            "output prefix '{}' does not name a file: it must end in a file name (e.g. `out` \
+             or `dir/out`), not `.`, `..` or a root",
+            prefix.display()
+        );
+    }
+    let mut s = trimmed.as_path().as_os_str().to_owned();
+    s.push(".");
+    s.push(suffix);
+    Ok(PathBuf::from(s))
+}
+
 /// Reject any write target that is the same file as one of the command's
 /// inputs, which would truncate the file being read.
 ///
@@ -3551,6 +3580,53 @@ mod tests {
     }
 
     use rstest::rstest;
+
+    /// `append_suffix` appends to the full prefix and drops only trailing separators and `.`
+    /// components; the comparison is on the raw string so separator normalization cannot hide
+    /// a difference.
+    #[rstest]
+    #[case::plain("out", "txt", "out.txt")]
+    #[case::dotted_prefix("out.v1", "family_sizes.txt", "out.v1.family_sizes.txt")]
+    #[case::trailing_separator("out/", "family_sizes.txt", "out.family_sizes.txt")]
+    #[case::double_trailing_separator("out//", "txt", "out.txt")]
+    #[case::absolute_trailing_separator("/a/b/out.v1/", "txt", "/a/b/out.v1.txt")]
+    #[case::trailing_cur_dir("out/.", "txt", "out.txt")]
+    #[case::leading_cur_dir_kept("./out/", "txt", "./out.txt")]
+    #[case::interior_double_separator_kept("a//out", "txt", "a//out.txt")]
+    #[case::interior_cur_dir_kept("a/./out", "txt", "a/./out.txt")]
+    #[case::interior_parent_dir_kept("a/../out", "txt", "a/../out.txt")]
+    #[case::trailing_dot_in_name_kept("out.", "txt", "out..txt")]
+    fn append_suffix_appends_to_the_full_prefix(
+        #[case] prefix: &str,
+        #[case] suffix: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(append_suffix(Path::new(prefix), suffix).unwrap().as_os_str(), expected);
+    }
+
+    /// A prefix whose last component (after trailing separators and `.` are dropped) is not a
+    /// file name is rejected, rather than writing dot-named files such as `/.txt` or `out/...txt`.
+    #[rstest]
+    #[case::cur_dir(".")]
+    #[case::cur_dir_trailing_separator("./")]
+    #[case::cur_dir_twice("././")]
+    #[case::parent_dir("..")]
+    #[case::parent_dir_trailing_separator("../")]
+    #[case::trailing_parent_dir("out/..")]
+    #[case::trailing_parent_dir_then_cur_dir("out/../.")]
+    #[case::root("/")]
+    #[case::root_cur_dir("/.")]
+    #[case::empty("")]
+    fn append_suffix_rejects_a_prefix_that_names_no_file(#[case] prefix: &str) {
+        let err = append_suffix(Path::new(prefix), "txt").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "output prefix '{prefix}' does not name a file: it must end in a file name \
+                 (e.g. `out` or `dir/out`), not `.`, `..` or a root"
+            )
+        );
+    }
 
     /// The `ConsensusCallingIterator` pre-group filter (fgbio parity,
     /// `ConsensusCallingIterator.scala:56-58`): the default keeps only mapped primary

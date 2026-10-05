@@ -440,7 +440,8 @@ fn run_group(
 }
 
 /// The three files a `--metrics PREFIX` run writes (see
-/// `commands::group::with_extension`).
+/// `commands::common::append_suffix`; this mirrors it for prefixes without a
+/// trailing path separator, which is every prefix used here).
 fn metrics_prefix_paths(
     prefix: &Path,
 ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {

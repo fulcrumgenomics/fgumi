@@ -104,6 +104,11 @@ A pair of output BAMs are created:
 - **<output>.consensus.bam**: Contains the relevant consensus reads from the consensus BAM
 - **<output>.grouped.bam**: Contains the relevant raw reads from the grouped BAM
 
+Each suffix is appended to the whole `--output` prefix, including any dots it contains, so
+`--output out.v1` writes `out.v1.consensus.bam`, `out.v1.grouped.bam` and `out.v1.txt`. A trailing
+path separator is dropped (`out/` writes `out.consensus.bam` beside `out`), and the prefix must name
+a file, not `.`, `..` or `/`. No output may be the same file as an input.
+
 A review file **<output>.txt** is also created. The review file contains details on each variant
 position along with detailed information on each consensus read that supports the variant. If the
 `--sample` argument is supplied and the input is VCF, genotype information for that sample will be
@@ -160,6 +165,11 @@ pub struct Review {
     pub reference: PathBuf,
 
     /// Output prefix for generated files
+    ///
+    /// Each suffix is appended to the whole prefix, dots included (`out.v1` →
+    /// `out.v1.<suffix>`). A trailing path separator is dropped, so `out/` writes
+    /// `out.<suffix>` beside `out`, not inside it. The prefix must name a file, not
+    /// `.`, `..` or `/`.
     #[arg(short = 'o', long = "output")]
     pub output: PathBuf,
 
@@ -195,6 +205,10 @@ impl Command for Review {
         validate_file_exists(&self.grouped_bam, "grouped BAM")?;
         validate_file_exists(&self.reference, "reference")?;
 
+        // Refuse an `--output` prefix that names no file, or whose outputs would overwrite an
+        // input, before any writer opens (`File::create` truncates the input mid-read).
+        self.reject_outputs_aliasing_inputs()?;
+
         // Validate FASTA index and dictionary
         self.validate_reference_files()?;
 
@@ -229,8 +243,8 @@ impl Command for Review {
 
         // Create BAM indexes for output files
         info!("Creating BAM indexes...");
-        let consensus_out_path = self.output.with_extension("consensus.bam");
-        let grouped_out_path = self.output.with_extension("grouped.bam");
+        let consensus_out_path = self.output_path("consensus.bam")?;
+        let grouped_out_path = self.output_path("grouped.bam")?;
 
         // Both paths are built with a `.bam` suffix above, so the sidecar naming
         // is unchanged here; going through the shared helper keeps every writer
@@ -249,6 +263,62 @@ impl Command for Review {
 }
 
 impl Review {
+    /// Build an output path by appending `.{suffix}` to the full `--output` prefix.
+    ///
+    /// The prefix is kept intact even when it contains dots (e.g. `out.v1` →
+    /// `out.v1.consensus.bam`), matching fgbio; `Path::with_extension` would instead
+    /// replace the prefix's last dotted component. Trailing path separators are dropped
+    /// by [`append_suffix`](crate::commands::common::append_suffix), so `out/` writes
+    /// `out.consensus.bam`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `--output` prefix does not name a file.
+    fn output_path(&self, suffix: &str) -> Result<PathBuf> {
+        crate::commands::common::append_suffix(&self.output, suffix)
+    }
+
+    /// Reject a run whose outputs (both BAMs, their `.bai` sidecars and the review `.txt`)
+    /// would overwrite one of its inputs or an input BAM's index, e.g. `-o s -c
+    /// s.consensus.bam`. Identity is by file (dev+inode on unix), so symlinks and hard links
+    /// are caught too.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `--output` prefix does not name a file, or naming both paths
+    /// if an output is the same file as an input.
+    fn reject_outputs_aliasing_inputs(&self) -> Result<()> {
+        let consensus_out = self.output_path("consensus.bam")?;
+        let grouped_out = self.output_path("grouped.bam")?;
+        let review_out = self.output_path("txt")?;
+        let consensus_out_bai = fgumi_bam_io::bai_sidecar_path(&consensus_out);
+        let grouped_out_bai = fgumi_bam_io::bai_sidecar_path(&grouped_out);
+        // `read_bam_index` reads either index form, and re-reads them after the output
+        // sidecars are written, so an index an output lands on is an input too.
+        let consensus_bai = fgumi_bam_io::bai_sidecar_path(&self.consensus_bam);
+        let consensus_alt_bai = self.consensus_bam.with_extension("bai");
+        let grouped_bai = fgumi_bam_io::bai_sidecar_path(&self.grouped_bam);
+        let grouped_alt_bai = self.grouped_bam.with_extension("bai");
+        let inputs: [(&Path, &str); 8] = [
+            (&self.input, "--input"),
+            (&self.consensus_bam, "--consensus-bam"),
+            (&consensus_bai, "--consensus-bam index"),
+            (&consensus_alt_bai, "--consensus-bam index"),
+            (&self.grouped_bam, "--grouped-bam"),
+            (&grouped_bai, "--grouped-bam index"),
+            (&grouped_alt_bai, "--grouped-bam index"),
+            (&self.reference, "--ref"),
+        ];
+        let outputs: [(&Path, &str); 5] = [
+            (&consensus_out, "--output consensus BAM"),
+            (&consensus_out_bai, "--output consensus BAM index"),
+            (&grouped_out, "--output grouped BAM"),
+            (&grouped_out_bai, "--output grouped BAM index"),
+            (&review_out, "--output review file"),
+        ];
+        crate::commands::common::reject_writes_aliasing_inputs(&inputs, &outputs)
+    }
+
     /// Load a BAM index, preferring the samtools sidecar (`.bai` appended to the
     /// full BAM path, e.g. `foo.bam` → `foo.bam.bai`) and falling back to the
     /// extension-replaced form (`foo.bam` → `foo.bai`) that some tools emit.
@@ -780,7 +850,7 @@ impl Review {
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
         // Create output BAM
-        let consensus_out_path = self.output.with_extension("consensus.bam");
+        let consensus_out_path = self.output_path("consensus.bam")?;
         let mut writer = bam::io::writer::Builder.build_from_path(&consensus_out_path)?;
         writer.write_header(&header)?;
 
@@ -896,7 +966,7 @@ impl Review {
         // Add @PG record with PP chaining (must happen before we consume the reader below)
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
-        let grouped_out_path = self.output.with_extension("grouped.bam");
+        let grouped_out_path = self.output_path("grouped.bam")?;
         let mut writer = bam::io::writer::Builder.build_from_path(&grouped_out_path)?;
         writer.write_header(&header)?;
 
@@ -957,7 +1027,7 @@ impl Review {
     /// - Review TSV file cannot be created or written
     /// - Record processing fails
     fn generate_review_file(&self, variants: &[Variant]) -> Result<()> {
-        let review_path = self.output.with_extension("txt");
+        let review_path = self.output_path("txt")?;
 
         // Open both BAMs with indexed readers that yield RawRecord directly.
         let con_index = Self::read_bam_index(&self.consensus_bam)?;
@@ -1558,7 +1628,19 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
                 .collect()
         }
 
-        /// Collect the read names present in a `.consensus.bam` output.
+        /// Expected `review` output path: `.{suffix}` appended to the full `--output` prefix.
+        ///
+        /// An independent oracle for `Review::output_path` — deliberately not
+        /// `Path::with_extension`, which replaces the prefix's last dotted component.
+        pub fn suffixed(prefix: &std::path::Path, suffix: &str) -> PathBuf {
+            let mut s = prefix.as_os_str().to_owned();
+            s.push(".");
+            s.push(suffix);
+            PathBuf::from(s)
+        }
+
+        /// Collect the read names present in an indexed output BAM (`.consensus.bam` or
+        /// `.grouped.bam`).
         pub fn consensus_bam_read_names(path: &std::path::Path) -> Vec<String> {
             use noodles::bam;
             let mut reader = bam::io::indexed_reader::Builder::default()
@@ -1932,26 +2014,261 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
         assert!(!review.is_vcf_file(&PathBuf::from("file.txt")));
     }
 
-    #[test]
-    fn test_review_output_path_extensions() {
+    /// Output paths append each suffix to the full `--output` prefix, so a dotted prefix
+    /// keeps every component, and a trailing path separator is dropped rather than
+    /// producing hidden files inside the named directory.
+    #[rstest]
+    #[case::plain_prefix(
+        "/path/to/output",
+        "/path/to/output.consensus.bam",
+        "/path/to/output.grouped.bam",
+        "/path/to/output.txt"
+    )]
+    #[case::dotted_prefix(
+        "/path/to/output.v1",
+        "/path/to/output.v1.consensus.bam",
+        "/path/to/output.v1.grouped.bam",
+        "/path/to/output.v1.txt"
+    )]
+    #[case::trailing_separator(
+        "/path/to/output/",
+        "/path/to/output.consensus.bam",
+        "/path/to/output.grouped.bam",
+        "/path/to/output.txt"
+    )]
+    #[case::relative_trailing_separators(
+        "out.v1//",
+        "out.v1.consensus.bam",
+        "out.v1.grouped.bam",
+        "out.v1.txt"
+    )]
+    fn test_review_output_path_extensions(
+        #[case] prefix: &str,
+        #[case] expected_consensus: &str,
+        #[case] expected_grouped: &str,
+        #[case] expected_txt: &str,
+    ) {
         let review = Review {
             input: PathBuf::from("variants.vcf"),
             consensus_bam: PathBuf::from("consensus.bam"),
             grouped_bam: PathBuf::from("grouped.bam"),
             reference: PathBuf::from("ref.fa"),
-            output: PathBuf::from("/path/to/output"),
+            output: PathBuf::from(prefix),
             sample: None,
             ignore_ns: false,
             maf: 0.05,
         };
 
-        let consensus_path = review.output.with_extension("consensus.bam");
-        let grouped_path = review.output.with_extension("grouped.bam");
-        let review_path = review.output.with_extension("txt");
+        assert_eq!(review.output_path("consensus.bam").unwrap(), PathBuf::from(expected_consensus));
+        assert_eq!(review.output_path("grouped.bam").unwrap(), PathBuf::from(expected_grouped));
+        assert_eq!(review.output_path("txt").unwrap(), PathBuf::from(expected_txt));
+    }
 
-        assert_eq!(consensus_path, PathBuf::from("/path/to/output.consensus.bam"));
-        assert_eq!(grouped_path, PathBuf::from("/path/to/output.grouped.bam"));
-        assert_eq!(review_path, PathBuf::from("/path/to/output.txt"));
+    /// Which `review` input a guard test places at a chosen file name.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ReviewInput {
+        Input,
+        ConsensusBam,
+        GroupedBam,
+        Reference,
+    }
+
+    /// A `review` whose four inputs exist as empty files in `dir` (the alias guard runs before
+    /// any input is parsed), with `role` named `role_name` and `prefix` as `--output`.
+    fn review_with_inputs(
+        dir: &TempDir,
+        role: ReviewInput,
+        role_name: &str,
+        prefix: &str,
+    ) -> Review {
+        let path_for = |r: ReviewInput, default: &str| {
+            let path = dir.path().join(if r == role { role_name } else { default });
+            std::fs::write(&path, b"").expect("create input");
+            path
+        };
+        Review {
+            input: path_for(ReviewInput::Input, "variants.interval_list"),
+            consensus_bam: path_for(ReviewInput::ConsensusBam, "in.consensus.bam"),
+            grouped_bam: path_for(ReviewInput::GroupedBam, "in.grouped.bam"),
+            reference: path_for(ReviewInput::Reference, "ref.fa"),
+            output: dir.path().join(prefix),
+            sample: None,
+            ignore_ns: false,
+            maf: 0.05,
+        }
+    }
+
+    /// An `--output` prefix whose derived outputs (either BAM, its `.bai` sidecar, or the
+    /// review `.txt`) are the same file as an input, or as an input BAM's index, is rejected
+    /// before any writer opens and names both paths. The dotted-prefix cases collide only
+    /// because the whole prefix is now kept (`sample.v1` → `sample.v1.consensus.bam`); the
+    /// old extension-replacing naming wrote `sample.consensus.bam` instead.
+    #[rstest]
+    #[case::consensus_bam(
+        "sample",
+        ReviewInput::ConsensusBam,
+        "sample.consensus.bam",
+        "--output consensus BAM",
+        "sample.consensus.bam",
+        "--consensus-bam",
+        "sample.consensus.bam"
+    )]
+    #[case::dotted_prefix_consensus_bam(
+        "sample.v1",
+        ReviewInput::ConsensusBam,
+        "sample.v1.consensus.bam",
+        "--output consensus BAM",
+        "sample.v1.consensus.bam",
+        "--consensus-bam",
+        "sample.v1.consensus.bam"
+    )]
+    #[case::trailing_separator_consensus_bam(
+        "sample/",
+        ReviewInput::ConsensusBam,
+        "sample.consensus.bam",
+        "--output consensus BAM",
+        "sample.consensus.bam",
+        "--consensus-bam",
+        "sample.consensus.bam"
+    )]
+    #[case::grouped_bam(
+        "sample",
+        ReviewInput::GroupedBam,
+        "sample.grouped.bam",
+        "--output grouped BAM",
+        "sample.grouped.bam",
+        "--grouped-bam",
+        "sample.grouped.bam"
+    )]
+    #[case::dotted_prefix_grouped_bam(
+        "sample.v1",
+        ReviewInput::GroupedBam,
+        "sample.v1.grouped.bam",
+        "--output grouped BAM",
+        "sample.v1.grouped.bam",
+        "--grouped-bam",
+        "sample.v1.grouped.bam"
+    )]
+    #[case::review_txt(
+        "sample",
+        ReviewInput::Input,
+        "sample.txt",
+        "--output review file",
+        "sample.txt",
+        "--input",
+        "sample.txt"
+    )]
+    #[case::dotted_prefix_review_txt(
+        "sample.v1",
+        ReviewInput::Reference,
+        "sample.v1.txt",
+        "--output review file",
+        "sample.v1.txt",
+        "--ref",
+        "sample.v1.txt"
+    )]
+    #[case::consensus_bam_sidecar(
+        "sample",
+        ReviewInput::Input,
+        "sample.consensus.bam.bai",
+        "--output consensus BAM index",
+        "sample.consensus.bam.bai",
+        "--input",
+        "sample.consensus.bam.bai"
+    )]
+    #[case::grouped_bam_sidecar(
+        "sample",
+        ReviewInput::Input,
+        "sample.grouped.bam.bai",
+        "--output grouped BAM index",
+        "sample.grouped.bam.bai",
+        "--input",
+        "sample.grouped.bam.bai"
+    )]
+    #[case::input_bam_index(
+        "sample",
+        ReviewInput::ConsensusBam,
+        "sample.consensus.bam.bam",
+        "--output consensus BAM index",
+        "sample.consensus.bam.bai",
+        "--consensus-bam index",
+        "sample.consensus.bam.bai"
+    )]
+    fn test_review_rejects_an_output_that_aliases_an_input(
+        #[case] prefix: &str,
+        #[case] role: ReviewInput,
+        #[case] role_name: &str,
+        #[case] output_flag: &str,
+        #[case] output_name: &str,
+        #[case] input_flag: &str,
+        #[case] input_name: &str,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let review = review_with_inputs(&dir, role, role_name, prefix);
+        // The aliased file must exist for the guard to compare identities (an index, here).
+        std::fs::write(dir.path().join(input_name), b"").unwrap();
+        let files_before = std::fs::read_dir(dir.path()).unwrap().count();
+
+        let err = review.execute("test").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{output_flag} '{}' is the same file as {input_flag} '{}'; choose a different path",
+                dir.path().join(output_name).display(),
+                dir.path().join(input_name).display(),
+            )
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), files_before, "nothing written");
+    }
+
+    /// A symlink onto an existing output is the same file, so it is caught by identity rather
+    /// than by name.
+    #[cfg(unix)]
+    #[test]
+    fn test_review_rejects_an_input_symlinked_to_an_output() {
+        let dir = TempDir::new().unwrap();
+        let review = review_with_inputs(&dir, ReviewInput::ConsensusBam, "link.bam", "sample");
+        let output = dir.path().join("sample.consensus.bam");
+        std::fs::write(&output, b"").unwrap();
+        std::fs::remove_file(&review.consensus_bam).unwrap();
+        std::os::unix::fs::symlink(&output, &review.consensus_bam).unwrap();
+
+        let err = review.execute("test").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "--output consensus BAM '{}' is the same file as --consensus-bam '{}'; choose a \
+                 different path",
+                output.display(),
+                review.consensus_bam.display(),
+            )
+        );
+    }
+
+    /// An `--output` prefix that names no file is rejected before any output is written,
+    /// rather than writing dot-named files such as `/.txt` or `out/...consensus.bam`.
+    #[rstest]
+    #[case::cur_dir(".")]
+    #[case::cur_dir_trailing_separator("./")]
+    #[case::parent_dir("..")]
+    #[case::trailing_parent_dir("out/..")]
+    #[case::root("/")]
+    fn test_review_rejects_a_prefix_that_names_no_file(#[case] prefix: &str) {
+        let dir = TempDir::new().unwrap();
+        let mut review =
+            review_with_inputs(&dir, ReviewInput::Input, "variants.interval_list", "x");
+        review.output = PathBuf::from(prefix);
+        let files_before = std::fs::read_dir(dir.path()).unwrap().count();
+
+        let err = review.execute("test").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "output prefix '{prefix}' does not name a file: it must end in a file name \
+                 (e.g. `out` or `dir/out`), not `.`, `..` or a root"
+            )
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), files_before, "nothing written");
     }
 
     // ------------------------------------------------------------------
@@ -2045,9 +2362,9 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
         review.execute("test").expect("execute should succeed");
 
         // Verify output files exist
-        let con_out = output_path.with_extension("consensus.bam");
-        let raw_out = output_path.with_extension("grouped.bam");
-        let txt_out = output_path.with_extension("txt");
+        let con_out = test_utils::suffixed(&output_path, "consensus.bam");
+        let raw_out = test_utils::suffixed(&output_path, "grouped.bam");
+        let txt_out = test_utils::suffixed(&output_path, "txt");
 
         assert!(con_out.exists());
         assert!(raw_out.exists());
@@ -2105,9 +2422,9 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
         review.execute("test").expect("execute should succeed");
 
         // Verify output files exist and are empty
-        let con_out = output_path.with_extension("consensus.bam");
-        let raw_out = output_path.with_extension("grouped.bam");
-        let txt_out = output_path.with_extension("txt");
+        let con_out = test_utils::suffixed(&output_path, "consensus.bam");
+        let raw_out = test_utils::suffixed(&output_path, "grouped.bam");
+        let txt_out = test_utils::suffixed(&output_path, "txt");
 
         assert!(con_out.exists());
         assert!(raw_out.exists());
@@ -2125,6 +2442,78 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
                 .read_record_buf(&con_header, &mut con_record)
                 .expect("failed to read BAM record"),
             0
+        );
+    }
+
+    /// Output file names are the full `--output` prefix plus a literal suffix, so a prefix
+    /// containing dots must be kept intact rather than having its last component replaced.
+    ///
+    /// Ported from fgbio `ReviewConsensusVariantsTest.scala:188` ("create empty BAMs when given
+    /// an empty interval list as input"), which names its output prefix
+    /// `makeTempFile("review_consensus.", ".out")` (i.e. `review_consensus.<random>.out`) and
+    /// expects `<outBase>.consensus.bam`, `<outBase>.grouped.bam` and `<outBase>.txt`
+    /// (`ReviewConsensusVariants.scala:186-187,212`). The exact set of files written next to the
+    /// prefix is asserted: both BAMs, their `.bam.bai` sidecars, and the review text file. As in
+    /// fgbio, both BAMs hold no records and the review file holds no rows (fgumi writes the
+    /// header line, as for every other metrics output).
+    ///
+    /// A prefix with a trailing path separator (`out/`) names the files `out.*` next to it, not
+    /// hidden `.consensus.bam` etc. inside an `out` directory, matching fgbio's `Path`
+    /// normalization; `expected_stem` is the file-name stem every output must carry.
+    #[rstest]
+    #[case::fgbio_temp_file_prefix("review_consensus.123.out", "review_consensus.123.out")]
+    #[case::single_version_component("out.v1", "out.v1")]
+    #[case::many_components("a.b.c.d", "a.b.c.d")]
+    #[case::trailing_separator("out/", "out")]
+    fn review_output_prefix_with_dots_is_preserved(
+        #[case] prefix: &str,
+        #[case] expected_stem: &str,
+    ) {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let ref_path = test_utils::create_test_reference(&temp_dir);
+        let (raw_path, consensus_path) = test_utils::create_test_bams(&temp_dir);
+        let interval_path = test_utils::create_empty_interval_list(&temp_dir);
+        let out_dir = temp_dir.path().join("outputs");
+        std::fs::create_dir(&out_dir).expect("failed to create output dir");
+
+        let review = Review {
+            input: interval_path,
+            consensus_bam: consensus_path,
+            grouped_bam: raw_path,
+            reference: ref_path,
+            output: out_dir.join(prefix),
+            sample: None,
+            ignore_ns: false,
+            maf: 0.05,
+        };
+
+        review.execute("test").expect("execute should succeed");
+
+        let mut produced: Vec<String> = std::fs::read_dir(&out_dir)
+            .expect("failed to list output dir")
+            .map(|e| {
+                e.expect("failed to read dir entry").file_name().to_string_lossy().into_owned()
+            })
+            .collect();
+        produced.sort();
+
+        let mut expected: Vec<String> =
+            [".consensus.bam", ".consensus.bam.bai", ".grouped.bam", ".grouped.bam.bai", ".txt"]
+                .iter()
+                .map(|suffix| format!("{expected_stem}{suffix}"))
+                .collect();
+        expected.sort();
+
+        assert_eq!(produced, expected);
+
+        let consensus_out = out_dir.join(format!("{expected_stem}.consensus.bam"));
+        let grouped_out = out_dir.join(format!("{expected_stem}.grouped.bam"));
+        let txt_out = out_dir.join(format!("{expected_stem}.txt"));
+        assert_eq!(test_utils::consensus_bam_read_names(&consensus_out), Vec::<String>::new());
+        assert_eq!(test_utils::consensus_bam_read_names(&grouped_out), Vec::<String>::new());
+        assert_eq!(
+            std::fs::read_to_string(&txt_out).expect("failed to read review txt"),
+            format!("{}\n", ConsensusVariantReviewInfo::tsv_header())
         );
     }
 
@@ -2152,9 +2541,9 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
         review.execute("test").expect("execute should succeed");
 
         // Verify output files exist
-        let con_out = output_path.with_extension("consensus.bam");
-        let raw_out = output_path.with_extension("grouped.bam");
-        let txt_out = output_path.with_extension("txt");
+        let con_out = test_utils::suffixed(&output_path, "consensus.bam");
+        let raw_out = test_utils::suffixed(&output_path, "grouped.bam");
+        let txt_out = test_utils::suffixed(&output_path, "txt");
 
         assert!(con_out.exists());
         assert!(raw_out.exists());
@@ -2240,7 +2629,7 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
 
         review.execute("test").expect("execute should succeed");
 
-        let txt_out = output_path.with_extension("txt");
+        let txt_out = test_utils::suffixed(&output_path, "txt");
         assert!(txt_out.exists());
 
         // Read TSV and verify it has content
@@ -2330,7 +2719,7 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
         };
         review.execute("test").expect("execute should succeed");
 
-        let txt_out = output_path.with_extension("txt");
+        let txt_out = test_utils::suffixed(&output_path, "txt");
         let file = std::fs::File::open(&txt_out).expect("failed to open review txt");
         let lines: Vec<String> = std::io::BufReader::new(file)
             .lines()
@@ -2398,7 +2787,7 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
         review.execute("test").expect("execute should succeed");
 
         // Read consensus BAM - should include D (spanning deletion)
-        let con_out = output_path.with_extension("consensus.bam");
+        let con_out = test_utils::suffixed(&output_path, "consensus.bam");
         let mut con_reader = bam::io::indexed_reader::Builder::default()
             .build_from_path(&con_out)
             .expect("failed to open indexed BAM");
@@ -2424,7 +2813,7 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
         // REV-03: but the spanning-deletion read must NOT get a row in the review
         // .txt (fgbio's SamLocusIterator.getRecordAndOffsets excludes deletions;
         // ReviewConsensusVariantsTest.scala:250-251).
-        let txt_out = output_path.with_extension("txt");
+        let txt_out = test_utils::suffixed(&output_path, "txt");
         let content = std::fs::read_to_string(&txt_out).expect("failed to read review txt");
         assert!(
             !content.contains("\tD/1\t"),
@@ -2439,7 +2828,7 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
         // the grouped output BAM — only the review .txt row is suppressed, not the read
         // itself (fgbio `readBamRecs(rawOut)` contains `D1/1`;
         // ReviewConsensusVariantsTest.scala:249).
-        let grouped_out = output_path.with_extension("grouped.bam");
+        let grouped_out = test_utils::suffixed(&output_path, "grouped.bam");
         let mut grp_reader = bam::io::indexed_reader::Builder::default()
             .build_from_path(&grouped_out)
             .expect("failed to open grouped BAM");
@@ -2486,7 +2875,7 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
         review.execute("test").expect("execute should succeed");
 
         // Read TSV and verify N bases are included
-        let txt_out = output_path.with_extension("txt");
+        let txt_out = test_utils::suffixed(&output_path, "txt");
         let content = std::fs::read_to_string(&txt_out).expect("failed to read file");
 
         // Should find E consensus read with N base
@@ -2507,7 +2896,7 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
 
         review2.execute("test").expect("execute should succeed");
 
-        let txt_out2 = output_path2.with_extension("txt");
+        let txt_out2 = test_utils::suffixed(&output_path2, "txt");
         let content2 = std::fs::read_to_string(&txt_out2).expect("failed to read file");
 
         // E should not be in the TSV (N bases ignored)
@@ -2540,7 +2929,7 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
         review.execute("test").expect("execute should succeed");
 
         // Read consensus BAM - should include both H/1 and H/2
-        let con_out = output_path.with_extension("consensus.bam");
+        let con_out = test_utils::suffixed(&output_path, "consensus.bam");
         let mut con_reader = bam::io::indexed_reader::Builder::default()
             .build_from_path(&con_out)
             .expect("failed to open indexed BAM");
@@ -2650,7 +3039,7 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
             maf,
         };
         review.execute("test").expect("execute should succeed");
-        let rows = test_utils::read_review_rows(&output_path.with_extension("txt"));
+        let rows = test_utils::read_review_rows(&test_utils::suffixed(&output_path, "txt"));
         (output_path, rows)
     }
 
@@ -2889,7 +3278,8 @@ chr1\t10\t.\tA\tAT\t.\tPASS\t.\n",
         let (out, rows) = run_review_over_test_bams(&temp_dir, vcf, None, 0.05);
         // The insertion is dropped, so the review file is header-only (no data rows).
         assert_eq!(rows.len(), 1, "insertion-only input must yield only the header: {rows:?}");
-        let names = test_utils::consensus_bam_read_names(&out.with_extension("consensus.bam"));
+        let names =
+            test_utils::consensus_bam_read_names(&test_utils::suffixed(&out, "consensus.bam"));
         assert!(
             names.is_empty(),
             "no reads should be extracted for a dropped insertion: {names:?}"
@@ -2986,8 +3376,10 @@ chr1\t30\t.\tA\tG\t.\tPASS\t.\n",
         .execute("test")
         .expect("execute should succeed");
 
-        let names =
-            test_utils::consensus_bam_read_names(&output_path.with_extension("consensus.bam"));
+        let names = test_utils::consensus_bam_read_names(&test_utils::suffixed(
+            &output_path,
+            "consensus.bam",
+        ));
         let span_count = names.iter().filter(|n| *n == "SPAN").count();
         assert_eq!(
             span_count, 1,
@@ -3052,8 +3444,10 @@ chr1\t30\t.\tA\tG\t.\tPASS\t.\n",
 
         // The output must be coordinate-sorted: EARLY_10 (chr1:10) before LATE_20 (chr1:20),
         // even though LATE_20 was selected first (at the earlier chr1:20 variant locus).
-        let names =
-            test_utils::consensus_bam_read_names(&output_path.with_extension("consensus.bam"));
+        let names = test_utils::consensus_bam_read_names(&test_utils::suffixed(
+            &output_path,
+            "consensus.bam",
+        ));
         assert_eq!(
             names,
             vec!["EARLY_10".to_string(), "LATE_20".to_string()],
@@ -3097,7 +3491,7 @@ chr1\t10\t.\tA\tT\t.\tPASS\t.\n",
         .execute("test")
         .expect("execute should succeed");
 
-        let rows = test_utils::read_review_rows(&output_path.with_extension("txt"));
+        let rows = test_utils::read_review_rows(&test_utils::suffixed(&output_path, "txt"));
         let frag: Vec<&Vec<String>> =
             rows[1..].iter().filter(|r| r[COL_CONSENSUS_READ].starts_with("FRAG")).collect();
         assert!(!frag.is_empty(), "expected a row for FRAG");

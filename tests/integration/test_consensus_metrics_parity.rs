@@ -52,8 +52,9 @@ fn run_fgumi(args: &[&str]) {
 }
 
 /// Appends `.{suffix}` to a metrics prefix path (mirrors
-/// `commands::group::with_extension`, which integration tests cannot import
-/// as it is `pub(crate)`).
+/// `commands::common::append_suffix`, which integration tests cannot import
+/// as it is `pub(crate)`, for prefixes without a trailing path separator,
+/// which is every prefix used here).
 fn suffixed(prefix: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}.{suffix}", prefix.display()))
 }

@@ -4,7 +4,7 @@ use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    is_r1_genomically_earlier_raw,
+    append_suffix, is_r1_genomically_earlier_raw,
 };
 use crate::metrics::TemplateFilterCounts;
 use crate::metrics::group::UmiGroupingMetrics;
@@ -477,6 +477,11 @@ pub struct GroupReadsByUmi {
     /// Writes `PREFIX.family_sizes.txt`, `PREFIX.grouping_metrics.txt`,
     /// and `PREFIX.position_group_sizes.txt`. Can be used alongside
     /// `--family-size-histogram` and `--grouping-metrics`.
+    ///
+    /// Each suffix is appended to the whole prefix, dots included (`out.v1` →
+    /// `out.v1.<suffix>`). A trailing path separator is dropped, so `out/` writes
+    /// `out.<suffix>` beside `out`, not inside it. The prefix must name a file, not
+    /// `.`, `..` or `/`.
     #[arg(short = 'M', long = "metrics")]
     pub metrics: Option<PathBuf>,
 
@@ -862,13 +867,10 @@ impl Command for GroupReadsByUmi {
     fn execute(&self, command_line: &str) -> Result<()> {
         // Reject two outputs resolving to one destination before any writer opens
         // (e.g. a `--metrics PREFIX` file, or `-f`/`-g`, landing on `--output`).
-        let metrics_files: Vec<PathBuf> = self.metrics.as_ref().map_or_else(Vec::new, |prefix| {
-            vec![
-                with_extension(prefix, "family_sizes.txt"),
-                with_extension(prefix, "grouping_metrics.txt"),
-                with_extension(prefix, "position_group_sizes.txt"),
-            ]
-        });
+        let metrics_files: Vec<PathBuf> = match &self.metrics {
+            Some(prefix) => group_metrics_paths(prefix)?.into(),
+            None => Vec::new(),
+        };
         let mut outputs: Vec<(&Path, &str)> = vec![(self.io.output.as_path(), "--output")];
         if let Some(path) = &self.family_size_histogram {
             outputs.push((path.as_path(), "--family-size-histogram"));
@@ -983,12 +985,19 @@ fn write_metrics<S: serde::Serialize + Default>(
     Ok(())
 }
 
-/// Build a path by appending `.{suffix}` to a prefix path.
-pub(crate) fn with_extension(prefix: &Path, suffix: &str) -> PathBuf {
-    let mut s = prefix.as_os_str().to_owned();
-    s.push(".");
-    s.push(suffix);
-    PathBuf::from(s)
+/// The files a group `--metrics PREFIX` writes, in order: family sizes, grouping metrics and
+/// position group sizes. The single source of these names for the writer and for every
+/// `--output` collision guard that must know them up front.
+///
+/// # Errors
+///
+/// Returns an error if `prefix` does not name a file (see [`append_suffix`]).
+pub(crate) fn group_metrics_paths(prefix: &Path) -> Result<[PathBuf; 3]> {
+    Ok([
+        append_suffix(prefix, "family_sizes.txt")?,
+        append_suffix(prefix, "grouping_metrics.txt")?,
+        append_suffix(prefix, "position_group_sizes.txt")?,
+    ])
 }
 
 /// Write all group metrics files for the chain-builder finalize hook.
@@ -1023,13 +1032,9 @@ pub(crate) fn write_metrics_for_chain(
 
     // --metrics prefix outputs (all three files)
     if let Some(prefix) = metrics_prefix {
-        let family_path = with_extension(prefix, "family_sizes.txt");
+        let [family_path, gm_path, position_path] = group_metrics_paths(prefix)?;
         write_metrics(&family_path, &family_size_metrics, "family size histogram")?;
-
-        let gm_path = with_extension(prefix, "grouping_metrics.txt");
         write_metrics(&gm_path, std::slice::from_ref(grouping_metrics), "grouping metrics")?;
-
-        let position_path = with_extension(prefix, "position_group_sizes.txt");
         write_metrics(
             &position_path,
             &position_group_size_metrics,
@@ -1073,8 +1078,8 @@ mod tests {
             "position_group_size\tcount\tfraction\tfraction_gt_or_eq_position_group_size\n";
         for (path, header) in [
             (histogram, family_header),
-            (with_extension(&prefix, "family_sizes.txt"), family_header),
-            (with_extension(&prefix, "position_group_sizes.txt"), position_header),
+            (append_suffix(&prefix, "family_sizes.txt")?, family_header),
+            (append_suffix(&prefix, "position_group_sizes.txt")?, position_header),
         ] {
             assert_eq!(std::fs::read_to_string(&path)?, header, "{}", path.display());
         }
@@ -2341,11 +2346,9 @@ mod tests {
 
     /// Helper to build the paths for `--metrics PREFIX` output files.
     fn metrics_prefix_paths(prefix: &Path) -> (PathBuf, PathBuf, PathBuf) {
-        (
-            with_extension(prefix, "family_sizes.txt"),
-            with_extension(prefix, "grouping_metrics.txt"),
-            with_extension(prefix, "position_group_sizes.txt"),
-        )
+        let [family, grouping, position] =
+            group_metrics_paths(prefix).expect("test metrics prefix names a file");
+        (family, grouping, position)
     }
 
     #[test]
@@ -6593,6 +6596,82 @@ mod tests {
             "error should point at `fgumi sort` as the remediation: {msg}",
         );
 
+        Ok(())
+    }
+
+    /// `group --metrics out/` writes `out.family_sizes.txt` etc. next to `out`, not hidden
+    /// files inside an `out` directory.
+    #[test]
+    fn test_metrics_prefix_with_trailing_separator_names_files_beside_it() -> Result<()> {
+        let (r1, r2) = build_test_pair("a01", 0, 100, 300, 60, 60, "AAAAAAAA");
+        let input = create_test_bam(vec![r1, r2])?;
+        let paths = TestPaths::new()?;
+        let metrics_dir = TempDir::new()?;
+        let mut prefix = metrics_dir.path().join("out").into_os_string();
+        prefix.push("/");
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
+            },
+            metrics: Some(PathBuf::from(prefix)),
+            ..test_group_cmd(Strategy::Identity, 0)
+        };
+        cmd.execute("test")?;
+
+        let mut produced: Vec<String> = std::fs::read_dir(metrics_dir.path())?
+            .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<_>>()?;
+        produced.sort();
+        assert_eq!(
+            produced,
+            vec![
+                "out.family_sizes.txt".to_string(),
+                "out.grouping_metrics.txt".to_string(),
+                "out.position_group_sizes.txt".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    /// The `--output` collision guard derives the `--metrics` files with the same helper the
+    /// writer uses, so it sees `out/` as `out.*` and rejects an `--output` that lands on one of
+    /// them before any writer opens (nothing is written).
+    #[test]
+    fn test_metrics_prefix_with_trailing_separator_collides_with_output() -> Result<()> {
+        let (r1, r2) = build_test_pair("a01", 0, 100, 300, 60, 60, "AAAAAAAA");
+        let input = create_test_bam(vec![r1, r2])?;
+        let dir = TempDir::new()?;
+        let mut prefix = dir.path().join("out").into_os_string();
+        prefix.push("/");
+        let output = dir.path().join("out.family_sizes.txt");
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: output.clone(),
+                async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
+            },
+            metrics: Some(PathBuf::from(prefix)),
+            ..test_group_cmd(Strategy::Identity, 0)
+        };
+        let err = cmd.execute("test").expect_err("--output collides with a --metrics file");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "--output and --metrics both write to {}: two outputs on one destination would \
+                 overwrite each other byte for byte, or interleave on a shared stream, and either \
+                 way nothing can read the result; give one a different path",
+                output.display()
+            )
+        );
+        assert_eq!(std::fs::read_dir(dir.path())?.count(), 0, "nothing may be written");
         Ok(())
     }
 
