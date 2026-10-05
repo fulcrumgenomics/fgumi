@@ -1204,21 +1204,19 @@ fn drained_input(command: &str, dir: &Path) -> PathBuf {
 ///
 /// A non-zero exit is a legitimate — and stronger — form of "the output depends
 /// on the input" than writing different bytes, but only when the command exits
-/// for the declared reason. The reason is pinned, not just the command name,
-/// because the two entries here fail in genuinely different ways and neither
-/// would notice being replaced by an unrelated failure:
-///
-/// - `extract` *refuses* the input: it cannot infer a quality encoding with no
-///   records to look at.
-/// - `compare` does not refuse anything — it runs to completion and exits 1
-///   because the drained file and the populated oracle **differ**, which is
-///   itself the dependence being tested.
-///
-/// A command that starts failing for a new reason — a bad flag combination, a
+/// for the declared reason. The reason is pinned, not just the command name, so
+/// a command that starts failing for a new reason — a bad flag combination, a
 /// rejected header, a panic — no longer matches its phrase and surfaces here
 /// instead of being absorbed.
-/// Each phrase must be one the command emits regardless of `RUST_LOG`. `extract`
-/// fails with an `anyhow` error, which reaches stderr unconditionally. `compare`
+///
+/// The only entry is `compare` (built with the `compare` feature), which does
+/// not refuse anything: it runs to completion and exits 1 because the drained
+/// file and the populated oracle **differ**, which is itself the dependence
+/// being tested. `extract` is deliberately absent: an empty FASTQ yields a
+/// header-only BAM (fgbio `FastqToBam` parity), so it goes through the byte
+/// comparison.
+///
+/// Each phrase must be one the command emits regardless of `RUST_LOG`. `compare`
 /// is pinned to its **stdout** `RESULT:` line rather than the matching
 /// `info!("BAM files differ")`: log records are filtered by `RUST_LOG`
 /// (`main.rs` builds the logger with `Env::default().default_filter_or("info")`),
@@ -1227,7 +1225,6 @@ fn drained_input(command: &str, dir: &Path) -> PathBuf {
 /// correctly-behaving binary. The `RESULT:` line is a `println!` gated only on
 /// `--quiet`, which this harness never passes.
 const DRAINED_INPUT_NONZERO_EXITS: &[(&str, &str)] = &[
-    ("extract", "Cannot detect quality encoding: no records provided"),
     #[cfg(feature = "compare")]
     ("compare", "RESULT: BAM files DIFFER"),
 ];

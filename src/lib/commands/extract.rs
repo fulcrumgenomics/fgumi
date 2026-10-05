@@ -15,7 +15,10 @@
 //! quality encodings. Detection pools the heads of all input FASTQs (EXT3-01), matching fgbio
 //! `FastqToBam`. When no encoding matches the observed qualities, fgumi fails like fgbio's
 //! `case Nil => fail(...)` (EXT3-03) but improves on its static message by reporting the
-//! observed quality range in the error (see `QualityEncoding::from_stats`).
+//! observed quality range in the error (see `QualityEncoding::from_stats`). When every input is
+//! empty there is nothing to detect from, and extract writes a header-only BAM, as fgbio
+//! `FastqToBam` does, and logs a warning that no records were emitted. An empty file paired with
+//! a populated one is still rejected as out of sync.
 
 use crate::commands::command::Command;
 use crate::commands::common::{
@@ -266,23 +269,19 @@ struct QualDetectionStats {
     min_qual: u8,
     /// Maximum quality byte observed across all non-empty sampled reads.
     max_qual: u8,
-    /// Total number of quality bytes observed (0 if every sampled read was empty).
+    /// Total number of quality bytes observed (0 if no records were sampled or
+    /// every sampled read was empty).
     total_bases: u64,
-    /// Number of records sampled (including empty-quality reads); 0 means no
-    /// records were available at all.
-    num_records: u64,
 }
 
 impl QualDetectionStats {
     fn new() -> Self {
-        Self { min_qual: u8::MAX, max_qual: u8::MIN, total_bases: 0, num_records: 0 }
+        Self { min_qual: u8::MAX, max_qual: u8::MIN, total_bases: 0 }
     }
 
     /// Fold one sampled read's quality bytes into the running summary. Empty
-    /// qualities still count as a record (so detection can tell "no records" from
-    /// "records with empty qualities") but contribute no min/max/base statistics.
+    /// qualities contribute no min/max/base statistics.
     fn observe(&mut self, qual: &[u8]) {
-        self.num_records += 1;
         for &q in qual {
             self.min_qual = self.min_qual.min(q);
             self.max_qual = self.max_qual.max(q);
@@ -327,13 +326,13 @@ impl QualityEncoding {
     /// (min, max, counts) summary instead of retaining `inputs × sample × read`
     /// bytes in memory (see [`sample_detection_quals`]).
     fn from_stats(stats: &QualDetectionStats) -> Result<Self> {
-        if stats.num_records == 0 {
-            bail!("Cannot detect quality encoding: no records provided");
-        }
+        let QualDetectionStats { min_qual, max_qual, total_bases } = *stats;
 
-        let QualDetectionStats { min_qual, max_qual, total_bases, .. } = *stats;
-
-        // If all reads were empty, we can't detect encoding but we'll default to Standard
+        // With no qualities to inspect (every input empty, or only empty reads) there
+        // is nothing to detect and nothing to convert, so default to Standard. An
+        // all-empty input therefore yields a header-only BAM rather than an error, matching
+        // fgbio `FastqToBam`, whose detector reports every encoding as compatible when
+        // it has sampled nothing and so never reaches its `case Nil => fail(...)`.
         if total_bases == 0 {
             return Ok(QualityEncoding::Standard);
         }
@@ -1020,7 +1019,9 @@ fn sample_detection_quals(
             open_fastq_reader(input, 1, false, check_crc, no_check_crc)?,
             BUFFER_SIZE,
         );
-        sample_into(&mut reader, &mut stats)?;
+        sample_into(&mut reader, &mut stats).with_context(|| {
+            format!("Failed to read {} while detecting its quality encoding", input.display())
+        })?;
     }
     Ok(stats)
 }
@@ -1067,7 +1068,8 @@ fn sample_detection_quals_from_stream(
     let tee = TeeReader::new(reader);
     let mut sampler =
         SimdFastqReader::with_capacity(BufReader::with_capacity(BUFFER_SIZE, tee), BUFFER_SIZE);
-    sample_into(&mut sampler, &mut stats)?;
+    sample_into(&mut sampler, &mut stats)
+        .context("Failed to read stdin while detecting its quality encoding")?;
 
     let (consumed, source) = sampler.into_inner().into_inner().into_parts();
     let replayed: Box<dyn BufRead + Send> =
@@ -1141,10 +1143,14 @@ fn open_fastq_input_readers(
 /// decompression thread count (not a sampling one) because that same reader
 /// decompresses every record that follows.
 ///
+/// When nothing is sampled (every input empty, or only empty reads) the encoding
+/// defaults to [`QualityEncoding::Standard`]; there is nothing to convert, so an
+/// all-empty input yields a header-only BAM.
+///
 /// # Errors
 ///
-/// Returns an error if a reader cannot be opened, the FASTQ is malformed, or the
-/// encoding cannot be determined from the sampled qualities.
+/// Returns an error if a reader cannot be opened, the FASTQ is malformed, or a
+/// sampled quality falls outside the printable ASCII range (33-126).
 pub(crate) fn detect_encoding_and_open_fastq_readers(
     inputs: &[PathBuf],
     interleaved: bool,
@@ -2792,6 +2798,105 @@ mod tests {
         assert!(err.to_string().contains("had too few bases to demux"));
     }
 
+    /// fgbio parity oracle: `FastqToBam` (fgbio e51a661) over FASTQs with no records writes a
+    /// header-only unmapped BAM. With nothing sampled the detector's quality counter is empty, so
+    /// `compatibleEncodings` (`QualityEncoding.scala:132-134`, a `forall` over that counter) admits
+    /// every encoding and `rankedCompatibleEncodings` (`QualityEncoding.scala:143-147`) returns
+    /// them unranked. `FastqToBam.scala:131-137` therefore takes its multiple-candidates branch
+    /// and picks the first declared encoding (Solexa) rather than reaching
+    /// `case Nil => fail(...)`. The choice is immaterial with no qualities to convert; fgumi
+    /// defaults to Standard. Either way the run succeeds, so fgumi must likewise skip detection
+    /// rather than fail, and write the full extract header with zero records.
+    ///
+    /// Secondary context only: `ExtractUmisFromBamTest.scala:104` ("accept a single molecular
+    /// index SAM tag") also runs over an input with no records and completes, but it tests
+    /// `--single-tag` handling on BAM input and asserts nothing about the output, so it supplies
+    /// no expected values.
+    ///
+    /// Covers single-end, paired (`10M90T` x2) and interleaved input, each single-threaded and
+    /// with two threads.
+    #[rstest]
+    #[case::single_end_no_read_structure(1, &[], false, 0)]
+    #[case::single_end_no_read_structure_threaded(1, &[], false, 2)]
+    #[case::paired_10m90t(2, &["10M90T", "10M90T"], false, 0)]
+    #[case::paired_10m90t_threaded(2, &["10M90T", "10M90T"], false, 2)]
+    #[case::interleaved_10m90t(1, &["10M90T", "10M90T"], true, 0)]
+    #[case::interleaved_10m90t_threaded(1, &["10M90T", "10M90T"], true, 2)]
+    fn extract_empty_input_writes_empty_output(
+        #[case] num_inputs: usize,
+        #[case] read_structures: &[&str],
+        #[case] interleaved: bool,
+        #[case] threads: usize,
+    ) {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let inputs: Vec<PathBuf> =
+            (1..=num_inputs).map(|i| create_fastq(&tmp, &format!("r{i}.fq"), &[])).collect();
+        let output = tmp.path().join("output.bam");
+
+        let extract = Extract {
+            inputs,
+            output: output.clone(),
+            read_structures: read_structures
+                .iter()
+                .map(|rs| ReadStructure::from_str(rs).expect("valid read structure"))
+                .collect(),
+            store_umi_quals: false,
+            store_cell_quals: false,
+            store_sample_barcode_qualities: false,
+            extract_umis_from_read_names: false,
+            annotate_read_names: false,
+            single_tag: None,
+            read_group_id: "A".to_string(),
+            sample: "foo".to_string(),
+            library: "bar".to_string(),
+            barcode: None,
+            platform: "illumina".to_string(),
+            platform_unit: None,
+            platform_model: None,
+            sequencing_center: None,
+            predicted_insert_size: None,
+            description: None,
+            comment: vec![],
+            run_date: None,
+            threading: if threads == 0 {
+                ThreadingOptions::none()
+            } else {
+                ThreadingOptions::new(threads)
+            },
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
+            check_crc: false,
+            no_check_crc: false,
+            interleaved,
+        };
+
+        extract.execute("test").expect("extract must accept an input with no records");
+
+        assert_eq!(read_bam_records(&output), Vec::<RecordBuf>::new());
+
+        // The empty path must still write the whole extract header, not just a valid BAM.
+        let (_, header) = create_bam_reader(&output, 1).expect("failed to read output BAM");
+        let mut writer = noodles::sam::io::Writer::new(Vec::new());
+        writer.write_header(&header).expect("failed to render header");
+        let text = String::from_utf8(writer.into_inner()).expect("header is UTF-8");
+        let (programs, lines): (Vec<&str>, Vec<&str>) =
+            text.lines().partition(|line| line.starts_with("@PG"));
+        assert_eq!(
+            lines,
+            vec!["@HD\tVN:1.6\tSO:unsorted\tGO:query", "@RG\tID:A\tSM:foo\tLB:bar\tPL:illumina"]
+        );
+        // `VN` carries the build version, so only the stable fields are pinned.
+        assert_eq!(programs.len(), 1, "expected exactly one @PG, got {programs:?}");
+        assert!(
+            programs[0].starts_with("@PG\tID:fgumi\tPN:fgumi\tVN:")
+                && programs[0].ends_with("\tCL:test"),
+            "unexpected @PG: {}",
+            programs[0]
+        );
+    }
+
     #[test]
     fn test_extract_sample_barcode_qualities() {
         let tmp = TempDir::new().expect("failed to create temp dir");
@@ -4279,12 +4384,14 @@ mod tests {
 
     #[test]
     fn test_quality_encoding_detection_empty_input() {
-        // Test that empty input produces an error
+        // With no records there is nothing to detect from: default to Standard
+        // rather than fail, so an empty input yields a header-only BAM (fgbio
+        // `FastqToBam` parity).
         let records: Vec<Vec<u8>> = vec![];
 
-        let result = QualityEncoding::detect(&records);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("no records provided"));
+        let encoding = QualityEncoding::detect(&records)
+            .expect("detection with no records must default rather than fail");
+        assert_eq!(encoding, QualityEncoding::Standard);
     }
 
     /// EXT3-03 (fgbio parity + message improvement): fgbio `FastqToBam` fails with

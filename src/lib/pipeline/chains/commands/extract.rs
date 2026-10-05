@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
-use log::info;
+use log::{info, warn};
 use noodles::sam::header::Header;
 use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::ReadGroup;
@@ -40,7 +40,11 @@ use crate::pipeline::chains::FinalizeHook;
 /// Post-pipeline finalize hook for the extract stage.
 ///
 /// Logs the records-emitted count and calls `timer.log_completion` so the
-/// per-stage wall-time line appears in the log.
+/// per-stage wall-time line appears in the log. Warns when nothing was emitted:
+/// every input template yields at least one record (a read that cannot be
+/// extracted is an error, never a silent skip), so zero records means every
+/// input was empty. That run still succeeds, writing a header-only BAM as fgbio
+/// `FastqToBam` does, but is almost always an upstream mistake worth surfacing.
 pub(crate) struct ExtractFinalizeHook {
     /// Counter atomically incremented by `ExtractStep` as it emits
     /// `BamTemplateBatch`es downstream.
@@ -53,6 +57,9 @@ impl FinalizeHook for ExtractFinalizeHook {
         let ExtractFinalizeHook { records_emitted, timer } = *self;
         let n = records_emitted.load(Ordering::Relaxed);
         info!("Extract: completed ({n} records emitted)");
+        if n == 0 {
+            warn!("Extract: no records were emitted (every input FASTQ was empty)");
+        }
         timer.log_completion(n);
         Ok(())
     }
