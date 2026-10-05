@@ -3205,9 +3205,9 @@ mod tests {
         let value: Vec<u8> = (0..50u8).map(|i| b'A' + (i % 26)).collect();
         {
             let mut ed = fgumi_raw_bam::RawTagsEditor::from_vec(&mut rec);
-            ed.append_string(&fgumi_raw_bam::SamTag::RG, &value);
-            ed.append_array_i32(&fgumi_raw_bam::SamTag::CG, &[0; 50]);
-            ed.append_string(&[b'X', b'B'], &value);
+            ed.append_string(fgumi_raw_bam::SamTag::RG, &value);
+            ed.append_array_i32(fgumi_raw_bam::SamTag::CG, &[0; 50]);
+            ed.append_string([b'X', b'B'], &value);
         }
         let mut record = fgumi_raw_bam::RawRecord::from(rec);
 
@@ -3217,14 +3217,14 @@ mod tests {
         assert_eq!(result, (5, 10));
 
         let rg =
-            fgumi_raw_bam::find_string_tag_in_record(record.as_ref(), &fgumi_raw_bam::SamTag::RG)
+            fgumi_raw_bam::find_string_tag_in_record(record.as_ref(), fgumi_raw_bam::SamTag::RG)
                 .expect("RG tag present");
         assert_eq!(rg, &value[..], "a protected tag must not be clipped on upgrade");
         let aux = fgumi_raw_bam::aux_data_slice(record.as_ref());
         let cg =
-            fgumi_raw_bam::find_array_tag(aux, &fgumi_raw_bam::SamTag::CG).expect("CG tag present");
+            fgumi_raw_bam::find_array_tag(aux, fgumi_raw_bam::SamTag::CG).expect("CG tag present");
         assert_eq!(cg.count, 50, "a protected array tag must not be clipped on upgrade");
-        let xb = fgumi_raw_bam::find_string_tag_in_record(record.as_ref(), &[b'X', b'B'])
+        let xb = fgumi_raw_bam::find_string_tag_in_record(record.as_ref(), [b'X', b'B'])
             .expect("XB tag present");
         assert_eq!(xb, &value[5..40], "a per-base tag is clipped on upgrade");
     }
