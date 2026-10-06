@@ -27,6 +27,7 @@ fgumi-raw-bam = { workspace = true, features = ["test-utils"] }
 # tests. fgumi-bam-io does NOT depend on fgumi-consensus, so this is cycle-free.
 fgumi-bam-io = { workspace = true }
 tempfile = { workspace = true }
+itertools = { workspace = true }
 rstest = { workspace = true }
 proptest = { workspace = true }
 

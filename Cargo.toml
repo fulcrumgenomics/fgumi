@@ -57,6 +57,7 @@ crossbeam-utils = "0.8.21"
 csv = "1.1"
 fgoxide = "0.6.0"
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
+itertools = "0.14.0"
 libdeflater = "1.22"
 libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
 log = "0.4"
@@ -144,7 +145,7 @@ crossbeam-utils = { workspace = true }
 parking_lot = { workspace = true }
 libdeflater = { workspace = true }
 serde = { workspace = true }
-itertools = "0.14.0"
+itertools = { workspace = true }
 indexmap = "2"
 rand = { workspace = true }
 csv = { workspace = true }

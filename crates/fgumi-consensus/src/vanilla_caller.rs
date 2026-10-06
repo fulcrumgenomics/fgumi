@@ -3895,6 +3895,275 @@ mod tests {
         assert!(rejected_indices.is_empty(), "No reads should be rejected");
     }
 
+    /// Runs `filter_source_reads_by_alignment` over reads built from `cigars` (one read per
+    /// entry, in the given order) and returns the CIGARs of the retained reads in output order.
+    fn filter_kept_cigars(cigars: &[&str]) -> Vec<String> {
+        let options = VanillaUmiConsensusOptions::default();
+        let mut caller =
+            VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
+        let source_reads: Vec<SourceRead> = cigars
+            .iter()
+            .enumerate()
+            .map(|(i, cigar)| {
+                let mut sr = create_source_read_with_cigar(cigar);
+                sr.original_idx = i;
+                sr
+            })
+            .collect();
+        let (filtered, _rejected) = caller.filter_source_reads_by_alignment(source_reads);
+        filtered.iter().map(|sr| simplified_cigar_to_string(&sr.simplified_cigar)).collect()
+    }
+
+    /// Tied alignment groups must resolve to the same winner, the group with the smallest
+    /// CIGAR, whatever the input order. CIGARs compare element by element on length, then
+    /// operator (`M < I < D`), as fgbio's `Cigar.cigarOrdering` does.
+    ///
+    /// The first four cases port fgbio's tie-breaking tests for `filterToMostCommonAlignment`:
+    ///
+    /// - `VanillaUmiConsensusCallerTest.scala:583` "select deterministically when alignment
+    ///   groups have equal sizes"
+    /// - `VanillaUmiConsensusCallerTest.scala:608` "break ties by operator type when element
+    ///   lengths are equal"
+    /// - `VanillaUmiConsensusCallerTest.scala:630` "break ties by number of elements when
+    ///   prefixes match" (decided by the first element's length, not the element count; see
+    ///   [`test_filter_tied_prefix_groups_prefer_fewer_elements`] for that rule)
+    /// - `VanillaUmiConsensusCallerTest.scala:652` "select deterministically among three or
+    ///   more tied groups"
+    ///
+    /// In the first three ports the tied groups differ in query length, so the length sort
+    /// fixes which group is created first and their orderings pin only the winner. The
+    /// `*_equal_query_lengths` and `element_length_outranks_operator` cases tie on query length
+    /// too, so their orderings create the groups in opposite orders and also catch order
+    /// dependence and a missing CIGAR tie-break.
+    #[rstest]
+    #[case::smaller_first_element_wins(
+        &[
+            &["25M1D24M", "25M1D24M", "50M", "50M"][..],
+            &["50M", "50M", "25M1D24M", "25M1D24M"][..],
+        ],
+        "25M1D24M",
+        2
+    )]
+    #[case::insertion_sorts_before_deletion(
+        &[
+            &["25M1I24M", "25M1I24M", "25M1D24M", "25M1D24M"][..],
+            &["25M1D24M", "25M1D24M", "25M1I24M", "25M1I24M"][..],
+        ],
+        "25M1I24M",
+        2
+    )]
+    #[case::smaller_first_element_wins_before_deletion(
+        &[
+            &["50M", "50M", "40M1D9M", "40M1D9M"][..],
+            &["40M1D9M", "40M1D9M", "50M", "50M"][..],
+        ],
+        "40M1D9M",
+        2
+    )]
+    #[case::three_tied_groups(
+        &[
+            &["30M1D19M", "30M1D19M", "30M1I19M", "30M1I19M", "50M", "50M"][..],
+            &["50M", "50M", "30M1D19M", "30M1D19M", "30M1I19M", "30M1I19M"][..],
+            &["30M1I19M", "50M", "30M1D19M", "30M1I19M", "50M", "30M1D19M"][..],
+        ],
+        "30M1I19M",
+        2
+    )]
+    #[case::smaller_first_element_wins_equal_query_lengths(
+        &[
+            &["25M1D25M", "25M1D25M", "50M", "50M"][..],
+            &["50M", "50M", "25M1D25M", "25M1D25M"][..],
+        ],
+        "25M1D25M",
+        2
+    )]
+    #[case::insertion_sorts_before_deletion_equal_query_lengths(
+        &[
+            &["25M1I24M", "25M1I24M", "25M1D25M", "25M1D25M"][..],
+            &["25M1D25M", "25M1D25M", "25M1I24M", "25M1I24M"][..],
+        ],
+        "25M1I24M",
+        2
+    )]
+    // `1D` is shorter than `2I` but has the larger operator; length is compared first.
+    #[case::element_length_outranks_operator(
+        &[
+            &["25M1D25M", "25M1D25M", "25M2I23M", "25M2I23M"][..],
+            &["25M2I23M", "25M2I23M", "25M1D25M", "25M1D25M"][..],
+        ],
+        "25M1D25M",
+        2
+    )]
+    fn test_filter_tied_alignment_groups_select_same_winner_in_any_input_order(
+        #[case] orderings: &[&[&str]],
+        #[case] expected_winner: &str,
+        #[case] expected_count: usize,
+    ) {
+        let expected: Vec<String> = vec![expected_winner.to_string(); expected_count];
+        for ordering in orderings {
+            assert_eq!(
+                filter_kept_cigars(ordering),
+                expected,
+                "input order {ordering:?} must retain only the {expected_winner} group"
+            );
+        }
+    }
+
+    /// When one tied group's CIGAR matches the other's leading elements, the CIGAR with fewer
+    /// elements is smaller, as in fgbio's `Cigar.cigarOrdering` (`Alignment.scala:102-112`):
+    /// `25M` and `25M1D` each form a group of one, and `25M` wins.
+    ///
+    /// The input order is fixed. `25M` is a prefix of `25M1D` with the same query length, so
+    /// listing `25M1D` first would let `25M` join its group instead of forming a tied one (in
+    /// fgbio as well).
+    #[test]
+    fn test_filter_tied_prefix_groups_prefer_fewer_elements() {
+        assert_eq!(filter_kept_cigars(&["25M", "25M1D"]), vec!["25M".to_string()]);
+    }
+
+    /// Reads whose CIGARs are prefixes of other reads' CIGARs (`40M` is a prefix of both `50M`
+    /// and `40M1I9M`; `30M` of all three) must land in the same alignment groups whether the
+    /// input lists them shortest-first or longest-first. Alignment grouping sorts by
+    /// descending length before prefix matching and breaks size ties with a CIGAR comparator,
+    /// so no input permutation may change which group wins or which reads it keeps.
+    ///
+    /// Ids 0-1 are `50M`, ids 2-3 are `40M1I9M`, id 4 is `40M`, id 5 is `30M`. Both
+    /// 50-base groups absorb the two prefix reads (4 reads each), so the tie is broken by the
+    /// smaller CIGAR (`40M1I9M`, whose first element is shorter) and ids 0-1 are rejected.
+    ///
+    /// Complements the tie-breaking ports above; fgbio's `filterToMostCommonAlignment`
+    /// (`VanillaUmiConsensusCallerTest.scala:583`, `:630`) makes the same order-independence
+    /// guarantee. All 720 input orders are checked, so the claim is enumerated, not sampled.
+    ///
+    /// The guarantee holds because every prefix here is strictly shorter on the query than the
+    /// CIGARs it prefixes. A prefix of equal query length (one whose extension consumes no query,
+    /// e.g. `25M` vs `25M1D`) ties in the stable length sort, so input order decides whether it
+    /// is seen before or after the longer CIGAR's group exists. fgbio's `sortBy(-length)` does the
+    /// same given these CIGARs, so that case is out of scope here. For real hard-clipped records
+    /// the two tools can still build different CIGARs to group on; that is a separate issue.
+    #[test]
+    fn test_filter_prefix_cigars_group_identically_in_any_input_order() {
+        use itertools::Itertools;
+
+        let cigars = ["50M", "50M", "40M1I9M", "40M1I9M", "40M", "30M"];
+        let orders: Vec<Vec<usize>> = (0..cigars.len()).permutations(cigars.len()).collect();
+        assert_eq!(orders.len(), 720);
+
+        for order in &orders {
+            let options = VanillaUmiConsensusOptions::default();
+            let mut caller =
+                VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
+
+            // `original_idx` is the read's stable identity, independent of its input position.
+            let source_reads: Vec<SourceRead> = order
+                .iter()
+                .map(|&id| {
+                    let mut sr = create_source_read_with_cigar(cigars[id]);
+                    sr.original_idx = id;
+                    sr
+                })
+                .collect();
+
+            let (filtered, rejected) = caller.filter_source_reads_by_alignment(source_reads);
+
+            // Retained reads come back in input order (fgbio restores the original order after
+            // grouping), so the expected ids are the winning group's ids in this input order.
+            let kept_ids: Vec<usize> = filtered.iter().map(|sr| sr.original_idx).collect();
+            let expected_kept: Vec<usize> =
+                order.iter().copied().filter(|id| [2, 3, 4, 5].contains(id)).collect();
+            assert_eq!(kept_ids, expected_kept, "input order {order:?}");
+
+            let mut rejected_ids: Vec<usize> = rejected.into_iter().collect();
+            rejected_ids.sort_unstable();
+            assert_eq!(rejected_ids, vec![0, 1], "input order {order:?}");
+        }
+    }
+
+    /// End-to-end counterpart of
+    /// [`test_filter_prefix_cigars_group_identically_in_any_input_order`]: the consensus called
+    /// from the same reads must be byte-identical whether the reads are listed shortest-first or
+    /// longest-first. The `50M` reads carry a `G` at query position 40 and the `40M1I9M` reads a
+    /// `C`, so a consensus built from the wrong alignment group shows up as a different base
+    /// there. Both 50-base CIGARs have the same query length, so only an order that lists
+    /// `40M1I9M` before `50M` (`fully_reversed`) changes which of their groups is created first.
+    #[rstest]
+    #[case::ascending_length(&[5, 4, 0, 1, 2, 3])]
+    #[case::descending_length(&[0, 1, 2, 3, 4, 5])]
+    #[case::fully_reversed(&[5, 4, 3, 2, 1, 0])]
+    fn test_consensus_with_prefix_cigars_is_identical_in_any_input_order(#[case] order: &[usize]) {
+        // (cigar ops as (BAM op code, length), base at query position 40 if the read has one)
+        type ReadSpec = (&'static [(u32, usize)], Option<u8>);
+        let specs: [ReadSpec; 6] = [
+            (&[(0, 50)], Some(b'G')),
+            (&[(0, 50)], Some(b'G')),
+            (&[(0, 40), (1, 1), (0, 9)], Some(b'C')),
+            (&[(0, 40), (1, 1), (0, 9)], Some(b'C')),
+            (&[(0, 40)], None),
+            (&[(0, 30)], None),
+        ];
+        let make_read = |id: usize| -> RawRecord {
+            let (ops, base_40) = specs[id];
+            let query_len: usize = ops.iter().filter(|(op, _)| *op != 2).map(|(_, len)| len).sum();
+            let mut seq = vec![b'A'; query_len];
+            if let Some(base) = base_40 {
+                seq[40] = base;
+            }
+            let encoded: Vec<u32> = ops.iter().map(|&(op, len)| encode_op(op, len)).collect();
+            let mut b = SamBuilder::new();
+            b.read_name(format!("read{id}").as_bytes())
+                .flags(0)
+                .ref_id(0)
+                .pos(100)
+                .sequence(&seq)
+                .qualities(&vec![b'I'; query_len])
+                .cigar_ops(&encoded)
+                .add_string_tag(SamTag::MI, b"UMI123");
+            b.build()
+        };
+
+        // Calls consensus with a fresh caller over the reads with the given ids, in that order.
+        let call_consensus = |ids: &[usize]| {
+            let options = VanillaUmiConsensusOptions {
+                min_reads: 1,
+                min_consensus_base_quality: 0,
+                ..VanillaUmiConsensusOptions::default()
+            };
+            let mut caller =
+                VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
+            let reads: Vec<RawRecord> = ids.iter().map(|&id| make_read(id)).collect();
+            consensus_reads_from_raw(&mut caller, reads).expect("consensus call should succeed")
+        };
+
+        let output = call_consensus(order);
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let mut expected_bases = vec![b'A'; 50];
+        expected_bases[40] = b'C';
+        assert_eq!(records[0].bases, expected_bases, "input order {order:?}");
+        // 40M1I9M x2 + 40M + 30M => depth 4 at the first 30 bases, 3 up to base 40, 2 after.
+        // The depth profile is the same for either 50-base group, so it shows that both prefix
+        // reads joined the winner; the base at position 40 above is what identifies the group.
+        let mut expected_depths = vec![4_i16; 30];
+        expected_depths.extend([3_i16; 10]);
+        expected_depths.extend([2_i16; 10]);
+        assert_eq!(
+            records[0].get_i16_array_tag(SamTag::CD_BASES).expect("cd tag should be present"),
+            expected_depths,
+            "input order {order:?}"
+        );
+        assert_eq!(
+            records[0].get_int_tag(SamTag::CD).expect("cD tag should be present"),
+            4,
+            "input order {order:?}"
+        );
+        // The consensus record for this order must be byte-identical to the reference
+        // (descending-length) order, which is what fgbio sorts into before grouping. For the
+        // `descending_length` case this is a self-comparison; that case is pinned by the base and
+        // depth assertions above.
+        let reference = call_consensus(&[0, 1, 2, 3, 4, 5]);
+        assert_eq!(output.data, reference.data, "input order {order:?}");
+    }
+
     // ============================================================================
     // toSourceRead tests (ported from fgbio VanillaUmiConsensusCallerTest.scala)
     // ============================================================================
