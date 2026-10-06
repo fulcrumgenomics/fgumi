@@ -14,7 +14,8 @@ use std::collections::HashSet;
 /// Get the ID of the last program in the @PG chain (for PP chaining).
 ///
 /// Finds the program that is not referenced by any other program's PP tag,
-/// i.e., the "leaf" of the chain.
+/// i.e., the "leaf" of the chain. When the header holds several chains, the
+/// leaf that appears last in header order (the most recently added) is chosen.
 ///
 /// # Arguments
 ///
@@ -40,11 +41,9 @@ pub fn get_last_program_id(header: &Header) -> Option<String> {
         }
     }
 
-    // Find a program that is NOT referenced (the leaf/end of chain)
-    for (id, _pg) in program_map {
-        if !referenced.contains(id.as_slice()) {
-            return Some(String::from_utf8_lossy(id).to_string());
-        }
+    // Find the last program that is NOT referenced (the newest leaf/end of chain)
+    if let Some(id) = program_map.keys().rev().find(|id| !referenced.contains(id.as_slice())) {
+        return Some(String::from_utf8_lossy(id).to_string());
     }
 
     // Fallback: return any program ID (shouldn't happen with valid headers)
@@ -258,6 +257,18 @@ mod tests {
     }
 
     #[test]
+    fn test_get_last_program_id_multiple_chains_picks_newest_leaf() {
+        assert_eq!(get_last_program_id(&header_with_two_chains()), Some("samtools".to_string()));
+
+        let header = Header::builder()
+            .add_program("bwa-mem3", Map::<Program>::default())
+            .add_program("samtools", Map::<Program>::default())
+            .add_program("fgumi", program_with_pp("bwa-mem3"))
+            .build();
+        assert_eq!(get_last_program_id(&header), Some("fgumi".to_string()));
+    }
+
+    #[test]
     fn test_make_unique_program_id_no_collision() {
         let header = Header::default();
         assert_eq!(make_unique_program_id(&header, "fgumi"), "fgumi");
@@ -427,6 +438,7 @@ mod tests {
     #[test]
     fn test_add_pg_record_repeated_adds_grow_by_one() {
         let mut header = header_with_two_chains();
+        let mut expected_pp = "samtools".to_string();
 
         for i in 0..6 {
             let expected_id = if i == 0 { "fgumi".to_string() } else { format!("fgumi.{i}") };
@@ -439,8 +451,8 @@ mod tests {
             assert_eq!(programs.as_ref().len(), before + 1, "each add must insert one @PG");
             let (last_id, _) = programs.as_ref().last().expect("header has programs");
             assert_eq!(last_id.to_string(), expected_id);
-            let pp = previous_program(&header, &expected_id).expect("new @PG must carry PP");
-            assert!(programs.as_ref().contains_key(pp.as_bytes()), "PP must name an existing @PG");
+            assert_eq!(previous_program(&header, &expected_id), Some(expected_pp));
+            expected_pp = expected_id;
         }
 
         assert_eq!(header.programs().as_ref().len(), 8);
