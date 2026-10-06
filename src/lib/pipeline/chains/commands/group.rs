@@ -254,10 +254,7 @@ pub(crate) fn build_group_process_step(
                     // would silently drop every read in it and still exit 0, so fail
                     // the run and let the user fix the input or the strategy. (Matches
                     // the non-chain `Group::execute` path.)
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Failed to assign UMI groups: {e:#}"),
-                    ));
+                    return Err(crate::umi::assign_umi_groups_error(&e));
                 }
 
                 let distinct_mi_count: u64 =

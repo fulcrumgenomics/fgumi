@@ -37,7 +37,7 @@ fn test_identity_assigner_basic_workflow() {
 
     // Apply identity UMI assigner
     let assigner = IdentityUmiAssigner::default();
-    let assignments = assigner.assign(&umis);
+    let assignments = assigner.assign(&umis).expect("assign should succeed");
 
     // Helper to find the MoleculeId for a given UMI string
     let get_assignment = |umi: &str| -> Option<&fgumi_lib::template::MoleculeId> {
@@ -86,7 +86,7 @@ fn test_adjacency_assigner_with_error_correction() {
 
     // Apply adjacency assigner with 1 mismatch allowed
     let assigner = AdjacencyUmiAssigner::new(1, 1, 100);
-    let assignments = assigner.assign(&umis);
+    let assignments = assigner.assign(&umis).expect("assign should succeed");
 
     // Helper to find the MoleculeId for a given UMI string
     let get_assignment = |umi: &str| -> Option<&fgumi_lib::template::MoleculeId> {
@@ -137,7 +137,7 @@ fn test_adjacency_respects_count_gradient() {
 
     // Apply adjacency assigner
     let assigner = AdjacencyUmiAssigner::new(1, 1, 100);
-    let assignments = assigner.assign(&umis);
+    let assignments = assigner.assign(&umis).expect("assign should succeed");
 
     // Helper to find the MoleculeId for a given UMI string
     let get_assignment = |umi: &str| -> Option<&fgumi_lib::template::MoleculeId> {

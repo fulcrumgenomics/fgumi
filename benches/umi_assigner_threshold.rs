@@ -117,14 +117,14 @@ fn bench_identity(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("sequential", n), &umis, |b, umis| {
             b.iter(|| {
                 let assigner = Strategy::Identity.new_assigner_full(0, 1, INDEX_THRESHOLD);
-                black_box(assigner.assign(black_box(umis)))
+                black_box(assigner.assign(black_box(umis)).expect("assign should succeed"))
             });
         });
 
         group.bench_with_input(BenchmarkId::new("parallel", n), &umis, |b, umis| {
             b.iter(|| {
                 let assigner = ParallelIdentityAssigner::new(threads);
-                black_box(assigner.assign(black_box(umis)))
+                black_box(assigner.assign(black_box(umis)).expect("assign should succeed"))
             });
         });
     }
@@ -180,7 +180,7 @@ fn bench_edit(c: &mut Criterion) {
                     // every sub-200 arm identical to the default and the sweep
                     // unable to locate the crossover it exists to find.
                     let assigner = SimpleErrorUmiAssigner::new_with_index_threshold(1, threshold);
-                    black_box(assigner.assign(black_box(umis)))
+                    black_box(assigner.assign(black_box(umis)).expect("assign should succeed"))
                 });
             });
         }
@@ -188,7 +188,7 @@ fn bench_edit(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("parallel", n), &umis, |b, umis| {
             b.iter(|| {
                 let assigner = ParallelEditAssigner::new(1, threads);
-                black_box(assigner.assign(black_box(umis)))
+                black_box(assigner.assign(black_box(umis)).expect("assign should succeed"))
             });
         });
     }
@@ -205,14 +205,14 @@ fn bench_adjacency(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("sequential", n), &umis, |b, umis| {
             b.iter(|| {
                 let assigner = Strategy::Adjacency.new_assigner_full(1, 1, INDEX_THRESHOLD);
-                black_box(assigner.assign(black_box(umis)))
+                black_box(assigner.assign(black_box(umis)).expect("assign should succeed"))
             });
         });
 
         group.bench_with_input(BenchmarkId::new("parallel", n), &umis, |b, umis| {
             b.iter(|| {
                 let assigner = ParallelAdjacencyAssigner::new(1, threads);
-                black_box(assigner.assign(black_box(umis)))
+                black_box(assigner.assign(black_box(umis)).expect("assign should succeed"))
             });
         });
     }
@@ -229,14 +229,14 @@ fn bench_paired(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("sequential", n), &umis, |b, umis| {
             b.iter(|| {
                 let assigner = Strategy::Paired.new_assigner_full(1, 1, INDEX_THRESHOLD);
-                black_box(assigner.assign(black_box(umis)))
+                black_box(assigner.assign(black_box(umis)).expect("assign should succeed"))
             });
         });
 
         group.bench_with_input(BenchmarkId::new("parallel", n), &umis, |b, umis| {
             b.iter(|| {
                 let assigner = ParallelPairedAssigner::new(1, threads);
-                black_box(assigner.assign(black_box(umis)))
+                black_box(assigner.assign(black_box(umis)).expect("assign should succeed"))
             });
         });
     }

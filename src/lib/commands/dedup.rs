@@ -34,6 +34,7 @@ use crate::template_filter::{
     TemplateFilterConfig, filter_template, template_has_malformed_record,
     template_is_fully_unmapped,
 };
+use crate::umi::assign_umis;
 use ahash::AHashMap;
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -601,20 +602,6 @@ fn get_pair_orientation(template: &Template) -> (bool, bool) {
     (r1_positive, r2_positive)
 }
 
-/// Truncate UMIs to minimum length if specified.
-fn truncate_umis(umis: Vec<String>, min_umi_length: Option<usize>) -> Result<Vec<String>> {
-    match min_umi_length {
-        None => Ok(umis),
-        Some(min_len) => {
-            let min_length = umis.iter().map(String::len).min().unwrap_or(0);
-            if min_length < min_len {
-                bail!("UMI found shorter than expected ({min_length} < {min_len})");
-            }
-            Ok(umis.into_iter().map(|u| u[..min_len].to_string()).collect())
-        }
-    }
-}
-
 /// Assign UMI groups to a subset of templates.
 fn assign_umi_groups_for_indices(
     templates: &mut [Template],
@@ -668,9 +655,8 @@ fn assign_umi_groups_for_indices(
         umis.push(processed_umi);
     }
 
-    // Truncate UMIs if needed (skip in no-umi mode)
-    let truncated_umis = if no_umi { umis } else { truncate_umis(umis, min_umi_length)? };
-    let assignments = assigner.assign(&truncated_umis);
+    // Apply --min-umi-length (skipped in no-umi mode) and assign
+    let assignments = assign_umis(assigner, umis, if no_umi { None } else { min_umi_length })?;
 
     for (i, &idx) in indices.iter().enumerate() {
         templates[idx].mi = assignments[i];
@@ -953,7 +939,8 @@ pub(crate) fn process_position_group(
     // `Template::mi`; it never calls `records_mut()` or touches the BAM bytes.
     let mut templates: Vec<Template> = filtered_templates;
     if let Err(e) = assign_umi_groups(&mut templates, assigner, raw_tag, min_umi_length, no_umi) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+        // Same wording as `group`'s chain step, with the full cause chain.
+        return Err(crate::umi::assign_umi_groups_error(&e));
     }
 
     // Clear existing duplicate flags before re-marking. This runs *after* UMI
@@ -1118,7 +1105,7 @@ discarded (not marked) when:
 - A mapped read has mapping quality below -q/--min-map-q (default 0, i.e. no reads are
   dropped for mapping quality unless a threshold is set).
 - The mate mapping quality (MQ tag) is below -q/--min-map-q, when the mate is mapped.
-- The UMI contains an N base (unless --no-umi is given).
+- The UMI contains an N or n base (unless --no-umi is given).
 - The UMI is shorter than -l/--min-umi-length, when that option is set.
 - The RX UMI tag is missing (unless --no-umi is given).
 - A record is truncated/corrupt (shorter than the minimum BAM record length).
@@ -1277,7 +1264,11 @@ pub struct MarkDuplicates {
     #[arg(short = 'e', long = "edits", default_value = "1")]
     pub edits: u32,
 
-    /// Minimum UMI length (UMIs shorter than this are discarded)
+    /// Minimum UMI length in bases (at least 1). Shorter UMIs are discarded; the rest are
+    /// truncated to the shortest UMI they are compared with. Dashes and other non-base
+    /// characters are not counted, and are ignored when comparing UMIs. With `identity` or
+    /// `--edits 0`, UMIs are first split by their first `--min-umi-length` bases and each split
+    /// is truncated separately (as in `fgumi group`).
     #[arg(short = 'l', long = "min-umi-length")]
     pub min_umi_length: Option<usize>,
 
@@ -1336,10 +1327,8 @@ impl Command for MarkDuplicates {
         }
         crate::commands::common::reject_output_collisions(&outputs)?;
 
-        // Validate strategy/min-umi-length combination
-        if self.min_umi_length.is_some() && matches!(self.strategy, Strategy::Paired) {
-            bail!("Paired strategy cannot be used with --min-umi-length");
-        }
+        // Validate --min-umi-length (at least 1, and not with the paired strategy)
+        crate::umi::validate_min_umi_length(self.min_umi_length, self.strategy)?;
 
         // Validate --no-umi is not used with paired strategy
         if self.no_umi && matches!(self.strategy, Strategy::Paired) {
@@ -1564,6 +1553,7 @@ impl crate::pipeline::core::item::Ordered for BatchedProcessedDedupGroups {
 mod tests {
     use super::*;
     use crate::umi::IdentityUmiAssigner;
+    use crate::umi::truncate_umis;
     use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags, testutil::encode_op};
     use rstest::rstest;
 
@@ -2626,6 +2616,99 @@ mod tests {
         assert_eq!(distinct_molecules_across_strands(no_umi, umi), expected_molecules);
     }
 
+    /// The mixed-length error for edit and adjacency, which ends with a `--min-umi-length` hint.
+    const MIXED_3_4_WITH_HINT: &str =
+        "Multiple UMI lengths: 3, 4 (use --min-umi-length to truncate UMIs to a common length)";
+
+    /// `--min-umi-length` truncates to the shortest UMI (fgbio `truncateUmis`), not to the
+    /// option value: with 8-base UMIs and `--min-umi-length 6`, `ACGTACGT` and `ACGTACGA` stay
+    /// distinct under identity instead of collapsing to `ACGTAC`.
+    #[test]
+    fn assign_umi_groups_truncates_to_shortest_umi_not_option() {
+        let mut templates = vec![
+            template_with_strand_of_origin(b"a01", false, b"ACGTACGT"),
+            template_with_strand_of_origin(b"a02", false, b"ACGTACGA"),
+        ];
+        let assigner = Strategy::Identity.new_assigner_full(0, 1, 100);
+        assign_umi_groups(&mut templates, assigner.as_ref(), SamTag::RX, Some(6), false)
+            .expect("UMIs at least 6 bases long must group");
+        assert_ne!(templates[0].mi.to_vec_index(), templates[1].mi.to_vec_index());
+    }
+
+    /// `--min-umi-length` removes dashes before truncating (fgbio#1185), so dashed UMIs with the
+    /// same bases are the same UMI wherever their dashes fall: each pair below truncates to
+    /// `ACGTACGTA` on both sides and forms one molecule. Keeping the dash would compare it
+    /// against a base, and comparing characters would leave the two at different lengths.
+    #[rstest]
+    #[case::edit_trailing_dash(Strategy::Edit, b"ACGTACGT-A", b"ACGTACGTAC")]
+    #[case::adjacency_trailing_dash(Strategy::Adjacency, b"ACGTACGT-A", b"ACGTACGTAC")]
+    #[case::edit_interleaved_dash(Strategy::Edit, b"ACGTACGTA-T", b"ACG-TACGTA")]
+    #[case::adjacency_interleaved_dash(Strategy::Adjacency, b"ACGTACGTA-T", b"ACG-TACGTA")]
+    fn assign_umi_groups_truncates_dashed_umis_by_bases(
+        #[case] strategy: Strategy,
+        #[case] umi_a: &[u8],
+        #[case] umi_b: &[u8],
+    ) {
+        let mut templates = vec![
+            template_with_strand_of_origin(b"a01", false, umi_a),
+            template_with_strand_of_origin(b"a02", false, umi_b),
+        ];
+        let assigner = strategy.new_assigner_full(1, 1, 100);
+        assign_umi_groups(&mut templates, assigner.as_ref(), SamTag::RX, Some(8), false)
+            .expect("dashed UMIs must truncate to a common base length");
+        assert_eq!(templates[0].mi, templates[1].mi, "same bases must be one molecule");
+    }
+
+    /// Identity and `--edits 0` split UMIs by their first `--min-umi-length` bases before
+    /// truncating (fgbio#1185), so `TTTT` does not shorten `ACGTA`/`ACGTC` to `ACGT`: all three
+    /// stay apart, in either input order.
+    #[rstest]
+    fn assign_umi_groups_splits_identical_grouping_by_prefix(
+        #[values((Strategy::Identity, 0), (Strategy::Edit, 0), (Strategy::Adjacency, 0))]
+        strategy_and_edits: (Strategy, u32),
+        #[values(false, true)] reversed: bool,
+    ) {
+        let (strategy, edits) = strategy_and_edits;
+        let mut umis: Vec<&[u8]> = vec![b"ACGTA", b"ACGTC", b"TTTT"];
+        if reversed {
+            umis.reverse();
+        }
+        let mut templates: Vec<Template> = umis
+            .iter()
+            .enumerate()
+            .map(|(i, umi)| template_with_strand_of_origin(format!("a{i}").as_bytes(), false, umi))
+            .collect();
+        let assigner = strategy.new_assigner_full(edits, 1, 100);
+        assign_umi_groups(&mut templates, assigner.as_ref(), SamTag::RX, Some(4), false)
+            .expect("UMIs at least 4 bases long must group");
+        let distinct: std::collections::HashSet<_> = templates.iter().map(|t| t.mi).collect();
+        assert_eq!(distinct.len(), 3, "each UMI must be its own molecule");
+    }
+
+    /// `dedup` shares the UMI assigners with `group`, so mixed UMI lengths at one position
+    /// (fgbio `GroupReadsByUmiTest.scala:513`, "fail when umis have different length") must
+    /// surface as an error from `assign_umi_groups` rather than a panic. `dedup` always builds
+    /// single-threaded assigners, so there is no parallel-assigner case here.
+    #[rstest]
+    #[case::edit(Strategy::Edit, b"AAAA", b"AAA", MIXED_3_4_WITH_HINT)]
+    #[case::adjacency(Strategy::Adjacency, b"AAAA", b"AAA", MIXED_3_4_WITH_HINT)]
+    #[case::paired(Strategy::Paired, b"ACT-ACT", b"ACT-AC", "Multiple UMI lengths: 5, 6")]
+    fn assign_umi_groups_rejects_mixed_umi_lengths(
+        #[case] strategy: Strategy,
+        #[case] umi_a: &[u8],
+        #[case] umi_b: &[u8],
+        #[case] expected: &str,
+    ) {
+        let mut templates = vec![
+            template_with_strand_of_origin(b"a01", false, umi_a),
+            template_with_strand_of_origin(b"a02", false, umi_b),
+        ];
+        let assigner = strategy.new_assigner_full(1, 1, 100);
+        let err = assign_umi_groups(&mut templates, assigner.as_ref(), SamTag::RX, None, false)
+            .expect_err("mixed UMI lengths must be an error");
+        assert_eq!(err.to_string(), expected);
+    }
+
     /// Groups `templates` and marks duplicates per family exactly as
     /// `process_position_group` does (assign, bucket by molecule id, then
     /// `mark_duplicates_in_family` per bucket), returning the number of templates
@@ -2774,12 +2857,13 @@ mod tests {
         assert_eq!(result, umis);
     }
 
+    /// Like fgbio, UMIs are truncated to the shortest UMI's length, not to the option value.
     #[test]
-    fn test_truncate_umis_truncates() {
-        let umis = vec!["ACGTACGT".to_string(), "TGCATGCA".to_string()];
+    fn test_truncate_umis_truncates_to_shortest() {
+        let umis = vec!["ACGTACGTAA".to_string(), "TGCATGCA".to_string()];
         let result =
-            truncate_umis(umis, Some(4)).expect("truncation of 8-base UMIs to 4 should not fail");
-        assert_eq!(result, vec!["ACGT".to_string(), "TGCA".to_string()]);
+            truncate_umis(umis, Some(4)).expect("truncation to the shortest UMI should not fail");
+        assert_eq!(result, vec!["ACGTACGT".to_string(), "TGCATGCA".to_string()]);
     }
 
     #[test]
@@ -2791,7 +2875,7 @@ mod tests {
             result
                 .expect_err("should fail for too-short UMI")
                 .to_string()
-                .contains("shorter than expected"),
+                .contains("shorter length than expected"),
             "Error message should mention UMI being too short"
         );
     }

@@ -302,7 +302,7 @@ impl TagInfo {
 pub enum UmiValidation {
     /// UMI is valid with the given number of bases (ACGT, case-insensitive)
     Valid(usize),
-    /// UMI contains 'N' (uppercase only, matching fgbio behavior)
+    /// UMI contains an `N` or `n` (no-call base)
     ContainsN,
 }
 
@@ -310,12 +310,12 @@ pub enum UmiValidation {
 ///
 /// This function:
 /// - Counts valid DNA bases (A, C, G, T - case insensitive)
-/// - Rejects UMIs containing uppercase 'N' (ambiguous base)
-/// - Skips dashes (paired UMI separator) and other characters including lowercase 'n'
+/// - Rejects UMIs containing an `N` or `n` (no-call base)
+/// - Skips dashes (paired UMI separator) and all other characters
 ///
-/// This matches fgbio's `GroupReadsByUmi` which:
-/// 1. Only rejects uppercase 'N': `.filter(r => !umi.contains('N'))`
-/// 2. Counts bases case-insensitively: `umi.toUpperCase.count(c => isUpperACGTN(c))`
+/// This matches fgbio's `GroupReadsByUmi` (after fulcrumgenomics/fgbio#1185), which:
+/// 1. Rejects both cases of `N`: `.filter(r => !(umi.contains('N') || umi.contains('n')))`
+/// 2. Counts only bases, case-insensitively, when applying `--min-umi-length`
 ///
 /// # Arguments
 ///
@@ -324,7 +324,7 @@ pub enum UmiValidation {
 /// # Returns
 ///
 /// * `UmiValidation::Valid(count)` - UMI is valid with `count` DNA bases
-/// * `UmiValidation::ContainsN` - UMI contains uppercase 'N'
+/// * `UmiValidation::ContainsN` - UMI contains `N` or `n`
 ///
 /// # Examples
 ///
@@ -335,7 +335,7 @@ pub enum UmiValidation {
 /// assert_eq!(validate_umi(b"acgt"), UmiValidation::Valid(4));
 /// assert_eq!(validate_umi(b"ACGT-TGCA"), UmiValidation::Valid(8));
 /// assert_eq!(validate_umi(b"ACNT"), UmiValidation::ContainsN);
-/// assert_eq!(validate_umi(b"acnt"), UmiValidation::Valid(3)); // lowercase 'n' skipped
+/// assert_eq!(validate_umi(b"acnt"), UmiValidation::ContainsN); // either case of N
 /// ```
 #[must_use]
 pub fn validate_umi(umi: &[u8]) -> UmiValidation {
@@ -343,8 +343,8 @@ pub fn validate_umi(umi: &[u8]) -> UmiValidation {
     for &b in umi {
         match b {
             b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't' => base_count += 1,
-            b'N' => return UmiValidation::ContainsN,
-            _ => {} // Skip dash, lowercase 'n', other chars (matches fgbio)
+            b'N' | b'n' => return UmiValidation::ContainsN,
+            _ => {} // Skip dash and other chars (matches fgbio)
         }
     }
     UmiValidation::Valid(base_count)
@@ -731,12 +731,12 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_umi_lowercase_n_skipped() {
-        // Lowercase 'n' should be skipped, not rejected (matches fgbio)
-        // fgbio's .contains('N') is case-sensitive
-        assert_eq!(validate_umi(b"ACnT"), UmiValidation::Valid(3));
-        assert_eq!(validate_umi(b"acnt"), UmiValidation::Valid(3));
-        assert_eq!(validate_umi(b"nnnn"), UmiValidation::Valid(0));
+    fn test_validate_umi_lowercase_n_rejected() {
+        // Lowercase 'n' is a no-call like 'N' (fgbio#1185 discards both)
+        assert_eq!(validate_umi(b"ACnT"), UmiValidation::ContainsN);
+        assert_eq!(validate_umi(b"acnt"), UmiValidation::ContainsN);
+        assert_eq!(validate_umi(b"ACGTn"), UmiValidation::ContainsN);
+        assert_eq!(validate_umi(b"nnnn"), UmiValidation::ContainsN);
     }
 
     #[test]
