@@ -553,16 +553,15 @@ pub(crate) fn record_duplex_coordinate_group(
     // `simplex_metrics::process_coordinate_group` already uses for its
     // `ss_groups` map.
     //
-    // The inner `Vec<(&str, &str, bool)>` stored as `ds_groups` entry.2 is
+    // The inner `Vec<&TemplateMetadata>` stored as `ds_groups` entry.2 is
     // still freed per entry on `.clear()`. Combined with the
     // `is_full_fraction` gate below, that inner Vec now allocates exactly
     // once per coordinate group (at the 100% fraction) rather than once
-    // per fraction × per `or_default()` slot. The `bool` is `r1_positive`
-    // (read 1 on the positive strand), used to orient the duplex UMI.
+    // per fraction × per `or_default()` slot.
     let mut downsampled: Vec<&TemplateMetadata> = Vec::new();
     let mut ss_groups: HashMap<&str, usize> = HashMap::new();
     #[allow(clippy::type_complexity)]
-    let mut ds_groups: HashMap<&str, (usize, usize, Vec<(&str, &str, bool)>)> = HashMap::new();
+    let mut ds_groups: HashMap<&str, (usize, usize, Vec<&TemplateMetadata>)> = HashMap::new();
 
     // For each fraction: filter ONCE, then groupBy (like fgbio)
     for (idx, &fraction) in fractions.iter().enumerate() {
@@ -590,8 +589,8 @@ pub(crate) fn record_duplex_coordinate_group(
         }
 
         // Group by base_umi for DS families with strand counts.
-        // HashMap value: (a_count, b_count, mi_rx_pairs for UMI metrics).
-        // The mi/rx pair vec is consumed only at the 100% fraction by
+        // HashMap value: (a_count, b_count, templates for UMI metrics).
+        // The template vec is consumed only at the 100% fraction by
         // `record_duplex_umi_metrics`; skip populating it on downsampled fractions
         // to avoid O(group_size) wasted pushes per non-full fraction.
         ds_groups.clear();
@@ -608,15 +607,11 @@ pub(crate) fn record_duplex_coordinate_group(
                 entry.0 += 1;
             }
             if is_full_fraction {
-                entry.2.push((
-                    m.template.mi.as_str(),
-                    m.template.rx.as_str(),
-                    m.template.r1_positive,
-                ));
+                entry.2.push(m);
             }
         }
 
-        for (base_umi, (a_count, b_count, mi_rx_pairs)) in &ds_groups {
+        for (base_umi, (a_count, b_count, family)) in &ds_groups {
             let ds_size = a_count + b_count;
             collectors[idx].record_ds_family(ds_size);
 
@@ -626,14 +621,14 @@ pub(crate) fn record_duplex_coordinate_group(
             collectors[idx].record_duplex_family(ab_count, ba_count);
 
             // Only collect UMI metrics for the 100% fraction. Pass the
-            // (&str, &str) pairs directly — the underlying String storage
-            // lives in `group`, which outlives this call, so the previous
-            // `Vec<(String, String)>` clone was pure overhead.
+            // borrowed metadata directly — the underlying String storage
+            // lives in `group`, which outlives this call, so cloning the
+            // MI/RX strings would be pure overhead.
             if is_full_fraction {
                 record_duplex_umi_metrics(
                     &mut collectors[idx],
                     umi_consensus_caller,
-                    mi_rx_pairs.as_slice(),
+                    family.as_slice(),
                     base_umi,
                     duplex_umi_counts,
                 )?;
@@ -661,16 +656,22 @@ pub(crate) fn record_duplex_coordinate_group(
 pub(crate) fn record_duplex_umi_metrics(
     collector: &mut DuplexMetricsCollector,
     umi_consensus_caller: &mut SimpleUmiConsensusCaller,
-    group_pairs: &[(&str, &str, bool)],
+    family: &[&TemplateMetadata],
     base_umi: &str,
     duplex_umi_counts: bool,
 ) -> Result<()> {
-    // Collect the two UMI positions, each oriented to the F1R2 reading of the
-    // top strand. umi1s holds the leading half, umi2s the trailing half.
+    // Collect the two UMI positions, paired up by single-strand family: umi1s holds
+    // the `/A` reads' leading half and the `/B` reads' trailing half; umi2s the
+    // reverse. Also track which strands have a positive-strand R1, to orient the
+    // duplex UMI below.
     let mut umi1s = Vec::new();
     let mut umi2s = Vec::new();
+    let mut saw_a_strand = false;
+    let mut a_strand_r1_positive = false;
+    let mut b_strand_r1_positive = false;
 
-    for &(mi, rx, r1_positive) in group_pairs {
+    for m in family {
+        let (mi, rx) = (m.template.mi.as_str(), m.template.rx.as_str());
         // Check if this MI tag belongs to the current base_umi family
         let mi_base = extract_mi_base(mi);
 
@@ -697,21 +698,22 @@ pub(crate) fn record_duplex_umi_metrics(
         // counts them, recording the empty half as an empty-string UMI, so
         // single-index / single-strand designs are not undercounted (DXM-01).
 
-        // Orient by the actual R1 strand, not the MI `/A`,`/B` suffix (which is
-        // not strand-reliable — e.g. an `/A` family can be on the negative
-        // strand). If R1 is on the positive strand the molecule was read
-        // top-strand-first, so the RX is already `u1-u2`; otherwise it was read
-        // bottom-strand-first, so swap the halves. Because metrics collection is
-        // R1-only, this reproduces fgbio's per-read F1R2 normalization
-        // (CollectDuplexSeqMetrics.scala:407-408) and its duplex-UMI orientation
-        // pick (:419-425), which then reduces to "lead with the positive-strand
-        // read's half" (DXM-02).
-        if r1_positive {
-            umi1s.push(parts[0].to_string());
-            umi2s.push(parts[1].to_string());
-        } else {
+        // Pair the halves by the MI `/A`,`/B` suffix, as fgbio does by single-strand
+        // family (CollectDuplexSeqMetrics.scala:407-408): `/B` reads carry the RX
+        // halves in the opposite order, so swap them. Do NOT pair by R1 strand: a
+        // duplex whose mates map in the same orientation (FF/RR — inversions, most
+        // inter-chromosomal chimeras) has R1 on the same strand in both families,
+        // which would leave `/B` unswapped and mix the halves. An unsuffixed MI is
+        // treated as `/A`, matching the AB-strand counting above.
+        if m.is_b_strand {
             umi1s.push(parts[1].to_string());
             umi2s.push(parts[0].to_string());
+            b_strand_r1_positive |= m.template.r1_positive;
+        } else {
+            umi1s.push(parts[0].to_string());
+            umi2s.push(parts[1].to_string());
+            saw_a_strand = true;
+            a_strand_r1_positive |= m.template.r1_positive;
         }
     }
 
@@ -736,25 +738,46 @@ pub(crate) fn record_duplex_umi_metrics(
 
     // Record duplex UMI metrics if enabled
     if duplex_umi_counts && consensus_umis.len() == 2 {
-        let duplex_umi = format!("{}-{}", consensus_umis[0], consensus_umis[1]);
+        // Both orientations of the duplex UMI: `/A` leading half first, then `/B`'s.
+        let duplex_umis = [
+            format!("{}-{}", consensus_umis[0], consensus_umis[1]),
+            format!("{}-{}", consensus_umis[1], consensus_umis[0]),
+        ];
+
+        // Orient the duplex UMI to lead with the half a positive-strand R1 reads
+        // first (fgbio's F1R2 normalization, CollectDuplexSeqMetrics.scala:419-425;
+        // DXM-02). The `/A` leading half leads when an `/A` R1 is positive, else the
+        // `/B` leading half when a `/B` R1 is positive. With no positive-strand R1 at
+        // all, lead with the half a negative-strand R1 reads last: the `/A` trailing
+        // half if there are `/A` reads, else the `/B` trailing half.
+        //
+        // When the two strands are not an F1R2/F2R1 split (FF: both R1s positive;
+        // RR: neither), fgbio's pick depends on which single-strand family its
+        // `groupBy(MI)` happens to iterate first (JVM hash order of the MI strings),
+        // so it is not reproducible here. fgumi deterministically leads with the
+        // `/A` leading half for FF and the `/A` trailing half for RR; this is a
+        // known divergence from fgbio on about half of same-orientation duplexes.
+        let a_leading_half_first = if a_strand_r1_positive {
+            true
+        } else if b_strand_r1_positive {
+            false
+        } else {
+            !saw_a_strand
+        };
+        let duplex_umi = &duplex_umis[usize::from(!a_leading_half_first)];
         // Each read pair contributes one observation to the duplex UMI
         // (not two, even though we track each component separately)
         let total_raw = umi1s.len();
 
         // Count how many raw RX tags had errors (don't match either duplex orientation)
-        let expected_duplex1 = format!("{}-{}", consensus_umis[0], consensus_umis[1]);
-        let expected_duplex2 = format!("{}-{}", consensus_umis[1], consensus_umis[0]);
-        let error_count = group_pairs
+        let error_count = family
             .iter()
-            .filter(|&&(mi, rx, _r1_positive)| {
-                let mi_base = extract_mi_base(mi);
-                mi_base == base_umi
-                    && rx != expected_duplex1.as_str()
-                    && rx != expected_duplex2.as_str()
+            .filter(|m| {
+                extract_mi_base(&m.template.mi) == base_umi && !duplex_umis.contains(&m.template.rx)
             })
             .count();
 
-        collector.record_duplex_umi(&duplex_umi, total_raw, error_count, true);
+        collector.record_duplex_umi(duplex_umi, total_raw, error_count, true);
     }
 
     Ok(())
