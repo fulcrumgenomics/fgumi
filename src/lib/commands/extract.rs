@@ -25,7 +25,7 @@ use crate::commands::common::{
 use crate::fastq::FastqSet;
 use crate::fastq::{FastqSegmentView, FastqSetView};
 use crate::fastq_deinterleave::deinterleave;
-use crate::fastq_parse::strip_read_suffix;
+use crate::fastq_parse::canonical_read_name;
 use crate::sam::SamTag;
 use crate::validation::validate_input_exists;
 use anyhow::{Context, Result, bail, ensure};
@@ -442,9 +442,12 @@ impl QualityEncoding {
 ///
 /// UMIs may be extracted from the read sequences, the read names, or both.  If `--extract-umis-from-read-names` is
 /// specified, any UMIs present in the read names are extracted; read names are expected to be `:`-separated with
-/// the UMI in the last field (of at least 8).  The extracted UMI is upper-cased, `r`-prefixed segments are
-/// reverse-complemented, `+` dual-UMI delimiters become `-`, and a UMI containing any character outside `ACGTN-`
-/// is rejected with an error.  If this option is specified, `--store-umi-quals` may not be used as
+/// the UMI in the last field, which is taken only when there are at least 8 fields and the last field is not
+/// empty.  A name with exactly 7 fields, or whose last field is empty, has no UMI, and a name with 6 or fewer fields
+/// is rejected with an error.  The read name ends at the first whitespace character (such as a space or TAB), so a
+/// comment is never part of the name or the UMI; a header with no name before that whitespace is an error.  The
+/// extracted UMI is upper-cased, `r`-prefixed segments are reverse-complemented, `+` dual-UMI delimiters become
+/// `-`, and a UMI containing any character outside `ACGTN-` is rejected with an error.  If this option is specified, `--store-umi-quals` may not be used as
 /// qualities are not available for UMIs in the read name. If UMI segments are present in the read structures those
 /// will also be extracted.  If UMIs are present in both, the final UMIs are constructed by first taking the UMIs
 /// from the read names, then adding a hyphen, then the UMIs extracted from the reads.
@@ -526,15 +529,19 @@ values.
 
 UMIs may be extracted from the read sequences, the read names, or both. If
 `--extract-umis-from-read-names` is specified, any UMIs present in the read names are extracted;
-read names are expected to be `:`-separated and the UMI is taken from the **last** field. At
-least 8 fields must be present — the standard Illumina shape
+read names are expected to be `:`-separated and the UMI is taken from the **last** field, but
+only when at least 8 fields are present — the standard Illumina shape
 `@<instrument>:<run>:<flowcell>:<lane>:<tile>:<x>:<y>:<UMI>`. Names with 9+ fields (e.g.
 produced by demultiplexers that fold the sample index into the colon-separated portion) are
-also handled, with the UMI still coming from the last field. Any `+` characters in the
-extracted UMI are normalized to `-`. If UMI segments are present in the read structures those
-will also be extracted. If UMIs are present in both, the final UMIs are constructed by first
-taking the UMIs from the read names, then adding a hyphen, then the UMIs extracted from the
-reads.
+also handled, with the UMI still coming from the last field. A name with exactly 7 fields,
+or whose last field is empty (a name ending in `:`), carries no UMI, and a name with 6 or
+fewer fields is rejected with an error naming the read. The read name ends at the first
+whitespace character (such as a space or TAB), so a comment such as `1:N:0:ACGT` or the
+TAB-separated tags written by `samtools fastq -T` is dropped and never read as the UMI. A
+header with no name before that whitespace is an error. Any `+` characters in the extracted UMI are normalized to `-`. If UMI
+segments are present in the read structures those will also be extracted. If UMIs are present
+in both, the final UMIs are constructed by first taking the UMIs from the read names, then
+adding a hyphen, then the UMIs extracted from the reads.
 "#
 )]
 #[command(verbatim_doc_comment)]
@@ -898,31 +905,35 @@ impl Extract {
     ///
     ///   `@<instrument>:<run>:<flowcell>:<lane>:<tile>:<x>:<y>:<UMI>`
     ///
-    /// (8 `:`-separated fields; the trailing space-separated comment such as
-    /// `1:N:0:<index>` is not counted, as it is stripped before parsing). See
+    /// (8 `:`-separated fields; the comment that follows the first whitespace character,
+    /// such as ` 1:N:0:<index>` or the TAB-separated SAM tags written by `samtools fastq -T`,
+    /// is not counted, as it is stripped before parsing). See
     /// <https://support.illumina.com/help/BaseSpace_OLH_009008/Content/Source/Informatics/BS/FileFormat_FASTQ-files_swBS.htm>.
     ///
-    /// An old-style Casava (<1.8) `/1` / `/2` read-number suffix is stripped from
-    /// the returned name (see [`strip_read_suffix`])
-    /// so both mates of a pair share an identical QNAME, matching fgbio's `FastqSource`.
-    /// Stripping happens before UMI extraction so a read-number digit never leaks into the UMI.
+    /// The comment and an old-style Casava (<1.8) `/1` / `/2` read-number suffix are
+    /// stripped from the returned name (see [`crate::fastq_parse::strip_read_suffix`]) so both mates of a pair
+    /// share an identical QNAME, matching fgbio's `FastqSource`. Stripping happens before UMI
+    /// extraction so neither the comment nor a read-number digit ever leaks into the UMI.
     ///
-    /// Some demultiplexers fold additional information (e.g. the sample index) into
-    /// the colon-separated portion of the read name, producing names with 9+ fields
-    /// where the UMI is the **last** field rather than the 8th. To handle both
-    /// shapes uniformly — matching the behavior of fgbio's
-    /// `Umis.extractUmisFromReadName` — this function returns the **last**
-    /// `:`-separated field as the UMI when at least 8 fields are present.
+    /// When `extract_umis` is set the field count follows fgbio's strict
+    /// `Umis.extractUmisFromReadName` (`Umis.scala:91-95`, called with `strict=true` by
+    /// `FastqToBam`): 7 fields carry no UMI (`None`), 8 fields carry the UMI in the last
+    /// field, and 6 or fewer fields are an error naming the read. fgumi deliberately
+    /// diverges from fgbio for 9+ fields: some demultiplexers fold additional information
+    /// (e.g. the sample index) into the colon-separated portion of the read name, so fgumi
+    /// takes the **last** field as the UMI where fgbio's strict mode would throw. An empty
+    /// last field yields `None` rather than an empty UMI (EXT3-09).
     ///
-    /// Names with fewer than 8 fields are treated as not containing a UMI and
-    /// produce `None`. The extracted UMI is then normalized via
+    /// The extracted UMI is then normalized via
     /// [`normalize_read_name_umi`](crate::umi::read_name::normalize_read_name_umi) to match fgbio's
     /// strict `Umis.extractUmisFromReadName` (reverse-complement `r`-prefixed
     /// segments, `+`→`-`, upper-case).
     ///
     /// # Errors
-    /// Returns an error if the extracted UMI contains a character outside `ACGTN-`,
-    /// mirroring fgbio's strict-mode rejection (EXT-01).
+    /// Returns an error if the name is empty after stripping (see [`canonical_read_name`]),
+    /// whether or not `extract_umis` is set. When `extract_umis` is set, also returns an error
+    /// if the name has 6 or fewer `:`-separated fields, or if the extracted UMI contains a
+    /// character outside `ACGTN-`, mirroring fgbio's strict-mode rejections (EXT-01).
     fn extract_read_name_and_umi(
         header: &[u8],
         extract_umis: bool,
@@ -930,13 +941,14 @@ impl Extract {
         // Remove @ prefix if present
         let name_bytes = if header.starts_with(b"@") { &header[1..] } else { header };
 
-        // Strip a trailing space comment and an old-style Casava (<1.8) `/1` / `/2`
+        // Strip a trailing whitespace comment and an old-style Casava (<1.8) `/1` / `/2`
         // read-number suffix so both mates of a pair share an identical QNAME (required by
         // the SAM spec). Matches fgbio's `FastqSource`: only `/` followed by a single digit
         // is removed. Done before UMI extraction so a read-number digit never leaks into the
         // UMI's trailing `:` field. This is the shared helper the paired-FASTQ sync
-        // validation also uses, keeping the written QNAME and validation in lock-step.
-        let name_part = strip_read_suffix(name_bytes);
+        // validation also uses, keeping the written QNAME and validation in lock-step. An
+        // empty result is an error, never an empty QNAME.
+        let name_part = canonical_read_name(name_bytes)?;
 
         if !extract_umis {
             return Ok((name_part.to_vec(), None));
@@ -946,8 +958,17 @@ impl Extract {
         // least 8 fields (matching the standard Illumina read-name layout). This
         // works for both 8-field names (UMI in field 8) and 9+ field names where
         // a demultiplexer has appended additional fields (e.g. a sample index)
-        // before the UMI.
+        // before the UMI. A 7-field name has no UMI; fewer fields are not an Illumina
+        // read name at all, so reject them like fgbio's strict mode (`Umis.scala:95`)
+        // rather than silently writing the read without a UMI. The error text is
+        // adapted from fgbio's, since fgumi also accepts 9 or more fields.
         let parts: Vec<&[u8]> = name_part.split(|&b| b == b':').collect();
+        ensure!(
+            parts.len() >= 7,
+            "Trying to extract UMI from read with {} colon-separated fields; expected at least 7 (7 = no UMI, 8 or more = UMI in the last field). Check the read-name format, or omit --extract-umis-from-read-names if the read names carry no UMI. Read name: {}",
+            parts.len(),
+            String::from_utf8_lossy(name_part)
+        );
 
         if parts.len() >= 8
             && let Some(last) = parts.last()
@@ -1259,7 +1280,8 @@ pub struct ExtractOptions {
     pub single_tag: Option<SamTag>,
     /// Append `+<UMIs>` to each read name.
     pub annotate_read_names: bool,
-    /// Extract UMIs from read names (last `:`-separated field, ≥8 fields).
+    /// Extract UMIs from read names (last `:`-separated field, ≥8 fields; 7 fields or an
+    /// empty last field means no UMI, ≤6 fields is an error).
     pub extract_umis_from_read_names: bool,
     /// Store sample-barcode qualities in the `QT` tag.
     pub store_sample_barcode_qualities: bool,
@@ -2899,61 +2921,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_umis_from_read_names() {
-        let tmp = TempDir::new().expect("failed to create temp dir");
-        let r1 = create_fastq(
-            &tmp,
-            "r1.fq",
-            &[
-                ("q1:2:3:4:5:6:7:ACGT", "AAAAAAAAAA", "=========="),
-                ("q2:2:3:4:5:6:7:TTGA", "TAAAAAAAAA", "=========="),
-                ("q3:2:3:4:5:6:7", "TAAAAAAAAA", "=========="),
-            ],
-        );
-        let output = tmp.path().join("output.bam");
-
-        let extract = Extract {
-            inputs: vec![r1],
-            output: output.clone(),
-            read_structures: vec![],
-            store_umi_quals: false,
-            store_cell_quals: false,
-            store_sample_barcode_qualities: false,
-            extract_umis_from_read_names: true,
-            annotate_read_names: false,
-            single_tag: None,
-            read_group_id: "A".to_string(),
-            sample: "s".to_string(),
-            library: "l".to_string(),
-            barcode: None,
-            platform: "illumina".to_string(),
-            platform_unit: None,
-            platform_model: None,
-            sequencing_center: None,
-            predicted_insert_size: None,
-            description: None,
-            comment: vec![],
-            run_date: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
-            async_reader: false,
-            check_crc: false,
-            no_check_crc: false,
-            interleaved: false,
-        };
-
-        extract.execute("test").expect("execute should succeed");
-
-        let recs = read_bam_records(&output);
-        assert_eq!(recs.len(), 3);
-        assert_eq!(get_tag_string(&recs[0], "RX"), Some("ACGT".to_string()));
-        assert_eq!(get_tag_string(&recs[1], "RX"), Some("TTGA".to_string()));
-        assert!(get_tag_string(&recs[2], "RX").is_none());
-    }
-
-    #[test]
     fn test_extract_umis_from_read_names_and_sequences() {
         let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(
@@ -3017,11 +2984,14 @@ mod tests {
     ///
     /// However, some demultiplexers (e.g. ones that also fold the sample index into the
     /// `:`-separated portion) produce read names with 9+ fields where the UMI is the *last*
-    /// field, not the 8th. That matches the behavior of fgbio's
-    /// `Umis.extractUmisFromReadName`, which always returns the last `:`-separated field
-    /// as the UMI. These tests pin the expected behavior:
+    /// field, not the 8th. fgumi takes the last field for these, which is a deliberate
+    /// divergence: fgbio's `FastqToBam` calls `Umis.extractUmisFromReadName` with
+    /// `strict=true` (`Umis.scala:91-95`), which accepts only 7 or 8 fields and throws for
+    /// 9+. (fgbio's non-strict mode, used by `CopyUmiFromReadName`, returns the last field.)
+    /// These tests pin the expected behavior:
     ///
-    /// - 7 fields → no UMI (fgbio's strict-mode behavior, preserved for backward compat).
+    /// - 6 or fewer fields → error naming the read (fgbio's strict-mode behavior).
+    /// - 7 fields → no UMI (fgbio's strict-mode behavior).
     /// - 8 fields → last field as UMI.
     /// - 9+ fields → last field as UMI (was broken; previously returned `parts[7]`).
     /// - `+` in the UMI is normalized to `-`.
@@ -3165,6 +3135,267 @@ mod tests {
         let (name, umi) = Extract::extract_read_name_and_umi(&header, true).unwrap();
         assert_eq!(name, b"a:b:c:d:e:f:g:ACGT".to_vec());
         assert_eq!(umi, Some(b"ACGT".to_vec()));
+    }
+
+    // ── Whitespace comment truncation and strict field counts (B13) ──
+
+    /// fgbio `FastqSource.scala:111` splits the header at the first Java
+    /// `Character.isWhitespace` character (`header.indexWhere(_.isWhitespace)`), so a TAB
+    /// begins the comment just like a space does. `samtools fastq -T RX,BC` emits
+    /// TAB-separated comments (`name\tRX:Z:ACGT\tBC:Z:TTTT`); the comment must be dropped
+    /// before UMI extraction so the UMI is never taken from the comment, and so the written
+    /// QNAME never contains a TAB.
+    #[rstest]
+    #[case::samtools_tag_comment(
+        b"@q1:2:3:4:5:6:7:ACGT\tRX:Z:ACGT\tBC:Z:TTTT".as_slice(),
+        b"q1:2:3:4:5:6:7:ACGT".as_slice(),
+        Some(b"ACGT".as_slice())
+    )]
+    #[case::casava_comment(
+        b"@q1:2:3:4:5:6:7:ACGT\t1:N:0:NNNN".as_slice(),
+        b"q1:2:3:4:5:6:7:ACGT".as_slice(),
+        Some(b"ACGT".as_slice())
+    )]
+    #[case::tab_after_space_comment(
+        b"@q1:2:3:4:5:6:7:ACGT 1:N:0\tNNNN".as_slice(),
+        b"q1:2:3:4:5:6:7:ACGT".as_slice(),
+        Some(b"ACGT".as_slice())
+    )]
+    #[case::slash_digit_before_tab_comment(
+        b"@q1:2:3:4:5:6:7:ACGT/1\tBC:Z:TTTT".as_slice(),
+        b"q1:2:3:4:5:6:7:ACGT".as_slice(),
+        Some(b"ACGT".as_slice())
+    )]
+    // Only the fields before the comment are counted: this name has 7 fields, so no UMI,
+    // even though the comment itself contains `:`-separated fields.
+    #[case::seven_fields_then_tab_comment(
+        b"@q1:2:3:4:5:6:7\tRX:Z:ACGT".as_slice(),
+        b"q1:2:3:4:5:6:7".as_slice(),
+        None
+    )]
+    fn test_extract_read_name_and_umi_truncates_name_at_tab(
+        #[case] header: &[u8],
+        #[case] expected_name: &[u8],
+        #[case] expected_umi: Option<&[u8]>,
+    ) {
+        let (name, umi) = Extract::extract_read_name_and_umi(header, true).unwrap();
+        assert_eq!(name, expected_name.to_vec());
+        assert_eq!(umi, expected_umi.map(<[u8]>::to_vec));
+
+        // Without `-n` the name is truncated identically and no UMI is taken.
+        let (name, umi) = Extract::extract_read_name_and_umi(header, false).unwrap();
+        assert_eq!(name, expected_name.to_vec());
+        assert_eq!(umi, None);
+    }
+
+    /// fgbio `Umis.scala:91-95` (`extractUmisFromReadName(..., strict=true)`, which
+    /// `FastqToBam.scala:188` calls for `--extract-umis-from-read-names`) counts the
+    /// `:` delimiters and throws `IllegalArgumentException("Trying to extract UMI from read
+    /// with <n> parts (7-8 expected): <name>")` unless there are 7 or 8 parts
+    /// (`UmisTest.scala:51`, "throw an exception in strict mode if the read has too many or
+    /// too few segments"; its `1:2:3:4:5:6` case is `six_fields` below). fgumi keeps
+    /// accepting 9 or more fields (last field is the UMI, PR #264) but must error, naming
+    /// the read, when there are 6 or fewer, rather than silently writing the read without a
+    /// UMI. The message is adapted from fgbio's: fgbio's "(7-8 expected)" would be wrong for
+    /// fgumi, which accepts 9 or more fields.
+    #[rstest]
+    #[case::six_fields(b"@1:2:3:4:5:6".as_slice(), "1:2:3:4:5:6", 6)]
+    #[case::five_fields(b"@q1:2:3:4:5".as_slice(), "q1:2:3:4:5", 5)]
+    #[case::two_fields(b"@q1:ACGT".as_slice(), "q1:ACGT", 2)]
+    #[case::one_field(b"@q1".as_slice(), "q1", 1)]
+    // The comment is not part of the name: the read has 6 fields, so it is rejected, and
+    // the error names the read without its comment.
+    #[case::six_fields_then_comment(b"@q1:2:3:4:5:6 7:N:0:ACGT".as_slice(), "q1:2:3:4:5:6", 6)]
+    #[case::six_fields_then_tab_comment(b"@q1:2:3:4:5:6\t7:N:0:ACGT".as_slice(), "q1:2:3:4:5:6", 6)]
+    fn test_extract_read_name_and_umi_errors_on_six_or_fewer_fields(
+        #[case] header: &[u8],
+        #[case] expected_name: &str,
+        #[case] expected_parts: usize,
+    ) {
+        let err = Extract::extract_read_name_and_umi(header, true).unwrap_err();
+        assert_eq!(format!("{err:#}"), too_few_fields_message(expected_parts, expected_name));
+    }
+
+    /// The `-n` error for a read name with `parts` (6 or fewer) `:`-separated fields.
+    fn too_few_fields_message(parts: usize, name: &str) -> String {
+        format!(
+            "Trying to extract UMI from read with {parts} colon-separated fields; expected at \
+             least 7 (7 = no UMI, 8 or more = UMI in the last field). Check the read-name \
+             format, or omit --extract-umis-from-read-names if the read names carry no UMI. \
+             Read name: {name}"
+        )
+    }
+
+    /// A header whose first byte after `@` is whitespace has no read name. Stripping the
+    /// comment would leave an empty QNAME, so it is an error quoting the raw header, with or
+    /// without `-n` (fgbio's `FastqSource.scala:111-120` yields `""` here and writes it).
+    #[rstest]
+    #[case::leading_tab(b"@\tBC:Z:TTTT".as_slice(), r#""@\tBC:Z:TTTT""#)]
+    #[case::leading_space(b"@ 1:N:0:ACGT".as_slice(), r#""@ 1:N:0:ACGT""#)]
+    #[case::only_suffix(b"@/1".as_slice(), r#""@/1""#)]
+    fn test_extract_read_name_and_umi_errors_on_empty_name(
+        #[case] header: &[u8],
+        #[case] quoted: &str,
+        #[values(false, true)] extract_umis: bool,
+    ) {
+        let err = Extract::extract_read_name_and_umi(header, extract_umis).unwrap_err();
+        assert_eq!(format!("{err:#}"), empty_name_message(quoted));
+    }
+
+    /// The error for a FASTQ record whose read name is empty; `quoted` is the raw header
+    /// as Rust's `Debug` quotes it.
+    fn empty_name_message(quoted: &str) -> String {
+        format!(
+            "FASTQ record has an empty read name (the header must not start with whitespace or \
+             consist only of a /1 or /2 suffix): {quoted}"
+        )
+    }
+
+    /// The error is only for `--extract-umis-from-read-names`; without it a short name is
+    /// written verbatim (fgbio `FastqToBam.scala:188` only calls the extractor when
+    /// `extractUmisFromReadNames` is set).
+    #[test]
+    fn test_extract_read_name_and_umi_short_name_without_flag_is_not_an_error() {
+        let (name, umi) = Extract::extract_read_name_and_umi(b"@q1:2:3", false).unwrap();
+        assert_eq!(name, b"q1:2:3".to_vec());
+        assert_eq!(umi, None);
+    }
+
+    /// EXT3-09 (kept): an 8-field name whose UMI field is empty yields no UMI from the name
+    /// rather than an error, so `RX` comes only from any `M` read-structure segments. This is
+    /// one of the places fgumi deliberately differs from fgbio's strict mode (another is that
+    /// 9+ fields are accepted): fgbio would extract an empty UMI.
+    #[test]
+    fn test_extract_read_name_and_umi_eight_fields_empty_umi_returns_none() {
+        let (name, umi) = Extract::extract_read_name_and_umi(b"@q1:2:3:4:5:6:7:", true).unwrap();
+        assert_eq!(name, b"q1:2:3:4:5:6:7:".to_vec());
+        assert_eq!(umi, None);
+    }
+
+    /// Runs `fgumi extract` over one FASTQ per entry of `headers_per_input`, each holding one
+    /// record per header line (headers given without the `@`, comments included). The other
+    /// options are the defaults of [`bgzf_crc_extract`].
+    fn execute_extract_with_headers(
+        headers_per_input: &[&[&str]],
+        threading: ThreadingOptions,
+        extract_umis_from_read_names: bool,
+        interleaved: bool,
+    ) -> (TempDir, PathBuf, anyhow::Result<()>) {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let inputs = headers_per_input
+            .iter()
+            .enumerate()
+            .map(|(i, headers)| {
+                let records: Vec<(&str, &str, &str)> =
+                    headers.iter().map(|h| (*h, "AAAAAAAAAA", "==========")).collect();
+                create_fastq(&tmp, &format!("r{}.fq", i + 1), &records)
+            })
+            .collect();
+        let output = tmp.path().join("output.bam");
+        let extract = Extract {
+            inputs,
+            interleaved,
+            extract_umis_from_read_names,
+            ..bgzf_crc_extract(PathBuf::new(), output.clone(), threading, false, false)
+        };
+        let result = extract.execute("test");
+        (tmp, output, result)
+    }
+
+    /// End-to-end `FastqSource.scala:111` + `FastqToBamTest.scala:358` ("extract UMIs from
+    /// read names when requested"): FASTQ headers carrying `samtools fastq -T` TAB-separated
+    /// comments must produce `RX` equal to the UMI in the name (not the last field of the
+    /// comment, e.g. the sample barcode) and a QNAME free of the comment and of any TAB.
+    ///
+    /// The paired cases give R1 and R2 different TAB comments, so they also exercise the
+    /// FASTQ zip step's mate-name sync check, which shares `strip_read_suffix` and must treat
+    /// the TAB as the start of the comment rather than reporting a read name mismatch. The
+    /// comment-free variant is the plain 8-field / 7-field baseline.
+    #[rstest]
+    fn test_extract_umis_from_read_names_with_tab_comments_via_execute(
+        #[values(false, true)] paired: bool,
+        #[values(ThreadingOptions::none(), ThreadingOptions::new(2))] threading: ThreadingOptions,
+        #[values(false, true)] with_comments: bool,
+    ) {
+        let r1_headers = [
+            "q1:2:3:4:5:6:7:ACGT\tRX:Z:ACGT\tBC:Z:TTTT",
+            "q2:2:3:4:5:6:7:TTGA\tRX:Z:TTGA\tBC:Z:CCCC",
+            "q3:2:3:4:5:6:7\tBC:Z:GGGG",
+        ];
+        let r2_headers = [
+            "q1:2:3:4:5:6:7:ACGT\tRX:Z:ACGT\tBC:Z:AAAA",
+            "q2:2:3:4:5:6:7:TTGA\tRX:Z:TTGA\tBC:Z:GGGG",
+            "q3:2:3:4:5:6:7\tBC:Z:TTTT",
+        ];
+        let strip = |headers: [&'static str; 3]| {
+            headers.map(|h| if with_comments { h } else { h.split('\t').next().unwrap_or(h) })
+        };
+        let (r1_headers, r2_headers) = (strip(r1_headers), strip(r2_headers));
+        let inputs: Vec<&[&str]> =
+            if paired { vec![&r1_headers, &r2_headers] } else { vec![&r1_headers] };
+        let (_tmp, output, result) = execute_extract_with_headers(&inputs, threading, true, false);
+        result.expect("execute should succeed");
+
+        let actual: Vec<(Vec<u8>, Option<String>)> = read_bam_records(&output)
+            .iter()
+            .map(|r| (r.name().expect("name").to_vec(), get_tag_string(r, "RX")))
+            .collect();
+        let segments_per_template = if paired { 2 } else { 1 };
+        let expected: Vec<(Vec<u8>, Option<String>)> = [
+            (b"q1:2:3:4:5:6:7:ACGT".as_slice(), Some("ACGT")),
+            (b"q2:2:3:4:5:6:7:TTGA".as_slice(), Some("TTGA")),
+            (b"q3:2:3:4:5:6:7".as_slice(), None),
+        ]
+        .iter()
+        .flat_map(|(name, rx)| {
+            std::iter::repeat_n((name.to_vec(), rx.map(str::to_string)), segments_per_template)
+        })
+        .collect();
+        assert_eq!(actual, expected);
+    }
+
+    /// End-to-end `Umis.scala:91-95` / `UmisTest.scala:51` ("throw an exception in strict
+    /// mode if the read has too many or too few segments"): `extract -n` over a FASTQ whose
+    /// names have 6 fields must fail naming the read, not write UMI-less records, with or
+    /// without worker threads.
+    #[rstest]
+    #[case::single_threaded(ThreadingOptions::none())]
+    #[case::multi_threaded(ThreadingOptions::new(2))]
+    fn test_extract_umis_from_read_names_six_fields_errors_via_execute(
+        #[case] threading: ThreadingOptions,
+    ) {
+        let (_tmp, _output, result) =
+            execute_extract_with_headers(&[&["1:2:3:4:5:6"]], threading, true, false);
+        // The pipeline flattens the step error behind a `Pipeline::run` prefix, so match the
+        // step's message (asserted exactly in the unit test above) as a substring.
+        let message = format!("{:#}", result.expect_err("six-field read name must be rejected"));
+        assert!(
+            message.contains(&too_few_fields_message(6, "1:2:3:4:5:6")),
+            "unexpected error: {message}"
+        );
+    }
+
+    /// End-to-end: a FASTQ header with no read name before its first whitespace fails the
+    /// run, never writing an empty QNAME. Covers single-end input, paired mates whose
+    /// different names both used to strip to `""` and pass the sync check, and the same
+    /// mates through the interleaved (de-interleave) reader, with and without `-n` and
+    /// worker threads.
+    #[rstest]
+    #[case::single_end_leading_tab(&[["\tBC:Z:TTTT"].as_slice()], false, r#""@\tBC:Z:TTTT""#)]
+    #[case::single_end_leading_space(&[["q1", " 1:N:0:ACGT"].as_slice()], false, r#""@ 1:N:0:ACGT""#)]
+    #[case::paired_mismatched_mates(&[[" readA"].as_slice(), [" readB"].as_slice()], false, r#""@ readA""#)]
+    #[case::interleaved_mismatched_mates(&[["\treadA", "\treadB"].as_slice()], true, r#""@\treadA""#)]
+    fn test_extract_empty_read_name_errors_via_execute(
+        #[case] headers_per_input: &[&[&str]],
+        #[case] interleaved: bool,
+        #[case] quoted: &str,
+        #[values(false, true)] extract_umis: bool,
+        #[values(ThreadingOptions::none(), ThreadingOptions::new(2))] threading: ThreadingOptions,
+    ) {
+        let (_tmp, _output, result) =
+            execute_extract_with_headers(headers_per_input, threading, extract_umis, interleaved);
+        let message = format!("{:#}", result.expect_err("an empty read name must be rejected"));
+        assert!(message.contains(&empty_name_message(quoted)), "unexpected error: {message}");
     }
 
     #[test]

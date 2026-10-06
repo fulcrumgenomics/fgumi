@@ -16,7 +16,7 @@
 
 use std::io;
 
-use crate::fastq_parse::{FastqRecord, strip_read_suffix};
+use crate::fastq_parse::{FastqRecord, canonical_read_name};
 use crate::grouper::FastqTemplate;
 use crate::pipeline::core::item::{HeapSize, Ordered};
 
@@ -101,15 +101,19 @@ impl Ordered for NRawFastqBatch {
 /// - **Unequal per-stream record counts** are an explicit "out of sync" error
 ///   (naming the stream that ran short), not a silent truncation.
 /// - **A read name that disagrees** across streams after
-///   [`strip_read_suffix`] is a "read name mismatch" `InvalidData` error.
+///   [`strip_read_suffix`](crate::fastq_parse::strip_read_suffix) is a "read name
+///   mismatch" `InvalidData` error.
+/// - **An empty read name** in any stream (see [`canonical_read_name`]) is an
+///   `InvalidData` error, so mates whose names are both empty never pass as in sync.
 ///
 /// `chunk_serial` is only used to label the diagnostics.
 ///
 /// # Errors
 ///
-/// Returns `Other` ("out of sync") on a per-stream record-count mismatch, or
-/// `InvalidData` ("read name mismatch") when a template's segments disagree on
-/// the base name.
+/// Returns `Other` ("out of sync") on a per-stream record-count mismatch,
+/// `InvalidData` ("empty read name") when a record's name is empty after
+/// canonicalization, or `InvalidData` ("read name mismatch") when a template's
+/// segments disagree on the base name.
 ///
 /// # Panics
 ///
@@ -160,7 +164,12 @@ pub fn zip_streams(
                 )));
             };
 
-            let stripped = strip_read_suffix(record.name());
+            let stripped = canonical_read_name(record.name()).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("at chunk_serial {chunk_serial}, stream {stream_idx}: {e}"),
+                )
+            })?;
             match &base_name {
                 None => base_name = Some(stripped.to_vec()),
                 Some(expected) => {
@@ -258,6 +267,112 @@ mod tests {
         let err = zip_streams(vec![s0, s1], 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("mismatch"), "got: {err}");
+    }
+
+    /// How a FASTQ zipper classified a set of per-stream inputs.
+    #[derive(Debug, PartialEq)]
+    enum ZipOutcome {
+        /// Zipped into templates with these base names.
+        Zipped(Vec<Vec<u8>>),
+        /// Rejected because a record's read name is empty after canonicalization.
+        EmptyName,
+        /// Rejected because the streams' base names disagree.
+        Mismatch,
+    }
+
+    fn classify(result: io::Result<Vec<FastqTemplate>>) -> ZipOutcome {
+        match result {
+            Ok(templates) => ZipOutcome::Zipped(templates.into_iter().map(|t| t.name).collect()),
+            Err(e) if e.to_string().contains("empty read name") => ZipOutcome::EmptyName,
+            Err(e)
+                if e.to_string().contains("mismatch") || e.to_string().contains("out of sync") =>
+            {
+                ZipOutcome::Mismatch
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    /// The pipeline zip step parses each chunk record by record
+    /// (`parse_fastq_chunk` -> `FastqRecord::from_slice`), then zips with `zip_streams`.
+    fn zip_via_pipeline(streams: &[&[u8]]) -> ZipOutcome {
+        let per_stream = streams
+            .iter()
+            .map(|data| super::super::parse_fastq_chunk(data, "test").map(|(r, _)| r))
+            .collect::<io::Result<Vec<_>>>()
+            .expect("well-formed FASTQ");
+        classify(zip_streams(per_stream, 0))
+    }
+
+    /// `FastqGrouper` parses in batches (`parse_fastq_records`), stitching a record split
+    /// across `add_bytes_for_stream` calls; each stream is fed in two halves, cut mid-record.
+    fn zip_via_grouper(streams: &[&[u8]]) -> ZipOutcome {
+        let mut grouper = crate::grouper::FastqGrouper::new(streams.len());
+        for (i, data) in streams.iter().enumerate() {
+            let (head, tail) = data.split_at(data.len() / 2);
+            grouper.add_bytes_for_stream(i, head).expect("add head");
+            grouper.add_bytes_for_stream(i, tail).expect("add tail");
+        }
+        let result = grouper.drain_complete_templates().and_then(|mut templates| {
+            templates.extend(grouper.finish()?);
+            Ok(templates)
+        });
+        classify(result)
+    }
+
+    /// Guard-set parity: the pipeline zip step and `FastqGrouper` share the read-name
+    /// guards (`canonical_read_name` plus the cross-stream comparison) and must classify
+    /// every input identically. A header whose first byte after `@` is whitespace has no
+    /// name and is rejected, including mates with different names that both used to strip
+    /// to `""` and pass as in sync.
+    #[rstest]
+    #[case::paired_ok(
+        &[b"@r1/1 1:N\nAC\n+\nII\n".as_slice(), b"@r1/2\tBC:Z:A\nGT\n+\nII\n".as_slice()],
+        ZipOutcome::Zipped(vec![b"r1".to_vec()])
+    )]
+    #[case::paired_mismatch(
+        &[b"@r1\nAC\n+\nII\n".as_slice(), b"@r2\nGT\n+\nII\n".as_slice()],
+        ZipOutcome::Mismatch
+    )]
+    #[case::single_leading_tab(&[b"@\tBC:Z:TTTT\nAC\n+\nII\n".as_slice()], ZipOutcome::EmptyName)]
+    #[case::single_leading_space(&[b"@ 1:N:0:ACGT\nAC\n+\nII\n".as_slice()], ZipOutcome::EmptyName)]
+    #[case::single_only_suffix(&[b"@/1\nAC\n+\nII\n".as_slice()], ZipOutcome::EmptyName)]
+    #[case::mismatched_mates_both_leading_space(
+        &[b"@ readA\nAC\n+\nII\n".as_slice(), b"@ readB\nGT\n+\nII\n".as_slice()],
+        ZipOutcome::EmptyName
+    )]
+    #[case::mismatched_mates_both_leading_tab(
+        &[b"@\treadA\nAC\n+\nII\n".as_slice(), b"@\treadB\nGT\n+\nII\n".as_slice()],
+        ZipOutcome::EmptyName
+    )]
+    #[case::empty_name_in_second_stream_only(
+        &[b"@r1\nAC\n+\nII\n".as_slice(), b"@\tr1\nGT\n+\nII\n".as_slice()],
+        ZipOutcome::EmptyName
+    )]
+    #[case::empty_name_after_valid_record(
+        &[b"@r1\nAC\n+\nII\n@ r2\nAC\n+\nII\n".as_slice()],
+        ZipOutcome::EmptyName
+    )]
+    fn zip_step_and_grouper_classify_read_names_identically(
+        #[case] streams: &[&[u8]],
+        #[case] expected: ZipOutcome,
+    ) {
+        assert_eq!(zip_via_pipeline(streams), expected, "pipeline zip step misclassified");
+        assert_eq!(zip_via_grouper(streams), expected, "FastqGrouper misclassified");
+    }
+
+    /// The empty-name error locates the record (chunk and stream) and quotes its header.
+    #[test]
+    fn zip_streams_empty_name_error_names_the_record() {
+        let s0 = vec![rec("r1", "AAAA")];
+        let s1 = vec![rec("\tr1", "GGGG")];
+        let err = zip_streams(vec![s0, s1], 3).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            "at chunk_serial 3, stream 1: FASTQ record has an empty read name (the header must \
+             not start with whitespace or consist only of a /1 or /2 suffix): \"@\\tr1\""
+        );
     }
 
     /// K=1 is a valid degenerate case: one record per template, no cross-stream

@@ -332,14 +332,28 @@ fn find_newline(data: &[u8]) -> Option<usize> {
     data.iter().position(|&b| b == b'\n')
 }
 
-/// Strip a mate-indicator suffix and CASAVA comment from a read name for comparison.
+/// Returns true if `b` separates a FASTQ read name from its comment.
 ///
-/// First truncates at the first ASCII space (removing CASAVA-style comments like
-/// `read1 1:N:0:ATCACG`), then strips a trailing `/` followed by a single ASCII
-/// digit (`0`-`9`), e.g. `read/1` -> `read`.
+/// Mirrors Java's `Character.isWhitespace(char)` (used by fgbio's `FastqSource`) over the
+/// ASCII range. Its Javadoc defines whitespace as the Unicode space/line/paragraph separators
+/// other than no-break spaces (of which only U+0020 is ASCII), plus U+0009-U+000D and
+/// U+001C-U+001F. So the set is exactly space, TAB, LF, vertical tab, form feed, CR, and the
+/// information separators `0x1C`-`0x1F`. Every other byte, including all bytes `>= 0x80`,
+/// is part of the name.
+const fn is_read_name_delimiter(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | 0x1C..=0x1F)
+}
+
+/// Strip a mate-indicator suffix and comment from a read name for comparison.
+///
+/// First truncates at the first whitespace character (removing comments such as the
+/// CASAVA `read1 1:N:0:ATCACG` or the TAB-separated SAM tags written by
+/// `samtools fastq -T`, e.g. `read1\tRX:Z:ACGT\tBC:Z:TTTT`), then strips a trailing `/`
+/// followed by a single ASCII digit (`0`-`9`), e.g. `read/1` -> `read`.
 ///
 /// This mirrors fgbio's `FastqSource` read-name canonicalization (see
-/// `com/fulcrumgenomics/fastq/FastqSource.scala`), which strips only a trailing
+/// `com/fulcrumgenomics/fastq/FastqSource.scala:111`), which splits the header at the
+/// first `Character.isWhitespace` character and strips only a trailing
 /// `/` + single digit. It deliberately does **not** strip `.`/`_`/`:` separators
 /// or multi-digit runs (`read/12` is left intact): those separators are not a
 /// reliable mate indicator, and treating them as one makes genuinely mismatched
@@ -348,9 +362,9 @@ fn find_newline(data: &[u8]) -> Option<usize> {
 /// position across paired/interleaved FASTQ streams have matching names.
 #[must_use]
 pub fn strip_read_suffix(name: &[u8]) -> &[u8] {
-    // Truncate at the first space (CASAVA comment separator).
-    let name = match name.iter().position(|&b| b == b' ') {
-        Some(space_pos) => &name[..space_pos],
+    // Truncate at the first whitespace (comment separator), like fgbio's `FastqSource`.
+    let name = match name.iter().position(|&b| is_read_name_delimiter(b)) {
+        Some(ws_pos) => &name[..ws_pos],
         None => name,
     };
 
@@ -363,6 +377,38 @@ pub fn strip_read_suffix(name: &[u8]) -> &[u8] {
         }
     }
     name
+}
+
+/// The canonical read name of a FASTQ header line (given without its leading `@`):
+/// [`strip_read_suffix`], rejecting a name that strips to nothing.
+///
+/// A header whose first byte after `@` is whitespace (`@\tRX:Z:ACGT`, `@ 1:N:0:ACGT`), or
+/// whose whole name is a `/<digit>` suffix (`@/1`), has no read name. Accepting it would write
+/// a record with an empty QNAME, which the SAM spec does not allow, and every such read would
+/// share one name, so mismatched mates would pass the pair-sync check. fgbio accepts these
+/// silently (`FastqSource.scala:111-120` yields `""`, `FastqSource.zipped` compares `"" == ""`,
+/// and htsjdk's `BAMRecordCodec.encode` writes the empty name unchecked); fgumi rejects them.
+///
+/// Every FASTQ path that names a template or a record goes through this function: the
+/// pipeline zip step (`zip_streams`), [`crate::grouper::FastqGrouper`], and extract's record
+/// builder. The parsers themselves keep the raw header verbatim.
+///
+/// # Errors
+///
+/// Returns an `InvalidData` error quoting the raw header when the canonical name is empty.
+pub fn canonical_read_name(header: &[u8]) -> io::Result<&[u8]> {
+    let name = strip_read_suffix(header);
+    if name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "FASTQ record has an empty read name (the header must not start with \
+                 whitespace or consist only of a /1 or /2 suffix): {:?}",
+                format!("@{}", String::from_utf8_lossy(header))
+            ),
+        ));
+    }
+    Ok(name)
 }
 
 #[cfg(test)]
@@ -606,12 +652,84 @@ mod tests {
     #[case::comment_and_slash(b"read/1 1:N:0:ATCACG", b"read")]
     // A comment is stripped even when there is no mate suffix.
     #[case::comment_only(b"read 1:N:0:ATCACG", b"read")]
+    // fgbio `FastqSource.scala:111` (`header.indexWhere(_.isWhitespace)`) truncates at the
+    // first whitespace character, so a TAB-separated comment (as written by
+    // `samtools fastq -T`) is stripped just like a space-separated one.
+    #[case::tab_comment_only(b"read\t1:N:0:ATCACG", b"read")]
+    #[case::tab_tag_comment(b"read\tRX:Z:ACGT\tBC:Z:TTTT", b"read")]
+    #[case::tab_comment_and_slash(b"read/1\tBC:Z:TTTT", b"read")]
+    #[case::space_then_tab_comment(b"read 1:N:0\tATCACG", b"read")]
+    #[case::tab_before_space_comment(b"read\t1:N:0 ATCACG", b"read")]
+    // The other ASCII characters Java's `Character.isWhitespace` accepts also start a comment.
+    #[case::carriage_return_comment(b"read\r1:N:0:ATCACG", b"read")]
+    #[case::vertical_tab_comment(b"read\x0B1:N:0:ATCACG", b"read")]
+    #[case::form_feed_comment(b"read\x0C1:N:0:ATCACG", b"read")]
+    #[case::unit_separator_comment(b"read\x1F1:N:0:ATCACG", b"read")]
+    // Both ends of each delimiter range (0x09-0x0D, 0x1C-0x1F, 0x20).
+    #[case::lf_comment(b"read\n1:N:0:ATCACG", b"read")]
+    #[case::file_separator_comment(b"read\x1C1:N:0:ATCACG", b"read")]
+    // Bytes Java's `Character.isWhitespace` rejects stay in the name: printable ASCII
+    // (`!` is the byte after space, `~` the last printable), the control bytes just outside
+    // each delimiter range, DEL, NUL, and bytes >= 0x80 (including 0x85 and 0xA0, which are
+    // NEL and NBSP as code points but are never whitespace as raw UTF-8 bytes).
+    #[case::bang_kept(b"read!x", b"read!x")]
+    #[case::letter_kept(b"readAx", b"readAx")]
+    #[case::tilde_kept(b"read~x", b"read~x")]
+    #[case::nul_kept(b"read\x00x", b"read\x00x")]
+    #[case::backspace_kept(b"read\x08x", b"read\x08x")]
+    #[case::shift_out_kept(b"read\x0Ex", b"read\x0Ex")]
+    #[case::escape_kept(b"read\x1Bx", b"read\x1Bx")]
+    #[case::del_kept(b"read\x7Fx", b"read\x7Fx")]
+    #[case::high_0x80_kept(b"read\x80x", b"read\x80x")]
+    #[case::high_0x85_kept(b"read\x85x", b"read\x85x")]
+    #[case::high_0xa0_kept(b"read\xA0x", b"read\xA0x")]
+    #[case::high_0xff_kept(b"read\xFFx", b"read\xFFx")]
     // No suffix at all.
     #[case::no_suffix(b"read", b"read")]
     #[case::single_char(b"a", b"a")]
     #[case::empty(b"", b"")]
     fn test_strip_read_suffix(#[case] input: &[u8], #[case] expected: &[u8]) {
         assert_eq!(strip_read_suffix(input), expected);
+    }
+
+    /// The delimiter set is exactly the ASCII characters Java's `Character.isWhitespace`
+    /// accepts (U+0009-U+000D, U+001C-U+001F, U+0020), checked over all 256 byte values so
+    /// that neither a broader set (e.g. every byte `<= 0x20`) nor a narrower one (e.g.
+    /// `u8::is_ascii_whitespace`, which omits 0x0B and 0x1C-0x1F) passes.
+    #[test]
+    fn test_is_read_name_delimiter_matches_java_is_whitespace_over_bytes() {
+        let delimiters: Vec<u8> = (0..=u8::MAX).filter(|&b| is_read_name_delimiter(b)).collect();
+        assert_eq!(delimiters, [0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x1F, 0x20]);
+    }
+
+    #[rstest]
+    #[case::plain(b"read".as_slice(), b"read".as_slice())]
+    #[case::comment_and_suffix(b"read/1\tBC:Z:TTTT".as_slice(), b"read".as_slice())]
+    #[case::single_char(b"a".as_slice(), b"a".as_slice())]
+    fn test_canonical_read_name_accepts_non_empty_names(
+        #[case] header: &[u8],
+        #[case] expected: &[u8],
+    ) {
+        assert_eq!(canonical_read_name(header).unwrap(), expected);
+    }
+
+    /// A header with no name before its comment, or with only a `/<digit>` suffix, is an
+    /// error quoting the raw header, never an empty name.
+    #[rstest]
+    #[case::leading_tab(b"\tBC:Z:TTTT".as_slice(), r#""@\tBC:Z:TTTT""#)]
+    #[case::leading_space(b" 1:N:0:ACGT".as_slice(), r#""@ 1:N:0:ACGT""#)]
+    #[case::only_suffix(b"/1".as_slice(), r#""@/1""#)]
+    #[case::empty(b"".as_slice(), r#""@""#)]
+    fn test_canonical_read_name_rejects_empty_names(#[case] header: &[u8], #[case] quoted: &str) {
+        let err = canonical_read_name(header).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "FASTQ record has an empty read name (the header must not start with whitespace \
+                 or consist only of a /1 or /2 suffix): {quoted}"
+            )
+        );
     }
 
     #[test]

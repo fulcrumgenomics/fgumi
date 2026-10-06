@@ -791,7 +791,7 @@ pub fn build_templates_from_records(records: Vec<DecodedRecord>) -> io::Result<V
     group_by_name_and_build(records, Ok, Template::from_decoded_records)
 }
 
-use crate::fastq_parse::{FastqRecord, parse_fastq_records, strip_read_suffix};
+use crate::fastq_parse::{FastqRecord, canonical_read_name, parse_fastq_records};
 
 // ============================================================================
 // FastqGrouper - Groups FASTQ records from multiple input streams
@@ -954,23 +954,28 @@ impl FastqGrouper {
         while self.pending_records.iter().all(|q| !q.is_empty()) {
             // Validate names match and get base_name (in block so names is dropped before pop)
             let base_name = {
-                // Peek at the first record from each stream
-                let names: Vec<&[u8]> = self
+                // Peek at the first record from each stream and canonicalize its name,
+                // rejecting an empty one with the same guard as the pipeline zip step
+                // (`zip_streams`), so two empty names never compare equal as in sync.
+                let bases: Vec<&[u8]> = self
                     .pending_records
                     .iter()
-                    .map(|q| {
-                        q.front()
+                    .enumerate()
+                    .map(|(i, q)| {
+                        let name = q
+                            .front()
                             .expect("pending queue must be non-empty inside all-non-empty loop")
-                            .name()
+                            .name();
+                        canonical_read_name(name)
+                            .map_err(|e| io::Error::new(e.kind(), format!("FASTQ stream {i}: {e}")))
                     })
-                    .collect();
+                    .collect::<io::Result<_>>()?;
 
                 // Copy base_name immediately
-                let base_name = strip_read_suffix(names[0]).to_vec();
+                let base_name = bases[0].to_vec();
 
                 // Validate all names match (strip /1, /2 suffixes for comparison)
-                for (i, &name) in names.iter().enumerate().skip(1) {
-                    let other_base = strip_read_suffix(name);
+                for (i, &other_base) in bases.iter().enumerate().skip(1) {
                     if base_name != other_base {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -984,7 +989,7 @@ impl FastqGrouper {
                     }
                 }
 
-                base_name // names dropped here
+                base_name // bases dropped here
             };
 
             // Pop records from all streams
