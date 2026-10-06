@@ -908,7 +908,8 @@ pub fn compute_read_stats(bam: &[u8]) -> (usize, f64) {
 /// the full read length, so a read whose low-quality bases are masked (and thus excluded
 /// from a non-N mean) is still judged on its original, unmasked quality.
 ///
-/// Returns `0.0` for an empty read.
+/// Returns `0.0` for an empty read (`SEQ` `*`), so any positive minimum rejects it. This
+/// deliberately differs from fgbio, whose `0 / 0` is `NaN` and lets the read pass.
 ///
 /// # Panics
 /// Panics if the record is shorter than `MIN_BAM_RECORD_LEN` (36 bytes).

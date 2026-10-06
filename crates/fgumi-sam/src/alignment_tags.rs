@@ -39,8 +39,14 @@ pub fn uq_tag() -> Tag {
 
 /// Regenerates NM, UQ, and MD tags for a record after base masking
 ///
-/// For unmapped reads, the tags are removed (set to null) to match fgbio behavior.
-/// For mapped reads, the tags are recalculated based on the alignment and reference.
+/// For unmapped reads, the tags are removed (set to null) to match fgbio behavior, as they are
+/// for a read flagged mapped but with no reference sequence id, which has nothing to recompute
+/// against. For mapped reads, the tags are recalculated based on the alignment and reference.
+/// A mapped read with no bases (`SEQ` `*`) has nothing to recompute from, so its tags are
+/// left as they are; fgbio's `Bams.regenerateNmUqMdTags` fails on such a read instead. A read
+/// with bases but no qualities (`QUAL` `*`) gets NM and MD, and keeps its UQ unchanged, as in
+/// fgbio. The checks run in the same order as in [`regenerate_alignment_tags_raw_with_scoring`],
+/// so both forms give the same result for the same record.
 ///
 /// Every base differing from the reference counts ([`ConversionScoring::Literal`]); this
 /// record-level form has no methylation-aware scoring. Use
@@ -52,12 +58,14 @@ pub fn uq_tag() -> Tag {
 /// * `reference` - Reference genome provider
 ///
 /// # Returns
-/// True if tags were regenerated, false if read is unmapped (tags are nulled)
+/// True if tags were regenerated, false if the read is unmapped or has no reference sequence
+/// id (tags are nulled) or has no bases (tags are left unchanged)
 ///
 /// # Errors
 ///
-/// Returns an error if the reference sequence ID is missing or not found in the header,
-/// the alignment start is missing, or the reference bases cannot be fetched.
+/// Returns an error if the reference sequence ID is not found in the header, the alignment
+/// start is missing, or the reference bases cannot be fetched. These checks run before the
+/// no-bases check, so a read with no bases still fails on them.
 #[allow(clippy::too_many_lines, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub fn regenerate_alignment_tags(
     record: &mut RecordBuf,
@@ -72,17 +80,32 @@ pub fn regenerate_alignment_tags(
         return Ok(false);
     }
 
-    // Get reference sequence ID and look up name in header
-    let ref_seq_id = record.reference_sequence_id().context("Missing reference sequence ID")?;
+    // A read flagged mapped but with no reference is malformed: strip its tags, as the raw form
+    // does for a negative reference id.
+    let Some(ref_seq_id) = record.reference_sequence_id() else {
+        record.data_mut().remove(&nm_tag());
+        record.data_mut().remove(&uq_tag());
+        record.data_mut().remove(&md_tag());
+        return Ok(false);
+    };
     let ref_seqs = header.reference_sequences();
     let (ref_name_bytes, _) =
         ref_seqs.get_index(ref_seq_id).context("Reference sequence ID not found in header")?;
     let ref_name = std::str::from_utf8(ref_name_bytes.as_ref())?;
 
     let ref_start = record.alignment_start().context("Missing alignment start")?;
-    let cigar = record.cigar();
+
+    // A mapped read with no bases: leave its alignment tags as they are. This sits after the
+    // header and position checks so it never hides those errors.
     let seq = record.sequence();
+    if seq.is_empty() {
+        return Ok(false);
+    }
+
+    let cigar = record.cigar();
     let qual = record.quality_scores();
+    // A read with bases but no qualities (`QUAL` `*`) has no UQ to compute; keep the one it has.
+    let has_quals = !qual.as_ref().is_empty();
 
     // Calculate total reference span from CIGAR and fetch entire alignment span once
     // This is a key optimization - instead of fetching per CIGAR operation, we fetch once
@@ -105,7 +128,9 @@ pub fn regenerate_alignment_tags(
     if ref_span == 0 {
         record.data_mut().insert(nm_tag(), Value::from(0u32));
         record.data_mut().insert(md_tag(), Value::String("0".to_owned().into()));
-        record.data_mut().insert(uq_tag(), Value::from(0u32));
+        if has_quals {
+            record.data_mut().insert(uq_tag(), Value::from(0u32));
+        }
         return Ok(true);
     }
 
@@ -142,11 +167,14 @@ pub fn regenerate_alignment_tags(
                         .get(seq_pos)
                         .copied()
                         .context("Sequence index out of bounds")?;
-                    let qual_score = qual
-                        .as_ref()
-                        .get(seq_pos)
-                        .copied()
-                        .context("Quality index out of bounds")?;
+                    let qual_score = if has_quals {
+                        qual.as_ref()
+                            .get(seq_pos)
+                            .copied()
+                            .context("Quality index out of bounds")?
+                    } else {
+                        0
+                    };
 
                     if seq_base == b'N' {
                         // Masked base: count as mismatch and add to MD
@@ -227,7 +255,9 @@ pub fn regenerate_alignment_tags(
 
     // Update tags
     record.data_mut().insert(nm_tag(), Value::from(nm as i32));
-    record.data_mut().insert(uq_tag(), Value::from(uq.min(i32::MAX as u32) as i32));
+    if has_quals {
+        record.data_mut().insert(uq_tag(), Value::from(uq.min(i32::MAX as u32) as i32));
+    }
     record.data_mut().insert(md_tag(), Value::from(md_string));
 
     Ok(true)
@@ -288,9 +318,19 @@ fn hidden_conversion(scoring: ConversionScoring, flags: u16) -> Option<(u8, u8)>
 /// recalculated based on the alignment and reference. A record flagged mapped
 /// but carrying a negative reference id is malformed and has nothing to
 /// recompute against, so its tags are removed as well rather than left stale.
+/// A mapped record with no bases (`SEQ` `*`, e.g. a secondary alignment as
+/// `bwa mem -a` writes it) has nothing to recompute from, so its tags are left
+/// as they are: recomputing them would walk a CIGAR that consumes bases the
+/// record does not carry. fgbio's `Bams.regenerateNmUqMdTags` fails on such a
+/// record instead. This check runs after the header and position checks, so it
+/// never hides their errors. A record with bases but no qualities (`QUAL` `*`,
+/// stored as `0xFF` filler) gets NM and MD and keeps its UQ unchanged, as in
+/// fgbio, rather than summing the filler bytes. The typed
+/// [`regenerate_alignment_tags`] runs the same checks in the same order.
 ///
 /// Returns `Ok(true)` if tags were regenerated, `Ok(false)` if they were removed
-/// (an unmapped read, or a mapped read with no reference id).
+/// (an unmapped read, or a mapped read with no reference id) or left unchanged
+/// (a mapped read with no bases).
 ///
 /// Every base differing from the reference counts ([`ConversionScoring::Literal`]); see
 /// [`regenerate_alignment_tags_raw_with_scoring`] to hide methylation conversions from NM/UQ.
@@ -373,6 +413,18 @@ pub fn regenerate_alignment_tags_raw_with_scoring(
     let ref_start = Position::new((alignment_start_0based + 1) as usize)
         .context("Invalid alignment start position")?;
 
+    // A mapped record with no bases: leave its alignment tags as they are. This sits after the
+    // header and position checks so it never hides those errors.
+    let l_seq = fgumi_raw_bam::l_seq(record) as usize;
+    if l_seq == 0 {
+        return Ok(false);
+    }
+    // BAM stores a missing QUAL (`*`) as 0xFF filler. htsjdk treats a record whose first quality
+    // byte is 0xFF as having no qualities (`BAMRecord.decodeBaseQualities`), and fgbio then leaves
+    // UQ unchanged (`Bams.regenerateNmUqMdTags`), so do the same instead of summing the filler.
+    let qual_off = fgumi_raw_bam::qual_offset(record);
+    let has_quals = record.get(qual_off).is_some_and(|&q| q != 0xFF);
+
     // Calculate reference span directly from the raw CIGAR bytes (zero allocation).
     let ref_span = usize::try_from(fgumi_raw_bam::reference_length_from_raw_bam(record))
         .context("CIGAR-derived reference span is negative")?;
@@ -381,7 +433,9 @@ pub fn regenerate_alignment_tags_raw_with_scoring(
     if ref_span == 0 {
         let mut editor = RawTagsEditor::from_vec(record);
         editor.update_int(SamTag::NM, 0);
-        editor.update_int(SamTag::UQ, 0);
+        if has_quals {
+            editor.update_int(SamTag::UQ, 0);
+        }
         editor.update_string(SamTag::MD, b"0");
         return Ok(true);
     }
@@ -395,8 +449,6 @@ pub fn regenerate_alignment_tags_raw_with_scoring(
 
     // Get seq/qual offsets and validate bounds
     let seq_off = fgumi_raw_bam::seq_offset(record);
-    let qual_off = fgumi_raw_bam::qual_offset(record);
-    let l_seq = fgumi_raw_bam::l_seq(record) as usize;
     let seq_bytes = l_seq.div_ceil(2);
     if seq_off + seq_bytes > record.len() || qual_off + l_seq > record.len() {
         anyhow::bail!("Truncated BAM record: seq/qual extends past record end");
@@ -500,7 +552,9 @@ pub fn regenerate_alignment_tags_raw_with_scoring(
     // Update tags
     let mut editor = RawTagsEditor::from_vec(record);
     editor.update_int(SamTag::NM, nm);
-    editor.update_int(SamTag::UQ, uq.min(i32::MAX as u32) as i32);
+    if has_quals {
+        editor.update_int(SamTag::UQ, uq.min(i32::MAX as u32) as i32);
+    }
     editor.update_string(SamTag::MD, md_string.as_bytes());
 
     Ok(true)
@@ -511,6 +565,7 @@ mod tests {
     use super::*;
     use crate::builder::RecordBuilder;
     use noodles::sam::alignment::record::Flags;
+    use noodles::sam::alignment::record_buf::{QualityScores, Sequence};
     use noodles::sam::header::record::value::map::ReferenceSequence;
     use std::collections::HashMap;
     use std::io::Write;
@@ -1266,6 +1321,174 @@ mod tests {
             Some(expected_md),
             "MD"
         );
+        Ok(())
+    }
+
+    /// A mapped `8M` record at position 1 with no bases (`SEQ` and `QUAL` `*`).
+    fn empty_sequence_record() -> RecordBuf {
+        // The builder fills in bases for a CIGAR-only record, so clear them afterwards.
+        let mut record = create_mapped_record("ACGTACGT", &[30; 8], "8M", 1);
+        *record.sequence_mut() = Sequence::default();
+        *record.quality_scores_mut() = QualityScores::default();
+        record
+    }
+
+    /// A mapped record with no bases (`SEQ` `*`, as `bwa mem -a` writes secondaries) keeps its
+    /// NM/UQ/MD unchanged and returns `Ok(false)`: there are no bases to compare against the
+    /// reference, and walking its `8M` CIGAR would run past the empty sequence.
+    #[test]
+    fn test_regenerate_alignment_tags_leaves_empty_sequence_tags_unchanged() -> Result<()> {
+        let (_fasta, reference) = create_test_reference()?;
+        let header = create_test_header();
+
+        let mut record = empty_sequence_record();
+        assert!(record.sequence().is_empty(), "precondition: the record has no bases");
+        record.data_mut().insert(nm_tag(), Value::from(7u32));
+        record.data_mut().insert(uq_tag(), Value::from(70u32));
+        record.data_mut().insert(md_tag(), Value::from("8".to_string()));
+
+        let regenerated = regenerate_alignment_tags(&mut record, &header, &reference)?;
+
+        assert!(!regenerated, "nothing was regenerated");
+        assert_eq!(record.data().get(&nm_tag()), Some(&Value::from(7u32)));
+        assert_eq!(record.data().get(&uq_tag()), Some(&Value::from(70u32)));
+        assert_eq!(record.data().get(&md_tag()), Some(&Value::from("8".to_string())));
+        Ok(())
+    }
+
+    /// Raw-path counterpart of
+    /// `test_regenerate_alignment_tags_leaves_empty_sequence_tags_unchanged`, for both scorings.
+    #[rstest::rstest]
+    fn test_regenerate_alignment_tags_raw_leaves_empty_sequence_tags_unchanged(
+        #[values(ConversionScoring::Literal, ConversionScoring::Hidden)] scoring: ConversionScoring,
+    ) -> Result<()> {
+        let (_fasta, reference) = create_test_reference()?;
+        let header = create_test_header();
+
+        let mut raw = encode_record_buf_to_raw(&header, &empty_sequence_record())?;
+        {
+            let mut editor = RawTagsEditor::from_vec(&mut raw);
+            editor.update_int(SamTag::NM, 7);
+            editor.update_int(SamTag::UQ, 70);
+            editor.update_string(SamTag::MD, b"8");
+        }
+        assert_eq!(fgumi_raw_bam::l_seq(&raw), 0, "precondition: the record has no bases");
+        assert!(!RawRecordView::new(&raw).is_unmapped(), "precondition: the record is mapped");
+        let before = raw.clone();
+
+        let regenerated =
+            regenerate_alignment_tags_raw_with_scoring(&mut raw, &header, &reference, scoring)?;
+
+        assert!(!regenerated, "nothing was regenerated");
+        assert_eq!(raw, before, "the record is left byte-for-byte unchanged");
+        Ok(())
+    }
+
+    /// The bases a parity-test record carries.
+    #[derive(Clone, Copy, Debug)]
+    enum ParitySeq {
+        /// `ACGTACGA`, one mismatch against the reference, all qualities 30.
+        Bases,
+        /// The same bases with no qualities (`QUAL` `*`, 0xFF filler in BAM).
+        NoQuals,
+        /// No bases (`SEQ` and `QUAL` `*`).
+        Empty,
+    }
+
+    /// The reference id a parity-test record carries.
+    #[derive(Clone, Copy, Debug)]
+    enum ParityRef {
+        /// `chr1`, present in the header.
+        Valid,
+        /// No reference id (typed `None`, raw `-1`) on a record flagged mapped.
+        Missing,
+        /// A reference id the header does not have.
+        OutOfRange,
+    }
+
+    /// NM, UQ and MD of a record, `None` where the tag is absent.
+    type AlignmentTags = (Option<i64>, Option<i64>, Option<String>);
+
+    /// The typed and raw regenerators run their checks in the same order, so they agree on every
+    /// record, including the malformed ones where several checks apply at once: no bases with a
+    /// missing or out-of-range reference id. Each case pins the shared outcome: `Some((returned,
+    /// tags))` on success, `None` on error. Every record starts with NM 7, UQ 70 and MD `8`.
+    #[rstest::rstest]
+    #[case::bases(ParitySeq::Bases, ParityRef::Valid, false,
+        Some((true, (Some(1), Some(30), Some("7T0".to_string())))))]
+    #[case::no_quals_keeps_uq(ParitySeq::NoQuals, ParityRef::Valid, false,
+        Some((true, (Some(1), Some(70), Some("7T0".to_string())))))]
+    #[case::empty_keeps_tags(ParitySeq::Empty, ParityRef::Valid, false,
+        Some((false, (Some(7), Some(70), Some("8".to_string())))))]
+    #[case::empty_missing_ref_strips(ParitySeq::Empty, ParityRef::Missing, false,
+        Some((false, (None, None, None))))]
+    #[case::bases_missing_ref_strips(ParitySeq::Bases, ParityRef::Missing, false,
+        Some((false, (None, None, None))))]
+    #[case::empty_out_of_range_ref_errors(ParitySeq::Empty, ParityRef::OutOfRange, false, None)]
+    #[case::bases_out_of_range_ref_errors(ParitySeq::Bases, ParityRef::OutOfRange, false, None)]
+    #[case::empty_unmapped_strips(ParitySeq::Empty, ParityRef::Valid, true,
+        Some((false, (None, None, None))))]
+    fn test_regenerate_alignment_tags_typed_and_raw_agree(
+        #[case] seq: ParitySeq,
+        #[case] ref_id: ParityRef,
+        #[case] unmapped: bool,
+        #[case] expected: Option<(bool, AlignmentTags)>,
+    ) -> Result<()> {
+        let (_fasta, reference) = create_test_reference()?;
+        let header = create_test_header();
+
+        let mut typed = create_mapped_record("ACGTACGA", &[30; 8], "8M", 1);
+        match seq {
+            ParitySeq::Bases => {}
+            ParitySeq::NoQuals => *typed.quality_scores_mut() = QualityScores::default(),
+            ParitySeq::Empty => {
+                *typed.sequence_mut() = Sequence::default();
+                *typed.quality_scores_mut() = QualityScores::default();
+            }
+        }
+        if unmapped {
+            *typed.flags_mut() = Flags::UNMAPPED;
+        }
+        typed.data_mut().insert(nm_tag(), Value::from(7u32));
+        typed.data_mut().insert(uq_tag(), Value::from(70u32));
+        typed.data_mut().insert(md_tag(), Value::from("8".to_string()));
+        // Encode before breaking the reference id: the BAM writer validates it.
+        let mut raw = encode_record_buf_to_raw(&header, &typed)?;
+        match ref_id {
+            ParityRef::Valid => {}
+            ParityRef::Missing => {
+                *typed.reference_sequence_id_mut() = None;
+                fgumi_raw_bam::set_ref_id(&mut raw, -1);
+            }
+            ParityRef::OutOfRange => {
+                *typed.reference_sequence_id_mut() = Some(5);
+                fgumi_raw_bam::set_ref_id(&mut raw, 5);
+            }
+        }
+
+        let typed_result = regenerate_alignment_tags(&mut typed, &header, &reference);
+        let raw_result = regenerate_alignment_tags_raw(&mut raw, &header, &reference);
+
+        let typed_tags: AlignmentTags = (
+            typed.data().get(&nm_tag()).and_then(Value::as_int),
+            typed.data().get(&uq_tag()).and_then(Value::as_int),
+            match typed.data().get(&md_tag()) {
+                Some(Value::String(md)) => Some(md.to_string()),
+                _ => None,
+            },
+        );
+        let aux = fgumi_raw_bam::aux_data_slice(&raw);
+        let raw_tags: AlignmentTags = (
+            fgumi_raw_bam::find_int_tag(aux, SamTag::NM),
+            fgumi_raw_bam::find_int_tag(aux, SamTag::UQ),
+            fgumi_raw_bam::find_string_tag(aux, SamTag::MD)
+                .map(|md| String::from_utf8_lossy(md).into_owned()),
+        );
+
+        let typed_outcome = typed_result.ok().map(|regenerated| (regenerated, typed_tags));
+        let raw_outcome = raw_result.ok().map(|regenerated| (regenerated, raw_tags));
+        assert_eq!(typed_outcome, raw_outcome, "typed and raw forms agree");
+        assert_eq!(typed_outcome, expected, "outcome");
         Ok(())
     }
 

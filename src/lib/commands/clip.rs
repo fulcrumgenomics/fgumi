@@ -45,7 +45,9 @@ done in streaming fashion with, for example:
 The output is written in the same order as the input. To produce coordinate-sorted output, pipe the
 result through a separate `fgumi sort`.
 
-Any existing NM, UQ and MD tags are repaired, and mate-pair information is updated.
+Any existing NM, UQ and MD tags are repaired, and mate-pair information is updated. A mapped secondary or
+supplementary record with no bases (SEQ `*`) keeps its NM, UQ and MD unchanged, where fgbio fails; a mapped
+primary record with no bases is an error. A record with bases but no qualities (QUAL `*`) keeps its UQ.
 
 Three clipping modes are supported:
 1. `soft` - soft-clip the bases and qualities.
@@ -149,6 +151,15 @@ fn leading_hard_clip(record: &RawRecord) -> usize {
         .sum()
 }
 
+/// Whether `record` is a mapped primary alignment (neither secondary nor supplementary) with no
+/// bases (`SEQ` `*`), which `clip` cannot clip.
+fn is_mapped_primary_without_bases(record: &RawRecord) -> bool {
+    !record.is_unmapped()
+        && !record.is_secondary()
+        && !record.is_supplementary()
+        && record.l_seq() == 0
+}
+
 /// What [`ClipParams::clip_template`] did to one template.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ClipTemplateOutcome {
@@ -240,15 +251,29 @@ impl ClipParams {
     /// the non-clipping shapes fgbio also passes through untouched — a lone primary R2 (no R1) and
     /// an empty / all-secondary-and-supplementary template.
     ///
+    /// A mapped secondary or supplementary record with no bases (`SEQ` `*`, as `bwa mem -a`
+    /// writes secondaries) passes through unclipped, and tag regeneration then leaves its
+    /// NM/UQ/MD unchanged. A mapped primary with no bases is an error: clipping it is
+    /// meaningless, and passing it through would silently skip the requested clip.
+    ///
     /// # Errors
     ///
-    /// Returns an error if primary-pair detection or a clipping operation fails.
+    /// Returns an error if a mapped primary record has no bases, or if primary-pair detection
+    /// or a clipping operation fails.
     pub(crate) fn clip_template(
         &self,
         records: &mut [RawRecord],
         clipper: &RawRecordClipper,
         metrics: Option<&mut ClippingMetricsCollection>,
     ) -> Result<ClipTemplateOutcome> {
+        // fgbio's ClipBam aborts on every mapped record with no bases. fgumi keeps that for
+        // primaries, before any record of the template is modified.
+        if let Some(record) = records.iter().find(|r| is_mapped_primary_without_bases(r)) {
+            anyhow::bail!(
+                "Cannot clip read {}: it is a mapped primary alignment with no bases (SEQ '*')",
+                String::from_utf8_lossy(record.read_name())
+            );
+        }
         // `soft-with-mask` clipping rewrites the clipped bases to N, hard clipping removes them,
         // and unmapping a reverse-mapped read reverse-complements SEQ, so snapshot every record
         // with modification tags and afterwards bring MM/ML in step with the clipped SEQ.

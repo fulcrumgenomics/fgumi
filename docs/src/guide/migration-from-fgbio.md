@@ -200,6 +200,20 @@ leave a stale `SO` tag when more than one consensus-calling thread is used. If y
 relying on fgbio's rejects header carrying the input's sort order, sort the rejects BAM
 explicitly after the fact.
 
+### Records With No Bases
+
+A record can carry no bases (`SEQ` `*`), as `bwa mem -a` writes secondary alignments. `filter` and
+`clip` handle these differently from fgbio's `FilterConsensusReads` and `ClipBam`:
+
+- `filter --min-mean-base-quality` gives a read with no bases a mean of 0, so any minimum greater
+  than 0 rejects it. fgbio's mean is `NaN` and the read passes.
+- A kept mapped record with no bases (e.g. a secondary in count mode, `--max-no-call-fraction` >= 1)
+  keeps its NM, UQ and MD tags unchanged. fgbio fails when it regenerates them.
+- `clip` passes a mapped secondary or supplementary record with no bases through with its tags
+  unchanged; fgbio fails. A mapped primary record with no bases is an error in both tools.
+
+With `--max-no-call-fraction` below 1.0, both tools reject a read with no bases.
+
 ### Boolean Flag Values
 
 fgumi boolean flags (e.g. `--output-per-base-tags`, `--trim`, `--require-single-strand-agreement`)
