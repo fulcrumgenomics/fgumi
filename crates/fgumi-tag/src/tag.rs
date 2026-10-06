@@ -121,6 +121,67 @@ impl SamTag {
     pub const XS: SamTag = SamTag::new(b'X', b'S');
     /// Program record identifier (SAM spec).
     pub const PG: SamTag = SamTag::new(b'P', b'G');
+    /// Library (SAM spec).
+    pub const LB: SamTag = SamTag::new(b'L', b'B');
+    /// Platform unit (SAM spec).
+    pub const PU: SamTag = SamTag::new(b'P', b'U');
+    /// Free-text comment (SAM spec).
+    pub const CO: SamTag = SamTag::new(b'C', b'O');
+    /// Cell barcode bases, uncorrected (SAM spec).
+    pub const CR: SamTag = SamTag::new(b'C', b'R');
+    /// Molecular barcode sequence, error-corrected (SAM spec).
+    pub const UB: SamTag = SamTag::new(b'U', b'B');
+    /// Molecular barcode sequence, uncorrected (SAM spec).
+    pub const UR: SamTag = SamTag::new(b'U', b'R');
+    /// Molecular barcode quality scores (SAM spec).
+    pub const UY: SamTag = SamTag::new(b'U', b'Y');
+    /// Other canonical alignments in a chimeric alignment (SAM spec).
+    pub const SA: SamTag = SamTag::new(b'S', b'A');
+    /// Original alignment (SAM spec).
+    pub const OA: SamTag = SamTag::new(b'O', b'A');
+    /// Original CIGAR, deprecated in favour of `OA` (SAM spec).
+    pub const OC: SamTag = SamTag::new(b'O', b'C');
+    /// Reference name of the next hit (SAM spec).
+    pub const CC: SamTag = SamTag::new(b'C', b'C');
+    /// Complete read annotation, `CT` (SAM spec).
+    ///
+    /// Note: the Rust identifier uses a descriptive suffix to avoid a name
+    /// collision with [`SamTag::CT`], the fgumi-local per-base `ct` count.
+    pub const CT_ANNOTATION: SamTag = SamTag::new(b'C', b'T');
+    /// Segment suffix (SAM spec).
+    pub const FS: SamTag = SamTag::new(b'F', b'S');
+    /// Annotations for parts of the padded read sequence (SAM spec).
+    pub const PT: SamTag = SamTag::new(b'P', b'T');
+    /// Sequence of the mate or next segment in the template (SAM spec).
+    pub const R2: SamTag = SamTag::new(b'R', b'2');
+    /// Phred qualities of the mate or next segment sequence in `R2` (SAM spec).
+    pub const Q2: SamTag = SamTag::new(b'Q', b'2');
+    /// Flow signal intensities, `B:S` array (SAM spec).
+    pub const FZ: SamTag = SamTag::new(b'F', b'Z');
+    /// CIGAR of an alignment with more than 65,535 operations, `B:I` array (SAM spec).
+    pub const CG: SamTag = SamTag::new(b'C', b'G');
+    /// Alternative hits, `Z` string (written by `bwa` / `bwa-mem3`).
+    pub const XA: SamTag = SamTag::new(b'X', b'A');
+    /// Difference string against the reference, `cs:Z` (written by `minimap2 --cs`).
+    pub const CS: SamTag = SamTag::new(b'c', b's');
+    /// Intron motifs, `jM:B:c` array (written by STAR).
+    pub const JM: SamTag = SamTag::new(b'j', b'M');
+    /// Intron start and end coordinates, `jI:B:i` array (written by STAR).
+    pub const JI: SamTag = SamTag::new(b'j', b'I');
+    /// Gene IDs, `Z` string (written by `STARsolo` and Cell Ranger).
+    pub const GX: SamTag = SamTag::new(b'G', b'X');
+    /// Gene names, `Z` string (written by `STARsolo` and Cell Ranger).
+    pub const GN: SamTag = SamTag::new(b'G', b'N');
+    /// Linked-read barcode, `Z` string (written by 10x Genomics Long Ranger).
+    pub const BX: SamTag = SamTag::new(b'B', b'X');
+    /// Basecaller move table, `mv:B:c` array (written by Oxford Nanopore `dorado`).
+    pub const MV: SamTag = SamTag::new(b'm', b'v');
+    /// Parent read ID of a split read, `pi:Z` (written by Oxford Nanopore `dorado`).
+    pub const PI: SamTag = SamTag::new(b'p', b'i');
+    /// Read start time, `st:Z` (written by Oxford Nanopore `dorado`).
+    pub const ST: SamTag = SamTag::new(b's', b't');
+    /// Source signal file name, `fn:Z` (written by Oxford Nanopore `dorado`).
+    pub const FN: SamTag = SamTag::new(b'f', b'n');
     /// Adapter clipping position (e.g. from Picard `MarkIlluminaAdapters`).
     pub const XT: SamTag = SamTag::new(b'X', b'T');
     /// Bisulfite strand (written by `bwameth` and related tools): `Z:f` for the

@@ -27,6 +27,61 @@ fn is_modification_tag(tag: [u8; 2]) -> bool {
     MODIFICATION_TAGS.iter().any(|t| **t == tag)
 }
 
+/// Tags whose values are not this read's per-base data, so `--auto-clip-attributes` must not
+/// slice them even when their length happens to equal the read's. Best-effort: an unlisted tag
+/// whose length matches the read's is still clipped.
+const NON_PER_BASE_TAGS: [fgumi_raw_bam::SamTag; 44] = [
+    fgumi_raw_bam::SamTag::RG,
+    fgumi_raw_bam::SamTag::LB,
+    fgumi_raw_bam::SamTag::PU,
+    fgumi_raw_bam::SamTag::PG,
+    fgumi_raw_bam::SamTag::CO,
+    fgumi_raw_bam::SamTag::MI,
+    fgumi_raw_bam::SamTag::BC,
+    fgumi_raw_bam::SamTag::QT,
+    fgumi_raw_bam::SamTag::RX,
+    fgumi_raw_bam::SamTag::QX,
+    fgumi_raw_bam::SamTag::OX,
+    fgumi_raw_bam::SamTag::BZ,
+    fgumi_raw_bam::SamTag::CB,
+    fgumi_raw_bam::SamTag::CR,
+    fgumi_raw_bam::SamTag::CY,
+    fgumi_raw_bam::SamTag::UB,
+    fgumi_raw_bam::SamTag::UR,
+    fgumi_raw_bam::SamTag::UY,
+    fgumi_raw_bam::SamTag::BX,
+    fgumi_raw_bam::SamTag::OB,
+    fgumi_raw_bam::SamTag::MC,
+    fgumi_raw_bam::SamTag::MD,
+    fgumi_raw_bam::SamTag::SA,
+    fgumi_raw_bam::SamTag::OA,
+    fgumi_raw_bam::SamTag::OC,
+    fgumi_raw_bam::SamTag::CG,
+    fgumi_raw_bam::SamTag::XA,
+    fgumi_raw_bam::SamTag::CS,
+    fgumi_raw_bam::SamTag::JM,
+    fgumi_raw_bam::SamTag::JI,
+    fgumi_raw_bam::SamTag::TC,
+    fgumi_raw_bam::SamTag::CC,
+    fgumi_raw_bam::SamTag::CT_ANNOTATION,
+    fgumi_raw_bam::SamTag::FS,
+    fgumi_raw_bam::SamTag::PT,
+    fgumi_raw_bam::SamTag::GX,
+    fgumi_raw_bam::SamTag::GN,
+    fgumi_raw_bam::SamTag::R2,
+    fgumi_raw_bam::SamTag::Q2,
+    fgumi_raw_bam::SamTag::FZ,
+    fgumi_raw_bam::SamTag::MV,
+    fgumi_raw_bam::SamTag::PI,
+    fgumi_raw_bam::SamTag::ST,
+    fgumi_raw_bam::SamTag::FN,
+];
+
+/// Whether `--auto-clip-attributes` must leave `tag` untouched whatever its length.
+fn is_never_auto_clipped(tag: [u8; 2]) -> bool {
+    is_modification_tag(tag) || NON_PER_BASE_TAGS.iter().any(|t| **t == tag)
+}
+
 const TAGS_TO_REVERSE: [fgumi_raw_bam::SamTag; 2] =
     [fgumi_raw_bam::SamTag::OQ, fgumi_raw_bam::SamTag::U2];
 
@@ -74,77 +129,29 @@ impl RawRecordClipper {
 
     /// Creates a new raw-byte clipper with auto-clip attributes enabled.
     ///
-    /// When enabled with hard clipping mode, any string or array tags that are the same
-    /// length as the read's sequence will be automatically clipped to match.
+    /// When enabled with hard clipping mode, string or array tags that are the same length as
+    /// the read's sequence are clipped to match, except the base modification tags and the
+    /// listed tags that are not per-base data for the read.
     #[must_use]
     pub fn with_auto_clip(mode: ClippingMode, auto_clip_attributes: bool) -> Self {
         Self { mode, auto_clip_attributes }
     }
 
     /// Clip per-base tags whose length equals `old_length` when in hard-clip mode.
-    ///
-    /// Collects tags that must change, then re-applies them through `RawTagsEditor`.
     fn clip_extended_attributes_raw(
         &self,
         record: &mut fgumi_raw_bam::RawRecord,
         remove: usize,
         from_start: bool,
     ) {
-        use fgumi_raw_bam::TagValue;
-
         if !matches!(self.mode, ClippingMode::Hard) || remove == 0 || !self.auto_clip_attributes {
             return;
         }
 
         let new_length = record.l_seq() as usize;
         let old_length = new_length + remove;
-
-        // Collect tags to update: must release the immutable borrow before mutating.
-        let aux = fgumi_raw_bam::aux_data_slice(record.as_ref()).to_vec();
-        let view = fgumi_raw_bam::RawTagsView::new(&aux);
-
-        // Tag update instructions: (tag, type_byte, new_bytes)
-        let mut string_updates: Vec<([u8; 2], Vec<u8>)> = Vec::new();
-        let mut array_updates: Vec<([u8; 2], u8, Vec<u8>)> = Vec::new();
-
-        for entry in view.iter_typed() {
-            let (tag, value) = entry;
-            if is_modification_tag(tag) {
-                continue;
-            }
-            match value {
-                TagValue::String(s) => {
-                    if s.len() == old_length {
-                        let (start, end) =
-                            if from_start { (remove, old_length) } else { (0, new_length) };
-                        string_updates.push((tag, s[start..end].to_vec()));
-                    }
-                }
-                TagValue::Array(arr) => {
-                    if arr.count == old_length {
-                        let (start, end) =
-                            if from_start { (remove, old_length) } else { (0, new_length) };
-                        let start_byte = start * arr.elem_size;
-                        let end_byte = end * arr.elem_size;
-                        array_updates.push((
-                            tag,
-                            arr.elem_type,
-                            arr.data[start_byte..end_byte].to_vec(),
-                        ));
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Apply updates via RawTagsEditor
-        let mut editor = record.tags_editor();
-        for (tag, value) in &string_updates {
-            editor.update_string(tag, value);
-        }
-        for (tag, elem_type, data) in &array_updates {
-            raw_clip_update_array_tag(&mut editor, *tag, *elem_type, data);
-        }
+        let (start, end) = if from_start { (remove, old_length) } else { (0, new_length) };
+        auto_clip_tags_raw(record, old_length, start, end);
     }
 
     /// Number of bases available to be clipped from the alignment.
@@ -939,10 +946,6 @@ impl RawRecordClipper {
     /// This function does not currently return errors but uses `anyhow::Result` for
     /// API symmetry with `upgrade_all_clipping`.
     #[expect(
-        clippy::too_many_lines,
-        reason = "mirrors SamRecordClipper::upgrade_all_clipping with raw-byte CIGAR surgery"
-    )]
-    #[expect(
         clippy::cast_possible_truncation,
         reason = "CIGAR lengths are bounded by BAM read length which fits in u32"
     )]
@@ -1061,51 +1064,59 @@ impl RawRecordClipper {
         record.set_cigar_ops(&new_cigar_ops);
 
         if self.auto_clip_attributes && (leading_soft > 0 || trailing_soft > 0) {
-            // Collect tags matching old length, then update them. Keep exactly the SEQ range
-            // retained above (it starts after the leading soft clip and is clamped to the stored
-            // SEQ), so per-base tags still match `l_seq` even when SEQ is `*` or shorter than the
-            // CIGAR's query length.
+            // Keep exactly the SEQ range retained above (it starts after the leading soft clip and
+            // is clamped to the stored SEQ), so per-base tags still match `l_seq` even when SEQ is
+            // `*` or shorter than the CIGAR's query length.
             let keep_start = leading_soft.min(old_seq_len);
-            let keep_end = keep_start + new_sequence.len();
-            let aux = fgumi_raw_bam::aux_data_slice(record.as_ref()).to_vec();
-            let view = fgumi_raw_bam::RawTagsView::new(&aux);
-            let mut string_updates: Vec<([u8; 2], Vec<u8>)> = Vec::new();
-            let mut array_updates: Vec<([u8; 2], u8, Vec<u8>)> = Vec::new();
-
-            for (tag, value) in view.iter_typed() {
-                use fgumi_raw_bam::TagValue;
-                if is_modification_tag(tag) {
-                    continue;
-                }
-                match value {
-                    TagValue::String(s) => {
-                        if s.len() == old_seq_len {
-                            string_updates.push((tag, s[keep_start..keep_end].to_vec()));
-                        }
-                    }
-                    TagValue::Array(arr) => {
-                        if arr.count == old_seq_len {
-                            let start = keep_start * arr.elem_size;
-                            let end = keep_end * arr.elem_size;
-                            array_updates.push((tag, arr.elem_type, arr.data[start..end].to_vec()));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            let mut editor = record.tags_editor();
-            for (tag, value) in &string_updates {
-                editor.update_string(tag, value);
-            }
-            for (tag, elem_type, data) in &array_updates {
-                raw_clip_update_array_tag(&mut editor, *tag, *elem_type, data);
-            }
+            auto_clip_tags_raw(record, old_seq_len, keep_start, keep_start + new_sequence.len());
         }
 
         record.set_sequence_and_qualities(&new_sequence, &new_qualities);
 
         Ok((leading_soft, trailing_soft))
+    }
+}
+
+/// Slices every String or Array tag of length `old_len` to `start..end`, skipping the tags
+/// that are never auto-clipped.
+///
+/// Collects tags that must change, then re-applies them through `RawTagsEditor`.
+fn auto_clip_tags_raw(
+    record: &mut fgumi_raw_bam::RawRecord,
+    old_len: usize,
+    start: usize,
+    end: usize,
+) {
+    use fgumi_raw_bam::TagValue;
+
+    // Collect tags to update: must release the immutable borrow before mutating.
+    let aux = fgumi_raw_bam::aux_data_slice(record.as_ref()).to_vec();
+    let view = fgumi_raw_bam::RawTagsView::new(&aux);
+    let mut string_updates: Vec<([u8; 2], Vec<u8>)> = Vec::new();
+    let mut array_updates: Vec<([u8; 2], u8, Vec<u8>)> = Vec::new();
+
+    for (tag, value) in view.iter_typed() {
+        if is_never_auto_clipped(tag) {
+            continue;
+        }
+        match value {
+            TagValue::String(s) if s.len() == old_len => {
+                string_updates.push((tag, s[start..end].to_vec()));
+            }
+            TagValue::Array(arr) if arr.count == old_len => {
+                let bytes = &arr.data[start * arr.elem_size..end * arr.elem_size];
+                array_updates.push((tag, arr.elem_type, bytes.to_vec()));
+            }
+            _ => {}
+        }
+    }
+
+    let mut editor = record.tags_editor();
+    for (tag, value) in &string_updates {
+        editor.update_string(tag, value);
+    }
+    for (tag, elem_type, data) in &array_updates {
+        raw_clip_update_array_tag(&mut editor, *tag, *elem_type, data);
     }
 }
 
@@ -2542,7 +2553,7 @@ mod tests {
         let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
 
         // Add a UInt8Array attribute that matches the read length
-        let tag = Tag::from([b'X', b'A']);
+        let tag = Tag::from([b'X', b'B']);
         let array: Vec<u8> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
         let value = Value::from(array);
         record.data_mut().insert(tag, value);
@@ -2556,7 +2567,7 @@ mod tests {
             let vec_data: Vec<u8> = arr.clone();
             assert_eq!(vec_data, vec![3, 4, 5, 6, 7, 8, 9]);
         } else {
-            panic!("Tag XA not found or wrong type");
+            panic!("Tag XB not found or wrong type");
         }
     }
 
@@ -2569,7 +2580,7 @@ mod tests {
         let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
 
         // Add a UInt8Array attribute that matches the read length
-        let tag = Tag::from([b'X', b'A']);
+        let tag = Tag::from([b'X', b'B']);
         let array: Vec<u8> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
         let value = Value::from(array);
         record.data_mut().insert(tag, value);
@@ -2583,7 +2594,7 @@ mod tests {
             let vec_data: Vec<u8> = arr.clone();
             assert_eq!(vec_data, vec![0, 1, 2, 3, 4, 5, 6]);
         } else {
-            panic!("Tag XA not found or wrong type");
+            panic!("Tag XB not found or wrong type");
         }
     }
 
@@ -2629,6 +2640,106 @@ mod tests {
         };
         let bytes: &[u8] = s.as_ref();
         assert_eq!(bytes, b"0123456789");
+    }
+
+    #[test]
+    fn test_auto_clip_attributes_skips_non_per_base_tags() {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+
+        use fgumi_raw_bam::SamTag;
+
+        let expected: [SamTag; 44] = [
+            SamTag::RG,
+            SamTag::LB,
+            SamTag::PU,
+            SamTag::PG,
+            SamTag::CO,
+            SamTag::MI,
+            SamTag::BC,
+            SamTag::QT,
+            SamTag::RX,
+            SamTag::QX,
+            SamTag::OX,
+            SamTag::BZ,
+            SamTag::CB,
+            SamTag::CR,
+            SamTag::CY,
+            SamTag::UB,
+            SamTag::UR,
+            SamTag::UY,
+            SamTag::BX,
+            SamTag::OB,
+            SamTag::MC,
+            SamTag::MD,
+            SamTag::SA,
+            SamTag::OA,
+            SamTag::OC,
+            SamTag::CG,
+            SamTag::XA,
+            SamTag::CS,
+            SamTag::JM,
+            SamTag::JI,
+            SamTag::TC,
+            SamTag::CC,
+            SamTag::CT_ANNOTATION,
+            SamTag::FS,
+            SamTag::PT,
+            SamTag::GX,
+            SamTag::GN,
+            SamTag::R2,
+            SamTag::Q2,
+            SamTag::FZ,
+            SamTag::MV,
+            SamTag::PI,
+            SamTag::ST,
+            SamTag::FN,
+        ];
+        let mut actual: Vec<[u8; 2]> = NON_PER_BASE_TAGS.iter().map(|t| **t).collect();
+        let mut wanted: Vec<[u8; 2]> = expected.iter().map(|t| **t).collect();
+        actual.sort_unstable();
+        wanted.sort_unstable();
+        assert_eq!(actual, wanted);
+
+        let clipper = RawClipperOnBuf::with_auto_clip(ClippingMode::Hard, true);
+        let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
+        // noodles reserves CG for long CIGARs and drops it from a RecordBuf; the raw upgrade test covers it.
+        for tag in expected.into_iter().filter(|t| *t != SamTag::CG) {
+            record.data_mut().insert(Tag::from(*tag), Value::from("0123456789"));
+        }
+        let per_base = [Tag::from(SamTag::OQ), Tag::from(SamTag::E2), Tag::from([b'X', b'B'])];
+        for tag in per_base {
+            record.data_mut().insert(tag, Value::from("0123456789"));
+        }
+        let depth = Tag::from(SamTag::CD_BASES);
+        record.data_mut().insert(depth, Value::from((0..10).collect::<Vec<i16>>()));
+
+        assert_eq!(clipper.clip_start_of_alignment(&mut record, 3), 3);
+
+        for tag in expected.into_iter().filter(|t| *t != SamTag::CG) {
+            match record.data().get(&Tag::from(*tag)) {
+                Some(Value::String(s)) => {
+                    let bytes: &[u8] = s.as_ref();
+                    assert_eq!(bytes, b"0123456789", "tag {tag:?} was clipped");
+                }
+                other => panic!("tag {tag:?} missing or retyped: {other:?}"),
+            }
+        }
+        for tag in per_base {
+            match record.data().get(&tag) {
+                Some(Value::String(s)) => {
+                    let bytes: &[u8] = s.as_ref();
+                    assert_eq!(bytes, b"3456789", "tag {tag:?} was not clipped");
+                }
+                other => panic!("tag {tag:?} missing or retyped: {other:?}"),
+            }
+        }
+        match record.data().get(&depth) {
+            Some(Value::Array(Array::Int16(values))) => {
+                assert_eq!(values, &(3..10).collect::<Vec<i16>>());
+            }
+            other => panic!("tag cd missing or retyped: {other:?}"),
+        }
     }
 
     #[test]
@@ -3342,6 +3453,44 @@ mod tests {
         let bytes = fgumi_raw_bam::find_string_tag_in_record(record.as_ref(), b"aa")
             .expect("aa tag present");
         assert_eq!(bytes, &raw[5..40], "non-UTF-8 tag bytes must be preserved on upgrade");
+    }
+
+    #[test]
+    fn test_upgrade_all_clipping_skips_non_per_base_tags() {
+        // The soft-to-hard upgrade has its own auto-clip loop, so pin the protected tags there too.
+        let seq = "12345678901234567890123456789012345678901234567890"; // 50 bases
+        let buf = create_test_record("5S35M10S", seq, 10);
+        let mut rec = to_raw(&buf).as_ref().to_vec();
+        let value: Vec<u8> = (0..50u8).map(|i| b'A' + (i % 26)).collect();
+        {
+            let mut ed = fgumi_raw_bam::RawTagsEditor::from_vec(&mut rec);
+            ed.append_string(fgumi_raw_bam::SamTag::RG, &value);
+            ed.append_array_i32(fgumi_raw_bam::SamTag::CG, &[0; 50]);
+            ed.append_string(fgumi_raw_bam::SamTag::OQ, &value);
+            ed.append_string([b'X', b'B'], &value);
+        }
+        let mut record = fgumi_raw_bam::RawRecord::from(rec);
+
+        let result = RawRecordClipper::with_auto_clip(ClippingMode::Hard, true)
+            .upgrade_all_clipping_raw(&mut record)
+            .expect("upgrade should succeed");
+        assert_eq!(result, (5, 10));
+
+        let rg =
+            fgumi_raw_bam::find_string_tag_in_record(record.as_ref(), fgumi_raw_bam::SamTag::RG)
+                .expect("RG tag present");
+        assert_eq!(rg, &value[..], "a protected tag must not be clipped on upgrade");
+        let aux = fgumi_raw_bam::aux_data_slice(record.as_ref());
+        let cg =
+            fgumi_raw_bam::find_array_tag(aux, fgumi_raw_bam::SamTag::CG).expect("CG tag present");
+        assert_eq!(cg.count, 50, "a protected array tag must not be clipped on upgrade");
+        let oq =
+            fgumi_raw_bam::find_string_tag_in_record(record.as_ref(), fgumi_raw_bam::SamTag::OQ)
+                .expect("OQ tag present");
+        assert_eq!(oq, &value[5..40], "a per-base tag is clipped on upgrade");
+        let xb = fgumi_raw_bam::find_string_tag_in_record(record.as_ref(), [b'X', b'B'])
+            .expect("XB tag present");
+        assert_eq!(xb, &value[5..40], "an unlisted tag is clipped on upgrade");
     }
 
     #[test]

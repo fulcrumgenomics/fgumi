@@ -619,7 +619,7 @@ pub struct Coverage {
 
 /// Count the alignment shapes in `bam`.
 pub fn coverage(bam: &Bam) -> Coverage {
-    let xa = SamTag::new(b'X', b'A');
+    let xa = SamTag::XA;
     let mut c = Coverage::default();
     for body in &bam.records {
         let f = flags(body);
